@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..runtime_env import bootstrap_runtime_pythonpath, validate_runtime_env_layout
+
 
 OPENPI_FAST_WORKER_PROTOCOL_VERSION = 1
 
@@ -30,13 +32,8 @@ class OpenPIFastWorkerRemoteError(OpenPIFastWorkerError):
 
 
 def _default_pythonpath() -> tuple[str, ...]:
-    mint_root = _default_mint_root()
-    openpi_src = mint_root.parent / "openpi" / "src"
-
-    entries = [str(mint_root)]
-    if openpi_src.exists():
-        entries.append(str(openpi_src.resolve()))
-    return tuple(entries)
+    current = os.environ.get("PYTHONPATH", "").strip()
+    return tuple(item for item in current.split(os.pathsep) if item)
 
 
 def _default_mint_root() -> Path:
@@ -44,19 +41,6 @@ def _default_mint_root() -> Path:
     if pfs_tinker_path:
         return Path(pfs_tinker_path).expanduser().resolve()
     return Path(__file__).resolve().parents[2]
-
-
-def _conley_workspace_root(mint_root: Path) -> Path | None:
-    if mint_root.name != "tinker-server":
-        return None
-    return mint_root.parent
-
-
-def _require_existing_dir(path: Path, *, label: str) -> str:
-    resolved = path.expanduser().resolve()
-    if not resolved.is_dir():
-        raise FileNotFoundError(f"OpenPI FAST {label} does not exist: {resolved}")
-    return str(resolved)
 
 
 def _require_existing_executable(path: Path, *, label: str) -> str:
@@ -99,36 +83,34 @@ class OpenPIFastRuntimeSpec:
     @classmethod
     def from_env(cls) -> "OpenPIFastRuntimeSpec":
         mint_root = _default_mint_root()
-        conley_root = _conley_workspace_root(mint_root)
         pythonpath_env = os.environ.get("MINT_OPENPI_FAST_PYTHONPATH", "").strip()
-        pythonpath = tuple(s for s in pythonpath_env.split(os.pathsep) if s) or _default_pythonpath()
+        pythonpath = tuple(s for s in pythonpath_env.split(os.pathsep) if s)
+        if not pythonpath:
+            pythonpath = tuple(
+                s
+                for s in bootstrap_runtime_pythonpath(
+                    os.environ,
+                    repo_root=str(mint_root),
+                ).split(os.pathsep)
+                if s
+            )
         request_timeout_s = float(os.environ.get("MINT_OPENPI_FAST_REQUEST_TIMEOUT_S", "300"))
         python_executable = (os.environ.get("MINT_OPENPI_FAST_PYTHON") or "").strip()
-        extra_env: dict[str, str] = {}
-        if conley_root is not None:
-            extra_env = {
-                "HF_HOME": _require_existing_dir(
-                    conley_root / "_cache" / "huggingface",
-                    label="HF cache root",
-                ),
-                "HF_HUB_OFFLINE": "1",
-                "OPENPI_DATA_HOME": _require_existing_dir(
-                    conley_root / "_cache" / "openpi",
-                    label="OpenPI cache root",
-                ),
-            }
-            if not python_executable:
-                python_executable = _require_existing_executable(
-                    conley_root / "_envs" / "openpi-runtime" / "bin" / "python",
-                    label="runtime python",
-                )
-        elif python_executable:
+        if python_executable:
             python_executable = _require_existing_executable(
                 Path(python_executable),
                 label="runtime python",
             )
+        else:
+            env_root = (os.environ.get("PFS_RUNTIME_ENV_ROOT") or "").strip()
+            if not env_root:
+                raise RuntimeError("PFS_RUNTIME_ENV_ROOT is required for OpenPI FAST runtime")
+            python_executable = validate_runtime_env_layout(
+                env_root,
+                require_host_python=True,
+            ).host_python
         return cls(
-            python_executable=python_executable or sys.executable,
+            python_executable=python_executable,
             worker_module=os.environ.get(
                 "MINT_OPENPI_FAST_WORKER_MODULE",
                 "tinker_server.backend.openpi_fast_worker",
@@ -145,8 +127,7 @@ class OpenPIFastRuntimeSpec:
             load_weights_timeout_s=float(
                 os.environ.get("MINT_OPENPI_FAST_LOAD_TIMEOUT_S", str(request_timeout_s))
             ),
-            cwd=os.environ.get("MINT_OPENPI_FAST_CWD") or None,
-            extra_env=extra_env,
+            cwd=os.environ.get("MINT_OPENPI_FAST_CWD") or str(mint_root),
         )
 
     def build_env(self) -> dict[str, str]:

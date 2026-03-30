@@ -4,7 +4,6 @@ Endpoints:
 - GET /healthz: Health check
 - POST /create_session: Create a new session
 - POST /create_sampling_session: Create a sampling session with dedicated engine
-- POST /create_action_session: Create an action session for action inference
 - GET /sessions: List sessions
 - GET /sessions/{session_id}: Get session details
 - GET /samplers/{sampler_id}: Get sampler details
@@ -39,8 +38,6 @@ from ..backend.session_heartbeat_store import session_heartbeat_store
 from ..health_checks import public_healthz_response
 from ..model_access_control import can_access_model, get_access_denied_error
 from ..models.types import (
-    CreateActionSessionRequest,
-    CreateActionSessionResponse,
     CreateSamplingSessionRequest,
     CreateSamplingSessionResponse,
     CreateSessionRequest,
@@ -66,7 +63,6 @@ sessions: dict[str, dict] = {}
 
 # Global session manager reference (set by app lifespan)
 session_manager: SessionManager | None = None
-action_session_manager: object | None = None
 
 
 def _get_user_data(request: Request) -> dict | None:
@@ -477,43 +473,6 @@ async def _create_sampling_session_impl(
     _write_sampler_index(sampling_session_id)
 
     return CreateSamplingSessionResponse(sampling_session_id=sampling_session_id)
-
-
-@router.post("/create_action_session")
-async def create_action_session(
-    request: CreateActionSessionRequest,
-    http_request: Request,
-) -> CreateActionSessionResponse:
-    """Create an action inference session.
-
-    Action inference sessions are distinct from text sampling sessions.
-    """
-    if action_session_manager is None:
-        raise HTTPException(status_code=503, detail="Action session manager not initialized")
-
-    user_id = _get_user_id(http_request)
-    base_model = request.base_model
-    if not base_model and request.model_path:
-        base_model = _infer_base_model_from_checkpoint(request.model_path, user_id=user_id)
-    if not base_model:
-        raise HTTPException(status_code=422, detail="base_model is required")
-
-    from ..supported_models_gate import enforce_base_model_allowed
-
-    base_model = await enforce_base_model_allowed(base_model=base_model, http_request=http_request)
-
-    user_data = _get_user_data(http_request)
-    if not can_access_model(base_model, user_data):
-        raise HTTPException(status_code=403, detail=get_access_denied_error(base_model))
-
-    action_session_id = await action_session_manager.create_session(  # type: ignore[attr-defined]
-        session_id=request.session_id,
-        action_session_seq_id=request.action_session_seq_id,
-        base_model=base_model,
-        model_path=request.model_path,
-        user_id=user_id,
-    )
-    return CreateActionSessionResponse(action_session_id=str(action_session_id))
 
 
 @router.post("/create_sampling_session")

@@ -52,3 +52,25 @@ class ForwardBackwardReverseKLResponse(MintBaseModel):
     outputs: list[ReverseKLItemOutput]
     metrics: dict[str, float]
     type: Literal["mint_forward_backward_reverse_kl"] = "mint_forward_backward_reverse_kl"
+
+
+class MintCreateActionSessionRequest(MintBaseModel):
+    session_id: str
+    action_session_seq_id: int | None = None
+    base_model: str | None = None
+    model_path: str | None = None
+
+
+class MintCreateActionSessionResponse(MintBaseModel):
+    action_session_id: str
+
+
+class MintActRequest(MintBaseModel):
+    seq_id: int | None = None
+    observation: ModelInput
+    extra_inputs: dict[str, TensorData] = {}
+
+
+class MintDeleteActionSessionResponse(MintBaseModel):
+    action_session_id: str
+    status: Literal["deleted"] = "deleted"

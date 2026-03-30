@@ -58,6 +58,7 @@ def test_build_runtime_pythonpath_uses_canonical_root(tmp_path):
     assert str(env_root / "src" / "Megatron-Bridge" / "src") in parts
     assert str(env_root / "src" / "Megatron-Bridge") in parts
     assert str(env_root / "src" / "verl") in parts
+    assert str(env_root / "src" / "openpi" / "src") in parts
     assert str(env_root / "src" / "Megatron-LM") in parts
     assert parts[-2] == "/vePFS/code/yiwen/tinker-server"
     assert parts[-1] == "/vePFS/hf/modules"
@@ -175,6 +176,12 @@ def test_runtime_env_layout_tracks_host_only_pythonpaths():
             expected.append(f"/tmp/runtime/src/{source['name']}{suffix}")
     layout = checkout_runtime_env_layout("/tmp/runtime")
     assert list(layout.host_pythonpath_entries) == expected
+
+
+def test_runtime_env_layout_includes_openpi_source_checkout():
+    layout = checkout_runtime_env_layout("/tmp/runtime")
+
+    assert str(Path("/tmp/runtime/src/openpi/src")) in layout.pythonpath_entries
 
 
 def test_build_runtime_env_normalizes_host_only_vllm_source_metadata(tmp_path):

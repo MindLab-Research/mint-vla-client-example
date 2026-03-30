@@ -33,6 +33,7 @@ class _StubFutureStore:
 class _StubCapacityManager:
     def __init__(self) -> None:
         self.calls: list[dict] = []
+        self.released: list[str] = []
 
     async def async_try_reserve(self, request_id: str, *, queue_bytes: int, object_store_bytes: int) -> dict:
         self.calls.append(
@@ -45,7 +46,7 @@ class _StubCapacityManager:
         return {"ok": True}
 
     async def async_release_all(self, request_id: str) -> None:
-        return None
+        self.released.append(request_id)
 
 
 class _StubQueue:
@@ -72,6 +73,68 @@ class _StubQueue:
                 "extra": extra,
             }
         )
+
+
+def test_mint_action_route_cleans_up_future_when_enqueue_fails(monkeypatch) -> None:
+    from tinker_server.routes import mint as mint_routes
+
+    future_store = _StubFutureStore()
+    capacity = _StubCapacityManager()
+
+    class _ExplodingQueue:
+        async def enqueue(
+            self,
+            *,
+            request_id: str,
+            op: str,
+            request_json: bytes,
+            user_id: str | None,
+            webhook_url: str | None,
+            extra: dict | None = None,
+        ) -> None:
+            _ = request_id, op, request_json, user_id, webhook_url, extra
+            raise RuntimeError("queue unavailable")
+
+    monkeypatch.setattr(mint_routes, "future_store", future_store, raising=False)
+    monkeypatch.setattr(mint_routes, "action_session_manager", object(), raising=False)
+
+    import tinker_server.backend.capacity_manager as capacity_module
+    import tinker_server.backend.api_work_queue as queue_module
+
+    monkeypatch.setattr(capacity_module, "capacity_manager", capacity)
+    monkeypatch.setattr(queue_module, "api_work_queue", _ExplodingQueue())
+
+    app = FastAPI()
+    app.include_router(mint_routes.router, prefix="/api/v1/mint")
+    client = TestClient(app)
+
+    resp = client.post(
+        "/api/v1/mint/action_sessions/action-session-1/act",
+        json={
+            "observation": {
+                "chunks": [
+                    {
+                        "type": "image",
+                        "data": "aW1n",
+                        "format": "png",
+                        "expected_tokens": 256,
+                    }
+                ]
+            },
+            "extra_inputs": {
+                "state": {
+                    "data": [0.0] * 8,
+                    "shape": [8],
+                    "dtype": "float32",
+                }
+            },
+        },
+    )
+
+    assert resp.status_code == 503, resp.text
+    assert len(future_store.created) == 1
+    assert future_store.cleaned == future_store.created
+    assert capacity.released == future_store.created
 
 
 def test_mint_interpolate_route_enqueues_expected_request(monkeypatch) -> None:

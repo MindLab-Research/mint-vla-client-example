@@ -819,10 +819,10 @@ async def lifespan(app: FastAPI):
     training.training_manager = train_manager
     training.training_engine = train_engine
     training.inference_manager = inference_manager  # For ephemeral save flow
-    service.action_session_manager = action_manager
     action_sampling.action_session_manager = action_manager
     mint.training_manager = train_manager
     mint.training_engine = train_engine
+    mint.action_session_manager = action_manager
 
     # Weights router also needs training components and inference manager
     weights.training_manager = train_manager
@@ -860,6 +860,7 @@ async def lifespan(app: FastAPI):
     from .backend.api_work_queue import api_work_queue
     from .backend.capacity_manager import capacity_manager
     from .models.types import (
+        ActRequest,
         ComputeLogprobsRequest,
         CreateModelFromStateRequest,
         CreateModelRequest,
@@ -1182,6 +1183,20 @@ async def lifespan(app: FastAPI):
             attributes={"queue.stage": "queue.stage.mint.forward_backward_reverse_kl"},
         )
 
+    async def _exec_mint_action_act(item):
+        async def _run():
+            req = ActRequest.model_validate_json(item.request_json)
+            await action_sampling._do_act(item.request_id, req)
+
+        await run_async_with_otel_span(
+            "queue.stage.mint.action.act",
+            _run,
+            component="api_work_queue",
+            op=str(item.op),
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.mint.action.act"},
+        )
+
     api_work_queue.set_executor("sampling.asample", _exec_sampling_asample)
     api_work_queue.set_executor("sampling.compute_logprobs", _exec_sampling_compute_logprobs)
     api_work_queue.set_executor("training.create_model", _exec_training_create_model)
@@ -1199,6 +1214,7 @@ async def lifespan(app: FastAPI):
     api_work_queue.set_executor("internal.noop", _exec_internal_noop)
     api_work_queue.set_executor("mint.interpolate_checkpoints", _exec_mint_interpolate_checkpoints)
     api_work_queue.set_executor("mint.forward_backward_reverse_kl", _exec_mint_forward_backward_reverse_kl)
+    api_work_queue.set_executor("mint.action.act", _exec_mint_action_act)
 
     await api_work_queue.start_workers(num_workers=int(config.api_work_queue_num_workers))
 

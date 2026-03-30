@@ -1,5 +1,16 @@
 # Using OpenPI Models Through a Tinker-Style API
 
+This file is a historical design sketch, not the current normative contract.
+
+Current normative sources are:
+
+- `docs/mint-openpi-vla-target.md`
+- `docs/README.md`
+- `docs/sub-targets/*.md`
+- the verified toolkit stage-local scripts under `src/mindlab-toolkit/examples/`
+
+This guide still contains pre-`train_step` and pre-MintX action-boundary examples. Until it is rewritten to match the current docs, do not use it as merge-readiness evidence or as the final interaction contract.
+
 This document is for users who already know the OpenPI workflow and want to understand what Mint is trying to preserve and what it is trying to improve. The goal is not to replace OpenPI's model logic or claim that the original repo workflow is wrong. The goal is to expose the same model families through a service-style API that is easier to integrate into larger training and deployment systems.
 
 The code examples below describe the intended Mint client surface (Tinker-style). The user entrypoint is `import mint` (provided by `src/mindlab-toolkit`), which re-exports a Tinker-compatible client plus a Mint-owned action inference client.

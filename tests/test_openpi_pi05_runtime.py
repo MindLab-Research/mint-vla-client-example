@@ -160,9 +160,13 @@ def test_openpi_pi05_engine_create_training_session_starts_runtime(monkeypatch) 
     assert factory.clients[0].calls[0][0] == "create_session"
 
 
-def test_openpi_pi05_default_runtime_factory_uses_shared_ray_runtime(monkeypatch) -> None:
+def test_openpi_pi05_default_runtime_factory_uses_shared_ray_runtime(
+    monkeypatch,
+    configure_runtime_env,
+) -> None:
     from tinker_server.backend.openpi_pi05_training import _default_runtime_factory
 
+    configure_runtime_env()
     calls: list[dict[str, object]] = []
 
     async def _fake_start_openpi_shared_ray_runtime(*, session, spec, config_name, model_config):

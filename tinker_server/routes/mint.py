@@ -21,17 +21,24 @@ from ..checkpoints import (
 )
 from ..client_compat import checkpoint_uri
 from ..logging_context import classify_failure_reason, set_request_id
+from ..model_access_control import can_access_model, get_access_denied_error
 from ..models.mint_types import (
     ForwardBackwardReverseKLRequest,
     InterpolateCheckpointsRequest,
+    MintActRequest,
+    MintCreateActionSessionRequest,
+    MintCreateActionSessionResponse,
+    MintDeleteActionSessionResponse,
 )
-from ..models.types import UntypedAPIFuture
+from ..models.types import ActRequest, UntypedAPIFuture
+from .service import _infer_base_model_from_checkpoint
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 training_manager = None
 training_engine = None
+action_session_manager = None
 
 
 def _get_user_data(request: Request) -> dict | None:
@@ -75,6 +82,106 @@ def _reverse_kl_token_stats(data: list) -> tuple[int, int]:
             len(ref_tokens) + int(target_shape[0]) - 1,
         )
     return total_tokens, max_seq_len
+
+
+@router.post("/action_sessions", response_model=MintCreateActionSessionResponse)
+async def create_action_session(
+    request: MintCreateActionSessionRequest,
+    http_request: Request,
+) -> MintCreateActionSessionResponse:
+    if action_session_manager is None:
+        raise HTTPException(status_code=503, detail="Action session manager not initialized")
+
+    user_id = _get_user_id(http_request)
+    base_model = request.base_model
+    if not base_model and request.model_path:
+        base_model = _infer_base_model_from_checkpoint(request.model_path, user_id=user_id)
+    if not base_model:
+        raise HTTPException(status_code=422, detail="base_model is required")
+
+    from ..supported_models_gate import enforce_base_model_allowed
+
+    base_model = await enforce_base_model_allowed(base_model=base_model, http_request=http_request)
+
+    user_data = _get_user_data(http_request)
+    if not can_access_model(base_model, user_data):
+        raise HTTPException(status_code=403, detail=get_access_denied_error(base_model))
+
+    action_session_id = await action_session_manager.create_session(  # type: ignore[attr-defined]
+        session_id=request.session_id,
+        action_session_seq_id=request.action_session_seq_id,
+        base_model=base_model,
+        model_path=request.model_path,
+        user_id=user_id,
+    )
+    return MintCreateActionSessionResponse(action_session_id=str(action_session_id))
+
+
+@router.post("/action_sessions/{action_session_id}/act", response_model=UntypedAPIFuture)
+async def act(
+    action_session_id: str,
+    request: MintActRequest,
+    http_request: Request,
+) -> UntypedAPIFuture:
+    if "state" not in request.extra_inputs:
+        raise HTTPException(status_code=400, detail="extra_inputs.state is required")
+    if action_session_manager is None:
+        raise HTTPException(status_code=503, detail="Action session manager not initialized")
+
+    from ..backend.api_work_queue import api_work_queue
+    from ..backend.capacity_manager import capacity_manager
+    from ..backend.result_size_estimator import estimate_small_result_bytes
+
+    queued_request = ActRequest(
+        action_session_id=action_session_id,
+        seq_id=request.seq_id,
+        observation=request.observation,
+        extra_inputs=request.extra_inputs,
+    )
+    request_json = queued_request.model_dump_json().encode("utf-8")
+    request_id = f"act_{uuid.uuid4().hex}"
+    reserve = await capacity_manager.async_try_reserve(
+        request_id,
+        queue_bytes=len(request_json),
+        object_store_bytes=estimate_small_result_bytes(),
+    )
+    if not bool(reserve.get("ok")):
+        raise HTTPException(
+            status_code=429,
+            detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
+        )
+
+    created = False
+    try:
+        await future_store.async_create_with_id(request_id)
+        created = True
+        await future_store.async_mark_queued(
+            request_id,
+            meta={"op": "mint.action.act", "action_session_id": action_session_id},
+        )
+        await api_work_queue.enqueue(
+            request_id=request_id,
+            op="mint.action.act",
+            request_json=request_json,
+            user_id=_get_user_id(http_request),
+            webhook_url=None,
+        )
+    except Exception as e:
+        await capacity_manager.async_release_all(request_id)
+        if created:
+            await future_store.async_cleanup(request_id)
+        raise HTTPException(status_code=503, detail=f"Failed to enqueue action act request: {e}")
+
+    return UntypedAPIFuture(request_id=request_id)
+
+
+@router.delete("/action_sessions/{action_session_id}", response_model=MintDeleteActionSessionResponse)
+async def delete_action_session(action_session_id: str) -> MintDeleteActionSessionResponse:
+    if action_session_manager is None:
+        raise HTTPException(status_code=503, detail="Action session manager not initialized")
+
+    await action_session_manager.shutdown_session(action_session_id)  # type: ignore[attr-defined]
+    return MintDeleteActionSessionResponse(action_session_id=action_session_id)
 
 
 @router.post("/checkpoints/interpolate", response_model=UntypedAPIFuture)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -167,9 +168,13 @@ def test_openpi_fast_engine_create_training_session_starts_runtime() -> None:
     assert factory.clients[0].calls[0][0] == "create_session"
 
 
-def test_openpi_fast_default_runtime_factory_uses_shared_ray_runtime(monkeypatch) -> None:
+def test_openpi_fast_default_runtime_factory_uses_shared_ray_runtime(
+    monkeypatch,
+    configure_runtime_env,
+) -> None:
     from tinker_server.backend.openpi_fast_training import _default_runtime_factory
 
+    runtime_env = configure_runtime_env()
     calls: list[dict[str, object]] = []
 
     async def _fake_start_openpi_shared_ray_runtime(*, session, spec, config_name, model_config):
@@ -178,6 +183,7 @@ def test_openpi_fast_default_runtime_factory_uses_shared_ray_runtime(monkeypatch
                 "model_id": session.model_id,
                 "worker_module": spec.worker_module,
                 "python_executable": spec.python_executable,
+                "pythonpath": spec.pythonpath,
                 "config_name": config_name,
                 "action_dim": model_config.action_dim,
                 "action_horizon": model_config.action_horizon,
@@ -211,7 +217,8 @@ def test_openpi_fast_default_runtime_factory_uses_shared_ray_runtime(monkeypatch
         {
             "model_id": "model-1",
             "worker_module": "tinker_server.backend.openpi_fast_worker",
-            "python_executable": os.environ.get("MINT_OPENPI_FAST_PYTHON") or os.sys.executable,
+            "python_executable": str(runtime_env["layout"].host_python),
+            "pythonpath": runtime_env["pythonpath"],
             "config_name": "pi0_fast_libero_low_mem_finetune",
             "action_dim": 32,
             "action_horizon": 10,
@@ -221,8 +228,11 @@ def test_openpi_fast_default_runtime_factory_uses_shared_ray_runtime(monkeypatch
 
 def test_openpi_fast_engine_create_training_session_surfaces_ray_start_failure_without_local_fallback(
     monkeypatch,
+    configure_runtime_env,
 ) -> None:
     from tinker_server.backend.openpi_fast_training import OpenPIFastTrainingEngine
+
+    configure_runtime_env()
 
     async def _failing_start_openpi_shared_ray_runtime(*, session, spec, config_name, model_config):
         _ = session, spec, config_name, model_config
@@ -402,9 +412,13 @@ def test_openpi_fast_engine_save_load_and_shutdown_delegate_to_runtime() -> None
     ]
 
 
-def test_openpi_fast_runtime_spec_reads_operation_specific_timeouts(monkeypatch) -> None:
+def test_openpi_fast_runtime_spec_reads_operation_specific_timeouts(
+    monkeypatch,
+    configure_runtime_env,
+) -> None:
     from tinker_server.backend.openpi_fast_runtime import OpenPIFastRuntimeSpec
 
+    configure_runtime_env()
     monkeypatch.setenv("MINT_OPENPI_FAST_CREATE_SESSION_TIMEOUT_S", "900")
     monkeypatch.setenv("MINT_OPENPI_FAST_SAVE_TIMEOUT_S", "1200")
     monkeypatch.setenv("MINT_OPENPI_FAST_LOAD_TIMEOUT_S", "1500")
@@ -416,86 +430,52 @@ def test_openpi_fast_runtime_spec_reads_operation_specific_timeouts(monkeypatch)
     assert spec.load_weights_timeout_s == 1500.0
 
 
-def test_openpi_fast_runtime_spec_uses_canonical_conley_paths(monkeypatch, tmp_path) -> None:
+def test_openpi_fast_runtime_spec_uses_runtime_env_contract(
+    configure_runtime_env,
+) -> None:
     from tinker_server.backend.openpi_fast_runtime import OpenPIFastRuntimeSpec
 
-    conley_root = tmp_path / "conley"
-    tinker_root = conley_root / "tinker-server"
-    openpi_src = conley_root / "openpi" / "src"
-    hf_home = conley_root / "_cache" / "huggingface"
-    openpi_cache = conley_root / "_cache" / "openpi"
-    worker_python = conley_root / "_envs" / "openpi-runtime" / "bin" / "python"
-    worker_python_target = conley_root / "_envs" / "python-bin" / "python3.12"
-
-    for path in (tinker_root, openpi_src, hf_home, openpi_cache, worker_python.parent, worker_python_target.parent):
-        path.mkdir(parents=True, exist_ok=True)
-    worker_python_target.write_text("#!/bin/sh\n")
-    worker_python_target.chmod(0o755)
-    worker_python.symlink_to(worker_python_target)
-
-    monkeypatch.setenv("PFS_TINKER_PATH", str(tinker_root))
-    monkeypatch.delenv("MINT_OPENPI_FAST_PYTHON", raising=False)
+    runtime_env = configure_runtime_env()
 
     spec = OpenPIFastRuntimeSpec.from_env()
     env = spec.build_env()
 
-    assert spec.python_executable == str(worker_python)
-    assert spec.pythonpath == (str(tinker_root.resolve()), str(openpi_src.resolve()))
-    assert env["HF_HOME"] == str(hf_home.resolve())
+    assert spec.python_executable == str(runtime_env["layout"].host_python)
+    assert spec.pythonpath == runtime_env["pythonpath"]
+    assert str(Path(runtime_env["env_root"]) / "src" / "openpi" / "src") in spec.pythonpath
+    assert spec.cwd == str(Path(runtime_env["tinker_root"]).resolve())
+    assert env["PYTHONPATH"] == os.pathsep.join(runtime_env["pythonpath"])
+    assert env["HF_HOME"] == str(Path(runtime_env["hf_home"]).resolve())
     assert env["HF_HUB_OFFLINE"] == "1"
-    assert env["OPENPI_DATA_HOME"] == str(openpi_cache.resolve())
+    assert env["OPENPI_DATA_HOME"] == str(Path(runtime_env["openpi_data_home"]).resolve())
 
 
 def test_openpi_fast_runtime_build_env_does_not_inherit_parent_pythonpath(
-    monkeypatch, tmp_path
+    monkeypatch,
+    configure_runtime_env,
 ) -> None:
     from tinker_server.backend.openpi_fast_runtime import OpenPIFastRuntimeSpec
 
-    conley_root = tmp_path / "conley"
-    tinker_root = conley_root / "tinker-server"
-    openpi_src = conley_root / "openpi" / "src"
-    hf_home = conley_root / "_cache" / "huggingface"
-    openpi_cache = conley_root / "_cache" / "openpi"
-    worker_python = conley_root / "_envs" / "openpi-runtime" / "bin" / "python"
-
-    for path in (tinker_root, openpi_src, hf_home, openpi_cache, worker_python.parent):
-        path.mkdir(parents=True, exist_ok=True)
-    worker_python.write_text("#!/bin/sh\n")
-    worker_python.chmod(0o755)
-
-    monkeypatch.setenv("PFS_TINKER_PATH", str(tinker_root))
+    runtime_env = configure_runtime_env()
     monkeypatch.setenv(
         "PYTHONPATH",
         "/vePFS-Mindverse/share/code/tinker-server-auth/.venv31213/lib/python3.12/site-packages",
     )
-    monkeypatch.delenv("MINT_OPENPI_FAST_PYTHON", raising=False)
 
     spec = OpenPIFastRuntimeSpec.from_env()
     env = spec.build_env()
 
-    assert env["PYTHONPATH"] == os.pathsep.join(
-        (str(tinker_root.resolve()), str(openpi_src.resolve()))
-    )
+    assert env["PYTHONPATH"] == os.pathsep.join(runtime_env["pythonpath"])
 
 
-def test_openpi_fast_runtime_spec_rejects_missing_canonical_runtime_python(
-    monkeypatch, tmp_path
+def test_openpi_fast_runtime_spec_rejects_incomplete_runtime_env_layout(
+    configure_runtime_env,
 ) -> None:
     from tinker_server.backend.openpi_fast_runtime import OpenPIFastRuntimeSpec
 
-    conley_root = tmp_path / "conley"
-    tinker_root = conley_root / "tinker-server"
-    openpi_src = conley_root / "openpi" / "src"
-    hf_home = conley_root / "_cache" / "huggingface"
-    openpi_cache = conley_root / "_cache" / "openpi"
+    configure_runtime_env(with_host_python=False)
 
-    for path in (tinker_root, openpi_src, hf_home, openpi_cache):
-        path.mkdir(parents=True, exist_ok=True)
-
-    monkeypatch.setenv("PFS_TINKER_PATH", str(tinker_root))
-    monkeypatch.delenv("MINT_OPENPI_FAST_PYTHON", raising=False)
-
-    with pytest.raises(FileNotFoundError, match="_envs/openpi-runtime/bin/python"):
+    with pytest.raises(RuntimeError, match="host-venv/bin/python"):
         OpenPIFastRuntimeSpec.from_env()
 
 
