@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -113,6 +114,210 @@ class _FakeActionRuntimeFactory:
         client = _FakeActionRuntimeClient()
         self.clients.append(client)
         return client
+
+
+def test_openpi_fast_default_runtime_factory_uses_action_ray_runtime(
+    monkeypatch,
+    configure_runtime_env,
+) -> None:
+    from tinker_server.backend.action_session_manager import _default_runtime_factory
+
+    runtime_env = configure_runtime_env()
+    calls: list[dict[str, object]] = []
+
+    async def _fake_start_openpi_action_ray_runtime(*, action_session_id: str, base_model: str, spec):
+        calls.append(
+            {
+                "action_session_id": action_session_id,
+                "base_model": base_model,
+                "worker_module": spec.worker_module,
+                "python_executable": spec.python_executable,
+                "pythonpath": spec.pythonpath,
+            }
+        )
+        return "action-ray-runtime-client"
+
+    async def _unexpected_local_fast_start(spec=None):
+        raise AssertionError(f"local fast action worker path must not run: {spec}")
+
+    async def _unexpected_local_worker_start(spec):
+        raise AssertionError(f"local worker path must not run: {spec.worker_module}")
+
+    monkeypatch.setattr(
+        "tinker_server.backend.action_session_manager.start_openpi_action_ray_runtime",
+        _fake_start_openpi_action_ray_runtime,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "tinker_server.backend.openpi_fast_action_runtime.OpenPIFastActionWorkerClient.start",
+        _unexpected_local_fast_start,
+    )
+    monkeypatch.setattr(
+        "tinker_server.backend.openpi_fast_runtime.OpenPIFastWorkerClient.start",
+        _unexpected_local_worker_start,
+    )
+
+    runtime = asyncio.run(
+        _default_runtime_factory(
+            action_session_id="session-1:action:3",
+            base_model=OPENPI_FAST_MODEL,
+            checkpoint_path="/tmp/export-1",
+            model_config=SimpleNamespace(action_dim=7, action_horizon=10, max_model_len=180),
+            config_name="pi0_fast_libero_low_mem_finetune",
+        )
+    )
+
+    assert runtime == "action-ray-runtime-client"
+    assert calls == [
+        {
+            "action_session_id": "session-1:action:3",
+            "base_model": OPENPI_FAST_MODEL,
+            "worker_module": "tinker_server.backend.openpi_fast_action_worker",
+            "python_executable": str(runtime_env["layout"].host_python),
+            "pythonpath": runtime_env["pythonpath"],
+        }
+    ]
+
+
+def test_openpi_pi05_default_runtime_factory_uses_action_ray_runtime(
+    monkeypatch,
+    configure_runtime_env,
+) -> None:
+    from tinker_server.backend.action_session_manager import _default_pi05_runtime_factory
+
+    runtime_env = configure_runtime_env()
+    calls: list[dict[str, object]] = []
+
+    async def _fake_start_openpi_action_ray_runtime(*, action_session_id: str, base_model: str, spec):
+        calls.append(
+            {
+                "action_session_id": action_session_id,
+                "base_model": base_model,
+                "worker_module": spec.worker_module,
+                "python_executable": spec.python_executable,
+                "pythonpath": spec.pythonpath,
+            }
+        )
+        return "action-ray-runtime-client"
+
+    async def _unexpected_local_fast_start(spec=None):
+        raise AssertionError(f"local pi0.5 action worker path must not run: {spec}")
+
+    async def _unexpected_local_worker_start(spec):
+        raise AssertionError(f"local worker path must not run: {spec.worker_module}")
+
+    monkeypatch.setattr(
+        "tinker_server.backend.action_session_manager.start_openpi_action_ray_runtime",
+        _fake_start_openpi_action_ray_runtime,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "tinker_server.backend.openpi_fast_action_runtime.OpenPIFastActionWorkerClient.start",
+        _unexpected_local_fast_start,
+    )
+    monkeypatch.setattr(
+        "tinker_server.backend.openpi_fast_runtime.OpenPIFastWorkerClient.start",
+        _unexpected_local_worker_start,
+    )
+
+    runtime = asyncio.run(
+        _default_pi05_runtime_factory(
+            action_session_id="session-1:action:9",
+            base_model="openpi/pi05-libero-low-mem-finetune",
+            checkpoint_path="/tmp/export-9",
+            model_config=SimpleNamespace(action_dim=7, action_horizon=10, max_model_len=180),
+            config_name="pi05_libero",
+        )
+    )
+
+    assert runtime == "action-ray-runtime-client"
+    assert calls == [
+        {
+            "action_session_id": "session-1:action:9",
+            "base_model": "openpi/pi05-libero-low-mem-finetune",
+            "worker_module": "tinker_server.backend.openpi_pi05_action_worker",
+            "python_executable": str(runtime_env["layout"].host_python),
+            "pythonpath": runtime_env["pythonpath"],
+        }
+    ]
+
+
+def test_start_openpi_action_ray_runtime_registers_actor_metadata_in_resource_pool(monkeypatch) -> None:
+    from tinker_server.backend import openpi_action_ray_runtime
+    from tinker_server.backend.openpi_fast_action_runtime import OpenPIFastActionRuntimeSpec
+
+    state: dict[str, object] = {}
+
+    class _FakeActorBuilder:
+        def options(self, **kwargs):
+            state["options"] = kwargs
+            return self
+
+        def remote(self, **kwargs):
+            state["remote"] = kwargs
+            return "actor-1"
+
+    class _FakeClient:
+        def __init__(self, *, actor, actor_name, spec, action_session_id, ready_timeout_s):
+            state["client_init"] = {
+                "actor": actor,
+                "actor_name": actor_name,
+                "action_session_id": action_session_id,
+                "ready_timeout_s": ready_timeout_s,
+                "worker_module": spec.worker_module,
+            }
+
+        async def ready(self):
+            return {
+                "actor_id": "actor-123",
+                "node_id": "node-456",
+                "node_ip": "192.168.0.8",
+                "pid": 999,
+                "cuda_visible_devices": "0",
+                "action_session_id": "session-1:action:3",
+            }
+
+        async def close(self):
+            return None
+
+    class _FakePool:
+        def register(self, **kwargs):
+            state["register"] = kwargs
+
+        def mark_ready(self, actor_name):
+            state["mark_ready"] = actor_name
+
+        def touch(self, actor_name):
+            state["touch"] = actor_name
+
+    monkeypatch.setattr(openpi_action_ray_runtime, "ensure_openpi_ray_initialized", lambda: None)
+    monkeypatch.setattr(openpi_action_ray_runtime, "OpenPIActionRayRuntimeActor", _FakeActorBuilder())
+    monkeypatch.setattr(openpi_action_ray_runtime, "OpenPIActionRayRuntimeClient", _FakeClient)
+    monkeypatch.setattr(openpi_action_ray_runtime, "get_resource_pool", lambda: _FakePool())
+
+    client = asyncio.run(
+        openpi_action_ray_runtime.start_openpi_action_ray_runtime(
+            action_session_id="session-1:action:3",
+            base_model=OPENPI_FAST_MODEL,
+            spec=OpenPIFastActionRuntimeSpec(
+                python_executable="/tmp/runtime/host-venv/bin/python",
+                worker_module="tinker_server.backend.openpi_fast_action_worker",
+                pythonpath=("/tmp/runtime/site-packages", "/tmp/runtime/src/openpi/src"),
+            ),
+        )
+    )
+
+    assert isinstance(client, _FakeClient)
+    register = state["register"]
+    assert register["actor_type"].value == "openpi"
+    assert register["base_model"] == OPENPI_FAST_MODEL
+    assert register["session_id"] == "session-1:action:3"
+    assert register["node_id"] == "node-456"
+    assert register["metadata"]["worker_module"] == "tinker_server.backend.openpi_fast_action_worker"
+    assert register["metadata"]["actor_id"] == "actor-123"
+    assert register["metadata"]["node_ip"] == "192.168.0.8"
+    assert register["metadata"]["pid"] == 999
+    assert register["metadata"]["cuda_visible_devices"] == "0"
 
 
 def test_openpi_fast_save_weights_for_sampler_exports_policy_loadable_checkpoint(tmp_path: Path) -> None:

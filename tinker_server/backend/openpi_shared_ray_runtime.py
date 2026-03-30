@@ -89,6 +89,32 @@ def clear_openpi_shared_runtime_pool() -> None:
             pass
 
 
+def _drop_shared_actor_entry(actor_name: str) -> _SharedActorEntry | None:
+    with _SHARED_POOL_LOCK:
+        return _SHARED_ACTORS.pop(actor_name, None)
+
+
+async def _cleanup_failed_shared_actor_start(*, actor_name: str, actor: Any) -> list[str]:
+    errors: list[str] = []
+    get_resource_pool().unregister(actor_name)
+    if not ray.is_initialized():
+        return errors
+
+    try:
+        await asyncio.to_thread(ray.get, actor.shutdown.remote(), timeout=5.0)
+    except Exception as exc:
+        errors.append(
+            f"OpenPI shared actor shutdown failed for {actor_name}: {type(exc).__name__}: {exc}"
+        )
+    try:
+        await asyncio.to_thread(ray.kill, actor, no_restart=True)
+    except Exception as exc:
+        errors.append(
+            f"OpenPI shared actor kill failed for {actor_name}: {type(exc).__name__}: {exc}"
+        )
+    return errors
+
+
 class OpenPISharedRuntimeCore:
     def __init__(
         self,
@@ -494,7 +520,17 @@ async def start_openpi_shared_ray_runtime(
         session_id=str(session.model_id),
         ready_timeout_s=_actor_ready_timeout_s(spec),
     )
-    metadata = await client.ready()
+    try:
+        metadata = await client.ready()
+    except Exception as exc:
+        _drop_shared_actor_entry(actor_name)
+        cleanup_errors = await _cleanup_failed_shared_actor_start(
+            actor_name=actor_name,
+            actor=entry.actor,
+        )
+        for note in cleanup_errors:
+            exc.add_note(note)
+        raise
 
     with _SHARED_POOL_LOCK:
         current = _SHARED_ACTORS.get(actor_name)

@@ -99,6 +99,35 @@ async def _cleanup_stale_actors() -> None:
                     return model_name, cfg
             return "", None
 
+        def _openpi_shared_actor_diag(actor) -> tuple[str, str | None, str | None, dict[str, object]]:
+            diag = ray.get(actor.describe.remote(), timeout=10)
+            if not isinstance(diag, dict):
+                raise TypeError(
+                    f"openpi shared actor describe payload must be dict, got {type(diag)}"
+                )
+            pool_key = diag.get("pool_key")
+            if not isinstance(pool_key, dict):
+                raise TypeError(
+                    f"openpi shared actor pool_key must be dict, got {type(pool_key)}"
+                )
+            base_model = str(pool_key.get("base_model", "") or "")
+            session_id = diag.get("current_session_id")
+            node_id = diag.get("node_id")
+            metadata = {
+                "pool_key": dict(pool_key),
+                "worker_module": diag.get("worker_module") or pool_key.get("worker_module"),
+                "actor_id": diag.get("actor_id"),
+                "node_ip": diag.get("node_ip"),
+                "pid": diag.get("pid"),
+                "cuda_visible_devices": diag.get("cuda_visible_devices"),
+            }
+            return (
+                base_model,
+                str(session_id) if session_id else None,
+                str(node_id) if node_id else None,
+                metadata,
+            )
+
         # Get all named actors in the configured namespace
         actors = ray.util.list_named_actors(all_namespaces=True)
         tinker_actors = [a for a in actors if a.get("namespace") == PERSISTENT_NAMESPACE]
@@ -160,6 +189,10 @@ async def _cleanup_stale_actors() -> None:
                         )
                         return total or None
 
+                    session_id: str | None = None
+                    node_id: str | None = None
+                    metadata: dict[str, object] | None = None
+                    protected = False
                     if name.startswith("tinker_vllm_") or name.startswith("multinode_vllm_"):
                         actor_type = ActorType.VLLM
                         base_model = ""
@@ -206,12 +239,18 @@ async def _cleanup_stale_actors() -> None:
                                 f"Skipping restored Megatron actor with unknown GPU count: actor={name}"
                             )
                             continue
+                    elif name.startswith("openpi_shared_runtime_"):
+                        actor_type = ActorType.OPENPI
+                        num_gpus = 1
+                        base_model, session_id, node_id, metadata = _openpi_shared_actor_diag(actor)
                     else:
                         logger.debug(f"Unknown actor type for {name}, skipping registration")
                         continue
 
                     from tinker_server.backend.model_registry import is_persistent_model
 
+                    if actor_type in {ActorType.VLLM, ActorType.MEGATRON}:
+                        protected = bool(base_model and is_persistent_model(base_model))
                     resource_pool.register(
                         actor_name=name,
                         actor_type=actor_type,
@@ -219,7 +258,10 @@ async def _cleanup_stale_actors() -> None:
                         actor_handle=actor,
                         namespace=PERSISTENT_NAMESPACE,
                         base_model=base_model,
-                        protected=bool(base_model and is_persistent_model(base_model)),
+                        session_id=session_id,
+                        node_id=node_id,
+                        protected=protected,
+                        metadata=metadata,
                     )
                     # Mark as ready since the actor passed health check
                     resource_pool.mark_ready(name)
@@ -261,6 +303,10 @@ async def _cleanup_stale_actors() -> None:
                             )
                             return total or None
 
+                        session_id: str | None = None
+                        node_id: str | None = None
+                        metadata: dict[str, object] | None = {"startup_reconcile": "__ray_ready__timeout"}
+                        protected = False
                         if name.startswith("tinker_vllm_") or name.startswith("multinode_vllm_"):
                             actor_type = ActorType.VLLM
                             num_gpus: int | None = None
@@ -298,12 +344,20 @@ async def _cleanup_stale_actors() -> None:
                                     f"Skipping busy restored Megatron actor with unknown GPU count: actor={name}"
                                 )
                                 continue
+                        elif name.startswith("openpi_shared_runtime_"):
+                            actor_type = ActorType.OPENPI
+                            num_gpus = 1
+                            base_model, session_id, node_id, openpi_metadata = _openpi_shared_actor_diag(actor)
+                            metadata = dict(openpi_metadata)
+                            metadata["startup_reconcile"] = "__ray_ready__timeout"
                         else:
                             logger.debug(f"Unknown actor type for {name}, skipping registration")
                             continue
 
                         from tinker_server.backend.model_registry import is_persistent_model
 
+                        if actor_type in {ActorType.VLLM, ActorType.MEGATRON}:
+                            protected = bool(base_model and is_persistent_model(base_model))
                         resource_pool.register(
                             actor_name=name,
                             actor_type=actor_type,
@@ -311,8 +365,10 @@ async def _cleanup_stale_actors() -> None:
                             actor_handle=actor,
                             namespace=PERSISTENT_NAMESPACE,
                             base_model=base_model,
-                            protected=bool(base_model and is_persistent_model(base_model)),
-                            metadata={"startup_reconcile": "__ray_ready__timeout"},
+                            session_id=session_id,
+                            node_id=node_id,
+                            protected=protected,
+                            metadata=metadata,
                         )
                         registered += 1
                         logger.info(

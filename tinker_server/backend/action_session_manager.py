@@ -7,8 +7,8 @@ from typing import Any, Awaitable, Callable
 from ..checkpoints import get_checkpoints_dir, resolve_checkpoint_uri
 from ..models.types import ActRequest, ModelInput, TensorData
 from .model_registry import get_model_config
-from .openpi_fast_action_runtime import OpenPIFastActionWorkerClient
-from .openpi_fast_runtime import OpenPIFastRuntimeSpec, OpenPIFastWorkerClient
+from .openpi_action_ray_runtime import start_openpi_action_ray_runtime
+from .openpi_fast_action_runtime import OpenPIFastActionRuntimeSpec
 from .openpi_fast_training import (
     OPENPI_FAST_TRAINING_BACKEND,
     get_openpi_fast_config_name,
@@ -41,8 +41,12 @@ async def _default_runtime_factory(
     model_config: Any,
     config_name: str,
 ) -> Any:
-    del action_session_id, base_model, checkpoint_path, model_config, config_name
-    return await OpenPIFastActionWorkerClient.start()
+    del checkpoint_path, model_config, config_name
+    return await start_openpi_action_ray_runtime(
+        action_session_id=action_session_id,
+        base_model=base_model,
+        spec=OpenPIFastActionRuntimeSpec.from_env(),
+    )
 
 
 async def _default_pi05_runtime_factory(
@@ -53,12 +57,16 @@ async def _default_pi05_runtime_factory(
     model_config: Any,
     config_name: str,
 ) -> Any:
-    del action_session_id, base_model, checkpoint_path, model_config, config_name
+    del checkpoint_path, model_config, config_name
     spec = dataclasses.replace(
-        OpenPIFastRuntimeSpec.from_env(),
+        OpenPIFastActionRuntimeSpec.from_env(),
         worker_module="tinker_server.backend.openpi_pi05_action_worker",
     )
-    return await OpenPIFastWorkerClient.start(spec)
+    return await start_openpi_action_ray_runtime(
+        action_session_id=action_session_id,
+        base_model=base_model,
+        spec=spec,
+    )
 
 
 class OpenPIFastActionSessionManager:

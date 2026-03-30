@@ -93,6 +93,12 @@ class _StubSessionManager:
 
 
 class _StubTrainingManager:
+    def __init__(self, **_kwargs):
+        return None
+
+    async def start_cleanup_task(self, _engine) -> None:
+        return None
+
     async def shutdown_all(self, _engine) -> None:
         return None
 
@@ -129,6 +135,9 @@ def _install_lifespan_stubs(monkeypatch, queue: _StubApiWorkQueue) -> None:
     api_work_queue_module = importlib.import_module("tinker_server.backend.api_work_queue")
     future_store_module = importlib.import_module("tinker_server.backend.future_store")
     training_session_manager_module = importlib.import_module("tinker_server.backend.training_session_manager")
+    gateway_session_store_module = importlib.import_module("tinker_server.backend.gateway_session_store")
+    session_index_store_module = importlib.import_module("tinker_server.backend.session_index_store")
+    training_session_store_module = importlib.import_module("tinker_server.backend.training_session_store")
     checkpoints_module = importlib.import_module("tinker_server.checkpoints")
     gateway_module = importlib.import_module("tinker_server.gateway")
     usage_store_module = importlib.import_module("tinker_server.usage_store")
@@ -140,6 +149,9 @@ def _install_lifespan_stubs(monkeypatch, queue: _StubApiWorkQueue) -> None:
     monkeypatch.setattr(api_work_queue_module, "api_work_queue", queue)
     monkeypatch.setattr(future_store_module, "future_store", _StubFutureStore())
     monkeypatch.setattr(training_session_manager_module, "TrainingSessionManager", _StubTrainingManager)
+    monkeypatch.setattr(gateway_session_store_module, "ensure_ready", lambda: None)
+    monkeypatch.setattr(session_index_store_module, "ensure_ready", lambda: None)
+    monkeypatch.setattr(training_session_store_module, "ensure_ready", lambda: None)
     monkeypatch.setattr(checkpoints_module, "get_checkpoint_reap_interval_s", lambda: 3600.0)
     monkeypatch.setattr(checkpoints_module, "get_checkpoint_mirror_poll_s", lambda: 3600.0)
     monkeypatch.setattr(checkpoints_module, "reap_runtime_checkpoints", lambda: {})
@@ -196,6 +208,75 @@ async def test_prewarm_raises_when_inference_prewarm_fails(monkeypatch) -> None:
 
     with pytest.raises(RuntimeError, match="pinned worker full"):
         await app_module._prewarm_persistent_models(SimpleNamespace(), _FailingManager())
+
+
+@pytest.mark.anyio
+async def test_cleanup_stale_actors_registers_openpi_shared_actor(monkeypatch) -> None:
+    _install_fake_ray(monkeypatch)
+    from tinker_server.backend import multi_lora_engine
+
+    ray = sys.modules["ray"]
+    actor_name = "openpi_shared_runtime_deadbeef"
+    actor = SimpleNamespace(
+        __ray_ready__=SimpleNamespace(remote=lambda: "ready-ref"),
+        describe=SimpleNamespace(remote=lambda: "describe-ref"),
+    )
+    registered: dict[str, object] = {}
+
+    ray.is_initialized = lambda: True  # type: ignore[attr-defined]
+    ray.get_actor = lambda name, namespace=None: actor  # type: ignore[attr-defined]
+    ray.util.list_named_actors = lambda all_namespaces=True: [  # type: ignore[attr-defined]
+        {"name": actor_name, "namespace": multi_lora_engine.PERSISTENT_NAMESPACE}
+    ]
+
+    def _fake_ray_get(ref, *args, **kwargs):
+        _ = args, kwargs
+        if ref == "ready-ref":
+            return None
+        if ref == "describe-ref":
+            return {
+                "pool_key": {
+                    "base_model": "openpi/pi0-fast-libero-low-mem-finetune",
+                    "worker_module": "tinker_server.backend.openpi_fast_worker",
+                },
+                "actor_id": "actor-123",
+                "node_id": "node-456",
+                "node_ip": "192.168.0.8",
+                "pid": 999,
+                "cuda_visible_devices": "0",
+                "current_session_id": "session-a",
+            }
+        raise AssertionError(f"unexpected ray.get ref: {ref!r}")
+
+    ray.get = _fake_ray_get  # type: ignore[attr-defined]
+
+    resource_pool_module = importlib.import_module("tinker_server.backend.resource_pool")
+
+    class _FakePool:
+        def register(self, **kwargs):
+            registered["register"] = kwargs
+
+        def mark_ready(self, actor_name):
+            registered["mark_ready"] = actor_name
+
+    monkeypatch.setattr(resource_pool_module, "get_resource_pool", lambda: _FakePool())
+    monkeypatch.setattr(app_module.config, "skip_actor_cleanup", False)
+
+    await app_module._cleanup_stale_actors()
+
+    register = registered["register"]
+    assert register["actor_name"] == actor_name
+    assert register["actor_type"].value == "openpi"
+    assert register["num_gpus"] == 1
+    assert register["base_model"] == "openpi/pi0-fast-libero-low-mem-finetune"
+    assert register["session_id"] == "session-a"
+    assert register["node_id"] == "node-456"
+    assert register["metadata"]["pool_key"]["worker_module"] == "tinker_server.backend.openpi_fast_worker"
+    assert register["metadata"]["actor_id"] == "actor-123"
+    assert register["metadata"]["node_ip"] == "192.168.0.8"
+    assert register["metadata"]["pid"] == 999
+    assert register["metadata"]["cuda_visible_devices"] == "0"
+    assert registered["mark_ready"] == actor_name
 
 
 @pytest.mark.anyio
