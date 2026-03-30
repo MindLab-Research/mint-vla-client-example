@@ -290,17 +290,35 @@ def _is_missing_lora_path_error(exc: BaseException) -> bool:
         cur = cur.__cause__ if isinstance(cur.__cause__, BaseException) else None
 
     joined = "\n".join(text_candidates)
-    return any(
+    if any(
         marker in joined
         for marker in (
             "missing lora adapter path",
             "no adapter found for",
             "failed: no adapter found",
             "no path found for lora_int_id",
-            "adapter_model.safetensors",
-            "adapter_config.json",
+        )
+    ):
+        return True
+
+    has_missing_file_signal = any(
+        marker in joined
+        for marker in (
             "file not found",
             "no such file or directory",
+        )
+    )
+    if not has_missing_file_signal:
+        return False
+
+    return any(
+        marker in joined
+        for marker in (
+            "adapter_model.safetensors",
+            "adapter_config.json",
+            "lora_int_id",
+            "lora adapter path",
+            "lora_path",
         )
     )
 
