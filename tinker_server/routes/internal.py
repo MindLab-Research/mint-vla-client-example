@@ -297,6 +297,13 @@ async def admission_stats() -> dict:
         except Exception as e:
             driver_state["sampling_sessions_error"] = f"{type(e).__name__}: {e}"
 
+    try:
+        from ..backend.dense_session_state import collect_dense_session_state_stats
+
+        driver_state.update(collect_dense_session_state_stats())
+    except Exception as e:
+        driver_state["dense_session_state_error"] = f"{type(e).__name__}: {e}"
+
     ray_cluster = None
     try:
         ray_cluster = get_ray_cluster_health_snapshot()
@@ -590,6 +597,13 @@ async def metrics() -> Response:
         _append_metric(lines, "mint_driver_session_heartbeat_entries", driver_state.get("session_heartbeat_entries"))
         _append_metric(lines, "mint_driver_lora_load_locks", driver_state.get("lora_load_locks"))
         _append_metric(lines, "mint_driver_sampling_sessions_total", driver_state.get("sampling_sessions_total"))
+        _append_metric(lines, "mint_dense_session_state_bytes", driver_state.get("dense_session_state_bytes"))
+        _append_metric(lines, "mint_dense_session_state_dirs", driver_state.get("dense_session_state_dirs"))
+        _append_metric(
+            lines,
+            "mint_dense_session_state_oldest_age_s",
+            driver_state.get("dense_session_state_oldest_age_s"),
+        )
         _append_metric(
             lines,
             "mint_driver_sampling_sessions_multi_lora",

@@ -740,6 +740,37 @@ async def lifespan(app: FastAPI):
     ensure_session_index_store_ready()
     ensure_training_session_store_ready()
 
+    try:
+        from .backend.dense_session_state import cleanup_legacy_dense_session_state_once
+        from .backend.training_session_store import list_training_sessions
+
+        active_model_ids = {
+            str(info.get("model_id"))
+            for info in await asyncio.to_thread(list_training_sessions)
+            if isinstance(info, dict) and str(info.get("model_id") or "").strip()
+        }
+        dense_cleanup = await asyncio.to_thread(
+            cleanup_legacy_dense_session_state_once,
+            active_session_ids=active_model_ids,
+        )
+        migrated = len(dense_cleanup.get("migrated", []))
+        deleted = len(dense_cleanup.get("deleted", []))
+        skipped = len(dense_cleanup.get("skipped", []))
+        errors = dense_cleanup.get("errors", [])
+        if migrated or deleted or skipped or errors:
+            logger.info(
+                "dense session-state startup cleanup target_root=%s migrated=%s deleted=%s skipped=%s errors=%s",
+                dense_cleanup.get("target_root"),
+                migrated,
+                deleted,
+                skipped,
+                len(errors) if isinstance(errors, list) else 0,
+            )
+            if errors:
+                logger.warning("dense session-state startup cleanup errors: %s", errors)
+    except Exception:
+        logger.exception("dense session-state startup cleanup failed")
+
     # ==========================================================================
     # Cleanup: Kill stale actors from previous server runs
     # ==========================================================================

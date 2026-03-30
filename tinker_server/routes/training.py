@@ -20,6 +20,7 @@ Endpoints:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -357,7 +358,8 @@ async def _best_effort_delete_training_session(
     session = training_manager.get_session(model_id)
     restored = False
     if session is None:
-        session = await _restore_training_session(model_id)
+        restored_session = _restore_training_session(model_id)
+        session = await restored_session if inspect.isawaitable(restored_session) else restored_session
         restored = session is not None
 
     shutdown_attempted = False
@@ -385,14 +387,29 @@ async def _best_effort_delete_training_session(
             )
             worker = getattr(training_engine, "_workers", {}).get(model_id)
             delete_session = getattr(worker, "delete_session", None) if worker is not None else None
+            deleted_dense_state = False
             if delete_session is not None:
                 try:
                     import ray
 
                     await asyncio.to_thread(ray.get, delete_session.remote(model_id), timeout=30)
+                    deleted_dense_state = True
                 except Exception as e:
                     logger.warning(
                         "[%s] best-effort stale training cleanup remote delete failed (%s): %s: %s",
+                        model_id,
+                        reason,
+                        type(e).__name__,
+                        e,
+                    )
+            if not deleted_dense_state:
+                try:
+                    from ..backend.dense_session_state import delete_dense_session_state
+
+                    delete_dense_session_state(model_id)
+                except Exception as e:
+                    logger.warning(
+                        "[%s] best-effort stale training cleanup storage delete failed (%s): %s: %s",
                         model_id,
                         reason,
                         type(e).__name__,

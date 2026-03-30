@@ -36,6 +36,11 @@ DEFAULT_IDLE_TIMEOUT = 0  # Disabled - LRU eviction manages actor lifecycle
 # Import centralized PFS paths from config
 from tinker_server.config import RAY_NAMESPACE
 from tinker_server.config import config as server_config
+from tinker_server.backend.dense_session_state import (
+    delete_dense_session_state,
+    get_dense_session_state_root,
+    maybe_migrate_legacy_dense_session_state,
+)
 from tinker_server.ray_utils import init_ray
 
 
@@ -71,16 +76,16 @@ class SessionStateManager:
             training_meta.json         # step count, learning_rate
     """
 
-    def __init__(self, base_path: str = "/tmp/mint_sessions"):
+    def __init__(self, base_path: str | None = None):
         """Initialize the session state manager.
 
         Args:
             base_path: Root directory for all session checkpoints.
         """
         import os
-        self.base_path = base_path
-        os.makedirs(base_path, exist_ok=True)
-        logger.info(f"[SessionStateManager] Initialized with base_path={base_path}")
+        self.base_path = os.path.abspath(base_path or get_dense_session_state_root())
+        os.makedirs(self.base_path, exist_ok=True)
+        logger.info(f"[SessionStateManager] Initialized with base_path={self.base_path}")
 
     def get_session_path(self, session_id: str) -> str:
         """Get checkpoint directory path for a session."""
@@ -90,6 +95,7 @@ class SessionStateManager:
     def session_exists(self, session_id: str) -> bool:
         """Check if a session has saved state."""
         import os
+        maybe_migrate_legacy_dense_session_state(session_id, root=self.base_path)
         session_path = self.get_session_path(session_id)
         adapter_path = os.path.join(session_path, "adapter_model.safetensors")
         return os.path.exists(adapter_path)
@@ -190,6 +196,7 @@ class SessionStateManager:
         from peft.utils.save_and_load import set_peft_model_state_dict
         from safetensors.torch import load_file
 
+        maybe_migrate_legacy_dense_session_state(session_id, root=self.base_path)
         session_path = self.get_session_path(session_id)
         adapter_path = os.path.join(session_path, "adapter_model.safetensors")
 
@@ -245,15 +252,10 @@ class SessionStateManager:
         Returns:
             True if deleted, False if not found.
         """
-        import os
-        import shutil
-
-        session_path = self.get_session_path(session_id)
-        if os.path.exists(session_path):
-            shutil.rmtree(session_path)
+        deleted = delete_dense_session_state(session_id, root=self.base_path)
+        if deleted:
             logger.info(f"[SessionStateManager] Deleted session {session_id}")
-            return True
-        return False
+        return deleted
 
 
 @ray.remote(num_gpus=1)
@@ -270,6 +272,7 @@ class TrainingWorker:
         lora_rank: int,
         learning_rate: float,
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
+        session_state_root: str | None = None,
     ):
         """Initialize model and optimizer on this worker's GPU.
 
@@ -279,6 +282,7 @@ class TrainingWorker:
             learning_rate: Initial learning rate for optimizer.
             idle_timeout: Seconds of inactivity before self-termination.
                           Set to 0 to disable auto-termination.
+            session_state_root: Shared root for dense per-session state.
         """
         init_actor_observability()
         torch = _get_torch()
@@ -368,7 +372,7 @@ class TrainingWorker:
         self._step_count = 0
 
         # Session state management for stateless trainer pattern
-        self._state_manager = SessionStateManager()
+        self._state_manager = SessionStateManager(base_path=session_state_root)
         self._current_session_id: str | None = None
 
         logger.info("[TrainingWorker] Ready")
@@ -1540,6 +1544,24 @@ class TrainingWorker:
             "opt_state_reset": opt_state_reset,
             "lr_updated": lr_updated,
             "learning_rate": learning_rate,
+        }
+
+    def delete_session(self, session_id: str) -> dict:
+        """Delete persisted state for a session and clear loaded in-memory state."""
+        self._touch()
+        cleared_loaded_session = False
+        if self._current_session_id == session_id:
+            self.optimizer.zero_grad()
+            self.optimizer.state.clear()
+            self._step_count = 0
+            self._current_session_id = None
+            cleared_loaded_session = True
+        deleted = self._state_manager.delete_session(session_id)
+        return {
+            "status": "ok",
+            "session_id": session_id,
+            "deleted": bool(deleted),
+            "cleared_loaded_session": cleared_loaded_session,
         }
 
     def get_session_info(self) -> dict:
@@ -3806,6 +3828,33 @@ class VerlTrainingEngine:
                     should_kill_actor = False
             except Exception:
                 pass
+
+        if session.backend == "peft":
+            dense_state_deleted = False
+            if not should_kill_actor and worker is not None:
+                delete_session = getattr(worker, "delete_session", None)
+                if delete_session is not None:
+                    try:
+                        await asyncio.to_thread(ray.get, delete_session.remote(model_id), timeout=30)
+                        dense_state_deleted = True
+                    except Exception as e:
+                        logger.warning(
+                            "[%s] failed to clear dense session state on live actor %s: %s: %s",
+                            model_id,
+                            actor_name,
+                            type(e).__name__,
+                            e,
+                        )
+            if not dense_state_deleted:
+                try:
+                    delete_dense_session_state(model_id)
+                except Exception as e:
+                    logger.warning(
+                        "[%s] failed to delete dense session state from shared storage: %s: %s",
+                        model_id,
+                        type(e).__name__,
+                        e,
+                    )
 
         self._resource_pool_actor_names.pop(model_id, None)
         self._workers.pop(model_id, None)
