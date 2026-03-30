@@ -1876,8 +1876,21 @@ def test_issue_193_partial_swap_explicit_session_recovers_save_checkpoint(monkey
     group._ensure_session_loaded = fake_ensure_session_loaded
 
     class _FakeSessionManager:
-        def prime_session(self, session_id, checkpoint_path, *, step, lr, actual_rank, optimizer_restored=True):
-            prime_calls.append((session_id, checkpoint_path, step, lr, actual_rank, optimizer_restored))
+        def prime_session(
+            self,
+            session_id,
+            checkpoint_path,
+            *,
+            step,
+            lr,
+            actual_rank,
+            optimizer_restored=True,
+            checkpoint_identity=None,
+            **kwargs,
+        ):
+            prime_calls.append(
+                (session_id, checkpoint_path, step, lr, actual_rank, optimizer_restored, checkpoint_identity, kwargs)
+            )
 
         def clear_actor_only_state(self, session_id):
             clear_actor_only_calls.append(session_id)
@@ -1934,7 +1947,7 @@ def test_issue_193_partial_swap_explicit_session_recovers_save_checkpoint(monkey
     assert worker_1.save_checkpoint.calls == [
         ("/tmp/recovery_ckpt", 12, 16, True, {"traceparent": None})
     ]
-    assert prime_calls == [("recovered_session", "/tmp/recovery_ckpt", 12, 3e-4, 16, True)]
+    assert prime_calls == [("recovered_session", "/tmp/recovery_ckpt", 12, 3e-4, 16, True, None, {})]
     assert clear_actor_only_calls == ["recovered_session"]
 
 

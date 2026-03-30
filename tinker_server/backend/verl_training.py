@@ -3789,7 +3789,7 @@ class VerlTrainingEngine:
                     step_count=session.current_step,
                     learning_rate=session.learning_rate,
                     actual_rank=actual_rank,
-                    actor_only_state_dirty=False,
+                    actor_only_state_dirty=bool(load_optimizer),
                     checkpoint_path=load_path,
                     optimizer_restored=bool(load_optimizer),
                     train_attn=bool(kwargs["train_attn"]),

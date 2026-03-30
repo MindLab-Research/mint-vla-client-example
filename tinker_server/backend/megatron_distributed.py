@@ -5548,6 +5548,7 @@ class MegatronSessionStateManager:
         train_attn: bool = True,
         train_mlp: bool = True,
         train_unembed: bool = True,
+        checkpoint_identity: str | None = None,
     ) -> str:
         if not os.path.isdir(checkpoint_path):
             raise FileNotFoundError(f"checkpoint_path does not exist: {checkpoint_path}")
@@ -5562,7 +5563,7 @@ class MegatronSessionStateManager:
             train_attn=train_attn,
             train_mlp=train_mlp,
             train_unembed=train_unembed,
-            checkpoint_identity=self.checkpoint_identity(checkpoint_path),
+            checkpoint_identity=checkpoint_identity or self.checkpoint_identity(checkpoint_path),
         )
         return session_path
 
