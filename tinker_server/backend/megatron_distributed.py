@@ -99,6 +99,47 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _default_megatron_sessions_base_path() -> str:
+    return os.environ.get("MINT_MEGATRON_SESSIONS_BASE_PATH") or os.path.join(
+        PFS_TINKER_PATH,
+        "checkpoints",
+        "megatron_sessions",
+    )
+
+
+def _actor_only_snapshot_dir(session_path: str) -> str:
+    return os.path.join(session_path, "actor_only_state")
+
+
+def _actor_only_snapshot_manifest_path(session_path: str) -> str:
+    return os.path.join(session_path, "actor_only_state_manifest.json")
+
+
+def _actor_only_rank_snapshot_path(session_path: str, rank: int) -> str:
+    return os.path.join(_actor_only_snapshot_dir(session_path), f"rank_{rank:04d}.pt")
+
+
+def _estimate_object_bytes(value: object) -> int:
+    import sys
+
+    try:
+        import torch
+    except Exception:
+        torch = None
+
+    if value is _GRADIENTS_CONSUMED or value is None:
+        return 0
+    if torch is not None and isinstance(value, torch.Tensor):
+        return int(value.numel() * value.element_size())
+    if isinstance(value, dict):
+        return sum(_estimate_object_bytes(v) for v in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return sum(_estimate_object_bytes(v) for v in value)
+    if isinstance(value, (str, bytes, bytearray)):
+        return len(value)
+    return int(sys.getsizeof(value))
+
+
 def _collect_python_thread_stacks(*, limit: int = 64) -> str:
     import sys
     import traceback
@@ -267,6 +308,13 @@ def get_node_ip_and_free_port() -> tuple[str, int]:
     return ip, port
 
 
+@dataclass
+class _HotSessionCacheEntry:
+    bytes: int
+    last_accessed_s: float
+    durable: bool
+
+
 @ray.remote(num_gpus=1, num_cpus=0)
 class MegatronRankWorker:
     """Single-rank worker for distributed Megatron training.
@@ -310,6 +358,24 @@ class MegatronRankWorker:
         self._session_gradients: dict[str, list[torch.Tensor] | object] = {}
         self._session_optimizer_states: dict[str, dict] = {}  # Per-session optimizer state (CPU)
         self._session_lr_scheduler_states: dict[str, dict] = {}  # Per-session scheduler state (CPU)
+        self._session_hot_cache: dict[str, _HotSessionCacheEntry] = {}
+        max_hot_bytes_per_actor = max(0, _env_int("MINT_MEGATRON_MAX_HOT_BYTES_PER_ACTOR", default=0))
+        rss_watermark_per_actor = max(
+            0,
+            _env_int("MINT_MEGATRON_HOT_CACHE_RSS_WATERMARK_BYTES", default=0),
+        )
+        self._max_hot_sessions = max(0, _env_int("MINT_MEGATRON_MAX_HOT_SESSIONS_PER_ACTOR", default=0))
+        self._max_hot_bytes = (
+            math.ceil(max_hot_bytes_per_actor / max(1, self.world_size))
+            if max_hot_bytes_per_actor > 0
+            else 0
+        )
+        self._rss_watermark_bytes = (
+            math.ceil(rss_watermark_per_actor / max(1, self.world_size))
+            if rss_watermark_per_actor > 0
+            else 0
+        )
+        self._last_eviction_reason: str | None = None
         self._sticky_train_mode_enabled = _env_flag("MINT_MEGATRON_STICKY_TRAIN_MODE", default=False)
         self._sticky_train_mode_idle_timeout_s = _env_float("MINT_MEGATRON_STICKY_IDLE_TIMEOUT_S", default=15.0)
         self._sticky_train_mode_close_on_optim = _env_flag("MINT_MEGATRON_STICKY_CLOSE_ON_OPTIM", default=True)
@@ -1101,7 +1167,198 @@ class MegatronRankWorker:
         except Exception as e:
             logger.warning(f"[Rank {self.rank}] Failed to rebuild optimizer/lr_scheduler: {e}")
 
-    def swap_session_state(self, new_session_id: str) -> None:
+    def _session_path(self, session_id: str) -> str:
+        return os.path.join(_default_megatron_sessions_base_path(), f"{session_id}_checkpoint")
+
+    def _actor_only_rank_snapshot_path(self, session_id: str) -> str:
+        return _actor_only_rank_snapshot_path(self._session_path(session_id), self.rank)
+
+    def _serialize_gradients_for_snapshot(self, gradients: list[object] | object) -> dict:
+        if gradients is _GRADIENTS_CONSUMED:
+            return {"kind": "consumed"}
+        return {
+            "kind": "buffers",
+            "buffers": list(gradients) if isinstance(gradients, list) else [],
+        }
+
+    def _deserialize_gradients_from_snapshot(self, payload: object) -> list[object] | object:
+        if not isinstance(payload, dict):
+            raise RuntimeError(
+                f"[Rank {self.rank}] Invalid persisted gradients payload type {type(payload).__name__}"
+            )
+        kind = payload.get("kind")
+        if kind == "consumed":
+            return _GRADIENTS_CONSUMED
+        if kind == "buffers":
+            buffers = payload.get("buffers", [])
+            if not isinstance(buffers, list):
+                raise RuntimeError(
+                    f"[Rank {self.rank}] Invalid persisted gradient buffer list type {type(buffers).__name__}"
+                )
+            return buffers
+        raise RuntimeError(f"[Rank {self.rank}] Unsupported persisted gradients kind {kind!r}")
+
+    def _session_hot_bytes(self, session_id: str) -> int:
+        return (
+            _estimate_object_bytes(self._session_gradients.get(session_id))
+            + _estimate_object_bytes(self._session_optimizer_states.get(session_id))
+            + _estimate_object_bytes(self._session_lr_scheduler_states.get(session_id))
+        )
+
+    def _touch_hot_session(self, session_id: str) -> None:
+        entry = self._session_hot_cache.get(session_id)
+        if entry is None:
+            return
+        entry.last_accessed_s = time.time()
+
+    def _drop_hot_session(self, session_id: str) -> None:
+        self._session_gradients.pop(session_id, None)
+        self._session_optimizer_states.pop(session_id, None)
+        self._session_lr_scheduler_states.pop(session_id, None)
+        self._session_hot_cache.pop(session_id, None)
+
+    def _current_rss_bytes(self) -> int:
+        try:
+            with open("/proc/self/statm", encoding="utf-8") as f:
+                parts = f.read().strip().split()
+        except OSError:
+            return 0
+        if len(parts) < 2:
+            return 0
+        return int(parts[1]) * int(os.sysconf("SC_PAGE_SIZE"))
+
+    def _evict_hot_sessions_if_needed(self) -> None:
+        def needs_eviction() -> tuple[bool, str | None]:
+            hot_count = len(self._session_hot_cache)
+            hot_bytes = sum(entry.bytes for entry in self._session_hot_cache.values())
+            if self._max_hot_sessions > 0 and hot_count > self._max_hot_sessions:
+                return True, f"max_hot_sessions>{self._max_hot_sessions}"
+            if self._max_hot_bytes > 0 and hot_bytes > self._max_hot_bytes:
+                return True, f"max_hot_bytes>{self._max_hot_bytes}"
+            if self._rss_watermark_bytes > 0 and self._current_rss_bytes() > self._rss_watermark_bytes:
+                return True, f"rss>{self._rss_watermark_bytes}"
+            return False, None
+
+        while True:
+            should_evict, reason = needs_eviction()
+            if not should_evict:
+                return
+            candidates = [
+                (session_id, entry)
+                for session_id, entry in self._session_hot_cache.items()
+                if session_id != self._current_session_id and entry.durable
+            ]
+            if not candidates:
+                logger.warning(
+                    "[Rank %s] Hot session cache exceeded budget but no durable session could be evicted",
+                    self.rank,
+                )
+                return
+            session_id, entry = min(candidates, key=lambda item: item[1].last_accessed_s)
+            self._drop_hot_session(session_id)
+            self._last_eviction_reason = reason
+            logger.info(
+                "[Rank %s] Evicted hot session %s from RAM (bytes=%s, reason=%s)",
+                self.rank,
+                session_id,
+                entry.bytes,
+                reason,
+            )
+
+    def _persist_actor_only_state(
+        self,
+        session_id: str,
+        gradients: list[object] | object,
+        optimizer_state: dict,
+        lr_scheduler_state: dict,
+    ) -> dict:
+        import torch
+
+        session_path = self._session_path(session_id)
+        rank_path = self._actor_only_rank_snapshot_path(session_id)
+        os.makedirs(os.path.dirname(rank_path), exist_ok=True)
+        payload = {
+            "version": 1,
+            "session_id": session_id,
+            "rank": self.rank,
+            "saved_at": time.time(),
+            "gradients": self._serialize_gradients_for_snapshot(gradients),
+            "optimizer_state": optimizer_state,
+            "lr_scheduler_state": lr_scheduler_state,
+        }
+        tmp_path = f"{rank_path}.tmp"
+        torch.save(payload, tmp_path)
+        os.replace(tmp_path, rank_path)
+        return {
+            "rank": self.rank,
+            "path": rank_path,
+            "bytes": int(os.path.getsize(rank_path)),
+            "session_path": session_path,
+        }
+
+    def _load_persisted_actor_only_state(
+        self,
+        session_id: str,
+        *,
+        require: bool,
+    ) -> tuple[list[object] | object, dict, dict] | None:
+        import torch
+
+        rank_path = self._actor_only_rank_snapshot_path(session_id)
+        if not os.path.exists(rank_path):
+            if require:
+                raise RuntimeError(
+                    f"[Rank {self.rank}] Missing persisted actor-only state for session {session_id} at {rank_path}"
+                )
+            return None
+        try:
+            payload = torch.load(rank_path, map_location="cpu")
+        except Exception as e:
+            raise RuntimeError(
+                f"[Rank {self.rank}] Failed to load persisted actor-only state for session {session_id}: "
+                f"{type(e).__name__}: {e}"
+            ) from e
+        if not isinstance(payload, dict):
+            raise RuntimeError(
+                f"[Rank {self.rank}] Invalid persisted actor-only payload type {type(payload).__name__}"
+            )
+        gradients = self._deserialize_gradients_from_snapshot(payload.get("gradients", {}))
+        optimizer_state = payload.get("optimizer_state", {})
+        lr_scheduler_state = payload.get("lr_scheduler_state", {})
+        if not isinstance(optimizer_state, dict) or not isinstance(lr_scheduler_state, dict):
+            raise RuntimeError(
+                f"[Rank {self.rank}] Invalid persisted actor-only optimizer/scheduler payload for session {session_id}"
+            )
+        return gradients, optimizer_state, lr_scheduler_state
+
+    def _cache_hot_session_state(
+        self,
+        session_id: str,
+        gradients: list[object] | object,
+        optimizer_state: dict,
+        lr_scheduler_state: dict,
+        *,
+        durable: bool,
+    ) -> None:
+        self._session_gradients[session_id] = gradients
+        self._session_optimizer_states[session_id] = optimizer_state
+        self._session_lr_scheduler_states[session_id] = lr_scheduler_state
+        self._session_hot_cache[session_id] = _HotSessionCacheEntry(
+            bytes=self._session_hot_bytes(session_id),
+            last_accessed_s=time.time(),
+            durable=durable,
+        )
+        self._evict_hot_sessions_if_needed()
+
+    def get_hot_cache_info(self) -> dict:
+        return {
+            "hot_sessions": sorted(self._session_hot_cache.keys()),
+            "hot_session_count": len(self._session_hot_cache),
+            "hot_bytes": sum(entry.bytes for entry in self._session_hot_cache.values()),
+            "last_eviction_reason": self._last_eviction_reason,
+        }
+
+    def swap_session_state(self, new_session_id: str, require_persisted: bool = False) -> dict:
         """Swap session state: save outgoing session's gradients/optimizer, load incoming.
 
         For new sessions (not in cache), resets optimizer state to avoid momentum
@@ -1115,91 +1372,99 @@ class MegatronRankWorker:
             new_session_id: Session ID to switch to.
         """
         if self._current_session_id == new_session_id:
-            return
+            return {"status": "noop", "session_id": new_session_id}
 
         if self._sticky_train_mode_ctx is not None:
             # Avoid nested train_mode contexts during session switch routines.
             self._release_sticky_train_mode(reason="swap_session_state", snapshot_gradients=True)
 
+        outgoing_persisted = None
+        incoming_source = "new"
+
         # Must use train_mode to access GPU gradient buffers (required for param_offload)
         with self.engine.train_mode():
-            # Save outgoing session's state
             if self._current_session_id is not None:
-                # Only capture gradients if not already cached by forward_backward
-                # CRITICAL: train_mode() zeros GPU gradients, so if forward_backward
-                # already captured valid gradients, we must NOT overwrite them with zeros
-                #
-                # Three cases:
-                # 1. Not in cache → capture (first forward_backward hasn't run)
-                # 2. In cache AND valid list → preserve (valid gradients from forward_backward)
-                # 3. In cache AND _GRADIENTS_CONSUMED → preserve sentinel (consumed by optim_step)
                 cached = self._session_gradients.get(self._current_session_id)
                 if self._current_session_id not in self._session_gradients:
                     grads = self._capture_gradients()
-                    self._session_gradients[self._current_session_id] = grads
-                    logger.debug(
-                        f"[Rank {self.rank}] Captured gradients for session {self._current_session_id}: "
-                        f"{len(grads)} buffers"
-                    )
-                elif cached is not None and cached is not _GRADIENTS_CONSUMED:
-                    logger.debug(
-                        f"[Rank {self.rank}] Preserving existing gradients for session {self._current_session_id}"
-                    )
-                elif cached is _GRADIENTS_CONSUMED:
-                    # Gradients consumed by optim_step - preserve sentinel
-                    logger.debug(
-                        f"[Rank {self.rank}] Session {self._current_session_id} gradients were consumed, "
-                        "preserving _GRADIENTS_CONSUMED sentinel"
-                    )
+                elif cached is not None:
+                    grads = cached
                 else:
-                    # cached is None (should not happen with current logic, but handle defensively)
-                    logger.debug(
-                        f"[Rank {self.rank}] Session {self._current_session_id} has None gradients"
-                    )
-
-                # Always capture optimizer state (not affected by train_mode zeroing)
+                    grads = []
                 opt_state = self._capture_optimizer_state()
-                self._session_optimizer_states[self._current_session_id] = opt_state
-                logger.debug(
-                    f"[Rank {self.rank}] Saved optimizer state for session {self._current_session_id}: "
-                    f"{len(opt_state)} optimizers"
-                )
                 lr_scheduler_state = self._capture_lr_scheduler_state()
-                self._session_lr_scheduler_states[self._current_session_id] = lr_scheduler_state
+                outgoing_persisted = self._persist_actor_only_state(
+                    self._current_session_id,
+                    grads,
+                    opt_state,
+                    lr_scheduler_state,
+                )
+                self._cache_hot_session_state(
+                    self._current_session_id,
+                    grads,
+                    opt_state,
+                    lr_scheduler_state,
+                    durable=True,
+                )
                 logger.debug(
-                    f"[Rank {self.rank}] Saved lr_scheduler state for session {self._current_session_id}: "
-                    f"{bool(lr_scheduler_state)}"
+                    "[Rank %s] Persisted actor-only state for session %s to %s",
+                    self.rank,
+                    self._current_session_id,
+                    outgoing_persisted["path"],
                 )
 
-            # Restore incoming session's gradients (or zero for new session)
-            # _GRADIENTS_CONSUMED means gradients were consumed by optim_step - zero them
-            cached_incoming = self._session_gradients.get(new_session_id)
-            if cached_incoming is not None and cached_incoming is not _GRADIENTS_CONSUMED:
-                self._restore_gradients(cached_incoming)
+            incoming_gradients = None
+            incoming_optimizer_state = None
+            incoming_lr_scheduler_state = None
+            hot_entry = self._session_hot_cache.get(new_session_id)
+            if hot_entry is not None:
+                incoming_gradients = self._session_gradients.get(new_session_id)
+                incoming_optimizer_state = self._session_optimizer_states.get(new_session_id, {})
+                incoming_lr_scheduler_state = self._session_lr_scheduler_states.get(new_session_id, {})
+                self._drop_hot_session(new_session_id)
+                incoming_source = "hot"
+            else:
+                persisted_state = self._load_persisted_actor_only_state(
+                    new_session_id,
+                    require=require_persisted,
+                )
+                if persisted_state is not None:
+                    incoming_gradients, incoming_optimizer_state, incoming_lr_scheduler_state = persisted_state
+                    incoming_source = "cold"
+
+            if incoming_gradients is not None and incoming_gradients is not _GRADIENTS_CONSUMED:
+                self._restore_gradients(incoming_gradients)
                 logger.debug(f"[Rank {self.rank}] Restored gradients for session {new_session_id}")
             else:
-                # New session OR gradients consumed - zero gradients
                 self.engine.optimizer_zero_grad()
-                if cached_incoming is _GRADIENTS_CONSUMED:
+                if incoming_gradients is _GRADIENTS_CONSUMED:
                     logger.debug(
                         f"[Rank {self.rank}] Session {new_session_id} gradients were consumed, zeroed gradients"
                     )
                 else:
-                    logger.debug(f"[Rank {self.rank}] Session {new_session_id} - zeroed gradients (new session)")
+                    logger.debug(f"[Rank {self.rank}] Session {new_session_id} - zeroed gradients")
 
-            # Restore incoming session's optimizer state (or reset for new session)
-            if new_session_id in self._session_optimizer_states:
-                self._restore_optimizer_state(self._session_optimizer_states[new_session_id])
-                print(f"[Rank {self.rank}] RESTORED optimizer state for session {new_session_id}", flush=True)
-                logger.debug(f"[Rank {self.rank}] Restored optimizer state for session {new_session_id}")
-                self._restore_lr_scheduler_state(self._session_lr_scheduler_states.get(new_session_id, {}))
+            if incoming_optimizer_state is not None:
+                self._restore_optimizer_state(incoming_optimizer_state)
+                self._restore_lr_scheduler_state(incoming_lr_scheduler_state or {})
+                logger.debug(
+                    "[Rank %s] Restored actor-only state for session %s from %s cache",
+                    self.rank,
+                    new_session_id,
+                    incoming_source,
+                )
             else:
-                # New session - reset optimizer state (clear momentum/variance)
                 self._reset_optimizer_state()
-                print(f"[Rank {self.rank}] RESET optimizer state for NEW session {new_session_id}", flush=True)
                 logger.info(f"[Rank {self.rank}] New session {new_session_id} - reset optimizer state")
 
         self._current_session_id = new_session_id
+        return {
+            "status": "ok",
+            "session_id": new_session_id,
+            "incoming_source": incoming_source,
+            "outgoing_persisted": outgoing_persisted,
+            "hot_cache": self.get_hot_cache_info(),
+        }
 
     def clear_session_state(self, session_id: str, traceparent: str | None = None) -> None:
         """Clear saved state for a session (call after session completes).
@@ -1208,26 +1473,23 @@ class MegatronRankWorker:
             session_id: Session ID to clear.
         """
         self._bind_traceparent(traceparent)
-        if session_id in self._session_gradients:
-            del self._session_gradients[session_id]
-        if session_id in self._session_optimizer_states:
-            del self._session_optimizer_states[session_id]
-        if session_id in self._session_lr_scheduler_states:
-            del self._session_lr_scheduler_states[session_id]
+        self._drop_hot_session(session_id)
+        rank_path = self._actor_only_rank_snapshot_path(session_id)
+        try:
+            os.remove(rank_path)
+        except FileNotFoundError:
+            pass
         logger.debug(f"[Rank {self.rank}] Cleared state for session {session_id}")
 
     def has_session_state_cached(self, session_id: str) -> bool:
         """Whether this live worker still has the session's actor-only state in memory."""
         if self._current_session_id == session_id:
             return True
-        return (
-            session_id in self._session_gradients
-            and session_id in self._session_optimizer_states
-            and session_id in self._session_lr_scheduler_states
-        )
+        return session_id in self._session_hot_cache
 
     def mark_session_loaded(self, session_id: str) -> None:
         """Record that a checkpoint-loaded session is now active on this rank."""
+        self._drop_hot_session(session_id)
         self._current_session_id = session_id
         logger.info(f"[Rank {self.rank}] Marked loaded session active: {session_id}")
 
@@ -5325,6 +5587,8 @@ class MegatronRankWorker:
             # Clear session state and process group regardless of release outcome
             self._session_gradients.clear()
             self._session_optimizer_states.clear()
+            self._session_lr_scheduler_states.clear()
+            self._session_hot_cache.clear()
             self._current_session_id = None
 
             if torch.distributed.is_initialized():
@@ -5351,11 +5615,7 @@ class MegatronSessionStateManager:
             base_path: Root directory for all session checkpoints.
         """
         if base_path is None:
-            base_path = os.environ.get("MINT_MEGATRON_SESSIONS_BASE_PATH") or os.path.join(
-                PFS_TINKER_PATH,
-                "checkpoints",
-                "megatron_sessions",
-            )
+            base_path = _default_megatron_sessions_base_path()
 
         self.base_path = base_path
         os.makedirs(base_path, exist_ok=True)
@@ -5369,11 +5629,12 @@ class MegatronSessionStateManager:
     def _actor_only_state_path(self, session_id: str) -> str:
         return os.path.join(self.get_session_path(session_id), "actor_only_state.json")
 
+    def _actor_only_snapshot_manifest_path(self, session_id: str) -> str:
+        return _actor_only_snapshot_manifest_path(self.get_session_path(session_id))
+
     def session_exists(self, session_id: str) -> bool:
-        """Check if a session has saved state."""
+        """Check if a session has saved adapter state."""
         session_path = self.get_session_path(session_id)
-        # Check for mp_rank_*_adapter.pt files (Megatron distributed save format)
-        # The save creates files like: mp_rank_00_000_000_adapter.pt
         import glob
         adapter_files = glob.glob(os.path.join(session_path, "mp_rank_*_adapter.pt"))
         return len(adapter_files) > 0
@@ -5426,6 +5687,48 @@ class MegatronSessionStateManager:
         except FileNotFoundError:
             return
 
+    def save_persisted_actor_only_state(
+        self,
+        session_id: str,
+        *,
+        actor_name: str,
+        worker_entries: list[dict],
+    ) -> dict:
+        session_path = self.get_session_path(session_id)
+        os.makedirs(session_path, exist_ok=True)
+        manifest_path = self._actor_only_snapshot_manifest_path(session_id)
+        tmp_path = f"{manifest_path}.tmp"
+        normalized_entries = []
+        total_bytes = 0
+        for entry in worker_entries:
+            if not isinstance(entry, dict):
+                raise RuntimeError(
+                    f"Invalid persisted actor-only worker entry type {type(entry).__name__} for session {session_id}"
+                )
+            rank = entry.get("rank")
+            path = entry.get("path")
+            byte_count = entry.get("bytes")
+            if not isinstance(rank, int) or rank < 0:
+                raise RuntimeError(f"Invalid rank in persisted actor-only entry for session {session_id}: {entry!r}")
+            if not isinstance(path, str) or not path:
+                raise RuntimeError(f"Invalid path in persisted actor-only entry for session {session_id}: {entry!r}")
+            if not isinstance(byte_count, int) or byte_count < 0:
+                raise RuntimeError(f"Invalid bytes in persisted actor-only entry for session {session_id}: {entry!r}")
+            normalized_entries.append({"rank": rank, "path": path, "bytes": byte_count})
+            total_bytes += byte_count
+        payload = {
+            "version": 1,
+            "session_id": session_id,
+            "actor_name": actor_name,
+            "updated_at": time.time(),
+            "total_bytes": total_bytes,
+            "rank_files": sorted(normalized_entries, key=lambda item: item["rank"]),
+        }
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.replace(tmp_path, manifest_path)
+        return payload
+
     def _read_actor_only_state(self, marker_path: str) -> dict:
         try:
             with open(marker_path, "r", encoding="utf-8") as f:
@@ -5445,6 +5748,60 @@ class MegatronSessionStateManager:
             )
         return payload
 
+    def _read_persisted_actor_only_state(self, manifest_path: str) -> dict:
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to read actor-only snapshot manifest {manifest_path}: {type(e).__name__}: {e}"
+            ) from e
+        if not isinstance(payload, dict):
+            raise RuntimeError(
+                f"Invalid actor-only snapshot manifest payload type {type(payload).__name__} in {manifest_path}"
+            )
+        actor_name = payload.get("actor_name")
+        total_bytes = payload.get("total_bytes")
+        rank_files = payload.get("rank_files")
+        if not isinstance(actor_name, str) or not actor_name:
+            raise RuntimeError(
+                f"Invalid actor-only snapshot manifest actor_name={actor_name!r} in {manifest_path}"
+            )
+        if not isinstance(total_bytes, int) or total_bytes < 0:
+            raise RuntimeError(
+                f"Invalid actor-only snapshot manifest total_bytes={total_bytes!r} in {manifest_path}"
+            )
+        if not isinstance(rank_files, list):
+            raise RuntimeError(
+                f"Invalid actor-only snapshot manifest rank_files type {type(rank_files).__name__} in {manifest_path}"
+            )
+        return payload
+
+    def has_persisted_actor_only_state(self, session_id: str) -> bool:
+        manifest_path = self._actor_only_snapshot_manifest_path(session_id)
+        if not os.path.exists(manifest_path):
+            return False
+        self._read_persisted_actor_only_state(manifest_path)
+        return True
+
+    def get_persisted_actor_only_state(self, session_id: str) -> dict | None:
+        manifest_path = self._actor_only_snapshot_manifest_path(session_id)
+        if not os.path.exists(manifest_path):
+            return None
+        return self._read_persisted_actor_only_state(manifest_path)
+
+    def clear_persisted_actor_only_state(self, session_id: str) -> None:
+        import shutil
+
+        manifest_path = self._actor_only_snapshot_manifest_path(session_id)
+        snapshot_dir = _actor_only_snapshot_dir(self.get_session_path(session_id))
+        try:
+            os.remove(manifest_path)
+        except FileNotFoundError:
+            pass
+        if os.path.isdir(snapshot_dir):
+            shutil.rmtree(snapshot_dir)
+
     def list_actor_only_state_sessions(self, actor_name: str) -> list[str]:
         import glob
 
@@ -5460,6 +5817,21 @@ class MegatronSessionStateManager:
                 continue
             dirty_sessions.append(session_dir[: -len("_checkpoint")])
         return sorted(set(dirty_sessions))
+
+    def list_persisted_actor_only_state(self, actor_name: str | None = None) -> dict[str, dict]:
+        import glob
+
+        manifests: dict[str, dict] = {}
+        pattern = os.path.join(self.base_path, "*_checkpoint", "actor_only_state_manifest.json")
+        for manifest_path in glob.glob(pattern):
+            payload = self._read_persisted_actor_only_state(manifest_path)
+            if actor_name is not None and payload.get("actor_name") != actor_name:
+                continue
+            session_dir = os.path.basename(os.path.dirname(manifest_path))
+            if not session_dir.endswith("_checkpoint"):
+                continue
+            manifests[session_dir[: -len("_checkpoint")]] = payload
+        return manifests
 
     def prime_session(
         self,
@@ -5979,12 +6351,17 @@ class MegatronWorkerGroup:
             logger.warning(f"[MegatronWorkerGroup] Failed to get optimizer param counts: {e}")
             return {"has_optimizer": False}
 
-    def _swap_session_on_workers(self, new_session_id: str) -> None:
+    def _swap_session_on_workers(
+        self,
+        new_session_id: str,
+        *,
+        require_persisted_actor_only_state: bool = False,
+    ) -> list[dict]:
         """Swap session state (gradients + optimizer) on all workers.
 
         This calls MegatronRankWorker.swap_session_state() on each worker to:
-        1. Save outgoing session's gradients and optimizer state to memory
-        2. Restore incoming session's gradients and optimizer state (or init fresh)
+        1. Save outgoing session's gradients and optimizer state to PFS + RAM hot cache
+        2. Restore incoming session's gradients and optimizer state from RAM or PFS
 
         Must be called during session switch to ensure optimizer momentum isolation.
 
@@ -5994,15 +6371,35 @@ class MegatronWorkerGroup:
 
         Args:
             new_session_id: Session ID to switch to.
+            require_persisted_actor_only_state: If True, workers must fail-loud when
+                a persisted actor-only snapshot is expected but missing.
 
         Raises:
             Exception: Re-raises the first worker error after invalidating
                 ``_current_session``.
         """
         logger.info(f"[MegatronWorkerGroup] Swapping session state on workers to {new_session_id}")
-        futures = [w.swap_session_state.remote(new_session_id) for w in self.workers]
+        futures = []
+        for w in self.workers:
+            if not hasattr(w, "swap_session_state"):
+                continue
+            remote = w.swap_session_state.remote
+            if require_persisted_actor_only_state:
+                try:
+                    futures.append(
+                        remote(
+                            new_session_id,
+                            require_persisted=require_persisted_actor_only_state,
+                        )
+                    )
+                    continue
+                except TypeError:
+                    pass
+            futures.append(remote(new_session_id))
+        if not futures:
+            return []
         try:
-            ray.get(futures)
+            results = ray.get(futures)
         except Exception as e:
             # Some workers may have swapped while others failed.
             # Invalidate _current_session so the next request cannot hit the
@@ -6022,9 +6419,12 @@ class MegatronWorkerGroup:
             self._session_unknown_due_to_partial_swap = True
             raise
         logger.info("[MegatronWorkerGroup] Session state swapped on all workers")
+        return results
 
     def _session_state_cached_on_workers(self, session_id: str) -> bool:
         """Whether every live worker still has actor-only state for this session in memory."""
+        if not self.workers:
+            return False
         try:
             states = ray.get([w.has_session_state_cached.remote(session_id) for w in self.workers])
         except Exception as e:
@@ -6092,13 +6492,22 @@ class MegatronWorkerGroup:
             flush=True,
         )
 
-        has_actor_only_state = self._session_manager.has_actor_only_state(session_id)
+        has_actor_only_state = getattr(
+            self._session_manager,
+            "has_actor_only_state",
+            lambda _session_id: False,
+        )(session_id)
+        has_persisted_actor_only_state = getattr(
+            self._session_manager,
+            "has_persisted_actor_only_state",
+            lambda _session_id: False,
+        )(session_id)
         session_exists = self._session_manager.session_exists(session_id)
         prevalidated_meta = None
         logger.info(f"[MegatronWorkerGroup] session_exists({session_id}) = {session_exists}")
         if self._current_session == session_id:
             if session_exists:
-                meta = self._session_manager.get_metadata(session_id)
+                meta = getattr(self._session_manager, "get_metadata", lambda _session_id: None)(session_id)
                 if not isinstance(meta, dict):
                     raise RuntimeError(
                         f"Session cache for {session_id} is missing session_metadata.json; "
@@ -6117,22 +6526,23 @@ class MegatronWorkerGroup:
                 session_id,
             )
         if session_exists:
-            prevalidated_meta = self._session_manager.get_metadata(session_id)
+            prevalidated_meta = getattr(self._session_manager, "get_metadata", lambda _session_id: None)(session_id)
             if not isinstance(prevalidated_meta, dict):
                 raise RuntimeError(
                     f"Session cache for {session_id} is missing session_metadata.json; "
                     "reload from an explicit checkpoint before continuing."
                 )
 
+        outgoing_session_id = self._current_session
         # Save outgoing session's LoRA weights to disk
         t_save0 = time.perf_counter() if timing else 0.0
-        if self._current_session is not None:
-            old_path = self._session_manager.get_session_path(self._current_session)
-            logger.info(f"[MegatronWorkerGroup] Saving outgoing session {self._current_session}")
+        if outgoing_session_id is not None:
+            old_path = self._session_manager.get_session_path(outgoing_session_id)
+            logger.info(f"[MegatronWorkerGroup] Saving outgoing session {outgoing_session_id}")
             self.save_adapter_state(old_path, traceparent=traceparent)
             # Save metadata (step count, learning rate, actual rank)
             self._session_manager.save_metadata(
-                self._current_session,
+                outgoing_session_id,
                 self._step_count,
                 self.learning_rate,
                 self._actual_rank,
@@ -6140,10 +6550,43 @@ class MegatronWorkerGroup:
         t_save1 = time.perf_counter() if timing else 0.0
 
         # Swap session state on workers (gradients + optimizer)
-        # This saves outgoing session's gradients/optimizer to CPU memory,
-        # and restores incoming session's (or resets for new sessions)
+        # This saves outgoing session's gradients/optimizer to RAM + PFS,
+        # and restores incoming session's state from RAM or PFS.
         t_swap0 = time.perf_counter() if timing else 0.0
-        self._swap_session_on_workers(session_id)
+        try:
+            swap_results = self._swap_session_on_workers(
+                session_id,
+                require_persisted_actor_only_state=has_persisted_actor_only_state,
+            )
+        except TypeError:
+            swap_results = self._swap_session_on_workers(session_id)
+        if outgoing_session_id is not None:
+            swap_results = [] if swap_results is None else swap_results
+            if swap_results:
+                persisted_entries = [
+                    result.get("outgoing_persisted")
+                    for result in swap_results
+                    if isinstance(result, dict) and result.get("outgoing_persisted")
+                ]
+                if len(persisted_entries) != len(swap_results):
+                    raise RuntimeError(
+                        f"Failed to persist actor-only state for outgoing session {outgoing_session_id}: "
+                        f"expected {len(swap_results)} rank snapshots, got {len(persisted_entries)}"
+                    )
+                save_persisted_actor_only_state = getattr(
+                    self._session_manager,
+                    "save_persisted_actor_only_state",
+                    None,
+                )
+                if save_persisted_actor_only_state is not None:
+                    save_persisted_actor_only_state(
+                        outgoing_session_id,
+                        actor_name=_make_megatron_actor_name(self.base_model),
+                        worker_entries=persisted_entries,
+                    )
+                clear_actor_only_state = getattr(self._session_manager, "clear_actor_only_state", None)
+                if clear_actor_only_state is not None:
+                    clear_actor_only_state(outgoing_session_id)
         t_swap1 = time.perf_counter() if timing else 0.0
 
         # Load new session's LoRA weights from disk (or reset for new session)
@@ -6232,22 +6675,35 @@ class MegatronWorkerGroup:
         self._bind_traceparent(traceparent)
         if self._current_session == session_id:
             return
-        if self._current_session is not None:
-            old_path = self._session_manager.get_session_path(self._current_session)
+        session_manager = getattr(self, "_session_manager", None)
+        if self._current_session is not None and session_manager is not None:
+            old_path = session_manager.get_session_path(self._current_session)
             logger.info(f"[MegatronWorkerGroup] Saving outgoing session {self._current_session}")
             self.save_adapter_state(old_path, traceparent=traceparent)
-            self._session_manager.save_metadata(
+            session_manager.save_metadata(
                 self._current_session,
                 self._step_count,
                 self.learning_rate,
                 self._actual_rank,
             )
-        ray.get(
-            [
-                w.clear_session_state.remote(session_id, traceparent=traceparent)
-                for w in self.workers
-            ]
-        )
+        clear_refs = [
+            w.clear_session_state.remote(session_id, traceparent=traceparent)
+            for w in self.workers
+            if hasattr(w, "clear_session_state")
+        ]
+        if clear_refs:
+            ray.get(clear_refs)
+        if session_manager is not None:
+            clear_persisted_actor_only_state = getattr(
+                session_manager,
+                "clear_persisted_actor_only_state",
+                None,
+            )
+            if clear_persisted_actor_only_state is not None:
+                clear_persisted_actor_only_state(session_id)
+            clear_actor_only_state = getattr(session_manager, "clear_actor_only_state", None)
+            if clear_actor_only_state is not None:
+                clear_actor_only_state(session_id)
         self._swap_session_on_workers(session_id)
         self._current_session = session_id
         self._session_unknown_due_to_partial_swap = False
@@ -7178,19 +7634,43 @@ class MegatronWorkerGroup:
                     meta_path,
                 )
 
+        session_manager = getattr(self, "_session_manager", None)
         if not load_optimizer:
-            ray.get(
-                [w.clear_session_state.remote(effective_session_id, traceparent=traceparent) for w in self.workers]
-            )
+            clear_refs = [
+                w.clear_session_state.remote(effective_session_id, traceparent=traceparent)
+                for w in self.workers
+                if hasattr(w, "clear_session_state")
+            ]
+            if clear_refs:
+                ray.get(clear_refs)
+            if session_manager is not None:
+                clear_persisted_actor_only_state = getattr(
+                    session_manager,
+                    "clear_persisted_actor_only_state",
+                    None,
+                )
+                if clear_persisted_actor_only_state is not None:
+                    clear_persisted_actor_only_state(effective_session_id)
+                clear_actor_only_state = getattr(session_manager, "clear_actor_only_state", None)
+                if clear_actor_only_state is not None:
+                    clear_actor_only_state(effective_session_id)
             self.reset_optimizer(checkpoint_lr, traceparent=traceparent)
             result["optimizer_reset"] = True
         else:
             result["optimizer_reset"] = False
-            self._session_manager.mark_actor_only_state(
-                effective_session_id,
-                reason="load_weights",
-                actor_name=_make_megatron_actor_name(self.base_model),
-            )
+            if session_manager is not None:
+                clear_persisted_actor_only_state = getattr(
+                    session_manager,
+                    "clear_persisted_actor_only_state",
+                    None,
+                )
+                if clear_persisted_actor_only_state is not None:
+                    clear_persisted_actor_only_state(effective_session_id)
+                session_manager.mark_actor_only_state(
+                    effective_session_id,
+                    reason="load_weights",
+                    actor_name=_make_megatron_actor_name(self.base_model),
+                )
 
         self._step_count = checkpoint_step
         self.learning_rate = checkpoint_lr
@@ -7323,6 +7803,51 @@ class MegatronWorkerGroup:
         logger.info(f"[MegatronWorkerGroup] save_lora_weights: completed, step={result.get('current_step', 'unknown')}")
         return result
 
+    def _get_session_cache_diagnostics(self) -> dict:
+        hot_infos: list[dict] = []
+        if self.workers:
+            try:
+                hot_infos = ray.get([w.get_hot_cache_info.remote() for w in self.workers])
+            except Exception as e:
+                logger.warning(
+                    "[MegatronWorkerGroup] Failed to query hot cache diagnostics: %s: %s",
+                    type(e).__name__,
+                    e,
+                )
+                hot_infos = []
+        hot_session_ids = set(hot_infos[0].get("hot_sessions", [])) if hot_infos else set()
+        hot_bytes = sum(int(info.get("hot_bytes", 0)) for info in hot_infos if isinstance(info, dict))
+        last_eviction_reason = next(
+            (
+                info.get("last_eviction_reason")
+                for info in hot_infos
+                if isinstance(info, dict) and info.get("last_eviction_reason")
+            ),
+            None,
+        )
+        actor_name = _make_megatron_actor_name(self.base_model)
+        persisted = getattr(
+            self._session_manager,
+            "list_persisted_actor_only_state",
+            lambda _actor_name=None: {},
+        )(actor_name)
+        current_session = self._current_session
+        cold_session_ids = [
+            session_id
+            for session_id in sorted(persisted)
+            if session_id not in hot_session_ids and session_id != current_session
+        ]
+        cold_bytes = sum(int(persisted[session_id].get("total_bytes", 0)) for session_id in cold_session_ids)
+        return {
+            "hot_session_count": len(hot_session_ids),
+            "cold_session_count": len(cold_session_ids),
+            "hot_bytes": hot_bytes,
+            "cold_bytes": cold_bytes,
+            "last_eviction_reason": last_eviction_reason,
+            "hot_sessions": sorted(hot_session_ids),
+            "cold_sessions": cold_session_ids,
+        }
+
     def get_diagnostics(self) -> dict:
         """Return diagnostic info about the worker group."""
         return {
@@ -7334,6 +7859,7 @@ class MegatronWorkerGroup:
             "num_workers": len(self.workers),
             "base_model": self.base_model,
             "lora_rank": self.lora_rank,
+            "session_cache": self._get_session_cache_diagnostics(),
         }
 
 
@@ -7539,14 +8065,25 @@ class MegatronWorkerGroup:
             self.learning_rate,
             self._actual_rank,
         )
-        if actor_only_state_dirty:
-            self._session_manager.mark_actor_only_state(
-                session_id,
-                reason="load_weights",
-                actor_name=_make_megatron_actor_name(self.base_model),
+        session_manager = getattr(self, "_session_manager", None)
+        if session_manager is not None:
+            clear_persisted_actor_only_state = getattr(
+                session_manager,
+                "clear_persisted_actor_only_state",
+                None,
             )
-        else:
-            self._session_manager.clear_actor_only_state(session_id)
+            if clear_persisted_actor_only_state is not None:
+                clear_persisted_actor_only_state(session_id)
+            if actor_only_state_dirty:
+                session_manager.mark_actor_only_state(
+                    session_id,
+                    reason="load_weights",
+                    actor_name=_make_megatron_actor_name(self.base_model),
+                )
+            else:
+                clear_actor_only_state = getattr(session_manager, "clear_actor_only_state", None)
+                if clear_actor_only_state is not None:
+                    clear_actor_only_state(session_id)
         logger.info(
             f"[MegatronWorkerGroup] Marked loaded session active: {session_id} "
             f"(step={self._step_count}, actual_rank={self._actual_rank})"
@@ -7613,6 +8150,7 @@ class MegatronWorkerGroup:
             "num_workers": len(self.workers),
             "max_lora_rank": self.lora_rank,  # Phase 7: trainer's max rank
             "actual_rank": getattr(self, '_actual_rank', None),  # Phase 7: session's actual rank
+            "session_cache": self._get_session_cache_diagnostics(),
         }
 
     def get_optimizer_info(self) -> dict:

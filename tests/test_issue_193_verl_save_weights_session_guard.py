@@ -2654,3 +2654,81 @@ def test_issue_193_save_lora_invalid_meta_non_strict_mode_warns_without_pollutio
 
     assert session.current_step == 77
     assert any("save_lora_weights_for_sampler" in rec.getMessage() for rec in caplog.records)
+
+
+def test_issue_193_persisted_actor_only_manifest_round_trip(tmp_path: Path):
+    manager = MegatronSessionStateManager(base_path=str(tmp_path))
+
+    payload = manager.save_persisted_actor_only_state(
+        "session_issue_193_actor_only_manifest",
+        actor_name="shared-megatron-actor",
+        worker_entries=[
+            {"rank": 0, "path": str(tmp_path / "r0.pt"), "bytes": 111},
+            {"rank": 1, "path": str(tmp_path / "r1.pt"), "bytes": 222},
+        ],
+    )
+
+    assert payload["total_bytes"] == 333
+    assert manager.has_persisted_actor_only_state("session_issue_193_actor_only_manifest") is True
+    stored = manager.get_persisted_actor_only_state("session_issue_193_actor_only_manifest")
+    assert stored is not None
+    assert stored["actor_name"] == "shared-megatron-actor"
+    assert stored["total_bytes"] == 333
+    assert list(manager.list_persisted_actor_only_state("shared-megatron-actor")) == [
+        "session_issue_193_actor_only_manifest"
+    ]
+
+    manager.clear_persisted_actor_only_state("session_issue_193_actor_only_manifest")
+    assert manager.has_persisted_actor_only_state("session_issue_193_actor_only_manifest") is False
+
+
+def test_issue_193_megatron_session_switch_persists_outgoing_actor_only_state(monkeypatch):
+    group_cls = MegatronWorkerGroup.__ray_actor_class__
+    group = group_cls.__new__(group_cls)
+    group._current_session = "session_current"
+    group.base_model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    group.learning_rate = 1e-4
+    group._actual_rank = 8
+    group.lora_rank = 8
+    group._step_count = 12
+    group.workers = [object()]
+    persisted_calls: list[tuple[str, str, list[dict]]] = []
+    cleared_markers: list[str] = []
+    swap_calls: list[tuple[str, bool]] = []
+    group._session_manager = SimpleNamespace(
+        has_actor_only_state=lambda session_id: False,
+        has_persisted_actor_only_state=lambda session_id: session_id == "session_target",
+        session_exists=lambda session_id: session_id == "session_target",
+        get_metadata=lambda session_id: {"step": 9, "lr": 2e-4, "actual_rank": 4},
+        get_session_path=lambda session_id: f"/tmp/{session_id}",
+        save_metadata=lambda session_id, step, lr, actual_rank: None,
+        save_persisted_actor_only_state=lambda session_id, actor_name, worker_entries: persisted_calls.append(
+            (session_id, actor_name, worker_entries)
+        ),
+        clear_actor_only_state=lambda session_id: cleared_markers.append(session_id),
+    )
+    group._bind_traceparent = lambda traceparent: None
+    group._get_lora_weight_norm = lambda: 0.0
+    group._get_lora_weight_checksum = lambda: "0"
+    group._get_base_weight_checksum = lambda: "0"
+    group._get_buffer_checksum = lambda: "0"
+    group._get_optimizer_param_counts = lambda: {}
+    group.save_adapter_state = lambda *args, **kwargs: None
+    group.load_adapter_state = lambda *args, **kwargs: None
+    group.reinit_lora_weights = lambda *args, **kwargs: None
+    group.reset_expert_bias = lambda *args, **kwargs: None
+    group._swap_session_on_workers = lambda session_id, require_persisted_actor_only_state=False: swap_calls.append(
+        (session_id, require_persisted_actor_only_state)
+    ) or [{"outgoing_persisted": {"rank": 0, "path": "/tmp/r0.pt", "bytes": 123}}]
+
+    group._ensure_session_loaded("session_target")
+
+    assert swap_calls == [("session_target", True)]
+    assert persisted_calls == [
+        (
+            "session_current",
+            "megatron_qwen3_30b_a3b_instruct_2507",
+            [{"rank": 0, "path": "/tmp/r0.pt", "bytes": 123}],
+        )
+    ]
+    assert cleared_markers == ["session_current"]

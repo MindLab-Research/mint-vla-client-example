@@ -2273,3 +2273,88 @@ def test_issue_193_long_forward_backward_refreshes_sticky_idle_timer(monkeypatch
 
     assert reused["reused"] is True
     assert state["exit"] == 0
+
+
+def test_issue_193_swap_session_persists_actor_only_state_and_recovers_cold(monkeypatch, tmp_path):
+    monkeypatch.setenv("MINT_MEGATRON_SESSIONS_BASE_PATH", str(tmp_path))
+    worker, _ = _make_worker(monkeypatch)
+
+    snapshots = {
+        "s1": {
+            "grads": ["grad-s1"],
+            "opt": {"optimizer_0": {"step": 3}},
+            "lr": {"last_epoch": 5},
+        },
+        "s2": {
+            "grads": ["grad-s2"],
+            "opt": {"optimizer_0": {"step": 4}},
+            "lr": {"last_epoch": 7},
+        },
+    }
+    restored = {"grads": None, "opt": None, "lr": None, "reset_count": 0, "zero_count": 0}
+
+    worker._current_session_id = "s1"
+    worker._capture_gradients = lambda: list(snapshots[worker._current_session_id]["grads"])  # type: ignore[index,method-assign]
+    worker._capture_optimizer_state = lambda: dict(snapshots[worker._current_session_id]["opt"])  # type: ignore[index,method-assign]
+    worker._capture_lr_scheduler_state = lambda: dict(snapshots[worker._current_session_id]["lr"])  # type: ignore[index,method-assign]
+    worker._restore_gradients = lambda grads: restored.__setitem__("grads", list(grads))  # type: ignore[method-assign]
+    worker._restore_optimizer_state = lambda state: restored.__setitem__("opt", state)  # type: ignore[method-assign]
+    worker._restore_lr_scheduler_state = lambda state: restored.__setitem__("lr", state)  # type: ignore[method-assign]
+    worker._reset_optimizer_state = lambda: restored.__setitem__("reset_count", restored["reset_count"] + 1)  # type: ignore[method-assign]
+    worker.engine.optimizer_zero_grad = lambda: restored.__setitem__("zero_count", restored["zero_count"] + 1)  # type: ignore[method-assign]
+
+    first = worker.swap_session_state("s2")
+
+    manifest_path = tmp_path / "s1_checkpoint" / "actor_only_state" / "rank_0000.pt"
+    assert first["incoming_source"] == "new"
+    assert first["outgoing_persisted"]["bytes"] > 0
+    assert manifest_path.exists()
+    assert worker._session_hot_cache.keys() == {"s1"}
+
+    worker._drop_hot_session("s1")
+    worker._current_session_id = "s2"
+    restored["grads"] = None
+    restored["opt"] = None
+    restored["lr"] = None
+
+    second = worker.swap_session_state("s1", require_persisted=True)
+
+    assert second["incoming_source"] == "cold"
+    assert restored["grads"] == ["grad-s1"]
+    assert restored["opt"] == {"optimizer_0": {"step": 3}}
+    assert restored["lr"] == {"last_epoch": 5}
+
+
+def test_issue_193_hot_cache_eviction_keeps_persisted_snapshots(monkeypatch, tmp_path):
+    monkeypatch.setenv("MINT_MEGATRON_SESSIONS_BASE_PATH", str(tmp_path))
+    monkeypatch.setenv("MINT_MEGATRON_MAX_HOT_SESSIONS_PER_ACTOR", "1")
+    worker, _ = _make_worker(monkeypatch)
+
+    snapshots = {
+        "s1": {"grads": ["grad-s1"], "opt": {"optimizer_0": {"step": 1}}, "lr": {}},
+        "s2": {"grads": ["grad-s2"], "opt": {"optimizer_0": {"step": 2}}, "lr": {}},
+    }
+    worker._current_session_id = "s1"
+    worker._capture_gradients = lambda: list(snapshots[worker._current_session_id]["grads"])  # type: ignore[index,method-assign]
+    worker._capture_optimizer_state = lambda: dict(snapshots[worker._current_session_id]["opt"])  # type: ignore[index,method-assign]
+    worker._capture_lr_scheduler_state = lambda: dict(snapshots[worker._current_session_id]["lr"])  # type: ignore[index,method-assign]
+    worker._restore_gradients = lambda grads: None  # type: ignore[method-assign]
+    worker._restore_optimizer_state = lambda state: None  # type: ignore[method-assign]
+    worker._restore_lr_scheduler_state = lambda state: None  # type: ignore[method-assign]
+    worker._reset_optimizer_state = lambda: None  # type: ignore[method-assign]
+    worker.engine.optimizer_zero_grad = lambda: None  # type: ignore[method-assign]
+
+    worker.swap_session_state("s2")
+    cache_after_first = worker.get_hot_cache_info()
+    assert cache_after_first["hot_sessions"] == ["s1"]
+
+    worker._current_session_id = "s2"
+    worker.swap_session_state("s3")
+
+    cache_after_second = worker.get_hot_cache_info()
+    assert cache_after_second["hot_sessions"] == ["s2"]
+    assert cache_after_second["last_eviction_reason"] == "max_hot_sessions>1"
+
+    s1_rank_snapshot = tmp_path / "s1_checkpoint" / "actor_only_state" / "rank_0000.pt"
+    assert s1_rank_snapshot.exists()
+    assert worker._session_hot_cache.keys() == {"s2"}
