@@ -133,6 +133,26 @@ class _StubApiWorkQueue:
         return None
 
 
+class _StubOwnerRuntimeSupervisor:
+    def __init__(self):
+        self.started = 0
+
+    async def async_ensure_started(self, *, timeout_s: float = 15.0):
+        self.started += 1
+        return {
+            "actor_name": "tinker_owner_runtime_supervisor",
+            "epoch_id": "epoch-1",
+            "timeout_s": float(timeout_s),
+        }
+
+    async def async_health_snapshot(self, *, timeout_s: float = 10.0):
+        return {
+            "actor_name": "tinker_owner_runtime_supervisor",
+            "epoch_id": "epoch-1",
+            "timeout_s": float(timeout_s),
+        }
+
+
 async def _noop_async(*_args, **_kwargs) -> None:
     return None
 
@@ -156,7 +176,11 @@ class _StubStartupLease:
         return True
 
 
-def _install_lifespan_stubs(monkeypatch, queue: _StubApiWorkQueue) -> None:
+def _install_lifespan_stubs(
+    monkeypatch,
+    queue: _StubApiWorkQueue,
+    owner_runtime: _StubOwnerRuntimeSupervisor,
+) -> None:
     monkeypatch.setattr(app_module, "_cleanup_stale_actors", _noop_async)
     monkeypatch.setattr(app_module, "_restore_sampling_sessions", _noop_async)
     monkeypatch.setattr(app_module, "SessionManager", _StubSessionManager)
@@ -174,12 +198,14 @@ def _install_lifespan_stubs(monkeypatch, queue: _StubApiWorkQueue) -> None:
     checkpoints_module = importlib.import_module("tinker_server.checkpoints")
     gateway_module = importlib.import_module("tinker_server.gateway")
     usage_store_module = importlib.import_module("tinker_server.usage_store")
+    owner_runtime_module = importlib.import_module("tinker_server.backend.owner_runtime_supervisor")
 
     verl_training_module = types.ModuleType("tinker_server.backend.verl_training")
     verl_training_module.VerlTrainingEngine = _StubTrainingEngine
     monkeypatch.setitem(sys.modules, "tinker_server.backend.verl_training", verl_training_module)
 
     monkeypatch.setattr(api_work_queue_module, "api_work_queue", queue)
+    monkeypatch.setattr(owner_runtime_module, "owner_runtime_supervisor", owner_runtime)
     monkeypatch.setattr(capacity_manager_module, "capacity_manager", _StubCapacityManager())
     monkeypatch.setattr(future_store_module, "future_store", _StubFutureStore())
     monkeypatch.setattr(gateway_session_store_module, "ensure_ready", lambda: None)
@@ -201,7 +227,8 @@ def _install_lifespan_stubs(monkeypatch, queue: _StubApiWorkQueue) -> None:
 
 def test_lifespan_waits_for_prewarm_and_fails_startup(monkeypatch) -> None:
     queue = _StubApiWorkQueue()
-    _install_lifespan_stubs(monkeypatch, queue)
+    owner_runtime = _StubOwnerRuntimeSupervisor()
+    _install_lifespan_stubs(monkeypatch, queue, owner_runtime)
     lease = _StubStartupLease(is_owner=True)
 
     async def _fail_prewarm(*_args, **_kwargs) -> None:
@@ -223,12 +250,14 @@ def test_lifespan_waits_for_prewarm_and_fails_startup(monkeypatch) -> None:
 
     asyncio.run(_run())
     assert queue.started_workers == 0
+    assert owner_runtime.started == 1
     assert lease.released is True
 
 
 def test_lifespan_follower_skips_leader_only_startup(monkeypatch) -> None:
     queue = _StubApiWorkQueue()
-    _install_lifespan_stubs(monkeypatch, queue)
+    owner_runtime = _StubOwnerRuntimeSupervisor()
+    _install_lifespan_stubs(monkeypatch, queue, owner_runtime)
 
     calls: list[str] = []
     lease = _StubStartupLease(is_owner=False)
@@ -256,7 +285,8 @@ def test_lifespan_follower_skips_leader_only_startup(monkeypatch) -> None:
     asyncio.run(_run())
 
     assert calls == []
-    assert queue.started_workers == 0
+    assert queue.started_workers == 1
+    assert owner_runtime.started == 1
     assert lease.heartbeat_started is False
     assert lease.released is True
 
@@ -292,27 +322,31 @@ async def test_prewarm_raises_when_inference_prewarm_fails(monkeypatch) -> None:
 @pytest.mark.anyio
 async def test_get_engine_skips_capacity_check_when_named_actor_exists(monkeypatch) -> None:
     _install_fake_ray(monkeypatch)
-    from tinker_server.backend import multi_lora_engine as mle
+    mle = importlib.import_module("tinker_server.backend.multi_lora_engine")
 
     actor_handle = SimpleNamespace(
         __ray_ready__=SimpleNamespace(remote=lambda: "ready-ref"),
         is_engine_ready=SimpleNamespace(remote=lambda: "engine-ready-ref"),
     )
 
-    monkeypatch.setattr(mle.ray, "is_initialized", lambda: True)
-    monkeypatch.setattr(mle.ray, "get_actor", lambda *args, **kwargs: actor_handle)
+    if not hasattr(mle, "ray"):
+        mle.ray = SimpleNamespace(exceptions=SimpleNamespace(RayActorError=RuntimeError))
+
+    monkeypatch.setattr(mle.ray, "is_initialized", lambda: True, raising=False)
+    monkeypatch.setattr(mle.ray, "get_actor", lambda *args, **kwargs: actor_handle, raising=False)
     monkeypatch.setattr(
         mle.ray,
         "get",
         lambda ref, *args, **kwargs: True if ref == "engine-ready-ref" else None,
+        raising=False,
     )
-    monkeypatch.setattr(mle, "parse_model_single_node_ip", lambda **_kwargs: "192.168.38.4")
-    monkeypatch.setattr(mle, "parse_model_node_ip_list", lambda **_kwargs: ["192.168.38.4"])
+    monkeypatch.setattr(mle, "parse_model_single_node_ip", lambda **_kwargs: "192.168.38.4", raising=False)
+    monkeypatch.setattr(mle, "parse_model_node_ip_list", lambda **_kwargs: ["192.168.38.4"], raising=False)
 
     def _fail_capacity_check(**_kwargs):
         raise AssertionError("capacity check should be skipped when a named actor already exists")
 
-    monkeypatch.setattr(mle, "assert_node_ip_capacity", _fail_capacity_check)
+    monkeypatch.setattr(mle, "assert_node_ip_capacity", _fail_capacity_check, raising=False)
 
     async def _fake_initialize(self) -> None:
         self._initialized = True
@@ -329,27 +363,30 @@ async def test_get_engine_skips_capacity_check_when_named_actor_exists(monkeypat
 @pytest.mark.anyio
 async def test_get_engine_checks_capacity_when_named_actor_probe_fails(monkeypatch) -> None:
     _install_fake_ray(monkeypatch)
-    from tinker_server.backend import multi_lora_engine as mle
+    mle = importlib.import_module("tinker_server.backend.multi_lora_engine")
 
     actor_handle = SimpleNamespace(
         __ray_ready__=SimpleNamespace(remote=lambda: "ready-ref"),
         is_engine_ready=SimpleNamespace(remote=lambda: "engine-ready-ref"),
     )
 
-    monkeypatch.setattr(mle.ray, "is_initialized", lambda: True)
-    monkeypatch.setattr(mle.ray, "get_actor", lambda *args, **kwargs: actor_handle)
+    if not hasattr(mle, "ray"):
+        mle.ray = SimpleNamespace(exceptions=SimpleNamespace(RayActorError=RuntimeError))
+
+    monkeypatch.setattr(mle.ray, "is_initialized", lambda: True, raising=False)
+    monkeypatch.setattr(mle.ray, "get_actor", lambda *args, **kwargs: actor_handle, raising=False)
 
     def _stale_actor_get(ref, *args, **kwargs):
         raise mle.ray.exceptions.RayActorError(f"stale actor during probe: {ref}")
 
-    monkeypatch.setattr(mle.ray, "get", _stale_actor_get)
-    monkeypatch.setattr(mle, "parse_model_single_node_ip", lambda **_kwargs: "192.168.38.4")
-    monkeypatch.setattr(mle, "parse_model_node_ip_list", lambda **_kwargs: ["192.168.38.4"])
+    monkeypatch.setattr(mle.ray, "get", _stale_actor_get, raising=False)
+    monkeypatch.setattr(mle, "parse_model_single_node_ip", lambda **_kwargs: "192.168.38.4", raising=False)
+    monkeypatch.setattr(mle, "parse_model_node_ip_list", lambda **_kwargs: ["192.168.38.4"], raising=False)
 
     def _capacity_check(**_kwargs):
         raise RuntimeError("capacity check ran")
 
-    monkeypatch.setattr(mle, "assert_node_ip_capacity", _capacity_check)
+    monkeypatch.setattr(mle, "assert_node_ip_capacity", _capacity_check, raising=False)
 
     manager = mle.MultiModelInferenceManager()
 

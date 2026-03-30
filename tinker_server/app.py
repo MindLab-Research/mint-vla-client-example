@@ -21,7 +21,12 @@ from .backend.future_store import FutureStoreUnavailableError
 from .backend.session_manager import DEFAULT_INACTIVITY_TIMEOUT, SessionManager
 from .config import config
 from .gateway import close_http_clients
-from .health_state import clear_startup_degraded_state, set_startup_degraded_state
+from .health_state import (
+    clear_runtime_degraded_state,
+    clear_startup_degraded_state,
+    set_runtime_degraded_state,
+    set_startup_degraded_state,
+)
 from .gateway_auth import extract_gateway_auth_context, has_gateway_auth_headers
 from .logging_context import (
     classify_failure_reason,
@@ -36,6 +41,7 @@ from .logging_context import (
 )
 from .ray_utils import init_ray
 from .routes import futures, internal, mint, openai_compat, sampling, service, training, weights
+from .server_info import _git_sha
 from .token_encryptor import TokenEncryptor
 
 if TYPE_CHECKING:
@@ -798,18 +804,14 @@ async def lifespan(app: FastAPI):
     # Ray: hard requirement (fail fast)
     # ==========================================================================
     clear_startup_degraded_state()
+    clear_runtime_degraded_state()
     from .backend.future_store import future_store
     from .backend.gateway_session_store import ensure_ready as ensure_gateway_session_store_ready
+    from .backend.owner_runtime_supervisor import owner_runtime_supervisor
     from .backend.sampling_session_store import ensure_ready as ensure_sampling_session_store_ready
     from .backend.session_index_store import ensure_ready as ensure_session_index_store_ready
     from .backend.startup_lease import acquire_startup_lease
     from .backend.training_session_store import ensure_ready as ensure_training_session_store_ready
-    from .checkpoints import (
-        get_checkpoint_mirror_poll_s,
-        get_checkpoint_reap_interval_s,
-        process_pending_checkpoint_mirrors,
-        reap_runtime_checkpoints,
-    )
 
     future_store.ensure_ready()
     ensure_gateway_session_store_ready()
@@ -848,6 +850,60 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("dense session-state startup cleanup failed")
 
+    app_module_git_sha = _git_sha()
+    owner_runtime = await owner_runtime_supervisor.async_ensure_started()
+    logger.info(
+        "owner runtime supervisor ready actor=%s epoch=%s",
+        owner_runtime.get("actor_name"),
+        owner_runtime.get("epoch_id"),
+    )
+
+    def _owner_runtime_health_error(snapshot: dict[str, object]) -> tuple[str, str, dict[str, object]] | None:
+        code_identity = snapshot.get("code_identity")
+        if code_identity != app_module_git_sha:
+            return (
+                "owner_runtime_supervisor_code_mismatch",
+                f"expected code_identity={app_module_git_sha!r} actual={code_identity!r}",
+                {"snapshot": snapshot},
+            )
+        loops = snapshot.get("loops")
+        if isinstance(loops, dict):
+            for loop_name, raw in loops.items():
+                if not isinstance(raw, dict):
+                    continue
+                last_error = raw.get("last_error")
+                last_error_at = raw.get("last_error_at")
+                last_success_at = raw.get("last_success_at")
+                if last_error and last_error_at is not None and (
+                    last_success_at is None or float(last_error_at) >= float(last_success_at)
+                ):
+                    return (
+                        "owner_runtime_supervisor_loop_error",
+                        f"loop={loop_name} last_error={last_error}",
+                        {"snapshot": snapshot},
+                    )
+        return None
+
+    async def _owner_runtime_health_loop() -> None:
+        while True:
+            try:
+                snapshot = await owner_runtime_supervisor.async_health_snapshot(timeout_s=10.0)
+                err = _owner_runtime_health_error(snapshot)
+                if err is None:
+                    clear_runtime_degraded_state()
+                else:
+                    reason, error, details = err
+                    set_runtime_degraded_state(reason=reason, error=error, details=details)
+            except Exception as e:
+                set_runtime_degraded_state(
+                    reason="owner_runtime_supervisor_unavailable",
+                    error=f"{type(e).__name__}: {e}",
+                    details={},
+                )
+            await asyncio.sleep(5.0)
+
+    owner_runtime_health_task = asyncio.create_task(_owner_runtime_health_loop())
+
     startup_lease = await acquire_startup_lease(_STARTUP_LEASE_ROLE)
     startup_owner = bool(startup_lease.is_owner)
     startup_lease_task: asyncio.Task | None = None
@@ -864,10 +920,7 @@ async def lifespan(app: FastAPI):
     inference_manager = None
     train_manager = None
     multi_model_manager = None
-    future_reaper_task = None
     stale_training_heartbeat_task = None
-    checkpoint_reaper_task = None
-    checkpoint_mirror_task = None
 
     try:
         # ==========================================================================
@@ -1333,20 +1386,7 @@ async def lifespan(app: FastAPI):
         api_work_queue.set_executor("mint.interpolate_checkpoints", _exec_mint_interpolate_checkpoints)
         api_work_queue.set_executor("mint.forward_backward_reverse_kl", _exec_mint_forward_backward_reverse_kl)
 
-        if startup_owner:
-            await api_work_queue.start_workers(num_workers=int(config.api_work_queue_num_workers))
-
-        async def _future_reaper_loop() -> None:
-            while True:
-                await asyncio.sleep(float(config.api_work_queue_reap_interval_s))
-                try:
-                    reaped = future_store.reap()
-                    for rid in list(reaped.get("expired", [])) + list(reaped.get("timed_out", [])):
-                        capacity_manager.release_all(str(rid))
-                except Exception:
-                    pass
-
-        future_reaper_task = asyncio.create_task(_future_reaper_loop()) if startup_owner else None
+        await api_work_queue.start_workers(num_workers=int(config.api_work_queue_num_workers))
 
         async def _stale_training_heartbeat_loop() -> None:
             while True:
@@ -1364,40 +1404,6 @@ async def lifespan(app: FastAPI):
 
         stale_training_heartbeat_task = asyncio.create_task(_stale_training_heartbeat_loop()) if startup_owner else None
 
-        async def _checkpoint_reaper_loop() -> None:
-            while True:
-                await asyncio.sleep(float(get_checkpoint_reap_interval_s()))
-                try:
-                    reaped = await asyncio.to_thread(reap_runtime_checkpoints)
-                    total = len(reaped["ephemeral"]) + len(reaped["persistent_cache"]) + len(reaped["persistent"])
-                    if total:
-                        logger.info(
-                            "checkpoint reaper removed ephemeral=%s persistent_cache=%s persistent=%s",
-                            len(reaped["ephemeral"]),
-                            len(reaped["persistent_cache"]),
-                            len(reaped["persistent"]),
-                        )
-                except Exception:
-                    logger.exception("checkpoint reaper failed")
-
-        checkpoint_reaper_task = asyncio.create_task(_checkpoint_reaper_loop()) if startup_owner else None
-
-        async def _checkpoint_mirror_loop() -> None:
-            while True:
-                try:
-                    mirrored = await asyncio.to_thread(process_pending_checkpoint_mirrors)
-                    if mirrored["mirrored"] or mirrored["failed"]:
-                        logger.info(
-                            "checkpoint mirror processed mirrored=%s failed=%s",
-                            len(mirrored["mirrored"]),
-                            len(mirrored["failed"]),
-                        )
-                except Exception:
-                    logger.exception("checkpoint mirror loop failed")
-                await asyncio.sleep(float(get_checkpoint_mirror_poll_s()))
-
-        checkpoint_mirror_task = asyncio.create_task(_checkpoint_mirror_loop()) if startup_owner else None
-
     except Exception:
         await _cancel_task(startup_lease_task)
         await startup_lease.release()
@@ -1414,13 +1420,10 @@ async def lifespan(app: FastAPI):
     # ==========================================================================
     # Shutdown
     # ==========================================================================
-    await _cancel_task(future_reaper_task)
+    await _cancel_task(owner_runtime_health_task)
     await _cancel_task(stale_training_heartbeat_task)
-    await _cancel_task(checkpoint_reaper_task)
-    await _cancel_task(checkpoint_mirror_task)
     await _cancel_task(startup_lease_task)
-    if startup_owner:
-        await api_work_queue.shutdown()
+    await api_work_queue.shutdown()
     await startup_lease.release()
     logger.info("Shutting down local runtime state")
 

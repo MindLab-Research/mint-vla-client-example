@@ -217,6 +217,8 @@ async def admission_stats() -> dict:
     from ..backend.api_work_queue import api_work_queue
     from ..backend.capacity_manager import capacity_manager
     from ..backend.future_store import future_store
+    from ..backend.owner_runtime_supervisor import owner_runtime_supervisor
+    from ..backend.queue_supervisor import queue_supervisor
     from ..backend.resource_pool import get_resource_pool
     from ..backend.session_heartbeat_store import session_heartbeat_store
     from ..routes import sampling as sampling_route
@@ -316,6 +318,18 @@ async def admission_stats() -> dict:
     except Exception as e:
         ray_gcs_metrics = {"error": f"{type(e).__name__}: {e}"}
 
+    owner_runtime = None
+    try:
+        owner_runtime = await owner_runtime_supervisor.async_health_snapshot(timeout_s=timeout_s)
+    except Exception as e:
+        owner_runtime = {"error": f"{type(e).__name__}: {e}"}
+
+    queue_runtime = None
+    try:
+        queue_runtime = await queue_supervisor.async_snapshot(timeout_s=timeout_s)
+    except Exception as e:
+        queue_runtime = {"error": f"{type(e).__name__}: {e}"}
+
     return {
         "capacity": cap,
         "work_queue": q,
@@ -325,7 +339,23 @@ async def admission_stats() -> dict:
         "driver_state": driver_state,
         "ray_cluster": ray_cluster,
         "ray_gcs_metrics": ray_gcs_metrics,
+        "owner_runtime_supervisor": owner_runtime,
+        "queue_supervisor": queue_runtime,
     }
+
+
+@router.get("/owner_runtime_supervisor")
+async def owner_runtime_supervisor_health() -> dict:
+    from ..backend.owner_runtime_supervisor import owner_runtime_supervisor
+
+    return await owner_runtime_supervisor.async_health_snapshot(timeout_s=10.0)
+
+
+@router.get("/queue_supervisor")
+async def queue_supervisor_health() -> dict:
+    from ..backend.queue_supervisor import queue_supervisor
+
+    return await queue_supervisor.async_snapshot(timeout_s=10.0)
 
 
 @router.get("/ray_cluster_health")

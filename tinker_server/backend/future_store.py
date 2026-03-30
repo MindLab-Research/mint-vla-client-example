@@ -20,6 +20,7 @@ from enum import Enum
 from typing import Any
 
 from ..config import config as server_config, otel_env_vars
+from .queue_execution_context import get_current_queue_generation_id
 
 
 class FutureStoreUnavailableError(RuntimeError):
@@ -979,11 +980,41 @@ class FutureStore:
             self._ray_actor = None
             raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
 
+    def _stale_generation_finalize_guard(self) -> tuple[bool, str | None]:
+        generation_id = get_current_queue_generation_id()
+        if generation_id is None:
+            return False, None
+        try:
+            from .queue_supervisor import queue_supervisor
+
+            if queue_supervisor.is_generation_current(generation_id=int(generation_id)):
+                return False, None
+            return True, f"stale generation finalize rejected (generation_id={generation_id})"
+        except Exception as e:
+            return True, f"stale generation finalize check failed: {type(e).__name__}: {e}"
+
+    async def _async_stale_generation_finalize_guard(self) -> tuple[bool, str | None]:
+        generation_id = get_current_queue_generation_id()
+        if generation_id is None:
+            return False, None
+        try:
+            from .queue_supervisor import queue_supervisor
+
+            if await queue_supervisor.async_is_generation_current(generation_id=int(generation_id)):
+                return False, None
+            return True, f"stale generation finalize rejected (generation_id={generation_id})"
+        except Exception as e:
+            return True, f"stale generation finalize check failed: {type(e).__name__}: {e}"
+
     def resolve(self, request_id: str, result: Any) -> None:
         actor = self._get_ray_actor()
         import ray
 
+        stale, message = self._stale_generation_finalize_guard()
         try:
+            if stale:
+                actor.fail.remote(request_id=request_id, error=str(message))
+                return
             meta = ray.get(actor.get_meta.remote(request_id=request_id))
             result = _sync_training_session_step(meta, result)
             ref = ray.put(result)
@@ -996,8 +1027,9 @@ class FutureStore:
         actor = self._get_ray_actor()
         import ray
 
+        stale, message = self._stale_generation_finalize_guard()
         try:
-            actor.fail.remote(request_id=request_id, error=str(error))
+            actor.fail.remote(request_id=request_id, error=str(message if stale and message else error))
         except ray.exceptions.ActorDiedError as e:
             self._ray_actor = None
             raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
@@ -1012,8 +1044,9 @@ class FutureStore:
         actor = self._get_cached_ray_actor_for_async_request_path()
         import ray
 
+        stale, message = await self._async_stale_generation_finalize_guard()
         try:
-            await _await_ray_ref(actor.fail.remote(request_id=request_id, error=str(error)))
+            await _await_ray_ref(actor.fail.remote(request_id=request_id, error=str(message if stale and message else error)))
         except ray.exceptions.ActorDiedError as e:
             self._ray_actor = None
             raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e

@@ -1153,8 +1153,11 @@ class ApiWorkQueueClient:
         self._ray_actor = None
         self._executors: dict[str, Executor] = {}
         self._worker_tasks: list[Any] = []
+        self._queue_supervisor_task: asyncio.Task | None = None
         self._running = False
+        self._desired_num_workers = 1
         self._consumer_job_id: str | None = None
+        self._consumer_generation_id: int | None = None
         self._execution_serial_states: dict[str, _ExecutionSerialState] = {}
         self._execution_serial_states_guard = asyncio.Lock()
 
@@ -1558,7 +1561,7 @@ class ApiWorkQueueClient:
             raise TypeError(f"ApiWorkQueue.get_eta_state returned non-dict: {type(result)}")
         return result
 
-    async def _reconcile_stale_running_requests(self, consumer_job_id: str) -> None:
+    async def _reconcile_stale_running_requests(self, consumer_job_id: str) -> int:
         import ray
 
         from .capacity_manager import capacity_manager
@@ -1572,6 +1575,8 @@ class ApiWorkQueueClient:
                 None,
                 lambda: ray.get(ref, timeout=30),
             )
+            if not isinstance(stale_leased_request_ids, list):
+                stale_leased_request_ids = []
         except Exception as e:
             logger.warning(
                 "[api_work_queue] release_stale_scheduler_leases failed consumer_job_id=%s: %s: %s",
@@ -1592,7 +1597,7 @@ class ApiWorkQueueClient:
                 type(e).__name__,
                 e,
             )
-            return
+            return 0
         except Exception as e:
             logger.warning(
                 "[api_work_queue] stale-running reconciliation failed consumer_job_id=%s: %s: %s",
@@ -1600,7 +1605,7 @@ class ApiWorkQueueClient:
                 type(e).__name__,
                 e,
             )
-            return
+            return 0
 
         stale_leased_request_ids = [str(request_id) for request_id in stale_leased_request_ids]
         pending_leased_request_ids = [
@@ -1625,7 +1630,7 @@ class ApiWorkQueueClient:
 
         all_stale_request_ids = [*stale_request_ids, *pending_leased_request_ids]
         if not all_stale_request_ids:
-            return
+            return 0
 
         for request_id in all_stale_request_ids:
             try:
@@ -1643,53 +1648,19 @@ class ApiWorkQueueClient:
             len(all_stale_request_ids),
             all_stale_request_ids,
         )
+        return len(all_stale_request_ids)
 
-    async def start_workers(self, *, num_workers: int) -> None:
-        import ray
-
-        if self._running:
+    async def _ensure_local_workers_running(self, num_workers: int) -> None:
+        alive = [task for task in self._worker_tasks if not task.done()]
+        self._worker_tasks = alive
+        if self._worker_tasks:
             return
-        self._running = True
-
-        try:
-            job_id = str(ray.get_runtime_context().get_job_id())
-            self._consumer_job_id = job_id
-            start_timeout_s = max(
-                10.0,
-                float(os.environ.get("MINT_API_WORK_QUEUE_START_TIMEOUT_S", "60.0")),
-            )
-            last_error: Exception | None = None
-            for attempt in range(1, 4):
-                try:
-                    actor = await self._get_ray_actor_async()
-                    ref = actor.set_active_job_id.remote(job_id)
-                    await self._await_ray_ref(ref, timeout_s=start_timeout_s)
-                    last_error = None
-                    break
-                except Exception as e:
-                    last_error = e
-                    logger.warning(
-                        "[api_work_queue] set_active_job_id attempt=%s failed (%s: %s); recreating actor",
-                        attempt,
-                        type(e).__name__,
-                        e,
-                    )
-                    self._ray_actor = None
-            if last_error is not None:
-                raise last_error
-            await self._reconcile_stale_running_requests(job_id)
-        except Exception as e:
-            self._running = False
-            self._consumer_job_id = None
-            raise RuntimeError(f"Failed to set ApiWorkQueue active job id: {type(e).__name__}: {e}") from e
-
         n = int(num_workers)
         if n < 1:
             n = 1
         self._worker_tasks = [asyncio.create_task(self._worker_loop(i)) for i in range(n)]
 
-    async def shutdown(self) -> None:
-        self._running = False
+    async def _stop_local_workers(self) -> None:
         for t in self._worker_tasks:
             t.cancel()
         if self._worker_tasks:
@@ -1708,12 +1679,81 @@ class ApiWorkQueueClient:
                 await self._await_ray_ref(ref, timeout_s=5.0)
             except Exception:
                 pass
+
+    async def _queue_supervisor_loop(self) -> None:
+        from .queue_supervisor import queue_supervisor
+
+        start_timeout_s = max(
+            10.0,
+            float(os.environ.get("MINT_API_WORK_QUEUE_START_TIMEOUT_S", "60.0")),
+        )
+
+        while self._running:
+            try:
+                snapshot = await queue_supervisor.async_claim_generation(timeout_s=start_timeout_s)
+                generation_id = int(snapshot.get("generation_id") or 0)
+                owner_id = snapshot.get("owner_id")
+                owns_generation = bool(owner_id) and str(owner_id) == queue_supervisor.owner_id() and generation_id > 0
+                if owns_generation:
+                    consumer_job_id = f"{queue_supervisor.owner_id()}:{generation_id}"
+                    generation_changed = (
+                        self._consumer_generation_id != generation_id
+                        or self._consumer_job_id != consumer_job_id
+                    )
+                    actor = await self._get_ray_actor_async()
+                    if generation_changed:
+                        ref = actor.set_active_job_id.remote(consumer_job_id)
+                        await self._await_ray_ref(ref, timeout_s=start_timeout_s)
+                        self._consumer_job_id = consumer_job_id
+                        self._consumer_generation_id = generation_id
+                        await queue_supervisor.async_begin_reconcile(generation_id=generation_id)
+                        stale_reconciled = await self._reconcile_stale_running_requests(consumer_job_id)
+                        await queue_supervisor.async_finish_reconcile(
+                            generation_id=generation_id,
+                            stale_reconciled=stale_reconciled,
+                        )
+                    await self._ensure_local_workers_running(self._desired_num_workers)
+                    ok = await queue_supervisor.async_heartbeat(generation_id=generation_id)
+                    if not ok:
+                        await self._stop_local_workers()
+                        self._consumer_job_id = None
+                        self._consumer_generation_id = None
+                else:
+                    if self._worker_tasks:
+                        await self._stop_local_workers()
+                    self._consumer_job_id = None
+                    self._consumer_generation_id = None
+            except Exception as e:
+                logger.error(
+                    "[api_work_queue] queue supervisor loop failed: %s: %s",
+                    type(e).__name__,
+                    e,
+                )
+            await asyncio.sleep(queue_supervisor.poll_s())
+
+    async def start_workers(self, *, num_workers: int) -> None:
+        self._desired_num_workers = max(1, int(num_workers))
+        if self._running:
+            return
+        self._running = True
+        self._queue_supervisor_task = asyncio.create_task(self._queue_supervisor_loop())
+
+    async def shutdown(self) -> None:
+        self._running = False
+        if self._queue_supervisor_task is not None:
+            self._queue_supervisor_task.cancel()
+            await asyncio.gather(self._queue_supervisor_task, return_exceptions=True)
+            self._queue_supervisor_task = None
+        await self._stop_local_workers()
         self._consumer_job_id = None
+        self._consumer_generation_id = None
 
     async def _worker_loop(self, worker_idx: int) -> None:
 
         from .capacity_manager import capacity_manager
         from .future_store import FutureStatus, future_store
+        from .queue_execution_context import queue_execution_context
+        from .queue_supervisor import queue_supervisor
 
         async def _finalize_request_slot(request_id: str) -> None:
             try:
@@ -1773,6 +1813,40 @@ class ApiWorkQueueClient:
                 trace_id = extract_trace_id_from_traceparent(item_traceparent)
             set_trace_id(trace_id)
             set_request_id(item.request_id)
+
+            current_generation_id = self._consumer_generation_id
+            is_current = False
+            if current_generation_id is not None:
+                try:
+                    is_current = await queue_supervisor.async_is_generation_current(
+                        generation_id=int(current_generation_id)
+                    )
+                except Exception:
+                    is_current = False
+            if current_generation_id is None or not is_current:
+                try:
+                    await future_store.async_fail(
+                        item.request_id,
+                        "queue generation fenced before execution",
+                    )
+                except Exception:
+                    pass
+                try:
+                    await capacity_manager.async_release_all(item.request_id)
+                except Exception:
+                    pass
+                try:
+                    await queue_supervisor.async_record_fenced_worker(generation_id=int(current_generation_id or -1))
+                except Exception:
+                    pass
+                await _finalize_request_slot(item.request_id)
+                logger.warning(
+                    "[api_work_queue] fenced stale generation before execution request_id=%s worker_idx=%s generation_id=%s",
+                    str(item.request_id),
+                    int(worker_idx),
+                    current_generation_id,
+                )
+                break
 
             if str(item.op) == "training.create_model":
                 try:
@@ -1886,6 +1960,7 @@ class ApiWorkQueueClient:
                         meta={
                             "worker_idx": int(worker_idx),
                             "consumer_job_id": str(self._consumer_job_id),
+                            "generation_id": None if self._consumer_generation_id is None else int(self._consumer_generation_id),
                             "op": item.op,
                             "queue_state": "running",
                             "stage": "prefill",
@@ -1985,40 +2060,44 @@ class ApiWorkQueueClient:
                         int(worker_idx),
                     )
                     tracer = get_otel_tracer()
-                    if tracer is None:
-                        await ex(item)
-                    else:
-                        try:
-                            from opentelemetry.propagate import extract
-                            from opentelemetry.trace import SpanKind, Status, StatusCode
-                        except Exception:
-                            # Best-effort: never block execution if OTel deps are unavailable.
+                    with queue_execution_context(
+                        consumer_id=self._consumer_job_id,
+                        generation_id=self._consumer_generation_id,
+                    ):
+                        if tracer is None:
                             await ex(item)
                         else:
-                            span_context = None
-                            traceparent = None
-                            if isinstance(item.extra, dict):
-                                traceparent = item.extra.get("_traceparent")
-                            if isinstance(traceparent, str) and traceparent:
-                                try:
-                                    span_context = extract({"traceparent": traceparent})
-                                except Exception:
-                                    span_context = None
-                            with tracer.start_as_current_span(
-                                "queue.execute",
-                                kind=SpanKind.INTERNAL,
-                                context=span_context,
-                            ) as span:
-                                span.set_attribute("component", "api_work_queue")
-                                span.set_attribute("op", str(item.op))
-                                span.set_attribute("request_id", str(item.request_id))
-                                span.set_attribute("worker_idx", int(worker_idx))
-                                try:
-                                    await ex(item)
-                                except Exception as e:
-                                    span.record_exception(e)
-                                    span.set_status(Status(StatusCode.ERROR, str(e)))
-                                    raise
+                            try:
+                                from opentelemetry.propagate import extract
+                                from opentelemetry.trace import SpanKind, Status, StatusCode
+                            except Exception:
+                                # Best-effort: never block execution if OTel deps are unavailable.
+                                await ex(item)
+                            else:
+                                span_context = None
+                                traceparent = None
+                                if isinstance(item.extra, dict):
+                                    traceparent = item.extra.get("_traceparent")
+                                if isinstance(traceparent, str) and traceparent:
+                                    try:
+                                        span_context = extract({"traceparent": traceparent})
+                                    except Exception:
+                                        span_context = None
+                                with tracer.start_as_current_span(
+                                    "queue.execute",
+                                    kind=SpanKind.INTERNAL,
+                                    context=span_context,
+                                ) as span:
+                                    span.set_attribute("component", "api_work_queue")
+                                    span.set_attribute("op", str(item.op))
+                                    span.set_attribute("request_id", str(item.request_id))
+                                    span.set_attribute("worker_idx", int(worker_idx))
+                                    try:
+                                        await ex(item)
+                                    except Exception as e:
+                                        span.record_exception(e)
+                                        span.set_status(Status(StatusCode.ERROR, str(e)))
+                                        raise
                     logger.debug(
                         "[api_work_queue] executor completed request_id=%s op=%s worker_idx=%s",
                         str(item.request_id),
