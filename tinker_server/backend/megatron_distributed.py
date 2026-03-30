@@ -7957,7 +7957,7 @@ class MegatronWorkerGroup:
         self._step_count = checkpoint_step
         self.learning_rate = checkpoint_lr
         mark_external_checkpoint = getattr(
-            self._session_manager,
+            session_manager,
             "mark_external_checkpoint",
             None,
         )
@@ -8037,8 +8037,9 @@ class MegatronWorkerGroup:
         timeout_s = int(os.environ.get("MINT_MEGATRON_SAVE_CHECKPOINT_TIMEOUT_S", str(default_timeout_s)))
         results = ray.get(futures, timeout=timeout_s)
         result = results[0]  # Only rank 0 returns actual data
+        session_manager = getattr(self, "_session_manager", None)
         mark_external_checkpoint = getattr(
-            self._session_manager,
+            session_manager,
             "mark_external_checkpoint",
             None,
         )
