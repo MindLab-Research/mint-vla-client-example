@@ -32,9 +32,15 @@ if str(REPO_ROOT) not in sys.path:
 
 def _subprocess_env(env: dict[str, str] | None = None) -> dict[str, str]:
     merged = os.environ.copy()
-    merged.setdefault("UV_HTTP_TIMEOUT", DEFAULT_UV_HTTP_TIMEOUT)
     if env:
         merged.update(env)
+    merged.setdefault("UV_HTTP_TIMEOUT", DEFAULT_UV_HTTP_TIMEOUT)
+    if "TMPDIR" not in merged:
+        xdg_cache_home = merged.get("XDG_CACHE_HOME")
+        if xdg_cache_home:
+            tmpdir = Path(xdg_cache_home) / "tmp"
+            tmpdir.mkdir(parents=True, exist_ok=True)
+            merged["TMPDIR"] = str(tmpdir)
     return merged
 
 

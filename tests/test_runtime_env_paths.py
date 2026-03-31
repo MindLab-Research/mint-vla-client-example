@@ -241,6 +241,31 @@ def test_subprocess_env_respects_existing_uv_http_timeout(monkeypatch):
     assert env["UV_HTTP_TIMEOUT"] == "900"
 
 
+def test_subprocess_env_sets_tmpdir_under_xdg_cache_home(monkeypatch, tmp_path):
+    from scripts import build_runtime_env as build_runtime_env
+
+    xdg_cache_home = tmp_path / "cache"
+    monkeypatch.delenv("TMPDIR", raising=False)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(xdg_cache_home))
+
+    env = build_runtime_env._subprocess_env()
+
+    assert env["TMPDIR"] == str(xdg_cache_home / "tmp")
+    assert (xdg_cache_home / "tmp").is_dir()
+
+
+def test_subprocess_env_respects_existing_tmpdir(monkeypatch, tmp_path):
+    from scripts import build_runtime_env as build_runtime_env
+
+    custom_tmpdir = tmp_path / "custom-tmp"
+    monkeypatch.setenv("TMPDIR", str(custom_tmpdir))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+
+    env = build_runtime_env._subprocess_env()
+
+    assert env["TMPDIR"] == str(custom_tmpdir)
+
+
 def test_export_host_requirements_writes_runtime_worker_stack(tmp_path):
     from scripts import build_runtime_env as build_runtime_env
 
