@@ -69,6 +69,15 @@ def _shared_actor_name(pool_key: dict[str, Any]) -> str:
     return f"{_SHARED_ACTOR_PREFIX}{hashlib.sha1(payload).hexdigest()[:12]}"
 
 
+def _template_session_id(actor_metadata: dict[str, Any] | None) -> str:
+    metadata = dict(actor_metadata or {})
+    scope = str(metadata.get("actor_name") or "").strip()
+    if not scope:
+        scope = json.dumps(metadata, sort_keys=True, separators=(",", ":"), default=str)
+    digest = hashlib.sha1(scope.encode("utf-8")).hexdigest()[:12]
+    return f"{OPENPI_SHARED_TEMPLATE_SESSION_ID}:{digest}"
+
+
 def clear_openpi_shared_runtime_pool() -> None:
     with _SHARED_POOL_LOCK:
         entries = list(_SHARED_ACTORS.values())
@@ -126,6 +135,7 @@ class OpenPISharedRuntimeCore:
         self._spec = spec
         self._runtime_factory = runtime_factory or OpenPIFastWorkerClient.start
         self._actor_metadata = dict(actor_metadata or {})
+        self._template_session_id = _template_session_id(self._actor_metadata)
         self._runtime: OpenPIFastWorkerClient | Any | None = None
         self._session_payloads: dict[str, dict[str, Any]] = {}
         self._initialized_sessions: set[str] = set()
@@ -168,7 +178,7 @@ class OpenPISharedRuntimeCore:
 
                 await runtime.request(
                     "save_session_state",
-                    {"session_id": OPENPI_SHARED_TEMPLATE_SESSION_ID},
+                    {"session_id": self._template_session_id},
                     timeout_s=self._spec.request_timeout_s,
                 )
                 await runtime.request(
@@ -190,9 +200,7 @@ class OpenPISharedRuntimeCore:
                 raise
 
             self._session_payloads[session_id] = payload
-            self._initialized_sessions.update(
-                {OPENPI_SHARED_TEMPLATE_SESSION_ID, session_id}
-            )
+            self._initialized_sessions.update({self._template_session_id, session_id})
             self._current_session_id = session_id
             self._create_session_response = dict(response)
             return dict(response)
@@ -223,7 +231,7 @@ class OpenPISharedRuntimeCore:
         load_session_id = (
             session_id
             if session_id in self._initialized_sessions
-            else OPENPI_SHARED_TEMPLATE_SESSION_ID
+            else self._template_session_id
         )
         await runtime.request(
             "load_session_state",

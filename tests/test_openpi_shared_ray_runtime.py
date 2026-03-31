@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from types import SimpleNamespace
 
@@ -9,12 +10,12 @@ import pytest
 from tinker_server.backend.training_session_manager import TrainingSession
 
 
-def _spec():
+def _spec(*, worker_module: str = "tinker_server.backend.openpi_fast_worker"):
     from tinker_server.backend.openpi_fast_runtime import OpenPIFastRuntimeSpec
 
     return OpenPIFastRuntimeSpec(
         python_executable=os.sys.executable,
-        worker_module="tinker_server.backend.openpi_fast_worker",
+        worker_module=worker_module,
         startup_timeout_s=30.0,
         create_session_timeout_s=300.0,
         request_timeout_s=300.0,
@@ -341,7 +342,10 @@ def test_start_openpi_shared_ray_runtime_cleans_up_detached_actor_when_ready_fai
 
 
 def test_openpi_shared_runtime_core_swaps_sessions_on_a_b_a() -> None:
-    from tinker_server.backend.openpi_shared_ray_runtime import OpenPISharedRuntimeCore
+    from tinker_server.backend.openpi_shared_ray_runtime import (
+        OpenPISharedRuntimeCore,
+        _template_session_id,
+    )
 
     class _FakeWorkerRuntime:
         def __init__(self) -> None:
@@ -372,8 +376,9 @@ def test_openpi_shared_runtime_core_swaps_sessions_on_a_b_a() -> None:
     core = OpenPISharedRuntimeCore(
         spec=_spec(),
         runtime_factory=lambda spec: runtime,
-        actor_metadata={"actor_id": "actor-1", "node_ip": "127.0.0.1"},
+        actor_metadata={"actor_name": "openpi_shared_runtime_fast"},
     )
+    template_session_id = _template_session_id({"actor_name": "openpi_shared_runtime_fast"})
 
     asyncio.run(core.register_session(session_a.session_id, _create_payload(session_a)))
     asyncio.run(core.request_for_session(session_a.session_id, "forward_backward", {"batch": []}))
@@ -383,11 +388,11 @@ def test_openpi_shared_runtime_core_swaps_sessions_on_a_b_a() -> None:
 
     assert runtime.calls == [
         ("create_session", _create_payload(session_a)),
-        ("save_session_state", {"session_id": "__mint_initial__"}),
+        ("save_session_state", {"session_id": template_session_id}),
         ("save_session_state", {"session_id": "session-a"}),
         ("forward_backward", {"batch": []}),
         ("save_session_state", {"session_id": "session-a"}),
-        ("load_session_state", {"session_id": "__mint_initial__"}),
+        ("load_session_state", {"session_id": template_session_id}),
         ("forward_backward", {"batch": []}),
         ("save_session_state", {"session_id": "session-b"}),
         ("load_session_state", {"session_id": "session-a"}),
@@ -434,6 +439,99 @@ def test_openpi_shared_runtime_core_surfaces_restore_failures_without_fallback()
         asyncio.run(core.request_for_session(session_b.session_id, "forward_backward", {"batch": []}))
 
     assert runtime.create_calls == 1
+
+
+def test_openpi_shared_runtime_core_isolates_template_state_per_actor(tmp_path) -> None:
+    from tinker_server.backend.openpi_session_state import OpenPISessionStateManager
+    from tinker_server.backend.openpi_shared_ray_runtime import OpenPISharedRuntimeCore
+
+    class _StateBackedRuntime:
+        def __init__(self, *, worker_module: str, state_root) -> None:
+            self._worker_module = worker_module
+            self._state_store = OpenPISessionStateManager(state_root)
+            self._runtime_signature = {"worker_module": worker_module}
+            self._current_payload: dict[str, object] | None = None
+
+        async def request(self, op: str, payload: dict[str, object] | None = None, *, timeout_s=None) -> dict:
+            _ = timeout_s
+            if op == "create_session":
+                self._current_payload = dict(payload or {})
+                return {
+                    "backend": "openpi_shared",
+                    "config_name": self._current_payload["config_name"],
+                }
+            if op == "save_session_state":
+                session_id = str((payload or {})["session_id"])
+                current_payload = dict(self._current_payload or {})
+
+                def _save_train_state(path, state) -> None:
+                    path.mkdir(parents=True, exist_ok=True)
+                    (path / "state.json").write_text(json.dumps(state), encoding="utf-8")
+
+                self._state_store.save_state(
+                    session_id,
+                    worker_module=self._worker_module,
+                    runtime_signature=self._runtime_signature,
+                    state=current_payload,
+                    rng={"worker_module": self._worker_module},
+                    pending_grads=None,
+                    learning_rate=1e-4,
+                    current_step=0,
+                    save_train_state_fn=_save_train_state,
+                )
+                return {"path": str(self._state_store.get_session_path(session_id))}
+            if op == "load_session_state":
+                session_id = str((payload or {})["session_id"])
+
+                def _load_train_state(path):
+                    return json.loads((path / "state.json").read_text(encoding="utf-8"))
+
+                loaded = self._state_store.load_state(
+                    session_id,
+                    expected_worker_module=self._worker_module,
+                    expected_runtime_signature=self._runtime_signature,
+                    load_train_state_fn=_load_train_state,
+                )
+                self._current_payload = dict(loaded["state"])
+                return {"current_step": loaded["current_step"], "learning_rate": loaded["learning_rate"]}
+            if op == "forward_backward":
+                return {"loss_fn_output_type": "cross_entropy_loss", "loss_fn_outputs": [], "metrics": {}}
+            raise AssertionError(f"unexpected op {op}")
+
+    state_root = tmp_path / "_mint_session_state"
+    fast_runtime = _StateBackedRuntime(
+        worker_module="tinker_server.backend.openpi_fast_worker",
+        state_root=state_root,
+    )
+    pi05_runtime = _StateBackedRuntime(
+        worker_module="tinker_server.backend.openpi_pi05_worker",
+        state_root=state_root,
+    )
+
+    fast_core = OpenPISharedRuntimeCore(
+        spec=_spec(),
+        runtime_factory=lambda spec: fast_runtime,
+        actor_metadata={"actor_name": "openpi_shared_runtime_fast"},
+    )
+    pi05_core = OpenPISharedRuntimeCore(
+        spec=_spec(worker_module="tinker_server.backend.openpi_pi05_worker"),
+        runtime_factory=lambda spec: pi05_runtime,
+        actor_metadata={"actor_name": "openpi_shared_runtime_pi05"},
+    )
+
+    fast_session_a = _make_session("fast-model-a", "fast-session-a")
+    fast_session_b = _make_session("fast-model-b", "fast-session-b")
+    pi05_session = _make_session("pi05-model-a", "pi05-session-a")
+
+    asyncio.run(fast_core.register_session(fast_session_a.session_id, _create_payload(fast_session_a)))
+    asyncio.run(pi05_core.register_session(pi05_session.session_id, _create_payload(pi05_session)))
+    asyncio.run(fast_core.register_session(fast_session_b.session_id, _create_payload(fast_session_b)))
+
+    result = asyncio.run(
+        fast_core.request_for_session(fast_session_b.session_id, "forward_backward", {"batch": []})
+    )
+
+    assert result["loss_fn_output_type"] == "cross_entropy_loss"
 
 
 def test_openpi_shared_runtime_core_resets_after_initial_create_session_failure() -> None:
