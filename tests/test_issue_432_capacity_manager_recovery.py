@@ -60,6 +60,7 @@ def test_issue_432_capacity_manager_create_race_falls_back_to_named_actor(monkey
 
     import tinker_server.config as config_mod
 
+    monkeypatch.setenv("RAY_ADDRESS", "ray://test")
     monkeypatch.setattr(config_mod, "PFS_RUNTIME_ENV_ROOT", "/tmp/runtime", raising=False)
     monkeypatch.setattr(config_mod, "PFS_TINKER_PATH", "/tmp/tinker", raising=False)
     monkeypatch.setattr(config_mod, "PFS_HF_MODULES_PATH", "/tmp/hfmods", raising=False)

@@ -46,6 +46,7 @@ def _install_ray_stub(monkeypatch) -> None:
 
 def _load_api_work_queue_module(monkeypatch):
     _install_ray_stub(monkeypatch)
+    monkeypatch.setenv("RAY_ADDRESS", "ray://test")
     import tinker_server.backend.api_work_queue as api_work_queue
 
     return importlib.reload(api_work_queue)
