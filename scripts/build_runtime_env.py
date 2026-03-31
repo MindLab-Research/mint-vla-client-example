@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -24,16 +25,25 @@ DEFAULT_INSPECT_PROBE_MODULES = (
     "optax",
     "orbax.checkpoint",
 )
+DEFAULT_UV_HTTP_TIMEOUT = "300"
 
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+def _subprocess_env(env: dict[str, str] | None = None) -> dict[str, str]:
+    merged = os.environ.copy()
+    merged.setdefault("UV_HTTP_TIMEOUT", DEFAULT_UV_HTTP_TIMEOUT)
+    if env:
+        merged.update(env)
+    return merged
+
+
 def _run(cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
-    subprocess.run(cmd, cwd=cwd, env=env, check=True)
+    subprocess.run(cmd, cwd=cwd, env=_subprocess_env(env), check=True)
 
 
 def _capture(cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None) -> str:
-    return subprocess.check_output(cmd, cwd=cwd, env=env, text=True)
+    return subprocess.check_output(cmd, cwd=cwd, env=_subprocess_env(env), text=True)
 
 
 def _resolve_uv() -> str:
@@ -165,22 +175,13 @@ def _export_shared_requirements(pyproject: dict[str, Any], output: Path) -> None
     )
 
 
-def _export_host_requirements(output: Path) -> None:
-    _run(
-        [
-            _resolve_uv(),
-            "export",
-            "--frozen",
-            "--no-hashes",
-            "--no-emit-project",
-            "--no-dev",
-            "--only-group",
-            "host-runtime",
-            "--output-file",
-            str(output),
-        ],
-        cwd=REPO_ROOT,
-    )
+def _export_host_requirements(pyproject: dict[str, Any], output: Path) -> None:
+    lines = [
+        "# Direct host requirements for the Mint runtime host venv.",
+        *(_host_deps(pyproject)),
+        "",
+    ]
+    output.write_text("\n".join(lines), encoding="utf-8")
 
 
 def _install_target(python: Path, target: Path, requirements_file: Path) -> None:
@@ -207,20 +208,35 @@ def _materialize_base_python(
     python_request: str,
     base_python_root: Path,
 ) -> Path:
-    uv = _resolve_uv()
-    find_cmd = [uv, "python", "find", "--managed-python", "--resolve-links", python_request]
-    try:
-        bootstrap_python = Path(_capture(find_cmd, cwd=REPO_ROOT).strip())
-    except subprocess.CalledProcessError:
-        _run([uv, "python", "install", python_request], cwd=REPO_ROOT)
-        bootstrap_python = Path(_capture(find_cmd, cwd=REPO_ROOT).strip())
-    if not bootstrap_python.exists():
-        raise RuntimeError(f"uv python find returned missing interpreter: {bootstrap_python}")
-    bootstrap_root = bootstrap_python.resolve().parent.parent
+    requested = tuple(int(part) for part in python_request.split("."))
+    current = tuple(sys.version_info[: len(requested)])
+    if current == requested:
+        base_executable = Path(getattr(sys, "_base_executable", sys.executable)).resolve()
+        if base_executable.exists():
+            bootstrap_root = base_executable.parent.parent
+        else:
+            bootstrap_root = None
+    else:
+        bootstrap_root = None
+    if bootstrap_root is None:
+        uv = _resolve_uv()
+        find_cmd = [uv, "python", "find", "--managed-python", python_request]
+        try:
+            bootstrap_python = Path(_capture(find_cmd, cwd=REPO_ROOT).strip())
+        except subprocess.CalledProcessError:
+            _run([uv, "python", "install", python_request], cwd=REPO_ROOT)
+            bootstrap_python = Path(_capture(find_cmd, cwd=REPO_ROOT).strip())
+        if not bootstrap_python.exists():
+            raise RuntimeError(f"uv python find returned missing interpreter: {bootstrap_python}")
+        bootstrap_root = bootstrap_python.resolve().parent.parent
     if base_python_root.exists():
         shutil.rmtree(base_python_root)
     shutil.copytree(bootstrap_root, base_python_root)
-    materialized_python = base_python_root / "bin" / bootstrap_python.name
+    materialized_python = base_python_root / "bin" / "python3.12"
+    if not materialized_python.exists():
+        executables = sorted((base_python_root / "bin").glob("python*"))
+        if executables:
+            materialized_python = executables[0]
     if not materialized_python.exists():
         raise RuntimeError(
             f"materialized base python missing after copy: {materialized_python}"
@@ -478,7 +494,7 @@ def build_runtime_env(env_root: Path) -> None:
     shared_requirements = env_root / "shared-requirements.txt"
     host_requirements = env_root / "host-requirements.txt"
 
-    _export_host_requirements(host_requirements)
+    _export_host_requirements(pyproject, host_requirements)
     base_python = _materialize_base_python(runtime["python_version"], base_python_root)
     host_python = _create_host_venv(base_python, host_venv, host_requirements)
     _export_shared_requirements(pyproject, shared_requirements)

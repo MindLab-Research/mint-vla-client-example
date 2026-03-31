@@ -221,6 +221,48 @@ def test_runtime_env_host_dependencies_include_openpi_worker_stack():
         assert requirement in deps
 
 
+def test_subprocess_env_sets_default_uv_http_timeout(monkeypatch):
+    from scripts import build_runtime_env as build_runtime_env
+
+    monkeypatch.delenv("UV_HTTP_TIMEOUT", raising=False)
+
+    env = build_runtime_env._subprocess_env()
+
+    assert env["UV_HTTP_TIMEOUT"] == "300"
+
+
+def test_subprocess_env_respects_existing_uv_http_timeout(monkeypatch):
+    from scripts import build_runtime_env as build_runtime_env
+
+    monkeypatch.setenv("UV_HTTP_TIMEOUT", "900")
+
+    env = build_runtime_env._subprocess_env()
+
+    assert env["UV_HTTP_TIMEOUT"] == "900"
+
+
+def test_export_host_requirements_writes_runtime_worker_stack(tmp_path):
+    from scripts import build_runtime_env as build_runtime_env
+
+    out = tmp_path / "host-requirements.txt"
+    build_runtime_env._export_host_requirements(build_runtime_env._load_pyproject(), out)
+    text = out.read_text(encoding="utf-8")
+
+    for requirement in (
+        "torch==2.9.1+cpu",
+        "jax[cuda12]==0.5.3",
+        "flax==0.10.2",
+        "optax==0.2.4",
+        "orbax-checkpoint==0.11.13",
+        "ml_collections==1.0.0",
+        "jaxtyping==0.2.36",
+        "augmax>=0.3.4",
+        "tqdm-loggable>=0.2",
+        "tyro>=0.9.5",
+    ):
+        assert requirement in text
+
+
 def test_build_runtime_env_normalizes_host_only_vllm_source_metadata(tmp_path):
     from scripts import build_runtime_env as build_runtime_env
 
@@ -261,6 +303,63 @@ def test_build_runtime_env_normalizes_host_only_vllm_source_metadata(tmp_path):
     pkg_info_text = pkg_info.read_text(encoding="utf-8")
     assert "Name: vllm" in pkg_info_text
     assert "Version: 0.16.0" in pkg_info_text
+
+
+def test_materialize_base_python_uses_current_uv_find_args(tmp_path, monkeypatch):
+    from scripts import build_runtime_env as build_runtime_env
+
+    bootstrap_root = tmp_path / "bootstrap-root"
+    bootstrap_python = bootstrap_root / "bin" / "python3.12"
+    bootstrap_python.parent.mkdir(parents=True, exist_ok=True)
+    bootstrap_python.write_text("", encoding="utf-8")
+    seen: list[list[str]] = []
+
+    def fake_capture(cmd, *, cwd=None, env=None):
+        seen.append(cmd)
+        return str(bootstrap_python)
+
+    monkeypatch.setattr(build_runtime_env, "sys", type("FakeSys", (), {"version_info": (3, 12, 13), "_base_executable": "/missing/python", "executable": "/missing/python"})())
+    monkeypatch.setattr(build_runtime_env, "_resolve_uv", lambda: "/tmp/fake-uv")
+    monkeypatch.setattr(build_runtime_env, "_capture", fake_capture)
+
+    materialized = build_runtime_env._materialize_base_python("3.12.14", tmp_path / "runtime" / "base-python")
+
+    assert seen == [["/tmp/fake-uv", "python", "find", "--managed-python", "3.12.14"]]
+    assert materialized == tmp_path / "runtime" / "base-python" / "bin" / "python3.12"
+    assert materialized.exists()
+
+
+def test_materialize_base_python_reuses_current_base_executable(tmp_path, monkeypatch):
+    from scripts import build_runtime_env as build_runtime_env
+
+    bootstrap_root = tmp_path / "bootstrap-root"
+    bootstrap_python = bootstrap_root / "bin" / "python3.12"
+    bootstrap_python.parent.mkdir(parents=True, exist_ok=True)
+    bootstrap_python.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(
+        build_runtime_env,
+        "sys",
+        type(
+            "FakeSys",
+            (),
+            {
+                "version_info": (3, 12, 13),
+                "_base_executable": str(bootstrap_python),
+                "executable": str(tmp_path / "venv" / "bin" / "python3.12"),
+            },
+        )(),
+    )
+
+    def fail_resolve_uv():
+        raise AssertionError("uv lookup should not run when current base executable matches")
+
+    monkeypatch.setattr(build_runtime_env, "_resolve_uv", fail_resolve_uv)
+
+    materialized = build_runtime_env._materialize_base_python("3.12.13", tmp_path / "runtime" / "base-python")
+
+    assert materialized == tmp_path / "runtime" / "base-python" / "bin" / "python3.12"
+    assert materialized.exists()
 
 
 def test_inspect_runtime_env_reports_probe_results(tmp_path):
