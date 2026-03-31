@@ -110,6 +110,7 @@ host_requirements = [
     "numpydantic>=1.6.6",
     "optax==0.2.4",
     "orbax-checkpoint==0.11.13",
+    "pytest>=7.0.0",
     "tqdm-loggable>=0.2",
     "tyro>=0.9.5",
 ]

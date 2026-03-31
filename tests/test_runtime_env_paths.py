@@ -215,6 +215,7 @@ def test_runtime_env_host_dependencies_include_openpi_worker_stack():
         "numpydantic>=1.6.6",
         "optax==0.2.4",
         "orbax-checkpoint==0.11.13",
+        "pytest>=7.0.0",
         "tqdm-loggable>=0.2",
         "tyro>=0.9.5",
     ):
@@ -282,6 +283,7 @@ def test_export_host_requirements_writes_runtime_worker_stack(tmp_path):
         "ml_collections==1.0.0",
         "jaxtyping==0.2.36",
         "augmax>=0.3.4",
+        "pytest>=7.0.0",
         "tqdm-loggable>=0.2",
         "tyro>=0.9.5",
     ):
