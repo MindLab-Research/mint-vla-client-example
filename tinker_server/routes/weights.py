@@ -116,6 +116,30 @@ def _build_execution_serial_extra(*, model_id: str, extra: dict | None = None) -
     return payload
 
 
+async def _get_route_training_store_info(model_id: str) -> dict | None:
+    from ..routes.training import _get_training_route_session_info
+
+    info = await _get_training_route_session_info(model_id)
+    if isinstance(info, dict):
+        return info
+    if training_manager is not None:
+        return None
+
+    try:
+        from ..backend.training_session_store import async_get_training_session_info
+
+        store_info = await async_get_training_session_info(model_id)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail="Training session store unavailable") from e
+    return store_info if isinstance(store_info, dict) else None
+
+
+async def _protect_training_session_enqueue_window(session_info: dict) -> None:
+    from ..routes.training import _protect_training_session_enqueue_window as _training_protect
+
+    await _training_protect(session_info)
+
+
 async def _enqueue_weights_request_with_trace(
     *,
     route_start_s: float,
@@ -447,27 +471,7 @@ async def save_weights(
         upstream_for_alias,
     )
 
-    try:
-        from ..backend.training_session_store import async_get_training_session_info
-
-        store_info = await async_get_training_session_info(request.model_id)
-    except Exception:
-        store_info = None
-
-    session = None
-    if not isinstance(store_info, dict) and training_manager is not None:
-        get_session = getattr(training_manager, "get_session", None)
-        if callable(get_session):
-            session = get_session(request.model_id)
-            if session is not None:
-                store_info = {"model_id": getattr(session, "model_id", request.model_id), "user_id": getattr(session, "user_id", None)}
-    session = None
-    if not isinstance(store_info, dict) and training_manager is not None:
-        get_session = getattr(training_manager, "get_session", None)
-        if callable(get_session):
-            session = get_session(request.model_id)
-            if session is not None:
-                store_info = {"model_id": getattr(session, "model_id", request.model_id), "user_id": getattr(session, "user_id", None)}
+    store_info = await _get_route_training_store_info(request.model_id)
     if not isinstance(store_info, dict):
         remote = await async_remote_training_model(request.model_id)
         if remote is not None:
@@ -508,6 +512,7 @@ async def save_weights(
     if not isinstance(store_info, dict):
         raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
 
+    await _protect_training_session_enqueue_window(store_info)
     user_id = _get_user_id(http_request)
     webhook_url = _get_webhook_url(http_request)
     from ..client_compat import prefer_tinker_uri
@@ -590,12 +595,7 @@ async def save_state(
         upstream_for_alias,
     )
 
-    try:
-        from ..backend.training_session_store import async_get_training_session_info
-
-        store_info = await async_get_training_session_info(request.model_id)
-    except Exception:
-        store_info = None
+    store_info = await _get_route_training_store_info(request.model_id)
     if not isinstance(store_info, dict):
         remote = await async_remote_training_model(request.model_id)
         if remote is not None:
@@ -633,12 +633,10 @@ async def save_state(
                 request_id=encode_request_id(upstream_alias=upstream_alias, upstream_request_id=upstream_request_id)
             )
 
-    if training_engine is None or training_manager is None:
-        raise HTTPException(status_code=503, detail="Training engine not initialized")
-
-    if session is None:
+    if not isinstance(store_info, dict):
         raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
 
+    await _protect_training_session_enqueue_window(store_info)
     user_id = _get_user_id(http_request)
     webhook_url = _get_webhook_url(http_request)
     from ..client_compat import prefer_tinker_uri
@@ -1058,19 +1056,7 @@ async def load_state(
         upstream_for_alias,
     )
 
-    try:
-        from ..backend.training_session_store import async_get_training_session_info
-
-        store_info = await async_get_training_session_info(request.model_id)
-    except Exception:
-        store_info = None
-    session = None
-    if not isinstance(store_info, dict) and training_manager is not None:
-        get_session = getattr(training_manager, "get_session", None)
-        if callable(get_session):
-            session = get_session(request.model_id)
-            if session is not None:
-                store_info = {"model_id": getattr(session, "model_id", request.model_id), "user_id": getattr(session, "user_id", None)}
+    store_info = await _get_route_training_store_info(request.model_id)
     remote = None if isinstance(store_info, dict) else await async_remote_training_model(request.model_id)
     if remote is not None:
         upstream_alias, base_model = remote
@@ -1145,6 +1131,7 @@ async def load_state(
     if not isinstance(store_info, dict):
         raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
 
+    await _protect_training_session_enqueue_window(store_info)
     user_id = _get_user_id(http_request)
     load_path = _resolve_mint_path(request.path, user_id=user_id, is_admin=is_admin_request(http_request))
     request = request.model_copy(update={"path": load_path})

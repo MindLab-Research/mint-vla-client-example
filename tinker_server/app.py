@@ -129,7 +129,7 @@ async def _shutdown_local_training_runtime(train_manager) -> None:
             logger.warning("Local training runtime shutdown failed model=%s: %s", model_id, e)
 
 async def _prewarm_persistent_models(
-    train_engine: VerlTrainingEngine,
+    train_engine: VerlTrainingEngine | None,
     multi_model_manager: MultiModelInferenceManager | None,
 ) -> None:
     """Pre-create and protect persistent actors at server startup.
@@ -167,8 +167,14 @@ async def _prewarm_persistent_models(
     lora_rank = int(config.prewarm_train_lora_rank)
     learning_rate = float(config.prewarm_train_lr)
     megatron_ready_timeout_s = float(config.prewarm_megatron_ready_timeout_s)
-    prewarm_training = bool(config.prewarm_enable_training)
+    prewarm_training_requested = bool(config.prewarm_enable_training)
+    prewarm_training = prewarm_training_requested and train_engine is not None
     prewarm_inference = bool(config.prewarm_enable_inference)
+    if prewarm_training_requested and train_engine is None:
+        raise RuntimeError(
+            "persistent prewarm training configured but unavailable in API process; "
+            "detached queue runtime owns training execution state"
+        )
 
     from tinker_server.backend.model_registry import (
         get_model_config,
@@ -667,38 +673,25 @@ async def lifespan(app: FastAPI):
         multi_model_manager: MultiModelInferenceManager | None = None
 
         # ==========================================================================
-        # Training: Initialize TrainingSessionManager and VerlTrainingEngine
+        # Training route layer: stateless API path uses detached stores only
         # ==========================================================================
-        logger.info("Initializing training components")
-
-        from .backend.training_session_manager import TrainingSessionManager
-        from .backend.verl_training import VerlTrainingEngine
-
-        train_manager = TrainingSessionManager(
-            inactivity_timeout=config.training_inactivity_timeout_s,
+        training.training_manager = None
+        training.training_engine = None
+        training.inference_manager = None
+        mint.training_manager = None
+        mint.training_engine = None
+        weights.training_manager = None
+        weights.training_engine = None
+        weights.inference_manager = None
+        logger.info(
+            "Training route globals left unbound in API process; detached queue runtime owns training execution state"
         )
-        train_engine = VerlTrainingEngine()
-        await train_engine.initialize()
-
-        # Make training components available to routes
-        training.training_manager = train_manager
-        training.training_engine = train_engine
-        training.inference_manager = None  # Queue execution runtime owns inference-side execution state
-        mint.training_manager = train_manager
-        mint.training_engine = train_engine
-
-        # Weights router also needs training components and inference manager
-        weights.training_manager = train_manager
-        weights.training_engine = train_engine
-        weights.inference_manager = None  # Queue execution runtime owns inference-side execution state
-
-        logger.info("Training components initialized")
 
         # ==========================================================================
-        # Persistent actors: pre-create and protect at startup
+        # Persistent prewarm hook (API process has no local training runtime)
         # ==========================================================================
         if startup_owner:
-            await _prewarm_persistent_models(train_engine, multi_model_manager)
+            await _prewarm_persistent_models(None, multi_model_manager)
         else:
             logger.info("Skipping persistent prewarm on follower worker")
 
@@ -754,8 +747,10 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down local runtime state")
 
     # Do not let an arbitrary API worker exit delete shared metadata or global actors.
-    await _shutdown_local_training_runtime(train_manager)
-    await _shutdown_local_inference_runtime(inference_manager)
+    if train_manager is not None:
+        await _shutdown_local_training_runtime(train_manager)
+    if inference_manager is not None:
+        await _shutdown_local_inference_runtime(inference_manager)
 
     # Shutdown multi-model inference manager
     if multi_model_manager is not None:

@@ -1158,6 +1158,9 @@ class ApiWorkQueueClient:
         self._desired_num_workers = 1
         self._consumer_job_id: str | None = None
         self._consumer_generation_id: int | None = None
+        self._execution_ready_event = asyncio.Event()
+        self._execution_ready_generation_id: int | None = None
+        self._execution_ready_at: float | None = None
         self._execution_serial_states: dict[str, _ExecutionSerialState] = {}
         self._execution_serial_states_guard = asyncio.Lock()
 
@@ -1650,6 +1653,24 @@ class ApiWorkQueueClient:
         )
         return len(all_stale_request_ids)
 
+    def _clear_execution_ready(self) -> None:
+        self._execution_ready_event.clear()
+        self._execution_ready_generation_id = None
+        self._execution_ready_at = None
+
+    def _mark_execution_ready(self, generation_id: int) -> None:
+        self._execution_ready_generation_id = int(generation_id)
+        self._execution_ready_at = time.time()
+        self._execution_ready_event.set()
+
+    async def wait_until_execution_ready(self, *, timeout_s: float = 60.0) -> dict[str, Any]:
+        await asyncio.wait_for(self._execution_ready_event.wait(), timeout=float(timeout_s))
+        return {
+            "execution_ready": True,
+            "generation_id": self._execution_ready_generation_id,
+            "ready_at": self._execution_ready_at,
+        }
+
     async def _ensure_local_workers_running(self, num_workers: int) -> None:
         alive = [task for task in self._worker_tasks if not task.done()]
         self._worker_tasks = alive
@@ -1666,6 +1687,7 @@ class ApiWorkQueueClient:
         if self._worker_tasks:
             await asyncio.gather(*self._worker_tasks, return_exceptions=True)
         self._worker_tasks = []
+        self._clear_execution_ready()
         actor = None
         consumer_job_id = self._consumer_job_id
         if consumer_job_id is not None:
@@ -1688,6 +1710,7 @@ class ApiWorkQueueClient:
             float(os.environ.get("MINT_API_WORK_QUEUE_START_TIMEOUT_S", "60.0")),
         )
 
+        self._clear_execution_ready()
         while self._running:
             try:
                 snapshot = await queue_supervisor.async_claim_generation(timeout_s=start_timeout_s)
@@ -1702,6 +1725,7 @@ class ApiWorkQueueClient:
                     )
                     actor = await self._get_ray_actor_async()
                     if generation_changed:
+                        self._clear_execution_ready()
                         ref = actor.set_active_job_id.remote(consumer_job_id)
                         await self._await_ray_ref(ref, timeout_s=start_timeout_s)
                         self._consumer_job_id = consumer_job_id
@@ -1714,16 +1738,20 @@ class ApiWorkQueueClient:
                         )
                     await self._ensure_local_workers_running(self._desired_num_workers)
                     ok = await queue_supervisor.async_heartbeat(generation_id=generation_id)
-                    if not ok:
+                    if ok:
+                        self._mark_execution_ready(generation_id)
+                    else:
                         await self._stop_local_workers()
                         self._consumer_job_id = None
                         self._consumer_generation_id = None
                 else:
+                    self._clear_execution_ready()
                     if self._worker_tasks:
                         await self._stop_local_workers()
                     self._consumer_job_id = None
                     self._consumer_generation_id = None
             except Exception as e:
+                self._clear_execution_ready()
                 logger.error(
                     "[api_work_queue] queue supervisor loop failed: %s: %s",
                     type(e).__name__,
@@ -1735,6 +1763,7 @@ class ApiWorkQueueClient:
         self._desired_num_workers = max(1, int(num_workers))
         if self._running:
             return
+        self._clear_execution_ready()
         self._running = True
         self._queue_supervisor_task = asyncio.create_task(self._queue_supervisor_loop())
 
@@ -1745,6 +1774,7 @@ class ApiWorkQueueClient:
             await asyncio.gather(self._queue_supervisor_task, return_exceptions=True)
             self._queue_supervisor_task = None
         await self._stop_local_workers()
+        self._clear_execution_ready()
         self._consumer_job_id = None
         self._consumer_generation_id = None
 

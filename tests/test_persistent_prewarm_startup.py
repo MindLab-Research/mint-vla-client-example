@@ -282,6 +282,40 @@ def test_lifespan_waits_for_prewarm_and_fails_startup(monkeypatch) -> None:
     assert queue_execution_runtime.ensure_started_calls == []
 
 
+def test_lifespan_fails_loudly_when_training_prewarm_configured_without_local_runtime(monkeypatch) -> None:
+    queue = _StubApiWorkQueue()
+    owner_runtime = _StubOwnerRuntimeSupervisor()
+    queue_execution_runtime = _StubQueueExecutionRuntime()
+    _install_lifespan_stubs(monkeypatch, queue, owner_runtime, queue_execution_runtime)
+    lease = _StubStartupLease(is_owner=True)
+
+    async def _acquire_startup_lease(*_args, **_kwargs):
+        return lease
+
+    monkeypatch.setattr(app_module.config, "prewarm_persistent_models_csv", "Qwen/Qwen3-30B-A3B-Instruct-2507")
+    monkeypatch.setattr(app_module.config, "prewarm_enable_training", True)
+    monkeypatch.setattr(app_module.config, "prewarm_enable_inference", False)
+    monkeypatch.setattr(
+        "tinker_server.backend.startup_lease.acquire_startup_lease",
+        _acquire_startup_lease,
+    )
+
+    async def _run() -> None:
+        with pytest.raises(
+            RuntimeError,
+            match="persistent prewarm training configured but unavailable in API process",
+        ):
+            async with app_module.lifespan(app_module.app):
+                raise AssertionError("lifespan should not yield when detached prewarm is unavailable")
+
+    asyncio.run(_run())
+    assert queue.started_workers == 0
+    assert owner_runtime.started == 1
+    assert lease.released is True
+    assert app_module.service.session_manager is None
+    assert queue_execution_runtime.ensure_started_calls == []
+
+
 def test_lifespan_follower_skips_leader_only_startup(monkeypatch) -> None:
     queue = _StubApiWorkQueue()
     owner_runtime = _StubOwnerRuntimeSupervisor()
@@ -320,6 +354,56 @@ def test_lifespan_follower_skips_leader_only_startup(monkeypatch) -> None:
     assert lease.released is True
     assert app_module.service.session_manager is None
     assert queue_execution_runtime.ensure_started_calls == [1]
+
+
+def test_lifespan_keeps_training_route_globals_unbound_in_stateless_api(monkeypatch) -> None:
+    queue = _StubApiWorkQueue()
+    owner_runtime = _StubOwnerRuntimeSupervisor()
+    queue_execution_runtime = _StubQueueExecutionRuntime()
+    _install_lifespan_stubs(monkeypatch, queue, owner_runtime, queue_execution_runtime)
+    lease = _StubStartupLease(is_owner=True)
+
+    async def _acquire_startup_lease(*_args, **_kwargs):
+        return lease
+
+    async def _noop_prewarm(*_args, **_kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(app_module, "_prewarm_persistent_models", _noop_prewarm)
+    monkeypatch.setattr(
+        "tinker_server.backend.startup_lease.acquire_startup_lease",
+        _acquire_startup_lease,
+    )
+
+    from tinker_server.routes import mint as mint_routes
+    from tinker_server.routes import training as training_routes
+    from tinker_server.routes import weights as weights_routes
+
+    async def _run() -> None:
+        async with app_module.lifespan(app_module.app):
+            assert training_routes.training_manager is None
+            assert mint_routes.training_manager is None
+            assert weights_routes.training_manager is None
+
+    asyncio.run(_run())
+
+    assert queue.started_workers == 0
+    assert owner_runtime.started == 1
+    assert lease.released is True
+    assert queue_execution_runtime.ensure_started_calls == [1]
+
+
+@pytest.mark.anyio
+async def test_prewarm_raises_when_training_prewarm_unavailable_in_stateless_api(monkeypatch) -> None:
+    monkeypatch.setattr(app_module.config, "prewarm_persistent_models_csv", "Qwen/Qwen3-30B-A3B-Instruct-2507")
+    monkeypatch.setattr(app_module.config, "prewarm_enable_training", True)
+    monkeypatch.setattr(app_module.config, "prewarm_enable_inference", False)
+
+    with pytest.raises(
+        RuntimeError,
+        match="persistent prewarm training configured but unavailable in API process",
+    ):
+        await app_module._prewarm_persistent_models(None, SimpleNamespace())
 
 
 @pytest.mark.anyio

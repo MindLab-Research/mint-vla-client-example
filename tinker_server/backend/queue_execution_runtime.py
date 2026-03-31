@@ -177,6 +177,7 @@ def _get_or_create_actor():
                     register_api_work_queue_executors(api_work_queue)
                     self._desired_workers = max(1, int(num_workers))
                     await api_work_queue.start_workers(num_workers=self._desired_workers)
+                    await api_work_queue.wait_until_execution_ready(timeout_s=120.0)
                     self._last_started_at = time.time()
                     self._last_error = None
                 except Exception as e:
@@ -209,6 +210,11 @@ def _get_or_create_actor():
                 "running": bool(getattr(api_work_queue, "_running", False)),
                 "consumer_job_id": getattr(api_work_queue, "_consumer_job_id", None),
                 "consumer_generation_id": getattr(api_work_queue, "_consumer_generation_id", None),
+                "execution_ready": bool(
+                    getattr(getattr(api_work_queue, "_execution_ready_event", None), "is_set", lambda: False)()
+                ),
+                "execution_ready_generation_id": getattr(api_work_queue, "_execution_ready_generation_id", None),
+                "execution_ready_at": getattr(api_work_queue, "_execution_ready_at", None),
                 "local_worker_tasks": len([t for t in getattr(api_work_queue, "_worker_tasks", []) if not t.done()]),
             }
 

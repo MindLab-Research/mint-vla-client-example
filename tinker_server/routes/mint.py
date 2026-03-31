@@ -77,6 +77,30 @@ def _reverse_kl_token_stats(data: list) -> tuple[int, int]:
     return total_tokens, max_seq_len
 
 
+async def _get_route_training_store_info(model_id: str) -> dict | None:
+    from ..routes.training import _get_training_route_session_info
+
+    info = await _get_training_route_session_info(model_id)
+    if isinstance(info, dict):
+        return info
+    if training_manager is not None:
+        return None
+
+    try:
+        from ..backend.training_session_store import async_get_training_session_info
+
+        store_info = await async_get_training_session_info(model_id)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail="Training session store unavailable") from e
+    return store_info if isinstance(store_info, dict) else None
+
+
+async def _protect_training_session_enqueue_window(session_info: dict) -> None:
+    from ..routes.training import _protect_training_session_enqueue_window as _training_protect
+
+    await _training_protect(session_info)
+
+
 @router.post("/checkpoints/interpolate", response_model=UntypedAPIFuture)
 async def interpolate_checkpoints(
     request: InterpolateCheckpointsRequest,
@@ -199,24 +223,11 @@ async def forward_backward_reverse_kl(
     request: ForwardBackwardReverseKLRequest,
     http_request: Request,
 ) -> UntypedAPIFuture:
-    try:
-        from ..backend.training_session_store import async_get_training_session_info
-
-        info = await async_get_training_session_info(request.model_id)
-    except Exception:
-        info = None
-    if not isinstance(info, dict) and training_manager is not None:
-        get_session = getattr(training_manager, "get_session", None)
-        if callable(get_session):
-            session = get_session(request.model_id)
-            if session is not None:
-                info = {
-                    "model_id": getattr(session, "model_id", request.model_id),
-                    "base_model": getattr(session, "base_model", None),
-                }
+    info = await _get_route_training_store_info(request.model_id)
     if not isinstance(info, dict):
         raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
 
+    await _protect_training_session_enqueue_window(info)
     try:
         _token_count, max_seq_len = _reverse_kl_token_stats(request.data)
     except ValueError as exc:

@@ -142,6 +142,18 @@ async def test_issue_281_forward_enqueues_scheduler_metadata(monkeypatch) -> Non
         return None
 
     monkeypatch.setattr(tr, "_restore_training_session", _restore_training_session)
+
+    async def _get_training_route_session_info(_model_id: str):
+        return {
+            "model_id": "run-281",
+            "session_id": "sess-281",
+            "base_model": "Qwen/Qwen3-0.6B",
+            "backend": "peft",
+            "user_id": "owner-a",
+        }
+
+    monkeypatch.setattr(tr, "_get_training_route_session_info", _get_training_route_session_info)
+    monkeypatch.setattr(tr, "_protect_training_session_enqueue_window", _async_none)
     monkeypatch.setattr(tr, "_get_max_model_len", lambda _base_model: 4096)
     monkeypatch.setattr(
         tr,
@@ -295,6 +307,18 @@ async def test_issue_281_save_weights_for_sampler_enqueues_scheduler_metadata(mo
         return None
 
     monkeypatch.setattr(tr, "_restore_training_session", _restore_training_session)
+
+    async def _get_training_route_session_info(_model_id: str):
+        return {
+            "model_id": "run-281",
+            "session_id": "sess-281",
+            "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "backend": "megatron",
+            "user_id": "owner-a",
+        }
+
+    monkeypatch.setattr(tr, "_get_training_route_session_info", _get_training_route_session_info)
+    monkeypatch.setattr(tr, "_protect_training_session_enqueue_window", _async_none)
     monkeypatch.setattr(
         tr,
         "future_store",
@@ -355,6 +379,18 @@ async def test_issue_281_reset_expert_bias_enqueues_scheduler_metadata(monkeypat
     monkeypatch.setattr(tr, "training_manager", _manager_stub(session))
     monkeypatch.setattr(tr, "training_engine", object())
     monkeypatch.setattr(tr, "_restore_training_session", _async_none)
+
+    async def _get_training_route_session_info(_model_id: str):
+        return {
+            "model_id": "run-281",
+            "session_id": "sess-281",
+            "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "backend": "megatron",
+            "user_id": "owner-a",
+        }
+
+    monkeypatch.setattr(tr, "_get_training_route_session_info", _get_training_route_session_info)
+    monkeypatch.setattr(tr, "_protect_training_session_enqueue_window", _async_none)
     monkeypatch.setattr(
         tr,
         "future_store",
