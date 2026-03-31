@@ -89,6 +89,54 @@ async def test_issue_364_queue_supervisor_claim_and_heartbeat(monkeypatch) -> No
     assert await qs.queue_supervisor.async_is_generation_current(generation_id=1) is True
 
 
+def test_issue_364_queue_supervisor_same_owner_claim_keeps_active_state(monkeypatch) -> None:
+    import tinker_server.backend.queue_supervisor as qs
+
+    class _ActorState:
+        def __init__(self) -> None:
+            self.generation_id = 0
+            self.owner_id = None
+            self.expires_at = 0.0
+            self.state = "inactive"
+
+        def snapshot(self):
+            return {
+                "generation_id": self.generation_id,
+                "owner_id": self.owner_id,
+                "expires_at": self.expires_at,
+                "state": self.state,
+            }
+
+        def claim_generation(self, *, owner_id: str, ttl_s: float):
+            now = 100.0
+            requested_owner = str(owner_id)
+            if self.expires_at > now and self.owner_id != requested_owner:
+                return self.snapshot()
+            if self.expires_at > now and self.owner_id == requested_owner:
+                self.expires_at = now + float(ttl_s)
+                return self.snapshot()
+            if self.owner_id != requested_owner:
+                self.generation_id += 1
+            self.owner_id = requested_owner
+            self.expires_at = now + float(ttl_s)
+            self.state = "starting"
+            return self.snapshot()
+
+        def finish_reconcile(self):
+            self.state = "active"
+            return self.snapshot()
+
+    s = _ActorState()
+    first = s.claim_generation(owner_id="owner-a", ttl_s=30.0)
+    assert first["generation_id"] == 1
+    assert first["state"] == "starting"
+    active = s.finish_reconcile()
+    assert active["state"] == "active"
+    claimed_again = s.claim_generation(owner_id="owner-a", ttl_s=30.0)
+    assert claimed_again["generation_id"] == 1
+    assert claimed_again["state"] == "active"
+
+
 def test_issue_364_future_store_rejects_stale_generation(monkeypatch) -> None:
     future_store_module = importlib.import_module("tinker_server.backend.future_store")
 
