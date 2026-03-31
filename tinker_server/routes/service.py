@@ -850,9 +850,71 @@ def _load_adapter_from_path(adapter_path: str, lora_rank: int) -> tuple[dict, di
     return state_dict, peft_config
 
 
+async def _child_sampler_ids_for_heartbeat(
+    root_session_id: str,
+    request_user_data: dict | None,
+) -> list[str]:
+    try:
+        from ..backend.session_index_store import get_sampler_index, get_session_index
+
+        info = await run_in_threadpool(get_session_index, root_session_id)
+    except Exception as e:
+        logger.warning("[session_heartbeat] session index lookup failed for %s: %s", root_session_id, e)
+        return []
+
+    if not isinstance(info, dict):
+        return []
+    if not _user_visible(request_user_data, info.get("user_id")):
+        logger.warning("[session_heartbeat] child sampler propagation denied for %s", root_session_id)
+        return []
+
+    seen: set[str] = set()
+    direct = info.get("heartbeat_sampler_ids") or []
+    if direct:
+        out: list[str] = []
+        for sampler_id in direct:
+            if not isinstance(sampler_id, str) or not sampler_id or sampler_id in seen:
+                continue
+            seen.add(sampler_id)
+            out.append(sampler_id)
+        return out
+
+    training_run_ids = {
+        training_run_id
+        for training_run_id in info.get("training_run_ids") or []
+        if isinstance(training_run_id, str) and training_run_id
+    }
+    out: list[str] = []
+    for sampler_id in info.get("sampler_ids") or []:
+        if not isinstance(sampler_id, str) or not sampler_id or sampler_id in seen:
+            continue
+        seen.add(sampler_id)
+        try:
+            sampler_info = await run_in_threadpool(get_sampler_index, sampler_id)
+        except Exception as e:
+            logger.warning("[session_heartbeat] sampler index lookup failed for %s: %s", sampler_id, e)
+            continue
+        if not isinstance(sampler_info, dict):
+            continue
+        if sampler_info.get("source_type") != "checkpoint":
+            continue
+        model_id = sampler_info.get("model_id")
+        if isinstance(model_id, str) and model_id in training_run_ids:
+            out.append(sampler_id)
+    return out
+
+
+async def _touch_child_sampler_sessions(root_session_id: str, request_user_data: dict | None) -> None:
+    if session_manager is None:
+        return
+    for sampler_id in await _child_sampler_ids_for_heartbeat(root_session_id, request_user_data):
+        session_manager.mark_session_inflight(sampler_id, 0)
+
+
 @router.post("/session_heartbeat")
 async def session_heartbeat(
     request: SessionHeartbeatRequest,
+    http_request: Request,
 ) -> SessionHeartbeatResponse:
     """Keep session alive.
 
@@ -860,8 +922,9 @@ async def session_heartbeat(
     """
     session_heartbeat_store.update(request.session_id)
     if session_manager is not None:
-        # Keep sampling sessions alive during long training phases between sample calls.
+        # Keep the root session alive and refresh heartbeat-eligible child sampler sessions.
         session_manager.mark_session_inflight(request.session_id, 0)
+        await _touch_child_sampler_sessions(request.session_id, _get_user_data(http_request))
     return SessionHeartbeatResponse()
 
 
