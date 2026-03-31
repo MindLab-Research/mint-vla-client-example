@@ -16,6 +16,13 @@ except ModuleNotFoundError:  # pragma: no cover
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PYPROJECT = REPO_ROOT / "pyproject.toml"
+DEFAULT_INSPECT_PROBE_MODULES = (
+    "openpi",
+    "jax",
+    "flax",
+    "optax",
+    "orbax.checkpoint",
+)
 
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -63,6 +70,7 @@ def _runtime_env_symbols():
         DEFAULT_SITE_PACKAGES_DIRNAME,
         DEFAULT_SOURCE_DIRNAME,
         checkout_runtime_env_layout,
+        runtime_env_layout,
     )
 
     return {
@@ -71,7 +79,49 @@ def _runtime_env_symbols():
         "DEFAULT_SITE_PACKAGES_DIRNAME": DEFAULT_SITE_PACKAGES_DIRNAME,
         "DEFAULT_SOURCE_DIRNAME": DEFAULT_SOURCE_DIRNAME,
         "checkout_runtime_env_layout": checkout_runtime_env_layout,
+        "runtime_env_layout": runtime_env_layout,
     }
+
+
+def _load_manifest(env_root: Path) -> dict[str, Any]:
+    manifest_path = env_root / "manifest.json"
+    if not manifest_path.exists():
+        raise RuntimeError(f"missing manifest.json under {env_root}")
+    return json.loads(manifest_path.read_text(encoding="utf-8"))
+
+
+def _required_runtime_paths(layout) -> list[str]:
+    return [
+        layout.site_packages,
+        *layout.pythonpath_entries[1:],
+        layout.base_python_root,
+        layout.host_venv_root,
+        layout.host_python,
+        *layout.host_pythonpath_entries,
+    ]
+
+
+def _probe_module(host_python: str, module: str) -> dict[str, Any]:
+    out = subprocess.run(
+        [
+            host_python,
+            "-c",
+            (
+                "import importlib, sys; "
+                "importlib.import_module(sys.argv[1])"
+            ),
+            module,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    detail = (out.stderr or out.stdout).strip()
+    result = {
+        "ok": out.returncode == 0,
+    }
+    if detail:
+        result["detail"] = detail
+    return result
 
 def _clone_checkout(target: Path, *, repo: str, commit: str) -> None:
     if target.exists():
@@ -356,6 +406,53 @@ def _write_host_wrappers(env_root: Path, host_python: Path) -> None:
         script.chmod(0o755)
 
 
+def inspect_runtime_env(
+    env_root: Path,
+    *,
+    probe_modules: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    env_root = env_root.resolve()
+    runtime_env = _runtime_env_symbols()
+    snapshot: dict[str, Any] = {
+        "env_root": str(env_root),
+        "manifest_path": str(env_root / "manifest.json"),
+        "manifest_present": False,
+        "valid_layout": False,
+        "missing_paths": [],
+        "probe_modules": list(probe_modules or DEFAULT_INSPECT_PROBE_MODULES),
+        "probe_results": {},
+    }
+    try:
+        manifest = _load_manifest(env_root)
+    except Exception as exc:
+        snapshot["layout_error"] = f"{type(exc).__name__}: {exc}"
+        return snapshot
+
+    snapshot["manifest_present"] = True
+    snapshot["runtime_env"] = manifest.get("runtime_env", {})
+    snapshot["sources"] = [source.get("name", "") for source in manifest.get("sources", [])]
+
+    layout = runtime_env["runtime_env_layout"](str(env_root))
+    snapshot["host_python"] = layout.host_python
+    snapshot["site_packages"] = layout.site_packages
+    snapshot["pythonpath_entries"] = list(layout.pythonpath_entries)
+    snapshot["host_pythonpath_entries"] = list(layout.host_pythonpath_entries)
+
+    missing_paths = [path for path in _required_runtime_paths(layout) if not Path(path).exists()]
+    snapshot["missing_paths"] = missing_paths
+    snapshot["valid_layout"] = not missing_paths
+    if missing_paths:
+        snapshot["layout_error"] = (
+            "PFS runtime env root is incomplete. "
+            f"root={env_root!s} missing={missing_paths!r}"
+        )
+        return snapshot
+
+    for module in snapshot["probe_modules"]:
+        snapshot["probe_results"][module] = _probe_module(layout.host_python, module)
+    return snapshot
+
+
 def build_runtime_env(env_root: Path) -> None:
     pyproject = _load_pyproject()
     runtime = _runtime_table(pyproject)
@@ -395,12 +492,25 @@ def build_runtime_env(env_root: Path) -> None:
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--env-root", required=True, help="Destination PFS runtime env root")
+    p.add_argument("--inspect", action="store_true", help="Inspect an existing runtime env root")
+    p.add_argument(
+        "--probe-module",
+        action="append",
+        default=None,
+        help="Module name to import with the runtime env host python during --inspect",
+    )
     return p.parse_args(argv)
 
 
 def main(argv: list[str]) -> int:
     args = _parse_args(argv)
-    build_runtime_env(Path(args.env_root).resolve())
+    env_root = Path(args.env_root).resolve()
+    if args.inspect:
+        snapshot = inspect_runtime_env(env_root, probe_modules=args.probe_module)
+        print(json.dumps(snapshot, indent=2))
+        probe_failed = any(not result["ok"] for result in snapshot["probe_results"].values())
+        return 0 if snapshot["valid_layout"] and not probe_failed else 1
+    build_runtime_env(env_root)
     return 0
 
 

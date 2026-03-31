@@ -43,6 +43,14 @@ def _materialize_runtime_env(root: Path) -> None:
     Path(layout.host_python).chmod(0o755)
 
 
+def _materialize_runtime_env_with_real_host_python(root: Path) -> None:
+    _materialize_runtime_env(root)
+    layout = checkout_runtime_env_layout(str(root))
+    host_python = Path(layout.host_python)
+    host_python.unlink()
+    host_python.symlink_to(Path(sys.executable))
+
+
 def test_build_runtime_pythonpath_uses_canonical_root(tmp_path):
     env_root = tmp_path / "runtime"
     _materialize_runtime_env(env_root)
@@ -224,6 +232,54 @@ def test_build_runtime_env_normalizes_host_only_vllm_source_metadata(tmp_path):
     pkg_info_text = pkg_info.read_text(encoding="utf-8")
     assert "Name: vllm" in pkg_info_text
     assert "Version: 0.16.0" in pkg_info_text
+
+
+def test_inspect_runtime_env_reports_probe_results(tmp_path):
+    from scripts import build_runtime_env as build_runtime_env
+
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env_with_real_host_python(env_root)
+
+    snapshot = build_runtime_env.inspect_runtime_env(
+        env_root,
+        probe_modules=["json", "pathlib"],
+    )
+
+    assert snapshot["env_root"] == str(env_root)
+    assert snapshot["manifest_path"] == str(env_root / "manifest.json")
+    assert snapshot["valid_layout"] is True
+    assert snapshot["missing_paths"] == []
+    assert snapshot["host_python"] == str(env_root / "host-venv" / "bin" / "python")
+    assert snapshot["probe_results"]["json"]["ok"] is True
+    assert snapshot["probe_results"]["pathlib"]["ok"] is True
+
+
+def test_build_runtime_env_inspect_cli_returns_nonzero_on_probe_failure(tmp_path):
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env_with_real_host_python(env_root)
+
+    out = subprocess.run(
+        [
+            sys.executable,
+            "scripts/build_runtime_env.py",
+            "--inspect",
+            "--env-root",
+            str(env_root),
+            "--probe-module",
+            "json",
+            "--probe-module",
+            "does_not_exist_for_runtime_env_probe",
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+    )
+
+    assert out.returncode == 1
+    snapshot = json.loads(out.stdout)
+    assert snapshot["valid_layout"] is True
+    assert snapshot["probe_results"]["json"]["ok"] is True
+    assert snapshot["probe_results"]["does_not_exist_for_runtime_env_probe"]["ok"] is False
 
 
 def test_runtime_env_layout_prefers_manifest_sources(tmp_path):
