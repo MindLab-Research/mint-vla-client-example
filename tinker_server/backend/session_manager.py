@@ -45,6 +45,7 @@ class SessionInfo:
     lora_int_id: int | None = None  # Persisted multi-LoRA id for restart recovery
     metadata_version: int = 1  # Monotonic metadata version for worker-local cache coherence
     inflight_requests: int = 0  # Prevent cleanup while requests are running
+    pending_persist: bool = False  # Local create path before detached state is visible
 
 
 @dataclass(frozen=True)
@@ -109,6 +110,7 @@ class SessionManager:
                     "lora_int_id": info.lora_int_id,
                     "uses_base_model": bool(info.uses_base_model),
                     "last_activity": float(info.last_activity),
+                    "inflight_requests": int(info.inflight_requests),
                     "metadata_version": int(info.metadata_version),
                 }
             )
@@ -120,7 +122,7 @@ class SessionManager:
         self._persist_sampling_session_info(session_id, info)
 
     async def start_cleanup_task(self) -> None:
-        """Start the background cleanup task."""
+        """Deprecated local cleanup loop retained only for legacy tests."""
         if self._cleanup_task is None:
             self._cleanup_task = asyncio.create_task(self._cleanup_loop())
             logger.info(
@@ -177,11 +179,12 @@ class SessionManager:
         This is required for long-context requests that can exceed the inactivity
         timeout while still actively running.
         """
-        info = self._sessions.get(session_id)
+        info = self._get_session_info(session_id, touch=False)
         if info is None:
             return
-        self._touch_info(session_id, info)
+        info.last_activity = time.time()
         info.inflight_requests = max(0, info.inflight_requests + delta)
+        self._persist_sampling_session_info(session_id, info)
 
     # =========================================================================
     # Shared Engine Methods (for fast ephemeral weight sync)
@@ -264,6 +267,7 @@ class SessionManager:
             last_activity=time.time(),
             lora_rank=lora_rank,
             is_shared=True,
+            pending_persist=True,
         )
         logger.info(
             f"Created ephemeral session {session_id} using shared engine "
@@ -320,6 +324,7 @@ class SessionManager:
             engine=engine,
             last_activity=time.time(),
             lora_rank=lora_rank,
+            pending_persist=True,
         )
         logger.info(
             f"Created session {session_id} with lora_rank={lora_rank}, "
@@ -369,33 +374,54 @@ class SessionManager:
             last_activity=time.time(),
             lora_rank=lora_rank,
             is_shared=True,  # Mark as shared to prevent SessionManager from shutting it down
+            pending_persist=True,
         )
         logger.info(
             f"Registered session {session_id} with external engine "
             f"(lora_rank={lora_rank})"
         )
 
-    def get_engine(self, session_id: str) -> VerlInferenceEngine | None:
-        """Get the engine for a session and update activity timestamp.
+    def _restore_from_detached_store(self, session_id: str) -> SessionInfo | None:
+        try:
+            from .sampling_session_store import get_sampling_session_info
 
-        Args:
-            session_id: The session identifier.
+            info = get_sampling_session_info(session_id)
+        except Exception:
+            return self._sessions.get(session_id)
 
-        Returns:
-            The engine if session exists, None otherwise.
-        """
+        if not isinstance(info, dict):
+            return self._sessions.get(session_id)
+        if not self.restore_sampling_session(info):
+            return self._sessions.get(session_id)
+        restored = self._sessions.get(session_id)
+        if restored is not None:
+            restored.pending_persist = False
+        return restored
+
+    def _get_session_info(self, session_id: str, *, touch: bool = True) -> SessionInfo | None:
         info = self._sessions.get(session_id)
         if info is None:
+            info = self._restore_from_detached_store(session_id)
+        elif not bool(getattr(info, "pending_persist", False)) and info.uses_multi_lora:
+            refreshed = self._restore_from_detached_store(session_id)
+            if refreshed is not None:
+                info = refreshed
+        if info is not None and touch:
+            self._touch_info(session_id, info)
+        return info
+
+    def get_engine(self, session_id: str) -> VerlInferenceEngine | None:
+        """Get the engine for a session and update activity timestamp."""
+        info = self._get_session_info(session_id)
+        if info is None:
             return None
-        self._touch_info(session_id, info)
         return info.engine
 
     def get_sampling_session_snapshot(self, session_id: str) -> SamplingSessionSnapshot | None:
         """Build a request-scope immutable snapshot for sampling session metadata."""
-        info = self._sessions.get(session_id)
+        info = self._get_session_info(session_id)
         if info is None:
             return None
-        self._touch_info(session_id, info)
         return SamplingSessionSnapshot(
             session_id=session_id,
             uses_multi_lora=bool(info.uses_multi_lora),
@@ -443,7 +469,10 @@ class SessionManager:
         """
         info = self._sessions.pop(session_id, None)
         if info is None:
-            return False
+            info = self._restore_from_detached_store(session_id)
+            if info is None:
+                return False
+            self._sessions.pop(session_id, None)
         try:
             from .sampling_session_store import delete_sampling_session
 
@@ -517,32 +546,48 @@ class SessionManager:
             logger.info("Shutdown shared engine")
 
     def list_sessions(self) -> list[str]:
-        """List all active session IDs."""
-        return list(self._sessions.keys())
+        """List active session IDs from detached authority plus local pending sessions."""
+        session_ids: set[str] = set(self._sessions.keys())
+        try:
+            from .sampling_session_store import list_sampling_sessions
+
+            for info in list_sampling_sessions():
+                if isinstance(info, dict):
+                    session_id = str(info.get("session_id") or "").strip()
+                    if session_id:
+                        session_ids.add(session_id)
+        except Exception:
+            pass
+        return list(session_ids)
 
     def observability_snapshot(self) -> dict[str, int]:
-        total = len(self._sessions)
-        multi_lora = 0
-        base_model = 0
-        lora_loaded = 0
-        inflight = 0
+        try:
+            from .sampling_session_store import list_sampling_sessions
 
-        for info in self._sessions.values():
-            if info.uses_multi_lora:
-                multi_lora += 1
-            if info.uses_base_model:
-                base_model += 1
-            if info.lora_loaded and not info.uses_base_model:
-                lora_loaded += 1
-            if info.inflight_requests > 0:
-                inflight += 1
+            infos = [dict(info) for info in list_sampling_sessions() if isinstance(info, dict)]
+        except Exception:
+            infos = []
+
+        if not infos:
+            infos = [
+                {
+                    "session_id": session_id,
+                    "uses_multi_lora": bool(info.uses_multi_lora),
+                    "uses_base_model": bool(info.uses_base_model),
+                    "lora_loaded": bool(info.lora_loaded),
+                    "inflight_requests": int(info.inflight_requests),
+                }
+                for session_id, info in self._sessions.items()
+            ]
 
         return {
-            "sampling_sessions_total": total,
-            "sampling_sessions_multi_lora": multi_lora,
-            "sampling_sessions_base_model": base_model,
-            "sampling_sessions_lora_loaded": lora_loaded,
-            "sampling_sessions_inflight": inflight,
+            "sampling_sessions_total": len(infos),
+            "sampling_sessions_multi_lora": sum(1 for info in infos if bool(info.get("uses_multi_lora"))),
+            "sampling_sessions_base_model": sum(1 for info in infos if bool(info.get("uses_base_model"))),
+            "sampling_sessions_lora_loaded": sum(
+                1 for info in infos if bool(info.get("lora_loaded")) and not bool(info.get("uses_base_model"))
+            ),
+            "sampling_sessions_inflight": sum(1 for info in infos if int(info.get("inflight_requests") or 0) > 0),
         }
 
     # =========================================================================
@@ -598,9 +643,7 @@ class SessionManager:
         Returns:
             Base model name, or None if session not found.
         """
-        info = self._sessions.get(session_id)
-        if info is not None:
-            self._touch_info(session_id, info)
+        info = self._get_session_info(session_id)
         return info.base_model if info else None
 
     async def get_engine_for_session(self, session_id: str) -> "MultiLoRAInferenceEngine | None":
@@ -612,10 +655,9 @@ class SessionManager:
         Returns:
             MultiLoRAInferenceEngine for the session's model, or None if not found.
         """
-        info = self._sessions.get(session_id)
+        info = self._get_session_info(session_id)
         if info is None:
             return None
-        self._touch_info(session_id, info)
         base_model = info.base_model
         if base_model is None:
             return None
@@ -664,46 +706,43 @@ class SessionManager:
             lora_loaded=bool(lora_loaded),
             lora_int_id=None if lora_int_id is None else int(lora_int_id),
             metadata_version=max(1, int(metadata_version) if metadata_version is not None else 1),
+            pending_persist=bool(persist),
         )
         if persist:
             self._persist_sampling_session_info(session_id, self._sessions[session_id])
+            self._sessions[session_id].pending_persist = False
         logger.info(
             f"Registered multi-LoRA session {session_id} (model={base_model}, lora_rank={lora_rank})"
         )
 
     def get_session_lora_rank(self, session_id: str) -> int | None:
-        info = self._sessions.get(session_id)
+        info = self._get_session_info(session_id)
         if info is None:
             return None
-        self._touch_info(session_id, info)
         return int(info.lora_rank)
 
     def get_session_adapter_path(self, session_id: str) -> str | None:
-        info = self._sessions.get(session_id)
+        info = self._get_session_info(session_id)
         if info is None:
             return None
-        self._touch_info(session_id, info)
         return info.adapter_path
 
     def get_session_lora_int_id(self, session_id: str) -> int | None:
-        info = self._sessions.get(session_id)
+        info = self._get_session_info(session_id)
         if info is None:
             return None
-        self._touch_info(session_id, info)
         return None if info.lora_int_id is None else int(info.lora_int_id)
 
     def get_session_metadata_version(self, session_id: str) -> int | None:
-        info = self._sessions.get(session_id)
+        info = self._get_session_info(session_id)
         if info is None:
             return None
-        self._touch_info(session_id, info)
         return max(1, int(info.metadata_version))
 
     def is_session_lora_loaded(self, session_id: str) -> bool:
-        info = self._sessions.get(session_id)
+        info = self._get_session_info(session_id)
         if info is None:
             return False
-        self._touch_info(session_id, info)
         return bool(info.lora_loaded)
 
     def mark_session_lora_loaded(
@@ -713,10 +752,9 @@ class SessionManager:
         *,
         lora_int_id: int | None = None,
     ) -> None:
-        info = self._sessions.get(session_id)
+        info = self._get_session_info(session_id)
         if info is None:
             return
-        self._touch_info(session_id, info)
         new_loaded = bool(loaded)
         changed = bool(info.lora_loaded) != new_loaded
         info.lora_loaded = new_loaded
@@ -762,7 +800,7 @@ class SessionManager:
         Returns:
             True if session uses multi-LoRA, False otherwise.
         """
-        info = self._sessions.get(session_id)
+        info = self._get_session_info(session_id, touch=False)
         return info is not None and info.uses_multi_lora
 
     def is_base_model_session(self, session_id: str) -> bool:
@@ -774,7 +812,7 @@ class SessionManager:
         Returns:
             True if session uses base model, False otherwise.
         """
-        info = self._sessions.get(session_id)
+        info = self._get_session_info(session_id, touch=False)
         return info is not None and info.uses_base_model
 
     def register_base_model_session(
@@ -808,6 +846,7 @@ class SessionManager:
             base_model=base_model,
             lora_loaded=False,
             metadata_version=max(1, int(metadata_version) if metadata_version is not None else 1),
+            pending_persist=False,
         )
         self._persist_sampling_session_info(session_id, self._sessions[session_id])
         logger.info(f"Registered base model session {session_id} (model={base_model})")
@@ -844,6 +883,8 @@ class SessionManager:
                 existing.lora_loaded = bool(info.get("lora_loaded"))
                 existing.lora_int_id = info.get("lora_int_id")
             existing.metadata_version = incoming_version
+            existing.inflight_requests = int(info.get("inflight_requests") or existing.inflight_requests)
+            existing.pending_persist = False
             return True
 
         uses_base_model = bool(info.get("uses_base_model"))
@@ -859,6 +900,8 @@ class SessionManager:
                 base_model=base_model,
                 lora_loaded=False,
                 metadata_version=incoming_version,
+                inflight_requests=int(info.get("inflight_requests") or 0),
+                pending_persist=False,
             )
             return True
 
@@ -873,6 +916,10 @@ class SessionManager:
             metadata_version=incoming_version,
             persist=False,
         )
+        restored = self._sessions.get(session_id)
+        if restored is not None:
+            restored.inflight_requests = int(info.get("inflight_requests") or 0)
+            restored.pending_persist = False
         return True
 
     async def _restore_loaded_lora_registration(

@@ -48,6 +48,7 @@ class TrainingSession:
     inflight_ops: int = 0  # Prevent cleanup while requests are queued or running
     backend: str = "peft"  # "peft" for dense models, "megatron" for MoE
     metadata_version: int = 1  # Monotonic metadata version for cache coherence
+    pending_persist: bool = True  # Local create path before detached state is visible
 
     # Per-session inference engine for isolated concurrent access
     # Lazily initialized on first save_weights_for_sampler call
@@ -154,6 +155,7 @@ class TrainingSessionManager:
             metadata_version=max(1, int(metadata_version) if metadata_version is not None else 1),
         )
 
+        session.pending_persist = True
         self._sessions[model_id] = session
         logger.info(
             f"Created training session: {model_id} "
@@ -219,6 +221,7 @@ class TrainingSessionManager:
                 metadata_version=incoming_version,
             )
             session.backend = str(info.get("backend", session.backend))
+            session.pending_persist = False
             try:
                 session.current_step = int(info.get("current_step", session.current_step))
             except Exception:
@@ -254,6 +257,7 @@ class TrainingSessionManager:
             except Exception:
                 pass
             session.metadata_version = incoming_version
+            session.pending_persist = False
 
         try:
             raw_last_activity = info.get("last_activity")
@@ -266,19 +270,65 @@ class TrainingSessionManager:
             session.created_at = created_at
         return session
 
+    def mark_persisted(self, model_id: str) -> None:
+        session = self._sessions.get(model_id)
+        if session is not None:
+            session.pending_persist = False
+
     def get_session(self, model_id: str) -> TrainingSession | None:
         """Get training session by model_id.
 
-        Does NOT update last_activity; call touch_session() explicitly
-        in training operation routes to prevent idle cleanup.  Read-only
-        lookups (GET /models, GET /training_runs, existence checks) must
-        not extend the idle deadline.
+        Detached training_session_store is the authoritative state source.
+        The local map is only a request-path cache plus create-time scratch state.
         """
-        return self._sessions.get(model_id)
+        session = self._sessions.get(model_id)
+        if session is not None and bool(getattr(session, "pending_persist", False)):
+            return session
+
+        try:
+            from .training_session_store import get_training_session_info
+
+            info = get_training_session_info(model_id)
+        except Exception:
+            return session
+
+        if not isinstance(info, dict):
+            if session is not None and not bool(getattr(session, "pending_persist", False)):
+                self._sessions.pop(model_id, None)
+            return session if session is not None and bool(getattr(session, "pending_persist", False)) else None
+
+        restored = self.restore_training_session_info(info)
+        if restored is not None:
+            restored.pending_persist = False
+        return restored
 
     def list_sessions(self) -> list[TrainingSession]:
-        """List all training sessions."""
-        return list(self._sessions.values())
+        """List training sessions from detached authority plus local pending creates."""
+        out: list[TrainingSession] = []
+        seen: set[str] = set()
+        try:
+            from .training_session_store import list_training_sessions
+
+            infos = list_training_sessions()
+        except Exception:
+            return list(self._sessions.values())
+
+        for info in infos:
+            if not isinstance(info, dict):
+                continue
+            restored = self.restore_training_session_info(info)
+            if restored is None:
+                continue
+            restored.pending_persist = False
+            out.append(restored)
+            seen.add(restored.model_id)
+
+        for model_id, session in self._sessions.items():
+            if model_id in seen:
+                continue
+            if bool(getattr(session, "pending_persist", False)):
+                out.append(session)
+        return out
 
     def delete_session(self, model_id: str) -> bool:
         """Delete a training session.

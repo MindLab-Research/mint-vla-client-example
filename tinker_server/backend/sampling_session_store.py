@@ -92,6 +92,7 @@ def _get_or_create_actor():
             current.setdefault("last_activity", time.time())
             current.setdefault("lora_loaded", False)
             current.setdefault("uses_base_model", False)
+            current.setdefault("inflight_requests", 0)
             current["metadata_version"] = incoming_version
             self._sessions[session_id] = current
 
@@ -236,6 +237,15 @@ def set_sampling_session_last_activity(session_id: str, last_activity: float) ->
         actor.set_last_activity.remote(session_id, float(last_activity))
     except Exception as e:
         logger.debug("Sampling session store write failed: last_activity: %s", e)
+
+
+async def async_set_sampling_session_last_activity(session_id: str, last_activity: float) -> float | None:
+    out = await _call_actor_for_async_request_path(
+        lambda actor: actor.set_last_activity.remote(session_id, float(last_activity))
+    )
+    if out is None:
+        return None
+    return float(out)
 
 
 def get_sampling_session_info(session_id: str) -> dict[str, Any] | None:

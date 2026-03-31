@@ -241,9 +241,12 @@ class CapacityManager:
             raise CapacityManagerUnavailableError("Ray not initialized")
 
         if self._ray_actor is None:
-            raise CapacityManagerUnavailableError(
-                "Detached Ray CapacityManager actor is not ready on this API server"
-            )
+            try:
+                self._ray_actor = _get_or_create_ray_actor()
+            except Exception as e:
+                raise CapacityManagerUnavailableError(
+                    "Detached Ray CapacityManager actor is not ready on this API server"
+                ) from e
         return self._ray_actor
 
     def _get_ray_actor(self):

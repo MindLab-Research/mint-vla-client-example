@@ -189,6 +189,32 @@ def _get_sampling_snapshot(session_id: str) -> SamplingSessionSnapshot | None:
     return _snapshot_from_legacy_getters(session_id)
 
 
+async def _async_get_detached_sampling_snapshot(session_id: str) -> SamplingSessionSnapshot | None:
+    try:
+        from ..backend.sampling_session_store import async_get_sampling_session_info
+
+        info = await async_get_sampling_session_info(session_id)
+    except Exception:
+        if session_manager is not None:
+            return _get_sampling_snapshot(session_id)
+        return None
+    if not isinstance(info, dict):
+        if session_manager is not None:
+            return _get_sampling_snapshot(session_id)
+        return None
+    return SamplingSessionSnapshot(
+        session_id=str(info.get("session_id") or session_id),
+        uses_multi_lora=True,
+        uses_base_model=bool(info.get("uses_base_model")),
+        base_model=info.get("base_model"),
+        lora_rank=int(info.get("lora_rank") or 0),
+        adapter_path=info.get("adapter_path"),
+        lora_loaded=bool(info.get("lora_loaded")),
+        lora_int_id=None if info.get("lora_int_id") is None else int(info.get("lora_int_id")),
+        metadata_version=max(1, int(info.get("metadata_version") or 1)),
+    )
+
+
 def _has_local_sampling_session(session_id: str) -> bool:
     if session_manager is None:
         return False
@@ -771,8 +797,22 @@ async def asample(
             status_code=422,
             detail="seq_id is required when sampling_session_id or model_id is provided",
         )
-    is_local = await _restore_local_sampling_session_if_needed(session_id)
-    remote = None if is_local else await async_remote_sampling_session(session_id)
+    snapshot = await _async_get_detached_sampling_snapshot(session_id)
+    remote = None
+    if snapshot is None:
+        try:
+            remote = await async_remote_sampling_session(session_id)
+        except Exception:
+            remote = None
+        if remote is None:
+            try:
+                from ..gateway import remote_sampling_session
+
+                remote = remote_sampling_session(session_id)
+            except Exception:
+                remote = None
+    if snapshot is None and remote is None and session_manager is None:
+        raise HTTPException(status_code=503, detail="Sampling session store unavailable")
     if remote is not None:
         upstream_alias, base_model = remote
         upstream = upstream_for_alias(upstream_alias)
@@ -801,12 +841,7 @@ async def asample(
             request_id=encode_request_id(upstream_alias=upstream_alias, upstream_request_id=upstream_request_id)
         )
 
-    # Preflight prompt length gate for multi-LoRA sessions. Do this before enqueuing
-    # work so misconfiguration is surfaced as an HTTP error rather than a latent
-    # async failure.
-    if session_manager is None:
-        raise HTTPException(status_code=503, detail="Session manager not initialized")
-    snapshot = _get_sampling_snapshot(session_id)
+    # Preflight prompt length gate from detached sampling state before enqueuing work.
     if snapshot is not None and snapshot.uses_multi_lora:
         base_model = snapshot.base_model
         if not base_model:
@@ -932,6 +967,7 @@ async def asample(
             request_id,
             meta={
                 "op": "sampling.asample",
+                "sampling_session_id": str(session_id),
                 "queue_state": "queued",
                 "queued_at": time.time(),
                 "stage": "queued",
@@ -1033,8 +1069,22 @@ async def sample_once(
         )
         raise HTTPException(status_code=429, detail="Sampling backpressure: server overloaded")
 
-    is_local = await _restore_local_sampling_session_if_needed(session_id)
-    remote = None if is_local else await async_remote_sampling_session(session_id)
+    snapshot = await _async_get_detached_sampling_snapshot(session_id)
+    remote = None
+    if snapshot is None:
+        try:
+            remote = await async_remote_sampling_session(session_id)
+        except Exception:
+            remote = None
+        if remote is None:
+            try:
+                from ..gateway import remote_sampling_session
+
+                remote = remote_sampling_session(session_id)
+            except Exception:
+                remote = None
+    if snapshot is None and remote is None and session_manager is None:
+        raise HTTPException(status_code=503, detail="Sampling session store unavailable")
     if remote is not None:
         upstream_alias, base_model = remote
         upstream = upstream_for_alias(upstream_alias)
@@ -1131,6 +1181,9 @@ async def sample_once(
     session_manager.mark_session_inflight(session_id, +1)
     try:
         snapshot = _get_sampling_snapshot(session_id)
+        if snapshot is None:
+            await _restore_local_sampling_session_if_needed(session_id)
+            snapshot = _get_sampling_snapshot(session_id)
         is_multi_lora = bool(snapshot.uses_multi_lora) if snapshot is not None else session_manager.is_multi_lora_session(session_id)
         if is_multi_lora:
             base_model = snapshot.base_model if snapshot is not None else session_manager.get_session_base_model(session_id)
@@ -1630,8 +1683,22 @@ async def compute_logprobs(
         upstream_for_alias,
     )
 
-    is_local = await _restore_local_sampling_session_if_needed(request.sampling_session_id)
-    remote = None if is_local else await async_remote_sampling_session(request.sampling_session_id)
+    snapshot = await _async_get_detached_sampling_snapshot(request.sampling_session_id)
+    remote = None
+    if snapshot is None:
+        try:
+            remote = await async_remote_sampling_session(request.sampling_session_id)
+        except Exception:
+            remote = None
+        if remote is None:
+            try:
+                from ..gateway import remote_sampling_session
+
+                remote = remote_sampling_session(request.sampling_session_id)
+            except Exception:
+                remote = None
+    if snapshot is None and remote is None and session_manager is None:
+        raise HTTPException(status_code=503, detail="Sampling session store unavailable")
     if remote is not None:
         upstream_alias, base_model = remote
         upstream = upstream_for_alias(upstream_alias)
@@ -1661,9 +1728,6 @@ async def compute_logprobs(
         )
 
     # Preflight length gate for multi-LoRA sessions to fail fast on registry issues.
-    if session_manager is None:
-        raise HTTPException(status_code=503, detail="Session manager not initialized")
-    snapshot = _get_sampling_snapshot(request.sampling_session_id)
     if snapshot is not None and snapshot.uses_multi_lora:
         base_model = snapshot.base_model
         if not base_model:
@@ -1719,7 +1783,13 @@ async def compute_logprobs(
     try:
         await future_store.async_create_with_id(request_id)
         created = True
-        await future_store.async_mark_queued(request_id, meta={"op": "sampling.compute_logprobs"})
+        await future_store.async_mark_queued(
+            request_id,
+            meta={
+                "op": "sampling.compute_logprobs",
+                "sampling_session_id": str(request.sampling_session_id),
+            },
+        )
         base_model = snapshot.base_model if snapshot is not None else None
         await _enqueue_sampling_request_with_trace(
             route_start_s=route_start_s,

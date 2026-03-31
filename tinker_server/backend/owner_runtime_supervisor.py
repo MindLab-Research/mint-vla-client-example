@@ -17,7 +17,7 @@ from ..checkpoints import (
 )
 from ..server_info import _git_sha
 
-CURRENT_CODE_IDENTITY = _git_sha()
+CURRENT_CODE_IDENTITY = os.environ.get("MINT_GIT_SHA") or _git_sha()
 
 logger = logging.getLogger(__name__)
 _ACTOR_HANDLE = None
@@ -25,6 +25,9 @@ _ACTOR_HANDLE = None
 _LOOP_FUTURE_REAPER = "future_reaper"
 _LOOP_CHECKPOINT_REAPER = "checkpoint_reaper"
 _LOOP_CHECKPOINT_MIRROR = "checkpoint_mirror"
+_LOOP_ACTOR_RECONCILIATION = "actor_reconciliation"
+_LOOP_TRAINING_CLEANUP = "training_cleanup"
+_LOOP_SAMPLING_CLEANUP = "sampling_cleanup"
 
 
 def _actor_name() -> str:
@@ -71,6 +74,36 @@ def run_checkpoint_reaper_once() -> dict[str, Any]:
 
 def run_checkpoint_mirror_once() -> dict[str, Any]:
     return process_pending_checkpoint_mirrors()
+
+
+def _actor_reconcile_interval_s() -> float:
+    return float(os.environ.get("MINT_ACTOR_RECONCILE_INTERVAL_S", "60"))
+
+
+def run_actor_reconciliation_once() -> dict[str, Any]:
+    from .actor_reconciliation import cleanup_stale_actors_once
+
+    import asyncio
+
+    return asyncio.run(cleanup_stale_actors_once())
+
+
+def run_training_cleanup_once() -> dict[str, Any]:
+    from .training_cleanup_executor import training_cleanup_executor
+
+    import asyncio
+
+    cleaned = asyncio.run(training_cleanup_executor.async_cleanup_stale_sessions_once())
+    return {"cleaned": list(cleaned)}
+
+
+def run_sampling_cleanup_once() -> dict[str, Any]:
+    from .sampling_cleanup_executor import sampling_cleanup_executor
+
+    import asyncio
+
+    cleaned = asyncio.run(sampling_cleanup_executor.async_cleanup_stale_sessions_once())
+    return {"cleaned": list(cleaned)}
 
 
 async def _await_ray_ref(ref: Any) -> Any:
@@ -125,7 +158,7 @@ def _get_or_create_actor():
             init_actor_observability()
             self._epoch_id = uuid.uuid4().hex
             self._started_at = time.time()
-            self._code_identity = _git_sha()
+            self._code_identity = CURRENT_CODE_IDENTITY
             self._tasks: dict[str, asyncio.Task] = {}
             self._loop_state: dict[str, dict[str, Any]] = {}
             self._loop_specs: dict[str, dict[str, Any]] = {
@@ -143,6 +176,21 @@ def _get_or_create_actor():
                     "interval_s": float(get_checkpoint_mirror_poll_s()),
                     "run_immediately": True,
                     "runner": run_checkpoint_mirror_once,
+                },
+                _LOOP_ACTOR_RECONCILIATION: {
+                    "interval_s": _actor_reconcile_interval_s(),
+                    "run_immediately": False,
+                    "runner": run_actor_reconciliation_once,
+                },
+                _LOOP_TRAINING_CLEANUP: {
+                    "interval_s": _future_reap_interval_s(),
+                    "run_immediately": False,
+                    "runner": run_training_cleanup_once,
+                },
+                _LOOP_SAMPLING_CLEANUP: {
+                    "interval_s": _future_reap_interval_s(),
+                    "run_immediately": False,
+                    "runner": run_sampling_cleanup_once,
                 },
             }
             for name, spec in self._loop_specs.items():
@@ -233,9 +281,12 @@ def _get_or_create_actor():
             options["resources"] = {"node:__internal_head__": 0.001}
     except Exception:
         pass
+    extra_env = otel_env_vars()
+    if CURRENT_CODE_IDENTITY:
+        extra_env["MINT_GIT_SHA"] = str(CURRENT_CODE_IDENTITY)
     options["runtime_env"] = actor_runtime_env(
         pythonpath=PFS_PYTHONPATH,
-        extra=otel_env_vars(),
+        extra=extra_env,
     )
 
     try:

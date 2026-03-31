@@ -218,6 +218,7 @@ async def admission_stats() -> dict:
     from ..backend.capacity_manager import capacity_manager
     from ..backend.future_store import future_store
     from ..backend.owner_runtime_supervisor import owner_runtime_supervisor
+    from ..backend.queue_execution_runtime import queue_execution_runtime
     from ..backend.queue_supervisor import queue_supervisor
     from ..backend.resource_pool import get_resource_pool
     from ..backend.session_heartbeat_store import session_heartbeat_store
@@ -283,9 +284,15 @@ async def admission_stats() -> dict:
     except Exception as e:
         proc["rss_error"] = f"{type(e).__name__}: {e}"
 
+    try:
+        session_heartbeat_entries = int(await session_heartbeat_store.async_size())
+    except Exception as e:
+        session_heartbeat_entries = 0
+        actors["session_heartbeat_store"] = {"error": f"{type(e).__name__}: {e}"}
+
     driver_state: dict = {
         "sdk_sessions_fallback": 0,
-        "session_heartbeat_entries": int(session_heartbeat_store.size()),
+        "session_heartbeat_entries": session_heartbeat_entries,
     }
     try:
         driver_state["lora_load_locks"] = int(await sampling_route._lora_load_lock_count())
@@ -330,6 +337,12 @@ async def admission_stats() -> dict:
     except Exception as e:
         queue_runtime = {"error": f"{type(e).__name__}: {e}"}
 
+    queue_execution = None
+    try:
+        queue_execution = await queue_execution_runtime.async_health_snapshot(timeout_s=timeout_s)
+    except Exception as e:
+        queue_execution = {"error": f"{type(e).__name__}: {e}"}
+
     return {
         "capacity": cap,
         "work_queue": q,
@@ -341,6 +354,7 @@ async def admission_stats() -> dict:
         "ray_gcs_metrics": ray_gcs_metrics,
         "owner_runtime_supervisor": owner_runtime,
         "queue_supervisor": queue_runtime,
+        "queue_execution_runtime": queue_execution,
     }
 
 
@@ -356,6 +370,13 @@ async def queue_supervisor_health() -> dict:
     from ..backend.queue_supervisor import queue_supervisor
 
     return await queue_supervisor.async_snapshot(timeout_s=10.0)
+
+
+@router.get("/queue_execution_runtime")
+async def queue_execution_runtime_health() -> dict:
+    from ..backend.queue_execution_runtime import queue_execution_runtime
+
+    return await queue_execution_runtime.async_health_snapshot(timeout_s=10.0)
 
 
 @router.get("/ray_cluster_health")

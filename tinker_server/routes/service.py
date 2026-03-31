@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
@@ -58,7 +59,7 @@ if TYPE_CHECKING:
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-# Global session manager reference (set by app lifespan)
+# Global session manager reference (set only in execution runtimes or tests)
 session_manager: SessionManager | None = None
 
 
@@ -78,6 +79,19 @@ def _user_visible(request_user_data: dict | None, owner: str | None) -> bool:
     if is_admin_user_data(request_user_data):
         return True
     return bool(owner) and owner == request_user_id
+
+
+def _local_sampling_config(session_id: str) -> tuple[str | None, str | None, int | None]:
+    if session_manager is None:
+        return None, None, None
+    get_base_model = getattr(session_manager, "get_session_base_model", None)
+    get_adapter_path = getattr(session_manager, "get_session_adapter_path", None)
+    get_lora_rank = getattr(session_manager, "get_session_lora_rank", None)
+    return (
+        get_base_model(session_id) if callable(get_base_model) else None,
+        get_adapter_path(session_id) if callable(get_adapter_path) else None,
+        get_lora_rank(session_id) if callable(get_lora_rank) else None,
+    )
 
 
 def _parse_checkpoint_path(model_path: str) -> tuple[str, str] | None:
@@ -255,9 +269,6 @@ async def _create_sampling_session_impl(
     First call lazily initializes the multi-LoRA engine (~60s).
     Subsequent calls register sessions instantly (<1s).
     """
-    if session_manager is None:
-        raise HTTPException(status_code=503, detail="Session manager not initialized")
-
     user_id = _get_user_id(http_request)
     created_at = datetime.now().isoformat()
     # Determine base_model from request or infer from model_path.
@@ -406,13 +417,23 @@ async def _create_sampling_session_impl(
 
     if request.sampling_session_seq_id is not None:
         sampling_session_id = f"{request.session_id}:sample:{request.sampling_session_seq_id}"
-        existing_base = session_manager.get_session_base_model(sampling_session_id)
+        existing_info = None
+        try:
+            from ..backend.sampling_session_store import async_get_sampling_session_info
+
+            existing_info = await async_get_sampling_session_info(sampling_session_id)
+        except Exception:
+            existing_info = None
+        if isinstance(existing_info, dict):
+            existing_base = str(existing_info.get("base_model") or "")
+            existing_adapter = existing_info.get("adapter_path")
+            existing_rank = int(existing_info.get("lora_rank") or 0)
+        else:
+            existing_base, existing_adapter, existing_rank = _local_sampling_config(sampling_session_id)
         if existing_base is not None:
-            existing_adapter = session_manager.get_session_adapter_path(sampling_session_id)
-            existing_rank = session_manager.get_session_lora_rank(sampling_session_id) or 0
             expected_adapter = adapter_path if request.model_path else None
             expected_rank = int(lora_rank)
-            if existing_base != base_model or existing_adapter != expected_adapter or int(existing_rank) != expected_rank:
+            if existing_base != base_model or existing_adapter != expected_adapter or int(existing_rank or 0) != expected_rank:
                 raise HTTPException(
                     status_code=409,
                     detail="Sampling session already exists with different configuration",
@@ -422,29 +443,37 @@ async def _create_sampling_session_impl(
     else:
         sampling_session_id = str(uuid.uuid4())
 
-    # Get or create engine for this model (dynamically creates vLLM actor if needed)
-    # Do not block on vLLM cold-start here (can exceed reverse-proxy timeouts).
-    # Warm vLLM in the background; /asample work will await readiness.
-    async def _warm_engine() -> None:
-        try:
-            await session_manager.get_engine_for_model(base_model)
-        except Exception as e:
-            logger.warning(f"[create_sampling_session] warm engine failed: model={base_model} err={e}")
+    try:
+        from ..backend.sampling_session_store import upsert_sampling_session
 
-    asyncio.create_task(_warm_engine())
-
-    if request.model_path:
-        # Register session now; LoRA will be loaded lazily on first /asample.
-        session_manager.register_multi_lora_session(
-            session_id=sampling_session_id,
-            base_model=base_model,
-            lora_rank=lora_rank,
-            adapter_path=adapter_path,
-            lora_loaded=False,
+        upsert_sampling_session(
+            {
+                "session_id": sampling_session_id,
+                "base_model": base_model,
+                "lora_rank": int(lora_rank),
+                "adapter_path": adapter_path,
+                "lora_loaded": False,
+                "lora_int_id": None,
+                "uses_base_model": not bool(request.model_path),
+                "last_activity": time.time(),
+                "inflight_requests": 0,
+                "metadata_version": 1,
+            }
         )
-    else:
-        # Base model (no LoRA): register session directly
-        session_manager.register_base_model_session(sampling_session_id, base_model=base_model)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail="Sampling session store unavailable") from e
+
+    if session_manager is not None:
+        if request.model_path:
+            session_manager.register_multi_lora_session(
+                session_id=sampling_session_id,
+                base_model=base_model,
+                lora_rank=lora_rank,
+                adapter_path=adapter_path,
+                lora_loaded=False,
+            )
+        else:
+            session_manager.register_base_model_session(sampling_session_id, base_model=base_model)
 
     _write_sampler_index(sampling_session_id)
 
@@ -479,18 +508,30 @@ async def ensure_sampling_session(
     sampling_request = CreateSamplingSessionRequest(**request_kwargs)
     response = await create_sampling_session(sampling_request, http_request)
     sampling_session_id = response.sampling_session_id
-    base_model = None if session_manager is None else session_manager.get_session_base_model(sampling_session_id)
+    base_model = None
+    try:
+        from ..backend.sampling_session_store import async_get_sampling_session_info
+
+        info = await async_get_sampling_session_info(sampling_session_id)
+        if isinstance(info, dict):
+            base_model = info.get("base_model")
+    except Exception:
+        base_model = None
+    if base_model is None and session_manager is not None:
+        base_model, _adapter_path, _rank = _local_sampling_config(sampling_session_id)
     if base_model is None:
         remote = await async_remote_sampling_session(sampling_session_id)
         if remote is not None:
             _, base_model = remote
+    if base_model is None:
+        base_model = request_kwargs.get("base_model")
 
     if not base_model:
         raise HTTPException(
             status_code=500,
             detail=f"Sampling session {sampling_session_id!r} missing base_model after creation",
         )
-    return sampling_session_id, base_model
+    return sampling_session_id, str(base_model)
 
 
 @router.get("/sessions/{session_id}", response_model=GetSessionResponse)
@@ -561,8 +602,17 @@ async def get_sampler(sampler_id: str, http_request: Request) -> GetSamplerRespo
         if not _user_visible(request_user_data, info.get("user_id")):
             raise HTTPException(status_code=404, detail=f"Sampler '{sampler_id}' not found")
         base_model = info.get("base_model")
-        if not base_model and session_manager is not None:
-            base_model = session_manager.get_session_base_model(sampler_id)
+        if not base_model:
+            try:
+                from ..backend.sampling_session_store import async_get_sampling_session_info
+
+                detached = await async_get_sampling_session_info(sampler_id)
+            except Exception:
+                detached = None
+            if isinstance(detached, dict):
+                base_model = detached.get("base_model")
+            elif session_manager is not None:
+                base_model, _adapter_path, _rank = _local_sampling_config(sampler_id)
 
         from ..client_compat import checkpoint_uri, prefer_tinker_uri
 
@@ -596,12 +646,26 @@ async def get_sampler(sampler_id: str, http_request: Request) -> GetSamplerRespo
             model_path=model_path,
         )
 
-    if session_manager is not None:
-        base_model = session_manager.get_session_base_model(sampler_id)
+    try:
+        from ..backend.sampling_session_store import async_get_sampling_session_info
+
+        detached = await async_get_sampling_session_info(sampler_id)
+    except Exception:
+        detached = None
+    if isinstance(detached, dict):
+        base_model = detached.get("base_model")
         if base_model:
             return GetSamplerResponse(
                 sampler_id=sampler_id,
-                base_model=base_model,
+                base_model=str(base_model),
+                model_path=None,
+            )
+    if session_manager is not None:
+        base_model, _adapter_path, _rank = _local_sampling_config(sampler_id)
+        if base_model:
+            return GetSamplerResponse(
+                sampler_id=sampler_id,
+                base_model=str(base_model),
                 model_path=None,
             )
 
@@ -737,10 +801,13 @@ async def session_heartbeat(
 
     Accepts heartbeat and returns acknowledgment. Session validation not implemented.
     """
-    session_heartbeat_store.update(request.session_id)
-    if session_manager is not None:
-        # Keep sampling sessions alive during long training phases between sample calls.
-        session_manager.mark_session_inflight(request.session_id, 0)
+    await session_heartbeat_store.async_update(request.session_id)
+    try:
+        from ..backend.sampling_session_store import async_set_sampling_session_last_activity
+
+        await async_set_sampling_session_last_activity(request.session_id, time.time())
+    except Exception as e:
+        raise HTTPException(status_code=503, detail="Sampling session store unavailable") from e
     return SessionHeartbeatResponse()
 
 

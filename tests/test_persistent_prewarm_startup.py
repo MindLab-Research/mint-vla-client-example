@@ -86,8 +86,10 @@ class _StubCapacityManager:
 class _StubSessionManager:
     def __init__(self, **_kwargs):
         self.multi_model_manager = None
+        self.start_cleanup_task_calls = 0
 
     async def start_cleanup_task(self) -> None:
+        self.start_cleanup_task_calls += 1
         return None
 
     def set_multi_model_manager(self, manager) -> None:
@@ -136,6 +138,7 @@ class _StubApiWorkQueue:
 class _StubOwnerRuntimeSupervisor:
     def __init__(self):
         self.started = 0
+        self.run_once_calls: list[str] = []
 
     async def async_ensure_started(self, *, timeout_s: float = 15.0):
         self.started += 1
@@ -149,6 +152,23 @@ class _StubOwnerRuntimeSupervisor:
         return {
             "actor_name": "tinker_owner_runtime_supervisor",
             "epoch_id": "epoch-1",
+            "timeout_s": float(timeout_s),
+        }
+
+    async def async_run_once(self, loop_name: str, *, timeout_s: float = 30.0):
+        self.run_once_calls.append(str(loop_name))
+        return {"ok": True, "loop_name": str(loop_name), "timeout_s": float(timeout_s)}
+
+
+class _StubQueueExecutionRuntime:
+    def __init__(self):
+        self.ensure_started_calls: list[int] = []
+
+    async def async_ensure_started(self, *, num_workers: int, timeout_s: float = 120.0):
+        self.ensure_started_calls.append(int(num_workers))
+        return {
+            "actor_name": "tinker_queue_execution_runtime",
+            "desired_workers": int(num_workers),
             "timeout_s": float(timeout_s),
         }
 
@@ -180,6 +200,7 @@ def _install_lifespan_stubs(
     monkeypatch,
     queue: _StubApiWorkQueue,
     owner_runtime: _StubOwnerRuntimeSupervisor,
+    queue_execution_runtime: _StubQueueExecutionRuntime,
 ) -> None:
     monkeypatch.setattr(app_module, "_cleanup_stale_actors", _noop_async)
     monkeypatch.setattr(app_module, "_restore_sampling_sessions", _noop_async)
@@ -192,6 +213,7 @@ def _install_lifespan_stubs(
     capacity_manager_module = importlib.import_module("tinker_server.backend.capacity_manager")
     gateway_session_store_module = importlib.import_module("tinker_server.backend.gateway_session_store")
     sampling_session_store_module = importlib.import_module("tinker_server.backend.sampling_session_store")
+    session_heartbeat_store_module = importlib.import_module("tinker_server.backend.session_heartbeat_store")
     session_index_store_module = importlib.import_module("tinker_server.backend.session_index_store")
     training_session_manager_module = importlib.import_module("tinker_server.backend.training_session_manager")
     training_session_store_module = importlib.import_module("tinker_server.backend.training_session_store")
@@ -199,6 +221,7 @@ def _install_lifespan_stubs(
     gateway_module = importlib.import_module("tinker_server.gateway")
     usage_store_module = importlib.import_module("tinker_server.usage_store")
     owner_runtime_module = importlib.import_module("tinker_server.backend.owner_runtime_supervisor")
+    queue_execution_runtime_module = importlib.import_module("tinker_server.backend.queue_execution_runtime")
 
     verl_training_module = types.ModuleType("tinker_server.backend.verl_training")
     verl_training_module.VerlTrainingEngine = _StubTrainingEngine
@@ -206,10 +229,12 @@ def _install_lifespan_stubs(
 
     monkeypatch.setattr(api_work_queue_module, "api_work_queue", queue)
     monkeypatch.setattr(owner_runtime_module, "owner_runtime_supervisor", owner_runtime)
+    monkeypatch.setattr(queue_execution_runtime_module, "queue_execution_runtime", queue_execution_runtime)
     monkeypatch.setattr(capacity_manager_module, "capacity_manager", _StubCapacityManager())
     monkeypatch.setattr(future_store_module, "future_store", _StubFutureStore())
     monkeypatch.setattr(gateway_session_store_module, "ensure_ready", lambda: None)
     monkeypatch.setattr(sampling_session_store_module, "ensure_ready", lambda: None)
+    monkeypatch.setattr(session_heartbeat_store_module, "session_heartbeat_store", SimpleNamespace(ensure_ready=lambda: None, async_size=lambda: 0))
     monkeypatch.setattr(session_index_store_module, "ensure_ready", lambda: None)
     monkeypatch.setattr(training_session_manager_module, "TrainingSessionManager", _StubTrainingManager)
     monkeypatch.setattr(training_session_store_module, "ensure_ready", lambda: None)
@@ -228,7 +253,8 @@ def _install_lifespan_stubs(
 def test_lifespan_waits_for_prewarm_and_fails_startup(monkeypatch) -> None:
     queue = _StubApiWorkQueue()
     owner_runtime = _StubOwnerRuntimeSupervisor()
-    _install_lifespan_stubs(monkeypatch, queue, owner_runtime)
+    queue_execution_runtime = _StubQueueExecutionRuntime()
+    _install_lifespan_stubs(monkeypatch, queue, owner_runtime, queue_execution_runtime)
     lease = _StubStartupLease(is_owner=True)
 
     async def _fail_prewarm(*_args, **_kwargs) -> None:
@@ -252,12 +278,15 @@ def test_lifespan_waits_for_prewarm_and_fails_startup(monkeypatch) -> None:
     assert queue.started_workers == 0
     assert owner_runtime.started == 1
     assert lease.released is True
+    assert app_module.service.session_manager is None
+    assert queue_execution_runtime.ensure_started_calls == []
 
 
 def test_lifespan_follower_skips_leader_only_startup(monkeypatch) -> None:
     queue = _StubApiWorkQueue()
     owner_runtime = _StubOwnerRuntimeSupervisor()
-    _install_lifespan_stubs(monkeypatch, queue, owner_runtime)
+    queue_execution_runtime = _StubQueueExecutionRuntime()
+    _install_lifespan_stubs(monkeypatch, queue, owner_runtime, queue_execution_runtime)
 
     calls: list[str] = []
     lease = _StubStartupLease(is_owner=False)
@@ -285,10 +314,12 @@ def test_lifespan_follower_skips_leader_only_startup(monkeypatch) -> None:
     asyncio.run(_run())
 
     assert calls == []
-    assert queue.started_workers == 1
+    assert queue.started_workers == 0
     assert owner_runtime.started == 1
     assert lease.heartbeat_started is False
     assert lease.released is True
+    assert app_module.service.session_manager is None
+    assert queue_execution_runtime.ensure_started_calls == [1]
 
 
 @pytest.mark.anyio

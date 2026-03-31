@@ -53,6 +53,36 @@ def test_issue_364_checkpoint_helpers_proxy_results(monkeypatch) -> None:
     assert ors.run_checkpoint_mirror_once() == {"mirrored": ["m1"], "failed": ["f1"]}
 
 
+def test_issue_364_training_cleanup_runner_proxies_results(monkeypatch) -> None:
+    from tinker_server.backend import owner_runtime_supervisor as ors
+
+    class _FakeTrainingCleanupExecutor:
+        async def async_cleanup_stale_sessions_once(self):
+            return ["model-a", "model-b"]
+
+    monkeypatch.setattr(
+        "tinker_server.backend.training_cleanup_executor.training_cleanup_executor",
+        _FakeTrainingCleanupExecutor(),
+    )
+
+    assert ors.run_training_cleanup_once() == {"cleaned": ["model-a", "model-b"]}
+
+
+def test_issue_364_sampling_cleanup_runner_proxies_results(monkeypatch) -> None:
+    from tinker_server.backend import owner_runtime_supervisor as ors
+
+    class _FakeSamplingCleanupExecutor:
+        async def async_cleanup_stale_sessions_once(self):
+            return ["sess-a", "sess-b"]
+
+    monkeypatch.setattr(
+        "tinker_server.backend.sampling_cleanup_executor.sampling_cleanup_executor",
+        _FakeSamplingCleanupExecutor(),
+    )
+
+    assert ors.run_sampling_cleanup_once() == {"cleaned": ["sess-a", "sess-b"]}
+
+
 def test_issue_364_runtime_degraded_healthz() -> None:
     from fastapi.responses import JSONResponse
 
