@@ -26,6 +26,24 @@ def scheduler_enabled_from_env() -> bool:
     return _to_bool(os.environ.get("MINT_SCHEDULER_ENABLE", "0"))
 
 
+def infer_scheduler_capacity_owner(scheduler_domain: Any) -> str | None:
+    domain = _clean_str(scheduler_domain)
+    if domain is None or ":" not in domain:
+        return None
+    backend, domain_key = domain.split(":", 1)
+    backend = backend.strip().lower()
+    domain_key = domain_key.strip()
+    if not backend or not domain_key:
+        return None
+    if backend == "vllm":
+        if "::replica::" in domain_key:
+            return "vllm_replica_single_worker"
+        return "model_registry_inference_dp"
+    if backend in ("megatron", "peft"):
+        return "single_worker"
+    return None
+
+
 @dataclass(frozen=True)
 class WorkClassification:
     queue_kind: str
@@ -33,6 +51,7 @@ class WorkClassification:
     scheduler_domain: str | None = None
     scheduler_session_key: str | None = None
     scheduler_domain_key_source: str | None = None
+    scheduler_capacity_owner: str | None = None
 
     @classmethod
     def build(
@@ -42,18 +61,23 @@ class WorkClassification:
         scheduler_domain: Any = None,
         scheduler_session_key: Any = None,
         scheduler_domain_key_source: Any = None,
+        scheduler_capacity_owner: Any = None,
     ) -> "WorkClassification":
         domain = _clean_str(scheduler_domain)
         session_key = _clean_str(scheduler_session_key)
         key_source = _clean_str(scheduler_domain_key_source)
+        capacity_owner = _clean_str(scheduler_capacity_owner)
+        if capacity_owner is None:
+            capacity_owner = infer_scheduler_capacity_owner(domain)
         enabled = bool(scheduler_enabled)
-        queue_kind = "scheduled" if enabled and domain and session_key else "legacy"
+        queue_kind = "scheduled" if enabled and domain and session_key and capacity_owner else "legacy"
         return cls(
             queue_kind=queue_kind,
             scheduler_enabled=enabled,
             scheduler_domain=domain,
             scheduler_session_key=session_key,
             scheduler_domain_key_source=key_source,
+            scheduler_capacity_owner=capacity_owner,
         )
 
     @classmethod
@@ -76,6 +100,7 @@ class WorkClassification:
             scheduler_domain=extra.get("scheduler_domain"),
             scheduler_session_key=scheduler_session_key,
             scheduler_domain_key_source=extra.get("scheduler_domain_key_source"),
+            scheduler_capacity_owner=extra.get("scheduler_capacity_owner"),
         )
 
     def queue_extra(self, *, extra: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -87,6 +112,8 @@ class WorkClassification:
             payload["scheduler_session_key"] = str(self.scheduler_session_key)
         if self.scheduler_domain_key_source is not None:
             payload["scheduler_domain_key_source"] = str(self.scheduler_domain_key_source)
+        if self.scheduler_capacity_owner is not None:
+            payload["scheduler_capacity_owner"] = str(self.scheduler_capacity_owner)
         return payload
 
     def queued_meta(
@@ -105,6 +132,7 @@ class WorkClassification:
             "scheduler_domain": self.scheduler_domain,
             "scheduler_session_id": self.scheduler_session_key,
             "scheduler_domain_key_source": self.scheduler_domain_key_source,
+            "scheduler_capacity_owner": self.scheduler_capacity_owner,
         }
         if extra_meta:
             meta.update(extra_meta)
