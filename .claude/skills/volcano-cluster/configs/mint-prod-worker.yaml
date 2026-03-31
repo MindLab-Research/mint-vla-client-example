@@ -29,42 +29,91 @@ Entrypoint: |
   echo "Using PFS code via symlink:"
   ls -la /root/tinker_project/tinker-server-auth/
 
-  # Read Ray head IP from PFS
-  RAY_HEAD_IP=$(cat /vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt 2>/dev/null || echo "")
-  if [ -z "${RAY_HEAD_IP}" ]; then
-    echo "ERROR: Ray head IP not found. Ensure mint-prod-head is running."
-    echo "Expected file: /vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt"
-    sleep 300
-    exit 1
-  fi
-  export RAY_HEAD_IP
-  echo "Connecting to Ray head at ${RAY_HEAD_IP}:6379"
-
   # Note: Ray CLI crashes on startup; start Ray via Python internals.
   set -euo pipefail
   python3 - <<'PY'
-  import os
+  import socket
   import time
+  from pathlib import Path
 
   import ray
   from ray._private.node import Node
   from ray._private.parameter import RayParams
 
-  head = os.environ.get("RAY_HEAD_IP", "")
-  if not head:
-      raise SystemExit("RAY_HEAD_IP env var is empty")
-  head = f"{head}:6379"
+  HEAD_IP_PATH = Path("/vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt")
+  CHECK_INTERVAL_S = 10
+  BACKOFF_INITIAL_S = 5
+  BACKOFF_MAX_S = 60
+  BACKOFF_RESET_AFTER_HEALTHY_CHECKS = 6
 
-  ip = ray.util.get_node_ip_address()
-  print(f"Local node IP: {ip}", flush=True)
 
-  ray_params = RayParams(
-      gcs_address=head,
-      num_gpus=8,
-  )
-  node = Node(ray_params, head=False, shutdown_at_exit=False, spawn_reaper=False)
+  def _read_head_ip() -> str:
+      try:
+          return HEAD_IP_PATH.read_text(encoding="utf-8").strip()
+      except FileNotFoundError:
+          return ""
+
+
+  def _port_open(host: str, port: int) -> bool:
+      sock = socket.socket()
+      sock.settimeout(2)
+      try:
+          sock.connect((host, port))
+          return True
+      except OSError:
+          return False
+      finally:
+          sock.close()
+
+
+  restart_delay_s = BACKOFF_INITIAL_S
   while True:
-      time.sleep(3600)
+      head_ip = _read_head_ip()
+      if not head_ip:
+          print(f"mint-prod worker missing Ray head IP file: {HEAD_IP_PATH}", flush=True)
+          print(f"mint-prod worker sleeping {restart_delay_s}s before retry", flush=True)
+          time.sleep(restart_delay_s)
+          restart_delay_s = min(BACKOFF_MAX_S, restart_delay_s * 2)
+          continue
+
+      head = f"{head_ip}:6379"
+      ip = ray.util.get_node_ip_address()
+      print(f"Local node IP: {ip}", flush=True)
+      print(f"Connecting to Ray head at {head}", flush=True)
+
+      ray_params = RayParams(
+          gcs_address=head,
+          num_gpus=8,
+      )
+      node = None
+      healthy_checks = 0
+      try:
+          node = Node(ray_params, head=False, shutdown_at_exit=False, spawn_reaper=False)
+          print(f"mint-prod worker joined Ray head at {head}", flush=True)
+          while True:
+              if not _port_open(head_ip, 6379):
+                  print(f"mint-prod worker lost connectivity to Ray head {head}", flush=True)
+                  break
+              dead = node.dead_processes()
+              if dead:
+                  print(f"mint-prod worker detected dead ray processes: {dead!r}; restarting worker node", flush=True)
+                  break
+              healthy_checks += 1
+              if healthy_checks >= BACKOFF_RESET_AFTER_HEALTHY_CHECKS and restart_delay_s != BACKOFF_INITIAL_S:
+                  print("mint-prod worker reset restart backoff to 5s after stable run", flush=True)
+                  restart_delay_s = BACKOFF_INITIAL_S
+              time.sleep(CHECK_INTERVAL_S)
+      except Exception as e:
+          print(f"mint-prod worker wrapper caught exception: {type(e).__name__}: {e}", flush=True)
+      finally:
+          if node is not None:
+              try:
+                  node.kill_all_processes(check_alive=False, allow_graceful=False, wait=True)
+              except Exception as e:
+                  print(f"mint-prod worker cleanup failed: {type(e).__name__}: {e}", flush=True)
+          print(f"mint-prod worker sleeping {restart_delay_s}s before retry", flush=True)
+          time.sleep(restart_delay_s)
+          restart_delay_s = min(BACKOFF_MAX_S, restart_delay_s * 2)
   PY
 
 ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:16-sm80"

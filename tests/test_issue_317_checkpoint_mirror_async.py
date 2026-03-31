@@ -309,7 +309,7 @@ async def test_issue_317_save_state_does_not_wait_for_sampling_registration(
                 current_step=11,
                 backend="dense",
             ),
-            mark_inflight=lambda _model_id, _delta: None,
+            mark_inflight=lambda *_args, **_kwargs: None,
         ),
     )
     monkeypatch.setattr(wt, "training_engine", SimpleNamespace(save_weights=_fake_save_weights))
@@ -377,7 +377,7 @@ async def test_issue_317_named_save_weights_for_sampler_preserves_type(
                 backend="dense",
                 lora_config=SimpleNamespace(rank=8, train_mlp=False),
             ),
-            mark_inflight=lambda _model_id, _delta: None,
+            mark_inflight=lambda *_args, **_kwargs: None,
         ),
     )
     monkeypatch.setattr(

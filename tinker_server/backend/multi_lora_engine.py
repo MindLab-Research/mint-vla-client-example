@@ -12,6 +12,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import ray
@@ -70,6 +71,40 @@ PERSISTENT_VLLM_ACTOR_NAME = "tinker_vllm_server"
 
 # Fixed namespace for persistent actors (without this, each process gets random namespace)
 PERSISTENT_NAMESPACE = RAY_NAMESPACE
+
+
+def _invalidate_model_session_loras(model_name: str) -> None:
+    """Force multi-LoRA sessions for a model to reload after actor recreate."""
+    try:
+        managers = []
+
+        from .session_manager import session_manager as backend_session_manager
+
+        if backend_session_manager is not None:
+            managers.append(backend_session_manager)
+
+        from ..routes import sampling as sampling_routes
+
+        route_session_manager = getattr(sampling_routes, "session_manager", None)
+        if route_session_manager is not None and route_session_manager not in managers:
+            managers.append(route_session_manager)
+
+        invalidated = 0
+        for manager in managers:
+            invalidated += manager.mark_model_lora_sessions_unloaded(model_name)
+        if invalidated:
+            logger.info(
+                "Invalidated cached LoRA load state for %s session(s) on model=%s after vLLM actor recreate",
+                invalidated,
+                model_name,
+            )
+    except Exception as e:
+        logger.warning(
+            "Failed to invalidate cached LoRA load state for model=%s: %s: %s",
+            model_name,
+            type(e).__name__,
+            e,
+        )
 
 
 def _get_actor_node_id(actor_handle: ray.actor.ActorHandle) -> str | None:
@@ -1298,12 +1333,9 @@ def _model_to_actor_name(model_name: str) -> str:
 
 
 def _resolve_model_path(model_name: str) -> str:
-    """Resolve model name to full path on PFS.
-
-    Uses cached paths for known models.
-    """
+    """Resolve model name to a concrete local snapshot path on PFS."""
     # Map of model names to local paths
-    MODEL_PATHS = {
+    model_paths = {
         # Dense models
         "Qwen/Qwen2.5-7B-Instruct": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28",
         "Qwen/Qwen3-0.6B": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca",
@@ -1321,12 +1353,22 @@ def _resolve_model_path(model_name: str) -> str:
         "moonshotai/Kimi-K2-Thinking": "/vePFS-Mindverse/share/huggingface/hub/models--moonshotai--Kimi-K2-Thinking/snapshots/612681931a8c906ddb349f8ad0f582cb552189cd",
     }
 
-    if model_name in MODEL_PATHS:
-        return MODEL_PATHS[model_name]
+    resolved = model_paths.get(model_name)
+    if resolved is None:
+        return model_name
 
-    # Fall back to model name as path
-    return model_name
+    resolved_path = Path(resolved)
+    if resolved_path.exists():
+        return str(resolved_path.resolve())
 
+    snapshots_dir = resolved_path.parent
+    if snapshots_dir.name == "snapshots" and snapshots_dir.exists():
+        snapshot_dirs = sorted(p for p in snapshots_dir.iterdir() if p.is_dir())
+        if snapshot_dirs:
+            return str(snapshot_dirs[-1].resolve())
+
+    # Fall back to the configured value so callers still get the original path in logs.
+    return resolved
 
 class MultiModelInferenceManager:
     """Manages multiple vLLM engines, one per base model.
@@ -1466,6 +1508,7 @@ class MultiModelInferenceManager:
                                     model_name,
                                 )
                                 self._engines.pop(model_name, None)
+                                _invalidate_model_session_loras(model_name)
                             else:
                                 logger.info("get_engine model=%s stage=return_cached_engine_multinode", model_name)
                                 return engine
@@ -1487,6 +1530,7 @@ class MultiModelInferenceManager:
                             f"Cached vLLM engine for {model_name} hit SystemExit during is_alive check; recreating"
                         )
                         self._engines.pop(model_name, None)
+                        _invalidate_model_session_loras(model_name)
                     except ray.exceptions.GetTimeoutError:
                         # Actor tasks can queue behind long-running generations/logprobs.
                         # A short timeout here is not evidence of death.
@@ -1500,9 +1544,11 @@ class MultiModelInferenceManager:
                             f"Cached vLLM engine for {model_name} has dead actor, recreating"
                         )
                         self._engines.pop(model_name, None)
+                        _invalidate_model_session_loras(model_name)
                 else:
                     # Engine has no actor handle, remove stale entry
                     self._engines.pop(model_name, None)
+                    _invalidate_model_session_loras(model_name)
 
             # Get model config for parallelism settings
             from tinker_server.backend.model_registry import get_model_config

@@ -104,6 +104,7 @@ class _TrainingSection(BaseModel):
 
     megatron_create_timeout_s: float | None = None
     dense_get_or_create_timeout_s: float | None = None
+    dense_session_state_root: str | None = None
     reinit_lora_timeout_s: float | None = None
     actor_ready_timeout_s: float | None = None
 

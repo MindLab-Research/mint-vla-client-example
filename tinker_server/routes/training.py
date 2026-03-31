@@ -20,6 +20,7 @@ Endpoints:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -355,7 +356,8 @@ async def _best_effort_delete_training_session(
 
     session = training_manager.get_session(model_id)
     if session is None:
-        session = await _restore_training_session(model_id)
+        restored_session = _restore_training_session(model_id)
+        session = await restored_session if inspect.isawaitable(restored_session) else restored_session
 
     deleted = False
     if session is not None:

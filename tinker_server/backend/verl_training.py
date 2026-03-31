@@ -36,6 +36,11 @@ DEFAULT_IDLE_TIMEOUT = 0  # Disabled - LRU eviction manages actor lifecycle
 # Import centralized PFS paths from config
 from tinker_server.config import RAY_NAMESPACE
 from tinker_server.config import config as server_config
+from tinker_server.backend.dense_session_state import (
+    delete_dense_session_state,
+    get_dense_session_state_root,
+    maybe_migrate_legacy_dense_session_state,
+)
 from tinker_server.ray_utils import init_ray
 
 
@@ -71,16 +76,16 @@ class SessionStateManager:
             training_meta.json         # step count, learning_rate
     """
 
-    def __init__(self, base_path: str = "/tmp/mint_sessions"):
+    def __init__(self, base_path: str | None = None):
         """Initialize the session state manager.
 
         Args:
             base_path: Root directory for all session checkpoints.
         """
         import os
-        self.base_path = base_path
-        os.makedirs(base_path, exist_ok=True)
-        logger.info(f"[SessionStateManager] Initialized with base_path={base_path}")
+        self.base_path = os.path.abspath(base_path or get_dense_session_state_root())
+        os.makedirs(self.base_path, exist_ok=True)
+        logger.info(f"[SessionStateManager] Initialized with base_path={self.base_path}")
 
     def get_session_path(self, session_id: str) -> str:
         """Get checkpoint directory path for a session."""
@@ -90,6 +95,7 @@ class SessionStateManager:
     def session_exists(self, session_id: str) -> bool:
         """Check if a session has saved state."""
         import os
+        maybe_migrate_legacy_dense_session_state(session_id, root=self.base_path)
         session_path = self.get_session_path(session_id)
         adapter_path = os.path.join(session_path, "adapter_model.safetensors")
         return os.path.exists(adapter_path)
@@ -190,6 +196,7 @@ class SessionStateManager:
         from peft.utils.save_and_load import set_peft_model_state_dict
         from safetensors.torch import load_file
 
+        maybe_migrate_legacy_dense_session_state(session_id, root=self.base_path)
         session_path = self.get_session_path(session_id)
         adapter_path = os.path.join(session_path, "adapter_model.safetensors")
 
@@ -245,15 +252,10 @@ class SessionStateManager:
         Returns:
             True if deleted, False if not found.
         """
-        import os
-        import shutil
-
-        session_path = self.get_session_path(session_id)
-        if os.path.exists(session_path):
-            shutil.rmtree(session_path)
+        deleted = delete_dense_session_state(session_id, root=self.base_path)
+        if deleted:
             logger.info(f"[SessionStateManager] Deleted session {session_id}")
-            return True
-        return False
+        return deleted
 
 
 @ray.remote(num_gpus=1)
@@ -270,6 +272,7 @@ class TrainingWorker:
         lora_rank: int,
         learning_rate: float,
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
+        session_state_root: str | None = None,
     ):
         """Initialize model and optimizer on this worker's GPU.
 
@@ -279,6 +282,7 @@ class TrainingWorker:
             learning_rate: Initial learning rate for optimizer.
             idle_timeout: Seconds of inactivity before self-termination.
                           Set to 0 to disable auto-termination.
+            session_state_root: Shared root for dense per-session state.
         """
         init_actor_observability()
         torch = _get_torch()
@@ -368,7 +372,7 @@ class TrainingWorker:
         self._step_count = 0
 
         # Session state management for stateless trainer pattern
-        self._state_manager = SessionStateManager()
+        self._state_manager = SessionStateManager(base_path=session_state_root)
         self._current_session_id: str | None = None
 
         logger.info("[TrainingWorker] Ready")
@@ -1559,6 +1563,24 @@ class TrainingWorker:
             "learning_rate": learning_rate,
         }
 
+    def delete_session(self, session_id: str) -> dict:
+        """Delete persisted state for a session and clear loaded in-memory state."""
+        self._touch()
+        cleared_loaded_session = False
+        if self._current_session_id == session_id:
+            self.optimizer.zero_grad()
+            self.optimizer.state.clear()
+            self._step_count = 0
+            self._current_session_id = None
+            cleared_loaded_session = True
+        deleted = self._state_manager.delete_session(session_id)
+        return {
+            "status": "ok",
+            "session_id": session_id,
+            "deleted": bool(deleted),
+            "cleared_loaded_session": cleared_loaded_session,
+        }
+
     def get_session_info(self) -> dict:
         """Get current session info for diagnostics.
 
@@ -2041,6 +2063,9 @@ class VerlTrainingEngine:
             or "rayactorerror" in text
             or "the actor died unexpectedly" in text
             or "worker process has died" in text
+            or "illegal memory access was encountered" in text
+            or "cuda context corrupted before" in text
+            or "cudaerrorillegaladdress" in text
         )
 
     @staticmethod
@@ -2166,6 +2191,12 @@ class VerlTrainingEngine:
         lock = await self._get_actor_recycle_lock(actor_name)
         async with lock:
             existing = self._workers.get(session.model_id)
+            cause_text = str(cause).lower()
+            cause_is_cuda_poison = (
+                "illegal memory access was encountered" in cause_text
+                or "cuda context corrupted before" in cause_text
+                or "cudaerrorillegaladdress" in cause_text
+            )
             if existing is None:
                 try:
                     return await self._rebind_megatron_worker(
@@ -2182,7 +2213,7 @@ class VerlTrainingEngine:
                         type(reconnect_error).__name__,
                         reconnect_error,
                     )
-            if existing is not None:
+            if existing is not None and not cause_is_cuda_poison:
                 try:
                     await asyncio.to_thread(ray.get, existing.get_diagnostics.remote(), timeout=10)
                     logger.warning(
@@ -2368,13 +2399,30 @@ class VerlTrainingEngine:
                 raise
             worker = await self._recycle_worker_after_failure(session, op=op, cause=e)
         self._touch_actor(session)
-        await self._log_worker_request_context(
-            session,
-            worker,
-            op=op,
-            stage="before_submit",
-            batch_stats=batch_stats,
-        )
+        try:
+            await self._log_worker_request_context(
+                session,
+                worker,
+                op=op,
+                stage="before_submit",
+                batch_stats=batch_stats,
+            )
+        except Exception as e:
+            if not self._is_dead_actor_error(e):
+                raise
+            worker = await self._recycle_worker_after_failure(
+                session,
+                op=op,
+                cause=e,
+                request_started=False,
+            )
+            await self._log_worker_request_context(
+                session,
+                worker,
+                op=op,
+                stage="after_recycle",
+                batch_stats=batch_stats,
+            )
         attempts = 0
         while True:
             try:
@@ -3781,6 +3829,11 @@ class VerlTrainingEngine:
                     learning_rate=session.learning_rate,
                     actual_rank=actual_rank,
                     actor_only_state_dirty=bool(load_optimizer),
+                    checkpoint_path=load_path,
+                    optimizer_restored=bool(load_optimizer),
+                    train_attn=bool(kwargs["train_attn"]),
+                    train_mlp=bool(kwargs["train_mlp"]),
+                    train_unembed=bool(kwargs["train_unembed"]),
                 ),
                 timeout=30,
             )
