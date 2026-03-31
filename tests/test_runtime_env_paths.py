@@ -192,6 +192,35 @@ def test_runtime_env_layout_includes_openpi_source_checkout():
     assert str(Path("/tmp/runtime/src/openpi/src")) in layout.pythonpath_entries
 
 
+def test_runtime_env_layout_includes_openpi_client_source_checkout():
+    layout = checkout_runtime_env_layout("/tmp/runtime")
+
+    assert str(Path("/tmp/runtime/src/openpi/packages/openpi-client/src")) in layout.pythonpath_entries
+
+
+def test_runtime_env_host_dependencies_include_openpi_worker_stack():
+    from scripts import build_runtime_env as build_runtime_env
+
+    deps = build_runtime_env._host_deps(build_runtime_env._load_pyproject())
+
+    for requirement in (
+        "augmax>=0.3.4",
+        "beartype==0.19.0",
+        "flax==0.10.2",
+        "filelock>=3.16.1",
+        "fsspec[gcs]>=2024.6.0",
+        "jax[cuda12]==0.5.3",
+        "jaxtyping==0.2.36",
+        "ml_collections==1.0.0",
+        "numpydantic>=1.6.6",
+        "optax==0.2.4",
+        "orbax-checkpoint==0.11.13",
+        "tqdm-loggable>=0.2",
+        "tyro>=0.9.5",
+    ):
+        assert requirement in deps
+
+
 def test_build_runtime_env_normalizes_host_only_vllm_source_metadata(tmp_path):
     from scripts import build_runtime_env as build_runtime_env
 

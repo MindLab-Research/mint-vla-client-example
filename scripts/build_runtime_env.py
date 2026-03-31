@@ -17,7 +17,8 @@ except ModuleNotFoundError:  # pragma: no cover
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 DEFAULT_INSPECT_PROBE_MODULES = (
-    "openpi",
+    "openpi.training.config",
+    "openpi_client.image_tools",
     "jax",
     "flax",
     "optax",
@@ -60,7 +61,16 @@ def _shared_deps(pyproject: dict[str, Any]) -> list[str]:
 
 def _host_deps(pyproject: dict[str, Any]) -> list[str]:
     groups = pyproject.get("dependency-groups", {})
-    return list(groups.get("host-runtime", []))
+    deps = list(groups.get("host-runtime", []))
+    deps.extend(_runtime_table(pyproject).get("host_requirements", []))
+    seen: set[str] = set()
+    out: list[str] = []
+    for dep in deps:
+        if dep in seen:
+            continue
+        seen.add(dep)
+        out.append(dep)
+    return out
 
 
 def _runtime_env_symbols():
