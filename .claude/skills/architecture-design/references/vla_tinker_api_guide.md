@@ -1,124 +1,132 @@
-# Using OpenPI Models Through a Tinker-Style API
+# Using OpenPI Models Through the Current Mint API
 
-This file is a historical design sketch, not the current normative contract.
+This file is background material, not the normative contract.
 
 Current normative sources are:
 
 - `docs/mint-openpi-vla-target.md`
 - `docs/README.md`
 - `docs/sub-targets/*.md`
-- the verified toolkit stage-local scripts under `src/mindlab-toolkit/examples/`
+- the verified stage-local scripts under `src/mindlab-toolkit/examples/`
 
-This guide still contains pre-`train_step` and pre-MintX action-boundary examples. Until it is rewritten to match the current docs, do not use it as merge-readiness evidence or as the final interaction contract.
+This guide exists for readers who already know the upstream OpenPI workflow and want a concise map from that workflow to the current Mint surface.
 
-This document is for users who already know the OpenPI workflow and want to understand what Mint is trying to preserve and what it is trying to improve. The goal is not to replace OpenPI's model logic or claim that the original repo workflow is wrong. The goal is to expose the same model families through a service-style API that is easier to integrate into larger training and deployment systems.
+## What Mint changes and what it does not
 
-The code examples below describe the intended Mint client surface (Tinker-style). The user entrypoint is `import mint` (provided by `src/mindlab-toolkit`), which re-exports a Tinker-compatible client plus a Mint-owned action inference client.
+Mint does not replace OpenPI model logic. It changes the service boundary around those models.
 
-## Why prefer a Tinker-style API
+The stable user-side shape is now:
 
-If you are already using OpenPI directly, the current workflow is workable for local experimentation:
+- `import mint`
+- create a `ServiceClient`
+- create a `TrainingClient` for `pi0-fast` or `pi0.5`
+- send VLA `Datum` batches
+- call `train_step(...)` as the default public training unit
+- export weights into an `ActionSamplingClient`
+- run action inference through Mint-owned action sessions
 
-- train with repo-local scripts such as `scripts/train.py`
-- run inference by constructing a policy or starting `scripts/serve_policy.py`
-- connect your robot or eval loop to the OpenPI websocket policy server
+Mint keeps three things stable for the user:
 
-That is a reasonable layout for model development inside the OpenPI repo. The friction appears when you want to operationalize the same models in a shared service environment.
+- `Datum` remains the training unit
+- async future semantics remain the long-running request contract
+- action inference remains part of the same Mint service, not a separate upstream websocket service
 
-Typical pain points are:
+Mint changes three things relative to old OpenPI-facing sketches:
 
-- training and inference use different transports and lifecycle assumptions
-- queueing, retries, auth, and request tracking are outside the core OpenPI model interface
-- moving from one model family to another leaks backend details into application code
-- production systems often want asynchronous request handling and checkpoint lifecycle management, not just a local script plus a websocket server
+- public training examples now use `train_step(...)`, not `forward_backward(...)` plus `optim_step(...)`
+- public action inference now goes through Mint-owned `/api/v1/mint/action_sessions*`
+- default action execution now goes through Mint queue, capacity, and Ray actor control-plane semantics
 
-A Tinker-style API is useful in that setting because it gives OpenPI users one control plane for:
+The older split-step examples were useful while the integration surface was still being discovered. They are no longer the public teaching path.
 
-- model creation and session management
-- async futures and `request_id` tracking
-- retries and queue-aware client behavior
-- weight save/load and inference handoff
-- a consistent client architecture across autoregressive and flow-matching VLA models
+## Why the current Mint surface exists
 
-The point is not abstract simplicity. The point is that an OpenPI user can keep working with OpenPI model families while reducing the amount of service glue they have to build around them.
+The upstream OpenPI workflow is still appropriate when you want to work directly inside `src/openpi`:
 
-## Design goal
+- run upstream training scripts
+- construct policies directly
+- use the upstream remote-inference protocol as documented by OpenPI
 
-The design goal is to keep the parts OpenPI users care about stable:
+That workflow is not the target production surface for this repo. The Mint surface exists because shared deployment needs a control plane that already handles:
 
-- the underlying model family
-- the semantics of the training target
-- the observation and action structure
+- async futures and request tracking
+- queueing and capacity control
+- checkpoint lifecycle
+- actor inventory and cleanup
+- one client pattern across `pi0-fast` and `pi0.5`
 
-while replacing the operational surface with something more uniform:
+The point is not abstraction for its own sake. The point is that callers should not need to rebuild service glue around each OpenPI model family.
 
-- keep `ServiceClient`
-- keep `TrainingClient`
-- keep `Datum`
-- keep async future and polling semantics
-- add the smallest possible sibling to token sampling for continuous robot actions
+## Current mental model
 
-The intended result is that changing model family should not force a rewrite of the surrounding application architecture.
+Treat Mint as the only primary service boundary.
 
-## How the intended API should feel
+From the user side:
 
-From the user side, the workflow should feel like a service wrapper around OpenPI models rather than a new model stack:
+1. build `Datum` values that contain images, text tokens, and tensor-valued supervision
+2. submit one or more training steps through `TrainingClient.train_step(...)`
+3. export a named checkpoint into an action client
+4. call `act(...)`
+5. clean up the action session and training model
 
-1. create a training client
-2. send batches of multimodal `Datum`
-3. run `forward_backward` and `optim_step`
-4. export weights for inference
-5. create an action-sampling client and call `act(...)`
+From the server side:
 
-The backend can still do model-specific work such as FAST tokenization or flow-based denoising. The point is that the client code should stay focused on robot observations, training data, and deployment flow rather than on transport details or model-family-specific serving logic.
+- training stays on the standard Mint future path
+- action inference stays on the Mint-owned action-session path
+- action requests enter the same future, queue, and capacity control plane rather than bypassing it with host-local background tasks
 
-## Why this is better than the original OpenPI workflow
+## Current public training boundary
 
-### Stable async semantics
+The public training boundary is now one atomic step:
 
-Tinker already gives a consistent async contract:
+```python
+training_client.train_step(
+    data=[datum],
+    loss_fn="cross_entropy" | "flow_matching" | ...,
+    adam_params=mint.types.AdamParams(...),
+).result()
+```
 
-- long-running work returns futures
-- the client can overlap `forward_backward` and `optim_step`
-- production deployments already understand this control flow
+That is the default public contract for OpenPI training in this repo.
 
-OpenPI's original workflow is more script-centric and less suited to shared, queued service operation.
+Internal service code still retains lower-level `forward`, `backward`, and optimizer-step semantics, but that lower-level split is no longer the public guide for shared deployment. The reason is multi-tenant scheduling: the public unit should be the whole step that Mint can enqueue, account for, and rotate fairly.
 
-### One training abstraction
+## Current public action boundary
 
-Tinker `Datum` already supports multimodal `ModelInput` chunks and arbitrary tensor-valued `loss_fn_inputs`. That is a much better common boundary for serving multiple model families than exposing OpenPI's internal `Observation` struct directly.
+The current action boundary is Mint-owned:
 
-### One production integration path
+- `POST /api/v1/mint/action_sessions`
+- `POST /api/v1/mint/action_sessions/{action_session_id}/act`
+- `DELETE /api/v1/mint/action_sessions/{action_session_id}`
 
-Mint already owns:
+Callers do not need to construct those routes directly. They use:
 
-- auth
-- queueing
-- routing
-- request lifecycle
-- weight save/load semantics
-- actor lifecycle
+- `ServiceClient.create_action_sampling_client(...)`
+- `TrainingClient.save_weights_and_get_action_sampling_client(...)`
+- `ActionSamplingClient.act(...)`
+- `ActionSamplingClient.shutdown()`
 
-Reusing that control plane is better than teaching every application to talk to a separate OpenPI websocket server.
+The important change is operational, not cosmetic. `act(...)` is no longer a side path outside Mint control-plane semantics. It creates a future, passes through capacity and queue control, and lands on a Mint-managed Ray actor runtime.
 
-### Easier model-family switching
+## Example shape: pi0-fast
 
-If `pi0-fast` and `pi0.5` are both exposed through the same Tinker-like client pattern, the user can switch model families without replacing their surrounding orchestration.
+This is the current public shape. It is intentionally schematic. For concrete builders of `Datum` and `observation`, use the verified examples under `src/mindlab-toolkit/examples/`, especially:
 
-## Intended client example: pi0-fast
-
-`pi0-fast` is the easiest first target because it is autoregressive over action tokens. Internally it can use FAST tokenization. Externally the user should still send `Datum` and receive action chunks.
+- `st04_pi0_fast_action_inference_acceptance.py`
+- `st06_mint_vla_minimal_closure.py`
+- `st09a_mintx_action_boundary_acceptance.py`
 
 ```python
 from __future__ import annotations
 
-import numpy as np
 import mint
 
 types = mint.types
 
-
-service = mint.ServiceClient(base_url="REPLACE_WITH_BASE_URL", api_key="REPLACE_WITH_API_KEY")
+service = mint.ServiceClient(
+    base_url="REPLACE_WITH_BASE_URL",
+    api_key="REPLACE_WITH_API_KEY",
+)
 
 training_client = service.create_lora_training_client(
     base_model="openpi/pi0-fast-libero-low-mem-finetune",
@@ -128,119 +136,62 @@ training_client = service.create_lora_training_client(
     train_unembed=True,
 )
 
+datum = build_pi0_fast_datum(mint_module=mint)
+observation = build_pi0_fast_observation(mint_module=mint)
 
-def build_pi0_fast_datum(
-    *,
-    prompt_tokens: list[int],
-    image_chunks: list[types.ImageChunk],
-    state: np.ndarray,
-    target_action_tokens: np.ndarray,
-    weights: np.ndarray,
-    token_ar_mask: np.ndarray,
-) -> types.Datum:
-    return types.Datum(
-        model_input=types.ModelInput(
-            chunks=[
-                *image_chunks,
-                types.EncodedTextChunk(tokens=prompt_tokens),
-            ]
-        ),
-        loss_fn_inputs={
-            "state": types.TensorData(
-                data=state.astype(np.float32).reshape(-1).tolist(),
-                shape=[int(state.size)],
-                dtype="float32",
-            ),
-            "target_tokens": types.TensorData(
-                data=target_action_tokens.astype(np.int64).reshape(-1).tolist(),
-                shape=[int(target_action_tokens.size)],
-                dtype="int64",
-            ),
-            "weights": types.TensorData(
-                data=weights.astype(np.float32).reshape(-1).tolist(),
-                shape=[int(weights.size)],
-                dtype="float32",
-            ),
-            "token_ar_mask": types.TensorData(
-                data=token_ar_mask.astype(np.int64).reshape(-1).tolist(),
-                shape=[int(token_ar_mask.size)],
-                dtype="int64",
-            ),
-        },
-    )
+train_step = training_client.train_step(
+    data=[datum],
+    loss_fn="cross_entropy",
+    adam_params=types.AdamParams(learning_rate=1e-4),
+).result()
 
-
-batch = [
-    build_pi0_fast_datum(
-        prompt_tokens=[2, 314, 271, 99],
-        image_chunks=[
-            types.ImageChunk(data=open("base.png", "rb").read(), format="png", expected_tokens=256),
-            types.ImageChunk(data=open("left.png", "rb").read(), format="png", expected_tokens=256),
-            types.ImageChunk(data=open("right.png", "rb").read(), format="png", expected_tokens=256),
-        ],
-        state=np.zeros([8], dtype=np.float32),
-        target_action_tokens=np.array([101, 102, 103, 104], dtype=np.int64),
-        weights=np.array([0.0, 1.0, 1.0, 1.0], dtype=np.float32),
-        token_ar_mask=np.array([0, 1, 1, 1], dtype=np.int64),
-    )
-]
-
-fwdbwd_future = training_client.forward_backward(batch, loss_fn="cross_entropy")
-optim_future = training_client.optim_step(types.AdamParams(learning_rate=1e-4))
-
-fwdbwd_result = fwdbwd_future.result()
-optim_result = optim_future.result()
-
-save_name = "pi0-fast-example"
-action_client = training_client.save_weights_and_get_action_sampling_client(save_name)
+action_client = training_client.save_weights_and_get_action_sampling_client(
+    "pi0-fast-example",
+)
 
 action_result = action_client.act(
-    observation=types.ModelInput(
-        chunks=[
-            types.ImageChunk(data=open("base.png", "rb").read(), format="png", expected_tokens=256),
-            types.ImageChunk(data=open("left.png", "rb").read(), format="png", expected_tokens=256),
-            types.ImageChunk(data=open("right.png", "rb").read(), format="png", expected_tokens=256),
-            types.EncodedTextChunk(tokens=[2, 314, 271, 99]),
-        ]
-    ),
+    observation=observation,
     extra_inputs={
         "state": types.TensorData(
-            data=np.zeros([8], dtype=np.float32).tolist(),
+            data=[0.0] * 8,
             shape=[8],
             dtype="float32",
         ),
     },
 ).result()
 
-actions = np.asarray(action_result["actions"]["data"], dtype=np.float32).reshape(
-    action_result["actions"]["shape"]
-)
+action_client.shutdown().result()
+training_client.delete_model().result()
 ```
 
-### Why this is a good fit
+The important part is not the exact datum builder. The important part is the control flow:
 
-For `pi0-fast`, the training loop still looks like standard Tinker:
+- `train_step(...)` is the public training unit
+- weight export hands off directly into an action client
+- action inference returns an action tensor payload, not a text-sampling payload
+- cleanup is explicit
 
-- `Datum`
-- `forward_backward`
-- `optim_step`
+## Example shape: pi0.5
 
-The main difference is that the backend interprets the target as action tokens instead of plain language tokens.
+`pi0.5` uses the same control-plane shape, but the loss semantics are different.
 
-## Intended client example: pi0.5
+For concrete builders of `Datum` and `observation`, use the verified examples under:
 
-`pi0.5` is a flow-matching model, not an autoregressive action-token model. The preferred client surface should still look similar, but the loss name and inference engine are different.
+- `st05_pi05_sft_action_inference_acceptance.py`
+- `st06_mint_vla_minimal_closure.py`
+- `st09a_mintx_action_boundary_acceptance.py`
 
 ```python
 from __future__ import annotations
 
-import numpy as np
 import mint
 
 types = mint.types
 
-
-service = mint.ServiceClient(base_url="REPLACE_WITH_BASE_URL", api_key="REPLACE_WITH_API_KEY")
+service = mint.ServiceClient(
+    base_url="REPLACE_WITH_BASE_URL",
+    api_key="REPLACE_WITH_API_KEY",
+)
 
 training_client = service.create_lora_training_client(
     base_model="openpi/pi05-libero-low-mem-finetune",
@@ -250,122 +201,94 @@ training_client = service.create_lora_training_client(
     train_unembed=True,
 )
 
+datum = build_pi05_datum(mint_module=mint)
+observation = build_pi05_observation(mint_module=mint)
 
-def build_pi05_flow_datum(
-    *,
-    prompt_tokens: list[int],
-    image_chunks: list[types.ImageChunk],
-    state: np.ndarray,
-    target_actions: np.ndarray,
-) -> types.Datum:
-    return types.Datum(
-        model_input=types.ModelInput(
-            chunks=[
-                *image_chunks,
-                types.EncodedTextChunk(tokens=prompt_tokens),
-            ]
-        ),
-        loss_fn_inputs={
-            "state": types.TensorData(
-                data=state.astype(np.float32).reshape(-1).tolist(),
-                shape=[int(state.size)],
-                dtype="float32",
-            ),
-            "actions": types.TensorData(
-                data=target_actions.astype(np.float32).reshape(-1).tolist(),
-                shape=[int(target_actions.shape[0]), int(target_actions.shape[1])],
-                dtype="float32",
-            ),
-        },
-    )
+train_step = training_client.train_step(
+    data=[datum],
+    loss_fn="flow_matching",
+    adam_params=types.AdamParams(learning_rate=1e-4),
+).result()
 
-
-batch = [
-    build_pi05_flow_datum(
-        prompt_tokens=[2, 314, 271, 99],
-        image_chunks=[
-            types.ImageChunk(data=open("base.png", "rb").read(), format="png", expected_tokens=256),
-            types.ImageChunk(data=open("left.png", "rb").read(), format="png", expected_tokens=256),
-            types.ImageChunk(data=open("right.png", "rb").read(), format="png", expected_tokens=256),
-        ],
-        state=np.zeros([8], dtype=np.float32),
-        target_actions=np.zeros([10, 7], dtype=np.float32),
-    )
-]
-
-fwdbwd_future = training_client.forward_backward(batch, loss_fn="flow_matching")
-optim_future = training_client.optim_step(types.AdamParams(learning_rate=1e-4))
-
-fwdbwd_result = fwdbwd_future.result()
-optim_result = optim_future.result()
-
-save_name = "pi05-example"
-action_client = training_client.save_weights_and_get_action_sampling_client(save_name)
+action_client = training_client.save_weights_and_get_action_sampling_client(
+    "pi05-example",
+)
 
 action_result = action_client.act(
-    observation=types.ModelInput(
-        chunks=[
-            types.ImageChunk(data=open("base.png", "rb").read(), format="png", expected_tokens=256),
-            types.ImageChunk(data=open("left.png", "rb").read(), format="png", expected_tokens=256),
-            types.ImageChunk(data=open("right.png", "rb").read(), format="png", expected_tokens=256),
-            types.EncodedTextChunk(tokens=[2, 314, 271, 99]),
-        ]
-    ),
+    observation=observation,
     extra_inputs={
         "state": types.TensorData(
-            data=np.zeros([8], dtype=np.float32).tolist(),
+            data=[0.0] * 8,
             shape=[8],
             dtype="float32",
         ),
     },
 ).result()
 
-actions = np.asarray(action_result["actions"]["data"], dtype=np.float32).reshape(
-    action_result["actions"]["shape"]
-)
+action_client.shutdown().result()
+training_client.delete_model().result()
 ```
 
-### Why this still feels like Tinker
+What stays the same:
 
-The flow-matching model does not produce token samples, but the surrounding client flow still matches Tinker:
+- one `ServiceClient`
+- one `TrainingClient`
+- one `train_step(...)` public training unit
+- one action-session handoff
+- one explicit cleanup sequence
 
-- one service client
-- one training client
-- one async future model
-- one export-and-infer step
+What changes is the model semantics, not the service shape.
 
-The difference is that inference returns action tensors instead of token sequences.
+## Runtime and deployment notes
 
-## What changes for the user
+Do not interpret successful private development runs as proof that a shared runtime artifact is correct.
 
-Very little should change in application structure:
+The current runtime contract is repo-owned:
 
-- batching still happens client-side
-- `Datum` is still the training unit
-- weights are still saved and reused through the same service
-- async futures still represent long-running work
+- `src/mint/pyproject.toml` declares the canonical `tool.tinker.runtime_env` sources and host requirements
+- the `openpi` source contract includes both `src` and `packages/openpi-client/src`
+- host-side requirements explicitly include the OpenPI worker stack such as `jax[cuda12]`, `flax`, `optax`, `orbax-checkpoint`, `ml_collections`, `jaxtyping`, `augmax`, `tqdm-loggable`, and `tyro`
+- `src/mint/scripts/build_runtime_env.py --inspect --env-root ...` is the standard probe for manifest, layout, and host-python import checks
 
-The main new concept is that VLA inference should use an action-sampling client instead of the text-only `SamplingClient`.
+The current rule is therefore:
 
-## Scope and status
+- do not rely on private workspace path guesses
+- do not rely on `unison` code sync alone as proof that runtime artifacts are current
+- do not use this guide as evidence that a shared runtime root is valid
 
-The main status distinctions are:
+Runtime validity must be proven separately by the runtime builder and inspect probes.
 
-- `pi0-fast` is the best first fit for Tinker-style integration because it is autoregressive
-- `pi0.5` can still fit the training API closely, but inference needs an action-output surface
-- `pi0.5` does not have an autoregressive variant in the current OpenPI repo
+## Relation to the upstream OpenPI workflow
 
-## Recommended user mental model
+Use the upstream OpenPI repo directly when your goal is:
 
-Use Tinker-style APIs when you want:
+- to reproduce upstream scripts exactly
+- to experiment inside upstream policy/training code without Mint service boundaries
+- to validate upstream behavior before integrating it into Mint
 
-- one client pattern across model families
-- asynchronous training and inference requests
-- production-grade routing and queue semantics
-- stable checkpoint and session handling
+Use the Mint surface when your goal is:
 
-Use the original OpenPI scripts when you want:
+- one service boundary for training and action inference
+- async future semantics
+- Mint-managed queue and capacity behavior
+- Mint-managed actor lifecycle
+- a stable client pattern across `pi0-fast` and `pi0.5`
 
-- direct experimentation inside the OpenPI repo
-- local reproduction of their released examples
-- the fastest path to matching the original repo workflow exactly
+## What this guide is and is not
+
+This file is now aligned with the current public Mint shape:
+
+- `train_step(...)` is the public training guide
+- MintX `/api/v1/mint/action_sessions*` is the public action guide
+- action inference is part of the Mint control plane
+
+This file is still not the normative source.
+
+If there is any conflict between this file and:
+
+- `docs/mint-openpi-vla-target.md`
+- `docs/README.md`
+- `docs/sub-targets/*.md`
+- the verified stage-local scripts
+
+the normative docs and verified examples win.
