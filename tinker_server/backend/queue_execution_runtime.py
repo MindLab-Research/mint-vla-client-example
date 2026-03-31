@@ -13,6 +13,25 @@ logger = logging.getLogger(__name__)
 _ACTOR_HANDLE = None
 
 
+def _runtime_env_overrides() -> dict[str, str]:
+    keys = (
+        "MINT_QUEUE_EXECUTION_RUNTIME_ACTOR_NAME",
+        "MINT_QUEUE_SUPERVISOR_ACTOR_NAME",
+        "MINT_API_WORK_QUEUE_ACTOR_NAME",
+        "MINT_OWNER_RUNTIME_SUPERVISOR_ACTOR_NAME",
+        "MINT_TRAINING_CLEANUP_EXECUTOR_ACTOR_NAME",
+        "MINT_SAMPLING_CLEANUP_EXECUTOR_ACTOR_NAME",
+        "TINKER_RAY_NAMESPACE",
+        "MINT_RAY_NAMESPACE",
+    )
+    out: dict[str, str] = {}
+    for key in keys:
+        value = os.environ.get(key, "").strip()
+        if value:
+            out[key] = value
+    return out
+
+
 def _ray_namespace() -> str:
     env_ns = os.environ.get("TINKER_RAY_NAMESPACE") or os.environ.get("MINT_RAY_NAMESPACE")
     if env_ns:
@@ -165,6 +184,17 @@ def _get_or_create_actor():
                     raise
             return await self.health_snapshot()
 
+        async def get_tokenizer_info(self, *, model_id: str) -> dict[str, Any]:
+            from ..routes import training
+
+            if not self._runtime_initialized:
+                await _initialize_execution_bindings()
+                self._runtime_initialized = True
+            session, _snapshot = await training._get_training_session_for_request(str(model_id))
+            if session is None:
+                raise RuntimeError(f"Model {model_id!r} not found")
+            return await training.training_engine.get_tokenizer_info(session)
+
         async def health_snapshot(self) -> dict[str, Any]:
             from .api_work_queue import api_work_queue
 
@@ -192,7 +222,9 @@ def _get_or_create_actor():
             options["resources"] = {"node:__internal_head__": 0.001}
     except Exception:
         pass
-    options["runtime_env"] = actor_runtime_env(pythonpath=PFS_PYTHONPATH, extra=otel_env_vars())
+    env = otel_env_vars()
+    env.update(_runtime_env_overrides())
+    options["runtime_env"] = actor_runtime_env(pythonpath=PFS_PYTHONPATH, extra=env)
 
     try:
         created = _QueueExecutionRuntimeActor.options(**options).remote()
@@ -233,6 +265,16 @@ class QueueExecutionRuntime:
         )
         if not isinstance(out, dict):
             raise TypeError(f"QueueExecutionRuntime.ensure_started returned non-dict: {type(out)}")
+        return out
+
+    async def async_get_tokenizer_info(self, *, model_id: str, timeout_s: float = 60.0) -> dict[str, Any]:
+        actor = self._get_ray_actor()
+        out = await asyncio.wait_for(
+            _await_ray_ref(actor.get_tokenizer_info.remote(model_id=str(model_id))),
+            timeout=float(timeout_s),
+        )
+        if not isinstance(out, dict):
+            raise TypeError(f"QueueExecutionRuntime.get_tokenizer_info returned non-dict: {type(out)}")
         return out
 
     async def async_health_snapshot(self, *, timeout_s: float = 30.0) -> dict[str, Any]:

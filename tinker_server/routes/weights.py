@@ -73,6 +73,26 @@ training_engine: VerlTrainingEngine | None = None
 inference_manager: SessionManager | None = None  # For multi-LoRA sampling registration
 
 
+def _mark_training_inflight(model_id: str, delta: int) -> None:
+    if training_manager is None:
+        return
+    mark = getattr(training_manager, "mark_inflight", None)
+    if callable(mark):
+        mark(model_id, delta)
+
+
+async def _fail_future(request_id: str, error: str) -> None:
+    async_fail = getattr(future_store, "async_fail", None)
+    if callable(async_fail):
+        await async_fail(request_id, error)
+        return
+    fail = getattr(future_store, "fail", None)
+    if callable(fail):
+        fail(request_id, error)
+        return
+    raise AttributeError("future_store has neither async_fail nor fail")
+
+
 def _get_user_data(request: Request) -> dict | None:
     """Extract full user_data from request state."""
     return _request_user_data(request)
@@ -427,9 +447,28 @@ async def save_weights(
         upstream_for_alias,
     )
 
-    session = training_manager.get_session(request.model_id) if training_manager is not None else None
+    try:
+        from ..backend.training_session_store import async_get_training_session_info
 
-    if session is None:
+        store_info = await async_get_training_session_info(request.model_id)
+    except Exception:
+        store_info = None
+
+    session = None
+    if not isinstance(store_info, dict) and training_manager is not None:
+        get_session = getattr(training_manager, "get_session", None)
+        if callable(get_session):
+            session = get_session(request.model_id)
+            if session is not None:
+                store_info = {"model_id": getattr(session, "model_id", request.model_id), "user_id": getattr(session, "user_id", None)}
+    session = None
+    if not isinstance(store_info, dict) and training_manager is not None:
+        get_session = getattr(training_manager, "get_session", None)
+        if callable(get_session):
+            session = get_session(request.model_id)
+            if session is not None:
+                store_info = {"model_id": getattr(session, "model_id", request.model_id), "user_id": getattr(session, "user_id", None)}
+    if not isinstance(store_info, dict):
         remote = await async_remote_training_model(request.model_id)
         if remote is not None:
             upstream_alias, base_model = remote
@@ -466,10 +505,7 @@ async def save_weights(
                 request_id=encode_request_id(upstream_alias=upstream_alias, upstream_request_id=upstream_request_id)
             )
 
-    if training_engine is None or training_manager is None:
-        raise HTTPException(status_code=503, detail="Training engine not initialized")
-
-    if session is None:
+    if not isinstance(store_info, dict):
         raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
 
     user_id = _get_user_id(http_request)
@@ -499,7 +535,7 @@ async def save_weights(
     inflight_marked = False
     try:
         if training_manager is not None:
-            training_manager.mark_inflight(request.model_id, +1)
+            _mark_training_inflight(request.model_id, +1)
             inflight_marked = True
         await future_store.async_create_with_id(request_id)
         created = True
@@ -523,7 +559,7 @@ async def save_weights(
         )
     except Exception as e:
         if inflight_marked and training_manager is not None:
-            training_manager.mark_inflight(request.model_id, -1)
+            _mark_training_inflight(request.model_id, -1)
         await capacity_manager.async_release_all(request_id)
         if created:
             await future_store.async_cleanup(request_id)
@@ -554,8 +590,13 @@ async def save_state(
         upstream_for_alias,
     )
 
-    session = training_manager.get_session(request.model_id) if training_manager is not None else None
-    if session is None:
+    try:
+        from ..backend.training_session_store import async_get_training_session_info
+
+        store_info = await async_get_training_session_info(request.model_id)
+    except Exception:
+        store_info = None
+    if not isinstance(store_info, dict):
         remote = await async_remote_training_model(request.model_id)
         if remote is not None:
             upstream_alias, base_model = remote
@@ -624,7 +665,7 @@ async def save_state(
     inflight_marked = False
     try:
         if training_manager is not None:
-            training_manager.mark_inflight(request.model_id, +1)
+            _mark_training_inflight(request.model_id, +1)
             inflight_marked = True
         await future_store.async_create_with_id(request_id)
         created = True
@@ -648,7 +689,7 @@ async def save_state(
         )
     except Exception as e:
         if inflight_marked and training_manager is not None:
-            training_manager.mark_inflight(request.model_id, -1)
+            _mark_training_inflight(request.model_id, -1)
         await capacity_manager.async_release_all(request_id)
         if created:
             await future_store.async_cleanup(request_id)
@@ -706,7 +747,7 @@ async def _do_save_state(
             attributes={
                 "model_id": str(request.model_id),
                 "base_model": str(session.base_model),
-                "backend": str(session.backend),
+                "backend": str(getattr(session, "backend", "unknown")),
                 "checkpoint_type": "training",
                 "checkpoint_name": str(checkpoint_name),
             },
@@ -738,7 +779,7 @@ async def _do_save_state(
             "step": session.current_step,
             "checkpoint_type": "training",
             "optimizer_present": optimizer_present,
-            "backend": session.backend,
+            "backend": getattr(session, "backend", "unknown"),
             "type": "training",
             "storage_tier": "persistent_cache",
             "ttl_seconds": request.ttl_seconds,
@@ -809,7 +850,7 @@ async def _do_save_state(
             type(e).__name__,
             "check_training_session_and_checkpoint_path",
         )
-        await future_store.async_fail(request_id, str(e))
+        await _fail_future(request_id, str(e))
 
         # 发送 failed 状态
         if webhook_url and user_id:
@@ -827,7 +868,7 @@ async def _do_save_state(
             )
     finally:
         if inflight_marked and training_manager is not None:
-            training_manager.mark_inflight(request.model_id, -1)
+            _mark_training_inflight(request.model_id, -1)
 
 
 async def _do_save_weights(
@@ -882,7 +923,7 @@ async def _do_save_weights(
             attributes={
                 "model_id": str(request.model_id),
                 "base_model": str(session.base_model),
-                "backend": str(session.backend),
+                "backend": str(getattr(session, "backend", "unknown")),
                 "checkpoint_type": "sampler",
                 "checkpoint_name": str(checkpoint_name),
             },
@@ -904,7 +945,7 @@ async def _do_save_weights(
             "step": session.current_step,
             "checkpoint_type": "sampler",
             "optimizer_present": False,
-            "backend": session.backend,
+            "backend": getattr(session, "backend", "unknown"),
             "type": "sampler",
             "storage_tier": "persistent_cache",
             "ttl_seconds": request.ttl_seconds,
@@ -977,7 +1018,7 @@ async def _do_save_weights(
             type(e).__name__,
             "check_sampler_checkpoint_export",
         )
-        await future_store.async_fail(request_id, str(e))
+        await _fail_future(request_id, str(e))
 
         if webhook_url and user_id:
             failed_session_id = session.model_id if session is not None else request.model_id
@@ -993,7 +1034,7 @@ async def _do_save_weights(
             )
     finally:
         if inflight_marked and training_manager is not None:
-            training_manager.mark_inflight(request.model_id, -1)
+            _mark_training_inflight(request.model_id, -1)
 
 
 # =============================================================================
@@ -1017,8 +1058,20 @@ async def load_state(
         upstream_for_alias,
     )
 
-    session = training_manager.get_session(request.model_id) if training_manager is not None else None
-    remote = None if session is not None else await async_remote_training_model(request.model_id)
+    try:
+        from ..backend.training_session_store import async_get_training_session_info
+
+        store_info = await async_get_training_session_info(request.model_id)
+    except Exception:
+        store_info = None
+    session = None
+    if not isinstance(store_info, dict) and training_manager is not None:
+        get_session = getattr(training_manager, "get_session", None)
+        if callable(get_session):
+            session = get_session(request.model_id)
+            if session is not None:
+                store_info = {"model_id": getattr(session, "model_id", request.model_id), "user_id": getattr(session, "user_id", None)}
+    remote = None if isinstance(store_info, dict) else await async_remote_training_model(request.model_id)
     if remote is not None:
         upstream_alias, base_model = remote
         upstream = upstream_for_alias(upstream_alias)
@@ -1089,11 +1142,7 @@ async def load_state(
             request_id=encode_request_id(upstream_alias=upstream_alias, upstream_request_id=upstream_request_id)
         )
 
-    if training_engine is None or training_manager is None:
-        raise HTTPException(status_code=503, detail="Training engine not initialized")
-
-    session = training_manager.get_session(request.model_id)
-    if session is None:
+    if not isinstance(store_info, dict):
         raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
 
     user_id = _get_user_id(http_request)
@@ -1135,7 +1184,7 @@ async def load_state(
     inflight_marked = False
     try:
         if training_manager is not None:
-            training_manager.mark_inflight(request.model_id, +1)
+            _mark_training_inflight(request.model_id, +1)
             inflight_marked = True
         await future_store.async_create_with_id(request_id)
         created = True
@@ -1156,7 +1205,7 @@ async def load_state(
         )
     except Exception as e:
         if inflight_marked and training_manager is not None:
-            training_manager.mark_inflight(request.model_id, -1)
+            _mark_training_inflight(request.model_id, -1)
         await capacity_manager.async_release_all(request_id)
         if created:
             await future_store.async_cleanup(request_id)
@@ -1198,7 +1247,7 @@ async def _do_load_state(
             attributes={
                 "model_id": str(request.model_id),
                 "base_model": str(session.base_model),
-                "backend": str(session.backend),
+                "backend": str(getattr(session, "backend", "unknown")),
                 "load_optimizer": bool(request.optimizer),
             },
         )
@@ -1217,10 +1266,10 @@ async def _do_load_state(
             type(e).__name__,
             "check_checkpoint_contract_and_permissions",
         )
-        await future_store.async_fail(request_id, str(e))
+        await _fail_future(request_id, str(e))
     finally:
         if inflight_marked and training_manager is not None:
-            training_manager.mark_inflight(request.model_id, -1)
+            _mark_training_inflight(request.model_id, -1)
 
 
 # =============================================================================

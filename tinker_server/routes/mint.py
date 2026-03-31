@@ -199,11 +199,22 @@ async def forward_backward_reverse_kl(
     request: ForwardBackwardReverseKLRequest,
     http_request: Request,
 ) -> UntypedAPIFuture:
-    if training_engine is None or training_manager is None:
-        raise HTTPException(status_code=503, detail="Training engine not initialized")
+    try:
+        from ..backend.training_session_store import async_get_training_session_info
 
-    session = training_manager.get_session(request.model_id)
-    if session is None:
+        info = await async_get_training_session_info(request.model_id)
+    except Exception:
+        info = None
+    if not isinstance(info, dict) and training_manager is not None:
+        get_session = getattr(training_manager, "get_session", None)
+        if callable(get_session):
+            session = get_session(request.model_id)
+            if session is not None:
+                info = {
+                    "model_id": getattr(session, "model_id", request.model_id),
+                    "base_model": getattr(session, "base_model", None),
+                }
+    if not isinstance(info, dict):
         raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
 
     try:
@@ -213,13 +224,14 @@ async def forward_backward_reverse_kl(
 
     from ..routes.training import _get_max_model_len
 
-    max_model_len = _get_max_model_len(session.base_model)
+    base_model = str(info.get("base_model") or "")
+    max_model_len = _get_max_model_len(base_model)
     if max_seq_len > max_model_len:
         raise HTTPException(
             status_code=400,
             detail=(
                 f"Input sequence length {max_seq_len} exceeds max_model_len {max_model_len} "
-                f"for model {session.base_model}"
+                f"for model {base_model}"
             ),
         )
 
