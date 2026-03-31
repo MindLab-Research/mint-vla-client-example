@@ -1716,6 +1716,7 @@ class ApiWorkQueueClient:
                 snapshot = await queue_supervisor.async_claim_generation(timeout_s=start_timeout_s)
                 generation_id = int(snapshot.get("generation_id") or 0)
                 owner_id = snapshot.get("owner_id")
+                generation_state = str(snapshot.get("state") or "")
                 owns_generation = bool(owner_id) and str(owner_id) == queue_supervisor.owner_id() and generation_id > 0
                 if owns_generation:
                     consumer_job_id = f"{queue_supervisor.owner_id()}:{generation_id}"
@@ -1723,6 +1724,7 @@ class ApiWorkQueueClient:
                         self._consumer_generation_id != generation_id
                         or self._consumer_job_id != consumer_job_id
                     )
+                    needs_reconcile = generation_changed or generation_state != "active"
                     actor = await self._get_ray_actor_async()
                     if generation_changed:
                         self._clear_execution_ready()
@@ -1730,6 +1732,7 @@ class ApiWorkQueueClient:
                         await self._await_ray_ref(ref, timeout_s=start_timeout_s)
                         self._consumer_job_id = consumer_job_id
                         self._consumer_generation_id = generation_id
+                    if needs_reconcile:
                         await queue_supervisor.async_begin_reconcile(generation_id=generation_id)
                         stale_reconciled = await self._reconcile_stale_running_requests(consumer_job_id)
                         await queue_supervisor.async_finish_reconcile(
@@ -1762,6 +1765,12 @@ class ApiWorkQueueClient:
     async def start_workers(self, *, num_workers: int) -> None:
         self._desired_num_workers = max(1, int(num_workers))
         if self._running:
+            alive = [task for task in self._worker_tasks if not task.done()]
+            self._worker_tasks = alive
+            if not self._worker_tasks or self._queue_supervisor_task is None or self._queue_supervisor_task.done():
+                self._clear_execution_ready()
+                if self._queue_supervisor_task is None or self._queue_supervisor_task.done():
+                    self._queue_supervisor_task = asyncio.create_task(self._queue_supervisor_loop())
             return
         self._clear_execution_ready()
         self._running = True

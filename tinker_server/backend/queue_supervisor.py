@@ -94,7 +94,7 @@ def _get_or_create_actor():
             requested_owner = str(owner_id)
             if self._lease_active() and self._owner_id != requested_owner:
                 return self.snapshot()
-            if self._lease_active() and self._owner_id == requested_owner:
+            if self._owner_id == requested_owner and int(self._generation_id) > 0:
                 self._expires_at = now + float(ttl_s)
                 self._last_claim_at = now
                 return self.snapshot()

@@ -98,6 +98,7 @@ def test_issue_364_queue_supervisor_same_owner_claim_keeps_active_state(monkeypa
             self.owner_id = None
             self.expires_at = 0.0
             self.state = "inactive"
+            self.now = 100.0
 
         def snapshot(self):
             return {
@@ -108,11 +109,11 @@ def test_issue_364_queue_supervisor_same_owner_claim_keeps_active_state(monkeypa
             }
 
         def claim_generation(self, *, owner_id: str, ttl_s: float):
-            now = 100.0
+            now = self.now
             requested_owner = str(owner_id)
             if self.expires_at > now and self.owner_id != requested_owner:
                 return self.snapshot()
-            if self.expires_at > now and self.owner_id == requested_owner:
+            if self.owner_id == requested_owner and int(self.generation_id) > 0:
                 self.expires_at = now + float(ttl_s)
                 return self.snapshot()
             if self.owner_id != requested_owner:
@@ -135,6 +136,10 @@ def test_issue_364_queue_supervisor_same_owner_claim_keeps_active_state(monkeypa
     claimed_again = s.claim_generation(owner_id="owner-a", ttl_s=30.0)
     assert claimed_again["generation_id"] == 1
     assert claimed_again["state"] == "active"
+    s.now = 1000.0
+    claimed_after_expiry = s.claim_generation(owner_id="owner-a", ttl_s=30.0)
+    assert claimed_after_expiry["generation_id"] == 1
+    assert claimed_after_expiry["state"] == "active"
 
 
 def test_issue_364_future_store_rejects_stale_generation(monkeypatch) -> None:
@@ -257,3 +262,37 @@ async def test_issue_364_api_work_queue_waits_for_first_generation_claim(monkeyp
     await asyncio.gather(loop_task, return_exceptions=True)
     worker_task.cancel()
     await asyncio.gather(worker_task, return_exceptions=True)
+
+
+@pytest.mark.anyio
+async def test_issue_364_api_work_queue_restarts_workers_when_running_but_empty() -> None:
+    api_work_queue_module = importlib.import_module("tinker_server.backend.api_work_queue")
+
+    client = api_work_queue_module.ApiWorkQueueClient()
+    client._running = True
+    client._desired_num_workers = 1
+    client._worker_tasks = []
+    client._queue_supervisor_task = None
+    client._execution_ready_event.set()
+
+    scheduled = []
+    original_create_task = asyncio.create_task
+
+    def _record(coro):
+        task = original_create_task(coro)
+        scheduled.append(task)
+        return task
+
+    try:
+        asyncio.create_task = _record  # type: ignore[assignment]
+        await client.start_workers(num_workers=2)
+    finally:
+        asyncio.create_task = original_create_task  # type: ignore[assignment]
+        for task in scheduled:
+            task.cancel()
+        if scheduled:
+            await asyncio.gather(*scheduled, return_exceptions=True)
+
+    assert client._desired_num_workers == 2
+    assert client._execution_ready_event.is_set() is False
+    assert client._queue_supervisor_task is not None
