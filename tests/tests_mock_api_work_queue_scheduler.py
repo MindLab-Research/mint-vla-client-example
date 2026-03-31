@@ -135,6 +135,89 @@ def _session_key_from_item(item: dict) -> str:
     return str(extra.get("scheduler_session_key") or extra.get("session_id") or "")
 
 
+def test_issue_432_global_arbiter_prefers_legacy_head_when_older(monkeypatch):
+    api_work_queue = _load_api_work_queue_module(monkeypatch)
+
+    decision = api_work_queue.choose_global_arbitration(
+        has_legacy=True,
+        legacy_head_created_at=10.0,
+        scheduled=api_work_queue.ScheduledCandidate(
+            domain="megatron:Qwen/Qwen3-30B-A3B-Instruct-2507",
+            session_id="run-A",
+            dequeue_reason="fairness_oldest",
+            head_created_at=12.0,
+        ),
+    )
+
+    assert decision == api_work_queue.GlobalArbitrationDecision(
+        queue_kind="legacy",
+        dequeue_reason="fifo",
+        decision_reason="legacy_head_older",
+    )
+
+
+def test_issue_432_global_arbiter_prefers_scheduled_when_head_is_older(monkeypatch):
+    api_work_queue = _load_api_work_queue_module(monkeypatch)
+
+    decision = api_work_queue.choose_global_arbitration(
+        has_legacy=True,
+        legacy_head_created_at=12.0,
+        scheduled=api_work_queue.ScheduledCandidate(
+            domain="megatron:Qwen/Qwen3-30B-A3B-Instruct-2507",
+            session_id="run-A",
+            dequeue_reason="fairness_oldest",
+            head_created_at=10.0,
+        ),
+    )
+
+    assert decision == api_work_queue.GlobalArbitrationDecision(
+        queue_kind="scheduled",
+        dequeue_reason="fairness_oldest",
+        decision_reason="scheduled_fairness_oldest",
+        scheduler_domain="megatron:Qwen/Qwen3-30B-A3B-Instruct-2507",
+        scheduler_session_id="run-A",
+    )
+
+
+def test_issue_432_global_arbiter_handles_single_bucket_cases(monkeypatch):
+    api_work_queue = _load_api_work_queue_module(monkeypatch)
+
+    legacy_only = api_work_queue.choose_global_arbitration(
+        has_legacy=True,
+        legacy_head_created_at=10.0,
+        scheduled=None,
+    )
+    assert legacy_only == api_work_queue.GlobalArbitrationDecision(
+        queue_kind="legacy",
+        dequeue_reason="fifo",
+        decision_reason="legacy_only",
+    )
+
+    scheduled_only = api_work_queue.choose_global_arbitration(
+        has_legacy=False,
+        legacy_head_created_at=None,
+        scheduled=api_work_queue.ScheduledCandidate(
+            domain="vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
+            session_id="sess-A",
+            dequeue_reason="fairness_rr",
+            head_created_at=5.0,
+        ),
+    )
+    assert scheduled_only == api_work_queue.GlobalArbitrationDecision(
+        queue_kind="scheduled",
+        dequeue_reason="fairness_rr",
+        decision_reason="scheduled_only",
+        scheduler_domain="vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
+        scheduler_session_id="sess-A",
+    )
+
+    assert api_work_queue.choose_global_arbitration(
+        has_legacy=False,
+        legacy_head_created_at=None,
+        scheduled=None,
+    ) is None
+
+
 def test_mock_scheduler_sticky_then_fairness_rr(monkeypatch):
     monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "1")
     monkeypatch.setenv("MINT_SCHEDULER_FAIRNESS", "rr")
