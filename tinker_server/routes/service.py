@@ -467,6 +467,7 @@ async def _create_sampling_session_impl(
         try:
             from ..backend.session_index_store import add_sampler_to_session, upsert_sampler_index
 
+            # Generic create_sampling_session children stay out of root heartbeat fanout.
             add_sampler_to_session(
                 session_id=request.session_id,
                 sampler_id=sampler_id,
@@ -855,7 +856,7 @@ async def _child_sampler_ids_for_heartbeat(
     request_user_data: dict | None,
 ) -> list[str]:
     try:
-        from ..backend.session_index_store import get_sampler_index, get_session_index
+        from ..backend.session_index_store import get_session_index
 
         info = await run_in_threadpool(get_session_index, root_session_id)
     except Exception as e:
@@ -869,38 +870,12 @@ async def _child_sampler_ids_for_heartbeat(
         return []
 
     seen: set[str] = set()
-    direct = info.get("heartbeat_sampler_ids") or []
-    if direct:
-        out: list[str] = []
-        for sampler_id in direct:
-            if not isinstance(sampler_id, str) or not sampler_id or sampler_id in seen:
-                continue
-            seen.add(sampler_id)
-            out.append(sampler_id)
-        return out
-
-    training_run_ids = {
-        training_run_id
-        for training_run_id in info.get("training_run_ids") or []
-        if isinstance(training_run_id, str) and training_run_id
-    }
     out: list[str] = []
-    for sampler_id in info.get("sampler_ids") or []:
+    for sampler_id in info.get("heartbeat_sampler_ids") or []:
         if not isinstance(sampler_id, str) or not sampler_id or sampler_id in seen:
             continue
         seen.add(sampler_id)
-        try:
-            sampler_info = await run_in_threadpool(get_sampler_index, sampler_id)
-        except Exception as e:
-            logger.warning("[session_heartbeat] sampler index lookup failed for %s: %s", sampler_id, e)
-            continue
-        if not isinstance(sampler_info, dict):
-            continue
-        if sampler_info.get("source_type") != "checkpoint":
-            continue
-        model_id = sampler_info.get("model_id")
-        if isinstance(model_id, str) and model_id in training_run_ids:
-            out.append(sampler_id)
+        out.append(sampler_id)
     return out
 
 

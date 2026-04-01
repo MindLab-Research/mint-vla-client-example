@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -61,7 +62,7 @@ async def test_issue_437_root_heartbeat_touches_explicit_heartbeat_children(monk
 
 
 @pytest.mark.anyio
-async def test_issue_437_root_heartbeat_derives_training_checkpoint_children_only(monkeypatch) -> None:
+async def test_issue_437_root_heartbeat_skips_children_without_explicit_heartbeat_ids(monkeypatch) -> None:
     from tinker_server.models.types import SessionHeartbeatRequest
     from tinker_server.routes import service
 
@@ -91,15 +92,6 @@ async def test_issue_437_root_heartbeat_derives_training_checkpoint_children_onl
             "sampler_ids": ["child-sampler", "other-checkpoint", "base-model"],
         },
     )
-    monkeypatch.setattr(
-        sis,
-        "get_sampler_index",
-        lambda sampler_id: {
-            "child-sampler": {"source_type": "checkpoint", "model_id": "train-a"},
-            "other-checkpoint": {"source_type": "checkpoint", "model_id": "train-b"},
-            "base-model": {"source_type": "base_model"},
-        }.get(sampler_id),
-    )
 
     resp = await service.session_heartbeat(
         SessionHeartbeatRequest(session_id="root-session"),
@@ -108,10 +100,7 @@ async def test_issue_437_root_heartbeat_derives_training_checkpoint_children_onl
 
     assert resp.type == "session_heartbeat"
     assert updates == ["root-session"]
-    assert touched == [
-        ("root-session", 0),
-        ("child-sampler", 0),
-    ]
+    assert touched == [("root-session", 0)]
 
 
 @pytest.mark.anyio
@@ -239,3 +228,57 @@ async def test_issue_437_root_heartbeat_keeps_best_effort_on_index_failure(monke
     assert updates == ["root-session"]
     assert touched == [("root-session", 0)]
     assert "session index lookup failed for root-session" in caplog.text
+
+
+def test_issue_437_add_heartbeat_sampler_compat_upserts_when_actor_lacks_method(monkeypatch, caplog) -> None:
+    import tinker_server.backend.session_index_store as sis
+
+    sampler_adds: list[tuple[str, str, str | None, str | None]] = []
+    upserts: list[tuple[str, dict]] = []
+
+    actor = SimpleNamespace(
+        add_sampler=SimpleNamespace(
+            remote=lambda session_id, sampler_id, user_id, created_at: sampler_adds.append(
+                (session_id, sampler_id, user_id, created_at)
+            )
+        ),
+        get_session=SimpleNamespace(
+            remote=lambda _session_id: {
+                "session_id": "root-session",
+                "heartbeat_sampler_ids": ["sampler-old"],
+            }
+        ),
+        upsert_session=SimpleNamespace(remote=lambda session_id, info: upserts.append((session_id, info))),
+    )
+
+    monkeypatch.setitem(
+        sys.modules,
+        "ray",
+        SimpleNamespace(
+            is_initialized=lambda: True,
+            get=lambda value: value,
+        ),
+    )
+    monkeypatch.setattr(sis, "_get_or_create_actor", lambda: actor)
+
+    with caplog.at_level("WARNING"):
+        sis.add_heartbeat_sampler_to_session(
+            session_id="root-session",
+            sampler_id="sampler-new",
+            user_id="owner-a",
+            created_at="2026-04-01T00:00:00",
+        )
+
+    assert sampler_adds == [
+        ("root-session", "sampler-new", "owner-a", "2026-04-01T00:00:00"),
+    ]
+    assert upserts == [
+        (
+            "root-session",
+            {
+                "session_id": "root-session",
+                "heartbeat_sampler_ids": ["sampler-old", "sampler-new"],
+            },
+        )
+    ]
+    assert "actor missing add_heartbeat_sampler; using compatibility upsert" in caplog.text

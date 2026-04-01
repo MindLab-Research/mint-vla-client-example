@@ -235,7 +235,28 @@ def add_heartbeat_sampler_to_session(
         return
     try:
         actor = _get_or_create_actor()
-        actor.add_heartbeat_sampler.remote(session_id, sampler_id, user_id, created_at)
+        try:
+            actor.add_heartbeat_sampler.remote(session_id, sampler_id, user_id, created_at)
+            return
+        except AttributeError:
+            logger.warning(
+                "Session index store actor missing add_heartbeat_sampler; using compatibility upsert"
+            )
+
+        actor.add_sampler.remote(session_id, sampler_id, user_id, created_at)
+        current = ray.get(actor.get_session.remote(session_id))
+        heartbeat_samplers = []
+        if isinstance(current, dict):
+            heartbeat_samplers = list(current.get("heartbeat_sampler_ids") or [])
+        if sampler_id not in heartbeat_samplers:
+            heartbeat_samplers.append(sampler_id)
+        actor.upsert_session.remote(
+            session_id,
+            {
+                "session_id": session_id,
+                "heartbeat_sampler_ids": heartbeat_samplers,
+            },
+        )
     except Exception as e:
         logger.warning("Session index store write failed: add_heartbeat_sampler: %s", e)
 

@@ -176,6 +176,62 @@ def test_create_sampling_session_conflict(monkeypatch):
         raise AssertionError("expected HTTPException")
 
 
+def test_create_sampling_session_keeps_generic_samplers_out_of_heartbeat_fanout(monkeypatch):
+    stub = _StubSessionManager()
+    sampler_calls: list[tuple[str, str, str | None, str | None]] = []
+    heartbeat_calls: list[tuple[str, str, str | None, str | None]] = []
+    sampler_index_updates: list[dict] = []
+
+    monkeypatch.setattr(service_route, "session_manager", stub)
+
+    import tinker_server.backend.session_index_store as sis
+    import tinker_server.supported_models_gate as gate
+    import tinker_server.gateway as gw
+
+    async def _allow(base_model: str, http_request=None):
+        return base_model
+
+    monkeypatch.setattr(gate, "enforce_base_model_allowed", _allow)
+    monkeypatch.setattr(service_route, "can_access_model", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(gw, "upstream_for_model", lambda _model: None)
+    monkeypatch.setattr(
+        sis,
+        "add_sampler_to_session",
+        lambda session_id, sampler_id, user_id=None, created_at=None: sampler_calls.append(
+            (session_id, sampler_id, user_id, created_at)
+        ),
+    )
+    monkeypatch.setattr(
+        sis,
+        "add_heartbeat_sampler_to_session",
+        lambda session_id, sampler_id, user_id=None, created_at=None: heartbeat_calls.append(
+            (session_id, sampler_id, user_id, created_at)
+        ),
+    )
+    monkeypatch.setattr(sis, "upsert_sampler_index", sampler_index_updates.append)
+
+    req = CreateSamplingSessionRequest(
+        session_id="sess",
+        sampling_session_seq_id=11,
+        base_model="Qwen/Qwen3-4B-Instruct-2507",
+    )
+    out = anyio.run(service_route.create_sampling_session, req, _dummy_request("u"))
+
+    assert out.sampling_session_id == "sess:sample:11"
+    assert sampler_calls == [("sess", "sess:sample:11", "u", sampler_calls[0][3])]
+    assert heartbeat_calls == []
+    assert sampler_index_updates == [
+        {
+            "sampler_id": "sess:sample:11",
+            "session_id": "sess",
+            "base_model": "Qwen/Qwen3-4B-Instruct-2507",
+            "user_id": "u",
+            "created_at": sampler_calls[0][3],
+            "source_type": "base_model",
+        }
+    ]
+
+
 def test_asample_deterministic_request_id_dedup(monkeypatch):
     stub_fs = _StubFutureStore()
     stub_cap = _StubCapacityManager()
