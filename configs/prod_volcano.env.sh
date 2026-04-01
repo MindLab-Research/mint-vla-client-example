@@ -73,7 +73,7 @@ fi
 export TINKER_API_WORK_QUEUE_ACTOR_NAME=tinker_api_work_queue_v20260309
 export MINT_API_WORK_QUEUE_ACTOR_MAX_CONCURRENCY=1024
 
-export PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/mint-runtime-py31213-openpi-candidate-20260331-203300
+export PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/mint-runtime-py31213
 runtime_torch_lib="${PFS_RUNTIME_ENV_ROOT}/host-venv/lib/python3.12/site-packages/torch/lib"
 export PFS_TINKER_PATH=/vePFS-Mindverse/share/code/tinker-server-auth
 export PFS_HF_MODULES_PATH=/vePFS-Mindverse/share/huggingface/modules
