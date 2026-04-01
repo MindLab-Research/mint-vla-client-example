@@ -64,6 +64,19 @@ def _http_route_label(request: Request) -> str:
     return request.url.path
 
 
+def _should_preload_openai_tokenizers() -> bool:
+    raw = os.environ.get("MINT_OAI_PRELOAD_TOKENIZERS", "auto").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    try:
+        workers = max(1, int(os.environ.get("MINT_UVICORN_WORKERS", "1")))
+    except Exception:
+        workers = 1
+    return workers <= 1
+
+
 async def _cleanup_stale_actors() -> None:
     try:
         from .backend.actor_reconciliation import cleanup_stale_actors_once
@@ -696,19 +709,24 @@ async def lifespan(app: FastAPI):
             logger.info("Skipping persistent prewarm on follower worker")
 
         # ==========================================================================
-        # OpenAI compat: preload tokenizers so request paths stay non-blocking
+        # OpenAI compat: preload tokenizers only for single-worker startup.
+        # Multi-worker preloading duplicates large tokenizer state in every API process
+        # and can destabilize worker startup; lazy loading remains available per request.
         # ==========================================================================
-        try:
-            preload_failures = openai_compat.preload_supported_tokenizers()
-            if preload_failures:
-                logger.warning(
-                    "OpenAI-compatible tokenizer preload incomplete: %s",
-                    preload_failures,
-                )
-            else:
-                logger.info("OpenAI-compatible tokenizers preloaded")
-        except Exception as e:
-            logger.exception("OpenAI-compatible tokenizer preload failed: %s", e)
+        if _should_preload_openai_tokenizers():
+            try:
+                preload_failures = openai_compat.preload_supported_tokenizers()
+                if preload_failures:
+                    logger.warning(
+                        "OpenAI-compatible tokenizer preload incomplete: %s",
+                        preload_failures,
+                    )
+                else:
+                    logger.info("OpenAI-compatible tokenizers preloaded")
+            except Exception as e:
+                logger.exception("OpenAI-compatible tokenizer preload failed: %s", e)
+        else:
+            logger.info("Skipping OpenAI-compatible tokenizer preload for multi-worker startup")
 
         # ==========================================================================
         # Issue #84: Admission control + API work queue workers + future reaper

@@ -393,6 +393,38 @@ def test_lifespan_keeps_training_route_globals_unbound_in_stateless_api(monkeypa
     assert queue_execution_runtime.ensure_started_calls == [1]
 
 
+def test_lifespan_skips_tokenizer_preload_for_multi_worker_startup(monkeypatch) -> None:
+    queue = _StubApiWorkQueue()
+    owner_runtime = _StubOwnerRuntimeSupervisor()
+    queue_execution_runtime = _StubQueueExecutionRuntime()
+    _install_lifespan_stubs(monkeypatch, queue, owner_runtime, queue_execution_runtime)
+    lease = _StubStartupLease(is_owner=True)
+    preload_calls = []
+
+    async def _acquire_startup_lease(*_args, **_kwargs):
+        return lease
+
+    async def _noop_prewarm(*_args, **_kwargs) -> None:
+        return None
+
+    monkeypatch.setenv("MINT_UVICORN_WORKERS", "8")
+    monkeypatch.setattr(app_module, "_prewarm_persistent_models", _noop_prewarm)
+    monkeypatch.setattr(app_module.openai_compat, "preload_supported_tokenizers", lambda: preload_calls.append(True) or {})
+    monkeypatch.setattr(
+        "tinker_server.backend.startup_lease.acquire_startup_lease",
+        _acquire_startup_lease,
+    )
+
+    async def _run() -> None:
+        async with app_module.lifespan(app_module.app):
+            return None
+
+    asyncio.run(_run())
+
+    assert preload_calls == []
+    assert queue_execution_runtime.ensure_started_calls == [1]
+
+
 @pytest.mark.anyio
 async def test_prewarm_raises_when_training_prewarm_unavailable_in_stateless_api(monkeypatch) -> None:
     monkeypatch.setattr(app_module.config, "prewarm_persistent_models_csv", "Qwen/Qwen3-30B-A3B-Instruct-2507")
