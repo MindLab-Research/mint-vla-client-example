@@ -212,11 +212,15 @@ async def acquire_startup_lease(role: str, *, ttl_s: float | None = None) -> Sta
             local_only=False,
         )
     except Exception as e:
-        logger.warning("startup lease unavailable, falling back to local-only ownership for role=%s: %s", role, e)
+        logger.warning(
+            "startup lease unavailable, failing closed to follower mode for role=%s: %s",
+            role,
+            e,
+        )
         return StartupLease(
             role=role,
             owner_id=_PROCESS_OWNER_ID,
             ttl_s=ttl,
-            is_owner=True,
-            local_only=True,
+            is_owner=False,
+            local_only=False,
         )

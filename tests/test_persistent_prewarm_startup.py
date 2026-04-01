@@ -367,6 +367,26 @@ def test_lifespan_follower_skips_leader_only_startup(monkeypatch) -> None:
     assert len(init_ray_calls) == 0
 
 
+@pytest.mark.anyio
+async def test_acquire_startup_lease_fails_closed_to_follower(monkeypatch) -> None:
+    _install_fake_ray(monkeypatch)
+    startup_lease_module = importlib.import_module("tinker_server.backend.startup_lease")
+    fake_ray = importlib.import_module("ray")
+
+    monkeypatch.setattr(fake_ray, "is_initialized", lambda: True)
+
+    async def _fail_get_actor():
+        raise RuntimeError("lease backend unavailable")
+
+    monkeypatch.setattr(startup_lease_module, "_get_actor", _fail_get_actor)
+
+    lease = await startup_lease_module.acquire_startup_lease("test-role")
+
+    assert lease.role == "test-role"
+    assert lease.is_owner is False
+    assert lease.local_only is False
+
+
 def test_lifespan_keeps_training_route_globals_unbound_in_stateless_api(monkeypatch) -> None:
     queue = _StubApiWorkQueue()
     owner_runtime = _StubOwnerRuntimeSupervisor()
