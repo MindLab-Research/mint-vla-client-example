@@ -21,7 +21,7 @@ from pydantic import BaseModel
 from ..auth_identity import get_user_data as _request_user_data
 from ..auth_identity import get_user_id as _request_user_id
 from ..auth_identity import is_admin_request
-from ..checkpoints import _iter_metadata_paths, get_resolution_roots
+from ..checkpoints import _iter_metadata_paths, get_persistent_search_roots, get_resolution_roots
 from ..config import config as server_config
 from ..usage_store import get_usage_store
 
@@ -560,11 +560,71 @@ def _iter_checkpoint_entries(user_id: str | None, *, is_admin: bool = False):
         yield metadata, ckpt_path, public_id
 
 
+def _looks_like_legacy_checkpoint_dir(path: str) -> bool:
+    try:
+        entries = os.listdir(path)
+    except OSError:
+        return False
+    for entry in entries:
+        if os.path.isfile(os.path.join(path, entry)):
+            return True
+    return False
+
+
+
+def _iter_legacy_checkpoint_entries(user_id: str | None, *, is_admin: bool = False):
+    """Yield metadata-less legacy checkpoints from the old /owner/checkpoint layout."""
+    seen: set[str] = set()
+    roots = get_persistent_search_roots(primary_root=CHECKPOINTS_DIR)
+
+    if is_admin:
+        top_level_dirs: list[tuple[str, str]] = []
+        for root in roots:
+            if not os.path.isdir(root):
+                continue
+            top_level_dirs.extend(
+                (root, d) for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))
+            )
+    else:
+        top_level_dirs = []
+        if user_id is None:
+            return
+        for root in roots:
+            user_dir = os.path.join(root, user_id)
+            if os.path.isdir(user_dir):
+                top_level_dirs.append((root, user_id))
+
+    for root, owner_dir in top_level_dirs:
+        top_path = os.path.join(root, owner_dir)
+        for sub_dir in os.listdir(top_path):
+            sub_path = os.path.join(top_path, sub_dir)
+            if not os.path.isdir(sub_path):
+                continue
+            if os.path.exists(os.path.join(sub_path, "metadata.json")):
+                continue
+            if not _looks_like_legacy_checkpoint_dir(sub_path):
+                continue
+
+            real = os.path.realpath(sub_path)
+            if real in seen:
+                continue
+            seen.add(real)
+
+            metadata = {
+                "checkpoint_id": f"{owner_dir}_{sub_dir}",
+                "owner_id": owner_dir,
+                "type": "training",
+            }
+            yield metadata, sub_path, metadata["checkpoint_id"]
+
+
 def _scan_checkpoints(user_id: str | None, *, is_admin: bool = False) -> list[CheckpointInfo]:
     """Scan metadata-backed checkpoints and return the newest visible entry per checkpoint_id."""
     checkpoints_by_id: dict[str, tuple[int, CheckpointInfo]] = {}
 
-    for metadata, ckpt_path, public_id in _iter_checkpoint_entries(user_id, is_admin=is_admin):
+    for metadata, ckpt_path, public_id in list(_iter_checkpoint_entries(user_id, is_admin=is_admin)) + list(
+        _iter_legacy_checkpoint_entries(user_id, is_admin=is_admin)
+    ):
         model_name = metadata.get("model_name")
         if not isinstance(model_name, str) or not model_name:
             adapter_config_path = os.path.join(ckpt_path, "adapter_config.json")
@@ -624,8 +684,17 @@ def _resolve_checkpoint_entry(
         return matches
 
     matches = _collect(user_id, is_admin, allow_raw=not is_admin)
+    if not matches:
+        for metadata, ckpt_path, public_id in _iter_legacy_checkpoint_entries(user_id, is_admin=is_admin):
+            if public_id == checkpoint_id:
+                matches.append((0, public_id, ckpt_path, metadata))
+
     if not matches and not is_admin:
         matches = _collect(None, True, allow_raw=False)
+        if not matches:
+            for metadata, ckpt_path, public_id in _iter_legacy_checkpoint_entries(None, is_admin=True):
+                if public_id == checkpoint_id:
+                    matches.append((0, public_id, ckpt_path, metadata))
     if not matches:
         return None
 

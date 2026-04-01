@@ -193,3 +193,137 @@ def test_issue_441_internal_checkpoint_archive_scopes_raw_id_to_request_owner(tm
     client = _make_app({"user_id": "owner-a", "user_role": "user"})
     resp = client.get("/internal/v1/checkpoints/same-id/archive")
     assert resp.status_code == 200, resp.text
+
+
+
+def test_issue_441_internal_checkpoint_admin_ids_include_owner_prefix(tmp_path: Path) -> None:
+    _configure_checkpoint_roots(tmp_path)
+
+    for owner_id, model_id, checkpoint_id in (
+        ("owner-a", "model-1", "ckpt-a"),
+        ("owner-b", "model-2", "ckpt-b"),
+    ):
+        ckpt_dir = tmp_path / owner_id / model_id / checkpoint_id
+        _touch(ckpt_dir / "adapter_model.safetensors", owner_id.encode("utf-8"))
+        write_checkpoint_metadata(
+            str(ckpt_dir),
+            {
+                "checkpoint_id": checkpoint_id,
+                "owner_id": owner_id,
+                "model_id": model_id,
+                "model_name": f"Model/{model_id}",
+                "created_at": "2026-01-01T00:00:00Z",
+                "checkpoint_type": "sampler",
+                "type": "sampler",
+            },
+        )
+
+    client = _make_app({"user_id": "admin", "user_role": "admin", "is_admin": True})
+    resp = client.get("/internal/v1/checkpoints")
+    assert resp.status_code == 200, resp.text
+    checkpoint_ids = {entry["checkpoint_id"] for entry in resp.json()["checkpoints"]}
+    assert checkpoint_ids == {"owner-a:model-1_ckpt-a", "owner-b:model-2_ckpt-b"}
+
+    resp = client.get("/internal/v1/checkpoints/owner-b:model-2_ckpt-b/archive")
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["content-disposition"] == 'attachment; filename="ckpt-b.tar.gz"'
+
+
+
+def test_issue_441_internal_checkpoint_list_supports_legacy_two_level_metadata_layout(tmp_path: Path) -> None:
+    _configure_checkpoint_roots(tmp_path)
+
+    ckpt_dir = tmp_path / "owner-a" / "legacy-ckpt"
+    _touch(ckpt_dir / "adapter_model.safetensors")
+    write_checkpoint_metadata(
+        str(ckpt_dir),
+        {
+            "checkpoint_id": "legacy-ckpt",
+            "owner_id": "owner-a",
+            "model_name": "Legacy/Model",
+            "created_at": "2026-01-01T00:00:00Z",
+            "checkpoint_type": "sampler",
+            "type": "sampler",
+        },
+    )
+
+    client = _make_app({"user_id": "owner-a", "user_role": "user"})
+    resp = client.get("/internal/v1/checkpoints")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["checkpoints"] == [
+        {
+            "checkpoint_id": "legacy-ckpt",
+            "model_name": "Legacy/Model",
+            "created_at": "2026-01-01T00:00:00Z",
+            "type": "sampler",
+            "size_bytes": resp.json()["checkpoints"][0]["size_bytes"],
+        }
+    ]
+
+    resp = client.get("/internal/v1/checkpoints/legacy-ckpt/archive")
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["content-disposition"] == 'attachment; filename="legacy-ckpt.tar.gz"'
+
+
+
+def test_issue_441_internal_checkpoint_ambiguous_raw_id_across_models_returns_not_found(tmp_path: Path) -> None:
+    _configure_checkpoint_roots(tmp_path)
+
+    for model_id in ("model-a", "model-b"):
+        ckpt_dir = tmp_path / "owner-a" / model_id / "same-id"
+        _touch(ckpt_dir / "adapter_model.safetensors")
+        write_checkpoint_metadata(
+            str(ckpt_dir),
+            {
+                "checkpoint_id": "same-id",
+                "owner_id": "owner-a",
+                "model_id": model_id,
+                "model_name": f"Model/{model_id}",
+                "created_at": "2026-01-01T00:00:00Z",
+                "checkpoint_type": "sampler",
+                "type": "sampler",
+            },
+        )
+
+    client = _make_app({"user_id": "owner-a", "user_role": "user"})
+    resp = client.get("/internal/v1/checkpoints/same-id/archive")
+    assert resp.status_code == 404, resp.text
+
+
+
+def test_issue_441_internal_checkpoint_admin_can_access_metadata_less_legacy_checkpoint(tmp_path: Path) -> None:
+    _configure_checkpoint_roots(tmp_path)
+
+    ckpt_dir = tmp_path / "owner-a" / "legacy-plain"
+    _touch(ckpt_dir / "adapter_model.safetensors", b"legacy")
+
+    client = _make_app({"user_id": "admin", "user_role": "admin", "is_admin": True})
+    resp = client.get("/internal/v1/checkpoints")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["checkpoints"] == [
+        {
+            "checkpoint_id": "owner-a_legacy-plain",
+            "model_name": "unknown",
+            "created_at": resp.json()["checkpoints"][0]["created_at"],
+            "type": "training",
+            "size_bytes": resp.json()["checkpoints"][0]["size_bytes"],
+        }
+    ]
+
+    resp = client.get("/internal/v1/checkpoints/owner-a_legacy-plain/archive")
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["content-disposition"] == 'attachment; filename="owner-a_legacy-plain.tar.gz"'
+
+
+
+def test_issue_441_internal_checkpoint_user_list_includes_own_metadata_less_legacy_checkpoint(tmp_path: Path) -> None:
+    _configure_checkpoint_roots(tmp_path)
+
+    _touch(tmp_path / "owner-a" / "legacy-plain" / "adapter_model.safetensors")
+    _touch(tmp_path / "owner-b" / "other-plain" / "adapter_model.safetensors")
+
+    client = _make_app({"user_id": "owner-a", "user_role": "user"})
+    resp = client.get("/internal/v1/checkpoints")
+    assert resp.status_code == 200, resp.text
+    checkpoint_ids = {entry["checkpoint_id"] for entry in resp.json()["checkpoints"]}
+    assert checkpoint_ids == {"owner-a_legacy-plain"}
