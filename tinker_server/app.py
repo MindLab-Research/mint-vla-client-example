@@ -576,7 +576,7 @@ async def lifespan(app: FastAPI):
     )
 
     if startup_owner:
-        future_store.ensure_ready()
+        await future_store.async_ensure_ready()
         ensure_gateway_session_store_ready()
         ensure_sampling_session_store_ready()
         session_heartbeat_store.ensure_ready()
@@ -740,8 +740,8 @@ async def lifespan(app: FastAPI):
         from .backend.capacity_manager import capacity_manager
         from .backend.queue_execution_runtime import queue_execution_runtime
 
-        capacity_manager.ensure_ready()
-        api_work_queue.ensure_ready()
+        await capacity_manager.async_ensure_ready()
+        await api_work_queue.async_ensure_ready()
         await queue_execution_runtime.async_ensure_started(num_workers=int(config.api_work_queue_num_workers))
 
         stale_training_heartbeat_task = None

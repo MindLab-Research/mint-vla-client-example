@@ -824,6 +824,7 @@ async def asample(
             status_code=422,
             detail="seq_id is required when sampling_session_id or model_id is provided",
         )
+    session_id = request.get_session_id()
     snapshot = await _async_get_detached_sampling_snapshot(session_id)
     remote = None
     if snapshot is None:
@@ -1667,7 +1668,7 @@ async def _do_sample(
                 await _persist_usage_events(auth_ctx=auth_ctx, events=usage_events)
 
             # Compatibility: older tinker clients don't accept a top-level `type` field on SampleResponse.
-            future_store.resolve(request_id, response.model_dump(exclude={"type"}))
+            await future_store.async_resolve(request_id, response.model_dump(exclude={"type"}))
             workload_status = "ok"
             workload_generated_tokens = sum(len(seq.tokens) for seq in sequences)
             logger.info(f"Sampling completed: {len(sequences)} sequences generated")
@@ -1978,7 +1979,7 @@ async def _do_compute_logprobs(
                 ],
             )
         # Compatibility: older tinker clients don't accept a top-level `type` field on ComputeLogprobsResponse.
-        future_store.resolve(request_id, response.model_dump(exclude={"type"}))
+        await future_store.async_resolve(request_id, response.model_dump(exclude={"type"}))
         workload_status = "ok"
         logger.debug(f"Request {request_id} computed {len(logprobs)} logprobs")
 

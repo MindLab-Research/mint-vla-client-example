@@ -761,7 +761,7 @@ def _create_multinode_vllm_actor(
             try:
                 from .future_store import future_store
 
-                future_store.update_meta(
+                await future_store.async_update_meta(
                     outer_request_id,
                     meta={
                         "stage": "decode",
@@ -1364,7 +1364,7 @@ def _create_multinode_vllm_actor(
             try:
                 from .future_store import future_store
 
-                future_store.update_meta(
+                await future_store.async_update_meta(
                     outer_request_id,
                     meta={
                         "stage": "prefill",

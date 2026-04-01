@@ -3,6 +3,8 @@ import asyncio
 import anyio
 import pytest
 
+from tinker_server.backend.api_work_queue import ApiWorkQueueClient
+from tinker_server.backend.capacity_manager import CapacityManager
 from tinker_server.backend.megatron_distributed import (
     MegatronRankWorker,
     MegatronSessionStateManager,
@@ -20,6 +22,9 @@ class _StubFutureStore:
 
     def fail(self, request_id: str, error: str) -> None:
         self.failed[request_id] = str(error)
+
+    async def async_fail(self, request_id: str, error: str) -> None:
+        self.fail(request_id, error)
 
     def resolve(self, request_id: str, payload: dict) -> None:
         raise AssertionError(f"did not expect resolve for canceled request {request_id}: {payload!r}")
@@ -63,6 +68,44 @@ def test_issue_439_reverse_kl_entrypoints_exist() -> None:
     assert callable(getattr(MegatronWorkerGroup, "forward_reference_full_log_probs", None))
     assert callable(getattr(MegatronWorkerGroup, "prime_session_checkpoint", None))
     assert callable(getattr(MegatronWorkerGroup, "delete_session", None))
+
+
+def test_issue_439_capacity_manager_interface_matches_startup_and_routes() -> None:
+    manager = CapacityManager()
+
+    for name in (
+        "async_ensure_ready",
+        "async_try_reserve",
+        "async_release_queue",
+        "async_release_object_store",
+        "async_release_all",
+        "async_snapshot",
+        "async_rss_bytes",
+    ):
+        fn = getattr(manager, name, None)
+        assert callable(fn)
+        assert asyncio.iscoroutinefunction(fn)
+
+
+def test_issue_439_api_work_queue_interface_matches_startup_and_routes() -> None:
+    queue = ApiWorkQueueClient()
+
+    for name in (
+        "async_ensure_ready",
+        "enqueue",
+        "find_position",
+        "record_execution_time",
+        "get_eta_state",
+        "start_workers",
+        "shutdown",
+        "stats",
+        "rss_bytes",
+        "finalize_request",
+        "debug_state",
+    ):
+        fn = getattr(queue, name, None)
+        assert callable(fn)
+        assert asyncio.iscoroutinefunction(fn)
 
 
 def test_issue_439_asample_cancellation_decrements_active_requests(monkeypatch: pytest.MonkeyPatch) -> None:

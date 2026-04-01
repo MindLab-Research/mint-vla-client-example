@@ -566,7 +566,7 @@ async def _best_effort_delete_training_session(
         return False
 
     try:
-        failed_request_ids = future_store.fail_training_requests_for_model(
+        failed_request_ids = await future_store.async_fail_training_requests_for_model(
             model_id,
             f"Training session terminated due to {reason}",
         )
@@ -671,144 +671,6 @@ async def cleanup_stale_training_sessions_once(*, stale_after_s: float | None = 
     from ..backend.training_cleanup_executor import training_cleanup_executor
 
     return await training_cleanup_executor.async_cleanup_stale_sessions_once(stale_after_s=stale_after_s)
-
-
-async def _best_effort_delete_training_session(
-    model_id: str,
-    *,
-    reason: str,
-) -> bool:
-    if training_engine is None or training_manager is None:
-        return False
-
-    try:
-        future_store.fail_training_requests_for_model(
-            model_id,
-            f"Training session terminated due to {reason}",
-        )
-    except Exception as e:
-        logger.warning(
-            "[%s] stale training cleanup aborted because pending future fail failed (%s): %s: %s",
-            model_id,
-            reason,
-            type(e).__name__,
-            e,
-        )
-        return False
-
-    session = training_manager.get_session(model_id)
-    if session is None:
-        restored_session = _restore_training_session(model_id)
-        session = await restored_session if inspect.isawaitable(restored_session) else restored_session
-    if session is None:
-        return False
-
-    try:
-        await training_engine.delete_session(session)
-    except Exception as e:
-        logger.warning(
-            "[%s] best-effort stale training cleanup delete failed (%s): %s: %s",
-            model_id,
-            reason,
-            type(e).__name__,
-            e,
-        )
-        return False
-
-    try:
-        training_manager.delete_session(model_id)
-    except Exception:
-        pass
-
-    try:
-        from ..backend.training_session_store import delete_training_session
-
-        delete_training_session(model_id)
-    except Exception as e:
-        logger.warning(
-            "[%s] best-effort stale training cleanup store delete failed (%s): %s: %s",
-            model_id,
-            reason,
-            type(e).__name__,
-            e,
-        )
-
-    try:
-        from ..backend.resource_pool import get_resource_pool
-
-        get_resource_pool().clear_session(model_id)
-    except Exception:
-        pass
-
-    return True
-
-
-async def cleanup_stale_training_sessions_once(*, stale_after_s: float | None = None) -> list[str]:
-    if stale_after_s is None:
-        stale_after_s = _training_heartbeat_stale_timeout_s()
-    if stale_after_s <= 0:
-        return []
-    if training_engine is None or training_manager is None:
-        return []
-
-    from ..backend.session_heartbeat_store import session_heartbeat_store
-
-    try:
-        from ..backend.training_session_store import list_training_sessions
-
-        infos = await asyncio.to_thread(list_training_sessions)
-    except Exception as e:
-        logger.warning(
-            "stale training cleanup skipped: failed to list detached training sessions: %s: %s",
-            type(e).__name__,
-            e,
-        )
-        return []
-
-    cleaned: list[str] = []
-    actor_refcounts: dict[str, int] = {}
-    for info in infos:
-        if not isinstance(info, dict):
-            continue
-        actor_name = str(info.get("actor_name") or "").strip()
-        if actor_name:
-            actor_refcounts[actor_name] = actor_refcounts.get(actor_name, 0) + 1
-
-    for info in infos:
-        if not isinstance(info, dict):
-            continue
-        model_id = str(info.get("model_id") or "").strip()
-        session_id = str(info.get("session_id") or "").strip()
-        actor_name = str(info.get("actor_name") or "").strip()
-        if not model_id or not session_id:
-            continue
-        if not session_heartbeat_store.is_stale(session_id, float(stale_after_s)):
-            continue
-        try:
-            deleted = await _best_effort_delete_training_session(
-                model_id,
-                reason=f"stale heartbeat (> {float(stale_after_s):.1f}s)",
-            )
-            if not deleted:
-                continue
-            cleaned.append(model_id)
-            logger.warning(
-                "[%s] auto-terminated stale training session: session_id=%s stale_after_s=%.1f actor_name=%s actor_refcount=%s",
-                model_id,
-                session_id,
-                float(stale_after_s),
-                actor_name or "<unknown>",
-                actor_refcounts.get(actor_name, 0) if actor_name else 0,
-            )
-        except Exception as e:
-            logger.warning(
-                "[%s] stale training cleanup failed for session_id=%s: %s: %s",
-                model_id,
-                session_id,
-                type(e).__name__,
-                e,
-            )
-    return cleaned
 
 
 def _training_run_from_info(info: dict) -> TrainingRun:
@@ -1377,7 +1239,7 @@ async def _do_create_model(
             type="create_model",
             backend=session.backend,  # "megatron" or "peft"
         )
-        future_store.resolve(request_id, response.model_dump())
+        await future_store.async_resolve(request_id, response.model_dump())
 
         # 2. 发送 running 状态 - 模型创建成功，训练就绪
         if webhook_url and user_id:
@@ -1756,7 +1618,7 @@ async def _do_create_model_from_state(
             model_id=model_id,
             type="create_model_from_state",
         )
-        future_store.resolve(request_id, response.model_dump())
+        await future_store.async_resolve(request_id, response.model_dump())
 
     except Exception as e:
         logger.exception(
@@ -2006,7 +1868,7 @@ async def _do_forward_backward(
                     )
                 ]
             )
-        future_store.resolve(request_id, result)
+        await future_store.async_resolve(request_id, result)
 
     except Exception as e:
         logger.exception(
@@ -2224,7 +2086,7 @@ async def _do_train_step(
                     )
                 ]
             )
-        future_store.resolve(request_id, result)
+        await future_store.async_resolve(request_id, result)
 
     except Exception as e:
         logger.exception(
@@ -2444,7 +2306,7 @@ async def _do_forward(
                     )
                 ]
             )
-        future_store.resolve(request_id, result)
+        await future_store.async_resolve(request_id, result)
 
     except Exception as e:
         logger.exception(
@@ -2635,7 +2497,7 @@ async def _do_optim_step(request_id: str, request: OptimStepRequest, user_id: st
         elapsed_s = time.time() - t0
         msg = f"[{session.model_id}] optim_step done request_id={request_id} elapsed_s={elapsed_s:.3f}"
         logger.info(msg)
-        future_store.resolve(request_id, result)
+        await future_store.async_resolve(request_id, result)
 
     except Exception as e:
         logger.exception(
@@ -2751,7 +2613,7 @@ async def _do_reset_expert_bias(
 
         result = await training_engine.reset_expert_bias(session)
         modules_reset = int(result.get("modules_reset", 0) or 0)
-        future_store.resolve(
+        await future_store.async_resolve(
             request_id,
             ResetExpertBiasResponse(
                 model_id=request.model_id,
@@ -3197,7 +3059,7 @@ async def _do_save_weights_for_sampler(
                 sampling_session_id=sampling_session_id,
             ).model_dump()
 
-        future_store.resolve(request_id, response)
+        await future_store.async_resolve(request_id, response)
 
     except Exception as e:
         logger.exception(
@@ -3501,7 +3363,7 @@ async def _do_delete_model(request_id: str, model_id: str) -> None:
         except Exception:
             pass
 
-        future_store.resolve(request_id, {"model_id": model_id, "status": "deleted"})
+        await future_store.async_resolve(request_id, {"model_id": model_id, "status": "deleted"})
     except Exception as e:
         logger.exception(
             "[training.delete_model] failed request_id=%s model_id=%s error_type=%s error=%s",

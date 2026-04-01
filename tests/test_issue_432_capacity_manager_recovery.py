@@ -1,26 +1,42 @@
 import sys
 from types import SimpleNamespace
 
+import anyio
 import pytest
 
 from tinker_server.backend import capacity_manager as cm
 
 
+class _AwaitableRef:
+    def __init__(self, *, result=None, error: Exception | None = None):
+        self._result = result
+        self._error = error
+
+    def __await__(self):
+        async def _run():
+            if self._error is not None:
+                raise self._error
+            return self._result
+
+        return _run().__await__()
+
+
 class _RemoteMethod:
-    def __init__(self, ref):
-        self._ref = ref
+    def __init__(self, *, result=None, error: Exception | None = None):
+        self._result = result
+        self._error = error
 
     def remote(self, *args, **kwargs):
-        return self._ref
+        return _AwaitableRef(result=self._result, error=self._error)
 
 
 class _StubActor:
-    def __init__(self, ref):
-        self.try_reserve = _RemoteMethod(ref)
+    def __init__(self, *, result=None, error: Exception | None = None):
+        self.try_reserve = _RemoteMethod(result=result, error=error)
 
 
 @pytest.mark.parametrize("exc_name", ["ActorDiedError", "RayActorError"])
-def test_issue_432_capacity_manager_try_reserve_retries_after_actor_error(monkeypatch, exc_name):
+def test_issue_432_capacity_manager_async_try_reserve_retries_after_actor_error(monkeypatch, exc_name):
     class _RayExceptions:
         class ActorDiedError(Exception):
             pass
@@ -30,25 +46,25 @@ def test_issue_432_capacity_manager_try_reserve_retries_after_actor_error(monkey
 
     dead_exc = getattr(_RayExceptions, exc_name)("dead actor")
 
-    def _ray_get(ref, timeout=None):
-        if ref == "dead":
-            raise dead_exc
-        if ref == "ok":
-            return {"ok": True}
-        raise AssertionError(f"unexpected ref: {ref!r}")
-
-    ray_stub = SimpleNamespace(exceptions=_RayExceptions, get=_ray_get)
+    ray_stub = SimpleNamespace(exceptions=_RayExceptions)
     monkeypatch.setitem(sys.modules, "ray", ray_stub)
 
     mgr = cm.CapacityManager()
-    first = _StubActor("dead")
-    second = _StubActor("ok")
-    actors = iter([first, second])
+    first = _StubActor(error=dead_exc)
+    second = _StubActor(result={"ok": True})
     resets = []
-    monkeypatch.setattr(mgr, "_get_ray_actor", lambda: next(actors))
+
+    async def _get_ray_actor_async():
+        return second
+
+    monkeypatch.setattr(mgr, "_get_cached_ray_actor_for_async_request_path", lambda: first)
+    monkeypatch.setattr(mgr, "_get_ray_actor_async", _get_ray_actor_async)
     monkeypatch.setattr(mgr, "_reset_ray_actor", lambda actor=None: resets.append(actor))
 
-    out = mgr.try_reserve("rid", queue_bytes=7, object_store_bytes=11)
+    async def _run_async_try_reserve():
+        return await mgr.async_try_reserve("rid", queue_bytes=7, object_store_bytes=11)
+
+    out = anyio.run(_run_async_try_reserve)
 
     assert out == {"ok": True}
     assert resets == [first]

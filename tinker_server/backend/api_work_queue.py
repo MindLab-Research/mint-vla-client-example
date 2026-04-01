@@ -1173,44 +1173,12 @@ class ApiWorkQueueClient:
         if not ray.is_initialized():
             raise ApiWorkQueueUnavailableError("Ray not initialized")
 
-        if self._ray_actor is None:
-            try:
-                self._ray_actor = self._get_ray_actor()
-            except Exception as e:
-                raise ApiWorkQueueUnavailableError(
-                    "Detached Ray ApiWorkQueue actor is not ready on this API server"
-                ) from e
-        return self._ray_actor
-
-    def _get_ray_actor(self):
-        try:
-            import ray
-        except Exception as e:
-            raise ApiWorkQueueUnavailableError("Ray import failed") from e
-
-        if not ray.is_initialized():
-            try:
-                from ..ray_utils import init_ray
-
-                init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
-            except Exception as e:
-                raise ApiWorkQueueUnavailableError("Ray not initialized (init_ray failed)") from e
-
-        if not ray.is_initialized():
-            raise ApiWorkQueueUnavailableError("Ray not initialized")
-
-        if self._ray_actor is not None:
-            try:
-                ray.get(self._ray_actor.stats.remote(), timeout=1.0)
-            except Exception:
-                self._ray_actor = None
-
-        if self._ray_actor is None:
-            try:
-                self._ray_actor = _get_or_create_ray_actor()
-            except Exception as e:
-                raise ApiWorkQueueUnavailableError("Failed to get/create detached Ray ApiWorkQueue actor") from e
-        return self._ray_actor
+        actor = self._ray_actor
+        if actor is None:
+            raise ApiWorkQueueUnavailableError(
+                "Detached Ray ApiWorkQueue actor is not ready on this API server"
+            )
+        return actor
 
     async def _get_ray_actor_async(self):
         try:
@@ -1317,12 +1285,12 @@ class ApiWorkQueueClient:
 
             raise ray.exceptions.GetTimeoutError(f"timed out after {float(timeout_s):.3f}s") from e
 
-    def ensure_ready(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
-        actor = self._get_ray_actor()
+    async def async_ensure_ready(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
+        actor = await self._get_ray_actor_async()
         import ray
 
         try:
-            out = ray.get(actor.stats.remote(), timeout=float(timeout_s))
+            out = await self._await_ray_ref(actor.stats.remote(), timeout_s=float(timeout_s))
         except ray.exceptions.ActorDiedError as e:
             self._ray_actor = None
             raise ApiWorkQueueUnavailableError("Detached Ray ApiWorkQueue actor died") from e
@@ -1575,12 +1543,9 @@ class ApiWorkQueueClient:
 
         stale_leased_request_ids: list[str] = []
         try:
-            actor = self._get_ray_actor()
+            actor = await self._get_ray_actor_async()
             ref = actor.release_stale_scheduler_leases.remote(str(consumer_job_id))
-            stale_leased_request_ids = await asyncio.get_running_loop().run_in_executor(
-                None,
-                lambda: ray.get(ref, timeout=30),
-            )
+            stale_leased_request_ids = await self._await_ray_ref(ref, timeout_s=30.0)
             if not isinstance(stale_leased_request_ids, list):
                 stale_leased_request_ids = []
         except Exception as e:
@@ -1592,7 +1557,7 @@ class ApiWorkQueueClient:
             )
 
         try:
-            stale_request_ids = future_store.fail_stale_running_requests(
+            stale_request_ids = await future_store.async_fail_stale_running_requests(
                 str(consumer_job_id),
                 "api server restarted while request was running",
             )
@@ -1621,13 +1586,13 @@ class ApiWorkQueueClient:
         ]
         for request_id in pending_leased_request_ids:
             try:
-                future_store.fail(
+                await future_store.async_fail(
                     request_id,
                     "api server restarted while request was dequeued before execution began",
                 )
             except Exception as e:
                 logger.warning(
-                    "[api_work_queue] future_store.fail failed for stale leased request_id=%s consumer_job_id=%s: %s: %s",
+                    "[api_work_queue] future_store.async_fail failed for stale leased request_id=%s consumer_job_id=%s: %s: %s",
                     str(request_id),
                     str(consumer_job_id),
                     type(e).__name__,
