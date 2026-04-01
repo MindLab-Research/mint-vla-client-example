@@ -6333,6 +6333,30 @@ class MegatronWorkerGroup:
             chunks_by_rank.append(chunks)
         return chunks_by_rank
 
+    def debug_lora_storage(
+        self,
+        session_id: str | None = None,
+        traceparent: str | None = None,
+        *,
+        train_attn: bool | None = None,
+        train_mlp: bool | None = None,
+        train_unembed: bool | None = None,
+    ) -> dict:
+        self._bind_traceparent(traceparent)
+        effective_session_id = self._resolve_required_session_id(
+            session_id,
+            op="debug_lora_storage",
+        )
+        self._ensure_session_loaded(
+            effective_session_id,
+            traceparent=traceparent,
+            train_attn=train_attn,
+            train_mlp=train_mlp,
+            train_unembed=train_unembed,
+        )
+        results = ray.get([w.debug_lora_storage.remote(traceparent=traceparent) for w in self.workers])
+        return {"results": results}
+
     def optim_step(
         self,
         learning_rate: float,
