@@ -99,10 +99,20 @@ def _parse_checkpoint_path(model_path: str) -> tuple[str, str] | None:
     return None
 
 
-def _infer_base_model_from_checkpoint(model_path: str, *, user_id: str | None) -> str | None:
+def _infer_base_model_from_checkpoint(
+    model_path: str,
+    *,
+    user_id: str | None,
+    is_admin: bool = False,
+) -> str | None:
     from ..checkpoints import get_checkpoints_dir, read_checkpoint_metadata, resolve_checkpoint_uri
 
-    resolved = resolve_checkpoint_uri(model_path, get_checkpoints_dir(), user_id=user_id)
+    resolved = resolve_checkpoint_uri(
+        model_path,
+        get_checkpoints_dir(),
+        user_id=user_id,
+        is_admin=is_admin,
+    )
     if not resolved or not os.path.isdir(resolved):
         return None
     try:

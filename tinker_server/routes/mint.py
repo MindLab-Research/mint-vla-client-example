@@ -93,9 +93,14 @@ async def create_action_session(
         raise HTTPException(status_code=503, detail="Action session manager not initialized")
 
     user_id = _get_user_id(http_request)
+    is_admin = is_admin_request(http_request)
     base_model = request.base_model
     if not base_model and request.model_path:
-        base_model = _infer_base_model_from_checkpoint(request.model_path, user_id=user_id)
+        base_model = _infer_base_model_from_checkpoint(
+            request.model_path,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
     if not base_model:
         raise HTTPException(status_code=422, detail="base_model is required")
 
@@ -107,11 +112,19 @@ async def create_action_session(
     if not can_access_model(base_model, user_data):
         raise HTTPException(status_code=403, detail=get_access_denied_error(base_model))
 
+    model_path = request.model_path
+    if model_path:
+        model_path = _resolve_checkpoint_for_user(
+            model_path,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
     action_session_id = await action_session_manager.create_session(  # type: ignore[attr-defined]
         session_id=request.session_id,
         action_session_seq_id=request.action_session_seq_id,
         base_model=base_model,
-        model_path=request.model_path,
+        model_path=model_path,
         user_id=user_id,
     )
     return MintCreateActionSessionResponse(action_session_id=str(action_session_id))

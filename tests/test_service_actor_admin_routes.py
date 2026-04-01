@@ -222,6 +222,53 @@ def test_kill_dense_actors_returns_503_when_pg_removal_fails(monkeypatch) -> Non
     assert pool.unregister_calls == []
 
 
+def test_infer_base_model_from_checkpoint_passes_admin_scope(monkeypatch, tmp_path) -> None:
+    from tinker_server.routes import service as service_routes
+    import tinker_server.checkpoints as checkpoints
+
+    checkpoint_dir = tmp_path / "admin-ckpt"
+    checkpoint_dir.mkdir()
+    resolve_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(checkpoints, "get_checkpoints_dir", lambda: str(tmp_path / "root"))
+    monkeypatch.setattr(
+        checkpoints,
+        "resolve_checkpoint_uri",
+        lambda model_path, checkpoints_dir, *, user_id=None, is_admin=False: (
+            resolve_calls.append(
+                {
+                    "model_path": model_path,
+                    "checkpoints_dir": checkpoints_dir,
+                    "user_id": user_id,
+                    "is_admin": is_admin,
+                }
+            ),
+            str(checkpoint_dir),
+        )[1],
+    )
+    monkeypatch.setattr(
+        checkpoints,
+        "read_checkpoint_metadata",
+        lambda _path: {"model_name": "openpi/pi0-fast-libero-low-mem-finetune"},
+    )
+
+    base_model = service_routes._infer_base_model_from_checkpoint(
+        "mint://run-1/sampler_weights/export-1",
+        user_id="admin",
+        is_admin=True,
+    )
+
+    assert base_model == "openpi/pi0-fast-libero-low-mem-finetune"
+    assert resolve_calls == [
+        {
+            "model_path": "mint://run-1/sampler_weights/export-1",
+            "checkpoints_dir": str(tmp_path / "root"),
+            "user_id": "admin",
+            "is_admin": True,
+        }
+    ]
+
+
 def test_kill_dense_actors_returns_503_when_pg_lookup_mismatches_namespace(monkeypatch) -> None:
     from tinker_server.routes import service as service_routes
     import tinker_server.backend.ray_placement_groups as ray_placement_groups

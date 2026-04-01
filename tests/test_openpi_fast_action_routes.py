@@ -144,12 +144,22 @@ class _StubQueue:
         )
 
 
-def test_create_action_session_route_returns_action_session_id(monkeypatch) -> None:
+def test_create_action_session_route_resolves_checkpoint_path_before_manager(monkeypatch) -> None:
     from tinker_server.routes import mint as mint_routes
 
     manager = _FakeActionSessionManager()
+    resolve_calls: list[dict[str, object]] = []
     monkeypatch.setattr(mint_routes, "action_session_manager", manager, raising=False)
     monkeypatch.setattr(mint_routes, "_get_user_id", lambda _request: "user-1")
+    monkeypatch.setattr(mint_routes, "is_admin_request", lambda _request: False)
+    monkeypatch.setattr(
+        mint_routes,
+        "_resolve_checkpoint_for_user",
+        lambda path, *, user_id, is_admin: (
+            resolve_calls.append({"path": path, "user_id": user_id, "is_admin": is_admin}),
+            "/runtime/persistent_cache/user-1/model-1/export-1",
+        )[1],
+    )
 
     app = FastAPI()
     app.include_router(mint_routes.router, prefix="/api/v1/mint")
@@ -166,13 +176,84 @@ def test_create_action_session_route_returns_action_session_id(monkeypatch) -> N
 
     assert resp.status_code == 200, resp.text
     assert resp.json() == {"action_session_id": "action-session-1"}
+    assert resolve_calls == [
+        {
+            "path": "tinker://model-1/sampler_weights/export-1",
+            "user_id": "user-1",
+            "is_admin": False,
+        }
+    ]
     assert manager.create_calls == [
         {
             "session_id": "session-1",
             "action_session_seq_id": None,
             "base_model": OPENPI_FAST_MODEL,
-            "model_path": "tinker://model-1/sampler_weights/export-1",
+            "model_path": "/runtime/persistent_cache/user-1/model-1/export-1",
             "user_id": "user-1",
+        }
+    ]
+
+
+def test_create_action_session_route_infers_base_model_with_admin_scope(monkeypatch) -> None:
+    from tinker_server.routes import mint as mint_routes
+
+    manager = _FakeActionSessionManager()
+    infer_calls: list[dict[str, object]] = []
+    resolve_calls: list[dict[str, object]] = []
+    monkeypatch.setattr(mint_routes, "action_session_manager", manager, raising=False)
+    monkeypatch.setattr(mint_routes, "_get_user_id", lambda _request: "admin")
+    monkeypatch.setattr(mint_routes, "is_admin_request", lambda _request: True)
+    monkeypatch.setattr(
+        mint_routes,
+        "_infer_base_model_from_checkpoint",
+        lambda model_path, *, user_id, is_admin: (
+            infer_calls.append({"model_path": model_path, "user_id": user_id, "is_admin": is_admin}),
+            OPENPI_FAST_MODEL,
+        )[1],
+    )
+    monkeypatch.setattr(
+        mint_routes,
+        "_resolve_checkpoint_for_user",
+        lambda path, *, user_id, is_admin: (
+            resolve_calls.append({"path": path, "user_id": user_id, "is_admin": is_admin}),
+            "/runtime/persistent_cache/anonymous/model-1/export-1",
+        )[1],
+    )
+
+    app = FastAPI()
+    app.include_router(mint_routes.router, prefix="/api/v1/mint")
+    client = TestClient(app)
+
+    resp = client.post(
+        "/api/v1/mint/action_sessions",
+        json={
+            "session_id": "session-1",
+            "model_path": "mint://model-1/sampler_weights/export-1",
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert infer_calls == [
+        {
+            "model_path": "mint://model-1/sampler_weights/export-1",
+            "user_id": "admin",
+            "is_admin": True,
+        }
+    ]
+    assert resolve_calls == [
+        {
+            "path": "mint://model-1/sampler_weights/export-1",
+            "user_id": "admin",
+            "is_admin": True,
+        }
+    ]
+    assert manager.create_calls == [
+        {
+            "session_id": "session-1",
+            "action_session_seq_id": None,
+            "base_model": OPENPI_FAST_MODEL,
+            "model_path": "/runtime/persistent_cache/anonymous/model-1/export-1",
+            "user_id": "admin",
         }
     ]
 
