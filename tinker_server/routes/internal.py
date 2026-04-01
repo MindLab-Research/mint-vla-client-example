@@ -21,7 +21,7 @@ from pydantic import BaseModel
 from ..auth_identity import get_user_data as _request_user_data
 from ..auth_identity import get_user_id as _request_user_id
 from ..auth_identity import is_admin_request
-from ..checkpoints import get_persistent_search_roots
+from ..checkpoints import _iter_metadata_paths, get_persistent_search_roots, get_resolution_roots
 from ..config import config as server_config
 from ..health_checks import deep_healthz_response
 from ..logging_context import get_otel_tracer
@@ -868,136 +868,201 @@ def _get_dir_size(path: str) -> int:
     return total
 
 
-def _scan_checkpoints(user_id: str | None, *, is_admin: bool = False) -> list[CheckpointInfo]:
-    """Scan checkpoint directories and return those owned by user.
+def _checkpoint_rank(storage_tier: str | None) -> int:
+    if storage_tier == "persistent_tos":
+        return 2
+    if storage_tier == "persistent_cache":
+        return 1
+    return 0
 
-    Storage schema: /checkpoints/{user_id}/{checkpoint_id}/
 
-    Admin sees all checkpoints, regular users only see their own directory.
-    """
-    checkpoints = []
+def _public_checkpoint_id(metadata: dict, *, is_admin: bool) -> str | None:
+    raw_checkpoint_id = metadata.get("checkpoint_id")
+    if not isinstance(raw_checkpoint_id, str) or not raw_checkpoint_id:
+        return None
 
-    # Determine which directories to scan
+    model_id = metadata.get("model_id")
+    public_id = raw_checkpoint_id
+    if isinstance(model_id, str) and model_id:
+        public_id = f"{model_id}_{raw_checkpoint_id}"
+
     if is_admin:
-        # Admin sees all - scan all top-level directories
+        owner_id = metadata.get("owner_id")
+        owner = str(owner_id or "anonymous").strip() or "anonymous"
+        public_id = f"{owner}:{public_id}"
+
+    return public_id
+
+
+def _iter_checkpoint_entries(user_id: str | None, *, is_admin: bool = False):
+    for metadata_path in _iter_metadata_paths(
+        get_resolution_roots(primary_root=CHECKPOINTS_DIR),
+        user_id=user_id,
+        is_admin=is_admin,
+    ):
+        ckpt_path = os.path.dirname(metadata_path)
+        try:
+            with open(metadata_path) as f:
+                metadata = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+
+        owner_id = metadata.get("owner_id")
+        if not is_admin and owner_id != user_id:
+            continue
+
+        public_id = _public_checkpoint_id(metadata, is_admin=is_admin)
+        if public_id is None:
+            continue
+
+        yield metadata, ckpt_path, public_id
+
+
+def _looks_like_legacy_checkpoint_dir(path: str) -> bool:
+    try:
+        entries = os.listdir(path)
+    except OSError:
+        return False
+    for entry in entries:
+        if os.path.isfile(os.path.join(path, entry)):
+            return True
+    return False
+
+
+
+def _iter_legacy_checkpoint_entries(user_id: str | None, *, is_admin: bool = False):
+    """Yield metadata-less legacy checkpoints from the old /owner/checkpoint layout."""
+    seen: set[str] = set()
+    roots = get_persistent_search_roots(primary_root=CHECKPOINTS_DIR)
+
+    if is_admin:
         top_level_dirs: list[tuple[str, str]] = []
-        for root in get_persistent_search_roots():
+        for root in roots:
             if not os.path.isdir(root):
                 continue
             top_level_dirs.extend(
                 (root, d) for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))
             )
     else:
-        # Regular user - only scan their own directory
         top_level_dirs = []
-        for root in get_persistent_search_roots():
+        if user_id is None:
+            return
+        for root in roots:
             user_dir = os.path.join(root, user_id)
             if os.path.isdir(user_dir):
                 top_level_dirs.append((root, user_id))
 
-    for root, top_level in top_level_dirs:
-        top_path = os.path.join(root, top_level)
-
+    for root, owner_dir in top_level_dirs:
+        top_path = os.path.join(root, owner_dir)
         for sub_dir in os.listdir(top_path):
             sub_path = os.path.join(top_path, sub_dir)
             if not os.path.isdir(sub_path):
                 continue
+            if os.path.exists(os.path.join(sub_path, "metadata.json")):
+                continue
+            if not _looks_like_legacy_checkpoint_dir(sub_path):
+                continue
 
-            # Read metadata.json
-            metadata_path = os.path.join(sub_path, "metadata.json")
-            metadata = {}
-            if os.path.exists(metadata_path):
+            real = os.path.realpath(sub_path)
+            if real in seen:
+                continue
+            seen.add(real)
+
+            metadata = {
+                "checkpoint_id": f"{owner_dir}_{sub_dir}",
+                "owner_id": owner_dir,
+                "type": "training",
+            }
+            yield metadata, sub_path, metadata["checkpoint_id"]
+
+
+def _scan_checkpoints(user_id: str | None, *, is_admin: bool = False) -> list[CheckpointInfo]:
+    """Scan metadata-backed checkpoints and return the newest visible entry per checkpoint_id."""
+    checkpoints_by_id: dict[str, tuple[int, CheckpointInfo]] = {}
+
+    for metadata, ckpt_path, public_id in list(_iter_checkpoint_entries(user_id, is_admin=is_admin)) + list(
+        _iter_legacy_checkpoint_entries(user_id, is_admin=is_admin)
+    ):
+        model_name = metadata.get("model_name")
+        if not isinstance(model_name, str) or not model_name:
+            adapter_config_path = os.path.join(ckpt_path, "adapter_config.json")
+            if os.path.exists(adapter_config_path):
                 try:
-                    with open(metadata_path) as f:
-                        metadata = json.load(f)
+                    with open(adapter_config_path) as f:
+                        adapter_config = json.load(f)
+                    model_name = adapter_config.get("base_model_name_or_path") or "unknown"
                 except (json.JSONDecodeError, OSError):
-                    pass
-
-            # Get checkpoint_id from metadata or construct from path
-            checkpoint_id = metadata.get("checkpoint_id", f"{top_level}_{sub_dir}")
-
-            # Get model_name from metadata or infer from adapter_config.json
-            model_name = metadata.get("model_name")
-            if not model_name:
-                adapter_config_path = os.path.join(sub_path, "adapter_config.json")
-                if os.path.exists(adapter_config_path):
-                    try:
-                        with open(adapter_config_path) as f:
-                            adapter_config = json.load(f)
-                            model_name = adapter_config.get("base_model_name_or_path", "unknown")
-                    except (json.JSONDecodeError, OSError):
-                        model_name = "unknown"
-                else:
                     model_name = "unknown"
+            else:
+                model_name = "unknown"
 
-            # Get created_at from metadata or file mtime
-            created_at = metadata.get("created_at")
-            if not created_at:
-                try:
-                    mtime = os.path.getmtime(sub_path)
-                    created_at = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
-                except OSError:
-                    created_at = datetime.now(timezone.utc).isoformat()
+        created_at = metadata.get("created_at")
+        if not isinstance(created_at, str) or not created_at:
+            try:
+                mtime = os.path.getmtime(ckpt_path)
+                created_at = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+            except OSError:
+                created_at = datetime.now(timezone.utc).isoformat()
 
-            # Get type from metadata (default to "training")
-            ckpt_type = metadata.get("type", "training")
+        ckpt_type = metadata.get("checkpoint_type") or metadata.get("type") or "training"
+        size_bytes = _get_dir_size(ckpt_path)
+        info = CheckpointInfo(
+            checkpoint_id=public_id,
+            model_name=model_name,
+            created_at=created_at,
+            type=ckpt_type,
+            size_bytes=size_bytes,
+        )
+        rank = _checkpoint_rank(metadata.get("storage_tier"))
+        current = checkpoints_by_id.get(public_id)
+        if current is None or rank >= current[0]:
+            checkpoints_by_id[public_id] = (rank, info)
 
-            # Calculate size
-            size_bytes = _get_dir_size(sub_path)
-
-            checkpoints.append(CheckpointInfo(
-                checkpoint_id=checkpoint_id,
-                model_name=model_name,
-                created_at=created_at,
-                type=ckpt_type,
-                size_bytes=size_bytes,
-            ))
-
-    # Sort by created_at descending
+    checkpoints = [entry[1] for entry in checkpoints_by_id.values()]
     checkpoints.sort(key=lambda x: x.created_at, reverse=True)
     return checkpoints
 
 
-def _resolve_checkpoint_path(checkpoint_id: str) -> str | None:
-    """Resolve checkpoint_id to filesystem path.
-
-    Supports two schemas:
-    1. New: checkpoint_id is stored in metadata, path is /checkpoints/{user_id}/{checkpoint_id}/
-    2. Legacy: checkpoint_id format is {model_id}_{checkpoint_name}
-
-    Scans all directories to find matching checkpoint_id.
-    """
-    # Search all checkpoint directories
-    for root in get_persistent_search_roots():
-        if not os.path.isdir(root):
-            continue
-        for top_level in os.listdir(root):
-            top_path = os.path.join(root, top_level)
-            if not os.path.isdir(top_path):
+def _resolve_checkpoint_entry(
+    checkpoint_id: str,
+    *,
+    user_id: str | None,
+    is_admin: bool,
+) -> tuple[str, dict] | None:
+    def _collect(scope_user_id: str | None, scope_is_admin: bool, *, allow_raw: bool) -> list[tuple[int, str, str, dict]]:
+        matches: list[tuple[int, str, str, dict]] = []
+        for metadata, ckpt_path, public_id in _iter_checkpoint_entries(scope_user_id, is_admin=scope_is_admin):
+            raw_checkpoint_id = metadata.get("checkpoint_id")
+            user_public_id = _public_checkpoint_id(metadata, is_admin=False)
+            if public_id == checkpoint_id or user_public_id == checkpoint_id:
+                matches.append((_checkpoint_rank(metadata.get("storage_tier")), public_id, ckpt_path, metadata))
                 continue
+            if allow_raw and isinstance(raw_checkpoint_id, str) and raw_checkpoint_id == checkpoint_id:
+                matches.append((_checkpoint_rank(metadata.get("storage_tier")), public_id, ckpt_path, metadata))
+        return matches
 
-            for sub_dir in os.listdir(top_path):
-                sub_path = os.path.join(top_path, sub_dir)
-                if not os.path.isdir(sub_path):
-                    continue
+    matches = _collect(user_id, is_admin, allow_raw=not is_admin)
+    if not matches:
+        for metadata, ckpt_path, public_id in _iter_legacy_checkpoint_entries(user_id, is_admin=is_admin):
+            if public_id == checkpoint_id:
+                matches.append((0, public_id, ckpt_path, metadata))
 
-                # Check if this checkpoint matches
-                metadata_path = os.path.join(sub_path, "metadata.json")
-                if os.path.exists(metadata_path):
-                    try:
-                        with open(metadata_path) as f:
-                            metadata = json.load(f)
-                        if metadata.get("checkpoint_id") == checkpoint_id:
-                            return sub_path
-                    except (json.JSONDecodeError, OSError):
-                        pass
+    if not matches and not is_admin:
+        matches = _collect(None, True, allow_raw=False)
+        if not matches:
+            for metadata, ckpt_path, public_id in _iter_legacy_checkpoint_entries(None, is_admin=True):
+                if public_id == checkpoint_id:
+                    matches.append((0, public_id, ckpt_path, metadata))
+    if not matches:
+        return None
 
-                # Check legacy format
-                legacy_id = f"{top_level}_{sub_dir}"
-                if legacy_id == checkpoint_id:
-                    return sub_path
+    public_ids = {match[1] for match in matches}
+    if len(public_ids) > 1:
+        return None
 
-    return None
+    matches.sort(key=lambda item: item[0], reverse=True)
+    _, _, ckpt_path, metadata = matches[0]
+    return ckpt_path, metadata
 
 
 @router.get("/v1/checkpoints", response_model=CheckpointsListResponse)
@@ -1026,27 +1091,19 @@ async def download_checkpoint(checkpoint_id: str, request: Request):
     if user_id is None:
         raise HTTPException(status_code=401, detail="Authentication required")
 
-    # Resolve checkpoint path
-    ckpt_path = _resolve_checkpoint_path(checkpoint_id)
-    if ckpt_path is None:
+    # Resolve checkpoint path via metadata-backed checkpoint ids.
+    resolved = _resolve_checkpoint_entry(
+        checkpoint_id,
+        user_id=user_id,
+        is_admin=is_admin_request(request),
+    )
+    if resolved is None:
         raise HTTPException(status_code=404, detail="Checkpoint not found")
 
-    # Check ownership via metadata.json (admin can access all, others only their own)
-    if not is_admin_request(request):
-        metadata_path = os.path.join(ckpt_path, "metadata.json")
-        if os.path.exists(metadata_path):
-            try:
-                with open(metadata_path) as f:
-                    metadata = json.load(f)
-                owner_id = metadata.get("owner_id")
-                if owner_id != user_id:
-                    raise HTTPException(status_code=403, detail="Access denied")
-            except (json.JSONDecodeError, OSError):
-                # No valid metadata = no owner = deny access for non-admin
-                raise HTTPException(status_code=403, detail="Access denied")
-        else:
-            # No metadata.json = legacy checkpoint = deny access for non-admin
-            raise HTTPException(status_code=403, detail="Access denied")
+    ckpt_path, metadata = resolved
+
+    if not is_admin_request(request) and metadata.get("owner_id") != user_id:
+        raise HTTPException(status_code=403, detail="Access denied")
 
     def stream_tar_gz():
         """Stream tar.gz via subprocess to avoid memory explosion."""
@@ -1065,7 +1122,8 @@ async def download_checkpoint(checkpoint_id: str, request: Request):
             proc.stdout.close()
             proc.wait()
 
-    filename = f"{checkpoint_id}.tar.gz"
+    archive_name = metadata.get("checkpoint_id") if isinstance(metadata.get("checkpoint_id"), str) else checkpoint_id
+    filename = f"{archive_name}.tar.gz"
     return StreamingResponse(
         stream_tar_gz(),
         media_type="application/gzip",
