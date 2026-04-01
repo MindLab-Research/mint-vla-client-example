@@ -202,6 +202,10 @@ def test_runtime_env_host_dependencies_include_openpi_worker_stack():
     from scripts import build_runtime_env as build_runtime_env
 
     deps = build_runtime_env._host_deps(build_runtime_env._load_pyproject())
+    lerobot_requirement = (
+        "lerobot @ git+https://github.com/huggingface/lerobot.git"
+        "@0cf864870cf29f4738d3ade893e6fd13fbd7cdb5"
+    )
 
     for requirement in (
         "augmax>=0.3.4",
@@ -211,6 +215,7 @@ def test_runtime_env_host_dependencies_include_openpi_worker_stack():
         "fsspec[gcs]>=2024.6.0",
         "jax[cuda12]==0.5.3",
         "jaxtyping==0.2.36",
+        lerobot_requirement,
         "ml_collections==1.0.0",
         "numpydantic>=1.6.6",
         "optax==0.2.4",
@@ -242,6 +247,20 @@ def test_subprocess_env_respects_existing_uv_http_timeout(monkeypatch):
     assert env["UV_HTTP_TIMEOUT"] == "900"
 
 
+def test_resolve_uv_prefers_explicit_uv_bin_override(tmp_path, monkeypatch):
+    from scripts import build_runtime_env as build_runtime_env
+
+    fake_uv = tmp_path / "bin" / "uv"
+    fake_uv.parent.mkdir(parents=True, exist_ok=True)
+    fake_uv.write_text("", encoding="utf-8")
+    fake_uv.chmod(0o755)
+
+    monkeypatch.setenv("UV_BIN", str(fake_uv))
+    monkeypatch.setattr(build_runtime_env.shutil, "which", lambda _: "/usr/bin/uv")
+
+    assert build_runtime_env._resolve_uv() == str(fake_uv)
+
+
 def test_subprocess_env_sets_tmpdir_under_xdg_cache_home(monkeypatch, tmp_path):
     from scripts import build_runtime_env as build_runtime_env
 
@@ -253,6 +272,18 @@ def test_subprocess_env_sets_tmpdir_under_xdg_cache_home(monkeypatch, tmp_path):
 
     assert env["TMPDIR"] == str(xdg_cache_home / "tmp")
     assert (xdg_cache_home / "tmp").is_dir()
+
+
+def test_subprocess_env_sets_uv_cache_dir_under_xdg_cache_home(monkeypatch, tmp_path):
+    from scripts import build_runtime_env as build_runtime_env
+
+    xdg_cache_home = tmp_path / "cache"
+    monkeypatch.delenv("UV_CACHE_DIR", raising=False)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(xdg_cache_home))
+
+    env = build_runtime_env._subprocess_env()
+
+    assert env["UV_CACHE_DIR"] == str(xdg_cache_home / "uv")
 
 
 def test_subprocess_env_respects_existing_tmpdir(monkeypatch, tmp_path):
@@ -273,6 +304,10 @@ def test_export_host_requirements_writes_runtime_worker_stack(tmp_path):
     out = tmp_path / "host-requirements.txt"
     build_runtime_env._export_host_requirements(build_runtime_env._load_pyproject(), out)
     text = out.read_text(encoding="utf-8")
+    lerobot_requirement = (
+        "lerobot @ git+https://github.com/huggingface/lerobot.git"
+        "@0cf864870cf29f4738d3ade893e6fd13fbd7cdb5"
+    )
 
     for requirement in (
         "torch==2.9.1+cpu",
@@ -283,11 +318,141 @@ def test_export_host_requirements_writes_runtime_worker_stack(tmp_path):
         "ml_collections==1.0.0",
         "jaxtyping==0.2.36",
         "augmax>=0.3.4",
+        lerobot_requirement,
         "pytest>=7.0.0",
         "tqdm-loggable>=0.2",
         "tyro>=0.9.5",
     ):
         assert requirement in text
+
+
+def test_default_inspect_probe_modules_cover_openpi_training_loader():
+    from scripts import build_runtime_env as build_runtime_env
+
+    assert "openpi.training.data_loader" in build_runtime_env.DEFAULT_INSPECT_PROBE_MODULES
+
+
+def test_partition_host_requirements_keeps_only_torch_on_torch_backend():
+    from scripts import build_runtime_env as build_runtime_env
+
+    torch_backend_reqs, generic_reqs = build_runtime_env._partition_host_requirements(
+        [
+            "torch==2.9.1+cpu",
+            "flax==0.10.2",
+            "lerobot @ git+https://github.com/huggingface/lerobot.git@0cf864870cf29f4738d3ade893e6fd13fbd7cdb5",
+        ]
+    )
+
+    assert torch_backend_reqs == ["torch==2.9.1+cpu"]
+    assert generic_reqs == [
+        "flax==0.10.2",
+        "lerobot @ git+https://github.com/huggingface/lerobot.git@0cf864870cf29f4738d3ade893e6fd13fbd7cdb5",
+    ]
+
+
+def test_create_host_venv_installs_torch_backend_and_generic_requirements_separately(tmp_path, monkeypatch):
+    from scripts import build_runtime_env as build_runtime_env
+
+    base_python = tmp_path / "base-python" / "bin" / "python3.12"
+    base_python.parent.mkdir(parents=True, exist_ok=True)
+    base_python.write_text("", encoding="utf-8")
+    host_venv = tmp_path / "host-venv"
+    host_requirements = tmp_path / "host-requirements.txt"
+    host_requirements.write_text(
+        "\n".join(
+            [
+                "torch==2.9.1+cpu",
+                "flax==0.10.2",
+                "lerobot @ git+https://github.com/huggingface/lerobot.git@0cf864870cf29f4738d3ade893e6fd13fbd7cdb5",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None):
+        calls.append(cmd)
+        if cmd[:4] == [str(base_python), "-m", "venv", "--copies"]:
+            python = host_venv / "bin" / "python"
+            python.parent.mkdir(parents=True, exist_ok=True)
+            python.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(build_runtime_env, "_run", fake_run)
+    monkeypatch.setattr(build_runtime_env, "_resolve_uv", lambda: "/fake/uv")
+
+    python = build_runtime_env._create_host_venv(base_python, host_venv, host_requirements)
+
+    generic_requirements = tmp_path / "host-requirements-generic.txt"
+    assert python == host_venv / "bin" / "python"
+    assert calls[0] == [str(base_python), "-m", "venv", "--copies", str(host_venv)]
+    assert calls[1] == [str(python), "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"]
+    assert calls[2] == [
+        "/fake/uv",
+        "pip",
+        "install",
+        "--python",
+        str(python),
+        "torch==2.9.1+cpu",
+        "--torch-backend",
+        "cpu",
+    ]
+    assert calls[3] == [
+        "/fake/uv",
+        "pip",
+        "install",
+        "--python",
+        str(python),
+        "--requirements",
+        str(generic_requirements),
+    ]
+    assert generic_requirements.read_text(encoding="utf-8").splitlines() == [
+        "flax==0.10.2",
+        "lerobot @ git+https://github.com/huggingface/lerobot.git@0cf864870cf29f4738d3ade893e6fd13fbd7cdb5",
+    ]
+
+
+def test_write_host_pth_prepends_runtime_paths(tmp_path, monkeypatch):
+    from scripts import build_runtime_env as build_runtime_env
+
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env(env_root)
+    purelib = tmp_path / "purelib"
+    purelib.mkdir()
+
+    monkeypatch.setattr(
+        build_runtime_env.subprocess,
+        "check_output",
+        lambda *args, **kwargs: str(purelib),
+    )
+
+    build_runtime_env._write_host_pth(env_root, env_root / "host-venv" / "bin" / "python")
+
+    line = (purelib / "tinker_runtime_env.pth").read_text(encoding="utf-8").strip()
+    original_sys_path = sys.path[:]
+    sys.path[:] = [
+        "/host/site-packages",
+        str(env_root / "src" / "openpi" / "src"),
+        "/other",
+    ]
+    try:
+        exec(line, {})
+        actual = sys.path[:]
+    finally:
+        sys.path[:] = original_sys_path
+
+    expected = [
+        str(env_root / "site-packages"),
+        str(env_root / "src" / "Megatron-LM"),
+        str(env_root / "src" / "Megatron-Bridge" / "src"),
+        str(env_root / "src" / "Megatron-Bridge"),
+        str(env_root / "src" / "verl"),
+        str(env_root / "src" / "openpi" / "src"),
+        str(env_root / "src" / "openpi" / "packages" / "openpi-client" / "src"),
+        str(env_root / "src" / "vllm"),
+    ]
+    assert actual[: len(expected)] == expected
+    assert actual.count(str(env_root / "src" / "openpi" / "src")) == 1
 
 
 def test_build_runtime_env_normalizes_host_only_vllm_source_metadata(tmp_path):

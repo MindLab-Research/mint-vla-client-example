@@ -19,6 +19,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 DEFAULT_INSPECT_PROBE_MODULES = (
     "openpi.training.config",
+    "openpi.training.data_loader",
     "openpi_client.image_tools",
     "jax",
     "flax",
@@ -35,8 +36,12 @@ def _subprocess_env(env: dict[str, str] | None = None) -> dict[str, str]:
     if env:
         merged.update(env)
     merged.setdefault("UV_HTTP_TIMEOUT", DEFAULT_UV_HTTP_TIMEOUT)
+    xdg_cache_home = merged.get("XDG_CACHE_HOME")
+    if "UV_CACHE_DIR" not in merged and xdg_cache_home:
+        uv_cache_dir = Path(xdg_cache_home) / "uv"
+        uv_cache_dir.mkdir(parents=True, exist_ok=True)
+        merged["UV_CACHE_DIR"] = str(uv_cache_dir)
     if "TMPDIR" not in merged:
-        xdg_cache_home = merged.get("XDG_CACHE_HOME")
         if xdg_cache_home:
             tmpdir = Path(xdg_cache_home) / "tmp"
             tmpdir.mkdir(parents=True, exist_ok=True)
@@ -53,13 +58,19 @@ def _capture(cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] | N
 
 
 def _resolve_uv() -> str:
+    explicit = (os.environ.get("UV_BIN") or "").strip()
+    if explicit:
+        candidate = Path(explicit)
+        if candidate.exists():
+            return str(candidate)
+        raise RuntimeError(f"UV_BIN points to a missing path: {explicit}")
     uv = shutil.which("uv")
     if uv:
         return uv
     candidate = Path.home() / ".local" / "bin" / "uv"
     if candidate.exists():
         return str(candidate)
-    raise RuntimeError("uv executable not found; install uv or add it to PATH")
+    raise RuntimeError("uv executable not found; set UV_BIN, install uv, or add it to PATH")
 
 
 def _load_pyproject() -> dict[str, Any]:
@@ -87,6 +98,26 @@ def _host_deps(pyproject: dict[str, Any]) -> list[str]:
         seen.add(dep)
         out.append(dep)
     return out
+
+
+def _requirement_name(requirement: str) -> str:
+    name = requirement.split(";", 1)[0].strip()
+    name = name.split("@", 1)[0].strip()
+    for marker in ("==", ">=", "<=", "~=", "!=", ">", "<"):
+        name = name.split(marker, 1)[0].strip()
+    name = name.split("[", 1)[0].strip()
+    return name.lower().replace("_", "-")
+
+
+def _partition_host_requirements(requirements: list[str]) -> tuple[list[str], list[str]]:
+    torch_backend_requirements: list[str] = []
+    generic_requirements: list[str] = []
+    for requirement in requirements:
+        if _requirement_name(requirement) == "torch":
+            torch_backend_requirements.append(requirement)
+            continue
+        generic_requirements.append(requirement)
+    return torch_backend_requirements, generic_requirements
 
 
 def _runtime_env_symbols():
@@ -260,20 +291,43 @@ def _create_host_venv(
     _run([str(base_python), "-m", "venv", "--copies", str(host_venv)])
     python = host_venv / "bin" / "python"
     _run([str(python), "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
-    _run(
-        [
-            _resolve_uv(),
-            "pip",
-            "install",
-            "--python",
-            str(python),
-            "--requirements",
-            str(host_requirements),
-            "--torch-backend",
-            "cpu",
-        ],
-        cwd=REPO_ROOT,
-    )
+    requirements = [
+        line.strip()
+        for line in host_requirements.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    torch_backend_requirements, generic_requirements = _partition_host_requirements(requirements)
+    if torch_backend_requirements:
+        _run(
+            [
+                _resolve_uv(),
+                "pip",
+                "install",
+                "--python",
+                str(python),
+                *torch_backend_requirements,
+                "--torch-backend",
+                "cpu",
+            ],
+            cwd=REPO_ROOT,
+        )
+    if generic_requirements:
+        generic_requirements_path = host_requirements.with_name(
+            f"{host_requirements.stem}-generic{host_requirements.suffix}"
+        )
+        generic_requirements_path.write_text("\n".join([*generic_requirements, ""]), encoding="utf-8")
+        _run(
+            [
+                _resolve_uv(),
+                "pip",
+                "install",
+                "--python",
+                str(python),
+                "--requirements",
+                str(generic_requirements_path),
+            ],
+            cwd=REPO_ROOT,
+        )
     return python
 
 
@@ -321,7 +375,13 @@ def _write_host_pth(env_root: Path, host_python: Path) -> None:
     ).strip()
     pth = Path(purelib) / "tinker_runtime_env.pth"
     lines = [layout.site_packages, *layout.pythonpath_entries[1:], *layout.host_pythonpath_entries]
-    pth.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    code = (
+        "import sys; "
+        f"paths = {lines!r}; "
+        "sys.path[:] = [p for p in sys.path if p not in paths]; "
+        "sys.path[:0] = paths"
+    )
+    pth.write_text(code + "\n", encoding="utf-8")
 
 
 def _write_host_source_dist_info(pyproject: dict[str, Any], host_python: Path) -> None:

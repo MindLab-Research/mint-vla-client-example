@@ -10,8 +10,9 @@
 #   python scripts/run_server.py
 
 # ── Python / venv ──────────────────────────────────────────────────────────────
-export PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/mint-runtime-py31213
-export PYTHON_BIN=/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python
+export PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/mint-runtime-py31213-openpi-candidate-20260331-203300
+runtime_torch_lib="${PFS_RUNTIME_ENV_ROOT}/host-venv/lib/python3.12/site-packages/torch/lib"
+export PYTHON_BIN="${PFS_RUNTIME_ENV_ROOT}/host-venv/bin/python"
 export PYTHONDONTWRITEBYTECODE=1
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
@@ -19,7 +20,7 @@ export HF_HOME=/vePFS-Mindverse/share/huggingface
 export HF_HUB_OFFLINE=1
 export PFS_TINKER_PATH=/vePFS-Mindverse/share/code/leixiang/tinker-server
 export PFS_HF_MODULES_PATH=/vePFS-Mindverse/share/huggingface/modules
-export LD_LIBRARY_PATH=/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/lib/python3.12/site-packages/torch/lib:/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64
+export LD_LIBRARY_PATH="${runtime_torch_lib}:/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64"
 
 # ── Ray ────────────────────────────────────────────────────────────────────────
 export RAY_ADDRESS=192.168.38.143:6379
