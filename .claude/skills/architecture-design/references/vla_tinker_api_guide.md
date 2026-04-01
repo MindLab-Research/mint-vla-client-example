@@ -258,6 +258,13 @@ The current rule is therefore:
 
 Runtime validity must be proven separately by the runtime builder and inspect probes.
 
+Current rollout status is narrower than "shared deployment already switched":
+
+- the shared candidate runtime root has been verified privately
+- the rollback baseline still exists
+- `pi0.5` shared-service allowlist and repo fallback default list remain separate decisions
+- 2026-04-01 read-only checks found that `mint-dev` currently has no live shared service on `8000`, `18000`, or `18080`, so public/shared root cutover is still an operational pending item rather than an already-executed step
+
 ## Relation to the upstream OpenPI workflow
 
 Use the upstream OpenPI repo directly when your goal is:

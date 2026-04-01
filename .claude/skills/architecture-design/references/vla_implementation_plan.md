@@ -1,386 +1,128 @@
-# VLA Support Plan for Mint
+# Historical VLA Support Plan for Mint
 
-This document describes how to add OpenPI-style VLA support to Mint while staying as close as possible to the Tinker API.
+This file is historical design input, not the normative contract.
 
-It covers two model families:
+Current normative sources are:
 
-- autoregressive action-token models such as `pi0-fast`
-- flow-matching action models such as `pi0.5`
+- `docs/mint-openpi-vla-target.md`
+- `docs/README.md`
+- `docs/sub-targets/*.md`
+- `docs/plans/2026-03-30-pr422-long-term-remediation.md`
+- the verified stage-local scripts under `src/mindlab-toolkit/examples/`
 
-## Goal
+This file remains useful only as a record of early design pressures and boundary questions. It should not be used as the merge-readiness checklist or as the current implementation plan.
 
-Expose VLA training and inference through the existing Mint control plane:
+## What survived from the historical plan
 
-- `ServiceClient`
-- `TrainingClient`
-- async future protocol
-- model/session identifiers
-- weight save/load flows
+Several early decisions were directionally right and still survive in the current repo:
 
-The backend implementation can differ per model family. The client architecture should not.
+- keep `Datum` as the user-facing training unit
+- keep `import mint` as the user entrypoint instead of pushing users into upstream `openpi`
+- keep action inference separate from text token sampling
+- treat `pi0-fast` and `pi0.5` as different model families with different loss semantics
+- keep `pi0.5` RL out of the first-stage contract
+- avoid promising vLLM-style multi-LoRA serving economics for OpenPI checkpoints
 
-## Non-goals
+Those ideas now live in the target doc and stage docs instead of in this file.
 
-- Do not force continuous-action models through the text-only `SamplingClient`
-- Do not claim that existing Tinker RL losses work unchanged for flow-matching models
-- Do not depend on the original OpenPI websocket policy server as the long-term production interface
+## What changed after this plan
 
-## Architecture decision
+The original plan predated the final PR422 convergence work. The current repo contract differs in five important ways.
 
-### Keep the training boundary
+### 1. Public training examples now use `train_step(...)`
 
-Keep `Datum` as the training unit.
+This file originally reasoned in terms of split-step public training such as:
 
-Rationale:
+- `forward_backward(...)`
+- `optim_step(...)`
 
-- canonical Tinker `ModelInput` already supports multimodal chunks
-- canonical `Datum.loss_fn_inputs` already supports arbitrary tensor payloads
-- this is the smallest API change that still represents both model families honestly
+That is no longer the public teaching path.
 
-### Add a sibling action inference surface
+Current public guidance is:
 
-Do not overload token sampling for continuous actions.
+- `TrainingClient.train_step(...)` is the default public OpenPI training unit
+- split `forward_backward` / `optim_step` remains internal Mint training semantics and low-level test surface
+- shared deployment fairness is defined at the complete training-step boundary
 
-Current canonical sampling types are token-oriented:
+### 2. Public action inference now uses MintX routes
 
-- request takes `prompt`
-- response returns `SampledSequence.tokens`
+The current canonical action boundary is:
 
-That fits language models and could be stretched for `pi0-fast`, but it is the wrong contract for `pi0.5`.
+- `POST /api/v1/mint/action_sessions`
+- `POST /api/v1/mint/action_sessions/{action_session_id}/act`
+- `DELETE /api/v1/mint/action_sessions/{action_session_id}`
 
-Recommendation:
+The old `/api/v1/create_action_session`, `/api/v1/act`, and `/api/v1/action_sessions/{id}` routes are not the long-term contract.
 
-- add `ActionSamplingClient`
-- add `create_action_session`
-- add `act(...)`
-- return action tensors and diagnostics, not token sequences
+### 3. Default action execution now stays inside Mint control-plane semantics
 
-This keeps the outer Tinker shape while admitting continuous action models.
+The current repo no longer treats action inference as a side path outside Mint scheduling.
 
-## Shared implementation work
+Default action requests now:
 
-These changes are shared by both model families.
+- create a future
+- go through queue and capacity control
+- execute on Mint-managed Ray actors
+- surface placement and lifecycle through `ResourcePool`
 
-### 1. Align Mint types with canonical Tinker
+### 4. Runtime declaration is now repo-owned
 
-Mint's local `tinker_server/models/types.py` is currently narrower than canonical Tinker.
+This historical plan was written before the runtime contract was pulled into Mint's canonical `runtime_env` metadata.
 
-Required changes:
+The current rule is:
 
-- make `ModelInput.chunks` support the canonical union of:
-  - `EncodedTextChunk`
-  - `ImageChunk`
-  - `ImageAssetPointerChunk`
-- keep `Datum.loss_fn_inputs` as a general tensor dictionary
+- `src/mint/pyproject.toml` owns `tool.tinker.runtime_env`
+- the OpenPI source contract includes both `src/openpi/src` and `src/openpi/packages/openpi-client/src`
+- host requirements explicitly include the OpenPI worker stack
+- `src/mint/scripts/build_runtime_env.py --inspect --env-root ...` is the canonical probe for manifest, layout, and host-python import checks
 
-This is prerequisite work. Otherwise the server-side contract cannot truthfully claim Tinker compatibility.
+Do not infer runtime correctness from private workspace paths or from `unison` code sync.
 
-### 2. Add model-family metadata to the registry
+### 5. Shared runtime rollout and model exposure are separate decisions
 
-Extend model metadata with at least:
+The shared candidate runtime artifact and the shared-service model allowlist are not the same decision.
 
-- `policy_family`: `text_lm | ar_action_tokens | flow_action`
-- `inference_modality`: `tokens | actions`
-- `camera_layout`
-- `action_dim`
-- `action_horizon`
-- `training_backend`
+Keep these distinct:
 
-This removes scattered special-casing and lets route logic dispatch by model family.
+- shared runtime candidate: `/vePFS-Mindverse/share/code/mint-runtime-py31213-openpi-candidate-20260331-203300`
+- rollback baseline: `/vePFS-Mindverse/share/code/mint-runtime-py31213`
+- shared-service allowlist: deployment-level `MINT_SUPPORTED_MODELS`
+- repo fallback default list: built-in `allowed` list in `list_supported_models()`
 
-### 3. Standardize observation reconstruction
+`pi0.5` should not be treated as repo-default exposure just because the candidate runtime root is valid.
 
-The backend must reconstruct model-specific observations from Tinker inputs.
+## Current reading path
 
-Needed decisions:
+If you need the actual current contract, read in this order:
 
-- camera ordering or camera naming
-- default image masks
-- state tensor key naming
-- prompt token handling
-
-The current OpenPI code expects fixed camera names such as:
-
-- `base_0_rgb`
-- `left_wrist_0_rgb`
-- `right_wrist_0_rgb`
-
-Tinker `ImageChunk` is positional. So Mint needs one explicit rule:
-
-- either define canonical chunk order per model family
-- or extend the image input contract with camera-role metadata
-
-The first option is smaller. The second option is cleaner.
-
-### 4. Add a persistent action inference actor type
-
-Text models use vLLM. VLA models should not.
-
-Needed actor type:
-
-- one actor that owns a loaded OpenPI policy
-- accepts structured observation input
-- returns action chunk tensors
-
-This actor should participate in:
-
-- `ResourcePool`
-- eviction
-- detached actor reconciliation if made detached
-
-## Plan for autoregressive models such as pi0-fast
-
-## Why pi0-fast is the first target
-
-`pi0-fast` is the best first integration target because:
-
-- training is token-level cross-entropy over action tokens
-- action generation is autoregressive
-- the data contract already resembles Tinker's token training worldview
-
-This means:
-
-- SFT training can map cleanly onto `forward_backward(..., loss_fn="cross_entropy")`
-- token-level RL losses are conceptually possible
-
-## Data contract
-
-Recommended `Datum` shape for `pi0-fast`:
-
-- `model_input`
-  - image chunks
-  - text chunks for language prompt or task text
-- `loss_fn_inputs`
-  - `state`
-  - `target_tokens`
-  - `weights`
-  - `token_ar_mask`
-  - optionally `token_input_mask`
-
-The backend adapter then reconstructs the OpenPI FAST observation format.
-
-## Training backend
-
-Add a dedicated backend, for example:
-
-- `tinker_server/backend/openpi_fast_training.py`
-
-Responsibilities:
-
-- create and own OpenPI `pi0-fast` model state
-- convert `Datum` into OpenPI observation tensors and targets
-- run forward/backward and optimizer step
-- save checkpoints in a Mint-owned format
-
-Do not route this through the current language-model training worker. The supervision shape is different even if the loss name is the same.
-
-## Inference backend
-
-Even though `pi0-fast` is token-autoregressive internally, user-facing inference should still return action chunks.
-
-Recommended behavior:
-
-- action inference actor receives observation
-- actor runs FAST decoding internally
-- actor detokenizes to `[action_horizon, action_dim]`
-- client receives action tensor result
-
-Do not expose raw action tokens as the default user-facing inference result.
-
-## RL support
-
-`pi0-fast` is the only realistic first candidate for Tinker-style RL among the OpenPI families discussed here.
-
-Why it is feasible:
-
-- the model defines token probabilities
-- canonical Tinker RL losses already operate on token-level `target_tokens`, `logprobs`, and `advantages`
-
-What is still required:
-
-- exact mapping from action rollout to FAST action tokens
-- stable token masks so only action-token positions contribute to RL loss
-- a trustworthy way to record sampling logprobs from the action inference path
-
-Main caveat:
-
-- user-facing inference should return action chunks, but RL still needs token logprobs internally
-- the backend therefore needs a split representation:
-  - internal action-token sequence for loss computation
-  - external continuous action chunk for robot execution
-
-## Weight export and serving caveat
-
-OpenPI currently does not provide a native adapter-only serving path comparable to Mint's vLLM multi-LoRA stack.
-
-That means the first implementation should assume:
-
-- per-session policy checkpoints
-- per-session action inference actors
-
-Do not promise vLLM-style shared multi-LoRA serving for `pi0-fast` in the first version.
-
-## Plan for flow-matching models such as pi0.5
-
-## Why pi0.5 is different
-
-`pi0.5` is currently supported in OpenPI as a flow-matching model, not an autoregressive action-token model.
-
-Consequences:
-
-- training target is continuous action chunks
-- inference is iterative denoising / flow integration
-- there is no natural token sequence output
-- canonical Tinker RL losses do not directly apply
-
-## Data contract
-
-Recommended `Datum` shape for `pi0.5`:
-
-- `model_input`
-  - image chunks
-  - optional prompt text chunks
-- `loss_fn_inputs`
-  - `state`
-  - `actions`
-  - optional masks and model-family-specific tensors
-
-This keeps training close to Tinker:
-
-- still `Datum`
-- still `forward_backward`
-- new loss function name, for example `flow_matching`
-
-## Training backend
-
-Add a dedicated backend, for example:
-
-- `tinker_server/backend/openpi_pi05_training.py`
-
-Responsibilities:
-
-- reconstruct OpenPI `Observation`
-- reconstruct continuous target actions
-- sample training noise and timesteps
-- compute the flow-matching objective
-- return diagnostics meaningful for this model family
-
-The backend should not pretend the output is token logprobs. It should return metrics that actually matter, such as:
-
-- flow loss
-- action MSE surrogates if useful
-- timing and memory diagnostics
-
-## Inference backend
-
-Flow inference needs its own serving path.
-
-Recommended API shape:
-
-- `create_action_session(...)`
-- `ActionSamplingClient.act(...)`
-- result contains:
-  - `actions`
-  - optional inference diagnostics such as `num_steps`, `infer_ms`
-
-The actor implementation then:
-
-- builds the observation
-- initializes noise
-- runs the configured denoising steps
-- returns the final action chunk
-
-## RL and custom loss challenges for flow-matching models
-
-This is the main caveat.
-
-### Built-in Tinker RL losses do not fit
-
-Canonical Tinker RL losses such as:
-
-- `importance_sampling`
-- `ppo`
-- `cispo`
-- `dro`
-
-all assume token logprobs.
-
-That assumption breaks for flow-matching models because the model does not naturally expose exact token log probabilities or a simple action density in the current API shape.
-
-### `forward_backward_custom` also does not fit well
-
-Current Tinker custom loss flow assumes:
-
-1. do a forward pass
-2. obtain token logprobs
-3. let user compute a differentiable custom scalar from those logprobs
-4. backprop through that representation
-
-That is a language-model custom-loss interface. It is not a good generic interface for flow-matching models.
-
-If we want custom loss support for flow models, we need a new boundary. Options:
-
-1. `forward_backward_custom_continuous`
-   - expose continuous model outputs such as predicted velocity or denoising residual
-   - user computes custom loss from those outputs
-
-2. a more general `forward_with_outputs`
-   - backend returns a typed family-specific output object
-   - custom loss support becomes model-family aware
-
-Option 2 is more honest but larger.
-
-### Recommended first release policy
-
-For flow-matching models:
-
-- support SFT first
-- defer RL
-- defer generic custom-loss support unless there is a concrete use case
-
-That is not a temporary excuse. It follows from the actual mathematical boundary of the existing Tinker RL interface.
-
-## Backend choice caveats from upstream OpenPI
-
-The upstream OpenPI repo has constraints that matter for implementation planning:
-
-- the current JAX training script does not support multi-node training
-- PyTorch support exists for `pi0` and `pi0.5`
-- PyTorch support does not currently include `pi0-fast`
-- PyTorch support does not currently include LoRA training
-
-Implications:
-
-- `pi0-fast` integration should start from the JAX path, not the PyTorch path
-- `pi0.5` could use JAX or PyTorch for some workloads, but LoRA-focused integration still points back toward JAX
-- we should not assume upstream OpenPI can drop directly into Mint's current distributed training patterns without adaptation
-
-## Suggested rollout order
-
-1. Align Mint server types with canonical Tinker multimodal `ModelInput`
-2. Add action-sampling session and client types
-3. Implement `pi0-fast` SFT training and action inference
-4. Add `pi0-fast` token-logprob plumbing needed for RL
-5. Implement `pi0.5` SFT training and action inference
-6. Reassess whether flow-model custom loss is justified
-7. Treat flow-model RL as a separate research project, not as an automatic extension of the existing Tinker RL stack
-
-## Failure modes to watch
-
-- claiming Tinker compatibility while keeping the narrowed local `ModelInput` type
-- overloading token `SamplingClient` for continuous-action models
-- pretending `ppo` is available for `pi0.5` just because `TrainingClient.forward_backward` accepts a loss string
-- promising vLLM-style multi-LoRA economics for OpenPI checkpoints without a real adapter-serving path
-- hiding camera-order assumptions in undocumented backend code
+1. `docs/README.md`
+2. `docs/mint-openpi-vla-target.md`
+3. `docs/sub-targets/st-07-openpi-ray-gpu-actor.md`
+4. `docs/sub-targets/st-08-openpi-shared-ray-actor-pool.md`
+5. `docs/sub-targets/st-09-mintx-action-boundary-runtime-contract.md`
+6. `docs/plans/2026-04-01-shared-runtime-candidate-rollout-verification.md`
+7. `docs/plans/2026-04-01-mint-dev-shared-runtime-rollout-readiness.md`
+
+Then use the verified example scripts as the executable surface:
+
+- `src/mindlab-toolkit/examples/st06_mint_vla_minimal_closure.py`
+- `src/mindlab-toolkit/examples/st07_openpi_ray_single_gpu_actor_acceptance.py`
+- `src/mindlab-toolkit/examples/st08_openpi_shared_ray_actor_pool_acceptance.py`
+- `src/mindlab-toolkit/examples/st09a_mintx_action_boundary_acceptance.py`
+- `src/mindlab-toolkit/examples/st09b_openpi_action_ray_runtime_acceptance.py`
+
+## What not to infer from this file
+
+Do not use this file to infer any of the following:
+
+- that split-step public training is still recommended
+- that legacy `/api/v1/*` action routes are still canonical
+- that action inference still runs outside Mint queue/capacity semantics
+- that private workspace paths are an acceptable runtime contract
+- that `pi0.5` RL or repo-default exposure is part of the current first-stage commitment
 
 ## Bottom line
 
-The smallest honest design is:
+Keep this file only as historical background.
 
-- keep `Datum`
-- keep `TrainingClient`
-- add `flow_matching` as a new training loss family
-- add a sibling action-inference client
-- implement RL first only for autoregressive action-token models
-
-That stays close to Tinker where the contract is genuinely reusable and splits only where the current token-sampling contract is mathematically the wrong abstraction.
+For current development work, follow the target doc, stage docs, rollout/readiness docs, and the verified example scripts.
