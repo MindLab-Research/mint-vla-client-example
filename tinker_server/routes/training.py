@@ -2856,10 +2856,10 @@ async def _do_save_weights_for_sampler(
                 )
 
             try:
-                from ..backend.session_index_store import add_sampler_to_session, upsert_sampler_index
+                from ..backend.session_index_store import add_heartbeat_sampler_to_session, upsert_sampler_index
 
                 created_at = datetime.now().isoformat()
-                add_sampler_to_session(
+                add_heartbeat_sampler_to_session(
                     session_id=session.session_id,
                     sampler_id=sampling_session_id,
                     user_id=user_id,

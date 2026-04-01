@@ -78,6 +78,7 @@ def _get_or_create_actor():
             current.setdefault("session_id", session_id)
             current.setdefault("training_run_ids", list(current.get("training_run_ids") or []))
             current.setdefault("sampler_ids", list(current.get("sampler_ids") or []))
+            current.setdefault("heartbeat_sampler_ids", list(current.get("heartbeat_sampler_ids") or []))
             self._sessions[session_id] = current
 
         def add_training_run(
@@ -112,6 +113,30 @@ def _get_or_create_actor():
                 samplers.append(sampler_id)
             current["session_id"] = session_id
             current["sampler_ids"] = samplers
+            current.setdefault("heartbeat_sampler_ids", list(current.get("heartbeat_sampler_ids") or []))
+            if user_id is not None:
+                current.setdefault("user_id", user_id)
+            if created_at is not None:
+                current.setdefault("created_at", created_at)
+            self._sessions[session_id] = current
+
+        def add_heartbeat_sampler(
+            self,
+            session_id: str,
+            sampler_id: str,
+            user_id: str | None,
+            created_at: str | None,
+        ) -> None:
+            current = dict(self._sessions.get(session_id, {}))
+            samplers = list(current.get("sampler_ids") or [])
+            if sampler_id not in samplers:
+                samplers.append(sampler_id)
+            heartbeat_samplers = list(current.get("heartbeat_sampler_ids") or [])
+            if sampler_id not in heartbeat_samplers:
+                heartbeat_samplers.append(sampler_id)
+            current["session_id"] = session_id
+            current["sampler_ids"] = samplers
+            current["heartbeat_sampler_ids"] = heartbeat_samplers
             if user_id is not None:
                 current.setdefault("user_id", user_id)
             if created_at is not None:
@@ -280,6 +305,48 @@ def add_sampler_to_session(
         actor.add_sampler.remote(session_id, sampler_id, user_id, created_at)
     except Exception as e:
         logger.warning("Session index store write failed: add_sampler: %s", e)
+
+
+def add_heartbeat_sampler_to_session(
+    session_id: str,
+    sampler_id: str,
+    *,
+    user_id: str | None = None,
+    created_at: str | None = None,
+) -> None:
+    import ray
+
+    if not ray.is_initialized():
+        logger.warning("Session index store write skipped: Ray not initialized")
+        return
+    if not session_id or not sampler_id:
+        return
+    try:
+        actor = _get_or_create_actor()
+        try:
+            actor.add_heartbeat_sampler.remote(session_id, sampler_id, user_id, created_at)
+            return
+        except AttributeError:
+            logger.warning(
+                "Session index store actor missing add_heartbeat_sampler; using compatibility upsert"
+            )
+
+        actor.add_sampler.remote(session_id, sampler_id, user_id, created_at)
+        current = ray.get(actor.get_session.remote(session_id))
+        heartbeat_samplers = []
+        if isinstance(current, dict):
+            heartbeat_samplers = list(current.get("heartbeat_sampler_ids") or [])
+        if sampler_id not in heartbeat_samplers:
+            heartbeat_samplers.append(sampler_id)
+        actor.upsert_session.remote(
+            session_id,
+            {
+                "session_id": session_id,
+                "heartbeat_sampler_ids": heartbeat_samplers,
+            },
+        )
+    except Exception as e:
+        logger.warning("Session index store write failed: add_heartbeat_sampler: %s", e)
 
 
 def get_session_index(session_id: str) -> dict[str, Any] | None:
