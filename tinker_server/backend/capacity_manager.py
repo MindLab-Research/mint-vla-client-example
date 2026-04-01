@@ -217,9 +217,14 @@ def _get_or_create_ray_actor():
         pythonpath=PFS_PYTHONPATH,
         extra=actor_otel_env,
     )
-    return _RayCapacityManagerActor.options(  # type: ignore[attr-defined]
+    created = _RayCapacityManagerActor.options(  # type: ignore[attr-defined]
         **options
     ).remote(queue_bytes_budget=queue_bytes_budget)
+    try:
+        ray.get(created.snapshot.remote(), timeout=1.0)
+        return created
+    except Exception:
+        return ray.get_actor(actor_name, namespace=_ray_namespace())
 
 
 class CapacityManager:
@@ -236,9 +241,12 @@ class CapacityManager:
             raise CapacityManagerUnavailableError("Ray not initialized")
 
         if self._ray_actor is None:
-            raise CapacityManagerUnavailableError(
-                "Detached Ray CapacityManager actor is not ready on this API server"
-            )
+            try:
+                self._ray_actor = _get_or_create_ray_actor()
+            except Exception as e:
+                raise CapacityManagerUnavailableError(
+                    "Detached Ray CapacityManager actor is not ready on this API server"
+                ) from e
         return self._ray_actor
 
     def _get_ray_actor(self):

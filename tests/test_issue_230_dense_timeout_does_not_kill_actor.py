@@ -172,3 +172,63 @@ def test_issue_230_unbind_session_keeps_shared_dense_actor_pinned(monkeypatch: p
     assert pool.get(actor_name).current_session == other_model_id
 
     pool.unregister(actor_name)
+
+
+def test_issue_230_shutdown_session_keeps_protected_dense_actor_alive(monkeypatch: pytest.MonkeyPatch) -> None:
+    pool = get_resource_pool()
+    actor_name = f"peft_trainer_test_{uuid.uuid4().hex}_maxr64"
+    model_id = f"model_{uuid.uuid4().hex}"
+
+    pool.unregister(actor_name)
+    entry = pool.register(
+        actor_name=actor_name,
+        actor_type=ActorType.DENSE,
+        num_gpus=1,
+        base_model="/tmp/fake_model_path",
+        session_id=model_id,
+        protected=True,
+    )
+    pool.mark_ready(actor_name)
+
+    engine = VerlTrainingEngine()
+
+    class _ShutdownRecorder:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.shutdown = self
+
+        def remote(self):
+            self.calls += 1
+            return True
+
+    worker = _ShutdownRecorder()
+    engine._resource_pool_actor_names[model_id] = actor_name
+    engine._workers[model_id] = worker
+
+    session = TrainingSession(
+        model_id=model_id,
+        session_id="session_protected",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-4B-Instruct-2507",
+        backend="peft",
+    )
+
+    import tinker_server.backend.verl_training as verl_training
+
+    killed: list[dict] = []
+
+    def _fake_kill(*args, **kwargs):
+        killed.append(dict(kwargs))
+
+    monkeypatch.setattr(verl_training.ray_kill, "kill", _fake_kill)
+
+    asyncio.run(engine.shutdown_session(session))
+
+    assert worker.calls == 0
+    assert killed == []
+    assert model_id not in engine._resource_pool_actor_names
+    assert model_id not in engine._workers
+    assert entry.current_session is None
+    assert pool.is_protected(actor_name) is True
+
+    pool.unregister(actor_name)

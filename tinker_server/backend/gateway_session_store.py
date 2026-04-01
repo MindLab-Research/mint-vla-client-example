@@ -108,10 +108,16 @@ def _get_or_create_actor():
     )
 
     try:
-        _ACTOR_HANDLE = _GatewaySessionStoreActor.options(
+        created = _GatewaySessionStoreActor.options(
             **options
         ).remote()
-        return _ACTOR_HANDLE
+        try:
+            ray.get(created.list.remote())
+            _ACTOR_HANDLE = created
+            return _ACTOR_HANDLE
+        except Exception:
+            _ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)
+            return _ACTOR_HANDLE
     except Exception as e:
         # Concurrency: another process may have created the detached actor after our initial
         # ray.get_actor(name) check but before this .remote() call.

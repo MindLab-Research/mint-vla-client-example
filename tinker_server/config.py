@@ -209,11 +209,14 @@ def actor_runtime_env(*, pythonpath: str, extra: dict[str, str] | None = None) -
 
 
 def preferred_vllm_python_executable() -> str | None:
+    explicit = _env_nonempty(os.environ, "MINT_VLLM_CHILD_PYTHON_EXECUTABLE")
+    if explicit:
+        return explicit
     if PFS_TINKER_PATH:
         candidate = Path(PFS_TINKER_PATH) / "scripts" / "vllm_worker_python.py"
         if candidate.exists():
             return str(candidate)
-    return _env_nonempty(os.environ, "MINT_VLLM_CHILD_PYTHON_EXECUTABLE")
+    return None
 
 
 def preferred_torch_lib_dirs(environ: dict[str, str] | None = None) -> list[str]:

@@ -19,9 +19,17 @@ class _StubActor:
             self._outer.job_ids.append(job_id)
             return ("set_active_job_id", job_id)
 
+    class _ReleaseStaleRemote:
+        def remote(self, _job_id: str):
+            return []
+
     @property
     def set_active_job_id(self):
         return self._SetActiveRemote(self)
+
+    @property
+    def release_stale_scheduler_leases(self):
+        return self._ReleaseStaleRemote()
 
 
 class _StubFutureStore:
@@ -39,6 +47,9 @@ class _StubCapacityManager:
         self.released: list[str] = []
 
     def release_all(self, request_id: str) -> None:
+        self.released.append(request_id)
+
+    async def async_release_all(self, request_id: str) -> None:
         self.released.append(request_id)
 
 
@@ -68,24 +79,22 @@ async def _noop_worker_loop(self, worker_idx: int):
     return None
 
 
-def test_start_workers_fails_stale_running_requests(monkeypatch):
+def test_reconcile_fails_stale_running_requests(monkeypatch):
     client = queue_mod.ApiWorkQueueClient()
     actor = _StubActor()
     future_store = _StubFutureStore(["rid-a", "rid-b"])
     capacity_manager = _StubCapacityManager()
 
     monkeypatch.setattr(client, "_get_ray_actor", lambda: actor)
-    monkeypatch.setattr(queue_mod.ApiWorkQueueClient, "_worker_loop", _noop_worker_loop, raising=False)
     monkeypatch.setattr(future_store_mod, "future_store", future_store)
     monkeypatch.setattr(capacity_manager_mod, "capacity_manager", capacity_manager)
     monkeypatch.setitem(__import__("sys").modules, "ray", _StubRay)
 
     async def _run():
-        await client.start_workers(num_workers=1)
-        await client.shutdown()
+        count = await client._reconcile_stale_running_requests("job-new")
+        assert count == 2
 
     anyio.run(_run)
 
-    assert actor.job_ids == ["job-new"]
     assert future_store.calls == [("job-new", "api server restarted while request was running")]
     assert capacity_manager.released == ["rid-a", "rid-b"]

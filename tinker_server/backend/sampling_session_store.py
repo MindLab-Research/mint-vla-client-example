@@ -1,9 +1,10 @@
-"""Detached Ray store for training session metadata.
+"""Detached Ray store for sampling session metadata.
 
 This supports recovery after API server restarts:
-- Training workers are detached Ray actors (or pools) that can survive process death.
-- The API process loses in-memory TrainingSessionManager state on restart.
-- Persist minimal session metadata in a detached Ray actor so we can restore routing.
+- vLLM actors are detached Ray actors and can survive process death.
+- The API process loses in-memory SessionManager state on restart.
+- Persist minimal sampling-session metadata in a detached Ray actor so
+  routing and LoRA bookkeeping can be restored.
 """
 
 from __future__ import annotations
@@ -52,7 +53,7 @@ def _ray_namespace() -> str:
 
 
 def _actor_name() -> str:
-    return os.environ.get("MINT_TRAINING_SESSION_STORE_ACTOR_NAME", "tinker_training_session_store")
+    return os.environ.get("MINT_SAMPLING_SESSION_STORE_ACTOR_NAME", "tinker_sampling_session_store")
 
 
 def _get_or_create_actor():
@@ -68,59 +69,41 @@ def _get_or_create_actor():
         pass
 
     @ray.remote(num_cpus=0)
-    class _TrainingSessionStoreActor:
+    class _SamplingSessionStoreActor:
         def __init__(self) -> None:
             from ..logging_context import init_actor_observability
 
             init_actor_observability()
             self._sessions: dict[str, dict[str, Any]] = {}
 
-        def upsert(self, model_id: str, info: dict[str, Any]) -> None:
-            current = dict(self._sessions.get(model_id, {}))
+        def upsert(self, session_id: str, info: dict[str, Any]) -> None:
+            current = dict(self._sessions.get(session_id, {}))
             incoming = dict(info)
             incoming_version = max(1, int(incoming.get("metadata_version") or 1))
             current_version = max(1, int(current.get("metadata_version") or 1))
             if incoming_version < current_version:
+                # Ignore stale metadata writes but keep monotonic last_activity.
                 incoming_last_activity = float(incoming.get("last_activity", 0.0) or 0.0)
-                current_last_activity = float(current.get("last_activity", 0.0) or 0.0)
-                current["last_activity"] = max(current_last_activity, incoming_last_activity)
-                try:
-                    incoming_step = int(incoming.get("current_step", 0))
-                    current_step = int(current.get("current_step", 0))
-                    current["current_step"] = max(current_step, incoming_step)
-                except Exception:
-                    pass
-                self._sessions[model_id] = current
+                current["last_activity"] = max(float(current.get("last_activity", 0.0) or 0.0), incoming_last_activity)
+                self._sessions[session_id] = current
                 return
-            merged = dict(current)
-            merged.update(incoming)
-            merged.setdefault("current_step", int(current.get("current_step", 0)))
-            merged.setdefault("last_activity", time.time())
-            merged["metadata_version"] = incoming_version
-            self._sessions[model_id] = merged
+            current.update(incoming)
+            current.setdefault("session_id", session_id)
+            current.setdefault("last_activity", time.time())
+            current.setdefault("lora_loaded", False)
+            current.setdefault("uses_base_model", False)
+            current.setdefault("inflight_requests", 0)
+            current["metadata_version"] = incoming_version
+            self._sessions[session_id] = current
 
-        def get(self, model_id: str) -> dict[str, Any] | None:
-            return self._sessions.get(model_id)
+        def get(self, session_id: str) -> dict[str, Any] | None:
+            return self._sessions.get(session_id)
 
-        def delete(self, model_id: str) -> None:
-            self._sessions.pop(model_id, None)
+        def delete(self, session_id: str) -> None:
+            self._sessions.pop(session_id, None)
 
-        def bump_step(self, model_id: str) -> int:
-            s = self._sessions.get(model_id)
-            if s is None:
-                return 0
-            s["current_step"] = int(s.get("current_step", 0)) + 1
-            return int(s["current_step"])
-
-        def set_step(self, model_id: str, step: int) -> int:
-            s = self._sessions.get(model_id)
-            if s is None:
-                return int(step)
-            s["current_step"] = max(int(s.get("current_step", 0)), int(step))
-            return int(s["current_step"])
-
-        def set_last_activity(self, model_id: str, last_activity: float) -> float | None:
-            s = self._sessions.get(model_id)
+        def set_last_activity(self, session_id: str, last_activity: float) -> float | None:
+            s = self._sessions.get(session_id)
             if s is None:
                 return None
             s["last_activity"] = float(last_activity)
@@ -141,15 +124,14 @@ def _get_or_create_actor():
         pass
     actor_otel_env = otel_env_vars()
     from ..config import PFS_PYTHONPATH, actor_runtime_env
+
     options["runtime_env"] = actor_runtime_env(
         pythonpath=PFS_PYTHONPATH,
         extra=actor_otel_env,
     )
 
     try:
-        created = _TrainingSessionStoreActor.options(
-            **options
-        ).remote()
+        created = _SamplingSessionStoreActor.options(**options).remote()
         try:
             ray.get(created.list.remote())
             _ACTOR_HANDLE = created
@@ -159,16 +141,6 @@ def _get_or_create_actor():
     except Exception:
         _ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)
         return _ACTOR_HANDLE
-
-
-def _get_cached_actor_for_async_request_path():
-    import ray
-
-    if not ray.is_initialized():
-        raise RuntimeError("Ray not initialized")
-    if _ACTOR_HANDLE is None:
-        raise RuntimeError("Training session store actor is not ready on this API server")
-    return _ACTOR_HANDLE
 
 
 async def _reacquire_actor_for_async_request_path():
@@ -187,7 +159,7 @@ async def _reacquire_actor_for_async_request_path():
         )
     except ValueError as e:
         _ACTOR_HANDLE = None
-        raise RuntimeError("Training session store actor is not ready on this API server") from e
+        raise RuntimeError("Sampling session store actor is not ready on this API server") from e
     return _ACTOR_HANDLE
 
 
@@ -219,108 +191,84 @@ def ensure_ready() -> None:
     actor = _get_or_create_actor()
     out = ray.get(actor.list.remote())
     if not isinstance(out, list):
-        raise TypeError(f"Training session store returned non-list: {type(out)}")
+        raise TypeError(f"Sampling session store returned non-list: {type(out)}")
 
 
-def upsert_training_session(info: dict[str, Any]) -> None:
+def upsert_sampling_session(info: dict[str, Any]) -> None:
     import ray
 
     if not ray.is_initialized():
-        logger.warning("Training session store write skipped: Ray not initialized")
+        logger.warning("Sampling session store write skipped: Ray not initialized")
         return
     payload = dict(info)
-    payload.setdefault("current_step", 0)
+    session_id = str(payload.get("session_id", ""))
+    if not session_id:
+        logger.warning("Sampling session store write skipped: missing session_id")
+        return
     payload.setdefault("last_activity", time.time())
     payload["metadata_version"] = max(1, int(payload.get("metadata_version") or 1))
     try:
         actor = _get_or_create_actor()
-        actor.upsert.remote(str(payload.get("model_id", "")), payload)
+        actor.upsert.remote(session_id, payload)
     except Exception as e:
-        logger.warning("Training session store write failed: upsert: %s", e)
+        logger.warning("Sampling session store write failed: upsert: %s", e)
 
 
-def delete_training_session(model_id: str) -> None:
+def delete_sampling_session(session_id: str) -> None:
     import ray
 
     if not ray.is_initialized():
-        logger.warning("Training session store write skipped: Ray not initialized")
+        logger.warning("Sampling session store write skipped: Ray not initialized")
         return
     try:
         actor = _get_or_create_actor()
-        actor.delete.remote(model_id)
+        actor.delete.remote(session_id)
     except Exception as e:
-        logger.warning("Training session store write failed: delete: %s", e)
+        logger.warning("Sampling session store write failed: delete: %s", e)
 
 
-def set_training_session_last_activity(model_id: str, last_activity: float) -> None:
+def set_sampling_session_last_activity(session_id: str, last_activity: float) -> None:
     import ray
 
     if not ray.is_initialized():
         return
     try:
         actor = _get_or_create_actor()
-        actor.set_last_activity.remote(model_id, float(last_activity))
+        actor.set_last_activity.remote(session_id, float(last_activity))
     except Exception as e:
-        logger.debug("Training session store write failed: last_activity: %s", e)
+        logger.debug("Sampling session store write failed: last_activity: %s", e)
 
 
-def get_training_session_info(model_id: str) -> dict[str, Any] | None:
-    import ray
-
-    if not ray.is_initialized():
-        raise RuntimeError("Ray not initialized")
-    actor = _get_or_create_actor()
-    return ray.get(actor.get.remote(model_id))
-
-
-def bump_training_session_step(model_id: str) -> int:
-    import ray
-
-    if not ray.is_initialized():
-        raise RuntimeError("Ray not initialized")
-    actor = _get_or_create_actor()
-    return int(ray.get(actor.bump_step.remote(model_id)))
-
-
-def set_training_session_step(model_id: str, step: int) -> int:
-    import ray
-
-    if not ray.is_initialized():
-        raise RuntimeError("Ray not initialized")
-    actor = _get_or_create_actor()
-    return int(ray.get(actor.set_step.remote(model_id, int(step))))
-
-
-async def async_get_training_session_info(model_id: str) -> dict[str, Any] | None:
+async def async_set_sampling_session_last_activity(session_id: str, last_activity: float) -> float | None:
     out = await _call_actor_for_async_request_path(
-        lambda actor: actor.get.remote(model_id)
+        lambda actor: actor.set_last_activity.remote(session_id, float(last_activity))
+    )
+    if out is None:
+        return None
+    return float(out)
+
+
+def get_sampling_session_info(session_id: str) -> dict[str, Any] | None:
+    import ray
+
+    if not ray.is_initialized():
+        raise RuntimeError("Ray not initialized")
+    actor = _get_or_create_actor()
+    return ray.get(actor.get.remote(session_id))
+
+
+async def async_get_sampling_session_info(session_id: str) -> dict[str, Any] | None:
+    out = await _call_actor_for_async_request_path(
+        lambda actor: actor.get.remote(session_id)
     )
     if out is None:
         return None
     if not isinstance(out, dict):
-        raise TypeError(f"Training session store returned non-dict: {type(out)}")
+        raise TypeError(f"Sampling session store returned non-dict: {type(out)}")
     return out
 
 
-def set_training_session_step_best_effort(model_id: str, step: int) -> None:
-    import ray
-
-    if not ray.is_initialized():
-        raise RuntimeError("Ray not initialized")
-    actor = _get_or_create_actor()
-    actor.set_step.remote(model_id, int(step))
-
-
-def bump_training_session_step_best_effort(model_id: str) -> None:
-    import ray
-
-    if not ray.is_initialized():
-        raise RuntimeError("Ray not initialized")
-    actor = _get_or_create_actor()
-    actor.bump_step.remote(model_id)
-
-
-def list_training_sessions() -> list[dict[str, Any]]:
+def list_sampling_sessions() -> list[dict[str, Any]]:
     import ray
 
     if not ray.is_initialized():
@@ -329,10 +277,10 @@ def list_training_sessions() -> list[dict[str, Any]]:
     return ray.get(actor.list.remote())
 
 
-async def async_list_training_sessions() -> list[dict[str, Any]]:
+async def async_list_sampling_sessions() -> list[dict[str, Any]]:
     out = await _call_actor_for_async_request_path(
         lambda actor: actor.list.remote()
     )
     if not isinstance(out, list):
-        raise TypeError(f"Training session store returned non-list: {type(out)}")
+        raise TypeError(f"Sampling session store returned non-list: {type(out)}")
     return [dict(item) for item in out if isinstance(item, dict)]

@@ -10,6 +10,7 @@ import tomllib
 import subprocess
 import sys
 
+import tinker_server.config as server_config
 from tinker_server.runtime_env import (
     bootstrap_runtime_pythonpath,
     build_runtime_pythonpath,
@@ -254,6 +255,22 @@ def test_runtime_env_layout_prefers_manifest_sources(tmp_path):
     ]
 
 
+def test_preferred_vllm_python_executable_prefers_explicit_env(monkeypatch, tmp_path):
+    repo_root = tmp_path / "local-tinker"
+    worker_wrapper = repo_root / "scripts" / "vllm_worker_python.py"
+    worker_wrapper.parent.mkdir(parents=True, exist_ok=True)
+    worker_wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    explicit = tmp_path / "shared" / "scripts" / "vllm_worker_python.py"
+    explicit.parent.mkdir(parents=True, exist_ok=True)
+    explicit.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    monkeypatch.setattr(server_config, "PFS_TINKER_PATH", str(repo_root))
+    monkeypatch.setenv("MINT_VLLM_CHILD_PYTHON_EXECUTABLE", str(explicit))
+
+    assert server_config.preferred_vllm_python_executable() == str(explicit)
+
+
 def test_validate_runtime_env_layout_requires_base_python_when_host_python_required(tmp_path):
     env_root = tmp_path / "runtime"
     _materialize_runtime_env(env_root)
@@ -328,10 +345,12 @@ def test_detached_store_namespaces_respect_config_file(tmp_path):
             (
                 "import tinker_server.config as c; "
                 "import tinker_server.backend.gateway_session_store as g; "
+                "import tinker_server.backend.sampling_session_store as p; "
                 "import tinker_server.backend.session_index_store as s; "
                 "import tinker_server.backend.training_session_store as t; "
                 "print(c.RAY_NAMESPACE); "
                 "print(g._ray_namespace()); "
+                "print(p._ray_namespace()); "
                 "print(s._ray_namespace()); "
                 "print(t._ray_namespace())"
             ),
@@ -342,7 +361,7 @@ def test_detached_store_namespaces_respect_config_file(tmp_path):
         text=True,
         env=env,
     )
-    assert out.stdout.strip().splitlines() == ["cfg_ns", "cfg_ns", "cfg_ns", "cfg_ns"]
+    assert out.stdout.strip().splitlines() == ["cfg_ns", "cfg_ns", "cfg_ns", "cfg_ns", "cfg_ns"]
 
 
 def test_config_import_fails_on_namespace_mismatch(tmp_path):

@@ -20,6 +20,7 @@ from enum import Enum
 from typing import Any
 
 from ..config import config as server_config, otel_env_vars
+from .queue_execution_context import get_current_queue_generation_id
 
 
 class FutureStoreUnavailableError(RuntimeError):
@@ -104,21 +105,40 @@ def _sync_training_session_step(meta: dict[str, Any] | None, result: Any) -> Any
         return result
 
     try:
-        from .training_session_store import (
-            bump_training_session_step_best_effort,
-            set_training_session_step_best_effort,
-        )
+        from . import training_session_store
 
         step = _extract_training_step(result)
+        persisted_step: int | None = None
         if step is None:
-            bump_training_session_step_best_effort(str(model_id))
-            return result
+            bump_step = getattr(training_session_store, "bump_training_session_step", None)
+            if callable(bump_step):
+                try:
+                    persisted_step = int(bump_step(str(model_id)))
+                except Exception:
+                    persisted_step = None
+            if persisted_step is None:
+                bump_best_effort = getattr(training_session_store, "bump_training_session_step_best_effort", None)
+                if callable(bump_best_effort):
+                    bump_best_effort(str(model_id))
+        else:
+            set_step = getattr(training_session_store, "set_training_session_step", None)
+            if callable(set_step):
+                try:
+                    persisted_step = int(set_step(str(model_id), int(step)))
+                except Exception:
+                    persisted_step = None
+            if persisted_step is None:
+                set_best_effort = getattr(training_session_store, "set_training_session_step_best_effort", None)
+                if callable(set_best_effort):
+                    set_best_effort(str(model_id), int(step))
+            if persisted_step is None:
+                persisted_step = int(step)
 
-        set_training_session_step_best_effort(str(model_id), int(step))
         if isinstance(result, dict):
             metrics = result.get("metrics")
             if isinstance(metrics, dict):
-                metrics["step"] = int(step)
+                if persisted_step is not None:
+                    metrics["step"] = int(persisted_step)
         return result
     except Exception:
         return result
@@ -649,6 +669,32 @@ def _get_or_create_ray_actor():
                 failed.append(str(request_id))
             return failed
 
+        def fail_sampling_requests_for_session(self, sampling_session_id: str, error: str) -> list[str]:
+            self._prune()
+            target_session_id = str(sampling_session_id).strip()
+            if not target_session_id:
+                return []
+            now = time.time()
+            message = str(error)
+            failed: list[str] = []
+            for request_id in list(self._pending):
+                meta = self._meta.get(request_id)
+                if not isinstance(meta, dict):
+                    continue
+                if str(meta.get("sampling_session_id") or "").strip() != target_session_id:
+                    continue
+                op = self._op_from_meta(meta) or ""
+                if not op.startswith("sampling."):
+                    continue
+                self._pending.discard(request_id)
+                self._refs.pop(request_id, None)
+                self._update_op_from_meta(request_id, meta)
+                self._meta.pop(request_id, None)
+                self._errors[request_id] = message
+                self._done_at[request_id] = now
+                failed.append(str(request_id))
+            return failed
+
         def forget(self, request_id: str) -> None:
             self._forget(request_id)
 
@@ -675,9 +721,14 @@ def _get_or_create_ray_actor():
     )
 
     try:
-        return _RayFutureStoreActor.options(
+        created = _RayFutureStoreActor.options(
             **options
         ).remote(ttl_s, queue_ttl_s, done_ttl_s, tombstone_ttl_s)
+        try:
+            ray.get(created.stats.remote())
+            return created
+        except Exception:
+            return ray.get_actor(actor_name, namespace=namespace)
     except Exception:
         # Race: another process may have created the actor between get_actor and create.
         return ray.get_actor(actor_name, namespace=namespace)
@@ -699,9 +750,12 @@ class FutureStore:
             raise FutureStoreUnavailableError("Ray not initialized")
 
         if self._ray_actor is None:
-            raise FutureStoreUnavailableError(
-                "Detached Ray FutureStore actor is not ready on this API server"
-            )
+            try:
+                self._ray_actor = self._get_ray_actor()
+            except Exception as e:
+                raise FutureStoreUnavailableError(
+                    "Detached Ray FutureStore actor is not ready on this API server"
+                ) from e
         return self._ray_actor
 
     def ensure_ready(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
@@ -955,11 +1009,41 @@ class FutureStore:
             self._ray_actor = None
             raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
 
+    def _stale_generation_finalize_guard(self) -> tuple[bool, str | None]:
+        generation_id = get_current_queue_generation_id()
+        if generation_id is None:
+            return False, None
+        try:
+            from .queue_supervisor import queue_supervisor
+
+            if queue_supervisor.is_generation_current(generation_id=int(generation_id)):
+                return False, None
+            return True, f"stale generation finalize rejected (generation_id={generation_id})"
+        except Exception as e:
+            return True, f"stale generation finalize check failed: {type(e).__name__}: {e}"
+
+    async def _async_stale_generation_finalize_guard(self) -> tuple[bool, str | None]:
+        generation_id = get_current_queue_generation_id()
+        if generation_id is None:
+            return False, None
+        try:
+            from .queue_supervisor import queue_supervisor
+
+            if await queue_supervisor.async_is_generation_current(generation_id=int(generation_id)):
+                return False, None
+            return True, f"stale generation finalize rejected (generation_id={generation_id})"
+        except Exception as e:
+            return True, f"stale generation finalize check failed: {type(e).__name__}: {e}"
+
     def resolve(self, request_id: str, result: Any) -> None:
         actor = self._get_ray_actor()
         import ray
 
+        stale, message = self._stale_generation_finalize_guard()
         try:
+            if stale:
+                actor.fail.remote(request_id=request_id, error=str(message))
+                return
             meta = ray.get(actor.get_meta.remote(request_id=request_id))
             result = _sync_training_session_step(meta, result)
             ref = ray.put(result)
@@ -972,8 +1056,9 @@ class FutureStore:
         actor = self._get_ray_actor()
         import ray
 
+        stale, message = self._stale_generation_finalize_guard()
         try:
-            actor.fail.remote(request_id=request_id, error=str(error))
+            actor.fail.remote(request_id=request_id, error=str(message if stale and message else error))
         except ray.exceptions.ActorDiedError as e:
             self._ray_actor = None
             raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
@@ -988,8 +1073,9 @@ class FutureStore:
         actor = self._get_cached_ray_actor_for_async_request_path()
         import ray
 
+        stale, message = await self._async_stale_generation_finalize_guard()
         try:
-            await _await_ray_ref(actor.fail.remote(request_id=request_id, error=str(error)))
+            await _await_ray_ref(actor.fail.remote(request_id=request_id, error=str(message if stale and message else error)))
         except ray.exceptions.ActorDiedError as e:
             self._ray_actor = None
             raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
@@ -1017,6 +1103,38 @@ class FutureStore:
 
         if not isinstance(failed, list):
             raise TypeError("FutureStore.fail_training_requests_for_model returned non-list")
+
+        failed_ids = [str(request_id) for request_id in failed]
+        if not failed_ids:
+            return []
+
+        try:
+            from .capacity_manager import capacity_manager
+
+            for request_id in failed_ids:
+                capacity_manager.release_all(request_id)
+        except Exception:
+            pass
+
+        return failed_ids
+
+    def fail_sampling_requests_for_session(self, sampling_session_id: str, error: str) -> list[str]:
+        actor = self._get_ray_actor()
+        import ray
+
+        try:
+            failed = ray.get(
+                actor.fail_sampling_requests_for_session.remote(
+                    sampling_session_id=str(sampling_session_id),
+                    error=str(error),
+                )
+            )
+        except ray.exceptions.ActorDiedError as e:
+            self._ray_actor = None
+            raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
+
+        if not isinstance(failed, list):
+            raise TypeError("FutureStore.fail_sampling_requests_for_session returned non-list")
 
         failed_ids = [str(request_id) for request_id in failed]
         if not failed_ids:
