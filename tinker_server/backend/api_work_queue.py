@@ -1174,9 +1174,12 @@ class ApiWorkQueueClient:
             raise ApiWorkQueueUnavailableError("Ray not initialized")
 
         if self._ray_actor is None:
-            raise ApiWorkQueueUnavailableError(
-                "Detached Ray ApiWorkQueue actor is not ready on this API server"
-            )
+            try:
+                self._ray_actor = self._get_ray_actor()
+            except Exception as e:
+                raise ApiWorkQueueUnavailableError(
+                    "Detached Ray ApiWorkQueue actor is not ready on this API server"
+                ) from e
         return self._ray_actor
 
     def _get_ray_actor(self):

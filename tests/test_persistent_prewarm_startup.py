@@ -78,6 +78,12 @@ class _StubFutureStore:
         return None
 
 
+class _StubInitRayCalls(list):
+    def __call__(self, *args, **kwargs):
+        self.append({"args": args, "kwargs": kwargs})
+        return None
+
+
 class _StubCapacityManager:
     def ensure_ready(self) -> None:
         return None
@@ -201,6 +207,7 @@ def _install_lifespan_stubs(
     queue: _StubApiWorkQueue,
     owner_runtime: _StubOwnerRuntimeSupervisor,
     queue_execution_runtime: _StubQueueExecutionRuntime,
+    init_ray_calls: _StubInitRayCalls | None = None,
 ) -> None:
     monkeypatch.setattr(app_module, "_cleanup_stale_actors", _noop_async)
     monkeypatch.setattr(app_module, "_restore_sampling_sessions", _noop_async)
@@ -227,6 +234,8 @@ def _install_lifespan_stubs(
     verl_training_module.VerlTrainingEngine = _StubTrainingEngine
     monkeypatch.setitem(sys.modules, "tinker_server.backend.verl_training", verl_training_module)
 
+    if init_ray_calls is not None:
+        monkeypatch.setattr(app_module, "init_ray", init_ray_calls)
     monkeypatch.setattr(api_work_queue_module, "api_work_queue", queue)
     monkeypatch.setattr(owner_runtime_module, "owner_runtime_supervisor", owner_runtime)
     monkeypatch.setattr(queue_execution_runtime_module, "queue_execution_runtime", queue_execution_runtime)
@@ -320,7 +329,8 @@ def test_lifespan_follower_skips_leader_only_startup(monkeypatch) -> None:
     queue = _StubApiWorkQueue()
     owner_runtime = _StubOwnerRuntimeSupervisor()
     queue_execution_runtime = _StubQueueExecutionRuntime()
-    _install_lifespan_stubs(monkeypatch, queue, owner_runtime, queue_execution_runtime)
+    init_ray_calls = _StubInitRayCalls()
+    _install_lifespan_stubs(monkeypatch, queue, owner_runtime, queue_execution_runtime, init_ray_calls)
 
     calls: list[str] = []
     lease = _StubStartupLease(is_owner=False)
@@ -354,6 +364,7 @@ def test_lifespan_follower_skips_leader_only_startup(monkeypatch) -> None:
     assert lease.released is True
     assert app_module.service.session_manager is None
     assert queue_execution_runtime.ensure_started_calls == [1]
+    assert len(init_ray_calls) == 0
 
 
 def test_lifespan_keeps_training_route_globals_unbound_in_stateless_api(monkeypatch) -> None:

@@ -557,13 +557,32 @@ async def lifespan(app: FastAPI):
     from .backend.session_index_store import ensure_ready as ensure_session_index_store_ready
     from .backend.startup_lease import acquire_startup_lease
     from .backend.training_session_store import ensure_ready as ensure_training_session_store_ready
+    from .config import RAY_NAMESPACE
 
-    future_store.ensure_ready()
-    ensure_gateway_session_store_ready()
-    ensure_sampling_session_store_ready()
-    session_heartbeat_store.ensure_ready()
-    ensure_session_index_store_ready()
-    ensure_training_session_store_ready()
+    if os.environ.get("RAY_ADDRESS") or os.environ.get("RAY_CLIENT_ADDRESS") or os.environ.get("MINT_RAY_CLIENT_ADDRESS"):
+        init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
+
+    startup_lease = await acquire_startup_lease(_STARTUP_LEASE_ROLE)
+    startup_owner = bool(startup_lease.is_owner)
+    startup_lease_task: asyncio.Task | None = None
+    if startup_owner and not startup_lease.local_only:
+        startup_lease_task = asyncio.create_task(startup_lease.heartbeat_loop())
+    logger.info(
+        "startup lease role=%s is_owner=%s local_only=%s owner_id=%s",
+        _STARTUP_LEASE_ROLE,
+        startup_owner,
+        startup_lease.local_only,
+        startup_lease.owner_id,
+    )
+
+    if startup_owner:
+        future_store.ensure_ready()
+        ensure_gateway_session_store_ready()
+        ensure_sampling_session_store_ready()
+        session_heartbeat_store.ensure_ready()
+        ensure_session_index_store_ready()
+        ensure_training_session_store_ready()
+    owner_runtime = await owner_runtime_supervisor.async_ensure_started()
 
     try:
         from .backend.dense_session_state import cleanup_legacy_dense_session_state_once
@@ -597,7 +616,6 @@ async def lifespan(app: FastAPI):
         logger.exception("dense session-state startup cleanup failed")
 
     app_module_git_sha = _git_sha()
-    owner_runtime = await owner_runtime_supervisor.async_ensure_started()
     logger.info(
         "owner runtime supervisor ready actor=%s epoch=%s",
         owner_runtime.get("actor_name"),
@@ -649,19 +667,6 @@ async def lifespan(app: FastAPI):
             await asyncio.sleep(5.0)
 
     owner_runtime_health_task = asyncio.create_task(_owner_runtime_health_loop())
-
-    startup_lease = await acquire_startup_lease(_STARTUP_LEASE_ROLE)
-    startup_owner = bool(startup_lease.is_owner)
-    startup_lease_task: asyncio.Task | None = None
-    if startup_owner and not startup_lease.local_only:
-        startup_lease_task = asyncio.create_task(startup_lease.heartbeat_loop())
-    logger.info(
-        "startup lease role=%s is_owner=%s local_only=%s owner_id=%s",
-        _STARTUP_LEASE_ROLE,
-        startup_owner,
-        startup_lease.local_only,
-        startup_lease.owner_id,
-    )
 
     inference_manager = None
     train_manager = None

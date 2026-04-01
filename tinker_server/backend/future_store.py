@@ -750,9 +750,12 @@ class FutureStore:
             raise FutureStoreUnavailableError("Ray not initialized")
 
         if self._ray_actor is None:
-            raise FutureStoreUnavailableError(
-                "Detached Ray FutureStore actor is not ready on this API server"
-            )
+            try:
+                self._ray_actor = self._get_ray_actor()
+            except Exception as e:
+                raise FutureStoreUnavailableError(
+                    "Detached Ray FutureStore actor is not ready on this API server"
+                ) from e
         return self._ray_actor
 
     def ensure_ready(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
