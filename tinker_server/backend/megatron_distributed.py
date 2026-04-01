@@ -11,6 +11,7 @@ from __future__ import annotations  # Allow forward references in type hints
 import os
 import json
 import math
+import hashlib
 import socket
 import logging
 import threading
@@ -2297,6 +2298,346 @@ class MegatronRankWorker:
                 "log_probs": combined_log_probs,  # Combined per-token log_probs tensor (for backward compat)
             }
         return {}
+
+    def forward_backward_reverse_kl(
+        self,
+        data_items: list[dict],
+        reference_checkpoint_path: str,
+        reference_actual_rank: int | None,
+        temperature: float,
+        session_id: str | None = None,
+        traceparent: str | None = None,
+        train_attn: bool | None = None,
+        train_mlp: bool | None = None,
+        train_unembed: bool | None = None,
+        reference_full_log_prob_chunks: list | None = None,
+    ) -> dict:
+        """Run reverse-KL distillation loss against a fixed reference adapter checkpoint."""
+        import torch
+        from tinker_server.backend.megatron_training import (
+            create_reverse_kl_loss_fn,
+            create_vocab_parallel_logits_extractor_fn,
+            tinker_to_tensordict,
+        )
+        from verl.utils.megatron_peft_utils import _get_rank_checkpoint_path
+
+        from .mintx_ops import build_scoring_sequence, vocab_parallel_log_probs_from_logits_no_grad
+
+        self._bind_traceparent(traceparent)
+        if temperature <= 0:
+            raise ValueError(f"temperature must be positive, got {temperature!r}")
+
+        output_rank = self._is_output_rank()
+        completion_lengths: list[int] = []
+        completion_weights: list[list[float]] = []
+        student_items: list[dict] = []
+        reference_items: list[dict] = []
+        for item_index, item in enumerate(data_items):
+            student_input = item.get("student_input")
+            reference_input = item.get("reference_input")
+            target_tokens = item.get("target_tokens")
+            weights = item.get("weights")
+            if not isinstance(student_input, dict) or not isinstance(reference_input, dict):
+                raise ValueError(f"Item {item_index}: student_input/reference_input must be dicts")
+            student_tokens = flatten_encoded_text_chunks(student_input)
+            reference_tokens = flatten_encoded_text_chunks(reference_input)
+            if not student_tokens or not reference_tokens:
+                raise ValueError(f"Item {item_index}: student/reference input must contain tokens")
+            if not isinstance(target_tokens, dict) or not isinstance(weights, dict):
+                raise ValueError(f"Item {item_index}: target_tokens and weights must be TensorData-like dicts")
+            completion_tokens = target_tokens.get("data", [])
+            weight_values = weights.get("data", [])
+            if not isinstance(completion_tokens, list) or not completion_tokens:
+                raise ValueError(f"Item {item_index}: target_tokens.data must be non-empty")
+            if not isinstance(weight_values, list) or len(weight_values) != len(completion_tokens):
+                raise ValueError(f"Item {item_index}: weights.data must align with target_tokens.data")
+            completion_lengths.append(len(completion_tokens))
+            completion_weights.append([float(x) for x in weight_values])
+
+            student_full_input, student_completion_start = build_scoring_sequence(
+                [int(x) for x in student_tokens],
+                [int(x) for x in completion_tokens],
+            )
+            reference_full_input, reference_completion_start = build_scoring_sequence(
+                [int(x) for x in reference_tokens],
+                [int(x) for x in completion_tokens],
+            )
+            student_full_targets = student_full_input[1:] + [int(completion_tokens[-1])]
+            reference_full_targets = reference_full_input[1:] + [int(completion_tokens[-1])]
+            student_full_weights = [0.0] * student_completion_start + [float(x) for x in weight_values]
+            reference_full_weights = [0.0] * reference_completion_start + [float(x) for x in weight_values]
+
+            student_items.append(
+                {
+                    "model_input": {"chunks": [{"type": "encoded_text", "tokens": student_full_input}]},
+                    "loss_fn_inputs": {
+                        "target_tokens": {"data": student_full_targets, "shape": [len(student_full_targets)], "dtype": "int64"},
+                        "weights": {"data": student_full_weights, "shape": [len(student_full_weights)], "dtype": "float32"},
+                    },
+                }
+            )
+            reference_items.append(
+                {
+                    "model_input": {"chunks": [{"type": "encoded_text", "tokens": reference_full_input}]},
+                    "loss_fn_inputs": {
+                        "target_tokens": {"data": reference_full_targets, "shape": [len(reference_full_targets)], "dtype": "int64"},
+                        "weights": {"data": reference_full_weights, "shape": [len(reference_full_weights)], "dtype": "float32"},
+                    },
+                }
+            )
+
+        device = torch.cuda.current_device()
+        max_token_len = get_model_config(self.base_model).max_model_len
+        student_data = tinker_to_tensordict(
+            student_items,
+            max_token_len_per_gpu=max_token_len,
+            device=f"cuda:{device}",
+        )
+        student_data.set_non_tensor("temperature", float(temperature))
+        student_data.set_non_tensor("return_vocab_parallel_logits", True)
+        if reference_full_log_prob_chunks is None:
+            reference_data = tinker_to_tensordict(
+                reference_items,
+                max_token_len_per_gpu=max_token_len,
+                device=f"cuda:{device}",
+            )
+            reference_data.set_non_tensor("temperature", float(temperature))
+            reference_data.set_non_tensor("return_vocab_parallel_logits", True)
+
+            current_adapter_state = self._capture_adapter_state_dict()
+            rank_path = _get_rank_checkpoint_path(reference_checkpoint_path)
+            adapter_file = rank_path + "_adapter.pt"
+            if not os.path.isfile(adapter_file):
+                raise FileNotFoundError(f"Reference adapter checkpoint not found: {adapter_file}")
+            checkpoint = torch.load(adapter_file, map_location="cpu", weights_only=False)
+            reference_adapter_state = checkpoint.get("adapter_state_dict", {})
+            with self.engine.eval_mode():
+                try:
+                    self._restore_adapter_state_dict(
+                        reference_adapter_state,
+                        actual_rank=reference_actual_rank,
+                        trainer_rank=self.lora_rank,
+                        train_attn=train_attn,
+                        train_mlp=train_mlp,
+                        train_unembed=train_unembed,
+                    )
+                    extractor = create_vocab_parallel_logits_extractor_fn()
+                    with torch.no_grad():
+                        reference_result = self.engine.forward_backward_batch(
+                            data=reference_data,
+                            loss_function=extractor,
+                            forward_only=True,
+                        )
+                    reference_model_output = reference_result.get("model_output", {})
+                    reference_local_logits = reference_model_output.get("vocab_parallel_logits")
+                    if reference_local_logits is None:
+                        raise ValueError("reference forward missing vocab_parallel_logits")
+                    if hasattr(reference_local_logits, "values"):
+                        reference_local_logits = reference_local_logits.values()
+                    reference_log_probs = vocab_parallel_log_probs_from_logits_no_grad(reference_local_logits)
+                finally:
+                    self._restore_adapter_state_dict(
+                        current_adapter_state,
+                        trainer_rank=self.lora_rank,
+                        train_attn=train_attn,
+                        train_mlp=train_mlp,
+                        train_unembed=train_unembed,
+                    )
+
+            reference_loss_mask = reference_data["loss_mask"]
+            if hasattr(reference_loss_mask, "values"):
+                reference_loss_mask = reference_loss_mask.values()
+            selected_reference_log_probs = reference_log_probs[reference_loss_mask != 0].detach()
+            ref_chunks = []
+            offset = 0
+            for completion_len in completion_lengths:
+                ref_chunks.append(
+                    selected_reference_log_probs[offset: offset + completion_len].cpu()
+                )
+                offset += completion_len
+        else:
+            ref_chunks = [
+                chunk.to(dtype=torch.float32, device="cpu")
+                if hasattr(chunk, "to")
+                else torch.tensor(chunk, dtype=torch.float32, device="cpu")
+                for chunk in reference_full_log_prob_chunks
+            ]
+        # Re-materialize the current adapter weights before the student forward.
+        # The 30B SDPO path has repeatedly surfaced zero-storage LoRA tensors in
+        # live runs; capturing and restoring the current adapter state forces the
+        # parameter storage back through a fresh CPU clone before the batch runs.
+        # Keep teacher log-probs outside the TensorDict batch object. The student
+        # forward path only needs input_ids/loss_mask; carrying the teacher tensor
+        # inside the batch adds a large extra tensor field to every microbatch.
+        flat_reference_log_probs = torch.cat(ref_chunks, dim=0)
+        reverse_kl_loss_fn = create_reverse_kl_loss_fn(
+            temperature=temperature,
+            reference_log_probs=flat_reference_log_probs,
+        )
+
+        result = None
+        def _run_reverse_kl_compute():
+            nonlocal result
+            watchdog = self._start_slow_op_watchdog(
+                op="forward_backward_batch_reverse_kl",
+                session_id=session_id,
+                extra=f"items={len(data_items)}",
+            )
+            try:
+                result = self.engine.forward_backward_batch(
+                    data=student_data,
+                    loss_function=reverse_kl_loss_fn,
+                    forward_only=False,
+                )
+            finally:
+                self._stop_slow_op_watchdog(watchdog)
+
+        try:
+            if self._sticky_enabled_for(session_id):
+                sticky = self._ensure_sticky_train_mode(session_id=session_id, reason="forward_backward_reverse_kl")
+                train_mode_reused = bool(sticky.get("reused", False))
+                cached_grads = self._session_gradients.get(session_id)
+                if cached_grads is not None and cached_grads is not _GRADIENTS_CONSUMED and not train_mode_reused:
+                    self._restore_gradients(cached_grads)
+                try:
+                    _run_reverse_kl_compute()
+                    self._sticky_train_mode_last_used_s = time.perf_counter()
+                except Exception as original_error:
+                    try:
+                        self._release_sticky_train_mode(
+                            reason="forward_backward_reverse_kl_error",
+                            snapshot_gradients=False,
+                        )
+                    except Exception:
+                        pass
+                    raise original_error
+            else:
+                with self.engine.train_mode():
+                    cached_grads = self._session_gradients.get(session_id) if session_id else None
+                    if cached_grads is not None and cached_grads is not _GRADIENTS_CONSUMED:
+                        self._restore_gradients(cached_grads)
+                    _run_reverse_kl_compute()
+                    if session_id is not None:
+                        self._session_gradients[session_id] = self._capture_gradients()
+        finally:
+            pass
+        if not output_rank:
+            return {}
+
+        result_metrics = result.get("metrics", {}) if isinstance(result, dict) else {}
+        losses = result.get("loss", []) if isinstance(result, dict) else []
+        total_loss = 0.0
+        for loss in losses:
+            if hasattr(loss, "item"):
+                loss = loss.item()
+            total_loss += float(loss)
+
+        num_tokens = 0
+        for value in result_metrics.get("num_tokens", []):
+            if hasattr(value, "item"):
+                value = value.item()
+            num_tokens += int(value)
+
+        kl_tensors = []
+        for value in result_metrics.get("reverse_kl_tokens", []):
+            if hasattr(value, "cpu"):
+                value = value.cpu()
+            kl_tensors.append(value)
+        combined_kl = torch.cat(kl_tensors, dim=0) if kl_tensors else None
+
+        outputs = []
+        offset = 0
+        for completion_len, weights in zip(completion_lengths, completion_weights, strict=True):
+            if combined_kl is None:
+                item_loss = total_loss / max(len(completion_lengths), 1)
+            else:
+                sample_kl = combined_kl[offset: offset + completion_len]
+                offset += completion_len
+                weights_t = torch.tensor(weights, dtype=sample_kl.dtype)
+                item_loss = float((sample_kl * weights_t).sum().item())
+            outputs.append(
+                {
+                    "loss": {
+                        "data": [float(item_loss)],
+                        "shape": [1],
+                        "dtype": "float32",
+                    }
+                }
+            )
+
+        avg_loss = total_loss / max(float(num_tokens), 1.0)
+        return {
+            "outputs": outputs,
+            "metrics": {
+                "loss:mean": float(avg_loss),
+                "reverse_kl:mean": float(avg_loss),
+                "num_samples:sum": float(len(outputs)),
+                "num_tokens:sum": float(num_tokens),
+            },
+            "type": "mint_forward_backward_reverse_kl",
+        }
+
+    def forward_reference_full_log_probs(
+        self,
+        data_items: list[dict],
+        temperature: float,
+        traceparent: str | None = None,
+    ) -> dict:
+        """Compute full-vocab teacher log-probs on masked completion tokens only."""
+        import torch
+        from tinker_server.backend.megatron_training import (
+            create_vocab_parallel_logits_extractor_fn,
+            tinker_to_tensordict,
+        )
+
+        from .mintx_ops import vocab_parallel_log_probs_from_logits_no_grad
+
+        self._bind_traceparent(traceparent)
+        if temperature <= 0:
+            raise ValueError(f"temperature must be positive, got {temperature!r}")
+        completion_lengths: list[int] = []
+        for item_index, item in enumerate(data_items):
+            weights = item.get("loss_fn_inputs", {}).get("weights", {})
+            weight_values = weights.get("data", []) if isinstance(weights, dict) else []
+            if not isinstance(weight_values, list):
+                raise ValueError(f"Item {item_index}: weights.data must be list")
+            completion_lengths.append(sum(1 for w in weight_values if float(w) != 0.0))
+
+        device = torch.cuda.current_device()
+        max_token_len = get_model_config(self.base_model).max_model_len
+        td = tinker_to_tensordict(data_items, max_token_len_per_gpu=max_token_len, device=f"cuda:{device}")
+        td.set_non_tensor("temperature", float(temperature))
+        td.set_non_tensor("return_vocab_parallel_logits", True)
+
+        extractor = create_vocab_parallel_logits_extractor_fn()
+        with self.engine.eval_mode():
+            with torch.no_grad():
+                result = self.engine.forward_backward_batch(
+                    data=td,
+                    loss_function=extractor,
+                    forward_only=True,
+                )
+
+        model_output = result.get("model_output", {})
+        local_logits = model_output.get("vocab_parallel_logits")
+        if local_logits is None:
+            raise ValueError("reference forward missing vocab_parallel_logits")
+        if hasattr(local_logits, "values"):
+            local_logits = local_logits.values()
+        local_log_probs = vocab_parallel_log_probs_from_logits_no_grad(local_logits)
+
+        loss_mask = td["loss_mask"]
+        if hasattr(loss_mask, "values"):
+            loss_mask = loss_mask.values()
+        selected_local = local_log_probs[loss_mask != 0].contiguous()
+
+        local = selected_local.cpu()
+        chunks = []
+        offset = 0
+        for clen in completion_lengths:
+            chunks.append(local[offset:offset + clen].clone().tolist())
+            offset += clen
+        return {"reference_local_log_probs": chunks}
 
     def optim_step(
         self,
@@ -4715,29 +5056,275 @@ class MegatronSessionStateManager:
         adapter_files = glob.glob(os.path.join(session_path, "mp_rank_*_adapter.pt"))
         return len(adapter_files) > 0
 
-    def save_metadata(self, session_id: str, step: int, lr: float, actual_rank: int | None = None):
+    def _metadata_path(self, session_id: str) -> str:
+        return os.path.join(self.base_path, f"{session_id}_checkpoint.session_metadata.json")
+
+    def _actor_only_state_path(self, session_id: str) -> str:
+        return os.path.join(self.base_path, f"{session_id}_checkpoint.actor_only_state.json")
+
+    def _detach_session_path_from_checkpoint(self, session_id: str) -> None:
+        session_path = self.get_session_path(session_id)
+        if not os.path.islink(session_path):
+            return
+        os.unlink(session_path)
+        os.makedirs(session_path, exist_ok=True)
+        logger.info(
+            "[MegatronSessionStateManager] Detached session %s from primed checkpoint path for private writes",
+            session_id,
+        )
+
+    def checkpoint_identity(self, checkpoint_path: str) -> str:
+        digest = hashlib.sha256()
+        for root, dirnames, filenames in os.walk(checkpoint_path):
+            dirnames.sort()
+            filenames.sort()
+            rel_root = os.path.relpath(root, checkpoint_path)
+            digest.update(rel_root.encode("utf-8"))
+            for filename in filenames:
+                path = os.path.join(root, filename)
+                stat = os.stat(path, follow_symlinks=False)
+                rel_path = os.path.relpath(path, checkpoint_path)
+                digest.update(rel_path.encode("utf-8"))
+                digest.update(str(stat.st_size).encode("utf-8"))
+                digest.update(str(stat.st_mtime_ns).encode("utf-8"))
+        return digest.hexdigest()
+
+    def _replace_session_dir_with_snapshot(self, session_id: str, checkpoint_path: str) -> str:
+        import shutil
+
+        session_path = self.get_session_path(session_id)
+        if os.path.lexists(session_path):
+            if os.path.islink(session_path) or os.path.isfile(session_path):
+                os.unlink(session_path)
+            else:
+                shutil.rmtree(session_path)
+        os.makedirs(session_path, exist_ok=True)
+
+        for entry in os.scandir(checkpoint_path):
+            src = entry.path
+            dst = os.path.join(session_path, entry.name)
+            if entry.is_dir(follow_symlinks=False):
+                shutil.copytree(src, dst, copy_function=shutil.copy2)
+            else:
+                shutil.copy2(src, dst)
+        return session_path
+
+    def save_metadata(
+        self,
+        session_id: str,
+        step: int,
+        lr: float,
+        actual_rank: int | None = None,
+        *,
+        optimizer_restored: bool = True,
+        checkpoint_path: str | None = None,
+        train_attn: bool = True,
+        train_mlp: bool = True,
+        train_unembed: bool = True,
+        checkpoint_identity: str | None = None,
+    ):
         """Save session metadata (step count, learning rate, actual rank)."""
-        self._session_metadata[session_id] = {
+        meta = {
             "step": step,
             "lr": lr,
             "actual_rank": actual_rank,
+            "optimizer_restored": bool(optimizer_restored),
+            "checkpoint_path": os.path.realpath(checkpoint_path or self.get_session_path(session_id)),
+            "train_attn": bool(train_attn),
+            "train_mlp": bool(train_mlp),
+            "train_unembed": bool(train_unembed),
+            "checkpoint_identity": checkpoint_identity
+            or self.checkpoint_identity(checkpoint_path or self.get_session_path(session_id)),
         }
+        self._session_metadata[session_id] = meta
+        os.makedirs(self.base_path, exist_ok=True)
+        metadata_path = self._metadata_path(session_id)
+        with open(metadata_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f)
+
+    def mark_actor_only_state(
+        self,
+        session_id: str,
+        *,
+        reason: str,
+        actor_name: str | None = None,
+    ) -> None:
+        session_path = self.get_session_path(session_id)
+        self._detach_session_path_from_checkpoint(session_id)
+        os.makedirs(session_path, exist_ok=True)
+        marker_path = self._actor_only_state_path(session_id)
+        tmp_path = f"{marker_path}.tmp"
+        payload = {
+            "reason": str(reason),
+            "actor_name": None if actor_name is None else str(actor_name),
+            "updated_at": time.time(),
+        }
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.replace(tmp_path, marker_path)
+
+    def has_actor_only_state(self, session_id: str) -> bool:
+        marker_path = self._actor_only_state_path(session_id)
+        if not os.path.exists(marker_path):
+            return False
+        self._read_actor_only_state(marker_path)
+        return True
+
+    def clear_actor_only_state(self, session_id: str) -> None:
+        marker_path = self._actor_only_state_path(session_id)
+        try:
+            os.remove(marker_path)
+        except FileNotFoundError:
+            return
+
+    def _read_actor_only_state(self, marker_path: str) -> dict:
+        try:
+            with open(marker_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to read actor_only_state marker {marker_path}: {type(e).__name__}: {e}"
+            ) from e
+        if not isinstance(payload, dict):
+            raise RuntimeError(
+                f"Invalid actor_only_state marker payload type {type(payload).__name__} in {marker_path}"
+            )
+        marker_actor_name = payload.get("actor_name")
+        if not isinstance(marker_actor_name, str) or not marker_actor_name:
+            raise RuntimeError(
+                f"Invalid actor_only_state marker actor_name={marker_actor_name!r} in {marker_path}"
+            )
+        return payload
+
+    def list_actor_only_state_sessions(self, actor_name: str) -> list[str]:
+        import glob
+
+        dirty_sessions: list[str] = []
+        pattern = os.path.join(self.base_path, "*_checkpoint.actor_only_state.json")
+        for marker_path in glob.glob(pattern):
+            payload = self._read_actor_only_state(marker_path)
+            marker_actor_name = payload["actor_name"]
+            if marker_actor_name != actor_name:
+                continue
+            marker_name = os.path.basename(marker_path)
+            suffix = "_checkpoint.actor_only_state.json"
+            if not marker_name.endswith(suffix):
+                continue
+            dirty_sessions.append(marker_name[: -len(suffix)])
+        return sorted(set(dirty_sessions))
+
+    def prime_session(
+        self,
+        session_id: str,
+        checkpoint_path: str,
+        *,
+        step: int,
+        lr: float,
+        actual_rank: int | None = None,
+        optimizer_restored: bool = True,
+        train_attn: bool = True,
+        train_mlp: bool = True,
+        train_unembed: bool = True,
+        checkpoint_identity: str | None = None,
+    ) -> str:
+        if not os.path.isdir(checkpoint_path):
+            raise FileNotFoundError(f"checkpoint_path does not exist: {checkpoint_path}")
+        session_path = self._replace_session_dir_with_snapshot(session_id, checkpoint_path)
+        self.save_metadata(
+            session_id,
+            step,
+            lr,
+            actual_rank,
+            optimizer_restored=optimizer_restored,
+            checkpoint_path=checkpoint_path,
+            train_attn=train_attn,
+            train_mlp=train_mlp,
+            train_unembed=train_unembed,
+            checkpoint_identity=checkpoint_identity or self.checkpoint_identity(checkpoint_path),
+        )
+        return session_path
 
     def get_metadata(self, session_id: str) -> dict | None:
         """Get session metadata if exists."""
-        return self._session_metadata.get(session_id)
+        metadata_path = self._metadata_path(session_id)
+        if not os.path.exists(metadata_path):
+            return None
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+        except Exception:
+            return None
+        validated = self._validate_metadata(meta, session_id=session_id)
+        if validated is not None:
+            self._session_metadata[session_id] = validated
+        return validated
+
+    def _validate_metadata(self, meta: object, *, session_id: str) -> dict | None:
+        if not isinstance(meta, dict):
+            return None
+        step = meta.get("step")
+        if not isinstance(step, int) or isinstance(step, bool) or step < 0:
+            return None
+        lr_value = meta.get("lr")
+        if isinstance(lr_value, bool):
+            return None
+        try:
+            lr = float(lr_value)
+        except Exception:
+            return None
+        if not math.isfinite(lr):
+            return None
+        actual_rank = meta.get("actual_rank")
+        if actual_rank is not None:
+            if not isinstance(actual_rank, int) or isinstance(actual_rank, bool) or actual_rank <= 0:
+                return None
+        optimizer_restored = meta.get("optimizer_restored", True)
+        if not isinstance(optimizer_restored, bool):
+            return None
+        checkpoint_path = meta.get("checkpoint_path")
+        if not isinstance(checkpoint_path, str) or not checkpoint_path:
+            return None
+        checkpoint_identity = meta.get("checkpoint_identity")
+        if not isinstance(checkpoint_identity, str) or not checkpoint_identity:
+            return None
+        train_attn = meta.get("train_attn", True)
+        train_mlp = meta.get("train_mlp", True)
+        train_unembed = meta.get("train_unembed", True)
+        if not isinstance(train_attn, bool) or not isinstance(train_mlp, bool) or not isinstance(train_unembed, bool):
+            return None
+        return {
+            "step": step,
+            "lr": lr,
+            "actual_rank": actual_rank,
+            "optimizer_restored": optimizer_restored,
+            "checkpoint_path": checkpoint_path,
+            "checkpoint_identity": checkpoint_identity,
+            "train_attn": train_attn,
+            "train_mlp": train_mlp,
+            "train_unembed": train_unembed,
+        }
 
     def delete_session(self, session_id: str) -> bool:
         """Delete session checkpoint and metadata."""
         import shutil
+
         session_path = self.get_session_path(session_id)
         deleted = False
-        if os.path.exists(session_path):
-            shutil.rmtree(session_path)
+        if os.path.lexists(session_path):
+            if os.path.islink(session_path) or os.path.isfile(session_path):
+                os.unlink(session_path)
+            else:
+                shutil.rmtree(session_path)
             deleted = True
         if session_id in self._session_metadata:
             del self._session_metadata[session_id]
             deleted = True
+        for sidecar_path in (self._metadata_path(session_id), self._actor_only_state_path(session_id)):
+            try:
+                os.remove(sidecar_path)
+                deleted = True
+            except FileNotFoundError:
+                pass
         if deleted:
             logger.info(f"[MegatronSessionStateManager] Deleted session {session_id}")
         return deleted
@@ -5134,6 +5721,7 @@ class MegatronWorkerGroup:
         train_attn: bool | None = None,
         train_mlp: bool | None = None,
         train_unembed: bool | None = None,
+        reload_optimizer_model_params: bool = True,
     ) -> dict[str, object]:
         """Ensure the specified session's state is loaded (LoRA + optimizer + gradients).
 
@@ -5649,6 +6237,101 @@ class MegatronWorkerGroup:
             "metrics": metrics,
             "log_probs": log_probs_data,  # Per-token log probabilities
         }
+
+    def forward_backward_reverse_kl(
+        self,
+        data_items: list[dict],
+        reference_checkpoint_path: str | None,
+        temperature: float,
+        session_id: str | None = None,
+        traceparent: str | None = None,
+        *,
+        train_attn: bool | None = None,
+        train_mlp: bool | None = None,
+        train_unembed: bool | None = None,
+        reference_full_log_prob_chunks: list | None = None,
+    ) -> dict:
+        """Run Mint reverse-KL forward/backward on all workers."""
+        self._bind_traceparent(traceparent)
+        effective_session_id = self._resolve_required_session_id(
+            session_id,
+            op="forward_backward_reverse_kl",
+        )
+        self._ensure_session_loaded(
+            effective_session_id,
+            traceparent=traceparent,
+            train_attn=train_attn,
+            train_mlp=train_mlp,
+            train_unembed=train_unembed,
+            reload_optimizer_model_params=False,
+        )
+
+        futures = [
+            w.forward_backward_reverse_kl.remote(
+                data_items,
+                reference_checkpoint_path,
+                None,
+                temperature,
+                effective_session_id,
+                traceparent=traceparent,
+                train_attn=train_attn,
+                train_mlp=train_mlp,
+                train_unembed=train_unembed,
+                reference_full_log_prob_chunks=(
+                    reference_full_log_prob_chunks[idx]
+                    if isinstance(reference_full_log_prob_chunks, list)
+                    and len(reference_full_log_prob_chunks) == len(self.workers)
+                    else reference_full_log_prob_chunks
+                ),
+            )
+            for idx, w in enumerate(self.workers)
+        ]
+        results = ray.get(futures)
+        rank0_result = next((r for r in results if isinstance(r, dict) and r), {})
+        if not rank0_result:
+            raise ValueError("reverse_kl produced no rank0 result")
+        return rank0_result
+
+    def forward_reference_full_log_probs(
+        self,
+        data_items: list[dict],
+        temperature: float,
+        session_id: str | None = None,
+        traceparent: str | None = None,
+        *,
+        train_attn: bool | None = None,
+        train_mlp: bool | None = None,
+        train_unembed: bool | None = None,
+    ) -> list:
+        self._bind_traceparent(traceparent)
+        effective_session_id = self._resolve_required_session_id(
+            session_id,
+            op="forward_reference_full_log_probs",
+        )
+        self._ensure_session_loaded(
+            effective_session_id,
+            traceparent=traceparent,
+            train_attn=train_attn,
+            train_mlp=train_mlp,
+            train_unembed=train_unembed,
+            reload_optimizer_model_params=False,
+        )
+        futures = [
+            w.forward_reference_full_log_probs.remote(
+                data_items,
+                temperature,
+                traceparent=traceparent,
+            )
+            for w in self.workers
+        ]
+        results = ray.get(futures)
+        chunks_by_rank = []
+        for idx, result in enumerate(results):
+            chunks = result.get("reference_local_log_probs") if isinstance(result, dict) else None
+            if not isinstance(chunks, list):
+                raise ValueError(f"reference_local_log_probs missing from worker index {idx}")
+            chunks_by_rank.append(chunks)
+        return chunks_by_rank
 
     def optim_step(
         self,
@@ -6458,6 +7141,49 @@ class MegatronWorkerGroup:
             f"(step={self._step_count}, actual_rank={self._actual_rank})"
         )
         return {"status": "ok", "session_id": session_id}
+
+    def prime_session_checkpoint(
+        self,
+        session_id: str,
+        checkpoint_path: str,
+        *,
+        step_count: int,
+        learning_rate: float,
+        actual_rank: int | None = None,
+        optimizer_restored: bool = True,
+    ) -> dict:
+        session_path = self._session_manager.prime_session(
+            session_id,
+            checkpoint_path,
+            step=int(step_count),
+            lr=float(learning_rate),
+            actual_rank=actual_rank,
+            optimizer_restored=optimizer_restored,
+        )
+        logger.info(
+            f"[MegatronWorkerGroup] Primed session {session_id} from {checkpoint_path} "
+            f"into {session_path} (actual_rank={actual_rank})"
+        )
+        return {
+            "status": "ok",
+            "session_id": session_id,
+            "session_path": session_path,
+            "actual_rank": actual_rank,
+        }
+
+    def delete_session(
+        self,
+        session_id: str,
+        *,
+        traceparent: str | None = None,
+    ) -> dict:
+        self._bind_traceparent(traceparent)
+        ray.get([w.clear_session_state.remote(session_id, traceparent=traceparent) for w in self.workers])
+        deleted = self._session_manager.delete_session(session_id)
+        if self._current_session == session_id:
+            self._current_session = None
+            self._session_unknown_due_to_partial_swap = False
+        return {"status": "ok", "session_id": session_id, "deleted": bool(deleted)}
 
     def get_session_info(self) -> dict:
         """Get current session info.
