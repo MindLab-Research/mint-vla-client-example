@@ -518,6 +518,18 @@ def _compute_token_stats(data: list[Datum]) -> tuple[int, int]:
     return total_tokens, max_seq_len
 
 
+def _validate_training_batch_has_explicit_loss_masks_or_422(data: list[Datum]) -> None:
+    """Reject batches that omit the explicit per-token training mask contract."""
+    for item_index, datum in enumerate(data):
+        loss_fn_inputs = datum.loss_fn_inputs or {}
+        if any(key in loss_fn_inputs for key in ("loss_mask", "mask", "weights")):
+            continue
+        raise HTTPException(
+            status_code=422,
+            detail=f"Item {item_index} missing loss_mask/mask/weights",
+        )
+
+
 def _normalize_megatron_scheduler_domain_key(base_model: str) -> str:
     hf_cache_pattern = r"models--([^/]+)--([^/]+)/snapshots"
     match = re.search(hf_cache_pattern, base_model)
@@ -1474,6 +1486,7 @@ async def forward_backward(
     )
 
     user_id = _get_user_id(http_request)
+    _validate_training_batch_has_explicit_loss_masks_or_422(request.forward_backward_input.data)
 
     session = None
     if training_manager is not None:
@@ -1712,6 +1725,8 @@ async def train_step(
         forward_json,
         upstream_for_alias,
     )
+
+    _validate_training_batch_has_explicit_loss_masks_or_422(request.forward_backward_input.data)
 
     session = None
     if training_manager is not None:
