@@ -106,6 +106,47 @@ Semantics:
 - `model_path`, when provided, is resolved and access-checked under the caller's user/admin context before runtime creation
 - the returned `action_session_id` is the handle for subsequent `act` and `DELETE` requests
 
+### POST `/api/v1/mint/vla/train_step`
+
+Queue one MintX VLA training step with observation-side state separated from loss-side supervision.
+
+Request:
+
+```python
+class VLAObservation(BaseModel):
+    model_input: ModelInput
+    state: TensorData
+
+class VLADatum(BaseModel):
+    observation: VLAObservation
+    supervision: dict[str, TensorData]
+
+class VLATrainStepRequest(BaseModel):
+    model_id: str
+    data: list[VLADatum]
+    loss_fn: str
+    loss_fn_config: dict[str, Any] | None = None
+    adam_params: AdamParams | None = None
+    seq_id: int | None = None
+```
+
+Immediate route response:
+
+```python
+class UntypedAPIFuture(BaseModel):
+    request_id: str
+```
+
+Resolved payload after `retrieve_future`:
+
+- same shape as the standard `train_step` resolved payload, because the MintX route lowers into the existing internal training engine contract before execution
+
+Semantics:
+
+- `observation` carries forward-input state; callers must not put `state` inside `supervision`
+- `supervision` carries loss-side tensors such as `target_tokens`, `weights`, `token_ar_mask`, `actions`, `logprobs`, and `advantages`
+- the route is Mint-only because this boundary is not expressible cleanly through the standard Tinker `Datum` contract without mixing observation data into `loss_fn_inputs`
+
 ### POST `/api/v1/mint/action_sessions/{action_session_id}/act`
 
 Queue one action-inference request against an existing MintX action session.
@@ -113,10 +154,9 @@ Queue one action-inference request against an existing MintX action session.
 Request:
 
 ```python
-class MintActRequest(BaseModel):
+class VLAActRequest(BaseModel):
     seq_id: int | None = None
-    observation: ModelInput
-    extra_inputs: dict[str, TensorData] = {}
+    observation: VLAObservation
 ```
 
 Immediate route response:
@@ -137,9 +177,9 @@ class ActResponse(BaseModel):
 
 Semantics:
 
-- `extra_inputs.state` is required
+- `observation.state` is required
 - the request is admitted through the normal Mint capacity and work-queue path under op `mint.action.act`
-- the resolved payload reuses the existing action-output shape instead of defining a parallel Mint-only action result type
+- the route lowers into the existing internal action-runtime payload shape, so the resolved payload reuses the standard action-output schema instead of defining a parallel Mint-only action result type
 
 ### DELETE `/api/v1/mint/action_sessions/{action_session_id}`
 
@@ -169,6 +209,10 @@ Current helpers:
 - `mint.mint.InterpolateCheckpointsResponse`
 - `mint.mint.ForwardBackwardReverseKLRequest`
 - `mint.mint.ForwardBackwardReverseKLResponse`
+- `mint.mint.VLAObservation`
+- `mint.mint.VLADatum`
+- `mint.mint.VLATrainStepRequest`
+- `mint.mint.VLAActRequest`
 - `mint.mint.interpolate_checkpoints(...)`
 - `mint.mint.interpolate_checkpoints_async(...)`
 - `mint.mint.forward_backward_reverse_kl(...)`
@@ -179,5 +223,8 @@ When those helpers are updated, they must mirror the server contract above for:
 
 - `MintCreateActionSessionRequest`
 - `MintCreateActionSessionResponse`
-- `MintActRequest`
+- `VLAObservation`
+- `VLADatum`
+- `VLATrainStepRequest`
+- `VLAActRequest`
 - `MintDeleteActionSessionResponse`

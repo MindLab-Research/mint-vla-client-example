@@ -933,6 +933,7 @@ async def lifespan(app: FastAPI):
     from .models.mint_types import (
         ForwardBackwardReverseKLRequest,
         InterpolateCheckpointsRequest,
+        VLATrainStepRequest,
     )
 
     capacity_manager.ensure_ready()
@@ -1239,6 +1240,20 @@ async def lifespan(app: FastAPI):
             attributes={"queue.stage": "queue.stage.mint.forward_backward_reverse_kl"},
         )
 
+    async def _exec_mint_vla_train_step(item):
+        async def _run():
+            req = VLATrainStepRequest.model_validate_json(item.request_json)
+            await mint._do_vla_train_step(item.request_id, req, item.user_id)
+
+        await run_async_with_otel_span(
+            "queue.stage.mint.vla.train_step",
+            _run,
+            component="api_work_queue",
+            op=str(item.op),
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.mint.vla.train_step"},
+        )
+
     async def _exec_mint_action_act(item):
         async def _run():
             req = ActRequest.model_validate_json(item.request_json)
@@ -1270,6 +1285,7 @@ async def lifespan(app: FastAPI):
     api_work_queue.set_executor("internal.noop", _exec_internal_noop)
     api_work_queue.set_executor("mint.interpolate_checkpoints", _exec_mint_interpolate_checkpoints)
     api_work_queue.set_executor("mint.forward_backward_reverse_kl", _exec_mint_forward_backward_reverse_kl)
+    api_work_queue.set_executor("mint.vla.train_step", _exec_mint_vla_train_step)
     api_work_queue.set_executor("mint.action.act", _exec_mint_action_act)
 
     await api_work_queue.start_workers(num_workers=int(config.api_work_queue_num_workers))

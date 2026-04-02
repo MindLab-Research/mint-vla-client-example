@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -112,21 +113,21 @@ def test_mint_action_route_cleans_up_future_when_enqueue_fails(monkeypatch) -> N
         "/api/v1/mint/action_sessions/action-session-1/act",
         json={
             "observation": {
-                "chunks": [
-                    {
-                        "type": "image",
-                        "data": "aW1n",
-                        "format": "png",
-                        "expected_tokens": 256,
-                    }
-                ]
-            },
-            "extra_inputs": {
                 "state": {
                     "data": [0.0] * 8,
                     "shape": [8],
                     "dtype": "float32",
-                }
+                },
+                "model_input": {
+                    "chunks": [
+                        {
+                            "type": "image",
+                            "data": "aW1n",
+                            "format": "png",
+                            "expected_tokens": 256,
+                        }
+                    ]
+                },
             },
         },
     )
@@ -135,6 +136,183 @@ def test_mint_action_route_cleans_up_future_when_enqueue_fails(monkeypatch) -> N
     assert len(future_store.created) == 1
     assert future_store.cleaned == future_store.created
     assert capacity.released == future_store.created
+
+
+def test_mint_vla_train_step_route_enqueues_expected_request(monkeypatch) -> None:
+    from tinker_server.routes import mint as mint_routes
+
+    future_store = _StubFutureStore()
+    capacity = _StubCapacityManager()
+    queue = _StubQueue()
+
+    session = SimpleNamespace(
+        model_id="model-123",
+        base_model="openpi/pi0-fast-libero-low-mem-finetune",
+        backend="openpi_fast",
+    )
+
+    class _StubTrainingManager:
+        def __init__(self) -> None:
+            self.inflight: list[tuple[str, int]] = []
+
+        def get_session(self, model_id: str):
+            return session if model_id == "model-123" else None
+
+        def mark_inflight(self, model_id: str, delta: int) -> None:
+            self.inflight.append((model_id, delta))
+
+    monkeypatch.setattr(mint_routes, "future_store", future_store)
+    monkeypatch.setattr(mint_routes, "training_engine", object())
+    monkeypatch.setattr(mint_routes, "training_manager", _StubTrainingManager())
+    monkeypatch.setattr(mint_routes, "_get_user_id", lambda _request: "user-a")
+
+    import tinker_server.backend.capacity_manager as capacity_module
+    import tinker_server.backend.api_work_queue as queue_module
+    from tinker_server.routes import training as training_routes
+
+    monkeypatch.setattr(capacity_module, "capacity_manager", capacity)
+    monkeypatch.setattr(queue_module, "api_work_queue", queue)
+    monkeypatch.setattr(training_routes, "_get_max_model_len", lambda _base_model: 2048)
+    monkeypatch.setattr(
+        training_routes,
+        "_build_training_scheduler_extra",
+        lambda *, session, model_id, training_op, seq_id=None: {
+            "scheduler_session_key": model_id,
+            "training_op": training_op,
+            "seq_id": seq_id,
+            "backend": session.backend,
+        },
+    )
+
+    async def _fake_enqueue_training_request_with_trace(**kwargs):
+        await kwargs["enqueue_coro"]
+
+    monkeypatch.setattr(
+        training_routes,
+        "_enqueue_training_request_with_trace",
+        _fake_enqueue_training_request_with_trace,
+    )
+
+    app = FastAPI()
+    app.include_router(mint_routes.router, prefix="/api/v1/mint")
+    client = TestClient(app)
+
+    resp = client.post(
+        "/api/v1/mint/vla/train_step",
+        json={
+            "model_id": "model-123",
+            "loss_fn": "cross_entropy",
+            "data": [
+                {
+                    "observation": {
+                        "state": {
+                            "data": [0.0] * 8,
+                            "shape": [8],
+                            "dtype": "float32",
+                        },
+                        "model_input": {
+                            "chunks": [
+                                {"type": "image", "data": "aW1n", "format": "png", "expected_tokens": 256},
+                                {"type": "encoded_text", "tokens": [1, 2, 3]},
+                            ]
+                        },
+                    },
+                    "supervision": {
+                        "target_tokens": {
+                            "data": [11, 12],
+                            "shape": [2],
+                            "dtype": "int64",
+                        },
+                        "weights": {
+                            "data": [1.0, 1.0],
+                            "shape": [2],
+                            "dtype": "float32",
+                        },
+                        "token_ar_mask": {
+                            "data": [1, 1],
+                            "shape": [2],
+                            "dtype": "int64",
+                        },
+                    },
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    request_id = resp.json()["request_id"]
+    assert future_store.created == [request_id]
+    assert future_store.queued == [
+        (request_id, {"op": "mint.vla.train_step", "model_id": "model-123"})
+    ]
+    assert len(queue.calls) == 1
+    queued = queue.calls[0]
+    assert queued["op"] == "mint.vla.train_step"
+    assert queued["request_json"]["data"][0]["observation"]["state"]["shape"] == [8]
+    assert queued["request_json"]["data"][0]["supervision"]["target_tokens"]["shape"] == [2]
+
+
+def test_mint_vla_train_step_background_lowers_observation_and_supervision(monkeypatch) -> None:
+    from tinker_server.models.mint_types import VLATrainStepRequest
+    from tinker_server.routes import mint as mint_routes
+    from tinker_server.routes import training as training_routes
+
+    future_store = _StubFutureStore()
+    mark_calls: list[tuple[str, int]] = []
+    captured: dict[str, object] = {}
+
+    class _StubTrainingManager:
+        def mark_inflight(self, model_id: str, delta: int) -> None:
+            mark_calls.append((model_id, delta))
+
+    async def _fake_do_train_step(request_id: str, request, user_id: str | None, gateway_auth=None) -> None:
+        _ = request_id, user_id, gateway_auth
+        captured["request"] = request
+
+    monkeypatch.setattr(mint_routes, "future_store", future_store)
+    monkeypatch.setattr(mint_routes, "training_manager", _StubTrainingManager())
+    monkeypatch.setattr(training_routes, "_do_train_step", _fake_do_train_step)
+
+    request = VLATrainStepRequest.model_validate(
+        {
+            "model_id": "model-123",
+            "loss_fn": "cross_entropy",
+            "data": [
+                {
+                    "observation": {
+                        "state": {
+                            "data": [0.0] * 8,
+                            "shape": [8],
+                            "dtype": "float32",
+                        },
+                        "model_input": {
+                            "chunks": [
+                                {"type": "image", "data": "aW1n", "format": "png", "expected_tokens": 256},
+                                {"type": "encoded_text", "tokens": [1, 2, 3]},
+                            ]
+                        },
+                    },
+                    "supervision": {
+                        "target_tokens": {"data": [11, 12], "shape": [2], "dtype": "int64"},
+                        "weights": {"data": [1.0, 1.0], "shape": [2], "dtype": "float32"},
+                        "token_ar_mask": {"data": [1, 1], "shape": [2], "dtype": "int64"},
+                    },
+                }
+            ],
+        }
+    )
+
+    import asyncio
+
+    asyncio.run(mint_routes._do_vla_train_step("req-1", request, "user-a"))
+
+    internal = captured["request"]
+    lowered = internal.forward_backward_input.data[0]
+    assert lowered.model_input.chunks[1].tokens == [1, 2, 3]
+    assert lowered.loss_fn_inputs["state"].shape == [8]
+    assert lowered.loss_fn_inputs["target_tokens"].shape == [2]
+    assert lowered.loss_fn_inputs["token_ar_mask"].shape == [2]
+    assert mark_calls == []
 
 
 def test_mint_interpolate_route_enqueues_expected_request(monkeypatch) -> None:
