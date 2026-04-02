@@ -78,13 +78,13 @@ def _save_weights_for_sampler(base_url: str, model_id: str, checkpoint_name: str
     return path
 
 
-def _create_action_session(base_url: str, base_model: str, model_path: str, *, timeout_s: float = 900.0) -> str:
+def _create_action_session(base_url: str, base_model: str, model_path: str, *, timeout_s: float = 3600.0) -> str:
     deadline = time.time() + timeout_s
     while True:
         resp = requests.post(
             f"{base_url}/api/v1/mint/action_sessions",
             json={"session_id": f"act-{uuid.uuid4().hex[:12]}", "base_model": base_model, "model_path": model_path},
-            timeout=120,
+            timeout=3600,
         )
         if resp.status_code in {429, 503} and time.time() < deadline:
             time.sleep(2.0)
