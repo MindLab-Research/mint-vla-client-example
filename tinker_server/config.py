@@ -403,6 +403,15 @@ class ServerConfig:
             v = _env_nonempty(environ, name)
             return v if v is not None else (file_value if file_value is not None else default)
 
+        def _pick_str_alias(primary: str, legacy: str, file_value: str | None, default: str) -> str:
+            primary_v = _env_nonempty(environ, primary)
+            if primary_v is not None:
+                return primary_v
+            legacy_v = _env_nonempty(environ, legacy)
+            if legacy_v is not None:
+                return legacy_v
+            return file_value if file_value is not None else default
+
         def _pick_int(name: str, file_value: int | None, default: int) -> int:
             v = _env_nonempty(environ, name)
             return int(v) if v is not None else (int(file_value) if file_value is not None else int(default))
@@ -615,12 +624,14 @@ class ServerConfig:
                 300.0,
             ),
             # Admission control + API work queue (issue #84)
-            capacity_manager_actor_name=_pick_str(
+            capacity_manager_actor_name=_pick_str_alias(
+                "MINT_CAPACITY_MANAGER_ACTOR_NAME",
                 "TINKER_CAPACITY_MANAGER_ACTOR_NAME",
                 None,
                 "tinker_capacity_manager",
             ),
-            api_work_queue_actor_name=_pick_str(
+            api_work_queue_actor_name=_pick_str_alias(
+                "MINT_API_WORK_QUEUE_ACTOR_NAME",
                 "TINKER_API_WORK_QUEUE_ACTOR_NAME",
                 None,
                 "tinker_api_work_queue",

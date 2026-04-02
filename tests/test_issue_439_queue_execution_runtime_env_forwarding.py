@@ -11,7 +11,7 @@ def test_issue_439_queue_execution_runtime_forwards_actor_name_overrides(monkeyp
 
     out = qer._runtime_env_overrides()
 
-    assert out["TINKER_API_WORK_QUEUE_ACTOR_NAME"] == "queue-v20260309"
+    assert out["MINT_API_WORK_QUEUE_ACTOR_NAME"] == "queue-v20260309"
     assert out["MINT_FUTURE_STORE_ACTOR_NAME"] == "future-v2"
-    assert out["TINKER_CAPACITY_MANAGER_ACTOR_NAME"] == "capacity-v3"
+    assert out["MINT_CAPACITY_MANAGER_ACTOR_NAME"] == "capacity-v3"
     assert out["TINKER_RAY_NAMESPACE"] == "ns-issue-439"
