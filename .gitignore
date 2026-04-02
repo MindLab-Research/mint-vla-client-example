@@ -235,7 +235,11 @@ ray_head_ip.txt
 *.key
 
 # Work-in-progress investigation scripts
-scripts/wip/
+scripts/wip/*
+!scripts/wip/openpi_libero_sft.py
+!scripts/wip/openpi_libero_fast_rl.py
+!scripts/wip/openpi_libero_resume_sft.py
+!scripts/wip/openpi_vla_pressure_threads.py
 
 # Experiment outputs in root
 *_training_curves.png
