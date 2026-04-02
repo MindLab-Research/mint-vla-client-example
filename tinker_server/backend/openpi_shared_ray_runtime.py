@@ -98,8 +98,13 @@ def clear_openpi_shared_runtime_pool() -> None:
             pass
 
 
-def _drop_shared_actor_entry(actor_name: str) -> _SharedActorEntry | None:
+def _drop_shared_actor_entry(actor_name: str, *, actor: Any | None = None) -> _SharedActorEntry | None:
     with _SHARED_POOL_LOCK:
+        entry = _SHARED_ACTORS.get(actor_name)
+        if entry is None:
+            return None
+        if actor is not None and entry.actor is not actor:
+            return None
         return _SHARED_ACTORS.pop(actor_name, None)
 
 
@@ -375,6 +380,7 @@ class OpenPISharedRayRuntimeClient:
         spec: OpenPIFastRuntimeSpec,
         session_id: str,
         ready_timeout_s: float,
+        owns_started_actor: bool = False,
     ) -> None:
         self._actor = actor
         self._actor_name = actor_name
@@ -383,6 +389,9 @@ class OpenPISharedRayRuntimeClient:
         self._ready_timeout_s = float(ready_timeout_s)
         self._closed = False
         self._metadata: dict[str, Any] | None = None
+        self._owns_started_actor = bool(owns_started_actor)
+        self._bootstrap_session_pending = bool(owns_started_actor)
+        self._cleanup_attempted = False
 
     @property
     def metadata(self) -> dict[str, Any] | None:
@@ -457,6 +466,8 @@ class OpenPISharedRayRuntimeClient:
             raise TypeError(
                 f"OpenPI shared Ray runtime request returned non-dict payload: {type(result)}"
             )
+        if op == "create_session":
+            self._bootstrap_session_pending = False
         if op == "shutdown":
             pool.set_session(self._actor_name, None)
         else:
@@ -474,7 +485,23 @@ class OpenPISharedRayRuntimeClient:
         return metadata
 
     async def close(self) -> None:
+        if self._closed:
+            return
         self._closed = True
+        if not self._owns_started_actor or not self._bootstrap_session_pending or self._cleanup_attempted:
+            return
+
+        self._cleanup_attempted = True
+        dropped = _drop_shared_actor_entry(self._actor_name, actor=self._actor)
+        if dropped is None:
+            return
+
+        cleanup_errors = await _cleanup_failed_shared_actor_start(
+            actor_name=self._actor_name,
+            actor=self._actor,
+        )
+        for note in cleanup_errors:
+            logger.warning("%s", note)
 
 
 async def start_openpi_shared_ray_runtime(
@@ -493,6 +520,7 @@ async def start_openpi_shared_ray_runtime(
         model_config=model_config,
     )
     actor_name = _shared_actor_name(pool_key)
+    owns_started_actor = False
 
     with _SHARED_POOL_LOCK:
         entry = _SHARED_ACTORS.get(actor_name)
@@ -504,6 +532,7 @@ async def start_openpi_shared_ray_runtime(
                 except ValueError:
                     actor = None
             if actor is None:
+                owns_started_actor = True
                 actor = OpenPISharedRayRuntimeActor.options(
                     name=actor_name,
                     namespace=RAY_NAMESPACE,
@@ -527,6 +556,7 @@ async def start_openpi_shared_ray_runtime(
         spec=spec,
         session_id=str(session.model_id),
         ready_timeout_s=_actor_ready_timeout_s(spec),
+        owns_started_actor=owns_started_actor,
     )
     try:
         metadata = await client.ready()
