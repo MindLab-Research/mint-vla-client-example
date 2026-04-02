@@ -171,9 +171,9 @@ def _get_or_create_actor():
                     if not self._runtime_initialized:
                         await _initialize_execution_bindings()
                         self._runtime_initialized = True
-                    capacity_manager.ensure_ready()
-                    future_store.ensure_ready()
-                    api_work_queue.ensure_ready()
+                    await capacity_manager.async_ensure_ready()
+                    await future_store.async_ensure_ready()
+                    await api_work_queue.async_ensure_ready()
                     register_api_work_queue_executors(api_work_queue)
                     self._desired_workers = max(1, int(num_workers))
                     await api_work_queue.start_workers(num_workers=self._desired_workers)
