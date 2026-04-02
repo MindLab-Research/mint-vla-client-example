@@ -6,6 +6,7 @@ import io
 import json
 import logging
 import os
+import shutil
 import sys
 import traceback
 from dataclasses import dataclass
@@ -456,6 +457,96 @@ class OpenPIPi05WorkerSession:
             if callable(close):
                 close()
 
+    def _session_state_tree(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "step": self._state.step,
+            "params": self._state.params.filter(self._config.trainable_filter),
+            "opt_state": self._state.opt_state,
+        }
+        if self._state.ema_params is not None:
+            payload["ema_params"] = self._state.ema_params.filter(self._config.trainable_filter)
+        return payload
+
+    def _initialize_session_checkpoint_dir(
+        self,
+        path: Path,
+        *,
+        overwrite: bool,
+        resume: bool,
+    ) -> tuple[Any, bool]:
+        checkpoint_path = Path(path).resolve()
+        resuming = False
+        if checkpoint_path.exists():
+            if overwrite:
+                shutil.rmtree(checkpoint_path)
+                checkpoint_path.mkdir(parents=True, exist_ok=True)
+            elif resume:
+                resuming = True
+            else:
+                raise FileExistsError(
+                    f"Checkpoint directory {checkpoint_path} already exists. Use overwrite or resume."
+                )
+        checkpoint_path.mkdir(parents=True, exist_ok=True)
+        manager = self._ocp.CheckpointManager(
+            str(checkpoint_path),
+            item_handlers={"session_state": self._ocp.PyTreeCheckpointHandler()},
+            options=self._ocp.CheckpointManagerOptions(
+                max_to_keep=1,
+                keep_period=None,
+                create=False,
+                async_options=self._ocp.AsyncOptions(timeout_secs=7200),
+            ),
+        )
+        if resuming and tuple(manager.all_steps()) in [(), (0,)]:
+            resuming = False
+        return manager, resuming
+
+    def _save_session_train_state_checkpoint(self, path: Path, state: dict[str, Any]) -> None:
+        manager, _ = self._initialize_session_checkpoint_dir(path, overwrite=True, resume=False)
+        try:
+            checkpoint_step = max(1, _int_scalar(state["step"]))
+            manager.save(checkpoint_step, items={"session_state": state})
+            manager.wait_until_finished()
+        finally:
+            close = getattr(manager, "close", None)
+            if callable(close):
+                close()
+
+    def _load_session_train_state_checkpoint(self, path: Path) -> Any:
+        manager, resuming = self._initialize_session_checkpoint_dir(path, overwrite=False, resume=True)
+        if not resuming:
+            close = getattr(manager, "close", None)
+            if callable(close):
+                close()
+            raise FileNotFoundError(f"OpenPI pi0.5 session checkpoint has no saved steps: {path}")
+        try:
+            restored = manager.restore(
+                None,
+                items={"session_state": self._session_state_tree()},
+            )["session_state"]
+        finally:
+            close = getattr(manager, "close", None)
+            if callable(close):
+                close()
+
+        params = self._state.params
+        params.replace_by_pure_dict(restored["params"].to_pure_dict())
+        ema_params = self._state.ema_params
+        restored_ema_params = restored.get("ema_params")
+        if ema_params is None and restored_ema_params is not None:
+            raise ValueError("OpenPI pi0.5 session checkpoint unexpectedly contains ema_params")
+        if ema_params is not None and restored_ema_params is None:
+            raise ValueError("OpenPI pi0.5 session checkpoint is missing ema_params")
+        if ema_params is not None and restored_ema_params is not None:
+            ema_params.replace_by_pure_dict(restored_ema_params.to_pure_dict())
+        return dataclasses.replace(
+            self._state,
+            step=restored["step"],
+            params=params,
+            opt_state=restored["opt_state"],
+            ema_params=ema_params,
+        )
+
     def save_weights(self, payload: dict[str, Any]) -> dict[str, Any]:
         save_path = str(Path(payload["save_path"]).resolve())
         self._save_train_state_checkpoint(Path(save_path), self._state)
@@ -475,12 +566,12 @@ class OpenPIPi05WorkerSession:
             session_id,
             worker_module="tinker_server.backend.openpi_pi05_worker",
             runtime_signature=self._session_state_signature(),
-            state=self._state,
+            state=self._session_state_tree(),
             rng=self._rng,
             pending_grads=self._pending_grads,
             learning_rate=self._learning_rate,
             current_step=_int_scalar(self._state.step),
-            save_train_state_fn=self._save_train_state_checkpoint,
+            save_train_state_fn=self._save_session_train_state_checkpoint,
         )
         return {
             "path": str(path),
@@ -494,7 +585,7 @@ class OpenPIPi05WorkerSession:
             session_id,
             expected_worker_module="tinker_server.backend.openpi_pi05_worker",
             expected_runtime_signature=self._session_state_signature(),
-            load_train_state_fn=self._load_train_state_checkpoint,
+            load_train_state_fn=self._load_session_train_state_checkpoint,
         )
         self._state = restored["state"]
         self._rng = restored["rng"]

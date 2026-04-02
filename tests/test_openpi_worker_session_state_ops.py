@@ -19,11 +19,12 @@ def test_openpi_fast_worker_save_session_state_uses_manager() -> None:
     fake_session = SimpleNamespace(
         _session_state_manager=_FakeManager(),
         _session_state_signature=lambda: {"config_name": "pi0_fast_libero_low_mem_finetune"},
+        _session_state_tree=lambda: {"marker": "fast-session-tree"},
         _state=SimpleNamespace(step=7),
         _rng={"seed": [11, 12]},
         _pending_grads={"grad": [0.5, 0.25]},
         _learning_rate=1e-4,
-        _save_train_state_checkpoint=lambda path, state: (path, state),
+        _save_session_train_state_checkpoint=lambda path, state: (path, state),
     )
 
     result = fast_worker_module.OpenPIFastWorkerSession.save_session_state(
@@ -34,12 +35,12 @@ def test_openpi_fast_worker_save_session_state_uses_manager() -> None:
     assert calls["session_id"] == "session-a"
     assert calls["worker_module"] == "tinker_server.backend.openpi_fast_worker"
     assert calls["runtime_signature"] == {"config_name": "pi0_fast_libero_low_mem_finetune"}
-    assert calls["state"] is fake_session._state
+    assert calls["state"] == {"marker": "fast-session-tree"}
     assert calls["rng"] == {"seed": [11, 12]}
     assert calls["pending_grads"] == {"grad": [0.5, 0.25]}
     assert calls["learning_rate"] == 1e-4
     assert calls["current_step"] == 7
-    assert callable(calls["save_train_state_fn"])
+    assert calls["save_train_state_fn"] is fake_session._save_session_train_state_checkpoint
     assert result == {"path": "/tmp/session-a", "current_step": 7, "learning_rate": 1e-4}
 
 
@@ -65,7 +66,7 @@ def test_openpi_fast_worker_load_session_state_restores_aux_state() -> None:
         _rng={"seed": [11, 12]},
         _pending_grads=None,
         _learning_rate=1e-4,
-        _load_train_state_checkpoint=lambda path: path,
+        _load_session_train_state_checkpoint=lambda path: path,
     )
 
     result = fast_worker_module.OpenPIFastWorkerSession.load_session_state(
@@ -76,7 +77,7 @@ def test_openpi_fast_worker_load_session_state_restores_aux_state() -> None:
     assert calls["session_id"] == "session-a"
     assert calls["expected_worker_module"] == "tinker_server.backend.openpi_fast_worker"
     assert calls["expected_runtime_signature"] == {"config_name": "pi0_fast_libero_low_mem_finetune"}
-    assert callable(calls["load_train_state_fn"])
+    assert calls["load_train_state_fn"] is fake_session._load_session_train_state_checkpoint
     assert fake_session._state == "new-state"
     assert fake_session._rng == {"seed": [99]}
     assert fake_session._pending_grads == {"grad": [0.1]}
@@ -111,12 +112,13 @@ def test_openpi_pi05_worker_save_and_load_session_state_use_manager() -> None:
             "config_name": "pi05_libero",
             "max_token_len": 48,
         },
+        _session_state_tree=lambda: {"marker": "pi05-session-tree"},
         _state=SimpleNamespace(step=11),
         _rng={"seed": [1]},
         _pending_grads={"grad": [0.1]},
         _learning_rate=5e-4,
-        _save_train_state_checkpoint=lambda path, state: (path, state),
-        _load_train_state_checkpoint=lambda path: path,
+        _save_session_train_state_checkpoint=lambda path, state: (path, state),
+        _load_session_train_state_checkpoint=lambda path: path,
     )
 
     save_result = pi05_worker_module.OpenPIPi05WorkerSession.save_session_state(
@@ -133,11 +135,14 @@ def test_openpi_pi05_worker_save_and_load_session_state_use_manager() -> None:
         "config_name": "pi05_libero",
         "max_token_len": 48,
     }
+    assert save_calls["state"] == {"marker": "pi05-session-tree"}
+    assert save_calls["save_train_state_fn"] is fake_session._save_session_train_state_checkpoint
     assert load_calls["expected_worker_module"] == "tinker_server.backend.openpi_pi05_worker"
     assert load_calls["expected_runtime_signature"] == {
         "config_name": "pi05_libero",
         "max_token_len": 48,
     }
+    assert load_calls["load_train_state_fn"] is fake_session._load_session_train_state_checkpoint
     assert save_result == {"path": "/tmp/session-b", "current_step": 11, "learning_rate": 5e-4}
     assert load_result == {"current_step": 13, "learning_rate": 0.003}
     assert fake_session._state == "pi05-state"
