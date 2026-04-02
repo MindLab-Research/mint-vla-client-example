@@ -79,6 +79,85 @@ Semantics:
 - gradients flow only through the student model
 - temperature uses the standard scaled-distribution convention internally
 
+### POST `/api/v1/mint/action_sessions`
+
+Create a Mint-owned action inference session for a VLA checkpoint.
+
+Request:
+
+```python
+class MintCreateActionSessionRequest(BaseModel):
+    session_id: str
+    action_session_seq_id: int | None = None
+    base_model: str | None = None
+    model_path: str | None = None
+```
+
+Response:
+
+```python
+class MintCreateActionSessionResponse(BaseModel):
+    action_session_id: str
+```
+
+Semantics:
+
+- `base_model` may be omitted only when it can be inferred from `model_path`
+- `model_path`, when provided, is resolved and access-checked under the caller's user/admin context before runtime creation
+- the returned `action_session_id` is the handle for subsequent `act` and `DELETE` requests
+
+### POST `/api/v1/mint/action_sessions/{action_session_id}/act`
+
+Queue one action-inference request against an existing MintX action session.
+
+Request:
+
+```python
+class MintActRequest(BaseModel):
+    seq_id: int | None = None
+    observation: ModelInput
+    extra_inputs: dict[str, TensorData] = {}
+```
+
+Immediate route response:
+
+```python
+class UntypedAPIFuture(BaseModel):
+    request_id: str
+```
+
+Resolved payload after `retrieve_future`:
+
+```python
+class ActResponse(BaseModel):
+    actions: TensorData
+    policy_timing: dict[str, float] | None = None
+    type: Literal["act"] = "act"
+```
+
+Semantics:
+
+- `extra_inputs.state` is required
+- the request is admitted through the normal Mint capacity and work-queue path under op `mint.action.act`
+- the resolved payload reuses the existing action-output shape instead of defining a parallel Mint-only action result type
+
+### DELETE `/api/v1/mint/action_sessions/{action_session_id}`
+
+Release one MintX action session.
+
+Response:
+
+```python
+class MintDeleteActionSessionResponse(BaseModel):
+    action_session_id: str
+    status: Literal["deleted"] = "deleted"
+```
+
+Semantics:
+
+- this endpoint is synchronous and does not return a future
+- success means the server has asked the action-session manager to shut down the bound runtime for `action_session_id`
+
 ## Client Namespace
 
 All Mint-only client helpers live under `mint.mint`.
@@ -94,3 +173,11 @@ Current helpers:
 - `mint.mint.interpolate_checkpoints_async(...)`
 - `mint.mint.forward_backward_reverse_kl(...)`
 - `mint.mint.forward_backward_reverse_kl_async(...)`
+
+This repo does not vendor the `mint.mint` action-session helper implementation.
+When those helpers are updated, they must mirror the server contract above for:
+
+- `MintCreateActionSessionRequest`
+- `MintCreateActionSessionResponse`
+- `MintActRequest`
+- `MintDeleteActionSessionResponse`
