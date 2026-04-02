@@ -4,6 +4,7 @@ import base64
 import io
 import json
 import logging
+import os
 import sys
 import time
 import traceback
@@ -43,6 +44,30 @@ def _tensor_to_numpy(tensor: dict[str, Any], *, dtype: np.dtype) -> np.ndarray:
     return arr
 
 
+def _resolve_fast_tokenizer_path(default_path: str) -> str:
+    override = (os.environ.get("MINT_OPENPI_FAST_TOKENIZER_PATH") or "").strip()
+    if override:
+        return override
+
+    hf_home = Path((os.environ.get("HF_HOME") or "").strip() or "/vePFS-Mindverse/share/huggingface")
+    repo_root = hf_home / "hub" / "models--physical-intelligence--fast"
+    refs_main = repo_root / "refs" / "main"
+    if refs_main.exists():
+        revision = refs_main.read_text(encoding="utf-8").strip()
+        if revision:
+            snapshot_dir = repo_root / "snapshots" / revision
+            if snapshot_dir.exists():
+                return str(snapshot_dir)
+
+    snapshots_dir = repo_root / "snapshots"
+    if snapshots_dir.exists():
+        snapshots = sorted(path for path in snapshots_dir.iterdir() if path.is_dir())
+        if snapshots:
+            return str(snapshots[-1])
+
+    return default_path
+
+
 class OpenPIFastActionSession:
     def __init__(self, payload: dict[str, Any]) -> None:
         import jax
@@ -75,7 +100,12 @@ class OpenPIFastActionSession:
             if config.model.fast_model_tokenizer is None
             else config.model.fast_model_tokenizer
         )
-        tokenizer_kwargs = {} if config.model.fast_model_tokenizer_kwargs is None else config.model.fast_model_tokenizer_kwargs
+        tokenizer_kwargs = {} if config.model.fast_model_tokenizer_kwargs is None else dict(config.model.fast_model_tokenizer_kwargs)
+        if tokenizer_cls is tokenizer_mod.FASTTokenizer:
+            tokenizer_kwargs.setdefault(
+                "fast_tokenizer_path",
+                _resolve_fast_tokenizer_path(tokenizer_kwargs.get("fast_tokenizer_path") or "physical-intelligence/fast"),
+            )
         self._tokenizer = tokenizer_cls(config.model.max_token_len, **tokenizer_kwargs)
         self._rng = jax.random.key(0)
 

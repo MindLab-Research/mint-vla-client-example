@@ -42,6 +42,33 @@ def _make_observation() -> ModelInput:
     )
 
 
+def test_openpi_fast_action_worker_prefers_env_tokenizer_override(monkeypatch, tmp_path: Path) -> None:
+    from tinker_server.backend.openpi_fast_action_worker import _resolve_fast_tokenizer_path
+
+    override = tmp_path / "fast-override"
+    override.mkdir()
+    monkeypatch.setenv("MINT_OPENPI_FAST_TOKENIZER_PATH", str(override))
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf-home"))
+
+    assert _resolve_fast_tokenizer_path("physical-intelligence/fast") == str(override)
+
+
+def test_openpi_fast_action_worker_prefers_local_fast_snapshot(monkeypatch, tmp_path: Path) -> None:
+    from tinker_server.backend.openpi_fast_action_worker import _resolve_fast_tokenizer_path
+
+    hf_home = tmp_path / "hf-home"
+    snapshot_dir = hf_home / "hub" / "models--physical-intelligence--fast" / "snapshots" / "rev-123"
+    snapshot_dir.mkdir(parents=True)
+    refs_dir = hf_home / "hub" / "models--physical-intelligence--fast" / "refs"
+    refs_dir.mkdir(parents=True)
+    (refs_dir / "main").write_text("rev-123", encoding="utf-8")
+
+    monkeypatch.delenv("MINT_OPENPI_FAST_TOKENIZER_PATH", raising=False)
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+
+    assert _resolve_fast_tokenizer_path("physical-intelligence/fast") == str(snapshot_dir)
+
+
 class _FakeTrainingRuntimeClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict | None]] = []

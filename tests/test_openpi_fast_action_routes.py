@@ -99,6 +99,19 @@ class _AsyncFakeFutureStore:
         self.cleaned.append(request_id)
 
 
+class _AsyncResolvingFutureStore(_AsyncFakeFutureStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.resolved: list[tuple[str, dict[str, object]]] = []
+        self.failed: list[tuple[str, str]] = []
+
+    async def async_resolve(self, request_id: str, payload: dict[str, object]) -> None:
+        self.resolved.append((request_id, payload))
+
+    async def async_fail(self, request_id: str, error: str) -> None:
+        self.failed.append((request_id, error))
+
+
 class _StubCapacityManager:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
@@ -339,6 +352,46 @@ def test_do_act_resolves_future_with_actions(monkeypatch) -> None:
     assert future_store.resolved == [
         (
             "req-1",
+            {
+                "actions": {
+                    "data": [0.0] * 28,
+                    "shape": [4, 7],
+                    "dtype": "float32",
+                },
+                "policy_timing": {"infer_ms": 8.0},
+                "type": "act",
+            },
+        )
+    ]
+    assert future_store.failed == []
+
+
+def test_do_act_prefers_async_future_store_api(monkeypatch) -> None:
+    from tinker_server.routes import action_sampling as action_routes
+    from tinker_server.models.types import ActRequest, EncodedTextChunk, ImageChunk, ModelInput, TensorData
+
+    manager = _FakeActionSessionManager()
+    future_store = _AsyncResolvingFutureStore()
+    monkeypatch.setattr(action_routes, "action_session_manager", manager, raising=False)
+    monkeypatch.setattr(action_routes, "future_store", future_store, raising=False)
+
+    request = ActRequest(
+        action_session_id="action-session-1",
+        observation=ModelInput(
+            chunks=[
+                ImageChunk(data=b"img", format="png", expected_tokens=256),
+                EncodedTextChunk(tokens=[1, 2, 3]),
+            ]
+        ),
+        extra_inputs={"state": TensorData(data=[0.0] * 8, shape=[8], dtype="float32")},
+    )
+
+    asyncio.run(action_routes._do_act("req-2", request))
+
+    assert manager.act_calls
+    assert future_store.resolved == [
+        (
+            "req-2",
             {
                 "actions": {
                     "data": [0.0] * 28,
