@@ -69,6 +69,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",
+    "trio>=0.33.0",
 ]
 
 [build-system]

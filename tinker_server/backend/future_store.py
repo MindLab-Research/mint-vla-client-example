@@ -499,12 +499,16 @@ def _get_or_create_ray_actor():
                 return
             self._pending.discard(request_id)
             self._refs.pop(request_id, None)
-            self._update_op_from_meta(request_id, self._meta.get(request_id))
-            self._meta.pop(request_id, None)
+            meta = dict(self._meta.get(request_id) or {})
+            self._update_op_from_meta(request_id, meta)
             import ray
 
             self._result_refs[request_id] = ray.put(result)
-            self._done_at[request_id] = time.time()
+            done_at = time.time()
+            self._done_at[request_id] = done_at
+            meta["final_status"] = FutureStatus.DONE.value
+            meta["done_at"] = done_at
+            self._meta[request_id] = meta
 
         def resolve_ref(self, request_id: str, ref: Any) -> None:
             self._prune()
@@ -531,10 +535,14 @@ def _get_or_create_ray_actor():
                 return
             self._pending.discard(request_id)
             self._refs.pop(request_id, None)
-            self._update_op_from_meta(request_id, self._meta.get(request_id))
-            self._meta.pop(request_id, None)
+            meta = dict(self._meta.get(request_id) or {})
+            self._update_op_from_meta(request_id, meta)
             self._errors[request_id] = error
-            self._done_at[request_id] = time.time()
+            done_at = time.time()
+            self._done_at[request_id] = done_at
+            meta["final_status"] = FutureStatus.FAILED.value
+            meta["done_at"] = done_at
+            self._meta[request_id] = meta
 
         def get_status(self, request_id: str) -> str:
             self._prune()
@@ -559,15 +567,23 @@ def _get_or_create_ray_actor():
                         result = ray.get(ref)
                         result = _sync_training_session_step(meta, result)
                         self._result_refs[request_id] = ray.put(result)
-                        self._done_at[request_id] = time.time()
+                        done_at = time.time()
+                        self._done_at[request_id] = done_at
                         self._refs.pop(request_id, None)
-                        self._meta.pop(request_id, None)
+                        next_meta = dict(meta or {})
+                        next_meta["final_status"] = FutureStatus.DONE.value
+                        next_meta["done_at"] = done_at
+                        self._meta[request_id] = next_meta
                         return FutureStatus.DONE.value
                     except Exception as e:
                         self._errors[request_id] = str(e)
-                        self._done_at[request_id] = time.time()
+                        done_at = time.time()
+                        self._done_at[request_id] = done_at
                         self._refs.pop(request_id, None)
-                        self._meta.pop(request_id, None)
+                        next_meta = dict(meta or {})
+                        next_meta["final_status"] = FutureStatus.FAILED.value
+                        next_meta["done_at"] = done_at
+                        self._meta[request_id] = next_meta
                         return FutureStatus.FAILED.value
             if request_id in self._pending:
                 return FutureStatus.PENDING.value
@@ -590,14 +606,35 @@ def _get_or_create_ray_actor():
             return self._meta.get(request_id)
 
         def cleanup(self, request_id: str) -> None:
+            terminal = (
+                request_id in self._result_refs
+                or request_id in self._errors
+                or request_id in self._expired_at
+                or request_id in self._retrieved_at
+            )
+            if not terminal:
+                self._forget(request_id)
+                return
             self._pending.discard(request_id)
             self._refs.pop(request_id, None)
-            self._meta.pop(request_id, None)
             self._created_at.pop(request_id, None)
             self._queued_at.pop(request_id, None)
             self._running_at.pop(request_id, None)
             self._expired_at.pop(request_id, None)
-            self._retrieved_at[request_id] = time.time()
+            retrieved_at = time.time()
+            self._retrieved_at[request_id] = retrieved_at
+            meta = dict(self._meta.get(request_id) or {})
+            if "done_at" not in meta and request_id in self._done_at:
+                meta["done_at"] = self._done_at[request_id]
+            if "final_status" not in meta:
+                if request_id in self._result_refs:
+                    meta["final_status"] = FutureStatus.DONE.value
+                elif request_id in self._errors:
+                    meta["final_status"] = FutureStatus.FAILED.value
+                elif request_id in self._expired_at:
+                    meta["final_status"] = FutureStatus.EXPIRED.value
+            meta["retrieved_at"] = retrieved_at
+            self._meta[request_id] = meta
 
         def fail_stale_running_requests(self, active_consumer_job_id: str, error: str) -> list[str]:
             self._prune()

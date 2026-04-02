@@ -37,6 +37,12 @@ def _parse_bool(s: str) -> bool:
     return str(s).strip().lower() in ("true", "1", "yes", "y", "on")
 
 
+def _default_future_replay_root_dir(*, auth_enabled: bool) -> str:
+    if auth_enabled:
+        return "/vePFS-Mindverse/share/mint-prod-data/future-replay"
+    return "/vePFS-Mindverse/share/mint-prod-dev/future-replay"
+
+
 def _load_config_file_for_process(environ: dict[str, str]) -> tuple[str | None, object | None]:
     path = _env_nonempty(environ, "TINKER_CONFIG_PATH")
     if not path:
@@ -333,6 +339,10 @@ class ServerConfig:
     future_store_queue_ttl_s: float = 7 * 86400.0
     future_store_done_ttl_s: float = 7200.0
     future_store_tombstone_ttl_s: float = 300.0
+    future_replay_root_dir: str = "/vePFS-Mindverse/share/mint-prod-dev/future-replay"
+    future_replay_hot_ttl_s: float = 60.0
+    future_replay_disk_ttl_s: float = 86400.0
+    future_replay_sweep_interval_s: float = 21600.0
 
     # Admission control + API work queue (issue #84)
     capacity_manager_actor_name: str = "tinker_capacity_manager"
@@ -385,6 +395,7 @@ class ServerConfig:
         api_key = environ.get("TINKER_API_KEY", "")
         token_secret_key = environ.get("TINKER_TOKEN_SECRET_KEY", "")
         # Auth disabled (dev mode) if neither api_key nor token_secret_key is set
+        auth_enabled = bool(api_key or token_secret_key)
         inactivity_s = environ.get("TINKER_SESSION_INACTIVITY_TIMEOUT_S") or environ.get("TINKER_INACTIVITY_TIMEOUT_S")
         file_server = config_file.server if config_file is not None else None
         file_sampling = config_file.sampling if config_file is not None else None
@@ -613,6 +624,26 @@ class ServerConfig:
                 "MINT_FUTURE_TOMBSTONE_TTL_S",
                 file_future_store.tombstone_ttl_s if file_future_store is not None else None,
                 300.0,
+            ),
+            future_replay_root_dir=_pick_str(
+                "MINT_FUTURE_REPLAY_ROOT_DIR",
+                file_future_store.replay_root_dir if file_future_store is not None else None,
+                _default_future_replay_root_dir(auth_enabled=auth_enabled),
+            ),
+            future_replay_hot_ttl_s=_pick_float(
+                "MINT_FUTURE_REPLAY_HOT_TTL_S",
+                file_future_store.replay_hot_ttl_s if file_future_store is not None else None,
+                60.0,
+            ),
+            future_replay_disk_ttl_s=_pick_float(
+                "MINT_FUTURE_REPLAY_DISK_TTL_S",
+                file_future_store.replay_disk_ttl_s if file_future_store is not None else None,
+                86400.0,
+            ),
+            future_replay_sweep_interval_s=_pick_float(
+                "MINT_FUTURE_REPLAY_SWEEP_INTERVAL_S",
+                file_future_store.replay_sweep_interval_s if file_future_store is not None else None,
+                21600.0,
             ),
             # Admission control + API work queue (issue #84)
             capacity_manager_actor_name=_pick_str(
