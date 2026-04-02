@@ -91,6 +91,20 @@ def _ray_api_work_queue_actor_name() -> str:
     return str(getattr(server_config, "api_work_queue_actor_name", "tinker_api_work_queue"))
 
 
+def _api_work_queue_actor_resources() -> dict[str, float] | None:
+    pinned_ip = str(os.environ.get("MINT_API_WORK_QUEUE_PINNED_NODE_IP") or "").strip()
+    if pinned_ip:
+        return {f"node:{pinned_ip}": 0.001}
+    try:
+        import ray
+
+        if "node:__internal_head__" in ray.cluster_resources():
+            return {"node:__internal_head__": 0.001}
+    except Exception:
+        return None
+    return None
+
+
 @dataclass(frozen=True)
 class WorkItem:
     request_id: str
@@ -1112,12 +1126,7 @@ def _create_ray_actor():
     # Keep the detached queue actor on the head node when possible. Losing this
     # actor drops all queued items (in-memory queue), which can leave futures
     # pending forever.
-    resources = None
-    try:
-        if "node:__internal_head__" in ray.cluster_resources():
-            resources = {"node:__internal_head__": 0.001}
-    except Exception:
-        resources = None
+    resources = _api_work_queue_actor_resources()
 
     options: dict[str, Any] = {
         "name": actor_name,
@@ -1471,7 +1480,7 @@ class ApiWorkQueueClient:
     ) -> None:
         import ray
 
-        actor = self._get_cached_ray_actor_for_async_request_path()
+        actor = await self._get_ray_actor_async()
         tracer = get_otel_tracer()
         producer_job_id = None
         try:

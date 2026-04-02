@@ -69,6 +69,38 @@ def test_openpi_fast_action_worker_prefers_local_fast_snapshot(monkeypatch, tmp_
     assert _resolve_fast_tokenizer_path("physical-intelligence/fast") == str(snapshot_dir)
 
 
+def test_openpi_fast_action_worker_captures_non_protocol_stdout(monkeypatch) -> None:
+    import tinker_server.backend.openpi_fast_action_worker as worker_module
+
+    def _fake_dispatch(session, op, payload):
+        _ = session, op, payload
+        print("Tokens: [1, 2, 3]")
+        return {"ok": True}, None
+
+    warnings: list[str] = []
+
+    monkeypatch.setattr(worker_module, "_dispatch", _fake_dispatch)
+    monkeypatch.setattr(worker_module.logger, "warning", lambda msg, *args: warnings.append(msg % args if args else msg))
+
+    payload, session = worker_module._dispatch_with_protocol_stdout(None, "act", {})
+
+    assert payload == {"ok": True}
+    assert session is None
+    assert warnings == ["Suppressed non-protocol stdout from OpenPI FAST action worker: Tokens: [1, 2, 3]"]
+
+
+def test_openpi_fast_action_worker_reply_prefers_protocol_stream(monkeypatch) -> None:
+    import io
+    import tinker_server.backend.openpi_fast_action_worker as worker_module
+
+    protocol_stream = io.StringIO()
+    monkeypatch.setattr(worker_module, "_PROTOCOL_STDOUT", protocol_stream)
+
+    worker_module._reply({"ok": True})
+
+    assert protocol_stream.getvalue() == '{"ok": true}\n'
+
+
 class _FakeTrainingRuntimeClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict | None]] = []

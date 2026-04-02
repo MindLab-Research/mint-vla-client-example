@@ -68,6 +68,95 @@ async def test_issue_444_api_work_queue_rebinds_active_job_id_when_actor_recreat
     assert calls == [("set_active_job_id", "consumer-123")]
 
 
+@pytest.mark.anyio
+async def test_issue_444_api_work_queue_enqueue_reacquires_actor(monkeypatch) -> None:
+    api_work_queue_module = importlib.import_module("tinker_server.backend.api_work_queue")
+
+    client = api_work_queue_module.ApiWorkQueueClient()
+    stale_actor = object()
+    client._ray_actor = stale_actor
+
+    enqueue_calls: list[tuple[dict[str, object], str | None]] = []
+
+    class _FreshActor:
+        class _EnqueueRemote:
+            def remote(self, item: dict[str, object], producer_job_id: str | None):
+                enqueue_calls.append((item, producer_job_id))
+                return {"ok": True}
+
+        @property
+        def enqueue(self):
+            return self._EnqueueRemote()
+
+    fresh_actor = _FreshActor()
+    reacquire_calls: list[str] = []
+
+    async def _get_ray_actor_async():
+        reacquire_calls.append("reacquired")
+        return fresh_actor
+
+    async def _await_ref(ref, *, timeout_s: float | None = None):
+        _ = timeout_s
+        return ref
+
+    monkeypatch.setattr(client, "_get_ray_actor_async", _get_ray_actor_async)
+    monkeypatch.setattr(client, "_await_ray_ref", _await_ref)
+    monkeypatch.setattr(api_work_queue_module, "get_otel_tracer", lambda: None)
+
+    await client.enqueue(
+        request_id="rid-1",
+        op="mint.action.act",
+        request_json=b"{}",
+        user_id=None,
+        webhook_url=None,
+    )
+
+    assert reacquire_calls == ["reacquired"]
+    assert len(enqueue_calls) == 1
+    item, producer_job_id = enqueue_calls[0]
+    assert item["request_id"] == "rid-1"
+    assert item["op"] == "mint.action.act"
+    assert isinstance(producer_job_id, str) and producer_job_id
+
+
+@pytest.mark.anyio
+async def test_issue_444_future_store_async_create_reacquires_actor(monkeypatch) -> None:
+    future_store_module = importlib.import_module("tinker_server.backend.future_store")
+
+    store = future_store_module.FutureStore()
+    store._ray_actor = object()
+    add_pending_calls: list[str] = []
+
+    class _FreshActor:
+        class _AddPendingRemote:
+            def remote(self, request_id: str):
+                add_pending_calls.append(request_id)
+                return None
+
+        @property
+        def add_pending(self):
+            return self._AddPendingRemote()
+
+    fresh_actor = _FreshActor()
+    reacquire_calls: list[str] = []
+
+    async def _get_ray_actor_async():
+        reacquire_calls.append("reacquired")
+        return fresh_actor
+
+    async def _await_ref(ref):
+        return ref
+
+    monkeypatch.setattr(store, "_get_ray_actor_async", _get_ray_actor_async)
+    monkeypatch.setattr(future_store_module, "_await_ray_ref", _await_ref)
+
+    request_id = await store.async_create_with_id("rid-fs-1")
+
+    assert request_id == "rid-fs-1"
+    assert reacquire_calls == ["reacquired"]
+    assert add_pending_calls == ["rid-fs-1"]
+
+
 def test_issue_444_queue_actor_name_prefers_env_overrides(monkeypatch) -> None:
     api_work_queue_module = importlib.import_module("tinker_server.backend.api_work_queue")
 
@@ -83,17 +172,35 @@ def test_issue_444_queue_actor_name_prefers_env_overrides(monkeypatch) -> None:
     assert api_work_queue_module._ray_api_work_queue_actor_name() == "from-tinker-env"
 
 
+def test_issue_444_queue_actor_resources_prefers_pinned_node_ip(monkeypatch) -> None:
+    api_work_queue_module = importlib.import_module("tinker_server.backend.api_work_queue")
+
+    class _RayStub:
+        @staticmethod
+        def cluster_resources():
+            return {"node:__internal_head__": 1.0}
+
+    monkeypatch.setitem(sys.modules, "ray", _RayStub)
+    monkeypatch.delenv("MINT_API_WORK_QUEUE_PINNED_NODE_IP", raising=False)
+    assert api_work_queue_module._api_work_queue_actor_resources() == {"node:__internal_head__": 0.001}
+
+    monkeypatch.setenv("MINT_API_WORK_QUEUE_PINNED_NODE_IP", "192.168.38.176")
+    assert api_work_queue_module._api_work_queue_actor_resources() == {"node:192.168.38.176": 0.001}
+
+
 def test_issue_444_queue_execution_runtime_forwards_runtime_contract_env(monkeypatch) -> None:
     queue_execution_runtime_module = importlib.import_module("tinker_server.backend.queue_execution_runtime")
 
     monkeypatch.delenv("TINKER_API_WORK_QUEUE_ACTOR_NAME", raising=False)
     monkeypatch.delenv("MINT_API_WORK_QUEUE_ACTOR_NAME", raising=False)
     monkeypatch.delenv("MINT_MODEL_NODE_IPS_JSON", raising=False)
+    monkeypatch.delenv("MINT_API_WORK_QUEUE_PINNED_NODE_IP", raising=False)
     monkeypatch.delenv("OPENPI_DATA_HOME", raising=False)
     monkeypatch.delenv("MINT_OPENPI_FAST_WEIGHTS_PATH", raising=False)
     monkeypatch.setenv("TINKER_RAY_NAMESPACE", "ns-test")
     monkeypatch.setenv("TINKER_API_WORK_QUEUE_ACTOR_NAME", "queue-custom")
     monkeypatch.setenv("MINT_MODEL_NODE_IPS_JSON", '{"openpi/pi0-fast-libero-low-mem-finetune":["192.168.38.176"]}')
+    monkeypatch.setenv("MINT_API_WORK_QUEUE_PINNED_NODE_IP", "192.168.38.176")
     monkeypatch.setenv("OPENPI_DATA_HOME", "/tmp/openpi-data")
     monkeypatch.setenv("MINT_OPENPI_FAST_WEIGHTS_PATH", "/tmp/pi0-fast-weights")
 
@@ -102,6 +209,7 @@ def test_issue_444_queue_execution_runtime_forwards_runtime_contract_env(monkeyp
     assert overrides["TINKER_RAY_NAMESPACE"] == "ns-test"
     assert overrides["TINKER_API_WORK_QUEUE_ACTOR_NAME"] == "queue-custom"
     assert overrides["MINT_MODEL_NODE_IPS_JSON"] == '{"openpi/pi0-fast-libero-low-mem-finetune":["192.168.38.176"]}'
+    assert overrides["MINT_API_WORK_QUEUE_PINNED_NODE_IP"] == "192.168.38.176"
     assert overrides["OPENPI_DATA_HOME"] == "/tmp/openpi-data"
     assert overrides["MINT_OPENPI_FAST_WEIGHTS_PATH"] == "/tmp/pi0-fast-weights"
     assert "MINT_API_WORK_QUEUE_ACTOR_NAME" not in overrides

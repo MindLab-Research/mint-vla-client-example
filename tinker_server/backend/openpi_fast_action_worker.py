@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import io
 import json
 import logging
@@ -18,11 +19,22 @@ from .openpi_fast_runtime import OPENPI_FAST_WORKER_PROTOCOL_VERSION
 
 
 logger = logging.getLogger(__name__)
+_PROTOCOL_STDOUT = None
+
+
+def _install_protocol_stdout_redirect() -> None:
+    global _PROTOCOL_STDOUT
+    if _PROTOCOL_STDOUT is not None:
+        return
+    protocol_fd = os.dup(sys.stdout.fileno())
+    _PROTOCOL_STDOUT = os.fdopen(protocol_fd, "w", buffering=1, encoding="utf-8", closefd=True)
+    os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
 
 
 def _reply(message: dict[str, Any]) -> None:
-    sys.stdout.write(json.dumps(message) + "\n")
-    sys.stdout.flush()
+    stream = _PROTOCOL_STDOUT or sys.stdout
+    stream.write(json.dumps(message) + "\n")
+    stream.flush()
 
 
 def _decode_image(encoded: dict[str, Any]) -> np.ndarray:
@@ -183,7 +195,20 @@ def _dispatch(session: OpenPIFastActionSession | None, op: str, payload: dict[st
     raise ValueError(f"Unknown OpenPI FAST action worker op: {op}")
 
 
+def _dispatch_with_protocol_stdout(
+    session: OpenPIFastActionSession | None, op: str, payload: dict[str, Any]
+) -> tuple[dict[str, Any], OpenPIFastActionSession | None]:
+    capture = io.StringIO()
+    with contextlib.redirect_stdout(capture):
+        response, next_session = _dispatch(session, op, payload)
+    extra_stdout = capture.getvalue().strip()
+    if extra_stdout:
+        logger.warning("Suppressed non-protocol stdout from OpenPI FAST action worker: %s", extra_stdout)
+    return response, next_session
+
+
 def main() -> None:
+    _install_protocol_stdout_redirect()
     logging.basicConfig(level=logging.INFO)
     _reply({"event": "ready", "protocol_version": OPENPI_FAST_WORKER_PROTOCOL_VERSION})
 
@@ -194,7 +219,7 @@ def main() -> None:
         request = json.loads(line)
         request_id = request["id"]
         try:
-            payload, session = _dispatch(session, request["op"], request.get("payload", {}))
+            payload, session = _dispatch_with_protocol_stdout(session, request["op"], request.get("payload", {}))
             _reply({"id": request_id, "ok": True, "payload": payload})
             if request["op"] == "shutdown":
                 break
