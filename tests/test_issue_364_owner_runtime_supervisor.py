@@ -14,6 +14,9 @@ def test_issue_364_future_reaper_once_releases_capacity(monkeypatch) -> None:
     released: list[str] = []
 
     class _FakeFutureStore:
+        async def async_ensure_ready(self) -> dict:
+            return {"ok": True}
+
         async def async_reap(self) -> dict:
             return {"expired": ["req-expired"], "timed_out": ["req-timeout"]}
 
