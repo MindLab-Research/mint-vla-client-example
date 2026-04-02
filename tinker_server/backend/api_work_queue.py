@@ -82,6 +82,12 @@ def _ray_namespace() -> str:
 
 
 def _ray_api_work_queue_actor_name() -> str:
+    env_value = (
+        os.environ.get("TINKER_API_WORK_QUEUE_ACTOR_NAME")
+        or os.environ.get("MINT_API_WORK_QUEUE_ACTOR_NAME")
+    )
+    if env_value:
+        return str(env_value)
     return str(getattr(server_config, "api_work_queue_actor_name", "tinker_api_work_queue"))
 
 
@@ -1238,6 +1244,17 @@ class ApiWorkQueueClient:
         except Exception as e:
             raise ApiWorkQueueUnavailableError("Ray import failed") from e
 
+        async def _ensure_active_job_binding(actor: Any, *, timeout_s: float) -> None:
+            if self._consumer_job_id is None:
+                return
+            state = await self._await_ray_ref(actor.debug_state.remote(), timeout_s=timeout_s)
+            if not isinstance(state, dict):
+                raise TypeError(f"ApiWorkQueue.debug_state returned non-dict: {type(state)}")
+            if state.get("active_job_id") == self._consumer_job_id:
+                return
+            ref = actor.set_active_job_id.remote(self._consumer_job_id)
+            await self._await_ray_ref(ref, timeout_s=timeout_s)
+
         if not ray.is_initialized():
             try:
                 from ..ray_utils import init_ray
@@ -1252,6 +1269,7 @@ class ApiWorkQueueClient:
         if self._ray_actor is not None:
             try:
                 await self._await_ray_ref(self._ray_actor.stats.remote(), timeout_s=1.0)
+                await _ensure_active_job_binding(self._ray_actor, timeout_s=5.0)
                 return self._ray_actor
             except Exception:
                 self._ray_actor = None
@@ -1267,6 +1285,7 @@ class ApiWorkQueueClient:
         try:
             actor = ray.get_actor(actor_name, namespace=_ray_namespace())
             await self._await_ray_ref(actor.stats.remote(), timeout_s=probe_timeout_s)
+            await _ensure_active_job_binding(actor, timeout_s=max(5.0, probe_timeout_s))
             self._ray_actor = actor
             return actor
         except ValueError:
@@ -1309,6 +1328,7 @@ class ApiWorkQueueClient:
 
         try:
             self._ray_actor = _create_ray_actor()
+            await _ensure_active_job_binding(self._ray_actor, timeout_s=max(5.0, probe_timeout_s))
         except Exception as e:
             raise ApiWorkQueueUnavailableError("Failed to get/create detached Ray ApiWorkQueue actor") from e
         return self._ray_actor

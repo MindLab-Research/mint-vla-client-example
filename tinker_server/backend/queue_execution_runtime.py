@@ -17,10 +17,25 @@ def _runtime_env_overrides() -> dict[str, str]:
     keys = (
         "MINT_QUEUE_EXECUTION_RUNTIME_ACTOR_NAME",
         "MINT_QUEUE_SUPERVISOR_ACTOR_NAME",
+        "TINKER_API_WORK_QUEUE_ACTOR_NAME",
         "MINT_API_WORK_QUEUE_ACTOR_NAME",
         "MINT_OWNER_RUNTIME_SUPERVISOR_ACTOR_NAME",
         "MINT_TRAINING_CLEANUP_EXECUTOR_ACTOR_NAME",
         "MINT_SAMPLING_CLEANUP_EXECUTOR_ACTOR_NAME",
+        "MINT_SUPPORTED_MODELS",
+        "TINKER_SUPPORTED_MODELS",
+        "ALLOW_UNSUPPORTED_MODELS",
+        "TINKER_ENABLE_MULTI_LORA",
+        "MINT_MODEL_NODE_IPS_JSON",
+        "MINT_DENSE_MODEL_NODE_IPS_JSON",
+        "MINT_MEGATRON_MODEL_NODE_IPS_JSON",
+        "MINT_VLLM_MODEL_NODE_IPS_JSON",
+        "MINT_VLLM_PINNED_NODE_IP_JSON",
+        "HF_HOME",
+        "HF_HUB_OFFLINE",
+        "OPENPI_DATA_HOME",
+        "XDG_CACHE_HOME",
+        "TMPDIR",
         "TINKER_RAY_NAMESPACE",
         "MINT_RAY_NAMESPACE",
     )
@@ -29,6 +44,9 @@ def _runtime_env_overrides() -> dict[str, str]:
         value = os.environ.get(key, "").strip()
         if value:
             out[key] = value
+    for key, value in os.environ.items():
+        if key.startswith("MINT_OPENPI_") and value.strip():
+            out[key] = value.strip()
     return out
 
 

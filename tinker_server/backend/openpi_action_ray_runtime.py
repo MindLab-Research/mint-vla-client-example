@@ -106,6 +106,12 @@ def _single_node_actor_options(*, base_model: str, actor_name: str) -> dict[str,
     }
 
 
+async def _pool_call(method_name: str, *args: Any, **kwargs: Any) -> Any:
+    pool = get_resource_pool()
+    method = getattr(pool, method_name)
+    return await asyncio.to_thread(method, *args, **kwargs)
+
+
 @ray.remote(num_gpus=1, max_concurrency=1)
 class OpenPIActionRayRuntimeActor:
     def __init__(
@@ -234,25 +240,24 @@ class OpenPIActionRayRuntimeClient:
         if self._closed:
             raise OpenPIFastWorkerProtocolError("OpenPI action Ray runtime client is closed")
 
-        pool = get_resource_pool()
-        pool.mark_inflight(self._actor_name, +1)
+        await _pool_call("mark_inflight", self._actor_name, +1)
         try:
             result = await self._ray_get(
                 self._actor.request.remote(op, payload or {}, timeout_s=timeout_s),
                 timeout_s=timeout_s,
             )
         finally:
-            pool.mark_inflight(self._actor_name, -1)
+            await _pool_call("mark_inflight", self._actor_name, -1)
 
         if not isinstance(result, dict):
             raise TypeError(
                 f"OpenPI action Ray runtime request returned non-dict payload: {type(result)}"
             )
         if op == "shutdown":
-            pool.set_session(self._actor_name, None)
+            await _pool_call("set_session", self._actor_name, None)
         else:
-            pool.set_session(self._actor_name, self._action_session_id)
-        pool.touch(self._actor_name)
+            await _pool_call("set_session", self._actor_name, self._action_session_id)
+        await _pool_call("touch", self._actor_name)
         return result
 
     async def describe(self) -> dict[str, Any]:
@@ -286,7 +291,7 @@ class OpenPIActionRayRuntimeClient:
                 type(exc).__name__,
                 exc,
             )
-        get_resource_pool().unregister(self._actor_name)
+        await _pool_call("unregister", self._actor_name)
 
 
 async def start_openpi_action_ray_runtime(
@@ -328,8 +333,8 @@ async def start_openpi_action_ray_runtime(
         await client.close()
         raise
 
-    pool = get_resource_pool()
-    pool.register(
+    await _pool_call(
+        "register",
         actor_name=actor_name,
         actor_type=ActorType.OPENPI,
         num_gpus=1,
@@ -347,6 +352,6 @@ async def start_openpi_action_ray_runtime(
             "cuda_visible_devices": metadata.get("cuda_visible_devices"),
         },
     )
-    pool.mark_ready(actor_name)
-    pool.touch(actor_name)
+    await _pool_call("mark_ready", actor_name)
+    await _pool_call("touch", actor_name)
     return client

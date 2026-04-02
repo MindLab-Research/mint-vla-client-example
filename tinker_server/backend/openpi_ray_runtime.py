@@ -20,15 +20,18 @@ from .openpi_fast_runtime import (
 logger = logging.getLogger(__name__)
 
 
+from ..config import actor_runtime_env_vars
+
 def _openpi_runtime_env_vars() -> dict[str, str]:
-    env_vars = {
-        "PYTHONPATH": PFS_PYTHONPATH,
-        "PYTHONDONTWRITEBYTECODE": "1",
-    }
+    extra = {"PYTHONDONTWRITEBYTECODE": "1"}
     for key, value in os.environ.items():
         if key.startswith("MINT_OPENPI_"):
-            env_vars[key] = value
-    return env_vars
+            extra[key] = value
+    for key in ("HF_HOME", "HF_HUB_OFFLINE", "OPENPI_DATA_HOME"):
+        value = os.environ.get(key, "").strip()
+        if value:
+            extra[key] = value
+    return actor_runtime_env_vars(pythonpath=PFS_PYTHONPATH, extra=extra)
 
 
 def ensure_openpi_ray_initialized() -> None:

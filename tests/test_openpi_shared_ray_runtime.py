@@ -64,7 +64,19 @@ def _reset_shared_runtime_test_state(monkeypatch, openpi_shared_ray_runtime) -> 
             register=lambda **_kwargs: None,
             mark_ready=lambda *_args, **_kwargs: None,
             touch=lambda *_args, **_kwargs: None,
+            mark_inflight=lambda *_args, **_kwargs: None,
+            set_session=lambda *_args, **_kwargs: None,
         ),
+    )
+    monkeypatch.setattr(
+        openpi_shared_ray_runtime,
+        "_openpi_runtime_env_vars",
+        lambda: {
+            "PYTHONPATH": "/runtime/site-packages:/repo:/hf",
+            "PFS_RUNTIME_ENV_ROOT": "/runtime",
+            "PFS_TINKER_PATH": "/repo",
+            "PFS_HF_MODULES_PATH": "/hf",
+        },
     )
     monkeypatch.setattr(openpi_shared_ray_runtime.ray, "is_initialized", lambda: False)
     openpi_shared_ray_runtime.clear_openpi_shared_runtime_pool()

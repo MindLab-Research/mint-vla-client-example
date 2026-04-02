@@ -170,7 +170,7 @@ def _drop_shared_actor_entry(actor_name: str, *, actor: Any | None = None) -> _S
 
 async def _cleanup_failed_shared_actor_start(*, actor_name: str, actor: Any) -> list[str]:
     errors: list[str] = []
-    get_resource_pool().unregister(actor_name)
+    await _pool_call("unregister", actor_name)
     if not ray.is_initialized():
         return errors
 
@@ -187,6 +187,12 @@ async def _cleanup_failed_shared_actor_start(*, actor_name: str, actor: Any) -> 
             f"OpenPI shared actor kill failed for {actor_name}: {type(exc).__name__}: {exc}"
         )
     return errors
+
+
+async def _pool_call(method_name: str, *args: Any, **kwargs: Any) -> Any:
+    pool = get_resource_pool()
+    method = getattr(pool, method_name)
+    return await asyncio.to_thread(method, *args, **kwargs)
 
 
 class OpenPISharedRuntimeCore:
@@ -504,10 +510,11 @@ class OpenPISharedRayRuntimeClient:
         timeout_s: float | None = None,
     ) -> dict[str, Any]:
         if self._closed:
-            raise OpenPIFastWorkerProtocolError("OpenPI shared Ray runtime client is closed")
+            raise OpenPIFastWorkerProtocolError(
+                f"OpenPI shared Ray runtime client is closed for session {self._session_id!r}"
+            )
 
-        pool = get_resource_pool()
-        pool.mark_inflight(self._actor_name, +1)
+        await _pool_call("mark_inflight", self._actor_name, +1)
         try:
             if op == "create_session":
                 ref = self._actor.register_session.remote(self._session_id, payload or {})
@@ -520,7 +527,7 @@ class OpenPISharedRayRuntimeClient:
                 )
             result = await self._ray_get(ref, timeout_s=timeout_s)
         finally:
-            pool.mark_inflight(self._actor_name, -1)
+            await _pool_call("mark_inflight", self._actor_name, -1)
 
         if not isinstance(result, dict):
             raise TypeError(
@@ -529,10 +536,10 @@ class OpenPISharedRayRuntimeClient:
         if op == "create_session":
             self._bootstrap_session_pending = False
         if op == "shutdown":
-            pool.set_session(self._actor_name, None)
+            await _pool_call("set_session", self._actor_name, None)
         else:
-            pool.set_session(self._actor_name, self._session_id)
-        pool.touch(self._actor_name)
+            await _pool_call("set_session", self._actor_name, self._session_id)
+        await _pool_call("touch", self._actor_name)
         return result
 
     async def describe(self) -> dict[str, Any]:
@@ -639,8 +646,8 @@ async def start_openpi_shared_ray_runtime(
         if current is not None:
             current.metadata = dict(metadata)
 
-    pool = get_resource_pool()
-    pool.register(
+    await _pool_call(
+        "register",
         actor_name=actor_name,
         actor_type=ActorType.OPENPI,
         num_gpus=1,
@@ -658,6 +665,6 @@ async def start_openpi_shared_ray_runtime(
             "cuda_visible_devices": metadata.get("cuda_visible_devices"),
         },
     )
-    pool.mark_ready(actor_name)
-    pool.touch(actor_name)
+    await _pool_call("mark_ready", actor_name)
+    await _pool_call("touch", actor_name)
     return client

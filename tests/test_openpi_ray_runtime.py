@@ -10,6 +10,24 @@ def _reload_openpi_ray_runtime(monkeypatch):
     import tinker_server.config as config
 
     monkeypatch.setattr(config, "PFS_PYTHONPATH", "/runtime/site-packages:/repo:/hf")
+    monkeypatch.setattr(config, "PFS_RUNTIME_ENV_ROOT", "/runtime")
+    monkeypatch.setattr(config, "PFS_TINKER_PATH", "/repo")
+    monkeypatch.setattr(config, "PFS_HF_MODULES_PATH", "/hf")
+
+    def _fake_actor_runtime_env_vars(*, pythonpath: str, extra: dict[str, str] | None = None) -> dict[str, str]:
+        out = {
+            "PFS_RUNTIME_ENV_ROOT": "/runtime",
+            "PFS_TINKER_PATH": "/repo",
+            "PFS_HF_MODULES_PATH": "/hf",
+            "RAY_ADDRESS": "auto",
+            "TINKER_RAY_NAMESPACE": "tinker",
+            "PYTHONPATH": pythonpath,
+        }
+        if extra:
+            out.update(extra)
+        return out
+
+    monkeypatch.setattr(config, "actor_runtime_env_vars", _fake_actor_runtime_env_vars)
     import tinker_server.backend.openpi_ray_runtime as openpi_ray_runtime
 
     return importlib.reload(openpi_ray_runtime)
@@ -33,14 +51,23 @@ def test_openpi_ray_runtime_env_vars_forward_mint_openpi_overrides(monkeypatch) 
 
     monkeypatch.setenv("MINT_OPENPI_FAST_WEIGHTS_PATH", "/tmp/fast-weights")
     monkeypatch.setenv("MINT_OPENPI_PI05_ASSETS_BASE_DIR", "/tmp/pi05-assets")
+    monkeypatch.setenv("HF_HOME", "/tmp/hf-home")
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setenv("OPENPI_DATA_HOME", "/tmp/openpi-data")
     monkeypatch.setenv("UNRELATED_ENV", "ignore-me")
 
     env_vars = openpi_ray_runtime._openpi_runtime_env_vars()
 
     assert env_vars["MINT_OPENPI_FAST_WEIGHTS_PATH"] == "/tmp/fast-weights"
     assert env_vars["MINT_OPENPI_PI05_ASSETS_BASE_DIR"] == "/tmp/pi05-assets"
-    assert "UNRELATED_ENV" not in env_vars
+    assert env_vars["HF_HOME"] == "/tmp/hf-home"
+    assert env_vars["HF_HUB_OFFLINE"] == "1"
+    assert env_vars["OPENPI_DATA_HOME"] == "/tmp/openpi-data"
     assert env_vars["PYTHONPATH"] == "/runtime/site-packages:/repo:/hf"
+    assert env_vars["PFS_RUNTIME_ENV_ROOT"] == "/runtime"
+    assert env_vars["PFS_TINKER_PATH"] == "/repo"
+    assert env_vars["PFS_HF_MODULES_PATH"] == "/hf"
+    assert "UNRELATED_ENV" not in env_vars
 
 
 def test_openpi_ray_actor_ready_timeout_defaults_to_extended_budget(monkeypatch) -> None:

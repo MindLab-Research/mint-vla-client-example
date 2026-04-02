@@ -13,6 +13,15 @@ from tinker_server.models.types import EncodedTextChunk, ImageChunk, ModelInput,
 OPENPI_FAST_MODEL = "openpi/pi0-fast-libero-low-mem-finetune"
 
 
+def _fake_openpi_actor_env() -> dict[str, str]:
+    return {
+        "PYTHONPATH": "/runtime/site-packages:/repo:/hf",
+        "PFS_RUNTIME_ENV_ROOT": "/runtime",
+        "PFS_TINKER_PATH": "/repo",
+        "PFS_HF_MODULES_PATH": "/hf",
+    }
+
+
 def _make_session() -> TrainingSession:
     return TrainingSession(
         model_id="model-1",
@@ -294,6 +303,7 @@ def test_start_openpi_action_ray_runtime_registers_actor_metadata_in_resource_po
     monkeypatch.setattr(openpi_action_ray_runtime, "OpenPIActionRayRuntimeActor", _FakeActorBuilder())
     monkeypatch.setattr(openpi_action_ray_runtime, "OpenPIActionRayRuntimeClient", _FakeClient)
     monkeypatch.setattr(openpi_action_ray_runtime, "get_resource_pool", lambda: _FakePool())
+    monkeypatch.setattr(openpi_action_ray_runtime, "_openpi_runtime_env_vars", _fake_openpi_actor_env)
 
     client = asyncio.run(
         openpi_action_ray_runtime.start_openpi_action_ray_runtime(
@@ -360,6 +370,7 @@ def test_start_openpi_action_ray_runtime_applies_single_node_pin(monkeypatch) ->
     monkeypatch.setattr(openpi_action_ray_runtime, "OpenPIActionRayRuntimeActor", _FakeActorBuilder())
     monkeypatch.setattr(openpi_action_ray_runtime, "OpenPIActionRayRuntimeClient", _FakeClient)
     monkeypatch.setattr(openpi_action_ray_runtime, "get_resource_pool", lambda: _FakePool())
+    monkeypatch.setattr(openpi_action_ray_runtime, "_openpi_runtime_env_vars", _fake_openpi_actor_env)
     monkeypatch.setattr(
         openpi_action_ray_runtime,
         "parse_model_node_ip_list",
