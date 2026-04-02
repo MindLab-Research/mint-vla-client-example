@@ -5426,6 +5426,8 @@ class MegatronWorkerGroup:
         self._session_manager = MegatronSessionStateManager()  # Issue #44: session state management
         self._master_addr: str | None = None
         self._master_port: int | None = None
+        self._placement_bundle_node_ips: list[str | None] = []
+        self._placement_requested_node_ips: list[str] = []
 
         self._initialize()
 
@@ -5553,6 +5555,12 @@ class MegatronWorkerGroup:
                     cpu_per_gpu=1,
                 )
                 logger.info(f"[MegatronWorkerGroup] Model placement preferred nodes={node_ips}")
+        self._placement_bundle_node_ips = [_bundle_node_ip(bundle) for bundle in bundles]
+        self._placement_requested_node_ips = [ip for ip in self._placement_bundle_node_ips if ip is not None]
+        logger.info(
+            f"[MegatronWorkerGroup] Placement bundle node IPs={self._placement_bundle_node_ips}"
+        )
+
         # PACK: try to colocate but allow multi-node for large models (K2: 16+ GPUs)
         # STRICT_PACK would require single node, blocking on 8-GPU nodes
         pg_name = _make_megatron_pg_name(self.base_model)
@@ -5640,6 +5648,7 @@ class MegatronWorkerGroup:
                     placement_group=self.placement_group,
                     placement_group_bundle_index=0,
                 ),
+                resources=_node_affinity_resources(self._placement_bundle_node_ips[0]),
                 runtime_env=runtime_env,
             ).remote()
         )
@@ -5658,6 +5667,7 @@ class MegatronWorkerGroup:
                     placement_group=self.placement_group,
                     placement_group_bundle_index=rank,
                 ),
+                resources=_node_affinity_resources(self._placement_bundle_node_ips[rank]),
                 runtime_env=runtime_env,
             ).remote(
                 rank=rank,
@@ -7017,6 +7027,8 @@ class MegatronWorkerGroup:
             "num_workers": len(self.workers),
             "base_model": self.base_model,
             "lora_rank": self.lora_rank,
+            "placement_bundle_node_ips": list(self._placement_bundle_node_ips),
+            "placement_requested_node_ips": list(dict.fromkeys(self._placement_requested_node_ips)),
         }
 
 
@@ -7409,7 +7421,7 @@ def get_or_create_megatron_worker_group(
         # Heal a common invariant violation: a detached Megatron placement group can outlive the
         # named actor (e.g., crash during initialization). The orphan PG reserves GPUs, which can
         # make ensure_gpus_available() block forever even though nothing is actually running.
-        pg_name = f"{actor_name}_pg"
+        pg_name = _make_megatron_pg_name(base_model)
         try:
             orphan_pg = ray.util.get_placement_group(pg_name)
         except ValueError:
@@ -7615,7 +7627,7 @@ def kill_megatron_actor(base_model: str | None = None) -> bool:
     killed_any = False
 
     def _remove_detached_pg(actor_name: str) -> None:
-        pg_name = f"{actor_name}_pg"
+        pg_name = _make_megatron_pg_name_from_actor_name(actor_name)
         try:
             pg = ray.util.get_placement_group(pg_name)
         except ValueError:

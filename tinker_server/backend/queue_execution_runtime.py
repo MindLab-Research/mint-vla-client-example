@@ -25,6 +25,13 @@ def _runtime_env_overrides() -> dict[str, str]:
         "MINT_SAMPLING_CLEANUP_EXECUTOR_ACTOR_NAME",
         "TINKER_RAY_NAMESPACE",
         "MINT_RAY_NAMESPACE",
+        "MINT_VLLM_PINNED_NODE_IP_JSON",
+        "MINT_DENSE_MODEL_NODE_IPS_JSON",
+        "MINT_MODEL_NODE_IPS_JSON",
+        "MINT_VLLM_MODEL_NODE_IPS_JSON",
+        "MINT_MEGATRON_MODEL_NODE_IPS_JSON",
+        "MINT_MEGATRON_NODE_IPS_CSV",
+        "MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID",
     )
     for key in direct_keys:
         value = os.environ.get(key, "").strip()
