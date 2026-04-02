@@ -56,10 +56,10 @@ def run_future_reaper_once() -> dict[str, Any]:
     from .capacity_manager import capacity_manager
     from .future_store import future_store
 
-    reaped = future_store.reap()
+    reaped = asyncio.run(future_store.async_reap())
     released: list[str] = []
     for rid in list(reaped.get("expired", [])) + list(reaped.get("timed_out", [])):
-        capacity_manager.release_all(str(rid))
+        asyncio.run(capacity_manager.async_release_all(str(rid)))
         released.append(str(rid))
     return {
         "expired": list(reaped.get("expired", [])),
