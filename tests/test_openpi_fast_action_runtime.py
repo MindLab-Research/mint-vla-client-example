@@ -320,6 +320,84 @@ def test_start_openpi_action_ray_runtime_registers_actor_metadata_in_resource_po
     assert register["metadata"]["cuda_visible_devices"] == "0"
 
 
+def test_start_openpi_action_ray_runtime_applies_single_node_pin(monkeypatch) -> None:
+    from tinker_server.backend import openpi_action_ray_runtime
+    from tinker_server.backend.openpi_fast_action_runtime import OpenPIFastActionRuntimeSpec
+
+    state: dict[str, object] = {}
+    node_id = "b" * 56
+
+    class _FakeActorBuilder:
+        def options(self, **kwargs):
+            state["options"] = kwargs
+            return self
+
+        def remote(self, **kwargs):
+            state["remote"] = kwargs
+            return "actor-1"
+
+    class _FakeClient:
+        def __init__(self, *, actor, actor_name, spec, action_session_id, ready_timeout_s):
+            _ = actor, actor_name, spec, action_session_id, ready_timeout_s
+
+        async def ready(self):
+            return {"actor_id": "actor-123", "node_id": node_id, "node_ip": "192.168.38.176"}
+
+        async def close(self):
+            return None
+
+    class _FakePool:
+        def register(self, **kwargs):
+            state["register"] = kwargs
+
+        def mark_ready(self, actor_name):
+            state["mark_ready"] = actor_name
+
+        def touch(self, actor_name):
+            state["touch"] = actor_name
+
+    monkeypatch.setattr(openpi_action_ray_runtime, "ensure_openpi_ray_initialized", lambda: None)
+    monkeypatch.setattr(openpi_action_ray_runtime, "OpenPIActionRayRuntimeActor", _FakeActorBuilder())
+    monkeypatch.setattr(openpi_action_ray_runtime, "OpenPIActionRayRuntimeClient", _FakeClient)
+    monkeypatch.setattr(openpi_action_ray_runtime, "get_resource_pool", lambda: _FakePool())
+    monkeypatch.setattr(
+        openpi_action_ray_runtime,
+        "parse_model_node_ip_list",
+        lambda **_kwargs: ["192.168.38.176"],
+    )
+    capacity_calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        openpi_action_ray_runtime,
+        "assert_node_ip_capacity",
+        lambda **kwargs: capacity_calls.append(kwargs),
+    )
+    monkeypatch.setattr(
+        openpi_action_ray_runtime.ray,
+        "nodes",
+        lambda: [{"Alive": True, "NodeManagerAddress": "192.168.38.176", "NodeID": node_id}],
+    )
+
+    asyncio.run(
+        openpi_action_ray_runtime.start_openpi_action_ray_runtime(
+            action_session_id="session-1:action:3",
+            base_model=OPENPI_FAST_MODEL,
+            spec=OpenPIFastActionRuntimeSpec(),
+        )
+    )
+
+    options = state["options"]
+    assert options["resources"] == {"node:192.168.38.176": 0.001}
+    assert options["scheduling_strategy"].node_id == node_id
+    assert options["scheduling_strategy"].soft is False
+    assert capacity_calls == [
+        {
+            "required_gpus_by_node_ip": {"192.168.38.176": 1},
+            "context": "[OpenPIActionRuntime] node pinning model='openpi/pi0-fast-libero-low-mem-finetune' actor="
+            f"{state['register']['actor_name']!r}",
+        }
+    ]
+
+
 def test_openpi_fast_save_weights_for_sampler_exports_policy_loadable_checkpoint(tmp_path: Path) -> None:
     from tinker_server.backend.openpi_fast_training import OpenPIFastTrainingEngine
 

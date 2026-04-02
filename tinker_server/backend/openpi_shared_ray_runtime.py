@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 import ray
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from ..config import RAY_NAMESPACE
 from .openpi_fast_runtime import (
@@ -26,6 +27,7 @@ from .openpi_ray_runtime import (
     ensure_openpi_ray_initialized,
 )
 from .resource_pool import ActorType, get_resource_pool
+from .volc_placement import assert_node_ip_capacity, parse_model_node_ip_list
 
 
 logger = logging.getLogger(__name__)
@@ -67,6 +69,64 @@ def _normalize_pool_key(
 def _shared_actor_name(pool_key: dict[str, Any]) -> str:
     payload = json.dumps(pool_key, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return f"{_SHARED_ACTOR_PREFIX}{hashlib.sha1(payload).hexdigest()[:12]}"
+
+
+def _preferred_openpi_node_ip(base_model: str, actor_name: str) -> str | None:
+    lookup_keys = [
+        str(base_model).strip(),
+        str(base_model).strip().lower(),
+        str(actor_name).strip(),
+        str(actor_name).strip().lower(),
+    ]
+    node_ips = parse_model_node_ip_list(
+        raw_json=os.environ.get("MINT_MODEL_NODE_IPS_JSON"),
+        lookup_keys=lookup_keys,
+        env_var_name="MINT_MODEL_NODE_IPS_JSON",
+        context=f"[OpenPISharedRuntime] node pinning model={base_model!r} actor={actor_name!r}",
+    )
+    if not node_ips:
+        return None
+    if len(node_ips) != 1:
+        raise RuntimeError(
+            f"[OpenPISharedRuntime] node pinning model={base_model!r} actor={actor_name!r}: "
+            f"expected exactly 1 node for single-GPU actor, got {node_ips}"
+        )
+    assert_node_ip_capacity(
+        required_gpus_by_node_ip={node_ips[0]: 1},
+        context=f"[OpenPISharedRuntime] node pinning model={base_model!r} actor={actor_name!r}",
+    )
+    return node_ips[0]
+
+
+def _single_node_actor_options(*, base_model: str, actor_name: str) -> dict[str, Any]:
+    preferred_ip = _preferred_openpi_node_ip(base_model, actor_name)
+    if not preferred_ip:
+        return {}
+    node_map = {
+        str(node.get("NodeManagerAddress") or ""): str(node.get("NodeID") or "")
+        for node in ray.nodes()
+        if node.get("Alive")
+    }
+    node_id = node_map.get(preferred_ip)
+    if not node_id:
+        raise RuntimeError(
+            f"[OpenPISharedRuntime] pinned node_ip={preferred_ip} for actor={actor_name!r} "
+            "is not an alive Ray node"
+        )
+    logger.info(
+        "[OpenPISharedRuntime] pin model=%s actor=%s node_ip=%s node_id=%s",
+        base_model,
+        actor_name,
+        preferred_ip,
+        node_id,
+    )
+    return {
+        "resources": {f"node:{preferred_ip}": 0.001},
+        "scheduling_strategy": NodeAffinitySchedulingStrategy(
+            node_id=node_id,
+            soft=False,
+        ),
+    }
 
 
 def _template_session_id(actor_metadata: dict[str, Any] | None) -> str:
@@ -538,6 +598,10 @@ async def start_openpi_shared_ray_runtime(
                     namespace=RAY_NAMESPACE,
                     lifetime="detached",
                     runtime_env={"env_vars": _openpi_runtime_env_vars()},
+                    **_single_node_actor_options(
+                        base_model=str(getattr(session, "base_model", "") or ""),
+                        actor_name=actor_name,
+                    ),
                 ).remote(
                     actor_name=actor_name,
                     pool_key=pool_key,
