@@ -7,6 +7,8 @@ import math
 import random
 import time
 import uuid
+
+from requests import HTTPError
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +32,7 @@ def _poll_future(base_url: str, request_id: str, *, timeout_s: float = 3600.0):
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         resp = requests.post(f"{base_url}/api/v1/retrieve_future", json={"request_id": request_id}, timeout=120)
-        if resp.status_code == 408:
+        if resp.status_code in {408, 503}:
             time.sleep(1.0)
             continue
         resp.raise_for_status()
@@ -76,18 +78,26 @@ def _save_weights_for_sampler(base_url: str, model_id: str, checkpoint_name: str
     return path
 
 
-def _create_action_session(base_url: str, base_model: str, model_path: str) -> str:
-    resp = requests.post(
-        f"{base_url}/api/v1/mint/action_sessions",
-        json={"session_id": f"act-{uuid.uuid4().hex[:12]}", "base_model": base_model, "model_path": model_path},
-        timeout=120,
-    )
-    resp.raise_for_status()
-    result = resp.json()
-    session_id = result.get("action_session_id")
-    if not isinstance(session_id, str) or not session_id:
-        raise RuntimeError(f"create_action_session missing action_session_id: {result!r}")
-    return session_id
+def _create_action_session(base_url: str, base_model: str, model_path: str, *, timeout_s: float = 900.0) -> str:
+    deadline = time.time() + timeout_s
+    while True:
+        resp = requests.post(
+            f"{base_url}/api/v1/mint/action_sessions",
+            json={"session_id": f"act-{uuid.uuid4().hex[:12]}", "base_model": base_model, "model_path": model_path},
+            timeout=120,
+        )
+        if resp.status_code in {429, 503} and time.time() < deadline:
+            time.sleep(2.0)
+            continue
+        try:
+            resp.raise_for_status()
+        except HTTPError:
+            raise
+        result = resp.json()
+        session_id = result.get("action_session_id")
+        if not isinstance(session_id, str) or not session_id:
+            raise RuntimeError(f"create_action_session missing action_session_id: {result!r}")
+        return session_id
 
 
 def _delete_action_session(base_url: str, action_session_id: str) -> None:

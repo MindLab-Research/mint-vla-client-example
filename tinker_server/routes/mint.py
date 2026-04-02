@@ -176,13 +176,19 @@ async def create_action_session(
             is_admin=is_admin,
         )
 
-    action_session_id = await action_session_manager.create_session(  # type: ignore[attr-defined]
-        session_id=request.session_id,
-        action_session_seq_id=request.action_session_seq_id,
-        base_model=base_model,
-        model_path=model_path,
-        user_id=user_id,
-    )
+    try:
+        action_session_id = await action_session_manager.create_session(  # type: ignore[attr-defined]
+            session_id=request.session_id,
+            action_session_seq_id=request.action_session_seq_id,
+            base_model=base_model,
+            model_path=model_path,
+            user_id=user_id,
+        )
+    except RuntimeError as exc:
+        message = str(exc)
+        if 'pinned node capacity check failed' in message:
+            raise HTTPException(status_code=503, detail=message) from exc
+        raise
     return MintCreateActionSessionResponse(action_session_id=str(action_session_id))
 
 

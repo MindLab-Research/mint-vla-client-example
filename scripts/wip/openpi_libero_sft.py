@@ -196,7 +196,7 @@ def _poll_future(base_url: str, request_id: str, *, timeout_s: float = 3600.0) -
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         resp = requests.post(f'{base_url}/api/v1/retrieve_future', json={'request_id': request_id}, timeout=120)
-        if resp.status_code == 408:
+        if resp.status_code in {408, 503}:
             time.sleep(1.0)
             continue
         resp.raise_for_status()
