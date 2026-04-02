@@ -404,6 +404,8 @@ def test_create_host_venv_installs_torch_backend_and_generic_requirements_separa
         "install",
         "--python",
         str(python),
+        "--torch-backend",
+        "cpu",
         "--requirements",
         str(generic_requirements),
     ]

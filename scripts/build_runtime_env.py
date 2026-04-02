@@ -323,6 +323,8 @@ def _create_host_venv(
                 "install",
                 "--python",
                 str(python),
+                "--torch-backend",
+                "cpu",
                 "--requirements",
                 str(generic_requirements_path),
             ],
