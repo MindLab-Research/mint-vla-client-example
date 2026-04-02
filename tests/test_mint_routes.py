@@ -142,6 +142,45 @@ def test_mint_action_route_cleans_up_future_when_enqueue_fails(monkeypatch) -> N
     assert capacity.released == future_store.created
 
 
+def test_mint_create_action_session_maps_capacity_runtime_error_to_503(monkeypatch) -> None:
+    from tinker_server.routes import mint as mint_routes
+    import tinker_server.supported_models_gate as supported_models_gate
+
+    class _StubActionSessionManager:
+        async def create_session(self, **kwargs):
+            _ = kwargs
+            raise RuntimeError(
+                "[OpenPIActionRuntime] node pinning model='openpi/pi0-fast-libero-low-mem-finetune' actor='openpi_action_runtime_test': "
+                "pinned node capacity check failed: required_by_node={'192.168.38.176': 1}"
+            )
+
+    async def _allow_model(*, base_model: str, http_request):
+        _ = http_request
+        return base_model
+
+    monkeypatch.setattr(mint_routes, 'action_session_manager', _StubActionSessionManager(), raising=False)
+    monkeypatch.setattr(mint_routes, 'can_access_model', lambda base_model, user_data: True)
+    monkeypatch.setattr(mint_routes, '_get_user_data', lambda request: None)
+    monkeypatch.setattr(supported_models_gate, 'enforce_base_model_allowed', _allow_model)
+
+    app = FastAPI()
+    app.include_router(mint_routes.router, prefix='/api/v1/mint')
+    client = TestClient(app)
+
+    resp = client.post(
+        '/api/v1/mint/action_sessions',
+        json={
+            'base_model': 'openpi/pi0-fast-libero-low-mem-finetune',
+            'session_id': 'act-test',
+            'action_session_seq_id': 0,
+            'model_path': 'mint://model/checkpoint',
+        },
+    )
+
+    assert resp.status_code == 503, resp.text
+    assert 'pinned node capacity check failed' in resp.text
+
+
 def test_mint_vla_train_step_route_enqueues_expected_request(monkeypatch) -> None:
     from tinker_server.routes import mint as mint_routes
 
