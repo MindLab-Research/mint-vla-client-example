@@ -120,6 +120,33 @@ def _build_sampling_usage_label(*, model: str, route: str, dimension: str) -> st
     return f"model={model},route={route},dimension={dimension}"
 
 
+def _record_vllm_workload_start(*, base_model: str, op: str) -> None:
+    from ..backend.runtime_observability import runtime_observability
+
+    runtime_observability.begin_vllm_request(base_model=base_model, op=op)
+
+
+def _record_vllm_workload_finish(
+    *,
+    base_model: str,
+    op: str,
+    status: str,
+    prompt_tokens: int,
+    generated_tokens: int,
+    started_at: float,
+) -> None:
+    from ..backend.runtime_observability import runtime_observability
+
+    runtime_observability.finish_vllm_request(
+        base_model=base_model,
+        op=op,
+        status=status,
+        prompt_tokens=prompt_tokens,
+        generated_tokens=generated_tokens,
+        duration_s=max(0.0, time.perf_counter() - float(started_at)),
+    )
+
+
 def _snapshot_from_legacy_getters(session_id: str) -> SamplingSessionSnapshot | None:
     if session_manager is None:
         return None
@@ -797,6 +824,7 @@ async def asample(
             status_code=422,
             detail="seq_id is required when sampling_session_id or model_id is provided",
         )
+    session_id = request.get_session_id()
     snapshot = await _async_get_detached_sampling_snapshot(session_id)
     remote = None
     if snapshot is None:
@@ -1323,6 +1351,11 @@ async def _do_sample(
     engine = None
     resource_pool = None
     resource_pool_actor_name: str | None = None
+    workload_base_model = "unknown"
+    workload_started_at = time.perf_counter()
+    workload_started = False
+    workload_status = "error"
+    workload_generated_tokens = 0
     try:
         try:
             if session_manager is None:
@@ -1331,6 +1364,9 @@ async def _do_sample(
             token_ids = request.prompt.to_token_ids()
             session_id = request.get_session_id()  # Supports both sampling_session_id and model_id
             await _restore_local_sampling_session_if_needed(session_id)
+            workload_base_model = _resolve_billing_model(session_id)
+            _record_vllm_workload_start(base_model=workload_base_model, op="asample")
+            workload_started = True
             session_manager.mark_session_inflight(session_id, +1)
             snapshot = _get_sampling_snapshot(session_id)
 
@@ -1632,10 +1668,13 @@ async def _do_sample(
                 await _persist_usage_events(auth_ctx=auth_ctx, events=usage_events)
 
             # Compatibility: older tinker clients don't accept a top-level `type` field on SampleResponse.
-            future_store.resolve(request_id, response.model_dump(exclude={"type"}))
+            await future_store.async_resolve(request_id, response.model_dump(exclude={"type"}))
+            workload_status = "ok"
+            workload_generated_tokens = sum(len(seq.tokens) for seq in sequences)
             logger.info(f"Sampling completed: {len(sequences)} sequences generated")
 
         except asyncio.CancelledError:
+            workload_status = "canceled"
             await _abort_engine_request(engine, request_id)
             await future_store.async_fail(request_id, "sampling task cancelled")
             logger.warning(
@@ -1646,6 +1685,7 @@ async def _do_sample(
             )
             raise
         except Exception as e:
+            workload_status = "error"
             await _abort_engine_request(engine, request_id)
             logger.exception(
                 "[sampling.asample] failed request_id=%s session_id=%s failure_reason=%s error_type=%s next_action=%s",
@@ -1657,6 +1697,15 @@ async def _do_sample(
             )
             await future_store.async_fail(request_id, str(e))
     finally:
+        if workload_started:
+            _record_vllm_workload_finish(
+                base_model=workload_base_model,
+                op="asample",
+                status=workload_status,
+                prompt_tokens=len(token_ids) if 'token_ids' in locals() else 0,
+                generated_tokens=workload_generated_tokens,
+                started_at=workload_started_at,
+            )
         if resource_pool is not None and resource_pool_actor_name is not None:
             resource_pool.mark_inflight(resource_pool_actor_name, -1)
         if session_manager is not None and session_id is not None:
@@ -1830,6 +1879,10 @@ async def _do_compute_logprobs(
     session_id: str | None = None
     resource_pool = None
     resource_pool_actor_name: str | None = None
+    workload_base_model = "unknown"
+    workload_started_at = time.perf_counter()
+    workload_started = False
+    workload_status = "error"
     try:
         set_request_id(request_id)
         if session_manager is None:
@@ -1838,6 +1891,9 @@ async def _do_compute_logprobs(
         token_ids = request.sequence.to_token_ids()
         session_id = request.sampling_session_id
         await _restore_local_sampling_session_if_needed(session_id)
+        workload_base_model = _resolve_billing_model(session_id)
+        _record_vllm_workload_start(base_model=workload_base_model, op="compute_logprobs")
+        workload_started = True
         session_manager.mark_session_inflight(session_id, +1)
         snapshot = _get_sampling_snapshot(session_id)
         base_model = snapshot.base_model if snapshot is not None else session_manager.get_session_base_model(session_id)
@@ -1923,10 +1979,22 @@ async def _do_compute_logprobs(
                 ],
             )
         # Compatibility: older tinker clients don't accept a top-level `type` field on ComputeLogprobsResponse.
-        future_store.resolve(request_id, response.model_dump(exclude={"type"}))
+        await future_store.async_resolve(request_id, response.model_dump(exclude={"type"}))
+        workload_status = "ok"
         logger.debug(f"Request {request_id} computed {len(logprobs)} logprobs")
 
+    except asyncio.CancelledError:
+        workload_status = "canceled"
+        await future_store.async_fail(request_id, "compute_logprobs task cancelled")
+        logger.warning(
+            "[sampling.compute_logprobs] canceled request_id=%s session_id=%s next_action=%s",
+            str(request_id),
+            str(session_id or request.sampling_session_id),
+            "caller_can_retry",
+        )
+        raise
     except Exception as e:
+        workload_status = "error"
         logger.exception(
             "[sampling.compute_logprobs] failed request_id=%s session_id=%s failure_reason=%s error_type=%s next_action=%s",
             str(request_id),
@@ -1937,6 +2005,15 @@ async def _do_compute_logprobs(
         )
         await future_store.async_fail(request_id, str(e))
     finally:
+        if workload_started:
+            _record_vllm_workload_finish(
+                base_model=workload_base_model,
+                op="compute_logprobs",
+                status=workload_status,
+                prompt_tokens=len(token_ids) if 'token_ids' in locals() else 0,
+                generated_tokens=0,
+                started_at=workload_started_at,
+            )
         if resource_pool is not None and resource_pool_actor_name is not None:
             resource_pool.mark_inflight(resource_pool_actor_name, -1)
         if session_manager is not None and session_id is not None:

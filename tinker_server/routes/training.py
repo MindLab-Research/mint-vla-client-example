@@ -566,7 +566,7 @@ async def _best_effort_delete_training_session(
         return False
 
     try:
-        failed_request_ids = future_store.fail_training_requests_for_model(
+        failed_request_ids = await future_store.async_fail_training_requests_for_model(
             model_id,
             f"Training session terminated due to {reason}",
         )
@@ -1239,7 +1239,7 @@ async def _do_create_model(
             type="create_model",
             backend=session.backend,  # "megatron" or "peft"
         )
-        future_store.resolve(request_id, response.model_dump())
+        await future_store.async_resolve(request_id, response.model_dump())
 
         # 2. 发送 running 状态 - 模型创建成功，训练就绪
         if webhook_url and user_id:
@@ -1618,7 +1618,7 @@ async def _do_create_model_from_state(
             model_id=model_id,
             type="create_model_from_state",
         )
-        future_store.resolve(request_id, response.model_dump())
+        await future_store.async_resolve(request_id, response.model_dump())
 
     except Exception as e:
         logger.exception(
@@ -1868,7 +1868,7 @@ async def _do_forward_backward(
                     )
                 ]
             )
-        future_store.resolve(request_id, result)
+        await future_store.async_resolve(request_id, result)
 
     except Exception as e:
         logger.exception(
@@ -2086,7 +2086,7 @@ async def _do_train_step(
                     )
                 ]
             )
-        future_store.resolve(request_id, result)
+        await future_store.async_resolve(request_id, result)
 
     except Exception as e:
         logger.exception(
@@ -2306,7 +2306,7 @@ async def _do_forward(
                     )
                 ]
             )
-        future_store.resolve(request_id, result)
+        await future_store.async_resolve(request_id, result)
 
     except Exception as e:
         logger.exception(
@@ -2497,7 +2497,7 @@ async def _do_optim_step(request_id: str, request: OptimStepRequest, user_id: st
         elapsed_s = time.time() - t0
         msg = f"[{session.model_id}] optim_step done request_id={request_id} elapsed_s={elapsed_s:.3f}"
         logger.info(msg)
-        future_store.resolve(request_id, result)
+        await future_store.async_resolve(request_id, result)
 
     except Exception as e:
         logger.exception(
@@ -2613,7 +2613,7 @@ async def _do_reset_expert_bias(
 
         result = await training_engine.reset_expert_bias(session)
         modules_reset = int(result.get("modules_reset", 0) or 0)
-        future_store.resolve(
+        await future_store.async_resolve(
             request_id,
             ResetExpertBiasResponse(
                 model_id=request.model_id,
@@ -3059,7 +3059,7 @@ async def _do_save_weights_for_sampler(
                 sampling_session_id=sampling_session_id,
             ).model_dump()
 
-        future_store.resolve(request_id, response)
+        await future_store.async_resolve(request_id, response)
 
     except Exception as e:
         logger.exception(
@@ -3363,7 +3363,7 @@ async def _do_delete_model(request_id: str, model_id: str) -> None:
         except Exception:
             pass
 
-        future_store.resolve(request_id, {"model_id": model_id, "status": "deleted"})
+        await future_store.async_resolve(request_id, {"model_id": model_id, "status": "deleted"})
     except Exception as e:
         logger.exception(
             "[training.delete_model] failed request_id=%s model_id=%s error_type=%s error=%s",

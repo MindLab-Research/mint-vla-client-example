@@ -811,7 +811,7 @@ async def _do_save_state(
             checkpoint_type="training",
         )
 
-        future_store.resolve(request_id, {
+        await future_store.async_resolve(request_id, {
             "checkpoint_id": checkpoint_name,
             "path": selected_path,
             "mint_path": mint_path,
@@ -977,7 +977,7 @@ async def _do_save_weights(
             checkpoint_type="sampler",
         )
 
-        future_store.resolve(
+        await future_store.async_resolve(
             request_id,
             {
                 "checkpoint_id": checkpoint_name,
@@ -1239,7 +1239,7 @@ async def _do_load_state(
             },
         )
 
-        future_store.resolve(request_id, {
+        await future_store.async_resolve(request_id, {
             "path": request.path,
             "type": "load_weights",
         })

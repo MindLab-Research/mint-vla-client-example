@@ -730,7 +730,7 @@ def _create_extended_server_class(
             try:
                 from tinker_server.backend.future_store import future_store
 
-                future_store.update_meta(
+                await future_store.async_update_meta(
                     request_id,
                     meta={
                         "stage": stage,
@@ -1181,7 +1181,7 @@ def _create_extended_server_class(
             try:
                 from tinker_server.backend.future_store import future_store
 
-                future_store.update_meta(
+                await future_store.async_update_meta(
                     request_id,
                     meta={
                         "stage": "prefill",
@@ -1446,7 +1446,7 @@ def _create_extended_server_class(
             try:
                 from tinker_server.backend.future_store import future_store
 
-                future_store.update_meta(
+                await future_store.async_update_meta(
                     request_id,
                     meta={
                         "stage": "prefill",

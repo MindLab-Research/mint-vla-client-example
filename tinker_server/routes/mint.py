@@ -193,7 +193,7 @@ async def _do_interpolate_checkpoints(
             prefer_tinker=False,
             checkpoint_type="sampler",
         )
-        future_store.resolve(
+        await future_store.async_resolve(
             request_id,
             {
                 "path": path_uri,
@@ -334,7 +334,7 @@ async def _do_forward_backward_reverse_kl(
             session.model_id,
             time.time() - t0,
         )
-        future_store.resolve(request_id, result)
+        await future_store.async_resolve(request_id, result)
     except Exception as e:
         logger.exception(
             "[mint.forward_backward_reverse_kl] failed request_id=%s model_id=%s failure_reason=%s error_type=%s next_action=%s",

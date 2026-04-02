@@ -14,11 +14,14 @@ def test_issue_364_future_reaper_once_releases_capacity(monkeypatch) -> None:
     released: list[str] = []
 
     class _FakeFutureStore:
-        def reap(self) -> dict:
+        async def async_ensure_ready(self) -> dict:
+            return {"ok": True}
+
+        async def async_reap(self) -> dict:
             return {"expired": ["req-expired"], "timed_out": ["req-timeout"]}
 
     class _FakeCapacityManager:
-        def release_all(self, request_id: str) -> None:
+        async def async_release_all(self, request_id: str) -> None:
             released.append(str(request_id))
 
     import importlib
