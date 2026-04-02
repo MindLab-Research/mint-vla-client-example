@@ -27,12 +27,17 @@ KNOWN_QUEUE_OPS = (
     "internal.noop",
     "mint.interpolate_checkpoints",
     "mint.forward_backward_reverse_kl",
+    "mint.vla.train_step",
     "mint.action.act",
 )
 
 
 async def execute_work_item(item: Any) -> None:
-    from ..models.mint_types import ForwardBackwardReverseKLRequest, InterpolateCheckpointsRequest
+    from ..models.mint_types import (
+        ForwardBackwardReverseKLRequest,
+        InterpolateCheckpointsRequest,
+        VLATrainStepRequest,
+    )
     from ..models.types import (
         ActRequest,
         ComputeLogprobsRequest,
@@ -349,6 +354,20 @@ async def execute_work_item(item: Any) -> None:
             op=op,
             request_id=str(item.request_id),
             attributes={"queue.stage": "queue.stage.mint.forward_backward_reverse_kl"},
+        )
+
+    if op == "mint.vla.train_step":
+        async def _run():
+            req = VLATrainStepRequest.model_validate_json(item.request_json)
+            await mint._do_vla_train_step(item.request_id, req, item.user_id)
+
+        return await run_async_with_otel_span(
+            "queue.stage.mint.vla.train_step",
+            _run,
+            component="api_work_queue",
+            op=op,
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.mint.vla.train_step"},
         )
 
     if op == "mint.action.act":

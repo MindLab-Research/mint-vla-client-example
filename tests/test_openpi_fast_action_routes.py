@@ -271,24 +271,25 @@ def test_act_route_rejects_missing_state(monkeypatch) -> None:
         "/api/v1/mint/action_sessions/action-session-1/act",
         json={
             "observation": {
-                "chunks": [
-                    {
-                        "type": "image",
-                        "data": "aW1n",
-                        "format": "png",
-                        "expected_tokens": 256,
-                    },
-                    {
-                        "type": "encoded_text",
-                        "tokens": [1, 2, 3],
-                    },
-                ]
+                "model_input": {
+                    "chunks": [
+                        {
+                            "type": "image",
+                            "data": "aW1n",
+                            "format": "png",
+                            "expected_tokens": 256,
+                        },
+                        {
+                            "type": "encoded_text",
+                            "tokens": [1, 2, 3],
+                        },
+                    ]
+                }
             },
-            "extra_inputs": {},
         },
     )
 
-    assert resp.status_code == 400, resp.text
+    assert resp.status_code == 422, resp.text
     assert "state" in resp.text
 
 
@@ -423,25 +424,25 @@ def test_mint_action_route_enqueues_expected_request(monkeypatch) -> None:
         "/api/v1/mint/action_sessions/action-session-1/act",
         json={
             "observation": {
-                "chunks": [
-                    {
-                        "type": "image",
-                        "data": "aW1n",
-                        "format": "png",
-                        "expected_tokens": 256,
-                    },
-                    {
-                        "type": "encoded_text",
-                        "tokens": [1, 2, 3],
-                    },
-                ]
-            },
-            "extra_inputs": {
                 "state": {
                     "data": [0.0] * 8,
                     "shape": [8],
                     "dtype": "float32",
-                }
+                },
+                "model_input": {
+                    "chunks": [
+                        {
+                            "type": "image",
+                            "data": "aW1n",
+                            "format": "png",
+                            "expected_tokens": 256,
+                        },
+                        {
+                            "type": "encoded_text",
+                            "tokens": [1, 2, 3],
+                        },
+                    ]
+                },
             },
         },
     )
