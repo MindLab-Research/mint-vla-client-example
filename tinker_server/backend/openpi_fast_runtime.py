@@ -161,7 +161,7 @@ class OpenPIFastWorkerClient:
             spec.worker_module,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stderr=None,
             cwd=spec.cwd,
             env=spec.build_env(),
         )

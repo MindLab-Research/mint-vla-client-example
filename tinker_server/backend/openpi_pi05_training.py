@@ -381,7 +381,7 @@ class OpenPIPi05TrainingEngine:
 
         temp_dir = checkpoint_root / f".openpi_pi05_sampler_export_{checkpoint_name}_{uuid.uuid4().hex}"
         try:
-            result = await self._request_runtime(runtime, "save_weights", {"save_path": str(temp_dir)})
+            result = await self._request_runtime(runtime, "save_sampler_weights", {"save_path": str(temp_dir)})
             source_dir = find_openpi_policy_checkpoint_dir(result["path"])
             params_dir = source_dir / "params"
             assets_dir = source_dir / "assets"

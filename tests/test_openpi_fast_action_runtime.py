@@ -110,7 +110,7 @@ class _FakeTrainingRuntimeClient:
         _ = timeout_s
         if op == "create_session":
             return {"session": "created"}
-        if op == "save_weights":
+        if op in {"save_weights", "save_sampler_weights"}:
             save_path = Path(payload["save_path"])
             (save_path / "1" / "params").mkdir(parents=True, exist_ok=True)
             (save_path / "1" / "assets").mkdir(parents=True, exist_ok=True)

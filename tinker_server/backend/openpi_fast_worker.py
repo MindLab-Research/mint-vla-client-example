@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import dataclasses
 import io
 import json
@@ -20,6 +21,22 @@ from .openpi_session_state import OpenPISessionStateManager
 
 
 logger = logging.getLogger(__name__)
+_PROTOCOL_STDOUT = None
+
+
+def _install_protocol_stdout_redirect() -> None:
+    global _PROTOCOL_STDOUT
+    if _PROTOCOL_STDOUT is not None:
+        return
+    protocol_fd = os.dup(sys.stdout.fileno())
+    _PROTOCOL_STDOUT = os.fdopen(protocol_fd, "w", buffering=1, encoding="utf-8", closefd=True)
+    os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+
+
+def _reply(message: dict[str, Any]) -> None:
+    stream = _PROTOCOL_STDOUT or sys.stdout
+    stream.write(json.dumps(message) + "\n")
+    stream.flush()
 
 
 @dataclass(frozen=True)
@@ -43,11 +60,6 @@ class OpenPIFastRuntimeInitOverrides:
         if weights_path is not None:
             weights_path = str(Path(weights_path).resolve())
         return cls(weights_path=weights_path, random_init=random_init)
-
-
-def _reply(message: dict[str, Any]) -> None:
-    sys.stdout.write(json.dumps(message) + "\n")
-    sys.stdout.flush()
 
 
 def _float_scalar(value: Any) -> float:
@@ -738,6 +750,37 @@ class OpenPIFastWorkerSession:
             if callable(close):
                 close()
 
+    def _save_sampler_checkpoint(self, path: Path, state: Any) -> None:
+        checkpoint_path = str(Path(path).resolve())
+        manager, _ = self._checkpoints.initialize_checkpoint_dir(
+            checkpoint_path,
+            keep_period=None,
+            overwrite=True,
+            resume=False,
+        )
+        try:
+            checkpoint_step = max(1, _int_scalar(state.step))
+            params = state.ema_params if getattr(state, "ema_params", None) is not None else state.params
+
+            def save_assets(directory: Path) -> None:
+                data_config = self._data_loader.data_config()
+                norm_stats = data_config.norm_stats
+                if norm_stats is not None and data_config.asset_id is not None:
+                    self._checkpoints._normalize.save(directory / data_config.asset_id, norm_stats)
+
+            manager.save(
+                checkpoint_step,
+                items={
+                    "assets": save_assets,
+                    "params": {"params": params},
+                },
+            )
+            manager.wait_until_finished()
+        finally:
+            close = getattr(manager, "close", None)
+            if callable(close):
+                close()
+
     def _load_train_state_checkpoint(self, path: Path) -> Any:
         checkpoint_path = str(Path(path).resolve())
         manager, resuming = self._checkpoints.initialize_checkpoint_dir(
@@ -857,6 +900,11 @@ class OpenPIFastWorkerSession:
         self._save_train_state_checkpoint(Path(save_path), self._state)
         return {"path": save_path, "current_step": _int_scalar(self._state.step)}
 
+    def save_sampler_weights(self, payload: dict[str, Any]) -> dict[str, Any]:
+        save_path = str(Path(payload["save_path"]).resolve())
+        self._save_sampler_checkpoint(Path(save_path), self._state)
+        return {"path": save_path, "current_step": _int_scalar(self._state.step)}
+
     def load_weights(self, payload: dict[str, Any]) -> dict[str, Any]:
         load_path = str(Path(payload["load_path"]).resolve())
         self._state = self._load_train_state_checkpoint(Path(load_path))
@@ -917,6 +965,8 @@ def _dispatch(session: OpenPIFastWorkerSession | None, op: str, payload: dict[st
         return session.optim_step(payload), False
     if op == "save_weights":
         return session.save_weights(payload), False
+    if op == "save_sampler_weights":
+        return session.save_sampler_weights(payload), False
     if op == "load_weights":
         return session.load_weights(payload), False
     if op == "save_session_state":
@@ -927,6 +977,16 @@ def _dispatch(session: OpenPIFastWorkerSession | None, op: str, payload: dict[st
         return session.shutdown(), True
 
     raise ValueError(f"Unknown OpenPI FAST worker op: {op!r}")
+
+
+def _dispatch_with_protocol_stdout(session: OpenPIFastWorkerSession | None, op: str, payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    capture = io.StringIO()
+    with contextlib.redirect_stdout(capture):
+        response, should_stop = _dispatch(session, op, payload)
+    extra_stdout = capture.getvalue().strip()
+    if extra_stdout:
+        logger.warning("Suppressed non-protocol stdout from OpenPI worker: %s", extra_stdout)
+    return response, should_stop
 
 
 def main() -> None:
@@ -952,7 +1012,7 @@ def main() -> None:
                 session = OpenPIFastWorkerSession(payload)
                 response = session.create_session()
             else:
-                response, should_stop = _dispatch(session, op, payload)
+                response, should_stop = _dispatch_with_protocol_stdout(session, op, payload)
             _reply({"id": request_id, "ok": True, "payload": response})
         except Exception as exc:
             logger.exception("OpenPI FAST worker request failed")

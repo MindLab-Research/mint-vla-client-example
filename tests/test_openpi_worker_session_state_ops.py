@@ -278,3 +278,171 @@ def test_openpi_pi05_worker_checkpoint_save_normalizes_step_zero() -> None:
     assert calls["save"]["step"] == 1
     assert calls["waited"] is True
     assert calls["closed"] is True
+
+
+def test_openpi_fast_worker_sampler_checkpoint_omits_train_state() -> None:
+    calls: dict[str, object] = {}
+
+    class _FakeManager:
+        def save(self, step, *, items):
+            calls["save"] = {"step": step, "items": items}
+
+        def wait_until_finished(self) -> None:
+            calls["waited"] = True
+
+        def close(self) -> None:
+            calls["closed"] = True
+
+    class _FakeCheckpoints:
+        def initialize_checkpoint_dir(self, checkpoint_path, *, keep_period, overwrite, resume):
+            calls["checkpoint_path"] = checkpoint_path
+            calls["init"] = {
+                "keep_period": keep_period,
+                "overwrite": overwrite,
+                "resume": resume,
+            }
+            return _FakeManager(), False
+
+        @staticmethod
+        def _split_params(state):
+            return object(), {"params": state.params}
+
+        class _normalize:
+            @staticmethod
+            def save(path, norm_stats):
+                calls["asset_save"] = {"path": path, "norm_stats": norm_stats}
+
+    class _FakeDataLoader:
+        @staticmethod
+        def data_config():
+            return SimpleNamespace(norm_stats=None, asset_id=None)
+
+    fake_session = SimpleNamespace(
+        _checkpoints=_FakeCheckpoints(),
+        _data_loader=_FakeDataLoader(),
+    )
+    state = SimpleNamespace(step=0, params={"w": 1})
+
+    fast_worker_module.OpenPIFastWorkerSession._save_sampler_checkpoint(
+        fake_session,
+        Path("/tmp/openpi-fast-sampler"),
+        state,
+    )
+
+    assert calls["save"]["step"] == 1
+    assert set(calls["save"]["items"].keys()) == {"assets", "params"}
+    assert calls["waited"] is True
+    assert calls["closed"] is True
+
+
+def test_openpi_pi05_worker_sampler_checkpoint_omits_train_state() -> None:
+    calls: dict[str, object] = {}
+
+    class _FakeManager:
+        def save(self, step, *, items):
+            calls["save"] = {"step": step, "items": items}
+
+        def wait_until_finished(self) -> None:
+            calls["waited"] = True
+
+        def close(self) -> None:
+            calls["closed"] = True
+
+    class _FakeCheckpoints:
+        def initialize_checkpoint_dir(self, checkpoint_path, *, keep_period, overwrite, resume):
+            calls["checkpoint_path"] = checkpoint_path
+            calls["init"] = {
+                "keep_period": keep_period,
+                "overwrite": overwrite,
+                "resume": resume,
+            }
+            return _FakeManager(), False
+
+        @staticmethod
+        def _split_params(state):
+            return object(), {"params": state.params}
+
+        class _normalize:
+            @staticmethod
+            def save(path, norm_stats):
+                calls["asset_save"] = {"path": path, "norm_stats": norm_stats}
+
+    class _FakeDataLoader:
+        @staticmethod
+        def data_config():
+            return SimpleNamespace(norm_stats=None, asset_id=None)
+
+    fake_session = SimpleNamespace(
+        _checkpoints=_FakeCheckpoints(),
+        _data_loader=_FakeDataLoader(),
+    )
+    state = SimpleNamespace(step=0, params={"w": 1})
+
+    pi05_worker_module.OpenPIPi05WorkerSession._save_sampler_checkpoint(
+        fake_session,
+        Path("/tmp/openpi-pi05-sampler"),
+        state,
+    )
+
+    assert calls["save"]["step"] == 1
+    assert set(calls["save"]["items"].keys()) == {"assets", "params"}
+    assert calls["waited"] is True
+    assert calls["closed"] is True
+
+
+def test_openpi_fast_worker_reply_prefers_protocol_stream(monkeypatch) -> None:
+    import io
+
+    protocol_stream = io.StringIO()
+    monkeypatch.setattr(fast_worker_module, "_PROTOCOL_STDOUT", protocol_stream)
+
+    fast_worker_module._reply({"ok": True})
+
+    assert protocol_stream.getvalue() == '{"ok": true}\n'
+
+
+def test_openpi_fast_worker_captures_non_protocol_stdout(monkeypatch) -> None:
+    warnings: list[str] = []
+
+    def _fake_dispatch(session, op, payload):
+        _ = session, op, payload
+        print("Tokens: [1, 2, 3]")
+        return {"ok": True}, False
+
+    monkeypatch.setattr(fast_worker_module, "_dispatch", _fake_dispatch)
+    monkeypatch.setattr(fast_worker_module.logger, "warning", lambda msg, *args: warnings.append(msg % args if args else msg))
+
+    payload, should_stop = fast_worker_module._dispatch_with_protocol_stdout(None, "save_sampler_weights", {})
+
+    assert payload == {"ok": True}
+    assert should_stop is False
+    assert warnings == ["Suppressed non-protocol stdout from OpenPI worker: Tokens: [1, 2, 3]"]
+
+
+def test_openpi_pi05_worker_reply_prefers_protocol_stream(monkeypatch) -> None:
+    import io
+
+    protocol_stream = io.StringIO()
+    monkeypatch.setattr(pi05_worker_module, "_PROTOCOL_STDOUT", protocol_stream)
+
+    pi05_worker_module._reply({"ok": True})
+
+    assert protocol_stream.getvalue() == '{"ok": true}\n'
+
+
+def test_openpi_pi05_worker_captures_non_protocol_stdout(monkeypatch) -> None:
+    warnings: list[str] = []
+
+    def _fake_dispatch(session, op, payload):
+        _ = session, op, payload
+        print("Tokens: [1, 2, 3]")
+        return {"ok": True}, False
+
+    monkeypatch.setattr(pi05_worker_module, "_dispatch", _fake_dispatch)
+    monkeypatch.setattr(pi05_worker_module.logger, "warning", lambda msg, *args: warnings.append(msg % args if args else msg))
+
+    payload, should_stop = pi05_worker_module._dispatch_with_protocol_stdout(None, "save_sampler_weights", {})
+
+    assert payload == {"ok": True}
+    assert should_stop is False
+    assert warnings == ["Suppressed non-protocol stdout from OpenPI worker: Tokens: [1, 2, 3]"]
