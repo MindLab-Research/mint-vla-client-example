@@ -26,6 +26,9 @@ class _StubFutureStore:
     def resolve(self, request_id: str, payload: dict) -> None:
         self.resolved.append((request_id, payload))
 
+    async def async_resolve(self, request_id: str, payload: dict) -> None:
+        self.resolve(request_id, payload)
+
     async def async_fail(self, request_id: str, message: str) -> None:
         self.failed.append((request_id, message))
 
@@ -193,6 +196,7 @@ def test_mint_interpolate_route_enqueues_expected_request(monkeypatch) -> None:
 
 def test_mint_reverse_kl_route_and_background_path(monkeypatch) -> None:
     from tinker_server.routes import mint as mint_routes
+    from tinker_server.routes import training as training_routes
     from tinker_server.models.mint_types import ForwardBackwardReverseKLRequest
 
     future_store = _StubFutureStore()
@@ -231,6 +235,15 @@ def test_mint_reverse_kl_route_and_background_path(monkeypatch) -> None:
                 "type": "mint_forward_backward_reverse_kl",
             }
 
+    async def _get_training_route_session_info(model_id: str):
+        if model_id == "model-123":
+            return {
+                "model_id": model_id,
+                "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+                "backend": "megatron",
+            }
+        return None
+
     monkeypatch.setattr(mint_routes, "future_store", future_store)
     monkeypatch.setattr(mint_routes, "training_engine", _StubTrainingEngine())
     monkeypatch.setattr(mint_routes, "training_manager", _StubTrainingManager())
@@ -241,11 +254,11 @@ def test_mint_reverse_kl_route_and_background_path(monkeypatch) -> None:
 
     import tinker_server.backend.capacity_manager as capacity_module
     import tinker_server.backend.api_work_queue as queue_module
-    from tinker_server.routes import training as training_routes
 
     monkeypatch.setattr(capacity_module, "capacity_manager", capacity)
     monkeypatch.setattr(queue_module, "api_work_queue", queue)
     monkeypatch.setattr(training_routes, "_get_max_model_len", lambda _base_model: 2048)
+    monkeypatch.setattr(training_routes, "_get_training_route_session_info", _get_training_route_session_info)
 
     app = FastAPI()
     app.include_router(mint_routes.router, prefix="/api/v1/mint")
@@ -306,3 +319,166 @@ def test_mint_reverse_kl_route_and_background_path(monkeypatch) -> None:
             },
         )
     ]
+
+
+def test_mint_reverse_kl_route_uses_detached_training_info_without_route_runtime(monkeypatch) -> None:
+    from tinker_server.routes import mint as mint_routes
+    from tinker_server.routes import training as training_routes
+
+    future_store = _StubFutureStore()
+    capacity = _StubCapacityManager()
+    queue = _StubQueue()
+
+    async def _get_training_route_session_info(model_id: str):
+        if model_id == "model-123":
+            return {
+                "model_id": model_id,
+                "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+                "backend": "megatron",
+            }
+        return None
+
+    monkeypatch.setattr(mint_routes, "future_store", future_store)
+    monkeypatch.setattr(mint_routes, "training_engine", None)
+    monkeypatch.setattr(mint_routes, "training_manager", None)
+    monkeypatch.setattr(mint_routes, "_get_user_id", lambda _request: "user-a")
+    monkeypatch.setattr(mint_routes, "is_admin_request", lambda _request: False)
+    monkeypatch.setattr(mint_routes, "_resolve_checkpoint_for_user", lambda path, **_: "/resolved/ref-step-0010")
+    monkeypatch.setattr(training_routes, "_get_training_route_session_info", _get_training_route_session_info)
+
+    import tinker_server.backend.capacity_manager as capacity_module
+    import tinker_server.backend.api_work_queue as queue_module
+
+    monkeypatch.setattr(capacity_module, "capacity_manager", capacity)
+    monkeypatch.setattr(queue_module, "api_work_queue", queue)
+    monkeypatch.setattr(training_routes, "_get_max_model_len", lambda _base_model: 2048)
+
+    app = FastAPI()
+    app.include_router(mint_routes.router, prefix="/api/v1/mint")
+    client = TestClient(app)
+
+    payload = {
+        "model_id": "model-123",
+        "reference_model_path": "mint://teacher/ref-step-0010",
+        "temperature": 1.0,
+        "data": [
+            {
+                "student_input": {"chunks": [{"type": "encoded_text", "tokens": [1, 2, 3]}]},
+                "reference_input": {"chunks": [{"type": "encoded_text", "tokens": [4, 5, 6]}]},
+                "target_tokens": {"data": [7, 8], "shape": [2], "dtype": "int64"},
+                "weights": {"data": [1.0, 1.0], "shape": [2], "dtype": "float32"},
+            }
+        ],
+    }
+    resp = client.post("/api/v1/mint/forward_backward_reverse_kl", json=payload)
+
+    assert resp.status_code == 200, resp.text
+    request_id = resp.json()["request_id"]
+    assert future_store.created == [request_id]
+    assert future_store.queued == [
+        (request_id, {"op": "mint.forward_backward_reverse_kl", "model_id": "model-123"})
+    ]
+    assert len(queue.calls) == 1
+    queued = queue.calls[0]
+    assert queued["op"] == "mint.forward_backward_reverse_kl"
+    assert queued["request_json"]["reference_model_path"] == "/resolved/ref-step-0010"
+
+
+def test_mint_reverse_kl_route_propagates_detached_store_503(monkeypatch) -> None:
+    from tinker_server.routes import mint as mint_routes
+    from tinker_server.routes import training as training_routes
+    import tinker_server.backend.training_session_store as training_store_module
+
+    async def _get_training_route_session_info(_model_id: str):
+        return None
+
+    async def _async_get_training_session_info(_model_id: str):
+        raise RuntimeError("store down")
+
+    monkeypatch.setattr(training_routes, "_get_training_route_session_info", _get_training_route_session_info)
+    monkeypatch.setattr(training_store_module, "async_get_training_session_info", _async_get_training_session_info)
+    monkeypatch.setattr(mint_routes, "training_manager", None)
+    monkeypatch.setattr(mint_routes, "training_engine", None)
+
+    app = FastAPI()
+    app.include_router(mint_routes.router, prefix="/api/v1/mint")
+    client = TestClient(app)
+
+    payload = {
+        "model_id": "model-123",
+        "reference_model_path": "mint://teacher/ref-step-0010",
+        "temperature": 1.0,
+        "data": [
+            {
+                "student_input": {"chunks": [{"type": "encoded_text", "tokens": [1, 2, 3]}]},
+                "reference_input": {"chunks": [{"type": "encoded_text", "tokens": [4, 5, 6]}]},
+                "target_tokens": {"data": [7, 8], "shape": [2], "dtype": "int64"},
+                "weights": {"data": [1.0, 1.0], "shape": [2], "dtype": "float32"},
+            }
+        ],
+    }
+
+    resp = client.post("/api/v1/mint/forward_backward_reverse_kl", json=payload)
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["detail"] == "Training session store unavailable"
+def test_mint_reverse_kl_route_refreshes_detached_enqueue_protection(monkeypatch) -> None:
+    from tinker_server.routes import mint as mint_routes
+    from tinker_server.routes import training as training_routes
+
+    future_store = _StubFutureStore()
+    capacity = _StubCapacityManager()
+    queue = _StubQueue()
+    protected: list[dict] = []
+
+    async def _get_training_route_session_info(model_id: str):
+        if model_id == "model-123":
+            return {
+                "model_id": model_id,
+                "session_id": "sess-123",
+                "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+                "backend": "megatron",
+            }
+        return None
+
+    async def _protect_training_session_enqueue_window(session_info: dict) -> None:
+        protected.append(dict(session_info))
+
+    monkeypatch.setattr(mint_routes, "future_store", future_store)
+    monkeypatch.setattr(mint_routes, "training_engine", None)
+    monkeypatch.setattr(mint_routes, "training_manager", None)
+    monkeypatch.setattr(mint_routes, "_get_user_id", lambda _request: "user-a")
+    monkeypatch.setattr(mint_routes, "is_admin_request", lambda _request: False)
+    monkeypatch.setattr(mint_routes, "_resolve_checkpoint_for_user", lambda path, **_: "/resolved/ref-step-0010")
+    monkeypatch.setattr(mint_routes, "_protect_training_session_enqueue_window", _protect_training_session_enqueue_window)
+    monkeypatch.setattr(training_routes, "_get_training_route_session_info", _get_training_route_session_info)
+
+    import tinker_server.backend.capacity_manager as capacity_module
+    import tinker_server.backend.api_work_queue as queue_module
+
+    monkeypatch.setattr(capacity_module, "capacity_manager", capacity)
+    monkeypatch.setattr(queue_module, "api_work_queue", queue)
+    monkeypatch.setattr(training_routes, "_get_max_model_len", lambda _base_model: 2048)
+
+    app = FastAPI()
+    app.include_router(mint_routes.router, prefix="/api/v1/mint")
+    client = TestClient(app)
+
+    payload = {
+        "model_id": "model-123",
+        "reference_model_path": "mint://teacher/ref-step-0010",
+        "temperature": 1.0,
+        "data": [
+            {
+                "student_input": {"chunks": [{"type": "encoded_text", "tokens": [1, 2, 3]}]},
+                "reference_input": {"chunks": [{"type": "encoded_text", "tokens": [4, 5, 6]}]},
+                "target_tokens": {"data": [7, 8], "shape": [2], "dtype": "int64"},
+                "weights": {"data": [1.0, 1.0], "shape": [2], "dtype": "float32"},
+            }
+        ],
+    }
+
+    resp = client.post("/api/v1/mint/forward_backward_reverse_kl", json=payload)
+
+    assert resp.status_code == 200, resp.text
+    assert [entry["session_id"] for entry in protected] == ["sess-123"]

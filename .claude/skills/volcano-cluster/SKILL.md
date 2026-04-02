@@ -226,22 +226,25 @@ PY
    ```
    Do not assume the shared PFS copy of the template is current. Submit the checked-in local template you are actually reviewing.
 
-2. **Get head IP from logs:**
+2. **Get head IP from logs and confirm PFS publication:**
    ```bash
    ssh mint-dev '/root/.volc/bin/volc ml_task logs -t <head_task_id> -i worker_0 | grep \"Local node IP\"'
+   ssh mint-dev 'cat /vePFS-Mindverse/share/code/tinker-server/ray_head_ip.txt'
    ```
 
-3. **Copy template and fill in head IP + choose GPU queue:**
+3. **Copy worker template and set only the GPU queue:**
    ```bash
    cp .claude/skills/volcano-cluster/configs/mint-dev-worker.yaml /tmp/mint-dev-worker.yaml
-   sed -i "s/<RAY_HEAD_IP>/<actual_ip>/g" /tmp/mint-dev-worker.yaml
    sed -i "s/<GPU_QUEUE_ID>/<queue_id>/g" /tmp/mint-dev-worker.yaml
    ```
+   `mint-dev-worker.yaml` reads the head IP from `/vePFS-Mindverse/share/code/tinker-server/ray_head_ip.txt`, so do not patch the head IP into the worker template.
    Choose a GPU queue that is currently available in the Volcano console. If only prod GPU queues are available, get user approval before submitting dev workers.
 
-4. **Submit worker from temp file:**
+4. **Submit one worker task per node:**
    ```bash
-   ssh mint-dev '/root/.volc/bin/volc ml_task submit -c /tmp/mint-dev-worker.yaml --output json'
+   for i in 1 2 3 4 5 6; do
+     ssh mint-dev "/root/.volc/bin/volc ml_task submit -c /tmp/mint-dev-worker.yaml --task_name mint_dev_worker${i} --output json"
+   done
    ```
 
 5. **Do not run `ray start` on `mint-dev`:**

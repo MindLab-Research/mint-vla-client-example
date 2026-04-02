@@ -6,10 +6,10 @@ import os
 from fastapi.responses import JSONResponse
 
 
-def _startup_degraded_response() -> JSONResponse | None:
-    from .health_state import get_startup_degraded_state
+def _degraded_response() -> JSONResponse | None:
+    from .health_state import get_runtime_degraded_state, get_startup_degraded_state
 
-    degraded = get_startup_degraded_state()
+    degraded = get_runtime_degraded_state() or get_startup_degraded_state()
     if degraded is None:
         return None
     return JSONResponse(
@@ -25,7 +25,7 @@ def _startup_degraded_response() -> JSONResponse | None:
 
 def public_healthz_response() -> dict | JSONResponse:
     """Return cheap public API-worker health without probing Ray or other backends."""
-    degraded = _startup_degraded_response()
+    degraded = _degraded_response()
     if degraded is not None:
         return degraded
     return {"status": "ready"}
@@ -33,7 +33,7 @@ def public_healthz_response() -> dict | JSONResponse:
 
 async def deep_healthz_response() -> dict | JSONResponse:
     """Return internal deep health with Ray and placement-group observations."""
-    degraded = _startup_degraded_response()
+    degraded = _degraded_response()
     if degraded is not None:
         return degraded
 

@@ -55,6 +55,21 @@ def _create_payload(session: TrainingSession, *, learning_rate: float = 1e-4) ->
     }
 
 
+def _reset_shared_runtime_test_state(monkeypatch, openpi_shared_ray_runtime) -> None:
+    monkeypatch.setattr(
+        openpi_shared_ray_runtime,
+        "get_resource_pool",
+        lambda: SimpleNamespace(
+            unregister=lambda *_args, **_kwargs: None,
+            register=lambda **_kwargs: None,
+            mark_ready=lambda *_args, **_kwargs: None,
+            touch=lambda *_args, **_kwargs: None,
+        ),
+    )
+    monkeypatch.setattr(openpi_shared_ray_runtime.ray, "is_initialized", lambda: False)
+    openpi_shared_ray_runtime.clear_openpi_shared_runtime_pool()
+
+
 def test_start_openpi_shared_ray_runtime_reuses_actor_for_same_pool_key(monkeypatch) -> None:
     from tinker_server.backend import openpi_shared_ray_runtime
 
@@ -88,7 +103,7 @@ def test_start_openpi_shared_ray_runtime_reuses_actor_for_same_pool_key(monkeypa
         async def close(self):
             return None
 
-    openpi_shared_ray_runtime.clear_openpi_shared_runtime_pool()
+    _reset_shared_runtime_test_state(monkeypatch, openpi_shared_ray_runtime)
     monkeypatch.setattr(openpi_shared_ray_runtime, "ensure_openpi_ray_initialized", lambda: None)
     monkeypatch.setattr(openpi_shared_ray_runtime, "OpenPISharedRayRuntimeActor", _FakeActorBuilder())
     monkeypatch.setattr(openpi_shared_ray_runtime, "OpenPISharedRayRuntimeClient", _FakeClient)
@@ -178,7 +193,7 @@ def test_start_openpi_shared_ray_runtime_registers_actor_metadata_in_resource_po
         def touch(self, actor_name):
             state["touch"] = actor_name
 
-    openpi_shared_ray_runtime.clear_openpi_shared_runtime_pool()
+    _reset_shared_runtime_test_state(monkeypatch, openpi_shared_ray_runtime)
     monkeypatch.setattr(openpi_shared_ray_runtime, "ensure_openpi_ray_initialized", lambda: None)
     monkeypatch.setattr(openpi_shared_ray_runtime, "OpenPISharedRayRuntimeActor", _FakeActorBuilder())
     monkeypatch.setattr(openpi_shared_ray_runtime, "OpenPISharedRayRuntimeClient", _FakeClient)
@@ -278,7 +293,7 @@ def test_shared_client_close_cleans_up_new_actor_after_failed_initial_create_ses
     def _fake_ray_kill(actor, *, no_restart=True):
         state["kill_calls"].append((actor, no_restart))
 
-    openpi_shared_ray_runtime.clear_openpi_shared_runtime_pool()
+    _reset_shared_runtime_test_state(monkeypatch, openpi_shared_ray_runtime)
     monkeypatch.setattr(openpi_shared_ray_runtime, "ensure_openpi_ray_initialized", lambda: None)
     monkeypatch.setattr(openpi_shared_ray_runtime, "OpenPISharedRayRuntimeActor", _FakeActorBuilder())
     monkeypatch.setattr(openpi_shared_ray_runtime, "get_resource_pool", lambda: _FakePool())
@@ -383,7 +398,7 @@ def test_shared_client_close_does_not_kill_actor_after_successful_create_session
     def _fake_ray_kill(actor, *, no_restart=True):
         state["kill_calls"].append((actor, no_restart))
 
-    openpi_shared_ray_runtime.clear_openpi_shared_runtime_pool()
+    _reset_shared_runtime_test_state(monkeypatch, openpi_shared_ray_runtime)
     monkeypatch.setattr(openpi_shared_ray_runtime, "ensure_openpi_ray_initialized", lambda: None)
     monkeypatch.setattr(openpi_shared_ray_runtime, "OpenPISharedRayRuntimeActor", _FakeActorBuilder())
     monkeypatch.setattr(openpi_shared_ray_runtime, "get_resource_pool", lambda: _FakePool())
@@ -448,7 +463,7 @@ def test_start_openpi_shared_ray_runtime_uses_model_id_as_runtime_session_key(mo
         def touch(self, actor_name):
             _ = actor_name
 
-    openpi_shared_ray_runtime.clear_openpi_shared_runtime_pool()
+    _reset_shared_runtime_test_state(monkeypatch, openpi_shared_ray_runtime)
     monkeypatch.setattr(openpi_shared_ray_runtime, "ensure_openpi_ray_initialized", lambda: None)
     monkeypatch.setattr(openpi_shared_ray_runtime, "OpenPISharedRayRuntimeActor", _FakeActorBuilder())
     monkeypatch.setattr(openpi_shared_ray_runtime, "OpenPISharedRayRuntimeClient", _FakeClient)
@@ -523,7 +538,7 @@ def test_start_openpi_shared_ray_runtime_cleans_up_detached_actor_when_ready_fai
     def _fake_ray_kill(actor, *, no_restart=True):
         state["kill_calls"].append((actor, no_restart))
 
-    openpi_shared_ray_runtime.clear_openpi_shared_runtime_pool()
+    _reset_shared_runtime_test_state(monkeypatch, openpi_shared_ray_runtime)
     monkeypatch.setattr(openpi_shared_ray_runtime, "ensure_openpi_ray_initialized", lambda: None)
     monkeypatch.setattr(openpi_shared_ray_runtime, "OpenPISharedRayRuntimeActor", _FakeActorBuilder())
     monkeypatch.setattr(openpi_shared_ray_runtime, "OpenPISharedRayRuntimeClient", _FailingClient)

@@ -12,6 +12,7 @@ without depending on a specific Mint/Tinker SDK install.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import pathlib
@@ -218,15 +219,17 @@ def _create_synthetic_pending_training_future(model_id: str, *, ray_address: str
     from tinker_server.backend.future_store import future_store
 
     request_id = f"issue368-synthetic-{uuid.uuid4().hex}"
-    future_store.create_with_id(request_id)
-    future_store.mark_running(
-        request_id,
-        meta={
-            "op": "training.optim_step",
-            "model_id": model_id,
-            "queue_state": "running",
-            "queue_state_reason": "issue368_synthetic_pending_future",
-        },
+    asyncio.run(future_store.async_create_with_id(request_id))
+    asyncio.run(
+        future_store.async_mark_running(
+            request_id,
+            meta={
+                "op": "training.optim_step",
+                "model_id": model_id,
+                "queue_state": "running",
+                "queue_state_reason": "issue368_synthetic_pending_future",
+            },
+        )
     )
     return request_id
 
@@ -243,9 +246,9 @@ def _wait_for_synthetic_future_failure(
 
     deadline = time.monotonic() + timeout_s
     while True:
-        status = future_store.get_status(request_id)
+        status = asyncio.run(future_store.async_get_status(request_id))
         if status == FutureStatus.FAILED:
-            return status.value, future_store.get_error(request_id)
+            return status.value, asyncio.run(future_store.async_get_error(request_id))
         if time.monotonic() > deadline:
             raise TimeoutError(f"synthetic future {request_id} did not fail within {timeout_s}s (status={status.value})")
         time.sleep(1.0)

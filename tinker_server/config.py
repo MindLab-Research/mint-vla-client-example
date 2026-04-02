@@ -17,6 +17,7 @@ from .runtime_env import (
     build_runtime_pythonpath,
     env_nonempty as _runtime_env_nonempty,
 )
+from .checkpoints import DEFAULT_RUNTIME_CHECKPOINTS_DIR
 from .ray_utils import require_ray_address
 
 
@@ -183,6 +184,9 @@ def actor_runtime_env_vars(*, pythonpath: str, extra: dict[str, str] | None = No
         "TINKER_ACTOR_LD_LIBRARY_PATH",
         "MINT_SFT_DIAG_FAIL",
         "MINT_REVERSE_KL_DIAG_FAIL",
+        "TINKER_DENSE_SESSION_STATE_ROOT",
+        "TINKER_RUNTIME_CHECKPOINT_DIR",
+        "TINKER_LEGACY_DENSE_SESSION_STATE_ROOTS",
     ):
         value = _env_nonempty(os.environ, key)
         if value is not None:
@@ -205,11 +209,14 @@ def actor_runtime_env(*, pythonpath: str, extra: dict[str, str] | None = None) -
 
 
 def preferred_vllm_python_executable() -> str | None:
+    explicit = _env_nonempty(os.environ, "MINT_VLLM_CHILD_PYTHON_EXECUTABLE")
+    if explicit:
+        return explicit
     if PFS_TINKER_PATH:
         candidate = Path(PFS_TINKER_PATH) / "scripts" / "vllm_worker_python.py"
         if candidate.exists():
             return str(candidate)
-    return _env_nonempty(os.environ, "MINT_VLLM_CHILD_PYTHON_EXECUTABLE")
+    return None
 
 
 def preferred_torch_lib_dirs(environ: dict[str, str] | None = None) -> list[str]:
@@ -340,6 +347,10 @@ class ServerConfig:
     training_enable_sdp: bool = True
     training_megatron_create_timeout_s: float = 1800.0
     training_dense_get_or_create_timeout_s: float = 1800.0
+    training_dense_session_state_root: str = os.path.join(
+        DEFAULT_RUNTIME_CHECKPOINTS_DIR,
+        "dense_session_state",
+    )
     training_reinit_lora_timeout_s: float = 0.0
     training_actor_ready_timeout_s: float | None = None
 
@@ -383,6 +394,10 @@ class ServerConfig:
         file_prewarm = config_file.prewarm if config_file is not None else None
         file_docs = config_file.docs if config_file is not None else None
         file_internal = config_file.internal if config_file is not None else None
+        dense_session_state_default_root = os.path.join(
+            _env_nonempty(environ, "TINKER_RUNTIME_CHECKPOINT_DIR") or DEFAULT_RUNTIME_CHECKPOINTS_DIR,
+            "dense_session_state",
+        )
 
         def _pick_str(name: str, file_value: str | None, default: str) -> str:
             v = _env_nonempty(environ, name)
@@ -650,6 +665,11 @@ class ServerConfig:
                 "MINT_DENSE_GET_OR_CREATE_TIMEOUT_S",
                 file_training.dense_get_or_create_timeout_s if file_training is not None else None,
                 1800.0,
+            ),
+            training_dense_session_state_root=_pick_str(
+                "TINKER_DENSE_SESSION_STATE_ROOT",
+                file_training.dense_session_state_root if file_training is not None else None,
+                dense_session_state_default_root,
             ),
             training_reinit_lora_timeout_s=_pick_float(
                 "MINT_REINIT_LORA_TIMEOUT_S",

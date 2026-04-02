@@ -33,6 +33,7 @@ def test_issue_301_actor_entrypoints_call_observability_init():
         "tinker_server/backend/api_work_queue.py": 1,
         "tinker_server/backend/capacity_manager.py": 1,
         "tinker_server/backend/future_store.py": 1,
+        "tinker_server/backend/sampling_session_store.py": 1,
         "tinker_server/backend/session_index_store.py": 1,
         "tinker_server/backend/training_session_store.py": 1,
         "tinker_server/backend/gateway_session_store.py": 1,

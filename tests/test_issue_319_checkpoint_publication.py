@@ -29,6 +29,9 @@ class _StubFutureStore:
         self.resolve = resolve or (lambda *_args, **_kwargs: None)
         self.async_fail = async_fail or (lambda *_args, **_kwargs: None)
 
+    async def async_resolve(self, request_id: str, payload: dict[str, object]) -> None:
+        self.resolve(request_id, payload)
+
 
 @pytest.fixture
 def anyio_backend():

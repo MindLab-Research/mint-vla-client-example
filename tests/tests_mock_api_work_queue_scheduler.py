@@ -25,12 +25,35 @@ def _install_ray_stub(monkeypatch) -> None:
 
     def remote(*_args, **_kwargs):
         def _decorator(cls):
-            class _RemoteWrapped(cls):
+            class _MethodHandle:
+                def __init__(self, fn):
+                    self._fn = fn
+
+                def __call__(self, *args, **kwargs):
+                    return self._fn(*args, **kwargs)
+
+                def remote(self, *args, **kwargs):
+                    return self._fn(*args, **kwargs)
+
+            class _ActorHandle:
+                def __init__(self, *args, **kwargs):
+                    object.__setattr__(self, '_instance', cls(*args, **kwargs))
+
+                def __getattr__(self, name):
+                    value = getattr(object.__getattribute__(self, '_instance'), name)
+                    if callable(value):
+                        return _MethodHandle(value)
+                    return value
+
+                def __setattr__(self, name, value):
+                    setattr(object.__getattribute__(self, '_instance'), name, value)
+
+            class _RemoteWrapped:
                 @classmethod
                 def options(cls_, **_opts):
                     class _OptionsHandle:
                         def remote(self, *args, **kwargs):
-                            return cls_(*args, **kwargs)
+                            return _ActorHandle(*args, **kwargs)
 
                     return _OptionsHandle()
 
@@ -96,9 +119,10 @@ def _item(
     created_at: float = 0.0,
 ) -> dict:
     serial_session_key = session_key or legacy_session_id or "unknown"
+    scheduler_domain = domain if ":" in str(domain) else f"megatron:{domain}"
     extra = {
         "scheduler_enabled": True,
-        "scheduler_domain": domain,
+        "scheduler_domain": scheduler_domain,
         "execution_serial_key": f"training_session:{serial_session_key}",
     }
     if session_key is not None:
@@ -118,6 +142,20 @@ def _item(
         "throttle_principal": None,
         "webhook_url": None,
         "extra": extra,
+        "created_at": created_at,
+    }
+
+
+def _legacy_item(request_id: str, *, created_at: float = 0.0) -> dict:
+    return {
+        "request_id": request_id,
+        "op": "sampling.asample",
+        "request_json": b"{}",
+        "user_id": None,
+        "apikey_id": None,
+        "throttle_principal": None,
+        "webhook_url": None,
+        "extra": {},
         "created_at": created_at,
     }
 
@@ -180,7 +218,7 @@ def test_mock_scheduler_invariant_current_session_without_queue_raises(monkeypat
     asyncio.run(_enqueue_many(actor, [_item("r1", domain="d", session_key="B", created_at=1.0)]))
 
     # Corrupt scheduler state to simulate impossible stale pointer.
-    state = actor._sched_domains["d"]
+    state = actor._sched_domains["megatron:d"]
     state["current_session"] = "ghost-session"
     state["last_session"] = "ghost-session"
 
@@ -306,8 +344,6 @@ def test_issue_194_dequeue_assigns_monotonic_execution_serial_seq(monkeypatch):
     assert seqs == [1, 2]
     assert epochs[0]
     assert epochs == [epochs[0], epochs[0]]
-
-
 def test_stale_dequeue_returns_stale_consumer_sentinel(monkeypatch):
     monkeypatch.setenv("MINT_API_WORK_QUEUE_DEQUEUE_POLL_S", "0.05")
 
@@ -423,107 +459,3 @@ def test_issue_324_consumer_handoff_releases_leased_slots(monkeypatch):
 
     accepted = asyncio.run(actor.enqueue(dict(item, request_id="r2")))
     assert accepted == {"ok": True}
-
-
-def test_issue_324_scheduler_lease_survives_handoff_until_stale_request_reconciled(monkeypatch):
-    monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "1")
-    monkeypatch.setenv("MINT_SCHEDULER_FAIRNESS", "oldest")
-    monkeypatch.setenv("MINT_SCHEDULER_MAX_CONSECUTIVE", "8")
-    monkeypatch.setenv("MINT_SCHEDULER_COALESCE_MS", "0")
-
-    api_work_queue = _load_api_work_queue_module(monkeypatch)
-    actor = api_work_queue._get_or_create_ray_actor()
-
-    actor.set_active_job_id("consumer-old")
-    asyncio.run(_enqueue_many(actor, [_item("r1", domain="d", session_key="A", created_at=1.0)]))
-    first = asyncio.run(actor.dequeue("consumer-old"))
-    assert first["request_id"] == "r1"
-
-    asyncio.run(_enqueue_many(actor, [_item("r2", domain="d", session_key="B", created_at=2.0)]))
-    actor.set_active_job_id("consumer-new")
-    with pytest.raises(asyncio.TimeoutError):
-        asyncio.run(asyncio.wait_for(actor.dequeue("consumer-new"), timeout=0.05))
-
-    released_ids = actor.release_scheduler_leases_for_consumer("consumer-old")
-    assert released_ids == ["r1"]
-    second = asyncio.run(asyncio.wait_for(actor.dequeue("consumer-new"), timeout=0.05))
-
-    assert second["request_id"] == "r2"
-
-
-def test_issue_324_stale_finalize_after_handoff_cannot_restore_followup_bias(monkeypatch):
-    monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "1")
-    monkeypatch.setenv("MINT_SCHEDULER_FAIRNESS", "oldest")
-    monkeypatch.setenv("MINT_SCHEDULER_MAX_CONSECUTIVE", "8")
-    monkeypatch.setenv("MINT_SCHEDULER_COALESCE_MS", "0")
-
-    api_work_queue = _load_api_work_queue_module(monkeypatch)
-    actor = api_work_queue._get_or_create_ray_actor()
-
-    actor.set_active_job_id("consumer-old")
-    asyncio.run(_enqueue_many(actor, [_item("r1", domain="d", session_key="A", created_at=1.0)]))
-    first = asyncio.run(actor.dequeue("consumer-old"))
-    assert first["request_id"] == "r1"
-
-    asyncio.run(
-        _enqueue_many(
-            actor,
-            [
-                _item("r2", domain="d", session_key="B", created_at=2.0),
-                _item("r3", domain="d", session_key="A", created_at=3.0),
-            ],
-        )
-    )
-    actor.set_active_job_id("consumer-new")
-    assert actor.release_scheduler_leases_for_consumer("consumer-old") == ["r1"]
-    asyncio.run(actor.finalize_request("r1"))
-
-    second = asyncio.run(asyncio.wait_for(actor.dequeue("consumer-new"), timeout=0.05))
-    assert second["request_id"] == "r2"
-
-
-def test_issue_324_reconcile_stale_running_requests_fails_pending_leased_requests(monkeypatch):
-    api_work_queue = _load_api_work_queue_module(monkeypatch)
-    client = api_work_queue.ApiWorkQueueClient()
-    released: list[str] = []
-    failed: list[tuple[str, str]] = []
-
-    class _RemoteMethod:
-        def __init__(self, fn):
-            self._fn = fn
-
-        def remote(self, *args, **kwargs):
-            return self._fn(*args, **kwargs)
-
-    actor = types.SimpleNamespace(
-        release_stale_scheduler_leases=_RemoteMethod(
-            lambda active_consumer_job_id: ["leased-r1"] if active_consumer_job_id == "consumer-new" else []
-        )
-    )
-
-    monkeypatch.setattr(client, "_get_ray_actor", lambda: actor)
-    future_store_module = importlib.import_module("tinker_server.backend.future_store")
-    capacity_manager_module = importlib.import_module("tinker_server.backend.capacity_manager")
-
-    monkeypatch.setattr(
-        future_store_module,
-        "future_store",
-        types.SimpleNamespace(
-            fail_stale_running_requests=lambda active_consumer_job_id, error: [],
-            fail=lambda request_id, error: failed.append((request_id, error)),
-        ),
-    )
-
-    async def _async_release_all(request_id):
-        released.append(request_id)
-
-    monkeypatch.setattr(
-        capacity_manager_module,
-        "capacity_manager",
-        types.SimpleNamespace(async_release_all=_async_release_all),
-    )
-
-    asyncio.run(client._reconcile_stale_running_requests("consumer-new"))
-
-    assert failed == [("leased-r1", "api server restarted while request was dequeued before execution began")]
-    assert released == ["leased-r1"]

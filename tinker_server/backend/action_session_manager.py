@@ -7,7 +7,11 @@ from typing import Any, Awaitable, Callable
 from ..checkpoints import get_checkpoints_dir, resolve_checkpoint_uri
 from ..models.types import ActRequest, ModelInput, TensorData
 from .model_registry import get_model_config
-from .openpi_action_ray_runtime import start_openpi_action_ray_runtime
+from .openpi_action_ray_runtime import (
+    OpenPIActionRayRuntimeClient,
+    _actor_ready_timeout_s,
+    start_openpi_action_ray_runtime,
+)
 from .openpi_fast_action_runtime import OpenPIFastActionRuntimeSpec
 from .openpi_fast_training import (
     OPENPI_FAST_TRAINING_BACKEND,
@@ -17,6 +21,7 @@ from .openpi_pi05_training import (
     OPENPI_PI05_TRAINING_BACKEND,
     get_openpi_pi05_config_name,
 )
+from .resource_pool import ActorType, get_resource_pool
 
 
 def _is_openpi_fast_model(base_model: str) -> bool:
@@ -67,6 +72,47 @@ async def _default_pi05_runtime_factory(
         base_model=base_model,
         spec=spec,
     )
+
+
+def _runtime_spec_for_worker_module(worker_module: str | None) -> OpenPIFastActionRuntimeSpec:
+    spec = OpenPIFastActionRuntimeSpec.from_env()
+    if worker_module:
+        return dataclasses.replace(spec, worker_module=str(worker_module))
+    return spec
+
+
+def _recover_detached_action_runtime_client(
+    *,
+    action_session_id: str,
+    supports_base_model: Callable[[str], bool],
+) -> OpenPIActionRayRuntimeClient | None:
+    pool = get_resource_pool()
+    for entry in pool.iter_entries(prune_stale=True):
+        metadata = dict(entry.metadata or {})
+        if entry.actor_type != ActorType.OPENPI:
+            continue
+        if str(metadata.get("action_session_id") or entry.current_session or "") != action_session_id:
+            continue
+        base_model = str(entry.base_model or "")
+        if not supports_base_model(base_model):
+            continue
+        worker_module = str(metadata.get("worker_module") or "")
+        if not worker_module:
+            continue
+        current = pool.get(entry.actor_name)
+        actor_entry = current or entry
+        actor_handle = actor_entry.actor_handle
+        if actor_handle is None:
+            continue
+        spec = _runtime_spec_for_worker_module(worker_module)
+        return OpenPIActionRayRuntimeClient(
+            actor=actor_handle,
+            actor_name=actor_entry.actor_name,
+            spec=spec,
+            action_session_id=action_session_id,
+            ready_timeout_s=_actor_ready_timeout_s(spec),
+        )
+    return None
 
 
 class OpenPIFastActionSessionManager:
@@ -146,10 +192,16 @@ class OpenPIFastActionSessionManager:
         observation: ModelInput,
         extra_inputs: dict[str, TensorData],
     ) -> dict[str, Any]:
-        try:
-            runtime = self._runtime_clients[action_session_id]
-        except KeyError as exc:
-            raise KeyError(f"Unknown action_session_id: {action_session_id}") from exc
+        runtime = self._runtime_clients.get(action_session_id)
+        if runtime is None:
+            runtime = _recover_detached_action_runtime_client(
+                action_session_id=action_session_id,
+                supports_base_model=_is_openpi_fast_model,
+            )
+            if runtime is not None:
+                self._runtime_clients[action_session_id] = runtime
+        if runtime is None:
+            raise KeyError(f"Unknown action_session_id: {action_session_id}")
         request = ActRequest(
             action_session_id=action_session_id,
             observation=observation,
@@ -159,6 +211,11 @@ class OpenPIFastActionSessionManager:
 
     async def shutdown_session(self, action_session_id: str) -> None:
         runtime = self._runtime_clients.pop(action_session_id, None)
+        if runtime is None:
+            runtime = _recover_detached_action_runtime_client(
+                action_session_id=action_session_id,
+                supports_base_model=_is_openpi_fast_model,
+            )
         if runtime is None:
             return
         try:
@@ -250,10 +307,16 @@ class OpenPIPi05ActionSessionManager:
         observation: ModelInput,
         extra_inputs: dict[str, TensorData],
     ) -> dict[str, Any]:
-        try:
-            runtime = self._runtime_clients[action_session_id]
-        except KeyError as exc:
-            raise KeyError(f"Unknown action_session_id: {action_session_id}") from exc
+        runtime = self._runtime_clients.get(action_session_id)
+        if runtime is None:
+            runtime = _recover_detached_action_runtime_client(
+                action_session_id=action_session_id,
+                supports_base_model=_is_openpi_pi05_model,
+            )
+            if runtime is not None:
+                self._runtime_clients[action_session_id] = runtime
+        if runtime is None:
+            raise KeyError(f"Unknown action_session_id: {action_session_id}")
         request = ActRequest(
             action_session_id=action_session_id,
             observation=observation,
@@ -263,6 +326,11 @@ class OpenPIPi05ActionSessionManager:
 
     async def shutdown_session(self, action_session_id: str) -> None:
         runtime = self._runtime_clients.pop(action_session_id, None)
+        if runtime is None:
+            runtime = _recover_detached_action_runtime_client(
+                action_session_id=action_session_id,
+                supports_base_model=_is_openpi_pi05_model,
+            )
         if runtime is None:
             return
         try:
@@ -295,6 +363,22 @@ class ActionSessionRouter:
             return self._openpi_pi05
         raise ValueError(f"Action inference does not support {base_model!r}")
 
+    def _recover_manager_for_session(self, action_session_id: str) -> object | None:
+        pool = get_resource_pool()
+        for entry in pool.iter_entries(prune_stale=True):
+            metadata = dict(entry.metadata or {})
+            if entry.actor_type != ActorType.OPENPI:
+                continue
+            if str(metadata.get("action_session_id") or entry.current_session or "") != action_session_id:
+                continue
+            try:
+                manager = self._manager_for_model(str(entry.base_model or ""))
+            except ValueError:
+                continue
+            self._manager_for_session[action_session_id] = manager
+            return manager
+        return None
+
     async def create_session(
         self,
         *,
@@ -322,10 +406,11 @@ class ActionSessionRouter:
         observation: ModelInput,
         extra_inputs: dict[str, TensorData],
     ) -> dict[str, Any]:
-        try:
-            manager = self._manager_for_session[action_session_id]
-        except KeyError as exc:
-            raise KeyError(f"Unknown action_session_id: {action_session_id}") from exc
+        manager = self._manager_for_session.get(action_session_id)
+        if manager is None:
+            manager = self._recover_manager_for_session(action_session_id)
+        if manager is None:
+            raise KeyError(f"Unknown action_session_id: {action_session_id}")
         return await manager.act(  # type: ignore[attr-defined]
             action_session_id=action_session_id,
             observation=observation,
@@ -335,9 +420,12 @@ class ActionSessionRouter:
     async def shutdown_session(self, action_session_id: str) -> None:
         manager = self._manager_for_session.pop(action_session_id, None)
         if manager is None:
+            manager = self._recover_manager_for_session(action_session_id)
+        if manager is None:
             await self._openpi_fast.shutdown_session(action_session_id)
             await self._openpi_pi05.shutdown_session(action_session_id)
             return
+        self._manager_for_session.pop(action_session_id, None)
         await manager.shutdown_session(action_session_id)  # type: ignore[attr-defined]
 
     async def shutdown_all(self) -> None:

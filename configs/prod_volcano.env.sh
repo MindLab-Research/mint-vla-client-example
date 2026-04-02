@@ -24,12 +24,13 @@ export MINT_SAVE_LORA_TIMEOUT_S=1800
 export MINT_SCHEDULER_ENABLE=1
 
 # Current worker topology after 2026-03-12 rebuild:
-# worker1=192.168.37.159 worker2=192.168.37.160 worker3=192.168.37.161 worker4=192.168.37.162
-# worker5=192.168.37.163 worker6=192.168.37.156 worker7=192.168.37.157 worker8=192.168.37.158
-export MINT_VLLM_PINNED_NODE_IP_JSON='{"Qwen/Qwen3-0.6B":"192.168.37.159","Qwen/Qwen3-4B-Instruct-2507":"192.168.37.159","Qwen/Qwen3-4B-Thinking-2507":"192.168.37.159","Qwen/Qwen3-30B-A3B-Instruct-2507":"192.168.37.160"}'
-export MINT_DENSE_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.37.159"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.37.159"],"Qwen/Qwen3-4B-Thinking-2507":["192.168.37.159"]}'
-export MINT_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.37.159"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.37.159"],"Qwen/Qwen3-4B-Thinking-2507":["192.168.37.159"],"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.37.160"]}'
-export MINT_VLLM_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.37.159"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.37.159"],"Qwen/Qwen3-4B-Thinking-2507":["192.168.37.159"],"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.37.160"],"Qwen/Qwen3-235B-A22B-Instruct-2507":["192.168.37.161","192.168.37.162"],"Qwen/Qwen3-235B-A22B-Thinking-2507":["192.168.37.161","192.168.37.162"]}'
+# active dense/vllm pin node: 192.168.38.153
+# worker2=192.168.37.160 worker3=192.168.37.161 worker4=192.168.37.162
+# worker5=192.168.37.163 worker6=192.168.37.156 worker7=192.168.37.157 worker8=192.168.37.158 worker9=192.168.38.153
+export MINT_VLLM_PINNED_NODE_IP_JSON='{"Qwen/Qwen3-0.6B":"192.168.38.153","Qwen/Qwen3-4B-Instruct-2507":"192.168.38.153","Qwen/Qwen3-4B-Thinking-2507":"192.168.38.153","Qwen/Qwen3-30B-A3B-Instruct-2507":"192.168.37.160"}'
+export MINT_DENSE_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.38.153"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.38.153"],"Qwen/Qwen3-4B-Thinking-2507":["192.168.38.153"]}'
+export MINT_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.38.153"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.38.153"],"Qwen/Qwen3-4B-Thinking-2507":["192.168.38.153"],"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.37.160"]}'
+export MINT_VLLM_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.38.153"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.38.153"],"Qwen/Qwen3-4B-Thinking-2507":["192.168.38.153"],"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.37.160"],"Qwen/Qwen3-235B-A22B-Instruct-2507":["192.168.37.161","192.168.37.162"],"Qwen/Qwen3-235B-A22B-Thinking-2507":["192.168.37.161","192.168.37.162"]}'
 export MINT_MEGATRON_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.37.160"],"Qwen/Qwen3-235B-A22B-Instruct-2507":["192.168.37.163","192.168.37.156","192.168.37.157","192.168.37.158"],"Qwen/Qwen3-235B-A22B-Thinking-2507":["192.168.37.163","192.168.37.156","192.168.37.157","192.168.37.158"]}'
 
 export MINT_MODEL_CONFIG_OVERRIDES_JSON=''

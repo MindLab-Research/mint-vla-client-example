@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
@@ -58,10 +59,7 @@ if TYPE_CHECKING:
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-# In-memory session storage
-sessions: dict[str, dict] = {}
-
-# Global session manager reference (set by app lifespan)
+# Global session manager reference (set only in execution runtimes or tests)
 session_manager: SessionManager | None = None
 
 
@@ -81,6 +79,19 @@ def _user_visible(request_user_data: dict | None, owner: str | None) -> bool:
     if is_admin_user_data(request_user_data):
         return True
     return bool(owner) and owner == request_user_id
+
+
+def _local_sampling_config(session_id: str) -> tuple[str | None, str | None, int | None]:
+    if session_manager is None:
+        return None, None, None
+    get_base_model = getattr(session_manager, "get_session_base_model", None)
+    get_adapter_path = getattr(session_manager, "get_session_adapter_path", None)
+    get_lora_rank = getattr(session_manager, "get_session_lora_rank", None)
+    return (
+        get_base_model(session_id) if callable(get_base_model) else None,
+        get_adapter_path(session_id) if callable(get_adapter_path) else None,
+        get_lora_rank(session_id) if callable(get_lora_rank) else None,
+    )
 
 
 def _parse_checkpoint_path(model_path: str) -> tuple[str, str] | None:
@@ -253,12 +264,7 @@ async def create_session(request: CreateSessionRequest, http_request: Request) -
     """
     session_id = str(uuid.uuid4())
     user_id = _get_user_id(http_request)
-    sessions[session_id] = {
-        "tags": request.tags,
-        "metadata": request.user_metadata,
-        "user_id": user_id,
-        "created_at": datetime.now().isoformat(),
-    }
+    created_at = datetime.now().isoformat()
     try:
         from ..backend.session_index_store import upsert_session_index
 
@@ -268,7 +274,7 @@ async def create_session(request: CreateSessionRequest, http_request: Request) -
                 "training_run_ids": [],
                 "sampler_ids": [],
                 "user_id": user_id,
-                "created_at": sessions[session_id]["created_at"],
+                "created_at": created_at,
             }
         )
     except Exception as e:
@@ -289,9 +295,6 @@ async def _create_sampling_session_impl(
     First call lazily initializes the multi-LoRA engine (~60s).
     Subsequent calls register sessions instantly (<1s).
     """
-    if session_manager is None:
-        raise HTTPException(status_code=503, detail="Session manager not initialized")
-
     user_id = _get_user_id(http_request)
     created_at = datetime.now().isoformat()
     # Determine base_model from request or infer from model_path.
@@ -440,13 +443,23 @@ async def _create_sampling_session_impl(
 
     if request.sampling_session_seq_id is not None:
         sampling_session_id = f"{request.session_id}:sample:{request.sampling_session_seq_id}"
-        existing_base = session_manager.get_session_base_model(sampling_session_id)
+        existing_info = None
+        try:
+            from ..backend.sampling_session_store import async_get_sampling_session_info
+
+            existing_info = await async_get_sampling_session_info(sampling_session_id)
+        except Exception:
+            existing_info = None
+        if isinstance(existing_info, dict):
+            existing_base = str(existing_info.get("base_model") or "")
+            existing_adapter = existing_info.get("adapter_path")
+            existing_rank = int(existing_info.get("lora_rank") or 0)
+        else:
+            existing_base, existing_adapter, existing_rank = _local_sampling_config(sampling_session_id)
         if existing_base is not None:
-            existing_adapter = session_manager.get_session_adapter_path(sampling_session_id)
-            existing_rank = session_manager.get_session_lora_rank(sampling_session_id) or 0
             expected_adapter = adapter_path if request.model_path else None
             expected_rank = int(lora_rank)
-            if existing_base != base_model or existing_adapter != expected_adapter or int(existing_rank) != expected_rank:
+            if existing_base != base_model or existing_adapter != expected_adapter or int(existing_rank or 0) != expected_rank:
                 raise HTTPException(
                     status_code=409,
                     detail="Sampling session already exists with different configuration",
@@ -456,29 +469,37 @@ async def _create_sampling_session_impl(
     else:
         sampling_session_id = str(uuid.uuid4())
 
-    # Get or create engine for this model (dynamically creates vLLM actor if needed)
-    # Do not block on vLLM cold-start here (can exceed reverse-proxy timeouts).
-    # Warm vLLM in the background; /asample work will await readiness.
-    async def _warm_engine() -> None:
-        try:
-            await session_manager.get_engine_for_model(base_model)
-        except Exception as e:
-            logger.warning(f"[create_sampling_session] warm engine failed: model={base_model} err={e}")
+    try:
+        from ..backend.sampling_session_store import upsert_sampling_session
 
-    asyncio.create_task(_warm_engine())
-
-    if request.model_path:
-        # Register session now; LoRA will be loaded lazily on first /asample.
-        session_manager.register_multi_lora_session(
-            session_id=sampling_session_id,
-            base_model=base_model,
-            lora_rank=lora_rank,
-            adapter_path=adapter_path,
-            lora_loaded=False,
+        upsert_sampling_session(
+            {
+                "session_id": sampling_session_id,
+                "base_model": base_model,
+                "lora_rank": int(lora_rank),
+                "adapter_path": adapter_path,
+                "lora_loaded": False,
+                "lora_int_id": None,
+                "uses_base_model": not bool(request.model_path),
+                "last_activity": time.time(),
+                "inflight_requests": 0,
+                "metadata_version": 1,
+            }
         )
-    else:
-        # Base model (no LoRA): register session directly
-        session_manager.register_base_model_session(sampling_session_id, base_model=base_model)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail="Sampling session store unavailable") from e
+
+    if session_manager is not None:
+        if request.model_path:
+            session_manager.register_multi_lora_session(
+                session_id=sampling_session_id,
+                base_model=base_model,
+                lora_rank=lora_rank,
+                adapter_path=adapter_path,
+                lora_loaded=False,
+            )
+        else:
+            session_manager.register_base_model_session(sampling_session_id, base_model=base_model)
 
     _write_sampler_index(sampling_session_id)
 
@@ -513,18 +534,30 @@ async def ensure_sampling_session(
     sampling_request = CreateSamplingSessionRequest(**request_kwargs)
     response = await create_sampling_session(sampling_request, http_request)
     sampling_session_id = response.sampling_session_id
-    base_model = None if session_manager is None else session_manager.get_session_base_model(sampling_session_id)
+    base_model = None
+    try:
+        from ..backend.sampling_session_store import async_get_sampling_session_info
+
+        info = await async_get_sampling_session_info(sampling_session_id)
+        if isinstance(info, dict):
+            base_model = info.get("base_model")
+    except Exception:
+        base_model = None
+    if base_model is None and session_manager is not None:
+        base_model, _adapter_path, _rank = _local_sampling_config(sampling_session_id)
     if base_model is None:
         remote = await async_remote_sampling_session(sampling_session_id)
         if remote is not None:
             _, base_model = remote
+    if base_model is None:
+        base_model = request_kwargs.get("base_model")
 
     if not base_model:
         raise HTTPException(
             status_code=500,
             detail=f"Sampling session {sampling_session_id!r} missing base_model after creation",
         )
-    return sampling_session_id, base_model
+    return sampling_session_id, str(base_model)
 
 
 @router.get("/sessions/{session_id}", response_model=GetSessionResponse)
@@ -546,10 +579,6 @@ async def get_session(session_id: str, http_request: Request) -> GetSessionRespo
             sampler_ids=list(info.get("sampler_ids") or []),
         )
 
-    entry = sessions.get(session_id)
-    if entry and _user_visible(request_user_data, entry.get("user_id")):
-        return GetSessionResponse(training_run_ids=[], sampler_ids=[])
-
     raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
 
 
@@ -557,7 +586,6 @@ async def get_session(session_id: str, http_request: Request) -> GetSessionRespo
 async def list_sessions(limit: int = 20, offset: int = 0, http_request: Request = None) -> ListSessionsResponse:
     request_user_data = _get_user_data(http_request) if http_request else None
     entries: list[dict] = []
-    seen: set[str] = set()
 
     try:
         from ..backend.session_index_store import async_list_session_index
@@ -573,14 +601,6 @@ async def list_sessions(limit: int = 20, offset: int = 0, http_request: Request 
         if not _user_visible(request_user_data, info.get("user_id")):
             continue
         entries.append({"session_id": sid, "created_at": info.get("created_at")})
-        seen.add(sid)
-
-    for sid, entry in sessions.items():
-        if sid in seen:
-            continue
-        if not _user_visible(request_user_data, entry.get("user_id")):
-            continue
-        entries.append({"session_id": sid, "created_at": entry.get("created_at")})
 
     entries.sort(key=lambda x: str(x.get("session_id") or ""))
     entries.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
@@ -608,8 +628,17 @@ async def get_sampler(sampler_id: str, http_request: Request) -> GetSamplerRespo
         if not _user_visible(request_user_data, info.get("user_id")):
             raise HTTPException(status_code=404, detail=f"Sampler '{sampler_id}' not found")
         base_model = info.get("base_model")
-        if not base_model and session_manager is not None:
-            base_model = session_manager.get_session_base_model(sampler_id)
+        if not base_model:
+            try:
+                from ..backend.sampling_session_store import async_get_sampling_session_info
+
+                detached = await async_get_sampling_session_info(sampler_id)
+            except Exception:
+                detached = None
+            if isinstance(detached, dict):
+                base_model = detached.get("base_model")
+            elif session_manager is not None:
+                base_model, _adapter_path, _rank = _local_sampling_config(sampler_id)
 
         from ..client_compat import checkpoint_uri, prefer_tinker_uri
 
@@ -643,12 +672,26 @@ async def get_sampler(sampler_id: str, http_request: Request) -> GetSamplerRespo
             model_path=model_path,
         )
 
-    if session_manager is not None:
-        base_model = session_manager.get_session_base_model(sampler_id)
+    try:
+        from ..backend.sampling_session_store import async_get_sampling_session_info
+
+        detached = await async_get_sampling_session_info(sampler_id)
+    except Exception:
+        detached = None
+    if isinstance(detached, dict):
+        base_model = detached.get("base_model")
         if base_model:
             return GetSamplerResponse(
                 sampler_id=sampler_id,
-                base_model=base_model,
+                base_model=str(base_model),
+                model_path=None,
+            )
+    if session_manager is not None:
+        base_model, _adapter_path, _rank = _local_sampling_config(sampler_id)
+        if base_model:
+            return GetSamplerResponse(
+                sampler_id=sampler_id,
+                base_model=str(base_model),
                 model_path=None,
             )
 
@@ -784,10 +827,13 @@ async def session_heartbeat(
 
     Accepts heartbeat and returns acknowledgment. Session validation not implemented.
     """
-    session_heartbeat_store.update(request.session_id)
-    if session_manager is not None:
-        # Keep sampling sessions alive during long training phases between sample calls.
-        session_manager.mark_session_inflight(request.session_id, 0)
+    await session_heartbeat_store.async_update(request.session_id)
+    try:
+        from ..backend.sampling_session_store import async_set_sampling_session_last_activity
+
+        await async_set_sampling_session_last_activity(request.session_id, time.time())
+    except Exception as e:
+        raise HTTPException(status_code=503, detail="Sampling session store unavailable") from e
     return SessionHeartbeatResponse()
 
 
@@ -904,6 +950,131 @@ class KillActorsRequest(BaseModel):
     actor_type: str  # "vllm" | "megatron" | "dense" | "all"
     model_name: str | None = None  # optional per-type model filter
     actor_name: str | None = None  # optional exact actor target
+    force: bool = False  # allow killing actors with in-flight work
+    reason: str | None = None  # optional operator-provided audit reason
+
+
+def _entry_actor_type_name(entry: object) -> str:
+    raw = getattr(entry, "actor_type", None)
+    value = getattr(raw, "value", raw)
+    return str(value or "").strip().lower()
+
+
+def _entry_matches_kill_request(
+    entry: object,
+    *,
+    actor_type: str,
+    model_name: str | None,
+    actor_name: str | None,
+) -> bool:
+    entry_name = str(getattr(entry, "actor_name", "") or "")
+    if actor_name is not None and entry_name != actor_name:
+        return False
+
+    entry_type = _entry_actor_type_name(entry)
+    if actor_type != "all" and entry_type != actor_type:
+        return False
+
+    if model_name is not None and str(getattr(entry, "base_model", "") or "") != model_name:
+        return False
+
+    return True
+
+
+def _collect_kill_target_entries(
+    *,
+    actor_type: str,
+    model_name: str | None,
+    actor_name: str | None,
+) -> list[object]:
+    from ..backend.resource_pool import get_resource_pool
+
+    pool = get_resource_pool()
+    return [
+        entry
+        for entry in pool.iter_entries()
+        if _entry_matches_kill_request(
+            entry,
+            actor_type=actor_type,
+            model_name=model_name,
+            actor_name=actor_name,
+        )
+    ]
+
+
+def _kill_target_snapshot(entries: list[object]) -> list[dict[str, object]]:
+    return [
+        {
+            "actor_name": str(getattr(entry, "actor_name", "") or ""),
+            "actor_type": _entry_actor_type_name(entry),
+            "base_model": str(getattr(entry, "base_model", "") or ""),
+            "current_session": getattr(entry, "current_session", None),
+            "inflight_count": int(getattr(entry, "inflight_count", 0) or 0),
+            "creating": bool(getattr(entry, "creating", False)),
+            "protected": bool(getattr(entry, "protected", False)),
+        }
+        for entry in entries
+    ]
+
+
+def _request_audit_fields(request: Request) -> dict[str, object]:
+    user_data = _get_user_data(request)
+    client = getattr(request, "client", None)
+    return {
+        "client_host": getattr(client, "host", None),
+        "x_forwarded_for": request.headers.get("x-forwarded-for"),
+        "user_agent": request.headers.get("user-agent"),
+        "origin": request.headers.get("origin"),
+        "referer": request.headers.get("referer"),
+        "user_id": user_data.get("user_id") if isinstance(user_data, dict) else None,
+        "is_admin": bool(is_admin_user_data(user_data)),
+    }
+
+
+def _log_kill_request(
+    request: Request,
+    body: KillActorsRequest,
+    *,
+    stage: str,
+    targets: list[dict[str, object]],
+    detail: str | None = None,
+    result: dict[str, object] | None = None,
+) -> None:
+    payload: dict[str, object] = {
+        "stage": stage,
+        "actor_type": body.actor_type,
+        "model_name": body.model_name,
+        "actor_name": body.actor_name,
+        "force": body.force,
+        "reason": body.reason,
+        "targets": targets,
+    }
+    payload.update(_request_audit_fields(request))
+    if detail is not None:
+        payload["detail"] = detail
+    if result is not None:
+        payload["result"] = result
+    logger.info("[actors.kill] %s", payload)
+
+
+def _raise_if_busy_kill_targets(
+    *,
+    request: Request,
+    body: KillActorsRequest,
+    targets: list[dict[str, object]],
+) -> None:
+    if body.force:
+        return
+    busy = [target for target in targets if int(target.get("inflight_count", 0) or 0) > 0]
+    if not busy:
+        return
+    actor_list = ", ".join(str(target.get("actor_name") or "<unknown>") for target in busy)
+    detail = (
+        f"Refusing to kill busy actor(s): {actor_list}. "
+        "Pass force=true to override."
+    )
+    _log_kill_request(request, body, stage="blocked_busy", targets=targets, detail=detail)
+    raise HTTPException(status_code=409, detail=detail)
 
 
 def _remove_actor_pg(actor_name: str, *, namespace: str | None = None) -> None:
@@ -1063,6 +1234,16 @@ async def kill_actors(request: Request, body: KillActorsRequest) -> dict:
     model_name = body.model_name
     actor_name = body.actor_name.strip() if body.actor_name else None
 
+    targets = _kill_target_snapshot(
+        _collect_kill_target_entries(
+            actor_type=t,
+            model_name=model_name,
+            actor_name=actor_name,
+        )
+    )
+    _log_kill_request(request, body, stage="received", targets=targets)
+    _raise_if_busy_kill_targets(request=request, body=body, targets=targets)
+
     killed_by_type: dict[str, int] = {"vllm": 0, "megatron": 0, "dense": 0}
 
     if actor_name:
@@ -1084,10 +1265,12 @@ async def kill_actors(request: Request, body: KillActorsRequest) -> dict:
                 raise HTTPException(status_code=503, detail=f"Ray unavailable for dense actor kill: {e}") from e
         else:
             raise HTTPException(status_code=422, detail="actor_type must be one of: vllm, megatron, dense, all")
-        return {
+        result = {
             "killed": int(sum(killed_by_type.values())),
             "killed_by_type": killed_by_type,
         }
+        _log_kill_request(request, body, stage="completed", targets=targets, result=result)
+        return result
 
     if t in ("vllm", "all"):
         from ..backend.multi_lora_engine import kill_persistent_vllm_actor
@@ -1118,7 +1301,9 @@ async def kill_actors(request: Request, body: KillActorsRequest) -> dict:
     if t not in ("vllm", "megatron", "dense", "all"):
         raise HTTPException(status_code=422, detail="actor_type must be one of: vllm, megatron, dense, all")
 
-    return {
+    result = {
         "killed": int(sum(killed_by_type.values())),
         "killed_by_type": killed_by_type,
     }
+    _log_kill_request(request, body, stage="completed", targets=targets, result=result)
+    return result
