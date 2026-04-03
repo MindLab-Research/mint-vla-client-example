@@ -760,7 +760,8 @@ class OpenPIFastWorkerSession:
         )
         try:
             checkpoint_step = max(1, _int_scalar(state.step))
-            params = state.ema_params if getattr(state, "ema_params", None) is not None else state.params
+            # Sampler exports must reflect the current policy params, not a lagging EMA shadow.
+            params = state.params
 
             def save_assets(directory: Path) -> None:
                 data_config = self._data_loader.data_config()

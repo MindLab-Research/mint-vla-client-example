@@ -123,6 +123,11 @@ class OpenPIPi05ActionSession:
         )
 
     def act(self, payload: dict[str, Any]) -> dict[str, Any]:
+        temperature = float(payload.get("temperature", 0.0) or 0.0)
+        if temperature != 0.0:
+            raise ValueError(
+                "OpenPI pi0.5 action inference does not support temperature-based exploration"
+            )
         observation = self._observation_from_payload(payload)
         self._rng, rng = self._jax.random.split(self._rng)
         started = time.monotonic()
@@ -135,7 +140,7 @@ class OpenPIPi05ActionSession:
                 "shape": list(actions.shape),
                 "dtype": "float32",
             },
-            "policy_timing": {"infer_ms": infer_ms},
+            "policy_timing": {"infer_ms": infer_ms, "temperature": temperature},
         }
 
     def shutdown(self) -> dict[str, Any]:

@@ -210,6 +210,7 @@ async def act(
         seq_id=request.seq_id,
         observation=request.observation.model_input,
         extra_inputs={"state": request.observation.state},
+        temperature=request.temperature,
     )
     request_json = queued_request.model_dump_json().encode("utf-8")
     request_id = f"act_{uuid.uuid4().hex}"

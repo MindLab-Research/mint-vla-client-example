@@ -400,6 +400,7 @@ class ActRequest(BaseModel):
     seq_id: int | None = None
     observation: ModelInput
     extra_inputs: dict[str, TensorData] = {}
+    temperature: float | None = None
 
 
 class ActResponse(BaseModel):

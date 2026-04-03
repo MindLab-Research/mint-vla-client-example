@@ -159,8 +159,14 @@ class OpenPIFastActionSession:
     def act(self, payload: dict[str, Any]) -> dict[str, Any]:
         observation = self._observation_from_payload(payload)
         self._rng, rng = self._jax.random.split(self._rng)
+        temperature = float(payload.get("temperature", 0.0) or 0.0)
+        if temperature < 0.0:
+            raise ValueError(f"OpenPI FAST action inference temperature must be non-negative, got {temperature}")
         started = time.monotonic()
-        action_tokens = np.asarray(self._model.sample_actions(rng, observation)[0], dtype=np.int32)
+        action_tokens = np.asarray(
+            self._model.sample_actions(rng, observation, temperature=temperature)[0],
+            dtype=np.int32,
+        )
         actions = np.asarray(
             self._tokenizer.extract_actions(
                 action_tokens,
@@ -176,7 +182,7 @@ class OpenPIFastActionSession:
                 "shape": list(actions.shape),
                 "dtype": "float32",
             },
-            "policy_timing": {"infer_ms": infer_ms},
+            "policy_timing": {"infer_ms": infer_ms, "temperature": temperature},
         }
 
     def shutdown(self) -> dict[str, Any]:

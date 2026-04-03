@@ -191,6 +191,7 @@ class OpenPIFastActionSessionManager:
         action_session_id: str,
         observation: ModelInput,
         extra_inputs: dict[str, TensorData],
+        temperature: float | None = None,
     ) -> dict[str, Any]:
         runtime = self._runtime_clients.get(action_session_id)
         if runtime is None:
@@ -206,6 +207,7 @@ class OpenPIFastActionSessionManager:
             action_session_id=action_session_id,
             observation=observation,
             extra_inputs=extra_inputs,
+            temperature=temperature,
         )
         return await runtime.request("act", request.model_dump(mode="json"))
 
@@ -306,6 +308,7 @@ class OpenPIPi05ActionSessionManager:
         action_session_id: str,
         observation: ModelInput,
         extra_inputs: dict[str, TensorData],
+        temperature: float | None = None,
     ) -> dict[str, Any]:
         runtime = self._runtime_clients.get(action_session_id)
         if runtime is None:
@@ -321,6 +324,7 @@ class OpenPIPi05ActionSessionManager:
             action_session_id=action_session_id,
             observation=observation,
             extra_inputs=extra_inputs,
+            temperature=temperature,
         )
         return await runtime.request("act", request.model_dump(mode="json"))
 
@@ -405,6 +409,7 @@ class ActionSessionRouter:
         action_session_id: str,
         observation: ModelInput,
         extra_inputs: dict[str, TensorData],
+        temperature: float | None = None,
     ) -> dict[str, Any]:
         manager = self._manager_for_session.get(action_session_id)
         if manager is None:
@@ -415,6 +420,7 @@ class ActionSessionRouter:
             action_session_id=action_session_id,
             observation=observation,
             extra_inputs=extra_inputs,
+            temperature=temperature,
         )
 
     async def shutdown_session(self, action_session_id: str) -> None:

@@ -88,6 +88,7 @@ class MintCreateActionSessionResponse(MintBaseModel):
 class VLAActRequest(MintBaseModel):
     seq_id: int | None = None
     observation: VLAObservation
+    temperature: float | None = None
 
 
 class MintDeleteActionSessionResponse(MintBaseModel):
