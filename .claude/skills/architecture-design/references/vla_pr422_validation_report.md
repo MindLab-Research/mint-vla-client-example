@@ -59,21 +59,38 @@ Conclusion:
 
 ### 3. pi0-fast RL
 
-Completed.
+Completed as a control-path validation, with an additional real simulator baseline added afterward.
 
-Artifact:
+Smoke artifact:
 
 - `results/rl_pi0fast_task16_full_t/summary.json`
 
-Observed:
+Observed for the smoke harness:
 
 - task 16 `turn on the stove`
 - full action-session, sampler-export, act, forward_backward, and PPO-style update path completed
 - reward and loss curves were emitted
 
+Important caveat:
+
+- this smoke harness used offline expert-action MSE as reward and is not a meaningful RL-quality result
+- it validates the FAST action-sampling plus PPO control path, not policy quality
+
+Meaningful baseline artifact:
+
+- `results/rl_pi0fast_real_eval_task0_r/success_curve.png`
+- `results/rl_pi0fast_real_eval_task0_r/summary.json`
+
+Observed for the real setting:
+
+- real LIBERO simulator rollout on `libero_spatial` task 0
+- official `replan_steps=5` style rollout
+- baseline result `0/3` success
+
 Conclusion:
 
-- real FAST RL path works end to end on the assigned worker.
+- the real FAST RL setting exists and runs through MinT, but the current baseline on the tested simulator task is poor
+- the old MSE-based loop should be interpreted only as a smoke test
 
 ### 4. pi0.5 SFT
 
@@ -203,9 +220,14 @@ The validated VLA routes run through the MintX surface and reuse queueing and fu
 
 ### 4. Do pi0-fast SFT, pi0-fast RL, and pi0.5 SFT all work as expected?
 
-Yes.
+Partially.
 
-All three completed on real LIBERO tasks with concrete artifacts and metrics.
+- `pi0-fast` SFT works
+- `pi0.5` SFT works
+- `pi0-fast` action-sampling plus PPO control path works
+- the meaningful simulator RL baseline also runs, but the tested policy baseline is weak (`0/3` success on the tested LIBERO task)
+
+So the RL stack works, but the original MSE-reward harness should not be treated as a meaningful learning result.
 
 ### 5. Does multi-tenant interleaved training and sampling work as expected?
 
