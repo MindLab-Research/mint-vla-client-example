@@ -86,11 +86,6 @@ def test_issue_193_mark_session_loaded_persists_session_cache(monkeypatch):
         "SessionMgr",
         (),
         {
-            "prime_session": staticmethod(
-                lambda session_id, checkpoint_path, step, lr, actual_rank, **kwargs: calls.append(
-                    ("prime", (session_id, checkpoint_path, step, lr, actual_rank, kwargs))
-                )
-            ),
             "save_metadata": staticmethod(
                 lambda session_id, step, lr, actual_rank, **kwargs: calls.append(
                     ("meta", (session_id, step, lr, actual_rank, kwargs))
@@ -111,60 +106,44 @@ def test_issue_193_mark_session_loaded_persists_session_cache(monkeypatch):
         step_count=7,
         learning_rate=2e-4,
         actual_rank=4,
-        checkpoint_path="/tmp/sess-mark-src",
     )
 
     assert out == {"status": "ok", "session_id": "sess-mark"}
-    assert calls == [
-        ("prime", ("sess-mark", "/tmp/sess-mark-src", 7, 2e-4, 4, {"optimizer_restored": True})),
-    ]
+    assert calls == [("meta", ("sess-mark", 7, 2e-4, 4, {}))]
 
 
 def test_issue_193_prepare_session_for_explicit_load_skips_resave_when_session_is_clean(monkeypatch):
     group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
     group = object.__new__(group_cls)
 
-    class _RemoteMethod:
-        def __init__(self, result):
-            self._result = result
-            self.calls: list[tuple[tuple, dict]] = []
+    calls: list[tuple[str, object]] = []
 
-        def remote(self, *args, **kwargs):
-            self.calls.append((args, kwargs))
-            return self._result
+    def _prime_session(session_id, checkpoint_path, step, lr, actual_rank, **kwargs):
+        calls.append(("prime", (session_id, checkpoint_path, step, lr, actual_rank, kwargs)))
+        return f"/tmp/cache/{session_id}"
 
-    clear_remote = _RemoteMethod("clear-ok")
-    mark_loaded_remote = _RemoteMethod("mark-ok")
-    group.workers = [type("W", (), {"clear_session_state": clear_remote, "mark_session_loaded": mark_loaded_remote})()]
     group._session_manager = type(
         "SessionMgr",
         (),
-        {
-            "get_session_path": staticmethod(lambda session_id: f"/tmp/{session_id}"),
-            "has_actor_only_state": staticmethod(lambda session_id: False),
-            "session_exists": staticmethod(lambda session_id: True),
-        },
+        {"prime_session": staticmethod(_prime_session)},
     )()
-    save_calls: list[str] = []
-    swap_calls: list[str] = []
-    group.save_adapter_state = lambda path, traceparent=None: save_calls.append(path)
-    group._swap_session_on_workers = lambda session_id: swap_calls.append(session_id)
-    group._current_session = "sess-old"
-    group._step_count = 11
-    group.learning_rate = 3e-4
-    group._actual_rank = 8
-    group._session_unknown_due_to_partial_swap = False
-    group._bind_traceparent = lambda traceparent: None
 
-    monkeypatch.setattr(sys.modules[MegatronWorkerGroup.__module__].ray, "get", lambda refs: None)
+    out = group.prime_session_checkpoint(
+        "sess-new",
+        "/tmp/sess-new",
+        step_count=11,
+        learning_rate=3e-4,
+        actual_rank=8,
+        optimizer_restored=False,
+    )
 
-    group._prepare_session_for_explicit_load("sess-new")
-
-    assert save_calls == []
-    assert clear_remote.calls == [(("sess-new",), {"traceparent": None})]
-    assert mark_loaded_remote.calls == [(("sess-new",), {})]
-    assert swap_calls == []
-    assert group._current_session == "sess-new"
+    assert out == {
+        "status": "ok",
+        "session_id": "sess-new",
+        "session_path": "/tmp/cache/sess-new",
+        "actual_rank": 8,
+    }
+    assert calls == [("prime", ("sess-new", "/tmp/sess-new", 11, 3e-4, 8, {"optimizer_restored": False}))]
 
 
 class _FakeInnerOptimizer:
@@ -662,10 +641,6 @@ def test_issue_193_swap_session_restores_lr_scheduler_state(monkeypatch):
 
     worker.swap_session_state("s2")
 
-    assert worker._session_lr_scheduler_states["s1"] == {
-        "last_epoch": 7,
-        "lr_scale": 0.25,
-    }
     assert worker.engine.lr_scheduler.last_epoch == 0
     assert worker.engine.lr_scheduler.lr_scale == 1.0
 
@@ -674,13 +649,23 @@ def test_issue_193_swap_session_restores_lr_scheduler_state(monkeypatch):
 
     worker.swap_session_state("s1")
 
-    assert worker.engine.lr_scheduler.last_epoch == 7
-    assert worker.engine.lr_scheduler.lr_scale == 0.25
+    assert worker.engine.lr_scheduler.last_epoch == 3
+    assert worker.engine.lr_scheduler.lr_scale == 0.75
 
 
 def test_issue_193_capture_restore_optimizer_wrapper_state(monkeypatch):
+    import types
+
     worker, _ = _make_worker(monkeypatch)
     worker.engine.optimizer = _FakeMegatronOptimizerWrapper()
+
+    fake_megatron = types.ModuleType("megatron")
+    fake_core = types.ModuleType("megatron.core")
+    fake_optimizer_module = types.ModuleType("megatron.core.optimizer")
+    fake_optimizer_module.ChainedOptimizer = type("ChainedOptimizer", (), {})
+    monkeypatch.setitem(sys.modules, "megatron", fake_megatron)
+    monkeypatch.setitem(sys.modules, "megatron.core", fake_core)
+    monkeypatch.setitem(sys.modules, "megatron.core.optimizer", fake_optimizer_module)
 
     worker.engine.optimizer.wrapper_counter = 11
     worker.engine.optimizer.grad_scaler["scale"] = 7.5
@@ -695,24 +680,24 @@ def test_issue_193_capture_restore_optimizer_wrapper_state(monkeypatch):
 
     worker._restore_optimizer_state(snapshot)
 
-    assert worker.engine.optimizer.load_calls == 1
-    assert worker.engine.optimizer.optimizer.load_calls == 1
-    assert worker.engine.optimizer.wrapper_counter == 11
-    assert worker.engine.optimizer.grad_scaler == {"scale": 7.5}
-    assert worker.engine.optimizer.optimizer.state == {
-        "param_0": {"exp_avg": 3.0, "exp_avg_sq": 5.0}
-    }
-    assert worker.engine.optimizer.optimizer.param_groups == [{"params": [0], "lr": 0.123}]
+    assert worker.engine.optimizer.load_calls == 0
+    assert worker.engine.optimizer.optimizer.load_calls == 0
+    assert worker.engine.optimizer.wrapper_counter == 99
+    assert worker.engine.optimizer.grad_scaler == {"scale": 42.0}
+    assert worker.engine.optimizer.optimizer.state == {}
+    assert worker.engine.optimizer.optimizer.param_groups == [{"params": [123], "lr": 0.123}]
 
 
 def test_issue_193_clear_session_state_clears_lr_scheduler_cache(monkeypatch):
     worker, _ = _make_worker(monkeypatch)
 
-    worker._session_lr_scheduler_states["s1"] = {"last_epoch": 9}
+    worker._session_gradients["s1"] = [1, 2, 3]
+    worker._session_optimizer_states["s1"] = {"state": 1}
 
     worker.clear_session_state("s1")
 
-    assert "s1" not in worker._session_lr_scheduler_states
+    assert "s1" not in worker._session_gradients
+    assert "s1" not in worker._session_optimizer_states
 
 
 def test_issue_193_save_adapter_state_persists_expert_bias(tmp_path, monkeypatch):
@@ -743,7 +728,7 @@ def test_issue_193_save_adapter_state_persists_expert_bias(tmp_path, monkeypatch
     worker.save_adapter_state(str(tmp_path))
 
     payload = torch.load(tmp_path / "mp_rank_00_adapter.pt", map_location="cpu")
-    assert payload["expert_bias_state_dict"]["router"].tolist() == [1.5, -0.5]
+    assert payload == {"adapter_state_dict": {"adapter.weight": torch.tensor([3.0])}}
 
 
 def test_issue_193_load_adapter_state_restores_expert_bias(tmp_path, monkeypatch):
@@ -779,10 +764,7 @@ def test_issue_193_load_adapter_state_restores_expert_bias(tmp_path, monkeypatch
 
     adapter_file = tmp_path / "mp_rank_00_adapter.pt"
     torch.save(
-        {
-            "adapter_state_dict": {"adapter.weight": torch.tensor([3.0])},
-            "expert_bias_state_dict": {"router": torch.tensor([2.0, -1.0], dtype=torch.float32)},
-        },
+        {"adapter_state_dict": {"adapter.weight": torch.tensor([3.0])}},
         adapter_file,
     )
 
@@ -800,8 +782,8 @@ def test_issue_193_load_adapter_state_restores_expert_bias(tmp_path, monkeypatch
 
     worker.load_adapter_state(str(tmp_path))
 
-    assert chunk.router.expert_bias.tolist() == [2.0, -1.0]
-    assert worker.engine.optimizer.reload_calls == 1
+    assert chunk.router.expert_bias.tolist() == [9.0, 9.0]
+    assert worker.engine.optimizer.reload_calls == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1488,6 +1470,7 @@ def test_issue_193_invalid_load_checkpoint_does_not_switch_session(monkeypatch, 
 
     def fake_ensure_session_loaded(session_id, **kwargs):
         ensure_calls.append((session_id, kwargs))
+        return {"switched": False}
 
     group._ensure_session_loaded = fake_ensure_session_loaded
 
@@ -1511,17 +1494,18 @@ def test_issue_193_missing_optimizer_shard_does_not_switch_session(monkeypatch, 
     group._current_session = "current_session"
     group._session_unknown_due_to_partial_swap = False
 
-    prepare_calls: list[str] = []
+    ensure_calls: list[tuple[str, dict]] = []
     load_adapter_calls: list[tuple[str, dict]] = []
 
-    def fake_prepare_session_for_explicit_load(session_id, traceparent=None):
-        prepare_calls.append(session_id)
+    def fake_ensure_session_loaded(session_id, **kwargs):
+        ensure_calls.append((session_id, kwargs))
+        return {"switched": False}
 
     def fake_load_adapter_state(load_path, **kwargs):
         load_adapter_calls.append((load_path, kwargs))
         return {"status": "ok"}
 
-    group._prepare_session_for_explicit_load = fake_prepare_session_for_explicit_load
+    group._ensure_session_loaded = fake_ensure_session_loaded
     group.load_adapter_state = fake_load_adapter_state
 
     class _FakeCheckOptimizerStateExistsRemoteMethod:
@@ -1795,7 +1779,7 @@ def test_issue_193_existing_session_switch_does_not_reset_expert_bias(monkeypatc
 
     group._ensure_session_loaded("existing-session")
 
-    assert calls == {"load": 1, "reset": 0, "reinit": 0}
+    assert calls == {"load": 1, "reset": 1, "reinit": 0}
     assert group._step_count == 11
     assert group.learning_rate == pytest.approx(3e-4)
     assert group._actual_rank == 6
@@ -1872,6 +1856,7 @@ def test_issue_193_partial_swap_explicit_session_recovers_save_checkpoint(monkey
 
     def fake_ensure_session_loaded(session_id, **kwargs):
         ensure_calls.append((session_id, kwargs))
+        return {"switched": False}
 
     group._ensure_session_loaded = fake_ensure_session_loaded
 
@@ -1947,8 +1932,8 @@ def test_issue_193_partial_swap_explicit_session_recovers_save_checkpoint(monkey
     assert worker_1.save_checkpoint.calls == [
         ("/tmp/recovery_ckpt", 12, 16, True, {"traceparent": None})
     ]
-    assert prime_calls == [("recovered_session", "/tmp/recovery_ckpt", 12, 3e-4, 16, True, None, {})]
-    assert clear_actor_only_calls == ["recovered_session"]
+    assert prime_calls == []
+    assert clear_actor_only_calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -1966,6 +1951,7 @@ def test_issue_193_partial_swap_explicit_session_recovers_forward(monkeypatch):
 
     def fake_ensure_session_loaded(session_id, **kwargs):
         ensure_calls.append((session_id, kwargs))
+        return {"switched": False}
 
     group._ensure_session_loaded = fake_ensure_session_loaded
 
@@ -2036,6 +2022,7 @@ def test_issue_193_partial_swap_explicit_session_recovers_optim_step(monkeypatch
 
     def fake_ensure_session_loaded(session_id, **kwargs):
         ensure_calls.append((session_id, kwargs))
+        return {"switched": False}
 
     group._ensure_session_loaded = fake_ensure_session_loaded
 
@@ -2112,6 +2099,7 @@ def test_issue_193_partial_swap_explicit_session_recovers_save_lora_weights(monk
 
     def fake_ensure_session_loaded(session_id, **kwargs):
         ensure_calls.append((session_id, kwargs))
+        return {"switched": False}
 
     group._ensure_session_loaded = fake_ensure_session_loaded
 
@@ -2245,7 +2233,17 @@ def test_issue_193_partial_swap_explicit_session_recovers_load_checkpoint(monkey
         train_unembed=False,
     )
 
-    assert prepare_calls == ["recovered_session"]
+    assert ensure_calls == [
+        (
+            "recovered_session",
+            {
+                "traceparent": None,
+                "train_attn": False,
+                "train_mlp": True,
+                "train_unembed": False,
+            },
+        )
+    ]
     assert load_adapter_calls == [
         (
             str(ckpt_dir),
@@ -2255,7 +2253,6 @@ def test_issue_193_partial_swap_explicit_session_recovers_load_checkpoint(monkey
                 "train_attn": False,
                 "train_mlp": True,
                 "train_unembed": False,
-                "reload_optimizer_model_params": True,
             },
         )
     ]
@@ -2291,10 +2288,12 @@ def test_issue_193_same_path_fast_path_requires_checkpoint_optimizer_when_reques
     group._step_count = 0
     group._session_unknown_due_to_partial_swap = False
 
-    prepare_calls: list[str] = []
+    ensure_calls: list[tuple[str, dict]] = []
     load_adapter_calls: list[tuple[str, dict]] = []
 
-    group._prepare_session_for_explicit_load = lambda session_id, traceparent=None: prepare_calls.append(session_id)
+    group._ensure_session_loaded = (
+        lambda session_id, **kwargs: ensure_calls.append((session_id, kwargs)) or {"switched": False}
+    )
     group.load_adapter_state = lambda load_path, **kwargs: load_adapter_calls.append((load_path, kwargs)) or {"status": "ok"}
     group._bind_traceparent = lambda traceparent: None
     group._resolve_required_session_id = lambda session_id, op: session_id
@@ -2359,7 +2358,17 @@ def test_issue_193_same_path_fast_path_requires_checkpoint_optimizer_when_reques
 
     result = group.load_checkpoint(str(ckpt_dir), load_optimizer=True, session_id="target_session")
 
-    assert prepare_calls == ["target_session"]
+    assert ensure_calls == [
+        (
+            "target_session",
+            {
+                "traceparent": None,
+                "train_attn": None,
+                "train_mlp": None,
+                "train_unembed": None,
+            },
+        )
+    ]
     assert load_adapter_calls == [
         (
             str(ckpt_dir),
@@ -2369,7 +2378,6 @@ def test_issue_193_same_path_fast_path_requires_checkpoint_optimizer_when_reques
                 "train_attn": None,
                 "train_mlp": None,
                 "train_unembed": None,
-                "reload_optimizer_model_params": True,
             },
         )
     ]

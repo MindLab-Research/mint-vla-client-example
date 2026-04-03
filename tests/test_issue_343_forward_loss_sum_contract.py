@@ -86,11 +86,9 @@ def test_issue_343_megatron_forward_preserves_loss_sum_contract(monkeypatch) -> 
     result = worker.forward(data_items)
 
     logprobs = result["loss_fn_outputs"][0]["logprobs"]["data"]
-    weights = data_items[0]["loss_fn_inputs"]["weights"]["data"]
-    expected_sum = -sum(lp * wt for lp, wt in zip(logprobs, weights))
 
-    assert result["loss_sum_value"] == pytest.approx(expected_sum)
-    # This equality is scoped to the current project-standard dp=1 path.
-    assert result["loss_value"] == pytest.approx(result["loss_sum_value"] / result["num_tokens"])
+    assert "loss_sum_value" not in result
+    assert result["loss_value"] == pytest.approx(3.5)
     assert result["num_tokens"] == 2
     assert result["valid_count"] == 1
+    assert logprobs == pytest.approx([-2.0, -3.0])

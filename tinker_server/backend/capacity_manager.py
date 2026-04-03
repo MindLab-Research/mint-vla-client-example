@@ -224,11 +224,17 @@ def _get_or_create_ray_actor():
     }
 
     try:
-        return _RayCapacityManagerActor.options(  # type: ignore[attr-defined]
+        created = _RayCapacityManagerActor.options(  # type: ignore[attr-defined]
             **options
         ).remote(queue_bytes_budget=queue_bytes_budget)
     except Exception:
         # Race: another request may have created the detached actor first.
+        return ray.get_actor(actor_name, namespace=_ray_namespace())
+
+    try:
+        ray.get(created.snapshot.remote(), timeout=1.0)
+        return created
+    except Exception:
         return ray.get_actor(actor_name, namespace=_ray_namespace())
 
 
@@ -291,17 +297,42 @@ class CapacityManager:
     async def _async_with_actor_retry(self, fn, *, err_msg: str):
         import ray
 
-        actor = self._get_cached_ray_actor_for_async_request_path()
+        actor_died_errors = tuple(
+            err
+            for err in (
+                getattr(ray.exceptions, "ActorDiedError", None),
+                getattr(ray.exceptions, "RayActorError", None),
+            )
+            if isinstance(err, type) and issubclass(err, BaseException)
+        )
+
+        try:
+            actor = self._get_cached_ray_actor_for_async_request_path()
+        except CapacityManagerUnavailableError:
+            actor = await self._get_ray_actor_async()
+
         try:
             return await fn(actor)
-        except (ray.exceptions.ActorDiedError, ray.exceptions.RayActorError):
+        except actor_died_errors as e:
             self._reset_ray_actor(actor)
-            actor = await self._get_ray_actor_async()
-            try:
-                return await fn(actor)
-            except (ray.exceptions.ActorDiedError, ray.exceptions.RayActorError) as retry_e:
-                self._reset_ray_actor(actor)
-                raise CapacityManagerUnavailableError(err_msg) from retry_e
+            raise CapacityManagerUnavailableError(err_msg) from e
+
+    def _run_coro_sync_best_effort(self, coro: Any) -> Any:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(coro)
+        loop.create_task(coro)
+        return None
+
+    def release_queue(self, request_id: str) -> None:
+        self._run_coro_sync_best_effort(self.async_release_queue(request_id))
+
+    def release_object_store(self, request_id: str) -> None:
+        self._run_coro_sync_best_effort(self.async_release_object_store(request_id))
+
+    def release_all(self, request_id: str) -> None:
+        self._run_coro_sync_best_effort(self.async_release_all(request_id))
 
     async def async_ensure_ready(self, *, timeout_s: float = 10.0) -> CapacitySnapshot:
         actor = await self._get_ray_actor_async()

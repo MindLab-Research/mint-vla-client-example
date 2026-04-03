@@ -61,6 +61,7 @@ from ..checkpoints import (
 )
 from ..config import RAY_NAMESPACE
 from ..model_access_control import can_access_model, get_access_denied_error
+from ..queue_priority import merge_queue_priority_extra
 from ..models.types import (
     CreateModelFromStateRequest,
     CreateModelFromStateResponse,
@@ -1050,10 +1051,13 @@ async def create_model(
 
     user_id = _get_user_id(http_request)
     webhook_url = _get_webhook_url(http_request)
-    scheduler_extra = _build_create_scheduler_extra(
-        base_model=request.base_model,
-        model_id=model_id,
-        training_op="create_model",
+    scheduler_extra = merge_queue_priority_extra(
+        _build_create_scheduler_extra(
+            base_model=request.base_model,
+            model_id=model_id,
+            training_op="create_model",
+        ),
+        request=http_request,
     )
 
     from ..backend.api_work_queue import api_work_queue
@@ -1451,10 +1455,13 @@ async def create_model_from_state(
 
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
-    scheduler_extra = _build_create_scheduler_extra(
-        base_model=request.base_model,
-        model_id=model_id,
-        training_op="create_model_from_state",
+    scheduler_extra = merge_queue_priority_extra(
+        _build_create_scheduler_extra(
+            base_model=request.base_model,
+            model_id=model_id,
+            training_op="create_model_from_state",
+        ),
+        request=http_request,
     )
     reserve = await capacity_manager.async_try_reserve(
         request_id,
@@ -1753,11 +1760,14 @@ async def forward_backward(
     try:
         _mark_training_inflight(request.model_id, +1)
         inflight_marked = True
-        scheduler_extra = _build_training_scheduler_extra(
-            session=route_session_info,
-            model_id=request.model_id,
-            training_op="forward_backward",
-            seq_id=request.seq_id,
+        scheduler_extra = merge_queue_priority_extra(
+            _build_training_scheduler_extra(
+                session=route_session_info,
+                model_id=request.model_id,
+                training_op="forward_backward",
+                seq_id=request.seq_id,
+            ),
+            request=http_request,
         )
         if gateway_auth is not None:
             scheduler_extra["gateway_auth"] = gateway_auth.__dict__
@@ -1984,11 +1994,14 @@ async def train_step(
     try:
         _mark_training_inflight(request.model_id, +1)
         inflight_marked = True
-        scheduler_extra = _build_training_scheduler_extra(
-            session=route_session_info,
-            model_id=request.model_id,
-            training_op="train_step",
-            seq_id=request.seq_id,
+        scheduler_extra = merge_queue_priority_extra(
+            _build_training_scheduler_extra(
+                session=route_session_info,
+                model_id=request.model_id,
+                training_op="train_step",
+                seq_id=request.seq_id,
+            ),
+            request=http_request,
         )
         if gateway_auth is not None:
             scheduler_extra["gateway_auth"] = gateway_auth.__dict__
@@ -2208,11 +2221,14 @@ async def forward(
     try:
         _mark_training_inflight(request.model_id, +1)
         inflight_marked = True
-        scheduler_extra = _build_training_scheduler_extra(
-            session=route_session_info,
-            model_id=request.model_id,
-            training_op="forward",
-            seq_id=request.seq_id,
+        scheduler_extra = merge_queue_priority_extra(
+            _build_training_scheduler_extra(
+                session=route_session_info,
+                model_id=request.model_id,
+                training_op="forward",
+                seq_id=request.seq_id,
+            ),
+            request=http_request,
         )
         if gateway_auth is not None:
             scheduler_extra["gateway_auth"] = gateway_auth.__dict__
@@ -2426,11 +2442,14 @@ async def optim_step(
     try:
         _mark_training_inflight(request.model_id, +1)
         inflight_marked = True
-        scheduler_extra = _build_training_scheduler_extra(
-            session=route_session_info,
-            model_id=request.model_id,
-            training_op="optim_step",
-            seq_id=request.seq_id,
+        scheduler_extra = merge_queue_priority_extra(
+            _build_training_scheduler_extra(
+                session=route_session_info,
+                model_id=request.model_id,
+                training_op="optim_step",
+                seq_id=request.seq_id,
+            ),
+            request=http_request,
         )
         await future_store.async_create_with_id(request_id)
         created = True
@@ -2576,10 +2595,13 @@ async def reset_expert_bias(
             model_id=request.model_id,
             op="training.reset_expert_bias",
             request_json=request.model_dump_json().encode("utf-8"),
-            extra=_build_training_scheduler_extra(
-                session=route_session_info,
-                model_id=request.model_id,
-                training_op="reset_expert_bias",
+            extra=merge_queue_priority_extra(
+                _build_training_scheduler_extra(
+                    session=route_session_info,
+                    model_id=request.model_id,
+                    training_op="reset_expert_bias",
+                ),
+                request=http_request,
             ),
             user_id=_get_user_id(http_request),
         )
@@ -2732,11 +2754,14 @@ async def save_weights_for_sampler(
     try:
         _mark_training_inflight(request.model_id, +1)
         inflight_marked = True
-        scheduler_extra = _build_training_scheduler_extra(
-            session=route_session_info,
-            model_id=request.model_id,
-            training_op="save_weights_for_sampler",
-            seq_id=request.seq_id,
+        scheduler_extra = merge_queue_priority_extra(
+            _build_training_scheduler_extra(
+                session=route_session_info,
+                model_id=request.model_id,
+                training_op="save_weights_for_sampler",
+                seq_id=request.seq_id,
+            ),
+            request=http_request,
         )
         scheduler_extra["prefer_tinker"] = bool(prefer_tinker)
         scheduler_extra["is_admin"] = is_admin_request(http_request)

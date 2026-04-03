@@ -77,6 +77,9 @@ class _StubFutureStore:
     def ensure_ready(self) -> None:
         return None
 
+    async def async_ensure_ready(self) -> None:
+        return None
+
 
 class _StubInitRayCalls(list):
     def __call__(self, *args, **kwargs):
@@ -86,6 +89,9 @@ class _StubInitRayCalls(list):
 
 class _StubCapacityManager:
     def ensure_ready(self) -> None:
+        return None
+
+    async def async_ensure_ready(self) -> None:
         return None
 
 
@@ -129,6 +135,9 @@ class _StubApiWorkQueue:
         self.started_workers = 0
 
     def ensure_ready(self) -> None:
+        return None
+
+    async def async_ensure_ready(self) -> None:
         return None
 
     def set_executor(self, _op: str, _executor) -> None:
@@ -212,11 +221,13 @@ def _install_lifespan_stubs(
     monkeypatch.setattr(app_module, "_cleanup_stale_actors", _noop_async)
     monkeypatch.setattr(app_module, "_restore_sampling_sessions", _noop_async)
     monkeypatch.setattr(app_module, "SessionManager", _StubSessionManager)
+    monkeypatch.setattr(app_module, "_should_preload_openai_tokenizers", lambda: False)
     monkeypatch.setattr(app_module.config, "enable_multi_lora", False)
     monkeypatch.setattr(app_module.config, "api_work_queue_num_workers", 1)
 
     api_work_queue_module = importlib.import_module("tinker_server.backend.api_work_queue")
     future_store_module = importlib.import_module("tinker_server.backend.future_store")
+    future_replay_module = importlib.import_module("tinker_server.backend.future_replay")
     capacity_manager_module = importlib.import_module("tinker_server.backend.capacity_manager")
     gateway_session_store_module = importlib.import_module("tinker_server.backend.gateway_session_store")
     sampling_session_store_module = importlib.import_module("tinker_server.backend.sampling_session_store")
@@ -241,12 +252,14 @@ def _install_lifespan_stubs(
     monkeypatch.setattr(queue_execution_runtime_module, "queue_execution_runtime", queue_execution_runtime)
     monkeypatch.setattr(capacity_manager_module, "capacity_manager", _StubCapacityManager())
     monkeypatch.setattr(future_store_module, "future_store", _StubFutureStore())
+    monkeypatch.setattr(future_replay_module, "ensure_future_replay_sweeper", lambda *args, **kwargs: {})
     monkeypatch.setattr(gateway_session_store_module, "ensure_ready", lambda: None)
     monkeypatch.setattr(sampling_session_store_module, "ensure_ready", lambda: None)
     monkeypatch.setattr(session_heartbeat_store_module, "session_heartbeat_store", SimpleNamespace(ensure_ready=lambda: None, async_size=lambda: 0))
     monkeypatch.setattr(session_index_store_module, "ensure_ready", lambda: None)
     monkeypatch.setattr(training_session_manager_module, "TrainingSessionManager", _StubTrainingManager)
     monkeypatch.setattr(training_session_store_module, "ensure_ready", lambda: None)
+    monkeypatch.setattr(training_session_store_module, "list_training_sessions", lambda: [])
     monkeypatch.setattr(checkpoints_module, "get_checkpoint_reap_interval_s", lambda: 3600.0)
     monkeypatch.setattr(checkpoints_module, "get_checkpoint_mirror_poll_s", lambda: 3600.0)
     monkeypatch.setattr(checkpoints_module, "reap_runtime_checkpoints", lambda: {})

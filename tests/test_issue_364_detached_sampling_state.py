@@ -523,12 +523,18 @@ async def test_issue_364_save_weights_for_sampler_persists_lora_int_id(
         SimpleNamespace(save_weights_for_sampler=_fake_save_weights_for_sampler),
     )
     monkeypatch.setattr(training_route, "inference_manager", _FakeInferenceManager())
+    async def _async_resolve(request_id: str, response):
+        resolved.update({"request_id": request_id, "response": response})
+
+    async def _async_fail(*_args, **_kwargs):
+        return None
+
     monkeypatch.setattr(
         training_route,
         "future_store",
         SimpleNamespace(
-            resolve=lambda request_id, response: resolved.update({"request_id": request_id, "response": response}),
-            fail=lambda *_args, **_kwargs: None,
+            async_resolve=_async_resolve,
+            async_fail=_async_fail,
         ),
     )
     monkeypatch.setattr(training_route, "checkpoint_has_optimizer_state", lambda _path: False)
@@ -660,12 +666,18 @@ async def test_issue_364_compute_logprobs_marks_resource_pool_inflight(
     failed: list[str] = []
 
     monkeypatch.setattr(sampling_route, "session_manager", manager)
+    async def _async_resolve(request_id: str, response):
+        resolved.update({"request_id": request_id, "response": response})
+
+    async def _async_fail(_request_id: str, error: str):
+        failed.append(str(error))
+
     monkeypatch.setattr(
         sampling_route,
         "future_store",
         SimpleNamespace(
-            resolve=lambda request_id, response: resolved.update({"request_id": request_id, "response": response}),
-            async_fail=lambda _request_id, error: failed.append(str(error)),
+            async_resolve=_async_resolve,
+            async_fail=_async_fail,
         ),
     )
     _install_fake_resource_pool(monkeypatch, resource_pool)

@@ -23,7 +23,7 @@ class _StubFutureStore:
     async def async_cleanup(self, request_id: str) -> None:
         self.cleaned.append(request_id)
 
-    def resolve(self, request_id: str, payload: dict) -> None:
+    async def async_resolve(self, request_id: str, payload: dict) -> None:
         self.resolved.append((request_id, payload))
 
     async def async_fail(self, request_id: str, message: str) -> None:

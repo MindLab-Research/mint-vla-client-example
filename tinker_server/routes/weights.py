@@ -57,6 +57,7 @@ from ..models.types import (
 )
 from ..logging_context import classify_failure_reason, get_otel_tracer, run_async_with_otel_span, set_request_id
 from ..model_access_control import can_access_model, get_access_denied_error
+from ..queue_priority import merge_queue_priority_extra
 from ..webhook import EventType, send_task_event
 
 if TYPE_CHECKING:
@@ -556,9 +557,12 @@ async def save_weights(
                 request_json=request_json,
                 user_id=user_id,
                 webhook_url=webhook_url,
-                extra=_build_execution_serial_extra(
-                    model_id=request.model_id,
-                    extra={"prefer_tinker": bool(prefer_tinker)},
+                extra=merge_queue_priority_extra(
+                    _build_execution_serial_extra(
+                        model_id=request.model_id,
+                        extra={"prefer_tinker": bool(prefer_tinker)},
+                    ),
+                    request=http_request,
                 ),
             ),
         )
@@ -679,9 +683,12 @@ async def save_state(
                 request_json=request_json,
                 user_id=user_id,
                 webhook_url=webhook_url,
-                extra=_build_execution_serial_extra(
-                    model_id=request.model_id,
-                    extra={"prefer_tinker": bool(prefer_tinker)},
+                extra=merge_queue_priority_extra(
+                    _build_execution_serial_extra(
+                        model_id=request.model_id,
+                        extra={"prefer_tinker": bool(prefer_tinker)},
+                    ),
+                    request=http_request,
                 ),
             ),
         )
@@ -1187,7 +1194,10 @@ async def load_state(
                 request_json=request_json,
                 user_id=user_id,
                 webhook_url=None,
-                extra=_build_execution_serial_extra(model_id=request.model_id),
+                extra=merge_queue_priority_extra(
+                    _build_execution_serial_extra(model_id=request.model_id),
+                    request=http_request,
+                ),
             ),
         )
     except Exception as e:

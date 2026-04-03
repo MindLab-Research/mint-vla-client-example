@@ -181,6 +181,10 @@ class _AsyncOnlyTerminalFutureStore:
         self.calls.append(("async_get_status", request_id))
         return FutureStatus.DONE
 
+    async def async_get_meta(self, request_id: str):
+        self.calls.append(("async_get_meta", request_id))
+        return {"op": "sampling.asample"}
+
     async def async_get_result(self, request_id: str):
         self.calls.append(("async_get_result", request_id))
         return {"ok": request_id}

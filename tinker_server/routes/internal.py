@@ -25,6 +25,7 @@ from ..checkpoints import _iter_metadata_paths, get_persistent_search_roots, get
 from ..config import config as server_config
 from ..health_checks import deep_healthz_response
 from ..logging_context import get_otel_tracer
+from ..queue_priority import merge_queue_priority_extra
 from ..ray_cluster_health import get_ray_cluster_health_snapshot
 from ..ray_gcs_metrics import get_ray_gcs_metrics_snapshot
 from ..usage_store import get_usage_store
@@ -857,7 +858,7 @@ async def metrics() -> Response:
 
 
 @router.post("/work_queue/noop")
-async def work_queue_noop() -> dict:
+async def work_queue_noop(http_request: Request) -> dict:
     from ..backend.api_work_queue import api_work_queue
     from ..backend.capacity_manager import capacity_manager
     from ..backend.future_store import future_store
@@ -892,7 +893,7 @@ async def work_queue_noop() -> dict:
                 request_json=request_json,
                 user_id=None,
                 webhook_url=None,
-                extra={"ts": float(time.time())},
+                extra=merge_queue_priority_extra({"ts": float(time.time())}, request=http_request),
             ),
         )
     except Exception as e:

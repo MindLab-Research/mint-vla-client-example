@@ -71,6 +71,8 @@ def test_issue_413_session_state_manager_migrates_legacy_root(monkeypatch: pytes
     legacy_dir = _write_dense_session_dir(legacy_root, "model-413")
     manager = SessionStateManager(base_path=str(dense_root))
 
+    migrated = dense_state_module.maybe_migrate_legacy_dense_session_state("model-413", root=str(dense_root))
+    assert migrated == str((dense_root / "model-413_checkpoint").resolve())
     assert manager.session_exists("model-413") is True
     assert not legacy_dir.exists()
     assert (dense_root / "model-413_checkpoint" / "adapter_model.safetensors").exists()
@@ -113,6 +115,13 @@ def test_issue_413_shutdown_session_reclaims_dense_state_for_shared_actor(
 ) -> None:
     dense_root = tmp_path / "runtime" / "dense_session_state"
     monkeypatch.setattr(server_config, "training_dense_session_state_root", str(dense_root))
+
+    import tinker_server.config as config_module
+
+    runtime_env_root = (tmp_path / "runtime_env").resolve()
+    runtime_env_root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(config_module, "PFS_RUNTIME_ENV_ROOT", str(runtime_env_root))
+    monkeypatch.setattr(config_module, "PFS_PYTHONPATH", str((tmp_path / "runtime_py").resolve()))
 
     pool = get_resource_pool()
     actor_name = f"peft_trainer_test_{uuid.uuid4().hex}_maxr64"

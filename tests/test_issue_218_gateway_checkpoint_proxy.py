@@ -182,6 +182,11 @@ def test_issue_218_gateway_load_state_proxies_local_checkpoint_dir(tmp_path, mon
 
     monkeypatch.setattr(wt, "async_create_checkpoint_archive", _fake_async_create_archive)
 
+    async def _fake_route_training_store_info(_model_id: str):
+        return None
+
+    monkeypatch.setattr(wt, "_get_route_training_store_info", _fake_route_training_store_info)
+
     upstream = Upstream(alias="up", base_url="http://upstream.example", auth_mode="none")
     monkeypatch.setattr(gw, "remote_training_model", lambda _model_id: ("up", "Qwen/Qwen3-30B-A3B-Instruct-2507"))
     async def _fake_async_remote_training_model(_model_id: str):
