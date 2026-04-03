@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -25,7 +26,9 @@ async def test_issue_408_save_weights_for_sampler_registers_lazy_multilora_sessi
     resolved: dict[str, object] = {}
     failures: list[tuple[str, str]] = []
     registration: dict[str, object] = {}
-    eager_calls: list[tuple[str, str]] = []
+    warm_calls: list[str] = []
+    warm_gate = asyncio.Event()
+    scheduled_tasks: list[asyncio.Task[object]] = []
 
     async def _fake_save_weights_for_sampler(**_kwargs):
         return str(ckpt_dir)
@@ -33,19 +36,16 @@ async def test_issue_408_save_weights_for_sampler_registers_lazy_multilora_sessi
     async def _async_fail(request_id: str, error: str) -> None:
         failures.append((request_id, error))
 
-    class _EngineStub:
-        async def add_lora_for_session_from_path(self, sampling_session_id: str, lora_path: str) -> int:
-            eager_calls.append((sampling_session_id, lora_path))
-            raise AssertionError("save_weights_for_sampler must not eager-load LoRA")
-
     class _InferenceManagerStub:
         tensor_parallel_size = 1
         data_parallel_size = 1
         gpu_memory_utilization = 0.8
         max_model_len = 4096
 
-        async def get_engine_for_model(self, _base_model: str):
-            return _EngineStub()
+        async def get_engine_for_model(self, base_model: str):
+            warm_calls.append(base_model)
+            await warm_gate.wait()
+            return object()
 
         def register_multi_lora_session(self, **kwargs) -> None:
             registration.update(kwargs)
@@ -88,16 +88,30 @@ async def test_issue_408_save_weights_for_sampler_registers_lazy_multilora_sessi
     monkeypatch.setattr(sis, "add_sampler_to_session", lambda **_kwargs: None)
     monkeypatch.setattr(sis, "upsert_sampler_index", lambda _payload: None)
 
+    orig_create_task = tr.asyncio.create_task
+
+    def _capture_task(coro):
+        task = orig_create_task(coro)
+        scheduled_tasks.append(task)
+        return task
+
+    monkeypatch.setattr(tr.asyncio, "create_task", _capture_task)
+
     request = SaveWeightsForSamplerRequest(model_id="run-408", seq_id=0)
-    await tr._do_save_weights_for_sampler(
+    await asyncio.wait_for(
+        tr._do_save_weights_for_sampler(
         request_id="req-408-save",
         request=request,
         user_id="owner-408",
         prefer_tinker=True,
+        ),
+        timeout=0.1,
     )
+    await asyncio.sleep(0)
 
     assert failures == []
-    assert eager_calls == []
+    assert warm_calls == ["Qwen/Qwen3-30B-A3B-Instruct-2507"]
+    assert len(scheduled_tasks) == 1
     assert resolved["request_id"] == "req-408-save"
     response = resolved["response"]
     assert isinstance(response, dict)
@@ -111,3 +125,7 @@ async def test_issue_408_save_weights_for_sampler_registers_lazy_multilora_sessi
         "adapter_path": str(ckpt_dir),
         "lora_loaded": False,
     }
+
+    for task in scheduled_tasks:
+        task.cancel()
+    await asyncio.gather(*scheduled_tasks, return_exceptions=True)
