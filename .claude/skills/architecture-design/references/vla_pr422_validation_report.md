@@ -270,10 +270,9 @@ Completed.
 
 Detailed memo: `.claude/skills/architecture-design/references/vla_benchmark_demo_research.md`.
 
-Recommended benchmark ladder:
+Recommended benchmark ladder after the current base-LIBERO validation:
 
-- LIBERO first
-- then LIBERO-plus
+- LIBERO-plus
 - then DROID
 - then ALOHA as the main demo track
 - then CALVIN
