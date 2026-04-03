@@ -5720,6 +5720,9 @@ class MegatronSessionStateManager:
             "reason": str(reason),
             "actor_name": None if actor_name is None else str(actor_name),
             "updated_at": time.time(),
+            "is_fresh": True,
+            "invalidated_at": None,
+            "invalidated_reason": None,
         }
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(payload, f)
@@ -5732,6 +5735,23 @@ class MegatronSessionStateManager:
         if not os.path.exists(marker_path):
             return None
         return self._read_external_checkpoint(marker_path)
+
+    def invalidate_external_checkpoint(self, session_id: str, *, reason: str) -> dict | None:
+        marker_path = self._external_checkpoint_marker_path(session_id)
+        if not os.path.exists(marker_path):
+            return None
+        payload = self._read_external_checkpoint(marker_path)
+        if not payload.get("is_fresh", False) and payload.get("invalidated_reason") == str(reason):
+            return payload
+        payload["is_fresh"] = False
+        payload["invalidated_at"] = time.time()
+        payload["invalidated_reason"] = str(reason)
+        tmp_path = f"{marker_path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.replace(tmp_path, marker_path)
+        self._maybe_recycle_cache()
+        return payload
 
     def clear_external_checkpoint(self, session_id: str) -> None:
         marker_path = self._external_checkpoint_marker_path(session_id)
@@ -5824,6 +5844,26 @@ class MegatronSessionStateManager:
             raise RuntimeError(
                 f"Invalid external checkpoint marker actor_name={actor_name!r} in {marker_path}"
             )
+        is_fresh = payload.get("is_fresh", False)
+        if not isinstance(is_fresh, bool):
+            raise RuntimeError(
+                f"Invalid external checkpoint marker is_fresh={is_fresh!r} in {marker_path}"
+            )
+        invalidated_at = payload.get("invalidated_at")
+        if invalidated_at is not None and not isinstance(invalidated_at, (int, float)):
+            raise RuntimeError(
+                f"Invalid external checkpoint marker invalidated_at={invalidated_at!r} in {marker_path}"
+            )
+        invalidated_reason = payload.get("invalidated_reason")
+        if invalidated_reason is not None and (
+            not isinstance(invalidated_reason, str) or not invalidated_reason
+        ):
+            raise RuntimeError(
+                f"Invalid external checkpoint marker invalidated_reason={invalidated_reason!r} in {marker_path}"
+            )
+        payload["is_fresh"] = is_fresh
+        payload["invalidated_at"] = invalidated_at
+        payload["invalidated_reason"] = invalidated_reason
         return payload
 
     def _read_persisted_actor_only_state(self, manifest_path: str) -> dict:
@@ -5983,12 +6023,15 @@ class MegatronSessionStateManager:
                 external_marker = self.get_external_checkpoint(session_id)
                 dirty_marker = self.has_actor_only_state(session_id)
                 persisted = self.get_persisted_actor_only_state(session_id)
-                if dirty_marker:
+                if external_marker is not None and bool(external_marker.get("is_fresh", False)):
+                    actor_name = external_marker.get("actor_name")
+                    cold_safe = True
+                elif dirty_marker:
                     actor_name = self._read_actor_only_state(self._actor_only_state_path(session_id)).get("actor_name")
                     skip_reason = "actor_only_state_dirty"
                 elif external_marker is not None:
                     actor_name = external_marker.get("actor_name")
-                    cold_safe = True
+                    skip_reason = "stale_external_checkpoint"
                 else:
                     skip_reason = "no_external_checkpoint"
                 if actor_name is None and isinstance(persisted, dict):
@@ -6018,6 +6061,9 @@ class MegatronSessionStateManager:
         oldest_age_s = max((entry.age_s for entry in entries), default=0.0)
         skipped = [entry for entry in entries if not entry.cold_safe]
         evictable = [entry for entry in entries if entry.cold_safe]
+        stale = [entry for entry in skipped if entry.skip_reason == "stale_external_checkpoint"]
+        dirty = [entry for entry in skipped if entry.skip_reason == "actor_only_state_dirty"]
+        missing = [entry for entry in skipped if entry.skip_reason == "no_external_checkpoint"]
         return {
             "base_path": self.base_path,
             "actor_name": actor_name,
@@ -6026,6 +6072,12 @@ class MegatronSessionStateManager:
             "oldest_entry_age_s": oldest_age_s,
             "skipped_not_cold_safe_count": len(skipped),
             "skipped_not_cold_safe_sessions": [entry.session_id for entry in skipped],
+            "stale_external_checkpoint_count": len(stale),
+            "stale_external_checkpoint_sessions": [entry.session_id for entry in stale],
+            "actor_only_state_dirty_count": len(dirty),
+            "actor_only_state_dirty_sessions": [entry.session_id for entry in dirty],
+            "no_external_checkpoint_count": len(missing),
+            "no_external_checkpoint_sessions": [entry.session_id for entry in missing],
             "evictable_session_count": len(evictable),
             "evictable_bytes": sum(entry.total_bytes for entry in evictable),
         }
@@ -7010,6 +7062,33 @@ class MegatronWorkerGroup:
             )
         return effective_session_id
 
+    def _invalidate_session_durability(
+        self,
+        session_id: str | None,
+        *,
+        reason: str,
+        preserve_existing_reason: bool = False,
+    ) -> dict | None:
+        if session_id is None:
+            return None
+        session_manager = getattr(self, "_session_manager", None)
+        if session_manager is None:
+            return None
+        if preserve_existing_reason:
+            get_external_checkpoint = getattr(session_manager, "get_external_checkpoint", None)
+            if get_external_checkpoint is not None:
+                marker = get_external_checkpoint(session_id)
+                if isinstance(marker, dict) and not bool(marker.get("is_fresh", False)):
+                    return marker
+        invalidate_external_checkpoint = getattr(
+            session_manager,
+            "invalidate_external_checkpoint",
+            None,
+        )
+        if invalidate_external_checkpoint is None:
+            return None
+        return invalidate_external_checkpoint(session_id, reason=reason)
+
     def forward_backward(
         self,
         data_items: list[dict],
@@ -7090,6 +7169,16 @@ class MegatronWorkerGroup:
             reason="forward_backward",
             actor_name=_make_megatron_actor_name(self.base_model),
         )
+        invalidate_external_checkpoint = getattr(
+            self._session_manager,
+            "invalidate_external_checkpoint",
+            None,
+        )
+        if invalidate_external_checkpoint is not None:
+            invalidate_external_checkpoint(
+                effective_session_id,
+                reason="forward_backward",
+            )
         if timing:
             logger.info(
                 f"[MegatronWorkerGroup] forward_backward timing: "
@@ -7525,6 +7614,16 @@ class MegatronWorkerGroup:
             reason="optim_step",
             actor_name=_make_megatron_actor_name(self.base_model),
         )
+        invalidate_external_checkpoint = getattr(
+            self._session_manager,
+            "invalidate_external_checkpoint",
+            None,
+        )
+        if invalidate_external_checkpoint is not None:
+            invalidate_external_checkpoint(
+                effective_session_id,
+                reason="optim_step",
+            )
 
         print(
             f"[MegatronWorkerGroup] optim_step: grad_norm={grad_norm:.4f}, "
@@ -7730,6 +7829,11 @@ class MegatronWorkerGroup:
             f"[MegatronWorkerGroup] reinit_lora_weights: reinitializing on all workers "
             f"(lr={learning_rate}, actual_rank={actual_rank}, train_attn={train_attn}, train_mlp={train_mlp}, train_unembed={train_unembed})"
         )
+        self._invalidate_session_durability(
+            self._current_session,
+            reason="reinit_lora_weights",
+            preserve_existing_reason=True,
+        )
 
         # Call reinit on all workers (required for distributed sync)
         futures = [
@@ -7849,6 +7953,12 @@ class MegatronWorkerGroup:
                 f"Invalid adapter rank in {adapter_config_path}: expected positive int, got {checkpoint_rank!r}"
             )
 
+        if not load_optimizer:
+            self._invalidate_session_durability(
+                effective_session_id,
+                reason="load_checkpoint_without_optimizer",
+            )
+
         # Delegate to load_adapter_state
         result = self.load_adapter_state(
             load_path,
@@ -7956,18 +8066,19 @@ class MegatronWorkerGroup:
 
         self._step_count = checkpoint_step
         self.learning_rate = checkpoint_lr
-        mark_external_checkpoint = getattr(
-            session_manager,
-            "mark_external_checkpoint",
-            None,
-        )
-        if mark_external_checkpoint is not None:
-            mark_external_checkpoint(
-                effective_session_id,
-                checkpoint_path=load_path,
-                reason="load_checkpoint",
-                actor_name=_make_megatron_actor_name(self.base_model),
+        if load_optimizer:
+            mark_external_checkpoint = getattr(
+                session_manager,
+                "mark_external_checkpoint",
+                None,
             )
+            if mark_external_checkpoint is not None:
+                mark_external_checkpoint(
+                    effective_session_id,
+                    checkpoint_path=load_path,
+                    reason="load_checkpoint",
+                    actor_name=_make_megatron_actor_name(self.base_model),
+                )
 
         return result
 
@@ -8292,6 +8403,11 @@ class MegatronWorkerGroup:
         """
         self._bind_traceparent(traceparent)
         logger.info(f"[MegatronWorkerGroup] Resetting optimizer (lr={learning_rate})")
+        self._invalidate_session_durability(
+            self._current_session,
+            reason="reset_optimizer",
+            preserve_existing_reason=True,
+        )
         futures = [w.reset_optimizer.remote(learning_rate, traceparent=traceparent) for w in self.workers]
         results = ray.get(futures)
         result = results[0]  # Rank 0 result

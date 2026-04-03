@@ -126,6 +126,188 @@ def test_issue_414_recycle_cache_enforces_per_actor_budget(tmp_path: Path):
     assert Path(manager.get_session_path("session_b")).exists()
 
 
+def test_issue_414_stale_external_checkpoint_is_not_evictable(tmp_path: Path):
+    manager = MegatronSessionStateManager(base_path=str(tmp_path))
+
+    session_path = Path(manager.get_session_path("session_stale"))
+    _write_adapter(session_path, size=144)
+    manager.mark_external_checkpoint(
+        "session_stale",
+        checkpoint_path="/checkpoints/actor-a/session_stale",
+        reason="save_checkpoint",
+        actor_name="actor-a",
+    )
+    manager.invalidate_external_checkpoint("session_stale", reason="forward_backward")
+    _set_tree_mtime(session_path, time.time() - 7200)
+
+    usage = manager.get_cache_usage(actor_name="actor-a")
+    assert usage["stale_external_checkpoint_count"] == 1
+    assert usage["stale_external_checkpoint_sessions"] == ["session_stale"]
+    assert usage["evictable_session_count"] == 0
+
+    result = manager.recycle_cache(max_age_s=3600, max_total_bytes=0, max_bytes_per_actor=0)
+
+    assert result["evicted_sessions"] == []
+    assert session_path.exists()
+    assert result["after"]["stale_external_checkpoint_sessions"] == ["session_stale"]
+
+
+def test_issue_414_fresh_external_checkpoint_restores_evictability(tmp_path: Path):
+    manager = MegatronSessionStateManager(base_path=str(tmp_path))
+
+    session_path = Path(manager.get_session_path("session_saved"))
+    _write_adapter(session_path, size=144)
+    manager.mark_actor_only_state(
+        "session_saved",
+        reason="forward_backward",
+        actor_name="actor-a",
+    )
+    manager.mark_external_checkpoint(
+        "session_saved",
+        checkpoint_path="/checkpoints/actor-a/session_saved",
+        reason="save_checkpoint",
+        actor_name="actor-a",
+    )
+
+    usage = manager.get_cache_usage(actor_name="actor-a")
+
+    assert usage["evictable_session_count"] == 1
+    assert usage["evictable_bytes"] >= 144
+    assert usage["actor_only_state_dirty_count"] == 0
+
+
+def test_issue_414_load_checkpoint_without_optimizer_invalidates_existing_external_checkpoint(tmp_path: Path):
+    load_path = tmp_path / "checkpoint"
+    load_path.mkdir()
+    (load_path / "mp_rank_00_adapter.pt").write_bytes(b"adapter")
+    (load_path / "adapter_config.json").write_text('{"r": 8}', encoding="utf-8")
+    (load_path / "training_meta.json").write_text('{"current_step": 5, "learning_rate": 0.0002}', encoding="utf-8")
+
+    manager = MegatronSessionStateManager(base_path=str(tmp_path / "session_store"))
+    cached_session_path = Path(manager.get_session_path("sess-2"))
+    _write_adapter(cached_session_path, size=99)
+    manager.mark_external_checkpoint(
+        "sess-2",
+        checkpoint_path="/checkpoints/actor-a/sess-2",
+        reason="save_checkpoint",
+        actor_name="megatron_qwen3_30b_a3b_instruct_2507",
+    )
+
+    group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
+    group = object.__new__(group_cls)
+    group.workers = []
+    group.base_model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    group.learning_rate = 1e-4
+    group._step_count = 0
+    group.lora_rank = 8
+    group._bind_traceparent = lambda traceparent: None
+    group._resolve_required_session_id = lambda session_id, op: session_id
+    group._prepare_session_for_explicit_load = lambda session_id, traceparent=None: None
+    group.load_adapter_state = lambda *args, **kwargs: {"status": "ok"}
+    group.reset_optimizer = lambda learning_rate, traceparent=None: {"status": "ok", "learning_rate": learning_rate}
+    group._session_manager = manager
+
+    out = group.load_checkpoint(str(load_path), load_optimizer=False, session_id="sess-2")
+
+    assert out["optimizer_restored"] is False
+    assert out["optimizer_reset"] is True
+    marker = manager.get_external_checkpoint("sess-2")
+    assert marker is not None
+    assert marker["is_fresh"] is False
+    assert marker["invalidated_reason"] == "load_checkpoint_without_optimizer"
+
+    usage = manager.get_cache_usage(actor_name="megatron_qwen3_30b_a3b_instruct_2507")
+    assert usage["stale_external_checkpoint_count"] == 1
+    assert usage["evictable_session_count"] == 0
+
+
+def test_issue_414_load_checkpoint_without_optimizer_stales_marker_before_reset(tmp_path: Path):
+    load_path = tmp_path / "checkpoint"
+    load_path.mkdir()
+    (load_path / "mp_rank_00_adapter.pt").write_bytes(b"adapter")
+    (load_path / "adapter_config.json").write_text('{"r": 8}', encoding="utf-8")
+    (load_path / "training_meta.json").write_text('{"current_step": 5, "learning_rate": 0.0002}', encoding="utf-8")
+
+    manager = MegatronSessionStateManager(base_path=str(tmp_path / "session_store"))
+    cached_session_path = Path(manager.get_session_path("sess-3"))
+    _write_adapter(cached_session_path, size=64)
+    manager.mark_external_checkpoint(
+        "sess-3",
+        checkpoint_path="/checkpoints/actor-a/sess-3",
+        reason="save_checkpoint",
+        actor_name="megatron_qwen3_30b_a3b_instruct_2507",
+    )
+
+    group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
+    group = object.__new__(group_cls)
+    group.workers = []
+    group.base_model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    group.learning_rate = 1e-4
+    group._step_count = 0
+    group.lora_rank = 8
+    group._bind_traceparent = lambda traceparent: None
+    group._resolve_required_session_id = lambda session_id, op: session_id
+    group._prepare_session_for_explicit_load = lambda session_id, traceparent=None: None
+    group.load_adapter_state = lambda *args, **kwargs: {"status": "ok"}
+    group.reset_optimizer = lambda learning_rate, traceparent=None: (_ for _ in ()).throw(RuntimeError("reset failed"))
+    group._session_manager = manager
+
+    with pytest.raises(RuntimeError, match="reset failed"):
+        group.load_checkpoint(str(load_path), load_optimizer=False, session_id="sess-3")
+
+    marker = manager.get_external_checkpoint("sess-3")
+    assert marker is not None
+    assert marker["is_fresh"] is False
+    assert marker["invalidated_reason"] == "load_checkpoint_without_optimizer"
+
+
+def test_issue_414_reinit_lora_weights_invalidates_existing_external_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    manager = MegatronSessionStateManager(base_path=str(tmp_path / "session_store"))
+    session_path = Path(manager.get_session_path("sess-4"))
+    _write_adapter(session_path, size=64)
+    manager.mark_external_checkpoint(
+        "sess-4",
+        checkpoint_path="/checkpoints/actor-a/sess-4",
+        reason="save_checkpoint",
+        actor_name="megatron_qwen3_30b_a3b_instruct_2507",
+    )
+
+    class _RemoteCall:
+        def __init__(self, result):
+            self._result = result
+
+        def remote(self, *args, **kwargs):
+            return self._result
+
+    class _Worker:
+        reinit_lora_weights = _RemoteCall({"reinit_count": 1, "opt_state_reset": 1, "lr_updated": False})
+
+    group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
+    group = object.__new__(group_cls)
+    group.workers = [_Worker()]
+    group.base_model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    group.learning_rate = 1e-4
+    group._step_count = 7
+    group._actual_rank = 8
+    group.lora_rank = 8
+    group._current_session = "sess-4"
+    group._bind_traceparent = lambda traceparent: None
+    group._session_manager = manager
+
+    monkeypatch.setattr(sys.modules[MegatronWorkerGroup.__module__].ray, "get", lambda refs: refs)
+
+    out = group.reinit_lora_weights()
+
+    assert out["status"] == "ok"
+    marker = manager.get_external_checkpoint("sess-4")
+    assert marker is not None
+    assert marker["is_fresh"] is False
+    assert marker["invalidated_reason"] == "reinit_lora_weights"
+
+
 def test_issue_414_save_checkpoint_marks_external_checkpoint(monkeypatch: pytest.MonkeyPatch):
     group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
     group = object.__new__(group_cls)
