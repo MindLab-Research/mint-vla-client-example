@@ -93,6 +93,10 @@ class _FutureStoreSection(BaseModel):
     queue_ttl_s: float | None = None
     done_ttl_s: float | None = None
     tombstone_ttl_s: float | None = None
+    replay_root_dir: str | None = None
+    replay_hot_ttl_s: float | None = None
+    replay_disk_ttl_s: float | None = None
+    replay_sweep_interval_s: float | None = None
 
 
 class _TrainingSection(BaseModel):

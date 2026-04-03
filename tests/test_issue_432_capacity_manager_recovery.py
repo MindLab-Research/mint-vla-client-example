@@ -159,3 +159,53 @@ def test_issue_432_capacity_manager_probe_failure_falls_back_to_named_actor(monk
         (cm._ray_capacity_manager_actor_name(), cm._ray_namespace()),
     ]
     assert recorder["ray_get_calls"] == [("snapshot_ref", 1.0)]
+
+
+def test_issue_432_capacity_manager_prefers_configured_detached_actor_node(monkeypatch):
+    existing_actor = object()
+    recorder = {}
+
+    import tinker_server.config as config_mod
+
+    monkeypatch.setenv("RAY_ADDRESS", "ray://test")
+    monkeypatch.setenv("MINT_DETACHED_ACTOR_NODE_IP", "192.168.38.175")
+    monkeypatch.setattr(config_mod, "PFS_RUNTIME_ENV_ROOT", "/tmp/runtime", raising=False)
+    monkeypatch.setattr(config_mod, "PFS_TINKER_PATH", "/tmp/tinker", raising=False)
+    monkeypatch.setattr(config_mod, "PFS_HF_MODULES_PATH", "/tmp/hfmods", raising=False)
+    monkeypatch.setattr(config_mod, "PFS_PYTHONPATH", "/tmp/runtime:/tmp/tinker:/tmp/hfmods", raising=False)
+
+    def _get_actor(name, namespace):
+        recorder.setdefault("get_actor_calls", []).append((name, namespace))
+        if len(recorder["get_actor_calls"]) == 1:
+            raise ValueError("missing")
+        return existing_actor
+
+    class _RemoteActorFactory:
+        def options(self, **options):
+            recorder["options"] = options
+            return self
+
+        def remote(self, **kwargs):
+            recorder["remote_kwargs"] = kwargs
+            raise RuntimeError("actor create raced")
+
+    def _remote(**remote_kwargs):
+        recorder["remote_decorator_kwargs"] = remote_kwargs
+
+        def _wrap(cls):
+            recorder["actor_cls_name"] = cls.__name__
+            return _RemoteActorFactory()
+
+        return _wrap
+
+    ray_stub = SimpleNamespace(
+        get_actor=_get_actor,
+        cluster_resources=lambda: {"node:__internal_head__": 1.0, "node:192.168.38.175": 1.0},
+        remote=_remote,
+    )
+    monkeypatch.setitem(sys.modules, "ray", ray_stub)
+
+    actor = cm._get_or_create_ray_actor()
+
+    assert actor is existing_actor
+    assert recorder["options"]["resources"] == {"node:192.168.38.175": 0.001}

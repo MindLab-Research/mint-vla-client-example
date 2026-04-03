@@ -7,7 +7,7 @@ import os
 import time
 from typing import Any
 
-from ..config import PFS_PYTHONPATH, actor_runtime_env, otel_env_vars
+from ..config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources, config as server_config, otel_env_vars
 
 logger = logging.getLogger(__name__)
 _ACTOR_HANDLE = None
@@ -20,6 +20,12 @@ def _runtime_env_overrides() -> dict[str, str]:
         "MINT_QUEUE_EXECUTION_RUNTIME_ACTOR_NAME",
         "MINT_QUEUE_SUPERVISOR_ACTOR_NAME",
         "MINT_FUTURE_STORE_ACTOR_NAME",
+        "MINT_GATEWAY_SESSION_STORE_ACTOR_NAME",
+        "MINT_SAMPLING_SESSION_STORE_ACTOR_NAME",
+        "MINT_TRAINING_SESSION_STORE_ACTOR_NAME",
+        "MINT_SESSION_HEARTBEAT_ACTOR_NAME",
+        "MINT_SESSION_INDEX_ACTOR_NAME",
+        "MINT_RESOURCE_POOL_ACTOR_NAME",
         "MINT_OWNER_RUNTIME_SUPERVISOR_ACTOR_NAME",
         "MINT_TRAINING_CLEANUP_EXECUTOR_ACTOR_NAME",
         "MINT_SAMPLING_CLEANUP_EXECUTOR_ACTOR_NAME",
@@ -35,6 +41,7 @@ def _runtime_env_overrides() -> dict[str, str]:
         "MINT_MEGATRON_MODEL_NODE_IPS_JSON",
         "MINT_MEGATRON_NODE_IPS_CSV",
         "MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID",
+        "MINT_SUPPORTED_MODELS",
     )
     for key in direct_keys:
         value = os.environ.get(key, "").strip()
@@ -50,6 +57,15 @@ def _runtime_env_overrides() -> dict[str, str]:
         value = os.environ.get(canonical, "").strip() or os.environ.get(legacy, "").strip()
         if value:
             out[canonical] = value
+
+    out.setdefault(
+        "MINT_API_WORK_QUEUE_ACTOR_NAME",
+        str(getattr(server_config, "api_work_queue_actor_name", "tinker_api_work_queue")),
+    )
+    out.setdefault(
+        "MINT_CAPACITY_MANAGER_ACTOR_NAME",
+        str(getattr(server_config, "capacity_manager_actor_name", "tinker_capacity_manager")),
+    )
     return out
 
 
@@ -244,11 +260,7 @@ def _get_or_create_actor():
         "namespace": namespace,
         "lifetime": "detached",
     }
-    try:
-        if "node:__internal_head__" in ray.cluster_resources():
-            options["resources"] = {"node:__internal_head__": 0.001}
-    except Exception:
-        pass
+    apply_detached_actor_resources(options, ray)
     env = otel_env_vars()
     env.update(_runtime_env_overrides())
     options["runtime_env"] = actor_runtime_env(pythonpath=PFS_PYTHONPATH, extra=env)

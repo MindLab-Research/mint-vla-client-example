@@ -269,6 +269,7 @@ class TrainingWorker:
         lora_rank: int,
         learning_rate: float,
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
+        session_state_root: str = "/tmp/mint_sessions",
     ):
         """Initialize model and optimizer on this worker's GPU.
 
@@ -278,6 +279,7 @@ class TrainingWorker:
             learning_rate: Initial learning rate for optimizer.
             idle_timeout: Seconds of inactivity before self-termination.
                           Set to 0 to disable auto-termination.
+            session_state_root: Root directory for per-session dense trainer state.
         """
         init_actor_observability()
         torch = _get_torch()
@@ -367,7 +369,7 @@ class TrainingWorker:
         self._step_count = 0
 
         # Session state management for stateless trainer pattern
-        self._state_manager = SessionStateManager()
+        self._state_manager = SessionStateManager(base_path=session_state_root)
         self._current_session_id: str | None = None
 
         logger.info("[TrainingWorker] Ready")
