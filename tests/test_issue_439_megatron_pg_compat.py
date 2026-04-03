@@ -18,8 +18,8 @@ def test_issue_439_megatron_pg_recreates_incompatible_named_group(monkeypatch) -
         raise PlacementGroupMismatchError(old_pg, "mismatch")
 
     monkeypatch.setattr(dist, "get_named_placement_group", _raise_mismatch)
-    monkeypatch.setattr(dist.ray.util, "remove_placement_group", lambda pg: removed.append(pg))
-    monkeypatch.setattr(dist.ray.util, "placement_group", lambda *args, **kwargs: new_pg)
+    monkeypatch.setattr(dist.ray.util, "remove_placement_group", lambda pg: removed.append(pg), raising=False)
+    monkeypatch.setattr(dist.ray.util, "placement_group", lambda *args, **kwargs: new_pg, raising=False)
 
     out = dist._get_or_create_megatron_placement_group(
         pg_name="megatron_qwen_pg",

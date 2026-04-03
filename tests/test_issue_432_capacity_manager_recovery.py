@@ -40,6 +40,9 @@ def test_issue_432_capacity_manager_async_try_reserve_actor_died_clears_cache(mo
         class ActorDiedError(Exception):
             pass
 
+        class RayActorError(Exception):
+            pass
+
     ray_stub = SimpleNamespace(exceptions=_RayExceptions, is_initialized=lambda: True)
     monkeypatch.setitem(sys.modules, "ray", ray_stub)
 
@@ -58,6 +61,9 @@ def test_issue_432_capacity_manager_async_try_reserve_actor_died_clears_cache(mo
 def test_issue_432_capacity_manager_async_try_reserve_recovers_on_next_request(monkeypatch):
     class _RayExceptions:
         class ActorDiedError(Exception):
+            pass
+
+        class RayActorError(Exception):
             pass
 
     ray_stub = SimpleNamespace(exceptions=_RayExceptions, is_initialized=lambda: True)
