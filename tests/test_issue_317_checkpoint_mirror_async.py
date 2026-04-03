@@ -288,7 +288,7 @@ async def test_issue_317_save_state_does_not_wait_for_sampling_registration(
         _touch(ckpt_dir / "optimizer.pt")
         return str(ckpt_dir)
 
-    def _resolve(request_id: str, response: dict) -> None:
+    async def _async_resolve(request_id: str, response: dict) -> None:
         resolved["request_id"] = request_id
         resolved["response"] = response
 
@@ -316,7 +316,7 @@ async def test_issue_317_save_state_does_not_wait_for_sampling_registration(
     monkeypatch.setattr(
         wt,
         "future_store",
-        SimpleNamespace(resolve=_resolve, async_fail=_async_fail),
+        SimpleNamespace(async_resolve=_async_resolve, async_fail=_async_fail),
     )
     monkeypatch.setattr(wt, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
     monkeypatch.setattr(
@@ -359,7 +359,7 @@ async def test_issue_317_named_save_weights_for_sampler_preserves_type(
         save_file({"lora_A.weight": np.zeros((1, 1), dtype=np.float32)}, str(ckpt_dir / "adapter_model.safetensors"))
         return str(ckpt_dir)
 
-    def _resolve(request_id: str, response: dict) -> None:
+    async def _async_resolve(request_id: str, response: dict) -> None:
         resolved["request_id"] = request_id
         resolved["response"] = response
 
@@ -388,7 +388,7 @@ async def test_issue_317_named_save_weights_for_sampler_preserves_type(
     monkeypatch.setattr(
         tr,
         "future_store",
-        SimpleNamespace(resolve=_resolve, async_fail=_async_fail),
+        SimpleNamespace(async_resolve=_async_resolve, async_fail=_async_fail),
     )
     monkeypatch.setattr(tr, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
     monkeypatch.setattr(

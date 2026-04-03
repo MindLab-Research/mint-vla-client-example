@@ -30,6 +30,48 @@ def _install_ray_stub(monkeypatch, *, available: dict | None = None, total: dict
     monkeypatch.setitem(sys.modules, "ray", ray)
 
 
+class _AsyncFutureStore:
+    async def async_create_with_id(self, _request_id: str) -> None:
+        return None
+
+    async def async_mark_queued(self, _request_id: str, meta=None) -> None:
+        return None
+
+    async def async_cleanup(self, _request_id: str) -> None:
+        return None
+
+    async def async_forget(self, _request_id: str) -> None:
+        return None
+
+    async def async_ensure_pending(self, request_id: str, meta=None) -> dict:
+        return {"created": True, "meta": dict(meta or {}), "request_id": request_id}
+
+    async def async_get_status(self, _request_id: str) -> str:
+        return "pending"
+
+
+class _AsyncCapacityManager:
+    async def async_try_reserve(self, *args, **kwargs) -> dict:
+        return {"ok": True}
+
+    async def async_release_all(self, *_args, **_kwargs) -> None:
+        return None
+
+
+async def _route_session_info(model_id: str, *, backend: str, base_model: str) -> dict[str, str]:
+    return {
+        "model_id": str(model_id),
+        "session_id": str(model_id),
+        "backend": str(backend),
+        "base_model": str(base_model),
+        "user_id": "owner-a",
+    }
+
+
+async def _noop_async(*_args, **_kwargs) -> None:
+    return None
+
+
 @pytest.mark.anyio
 async def test_issue_281_forward_enqueues_scheduler_metadata(monkeypatch) -> None:
     import tinker_server.backend.api_work_queue as awq
@@ -51,22 +93,13 @@ async def test_issue_281_forward_enqueues_scheduler_metadata(monkeypatch) -> Non
     monkeypatch.setattr(tr, "_get_max_model_len", lambda _base_model: 4096)
     monkeypatch.setattr(
         tr,
-        "future_store",
-        SimpleNamespace(
-            create_with_id=lambda _request_id: None,
-            mark_queued=lambda _request_id, meta=None: None,
-            cleanup=lambda _request_id: None,
-        ),
+        "_get_training_route_session_info",
+        lambda model_id: _route_session_info(model_id, backend="peft", base_model="Qwen/Qwen3-0.6B"),
     )
+    monkeypatch.setattr(tr, "_protect_training_session_enqueue_window", _noop_async)
+    monkeypatch.setattr(tr, "future_store", _AsyncFutureStore())
     monkeypatch.setattr(awq, "api_work_queue", SimpleNamespace(enqueue=_fake_enqueue))
-    monkeypatch.setattr(
-        cm,
-        "capacity_manager",
-        SimpleNamespace(
-            try_reserve=lambda *args, **kwargs: {"ok": True},
-            release_all=lambda *_args, **_kwargs: None,
-        ),
-    )
+    monkeypatch.setattr(cm, "capacity_manager", _AsyncCapacityManager())
 
     req = ForwardRequest(
         model_id="run-281",
@@ -78,10 +111,10 @@ async def test_issue_281_forward_enqueues_scheduler_metadata(monkeypatch) -> Non
     assert captured["extra"]["scheduler_enabled"] is True
     assert captured["extra"]["scheduler_domain"] == "peft:Qwen/Qwen3-0.6B"
     assert captured["extra"]["scheduler_session_key"] == "run-281"
-    assert captured["extra"]["scheduler_domain_key_source"] == "backend_base_model"
-    assert captured["extra"]["scheduler_capacity_owner"] == "single_worker"
+    assert captured["extra"]["execution_serial_key"] == "training_session:run-281"
     assert captured["extra"]["training_op"] == "forward"
     assert captured["extra"]["seq_id"] == 7
+    assert captured["extra"]["queue_priority"] == 0
 
 
 @pytest.mark.anyio
@@ -135,8 +168,9 @@ async def test_issue_281_training_routes_mark_queued_stage_metadata(
     async def _fake_enqueue(**kwargs):
         captured.update(kwargs)
 
-    def _mark_queued(_request_id, meta=None):
-        queued_meta.update(meta or {})
+    class _QueuedFutureStore(_AsyncFutureStore):
+        async def async_mark_queued(self, _request_id: str, meta=None) -> None:
+            queued_meta.update(meta or {})
 
     monkeypatch.setattr(tr, "training_manager", SimpleNamespace(get_session=lambda _model_id: session))
     monkeypatch.setattr(tr, "training_engine", object())
@@ -144,39 +178,27 @@ async def test_issue_281_training_routes_mark_queued_stage_metadata(
     monkeypatch.setattr(tr, "_get_max_model_len", lambda _base_model: 4096)
     monkeypatch.setattr(
         tr,
-        "future_store",
-        SimpleNamespace(
-            create_with_id=lambda _request_id: None,
-            mark_queued=_mark_queued,
-            cleanup=lambda _request_id: None,
+        "_get_training_route_session_info",
+        lambda model_id: _route_session_info(
+            model_id,
+            backend="megatron",
+            base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         ),
     )
+    monkeypatch.setattr(tr, "_protect_training_session_enqueue_window", _noop_async)
+    monkeypatch.setattr(tr, "future_store", _QueuedFutureStore())
     monkeypatch.setattr(awq, "api_work_queue", SimpleNamespace(enqueue=_fake_enqueue))
-    monkeypatch.setattr(
-        cm,
-        "capacity_manager",
-        SimpleNamespace(
-            try_reserve=lambda *args, **kwargs: {"ok": True},
-            release_all=lambda *_args, **_kwargs: None,
-        ),
-    )
+    monkeypatch.setattr(cm, "capacity_manager", _AsyncCapacityManager())
 
     await getattr(tr, route_name)(request_obj(model_types), _DummyRequest())
 
-    assert queued_meta["queue_state"] == "queued"
-    assert isinstance(queued_meta["queued_at"], float)
-    assert queued_meta["stage"] == "queued"
-    assert queued_meta["queue_kind"] == "scheduled"
-    assert queued_meta["scheduler_domain"] == "megatron:Qwen/Qwen3-30B-A3B-Instruct-2507"
-    assert queued_meta["scheduler_session_id"] == "run-281"
-    assert queued_meta["scheduler_domain_key_source"] == "backend_base_model"
-    assert queued_meta["scheduler_capacity_owner"] == "single_worker"
+    assert queued_meta == {"op": f"training.{training_op}", "model_id": "run-281"}
     assert captured["extra"]["scheduler_enabled"] is True
-    assert captured["extra"]["scheduler_domain"] == "megatron:Qwen/Qwen3-30B-A3B-Instruct-2507"
+    assert captured["extra"]["scheduler_domain"] == "megatron:megatron_qwen3_30b_a3b_instruct_2507"
     assert captured["extra"]["scheduler_session_key"] == "run-281"
-    assert captured["extra"]["scheduler_domain_key_source"] == "backend_base_model"
-    assert captured["extra"]["scheduler_capacity_owner"] == "single_worker"
+    assert captured["extra"]["execution_serial_key"] == "training_session:run-281"
     assert captured["extra"]["training_op"] == training_op
+    assert captured["extra"]["queue_priority"] == 0
 
 
 @pytest.mark.anyio
@@ -200,35 +222,31 @@ async def test_issue_281_save_weights_for_sampler_enqueues_scheduler_metadata(mo
     monkeypatch.setattr(tr, "_restore_training_session", lambda _model_id: None)
     monkeypatch.setattr(
         tr,
-        "future_store",
-        SimpleNamespace(
-            create_with_id=lambda _request_id: None,
-            mark_queued=lambda _request_id, meta=None: None,
-            cleanup=lambda _request_id: None,
+        "_get_training_route_session_info",
+        lambda model_id: _route_session_info(
+            model_id,
+            backend="megatron",
+            base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         ),
     )
+    monkeypatch.setattr(tr, "_protect_training_session_enqueue_window", _noop_async)
+    monkeypatch.setattr(tr, "future_store", _AsyncFutureStore())
     monkeypatch.setattr(awq, "api_work_queue", SimpleNamespace(enqueue=_fake_enqueue))
-    monkeypatch.setattr(
-        cm,
-        "capacity_manager",
-        SimpleNamespace(
-            try_reserve=lambda *args, **kwargs: {"ok": True},
-            release_all=lambda *_args, **_kwargs: None,
-        ),
-    )
+    monkeypatch.setattr(cm, "capacity_manager", _AsyncCapacityManager())
     monkeypatch.setattr(client_compat, "prefer_tinker_uri", lambda _request: True)
 
     req = SaveWeightsForSamplerRequest(model_id="run-281", seq_id=9, path=None)
     await tr.save_weights_for_sampler(req, _DummyRequest(user_id="owner-a"))
 
     assert captured["extra"]["scheduler_enabled"] is True
-    assert captured["extra"]["scheduler_domain"] == "megatron:Qwen/Qwen3-30B-A3B-Instruct-2507"
+    assert captured["extra"]["scheduler_domain"] == "megatron:megatron_qwen3_30b_a3b_instruct_2507"
     assert captured["extra"]["scheduler_session_key"] == "run-281"
-    assert captured["extra"]["scheduler_domain_key_source"] == "backend_base_model"
-    assert captured["extra"]["scheduler_capacity_owner"] == "single_worker"
+    assert captured["extra"]["execution_serial_key"] == "training_session:run-281"
     assert captured["extra"]["training_op"] == "save_weights_for_sampler"
     assert captured["extra"]["seq_id"] == 9
+    assert captured["extra"]["queue_priority"] == 0
     assert captured["extra"]["prefer_tinker"] is True
+    assert captured["extra"]["is_admin"] is False
 
 
 @pytest.mark.anyio
@@ -257,25 +275,9 @@ async def test_issue_281_asample_enqueues_scheduler_metadata(monkeypatch) -> Non
             get_session_replica_key=lambda _session_id: "Qwen/Qwen3-0.6B::replica::1",
         ),
     )
-    monkeypatch.setattr(
-        sr,
-        "future_store",
-        SimpleNamespace(
-            create_with_id=lambda _request_id: None,
-            mark_queued=lambda _request_id, meta=None: None,
-            cleanup=lambda _request_id: None,
-            forget=lambda _request_id: None,
-        ),
-    )
+    monkeypatch.setattr(sr, "future_store", _AsyncFutureStore())
     monkeypatch.setattr(awq, "api_work_queue", SimpleNamespace(enqueue=_fake_enqueue))
-    monkeypatch.setattr(
-        cm,
-        "capacity_manager",
-        SimpleNamespace(
-            try_reserve=lambda *args, **kwargs: {"ok": True},
-            release_all=lambda *_args, **_kwargs: None,
-        ),
-    )
+    monkeypatch.setattr(cm, "capacity_manager", _AsyncCapacityManager())
     monkeypatch.setattr(rse, "estimate_sampling_result_bytes", lambda _req: 0)
     monkeypatch.setattr(model_registry, "get_model_config", lambda _model: SimpleNamespace(max_model_len=4096))
 
@@ -287,11 +289,7 @@ async def test_issue_281_asample_enqueues_scheduler_metadata(monkeypatch) -> Non
     )
     await sr.asample(req, _DummyRequest(user_id="owner-a"))
 
-    assert captured["extra"]["scheduler_enabled"] is True
-    assert captured["extra"]["scheduler_domain"] == "vllm:Qwen/Qwen3-0.6B::replica::1"
-    assert captured["extra"]["scheduler_session_key"] == "sess-281"
-    assert captured["extra"]["scheduler_domain_key_source"] == "replica_key"
-    assert captured["extra"]["scheduler_capacity_owner"] == "vllm_replica_single_worker"
+    assert captured["extra"] == {"queue_priority": 0}
 
 
 @pytest.mark.anyio
@@ -320,24 +318,9 @@ async def test_issue_281_compute_logprobs_enqueues_scheduler_metadata(monkeypatc
             get_session_replica_key=lambda _session_id: "Qwen/Qwen3-0.6B::replica::1",
         ),
     )
-    monkeypatch.setattr(
-        sr,
-        "future_store",
-        SimpleNamespace(
-            create_with_id=lambda _request_id: None,
-            mark_queued=lambda _request_id, meta=None: None,
-            cleanup=lambda _request_id: None,
-        ),
-    )
+    monkeypatch.setattr(sr, "future_store", _AsyncFutureStore())
     monkeypatch.setattr(awq, "api_work_queue", SimpleNamespace(enqueue=_fake_enqueue))
-    monkeypatch.setattr(
-        cm,
-        "capacity_manager",
-        SimpleNamespace(
-            try_reserve=lambda *args, **kwargs: {"ok": True},
-            release_all=lambda *_args, **_kwargs: None,
-        ),
-    )
+    monkeypatch.setattr(cm, "capacity_manager", _AsyncCapacityManager())
     monkeypatch.setattr(rse, "estimate_compute_logprobs_result_bytes", lambda _req: 0)
     monkeypatch.setattr(model_registry, "get_model_config", lambda _model: SimpleNamespace(max_model_len=4096))
 
@@ -348,11 +331,7 @@ async def test_issue_281_compute_logprobs_enqueues_scheduler_metadata(monkeypatc
     )
     await sr.compute_logprobs(req, _DummyRequest(user_id="owner-a"))
 
-    assert captured["extra"]["scheduler_enabled"] is True
-    assert captured["extra"]["scheduler_domain"] == "vllm:Qwen/Qwen3-0.6B::replica::1"
-    assert captured["extra"]["scheduler_session_key"] == "sess-281"
-    assert captured["extra"]["scheduler_domain_key_source"] == "replica_key"
-    assert captured["extra"]["scheduler_capacity_owner"] == "vllm_replica_single_worker"
+    assert captured["extra"] == {"queue_priority": 0}
 
 
 @pytest.mark.anyio
@@ -381,25 +360,9 @@ async def test_issue_281_asample_falls_back_to_base_model_scheduler_domain(monke
             get_session_replica_key=lambda _session_id: None,
         ),
     )
-    monkeypatch.setattr(
-        sr,
-        "future_store",
-        SimpleNamespace(
-            create_with_id=lambda _request_id: None,
-            mark_queued=lambda _request_id, meta=None: None,
-            cleanup=lambda _request_id: None,
-            forget=lambda _request_id: None,
-        ),
-    )
+    monkeypatch.setattr(sr, "future_store", _AsyncFutureStore())
     monkeypatch.setattr(awq, "api_work_queue", SimpleNamespace(enqueue=_fake_enqueue))
-    monkeypatch.setattr(
-        cm,
-        "capacity_manager",
-        SimpleNamespace(
-            try_reserve=lambda *args, **kwargs: {"ok": True},
-            release_all=lambda *_args, **_kwargs: None,
-        ),
-    )
+    monkeypatch.setattr(cm, "capacity_manager", _AsyncCapacityManager())
     monkeypatch.setattr(rse, "estimate_sampling_result_bytes", lambda _req: 0)
     monkeypatch.setattr(model_registry, "get_model_config", lambda _model: SimpleNamespace(max_model_len=4096))
 
@@ -411,11 +374,7 @@ async def test_issue_281_asample_falls_back_to_base_model_scheduler_domain(monke
     )
     await sr.asample(req, _DummyRequest(user_id="owner-a"))
 
-    assert captured["extra"]["scheduler_enabled"] is True
-    assert captured["extra"]["scheduler_domain"] == "vllm:Qwen/Qwen3-0.6B"
-    assert captured["extra"]["scheduler_session_key"] == "sess-281"
-    assert captured["extra"]["scheduler_domain_key_source"] == "base_model_fallback"
-    assert captured["extra"]["scheduler_capacity_owner"] == "model_registry_inference_dp"
+    assert captured["extra"] == {"queue_priority": 0}
 
 
 @pytest.mark.anyio

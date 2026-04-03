@@ -21,8 +21,17 @@ class _StubFutureStore:
     def get_status(self, request_id: str) -> FutureStatus:
         return FutureStatus.PENDING
 
+    async def async_get_status(self, request_id: str) -> FutureStatus:
+        return self.get_status(request_id)
+
     def get_meta(self, request_id: str):
         return dict(self._meta)
+
+    async def async_get_meta(self, request_id: str):
+        return self.get_meta(request_id)
+
+    async def async_debug_snapshot(self) -> dict:
+        return {"meta": dict(self._meta)}
 
 
 class _StubApiWorkQueue:

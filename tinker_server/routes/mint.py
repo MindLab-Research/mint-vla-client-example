@@ -21,6 +21,7 @@ from ..checkpoints import (
 )
 from ..client_compat import checkpoint_uri
 from ..logging_context import classify_failure_reason, set_request_id
+from ..queue_priority import merge_queue_priority_extra
 from ..models.mint_types import (
     ForwardBackwardReverseKLRequest,
     InterpolateCheckpointsRequest,
@@ -138,6 +139,7 @@ async def interpolate_checkpoints(
             request_json=request_json,
             user_id=user_id,
             webhook_url=None,
+            extra=merge_queue_priority_extra(request=http_request),
         )
     except Exception as e:
         await capacity_manager.async_release_all(request_id)
@@ -286,6 +288,7 @@ async def forward_backward_reverse_kl(
             request_json=request_json,
             user_id=user_id,
             webhook_url=None,
+            extra=merge_queue_priority_extra(request=http_request),
         )
     except Exception as e:
         await capacity_manager.async_release_all(request_id)

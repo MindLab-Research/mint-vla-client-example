@@ -303,6 +303,23 @@ class CapacityManager:
                 self._reset_ray_actor(actor)
                 raise CapacityManagerUnavailableError(err_msg) from retry_e
 
+    def _run_coro_sync_best_effort(self, coro: Any) -> Any:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(coro)
+        loop.create_task(coro)
+        return None
+
+    def release_queue(self, request_id: str) -> None:
+        self._run_coro_sync_best_effort(self.async_release_queue(request_id))
+
+    def release_object_store(self, request_id: str) -> None:
+        self._run_coro_sync_best_effort(self.async_release_object_store(request_id))
+
+    def release_all(self, request_id: str) -> None:
+        self._run_coro_sync_best_effort(self.async_release_all(request_id))
+
     async def async_ensure_ready(self, *, timeout_s: float = 10.0) -> CapacitySnapshot:
         actor = await self._get_ray_actor_async()
         d = await asyncio.wait_for(

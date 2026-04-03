@@ -15,8 +15,14 @@ class _StubFutureStore:
         self.order.append("resolve")
         self.resolved[request_id] = dict(payload)
 
+    async def async_resolve(self, request_id: str, payload: dict) -> None:
+        self.resolve(request_id, payload)
+
     def fail(self, request_id: str, error: str) -> None:
         self.failed[request_id] = str(error)
+
+    async def async_fail(self, request_id: str, error: str) -> None:
+        self.fail(request_id, error)
 
 
 class _StubUsageStore:

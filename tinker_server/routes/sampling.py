@@ -30,6 +30,7 @@ from ..logging_context import (
     set_request_id,
 )
 from ..model_access_control import can_access_model, get_access_denied_error
+from ..queue_priority import merge_queue_priority_extra
 from ..models.types import (
     ComputeLogprobsRequest,
     ComputeLogprobsResponse,
@@ -818,6 +819,22 @@ async def asample(
         upstream_for_alias,
     )
 
+    if request.needs_session_creation():
+        from .service import ensure_sampling_session
+
+        selector = request.model_path or request.base_model
+        if not isinstance(selector, str) or not selector:
+            raise HTTPException(status_code=422, detail="base_model or model_path is required")
+        session_id, _created_base_model = await ensure_sampling_session(model_path=selector, http_request=http_request)
+        request = request.model_copy(
+            update={
+                "sampling_session_id": session_id,
+                "model_id": None,
+                "base_model": None,
+                "model_path": None,
+            }
+        )
+
     uses_existing_session_selector = request.has_session_selector()
     if server_config.sampling_require_seq_id and uses_existing_session_selector and request.seq_id is None:
         raise HTTPException(
@@ -1016,7 +1033,10 @@ async def asample(
                 apikey_id=apikey_id,
                 throttle_principal=throttle_principal,
                 webhook_url=None,
-                extra={"gateway_auth": billing_auth.__dict__} if billing_auth is not None else None,
+                extra=merge_queue_priority_extra(
+                    {"gateway_auth": billing_auth.__dict__} if billing_auth is not None else None,
+                    request=http_request,
+                ),
             ),
         )
     except ApiWorkQueueThrottleError as e:
@@ -1852,7 +1872,10 @@ async def compute_logprobs(
                 request_json=request_json,
                 user_id=user_id,
                 webhook_url=None,
-                extra={"gateway_auth": billing_auth.__dict__} if billing_auth is not None else None,
+                extra=merge_queue_priority_extra(
+                    {"gateway_auth": billing_auth.__dict__} if billing_auth is not None else None,
+                    request=http_request,
+                ),
             ),
         )
     except Exception as e:

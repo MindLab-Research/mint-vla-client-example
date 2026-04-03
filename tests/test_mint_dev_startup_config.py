@@ -4,15 +4,16 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_dev_volcano_env_does_not_pin_tinker_checkout_paths():
+def test_dev_volcano_env_pins_runtime_paths_for_dev_host() -> None:
     text = (REPO_ROOT / "configs" / "dev_volcano.env.sh").read_text()
 
-    assert "export PFS_TINKER_PATH=" not in text
-    assert "export PYTHONPATH=" not in text
+    assert "export PFS_RUNTIME_ENV_ROOT=" in text
+    assert "export PFS_TINKER_PATH=" in text
+    assert "export MINT_VLLM_CHILD_PYTHON_EXECUTABLE=" in text
 
 
-def test_start_mint_dev_server_uses_current_repo_for_api_and_worker_paths():
-    text = (REPO_ROOT / "scripts" / "start_mint_dev_server.sh").read_text()
+def test_start_dev_server_script_sources_env_and_uses_runtime_python() -> None:
+    text = (REPO_ROOT / "scripts" / "start_dev_server.sh").read_text()
 
-    assert 'export PFS_TINKER_PATH="$repo_root"' in text
-    assert '$repo_root${PFS_HF_MODULES_PATH:+:$PFS_HF_MODULES_PATH}' in text
+    assert ". ./configs/dev_volcano.env.sh" in text
+    assert 'exec "${PFS_RUNTIME_ENV_ROOT}/host-venv/bin/python" scripts/run_server.py' in text
