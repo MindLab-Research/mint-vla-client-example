@@ -342,12 +342,16 @@ def ensure_future_replay_sweeper(*, timeout_s: float = 10.0) -> dict[str, Any]:
     return ray.get(actor.poke.remote(), timeout=float(timeout_s))
 
 
+def _future_replay_sweeper_actor_name() -> str:
+    return os.environ.get("MINT_FUTURE_REPLAY_SWEEPER_ACTOR_NAME", "mint_future_replay_sweeper")
+
+
 def _get_or_create_sweeper_actor():
     from .future_store import _ray_namespace
 
     import ray
 
-    actor_name = "mint_future_replay_sweeper"
+    actor_name = _future_replay_sweeper_actor_name()
     namespace = _ray_namespace()
     sweep_interval_s = max(1.0, float(config.future_replay_sweep_interval_s))
 
@@ -394,7 +398,7 @@ def _get_or_create_sweeper_actor():
                 "root_dir": str(future_replay_store().root_dir),
             }
 
-    from ..config import PFS_PYTHONPATH, actor_runtime_env_vars, otel_env_vars
+    from ..config import PFS_PYTHONPATH, actor_runtime_env_vars, apply_detached_actor_resources, otel_env_vars
 
     options: dict[str, Any] = {
         "name": actor_name,
@@ -407,6 +411,7 @@ def _get_or_create_sweeper_actor():
             )
         },
     }
+    apply_detached_actor_resources(options, ray)
 
     try:
         return _RayFutureReplaySweeperActor.options(**options).remote(sweep_interval_s)

@@ -124,6 +124,17 @@ def _sync_training_session_step(meta: dict[str, Any] | None, result: Any) -> Any
         return result
 
 
+def _meta_with_request_op(meta: dict[str, Any] | None, request_op: Any) -> dict[str, Any]:
+    out = dict(meta or {})
+    op = out.get("op")
+    if isinstance(op, str) and op.strip():
+        return out
+    op = str(request_op or "").strip()
+    if op:
+        out["op"] = op
+    return out
+
+
 async def _await_ray_ref(ref: Any) -> Any:
     """Await a Ray ObjectRef using native async integration."""
     if hasattr(ref, "__await__"):
@@ -499,7 +510,7 @@ def _get_or_create_ray_actor():
                 return
             self._pending.discard(request_id)
             self._refs.pop(request_id, None)
-            meta = dict(self._meta.get(request_id) or {})
+            meta = _meta_with_request_op(self._meta.get(request_id), self._request_op(request_id))
             self._update_op_from_meta(request_id, meta)
             import ray
 
@@ -535,7 +546,7 @@ def _get_or_create_ray_actor():
                 return
             self._pending.discard(request_id)
             self._refs.pop(request_id, None)
-            meta = dict(self._meta.get(request_id) or {})
+            meta = _meta_with_request_op(self._meta.get(request_id), self._request_op(request_id))
             self._update_op_from_meta(request_id, meta)
             self._errors[request_id] = error
             done_at = time.time()
@@ -560,7 +571,7 @@ def _get_or_create_ray_actor():
                 ref = self._refs[request_id]
                 ready, _ = ray.wait([ref], timeout=0)
                 if ready:
-                    meta = self._meta.get(request_id)
+                    meta = _meta_with_request_op(self._meta.get(request_id), self._request_op(request_id))
                     self._pending.discard(request_id)
                     self._update_op_from_meta(request_id, meta)
                     try:
@@ -570,7 +581,7 @@ def _get_or_create_ray_actor():
                         done_at = time.time()
                         self._done_at[request_id] = done_at
                         self._refs.pop(request_id, None)
-                        next_meta = dict(meta or {})
+                        next_meta = _meta_with_request_op(meta, self._request_op(request_id))
                         next_meta["final_status"] = FutureStatus.DONE.value
                         next_meta["done_at"] = done_at
                         self._meta[request_id] = next_meta
@@ -580,7 +591,7 @@ def _get_or_create_ray_actor():
                         done_at = time.time()
                         self._done_at[request_id] = done_at
                         self._refs.pop(request_id, None)
-                        next_meta = dict(meta or {})
+                        next_meta = _meta_with_request_op(meta, self._request_op(request_id))
                         next_meta["final_status"] = FutureStatus.FAILED.value
                         next_meta["done_at"] = done_at
                         self._meta[request_id] = next_meta
@@ -603,7 +614,8 @@ def _get_or_create_ray_actor():
 
         def get_meta(self, request_id: str) -> dict[str, Any] | None:
             self._prune()
-            return self._meta.get(request_id)
+            meta = _meta_with_request_op(self._meta.get(request_id), self._request_op(request_id))
+            return meta or None
 
         def cleanup(self, request_id: str) -> None:
             terminal = (
@@ -623,7 +635,7 @@ def _get_or_create_ray_actor():
             self._expired_at.pop(request_id, None)
             retrieved_at = time.time()
             self._retrieved_at[request_id] = retrieved_at
-            meta = dict(self._meta.get(request_id) or {})
+            meta = _meta_with_request_op(self._meta.get(request_id), self._request_op(request_id))
             if "done_at" not in meta and request_id in self._done_at:
                 meta["done_at"] = self._done_at[request_id]
             if "final_status" not in meta:
@@ -699,13 +711,9 @@ def _get_or_create_ray_actor():
         "namespace": namespace,
         "lifetime": "detached",
     }
-    try:
-        if "node:__internal_head__" in ray.cluster_resources():
-            options["resources"] = {"node:__internal_head__": 0.001}
-    except Exception:
-        pass
     actor_otel_env = otel_env_vars()
-    from ..config import PFS_PYTHONPATH, actor_runtime_env
+    from ..config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources
+    apply_detached_actor_resources(options, ray)
     options["runtime_env"] = actor_runtime_env(
         pythonpath=PFS_PYTHONPATH,
         extra=actor_otel_env,

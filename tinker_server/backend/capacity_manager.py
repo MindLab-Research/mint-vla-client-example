@@ -205,13 +205,6 @@ def _get_or_create_ray_actor():
             self._object_store_released.discard(request_id)
             return {"ok": True}
 
-    resources = None
-    try:
-        if "node:__internal_head__" in ray.cluster_resources():
-            resources = {"node:__internal_head__": 0.001}
-    except Exception:
-        resources = None
-
     options: dict[str, Any] = {
         "name": actor_name,
         "namespace": _ray_namespace(),
@@ -221,15 +214,14 @@ def _get_or_create_ray_actor():
         "max_task_retries": -1,
     }
     actor_otel_env = otel_env_vars()
-    from ..config import PFS_PYTHONPATH, actor_runtime_env_vars
+    from ..config import PFS_PYTHONPATH, actor_runtime_env_vars, apply_detached_actor_resources
+    apply_detached_actor_resources(options, ray)
     options["runtime_env"] = {
         "env_vars": actor_runtime_env_vars(
             pythonpath=PFS_PYTHONPATH,
             extra=actor_otel_env,
         )
     }
-    if resources is not None:
-        options["resources"] = resources
 
     try:
         return _RayCapacityManagerActor.options(  # type: ignore[attr-defined]

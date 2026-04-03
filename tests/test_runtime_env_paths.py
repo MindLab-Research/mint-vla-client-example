@@ -606,9 +606,78 @@ def test_actor_runtime_env_vars_forwards_config_path(tmp_path):
             "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
             "RAY_ADDRESS": "ray://cfg-test",
             "TINKER_CONFIG_PATH": str(cfg),
+            "MINT_DETACHED_ACTOR_NODE_IP": "192.168.38.175",
+            "MINT_API_WORK_QUEUE_ACTOR_NAME": "issue440-api-work-queue",
+            "MINT_CAPACITY_MANAGER_ACTOR_NAME": "issue440-capacity-manager",
         },
     )
     data = json.loads(out.stdout)
     assert data["RAY_ADDRESS"] == "ray://cfg-test"
     assert data["TINKER_CONFIG_PATH"] == str(cfg)
     assert data["TINKER_RAY_NAMESPACE"] == "cfg_ns"
+    assert data["MINT_DETACHED_ACTOR_NODE_IP"] == "192.168.38.175"
+    assert data["MINT_API_WORK_QUEUE_ACTOR_NAME"] == "issue440-api-work-queue"
+    assert data["MINT_CAPACITY_MANAGER_ACTOR_NAME"] == "issue440-capacity-manager"
+
+
+def test_server_config_prefers_mint_actor_names_and_accepts_legacy_tinker_aliases():
+    cfg = server_config.ServerConfig.from_sources(
+        environ={
+            "TINKER_API_KEY": "dev-key",
+            "MINT_API_WORK_QUEUE_ACTOR_NAME": "mint-api",
+            "TINKER_API_WORK_QUEUE_ACTOR_NAME": "legacy-api",
+            "MINT_CAPACITY_MANAGER_ACTOR_NAME": "mint-cap",
+            "TINKER_CAPACITY_MANAGER_ACTOR_NAME": "legacy-cap",
+        },
+        config_path=None,
+        config_file=None,
+    )
+
+    assert cfg.api_work_queue_actor_name == "mint-api"
+    assert cfg.capacity_manager_actor_name == "mint-cap"
+
+    legacy_only = server_config.ServerConfig.from_sources(
+        environ={
+            "TINKER_API_KEY": "dev-key",
+            "TINKER_API_WORK_QUEUE_ACTOR_NAME": "legacy-api",
+            "TINKER_CAPACITY_MANAGER_ACTOR_NAME": "legacy-cap",
+        },
+        config_path=None,
+        config_file=None,
+    )
+
+    assert legacy_only.api_work_queue_actor_name == "legacy-api"
+    assert legacy_only.capacity_manager_actor_name == "legacy-cap"
+
+
+def test_actor_runtime_env_vars_canonicalize_legacy_tinker_actor_aliases(tmp_path):
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env(env_root)
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json; "
+                "from tinker_server.config import actor_runtime_env_vars; "
+                "print(json.dumps(actor_runtime_env_vars(pythonpath='X')))"
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            "PFS_RUNTIME_ENV_ROOT": str(env_root),
+            "PFS_TINKER_PATH": str(tmp_path / 'repo'),
+            "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
+            "RAY_ADDRESS": "ray://cfg-test",
+            "TINKER_API_WORK_QUEUE_ACTOR_NAME": "legacy-api-work-queue",
+            "TINKER_CAPACITY_MANAGER_ACTOR_NAME": "legacy-capacity-manager",
+        },
+    )
+    data = json.loads(out.stdout)
+    assert data["MINT_API_WORK_QUEUE_ACTOR_NAME"] == "legacy-api-work-queue"
+    assert data["MINT_CAPACITY_MANAGER_ACTOR_NAME"] == "legacy-capacity-manager"
+    assert "TINKER_API_WORK_QUEUE_ACTOR_NAME" not in data
+    assert "TINKER_CAPACITY_MANAGER_ACTOR_NAME" not in data

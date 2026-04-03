@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import time
 import uuid
 from pathlib import Path
@@ -10,7 +11,7 @@ pytest.importorskip("ray")
 from tinker_server.backend import dense_session_state as dense_state_module
 from tinker_server.backend.resource_pool import ActorType, get_resource_pool
 from tinker_server.backend.training_session_manager import TrainingSession
-from tinker_server.backend.verl_training import SessionStateManager, VerlTrainingEngine
+from tinker_server.backend.verl_training import SessionStateManager, TrainingWorker, VerlTrainingEngine
 from tinker_server.config import config as server_config
 from tinker_server.routes import internal as internal_routes
 
@@ -52,6 +53,13 @@ def _write_dense_session_dir(root: Path, session_id: str, *, age_s: float | None
         for path in (session_dir, session_dir / "adapter_model.safetensors", session_dir / "optimizer.pt"):
             os.utime(path, (ts, ts))
     return session_dir
+
+
+def test_issue_413_training_worker_signature_accepts_session_state_root() -> None:
+    modified_class = TrainingWorker.__ray_metadata__.modified_class
+    sig = inspect.signature(modified_class.__init__)
+
+    assert "session_state_root" in sig.parameters
 
 
 def test_issue_413_session_state_manager_migrates_legacy_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

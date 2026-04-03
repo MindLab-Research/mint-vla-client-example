@@ -101,7 +101,8 @@ def _get_or_create_actor():
         "lifetime": "detached",
     }
     actor_otel_env = otel_env_vars()
-    from ..config import PFS_PYTHONPATH, actor_runtime_env
+    from ..config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources
+    apply_detached_actor_resources(options, ray)
     options["runtime_env"] = actor_runtime_env(
         pythonpath=PFS_PYTHONPATH,
         extra=actor_otel_env,

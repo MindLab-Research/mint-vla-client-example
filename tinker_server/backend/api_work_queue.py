@@ -1051,15 +1051,8 @@ def _create_ray_actor():
             v = self._ema_exec_s_by_op.get(key)
             return {"ema_exec_s": None if v is None else float(v)}
 
-    # Keep the detached queue actor on the head node when possible. Losing this
-    # actor drops all queued items (in-memory queue), which can leave futures
-    # pending forever.
-    resources = None
-    try:
-        if "node:__internal_head__" in ray.cluster_resources():
-            resources = {"node:__internal_head__": 0.001}
-    except Exception:
-        resources = None
+    # Keep the detached queue actor on a stable control-plane node. By default
+    # this is the head, but MINT_DETACHED_ACTOR_NODE_IP can move it elsewhere.
 
     options: dict[str, Any] = {
         "name": actor_name,
@@ -1070,13 +1063,12 @@ def _create_ray_actor():
         "max_task_retries": -1,
     }
     actor_otel_env = otel_env_vars()
-    from ..config import PFS_PYTHONPATH, actor_runtime_env
+    from ..config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources
+    apply_detached_actor_resources(options, ray)
     options["runtime_env"] = actor_runtime_env(
         pythonpath=PFS_PYTHONPATH,
         extra=actor_otel_env,
     )
-    if resources is not None:
-        options["resources"] = resources
 
     created = _RayApiWorkQueueActor.options(  # type: ignore[attr-defined]
         **options
@@ -1536,8 +1528,6 @@ class ApiWorkQueueClient:
         return result
 
     async def _reconcile_stale_running_requests(self, consumer_job_id: str) -> int:
-        import ray
-
         from .capacity_manager import capacity_manager
         from .future_store import FutureStoreUnavailableError, future_store
 

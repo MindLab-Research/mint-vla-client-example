@@ -8,7 +8,7 @@ import time
 import uuid
 from typing import Any
 
-from ..config import PFS_PYTHONPATH, actor_runtime_env, otel_env_vars
+from ..config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources, otel_env_vars
 from ..checkpoints import (
     get_checkpoint_mirror_poll_s,
     get_checkpoint_reap_interval_s,
@@ -125,8 +125,6 @@ async def _await_ray_ref(ref: Any) -> Any:
 
 
 def _kill_named_actor(actor: Any) -> None:
-    import ray
-
     from . import ray_kill
 
     ray_kill.kill(
@@ -277,11 +275,7 @@ def _get_or_create_actor():
         "namespace": namespace,
         "lifetime": "detached",
     }
-    try:
-        if "node:__internal_head__" in ray.cluster_resources():
-            options["resources"] = {"node:__internal_head__": 0.001}
-    except Exception:
-        pass
+    apply_detached_actor_resources(options, ray)
     extra_env = otel_env_vars()
     if CURRENT_CODE_IDENTITY:
         extra_env["MINT_GIT_SHA"] = str(CURRENT_CODE_IDENTITY)

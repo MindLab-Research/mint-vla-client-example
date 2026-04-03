@@ -613,14 +613,10 @@ def _get_or_create_actor_sync() -> Any:
         "namespace": namespace,
         "lifetime": "detached",
     }
-    try:
-        if "node:__internal_head__" in ray.cluster_resources():
-            options["resources"] = {"node:__internal_head__": 0.001}
-    except Exception:
-        pass
 
-    from ..config import PFS_PYTHONPATH, actor_runtime_env
+    from ..config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources
 
+    apply_detached_actor_resources(options, ray)
     options["runtime_env"] = actor_runtime_env(
         pythonpath=PFS_PYTHONPATH,
         extra=otel_env_vars(),
