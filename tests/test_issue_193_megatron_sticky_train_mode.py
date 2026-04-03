@@ -10,8 +10,10 @@ pytest.importorskip("ray")
 from tinker_server.backend.megatron_distributed import (
     DistributedConfig,
     MegatronRankWorker,
+    MegatronSessionStateManager,
     MegatronWorkerGroup,
     _GRADIENTS_CONSUMED,
+    _make_megatron_actor_name,
 )
 
 
@@ -2358,3 +2360,84 @@ def test_issue_193_hot_cache_eviction_keeps_persisted_snapshots(monkeypatch, tmp
     s1_rank_snapshot = tmp_path / "s1_checkpoint" / "actor_only_state" / "rank_0000.pt"
     assert s1_rank_snapshot.exists()
     assert worker._session_hot_cache.keys() == {"s2"}
+
+
+
+def test_issue_193_session_cache_diagnostics_reports_partial_residency(monkeypatch, tmp_path):
+    monkeypatch.setenv("MINT_MEGATRON_SESSIONS_BASE_PATH", str(tmp_path))
+
+    manager = MegatronSessionStateManager(base_path=str(tmp_path))
+    actor_name = _make_megatron_actor_name("Qwen/Qwen3-0.6B")
+    manager.save_persisted_actor_only_state(
+        "s-hot",
+        actor_name=actor_name,
+        worker_entries=[
+            {"rank": 0, "path": str(tmp_path / "s-hot-r0.pt"), "bytes": 40},
+            {"rank": 1, "path": str(tmp_path / "s-hot-r1.pt"), "bytes": 61},
+        ],
+    )
+    manager.save_persisted_actor_only_state(
+        "s-partial",
+        actor_name=actor_name,
+        worker_entries=[
+            {"rank": 0, "path": str(tmp_path / "s-partial-r0.pt"), "bytes": 100},
+            {"rank": 1, "path": str(tmp_path / "s-partial-r1.pt"), "bytes": 102},
+        ],
+    )
+    manager.save_persisted_actor_only_state(
+        "s-cold",
+        actor_name=actor_name,
+        worker_entries=[
+            {"rank": 0, "path": str(tmp_path / "s-cold-r0.pt"), "bytes": 101},
+            {"rank": 1, "path": str(tmp_path / "s-cold-r1.pt"), "bytes": 202},
+        ],
+    )
+    manager.save_persisted_actor_only_state(
+        "s-current",
+        actor_name=actor_name,
+        worker_entries=[
+            {"rank": 0, "path": str(tmp_path / "s-current-r0.pt"), "bytes": 200},
+            {"rank": 1, "path": str(tmp_path / "s-current-r1.pt"), "bytes": 204},
+        ],
+    )
+
+    class _RemoteCall:
+        def __init__(self, result):
+            self._result = result
+
+        def remote(self):
+            return self._result
+
+    class _Worker:
+        def __init__(self, hot_sessions, hot_bytes, last_eviction_reason=None):
+            self.get_hot_cache_info = _RemoteCall(
+                {
+                    "hot_sessions": hot_sessions,
+                    "hot_bytes": hot_bytes,
+                    "last_eviction_reason": last_eviction_reason,
+                }
+            )
+
+    group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
+    group = object.__new__(group_cls)
+    group.workers = [
+        _Worker(["s-hot", "s-partial"], 111, None),
+        _Worker(["s-hot"], 222, "max_hot_bytes>256"),
+    ]
+    group.base_model = "Qwen/Qwen3-0.6B"
+    group._session_manager = manager
+    group._current_session = "s-current"
+
+    monkeypatch.setattr(sys.modules[MegatronWorkerGroup.__module__].ray, "get", lambda refs: refs)
+
+    diagnostics = group._get_session_cache_diagnostics()
+
+    assert diagnostics["hot_sessions"] == ["s-hot"]
+    assert diagnostics["hot_session_count"] == 1
+    assert diagnostics["partially_hot_sessions"] == ["s-partial"]
+    assert diagnostics["partially_hot_session_count"] == 1
+    assert diagnostics["cold_sessions"] == ["s-cold"]
+    assert diagnostics["cold_session_count"] == 1
+    assert diagnostics["hot_bytes"] == 333
+    assert diagnostics["cold_bytes"] == 303
+    assert diagnostics["last_eviction_reason"] == "max_hot_bytes>256"

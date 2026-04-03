@@ -8246,7 +8246,23 @@ class MegatronWorkerGroup:
                     e,
                 )
                 hot_infos = []
-        hot_session_ids = set(hot_infos[0].get("hot_sessions", [])) if hot_infos else set()
+        worker_count = len(hot_infos)
+        hot_membership_counts: dict[str, int] = {}
+        for info in hot_infos:
+            if not isinstance(info, dict):
+                continue
+            for session_id in info.get("hot_sessions", []):
+                hot_membership_counts[session_id] = hot_membership_counts.get(session_id, 0) + 1
+        fully_hot_session_ids = {
+            session_id
+            for session_id, count in hot_membership_counts.items()
+            if worker_count > 0 and count == worker_count
+        }
+        partially_hot_session_ids = {
+            session_id
+            for session_id, count in hot_membership_counts.items()
+            if 0 < count < worker_count
+        }
         hot_bytes = sum(int(info.get("hot_bytes", 0)) for info in hot_infos if isinstance(info, dict))
         last_eviction_reason = next(
             (
@@ -8266,16 +8282,18 @@ class MegatronWorkerGroup:
         cold_session_ids = [
             session_id
             for session_id in sorted(persisted)
-            if session_id not in hot_session_ids and session_id != current_session
+            if session_id not in hot_membership_counts and session_id != current_session
         ]
         cold_bytes = sum(int(persisted[session_id].get("total_bytes", 0)) for session_id in cold_session_ids)
         return {
-            "hot_session_count": len(hot_session_ids),
+            "hot_session_count": len(fully_hot_session_ids),
+            "partially_hot_session_count": len(partially_hot_session_ids),
             "cold_session_count": len(cold_session_ids),
             "hot_bytes": hot_bytes,
             "cold_bytes": cold_bytes,
             "last_eviction_reason": last_eviction_reason,
-            "hot_sessions": sorted(hot_session_ids),
+            "hot_sessions": sorted(fully_hot_session_ids),
+            "partially_hot_sessions": sorted(partially_hot_session_ids),
             "cold_sessions": cold_session_ids,
         }
 
