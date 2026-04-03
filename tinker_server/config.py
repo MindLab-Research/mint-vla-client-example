@@ -163,6 +163,22 @@ def otel_env_vars() -> dict[str, str]:
     return out
 
 
+def preferred_control_plane_resources(
+    cluster_resources: dict[str, float] | None,
+    *,
+    env_var: str | None = None,
+) -> dict[str, float] | None:
+    for candidate in (env_var, "MINT_CONTROL_PLANE_PINNED_NODE_IP"):
+        if not candidate:
+            continue
+        pinned_node_ip = _env_nonempty(os.environ, candidate)
+        if pinned_node_ip is not None:
+            return {f"node:{pinned_node_ip}": 0.001}
+    if cluster_resources and "node:__internal_head__" in cluster_resources:
+        return {"node:__internal_head__": 0.001}
+    return None
+
+
 def actor_runtime_env_vars(*, pythonpath: str, extra: dict[str, str] | None = None) -> dict[str, str]:
     ensure_runtime_env_configured()
     out = {
@@ -181,6 +197,9 @@ def actor_runtime_env_vars(*, pythonpath: str, extra: dict[str, str] | None = No
         out["TINKER_CONFIG_PATH"] = config_path
     for key in (
         "MINT_VLLM_CHILD_PYTHON_EXECUTABLE",
+        "MINT_CONTROL_PLANE_PINNED_NODE_IP",
+        "MINT_API_WORK_QUEUE_PINNED_NODE_IP",
+        "MINT_STARTUP_LEASE_PINNED_NODE_IP",
         "TINKER_ACTOR_LD_LIBRARY_PATH",
         "MINT_SFT_DIAG_FAIL",
         "MINT_REVERSE_KL_DIAG_FAIL",

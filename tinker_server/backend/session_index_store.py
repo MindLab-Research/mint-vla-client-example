@@ -12,7 +12,7 @@ import logging
 import os
 from typing import Any
 
-from ..config import otel_env_vars
+from ..config import otel_env_vars, preferred_control_plane_resources, preferred_control_plane_resources
 
 logger = logging.getLogger(__name__)
 _ACTOR_HANDLE = None
@@ -154,8 +154,9 @@ def _get_or_create_actor():
         "lifetime": "detached",
     }
     try:
-        if "node:__internal_head__" in ray.cluster_resources():
-            options["resources"] = {"node:__internal_head__": 0.001}
+        resources = preferred_control_plane_resources(ray.cluster_resources())
+        if resources is not None:
+            options["resources"] = resources
     except Exception:
         pass
     actor_otel_env = otel_env_vars()

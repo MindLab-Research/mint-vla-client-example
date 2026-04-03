@@ -252,3 +252,4 @@ REFLECTION_*.md
 node_modules/
 .pnpm-store/
 .learnings/ERRORS.md
+!scripts/wip/openpi_vla_start_server.sh

@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
-from ..config import config as server_config, otel_env_vars
+from ..config import config as server_config, otel_env_vars, preferred_control_plane_resources
 from ..logging_context import (
     classify_failure_reason,
     ensure_trace_id,
@@ -98,11 +98,9 @@ def _api_work_queue_actor_resources() -> dict[str, float] | None:
     try:
         import ray
 
-        if "node:__internal_head__" in ray.cluster_resources():
-            return {"node:__internal_head__": 0.001}
+        return preferred_control_plane_resources(ray.cluster_resources())
     except Exception:
         return None
-    return None
 
 
 @dataclass(frozen=True)

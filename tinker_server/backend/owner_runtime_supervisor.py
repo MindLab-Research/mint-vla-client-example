@@ -8,7 +8,7 @@ import time
 import uuid
 from typing import Any
 
-from ..config import PFS_PYTHONPATH, actor_runtime_env, otel_env_vars
+from ..config import PFS_PYTHONPATH, actor_runtime_env, otel_env_vars, preferred_control_plane_resources
 from ..checkpoints import (
     get_checkpoint_mirror_poll_s,
     get_checkpoint_reap_interval_s,
@@ -278,8 +278,9 @@ def _get_or_create_actor():
         "lifetime": "detached",
     }
     try:
-        if "node:__internal_head__" in ray.cluster_resources():
-            options["resources"] = {"node:__internal_head__": 0.001}
+        resources = preferred_control_plane_resources(ray.cluster_resources())
+        if resources is not None:
+            options["resources"] = resources
     except Exception:
         pass
     extra_env = otel_env_vars()

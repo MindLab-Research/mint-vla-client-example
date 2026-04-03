@@ -19,7 +19,7 @@ from enum import Enum
 from typing import Any
 
 from .queue_execution_context import get_current_queue_generation_id
-from ..config import config as server_config, otel_env_vars
+from ..config import config as server_config, otel_env_vars, preferred_control_plane_resources, preferred_control_plane_resources
 
 
 class FutureStoreUnavailableError(RuntimeError):
@@ -663,8 +663,9 @@ def _get_or_create_ray_actor():
         "lifetime": "detached",
     }
     try:
-        if "node:__internal_head__" in ray.cluster_resources():
-            options["resources"] = {"node:__internal_head__": 0.001}
+        resources = preferred_control_plane_resources(ray.cluster_resources())
+        if resources is not None:
+            options["resources"] = resources
     except Exception:
         pass
     actor_otel_env = otel_env_vars()

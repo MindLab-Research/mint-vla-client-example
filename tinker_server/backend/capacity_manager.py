@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from ..config import config as server_config, otel_env_vars
+from ..config import config as server_config, otel_env_vars, preferred_control_plane_resources
 
 
 class CapacityManagerUnavailableError(RuntimeError):
@@ -207,8 +207,7 @@ def _get_or_create_ray_actor():
 
     resources = None
     try:
-        if "node:__internal_head__" in ray.cluster_resources():
-            resources = {"node:__internal_head__": 0.001}
+        resources = preferred_control_plane_resources(ray.cluster_resources())
     except Exception:
         resources = None
 

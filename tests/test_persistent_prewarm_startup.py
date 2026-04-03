@@ -396,6 +396,126 @@ async def test_acquire_startup_lease_fails_closed_to_follower(monkeypatch) -> No
     assert lease.local_only is False
 
 
+def test_startup_lease_creation_prefers_explicit_pinned_node(monkeypatch) -> None:
+    _install_fake_ray(monkeypatch)
+    startup_lease_module = importlib.import_module("tinker_server.backend.startup_lease")
+    config_module = importlib.import_module("tinker_server.config")
+    fake_ray = importlib.import_module("ray")
+    created_options = {}
+
+    class _FakeRemoteCall:
+        def remote(self, *_args, **_kwargs):
+            return object()
+
+    class _FakeActorHandle:
+        def __init__(self) -> None:
+            self.try_acquire = _FakeRemoteCall()
+
+    class _FakeRemoteBuilder:
+        def remote(self):
+            return _FakeActorHandle()
+
+    class _FakeRemoteClass:
+        @staticmethod
+        def options(**kwargs):
+            created_options.update(kwargs)
+            return _FakeRemoteBuilder()
+
+    def _fake_remote(**kwargs):
+        assert kwargs == {"num_cpus": 0}
+
+        def _decorator(_cls):
+            return _FakeRemoteClass
+
+        return _decorator
+
+    monkeypatch.setattr(fake_ray, "remote", _fake_remote, raising=False)
+    monkeypatch.setattr(
+        fake_ray,
+        "get_actor",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("actor not found")),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        fake_ray,
+        "cluster_resources",
+        lambda: {"node:__internal_head__": 1.0},
+        raising=False,
+    )
+    monkeypatch.setattr(fake_ray, "get", lambda *_args, **_kwargs: {"owner": True}, raising=False)
+    monkeypatch.setattr(config_module, "PFS_RUNTIME_ENV_ROOT", "/tmp/runtime-root")
+    monkeypatch.setattr(config_module, "PFS_TINKER_PATH", "/tmp/tinker-root")
+    monkeypatch.setattr(config_module, "PFS_HF_MODULES_PATH", "/tmp/hf-modules")
+    monkeypatch.setattr(config_module, "PFS_PYTHONPATH", "/tmp/runtime-root/site-packages:/tmp/tinker-root")
+    monkeypatch.setenv("RAY_ADDRESS", "192.168.38.184:6379")
+    monkeypatch.setenv("MINT_STARTUP_LEASE_PINNED_NODE_IP", "192.168.38.176")
+    monkeypatch.setattr(startup_lease_module, "_ACTOR_HANDLE", None)
+
+    startup_lease_module._get_or_create_actor()
+
+    assert created_options["resources"] == {"node:192.168.38.176": 0.001}
+
+
+def test_startup_lease_creation_defaults_to_head_pin(monkeypatch) -> None:
+    _install_fake_ray(monkeypatch)
+    startup_lease_module = importlib.import_module("tinker_server.backend.startup_lease")
+    config_module = importlib.import_module("tinker_server.config")
+    fake_ray = importlib.import_module("ray")
+    created_options = {}
+
+    class _FakeRemoteCall:
+        def remote(self, *_args, **_kwargs):
+            return object()
+
+    class _FakeActorHandle:
+        def __init__(self) -> None:
+            self.try_acquire = _FakeRemoteCall()
+
+    class _FakeRemoteBuilder:
+        def remote(self):
+            return _FakeActorHandle()
+
+    class _FakeRemoteClass:
+        @staticmethod
+        def options(**kwargs):
+            created_options.update(kwargs)
+            return _FakeRemoteBuilder()
+
+    def _fake_remote(**kwargs):
+        assert kwargs == {"num_cpus": 0}
+
+        def _decorator(_cls):
+            return _FakeRemoteClass
+
+        return _decorator
+
+    monkeypatch.setattr(fake_ray, "remote", _fake_remote, raising=False)
+    monkeypatch.setattr(
+        fake_ray,
+        "get_actor",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("actor not found")),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        fake_ray,
+        "cluster_resources",
+        lambda: {"node:__internal_head__": 1.0},
+        raising=False,
+    )
+    monkeypatch.setattr(fake_ray, "get", lambda *_args, **_kwargs: {"owner": True}, raising=False)
+    monkeypatch.setattr(config_module, "PFS_RUNTIME_ENV_ROOT", "/tmp/runtime-root")
+    monkeypatch.setattr(config_module, "PFS_TINKER_PATH", "/tmp/tinker-root")
+    monkeypatch.setattr(config_module, "PFS_HF_MODULES_PATH", "/tmp/hf-modules")
+    monkeypatch.setattr(config_module, "PFS_PYTHONPATH", "/tmp/runtime-root/site-packages:/tmp/tinker-root")
+    monkeypatch.setenv("RAY_ADDRESS", "192.168.38.184:6379")
+    monkeypatch.delenv("MINT_STARTUP_LEASE_PINNED_NODE_IP", raising=False)
+    monkeypatch.setattr(startup_lease_module, "_ACTOR_HANDLE", None)
+
+    startup_lease_module._get_or_create_actor()
+
+    assert created_options["resources"] == {"node:__internal_head__": 0.001}
+
+
 def test_lifespan_keeps_training_route_globals_unbound_in_stateless_api(monkeypatch) -> None:
     queue = _StubApiWorkQueue()
     owner_runtime = _StubOwnerRuntimeSupervisor()
