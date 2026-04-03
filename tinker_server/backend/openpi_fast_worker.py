@@ -222,12 +222,18 @@ class OpenPIFastWorkerSession:
             resume=False,
         )
         overrides = OpenPIFastRuntimeInitOverrides.from_env()
+        self._seed_assets_dir: Path | None = None
         if overrides.weights_path is not None:
             logger.info("OpenPI FAST worker using explicit weights path: %s", overrides.weights_path)
             self._config = dataclasses.replace(
                 self._config,
                 weight_loader=weight_loaders.CheckpointWeightLoader(overrides.weights_path),
             )
+            seed_path = Path(overrides.weights_path).resolve()
+            seed_root = seed_path.parent if seed_path.name == "params" else seed_path
+            candidate_assets = seed_root / "assets"
+            if candidate_assets.is_dir():
+                self._seed_assets_dir = candidate_assets
         elif overrides.random_init:
             logger.info("OpenPI FAST worker using explicit random-init mode")
             self._config = dataclasses.replace(
@@ -768,6 +774,16 @@ class OpenPIFastWorkerSession:
                 norm_stats = data_config.norm_stats
                 if norm_stats is not None and data_config.asset_id is not None:
                     self._checkpoints._normalize.save(directory / data_config.asset_id, norm_stats)
+                    return
+
+                seed_assets_dir = getattr(self, "_seed_assets_dir", None)
+                if seed_assets_dir is not None and Path(seed_assets_dir).is_dir():
+                    shutil.copytree(Path(seed_assets_dir), directory, dirs_exist_ok=True)
+                    return
+
+                raise FileNotFoundError(
+                    "OpenPI FAST sampler export missing norm_stats and seed assets directory"
+                )
 
             manager.save(
                 checkpoint_step,

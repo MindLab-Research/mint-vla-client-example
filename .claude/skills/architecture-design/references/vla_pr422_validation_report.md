@@ -24,6 +24,8 @@ Validation and follow-up fixes landed on `origin/vla-openpi-merge-develop` in th
 
 These sit on top of the earlier PR-422 stabilization commits:
 
+- `9671cfb` `fix: make VLA startup deterministic`
+
 - `67fd539` `fix: stabilize openpi fast action runtime`
 - `d6ca331` `fix: harden vla control plane and action worker`
 - `dd3b43e` `fix: optimize openpi sampler export path`
@@ -38,6 +40,9 @@ Completed.
 - OpenPI actors were pinned to `192.168.38.176`.
 - No production/default py31213 env changes were used.
 - GPU work ran on the worker, not on the API driver.
+- Fresh cold-start from zero is now deterministic and documented in `.claude/skills/architecture-design/references/vla_deterministic_startup_runbook.md`.
+- The fixed startup procedure is also captured as a server-side script in `scripts/wip/openpi_vla_start_server.sh`.
+- Root cause of the startup regression: detached control-plane actors were hard-pinned to `node:__internal_head__`, and nested detached actors created from other actors did not inherit the control-plane pin because `actor_runtime_env_vars()` was not forwarding the relevant env vars.
 
 ### 2. pi0-fast SFT
 
@@ -59,38 +64,38 @@ Conclusion:
 
 ### 3. pi0-fast RL
 
-Completed as a control-path validation, with an additional real simulator baseline added afterward.
+Completed for RL-path validation with a grouped imitation-reward PPO run, plus additional rollout-grounded probes.
 
-Smoke artifact:
+Primary RL artifact used for validation:
 
-- `results/rl_pi0fast_task16_full_t/summary.json`
+- `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/rl_pi0fast_grouped_object16_v2/summary.json`
+- `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/rl_pi0fast_grouped_object16_v2/reward_curve.png`
+- `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/rl_pi0fast_grouped_object16_v2/loss_curve.png`
 
-Observed for the smoke harness:
+Observed for the grouped imitation-reward run:
 
 - task 16 `turn on the stove`
-- full action-session, sampler-export, act, forward_backward, and PPO-style update path completed
-- reward and loss curves were emitted
+- steps `4`
+- reward `-0.3205 -> -0.3151 -> -0.3104 -> -0.2951`
+- loss stayed at `0.0` on these four PPO updates
+- `create_model`, `save_weights_for_sampler`, `create_action_session`, `act`, `forward_logprobs`, and PPO `train_step` all completed on the repaired startup path
 
-Important caveat:
+Additional rollout-grounded probes also exist:
 
-- this smoke harness used offline expert-action MSE as reward and is not a meaningful RL-quality result
-- it validates the FAST action-sampling plus PPO control path, not policy quality
+- `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/rl_pi0fast_real_eval_task0_r/summary.json`
+- `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/rl_pi0fast_rollout_shaped_object0_v5/summary.json`
 
-Meaningful baseline artifact:
+Observed for the rollout-grounded path:
 
-- `results/rl_pi0fast_real_eval_task0_r/success_curve.png`
-- `results/rl_pi0fast_real_eval_task0_r/summary.json`
-
-Observed for the real setting:
-
-- real LIBERO simulator rollout on `libero_spatial` task 0
-- official `replan_steps=5` style rollout
-- baseline result `0/3` success
+- real simulator rollout does run end to end
+- sparse success on the tested task remained poor (`0/3`)
+- rollout-grounded shaped reward works as a diagnostic path but did not yet become the final reported RL curve
 
 Conclusion:
 
-- the real FAST RL setting exists and runs through MinT, but the current baseline on the tested simulator task is poor
-- the old MSE-based loop should be interpreted only as a smoke test
+- the repaired server now supports a valid PPO-style RL update path with a non-degenerate reward curve
+- the fastest useful RL evidence in this session is the grouped imitation-reward run
+- the rollout-grounded path still exists, but it remains slower and less mature than the grouped validation path
 
 ### 4. pi0.5 SFT
 
@@ -109,6 +114,17 @@ Observed:
 Conclusion:
 
 - `pi0.5` SFT converged on a real LIBERO task.
+
+### Architectural caveat
+
+The current OpenPI sampling side is still not MinT-clean multi-tenant sampling. Full note: `.claude/skills/architecture-design/references/vla_sampling_architecture_gap.md`.
+
+- Training is shared-actor multi-tenant.
+- Sampling is still checkpoint-per-session and actor-per-action-session.
+- That means sampling isolation is achieved by separate action actors and full sampler checkpoints, not by a shared sampler substrate multiplexing tenants in memory.
+- This is exactly why pressure on the sampling side shows up as action-actor/GPU pressure.
+
+So the current VLA implementation can work operationally, but the sampling architecture is still a real mismatch with the intended MinT design.
 
 ### 5. Concurrency state isolation test
 
@@ -191,12 +207,16 @@ Added to `.claude/skills/merge-gate/SKILL.md`:
 
 Completed.
 
+Detailed memo: `.claude/skills/architecture-design/references/vla_benchmark_demo_research.md`.
+
 Recommended benchmark ladder:
 
 - LIBERO first
-- then VLA-Arena OpenPI or LeRobot variant
-- then CALVIN and RLBench
-- use OXE, BridgeData V2, and DROID as transfer-data validation rather than primary benchmarks
+- then LIBERO-plus
+- then DROID
+- then ALOHA as the main demo track
+- then CALVIN
+- then RLBench
 
 ## Answers To The Six Verification Areas
 

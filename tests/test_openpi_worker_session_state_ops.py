@@ -335,6 +335,61 @@ def test_openpi_fast_worker_sampler_checkpoint_omits_train_state() -> None:
     assert calls["closed"] is True
 
 
+def test_openpi_fast_worker_sampler_checkpoint_copies_seed_assets(tmp_path) -> None:
+    calls: dict[str, object] = {}
+
+    class _FakeManager:
+        def save(self, step, *, items):
+            calls["save"] = {"step": step, "items": items}
+
+        def wait_until_finished(self) -> None:
+            calls["waited"] = True
+
+        def close(self) -> None:
+            calls["closed"] = True
+
+    class _FakeCheckpoints:
+        def initialize_checkpoint_dir(self, checkpoint_path, *, keep_period, overwrite, resume):
+            calls["checkpoint_path"] = checkpoint_path
+            return _FakeManager(), False
+
+        class _normalize:
+            @staticmethod
+            def save(path, norm_stats):
+                raise AssertionError("normalize.save should not be used when seed assets are available")
+
+    class _FakeDataLoader:
+        @staticmethod
+        def data_config():
+            return SimpleNamespace(norm_stats=None, asset_id=None)
+
+    seed_assets_dir = tmp_path / "seed_assets"
+    norm_stats = seed_assets_dir / "physical-intelligence" / "libero" / "norm_stats.json"
+    norm_stats.parent.mkdir(parents=True, exist_ok=True)
+    norm_stats.write_text("{}", encoding="utf-8")
+
+    fake_session = SimpleNamespace(
+        _checkpoints=_FakeCheckpoints(),
+        _data_loader=_FakeDataLoader(),
+        _seed_assets_dir=seed_assets_dir,
+    )
+    state = SimpleNamespace(step=0, params={"w": 1})
+
+    fast_worker_module.OpenPIFastWorkerSession._save_sampler_checkpoint(
+        fake_session,
+        tmp_path / "openpi-fast-sampler-seed-assets",
+        state,
+    )
+
+    assets_callback = calls["save"]["items"]["assets"]
+    export_assets_dir = tmp_path / "exported_assets"
+    assets_callback(export_assets_dir)
+
+    assert (export_assets_dir / "physical-intelligence" / "libero" / "norm_stats.json").read_text(encoding="utf-8") == "{}"
+    assert calls["waited"] is True
+    assert calls["closed"] is True
+
+
 def test_openpi_pi05_worker_sampler_checkpoint_omits_train_state() -> None:
     calls: dict[str, object] = {}
 

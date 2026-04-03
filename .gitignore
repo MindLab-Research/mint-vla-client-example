@@ -253,3 +253,8 @@ node_modules/
 .pnpm-store/
 .learnings/ERRORS.md
 !scripts/wip/openpi_vla_start_server.sh
+!scripts/wip/openpi_libero_fixed_eval_abs.py
+!scripts/wip/openpi_libero_fast_group_rl.py
+!scripts/wip/openpi_libero_fast_real_eval.py
+!scripts/wip/openpi_libero_fast_real_eval_report.py
+!scripts/wip/openpi_vla_smoke.py

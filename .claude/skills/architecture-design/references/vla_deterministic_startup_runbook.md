@@ -27,6 +27,8 @@ nohup bash scripts/wip/openpi_vla_start_server.sh tinker_root_vla_pr422_20260404
 - Use a namespace-specific queue actor name via `TINKER_API_WORK_QUEUE_ACTOR_NAME` and `MINT_API_WORK_QUEUE_ACTOR_NAME`.
 - Pin the queue actor with `MINT_API_WORK_QUEUE_PINNED_NODE_IP=192.168.38.176`.
 - Pin the detached control-plane actors with `MINT_CONTROL_PLANE_PINNED_NODE_IP=192.168.38.176`.
+- Set `MINT_OPENPI_FAST_WEIGHTS_PATH` to the actual params directory: `/vePFS-Mindverse/share/code/root/.openpi-data-vla-pr422/openpi-assets/checkpoints/pi0_fast_base/params.partial/params`. Do not point it at the wrapper `params.partial` root.
+- Optional: set `MINT_VLA_FAST_WEIGHTS_PATH` before running the startup script if you need to seed from a different known-good `params` checkpoint.
 - Do not rely on inherited shell env. Explicitly unset stray actor-name overrides before starting.
 
 ## Root Cause Fixed
