@@ -13,6 +13,51 @@ This report covers the end-to-end validation requested in `PROMPT.md` for PR 422
 
 The work includes runtime bringup, SFT and RL experiments, resume testing, interleaving and pressure testing, merge-gate updates, and a final answer to the six requested verification areas.
 
+## Artifact Index
+
+All experiment artifacts live on the dedicated mint-dev code root, not in the git worktree:
+
+- root: `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results`
+- grouped RL plots inspected locally after copy:
+  - `/home/yiwen/pr422-plot-cache/reward_curve.png`
+  - `/home/yiwen/pr422-plot-cache/loss_curve.png`
+
+Primary artifact paths by task:
+
+- pi0-fast SFT:
+  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/sft_pi0fast_task16_full_k/summary.json`
+  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/sft_pi0fast_task16_full_k/loss_curve.png`
+- pi0.5 SFT:
+  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/sft_pi05_task10_full_k/summary.json`
+  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/sft_pi05_task10_full_k/loss_curve.png`
+- pi0-fast grouped RL:
+  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/rl_pi0fast_grouped_object16_v2/summary.json`
+  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/rl_pi0fast_grouped_object16_v2/metrics.jsonl`
+  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/rl_pi0fast_grouped_object16_v2/reward_curve.png`
+  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/rl_pi0fast_grouped_object16_v2/loss_curve.png`
+- rollout-grounded probes:
+  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/rl_pi0fast_real_eval_task0_r/summary.json`
+  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/rl_pi0fast_real_eval_task0_r/success_curve.png`
+  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/rl_pi0fast_rollout_shaped_object0_v5/summary.json`
+  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/rl_pi0fast_rollout_shaped_object0_v5/reward_curve.png`
+  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/rl_pi0fast_rollout_shaped_object0_v5/loss_curve.png`
+  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/rl_pi0fast_rollout_shaped_object0_v5/success_curve.png`
+- isolation:
+  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/iso_fast_sft_task16_t/loss_curve.png`
+  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/iso_fast_sft_task17_t/loss_curve.png`
+  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/iso_fast_rl_task18_t/reward_curve.png`
+  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/iso_fast_rl_task18_t/loss_curve.png`
+  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/iso_fast_rl_task20_t/reward_curve.png`
+  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/iso_fast_rl_task20_t/loss_curve.png`
+  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/iso_pi05_sft_task10_t/loss_curve.png`
+  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/iso_pi05_sft_task11_t/loss_curve.png`
+  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/iso_pi05_sft_task12_t/loss_curve.png`
+- resume:
+  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/resume_pi0fast_task16_k/loss_curve.png`
+  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/resume_pi05_task10_k/loss_curve.png`
+- pressure:
+  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/pressure_threads_timeout3600_remote_p/batch_summary.json`
+
 ## Branch Changes
 
 Validation and follow-up fixes landed on `origin/vla-openpi-merge-develop` in these commits:
@@ -288,7 +333,7 @@ Yes, after the branch updates.
 
 At the end of validation:
 
-- PR branch head is `f92adea`, on top of the earlier `24dfc88`, `9671cfb`, and `8ab2078` updates
+- PR branch head is `9eca1b9`, on top of the earlier `f92adea`, `24dfc88`, `9671cfb`, and `8ab2078` updates
 - deterministic startup from zero was re-verified under the scripted runbook on port `18125`
 - focused local verification passed after the final changes: `75 passed` on startup/runtime/worker slices
 - grouped RL artifact completed at `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/rl_pi0fast_grouped_object16_v2/summary.json`
