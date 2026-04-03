@@ -1,6 +1,6 @@
 # PR 422 VLA Validation Report
 
-Date: 2026-04-03
+Date: 2026-04-04
 
 ## Scope
 
@@ -48,9 +48,10 @@ Completed.
 
 Completed.
 
-Artifact:
+Artifacts:
 
 - `results/sft_pi0fast_task16_full_k/summary.json`
+- `results/sft_pi0fast_task16_full_k/loss_curve.png`
 
 Observed:
 
@@ -101,9 +102,10 @@ Conclusion:
 
 Completed.
 
-Artifact:
+Artifacts:
 
 - `results/sft_pi05_task10_full_k/summary.json`
+- `results/sft_pi05_task10_full_k/loss_curve.png`
 
 Observed:
 
@@ -128,7 +130,7 @@ So the current VLA implementation can work operationally, but the sampling archi
 
 ### 5. Concurrency state isolation test
 
-Completed.
+Completed operationally, with a sampling-architecture caveat.
 
 Workload:
 
@@ -143,10 +145,21 @@ Observed:
 - separate FAST action actors for sampling
 - no duplicate trainer actors
 - no evidence of cross-tenant trainer-state contamination
+- plot artifacts were emitted for the completed isolation clients:
+  - `results/iso_fast_sft_task16_t/loss_curve.png`
+  - `results/iso_fast_sft_task17_t/loss_curve.png`
+  - `results/iso_fast_rl_task18_t/reward_curve.png`
+  - `results/iso_fast_rl_task18_t/loss_curve.png`
+  - `results/iso_fast_rl_task20_t/reward_curve.png`
+  - `results/iso_fast_rl_task20_t/loss_curve.png`
+  - `results/iso_pi05_sft_task10_t/loss_curve.png`
+  - `results/iso_pi05_sft_task11_t/loss_curve.png`
+  - `results/iso_pi05_sft_task12_t/loss_curve.png`
 
 Conclusion:
 
-- interleaved training and sampling behaved as intended on the shared-trainer architecture.
+- interleaved training worked as intended on the shared-trainer architecture
+- sampling isolation was achieved operationally by separate action actors, which is why this result does not imply MinT-clean shared multi-tenant sampling
 
 ### 6. Concurrency pressure test
 
@@ -185,6 +198,9 @@ Observed:
 
 - `pi0-fast` crossed the save/resume boundary without an immediate loss spike
 - `pi0.5` crossed the save/resume boundary without an immediate loss spike
+- resume plot artifacts:
+  - `results/resume_pi0fast_task16_k/loss_curve.png`
+  - `results/resume_pi05_task10_k/loss_curve.png`
 
 Conclusion:
 
@@ -251,14 +267,14 @@ So the RL stack works, but the original MSE-reward harness should not be treated
 
 ### 5. Does multi-tenant interleaved training and sampling work as expected?
 
-Yes, within the validated harness.
+Partially.
 
 - shared trainers were reused correctly
 - FAST action actors scaled separately
 - trainer duplication was not observed
 - final pressure run completed `30/30` logical clients successfully
 
-The important scope note is that the final `30/30` result is for the threaded logical-client harness, not the invalid naive `30`-process client launch.
+What was verified is shared training plus isolated action actors. That is operationally usable, but it is not MinT-clean shared multi-tenant sampling because sampling still uses checkpoint-per-session action actors.
 
 ### 6. Are API docs and client examples clear and consistent?
 
@@ -272,7 +288,7 @@ Yes, after the branch updates.
 
 At the end of validation:
 
-- PR branch head is `24dfc88`, on top of the earlier `9671cfb` startup fix and `8ab2078` VLA exploration fix
+- PR branch head is `f92adea`, on top of the earlier `24dfc88`, `9671cfb`, and `8ab2078` updates
 - deterministic startup from zero was re-verified under the scripted runbook on port `18125`
 - focused local verification passed after the final changes: `75 passed` on startup/runtime/worker slices
 - grouped RL artifact completed at `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/rl_pi0fast_grouped_object16_v2/summary.json`
