@@ -333,8 +333,8 @@ Yes, after the branch updates.
 
 At the end of validation:
 
-- PR branch head is `9eca1b9`, on top of the earlier `f92adea`, `24dfc88`, `9671cfb`, and `8ab2078` updates
+- PR branch head is `b05c6b0`, on top of the earlier `9eca1b9`, `f92adea`, `24dfc88`, `9671cfb`, and `8ab2078` updates
 - deterministic startup from zero was re-verified under the scripted runbook on port `18125`
 - focused local verification passed after the final changes: `75 passed` on startup/runtime/worker slices
 - grouped RL artifact completed at `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/rl_pi0fast_grouped_object16_v2/summary.json`
-- current `mint-dev` actor state returned to one idle shared OpenPI fast trainer on `192.168.38.176` after grouped RL cleanup
+- after the pressure test, `mint-dev` returned to the expected idle two-trainer state (fast + pi0.5); after the final grouped RL cleanup, the currently running server has one idle shared fast trainer on `192.168.38.176`
