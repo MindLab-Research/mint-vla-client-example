@@ -100,6 +100,30 @@ def test_issue_94_init_ray_merges_runtime_env_without_overriding_working_dir(mon
     }
 
 
+def test_issue_94_init_ray_prefers_mint_client_address(monkeypatch) -> None:
+    calls: list[dict] = []
+    _install_ray_stub(calls, monkeypatch)
+
+    from tinker_server.ray_utils import init_ray
+
+    monkeypatch.setenv("RAY_ADDRESS", "192.168.38.184:6379")
+    monkeypatch.setenv("RAY_CLIENT_ADDRESS", "ray://192.168.38.184:10001")
+    monkeypatch.setenv("MINT_RAY_CLIENT_ADDRESS", "ray://192.168.38.184:20001")
+    init_ray(namespace="ns", ignore_reinit_error=True)
+    assert calls[-1]["address"] == "ray://192.168.38.184:20001"
+
+
+def test_issue_94_init_ray_preserves_explicit_runtime_env(monkeypatch) -> None:
+    calls: list[dict] = []
+    _install_ray_stub(calls, monkeypatch)
+
+    from tinker_server.ray_utils import init_ray
+
+    monkeypatch.setenv("RAY_CLIENT_ADDRESS", "ray://192.168.38.184:10001")
+    init_ray(namespace="ns", ignore_reinit_error=True, runtime_env={"py_modules": ["x"]})
+    assert calls[-1]["runtime_env"] == {"py_modules": ["x"]}
+
+
 def test_issue_94_init_ray_requires_explicit_address(monkeypatch) -> None:
     calls: list[dict] = []
     _install_ray_stub(calls, monkeypatch)
