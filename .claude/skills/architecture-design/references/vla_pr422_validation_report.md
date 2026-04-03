@@ -40,7 +40,7 @@ Completed.
 - OpenPI actors were pinned to `192.168.38.176`.
 - No production/default py31213 env changes were used.
 - GPU work ran on the worker, not on the API driver.
-- Fresh cold-start from zero is now deterministic and documented in `.claude/skills/architecture-design/references/vla_deterministic_startup_runbook.md`.
+- Fresh cold-start from zero is now deterministic under the documented runbook on the assigned worker and fresh namespace, and is captured in `.claude/skills/architecture-design/references/vla_deterministic_startup_runbook.md`.
 - The fixed startup procedure is also captured as a server-side script in `scripts/wip/openpi_vla_start_server.sh`.
 - Root cause of the startup regression: detached control-plane actors were hard-pinned to `node:__internal_head__`, and nested detached actors created from other actors did not inherit the control-plane pin because `actor_runtime_env_vars()` was not forwarding the relevant env vars.
 
@@ -272,7 +272,8 @@ Yes, after the branch updates.
 
 At the end of validation:
 
-- PR branch head is `c6c54c5`
-- `tests/test_mint_routes.py` passed locally
-- `mint-dev` returned to two idle shared OpenPI trainer actors on `192.168.38.176`
-- no lingering action actors remained
+- PR branch head is `24dfc88`, on top of the earlier `9671cfb` startup fix and `8ab2078` VLA exploration fix
+- deterministic startup from zero was re-verified under the scripted runbook on port `18125`
+- focused local verification passed after the final changes: `75 passed` on startup/runtime/worker slices
+- grouped RL artifact completed at `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/rl_pi0fast_grouped_object16_v2/summary.json`
+- current `mint-dev` actor state returned to one idle shared OpenPI fast trainer on `192.168.38.176` after grouped RL cleanup
