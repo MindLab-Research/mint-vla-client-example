@@ -42,6 +42,7 @@ from tinker_server.backend.model_registry import get_model_config
 from tinker_server.ray_utils import init_ray
 from tinker_server.model_input_utils import flatten_encoded_text_chunks
 from tinker_server.backend.volc_placement import assert_node_ip_capacity, parse_model_node_ip_list
+from tinker_server.backend.ray_placement_groups import PlacementGroupMismatchError, get_named_placement_group
 
 # Persistent actor configuration
 PERSISTENT_NAMESPACE = RAY_NAMESPACE  # Same namespace as vLLM
@@ -164,6 +165,68 @@ def _make_megatron_actor_name(base_model: str) -> str:
         model_name = base_model.split("/")[-1].lower().replace("-", "_").replace(".", "_")
 
     return f"megatron_{model_name}"
+
+
+def _bundle_node_ip(bundle: dict[str, float | int]) -> str | None:
+    for key, value in bundle.items():
+        if isinstance(key, str) and key.startswith("node:") and float(value or 0) > 0:
+            return key.split("node:", 1)[1]
+    return None
+
+
+def _node_affinity_resources(node_ip: str | None) -> dict[str, float]:
+    if not node_ip:
+        return {}
+    return {f"node:{node_ip}": 0.001}
+
+
+def _make_namespace_pg_suffix(namespace: str) -> str:
+    raw = str(namespace).strip().lower()
+    if not raw:
+        return "default"
+    sanitized = "".join(ch if ch.isalnum() else "_" for ch in raw).strip("_")
+    if len(sanitized) <= 24:
+        return sanitized or "default"
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
+    return f"{sanitized[:15]}_{digest}"
+
+
+def _make_megatron_pg_name_from_actor_name(
+    actor_name: str,
+    *,
+    namespace: str = PERSISTENT_NAMESPACE,
+) -> str:
+    return f"{actor_name}_{_make_namespace_pg_suffix(namespace)}_pg"
+
+
+def _make_megatron_pg_name(base_model: str, *, namespace: str = PERSISTENT_NAMESPACE) -> str:
+    actor_name = _make_megatron_actor_name(base_model)
+    return _make_megatron_pg_name_from_actor_name(actor_name, namespace=namespace)
+
+
+def _get_or_create_megatron_placement_group(*, pg_name: str, bundles: list[dict[str, float | int]]):
+    try:
+        return get_named_placement_group(
+            pg_name,
+            namespace=PERSISTENT_NAMESPACE,
+            expected_bundles=bundles,
+        )
+    except PlacementGroupMismatchError as e:
+        logger.warning(
+            "[MegatronWorkerGroup] Removing incompatible placement group %s: %s",
+            pg_name,
+            e,
+        )
+        ray.util.remove_placement_group(e.pg)
+    except Exception:
+        pass
+
+    return ray.util.placement_group(
+        bundles,
+        strategy="PACK",
+        name=pg_name,
+        lifetime="detached",
+    )
 
 
 @dataclass
@@ -5363,6 +5426,8 @@ class MegatronWorkerGroup:
         self._session_manager = MegatronSessionStateManager()  # Issue #44: session state management
         self._master_addr: str | None = None
         self._master_port: int | None = None
+        self._placement_bundle_node_ips: list[str | None] = []
+        self._placement_requested_node_ips: list[str] = []
 
         self._initialize()
 
@@ -5490,18 +5555,19 @@ class MegatronWorkerGroup:
                     cpu_per_gpu=1,
                 )
                 logger.info(f"[MegatronWorkerGroup] Model placement preferred nodes={node_ips}")
+        self._placement_bundle_node_ips = [_bundle_node_ip(bundle) for bundle in bundles]
+        self._placement_requested_node_ips = [ip for ip in self._placement_bundle_node_ips if ip is not None]
+        logger.info(
+            f"[MegatronWorkerGroup] Placement bundle node IPs={self._placement_bundle_node_ips}"
+        )
+
         # PACK: try to colocate but allow multi-node for large models (K2: 16+ GPUs)
         # STRICT_PACK would require single node, blocking on 8-GPU nodes
-        pg_name = f"{_make_megatron_actor_name(self.base_model)}_pg"
-        try:
-            self.placement_group = ray.util.get_placement_group(pg_name)
-        except Exception:
-            self.placement_group = ray.util.placement_group(
-                bundles,
-                strategy="PACK",
-                name=pg_name,
-                lifetime="detached",
-            )
+        pg_name = _make_megatron_pg_name(self.base_model)
+        self.placement_group = _get_or_create_megatron_placement_group(
+            pg_name=pg_name,
+            bundles=bundles,
+        )
         ray.get(self.placement_group.ready())
 
         logger.info(f"[MegatronWorkerGroup] Placement group ready with {world_size} GPUs")
@@ -5582,6 +5648,7 @@ class MegatronWorkerGroup:
                     placement_group=self.placement_group,
                     placement_group_bundle_index=0,
                 ),
+                resources=_node_affinity_resources(self._placement_bundle_node_ips[0]),
                 runtime_env=runtime_env,
             ).remote()
         )
@@ -5600,6 +5667,7 @@ class MegatronWorkerGroup:
                     placement_group=self.placement_group,
                     placement_group_bundle_index=rank,
                 ),
+                resources=_node_affinity_resources(self._placement_bundle_node_ips[rank]),
                 runtime_env=runtime_env,
             ).remote(
                 rank=rank,
@@ -6333,6 +6401,30 @@ class MegatronWorkerGroup:
             chunks_by_rank.append(chunks)
         return chunks_by_rank
 
+    def debug_lora_storage(
+        self,
+        session_id: str | None = None,
+        traceparent: str | None = None,
+        *,
+        train_attn: bool | None = None,
+        train_mlp: bool | None = None,
+        train_unembed: bool | None = None,
+    ) -> dict:
+        self._bind_traceparent(traceparent)
+        effective_session_id = self._resolve_required_session_id(
+            session_id,
+            op="debug_lora_storage",
+        )
+        self._ensure_session_loaded(
+            effective_session_id,
+            traceparent=traceparent,
+            train_attn=train_attn,
+            train_mlp=train_mlp,
+            train_unembed=train_unembed,
+        )
+        results = ray.get([w.debug_lora_storage.remote(traceparent=traceparent) for w in self.workers])
+        return {"results": results}
+
     def optim_step(
         self,
         learning_rate: float,
@@ -6935,6 +7027,8 @@ class MegatronWorkerGroup:
             "num_workers": len(self.workers),
             "base_model": self.base_model,
             "lora_rank": self.lora_rank,
+            "placement_bundle_node_ips": list(self._placement_bundle_node_ips),
+            "placement_requested_node_ips": list(dict.fromkeys(self._placement_requested_node_ips)),
         }
 
 
@@ -7327,7 +7421,7 @@ def get_or_create_megatron_worker_group(
         # Heal a common invariant violation: a detached Megatron placement group can outlive the
         # named actor (e.g., crash during initialization). The orphan PG reserves GPUs, which can
         # make ensure_gpus_available() block forever even though nothing is actually running.
-        pg_name = f"{actor_name}_pg"
+        pg_name = _make_megatron_pg_name(base_model)
         try:
             orphan_pg = ray.util.get_placement_group(pg_name)
         except ValueError:
@@ -7533,7 +7627,7 @@ def kill_megatron_actor(base_model: str | None = None) -> bool:
     killed_any = False
 
     def _remove_detached_pg(actor_name: str) -> None:
-        pg_name = f"{actor_name}_pg"
+        pg_name = _make_megatron_pg_name_from_actor_name(actor_name)
         try:
             pg = ray.util.get_placement_group(pg_name)
         except ValueError:

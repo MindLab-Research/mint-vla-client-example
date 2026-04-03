@@ -277,7 +277,6 @@ def get_or_create_dense_trainer(
                     base_model=base_model,
                     lora_rank=effective_max_rank,
                     learning_rate=learning_rate,
-                    session_state_root=server_config.training_dense_session_state_root,
                 )
 
                 init_timeout_s = float(os.environ.get("MINT_DENSE_ACTOR_INIT_TIMEOUT_S", "600"))
