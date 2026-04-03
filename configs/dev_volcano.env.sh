@@ -71,7 +71,7 @@ export MINT_VLLM_VOLC_RESOURCE_QUEUE_ID=q-20251126180002-26lwz
 export RAY_ADDRESS=192.168.38.184:6379
 
 
-export TINKER_API_WORK_QUEUE_ACTOR_NAME=tinker_api_work_queue_leixiang
+export MINT_API_WORK_QUEUE_ACTOR_NAME=tinker_api_work_queue_leixiang
 export MINT_API_WORK_QUEUE_ACTOR_MAX_CONCURRENCY=1024
 
 export PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/mint-runtime-py31213

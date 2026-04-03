@@ -14,21 +14,42 @@ _ACTOR_HANDLE = None
 
 
 def _runtime_env_overrides() -> dict[str, str]:
-    keys = (
+    out: dict[str, str] = {}
+
+    direct_keys = (
         "MINT_QUEUE_EXECUTION_RUNTIME_ACTOR_NAME",
         "MINT_QUEUE_SUPERVISOR_ACTOR_NAME",
-        "MINT_API_WORK_QUEUE_ACTOR_NAME",
+        "MINT_FUTURE_STORE_ACTOR_NAME",
         "MINT_OWNER_RUNTIME_SUPERVISOR_ACTOR_NAME",
         "MINT_TRAINING_CLEANUP_EXECUTOR_ACTOR_NAME",
         "MINT_SAMPLING_CLEANUP_EXECUTOR_ACTOR_NAME",
+        "MINT_API_WORK_QUEUE_ACTOR_MAX_CONCURRENCY",
         "TINKER_RAY_NAMESPACE",
         "MINT_RAY_NAMESPACE",
+        "MINT_K2_INFER_VOLC_RESOURCE_QUEUE_ID",
+        "MINT_VLLM_PINNED_NODE_IP_JSON",
+        "MINT_VLLM_VOLC_RESOURCE_QUEUE_ID",
+        "MINT_DENSE_MODEL_NODE_IPS_JSON",
+        "MINT_MODEL_NODE_IPS_JSON",
+        "MINT_VLLM_MODEL_NODE_IPS_JSON",
+        "MINT_MEGATRON_MODEL_NODE_IPS_JSON",
+        "MINT_MEGATRON_NODE_IPS_CSV",
+        "MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID",
     )
-    out: dict[str, str] = {}
-    for key in keys:
+    for key in direct_keys:
         value = os.environ.get(key, "").strip()
         if value:
             out[key] = value
+
+    # Canonicalize legacy actor-name envs before detached runtime actors inherit them.
+    compat_keys = {
+        "MINT_API_WORK_QUEUE_ACTOR_NAME": "TINKER_API_WORK_QUEUE_ACTOR_NAME",
+        "MINT_CAPACITY_MANAGER_ACTOR_NAME": "TINKER_CAPACITY_MANAGER_ACTOR_NAME",
+    }
+    for canonical, legacy in compat_keys.items():
+        value = os.environ.get(canonical, "").strip() or os.environ.get(legacy, "").strip()
+        if value:
+            out[canonical] = value
     return out
 
 
