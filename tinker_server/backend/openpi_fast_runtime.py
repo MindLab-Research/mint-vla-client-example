@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import json
+import time
 import os
 import stat
 import sys
@@ -248,15 +249,26 @@ class OpenPIFastWorkerClient:
             await stdin.drain()
 
             effective_timeout = self.timeout_for(op) if timeout_s is None else float(timeout_s)
-            try:
-                message = await self._read_message(effective_timeout)
-            except OpenPIFastWorkerProtocolError as exc:
-                raise OpenPIFastWorkerProtocolError(
-                    f"worker op {op!r} timed out or returned invalid protocol after {effective_timeout}s: {exc}"
-                ) from exc
-            if message.get("id") != request_id:
-                raise OpenPIFastWorkerProtocolError(
-                    f"worker reply id mismatch: expected {request_id!r}, got {message.get('id')!r}"
+            deadline = time.monotonic() + effective_timeout
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise OpenPIFastWorkerProtocolError(
+                        f"worker op {op!r} timed out or returned invalid protocol after {effective_timeout}s: worker reply timed out"
+                    )
+                try:
+                    message = await self._read_message(remaining)
+                except OpenPIFastWorkerProtocolError as exc:
+                    raise OpenPIFastWorkerProtocolError(
+                        f"worker op {op!r} timed out or returned invalid protocol after {effective_timeout}s: {exc}"
+                    ) from exc
+                if message.get("id") == request_id:
+                    break
+                logger.warning(
+                    "Discarding stale OpenPI worker reply for op=%s expected_id=%s got_id=%s",
+                    op,
+                    request_id,
+                    message.get("id"),
                 )
             if message.get("ok") is not True:
                 error = message.get("error") or {}
