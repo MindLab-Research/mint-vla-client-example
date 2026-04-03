@@ -2970,38 +2970,66 @@ async def _do_save_weights_for_sampler(
             lora_rank = session.lora_config.rank if session.lora_config else 32
             base_model = session.base_model
 
-            # Get or create engine for this model (dynamically creates vLLM actor if needed)
-            multi_lora_engine = await inference_manager.get_engine_for_model(base_model)
+            # Do not block save-time on vLLM actor cold-start. Kick off engine
+            # warm in the background, but still fail fast if the warm task trips
+            # an immediate configuration or capacity error before we return a
+            # sampling_session_id. Allow one short grace window so async failures
+            # that happen right after the first await still surface on save.
+            async def _warm_engine() -> None:
+                await inference_manager.get_engine_for_model(base_model)
 
-            if multi_lora_engine is not None:
-                # Multi-LoRA mode: Each sampling session gets frozen weights
-                # Use path-based loading for MoE models (avoids 30k+ tensor Ray transfer)
-                # vLLM worker loads directly from shared PFS
-                start_time = time.time()
+            pending_warms = getattr(inference_manager, "_background_engine_warm_tasks", None)
+            if not isinstance(pending_warms, dict):
+                pending_warms = {}
+                setattr(inference_manager, "_background_engine_warm_tasks", pending_warms)
 
-                # Add LoRA from path - vLLM worker loads directly from PFS
-                # This avoids serializing 37k+ tensors through Ray object store
-                lora_id = await multi_lora_engine.add_lora_for_session_from_path(
-                    sampling_session_id=sampling_session_id,
-                    lora_path=save_path,
-                )
+            existing_warm = pending_warms.get(base_model)
+            if isinstance(existing_warm, asyncio.Task) and not existing_warm.done():
+                warm_task = existing_warm
+            else:
+                warm_task = asyncio.create_task(_warm_engine())
+                pending_warms[base_model] = warm_task
 
-                # Persist the detached snapshot with the concrete LoRA registry id so a
-                # different API worker can rebind the same loaded adapter after restore.
-                inference_manager.register_multi_lora_session(
-                    session_id=sampling_session_id,
-                    base_model=base_model,
-                    lora_rank=lora_rank,
-                    adapter_path=save_path,
-                    lora_loaded=True,
-                    lora_int_id=lora_id,
-                )
+                def _log_warm_failure(task: asyncio.Task[object]) -> None:
+                    if pending_warms.get(base_model) is task:
+                        pending_warms.pop(base_model, None)
+                    if task.cancelled():
+                        return
+                    try:
+                        exc = task.exception()
+                    except Exception:
+                        return
+                    if exc is not None:
+                        logger.warning(
+                            "[save_weights_for_sampler] background engine warm failed: "
+                            "model=%s err=%s",
+                            base_model,
+                            exc,
+                        )
 
-                load_time = time.time() - start_time
-                logger.info(
-                    f"[save_weights_for_sampler] Multi-LoRA: added lora_id={lora_id} "
-                    f"for session {sampling_session_id} (model={base_model}) in {load_time:.3f}s"
-                )
+                warm_task.add_done_callback(_log_warm_failure)
+
+            done, _pending = await asyncio.wait({warm_task}, timeout=0.05)
+            if warm_task in done:
+                await warm_task
+
+            # Multi-LoRA mode: register the sampling session immediately and let
+            # /asample load the adapter lazily on first use. This matches
+            # create_sampling_session() semantics and avoids blocking save-time
+            # on engine cold-start or vLLM's exclusive-engine gate while another
+            # generate is active.
+            inference_manager.register_multi_lora_session(
+                session_id=sampling_session_id,
+                base_model=base_model,
+                lora_rank=lora_rank,
+                adapter_path=save_path,
+                lora_loaded=False,
+            )
+
+            logger.info(
+                f"[save_weights_for_sampler] Multi-LoRA: registered lazy-load session "
+                f"{sampling_session_id} (model={base_model}, path={save_path})"
+            )
             else:
                 # Fallback: Per-session engine mode (legacy)
                 # This path is used when multi-LoRA engine creation fails
