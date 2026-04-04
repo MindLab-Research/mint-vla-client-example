@@ -1408,11 +1408,11 @@ class MegatronRankWorker:
             grad_accum_fusion_available = True
         except Exception:
             grad_accum_fusion_available = False
-        override_tf_config["gradient_accumulation_fusion"] = grad_accum_fusion_available
-        if not grad_accum_fusion_available:
+        override_tf_config["gradient_accumulation_fusion"] = False
+        if not override_tf_config["gradient_accumulation_fusion"]:
             logger.info(
-                f"[Rank {self.rank}] fused_weight_gradient_mlp_cuda not found; "
-                "gradient_accumulation_fusion=False"
+                f"[Rank {self.rank}] gradient_accumulation_fusion=False "
+                f"(available={grad_accum_fusion_available}, lora_rank={self.lora_rank})"
             )
         override_tf_config["persist_layer_norm"] = True
         override_tf_config["bias_activation_fusion"] = True
