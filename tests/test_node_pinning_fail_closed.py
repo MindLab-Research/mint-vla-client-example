@@ -114,40 +114,200 @@ def test_assert_node_ip_capacity_reports_missing_node(
         )
 
 
-def test_list_alive_gpu_nodes_stays_fail_closed_when_private_state_unavailable(
+def test_list_alive_gpu_nodes_fails_closed_when_state_and_pg_fallback_fail(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    ray = types.ModuleType("ray")
-    ray.is_initialized = lambda: True  # type: ignore[attr-defined]
-    ray.nodes = lambda: [  # type: ignore[attr-defined]
-        {
-            "Alive": True,
-            "NodeID": "node-1",
-            "NodeManagerAddress": "10.0.0.7",
-            "NodeManagerHostname": "worker-7",
-            "Resources": {"GPU": 8.0},
-        }
-    ]
-    ray.util = SimpleNamespace(placement_group_table=lambda: {})
-    monkeypatch.setitem(sys.modules, "ray", ray)
+    vp = _import_volc_placement(monkeypatch)
 
-    ray_private = types.ModuleType("ray._private")
-    ray_private.state = SimpleNamespace(
-        available_resources_per_node=lambda: (_ for _ in ()).throw(RuntimeError("client mode"))
+    monkeypatch.setattr(
+        vp.ray,
+        "nodes",
+        lambda: [
+            {
+                "Alive": True,
+                "NodeID": "node-1",
+                "NodeManagerAddress": "10.0.0.7",
+                "NodeManagerHostname": "worker-7",
+                "Resources": {"GPU": 8},
+            }
+        ],
     )
-    monkeypatch.setitem(sys.modules, "ray._private", ray_private)
-
-    sys.modules.pop("tinker_server.backend.volc_placement", None)
-    vp = importlib.import_module("tinker_server.backend.volc_placement")
+    monkeypatch.setitem(
+        sys.modules,
+        "ray._private",
+        types.ModuleType("ray._private"),
+    )
+    sys.modules["ray._private"].state = SimpleNamespace(  # type: ignore[attr-defined]
+        available_resources_per_node=lambda: (_ for _ in ()).throw(RuntimeError("state down"))
+    )
+    monkeypatch.setattr(
+        vp.ray.util,
+        "placement_group_table",
+        lambda: (_ for _ in ()).throw(RuntimeError("pg down")),
+    )
+    monkeypatch.setattr(
+        vp.ray.util,
+        "list_named_actors",
+        lambda all_namespaces=True: [{"name": "foreign-actor", "namespace": "other"}],
+        raising=False,
+    )
 
     nodes = vp._list_alive_gpu_nodes()
+
     assert len(nodes) == 1
     assert nodes[0].node_ip == "10.0.0.7"
-    assert nodes[0].total_gpus == 8
     assert nodes[0].available_gpus == 0
 
-    with pytest.raises(RuntimeError, match="pinned node capacity check failed"):
+
+def test_list_alive_gpu_nodes_accounts_pending_list_bundles_via_pinned_ip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vp = _import_volc_placement(monkeypatch)
+
+    monkeypatch.setattr(
+        vp.ray,
+        "nodes",
+        lambda: [
+            {
+                "Alive": True,
+                "NodeID": "node-1",
+                "NodeManagerAddress": "10.0.0.7",
+                "NodeManagerHostname": "worker-7",
+                "Resources": {"GPU": 8},
+            }
+        ],
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "ray._private",
+        types.ModuleType("ray._private"),
+    )
+    sys.modules["ray._private"].state = SimpleNamespace(  # type: ignore[attr-defined]
+        available_resources_per_node=lambda: (_ for _ in ()).throw(RuntimeError("state down"))
+    )
+    monkeypatch.setattr(
+        vp.ray.util,
+        "placement_group_table",
+        lambda: {
+            "pg-1": {
+                "state": "PENDING",
+                "bundles": [{"GPU": 4, "node:10.0.0.7": 0.001}],
+                "bundles_to_node_id": {},
+            }
+        },
+    )
+
+    nodes = vp._list_alive_gpu_nodes()
+
+    assert len(nodes) == 1
+    assert nodes[0].node_ip == "10.0.0.7"
+    assert nodes[0].available_gpus == 4
+
+
+def test_select_free_nodes_from_allowed_ips_uses_fail_closed_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vp = _import_volc_placement(monkeypatch)
+
+    monkeypatch.setattr(
+        vp.ray,
+        "nodes",
+        lambda: [
+            {
+                "Alive": True,
+                "NodeID": "node-1",
+                "NodeManagerAddress": "10.0.0.7",
+                "NodeManagerHostname": "worker-7",
+                "Resources": {"GPU": 8},
+            }
+        ],
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "ray._private",
+        types.ModuleType("ray._private"),
+    )
+    sys.modules["ray._private"].state = SimpleNamespace(  # type: ignore[attr-defined]
+        available_resources_per_node=lambda: (_ for _ in ()).throw(RuntimeError("state down"))
+    )
+    monkeypatch.setattr(vp.ray.util, "placement_group_table", lambda: {})
+    monkeypatch.setattr(
+        vp.ray.util,
+        "list_named_actors",
+        lambda all_namespaces=True: [{"name": "foreign-actor", "namespace": "other"}],
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError, match="insufficient free nodes within allowlist"):
+        vp.select_free_nodes_from_allowed_ips(allowed_node_ips=["10.0.0.7"], required_gpus=1)
+
+
+def test_list_alive_gpu_nodes_treats_missing_state_entry_as_zero_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vp = _import_volc_placement(monkeypatch)
+
+    monkeypatch.setattr(
+        vp.ray,
+        "nodes",
+        lambda: [
+            {
+                "Alive": True,
+                "NodeID": "node-1",
+                "NodeManagerAddress": "10.0.0.7",
+                "NodeManagerHostname": "worker-7",
+                "Resources": {"GPU": 8},
+            }
+        ],
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "ray._private",
+        types.ModuleType("ray._private"),
+    )
+    sys.modules["ray._private"].state = SimpleNamespace(available_resources_per_node=lambda: {})  # type: ignore[attr-defined]
+
+    nodes = vp._list_alive_gpu_nodes()
+
+    assert len(nodes) == 1
+    assert nodes[0].available_gpus == 0
+
+
+def test_assert_node_ip_capacity_handles_list_shaped_pg_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vp = _import_volc_placement(monkeypatch)
+
+    monkeypatch.setattr(
+        vp,
+        "_list_alive_gpu_nodes",
+        lambda: [
+            vp.VolcGpuNode(
+                node_id="node-1",
+                node_ip="10.0.0.7",
+                hostname="worker-7",
+                total_gpus=8,
+                available_gpus=0,
+                volc_job_id=None,
+                volc_resource_queue_id=None,
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        vp.ray.util,
+        "placement_group_table",
+        lambda: [
+            {
+                "name": "megatron_qwen_pg",
+                "state": "CREATED",
+                "bundles": [{"GPU": 8, "node:10.0.0.7": 0.001}],
+                "bundles_to_node_id": {0: "node-1"},
+            }
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="megatron_qwen_pg:CREATED"):
         vp.assert_node_ip_capacity(
-            required_gpus_by_node_ip={"10.0.0.7": 1},
-            context="client mode pin preflight",
+            required_gpus_by_node_ip={"10.0.0.7": 8},
+            context="single-node vllm pin",
         )
