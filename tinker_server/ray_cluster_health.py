@@ -9,6 +9,7 @@ from typing import Any
 _CACHE_LOCK = threading.Lock()
 _CACHE_AT_MONO = 0.0
 _CACHE_VALUE: dict[str, Any] | None = None
+_LAST_SUCCESS_AT_UNIX = 0.0
 
 
 def _utc_now_iso() -> str:
@@ -252,16 +253,19 @@ def _collect_ray_cluster_health() -> dict[str, Any]:
 
 
 def get_ray_cluster_health_snapshot(*, force_refresh: bool = False) -> dict[str, Any]:
-    global _CACHE_AT_MONO, _CACHE_VALUE
+    global _CACHE_AT_MONO, _CACHE_VALUE, _LAST_SUCCESS_AT_UNIX
 
     cache_ttl_s = _float_env("MINT_RAY_CLUSTER_HEALTH_CACHE_TTL_S", 15.0)
     now = time.monotonic()
+    wall_now = time.time()
     with _CACHE_LOCK:
         if not force_refresh and _CACHE_VALUE is not None and (now - _CACHE_AT_MONO) < cache_ttl_s:
             cached = dict(_CACHE_VALUE)
             cached["cached"] = True
             cached["cache_age_s"] = max(0.0, now - _CACHE_AT_MONO)
             cached["cache_ttl_s"] = cache_ttl_s
+            cached["last_success_unixtime"] = float(_LAST_SUCCESS_AT_UNIX) if _LAST_SUCCESS_AT_UNIX > 0 else None
+            cached["last_success_age_s"] = max(0.0, wall_now - float(_LAST_SUCCESS_AT_UNIX)) if _LAST_SUCCESS_AT_UNIX > 0 else None
             return cached
 
     try:
@@ -289,10 +293,15 @@ def get_ray_cluster_health_snapshot(*, force_refresh: bool = False) -> dict[str,
     with _CACHE_LOCK:
         _CACHE_VALUE = dict(snapshot)
         _CACHE_AT_MONO = time.monotonic()
+        if bool(snapshot.get("up")):
+            _LAST_SUCCESS_AT_UNIX = float(time.time())
         current_age_s = 0.0
+        last_success_unixtime = float(_LAST_SUCCESS_AT_UNIX) if _LAST_SUCCESS_AT_UNIX > 0 else None
 
     out = dict(snapshot)
     out["cached"] = False
     out["cache_age_s"] = current_age_s
     out["cache_ttl_s"] = cache_ttl_s
+    out["last_success_unixtime"] = last_success_unixtime
+    out["last_success_age_s"] = max(0.0, time.time() - last_success_unixtime) if last_success_unixtime is not None else None
     return out

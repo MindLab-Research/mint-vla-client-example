@@ -324,6 +324,7 @@ async def _prewarm_persistent_models(
                         learning_rate=learning_rate,
                         distributed_config=distributed_config,
                         session_id=None,
+                        observability_base_model=model_name,
                     )
                     actor_name = _make_megatron_actor_name(base_model or model_name)
                     # Protect as soon as the actor is registered, so readiness timeouts don't leave it evictable.

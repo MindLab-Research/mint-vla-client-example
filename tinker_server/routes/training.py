@@ -109,6 +109,14 @@ def _mark_training_inflight(model_id: str, delta: int) -> None:
         mark(model_id, delta)
 
 
+def _refresh_training_observability(model_id: str) -> None:
+    if training_manager is None:
+        return
+    refresh = getattr(training_manager, "refresh_observability_session", None)
+    if callable(refresh):
+        refresh(model_id)
+
+
 async def _fail_future(request_id: str, error: str) -> None:
     async_fail = getattr(future_store, "async_fail", None)
     if callable(async_fail):
@@ -332,6 +340,7 @@ def _restore_training_session_info_compat(info: dict):
     session.backend = str(info.get("backend", getattr(session, "backend", "peft")) or "peft")
     session.current_step = int(info.get("current_step", getattr(session, "current_step", 0)) or 0)
     session.metadata_version = max(1, int(info.get("metadata_version", getattr(session, "metadata_version", 1)) or 1))
+    _refresh_training_observability(model_id)
     return session
 
 
@@ -392,6 +401,7 @@ async def _restore_training_session(model_id: str):
         except Exception:
             pass
         session.is_active = True
+        _refresh_training_observability(model_id)
 
         actor_name = info.get("actor_name")
         if actor_name:
@@ -426,6 +436,7 @@ async def _restore_training_session(model_id: str):
                     session.current_step = original_session_state["current_step"]
                     session.is_active = original_session_state["is_active"]
                     session.metadata_version = original_session_state["metadata_version"]
+                    _refresh_training_observability(model_id)
                 return None
             getattr(training_engine, "_workers", {})[model_id] = worker
             getattr(training_engine, "_resource_pool_actor_names", {})[model_id] = actor_name
@@ -597,47 +608,63 @@ async def _best_effort_delete_training_session(
             session = restore_result
         restored = session is not None
 
-    shutdown_attempted = False
+    deleted = False
     if session is not None:
-        if allow_actor_shutdown:
-            try:
-                shutdown_attempted = True
-                await training_engine.shutdown_session(session)
-            except Exception as e:
+        try:
+            if allow_actor_shutdown:
+                await training_engine.delete_session(session)
+            else:
                 logger.warning(
-                    "[%s] best-effort stale training cleanup shutdown failed (%s): %s: %s",
+                    "[%s] skipping actor shutdown during stale training cleanup (%s); "
+                    "restored=%s allow_actor_shutdown=%s",
                     model_id,
                     reason,
-                    type(e).__name__,
-                    e,
+                    restored,
+                    allow_actor_shutdown,
                 )
-        else:
-            logger.warning(
-                "[%s] skipping actor shutdown during stale training cleanup (%s); "
-                "restored=%s allow_actor_shutdown=%s",
-                model_id,
-                reason,
-                restored,
-                allow_actor_shutdown,
-            )
-            worker = getattr(training_engine, "_workers", {}).get(model_id)
-            delete_session = getattr(worker, "delete_session", None) if worker is not None else None
-            if delete_session is not None:
-                try:
+                actor_name = getattr(training_engine, "_resource_pool_actor_names", {}).get(model_id)
+                worker = getattr(training_engine, "_workers", {}).get(model_id)
+                delete_session = getattr(worker, "delete_session", None) if worker is not None else None
+                if delete_session is not None:
                     import ray
 
-                    await asyncio.to_thread(ray.get, delete_session.remote(model_id), timeout=30)
-                except Exception as e:
-                    logger.warning(
-                        "[%s] best-effort stale training cleanup remote delete failed (%s): %s: %s",
-                        model_id,
-                        reason,
-                        type(e).__name__,
-                        e,
-                    )
-            getattr(training_engine, "_resource_pool_actor_names", {}).pop(model_id, None)
-            getattr(training_engine, "_workers", {}).pop(model_id, None)
-            session.is_active = False
+                    try:
+                        await asyncio.to_thread(ray.get, delete_session.remote(model_id), timeout=30)
+                    except Exception as e:
+                        logger.warning(
+                            "[%s] best-effort stale training cleanup remote delete failed (%s): %s: %s",
+                            model_id,
+                            reason,
+                            type(e).__name__,
+                            e,
+                        )
+                getattr(training_engine, "_resource_pool_actor_names", {}).pop(model_id, None)
+                getattr(training_engine, "_workers", {}).pop(model_id, None)
+                getattr(training_engine, "_poisoned_sessions", {}).pop(model_id, None)
+                actor_loaded_sessions = getattr(training_engine, "_actor_loaded_sessions", None)
+                if isinstance(actor_loaded_sessions, dict) and actor_name:
+                    if actor_loaded_sessions.get(actor_name) == model_id:
+                        actor_loaded_sessions.pop(actor_name, None)
+                actor_volatile_sessions = getattr(training_engine, "_actor_volatile_sessions", None)
+                if isinstance(actor_volatile_sessions, dict) and actor_name:
+                    volatile = actor_volatile_sessions.get(actor_name)
+                    if isinstance(volatile, set):
+                        volatile.discard(model_id)
+                        if not volatile:
+                            actor_volatile_sessions.pop(actor_name, None)
+                session.is_active = False
+                _refresh_training_observability(model_id)
+            deleted = True
+        except Exception as e:
+            logger.warning(
+                "[%s] best-effort stale training cleanup delete failed (%s): %s: %s",
+                model_id,
+                reason,
+                type(e).__name__,
+                e,
+            )
+    if not deleted:
+        return False
 
     try:
         training_manager.delete_session(model_id)
@@ -664,7 +691,7 @@ async def _best_effort_delete_training_session(
     except Exception:
         pass
 
-    return session is not None or shutdown_attempted
+    return deleted
 
 
 async def cleanup_stale_training_sessions_once(*, stale_after_s: float | None = None) -> list[str]:
@@ -1157,7 +1184,7 @@ async def _do_create_model(
             if bool(getattr(existing, "is_active", False)):
                 raise RuntimeError(f"Model '{model_id}' already exists")
             logger.warning(f"[{model_id}] Cleaning up stale inactive session from previous attempt")
-            await training_engine.shutdown_session(existing)
+            await training_engine.delete_session(existing)
             training_manager.delete_session(model_id)
 
         # Create session metadata first
@@ -1195,6 +1222,7 @@ async def _do_create_model(
                 "lora_rank": int(request.lora_config.rank) if request.lora_config is not None else None,
             },
         )
+        _refresh_training_observability(model_id)
 
         try:
             from ..backend.training_session_store import upsert_training_session
@@ -1531,7 +1559,7 @@ async def _do_create_model_from_state(
             if bool(getattr(existing, "is_active", False)):
                 raise RuntimeError(f"Model '{model_id}' already exists")
             logger.warning(f"[{model_id}] Cleaning up stale inactive session from previous attempt")
-            await training_engine.shutdown_session(existing)
+            await training_engine.delete_session(existing)
             training_manager.delete_session(model_id)
 
         # Create session metadata
@@ -1576,6 +1604,7 @@ async def _do_create_model_from_state(
                 "lora_rank": int(request.lora_config.rank) if request.lora_config is not None else None,
             },
         )
+        _refresh_training_observability(model_id)
 
         try:
             from ..backend.training_session_store import upsert_training_session
@@ -1644,7 +1673,7 @@ async def _do_create_model_from_state(
             try:
                 session = training_manager.get_session(model_id)
                 if session:
-                    await training_engine.shutdown_session(session)
+                    await training_engine.delete_session(session)
             except Exception:
                 pass  # Ignore cleanup errors
             training_manager.delete_session(model_id)
@@ -3378,7 +3407,7 @@ async def _do_delete_model(request_id: str, model_id: str) -> None:
 
         session = training_manager.get_session(model_id)
         if session is not None:
-            await training_engine.shutdown_session(session)
+            await training_engine.delete_session(session)
             training_manager.delete_session(model_id)
 
         try:

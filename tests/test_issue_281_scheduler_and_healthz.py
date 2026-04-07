@@ -30,6 +30,18 @@ def _install_ray_stub(monkeypatch, *, available: dict | None = None, total: dict
     monkeypatch.setitem(sys.modules, "ray", ray)
 
 
+def _manager_stub(session, *, delete_session=None):
+    return SimpleNamespace(
+        get_session=lambda _model_id: session,
+        mark_inflight=lambda *_args, **_kwargs: None,
+        delete_session=delete_session or (lambda _model_id: None),
+    )
+
+
+async def _async_none(*_args, **_kwargs):
+    return None
+
+
 class _AsyncFutureStore:
     async def async_create_with_id(self, _request_id: str) -> None:
         return None
@@ -335,6 +347,209 @@ async def test_issue_281_compute_logprobs_enqueues_scheduler_metadata(monkeypatc
 
 
 @pytest.mark.anyio
+async def test_issue_281_do_create_model_active_duplicate_fails_without_deleting_existing(monkeypatch) -> None:
+    from tinker_server.models.types import CreateModelRequest, LoRAConfig
+    from tinker_server.routes import training as tr
+
+    deleted: list[str] = []
+    failed: dict = {}
+
+    existing = SimpleNamespace(is_active=True)
+
+    async def _async_fail(request_id, error):
+        failed.update({"request_id": request_id, "error": error})
+
+    monkeypatch.setattr(
+        tr,
+        "training_manager",
+        SimpleNamespace(
+            get_session=lambda _model_id: existing,
+            delete_session=lambda model_id: deleted.append(model_id),
+        ),
+    )
+    monkeypatch.setattr(tr, "training_engine", SimpleNamespace(shutdown_session=lambda _session: None))
+    monkeypatch.setattr(
+        tr,
+        "future_store",
+        SimpleNamespace(
+            async_fail=_async_fail,
+        ),
+    )
+
+    await tr._do_create_model(
+        "rid-dup",
+        CreateModelRequest(
+            session_id="sdup",
+            model_seq_id=0,
+            base_model="Qwen/Qwen3-4B-Instruct-2507",
+            lora_config=LoRAConfig(rank=8),
+        ),
+        user_id="owner-a",
+        webhook_url=None,
+    )
+
+    assert deleted == []
+    assert failed["request_id"] == "rid-dup"
+    assert "already exists" in failed["error"]
+
+
+@pytest.mark.anyio
+async def test_issue_281_do_create_model_from_state_active_duplicate_fails_without_deleting_existing(monkeypatch) -> None:
+    from tinker_server.models.types import CreateModelFromStateRequest, LoRAConfig
+    from tinker_server.routes import training as tr
+
+    deleted: list[str] = []
+    failed: dict = {}
+
+    existing = SimpleNamespace(is_active=True)
+
+    async def _async_fail(request_id, error):
+        failed.update({"request_id": request_id, "error": error})
+
+    monkeypatch.setattr(
+        tr,
+        "training_manager",
+        SimpleNamespace(
+            get_session=lambda _model_id: existing,
+            delete_session=lambda model_id: deleted.append(model_id),
+        ),
+    )
+    monkeypatch.setattr(tr, "training_engine", SimpleNamespace(shutdown_session=lambda _session: None))
+    monkeypatch.setattr(
+        tr,
+        "future_store",
+        SimpleNamespace(
+            async_fail=_async_fail,
+        ),
+    )
+
+    await tr._do_create_model_from_state(
+        "rid-dup2",
+        CreateModelFromStateRequest(
+            session_id="sdup2",
+            model_seq_id=0,
+            base_model="Qwen/Qwen3-4B-Instruct-2507",
+            state_path="/tmp/fake-checkpoint",
+            lora_config=LoRAConfig(rank=8),
+            load_optimizer=False,
+        ),
+        user_id="owner-a",
+    )
+
+    assert deleted == []
+    assert failed["request_id"] == "rid-dup2"
+    assert "already exists" in failed["error"]
+
+
+@pytest.mark.anyio
+async def test_issue_281_do_reset_expert_bias_resolves_future(monkeypatch) -> None:
+    from tinker_server.models.types import ResetExpertBiasRequest
+    from tinker_server.routes import training as tr
+
+    resolved: dict = {}
+
+    async def _fake_reset(_session):
+        return {"modules_reset": 2}
+
+    async def _async_fail(request_id, error):
+        resolved.update({"failed_request_id": request_id, "error": error})
+
+    async def _async_resolve(request_id, payload):
+        resolved.update({"request_id": request_id, "payload": payload})
+
+    monkeypatch.setattr(
+        tr,
+        "training_engine",
+        SimpleNamespace(reset_expert_bias=_fake_reset),
+    )
+    monkeypatch.setattr(
+        tr,
+        "training_manager",
+        _manager_stub(SimpleNamespace(model_id="run-281")),
+    )
+    monkeypatch.setattr(tr, "_restore_training_session", _async_none)
+    monkeypatch.setattr(
+        tr,
+        "future_store",
+        SimpleNamespace(
+            async_resolve=_async_resolve,
+            async_fail=_async_fail,
+        ),
+    )
+
+    await tr._do_reset_expert_bias("rid-281", ResetExpertBiasRequest(model_id="run-281"))
+
+    assert resolved["request_id"] == "rid-281"
+    assert resolved["payload"] == {
+        "model_id": "run-281",
+        "modules_reset": 2,
+        "status": "success",
+    }
+    assert "error" not in resolved
+
+
+@pytest.mark.anyio
+async def test_issue_281_do_delete_model_deletes_then_resolves(monkeypatch) -> None:
+    _install_ray_stub(monkeypatch)
+    import tinker_server.backend.resource_pool as resource_pool
+    import tinker_server.backend.training_session_store as training_session_store
+    from tinker_server.routes import training as tr
+
+    calls: dict[str, list] = {
+        "engine_delete": [],
+        "delete_session": [],
+        "delete_store": [],
+        "clear_session": [],
+    }
+    resolved: dict = {}
+    session = SimpleNamespace(model_id="run-281")
+
+    async def _fake_delete(target_session):
+        calls["engine_delete"].append(target_session)
+
+    async def _async_resolve(request_id, payload):
+        resolved.update({"request_id": request_id, "payload": payload})
+
+    async def _async_fail(request_id, error):
+        resolved.update({"failed_request_id": request_id, "error": error})
+
+    monkeypatch.setattr(
+        tr,
+        "training_engine",
+        SimpleNamespace(delete_session=_fake_delete),
+    )
+    monkeypatch.setattr(
+        tr,
+        "training_manager",
+        _manager_stub(session, delete_session=lambda model_id: calls["delete_session"].append(model_id)),
+    )
+    monkeypatch.setattr(training_session_store, "delete_training_session", lambda model_id: calls["delete_store"].append(model_id))
+    monkeypatch.setattr(
+        resource_pool,
+        "get_resource_pool",
+        lambda: SimpleNamespace(clear_session=lambda model_id: calls["clear_session"].append(model_id)),
+    )
+    monkeypatch.setattr(
+        tr,
+        "future_store",
+        SimpleNamespace(
+            async_resolve=_async_resolve,
+            async_fail=_async_fail,
+        ),
+    )
+
+    await tr._do_delete_model("rid-282", "run-281")
+
+    assert calls["engine_delete"] == [session]
+    assert calls["delete_session"] == ["run-281"]
+    assert calls["delete_store"] == ["run-281"]
+    assert calls["clear_session"] == ["run-281"]
+    assert resolved["request_id"] == "rid-282"
+    assert resolved["payload"] == {"model_id": "run-281", "status": "deleted"}
+    assert "error" not in resolved
+
+
+@pytest.mark.anyio
 async def test_issue_281_asample_falls_back_to_base_model_scheduler_domain(monkeypatch) -> None:
     import tinker_server.backend.api_work_queue as awq
     import tinker_server.backend.capacity_manager as cm
@@ -375,6 +590,71 @@ async def test_issue_281_asample_falls_back_to_base_model_scheduler_domain(monke
     await sr.asample(req, _DummyRequest(user_id="owner-a"))
 
     assert captured["extra"] == {"queue_priority": 0}
+
+
+@pytest.mark.anyio
+async def test_issue_281_internal_serialized_op_marks_inflight_until_worker_finishes(monkeypatch) -> None:
+    import tinker_server.backend.api_work_queue as awq
+    import tinker_server.backend.capacity_manager as cm
+    from tinker_server.backend.training_session_manager import TrainingSessionManager
+    from tinker_server.models.types import ResetExpertBiasRequest
+    from tinker_server.routes import training as tr
+
+    manager = TrainingSessionManager()
+    manager.create_session("run-281", "sess-281", 0, "Qwen/Qwen3-30B-A3B-Instruct-2507")
+    resolved: dict = {}
+
+    async def _fake_enqueue(**_kwargs):
+        return None
+
+    async def _fake_reset(_session):
+        return {"modules_reset": 1}
+
+    async def _async_fail(request_id, error):
+        resolved.update({"failed_request_id": request_id, "error": error})
+
+    async def _async_try_reserve(*args, **kwargs):
+        _ = (args, kwargs)
+        return {"ok": True}
+
+    async def _async_resolve(request_id, payload):
+        resolved.update({"request_id": request_id, "payload": payload})
+
+    monkeypatch.setattr(tr, "training_manager", manager)
+    monkeypatch.setattr(tr, "training_engine", SimpleNamespace(reset_expert_bias=_fake_reset))
+    monkeypatch.setattr(
+        tr,
+        "future_store",
+        SimpleNamespace(
+            async_create_with_id=_async_none,
+            async_mark_queued=_async_none,
+            async_resolve=_async_resolve,
+            async_fail=_async_fail,
+        ),
+    )
+    monkeypatch.setattr(awq, "api_work_queue", SimpleNamespace(enqueue=_fake_enqueue))
+    monkeypatch.setattr(
+        cm,
+        "capacity_manager",
+        SimpleNamespace(
+            async_try_reserve=_async_try_reserve,
+            async_release_all=_async_none,
+        ),
+    )
+
+    request_id = await tr._enqueue_internal_serialized_model_op(
+        model_id="run-281",
+        op="training.reset_expert_bias",
+        request_json=b"{}",
+        extra={},
+    )
+    assert manager.get_session("run-281").inflight_ops == 1
+
+    await tr._do_reset_expert_bias(request_id, ResetExpertBiasRequest(model_id="run-281"))
+
+    assert manager.get_session("run-281").inflight_ops == 0
+    assert resolved["request_id"] == request_id
+    assert resolved["payload"]["modules_reset"] == 1
 
 
 @pytest.mark.anyio

@@ -42,6 +42,7 @@ from tinker_server.runtime_env import (
 )
 
 from . import ray_kill
+from .vllm_scheduler_observability import VllmStatsObserver, attach_vllm_stats_logger
 
 if TYPE_CHECKING:
     import torch
@@ -662,6 +663,8 @@ def _create_extended_server_class(
                     f"[ExtendedVLLMHttpServer] rollout config normalized type={type(rollout_cfg).__name__} _target_={getattr(rollout_cfg, '_target_', None)!r}",
                     flush=True,
                 )
+                if hasattr(rollout_cfg, "disable_log_stats"):
+                    rollout_cfg.disable_log_stats = False
                 call_kwargs["config"] = rollout_cfg
 
             if sig is not None:
@@ -687,6 +690,8 @@ def _create_extended_server_class(
                             dropped,
                         )
             super(ExtendedVLLMHttpServer, self).__init__(*args, **call_kwargs)
+            self._vllm_stats_observer = VllmStatsObserver()
+            attach_vllm_stats_logger(self.engine, self._vllm_stats_observer)
             # Track local paths for multi-LoRA (needed for GPU/CPU swap)
             self._lora_paths: dict[int, str] = {}
             self._timing = os.environ.get("MINT_VLLM_REQUEST_TIMING", "").strip().lower() in (
@@ -701,7 +706,6 @@ def _create_extended_server_class(
             )
             self._mint_pack_moe_patched = False
             self._progress_last: dict[str, float] = {}
-
         def _progress_meta(self, tokens_generated: int, max_tokens: int) -> dict[str, Any]:
             return {
                 "tokens_generated": int(tokens_generated),
@@ -754,6 +758,30 @@ def _create_extended_server_class(
             rss_pages = int(parts[1])
             page_size = int(os.sysconf("SC_PAGE_SIZE"))
             return rss_pages * page_size
+
+        async def get_observability_binding(self) -> dict[str, object]:
+            import socket
+
+            gpu_indices: list[int] = []
+            try:
+                for gpu_id in ray.get_gpu_ids():
+                    if isinstance(gpu_id, (int, float)):
+                        gpu_indices.append(int(gpu_id))
+                    else:
+                        gpu_indices.append(int(float(str(gpu_id))))
+            except Exception:
+                gpu_indices = []
+            node_id = None
+            try:
+                node_id = str(ray.get_runtime_context().get_node_id())
+            except Exception:
+                node_id = None
+            return {
+                "hostname": socket.gethostname(),
+                "node_id": node_id,
+                "gpu_indices": gpu_indices,
+                **self._vllm_stats_observer.snapshot(),
+            }
 
         async def is_engine_ready(self) -> bool:
             """Check if vLLM engine is properly initialized.
@@ -1355,7 +1383,7 @@ def _create_extended_server_class(
                         "stop_reason": out_stop_reason,
                         "_timing_total_s": float(total_s),
                         "_timing_first_tok_s": float(first_tok_s) if first_tok_s is not None else None,
-                    }
+                            }
                 )
             self._progress_last.pop(request_id, None)
             return outs
@@ -1620,7 +1648,7 @@ def _create_extended_server_class(
                         "stop_reason": out_stop_reason,
                         "_timing_total_s": float(total_s),
                         "_timing_first_tok_s": float(first_tok_s) if first_tok_s is not None else None,
-                    }
+                            }
                 )
             self._progress_last.pop(request_id, None)
             return outs

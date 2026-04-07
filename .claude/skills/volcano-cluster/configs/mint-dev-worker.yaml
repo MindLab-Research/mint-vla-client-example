@@ -140,3 +140,11 @@ Storages:
       MountPath: "/vePFS-Mindverse/share"
       SubPath: "share"
       ReadOnly: false
+    - Type: "TosFuse"
+      MountPath: "/tos-mindverse"
+      Bucket: "tos-mindverse-dev"
+      Prefix: "/"
+    - Type: "TosFuse"
+      MountPath: "/tos-mindverse-prod"
+      Bucket: "tos-mindverse"
+      Prefix: "/"
