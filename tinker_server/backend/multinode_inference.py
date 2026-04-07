@@ -575,20 +575,16 @@ def _create_multinode_vllm_actor(
             # Multinode multi-sample can run either through vLLM's native `n>1` path or
             # by expanding into repeated `n=1` requests.
             #
-            # Default to `concurrent_n1` so ordinary same-engine workload can continue to
-            # enter generation while a multi-sample request is in flight. Keep `vllm_n`
-            # available as an explicit opt-in for experiments against native
-            # `SamplingParams(n>1)`.
+            # Keep the default on vLLM's native `SamplingParams(n>1)` path. The issue428
+            # experiment should compare that native behavior before/after reducing the
+            # multisample-specific full-request mutex, rather than changing the default
+            # serving semantics at the tinker-server layer.
             #
             # Modes:
-            # - "vllm_n": use `SamplingParams(n=N)`
+            # - "vllm_n": use `SamplingParams(n=N)` (default)
             # - "sequential_n1": run N sequential `SamplingParams(n=1)` requests
-            # - "concurrent_n1": run N concurrent `SamplingParams(n=1)` requests (default)
-            self._multisample_mode = os.environ.get("MINT_VLLM_MULTISAMPLE_MODE", "concurrent_n1").strip().lower()
-            # Keep vllm_n opt-in safe by default. The default mode is concurrent_n1,
-            # but if an environment explicitly switches back to vllm_n and does not set
-            # MINT_VLLM_SERIALIZE_MULTISAMPLE, we should still preserve the historical
-            # protection for the native SamplingParams(n>1) path.
+            # - "concurrent_n1": run N concurrent `SamplingParams(n=1)` requests
+            self._multisample_mode = os.environ.get("MINT_VLLM_MULTISAMPLE_MODE", "vllm_n").strip().lower()
             default_serialize_multisample = self._multisample_mode == "vllm_n"
             self._serialize_multisample = _env_flag(
                 "MINT_VLLM_SERIALIZE_MULTISAMPLE",
@@ -1372,12 +1368,6 @@ def _create_multinode_vllm_actor(
                     try:
                         async with self._lock_read():
                             t1 = time.perf_counter()
-                            hold_multisample_lock_for_full_request = (
-                                n_req > 1
-                                and self._multisample_lock is not None
-                                and self._multisample_mode == "vllm_n"
-                            )
-
                             async def _enqueue_request(*, multisample_lock_already_held: bool) -> Any:
                                 # vLLM's AsyncLLMEngine.generate() is an async generator whose
                                 # first `__anext__()` both enqueues the request (add_request)
@@ -1386,10 +1376,8 @@ def _create_multinode_vllm_actor(
                                 # batching for long prompts.
                                 #
                                 # Keep serialization scoped to the enqueue window that is known to
-                                # be unsafe. For native `vllm_n`, keep the historical full-request
-                                # multisample isolation so two `n>1` requests cannot overlap in
-                                # collect/decode on multinode. For the other modes, only the enqueue
-                                # section needs protection.
+                                # be unsafe. Preserve native `vllm_n`, but do not hold the
+                                # multisample-specific lock across the whole decode path.
                                 try:
                                     async with AsyncExitStack() as stack:
                                         if (
@@ -1426,127 +1414,65 @@ def _create_multinode_vllm_actor(
                             if self._generate_timeout_s > 0:
                                 deadline = time.perf_counter() + self._generate_timeout_s
                             try:
-                                if hold_multisample_lock_for_full_request:
-                                    async with self._maybe_multisample_lock(n_req):
-                                        collector = await _enqueue_request(
-                                            multisample_lock_already_held=True,
-                                        )
-                                        while True:
-                                            try:
-                                                if deadline is None:
-                                                    remaining = None
-                                                else:
-                                                    remaining = deadline - time.perf_counter()
-                                                    if remaining <= 0:
-                                                        raise asyncio.TimeoutError()
+                                collector = await _enqueue_request(
+                                    multisample_lock_already_held=False,
+                                )
+                                while True:
+                                    try:
+                                        if deadline is None:
+                                            remaining = None
+                                        else:
+                                            remaining = deadline - time.perf_counter()
+                                            if remaining <= 0:
+                                                raise asyncio.TimeoutError()
 
-                                                if remaining is None:
-                                                    out = collector.get_nowait() or await collector.get()
-                                                else:
-                                                    out = collector.get_nowait() or await asyncio.wait_for(
-                                                        collector.get(),
-                                                        timeout=remaining,
-                                                    )
-                                            except asyncio.TimeoutError as e:
-                                                try:
-                                                    await self.engine.abort(request_id)
-                                                except Exception:
-                                                    pass
-                                                raise RuntimeError(
-                                                    f"vllm_generate_timeout_s={self._generate_timeout_s} request_id={request_id}"
-                                                ) from e
-                                            if first_tok_s is None:
-                                                first_tok_s = time.perf_counter() - t0
-                                            if by_index is not None:
-                                                for oo in out.outputs:
-                                                    try:
-                                                        idx = int(getattr(oo, "index"))
-                                                    except Exception:
-                                                        idx = -1
-                                                    by_index[idx] = oo
-                                            final_res = out
-                                            try:
-                                                if n_req == 1:
-                                                    tokens_generated = len(out.outputs[0].token_ids)
-                                                else:
-                                                    lengths = [len(oo.token_ids) for oo in out.outputs]
-                                                    tokens_generated = min(lengths) if lengths else 0
-                                                sub_request_id = None if outer_request_id == request_id else request_id
-                                                await self._update_progress(
-                                                    outer_request_id=outer_request_id,
-                                                    sub_request_id=sub_request_id,
-                                                    tokens_generated=tokens_generated,
-                                                    max_tokens=effective_max_tokens,
-                                                )
-                                            except Exception as e:
-                                                logger.warning(
-                                                    "multinode_vllm_progress_compute_failed request_id=%s err=%s: %s",
-                                                    outer_request_id,
-                                                    type(e).__name__,
-                                                    e,
-                                                )
-                                            if out.finished:
-                                                break
-                                else:
-                                    collector = await _enqueue_request(
-                                        multisample_lock_already_held=False,
-                                    )
-                                    while True:
+                                        if remaining is None:
+                                            out = collector.get_nowait() or await collector.get()
+                                        else:
+                                            out = collector.get_nowait() or await asyncio.wait_for(
+                                                collector.get(),
+                                                timeout=remaining,
+                                            )
+                                    except asyncio.TimeoutError as e:
                                         try:
-                                            if deadline is None:
-                                                remaining = None
-                                            else:
-                                                remaining = deadline - time.perf_counter()
-                                                if remaining <= 0:
-                                                    raise asyncio.TimeoutError()
-
-                                            if remaining is None:
-                                                out = collector.get_nowait() or await collector.get()
-                                            else:
-                                                out = collector.get_nowait() or await asyncio.wait_for(
-                                                    collector.get(),
-                                                    timeout=remaining,
-                                                )
-                                        except asyncio.TimeoutError as e:
+                                            await self.engine.abort(request_id)
+                                        except Exception:
+                                            pass
+                                        raise RuntimeError(
+                                            f"vllm_generate_timeout_s={self._generate_timeout_s} request_id={request_id}"
+                                        ) from e
+                                    if first_tok_s is None:
+                                        first_tok_s = time.perf_counter() - t0
+                                    if by_index is not None:
+                                        for oo in out.outputs:
                                             try:
-                                                await self.engine.abort(request_id)
+                                                idx = int(getattr(oo, "index"))
                                             except Exception:
-                                                pass
-                                            raise RuntimeError(
-                                                f"vllm_generate_timeout_s={self._generate_timeout_s} request_id={request_id}"
-                                            ) from e
-                                        if first_tok_s is None:
-                                            first_tok_s = time.perf_counter() - t0
-                                        if by_index is not None:
-                                            for oo in out.outputs:
-                                                try:
-                                                    idx = int(getattr(oo, "index"))
-                                                except Exception:
-                                                    idx = -1
-                                                by_index[idx] = oo
-                                        final_res = out
-                                        try:
-                                            if n_req == 1:
-                                                tokens_generated = len(out.outputs[0].token_ids)
-                                            else:
-                                                lengths = [len(oo.token_ids) for oo in out.outputs]
-                                                tokens_generated = min(lengths) if lengths else 0
-                                            sub_request_id = None if outer_request_id == request_id else request_id
-                                            await self._update_progress(
-                                                outer_request_id=outer_request_id,
-                                                sub_request_id=sub_request_id,
-                                                tokens_generated=tokens_generated,
-                                                max_tokens=effective_max_tokens,
-                                            )
-                                        except Exception as e:
-                                            logger.warning(
-                                                "multinode_vllm_progress_compute_failed request_id=%s err=%s: %s",
-                                                outer_request_id,
-                                                type(e).__name__,
-                                                e,
-                                            )
-                                        if out.finished:
-                                            break
+                                                idx = -1
+                                            by_index[idx] = oo
+                                    final_res = out
+                                    try:
+                                        if n_req == 1:
+                                            tokens_generated = len(out.outputs[0].token_ids)
+                                        else:
+                                            lengths = [len(oo.token_ids) for oo in out.outputs]
+                                            tokens_generated = min(lengths) if lengths else 0
+                                        sub_request_id = None if outer_request_id == request_id else request_id
+                                        await self._update_progress(
+                                            outer_request_id=outer_request_id,
+                                            sub_request_id=sub_request_id,
+                                            tokens_generated=tokens_generated,
+                                            max_tokens=effective_max_tokens,
+                                        )
+                                    except Exception as e:
+                                        logger.warning(
+                                            "multinode_vllm_progress_compute_failed request_id=%s err=%s: %s",
+                                            outer_request_id,
+                                            type(e).__name__,
+                                            e,
+                                        )
+                                    if out.finished:
+                                        break
                             except Exception:
                                 _raise_serializable_vllm_engine_error(
                                     request_id=request_id,
