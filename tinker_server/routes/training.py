@@ -2833,6 +2833,7 @@ async def _do_save_weights_for_sampler(
                 user_id=None if is_admin else user_id,
                 model_id=session.model_id,
                 checkpoint_name=checkpoint_name,
+                checkpoint_type="sampler",
             )
         else:
             # Ephemeral save - generate unique temp name
@@ -2841,6 +2842,7 @@ async def _do_save_weights_for_sampler(
                 user_id=None if is_admin else user_id,
                 model_id=session.model_id,
                 checkpoint_name=checkpoint_name,
+                checkpoint_type="sampler",
             )
 
         use_per_expert_lora = bool(request.use_per_expert_lora)
@@ -2867,7 +2869,8 @@ async def _do_save_weights_for_sampler(
             lambda: training_engine.save_weights_for_sampler(
                 session=session,
                 checkpoint_name=checkpoint_name,
-                checkpoint_base_dir=os.path.dirname(os.path.dirname(save_path)),
+                checkpoint_base_dir=os.path.dirname(os.path.dirname(os.path.dirname(save_path))),
+                checkpoint_type="sampler",
                 use_per_expert_lora=use_per_expert_lora,
             ),
             component="routes.training",
@@ -2921,6 +2924,7 @@ async def _do_save_weights_for_sampler(
                 user_id=None if is_admin else user_id,
                 model_id=session.model_id,
                 checkpoint_name=checkpoint_name,
+                checkpoint_type="sampler",
             )
 
         from ..client_compat import checkpoint_uri

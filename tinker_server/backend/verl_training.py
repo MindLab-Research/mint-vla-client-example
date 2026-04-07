@@ -2721,6 +2721,7 @@ class VerlTrainingEngine:
         session: TrainingSession,
         checkpoint_name: str,
         checkpoint_base_dir: str,
+        checkpoint_type: str | None = None,
         use_per_expert_lora: bool = False,
     ) -> str:
         """Save LoRA weights for inference use.
@@ -2740,6 +2741,8 @@ class VerlTrainingEngine:
         import os
 
         save_path = os.path.join(checkpoint_base_dir, session.model_id, checkpoint_name)
+        if checkpoint_type is not None:
+            save_path = os.path.join(save_path, checkpoint_type)
         if session.backend == "megatron":
             return await self.save_lora_weights_for_sampler(
                 session, save_path, use_per_expert_lora=use_per_expert_lora

@@ -32,6 +32,7 @@ PERSISTENT_CHECKPOINTS_DIR = os.environ.get("TINKER_PERSISTENT_CHECKPOINT_DIR", 
 RUNTIME_CHECKPOINTS_DIR = os.environ.get("TINKER_RUNTIME_CHECKPOINT_DIR", DEFAULT_RUNTIME_CHECKPOINTS_DIR)
 
 CheckpointType = Literal["training", "sampler"]
+_CHECKPOINT_TYPES: tuple[CheckpointType, ...] = ("training", "sampler")
 MIRROR_STATUS_PENDING = "pending"
 MIRROR_STATUS_IN_PROGRESS = "in_progress"
 MIRROR_STATUS_COMPLETE = "complete"
@@ -58,8 +59,15 @@ def checkpoint_owner_dir(user_id: str | None) -> str:
     return user_id or "anonymous"
 
 
+def checkpoint_logical_name(path: str) -> str:
+    base = os.path.basename(os.path.normpath(path))
+    if base in _CHECKPOINT_TYPES:
+        return os.path.basename(os.path.dirname(os.path.normpath(path)))
+    return base
+
+
 def is_ephemeral_checkpoint_name(name: str) -> bool:
-    return os.path.basename(name).startswith("_ephemeral_")
+    return checkpoint_logical_name(name).startswith("_ephemeral_")
 
 
 def get_checkpoints_dir() -> str:
@@ -121,26 +129,73 @@ def get_resolution_roots(*, primary_root: str | None = None, include_ephemeral: 
     return _dedupe_paths(paths)
 
 
-def build_checkpoint_dir(root: str, *, user_id: str | None, model_id: str, checkpoint_name: str) -> str:
+def checkpoint_namespace_dir(checkpoint_type: CheckpointType | None) -> str | None:
+    if checkpoint_type is None:
+        return None
+    if checkpoint_type not in _CHECKPOINT_TYPES:
+        raise ValueError(f"Unsupported checkpoint_type: {checkpoint_type!r}")
+    return checkpoint_type
+
+
+def build_checkpoint_dir(
+    root: str,
+    *,
+    user_id: str | None,
+    model_id: str,
+    checkpoint_name: str,
+    checkpoint_type: CheckpointType | None = None,
+) -> str:
     owner_dir = checkpoint_owner_dir(user_id)
-    return os.path.join(root, owner_dir, model_id, checkpoint_name)
+    path = os.path.join(root, owner_dir, model_id, checkpoint_name)
+    type_dir = checkpoint_namespace_dir(checkpoint_type)
+    return os.path.join(path, type_dir) if type_dir else path
 
 
-def build_ephemeral_checkpoint_dir(*, user_id: str | None, model_id: str, checkpoint_name: str) -> str:
+def build_ephemeral_checkpoint_dir(
+    *,
+    user_id: str | None,
+    model_id: str,
+    checkpoint_name: str,
+    checkpoint_type: CheckpointType | None = None,
+) -> str:
     return build_checkpoint_dir(
-        get_ephemeral_checkpoints_dir(), user_id=user_id, model_id=model_id, checkpoint_name=checkpoint_name
+        get_ephemeral_checkpoints_dir(),
+        user_id=user_id,
+        model_id=model_id,
+        checkpoint_name=checkpoint_name,
+        checkpoint_type=checkpoint_type,
     )
 
 
-def build_persistent_checkpoint_dir(*, user_id: str | None, model_id: str, checkpoint_name: str) -> str:
+def build_persistent_checkpoint_dir(
+    *,
+    user_id: str | None,
+    model_id: str,
+    checkpoint_name: str,
+    checkpoint_type: CheckpointType | None = None,
+) -> str:
     return build_checkpoint_dir(
-        get_persistent_checkpoints_dir(), user_id=user_id, model_id=model_id, checkpoint_name=checkpoint_name
+        get_persistent_checkpoints_dir(),
+        user_id=user_id,
+        model_id=model_id,
+        checkpoint_name=checkpoint_name,
+        checkpoint_type=checkpoint_type,
     )
 
 
-def build_persistent_cache_dir(*, user_id: str | None, model_id: str, checkpoint_name: str) -> str:
+def build_persistent_cache_dir(
+    *,
+    user_id: str | None,
+    model_id: str,
+    checkpoint_name: str,
+    checkpoint_type: CheckpointType | None = None,
+) -> str:
     return build_checkpoint_dir(
-        get_persistent_cache_dir(), user_id=user_id, model_id=model_id, checkpoint_name=checkpoint_name
+        get_persistent_cache_dir(),
+        user_id=user_id,
+        model_id=model_id,
+        checkpoint_name=checkpoint_name,
+        checkpoint_type=checkpoint_type,
     )
 
 
@@ -439,6 +494,7 @@ def _iter_metadata_paths(
                     [
                         os.path.join(root, prefix, "*", "metadata.json"),
                         os.path.join(root, prefix, "*", "*", "metadata.json"),
+                        os.path.join(root, prefix, "*", "*", "*", "metadata.json"),
                     ]
                 )
             else:
@@ -446,6 +502,7 @@ def _iter_metadata_paths(
                     [
                         os.path.join(root, "*", "metadata.json"),
                         os.path.join(root, "*", "*", "metadata.json"),
+                        os.path.join(root, "*", "*", "*", "metadata.json"),
                     ]
                 )
 
@@ -483,11 +540,46 @@ def resolve_checkpoint_id(
     return None
 
 
+def _checkpoint_type_from_uri_path(path_part: str) -> CheckpointType | None:
+    parts = path_part.split("/")
+    if len(parts) >= 3 and parts[1] == "weights":
+        return "training"
+    if len(parts) >= 3 and parts[1] == "sampler_weights":
+        return "sampler"
+    return None
+
+
 def _strip_tinker_checkpoint_kind(path_part: str) -> str:
     parts = path_part.split("/")
     if len(parts) >= 3 and parts[1] in ("weights", "sampler_weights"):
         return "/".join([parts[0], *parts[2:]])
     return path_part
+
+
+def _existing_checkpoint_view(
+    path: str,
+    *,
+    checkpoint_type: CheckpointType | None,
+) -> str | None:
+    candidates: list[str] = []
+    if checkpoint_type is not None:
+        candidates.append(os.path.join(path, checkpoint_type))
+    candidates.append(path)
+    for candidate in candidates:
+        if not os.path.isdir(candidate):
+            continue
+        if os.path.exists(os.path.join(candidate, "metadata.json")):
+            return candidate
+        if checkpoint_has_lora_weights(candidate) or checkpoint_has_optimizer_state(candidate):
+            return candidate
+    if checkpoint_type is None and os.path.isdir(path) and not os.path.exists(os.path.join(path, "metadata.json")):
+        training_dir = os.path.join(path, "training")
+        sampler_dir = os.path.join(path, "sampler")
+        if os.path.isdir(training_dir):
+            return training_dir
+        if os.path.isdir(sampler_dir):
+            return sampler_dir
+    return None
 
 
 def resolve_checkpoint_uri(
@@ -508,27 +600,33 @@ def resolve_checkpoint_uri(
         return resolved or uri
 
     if uri.startswith("tinker://"):
-        path_part = _strip_tinker_checkpoint_kind(uri[len("tinker://") :])
+        raw_path_part = uri[len("tinker://") :]
     elif uri.startswith("mint://"):
-        path_part = _strip_tinker_checkpoint_kind(uri[len("mint://") :])
+        raw_path_part = uri[len("mint://") :]
     else:
         return uri
 
+    checkpoint_type = _checkpoint_type_from_uri_path(raw_path_part)
+    path_part = _strip_tinker_checkpoint_kind(raw_path_part)
+
     if is_admin:
         for root in roots:
-            legacy = os.path.join(root, path_part)
-            if os.path.exists(legacy):
-                return legacy
-            matches = glob.glob(os.path.join(root, "*", path_part))
-            if len(matches) == 1 and os.path.exists(matches[0]):
-                return matches[0]
-        return os.path.join(get_persistent_checkpoints_dir(), path_part)
+            for candidate in [os.path.join(root, path_part), *glob.glob(os.path.join(root, "*", path_part))]:
+                resolved = _existing_checkpoint_view(candidate, checkpoint_type=checkpoint_type)
+                if resolved is not None:
+                    return resolved
+        base = os.path.join(get_persistent_checkpoints_dir(), path_part)
+        fallback_type = checkpoint_namespace_dir(checkpoint_type)
+        return os.path.join(base, fallback_type) if fallback_type else base
 
     for root in roots:
         candidate = os.path.join(root, owner_dir, path_part)
-        if os.path.exists(candidate):
-            return candidate
-    return os.path.join(get_persistent_checkpoints_dir(), owner_dir, path_part)
+        resolved = _existing_checkpoint_view(candidate, checkpoint_type=checkpoint_type)
+        if resolved is not None:
+            return resolved
+    base = os.path.join(get_persistent_checkpoints_dir(), owner_dir, path_part)
+    fallback_type = checkpoint_namespace_dir(checkpoint_type)
+    return os.path.join(base, fallback_type) if fallback_type else base
 
 
 def resolve_checkpoint_path(state_uri: str, *, user_id: str | None = None, is_admin: bool = False) -> str:
@@ -643,8 +741,14 @@ def mirror_checkpoint_to_persistent_store(
     user_id: str | None,
     model_id: str,
     checkpoint_name: str,
+    checkpoint_type: CheckpointType | None = None,
 ) -> str:
-    dst_dir = build_persistent_checkpoint_dir(user_id=user_id, model_id=model_id, checkpoint_name=checkpoint_name)
+    dst_dir = build_persistent_checkpoint_dir(
+        user_id=user_id,
+        model_id=model_id,
+        checkpoint_name=checkpoint_name,
+        checkpoint_type=checkpoint_type,
+    )
     return sync_checkpoint_tree(src_dir, dst_dir)
 
 
@@ -821,18 +925,23 @@ def _iter_runtime_checkpoint_dirs(root: str) -> list[str]:
     if not os.path.isdir(root):
         return []
     out: list[str] = []
-    for owner in os.listdir(root):
-        owner_path = os.path.join(root, owner)
-        if not os.path.isdir(owner_path):
+    seen: set[str] = set()
+    for current_root, dirnames, filenames in os.walk(root):
+        has_metadata = "metadata.json" in filenames
+        has_lora = "adapter_model.safetensors" in filenames or bool(
+            glob.glob(os.path.join(current_root, "mp_rank_*_adapter.pt"))
+        )
+        has_optimizer = "optimizer.pt" in filenames or bool(
+            glob.glob(os.path.join(current_root, "*_optimizer.pt"))
+        )
+        if not (has_metadata or has_lora or has_optimizer):
             continue
-        for model_id in os.listdir(owner_path):
-            model_path = os.path.join(owner_path, model_id)
-            if not os.path.isdir(model_path):
-                continue
-            for checkpoint_name in os.listdir(model_path):
-                checkpoint_path = os.path.join(model_path, checkpoint_name)
-                if os.path.isdir(checkpoint_path):
-                    out.append(checkpoint_path)
+        real = os.path.realpath(current_root)
+        if real in seen:
+            continue
+        seen.add(real)
+        out.append(current_root)
+        dirnames[:] = []
     return out
 
 
@@ -842,7 +951,7 @@ def reap_runtime_checkpoints(*, now: float | None = None) -> dict[str, list[str]
 
     ephemeral_root = get_ephemeral_checkpoints_dir()
     for checkpoint_path in _iter_runtime_checkpoint_dirs(ephemeral_root):
-        checkpoint_name = os.path.basename(checkpoint_path)
+        checkpoint_name = checkpoint_logical_name(checkpoint_path)
         meta = {}
         try:
             meta = read_checkpoint_metadata(checkpoint_path)
