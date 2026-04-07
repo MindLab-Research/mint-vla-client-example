@@ -23,7 +23,10 @@ def test_dev_head_keeps_dashboard_and_ray_client_enabled() -> None:
     assert "ray_client_server_port=10001" in text
     assert '_port_open("127.0.0.1", 6379)' in text
     assert "node.dead_processes()" in text
-
+    assert 'MountPath: "/tos-mindverse"' in text
+    assert 'Bucket: "tos-mindverse-dev"' in text
+    assert 'MountPath: "/tos-mindverse-prod"' in text
+    assert 'Bucket: "tos-mindverse"' in text
 
 
 def test_dev_worker_uses_short_temp_paths() -> None:
@@ -37,6 +40,10 @@ def test_dev_worker_uses_short_temp_paths() -> None:
     assert 'object_spilling_directory=ray_object_spilling_dir' in text
     assert 'os.symlink(ray_tmp_root_real, RAY_TMP_LINK)' in text
     assert "node.dead_processes()" in text
+    assert 'MountPath: "/tos-mindverse"' in text
+    assert 'Bucket: "tos-mindverse-dev"' in text
+    assert 'MountPath: "/tos-mindverse-prod"' in text
+    assert 'Bucket: "tos-mindverse"' in text
 
 
 def test_prod_head_self_heals_without_dashboard_or_ray_client() -> None:
