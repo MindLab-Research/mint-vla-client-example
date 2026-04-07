@@ -802,9 +802,12 @@ class FutureStore:
                 "Detached Ray FutureStore actor is not ready on this API server"
             )
         return self._ray_actor
+    async def async_ensure_started(self) -> None:
+        await self._get_ray_actor_async(require_ready=False)
+
     async def async_ensure_ready(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
         """Async variant of ensure_ready for request/control-plane paths."""
-        actor = await self._get_ray_actor_async()
+        actor = await self._get_ray_actor_async(require_ready=False)
         import ray
 
         try:
@@ -825,7 +828,7 @@ class FutureStore:
             self._ray_actor = None
             raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
         return int(v)
-    async def _get_ray_actor_async(self):
+    async def _get_ray_actor_async(self, *, require_ready: bool = True):
         try:
             import ray
         except Exception as e:
@@ -844,6 +847,8 @@ class FutureStore:
 
         actor = self._ray_actor
         if actor is not None:
+            if not require_ready:
+                return actor
             try:
                 await asyncio.wait_for(_await_ray_ref(actor.stats.remote()), timeout=1.0)
                 return actor

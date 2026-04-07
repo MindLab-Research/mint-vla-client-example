@@ -18,7 +18,7 @@ from .auth_identity import get_request_observability_context
 from .backend.api_work_queue import ApiWorkQueueUnavailableError
 from .backend.capacity_manager import CapacityManagerUnavailableError
 from .backend.future_store import FutureStoreUnavailableError
-from .backend.session_manager import DEFAULT_INACTIVITY_TIMEOUT, SessionManager
+from .backend.session_manager import SessionManager
 from .config import config
 from .gateway import close_http_clients
 from .health_state import (
@@ -36,7 +36,6 @@ from .logging_context import (
     get_trace_id,
     get_otel_tracer,
     record_http_server_metrics,
-    run_async_with_otel_span,
     set_trace_id,
 )
 from .ray_utils import init_ray
@@ -576,7 +575,7 @@ async def lifespan(app: FastAPI):
     )
 
     if startup_owner:
-        await future_store.async_ensure_ready()
+        await future_store.async_ensure_started()
         ensure_gateway_session_store_ready()
         ensure_sampling_session_store_ready()
         session_heartbeat_store.ensure_ready()
@@ -744,7 +743,7 @@ async def lifespan(app: FastAPI):
         from .backend.queue_execution_runtime import queue_execution_runtime
 
         await capacity_manager.async_ensure_ready()
-        await api_work_queue.async_ensure_ready()
+        await api_work_queue.async_ensure_started()
         await queue_execution_runtime.async_ensure_started(num_workers=int(config.api_work_queue_num_workers))
 
         stale_training_heartbeat_task = None
