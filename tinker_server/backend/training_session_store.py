@@ -76,9 +76,27 @@ def _get_or_create_actor():
             self._sessions: dict[str, dict[str, Any]] = {}
 
         def upsert(self, model_id: str, info: dict[str, Any]) -> None:
-            merged = dict(info)
-            if "current_step" not in merged:
-                merged["current_step"] = int(self._sessions.get(model_id, {}).get("current_step", 0))
+            current = dict(self._sessions.get(model_id, {}))
+            incoming = dict(info)
+            incoming_version = max(1, int(incoming.get("metadata_version") or 1))
+            current_version = max(1, int(current.get("metadata_version") or 1))
+            if incoming_version < current_version:
+                incoming_last_activity = float(incoming.get("last_activity", 0.0) or 0.0)
+                current_last_activity = float(current.get("last_activity", 0.0) or 0.0)
+                current["last_activity"] = max(current_last_activity, incoming_last_activity)
+                try:
+                    incoming_step = int(incoming.get("current_step", 0))
+                    current_step = int(current.get("current_step", 0))
+                    current["current_step"] = max(current_step, incoming_step)
+                except Exception:
+                    pass
+                self._sessions[model_id] = current
+                return
+            merged = dict(current)
+            merged.update(incoming)
+            merged.setdefault("current_step", int(current.get("current_step", 0)))
+            merged.setdefault("last_activity", time.time())
+            merged["metadata_version"] = incoming_version
             self._sessions[model_id] = merged
 
         def get(self, model_id: str) -> dict[str, Any] | None:
@@ -116,22 +134,23 @@ def _get_or_create_actor():
         "namespace": namespace,
         "lifetime": "detached",
     }
-    try:
-        if "node:__internal_head__" in ray.cluster_resources():
-            options["resources"] = {"node:__internal_head__": 0.001}
-    except Exception:
-        pass
     actor_otel_env = otel_env_vars()
-    from ..config import PFS_PYTHONPATH, actor_runtime_env
+    from ..config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources
+    apply_detached_actor_resources(options, ray)
     options["runtime_env"] = actor_runtime_env(
         pythonpath=PFS_PYTHONPATH,
         extra=actor_otel_env,
     )
 
     try:
-        _ACTOR_HANDLE = _TrainingSessionStoreActor.options(
+        created = _TrainingSessionStoreActor.options(
             **options
         ).remote()
+        try:
+            ray.get(created.list.remote())
+            _ACTOR_HANDLE = created
+        except Exception:
+            _ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)
         return _ACTOR_HANDLE
     except Exception:
         _ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)
@@ -208,6 +227,7 @@ def upsert_training_session(info: dict[str, Any]) -> None:
     payload = dict(info)
     payload.setdefault("current_step", 0)
     payload.setdefault("last_activity", time.time())
+    payload["metadata_version"] = max(1, int(payload.get("metadata_version") or 1))
     try:
         actor = _get_or_create_actor()
         actor.upsert.remote(str(payload.get("model_id", "")), payload)

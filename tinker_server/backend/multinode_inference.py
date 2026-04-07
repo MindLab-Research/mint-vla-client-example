@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any
 
 import ray
 
-from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, preferred_torch_lib_dirs
+from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, otel_env_vars, preferred_torch_lib_dirs
 from tinker_server.config import config as server_config
 from tinker_server.logging_context import (
     get_current_traceparent,
@@ -261,7 +261,9 @@ def _is_request_validation_error(exc: BaseException) -> bool:
         marker in text
         for marker in (
             "vllm_prompt_logprobs_add_request_failed",
+            "vllm_prompt_topk_add_request_failed",
             "vllm_generate_add_request_failed",
+            "Requested prompt logprobs of",
             "Prompt+max_tokens length",
             "exceeds max_model_len",
             "maximum model length",
@@ -269,6 +271,77 @@ def _is_request_validation_error(exc: BaseException) -> bool:
             "model context limit",
         )
     )
+
+
+def _is_missing_lora_path_error(exc: BaseException) -> bool:
+    """Return True for request-scoped missing-adapter/path failures.
+
+    These indicate missing request inputs (evicted/deleted adapter path), not a
+    broken vLLM actor. They must fail the request without killing the actor.
+    """
+    text_candidates: list[str] = []
+    cur: BaseException | None = exc
+    seen: set[int] = set()
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        message = str(cur)
+        if message:
+            text_candidates.append(message.lower())
+        cur = cur.__cause__ if isinstance(cur.__cause__, BaseException) else None
+
+    joined = "\n".join(text_candidates)
+    if any(
+        marker in joined
+        for marker in (
+            "missing lora adapter path",
+            "no adapter found for",
+            "failed: no adapter found",
+            "no path found for lora_int_id",
+        )
+    ):
+        return True
+
+    has_missing_file_signal = any(
+        marker in joined
+        for marker in (
+            "file not found",
+            "no such file or directory",
+        )
+    )
+    if not has_missing_file_signal:
+        return False
+
+    return any(
+        marker in joined
+        for marker in (
+            "adapter_model.safetensors",
+            "adapter_config.json",
+            "lora_int_id",
+            "lora adapter path",
+            "lora_path",
+        )
+    )
+
+
+def _raise_if_missing_lora_path(
+    *,
+    sampling_session_id: str | None,
+    lora_int_id: int | None,
+    lora_path: str | None,
+) -> None:
+    """Fail fast when a request-scoped LoRA path is missing.
+
+    This protects the multi-node path from escalating a missing adapter path
+    into a generic engine failure that kills the actor.
+    """
+    if lora_int_id is None:
+        return
+    if not lora_path or not os.path.isdir(lora_path):
+        raise ValueError(
+            "Missing LoRA adapter path for "
+            f"sampling_session_id={sampling_session_id!r} "
+            f"lora_int_id={lora_int_id!r} path={lora_path!r}"
+        )
 
 
 @dataclass
@@ -344,6 +417,41 @@ class MultiNodeLoRARegistry:
         async with self._lock:
             slot = self._id_to_slot.get(lora_id)
             return slot.adapter_path if slot else None
+
+    async def restore_existing_session(
+        self,
+        sampling_session_id: str,
+        *,
+        adapter_path: str,
+        lora_int_id: int,
+    ) -> int:
+        """Rehydrate an already-loaded LoRA mapping after API restart."""
+        async with self._lock:
+            existing_id = self._session_to_id.get(sampling_session_id)
+            if existing_id is not None:
+                return existing_id
+
+            lora_id = int(lora_int_id)
+            slot = self._id_to_slot.get(lora_id)
+            if slot is None:
+                slot = MultiNodeLoRASlot(
+                    lora_int_id=lora_id,
+                    sampling_session_id=sampling_session_id,
+                    adapter_path=str(adapter_path),
+                    session_ids={sampling_session_id},
+                )
+                self._id_to_slot[lora_id] = slot
+            else:
+                if str(slot.adapter_path) != str(adapter_path):
+                    raise ValueError(
+                        f"lora_int_id={lora_id} already mapped to adapter_path={slot.adapter_path}, "
+                        f"cannot restore adapter_path={adapter_path}"
+                    )
+                slot.session_ids.add(sampling_session_id)
+                slot.last_used = time.time()
+            self._session_to_id[sampling_session_id] = lora_id
+            self._next_id = max(self._next_id, lora_id + 1)
+            return lora_id
 
     async def remove_session(self, sampling_session_id: str) -> tuple[int | None, bool]:
         """Remove a session mapping and report whether engine unload is needed."""
@@ -653,7 +761,7 @@ def _create_multinode_vllm_actor(
             try:
                 from .future_store import future_store
 
-                future_store.update_meta(
+                await future_store.async_update_meta(
                     outer_request_id,
                     meta={
                         "stage": "decode",
@@ -1256,7 +1364,7 @@ def _create_multinode_vllm_actor(
             try:
                 from .future_store import future_store
 
-                future_store.update_meta(
+                await future_store.async_update_meta(
                     outer_request_id,
                     meta={
                         "stage": "prefill",
@@ -2756,6 +2864,11 @@ class MultiNodeInferenceEngine:
             lora_id = await self.registry.get_lora_id(sampling_session_id)
             if lora_id is not None:
                 lora_path = await self.registry.get_adapter_path(lora_id)
+        _raise_if_missing_lora_path(
+            sampling_session_id=sampling_session_id,
+            lora_int_id=lora_id,
+            lora_path=lora_path,
+        )
         traceparent = get_current_traceparent()
 
         ref = self.engine.generate.remote(
@@ -2787,7 +2900,7 @@ class MultiNodeInferenceEngine:
                 f"multinode_vllm_ray_get_timeout_s={ray_get_timeout_s} request_id={request_id}"
             ) from e
         except Exception as e:
-            if _is_request_validation_error(e):
+            if _is_request_validation_error(e) or _is_missing_lora_path_error(e):
                 raise
             logger.exception(
                 "multinode_vllm_ray_get_failed generate actor=%s request_id=%s sampling_session_id=%s prompt_len=%s max_tokens=%s",
@@ -2846,6 +2959,11 @@ class MultiNodeInferenceEngine:
             lora_id = await self.registry.get_lora_id(sampling_session_id)
             if lora_id is not None:
                 lora_path = await self.registry.get_adapter_path(lora_id)
+        _raise_if_missing_lora_path(
+            sampling_session_id=sampling_session_id,
+            lora_int_id=lora_id,
+            lora_path=lora_path,
+        )
         traceparent = get_current_traceparent()
 
         ref = self.engine.generate.remote(
@@ -2876,7 +2994,7 @@ class MultiNodeInferenceEngine:
                 f"multinode_vllm_ray_get_timeout_s={ray_get_timeout_s} request_id={request_id}"
             ) from e
         except Exception as e:
-            if _is_request_validation_error(e):
+            if _is_request_validation_error(e) or _is_missing_lora_path_error(e):
                 raise
             logger.exception(
                 "multinode_vllm_ray_get_failed generate_many actor=%s request_id=%s sampling_session_id=%s prompt_len=%s num_samples=%s max_tokens=%s",
@@ -2934,6 +3052,11 @@ class MultiNodeInferenceEngine:
             lora_id = await self.registry.get_lora_id(sampling_session_id)
             if lora_id is not None:
                 lora_path = await self.registry.get_adapter_path(lora_id)
+        _raise_if_missing_lora_path(
+            sampling_session_id=sampling_session_id,
+            lora_int_id=lora_id,
+            lora_path=lora_path,
+        )
         traceparent = get_current_traceparent()
 
         ref = self.engine.compute_prompt_logprobs.remote(
@@ -2951,7 +3074,7 @@ class MultiNodeInferenceEngine:
                 f"multinode_vllm_ray_get_timeout_s={ray_get_timeout_s} request_id={request_id}"
             ) from e
         except Exception as e:
-            if _is_request_validation_error(e):
+            if _is_request_validation_error(e) or _is_missing_lora_path_error(e):
                 raise
             logger.exception(
                 "multinode_vllm_ray_get_failed compute_logprobs actor=%s request_id=%s sampling_session_id=%s prompt_len=%s",
@@ -3009,6 +3132,11 @@ class MultiNodeInferenceEngine:
             lora_id = await self.registry.get_lora_id(sampling_session_id)
             if lora_id is not None:
                 lora_path = await self.registry.get_adapter_path(lora_id)
+        _raise_if_missing_lora_path(
+            sampling_session_id=sampling_session_id,
+            lora_int_id=lora_id,
+            lora_path=lora_path,
+        )
         traceparent = get_current_traceparent()
 
         ref = self.engine.compute_prompt_topk.remote(
@@ -3026,7 +3154,9 @@ class MultiNodeInferenceEngine:
             raise RuntimeError(
                 f"multinode_vllm_ray_get_timeout_s={ray_get_timeout_s} request_id={request_id}"
             ) from e
-        except Exception:
+        except Exception as e:
+            if _is_request_validation_error(e) or _is_missing_lora_path_error(e):
+                raise
             logger.exception(
                 "multinode_vllm_ray_get_failed compute_topk actor=%s request_id=%s sampling_session_id=%s prompt_len=%s k=%s",
                 self.actor_name,
@@ -3074,6 +3204,20 @@ class MultiNodeInferenceEngine:
             should_unload,
         )
         return True
+
+    async def restore_loaded_session(
+        self,
+        *,
+        sampling_session_id: str,
+        adapter_path: str,
+        lora_int_id: int,
+    ) -> int:
+        """Restore a detached control-plane mapping for an already-loaded LoRA."""
+        return await self.registry.restore_existing_session(
+            sampling_session_id,
+            adapter_path=adapter_path,
+            lora_int_id=lora_int_id,
+        )
 
     async def shutdown(self, kill_actor: bool = False) -> None:
         """Disconnect from the engine."""

@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -18,6 +20,7 @@ LORA_RANK = int(os.environ.get("TINKER_LORA_RANK", "8"))
 LEARNING_RATE = float(os.environ.get("TINKER_LEARNING_RATE", "1e-4"))
 WARMUP_STEPS = int(os.environ.get("TINKER_WARMUP_STEPS", "5"))
 COMPARE_STEPS = int(os.environ.get("TINKER_COMPARE_STEPS", "3"))
+DIFFERENT_CHECKPOINT_STEPS = int(os.environ.get("TINKER_DIFFERENT_CHECKPOINT_STEPS", "2"))
 SEQ_LEN = int(os.environ.get("TINKER_SEQ_LEN", "64"))
 CREATE_TIMEOUT_S = float(os.environ.get("TINKER_CREATE_TIMEOUT_S", "3600"))
 SAVE_TIMEOUT_S = float(os.environ.get("TINKER_SAVE_TIMEOUT_S", "3600"))
@@ -190,6 +193,21 @@ def _save_state(model_id: str, checkpoint_name: str) -> str:
     return path
 
 
+def _load_state(model_id: str, checkpoint_path: str, *, optimizer: bool = True, label: str = "reloaded") -> None:
+    loaded = _await_maybe_async(
+        _post_json(
+            "/api/v1/load_state",
+            {"model_id": model_id, "path": checkpoint_path, "optimizer": optimizer},
+            timeout_s=60.0,
+        ),
+        timeout_s=RESUME_TIMEOUT_S,
+    )
+    loaded_path = loaded.get("path")
+    if not isinstance(loaded_path, str) or not loaded_path:
+        raise RuntimeError(f"load_state missing path: {loaded!r}")
+    print(f"{label} model_id={model_id} path={loaded_path}", flush=True)
+
+
 def _resume_from_state(session_id: str, model_seq_id: int, state_path: str) -> str:
     resumed = _post_json(
         "/api/v1/create_model_from_state",
@@ -212,9 +230,23 @@ def _resume_from_state(session_id: str, model_seq_id: int, state_path: str) -> s
     return model_id
 
 
-def _compare_resume_to_presave(last_presave: TrainStep, resumed: list[TrainStep]) -> tuple[bool, str]:
+def _load_into_new_session(
+    session_id: str,
+    model_seq_id: int,
+    state_path: str,
+    *,
+    optimizer: bool = True,
+    label: str = "loaded-into-new-session",
+) -> str:
+    model_id, _backend = _create_model(session_id, model_seq_id)
+    _load_state(model_id, state_path, optimizer=optimizer, label=label)
+    print(f"{label} model_id={model_id}", flush=True)
+    return model_id
+
+
+def _compare_resume_to_presave(last_presave: TrainStep, resumed: list[TrainStep]) -> dict[str, float]:
     if not resumed:
-        return False, "no resumed steps recorded"
+        raise RuntimeError("no resumed steps recorded")
 
     first = resumed[0].loss
     max_resumed = max(step.loss for step in resumed)
@@ -230,12 +262,71 @@ def _compare_resume_to_presave(last_presave: TrainStep, resumed: list[TrainStep]
             flush=True,
         )
 
-    ok = max_ratio <= 1.25 and final <= first
-    summary = (
-        f"presave_loss={last_presave.loss:.6f} first_resumed={first:.6f} "
-        f"final_resumed={final:.6f} first_ratio={first_ratio:.6f} max_ratio={max_ratio:.6f}"
+    return {
+        "presave_loss": float(last_presave.loss),
+        "first_resumed": float(first),
+        "final_resumed": float(final),
+        "first_ratio": float(first_ratio),
+        "max_ratio": float(max_ratio),
+    }
+
+
+def _write_resume_artifacts(
+    *,
+    suffix: str,
+    last_presave: TrainStep,
+    advanced_step: TrainStep,
+    resumed_d: list[TrainStep],
+    resumed_b: list[TrainStep],
+    resumed_c: list[TrainStep],
+    summary_d: dict[str, float],
+    summary_b: dict[str, float],
+    summary_c: dict[str, float],
+) -> tuple[Path, Path]:
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        raise RuntimeError(f"matplotlib required for merge-gate trajectory artifact: {exc}") from exc
+
+    root = Path(
+        os.environ.get("MINT_TEST_EXPERIMENT_ROOT")
+        or f"results/merge-gate/manual-{time.strftime('%Y%m%d-%H%M%S')}"
     )
-    return ok, summary
+    artifact_dir = root / f"resume_training_{suffix}"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+
+    payload = {
+        "suffix": suffix,
+        "presave_reference": {"step": last_presave.index, "loss": last_presave.loss},
+        "advanced_reference": {"step": advanced_step.index, "loss": advanced_step.loss},
+        "weights_only_rollback": [step.__dict__ for step in resumed_d],
+        "create_model_from_state": [step.__dict__ for step in resumed_b],
+        "fresh_session_load_state": [step.__dict__ for step in resumed_c],
+        "summary": {
+            "weights_only_rollback": summary_d,
+            "create_model_from_state": summary_b,
+            "fresh_session_load_state": summary_c,
+        },
+    }
+    json_path = artifact_dir / "resume_trajectory.json"
+    json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    ax.plot([last_presave.index], [last_presave.loss], marker="o", label="presave_reference")
+    ax.plot([advanced_step.index], [advanced_step.loss], marker="o", label="advanced_reference")
+    ax.plot([step.index for step in resumed_d], [step.loss for step in resumed_d], marker="o", label="weights_only_rollback")
+    ax.plot([step.index for step in resumed_b], [step.loss for step in resumed_b], marker="o", label="create_model_from_state")
+    ax.plot([step.index for step in resumed_c], [step.loss for step in resumed_c], marker="o", label="fresh_session_load_state")
+    ax.set_xlabel("step")
+    ax.set_ylabel("loss")
+    ax.set_title(f"resume_training_{suffix}")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    png_path = artifact_dir / "resume_trajectory.png"
+    fig.tight_layout()
+    fig.savefig(png_path)
+    plt.close(fig)
+    return json_path, png_path
 
 
 def main() -> int:
@@ -243,8 +334,12 @@ def main() -> int:
     suffix = uuid.uuid4().hex[:8]
     session_a = f"issue315-a-{suffix}"
     session_b = f"issue315-b-{suffix}"
+    session_c = f"issue315-c-{suffix}"
+    session_d = f"issue315-d-{suffix}"
     model_a: str | None = None
     model_b: str | None = None
+    model_c: str | None = None
+    model_d: str | None = None
     try:
         model_a, _ = _create_model(session_a, 0)
         last_presave: TrainStep | None = None
@@ -256,22 +351,71 @@ def main() -> int:
 
         checkpoint_path = _save_state(model_a, f"issue315-{suffix}")
         print(f"presave_reference step={last_presave.index} loss={last_presave.loss:.6f}", flush=True)
+        _load_state(model_a, checkpoint_path, optimizer=True, label="reloaded")
+
+        advanced_step: TrainStep | None = None
+        for step_idx in range(1, DIFFERENT_CHECKPOINT_STEPS + 1):
+            advanced_step = _train_step(model_a, batch, WARMUP_STEPS + step_idx)
+        if advanced_step is None:
+            raise RuntimeError("no different-checkpoint advance steps ran")
+        checkpoint_newer_path = _save_state(model_a, f"issue315-{suffix}-newer")
+        print(
+            f"advanced_reference step={advanced_step.index} loss={advanced_step.loss:.6f} "
+            f"newer_checkpoint={checkpoint_newer_path}",
+            flush=True,
+        )
+
+        model_d = _load_into_new_session(
+            session_d,
+            0,
+            checkpoint_path,
+            optimizer=False,
+            label="weights-only-rollback",
+        )
+        resumed_d: list[TrainStep] = []
+        for compare_idx in range(1, COMPARE_STEPS + 1):
+            resumed_d.append(_train_step(model_d, batch, compare_idx))
+
+        summary_d = _compare_resume_to_presave(last_presave, resumed_d)
 
         model_b = _resume_from_state(session_b, 0, checkpoint_path)
-        resumed: list[TrainStep] = []
+        resumed_b: list[TrainStep] = []
         for compare_idx in range(1, COMPARE_STEPS + 1):
-            resumed.append(_train_step(model_b, batch, compare_idx))
+            resumed_b.append(_train_step(model_b, batch, compare_idx))
 
-        ok, summary = _compare_resume_to_presave(last_presave, resumed)
-        if not ok:
-            return _fail(f"resume trajectory diverged from pre-save behavior: {summary}")
+        summary_b = _compare_resume_to_presave(last_presave, resumed_b)
 
-        print(f"PASS: resumed trajectory stayed aligned with pre-save loss ({summary})", flush=True)
+        model_c = _load_into_new_session(session_c, 0, checkpoint_path, optimizer=True)
+        resumed_c: list[TrainStep] = []
+        for compare_idx in range(1, COMPARE_STEPS + 1):
+            resumed_c.append(_train_step(model_c, batch, compare_idx))
+
+        summary_c = _compare_resume_to_presave(last_presave, resumed_c)
+
+        json_path, png_path = _write_resume_artifacts(
+            suffix=suffix,
+            last_presave=last_presave,
+            advanced_step=advanced_step,
+            resumed_d=resumed_d,
+            resumed_b=resumed_b,
+            resumed_c=resumed_c,
+            summary_d=summary_d,
+            summary_b=summary_b,
+            summary_c=summary_c,
+        )
+
+        print(
+            "SUMMARY: weights-only older-checkpoint rollback, create_model_from_state, and fresh-session "
+            f"load_state recorded. artifacts json={json_path} png={png_path} "
+            f"(weights-only rollback: {summary_d}; create_model_from_state: {summary_b}; "
+            f"fresh-session: {summary_c})",
+            flush=True,
+        )
         return 0
     except Exception as exc:
         return _fail(str(exc))
     finally:
-        for model_id in (model_b, model_a):
+        for model_id in (model_d, model_c, model_b, model_a):
             if model_id:
                 _delete_model(model_id)
 

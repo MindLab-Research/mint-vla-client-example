@@ -101,17 +101,24 @@ def _get_or_create_actor():
         "lifetime": "detached",
     }
     actor_otel_env = otel_env_vars()
-    from ..config import PFS_PYTHONPATH, actor_runtime_env
+    from ..config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources
+    apply_detached_actor_resources(options, ray)
     options["runtime_env"] = actor_runtime_env(
         pythonpath=PFS_PYTHONPATH,
         extra=actor_otel_env,
     )
 
     try:
-        _ACTOR_HANDLE = _GatewaySessionStoreActor.options(
+        created = _GatewaySessionStoreActor.options(
             **options
         ).remote()
-        return _ACTOR_HANDLE
+        try:
+            ray.get(created.list.remote())
+            _ACTOR_HANDLE = created
+            return _ACTOR_HANDLE
+        except Exception:
+            _ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)
+            return _ACTOR_HANDLE
     except Exception as e:
         # Concurrency: another process may have created the detached actor after our initial
         # ray.get_actor(name) check but before this .remote() call.

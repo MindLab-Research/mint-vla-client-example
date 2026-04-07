@@ -14,6 +14,7 @@ def _install_ray_stub(calls: list[dict], monkeypatch) -> None:
         return {"ok": True}
 
     ray.init = init  # type: ignore[attr-defined]
+    ray.is_initialized = lambda: False  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "ray", ray)
 
 

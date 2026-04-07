@@ -132,6 +132,55 @@ class LoRARegistry:
                     self._slot_info[lora_id].last_used = time.time()
             return lora_id
 
+    async def restore_existing_session(
+        self,
+        sampling_session_id: str,
+        *,
+        adapter_path: str,
+        lora_int_id: int,
+    ) -> int:
+        """Rehydrate an already-loaded LoRA mapping after API restart."""
+        async with self._lock:
+            existing_id = self._session_to_id.get(sampling_session_id)
+            if existing_id is not None:
+                return existing_id
+
+            adapter_path = str(adapter_path)
+            lora_id = int(lora_int_id)
+            now = time.time()
+
+            self._session_to_id[sampling_session_id] = lora_id
+            self._session_to_path[sampling_session_id] = adapter_path
+
+            existing_path_id = self._path_to_id.get(adapter_path)
+            if existing_path_id is not None and existing_path_id != lora_id:
+                raise ValueError(
+                    f"Adapter path {adapter_path} already mapped to lora_int_id={existing_path_id}, "
+                    f"cannot restore lora_int_id={lora_id}"
+                )
+
+            self._path_to_id[adapter_path] = lora_id
+            self._id_to_path[lora_id] = adapter_path
+            self._path_refcount[adapter_path] = self._path_refcount.get(adapter_path, 0) + 1
+
+            slot = self._slot_info.get(lora_id)
+            if slot is None:
+                slot = LoRASlotInfo(
+                    lora_int_id=lora_id,
+                    sampling_session_id=sampling_session_id,
+                    loaded_at=now,
+                    last_used=now,
+                )
+                self._slot_info[lora_id] = slot
+            else:
+                slot.last_used = now
+
+            self._id_to_session.setdefault(lora_id, slot.sampling_session_id)
+            self._lru_order[lora_id] = None
+            self._lru_order.move_to_end(lora_id)
+            self._next_id = max(self._next_id, lora_id + 1)
+            return lora_id
+
     async def get_lru_candidates(self, count: int) -> list[int]:
         """Get the least recently used lora_int_ids for eviction."""
         async with self._lock:

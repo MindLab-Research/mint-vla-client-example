@@ -46,7 +46,7 @@ async def test_issue_319_save_weights_for_sampler_fails_before_metadata(monkeypa
                 backend="dense",
                 lora_config=SimpleNamespace(rank=8, train_mlp=False),
             ),
-            mark_inflight=lambda _model_id, _delta: None,
+            mark_inflight=lambda *_args, **_kwargs: None,
         ),
     )
     monkeypatch.setattr(
@@ -103,7 +103,7 @@ async def test_issue_319_save_weights_for_sampler_rejects_corrupt_safetensors(
                 backend="dense",
                 lora_config=SimpleNamespace(rank=8, train_mlp=False),
             ),
-            mark_inflight=lambda _model_id, _delta: None,
+            mark_inflight=lambda *_args, **_kwargs: None,
         ),
     )
     monkeypatch.setattr(
@@ -157,7 +157,7 @@ async def test_issue_319_save_state_fails_before_metadata(monkeypatch, tmp_path:
                 current_step=7,
                 backend="dense",
             ),
-            mark_inflight=lambda _model_id, _delta: None,
+            mark_inflight=lambda *_args, **_kwargs: None,
         ),
     )
     monkeypatch.setattr(wt, "training_engine", SimpleNamespace(save_weights=_fake_save_weights))

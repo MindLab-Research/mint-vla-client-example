@@ -50,9 +50,11 @@ def test_detached_store_actors_use_tinker_ray_namespace(monkeypatch):
 
     future_store_mod = importlib.import_module("tinker_server.backend.future_store")
     gateway_session_store_mod = importlib.import_module("tinker_server.backend.gateway_session_store")
+    sampling_session_store_mod = importlib.import_module("tinker_server.backend.sampling_session_store")
     training_session_store_mod = importlib.import_module("tinker_server.backend.training_session_store")
 
     assert future_store_mod._ray_namespace() == "ns_tinker"
+    assert sampling_session_store_mod._ray_namespace() == "ns_tinker"
     assert training_session_store_mod._ray_namespace() == "ns_tinker"
     assert gateway_session_store_mod._ray_namespace() == "ns_tinker"
 
@@ -68,5 +70,3 @@ def test_startup_reconciliation_does_not_guess_gpu_counts():
     txt = (repo_root / "tinker_server/app.py").read_text(encoding="utf-8")
     assert "num_gpus = 8" not in txt
     assert 'actor_type = ActorType.VLLM\n                            num_gpus = 1' not in txt
-    assert "Skipping busy restored vLLM actor with unknown GPU count" in txt
-    assert "Skipping busy restored Megatron actor with unknown GPU count" in txt
