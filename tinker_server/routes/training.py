@@ -73,7 +73,6 @@ from ..models.types import (
     ForwardRequest,
     GetInfoRequest,
     GetInfoResponse,
-    LoRAConfig,
     ModelData,
     OptimStepRequest,
     ResetExpertBiasRequest,

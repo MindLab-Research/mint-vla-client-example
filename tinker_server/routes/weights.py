@@ -950,7 +950,7 @@ async def _do_save_weights(
 
         logger.info(f"[{session.model_id}] Saving sampler weights to: {save_path}")
 
-        abs_path = await run_async_with_otel_span(
+        await run_async_with_otel_span(
             "weights.save_weights.execute",
             lambda: training_engine.save_weights_for_sampler(
                 session=session,
@@ -1546,13 +1546,6 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
 
                 checkpoint_type = metadata.get("checkpoint_type")
                 if checkpoint_type not in ("training", "sampler"):
-                    continue
-                try:
-                    if checkpoint_type == "sampler":
-                        validate_sampler_checkpoint_for_sampling(ckpt_path)
-                    else:
-                        validate_checkpoint_dir(ckpt_path, checkpoint_type=checkpoint_type)
-                except ValueError:
                     continue
                 storage_tier = metadata.get("storage_tier")
                 mirror_status = metadata.get("mirror_status")

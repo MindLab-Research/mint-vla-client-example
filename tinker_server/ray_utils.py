@@ -51,11 +51,19 @@ def preferred_driver_ray_address() -> str:
     )
 
 
+def preferred_ray_address() -> str | None:
+    try:
+        return preferred_driver_ray_address()
+    except MissingRayAddressError:
+        return None
+
+
 def _driver_runtime_env() -> dict[str, Any]:
     runtime_env: dict[str, Any] = {}
 
     working_dir = (
-        os.environ.get("MINT_RAY_WORKING_DIR", "").strip()
+        os.environ.get("MINT_RAY_JOB_WORKING_DIR", "").strip()
+        or os.environ.get("MINT_RAY_WORKING_DIR", "").strip()
         or os.environ.get("PFS_TINKER_PATH", "").strip()
     )
     if working_dir:
@@ -66,6 +74,14 @@ def _driver_runtime_env() -> dict[str, Any]:
         runtime_env["py_modules"] = [x.strip() for x in py_modules_csv.split(",") if x.strip()]
 
     return runtime_env
+
+
+def client_job_runtime_env() -> dict[str, Any] | None:
+    addr = preferred_ray_address()
+    if not addr or not addr.startswith("ray://"):
+        return None
+    runtime_env = _driver_runtime_env()
+    return runtime_env or None
 
 
 def _ray_init_lock_path() -> Path:
@@ -133,7 +149,8 @@ def init_ray(**kwargs: Any) -> Any:
     """Initialize Ray with optional log forwarding to driver.
 
     Adds log_to_driver=True when MINT_RAY_LOG_TO_DRIVER is enabled, unless explicitly
-    set by the caller.
+    set by the caller. When the caller leaves address unset or uses "auto", prefer
+    configured Ray Client endpoints before falling back to direct attach.
     """
     import ray
 
@@ -146,11 +163,9 @@ def init_ray(**kwargs: Any) -> Any:
     elif isinstance(current, str):
         kwargs["address"] = current.strip()
 
-    address = kwargs.get("address")
-    if isinstance(address, str) and address.startswith("ray://") and "runtime_env" not in kwargs:
-        runtime_env = _driver_runtime_env()
-        if runtime_env:
-            kwargs["runtime_env"] = runtime_env
+    runtime_env = client_job_runtime_env()
+    if runtime_env is not None:
+        kwargs.setdefault("runtime_env", runtime_env)
 
     node_ip = os.environ.get("MINT_RAY_NODE_IP_ADDRESS", "").strip()
     if node_ip and "_node_ip_address" not in kwargs:

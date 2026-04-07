@@ -1,6 +1,7 @@
 import importlib.machinery
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -55,5 +56,44 @@ def test_issue_94_init_ray_requires_explicit_address(monkeypatch) -> None:
     from tinker_server.ray_utils import MissingRayAddressError, init_ray
 
     monkeypatch.delenv("RAY_ADDRESS", raising=False)
+    monkeypatch.delenv("RAY_CLIENT_ADDRESS", raising=False)
+    monkeypatch.delenv("MINT_RAY_CLIENT_ADDRESS", raising=False)
     with pytest.raises(MissingRayAddressError):
         init_ray(namespace="ns", ignore_reinit_error=True)
+
+
+def test_issue_94_init_ray_prefers_client_address(monkeypatch, tmp_path: Path) -> None:
+    calls: list[dict] = []
+    _install_ray_stub(calls, monkeypatch)
+
+    from tinker_server.ray_utils import init_ray
+
+    monkeypatch.setenv("RAY_ADDRESS", "192.168.39.23:6379")
+    monkeypatch.setenv("RAY_CLIENT_ADDRESS", "ray://192.168.39.23:10001")
+    monkeypatch.setenv("MINT_RAY_CLIENT_ADDRESS", "ray://192.168.39.23:10002")
+    monkeypatch.setenv("MINT_RAY_JOB_WORKING_DIR", str(tmp_path))
+
+    init_ray(address="auto", namespace="ns", ignore_reinit_error=True)
+
+    assert calls[-1]["address"] == "ray://192.168.39.23:10002"
+    assert calls[-1]["runtime_env"] == {"working_dir": str(tmp_path)}
+
+
+def test_issue_94_future_store_infers_client_address(monkeypatch, tmp_path: Path) -> None:
+    from tinker_server.backend.future_store import _infer_ray_address
+
+    monkeypatch.setenv("PFS_TINKER_PATH", str(tmp_path))
+    monkeypatch.setenv("RAY_ADDRESS", "192.168.39.23:6379")
+    monkeypatch.setenv("RAY_CLIENT_ADDRESS", "ray://192.168.39.23:10001")
+    monkeypatch.setenv("MINT_RAY_CLIENT_ADDRESS", "ray://192.168.39.23:10002")
+
+    assert _infer_ray_address() == "ray://192.168.39.23:10002"
+
+
+def test_issue_94_client_job_runtime_env_uses_working_dir(monkeypatch, tmp_path: Path) -> None:
+    from tinker_server.ray_utils import client_job_runtime_env
+
+    monkeypatch.setenv("MINT_RAY_CLIENT_ADDRESS", "ray://192.168.39.23:10002")
+    monkeypatch.setenv("MINT_RAY_JOB_WORKING_DIR", str(tmp_path))
+
+    assert client_job_runtime_env() == {"working_dir": str(tmp_path)}

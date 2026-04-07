@@ -70,10 +70,38 @@ def _ray_future_tombstone_ttl_s() -> float:
     return float(getattr(server_config, "future_store_tombstone_ttl_s", 300.0))
 
 
-def _require_ray_address() -> str:
-    from ..ray_utils import require_ray_address
+def _infer_ray_address() -> str | None:
+    """Infer the preferred Ray attach address for remote clusters.
 
-    return require_ray_address()
+    Prefer explicit Ray Client endpoints, then direct `RAY_ADDRESS`. Fall back to
+    ray_head_ip.txt on shared storage when no env override is present.
+    """
+    from ..ray_utils import preferred_ray_address
+
+    addr = preferred_ray_address()
+    if addr:
+        return addr
+
+    candidates: list[str] = []
+    pfs_tinker_path = (os.environ.get("PFS_TINKER_PATH") or "").strip()
+    if pfs_tinker_path:
+        candidates.append(os.path.join(pfs_tinker_path, "ray_head_ip.txt"))
+    candidates.extend(
+        [
+            "/vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt",
+            "/vePFS-Mindverse/share/code/tinker-server/ray_head_ip.txt",
+            os.path.join(os.getcwd(), "ray_head_ip.txt"),
+        ]
+    )
+
+    for p in candidates:
+        try:
+            ip = open(p, "r", encoding="utf-8").read().strip()
+        except OSError:
+            continue
+        if ip:
+            return f"{ip}:6379"
+    return None
 
 
 def _is_training_step_op(op: Any) -> bool:
@@ -972,7 +1000,7 @@ class FutureStore:
 
             out["ray_initialized"] = bool(ray.is_initialized())
             if not ray.is_initialized():
-                out["ray_address"] = _require_ray_address()
+                out["ray_address_inferred"] = _infer_ray_address()
                 return out
 
             actor = self._ray_actor
