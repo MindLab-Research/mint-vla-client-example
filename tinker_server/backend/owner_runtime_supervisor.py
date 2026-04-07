@@ -22,6 +22,13 @@ CURRENT_CODE_IDENTITY = os.environ.get("MINT_GIT_SHA") or _git_sha()
 logger = logging.getLogger(__name__)
 _ACTOR_HANDLE = None
 
+def _reset_cached_actor_handle() -> None:
+    global _ACTOR_HANDLE
+    _ACTOR_HANDLE = None
+
+from ..ray_utils import register_ray_reconnect_invalidator as _register_ray_reconnect_invalidator
+_register_ray_reconnect_invalidator(_reset_cached_actor_handle)
+
 _LOOP_FUTURE_REAPER = "future_reaper"
 _LOOP_CHECKPOINT_REAPER = "checkpoint_reaper"
 _LOOP_CHECKPOINT_MIRROR = "checkpoint_mirror"

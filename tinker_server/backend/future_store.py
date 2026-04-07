@@ -763,6 +763,12 @@ class FutureStore:
         self._snapshot_hydrate_min_interval_s = float(
             os.environ.get("MINT_FUTURE_STORE_SNAPSHOT_HYDRATE_MIN_INTERVAL_S", "30.0")
         )
+        from ..ray_utils import register_ray_reconnect_invalidator
+
+        register_ray_reconnect_invalidator(self._reset_ray_actor)
+
+    def _reset_ray_actor(self) -> None:
+        self._ray_actor = None
 
     @staticmethod
     def _snapshot_op(meta: dict[str, Any] | None) -> str:
@@ -1008,13 +1014,20 @@ class FutureStore:
         except Exception as e:
             raise FutureStoreUnavailableError("Ray import failed") from e
 
+        try:
+            from ..ray_utils import init_ray
+
+            init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
+        except Exception as e:
+            raise FutureStoreUnavailableError("Ray not initialized (init_ray failed)") from e
         if not ray.is_initialized():
             raise FutureStoreUnavailableError("Ray not initialized")
 
         if self._ray_actor is None:
-            raise FutureStoreUnavailableError(
-                "Detached Ray FutureStore actor is not ready on this API server"
-            )
+            try:
+                self._ray_actor = _get_or_create_ray_actor()
+            except Exception as e:
+                raise FutureStoreUnavailableError("Detached Ray FutureStore actor is not ready on this API server") from e
         return self._ray_actor
 
     def ensure_started(self) -> None:
@@ -1101,14 +1114,12 @@ class FutureStore:
         except Exception as e:
             raise FutureStoreUnavailableError("Ray import failed") from e
 
-        if not ray.is_initialized():
-            try:
-                from ..ray_utils import init_ray
+        try:
+            from ..ray_utils import init_ray
 
-                init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
-            except Exception as e:
-                raise FutureStoreUnavailableError("Ray not initialized (init_ray failed)") from e
-
+            init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
+        except Exception as e:
+            raise FutureStoreUnavailableError("Ray not initialized (init_ray failed)") from e
         if not ray.is_initialized():
             raise FutureStoreUnavailableError("Ray not initialized")
 
@@ -1134,14 +1145,12 @@ class FutureStore:
         except Exception as e:
             raise FutureStoreUnavailableError("Ray import failed") from e
 
-        if not ray.is_initialized():
-            try:
-                from ..ray_utils import init_ray
+        try:
+            from ..ray_utils import init_ray
 
-                init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
-            except Exception as e:
-                raise FutureStoreUnavailableError("Ray not initialized (init_ray failed)") from e
-
+            init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
+        except Exception as e:
+            raise FutureStoreUnavailableError("Ray not initialized (init_ray failed)") from e
         if not ray.is_initialized():
             raise FutureStoreUnavailableError("Ray not initialized")
 

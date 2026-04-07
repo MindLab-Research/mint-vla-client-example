@@ -38,7 +38,7 @@ from .logging_context import (
     record_http_server_metrics,
     set_trace_id,
 )
-from .ray_utils import init_ray
+from .ray_utils import init_ray, ray_address_source_configured, ray_connection_epoch, ray_reconnect_poll_s
 from .routes import futures, internal, mint, openai_compat, sampling, service, training, weights
 from .server_info import _git_sha
 from .token_encryptor import TokenEncryptor
@@ -559,7 +559,7 @@ async def lifespan(app: FastAPI):
     from .backend.training_session_store import ensure_ready as ensure_training_session_store_ready
     from .config import RAY_NAMESPACE
 
-    if os.environ.get("RAY_ADDRESS") or os.environ.get("RAY_CLIENT_ADDRESS") or os.environ.get("MINT_RAY_CLIENT_ADDRESS"):
+    if ray_address_source_configured():
         init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
 
     startup_lease = await acquire_startup_lease(_STARTUP_LEASE_ROLE)
@@ -670,6 +670,8 @@ async def lifespan(app: FastAPI):
             await asyncio.sleep(5.0)
 
     owner_runtime_health_task = asyncio.create_task(_owner_runtime_health_loop())
+    ray_reconnect_watch_task: asyncio.Task | None = None
+    last_ray_connection_epoch = ray_connection_epoch()
 
     inference_manager = None
     train_manager = None
@@ -747,9 +749,41 @@ async def lifespan(app: FastAPI):
         await api_work_queue.async_ensure_started()
         await queue_execution_runtime.async_ensure_started(num_workers=int(config.api_work_queue_num_workers))
 
+        async def _ray_reconnect_watch_loop() -> None:
+            nonlocal last_ray_connection_epoch
+            poll_s = ray_reconnect_poll_s()
+            while True:
+                await asyncio.sleep(poll_s)
+                try:
+                    init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
+                    current_epoch = ray_connection_epoch()
+                    if current_epoch == last_ray_connection_epoch:
+                        continue
+                    last_ray_connection_epoch = current_epoch
+                    logger.warning(
+                        "Ray connection epoch advanced to %s; refreshing detached control-plane handles",
+                        current_epoch,
+                    )
+                    await future_store.async_ensure_started()
+                    ensure_gateway_session_store_ready()
+                    ensure_sampling_session_store_ready()
+                    session_heartbeat_store.ensure_ready()
+                    ensure_session_index_store_ready()
+                    ensure_training_session_store_ready()
+                    await capacity_manager.async_ensure_ready()
+                    await api_work_queue.async_ensure_started()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Ray reconnect watch failed")
+
+        if ray_address_source_configured():
+            ray_reconnect_watch_task = asyncio.create_task(_ray_reconnect_watch_loop())
+
         stale_training_heartbeat_task = None
 
     except Exception:
+        await _cancel_task(ray_reconnect_watch_task)
         await _cancel_task(startup_lease_task)
         await startup_lease.release()
         if train_manager is not None:
@@ -765,6 +799,7 @@ async def lifespan(app: FastAPI):
     # ==========================================================================
     # Shutdown
     # ==========================================================================
+    await _cancel_task(ray_reconnect_watch_task)
     await _cancel_task(owner_runtime_health_task)
     await _cancel_task(stale_training_heartbeat_task)
     await _cancel_task(startup_lease_task)

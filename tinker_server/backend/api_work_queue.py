@@ -1366,6 +1366,12 @@ class ApiWorkQueueClient:
         self._snapshot_hydrate_min_interval_s = float(
             os.environ.get("MINT_API_WORK_QUEUE_SNAPSHOT_HYDRATE_MIN_INTERVAL_S", "30.0")
         )
+        from ..ray_utils import register_ray_reconnect_invalidator
+
+        register_ray_reconnect_invalidator(self._reset_ray_actor)
+
+    def _reset_ray_actor(self) -> None:
+        self._ray_actor = None
 
     @staticmethod
     def _trim_unready_scheduler_metrics(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -1473,14 +1479,12 @@ class ApiWorkQueueClient:
         except Exception as e:
             raise ApiWorkQueueUnavailableError("Ray import failed") from e
 
-        if not ray.is_initialized():
-            try:
-                from ..ray_utils import init_ray
+        try:
+            from ..ray_utils import init_ray
 
-                init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
-            except Exception as e:
-                raise ApiWorkQueueUnavailableError("Ray not initialized (init_ray failed)") from e
-
+            init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
+        except Exception as e:
+            raise ApiWorkQueueUnavailableError("Ray not initialized (init_ray failed)") from e
         if not ray.is_initialized():
             raise ApiWorkQueueUnavailableError("Ray not initialized")
 
@@ -1661,20 +1665,7 @@ class ApiWorkQueueClient:
             }
 
     def _get_cached_ray_actor_for_async_request_path(self):
-        try:
-            import ray
-        except Exception as e:
-            raise ApiWorkQueueUnavailableError("Ray import failed") from e
-
-        if not ray.is_initialized():
-            raise ApiWorkQueueUnavailableError("Ray not initialized")
-
-        actor = self._ray_actor
-        if actor is None:
-            raise ApiWorkQueueUnavailableError(
-                "Detached Ray ApiWorkQueue actor is not ready on this API server"
-            )
-        return actor
+        return self._get_ray_actor(require_ready=False)
 
     async def _get_ray_actor_async(self, *, require_ready: bool = True):
         try:
@@ -1682,14 +1673,12 @@ class ApiWorkQueueClient:
         except Exception as e:
             raise ApiWorkQueueUnavailableError("Ray import failed") from e
 
-        if not ray.is_initialized():
-            try:
-                from ..ray_utils import init_ray
+        try:
+            from ..ray_utils import init_ray
 
-                init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
-            except Exception as e:
-                raise ApiWorkQueueUnavailableError("Ray not initialized (init_ray failed)") from e
-
+            init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
+        except Exception as e:
+            raise ApiWorkQueueUnavailableError("Ray not initialized (init_ray failed)") from e
         if not ray.is_initialized():
             raise ApiWorkQueueUnavailableError("Ray not initialized")
 

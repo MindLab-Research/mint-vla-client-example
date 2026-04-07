@@ -242,6 +242,9 @@ class CapacityManager:
     def __init__(self) -> None:
         self._ray_actor = None
         self._ray_actor_lock = threading.Lock()
+        from ..ray_utils import register_ray_reconnect_invalidator
+
+        register_ray_reconnect_invalidator(self._reset_ray_actor)
 
     def _reset_ray_actor(self, actor: Any | None = None) -> None:
         with self._ray_actor_lock:
@@ -254,14 +257,26 @@ class CapacityManager:
         except Exception as e:
             raise CapacityManagerUnavailableError("Ray import failed") from e
 
+        try:
+            from ..ray_utils import init_ray
+
+            init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
+        except Exception as e:
+            raise CapacityManagerUnavailableError("Ray not initialized (init_ray failed)") from e
         if not ray.is_initialized():
             raise CapacityManagerUnavailableError("Ray not initialized")
 
         actor = self._ray_actor
         if actor is None:
-            raise CapacityManagerUnavailableError(
-                "Detached Ray CapacityManager actor is not ready on this API server"
-            )
+            with self._ray_actor_lock:
+                if self._ray_actor is None:
+                    try:
+                        self._ray_actor = _get_or_create_ray_actor()
+                    except Exception as e:
+                        raise CapacityManagerUnavailableError(
+                            "Failed to get/create detached Ray CapacityManager actor"
+                        ) from e
+                actor = self._ray_actor
         return actor
 
     async def _get_ray_actor_async(self):
@@ -270,14 +285,12 @@ class CapacityManager:
         except Exception as e:
             raise CapacityManagerUnavailableError("Ray import failed") from e
 
-        if not ray.is_initialized():
-            try:
-                from ..ray_utils import init_ray
+        try:
+            from ..ray_utils import init_ray
 
-                init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
-            except Exception as e:
-                raise CapacityManagerUnavailableError("Ray not initialized (init_ray failed)") from e
-
+            init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
+        except Exception as e:
+            raise CapacityManagerUnavailableError("Ray not initialized (init_ray failed)") from e
         if not ray.is_initialized():
             raise CapacityManagerUnavailableError("Ray not initialized")
 

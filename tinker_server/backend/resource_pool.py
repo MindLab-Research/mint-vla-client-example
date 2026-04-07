@@ -562,6 +562,13 @@ async def _await_ray_ref(ref: Any) -> Any:
 
 _RESOURCE_POOL_ACTOR_HANDLE = None
 
+def _reset_cached_actor_handle() -> None:
+    global _RESOURCE_POOL_ACTOR_HANDLE
+    _RESOURCE_POOL_ACTOR_HANDLE = None
+
+from ..ray_utils import register_ray_reconnect_invalidator as _register_ray_reconnect_invalidator
+_register_ray_reconnect_invalidator(_reset_cached_actor_handle)
+
 
 def _get_or_create_actor_sync() -> Any:
     global _RESOURCE_POOL_ACTOR_HANDLE

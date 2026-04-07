@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+from pathlib import Path
 import sys
 import types
 from types import SimpleNamespace
@@ -406,6 +407,39 @@ def test_lifespan_follower_skips_leader_only_startup(monkeypatch) -> None:
     assert app_module.service.session_manager is None
     assert queue_execution_runtime.ensure_started_calls == [1]
     assert len(init_ray_calls) == 0
+
+
+def test_lifespan_init_ray_when_head_address_path_configured(monkeypatch, tmp_path: Path) -> None:
+    queue = _StubApiWorkQueue()
+    owner_runtime = _StubOwnerRuntimeSupervisor()
+    queue_execution_runtime = _StubQueueExecutionRuntime()
+    init_ray_calls = _StubInitRayCalls()
+    _install_lifespan_stubs(monkeypatch, queue, owner_runtime, queue_execution_runtime, init_ray_calls)
+
+    lease = _StubStartupLease(is_owner=False)
+    head_address = tmp_path / "ray-head.txt"
+    head_address.write_text("192.168.90.10\n", encoding="utf-8")
+    monkeypatch.setenv("MINT_RAY_HEAD_ADDRESS_PATH", str(head_address))
+    monkeypatch.delenv("RAY_ADDRESS", raising=False)
+    monkeypatch.delenv("RAY_CLIENT_ADDRESS", raising=False)
+    monkeypatch.delenv("MINT_RAY_CLIENT_ADDRESS", raising=False)
+
+    async def _acquire_startup_lease(*_args, **_kwargs):
+        return lease
+
+    monkeypatch.setattr(
+        "tinker_server.backend.startup_lease.acquire_startup_lease",
+        _acquire_startup_lease,
+    )
+
+    async def _run() -> None:
+        async with app_module.lifespan(app_module.app):
+            return None
+
+    asyncio.run(_run())
+
+    assert len(init_ray_calls) == 1
+    assert init_ray_calls[0]["kwargs"]["namespace"] == "tinker"
 
 
 def test_lifespan_uses_started_probes_for_queue_and_future_store(monkeypatch) -> None:

@@ -19,6 +19,26 @@ def _install_ray_stub(calls: list[dict], monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "ray", ray)
 
 
+def _install_stateful_ray_stub(calls: list[dict], shutdowns: list[str], monkeypatch) -> None:
+    ray = types.ModuleType("ray")
+    ray.__spec__ = importlib.machinery.ModuleSpec("ray", loader=None)
+    state = {"initialized": False}
+
+    def init(**kwargs):
+        calls.append(dict(kwargs))
+        state["initialized"] = True
+        return {"ok": True}
+
+    def shutdown():
+        shutdowns.append("shutdown")
+        state["initialized"] = False
+
+    ray.init = init  # type: ignore[attr-defined]
+    ray.shutdown = shutdown  # type: ignore[attr-defined]
+    ray.is_initialized = lambda: bool(state["initialized"])  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "ray", ray)
+
+
 def test_issue_94_init_ray_injects_log_to_driver(monkeypatch) -> None:
     calls: list[dict] = []
     _install_ray_stub(calls, monkeypatch)
@@ -77,6 +97,53 @@ def test_issue_94_init_ray_prefers_client_address(monkeypatch, tmp_path: Path) -
 
     assert calls[-1]["address"] == "ray://192.168.39.23:10002"
     assert calls[-1]["runtime_env"] == {"working_dir": str(tmp_path)}
+
+
+def test_issue_94_init_ray_prefers_configured_head_address_path(monkeypatch, tmp_path: Path) -> None:
+    calls: list[dict] = []
+    _install_ray_stub(calls, monkeypatch)
+
+    from tinker_server.ray_utils import init_ray
+
+    head_address = tmp_path / "ray-head.txt"
+    head_address.write_text("192.168.50.10\n", encoding="utf-8")
+    monkeypatch.setenv("MINT_RAY_HEAD_ADDRESS_PATH", str(head_address))
+    monkeypatch.setenv("RAY_ADDRESS", "192.168.39.23:6379")
+
+    init_ray(namespace="ns", ignore_reinit_error=True)
+
+    assert calls[-1]["address"] == "192.168.50.10:6379"
+
+
+def test_issue_94_init_ray_reconnects_when_head_address_path_changes(monkeypatch, tmp_path: Path) -> None:
+    calls: list[dict] = []
+    shutdowns: list[str] = []
+    _install_stateful_ray_stub(calls, shutdowns, monkeypatch)
+
+    import importlib
+
+    ray_utils = importlib.import_module("tinker_server.ray_utils")
+    importlib.reload(ray_utils)
+    monkeypatch.setattr(ray_utils, "_RAY_RECONNECT_INVALIDATORS", [])
+
+    resets: list[str] = []
+    ray_utils.register_ray_reconnect_invalidator(lambda: resets.append("reset"))
+
+    head_address = tmp_path / "ray-head.txt"
+    head_address.write_text("192.168.60.10\n", encoding="utf-8")
+    monkeypatch.setenv("MINT_RAY_HEAD_ADDRESS_PATH", str(head_address))
+
+    ray_utils.init_ray(namespace="ns", ignore_reinit_error=True)
+    head_address.write_text("192.168.60.11\n", encoding="utf-8")
+    ray_utils.init_ray(namespace="ns", ignore_reinit_error=True)
+
+    assert [call["address"] for call in calls] == [
+        "192.168.60.10:6379",
+        "192.168.60.11:6379",
+    ]
+    assert shutdowns == ["shutdown"]
+    assert resets == ["reset"]
+
 
 def test_issue_94_client_job_runtime_env_uses_working_dir(monkeypatch, tmp_path: Path) -> None:
     from tinker_server.ray_utils import client_job_runtime_env
