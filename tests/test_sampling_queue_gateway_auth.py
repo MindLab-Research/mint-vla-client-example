@@ -12,6 +12,9 @@ class _StubFutureStore:
     def ensure_ready(self, **_kwargs) -> None:
         return None
 
+    async def async_ensure_started(self) -> None:
+        return None
+
 
 class _StubCapacityManager:
     def ensure_ready(self) -> None:
@@ -88,6 +91,9 @@ class _StubApiWorkQueue:
         self._executors: dict[str, object] = {}
 
     def ensure_ready(self) -> None:
+        return None
+
+    async def async_ensure_started(self) -> None:
         return None
 
     async def async_ensure_ready(self, *, timeout_s: float = 10.0):

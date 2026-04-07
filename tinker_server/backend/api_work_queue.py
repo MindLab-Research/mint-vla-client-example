@@ -112,7 +112,7 @@ class _ExecutionSerialState:
 
 
 
-def _create_ray_actor():
+def _create_ray_actor(*, require_ready: bool = True):
     import ray
 
     actor_name = _ray_api_work_queue_actor_name()
@@ -1266,6 +1266,8 @@ def _create_ray_actor():
     created = _RayApiWorkQueueActor.options(  # type: ignore[attr-defined]
         **options
     ).remote()
+    if not require_ready:
+        return created
     try:
         ray.get(created.stats.remote(), timeout=1.0)
         return created
@@ -1451,7 +1453,7 @@ class ApiWorkQueueClient:
                     self._snapshot_drop_record(rec)
             self._snapshot_dequeued += 1
 
-    def _get_ray_actor(self):
+    def _get_ray_actor(self, *, require_ready: bool = True):
         try:
             import ray
         except Exception as e:
@@ -1477,6 +1479,8 @@ class ApiWorkQueueClient:
 
         actor = self._ray_actor
         if actor is not None:
+            if not require_ready:
+                return actor
             try:
                 ray.get(actor.stats.remote(), timeout=1.0)
                 return actor
@@ -1486,6 +1490,9 @@ class ApiWorkQueueClient:
         actor = None
         try:
             actor = ray.get_actor(actor_name, namespace=_ray_namespace())
+            if not require_ready:
+                self._ray_actor = actor
+                return actor
             ray.get(actor.stats.remote(), timeout=probe_timeout_s)
             self._ray_actor = actor
             return actor
@@ -1528,7 +1535,7 @@ class ApiWorkQueueClient:
             )
 
         try:
-            self._ray_actor = _create_ray_actor()
+            self._ray_actor = _create_ray_actor(require_ready=require_ready)
         except Exception as e:
             raise ApiWorkQueueUnavailableError("Failed to get/create detached Ray ApiWorkQueue actor") from e
         return self._ray_actor
@@ -1627,7 +1634,6 @@ class ApiWorkQueueClient:
             return {
                 "depth": depth,
                 "depth_legacy": depth,
-                "depth_scheduled": 0,
                 "enqueued": int(self._snapshot_enqueued),
                 "dequeued": int(self._snapshot_dequeued),
                 "by_executor": dict(self._snapshot_by_executor),
@@ -1637,12 +1643,7 @@ class ApiWorkQueueClient:
                     "oldest_queued_s": max(ages) if ages else 0.0,
                     "avg_queued_s": (sum(ages) / len(ages)) if ages else 0.0,
                 },
-                "scheduler_enabled": False,
-                "scheduler_picks_total": 0,
-                "scheduler_switches_total": 0,
-                "scheduler_starvation_picks_total": 0,
-                "scheduler_wait_s_sum": 0.0,
-                "scheduler_domains_total": 0,
+                "scheduler_metrics_ready": False,
             }
 
     def _get_cached_ray_actor_for_async_request_path(self):
@@ -1661,7 +1662,7 @@ class ApiWorkQueueClient:
             )
         return actor
 
-    async def _get_ray_actor_async(self):
+    async def _get_ray_actor_async(self, *, require_ready: bool = True):
         try:
             import ray
         except Exception as e:
@@ -1679,6 +1680,8 @@ class ApiWorkQueueClient:
             raise ApiWorkQueueUnavailableError("Ray not initialized")
 
         if self._ray_actor is not None:
+            if not require_ready:
+                return self._ray_actor
             try:
                 await self._await_ray_ref(self._ray_actor.stats.remote(), timeout_s=1.0)
                 return self._ray_actor
@@ -1695,6 +1698,9 @@ class ApiWorkQueueClient:
         actor = None
         try:
             actor = ray.get_actor(actor_name, namespace=_ray_namespace())
+            if not require_ready:
+                self._ray_actor = actor
+                return actor
             await self._await_ray_ref(actor.stats.remote(), timeout_s=probe_timeout_s)
             self._ray_actor = actor
             return actor
@@ -1737,7 +1743,7 @@ class ApiWorkQueueClient:
             )
 
         try:
-            self._ray_actor = _create_ray_actor()
+            self._ray_actor = _create_ray_actor(require_ready=require_ready)
         except Exception as e:
             raise ApiWorkQueueUnavailableError("Failed to get/create detached Ray ApiWorkQueue actor") from e
         return self._ray_actor
@@ -1766,8 +1772,11 @@ class ApiWorkQueueClient:
 
             raise ray.exceptions.GetTimeoutError(f"timed out after {float(timeout_s):.3f}s") from e
 
+    async def async_ensure_started(self) -> None:
+        await self._get_ray_actor_async(require_ready=False)
+
     async def async_ensure_ready(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
-        actor = await self._get_ray_actor_async()
+        actor = await self._get_ray_actor_async(require_ready=False)
         import ray
 
         try:
@@ -2255,15 +2264,16 @@ class ApiWorkQueueClient:
                 await asyncio.sleep(hydrate_retry_delay_s)
 
         if not hydrated:
-            self._running = False
-            self._consumer_job_id = None
-            self._consumer_generation_id = None
             if hydrate_error is not None:
-                raise RuntimeError(
-                    "ApiWorkQueue metrics baseline hydration failed at startup: "
-                    f"{type(hydrate_error).__name__}: {hydrate_error}"
-                ) from hydrate_error
-            raise RuntimeError("ApiWorkQueue metrics baseline hydration failed at startup")
+                logger.warning(
+                    "[api_work_queue] metrics snapshot hydration unavailable at startup; continuing without scheduler metrics: %s: %s",
+                    type(hydrate_error).__name__,
+                    hydrate_error,
+                )
+            else:
+                logger.warning(
+                    "[api_work_queue] metrics snapshot hydration unavailable at startup; continuing without scheduler metrics"
+                )
 
         self._clear_execution_ready()
         self._running = True

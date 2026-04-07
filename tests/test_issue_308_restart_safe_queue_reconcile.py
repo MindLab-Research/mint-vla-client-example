@@ -1,8 +1,6 @@
 import anyio
 import importlib
 
-import pytest
-
 from tinker_server.backend import api_work_queue as queue_mod
 from tinker_server.backend import capacity_manager as capacity_manager_mod
 
@@ -135,7 +133,7 @@ def test_reconcile_stale_running_requests(monkeypatch):
     assert capacity_manager.released == ["rid-a", "rid-b"]
 
 
-def test_start_workers_fails_when_snapshot_hydration_baseline_missing(monkeypatch):
+def test_start_workers_continues_when_snapshot_hydration_baseline_missing(monkeypatch):
     client = queue_mod.ApiWorkQueueClient()
     actor = _StubActor()
     future_store = _StubFutureStore([])
@@ -157,10 +155,16 @@ def test_start_workers_fails_when_snapshot_hydration_baseline_missing(monkeypatc
 
     monkeypatch.setattr(client, "hydrate_metrics_snapshot", _always_fail_hydrate)
 
+    async def _noop_queue_supervisor_loop():
+        return None
+
+    monkeypatch.setattr(client, "_queue_supervisor_loop", _noop_queue_supervisor_loop)
+
     async def _run():
-        with pytest.raises(RuntimeError, match="metrics baseline hydration failed"):
-            await client.start_workers(num_workers=1)
+        await client.start_workers(num_workers=1)
+        await client.shutdown()
 
     anyio.run(_run)
 
     assert attempts["count"] == 3
+    assert client._consumer_job_id is None

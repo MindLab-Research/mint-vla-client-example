@@ -231,8 +231,8 @@ def _get_or_create_actor():
                         self._runtime_initialized = True
                     await self._ensure_observability_flush_task()
                     await capacity_manager.async_ensure_ready()
-                    await future_store.async_ensure_ready()
-                    await api_work_queue.async_ensure_ready()
+                    await future_store.async_ensure_started()
+                    await api_work_queue.async_ensure_started()
                     register_api_work_queue_executors(api_work_queue)
                     self._desired_workers = max(1, int(num_workers))
                     await api_work_queue.start_workers(num_workers=self._desired_workers)

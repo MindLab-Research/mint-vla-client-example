@@ -1023,6 +1023,9 @@ class FutureStore:
             )
         return self._ray_actor
 
+    def ensure_started(self) -> None:
+        self._get_ray_actor(require_ready=False)
+
     def ensure_ready(self, *, timeout_s: float = 10.0, require_hydrated_baseline: bool = False) -> dict[str, Any]:
         actor = self._get_ray_actor()
         import ray
@@ -1070,9 +1073,12 @@ class FutureStore:
         self._snapshot_ensure_pending(str(request_id), meta=payload if payload is not None else out.get("meta"), has_ref=False)
         return out
 
+    async def async_ensure_started(self) -> None:
+        await self._get_ray_actor_async(require_ready=False)
+
     async def async_ensure_ready(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
         """Async variant of ensure_ready for request/control-plane paths."""
-        actor = await self._get_ray_actor_async()
+        actor = await self._get_ray_actor_async(require_ready=False)
         import ray
 
         try:
@@ -1095,7 +1101,7 @@ class FutureStore:
             self._ray_actor = None
             raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
         return int(v)
-    async def _get_ray_actor_async(self):
+    async def _get_ray_actor_async(self, *, require_ready: bool = True):
         try:
             import ray
         except Exception as e:
@@ -1114,6 +1120,8 @@ class FutureStore:
 
         actor = self._ray_actor
         if actor is not None:
+            if not require_ready:
+                return actor
             try:
                 await asyncio.wait_for(_await_ray_ref(actor.stats.remote()), timeout=1.0)
                 return actor
@@ -1126,7 +1134,7 @@ class FutureStore:
             raise FutureStoreUnavailableError("Failed to get/create detached Ray FutureStore actor") from e
         return self._ray_actor
 
-    def _get_ray_actor(self):
+    def _get_ray_actor(self, *, require_ready: bool = True):
         try:
             import ray
         except Exception as e:
@@ -1144,6 +1152,8 @@ class FutureStore:
             raise FutureStoreUnavailableError("Ray not initialized")
 
         if self._ray_actor is not None:
+            if not require_ready:
+                return self._ray_actor
             return self._ray_actor
 
         try:

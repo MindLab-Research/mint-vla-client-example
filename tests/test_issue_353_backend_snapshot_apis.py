@@ -39,6 +39,9 @@ def test_api_work_queue_metrics_snapshot_tracks_local_state() -> None:
     assert snap["by_throttle_principal"] == {"user:a": 1}
     assert snap["by_apikey_id"] == {"key-a": 1}
     assert snap["age_stats"]["oldest_queued_s"] >= snap["age_stats"]["avg_queued_s"]
+    assert snap["scheduler_metrics_ready"] is False
+    assert "depth_scheduled" not in snap
+    assert "scheduler_enabled" not in snap
 
     q._snapshot_on_dequeue({"request_id": "req-2"})
     snap2 = q.metrics_snapshot()
@@ -393,7 +396,22 @@ def test_future_store_ensure_ready_fails_when_hydration_baseline_required(monkey
     assert attempts["count"] == 3
 
 
-def test_api_work_queue_start_workers_fails_when_hydration_baseline_missing(monkeypatch) -> None:
+def test_future_store_ensure_started_skips_ready_probe(monkeypatch) -> None:
+    fs = FutureStore()
+    calls: list[bool] = []
+
+    def _fake_get_ray_actor(*, require_ready: bool = True):
+        calls.append(bool(require_ready))
+        return object()
+
+    monkeypatch.setattr(fs, "_get_ray_actor", _fake_get_ray_actor)
+
+    fs.ensure_started()
+
+    assert calls == [False]
+
+
+def test_api_work_queue_start_workers_continues_when_hydration_baseline_missing(monkeypatch) -> None:
     class _StubRuntimeContext:
         def get_job_id(self):
             return "job-1"
@@ -433,15 +451,19 @@ def test_api_work_queue_start_workers_fails_when_hydration_baseline_missing(monk
 
     monkeypatch.setattr(q, "hydrate_metrics_snapshot", _always_fail_hydrate)
 
-    try:
-        asyncio.run(q.start_workers(num_workers=1))
-        assert False, "expected start_workers to fail when hydration baseline is missing"
-    except RuntimeError as e:
-        assert "metrics baseline hydration failed" in str(e)
+    async def _noop_queue_supervisor_loop():
+        return None
+
+    q._queue_supervisor_loop = _noop_queue_supervisor_loop  # type: ignore[method-assign]
+
+    asyncio.run(q.start_workers(num_workers=1))
 
     assert attempts["count"] == 3
-    assert q._running is False
+    assert q._running is True
     assert q._consumer_job_id is None
+    assert q._consumer_generation_id is None
+
+    asyncio.run(q.shutdown())
 
 
 def test_resource_pool_cached_snapshot_exposes_rss_cache_state() -> None:
