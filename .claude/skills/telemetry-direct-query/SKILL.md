@@ -54,7 +54,8 @@ python .claude/skills/telemetry-direct-query/victoria_query.py --help
 ## Primary path: Python helper
 
 Use `.claude/skills/telemetry-direct-query/victoria_query.py` first.
-It is stdlib-only and wraps the documented Victoria APIs directly.
+It is stdlib-only, wraps the documented Victoria APIs directly, and normalizes
+VictoriaLogs newline-delimited JSON into one JSON array.
 
 Common commands:
 

@@ -9,6 +9,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from json import JSONDecodeError
 from typing import Any
 
 DEFAULTS = {
@@ -82,30 +83,43 @@ class VictoriaClient:
     timeout: float = 15.0
     verbose: bool = False
 
-    def get_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
+    def _build_url(self, path: str, params: dict[str, Any] | None = None) -> str:
         qs = urllib.parse.urlencode(
             {k: v for k, v in (params or {}).items() if v is not None}, doseq=True
         )
         url = f"{self.base_url}{path}"
         if qs:
             url = f"{url}?{qs}"
+        return url
+
+    def get_text(self, path: str, params: dict[str, Any] | None = None) -> str:
+        url = self._build_url(path, params)
         if self.verbose:
             print(url, file=sys.stderr)
         req = urllib.request.Request(
             url,
             headers={
-                "Accept": "application/json",
+                "Accept": "application/json,text/plain;q=0.9,*/*;q=0.8",
                 "User-Agent": "mint-telemetry-direct-query/1",
             },
         )
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                return json.load(resp)
+                return resp.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"HTTP {exc.code} for {url}\n{body}") from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"request failed for {url}: {exc.reason}") from exc
+
+    def get_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        body = self.get_text(path, params)
+        try:
+            return json.loads(body)
+        except JSONDecodeError as exc:
+            raise RuntimeError(
+                f"non-JSON response from {self._build_url(path, params)}: {exc.msg}"
+            ) from exc
 
 
 def dump_json(data: Any, compact: bool) -> None:
@@ -114,6 +128,19 @@ def dump_json(data: Any, compact: bool) -> None:
     else:
         json.dump(data, sys.stdout, indent=2, sort_keys=True)
     sys.stdout.write("\n")
+
+
+def parse_json_lines(body: str) -> list[Any]:
+    rows: list[Any] = []
+    for i, line in enumerate(body.splitlines(), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except JSONDecodeError as exc:
+            raise RuntimeError(f"invalid JSON line {i}: {exc.msg}") from exc
+    return rows
 
 
 def build_client(args: argparse.Namespace) -> VictoriaClient:
@@ -128,11 +155,12 @@ def add_common_flags(parser: argparse.ArgumentParser, kind: str) -> None:
 
 
 def cmd_logs(args: argparse.Namespace) -> int:
-    data = build_client(args).get_json(
+    client = build_client(args)
+    body = client.get_text(
         "/select/logsql/query",
         {"query": args.query, "limit": args.limit},
     )
-    dump_json(data, args.compact)
+    dump_json(parse_json_lines(body), args.compact)
     return 0
 
 
@@ -257,7 +285,7 @@ def main() -> int:
     args = parser.parse_args()
     try:
         return args.func(args)
-    except (RuntimeError, argparse.ArgumentTypeError) as exc:
+    except (RuntimeError, argparse.ArgumentTypeError, JSONDecodeError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
 
