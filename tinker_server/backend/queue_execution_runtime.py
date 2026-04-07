@@ -42,6 +42,7 @@ def _runtime_env_overrides() -> dict[str, str]:
         "MINT_MEGATRON_NODE_IPS_CSV",
         "MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID",
         "MINT_SUPPORTED_MODELS",
+        "MINT_RUNTIME_OBSERVABILITY_FLUSH_S",
     )
     for key in direct_keys:
         value = os.environ.get(key, "").strip()
@@ -195,7 +196,27 @@ def _get_or_create_actor():
             self._desired_workers = 0
             self._last_error = None
             self._last_started_at = None
+            self._observability_flush_task: asyncio.Task | None = None
+            self._observability_flush_interval_s = max(
+                5.0,
+                float(os.environ.get("MINT_RUNTIME_OBSERVABILITY_FLUSH_S", "15.0")),
+            )
             self._lock = asyncio.Lock()
+
+        async def _ensure_observability_flush_task(self) -> None:
+            if self._observability_flush_task is not None and not self._observability_flush_task.done():
+                return
+            self._observability_flush_task = asyncio.create_task(self._observability_flush_loop())
+
+        async def _observability_flush_loop(self) -> None:
+            from .runtime_observability import runtime_observability
+
+            while True:
+                try:
+                    runtime_observability.flush_otel()
+                except Exception as e:
+                    logger.debug("queue_execution_runtime observability flush failed: %s", e)
+                await asyncio.sleep(self._observability_flush_interval_s)
 
         async def ensure_started(self, *, num_workers: int) -> dict[str, Any]:
             from .api_work_queue import api_work_queue
@@ -208,9 +229,10 @@ def _get_or_create_actor():
                     if not self._runtime_initialized:
                         await _initialize_execution_bindings()
                         self._runtime_initialized = True
+                    await self._ensure_observability_flush_task()
                     await capacity_manager.async_ensure_ready()
-                    await future_store.async_ensure_ready()
-                    await api_work_queue.async_ensure_ready()
+                    await future_store.async_ensure_started()
+                    await api_work_queue.async_ensure_started()
                     register_api_work_queue_executors(api_work_queue)
                     self._desired_workers = max(1, int(num_workers))
                     await api_work_queue.start_workers(num_workers=self._desired_workers)
@@ -234,7 +256,29 @@ def _get_or_create_actor():
             return await training.training_engine.get_tokenizer_info(session)
 
         async def health_snapshot(self) -> dict[str, Any]:
+            from ..routes import service, training
             from .api_work_queue import api_work_queue
+            from .runtime_observability import runtime_observability
+
+            sampling_sessions = None
+            manager = getattr(service, "session_manager", None)
+            if manager is not None:
+                snapshot = getattr(manager, "observability_snapshot", None)
+                if callable(snapshot):
+                    try:
+                        sampling_sessions = snapshot()
+                    except Exception as e:
+                        sampling_sessions = {"error": f"{type(e).__name__}: {e}"}
+
+            training_sessions = None
+            train_manager = getattr(training, "training_manager", None)
+            if train_manager is not None:
+                snapshot = getattr(train_manager, "observability_snapshot", None)
+                if callable(snapshot):
+                    try:
+                        training_sessions = snapshot()
+                    except Exception as e:
+                        training_sessions = {"error": f"{type(e).__name__}: {e}"}
 
             return {
                 "actor_name": _actor_name(),
@@ -253,6 +297,9 @@ def _get_or_create_actor():
                 "execution_ready_generation_id": getattr(api_work_queue, "_execution_ready_generation_id", None),
                 "execution_ready_at": getattr(api_work_queue, "_execution_ready_at", None),
                 "local_worker_tasks": len([t for t in getattr(api_work_queue, "_worker_tasks", []) if not t.done()]),
+                "sampling_sessions": sampling_sessions,
+                "training_sessions": training_sessions,
+                "runtime_observability": runtime_observability.snapshot(),
             }
 
     options: dict[str, Any] = {

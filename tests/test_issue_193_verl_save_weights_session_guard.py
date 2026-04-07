@@ -2335,9 +2335,15 @@ def test_issue_193_megatron_create_training_session_marks_ready_without_waiting(
         "tinker_server.backend.model_registry.get_training_parallelism",
         lambda _model: (1, 1, 1, 1, 1),
     )
+    create_kwargs: dict[str, object] = {}
+
+    async def fake_get_or_create_megatron_worker_group(**kwargs):
+        create_kwargs.update(kwargs)
+        return worker
+
     monkeypatch.setattr(
         "tinker_server.backend.megatron_distributed.async_get_or_create_megatron_worker_group",
-        lambda **kwargs: asyncio.sleep(0, result=worker),
+        fake_get_or_create_megatron_worker_group,
     )
     monkeypatch.setattr(
         "tinker_server.backend.resource_pool.get_resource_pool",
@@ -2363,6 +2369,8 @@ def test_issue_193_megatron_create_training_session_marks_ready_without_waiting(
     asyncio.run(_run())
 
     assert keepalive_calls == []
+    assert create_kwargs["base_model"] == "/resolved/Qwen/Qwen3-30B-A3B-Instruct-2507"
+    assert create_kwargs["observability_base_model"] == "Qwen/Qwen3-30B-A3B-Instruct-2507"
     assert engine._workers[model_id] is worker
     assert session.backend == "megatron"
     assert session.is_active is True

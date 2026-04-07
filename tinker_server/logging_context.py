@@ -65,6 +65,17 @@ _HTTP_DURATION_HISTOGRAM: Any | None = None
 _HTTP_ERROR_COUNTER: Any | None = None
 _SAMPLING_ADMISSION_COUNTER: Any | None = None
 _FUTURE_STORE_TIMEOUT_COUNTER: Any | None = None
+_VLLM_ACTOR_REQUEST_COUNTER: Any | None = None
+_VLLM_ACTOR_REQUEST_DURATION_HISTOGRAM: Any | None = None
+_TRAINING_OPERATION_COUNTER: Any | None = None
+_TRAINING_OPERATION_DURATION_HISTOGRAM: Any | None = None
+_MEGATRON_SESSION_SWITCH_COUNTER: Any | None = None
+_MEGATRON_SESSION_SWITCH_DURATION_COUNTER: Any | None = None
+_SCHEDULER_DECISION_COUNTER: Any | None = None
+_SCHEDULER_SWITCH_COUNTER: Any | None = None
+_SCHEDULER_QUEUE_WAIT_HISTOGRAM: Any | None = None
+_SCHEDULER_READY_SESSIONS_HISTOGRAM: Any | None = None
+_SCHEDULER_CHOSEN_QUEUE_DEPTH_HISTOGRAM: Any | None = None
 _TRACER: Any | None = None
 _OP_PREFIX_RE = re.compile(r"^\[([A-Za-z0-9_.:-]+)\]")
 _ACTOR_OBS_INITIALIZED = False
@@ -552,7 +563,12 @@ def _configure_opentelemetry(root_logger: logging.Logger) -> None:
     """Configure OTLP trace/metric/log export (APMPlus or collector)."""
     global _OTEL_ENABLED, _OTEL_INITIALIZED, _OTEL_LOG_HANDLER_ATTACHED
     global _HTTP_REQUEST_COUNTER, _HTTP_DURATION_HISTOGRAM, _HTTP_ERROR_COUNTER
-    global _SAMPLING_ADMISSION_COUNTER, _FUTURE_STORE_TIMEOUT_COUNTER, _TRACER
+    global _SAMPLING_ADMISSION_COUNTER, _FUTURE_STORE_TIMEOUT_COUNTER
+    global _VLLM_ACTOR_REQUEST_COUNTER, _VLLM_ACTOR_REQUEST_DURATION_HISTOGRAM
+    global _TRAINING_OPERATION_COUNTER, _TRAINING_OPERATION_DURATION_HISTOGRAM
+    global _MEGATRON_SESSION_SWITCH_COUNTER, _MEGATRON_SESSION_SWITCH_DURATION_COUNTER
+    global _SCHEDULER_DECISION_COUNTER, _SCHEDULER_SWITCH_COUNTER, _SCHEDULER_QUEUE_WAIT_HISTOGRAM
+    global _SCHEDULER_READY_SESSIONS_HISTOGRAM, _SCHEDULER_CHOSEN_QUEUE_DEPTH_HISTOGRAM, _TRACER
 
     if _OTEL_INITIALIZED:
         return
@@ -633,6 +649,61 @@ def _configure_opentelemetry(root_logger: logging.Logger) -> None:
             "mint_future_store_timeout_events_total",
             unit="{timeout}",
             description="FutureStore queue and execution timeout events observed by mint",
+        )
+        _VLLM_ACTOR_REQUEST_COUNTER = meter.create_counter(
+            "mint_vllm_actor_requests_total",
+            unit="{request}",
+            description="Successful vLLM actor requests observed by mint",
+        )
+        _VLLM_ACTOR_REQUEST_DURATION_HISTOGRAM = meter.create_histogram(
+            "mint_vllm_actor_request_duration_s",
+            unit="s",
+            description="Successful vLLM actor request duration in seconds",
+        )
+        _TRAINING_OPERATION_COUNTER = meter.create_counter(
+            "mint_training_operations_total",
+            unit="{operation}",
+            description="Successful training operations observed by mint",
+        )
+        _TRAINING_OPERATION_DURATION_HISTOGRAM = meter.create_histogram(
+            "mint_training_operation_duration_s",
+            unit="s",
+            description="Successful training operation duration in seconds",
+        )
+        _MEGATRON_SESSION_SWITCH_COUNTER = meter.create_counter(
+            "mint_megatron_session_switch_total",
+            unit="{switch}",
+            description="Megatron session-switch events observed by mint",
+        )
+        _MEGATRON_SESSION_SWITCH_DURATION_COUNTER = meter.create_counter(
+            "mint_megatron_session_switch_duration_s_total",
+            unit="s",
+            description="Megatron session-switch duration totals observed by mint",
+        )
+        _SCHEDULER_DECISION_COUNTER = meter.create_counter(
+            "mint_scheduler_decision_total",
+            unit="{decision}",
+            description="Queue scheduling decisions observed by mint",
+        )
+        _SCHEDULER_SWITCH_COUNTER = meter.create_counter(
+            "mint_scheduler_switch_total",
+            unit="{switch}",
+            description="Queue scheduling session switches observed by mint",
+        )
+        _SCHEDULER_QUEUE_WAIT_HISTOGRAM = meter.create_histogram(
+            "mint_scheduler_queue_wait_s",
+            unit="s",
+            description="Queue wait time from enqueue to dequeue in seconds",
+        )
+        _SCHEDULER_READY_SESSIONS_HISTOGRAM = meter.create_histogram(
+            "mint_scheduler_ready_sessions",
+            unit="{session}",
+            description="Ready session count seen at scheduler decision time",
+        )
+        _SCHEDULER_CHOSEN_QUEUE_DEPTH_HISTOGRAM = meter.create_histogram(
+            "mint_scheduler_chosen_queue_depth",
+            unit="{request}",
+            description="Chosen session queue depth seen at scheduler decision time",
         )
 
         # 3) Logs
@@ -722,6 +793,141 @@ def record_future_store_timeout_metric(*, kind: str, op: str | None = None) -> N
     try:
         if _FUTURE_STORE_TIMEOUT_COUNTER is not None:
             _FUTURE_STORE_TIMEOUT_COUNTER.add(1, attributes=attrs)
+    except Exception:
+        pass
+
+
+def _record_current_span_event(event_name: str, attrs: dict[str, object]) -> None:
+    if not _OTEL_ENABLED:
+        return
+    try:
+        from opentelemetry import trace
+
+        span = trace.get_current_span()
+        span_ctx = span.get_span_context() if span is not None else None
+        if span_ctx is None or not bool(getattr(span_ctx, "is_valid", False)):
+            return
+        span.add_event(str(event_name), attributes=attrs)
+    except Exception:
+        pass
+
+
+def record_vllm_actor_latency_otel(
+    *,
+    actor_name: str | None,
+    base_model: str,
+    op: str,
+    status: str,
+    duration_s: float,
+) -> None:
+    if not _OTEL_ENABLED:
+        return
+    attrs: dict[str, str] = {
+        "actor_name": str(actor_name or "unknown"),
+        "base_model": str(base_model),
+        "op": str(op),
+    }
+    try:
+        if str(status) != "ok":
+            _record_current_span_event(
+                "mint.vllm_actor_request.failure",
+                {**attrs, "status": str(status), "duration_s": float(duration_s)},
+            )
+            return
+        if _VLLM_ACTOR_REQUEST_COUNTER is not None:
+            _VLLM_ACTOR_REQUEST_COUNTER.add(1, attributes=attrs)
+        if _VLLM_ACTOR_REQUEST_DURATION_HISTOGRAM is not None:
+            _VLLM_ACTOR_REQUEST_DURATION_HISTOGRAM.record(float(duration_s), attributes=attrs)
+    except Exception:
+        pass
+
+
+def record_megatron_session_switch_otel(
+    *,
+    base_model: str,
+    session_state: str,
+    count: int,
+    durations_s: dict[str, float],
+) -> None:
+    if not _OTEL_ENABLED:
+        return
+    attrs = {
+        "base_model": str(base_model),
+        "session_state": str(session_state),
+    }
+    try:
+        if _MEGATRON_SESSION_SWITCH_COUNTER is not None and int(count) > 0:
+            _MEGATRON_SESSION_SWITCH_COUNTER.add(int(count), attributes=attrs)
+        if _MEGATRON_SESSION_SWITCH_DURATION_COUNTER is not None:
+            for phase, total_s in durations_s.items():
+                total = max(0.0, float(total_s))
+                if total <= 0.0:
+                    continue
+                _MEGATRON_SESSION_SWITCH_DURATION_COUNTER.add(total, attributes={**attrs, "phase": str(phase)})
+    except Exception:
+        pass
+
+
+def record_scheduler_decision_otel(
+    *,
+    op: str,
+    backend: str,
+    queue_kind: str,
+    reason: str,
+    queue_wait_s: float,
+    switched: bool,
+    ready_sessions: int | None = None,
+    chosen_queue_depth: int | None = None,
+) -> None:
+    if not _OTEL_ENABLED:
+        return
+    attrs = {
+        "op": str(op),
+        "backend": str(backend),
+        "queue_kind": str(queue_kind),
+        "reason": str(reason),
+    }
+    try:
+        if _SCHEDULER_DECISION_COUNTER is not None:
+            _SCHEDULER_DECISION_COUNTER.add(1, attributes=attrs)
+        if bool(switched) and _SCHEDULER_SWITCH_COUNTER is not None:
+            _SCHEDULER_SWITCH_COUNTER.add(1, attributes=attrs)
+        if _SCHEDULER_QUEUE_WAIT_HISTOGRAM is not None:
+            _SCHEDULER_QUEUE_WAIT_HISTOGRAM.record(max(0.0, float(queue_wait_s)), attributes=attrs)
+        if ready_sessions is not None and _SCHEDULER_READY_SESSIONS_HISTOGRAM is not None:
+            _SCHEDULER_READY_SESSIONS_HISTOGRAM.record(max(0, int(ready_sessions)), attributes=attrs)
+        if chosen_queue_depth is not None and _SCHEDULER_CHOSEN_QUEUE_DEPTH_HISTOGRAM is not None:
+            _SCHEDULER_CHOSEN_QUEUE_DEPTH_HISTOGRAM.record(max(0, int(chosen_queue_depth)), attributes=attrs)
+    except Exception:
+        pass
+
+
+def record_training_operation_latency_otel(
+    *,
+    base_model: str,
+    backend: str,
+    op: str,
+    status: str,
+    duration_s: float,
+) -> None:
+    if not _OTEL_ENABLED:
+        return
+    attrs: dict[str, str] = {
+        "base_model": str(base_model),
+        "backend": str(backend),
+        "op": str(op),
+    }
+    try:
+        if str(status) != "ok":
+            _record_current_span_event(
+                "mint.training_operation.failure",
+                {**attrs, "status": str(status), "duration_s": float(duration_s)},
+            )
+            return
+        if _TRAINING_OPERATION_COUNTER is not None:
+            _TRAINING_OPERATION_COUNTER.add(1, attributes=attrs)
+        if _TRAINING_OPERATION_DURATION_HISTOGRAM is not None:
+            _TRAINING_OPERATION_DURATION_HISTOGRAM.record(float(duration_s), attributes=attrs)
     except Exception:
         pass
 

@@ -38,6 +38,7 @@ from . import ray_kill
 from .multinode_resources import compute_multinode_engine_resources
 from .ray_placement_groups import PlacementGroupMismatchError, get_named_placement_group
 from .ray_keepalive import ray_get_with_resource_pool_keepalive
+from .vllm_scheduler_observability import VllmStatsObserver, make_vllm_stats_logger_factory
 from .volc_placement import (
     assert_node_ip_capacity,
     parse_model_node_ip_list,
@@ -631,6 +632,7 @@ def _create_multinode_vllm_actor(
             self._generate_timeout_s = float(os.environ.get("MINT_VLLM_GENERATE_TIMEOUT_S", "0"))
             self._post_generate_delay_s = float(os.environ.get("MINT_VLLM_POST_GENERATE_DELAY_S", "0"))
             self._gate_lock = asyncio.Lock()
+            self._vllm_stats_observer = VllmStatsObserver()
             self._active_generates = 0
             self._active_generates_cond = asyncio.Condition()
             self._is_ready_timeout_s = float(os.environ.get("MINT_VLLM_IS_READY_TIMEOUT_S", "0.05"))
@@ -645,7 +647,6 @@ def _create_multinode_vllm_actor(
             self._admission_control = _env_flag("MINT_VLLM_ADMISSION_CONTROL", default=True)
             self._active_seq_slots = 0
             self._seq_slots_cond = asyncio.Condition()
-
         def get_node_ip(self) -> str:
             return ray.util.get_node_ip_address()
 
@@ -657,6 +658,30 @@ def _create_multinode_vllm_actor(
             rss_pages = int(parts[1])
             page_size = int(os.sysconf("SC_PAGE_SIZE"))
             return rss_pages * page_size
+
+        async def get_observability_binding(self) -> dict[str, object]:
+            import socket
+
+            gpu_indices: list[int] = []
+            try:
+                for gpu_id in ray.get_gpu_ids():
+                    if isinstance(gpu_id, (int, float)):
+                        gpu_indices.append(int(gpu_id))
+                    else:
+                        gpu_indices.append(int(float(str(gpu_id))))
+            except Exception:
+                gpu_indices = []
+            node_id = None
+            try:
+                node_id = str(ray.get_runtime_context().get_node_id())
+            except Exception:
+                node_id = None
+            return {
+                "hostname": socket.gethostname(),
+                "node_id": node_id,
+                "gpu_indices": gpu_indices,
+                **self._vllm_stats_observer.snapshot(),
+            }
 
         def _bind_traceparent(self, traceparent: str | None) -> None:
             if isinstance(traceparent, str) and traceparent:
@@ -952,7 +977,10 @@ def _create_multinode_vllm_actor(
             )
 
             # Create engine - vLLM will spawn Ray workers across nodes
-            self.engine = AsyncLLMEngine.from_engine_args(engine_args)
+            self.engine = AsyncLLMEngine.from_engine_args(
+                engine_args,
+                stat_loggers=[make_vllm_stats_logger_factory(self._vllm_stats_observer)],
+            )
 
             self._initialized = True
             logger.info("MultiNodeVLLMEngine initialized")
@@ -1604,6 +1632,8 @@ def _create_multinode_vllm_actor(
                     "logprobs": log_probs,
                     "stop_reason": stop_reason,
                     "routed_experts": routed_experts,
+                    "_timing_total_s": float(t2 - t0),
+                    "_timing_first_tok_s": float(first_tok_s) if first_tok_s is not None else None,
                 }
                 if outer_request_id == request_id:
                     await self._clear_progress(outer_request_id)
@@ -1703,7 +1733,9 @@ def _create_multinode_vllm_actor(
                         "logprobs": out_log_probs,
                         "stop_reason": out_stop_reason,
                         "routed_experts": out_routed_experts,
-                    }
+                        "_timing_total_s": float(t2 - t0),
+                        "_timing_first_tok_s": float(first_tok_s) if first_tok_s is not None else None,
+                            }
                 )
 
             if non_finite_count:
@@ -2120,7 +2152,11 @@ class MultiNodeInferenceEngine:
             def _attach_existing_actor(existing_actor_handle) -> None:
                 self.engine = existing_actor_handle
                 self._initialized = True
-                from tinker_server.backend.resource_pool import get_resource_pool, ActorType
+                from tinker_server.backend.resource_pool import (
+                    ActorType,
+                    actor_observability_metadata,
+                    get_resource_pool,
+                )
 
                 resource_pool = get_resource_pool()
                 resource_pool.register(
@@ -2131,6 +2167,7 @@ class MultiNodeInferenceEngine:
                     namespace=PERSISTENT_NAMESPACE,
                     base_model=self.model_path,
                     protected=is_persistent,
+                    metadata=dict(actor_observability_metadata(self.engine) or {}),
                 )
                 resource_pool.mark_ready(self.actor_name)
 
@@ -2338,7 +2375,11 @@ class MultiNodeInferenceEngine:
             os.makedirs(self.shared_adapter_dir, exist_ok=True)
 
             # Step 1: Ensure enough GPUs are available (evict idle actors if needed)
-            from tinker_server.backend.resource_pool import get_resource_pool, ActorType
+            from tinker_server.backend.resource_pool import (
+                ActorType,
+                actor_observability_metadata,
+                get_resource_pool,
+            )
             resource_pool = get_resource_pool()
             logger.info(
                 f"Ensuring {total_required_gpus} GPUs available for multi-node vLLM "
@@ -2677,6 +2718,7 @@ class MultiNodeInferenceEngine:
                 namespace=PERSISTENT_NAMESPACE,
                 base_model=self.model_path,
                 protected=is_persistent,
+                metadata=dict(actor_observability_metadata(self.engine) or {}),
             )
             # Mark as ready since initialization completed
             resource_pool.mark_ready(self.actor_name)

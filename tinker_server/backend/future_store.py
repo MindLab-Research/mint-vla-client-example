@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import os
+import threading
 import time
 from enum import Enum
 from typing import Any
@@ -760,44 +761,223 @@ class FutureStore:
     def __init__(self) -> None:
         self._ray_actor = None
 
-    def _get_cached_ray_actor_for_async_request_path(self):
+        # Process-local snapshot for cheap metrics reads and startup baseline.
+        self._snapshot_lock = threading.Lock()
+        self._snapshot_requests: dict[str, dict[str, Any]] = {}
+        self._snapshot_hydrated = False
+        self._snapshot_hydrate_last_attempt_s = 0.0
+        self._snapshot_hydrate_min_interval_s = float(
+            os.environ.get("MINT_FUTURE_STORE_SNAPSHOT_HYDRATE_MIN_INTERVAL_S", "30.0")
+        )
+
+    @staticmethod
+    def _snapshot_op(meta: dict[str, Any] | None) -> str:
+        if isinstance(meta, dict):
+            op = meta.get("op")
+            if isinstance(op, str) and op.strip():
+                return op.strip()
+        return "unknown"
+
+    def _snapshot_ensure_pending(self, request_id: str, *, meta: dict[str, Any] | None, has_ref: bool) -> None:
+        request_id = str(request_id)
+        now = time.time()
+        with self._snapshot_lock:
+            rec = self._snapshot_requests.get(request_id)
+            if rec is None:
+                rec = {
+                    "status": FutureStatus.PENDING.value,
+                    "created_at": now,
+                    "done_at": None,
+                    "op": self._snapshot_op(meta),
+                    "has_meta": bool(meta),
+                    "has_ref": bool(has_ref),
+                    "has_result_ref": False,
+                    "has_error": False,
+                }
+            else:
+                rec = dict(rec)
+                rec["status"] = FutureStatus.PENDING.value
+                rec["done_at"] = None
+                rec["op"] = self._snapshot_op(meta) if meta is not None else str(rec.get("op") or "unknown")
+                rec["has_meta"] = bool(rec.get("has_meta", False) or bool(meta))
+                rec["has_ref"] = bool(rec.get("has_ref", False) or bool(has_ref))
+                rec["has_result_ref"] = bool(rec.get("has_result_ref", False))
+                rec["has_error"] = bool(rec.get("has_error", False))
+                if "created_at" not in rec:
+                    rec["created_at"] = now
+            self._snapshot_requests[request_id] = rec
+
+    def _snapshot_mark_terminal(self, request_id: str, *, status: str) -> None:
+        request_id = str(request_id)
+        status = str(status)
+        now = time.time()
+        with self._snapshot_lock:
+            rec = dict(self._snapshot_requests.get(request_id) or {})
+            rec.setdefault("created_at", now)
+            rec["status"] = status
+            rec["done_at"] = now
+            rec.setdefault("op", "unknown")
+            rec.setdefault("has_meta", False)
+            rec.setdefault("has_ref", False)
+            rec.setdefault("has_result_ref", False)
+            rec.setdefault("has_error", False)
+            if status == FutureStatus.DONE.value:
+                rec["has_result_ref"] = True
+                rec["has_ref"] = False
+            elif status == FutureStatus.FAILED.value:
+                rec["has_error"] = True
+            self._snapshot_requests[request_id] = rec
+
+    def metrics_snapshot(self) -> dict[str, Any]:
+        now = time.time()
+        with self._snapshot_lock:
+            records = [dict(v) for v in self._snapshot_requests.values()]
+
+        by_op: dict[str, dict[str, int]] = {}
+
+        def _bump(op: str, key: str) -> None:
+            bucket = by_op.setdefault(op, {"pending": 0, "results": 0, "errors": 0})
+            bucket[key] = int(bucket.get(key, 0)) + 1
+
+        pending_ages: list[float] = []
+        done_ages: list[float] = []
+        pending = results = errors = expired = retrieved = 0
+        refs = meta = result_refs = payload_errors = 0
+
+        for rec in records:
+            status = str(rec.get("status") or "")
+            op = str(rec.get("op") or "unknown")
+            created_at = float(rec.get("created_at") or now)
+            done_at_raw = rec.get("done_at")
+            done_at = float(done_at_raw) if isinstance(done_at_raw, (int, float)) else None
+            has_ref = bool(rec.get("has_ref"))
+            has_meta = bool(rec.get("has_meta"))
+            has_result_ref = bool(rec.get("has_result_ref"))
+            has_error = bool(rec.get("has_error"))
+
+            if has_ref:
+                refs += 1
+            if has_meta:
+                meta += 1
+            if has_result_ref:
+                result_refs += 1
+            if has_error:
+                payload_errors += 1
+
+            if status == FutureStatus.PENDING.value:
+                pending += 1
+                _bump(op, "pending")
+                pending_ages.append(max(0.0, now - created_at))
+            elif status == FutureStatus.DONE.value:
+                results += 1
+                _bump(op, "results")
+                done_ages.append(max(0.0, now - (done_at if done_at is not None else created_at)))
+            elif status == FutureStatus.FAILED.value:
+                errors += 1
+                _bump(op, "errors")
+                done_ages.append(max(0.0, now - (done_at if done_at is not None else created_at)))
+            elif status == FutureStatus.EXPIRED.value:
+                expired += 1
+                done_ages.append(max(0.0, now - (done_at if done_at is not None else created_at)))
+            elif status == FutureStatus.RETRIEVED.value:
+                retrieved += 1
+                done_ages.append(max(0.0, now - (done_at if done_at is not None else created_at)))
+
+        timeout_counts = {"queue": 0, "execution": 0, "total": 0, "by_op": {}}
+        return {
+            "pending": int(pending),
+            "results": int(results),
+            "errors": int(errors),
+            "refs": int(refs),
+            "meta": int(meta),
+            "expired": int(expired),
+            "retrieved": int(retrieved),
+            "execution_timeout_s": float(_ray_future_ttl_s()),
+            "queue_timeout_s": float(_ray_future_queue_ttl_s()),
+            "result_ttl_s": float(_ray_future_done_ttl_s()),
+            "tombstone_ttl_s": float(_ray_future_tombstone_ttl_s()),
+            "by_op": by_op,
+            "age_stats": {
+                "oldest_pending_s": max(pending_ages) if pending_ages else 0.0,
+                "oldest_done_s": max(done_ages) if done_ages else 0.0,
+                "avg_pending_s": (sum(pending_ages) / len(pending_ages)) if pending_ages else 0.0,
+                "avg_done_s": (sum(done_ages) / len(done_ages)) if done_ages else 0.0,
+            },
+            "payload_stats": {
+                "result_refs_count": int(result_refs),
+                "errors_count": int(payload_errors),
+                "refs_count": int(refs),
+            },
+            "timeout_counts": timeout_counts,
+        }
+
+    def hydrate_metrics_snapshot(self, *, timeout_s: float = 10.0, force: bool = False) -> bool:
+        now = time.time()
+        with self._snapshot_lock:
+            if self._snapshot_hydrated and not force:
+                return True
+            if not force and (now - float(self._snapshot_hydrate_last_attempt_s)) < float(
+                self._snapshot_hydrate_min_interval_s
+            ):
+                return False
+            self._snapshot_hydrate_last_attempt_s = now
+
+        actor = self._get_ray_actor()
         try:
             import ray
-        except Exception as e:
-            raise FutureStoreUnavailableError("Ray import failed") from e
 
-        if not ray.is_initialized():
-            raise FutureStoreUnavailableError("Ray not initialized")
+            payload = ray.get(actor.metrics_seed_snapshot.remote(), timeout=float(timeout_s))
+        except Exception:
+            return False
 
-        if self._ray_actor is None:
-            raise FutureStoreUnavailableError(
-                "Detached Ray FutureStore actor is not ready on this API server"
-            )
-        return self._ray_actor
-    async def async_ensure_ready(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
-        """Async variant of ensure_ready for request/control-plane paths."""
-        actor = await self._get_ray_actor_async()
-        import ray
+        if not isinstance(payload, dict):
+            return False
+        requests = payload.get("requests")
+        if not isinstance(requests, list):
+            return False
 
-        try:
-            out = await asyncio.wait_for(_await_ray_ref(actor.stats.remote()), timeout=float(timeout_s))
-        except ray.exceptions.ActorDiedError as e:
-            self._ray_actor = None
-            raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
-        if not isinstance(out, dict):
-            raise TypeError(f"FutureStore.stats returned non-dict: {type(out)}")
-        return out
-    async def async_rss_bytes(self, *, timeout_s: float = 10.0) -> int:
-        actor = self._get_cached_ray_actor_for_async_request_path()
-        import ray
+        next_snapshot: dict[str, dict[str, Any]] = {}
+        for rec in requests:
+            if not isinstance(rec, dict):
+                continue
+            request_id = str(rec.get("request_id") or "")
+            if not request_id:
+                continue
+            status = str(rec.get("status") or FutureStatus.PENDING.value)
+            if status not in {
+                FutureStatus.PENDING.value,
+                FutureStatus.DONE.value,
+                FutureStatus.FAILED.value,
+                FutureStatus.EXPIRED.value,
+                FutureStatus.RETRIEVED.value,
+            }:
+                status = FutureStatus.PENDING.value
+            created_at_raw = rec.get("created_at")
+            done_at_raw = rec.get("done_at")
+            try:
+                created_at = float(created_at_raw)
+            except Exception:
+                created_at = now
+            done_at = None
+            if isinstance(done_at_raw, (int, float)):
+                done_at = float(done_at_raw)
+            next_snapshot[request_id] = {
+                "status": status,
+                "created_at": created_at,
+                "done_at": done_at,
+                "op": str(rec.get("op") or "unknown"),
+                "has_meta": bool(rec.get("has_meta")),
+                "has_ref": bool(rec.get("has_ref")),
+                "has_result_ref": bool(rec.get("has_result_ref")),
+                "has_error": bool(rec.get("has_error")),
+            }
 
-        try:
-            v = await asyncio.wait_for(_await_ray_ref(actor.get_rss_bytes.remote()), timeout=float(timeout_s))
-        except ray.exceptions.ActorDiedError as e:
-            self._ray_actor = None
-            raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
-        return int(v)
-    async def _get_ray_actor_async(self):
+        with self._snapshot_lock:
+            self._snapshot_requests = next_snapshot
+            self._snapshot_hydrated = True
+        return True
+
+    def _get_ray_actor(self):
         try:
             import ray
         except Exception as e:
@@ -817,6 +997,132 @@ class FutureStore:
         actor = self._ray_actor
         if actor is not None:
             try:
+                ray.get(actor.stats.remote(), timeout=1.0)
+                return actor
+            except Exception:
+                self._ray_actor = None
+
+        try:
+            self._ray_actor = _get_or_create_ray_actor()
+        except Exception as e:
+            raise FutureStoreUnavailableError("Failed to get/create detached Ray FutureStore actor") from e
+        return self._ray_actor
+
+    def _get_cached_ray_actor_for_async_request_path(self):
+        try:
+            import ray
+        except Exception as e:
+            raise FutureStoreUnavailableError("Ray import failed") from e
+
+        if not ray.is_initialized():
+            raise FutureStoreUnavailableError("Ray not initialized")
+
+        if self._ray_actor is None:
+            raise FutureStoreUnavailableError(
+                "Detached Ray FutureStore actor is not ready on this API server"
+            )
+        return self._ray_actor
+
+    def ensure_started(self) -> None:
+        self._get_ray_actor(require_ready=False)
+
+    def ensure_ready(self, *, timeout_s: float = 10.0, require_hydrated_baseline: bool = False) -> dict[str, Any]:
+        actor = self._get_ray_actor()
+        import ray
+
+        try:
+            out = ray.get(actor.stats.remote(), timeout=float(timeout_s))
+        except ray.exceptions.ActorDiedError as e:
+            self._ray_actor = None
+            raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
+        if not isinstance(out, dict):
+            raise TypeError(f"FutureStore.stats returned non-dict: {type(out)}")
+
+        if require_hydrated_baseline:
+            retries = max(
+                1,
+                int(os.environ.get("MINT_FUTURE_STORE_METRICS_HYDRATE_STARTUP_RETRIES", "3")),
+            )
+            retry_delay_s = max(
+                0.0,
+                float(os.environ.get("MINT_FUTURE_STORE_METRICS_HYDRATE_RETRY_DELAY_S", "0.2")),
+            )
+            hydrated = False
+            for attempt in range(1, retries + 1):
+                hydrated = bool(self.hydrate_metrics_snapshot(timeout_s=float(timeout_s), force=True))
+                if hydrated:
+                    break
+                if attempt < retries and retry_delay_s > 0:
+                    time.sleep(retry_delay_s)
+            if not hydrated:
+                raise FutureStoreUnavailableError("FutureStore metrics baseline hydration failed at startup")
+        return out
+
+    def ensure_pending(self, request_id: str, meta: dict[str, Any] | None = None) -> dict[str, Any]:
+        actor = self._get_ray_actor()
+        import ray
+
+        payload = None if meta is None else dict(meta)
+        try:
+            out = ray.get(actor.ensure_pending.remote(request_id=str(request_id), meta=payload))
+        except ray.exceptions.ActorDiedError as e:
+            self._ray_actor = None
+            raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
+        if not isinstance(out, dict):
+            raise TypeError(f"FutureStore.ensure_pending returned non-dict: {type(out)}")
+        self._snapshot_ensure_pending(str(request_id), meta=payload if payload is not None else out.get("meta"), has_ref=False)
+        return out
+
+    async def async_ensure_started(self) -> None:
+        await self._get_ray_actor_async(require_ready=False)
+
+    async def async_ensure_ready(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
+        """Async variant of ensure_ready for request/control-plane paths."""
+        actor = await self._get_ray_actor_async(require_ready=False)
+        import ray
+
+        try:
+            out = await asyncio.wait_for(_await_ray_ref(actor.stats.remote()), timeout=float(timeout_s))
+        except ray.exceptions.ActorDiedError as e:
+            self._ray_actor = None
+            raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
+        if not isinstance(out, dict):
+            raise TypeError(f"FutureStore.stats returned non-dict: {type(out)}")
+        if not self._snapshot_hydrated:
+            self.hydrate_metrics_snapshot(timeout_s=float(timeout_s), force=True)
+        return self.metrics_snapshot()
+    async def async_rss_bytes(self, *, timeout_s: float = 10.0) -> int:
+        actor = self._get_cached_ray_actor_for_async_request_path()
+        import ray
+
+        try:
+            v = await asyncio.wait_for(_await_ray_ref(actor.get_rss_bytes.remote()), timeout=float(timeout_s))
+        except ray.exceptions.ActorDiedError as e:
+            self._ray_actor = None
+            raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
+        return int(v)
+    async def _get_ray_actor_async(self, *, require_ready: bool = True):
+        try:
+            import ray
+        except Exception as e:
+            raise FutureStoreUnavailableError("Ray import failed") from e
+
+        if not ray.is_initialized():
+            try:
+                from ..ray_utils import init_ray
+
+                init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
+            except Exception as e:
+                raise FutureStoreUnavailableError("Ray not initialized (init_ray failed)") from e
+
+        if not ray.is_initialized():
+            raise FutureStoreUnavailableError("Ray not initialized")
+
+        actor = self._ray_actor
+        if actor is not None:
+            if not require_ready:
+                return actor
+            try:
                 await asyncio.wait_for(_await_ray_ref(actor.stats.remote()), timeout=1.0)
                 return actor
             except Exception:
@@ -828,7 +1134,7 @@ class FutureStore:
             raise FutureStoreUnavailableError("Failed to get/create detached Ray FutureStore actor") from e
         return self._ray_actor
 
-    def _get_ray_actor(self):
+    def _get_ray_actor(self, *, require_ready: bool = True):
         try:
             import ray
         except Exception as e:
@@ -846,6 +1152,8 @@ class FutureStore:
             raise FutureStoreUnavailableError("Ray not initialized")
 
         if self._ray_actor is not None:
+            if not require_ready:
+                return self._ray_actor
             return self._ray_actor
 
         try:
@@ -1001,6 +1309,7 @@ class FutureStore:
         except ray.exceptions.ActorDiedError as e:
             self._ray_actor = None
             raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
+        self._snapshot_ensure_pending(str(request_id), meta=None, has_ref=False)
         return str(request_id)
     async def async_ensure_pending(self, request_id: str, meta: dict[str, Any] | None = None) -> dict[str, Any]:
         actor = self._get_cached_ray_actor_for_async_request_path()
@@ -1014,6 +1323,7 @@ class FutureStore:
             raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
         if not isinstance(out, dict):
             raise TypeError(f"FutureStore.ensure_pending returned non-dict: {type(out)}")
+        self._snapshot_ensure_pending(str(request_id), meta=payload if payload is not None else out.get("meta"), has_ref=False)
         return out
     async def async_mark_queued(self, request_id: str, meta: dict[str, Any] | None = None) -> None:
         actor = self._get_cached_ray_actor_for_async_request_path()
@@ -1025,6 +1335,7 @@ class FutureStore:
         except ray.exceptions.ActorDiedError as e:
             self._ray_actor = None
             raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
+        self._snapshot_ensure_pending(str(request_id), meta=payload, has_ref=False)
     async def async_mark_running(self, request_id: str, meta: dict[str, Any] | None = None) -> None:
         actor = self._get_cached_ray_actor_for_async_request_path()
         import ray
@@ -1035,6 +1346,7 @@ class FutureStore:
         except ray.exceptions.ActorDiedError:
             self._ray_actor = None
             raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from None
+        self._snapshot_ensure_pending(str(request_id), meta=payload, has_ref=False)
     async def async_update_meta(self, request_id: str, meta: dict[str, Any] | None = None) -> None:
         actor = self._get_cached_ray_actor_for_async_request_path()
         import ray
@@ -1045,6 +1357,7 @@ class FutureStore:
         except ray.exceptions.ActorDiedError as e:
             self._ray_actor = None
             raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
+        self._snapshot_ensure_pending(str(request_id), meta=payload, has_ref=False)
 
     async def _async_stale_generation_finalize_guard(self) -> tuple[bool, str | None]:
         generation_id = get_current_queue_generation_id()
@@ -1072,6 +1385,7 @@ class FutureStore:
             result = _sync_training_session_step(meta, result)
             ref = ray.put(result)
             await _await_ray_ref(actor.resolve_ref.remote(request_id=request_id, ref=ref))
+            self._snapshot_mark_terminal(str(request_id), status=FutureStatus.DONE.value)
         except ray.exceptions.ActorDiedError as e:
             self._ray_actor = None
             raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
@@ -1082,6 +1396,7 @@ class FutureStore:
         stale, message = await self._async_stale_generation_finalize_guard()
         try:
             await _await_ray_ref(actor.fail.remote(request_id=request_id, error=str(message if stale and message else error)))
+            self._snapshot_mark_terminal(str(request_id), status=FutureStatus.FAILED.value)
         except ray.exceptions.ActorDiedError as e:
             self._ray_actor = None
             raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
@@ -1179,7 +1494,9 @@ class FutureStore:
         import ray
 
         try:
-            return await _await_ray_ref(actor.get_result.remote(request_id=request_id))
+            out = await _await_ray_ref(actor.get_result.remote(request_id=request_id))
+            self._snapshot_mark_terminal(str(request_id), status=FutureStatus.RETRIEVED.value)
+            return out
         except ray.exceptions.ActorDiedError as e:
             self._ray_actor = None
             raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
@@ -1205,7 +1522,13 @@ class FutureStore:
         timed_out = out.get("timed_out") or []
         if not isinstance(expired, list) or not isinstance(timed_out, list):
             raise TypeError("FutureStore.reap returned invalid payload")
-        return {"expired": [str(x) for x in expired], "timed_out": [str(x) for x in timed_out]}
+        expired_ids = [str(x) for x in expired]
+        timed_out_ids = [str(x) for x in timed_out]
+        for request_id in expired_ids:
+            self._snapshot_mark_terminal(request_id, status=FutureStatus.EXPIRED.value)
+        for request_id in timed_out_ids:
+            self._snapshot_mark_terminal(request_id, status=FutureStatus.FAILED.value)
+        return {"expired": expired_ids, "timed_out": timed_out_ids}
     async def async_get_error(self, request_id: str) -> str | None:
         actor = self._get_cached_ray_actor_for_async_request_path()
 
@@ -1252,6 +1575,8 @@ class FutureStore:
         except ray.exceptions.ActorDiedError as e:
             self._ray_actor = None
             raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
+        with self._snapshot_lock:
+            self._snapshot_requests.pop(str(request_id), None)
     async def async_cleanup(self, request_id: str) -> None:
         actor = self._get_cached_ray_actor_for_async_request_path()
         import ray
@@ -1261,6 +1586,8 @@ class FutureStore:
         except ray.exceptions.ActorDiedError as e:
             self._ray_actor = None
             raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
+        with self._snapshot_lock:
+            self._snapshot_requests.pop(str(request_id), None)
     async def async_fail_stale_running_requests(self, active_consumer_job_id: str, error: str) -> list[str]:
         actor = self._get_cached_ray_actor_for_async_request_path()
         import ray
@@ -1277,7 +1604,10 @@ class FutureStore:
             raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
         if not isinstance(out, list):
             raise TypeError(f"FutureStore.fail_stale_running_requests returned non-list: {type(out)}")
-        return [str(x) for x in out]
+        out_ids = [str(x) for x in out]
+        for request_id in out_ids:
+            self._snapshot_mark_terminal(request_id, status=FutureStatus.FAILED.value)
+        return out_ids
 
 
 future_store = FutureStore()

@@ -121,30 +121,55 @@ def _build_sampling_usage_label(*, model: str, route: str, dimension: str) -> st
     return f"model={model},route={route},dimension={dimension}"
 
 
-def _record_vllm_workload_start(*, base_model: str, op: str) -> None:
+def _record_vllm_workload_start(*, actor_name: str | None, base_model: str, op: str) -> None:
     from ..backend.runtime_observability import runtime_observability
 
-    runtime_observability.begin_vllm_request(base_model=base_model, op=op)
+    runtime_observability.begin_vllm_request(actor_name=actor_name, base_model=base_model, op=op)
+
+
+def _vllm_request_observation(results: list[object], generated_tokens: int) -> dict[str, float | None]:
+    if not results:
+        return {
+            "ttft_s": None,
+            "tpot_s": None,
+        }
+    first = results[0]
+    ttft_s = getattr(first, "timing_first_tok_s", None)
+    total_s = getattr(first, "timing_total_s", None)
+    tpot_s = None
+    if ttft_s is not None and total_s is not None and int(generated_tokens) > 1:
+        decode_s = max(0.0, float(total_s) - float(ttft_s))
+        tpot_s = decode_s / float(max(1, int(generated_tokens) - 1))
+    return {
+        "ttft_s": float(ttft_s) if ttft_s is not None else None,
+        "tpot_s": float(tpot_s) if tpot_s is not None else None,
+    }
 
 
 def _record_vllm_workload_finish(
     *,
+    actor_name: str | None,
     base_model: str,
     op: str,
     status: str,
     prompt_tokens: int,
     generated_tokens: int,
     started_at: float,
+    ttft_s: float | None = None,
+    tpot_s: float | None = None,
 ) -> None:
     from ..backend.runtime_observability import runtime_observability
 
     runtime_observability.finish_vllm_request(
+        actor_name=actor_name,
         base_model=base_model,
         op=op,
         status=status,
         prompt_tokens=prompt_tokens,
         generated_tokens=generated_tokens,
         duration_s=max(0.0, time.perf_counter() - float(started_at)),
+        ttft_s=ttft_s,
+        tpot_s=tpot_s,
     )
 
 
@@ -1376,6 +1401,10 @@ async def _do_sample(
     workload_started = False
     workload_status = "error"
     workload_generated_tokens = 0
+    workload_obs = {
+        "ttft_s": None,
+        "tpot_s": None,
+    }
     try:
         try:
             if session_manager is None:
@@ -1385,8 +1414,6 @@ async def _do_sample(
             session_id = request.get_session_id()  # Supports both sampling_session_id and model_id
             await _restore_local_sampling_session_if_needed(session_id)
             workload_base_model = _resolve_billing_model(session_id)
-            _record_vllm_workload_start(base_model=workload_base_model, op="asample")
-            workload_started = True
             session_manager.mark_session_inflight(session_id, +1)
             snapshot = _get_sampling_snapshot(session_id)
 
@@ -1441,6 +1468,12 @@ async def _do_sample(
                         f"Engine for session {session_id} missing actor_name; cannot protect from eviction"
                     )
                 resource_pool.mark_inflight(resource_pool_actor_name, +1)
+                _record_vllm_workload_start(
+                    actor_name=resource_pool_actor_name,
+                    base_model=workload_base_model,
+                    op="asample",
+                )
+                workload_started = True
 
                 logger.info(
                     f"[sample path] session_id={session_id} "
@@ -1558,6 +1591,13 @@ async def _do_sample(
                 engine = session_manager.get_engine(session_id)
                 if engine is None:
                     raise RuntimeError(f"No engine found for session {session_id}")
+                resource_pool_actor_name = getattr(engine, "actor_name", None)
+                _record_vllm_workload_start(
+                    actor_name=resource_pool_actor_name,
+                    base_model=workload_base_model,
+                    op="asample",
+                )
+                workload_started = True
 
                 async def _generate_one(i: int):
                     return await engine.generate(
@@ -1691,6 +1731,7 @@ async def _do_sample(
             await future_store.async_resolve(request_id, response.model_dump(exclude={"type"}))
             workload_status = "ok"
             workload_generated_tokens = sum(len(seq.tokens) for seq in sequences)
+            workload_obs = _vllm_request_observation(results, workload_generated_tokens)
             logger.info(f"Sampling completed: {len(sequences)} sequences generated")
 
         except asyncio.CancelledError:
@@ -1719,12 +1760,15 @@ async def _do_sample(
     finally:
         if workload_started:
             _record_vllm_workload_finish(
+                actor_name=resource_pool_actor_name,
                 base_model=workload_base_model,
                 op="asample",
                 status=workload_status,
                 prompt_tokens=len(token_ids) if 'token_ids' in locals() else 0,
                 generated_tokens=workload_generated_tokens,
                 started_at=workload_started_at,
+                ttft_s=workload_obs["ttft_s"],
+                tpot_s=workload_obs["tpot_s"],
             )
         if resource_pool is not None and resource_pool_actor_name is not None:
             resource_pool.mark_inflight(resource_pool_actor_name, -1)
@@ -1915,14 +1959,12 @@ async def _do_compute_logprobs(
         session_id = request.sampling_session_id
         await _restore_local_sampling_session_if_needed(session_id)
         workload_base_model = _resolve_billing_model(session_id)
-        _record_vllm_workload_start(base_model=workload_base_model, op="compute_logprobs")
-        workload_started = True
         session_manager.mark_session_inflight(session_id, +1)
         snapshot = _get_sampling_snapshot(session_id)
         base_model = snapshot.base_model if snapshot is not None else session_manager.get_session_base_model(session_id)
 
         async def _compute_logprobs_action():
-            nonlocal resource_pool, resource_pool_actor_name
+            nonlocal resource_pool, resource_pool_actor_name, workload_started
 
             # Check if session uses multi-LoRA mode (includes base model sessions)
             is_multi_lora = bool(snapshot.uses_multi_lora) if snapshot is not None else session_manager.is_multi_lora_session(session_id)
@@ -1952,6 +1994,12 @@ async def _do_compute_logprobs(
                         f"Engine for session {session_id} missing actor_name; cannot protect from eviction"
                     )
                 resource_pool.mark_inflight(resource_pool_actor_name, +1)
+                _record_vllm_workload_start(
+                    actor_name=resource_pool_actor_name,
+                    base_model=workload_base_model,
+                    op="compute_logprobs",
+                )
+                workload_started = True
                 await _ensure_session_lora_loaded(multi_lora_engine, session_id, snapshot=snapshot)
                 return await multi_lora_engine.compute_logprobs(
                     sampling_session_id=session_id,
@@ -1962,6 +2010,13 @@ async def _do_compute_logprobs(
             engine = session_manager.get_engine(session_id)
             if engine is None:
                 raise RuntimeError(f"No engine found for session {session_id}")
+            resource_pool_actor_name = getattr(engine, "actor_name", None)
+            _record_vllm_workload_start(
+                actor_name=resource_pool_actor_name,
+                base_model=workload_base_model,
+                op="compute_logprobs",
+            )
+            workload_started = True
             return await engine.compute_logprobs(
                 prompt_ids=token_ids,
                 request_id=request_id,
@@ -2030,6 +2085,7 @@ async def _do_compute_logprobs(
     finally:
         if workload_started:
             _record_vllm_workload_finish(
+                actor_name=resource_pool_actor_name,
                 base_model=workload_base_model,
                 op="compute_logprobs",
                 status=workload_status,

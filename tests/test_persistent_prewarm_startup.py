@@ -74,10 +74,22 @@ def _install_fake_ray(monkeypatch) -> None:
 
 
 class _StubFutureStore:
-    def ensure_ready(self) -> None:
+    def __init__(self, *, fail_async_ensure_ready: bool = False):
+        self.fail_async_ensure_ready = bool(fail_async_ensure_ready)
+        self.async_ensure_started_calls = 0
+        self.async_ensure_ready_calls = 0
+
+    def ensure_ready(self, **_kwargs) -> None:
+        return None
+
+    async def async_ensure_started(self) -> None:
+        self.async_ensure_started_calls += 1
         return None
 
     async def async_ensure_ready(self) -> None:
+        self.async_ensure_ready_calls += 1
+        if self.fail_async_ensure_ready:
+            raise RuntimeError("future store stats probe failed")
         return None
 
 
@@ -91,8 +103,8 @@ class _StubCapacityManager:
     def ensure_ready(self) -> None:
         return None
 
-    async def async_ensure_ready(self) -> None:
-        return None
+    async def async_ensure_ready(self, *, timeout_s: float = 10.0):
+        return {"capacity": 1, "inflight": 0, "timeout_s": float(timeout_s)}
 
 
 class _StubSessionManager:
@@ -131,14 +143,24 @@ class _StubTrainingEngine:
 
 
 class _StubApiWorkQueue:
-    def __init__(self):
+    def __init__(self, *, fail_async_ensure_ready: bool = False):
+        self.fail_async_ensure_ready = bool(fail_async_ensure_ready)
         self.started_workers = 0
+        self.async_ensure_started_calls = 0
+        self.async_ensure_ready_calls = 0
 
     def ensure_ready(self) -> None:
         return None
 
-    async def async_ensure_ready(self) -> None:
+    async def async_ensure_started(self) -> None:
+        self.async_ensure_started_calls += 1
         return None
+
+    async def async_ensure_ready(self, *, timeout_s: float = 10.0):
+        self.async_ensure_ready_calls += 1
+        if self.fail_async_ensure_ready:
+            raise RuntimeError("api work queue stats probe failed")
+        return {"depth": 0, "enqueued": 0, "dequeued": 0, "timeout_s": float(timeout_s)}
 
     def set_executor(self, _op: str, _executor) -> None:
         return None
@@ -217,17 +239,16 @@ def _install_lifespan_stubs(
     owner_runtime: _StubOwnerRuntimeSupervisor,
     queue_execution_runtime: _StubQueueExecutionRuntime,
     init_ray_calls: _StubInitRayCalls | None = None,
+    future_store: _StubFutureStore | None = None,
 ) -> None:
     monkeypatch.setattr(app_module, "_cleanup_stale_actors", _noop_async)
     monkeypatch.setattr(app_module, "_restore_sampling_sessions", _noop_async)
     monkeypatch.setattr(app_module, "SessionManager", _StubSessionManager)
-    monkeypatch.setattr(app_module, "_should_preload_openai_tokenizers", lambda: False)
     monkeypatch.setattr(app_module.config, "enable_multi_lora", False)
     monkeypatch.setattr(app_module.config, "api_work_queue_num_workers", 1)
 
     api_work_queue_module = importlib.import_module("tinker_server.backend.api_work_queue")
     future_store_module = importlib.import_module("tinker_server.backend.future_store")
-    future_replay_module = importlib.import_module("tinker_server.backend.future_replay")
     capacity_manager_module = importlib.import_module("tinker_server.backend.capacity_manager")
     gateway_session_store_module = importlib.import_module("tinker_server.backend.gateway_session_store")
     sampling_session_store_module = importlib.import_module("tinker_server.backend.sampling_session_store")
@@ -235,6 +256,8 @@ def _install_lifespan_stubs(
     session_index_store_module = importlib.import_module("tinker_server.backend.session_index_store")
     training_session_manager_module = importlib.import_module("tinker_server.backend.training_session_manager")
     training_session_store_module = importlib.import_module("tinker_server.backend.training_session_store")
+    future_replay_module = importlib.import_module("tinker_server.backend.future_replay")
+    dense_session_state_module = importlib.import_module("tinker_server.backend.dense_session_state")
     checkpoints_module = importlib.import_module("tinker_server.checkpoints")
     gateway_module = importlib.import_module("tinker_server.gateway")
     usage_store_module = importlib.import_module("tinker_server.usage_store")
@@ -251,8 +274,7 @@ def _install_lifespan_stubs(
     monkeypatch.setattr(owner_runtime_module, "owner_runtime_supervisor", owner_runtime)
     monkeypatch.setattr(queue_execution_runtime_module, "queue_execution_runtime", queue_execution_runtime)
     monkeypatch.setattr(capacity_manager_module, "capacity_manager", _StubCapacityManager())
-    monkeypatch.setattr(future_store_module, "future_store", _StubFutureStore())
-    monkeypatch.setattr(future_replay_module, "ensure_future_replay_sweeper", lambda *args, **kwargs: {})
+    monkeypatch.setattr(future_store_module, "future_store", future_store or _StubFutureStore())
     monkeypatch.setattr(gateway_session_store_module, "ensure_ready", lambda: None)
     monkeypatch.setattr(sampling_session_store_module, "ensure_ready", lambda: None)
     monkeypatch.setattr(session_heartbeat_store_module, "session_heartbeat_store", SimpleNamespace(ensure_ready=lambda: None, async_size=lambda: 0))
@@ -260,6 +282,12 @@ def _install_lifespan_stubs(
     monkeypatch.setattr(training_session_manager_module, "TrainingSessionManager", _StubTrainingManager)
     monkeypatch.setattr(training_session_store_module, "ensure_ready", lambda: None)
     monkeypatch.setattr(training_session_store_module, "list_training_sessions", lambda: [])
+    monkeypatch.setattr(future_replay_module, "ensure_future_replay_sweeper", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        dense_session_state_module,
+        "cleanup_legacy_dense_session_state_once",
+        lambda *args, **kwargs: {"migrated": [], "deleted": [], "skipped": [], "errors": []},
+    )
     monkeypatch.setattr(checkpoints_module, "get_checkpoint_reap_interval_s", lambda: 3600.0)
     monkeypatch.setattr(checkpoints_module, "get_checkpoint_mirror_poll_s", lambda: 3600.0)
     monkeypatch.setattr(checkpoints_module, "reap_runtime_checkpoints", lambda: {})
@@ -378,6 +406,46 @@ def test_lifespan_follower_skips_leader_only_startup(monkeypatch) -> None:
     assert app_module.service.session_manager is None
     assert queue_execution_runtime.ensure_started_calls == [1]
     assert len(init_ray_calls) == 0
+
+
+def test_lifespan_uses_started_probes_for_queue_and_future_store(monkeypatch) -> None:
+    queue = _StubApiWorkQueue(fail_async_ensure_ready=True)
+    future_store = _StubFutureStore(fail_async_ensure_ready=True)
+    owner_runtime = _StubOwnerRuntimeSupervisor()
+    queue_execution_runtime = _StubQueueExecutionRuntime()
+    _install_lifespan_stubs(
+        monkeypatch,
+        queue,
+        owner_runtime,
+        queue_execution_runtime,
+        future_store=future_store,
+    )
+    lease = _StubStartupLease(is_owner=True)
+
+    async def _acquire_startup_lease(*_args, **_kwargs):
+        return lease
+
+    async def _noop_prewarm(*_args, **_kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(app_module, "_prewarm_persistent_models", _noop_prewarm)
+    monkeypatch.setattr(
+        "tinker_server.backend.startup_lease.acquire_startup_lease",
+        _acquire_startup_lease,
+    )
+
+    async def _run() -> None:
+        async with app_module.lifespan(app_module.app):
+            return None
+
+    asyncio.run(_run())
+
+    assert future_store.async_ensure_started_calls == 1
+    assert future_store.async_ensure_ready_calls == 0
+    assert queue.async_ensure_started_calls == 1
+    assert queue.async_ensure_ready_calls == 0
+    assert queue_execution_runtime.ensure_started_calls == [1]
+    assert lease.released is True
 
 
 @pytest.mark.anyio
