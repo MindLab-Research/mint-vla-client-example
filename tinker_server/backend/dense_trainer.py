@@ -19,7 +19,7 @@ import ray
 
 from . import ray_kill
 from .ray_placement_groups import PlacementGroupMismatchError, get_named_placement_group
-from .resource_pool import ActorType, get_resource_pool
+from .resource_pool import ActorType, actor_observability_metadata, get_resource_pool
 from ..config import PFS_PYTHONPATH, RAY_NAMESPACE
 
 logger = logging.getLogger(__name__)
@@ -311,6 +311,7 @@ def get_or_create_dense_trainer(
                     "max_lora_rank": effective_max_rank,
                     "actual_rank": int(lora_rank),
                     "model_key": name_key,
+                    **dict(actor_observability_metadata(actor) or {}),
                 },
             )
             pool.mark_ready(actor_name)

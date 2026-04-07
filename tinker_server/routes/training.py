@@ -110,6 +110,14 @@ def _mark_training_inflight(model_id: str, delta: int) -> None:
         mark(model_id, delta)
 
 
+def _refresh_training_observability(model_id: str) -> None:
+    if training_manager is None:
+        return
+    refresh = getattr(training_manager, "refresh_observability_session", None)
+    if callable(refresh):
+        refresh(model_id)
+
+
 async def _fail_future(request_id: str, error: str) -> None:
     async_fail = getattr(future_store, "async_fail", None)
     if callable(async_fail):
@@ -333,6 +341,7 @@ def _restore_training_session_info_compat(info: dict):
     session.backend = str(info.get("backend", getattr(session, "backend", "peft")) or "peft")
     session.current_step = int(info.get("current_step", getattr(session, "current_step", 0)) or 0)
     session.metadata_version = max(1, int(info.get("metadata_version", getattr(session, "metadata_version", 1)) or 1))
+    _refresh_training_observability(model_id)
     return session
 
 
@@ -393,6 +402,7 @@ async def _restore_training_session(model_id: str):
         except Exception:
             pass
         session.is_active = True
+        _refresh_training_observability(model_id)
 
         actor_name = info.get("actor_name")
         if actor_name:
@@ -427,6 +437,7 @@ async def _restore_training_session(model_id: str):
                     session.current_step = original_session_state["current_step"]
                     session.is_active = original_session_state["is_active"]
                     session.metadata_version = original_session_state["metadata_version"]
+                    _refresh_training_observability(model_id)
                 return None
             getattr(training_engine, "_workers", {})[model_id] = worker
             getattr(training_engine, "_resource_pool_actor_names", {})[model_id] = actor_name
@@ -618,7 +629,16 @@ async def _best_effort_delete_training_session(
                 if delete_session is not None:
                     import ray
 
-                    await asyncio.to_thread(ray.get, delete_session.remote(model_id), timeout=30)
+                    try:
+                        await asyncio.to_thread(ray.get, delete_session.remote(model_id), timeout=30)
+                    except Exception as e:
+                        logger.warning(
+                            "[%s] best-effort stale training cleanup remote delete failed (%s): %s: %s",
+                            model_id,
+                            reason,
+                            type(e).__name__,
+                            e,
+                        )
                 getattr(training_engine, "_resource_pool_actor_names", {}).pop(model_id, None)
                 getattr(training_engine, "_workers", {}).pop(model_id, None)
                 getattr(training_engine, "_poisoned_sessions", {}).pop(model_id, None)
@@ -634,6 +654,7 @@ async def _best_effort_delete_training_session(
                         if not volatile:
                             actor_volatile_sessions.pop(actor_name, None)
                 session.is_active = False
+                _refresh_training_observability(model_id)
             deleted = True
         except Exception as e:
             logger.warning(
@@ -1202,6 +1223,7 @@ async def _do_create_model(
                 "lora_rank": int(request.lora_config.rank) if request.lora_config is not None else None,
             },
         )
+        _refresh_training_observability(model_id)
 
         try:
             from ..backend.training_session_store import upsert_training_session
@@ -1580,6 +1602,7 @@ async def _do_create_model_from_state(
                 "lora_rank": int(request.lora_config.rank) if request.lora_config is not None else None,
             },
         )
+        _refresh_training_observability(model_id)
 
         try:
             from ..backend.training_session_store import upsert_training_session

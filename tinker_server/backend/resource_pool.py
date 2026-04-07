@@ -57,6 +57,11 @@ class ActorEntry:
     creating: bool = True
     protected: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
+    metadata_sample_time: float | None = None
+    metadata_sample_source: str | None = None
+    rss_bytes: int | None = None
+    rss_sample_time: float | None = None
+    rss_sample_source: str | None = None
 
     def touch(self) -> None:
         self.last_accessed = time.time()
@@ -111,6 +116,7 @@ class _ResourcePoolState:
     ) -> ActorEntry:
         entry = self.entries.get(actor_name)
         if entry is None:
+            has_metadata = bool(metadata)
             entry = ActorEntry(
                 actor_name=actor_name,
                 actor_type=actor_type,
@@ -121,6 +127,8 @@ class _ResourcePoolState:
                 node_id=node_id,
                 protected=bool(protected),
                 metadata=dict(metadata or {}),
+                metadata_sample_time=(time.time() if has_metadata else None),
+                metadata_sample_source=("register" if has_metadata else None),
             )
             self.entries[actor_name] = entry
             logger.info(
@@ -146,6 +154,8 @@ class _ResourcePoolState:
             entry.protected = True
         if metadata:
             entry.metadata.update(dict(metadata))
+            entry.metadata_sample_time = time.time()
+            entry.metadata_sample_source = "register"
         return entry
 
     def unregister(self, actor_name: str) -> bool:
@@ -203,6 +213,22 @@ class _ResourcePoolState:
         if entry is None:
             return False
         entry.mark_ready()
+        return True
+
+    def update_metadata(
+        self,
+        actor_name: str,
+        *,
+        metadata: dict[str, Any],
+        sample_time: float | None = None,
+        sample_source: str | None = None,
+    ) -> bool:
+        entry = self.entries.get(actor_name)
+        if entry is None:
+            return False
+        entry.metadata = dict(metadata)
+        entry.metadata_sample_time = time.time() if sample_time is None else float(sample_time)
+        entry.metadata_sample_source = None if sample_source is None else str(sample_source)
         return True
 
     def reserve_gpus(self, num_gpus: int) -> bool:
@@ -411,6 +437,11 @@ def _entry_to_record(entry: ActorEntry) -> dict[str, Any]:
         "creating": bool(entry.creating),
         "protected": bool(entry.protected),
         "metadata": dict(entry.metadata or {}),
+        "metadata_sample_time": entry.metadata_sample_time,
+        "metadata_sample_source": entry.metadata_sample_source,
+        "rss_bytes": entry.rss_bytes,
+        "rss_sample_time": entry.rss_sample_time,
+        "rss_sample_source": entry.rss_sample_source,
     }
 
 
@@ -430,6 +461,21 @@ def _record_to_entry(record: dict[str, Any], *, actor_handle: ActorHandle | None
         creating=bool(record.get("creating", True)),
         protected=bool(record.get("protected", False)),
         metadata=dict(record.get("metadata") or {}),
+        metadata_sample_time=(
+            None if record.get("metadata_sample_time") is None else float(record.get("metadata_sample_time"))
+        ),
+        metadata_sample_source=(
+            None
+            if record.get("metadata_sample_source") is None
+            else str(record.get("metadata_sample_source"))
+        ),
+        rss_bytes=(None if record.get("rss_bytes") is None else int(record.get("rss_bytes"))),
+        rss_sample_time=(
+            None if record.get("rss_sample_time") is None else float(record.get("rss_sample_time"))
+        ),
+        rss_sample_source=(
+            None if record.get("rss_sample_source") is None else str(record.get("rss_sample_source"))
+        ),
     )
 
 
@@ -567,6 +613,20 @@ def _get_or_create_actor_sync() -> Any:
         def mark_ready(self, actor_name: str) -> bool:
             return self._state.mark_ready(actor_name)
 
+        def update_metadata(
+            self,
+            actor_name: str,
+            metadata: dict[str, Any],
+            sample_time: float | None = None,
+            sample_source: str | None = None,
+        ) -> bool:
+            return self._state.update_metadata(
+                actor_name,
+                metadata=dict(metadata or {}),
+                sample_time=sample_time,
+                sample_source=sample_source,
+            )
+
         def reserve_gpus(self, num_gpus: int) -> bool:
             return self._state.reserve_gpus(num_gpus)
 
@@ -649,6 +709,95 @@ def _call_actor_sync(method_name: str, *args, retry_on_actor_restart: bool = Fal
         return ray.get(remote_method.remote(*args, **kwargs))
 
 
+def actor_observability_metadata(actor_handle: ActorHandle | None, *, timeout_s: float = 5.0) -> dict[str, Any] | None:
+    if actor_handle is None:
+        return None
+    getter = getattr(actor_handle, "get_observability_binding", None)
+    if not callable(getter):
+        return None
+    try:
+        payload = ray.get(getter.remote(), timeout=float(timeout_s))
+    except Exception as e:
+        logger.debug("[ResourcePool] get_observability_binding failed: %s", e)
+        return None
+    if not isinstance(payload, dict):
+        return None
+    out: dict[str, Any] = {}
+    hostname = payload.get("hostname")
+    if isinstance(hostname, str) and hostname.strip():
+        out["hostname"] = hostname.strip()
+    node_id = payload.get("node_id")
+    if isinstance(node_id, str) and node_id.strip():
+        out["node_id"] = node_id.strip()
+    gpu_indices = payload.get("gpu_indices")
+    if isinstance(gpu_indices, list):
+        out["gpu_indices"] = [int(idx) for idx in gpu_indices if isinstance(idx, (int, float, str)) and str(idx).strip()]
+    gpu_bindings = payload.get("gpu_bindings")
+    if isinstance(gpu_bindings, list):
+        clean_bindings = []
+        for binding in gpu_bindings:
+            if not isinstance(binding, dict):
+                continue
+            gpu_index = binding.get("gpu_index")
+            if gpu_index is None:
+                continue
+            clean_bindings.append(
+                {
+                    "hostname": binding.get("hostname"),
+                    "node_id": binding.get("node_id"),
+                    "gpu_index": int(gpu_index),
+                    "rank": binding.get("rank"),
+                }
+            )
+        if clean_bindings:
+            out["gpu_bindings"] = clean_bindings
+    int_fields = (
+        "scheduler_waiting_requests",
+        "scheduler_running_requests",
+        "prefix_cache_queries_total",
+        "prefix_cache_hits_total",
+        "preemptions_total",
+        "queue_time_s_count",
+        "prefill_time_s_count",
+        "decode_time_s_count",
+        "time_per_output_token_s_count",
+        "active_sessions",
+        "session_unknown",
+        "session_step",
+        "gpu_memory_allocated_bytes",
+        "gpu_memory_reserved_bytes",
+        "gpu_memory_fragmentation_bytes",
+    )
+    float_fields = (
+        "scheduler_kv_cache_usage_ratio",
+        "prefix_cache_hit_ratio",
+        "queue_time_s_total",
+        "queue_time_s_max",
+        "prefill_time_s_total",
+        "prefill_time_s_max",
+        "decode_time_s_total",
+        "decode_time_s_max",
+        "time_per_output_token_s_total",
+        "time_per_output_token_s_max",
+        "learning_rate",
+    )
+    for src in int_fields:
+        value = payload.get(src)
+        if isinstance(value, (int, float, str)) and str(value).strip():
+            try:
+                out[src] = max(0, int(value))
+            except (TypeError, ValueError):
+                pass
+    for src in float_fields:
+        value = payload.get(src)
+        if isinstance(value, (int, float, str)) and str(value).strip():
+            try:
+                out[src] = max(0.0, float(value))
+            except (TypeError, ValueError):
+                pass
+    return out or None
+
+
 class ResourcePool:
     """Unified pool managing all GPU-using actors with detached control plane."""
 
@@ -676,6 +825,12 @@ class ResourcePool:
         )
         self._local_lock = threading.Lock()
         self._handle_cache: dict[str, ActorHandle] = {}
+        self.RSS_TTL_S = float(os.environ.get("MINT_RESOURCE_POOL_RSS_TTL_S", "60.0"))
+        self.METADATA_TTL_S = float(os.environ.get("MINT_RESOURCE_POOL_OBSERVABILITY_TTL_S", "30.0"))
+        self.METADATA_TIMEOUT_S = float(os.environ.get("MINT_RESOURCE_POOL_OBSERVABILITY_TIMEOUT_S", "1.0"))
+        # Backward-compatible aliases used by observability tests.
+        self._pool_lock = self._local_lock
+        self._entries = self._local_state.entries
         self._initialized = True
         logger.info(
             "[ResourcePool] Initialized MIN_ACTOR_AGE=%s SESSION_IDLE_TIMEOUT=%s detached=%s",
@@ -808,6 +963,35 @@ class ResourcePool:
             return
         _call_actor_sync("mark_ready", actor_name)
 
+    def update_metadata(
+        self,
+        actor_name: str,
+        *,
+        metadata: dict[str, Any],
+        sample_time: float | None = None,
+        sample_source: str | None = None,
+    ) -> bool:
+        if not self._use_detached():
+            return bool(
+                self._local(
+                    self._local_state.update_metadata,
+                    actor_name,
+                    metadata=dict(metadata or {}),
+                    sample_time=sample_time,
+                    sample_source=sample_source,
+                )
+            )
+        return bool(
+            _call_actor_sync(
+                "update_metadata",
+                actor_name,
+                dict(metadata or {}),
+                sample_time,
+                sample_source,
+                retry_on_actor_restart=True,
+            )
+        )
+
     def reserve_gpus(self, num_gpus: int) -> bool:
         if not self._use_detached():
             return bool(self._local(self._local_state.reserve_gpus, num_gpus))
@@ -873,6 +1057,72 @@ class ResourcePool:
             }
             for entry in entries
         ]
+
+    def _metadata_is_fresh(self, entry: ActorEntry, *, now: float) -> bool:
+        if entry.metadata_sample_time is None:
+            return False
+        return max(0.0, float(now) - float(entry.metadata_sample_time)) <= float(self.METADATA_TTL_S)
+
+    def _refresh_entry_metadata(self, entry: ActorEntry, *, now: float) -> None:
+        if entry.actor_type not in {ActorType.VLLM, ActorType.MEGATRON} or self._metadata_is_fresh(entry, now=now):
+            return
+        handle = entry.actor_handle or self._lookup_handle(entry.actor_name, entry.namespace)
+        if handle is None:
+            return
+        metadata = actor_observability_metadata(handle, timeout_s=self.METADATA_TIMEOUT_S)
+        if metadata is None:
+            return
+        sample_time = float(now)
+        if self.update_metadata(
+            entry.actor_name,
+            metadata=metadata,
+            sample_time=sample_time,
+            sample_source="cached_snapshot",
+        ):
+            entry.metadata = dict(metadata)
+            entry.metadata_sample_time = sample_time
+            entry.metadata_sample_source = "cached_snapshot"
+
+    def _cached_snapshot_record(self, entry: ActorEntry, *, now: float) -> dict[str, Any]:
+        rec: dict[str, Any] = {
+            "actor_name": entry.actor_name,
+            "actor_type": entry.actor_type.value,
+            "num_gpus": entry.num_gpus,
+            "base_model": entry.base_model,
+            "current_session": entry.current_session,
+            "node_id": entry.node_id,
+            "creating": entry.creating,
+            "protected": entry.protected,
+            "metadata": dict(entry.metadata or {}),
+            "idle": entry.is_idle(self.SESSION_IDLE_TIMEOUT),
+            "idle_time": entry.idle_time(),
+            "age": entry.age(),
+        }
+        if entry.rss_bytes is None or entry.rss_sample_time is None:
+            rec["rss_cache_state"] = "unknown"
+            return rec
+
+        sample_age = max(0.0, float(now) - float(entry.rss_sample_time))
+        rec["rss_sample_age_s"] = sample_age
+        if entry.rss_sample_source is not None:
+            rec["rss_sample_source"] = str(entry.rss_sample_source)
+        if sample_age <= float(self.RSS_TTL_S):
+            rec["rss_cache_state"] = "fresh"
+            rec["rss_bytes"] = int(entry.rss_bytes)
+        else:
+            rec["rss_cache_state"] = "stale"
+        return rec
+
+    def cached_snapshot(self) -> list[dict[str, Any]]:
+        now = time.time()
+        if not self._use_detached():
+            with self._pool_lock:
+                entries = list(self._entries.values())
+        else:
+            entries = self.iter_entries(prune_stale=True)
+        for entry in entries:
+            self._refresh_entry_metadata(entry, now=now)
+        return [self._cached_snapshot_record(entry, now=now) for entry in entries]
 
     def rss_snapshot(self, *, timeout_s: float = 10.0) -> list[dict]:
         out: list[dict] = []

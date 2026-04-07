@@ -576,7 +576,7 @@ async def lifespan(app: FastAPI):
     )
 
     if startup_owner:
-        await future_store.async_ensure_ready()
+        future_store.ensure_ready(require_hydrated_baseline=True)
         ensure_gateway_session_store_ready()
         ensure_sampling_session_store_ready()
         session_heartbeat_store.ensure_ready()

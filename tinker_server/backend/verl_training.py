@@ -534,6 +534,29 @@ class TrainingWorker:
         page_size = int(os.sysconf("SC_PAGE_SIZE"))
         return rss_pages * page_size
 
+    def get_observability_binding(self) -> dict[str, object]:
+        import socket
+
+        gpu_indices: list[int] = []
+        try:
+            for gpu_id in ray.get_gpu_ids():
+                if isinstance(gpu_id, (int, float)):
+                    gpu_indices.append(int(gpu_id))
+                else:
+                    gpu_indices.append(int(float(str(gpu_id))))
+        except Exception:
+            gpu_indices = []
+        node_id = None
+        try:
+            node_id = str(ray.get_runtime_context().get_node_id())
+        except Exception:
+            node_id = None
+        return {
+            "hostname": socket.gethostname(),
+            "node_id": node_id,
+            "gpu_indices": gpu_indices,
+        }
+
     def forward_backward(
         self,
         data_items: list[dict],
@@ -1705,6 +1728,52 @@ class VerlTrainingEngine:
             total_s=float(metrics.get("session_switch_total_s:sum", 0.0) or 0.0),
         )
 
+    def _record_training_operation(
+        self,
+        session: "TrainingSession",
+        *,
+        op: str,
+        status: str,
+        duration_s: float,
+    ) -> None:
+        from .runtime_observability import runtime_observability
+
+        runtime_observability.record_training_operation(
+            base_model=session.base_model,
+            backend=session.backend,
+            op=op,
+            status=status,
+            duration_s=duration_s,
+        )
+
+    def _record_training_operation_from_result(
+        self,
+        session: "TrainingSession",
+        *,
+        op: str,
+        result: dict | None,
+    ) -> None:
+        if not isinstance(result, dict):
+            return
+        metrics = result.get("metrics")
+        if not isinstance(metrics, dict):
+            return
+        ms_key = {
+            "forward_backward": "forward_backward_batch_ms",
+            "optim_step": "optim_step_batch_ms",
+        }.get(op)
+        if ms_key is None:
+            return
+        duration_ms = metrics.get(ms_key)
+        if not isinstance(duration_ms, (int, float)):
+            return
+        self._record_training_operation(
+            session,
+            op=op,
+            status="ok",
+            duration_s=max(0.0, float(duration_ms) / 1000.0),
+        )
+
     def _resolve_session_base_model(self, session: "TrainingSession") -> tuple[str | None, str | None]:
         """Resolve session base model to a local path (same policy as create_training_session)."""
         requested_model = session.base_model or self.default_base_model
@@ -1933,6 +2002,16 @@ class VerlTrainingEngine:
                 return await asyncio.to_thread(ray.get, awaitable, timeout=wait_s)
             except ray.exceptions.GetTimeoutError:
                 continue
+
+    def _training_remote_call_timeout_s(self, session: "TrainingSession", op: str) -> float | None:
+        configured = server_config.training_remote_call_timeout_s
+        if configured is not None:
+            configured = float(configured)
+            return configured if configured > 0 else None
+
+        if op == "train_step":
+            return 3600.0 if session.backend == "megatron" else 1200.0
+        return 1800.0 if session.backend == "megatron" else 600.0
 
     def _resolve_hf_model_path(self, hf_model_id: str) -> str | None:
         """Resolve HuggingFace model ID to local cache path.
@@ -2236,6 +2315,8 @@ class VerlTrainingEngine:
             Dict with loss_fn_outputs and metrics.
         """
         model_id = session.model_id
+        op_started_at = time.perf_counter()
+        workload_status = "error"
         worker = await self._get_live_worker(session, op="forward_backward")
 
         # Mark actor as recently used to prevent LRU eviction during training
@@ -2288,14 +2369,33 @@ class VerlTrainingEngine:
                 session.model_id,
                 traceparent=traceparent,
             )
-        result = await self._await_with_keepalive(pending, session, interval_s=30.0)
-
-        # Update session state
-        session.accumulated_gradients += 1
-        self._record_megatron_result_metrics(session, result)
-
-        logger.info(f"[{model_id}] forward_backward completed (loss_fn={loss_fn})")
-        return result
+        try:
+            result = await self._await_with_keepalive(
+                pending,
+                session,
+                interval_s=30.0,
+                timeout_s=self._training_remote_call_timeout_s(session, "forward_backward"),
+            )
+        except asyncio.CancelledError:
+            workload_status = "canceled"
+            raise
+        except Exception:
+            workload_status = "error"
+            raise
+        else:
+            workload_status = "ok"
+            # Update session state
+            session.accumulated_gradients += 1
+            self._record_megatron_result_metrics(session, result)
+            logger.info(f"[{model_id}] forward_backward completed (loss_fn={loss_fn})")
+            return result
+        finally:
+            self._record_training_operation(
+                session,
+                op="forward_backward",
+                status=workload_status,
+                duration_s=max(0.0, time.perf_counter() - op_started_at),
+            )
 
     async def forward_backward_reverse_kl(
         self,
@@ -2470,7 +2570,12 @@ class VerlTrainingEngine:
             )
         else:
             pending = worker.forward.remote(data_items, session.model_id, traceparent=traceparent)
-        result = await self._await_with_keepalive(pending, session, interval_s=30.0)
+        result = await self._await_with_keepalive(
+            pending,
+            session,
+            interval_s=30.0,
+            timeout_s=self._training_remote_call_timeout_s(session, "forward"),
+        )
         self._record_megatron_result_metrics(session, result)
 
         logger.info(f"[{model_id}] forward completed")
@@ -2510,6 +2615,8 @@ class VerlTrainingEngine:
             Dict with metrics.
         """
         model_id = session.model_id
+        op_started_at = time.perf_counter()
+        workload_status = "error"
         worker = await self._get_live_worker(session, op="optim_step")
 
         # Mark actor as recently used to prevent LRU eviction during training
@@ -2538,18 +2645,38 @@ class VerlTrainingEngine:
             )
         else:
             pending = worker.optim_step.remote(lr, session.model_id, traceparent=traceparent)
-        result = await self._await_with_keepalive(pending, session, interval_s=30.0)
+        try:
+            result = await self._await_with_keepalive(
+                pending,
+                session,
+                interval_s=30.0,
+                timeout_s=self._training_remote_call_timeout_s(session, "optim_step"),
+            )
+        except asyncio.CancelledError:
+            workload_status = "canceled"
+            raise
+        except Exception:
+            workload_status = "error"
+            raise
+        else:
+            workload_status = "ok"
+            # Update session state
+            session.current_step += 1
+            session.accumulated_gradients = 0
 
-        # Update session state
-        session.current_step += 1
-        session.accumulated_gradients = 0
+            # Add step to result metrics
+            result["metrics"]["step"] = session.current_step
+            self._record_megatron_result_metrics(session, result)
 
-        # Add step to result metrics
-        result["metrics"]["step"] = session.current_step
-        self._record_megatron_result_metrics(session, result)
-
-        logger.info(f"[{model_id}] optim_step: step={session.current_step}")
-        return result
+            logger.info(f"[{model_id}] optim_step: step={session.current_step}")
+            return result
+        finally:
+            self._record_training_operation(
+                session,
+                op="optim_step",
+                status=workload_status,
+                duration_s=max(0.0, time.perf_counter() - op_started_at),
+            )
 
     async def train_step(
         self,
@@ -2628,7 +2755,14 @@ class VerlTrainingEngine:
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
             )
-            result = await self._await_with_keepalive(pending, session, interval_s=30.0)
+            result = await self._await_with_keepalive(
+                pending,
+                session,
+                interval_s=30.0,
+                timeout_s=self._training_remote_call_timeout_s(session, "train_step"),
+            )
+            self._record_training_operation_from_result(session, op="forward_backward", result=result)
+            self._record_training_operation_from_result(session, op="optim_step", result=result)
         else:
             # Dense models: Use separate calls (they don't have param_offload issues)
             # Pass session_id for stateless trainer pattern
@@ -2652,7 +2786,30 @@ class VerlTrainingEngine:
                     session.model_id,
                     traceparent=traceparent,
                 )
-            fb_result = await self._await_with_keepalive(fb_pending, session, interval_s=30.0)
+            fb_started_at = time.perf_counter()
+            fb_status = "error"
+            try:
+                fb_result = await self._await_with_keepalive(
+                    fb_pending,
+                    session,
+                    interval_s=30.0,
+                    timeout_s=self._training_remote_call_timeout_s(session, "forward_backward"),
+                )
+            except asyncio.CancelledError:
+                fb_status = "canceled"
+                raise
+            except Exception:
+                fb_status = "error"
+                raise
+            else:
+                fb_status = "ok"
+            finally:
+                self._record_training_operation(
+                    session,
+                    op="forward_backward",
+                    status=fb_status,
+                    duration_s=max(0.0, time.perf_counter() - fb_started_at),
+                )
             if session.backend == "megatron":
                 opt_pending = worker.optim_step.remote(
                     lr,
@@ -2664,7 +2821,30 @@ class VerlTrainingEngine:
                 )
             else:
                 opt_pending = worker.optim_step.remote(lr, session.model_id, traceparent=traceparent)
-            opt_result = await self._await_with_keepalive(opt_pending, session, interval_s=30.0)
+            opt_started_at = time.perf_counter()
+            opt_status = "error"
+            try:
+                opt_result = await self._await_with_keepalive(
+                    opt_pending,
+                    session,
+                    interval_s=30.0,
+                    timeout_s=self._training_remote_call_timeout_s(session, "optim_step"),
+                )
+            except asyncio.CancelledError:
+                opt_status = "canceled"
+                raise
+            except Exception:
+                opt_status = "error"
+                raise
+            else:
+                opt_status = "ok"
+            finally:
+                self._record_training_operation(
+                    session,
+                    op="optim_step",
+                    status=opt_status,
+                    duration_s=max(0.0, time.perf_counter() - opt_started_at),
+                )
 
             # Merge results
             result = fb_result.copy()

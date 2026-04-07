@@ -37,7 +37,7 @@ from ..logging_context import (
 logger = logging.getLogger(__name__)
 
 # Import centralized PFS paths from config
-from tinker_server.config import PFS_PYTHONPATH, PFS_TINKER_PATH, RAY_NAMESPACE
+from tinker_server.config import PFS_PYTHONPATH, PFS_TINKER_PATH, RAY_NAMESPACE, config as server_config
 from tinker_server.backend.model_registry import get_model_config
 from tinker_server.ray_utils import init_ray
 from tinker_server.model_input_utils import flatten_encoded_text_chunks
@@ -726,6 +726,44 @@ class MegatronRankWorker:
         rss_pages = int(parts[1])
         page_size = int(os.sysconf("SC_PAGE_SIZE"))
         return rss_pages * page_size
+
+    def get_observability_binding(self) -> dict[str, object]:
+        import socket
+
+        gpu_indices: list[int] = []
+        try:
+            for gpu_id in ray.get_gpu_ids():
+                if isinstance(gpu_id, (int, float)):
+                    gpu_indices.append(int(gpu_id))
+                else:
+                    gpu_indices.append(int(float(str(gpu_id))))
+        except Exception:
+            gpu_indices = []
+        node_id = None
+        try:
+            node_id = str(ray.get_runtime_context().get_node_id())
+        except Exception:
+            node_id = None
+        mem: dict[str, int] = {}
+        try:
+            torch = _get_torch()
+            if torch.cuda.is_available():
+                allocated = int(torch.cuda.memory_allocated())
+                reserved = int(torch.cuda.memory_reserved())
+                mem = {
+                    "gpu_memory_allocated_bytes": allocated,
+                    "gpu_memory_reserved_bytes": reserved,
+                    "gpu_memory_fragmentation_bytes": max(0, reserved - allocated),
+                }
+        except Exception:
+            mem = {}
+        return {
+            "hostname": socket.gethostname(),
+            "node_id": node_id,
+            "gpu_indices": gpu_indices,
+            "rank": int(self.rank),
+            **mem,
+        }
 
     def _bind_traceparent(self, traceparent: str | None) -> None:
         if isinstance(traceparent, str) and traceparent:
@@ -6227,6 +6265,34 @@ class MegatronWorkerGroup:
         except Exception:
             pass
 
+    def _training_remote_call_timeout_s(self, op: str) -> float | None:
+        configured = server_config.training_remote_call_timeout_s
+        if configured is not None:
+            configured = float(configured)
+            return configured if configured > 0 else None
+
+        if op == "train_step":
+            return 3600.0
+        return 1800.0
+
+    def _ray_get_group_results(
+        self,
+        futures: list[ray.ObjectRef],
+        *,
+        op: str,
+        session_id: str | None,
+    ) -> list:
+        timeout_s = self._training_remote_call_timeout_s(op)
+        try:
+            if timeout_s is not None and timeout_s > 0:
+                return ray.get(futures, timeout=timeout_s)
+            return ray.get(futures)
+        except ray.exceptions.GetTimeoutError as e:
+            raise RuntimeError(
+                f"Megatron worker group {op} timed out after {timeout_s}s "
+                f"session_id={session_id!r} workers={len(self.workers)}"
+            ) from e
+
     def _initialize(self):
         """Create placement group, spawn workers, then initialize them all together."""
         world_size = self.config.world_size
@@ -6947,7 +7013,11 @@ class MegatronWorkerGroup:
                 )
                 for w in self.workers
             ]
-            results = ray.get(futures)
+            results = self._ray_get_group_results(
+                futures,
+                op="forward_backward",
+                session_id=effective_session_id,
+            )
             t3 = time.perf_counter() if timing else 0.0
         finally:
             self._stop_slow_group_watchdog(watchdog)
@@ -7166,7 +7236,11 @@ class MegatronWorkerGroup:
         # Send raw data_items to workers (TensorDict created locally on each worker
         # to avoid Ray serialization issues with nested tensors)
         futures = [w.forward.remote(data_items, reset_bias, traceparent=traceparent) for w in self.workers]
-        results = ray.get(futures)
+        results = self._ray_get_group_results(
+            futures,
+            op="forward",
+            session_id=effective_session_id,
+        )
 
         # Pick the first non-empty result (pipeline last stage).
         rank0_result = next((r for r in results if isinstance(r, dict) and r), {})
@@ -7402,7 +7476,11 @@ class MegatronWorkerGroup:
             )
             for w in self.workers
         ]
-        results = ray.get(futures)
+        results = self._ray_get_group_results(
+            futures,
+            op="optim_step",
+            session_id=effective_session_id,
+        )
         t3 = time.perf_counter() if timing else 0.0
         if timing:
             logger.info(
@@ -8128,6 +8206,62 @@ class MegatronWorkerGroup:
             "placement_requested_node_ips": list(dict.fromkeys(self._placement_requested_node_ips)),
         }
 
+    def get_observability_binding(self) -> dict[str, object]:
+        bindings: list[dict[str, object]] = []
+        allocated_bytes = 0
+        reserved_bytes = 0
+        fragmentation_bytes = 0
+        saw_memory = False
+        for worker in self.workers:
+            try:
+                binding = ray.get(worker.get_observability_binding.remote(), timeout=5)
+            except Exception:
+                continue
+            if not isinstance(binding, dict):
+                continue
+            gpu_indices = binding.get("gpu_indices")
+            if isinstance(gpu_indices, list):
+                for gpu_index in gpu_indices:
+                    bindings.append(
+                        {
+                            "hostname": binding.get("hostname"),
+                            "node_id": binding.get("node_id"),
+                            "gpu_index": int(gpu_index),
+                            "rank": binding.get("rank"),
+                        }
+                    )
+            for field_name, total_name in (
+                ("gpu_memory_allocated_bytes", "allocated"),
+                ("gpu_memory_reserved_bytes", "reserved"),
+                ("gpu_memory_fragmentation_bytes", "fragmentation"),
+            ):
+                value = binding.get(field_name)
+                if not isinstance(value, (int, float)):
+                    continue
+                saw_memory = True
+                if total_name == "allocated":
+                    allocated_bytes += max(0, int(value))
+                elif total_name == "reserved":
+                    reserved_bytes += max(0, int(value))
+                else:
+                    fragmentation_bytes += max(0, int(value))
+        out: dict[str, object] = {
+            "gpu_bindings": bindings,
+            "active_sessions": int(self._current_session is not None),
+            "session_unknown": int(bool(self._session_unknown_due_to_partial_swap)),
+            "session_step": max(0, int(self._step_count)),
+            "learning_rate": max(0.0, float(self.learning_rate)),
+        }
+        if saw_memory:
+            out.update(
+                {
+                    "gpu_memory_allocated_bytes": allocated_bytes,
+                    "gpu_memory_reserved_bytes": reserved_bytes,
+                    "gpu_memory_fragmentation_bytes": fragmentation_bytes,
+                }
+            )
+        return out
+
 
     # ========================================================================
     # Phase 6: Multi-Session Support Methods
@@ -8473,7 +8607,11 @@ def get_or_create_megatron_worker_group(
     Returns:
         Ray actor handle to MegatronWorkerGroup.
     """
-    from tinker_server.backend.resource_pool import get_resource_pool, ActorType
+    from tinker_server.backend.resource_pool import (
+        ActorType,
+        actor_observability_metadata,
+        get_resource_pool,
+    )
     from .model_registry import is_persistent_model
 
     config = distributed_config or DistributedConfig()
@@ -8530,6 +8668,7 @@ def get_or_create_megatron_worker_group(
                 namespace=PERSISTENT_NAMESPACE,
                 base_model=base_model,
                 protected=is_persistent,
+                metadata=dict(actor_observability_metadata(actor) or {}),
             )
             # Existing actor is already ready
             resource_pool.mark_ready(actor_name)
@@ -8687,6 +8826,7 @@ def get_or_create_megatron_worker_group(
                 base_model=base_model,
                 session_id=session_id,
                 protected=is_persistent,
+                metadata=dict(actor_observability_metadata(actor) or {}),
             )
             return actor
         finally:

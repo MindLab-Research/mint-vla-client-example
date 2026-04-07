@@ -397,6 +397,7 @@ class ServerConfig:
     )
     training_reinit_lora_timeout_s: float = 0.0
     training_actor_ready_timeout_s: float | None = None
+    training_remote_call_timeout_s: float | None = None
 
     # Persistent-prewarm settings (app.py)
     prewarm_persistent_models_csv: str = ""
@@ -473,6 +474,16 @@ class ServerConfig:
             float(actor_ready_timeout_env)
             if actor_ready_timeout_env is not None
             else (float(file_training.actor_ready_timeout_s) if file_training is not None and file_training.actor_ready_timeout_s is not None else None)
+        )
+        remote_call_timeout_env = _env_nonempty(environ, "MINT_TRAINING_REMOTE_CALL_TIMEOUT_S")
+        remote_call_timeout_s = (
+            float(remote_call_timeout_env)
+            if remote_call_timeout_env is not None
+            else (
+                float(file_training.remote_call_timeout_s)
+                if file_training is not None and file_training.remote_call_timeout_s is not None
+                else None
+            )
         )
 
         return cls(
@@ -748,6 +759,7 @@ class ServerConfig:
                 0.0,
             ),
             training_actor_ready_timeout_s=actor_ready_timeout_s,
+            training_remote_call_timeout_s=remote_call_timeout_s,
             router_replay_mode=_pick_str(
                 "MINT_ROUTER_REPLAY_MODE",
                 None,
