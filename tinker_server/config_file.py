@@ -93,6 +93,10 @@ class _FutureStoreSection(BaseModel):
     queue_ttl_s: float | None = None
     done_ttl_s: float | None = None
     tombstone_ttl_s: float | None = None
+    replay_root_dir: str | None = None
+    replay_hot_ttl_s: float | None = None
+    replay_disk_ttl_s: float | None = None
+    replay_sweep_interval_s: float | None = None
 
 
 class _TrainingSection(BaseModel):
@@ -104,6 +108,7 @@ class _TrainingSection(BaseModel):
 
     megatron_create_timeout_s: float | None = None
     dense_get_or_create_timeout_s: float | None = None
+    dense_session_state_root: str | None = None
     reinit_lora_timeout_s: float | None = None
     actor_ready_timeout_s: float | None = None
 

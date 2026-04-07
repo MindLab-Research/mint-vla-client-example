@@ -226,42 +226,40 @@ PY
    ```
    Do not assume the shared PFS copy of the template is current. Submit the checked-in local template you are actually reviewing.
 
-2. **Get head IP from logs:**
+2. **Get head IP from logs and confirm PFS publication:**
    ```bash
    ssh mint-dev '/root/.volc/bin/volc ml_task logs -t <head_task_id> -i worker_0 | grep \"Local node IP\"'
+   ssh mint-dev 'cat /vePFS-Mindverse/share/code/tinker-server/ray_head_ip.txt'
    ```
 
-3. **Copy template and fill in head IP + choose GPU queue:**
+3. **Copy worker template and set only the GPU queue:**
    ```bash
    cp .claude/skills/volcano-cluster/configs/mint-dev-worker.yaml /tmp/mint-dev-worker.yaml
-   sed -i "s/<RAY_HEAD_IP>/<actual_ip>/g" /tmp/mint-dev-worker.yaml
    sed -i "s/<GPU_QUEUE_ID>/<queue_id>/g" /tmp/mint-dev-worker.yaml
    ```
+   `mint-dev-worker.yaml` reads the head IP from `/vePFS-Mindverse/share/code/tinker-server/ray_head_ip.txt`, so do not patch the head IP into the worker template.
    Choose a GPU queue that is currently available in the Volcano console. If only prod GPU queues are available, get user approval before submitting dev workers.
 
-4. **Submit worker from temp file:**
+4. **Submit one worker task per node:**
    ```bash
-   ssh mint-dev '/root/.volc/bin/volc ml_task submit -c /tmp/mint-dev-worker.yaml --output json'
+   for i in 1 2 3 4 5 6; do
+     ssh mint-dev "/root/.volc/bin/volc ml_task submit -c /tmp/mint-dev-worker.yaml --task_name mint_dev_worker${i} --output json"
+   done
    ```
 
-5. **Join `mint-dev` as a zero-resource Ray driver node before any `ray.init(...)` or API-server startup:**
-   - After a fresh dev-cluster rebuild, direct `ray.init(address=...)` from `mint-dev` can fail with local `node_ip_address.json` / missing-local-raylet errors.
-   - The working pattern is to attach `mint-dev` to the rebuilt head with **zero CPUs and zero GPUs**, so it is not a schedulable compute node.
-   - Do **not** use `hostname -I | awk '{print $1}'` for the API-host IP. Derive the source IP from the route to the head.
+5. **Do not run `ray start` on `mint-dev`:**
+   - `mint-dev` is a driver/API host. Starting a local raylet makes it schedulable and can steal actor placement.
+   - Dev uses Ray client mode, so the bastion does not need to join the cluster as a zero-resource driver node.
+   - Use `ray.init(address=...)` in Python or Ray CLI commands that connect to the head directly.
 
    ```bash
-   ssh mint-dev "python3 - <<'PY'\nimport socket\ns=socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\ns.connect(('<RAY_HEAD_IP>', 6379))\nprint(s.getsockname()[0])\ns.close()\nPY"
-   ssh mint-dev "/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/ray stop --force || true"
-   ssh mint-dev "/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/ray start --address='<RAY_HEAD_IP>:6379' --num-cpus=0 --num-gpus=0 --disable-usage-stats"
    ssh mint-dev "/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/ray status --address='<RAY_HEAD_IP>:6379'"
+   ssh mint-dev "/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python - <<'PY'\nimport ray\nray.init(address='<RAY_HEAD_IP>:6379')\nprint(ray.cluster_resources())\nray.shutdown()\nPY"
    ```
-   For API-host server startup after this attach, also export:
-   - `MINT_RAY_NODE_IP_ADDRESS=<route-derived API IP>`
-   - `MINT_RAY_TEMP_DIR=/tmp/<fresh-ray-temp-dir>`
 
 ### Production Cluster
 
-Prod head writes IP to PFS automatically. Workers read from PFS.
+Prod head self-heals the Ray control plane, writes IP to PFS automatically, and keeps dashboard plus Ray client disabled. Workers read from PFS.
 
 1. **Submit head:**
    ```bash
@@ -296,9 +294,10 @@ PY
      /root/.volc/bin/volc ml_task submit -c "$tmp" --output json'
    ```
 
-4. **DO NOT run `ray start` on `mint-prod-volcano`:**
-   - This host is a driver/API bastion. Starting a local raylet makes it schedulable and can steal actor placement.
-   - Use `ray.init(address=...)` in Python or Ray CLI commands that connect to the head without starting a local node.
+4. **Production join is a bootstrap step, not a test step:**
+   - `mint-prod-volcano` may need the documented one-time local 0-GPU join before the production API server can start cleanly.
+   - Do not repeat `ray start` during normal tests or inspection once that join is already in place.
+   - For tests and connectivity checks, use `ray.init(address=...)` in Python or Ray CLI commands that connect to the head directly.
 
    ```bash
    ssh mint-prod-volcano "ray status --address='<RAY_HEAD_IP>:6379'"

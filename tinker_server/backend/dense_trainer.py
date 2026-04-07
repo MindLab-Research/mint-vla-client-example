@@ -248,7 +248,7 @@ def get_or_create_dense_trainer(
 
             if actor is None:
                 pool.ensure_gpus_available(DEFAULT_NUM_GPUS)
-                from ..config import actor_runtime_env_vars, otel_env_vars
+                from ..config import actor_runtime_env_vars, config as server_config, otel_env_vars
                 runtime_env = {
                     "env_vars": actor_runtime_env_vars(
                         pythonpath=PFS_PYTHONPATH_DENSE,

@@ -208,8 +208,8 @@ Every item below is runnable now and tied either to a related issue/PR or to a c
 
 | id | provenance | model | gpu_required | runner | reveals |
 |---|---|---|---:|---|---|
-| `resume_training_dense_0p6b` | PR 315 contract generalized to dense | `Qwen/Qwen3-0.6B` | 1 | `TINKER_MODEL=Qwen/Qwen3-0.6B python scripts/tools/reproduce_issue_315_resume_training.py` | `save_state` plus `create_model_from_state(..., load_optimizer=true)` preserves training continuity instead of spiking back to fresh-session behavior. |
-| `resume_training_moe_30b` | PR 315 and issue 283 | `Qwen/Qwen3-30B-A3B-Instruct-2507` | 4 | `TINKER_MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507 python scripts/tools/reproduce_issue_315_resume_training.py` | Megatron resume continuity with optimizer restore on the live 30B path. |
+| `resume_training_dense_0p6b` | PR 315 contract generalized to dense | `Qwen/Qwen3-0.6B` | 1 | `TINKER_MODEL=Qwen/Qwen3-0.6B python scripts/tools/reproduce_issue_315_resume_training.py` | Exercises three resume surfaces explicitly: live-session `load_state(..., optimizer=true)`, fresh-session weights-only rollback to an older checkpoint, `create_model_from_state(..., load_optimizer=true)`, and a fresh `create_model` followed by `load_state(..., optimizer=true)`, then checks post-resume training continuity. |
+| `resume_training_moe_30b` | PR 315, issue 283, and issue 404 follow-up | `Qwen/Qwen3-30B-A3B-Instruct-2507` | 4 | `TINKER_MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507 python scripts/tools/reproduce_issue_315_resume_training.py` | Exercises the 30B Megatron resume family explicitly: live-session `load_state(..., optimizer=true)`, fresh-session weights-only rollback to an older checkpoint while the actor is on a newer checkpoint, `create_model_from_state(..., load_optimizer=true)`, and a fresh `create_model` plus `load_state(..., optimizer=true)`. This is the current merge-gate coverage for the illegal-CUDA same-actor resume family. |
 
 ### Concurrency and Isolation
 

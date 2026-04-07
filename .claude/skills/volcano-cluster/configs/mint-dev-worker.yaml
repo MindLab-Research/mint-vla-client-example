@@ -23,6 +23,7 @@ Entrypoint: |
   # Connect to Ray head published by mint-dev-head.
   set -euo pipefail
   python3 - <<'PY'
+  import os
   import socket
   import time
 
@@ -31,6 +32,8 @@ Entrypoint: |
   from ray._private.parameter import RayParams
 
   HEAD_IP_PATH = "/vePFS-Mindverse/share/code/tinker-server/ray_head_ip.txt"
+  RAY_TMP_ROOT_BASE = "/vePFS-Mindverse/share/mint_data/dev_cluster_tmp/worker"
+  RAY_TMP_LINK = "/tmp/mdw"
   CHECK_INTERVAL_S = 10
 
 
@@ -69,8 +72,24 @@ Entrypoint: |
 
   ip = ray.util.get_node_ip_address()
   print(f"Local node IP: {ip}", flush=True)
+  ray_tmp_root_real = f"{RAY_TMP_ROOT_BASE}/{ip.replace('.', '-')}"
+  ray_temp_dir = f"{RAY_TMP_LINK}/t"
+  ray_object_spilling_dir = f"{RAY_TMP_LINK}/s"
 
   while True:
+      os.makedirs(ray_tmp_root_real, exist_ok=True)
+      if os.path.lexists(RAY_TMP_LINK):
+          if os.path.islink(RAY_TMP_LINK) or os.path.isfile(RAY_TMP_LINK):
+              os.unlink(RAY_TMP_LINK)
+          else:
+              raise RuntimeError(f"refusing to replace non-link temp path: {RAY_TMP_LINK}")
+      os.symlink(ray_tmp_root_real, RAY_TMP_LINK)
+      os.makedirs(ray_temp_dir, exist_ok=True)
+      os.makedirs(ray_object_spilling_dir, exist_ok=True)
+      print(
+          f"mint-dev worker using temp_dir={ray_temp_dir} object_spilling_directory={ray_object_spilling_dir} real_root={ray_tmp_root_real}",
+          flush=True,
+      )
       head = _read_head()
       print(f"mint-dev worker connecting to head: {head}", flush=True)
       node = None
@@ -78,6 +97,8 @@ Entrypoint: |
           ray_params = RayParams(
               gcs_address=head,
               num_gpus=8,
+              temp_dir=ray_temp_dir,
+              object_spilling_directory=ray_object_spilling_dir,
           )
           node = Node(ray_params, head=False, shutdown_at_exit=False, spawn_reaper=False)
           while True:

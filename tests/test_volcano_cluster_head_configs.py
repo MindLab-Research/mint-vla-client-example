@@ -1,0 +1,71 @@
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEV_HEAD = REPO_ROOT / ".claude" / "skills" / "volcano-cluster" / "configs" / "mint-dev-head.yaml"
+DEV_WORKER = REPO_ROOT / ".claude" / "skills" / "volcano-cluster" / "configs" / "mint-dev-worker.yaml"
+PROD_HEAD = REPO_ROOT / ".claude" / "skills" / "volcano-cluster" / "configs" / "mint-prod-head.yaml"
+PROD_WORKER = REPO_ROOT / ".claude" / "skills" / "volcano-cluster" / "configs" / "mint-prod-worker.yaml"
+
+
+def test_dev_head_keeps_dashboard_and_ray_client_enabled() -> None:
+    text = DEV_HEAD.read_text(encoding="utf-8")
+
+    assert 'HEAD_IP_PATH = "/vePFS-Mindverse/share/code/tinker-server/ray_head_ip.txt"' in text
+    assert 'RAY_TMP_ROOT_REAL = "/vePFS-Mindverse/share/mint_data/dev_cluster_tmp/head"' in text
+    assert 'RAY_TMP_LINK = "/tmp/mdh"' in text
+    assert 'temp_dir=RAY_TEMP_DIR' in text
+    assert 'object_spilling_directory=RAY_OBJECT_SPILLING_DIR' in text
+    assert 'os.symlink(RAY_TMP_ROOT_REAL, RAY_TMP_LINK)' in text
+    assert "include_dashboard=True" in text
+    assert 'dashboard_host="0.0.0.0"' in text
+    assert "dashboard_port=8265" in text
+    assert "ray_client_server_port=10001" in text
+    assert '_port_open("127.0.0.1", 6379)' in text
+    assert "node.dead_processes()" in text
+
+
+
+def test_dev_worker_uses_short_temp_paths() -> None:
+    text = DEV_WORKER.read_text(encoding="utf-8")
+
+    assert 'HEAD_IP_PATH = "/vePFS-Mindverse/share/code/tinker-server/ray_head_ip.txt"' in text
+    assert 'RAY_TMP_ROOT_BASE = "/vePFS-Mindverse/share/mint_data/dev_cluster_tmp/worker"' in text
+    assert 'RAY_TMP_LINK = "/tmp/mdw"' in text
+    assert "ip.replace('.', '-')" in text
+    assert 'temp_dir=ray_temp_dir' in text
+    assert 'object_spilling_directory=ray_object_spilling_dir' in text
+    assert 'os.symlink(ray_tmp_root_real, RAY_TMP_LINK)' in text
+    assert "node.dead_processes()" in text
+
+
+def test_prod_head_self_heals_without_dashboard_or_ray_client() -> None:
+    text = PROD_HEAD.read_text(encoding="utf-8")
+
+    assert 'HEAD_IP_PATH = "/vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt"' in text
+    assert "BACKOFF_INITIAL_S = 5" in text
+    assert "BACKOFF_MAX_S = 60" in text
+    assert "BACKOFF_RESET_AFTER_HEALTHY_CHECKS = 6" in text
+    assert "include_dashboard=False" in text
+    assert "dashboard_host=" not in text
+    assert "dashboard_port=" not in text
+    assert "ray_client_server_port=" not in text
+    assert '_port_open("127.0.0.1", 6379)' in text
+    assert "node.dead_processes()" in text
+    assert "kill_all_processes(check_alive=False, allow_graceful=False, wait=True)" in text
+    assert "restart_delay_s = min(BACKOFF_MAX_S, restart_delay_s * 2)" in text
+
+
+def test_prod_worker_self_heals_with_backoff() -> None:
+    text = PROD_WORKER.read_text(encoding="utf-8")
+
+    assert 'HEAD_IP_PATH = Path("/vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt")' in text
+    assert "BACKOFF_INITIAL_S = 5" in text
+    assert "BACKOFF_MAX_S = 60" in text
+    assert "BACKOFF_RESET_AFTER_HEALTHY_CHECKS = 6" in text
+    assert "def _read_head_ip() -> str:" in text
+    assert "_port_open(head_ip, 6379)" in text
+    assert "node.dead_processes()" in text
+    assert "kill_all_processes(check_alive=False, allow_graceful=False, wait=True)" in text
+    assert "restart_delay_s = min(BACKOFF_MAX_S, restart_delay_s * 2)" in text
+    assert "sleep 300" not in text

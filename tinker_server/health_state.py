@@ -5,13 +5,24 @@ from typing import Any
 
 
 @dataclass(frozen=True)
-class StartupDegradedState:
+class DegradedState:
     reason: str
     error: str
     details: dict[str, Any]
 
 
-_STARTUP_DEGRADED: StartupDegradedState | None = None
+_STARTUP_DEGRADED: DegradedState | None = None
+_RUNTIME_DEGRADED: DegradedState | None = None
+
+
+def _to_payload(state: DegradedState | None) -> dict[str, Any] | None:
+    if state is None:
+        return None
+    return {
+        "reason": state.reason,
+        "error": state.error,
+        "details": dict(state.details),
+    }
 
 
 def clear_startup_degraded_state() -> None:
@@ -19,9 +30,23 @@ def clear_startup_degraded_state() -> None:
     _STARTUP_DEGRADED = None
 
 
+def clear_runtime_degraded_state() -> None:
+    global _RUNTIME_DEGRADED
+    _RUNTIME_DEGRADED = None
+
+
 def set_startup_degraded_state(*, reason: str, error: str, details: dict[str, Any] | None = None) -> None:
     global _STARTUP_DEGRADED
-    _STARTUP_DEGRADED = StartupDegradedState(
+    _STARTUP_DEGRADED = DegradedState(
+        reason=str(reason),
+        error=str(error),
+        details={} if details is None else dict(details),
+    )
+
+
+def set_runtime_degraded_state(*, reason: str, error: str, details: dict[str, Any] | None = None) -> None:
+    global _RUNTIME_DEGRADED
+    _RUNTIME_DEGRADED = DegradedState(
         reason=str(reason),
         error=str(error),
         details={} if details is None else dict(details),
@@ -29,11 +54,9 @@ def set_startup_degraded_state(*, reason: str, error: str, details: dict[str, An
 
 
 def get_startup_degraded_state() -> dict[str, Any] | None:
-    if _STARTUP_DEGRADED is None:
-        return None
-    return {
-        "reason": _STARTUP_DEGRADED.reason,
-        "error": _STARTUP_DEGRADED.error,
-        "details": dict(_STARTUP_DEGRADED.details),
-    }
+    return _to_payload(_STARTUP_DEGRADED)
+
+
+def get_runtime_degraded_state() -> dict[str, Any] | None:
+    return _to_payload(_RUNTIME_DEGRADED)
 

@@ -112,3 +112,28 @@ def test_assert_node_ip_capacity_reports_missing_node(
             required_gpus_by_node_ip={"10.0.0.9": 8},
             context="single-node vllm pin",
         )
+
+
+def test_available_resources_per_node_safe_falls_back_in_ray_client_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vp = _import_volc_placement(monkeypatch)
+    expected = {"node-1": {"GPU": 4.0}}
+
+    class _RaySystemError(RuntimeError):
+        pass
+
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        sys.modules["ray._private"].state,
+        "available_resources_per_node",
+        lambda: (_ for _ in ()).throw(_RaySystemError("Ray has not been started yet")),
+    )
+    vp.ray.remote = lambda **_kwargs: (  # type: ignore[attr-defined]
+        lambda fn: SimpleNamespace(remote=lambda: (calls.append("remote"), expected)[1])
+    )
+    vp.ray.get = lambda ref: ref  # type: ignore[attr-defined]
+
+    assert vp._available_resources_per_node_safe() == expected
+    assert calls == ["remote"]

@@ -57,6 +57,7 @@ from ..models.types import (
 )
 from ..logging_context import classify_failure_reason, get_otel_tracer, run_async_with_otel_span, set_request_id
 from ..model_access_control import can_access_model, get_access_denied_error
+from ..queue_priority import merge_queue_priority_extra
 from ..webhook import EventType, send_task_event
 
 if TYPE_CHECKING:
@@ -71,6 +72,26 @@ router = APIRouter()
 training_manager: TrainingSessionManager | None = None
 training_engine: VerlTrainingEngine | None = None
 inference_manager: SessionManager | None = None  # For multi-LoRA sampling registration
+
+
+def _mark_training_inflight(model_id: str, delta: int) -> None:
+    if training_manager is None:
+        return
+    mark = getattr(training_manager, "mark_inflight", None)
+    if callable(mark):
+        mark(model_id, delta)
+
+
+async def _fail_future(request_id: str, error: str) -> None:
+    async_fail = getattr(future_store, "async_fail", None)
+    if callable(async_fail):
+        await async_fail(request_id, error)
+        return
+    fail = getattr(future_store, "fail", None)
+    if callable(fail):
+        fail(request_id, error)
+        return
+    raise AttributeError("future_store has neither async_fail nor fail")
 
 
 def _get_user_data(request: Request) -> dict | None:
@@ -94,6 +115,30 @@ def _build_execution_serial_extra(*, model_id: str, extra: dict | None = None) -
     payload = {} if extra is None else dict(extra)
     payload["execution_serial_key"] = f"training_session:{model_id}"
     return payload
+
+
+async def _get_route_training_store_info(model_id: str) -> dict | None:
+    from ..routes.training import _get_training_route_session_info
+
+    info = await _get_training_route_session_info(model_id)
+    if isinstance(info, dict):
+        return info
+    if training_manager is not None:
+        return None
+
+    try:
+        from ..backend.training_session_store import async_get_training_session_info
+
+        store_info = await async_get_training_session_info(model_id)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail="Training session store unavailable") from e
+    return store_info if isinstance(store_info, dict) else None
+
+
+async def _protect_training_session_enqueue_window(session_info: dict) -> None:
+    from ..routes.training import _protect_training_session_enqueue_window as _training_protect
+
+    await _training_protect(session_info)
 
 
 async def _enqueue_weights_request_with_trace(
@@ -427,9 +472,8 @@ async def save_weights(
         upstream_for_alias,
     )
 
-    session = training_manager.get_session(request.model_id) if training_manager is not None else None
-
-    if session is None:
+    store_info = await _get_route_training_store_info(request.model_id)
+    if not isinstance(store_info, dict):
         remote = await async_remote_training_model(request.model_id)
         if remote is not None:
             upstream_alias, base_model = remote
@@ -466,12 +510,10 @@ async def save_weights(
                 request_id=encode_request_id(upstream_alias=upstream_alias, upstream_request_id=upstream_request_id)
             )
 
-    if training_engine is None or training_manager is None:
-        raise HTTPException(status_code=503, detail="Training engine not initialized")
-
-    if session is None:
+    if not isinstance(store_info, dict):
         raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
 
+    await _protect_training_session_enqueue_window(store_info)
     user_id = _get_user_id(http_request)
     webhook_url = _get_webhook_url(http_request)
     from ..client_compat import prefer_tinker_uri
@@ -499,7 +541,7 @@ async def save_weights(
     inflight_marked = False
     try:
         if training_manager is not None:
-            training_manager.mark_inflight(request.model_id, +1)
+            _mark_training_inflight(request.model_id, +1)
             inflight_marked = True
         await future_store.async_create_with_id(request_id)
         created = True
@@ -515,15 +557,18 @@ async def save_weights(
                 request_json=request_json,
                 user_id=user_id,
                 webhook_url=webhook_url,
-                extra=_build_execution_serial_extra(
-                    model_id=request.model_id,
-                    extra={"prefer_tinker": bool(prefer_tinker)},
+                extra=merge_queue_priority_extra(
+                    _build_execution_serial_extra(
+                        model_id=request.model_id,
+                        extra={"prefer_tinker": bool(prefer_tinker)},
+                    ),
+                    request=http_request,
                 ),
             ),
         )
     except Exception as e:
         if inflight_marked and training_manager is not None:
-            training_manager.mark_inflight(request.model_id, -1)
+            _mark_training_inflight(request.model_id, -1)
         await capacity_manager.async_release_all(request_id)
         if created:
             await future_store.async_cleanup(request_id)
@@ -554,8 +599,8 @@ async def save_state(
         upstream_for_alias,
     )
 
-    session = training_manager.get_session(request.model_id) if training_manager is not None else None
-    if session is None:
+    store_info = await _get_route_training_store_info(request.model_id)
+    if not isinstance(store_info, dict):
         remote = await async_remote_training_model(request.model_id)
         if remote is not None:
             upstream_alias, base_model = remote
@@ -592,12 +637,10 @@ async def save_state(
                 request_id=encode_request_id(upstream_alias=upstream_alias, upstream_request_id=upstream_request_id)
             )
 
-    if training_engine is None or training_manager is None:
-        raise HTTPException(status_code=503, detail="Training engine not initialized")
-
-    if session is None:
+    if not isinstance(store_info, dict):
         raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
 
+    await _protect_training_session_enqueue_window(store_info)
     user_id = _get_user_id(http_request)
     webhook_url = _get_webhook_url(http_request)
     from ..client_compat import prefer_tinker_uri
@@ -624,7 +667,7 @@ async def save_state(
     inflight_marked = False
     try:
         if training_manager is not None:
-            training_manager.mark_inflight(request.model_id, +1)
+            _mark_training_inflight(request.model_id, +1)
             inflight_marked = True
         await future_store.async_create_with_id(request_id)
         created = True
@@ -640,15 +683,18 @@ async def save_state(
                 request_json=request_json,
                 user_id=user_id,
                 webhook_url=webhook_url,
-                extra=_build_execution_serial_extra(
-                    model_id=request.model_id,
-                    extra={"prefer_tinker": bool(prefer_tinker)},
+                extra=merge_queue_priority_extra(
+                    _build_execution_serial_extra(
+                        model_id=request.model_id,
+                        extra={"prefer_tinker": bool(prefer_tinker)},
+                    ),
+                    request=http_request,
                 ),
             ),
         )
     except Exception as e:
         if inflight_marked and training_manager is not None:
-            training_manager.mark_inflight(request.model_id, -1)
+            _mark_training_inflight(request.model_id, -1)
         await capacity_manager.async_release_all(request_id)
         if created:
             await future_store.async_cleanup(request_id)
@@ -706,7 +752,7 @@ async def _do_save_state(
             attributes={
                 "model_id": str(request.model_id),
                 "base_model": str(session.base_model),
-                "backend": str(session.backend),
+                "backend": str(getattr(session, "backend", "unknown")),
                 "checkpoint_type": "training",
                 "checkpoint_name": str(checkpoint_name),
             },
@@ -738,7 +784,7 @@ async def _do_save_state(
             "step": session.current_step,
             "checkpoint_type": "training",
             "optimizer_present": optimizer_present,
-            "backend": session.backend,
+            "backend": getattr(session, "backend", "unknown"),
             "type": "training",
             "storage_tier": "persistent_cache",
             "ttl_seconds": request.ttl_seconds,
@@ -772,7 +818,7 @@ async def _do_save_state(
             checkpoint_type="training",
         )
 
-        future_store.resolve(request_id, {
+        await future_store.async_resolve(request_id, {
             "checkpoint_id": checkpoint_name,
             "path": selected_path,
             "mint_path": mint_path,
@@ -809,7 +855,7 @@ async def _do_save_state(
             type(e).__name__,
             "check_training_session_and_checkpoint_path",
         )
-        await future_store.async_fail(request_id, str(e))
+        await _fail_future(request_id, str(e))
 
         # 发送 failed 状态
         if webhook_url and user_id:
@@ -827,7 +873,7 @@ async def _do_save_state(
             )
     finally:
         if inflight_marked and training_manager is not None:
-            training_manager.mark_inflight(request.model_id, -1)
+            _mark_training_inflight(request.model_id, -1)
 
 
 async def _do_save_weights(
@@ -882,7 +928,7 @@ async def _do_save_weights(
             attributes={
                 "model_id": str(request.model_id),
                 "base_model": str(session.base_model),
-                "backend": str(session.backend),
+                "backend": str(getattr(session, "backend", "unknown")),
                 "checkpoint_type": "sampler",
                 "checkpoint_name": str(checkpoint_name),
             },
@@ -904,7 +950,7 @@ async def _do_save_weights(
             "step": session.current_step,
             "checkpoint_type": "sampler",
             "optimizer_present": False,
-            "backend": session.backend,
+            "backend": getattr(session, "backend", "unknown"),
             "type": "sampler",
             "storage_tier": "persistent_cache",
             "ttl_seconds": request.ttl_seconds,
@@ -938,7 +984,7 @@ async def _do_save_weights(
             checkpoint_type="sampler",
         )
 
-        future_store.resolve(
+        await future_store.async_resolve(
             request_id,
             {
                 "checkpoint_id": checkpoint_name,
@@ -977,7 +1023,7 @@ async def _do_save_weights(
             type(e).__name__,
             "check_sampler_checkpoint_export",
         )
-        await future_store.async_fail(request_id, str(e))
+        await _fail_future(request_id, str(e))
 
         if webhook_url and user_id:
             failed_session_id = session.model_id if session is not None else request.model_id
@@ -993,7 +1039,7 @@ async def _do_save_weights(
             )
     finally:
         if inflight_marked and training_manager is not None:
-            training_manager.mark_inflight(request.model_id, -1)
+            _mark_training_inflight(request.model_id, -1)
 
 
 # =============================================================================
@@ -1017,8 +1063,8 @@ async def load_state(
         upstream_for_alias,
     )
 
-    session = training_manager.get_session(request.model_id) if training_manager is not None else None
-    remote = None if session is not None else await async_remote_training_model(request.model_id)
+    store_info = await _get_route_training_store_info(request.model_id)
+    remote = None if isinstance(store_info, dict) else await async_remote_training_model(request.model_id)
     if remote is not None:
         upstream_alias, base_model = remote
         upstream = upstream_for_alias(upstream_alias)
@@ -1089,13 +1135,10 @@ async def load_state(
             request_id=encode_request_id(upstream_alias=upstream_alias, upstream_request_id=upstream_request_id)
         )
 
-    if training_engine is None or training_manager is None:
-        raise HTTPException(status_code=503, detail="Training engine not initialized")
-
-    session = training_manager.get_session(request.model_id)
-    if session is None:
+    if not isinstance(store_info, dict):
         raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
 
+    await _protect_training_session_enqueue_window(store_info)
     user_id = _get_user_id(http_request)
     load_path = _resolve_mint_path(request.path, user_id=user_id, is_admin=is_admin_request(http_request))
     request = request.model_copy(update={"path": load_path})
@@ -1135,7 +1178,7 @@ async def load_state(
     inflight_marked = False
     try:
         if training_manager is not None:
-            training_manager.mark_inflight(request.model_id, +1)
+            _mark_training_inflight(request.model_id, +1)
             inflight_marked = True
         await future_store.async_create_with_id(request_id)
         created = True
@@ -1151,12 +1194,15 @@ async def load_state(
                 request_json=request_json,
                 user_id=user_id,
                 webhook_url=None,
-                extra=_build_execution_serial_extra(model_id=request.model_id),
+                extra=merge_queue_priority_extra(
+                    _build_execution_serial_extra(model_id=request.model_id),
+                    request=http_request,
+                ),
             ),
         )
     except Exception as e:
         if inflight_marked and training_manager is not None:
-            training_manager.mark_inflight(request.model_id, -1)
+            _mark_training_inflight(request.model_id, -1)
         await capacity_manager.async_release_all(request_id)
         if created:
             await future_store.async_cleanup(request_id)
@@ -1198,12 +1244,12 @@ async def _do_load_state(
             attributes={
                 "model_id": str(request.model_id),
                 "base_model": str(session.base_model),
-                "backend": str(session.backend),
+                "backend": str(getattr(session, "backend", "unknown")),
                 "load_optimizer": bool(request.optimizer),
             },
         )
 
-        future_store.resolve(request_id, {
+        await future_store.async_resolve(request_id, {
             "path": request.path,
             "type": "load_weights",
         })
@@ -1217,10 +1263,10 @@ async def _do_load_state(
             type(e).__name__,
             "check_checkpoint_contract_and_permissions",
         )
-        await future_store.async_fail(request_id, str(e))
+        await _fail_future(request_id, str(e))
     finally:
         if inflight_marked and training_manager is not None:
-            training_manager.mark_inflight(request.model_id, -1)
+            _mark_training_inflight(request.model_id, -1)
 
 
 # =============================================================================

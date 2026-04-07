@@ -5,6 +5,7 @@ Uses verl's Ray-based vLLM infrastructure for scalable inference.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 
@@ -25,7 +26,7 @@ from typing import TYPE_CHECKING, Any
 import ray
 
 from tinker_server.backend.model_registry import get_model_config
-from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
+from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, otel_env_vars
 from tinker_server.config import config as server_config
 from tinker_server.logging_context import (
     get_current_traceparent,
@@ -729,7 +730,7 @@ def _create_extended_server_class(
             try:
                 from tinker_server.backend.future_store import future_store
 
-                future_store.update_meta(
+                await future_store.async_update_meta(
                     request_id,
                     meta={
                         "stage": stage,
@@ -1061,6 +1062,16 @@ def _create_extended_server_class(
                 lora_path=lora_path,
             )
 
+            deadline = time.time() + float(os.environ.get("MINT_VLLM_ENGINE_READY_WAIT_S", "30"))
+            engine_ready = False
+            while time.time() < deadline:
+                if await self.is_engine_ready():
+                    engine_ready = True
+                    break
+                await asyncio.sleep(0.1)
+            if not engine_ready:
+                raise RuntimeError("vLLM engine not ready before add_lora_from_path")
+
             await self._maybe_ensure_pack_moe_patched_for_adapter_dir(lora_path)
             await self.engine.add_lora(lora_request)
 
@@ -1170,7 +1181,7 @@ def _create_extended_server_class(
             try:
                 from tinker_server.backend.future_store import future_store
 
-                future_store.update_meta(
+                await future_store.async_update_meta(
                     request_id,
                     meta={
                         "stage": "prefill",
@@ -1435,7 +1446,7 @@ def _create_extended_server_class(
             try:
                 from tinker_server.backend.future_store import future_store
 
-                future_store.update_meta(
+                await future_store.async_update_meta(
                     request_id,
                     meta={
                         "stage": "prefill",

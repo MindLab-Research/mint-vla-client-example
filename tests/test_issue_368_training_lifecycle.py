@@ -61,12 +61,26 @@ class _StubTrainingManager:
 
 class _StubTrainingEngine:
     def __init__(self):
-        self.shutdown_calls = []
+        self.unbind_calls = []
+        self.delete_calls = []
         self._workers = {}
         self._resource_pool_actor_names = {}
 
+    async def unbind_session(self, session):
+        self.unbind_calls.append(session.model_id)
+        session.is_active = False
+
     async def shutdown_session(self, session):
-        self.shutdown_calls.append(session.model_id)
+        await self.delete_session(session)
+
+    async def delete_session(self, session):
+        self.delete_calls.append(session.model_id)
+        worker = self._workers.get(session.model_id)
+        delete_session = getattr(worker, "delete_session", None) if worker is not None else None
+        if delete_session is not None:
+            delete_session.remote(session.model_id)
+        self._workers.pop(session.model_id, None)
+        self._resource_pool_actor_names.pop(session.model_id, None)
         session.is_active = False
 
 
@@ -123,26 +137,15 @@ async def test_issue_368_cleanup_stale_training_sessions(monkeypatch: pytest.Mon
 
     monkeypatch.setattr(training_routes, "training_manager", manager)
     monkeypatch.setattr(training_routes, "training_engine", engine)
+
+    async def _async_fail_training_requests_for_model(model_id: str, error: str) -> list[str]:
+        failed_future_calls.append((model_id, error))
+        return ["req-stale"]
+
     monkeypatch.setattr(
         training_routes.future_store,
-        "fail_training_requests_for_model",
-        lambda model_id, error: failed_future_calls.append((model_id, error)) or ["req-stale"],
-    )
-    monkeypatch.setattr(
-        training_store_module,
-        "list_training_sessions",
-        lambda: [
-            {
-                "model_id": stale_session.model_id,
-                "session_id": stale_session.session_id,
-                "actor_name": "dedicated-stale-actor",
-            },
-            {
-                "model_id": live_session.model_id,
-                "session_id": live_session.session_id,
-                "actor_name": "dedicated-live-actor",
-            },
-        ],
+        "async_fail_training_requests_for_model",
+        _async_fail_training_requests_for_model,
     )
     monkeypatch.setattr(
         training_store_module,
@@ -155,14 +158,17 @@ async def test_issue_368_cleanup_stale_training_sessions(monkeypatch: pytest.Mon
         lambda: SimpleNamespace(clear_session=lambda model_id: cleared_model_ids.append(model_id)),
     )
 
-    cleaned = await training_routes.cleanup_stale_training_sessions_once(stale_after_s=123.0)
+    deleted = await training_routes._best_effort_delete_training_session(
+        stale_session.model_id,
+        reason="stale heartbeat (> 123.0s)",
+        allow_actor_shutdown=True,
+    )
 
-    assert cleaned == ["model-stale"]
-    assert engine.shutdown_calls == ["model-stale"]
+    assert deleted is True
+    assert engine.delete_calls == ["model-stale"]
     assert manager.deleted == ["model-stale"]
     assert deleted_model_ids == ["model-stale"]
     assert cleared_model_ids == ["model-stale"]
-    assert heartbeat_store.calls == [("sess-stale", 123.0), ("sess-live", 123.0)]
     assert failed_future_calls == [
         ("model-stale", "Training session terminated due to stale heartbeat (> 123.0s)")
     ]
@@ -178,21 +184,15 @@ async def test_issue_368_cleanup_can_restore_session_before_shutdown(monkeypatch
 
     monkeypatch.setattr(training_routes, "training_manager", manager)
     monkeypatch.setattr(training_routes, "training_engine", engine)
+
+    async def _async_fail_training_requests_for_model(model_id: str, error: str) -> list[str]:
+        _ = (model_id, error)
+        return []
+
     monkeypatch.setattr(
         training_routes.future_store,
-        "fail_training_requests_for_model",
-        lambda model_id, error: [],
-    )
-    monkeypatch.setattr(
-        training_store_module,
-        "list_training_sessions",
-        lambda: [
-            {
-                "model_id": restored.model_id,
-                "session_id": restored.session_id,
-                "actor_name": "dedicated-actor",
-            }
-        ],
+        "async_fail_training_requests_for_model",
+        _async_fail_training_requests_for_model,
     )
     monkeypatch.setattr(
         training_store_module,
@@ -200,16 +200,24 @@ async def test_issue_368_cleanup_can_restore_session_before_shutdown(monkeypatch
         lambda model_id: deleted_model_ids.append(model_id),
     )
     monkeypatch.setattr(heartbeat_store_module, "session_heartbeat_store", heartbeat_store)
-    monkeypatch.setattr(training_routes, "_restore_training_session", lambda model_id: restored)
+
+    async def _restore_training_session(_model_id: str):
+        return restored
+
+    monkeypatch.setattr(training_routes, "_restore_training_session", _restore_training_session)
     monkeypatch.setattr(
         "tinker_server.backend.resource_pool.get_resource_pool",
         lambda: SimpleNamespace(clear_session=lambda model_id: None),
     )
 
-    cleaned = await training_routes.cleanup_stale_training_sessions_once(stale_after_s=60.0)
+    deleted = await training_routes._best_effort_delete_training_session(
+        restored.model_id,
+        reason="stale heartbeat (> 60.0s)",
+        allow_actor_shutdown=True,
+    )
 
-    assert cleaned == ["model-restore"]
-    assert engine.shutdown_calls == ["model-restore"]
+    assert deleted is True
+    assert engine.delete_calls == ["model-restore"]
     assert deleted_model_ids == ["model-restore"]
 
 
@@ -223,21 +231,15 @@ async def test_issue_368_cleanup_aborts_if_future_fail_path_errors(monkeypatch: 
 
     monkeypatch.setattr(training_routes, "training_manager", manager)
     monkeypatch.setattr(training_routes, "training_engine", engine)
+
+    async def _async_fail_training_requests_for_model(model_id: str, error: str) -> list[str]:
+        _ = (model_id, error)
+        raise RuntimeError("future-store-down")
+
     monkeypatch.setattr(
         training_routes.future_store,
-        "fail_training_requests_for_model",
-        lambda model_id, error: (_ for _ in ()).throw(RuntimeError("future-store-down")),
-    )
-    monkeypatch.setattr(
-        training_store_module,
-        "list_training_sessions",
-        lambda: [
-            {
-                "model_id": stale_session.model_id,
-                "session_id": stale_session.session_id,
-                "actor_name": "dedicated-stale-actor",
-            }
-        ],
+        "async_fail_training_requests_for_model",
+        _async_fail_training_requests_for_model,
     )
     monkeypatch.setattr(
         training_store_module,
@@ -250,10 +252,14 @@ async def test_issue_368_cleanup_aborts_if_future_fail_path_errors(monkeypatch: 
         lambda: SimpleNamespace(clear_session=lambda model_id: None),
     )
 
-    cleaned = await training_routes.cleanup_stale_training_sessions_once(stale_after_s=60.0)
+    deleted = await training_routes._best_effort_delete_training_session(
+        stale_session.model_id,
+        reason="stale heartbeat (> 60.0s)",
+        allow_actor_shutdown=True,
+    )
 
-    assert cleaned == []
-    assert engine.shutdown_calls == []
+    assert deleted is False
+    assert engine.delete_calls == []
     assert manager.deleted == []
     assert deleted_model_ids == []
 
@@ -275,18 +281,15 @@ async def test_issue_368_cleanup_skips_shared_actor_shutdown_after_restore(
 
     monkeypatch.setattr(training_routes, "training_manager", manager)
     monkeypatch.setattr(training_routes, "training_engine", engine)
+
+    async def _async_fail_training_requests_for_model(model_id: str, error: str) -> list[str]:
+        _ = (model_id, error)
+        return []
+
     monkeypatch.setattr(
         training_routes.future_store,
-        "fail_training_requests_for_model",
-        lambda model_id, error: [],
-    )
-    monkeypatch.setattr(
-        training_store_module,
-        "list_training_sessions",
-        lambda: [
-            {"model_id": stale.model_id, "session_id": stale.session_id, "actor_name": "shared-actor"},
-            {"model_id": live.model_id, "session_id": live.session_id, "actor_name": "shared-actor"},
-        ],
+        "async_fail_training_requests_for_model",
+        _async_fail_training_requests_for_model,
     )
     monkeypatch.setattr(
         training_store_module,
@@ -294,17 +297,25 @@ async def test_issue_368_cleanup_skips_shared_actor_shutdown_after_restore(
         lambda model_id: deleted_model_ids.append(model_id),
     )
     monkeypatch.setattr(heartbeat_store_module, "session_heartbeat_store", heartbeat_store)
-    monkeypatch.setattr(training_routes, "_restore_training_session", lambda model_id: stale)
+
+    async def _restore_training_session(_model_id: str):
+        return stale
+
+    monkeypatch.setattr(training_routes, "_restore_training_session", _restore_training_session)
     monkeypatch.setitem(sys.modules, "ray", SimpleNamespace(get=lambda value, timeout=None: value))
     monkeypatch.setattr(
         "tinker_server.backend.resource_pool.get_resource_pool",
         lambda: SimpleNamespace(clear_session=lambda model_id: None),
     )
 
-    cleaned = await training_routes.cleanup_stale_training_sessions_once(stale_after_s=60.0)
+    deleted = await training_routes._best_effort_delete_training_session(
+        stale.model_id,
+        reason="stale heartbeat (> 60.0s)",
+        allow_actor_shutdown=False,
+    )
 
-    assert cleaned == ["model-stale"]
-    assert engine.shutdown_calls == []
+    assert deleted is True
+    assert engine.delete_calls == []
     assert shared_worker.delete_calls == ["model-stale"]
     assert deleted_model_ids == ["model-stale"]
     assert stale.model_id not in engine._workers
@@ -313,8 +324,8 @@ async def test_issue_368_cleanup_skips_shared_actor_shutdown_after_restore(
 
 def test_issue_368_sync_training_session_step_bumps_when_result_has_no_step(monkeypatch: pytest.MonkeyPatch) -> None:
     actor = _StubTrainingStoreActor()
-    monkeypatch.setattr(training_store_module, "bump_training_session_step", actor._bump_step)
-    monkeypatch.setattr(training_store_module, "set_training_session_step", actor._set_step)
+    monkeypatch.setattr(training_store_module, "bump_training_session_step_best_effort", actor._bump_step)
+    monkeypatch.setattr(training_store_module, "set_training_session_step_best_effort", actor._set_step)
 
     result = future_store_module._sync_training_session_step(
         {"op": "training.optim_step", "model_id": "model-a"},
@@ -323,15 +334,15 @@ def test_issue_368_sync_training_session_step_bumps_when_result_has_no_step(monk
 
     assert actor.bump_calls == ["model-a"]
     assert actor.set_calls == []
-    assert result["metrics"]["step"] == 7
+    assert "step" not in result["metrics"]
 
 
 def test_issue_368_sync_training_session_step_uses_reported_step_when_present(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     actor = _StubTrainingStoreActor()
-    monkeypatch.setattr(training_store_module, "bump_training_session_step", actor._bump_step)
-    monkeypatch.setattr(training_store_module, "set_training_session_step", actor._set_step)
+    monkeypatch.setattr(training_store_module, "bump_training_session_step_best_effort", actor._bump_step)
+    monkeypatch.setattr(training_store_module, "set_training_session_step_best_effort", actor._set_step)
 
     result = future_store_module._sync_training_session_step(
         {"op": "training.train_step", "model_id": "model-b"},
@@ -343,28 +354,35 @@ def test_issue_368_sync_training_session_step_uses_reported_step_when_present(
     assert result["metrics"]["step"] == 11
 
 
-def test_issue_368_fail_training_requests_for_model_releases_capacity(
+@pytest.mark.anyio
+async def test_issue_368_fail_training_requests_for_model_releases_capacity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     actor = _StubFutureStoreActor(["req-1", "req-2"])
     store = future_store_module.FutureStore()
     released_request_ids = []
 
-    monkeypatch.setattr(store, "_get_ray_actor", lambda: actor)
+    monkeypatch.setattr(store, "_get_cached_ray_actor_for_async_request_path", lambda: actor)
+
+    async def _fake_await_ray_ref(value):
+        return value
+
+    monkeypatch.setattr(future_store_module, "_await_ray_ref", _fake_await_ray_ref)
     monkeypatch.setitem(
         sys.modules,
         "ray",
-        SimpleNamespace(
-            get=lambda value: value,
-            exceptions=SimpleNamespace(ActorDiedError=RuntimeError),
-        ),
-    )
-    monkeypatch.setattr(
-        "tinker_server.backend.capacity_manager.capacity_manager.release_all",
-        lambda request_id: released_request_ids.append(request_id),
+        SimpleNamespace(exceptions=SimpleNamespace(ActorDiedError=RuntimeError)),
     )
 
-    failed = store.fail_training_requests_for_model("model-z", "stale heartbeat")
+    async def _async_release_all(request_id: str) -> None:
+        released_request_ids.append(request_id)
+
+    monkeypatch.setattr(
+        "tinker_server.backend.capacity_manager.capacity_manager.async_release_all",
+        _async_release_all,
+    )
+
+    failed = await store.async_fail_training_requests_for_model("model-z", "stale heartbeat")
 
     assert failed == ["req-1", "req-2"]
     assert actor.calls == [("model-z", "stale heartbeat")]
