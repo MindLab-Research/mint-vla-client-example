@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -98,6 +99,31 @@ def test_checkpoint_namespace_resolution_falls_back_to_legacy_flat_dir(tmp_path,
         "tinker://run-hotfix/sampler_weights/0002",
         user_id="owner-a",
     ) == str(legacy_dir)
+
+
+def test_checkpoint_namespace_rejects_untyped_uri(tmp_path, monkeypatch) -> None:
+    from tinker_server import checkpoints
+
+    persistent_root = tmp_path / "tos"
+    runtime_root = tmp_path / "runtime"
+    _mk_checkpoint_view(
+        persistent_root,
+        owner="owner-a",
+        run_id="run-hotfix",
+        name="0002",
+        checkpoint_type="sampler",
+        typed=False,
+    )
+
+    monkeypatch.setattr(checkpoints, "CHECKPOINTS_DIR", str(persistent_root))
+    monkeypatch.setattr(checkpoints, "PERSISTENT_CHECKPOINTS_DIR", str(persistent_root))
+    monkeypatch.setattr(checkpoints, "RUNTIME_CHECKPOINTS_DIR", str(runtime_root))
+
+    with pytest.raises(ValueError, match="explicit checkpoint type"):
+        checkpoints.resolve_checkpoint_path(
+            "mint://run-hotfix/0002",
+            user_id="owner-a",
+        )
 
 
 def test_checkpoint_namespace_reap_typed_ephemeral_leaf(tmp_path, monkeypatch) -> None:

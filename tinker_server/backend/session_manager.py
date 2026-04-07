@@ -336,7 +336,7 @@ class SessionManager:
         """Resolve model_path URI to filesystem path.
 
         Args:
-            model_path: URI like file:///path, mint://{uuid}/..., or absolute path.
+            model_path: URI like file:///path, mint://{run_id}/{kind}/{name}, or absolute path.
 
         Returns:
             Absolute filesystem path to adapter directory.

@@ -105,7 +105,10 @@ def test_mint_interpolate_route_enqueues_expected_request(monkeypatch) -> None:
     resp = client.post(
         "/api/v1/mint/checkpoints/interpolate",
         json={
-            "source_paths": ["mint://teacher/ckpt-a", "mint://student/ckpt-b"],
+            "source_paths": [
+                "mint://teacher/sampler_weights/ckpt-a",
+                "mint://student/sampler_weights/ckpt-b",
+            ],
             "coefficients": [0.9, 0.1],
             "output_path": "ema-0010",
         },
@@ -123,8 +126,8 @@ def test_mint_interpolate_route_enqueues_expected_request(monkeypatch) -> None:
     assert queued["op"] == "mint.interpolate_checkpoints"
     assert queued["user_id"] == "user-a"
     assert queued["request_json"]["source_paths"] == [
-        "mint://teacher/ckpt-a",
-        "mint://student/ckpt-b",
+        "mint://teacher/sampler_weights/ckpt-a",
+        "mint://student/sampler_weights/ckpt-b",
     ]
 
 
@@ -200,7 +203,7 @@ def test_mint_reverse_kl_route_and_background_path(monkeypatch) -> None:
 
     payload = {
         "model_id": "model-123",
-        "reference_model_path": "mint://teacher/ref-step-0010",
+        "reference_model_path": "mint://teacher/sampler_weights/ref-step-0010",
         "temperature": 1.0,
         "data": [
             {
@@ -293,7 +296,7 @@ def test_mint_reverse_kl_route_uses_detached_training_info_without_route_runtime
 
     payload = {
         "model_id": "model-123",
-        "reference_model_path": "mint://teacher/ref-step-0010",
+        "reference_model_path": "mint://teacher/sampler_weights/ref-step-0010",
         "temperature": 1.0,
         "data": [
             {
@@ -340,7 +343,7 @@ def test_mint_reverse_kl_route_propagates_detached_store_503(monkeypatch) -> Non
 
     payload = {
         "model_id": "model-123",
-        "reference_model_path": "mint://teacher/ref-step-0010",
+        "reference_model_path": "mint://teacher/sampler_weights/ref-step-0010",
         "temperature": 1.0,
         "data": [
             {
@@ -400,7 +403,7 @@ def test_mint_reverse_kl_route_refreshes_detached_enqueue_protection(monkeypatch
 
     payload = {
         "model_id": "model-123",
-        "reference_model_path": "mint://teacher/ref-step-0010",
+        "reference_model_path": "mint://teacher/sampler_weights/ref-step-0010",
         "temperature": 1.0,
         "data": [
             {

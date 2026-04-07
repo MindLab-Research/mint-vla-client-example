@@ -572,13 +572,6 @@ def _existing_checkpoint_view(
             return candidate
         if checkpoint_has_lora_weights(candidate) or checkpoint_has_optimizer_state(candidate):
             return candidate
-    if checkpoint_type is None and os.path.isdir(path) and not os.path.exists(os.path.join(path, "metadata.json")):
-        training_dir = os.path.join(path, "training")
-        sampler_dir = os.path.join(path, "sampler")
-        if os.path.isdir(training_dir):
-            return training_dir
-        if os.path.isdir(sampler_dir):
-            return sampler_dir
     return None
 
 
@@ -607,6 +600,11 @@ def resolve_checkpoint_uri(
         return uri
 
     checkpoint_type = _checkpoint_type_from_uri_path(raw_path_part)
+    if checkpoint_type is None:
+        raise ValueError(
+            "Checkpoint URIs must include an explicit checkpoint type "
+            "('/weights/' or '/sampler_weights/')."
+        )
     path_part = _strip_tinker_checkpoint_kind(raw_path_part)
 
     if is_admin:

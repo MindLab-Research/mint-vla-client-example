@@ -185,21 +185,20 @@ def _resolve_mint_path(mint_uri: str, *, user_id: str | None, is_admin: bool = F
     Args:
         mint_uri: One of:
             - checkpoint_id (ckpt_xxx): Search in all checkpoint directories
-            - mint://{model_id}/{name}: Legacy format -> /checkpoints/{model_id}/{name}
+            - tinker://{model_id}/{weights|sampler_weights}/{name}
+            - mint://{model_id}/{weights|sampler_weights}/{name}
             - file:///path: Strip prefix
             - Absolute path: Return as-is
 
     Returns:
         Filesystem path.
     """
-    resolved = resolve_checkpoint_path(mint_uri, user_id=user_id, is_admin=is_admin)
+    try:
+        resolved = resolve_checkpoint_path(mint_uri, user_id=user_id, is_admin=is_admin)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     ensure_checkpoint_path_allowed(resolved, user_id=user_id, is_admin=is_admin)
     return materialize_persistent_checkpoint(resolved)
-
-
-def _to_mint_path(model_id: str, checkpoint_name: str) -> str:
-    """Convert to mint://{model_id}/ URI (legacy format)."""
-    return f"mint://{model_id}/{checkpoint_name}"
 
 
 def _checkpoint_rank(storage_tier: str | None) -> int:
@@ -839,7 +838,12 @@ async def _do_save_state(
 
         from ..client_compat import checkpoint_uri
 
-        mint_path = _to_mint_path(session.model_id, checkpoint_name)
+        mint_path = checkpoint_uri(
+            session.model_id,
+            checkpoint_name,
+            prefer_tinker=False,
+            checkpoint_type="training",
+        )
         tinker_path = checkpoint_uri(
             session.model_id,
             checkpoint_name,
@@ -1008,7 +1012,12 @@ async def _do_save_weights(
 
         from ..client_compat import checkpoint_uri
 
-        mint_path = _to_mint_path(session.model_id, checkpoint_name)
+        mint_path = checkpoint_uri(
+            session.model_id,
+            checkpoint_name,
+            prefer_tinker=False,
+            checkpoint_type="sampler",
+        )
         tinker_path = checkpoint_uri(
             session.model_id,
             checkpoint_name,
@@ -1117,7 +1126,12 @@ async def load_state(
         incoming_headers = dict(http_request.headers)
         json_body = request.model_dump()
         if request.path.startswith(("tinker://", "mint://", "ckpt_")):
-            local_path = resolve_checkpoint_path(request.path, user_id=user_id, is_admin=is_admin_request(http_request))
+            try:
+                local_path = resolve_checkpoint_path(
+                    request.path, user_id=user_id, is_admin=is_admin_request(http_request)
+                )
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
             try:
                 ensure_checkpoint_path_allowed(local_path, user_id=user_id, is_admin=is_admin_request(http_request))
             except PermissionError as e:

@@ -44,7 +44,10 @@ def _get_user_id(request: Request) -> str | None:
 
 
 def _resolve_checkpoint_for_user(path: str, *, user_id: str | None, is_admin: bool) -> str:
-    resolved = resolve_checkpoint_path(path, user_id=user_id, is_admin=is_admin)
+    try:
+        resolved = resolve_checkpoint_path(path, user_id=user_id, is_admin=is_admin)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     ensure_checkpoint_path_allowed(resolved, user_id=user_id, is_admin=is_admin)
     return materialize_persistent_checkpoint(resolved)
 

@@ -1304,7 +1304,10 @@ def _resolve_state_path(state_uri: str, *, user_id: str | None, is_admin: bool =
     if not is_admin and not state_uri.startswith(("tinker://", "mint://", "ckpt_")):
         raise HTTPException(status_code=403, detail="Access denied")
 
-    resolved = resolve_checkpoint_path(state_uri, user_id=user_id, is_admin=is_admin)
+    try:
+        resolved = resolve_checkpoint_path(state_uri, user_id=user_id, is_admin=is_admin)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     if state_uri.startswith("ckpt_") and resolved == state_uri:
         raise HTTPException(status_code=404, detail="Checkpoint not found")
     try:
