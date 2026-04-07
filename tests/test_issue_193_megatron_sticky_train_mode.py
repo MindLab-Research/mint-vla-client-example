@@ -10,8 +10,10 @@ pytest.importorskip("ray")
 from tinker_server.backend.megatron_distributed import (
     DistributedConfig,
     MegatronRankWorker,
+    MegatronSessionStateManager,
     MegatronWorkerGroup,
     _GRADIENTS_CONSUMED,
+    _make_megatron_actor_name,
 )
 
 
@@ -2461,3 +2463,169 @@ def test_issue_193_long_forward_backward_refreshes_sticky_idle_timer(monkeypatch
 
     assert reused["reused"] is True
     assert state["exit"] == 0
+
+
+def test_issue_193_swap_session_persists_actor_only_state_and_recovers_cold(monkeypatch, tmp_path):
+    monkeypatch.setenv("MINT_MEGATRON_SESSIONS_BASE_PATH", str(tmp_path))
+    worker, _ = _make_worker(monkeypatch)
+
+    snapshots = {
+        "s1": {
+            "grads": ["grad-s1"],
+            "opt": {"optimizer_0": {"step": 3}},
+            "lr": {"last_epoch": 5},
+        },
+        "s2": {
+            "grads": ["grad-s2"],
+            "opt": {"optimizer_0": {"step": 4}},
+            "lr": {"last_epoch": 7},
+        },
+    }
+    restored = {"grads": None, "opt": None, "lr": None, "reset_count": 0, "zero_count": 0}
+
+    worker._current_session_id = "s1"
+    worker._capture_gradients = lambda: list(snapshots[worker._current_session_id]["grads"])  # type: ignore[index,method-assign]
+    worker._capture_optimizer_state = lambda: dict(snapshots[worker._current_session_id]["opt"])  # type: ignore[index,method-assign]
+    worker._capture_lr_scheduler_state = lambda: dict(snapshots[worker._current_session_id]["lr"])  # type: ignore[index,method-assign]
+    worker._restore_gradients = lambda grads: restored.__setitem__("grads", list(grads))  # type: ignore[method-assign]
+    worker._restore_optimizer_state = lambda state: restored.__setitem__("opt", state)  # type: ignore[method-assign]
+    worker._restore_lr_scheduler_state = lambda state: restored.__setitem__("lr", state)  # type: ignore[method-assign]
+    worker._reset_optimizer_state = lambda: restored.__setitem__("reset_count", restored["reset_count"] + 1)  # type: ignore[method-assign]
+    worker.engine.optimizer_zero_grad = lambda: restored.__setitem__("zero_count", restored["zero_count"] + 1)  # type: ignore[method-assign]
+
+    first = worker.swap_session_state("s2")
+
+    manifest_path = tmp_path / "s1_checkpoint" / "actor_only_state" / "rank_0000.pt"
+    assert first["incoming_source"] == "new"
+    assert first["outgoing_persisted"]["bytes"] > 0
+    assert manifest_path.exists()
+    assert worker._session_hot_cache.keys() == {"s1"}
+
+    worker._drop_hot_session("s1")
+    worker._current_session_id = "s2"
+    restored["grads"] = None
+    restored["opt"] = None
+    restored["lr"] = None
+
+    second = worker.swap_session_state("s1", require_persisted=True)
+
+    assert second["incoming_source"] == "cold"
+    assert restored["grads"] == ["grad-s1"]
+    assert restored["opt"] == {"optimizer_0": {"step": 3}}
+    assert restored["lr"] == {"last_epoch": 5}
+
+
+def test_issue_193_hot_cache_eviction_keeps_persisted_snapshots(monkeypatch, tmp_path):
+    monkeypatch.setenv("MINT_MEGATRON_SESSIONS_BASE_PATH", str(tmp_path))
+    monkeypatch.setenv("MINT_MEGATRON_MAX_HOT_SESSIONS_PER_ACTOR", "1")
+    worker, _ = _make_worker(monkeypatch)
+
+    snapshots = {
+        "s1": {"grads": ["grad-s1"], "opt": {"optimizer_0": {"step": 1}}, "lr": {}},
+        "s2": {"grads": ["grad-s2"], "opt": {"optimizer_0": {"step": 2}}, "lr": {}},
+    }
+    worker._current_session_id = "s1"
+    worker._capture_gradients = lambda: list(snapshots[worker._current_session_id]["grads"])  # type: ignore[index,method-assign]
+    worker._capture_optimizer_state = lambda: dict(snapshots[worker._current_session_id]["opt"])  # type: ignore[index,method-assign]
+    worker._capture_lr_scheduler_state = lambda: dict(snapshots[worker._current_session_id]["lr"])  # type: ignore[index,method-assign]
+    worker._restore_gradients = lambda grads: None  # type: ignore[method-assign]
+    worker._restore_optimizer_state = lambda state: None  # type: ignore[method-assign]
+    worker._restore_lr_scheduler_state = lambda state: None  # type: ignore[method-assign]
+    worker._reset_optimizer_state = lambda: None  # type: ignore[method-assign]
+    worker.engine.optimizer_zero_grad = lambda: None  # type: ignore[method-assign]
+
+    worker.swap_session_state("s2")
+    cache_after_first = worker.get_hot_cache_info()
+    assert cache_after_first["hot_sessions"] == ["s1"]
+
+    worker._current_session_id = "s2"
+    worker.swap_session_state("s3")
+
+    cache_after_second = worker.get_hot_cache_info()
+    assert cache_after_second["hot_sessions"] == ["s2"]
+    assert cache_after_second["last_eviction_reason"] == "max_hot_sessions>1"
+
+    s1_rank_snapshot = tmp_path / "s1_checkpoint" / "actor_only_state" / "rank_0000.pt"
+    assert s1_rank_snapshot.exists()
+    assert worker._session_hot_cache.keys() == {"s2"}
+
+
+
+def test_issue_193_session_cache_diagnostics_reports_partial_residency(monkeypatch, tmp_path):
+    monkeypatch.setenv("MINT_MEGATRON_SESSIONS_BASE_PATH", str(tmp_path))
+
+    manager = MegatronSessionStateManager(base_path=str(tmp_path))
+    actor_name = _make_megatron_actor_name("Qwen/Qwen3-0.6B")
+    manager.save_persisted_actor_only_state(
+        "s-hot",
+        actor_name=actor_name,
+        worker_entries=[
+            {"rank": 0, "path": str(tmp_path / "s-hot-r0.pt"), "bytes": 40},
+            {"rank": 1, "path": str(tmp_path / "s-hot-r1.pt"), "bytes": 61},
+        ],
+    )
+    manager.save_persisted_actor_only_state(
+        "s-partial",
+        actor_name=actor_name,
+        worker_entries=[
+            {"rank": 0, "path": str(tmp_path / "s-partial-r0.pt"), "bytes": 100},
+            {"rank": 1, "path": str(tmp_path / "s-partial-r1.pt"), "bytes": 102},
+        ],
+    )
+    manager.save_persisted_actor_only_state(
+        "s-cold",
+        actor_name=actor_name,
+        worker_entries=[
+            {"rank": 0, "path": str(tmp_path / "s-cold-r0.pt"), "bytes": 101},
+            {"rank": 1, "path": str(tmp_path / "s-cold-r1.pt"), "bytes": 202},
+        ],
+    )
+    manager.save_persisted_actor_only_state(
+        "s-current",
+        actor_name=actor_name,
+        worker_entries=[
+            {"rank": 0, "path": str(tmp_path / "s-current-r0.pt"), "bytes": 200},
+            {"rank": 1, "path": str(tmp_path / "s-current-r1.pt"), "bytes": 204},
+        ],
+    )
+
+    class _RemoteCall:
+        def __init__(self, result):
+            self._result = result
+
+        def remote(self):
+            return self._result
+
+    class _Worker:
+        def __init__(self, hot_sessions, hot_bytes, last_eviction_reason=None):
+            self.get_hot_cache_info = _RemoteCall(
+                {
+                    "hot_sessions": hot_sessions,
+                    "hot_bytes": hot_bytes,
+                    "last_eviction_reason": last_eviction_reason,
+                }
+            )
+
+    group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
+    group = object.__new__(group_cls)
+    group.workers = [
+        _Worker(["s-hot", "s-partial"], 111, None),
+        _Worker(["s-hot"], 222, "max_hot_bytes>256"),
+    ]
+    group.base_model = "Qwen/Qwen3-0.6B"
+    group._session_manager = manager
+    group._current_session = "s-current"
+
+    monkeypatch.setattr(sys.modules[MegatronWorkerGroup.__module__].ray, "get", lambda refs: refs)
+
+    diagnostics = group._get_session_cache_diagnostics()
+
+    assert diagnostics["hot_sessions"] == ["s-hot"]
+    assert diagnostics["hot_session_count"] == 1
+    assert diagnostics["partially_hot_sessions"] == ["s-partial"]
+    assert diagnostics["partially_hot_session_count"] == 1
+    assert diagnostics["cold_sessions"] == ["s-cold"]
+    assert diagnostics["cold_session_count"] == 1
+    assert diagnostics["hot_bytes"] == 333
+    assert diagnostics["cold_bytes"] == 303
+    assert diagnostics["last_eviction_reason"] == "max_hot_bytes>256"

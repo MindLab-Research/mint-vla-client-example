@@ -124,7 +124,7 @@ def test_issue_230_keepalive_touches_dense_actor_without_inflight_mark(monkeypat
     pool.unregister(actor_name)
 
 
-def test_issue_230_shutdown_session_keeps_shared_dense_actor_pinned(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_issue_230_unbind_session_keeps_shared_dense_actor_pinned(monkeypatch: pytest.MonkeyPatch) -> None:
     pool = get_resource_pool()
     actor_name = f"peft_trainer_test_{uuid.uuid4().hex}_maxr64"
     model_id = f"model_{uuid.uuid4().hex}"
@@ -164,7 +164,7 @@ def test_issue_230_shutdown_session_keeps_shared_dense_actor_pinned(monkeypatch:
 
     monkeypatch.setattr(verl_training.ray_kill, "kill", _fake_kill)
 
-    asyncio.run(engine.shutdown_session(session))
+    asyncio.run(engine.unbind_session(session))
 
     assert killed == []
     assert model_id not in engine._resource_pool_actor_names
