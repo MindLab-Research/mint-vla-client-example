@@ -1,43 +1,46 @@
 ---
 name: telemetry-direct-query
 description: |
-  Direct VictoriaMetrics, VictoriaLogs, and VictoriaTraces querying with curl,
-  HTTPie, or Python when `obsh` is unavailable.
+  Direct VictoriaMetrics, VictoriaLogs, and VictoriaTraces querying with a local
+  Python helper, HTTPie, or raw curl when `obsh` is unavailable.
 
   Use for: incident triage from error text, `request_id`, `trace_id`, endpoint,
   or a narrow time window when only raw HTTP access is available.
 
   Triggers: "victoria", "victoriametrics", "victorialogs", "victoriatraces",
   "telemetry query", "observability query", "promql", "logsql", "trace_id",
-  "request_id", "curl observability", "httpie observability"
+  "request_id", "httpie observability", "curl observability"
 ---
 
 # telemetry-direct-query
 
 Use this skill when `obsh` is unavailable and you must query Victoria directly.
+Prefer the local Python helper. It removes most shell quoting errors and keeps
+all three backends behind one CLI.
+
 The three query surfaces are:
 
-1. VictoriaLogs: text search and id-first narrowing
-2. VictoriaTraces: Jaeger-compatible trace search and trace fetch
+1. VictoriaLogs: LogSQL search and id-first narrowing
+2. VictoriaTraces: Jaeger-compatible trace discovery and trace fetch
 3. VictoriaMetrics: PromQL instant and range queries
 
-Do not guess endpoints from memory. Current recorded defaults from
-`/vePFS-Mindverse/user/nolanho/docs/grafana/README.md` are:
+Current recorded defaults from `/vePFS-Mindverse/user/nolanho/docs/grafana/README.md`:
 
 - `VICTORIA_LOGS_URL=http://192.168.4.70:9428`
 - `VICTORIA_TRACES_URL=http://192.168.4.70:10428`
 - `VICTORIA_METRICS_URL=http://192.168.4.70:8428`
 
 If the task provides a tunnel or another host, override these env vars instead of
-editing commands inline.
+editing command examples inline.
 
 ## Hard rules
 
-- Start from the narrowest known anchor: exact error text, `request_id`, `trace_id`, endpoint, service, or small time window.
+- Start from the narrowest anchor you already have: exact error text, `request_id`, `trace_id`, endpoint, service, or small time window.
 - Logs first for vague incidents. Trace first only when you already have `trace_id`.
-- Use metrics to confirm rate, latency, saturation, queue pressure, or resource effects. Metrics do not replace logs.
+- Use metrics to confirm whether an event is isolated or systemic. Metrics do not replace logs.
 - Do not assume localhost unless you are explicitly on the observability host or inside a tunnel.
-- Keep copied evidence short: command, time window, stable ids, and one to three proof lines.
+- Keep evidence short: command, time window, stable ids, and one to three proof lines.
+- Use `mint_*` metric names by default. If only `tinker_*` appears, treat that as migration debt.
 
 ## Setup
 
@@ -45,188 +48,148 @@ editing commands inline.
 export VICTORIA_LOGS_URL=${VICTORIA_LOGS_URL:-http://192.168.4.70:9428}
 export VICTORIA_TRACES_URL=${VICTORIA_TRACES_URL:-http://192.168.4.70:10428}
 export VICTORIA_METRICS_URL=${VICTORIA_METRICS_URL:-http://192.168.4.70:8428}
-```
-
-Optional local helper:
-
-```bash
 python .claude/skills/telemetry-direct-query/victoria_query.py --help
 ```
 
-## 1. Logs: VictoriaLogs
+## Primary path: Python helper
 
-Current direct API pattern from `/vePFS-Mindverse/user/nolanho/docs/grafana/victoria-otel-debug.md`:
+Use `.claude/skills/telemetry-direct-query/victoria_query.py` first.
+It is stdlib-only and wraps the documented Victoria APIs directly.
 
-```bash
-curl -s "$VICTORIA_LOGS_URL/select/logsql/query?query=trace_id:fedcba9876543210fedcba9876543210&limit=5"
-```
-
-Search by error text:
+Common commands:
 
 ```bash
-curl -sG "$VICTORIA_LOGS_URL/select/logsql/query" \
-  --data-urlencode 'query="CUDA out of memory"' \
-  --data-urlencode 'limit=20'
+python .claude/skills/telemetry-direct-query/victoria_query.py logs \
+  --query 'request_id:sample_12b39ee941342a4fe58b57354688f3c1' \
+  --limit 20
+
+python .claude/skills/telemetry-direct-query/victoria_query.py trace-services
+
+python .claude/skills/telemetry-direct-query/victoria_query.py trace-search \
+  --service mint \
+  --operation 'POST /api/v1/retrieve_future' \
+  --lookback 1h \
+  --limit 20
+
+python .claude/skills/telemetry-direct-query/victoria_query.py trace-get \
+  --trace-id 042397caf580ea9b2d71eb2ea7332f99
+
+python .claude/skills/telemetry-direct-query/victoria_query.py metrics-query \
+  --query 'mint_metrics_up'
+
+python .claude/skills/telemetry-direct-query/victoria_query.py metrics-range \
+  --query 'rate(mint_http_server_requests_total[5m])' \
+  --since 30m \
+  --step 60s
+
+python .claude/skills/telemetry-direct-query/victoria_query.py metrics-names
 ```
 
-Search by `request_id` or `trace_id`:
+Useful helper flags:
+
+- `--verbose`: print the resolved request URL to stderr
+- `--compact`: emit compact JSON for shell pipelines
+- `--timeout`: override the default 15s timeout
+- `metrics-range --since 30m --end now`: avoid hand-calculating epochs
+
+## Query workflow by backend
+
+### 1. VictoriaLogs
+
+Use logs to move from symptom text to stable ids.
+Current documented direct API path from `/vePFS-Mindverse/user/nolanho/docs/grafana/victoria-otel-debug.md` is:
+
+- `GET $VICTORIA_LOGS_URL/select/logsql/query?query=...&limit=...`
+
+Primary examples:
 
 ```bash
-curl -sG "$VICTORIA_LOGS_URL/select/logsql/query" \
-  --data-urlencode 'query=request_id:sample_12b39ee941342a4fe58b57354688f3c1' \
-  --data-urlencode 'limit=20'
+python .claude/skills/telemetry-direct-query/victoria_query.py logs \
+  --query '"CUDA out of memory"' \
+  --limit 20
 
-curl -sG "$VICTORIA_LOGS_URL/select/logsql/query" \
-  --data-urlencode 'query=trace_id:042397caf580ea9b2d71eb2ea7332f99' \
-  --data-urlencode 'limit=20'
+python .claude/skills/telemetry-direct-query/victoria_query.py logs \
+  --query 'request_id:sample_12b39ee941342a4fe58b57354688f3c1' \
+  --limit 20
+
+python .claude/skills/telemetry-direct-query/victoria_query.py logs \
+  --query 'trace_id:042397caf580ea9b2d71eb2ea7332f99' \
+  --limit 20
 ```
 
-HTTPie equivalents:
+After you extract `trace_id` or `request_id`, pivot instead of repeating broad text search.
+
+### 2. VictoriaTraces
+
+VictoriaTraces exposes a Jaeger-compatible query surface under
+`$VICTORIA_TRACES_URL/select/jaeger/api/...`.
+
+Primary examples:
+
+```bash
+python .claude/skills/telemetry-direct-query/victoria_query.py trace-services
+
+python .claude/skills/telemetry-direct-query/victoria_query.py trace-search \
+  --service mint \
+  --operation 'POST /api/v1/retrieve_future' \
+  --lookback 1h \
+  --limit 20
+
+python .claude/skills/telemetry-direct-query/victoria_query.py trace-get \
+  --trace-id 042397caf580ea9b2d71eb2ea7332f99
+```
+
+If the Jaeger result looks sparse, cross-check the same `trace_id` in logs:
+
+```bash
+python .claude/skills/telemetry-direct-query/victoria_query.py logs \
+  --query 'trace_id:042397caf580ea9b2d71eb2ea7332f99' \
+  --limit 50
+```
+
+If you already know `trace_id`, skip service discovery and fetch the trace directly.
+
+### 3. VictoriaMetrics
+
+Current documented direct API paths from `/vePFS-Mindverse/user/nolanho/docs/grafana/victoria-otel-debug.md` are:
+
+- `GET $VICTORIA_METRICS_URL/api/v1/query?query=...`
+- `GET $VICTORIA_METRICS_URL/api/v1/query_range?query=...&start=...&end=...&step=...`
+- `GET $VICTORIA_METRICS_URL/api/v1/label/__name__/values`
+
+Primary examples:
+
+```bash
+python .claude/skills/telemetry-direct-query/victoria_query.py metrics-query \
+  --query 'mint_metrics_up'
+
+python .claude/skills/telemetry-direct-query/victoria_query.py metrics-query \
+  --query 'rate(mint_http_server_requests_total{status_code=~"5.."}[5m])'
+
+python .claude/skills/telemetry-direct-query/victoria_query.py metrics-range \
+  --query 'rate(mint_http_server_requests_total[5m])' \
+  --since 30m \
+  --step 60s
+
+python .claude/skills/telemetry-direct-query/victoria_query.py metrics-names
+```
+
+Use metrics to confirm rate, latency, queue depth, capacity pressure, or saturation after logs and traces have narrowed the failing path.
+
+## Secondary path: HTTPie
+
+Use HTTPie when you want raw HTTP visibility but still want less quoting pain than `curl`.
 
 ```bash
 http --pretty=format GET "$VICTORIA_LOGS_URL/select/logsql/query" \
   query=='request_id:sample_12b39ee941342a4fe58b57354688f3c1' \
   limit:=20
-```
-
-Python equivalent:
-
-```bash
-python - <<'PY'
-import json
-import os
-import urllib.parse
-import urllib.request
-
-base = os.environ["VICTORIA_LOGS_URL"]
-params = urllib.parse.urlencode(
-    {
-        "query": 'request_id:sample_12b39ee941342a4fe58b57354688f3c1',
-        "limit": 20,
-    }
-)
-with urllib.request.urlopen(f"{base}/select/logsql/query?{params}") as r:
-    print(json.dumps(json.load(r), indent=2, sort_keys=True))
-PY
-```
-
-Use logs to extract stable ids. Then pivot instead of repeating broad text search.
-
-## 2. Traces: VictoriaTraces
-
-VictoriaTraces exposes a Jaeger-compatible query surface under
-`$VICTORIA_TRACES_URL/select/jaeger/api/...`.
-
-Discover services first when the trace ownership is unclear:
-
-```bash
-curl -s "$VICTORIA_TRACES_URL/select/jaeger/api/services"
-```
-
-Search recent traces by service and optional operation:
-
-```bash
-curl -sG "$VICTORIA_TRACES_URL/select/jaeger/api/traces" \
-  --data-urlencode 'service=mint' \
-  --data-urlencode 'operation=POST /api/v1/retrieve_future' \
-  --data-urlencode 'lookback=1h' \
-  --data-urlencode 'limit=20'
-```
-
-Fetch one trace directly when you already have `trace_id`:
-
-```bash
-TRACE_ID=042397caf580ea9b2d71eb2ea7332f99
-curl -s "$VICTORIA_TRACES_URL/select/jaeger/api/traces/$TRACE_ID"
-```
-
-Cross-check the same `trace_id` through log search when the Jaeger result looks sparse:
-
-```bash
-curl -sG "$VICTORIA_LOGS_URL/select/logsql/query" \
-  --data-urlencode "query=trace_id:$TRACE_ID" \
-  --data-urlencode 'limit=50'
-```
-
-HTTPie equivalents:
-
-```bash
-http --pretty=format GET "$VICTORIA_TRACES_URL/select/jaeger/api/services"
 
 http --pretty=format GET "$VICTORIA_TRACES_URL/select/jaeger/api/traces" \
   service==mint \
   operation=='POST /api/v1/retrieve_future' \
   lookback==1h \
   limit:=20
-```
-
-Python equivalent:
-
-```bash
-python - <<'PY'
-import json
-import os
-import urllib.parse
-import urllib.request
-
-base = os.environ["VICTORIA_TRACES_URL"]
-params = urllib.parse.urlencode(
-    {
-        "service": "mint",
-        "operation": "POST /api/v1/retrieve_future",
-        "lookback": "1h",
-        "limit": 20,
-    }
-)
-with urllib.request.urlopen(f"{base}/select/jaeger/api/traces?{params}") as r:
-    print(json.dumps(json.load(r), indent=2, sort_keys=True))
-PY
-```
-
-If you already know `trace_id`, skip service discovery and fetch the trace directly.
-
-## 3. Metrics: VictoriaMetrics
-
-Current direct API pattern from `/vePFS-Mindverse/user/nolanho/docs/grafana/victoria-otel-debug.md`:
-
-```bash
-curl -s "$VICTORIA_METRICS_URL/api/v1/query?query=maple_test_counter_total"
-```
-
-Instant query for a metric or PromQL expression:
-
-```bash
-curl -sG "$VICTORIA_METRICS_URL/api/v1/query" \
-  --data-urlencode 'query=mint_metrics_up'
-
-curl -sG "$VICTORIA_METRICS_URL/api/v1/query" \
-  --data-urlencode 'query=rate(mint_http_server_requests_total{status_code=~"5.."}[5m])'
-```
-
-Range query for trend confirmation:
-
-```bash
-START=$(date -u -d '30 minutes ago' +%s)
-END=$(date -u +%s)
-
-curl -sG "$VICTORIA_METRICS_URL/api/v1/query_range" \
-  --data-urlencode 'query=rate(mint_http_server_requests_total[5m])' \
-  --data-urlencode "start=$START" \
-  --data-urlencode "end=$END" \
-  --data-urlencode 'step=60s'
-```
-
-Discover available metric names:
-
-```bash
-curl -s "$VICTORIA_METRICS_URL/api/v1/label/__name__/values"
-```
-
-HTTPie equivalents:
-
-```bash
-http --pretty=format GET "$VICTORIA_METRICS_URL/api/v1/query" \
-  query=='mint_metrics_up'
 
 http --pretty=format GET "$VICTORIA_METRICS_URL/api/v1/query_range" \
   query=='rate(mint_http_server_requests_total[5m])' \
@@ -235,55 +198,39 @@ http --pretty=format GET "$VICTORIA_METRICS_URL/api/v1/query_range" \
   step==60s
 ```
 
-Python equivalent:
+## Fallback path: curl
+
+Use `curl` only when HTTPie is absent or you need exact raw URL semantics.
+Keep `curl` as a low-level fallback, not the default workflow.
 
 ```bash
-python - <<'PY'
-import json
-import os
-import urllib.parse
-import urllib.request
+curl -sG "$VICTORIA_LOGS_URL/select/logsql/query" \
+  --data-urlencode 'query=request_id:sample_12b39ee941342a4fe58b57354688f3c1' \
+  --data-urlencode 'limit=20'
 
-base = os.environ["VICTORIA_METRICS_URL"]
-params = urllib.parse.urlencode(
-    {
-        "query": 'rate(mint_http_server_requests_total[5m])',
-        "start": 1712462400,
-        "end": 1712464200,
-        "step": "60s",
-    }
-)
-with urllib.request.urlopen(f"{base}/api/v1/query_range?{params}") as r:
-    print(json.dumps(json.load(r), indent=2, sort_keys=True))
-PY
+curl -s "$VICTORIA_TRACES_URL/select/jaeger/api/services"
+
+curl -sG "$VICTORIA_TRACES_URL/select/jaeger/api/traces" \
+  --data-urlencode 'service=mint' \
+  --data-urlencode 'operation=POST /api/v1/retrieve_future' \
+  --data-urlencode 'lookback=1h' \
+  --data-urlencode 'limit=20'
+
+curl -s "$VICTORIA_TRACES_URL/select/jaeger/api/traces/042397caf580ea9b2d71eb2ea7332f99"
+
+curl -sG "$VICTORIA_METRICS_URL/api/v1/query" \
+  --data-urlencode 'query=rate(mint_http_server_requests_total{status_code=~"5.."}[5m])'
+
+curl -s "$VICTORIA_METRICS_URL/api/v1/label/__name__/values"
 ```
-
-Use `mint_*` metric names by default. If only `tinker_*` exists in raw data, treat that as migration debt rather than the preferred query prefix.
 
 ## Incident loop
 
 1. Logs: search the exact symptom and pull out `trace_id` or `request_id`.
-2. Traces: fetch the trace tree or recent trace set around the same service or operation.
-3. Metrics: confirm whether the event is isolated or reflected in rates, latency, queue depth, or capacity metrics.
+2. Traces: fetch the trace or recent trace set around the same service or operation.
+3. Metrics: confirm whether the event appears in rates, latency, queue depth, or capacity metrics.
 4. Record only the proof that changes the diagnosis.
 
-## Local helper script
+## Current limit
 
-The helper wraps the direct APIs without `requests` or other third-party packages:
-
-```bash
-python .claude/skills/telemetry-direct-query/victoria_query.py logs \
-  --query 'request_id:sample_12b39ee941342a4fe58b57354688f3c1' \
-  --limit 20
-
-python .claude/skills/telemetry-direct-query/victoria_query.py trace-get \
-  --trace-id 042397caf580ea9b2d71eb2ea7332f99
-
-python .claude/skills/telemetry-direct-query/victoria_query.py metrics-range \
-  --query 'rate(mint_http_server_requests_total[5m])' \
-  --start 1712462400 \
-  --end 1712464200 \
-  --step 60s
-```
-
-Use the helper when shell quoting becomes the main source of error.
+I did not runtime-verify the live VictoriaTraces path in this skill. The Jaeger path is copied from the existing Grafana docs and should be treated as documented configuration, not runtime proof.
