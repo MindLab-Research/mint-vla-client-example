@@ -100,6 +100,7 @@ class _ResourcePoolState:
         self.pending_gpus: int = 0
         self.min_actor_age = int(min_actor_age)
         self.session_idle_timeout = int(session_idle_timeout)
+        self.lifecycle_metrics: dict[tuple[str, str], int] = {}
 
     def register(
         self,
@@ -231,6 +232,20 @@ class _ResourcePoolState:
         entry.metadata_sample_source = None if sample_source is None else str(sample_source)
         return True
 
+    def record_lifecycle_event(self, *, base_model: str, event: str) -> None:
+        key = (str(base_model or "unknown"), str(event or "unknown"))
+        self.lifecycle_metrics[key] = int(self.lifecycle_metrics.get(key, 0)) + 1
+
+    def lifecycle_metrics_snapshot(self) -> list[dict[str, int | str]]:
+        return [
+            {
+                "base_model": base_model,
+                "event": event,
+                "count": int(count),
+            }
+            for (base_model, event), count in sorted(self.lifecycle_metrics.items())
+        ]
+
     def reserve_gpus(self, num_gpus: int) -> bool:
         self.pending_gpus += max(0, int(num_gpus))
         return True
@@ -291,6 +306,8 @@ class _ResourcePoolState:
                 min_actor_age=self.min_actor_age,
                 session_idle_timeout=self.session_idle_timeout,
             )
+            if entry.actor_type == ActorType.MEGATRON:
+                self.record_lifecycle_event(base_model=entry.base_model, event="evicted")
             logger.info("[ResourcePool] Evicted actor=%s", entry.actor_name)
             return True
         except Exception as e:
@@ -627,6 +644,9 @@ def _get_or_create_actor_sync() -> Any:
                 sample_source=sample_source,
             )
 
+        def lifecycle_metrics_snapshot(self) -> list[dict[str, int | str]]:
+            return self._state.lifecycle_metrics_snapshot()
+
         def reserve_gpus(self, num_gpus: int) -> bool:
             return self._state.reserve_gpus(num_gpus)
 
@@ -828,6 +848,8 @@ class ResourcePool:
         self.RSS_TTL_S = float(os.environ.get("MINT_RESOURCE_POOL_RSS_TTL_S", "60.0"))
         self.METADATA_TTL_S = float(os.environ.get("MINT_RESOURCE_POOL_OBSERVABILITY_TTL_S", "30.0"))
         self.METADATA_TIMEOUT_S = float(os.environ.get("MINT_RESOURCE_POOL_OBSERVABILITY_TIMEOUT_S", "1.0"))
+        self._metadata_metrics_lock = threading.Lock()
+        self._metadata_metrics: dict[str, dict[str, int]] = {}
         # Backward-compatible aliases used by observability tests.
         self._pool_lock = self._local_lock
         self._entries = self._local_state.entries
@@ -1063,14 +1085,54 @@ class ResourcePool:
             return False
         return max(0.0, float(now) - float(entry.metadata_sample_time)) <= float(self.METADATA_TTL_S)
 
+    def _record_metadata_metric(self, actor_type: ActorType, key: str) -> None:
+        actor_key = actor_type.value
+        with self._metadata_metrics_lock:
+            bucket = self._metadata_metrics.setdefault(
+                actor_key,
+                {
+                    "cache_hits_total": 0,
+                    "cache_stale_total": 0,
+                    "refresh_success_total": 0,
+                    "refresh_failures_total": 0,
+                },
+            )
+            bucket[key] = int(bucket.get(key, 0)) + 1
+
+    def metadata_cache_metrics_snapshot(self) -> list[dict[str, int | str]]:
+        with self._metadata_metrics_lock:
+            items = sorted(self._metadata_metrics.items())
+        return [
+            {
+                "actor_type": actor_type,
+                "cache_hits_total": int(values.get("cache_hits_total", 0)),
+                "cache_stale_total": int(values.get("cache_stale_total", 0)),
+                "refresh_success_total": int(values.get("refresh_success_total", 0)),
+                "refresh_failures_total": int(values.get("refresh_failures_total", 0)),
+            }
+            for actor_type, values in items
+        ]
+
+    def lifecycle_metrics_snapshot(self) -> list[dict[str, int | str]]:
+        if not self._use_detached():
+            return self._local(self._local_state.lifecycle_metrics_snapshot)
+        rows = _call_actor_sync("lifecycle_metrics_snapshot", retry_on_actor_restart=True)
+        return rows if isinstance(rows, list) else []
+
     def _refresh_entry_metadata(self, entry: ActorEntry, *, now: float) -> None:
-        if entry.actor_type not in {ActorType.VLLM, ActorType.MEGATRON} or self._metadata_is_fresh(entry, now=now):
+        if entry.actor_type not in {ActorType.VLLM, ActorType.MEGATRON}:
             return
+        if self._metadata_is_fresh(entry, now=now):
+            self._record_metadata_metric(entry.actor_type, "cache_hits_total")
+            return
+        self._record_metadata_metric(entry.actor_type, "cache_stale_total")
         handle = entry.actor_handle or self._lookup_handle(entry.actor_name, entry.namespace)
         if handle is None:
+            self._record_metadata_metric(entry.actor_type, "refresh_failures_total")
             return
         metadata = actor_observability_metadata(handle, timeout_s=self.METADATA_TIMEOUT_S)
         if metadata is None:
+            self._record_metadata_metric(entry.actor_type, "refresh_failures_total")
             return
         sample_time = float(now)
         if self.update_metadata(
@@ -1082,6 +1144,9 @@ class ResourcePool:
             entry.metadata = dict(metadata)
             entry.metadata_sample_time = sample_time
             entry.metadata_sample_source = "cached_snapshot"
+            self._record_metadata_metric(entry.actor_type, "refresh_success_total")
+            return
+        self._record_metadata_metric(entry.actor_type, "refresh_failures_total")
 
     def _cached_snapshot_record(self, entry: ActorEntry, *, now: float) -> dict[str, Any]:
         rec: dict[str, Any] = {

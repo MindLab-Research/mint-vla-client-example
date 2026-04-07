@@ -2099,6 +2099,7 @@ class VerlTrainingEngine:
             f"[DEBUG {model_id}] create_training_session start: requested_model={requested_model} use_megatron={use_megatron} base_model={base_model}",
             flush=True,
         )
+        observability_base_model = str(session.base_model or requested_model or base_model or "unknown")
 
         if use_megatron:
             import asyncio
@@ -2137,13 +2138,19 @@ class VerlTrainingEngine:
                         learning_rate=session.learning_rate,
                         distributed_config=distributed_config,
                         session_id=session.model_id,
+                        observability_base_model=observability_base_model,
                     ),
                     timeout=megatron_timeout_s,
                 )
             except asyncio.TimeoutError:
                 # Best-effort: kill the persistent Megatron actor to unblock retries.
                 from .megatron_distributed import _make_megatron_actor_name
+                from .runtime_observability import runtime_observability
 
+                runtime_observability.record_megatron_actor_lifecycle(
+                    base_model=observability_base_model,
+                    event="startup_timeout",
+                )
                 actor_name = _make_megatron_actor_name(base_model or requested_model or "")
                 try:
                     actor = ray.get_actor(actor_name, namespace=RAY_NAMESPACE)

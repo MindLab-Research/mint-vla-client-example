@@ -292,13 +292,20 @@ async def admission_stats(*, include_actor_rss: bool = True) -> dict:
 
             pool = get_resource_pool()
             actors["resource_pool"] = pool.rss_snapshot(timeout_s=timeout_s)
+            actors["resource_pool_metadata_cache"] = pool.metadata_cache_metrics_snapshot()
+            actors["resource_pool_lifecycle"] = pool.lifecycle_metrics_snapshot()
         except Exception as e:
             actors["resource_pool"] = {"error": f"{type(e).__name__}: {e}"}
     else:
         # Metrics scrapes must stay cheap. A single hung actor in rss_snapshot()
         # can otherwise block the API thread and stall unrelated routes.
         try:
-            actors["resource_pool"] = _resource_pool_local_snapshot()
+            from ..backend.resource_pool import get_resource_pool
+
+            pool = get_resource_pool()
+            actors["resource_pool"] = pool.cached_snapshot()
+            actors["resource_pool_metadata_cache"] = pool.metadata_cache_metrics_snapshot()
+            actors["resource_pool_lifecycle"] = pool.lifecycle_metrics_snapshot()
         except Exception as e:
             actors["resource_pool"] = {"error": f"{type(e).__name__}: {e}"}
 
@@ -558,6 +565,7 @@ def _resource_pool_gpu_bindings(rec: dict[str, object]) -> list[dict[str, str]]:
 async def metrics() -> Response:
     stats = await admission_stats(include_actor_rss=False)
     lines: list[str] = []
+    megatron_actor_lifecycle_counts: dict[tuple[str, str], float] = {}
 
     cap = stats.get("capacity")
     if isinstance(cap, dict):
@@ -930,6 +938,47 @@ async def metrics() -> Response:
                             labels={**labels, "state": state},
                         )
 
+        resource_pool_metadata_cache = actors.get("resource_pool_metadata_cache")
+        if isinstance(resource_pool_metadata_cache, list):
+            for row in resource_pool_metadata_cache:
+                if not isinstance(row, dict):
+                    continue
+                labels = {"actor_type": row.get("actor_type") or "unknown"}
+                _append_metric(
+                    lines,
+                    "mint_resource_pool_observability_cache_hits_total",
+                    row.get("cache_hits_total"),
+                    labels=labels,
+                )
+                _append_metric(
+                    lines,
+                    "mint_resource_pool_observability_cache_stale_total",
+                    row.get("cache_stale_total"),
+                    labels=labels,
+                )
+                _append_metric(
+                    lines,
+                    "mint_resource_pool_observability_refresh_success_total",
+                    row.get("refresh_success_total"),
+                    labels=labels,
+                )
+                _append_metric(
+                    lines,
+                    "mint_resource_pool_observability_refresh_failures_total",
+                    row.get("refresh_failures_total"),
+                    labels=labels,
+                )
+
+        resource_pool_lifecycle = actors.get("resource_pool_lifecycle")
+        if isinstance(resource_pool_lifecycle, list):
+            for row in resource_pool_lifecycle:
+                if not isinstance(row, dict):
+                    continue
+                key = (str(row.get("base_model") or "unknown"), str(row.get("event") or "unknown"))
+                megatron_actor_lifecycle_counts[key] = float(megatron_actor_lifecycle_counts.get(key, 0.0)) + float(
+                    row.get("count") or 0.0
+                )
+
     proc = stats.get("process")
     if isinstance(proc, dict):
         _append_metric(lines, "mint_api_server_process_rss_bytes", proc.get("rss_bytes"))
@@ -1007,6 +1056,27 @@ async def metrics() -> Response:
 
         runtime_observability = queue_execution.get("runtime_observability")
         if isinstance(runtime_observability, dict):
+            megatron_switch_failures = runtime_observability.get("megatron_session_switch_failures")
+            if isinstance(megatron_switch_failures, list):
+                for row in megatron_switch_failures:
+                    if not isinstance(row, dict):
+                        continue
+                    labels = {
+                        "base_model": row.get("base_model") or "unknown",
+                        "reason": row.get("reason") or "unknown",
+                    }
+                    _append_metric(lines, "mint_megatron_session_switch_failures_total", row.get("count"), labels=labels)
+
+            megatron_actor_lifecycle = runtime_observability.get("megatron_actor_lifecycle")
+            if isinstance(megatron_actor_lifecycle, list):
+                for row in megatron_actor_lifecycle:
+                    if not isinstance(row, dict):
+                        continue
+                    key = (str(row.get("base_model") or "unknown"), str(row.get("event") or "unknown"))
+                    megatron_actor_lifecycle_counts[key] = float(megatron_actor_lifecycle_counts.get(key, 0.0)) + float(
+                        row.get("count") or 0.0
+                    )
+
             vllm_workload = runtime_observability.get("vllm_workload")
             if isinstance(vllm_workload, list):
                 for row in vllm_workload:
@@ -1039,6 +1109,14 @@ async def metrics() -> Response:
                         "op": row.get("op") or "unknown",
                     }
                     _append_metric(lines, "mint_vllm_workload_active_requests", row.get("active_requests"), labels=labels)
+
+    for (base_model, event), count in sorted(megatron_actor_lifecycle_counts.items()):
+        _append_metric(
+            lines,
+            "mint_megatron_actor_lifecycle_events_total",
+            count,
+            labels={"base_model": base_model, "event": event},
+        )
 
     ray_cluster = stats.get("ray_cluster")
     if isinstance(ray_cluster, dict):
@@ -1087,6 +1165,9 @@ async def metrics() -> Response:
                 named_actors.get("namespace"),
             )
 
+        _append_metric(lines, "mint_ray_cluster_last_success_unixtime", ray_cluster.get("last_success_unixtime"))
+        _append_metric(lines, "mint_ray_cluster_last_success_age_s", ray_cluster.get("last_success_age_s"))
+
         probes = ray_cluster.get("probes")
         if isinstance(probes, dict):
             for probe_name, probe in probes.items():
@@ -1118,6 +1199,16 @@ async def metrics() -> Response:
             lines,
             "mint_ray_gcs_metrics_bridge_cache_age_s",
             ray_gcs_metrics.get("cache_age_s"),
+        )
+        _append_metric(
+            lines,
+            "mint_ray_gcs_metrics_bridge_last_success_unixtime",
+            ray_gcs_metrics.get("last_success_unixtime"),
+        )
+        _append_metric(
+            lines,
+            "mint_ray_gcs_metrics_bridge_last_success_age_s",
+            ray_gcs_metrics.get("last_success_age_s"),
         )
 
         derived = ray_gcs_metrics.get("derived")

@@ -581,3 +581,60 @@ def test_resource_pool_cached_snapshot_refreshes_megatron_observability_on_ttl(m
         pool.METADATA_TTL_S = old_ttl
         pool.METADATA_TIMEOUT_S = old_timeout
         pool.clear(kill_actors=False)
+
+
+def test_resource_pool_cached_snapshot_uses_fresh_metadata_without_refresh(monkeypatch) -> None:
+    pool = get_resource_pool()
+    pool.clear(kill_actors=False)
+    old_ttl = pool.METADATA_TTL_S
+
+    def _fail_observability(_handle, *, timeout_s=5.0):
+        raise AssertionError("fresh metadata must not trigger refresh")
+
+    monkeypatch.setattr(resource_pool_mod, "actor_observability_metadata", _fail_observability)
+
+    try:
+        pool.METADATA_TTL_S = 30.0
+        before = {row["actor_type"]: row for row in pool.metadata_cache_metrics_snapshot()}
+        before_vllm = before.get("vllm", {})
+        pool.register("actor-vllm", ActorType.VLLM, 1, actor_handle=object(), base_model="m")
+        with pool._pool_lock:
+            entry = pool._entries["actor-vllm"]
+            entry.metadata = {"scheduler_waiting_requests": 2}
+            entry.metadata_sample_time = time.time()
+            entry.metadata_sample_source = "register"
+
+        rec = {item["actor_name"]: item for item in pool.cached_snapshot()}["actor-vllm"]
+        assert rec["metadata"]["scheduler_waiting_requests"] == 2
+        stats = {row["actor_type"]: row for row in pool.metadata_cache_metrics_snapshot()}
+        assert stats["vllm"]["cache_hits_total"] >= int(before_vllm.get("cache_hits_total", 0)) + 1
+        assert stats["vllm"]["refresh_failures_total"] == int(before_vllm.get("refresh_failures_total", 0))
+    finally:
+        pool.METADATA_TTL_S = old_ttl
+        pool.clear(kill_actors=False)
+
+
+def test_resource_pool_cached_snapshot_tracks_refresh_failure(monkeypatch) -> None:
+    pool = get_resource_pool()
+    pool.clear(kill_actors=False)
+    old_ttl = pool.METADATA_TTL_S
+
+    monkeypatch.setattr(resource_pool_mod, "actor_observability_metadata", lambda *_args, **_kwargs: None)
+
+    try:
+        pool.METADATA_TTL_S = 30.0
+        pool.register("actor-megatron", ActorType.MEGATRON, 8, actor_handle=object(), base_model="m")
+        with pool._pool_lock:
+            entry = pool._entries["actor-megatron"]
+            entry.metadata = {"active_sessions": 3}
+            entry.metadata_sample_time = time.time() - 120.0
+            entry.metadata_sample_source = "stale"
+
+        rec = {item["actor_name"]: item for item in pool.cached_snapshot()}["actor-megatron"]
+        assert rec["metadata"]["active_sessions"] == 3
+        stats = {row["actor_type"]: row for row in pool.metadata_cache_metrics_snapshot()}
+        assert stats["megatron"]["cache_stale_total"] >= 1
+        assert stats["megatron"]["refresh_failures_total"] >= 1
+    finally:
+        pool.METADATA_TTL_S = old_ttl
+        pool.clear(kill_actors=False)

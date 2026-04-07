@@ -45,6 +45,8 @@ class RuntimeObservability:
         self._lock = threading.Lock()
         self._megatron_session_switch: dict[tuple[str, str], _MegatronSwitchAggregate] = {}
         self._megatron_session_switch_pending: dict[tuple[str, str], _MegatronSwitchAggregate] = {}
+        self._megatron_session_switch_failures: dict[tuple[str, str], int] = {}
+        self._megatron_actor_lifecycle: dict[tuple[str, str], int] = {}
         self._vllm_workload: dict[tuple[str, str, str, str], _VllmAggregate] = {}
         self._vllm_active_requests: dict[tuple[str, str, str], int] = {}
 
@@ -74,6 +76,16 @@ class RuntimeObservability:
                 agg.reset_bias_s_max = max(agg.reset_bias_s_max, float(reset_bias_s))
                 agg.total_s_total += float(total_s)
                 agg.total_s_max = max(agg.total_s_max, float(total_s))
+
+    def record_megatron_session_switch_failure(self, *, base_model: str, reason: str) -> None:
+        key = (str(base_model or "unknown"), str(reason or "unknown"))
+        with self._lock:
+            self._megatron_session_switch_failures[key] = int(self._megatron_session_switch_failures.get(key, 0)) + 1
+
+    def record_megatron_actor_lifecycle(self, *, base_model: str, event: str) -> None:
+        key = (str(base_model or "unknown"), str(event or "unknown"))
+        with self._lock:
+            self._megatron_actor_lifecycle[key] = int(self._megatron_actor_lifecycle.get(key, 0)) + 1
 
     def begin_vllm_request(self, *, actor_name: str | None, base_model: str, op: str) -> None:
         key = (str(actor_name or "unknown"), str(base_model or "unknown"), str(op or "unknown"))
@@ -183,6 +195,24 @@ class RuntimeObservability:
                     }
                 )
 
+            megatron_session_switch_failures = [
+                {
+                    "base_model": base_model,
+                    "reason": reason,
+                    "count": int(count),
+                }
+                for (base_model, reason), count in sorted(self._megatron_session_switch_failures.items())
+            ]
+
+            megatron_actor_lifecycle = [
+                {
+                    "base_model": base_model,
+                    "event": event,
+                    "count": int(count),
+                }
+                for (base_model, event), count in sorted(self._megatron_actor_lifecycle.items())
+            ]
+
             vllm = []
             for (actor_name, base_model, op, status), agg in sorted(self._vllm_workload.items()):
                 vllm.append(
@@ -218,6 +248,8 @@ class RuntimeObservability:
 
         return {
             "megatron_session_switch": megatron,
+            "megatron_session_switch_failures": megatron_session_switch_failures,
+            "megatron_actor_lifecycle": megatron_actor_lifecycle,
             "vllm_workload": vllm,
             "vllm_active_requests": active,
         }

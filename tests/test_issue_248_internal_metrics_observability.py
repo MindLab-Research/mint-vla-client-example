@@ -66,6 +66,22 @@ async def _fake_admission_stats(*, include_actor_rss: bool = True) -> dict:
                 },
             },
         ],
+        "resource_pool_metadata_cache": [
+            {
+                "actor_type": "megatron",
+                "cache_hits_total": 9,
+                "cache_stale_total": 3,
+                "refresh_success_total": 2,
+                "refresh_failures_total": 1,
+            },
+            {
+                "actor_type": "vllm",
+                "cache_hits_total": 12,
+                "cache_stale_total": 4,
+                "refresh_success_total": 3,
+                "refresh_failures_total": 0,
+            },
+        ],
     }
     if include_actor_rss:
         actors.update(
@@ -182,6 +198,25 @@ async def _fake_admission_stats(*, include_actor_rss: bool = True) -> dict:
                         "reset_bias_s_max": 0.8,
                         "total_s_total": 28.5,
                         "total_s_max": 10.5,
+                    }
+                ],
+                "megatron_session_switch_failures": [
+                    {
+                        "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+                        "reason": "partial_swap",
+                        "count": 2,
+                    }
+                ],
+                "megatron_actor_lifecycle": [
+                    {
+                        "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+                        "event": "evicted",
+                        "count": 1,
+                    },
+                    {
+                        "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+                        "event": "startup_timeout",
+                        "count": 1,
                     }
                 ],
                 "vllm_workload": [
@@ -325,6 +360,15 @@ def test_issue_248_internal_metrics_omits_unknown_resource_pool_rss(monkeypatch)
         'mint_megatron_gpu_memory_fragmentation_bytes{actor_name="megatron-1",base_model="Qwen/Qwen3-30B-A3B-Instruct-2507"} 4000000000',
         'mint_resource_pool_actor_gpu_binding{actor_name="megatron-1",gpu_index="0",hostname="host-b",workload="train"} 1',
         'mint_resource_pool_actor_gpu_binding{actor_name="megatron-1",gpu_index="1",hostname="host-b",workload="train"} 1',
+        'mint_resource_pool_observability_cache_hits_total{actor_type="megatron"} 9',
+        'mint_resource_pool_observability_cache_stale_total{actor_type="megatron"} 3',
+        'mint_resource_pool_observability_refresh_success_total{actor_type="megatron"} 2',
+        'mint_resource_pool_observability_refresh_failures_total{actor_type="megatron"} 1',
+        'mint_resource_pool_observability_cache_hits_total{actor_type="vllm"} 12',
+        'mint_resource_pool_observability_refresh_success_total{actor_type="vllm"} 3',
+        'mint_megatron_session_switch_failures_total{base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",reason="partial_swap"} 2',
+        'mint_megatron_actor_lifecycle_events_total{base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",event="evicted"} 1',
+        'mint_megatron_actor_lifecycle_events_total{base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",event="startup_timeout"} 1',
     )
     for line in extra_lines:
         assert line in text, f"missing metric line: {line}"
@@ -416,6 +460,12 @@ def test_issue_248_admission_stats_metrics_path_uses_cached_pool_snapshot(monkey
             calls["cached_snapshot"] += 1
             return [{"actor_name": "a", "actor_type": "vllm", "base_model": "m", "idle_time": 1, "age": 2}]
 
+        def metadata_cache_metrics_snapshot(self) -> list[dict]:
+            return [{"actor_type": "vllm", "cache_hits_total": 1, "cache_stale_total": 0, "refresh_success_total": 0, "refresh_failures_total": 0}]
+
+        def lifecycle_metrics_snapshot(self) -> list[dict]:
+            return []
+
         def rss_snapshot(self, *, timeout_s: float = 10.0) -> list[dict]:
             raise AssertionError("metrics scrape must not call resource_pool.rss_snapshot")
 
@@ -463,3 +513,48 @@ def test_issue_248_scheduler_decisions_debug_route_proxies_filters(monkeypatch) 
         "timeout_s": 10.0,
     }
     assert payload["last_seq"] == 12
+
+
+def test_issue_248_internal_metrics_exports_ray_control_plane_cache_timestamps(monkeypatch) -> None:
+    async def _fake_with_ray(*, include_actor_rss: bool = True) -> dict:
+        stats = await _fake_admission_stats(include_actor_rss=include_actor_rss)
+        stats["ray_cluster"] = {
+            "up": True,
+            "cache_age_s": 7.0,
+            "last_success_unixtime": 1700000000.0,
+            "last_success_age_s": 12.0,
+            "warning_count": 0,
+            "probe_error_count": 0,
+            "slow_probe_count": 0,
+            "total_probe_latency_ms": 15.0,
+            "nodes": {"alive": 2, "dead": 0, "dead_missing_heartbeats": 0},
+            "resources": {"cpu_total": 8, "cpu_available": 4, "gpu_total": 2, "gpu_available": 1},
+            "placement_groups": {"total": 1, "created": 1, "removed": 0, "pending": 0, "pending_gpu": 0},
+            "named_actors": {"total": 5, "namespace": 5},
+            "probes": {"nodes": {"ok": True, "latency_ms": 1.5}},
+        }
+        stats["ray_gcs_metrics"] = {
+            "up": True,
+            "cache_age_s": 5.0,
+            "last_success_unixtime": 1700000005.0,
+            "last_success_age_s": 9.0,
+            "scrape_error_count": 0,
+            "sample_count": 1,
+            "scrape_latency_ms": 20.0,
+            "derived": {"gcs_task_manager_task_events_drop_ratio": 0.1},
+            "samples": [
+                {"name": "gcs_actors_count", "labels": {"State": "ALIVE"}, "value": 6.0},
+            ],
+        }
+        return stats
+
+    monkeypatch.setattr(internal_routes, "admission_stats", _fake_with_ray)
+
+    resp = asyncio.run(internal_routes.metrics())
+    text = resp.body.decode("utf-8")
+
+    assert "mint_ray_cluster_last_success_unixtime 1700000000" in text
+    assert "mint_ray_cluster_last_success_age_s 12" in text
+    assert "mint_ray_gcs_metrics_bridge_last_success_unixtime 1700000005" in text
+    assert "mint_ray_gcs_metrics_bridge_last_success_age_s 9" in text
+    assert 'gcs_actors_count{State="ALIVE"} 6' in text

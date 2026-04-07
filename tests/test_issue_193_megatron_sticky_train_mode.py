@@ -1375,6 +1375,8 @@ def _make_group_with_unknown_session_after_partial_swap(monkeypatch):
 
     group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
     group = object.__new__(group_cls)
+    group.base_model = "/resolved/Qwen/Qwen3-30B-A3B-Instruct-2507"
+    group.observability_base_model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
     group._current_session = "s1"
 
     class _FakeRemoteMethod:
@@ -1398,6 +1400,23 @@ def _make_group_with_unknown_session_after_partial_swap(monkeypatch):
     assert group._current_session is None
     assert group._session_unknown_due_to_partial_swap is True
     return group
+
+
+def test_issue_193_partial_swap_failure_uses_observability_base_model(monkeypatch):
+    import tinker_server.backend.runtime_observability as runtime_obs_mod
+
+    obs = runtime_obs_mod.RuntimeObservability()
+    monkeypatch.setattr(runtime_obs_mod, "runtime_observability", obs)
+
+    _make_group_with_unknown_session_after_partial_swap(monkeypatch)
+
+    assert obs.snapshot()["megatron_session_switch_failures"] == [
+        {
+            "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "reason": "partial_swap",
+            "count": 1,
+        }
+    ]
 
 
 # ---------------------------------------------------------------------------

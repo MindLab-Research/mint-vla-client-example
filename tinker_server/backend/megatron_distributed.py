@@ -6170,9 +6170,11 @@ class MegatronWorkerGroup:
         lora_rank: int,
         learning_rate: float,
         distributed_config: DistributedConfig | None = None,
+        observability_base_model: str | None = None,
     ):
         init_actor_observability()
         self.base_model = base_model
+        self.observability_base_model = str(observability_base_model or base_model or "unknown")
         self.lora_rank = lora_rank  # This is max_lora_rank for Phase 7
         self.learning_rate = learning_rate
         self.config = distributed_config or DistributedConfig()
@@ -6589,6 +6591,14 @@ class MegatronWorkerGroup:
                 type(e).__name__,
                 e,
                 exc_info=True,
+            )
+            from .runtime_observability import runtime_observability
+
+            runtime_observability.record_megatron_session_switch_failure(
+                base_model=str(
+                    getattr(self, "observability_base_model", getattr(self, "base_model", "unknown") or "unknown")
+                ),
+                reason="partial_swap",
             )
             self._current_session = None
             self._session_unknown_due_to_partial_swap = True
@@ -8591,6 +8601,7 @@ def get_or_create_megatron_worker_group(
     learning_rate: float,
     distributed_config: DistributedConfig | None = None,
     session_id: str | None = None,
+    observability_base_model: str | None = None,
 ) -> ray.actor.ActorHandle:
     """Get existing or create new persistent MegatronWorkerGroup for this model.
 
@@ -8617,6 +8628,7 @@ def get_or_create_megatron_worker_group(
     config = distributed_config or DistributedConfig()
     num_gpus = config.world_size
     is_persistent = is_persistent_model(base_model)
+    observability_model = str(observability_base_model or base_model or "unknown")
 
     if not ray.is_initialized():
         init_ray(
@@ -8641,6 +8653,12 @@ def get_or_create_megatron_worker_group(
             except ray.exceptions.RayActorError:
                 # Actor is dead, kill to free name
                 logger.warning(f"Megatron actor {actor_name} is dead, killing to free name")
+                from .runtime_observability import runtime_observability
+
+                runtime_observability.record_megatron_actor_lifecycle(
+                    base_model=observability_model,
+                    event="recreate",
+                )
                 try:
                     ray_kill.kill(
                         actor,
@@ -8666,7 +8684,7 @@ def get_or_create_megatron_worker_group(
                 num_gpus=num_gpus,
                 actor_handle=actor,
                 namespace=PERSISTENT_NAMESPACE,
-                base_model=base_model,
+                base_model=observability_model,
                 protected=is_persistent,
                 metadata=dict(actor_observability_metadata(actor) or {}),
             )
@@ -8803,6 +8821,7 @@ def get_or_create_megatron_worker_group(
                     lora_rank=lora_rank,
                     learning_rate=learning_rate,
                     distributed_config=config,
+                    observability_base_model=observability_model,
                 )
             except Exception as e:
                 msg = str(e)
@@ -8823,7 +8842,7 @@ def get_or_create_megatron_worker_group(
                 num_gpus=num_gpus,
                 actor_handle=actor,
                 namespace=PERSISTENT_NAMESPACE,
-                base_model=base_model,
+                base_model=observability_model,
                 session_id=session_id,
                 protected=is_persistent,
                 metadata=dict(actor_observability_metadata(actor) or {}),
@@ -8840,6 +8859,7 @@ async def async_get_or_create_megatron_worker_group(
     learning_rate: float,
     distributed_config: DistributedConfig | None = None,
     session_id: str | None = None,
+    observability_base_model: str | None = None,
 ) -> ray.actor.ActorHandle:
     """Async version of get_or_create_megatron_worker_group.
 
@@ -8865,6 +8885,7 @@ async def async_get_or_create_megatron_worker_group(
         learning_rate,
         distributed_config,
         session_id,
+        observability_base_model,
     )
 
 

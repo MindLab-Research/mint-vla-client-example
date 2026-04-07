@@ -56,6 +56,14 @@ def test_issue_432_runtime_observability_tracks_megatron_session_switch() -> Non
         reset_bias_s=0.25,
         total_s=3.25,
     )
+    obs.record_megatron_session_switch_failure(
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        reason="partial_swap",
+    )
+    obs.record_megatron_actor_lifecycle(
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        event="startup_timeout",
+    )
 
     snap = obs.snapshot()
     rows = snap["megatron_session_switch"]
@@ -74,6 +82,20 @@ def test_issue_432_runtime_observability_tracks_megatron_session_switch() -> Non
             "reset_bias_s_max": 0.5,
             "total_s_total": 9.75,
             "total_s_max": 6.5,
+        }
+    ]
+    assert snap["megatron_session_switch_failures"] == [
+        {
+            "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "reason": "partial_swap",
+            "count": 1,
+        }
+    ]
+    assert snap["megatron_actor_lifecycle"] == [
+        {
+            "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "event": "startup_timeout",
+            "count": 1,
         }
     ]
 
