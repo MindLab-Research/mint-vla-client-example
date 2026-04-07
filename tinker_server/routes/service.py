@@ -103,8 +103,6 @@ def _parse_checkpoint_path(model_path: str) -> tuple[str, str] | None:
         return None
 
     parts = [p for p in path_part.split("/") if p]
-    if len(parts) == 2:
-        return parts[0], parts[1]
     if len(parts) == 3 and parts[1] in ("weights", "sampler_weights"):
         return parts[0], parts[2]
     return None
@@ -334,7 +332,7 @@ async def _create_sampling_session_impl(
         return CreateSamplingSessionResponse(sampling_session_id=sampling_session_id_remote)
 
     if request.model_path:
-        # Resolve adapter directory (file://, mint://, absolute path).
+        # Resolve adapter directory (file://, typed checkpoint URI, absolute path).
         if adapter_path is None:
             adapter_path = _resolve_model_path(
                 request.model_path, user_id=user_id, http_request=http_request
@@ -678,7 +676,7 @@ def _resolve_model_path(
     """Resolve model_path URI to filesystem path.
 
     Args:
-        model_path: URI like file:///path, mint://{uuid}/..., or absolute path.
+        model_path: URI like file:///path, mint://{run_id}/{kind}/{name}, or absolute path.
 
     Returns:
         Absolute filesystem path to adapter directory.
@@ -693,7 +691,10 @@ def _resolve_model_path(
     if not is_admin and not model_path.startswith(("tinker://", "mint://", "ckpt_")):
         raise HTTPException(status_code=403, detail="Access denied")
 
-    resolved = resolve_checkpoint_uri(model_path, "", user_id=user_id, is_admin=is_admin)
+    try:
+        resolved = resolve_checkpoint_uri(model_path, "", user_id=user_id, is_admin=is_admin)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     if model_path.startswith("ckpt_") and resolved == model_path:
         raise HTTPException(status_code=404, detail="Checkpoint not found")
     try:

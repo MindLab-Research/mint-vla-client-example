@@ -73,7 +73,6 @@ from ..models.types import (
     ForwardRequest,
     GetInfoRequest,
     GetInfoResponse,
-    LoRAConfig,
     ModelData,
     OptimStepRequest,
     ResetExpertBiasRequest,
@@ -1333,7 +1332,10 @@ def _resolve_state_path(state_uri: str, *, user_id: str | None, is_admin: bool =
     if not is_admin and not state_uri.startswith(("tinker://", "mint://", "ckpt_")):
         raise HTTPException(status_code=403, detail="Access denied")
 
-    resolved = resolve_checkpoint_path(state_uri, user_id=user_id, is_admin=is_admin)
+    try:
+        resolved = resolve_checkpoint_path(state_uri, user_id=user_id, is_admin=is_admin)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     if state_uri.startswith("ckpt_") and resolved == state_uri:
         raise HTTPException(status_code=404, detail="Checkpoint not found")
     try:
@@ -2862,6 +2864,7 @@ async def _do_save_weights_for_sampler(
                 user_id=None if is_admin else user_id,
                 model_id=session.model_id,
                 checkpoint_name=checkpoint_name,
+                checkpoint_type="sampler",
             )
         else:
             # Ephemeral save - generate unique temp name
@@ -2870,6 +2873,7 @@ async def _do_save_weights_for_sampler(
                 user_id=None if is_admin else user_id,
                 model_id=session.model_id,
                 checkpoint_name=checkpoint_name,
+                checkpoint_type="sampler",
             )
 
         use_per_expert_lora = bool(request.use_per_expert_lora)
@@ -2896,7 +2900,8 @@ async def _do_save_weights_for_sampler(
             lambda: training_engine.save_weights_for_sampler(
                 session=session,
                 checkpoint_name=checkpoint_name,
-                checkpoint_base_dir=os.path.dirname(os.path.dirname(save_path)),
+                checkpoint_base_dir=os.path.dirname(os.path.dirname(os.path.dirname(save_path))),
+                checkpoint_type="sampler",
                 use_per_expert_lora=use_per_expert_lora,
             ),
             component="routes.training",
@@ -2950,6 +2955,7 @@ async def _do_save_weights_for_sampler(
                 user_id=None if is_admin else user_id,
                 model_id=session.model_id,
                 checkpoint_name=checkpoint_name,
+                checkpoint_type="sampler",
             )
 
         from ..client_compat import checkpoint_uri

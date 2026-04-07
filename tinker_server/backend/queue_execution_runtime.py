@@ -12,6 +12,13 @@ from ..config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_res
 logger = logging.getLogger(__name__)
 _ACTOR_HANDLE = None
 
+def _reset_cached_actor_handle() -> None:
+    global _ACTOR_HANDLE
+    _ACTOR_HANDLE = None
+
+from ..ray_utils import register_ray_reconnect_invalidator as _register_ray_reconnect_invalidator
+_register_ray_reconnect_invalidator(_reset_cached_actor_handle)
+
 
 def _runtime_env_overrides() -> dict[str, str]:
     out: dict[str, str] = {}

@@ -1103,6 +1103,7 @@ def _create_ray_actor(*, require_ready: bool = True):
             for item in self._iter_all_queued_items():
                 executor = self._item_executor(item)
                 by_executor[executor] = int(by_executor.get(executor, 0)) + 1
+            scheduler_metrics_ready = bool(self._active_job_id)
             return {
                 "depth": int(depth_legacy + depth_scheduled),
                 "depth_legacy": int(depth_legacy),
@@ -1129,6 +1130,7 @@ def _create_ray_actor(*, require_ready: bool = True):
                         | set(self._max_exec_s_by_op)
                     )
                 },
+                "scheduler_metrics_ready": scheduler_metrics_ready,
                 "scheduler_enabled": bool(self._scheduler_enabled),
                 "scheduler_picks_total": int(self._sched_stats.get("picks_total", 0)),
                 "scheduler_switches_total": int(self._sched_stats.get("switches_total", 0)),
@@ -1364,6 +1366,24 @@ class ApiWorkQueueClient:
         self._snapshot_hydrate_min_interval_s = float(
             os.environ.get("MINT_API_WORK_QUEUE_SNAPSHOT_HYDRATE_MIN_INTERVAL_S", "30.0")
         )
+        from ..ray_utils import register_ray_reconnect_invalidator
+
+        register_ray_reconnect_invalidator(self._reset_ray_actor)
+
+    def _reset_ray_actor(self) -> None:
+        self._ray_actor = None
+
+    @staticmethod
+    def _trim_unready_scheduler_metrics(snapshot: dict[str, Any]) -> dict[str, Any]:
+        if bool(snapshot.get("scheduler_metrics_ready", True)):
+            return snapshot
+        out = dict(snapshot)
+        out.pop("depth_scheduled", None)
+        out.pop("scheduled_depth_by_priority", None)
+        for key in list(out):
+            if key.startswith("scheduler_") and key != "scheduler_metrics_ready":
+                out.pop(key, None)
+        return out
 
     @staticmethod
     def _snapshot_bump(bucket: dict[str, int], key: str | None, delta: int) -> None:
@@ -1459,14 +1479,12 @@ class ApiWorkQueueClient:
         except Exception as e:
             raise ApiWorkQueueUnavailableError("Ray import failed") from e
 
-        if not ray.is_initialized():
-            try:
-                from ..ray_utils import init_ray
+        try:
+            from ..ray_utils import init_ray
 
-                init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
-            except Exception as e:
-                raise ApiWorkQueueUnavailableError("Ray not initialized (init_ray failed)") from e
-
+            init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
+        except Exception as e:
+            raise ApiWorkQueueUnavailableError("Ray not initialized (init_ray failed)") from e
         if not ray.is_initialized():
             raise ApiWorkQueueUnavailableError("Ray not initialized")
 
@@ -1647,20 +1665,7 @@ class ApiWorkQueueClient:
             }
 
     def _get_cached_ray_actor_for_async_request_path(self):
-        try:
-            import ray
-        except Exception as e:
-            raise ApiWorkQueueUnavailableError("Ray import failed") from e
-
-        if not ray.is_initialized():
-            raise ApiWorkQueueUnavailableError("Ray not initialized")
-
-        actor = self._ray_actor
-        if actor is None:
-            raise ApiWorkQueueUnavailableError(
-                "Detached Ray ApiWorkQueue actor is not ready on this API server"
-            )
-        return actor
+        return self._get_ray_actor(require_ready=False)
 
     async def _get_ray_actor_async(self, *, require_ready: bool = True):
         try:
@@ -1668,14 +1673,12 @@ class ApiWorkQueueClient:
         except Exception as e:
             raise ApiWorkQueueUnavailableError("Ray import failed") from e
 
-        if not ray.is_initialized():
-            try:
-                from ..ray_utils import init_ray
+        try:
+            from ..ray_utils import init_ray
 
-                init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
-            except Exception as e:
-                raise ApiWorkQueueUnavailableError("Ray not initialized (init_ray failed)") from e
-
+            init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
+        except Exception as e:
+            raise ApiWorkQueueUnavailableError("Ray not initialized (init_ray failed)") from e
         if not ray.is_initialized():
             raise ApiWorkQueueUnavailableError("Ray not initialized")
 
@@ -1786,7 +1789,7 @@ class ApiWorkQueueClient:
             raise ApiWorkQueueUnavailableError("Detached Ray ApiWorkQueue actor died") from e
         if not isinstance(out, dict):
             raise TypeError(f"ApiWorkQueue.stats returned non-dict: {type(out)}")
-        return out
+        return self._trim_unready_scheduler_metrics(out)
 
     def set_executor(self, op: str, executor: Executor) -> None:
         self._executors[str(op)] = executor
@@ -2704,9 +2707,17 @@ class ApiWorkQueueClient:
                     await _finalize_request_slot(item.request_id)
 
     async def stats(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
-        if not self._snapshot_hydrated:
-            self.hydrate_metrics_snapshot(timeout_s=float(timeout_s), force=True)
-        return self.metrics_snapshot()
+        try:
+            actor = self._get_cached_ray_actor_for_async_request_path()
+        except ApiWorkQueueUnavailableError:
+            if not self._snapshot_hydrated:
+                self.hydrate_metrics_snapshot(timeout_s=float(timeout_s), force=True)
+            return self.metrics_snapshot()
+        ref = actor.stats.remote()
+        out = await self._await_ray_ref(ref, timeout_s=float(timeout_s))
+        if not isinstance(out, dict):
+            raise TypeError(f"ApiWorkQueue.stats returned non-dict: {type(out)}")
+        return self._trim_unready_scheduler_metrics(out)
 
     async def rss_bytes(self, *, timeout_s: float = 10.0) -> int:
         actor = self._get_cached_ray_actor_for_async_request_path()

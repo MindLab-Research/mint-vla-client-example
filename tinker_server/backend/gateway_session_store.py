@@ -16,6 +16,13 @@ from ..config import otel_env_vars
 
 _ACTOR_HANDLE = None
 
+def _reset_cached_actor_handle() -> None:
+    global _ACTOR_HANDLE
+    _ACTOR_HANDLE = None
+
+from ..ray_utils import register_ray_reconnect_invalidator as _register_ray_reconnect_invalidator
+_register_ray_reconnect_invalidator(_reset_cached_actor_handle)
+
 
 async def _await_ray_ref(ref: Any) -> Any:
     if hasattr(ref, "__await__"):
