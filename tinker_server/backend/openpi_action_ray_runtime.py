@@ -18,6 +18,7 @@ from .openpi_fast_runtime import (
     OpenPIFastWorkerProtocolError,
 )
 from .openpi_ray_runtime import (
+    _action_session_state_root,
     _actor_ready_timeout_s,
     _openpi_runtime_env_vars,
     _ray_timeout,
@@ -307,10 +308,14 @@ async def start_openpi_action_ray_runtime(
         base_model=base_model,
         worker_module=spec.worker_module,
     )
+    runtime_env_vars = {
+        **_openpi_runtime_env_vars(),
+        "MINT_OPENPI_FAST_ACTION_SESSION_STATE_ROOT": _action_session_state_root(actor_name),
+    }
     actor = OpenPIActionRayRuntimeActor.options(
         name=actor_name,
         namespace=RAY_NAMESPACE,
-        runtime_env={"env_vars": _openpi_runtime_env_vars()},
+        runtime_env={"env_vars": runtime_env_vars},
         **_single_node_actor_options(
             base_model=base_model,
             actor_name=actor_name,

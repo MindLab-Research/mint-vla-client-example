@@ -88,6 +88,7 @@ class ModelConfig:
     camera_layout: tuple[str, ...] = ()
     action_dim: int | None = None
     action_horizon: int | None = None
+    action_token_budget: int | None = None
 
     @property
     def total_gpus(self) -> int:
@@ -137,6 +138,7 @@ MODEL_CONFIGS = {
         camera_layout=("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"),
         action_dim=7,
         action_horizon=10,
+        action_token_budget=21,
     ),
     "openpi/pi05-libero-low-mem-finetune": ModelConfig(
         num_parameters=3.0,

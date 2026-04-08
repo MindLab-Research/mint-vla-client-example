@@ -26,6 +26,7 @@ async def _do_act(request_id: str, request: ActRequest) -> None:
             action_session_id=request.action_session_id,
             observation=request.observation,
             extra_inputs=request.extra_inputs,
+            temperature=request.temperature,
         )
         payload = dict(out)
         payload["type"] = "act"

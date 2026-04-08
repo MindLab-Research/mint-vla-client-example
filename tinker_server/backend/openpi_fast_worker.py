@@ -16,6 +16,8 @@ from typing import Any
 
 import numpy as np
 
+from ..checkpoints import checkpoint_has_openpi_policy_weights, checkpoint_has_openpi_training_state
+from .openpi_fast_action_runtime import find_openpi_policy_checkpoint_dir
 from .openpi_fast_runtime import OPENPI_FAST_WORKER_PROTOCOL_VERSION
 from .openpi_session_state import OpenPISessionStateManager
 
@@ -68,6 +70,28 @@ def _float_scalar(value: Any) -> float:
 
 def _int_scalar(value: Any) -> int:
     return int(np.asarray(value).item())
+
+
+def _checkpoint_step_from_metadata(path: Path) -> int:
+    candidates = [path]
+    if path.name.isdigit():
+        candidates.append(path.parent)
+    for candidate in candidates:
+        metadata_path = candidate / "metadata.json"
+        if not metadata_path.is_file():
+            continue
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        step = metadata.get("step")
+        if step is None:
+            continue
+        try:
+            return int(step)
+        except Exception:
+            continue
+    return 0
 
 
 def _decode_image(encoded: dict[str, Any]) -> np.ndarray:
@@ -269,7 +293,7 @@ class OpenPIFastWorkerSession:
             }
         )
 
-    def _init_train_state(self) -> Any:
+    def _init_train_state(self, *, partial_params: Any | None = None, step: int = 0) -> Any:
         config = self._config
         jax = self._jax
         nnx = self._nnx
@@ -291,7 +315,7 @@ class OpenPIFastWorkerSession:
                 lambda p: p.replace(p.value.astype(self._jnp.bfloat16)),
             )
             return self._training_utils.TrainState(
-                step=0,
+                step=step,
                 params=params,
                 model_def=nnx.graphdef(model),
                 tx=tx,
@@ -303,10 +327,18 @@ class OpenPIFastWorkerSession:
         init_rng = jax.random.key(config.seed)
         train_state_shape = jax.eval_shape(init, init_rng)
         state_sharding = self._sharding_mod.fsdp_sharding(train_state_shape, self._mesh, log=True)
-        partial_params = self._load_weights_and_validate(
-            config.weight_loader,
-            train_state_shape.params.to_pure_dict(),
-        )
+        if partial_params is None:
+            partial_params = self._load_weights_and_validate(
+                config.weight_loader,
+                train_state_shape.params.to_pure_dict(),
+            )
+        else:
+            self._array_typing.check_pytree_equality(
+                expected=train_state_shape.params.to_pure_dict(),
+                got=partial_params,
+                check_shapes=True,
+                check_dtypes=False,
+            )
         replicated_sharding = jax.sharding.NamedSharding(self._mesh, jax.sharding.PartitionSpec())
         train_state = jax.jit(
             init,
@@ -382,10 +414,11 @@ class OpenPIFastWorkerSession:
         return grads, loss_value, grad_norm, param_norm
 
     def _compute_target_logprobs(self, model_obj: Any, rng: Any, observation: Any) -> Any:
+        model_obj.eval()
         observation = self._openpi_model.preprocess_observation(
             rng,
             observation,
-            train=True,
+            train=False,
             image_keys=list(observation.images.keys()),
         )
         input_token_embeddings, input_mask, ar_mask = model_obj.embed_inputs(observation)
@@ -751,10 +784,27 @@ class OpenPIFastWorkerSession:
                 checkpoint_step,
             )
             manager.wait_until_finished()
+            self._save_checkpoint_assets(Path(checkpoint_path) / str(checkpoint_step) / "assets")
         finally:
             close = getattr(manager, "close", None)
             if callable(close):
                 close()
+
+    def _save_checkpoint_assets(self, directory: Path) -> None:
+        data_config = self._data_loader.data_config()
+        norm_stats = data_config.norm_stats
+        if norm_stats is not None and data_config.asset_id is not None:
+            self._checkpoints._normalize.save(directory / data_config.asset_id, norm_stats)
+            return
+
+        seed_assets_dir = getattr(self, "_seed_assets_dir", None)
+        if seed_assets_dir is not None and Path(seed_assets_dir).is_dir():
+            shutil.copytree(Path(seed_assets_dir), directory, dirs_exist_ok=True)
+            return
+
+        raise FileNotFoundError(
+            "OpenPI FAST checkpoint export missing norm_stats and seed assets directory"
+        )
 
     def _save_sampler_checkpoint(self, path: Path, state: Any) -> None:
         checkpoint_path = str(Path(path).resolve())
@@ -769,26 +819,10 @@ class OpenPIFastWorkerSession:
             # Sampler exports must reflect the current policy params, not a lagging EMA shadow.
             params = state.params
 
-            def save_assets(directory: Path) -> None:
-                data_config = self._data_loader.data_config()
-                norm_stats = data_config.norm_stats
-                if norm_stats is not None and data_config.asset_id is not None:
-                    self._checkpoints._normalize.save(directory / data_config.asset_id, norm_stats)
-                    return
-
-                seed_assets_dir = getattr(self, "_seed_assets_dir", None)
-                if seed_assets_dir is not None and Path(seed_assets_dir).is_dir():
-                    shutil.copytree(Path(seed_assets_dir), directory, dirs_exist_ok=True)
-                    return
-
-                raise FileNotFoundError(
-                    "OpenPI FAST sampler export missing norm_stats and seed assets directory"
-                )
-
             manager.save(
                 checkpoint_step,
                 items={
-                    "assets": save_assets,
+                    "assets": self._save_checkpoint_assets,
                     "params": {"params": params},
                 },
             )
@@ -821,6 +855,17 @@ class OpenPIFastWorkerSession:
             close = getattr(manager, "close", None)
             if callable(close):
                 close()
+
+    def _load_policy_weights_checkpoint(self, path: Path) -> Any:
+        source_dir = find_openpi_policy_checkpoint_dir(path)
+        partial_params = self._openpi_model.restore_params(
+            source_dir / "params",
+            dtype=self._jnp.bfloat16,
+        )
+        return self._init_train_state(
+            partial_params=partial_params,
+            step=_checkpoint_step_from_metadata(source_dir),
+        )
 
     def _session_state_tree(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -924,7 +969,20 @@ class OpenPIFastWorkerSession:
 
     def load_weights(self, payload: dict[str, Any]) -> dict[str, Any]:
         load_path = str(Path(payload["load_path"]).resolve())
-        self._state = self._load_train_state_checkpoint(Path(load_path))
+        load_optimizer = bool(payload.get("load_optimizer", True))
+        load_root = Path(load_path)
+        policy_only_checkpoint = False
+        try:
+            find_openpi_policy_checkpoint_dir(load_root)
+            policy_only_checkpoint = True
+        except FileNotFoundError:
+            policy_only_checkpoint = False
+        if checkpoint_has_openpi_training_state(load_path):
+            self._state = self._load_train_state_checkpoint(load_root)
+        elif not load_optimizer and policy_only_checkpoint:
+            self._state = self._load_policy_weights_checkpoint(load_root)
+        else:
+            self._state = self._load_train_state_checkpoint(load_root)
         return {
             "current_step": _int_scalar(self._state.step),
             "learning_rate": self._learning_rate,

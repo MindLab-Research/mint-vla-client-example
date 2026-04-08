@@ -4,6 +4,7 @@ import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from tinker_server.backend.training_session_manager import TrainingSession
@@ -101,6 +102,216 @@ def test_openpi_fast_action_worker_reply_prefers_protocol_stream(monkeypatch) ->
     assert protocol_stream.getvalue() == '{"ok": true}\n'
 
 
+def test_openpi_fast_action_worker_dispatch_supports_session_state_ops() -> None:
+    import tinker_server.backend.openpi_fast_action_worker as worker_module
+
+    class _FakeSession:
+        def save_session_state(self, payload):
+            return {"save": payload["session_id"]}
+
+        def load_session_state(self, payload):
+            return {"load": payload["session_id"]}
+
+    session = _FakeSession()
+    assert worker_module._dispatch(session, "save_session_state", {"session_id": "sess-a"}) == ({"save": "sess-a"}, session)
+    assert worker_module._dispatch(session, "load_session_state", {"session_id": "sess-a"}) == ({"load": "sess-a"}, session)
+
+
+def test_openpi_fast_action_worker_dispatch_cleans_up_replaced_session(monkeypatch) -> None:
+    import tinker_server.backend.openpi_fast_action_worker as worker_module
+
+    events = []
+
+    class _ExistingSession:
+        def shutdown(self):
+            events.append("shutdown-old")
+            return {"stopped": True}
+
+    class _NewSession:
+        def __init__(self, payload):
+            events.append(("create-new", payload))
+
+    monkeypatch.setattr(worker_module, "OpenPIFastActionSession", _NewSession)
+
+    result, session = worker_module._dispatch(_ExistingSession(), "create_session", {"foo": "bar"})
+    assert result == {"ready": True}
+    assert isinstance(session, _NewSession)
+    assert events == ["shutdown-old", ("create-new", {"foo": "bar"})]
+
+    result, session = worker_module._dispatch(_ExistingSession(), "shutdown", {})
+    assert result == {"stopped": True}
+    assert session is None
+
+
+def test_openpi_fast_action_worker_act_fails_on_missing_action_prefix() -> None:
+    from tinker_server.backend.openpi_fast_action_worker import OpenPIFastActionSession
+
+    session = OpenPIFastActionSession.__new__(OpenPIFastActionSession)
+    session._observation_from_payload = lambda payload: {"payload": payload}
+    session._jax = SimpleNamespace(
+        random=SimpleNamespace(
+            split=lambda rng: ("next-rng", "sample-rng"),
+            key_data=lambda rng: np.asarray([0, 0], dtype=np.uint32),
+        )
+    )
+    session._rng = "seed-rng"
+    session._sample_counter = 0
+    session._action_token_budget = 18
+    session._model = SimpleNamespace(
+        sample_actions=lambda rng, observation, max_decoding_steps=None, temperature=0.0: np.asarray([[1, 2, 3]], dtype=np.int32)
+    )
+
+    class _FakeTokenizer:
+        _paligemma_tokenizer = SimpleNamespace(decode=lambda tokens: "bad output without action prefix")
+
+        def extract_actions(self, *args, **kwargs):
+            raise AssertionError("extract_actions should not run when the sampled suffix is malformed")
+
+    session._tokenizer = _FakeTokenizer()
+    session._action_horizon = 10
+    session._action_dim = 7
+
+    with pytest.raises(RuntimeError, match="missing 'Action: ' prefix"):
+        session.act({"observation": {"chunks": []}, "extra_inputs": {"state": {"data": [0.0], "shape": [1], "dtype": "float32"}}})
+
+
+def test_openpi_fast_action_worker_act_fails_on_strict_decode_shape_mismatch() -> None:
+    from tinker_server.backend.openpi_fast_action_worker import OpenPIFastActionSession
+
+    session = OpenPIFastActionSession.__new__(OpenPIFastActionSession)
+    session._observation_from_payload = lambda payload: {"payload": payload}
+    session._jax = SimpleNamespace(
+        random=SimpleNamespace(
+            split=lambda rng: ("next-rng", "sample-rng"),
+            key_data=lambda rng: np.asarray([0, 0], dtype=np.uint32),
+        )
+    )
+    session._rng = "seed-rng"
+    session._sample_counter = 0
+    session._action_token_budget = 18
+    session._model = SimpleNamespace(
+        sample_actions=lambda rng, observation, max_decoding_steps=None, temperature=0.0: np.asarray([[1, 2, 3]], dtype=np.int32)
+    )
+    session._action_horizon = 10
+    session._action_dim = 7
+    session._scipy_idct = lambda arr, axis=0, norm="ortho": arr
+
+    class _FakePaligemmaTokenizer:
+        @staticmethod
+        def decode(tokens):
+            _ = tokens
+            return "Action: abc|"
+
+        @staticmethod
+        def encode(text):
+            _ = text
+            return [1, 2, 3]
+
+    class _FakeBpeTokenizer:
+        @staticmethod
+        def decode(tokens):
+            _ = tokens
+            return "abc"
+
+    session._tokenizer = SimpleNamespace(
+        _paligemma_tokenizer=_FakePaligemmaTokenizer(),
+        _fast_tokenizer=SimpleNamespace(bpe_tokenizer=_FakeBpeTokenizer(), min_token=0, scale=1),
+        _act_tokens_to_paligemma_tokens=lambda tokens: tokens,
+    )
+
+    with pytest.raises(RuntimeError, match="decoded action token count is not divisible"):
+        session.act({"observation": {"chunks": []}, "extra_inputs": {"state": {"data": [0.0], "shape": [1], "dtype": "float32"}}})
+
+
+def test_openpi_fast_action_worker_act_bounds_decoding_to_expected_suffix_len() -> None:
+    from tinker_server.backend.openpi_fast_action_worker import OpenPIFastActionSession
+
+    calls: list[dict[str, object]] = []
+
+    session = OpenPIFastActionSession.__new__(OpenPIFastActionSession)
+    session._observation_from_payload = lambda payload: {"payload": payload}
+    session._jax = SimpleNamespace(
+        random=SimpleNamespace(
+            split=lambda rng: ("next-rng", "sample-rng"),
+            key_data=lambda rng: np.asarray([0, 0], dtype=np.uint32),
+        )
+    )
+    session._rng = "seed-rng"
+    session._sample_counter = 0
+    session._action_token_budget = 18
+    session._action_horizon = 10
+    session._action_dim = 7
+    session._extract_actions_strict = lambda action_tokens: np.ones((10, 7), dtype=np.float32)
+    session._model = SimpleNamespace(
+        sample_actions=lambda rng, observation, max_decoding_steps, temperature=0.0: (
+            calls.append(
+                {
+                    "rng": rng,
+                    "observation": observation,
+                    "max_decoding_steps": max_decoding_steps,
+                    "temperature": temperature,
+                }
+            )
+            or np.asarray([[1, 2, 3]], dtype=np.int32)
+        )
+    )
+
+    result = session.act(
+        {"observation": {"chunks": []}, "extra_inputs": {"state": {"data": [0.0], "shape": [1], "dtype": "float32"}}, "temperature": 0.3}
+    )
+
+    assert calls == [
+        {
+            "rng": "sample-rng",
+            "observation": {"payload": {"observation": {"chunks": []}, "extra_inputs": {"state": {"data": [0.0], "shape": [1], "dtype": "float32"}}, "temperature": 0.3}},
+            "max_decoding_steps": 18,
+            "temperature": 0.3,
+        }
+    ]
+    assert result["actions"]["shape"] == [10, 7]
+
+
+def test_openpi_pi05_action_worker_dispatch_supports_session_state_ops() -> None:
+    import tinker_server.backend.openpi_pi05_action_worker as worker_module
+
+    class _FakeSession:
+        def save_session_state(self, payload):
+            return {"save": payload["session_id"]}
+
+        def load_session_state(self, payload):
+            return {"load": payload["session_id"]}
+
+    session = _FakeSession()
+    assert worker_module._dispatch(session, "save_session_state", {"session_id": "sess-b"}) == ({"save": "sess-b"}, session)
+    assert worker_module._dispatch(session, "load_session_state", {"session_id": "sess-b"}) == ({"load": "sess-b"}, session)
+
+
+def test_openpi_pi05_action_worker_dispatch_cleans_up_replaced_session(monkeypatch) -> None:
+    import tinker_server.backend.openpi_pi05_action_worker as worker_module
+
+    events = []
+
+    class _ExistingSession:
+        def shutdown(self):
+            events.append("shutdown-old")
+            return {"stopped": True}
+
+    class _NewSession:
+        def __init__(self, payload):
+            events.append(("create-new", payload))
+
+    monkeypatch.setattr(worker_module, "OpenPIPi05ActionSession", _NewSession)
+
+    result, session = worker_module._dispatch(_ExistingSession(), "create_session", {"foo": "bar"})
+    assert result == {"ready": True}
+    assert isinstance(session, _NewSession)
+    assert events == ["shutdown-old", ("create-new", {"foo": "bar"})]
+
+    result, session = worker_module._dispatch(_ExistingSession(), "shutdown", {})
+    assert result == {"stopped": True}
+    assert session is None
+
+
 class _FakeTrainingRuntimeClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict | None]] = []
@@ -177,6 +388,7 @@ class _FakeActionRuntimeFactory:
                 "checkpoint_path": checkpoint_path,
                 "config_name": config_name,
                 "camera_layout": model_config.camera_layout,
+                "action_token_budget": model_config.action_token_budget,
             }
         )
         client = _FakeActionRuntimeClient()
@@ -184,7 +396,7 @@ class _FakeActionRuntimeFactory:
         return client
 
 
-def test_openpi_fast_default_runtime_factory_uses_action_ray_runtime(
+def test_openpi_fast_default_runtime_factory_uses_shared_runtime(
     monkeypatch,
     configure_runtime_env,
 ) -> None:
@@ -193,17 +405,23 @@ def test_openpi_fast_default_runtime_factory_uses_action_ray_runtime(
     runtime_env = configure_runtime_env()
     calls: list[dict[str, object]] = []
 
-    async def _fake_start_openpi_action_ray_runtime(*, action_session_id: str, base_model: str, spec):
+    async def _fake_start_openpi_shared_ray_runtime(*, session, spec, config_name, model_config, template_reusable):
         calls.append(
             {
-                "action_session_id": action_session_id,
-                "base_model": base_model,
+                "session_id": session.model_id,
+                "base_model": session.base_model,
                 "worker_module": spec.worker_module,
                 "python_executable": spec.python_executable,
                 "pythonpath": spec.pythonpath,
+                "config_name": config_name,
+                "action_dim": model_config.action_dim,
+                "action_horizon": model_config.action_horizon,
+                "action_token_budget": model_config.action_token_budget,
+                "max_model_len": model_config.max_model_len,
+                "template_reusable": template_reusable,
             }
         )
-        return "action-ray-runtime-client"
+        return "openpi-shared-runtime-client"
 
     async def _unexpected_local_fast_start(spec=None):
         raise AssertionError(f"local fast action worker path must not run: {spec}")
@@ -212,8 +430,8 @@ def test_openpi_fast_default_runtime_factory_uses_action_ray_runtime(
         raise AssertionError(f"local worker path must not run: {spec.worker_module}")
 
     monkeypatch.setattr(
-        "tinker_server.backend.action_session_manager.start_openpi_action_ray_runtime",
-        _fake_start_openpi_action_ray_runtime,
+        "tinker_server.backend.action_session_manager.start_openpi_shared_ray_runtime",
+        _fake_start_openpi_shared_ray_runtime,
         raising=False,
     )
     monkeypatch.setattr(
@@ -230,24 +448,30 @@ def test_openpi_fast_default_runtime_factory_uses_action_ray_runtime(
             action_session_id="session-1:action:3",
             base_model=OPENPI_FAST_MODEL,
             checkpoint_path="/tmp/export-1",
-            model_config=SimpleNamespace(action_dim=7, action_horizon=10, max_model_len=180),
+            model_config=SimpleNamespace(action_dim=7, action_horizon=10, action_token_budget=21, max_model_len=180),
             config_name="pi0_fast_libero_low_mem_finetune",
         )
     )
 
-    assert runtime == "action-ray-runtime-client"
+    assert runtime == "openpi-shared-runtime-client"
     assert calls == [
         {
-            "action_session_id": "session-1:action:3",
+            "session_id": "session-1:action:3",
             "base_model": OPENPI_FAST_MODEL,
             "worker_module": "tinker_server.backend.openpi_fast_action_worker",
             "python_executable": str(runtime_env["layout"].host_python),
             "pythonpath": runtime_env["pythonpath"],
+            "config_name": "pi0_fast_libero_low_mem_finetune",
+            "action_dim": 7,
+            "action_horizon": 10,
+            "action_token_budget": 21,
+            "max_model_len": 180,
+            "template_reusable": False,
         }
     ]
 
 
-def test_openpi_pi05_default_runtime_factory_uses_action_ray_runtime(
+def test_openpi_pi05_default_runtime_factory_uses_shared_runtime(
     monkeypatch,
     configure_runtime_env,
 ) -> None:
@@ -256,17 +480,22 @@ def test_openpi_pi05_default_runtime_factory_uses_action_ray_runtime(
     runtime_env = configure_runtime_env()
     calls: list[dict[str, object]] = []
 
-    async def _fake_start_openpi_action_ray_runtime(*, action_session_id: str, base_model: str, spec):
+    async def _fake_start_openpi_shared_ray_runtime(*, session, spec, config_name, model_config, template_reusable):
         calls.append(
             {
-                "action_session_id": action_session_id,
-                "base_model": base_model,
+                "session_id": session.model_id,
+                "base_model": session.base_model,
                 "worker_module": spec.worker_module,
                 "python_executable": spec.python_executable,
                 "pythonpath": spec.pythonpath,
+                "config_name": config_name,
+                "action_dim": model_config.action_dim,
+                "action_horizon": model_config.action_horizon,
+                "max_model_len": model_config.max_model_len,
+                "template_reusable": template_reusable,
             }
         )
-        return "action-ray-runtime-client"
+        return "openpi-shared-runtime-client"
 
     async def _unexpected_local_fast_start(spec=None):
         raise AssertionError(f"local pi0.5 action worker path must not run: {spec}")
@@ -275,8 +504,8 @@ def test_openpi_pi05_default_runtime_factory_uses_action_ray_runtime(
         raise AssertionError(f"local worker path must not run: {spec.worker_module}")
 
     monkeypatch.setattr(
-        "tinker_server.backend.action_session_manager.start_openpi_action_ray_runtime",
-        _fake_start_openpi_action_ray_runtime,
+        "tinker_server.backend.action_session_manager.start_openpi_shared_ray_runtime",
+        _fake_start_openpi_shared_ray_runtime,
         raising=False,
     )
     monkeypatch.setattr(
@@ -298,16 +527,152 @@ def test_openpi_pi05_default_runtime_factory_uses_action_ray_runtime(
         )
     )
 
-    assert runtime == "action-ray-runtime-client"
+    assert runtime == "openpi-shared-runtime-client"
     assert calls == [
         {
-            "action_session_id": "session-1:action:9",
+            "session_id": "session-1:action:9",
             "base_model": "openpi/pi05-libero-low-mem-finetune",
             "worker_module": "tinker_server.backend.openpi_pi05_action_worker",
             "python_executable": str(runtime_env["layout"].host_python),
             "pythonpath": runtime_env["pythonpath"],
+            "config_name": "pi05_libero",
+            "action_dim": 7,
+            "action_horizon": 10,
+            "max_model_len": 180,
+            "template_reusable": False,
         }
     ]
+
+
+def test_recover_detached_action_runtime_client_uses_shared_client_for_shared_actor(monkeypatch) -> None:
+    from tinker_server.backend import action_session_manager
+    from tinker_server.backend.resource_pool import ActorType
+
+    class _FakeActorHandle:
+        class _Describe:
+            @staticmethod
+            def remote():
+                return "describe-ref"
+
+        describe = _Describe()
+
+    actor_handle_obj = _FakeActorHandle()
+
+    class _FakeEntry:
+        actor_type = ActorType.OPENPI
+        actor_name = "openpi_shared_runtime_deadbeef"
+        current_session = None
+        base_model = OPENPI_FAST_MODEL
+        actor_handle = actor_handle_obj
+        metadata = {
+            "worker_module": "tinker_server.backend.openpi_fast_action_worker",
+            "pool_key": {"base_model": OPENPI_FAST_MODEL},
+        }
+
+    class _FakePool:
+        def iter_entries(self, prune_stale: bool = False):
+            assert prune_stale is True
+            return [_FakeEntry()]
+
+        def get(self, actor_name):
+            assert actor_name == "openpi_shared_runtime_deadbeef"
+            return None
+
+    init: dict[str, object] = {}
+
+    class _FakeSharedClient:
+        def __init__(self, *, actor, actor_name, spec, session_id, ready_timeout_s):
+            init.update(
+                {
+                    "actor": actor,
+                    "actor_name": actor_name,
+                    "worker_module": spec.worker_module,
+                    "session_id": session_id,
+                    "ready_timeout_s": ready_timeout_s,
+                }
+            )
+
+    class _UnexpectedActionClient:
+        def __init__(self, **kwargs):
+            raise AssertionError(f"legacy action client recovery must not run: {kwargs}")
+
+    monkeypatch.setattr(action_session_manager, "get_resource_pool", lambda: _FakePool())
+    monkeypatch.setattr(action_session_manager, "OpenPISharedRayRuntimeClient", _FakeSharedClient)
+    monkeypatch.setattr(action_session_manager, "OpenPIActionRayRuntimeClient", _UnexpectedActionClient)
+    monkeypatch.setattr(action_session_manager, "_actor_ready_timeout_s", lambda spec: 123.0)
+    monkeypatch.setattr(
+        action_session_manager,
+        "_runtime_spec_for_worker_module",
+        lambda worker_module: SimpleNamespace(worker_module=worker_module),
+    )
+    monkeypatch.setattr(
+        action_session_manager.ray,
+        "get",
+        lambda ref, timeout=None: {"known_session_ids": ["session-1:action:3"]},
+    )
+
+    client = action_session_manager._recover_detached_action_runtime_client(
+        action_session_id="session-1:action:3",
+        supports_base_model=lambda base_model: base_model == OPENPI_FAST_MODEL,
+        supports_worker_module=lambda worker_module: worker_module == "tinker_server.backend.openpi_fast_action_worker",
+    )
+
+    assert isinstance(client, _FakeSharedClient)
+    assert init == {
+        "actor": actor_handle_obj,
+        "actor_name": "openpi_shared_runtime_deadbeef",
+        "worker_module": "tinker_server.backend.openpi_fast_action_worker",
+        "session_id": "session-1:action:3",
+        "ready_timeout_s": 123.0,
+    }
+
+
+def test_action_session_router_recovers_shared_session_from_known_session_ids(monkeypatch) -> None:
+    from tinker_server.backend import action_session_manager
+    from tinker_server.backend.resource_pool import ActorType
+
+    class _FakeActorHandle:
+        class _Describe:
+            @staticmethod
+            def remote():
+                return "describe-ref"
+
+        describe = _Describe()
+
+    class _FakeEntry:
+        actor_type = ActorType.OPENPI
+        actor_name = "openpi_shared_runtime_deadbeef"
+        current_session = None
+        base_model = OPENPI_FAST_MODEL
+        actor_handle = _FakeActorHandle()
+        metadata = {
+            "worker_module": "tinker_server.backend.openpi_fast_action_worker",
+            "pool_key": {"base_model": OPENPI_FAST_MODEL},
+        }
+
+    class _FakePool:
+        def iter_entries(self, prune_stale: bool = False):
+            assert prune_stale is True
+            return [_FakeEntry()]
+
+    fake_fast_manager = object()
+
+    monkeypatch.setattr(action_session_manager, "get_resource_pool", lambda: _FakePool())
+    monkeypatch.setattr(
+        action_session_manager.ray,
+        "get",
+        lambda ref, timeout=None: {"known_session_ids": ["session-1:action:3"]},
+    )
+
+    router = action_session_manager.ActionSessionRouter(
+        openpi_fast_manager=fake_fast_manager,
+        openpi_pi05_manager=object(),
+    )
+
+    recovered = router._recover_manager_for_session("session-1:action:3")
+
+    assert recovered is fake_fast_manager
+    assert router._manager_for_session["session-1:action:3"] is fake_fast_manager
 
 
 def test_start_openpi_action_ray_runtime_registers_actor_metadata_in_resource_pool(monkeypatch) -> None:
@@ -363,6 +728,7 @@ def test_start_openpi_action_ray_runtime_registers_actor_metadata_in_resource_po
     monkeypatch.setattr(openpi_action_ray_runtime, "OpenPIActionRayRuntimeClient", _FakeClient)
     monkeypatch.setattr(openpi_action_ray_runtime, "get_resource_pool", lambda: _FakePool())
     monkeypatch.setattr(openpi_action_ray_runtime, "_openpi_runtime_env_vars", _fake_openpi_actor_env)
+    monkeypatch.setenv("PFS_TINKER_PATH", "/repo")
 
     client = asyncio.run(
         openpi_action_ray_runtime.start_openpi_action_ray_runtime(
@@ -377,6 +743,10 @@ def test_start_openpi_action_ray_runtime_registers_actor_metadata_in_resource_po
     )
 
     assert isinstance(client, _FakeClient)
+    expected_actor_name = state["client_init"]["actor_name"]
+    assert state["options"]["runtime_env"]["env_vars"]["MINT_OPENPI_FAST_ACTION_SESSION_STATE_ROOT"] == (
+        f"/repo/checkpoints/openpi_action_session_state/tinker/{expected_actor_name}"
+    )
     register = state["register"]
     assert register["actor_type"].value == "openpi"
     assert register["base_model"] == OPENPI_FAST_MODEL
@@ -430,6 +800,7 @@ def test_start_openpi_action_ray_runtime_applies_single_node_pin(monkeypatch) ->
     monkeypatch.setattr(openpi_action_ray_runtime, "OpenPIActionRayRuntimeClient", _FakeClient)
     monkeypatch.setattr(openpi_action_ray_runtime, "get_resource_pool", lambda: _FakePool())
     monkeypatch.setattr(openpi_action_ray_runtime, "_openpi_runtime_env_vars", _fake_openpi_actor_env)
+    monkeypatch.setenv("PFS_TINKER_PATH", "/repo")
     monkeypatch.setattr(
         openpi_action_ray_runtime,
         "parse_model_node_ip_list",
@@ -456,6 +827,9 @@ def test_start_openpi_action_ray_runtime_applies_single_node_pin(monkeypatch) ->
     )
 
     options = state["options"]
+    assert options["runtime_env"]["env_vars"]["MINT_OPENPI_FAST_ACTION_SESSION_STATE_ROOT"] == (
+        f"/repo/checkpoints/openpi_action_session_state/tinker/{state['register']['actor_name']}"
+    )
     assert options["resources"] == {"node:192.168.38.176": 0.001}
     assert options["scheduling_strategy"].node_id == node_id
     assert options["scheduling_strategy"].soft is False
@@ -520,6 +894,7 @@ def test_action_session_manager_create_session_starts_runtime_from_checkpoint(tm
             "checkpoint_path": str(checkpoint_dir.resolve()),
             "config_name": "pi0_fast_libero_low_mem_finetune",
             "camera_layout": ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"),
+            "action_token_budget": 21,
         }
     ]
     assert factory.clients[0].calls[0] == (
@@ -531,6 +906,7 @@ def test_action_session_manager_create_session_starts_runtime_from_checkpoint(tm
             "config_name": "pi0_fast_libero_low_mem_finetune",
             "action_dim": 7,
             "action_horizon": 10,
+            "action_token_budget": 21,
             "max_token_len": 180,
             "camera_layout": ["base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"],
         },

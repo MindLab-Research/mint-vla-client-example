@@ -57,6 +57,31 @@ def _create_model(base_url: str, base_model: str) -> str:
     return model_id
 
 
+def _create_model_from_state(
+    base_url: str,
+    *,
+    base_model: str,
+    state_path: str,
+    load_optimizer: bool = False,
+) -> str:
+    payload = {
+        "session_id": f"rl-{uuid.uuid4().hex[:12]}",
+        "model_seq_id": 0,
+        "base_model": base_model,
+        "state_path": state_path,
+        "lora_config": {"rank": 16, "train_attn": True, "train_mlp": True, "train_unembed": True},
+        "load_optimizer": bool(load_optimizer),
+        "user_metadata": {"script": "scripts/wip/openpi_libero_fast_rl.py"},
+    }
+    resp = requests.post(f"{base_url}/api/v1/create_model_from_state", json=payload, timeout=120)
+    resp.raise_for_status()
+    result = _poll_future(base_url, resp.json()["request_id"], timeout_s=3600)
+    model_id = result.get("model_id")
+    if not isinstance(model_id, str) or not model_id:
+        raise RuntimeError(f"create_model_from_state missing model_id: {result!r}")
+    return model_id
+
+
 def _delete_model(base_url: str, model_id: str) -> None:
     try:
         requests.delete(f"{base_url}/api/v1/models/{model_id}", timeout=300)
@@ -163,15 +188,19 @@ def _make_action_observation(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _sample_actions(base_url: str, action_session_id: str, item: dict[str, Any]) -> np.ndarray:
+def _sample_actions(base_url: str, action_session_id: str, item: dict[str, Any], *, temperature: float = 0.0) -> np.ndarray:
+    payload = _make_action_observation(item)
+    payload["temperature"] = float(temperature)
     resp = requests.post(
         f"{base_url}/api/v1/mint/action_sessions/{action_session_id}/act",
-        json=_make_action_observation(item),
+        json=payload,
         timeout=120,
     )
     resp.raise_for_status()
     result = _poll_future(base_url, resp.json()["request_id"], timeout_s=3600)
-    actions = result["actions"]
+    actions = result.get("actions")
+    if not isinstance(actions, dict):
+        raise RuntimeError(f"act future missing actions payload: {result!r}")
     arr = np.asarray(actions["data"], dtype=np.float32)
     shape = list(actions["shape"])
     return arr.reshape(shape)

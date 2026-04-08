@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
 import uuid
+from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
+
+import ray
 
 from ..checkpoints import get_checkpoints_dir, resolve_checkpoint_uri
 from ..models.types import ActRequest, ModelInput, TensorData
@@ -17,11 +21,15 @@ from .openpi_fast_training import (
     OPENPI_FAST_TRAINING_BACKEND,
     get_openpi_fast_config_name,
 )
+from .openpi_shared_ray_runtime import start_openpi_shared_ray_runtime
+from .openpi_shared_ray_runtime import OpenPISharedRayRuntimeClient
 from .openpi_pi05_training import (
     OPENPI_PI05_TRAINING_BACKEND,
     get_openpi_pi05_config_name,
 )
 from .resource_pool import ActorType, get_resource_pool
+
+logger = logging.getLogger(__name__)
 
 
 def _is_openpi_fast_model(base_model: str) -> bool:
@@ -46,11 +54,13 @@ async def _default_runtime_factory(
     model_config: Any,
     config_name: str,
 ) -> Any:
-    del checkpoint_path, model_config, config_name
-    return await start_openpi_action_ray_runtime(
-        action_session_id=action_session_id,
-        base_model=base_model,
+    del checkpoint_path
+    return await start_openpi_shared_ray_runtime(
+        session=SimpleNamespace(model_id=action_session_id, base_model=base_model),
         spec=OpenPIFastActionRuntimeSpec.from_env(),
+        config_name=config_name,
+        model_config=model_config,
+        template_reusable=False,
     )
 
 
@@ -62,15 +72,17 @@ async def _default_pi05_runtime_factory(
     model_config: Any,
     config_name: str,
 ) -> Any:
-    del checkpoint_path, model_config, config_name
+    del checkpoint_path
     spec = dataclasses.replace(
         OpenPIFastActionRuntimeSpec.from_env(),
         worker_module="tinker_server.backend.openpi_pi05_action_worker",
     )
-    return await start_openpi_action_ray_runtime(
-        action_session_id=action_session_id,
-        base_model=base_model,
+    return await start_openpi_shared_ray_runtime(
+        session=SimpleNamespace(model_id=action_session_id, base_model=base_model),
         spec=spec,
+        config_name=config_name,
+        model_config=model_config,
+        template_reusable=False,
     )
 
 
@@ -85,19 +97,19 @@ def _recover_detached_action_runtime_client(
     *,
     action_session_id: str,
     supports_base_model: Callable[[str], bool],
-) -> OpenPIActionRayRuntimeClient | None:
+    supports_worker_module: Callable[[str], bool],
+) -> OpenPIActionRayRuntimeClient | OpenPISharedRayRuntimeClient | None:
     pool = get_resource_pool()
+    shared_candidates: list[tuple[Any, OpenPIFastActionRuntimeSpec]] = []
     for entry in pool.iter_entries(prune_stale=True):
         metadata = dict(entry.metadata or {})
         if entry.actor_type != ActorType.OPENPI:
-            continue
-        if str(metadata.get("action_session_id") or entry.current_session or "") != action_session_id:
             continue
         base_model = str(entry.base_model or "")
         if not supports_base_model(base_model):
             continue
         worker_module = str(metadata.get("worker_module") or "")
-        if not worker_module:
+        if not worker_module or not supports_worker_module(worker_module):
             continue
         current = pool.get(entry.actor_name)
         actor_entry = current or entry
@@ -105,6 +117,25 @@ def _recover_detached_action_runtime_client(
         if actor_handle is None:
             continue
         spec = _runtime_spec_for_worker_module(worker_module)
+        is_shared = str(entry.actor_name).startswith("openpi_shared_runtime_") or "pool_key" in metadata
+        if is_shared:
+            shared_candidates.append((actor_entry, spec))
+        recovered = str(metadata.get("action_session_id") or entry.current_session or "") == action_session_id
+        if not recovered and str(entry.actor_name or "").startswith("openpi_shared_runtime_"):
+            try:
+                recovered = action_session_id in _shared_actor_known_sessions(actor_handle)
+            except Exception:
+                recovered = False
+        if not recovered:
+            continue
+        if is_shared:
+            return OpenPISharedRayRuntimeClient(
+                actor=actor_handle,
+                actor_name=actor_entry.actor_name,
+                spec=spec,
+                session_id=action_session_id,
+                ready_timeout_s=_actor_ready_timeout_s(spec),
+            )
         return OpenPIActionRayRuntimeClient(
             actor=actor_handle,
             actor_name=actor_entry.actor_name,
@@ -112,7 +143,35 @@ def _recover_detached_action_runtime_client(
             action_session_id=action_session_id,
             ready_timeout_s=_actor_ready_timeout_s(spec),
         )
+    if len(shared_candidates) == 1:
+        actor_entry, spec = shared_candidates[0]
+        logger.warning(
+            "[action_session_recover] inferring shared action actor without exact session membership: "
+            "action_session_id=%s actor_name=%s base_model=%s worker_module=%s",
+            action_session_id,
+            actor_entry.actor_name,
+            actor_entry.base_model,
+            spec.worker_module,
+        )
+        return OpenPISharedRayRuntimeClient(
+            actor=actor_entry.actor_handle,
+            actor_name=actor_entry.actor_name,
+            spec=spec,
+            session_id=action_session_id,
+            ready_timeout_s=_actor_ready_timeout_s(spec),
+        )
     return None
+
+
+def _shared_actor_known_sessions(actor_handle: Any) -> set[str]:
+    describe = getattr(actor_handle, "describe", None)
+    remote = getattr(describe, "remote", None)
+    if not callable(remote):
+        return set()
+    payload = ray.get(remote(), timeout=5.0)
+    if not isinstance(payload, dict):
+        return set()
+    return {str(session_id) for session_id in list(payload.get("known_session_ids") or []) if session_id}
 
 
 class OpenPIFastActionSessionManager:
@@ -155,13 +214,22 @@ class OpenPIFastActionSessionManager:
         checkpoint_path = self._resolve_model_path(model_path, user_id)
         action_session_id = self._action_session_id(session_id, action_session_seq_id)
         config_name = get_openpi_fast_config_name(base_model)
-        client = await self._runtime_factory(
-            action_session_id=action_session_id,
-            base_model=base_model,
-            checkpoint_path=checkpoint_path,
-            model_config=model_config,
-            config_name=config_name,
-        )
+        try:
+            client = await self._runtime_factory(
+                action_session_id=action_session_id,
+                base_model=base_model,
+                checkpoint_path=checkpoint_path,
+                model_config=model_config,
+                config_name=config_name,
+            )
+        except Exception:
+            logger.exception(
+                "[openpi_fast_action] runtime_factory failed: action_session_id=%s base_model=%s checkpoint_path=%s",
+                action_session_id,
+                base_model,
+                checkpoint_path,
+            )
+            raise
         try:
             await client.request(
                 "create_session",
@@ -172,11 +240,18 @@ class OpenPIFastActionSessionManager:
                     "config_name": config_name,
                     "action_dim": int(model_config.action_dim or 0),
                     "action_horizon": int(model_config.action_horizon or 0),
+                    "action_token_budget": int(model_config.action_token_budget or 0),
                     "max_token_len": int(model_config.max_model_len),
                     "camera_layout": list(model_config.camera_layout),
                 },
             )
         except Exception:
+            logger.exception(
+                "[openpi_fast_action] create_session failed: action_session_id=%s base_model=%s checkpoint_path=%s",
+                action_session_id,
+                base_model,
+                checkpoint_path,
+            )
             close = getattr(client, "close", None)
             if callable(close):
                 await close()
@@ -198,6 +273,8 @@ class OpenPIFastActionSessionManager:
             runtime = _recover_detached_action_runtime_client(
                 action_session_id=action_session_id,
                 supports_base_model=_is_openpi_fast_model,
+                supports_worker_module=lambda worker_module: worker_module
+                == "tinker_server.backend.openpi_fast_action_worker",
             )
             if runtime is not None:
                 self._runtime_clients[action_session_id] = runtime
@@ -217,6 +294,8 @@ class OpenPIFastActionSessionManager:
             runtime = _recover_detached_action_runtime_client(
                 action_session_id=action_session_id,
                 supports_base_model=_is_openpi_fast_model,
+                supports_worker_module=lambda worker_module: worker_module
+                == "tinker_server.backend.openpi_fast_action_worker",
             )
         if runtime is None:
             return
@@ -315,6 +394,8 @@ class OpenPIPi05ActionSessionManager:
             runtime = _recover_detached_action_runtime_client(
                 action_session_id=action_session_id,
                 supports_base_model=_is_openpi_pi05_model,
+                supports_worker_module=lambda worker_module: worker_module
+                == "tinker_server.backend.openpi_pi05_action_worker",
             )
             if runtime is not None:
                 self._runtime_clients[action_session_id] = runtime
@@ -334,6 +415,8 @@ class OpenPIPi05ActionSessionManager:
             runtime = _recover_detached_action_runtime_client(
                 action_session_id=action_session_id,
                 supports_base_model=_is_openpi_pi05_model,
+                supports_worker_module=lambda worker_module: worker_module
+                == "tinker_server.backend.openpi_pi05_action_worker",
             )
         if runtime is None:
             return
@@ -369,16 +452,39 @@ class ActionSessionRouter:
 
     def _recover_manager_for_session(self, action_session_id: str) -> object | None:
         pool = get_resource_pool()
+        candidate_managers: dict[int, object] = {}
         for entry in pool.iter_entries(prune_stale=True):
             metadata = dict(entry.metadata or {})
             if entry.actor_type != ActorType.OPENPI:
                 continue
-            if str(metadata.get("action_session_id") or entry.current_session or "") != action_session_id:
+            worker_module = str(metadata.get("worker_module") or "")
+            if not worker_module.endswith("_action_worker"):
+                continue
+            recovered = str(metadata.get("action_session_id") or entry.current_session or "") == action_session_id
+            if not recovered and str(entry.actor_name or "").startswith("openpi_shared_runtime_"):
+                actor_handle = entry.actor_handle
+                if actor_handle is not None:
+                    try:
+                        recovered = action_session_id in _shared_actor_known_sessions(actor_handle)
+                    except Exception:
+                        recovered = False
+            if not recovered:
                 continue
             try:
                 manager = self._manager_for_model(str(entry.base_model or ""))
             except ValueError:
                 continue
+            candidate_managers.setdefault(id(manager), manager)
+            if not recovered:
+                continue
+            self._manager_for_session[action_session_id] = manager
+            return manager
+        if len(candidate_managers) == 1:
+            manager = next(iter(candidate_managers.values()))
+            logger.warning(
+                "[action_session_router] inferring action manager without exact session membership: action_session_id=%s",
+                action_session_id,
+            )
             self._manager_for_session[action_session_id] = manager
             return manager
         return None

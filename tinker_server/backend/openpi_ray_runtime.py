@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from pathlib import Path
 from typing import Any
 
 import ray
@@ -27,11 +28,38 @@ def _openpi_runtime_env_vars() -> dict[str, str]:
     for key, value in os.environ.items():
         if key.startswith("MINT_OPENPI_"):
             extra[key] = value
+    xla_flags = os.environ.get("MINT_OPENPI_XLA_FLAGS", "").strip()
+    if xla_flags:
+        extra["XLA_FLAGS"] = xla_flags
     for key in ("HF_HOME", "HF_HUB_OFFLINE", "OPENPI_DATA_HOME"):
         value = os.environ.get(key, "").strip()
         if value:
             extra[key] = value
     return actor_runtime_env_vars(pythonpath=PFS_PYTHONPATH, extra=extra)
+
+
+def _action_session_state_root(actor_name: str) -> str:
+    pfs_tinker_path = str(os.environ.get("PFS_TINKER_PATH") or "").strip()
+    if not pfs_tinker_path:
+        raise RuntimeError("OpenPI action session state root requires PFS_TINKER_PATH")
+    namespace = str(
+        os.environ.get("MINT_RAY_NAMESPACE")
+        or os.environ.get("TINKER_RAY_NAMESPACE")
+        or RAY_NAMESPACE
+        or ""
+    ).strip()
+    if not namespace:
+        raise RuntimeError("OpenPI action session state root requires a Ray namespace")
+    namespace_dir = namespace.replace("/", "_")
+    return str(
+        (
+            Path(pfs_tinker_path).resolve()
+            / "checkpoints"
+            / "openpi_action_session_state"
+            / namespace_dir
+            / actor_name
+        ).resolve()
+    )
 
 
 def ensure_openpi_ray_initialized() -> None:

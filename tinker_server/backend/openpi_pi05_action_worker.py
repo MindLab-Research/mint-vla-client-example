@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import base64
+import gc
 import io
 import json
 import logging
+import os
 import sys
 import time
 import traceback
@@ -14,6 +16,7 @@ import numpy as np
 
 from .openpi_fast_action_runtime import find_openpi_policy_checkpoint_dir
 from .openpi_fast_runtime import OPENPI_FAST_WORKER_PROTOCOL_VERSION
+from .openpi_session_state import OpenPISessionStateManager
 
 
 logger = logging.getLogger(__name__)
@@ -70,7 +73,7 @@ class OpenPIPi05ActionSession:
         self._camera_layout = tuple(str(name) for name in payload["camera_layout"])
         self._checkpoint_dir = find_openpi_policy_checkpoint_dir(payload["checkpoint_path"])
 
-        model_cfg = pi0_config.Pi0Config(
+        self._model_cfg = pi0_config.Pi0Config(
             pi05=True,
             action_dim=self._action_dim,
             action_horizon=self._action_horizon,
@@ -78,10 +81,62 @@ class OpenPIPi05ActionSession:
             discrete_state_input=False,
             paligemma_variant="gemma_2b_lora",
         )
-        self._model = model_cfg.load(
-            openpi_model.restore_params(self._checkpoint_dir / "params", dtype=jnp.bfloat16)
-        )
+        self._load_checkpoint_dir(self._checkpoint_dir)
+        state_root = str(os.environ.get("MINT_OPENPI_FAST_ACTION_SESSION_STATE_ROOT") or "").strip()
+        if not state_root:
+            raise RuntimeError("OpenPI pi0.5 action inference requires MINT_OPENPI_FAST_ACTION_SESSION_STATE_ROOT")
+        self._session_state_manager = OpenPISessionStateManager(state_root)
         self._rng = jax.random.key(0)
+
+    def _load_checkpoint_dir(self, checkpoint_dir: Path) -> None:
+        self._checkpoint_dir = Path(checkpoint_dir).resolve()
+        self._model = self._model_cfg.load(
+            self._openpi_model.restore_params(self._checkpoint_dir / "params", dtype=self._jnp.bfloat16)
+        )
+
+    def _session_state_signature(self) -> dict[str, Any]:
+        return {
+            "base_model": self._base_model,
+            "action_dim": self._action_dim,
+            "action_horizon": self._action_horizon,
+            "max_token_len": self._max_token_len,
+            "camera_layout": list(self._camera_layout),
+            "pi05": True,
+        }
+
+    def _save_session_payload(self, path: Path, state: dict[str, Any]) -> None:
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "state.json").write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+
+    def _load_session_payload(self, path: Path) -> dict[str, Any]:
+        return json.loads((path / "state.json").read_text(encoding="utf-8"))
+
+    def save_session_state(self, payload: dict[str, Any]) -> dict[str, Any]:
+        session_id = str(payload["session_id"])
+        path = self._session_state_manager.save_state(
+            session_id,
+            worker_module="tinker_server.backend.openpi_pi05_action_worker",
+            runtime_signature=self._session_state_signature(),
+            state={"checkpoint_path": str(self._checkpoint_dir)},
+            rng=self._rng,
+            pending_grads=None,
+            learning_rate=0.0,
+            current_step=0,
+            save_train_state_fn=self._save_session_payload,
+        )
+        return {"path": str(path)}
+
+    def load_session_state(self, payload: dict[str, Any]) -> dict[str, Any]:
+        session_id = str(payload["session_id"])
+        restored = self._session_state_manager.load_state(
+            session_id,
+            expected_worker_module="tinker_server.backend.openpi_pi05_action_worker",
+            expected_runtime_signature=self._session_state_signature(),
+            load_train_state_fn=self._load_session_payload,
+        )
+        self._load_checkpoint_dir(Path(restored["state"]["checkpoint_path"]))
+        self._rng = restored["rng"]
+        return {"path": str(self._session_state_manager.get_session_path(session_id))}
 
     def _observation_from_payload(self, payload: dict[str, Any]):
         jnp = self._jnp
@@ -144,6 +199,18 @@ class OpenPIPi05ActionSession:
         }
 
     def shutdown(self) -> dict[str, Any]:
+        jax_mod = getattr(self, "_jax", None)
+        for attr in ("_model", "_config", "_rng"):
+            try:
+                setattr(self, attr, None)
+            except Exception:
+                pass
+        try:
+            if jax_mod is not None:
+                jax_mod.clear_caches()
+        except Exception:
+            pass
+        gc.collect()
         return {"stopped": True}
 
 
@@ -153,13 +220,19 @@ def _dispatch(
     payload: dict[str, Any],
 ) -> tuple[dict[str, Any], OpenPIPi05ActionSession | None]:
     if op == "create_session":
+        if session is not None:
+            session.shutdown()
         return {"ready": True}, OpenPIPi05ActionSession(payload)
     if session is None:
         raise RuntimeError("OpenPI pi0.5 action session is not initialized")
     if op == "act":
         return session.act(payload), session
+    if op == "save_session_state":
+        return session.save_session_state(payload), session
+    if op == "load_session_state":
+        return session.load_session_state(payload), session
     if op == "shutdown":
-        return session.shutdown(), session
+        return session.shutdown(), None
     raise ValueError(f"Unknown OpenPI pi0.5 action worker op: {op}")
 
 

@@ -21,6 +21,7 @@ from .openpi_fast_runtime import (
     OpenPIFastWorkerProtocolError,
 )
 from .openpi_ray_runtime import (
+    _action_session_state_root,
     _actor_ready_timeout_s,
     _openpi_runtime_env_vars,
     _ray_timeout,
@@ -63,6 +64,11 @@ def _normalize_pool_key(
         "action_dim": int(getattr(model_config, "action_dim", 0) or 0),
         "action_horizon": int(getattr(model_config, "action_horizon", 0) or 0),
         "max_model_len": int(getattr(model_config, "max_model_len", 0) or 0),
+        "startup_timeout_s": float(spec.startup_timeout_s),
+        "request_timeout_s": float(spec.request_timeout_s),
+        "create_session_timeout_s": float(spec.create_session_timeout_s),
+        "save_weights_timeout_s": float(spec.save_weights_timeout_s),
+        "load_weights_timeout_s": float(spec.load_weights_timeout_s),
     }
 
 
@@ -202,11 +208,13 @@ class OpenPISharedRuntimeCore:
         spec: OpenPIFastRuntimeSpec,
         runtime_factory: Callable[[OpenPIFastRuntimeSpec], Any] | None = None,
         actor_metadata: dict[str, Any] | None = None,
+        template_reusable: bool = True,
     ) -> None:
         self._spec = spec
         self._runtime_factory = runtime_factory or OpenPIFastWorkerClient.start
         self._actor_metadata = dict(actor_metadata or {})
         self._template_session_id = _template_session_id(self._actor_metadata)
+        self._template_reusable = bool(template_reusable)
         self._runtime: OpenPIFastWorkerClient | Any | None = None
         self._session_payloads: dict[str, dict[str, Any]] = {}
         self._initialized_sessions: set[str] = set()
@@ -232,6 +240,8 @@ class OpenPISharedRuntimeCore:
             payload = dict(create_payload)
             if self._create_session_response is not None:
                 self._session_payloads[session_id] = payload
+                if not self._template_reusable:
+                    self._initialized_sessions.discard(session_id)
                 return dict(self._create_session_response)
 
             runtime = await self._ensure_runtime()
@@ -299,16 +309,42 @@ class OpenPISharedRuntimeCore:
             )
             self._initialized_sessions.add(self._current_session_id)
 
-        load_session_id = (
-            session_id
-            if session_id in self._initialized_sessions
-            else self._template_session_id
+        if session_id in self._initialized_sessions:
+            load_session_id = session_id
+            await runtime.request(
+                "load_session_state",
+                {"session_id": load_session_id},
+                timeout_s=effective_timeout,
+            )
+            self._current_session_id = session_id
+            return
+
+        if self._template_reusable:
+            await runtime.request(
+                "load_session_state",
+                {"session_id": self._template_session_id},
+                timeout_s=effective_timeout,
+            )
+            self._current_session_id = session_id
+            return
+
+        payload = dict(self._session_payloads[session_id])
+        response = await runtime.request(
+            "create_session",
+            payload,
+            timeout_s=self._spec.create_session_timeout_s,
         )
+        if not isinstance(response, dict):
+            raise TypeError(
+                "OpenPI shared runtime create_session returned non-dict payload: "
+                f"{type(response)}"
+            )
         await runtime.request(
-            "load_session_state",
-            {"session_id": load_session_id},
+            "save_session_state",
+            {"session_id": session_id},
             timeout_s=effective_timeout,
         )
+        self._initialized_sessions.add(session_id)
         self._current_session_id = session_id
 
     async def request_for_session(
@@ -383,6 +419,7 @@ class OpenPISharedRayRuntimeActor:
         actor_name: str,
         pool_key: dict[str, Any],
         spec: OpenPIFastRuntimeSpec,
+        template_reusable: bool = True,
     ) -> None:
         self._actor_name = actor_name
         self._pool_key = dict(pool_key)
@@ -392,6 +429,7 @@ class OpenPISharedRayRuntimeActor:
                 "actor_name": actor_name,
                 "pool_key": dict(pool_key),
             },
+            template_reusable=template_reusable,
         )
 
     async def ready_metadata(self) -> dict[str, Any]:
@@ -474,6 +512,15 @@ class OpenPISharedRayRuntimeClient:
             return self._spec.load_weights_timeout_s
         return self._spec.request_timeout_s
 
+    def _refresh_actor_handle(self) -> None:
+        if not ray.is_initialized():
+            return
+        try:
+            actor = ray.get_actor(self._actor_name, namespace=RAY_NAMESPACE)
+        except ValueError:
+            return
+        self._actor = actor
+
     async def _ray_get(self, ref: Any, *, timeout_s: float | None) -> Any:
         try:
             return await asyncio.to_thread(ray.get, ref, timeout=_ray_timeout(timeout_s))
@@ -491,6 +538,7 @@ class OpenPISharedRayRuntimeClient:
             raise
 
     async def ready(self) -> dict[str, Any]:
+        self._refresh_actor_handle()
         metadata = await self._ray_get(
             self._actor.ready_metadata.remote(),
             timeout_s=self._ready_timeout_s,
@@ -514,6 +562,7 @@ class OpenPISharedRayRuntimeClient:
                 f"OpenPI shared Ray runtime client is closed for session {self._session_id!r}"
             )
 
+        self._refresh_actor_handle()
         await _pool_call("mark_inflight", self._actor_name, +1)
         try:
             if op == "create_session":
@@ -543,6 +592,7 @@ class OpenPISharedRayRuntimeClient:
         return result
 
     async def describe(self) -> dict[str, Any]:
+        self._refresh_actor_handle()
         metadata = await self._ray_get(self._actor.describe.remote(), timeout_s=5.0)
         if not isinstance(metadata, dict):
             raise TypeError(
@@ -577,6 +627,7 @@ async def start_openpi_shared_ray_runtime(
     spec: OpenPIFastRuntimeSpec,
     config_name: str,
     model_config: Any,
+    template_reusable: bool = True,
 ) -> OpenPISharedRayRuntimeClient:
     ensure_openpi_ray_initialized()
 
@@ -591,35 +642,43 @@ async def start_openpi_shared_ray_runtime(
 
     with _SHARED_POOL_LOCK:
         entry = _SHARED_ACTORS.get(actor_name)
-        if entry is None:
-            actor = None
-            if ray.is_initialized():
-                try:
-                    actor = ray.get_actor(actor_name, namespace=RAY_NAMESPACE)
-                except ValueError:
-                    actor = None
-            if actor is None:
-                owns_started_actor = True
-                actor = OpenPISharedRayRuntimeActor.options(
-                    name=actor_name,
-                    namespace=RAY_NAMESPACE,
-                    lifetime="detached",
-                    runtime_env={"env_vars": _openpi_runtime_env_vars()},
-                    **_single_node_actor_options(
-                        base_model=str(getattr(session, "base_model", "") or ""),
-                        actor_name=actor_name,
-                    ),
-                ).remote(
+        actor = entry.actor if entry is not None else None
+        runtime_env_vars = {
+            **_openpi_runtime_env_vars(),
+            "MINT_OPENPI_FAST_ACTION_SESSION_STATE_ROOT": _action_session_state_root(actor_name),
+        }
+        if ray.is_initialized():
+            try:
+                actor = ray.get_actor(actor_name, namespace=RAY_NAMESPACE)
+            except ValueError:
+                actor = None
+        if actor is None:
+            owns_started_actor = True
+            actor = OpenPISharedRayRuntimeActor.options(
+                name=actor_name,
+                namespace=RAY_NAMESPACE,
+                lifetime="detached",
+                runtime_env={"env_vars": runtime_env_vars},
+                **_single_node_actor_options(
+                    base_model=str(getattr(session, "base_model", "") or ""),
                     actor_name=actor_name,
-                    pool_key=pool_key,
-                    spec=spec,
-                )
+                ),
+            ).remote(
+                actor_name=actor_name,
+                pool_key=pool_key,
+                spec=spec,
+                template_reusable=template_reusable,
+            )
+        if entry is None:
             entry = _SharedActorEntry(
                 actor_name=actor_name,
                 actor=actor,
                 pool_key=dict(pool_key),
             )
             _SHARED_ACTORS[actor_name] = entry
+        else:
+            entry.actor = actor
+            entry.pool_key = dict(pool_key)
 
     client = OpenPISharedRayRuntimeClient(
         actor=entry.actor,

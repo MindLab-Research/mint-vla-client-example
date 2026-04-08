@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import logging
 import json
 import time
 import os
@@ -16,6 +17,7 @@ from ..runtime_env import bootstrap_runtime_pythonpath, validate_runtime_env_lay
 
 OPENPI_FAST_WORKER_PROTOCOL_VERSION = 1
 
+logger = logging.getLogger(__name__)
 
 class OpenPIFastWorkerError(RuntimeError):
     pass

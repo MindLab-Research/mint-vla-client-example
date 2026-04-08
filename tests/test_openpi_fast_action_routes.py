@@ -43,12 +43,14 @@ class _FakeActionSessionManager:
         action_session_id: str,
         observation,
         extra_inputs,
+        temperature=None,
     ) -> dict[str, object]:
         self.act_calls.append(
             {
                 "action_session_id": action_session_id,
                 "observation": observation,
                 "extra_inputs": extra_inputs,
+                "temperature": temperature,
             }
         )
         return {
@@ -162,6 +164,7 @@ def test_create_action_session_route_resolves_checkpoint_path_before_manager(mon
 
     manager = _FakeActionSessionManager()
     resolve_calls: list[dict[str, object]] = []
+    monkeypatch.setenv("MINT_SUPPORTED_MODELS", OPENPI_FAST_MODEL)
     monkeypatch.setattr(mint_routes, "action_session_manager", manager, raising=False)
     monkeypatch.setattr(mint_routes, "_get_user_id", lambda _request: "user-1")
     monkeypatch.setattr(mint_routes, "is_admin_request", lambda _request: False)
@@ -213,6 +216,7 @@ def test_create_action_session_route_infers_base_model_with_admin_scope(monkeypa
     manager = _FakeActionSessionManager()
     infer_calls: list[dict[str, object]] = []
     resolve_calls: list[dict[str, object]] = []
+    monkeypatch.setenv("MINT_SUPPORTED_MODELS", OPENPI_FAST_MODEL)
     monkeypatch.setattr(mint_routes, "action_session_manager", manager, raising=False)
     monkeypatch.setattr(mint_routes, "_get_user_id", lambda _request: "admin")
     monkeypatch.setattr(mint_routes, "is_admin_request", lambda _request: True)
@@ -344,11 +348,19 @@ def test_do_act_resolves_future_with_actions(monkeypatch) -> None:
             ]
         ),
         extra_inputs={"state": TensorData(data=[0.0] * 8, shape=[8], dtype="float32")},
+        temperature=3.0,
     )
 
     asyncio.run(action_routes._do_act("req-1", request))
 
-    assert manager.act_calls
+    assert manager.act_calls == [
+        {
+            "action_session_id": "action-session-1",
+            "observation": request.observation,
+            "extra_inputs": request.extra_inputs,
+            "temperature": 3.0,
+        }
+    ]
     assert future_store.resolved == [
         (
             "req-1",
@@ -384,11 +396,19 @@ def test_do_act_prefers_async_future_store_api(monkeypatch) -> None:
             ]
         ),
         extra_inputs={"state": TensorData(data=[0.0] * 8, shape=[8], dtype="float32")},
+        temperature=1.5,
     )
 
     asyncio.run(action_routes._do_act("req-2", request))
 
-    assert manager.act_calls
+    assert manager.act_calls == [
+        {
+            "action_session_id": "action-session-1",
+            "observation": request.observation,
+            "extra_inputs": request.extra_inputs,
+            "temperature": 1.5,
+        }
+    ]
     assert future_store.resolved == [
         (
             "req-2",
