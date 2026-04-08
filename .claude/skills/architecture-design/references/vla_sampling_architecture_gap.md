@@ -1,6 +1,6 @@
 # VLA Sampling Architecture Gap
 
-Date: 2026-04-04
+Date: 2026-04-07
 
 This note documents the current OpenPI sampling architecture in PR 422 and why it is still a mismatch with the intended MinT design.
 
@@ -15,9 +15,10 @@ Training side:
 Sampling side:
 
 - `save_weights_for_sampler` materializes an inference-ready checkpoint for a single tenant
-- `create_action_session` starts a dedicated OpenPI action actor for that checkpoint
-- one action session therefore implies one action actor and one full sampler checkpoint load
-- concurrent sampling across tenants scales by creating more action actors, subject to GPU capacity
+- `create_action_session` now routes through one shared OpenPI action runtime per base model
+- tenant switching inside that shared runtime is handled by saving and loading action-session state on vePFS
+- concurrent sampling across tenants no longer implies one Ray actor per action session in the tested mixed-case path
+- but tenant isolation is still achieved by checkpoint-per-session state materialization, not by a true shared adapter-style serving substrate
 
 ## Why this is a MinT architecture mismatch
 
@@ -28,45 +29,44 @@ The current OpenPI sampling path does not do that.
 It achieves isolation by:
 
 - exporting a full inference checkpoint per session
-- loading that checkpoint into a dedicated action actor
-- keeping tenant isolation at the actor boundary
+- saving checkpoint-derived action-session state per tenant on vePFS
+- reloading that session state inside one shared action actor
 
-That means sampling multi-tenancy is not implemented as:
+That means sampling multi-tenancy is only partially implemented as:
 
-- a shared sampler actor keyed by base model
-- session switching inside one sampler runtime
-- or a shared adapter-style serving surface
+- a shared sampler actor keyed by base model: yes, now present in the tested path
+- session switching inside one sampler runtime: yes, now present in the tested path
+- a shared adapter-style serving surface: still no
 
-It is implemented as checkpoint-per-session actor spawning.
+The remaining gap is that the shared sampler still depends on checkpoint-per-session state materialization rather than a lighter-weight shared serving substrate.
 
 ## Evidence from runtime behavior
 
-- pressure on the sampling side shows up as action-actor GPU pressure
-- action-session creation can fail when no additional action actor can be placed on the assigned worker
-- trainer sharing works, but sampling does not share the same way
+- the mixed valid/invalid isolation probe now reuses one shared action actor while preserving the tested session boundary
+- action-session contamination was previously real and was fixed by moving action-session state roots from checkpoint-scoped paths to actor-scoped vePFS paths
+- trainer sharing works, and sampling now shares structurally too, but it still reloads checkpoint-derived tenant state instead of using a true shared adapter surface
 
 This matches the observed architecture, not just an abstract complaint.
 
 ## Minimal design change needed
 
-A MinT-clean OpenPI sampling design would need all of the following:
+A MinT-clean OpenPI sampling design would still need all of the following:
 
-1. shared action runtime per base model
-- one action runtime actor per base model, not per action session
+1. keep the shared action runtime per base model
+- this part now exists and should remain
 
-2. per-session checkpoint switching inside that runtime
-- action sessions must map to checkpoint identity or session state without requiring a new Ray actor per tenant
+2. lighter-weight per-session switching inside that runtime
+- action sessions should switch lightweight tenant state without full checkpoint-derived state materialization
 
-3. worker protocol support for switching weights
-- the current action workers only support `create_session`, `act`, and `shutdown`
-- they do not support `load_weights` or `load_session_state`
-- that is the protocol gap that prevents a shared action runtime from multiplexing tenants
+3. serving abstraction that is not checkpoint-per-session
+- the current shared runtime multiplexes tenants by persisting and restoring checkpoint-derived action state
+- it does not yet behave like MinT shared adapter serving
 
-4. action session manager routing change
-- `action_session_manager` would need to route many action sessions through one shared runtime keyed by base model, analogous to how the training side routes many training sessions through one shared trainer actor
+4. action session manager routing must stay aligned with the shared runtime
+- this routing now exists for the tested path and must not regress
 
-5. capacity semantics change
-- capacity management would need to treat action sessions as logical sessions within a shared sampler, not as one-GPU actor placements
+5. capacity semantics that reflect logical sessions rather than checkpoint-derived sampler state churn
+- current capacity pressure is lower than actor-per-session spawning, but sampling still pays checkpoint-derived state-switch costs
 
 ## Practical implication
 
@@ -75,6 +75,7 @@ The current implementation can be made operational and tested, but it should not
 The right status is:
 
 - training architecture: mostly aligned
-- sampling architecture: still a known structural gap
+- sampling architecture: improved substantially
+- sampling serving model: still not fully MinT-clean
 
 That gap should stay explicit in validation and reporting.

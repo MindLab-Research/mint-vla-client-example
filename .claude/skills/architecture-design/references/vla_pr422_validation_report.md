@@ -1,339 +1,256 @@
-# PR 422 VLA Validation Report
+# VLA validation report
 
-Date: 2026-04-04
+Date: 2026-04-08
 
-## Scope
+## Environment used
 
-This report covers the end-to-end validation requested in `PROMPT.md` for PR 422 on `mint-dev`, using:
+- Ray head: `192.168.39.23`
+- Assigned worker: `192.168.39.28`
+- Dedicated code root: `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402`
+- Dedicated runtime env: `/vePFS-Mindverse/share/code/root/mint-runtime-py31213-openpi-pr422-20260402`
+- Dedicated namespaces used during the clean latest runs include `tinker_root_vla_pr422_20260408d` and `tinker_root_vla_pr422_20260408f`
 
-- dedicated code root `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402`
-- dedicated env `/vePFS-Mindverse/share/code/root/mint-runtime-py31213-openpi-pr422-20260402`
-- dedicated Ray namespace `tinker_root_vla_pr422_20260402t`
-- assigned worker `192.168.38.176` only
+## Major fixes landed during validation
 
-The work includes runtime bringup, SFT and RL experiments, resume testing, interleaving and pressure testing, merge-gate updates, and a final answer to the six requested verification areas.
+- Action temperature is now forwarded into action sampling in `tinker_server/routes/action_sampling.py:20-30`.
+- Action-session recovery across queued act paths is now worker-module-aware in `tinker_server/backend/action_session_manager.py:96-122` and `tinker_server/backend/action_session_manager.py:453-485`.
+- Action-session state roots are now namespace-scoped in `tinker_server/backend/openpi_ray_runtime.py:41`.
+- FAST action decoding now fails loudly on malformed outputs in `tinker_server/backend/openpi_fast_action_worker.py:239-338`.
+- The grouped RL harness no longer aborts on a same-state group with zero within-group reward variance; zero-variance groups now contribute zero centered reward instead.
+- Shared FAST action actor recreate drift on the tested deterministic paths was removed on the XLA-flags setup wired through `scripts/wip/openpi_vla_start_server.sh` and `tinker_server/backend/openpi_ray_runtime.py`.
 
-## Artifact Index
+## Prompt task status
 
-All experiment artifacts live on the dedicated mint-dev code root, not in the git worktree:
+### 1. Dedicated troubleshooting env on `mint-dev`
 
-- root: `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results`
-- grouped RL plots inspected locally after copy:
-  - `/home/yiwen/pr422-plot-cache/reward_curve.png`
-  - `/home/yiwen/pr422-plot-cache/loss_curve.png`
+Passed.
 
-Primary artifact paths by task:
+What is established:
+- the dedicated vePFS code root, dedicated runtime env, dedicated Ray namespace, and assigned worker only were used for the current validated runs
+- the VLA actors start and run on that dedicated path
+- worker-local checkpoint/session-state disk exhaustion is not supported by the evidence gathered on the dedicated path
 
-- pi0-fast SFT:
-  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/sft_pi0fast_task16_full_k/summary.json`
-  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/sft_pi0fast_task16_full_k/loss_curve.png`
-- pi0.5 SFT:
-  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/sft_pi05_task10_full_k/summary.json`
-  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/sft_pi05_task10_full_k/loss_curve.png`
-- pi0-fast grouped RL:
-  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/rl_pi0fast_grouped_object16_v2/summary.json`
-  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/rl_pi0fast_grouped_object16_v2/metrics.jsonl`
-  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/rl_pi0fast_grouped_object16_v2/reward_curve.png`
-  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/rl_pi0fast_grouped_object16_v2/loss_curve.png`
-- rollout-grounded probes:
-  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/rl_pi0fast_real_eval_task0_r/summary.json`
-  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/rl_pi0fast_real_eval_task0_r/success_curve.png`
-  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/rl_pi0fast_rollout_shaped_object0_v5/summary.json`
-  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/rl_pi0fast_rollout_shaped_object0_v5/reward_curve.png`
-  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/rl_pi0fast_rollout_shaped_object0_v5/loss_curve.png`
-  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/rl_pi0fast_rollout_shaped_object0_v5/success_curve.png`
-- isolation:
-  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/iso_fast_sft_task16_t/loss_curve.png`
-  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/iso_fast_sft_task17_t/loss_curve.png`
-  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/iso_fast_rl_task18_t/reward_curve.png`
-  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/iso_fast_rl_task18_t/loss_curve.png`
-  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/iso_fast_rl_task20_t/reward_curve.png`
-  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/iso_fast_rl_task20_t/loss_curve.png`
-  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/iso_pi05_sft_task10_t/loss_curve.png`
-  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/iso_pi05_sft_task11_t/loss_curve.png`
-  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/iso_pi05_sft_task12_t/loss_curve.png`
-- resume:
-  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/resume_pi0fast_task16_k/loss_curve.png`
-  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/resume_pi05_task10_k/loss_curve.png`
-- pressure:
-  - `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/pressure_threads_timeout3600_remote_p/batch_summary.json`
+### 2. pi0-fast SFT experiment with a curve
 
-## Branch Changes
-
-Validation and follow-up fixes landed on `origin/vla-openpi-merge-develop` in these commits:
-
-- `151d0cc` `test: add VLA merge-gate runners`
-- `6a82cab` `fix: retry VLA backpressure on action sessions`
-- `e23e6c4` `test: cover VLA action-session backpressure`
-- `c6c54c5` `fix: extend VLA action-session wait budget`
-
-These sit on top of the earlier PR-422 stabilization commits:
-
-- `9671cfb` `fix: make VLA startup deterministic`
-
-- `67fd539` `fix: stabilize openpi fast action runtime`
-- `d6ca331` `fix: harden vla control plane and action worker`
-- `dd3b43e` `fix: optimize openpi sampler export path`
-
-## Results By Prompt Task
-
-### 1. Dedicated troubleshooting env
-
-Completed.
-
-- OpenPI worker/runtime overlay started successfully from the dedicated env.
-- OpenPI actors were pinned to `192.168.38.176`.
-- No production/default py31213 env changes were used.
-- GPU work ran on the worker, not on the API driver.
-- Fresh cold-start from zero is now deterministic under the documented runbook on the assigned worker and fresh namespace, and is captured in `.claude/skills/architecture-design/references/vla_deterministic_startup_runbook.md`.
-- The fixed startup procedure is also captured as a server-side script in `scripts/wip/openpi_vla_start_server.sh`.
-- Root cause of the startup regression: detached control-plane actors were hard-pinned to `node:__internal_head__`, and nested detached actors created from other actors did not inherit the control-plane pin because `actor_runtime_env_vars()` was not forwarding the relevant env vars.
-
-### 2. pi0-fast SFT
-
-Completed.
+Passed on one meaningful LIBERO task.
 
 Artifacts:
-
 - `results/sft_pi0fast_task16_full_k/summary.json`
 - `results/sft_pi0fast_task16_full_k/loss_curve.png`
 
 Observed:
+- task 16: `turn on the stove`
+- 12 steps
+- loss `0.7759211196 -> 0.2169210192`
+- minimum observed loss `0.2098036820`
 
-- task 16 `turn on the stove`
-- loss `0.7759 -> 0.2169`
-- minimum observed loss `0.2098`
+### 3. pi0-fast RL experiment with a meaningful curve and metrics
 
-Conclusion:
-
-- `pi0-fast` SFT converged on a real LIBERO task.
-
-### 3. pi0-fast RL
-
-Completed for RL-path validation with a grouped imitation-reward PPO run, plus additional rollout-grounded probes.
-
-Primary RL artifact used for validation:
-
-- `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/rl_pi0fast_grouped_object16_v2/summary.json`
-- `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/rl_pi0fast_grouped_object16_v2/reward_curve.png`
-- `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/rl_pi0fast_grouped_object16_v2/loss_curve.png`
-
-Observed for the grouped imitation-reward run:
-
-- task 16 `turn on the stove`
-- steps `4`
-- reward `-0.3205 -> -0.3151 -> -0.3104 -> -0.2951`
-- loss stayed at `0.0` on these four PPO updates
-- `create_model`, `save_weights_for_sampler`, `create_action_session`, `act`, `forward_logprobs`, and PPO `train_step` all completed on the repaired startup path
-
-Additional rollout-grounded probes also exist:
-
-- `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/rl_pi0fast_real_eval_task0_r/summary.json`
-- `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/rl_pi0fast_rollout_shaped_object0_v5/summary.json`
-
-Observed for the rollout-grounded path:
-
-- real simulator rollout does run end to end
-- sparse success on the tested task remained poor (`0/3`)
-- rollout-grounded shaped reward works as a diagnostic path but did not yet become the final reported RL curve
-
-Conclusion:
-
-- the repaired server now supports a valid PPO-style RL update path with a non-degenerate reward curve
-- the fastest useful RL evidence in this session is the grouped imitation-reward run
-- the rollout-grounded path still exists, but it remains slower and less mature than the grouped validation path
-
-### 4. pi0.5 SFT
-
-Completed.
+Partial only.
 
 Artifacts:
+- `results/rl_pi0fast_grouped_samestate_batchstd_xla_lr1e5_t005_g4_6step_20260408d/run.log`
+- `results/rl_pi0fast_grouped_samestate_batchstd_xla_lr1e5_t005_g4_6step_20260408d/metrics.jsonl`
 
+Observed training reward trace:
+- step 0 `-0.0023415950`
+- step 1 `-0.0021082656`
+- step 2 `-0.0021240816`
+- step 3 `-0.0016613363`
+- step 4 `-0.0016613363`
+- step 5 `-0.0017247119`
+- step 6 `-0.0018833488`
+
+Observed PPO diagnostics at step 6:
+- `loss = -7.554060882992214e-09`
+- `loss_abs_mean = 0.8179361205548048`
+- `ratio_mean = 1.0`
+- `clipfrac_mean = 0.0`
+- `post_update_ratio_mean = 0.9996794573962688`
+- `post_update_clipfrac_mean = 0.0`
+
+Current conclusion:
+- the pi0-fast PPO path is no longer obviously mathematically broken
+- the current 6-step train curve is still too short and too non-monotonic to count as a meaningful RL result
+
+### 4. pi0.5 SFT experiment with a curve
+
+Passed on one meaningful LIBERO task.
+
+Artifacts:
 - `results/sft_pi05_task10_full_k/summary.json`
 - `results/sft_pi05_task10_full_k/loss_curve.png`
 
 Observed:
+- task 10: `put the bowl on the plate`
+- 12 steps
+- loss `0.1187784318 -> 0.0630739303`
+- minimum observed loss `0.0606572889`
 
-- task 10 `put the bowl on the plate`
-- loss `0.1188 -> 0.0631`
-- minimum observed loss `0.0607`
+### 5. Concurrency state-isolation test
 
-Conclusion:
+Partial only.
 
-- `pi0.5` SFT converged on a real LIBERO task.
+Positive evidence gathered:
+- narrow mixed valid/invalid sampling isolation:
+  - `results/dual_sampling_isolation_probe_20260406b.json`
+- pi0-fast concurrent-task SFT traces:
+  - `results/iso_fast_sft_task16_t/summary.json`
+  - `results/iso_fast_sft_task17_t/summary.json`
+- pi0-fast concurrent-task RL traces:
+  - `results/iso_fast_rl_task18_t/summary.json`
+  - `results/iso_fast_rl_task20_t/summary.json`
+- pi0.5 concurrent-task SFT traces:
+  - `results/iso_pi05_sft_task10_t/summary.json`
+  - `results/iso_pi05_sft_task11_t/summary.json`
+  - `results/iso_pi05_sft_task12_t/summary.json`
 
-### Architectural caveat
+Current conclusion:
+- concurrent clients on different tasks were run and produced distinct traces
+- this is positive evidence, but it is still not a decisive proof that the full mixed-client matrix is contamination-free
 
-The current OpenPI sampling side is still not MinT-clean multi-tenant sampling. Full note: `.claude/skills/architecture-design/references/vla_sampling_architecture_gap.md`.
+### 6. Concurrency pressure test with 10 pi0-fast SFT, 10 pi0-fast RL, and 10 pi0.5 SFT clients
 
-- Training is shared-actor multi-tenant.
-- Sampling is still checkpoint-per-session and actor-per-action-session.
-- That means sampling isolation is achieved by separate action actors and full sampler checkpoints, not by a shared sampler substrate multiplexing tenants in memory.
-- This is exactly why pressure on the sampling side shows up as action-actor/GPU pressure.
+Partial only, not passed.
 
-So the current VLA implementation can work operationally, but the sampling architecture is still a real mismatch with the intended MinT design.
-
-### 5. Concurrency state isolation test
-
-Completed operationally, with a sampling-architecture caveat.
-
-Workload:
-
-- `2` `pi0-fast` SFT clients
-- `2` `pi0-fast` RL clients
-- `3` `pi0.5` SFT clients
-
-Observed:
-
-- one shared FAST OpenPI trainer actor
-- one shared pi0.5 OpenPI trainer actor
-- separate FAST action actors for sampling
-- no duplicate trainer actors
-- no evidence of cross-tenant trainer-state contamination
-- plot artifacts were emitted for the completed isolation clients:
-  - `results/iso_fast_sft_task16_t/loss_curve.png`
-  - `results/iso_fast_sft_task17_t/loss_curve.png`
-  - `results/iso_fast_rl_task18_t/reward_curve.png`
-  - `results/iso_fast_rl_task18_t/loss_curve.png`
-  - `results/iso_fast_rl_task20_t/reward_curve.png`
-  - `results/iso_fast_rl_task20_t/loss_curve.png`
-  - `results/iso_pi05_sft_task10_t/loss_curve.png`
-  - `results/iso_pi05_sft_task11_t/loss_curve.png`
-  - `results/iso_pi05_sft_task12_t/loss_curve.png`
-
-Conclusion:
-
-- interleaved training worked as intended on the shared-trainer architecture
-- sampling isolation was achieved operationally by separate action actors, which is why this result does not imply MinT-clean shared multi-tenant sampling
-
-### 6. Concurrency pressure test
-
-Completed.
-
-Important note:
-
-- the naive `30`-process client launch was not a valid server pressure test because the API-host clients were OOM-killed before reaching MinT
-- the valid pressure result is from the threaded logical-client harness `scripts/wip/openpi_vla_pressure_threads.py`
-
-Final artifact:
-
-- `results/pressure_threads_timeout3600_remote_p/batch_summary.json`
-
-Final observed result:
-
-- `count=30`
-- `ok=30`
-- `failed=0`
-
-Final actor state after completion:
-
-- exactly two idle shared OpenPI trainer actors remained
-- no lingering action actors
-- no duplicate trainers
-
-Conclusion:
-
-- under the validated server-side pressure harness, large logical-client concurrency completed successfully without duplicate trainer creation or server OOM.
-
-### 7. Resume training test
-
-Completed.
+Artifact:
+- `results/pressure_threads_final_503retry_k/batch_summary.json`
 
 Observed:
+- 30 logical clients launched
+- 26 succeeded, 4 failed
+- fast SFT: `10/10`
+- pi0.5 SFT: `10/10`
+- fast RL: `6/10`
+- all 4 failures were fast-RL action-session creation failures
+- failure logs:
+  - `results/pressure_threads_final_503retry_k/pressure2_fast_rl_11_w.run.log`
+  - `results/pressure_threads_final_503retry_k/pressure2_fast_rl_12_w.run.log`
+  - `results/pressure_threads_final_503retry_k/pressure2_fast_rl_14_w.run.log`
+  - `results/pressure_threads_final_503retry_k/pressure2_fast_rl_19_w.run.log`
 
-- `pi0-fast` crossed the save/resume boundary without an immediate loss spike
-- `pi0.5` crossed the save/resume boundary without an immediate loss spike
-- resume plot artifacts:
-  - `results/resume_pi0fast_task16_k/loss_curve.png`
-  - `results/resume_pi05_task10_k/loss_curve.png`
+Current conclusion:
+- the pressure run exists and is useful evidence, but it does not pass because 4 of the 10 fast-RL clients still fail during action-session creation
 
-Conclusion:
+### 7. Resume training test for pi0-fast and pi0.5
 
-- both resume paths are healthy for the tested boundary case.
+Passed on the tested tasks, with a caveat on the pi0-fast run cleanliness.
+
+pi0-fast resume artifacts:
+- `results/resume_pi0fast_task16_k/summary.json`
+- `results/resume_pi0fast_task16_k/loss_curve.png`
+
+Observed:
+- presave loss `0.3178560336`
+- first resumed loss `0.2805477182`
+- final loss `0.2697689892`
+- no immediate spike at the resume boundary
+- caveat: the run log later shows a connection-refused failure after the useful continuity evidence was already produced
+
+pi0.5 resume artifacts:
+- `results/resume_pi05_task10_k/summary.json`
+- `results/resume_pi05_task10_k/loss_curve.png`
+
+Observed:
+- presave loss `0.1067636572`
+- first resumed loss `0.0972024137`
+- final loss `0.0821148874`
+- no immediate spike at the resume boundary
 
 ### 8. Merge-gate update
 
-Completed.
+Passed.
 
-Added to `.claude/skills/merge-gate/SKILL.md`:
+What changed:
+- `.claude/skills/merge-gate/SKILL.md` now includes runnable VLA catalog entries for:
+  - pi0-fast SFT
+  - pi0.5 SFT
+  - pi0-fast short RL trace
+  - pi0-fast resume
+  - pi0.5 resume
+  - dual sampling isolation
+  - shared-action actor checkpoint switching
+  - mixed OpenPI pressure run
 
-- `vla_sft_pi0_fast_libero`
-- `vla_sft_pi05_libero`
-- `vla_rl_pi0_fast_libero`
-- `vla_resume_pi0_fast_libero`
-- `vla_resume_pi05_libero`
-- `vla_pressure_shared_openpi`
+### 9. Benchmark and demo research
 
-### 9. Research on next step
+Passed.
 
-Completed.
+Artifact:
+- `.claude/skills/architecture-design/references/vla_next_benchmarks_and_demos_20260408.md`
 
-Detailed memo: `.claude/skills/architecture-design/references/vla_benchmark_demo_research.md`.
+Current recommendation order:
+1. LIBERO suite expansion
+2. LIBERO-plus robustness sweep
+3. MinT-hosted LIBERO policy-server demo
+4. DROID no-robot serving demo
+5. Meta-World adapter pilot
+6. CALVIN after the stack has a stronger sequential-evaluation path
 
-Recommended benchmark ladder after the current base-LIBERO validation:
+### 10. Final report
 
-- LIBERO-plus
-- then DROID
-- then ALOHA as the main demo track
-- then CALVIN
-- then RLBench
+This file is the current repository-tracked validation report.
 
-## Answers To The Six Verification Areas
+## Answers to the six verification areas
 
-### 1. Does the openpi dependency install correctly to worker runtime overlay?
+### 1. Does the OpenPI dependency install correctly to the worker runtime overlay?
 
-Yes.
+Passed on the dedicated path used here.
 
-The dedicated env and runtime overlay loaded OpenPI and its worker stack on `192.168.38.176`.
+### 2. Do all GPU workloads happen on the worker, not the API driver?
 
-### 2. Do all GPU workloads happen on worker, not API driver?
+Passed on the tested VLA path.
 
-Yes.
+### 3. Are request handling and queue/future reuse consistent with the existing MinT pattern?
 
-Training and action workloads ran on the worker. The API driver handled HTTP and control-plane logic only.
+Partial.
 
-### 3. Are the request handling paths consistent with LLMs and do they reuse queues and futures?
+What is established:
+- the path uses queues and futures
+- real correctness bugs in temperature forwarding and detached action-session recovery were fixed
 
-Yes.
+Current conclusion:
+- the architecture is aligned, but the original implementation needed nontrivial fixes
 
-The validated VLA routes run through the MintX surface and reuse queueing and future retrieval rather than bypassing the control plane.
+### 4. Do pi0-fast SFT, pi0-fast RL, and pi0.5 SFT work as expected?
 
-### 4. Do pi0-fast SFT, pi0-fast RL, and pi0.5 SFT all work as expected?
+Partial.
 
-Partially.
+Current conclusion:
+- pi0-fast SFT: yes on the tested task 16 trace
+- pi0.5 SFT: yes on the tested task 10 trace
+- pi0-fast RL: still not at "works as expected"
 
-- `pi0-fast` SFT works
-- `pi0.5` SFT works
-- `pi0-fast` action-sampling plus PPO control path works
-- the meaningful simulator RL baseline also runs, but the tested policy baseline is weak (`0/3` success on the tested LIBERO task)
+### 5. Does multi-tenant training and sampling work as expected, without contamination, with correct actor sharing and concurrency handling?
 
-So the RL stack works, but the original MSE-reward harness should not be treated as a meaningful learning result.
+Partial.
 
-### 5. Does multi-tenant interleaved training and sampling work as expected?
+What is established:
+- the earlier cross-namespace contamination bug was real and is fixed
+- narrow mixed valid/invalid sampling isolation works
+- tested shared-action actor checkpoint switching works on the validated deterministic pair
+- lighter concurrent pi0-fast sampling can reuse one shared action actor
 
-Partially.
+What is not established:
+- broad mixed-client contamination freedom
+- 30-client pressure success for all fast-RL clients
+- general long-lived churn correctness across all checkpoint families
 
-- shared trainers were reused correctly
-- FAST action actors scaled separately
-- trainer duplication was not observed
-- final pressure run completed `30/30` logical clients successfully
+### 6. Are API contract docs clear and consistent, with concise client examples?
 
-What was verified is shared training plus isolated action actors. That is operationally usable, but it is not MinT-clean shared multi-tenant sampling because sampling still uses checkpoint-per-session action actors.
+Not established in this pass.
 
-### 6. Are API docs and client examples clear and consistent?
+## Bottom line
 
-Yes, after the branch updates.
+The current repository state supports these concrete claims:
+- the dedicated OpenPI VLA path on the assigned worker is usable
+- pi0-fast SFT and pi0.5 SFT each have real downward curves on tested LIBERO tasks
+- tested save-resume continuity exists for pi0-fast and pi0.5 on the chosen tasks
+- the pi0-fast PPO path is now numerically sane on the tested 6-step run
+- narrow shared-action actor sampling correctness is established on a tested path
 
-- MintX docs were synchronized earlier
-- repo-local VLA runners now serve as concise concrete examples
-- merge-gate catalog entries point at those runners directly
-
-## Final State
-
-At the end of validation:
-
-- PR branch now includes the deterministic startup fix, the validation artifact additions, and the later report-sync commits. For the exact current tip, use `git rev-parse --short HEAD` in the branch worktree.
-- deterministic startup from zero was re-verified under the scripted runbook on port `18125`
-- focused local verification passed after the final changes: `75 passed` on startup/runtime/worker slices
-- grouped RL artifact completed at `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/rl_pi0fast_grouped_object16_v2/summary.json`
-- after the pressure test, `mint-dev` returned to the expected idle two-trainer state (fast + pi0.5); after the final grouped RL cleanup, the currently running server has one idle shared fast trainer on `192.168.38.176`
+The current repository state does not yet support these stronger claims:
+- meaningful pi0-fast RL
+- decisive mixed-client contamination freedom
+- fully passing 30-client pressure behavior
+- completed benchmark/demo execution beyond the current LIBERO-oriented traces
