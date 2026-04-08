@@ -212,4 +212,4 @@ def test_issue_444_queue_execution_runtime_forwards_runtime_contract_env(monkeyp
     assert overrides["MINT_API_WORK_QUEUE_PINNED_NODE_IP"] == "192.168.38.176"
     assert overrides["OPENPI_DATA_HOME"] == "/tmp/openpi-data"
     assert overrides["MINT_OPENPI_FAST_WEIGHTS_PATH"] == "/tmp/pi0-fast-weights"
-    assert "MINT_API_WORK_QUEUE_ACTOR_NAME" not in overrides
+    assert overrides["MINT_API_WORK_QUEUE_ACTOR_NAME"] == "queue-custom"
