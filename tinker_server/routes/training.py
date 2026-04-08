@@ -38,9 +38,12 @@ from ..backend.async_ray_control import async_lookup_actor_handle
 from ..gateway_auth import GatewayAuthContext, build_billing_auth_context
 from ..logging_context import (
     classify_failure_reason,
+    get_current_traceparent,
     get_otel_tracer,
     run_async_with_otel_span,
     set_request_id,
+    start_as_current_span,
+    start_as_current_span_from_traceparent,
 )
 
 from ..backend.future_store import FutureStatus, future_store
@@ -2869,46 +2872,80 @@ async def _do_save_weights_for_sampler(
             },
         )
 
-        if checkpoint_has_optimizer_state(save_path):
-            raise RuntimeError(
-                f"save_weights_for_sampler must not produce optimizer artifacts, but found some under: {save_path}"
-            )
-        try:
-            validate_sampler_checkpoint_for_sampling(save_path)
-        except ValueError as e:
-            raise RuntimeError(
-                f"save_weights_for_sampler produced an invalid sampler checkpoint at {save_path}: {e}"
-            ) from e
+        with start_as_current_span(
+            "training.save_weights_for_sampler.validate_checkpoint",
+            component="routes.training",
+            op="training.save_weights_for_sampler.validate_checkpoint",
+            request_id=str(request_id),
+            attributes={
+                "model_id": str(request.model_id),
+                "save_path": str(save_path),
+                "save_mode": "named" if request.path is not None else "ephemeral",
+            },
+        ):
+            if checkpoint_has_optimizer_state(save_path):
+                raise RuntimeError(
+                    f"save_weights_for_sampler must not produce optimizer artifacts, but found some under: {save_path}"
+                )
+            try:
+                validate_sampler_checkpoint_for_sampling(save_path)
+            except ValueError as e:
+                raise RuntimeError(
+                    f"save_weights_for_sampler produced an invalid sampler checkpoint at {save_path}: {e}"
+                ) from e
 
         ttl_seconds = request.ttl_seconds
         if request.path is None and ttl_seconds is None:
             ttl_seconds = None
-        write_checkpoint_metadata(
-            save_path,
-            {
-                "checkpoint_id": checkpoint_name,
-                "owner_id": user_id,
-                "model_id": session.model_id,
-                "model_name": session.base_model,
-                "created_at": datetime.utcnow().isoformat() + "Z",
-                "step": session.current_step,
-                "checkpoint_type": "sampler",
-                "optimizer_present": False,
-                "backend": session.backend,
-                "type": "sampler",
+        with start_as_current_span(
+            "training.save_weights_for_sampler.write_checkpoint_metadata",
+            component="routes.training",
+            op="training.save_weights_for_sampler.write_checkpoint_metadata",
+            request_id=str(request_id),
+            attributes={
+                "model_id": str(request.model_id),
+                "checkpoint_name": str(checkpoint_name),
                 "storage_tier": "ephemeral_pfs" if request.path is None else "persistent_cache",
-                "ttl_seconds": request.ttl_seconds,
+                "ttl_seconds": None if request.ttl_seconds is None else int(request.ttl_seconds),
             },
-        )
+        ):
+            write_checkpoint_metadata(
+                save_path,
+                {
+                    "checkpoint_id": checkpoint_name,
+                    "owner_id": user_id,
+                    "model_id": session.model_id,
+                    "model_name": session.base_model,
+                    "created_at": datetime.utcnow().isoformat() + "Z",
+                    "step": session.current_step,
+                    "checkpoint_type": "sampler",
+                    "optimizer_present": False,
+                    "backend": session.backend,
+                    "type": "sampler",
+                    "storage_tier": "ephemeral_pfs" if request.path is None else "persistent_cache",
+                    "ttl_seconds": request.ttl_seconds,
+                },
+            )
 
         persistent_path = None
         if request.path is not None:
-            persistent_path = begin_async_checkpoint_mirror(
-                save_path,
-                user_id=None if is_admin else user_id,
-                model_id=session.model_id,
-                checkpoint_name=checkpoint_name,
-            )
+            with start_as_current_span(
+                "training.save_weights_for_sampler.begin_async_checkpoint_mirror",
+                component="routes.training",
+                op="training.save_weights_for_sampler.begin_async_checkpoint_mirror",
+                request_id=str(request_id),
+                attributes={
+                    "model_id": str(request.model_id),
+                    "checkpoint_name": str(checkpoint_name),
+                    "save_path": str(save_path),
+                },
+            ):
+                persistent_path = begin_async_checkpoint_mirror(
+                    save_path,
+                    user_id=None if is_admin else user_id,
+                    model_id=session.model_id,
+                    checkpoint_name=checkpoint_name,
+                )
 
         from ..client_compat import checkpoint_uri
 
@@ -2957,8 +2994,23 @@ async def _do_save_weights_for_sampler(
             # an immediate configuration or capacity error before we return a
             # sampling_session_id. Allow one short grace window so async failures
             # that happen right after the first await still surface on save.
+            warm_traceparent = get_current_traceparent()
+
             async def _warm_engine() -> None:
-                await inference_manager.get_engine_for_model(base_model)
+                with start_as_current_span_from_traceparent(
+                    "training.save_weights_for_sampler.background_engine_warm",
+                    traceparent=warm_traceparent,
+                    component="routes.training",
+                    op="training.save_weights_for_sampler.background_engine_warm",
+                    request_id=str(request_id),
+                    attributes={
+                        "model_id": str(request.model_id),
+                        "sampling_session_id": str(sampling_session_id),
+                        "base_model": str(base_model),
+                        "save_mode": "ephemeral",
+                    },
+                ):
+                    await inference_manager.get_engine_for_model(base_model)
 
             pending_warms = getattr(inference_manager, "_background_engine_warm_tasks", None)
             if not isinstance(pending_warms, dict):
@@ -2966,32 +3018,50 @@ async def _do_save_weights_for_sampler(
                 setattr(inference_manager, "_background_engine_warm_tasks", pending_warms)
 
             existing_warm = pending_warms.get(base_model)
-            if isinstance(existing_warm, asyncio.Task) and not existing_warm.done():
-                warm_task = existing_warm
-            else:
-                warm_task = asyncio.create_task(_warm_engine())
-                pending_warms[base_model] = warm_task
+            with start_as_current_span(
+                "training.save_weights_for_sampler.schedule_background_engine_warm",
+                component="routes.training",
+                op="training.save_weights_for_sampler.schedule_background_engine_warm",
+                request_id=str(request_id),
+                attributes={
+                    "model_id": str(request.model_id),
+                    "sampling_session_id": str(sampling_session_id),
+                    "base_model": str(base_model),
+                    "warm_timeout_s": 0.05,
+                    "reused_existing_task": bool(
+                        isinstance(existing_warm, asyncio.Task) and not existing_warm.done()
+                    ),
+                },
+            ):
+                if isinstance(existing_warm, asyncio.Task) and not existing_warm.done():
+                    warm_task = existing_warm
+                else:
+                    warm_task = asyncio.create_task(_warm_engine())
+                    pending_warms[base_model] = warm_task
 
-                def _log_warm_failure(task: asyncio.Task[object]) -> None:
-                    if pending_warms.get(base_model) is task:
-                        pending_warms.pop(base_model, None)
-                    if task.cancelled():
-                        return
-                    try:
-                        exc = task.exception()
-                    except Exception:
-                        return
-                    if exc is not None:
-                        logger.warning(
-                            "[save_weights_for_sampler] background engine warm failed: "
-                            "model=%s err=%s",
-                            base_model,
-                            exc,
-                        )
+                    def _log_warm_failure(task: asyncio.Task[object]) -> None:
+                        if pending_warms.get(base_model) is task:
+                            pending_warms.pop(base_model, None)
+                        if task.cancelled():
+                            return
+                        try:
+                            exc = task.exception()
+                        except Exception:
+                            return
+                        if exc is not None:
+                            logger.warning(
+                                "[save_weights_for_sampler] background engine warm failed: "
+                                "model=%s err=%s",
+                                base_model,
+                                exc,
+                            )
 
-                warm_task.add_done_callback(_log_warm_failure)
+                    warm_task.add_done_callback(_log_warm_failure)
 
-            done, _pending = await asyncio.wait({warm_task}, timeout=0.05)
+                done, _pending = await asyncio.wait({warm_task}, timeout=0.05)
+            warm_completed_inline = warm_task in done
+            warm_reused = bool(isinstance(existing_warm, asyncio.Task) and not existing_warm.done())
+             
             if warm_task in done:
                 await warm_task
 
@@ -3000,13 +3070,27 @@ async def _do_save_weights_for_sampler(
             # create_sampling_session() semantics and avoids blocking save-time
             # on engine cold-start or vLLM's exclusive-engine gate while another
             # generate is active.
-            inference_manager.register_multi_lora_session(
-                session_id=sampling_session_id,
-                base_model=base_model,
-                lora_rank=lora_rank,
-                adapter_path=save_path,
-                lora_loaded=False,
-            )
+            with start_as_current_span(
+                "training.save_weights_for_sampler.register_sampling_session",
+                component="routes.training",
+                op="training.save_weights_for_sampler.register_sampling_session",
+                request_id=str(request_id),
+                attributes={
+                    "model_id": str(request.model_id),
+                    "sampling_session_id": str(sampling_session_id),
+                    "base_model": str(base_model),
+                    "lora_rank": int(lora_rank),
+                    "warm_reused": bool(warm_reused),
+                    "warm_completed_inline": bool(warm_completed_inline),
+                },
+            ):
+                inference_manager.register_multi_lora_session(
+                    session_id=sampling_session_id,
+                    base_model=base_model,
+                    lora_rank=lora_rank,
+                    adapter_path=save_path,
+                    lora_loaded=False,
+                )
 
             logger.info(
                 f"[save_weights_for_sampler] Multi-LoRA: registered lazy-load session "
@@ -3014,29 +3098,41 @@ async def _do_save_weights_for_sampler(
             )
 
             try:
-                from ..backend.session_index_store import add_sampler_to_session, upsert_sampler_index
+                from ..backend.session_index_store import add_heartbeat_sampler_to_session, upsert_sampler_index
 
                 created_at = datetime.now().isoformat()
-                add_sampler_to_session(
-                    session_id=session.session_id,
-                    sampler_id=sampling_session_id,
-                    user_id=user_id,
-                    created_at=created_at,
-                )
+                with start_as_current_span(
+                    "training.save_weights_for_sampler.session_index_write",
+                    component="routes.training",
+                    op="training.save_weights_for_sampler.session_index_write",
+                    request_id=str(request_id),
+                    attributes={
+                        "model_id": str(request.model_id),
+                        "sampling_session_id": str(sampling_session_id),
+                        "session_id": str(session.session_id),
+                        "checkpoint_name": str(checkpoint_name),
+                    },
+                ):
+                    add_heartbeat_sampler_to_session(
+                        session_id=session.session_id,
+                        sampler_id=sampling_session_id,
+                        user_id=user_id,
+                        created_at=created_at,
+                    )
 
-                upsert_sampler_index(
-                    {
-                        "sampler_id": sampling_session_id,
-                        "session_id": session.session_id,
-                        "base_model": base_model,
-                        "user_id": user_id,
-                        "created_at": created_at,
-                        "source_type": "checkpoint",
-                        "model_id": session.model_id,
-                        "checkpoint_name": checkpoint_name,
-                        "model_path_raw": tinker_uri,
-                    }
-                )
+                    upsert_sampler_index(
+                        {
+                            "sampler_id": sampling_session_id,
+                            "session_id": session.session_id,
+                            "base_model": base_model,
+                            "user_id": user_id,
+                            "created_at": created_at,
+                            "source_type": "checkpoint",
+                            "model_id": session.model_id,
+                            "checkpoint_name": checkpoint_name,
+                            "model_path_raw": tinker_uri,
+                        }
+                    )
             except Exception as e:
                 logger.warning("[save_weights_for_sampler] session index write failed: %s", e)
 

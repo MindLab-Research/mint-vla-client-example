@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
+import sys
+import types
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+
+def _import_training_route():
+    sys.modules.setdefault("tinker_server.routes.service", types.ModuleType("tinker_server.routes.service"))
+    return importlib.import_module("tinker_server.routes.training")
 
 
 @pytest.fixture
@@ -18,7 +26,8 @@ async def test_issue_408_save_weights_for_sampler_registers_lazy_multilora_sessi
 ) -> None:
     from tinker_server.backend import session_index_store as sis
     from tinker_server.models.types import SaveWeightsForSamplerRequest
-    from tinker_server.routes import training as tr
+
+    tr = _import_training_route()
 
     ckpt_dir = tmp_path / "sampler_ephemeral"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -137,7 +146,8 @@ async def test_issue_408_save_weights_for_sampler_reuses_pending_warm_task(
 ) -> None:
     from tinker_server.backend import session_index_store as sis
     from tinker_server.models.types import SaveWeightsForSamplerRequest
-    from tinker_server.routes import training as tr
+
+    tr = _import_training_route()
 
     ckpt_dir = tmp_path / "sampler_ephemeral"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -243,7 +253,8 @@ async def test_issue_408_save_weights_for_sampler_fails_fast_on_immediate_engine
 ) -> None:
     from tinker_server.backend import session_index_store as sis
     from tinker_server.models.types import SaveWeightsForSamplerRequest
-    from tinker_server.routes import training as tr
+
+    tr = _import_training_route()
 
     ckpt_dir = tmp_path / "sampler_ephemeral"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -332,7 +343,8 @@ async def test_issue_408_save_weights_for_sampler_fails_fast_on_async_warm_error
 ) -> None:
     from tinker_server.backend import session_index_store as sis
     from tinker_server.models.types import SaveWeightsForSamplerRequest
-    from tinker_server.routes import training as tr
+
+    tr = _import_training_route()
 
     ckpt_dir = tmp_path / "sampler_ephemeral"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
