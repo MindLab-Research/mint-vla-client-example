@@ -130,13 +130,22 @@ async def test_issue_408_save_weights_for_sampler_emits_trace_spans(
     await asyncio.sleep(0)
 
     assert resolved["request_id"] == "req-408-save"
-    span_names = {name for name, _kwargs in span_calls}
-    assert "training.save_weights_for_sampler.validate_checkpoint" in span_names
-    assert "training.save_weights_for_sampler.write_checkpoint_metadata" in span_names
-    assert "training.save_weights_for_sampler.schedule_background_engine_warm" in span_names
-    assert "training.save_weights_for_sampler.background_engine_warm" in span_names
-    assert "training.save_weights_for_sampler.register_sampling_session" in span_names
-    assert "training.save_weights_for_sampler.session_index_write" in span_names
+    span_by_name = {name: kwargs for name, kwargs in span_calls}
+    assert "training.save_weights_for_sampler.validate_checkpoint" in span_by_name
+    assert "training.save_weights_for_sampler.write_checkpoint_metadata" in span_by_name
+    assert "training.save_weights_for_sampler.schedule_background_engine_warm" in span_by_name
+    assert "training.save_weights_for_sampler.background_engine_warm" in span_by_name
+    assert "training.save_weights_for_sampler.register_sampling_session" in span_by_name
+    assert "training.save_weights_for_sampler.session_index_write" in span_by_name
+    assert span_by_name["training.save_weights_for_sampler.validate_checkpoint"]["request_id"] == "req-408-save"
+    assert span_by_name["training.save_weights_for_sampler.validate_checkpoint"]["attributes"]["model_id"] == "run-408"
+    assert span_by_name["training.save_weights_for_sampler.background_engine_warm"]["traceparent"] == (
+        "00-" + ("a" * 32) + "-" + ("1" * 16) + "-01"
+    )
+    assert span_by_name["training.save_weights_for_sampler.background_engine_warm"]["request_id"] == "req-408-save"
+    assert span_by_name["training.save_weights_for_sampler.background_engine_warm"]["attributes"]["base_model"] == (
+        "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    )
 
 
 def test_issue_408_megatron_create_path_emits_trace_spans(monkeypatch) -> None:
@@ -198,6 +207,11 @@ def test_issue_408_megatron_create_path_emits_trace_spans(monkeypatch) -> None:
         "start_as_current_span_from_traceparent",
         lambda name, **kwargs: _span_recorder(span_calls, name, **kwargs),
     )
+    monkeypatch.setattr(
+        md,
+        "start_as_current_span",
+        lambda name, **kwargs: _span_recorder(span_calls, name, **kwargs),
+    )
 
     actor = md.get_or_create_megatron_worker_group(
         base_model="/tmp/qwen",
@@ -219,12 +233,59 @@ def test_issue_408_megatron_create_path_emits_trace_spans(monkeypatch) -> None:
         "traceparent": "00-" + ("b" * 32) + "-" + ("2" * 16) + "-01",
         "request_id": "req-408-create",
     }]
-    span_names = {name for name, _kwargs in span_calls}
-    assert "training.create_model.megatron.actor_lookup" in span_names
-    assert "training.create_model.megatron.orphan_pg_probe" in span_names
-    assert "training.create_model.megatron.orphan_pg_race_guard" in span_names
-    assert "training.create_model.megatron.orphan_pg_remove" in span_names
-    assert "training.create_model.megatron.ensure_gpus_available" in span_names
-    assert "training.create_model.megatron.reserve_gpus" in span_names
-    assert "training.create_model.megatron.actor_create" in span_names
-    assert "training.create_model.megatron.register_new_actor" in span_names
+    span_by_name = {name: kwargs for name, kwargs in span_calls}
+    assert "training.create_model.megatron.actor_lookup" in span_by_name
+    assert "training.create_model.megatron.orphan_pg_probe" in span_by_name
+    assert "training.create_model.megatron.orphan_pg_race_guard" in span_by_name
+    assert "training.create_model.megatron.orphan_pg_remove" in span_by_name
+    assert "training.create_model.megatron.ensure_gpus_available" in span_by_name
+    assert "training.create_model.megatron.reserve_gpus" in span_by_name
+    assert "training.create_model.megatron.actor_create" in span_by_name
+    assert "training.create_model.megatron.register_new_actor" in span_by_name
+    assert span_by_name["training.create_model.megatron.actor_lookup"]["traceparent"] == (
+        "00-" + ("b" * 32) + "-" + ("2" * 16) + "-01"
+    )
+    assert span_by_name["training.create_model.megatron.actor_lookup"]["request_id"] == "req-408-create"
+    assert span_by_name["training.create_model.megatron.actor_create"]["attributes"]["base_model"] == "/tmp/qwen"
+    assert span_by_name["training.create_model.megatron.reserve_gpus"]["attributes"]["world_size"] == 1
+
+
+@pytest.mark.anyio
+async def test_issue_408_async_get_or_create_megatron_worker_group_propagates_context(monkeypatch) -> None:
+    from tinker_server.backend import megatron_distributed as md
+
+    captured: dict[str, object] = {}
+
+    def _fake_get_or_create(*args):
+        captured["args"] = args
+        return "actor-handle"
+
+    async def _fake_to_thread(fn, *args):
+        captured["fn"] = fn
+        return fn(*args)
+
+    monkeypatch.setattr(md, "get_or_create_megatron_worker_group", _fake_get_or_create)
+    monkeypatch.setattr(asyncio, "to_thread", _fake_to_thread)
+    monkeypatch.setattr(md, "get_current_traceparent", lambda: "00-" + ("c" * 32) + "-" + ("3" * 16) + "-01")
+    monkeypatch.setattr(md, "get_request_id", lambda: "req-408-async")
+
+    out = await md.async_get_or_create_megatron_worker_group(
+        base_model="/tmp/qwen",
+        lora_rank=16,
+        learning_rate=2e-4,
+        session_id="sess-async",
+        observability_base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+    )
+
+    assert out == "actor-handle"
+    assert captured["fn"] is _fake_get_or_create
+    assert captured["args"] == (
+        "/tmp/qwen",
+        16,
+        2e-4,
+        None,
+        "sess-async",
+        "Qwen/Qwen3-30B-A3B-Instruct-2507",
+        "00-" + ("c" * 32) + "-" + ("3" * 16) + "-01",
+        "req-408-async",
+    )
