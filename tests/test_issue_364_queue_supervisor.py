@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -185,6 +187,15 @@ def test_issue_364_future_store_rejects_stale_generation(monkeypatch) -> None:
     queue_supervisor_module = importlib.import_module("tinker_server.backend.queue_supervisor")
     monkeypatch.setattr(queue_supervisor_module, "queue_supervisor", _FakeQueueSupervisor())
     monkeypatch.setattr(future_store_module, "get_current_queue_generation_id", lambda: 7)
+    monkeypatch.setitem(
+        sys.modules,
+        "ray",
+        SimpleNamespace(
+            get=lambda value: value,
+            put=lambda value: value,
+            exceptions=SimpleNamespace(ActorDiedError=RuntimeError),
+        ),
+    )
 
     future_store_module.future_store.resolve("rid-1", {"ok": True})
 

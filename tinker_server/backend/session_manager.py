@@ -93,6 +93,14 @@ class SessionManager:
         self._cleanup_task: asyncio.Task | None = None
         self._shared_engine: VerlInferenceEngine | None = None
         self._shared_engine_lock = asyncio.Lock()
+        self._obs_sampling_totals: dict[str, int] = {
+            "sampling_sessions_total": 0,
+            "sampling_sessions_multi_lora": 0,
+            "sampling_sessions_base_model": 0,
+            "sampling_sessions_lora_loaded": 0,
+            "sampling_sessions_inflight": 0,
+        }
+        self._obs_sampling_by_model: dict[str, dict[str, int | str]] = {}
 
     def _persist_sampling_session_info(self, session_id: str, info: SessionInfo) -> None:
         if not info.uses_multi_lora:
@@ -120,6 +128,60 @@ class SessionManager:
     def _touch_info(self, session_id: str, info: SessionInfo) -> None:
         info.last_activity = time.time()
         self._persist_sampling_session_info(session_id, info)
+
+    @staticmethod
+    def _sampling_obs_state(info: SessionInfo | None) -> dict[str, int | str] | None:
+        if info is None:
+            return None
+        return {
+            "base_model": str(info.base_model or "unknown"),
+            "sampling_sessions_total": 1,
+            "sampling_sessions_multi_lora": 1 if bool(info.uses_multi_lora) else 0,
+            "sampling_sessions_base_model": 1 if bool(info.uses_base_model) else 0,
+            "sampling_sessions_lora_loaded": 1 if bool(info.lora_loaded) and not bool(info.uses_base_model) else 0,
+            "sampling_sessions_inflight": 1 if int(info.inflight_requests) > 0 else 0,
+            "total": 1,
+            "inflight": 1 if int(info.inflight_requests) > 0 else 0,
+            "lora_loaded": 1 if bool(info.lora_loaded) and not bool(info.uses_base_model) else 0,
+        }
+
+    def _apply_sampling_obs_delta(self, state: dict[str, int | str] | None, sign: int) -> None:
+        if state is None:
+            return
+        for key in (
+            "sampling_sessions_total",
+            "sampling_sessions_multi_lora",
+            "sampling_sessions_base_model",
+            "sampling_sessions_lora_loaded",
+            "sampling_sessions_inflight",
+        ):
+            self._obs_sampling_totals[key] = max(0, int(self._obs_sampling_totals.get(key, 0)) + sign * int(state[key]))
+
+        base_model = str(state["base_model"])
+        bucket = self._obs_sampling_by_model.get(base_model)
+        if bucket is None and sign > 0:
+            bucket = {
+                "base_model": base_model,
+                "total": 0,
+                "inflight": 0,
+                "lora_loaded": 0,
+            }
+            self._obs_sampling_by_model[base_model] = bucket
+        if bucket is None:
+            return
+        for key in ("total", "inflight", "lora_loaded"):
+            bucket[key] = max(0, int(bucket.get(key, 0)) + sign * int(state[key]))
+        if int(bucket["total"]) == 0 and int(bucket["inflight"]) == 0 and int(bucket["lora_loaded"]) == 0:
+            self._obs_sampling_by_model.pop(base_model, None)
+
+    def _refresh_sampling_observability(
+        self,
+        *,
+        before: SessionInfo | None,
+        after: SessionInfo | None,
+    ) -> None:
+        self._apply_sampling_obs_delta(self._sampling_obs_state(before), -1)
+        self._apply_sampling_obs_delta(self._sampling_obs_state(after), 1)
 
     async def start_cleanup_task(self) -> None:
         """Deprecated local cleanup loop retained only for legacy tests."""
@@ -182,9 +244,11 @@ class SessionManager:
         info = self._get_session_info(session_id, touch=False)
         if info is None:
             return
+        before = SessionInfo(**vars(info))
         info.last_activity = time.time()
         info.inflight_requests = max(0, info.inflight_requests + delta)
         self._persist_sampling_session_info(session_id, info)
+        self._refresh_sampling_observability(before=before, after=info)
 
     # =========================================================================
     # Shared Engine Methods (for fast ephemeral weight sync)
@@ -269,6 +333,7 @@ class SessionManager:
             is_shared=True,
             pending_persist=True,
         )
+        self._refresh_sampling_observability(before=None, after=self._sessions[session_id])
         logger.info(
             f"Created ephemeral session {session_id} using shared engine "
             f"(reload took {reload_time:.3f}s)"
@@ -326,6 +391,7 @@ class SessionManager:
             lora_rank=lora_rank,
             pending_persist=True,
         )
+        self._refresh_sampling_observability(before=None, after=self._sessions[session_id])
         logger.info(
             f"Created session {session_id} with lora_rank={lora_rank}, "
             f"adapter_path={adapter_path}"
@@ -336,7 +402,7 @@ class SessionManager:
         """Resolve model_path URI to filesystem path.
 
         Args:
-            model_path: URI like file:///path, mint://{uuid}/..., or absolute path.
+            model_path: URI like file:///path, mint://{run_id}/{kind}/{name}, or absolute path.
 
         Returns:
             Absolute filesystem path to adapter directory.
@@ -376,6 +442,7 @@ class SessionManager:
             is_shared=True,  # Mark as shared to prevent SessionManager from shutting it down
             pending_persist=True,
         )
+        self._refresh_sampling_observability(before=None, after=self._sessions[session_id])
         logger.info(
             f"Registered session {session_id} with external engine "
             f"(lora_rank={lora_rank})"
@@ -473,6 +540,7 @@ class SessionManager:
             if info is None:
                 return False
             self._sessions.pop(session_id, None)
+        self._refresh_sampling_observability(before=info, after=None)
         try:
             from .sampling_session_store import delete_sampling_session
 
@@ -560,34 +628,12 @@ class SessionManager:
             pass
         return list(session_ids)
 
-    def observability_snapshot(self) -> dict[str, int]:
-        try:
-            from .sampling_session_store import list_sampling_sessions
-
-            infos = [dict(info) for info in list_sampling_sessions() if isinstance(info, dict)]
-        except Exception:
-            infos = []
-
-        if not infos:
-            infos = [
-                {
-                    "session_id": session_id,
-                    "uses_multi_lora": bool(info.uses_multi_lora),
-                    "uses_base_model": bool(info.uses_base_model),
-                    "lora_loaded": bool(info.lora_loaded),
-                    "inflight_requests": int(info.inflight_requests),
-                }
-                for session_id, info in self._sessions.items()
-            ]
-
+    def observability_snapshot(self) -> dict[str, int | list[dict[str, int | str]]]:
         return {
-            "sampling_sessions_total": len(infos),
-            "sampling_sessions_multi_lora": sum(1 for info in infos if bool(info.get("uses_multi_lora"))),
-            "sampling_sessions_base_model": sum(1 for info in infos if bool(info.get("uses_base_model"))),
-            "sampling_sessions_lora_loaded": sum(
-                1 for info in infos if bool(info.get("lora_loaded")) and not bool(info.get("uses_base_model"))
-            ),
-            "sampling_sessions_inflight": sum(1 for info in infos if int(info.get("inflight_requests") or 0) > 0),
+            **self._obs_sampling_totals,
+            "sampling_sessions_by_model": [
+                dict(self._obs_sampling_by_model[key]) for key in sorted(self._obs_sampling_by_model)
+            ],
         }
 
     # =========================================================================
@@ -708,6 +754,7 @@ class SessionManager:
             metadata_version=max(1, int(metadata_version) if metadata_version is not None else 1),
             pending_persist=bool(persist),
         )
+        self._refresh_sampling_observability(before=None, after=self._sessions[session_id])
         if persist:
             self._persist_sampling_session_info(session_id, self._sessions[session_id])
             self._sessions[session_id].pending_persist = False
@@ -755,6 +802,7 @@ class SessionManager:
         info = self._get_session_info(session_id)
         if info is None:
             return
+        before = SessionInfo(**vars(info))
         new_loaded = bool(loaded)
         changed = bool(info.lora_loaded) != new_loaded
         info.lora_loaded = new_loaded
@@ -764,6 +812,7 @@ class SessionManager:
         if changed:
             info.metadata_version = max(1, int(info.metadata_version) + 1)
         self._persist_sampling_session_info(session_id, info)
+        self._refresh_sampling_observability(before=before, after=info)
 
     def mark_model_lora_sessions_unloaded(self, base_model: str) -> int:
         """Invalidate multi-LoRA load state for sessions bound to a base model.
@@ -786,8 +835,10 @@ class SessionManager:
                 continue
             if not info.lora_loaded:
                 continue
+            before = SessionInfo(**vars(info))
             info.last_activity = now
             info.lora_loaded = False
+            self._refresh_sampling_observability(before=before, after=info)
             count += 1
         return count
 
@@ -848,6 +899,7 @@ class SessionManager:
             metadata_version=max(1, int(metadata_version) if metadata_version is not None else 1),
             pending_persist=False,
         )
+        self._refresh_sampling_observability(before=None, after=self._sessions[session_id])
         self._persist_sampling_session_info(session_id, self._sessions[session_id])
         logger.info(f"Registered base model session {session_id} (model={base_model})")
 
@@ -869,6 +921,7 @@ class SessionManager:
                 except Exception:
                     pass
                 return True
+            before = SessionInfo(**vars(existing))
             existing.uses_base_model = bool(info.get("uses_base_model"))
             existing.base_model = base_model
             existing.last_activity = float(info.get("last_activity", existing.last_activity))
@@ -885,6 +938,7 @@ class SessionManager:
             existing.metadata_version = incoming_version
             existing.inflight_requests = int(info.get("inflight_requests") or existing.inflight_requests)
             existing.pending_persist = False
+            self._refresh_sampling_observability(before=before, after=existing)
             return True
 
         uses_base_model = bool(info.get("uses_base_model"))
@@ -903,6 +957,7 @@ class SessionManager:
                 inflight_requests=int(info.get("inflight_requests") or 0),
                 pending_persist=False,
             )
+            self._refresh_sampling_observability(before=None, after=self._sessions[session_id])
             return True
 
         self.register_multi_lora_session(
@@ -918,8 +973,10 @@ class SessionManager:
         )
         restored = self._sessions.get(session_id)
         if restored is not None:
+            before = SessionInfo(**vars(restored))
             restored.inflight_requests = int(info.get("inflight_requests") or 0)
             restored.pending_persist = False
+            self._refresh_sampling_observability(before=before, after=restored)
         return True
 
     async def _restore_loaded_lora_registration(

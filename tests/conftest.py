@@ -14,6 +14,76 @@ if "structlog" not in sys.modules:
     sys.modules["structlog"] = types.ModuleType("structlog")
 
 
+def _install_fake_ray() -> None:
+    try:
+        import ray  # noqa: F401
+        return
+    except ModuleNotFoundError:
+        pass
+
+    ray_module = types.ModuleType("ray")
+    ray_exceptions = types.ModuleType("ray.exceptions")
+    ray_util_module = types.ModuleType("ray.util")
+    ray_sched_module = types.ModuleType("ray.util.scheduling_strategies")
+    ray_private_module = types.ModuleType("ray._private")
+    ray_private_state_module = types.ModuleType("ray._private.state")
+
+    class _RayActorError(Exception):
+        pass
+
+    class _ActorDiedError(_RayActorError):
+        pass
+
+    class _GetTimeoutError(Exception):
+        pass
+
+    class _RayTaskError(Exception):
+        def __init__(self, msg: str = "", *, cause=None):
+            super().__init__(msg)
+            self.cause = cause
+
+    class _NodeAffinitySchedulingStrategy:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+    ray_exceptions.RayActorError = _RayActorError
+    ray_exceptions.ActorDiedError = _ActorDiedError
+    ray_exceptions.GetTimeoutError = _GetTimeoutError
+    ray_exceptions.RayTaskError = _RayTaskError
+    ray_sched_module.NodeAffinitySchedulingStrategy = _NodeAffinitySchedulingStrategy
+
+    ray_private_state_module.available_resources_per_node = lambda: {}
+    ray_private_state_module.actors = lambda *_args, **_kwargs: {}
+    ray_private_module.state = ray_private_state_module
+
+    ray_util_module.list_named_actors = lambda *args, **kwargs: []
+    ray_util_module.get_placement_group = lambda *args, **kwargs: None
+    ray_util_module.remove_placement_group = lambda *args, **kwargs: None
+    ray_util_module.placement_group_table = lambda *args, **kwargs: {}
+
+    ray_module.actor = types.SimpleNamespace(ActorHandle=object)
+    ray_module.exceptions = ray_exceptions
+    ray_module.util = ray_util_module
+    ray_module._private = ray_private_module
+    ray_module.init = lambda *args, **kwargs: None
+    ray_module.is_initialized = lambda: False
+    ray_module.get_actor = lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("actor not found"))
+    ray_module.get = lambda *args, **kwargs: None
+    ray_module.nodes = lambda: []
+    ray_module.kill = lambda *args, **kwargs: None
+
+    sys.modules["ray"] = ray_module
+    sys.modules["ray.exceptions"] = ray_exceptions
+    sys.modules["ray.util"] = ray_util_module
+    sys.modules["ray.util.scheduling_strategies"] = ray_sched_module
+    sys.modules["ray._private"] = ray_private_module
+    sys.modules["ray._private.state"] = ray_private_state_module
+
+
+_install_fake_ray()
+
+
 def _runtime_manifest() -> dict:
     runtime = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["tool"][
         "tinker"
@@ -91,3 +161,7 @@ def configure_runtime_env(monkeypatch, tmp_path):
         }
 
     return _configure
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"

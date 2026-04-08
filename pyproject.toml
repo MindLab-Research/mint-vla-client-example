@@ -69,6 +69,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",
+    "trio>=0.33.0",
 ]
 
 [build-system]
@@ -131,7 +132,7 @@ pythonpath = ["src", "."]
 [[tool.tinker.runtime_env.sources]]
 name = "verl"
 repo = "https://github.com/verl-project/verl.git"
-commit = "9433f8a8f2771256ea4f8f94e4401bcfe9703228"
+commit = "d2916f5a0ed346464d8999e040e0ebb05bb8fadf"
 pythonpath = ["."]
 
 [[tool.tinker.runtime_env.sources]]

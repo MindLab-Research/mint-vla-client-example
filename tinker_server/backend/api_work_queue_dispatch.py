@@ -314,7 +314,7 @@ async def execute_work_item(item: Any) -> None:
         async def _run():
             from .future_store import future_store
 
-            future_store.resolve(
+            await future_store.async_resolve(
                 str(item.request_id),
                 {"ok": True, "op": "internal.noop", "ts": time.time()},
             )

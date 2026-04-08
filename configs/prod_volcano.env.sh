@@ -71,7 +71,7 @@ else
   return 1 2>/dev/null || exit 1
 fi
 
-export TINKER_API_WORK_QUEUE_ACTOR_NAME=tinker_api_work_queue_v20260309
+export MINT_API_WORK_QUEUE_ACTOR_NAME=tinker_api_work_queue_v20260309
 export MINT_API_WORK_QUEUE_ACTOR_MAX_CONCURRENCY=1024
 
 export PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/mint-runtime-py31213

@@ -49,7 +49,7 @@ async def test_issue_364_get_tokenizer_info_allows_dense_recover(monkeypatch: py
     out = await engine.get_tokenizer_info(session)
 
     assert out["model_name"] == "Qwen/Qwen3-0.6B"
-    assert calls == [("get_tokenizer_info", True)]
+    assert calls == [("get_tokenizer_info", False)]
 
 
 @pytest.mark.anyio
@@ -82,4 +82,4 @@ async def test_issue_364_save_dense_lora_weights_allows_dense_recover(monkeypatc
     out = await engine.save_dense_lora_weights_for_sampler(session, str(tmp_path / "ckpt"))
 
     assert out == str((tmp_path / "ckpt").resolve())
-    assert calls == [("save_dense_lora_weights_for_sampler", True)]
+    assert calls == [("save_dense_lora_weights_for_sampler", False)]

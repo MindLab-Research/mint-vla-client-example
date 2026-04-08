@@ -35,8 +35,7 @@ class _StubActor:
         self.try_reserve = _RemoteMethod(result=result, error=error)
 
 
-@pytest.mark.parametrize("exc_name", ["ActorDiedError", "RayActorError"])
-def test_issue_432_capacity_manager_async_try_reserve_retries_after_actor_error(monkeypatch, exc_name):
+def test_issue_432_capacity_manager_async_try_reserve_actor_died_clears_cache(monkeypatch):
     class _RayExceptions:
         class ActorDiedError(Exception):
             pass
@@ -44,39 +43,138 @@ def test_issue_432_capacity_manager_async_try_reserve_retries_after_actor_error(
         class RayActorError(Exception):
             pass
 
-    dead_exc = getattr(_RayExceptions, exc_name)("dead actor")
-
-    ray_stub = SimpleNamespace(exceptions=_RayExceptions)
+    ray_stub = SimpleNamespace(exceptions=_RayExceptions, is_initialized=lambda: True)
     monkeypatch.setitem(sys.modules, "ray", ray_stub)
 
     mgr = cm.CapacityManager()
-    first = _StubActor(error=dead_exc)
-    second = _StubActor(result={"ok": True})
-    resets = []
-
-    async def _get_ray_actor_async():
-        return second
-
-    monkeypatch.setattr(mgr, "_get_cached_ray_actor_for_async_request_path", lambda: first)
-    monkeypatch.setattr(mgr, "_get_ray_actor_async", _get_ray_actor_async)
-    monkeypatch.setattr(mgr, "_reset_ray_actor", lambda actor=None: resets.append(actor))
+    mgr._ray_actor = _StubActor(error=_RayExceptions.ActorDiedError("dead actor"))
 
     async def _run_async_try_reserve():
         return await mgr.async_try_reserve("rid", queue_bytes=7, object_store_bytes=11)
 
+    with pytest.raises(cm.CapacityManagerUnavailableError, match="died"):
+        anyio.run(_run_async_try_reserve)
+
+    assert mgr._ray_actor is None
+
+
+def test_issue_432_capacity_manager_async_try_reserve_recovers_on_next_request(monkeypatch):
+    class _RayExceptions:
+        class ActorDiedError(Exception):
+            pass
+
+        class RayActorError(Exception):
+            pass
+
+    ray_stub = SimpleNamespace(exceptions=_RayExceptions, is_initialized=lambda: True)
+    monkeypatch.setitem(sys.modules, "ray", ray_stub)
+
+    mgr = cm.CapacityManager()
+    mgr._ray_actor = _StubActor(error=_RayExceptions.ActorDiedError("dead actor"))
+    recovered = _StubActor(result={"ok": True})
+    recreated = []
+
+    def _get_or_create_ray_actor():
+        recreated.append(True)
+        return recovered
+
+    monkeypatch.setattr(cm, "_get_or_create_ray_actor", _get_or_create_ray_actor)
+
+    async def _run_async_try_reserve():
+        return await mgr.async_try_reserve("rid", queue_bytes=7, object_store_bytes=11)
+
+    with pytest.raises(cm.CapacityManagerUnavailableError):
+        anyio.run(_run_async_try_reserve)
+
     out = anyio.run(_run_async_try_reserve)
 
     assert out == {"ok": True}
-    assert resets == [first]
+    assert recreated == [True]
 
 
-def test_issue_432_capacity_manager_create_race_falls_back_to_named_actor(monkeypatch):
+def test_issue_432_capacity_manager_probe_failure_falls_back_to_named_actor(monkeypatch):
+    existing_actor = object()
+    recorder = {"ray_get_calls": []}
+
+    import tinker_server.config as config_mod
+
+    monkeypatch.setenv("RAY_ADDRESS", "ray://test")
+    monkeypatch.setattr(config_mod, "PFS_RUNTIME_ENV_ROOT", "/tmp/runtime", raising=False)
+    monkeypatch.setattr(config_mod, "PFS_TINKER_PATH", "/tmp/tinker", raising=False)
+    monkeypatch.setattr(config_mod, "PFS_HF_MODULES_PATH", "/tmp/hfmods", raising=False)
+    monkeypatch.setattr(config_mod, "PFS_PYTHONPATH", "/tmp/runtime:/tmp/tinker:/tmp/hfmods", raising=False)
+    monkeypatch.setattr(
+        config_mod,
+        "actor_runtime_env",
+        lambda pythonpath, extra: {"py_modules": [], "env_vars": {"PYTHONPATH": pythonpath, **extra}},
+        raising=False,
+    )
+
+    def _get_actor(name, namespace):
+        recorder.setdefault("get_actor_calls", []).append((name, namespace))
+        if len(recorder["get_actor_calls"]) == 1:
+            raise ValueError("missing")
+        return existing_actor
+
+    class _SnapshotMethod:
+        def remote(self):
+            return "snapshot_ref"
+
+    class _CreatedActor:
+        snapshot = _SnapshotMethod()
+
+    class _RemoteActorFactory:
+        def options(self, **options):
+            recorder["options"] = options
+            return self
+
+        def remote(self, **kwargs):
+            recorder["remote_kwargs"] = kwargs
+            return _CreatedActor()
+
+    def _remote(**remote_kwargs):
+        recorder["remote_decorator_kwargs"] = remote_kwargs
+
+        def _wrap(cls):
+            recorder["actor_cls_name"] = cls.__name__
+            return _RemoteActorFactory()
+
+        return _wrap
+
+    def _ray_get(ref, timeout=None):
+        recorder["ray_get_calls"].append((ref, timeout))
+        if ref == "snapshot_ref":
+            raise RuntimeError("probe failed")
+        return ref
+
+    ray_stub = SimpleNamespace(
+        get_actor=_get_actor,
+        get=_ray_get,
+        remote=_remote,
+    )
+    monkeypatch.setitem(sys.modules, "ray", ray_stub)
+
+    actor = cm._get_or_create_ray_actor()
+
+    assert actor is existing_actor
+    assert recorder["remote_decorator_kwargs"] == {"num_cpus": 0}
+    assert recorder["options"]["get_if_exists"] is True
+    assert recorder["options"]["lifetime"] == "detached"
+    assert recorder["get_actor_calls"] == [
+        (cm._ray_capacity_manager_actor_name(), cm._ray_namespace()),
+        (cm._ray_capacity_manager_actor_name(), cm._ray_namespace()),
+    ]
+    assert recorder["ray_get_calls"] == [("snapshot_ref", 1.0)]
+
+
+def test_issue_432_capacity_manager_prefers_configured_detached_actor_node(monkeypatch):
     existing_actor = object()
     recorder = {}
 
     import tinker_server.config as config_mod
 
     monkeypatch.setenv("RAY_ADDRESS", "ray://test")
+    monkeypatch.setenv("MINT_DETACHED_ACTOR_NODE_IP", "192.168.38.175")
     monkeypatch.setattr(config_mod, "PFS_RUNTIME_ENV_ROOT", "/tmp/runtime", raising=False)
     monkeypatch.setattr(config_mod, "PFS_TINKER_PATH", "/tmp/tinker", raising=False)
     monkeypatch.setattr(config_mod, "PFS_HF_MODULES_PATH", "/tmp/hfmods", raising=False)
@@ -108,7 +206,7 @@ def test_issue_432_capacity_manager_create_race_falls_back_to_named_actor(monkey
 
     ray_stub = SimpleNamespace(
         get_actor=_get_actor,
-        cluster_resources=lambda: {"node:__internal_head__": 1.0},
+        cluster_resources=lambda: {"node:__internal_head__": 1.0, "node:192.168.38.175": 1.0},
         remote=_remote,
     )
     monkeypatch.setitem(sys.modules, "ray", ray_stub)
@@ -116,12 +214,4 @@ def test_issue_432_capacity_manager_create_race_falls_back_to_named_actor(monkey
     actor = cm._get_or_create_ray_actor()
 
     assert actor is existing_actor
-    assert recorder["remote_decorator_kwargs"] == {"num_cpus": 0}
-    assert recorder["options"]["get_if_exists"] is True
-    assert recorder["options"]["max_restarts"] == -1
-    assert recorder["options"]["max_task_retries"] == -1
-    assert recorder["options"]["resources"] == {"node:__internal_head__": 0.001}
-    assert recorder["get_actor_calls"] == [
-        (cm._ray_capacity_manager_actor_name(), cm._ray_namespace()),
-        (cm._ray_capacity_manager_actor_name(), cm._ray_namespace()),
-    ]
+    assert recorder["options"]["resources"] == {"node:192.168.38.175": 0.001}

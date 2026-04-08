@@ -22,6 +22,7 @@ from ..checkpoints import (
 from ..client_compat import checkpoint_uri
 from ..logging_context import classify_failure_reason, set_request_id
 from ..model_access_control import can_access_model, get_access_denied_error
+from ..queue_priority import merge_queue_priority_extra
 from ..models.mint_types import (
     ForwardBackwardReverseKLRequest,
     InterpolateCheckpointsRequest,
@@ -58,7 +59,10 @@ def _get_user_id(request: Request) -> str | None:
 
 
 def _resolve_checkpoint_for_user(path: str, *, user_id: str | None, is_admin: bool) -> str:
-    resolved = resolve_checkpoint_path(path, user_id=user_id, is_admin=is_admin)
+    try:
+        resolved = resolve_checkpoint_path(path, user_id=user_id, is_admin=is_admin)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     ensure_checkpoint_path_allowed(resolved, user_id=user_id, is_admin=is_admin)
     return materialize_persistent_checkpoint(resolved)
 
@@ -416,6 +420,7 @@ async def interpolate_checkpoints(
             request_json=request_json,
             user_id=user_id,
             webhook_url=None,
+            extra=merge_queue_priority_extra(request=http_request),
         )
     except Exception as e:
         await capacity_manager.async_release_all(request_id)
@@ -564,6 +569,7 @@ async def forward_backward_reverse_kl(
             request_json=request_json,
             user_id=user_id,
             webhook_url=None,
+            extra=merge_queue_priority_extra(request=http_request),
         )
     except Exception as e:
         await capacity_manager.async_release_all(request_id)

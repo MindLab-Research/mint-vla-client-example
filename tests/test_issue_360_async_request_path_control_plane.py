@@ -181,6 +181,10 @@ class _AsyncOnlyTerminalFutureStore:
         self.calls.append(("async_get_status", request_id))
         return FutureStatus.DONE
 
+    async def async_get_meta(self, request_id: str):
+        self.calls.append(("async_get_meta", request_id))
+        return {"op": "sampling.asample"}
+
     async def async_get_result(self, request_id: str):
         self.calls.append(("async_get_result", request_id))
         return {"ok": request_id}
@@ -512,6 +516,81 @@ def test_issue_360_internal_admission_stats_uses_async_store_calls(monkeypatch):
     assert payload["actors"]["capacity_manager"]["rss_bytes"] == 111
     assert payload["actors"]["api_work_queue"]["rss_bytes"] == 123
     assert payload["actors"]["future_store"]["rss_bytes"] == 222
+
+
+@pytest.mark.anyio
+async def test_issue_360_api_work_queue_stats_omits_unready_scheduler_metrics(monkeypatch):
+    import importlib
+
+    _install_minimal_ray_module(monkeypatch)
+    ray_mod = importlib.import_module("ray")
+    monkeypatch.setattr(ray_mod, "is_initialized", lambda: True, raising=False)
+
+    wq = importlib.import_module("tinker_server.backend.api_work_queue")
+    client = wq.ApiWorkQueueClient()
+
+    class _StatsHandle:
+        def remote(self):
+            return object()
+
+    class _Actor:
+        stats = _StatsHandle()
+
+    client._ray_actor = _Actor()
+
+    async def _fake_await(_ref, *, timeout_s=None):
+        _ = timeout_s
+        return {
+            "depth": 5,
+            "depth_legacy": 5,
+            "depth_scheduled": 4,
+            "scheduler_metrics_ready": False,
+            "scheduler_enabled": False,
+            "scheduler_picks_total": 0,
+            "scheduler_switches_total": 0,
+        }
+
+    monkeypatch.setattr(client, "_await_ray_ref", _fake_await)
+
+    payload = await client.stats(timeout_s=1.0)
+
+    assert payload["depth"] == 5
+    assert payload["depth_legacy"] == 5
+    assert payload["scheduler_metrics_ready"] is False
+    assert "depth_scheduled" not in payload
+    assert "scheduler_enabled" not in payload
+    assert "scheduler_picks_total" not in payload
+
+
+@pytest.mark.anyio
+async def test_issue_360_async_started_probes_skip_ready_snapshot(monkeypatch):
+    import importlib
+
+    fs_module = importlib.import_module("tinker_server.backend.future_store")
+    wq_module = importlib.import_module("tinker_server.backend.api_work_queue")
+
+    future_store = fs_module.FutureStore()
+    api_work_queue = wq_module.ApiWorkQueueClient()
+    calls: list[tuple[str, bool]] = []
+
+    async def _fake_future_get(*, require_ready: bool = True):
+        calls.append(("future_store", bool(require_ready)))
+        return object()
+
+    async def _fake_queue_get(*, require_ready: bool = True):
+        calls.append(("api_work_queue", bool(require_ready)))
+        return object()
+
+    monkeypatch.setattr(future_store, "_get_ray_actor_async", _fake_future_get)
+    monkeypatch.setattr(api_work_queue, "_get_ray_actor_async", _fake_queue_get)
+
+    await future_store.async_ensure_started()
+    await api_work_queue.async_ensure_started()
+
+    assert calls == [
+        ("future_store", False),
+        ("api_work_queue", False),
+    ]
 
 
 def test_issue_360_training_optim_step_admission_uses_async_capacity_and_future(monkeypatch):

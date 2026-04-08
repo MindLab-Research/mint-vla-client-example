@@ -8,10 +8,17 @@ import shutil
 import time
 from typing import Any
 
-from ..config import PFS_PYTHONPATH, actor_runtime_env, otel_env_vars, preferred_control_plane_resources
+from ..config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources, otel_env_vars
 
 logger = logging.getLogger(__name__)
 _ACTOR_HANDLE = None
+
+def _reset_cached_actor_handle() -> None:
+    global _ACTOR_HANDLE
+    _ACTOR_HANDLE = None
+
+from ..ray_utils import register_ray_reconnect_invalidator as _register_ray_reconnect_invalidator
+_register_ray_reconnect_invalidator(_reset_cached_actor_handle)
 
 
 def _ray_namespace() -> str:
@@ -249,12 +256,7 @@ def _get_or_create_actor():
         "namespace": namespace,
         "lifetime": "detached",
     }
-    try:
-        resources = preferred_control_plane_resources(ray.cluster_resources())
-        if resources is not None:
-            options["resources"] = resources
-    except Exception:
-        pass
+    apply_detached_actor_resources(options, ray)
     options["runtime_env"] = actor_runtime_env(pythonpath=PFS_PYTHONPATH, extra=otel_env_vars())
 
     try:

@@ -17,7 +17,7 @@ import os
 import sys
 import time
 import traceback
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -38,6 +38,7 @@ from . import ray_kill
 from .multinode_resources import compute_multinode_engine_resources
 from .ray_placement_groups import PlacementGroupMismatchError, get_named_placement_group
 from .ray_keepalive import ray_get_with_resource_pool_keepalive
+from .vllm_scheduler_observability import VllmStatsObserver, make_vllm_stats_logger_factory
 from .volc_placement import (
     assert_node_ip_capacity,
     parse_model_node_ip_list,
@@ -608,12 +609,15 @@ def _create_multinode_vllm_actor(
             self._serialize_add_request = _env_flag("MINT_VLLM_SERIALIZE_ADD_REQUEST", default=True)
             self._add_request_lock = asyncio.Lock() if self._serialize_add_request else None
             # Multinode multi-sample can run either through vLLM's native `n>1` path or
-            # by expanding into repeated `n=1` requests. Default to the native path here so
-            # experiments measure real `SamplingParams(n>1)` behavior unless explicitly
-            # overridden by environment.
+            # by expanding into repeated `n=1` requests.
+            #
+            # Keep the default on vLLM's native `SamplingParams(n>1)` path. The issue428
+            # experiment should compare that native behavior before/after reducing the
+            # multisample-specific full-request mutex, rather than changing the default
+            # serving semantics at the tinker-server layer.
             #
             # Modes:
-            # - "vllm_n": use `SamplingParams(n=N)` (default vLLM multisample)
+            # - "vllm_n": use `SamplingParams(n=N)` (default)
             # - "sequential_n1": run N sequential `SamplingParams(n=1)` requests
             # - "concurrent_n1": run N concurrent `SamplingParams(n=1)` requests
             self._multisample_mode = os.environ.get("MINT_VLLM_MULTISAMPLE_MODE", "vllm_n").strip().lower()
@@ -628,6 +632,7 @@ def _create_multinode_vllm_actor(
             self._generate_timeout_s = float(os.environ.get("MINT_VLLM_GENERATE_TIMEOUT_S", "0"))
             self._post_generate_delay_s = float(os.environ.get("MINT_VLLM_POST_GENERATE_DELAY_S", "0"))
             self._gate_lock = asyncio.Lock()
+            self._vllm_stats_observer = VllmStatsObserver()
             self._active_generates = 0
             self._active_generates_cond = asyncio.Condition()
             self._is_ready_timeout_s = float(os.environ.get("MINT_VLLM_IS_READY_TIMEOUT_S", "0.05"))
@@ -642,7 +647,6 @@ def _create_multinode_vllm_actor(
             self._admission_control = _env_flag("MINT_VLLM_ADMISSION_CONTROL", default=True)
             self._active_seq_slots = 0
             self._seq_slots_cond = asyncio.Condition()
-
         def get_node_ip(self) -> str:
             return ray.util.get_node_ip_address()
 
@@ -654,6 +658,30 @@ def _create_multinode_vllm_actor(
             rss_pages = int(parts[1])
             page_size = int(os.sysconf("SC_PAGE_SIZE"))
             return rss_pages * page_size
+
+        async def get_observability_binding(self) -> dict[str, object]:
+            import socket
+
+            gpu_indices: list[int] = []
+            try:
+                for gpu_id in ray.get_gpu_ids():
+                    if isinstance(gpu_id, (int, float)):
+                        gpu_indices.append(int(gpu_id))
+                    else:
+                        gpu_indices.append(int(float(str(gpu_id))))
+            except Exception:
+                gpu_indices = []
+            node_id = None
+            try:
+                node_id = str(ray.get_runtime_context().get_node_id())
+            except Exception:
+                node_id = None
+            return {
+                "hostname": socket.gethostname(),
+                "node_id": node_id,
+                "gpu_indices": gpu_indices,
+                **self._vllm_stats_observer.snapshot(),
+            }
 
         def _bind_traceparent(self, traceparent: str | None) -> None:
             if isinstance(traceparent, str) and traceparent:
@@ -949,7 +977,10 @@ def _create_multinode_vllm_actor(
             )
 
             # Create engine - vLLM will spawn Ray workers across nodes
-            self.engine = AsyncLLMEngine.from_engine_args(engine_args)
+            self.engine = AsyncLLMEngine.from_engine_args(
+                engine_args,
+                stat_loggers=[make_vllm_stats_logger_factory(self._vllm_stats_observer)],
+            )
 
             self._initialized = True
             logger.info("MultiNodeVLLMEngine initialized")
@@ -1287,29 +1318,41 @@ def _create_multinode_vllm_actor(
                             outs.append(out)
                         return outs
 
-                    tasks = []
+                    tasks: dict[str, asyncio.Task] = {}
                     for i in range(n_req):
                         sub_id = f"{request_id}_s{i}"
-                        tasks.append(
-                            asyncio.create_task(
-                                self.generate(
-                                    prompt_ids=prompt_ids,
-                                    request_id=sub_id,
-                                    lora_int_id=lora_int_id,
-                                    lora_path=lora_path,
-                                    max_tokens=max_tokens,
-                                    outer_request_id=outer_request_id,
-                                    stop=stop,
-                                    temperature=temperature,
-                                    top_k=top_k,
-                                    top_p=top_p,
-                                    logprobs=logprobs,
-                                    n=1,
-                                    traceparent=traceparent,
-                                )
+                        tasks[sub_id] = asyncio.create_task(
+                            self.generate(
+                                prompt_ids=prompt_ids,
+                                request_id=sub_id,
+                                lora_int_id=lora_int_id,
+                                lora_path=lora_path,
+                                max_tokens=max_tokens,
+                                outer_request_id=outer_request_id,
+                                stop=stop,
+                                temperature=temperature,
+                                top_k=top_k,
+                                top_p=top_p,
+                                logprobs=logprobs,
+                                n=1,
+                                traceparent=traceparent,
                             )
                         )
-                    outs_raw = await asyncio.gather(*tasks)
+                    try:
+                        outs_raw = await asyncio.gather(*tasks.values())
+                    except Exception:
+                        # One subrequest failed. Best-effort abort the remaining in-flight
+                        # subrequests while the outer->subrequest mapping is still present,
+                        # then await task cleanup before dropping the mapping in finally.
+                        try:
+                            await self.abort_request(request_id)
+                        except Exception:
+                            pass
+                        for task in tasks.values():
+                            if not task.done():
+                                task.cancel()
+                        await asyncio.gather(*tasks.values(), return_exceptions=True)
+                        raise
                     outs: list[dict] = []
                     for out in outs_raw:
                         assert isinstance(out, dict)
@@ -1386,127 +1429,38 @@ def _create_multinode_vllm_actor(
                 async with self._reserve_seq_slots(n_req):
                     await self._register_generate_start()
                     try:
-                        async with self._maybe_multisample_lock(n_req):
-                            async with self._lock_read():
-                                t1 = time.perf_counter()
+                        async with self._lock_read():
+                            t1 = time.perf_counter()
+                            async def _enqueue_request(*, multisample_lock_already_held: bool) -> Any:
                                 # vLLM's AsyncLLMEngine.generate() is an async generator whose
                                 # first `__anext__()` both enqueues the request (add_request)
                                 # and waits for the first engine output. Serializing that
                                 # `__anext__()` across concurrent requests destroys continuous
                                 # batching for long prompts.
                                 #
-                                # Serialize only the enqueue (add_request) call, then allow
-                                # concurrent in-flight requests to progress.
-                                if self._add_request_lock is None:
-                                    try:
-                                        collector = await self.engine.add_request(
+                                # Keep serialization scoped to the enqueue window that is known to
+                                # be unsafe. Preserve native `vllm_n`, but do not hold the
+                                # multisample-specific lock across the whole decode path.
+                                try:
+                                    async with AsyncExitStack() as stack:
+                                        if (
+                                            not multisample_lock_already_held
+                                            and n_req > 1
+                                            and self._multisample_lock is not None
+                                        ):
+                                            await stack.enter_async_context(self._maybe_multisample_lock(n_req))
+                                        if self._add_request_lock is not None:
+                                            await stack.enter_async_context(self._maybe_add_request_lock())
+                                        return await self.engine.add_request(
                                             request_id=request_id,
                                             prompt=prompt,
                                             params=sampling_params,
                                             lora_request=lora_request,
                                         )
-                                    except Exception:
-                                        _raise_serializable_vllm_error(
-                                            request_id=request_id,
-                                            where="vllm_add_request_failed",
-                                            extra={
-                                                "prompt_len": len(prompt_ids),
-                                                "max_tokens": effective_max_tokens,
-                                                "n": n_req,
-                                                "model_path": self.model_path,
-                                                "tp": self.tensor_parallel_size,
-                                                "pp": self.pipeline_parallel_size,
-                                            },
-                                        )
-                                else:
-                                    async with self._add_request_lock:
-                                        try:
-                                            collector = await self.engine.add_request(
-                                                request_id=request_id,
-                                                prompt=prompt,
-                                                params=sampling_params,
-                                                lora_request=lora_request,
-                                            )
-                                        except Exception:
-                                            _raise_serializable_vllm_error(
-                                                request_id=request_id,
-                                                where="vllm_add_request_failed",
-                                                extra={
-                                                    "prompt_len": len(prompt_ids),
-                                                    "max_tokens": effective_max_tokens,
-                                                    "n": n_req,
-                                                    "model_path": self.model_path,
-                                                    "tp": self.tensor_parallel_size,
-                                                    "pp": self.pipeline_parallel_size,
-                                                },
-                                            )
-
-                                final_res = None
-                                by_index: dict[int, Any] | None = {} if n_req > 1 else None
-                                deadline = None
-                                if self._generate_timeout_s > 0:
-                                    deadline = time.perf_counter() + self._generate_timeout_s
-                                try:
-                                    while True:
-                                        try:
-                                            if deadline is None:
-                                                remaining = None
-                                            else:
-                                                remaining = deadline - time.perf_counter()
-                                                if remaining <= 0:
-                                                    raise asyncio.TimeoutError()
-
-                                            if remaining is None:
-                                                out = collector.get_nowait() or await collector.get()
-                                            else:
-                                                out = collector.get_nowait() or await asyncio.wait_for(
-                                                    collector.get(),
-                                                    timeout=remaining,
-                                                )
-                                        except asyncio.TimeoutError as e:
-                                            try:
-                                                await self.engine.abort(request_id)
-                                            except Exception:
-                                                pass
-                                            raise RuntimeError(
-                                                f"vllm_generate_timeout_s={self._generate_timeout_s} request_id={request_id}"
-                                            ) from e
-                                        if first_tok_s is None:
-                                            first_tok_s = time.perf_counter() - t0
-                                        if by_index is not None:
-                                            for oo in out.outputs:
-                                                try:
-                                                    idx = int(getattr(oo, "index"))
-                                                except Exception:
-                                                    idx = -1
-                                                by_index[idx] = oo
-                                        final_res = out
-                                        try:
-                                            if n_req == 1:
-                                                tokens_generated = len(out.outputs[0].token_ids)
-                                            else:
-                                                lengths = [len(oo.token_ids) for oo in out.outputs]
-                                                tokens_generated = min(lengths) if lengths else 0
-                                            sub_request_id = None if outer_request_id == request_id else request_id
-                                            await self._update_progress(
-                                                outer_request_id=outer_request_id,
-                                                sub_request_id=sub_request_id,
-                                                tokens_generated=tokens_generated,
-                                                max_tokens=effective_max_tokens,
-                                            )
-                                        except Exception as e:
-                                            logger.warning(
-                                                "multinode_vllm_progress_compute_failed request_id=%s err=%s: %s",
-                                                outer_request_id,
-                                                type(e).__name__,
-                                                e,
-                                            )
-                                        if out.finished:
-                                            break
                                 except Exception:
-                                    _raise_serializable_vllm_engine_error(
+                                    _raise_serializable_vllm_error(
                                         request_id=request_id,
-                                        where="vllm_generate_collect_failed",
+                                        where="vllm_add_request_failed",
                                         extra={
                                             "prompt_len": len(prompt_ids),
                                             "max_tokens": effective_max_tokens,
@@ -1516,6 +1470,85 @@ def _create_multinode_vllm_actor(
                                             "pp": self.pipeline_parallel_size,
                                         },
                                     )
+
+                            final_res = None
+                            by_index: dict[int, Any] | None = {} if n_req > 1 else None
+                            deadline = None
+                            if self._generate_timeout_s > 0:
+                                deadline = time.perf_counter() + self._generate_timeout_s
+                            try:
+                                collector = await _enqueue_request(
+                                    multisample_lock_already_held=False,
+                                )
+                                while True:
+                                    try:
+                                        if deadline is None:
+                                            remaining = None
+                                        else:
+                                            remaining = deadline - time.perf_counter()
+                                            if remaining <= 0:
+                                                raise asyncio.TimeoutError()
+
+                                        if remaining is None:
+                                            out = collector.get_nowait() or await collector.get()
+                                        else:
+                                            out = collector.get_nowait() or await asyncio.wait_for(
+                                                collector.get(),
+                                                timeout=remaining,
+                                            )
+                                    except asyncio.TimeoutError as e:
+                                        try:
+                                            await self.engine.abort(request_id)
+                                        except Exception:
+                                            pass
+                                        raise RuntimeError(
+                                            f"vllm_generate_timeout_s={self._generate_timeout_s} request_id={request_id}"
+                                        ) from e
+                                    if first_tok_s is None:
+                                        first_tok_s = time.perf_counter() - t0
+                                    if by_index is not None:
+                                        for oo in out.outputs:
+                                            try:
+                                                idx = int(getattr(oo, "index"))
+                                            except Exception:
+                                                idx = -1
+                                            by_index[idx] = oo
+                                    final_res = out
+                                    try:
+                                        if n_req == 1:
+                                            tokens_generated = len(out.outputs[0].token_ids)
+                                        else:
+                                            lengths = [len(oo.token_ids) for oo in out.outputs]
+                                            tokens_generated = min(lengths) if lengths else 0
+                                        sub_request_id = None if outer_request_id == request_id else request_id
+                                        await self._update_progress(
+                                            outer_request_id=outer_request_id,
+                                            sub_request_id=sub_request_id,
+                                            tokens_generated=tokens_generated,
+                                            max_tokens=effective_max_tokens,
+                                        )
+                                    except Exception as e:
+                                        logger.warning(
+                                            "multinode_vllm_progress_compute_failed request_id=%s err=%s: %s",
+                                            outer_request_id,
+                                            type(e).__name__,
+                                            e,
+                                        )
+                                    if out.finished:
+                                        break
+                            except Exception:
+                                _raise_serializable_vllm_engine_error(
+                                    request_id=request_id,
+                                    where="vllm_generate_collect_failed",
+                                    extra={
+                                        "prompt_len": len(prompt_ids),
+                                        "max_tokens": effective_max_tokens,
+                                        "n": n_req,
+                                        "model_path": self.model_path,
+                                        "tp": self.tensor_parallel_size,
+                                        "pp": self.pipeline_parallel_size,
+                                    },
+                                )
                         assert final_res is not None
                     finally:
                         await self._register_generate_end()
@@ -1599,6 +1632,8 @@ def _create_multinode_vllm_actor(
                     "logprobs": log_probs,
                     "stop_reason": stop_reason,
                     "routed_experts": routed_experts,
+                    "_timing_total_s": float(t2 - t0),
+                    "_timing_first_tok_s": float(first_tok_s) if first_tok_s is not None else None,
                 }
                 if outer_request_id == request_id:
                     await self._clear_progress(outer_request_id)
@@ -1698,7 +1733,9 @@ def _create_multinode_vllm_actor(
                         "logprobs": out_log_probs,
                         "stop_reason": out_stop_reason,
                         "routed_experts": out_routed_experts,
-                    }
+                        "_timing_total_s": float(t2 - t0),
+                        "_timing_first_tok_s": float(first_tok_s) if first_tok_s is not None else None,
+                            }
                 )
 
             if non_finite_count:
@@ -2115,7 +2152,11 @@ class MultiNodeInferenceEngine:
             def _attach_existing_actor(existing_actor_handle) -> None:
                 self.engine = existing_actor_handle
                 self._initialized = True
-                from tinker_server.backend.resource_pool import get_resource_pool, ActorType
+                from tinker_server.backend.resource_pool import (
+                    ActorType,
+                    actor_observability_metadata,
+                    get_resource_pool,
+                )
 
                 resource_pool = get_resource_pool()
                 resource_pool.register(
@@ -2126,6 +2167,7 @@ class MultiNodeInferenceEngine:
                     namespace=PERSISTENT_NAMESPACE,
                     base_model=self.model_path,
                     protected=is_persistent,
+                    metadata=dict(actor_observability_metadata(self.engine) or {}),
                 )
                 resource_pool.mark_ready(self.actor_name)
 
@@ -2333,7 +2375,11 @@ class MultiNodeInferenceEngine:
             os.makedirs(self.shared_adapter_dir, exist_ok=True)
 
             # Step 1: Ensure enough GPUs are available (evict idle actors if needed)
-            from tinker_server.backend.resource_pool import get_resource_pool, ActorType
+            from tinker_server.backend.resource_pool import (
+                ActorType,
+                actor_observability_metadata,
+                get_resource_pool,
+            )
             resource_pool = get_resource_pool()
             logger.info(
                 f"Ensuring {total_required_gpus} GPUs available for multi-node vLLM "
@@ -2672,6 +2718,7 @@ class MultiNodeInferenceEngine:
                 namespace=PERSISTENT_NAMESPACE,
                 base_model=self.model_path,
                 protected=is_persistent,
+                metadata=dict(actor_observability_metadata(self.engine) or {}),
             )
             # Mark as ready since initialization completed
             resource_pool.mark_ready(self.actor_name)

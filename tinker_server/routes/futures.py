@@ -15,6 +15,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request, Response
 
 from ..auth_identity import is_admin_request
+from ..backend.future_replay import ReplayEntry, future_replay_store, should_persist_training_future
 from ..backend.future_store import FutureStatus, FutureStoreUnavailableError, future_store
 from ..futures_utils import pending_future_http_response
 from ..models.types import FutureRetrieveRequest
@@ -48,7 +49,7 @@ def _retrieve_pending_min_poll_s() -> float:
 
 
 _RECENT_MAX = int(os.environ.get("MINT_RETRIEVE_FUTURE_RECENT_MAX", "2048"))
-_RECENT: "OrderedDict[str, tuple[float, Any]]" = OrderedDict()
+_RECENT: "OrderedDict[str, tuple[float, float | None, Any]]" = OrderedDict()
 _PENDING_HINTS_MAX = int(os.environ.get("MINT_RETRIEVE_FUTURE_PENDING_MAX", "8192"))
 _PENDING_HINTS: "OrderedDict[str, float]" = OrderedDict()
 
@@ -71,9 +72,18 @@ def _apply_cached_response(cached: Any, response: Response) -> Any:
     return cached["__cached_body__"]
 
 
-def _recent_put(request_id: str, payload: Any) -> None:
+def _local_hot_ttl_s() -> float:
+    from ..config import config as server_config
+
+    try:
+        return max(0.0, float(server_config.future_replay_hot_ttl_s))
+    except Exception:
+        return 0.0
+
+
+def _recent_put(request_id: str, payload: Any, *, ttl_s: float | None = None) -> None:
     now = time.time()
-    _RECENT[request_id] = (now, payload)
+    _RECENT[request_id] = (now, ttl_s, payload)
     _RECENT.move_to_end(request_id)
     # Evict oldest first.
     while len(_RECENT) > _RECENT_MAX:
@@ -81,14 +91,22 @@ def _recent_put(request_id: str, payload: Any) -> None:
 
 
 def _recent_get(request_id: str) -> Any | None:
-    grace_s = _retrieve_grace_s()
-    if grace_s <= 0:
-        return None
     now = time.time()
     v = _RECENT.get(request_id)
     if v is None:
         return None
-    ts, payload = v
+    ts: float
+    ttl_s: float | None
+    payload: Any
+    if isinstance(v, tuple) and len(v) == 3:
+        ts, ttl_s, payload = v
+    else:
+        ts, payload = v  # type: ignore[misc]
+        ttl_s = None
+    grace_s = _retrieve_grace_s() if ttl_s is None else max(0.0, float(ttl_s))
+    if grace_s <= 0:
+        _RECENT.pop(request_id, None)
+        return None
     if (now - ts) > grace_s:
         _RECENT.pop(request_id, None)
         return None
@@ -148,6 +166,73 @@ def _is_privileged(request: Request) -> bool:
     if not server_config.auth_enabled:
         return True
     return is_admin_request(request)
+
+
+def _failed_payload(error: str | None, request: Request) -> dict[str, str]:
+    if _is_privileged(request):
+        return {"error": error, "category": "system"}
+    return {"error": _public_error(error), "category": "system"}
+
+
+def _terminal_evicted_payload(entry: ReplayEntry) -> dict[str, Any]:
+    return {
+        "error": "Known terminal future evicted",
+        "category": "system",
+        "request_id": entry.request_id,
+        "op": entry.op,
+        "done_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(entry.done_at_ts)),
+        "retrieved_at": (
+            None
+            if entry.retrieved_at_ts is None
+            else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(entry.retrieved_at_ts))
+        ),
+    }
+
+
+def _maybe_persist_terminal_replay(
+    request_id: str,
+    *,
+    final_status: str,
+    payload: Any,
+    meta: dict[str, Any] | None,
+) -> None:
+    if not isinstance(meta, dict):
+        return
+    op = meta.get("op")
+    if not should_persist_training_future(op):
+        return
+    done_at = meta.get("done_at")
+    if not isinstance(done_at, (int, float)):
+        done_at = time.time()
+    try:
+        future_replay_store().persist_terminal_payload(
+            request_id=request_id,
+            op=str(op),
+            model_id=None if meta.get("model_id") is None else str(meta.get("model_id")),
+            final_status=final_status,
+            payload=payload,
+            done_at_ts=float(done_at),
+            retrieved_at_ts=time.time(),
+        )
+    except Exception:
+        logger.exception("terminal replay persist failed: request_id=%s op=%s", request_id, op)
+
+
+def _lookup_local_terminal_replay(request_id: str, http_request: Request) -> Any | None:
+    lookup = future_replay_store().lookup(request_id)
+    if lookup.state == "miss":
+        return None
+    if lookup.state == "evicted":
+        return _terminal_evicted_payload(lookup.entry)
+    envelope = lookup.envelope or {}
+    entry = lookup.entry
+    if entry is None:
+        return None
+    payload = envelope.get("payload")
+    if entry.final_status == FutureStatus.FAILED.value:
+        error = payload if isinstance(payload, str) else str(payload)
+        return _failed_payload(error, http_request)
+    return payload
 
 
 @router.post("/retrieve_future")
@@ -277,6 +362,21 @@ async def retrieve_future(
                 ),
             )
         return payload
+
+    cached = _recent_get(body.request_id)
+    if cached is not None:
+        logger.info("[retrieve_future] request_id=%s local_cache_hit=true", body.request_id)
+        return _apply_cached_response(cached, response)
+
+    replay_payload = _lookup_local_terminal_replay(body.request_id, http_request)
+    if replay_payload is not None:
+        _pending_hint_clear(body.request_id)
+        _recent_put(body.request_id, replay_payload, ttl_s=_local_hot_ttl_s())
+        if isinstance(replay_payload, dict) and replay_payload.get("error") == "Known terminal future evicted":
+            logger.info("[retrieve_future] request_id=%s status=terminal_evicted", body.request_id)
+        else:
+            logger.info("[retrieve_future] request_id=%s replay_cache_hit=true", body.request_id)
+        return replay_payload
 
     try:
         status = await future_store.async_get_status(body.request_id)
@@ -600,18 +700,28 @@ async def retrieve_future(
         if cached is not None:
             logger.info("[retrieve_future] request_id=%s status=retrieved served=cached", body.request_id)
             return _apply_cached_response(cached, response)
+        meta = await future_store.async_get_meta(body.request_id)
         result = await future_store.async_get_result(body.request_id)
         if result is not None:
-            _recent_put(body.request_id, result)
+            _maybe_persist_terminal_replay(
+                body.request_id,
+                final_status=FutureStatus.DONE.value,
+                payload=result,
+                meta=meta,
+            )
+            _recent_put(body.request_id, result, ttl_s=_local_hot_ttl_s())
             logger.info("[retrieve_future] request_id=%s status=retrieved served=result", body.request_id)
             return result
         error = await future_store.async_get_error(body.request_id)
         if error is not None:
-            if _is_privileged(http_request):
-                payload = {"error": error, "category": "system"}
-            else:
-                payload = {"error": _public_error(error), "category": "system"}
-            _recent_put(body.request_id, payload)
+            _maybe_persist_terminal_replay(
+                body.request_id,
+                final_status=FutureStatus.FAILED.value,
+                payload=str(error),
+                meta=meta,
+            )
+            payload = _failed_payload(error, http_request)
+            _recent_put(body.request_id, payload, ttl_s=_local_hot_ttl_s())
             logger.info("[retrieve_future] request_id=%s status=retrieved served=error_payload", body.request_id)
             return payload
         logger.info("[retrieve_future] request_id=%s status=retrieved served=error", body.request_id)
@@ -619,12 +729,15 @@ async def retrieve_future(
     elif status == FutureStatus.FAILED:
         _pending_hint_clear(body.request_id)
         error = await future_store.async_get_error(body.request_id)
-        # Only expose full error details to privileged users
-        if _is_privileged(http_request):
-            payload = {"error": error, "category": "system"}
-        else:
-            payload = {"error": _public_error(error), "category": "system"}
-        _recent_put(body.request_id, payload)
+        payload = _failed_payload(error, http_request)
+        meta = await future_store.async_get_meta(body.request_id)
+        _maybe_persist_terminal_replay(
+            body.request_id,
+            final_status=FutureStatus.FAILED.value,
+            payload=str(error),
+            meta=meta,
+        )
+        _recent_put(body.request_id, payload, ttl_s=_local_hot_ttl_s())
         logger.info("[retrieve_future] request_id=%s status=failed", body.request_id)
         try:
             from ..backend.capacity_manager import capacity_manager
@@ -642,9 +755,15 @@ async def retrieve_future(
         return payload
     else:
         _pending_hint_clear(body.request_id)
-        # DONE - return the result
         result = await future_store.async_get_result(body.request_id)
-        _recent_put(body.request_id, result)
+        meta = await future_store.async_get_meta(body.request_id)
+        _maybe_persist_terminal_replay(
+            body.request_id,
+            final_status=FutureStatus.DONE.value,
+            payload=result,
+            meta=meta,
+        )
+        _recent_put(body.request_id, result, ttl_s=_local_hot_ttl_s())
         logger.info("[retrieve_future] request_id=%s status=done", body.request_id)
         try:
             from ..backend.capacity_manager import capacity_manager

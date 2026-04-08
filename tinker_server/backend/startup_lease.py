@@ -16,6 +16,13 @@ from ..config import otel_env_vars, preferred_control_plane_resources, preferred
 
 logger = logging.getLogger(__name__)
 _ACTOR_HANDLE = None
+
+def _reset_cached_actor_handle() -> None:
+    global _ACTOR_HANDLE
+    _ACTOR_HANDLE = None
+
+from ..ray_utils import register_ray_reconnect_invalidator as _register_ray_reconnect_invalidator
+_register_ray_reconnect_invalidator(_reset_cached_actor_handle)
 _PROCESS_OWNER_ID = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex}"
 
 
@@ -128,8 +135,10 @@ def _get_or_create_actor():
     except Exception:
         pass
     actor_otel_env = otel_env_vars()
-    from ..config import PFS_PYTHONPATH, actor_runtime_env
+    from ..config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources
 
+    if "resources" not in options:
+        apply_detached_actor_resources(options, ray)
     options["runtime_env"] = actor_runtime_env(
         pythonpath=PFS_PYTHONPATH,
         extra=actor_otel_env,

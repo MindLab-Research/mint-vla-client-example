@@ -289,10 +289,12 @@ class RolloutCorrectionConfig(BaseModel):
     """Session-level rollout correction policy for RL losses.
 
     This mirrors verl's canonical `policy_loss.rollout_correction` schema.
+    `rollout_is_threshold` accepts either a numeric TIS upper bound or an
+    IcePop `lower_upper` string such as `"0.5_5.0"`.
     """
 
     rollout_is: Literal["token", "sequence"] | None = None
-    rollout_is_threshold: float | None = None
+    rollout_is_threshold: str | float | None = None
     rollout_is_batch_normalize: bool | None = None
     rollout_rs: str | None = None
     rollout_rs_threshold: str | float | None = None

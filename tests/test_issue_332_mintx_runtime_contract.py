@@ -89,6 +89,7 @@ def test_issue_332_megatron_group_forward_preserves_top_level_log_probs(monkeypa
         "shape": [2],
         "dtype": "float32",
     }
+    log_probs_tensor = torch.tensor([-1.0, -2.0], dtype=torch.float32)
 
     class _RemoteForward:
         def remote(self, *args, **kwargs):
@@ -97,7 +98,7 @@ def test_issue_332_megatron_group_forward_preserves_top_level_log_probs(monkeypa
     dummy_group = types.SimpleNamespace(
         _bind_traceparent=lambda traceparent: None,
         _resolve_required_session_id=lambda session_id, op: "sess-1",
-        _ensure_session_loaded=lambda *args, **kwargs: None,
+        _ensure_session_loaded=lambda *args, **kwargs: {},
         workers=[types.SimpleNamespace(forward=_RemoteForward())],
     )
 
@@ -120,7 +121,7 @@ def test_issue_332_megatron_group_forward_preserves_top_level_log_probs(monkeypa
                         "logprobs": log_probs,
                     }
                 ],
-                "log_probs": log_probs,
+                "log_probs": log_probs_tensor,
             }
         ],
     )
@@ -131,6 +132,6 @@ def test_issue_332_megatron_group_forward_preserves_top_level_log_probs(monkeypa
         session_id="sess-1",
     )
 
-    assert result["log_probs"] == log_probs
-    assert result["metrics"]["loss:sum"] == 1.0
+    assert result["log_probs"] == {"data": [-1.0, -2.0], "shape": [2], "dtype": "torch.float32"}
+    assert "loss:sum" not in result["metrics"]
     assert result["metrics"]["loss:mean"] == 0.5

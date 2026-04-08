@@ -8,7 +8,7 @@ import time
 import uuid
 from typing import Any
 
-from ..config import PFS_PYTHONPATH, actor_runtime_env, otel_env_vars, preferred_control_plane_resources
+from ..config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources, otel_env_vars
 from ..checkpoints import (
     get_checkpoint_mirror_poll_s,
     get_checkpoint_reap_interval_s,
@@ -21,6 +21,13 @@ CURRENT_CODE_IDENTITY = os.environ.get("MINT_GIT_SHA") or _git_sha()
 
 logger = logging.getLogger(__name__)
 _ACTOR_HANDLE = None
+
+def _reset_cached_actor_handle() -> None:
+    global _ACTOR_HANDLE
+    _ACTOR_HANDLE = None
+
+from ..ray_utils import register_ray_reconnect_invalidator as _register_ray_reconnect_invalidator
+_register_ray_reconnect_invalidator(_reset_cached_actor_handle)
 
 _LOOP_FUTURE_REAPER = "future_reaper"
 _LOOP_CHECKPOINT_REAPER = "checkpoint_reaper"
@@ -56,7 +63,7 @@ def run_future_reaper_once() -> dict[str, Any]:
     from .capacity_manager import capacity_manager
     from .future_store import future_store
 
-    asyncio.run(future_store.async_ensure_ready())
+    asyncio.run(future_store.async_ensure_started())
     reaped = asyncio.run(future_store.async_reap())
     released: list[str] = []
     for rid in list(reaped.get("expired", [])) + list(reaped.get("timed_out", [])):
@@ -125,8 +132,6 @@ async def _await_ray_ref(ref: Any) -> Any:
 
 
 def _kill_named_actor(actor: Any) -> None:
-    import ray
-
     from . import ray_kill
 
     ray_kill.kill(
@@ -277,12 +282,7 @@ def _get_or_create_actor():
         "namespace": namespace,
         "lifetime": "detached",
     }
-    try:
-        resources = preferred_control_plane_resources(ray.cluster_resources())
-        if resources is not None:
-            options["resources"] = resources
-    except Exception:
-        pass
+    apply_detached_actor_resources(options, ray)
     extra_env = otel_env_vars()
     if CURRENT_CODE_IDENTITY:
         extra_env["MINT_GIT_SHA"] = str(CURRENT_CODE_IDENTITY)

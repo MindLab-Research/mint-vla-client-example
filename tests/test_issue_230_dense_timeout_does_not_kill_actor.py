@@ -68,7 +68,7 @@ def test_issue_230_timeout_does_not_kill_actor(monkeypatch: pytest.MonkeyPatch) 
     pool.unregister(actor_name)
 
 
-def test_issue_230_keepalive_marks_dense_actor_inflight(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_issue_230_keepalive_touches_dense_actor_without_inflight_mark(monkeypatch: pytest.MonkeyPatch) -> None:
     pool = get_resource_pool()
     actor_name = f"peft_trainer_test_{uuid.uuid4().hex}_maxr64"
     model_id = f"model_{uuid.uuid4().hex}"
@@ -95,6 +95,7 @@ def test_issue_230_keepalive_marks_dense_actor_inflight(monkeypatch: pytest.Monk
     )
 
     observed_inflight: list[int] = []
+    before_last_accessed = pool.get(actor_name).last_accessed
 
     def _timeout_once_then_return(*args, **kwargs):
         observed_inflight.append(pool.get(actor_name).inflight_count)
@@ -115,8 +116,9 @@ def test_issue_230_keepalive_marks_dense_actor_inflight(monkeypatch: pytest.Monk
 
     asyncio.run(_run())
 
-    assert observed_inflight[0] == 1
+    assert observed_inflight[0] == 0
     assert pool.get(actor_name).inflight_count == 0
+    assert pool.get(actor_name).last_accessed >= before_last_accessed
     assert entry.current_session == model_id
 
     pool.unregister(actor_name)

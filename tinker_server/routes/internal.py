@@ -25,6 +25,7 @@ from ..checkpoints import _iter_metadata_paths, get_persistent_search_roots, get
 from ..config import config as server_config
 from ..health_checks import deep_healthz_response
 from ..logging_context import get_otel_tracer
+from ..queue_priority import merge_queue_priority_extra
 from ..ray_cluster_health import get_ray_cluster_health_snapshot
 from ..ray_gcs_metrics import get_ray_gcs_metrics_snapshot
 from ..usage_store import get_usage_store
@@ -210,8 +211,25 @@ async def deep_health_check():
     return await deep_healthz_response()
 
 
+def _self_rss_bytes() -> int:
+    with open("/proc/self/statm", encoding="utf-8") as f:
+        parts = f.read().strip().split()
+    if len(parts) < 2:
+        raise ValueError(f"unexpected /proc/self/statm format: {parts!r}")
+    rss_pages = int(parts[1])
+    page_size = int(os.sysconf("SC_PAGE_SIZE"))
+    return rss_pages * page_size
+
+
+def _resource_pool_local_snapshot() -> list[dict]:
+    from ..backend.resource_pool import get_resource_pool
+
+    pool = get_resource_pool()
+    return pool.cached_snapshot()
+
+
 @router.get("/admission_stats")
-async def admission_stats() -> dict:
+async def admission_stats(*, include_actor_rss: bool = True) -> dict:
     from dataclasses import asdict
 
     from ..backend.api_work_queue import api_work_queue
@@ -220,19 +238,9 @@ async def admission_stats() -> dict:
     from ..backend.owner_runtime_supervisor import owner_runtime_supervisor
     from ..backend.queue_execution_runtime import queue_execution_runtime
     from ..backend.queue_supervisor import queue_supervisor
-    from ..backend.resource_pool import get_resource_pool
     from ..backend.session_heartbeat_store import session_heartbeat_store
     from ..routes import sampling as sampling_route
     from ..routes import service as service_route
-
-    def _self_rss_bytes() -> int:
-        with open("/proc/self/statm", encoding="utf-8") as f:
-            parts = f.read().strip().split()
-        if len(parts) < 2:
-            raise ValueError(f"unexpected /proc/self/statm format: {parts!r}")
-        rss_pages = int(parts[1])
-        page_size = int(os.sysconf("SC_PAGE_SIZE"))
-        return rss_pages * page_size
 
     timeout_s = 10.0
 
@@ -244,39 +252,62 @@ async def admission_stats() -> dict:
 
     q = None
     try:
-        q = await api_work_queue.stats(timeout_s=timeout_s)
+        if not include_actor_rss and hasattr(api_work_queue, "metrics_snapshot"):
+            q = api_work_queue.metrics_snapshot()
+        else:
+            q = await api_work_queue.stats(timeout_s=timeout_s)
         if not isinstance(q, dict):
-            q = {"error": f"api_work_queue.stats returned non-dict: {type(q)}"}
+            q = {"error": f"api_work_queue snapshot returned non-dict: {type(q)}"}
     except Exception as e:
         q = {"error": f"{type(e).__name__}: {e}"}
 
     fs = None
     try:
-        fs = await future_store.async_ensure_ready(timeout_s=timeout_s)
+        if not include_actor_rss and hasattr(future_store, "metrics_snapshot"):
+            fs = future_store.metrics_snapshot()
+        else:
+            fs = future_store.ensure_ready(timeout_s=timeout_s)
     except Exception as e:
         fs = {"error": f"{type(e).__name__}: {e}"}
 
     actors: dict = {}
-    try:
-        actors["capacity_manager"] = {"rss_bytes": int(await capacity_manager.async_rss_bytes(timeout_s=timeout_s))}
-    except Exception as e:
-        actors["capacity_manager"] = {"error": f"{type(e).__name__}: {e}"}
+    if include_actor_rss:
+        try:
+            actors["capacity_manager"] = {"rss_bytes": int(await capacity_manager.async_rss_bytes(timeout_s=timeout_s))}
+        except Exception as e:
+            actors["capacity_manager"] = {"error": f"{type(e).__name__}: {e}"}
 
-    try:
-        actors["api_work_queue"] = {"rss_bytes": int(await api_work_queue.rss_bytes(timeout_s=timeout_s))}
-    except Exception as e:
-        actors["api_work_queue"] = {"error": f"{type(e).__name__}: {e}"}
+        try:
+            actors["api_work_queue"] = {"rss_bytes": int(await api_work_queue.rss_bytes(timeout_s=timeout_s))}
+        except Exception as e:
+            actors["api_work_queue"] = {"error": f"{type(e).__name__}: {e}"}
 
-    try:
-        actors["future_store"] = {"rss_bytes": int(await future_store.async_rss_bytes(timeout_s=timeout_s))}
-    except Exception as e:
-        actors["future_store"] = {"error": f"{type(e).__name__}: {e}"}
+        try:
+            actors["future_store"] = {"rss_bytes": int(await future_store.async_rss_bytes(timeout_s=timeout_s))}
+        except Exception as e:
+            actors["future_store"] = {"error": f"{type(e).__name__}: {e}"}
 
-    try:
-        pool = get_resource_pool()
-        actors["resource_pool"] = pool.rss_snapshot(timeout_s=timeout_s)
-    except Exception as e:
-        actors["resource_pool"] = {"error": f"{type(e).__name__}: {e}"}
+        try:
+            from ..backend.resource_pool import get_resource_pool
+
+            pool = get_resource_pool()
+            actors["resource_pool"] = pool.rss_snapshot(timeout_s=timeout_s)
+            actors["resource_pool_metadata_cache"] = pool.metadata_cache_metrics_snapshot()
+            actors["resource_pool_lifecycle"] = pool.lifecycle_metrics_snapshot()
+        except Exception as e:
+            actors["resource_pool"] = {"error": f"{type(e).__name__}: {e}"}
+    else:
+        # Metrics scrapes must stay cheap. A single hung actor in rss_snapshot()
+        # can otherwise block the API thread and stall unrelated routes.
+        try:
+            from ..backend.resource_pool import get_resource_pool
+
+            pool = get_resource_pool()
+            actors["resource_pool"] = pool.cached_snapshot()
+            actors["resource_pool_metadata_cache"] = pool.metadata_cache_metrics_snapshot()
+            actors["resource_pool_lifecycle"] = pool.lifecycle_metrics_snapshot()
+        except Exception as e:
+            actors["resource_pool"] = {"error": f"{type(e).__name__}: {e}"}
 
     proc = {"pid": int(os.getpid())}
     try:
@@ -470,10 +501,71 @@ def _append_raw_prom_sample(
     lines.append(f"{metric_name} {_prom_format_number(num)}")
 
 
+def _scheduler_domain_base_model(scheduler_domain: object) -> str | None:
+    domain = str(scheduler_domain or "").strip()
+    if not domain or ":" not in domain:
+        return None
+    _backend, domain_key = domain.split(":", 1)
+    domain_key = domain_key.strip()
+    if not domain_key:
+        return None
+    if "::replica::" in domain_key:
+        domain_key = domain_key.split("::replica::", 1)[0].strip()
+    return domain_key or None
+
+
+def _actor_workload(actor_type: object) -> str:
+    return "sample" if str(actor_type or "").strip().lower() == "vllm" else "train"
+
+
+def _resource_pool_gpu_bindings(rec: dict[str, object]) -> list[dict[str, str]]:
+    metadata = rec.get("metadata") if isinstance(rec.get("metadata"), dict) else {}
+    actor_name = str(rec.get("actor_name") or "unknown")
+    actor_type = str(rec.get("actor_type") or "unknown")
+    workload = _actor_workload(actor_type)
+
+    bindings = metadata.get("gpu_bindings") if isinstance(metadata, dict) else None
+    if isinstance(bindings, list):
+        out: list[dict[str, str]] = []
+        for binding in bindings:
+            if not isinstance(binding, dict):
+                continue
+            gpu_index = binding.get("gpu_index")
+            if gpu_index is None:
+                continue
+            out.append(
+                {
+                    "actor_name": actor_name,
+                    "workload": workload,
+                    "hostname": str(binding.get("hostname") or metadata.get("hostname") or "unknown"),
+                    "gpu_index": str(gpu_index),
+                }
+            )
+        if out:
+            return out
+
+    gpu_indices = metadata.get("gpu_indices") if isinstance(metadata, dict) else None
+    if not isinstance(gpu_indices, list):
+        return []
+    hostname = str(metadata.get("hostname") or "unknown") if isinstance(metadata, dict) else "unknown"
+    out = []
+    for gpu_index in gpu_indices:
+        out.append(
+            {
+                "actor_name": actor_name,
+                "workload": workload,
+                "hostname": hostname,
+                "gpu_index": str(gpu_index),
+            }
+        )
+    return out
+
+
 @router.get("/metrics")
 async def metrics() -> Response:
-    stats = await admission_stats()
+    stats = await admission_stats(include_actor_rss=False)
     lines: list[str] = []
+    megatron_actor_lifecycle_counts: dict[tuple[str, str], float] = {}
 
     cap = stats.get("capacity")
     if isinstance(cap, dict):
@@ -528,13 +620,13 @@ async def metrics() -> Response:
                 _append_metric(lines, "mint_work_queue_execution_count", rec.get("count"), labels=labels)
                 _append_metric(lines, "mint_work_queue_execution_max_s", rec.get("max"), labels=labels)
 
-        _append_metric(lines, "tinker_work_queue_scheduler_arbitration_total", wq.get("scheduler_arbitration_total"))
+        _append_metric(lines, "mint_work_queue_scheduler_arbitration_total", wq.get("scheduler_arbitration_total"))
         arbitration_by_winner = wq.get("scheduler_arbitration_by_winner")
         if isinstance(arbitration_by_winner, dict):
             for winner_bucket, total in arbitration_by_winner.items():
                 _append_metric(
                     lines,
-                    "tinker_work_queue_scheduler_arbitration_total",
+                    "mint_work_queue_scheduler_arbitration_total",
                     total,
                     labels={"winner_bucket": winner_bucket},
                 )
@@ -543,7 +635,7 @@ async def metrics() -> Response:
             for decision_reason, total in arbitration_by_reason.items():
                 _append_metric(
                     lines,
-                    "tinker_work_queue_scheduler_arbitration_total",
+                    "mint_work_queue_scheduler_arbitration_total",
                     total,
                     labels={"decision_reason": decision_reason},
                 )
@@ -561,7 +653,7 @@ async def metrics() -> Response:
                     "op": rec.get("op") or "unknown",
                     "execution_scope": "local",
                 }
-                _append_metric(lines, "tinker_work_queue_scheduler_domain_dequeue_total", rec.get("total"), labels=labels)
+                _append_metric(lines, "mint_work_queue_scheduler_domain_dequeue_total", rec.get("total"), labels=labels)
 
         legacy_dequeue_stats = wq.get("legacy_dequeue_stats")
         if isinstance(legacy_dequeue_stats, list):
@@ -570,7 +662,7 @@ async def metrics() -> Response:
                     continue
                 _append_metric(
                     lines,
-                    "tinker_work_queue_legacy_dequeue_total",
+                    "mint_work_queue_legacy_dequeue_total",
                     rec.get("total"),
                     labels={
                         "reason": rec.get("reason") or "unknown",
@@ -581,6 +673,7 @@ async def metrics() -> Response:
 
         scheduler_domains = wq.get("scheduler_domains")
         if isinstance(scheduler_domains, dict):
+            sample_model_load: dict[str, dict[str, float]] = {}
             for scheduler_domain, rec in scheduler_domains.items():
                 if not isinstance(rec, dict):
                     continue
@@ -589,20 +682,45 @@ async def metrics() -> Response:
                     "backend": rec.get("backend") or str(scheduler_domain).split(":", 1)[0],
                     "execution_scope": "local",
                 }
-                _append_metric(lines, "tinker_work_queue_scheduler_domain_pending_requests", rec.get("pending_requests"), labels=labels)
-                _append_metric(lines, "tinker_work_queue_scheduler_domain_oldest_queued_s", rec.get("oldest_queued_s"), labels=labels)
-                _append_metric(lines, "tinker_work_queue_scheduler_domain_active_sessions", rec.get("active_sessions"), labels=labels)
-                _append_metric(lines, "tinker_work_queue_scheduler_domain_inflight_workers", rec.get("inflight_workers"), labels=labels)
-                _append_metric(lines, "tinker_work_queue_scheduler_domain_service_gap_s", rec.get("service_gap_s"), labels=labels)
+                _append_metric(lines, "mint_work_queue_scheduler_domain_pending_requests", rec.get("pending_requests"), labels=labels)
+                _append_metric(lines, "mint_work_queue_scheduler_domain_oldest_queued_s", rec.get("oldest_queued_s"), labels=labels)
+                _append_metric(lines, "mint_work_queue_scheduler_domain_active_sessions", rec.get("active_sessions"), labels=labels)
+                _append_metric(lines, "mint_work_queue_scheduler_domain_inflight_workers", rec.get("inflight_workers"), labels=labels)
+                _append_metric(lines, "mint_work_queue_scheduler_domain_capacity_workers", rec.get("capacity_workers"), labels=labels)
+                _append_metric(lines, "mint_work_queue_scheduler_domain_admissible", rec.get("admissible"), labels=labels)
+                _append_metric(lines, "mint_work_queue_scheduler_domain_service_gap_s", rec.get("service_gap_s"), labels=labels)
                 domain_stats = rec.get("stats")
                 if isinstance(domain_stats, dict):
                     _append_metric(
                         lines,
-                        "tinker_work_queue_scheduler_domain_dequeue_picks_total",
+                        "mint_work_queue_scheduler_domain_dequeue_picks_total",
                         domain_stats.get("picks"),
                         labels=labels,
                     )
-                    _append_metric(lines, "tinker_work_queue_scheduler_domain_starvation_picks_total", domain_stats.get("starvation_picks"), labels=labels)
+                    _append_metric(lines, "mint_work_queue_scheduler_domain_starvation_picks_total", domain_stats.get("starvation_picks"), labels=labels)
+
+                backend = str(rec.get("backend") or str(scheduler_domain).split(":", 1)[0]).strip().lower()
+                if backend != "vllm":
+                    continue
+                base_model = _scheduler_domain_base_model(scheduler_domain)
+                if not base_model:
+                    continue
+                bucket = sample_model_load.setdefault(
+                    base_model,
+                    {"pending_requests": 0.0, "inflight_workers": 0.0, "capacity_workers": 0.0},
+                )
+                bucket["pending_requests"] += float(_prom_number(rec.get("pending_requests")) or 0.0)
+                bucket["inflight_workers"] += float(_prom_number(rec.get("inflight_workers")) or 0.0)
+                bucket["capacity_workers"] += float(_prom_number(rec.get("capacity_workers")) or 0.0)
+
+            for base_model, agg in sorted(sample_model_load.items()):
+                labels = {"base_model": base_model, "workload": "sample"}
+                capacity_workers = float(agg.get("capacity_workers", 0.0))
+                load_pct = 0.0 if capacity_workers <= 0 else (100.0 * float(agg.get("inflight_workers", 0.0)) / capacity_workers)
+                _append_metric(lines, "mint_model_load_pct", load_pct, labels=labels)
+                _append_metric(lines, "mint_model_pending_requests", agg.get("pending_requests"), labels=labels)
+                _append_metric(lines, "mint_model_inflight_workers", agg.get("inflight_workers"), labels=labels)
+                _append_metric(lines, "mint_model_capacity_workers", agg.get("capacity_workers"), labels=labels)
 
     fs = stats.get("future_store")
     if isinstance(fs, dict):
@@ -689,12 +807,109 @@ async def metrics() -> Response:
                 model = str(rec.get("base_model") or "unknown")
                 actor_name = str(rec.get("actor_name") or "unknown")
                 labels = {"actor_type": actor_type, "model": model, "actor_name": actor_name}
+                metadata = rec.get("metadata") if isinstance(rec.get("metadata"), dict) else {}
                 _append_metric(lines, "mint_resource_pool_actor_idle_time_s", rec.get("idle_time"), labels=labels)
                 _append_metric(lines, "mint_resource_pool_actor_age_s", rec.get("age"), labels=labels)
                 _append_metric(lines, "mint_resource_pool_actor_rss_bytes", rec.get("rss_bytes"), labels=labels)
+                _append_metric(lines, "mint_resource_pool_actor_rss_sample_age_s", rec.get("rss_sample_age_s"), labels=labels)
+                if actor_type.strip().lower() == "vllm":
+                    vllm_labels = {"actor_name": actor_name, "base_model": model}
+                    _append_metric(
+                        lines,
+                        "mint_vllm_scheduler_waiting_requests",
+                        metadata.get("scheduler_waiting_requests"),
+                        labels=vllm_labels,
+                    )
+                    _append_metric(
+                        lines,
+                        "mint_vllm_scheduler_running_requests",
+                        metadata.get("scheduler_running_requests"),
+                        labels=vllm_labels,
+                    )
+                    _append_metric(
+                        lines,
+                        "mint_vllm_scheduler_kv_cache_usage_ratio",
+                        metadata.get("scheduler_kv_cache_usage_ratio"),
+                        labels=vllm_labels,
+                    )
+                    _append_metric(
+                        lines,
+                        "mint_vllm_prefix_cache_queries_total",
+                        metadata.get("prefix_cache_queries_total"),
+                        labels=vllm_labels,
+                    )
+                    _append_metric(
+                        lines,
+                        "mint_vllm_prefix_cache_hits_total",
+                        metadata.get("prefix_cache_hits_total"),
+                        labels=vllm_labels,
+                    )
+                    _append_metric(
+                        lines,
+                        "mint_vllm_prefix_cache_hit_ratio",
+                        metadata.get("prefix_cache_hit_ratio"),
+                        labels=vllm_labels,
+                    )
+                    _append_metric(
+                        lines,
+                        "mint_vllm_preemptions_total",
+                        metadata.get("preemptions_total"),
+                        labels=vllm_labels,
+                    )
+                    for stem in (
+                        "queue_time_s",
+                        "prefill_time_s",
+                        "decode_time_s",
+                        "time_per_output_token_s",
+                    ):
+                        _append_metric(lines, f"mint_vllm_{stem}_sum", metadata.get(f"{stem}_total"), labels=vllm_labels)
+                        _append_metric(lines, f"mint_vllm_{stem}_count", metadata.get(f"{stem}_count"), labels=vllm_labels)
+                        _append_metric(lines, f"mint_vllm_{stem}_max", metadata.get(f"{stem}_max"), labels=vllm_labels)
+                elif actor_type.strip().lower() == "megatron":
+                    megatron_labels = {"actor_name": actor_name, "base_model": model}
+                    for stem in (
+                        "active_sessions",
+                        "session_unknown",
+                        "session_step",
+                        "learning_rate",
+                        "gpu_memory_allocated_bytes",
+                        "gpu_memory_reserved_bytes",
+                        "gpu_memory_fragmentation_bytes",
+                    ):
+                        _append_metric(lines, f"mint_megatron_{stem}", metadata.get(stem), labels=megatron_labels)
+                for binding in _resource_pool_gpu_bindings(rec):
+                    _append_metric(lines, "mint_resource_pool_actor_gpu_binding", 1, labels=binding)
 
-                bucket = grouped.setdefault((actor_type, model), {"count": 0.0, "rss_sum": 0.0, "max_idle": 0.0, "max_age": 0.0})
+                rss_state = str(rec.get("rss_cache_state") or "").strip().lower()
+                if rss_state not in {"fresh", "stale", "unknown"}:
+                    if _prom_number(rec.get("rss_bytes")) is not None:
+                        rss_state = "fresh"
+                    elif rec.get("rss_sample_age_s") is not None or rec.get("rss_sample_source") is not None:
+                        rss_state = "stale"
+                    else:
+                        rss_state = "unknown"
+                _append_metric(
+                    lines,
+                    "mint_resource_pool_actor_rss_cache_state",
+                    1,
+                    labels={**labels, "state": rss_state},
+                )
+
+                bucket = grouped.setdefault(
+                    (actor_type, model),
+                    {
+                        "count": 0.0,
+                        "rss_sum": 0.0,
+                        "rss_count": 0.0,
+                        "rss_fresh": 0.0,
+                        "rss_stale": 0.0,
+                        "rss_unknown": 0.0,
+                        "max_idle": 0.0,
+                        "max_age": 0.0,
+                    },
+                )
                 bucket["count"] += 1.0
+                bucket[f"rss_{rss_state}"] += 1.0
                 idle = _prom_number(rec.get("idle_time"))
                 if idle is not None and idle > bucket["max_idle"]:
                     bucket["max_idle"] = idle
@@ -704,13 +919,65 @@ async def metrics() -> Response:
                 rss = _prom_number(rec.get("rss_bytes"))
                 if rss is not None:
                     bucket["rss_sum"] += rss
+                    bucket["rss_count"] += 1.0
 
             for (actor_type, model), agg in grouped.items():
                 labels = {"actor_type": actor_type, "model": model}
                 _append_metric(lines, "mint_resource_pool_actors", agg["count"], labels=labels)
-                _append_metric(lines, "mint_resource_pool_group_rss_bytes", agg["rss_sum"], labels=labels)
                 _append_metric(lines, "mint_resource_pool_group_oldest_idle_time_s", agg["max_idle"], labels=labels)
                 _append_metric(lines, "mint_resource_pool_group_oldest_age_s", agg["max_age"], labels=labels)
+                if agg.get("rss_count", 0.0) > 0.0:
+                    _append_metric(lines, "mint_resource_pool_group_rss_bytes", agg["rss_sum"], labels=labels)
+                for state in ("fresh", "stale", "unknown"):
+                    key = f"rss_{state}"
+                    if agg.get(key, 0.0) > 0.0:
+                        _append_metric(
+                            lines,
+                            "mint_resource_pool_group_rss_cache_samples",
+                            agg[key],
+                            labels={**labels, "state": state},
+                        )
+
+        resource_pool_metadata_cache = actors.get("resource_pool_metadata_cache")
+        if isinstance(resource_pool_metadata_cache, list):
+            for row in resource_pool_metadata_cache:
+                if not isinstance(row, dict):
+                    continue
+                labels = {"actor_type": row.get("actor_type") or "unknown"}
+                _append_metric(
+                    lines,
+                    "mint_resource_pool_observability_cache_hits_total",
+                    row.get("cache_hits_total"),
+                    labels=labels,
+                )
+                _append_metric(
+                    lines,
+                    "mint_resource_pool_observability_cache_stale_total",
+                    row.get("cache_stale_total"),
+                    labels=labels,
+                )
+                _append_metric(
+                    lines,
+                    "mint_resource_pool_observability_refresh_success_total",
+                    row.get("refresh_success_total"),
+                    labels=labels,
+                )
+                _append_metric(
+                    lines,
+                    "mint_resource_pool_observability_refresh_failures_total",
+                    row.get("refresh_failures_total"),
+                    labels=labels,
+                )
+
+        resource_pool_lifecycle = actors.get("resource_pool_lifecycle")
+        if isinstance(resource_pool_lifecycle, list):
+            for row in resource_pool_lifecycle:
+                if not isinstance(row, dict):
+                    continue
+                key = (str(row.get("base_model") or "unknown"), str(row.get("event") or "unknown"))
+                megatron_actor_lifecycle_counts[key] = float(megatron_actor_lifecycle_counts.get(key, 0.0)) + float(
+                    row.get("count") or 0.0
+                )
 
     proc = stats.get("process")
     if isinstance(proc, dict):
@@ -750,6 +1017,105 @@ async def metrics() -> Response:
             lines,
             "mint_driver_sampling_sessions_inflight",
             driver_state.get("sampling_sessions_inflight"),
+        )
+
+    queue_execution = stats.get("queue_execution_runtime")
+    if isinstance(queue_execution, dict):
+        sampling_sessions = queue_execution.get("sampling_sessions")
+        if isinstance(sampling_sessions, dict):
+            _append_metric(lines, "mint_sampling_sessions_total", sampling_sessions.get("sampling_sessions_total"))
+            _append_metric(lines, "mint_sampling_sessions_inflight", sampling_sessions.get("sampling_sessions_inflight"))
+            _append_metric(lines, "mint_sampling_sessions_lora_loaded_total", sampling_sessions.get("sampling_sessions_lora_loaded"))
+            by_model = sampling_sessions.get("sampling_sessions_by_model")
+            if isinstance(by_model, list):
+                for row in by_model:
+                    if not isinstance(row, dict):
+                        continue
+                    labels = {"base_model": row.get("base_model") or "unknown"}
+                    _append_metric(lines, "mint_sampling_sessions_by_model", row.get("total"), labels=labels)
+                    _append_metric(lines, "mint_sampling_sessions_inflight_by_model", row.get("inflight"), labels=labels)
+                    _append_metric(lines, "mint_sampling_sessions_lora_loaded_by_model", row.get("lora_loaded"), labels=labels)
+
+        training_sessions = queue_execution.get("training_sessions")
+        if isinstance(training_sessions, dict):
+            _append_metric(lines, "mint_training_sessions_total", training_sessions.get("training_sessions_total"))
+            _append_metric(lines, "mint_training_sessions_active", training_sessions.get("training_sessions_active"))
+            _append_metric(lines, "mint_training_sessions_inflight", training_sessions.get("training_sessions_inflight"))
+            by_model = training_sessions.get("training_sessions_by_model")
+            if isinstance(by_model, list):
+                for row in by_model:
+                    if not isinstance(row, dict):
+                        continue
+                    labels = {
+                        "base_model": row.get("base_model") or "unknown",
+                        "backend": row.get("backend") or "unknown",
+                    }
+                    _append_metric(lines, "mint_training_sessions_by_model", row.get("total"), labels=labels)
+                    _append_metric(lines, "mint_training_sessions_active_by_model", row.get("active"), labels=labels)
+                    _append_metric(lines, "mint_training_sessions_inflight_by_model", row.get("inflight"), labels=labels)
+
+        runtime_observability = queue_execution.get("runtime_observability")
+        if isinstance(runtime_observability, dict):
+            megatron_switch_failures = runtime_observability.get("megatron_session_switch_failures")
+            if isinstance(megatron_switch_failures, list):
+                for row in megatron_switch_failures:
+                    if not isinstance(row, dict):
+                        continue
+                    labels = {
+                        "base_model": row.get("base_model") or "unknown",
+                        "reason": row.get("reason") or "unknown",
+                    }
+                    _append_metric(lines, "mint_megatron_session_switch_failures_total", row.get("count"), labels=labels)
+
+            megatron_actor_lifecycle = runtime_observability.get("megatron_actor_lifecycle")
+            if isinstance(megatron_actor_lifecycle, list):
+                for row in megatron_actor_lifecycle:
+                    if not isinstance(row, dict):
+                        continue
+                    key = (str(row.get("base_model") or "unknown"), str(row.get("event") or "unknown"))
+                    megatron_actor_lifecycle_counts[key] = float(megatron_actor_lifecycle_counts.get(key, 0.0)) + float(
+                        row.get("count") or 0.0
+                    )
+
+            vllm_workload = runtime_observability.get("vllm_workload")
+            if isinstance(vllm_workload, list):
+                for row in vllm_workload:
+                    if not isinstance(row, dict):
+                        continue
+                    labels = {
+                        "actor_name": row.get("actor_name") or "unknown",
+                        "base_model": row.get("base_model") or "unknown",
+                        "op": row.get("op") or "unknown",
+                        "status": row.get("status") or "unknown",
+                    }
+                    _append_metric(lines, "mint_vllm_workload_requests_total", row.get("requests_total"), labels=labels)
+                    _append_metric(lines, "mint_vllm_workload_prompt_tokens_total", row.get("prompt_tokens_total"), labels=labels)
+                    _append_metric(lines, "mint_vllm_workload_generated_tokens_total", row.get("generated_tokens_total"), labels=labels)
+                    _append_metric(lines, "mint_vllm_workload_ttft_s_sum", row.get("ttft_s_total"), labels=labels)
+                    _append_metric(lines, "mint_vllm_workload_ttft_s_count", row.get("ttft_s_count"), labels=labels)
+                    _append_metric(lines, "mint_vllm_workload_ttft_s_max", row.get("ttft_s_max"), labels=labels)
+                    _append_metric(lines, "mint_vllm_workload_tpot_s_sum", row.get("tpot_s_total"), labels=labels)
+                    _append_metric(lines, "mint_vllm_workload_tpot_s_count", row.get("tpot_s_count"), labels=labels)
+                    _append_metric(lines, "mint_vllm_workload_tpot_s_max", row.get("tpot_s_max"), labels=labels)
+
+            vllm_active = runtime_observability.get("vllm_active_requests")
+            if isinstance(vllm_active, list):
+                for row in vllm_active:
+                    if not isinstance(row, dict):
+                        continue
+                    labels = {
+                        "actor_name": row.get("actor_name") or "unknown",
+                        "base_model": row.get("base_model") or "unknown",
+                        "op": row.get("op") or "unknown",
+                    }
+                    _append_metric(lines, "mint_vllm_workload_active_requests", row.get("active_requests"), labels=labels)
+
+    for (base_model, event), count in sorted(megatron_actor_lifecycle_counts.items()):
+        _append_metric(
+            lines,
+            "mint_megatron_actor_lifecycle_events_total",
+            count,
+            labels={"base_model": base_model, "event": event},
         )
 
     ray_cluster = stats.get("ray_cluster")
@@ -799,6 +1165,9 @@ async def metrics() -> Response:
                 named_actors.get("namespace"),
             )
 
+        _append_metric(lines, "mint_ray_cluster_last_success_unixtime", ray_cluster.get("last_success_unixtime"))
+        _append_metric(lines, "mint_ray_cluster_last_success_age_s", ray_cluster.get("last_success_age_s"))
+
         probes = ray_cluster.get("probes")
         if isinstance(probes, dict):
             for probe_name, probe in probes.items():
@@ -831,6 +1200,16 @@ async def metrics() -> Response:
             "mint_ray_gcs_metrics_bridge_cache_age_s",
             ray_gcs_metrics.get("cache_age_s"),
         )
+        _append_metric(
+            lines,
+            "mint_ray_gcs_metrics_bridge_last_success_unixtime",
+            ray_gcs_metrics.get("last_success_unixtime"),
+        )
+        _append_metric(
+            lines,
+            "mint_ray_gcs_metrics_bridge_last_success_age_s",
+            ray_gcs_metrics.get("last_success_age_s"),
+        )
 
         derived = ray_gcs_metrics.get("derived")
         if isinstance(derived, dict):
@@ -857,7 +1236,7 @@ async def metrics() -> Response:
 
 
 @router.post("/work_queue/noop")
-async def work_queue_noop() -> dict:
+async def work_queue_noop(http_request: Request) -> dict:
     from ..backend.api_work_queue import api_work_queue
     from ..backend.capacity_manager import capacity_manager
     from ..backend.future_store import future_store
@@ -892,7 +1271,7 @@ async def work_queue_noop() -> dict:
                 request_json=request_json,
                 user_id=None,
                 webhook_url=None,
-                extra={"ts": float(time.time())},
+                extra=merge_queue_priority_extra({"ts": float(time.time())}, request=http_request),
             ),
         )
     except Exception as e:
@@ -909,6 +1288,24 @@ async def work_queue_debug_state() -> dict:
     from ..backend.api_work_queue import api_work_queue
 
     return await api_work_queue.debug_state(timeout_s=10.0)
+
+
+@router.get("/debug/scheduler_decisions")
+async def scheduler_decisions_debug(
+    limit: int = Query(default=100, ge=1, le=5000),
+    scheduler_domain: str | None = None,
+    reason: str | None = None,
+    since_seq: int | None = Query(default=None, ge=0),
+) -> dict:
+    from ..backend.api_work_queue import api_work_queue
+
+    return await api_work_queue.scheduler_decisions(
+        limit=int(limit),
+        scheduler_domain=scheduler_domain,
+        reason=reason,
+        since_seq=since_seq,
+        timeout_s=10.0,
+    )
 
 
 # =============================================================================

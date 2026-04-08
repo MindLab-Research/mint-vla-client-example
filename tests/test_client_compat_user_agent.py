@@ -1,3 +1,5 @@
+import pytest
+
 from tinker_server.client_compat import checkpoint_uri, is_tinker_sdk_user_agent
 
 
@@ -31,6 +33,5 @@ def test_checkpoint_uri_scheme():
         == "mint://run-1/sampler_weights/0000"
     )
 
-    # Legacy fallback when checkpoint type is unknown.
-    assert checkpoint_uri("run-1", "0000", prefer_tinker=True) == "tinker://run-1/0000"
-    assert checkpoint_uri("run-1", "0000", prefer_tinker=False) == "mint://run-1/0000"
+    with pytest.raises(ValueError, match="Unsupported checkpoint_type"):
+        checkpoint_uri("run-1", "0000", prefer_tinker=True, checkpoint_type="legacy")

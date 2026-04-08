@@ -205,12 +205,6 @@ def _get_or_create_ray_actor():
             self._object_store_released.discard(request_id)
             return {"ok": True}
 
-    resources = None
-    try:
-        resources = preferred_control_plane_resources(ray.cluster_resources())
-    except Exception:
-        resources = None
-
     options: dict[str, Any] = {
         "name": actor_name,
         "namespace": _ray_namespace(),
@@ -220,22 +214,27 @@ def _get_or_create_ray_actor():
         "max_task_retries": -1,
     }
     actor_otel_env = otel_env_vars()
-    from ..config import PFS_PYTHONPATH, actor_runtime_env_vars
+    from ..config import PFS_PYTHONPATH, actor_runtime_env_vars, apply_detached_actor_resources
+    apply_detached_actor_resources(options, ray)
     options["runtime_env"] = {
         "env_vars": actor_runtime_env_vars(
             pythonpath=PFS_PYTHONPATH,
             extra=actor_otel_env,
         )
     }
-    if resources is not None:
-        options["resources"] = resources
 
     try:
-        return _RayCapacityManagerActor.options(  # type: ignore[attr-defined]
+        created = _RayCapacityManagerActor.options(  # type: ignore[attr-defined]
             **options
         ).remote(queue_bytes_budget=queue_bytes_budget)
     except Exception:
         # Race: another request may have created the detached actor first.
+        return ray.get_actor(actor_name, namespace=_ray_namespace())
+
+    try:
+        ray.get(created.snapshot.remote(), timeout=1.0)
+        return created
+    except Exception:
         return ray.get_actor(actor_name, namespace=_ray_namespace())
 
 
@@ -243,6 +242,9 @@ class CapacityManager:
     def __init__(self) -> None:
         self._ray_actor = None
         self._ray_actor_lock = threading.Lock()
+        from ..ray_utils import register_ray_reconnect_invalidator
+
+        register_ray_reconnect_invalidator(self._reset_ray_actor)
 
     def _reset_ray_actor(self, actor: Any | None = None) -> None:
         with self._ray_actor_lock:
@@ -255,14 +257,26 @@ class CapacityManager:
         except Exception as e:
             raise CapacityManagerUnavailableError("Ray import failed") from e
 
+        try:
+            from ..ray_utils import init_ray
+
+            init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
+        except Exception as e:
+            raise CapacityManagerUnavailableError("Ray not initialized (init_ray failed)") from e
         if not ray.is_initialized():
             raise CapacityManagerUnavailableError("Ray not initialized")
 
         actor = self._ray_actor
         if actor is None:
-            raise CapacityManagerUnavailableError(
-                "Detached Ray CapacityManager actor is not ready on this API server"
-            )
+            with self._ray_actor_lock:
+                if self._ray_actor is None:
+                    try:
+                        self._ray_actor = _get_or_create_ray_actor()
+                    except Exception as e:
+                        raise CapacityManagerUnavailableError(
+                            "Failed to get/create detached Ray CapacityManager actor"
+                        ) from e
+                actor = self._ray_actor
         return actor
 
     async def _get_ray_actor_async(self):
@@ -271,14 +285,12 @@ class CapacityManager:
         except Exception as e:
             raise CapacityManagerUnavailableError("Ray import failed") from e
 
-        if not ray.is_initialized():
-            try:
-                from ..ray_utils import init_ray
+        try:
+            from ..ray_utils import init_ray
 
-                init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
-            except Exception as e:
-                raise CapacityManagerUnavailableError("Ray not initialized (init_ray failed)") from e
-
+            init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
+        except Exception as e:
+            raise CapacityManagerUnavailableError("Ray not initialized (init_ray failed)") from e
         if not ray.is_initialized():
             raise CapacityManagerUnavailableError("Ray not initialized")
 
@@ -298,17 +310,42 @@ class CapacityManager:
     async def _async_with_actor_retry(self, fn, *, err_msg: str):
         import ray
 
-        actor = self._get_cached_ray_actor_for_async_request_path()
+        actor_died_errors = tuple(
+            err
+            for err in (
+                getattr(ray.exceptions, "ActorDiedError", None),
+                getattr(ray.exceptions, "RayActorError", None),
+            )
+            if isinstance(err, type) and issubclass(err, BaseException)
+        )
+
+        try:
+            actor = self._get_cached_ray_actor_for_async_request_path()
+        except CapacityManagerUnavailableError:
+            actor = await self._get_ray_actor_async()
+
         try:
             return await fn(actor)
-        except (ray.exceptions.ActorDiedError, ray.exceptions.RayActorError):
+        except actor_died_errors as e:
             self._reset_ray_actor(actor)
-            actor = await self._get_ray_actor_async()
-            try:
-                return await fn(actor)
-            except (ray.exceptions.ActorDiedError, ray.exceptions.RayActorError) as retry_e:
-                self._reset_ray_actor(actor)
-                raise CapacityManagerUnavailableError(err_msg) from retry_e
+            raise CapacityManagerUnavailableError(err_msg) from e
+
+    def _run_coro_sync_best_effort(self, coro: Any) -> Any:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(coro)
+        loop.create_task(coro)
+        return None
+
+    def release_queue(self, request_id: str) -> None:
+        self._run_coro_sync_best_effort(self.async_release_queue(request_id))
+
+    def release_object_store(self, request_id: str) -> None:
+        self._run_coro_sync_best_effort(self.async_release_object_store(request_id))
+
+    def release_all(self, request_id: str) -> None:
+        self._run_coro_sync_best_effort(self.async_release_all(request_id))
 
     async def async_ensure_ready(self, *, timeout_s: float = 10.0) -> CapacitySnapshot:
         actor = await self._get_ray_actor_async()

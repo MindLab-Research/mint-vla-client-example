@@ -224,7 +224,7 @@ def test_issue_283_create_model_from_state_background_uses_resolved_path(tmp_pat
         def __init__(self) -> None:
             self.resolved: list[tuple[str, dict]] = []
 
-        def resolve(self, request_id: str, payload: dict) -> None:
+        async def async_resolve(self, request_id: str, payload: dict) -> None:
             self.resolved.append((request_id, payload))
 
         async def async_fail(self, request_id: str, error: str) -> None:
@@ -549,7 +549,7 @@ def test_issue_283_load_state_background_uses_resolved_path(tmp_path: Path, monk
         def __init__(self) -> None:
             self.resolved: list[tuple[str, dict]] = []
 
-        def resolve(self, request_id: str, payload: dict) -> None:
+        async def async_resolve(self, request_id: str, payload: dict) -> None:
             self.resolved.append((request_id, payload))
 
         async def async_fail(self, request_id: str, error: str) -> None:
