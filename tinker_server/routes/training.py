@@ -2955,7 +2955,6 @@ async def _do_save_weights_for_sampler(
                 user_id=None if is_admin else user_id,
                 model_id=session.model_id,
                 checkpoint_name=checkpoint_name,
-                checkpoint_type="sampler",
             )
 
         from ..client_compat import checkpoint_uri

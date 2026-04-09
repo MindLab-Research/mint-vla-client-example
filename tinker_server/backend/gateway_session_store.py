@@ -204,9 +204,21 @@ async def _call_actor_for_async_request_path(remote_call):
         return await _await_ray_ref(remote_call(actor))
 
 
+def _gateway_store_enabled() -> bool:
+    try:
+        from ..gateway import get_gateway_config
+
+        cfg = get_gateway_config()
+    except Exception:
+        return False
+    return bool(cfg is not None and cfg.model_to_upstream)
+
+
 def ensure_ready() -> None:
     import ray
 
+    if not _gateway_store_enabled():
+        return
     if not ray.is_initialized():
         raise RuntimeError("Ray not initialized")
     actor = _get_or_create_actor()

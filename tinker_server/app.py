@@ -575,6 +575,8 @@ async def lifespan(app: FastAPI):
         startup_lease.owner_id,
     )
 
+    owner_runtime_local_only = os.environ.get("MINT_OWNER_RUNTIME_SUPERVISOR_LOCAL_ONLY", "").strip().lower() in {"1", "true", "yes", "on"}
+
     if startup_owner:
         await future_store.async_ensure_started()
         ensure_gateway_session_store_ready()
@@ -585,7 +587,10 @@ async def lifespan(app: FastAPI):
         from .backend.future_replay import ensure_future_replay_sweeper
 
         ensure_future_replay_sweeper()
-    owner_runtime = await owner_runtime_supervisor.async_ensure_started()
+    if owner_runtime_local_only:
+        owner_runtime = {"actor_name": "local_owner_runtime_supervisor", "epoch_id": "local"}
+    else:
+        owner_runtime = await owner_runtime_supervisor.async_ensure_started()
 
     try:
         from .backend.dense_session_state import cleanup_legacy_dense_session_state_once
@@ -669,7 +674,11 @@ async def lifespan(app: FastAPI):
                 )
             await asyncio.sleep(5.0)
 
-    owner_runtime_health_task = asyncio.create_task(_owner_runtime_health_loop())
+    if owner_runtime_local_only:
+        clear_runtime_degraded_state()
+        owner_runtime_health_task = None
+    else:
+        owner_runtime_health_task = asyncio.create_task(_owner_runtime_health_loop())
     ray_reconnect_watch_task: asyncio.Task | None = None
     last_ray_connection_epoch = ray_connection_epoch()
 
@@ -683,7 +692,12 @@ async def lifespan(app: FastAPI):
         # Cleanup: Kill stale actors from previous server runs
         # ==========================================================================
         if startup_owner:
-            await owner_runtime_supervisor.async_run_once("actor_reconciliation", timeout_s=60.0)
+            if owner_runtime_local_only:
+                from .backend.actor_reconciliation import cleanup_stale_actors_once
+
+                await asyncio.to_thread(cleanup_stale_actors_once)
+            else:
+                await owner_runtime_supervisor.async_run_once("actor_reconciliation", timeout_s=60.0)
         else:
             logger.info("Skipping stale-actor cleanup on follower worker")
 
@@ -745,9 +759,22 @@ async def lifespan(app: FastAPI):
         from .backend.capacity_manager import capacity_manager
         from .backend.queue_execution_runtime import queue_execution_runtime
 
-        await capacity_manager.async_ensure_ready()
+        await capacity_manager.async_ensure_ready(timeout_s=180.0)
         await api_work_queue.async_ensure_started()
-        await queue_execution_runtime.async_ensure_started(num_workers=int(config.api_work_queue_num_workers))
+        if os.environ.get("MINT_QUEUE_EXECUTION_RUNTIME_LOCAL_ONLY", "").strip().lower() in {"1", "true", "yes", "on"}:
+            from .backend.api_work_queue_dispatch import register_api_work_queue_executors
+            from .backend.queue_execution_runtime import _initialize_execution_bindings
+
+            logger.warning(
+                "Using local queue execution runtime fallback in API process "
+                "(MINT_QUEUE_EXECUTION_RUNTIME_LOCAL_ONLY=1)"
+            )
+            await _initialize_execution_bindings()
+            register_api_work_queue_executors(api_work_queue)
+            await api_work_queue.start_workers(num_workers=int(config.api_work_queue_num_workers))
+            await api_work_queue.wait_until_execution_ready(timeout_s=120.0)
+        else:
+            await queue_execution_runtime.async_ensure_started(num_workers=int(config.api_work_queue_num_workers))
 
         async def _ray_reconnect_watch_loop() -> None:
             nonlocal last_ray_connection_epoch

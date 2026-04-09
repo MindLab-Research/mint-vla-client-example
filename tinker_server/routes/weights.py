@@ -829,7 +829,6 @@ async def _do_save_state(
             user_id=user_id,
             model_id=session.model_id,
             checkpoint_name=checkpoint_name,
-            checkpoint_type="training",
         )
 
         # Sampling engines load checkpoints on demand via checkpoint_uri/create_sampling_session.
@@ -1003,7 +1002,6 @@ async def _do_save_weights(
             user_id=user_id,
             model_id=session.model_id,
             checkpoint_name=checkpoint_name,
-            checkpoint_type="sampler",
         )
 
         # Keep save_weights completion scoped to checkpoint export + metadata publication.

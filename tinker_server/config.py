@@ -201,6 +201,7 @@ def actor_runtime_env_vars(*, pythonpath: str, extra: dict[str, str] | None = No
         "TINKER_RUNTIME_CHECKPOINT_DIR",
         "TINKER_LEGACY_DENSE_SESSION_STATE_ROOTS",
         "MINT_DETACHED_ACTOR_NODE_IP",
+        "MINT_RAY_HEAD_ADDRESS_PATH",
     ):
         value = _env_nonempty(os.environ, key)
         if value is not None:

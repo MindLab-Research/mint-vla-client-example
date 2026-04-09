@@ -977,6 +977,38 @@ class MegatronRankWorker:
         logger.debug(f"[Rank {self.rank}] Captured optimizer state for {len(state_dict)} optimizers")
         return state_dict
 
+    def _capture_lr_scheduler_state(self) -> dict:
+        """Capture lr scheduler state to a CPU-serializable dict.
+
+        Unlike optimizer state, most scheduler state is already non-tensor metadata.
+        We still normalize tensors onto CPU for safety.
+        """
+        import torch
+
+        lr_scheduler = getattr(self.engine, "lr_scheduler", None)
+        if lr_scheduler is None or not hasattr(lr_scheduler, "state_dict"):
+            return {}
+        try:
+            state = lr_scheduler.state_dict()
+        except Exception as e:
+            logger.warning(f"[Rank {self.rank}] Failed to capture lr_scheduler state: {e}")
+            return {}
+
+        def _to_cpu(value):
+            if isinstance(value, torch.Tensor):
+                return value.detach().cpu().clone()
+            if isinstance(value, dict):
+                return {k: _to_cpu(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [_to_cpu(v) for v in value]
+            if isinstance(value, tuple):
+                return tuple(_to_cpu(v) for v in value)
+            return value
+
+        normalized = _to_cpu(state if isinstance(state, dict) else {})
+        logger.debug(f"[Rank {self.rank}] Captured lr_scheduler state")
+        return normalized if isinstance(normalized, dict) else {}
+
     def _restore_optimizer_state(self, state_dict: dict) -> None:
         """Restore optimizer state from CPU.
 
@@ -1053,6 +1085,35 @@ class MegatronRankWorker:
                             pg[k] = v
 
         logger.debug(f"[Rank {self.rank}] Restored optimizer state (cleared first)")
+
+    def _restore_lr_scheduler_state(self, state_dict: dict) -> None:
+        """Restore lr scheduler state for a session.
+
+        Best-effort: if no scheduler exists, rebuild one when possible. If no state is
+        provided, keep the freshly reset/rebuilt scheduler.
+        """
+        lr_scheduler = getattr(self.engine, "lr_scheduler", None)
+        if lr_scheduler is None and hasattr(self.engine, "_build_lr_scheduler"):
+            try:
+                self.engine.lr_scheduler = self.engine._build_lr_scheduler()
+                lr_scheduler = self.engine.lr_scheduler
+                for attr_name in ("checkpoint_mananager", "checkpoint_manager"):
+                    manager = getattr(self.engine, attr_name, None)
+                    if manager is not None and hasattr(manager, "optimizer_scheduler"):
+                        manager.optimizer_scheduler = lr_scheduler
+            except Exception as e:
+                logger.warning(f"[Rank {self.rank}] Failed to rebuild lr_scheduler for restore: {e}")
+                return
+
+        if lr_scheduler is None or not hasattr(lr_scheduler, "load_state_dict"):
+            return
+        if not state_dict:
+            return
+        try:
+            lr_scheduler.load_state_dict(state_dict)
+            logger.debug(f"[Rank {self.rank}] Restored lr_scheduler state")
+        except Exception as e:
+            logger.warning(f"[Rank {self.rank}] Failed to restore lr_scheduler state: {e}")
 
     def _reset_optimizer_state(self) -> None:
         """Reset optimizer state (momentum, variance) for a new session.

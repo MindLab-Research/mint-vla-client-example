@@ -52,6 +52,8 @@ def _awaitable(ref: Any) -> Any:
 def _get_or_create_actor():
     import ray
 
+    from ..ray_utils import force_reconnect_ray, is_wrong_cluster_error
+
     global _ACTOR_HANDLE
     name = _actor_name()
     namespace = _ray_namespace()
@@ -60,6 +62,12 @@ def _get_or_create_actor():
         return _ACTOR_HANDLE
     except ValueError:
         pass
+    except Exception as e:
+        if is_wrong_cluster_error(e):
+            force_reconnect_ray(namespace=namespace)
+            _ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)
+            return _ACTOR_HANDLE
+        raise
 
     @ray.remote(num_cpus=0)
     class _RaySessionHeartbeatStore:
@@ -127,7 +135,16 @@ def _get_or_create_actor():
         except Exception:
             _ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)
         return _ACTOR_HANDLE
-    except Exception:
+    except Exception as e:
+        if is_wrong_cluster_error(e):
+            force_reconnect_ray(namespace=namespace)
+            created = _RaySessionHeartbeatStore.options(**options).remote()
+            try:
+                ray.get(created.size.remote())
+                _ACTOR_HANDLE = created
+            except Exception:
+                _ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)
+            return _ACTOR_HANDLE
         _ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)
         return _ACTOR_HANDLE
 
