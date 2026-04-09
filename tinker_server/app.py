@@ -140,6 +140,21 @@ async def _shutdown_local_training_runtime(train_manager) -> None:
         except Exception as e:
             logger.warning("Local training runtime shutdown failed model=%s: %s", model_id, e)
 
+
+def _clear_local_execution_route_globals() -> None:
+    from .routes import mint, sampling, service, training, weights
+
+    service.session_manager = None
+    sampling.session_manager = None
+    training.training_manager = None
+    training.training_engine = None
+    training.inference_manager = None
+    mint.training_manager = None
+    mint.training_engine = None
+    weights.training_manager = None
+    weights.training_engine = None
+    weights.inference_manager = None
+
 async def _prewarm_persistent_models(
     train_engine: VerlTrainingEngine | None,
     multi_model_manager: MultiModelInferenceManager | None,
@@ -769,7 +784,10 @@ async def lifespan(app: FastAPI):
                 "Using local queue execution runtime fallback in API process "
                 "(MINT_QUEUE_EXECUTION_RUNTIME_LOCAL_ONLY=1)"
             )
-            await _initialize_execution_bindings()
+            bindings = await _initialize_execution_bindings()
+            inference_manager = bindings.get("inference_manager")
+            train_manager = bindings.get("train_manager")
+            multi_model_manager = bindings.get("multi_model_manager")
             register_api_work_queue_executors(api_work_queue)
             await api_work_queue.start_workers(num_workers=int(config.api_work_queue_num_workers))
             await api_work_queue.wait_until_execution_ready(timeout_s=120.0)
@@ -819,6 +837,7 @@ async def lifespan(app: FastAPI):
             await _shutdown_local_inference_runtime(inference_manager)
         if multi_model_manager is not None:
             await multi_model_manager.shutdown_all()
+        _clear_local_execution_route_globals()
         raise
 
     yield
@@ -844,6 +863,7 @@ async def lifespan(app: FastAPI):
     if multi_model_manager is not None:
         await multi_model_manager.shutdown_all()
         logger.info("Multi-model inference manager shutdown")
+    _clear_local_execution_route_globals()
 
     openai_compat.shutdown_tokenizer_executor()
 

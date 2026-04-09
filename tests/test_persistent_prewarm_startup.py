@@ -144,11 +144,18 @@ class _StubTrainingEngine:
 
 
 class _StubApiWorkQueue:
-    def __init__(self, *, fail_async_ensure_ready: bool = False):
+    def __init__(
+        self,
+        *,
+        fail_async_ensure_ready: bool = False,
+        fail_wait_until_execution_ready: bool = False,
+    ):
         self.fail_async_ensure_ready = bool(fail_async_ensure_ready)
+        self.fail_wait_until_execution_ready = bool(fail_wait_until_execution_ready)
         self.started_workers = 0
         self.async_ensure_started_calls = 0
         self.async_ensure_ready_calls = 0
+        self.wait_until_execution_ready_calls: list[float] = []
 
     def ensure_ready(self) -> None:
         return None
@@ -168,6 +175,12 @@ class _StubApiWorkQueue:
 
     async def start_workers(self, num_workers: int) -> None:
         self.started_workers += int(num_workers)
+
+    async def wait_until_execution_ready(self, *, timeout_s: float = 120.0) -> bool:
+        self.wait_until_execution_ready_calls.append(float(timeout_s))
+        if self.fail_wait_until_execution_ready:
+            raise RuntimeError("local queue runtime not ready")
+        return True
 
     async def shutdown(self) -> None:
         return None
@@ -209,6 +222,14 @@ class _StubQueueExecutionRuntime:
             "desired_workers": int(num_workers),
             "timeout_s": float(timeout_s),
         }
+
+
+class _TrackedMultiModelManager:
+    def __init__(self) -> None:
+        self.shutdown_calls = 0
+
+    async def shutdown_all(self) -> None:
+        self.shutdown_calls += 1
 
 
 async def _noop_async(*_args, **_kwargs) -> None:
@@ -537,6 +558,191 @@ def test_lifespan_keeps_training_route_globals_unbound_in_stateless_api(monkeypa
     assert owner_runtime.started == 1
     assert lease.released is True
     assert queue_execution_runtime.ensure_started_calls == [1]
+
+
+def test_lifespan_local_queue_runtime_cleans_up_bound_handles(monkeypatch) -> None:
+    queue = _StubApiWorkQueue()
+    owner_runtime = _StubOwnerRuntimeSupervisor()
+    queue_execution_runtime = _StubQueueExecutionRuntime()
+    _install_lifespan_stubs(monkeypatch, queue, owner_runtime, queue_execution_runtime)
+    lease = _StubStartupLease(is_owner=True)
+    shutdown_calls: list[tuple[str, object]] = []
+    register_calls: list[int] = []
+
+    async def _acquire_startup_lease(*_args, **_kwargs):
+        return lease
+
+    async def _noop_prewarm(*_args, **_kwargs) -> None:
+        return None
+
+    async def _record_inference_shutdown(manager) -> None:
+        shutdown_calls.append(("inference", manager))
+
+    async def _record_training_shutdown(manager) -> None:
+        shutdown_calls.append(("training", manager))
+
+    inference_manager = SimpleNamespace(_cleanup_task=None, _sessions={})
+    train_manager = SimpleNamespace(_cleanup_task=None, _sessions={})
+    multi_model_manager = _TrackedMultiModelManager()
+
+    async def _fake_initialize_execution_bindings():
+        from tinker_server.routes import mint as mint_routes
+        from tinker_server.routes import sampling as sampling_routes
+        from tinker_server.routes import service as service_routes
+        from tinker_server.routes import training as training_routes
+        from tinker_server.routes import weights as weights_routes
+
+        service_routes.session_manager = inference_manager
+        sampling_routes.session_manager = inference_manager
+        training_routes.training_manager = train_manager
+        training_routes.training_engine = object()
+        training_routes.inference_manager = inference_manager
+        mint_routes.training_manager = train_manager
+        mint_routes.training_engine = object()
+        weights_routes.training_manager = train_manager
+        weights_routes.training_engine = object()
+        weights_routes.inference_manager = inference_manager
+        return {
+            "inference_manager": inference_manager,
+            "train_manager": train_manager,
+            "multi_model_manager": multi_model_manager,
+            "restored_sampling_sessions": 0,
+            "multi_model_enabled": False,
+        }
+
+    monkeypatch.setenv("MINT_QUEUE_EXECUTION_RUNTIME_LOCAL_ONLY", "1")
+    monkeypatch.setattr(app_module, "_prewarm_persistent_models", _noop_prewarm)
+    monkeypatch.setattr(app_module, "_shutdown_local_inference_runtime", _record_inference_shutdown)
+    monkeypatch.setattr(app_module, "_shutdown_local_training_runtime", _record_training_shutdown)
+    monkeypatch.setattr(
+        "tinker_server.backend.startup_lease.acquire_startup_lease",
+        _acquire_startup_lease,
+    )
+    monkeypatch.setattr(
+        "tinker_server.backend.queue_execution_runtime._initialize_execution_bindings",
+        _fake_initialize_execution_bindings,
+    )
+    monkeypatch.setattr(
+        "tinker_server.backend.api_work_queue_dispatch.register_api_work_queue_executors",
+        lambda _queue: register_calls.append(1),
+    )
+
+    from tinker_server.routes import mint as mint_routes
+    from tinker_server.routes import sampling as sampling_routes
+    from tinker_server.routes import service as service_routes
+    from tinker_server.routes import training as training_routes
+    from tinker_server.routes import weights as weights_routes
+
+    async def _run() -> None:
+        async with app_module.lifespan(app_module.app):
+            assert service_routes.session_manager is inference_manager
+            assert sampling_routes.session_manager is inference_manager
+            assert training_routes.training_manager is train_manager
+            assert mint_routes.training_manager is train_manager
+            assert weights_routes.inference_manager is inference_manager
+
+    asyncio.run(_run())
+
+    assert shutdown_calls == [
+        ("training", train_manager),
+        ("inference", inference_manager),
+    ]
+    assert multi_model_manager.shutdown_calls == 1
+    assert register_calls == [1]
+    assert queue.started_workers == 1
+    assert queue.wait_until_execution_ready_calls == [120.0]
+    assert queue_execution_runtime.ensure_started_calls == []
+    assert owner_runtime.started == 1
+    assert lease.released is True
+    assert service_routes.session_manager is None
+    assert sampling_routes.session_manager is None
+    assert training_routes.training_manager is None
+    assert training_routes.training_engine is None
+    assert training_routes.inference_manager is None
+    assert mint_routes.training_manager is None
+    assert mint_routes.training_engine is None
+    assert weights_routes.training_manager is None
+    assert weights_routes.training_engine is None
+    assert weights_routes.inference_manager is None
+
+
+def test_lifespan_local_queue_runtime_start_failure_still_cleans_up_bound_handles(monkeypatch) -> None:
+    queue = _StubApiWorkQueue(fail_wait_until_execution_ready=True)
+    owner_runtime = _StubOwnerRuntimeSupervisor()
+    queue_execution_runtime = _StubQueueExecutionRuntime()
+    _install_lifespan_stubs(monkeypatch, queue, owner_runtime, queue_execution_runtime)
+    lease = _StubStartupLease(is_owner=True)
+    shutdown_calls: list[tuple[str, object]] = []
+
+    async def _acquire_startup_lease(*_args, **_kwargs):
+        return lease
+
+    async def _noop_prewarm(*_args, **_kwargs) -> None:
+        return None
+
+    async def _record_inference_shutdown(manager) -> None:
+        shutdown_calls.append(("inference", manager))
+
+    async def _record_training_shutdown(manager) -> None:
+        shutdown_calls.append(("training", manager))
+
+    inference_manager = SimpleNamespace(_cleanup_task=None, _sessions={})
+    train_manager = SimpleNamespace(_cleanup_task=None, _sessions={})
+
+    async def _fake_initialize_execution_bindings():
+        from tinker_server.routes import service as service_routes
+        from tinker_server.routes import training as training_routes
+
+        service_routes.session_manager = inference_manager
+        training_routes.training_manager = train_manager
+        training_routes.inference_manager = inference_manager
+        return {
+            "inference_manager": inference_manager,
+            "train_manager": train_manager,
+            "multi_model_manager": None,
+            "restored_sampling_sessions": 0,
+            "multi_model_enabled": False,
+        }
+
+    monkeypatch.setenv("MINT_QUEUE_EXECUTION_RUNTIME_LOCAL_ONLY", "1")
+    monkeypatch.setattr(app_module, "_prewarm_persistent_models", _noop_prewarm)
+    monkeypatch.setattr(app_module, "_shutdown_local_inference_runtime", _record_inference_shutdown)
+    monkeypatch.setattr(app_module, "_shutdown_local_training_runtime", _record_training_shutdown)
+    monkeypatch.setattr(
+        "tinker_server.backend.startup_lease.acquire_startup_lease",
+        _acquire_startup_lease,
+    )
+    monkeypatch.setattr(
+        "tinker_server.backend.queue_execution_runtime._initialize_execution_bindings",
+        _fake_initialize_execution_bindings,
+    )
+    monkeypatch.setattr(
+        "tinker_server.backend.api_work_queue_dispatch.register_api_work_queue_executors",
+        lambda _queue: None,
+    )
+
+    from tinker_server.routes import service as service_routes
+    from tinker_server.routes import training as training_routes
+
+    async def _run() -> None:
+        with pytest.raises(RuntimeError, match="local queue runtime not ready"):
+            async with app_module.lifespan(app_module.app):
+                raise AssertionError("lifespan should not yield on local queue runtime failure")
+
+    asyncio.run(_run())
+
+    assert shutdown_calls == [
+        ("training", train_manager),
+        ("inference", inference_manager),
+    ]
+    assert queue.started_workers == 1
+    assert queue.wait_until_execution_ready_calls == [120.0]
+    assert queue_execution_runtime.ensure_started_calls == []
+    assert owner_runtime.started == 1
+    assert lease.released is True
+    assert service_routes.session_manager is None
+    assert training_routes.training_manager is None
+    assert training_routes.inference_manager is None
 
 
 def test_lifespan_skips_tokenizer_preload_for_multi_worker_startup(monkeypatch) -> None:

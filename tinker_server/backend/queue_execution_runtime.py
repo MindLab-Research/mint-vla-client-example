@@ -189,6 +189,9 @@ async def _initialize_execution_bindings() -> dict[str, Any]:
     weights.inference_manager = inference_manager
 
     return {
+        "inference_manager": inference_manager,
+        "train_manager": train_manager,
+        "multi_model_manager": multi_model_manager,
         "restored_sampling_sessions": int(restored_sampling_sessions),
         "multi_model_enabled": bool(config.enable_multi_lora),
     }
