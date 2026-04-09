@@ -244,6 +244,10 @@ scripts/wip/
 *_REPORT.md
 REFLECTION_*.md
 
+# Local pytest scratch and logs
+.tmp/
+.pi/logs/
+
 # Frontend package managers
 node_modules/
 .pnpm-store/
