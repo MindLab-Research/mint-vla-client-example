@@ -23,6 +23,7 @@ from ..logging_context import (
     set_request_id,
     set_trace_id,
 )
+from ..queue_priority import QUEUE_PRIORITY_AGING_S, effective_queue_priority, normalize_queue_priority
 
 logger = logging.getLogger(__name__)
 
@@ -329,6 +330,29 @@ def _create_ray_actor(*, require_ready: bool = True):
             except Exception:
                 return fallback
 
+        def _item_raw_priority(self, item: dict[str, Any]) -> int:
+            extra = item.get("extra")
+            if not isinstance(extra, dict):
+                return 0
+            return normalize_queue_priority(extra.get("queue_priority", 0))
+
+        def _item_effective_priority(self, item: dict[str, Any], *, now: float) -> int:
+            return effective_queue_priority(
+                raw_priority=self._item_raw_priority(item),
+                created_at=self._item_created_at(item, now=now),
+                now=now,
+                aging_s=QUEUE_PRIORITY_AGING_S,
+            )
+
+        def _annotate_queue_priority(self, item: dict[str, Any], *, now: float, kind: str) -> None:
+            extra = item.get("extra")
+            if not isinstance(extra, dict):
+                extra = {}
+                item["extra"] = extra
+            extra["_queue_priority_raw"] = self._item_raw_priority(item)
+            extra["_queue_priority_effective"] = self._item_effective_priority(item, now=now)
+            extra["_queue_kind"] = str(kind)
+
         def _item_log_context(self, item: dict[str, Any]) -> tuple[str, str]:
             request_id = str(item.get("request_id") or "-")
             trace_id: str | None = None
@@ -541,7 +565,7 @@ def _create_ray_actor(*, require_ready: bool = True):
             return sid, reason
 
         def _pick_scheduled_candidate(self, *, now: float) -> tuple[str, str, str] | None:
-            best: tuple[float, str, str, str] | None = None
+            best: tuple[int, float, str, str, str] | None = None
             for domain, state in self._sched_domains.items():
                 if state.get("leased_request_id") is not None:
                     continue
@@ -552,12 +576,15 @@ def _create_ray_actor(*, require_ready: bool = True):
                 q = state["queues_by_session"].get(sid)
                 if not q:
                     continue
-                created_at = self._item_created_at(q[0], now=now)
-                if best is None or created_at < best[0]:
-                    best = (created_at, domain, sid, reason)
+                head = q[0]
+                priority = self._item_effective_priority(head, now=now)
+                created_at = self._item_created_at(head, now=now)
+                candidate = (-priority, created_at, domain, sid, reason)
+                if best is None or candidate < best:
+                    best = candidate
             if best is None:
                 return None
-            return best[1], best[2], best[3]
+            return best[2], best[3], best[4]
 
         def _record_switch_reason(self, reason: str) -> None:
             reasons = self._sched_stats.get("switch_reasons")
@@ -920,6 +947,7 @@ def _create_ray_actor(*, require_ready: bool = True):
 
                     if has_legacy and sched_choice is not None:
                         legacy_head = self._items[0]
+                        legacy_priority = self._item_effective_priority(legacy_head, now=now)
                         legacy_ts = self._item_created_at(legacy_head, now=now)
                         sched_domain, sched_session_id, sched_reason = sched_choice
                         sched_state = self._sched_domains.get(sched_domain)
@@ -928,31 +956,46 @@ def _create_ray_actor(*, require_ready: bool = True):
                             if sched_state is None
                             else (sched_state.get("queues_by_session", {}) or {}).get(sched_session_id)
                         )
-                        sched_head_ts = (
-                            legacy_ts
-                            if not sched_queue
-                            else self._item_created_at(sched_queue[0], now=now)
-                        )
-                        if legacy_ts <= sched_head_ts:
+                        if not sched_queue:
                             item = self._items.popleft()
                         else:
-                            decision_ctx = self._scheduler_decision_context(
-                                domain=str(sched_domain),
-                                session_id=str(sched_session_id),
-                                reason=str(sched_reason),
-                                coalesce_applied=coalesce_applied,
-                            )
-                            item = self._pop_scheduled(
-                                domain=sched_domain,
-                                session_id=sched_session_id,
-                                reason=sched_reason,
-                                now=now,
-                            )
-                            dequeue_reason = str(sched_reason)
-                            scheduler_domain = str(sched_domain)
-                            scheduler_session_id = str(sched_session_id)
+                            sched_head = sched_queue[0]
+                            sched_priority = self._item_effective_priority(sched_head, now=now)
+                            sched_head_ts = self._item_created_at(sched_head, now=now)
+                            if (legacy_priority, -legacy_ts) >= (sched_priority, -sched_head_ts):
+                                item = self._items.popleft()
+                            else:
+                                decision_ctx = self._scheduler_decision_context(
+                                    domain=str(sched_domain),
+                                    session_id=str(sched_session_id),
+                                    reason=str(sched_reason),
+                                    coalesce_applied=coalesce_applied,
+                                )
+                                item = self._pop_scheduled(
+                                    domain=sched_domain,
+                                    session_id=sched_session_id,
+                                    reason=sched_reason,
+                                    now=now,
+                                )
+                                dequeue_reason = str(sched_reason)
+                                scheduler_domain = str(sched_domain)
+                                scheduler_session_id = str(sched_session_id)
                     elif has_legacy:
-                        item = self._items.popleft()
+                        best_idx = 0
+                        best_priority = self._item_effective_priority(self._items[0], now=now)
+                        best_ts = self._item_created_at(self._items[0], now=now)
+                        for idx, candidate in enumerate(list(self._items)[1:], start=1):
+                            candidate_priority = self._item_effective_priority(candidate, now=now)
+                            candidate_ts = self._item_created_at(candidate, now=now)
+                            if (candidate_priority, -candidate_ts) > (best_priority, -best_ts):
+                                best_idx = idx
+                                best_priority = candidate_priority
+                                best_ts = candidate_ts
+                        if best_idx == 0:
+                            item = self._items.popleft()
+                        else:
+                            item = self._items[best_idx]
+                            del self._items[best_idx]
                     else:
                         if sched_choice is None:
                             await self._cv.wait()
@@ -993,6 +1036,11 @@ def _create_ray_actor(*, require_ready: bool = True):
                 self._dequeued += 1
                 dequeue_ts = time.time()
                 wait_s = max(0.0, dequeue_ts - self._item_created_at(item, now=dequeue_ts))
+                self._annotate_queue_priority(
+                    item,
+                    now=dequeue_ts,
+                    kind="scheduled" if scheduler_domain is not None else "legacy",
+                )
                 self._record_scheduler_metrics(
                     item=item,
                     scheduler_domain=scheduler_domain,

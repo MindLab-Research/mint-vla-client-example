@@ -140,6 +140,7 @@ def test_issue_439_asample_cancellation_decrements_active_requests(monkeypatch: 
     assert session_manager.inflight == [("sess-1", 1), ("sess-1", -1)]
     assert snap["vllm_active_requests"] == [
         {
+            "actor_name": "actor-test",
             "base_model": "Qwen/Test",
             "op": "asample",
             "active_requests": 0,
@@ -183,6 +184,7 @@ def test_issue_439_compute_logprobs_cancellation_decrements_active_requests(monk
     assert session_manager.inflight == [("sess-1", 1), ("sess-1", -1)]
     assert snap["vllm_active_requests"] == [
         {
+            "actor_name": "actor-test",
             "base_model": "Qwen/Test",
             "op": "compute_logprobs",
             "active_requests": 0,

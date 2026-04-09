@@ -99,6 +99,8 @@ def test_issue_332_megatron_group_forward_preserves_top_level_log_probs(monkeypa
         _bind_traceparent=lambda traceparent: None,
         _resolve_required_session_id=lambda session_id, op: "sess-1",
         _ensure_session_loaded=lambda *args, **kwargs: {},
+        _ensure_session_for_request=lambda **_kwargs: ("sess-1", {}),
+        _ray_get_group_results=lambda futures, **_kwargs: distributed.ray.get(futures),
         workers=[types.SimpleNamespace(forward=_RemoteForward())],
     )
 

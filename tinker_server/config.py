@@ -177,18 +177,24 @@ def _env_nonempty_any(environ: dict[str, str], *names: str) -> tuple[str | None,
 
 
 def actor_runtime_env_vars(*, pythonpath: str, extra: dict[str, str] | None = None) -> dict[str, str]:
-    ensure_runtime_env_configured()
+    if not PFS_RUNTIME_ENV_ROOT:
+        raise RuntimeError("PFS_RUNTIME_ENV_ROOT is required")
+    if not PFS_TINKER_PATH:
+        raise RuntimeError("PFS_TINKER_PATH is required")
+    if not PFS_HF_MODULES_PATH:
+        raise RuntimeError("PFS_HF_MODULES_PATH is required")
+    ray_address = _env_nonempty(os.environ, "RAY_ADDRESS")
+    if ray_address is None:
+        raise RuntimeError("RAY_ADDRESS is required")
+
     out = {
+        "TINKER_RAY_NAMESPACE": RAY_NAMESPACE,
+        "PYTHONPATH": pythonpath,
         "PFS_RUNTIME_ENV_ROOT": PFS_RUNTIME_ENV_ROOT,
         "PFS_TINKER_PATH": PFS_TINKER_PATH,
         "PFS_HF_MODULES_PATH": PFS_HF_MODULES_PATH,
-        "RAY_ADDRESS": require_ray_address(),
-        "TINKER_RAY_NAMESPACE": RAY_NAMESPACE,
-        "PYTHONPATH": pythonpath,
+        "RAY_ADDRESS": ray_address,
     }
-    ray_address = _env_nonempty(os.environ, "RAY_ADDRESS")
-    if ray_address is not None:
-        out["RAY_ADDRESS"] = ray_address
     config_path = _env_nonempty(os.environ, "TINKER_CONFIG_PATH")
     if config_path is not None:
         out["TINKER_CONFIG_PATH"] = config_path

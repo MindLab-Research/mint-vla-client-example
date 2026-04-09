@@ -1,9 +1,12 @@
 import json
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
+import numpy as np
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from safetensors.numpy import save_file
 
 
 def _mk_checkpoint_view(
@@ -18,7 +21,7 @@ def _mk_checkpoint_view(
     ckpt_root = root / owner / run_id / name
     ckpt_dir = ckpt_root / checkpoint_type if typed else ckpt_root
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    (ckpt_dir / "adapter_model.safetensors").write_bytes(b"dummy-lora")
+    save_file({"lora": np.zeros((1,), dtype=np.float32)}, str(ckpt_dir / "adapter_model.safetensors"))
     if checkpoint_type == "training":
         (ckpt_dir / "optimizer.pt").write_bytes(b"dummy-optim")
     (ckpt_dir / "metadata.json").write_text(
@@ -126,29 +129,34 @@ def test_checkpoint_namespace_rejects_untyped_uri(tmp_path, monkeypatch) -> None
         )
 
 
-def test_checkpoint_namespace_reap_typed_ephemeral_leaf(tmp_path, monkeypatch) -> None:
+def test_checkpoint_namespace_reap_typed_ephemeral_leaf(monkeypatch) -> None:
     from tinker_server import checkpoints
 
-    runtime_root = tmp_path / "runtime"
-    ephemeral_dir = _mk_checkpoint_view(
-        runtime_root / "ephemeral",
-        owner="owner-a",
-        run_id="run-hotfix",
-        name="_ephemeral_dead",
-        checkpoint_type="sampler",
-        typed=True,
-    )
+    with TemporaryDirectory() as td:
+        root = Path(td)
+        runtime_root = root / "runtime"
+        persistent_root = root / "persistent"
+        ephemeral_dir = _mk_checkpoint_view(
+            runtime_root / "ephemeral",
+            owner="owner-a",
+            run_id="run-hotfix",
+            name="_ephemeral_dead",
+            checkpoint_type="sampler",
+            typed=True,
+        )
 
-    monkeypatch.setattr(checkpoints, "RUNTIME_CHECKPOINTS_DIR", str(runtime_root))
-    monkeypatch.setenv("MINT_EPHEMERAL_CHECKPOINT_TTL_S", "1")
+        monkeypatch.setattr(checkpoints, "CHECKPOINTS_DIR", str(persistent_root))
+        monkeypatch.setattr(checkpoints, "PERSISTENT_CHECKPOINTS_DIR", str(persistent_root))
+        monkeypatch.setattr(checkpoints, "RUNTIME_CHECKPOINTS_DIR", str(runtime_root))
+        monkeypatch.setenv("MINT_EPHEMERAL_CHECKPOINT_TTL_S", "1")
 
-    old_time = 1_700_000_000
-    import os
+        old_time = 1_700_000_000
+        import os
 
-    os.utime(ephemeral_dir, (old_time, old_time))
+        os.utime(ephemeral_dir, (old_time, old_time))
 
-    reaped = checkpoints.reap_runtime_checkpoints(now=1_800_000_000)
-    assert str(ephemeral_dir) in reaped["ephemeral"]
+        reaped = checkpoints.reap_runtime_checkpoints(now=1_800_000_000)
+        assert str(ephemeral_dir) in reaped["ephemeral"]
 
 
 def test_checkpoint_namespace_list_exposes_training_and_sampler_views(tmp_path: Path) -> None:
