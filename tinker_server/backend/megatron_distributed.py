@@ -4192,26 +4192,6 @@ class MegatronRankWorker:
             if 0 in ep_tensors:
                 lora_state_dict[peft_name] = ep_tensors[0]
 
-        fused_qkv_sizes: tuple[int, int, int] | None = None
-        if any("linear_qkv" in str(k) for k in regular_params.keys()):
-            try:
-                from transformers import AutoConfig
-
-                hf_config = AutoConfig.from_pretrained(self.base_model, trust_remote_code=True)
-                fused_qkv_sizes = self._get_standard_attention_qkv_sizes(hf_config)
-                logger.info(
-                    "[Rank 0] Standard attention fused-QKV export sizes: q=%s kv=%s total=%s",
-                    fused_qkv_sizes[0],
-                    fused_qkv_sizes[1],
-                    fused_qkv_sizes[0] + 2 * fused_qkv_sizes[1],
-                )
-            except Exception as e:
-                logger.warning(
-                    "[Rank 0] Could not derive fused-QKV split sizes for %s: %s",
-                    self.base_model,
-                    e,
-                )
-
         # Process regular (non-EP-indexed) params
         for name, tensor in regular_params.items():
             # Add PEFT prefix if not already present
@@ -4286,28 +4266,6 @@ class MegatronRankWorker:
                 else:
                     # Filter out MLP modules when not using per-expert expansion
                     mlp_filtered_count += 1
-                continue
-
-            is_standard_fused_qkv = (
-                ('linear_qkv.adapter' in name or 'linear_qkv.lora_' in name.lower())
-                and '.self_attn.q_proj.' in peft_name
-            )
-            if is_standard_fused_qkv and fused_qkv_sizes is not None:
-                lora_type = 'lora_A' if '.lora_A.' in peft_name else 'lora_B'
-                q_size, kv_size, _ = fused_qkv_sizes
-                split_entries = self._split_standard_attention_qkv_peft_entries(
-                    peft_name=peft_name,
-                    tensor=tensor,
-                    lora_type=lora_type,
-                    q_size=q_size,
-                    kv_size=kv_size,
-                )
-                lora_state_dict.update(split_entries)
-                logger.info(
-                    "[Rank 0] Split fused QKV %s into %s",
-                    peft_name,
-                    sorted(split_entries.keys()),
-                )
                 continue
 
             lora_state_dict[peft_name] = tensor
@@ -4387,50 +4345,6 @@ class MegatronRankWorker:
                 )
 
         return lora_state_dict
-
-    @staticmethod
-    def _get_standard_attention_qkv_sizes(hf_config) -> tuple[int, int, int]:
-        head_dim = int(getattr(hf_config, "head_dim", 0) or (hf_config.hidden_size // hf_config.num_attention_heads))
-        q_size = int(hf_config.num_attention_heads) * head_dim
-        kv_size = int(hf_config.num_key_value_heads) * head_dim
-        total = q_size + 2 * kv_size
-        return q_size, kv_size, total
-
-    @staticmethod
-    def _split_standard_attention_qkv_peft_entries(
-        *,
-        peft_name: str,
-        tensor,
-        lora_type: str,
-        q_size: int,
-        kv_size: int,
-    ) -> dict[str, object]:
-        q_name = peft_name
-        k_name = peft_name.replace('.q_proj.', '.k_proj.')
-        v_name = peft_name.replace('.q_proj.', '.v_proj.')
-        if lora_type == 'lora_A':
-            return {
-                q_name: tensor.clone(),
-                k_name: tensor.clone(),
-                v_name: tensor.clone(),
-            }
-        if lora_type != 'lora_B':
-            raise ValueError(f"Unsupported fused QKV LoRA type: {lora_type}")
-        expected = q_size + 2 * kv_size
-        actual = int(tensor.shape[0])
-        if actual != expected:
-            raise ValueError(
-                "Fused QKV lora_B shape mismatch: "
-                f"expected_first_dim={expected} actual_first_dim={actual} peft_name={peft_name}"
-            )
-        q_tensor = tensor[:q_size, :].clone()
-        k_tensor = tensor[q_size:q_size + kv_size, :].clone()
-        v_tensor = tensor[q_size + kv_size:q_size + 2 * kv_size, :].clone()
-        return {
-            q_name: q_tensor,
-            k_name: k_tensor,
-            v_name: v_tensor,
-        }
 
     def _convert_megatron_to_peft(self, name: str) -> str | None:
         """Convert Megatron LoRA param name to PEFT format.
