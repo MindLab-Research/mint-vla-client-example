@@ -3306,1235 +3306,244 @@ class MegatronRankWorker:
             }
         return {}
 
-    def get_lora_state_dict(self, use_per_expert_lora: bool = False) -> dict:
-        """Get LoRA state dict in PEFT format (rank 0 gathers from all ranks).
+    def get_lora_state_dict(
+        self,
+        use_per_expert_lora: bool = False,
+        *,
+        train_attn: bool | None = None,
+        train_mlp: bool | None = None,
+        train_unembed: bool | None = None,
+    ) -> dict:
+        """Get LoRA state dict in PEFT format via Megatron-Bridge only.
 
-        MBridge stores LoRA weights as lora_a/lora_b submodules, but bridge.export_weights()
-        MERGES them into base weights. We must extract directly from model.named_parameters()
-        to get separate lora_A/lora_B matrices for vLLM multi-LoRA inference.
+        The custom export/conversion path has been removed. All adapter export
+        must flow through `bridge.export_adapter_weights()`, which is responsible
+        for emitting PEFT-format tensors, including fused-QKV split handling.
 
-        IMPORTANT: ALL ranks must participate in extraction if using any NCCL collectives.
-        Only rank 0 processes and returns the actual data.
-
-        MBridge internal names (from named_parameters):
-            decoder.layers.0.self_attention.linear_qkv.lora_a.weight
-            decoder.layers.0.self_attention.linear_qkv.lora_b.weight
-
-        PEFT expects names like:
-            base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight
-            base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight
-
-        Args:
-            use_per_expert_lora: If True, expand shared MLP LoRA to per-expert format
-                for vLLM FusedMoEWithLoRA compatibility. If False (default), filter out
-                MLP/expert modules for MoE models to avoid weight format mismatch.
-
-        MoE Weight Format Issue:
-            Megatron-Bridge exports shared LoRA weights (single adapter applied to all experts):
-                decoder.layers.X.mlp.experts.linear_fc1.adapter.linear_in.weight
-
-            vLLM FusedMoEWithLoRA expects per-expert weights:
-                base_model.model.model.layers.X.mlp.experts.0.gate_proj.lora_A.weight
-                base_model.model.model.layers.X.mlp.experts.1.gate_proj.lora_A.weight
-                ...
-
-            When use_per_expert_lora=True, we expand the shared weights to per-expert format
-            by replicating the shared weights for each expert. This ensures train-inference
-        consistency but may use more memory during inference.
+        IMPORTANT: ALL ranks must participate because the bridge export can use
+        distributed collectives internally. Only rank 0 returns materialized
+        tensors; other ranks return an empty dict.
         """
-        import os
-
-        logger.info(f"[Rank {self.rank}] get_lora_state_dict: ENTRY")
+        logger.info(
+            "[Rank %s] get_lora_state_dict: ENTRY use_per_expert_lora=%s train_attn=%s train_mlp=%s train_unembed=%s",
+            self.rank,
+            use_per_expert_lora,
+            train_attn,
+            train_mlp,
+            train_unembed,
+        )
         self._release_sticky_for_aux_mode_transition(
             reason="get_lora_state_dict",
             snapshot_gradients=True,
         )
+        train_attn = True if train_attn is None else bool(train_attn)
+        train_mlp = True if train_mlp is None else bool(train_mlp)
+        train_unembed = True if train_unembed is None else bool(train_unembed)
 
-        # ========== Try HollowMan Megatron-Bridge export_adapter_weights API ==========
-        # This is enabled via USE_MBRIDGE_LORA_EXPORT=true environment variable which
-        # prepends HollowMan fork to PYTHONPATH
-        bridge = getattr(self.engine, 'bridge', None)
+        bridge = getattr(self.engine, "bridge", None)
+        if bridge is None or not hasattr(bridge, "export_adapter_weights"):
+            raise RuntimeError(
+                "Megatron-Bridge export_adapter_weights() is required for LoRA export; "
+                "the legacy custom export path has been removed"
+            )
+
         try:
-            model_is_moe = get_model_config(self.base_model).is_moe
+            from megatron.core import parallel_state as mpu
+
+            pipeline_world_size = int(mpu.get_pipeline_model_parallel_world_size())
         except Exception:
-            model_is_moe = False
+            pipeline_world_size = None
 
-        # For MoE models when we are NOT exporting per-expert LoRA (train_mlp=False),
-        # avoid export_adapter_weights: it materializes the entire MLP LoRA tree
-        # (hundreds of thousands of tensors) even though we will filter it out.
-        if model_is_moe and not use_per_expert_lora and bridge is not None and hasattr(bridge, 'export_adapter_weights'):
-            logger.info(
-                f"[Rank {self.rank}] Skipping Megatron-Bridge export_adapter_weights API (MoE attention-only export)"
-            )
-        if bridge is not None and hasattr(bridge, 'export_adapter_weights') and not (model_is_moe and not use_per_expert_lora):
-            logger.info(f"[Rank {self.rank}] Using Megatron-Bridge export_adapter_weights API")
-            adapter_state = {}
+        restore_bridge_patch = None
+        if pipeline_world_size == 1:
+            from megatron.bridge.models.conversion import model_bridge as bridge_dispatch
 
-            # Default to exporting a shared-expert LoRA artifact (expert 0 only) for MoE models.
-            # vLLM hot-load will broadcast the shared expert weights at load time.
-            shared_mode = os.environ.get("MINT_MOE_LORA_SHARED_EXPERT_EXPORT", "1").strip().lower()
-            # Default to exporting the full per-expert LoRA tree so vLLM can pack MoE LoRAs.
-            # Operators can force a "shared expert" export (keep only expert 0) to reduce
-            # artifact size, but this requires downstream broadcasting support.
-            shared_export = (
-                bool(model_is_moe)
-                and bool(use_per_expert_lora)
-                and shared_mode in {"1", "true", "yes"}
-            )
-            import re
+            bridge_impl = bridge_dispatch.get_model_bridge(bridge._causal_lm_architecture)
+            bridge_cls = type(bridge_impl)
+            original_collect = getattr(bridge_cls, "_megatron_global_adapters_info_all_pp_ranks", None)
+            if not callable(original_collect):
+                raise RuntimeError(
+                    "Megatron-Bridge export_adapter_weights() is missing "
+                    "_megatron_global_adapters_info_all_pp_ranks; cannot apply single-PP export fix"
+                )
+            from collections import defaultdict
+            import itertools
 
-            expert_pat = re.compile(r"\.mlp\.(?:shared_)?experts\.(\d+)\.")
+            from megatron.bridge.models.conversion.model_bridge import _megatron_local_name_to_global
+            from megatron.bridge.models.conversion.utils import extract_sort_key, persistent_buffers
+            from megatron.bridge.peft.canonical_lora import ModuleDict
+            from megatron.bridge.peft.utils import ParallelLinearAdapter, get_adapter_attributes_from_linear
+            from megatron.core.utils import get_pg_rank, unwrap_model
 
-            # Debug: verify whether "shared" expert LoRA weights are actually identical across
-            # expert-parallel (EP) shards. If they differ, "expert-0-only" export is not valid.
-            #
-            # We only gather small checksum scalars (not full tensors) to keep overhead low.
-            ep_group = None
-            ep_size = 1
-            ep_rank = 0
-            try:
-                from megatron.core import parallel_state as mpu
+            _missing = object()
+            previous_attr_values = {
+                "_tinker_export_train_attn": getattr(bridge_cls, "_tinker_export_train_attn", _missing),
+                "_tinker_export_train_mlp": getattr(bridge_cls, "_tinker_export_train_mlp", _missing),
+                "_tinker_export_train_unembed": getattr(bridge_cls, "_tinker_export_train_unembed", _missing),
+            }
+            setattr(bridge_cls, "_tinker_export_train_attn", train_attn)
+            setattr(bridge_cls, "_tinker_export_train_mlp", train_mlp)
+            setattr(bridge_cls, "_tinker_export_train_unembed", train_unembed)
 
-                ep_size = int(mpu.get_expert_model_parallel_world_size())
-                ep_rank = int(mpu.get_expert_model_parallel_rank())
-                if ep_size > 1:
-                    ep_group = mpu.get_expert_model_parallel_group()
-            except Exception:
-                ep_group = None
-                ep_size = 1
-                ep_rank = 0
+            def _allow_target(bridge_self, param_name: str) -> bool:
+                allow_attn = bool(getattr(bridge_self, "_tinker_export_train_attn", True))
+                allow_mlp = bool(getattr(bridge_self, "_tinker_export_train_mlp", True))
+                allow_unembed = bool(getattr(bridge_self, "_tinker_export_train_unembed", True))
+                tgt = MegatronRankWorker._classify_lora_param_target(param_name.lower())
+                if tgt == "attn":
+                    return allow_attn
+                if tgt == "mlp":
+                    return allow_mlp
+                if tgt == "unembed":
+                    return allow_unembed
+                return True
 
-            did_ep_checksum = False
-            with self.engine.eval_mode():
-                for name, tensor in bridge.export_adapter_weights(self.engine.module, cpu=True, show_progress=False):
-                    if (
-                        (not did_ep_checksum)
-                        and ep_group is not None
-                        and ep_size > 1
-                        and use_per_expert_lora
-                        and ".mlp.experts." in name
-                        and ".mlp.shared_experts." not in name
-                        and name.endswith(".adapter.linear_in.weight")
-                    ):
-                        import torch
-                        import torch.distributed as dist
+            def _single_pp_collect(self, megatron_model):
+                if hasattr(self, "_cached_param_objects_adapter"):
+                    return self._cached_param_objects_adapter
 
-                        # tensor is already on CPU here; compute checksum on CPU, then all_gather
-                        # the tiny checksum tensor on GPU/NCCL.
-                        t = tensor.detach()
-                        chk = torch.tensor(
-                            [
-                                float(ep_rank),
-                                float(t.float().sum().item()),
-                                float(t.float().mean().item()),
-                                float(t.float().abs().max().item()),
-                            ],
-                            device=torch.cuda.current_device(),
-                            dtype=torch.float32,
-                        )
-                        gathered = [torch.empty_like(chk) for _ in range(ep_size)]
-                        dist.all_gather(gathered, chk, group=ep_group)
-                        if self.rank == 0:
-                            rows = [
-                                (
-                                    int(g[0].item()),
-                                    float(g[1].item()),
-                                    float(g[2].item()),
-                                    float(g[3].item()),
-                                )
-                                for g in gathered
-                            ]
-                            rows = sorted(rows, key=lambda x: x[0])
-                            logger.info(
-                                f"[Rank 0] EP LoRA checksum probe ({name}): "
-                                f"ep_size={ep_size} rows={rows}"
-                            )
-                        did_ep_checksum = True
-                    if self.rank == 0:
-                        if shared_export:
-                            m = expert_pat.search(name)
-                            if m is not None and int(m.group(1)) != 0:
-                                continue
-                        adapter_state[name] = tensor.clone()
+                models = megatron_model if isinstance(megatron_model, list) else [megatron_model]
+                pp_group = mpu.get_pipeline_model_parallel_group()
+                pp_rank = get_pg_rank(pp_group)
+                model_config = unwrap_model(models)[0].config
+                global_param_objects = []
 
-            # Non-rank-0 workers return empty dict
-            if self.rank != 0:
-                logger.info(f"[Rank {self.rank}] get_lora_state_dict: returning empty dict (non-rank-0)")
-                return {}
-
-            if model_is_moe and not use_per_expert_lora:
-                before = len(adapter_state)
-                adapter_state = {
-                    k: v
-                    for k, v in adapter_state.items()
-                    if (".mlp." not in k and ".experts." not in k)
-                }
-                logger.info(f"[Rank 0] Filtered {before - len(adapter_state)} MLP/expert params (export_adapter_weights)")
-
-            # For MoE models exporting per-expert LoRA, the full per-expert tree can be
-            # extremely large (K2: ~140k tensors, ~77GB).
-            #
-            # Current vLLM hot-load support in this repo only supports:
-            # - full per-expert exports (all experts present), OR
-            # - "shared-expert" exports (expert 0 only) where vLLM broadcasts expert 0
-            #   weights to all experts at load time.
-            #
-            # A "one representative expert per EP shard" sparse export is not supported
-            # by the current vLLM loader patch (it fail-fast) because correct filling
-            # requires EP shard aware mapping.
-            if model_is_moe and use_per_expert_lora:
-                import os
-                import re
-
-                if os.environ.get("MINT_MOE_LORA_SPARSE_EXPERT_EXPORT", "1").strip() != "0":
-                    # Sparse expert export: keep one representative expert per EP shard (linear placement).
-                    #
-                    # This reduces the export artifact size drastically (K2 full per-expert adapters are very large).
-                    # The downstream vLLM hot-load path must reconstruct full per-expert tensors at load time.
-                    #
-                    # If MINT_MOE_LORA_SHARED_EXPERT_EXPORT=1 is also enabled, we additionally drop to expert-0-only.
-
-                    # Determine EP size.
-                    try:
-                        from megatron.core import parallel_state as mpu
-
-                        ep_size = int(mpu.get_expert_model_parallel_world_size())
-                    except Exception:
-                        ep_size = 1
-
-                    # Determine num_experts.
-                    num_experts = 0
-                    if ep_size > 1:
-                        try:
-                            from transformers import AutoConfig
-
-                            hf_config = AutoConfig.from_pretrained(
-                                self.base_model, trust_remote_code=True
-                            )
-                            num_experts = int(
-                                getattr(hf_config, "num_experts", None)
-                                or getattr(hf_config, "n_routed_experts", 0)
-                                or 0
-                            )
-                        except Exception:
-                            num_experts = 0
-
-                    if ep_size > 1 and num_experts > 0:
-                        base = num_experts // ep_size
-                        rem = num_experts % ep_size
-                        reps = {
-                            (r * base + min(r, rem))
-                            for r in range(ep_size)
-                            if (base + (1 if r < rem else 0)) > 0
-                        }
-
-                        # Keep all non-expert keys + only representative expert keys.
-                        expert_pat = re.compile(r"\.mlp\.experts\.(\d+)\.")
-                        before = len(adapter_state)
-                        dropped = 0
-                        filtered = {}
-                        for k, v in adapter_state.items():
-                            m = expert_pat.search(k)
-                            if m is None:
-                                filtered[k] = v
-                                continue
-                            idx = int(m.group(1))
-                            if idx in reps:
-                                filtered[k] = v
-                            else:
-                                dropped += 1
-
-                        adapter_state = filtered
-                        logger.info(
-                            f"[Rank 0] Sparse expert export (export_adapter_weights): "
-                            f"ep_size={ep_size} num_experts={num_experts} kept_experts={len(reps)} "
-                            f"dropped_keys={dropped} before={before} after={len(adapter_state)}"
-                        )
-
-                # Default to shared-expert export (expert 0 only). vLLM load-time patch will
-                # broadcast the shared expert weights across experts.
-                mode = os.environ.get("MINT_MOE_LORA_SHARED_EXPERT_EXPORT", "1").strip().lower()
-                if mode in {"1", "true", "yes"}:
-                    expert_pat = re.compile(r"\.mlp\.(?:shared_)?experts\.(\d+)\.")
-                    before = len(adapter_state)
-                    dropped = 0
-                    filtered = {}
-                    for k, v in adapter_state.items():
-                        m = expert_pat.search(k)
-                        if m is None:
-                            filtered[k] = v
+                for vp_stage, model in enumerate(models):
+                    for local_param_name, _ in itertools.chain(model.named_parameters(), persistent_buffers(model)):
+                        if "_extra_state" in local_param_name:
                             continue
-                        idx = int(m.group(1))
-                        if idx == 0:
-                            filtered[k] = v
+                        local_param_name = self._unwrap_name(local_param_name)
+                        global_param_name = _megatron_local_name_to_global(
+                            models, model_config, local_param_name, vp_stage
+                        )
+                        if not self._is_adapter_param_name(global_param_name) or not global_param_name.endswith(
+                            ".linear_in.weight"
+                        ):
+                            continue
+                        if not _allow_target(self, global_param_name):
+                            continue
+
+                        local_base_prefix = local_param_name.partition(".adapter.")[0]
+                        global_base_name = global_param_name[: -len(".linear_in.weight")]
+                        adapter, to_wrap = self._get_adapter_wrap_module(local_base_prefix, models, vp_stage)
+                        if isinstance(adapter, ModuleDict):
+                            adapter_name = local_param_name.removeprefix(local_base_prefix + ".adapter.").split(".")[0]
+                            adapter = adapter[adapter_name]
+                        if isinstance(adapter, ParallelLinearAdapter):
+                            input_is_parallel = adapter.input_is_parallel
+                            base_linear_is_parallel = True
                         else:
-                            dropped += 1
-                    adapter_state = filtered
-                    logger.info(
-                        f"[Rank 0] Shared-expert export (export_adapter_weights): kept_expert=0 "
-                        f"dropped_keys={dropped} before={before} after={len(adapter_state)}"
-                    )
+                            input_is_parallel, _, _, _, _, base_linear_is_parallel = get_adapter_attributes_from_linear(
+                                to_wrap
+                            )
+                        global_param_objects.append(
+                            (
+                                global_base_name,
+                                local_base_prefix,
+                                input_is_parallel,
+                                base_linear_is_parallel,
+                                adapter.alpha,
+                                adapter.dim,
+                                pp_rank,
+                                vp_stage,
+                            )
+                        )
 
-            logger.info(f"[Rank 0] export_adapter_weights returned {len(adapter_state)} params")
-            return adapter_state
+                gathered_global_param_objects = sorted(
+                    list(set(global_param_objects)),
+                    key=lambda x: extract_sort_key(x[0]),
+                )
+                self._cached_param_objects_adapter = gathered_global_param_objects
+                return gathered_global_param_objects
 
-        # ========== Fall back to custom implementation ==========
-        logger.info(f"[Rank {self.rank}] Using custom LoRA extraction (export_adapter_weights not available)")
+            bridge_cls._megatron_global_adapters_info_all_pp_ranks = _single_pp_collect
+            logger.info("[Rank %s] Temporarily patched Megatron-Bridge single-PP adapter metadata gather", self.rank)
 
-        # Write diagnostic output to shared PFS for debugging
-        debug_file = "/vePFS-Mindverse/share/code/tinker-server/debug_lora_export.log"
+            def _restore_bridge_patch():
+                bridge_cls._megatron_global_adapters_info_all_pp_ranks = original_collect
+                for attr_name, previous_value in previous_attr_values.items():
+                    if previous_value is _missing:
+                        try:
+                            delattr(bridge_cls, attr_name)
+                        except AttributeError:
+                            pass
+                    else:
+                        setattr(bridge_cls, attr_name, previous_value)
 
-        # ========== TP Gathering Helpers ==========
-        # LoRA weights are sharded across TP ranks. We must gather before export.
-        # Based on Megatron-Bridge gpt_bridge.py _get_tp_split_dim() logic.
-        #
-        # Sharding rules for LoRA:
-        # - linear_proj, linear_fc2 (RowParallel): lora_A sharded on dim 1
-        # - linear_q_proj, linear_kv_up_proj (ColumnParallel): lora_B sharded on dim 0
-        # - linear_fc1 (fused gate+up): lora_B sharded on dim 1 (special case)
-        # - linear_kv_down_proj: lora_B sharded on dim 0 (for mcore < 0.14)
+            restore_bridge_patch = _restore_bridge_patch
 
-        def _get_lora_tp_split_dim(param_name: str, etp_size: int = 1) -> int | None:
-            """Determine TP split dimension for a LoRA parameter.
+        import torch
+        from megatron.bridge.models.conversion import param_mapping as bridge_param_mapping
+        import torch.distributed as dist
 
-            Returns None if parameter is not TP-sharded.
-            Returns 0 for column-parallel (output sharded).
-            Returns 1 for row-parallel (input sharded) or fused linear_fc1.
+        restore_tp_gather = bridge_param_mapping.MegatronParamMapping.gather_from_tp_ranks
+        gloo_tp_groups: dict[tuple[int, ...], object] = {}
 
-            CRITICAL: For MoE models with ETP=1, expert MLP LoRAs are NOT tensor-parallelized.
-            Only attention LoRAs use TP sharding. Expert MLP LoRAs use ETP sharding.
-            """
-            import re
-
-            # Identify lora_A vs lora_B
-            is_lora_a = '.adapter.linear_in.' in param_name or '.lora_a.' in param_name.lower()
-            is_lora_b = '.adapter.linear_out.' in param_name or '.lora_b.' in param_name.lower()
-
-            if not (is_lora_a or is_lora_b):
-                return None
-
-            # Check if this is an expert MLP layer (MoE)
-            # Expert layers have patterns like: mlp.experts.*, mlp.shared_experts.*
-            # These use ETP (Expert Tensor Parallel) instead of TP
-            # Note: Dense MLP layers (e.g., layer 0's .mlp.linear_fc1 without .experts.)
-            # still use TP sharding and should be gathered
-            is_expert_layer = '.mlp.experts.' in param_name or '.mlp.shared_experts.' in param_name
-
-            if is_expert_layer:
-                # For expert layers, sharding depends on ETP, not TP
-                # With ETP=1 (no expert tensor parallelism), these are NOT sharded
-                if etp_size <= 1:
-                    return None
-                # With ETP > 1, would need ETP-based gathering (not implemented)
-                # For now, return None and log warning
-                logger.warning(f"ETP={etp_size} > 1 not yet supported for LoRA gathering")
-                return None
-
-            # RowParallel layers (attention output projection, MLP down projection):
-            # - lora_A is sharded on dim 1 (input dimension)
-            row_parallel_keys = {'linear_proj', 'linear_fc2'}
-
-            # ColumnParallel layers (attention QKV, MLA projections, MLP up/gate):
-            # - lora_A is sharded on dim 0 (rank dimension)
-            # - lora_B is sharded on dim 0 (output dimension)
-            col_parallel_keys = {'linear_qkv', 'linear_q_proj', 'linear_kv_up_proj', 'linear_kv_down_proj', 'linear_fc1'}
-
-            # Extract base layer name (e.g., "linear_proj" from "decoder.layers.0.self_attn.linear_proj.adapter.linear_in.weight")
-            match = re.search(r'(linear_\w+)\.(?:adapter|lora)', param_name)
-            if not match:
-                return None
-            base_layer = match.group(1)
-
-            if is_lora_a:
-                # lora_A is sharded if base layer is RowParallel (dim 1) or ColumnParallel (dim 0)
-                if base_layer in row_parallel_keys:
-                    return 1  # RowParallel: lora_A sharded on input dim
-                elif base_layer in col_parallel_keys:
-                    return 0  # ColumnParallel: lora_A sharded on rank dim
-            elif is_lora_b:
-                # CRITICAL: linear_out in ParallelLinearAdapter is ALWAYS ColumnParallelLinear
-                # regardless of whether base layer is RowParallel or ColumnParallel.
-                # So lora_B is ALWAYS sharded on dim 0 (output dimension).
-                if base_layer in col_parallel_keys or base_layer in row_parallel_keys:
-                    return 0  # lora_B always sharded on output dim
-
-            return None
-
-        def _gather_tensor_across_tp(tensor, tp_group, split_dim: int):
-            """Gather tensor across TP ranks along the specified dimension.
-
-            Args:
-                tensor: Local shard of the tensor
-                tp_group: Tensor parallel process group
-                split_dim: Dimension along which tensor is sharded (0 or 1)
-
-            Returns:
-                Gathered tensor (full tensor on all ranks)
-            """
-            import torch
-            import torch.distributed as dist
-
-            tp_size = dist.get_world_size(tp_group)
-            if tp_size == 1:
-                return tensor
-
-            # Ensure tensor is on GPU for NCCL
-            device = torch.cuda.current_device()
-            tensor = tensor.to(device) if not tensor.is_cuda else tensor
-
-            if split_dim == 0:
-                # Prefer list-based all_gather over all_gather_into_tensor: the latter
-                # has been observed to hang in large EP-folded configurations.
-                gathered_list = [torch.empty_like(tensor) for _ in range(tp_size)]
-                dist.all_gather(gathered_list, tensor.contiguous(), group=tp_group)
-                return torch.cat(gathered_list, dim=0)
-            else:
-                # Gather along other dimension (RowParallel lora_A, fused lora_B)
-                # Need to use all_gather then cat
-                gathered_list = [torch.empty_like(tensor) for _ in range(tp_size)]
-                dist.all_gather(gathered_list, tensor.contiguous(), group=tp_group)
-                return torch.cat(gathered_list, dim=split_dim)
-
-        def _split_fused_gate_up_lora_b(tensor, tp_size_for_split: int):
-            """Split fused gate+up lora_B tensor with TP-aware interleaved layout.
-
-            When TP > 1, lora_B for fused gate+up is interleaved:
-            Layout: [gate_shard0, up_shard0, gate_shard1, up_shard1, ...]
-
-            M-Bridge reference: peft_bridge.py:282-311
-
-            Args:
-                tensor: Fused lora_B tensor of shape (2*intermediate_size, rank)
-                tp_size_for_split: TP size (use ETP for expert layers, TP for dense)
-
-            Returns:
-                (gate_tensor, up_tensor) each of shape (intermediate_size, rank)
-            """
-            import torch
-
-            if tp_size_for_split <= 1:
-                # Simple contiguous split
-                half_size = tensor.shape[0] // 2
-                return tensor[:half_size, :].clone(), tensor[half_size:, :].clone()
-
-            # TP > 1: Deinterleave the shards
-            shard_size = tensor.shape[0] // tp_size_for_split
-            if shard_size * tp_size_for_split != tensor.shape[0] or shard_size % 2 != 0:
-                # Fallback if dimensions don't match expected interleaved layout
-                logger.warning(f"Unexpected tensor shape for TP-aware split: {tensor.shape}, tp_size={tp_size_for_split}")
-                half_size = tensor.shape[0] // 2
-                return tensor[:half_size, :].clone(), tensor[half_size:, :].clone()
-
-            shards = torch.split(tensor, shard_size, dim=0)
-            gate_parts = []
-            up_parts = []
-            for shard in shards:
-                gate_shard, up_shard = torch.chunk(shard, 2, dim=0)
-                gate_parts.append(gate_shard)
-                up_parts.append(up_shard)
-            return torch.cat(gate_parts, dim=0), torch.cat(up_parts, dim=0)
-
-        # Get TP group and size for gathering
-        try:
-            from megatron.core import parallel_state as mpu
-            tp_group = mpu.get_tensor_model_parallel_group()
-            tp_size = mpu.get_tensor_model_parallel_world_size()
-            logger.info(f"[Rank {self.rank}] TP size: {tp_size}")
-        except Exception as e:
-            logger.warning(f"[Rank {self.rank}] Could not get TP group: {e}, assuming TP=1")
-            tp_group = None
-            tp_size = 1
-
-        # Get ETP size for MoE expert layers
-        try:
-            from megatron.core import parallel_state as mpu
-            etp_size = mpu.get_expert_tensor_parallel_world_size()
-            logger.info(f"[Rank {self.rank}] ETP size: {etp_size}")
-        except Exception:
-            # ETP not available, assume 1 (no expert tensor parallelism)
-            etp_size = 1
-
-        # Get EP (Expert Parallelism) group, size, and rank
-        # CRITICAL: With EP=8, each rank holds different experts (64/8 = 8 experts per rank)
-        # We must gather expert LoRAs from ALL EP ranks to export complete state
-        try:
-            from megatron.core import parallel_state as mpu
-            ep_group = mpu.get_expert_model_parallel_group()
-            ep_size = mpu.get_expert_model_parallel_world_size()
-            ep_rank = mpu.get_expert_model_parallel_rank()
-            logger.info(f"[Rank {self.rank}] EP size: {ep_size}, EP rank: {ep_rank}")
-        except Exception as e:
-            logger.warning(f"[Rank {self.rank}] Could not get EP group: {e}, assuming EP=1")
-            ep_group = None
-            ep_size = 1
-            ep_rank = 0
-
-        # For MoE models, exporting routed expert LoRAs requires EP gathering and
-        # per-expert expansion for vLLM. If we're not exporting per-expert weights,
-        # skip the MLP subtree early to avoid expensive TP/EP collectives.
-        try:
-            model_is_moe = get_model_config(self.base_model).is_moe
-        except Exception:
-            model_is_moe = False
-
-        skip_mlp_params = model_is_moe and not use_per_expert_lora
-        if self.rank == 0:
-            print(
-                f"[Rank 0] get_lora_state_dict groups: tp_size={tp_size} etp_size={etp_size} "
-                f"ep_size={ep_size} use_per_expert_lora={use_per_expert_lora} skip_mlp={skip_mlp_params}",
-                flush=True,
-            )
-
-        import os
-
-        debug_lora_export = os.environ.get("MINT_DEBUG_LORA_EXPORT", "0") == "1"
-        debug_lora_export_max_params = int(os.environ.get("MINT_DEBUG_LORA_EXPORT_MAX_PARAMS", "10"))
-
-        def _gather_expert_lora_across_ep(tensor, ep_group, ep_size: int):
-            """Gather expert LoRA tensor from all EP ranks.
-
-            Each EP rank holds a shard of experts. We gather all shards to
-            get complete expert weights.
-
-            Args:
-                tensor: Local expert LoRA tensor
-                ep_group: Expert parallel process group
-                ep_size: Number of EP ranks
-
-            Returns:
-                List of tensors, one per EP rank (indexed by ep_rank)
-            """
-            import torch
-            import torch.distributed as dist
-
-            if ep_size == 1:
+        def _cpu_gloo_gather_from_tp_ranks(mapping, tensor: torch.Tensor) -> list[torch.Tensor]:
+            if mapping.tp_size == 1:
                 return [tensor]
 
-            # Ensure tensor is on GPU for NCCL
-            device = torch.cuda.current_device()
-            tensor = tensor.to(device) if not tensor.is_cuda else tensor
+            if not dist.is_gloo_available():
+                raise RuntimeError("Gloo backend is unavailable; cannot run CPU TP gather for adapter export")
 
-            # Gather from all EP ranks
-            gathered_list = [torch.empty_like(tensor) for _ in range(ep_size)]
-            dist.all_gather(gathered_list, tensor.contiguous(), group=ep_group)
-            return gathered_list
+            group_ranks = tuple(dist.get_process_group_ranks(mapping.tp_group))
+            gloo_group = gloo_tp_groups.get(group_ranks)
+            if gloo_group is None:
+                gloo_group = dist.new_group(ranks=list(group_ranks), backend="gloo")
+                gloo_tp_groups[group_ranks] = gloo_group
 
-        # ========== End TP/EP Gathering Helpers ==========
-
-        adapter_state = {}
-
-        # CRITICAL: With param_offload=True, model is on CPU. Must use eval_mode() context
-        # to load model onto GPU before accessing parameters.
-        with self.engine.eval_mode():
-            # FIRST: Try direct extraction from model.named_parameters()
-            # MBridge stores LoRA weights as .adapter.linear_in/.adapter.linear_out submodules
-            # This avoids the merge that export_weights() does
-            logger.info(f"[Rank {self.rank}] Trying direct named_parameters() extraction (within eval_mode)...")
             try:
-                from verl.utils.megatron_utils import unwrap_model
+                cpu_tensor = tensor.detach().cpu().contiguous()
+            except Exception as exc:
+                raise RuntimeError(
+                    "Megatron-Bridge adapter export failed before TP gather could start: "
+                    f"hf_param={getattr(mapping, 'hf_param', None)!r} "
+                    f"shape={tuple(tensor.shape)} dtype={tensor.dtype} device={tensor.device} "
+                    f"tp_rank={getattr(mapping, 'tp_rank', None)!r} tp_size={getattr(mapping, 'tp_size', None)!r}"
+                ) from exc
+            gathered = [torch.empty_like(cpu_tensor) for _ in range(mapping.tp_size)]
+            dist.all_gather(gathered, cpu_tensor, group=gloo_group)
+            return gathered
 
-                unwrapped = unwrap_model(self.engine.module)
-                if isinstance(unwrapped, list):
-                    unwrapped = unwrapped[0]
+        bridge_param_mapping.MegatronParamMapping.gather_from_tp_ranks = _cpu_gloo_gather_from_tp_ranks
 
-                all_param_names = []
-                lora_param_names = []
-                lora_seen = 0
+        adapter_state: dict[str, torch.Tensor] = {}
+        try:
+            with self.engine.eval_mode():
+                for name, tensor in bridge.export_adapter_weights(
+                    self.engine.module,
+                    cpu=True,
+                    show_progress=False,
+                ):
+                    if self.rank == 0:
+                        adapter_state[str(name)] = tensor.clone()
+        finally:
+            bridge_param_mapping.MegatronParamMapping.gather_from_tp_ranks = restore_tp_gather
+            if restore_bridge_patch is not None:
+                restore_bridge_patch()
 
-                for name, param in unwrapped.named_parameters():
-                    all_param_names.append(name)
-                    # Look for adapter patterns in name (MBridge uses .adapter.linear_in/.adapter.linear_out)
-                    name_lower = name.lower()
-                    if '.adapter.' in name_lower or 'lora_a' in name_lower or 'lora_b' in name_lower:
-                        lora_param_names.append(name)
-                        lora_seen += 1
-                        if self.rank == 0 and (lora_seen == 1 or lora_seen % 500 == 0):
-                            print(
-                                f"[Rank 0] get_lora_state_dict progress: lora_seen={lora_seen} last={name}",
-                                flush=True,
-                            )
-                        original_shape = list(param.data.shape)
-                        do_debug_param = debug_lora_export and (len(lora_param_names) <= debug_lora_export_max_params)
-
-                        # MoE MLP/expert LoRAs are only needed when exporting per-expert weights.
-                        # If we aren't exporting per-expert LoRAs, skip the MLP subtree early to
-                        # avoid expensive TP/EP collectives and CPU copies.
-                        if skip_mlp_params and ".mlp." in name_lower:
-                            continue
-
-                        # DEBUG: Log original tensor shape with more detail
-                        if self.rank == 0 and do_debug_param:
-                            is_lora_a = '.adapter.linear_in.' in name or '.lora_a.' in name_lower
-                            lora_type = "lora_A" if is_lora_a else "lora_B"
-                            logger.info(f"[Rank 0] Megatron {lora_type} {name}: shape={original_shape}")
-                        # CRITICAL: ALL ranks must participate in gathering to avoid NCCL deadlock!
-                        # Check if this parameter needs TP gathering
-                        split_dim = _get_lora_tp_split_dim(name, etp_size=etp_size)
-                        if self.rank == 0 and do_debug_param:
-                            # Detailed logging for shape debugging
-                            is_expert = '.mlp.experts.' in name or '.mlp.shared_experts.' in name or '.mlp.linear_fc' in name
-                            logger.info(f"[Rank 0] {name}: split_dim={split_dim}, is_expert={is_expert}, etp_size={etp_size}, tp_size={tp_size}")
-                        if split_dim is not None and tp_group is not None and tp_size > 1:
-                            # Gather across TP ranks (NCCL collective).
-                            gathered = _gather_tensor_across_tp(param.data, tp_group, split_dim)
-                            tensor_for_export = gathered
-                            if self.rank == 0 and do_debug_param:
-                                logger.info(f"[Rank 0] GATHERED {name}: {original_shape} -> {list(gathered.shape)} (dim={split_dim})")
-                        else:
-                            tensor_for_export = param.data
-                            if self.rank == 0 and do_debug_param:
-                                logger.info(f"[Rank 0] NO_GATHER {name}: shape={list(tensor_for_export.shape)}")
-
-                        # EP gather is only required when exporting per-expert expert LoRAs.
-                        is_routed_expert = '.mlp.experts.' in name and '.mlp.shared_experts.' not in name
-                        if use_per_expert_lora and is_routed_expert and ep_group is not None and ep_size > 1:
-                            # ALL ranks participate in EP all_gather (NCCL collective).
-                            ep_gathered = _gather_expert_lora_across_ep(tensor_for_export, ep_group, ep_size)
-                            if self.rank == 0:
-                                if do_debug_param:
-                                    logger.info(f"[Rank 0] EP_GATHERED {name}: {ep_size} shards, shape={list(ep_gathered[0].shape)}")
-                                # Store with EP rank index for later expansion
-                                # Key format: original_name::EP_RANK::{i}
-                                for i, tensor in enumerate(ep_gathered):
-                                    ep_key = f"{name}::EP_RANK::{i}"
-                                    adapter_state[ep_key] = tensor.detach().cpu()
-                        else:
-                            # Non-expert param or EP=1: store normally (only rank 0)
-                            if self.rank == 0:
-                                adapter_state[name] = tensor_for_export.detach().cpu()
-
-                logger.info(f"[Rank {self.rank}] named_parameters() returned {len(all_param_names)} total, {len(lora_param_names)} LoRA params")
-
-                if self.rank == 0:
-                    # Write diagnostic info with shapes
-                    try:
-                        import datetime
-                        with open(debug_file, "a") as f:
-                            f.write(f"\n=== {datetime.datetime.now()} (named_parameters within eval_mode) ===\n")
-                            f.write(f"Total params: {len(all_param_names)}\n")
-                            f.write(f"LoRA params found: {len(lora_param_names)}\n")
-                            f.write(f"TP size: {tp_size}, ETP size: {etp_size}, EP size: {ep_size}\n")
-                            f.write("LoRA params with shapes and norms:\n")
-                            total_norm = 0.0
-                            nonzero_count = 0
-                            for n in lora_param_names[:50]:
-                                if n in adapter_state:
-                                    t = adapter_state[n]
-                                    shape = list(t.shape)
-                                    norm = float(t.norm().item())
-                                    max_val = float(t.abs().max().item())
-                                    total_norm += norm
-                                    if norm > 1e-8:
-                                        nonzero_count += 1
-                                    f.write(f"  {n}: shape={shape}, norm={norm:.6f}, max={max_val:.6f}\n")
-                            f.write(f"\nSummary: {nonzero_count}/{len(lora_param_names[:50])} tensors non-zero, total_norm={total_norm:.6f}\n")
-                            f.write("===\n")
-                        # ALSO LOG TO STDOUT for visibility in server logs
-                        logger.info(f"[Rank 0] LoRA TENSOR NORMS: {nonzero_count}/{len(lora_param_names[:50])} non-zero, total_norm={total_norm:.6f}")
-                        for n in lora_param_names[:5]:
-                            if n in adapter_state:
-                                t = adapter_state[n]
-                                norm = float(t.norm().item())
-                                logger.info(f"[Rank 0] TENSOR {n}: norm={norm:.6f}")
-                    except Exception as e:
-                        logger.warning(f"Failed to write debug file: {e}")
-
-                    if lora_param_names:
-                        logger.info(f"[Rank 0] Sample LoRA params: {lora_param_names[:5]}")
-                    else:
-                        logger.warning("[Rank 0] NO .adapter. params found in named_parameters()")
-            except Exception as e:
-                logger.error(f"[Rank {self.rank}] named_parameters() extraction failed: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
-
-            # Log before exiting eval_mode to detect if exit is blocked
-            logger.info(f"[Rank {self.rank}] get_lora_state_dict: extraction complete, about to exit eval_mode (adapter_state has {len(adapter_state)} keys)")
-
-            # SECOND: If direct extraction failed, try bridge.export_hf_weights()
-            # NOTE: Modern Megatron-Bridge uses export_hf_weights(), not the old export_weights() API.
-            # export_weights() merges LoRA into base weights, which is not what we want.
-            # CRITICAL: Use lora_param_names (same across all ranks) not adapter_state (only rank 0 has data)
-            adapter_param_names = []  # Track across fallbacks for symmetric branching
-            if not lora_param_names:
-                bridge = getattr(self.engine, 'bridge', None)
-                has_export_hf_weights = bridge is not None and hasattr(bridge, 'export_hf_weights')
-
-                if has_export_hf_weights:
-                    logger.info(f"[Rank {self.rank}] Fallback to bridge.export_hf_weights()")
-                    try:
-                        adapter_patterns = ['lora', 'adapter', 'peft']
-                        all_param_names = []
-
-                        for name, tensor in bridge.export_hf_weights(self.engine.module):
-                            all_param_names.append(name)
-                            name_lower = name.lower()
-                            if any(pattern in name_lower for pattern in adapter_patterns):
-                                adapter_param_names.append(name)
-                                # CRITICAL: ALL ranks must do the same work to avoid NCCL deadlock!
-                                cloned = tensor.data.clone().cpu() if tensor.is_cuda else tensor.data.clone()
-                                if self.rank == 0:
-                                    adapter_state[name] = cloned
-
-                        logger.info(f"[Rank {self.rank}] bridge.export_hf_weights() returned {len(all_param_names)} params, {len(adapter_param_names)} adapter")
-
-                        if self.rank == 0 and not adapter_param_names:
-                            logger.warning("[Rank 0] NO adapter params found via export_hf_weights()")
-                    except Exception as e:
-                        logger.error(f"[Rank {self.rank}] bridge.export_hf_weights() failed: {e}")
-
-            # THIRD: Try verl's get_adapter_state_dict as last resort (also within eval_mode)
-            # CRITICAL: ALL ranks must attempt this to stay synchronized
-            # Use symmetric condition: no params found from prior methods
-            if not lora_param_names and not adapter_param_names:
-                logger.info(f"[Rank {self.rank}] Trying get_adapter_state_dict() fallback...")
-                try:
-                    from verl.utils.megatron_peft_utils import get_adapter_state_dict
-                    raw_state = get_adapter_state_dict(self.engine.module)
-                    logger.info(f"[Rank {self.rank}] get_adapter_state_dict returned {len(raw_state)} params")
-                    for name, tensor in raw_state.items():
-                        # ALL ranks must participate in gathering
-                        split_dim = _get_lora_tp_split_dim(name, etp_size=etp_size)
-                        if split_dim is not None and tp_group is not None and tp_size > 1:
-                            gathered = _gather_tensor_across_tp(tensor, tp_group, split_dim)
-                            cloned = gathered.cpu()
-                        else:
-                            cloned = tensor.cpu() if tensor.is_cuda else tensor.clone()
-                        if self.rank == 0:
-                            adapter_state[name] = cloned
-                    if self.rank == 0 and adapter_state:
-                        sample_keys = list(adapter_state.keys())[:5]
-                        logger.info(f"[Rank 0] Sample Megatron keys: {sample_keys}")
-                except ImportError:
-                    logger.warning(f"[Rank {self.rank}] verl.utils.megatron_peft_utils not available")
-                except Exception as e:
-                    logger.error(f"[Rank {self.rank}] get_adapter_state_dict failed: {e}")
-
-        # Non-rank-0 workers return empty dict
         if self.rank != 0:
-            logger.info(f"[Rank {self.rank}] get_lora_state_dict: returning empty dict (non-rank-0)")
+            logger.info(
+                "[Rank %s] get_lora_state_dict: returning empty dict (non-rank-0)",
+                self.rank,
+            )
             return {}
 
         if not adapter_state:
-            logger.warning("[Rank 0] No adapter/LoRA parameters found!")
+            logger.warning("[Rank 0] Megatron-Bridge export_adapter_weights returned no adapter tensors")
             return {}
 
-        # Convert to PEFT format
-        # HF names: model.layers.X.self_attn.q_proj.lora_A.weight
-        # PEFT names: base_model.model.model.layers.X.self_attn.q_proj.lora_A.weight
-        def _is_mlp_module(param_name: str) -> bool:
-            """Check if parameter is from MLP/expert layer."""
-            mlp_patterns = ['.mlp.', '.experts.', 'linear_fc1', 'linear_fc2',
-                           'gate_proj', 'up_proj', 'down_proj', 'shared_expert']
-            name_lower = param_name.lower()
-            return any(p in name_lower for p in mlp_patterns)
-
-        # Get number of experts for per-expert expansion (only when use_per_expert_lora=True)
-        num_experts = 0
-        if model_is_moe and use_per_expert_lora:
-            try:
-                from transformers import AutoConfig
-                hf_config = AutoConfig.from_pretrained(self.base_model, trust_remote_code=True)
-                # Different HF configs use different attribute names
-                num_experts = getattr(hf_config, "num_experts", None) or getattr(hf_config, "n_routed_experts", 0)
-                logger.info(f"[Rank 0] MoE model with {num_experts} experts - expanding shared LoRA to per-expert format")
-            except Exception as e:
-                logger.warning(f"[Rank 0] Could not get num_experts: {e}, disabling per-expert expansion")
-                use_per_expert_lora = False
-
-        if model_is_moe and not use_per_expert_lora:
-            logger.info("[Rank 0] MoE model detected - filtering MLP/expert modules (no MLP LoRA trained)")
-            logger.info("[Rank 0] Set use_per_expert_lora=True if MLP LoRA was trained")
-
-        lora_state_dict = {}
-        mlp_filtered_count = 0
-        mlp_expanded_count = 0
-
-        import os
-
-        def _ep_rank_to_expert_range(ep_rank_idx: int, *, ep_size: int, num_experts: int) -> tuple[int, int]:
-            """Map an EP rank to its contiguous expert ID range (linear placement).
-
-            Mirrors vLLM's `determine_expert_map(..., expert_placement_strategy='linear')`.
-            """
-            if ep_size <= 1:
-                return 0, num_experts
-            base = num_experts // ep_size
-            rem = num_experts % ep_size
-            start = ep_rank_idx * base + min(ep_rank_idx, rem)
-            local = base + 1 if ep_rank_idx < rem else base
-            end = min(num_experts, start + local)
-            return start, end
-
-        sparse_expert_export = (
-            bool(model_is_moe)
-            and bool(use_per_expert_lora)
-            and num_experts > 0
-            and ep_size > 1
-            and os.environ.get("MINT_MOE_LORA_SPARSE_EXPERT_EXPORT", "1").strip() != "0"
-        )
-        expert_representatives = []
-        if sparse_expert_export:
-            # One representative expert per EP shard (linear placement).
-            # The vLLM hot-load patch reconstructs full per-expert tensors at load time.
-            base = num_experts // ep_size
-            rem = num_experts % ep_size
-            expert_representatives = [
-                (r * base + min(r, rem))
-                for r in range(ep_size)
-                if (base + (1 if r < rem else 0)) > 0
-            ]
-
+        sample_keys = list(adapter_state.keys())[:5]
         logger.info(
-            f"[Rank 0] Processing {len(adapter_state)} params from adapter_state "
-            f"(ep_size={ep_size}, sparse_expert_export={sparse_expert_export}, "
-            f"expert_representatives={len(expert_representatives)})"
+            "[Rank 0] Megatron-Bridge export_adapter_weights returned %s tensors sample_keys=%s",
+            len(adapter_state),
+            sample_keys,
         )
+        return adapter_state
 
-        # First pass: group EP-indexed keys by base name
-        ep_grouped_params = {}  # base_name -> {ep_rank: tensor}
-        regular_params = {}  # name -> tensor
-        for name, tensor in adapter_state.items():
-            if '::EP_RANK::' in name:
-                # Parse EP-indexed key: base_name::EP_RANK::X
-                base_name, _, ep_rank_str = name.rpartition('::EP_RANK::')
-                ep_rank_idx = int(ep_rank_str)
-                if base_name not in ep_grouped_params:
-                    ep_grouped_params[base_name] = {}
-                ep_grouped_params[base_name][ep_rank_idx] = tensor
-            else:
-                regular_params[name] = tensor
+    
 
-        logger.info(f"[Rank 0] Found {len(ep_grouped_params)} EP-grouped params, {len(regular_params)} regular params")
-
-        # Process EP-grouped params with correct expert assignment
-        for base_name, ep_tensors in ep_grouped_params.items():
-            # Convert base name to PEFT format
-            peft_name = self._convert_megatron_to_peft(base_name)
-            if peft_name is None:
-                logger.warning(f"Could not convert to PEFT: {base_name}")
-                continue
-
-            # Handle MoE MLP/expert modules with EP-aware expansion
-            if model_is_moe and _is_mlp_module(peft_name):
-                is_shared_expert = '.shared_expert.' in peft_name
-
-                if use_per_expert_lora and num_experts > 0 and not is_shared_expert:
-                    # Split fused gate_up_proj if needed, then expand with EP-aware indexing
-                    if '.gate_up_proj_fused.' in peft_name:
-                        gate_peft_name = peft_name.replace('.gate_up_proj_fused.', '.gate_proj.')
-                        up_peft_name = peft_name.replace('.gate_up_proj_fused.', '.up_proj.')
-
-                        # Expand with correct EP rank -> expert index mapping
-                        for ep_rank_idx, tensor in ep_tensors.items():
-                            expert_start, expert_end = _ep_rank_to_expert_range(
-                                ep_rank_idx, ep_size=ep_size, num_experts=num_experts
-                            )
-                            if expert_start >= expert_end:
-                                continue
-
-                            if '.lora_A.' in peft_name:
-                                gate_tensor = tensor
-                                up_tensor = tensor
-                            elif '.lora_B.' in peft_name:
-                                # Use TP-aware split for interleaved gate+up layout
-                                # For MoE experts, use etp_size; if ETP=1, fallback to simple split
-                                gate_tensor, up_tensor = _split_fused_gate_up_lora_b(tensor, etp_size)
-                            else:
-                                continue
-
-                            if sparse_expert_export:
-                                rep_experts = [
-                                    e
-                                    for e in expert_representatives
-                                    if expert_start <= e < expert_end
-                                ]
-                            else:
-                                rep_experts = range(expert_start, expert_end)
-                            for expert_idx in rep_experts:
-                                gate_expert_name = gate_peft_name.replace(
-                                    '.mlp.gate_proj.', f'.mlp.experts.{expert_idx}.gate_proj.'
-                                )
-                                up_expert_name = up_peft_name.replace(
-                                    '.mlp.up_proj.', f'.mlp.experts.{expert_idx}.up_proj.'
-                                )
-                                lora_state_dict[gate_expert_name] = gate_tensor.clone()
-                                lora_state_dict[up_expert_name] = up_tensor.clone()
-                                mlp_expanded_count += 2
-
-                        logger.info(
-                            f"[Rank 0] EP-expanded fused MLP LoRA for {len(ep_tensors)} EP shards "
-                            f"(sparse={sparse_expert_export})"
-                        )
-                    else:
-                        # Non-fused modules with EP-aware expansion
-                        for ep_rank_idx, tensor in ep_tensors.items():
-                            expert_start, expert_end = _ep_rank_to_expert_range(
-                                ep_rank_idx, ep_size=ep_size, num_experts=num_experts
-                            )
-                            if expert_start >= expert_end:
-                                continue
-
-                            if sparse_expert_export:
-                                rep_experts = [
-                                    e
-                                    for e in expert_representatives
-                                    if expert_start <= e < expert_end
-                                ]
-                            else:
-                                rep_experts = range(expert_start, expert_end)
-                            for expert_idx in rep_experts:
-                                # Insert expert index into path
-                                if '.mlp.gate_proj.' in peft_name:
-                                    expert_peft_name = peft_name.replace('.mlp.gate_proj.', f'.mlp.experts.{expert_idx}.gate_proj.')
-                                elif '.mlp.up_proj.' in peft_name:
-                                    expert_peft_name = peft_name.replace('.mlp.up_proj.', f'.mlp.experts.{expert_idx}.up_proj.')
-                                elif '.mlp.down_proj.' in peft_name:
-                                    expert_peft_name = peft_name.replace('.mlp.down_proj.', f'.mlp.experts.{expert_idx}.down_proj.')
-                                else:
-                                    expert_peft_name = peft_name.replace('.mlp.', f'.mlp.experts.{expert_idx}.')
-                                lora_state_dict[expert_peft_name] = tensor.clone()
-                                mlp_expanded_count += 1
-
-                        logger.info(
-                            f"[Rank 0] EP-expanded MLP LoRA: {base_name} (sparse={sparse_expert_export})"
-                        )
-                elif is_shared_expert:
-                    # Shared expert (EP rank 0 only for shared experts)
-                    if 0 in ep_tensors:
-                        lora_state_dict[peft_name] = ep_tensors[0]
-                        logger.info(f"[Rank 0] Added shared_expert MLP LoRA from EP rank 0: {peft_name}")
-                else:
-                    mlp_filtered_count += len(ep_tensors)
-                continue
-
-            # Non-MLP EP-grouped params (shouldn't happen, but handle gracefully)
-            if 0 in ep_tensors:
-                lora_state_dict[peft_name] = ep_tensors[0]
-
-        # Process regular (non-EP-indexed) params
-        for name, tensor in regular_params.items():
-            # Add PEFT prefix if not already present
-            if name.startswith("model."):
-                peft_name = f"base_model.model.{name}"
-            elif name.startswith("base_model."):
-                peft_name = name  # Already in PEFT format
-            else:
-                # Megatron format - need more complex conversion
-                peft_name = self._convert_megatron_to_peft(name)
-                if peft_name is None:
-                    logger.warning(f"Could not convert to PEFT: {name}")
-                    continue
-
-            # Handle MoE MLP/expert modules
-            # IMPORTANT: shared_expert modules should NOT be expanded to per-expert format
-            if model_is_moe and _is_mlp_module(peft_name):
-                is_shared_expert = '.shared_expert.' in peft_name
-
-                if use_per_expert_lora and num_experts > 0:
-                    # First check if this is a fused gate_up_proj that needs splitting
-                    if '.gate_up_proj_fused.' in peft_name:
-                        # Split the fused projection before expanding to per-expert
-                        gate_peft_name = peft_name.replace('.gate_up_proj_fused.', '.gate_proj.')
-                        up_peft_name = peft_name.replace('.gate_up_proj_fused.', '.up_proj.')
-
-                        if '.lora_A.' in peft_name:
-                            # lora_A is shared - duplicate for both gate and up
-                            gate_tensor = tensor.clone()
-                            up_tensor = tensor.clone()
-                        elif '.lora_B.' in peft_name:
-                            # lora_B uses TP-aware split for interleaved gate+up layout
-                            # For MoE/shared experts, use etp_size
-                            gate_tensor, up_tensor = _split_fused_gate_up_lora_b(tensor, etp_size)
-                        else:
-                            logger.warning(f"[Rank 0] Unknown lora type for fused MoE: {peft_name}")
-                            continue
-
-                        if is_shared_expert:
-                            # Shared expert: add directly without per-expert expansion
-                            lora_state_dict[gate_peft_name] = gate_tensor
-                            lora_state_dict[up_peft_name] = up_tensor
-                            logger.info(f"[Rank 0] Split shared_expert fused MLP LoRA: {gate_peft_name}, {up_peft_name}")
-                        else:
-                            # Routed experts: expand both gate and up to per-expert format
-                            for proj_name, proj_tensor in [(gate_peft_name, gate_tensor), (up_peft_name, up_tensor)]:
-                                expanded_names = self._expand_shared_to_per_expert(
-                                    proj_name,
-                                    num_experts,
-                                    expert_indices=expert_representatives if sparse_expert_export else None,
-                                )
-                                for expanded_name in expanded_names:
-                                    lora_state_dict[expanded_name] = proj_tensor.clone()
-                                    mlp_expanded_count += 1
-                            logger.info(f"[Rank 0] Split and expanded fused MLP LoRA to {len(expanded_names)*2} per-expert weights")
-                    else:
-                        # Non-fused modules
-                        if is_shared_expert:
-                            # Shared expert: add directly without expansion
-                            lora_state_dict[peft_name] = tensor
-                            logger.info(f"[Rank 0] Added shared_expert MLP LoRA: {peft_name}")
-                        else:
-                            # Routed experts: expand to per-expert
-                            expanded_names = self._expand_shared_to_per_expert(
-                                peft_name,
-                                num_experts,
-                                expert_indices=expert_representatives if sparse_expert_export else None,
-                            )
-                            for expanded_name in expanded_names:
-                                lora_state_dict[expanded_name] = tensor.clone()
-                                mlp_expanded_count += 1
-                else:
-                    # Filter out MLP modules when not using per-expert expansion
-                    mlp_filtered_count += 1
-                continue
-
-            lora_state_dict[peft_name] = tensor
-
-            # Special handling for fused gate+up projection (linear_fc1)
-            # vLLM's MergedColumnParallelLinearWithLoRA expects separate gate_proj and up_proj
-            # lora_A is duplicated, lora_B is split in half
-            if '.gate_up_proj_fused.' in peft_name:
-                gate_peft_name = peft_name.replace('.gate_up_proj_fused.', '.gate_proj.')
-                up_peft_name = peft_name.replace('.gate_up_proj_fused.', '.up_proj.')
-
-                if '.lora_A.' in peft_name:
-                    # lora_A is shared between gate and up projections
-                    lora_state_dict[gate_peft_name] = tensor.clone()
-                    lora_state_dict[up_peft_name] = tensor.clone()
-                    logger.info(f"[Rank 0] Split fused lora_A: {gate_peft_name}, {up_peft_name}")
-                elif '.lora_B.' in peft_name:
-                    # lora_B uses TP-aware split for interleaved gate+up layout
-                    # For dense layers (non-MoE), use tp_size
-                    gate_tensor, up_tensor = _split_fused_gate_up_lora_b(tensor, tp_size)
-                    lora_state_dict[gate_peft_name] = gate_tensor
-                    lora_state_dict[up_peft_name] = up_tensor
-                    logger.info(f"[Rank 0] Split fused lora_B: {gate_peft_name} shape {gate_tensor.shape}, {up_peft_name} shape {up_tensor.shape}")
-                else:
-                    logger.warning(f"[Rank 0] Unknown lora type for fused projection: {peft_name}")
-
-                # Remove the placeholder entry
-                del lora_state_dict[peft_name]
-
-        if model_is_moe:
-            if use_per_expert_lora:
-                logger.info(f"[Rank 0] Expanded {mlp_expanded_count} shared MLP modules to per-expert format")
-            else:
-                logger.info(f"[Rank 0] Filtered {mlp_filtered_count} MLP/expert modules for MoE model")
-        logger.info(f"[Rank 0] Extracted {len(lora_state_dict)} LoRA parameters (PEFT format)")
-
-        # Warn if all weights were filtered (e.g., LoRA targeted only MLP for MoE)
-        if not lora_state_dict and mlp_filtered_count > 0:
-            logger.warning(
-                f"[Rank 0] ALL LoRA weights were filtered ({mlp_filtered_count} MLP modules). "
-                "This may indicate LoRA was configured to target only expert layers. "
-                "Set use_per_expert_lora=True to expand shared MLP LoRA to per-expert format."
-            )
-
-        if lora_state_dict:
-            sample_peft_keys = list(lora_state_dict.keys())[:5]
-            logger.info(f"[Rank 0] Sample PEFT keys: {sample_peft_keys}")
-            # Log shapes for debugging vLLM compatibility
-            for key in list(lora_state_dict.keys())[:10]:
-                tensor = lora_state_dict[key]
-                logger.info(f"[Rank 0] FINAL PEFT {key}: shape={list(tensor.shape)}")
-
-        if model_is_moe and use_per_expert_lora and lora_state_dict:
-            import os
-            import re
-
-            mode = os.environ.get("MINT_MOE_LORA_SHARED_EXPERT_EXPORT", "1").strip().lower()
-            if mode in {"1", "true", "yes"}:
-                expert_pat = re.compile(r"\.mlp\.(?:shared_)?experts\.(\d+)\.")
-                before = len(lora_state_dict)
-                dropped = 0
-                filtered = {}
-                for k, v in lora_state_dict.items():
-                    m = expert_pat.search(k)
-                    if m is None:
-                        filtered[k] = v
-                        continue
-                    idx = int(m.group(1))
-                    if idx == 0:
-                        filtered[k] = v
-                    else:
-                        dropped += 1
-                lora_state_dict = filtered
-                logger.info(
-                    f"[Rank 0] Shared-expert export (custom extract): kept_expert=0 "
-                    f"dropped_keys={dropped} before={before} after={len(lora_state_dict)}"
-                )
-
-        return lora_state_dict
-
-    def _convert_megatron_to_peft(self, name: str) -> str | None:
-        """Convert Megatron LoRA param name to PEFT format.
-
-        Megatron-Bridge names (with vanilla_mbridge=False):
-            Standard attention:
-                decoder.layers.0.self_attention.linear_qkv.adapter.linear_in.weight
-                decoder.layers.0.self_attention.linear_proj.adapter.linear_in.weight
-
-            MLA attention (DeepSeek V3/Moonlight/K2):
-                decoder.layers.0.self_attention.linear_q_down_proj.adapter.linear_in.weight
-                decoder.layers.0.self_attention.linear_q_up_proj.adapter.linear_in.weight
-                decoder.layers.0.self_attention.linear_kv_down_proj.adapter.linear_in.weight
-                decoder.layers.0.self_attention.linear_kv_up_proj.adapter.linear_in.weight
-                decoder.layers.0.self_attention.linear_proj.adapter.linear_in.weight
-
-            MLP/Expert:
-                decoder.layers.0.mlp.experts.linear_fc1.adapter.linear_in.weight
-                decoder.layers.0.mlp.experts.linear_fc2.adapter.linear_out.weight
-
-        PEFT names (HuggingFace style):
-            Standard attention:
-                base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight
-                base_model.model.model.layers.0.self_attn.o_proj.lora_B.weight
-
-            MLA attention:
-                base_model.model.model.layers.0.self_attn.q_a_proj.lora_A.weight
-                base_model.model.model.layers.0.self_attn.q_b_proj.lora_A.weight
-                base_model.model.model.layers.0.self_attn.kv_a_proj_with_mqa.lora_A.weight
-                base_model.model.model.layers.0.self_attn.kv_b_proj.lora_A.weight
-                base_model.model.model.layers.0.self_attn.o_proj.lora_A.weight
-        """
-        import re
-
-        # Extract layer number
-        match = re.search(r'layers\.(\d+)\.', name)
-        if not match:
-            logger.warning(f"Could not extract layer number from: {name}")
-            return None
-        layer_num = match.group(1)
-
-        # Map adapter naming to LoRA naming
-        # adapter.linear_in -> lora_A, adapter.linear_out -> lora_B
-        if 'adapter.linear_in' in name:
-            lora_type = 'lora_A'
-        elif 'adapter.linear_out' in name:
-            lora_type = 'lora_B'
-        elif 'lora_a' in name.lower():
-            lora_type = 'lora_A'
-        elif 'lora_b' in name.lower():
-            lora_type = 'lora_B'
-        else:
-            logger.warning(f"Could not determine LoRA type from: {name}")
-            return None
-
-        # Check if this is an MLA model based on parameter names
-        # MLA models have linear_q_down_proj, linear_kv_down_proj, etc.
-        model_is_mla = any(p in name for p in [
-            'linear_q_down_proj', 'linear_q_up_proj',
-            'linear_kv_down_proj', 'linear_kv_up_proj'
-        ])
-
-        # Also check model registry for MLA flag (fallback)
-        if not model_is_mla:
-            try:
-                model_is_mla = get_model_config(self.base_model).is_mla
-            except (ValueError, AttributeError):
-                pass
-
-        # Determine the target module
-        target = None
-
-        # MLA attention projections (DeepSeek V3 / Moonlight / K2)
-        # Note: Megatron uses linear_q_proj (single), not linear_q_down_proj/linear_q_up_proj
-        if 'linear_q_proj' in name and 'linear_kv' not in name:
-            # MLA Q projection - maps to q_proj for vLLM
-            # (vLLM's DeepseekV3 model uses q_a_proj/q_b_proj internally but expects q_proj for LoRA)
-            target = 'self_attn.q_proj'
-        elif 'linear_q_down_proj' in name:
-            target = 'self_attn.q_a_proj'
-        elif 'linear_q_up_proj' in name:
-            target = 'self_attn.q_b_proj'
-        elif 'linear_kv_down_proj' in name:
-            target = 'self_attn.kv_a_proj_with_mqa'
-        elif 'linear_kv_up_proj' in name:
-            target = 'self_attn.kv_b_proj'
-        # Standard attention projections
-        elif 'linear_qkv.adapter' in name or 'linear_qkv.lora_' in name.lower():
-            # Fused QKV - map to q_proj (vLLM will handle the fused format)
-            target = 'self_attn.q_proj'
-        elif 'self_attention.linear_proj' in name:
-            target = 'self_attn.o_proj'
-        # MLP/Expert projections
-        # IMPORTANT: Distinguish shared_experts from routed experts
-        # shared_experts: single expert, always active (different intermediate size)
-        # experts: routed experts, need per-expert expansion
-        elif 'linear_fc1' in name:
-            if '.shared_experts.' in name:
-                # Shared expert MLP - use separate namespace to avoid overwriting routed experts
-                target = 'mlp.shared_expert.gate_up_proj_fused'
-            else:
-                # Routed expert MLP gate/up fused projection - map to gate_up_proj
-                # For vLLM MergedColumnParallelLinear, we need separate gate_proj and up_proj
-                # This is handled specially in get_lora_state_dict to split the B matrix
-                # Here we mark it as gate_up_proj_fused to trigger special handling
-                target = 'mlp.gate_up_proj_fused'
-        elif 'linear_fc2' in name:
-            if '.shared_experts.' in name:
-                # Shared expert down projection
-                target = 'mlp.shared_expert.down_proj'
-            else:
-                # Routed expert down projection
-                target = 'mlp.down_proj'
-
-        if target is None:
-            logger.warning(f"Unknown module pattern: {name}")
-            return None
-
-        peft_name = f"base_model.model.model.layers.{layer_num}.{target}.{lora_type}.weight"
-        return peft_name
-
-    def _expand_shared_to_per_expert(
-        self, peft_name: str, num_experts: int, *, expert_indices: list[int] | None = None
-    ) -> list[str]:
-        """Expand shared MLP LoRA to per-expert format for vLLM FusedMoEWithLoRA.
-
-        Megatron-Bridge exports shared LoRA (single adapter for all experts):
-            base_model.model.model.layers.X.mlp.gate_proj.lora_A.weight
-
-        vLLM FusedMoEWithLoRA expects per-expert weights:
-            base_model.model.model.layers.X.mlp.experts.0.gate_proj.lora_A.weight
-            base_model.model.model.layers.X.mlp.experts.1.gate_proj.lora_A.weight
-            ...
-
-        This method generates the per-expert weight names by inserting "experts.{i}."
-        into the MLP path for each expert.
-
-        Supported naming conventions:
-        - Qwen/standard: gate_proj, up_proj, down_proj
-        - DeepSeek/alternative: w1, w2, w3, gate_up_proj
-
-        Args:
-            peft_name: The shared PEFT name (e.g., ...mlp.gate_proj.lora_A.weight)
-            num_experts: Number of experts in the MoE model
-
-        Returns:
-            List of per-expert PEFT names
-        """
-        import re
-
-        # Pattern to match MLP module paths
-        # Shared: base_model.model.model.layers.X.mlp.gate_proj.lora_A.weight
-        # Per-expert: base_model.model.model.layers.X.mlp.experts.{i}.gate_proj.lora_A.weight
-        # Support multiple naming conventions: gate_proj/up_proj/down_proj (Qwen), w1/w2/w3 (DeepSeek), gate_up_proj (fused)
-        mlp_patterns = r'(gate_proj|up_proj|down_proj|w1|w2|w3|gate_up_proj)'
-        mlp_match = re.search(r'(\.mlp\.)(' + mlp_patterns + r')', peft_name)
-        if mlp_match:
-            # Insert experts.{i}. after .mlp.
-            prefix = peft_name[:mlp_match.end(1)]  # ...mlp.
-            suffix = peft_name[mlp_match.end(1):]  # gate_proj.lora_A.weight
-            idxs = expert_indices if expert_indices is not None else list(range(num_experts))
-            return [f"{prefix}experts.{i}.{suffix}" for i in idxs]
-
-        # If already has experts in path, just return the original
-        if '.experts.' in peft_name:
-            return [peft_name]
-
-        # Fallback: return original name if pattern not matched
-        logger.warning(f"Could not expand to per-expert format: {peft_name}")
-        return [peft_name]
+    
 
     def get_lora_weight_norm(self) -> float:
         """Compute L2 norm of all LoRA weights for debugging."""
@@ -4581,6 +3590,39 @@ class MegatronRankWorker:
                 "abs_sum": total_abs_sum,
                 "count": param_count,
             }
+
+    def debug_named_parameter(self, needle: str) -> dict:
+        """Inspect matching parameters for metadata and basic readback health."""
+        with self.engine.train_mode():
+            from verl.utils.megatron_utils import unwrap_model
+
+            model = unwrap_model(self.engine.module)
+            while isinstance(model, list):
+                model = model[0]
+
+            rows = []
+            for name, param in model.named_parameters():
+                if needle not in name:
+                    continue
+                row = {
+                    "rank": self.rank,
+                    "name": name,
+                    "shape": list(param.shape),
+                    "dtype": str(param.dtype),
+                    "device": str(param.device),
+                    "requires_grad": bool(param.requires_grad),
+                }
+                try:
+                    row["sum"] = float(param.data.float().sum().item())
+                except Exception as e:
+                    row["sum_error"] = f"{type(e).__name__}: {e}"
+                try:
+                    cpu_tensor = param.detach().cpu()
+                    row["cpu_shape"] = list(cpu_tensor.shape)
+                except Exception as e:
+                    row["cpu_error"] = f"{type(e).__name__}: {e}"
+                rows.append(row)
+            return {"matches": rows}
 
     def get_base_weight_checksum(self, max_params: int = 5) -> dict:
         """Compute checksum stats for a small sample of non-LoRA params (rank 0 only)."""
@@ -5143,6 +4185,9 @@ class MegatronRankWorker:
         step_count: int = 0,
         actual_rank: int | None = None,
         use_per_expert_lora: bool = False,
+        train_attn: bool | None = None,
+        train_mlp: bool | None = None,
+        train_unembed: bool | None = None,
         traceparent: str | None = None,
     ) -> dict:
         """Save LoRA weights in PEFT format for sampling (no optimizer/resume artifacts).
@@ -5157,7 +4202,12 @@ class MegatronRankWorker:
         from safetensors.torch import save_file
 
         # ALL ranks must call get_lora_state_dict - it uses NCCL collectives.
-        state_dict = self.get_lora_state_dict(use_per_expert_lora=use_per_expert_lora)
+        state_dict = self.get_lora_state_dict(
+            use_per_expert_lora=use_per_expert_lora,
+            train_attn=train_attn,
+            train_mlp=train_mlp,
+            train_unembed=train_unembed,
+        )
 
         os.makedirs(save_path, exist_ok=True)
 
@@ -6627,6 +5677,10 @@ class MegatronWorkerGroup:
         except Exception as e:
             logger.warning(f"[MegatronWorkerGroup] Failed to get LoRA checksum: {e}")
             return {"sum": 0.0, "abs_sum": 0.0, "count": 0}
+
+    def debug_named_parameter(self, needle: str) -> list[dict]:
+        """Inspect a parameter across all Megatron ranks."""
+        return ray.get([w.debug_named_parameter.remote(needle) for w in self.workers])
 
     def _get_base_weight_checksum(self) -> dict:
         """Get base weight checksum stats from rank 0 for debugging."""
@@ -8333,6 +7387,9 @@ class MegatronWorkerGroup:
                 self._step_count,
                 self._actual_rank,
                 use_per_expert_lora,
+                train_attn=train_attn,
+                train_mlp=train_mlp,
+                train_unembed=train_unembed,
                 traceparent=traceparent,
             )
             for w in self.workers
@@ -9042,6 +8099,15 @@ def get_or_create_megatron_worker_group(
             for k in (
                 "MINT_MOE_LORA_SPARSE_EXPERT_EXPORT",
                 "MINT_MOE_LORA_SHARED_EXPERT_EXPORT",
+            ):
+                v = os.environ.get(k)
+                if v is not None:
+                    runtime_env["env_vars"][k] = v
+            for k in (
+                "CUDA_LAUNCH_BLOCKING",
+                "TORCH_DISTRIBUTED_DEBUG",
+                "NCCL_DEBUG",
+                "NCCL_DEBUG_SUBSYS",
             ):
                 v = os.environ.get(k)
                 if v is not None:

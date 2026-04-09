@@ -1,0 +1,167 @@
+{
+  "run_meta": {
+    "model_name": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+    "model_path": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-30B-A3B-Instruct-2507/snapshots/0d7cf23991f47feeb3a57ecb4c9cee8ea4a17bfe",
+    "session_id": "e87a09ac-2e2e-4e02-b1da-a6f6af996bc9",
+    "model_id": "e87a09ac-2e2e-4e02-b1da-a6f6af996bc9_0",
+    "seed": 42,
+    "n_epochs": 20,
+    "batch_size": 4,
+    "steps_per_epoch": 8,
+    "total_steps": 160,
+    "learning_rate": 5e-05,
+    "lora_rank": 64,
+    "data_file": "/vePFS-Mindverse/share/code/yiwen/tinker-server-issue467-eval/context/dishlist_mint_e2e/data/turn10_tcov_1_0.json",
+    "base_url": "http://127.0.0.1:8012"
+  },
+  "checkpoint_results": {
+    "step_0000": {
+      "checkpoint_name": "step_0000",
+      "state_path": "mint://e87a09ac-2e2e-4e02-b1da-a6f6af996bc9_0/weights/step_0000",
+      "sampling_session_id": "issue467-step_0000-1775730686:sample:0",
+      "train": {
+        "summary": {
+          "n": 30,
+          "overall_accuracy": 0.0,
+          "write_success": 0.0,
+          "generalization_accuracy": 0.0,
+          "length_extrapolation_accuracy": 0.0,
+          "update_fidelity": 0.0,
+          "stale_answer_rate": 0.0,
+          "abstention_accuracy": 0.0,
+          "by_format": {
+            "qa": 0.0
+          }
+        },
+        "predictions_path": "/vePFS-Mindverse/share/code/yiwen/issue467_api_full_verify_20260409_retry1/step_0000/train_predictions.jsonl"
+      },
+      "test": {
+        "summary": {
+          "n": 30,
+          "overall_accuracy": 0.0,
+          "write_success": 0.0,
+          "generalization_accuracy": 0.0,
+          "length_extrapolation_accuracy": 0.0,
+          "update_fidelity": 0.0,
+          "stale_answer_rate": 0.0,
+          "abstention_accuracy": 0.0,
+          "by_format": {
+            "qa": 0.0
+          }
+        },
+        "predictions_path": "/vePFS-Mindverse/share/code/yiwen/issue467_api_full_verify_20260409_retry1/step_0000/test_predictions.jsonl"
+      }
+    },
+    "step_0040": {
+      "checkpoint_name": "step_0040",
+      "state_path": "mint://e87a09ac-2e2e-4e02-b1da-a6f6af996bc9_0/weights/step_0040",
+      "sampling_session_id": "issue467-step_0040-1775731307:sample:0",
+      "train": {
+        "summary": {
+          "n": 30,
+          "overall_accuracy": 0.1667,
+          "write_success": 0.1667,
+          "generalization_accuracy": 0.0,
+          "length_extrapolation_accuracy": 0.0,
+          "update_fidelity": 0.0,
+          "stale_answer_rate": 0.0,
+          "abstention_accuracy": 0.0,
+          "by_format": {
+            "qa": 0.1667
+          }
+        },
+        "predictions_path": "/vePFS-Mindverse/share/code/yiwen/issue467_api_full_verify_20260409_retry1/step_0040/train_predictions.jsonl"
+      },
+      "test": {
+        "summary": {
+          "n": 30,
+          "overall_accuracy": 0.0,
+          "write_success": 0.0,
+          "generalization_accuracy": 0.0,
+          "length_extrapolation_accuracy": 0.0,
+          "update_fidelity": 0.0,
+          "stale_answer_rate": 0.0,
+          "abstention_accuracy": 0.0,
+          "by_format": {
+            "qa": 0.0
+          }
+        },
+        "predictions_path": "/vePFS-Mindverse/share/code/yiwen/issue467_api_full_verify_20260409_retry1/step_0040/test_predictions.jsonl"
+      }
+    },
+    "step_0080": {
+      "checkpoint_name": "step_0080",
+      "state_path": "mint://e87a09ac-2e2e-4e02-b1da-a6f6af996bc9_0/weights/step_0080",
+      "sampling_session_id": "issue467-step_0080-1775731925:sample:0",
+      "train": {
+        "summary": {
+          "n": 30,
+          "overall_accuracy": 0.9667,
+          "write_success": 0.9667,
+          "generalization_accuracy": 0.0,
+          "length_extrapolation_accuracy": 0.0,
+          "update_fidelity": 0.0,
+          "stale_answer_rate": 0.0,
+          "abstention_accuracy": 0.0,
+          "by_format": {
+            "qa": 0.9667
+          }
+        },
+        "predictions_path": "/vePFS-Mindverse/share/code/yiwen/issue467_api_full_verify_20260409_retry1/step_0080/train_predictions.jsonl"
+      },
+      "test": {
+        "summary": {
+          "n": 30,
+          "overall_accuracy": 0.5667,
+          "write_success": 0.5667,
+          "generalization_accuracy": 0.0,
+          "length_extrapolation_accuracy": 0.0,
+          "update_fidelity": 0.0,
+          "stale_answer_rate": 0.0,
+          "abstention_accuracy": 0.0,
+          "by_format": {
+            "qa": 0.5667
+          }
+        },
+        "predictions_path": "/vePFS-Mindverse/share/code/yiwen/issue467_api_full_verify_20260409_retry1/step_0080/test_predictions.jsonl"
+      }
+    },
+    "step_0160": {
+      "checkpoint_name": "step_0160",
+      "state_path": "mint://e87a09ac-2e2e-4e02-b1da-a6f6af996bc9_0/weights/step_0160",
+      "sampling_session_id": "issue467-step_0160-1775733032:sample:0",
+      "train": {
+        "summary": {
+          "n": 30,
+          "overall_accuracy": 1.0,
+          "write_success": 1.0,
+          "generalization_accuracy": 0.0,
+          "length_extrapolation_accuracy": 0.0,
+          "update_fidelity": 0.0,
+          "stale_answer_rate": 0.0,
+          "abstention_accuracy": 0.0,
+          "by_format": {
+            "qa": 1.0
+          }
+        },
+        "predictions_path": "/vePFS-Mindverse/share/code/yiwen/issue467_api_full_verify_20260409_retry1/step_0160/train_predictions.jsonl"
+      },
+      "test": {
+        "summary": {
+          "n": 30,
+          "overall_accuracy": 0.8,
+          "write_success": 0.8,
+          "generalization_accuracy": 0.0,
+          "length_extrapolation_accuracy": 0.0,
+          "update_fidelity": 0.0,
+          "stale_answer_rate": 0.0,
+          "abstention_accuracy": 0.0,
+          "by_format": {
+            "qa": 0.8
+          }
+        },
+        "predictions_path": "/vePFS-Mindverse/share/code/yiwen/issue467_api_full_verify_20260409_retry1/step_0160/test_predictions.jsonl"
+      }
+    }
+  }
+}

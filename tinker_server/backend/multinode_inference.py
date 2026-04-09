@@ -1043,6 +1043,7 @@ def _create_multinode_vllm_actor(
             """
             self._bind_traceparent(traceparent)
             from vllm.lora.request import LoRARequest
+            from .lora_utils import validate_peft_adapter_checkpoint_shapes
 
             lora_request = LoRARequest(
                 lora_name=lora_name,
@@ -1055,6 +1056,10 @@ def _create_multinode_vllm_actor(
                 async with self._lock_write():
                     t1 = time.perf_counter()
                     try:
+                        validate_peft_adapter_checkpoint_shapes(
+                            lora_path,
+                            self.model_path,
+                        )
                         await self.engine.add_lora(lora_request)
                     except Exception:
                         import json

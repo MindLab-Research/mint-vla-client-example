@@ -30,6 +30,20 @@ class _FakeTrainMode:
         return None
 
 
+class _FakeEvalMode:
+    def __init__(self, state: dict):
+        self._state = state
+
+    def __enter__(self):
+        self._state["eval_enter"] += 1
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        _ = (exc_type, exc, tb)
+        self._state["eval_exit"] += 1
+        return None
+
+
 class _FakeEngine:
     def __init__(self, state: dict):
         self._state = state
@@ -40,7 +54,7 @@ class _FakeEngine:
         return _FakeTrainMode(self._state)
 
     def eval_mode(self):
-        return _FakeTrainMode(self._state)
+        return _FakeEvalMode(self._state)
 
     def forward_backward_batch(self, *args, **kwargs):
         """Default no-op; override in tests to raise."""
@@ -234,7 +248,7 @@ def _make_worker(
     monkeypatch.setenv("MINT_MEGATRON_STICKY_TRAIN_MODE", "1")
     monkeypatch.setenv("MINT_MEGATRON_STICKY_IDLE_TIMEOUT_S", idle_timeout_s)
     monkeypatch.setenv("MINT_MEGATRON_STICKY_CLOSE_ON_OPTIM", close_on_optim)
-    state = {"enter": 0, "exit": 0}
+    state = {"enter": 0, "exit": 0, "eval_enter": 0, "eval_exit": 0}
     impl_cls = MegatronRankWorker.__ray_metadata__.modified_class
     worker = impl_cls(
         rank=0,
@@ -2457,7 +2471,6 @@ def test_issue_193_get_lora_state_dict_releases_sticky_before_eval_mode(monkeypa
     from types import SimpleNamespace
 
     worker, _ = _make_worker(monkeypatch, close_on_optim="0")
-    worker.engine.eval_mode = worker.engine.train_mode  # type: ignore[attr-defined]
     worker.engine.module = object()
     worker.engine.bridge = SimpleNamespace(
         export_adapter_weights=lambda *args, **kwargs: [("adapter.weight", torch.ones(1))]
@@ -2479,6 +2492,61 @@ def test_issue_193_get_lora_state_dict_releases_sticky_before_eval_mode(monkeypa
 
     assert release_calls == [("get_lora_state_dict", True)]
     assert list(state_dict.keys()) == ["adapter.weight"]
+
+
+def test_issue_467_get_lora_state_dict_enters_eval_mode_for_bridge_export(monkeypatch):
+    import torch
+
+    worker, state = _make_worker(monkeypatch, close_on_optim="0")
+    worker.engine.module = object()
+
+    calls: list[tuple[object, bool, bool]] = []
+
+    class _Bridge:
+        def export_adapter_weights(self, module, cpu=True, show_progress=True):
+            calls.append((module, cpu, show_progress))
+            return [("adapter.weight", torch.ones(1))]
+
+    worker.engine.bridge = _Bridge()
+
+    state_dict = worker.get_lora_state_dict()
+
+    assert calls == [(worker.engine.module, True, False)]
+    assert list(state_dict.keys()) == ["adapter.weight"]
+    assert state["enter"] == 0
+    assert state["exit"] == 0
+    assert state["eval_enter"] == 1
+    assert state["eval_exit"] == 1
+
+
+def test_issue_467_get_lora_state_dict_uses_bridge_export_without_custom_fallback(monkeypatch):
+    import torch
+
+    worker, _ = _make_worker(monkeypatch, close_on_optim="0")
+    worker.engine.module = object()
+
+    calls: list[tuple[object, bool, bool]] = []
+
+    class _Bridge:
+        def export_adapter_weights(self, module, cpu=True, show_progress=True):
+            calls.append((module, cpu, show_progress))
+            return [("base_model.model.layers.0.self_attn.q_proj.lora_A.weight", torch.ones(2, 3))]
+
+    worker.engine.bridge = _Bridge()
+
+    state_dict = worker.get_lora_state_dict(use_per_expert_lora=False)
+
+    assert calls == [(worker.engine.module, True, False)]
+    assert list(state_dict.keys()) == ["base_model.model.layers.0.self_attn.q_proj.lora_A.weight"]
+
+
+def test_issue_467_get_lora_state_dict_fails_when_bridge_export_is_missing(monkeypatch):
+    worker, _ = _make_worker(monkeypatch, close_on_optim="0")
+    worker.engine.module = object()
+    worker.engine.bridge = object()
+
+    with pytest.raises(RuntimeError, match="export_adapter_weights"):
+        worker.get_lora_state_dict()
 
 
 def test_issue_193_load_optimizer_state_releases_sticky_before_train_mode(monkeypatch, tmp_path):
