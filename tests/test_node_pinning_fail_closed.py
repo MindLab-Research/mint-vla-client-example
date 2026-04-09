@@ -114,26 +114,33 @@ def test_assert_node_ip_capacity_reports_missing_node(
         )
 
 
-def test_available_resources_per_node_safe_falls_back_in_ray_client_mode(
+def test_list_alive_gpu_nodes_falls_back_when_private_state_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    vp = _import_volc_placement(monkeypatch)
-    expected = {"node-1": {"GPU": 4.0}}
+    ray = types.ModuleType("ray")
+    ray.is_initialized = lambda: True  # type: ignore[attr-defined]
+    ray.nodes = lambda: [  # type: ignore[attr-defined]
+        {
+            "Alive": True,
+            "NodeID": "node-1",
+            "NodeManagerAddress": "10.0.0.7",
+            "NodeManagerHostname": "worker-7",
+            "Resources": {"GPU": 8.0},
+        }
+    ]
+    ray.util = SimpleNamespace(placement_group_table=lambda: {})
+    monkeypatch.setitem(sys.modules, "ray", ray)
 
-    class _RaySystemError(RuntimeError):
-        pass
-
-    calls: list[str] = []
-
-    monkeypatch.setattr(
-        sys.modules["ray._private"].state,
-        "available_resources_per_node",
-        lambda: (_ for _ in ()).throw(_RaySystemError("Ray has not been started yet")),
+    ray_private = types.ModuleType("ray._private")
+    ray_private.state = SimpleNamespace(
+        available_resources_per_node=lambda: (_ for _ in ()).throw(RuntimeError("client mode"))
     )
-    vp.ray.remote = lambda **_kwargs: (  # type: ignore[attr-defined]
-        lambda fn: SimpleNamespace(remote=lambda: (calls.append("remote"), expected)[1])
-    )
-    vp.ray.get = lambda ref: ref  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "ray._private", ray_private)
 
-    assert vp._available_resources_per_node_safe() == expected
-    assert calls == ["remote"]
+    sys.modules.pop("tinker_server.backend.volc_placement", None)
+    vp = importlib.import_module("tinker_server.backend.volc_placement")
+
+    nodes = vp._list_alive_gpu_nodes()
+    assert len(nodes) == 1
+    assert nodes[0].node_ip == "10.0.0.7"
+    assert nodes[0].available_gpus == 8

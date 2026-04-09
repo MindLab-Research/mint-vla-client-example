@@ -152,9 +152,19 @@ def _list_alive_gpu_nodes() -> list[VolcGpuNode]:
     if not ray.is_initialized():
         raise RuntimeError("ray is not initialized (expected to be connected already)")
 
-    from ray._private import state as ray_state
+    avail: dict[str, dict] | None = None
+    try:
+        avail = _available_resources_per_node_safe()
+    except Exception as e:
+        # Ray Client does not populate ray._private.state global state on the
+        # local driver. Shared-test-env attaches through Ray Client, so keep the
+        # alive-node check working and defer exact GPU exhaustion detection to the
+        # subsequent actor/placement-group creation attempt.
+        logger.warning(
+            "available_resources_per_node unavailable; falling back to total GPU view err=%s",
+            e,
+        )
 
-    avail = _available_resources_per_node_safe()
     nodes: list[VolcGpuNode] = []
     for n in ray.nodes():
         if not n.get("Alive"):
@@ -167,8 +177,8 @@ def _list_alive_gpu_nodes() -> list[VolcGpuNode]:
         node_ip = str(n.get("NodeManagerAddress") or "")
         hostname = str(n.get("NodeManagerHostname") or "")
         total_gpus = int(float(res.get("GPU", 0) or 0))
-        node_avail = avail.get(node_id) or {}
-        available_gpus = int(float(node_avail.get("GPU", 0) or 0))
+        node_avail = (avail or {}).get(node_id) or {}
+        available_gpus = int(float(node_avail.get("GPU", total_gpus) or 0))
         nodes.append(
             VolcGpuNode(
                 node_id=node_id,

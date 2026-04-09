@@ -249,6 +249,29 @@ def apply_detached_actor_resources(options: dict[str, object], ray_module: Any |
         options["resources"] = {key: 0.001}
 
 
+def _worker_visible_py_executable(path: str | None) -> str | None:
+    raw = str(path or "").strip()
+    if not raw:
+        return None
+
+    job_working_dir = _env_nonempty(os.environ, "MINT_RAY_JOB_WORKING_DIR")
+    if not job_working_dir:
+        return raw
+
+    try:
+        rel = Path(raw).resolve().relative_to(Path(job_working_dir).resolve())
+    except Exception:
+        return raw
+
+    rel_path = f"./{rel.as_posix()}"
+    # Ray Client uploads `working_dir` as a package on the cluster. Workers cannot
+    # see the driver's absolute repo path. `.py` wrappers also lose their executable
+    # bit after packaging on this cluster, so invoke them through `python`.
+    if rel.suffix == ".py":
+        return f"python {rel_path}"
+    return rel_path
+
+
 def preferred_vllm_python_executable() -> str | None:
     explicit = _env_nonempty(os.environ, "MINT_VLLM_CHILD_PYTHON_EXECUTABLE")
     if explicit:
@@ -256,8 +279,8 @@ def preferred_vllm_python_executable() -> str | None:
     if PFS_TINKER_PATH:
         candidate = Path(PFS_TINKER_PATH) / "scripts" / "vllm_worker_python.py"
         if candidate.exists():
-            return str(candidate)
-    return None
+            return _worker_visible_py_executable(str(candidate))
+    return _worker_visible_py_executable(_env_nonempty(os.environ, "MINT_VLLM_CHILD_PYTHON_EXECUTABLE"))
 
 
 def preferred_torch_lib_dirs(environ: dict[str, str] | None = None) -> list[str]:
