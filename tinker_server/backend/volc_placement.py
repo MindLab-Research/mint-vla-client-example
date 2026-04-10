@@ -156,12 +156,11 @@ def _list_alive_gpu_nodes() -> list[VolcGpuNode]:
     try:
         avail = _available_resources_per_node_safe()
     except Exception as e:
-        # Ray Client does not populate ray._private.state global state on the
-        # local driver. Shared-test-env attaches through Ray Client, so keep the
-        # alive-node check working and defer exact GPU exhaustion detection to the
-        # subsequent actor/placement-group creation attempt.
+        # Ray Client may not populate ray._private.state on the local driver.
+        # Keep node liveness visibility, but treat per-node free GPU capacity as
+        # unknown so pinned-node preflight stays fail-closed.
         logger.warning(
-            "available_resources_per_node unavailable; falling back to total GPU view err=%s",
+            "available_resources_per_node unavailable; treating free GPU capacity as unknown err=%s",
             e,
         )
 
@@ -178,7 +177,7 @@ def _list_alive_gpu_nodes() -> list[VolcGpuNode]:
         hostname = str(n.get("NodeManagerHostname") or "")
         total_gpus = int(float(res.get("GPU", 0) or 0))
         node_avail = (avail or {}).get(node_id) or {}
-        available_gpus = int(float(node_avail.get("GPU", total_gpus) or 0))
+        available_gpus = int(float(node_avail.get("GPU", 0) or 0))
         nodes.append(
             VolcGpuNode(
                 node_id=node_id,

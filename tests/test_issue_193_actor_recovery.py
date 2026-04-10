@@ -674,7 +674,7 @@ def test_issue_193_megatron_missing_worker_rebinds_before_recycle(monkeypatch):
     assert rebind_calls == ["forward:missing_worker"]
 
 
-def test_issue_193_megatron_rebind_re_registers_resource_pool(monkeypatch):
+def test_issue_193_megatron_rebind_reuses_existing_actor_without_ready_probe(monkeypatch):
     engine = VerlTrainingEngine()
     model_id = "model_issue_193_megatron_rebind_registers_pool"
     worker = _FakeLoadWorker(ref="unused-load-ref")
@@ -734,14 +734,14 @@ def test_issue_193_megatron_rebind_re_registers_resource_pool(monkeypatch):
     )
 
     assert rebound is worker
-    assert keepalive_calls == [("fake-load-ready-ref", model_id, 30.0, 3600.0)]
+    assert keepalive_calls == []
     assert len(register_calls) == 1
     assert register_calls[0][1]["session_id"] == model_id
     assert register_calls[0][1]["num_gpus"] == 1
     assert mark_ready_calls == ["megatron_qwen3_30b_a3b_instruct_2507"]
 
 
-def test_issue_193_megatron_rebind_ready_death_maps_to_missing_worker(monkeypatch):
+def test_issue_193_megatron_rebind_created_actor_ready_death_maps_to_missing_worker(monkeypatch):
     engine = VerlTrainingEngine()
     model_id = "model_issue_193_megatron_rebind_ready_death"
     worker = _FakeLoadWorker(ref="unused-load-ref")
@@ -767,9 +767,8 @@ def test_issue_193_megatron_rebind_ready_death_maps_to_missing_worker(monkeypatc
         lambda _model: False,
     )
     monkeypatch.setattr(
-        ray,
-        "get_actor",
-        lambda actor_name, namespace=None: worker,
+        "tinker_server.backend.megatron_distributed.async_get_or_create_megatron_worker_group",
+        lambda **_kwargs: asyncio.sleep(0, result=worker),
     )
     monkeypatch.setattr(
         "tinker_server.backend.resource_pool.get_resource_pool",
@@ -791,7 +790,7 @@ def test_issue_193_megatron_rebind_ready_death_maps_to_missing_worker(monkeypatc
             engine._rebind_megatron_worker(
                 session,
                 reason="unit_test",
-                allow_create=False,
+                allow_create=True,
             )
         )
 

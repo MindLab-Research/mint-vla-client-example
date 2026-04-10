@@ -2109,22 +2109,23 @@ class VerlTrainingEngine:
                 )
             except ValueError as e:
                 raise RuntimeError(f"[{session.model_id}] missing worker for backend=megatron") from e
-        ready_timeout_s = (
-            float(server_config.training_actor_ready_timeout_s)
-            if server_config.training_actor_ready_timeout_s is not None
-            else 3600.0
-        )
-        try:
-            await self._await_with_keepalive(
-                worker.__ray_ready__.remote(),
-                session,
-                interval_s=30.0,
-                timeout_s=ready_timeout_s,
+        if allow_create:
+            ready_timeout_s = (
+                float(server_config.training_actor_ready_timeout_s)
+                if server_config.training_actor_ready_timeout_s is not None
+                else 3600.0
             )
-        except Exception as e:
-            if self._is_dead_actor_error(e):
-                raise RuntimeError(f"[{session.model_id}] missing worker for backend=megatron") from e
-            raise
+            try:
+                await self._await_with_keepalive(
+                    worker.__ray_ready__.remote(),
+                    session,
+                    interval_s=30.0,
+                    timeout_s=ready_timeout_s,
+                )
+            except Exception as e:
+                if self._is_dead_actor_error(e):
+                    raise RuntimeError(f"[{session.model_id}] missing worker for backend=megatron") from e
+                raise
         get_resource_pool().register(
             actor_name=actor_name,
             actor_type=ActorType.MEGATRON,

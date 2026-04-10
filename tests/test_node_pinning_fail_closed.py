@@ -114,7 +114,7 @@ def test_assert_node_ip_capacity_reports_missing_node(
         )
 
 
-def test_list_alive_gpu_nodes_falls_back_when_private_state_unavailable(
+def test_list_alive_gpu_nodes_stays_fail_closed_when_private_state_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ray = types.ModuleType("ray")
@@ -143,4 +143,11 @@ def test_list_alive_gpu_nodes_falls_back_when_private_state_unavailable(
     nodes = vp._list_alive_gpu_nodes()
     assert len(nodes) == 1
     assert nodes[0].node_ip == "10.0.0.7"
-    assert nodes[0].available_gpus == 8
+    assert nodes[0].total_gpus == 8
+    assert nodes[0].available_gpus == 0
+
+    with pytest.raises(RuntimeError, match="pinned node capacity check failed"):
+        vp.assert_node_ip_capacity(
+            required_gpus_by_node_ip={"10.0.0.7": 1},
+            context="client mode pin preflight",
+        )
