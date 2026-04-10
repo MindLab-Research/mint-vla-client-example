@@ -1479,12 +1479,6 @@ class ApiWorkQueueClient:
         except Exception as e:
             raise ApiWorkQueueUnavailableError("Ray import failed") from e
 
-        try:
-            from ..ray_utils import init_ray
-
-            init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
-        except Exception as e:
-            raise ApiWorkQueueUnavailableError("Ray not initialized (init_ray failed)") from e
         if not ray.is_initialized():
             raise ApiWorkQueueUnavailableError("Ray not initialized")
 
@@ -1673,12 +1667,6 @@ class ApiWorkQueueClient:
         except Exception as e:
             raise ApiWorkQueueUnavailableError("Ray import failed") from e
 
-        try:
-            from ..ray_utils import init_ray
-
-            init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
-        except Exception as e:
-            raise ApiWorkQueueUnavailableError("Ray not initialized (init_ray failed)") from e
         if not ray.is_initialized():
             raise ApiWorkQueueUnavailableError("Ray not initialized")
 

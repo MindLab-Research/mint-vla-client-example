@@ -191,10 +191,23 @@ async def _initialize_execution_bindings() -> dict[str, Any]:
     return {
         "inference_manager": inference_manager,
         "train_manager": train_manager,
+        "train_engine": train_engine,
         "multi_model_manager": multi_model_manager,
         "restored_sampling_sessions": int(restored_sampling_sessions),
         "multi_model_enabled": bool(config.enable_multi_lora),
     }
+
+
+async def _initialize_execution_runtime(*, prewarm: bool) -> dict[str, Any]:
+    bindings = await _initialize_execution_bindings()
+    if prewarm:
+        from .persistent_prewarm import prewarm_persistent_models
+
+        await prewarm_persistent_models(
+            bindings.get("train_engine"),
+            bindings.get("multi_model_manager"),
+        )
+    return bindings
 
 
 def _get_or_create_actor():
@@ -251,7 +264,7 @@ def _get_or_create_actor():
             async with self._lock:
                 try:
                     if not self._runtime_initialized:
-                        await _initialize_execution_bindings()
+                        await _initialize_execution_runtime(prewarm=True)
                         self._runtime_initialized = True
                     await self._ensure_observability_flush_task()
                     await capacity_manager.async_ensure_ready()
@@ -272,7 +285,7 @@ def _get_or_create_actor():
             from ..routes import training
 
             if not self._runtime_initialized:
-                await _initialize_execution_bindings()
+                await _initialize_execution_runtime(prewarm=True)
                 self._runtime_initialized = True
             session, _snapshot = await training._get_training_session_for_request(str(model_id))
             if session is None:

@@ -238,9 +238,9 @@ async def create_session(request: CreateSessionRequest, http_request: Request) -
     session_id = str(uuid.uuid4())
     user_id = _get_user_id(http_request)
     created_at = datetime.now().isoformat()
-    try:
-        from ..backend.session_index_store import upsert_session_index
+    from ..backend.session_index_store import upsert_session_index
 
+    try:
         upsert_session_index(
             {
                 "session_id": session_id,
@@ -251,7 +251,7 @@ async def create_session(request: CreateSessionRequest, http_request: Request) -
             }
         )
     except Exception as e:
-        logger.warning("[create_session] session index write failed: %s", e)
+        raise HTTPException(status_code=503, detail="Session index store unavailable") from e
     return CreateSessionResponse(session_id=session_id)
 
 
@@ -370,50 +370,47 @@ async def _create_sampling_session_impl(
         lora_rank = 0
 
     def _write_sampler_index(sampler_id: str) -> None:
-        try:
-            from ..backend.session_index_store import add_sampler_to_session, upsert_sampler_index
+        from ..backend.session_index_store import add_sampler_to_session, upsert_sampler_index
 
-            # Generic create_sampling_session children stay out of root heartbeat fanout.
-            add_sampler_to_session(
-                session_id=request.session_id,
-                sampler_id=sampler_id,
-                user_id=user_id,
-                created_at=created_at,
-            )
+        # Generic create_sampling_session children stay out of root heartbeat fanout.
+        add_sampler_to_session(
+            session_id=request.session_id,
+            sampler_id=sampler_id,
+            user_id=user_id,
+            created_at=created_at,
+        )
 
-            sampler_info: dict = {
-                "sampler_id": sampler_id,
-                "session_id": request.session_id,
-                "base_model": base_model,
-                "user_id": user_id,
-                "created_at": created_at,
-            }
+        sampler_info: dict = {
+            "sampler_id": sampler_id,
+            "session_id": request.session_id,
+            "base_model": base_model,
+            "user_id": user_id,
+            "created_at": created_at,
+        }
 
-            if request.model_path:
-                parsed = _parse_checkpoint_path(request.model_path)
-                if parsed:
-                    model_id, checkpoint_name = parsed
-                    sampler_info.update(
-                        {
-                            "source_type": "checkpoint",
-                            "model_id": model_id,
-                            "checkpoint_name": checkpoint_name,
-                            "model_path_raw": request.model_path,
-                        }
-                    )
-                else:
-                    sampler_info.update(
-                        {
-                            "source_type": "raw_model_path",
-                            "model_path_raw": request.model_path,
-                        }
-                    )
+        if request.model_path:
+            parsed = _parse_checkpoint_path(request.model_path)
+            if parsed:
+                model_id, checkpoint_name = parsed
+                sampler_info.update(
+                    {
+                        "source_type": "checkpoint",
+                        "model_id": model_id,
+                        "checkpoint_name": checkpoint_name,
+                        "model_path_raw": request.model_path,
+                    }
+                )
             else:
-                sampler_info.update({"source_type": "base_model"})
+                sampler_info.update(
+                    {
+                        "source_type": "raw_model_path",
+                        "model_path_raw": request.model_path,
+                    }
+                )
+        else:
+            sampler_info.update({"source_type": "base_model"})
 
-            upsert_sampler_index(sampler_info)
-        except Exception as e:
-            logger.warning("[create_sampling_session] sampler index write failed: %s", e)
+        upsert_sampler_index(sampler_info)
 
     if request.sampling_session_seq_id is not None:
         sampling_session_id = f"{request.session_id}:sample:{request.sampling_session_seq_id}"
@@ -438,7 +435,10 @@ async def _create_sampling_session_impl(
                     status_code=409,
                     detail="Sampling session already exists with different configuration",
                 )
-            _write_sampler_index(sampling_session_id)
+            try:
+                _write_sampler_index(sampling_session_id)
+            except Exception as e:
+                raise HTTPException(status_code=503, detail="Session index store unavailable") from e
             return CreateSamplingSessionResponse(sampling_session_id=sampling_session_id)
     else:
         sampling_session_id = str(uuid.uuid4())
@@ -463,6 +463,20 @@ async def _create_sampling_session_impl(
     except Exception as e:
         raise HTTPException(status_code=503, detail="Sampling session store unavailable") from e
 
+    try:
+        _write_sampler_index(sampling_session_id)
+    except Exception as e:
+        try:
+            from ..backend.sampling_session_store import delete_sampling_session
+
+            delete_sampling_session(sampling_session_id)
+        except Exception:
+            logger.warning(
+                "[create_sampling_session] cleanup failed after sampler index write error session_id=%s",
+                sampling_session_id,
+            )
+        raise HTTPException(status_code=503, detail="Session index store unavailable") from e
+
     if session_manager is not None:
         if request.model_path:
             session_manager.register_multi_lora_session(
@@ -474,8 +488,6 @@ async def _create_sampling_session_impl(
             )
         else:
             session_manager.register_base_model_session(sampling_session_id, base_model=base_model)
-
-    _write_sampler_index(sampling_session_id)
 
     return CreateSamplingSessionResponse(sampling_session_id=sampling_session_id)
 

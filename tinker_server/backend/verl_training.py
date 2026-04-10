@@ -3385,19 +3385,11 @@ class VerlTrainingEngine:
         session.is_active = False
         logger.info(f"[{model_id}] TrainingWorker unbound")
 
-    async def shutdown_session(self, session: TrainingSession) -> None:
-        """Backward-compatible alias for delete_session()."""
-        await self.delete_session(session)
-
     async def delete_session(self, session: TrainingSession) -> None:
         """Delete actor-local and persisted state, then unbind the session."""
         plan = self._build_session_unbind_plan(session)
         await self._delete_actor_local_session_state(session, worker=plan["worker"])
         await self._unbind_session(session, plan=plan)
-
-    async def delete_session(self, session: TrainingSession) -> None:
-        """Backward-compatible alias for session deletion paths."""
-        await self.shutdown_session(session)
 
 
 # Global engine instance (initialized in app lifespan)
