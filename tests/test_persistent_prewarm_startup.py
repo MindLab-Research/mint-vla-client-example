@@ -943,3 +943,58 @@ async def test_get_engine_checks_capacity_when_named_actor_probe_fails(monkeypat
 
     with pytest.raises(RuntimeError, match="capacity check ran"):
         await manager.get_engine("Qwen/Qwen3-0.6B")
+
+
+@pytest.mark.anyio
+async def test_issue_489_cleanup_stale_actors_uses_relaxed_ready_timeout(monkeypatch) -> None:
+    _install_fake_ray(monkeypatch)
+    import importlib
+
+    ray = importlib.import_module("ray")
+    actor_reconciliation_module = importlib.import_module("tinker_server.backend.actor_reconciliation")
+    resource_pool_module = importlib.import_module("tinker_server.backend.resource_pool")
+    multi_lora_engine_module = importlib.import_module("tinker_server.backend.multi_lora_engine")
+
+    timeout_calls: list[float] = []
+    register_calls: list[dict] = []
+    mark_ready_calls: list[str] = []
+
+    actor_handle = SimpleNamespace(
+        __ray_ready__=SimpleNamespace(remote=lambda: "ready-ref"),
+    )
+
+    monkeypatch.delenv("MINT_STARTUP_RECONCILE_READY_TIMEOUT_S", raising=False)
+    monkeypatch.setattr(app_module.config, "skip_actor_cleanup", False)
+    monkeypatch.setattr(actor_reconciliation_module, "init_ray", lambda **_kwargs: None)
+    monkeypatch.setattr(ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(ray.util, "list_named_actors", lambda **_kwargs: [
+        {"name": "megatron_qwen3_30b_a3b_instruct_2507", "namespace": multi_lora_engine_module.PERSISTENT_NAMESPACE}
+    ])
+    monkeypatch.setattr(ray, "get_actor", lambda *_args, **_kwargs: actor_handle)
+
+    def fake_get(_ref, timeout=None, **_kwargs):
+        timeout_calls.append(timeout)
+        raise ray.exceptions.GetTimeoutError("busy")
+
+    monkeypatch.setattr(ray, "get", fake_get)
+    monkeypatch.setattr(ray.util, "get_placement_group", lambda _name: object())
+    monkeypatch.setattr(ray.util, "placement_group_table", lambda _pg: {"bundles": {"0": {"GPU": 4}}})
+
+    class _FakePool:
+        def register(self, **kwargs):
+            register_calls.append(kwargs)
+
+        def mark_ready(self, actor_name):
+            mark_ready_calls.append(actor_name)
+
+        def unregister(self, _name):
+            return None
+
+    monkeypatch.setattr(resource_pool_module, "get_resource_pool", lambda: _FakePool())
+
+    await app_module._cleanup_stale_actors()
+
+    assert timeout_calls == [5.0]
+    assert len(register_calls) == 1
+    assert register_calls[0]["metadata"] == {"startup_reconcile": "__ray_ready__timeout"}
+    assert mark_ready_calls == []
