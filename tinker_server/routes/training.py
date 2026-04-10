@@ -73,6 +73,7 @@ from ..models.types import (
     ForwardRequest,
     GetInfoRequest,
     GetInfoResponse,
+    LoRAConfig,
     ModelData,
     OptimStepRequest,
     ResetExpertBiasRequest,
@@ -107,14 +108,6 @@ def _mark_training_inflight(model_id: str, delta: int) -> None:
     mark = getattr(training_manager, "mark_inflight", None)
     if callable(mark):
         mark(model_id, delta)
-
-
-def _refresh_training_observability(model_id: str) -> None:
-    if training_manager is None:
-        return
-    refresh = getattr(training_manager, "refresh_observability_session", None)
-    if callable(refresh):
-        refresh(model_id)
 
 
 async def _fail_future(request_id: str, error: str) -> None:
@@ -340,7 +333,6 @@ def _restore_training_session_info_compat(info: dict):
     session.backend = str(info.get("backend", getattr(session, "backend", "peft")) or "peft")
     session.current_step = int(info.get("current_step", getattr(session, "current_step", 0)) or 0)
     session.metadata_version = max(1, int(info.get("metadata_version", getattr(session, "metadata_version", 1)) or 1))
-    _refresh_training_observability(model_id)
     return session
 
 
@@ -401,7 +393,6 @@ async def _restore_training_session(model_id: str):
         except Exception:
             pass
         session.is_active = True
-        _refresh_training_observability(model_id)
 
         actor_name = info.get("actor_name")
         if actor_name:
@@ -436,7 +427,6 @@ async def _restore_training_session(model_id: str):
                     session.current_step = original_session_state["current_step"]
                     session.is_active = original_session_state["is_active"]
                     session.metadata_version = original_session_state["metadata_version"]
-                    _refresh_training_observability(model_id)
                 return None
             getattr(training_engine, "_workers", {})[model_id] = worker
             getattr(training_engine, "_resource_pool_actor_names", {})[model_id] = actor_name
@@ -608,63 +598,47 @@ async def _best_effort_delete_training_session(
             session = restore_result
         restored = session is not None
 
-    deleted = False
+    shutdown_attempted = False
     if session is not None:
-        try:
-            if allow_actor_shutdown:
-                await training_engine.delete_session(session)
-            else:
+        if allow_actor_shutdown:
+            try:
+                shutdown_attempted = True
+                await training_engine.shutdown_session(session)
+            except Exception as e:
                 logger.warning(
-                    "[%s] skipping actor shutdown during stale training cleanup (%s); "
-                    "restored=%s allow_actor_shutdown=%s",
+                    "[%s] best-effort stale training cleanup shutdown failed (%s): %s: %s",
                     model_id,
                     reason,
-                    restored,
-                    allow_actor_shutdown,
+                    type(e).__name__,
+                    e,
                 )
-                actor_name = getattr(training_engine, "_resource_pool_actor_names", {}).get(model_id)
-                worker = getattr(training_engine, "_workers", {}).get(model_id)
-                delete_session = getattr(worker, "delete_session", None) if worker is not None else None
-                if delete_session is not None:
-                    import ray
-
-                    try:
-                        await asyncio.to_thread(ray.get, delete_session.remote(model_id), timeout=30)
-                    except Exception as e:
-                        logger.warning(
-                            "[%s] best-effort stale training cleanup remote delete failed (%s): %s: %s",
-                            model_id,
-                            reason,
-                            type(e).__name__,
-                            e,
-                        )
-                getattr(training_engine, "_resource_pool_actor_names", {}).pop(model_id, None)
-                getattr(training_engine, "_workers", {}).pop(model_id, None)
-                getattr(training_engine, "_poisoned_sessions", {}).pop(model_id, None)
-                actor_loaded_sessions = getattr(training_engine, "_actor_loaded_sessions", None)
-                if isinstance(actor_loaded_sessions, dict) and actor_name:
-                    if actor_loaded_sessions.get(actor_name) == model_id:
-                        actor_loaded_sessions.pop(actor_name, None)
-                actor_volatile_sessions = getattr(training_engine, "_actor_volatile_sessions", None)
-                if isinstance(actor_volatile_sessions, dict) and actor_name:
-                    volatile = actor_volatile_sessions.get(actor_name)
-                    if isinstance(volatile, set):
-                        volatile.discard(model_id)
-                        if not volatile:
-                            actor_volatile_sessions.pop(actor_name, None)
-                session.is_active = False
-                _refresh_training_observability(model_id)
-            deleted = True
-        except Exception as e:
+        else:
             logger.warning(
-                "[%s] best-effort stale training cleanup delete failed (%s): %s: %s",
+                "[%s] skipping actor shutdown during stale training cleanup (%s); "
+                "restored=%s allow_actor_shutdown=%s",
                 model_id,
                 reason,
-                type(e).__name__,
-                e,
+                restored,
+                allow_actor_shutdown,
             )
-    if not deleted:
-        return False
+            worker = getattr(training_engine, "_workers", {}).get(model_id)
+            delete_session = getattr(worker, "delete_session", None) if worker is not None else None
+            if delete_session is not None:
+                try:
+                    import ray
+
+                    await asyncio.to_thread(ray.get, delete_session.remote(model_id), timeout=30)
+                except Exception as e:
+                    logger.warning(
+                        "[%s] best-effort stale training cleanup remote delete failed (%s): %s: %s",
+                        model_id,
+                        reason,
+                        type(e).__name__,
+                        e,
+                    )
+            getattr(training_engine, "_resource_pool_actor_names", {}).pop(model_id, None)
+            getattr(training_engine, "_workers", {}).pop(model_id, None)
+            session.is_active = False
 
     try:
         training_manager.delete_session(model_id)
@@ -691,7 +665,7 @@ async def _best_effort_delete_training_session(
     except Exception:
         pass
 
-    return deleted
+    return session is not None or shutdown_attempted
 
 
 async def cleanup_stale_training_sessions_once(*, stale_after_s: float | None = None) -> list[str]:
@@ -714,10 +688,6 @@ def _training_run_from_info(info: dict) -> TrainingRun:
         except Exception:
             pass
 
-    raw_last_activity = info.get("last_activity")
-    last_activity = float(raw_last_activity) if isinstance(raw_last_activity, (int, float)) else None
-    idle_for_s = max(0.0, time.time() - last_activity) if last_activity is not None else None
-
     return TrainingRun(
         training_run_id=str(info.get("model_id", "")),
         base_model=str(info.get("base_model", "")),
@@ -728,8 +698,6 @@ def _training_run_from_info(info: dict) -> TrainingRun:
         last_request_time=str(
             info.get("last_request_time") or info.get("created_at") or datetime.now().isoformat()
         ),
-        last_activity=last_activity,
-        idle_for_s=idle_for_s,
         last_checkpoint=None,
         last_sampler_checkpoint=None,
         user_metadata=info.get("user_metadata") or {},
@@ -748,18 +716,6 @@ def _compute_token_stats(data: list[Datum]) -> tuple[int, int]:
         if seq_len > max_seq_len:
             max_seq_len = seq_len
     return total_tokens, max_seq_len
-
-
-def _validate_training_batch_has_explicit_loss_masks_or_422(data: list[Datum]) -> None:
-    """Reject batches that omit the explicit per-token training mask contract."""
-    for item_index, datum in enumerate(data):
-        loss_fn_inputs = datum.loss_fn_inputs or {}
-        if any(key in loss_fn_inputs for key in ("loss_mask", "mask", "weights")):
-            continue
-        raise HTTPException(
-            status_code=422,
-            detail=f"Item {item_index} missing loss_mask/mask/weights",
-        )
 
 
 def _normalize_megatron_scheduler_domain_key(base_model: str) -> str:
@@ -902,41 +858,6 @@ def _build_create_scheduler_extra(
     }
 
 
-def _build_training_future_meta(
-    *,
-    op: str,
-    model_id: str,
-    session: Any | None = None,
-    seq_id: int | None = None,
-    extra: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    meta: dict[str, Any] = {
-        "op": str(op),
-        "model_id": str(model_id),
-        "queue_state": "queued",
-        "stage": "queued",
-        "queued_at": time.time(),
-    }
-    if session is not None:
-        session_id = _field(session, "session_id")
-        base_model = _field(session, "base_model")
-        backend = _field(session, "backend")
-        if session_id:
-            meta["session_id"] = str(session_id)
-        if base_model:
-            meta["base_model"] = str(base_model)
-        if backend:
-            meta["backend"] = str(backend)
-    if seq_id is not None:
-        try:
-            meta["seq_id"] = int(seq_id)
-        except Exception:
-            meta["seq_id"] = None
-    if extra:
-        meta.update(dict(extra))
-    return meta
-
-
 def _sync_route_wait_timeout_s() -> float:
     try:
         return max(1.0, float(str(os.environ.get("MINT_SYNC_ROUTE_WAIT_TIMEOUT_S", "3600")).strip()))
@@ -1025,10 +946,7 @@ async def _enqueue_internal_serialized_model_op(
             inflight_marked = True
         await future_store.async_create_with_id(request_id)
         created = True
-        await future_store.async_mark_queued(
-            request_id,
-            meta=_build_training_future_meta(op=op, model_id=model_id),
-        )
+        await future_store.async_mark_queued(request_id, meta={"op": op, "model_id": model_id})
         await api_work_queue.enqueue(
             request_id=request_id,
             op=op,
@@ -1163,18 +1081,7 @@ async def create_model(
     try:
         await future_store.async_create_with_id(request_id)
         created = True
-        await future_store.async_mark_queued(
-            request_id,
-            meta=_build_training_future_meta(
-                op="training.create_model",
-                model_id=model_id,
-                extra={
-                    "session_id": str(request.session_id),
-                    "model_seq_id": int(request.model_seq_id),
-                    "base_model": str(request.base_model),
-                },
-            ),
-        )
+        await future_store.async_mark_queued(request_id, meta={"op": "training.create_model", "model_id": model_id})
         await _enqueue_training_request_with_trace(
             route_start_s=route_start_s,
             request_id=request_id,
@@ -1251,7 +1158,7 @@ async def _do_create_model(
             if bool(getattr(existing, "is_active", False)):
                 raise RuntimeError(f"Model '{model_id}' already exists")
             logger.warning(f"[{model_id}] Cleaning up stale inactive session from previous attempt")
-            await training_engine.delete_session(existing)
+            await training_engine.shutdown_session(existing)
             training_manager.delete_session(model_id)
 
         # Create session metadata first
@@ -1289,41 +1196,46 @@ async def _do_create_model(
                 "lora_rank": int(request.lora_config.rank) if request.lora_config is not None else None,
             },
         )
-        _refresh_training_observability(model_id)
 
-        from ..backend.training_session_store import upsert_training_session
+        try:
+            from ..backend.training_session_store import upsert_training_session
 
-        actor_name = getattr(training_engine, "_resource_pool_actor_names", {}).get(model_id)
-        upsert_training_session({
-            "model_id": model_id,
-            "session_id": request.session_id,
-            "model_seq_id": request.model_seq_id,
-            "base_model": request.base_model,
-            "lora_config": request.lora_config.model_dump() if request.lora_config else None,
-            "rollout_correction_config": request.rollout_correction_config.model_dump(exclude_none=True)
-            if request.rollout_correction_config
-            else None,
-            "user_metadata": request.user_metadata or {},
-            "learning_rate": session.learning_rate,
-            "current_step": session.current_step,
-            "backend": session.backend,
-            "actor_name": actor_name,
-            "namespace": RAY_NAMESPACE,
-            "user_id": user_id,
-            "created_at": session.created_at,
-            "last_activity": session.last_activity,
-            "metadata_version": getattr(session, "metadata_version", 1),
-        })
-        training_manager.mark_persisted(model_id)
+            actor_name = getattr(training_engine, "_resource_pool_actor_names", {}).get(model_id)
+            upsert_training_session({
+                "model_id": model_id,
+                "session_id": request.session_id,
+                "model_seq_id": request.model_seq_id,
+                "base_model": request.base_model,
+                "lora_config": request.lora_config.model_dump() if request.lora_config else None,
+                "rollout_correction_config": request.rollout_correction_config.model_dump(exclude_none=True)
+                if request.rollout_correction_config
+                else None,
+                "user_metadata": request.user_metadata or {},
+                "learning_rate": session.learning_rate,
+                "current_step": session.current_step,
+                "backend": session.backend,
+                "actor_name": actor_name,
+                "namespace": RAY_NAMESPACE,
+                "user_id": user_id,
+                "created_at": session.created_at,
+                "last_activity": session.last_activity,
+                "metadata_version": getattr(session, "metadata_version", 1),
+            })
+            training_manager.mark_persisted(model_id)
+        except Exception as e:
+            logger.warning("[create_model] training session store write failed: %s", e)
 
-        from ..backend.session_index_store import add_training_run_to_session
+        try:
+            from ..backend.session_index_store import add_training_run_to_session
 
-        add_training_run_to_session(
-            session_id=request.session_id,
-            training_run_id=model_id,
-            user_id=user_id,
-            created_at=session.created_at,
-        )
+            add_training_run_to_session(
+                session_id=request.session_id,
+                training_run_id=model_id,
+                user_id=user_id,
+                created_at=session.created_at,
+            )
+        except Exception as e:
+            logger.warning("[create_model] session index write failed: %s", e)
 
         response = CreateModelResponse(
             request_id=request_id,
@@ -1393,10 +1305,7 @@ def _resolve_state_path(state_uri: str, *, user_id: str | None, is_admin: bool =
     if not is_admin and not state_uri.startswith(("tinker://", "mint://", "ckpt_")):
         raise HTTPException(status_code=403, detail="Access denied")
 
-    try:
-        resolved = resolve_checkpoint_path(state_uri, user_id=user_id, is_admin=is_admin)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
+    resolved = resolve_checkpoint_path(state_uri, user_id=user_id, is_admin=is_admin)
     if state_uri.startswith("ckpt_") and resolved == state_uri:
         raise HTTPException(status_code=404, detail="Checkpoint not found")
     try:
@@ -1571,15 +1480,7 @@ async def create_model_from_state(
         created = True
         await future_store.async_mark_queued(
             request_id,
-            meta=_build_training_future_meta(
-                op="training.create_model_from_state",
-                model_id=model_id,
-                extra={
-                    "session_id": str(request.session_id),
-                    "model_seq_id": int(request.model_seq_id),
-                    "base_model": str(request.base_model),
-                },
-            ),
+            meta={"op": "training.create_model_from_state", "model_id": model_id},
         )
         await _enqueue_training_request_with_trace(
             route_start_s=route_start_s,
@@ -1628,7 +1529,7 @@ async def _do_create_model_from_state(
             if bool(getattr(existing, "is_active", False)):
                 raise RuntimeError(f"Model '{model_id}' already exists")
             logger.warning(f"[{model_id}] Cleaning up stale inactive session from previous attempt")
-            await training_engine.delete_session(existing)
+            await training_engine.shutdown_session(existing)
             training_manager.delete_session(model_id)
 
         # Create session metadata
@@ -1673,41 +1574,46 @@ async def _do_create_model_from_state(
                 "lora_rank": int(request.lora_config.rank) if request.lora_config is not None else None,
             },
         )
-        _refresh_training_observability(model_id)
 
-        from ..backend.training_session_store import upsert_training_session
+        try:
+            from ..backend.training_session_store import upsert_training_session
 
-        actor_name = getattr(training_engine, "_resource_pool_actor_names", {}).get(model_id)
-        upsert_training_session({
-            "model_id": model_id,
-            "session_id": request.session_id,
-            "model_seq_id": request.model_seq_id,
-            "base_model": request.base_model,
-            "lora_config": request.lora_config.model_dump() if request.lora_config else None,
-            "rollout_correction_config": request.rollout_correction_config.model_dump(exclude_none=True)
-            if request.rollout_correction_config
-            else None,
-            "user_metadata": request.user_metadata or {},
-            "learning_rate": session.learning_rate,
-            "current_step": session.current_step,
-            "backend": session.backend,
-            "actor_name": actor_name,
-            "namespace": RAY_NAMESPACE,
-            "user_id": user_id,
-            "created_at": session.created_at,
-            "last_activity": session.last_activity,
-            "metadata_version": getattr(session, "metadata_version", 1),
-        })
-        training_manager.mark_persisted(model_id)
+            actor_name = getattr(training_engine, "_resource_pool_actor_names", {}).get(model_id)
+            upsert_training_session({
+                "model_id": model_id,
+                "session_id": request.session_id,
+                "model_seq_id": request.model_seq_id,
+                "base_model": request.base_model,
+                "lora_config": request.lora_config.model_dump() if request.lora_config else None,
+                "rollout_correction_config": request.rollout_correction_config.model_dump(exclude_none=True)
+                if request.rollout_correction_config
+                else None,
+                "user_metadata": request.user_metadata or {},
+                "learning_rate": session.learning_rate,
+                "current_step": session.current_step,
+                "backend": session.backend,
+                "actor_name": actor_name,
+                "namespace": RAY_NAMESPACE,
+                "user_id": user_id,
+                "created_at": session.created_at,
+                "last_activity": session.last_activity,
+                "metadata_version": getattr(session, "metadata_version", 1),
+            })
+            training_manager.mark_persisted(model_id)
+        except Exception as e:
+            logger.warning("[create_model_from_state] training session store write failed: %s", e)
 
-        from ..backend.session_index_store import add_training_run_to_session
+        try:
+            from ..backend.session_index_store import add_training_run_to_session
 
-        add_training_run_to_session(
-            session_id=request.session_id,
-            training_run_id=model_id,
-            user_id=user_id,
-            created_at=session.created_at,
-        )
+            add_training_run_to_session(
+                session_id=request.session_id,
+                training_run_id=model_id,
+                user_id=user_id,
+                created_at=session.created_at,
+            )
+        except Exception as e:
+            logger.warning("[create_model_from_state] session index write failed: %s", e)
 
         logger.info(
             f"[{model_id}] Created model from state: {request.state_path} "
@@ -1736,7 +1642,7 @@ async def _do_create_model_from_state(
             try:
                 session = training_manager.get_session(model_id)
                 if session:
-                    await training_engine.delete_session(session)
+                    await training_engine.shutdown_session(session)
             except Exception:
                 pass  # Ignore cleanup errors
             training_manager.delete_session(model_id)
@@ -1771,7 +1677,6 @@ async def forward_backward(
         upstream_for_alias,
     )
 
-    _validate_training_batch_has_explicit_loss_masks_or_422(request.forward_backward_input.data)
     route_session_info = await _get_training_route_session_info(request.model_id)
 
     if not isinstance(route_session_info, dict):
@@ -1837,12 +1742,7 @@ async def forward_backward(
 
     # Set request_id in context for logging
     set_request_id(request_id)
-    logger.info(
-        "forward_backward request received: model_id=%s seq_id=%s datums=%s",
-        request.model_id,
-        request.seq_id,
-        len(request.forward_backward_input.data),
-    )
+    logger.info(f"forward_backward request received: model_id={request.model_id}")
 
     reserve = await capacity_manager.async_try_reserve(
         request_id,
@@ -1875,12 +1775,7 @@ async def forward_backward(
         created = True
         await future_store.async_mark_queued(
             request_id,
-            meta=_build_training_future_meta(
-                op="training.forward_backward",
-                model_id=request.model_id,
-                session=route_session_info,
-                seq_id=request.seq_id,
-            ),
+            meta={"op": "training.forward_backward", "model_id": request.model_id},
         )
         await _enqueue_training_request_with_trace(
             route_start_s=route_start_s,
@@ -2019,7 +1914,6 @@ async def train_step(
         upstream_for_alias,
     )
 
-    _validate_training_batch_has_explicit_loss_masks_or_422(request.forward_backward_input.data)
     route_session_info = await _get_training_route_session_info(request.model_id)
 
     if not isinstance(route_session_info, dict):
@@ -2113,15 +2007,7 @@ async def train_step(
             scheduler_extra["gateway_auth"] = gateway_auth.__dict__
         await future_store.async_create_with_id(request_id)
         created = True
-        await future_store.async_mark_queued(
-            request_id,
-            meta=_build_training_future_meta(
-                op="training.train_step",
-                model_id=request.model_id,
-                session=route_session_info,
-                seq_id=request.seq_id,
-            ),
-        )
+        await future_store.async_mark_queued(request_id, meta={"op": "training.train_step", "model_id": request.model_id})
         await _enqueue_training_request_with_trace(
             route_start_s=route_start_s,
             request_id=request_id,
@@ -2348,15 +2234,7 @@ async def forward(
             scheduler_extra["gateway_auth"] = gateway_auth.__dict__
         await future_store.async_create_with_id(request_id)
         created = True
-        await future_store.async_mark_queued(
-            request_id,
-            meta=_build_training_future_meta(
-                op="training.forward",
-                model_id=request.model_id,
-                session=route_session_info,
-                seq_id=request.seq_id,
-            ),
-        )
+        await future_store.async_mark_queued(request_id, meta={"op": "training.forward", "model_id": request.model_id})
         await _enqueue_training_request_with_trace(
             route_start_s=route_start_s,
             request_id=request_id,
@@ -2575,15 +2453,7 @@ async def optim_step(
         )
         await future_store.async_create_with_id(request_id)
         created = True
-        await future_store.async_mark_queued(
-            request_id,
-            meta=_build_training_future_meta(
-                op="training.optim_step",
-                model_id=request.model_id,
-                session=route_session_info,
-                seq_id=request.seq_id,
-            ),
-        )
+        await future_store.async_mark_queued(request_id, meta={"op": "training.optim_step", "model_id": request.model_id})
         await _enqueue_training_request_with_trace(
             route_start_s=route_start_s,
             request_id=request_id,
@@ -2899,12 +2769,7 @@ async def save_weights_for_sampler(
         created = True
         await future_store.async_mark_queued(
             request_id,
-            meta=_build_training_future_meta(
-                op="training.save_weights_for_sampler",
-                model_id=request.model_id,
-                session=route_session_info,
-                seq_id=request.seq_id,
-            ),
+            meta={"op": "training.save_weights_for_sampler", "model_id": request.model_id},
         )
         await _enqueue_training_request_with_trace(
             route_start_s=route_start_s,
@@ -2968,7 +2833,6 @@ async def _do_save_weights_for_sampler(
                 user_id=None if is_admin else user_id,
                 model_id=session.model_id,
                 checkpoint_name=checkpoint_name,
-                checkpoint_type="sampler",
             )
         else:
             # Ephemeral save - generate unique temp name
@@ -2977,26 +2841,9 @@ async def _do_save_weights_for_sampler(
                 user_id=None if is_admin else user_id,
                 model_id=session.model_id,
                 checkpoint_name=checkpoint_name,
-                checkpoint_type="sampler",
             )
 
-        use_per_expert_lora = bool(request.use_per_expert_lora)
         train_mlp = bool(getattr(getattr(session, "lora_config", None), "train_mlp", False))
-        if session.backend == "megatron":
-            # vLLM MoE LoRA expects per-expert MLP weights. If MLP LoRA was trained, we must
-            # export in per-expert format regardless of the caller-provided flag.
-            if train_mlp:
-                if not use_per_expert_lora:
-                    logger.info(
-                        "[save_weights_for_sampler] forcing use_per_expert_lora=True because train_mlp=True"
-                    )
-                use_per_expert_lora = True
-            else:
-                if use_per_expert_lora:
-                    logger.info(
-                        "[save_weights_for_sampler] forcing use_per_expert_lora=False because train_mlp=False"
-                    )
-                use_per_expert_lora = False
 
         # Save weights
         save_path = await run_async_with_otel_span(
@@ -3004,9 +2851,7 @@ async def _do_save_weights_for_sampler(
             lambda: training_engine.save_weights_for_sampler(
                 session=session,
                 checkpoint_name=checkpoint_name,
-                checkpoint_base_dir=os.path.dirname(os.path.dirname(os.path.dirname(save_path))),
-                checkpoint_type="sampler",
-                use_per_expert_lora=use_per_expert_lora,
+                checkpoint_base_dir=os.path.dirname(os.path.dirname(save_path)),
             ),
             component="routes.training",
             op="training.save_weights_for_sampler",
@@ -3016,7 +2861,7 @@ async def _do_save_weights_for_sampler(
                 "base_model": str(session.base_model),
                 "backend": str(session.backend),
                 "save_mode": "named" if request.path is not None else "ephemeral",
-                "use_per_expert_lora": bool(use_per_expert_lora),
+                "train_mlp": bool(train_mlp),
             },
         )
 
@@ -3191,10 +3036,10 @@ async def _do_save_weights_for_sampler(
                 )
 
             try:
-                from ..backend.session_index_store import add_heartbeat_sampler_to_session, upsert_sampler_index
+                from ..backend.session_index_store import add_sampler_to_session, upsert_sampler_index
 
                 created_at = datetime.now().isoformat()
-                add_heartbeat_sampler_to_session(
+                add_sampler_to_session(
                     session_id=session.session_id,
                     sampler_id=sampling_session_id,
                     user_id=user_id,
@@ -3337,11 +3182,6 @@ async def get_model_info(model_id: str):
         _drop_local_training_session(model_id)
         raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
 
-    last_activity = info.get("last_activity")
-    idle_for_s = None
-    if isinstance(last_activity, (int, float)):
-        idle_for_s = max(0.0, time.time() - float(last_activity))
-
     return {
         "model_id": str(info.get("model_id") or model_id),
         "session_id": info.get("session_id"),
@@ -3351,8 +3191,6 @@ async def get_model_info(model_id: str):
         "user_metadata": info.get("user_metadata") or {},
         "learning_rate": info.get("learning_rate"),
         "created_at": info.get("created_at"),
-        "last_activity": last_activity,
-        "idle_for_s": idle_for_s,
         "current_step": info.get("current_step", 0),
         "is_active": info.get("is_active", False),
         "backend": info.get("backend"),
@@ -3443,10 +3281,6 @@ async def list_models():
         model_id = str(info.get("model_id") or "")
         if not model_id:
             continue
-        last_activity = info.get("last_activity")
-        idle_for_s = None
-        if isinstance(last_activity, (int, float)):
-            idle_for_s = max(0.0, time.time() - float(last_activity))
         models.append(
             {
                 "model_id": info.get("model_id"),
@@ -3454,8 +3288,6 @@ async def list_models():
                 "model_seq_id": info.get("model_seq_id"),
                 "base_model": info.get("base_model"),
                 "created_at": info.get("created_at"),
-                "last_activity": last_activity,
-                "idle_for_s": idle_for_s,
                 "current_step": info.get("current_step", 0),
                 "is_active": info.get("is_active", False),
             }
@@ -3523,7 +3355,7 @@ async def _do_delete_model(request_id: str, model_id: str) -> None:
 
         session = training_manager.get_session(model_id)
         if session is not None:
-            await training_engine.delete_session(session)
+            await training_engine.shutdown_session(session)
             training_manager.delete_session(model_id)
 
         try:
