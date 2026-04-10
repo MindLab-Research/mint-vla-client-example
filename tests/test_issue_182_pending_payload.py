@@ -151,6 +151,38 @@ def test_issue_182_pending_payload_progress_headers(monkeypatch):
     assert response.headers.get("X-Queue-Max-Tokens") == "12"
 
 
+def test_issue_182_pending_payload_training_correlation_fields(monkeypatch):
+    meta = {
+        "queue_state": "queued",
+        "stage": "queued",
+        "op": "training.forward_backward",
+        "model_id": "run-429",
+        "session_id": "sess-429",
+        "seq_id": 30,
+        "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+        "backend": "megatron",
+    }
+    monkeypatch.setattr(futures_route, "future_store", _StubFutureStore(meta))
+    import tinker_server.backend.api_work_queue as wq
+
+    monkeypatch.setattr(wq, "api_work_queue", _StubApiWorkQueue(depth=1, position=0, ema_exec_s=2.0))
+    import tinker_server.config as config_module
+
+    monkeypatch.setattr(config_module.config, "api_work_queue_num_workers", 1, raising=False)
+
+    body = FutureRetrieveRequest(request_id="rid_training_meta")
+    response = _response_stub()
+    payload = asyncio.run(futures_route.retrieve_future(body, _request_stub(), response))
+
+    assert response.status_code == 408
+    assert payload.get("status") == "queued"
+    assert payload.get("model_id") == "run-429"
+    assert payload.get("session_id") == "sess-429"
+    assert payload.get("seq_id") == 30
+    assert payload.get("base_model") == "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    assert payload.get("backend") == "megatron"
+
+
 def test_issue_182_pending_payload_queue_position_unknown_reason(monkeypatch):
     meta = {"queue_state": "queued", "stage": "queued", "op": "sampling.asample"}
     monkeypatch.setattr(futures_route, "future_store", _StubFutureStore(meta))
