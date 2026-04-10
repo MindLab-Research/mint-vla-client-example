@@ -3391,10 +3391,6 @@ class VerlTrainingEngine:
         await self._delete_actor_local_session_state(session, worker=plan["worker"])
         await self._unbind_session(session, plan=plan)
 
-    async def shutdown_session(self, session: TrainingSession) -> None:
-        """Backward-compatible alias for delete_session()."""
-        await self.delete_session(session)
-
 
 # Global engine instance (initialized in app lifespan)
 verl_training_engine: VerlTrainingEngine | None = None

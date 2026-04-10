@@ -224,7 +224,7 @@ def test_issue_230_shutdown_session_keeps_protected_dense_actor_alive(monkeypatc
 
     monkeypatch.setattr(verl_training.ray_kill, "kill", _fake_kill)
 
-    asyncio.run(engine.shutdown_session(session))
+    asyncio.run(engine.delete_session(session))
 
     assert worker.calls == 0
     assert killed == []

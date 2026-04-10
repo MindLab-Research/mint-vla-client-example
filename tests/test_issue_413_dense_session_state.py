@@ -158,7 +158,7 @@ def test_issue_413_shutdown_session_reclaims_dense_state_for_shared_actor(
 
     monkeypatch.setattr(verl_training.ray, "get", lambda value, timeout=None: value)
 
-    asyncio.run(engine.shutdown_session(session))
+    asyncio.run(engine.delete_session(session))
 
     assert worker.delete_calls == [model_id]
     assert not session_dir.exists()
@@ -171,7 +171,8 @@ def test_issue_413_shutdown_session_reclaims_dense_state_for_shared_actor(
 
 @pytest.mark.anyio
 async def test_issue_413_internal_metrics_include_dense_session_state(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def _fake_admission_stats() -> dict:
+    async def _fake_admission_stats(*, include_actor_rss: bool = False) -> dict:
+        _ = include_actor_rss
         return {
             "driver_state": {
                 "dense_session_state_bytes": 1234,
