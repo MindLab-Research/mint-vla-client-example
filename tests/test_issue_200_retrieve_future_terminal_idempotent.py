@@ -9,10 +9,11 @@ from tinker_server.routes import futures as futures_route
 class _StubFutureStore:
     _UNSET = object()
 
-    def __init__(self, status: FutureStatus, *, result=_UNSET, error=_UNSET):
+    def __init__(self, status: FutureStatus, *, result=_UNSET, error=_UNSET, meta=None):
         self._status = status
         self._result = {"ok": "default"} if result is self._UNSET else result
         self._error = "error:default" if error is self._UNSET else error
+        self._meta = meta
         self.cleanup_calls: list[str] = []
 
     async def async_get_status(self, request_id: str) -> FutureStatus:
@@ -23,6 +24,9 @@ class _StubFutureStore:
 
     async def async_get_error(self, request_id: str):
         return self._error
+
+    async def async_get_meta(self, request_id: str):
+        return self._meta
 
     async def async_cleanup(self, request_id: str) -> None:
         self.cleanup_calls.append(request_id)

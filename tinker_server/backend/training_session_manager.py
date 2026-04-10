@@ -47,6 +47,8 @@ class TrainingSession:
     last_activity: float = field(default_factory=time.time)
     inflight_ops: int = 0  # Prevent cleanup while requests are queued or running
     backend: str = "peft"  # "peft" for dense models, "megatron" for MoE
+    metadata_version: int = 1  # Monotonic metadata version for cache coherence
+    pending_persist: bool = True  # Local create path before detached state is visible
 
     # Per-session inference engine for isolated concurrent access
     # Lazily initialized on first save_weights_for_sampler call
@@ -72,6 +74,23 @@ class TrainingSession:
         }
 
 
+@dataclass(frozen=True)
+class TrainingSessionSnapshot:
+    """Request-scope immutable view of training metadata."""
+
+    model_id: str
+    session_id: str
+    model_seq_id: int
+    base_model: str
+    backend: str
+    current_step: int
+    lora_config: dict[str, Any] | None
+    rollout_correction_config: dict[str, Any] | None
+    user_metadata: dict[str, Any]
+    learning_rate: float
+    metadata_version: int
+
+
 class TrainingSessionManager:
     """Manages multiple training sessions.
 
@@ -84,6 +103,13 @@ class TrainingSessionManager:
         self._inactivity_timeout = inactivity_timeout
         self._cleanup_task: asyncio.Task | None = None
         self._engine = None  # Set via start_cleanup_task; used by cleanup loop
+        self._obs_training_totals: dict[str, int] = {
+            "training_sessions_total": 0,
+            "training_sessions_active": 0,
+            "training_sessions_inflight": 0,
+        }
+        self._obs_training_by_model: dict[tuple[str, str], dict[str, int | str]] = {}
+        self._obs_training_state_by_model_id: dict[str, dict[str, int | str]] = {}
         logger.info(
             "TrainingSessionManager initialized "
             f"(inactivity_timeout={self._inactivity_timeout}s)"
@@ -100,6 +126,7 @@ class TrainingSessionManager:
         user_metadata: dict | None = None,
         user_id: str | None = None,
         learning_rate: float = 1e-4,
+        metadata_version: int | None = None,
     ) -> TrainingSession:
         """Create a new training session.
 
@@ -132,29 +159,188 @@ class TrainingSessionManager:
             rollout_correction_config=rollout_correction_config,
             user_metadata=user_metadata or {},
             learning_rate=learning_rate,
+            metadata_version=max(1, int(metadata_version) if metadata_version is not None else 1),
         )
 
+        session.pending_persist = True
         self._sessions[model_id] = session
         logger.info(
             f"Created training session: {model_id} "
             f"(session={session_id}, seq={model_seq_id}, base={base_model})"
         )
+        self.refresh_observability_session(model_id)
 
         return session
+
+    def get_training_session_snapshot(self, model_id: str) -> TrainingSessionSnapshot | None:
+        session = self._sessions.get(model_id)
+        if session is None:
+            return None
+        return TrainingSessionSnapshot(
+            model_id=session.model_id,
+            session_id=session.session_id,
+            model_seq_id=int(session.model_seq_id),
+            base_model=session.base_model,
+            backend=session.backend,
+            current_step=int(session.current_step),
+            lora_config=session.lora_config.model_dump() if session.lora_config else None,
+            rollout_correction_config=session.rollout_correction_config,
+            user_metadata=dict(session.user_metadata or {}),
+            learning_rate=float(session.learning_rate),
+            metadata_version=max(1, int(session.metadata_version)),
+        )
+
+    def get_session_metadata_version(self, model_id: str) -> int | None:
+        session = self._sessions.get(model_id)
+        if session is None:
+            return None
+        return max(1, int(session.metadata_version))
+
+    def restore_training_session_info(self, info: dict[str, Any]) -> TrainingSession | None:
+        model_id = str(info.get("model_id") or "")
+        session_id = str(info.get("session_id") or "")
+        base_model = str(info.get("base_model") or "")
+        if not model_id or not session_id or not base_model:
+            return None
+
+        incoming_version = max(1, int(info.get("metadata_version") or 1))
+        session = self._sessions.get(model_id)
+
+        lora_cfg = None
+        if info.get("lora_config"):
+            try:
+                from ..models.types import LoRAConfig
+
+                lora_cfg = LoRAConfig(**info["lora_config"])
+            except Exception:
+                lora_cfg = None
+
+        if session is None:
+            session = self.create_session(
+                model_id=model_id,
+                session_id=session_id,
+                model_seq_id=int(info.get("model_seq_id", 0)),
+                base_model=base_model,
+                lora_config=lora_cfg,
+                rollout_correction_config=info.get("rollout_correction_config"),
+                user_metadata=info.get("user_metadata") or {},
+                user_id=info.get("user_id"),
+                learning_rate=float(info.get("learning_rate", 1e-4)),
+                metadata_version=incoming_version,
+            )
+            before = TrainingSession(**vars(session))
+            session.backend = str(info.get("backend", session.backend))
+            session.pending_persist = False
+            try:
+                session.current_step = int(info.get("current_step", session.current_step))
+            except Exception:
+                pass
+            self.refresh_observability_session(model_id, before=before)
+        elif incoming_version <= max(1, int(session.metadata_version)):
+            # Allow monotonic activity/step updates without overwriting newer metadata.
+            try:
+                session.current_step = max(session.current_step, int(info.get("current_step", session.current_step)))
+            except Exception:
+                pass
+            try:
+                raw_last_activity = info.get("last_activity")
+                if raw_last_activity is not None:
+                    session.last_activity = max(session.last_activity, float(raw_last_activity))
+            except Exception:
+                pass
+            return session
+        else:
+            before = TrainingSession(**vars(session))
+            session.session_id = session_id
+            session.model_seq_id = int(info.get("model_seq_id", session.model_seq_id))
+            session.base_model = base_model
+            session.lora_config = lora_cfg
+            session.rollout_correction_config = info.get("rollout_correction_config")
+            session.user_metadata = info.get("user_metadata") or {}
+            session.user_id = info.get("user_id")
+            try:
+                session.learning_rate = float(info.get("learning_rate", session.learning_rate))
+            except Exception:
+                pass
+            session.backend = str(info.get("backend", session.backend))
+            try:
+                session.current_step = max(session.current_step, int(info.get("current_step", session.current_step)))
+            except Exception:
+                pass
+            session.metadata_version = incoming_version
+            session.pending_persist = False
+            self.refresh_observability_session(model_id, before=before)
+
+        try:
+            raw_last_activity = info.get("last_activity")
+            if raw_last_activity is not None:
+                session.last_activity = float(raw_last_activity)
+        except Exception:
+            pass
+        created_at = info.get("created_at")
+        if isinstance(created_at, str) and created_at:
+            session.created_at = created_at
+        return session
+
+    def mark_persisted(self, model_id: str) -> None:
+        session = self._sessions.get(model_id)
+        if session is not None:
+            session.pending_persist = False
 
     def get_session(self, model_id: str) -> TrainingSession | None:
         """Get training session by model_id.
 
-        Does NOT update last_activity; call touch_session() explicitly
-        in training operation routes to prevent idle cleanup.  Read-only
-        lookups (GET /models, GET /training_runs, existence checks) must
-        not extend the idle deadline.
+        Detached training_session_store is the authoritative state source.
+        The local map is only a request-path cache plus create-time scratch state.
         """
-        return self._sessions.get(model_id)
+        session = self._sessions.get(model_id)
+        if session is not None and bool(getattr(session, "pending_persist", False)):
+            return session
+
+        try:
+            from .training_session_store import get_training_session_info
+
+            info = get_training_session_info(model_id)
+        except Exception:
+            return session
+
+        if not isinstance(info, dict):
+            if session is not None and not bool(getattr(session, "pending_persist", False)):
+                self._sessions.pop(model_id, None)
+            return session if session is not None and bool(getattr(session, "pending_persist", False)) else None
+
+        restored = self.restore_training_session_info(info)
+        if restored is not None:
+            restored.pending_persist = False
+        return restored
 
     def list_sessions(self) -> list[TrainingSession]:
-        """List all training sessions."""
-        return list(self._sessions.values())
+        """List training sessions from detached authority plus local pending creates."""
+        out: list[TrainingSession] = []
+        seen: set[str] = set()
+        try:
+            from .training_session_store import list_training_sessions
+
+            infos = list_training_sessions()
+        except Exception:
+            return list(self._sessions.values())
+
+        for info in infos:
+            if not isinstance(info, dict):
+                continue
+            restored = self.restore_training_session_info(info)
+            if restored is None:
+                continue
+            restored.pending_persist = False
+            out.append(restored)
+            seen.add(restored.model_id)
+
+        for model_id, session in self._sessions.items():
+            if model_id in seen:
+                continue
+            if bool(getattr(session, "pending_persist", False)):
+                out.append(session)
+        return out
 
     def delete_session(self, model_id: str) -> bool:
         """Delete a training session.
@@ -167,6 +353,7 @@ class TrainingSessionManager:
             return False
 
         session = self._sessions.pop(model_id)
+        self.refresh_observability_session(model_id)
         logger.info(
             f"Deleted training session: {model_id} "
             f"(step={session.current_step}, samples={session.total_samples_processed})"
@@ -176,6 +363,70 @@ class TrainingSessionManager:
     def get_session_count(self) -> int:
         """Get total number of active sessions."""
         return len(self._sessions)
+
+    @staticmethod
+    def _training_obs_state(session: TrainingSession | None) -> dict[str, int | str] | None:
+        if session is None:
+            return None
+        return {
+            "base_model": str(session.base_model or "unknown"),
+            "backend": str(session.backend or "unknown"),
+            "training_sessions_total": 1,
+            "training_sessions_active": 1 if bool(session.is_active) else 0,
+            "training_sessions_inflight": 1 if int(session.inflight_ops) > 0 else 0,
+            "total": 1,
+            "active": 1 if bool(session.is_active) else 0,
+            "inflight": 1 if int(session.inflight_ops) > 0 else 0,
+        }
+
+    def _apply_training_obs_delta(self, state: dict[str, int | str] | None, sign: int) -> None:
+        if state is None:
+            return
+        for key in (
+            "training_sessions_total",
+            "training_sessions_active",
+            "training_sessions_inflight",
+        ):
+            self._obs_training_totals[key] = max(0, int(self._obs_training_totals.get(key, 0)) + sign * int(state[key]))
+
+        bucket_key = (str(state["base_model"]), str(state["backend"]))
+        bucket = self._obs_training_by_model.get(bucket_key)
+        if bucket is None and sign > 0:
+            bucket = {
+                "base_model": bucket_key[0],
+                "backend": bucket_key[1],
+                "total": 0,
+                "active": 0,
+                "inflight": 0,
+            }
+            self._obs_training_by_model[bucket_key] = bucket
+        if bucket is None:
+            return
+        for key in ("total", "active", "inflight"):
+            bucket[key] = max(0, int(bucket.get(key, 0)) + sign * int(state[key]))
+        if int(bucket["total"]) == 0 and int(bucket["active"]) == 0 and int(bucket["inflight"]) == 0:
+            self._obs_training_by_model.pop(bucket_key, None)
+
+    def refresh_observability_session(self, model_id: str, *, before: TrainingSession | None = None) -> None:
+        after = self._sessions.get(model_id)
+        before_state = self._training_obs_state(before)
+        if before_state is None:
+            before_state = self._obs_training_state_by_model_id.get(model_id)
+        after_state = self._training_obs_state(after)
+        self._apply_training_obs_delta(before_state, -1)
+        self._apply_training_obs_delta(after_state, 1)
+        if after_state is None:
+            self._obs_training_state_by_model_id.pop(model_id, None)
+        else:
+            self._obs_training_state_by_model_id[model_id] = dict(after_state)
+
+    def observability_snapshot(self) -> dict[str, int | list[dict[str, int | str]]]:
+        return {
+            **self._obs_training_totals,
+            "training_sessions_by_model": [
+                dict(self._obs_training_by_model[key]) for key in sorted(self._obs_training_by_model)
+            ],
+        }
 
     def _persist_last_activity(self, model_id: str, last_activity: float) -> None:
         try:
@@ -205,9 +456,11 @@ class TrainingSessionManager:
         """
         session = self._sessions.get(model_id)
         if session is not None:
+            before = TrainingSession(**vars(session))
             session.last_activity = time.time()
             session.inflight_ops = max(0, session.inflight_ops + delta)
             self._persist_last_activity(model_id, session.last_activity)
+            self.refresh_observability_session(model_id, before=before)
 
     # =========================================================================
     # Background cleanup of idle training sessions
@@ -238,6 +491,22 @@ class TrainingSessionManager:
 
     async def _cleanup_inactive(self) -> None:
         """Cleanup training sessions inactive for longer than timeout."""
+        for model_id, session in list(self._sessions.items()):
+            try:
+                from .training_session_store import async_get_training_session_info
+
+                detached = await async_get_training_session_info(model_id)
+            except Exception:
+                detached = None
+            if isinstance(detached, dict):
+                try:
+                    session.last_activity = max(
+                        float(session.last_activity),
+                        float(detached.get("last_activity", session.last_activity)),
+                    )
+                except Exception:
+                    pass
+
         now = time.time()
         inactive = [
             model_id

@@ -114,9 +114,10 @@ def test_openai_completions_supports_gateway_routed_base_model(monkeypatch):
     tokenizer = _DummyTokenizer()
     seen: dict[str, object] = {"polls": 0}
 
-    async def _fake_create_sampling_session(request, _http_request):
-        seen["base_model"] = request.base_model
-        return service_route.CreateSamplingSessionResponse(sampling_session_id="remote-sample-235b")
+    async def _fake_ensure_sampling_session(*, model_path: str, http_request: Request, parent_session_id=None):
+        _ = (http_request, parent_session_id)
+        seen["base_model"] = model_path
+        return "remote-sample-235b", "Qwen/Qwen3-235B-A22B-Instruct-2507"
 
     async def _fake_get_tokenizer(base_model: str):
         seen["tokenizer_base_model"] = base_model
@@ -157,8 +158,7 @@ def test_openai_completions_supports_gateway_routed_base_model(monkeypatch):
             )
         raise AssertionError(f"unexpected path: {path}")
 
-    monkeypatch.setattr(openai_compat, "ensure_sampling_session", service_route.ensure_sampling_session)
-    monkeypatch.setattr(service_route, "create_sampling_session", _fake_create_sampling_session)
+    monkeypatch.setattr(openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session)
     monkeypatch.setattr(service_route, "session_manager", None)
     monkeypatch.setattr(openai_compat, "_get_tokenizer", _fake_get_tokenizer)
     monkeypatch.setattr(openai_compat, "sample_once", sampling_route.sample_once)

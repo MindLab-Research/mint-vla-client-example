@@ -58,6 +58,16 @@ def _install_namespace_module(monkeypatch, module_name: str, namespace: str):
     return module
 
 
+def _install_resource_pool_module(monkeypatch, *, pool, actor_types=None, stale_error=RuntimeError):
+    module_name = "tinker_server.backend.resource_pool"
+    module = types.ModuleType(module_name)
+    module.ActorType = actor_types or SimpleNamespace(VLLM="vllm", MEGATRON="megatron", DENSE="dense")
+    module.ResourcePoolStaleError = stale_error
+    module.get_resource_pool = lambda: pool
+    monkeypatch.setitem(sys.modules, module_name, module)
+    return module
+
+
 class _GatewayResponse:
     def __init__(self, payload: dict, *, status_code: int = 200, text: str = ""):
         self._payload = dict(payload)
@@ -72,9 +82,13 @@ def _patch_training_route_remote_fallback(monkeypatch) -> None:
     async def _restore_training_session(_model_id: str):
         return None
 
+    async def _get_training_route_session_info(_model_id: str):
+        return None
+
     monkeypatch.setattr(training_route, "training_manager", SimpleNamespace(get_session=lambda _model_id: None))
     monkeypatch.setattr(training_route, "training_engine", object())
     monkeypatch.setattr(training_route, "_restore_training_session", _restore_training_session)
+    monkeypatch.setattr(training_route, "_get_training_route_session_info", _get_training_route_session_info)
     monkeypatch.setattr(training_route, "can_access_model", lambda _base_model, _user_data: True)
 
 
@@ -166,6 +180,10 @@ class _AsyncOnlyTerminalFutureStore:
     async def async_get_status(self, request_id: str) -> FutureStatus:
         self.calls.append(("async_get_status", request_id))
         return FutureStatus.DONE
+
+    async def async_get_meta(self, request_id: str):
+        self.calls.append(("async_get_meta", request_id))
+        return {"op": "sampling.asample"}
 
     async def async_get_result(self, request_id: str):
         self.calls.append(("async_get_result", request_id))
@@ -500,6 +518,81 @@ def test_issue_360_internal_admission_stats_uses_async_store_calls(monkeypatch):
     assert payload["actors"]["future_store"]["rss_bytes"] == 222
 
 
+@pytest.mark.anyio
+async def test_issue_360_api_work_queue_stats_omits_unready_scheduler_metrics(monkeypatch):
+    import importlib
+
+    _install_minimal_ray_module(monkeypatch)
+    ray_mod = importlib.import_module("ray")
+    monkeypatch.setattr(ray_mod, "is_initialized", lambda: True, raising=False)
+
+    wq = importlib.import_module("tinker_server.backend.api_work_queue")
+    client = wq.ApiWorkQueueClient()
+
+    class _StatsHandle:
+        def remote(self):
+            return object()
+
+    class _Actor:
+        stats = _StatsHandle()
+
+    client._ray_actor = _Actor()
+
+    async def _fake_await(_ref, *, timeout_s=None):
+        _ = timeout_s
+        return {
+            "depth": 5,
+            "depth_legacy": 5,
+            "depth_scheduled": 4,
+            "scheduler_metrics_ready": False,
+            "scheduler_enabled": False,
+            "scheduler_picks_total": 0,
+            "scheduler_switches_total": 0,
+        }
+
+    monkeypatch.setattr(client, "_await_ray_ref", _fake_await)
+
+    payload = await client.stats(timeout_s=1.0)
+
+    assert payload["depth"] == 5
+    assert payload["depth_legacy"] == 5
+    assert payload["scheduler_metrics_ready"] is False
+    assert "depth_scheduled" not in payload
+    assert "scheduler_enabled" not in payload
+    assert "scheduler_picks_total" not in payload
+
+
+@pytest.mark.anyio
+async def test_issue_360_async_started_probes_skip_ready_snapshot(monkeypatch):
+    import importlib
+
+    fs_module = importlib.import_module("tinker_server.backend.future_store")
+    wq_module = importlib.import_module("tinker_server.backend.api_work_queue")
+
+    future_store = fs_module.FutureStore()
+    api_work_queue = wq_module.ApiWorkQueueClient()
+    calls: list[tuple[str, bool]] = []
+
+    async def _fake_future_get(*, require_ready: bool = True):
+        calls.append(("future_store", bool(require_ready)))
+        return object()
+
+    async def _fake_queue_get(*, require_ready: bool = True):
+        calls.append(("api_work_queue", bool(require_ready)))
+        return object()
+
+    monkeypatch.setattr(future_store, "_get_ray_actor_async", _fake_future_get)
+    monkeypatch.setattr(api_work_queue, "_get_ray_actor_async", _fake_queue_get)
+
+    await future_store.async_ensure_started()
+    await api_work_queue.async_ensure_started()
+
+    assert calls == [
+        ("future_store", False),
+        ("api_work_queue", False),
+    ]
+
+
 def test_issue_360_training_optim_step_admission_uses_async_capacity_and_future(monkeypatch):
     fs = _AsyncOnlyTrainingFutureStore()
     cap = _AsyncOnlyCapacityManager()
@@ -517,6 +610,21 @@ def test_issue_360_training_optim_step_admission_uses_async_capacity_and_future(
     )
     monkeypatch.setattr(training_route, "training_engine", object())
     monkeypatch.setattr(training_route, "_restore_training_session", _restore_training_session)
+
+    async def _get_training_route_session_info(_model_id: str):
+        return {
+            "model_id": "run-360",
+            "session_id": "sess-360",
+            "base_model": "Qwen/Qwen3-0.6B",
+            "backend": "peft",
+            "user_id": "user-a",
+        }
+
+    async def _protect_training_session_enqueue_window(_session_info: dict):
+        return None
+
+    monkeypatch.setattr(training_route, "_get_training_route_session_info", _get_training_route_session_info)
+    monkeypatch.setattr(training_route, "_protect_training_session_enqueue_window", _protect_training_session_enqueue_window)
 
     import tinker_server.backend.capacity_manager as cm
     import tinker_server.backend.api_work_queue as awq
@@ -536,6 +644,276 @@ def test_issue_360_training_optim_step_admission_uses_async_capacity_and_future(
     assert len(cap.calls) == 1
     assert any(name == "async_create_with_id" for name, _rid in fs.calls)
     assert len(q.calls) == 1
+
+
+def _install_stateless_training_enqueue_stubs(monkeypatch, *, route_session_info: dict | None):
+    fs = _AsyncOnlyTrainingFutureStore()
+    cap = _AsyncOnlyCapacityManager()
+    q = _RecordingQueue()
+
+    async def _get_training_route_session_info(_model_id: str):
+        return route_session_info
+
+    import tinker_server.backend.capacity_manager as cm
+    import tinker_server.backend.api_work_queue as awq
+    import tinker_server.backend.result_size_estimator as rse
+    import tinker_server.client_compat as client_compat
+
+    monkeypatch.setattr(training_route, "future_store", fs)
+    monkeypatch.setattr(training_route, "training_manager", None)
+    monkeypatch.setattr(training_route, "training_engine", None)
+    monkeypatch.setattr(training_route, "_get_training_route_session_info", _get_training_route_session_info)
+    monkeypatch.setattr(training_route, "build_billing_auth_context", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(training_route, "can_access_model", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(training_route, "is_admin_request", lambda _request: False)
+    monkeypatch.setattr(cm, "capacity_manager", cap)
+    monkeypatch.setattr(awq, "api_work_queue", q)
+    monkeypatch.setattr(rse, "estimate_small_result_bytes", lambda: 0)
+    monkeypatch.setattr(rse, "estimate_forward_backward_result_bytes", lambda _request: 0)
+    monkeypatch.setattr(client_compat, "prefer_tinker_uri", lambda _request: True)
+
+    return fs, cap, q
+
+
+@pytest.mark.parametrize(
+    ("route_name", "request_factory", "expected_op", "expected_training_op", "expected_seq_id", "expect_prefer_tinker"),
+    [
+        (
+            "forward_backward",
+            lambda: ForwardBackwardRequest(
+                model_id="run-detached",
+                seq_id=21,
+                forward_backward_input=ForwardBackwardInput(data=[], loss_fn="noop"),
+            ),
+            "training.forward_backward",
+            "forward_backward",
+            21,
+            False,
+        ),
+        (
+            "train_step",
+            lambda: TrainStepRequest(
+                model_id="run-detached",
+                seq_id=22,
+                forward_backward_input=ForwardBackwardInput(data=[], loss_fn="noop"),
+                adam_params=AdamParams(learning_rate=1e-4),
+            ),
+            "training.train_step",
+            "train_step",
+            22,
+            False,
+        ),
+        (
+            "forward",
+            lambda: ForwardRequest(
+                model_id="run-detached",
+                seq_id=23,
+                forward_input=ForwardBackwardInput(data=[], loss_fn="noop"),
+            ),
+            "training.forward",
+            "forward",
+            23,
+            False,
+        ),
+        (
+            "optim_step",
+            lambda: OptimStepRequest(
+                model_id="run-detached",
+                seq_id=24,
+                adam_params=AdamParams(learning_rate=1e-4),
+            ),
+            "training.optim_step",
+            "optim_step",
+            24,
+            False,
+        ),
+        (
+            "save_weights_for_sampler",
+            lambda: SaveWeightsForSamplerRequest(
+                model_id="run-detached",
+                seq_id=25,
+                path=None,
+            ),
+            "training.save_weights_for_sampler",
+            "save_weights_for_sampler",
+            25,
+            True,
+        ),
+    ],
+)
+def test_issue_360_training_enqueue_routes_use_detached_metadata_with_api_globals_none(
+    monkeypatch,
+    route_name: str,
+    request_factory,
+    expected_op: str,
+    expected_training_op: str,
+    expected_seq_id: int,
+    expect_prefer_tinker: bool,
+):
+    fs, cap, q = _install_stateless_training_enqueue_stubs(
+        monkeypatch,
+        route_session_info={
+            "model_id": "run-detached",
+            "base_model": "Qwen/Qwen3-0.6B",
+            "backend": "peft",
+            "user_id": "user-a",
+        },
+    )
+
+    route = getattr(training_route, route_name)
+    out = anyio.run(route, request_factory(), _request_stub("user-a"))
+
+    assert isinstance(out.request_id, str) and out.request_id
+    assert len(cap.calls) == 1
+    assert any(name == "async_create_with_id" for name, _rid in fs.calls)
+    assert len(q.calls) == 1
+    queued = q.calls[0]
+    assert queued["op"] == expected_op
+    assert queued["user_id"] == "user-a"
+    assert queued["extra"]["training_op"] == expected_training_op
+    assert queued["extra"]["scheduler_session_key"] == "run-detached"
+    assert queued["extra"]["execution_serial_key"] == "training_session:run-detached"
+    assert queued["extra"].get("seq_id") == expected_seq_id
+    if expect_prefer_tinker:
+        assert queued["extra"]["prefer_tinker"] is True
+        assert queued["extra"]["is_admin"] is False
+    else:
+        assert "prefer_tinker" not in queued["extra"]
+
+
+def test_issue_360_training_enqueue_propagates_detached_store_503(monkeypatch):
+    async def _raise_store_unavailable(_model_id: str):
+        raise training_route.HTTPException(status_code=503, detail="Training session store unavailable")
+
+    async def _unexpected_async_remote_training_model(*_args, **_kwargs):
+        raise AssertionError("remote fallback should not run after detached-store failure")
+
+    monkeypatch.setattr(training_route, "training_manager", None)
+    monkeypatch.setattr(training_route, "training_engine", None)
+    monkeypatch.setattr(training_route, "_get_training_route_session_info", _raise_store_unavailable)
+
+    import tinker_server.gateway as gw
+
+    monkeypatch.setattr(gw, "async_remote_training_model", _unexpected_async_remote_training_model)
+
+    req = ForwardRequest(
+        model_id="run-detached-fail",
+        seq_id=26,
+        forward_input=ForwardBackwardInput(data=[], loss_fn="noop"),
+    )
+
+    with pytest.raises(training_route.HTTPException) as excinfo:
+        anyio.run(training_route.forward, req, _request_stub("user-a"))
+
+    assert excinfo.value.status_code == 503
+    assert excinfo.value.detail == "Training session store unavailable"
+
+
+def test_issue_360_training_route_session_helper_returns_503_on_store_failure(monkeypatch):
+    import tinker_server.backend.training_session_store as tss
+
+    async def _async_get_training_session_info(_model_id: str):
+        raise RuntimeError("store down")
+
+    monkeypatch.setattr(tss, "async_get_training_session_info", _async_get_training_session_info)
+
+    with pytest.raises(training_route.HTTPException) as excinfo:
+        anyio.run(training_route._get_training_route_session_info, "run-detached-fail")
+
+    assert excinfo.value.status_code == 503
+    assert excinfo.value.detail == "Training session store unavailable"
+
+
+def test_issue_360_training_route_session_helper_does_not_fallback_to_local_state(monkeypatch):
+    import tinker_server.backend.training_session_store as tss
+
+    async def _async_get_training_session_info(_model_id: str):
+        return None
+
+    monkeypatch.setattr(tss, "async_get_training_session_info", _async_get_training_session_info)
+    monkeypatch.setattr(
+        training_route,
+        "training_manager",
+        SimpleNamespace(get_session=lambda _model_id: SimpleNamespace(model_id="local-only")),
+    )
+
+    info = anyio.run(training_route._get_training_route_session_info, "run-detached-miss")
+
+    assert info is None
+
+
+def test_issue_360_training_enqueue_refreshes_detached_heartbeat_before_queue(monkeypatch):
+    fs, cap, q = _install_stateless_training_enqueue_stubs(
+        monkeypatch,
+        route_session_info={
+            "model_id": "run-detached",
+            "session_id": "sess-detached",
+            "base_model": "Qwen/Qwen3-0.6B",
+            "backend": "peft",
+            "user_id": "user-a",
+        },
+    )
+
+    calls: list[tuple[str, float | None]] = []
+
+    class _HeartbeatStore:
+        async def async_update(self, session_id: str, now: float | None = None) -> None:
+            calls.append((session_id, now))
+
+    import tinker_server.backend.session_heartbeat_store as shs
+
+    monkeypatch.setattr(shs, "session_heartbeat_store", _HeartbeatStore())
+
+    req = ForwardRequest(
+        model_id="run-detached",
+        seq_id=31,
+        forward_input=ForwardBackwardInput(data=[], loss_fn="noop"),
+    )
+
+    out = anyio.run(training_route.forward, req, _request_stub("user-a"))
+
+    assert isinstance(out.request_id, str) and out.request_id
+    assert len(calls) == 1
+    assert calls[0][0] == "sess-detached"
+    assert calls[0][1] is not None
+    assert len(cap.calls) == 1
+    assert any(name == "async_create_with_id" for name, _rid in fs.calls)
+    assert len(q.calls) == 1
+
+
+def test_issue_360_training_enqueue_returns_503_when_heartbeat_protection_fails(monkeypatch):
+    _fs, _cap, q = _install_stateless_training_enqueue_stubs(
+        monkeypatch,
+        route_session_info={
+            "model_id": "run-detached",
+            "session_id": "sess-detached",
+            "base_model": "Qwen/Qwen3-0.6B",
+            "backend": "peft",
+            "user_id": "user-a",
+        },
+    )
+
+    class _BrokenHeartbeatStore:
+        async def async_update(self, session_id: str, now: float | None = None) -> None:
+            _ = (session_id, now)
+            raise RuntimeError("heartbeat store unavailable")
+
+    import tinker_server.backend.session_heartbeat_store as shs
+
+    monkeypatch.setattr(shs, "session_heartbeat_store", _BrokenHeartbeatStore())
+
+    req = ForwardRequest(
+        model_id="run-detached",
+        seq_id=32,
+        forward_input=ForwardBackwardInput(data=[], loss_fn="noop"),
+    )
+
+    with pytest.raises(training_route.HTTPException) as excinfo:
+        anyio.run(training_route.forward, req, _request_stub("user-a"))
+
+    assert excinfo.value.status_code == 503
+    assert excinfo.value.detail == "Training heartbeat store unavailable"
+    assert q.calls == []
 
 
 @pytest.mark.parametrize(
@@ -675,7 +1053,6 @@ def test_issue_360_service_get_session_uses_async_index_store(monkeypatch):
 
     monkeypatch.setattr(sis, "get_session_index", _sync_get_session_index)
     monkeypatch.setattr(sis, "async_get_session_index", _async_get_session_index)
-    monkeypatch.setattr(service_route, "sessions", {})
 
     out = anyio.run(service_route.get_session, "sess-360", _request_stub("admin"))
 
@@ -705,7 +1082,6 @@ def test_issue_360_service_list_sessions_uses_async_index_store(monkeypatch):
 
     monkeypatch.setattr(sis, "list_session_index", _sync_list_session_index)
     monkeypatch.setattr(sis, "async_list_session_index", _async_list_session_index)
-    monkeypatch.setattr(service_route, "sessions", {})
 
     out = anyio.run(service_route.list_sessions, 20, 0, _request_stub("admin"))
 
@@ -1276,11 +1652,12 @@ def test_issue_360_kill_exact_vllm_actor_passes_resolved_handle_to_async_kill(mo
 
     _install_minimal_ray_module(monkeypatch)
     _install_namespace_module(monkeypatch, "tinker_server.backend.multi_lora_engine", "ns-vllm")
-    import tinker_server.backend.resource_pool as rp
-
-    monkeypatch.setattr(rp, "ActorType", SimpleNamespace(VLLM="vllm"))
-    monkeypatch.setattr(rp, "ResourcePoolStaleError", RuntimeError)
-    monkeypatch.setattr(rp, "get_resource_pool", lambda: pool)
+    _install_resource_pool_module(
+        monkeypatch,
+        pool=pool,
+        actor_types=SimpleNamespace(VLLM="vllm"),
+        stale_error=RuntimeError,
+    )
     monkeypatch.setattr(service_route, "async_lookup_actor_handle", _async_lookup_actor_handle)
     monkeypatch.setattr(service_route, "async_kill_named_actor", _async_kill_named_actor)
     monkeypatch.setattr(service_route, "_remove_actor_pg", lambda actor_name: removed_pgs.append(actor_name))
@@ -1299,6 +1676,93 @@ def test_issue_360_kill_exact_vllm_actor_passes_resolved_handle_to_async_kill(mo
     ]
     assert unregister_calls == ["vllm-a"]
     assert removed_pgs == ["vllm-a"]
+
+
+def test_issue_364_kill_busy_vllm_actor_rejected(monkeypatch):
+    busy_entry = SimpleNamespace(
+        actor_name="tinker_vllm_qwen3-0.6b",
+        actor_type="vllm",
+        namespace="ns-vllm",
+        base_model="Qwen/Qwen3-0.6B",
+        current_session=None,
+        inflight_count=1,
+        creating=False,
+        protected=False,
+    )
+    pool = SimpleNamespace(iter_entries=lambda: [busy_entry])
+    kill_calls: list[str | None] = []
+
+    _install_minimal_ray_module(monkeypatch)
+
+    monkeypatch.setattr(service_route, "_require_admin", lambda _request: None)
+    _install_resource_pool_module(
+        monkeypatch,
+        pool=pool,
+        actor_types=SimpleNamespace(VLLM="vllm", MEGATRON="megatron", DENSE="dense"),
+    )
+    mle_module = types.ModuleType("tinker_server.backend.multi_lora_engine")
+    monkeypatch.setitem(sys.modules, "tinker_server.backend.multi_lora_engine", mle_module)
+    monkeypatch.setattr(
+        mle_module,
+        "kill_persistent_vllm_actor",
+        lambda model_name=None: kill_calls.append(model_name) or True,
+        raising=False,
+    )
+
+    with pytest.raises(service_route.HTTPException, match="Refusing to kill busy actor"):
+        anyio.run(
+            service_route.kill_actors,
+            _request_stub("admin"),
+            service_route.KillActorsRequest(actor_type="vllm", model_name="Qwen/Qwen3-0.6B"),
+        )
+
+    assert kill_calls == []
+
+
+def test_issue_364_kill_busy_vllm_actor_force_override(monkeypatch):
+    busy_entry = SimpleNamespace(
+        actor_name="tinker_vllm_qwen3-0.6b",
+        actor_type="vllm",
+        namespace="ns-vllm",
+        base_model="Qwen/Qwen3-0.6B",
+        current_session=None,
+        inflight_count=2,
+        creating=False,
+        protected=False,
+    )
+    pool = SimpleNamespace(iter_entries=lambda: [busy_entry])
+    kill_calls: list[str | None] = []
+
+    _install_minimal_ray_module(monkeypatch)
+
+    monkeypatch.setattr(service_route, "_require_admin", lambda _request: None)
+    _install_resource_pool_module(
+        monkeypatch,
+        pool=pool,
+        actor_types=SimpleNamespace(VLLM="vllm", MEGATRON="megatron", DENSE="dense"),
+    )
+    mle_module = types.ModuleType("tinker_server.backend.multi_lora_engine")
+    monkeypatch.setitem(sys.modules, "tinker_server.backend.multi_lora_engine", mle_module)
+    monkeypatch.setattr(
+        mle_module,
+        "kill_persistent_vllm_actor",
+        lambda model_name=None: kill_calls.append(model_name) or True,
+        raising=False,
+    )
+
+    result = anyio.run(
+        service_route.kill_actors,
+        _request_stub("admin"),
+        service_route.KillActorsRequest(
+            actor_type="vllm",
+            model_name="Qwen/Qwen3-0.6B",
+            force=True,
+            reason="test-force",
+        ),
+    )
+
+    assert result == {"killed": 1, "killed_by_type": {"vllm": 1, "megatron": 0, "dense": 0}}
+    assert kill_calls == ["Qwen/Qwen3-0.6B"]
 
 
 class _AwaitableObjectRef:
@@ -1475,5 +1939,42 @@ def test_issue_360_training_session_store_async_reacquires_dead_actor(monkeypatc
     out = anyio.run(store_module.async_get_training_session_info, "run-reacquired")
 
     assert out == {"model_id": "run-reacquired"}
+    assert reacquire_calls == [(store_module._actor_name(), store_module._ray_namespace())]
+    assert store_module._ACTOR_HANDLE is recovered_actor
+
+
+def test_issue_360_sampling_session_store_async_reacquires_dead_actor(monkeypatch):
+    import importlib
+
+    store_module = importlib.import_module("tinker_server.backend.sampling_session_store")
+
+    class _ActorDiedError(Exception):
+        pass
+
+    class _RayActorError(Exception):
+        pass
+
+    stale_actor = SimpleNamespace(get=_RemoteCall(error=_ActorDiedError("dead actor")))
+    recovered_actor = SimpleNamespace(get=_RemoteCall(result={"session_id": "sampling-reacquired"}))
+    reacquire_calls: list[tuple[str, str]] = []
+
+    ray_mod = types.ModuleType("ray")
+    ray_mod.is_initialized = lambda: True  # type: ignore[attr-defined]
+    ray_mod.exceptions = SimpleNamespace(
+        ActorDiedError=_ActorDiedError,
+        RayActorError=_RayActorError,
+    )
+
+    def _get_actor(name: str, *, namespace: str):
+        reacquire_calls.append((name, namespace))
+        return recovered_actor
+
+    ray_mod.get_actor = _get_actor  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "ray", ray_mod)
+    monkeypatch.setattr(store_module, "_ACTOR_HANDLE", stale_actor)
+
+    out = anyio.run(store_module.async_get_sampling_session_info, "sampling-reacquired")
+
+    assert out == {"session_id": "sampling-reacquired"}
     assert reacquire_calls == [(store_module._actor_name(), store_module._ray_namespace())]
     assert store_module._ACTOR_HANDLE is recovered_actor

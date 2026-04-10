@@ -21,6 +21,7 @@ from ..checkpoints import (
 )
 from ..client_compat import checkpoint_uri
 from ..logging_context import classify_failure_reason, set_request_id
+from ..queue_priority import merge_queue_priority_extra
 from ..models.mint_types import (
     ForwardBackwardReverseKLRequest,
     InterpolateCheckpointsRequest,
@@ -43,7 +44,10 @@ def _get_user_id(request: Request) -> str | None:
 
 
 def _resolve_checkpoint_for_user(path: str, *, user_id: str | None, is_admin: bool) -> str:
-    resolved = resolve_checkpoint_path(path, user_id=user_id, is_admin=is_admin)
+    try:
+        resolved = resolve_checkpoint_path(path, user_id=user_id, is_admin=is_admin)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     ensure_checkpoint_path_allowed(resolved, user_id=user_id, is_admin=is_admin)
     return materialize_persistent_checkpoint(resolved)
 
@@ -75,6 +79,30 @@ def _reverse_kl_token_stats(data: list) -> tuple[int, int]:
             len(ref_tokens) + int(target_shape[0]) - 1,
         )
     return total_tokens, max_seq_len
+
+
+async def _get_route_training_store_info(model_id: str) -> dict | None:
+    from ..routes.training import _get_training_route_session_info
+
+    info = await _get_training_route_session_info(model_id)
+    if isinstance(info, dict):
+        return info
+    if training_manager is not None:
+        return None
+
+    try:
+        from ..backend.training_session_store import async_get_training_session_info
+
+        store_info = await async_get_training_session_info(model_id)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail="Training session store unavailable") from e
+    return store_info if isinstance(store_info, dict) else None
+
+
+async def _protect_training_session_enqueue_window(session_info: dict) -> None:
+    from ..routes.training import _protect_training_session_enqueue_window as _training_protect
+
+    await _training_protect(session_info)
 
 
 @router.post("/checkpoints/interpolate", response_model=UntypedAPIFuture)
@@ -114,6 +142,7 @@ async def interpolate_checkpoints(
             request_json=request_json,
             user_id=user_id,
             webhook_url=None,
+            extra=merge_queue_priority_extra(request=http_request),
         )
     except Exception as e:
         await capacity_manager.async_release_all(request_id)
@@ -169,7 +198,7 @@ async def _do_interpolate_checkpoints(
             prefer_tinker=False,
             checkpoint_type="sampler",
         )
-        future_store.resolve(
+        await future_store.async_resolve(
             request_id,
             {
                 "path": path_uri,
@@ -199,13 +228,11 @@ async def forward_backward_reverse_kl(
     request: ForwardBackwardReverseKLRequest,
     http_request: Request,
 ) -> UntypedAPIFuture:
-    if training_engine is None or training_manager is None:
-        raise HTTPException(status_code=503, detail="Training engine not initialized")
-
-    session = training_manager.get_session(request.model_id)
-    if session is None:
+    info = await _get_route_training_store_info(request.model_id)
+    if not isinstance(info, dict):
         raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
 
+    await _protect_training_session_enqueue_window(info)
     try:
         _token_count, max_seq_len = _reverse_kl_token_stats(request.data)
     except ValueError as exc:
@@ -213,13 +240,14 @@ async def forward_backward_reverse_kl(
 
     from ..routes.training import _get_max_model_len
 
-    max_model_len = _get_max_model_len(session.base_model)
+    base_model = str(info.get("base_model") or "")
+    max_model_len = _get_max_model_len(base_model)
     if max_seq_len > max_model_len:
         raise HTTPException(
             status_code=400,
             detail=(
                 f"Input sequence length {max_seq_len} exceeds max_model_len {max_model_len} "
-                f"for model {session.base_model}"
+                f"for model {base_model}"
             ),
         )
 
@@ -263,6 +291,7 @@ async def forward_backward_reverse_kl(
             request_json=request_json,
             user_id=user_id,
             webhook_url=None,
+            extra=merge_queue_priority_extra(request=http_request),
         )
     except Exception as e:
         await capacity_manager.async_release_all(request_id)
@@ -311,7 +340,7 @@ async def _do_forward_backward_reverse_kl(
             session.model_id,
             time.time() - t0,
         )
-        future_store.resolve(request_id, result)
+        await future_store.async_resolve(request_id, result)
     except Exception as e:
         logger.exception(
             "[mint.forward_backward_reverse_kl] failed request_id=%s model_id=%s failure_reason=%s error_type=%s next_action=%s",

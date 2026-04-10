@@ -17,6 +17,13 @@ from ..config import otel_env_vars
 logger = logging.getLogger(__name__)
 _ACTOR_HANDLE = None
 
+def _reset_cached_actor_handle() -> None:
+    global _ACTOR_HANDLE
+    _ACTOR_HANDLE = None
+
+from ..ray_utils import register_ray_reconnect_invalidator as _register_ray_reconnect_invalidator
+_register_ray_reconnect_invalidator(_reset_cached_actor_handle)
+
 
 async def _await_ray_ref(ref: Any) -> Any:
     if hasattr(ref, "__await__"):
@@ -143,6 +150,18 @@ def _get_or_create_actor():
                 current.setdefault("created_at", created_at)
             self._sessions[session_id] = current
 
+        def remove_sampler(self, session_id: str, sampler_id: str) -> None:
+            current = dict(self._sessions.get(session_id, {}))
+            samplers = list(current.get("sampler_ids") or [])
+            heartbeat_samplers = list(current.get("heartbeat_sampler_ids") or [])
+            if sampler_id in samplers or sampler_id in heartbeat_samplers:
+                current["sampler_ids"] = [sid for sid in samplers if sid != sampler_id]
+                current["heartbeat_sampler_ids"] = [
+                    sid for sid in heartbeat_samplers if sid != sampler_id
+                ]
+                current["session_id"] = session_id
+                self._sessions[session_id] = current
+
         def get_session(self, session_id: str) -> dict[str, Any] | None:
             return self._sessions.get(session_id)
 
@@ -155,6 +174,9 @@ def _get_or_create_actor():
             current.setdefault("sampler_id", sampler_id)
             self._samplers[sampler_id] = current
 
+        def delete_sampler(self, sampler_id: str) -> None:
+            self._samplers.pop(sampler_id, None)
+
         def get_sampler(self, sampler_id: str) -> dict[str, Any] | None:
             return self._samplers.get(sampler_id)
 
@@ -166,22 +188,23 @@ def _get_or_create_actor():
         "namespace": namespace,
         "lifetime": "detached",
     }
-    try:
-        if "node:__internal_head__" in ray.cluster_resources():
-            options["resources"] = {"node:__internal_head__": 0.001}
-    except Exception:
-        pass
     actor_otel_env = otel_env_vars()
-    from ..config import PFS_PYTHONPATH, actor_runtime_env
+    from ..config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources
+    apply_detached_actor_resources(options, ray)
     options["runtime_env"] = actor_runtime_env(
         pythonpath=PFS_PYTHONPATH,
         extra=actor_otel_env,
     )
 
     try:
-        _ACTOR_HANDLE = _SessionIndexStore.options(
+        created = _SessionIndexStore.options(
             **options
         ).remote()
+        try:
+            ray.get(created.list_sessions.remote())
+            _ACTOR_HANDLE = created
+        except Exception:
+            _ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)
         return _ACTOR_HANDLE
     except Exception:
         _ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)
@@ -307,6 +330,21 @@ def add_sampler_to_session(
         logger.warning("Session index store write failed: add_sampler: %s", e)
 
 
+def remove_sampler_from_session(session_id: str, sampler_id: str) -> None:
+    import ray
+
+    if not ray.is_initialized():
+        logger.warning("Session index store write skipped: Ray not initialized")
+        return
+    if not session_id or not sampler_id:
+        return
+    try:
+        actor = _get_or_create_actor()
+        actor.remove_sampler.remote(session_id, sampler_id)
+    except Exception as e:
+        logger.warning("Session index store write failed: remove_sampler: %s", e)
+
+
 def add_heartbeat_sampler_to_session(
     session_id: str,
     sampler_id: str,
@@ -401,6 +439,21 @@ def upsert_sampler_index(info: dict[str, Any]) -> None:
         actor.upsert_sampler.remote(sampler_id, dict(info))
     except Exception as e:
         logger.warning("Session index store write failed: upsert_sampler: %s", e)
+
+
+def delete_sampler_index(sampler_id: str) -> None:
+    import ray
+
+    if not ray.is_initialized():
+        logger.warning("Session index store write skipped: Ray not initialized")
+        return
+    if not sampler_id:
+        return
+    try:
+        actor = _get_or_create_actor()
+        actor.delete_sampler.remote(sampler_id)
+    except Exception as e:
+        logger.warning("Session index store write failed: delete_sampler: %s", e)
 
 
 def get_sampler_index(sampler_id: str) -> dict[str, Any] | None:

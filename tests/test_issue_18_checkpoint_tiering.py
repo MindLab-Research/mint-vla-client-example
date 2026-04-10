@@ -119,7 +119,7 @@ def test_issue_18_no_legacy_fallback_resolution(tmp_path, monkeypatch) -> None:
         "tinker://run-18/sampler_weights/ckpt-final",
         user_id="owner-a",
     )
-    assert unresolved == str(persistent_root / "owner-a" / "run-18" / "ckpt-final")
+    assert unresolved == str(persistent_root / "owner-a" / "run-18" / "ckpt-final" / "sampler")
 
 
 def test_issue_18_session_manager_rejects_checkpoint_uri() -> None:

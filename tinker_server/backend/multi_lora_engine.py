@@ -19,7 +19,7 @@ import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from tinker_server.backend.model_registry import get_model_config
-from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
+from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, otel_env_vars
 from tinker_server.config import config as server_config
 from tinker_server.logging_context import get_current_traceparent, run_async_with_otel_span
 from tinker_server.ray_utils import init_ray
@@ -136,6 +136,18 @@ class GenerateResult:
     logprobs: list[float] | None = None
     stop_reason: str | None = None
     routed_experts: list | None = None
+    timing_total_s: float | None = None
+    timing_first_tok_s: float | None = None
+
+
+def _float_or_none(value: object) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
 
 
 class MultiLoRAInferenceEngine:
@@ -247,7 +259,11 @@ class MultiLoRAInferenceEngine:
 
                         # Register existing actor with resource pool for LRU tracking
                         # Include node_id for proper per-node GPU scheduling
-                        from tinker_server.backend.resource_pool import get_resource_pool, ActorType
+                        from tinker_server.backend.resource_pool import (
+                            ActorType,
+                            actor_observability_metadata,
+                            get_resource_pool,
+                        )
                         total_gpus = self.tensor_parallel_size * self.data_parallel_size
                         resource_pool = get_resource_pool()
                         actor_node_id = _get_actor_node_id(self.server)
@@ -260,6 +276,7 @@ class MultiLoRAInferenceEngine:
                             namespace=PERSISTENT_NAMESPACE,
                             base_model=self.model_path,
                             node_id=actor_node_id,
+                            metadata=dict(actor_observability_metadata(self.server) or {}),
                         )
                         # Mark as ready since it's an existing actor that responded to health check
                         resource_pool.mark_ready(self.actor_name)
@@ -296,7 +313,11 @@ class MultiLoRAInferenceEngine:
                     )
                     self._initialized = True
 
-                    from tinker_server.backend.resource_pool import get_resource_pool, ActorType
+                    from tinker_server.backend.resource_pool import (
+                        ActorType,
+                        actor_observability_metadata,
+                        get_resource_pool,
+                    )
                     total_gpus = self.tensor_parallel_size * self.data_parallel_size
                     resource_pool = get_resource_pool()
                     actor_node_id = _get_actor_node_id(self.server)
@@ -311,6 +332,7 @@ class MultiLoRAInferenceEngine:
                         namespace=PERSISTENT_NAMESPACE,
                         base_model=self.model_path,
                         node_id=actor_node_id,
+                        metadata=dict(actor_observability_metadata(self.server) or {}),
                     )
                     resource_pool.mark_ready(self.actor_name)
                     return
@@ -593,7 +615,11 @@ class MultiLoRAInferenceEngine:
 
             # Register with unified resource pool for LRU tracking
             # Include node_id for proper per-node GPU scheduling
-            from tinker_server.backend.resource_pool import get_resource_pool, ActorType
+            from tinker_server.backend.resource_pool import (
+                ActorType,
+                actor_observability_metadata,
+                get_resource_pool,
+            )
             resource_pool = get_resource_pool()
             actor_node_id = _get_actor_node_id(self.server)
             resource_pool.register(
@@ -604,6 +630,7 @@ class MultiLoRAInferenceEngine:
                 namespace=PERSISTENT_NAMESPACE,
                 base_model=self.model_path,
                 node_id=actor_node_id,
+                metadata=dict(actor_observability_metadata(self.server) or {}),
             )
             # Mark as ready now that launch completed successfully
             resource_pool.mark_ready(self.actor_name)
@@ -961,6 +988,8 @@ class MultiLoRAInferenceEngine:
             logprobs=result.get("logprobs"),
             stop_reason=result.get("stop_reason"),
             routed_experts=result.get("routed_experts"),
+            timing_total_s=_float_or_none(result.get("_timing_total_s")),
+            timing_first_tok_s=_float_or_none(result.get("_timing_first_tok_s")),
         )
 
     async def generate_many(
@@ -1080,6 +1109,8 @@ class MultiLoRAInferenceEngine:
                 logprobs=r.get("logprobs"),
                 stop_reason=r.get("stop_reason"),
                 routed_experts=r.get("routed_experts"),
+                timing_total_s=_float_or_none(r.get("_timing_total_s")),
+                timing_first_tok_s=_float_or_none(r.get("_timing_first_tok_s")),
             )
             for r in raw_list
         ]
@@ -1287,6 +1318,20 @@ class MultiLoRAInferenceEngine:
             should_unload,
         )
         return True
+
+    async def restore_loaded_session(
+        self,
+        *,
+        sampling_session_id: str,
+        adapter_path: str,
+        lora_int_id: int,
+    ) -> int:
+        """Restore a detached control-plane mapping for an already-loaded LoRA."""
+        return await self.registry.restore_existing_session(
+            sampling_session_id,
+            adapter_path=adapter_path,
+            lora_int_id=lora_int_id,
+        )
 
     async def shutdown(self, kill_actor: bool = False) -> None:
         """Disconnect from the engine (optionally kill the persistent actor).

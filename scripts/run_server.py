@@ -27,7 +27,7 @@ import pathlib
 import sys
 import tomllib
 import traceback
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -139,6 +139,8 @@ def _reexec_if_env_mismatch(*, pythonpath: str, ld_library_path: str) -> None:
         "LD_LIBRARY_PATH": ld_library_path,
         "TINKER_SERVER_EXACT_ENV": "1",
     }
+    current_pythonpath = _normalize_pythonpath(os.environ.get("PYTHONPATH", ""))
+    current_ld_library_path = os.environ.get("LD_LIBRARY_PATH", "")
     current_matches = all(
         os.environ.get(k) == v for k, v in desired.items() if k != "TINKER_SERVER_EXACT_ENV"
     )
@@ -151,6 +153,9 @@ def _reexec_if_env_mismatch(*, pythonpath: str, ld_library_path: str) -> None:
         )
     new_env = dict(os.environ)
     new_env.update(desired)
+    new_env["TINKER_SERVER_ENV_NORMALIZED"] = "1"
+    new_env["TINKER_SERVER_PYTHONPATH_CHANGED"] = "1" if current_pythonpath != pythonpath else "0"
+    new_env["TINKER_SERVER_LD_LIBRARY_PATH_CHANGED"] = "1" if current_ld_library_path != ld_library_path else "0"
     os.execvpe(sys.executable, [sys.executable, *sys.argv], new_env)
 
 
@@ -227,8 +232,104 @@ def _seed_runtime_env_from_config(config_path: str) -> None:
     os.environ["PFS_HF_MODULES_PATH"] = str(paths["pfs_hf_modules_path"])
 
 
-if __name__ == "__main__":
-    args = _parse_args(sys.argv[1:])
+_DEFAULT_UVICORN_WORKERS = 8
+_DEFAULT_WORKER_HEALTHCHECK_TIMEOUT_S = 120
+_APP_IMPORT_STRING = "tinker_server.app:app"
+
+
+def _resolve_workers(environ: dict[str, str] | None = None) -> int:
+    env = os.environ if environ is None else environ
+    raw = str(env.get("MINT_UVICORN_WORKERS", "")).strip()
+    if not raw:
+        return _DEFAULT_UVICORN_WORKERS
+    try:
+        workers = int(raw)
+    except ValueError as e:
+        raise RuntimeError(f"MINT_UVICORN_WORKERS must be an integer, got {raw!r}") from e
+    if workers < 1:
+        raise RuntimeError(f"MINT_UVICORN_WORKERS must be >= 1, got {workers}")
+    return workers
+
+
+def _resolve_worker_healthcheck_timeout_s(environ: dict[str, str] | None = None) -> int:
+    env = os.environ if environ is None else environ
+    raw = str(env.get("MINT_UVICORN_WORKER_HEALTHCHECK_TIMEOUT", "")).strip()
+    if not raw:
+        return _DEFAULT_WORKER_HEALTHCHECK_TIMEOUT_S
+    try:
+        timeout_s = int(raw)
+    except ValueError as e:
+        raise RuntimeError(
+            f"MINT_UVICORN_WORKER_HEALTHCHECK_TIMEOUT must be an integer, got {raw!r}"
+        ) from e
+    if timeout_s < 1:
+        raise RuntimeError(
+            f"MINT_UVICORN_WORKER_HEALTHCHECK_TIMEOUT must be >= 1, got {timeout_s}"
+        )
+    return timeout_s
+
+
+def _uvicorn_target_and_kwargs(*, app: object, config: SimpleNamespace, environ: dict[str, str] | None = None) -> tuple[object, dict[str, object]]:
+    workers = _resolve_workers(environ)
+    kwargs: dict[str, object] = {
+        "host": config.host,
+        "port": config.port,
+        "log_level": "info",
+    }
+    if workers > 1:
+        kwargs["workers"] = workers
+        kwargs["timeout_worker_healthcheck"] = _resolve_worker_healthcheck_timeout_s(environ)
+        return _APP_IMPORT_STRING, kwargs
+    return app, kwargs
+
+
+def _launcher_observability(*, target: object, kwargs: dict[str, object], environ: dict[str, str] | None = None) -> dict[str, object]:
+    env = os.environ if environ is None else environ
+    workers = int(kwargs.get("workers", 1))
+    pythonpath = _normalize_pythonpath(env.get("PYTHONPATH", ""))
+    entry_count = 0 if not pythonpath else len(pythonpath.split(":"))
+    return {
+        "mode": "multi-worker" if workers > 1 else "single-worker",
+        "workers": workers,
+        "host": kwargs["host"],
+        "port": kwargs["port"],
+        "target": target if isinstance(target, str) else "inproc:app",
+        "timeout_worker_healthcheck": kwargs.get("timeout_worker_healthcheck"),
+        "namespace": env.get("MINT_RAY_NAMESPACE") or env.get("TINKER_RAY_NAMESPACE") or "",
+        "startup_lease_actor": env.get("MINT_STARTUP_LEASE_ACTOR_NAME", ""),
+        "ray_address": env.get("RAY_ADDRESS", ""),
+        "ray_client_address": env.get("MINT_RAY_CLIENT_ADDRESS") or env.get("RAY_CLIENT_ADDRESS") or "",
+        "env_normalized": env.get("TINKER_SERVER_ENV_NORMALIZED") == "1",
+        "pythonpath_changed": env.get("TINKER_SERVER_PYTHONPATH_CHANGED") == "1",
+        "ld_library_path_changed": env.get("TINKER_SERVER_LD_LIBRARY_PATH_CHANGED") == "1",
+        "pythonpath_entries": entry_count,
+    }
+
+
+def _log_launcher_observability(*, target: object, kwargs: dict[str, object], environ: dict[str, str] | None = None) -> None:
+    meta = _launcher_observability(target=target, kwargs=kwargs, environ=environ)
+    logging.getLogger("tinker_server.launcher").info(
+        "launcher mode=%s workers=%s host=%s port=%s target=%r timeout_worker_healthcheck=%r namespace=%r startup_lease_actor=%r ray_address=%r ray_client_address=%r env_normalized=%s pythonpath_changed=%s ld_library_path_changed=%s pythonpath_entries=%s",
+        meta["mode"],
+        meta["workers"],
+        meta["host"],
+        meta["port"],
+        meta["target"],
+        meta["timeout_worker_healthcheck"],
+        meta["namespace"],
+        meta["startup_lease_actor"],
+        meta["ray_address"],
+        meta["ray_client_address"],
+        meta["env_normalized"],
+        meta["pythonpath_changed"],
+        meta["ld_library_path_changed"],
+        meta["pythonpath_entries"],
+    )
+
+
+def main(argv: list[str] | None = None) -> None:
+    argv = sys.argv[1:] if argv is None else argv
+    args = _parse_args(argv)
     config_path = str(args.config_path) if args.config_path else os.environ.get("TINKER_CONFIG_PATH", "").strip()
     if config_path:
         os.environ["TINKER_CONFIG_PATH"] = config_path
@@ -250,11 +351,9 @@ if __name__ == "__main__":
         ld_library_path=ld_library_path,
     )
 
-    # Configure structured logging early with request_id support
     from tinker_server.logging_context import configure_logging
-    configure_logging()
 
-    # Suppress noisy 408 polling logs
+    configure_logging()
     logging.getLogger("uvicorn.access").addFilter(PollingLogFilter())
 
     import uvicorn
@@ -262,9 +361,13 @@ if __name__ == "__main__":
     from tinker_server.app import app
     from tinker_server.config import config
 
-    uvicorn.run(
-        app,
-        host=config.host,
-        port=config.port,
-        log_level="info",
+    target, kwargs = _uvicorn_target_and_kwargs(
+        app=app,
+        config=SimpleNamespace(host=config.host, port=config.port),
     )
+    _log_launcher_observability(target=target, kwargs=kwargs)
+    uvicorn.run(target, **kwargs)
+
+
+if __name__ == "__main__":
+    main()

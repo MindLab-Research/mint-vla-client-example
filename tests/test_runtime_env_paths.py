@@ -10,6 +10,7 @@ import tomllib
 import subprocess
 import sys
 
+import tinker_server.config as server_config
 from tinker_server.runtime_env import (
     bootstrap_runtime_pythonpath,
     build_runtime_pythonpath,
@@ -254,6 +255,22 @@ def test_runtime_env_layout_prefers_manifest_sources(tmp_path):
     ]
 
 
+def test_preferred_vllm_python_executable_prefers_explicit_env(monkeypatch, tmp_path):
+    repo_root = tmp_path / "local-tinker"
+    worker_wrapper = repo_root / "scripts" / "vllm_worker_python.py"
+    worker_wrapper.parent.mkdir(parents=True, exist_ok=True)
+    worker_wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    explicit = tmp_path / "shared" / "scripts" / "vllm_worker_python.py"
+    explicit.parent.mkdir(parents=True, exist_ok=True)
+    explicit.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    monkeypatch.setattr(server_config, "PFS_TINKER_PATH", str(repo_root))
+    monkeypatch.setenv("MINT_VLLM_CHILD_PYTHON_EXECUTABLE", str(explicit))
+
+    assert server_config.preferred_vllm_python_executable() == str(explicit)
+
+
 def test_validate_runtime_env_layout_requires_base_python_when_host_python_required(tmp_path):
     env_root = tmp_path / "runtime"
     _materialize_runtime_env(env_root)
@@ -328,10 +345,12 @@ def test_detached_store_namespaces_respect_config_file(tmp_path):
             (
                 "import tinker_server.config as c; "
                 "import tinker_server.backend.gateway_session_store as g; "
+                "import tinker_server.backend.sampling_session_store as p; "
                 "import tinker_server.backend.session_index_store as s; "
                 "import tinker_server.backend.training_session_store as t; "
                 "print(c.RAY_NAMESPACE); "
                 "print(g._ray_namespace()); "
+                "print(p._ray_namespace()); "
                 "print(s._ray_namespace()); "
                 "print(t._ray_namespace())"
             ),
@@ -342,7 +361,7 @@ def test_detached_store_namespaces_respect_config_file(tmp_path):
         text=True,
         env=env,
     )
-    assert out.stdout.strip().splitlines() == ["cfg_ns", "cfg_ns", "cfg_ns", "cfg_ns"]
+    assert out.stdout.strip().splitlines() == ["cfg_ns", "cfg_ns", "cfg_ns", "cfg_ns", "cfg_ns"]
 
 
 def test_config_import_fails_on_namespace_mismatch(tmp_path):
@@ -587,9 +606,78 @@ def test_actor_runtime_env_vars_forwards_config_path(tmp_path):
             "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
             "RAY_ADDRESS": "ray://cfg-test",
             "TINKER_CONFIG_PATH": str(cfg),
+            "MINT_DETACHED_ACTOR_NODE_IP": "192.168.38.175",
+            "MINT_API_WORK_QUEUE_ACTOR_NAME": "issue440-api-work-queue",
+            "MINT_CAPACITY_MANAGER_ACTOR_NAME": "issue440-capacity-manager",
         },
     )
     data = json.loads(out.stdout)
     assert data["RAY_ADDRESS"] == "ray://cfg-test"
     assert data["TINKER_CONFIG_PATH"] == str(cfg)
     assert data["TINKER_RAY_NAMESPACE"] == "cfg_ns"
+    assert data["MINT_DETACHED_ACTOR_NODE_IP"] == "192.168.38.175"
+    assert data["MINT_API_WORK_QUEUE_ACTOR_NAME"] == "issue440-api-work-queue"
+    assert data["MINT_CAPACITY_MANAGER_ACTOR_NAME"] == "issue440-capacity-manager"
+
+
+def test_server_config_prefers_mint_actor_names_and_accepts_legacy_tinker_aliases():
+    cfg = server_config.ServerConfig.from_sources(
+        environ={
+            "TINKER_API_KEY": "dev-key",
+            "MINT_API_WORK_QUEUE_ACTOR_NAME": "mint-api",
+            "TINKER_API_WORK_QUEUE_ACTOR_NAME": "legacy-api",
+            "MINT_CAPACITY_MANAGER_ACTOR_NAME": "mint-cap",
+            "TINKER_CAPACITY_MANAGER_ACTOR_NAME": "legacy-cap",
+        },
+        config_path=None,
+        config_file=None,
+    )
+
+    assert cfg.api_work_queue_actor_name == "mint-api"
+    assert cfg.capacity_manager_actor_name == "mint-cap"
+
+    legacy_only = server_config.ServerConfig.from_sources(
+        environ={
+            "TINKER_API_KEY": "dev-key",
+            "TINKER_API_WORK_QUEUE_ACTOR_NAME": "legacy-api",
+            "TINKER_CAPACITY_MANAGER_ACTOR_NAME": "legacy-cap",
+        },
+        config_path=None,
+        config_file=None,
+    )
+
+    assert legacy_only.api_work_queue_actor_name == "legacy-api"
+    assert legacy_only.capacity_manager_actor_name == "legacy-cap"
+
+
+def test_actor_runtime_env_vars_canonicalize_legacy_tinker_actor_aliases(tmp_path):
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env(env_root)
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json; "
+                "from tinker_server.config import actor_runtime_env_vars; "
+                "print(json.dumps(actor_runtime_env_vars(pythonpath='X')))"
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            "PFS_RUNTIME_ENV_ROOT": str(env_root),
+            "PFS_TINKER_PATH": str(tmp_path / 'repo'),
+            "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
+            "RAY_ADDRESS": "ray://cfg-test",
+            "TINKER_API_WORK_QUEUE_ACTOR_NAME": "legacy-api-work-queue",
+            "TINKER_CAPACITY_MANAGER_ACTOR_NAME": "legacy-capacity-manager",
+        },
+    )
+    data = json.loads(out.stdout)
+    assert data["MINT_API_WORK_QUEUE_ACTOR_NAME"] == "legacy-api-work-queue"
+    assert data["MINT_CAPACITY_MANAGER_ACTOR_NAME"] == "legacy-capacity-manager"
+    assert "TINKER_API_WORK_QUEUE_ACTOR_NAME" not in data
+    assert "TINKER_CAPACITY_MANAGER_ACTOR_NAME" not in data

@@ -9,13 +9,19 @@ from tinker_server.models.types import ModelInput, SampleRequest, SamplingParams
 
 
 class _StubFutureStore:
-    def ensure_ready(self) -> None:
+    def ensure_ready(self, **_kwargs) -> None:
+        return None
+
+    async def async_ensure_started(self) -> None:
         return None
 
 
 class _StubCapacityManager:
     def ensure_ready(self) -> None:
         return None
+
+    async def async_ensure_ready(self, *, timeout_s: float = 10.0):
+        return {"capacity": 1, "inflight": 0, "timeout_s": float(timeout_s)}
 
 
 class _StubSessionManager:
@@ -27,6 +33,9 @@ class _StubSessionManager:
 
     def set_multi_model_manager(self, manager) -> None:
         self.multi_model_manager = manager
+
+    def restore_sampling_session(self, _info) -> bool:
+        return True
 
     async def shutdown_all(self) -> None:
         return None
@@ -48,12 +57,47 @@ class _StubTrainingEngine:
         return None
 
 
+class _StubOwnerRuntimeSupervisor:
+    async def async_ensure_started(self, *, timeout_s: float = 15.0):
+        return {
+            "actor_name": "tinker_owner_runtime_supervisor",
+            "epoch_id": "epoch-test",
+            "timeout_s": float(timeout_s),
+        }
+
+    async def async_health_snapshot(self, *, timeout_s: float = 10.0):
+        return {
+            "actor_name": "tinker_owner_runtime_supervisor",
+            "epoch_id": "epoch-test",
+            "timeout_s": float(timeout_s),
+        }
+
+
+class _StubQueueExecutionRuntime:
+    async def async_ensure_started(self, *, num_workers: int, timeout_s: float = 120.0):
+        from tinker_server.backend.api_work_queue_dispatch import register_api_work_queue_executors
+        from tinker_server.backend.api_work_queue import api_work_queue
+
+        register_api_work_queue_executors(api_work_queue)
+        return {
+            "actor_name": "tinker_queue_execution_runtime",
+            "desired_workers": int(num_workers),
+            "timeout_s": float(timeout_s),
+        }
+
+
 class _StubApiWorkQueue:
     def __init__(self):
         self._executors: dict[str, object] = {}
 
     def ensure_ready(self) -> None:
         return None
+
+    async def async_ensure_started(self) -> None:
+        return None
+
+    async def async_ensure_ready(self, *, timeout_s: float = 10.0):
+        return {"depth": 0, "enqueued": 0, "dequeued": 0, "timeout_s": float(timeout_s)}
 
     def set_executor(self, op: str, executor) -> None:
         self._executors[str(op)] = executor
@@ -80,6 +124,7 @@ def test_sampling_queue_executor_forwards_gateway_auth(monkeypatch):
 
     monkeypatch.setattr(app_module, "_cleanup_stale_actors", _noop_async)
     monkeypatch.setattr(app_module, "_prewarm_persistent_models", _noop_async)
+    monkeypatch.setattr(app_module, "_restore_sampling_sessions", _noop_async)
     monkeypatch.setattr(app_module, "SessionManager", _StubSessionManager)
     monkeypatch.setattr(app_module.sampling, "_do_sample", _capture_do_sample)
     monkeypatch.setattr(app_module.config, "enable_multi_lora", False)
@@ -89,9 +134,14 @@ def test_sampling_queue_executor_forwards_gateway_auth(monkeypatch):
     capacity_manager_module = importlib.import_module("tinker_server.backend.capacity_manager")
     future_store_module = importlib.import_module("tinker_server.backend.future_store")
     gateway_session_store_module = importlib.import_module("tinker_server.backend.gateway_session_store")
+    sampling_session_store_module = importlib.import_module("tinker_server.backend.sampling_session_store")
     session_index_store_module = importlib.import_module("tinker_server.backend.session_index_store")
     training_session_manager_module = importlib.import_module("tinker_server.backend.training_session_manager")
     training_session_store_module = importlib.import_module("tinker_server.backend.training_session_store")
+    future_replay_module = importlib.import_module("tinker_server.backend.future_replay")
+    dense_session_state_module = importlib.import_module("tinker_server.backend.dense_session_state")
+    owner_runtime_supervisor_module = importlib.import_module("tinker_server.backend.owner_runtime_supervisor")
+    queue_execution_runtime_module = importlib.import_module("tinker_server.backend.queue_execution_runtime")
     checkpoints_module = importlib.import_module("tinker_server.checkpoints")
     gateway_module = importlib.import_module("tinker_server.gateway")
     usage_store_module = importlib.import_module("tinker_server.usage_store")
@@ -103,9 +153,19 @@ def test_sampling_queue_executor_forwards_gateway_auth(monkeypatch):
     monkeypatch.setattr(capacity_manager_module, "capacity_manager", _StubCapacityManager())
     monkeypatch.setattr(future_store_module, "future_store", _StubFutureStore())
     monkeypatch.setattr(gateway_session_store_module, "ensure_ready", lambda: None)
+    monkeypatch.setattr(sampling_session_store_module, "ensure_ready", lambda: None)
     monkeypatch.setattr(session_index_store_module, "ensure_ready", lambda: None)
     monkeypatch.setattr(training_session_manager_module, "TrainingSessionManager", _StubTrainingManager)
     monkeypatch.setattr(training_session_store_module, "ensure_ready", lambda: None)
+    monkeypatch.setattr(training_session_store_module, "list_training_sessions", lambda: [])
+    monkeypatch.setattr(future_replay_module, "ensure_future_replay_sweeper", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        dense_session_state_module,
+        "cleanup_legacy_dense_session_state_once",
+        lambda *args, **kwargs: {"migrated": [], "deleted": [], "skipped": [], "errors": []},
+    )
+    monkeypatch.setattr(owner_runtime_supervisor_module, "owner_runtime_supervisor", _StubOwnerRuntimeSupervisor())
+    monkeypatch.setattr(queue_execution_runtime_module, "queue_execution_runtime", _StubQueueExecutionRuntime())
     monkeypatch.setattr(verl_training_module, "VerlTrainingEngine", _StubTrainingEngine)
     monkeypatch.setattr(checkpoints_module, "get_checkpoint_reap_interval_s", lambda: 3600.0)
     monkeypatch.setattr(checkpoints_module, "reap_runtime_checkpoints", lambda: {})

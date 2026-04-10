@@ -57,6 +57,7 @@ from ..models.types import (
 )
 from ..logging_context import classify_failure_reason, get_otel_tracer, run_async_with_otel_span, set_request_id
 from ..model_access_control import can_access_model, get_access_denied_error
+from ..queue_priority import merge_queue_priority_extra
 from ..webhook import EventType, send_task_event
 
 if TYPE_CHECKING:
@@ -71,6 +72,26 @@ router = APIRouter()
 training_manager: TrainingSessionManager | None = None
 training_engine: VerlTrainingEngine | None = None
 inference_manager: SessionManager | None = None  # For multi-LoRA sampling registration
+
+
+def _mark_training_inflight(model_id: str, delta: int) -> None:
+    if training_manager is None:
+        return
+    mark = getattr(training_manager, "mark_inflight", None)
+    if callable(mark):
+        mark(model_id, delta)
+
+
+async def _fail_future(request_id: str, error: str) -> None:
+    async_fail = getattr(future_store, "async_fail", None)
+    if callable(async_fail):
+        await async_fail(request_id, error)
+        return
+    fail = getattr(future_store, "fail", None)
+    if callable(fail):
+        fail(request_id, error)
+        return
+    raise AttributeError("future_store has neither async_fail nor fail")
 
 
 def _get_user_data(request: Request) -> dict | None:
@@ -94,6 +115,30 @@ def _build_execution_serial_extra(*, model_id: str, extra: dict | None = None) -
     payload = {} if extra is None else dict(extra)
     payload["execution_serial_key"] = f"training_session:{model_id}"
     return payload
+
+
+async def _get_route_training_store_info(model_id: str) -> dict | None:
+    from ..routes.training import _get_training_route_session_info
+
+    info = await _get_training_route_session_info(model_id)
+    if isinstance(info, dict):
+        return info
+    if training_manager is not None:
+        return None
+
+    try:
+        from ..backend.training_session_store import async_get_training_session_info
+
+        store_info = await async_get_training_session_info(model_id)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail="Training session store unavailable") from e
+    return store_info if isinstance(store_info, dict) else None
+
+
+async def _protect_training_session_enqueue_window(session_info: dict) -> None:
+    from ..routes.training import _protect_training_session_enqueue_window as _training_protect
+
+    await _training_protect(session_info)
 
 
 async def _enqueue_weights_request_with_trace(
@@ -140,21 +185,20 @@ def _resolve_mint_path(mint_uri: str, *, user_id: str | None, is_admin: bool = F
     Args:
         mint_uri: One of:
             - checkpoint_id (ckpt_xxx): Search in all checkpoint directories
-            - mint://{model_id}/{name}: Legacy format -> /checkpoints/{model_id}/{name}
+            - tinker://{model_id}/{weights|sampler_weights}/{name}
+            - mint://{model_id}/{weights|sampler_weights}/{name}
             - file:///path: Strip prefix
             - Absolute path: Return as-is
 
     Returns:
         Filesystem path.
     """
-    resolved = resolve_checkpoint_path(mint_uri, user_id=user_id, is_admin=is_admin)
+    try:
+        resolved = resolve_checkpoint_path(mint_uri, user_id=user_id, is_admin=is_admin)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     ensure_checkpoint_path_allowed(resolved, user_id=user_id, is_admin=is_admin)
     return materialize_persistent_checkpoint(resolved)
-
-
-def _to_mint_path(model_id: str, checkpoint_name: str) -> str:
-    """Convert to mint://{model_id}/ URI (legacy format)."""
-    return f"mint://{model_id}/{checkpoint_name}"
 
 
 def _checkpoint_rank(storage_tier: str | None) -> int:
@@ -187,22 +231,26 @@ def _persistent_candidate_paths(
     checkpoint_name: str,
     user_id: str | None,
     is_admin: bool = False,
+    checkpoint_type: str | None = None,
 ) -> list[str]:
     candidates: list[str] = []
+    type_suffix = checkpoint_type if checkpoint_type in ("training", "sampler") else None
+
+    def _extend(base_path: str) -> None:
+        if type_suffix is not None:
+            candidates.append(os.path.join(base_path, type_suffix))
+        candidates.append(base_path)
+
     for root in get_persistent_search_roots(primary_root=CHECKPOINTS_DIR):
         owner_dir = user_id or "anonymous"
-        candidates.extend(
-            [
-                os.path.join(root, owner_dir, model_id, checkpoint_name),
-                os.path.join(root, model_id, checkpoint_name),
-                os.path.join(root, owner_dir, checkpoint_name),
-            ]
-        )
+        _extend(os.path.join(root, owner_dir, model_id, checkpoint_name))
+        _extend(os.path.join(root, model_id, checkpoint_name))
+        _extend(os.path.join(root, owner_dir, checkpoint_name))
         if is_admin and os.path.isdir(root):
             try:
                 for owner in os.listdir(root):
-                    candidates.append(os.path.join(root, owner, model_id, checkpoint_name))
-                    candidates.append(os.path.join(root, owner, checkpoint_name))
+                    _extend(os.path.join(root, owner, model_id, checkpoint_name))
+                    _extend(os.path.join(root, owner, checkpoint_name))
             except OSError:
                 pass
     # Preserve order while dropping duplicates.
@@ -215,6 +263,35 @@ def _persistent_candidate_paths(
         seen.add(real)
         out.append(path)
     return out
+
+
+def _iter_checkpoint_views(root_path: str) -> list[tuple[str, str]]:
+    views: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for checkpoint_type in ("training", "sampler"):
+        typed_path = os.path.join(root_path, checkpoint_type)
+        metadata_path = os.path.join(typed_path, "metadata.json")
+        if not os.path.exists(metadata_path):
+            continue
+        real = os.path.realpath(typed_path)
+        if real in seen:
+            continue
+        seen.add(real)
+        views.append((checkpoint_type, typed_path))
+
+    metadata_path = os.path.join(root_path, "metadata.json")
+    if os.path.exists(metadata_path):
+        real = os.path.realpath(root_path)
+        if real not in seen:
+            try:
+                with open(metadata_path) as f:
+                    metadata = json.load(f)
+                checkpoint_type = metadata.get("checkpoint_type")
+            except Exception:
+                checkpoint_type = None
+            if checkpoint_type in ("training", "sampler"):
+                views.append((checkpoint_type, root_path))
+    return views
 
 
 def _build_sdk_archive_redirect_response(
@@ -427,9 +504,8 @@ async def save_weights(
         upstream_for_alias,
     )
 
-    session = training_manager.get_session(request.model_id) if training_manager is not None else None
-
-    if session is None:
+    store_info = await _get_route_training_store_info(request.model_id)
+    if not isinstance(store_info, dict):
         remote = await async_remote_training_model(request.model_id)
         if remote is not None:
             upstream_alias, base_model = remote
@@ -466,12 +542,10 @@ async def save_weights(
                 request_id=encode_request_id(upstream_alias=upstream_alias, upstream_request_id=upstream_request_id)
             )
 
-    if training_engine is None or training_manager is None:
-        raise HTTPException(status_code=503, detail="Training engine not initialized")
-
-    if session is None:
+    if not isinstance(store_info, dict):
         raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
 
+    await _protect_training_session_enqueue_window(store_info)
     user_id = _get_user_id(http_request)
     webhook_url = _get_webhook_url(http_request)
     from ..client_compat import prefer_tinker_uri
@@ -499,7 +573,7 @@ async def save_weights(
     inflight_marked = False
     try:
         if training_manager is not None:
-            training_manager.mark_inflight(request.model_id, +1)
+            _mark_training_inflight(request.model_id, +1)
             inflight_marked = True
         await future_store.async_create_with_id(request_id)
         created = True
@@ -515,15 +589,18 @@ async def save_weights(
                 request_json=request_json,
                 user_id=user_id,
                 webhook_url=webhook_url,
-                extra=_build_execution_serial_extra(
-                    model_id=request.model_id,
-                    extra={"prefer_tinker": bool(prefer_tinker)},
+                extra=merge_queue_priority_extra(
+                    _build_execution_serial_extra(
+                        model_id=request.model_id,
+                        extra={"prefer_tinker": bool(prefer_tinker)},
+                    ),
+                    request=http_request,
                 ),
             ),
         )
     except Exception as e:
         if inflight_marked and training_manager is not None:
-            training_manager.mark_inflight(request.model_id, -1)
+            _mark_training_inflight(request.model_id, -1)
         await capacity_manager.async_release_all(request_id)
         if created:
             await future_store.async_cleanup(request_id)
@@ -554,8 +631,8 @@ async def save_state(
         upstream_for_alias,
     )
 
-    session = training_manager.get_session(request.model_id) if training_manager is not None else None
-    if session is None:
+    store_info = await _get_route_training_store_info(request.model_id)
+    if not isinstance(store_info, dict):
         remote = await async_remote_training_model(request.model_id)
         if remote is not None:
             upstream_alias, base_model = remote
@@ -592,12 +669,10 @@ async def save_state(
                 request_id=encode_request_id(upstream_alias=upstream_alias, upstream_request_id=upstream_request_id)
             )
 
-    if training_engine is None or training_manager is None:
-        raise HTTPException(status_code=503, detail="Training engine not initialized")
-
-    if session is None:
+    if not isinstance(store_info, dict):
         raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
 
+    await _protect_training_session_enqueue_window(store_info)
     user_id = _get_user_id(http_request)
     webhook_url = _get_webhook_url(http_request)
     from ..client_compat import prefer_tinker_uri
@@ -624,7 +699,7 @@ async def save_state(
     inflight_marked = False
     try:
         if training_manager is not None:
-            training_manager.mark_inflight(request.model_id, +1)
+            _mark_training_inflight(request.model_id, +1)
             inflight_marked = True
         await future_store.async_create_with_id(request_id)
         created = True
@@ -640,15 +715,18 @@ async def save_state(
                 request_json=request_json,
                 user_id=user_id,
                 webhook_url=webhook_url,
-                extra=_build_execution_serial_extra(
-                    model_id=request.model_id,
-                    extra={"prefer_tinker": bool(prefer_tinker)},
+                extra=merge_queue_priority_extra(
+                    _build_execution_serial_extra(
+                        model_id=request.model_id,
+                        extra={"prefer_tinker": bool(prefer_tinker)},
+                    ),
+                    request=http_request,
                 ),
             ),
         )
     except Exception as e:
         if inflight_marked and training_manager is not None:
-            training_manager.mark_inflight(request.model_id, -1)
+            _mark_training_inflight(request.model_id, -1)
         await capacity_manager.async_release_all(request_id)
         if created:
             await future_store.async_cleanup(request_id)
@@ -692,6 +770,7 @@ async def _do_save_state(
             user_id=user_id,
             model_id=session.model_id,
             checkpoint_name=checkpoint_name,
+            checkpoint_type="training",
         )
 
         logger.info(f"[{session.model_id}] Saving state to: {save_path}")
@@ -706,7 +785,7 @@ async def _do_save_state(
             attributes={
                 "model_id": str(request.model_id),
                 "base_model": str(session.base_model),
-                "backend": str(session.backend),
+                "backend": str(getattr(session, "backend", "unknown")),
                 "checkpoint_type": "training",
                 "checkpoint_name": str(checkpoint_name),
             },
@@ -738,7 +817,7 @@ async def _do_save_state(
             "step": session.current_step,
             "checkpoint_type": "training",
             "optimizer_present": optimizer_present,
-            "backend": session.backend,
+            "backend": getattr(session, "backend", "unknown"),
             "type": "training",
             "storage_tier": "persistent_cache",
             "ttl_seconds": request.ttl_seconds,
@@ -758,7 +837,12 @@ async def _do_save_state(
 
         from ..client_compat import checkpoint_uri
 
-        mint_path = _to_mint_path(session.model_id, checkpoint_name)
+        mint_path = checkpoint_uri(
+            session.model_id,
+            checkpoint_name,
+            prefer_tinker=False,
+            checkpoint_type="training",
+        )
         tinker_path = checkpoint_uri(
             session.model_id,
             checkpoint_name,
@@ -772,7 +856,7 @@ async def _do_save_state(
             checkpoint_type="training",
         )
 
-        future_store.resolve(request_id, {
+        await future_store.async_resolve(request_id, {
             "checkpoint_id": checkpoint_name,
             "path": selected_path,
             "mint_path": mint_path,
@@ -809,7 +893,7 @@ async def _do_save_state(
             type(e).__name__,
             "check_training_session_and_checkpoint_path",
         )
-        await future_store.async_fail(request_id, str(e))
+        await _fail_future(request_id, str(e))
 
         # 发送 failed 状态
         if webhook_url and user_id:
@@ -827,7 +911,7 @@ async def _do_save_state(
             )
     finally:
         if inflight_marked and training_manager is not None:
-            training_manager.mark_inflight(request.model_id, -1)
+            _mark_training_inflight(request.model_id, -1)
 
 
 async def _do_save_weights(
@@ -864,6 +948,7 @@ async def _do_save_weights(
             user_id=user_id,
             model_id=session.model_id,
             checkpoint_name=checkpoint_name,
+            checkpoint_type="sampler",
         )
 
         logger.info(f"[{session.model_id}] Saving sampler weights to: {save_path}")
@@ -873,7 +958,8 @@ async def _do_save_weights(
             lambda: training_engine.save_weights_for_sampler(
                 session=session,
                 checkpoint_name=checkpoint_name,
-                checkpoint_base_dir=os.path.dirname(os.path.dirname(save_path)),
+                checkpoint_base_dir=os.path.dirname(os.path.dirname(os.path.dirname(save_path))),
+                checkpoint_type="sampler",
                 use_per_expert_lora=False,
             ),
             component="routes.weights",
@@ -882,7 +968,7 @@ async def _do_save_weights(
             attributes={
                 "model_id": str(request.model_id),
                 "base_model": str(session.base_model),
-                "backend": str(session.backend),
+                "backend": str(getattr(session, "backend", "unknown")),
                 "checkpoint_type": "sampler",
                 "checkpoint_name": str(checkpoint_name),
             },
@@ -904,7 +990,7 @@ async def _do_save_weights(
             "step": session.current_step,
             "checkpoint_type": "sampler",
             "optimizer_present": False,
-            "backend": session.backend,
+            "backend": getattr(session, "backend", "unknown"),
             "type": "sampler",
             "storage_tier": "persistent_cache",
             "ttl_seconds": request.ttl_seconds,
@@ -924,7 +1010,12 @@ async def _do_save_weights(
 
         from ..client_compat import checkpoint_uri
 
-        mint_path = _to_mint_path(session.model_id, checkpoint_name)
+        mint_path = checkpoint_uri(
+            session.model_id,
+            checkpoint_name,
+            prefer_tinker=False,
+            checkpoint_type="sampler",
+        )
         tinker_path = checkpoint_uri(
             session.model_id,
             checkpoint_name,
@@ -938,7 +1029,7 @@ async def _do_save_weights(
             checkpoint_type="sampler",
         )
 
-        future_store.resolve(
+        await future_store.async_resolve(
             request_id,
             {
                 "checkpoint_id": checkpoint_name,
@@ -977,7 +1068,7 @@ async def _do_save_weights(
             type(e).__name__,
             "check_sampler_checkpoint_export",
         )
-        await future_store.async_fail(request_id, str(e))
+        await _fail_future(request_id, str(e))
 
         if webhook_url and user_id:
             failed_session_id = session.model_id if session is not None else request.model_id
@@ -993,7 +1084,7 @@ async def _do_save_weights(
             )
     finally:
         if inflight_marked and training_manager is not None:
-            training_manager.mark_inflight(request.model_id, -1)
+            _mark_training_inflight(request.model_id, -1)
 
 
 # =============================================================================
@@ -1017,8 +1108,8 @@ async def load_state(
         upstream_for_alias,
     )
 
-    session = training_manager.get_session(request.model_id) if training_manager is not None else None
-    remote = None if session is not None else await async_remote_training_model(request.model_id)
+    store_info = await _get_route_training_store_info(request.model_id)
+    remote = None if isinstance(store_info, dict) else await async_remote_training_model(request.model_id)
     if remote is not None:
         upstream_alias, base_model = remote
         upstream = upstream_for_alias(upstream_alias)
@@ -1033,7 +1124,12 @@ async def load_state(
         incoming_headers = dict(http_request.headers)
         json_body = request.model_dump()
         if request.path.startswith(("tinker://", "mint://", "ckpt_")):
-            local_path = resolve_checkpoint_path(request.path, user_id=user_id, is_admin=is_admin_request(http_request))
+            try:
+                local_path = resolve_checkpoint_path(
+                    request.path, user_id=user_id, is_admin=is_admin_request(http_request)
+                )
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
             try:
                 ensure_checkpoint_path_allowed(local_path, user_id=user_id, is_admin=is_admin_request(http_request))
             except PermissionError as e:
@@ -1089,13 +1185,10 @@ async def load_state(
             request_id=encode_request_id(upstream_alias=upstream_alias, upstream_request_id=upstream_request_id)
         )
 
-    if training_engine is None or training_manager is None:
-        raise HTTPException(status_code=503, detail="Training engine not initialized")
-
-    session = training_manager.get_session(request.model_id)
-    if session is None:
+    if not isinstance(store_info, dict):
         raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
 
+    await _protect_training_session_enqueue_window(store_info)
     user_id = _get_user_id(http_request)
     load_path = _resolve_mint_path(request.path, user_id=user_id, is_admin=is_admin_request(http_request))
     request = request.model_copy(update={"path": load_path})
@@ -1135,7 +1228,7 @@ async def load_state(
     inflight_marked = False
     try:
         if training_manager is not None:
-            training_manager.mark_inflight(request.model_id, +1)
+            _mark_training_inflight(request.model_id, +1)
             inflight_marked = True
         await future_store.async_create_with_id(request_id)
         created = True
@@ -1151,12 +1244,15 @@ async def load_state(
                 request_json=request_json,
                 user_id=user_id,
                 webhook_url=None,
-                extra=_build_execution_serial_extra(model_id=request.model_id),
+                extra=merge_queue_priority_extra(
+                    _build_execution_serial_extra(model_id=request.model_id),
+                    request=http_request,
+                ),
             ),
         )
     except Exception as e:
         if inflight_marked and training_manager is not None:
-            training_manager.mark_inflight(request.model_id, -1)
+            _mark_training_inflight(request.model_id, -1)
         await capacity_manager.async_release_all(request_id)
         if created:
             await future_store.async_cleanup(request_id)
@@ -1198,12 +1294,12 @@ async def _do_load_state(
             attributes={
                 "model_id": str(request.model_id),
                 "base_model": str(session.base_model),
-                "backend": str(session.backend),
+                "backend": str(getattr(session, "backend", "unknown")),
                 "load_optimizer": bool(request.optimizer),
             },
         )
 
-        future_store.resolve(request_id, {
+        await future_store.async_resolve(request_id, {
             "path": request.path,
             "type": "load_weights",
         })
@@ -1217,10 +1313,10 @@ async def _do_load_state(
             type(e).__name__,
             "check_checkpoint_contract_and_permissions",
         )
-        await future_store.async_fail(request_id, str(e))
+        await _fail_future(request_id, str(e))
     finally:
         if inflight_marked and training_manager is not None:
-            training_manager.mark_inflight(request.model_id, -1)
+            _mark_training_inflight(request.model_id, -1)
 
 
 # =============================================================================
@@ -1423,89 +1519,79 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
         if not os.path.isdir(checkpoints_path):
             continue
         for name in os.listdir(checkpoints_path):
-            ckpt_path = os.path.join(checkpoints_path, name)
-            if not os.path.isdir(ckpt_path):
+            ckpt_root = os.path.join(checkpoints_path, name)
+            if not os.path.isdir(ckpt_root):
                 continue
-            key = f"{checkpoints_path}:{name}"
-            if key in seen:
-                continue
-            seen.add(key)
+            for checkpoint_type, ckpt_path in _iter_checkpoint_views(ckpt_root):
+                key = os.path.realpath(ckpt_path)
+                if key in seen:
+                    continue
+                seen.add(key)
 
-            metadata_path = os.path.join(ckpt_path, "metadata.json")
-            if not os.path.exists(metadata_path):
-                continue  # refuse unauthenticated legacy dirs
-            try:
-                import json
-
-                with open(metadata_path) as f:
-                    metadata = json.load(f)
-            except Exception:
-                continue
-
-            if metadata.get("model_id") != model_id:
-                continue
-            if not is_admin_request(request) and metadata.get("owner_id") != user_id:
-                continue
-
-            # Try to parse step from directory name
-            step = None
-            if name.startswith("checkpoint-"):
+                metadata_path = os.path.join(ckpt_path, "metadata.json")
+                if not os.path.exists(metadata_path):
+                    continue
                 try:
-                    step = int(name.split("-")[1])
-                except (IndexError, ValueError):
-                    pass
+                    with open(metadata_path) as f:
+                        metadata = json.load(f)
+                except Exception:
+                    continue
 
-            created_at = datetime.fromtimestamp(os.path.getctime(ckpt_path)).isoformat()
-            checkpoint_type = metadata.get("checkpoint_type")
-            if checkpoint_type not in ("training", "sampler"):
-                continue
-            try:
-                if checkpoint_type == "sampler":
-                    validate_sampler_checkpoint_for_sampling(ckpt_path)
-                else:
-                    validate_checkpoint_dir(ckpt_path, checkpoint_type=checkpoint_type)
-            except ValueError:
-                continue
-            storage_tier = metadata.get("storage_tier")
-            mirror_status = metadata.get("mirror_status")
-            mirror_error = metadata.get("mirror_error")
+                if metadata.get("model_id") != model_id:
+                    continue
+                if not is_admin_request(request) and metadata.get("owner_id") != user_id:
+                    continue
 
-            created_at = metadata.get("created_at") or created_at
-            try:
-                created_time = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-            except Exception:
-                created_time = datetime.fromtimestamp(os.path.getctime(ckpt_path))
+                step = None
+                if name.startswith("checkpoint-"):
+                    try:
+                        step = int(name.split("-")[1])
+                    except (IndexError, ValueError):
+                        pass
 
-            checkpoint_id = (
-                f"weights/{name}" if checkpoint_type == "training" else f"sampler_weights/{name}"
-            )
-            tinker_path = checkpoint_uri(
-                model_id,
-                name,
-                prefer_tinker=True,
-                checkpoint_type=checkpoint_type,
-            )
-            path_uri = checkpoint_uri(
-                model_id,
-                name,
-                prefer_tinker=prefer_tinker,
-                checkpoint_type=checkpoint_type,
-            )
+                created_at = datetime.fromtimestamp(os.path.getctime(ckpt_path)).isoformat()
+                created_at = metadata.get("created_at") or created_at
+                try:
+                    created_time = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                except Exception:
+                    created_time = datetime.fromtimestamp(os.path.getctime(ckpt_path))
 
-            _store_checkpoint(
-                CheckpointInfo(
-                    checkpoint_id=checkpoint_id,
-                    checkpoint_type=checkpoint_type,
-                    time=created_time,
-                    tinker_path=tinker_path,
-                    path=path_uri,
-                    step=step,
-                    created_at=created_at,
-                    storage_tier=storage_tier,
-                    mirror_status=mirror_status,
-                    mirror_error=mirror_error,
+                checkpoint_type = metadata.get("checkpoint_type")
+                if checkpoint_type not in ("training", "sampler"):
+                    continue
+                storage_tier = metadata.get("storage_tier")
+                mirror_status = metadata.get("mirror_status")
+                mirror_error = metadata.get("mirror_error")
+                checkpoint_id = (
+                    f"weights/{name}" if checkpoint_type == "training" else f"sampler_weights/{name}"
                 )
-            )
+                tinker_path = checkpoint_uri(
+                    model_id,
+                    name,
+                    prefer_tinker=True,
+                    checkpoint_type=checkpoint_type,
+                )
+                path_uri = checkpoint_uri(
+                    model_id,
+                    name,
+                    prefer_tinker=prefer_tinker,
+                    checkpoint_type=checkpoint_type,
+                )
+
+                _store_checkpoint(
+                    CheckpointInfo(
+                        checkpoint_id=checkpoint_id,
+                        checkpoint_type=checkpoint_type,
+                        time=created_time,
+                        tinker_path=tinker_path,
+                        path=path_uri,
+                        step=step,
+                        created_at=created_at,
+                        storage_tier=storage_tier,
+                        mirror_status=mirror_status,
+                        mirror_error=mirror_error,
+                    )
+                )
 
     # Also include uploaded checkpoints stored as /checkpoints/{owner}/{checkpoint_id}/ if metadata.model_id matches.
     owner_roots: list[str]
@@ -1538,8 +1624,6 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
             if not os.path.exists(metadata_path):
                 continue
             try:
-                import json
-
                 with open(metadata_path) as f:
                     metadata = json.load(f)
             except Exception:
@@ -1638,6 +1722,7 @@ async def delete_checkpoint(model_id: str, checkpoint_id: str, request: Request)
         checkpoint_name=checkpoint_name,
         user_id=user_id,
         is_admin=is_admin_request(request),
+        checkpoint_type=expected_type,
     )
 
     ckpt_path = next((p for p in candidates if os.path.isdir(p)), None)
@@ -1718,6 +1803,7 @@ async def download_checkpoint_archive(
         checkpoint_name=checkpoint_name,
         user_id=user_id,
         is_admin=is_admin_request(request),
+        checkpoint_type=expected_type,
     )
 
     # Prefer a candidate whose metadata matches the requested type.
@@ -1774,10 +1860,10 @@ async def download_checkpoint_archive(
 
     def stream_tar_gz():
         """Stream tar.gz via subprocess to avoid memory explosion."""
-        # Run tar in parent directory, archive the checkpoint_id folder
         parent_dir = os.path.dirname(ckpt_path)
+        dir_name = os.path.basename(ckpt_path)
         proc = subprocess.Popen(
-            ["tar", "czf", "-", checkpoint_name],
+            ["tar", "czf", "-", dir_name],
             cwd=parent_dir,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,

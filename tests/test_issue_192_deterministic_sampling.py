@@ -125,9 +125,27 @@ def _dummy_request(user_id: str | None = None):
     return SimpleNamespace(state=SimpleNamespace(user_data=user_data), headers={})
 
 
+def _install_detached_sampling_store(monkeypatch):
+    detached_sessions: dict[str, dict] = {}
+
+    import tinker_server.backend.sampling_session_store as sss
+
+    def _upsert_sampling_session(info: dict) -> None:
+        detached_sessions[str(info["session_id"])] = dict(info)
+
+    async def _async_get_sampling_session_info(session_id: str):
+        info = detached_sessions.get(str(session_id))
+        return None if info is None else dict(info)
+
+    monkeypatch.setattr(sss, "upsert_sampling_session", _upsert_sampling_session)
+    monkeypatch.setattr(sss, "async_get_sampling_session_info", _async_get_sampling_session_info)
+    return detached_sessions
+
+
 def test_create_sampling_session_deterministic_idempotent(monkeypatch):
     stub = _StubSessionManager()
     monkeypatch.setattr(service_route, "session_manager", stub)
+    _install_detached_sampling_store(monkeypatch)
 
     import tinker_server.supported_models_gate as gate
     import tinker_server.gateway as gw
@@ -155,6 +173,7 @@ def test_create_sampling_session_deterministic_idempotent(monkeypatch):
 def test_create_sampling_session_conflict(monkeypatch):
     stub = _StubSessionManager()
     monkeypatch.setattr(service_route, "session_manager", stub)
+    _install_detached_sampling_store(monkeypatch)
 
     import tinker_server.supported_models_gate as gate
     import tinker_server.gateway as gw
@@ -191,6 +210,7 @@ def test_create_sampling_session_keeps_generic_samplers_out_of_heartbeat_fanout(
     sampler_calls: list[tuple[str, str, str | None, str | None]] = []
     heartbeat_calls: list[tuple[str, str, str | None, str | None]] = []
     sampler_index_updates: list[dict] = []
+    detached_sampling_updates = _install_detached_sampling_store(monkeypatch)
 
     monkeypatch.setattr(service_route, "session_manager", stub)
 
@@ -219,7 +239,6 @@ def test_create_sampling_session_keeps_generic_samplers_out_of_heartbeat_fanout(
         ),
     )
     monkeypatch.setattr(sis, "upsert_sampler_index", sampler_index_updates.append)
-
     req = CreateSamplingSessionRequest(
         session_id="sess",
         sampling_session_seq_id=11,
@@ -230,6 +249,20 @@ def test_create_sampling_session_keeps_generic_samplers_out_of_heartbeat_fanout(
     assert out.sampling_session_id == "sess:sample:11"
     assert sampler_calls == [("sess", "sess:sample:11", "u", sampler_calls[0][3])]
     assert heartbeat_calls == []
+    assert detached_sampling_updates == {
+        "sess:sample:11": {
+            "session_id": "sess:sample:11",
+            "base_model": "Qwen/Qwen3-4B-Instruct-2507",
+            "lora_rank": 0,
+            "adapter_path": None,
+            "lora_loaded": False,
+            "lora_int_id": None,
+            "uses_base_model": True,
+            "last_activity": detached_sampling_updates["sess:sample:11"]["last_activity"],
+            "inflight_requests": 0,
+            "metadata_version": 1,
+        }
+    }
     assert sampler_index_updates == [
         {
             "sampler_id": "sess:sample:11",

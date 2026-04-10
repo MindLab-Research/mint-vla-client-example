@@ -21,10 +21,11 @@ from pydantic import BaseModel
 from ..auth_identity import get_user_data as _request_user_data
 from ..auth_identity import get_user_id as _request_user_id
 from ..auth_identity import is_admin_request
-from ..checkpoints import get_persistent_search_roots
+from ..checkpoints import _iter_metadata_paths, get_persistent_search_roots, get_resolution_roots
 from ..config import config as server_config
 from ..health_checks import deep_healthz_response
 from ..logging_context import get_otel_tracer
+from ..queue_priority import merge_queue_priority_extra
 from ..ray_cluster_health import get_ray_cluster_health_snapshot
 from ..ray_gcs_metrics import get_ray_gcs_metrics_snapshot
 from ..usage_store import get_usage_store
@@ -210,26 +211,36 @@ async def deep_health_check():
     return await deep_healthz_response()
 
 
+def _self_rss_bytes() -> int:
+    with open("/proc/self/statm", encoding="utf-8") as f:
+        parts = f.read().strip().split()
+    if len(parts) < 2:
+        raise ValueError(f"unexpected /proc/self/statm format: {parts!r}")
+    rss_pages = int(parts[1])
+    page_size = int(os.sysconf("SC_PAGE_SIZE"))
+    return rss_pages * page_size
+
+
+def _resource_pool_local_snapshot() -> list[dict]:
+    from ..backend.resource_pool import get_resource_pool
+
+    pool = get_resource_pool()
+    return pool.cached_snapshot()
+
+
 @router.get("/admission_stats")
-async def admission_stats() -> dict:
+async def admission_stats(*, include_actor_rss: bool = True) -> dict:
     from dataclasses import asdict
 
     from ..backend.api_work_queue import api_work_queue
     from ..backend.capacity_manager import capacity_manager
     from ..backend.future_store import future_store
-    from ..backend.resource_pool import get_resource_pool
+    from ..backend.owner_runtime_supervisor import owner_runtime_supervisor
+    from ..backend.queue_execution_runtime import queue_execution_runtime
+    from ..backend.queue_supervisor import queue_supervisor
     from ..backend.session_heartbeat_store import session_heartbeat_store
     from ..routes import sampling as sampling_route
     from ..routes import service as service_route
-
-    def _self_rss_bytes() -> int:
-        with open("/proc/self/statm", encoding="utf-8") as f:
-            parts = f.read().strip().split()
-        if len(parts) < 2:
-            raise ValueError(f"unexpected /proc/self/statm format: {parts!r}")
-        rss_pages = int(parts[1])
-        page_size = int(os.sysconf("SC_PAGE_SIZE"))
-        return rss_pages * page_size
 
     timeout_s = 10.0
 
@@ -241,39 +252,62 @@ async def admission_stats() -> dict:
 
     q = None
     try:
-        q = await api_work_queue.stats(timeout_s=timeout_s)
+        if not include_actor_rss and hasattr(api_work_queue, "metrics_snapshot"):
+            q = api_work_queue.metrics_snapshot()
+        else:
+            q = await api_work_queue.stats(timeout_s=timeout_s)
         if not isinstance(q, dict):
-            q = {"error": f"api_work_queue.stats returned non-dict: {type(q)}"}
+            q = {"error": f"api_work_queue snapshot returned non-dict: {type(q)}"}
     except Exception as e:
         q = {"error": f"{type(e).__name__}: {e}"}
 
     fs = None
     try:
-        fs = await future_store.async_ensure_ready(timeout_s=timeout_s)
+        if not include_actor_rss and hasattr(future_store, "metrics_snapshot"):
+            fs = future_store.metrics_snapshot()
+        else:
+            fs = future_store.ensure_ready(timeout_s=timeout_s)
     except Exception as e:
         fs = {"error": f"{type(e).__name__}: {e}"}
 
     actors: dict = {}
-    try:
-        actors["capacity_manager"] = {"rss_bytes": int(await capacity_manager.async_rss_bytes(timeout_s=timeout_s))}
-    except Exception as e:
-        actors["capacity_manager"] = {"error": f"{type(e).__name__}: {e}"}
+    if include_actor_rss:
+        try:
+            actors["capacity_manager"] = {"rss_bytes": int(await capacity_manager.async_rss_bytes(timeout_s=timeout_s))}
+        except Exception as e:
+            actors["capacity_manager"] = {"error": f"{type(e).__name__}: {e}"}
 
-    try:
-        actors["api_work_queue"] = {"rss_bytes": int(await api_work_queue.rss_bytes(timeout_s=timeout_s))}
-    except Exception as e:
-        actors["api_work_queue"] = {"error": f"{type(e).__name__}: {e}"}
+        try:
+            actors["api_work_queue"] = {"rss_bytes": int(await api_work_queue.rss_bytes(timeout_s=timeout_s))}
+        except Exception as e:
+            actors["api_work_queue"] = {"error": f"{type(e).__name__}: {e}"}
 
-    try:
-        actors["future_store"] = {"rss_bytes": int(await future_store.async_rss_bytes(timeout_s=timeout_s))}
-    except Exception as e:
-        actors["future_store"] = {"error": f"{type(e).__name__}: {e}"}
+        try:
+            actors["future_store"] = {"rss_bytes": int(await future_store.async_rss_bytes(timeout_s=timeout_s))}
+        except Exception as e:
+            actors["future_store"] = {"error": f"{type(e).__name__}: {e}"}
 
-    try:
-        pool = get_resource_pool()
-        actors["resource_pool"] = pool.rss_snapshot(timeout_s=timeout_s)
-    except Exception as e:
-        actors["resource_pool"] = {"error": f"{type(e).__name__}: {e}"}
+        try:
+            from ..backend.resource_pool import get_resource_pool
+
+            pool = get_resource_pool()
+            actors["resource_pool"] = pool.rss_snapshot(timeout_s=timeout_s)
+            actors["resource_pool_metadata_cache"] = pool.metadata_cache_metrics_snapshot()
+            actors["resource_pool_lifecycle"] = pool.lifecycle_metrics_snapshot()
+        except Exception as e:
+            actors["resource_pool"] = {"error": f"{type(e).__name__}: {e}"}
+    else:
+        # Metrics scrapes must stay cheap. A single hung actor in rss_snapshot()
+        # can otherwise block the API thread and stall unrelated routes.
+        try:
+            from ..backend.resource_pool import get_resource_pool
+
+            pool = get_resource_pool()
+            actors["resource_pool"] = pool.cached_snapshot()
+            actors["resource_pool_metadata_cache"] = pool.metadata_cache_metrics_snapshot()
+            actors["resource_pool_lifecycle"] = pool.lifecycle_metrics_snapshot()
+        except Exception as e:
+            actors["resource_pool"] = {"error": f"{type(e).__name__}: {e}"}
 
     proc = {"pid": int(os.getpid())}
     try:
@@ -281,9 +315,15 @@ async def admission_stats() -> dict:
     except Exception as e:
         proc["rss_error"] = f"{type(e).__name__}: {e}"
 
+    try:
+        session_heartbeat_entries = int(await session_heartbeat_store.async_size())
+    except Exception as e:
+        session_heartbeat_entries = 0
+        actors["session_heartbeat_store"] = {"error": f"{type(e).__name__}: {e}"}
+
     driver_state: dict = {
-        "sdk_sessions_fallback": int(len(service_route.sessions)),
-        "session_heartbeat_entries": int(session_heartbeat_store.size()),
+        "sdk_sessions_fallback": 0,
+        "session_heartbeat_entries": session_heartbeat_entries,
     }
     try:
         driver_state["lora_load_locks"] = int(await sampling_route._lora_load_lock_count())
@@ -316,6 +356,24 @@ async def admission_stats() -> dict:
     except Exception as e:
         ray_gcs_metrics = {"error": f"{type(e).__name__}: {e}"}
 
+    owner_runtime = None
+    try:
+        owner_runtime = await owner_runtime_supervisor.async_health_snapshot(timeout_s=timeout_s)
+    except Exception as e:
+        owner_runtime = {"error": f"{type(e).__name__}: {e}"}
+
+    queue_runtime = None
+    try:
+        queue_runtime = await queue_supervisor.async_snapshot(timeout_s=timeout_s)
+    except Exception as e:
+        queue_runtime = {"error": f"{type(e).__name__}: {e}"}
+
+    queue_execution = None
+    try:
+        queue_execution = await queue_execution_runtime.async_health_snapshot(timeout_s=timeout_s)
+    except Exception as e:
+        queue_execution = {"error": f"{type(e).__name__}: {e}"}
+
     return {
         "capacity": cap,
         "work_queue": q,
@@ -325,7 +383,31 @@ async def admission_stats() -> dict:
         "driver_state": driver_state,
         "ray_cluster": ray_cluster,
         "ray_gcs_metrics": ray_gcs_metrics,
+        "owner_runtime_supervisor": owner_runtime,
+        "queue_supervisor": queue_runtime,
+        "queue_execution_runtime": queue_execution,
     }
+
+
+@router.get("/owner_runtime_supervisor")
+async def owner_runtime_supervisor_health() -> dict:
+    from ..backend.owner_runtime_supervisor import owner_runtime_supervisor
+
+    return await owner_runtime_supervisor.async_health_snapshot(timeout_s=10.0)
+
+
+@router.get("/queue_supervisor")
+async def queue_supervisor_health() -> dict:
+    from ..backend.queue_supervisor import queue_supervisor
+
+    return await queue_supervisor.async_snapshot(timeout_s=10.0)
+
+
+@router.get("/queue_execution_runtime")
+async def queue_execution_runtime_health() -> dict:
+    from ..backend.queue_execution_runtime import queue_execution_runtime
+
+    return await queue_execution_runtime.async_health_snapshot(timeout_s=10.0)
 
 
 @router.get("/ray_cluster_health")
@@ -419,10 +501,71 @@ def _append_raw_prom_sample(
     lines.append(f"{metric_name} {_prom_format_number(num)}")
 
 
+def _scheduler_domain_base_model(scheduler_domain: object) -> str | None:
+    domain = str(scheduler_domain or "").strip()
+    if not domain or ":" not in domain:
+        return None
+    _backend, domain_key = domain.split(":", 1)
+    domain_key = domain_key.strip()
+    if not domain_key:
+        return None
+    if "::replica::" in domain_key:
+        domain_key = domain_key.split("::replica::", 1)[0].strip()
+    return domain_key or None
+
+
+def _actor_workload(actor_type: object) -> str:
+    return "sample" if str(actor_type or "").strip().lower() == "vllm" else "train"
+
+
+def _resource_pool_gpu_bindings(rec: dict[str, object]) -> list[dict[str, str]]:
+    metadata = rec.get("metadata") if isinstance(rec.get("metadata"), dict) else {}
+    actor_name = str(rec.get("actor_name") or "unknown")
+    actor_type = str(rec.get("actor_type") or "unknown")
+    workload = _actor_workload(actor_type)
+
+    bindings = metadata.get("gpu_bindings") if isinstance(metadata, dict) else None
+    if isinstance(bindings, list):
+        out: list[dict[str, str]] = []
+        for binding in bindings:
+            if not isinstance(binding, dict):
+                continue
+            gpu_index = binding.get("gpu_index")
+            if gpu_index is None:
+                continue
+            out.append(
+                {
+                    "actor_name": actor_name,
+                    "workload": workload,
+                    "hostname": str(binding.get("hostname") or metadata.get("hostname") or "unknown"),
+                    "gpu_index": str(gpu_index),
+                }
+            )
+        if out:
+            return out
+
+    gpu_indices = metadata.get("gpu_indices") if isinstance(metadata, dict) else None
+    if not isinstance(gpu_indices, list):
+        return []
+    hostname = str(metadata.get("hostname") or "unknown") if isinstance(metadata, dict) else "unknown"
+    out = []
+    for gpu_index in gpu_indices:
+        out.append(
+            {
+                "actor_name": actor_name,
+                "workload": workload,
+                "hostname": hostname,
+                "gpu_index": str(gpu_index),
+            }
+        )
+    return out
+
+
 @router.get("/metrics")
 async def metrics() -> Response:
-    stats = await admission_stats()
+    stats = await admission_stats(include_actor_rss=False)
     lines: list[str] = []
+    megatron_actor_lifecycle_counts: dict[tuple[str, str], float] = {}
 
     cap = stats.get("capacity")
     if isinstance(cap, dict):
@@ -476,6 +619,108 @@ async def metrics() -> Response:
                 _append_metric(lines, "mint_work_queue_execution_sum_s", rec.get("sum"), labels=labels)
                 _append_metric(lines, "mint_work_queue_execution_count", rec.get("count"), labels=labels)
                 _append_metric(lines, "mint_work_queue_execution_max_s", rec.get("max"), labels=labels)
+
+        _append_metric(lines, "mint_work_queue_scheduler_arbitration_total", wq.get("scheduler_arbitration_total"))
+        arbitration_by_winner = wq.get("scheduler_arbitration_by_winner")
+        if isinstance(arbitration_by_winner, dict):
+            for winner_bucket, total in arbitration_by_winner.items():
+                _append_metric(
+                    lines,
+                    "mint_work_queue_scheduler_arbitration_total",
+                    total,
+                    labels={"winner_bucket": winner_bucket},
+                )
+        arbitration_by_reason = wq.get("scheduler_arbitration_by_reason")
+        if isinstance(arbitration_by_reason, dict):
+            for decision_reason, total in arbitration_by_reason.items():
+                _append_metric(
+                    lines,
+                    "mint_work_queue_scheduler_arbitration_total",
+                    total,
+                    labels={"decision_reason": decision_reason},
+                )
+
+        scheduled_dequeue_stats = wq.get("scheduled_dequeue_stats")
+        if isinstance(scheduled_dequeue_stats, list):
+            for rec in scheduled_dequeue_stats:
+                if not isinstance(rec, dict):
+                    continue
+                scheduler_domain = rec.get("scheduler_domain")
+                labels = {
+                    "scheduler_domain": scheduler_domain,
+                    "backend": str(scheduler_domain).split(":", 1)[0] if scheduler_domain else "unknown",
+                    "reason": rec.get("reason") or "unknown",
+                    "op": rec.get("op") or "unknown",
+                    "execution_scope": "local",
+                }
+                _append_metric(lines, "mint_work_queue_scheduler_domain_dequeue_total", rec.get("total"), labels=labels)
+
+        legacy_dequeue_stats = wq.get("legacy_dequeue_stats")
+        if isinstance(legacy_dequeue_stats, list):
+            for rec in legacy_dequeue_stats:
+                if not isinstance(rec, dict):
+                    continue
+                _append_metric(
+                    lines,
+                    "mint_work_queue_legacy_dequeue_total",
+                    rec.get("total"),
+                    labels={
+                        "reason": rec.get("reason") or "unknown",
+                        "op": rec.get("op") or "unknown",
+                        "execution_scope": "local",
+                    },
+                )
+
+        scheduler_domains = wq.get("scheduler_domains")
+        if isinstance(scheduler_domains, dict):
+            sample_model_load: dict[str, dict[str, float]] = {}
+            for scheduler_domain, rec in scheduler_domains.items():
+                if not isinstance(rec, dict):
+                    continue
+                labels = {
+                    "scheduler_domain": scheduler_domain,
+                    "backend": rec.get("backend") or str(scheduler_domain).split(":", 1)[0],
+                    "execution_scope": "local",
+                }
+                _append_metric(lines, "mint_work_queue_scheduler_domain_pending_requests", rec.get("pending_requests"), labels=labels)
+                _append_metric(lines, "mint_work_queue_scheduler_domain_oldest_queued_s", rec.get("oldest_queued_s"), labels=labels)
+                _append_metric(lines, "mint_work_queue_scheduler_domain_active_sessions", rec.get("active_sessions"), labels=labels)
+                _append_metric(lines, "mint_work_queue_scheduler_domain_inflight_workers", rec.get("inflight_workers"), labels=labels)
+                _append_metric(lines, "mint_work_queue_scheduler_domain_capacity_workers", rec.get("capacity_workers"), labels=labels)
+                _append_metric(lines, "mint_work_queue_scheduler_domain_admissible", rec.get("admissible"), labels=labels)
+                _append_metric(lines, "mint_work_queue_scheduler_domain_service_gap_s", rec.get("service_gap_s"), labels=labels)
+                domain_stats = rec.get("stats")
+                if isinstance(domain_stats, dict):
+                    _append_metric(
+                        lines,
+                        "mint_work_queue_scheduler_domain_dequeue_picks_total",
+                        domain_stats.get("picks"),
+                        labels=labels,
+                    )
+                    _append_metric(lines, "mint_work_queue_scheduler_domain_starvation_picks_total", domain_stats.get("starvation_picks"), labels=labels)
+
+                backend = str(rec.get("backend") or str(scheduler_domain).split(":", 1)[0]).strip().lower()
+                if backend != "vllm":
+                    continue
+                base_model = _scheduler_domain_base_model(scheduler_domain)
+                if not base_model:
+                    continue
+                bucket = sample_model_load.setdefault(
+                    base_model,
+                    {"pending_requests": 0.0, "inflight_workers": 0.0, "capacity_workers": 0.0},
+                )
+                bucket["pending_requests"] += float(_prom_number(rec.get("pending_requests")) or 0.0)
+                bucket["inflight_workers"] += float(_prom_number(rec.get("inflight_workers")) or 0.0)
+                bucket["capacity_workers"] += float(_prom_number(rec.get("capacity_workers")) or 0.0)
+
+            for base_model, agg in sorted(sample_model_load.items()):
+                labels = {"base_model": base_model, "workload": "sample"}
+                capacity_workers = float(agg.get("capacity_workers", 0.0))
+                load_pct = 0.0 if capacity_workers <= 0 else (100.0 * float(agg.get("inflight_workers", 0.0)) / capacity_workers)
+                _append_metric(lines, "mint_model_load_pct", load_pct, labels=labels)
+                _append_metric(lines, "mint_model_pending_requests", agg.get("pending_requests"), labels=labels)
+                _append_metric(lines, "mint_model_inflight_workers", agg.get("inflight_workers"), labels=labels)
+                _append_metric(lines, "mint_model_capacity_workers", agg.get("capacity_workers"), labels=labels)
 
     fs = stats.get("future_store")
     if isinstance(fs, dict):
@@ -562,12 +807,109 @@ async def metrics() -> Response:
                 model = str(rec.get("base_model") or "unknown")
                 actor_name = str(rec.get("actor_name") or "unknown")
                 labels = {"actor_type": actor_type, "model": model, "actor_name": actor_name}
+                metadata = rec.get("metadata") if isinstance(rec.get("metadata"), dict) else {}
                 _append_metric(lines, "mint_resource_pool_actor_idle_time_s", rec.get("idle_time"), labels=labels)
                 _append_metric(lines, "mint_resource_pool_actor_age_s", rec.get("age"), labels=labels)
                 _append_metric(lines, "mint_resource_pool_actor_rss_bytes", rec.get("rss_bytes"), labels=labels)
+                _append_metric(lines, "mint_resource_pool_actor_rss_sample_age_s", rec.get("rss_sample_age_s"), labels=labels)
+                if actor_type.strip().lower() == "vllm":
+                    vllm_labels = {"actor_name": actor_name, "base_model": model}
+                    _append_metric(
+                        lines,
+                        "mint_vllm_scheduler_waiting_requests",
+                        metadata.get("scheduler_waiting_requests"),
+                        labels=vllm_labels,
+                    )
+                    _append_metric(
+                        lines,
+                        "mint_vllm_scheduler_running_requests",
+                        metadata.get("scheduler_running_requests"),
+                        labels=vllm_labels,
+                    )
+                    _append_metric(
+                        lines,
+                        "mint_vllm_scheduler_kv_cache_usage_ratio",
+                        metadata.get("scheduler_kv_cache_usage_ratio"),
+                        labels=vllm_labels,
+                    )
+                    _append_metric(
+                        lines,
+                        "mint_vllm_prefix_cache_queries_total",
+                        metadata.get("prefix_cache_queries_total"),
+                        labels=vllm_labels,
+                    )
+                    _append_metric(
+                        lines,
+                        "mint_vllm_prefix_cache_hits_total",
+                        metadata.get("prefix_cache_hits_total"),
+                        labels=vllm_labels,
+                    )
+                    _append_metric(
+                        lines,
+                        "mint_vllm_prefix_cache_hit_ratio",
+                        metadata.get("prefix_cache_hit_ratio"),
+                        labels=vllm_labels,
+                    )
+                    _append_metric(
+                        lines,
+                        "mint_vllm_preemptions_total",
+                        metadata.get("preemptions_total"),
+                        labels=vllm_labels,
+                    )
+                    for stem in (
+                        "queue_time_s",
+                        "prefill_time_s",
+                        "decode_time_s",
+                        "time_per_output_token_s",
+                    ):
+                        _append_metric(lines, f"mint_vllm_{stem}_sum", metadata.get(f"{stem}_total"), labels=vllm_labels)
+                        _append_metric(lines, f"mint_vllm_{stem}_count", metadata.get(f"{stem}_count"), labels=vllm_labels)
+                        _append_metric(lines, f"mint_vllm_{stem}_max", metadata.get(f"{stem}_max"), labels=vllm_labels)
+                elif actor_type.strip().lower() == "megatron":
+                    megatron_labels = {"actor_name": actor_name, "base_model": model}
+                    for stem in (
+                        "active_sessions",
+                        "session_unknown",
+                        "session_step",
+                        "learning_rate",
+                        "gpu_memory_allocated_bytes",
+                        "gpu_memory_reserved_bytes",
+                        "gpu_memory_fragmentation_bytes",
+                    ):
+                        _append_metric(lines, f"mint_megatron_{stem}", metadata.get(stem), labels=megatron_labels)
+                for binding in _resource_pool_gpu_bindings(rec):
+                    _append_metric(lines, "mint_resource_pool_actor_gpu_binding", 1, labels=binding)
 
-                bucket = grouped.setdefault((actor_type, model), {"count": 0.0, "rss_sum": 0.0, "max_idle": 0.0, "max_age": 0.0})
+                rss_state = str(rec.get("rss_cache_state") or "").strip().lower()
+                if rss_state not in {"fresh", "stale", "unknown"}:
+                    if _prom_number(rec.get("rss_bytes")) is not None:
+                        rss_state = "fresh"
+                    elif rec.get("rss_sample_age_s") is not None or rec.get("rss_sample_source") is not None:
+                        rss_state = "stale"
+                    else:
+                        rss_state = "unknown"
+                _append_metric(
+                    lines,
+                    "mint_resource_pool_actor_rss_cache_state",
+                    1,
+                    labels={**labels, "state": rss_state},
+                )
+
+                bucket = grouped.setdefault(
+                    (actor_type, model),
+                    {
+                        "count": 0.0,
+                        "rss_sum": 0.0,
+                        "rss_count": 0.0,
+                        "rss_fresh": 0.0,
+                        "rss_stale": 0.0,
+                        "rss_unknown": 0.0,
+                        "max_idle": 0.0,
+                        "max_age": 0.0,
+                    },
+                )
                 bucket["count"] += 1.0
+                bucket[f"rss_{rss_state}"] += 1.0
                 idle = _prom_number(rec.get("idle_time"))
                 if idle is not None and idle > bucket["max_idle"]:
                     bucket["max_idle"] = idle
@@ -577,13 +919,65 @@ async def metrics() -> Response:
                 rss = _prom_number(rec.get("rss_bytes"))
                 if rss is not None:
                     bucket["rss_sum"] += rss
+                    bucket["rss_count"] += 1.0
 
             for (actor_type, model), agg in grouped.items():
                 labels = {"actor_type": actor_type, "model": model}
                 _append_metric(lines, "mint_resource_pool_actors", agg["count"], labels=labels)
-                _append_metric(lines, "mint_resource_pool_group_rss_bytes", agg["rss_sum"], labels=labels)
                 _append_metric(lines, "mint_resource_pool_group_oldest_idle_time_s", agg["max_idle"], labels=labels)
                 _append_metric(lines, "mint_resource_pool_group_oldest_age_s", agg["max_age"], labels=labels)
+                if agg.get("rss_count", 0.0) > 0.0:
+                    _append_metric(lines, "mint_resource_pool_group_rss_bytes", agg["rss_sum"], labels=labels)
+                for state in ("fresh", "stale", "unknown"):
+                    key = f"rss_{state}"
+                    if agg.get(key, 0.0) > 0.0:
+                        _append_metric(
+                            lines,
+                            "mint_resource_pool_group_rss_cache_samples",
+                            agg[key],
+                            labels={**labels, "state": state},
+                        )
+
+        resource_pool_metadata_cache = actors.get("resource_pool_metadata_cache")
+        if isinstance(resource_pool_metadata_cache, list):
+            for row in resource_pool_metadata_cache:
+                if not isinstance(row, dict):
+                    continue
+                labels = {"actor_type": row.get("actor_type") or "unknown"}
+                _append_metric(
+                    lines,
+                    "mint_resource_pool_observability_cache_hits_total",
+                    row.get("cache_hits_total"),
+                    labels=labels,
+                )
+                _append_metric(
+                    lines,
+                    "mint_resource_pool_observability_cache_stale_total",
+                    row.get("cache_stale_total"),
+                    labels=labels,
+                )
+                _append_metric(
+                    lines,
+                    "mint_resource_pool_observability_refresh_success_total",
+                    row.get("refresh_success_total"),
+                    labels=labels,
+                )
+                _append_metric(
+                    lines,
+                    "mint_resource_pool_observability_refresh_failures_total",
+                    row.get("refresh_failures_total"),
+                    labels=labels,
+                )
+
+        resource_pool_lifecycle = actors.get("resource_pool_lifecycle")
+        if isinstance(resource_pool_lifecycle, list):
+            for row in resource_pool_lifecycle:
+                if not isinstance(row, dict):
+                    continue
+                key = (str(row.get("base_model") or "unknown"), str(row.get("event") or "unknown"))
+                megatron_actor_lifecycle_counts[key] = float(megatron_actor_lifecycle_counts.get(key, 0.0)) + float(
+                    row.get("count") or 0.0
+                )
 
     proc = stats.get("process")
     if isinstance(proc, dict):
@@ -623,6 +1017,105 @@ async def metrics() -> Response:
             lines,
             "mint_driver_sampling_sessions_inflight",
             driver_state.get("sampling_sessions_inflight"),
+        )
+
+    queue_execution = stats.get("queue_execution_runtime")
+    if isinstance(queue_execution, dict):
+        sampling_sessions = queue_execution.get("sampling_sessions")
+        if isinstance(sampling_sessions, dict):
+            _append_metric(lines, "mint_sampling_sessions_total", sampling_sessions.get("sampling_sessions_total"))
+            _append_metric(lines, "mint_sampling_sessions_inflight", sampling_sessions.get("sampling_sessions_inflight"))
+            _append_metric(lines, "mint_sampling_sessions_lora_loaded_total", sampling_sessions.get("sampling_sessions_lora_loaded"))
+            by_model = sampling_sessions.get("sampling_sessions_by_model")
+            if isinstance(by_model, list):
+                for row in by_model:
+                    if not isinstance(row, dict):
+                        continue
+                    labels = {"base_model": row.get("base_model") or "unknown"}
+                    _append_metric(lines, "mint_sampling_sessions_by_model", row.get("total"), labels=labels)
+                    _append_metric(lines, "mint_sampling_sessions_inflight_by_model", row.get("inflight"), labels=labels)
+                    _append_metric(lines, "mint_sampling_sessions_lora_loaded_by_model", row.get("lora_loaded"), labels=labels)
+
+        training_sessions = queue_execution.get("training_sessions")
+        if isinstance(training_sessions, dict):
+            _append_metric(lines, "mint_training_sessions_total", training_sessions.get("training_sessions_total"))
+            _append_metric(lines, "mint_training_sessions_active", training_sessions.get("training_sessions_active"))
+            _append_metric(lines, "mint_training_sessions_inflight", training_sessions.get("training_sessions_inflight"))
+            by_model = training_sessions.get("training_sessions_by_model")
+            if isinstance(by_model, list):
+                for row in by_model:
+                    if not isinstance(row, dict):
+                        continue
+                    labels = {
+                        "base_model": row.get("base_model") or "unknown",
+                        "backend": row.get("backend") or "unknown",
+                    }
+                    _append_metric(lines, "mint_training_sessions_by_model", row.get("total"), labels=labels)
+                    _append_metric(lines, "mint_training_sessions_active_by_model", row.get("active"), labels=labels)
+                    _append_metric(lines, "mint_training_sessions_inflight_by_model", row.get("inflight"), labels=labels)
+
+        runtime_observability = queue_execution.get("runtime_observability")
+        if isinstance(runtime_observability, dict):
+            megatron_switch_failures = runtime_observability.get("megatron_session_switch_failures")
+            if isinstance(megatron_switch_failures, list):
+                for row in megatron_switch_failures:
+                    if not isinstance(row, dict):
+                        continue
+                    labels = {
+                        "base_model": row.get("base_model") or "unknown",
+                        "reason": row.get("reason") or "unknown",
+                    }
+                    _append_metric(lines, "mint_megatron_session_switch_failures_total", row.get("count"), labels=labels)
+
+            megatron_actor_lifecycle = runtime_observability.get("megatron_actor_lifecycle")
+            if isinstance(megatron_actor_lifecycle, list):
+                for row in megatron_actor_lifecycle:
+                    if not isinstance(row, dict):
+                        continue
+                    key = (str(row.get("base_model") or "unknown"), str(row.get("event") or "unknown"))
+                    megatron_actor_lifecycle_counts[key] = float(megatron_actor_lifecycle_counts.get(key, 0.0)) + float(
+                        row.get("count") or 0.0
+                    )
+
+            vllm_workload = runtime_observability.get("vllm_workload")
+            if isinstance(vllm_workload, list):
+                for row in vllm_workload:
+                    if not isinstance(row, dict):
+                        continue
+                    labels = {
+                        "actor_name": row.get("actor_name") or "unknown",
+                        "base_model": row.get("base_model") or "unknown",
+                        "op": row.get("op") or "unknown",
+                        "status": row.get("status") or "unknown",
+                    }
+                    _append_metric(lines, "mint_vllm_workload_requests_total", row.get("requests_total"), labels=labels)
+                    _append_metric(lines, "mint_vllm_workload_prompt_tokens_total", row.get("prompt_tokens_total"), labels=labels)
+                    _append_metric(lines, "mint_vllm_workload_generated_tokens_total", row.get("generated_tokens_total"), labels=labels)
+                    _append_metric(lines, "mint_vllm_workload_ttft_s_sum", row.get("ttft_s_total"), labels=labels)
+                    _append_metric(lines, "mint_vllm_workload_ttft_s_count", row.get("ttft_s_count"), labels=labels)
+                    _append_metric(lines, "mint_vllm_workload_ttft_s_max", row.get("ttft_s_max"), labels=labels)
+                    _append_metric(lines, "mint_vllm_workload_tpot_s_sum", row.get("tpot_s_total"), labels=labels)
+                    _append_metric(lines, "mint_vllm_workload_tpot_s_count", row.get("tpot_s_count"), labels=labels)
+                    _append_metric(lines, "mint_vllm_workload_tpot_s_max", row.get("tpot_s_max"), labels=labels)
+
+            vllm_active = runtime_observability.get("vllm_active_requests")
+            if isinstance(vllm_active, list):
+                for row in vllm_active:
+                    if not isinstance(row, dict):
+                        continue
+                    labels = {
+                        "actor_name": row.get("actor_name") or "unknown",
+                        "base_model": row.get("base_model") or "unknown",
+                        "op": row.get("op") or "unknown",
+                    }
+                    _append_metric(lines, "mint_vllm_workload_active_requests", row.get("active_requests"), labels=labels)
+
+    for (base_model, event), count in sorted(megatron_actor_lifecycle_counts.items()):
+        _append_metric(
+            lines,
+            "mint_megatron_actor_lifecycle_events_total",
+            count,
+            labels={"base_model": base_model, "event": event},
         )
 
     ray_cluster = stats.get("ray_cluster")
@@ -672,6 +1165,9 @@ async def metrics() -> Response:
                 named_actors.get("namespace"),
             )
 
+        _append_metric(lines, "mint_ray_cluster_last_success_unixtime", ray_cluster.get("last_success_unixtime"))
+        _append_metric(lines, "mint_ray_cluster_last_success_age_s", ray_cluster.get("last_success_age_s"))
+
         probes = ray_cluster.get("probes")
         if isinstance(probes, dict):
             for probe_name, probe in probes.items():
@@ -704,6 +1200,16 @@ async def metrics() -> Response:
             "mint_ray_gcs_metrics_bridge_cache_age_s",
             ray_gcs_metrics.get("cache_age_s"),
         )
+        _append_metric(
+            lines,
+            "mint_ray_gcs_metrics_bridge_last_success_unixtime",
+            ray_gcs_metrics.get("last_success_unixtime"),
+        )
+        _append_metric(
+            lines,
+            "mint_ray_gcs_metrics_bridge_last_success_age_s",
+            ray_gcs_metrics.get("last_success_age_s"),
+        )
 
         derived = ray_gcs_metrics.get("derived")
         if isinstance(derived, dict):
@@ -730,7 +1236,7 @@ async def metrics() -> Response:
 
 
 @router.post("/work_queue/noop")
-async def work_queue_noop() -> dict:
+async def work_queue_noop(http_request: Request) -> dict:
     from ..backend.api_work_queue import api_work_queue
     from ..backend.capacity_manager import capacity_manager
     from ..backend.future_store import future_store
@@ -765,7 +1271,7 @@ async def work_queue_noop() -> dict:
                 request_json=request_json,
                 user_id=None,
                 webhook_url=None,
-                extra={"ts": float(time.time())},
+                extra=merge_queue_priority_extra({"ts": float(time.time())}, request=http_request),
             ),
         )
     except Exception as e:
@@ -782,6 +1288,24 @@ async def work_queue_debug_state() -> dict:
     from ..backend.api_work_queue import api_work_queue
 
     return await api_work_queue.debug_state(timeout_s=10.0)
+
+
+@router.get("/debug/scheduler_decisions")
+async def scheduler_decisions_debug(
+    limit: int = Query(default=100, ge=1, le=5000),
+    scheduler_domain: str | None = None,
+    reason: str | None = None,
+    since_seq: int | None = Query(default=None, ge=0),
+) -> dict:
+    from ..backend.api_work_queue import api_work_queue
+
+    return await api_work_queue.scheduler_decisions(
+        limit=int(limit),
+        scheduler_domain=scheduler_domain,
+        reason=reason,
+        since_seq=since_seq,
+        timeout_s=10.0,
+    )
 
 
 # =============================================================================
@@ -817,136 +1341,201 @@ def _get_dir_size(path: str) -> int:
     return total
 
 
-def _scan_checkpoints(user_id: str | None, *, is_admin: bool = False) -> list[CheckpointInfo]:
-    """Scan checkpoint directories and return those owned by user.
+def _checkpoint_rank(storage_tier: str | None) -> int:
+    if storage_tier == "persistent_tos":
+        return 2
+    if storage_tier == "persistent_cache":
+        return 1
+    return 0
 
-    Storage schema: /checkpoints/{user_id}/{checkpoint_id}/
 
-    Admin sees all checkpoints, regular users only see their own directory.
-    """
-    checkpoints = []
+def _public_checkpoint_id(metadata: dict, *, is_admin: bool) -> str | None:
+    raw_checkpoint_id = metadata.get("checkpoint_id")
+    if not isinstance(raw_checkpoint_id, str) or not raw_checkpoint_id:
+        return None
 
-    # Determine which directories to scan
+    model_id = metadata.get("model_id")
+    public_id = raw_checkpoint_id
+    if isinstance(model_id, str) and model_id:
+        public_id = f"{model_id}_{raw_checkpoint_id}"
+
     if is_admin:
-        # Admin sees all - scan all top-level directories
+        owner_id = metadata.get("owner_id")
+        owner = str(owner_id or "anonymous").strip() or "anonymous"
+        public_id = f"{owner}:{public_id}"
+
+    return public_id
+
+
+def _iter_checkpoint_entries(user_id: str | None, *, is_admin: bool = False):
+    for metadata_path in _iter_metadata_paths(
+        get_resolution_roots(primary_root=CHECKPOINTS_DIR),
+        user_id=user_id,
+        is_admin=is_admin,
+    ):
+        ckpt_path = os.path.dirname(metadata_path)
+        try:
+            with open(metadata_path) as f:
+                metadata = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+
+        owner_id = metadata.get("owner_id")
+        if not is_admin and owner_id != user_id:
+            continue
+
+        public_id = _public_checkpoint_id(metadata, is_admin=is_admin)
+        if public_id is None:
+            continue
+
+        yield metadata, ckpt_path, public_id
+
+
+def _looks_like_legacy_checkpoint_dir(path: str) -> bool:
+    try:
+        entries = os.listdir(path)
+    except OSError:
+        return False
+    for entry in entries:
+        if os.path.isfile(os.path.join(path, entry)):
+            return True
+    return False
+
+
+
+def _iter_legacy_checkpoint_entries(user_id: str | None, *, is_admin: bool = False):
+    """Yield metadata-less legacy checkpoints from the old /owner/checkpoint layout."""
+    seen: set[str] = set()
+    roots = get_persistent_search_roots(primary_root=CHECKPOINTS_DIR)
+
+    if is_admin:
         top_level_dirs: list[tuple[str, str]] = []
-        for root in get_persistent_search_roots():
+        for root in roots:
             if not os.path.isdir(root):
                 continue
             top_level_dirs.extend(
                 (root, d) for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))
             )
     else:
-        # Regular user - only scan their own directory
         top_level_dirs = []
-        for root in get_persistent_search_roots():
+        if user_id is None:
+            return
+        for root in roots:
             user_dir = os.path.join(root, user_id)
             if os.path.isdir(user_dir):
                 top_level_dirs.append((root, user_id))
 
-    for root, top_level in top_level_dirs:
-        top_path = os.path.join(root, top_level)
-
+    for root, owner_dir in top_level_dirs:
+        top_path = os.path.join(root, owner_dir)
         for sub_dir in os.listdir(top_path):
             sub_path = os.path.join(top_path, sub_dir)
             if not os.path.isdir(sub_path):
                 continue
+            if os.path.exists(os.path.join(sub_path, "metadata.json")):
+                continue
+            if not _looks_like_legacy_checkpoint_dir(sub_path):
+                continue
 
-            # Read metadata.json
-            metadata_path = os.path.join(sub_path, "metadata.json")
-            metadata = {}
-            if os.path.exists(metadata_path):
+            real = os.path.realpath(sub_path)
+            if real in seen:
+                continue
+            seen.add(real)
+
+            metadata = {
+                "checkpoint_id": f"{owner_dir}_{sub_dir}",
+                "owner_id": owner_dir,
+                "type": "training",
+            }
+            yield metadata, sub_path, metadata["checkpoint_id"]
+
+
+def _scan_checkpoints(user_id: str | None, *, is_admin: bool = False) -> list[CheckpointInfo]:
+    """Scan metadata-backed checkpoints and return the newest visible entry per checkpoint_id."""
+    checkpoints_by_id: dict[str, tuple[int, CheckpointInfo]] = {}
+
+    for metadata, ckpt_path, public_id in list(_iter_checkpoint_entries(user_id, is_admin=is_admin)) + list(
+        _iter_legacy_checkpoint_entries(user_id, is_admin=is_admin)
+    ):
+        model_name = metadata.get("model_name")
+        if not isinstance(model_name, str) or not model_name:
+            adapter_config_path = os.path.join(ckpt_path, "adapter_config.json")
+            if os.path.exists(adapter_config_path):
                 try:
-                    with open(metadata_path) as f:
-                        metadata = json.load(f)
+                    with open(adapter_config_path) as f:
+                        adapter_config = json.load(f)
+                    model_name = adapter_config.get("base_model_name_or_path") or "unknown"
                 except (json.JSONDecodeError, OSError):
-                    pass
-
-            # Get checkpoint_id from metadata or construct from path
-            checkpoint_id = metadata.get("checkpoint_id", f"{top_level}_{sub_dir}")
-
-            # Get model_name from metadata or infer from adapter_config.json
-            model_name = metadata.get("model_name")
-            if not model_name:
-                adapter_config_path = os.path.join(sub_path, "adapter_config.json")
-                if os.path.exists(adapter_config_path):
-                    try:
-                        with open(adapter_config_path) as f:
-                            adapter_config = json.load(f)
-                            model_name = adapter_config.get("base_model_name_or_path", "unknown")
-                    except (json.JSONDecodeError, OSError):
-                        model_name = "unknown"
-                else:
                     model_name = "unknown"
+            else:
+                model_name = "unknown"
 
-            # Get created_at from metadata or file mtime
-            created_at = metadata.get("created_at")
-            if not created_at:
-                try:
-                    mtime = os.path.getmtime(sub_path)
-                    created_at = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
-                except OSError:
-                    created_at = datetime.now(timezone.utc).isoformat()
+        created_at = metadata.get("created_at")
+        if not isinstance(created_at, str) or not created_at:
+            try:
+                mtime = os.path.getmtime(ckpt_path)
+                created_at = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+            except OSError:
+                created_at = datetime.now(timezone.utc).isoformat()
 
-            # Get type from metadata (default to "training")
-            ckpt_type = metadata.get("type", "training")
+        ckpt_type = metadata.get("checkpoint_type") or metadata.get("type") or "training"
+        size_bytes = _get_dir_size(ckpt_path)
+        info = CheckpointInfo(
+            checkpoint_id=public_id,
+            model_name=model_name,
+            created_at=created_at,
+            type=ckpt_type,
+            size_bytes=size_bytes,
+        )
+        rank = _checkpoint_rank(metadata.get("storage_tier"))
+        current = checkpoints_by_id.get(public_id)
+        if current is None or rank >= current[0]:
+            checkpoints_by_id[public_id] = (rank, info)
 
-            # Calculate size
-            size_bytes = _get_dir_size(sub_path)
-
-            checkpoints.append(CheckpointInfo(
-                checkpoint_id=checkpoint_id,
-                model_name=model_name,
-                created_at=created_at,
-                type=ckpt_type,
-                size_bytes=size_bytes,
-            ))
-
-    # Sort by created_at descending
+    checkpoints = [entry[1] for entry in checkpoints_by_id.values()]
     checkpoints.sort(key=lambda x: x.created_at, reverse=True)
     return checkpoints
 
 
-def _resolve_checkpoint_path(checkpoint_id: str) -> str | None:
-    """Resolve checkpoint_id to filesystem path.
-
-    Supports two schemas:
-    1. New: checkpoint_id is stored in metadata, path is /checkpoints/{user_id}/{checkpoint_id}/
-    2. Legacy: checkpoint_id format is {model_id}_{checkpoint_name}
-
-    Scans all directories to find matching checkpoint_id.
-    """
-    # Search all checkpoint directories
-    for root in get_persistent_search_roots():
-        if not os.path.isdir(root):
-            continue
-        for top_level in os.listdir(root):
-            top_path = os.path.join(root, top_level)
-            if not os.path.isdir(top_path):
+def _resolve_checkpoint_entry(
+    checkpoint_id: str,
+    *,
+    user_id: str | None,
+    is_admin: bool,
+) -> tuple[str, dict] | None:
+    def _collect(scope_user_id: str | None, scope_is_admin: bool, *, allow_raw: bool) -> list[tuple[int, str, str, dict]]:
+        matches: list[tuple[int, str, str, dict]] = []
+        for metadata, ckpt_path, public_id in _iter_checkpoint_entries(scope_user_id, is_admin=scope_is_admin):
+            raw_checkpoint_id = metadata.get("checkpoint_id")
+            user_public_id = _public_checkpoint_id(metadata, is_admin=False)
+            if public_id == checkpoint_id or user_public_id == checkpoint_id:
+                matches.append((_checkpoint_rank(metadata.get("storage_tier")), public_id, ckpt_path, metadata))
                 continue
+            if allow_raw and isinstance(raw_checkpoint_id, str) and raw_checkpoint_id == checkpoint_id:
+                matches.append((_checkpoint_rank(metadata.get("storage_tier")), public_id, ckpt_path, metadata))
+        return matches
 
-            for sub_dir in os.listdir(top_path):
-                sub_path = os.path.join(top_path, sub_dir)
-                if not os.path.isdir(sub_path):
-                    continue
+    matches = _collect(user_id, is_admin, allow_raw=not is_admin)
+    if not matches:
+        for metadata, ckpt_path, public_id in _iter_legacy_checkpoint_entries(user_id, is_admin=is_admin):
+            if public_id == checkpoint_id:
+                matches.append((0, public_id, ckpt_path, metadata))
 
-                # Check if this checkpoint matches
-                metadata_path = os.path.join(sub_path, "metadata.json")
-                if os.path.exists(metadata_path):
-                    try:
-                        with open(metadata_path) as f:
-                            metadata = json.load(f)
-                        if metadata.get("checkpoint_id") == checkpoint_id:
-                            return sub_path
-                    except (json.JSONDecodeError, OSError):
-                        pass
+    if not matches and not is_admin:
+        matches = _collect(None, True, allow_raw=False)
+        if not matches:
+            for metadata, ckpt_path, public_id in _iter_legacy_checkpoint_entries(None, is_admin=True):
+                if public_id == checkpoint_id:
+                    matches.append((0, public_id, ckpt_path, metadata))
+    if not matches:
+        return None
 
-                # Check legacy format
-                legacy_id = f"{top_level}_{sub_dir}"
-                if legacy_id == checkpoint_id:
-                    return sub_path
+    public_ids = {match[1] for match in matches}
+    if len(public_ids) > 1:
+        return None
 
-    return None
+    matches.sort(key=lambda item: item[0], reverse=True)
+    _, _, ckpt_path, metadata = matches[0]
+    return ckpt_path, metadata
 
 
 @router.get("/v1/checkpoints", response_model=CheckpointsListResponse)
@@ -975,27 +1564,19 @@ async def download_checkpoint(checkpoint_id: str, request: Request):
     if user_id is None:
         raise HTTPException(status_code=401, detail="Authentication required")
 
-    # Resolve checkpoint path
-    ckpt_path = _resolve_checkpoint_path(checkpoint_id)
-    if ckpt_path is None:
+    # Resolve checkpoint path via metadata-backed checkpoint ids.
+    resolved = _resolve_checkpoint_entry(
+        checkpoint_id,
+        user_id=user_id,
+        is_admin=is_admin_request(request),
+    )
+    if resolved is None:
         raise HTTPException(status_code=404, detail="Checkpoint not found")
 
-    # Check ownership via metadata.json (admin can access all, others only their own)
-    if not is_admin_request(request):
-        metadata_path = os.path.join(ckpt_path, "metadata.json")
-        if os.path.exists(metadata_path):
-            try:
-                with open(metadata_path) as f:
-                    metadata = json.load(f)
-                owner_id = metadata.get("owner_id")
-                if owner_id != user_id:
-                    raise HTTPException(status_code=403, detail="Access denied")
-            except (json.JSONDecodeError, OSError):
-                # No valid metadata = no owner = deny access for non-admin
-                raise HTTPException(status_code=403, detail="Access denied")
-        else:
-            # No metadata.json = legacy checkpoint = deny access for non-admin
-            raise HTTPException(status_code=403, detail="Access denied")
+    ckpt_path, metadata = resolved
+
+    if not is_admin_request(request) and metadata.get("owner_id") != user_id:
+        raise HTTPException(status_code=403, detail="Access denied")
 
     def stream_tar_gz():
         """Stream tar.gz via subprocess to avoid memory explosion."""
@@ -1014,7 +1595,8 @@ async def download_checkpoint(checkpoint_id: str, request: Request):
             proc.stdout.close()
             proc.wait()
 
-    filename = f"{checkpoint_id}.tar.gz"
+    archive_name = metadata.get("checkpoint_id") if isinstance(metadata.get("checkpoint_id"), str) else checkpoint_id
+    filename = f"{archive_name}.tar.gz"
     return StreamingResponse(
         stream_tar_gz(),
         media_type="application/gzip",

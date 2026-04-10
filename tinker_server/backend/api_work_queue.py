@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -18,6 +19,7 @@ from ..logging_context import (
     get_otel_tracer,
     init_actor_observability,
     log_with_bound_context,
+    record_scheduler_decision_otel,
     set_request_id,
     set_trace_id,
 )
@@ -110,7 +112,7 @@ class _ExecutionSerialState:
 
 
 
-def _create_ray_actor():
+def _create_ray_actor(*, require_ready: bool = True):
     import ray
 
     actor_name = _ray_api_work_queue_actor_name()
@@ -131,8 +133,13 @@ def _create_ray_actor():
             self._cv = asyncio.Condition()
             self._enqueued = 0
             self._dequeued = 0
-            self._recent_dequeues = deque(maxlen=int(os.environ.get("MINT_API_WORK_QUEUE_DEBUG_MAX", "50")))
-            self._recent_enqueues = deque(maxlen=int(os.environ.get("MINT_API_WORK_QUEUE_DEBUG_MAX", "50")))
+            debug_max = int(os.environ.get("MINT_API_WORK_QUEUE_DEBUG_MAX", "50"))
+            self._recent_dequeues = deque(maxlen=debug_max)
+            self._recent_enqueues = deque(maxlen=debug_max)
+            self._recent_scheduler_decisions = deque(
+                maxlen=int(os.environ.get("MINT_API_WORK_QUEUE_SCHED_DEBUG_MAX", str(debug_max)))
+            )
+            self._scheduler_decision_seq = 0
             self._active_job_id: str | None = None
             self._ema_exec_s_by_op: dict[str, float] = {}
             self._last_exec_s_by_op: dict[str, float] = {}
@@ -559,6 +566,94 @@ def _create_ray_actor():
                 self._sched_stats["switch_reasons"] = reasons
             reasons[reason] = int(reasons.get(reason, 0)) + 1
 
+        def _scheduler_backend(self, scheduler_domain: str | None) -> str:
+            domain = str(scheduler_domain or "").strip()
+            if not domain or ":" not in domain:
+                return "legacy"
+            return domain.split(":", 1)[0].strip() or "legacy"
+
+        def _scheduler_decision_context(
+            self,
+            *,
+            domain: str,
+            session_id: str,
+            reason: str,
+            coalesce_applied: bool,
+        ) -> dict[str, Any]:
+            state = self._sched_domains.get(domain)
+            if state is None:
+                return {
+                    "previous_session_id": None,
+                    "ready_sessions": 0,
+                    "chosen_queue_depth": 0,
+                    "switch_happened": False,
+                    "starvation_triggered": str(reason) == "starvation",
+                    "coalesce_applied": bool(coalesce_applied),
+                }
+            queues_by_session = state.get("queues_by_session", {}) or {}
+            chosen_queue_depth = len(queues_by_session.get(session_id) or [])
+            previous_session_id = state.get("current_session")
+            previous = str(previous_session_id) if isinstance(previous_session_id, str) and previous_session_id else None
+            return {
+                "previous_session_id": previous,
+                "ready_sessions": int(len(queues_by_session)),
+                "chosen_queue_depth": int(chosen_queue_depth),
+                "switch_happened": previous is not None and previous != str(session_id),
+                "starvation_triggered": str(reason) == "starvation",
+                "coalesce_applied": bool(coalesce_applied),
+            }
+
+        def _append_scheduler_decision(
+            self,
+            *,
+            ts: float,
+            item: dict[str, Any],
+            scheduler_domain: str,
+            scheduler_session_id: str,
+            dequeue_reason: str,
+            wait_s: float,
+            decision_ctx: dict[str, Any],
+        ) -> None:
+            self._scheduler_decision_seq += 1
+            self._recent_scheduler_decisions.append(
+                {
+                    "seq": int(self._scheduler_decision_seq),
+                    "ts": float(ts),
+                    "request_id": str(item.get("request_id") or ""),
+                    "op": str(item.get("op") or "unknown"),
+                    "scheduler_domain": str(scheduler_domain),
+                    "decision_reason": str(dequeue_reason),
+                    "chosen_session_id": str(scheduler_session_id),
+                    "previous_session_id": decision_ctx.get("previous_session_id"),
+                    "wait_s": float(wait_s),
+                    "ready_sessions": int(decision_ctx.get("ready_sessions") or 0),
+                    "chosen_queue_depth": int(decision_ctx.get("chosen_queue_depth") or 0),
+                    "switch_happened": bool(decision_ctx.get("switch_happened")),
+                    "starvation_triggered": bool(decision_ctx.get("starvation_triggered")),
+                    "coalesce_applied": bool(decision_ctx.get("coalesce_applied")),
+                }
+            )
+
+        def _record_scheduler_metrics(
+            self,
+            *,
+            item: dict[str, Any],
+            scheduler_domain: str | None,
+            dequeue_reason: str,
+            wait_s: float,
+            decision_ctx: dict[str, Any] | None,
+        ) -> None:
+            record_scheduler_decision_otel(
+                op=str(item.get("op") or "unknown"),
+                backend=self._scheduler_backend(scheduler_domain),
+                queue_kind="scheduled" if scheduler_domain is not None else "legacy",
+                reason=str(dequeue_reason or "fifo"),
+                queue_wait_s=max(0.0, float(wait_s)),
+                switched=bool((decision_ctx or {}).get("switch_happened")),
+                ready_sessions=(decision_ctx or {}).get("ready_sessions"),
+                chosen_queue_depth=(decision_ctx or {}).get("chosen_queue_depth"),
+            )
+
         def _pop_scheduled(self, *, domain: str, session_id: str, reason: str, now: float) -> dict[str, Any]:
             state = self._sched_domains.get(domain)
             if state is None:
@@ -749,6 +844,8 @@ def _create_ray_actor():
             )
 
             async with self._cv:
+                coalesce_applied = False
+                decision_ctx: dict[str, Any] | None = None
                 while True:
                     if self._active_job_id is not None and str(consumer_job_id) != self._active_job_id:
                         return {
@@ -812,12 +909,14 @@ def _create_ray_actor():
                                             await asyncio.wait_for(self._cv.wait(), timeout=remaining_s)
                                         except asyncio.TimeoutError:
                                             pass
+                                        coalesce_applied = True
                                         continue
 
                     item: dict[str, Any]
                     dequeue_reason = "fifo"
                     scheduler_domain = None
                     scheduler_session_id = None
+                    decision_ctx = None
 
                     if has_legacy and sched_choice is not None:
                         legacy_head = self._items[0]
@@ -837,6 +936,12 @@ def _create_ray_actor():
                         if legacy_ts <= sched_head_ts:
                             item = self._items.popleft()
                         else:
+                            decision_ctx = self._scheduler_decision_context(
+                                domain=str(sched_domain),
+                                session_id=str(sched_session_id),
+                                reason=str(sched_reason),
+                                coalesce_applied=coalesce_applied,
+                            )
                             item = self._pop_scheduled(
                                 domain=sched_domain,
                                 session_id=sched_session_id,
@@ -853,6 +958,12 @@ def _create_ray_actor():
                             await self._cv.wait()
                             continue
                         sched_domain, sched_session_id, sched_reason = sched_choice
+                        decision_ctx = self._scheduler_decision_context(
+                            domain=str(sched_domain),
+                            session_id=str(sched_session_id),
+                            reason=str(sched_reason),
+                            coalesce_applied=coalesce_applied,
+                        )
                         item = self._pop_scheduled(
                             domain=sched_domain,
                             session_id=sched_session_id,
@@ -880,6 +991,25 @@ def _create_ray_actor():
                     break
 
                 self._dequeued += 1
+                dequeue_ts = time.time()
+                wait_s = max(0.0, dequeue_ts - self._item_created_at(item, now=dequeue_ts))
+                self._record_scheduler_metrics(
+                    item=item,
+                    scheduler_domain=scheduler_domain,
+                    dequeue_reason=str(dequeue_reason),
+                    wait_s=wait_s,
+                    decision_ctx=decision_ctx,
+                )
+                if scheduler_domain is not None and scheduler_session_id is not None:
+                    self._append_scheduler_decision(
+                        ts=dequeue_ts,
+                        item=item,
+                        scheduler_domain=str(scheduler_domain),
+                        scheduler_session_id=str(scheduler_session_id),
+                        dequeue_reason=str(dequeue_reason),
+                        wait_s=wait_s,
+                        decision_ctx=decision_ctx or {},
+                    )
 
                 # Log dequeue with request_id context
                 request_id, trace_id = self._item_log_context(item)
@@ -900,7 +1030,7 @@ def _create_ray_actor():
                     ctx = ray.get_runtime_context()
                     self._recent_dequeues.append(
                         {
-                            "ts": time.time(),
+                            "ts": dequeue_ts,
                             "job_id": str(consumer_job_id),
                             "task_id": str(ctx.get_task_id()),
                             "request_id": str(item.get("request_id")),
@@ -914,6 +1044,7 @@ def _create_ray_actor():
                             "dequeue_reason": str(dequeue_reason),
                             "scheduler_domain": None if scheduler_domain is None else str(scheduler_domain),
                             "scheduler_session_id": None if scheduler_session_id is None else str(scheduler_session_id),
+                            "wait_s": float(wait_s),
                         }
                     )
                 except Exception:
@@ -972,6 +1103,7 @@ def _create_ray_actor():
             for item in self._iter_all_queued_items():
                 executor = self._item_executor(item)
                 by_executor[executor] = int(by_executor.get(executor, 0)) + 1
+            scheduler_metrics_ready = bool(self._active_job_id)
             return {
                 "depth": int(depth_legacy + depth_scheduled),
                 "depth_legacy": int(depth_legacy),
@@ -998,6 +1130,7 @@ def _create_ray_actor():
                         | set(self._max_exec_s_by_op)
                     )
                 },
+                "scheduler_metrics_ready": scheduler_metrics_ready,
                 "scheduler_enabled": bool(self._scheduler_enabled),
                 "scheduler_picks_total": int(self._sched_stats.get("picks_total", 0)),
                 "scheduler_switches_total": int(self._sched_stats.get("switches_total", 0)),
@@ -1006,13 +1139,75 @@ def _create_ray_actor():
                 "scheduler_domains_total": int(len(self._sched_domains)),
             }
 
+        def metrics_seed_snapshot(self) -> dict[str, Any]:
+            queued_items: list[dict[str, Any]] = []
+            for item in self._iter_all_queued_items():
+                queued_items.append(
+                    {
+                        "request_id": str(item.get("request_id") or ""),
+                        "executor": self._item_executor(item),
+                        "created_at": item.get("created_at"),
+                        "op": item.get("op"),
+                        "throttle_principal": item.get("throttle_principal"),
+                        "apikey_id": item.get("apikey_id"),
+                    }
+                )
+            return {
+                "stats": self.stats(),
+                "queued_items": queued_items,
+            }
+
+        def _scheduler_summary(self) -> dict[str, Any]:
+            return {
+                "enabled": bool(self._scheduler_enabled),
+                "max_consecutive": int(self._scheduler_max_consecutive),
+                "fairness": str(self._scheduler_fairness),
+                "starvation_s": float(self._scheduler_starvation_s),
+                "coalesce_ms": float(self._scheduler_coalesce_ms),
+                "stats": {
+                    "picks_total": int(self._sched_stats.get("picks_total", 0)),
+                    "switches_total": int(self._sched_stats.get("switches_total", 0)),
+                    "starvation_picks_total": int(self._sched_stats.get("starvation_picks_total", 0)),
+                    "wait_s_sum": float(self._sched_stats.get("wait_s_sum", 0.0)),
+                    "switch_reasons": dict(self._sched_stats.get("switch_reasons", {})),
+                },
+            }
+
         def debug_state(self) -> dict[str, Any]:
             return {
                 "stats": self.stats(),
                 "recent_enqueues": list(self._recent_enqueues),
                 "recent_dequeues": list(self._recent_dequeues),
+                "recent_scheduler_decisions": list(self._recent_scheduler_decisions),
                 "active_job_id": self._active_job_id,
                 "scheduler": self._scheduler_debug(),
+            }
+
+        def scheduler_decisions(
+            self,
+            *,
+            limit: int = 100,
+            scheduler_domain: str | None = None,
+            reason: str | None = None,
+            since_seq: int | None = None,
+        ) -> dict[str, Any]:
+            items = list(self._recent_scheduler_decisions)
+            if scheduler_domain is not None:
+                target_domain = str(scheduler_domain).strip()
+                items = [item for item in items if str(item.get("scheduler_domain") or "") == target_domain]
+            if reason is not None:
+                target_reason = str(reason).strip()
+                items = [item for item in items if str(item.get("decision_reason") or "") == target_reason]
+            if since_seq is not None:
+                min_seq = int(since_seq)
+                items = [item for item in items if int(item.get("seq") or 0) > min_seq]
+            max_items = max(1, int(limit))
+            items = items[-max_items:]
+            return {
+                "actor_name": _ray_api_work_queue_actor_name(),
+                "last_seq": int(self._scheduler_decision_seq),
+                "items": items,
+                "scheduler": self._scheduler_summary(),
             }
 
         def find_position(self, request_id: str) -> dict[str, Any]:
@@ -1051,15 +1246,8 @@ def _create_ray_actor():
             v = self._ema_exec_s_by_op.get(key)
             return {"ema_exec_s": None if v is None else float(v)}
 
-    # Keep the detached queue actor on the head node when possible. Losing this
-    # actor drops all queued items (in-memory queue), which can leave futures
-    # pending forever.
-    resources = None
-    try:
-        if "node:__internal_head__" in ray.cluster_resources():
-            resources = {"node:__internal_head__": 0.001}
-    except Exception:
-        resources = None
+    # Keep the detached queue actor on a stable control-plane node. By default
+    # this is the head, but MINT_DETACHED_ACTOR_NODE_IP can move it elsewhere.
 
     options: dict[str, Any] = {
         "name": actor_name,
@@ -1070,17 +1258,23 @@ def _create_ray_actor():
         "max_task_retries": -1,
     }
     actor_otel_env = otel_env_vars()
-    from ..config import PFS_PYTHONPATH, actor_runtime_env
+    from ..config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources
+    apply_detached_actor_resources(options, ray)
     options["runtime_env"] = actor_runtime_env(
         pythonpath=PFS_PYTHONPATH,
         extra=actor_otel_env,
     )
-    if resources is not None:
-        options["resources"] = resources
 
-    return _RayApiWorkQueueActor.options(  # type: ignore[attr-defined]
+    created = _RayApiWorkQueueActor.options(  # type: ignore[attr-defined]
         **options
     ).remote()
+    if not require_ready:
+        return created
+    try:
+        ray.get(created.stats.remote(), timeout=1.0)
+        return created
+    except Exception:
+        return ray.get_actor(actor_name, namespace=_ray_namespace())
 
 
 def _get_or_create_ray_actor():
@@ -1148,74 +1342,349 @@ class ApiWorkQueueClient:
         self._ray_actor = None
         self._executors: dict[str, Executor] = {}
         self._worker_tasks: list[Any] = []
+        self._queue_supervisor_task: asyncio.Task | None = None
         self._running = False
+        self._desired_num_workers = 1
         self._consumer_job_id: str | None = None
+        self._consumer_generation_id: int | None = None
+        self._execution_ready_event = asyncio.Event()
+        self._execution_ready_generation_id: int | None = None
+        self._execution_ready_at: float | None = None
         self._execution_serial_states: dict[str, _ExecutionSerialState] = {}
         self._execution_serial_states_guard = asyncio.Lock()
 
-    def _get_cached_ray_actor_for_async_request_path(self):
+        # Process-local queue snapshot for cheap /metrics reads.
+        self._snapshot_lock = threading.Lock()
+        self._snapshot_enqueued = 0
+        self._snapshot_dequeued = 0
+        self._snapshot_items_by_request_id: dict[str, dict[str, Any]] = {}
+        self._snapshot_by_executor: dict[str, int] = {}
+        self._snapshot_by_apikey_id: dict[str, int] = {}
+        self._snapshot_by_throttle_principal: dict[str, int] = {}
+        self._snapshot_hydrated = False
+        self._snapshot_hydrate_last_attempt_s = 0.0
+        self._snapshot_hydrate_min_interval_s = float(
+            os.environ.get("MINT_API_WORK_QUEUE_SNAPSHOT_HYDRATE_MIN_INTERVAL_S", "30.0")
+        )
+        from ..ray_utils import register_ray_reconnect_invalidator
+
+        register_ray_reconnect_invalidator(self._reset_ray_actor)
+
+    def _reset_ray_actor(self) -> None:
+        self._ray_actor = None
+
+    @staticmethod
+    def _trim_unready_scheduler_metrics(snapshot: dict[str, Any]) -> dict[str, Any]:
+        if bool(snapshot.get("scheduler_metrics_ready", True)):
+            return snapshot
+        out = dict(snapshot)
+        out.pop("depth_scheduled", None)
+        out.pop("scheduled_depth_by_priority", None)
+        for key in list(out):
+            if key.startswith("scheduler_") and key != "scheduler_metrics_ready":
+                out.pop(key, None)
+        return out
+
+    @staticmethod
+    def _snapshot_bump(bucket: dict[str, int], key: str | None, delta: int) -> None:
+        if key is None:
+            return
+        next_value = int(bucket.get(key, 0)) + int(delta)
+        if next_value > 0:
+            bucket[key] = next_value
+        else:
+            bucket.pop(key, None)
+
+    @staticmethod
+    def _snapshot_executor(item: dict[str, Any]) -> str:
+        executor = item.get("executor")
+        if isinstance(executor, str) and executor.strip():
+            return executor.strip()
+        op = item.get("op")
+        if isinstance(op, str) and op.strip():
+            return op.strip()
+        return "unknown"
+
+    @staticmethod
+    def _snapshot_created_at(item: dict[str, Any]) -> float:
+        now = time.time()
+        try:
+            ts = float(item.get("created_at", now))
+        except Exception:
+            return now
+        if ts <= 0:
+            return now
+        return ts
+
+    @staticmethod
+    def _snapshot_asample_identity(item: dict[str, Any]) -> tuple[str | None, str | None]:
+        if str(item.get("op")) != "sampling.asample":
+            return None, None
+        principal = item.get("throttle_principal")
+        apikey_id = item.get("apikey_id")
+        principal_str = None if principal is None else str(principal).strip()
+        apikey_str = None if apikey_id is None else str(apikey_id).strip()
+        if principal_str == "":
+            principal_str = None
+        if apikey_str == "":
+            apikey_str = None
+        return principal_str, apikey_str
+
+    def _snapshot_drop_record(self, rec: dict[str, Any]) -> None:
+        self._snapshot_bump(self._snapshot_by_executor, rec.get("executor"), -1)
+        principal = rec.get("throttle_principal")
+        apikey_id = rec.get("apikey_id")
+        if principal is not None:
+            self._snapshot_bump(self._snapshot_by_throttle_principal, principal, -1)
+            if apikey_id is not None:
+                self._snapshot_bump(self._snapshot_by_apikey_id, apikey_id, -1)
+
+    def _snapshot_on_enqueue(self, item: dict[str, Any]) -> None:
+        request_id = str(item.get("request_id") or "")
+        if not request_id:
+            return
+        executor = self._snapshot_executor(item)
+        created_at = self._snapshot_created_at(item)
+        principal, apikey_id = self._snapshot_asample_identity(item)
+        rec = {
+            "executor": executor,
+            "created_at": created_at,
+            "throttle_principal": principal,
+            "apikey_id": apikey_id,
+        }
+        with self._snapshot_lock:
+            previous = self._snapshot_items_by_request_id.pop(request_id, None)
+            if isinstance(previous, dict):
+                self._snapshot_drop_record(previous)
+            self._snapshot_items_by_request_id[request_id] = rec
+            self._snapshot_bump(self._snapshot_by_executor, executor, 1)
+            if principal is not None:
+                self._snapshot_bump(self._snapshot_by_throttle_principal, principal, 1)
+                if apikey_id is not None:
+                    self._snapshot_bump(self._snapshot_by_apikey_id, apikey_id, 1)
+            self._snapshot_enqueued += 1
+
+    def _snapshot_on_dequeue(self, item: dict[str, Any]) -> None:
+        request_id = str(item.get("request_id") or "")
+        with self._snapshot_lock:
+            if request_id:
+                rec = self._snapshot_items_by_request_id.pop(request_id, None)
+                if isinstance(rec, dict):
+                    self._snapshot_drop_record(rec)
+            self._snapshot_dequeued += 1
+
+    def _get_ray_actor(self, *, require_ready: bool = True):
         try:
             import ray
         except Exception as e:
             raise ApiWorkQueueUnavailableError("Ray import failed") from e
 
-        if not ray.is_initialized():
-            raise ApiWorkQueueUnavailableError("Ray not initialized")
-
-        if self._ray_actor is None:
-            raise ApiWorkQueueUnavailableError(
-                "Detached Ray ApiWorkQueue actor is not ready on this API server"
-            )
-        return self._ray_actor
-
-    def _get_ray_actor(self):
         try:
-            import ray
+            from ..ray_utils import init_ray
+
+            init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
         except Exception as e:
-            raise ApiWorkQueueUnavailableError("Ray import failed") from e
-
-        if not ray.is_initialized():
-            try:
-                from ..ray_utils import init_ray
-
-                init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
-            except Exception as e:
-                raise ApiWorkQueueUnavailableError("Ray not initialized (init_ray failed)") from e
-
+            raise ApiWorkQueueUnavailableError("Ray not initialized (init_ray failed)") from e
         if not ray.is_initialized():
             raise ApiWorkQueueUnavailableError("Ray not initialized")
 
-        if self._ray_actor is not None:
+        actor_name = _ray_api_work_queue_actor_name()
+        probe_timeout_s = float(os.environ.get("MINT_API_WORK_QUEUE_PROBE_TIMEOUT_S", "1.0"))
+        fail_fast_on_probe_timeout = (
+            os.environ.get("MINT_API_WORK_QUEUE_FAIL_FAST_ON_PROBE_TIMEOUT", "").strip().lower()
+            in ("1", "true", "yes", "y", "on")
+        )
+
+        actor = self._ray_actor
+        if actor is not None:
+            if not require_ready:
+                return actor
             try:
-                ray.get(self._ray_actor.stats.remote(), timeout=1.0)
+                ray.get(actor.stats.remote(), timeout=1.0)
+                return actor
             except Exception:
                 self._ray_actor = None
 
-        if self._ray_actor is None:
-            try:
-                self._ray_actor = _get_or_create_ray_actor()
-            except Exception as e:
-                raise ApiWorkQueueUnavailableError("Failed to get/create detached Ray ApiWorkQueue actor") from e
+        actor = None
+        try:
+            actor = ray.get_actor(actor_name, namespace=_ray_namespace())
+            if not require_ready:
+                self._ray_actor = actor
+                return actor
+            ray.get(actor.stats.remote(), timeout=probe_timeout_s)
+            self._ray_actor = actor
+            return actor
+        except ValueError:
+            logger.info("[api_work_queue] actor %s not found; creating", actor_name)
+        except ray.exceptions.GetTimeoutError:
+            if fail_fast_on_probe_timeout:
+                logger.warning(
+                    "[api_work_queue] actor %s alive but unresponsive (probe_timeout_s=%.2f); failing fast",
+                    actor_name,
+                    probe_timeout_s,
+                )
+                raise ApiWorkQueueUnavailableError(
+                    f"queue actor {actor_name} unresponsive (restarting?)"
+                )
+            logger.warning(
+                "[api_work_queue] actor %s probe timed out (probe_timeout_s=%.2f); reusing existing actor",
+                actor_name,
+                probe_timeout_s,
+            )
+            if actor is not None:
+                self._ray_actor = actor
+                return actor
+        except (ray.exceptions.ActorDiedError, ray.exceptions.RayActorError) as e:
+            logger.warning(
+                "[api_work_queue] actor %s dead (%s: %s); Ray auto-restart will recover",
+                actor_name,
+                type(e).__name__,
+                e,
+            )
+            raise ApiWorkQueueUnavailableError(
+                f"queue actor {actor_name} restarting ({type(e).__name__})"
+            ) from e
+        except Exception as e:
+            logger.warning(
+                "[api_work_queue] failed to fetch detached actor %s (%s: %s); creating",
+                actor_name,
+                type(e).__name__,
+                e,
+            )
+
+        try:
+            self._ray_actor = _create_ray_actor(require_ready=require_ready)
+        except Exception as e:
+            raise ApiWorkQueueUnavailableError("Failed to get/create detached Ray ApiWorkQueue actor") from e
         return self._ray_actor
 
-    async def _get_ray_actor_async(self):
+    def hydrate_metrics_snapshot(self, *, timeout_s: float = 10.0, force: bool = False) -> bool:
+        now = time.time()
+        with self._snapshot_lock:
+            if self._snapshot_hydrated and not force:
+                return True
+            if not force and (now - float(self._snapshot_hydrate_last_attempt_s)) < float(
+                self._snapshot_hydrate_min_interval_s
+            ):
+                return False
+            self._snapshot_hydrate_last_attempt_s = now
+
+        actor = self._get_ray_actor()
+        try:
+            import ray
+
+            payload = ray.get(actor.metrics_seed_snapshot.remote(), timeout=float(timeout_s))
+        except Exception as e:
+            logger.warning(
+                "[api_work_queue] metrics snapshot hydration failed: %s: %s",
+                type(e).__name__,
+                e,
+            )
+            return False
+
+        if not isinstance(payload, dict):
+            logger.warning(
+                "[api_work_queue] metrics snapshot hydration ignored non-dict payload: %s",
+                type(payload),
+            )
+            return False
+
+        stats = payload.get("stats")
+        queued_items = payload.get("queued_items")
+        if not isinstance(stats, dict) or not isinstance(queued_items, list):
+            logger.warning("[api_work_queue] metrics snapshot hydration ignored malformed payload")
+            return False
+
+        next_items: dict[str, dict[str, Any]] = {}
+        next_by_executor: dict[str, int] = {}
+        next_by_apikey_id: dict[str, int] = {}
+        next_by_principal: dict[str, int] = {}
+
+        for item in queued_items:
+            if not isinstance(item, dict):
+                continue
+            request_id = str(item.get("request_id") or "")
+            if not request_id:
+                continue
+            executor = self._snapshot_executor(item)
+            created_at = self._snapshot_created_at(item)
+            principal, apikey_id = self._snapshot_asample_identity(item)
+            rec = {
+                "executor": executor,
+                "created_at": created_at,
+                "throttle_principal": principal,
+                "apikey_id": apikey_id,
+            }
+            next_items[request_id] = rec
+            self._snapshot_bump(next_by_executor, executor, 1)
+            if principal is not None:
+                self._snapshot_bump(next_by_principal, principal, 1)
+                if apikey_id is not None:
+                    self._snapshot_bump(next_by_apikey_id, apikey_id, 1)
+
+        try:
+            enqueued = max(0, int(stats.get("enqueued", len(next_items))))
+        except Exception:
+            enqueued = int(len(next_items))
+        try:
+            dequeued = max(0, int(stats.get("dequeued", 0)))
+        except Exception:
+            dequeued = 0
+
+        with self._snapshot_lock:
+            self._snapshot_items_by_request_id = next_items
+            self._snapshot_by_executor = next_by_executor
+            self._snapshot_by_apikey_id = next_by_apikey_id
+            self._snapshot_by_throttle_principal = next_by_principal
+            self._snapshot_enqueued = int(enqueued)
+            self._snapshot_dequeued = int(dequeued)
+            self._snapshot_hydrated = True
+        return True
+
+    def metrics_snapshot(self) -> dict[str, Any]:
+        with self._snapshot_lock:
+            now = time.time()
+            ages = [
+                max(0.0, now - float(rec.get("created_at", now)))
+                for rec in self._snapshot_items_by_request_id.values()
+            ]
+            depth = int(len(self._snapshot_items_by_request_id))
+            return {
+                "depth": depth,
+                "depth_legacy": depth,
+                "enqueued": int(self._snapshot_enqueued),
+                "dequeued": int(self._snapshot_dequeued),
+                "by_executor": dict(self._snapshot_by_executor),
+                "by_apikey_id": dict(self._snapshot_by_apikey_id),
+                "by_throttle_principal": dict(self._snapshot_by_throttle_principal),
+                "age_stats": {
+                    "oldest_queued_s": max(ages) if ages else 0.0,
+                    "avg_queued_s": (sum(ages) / len(ages)) if ages else 0.0,
+                },
+                "scheduler_metrics_ready": False,
+            }
+
+    def _get_cached_ray_actor_for_async_request_path(self):
+        return self._get_ray_actor(require_ready=False)
+
+    async def _get_ray_actor_async(self, *, require_ready: bool = True):
         try:
             import ray
         except Exception as e:
             raise ApiWorkQueueUnavailableError("Ray import failed") from e
 
-        if not ray.is_initialized():
-            try:
-                from ..ray_utils import init_ray
+        try:
+            from ..ray_utils import init_ray
 
-                init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
-            except Exception as e:
-                raise ApiWorkQueueUnavailableError("Ray not initialized (init_ray failed)") from e
-
+            init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
+        except Exception as e:
+            raise ApiWorkQueueUnavailableError("Ray not initialized (init_ray failed)") from e
         if not ray.is_initialized():
             raise ApiWorkQueueUnavailableError("Ray not initialized")
 
         if self._ray_actor is not None:
+            if not require_ready:
+                return self._ray_actor
             try:
                 await self._await_ray_ref(self._ray_actor.stats.remote(), timeout_s=1.0)
                 return self._ray_actor
@@ -1232,6 +1701,9 @@ class ApiWorkQueueClient:
         actor = None
         try:
             actor = ray.get_actor(actor_name, namespace=_ray_namespace())
+            if not require_ready:
+                self._ray_actor = actor
+                return actor
             await self._await_ray_ref(actor.stats.remote(), timeout_s=probe_timeout_s)
             self._ray_actor = actor
             return actor
@@ -1274,7 +1746,7 @@ class ApiWorkQueueClient:
             )
 
         try:
-            self._ray_actor = _create_ray_actor()
+            self._ray_actor = _create_ray_actor(require_ready=require_ready)
         except Exception as e:
             raise ApiWorkQueueUnavailableError("Failed to get/create detached Ray ApiWorkQueue actor") from e
         return self._ray_actor
@@ -1303,18 +1775,21 @@ class ApiWorkQueueClient:
 
             raise ray.exceptions.GetTimeoutError(f"timed out after {float(timeout_s):.3f}s") from e
 
-    def ensure_ready(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
-        actor = self._get_ray_actor()
+    async def async_ensure_started(self) -> None:
+        await self._get_ray_actor_async(require_ready=False)
+
+    async def async_ensure_ready(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
+        actor = await self._get_ray_actor_async(require_ready=False)
         import ray
 
         try:
-            out = ray.get(actor.stats.remote(), timeout=float(timeout_s))
+            out = await self._await_ray_ref(actor.stats.remote(), timeout_s=float(timeout_s))
         except ray.exceptions.ActorDiedError as e:
             self._ray_actor = None
             raise ApiWorkQueueUnavailableError("Detached Ray ApiWorkQueue actor died") from e
         if not isinstance(out, dict):
             raise TypeError(f"ApiWorkQueue.stats returned non-dict: {type(out)}")
-        return out
+        return self._trim_unready_scheduler_metrics(out)
 
     def set_executor(self, op: str, executor: Executor) -> None:
         self._executors[str(op)] = executor
@@ -1474,6 +1949,7 @@ class ApiWorkQueueClient:
                 if isinstance(detail, dict):
                     raise ApiWorkQueueThrottleError.from_detail(detail)
                 raise RuntimeError(f"ApiWorkQueue.enqueue rejected item without detail: {result!r}")
+            self._snapshot_on_enqueue(item)
 
         if tracer is None:
             await _do_enqueue()
@@ -1518,6 +1994,7 @@ class ApiWorkQueueClient:
             raise StaleConsumerError(
                 f"stale consumer job_id={extra.get('consumer_job_id')!r} active_job_id={extra.get('active_job_id')!r}"
             )
+        self._snapshot_on_dequeue(item)
         return WorkItem(
             request_id=str(item["request_id"]),
             op=str(item["op"]),
@@ -1553,20 +2030,17 @@ class ApiWorkQueueClient:
             raise TypeError(f"ApiWorkQueue.get_eta_state returned non-dict: {type(result)}")
         return result
 
-    async def _reconcile_stale_running_requests(self, consumer_job_id: str) -> None:
-        import ray
-
+    async def _reconcile_stale_running_requests(self, consumer_job_id: str) -> int:
         from .capacity_manager import capacity_manager
         from .future_store import FutureStoreUnavailableError, future_store
 
         stale_leased_request_ids: list[str] = []
         try:
-            actor = self._get_ray_actor()
+            actor = await self._get_ray_actor_async()
             ref = actor.release_stale_scheduler_leases.remote(str(consumer_job_id))
-            stale_leased_request_ids = await asyncio.get_running_loop().run_in_executor(
-                None,
-                lambda: ray.get(ref, timeout=30),
-            )
+            stale_leased_request_ids = await self._await_ray_ref(ref, timeout_s=30.0)
+            if not isinstance(stale_leased_request_ids, list):
+                stale_leased_request_ids = []
         except Exception as e:
             logger.warning(
                 "[api_work_queue] release_stale_scheduler_leases failed consumer_job_id=%s: %s: %s",
@@ -1576,7 +2050,7 @@ class ApiWorkQueueClient:
             )
 
         try:
-            stale_request_ids = future_store.fail_stale_running_requests(
+            stale_request_ids = await future_store.async_fail_stale_running_requests(
                 str(consumer_job_id),
                 "api server restarted while request was running",
             )
@@ -1587,7 +2061,7 @@ class ApiWorkQueueClient:
                 type(e).__name__,
                 e,
             )
-            return
+            return 0
         except Exception as e:
             logger.warning(
                 "[api_work_queue] stale-running reconciliation failed consumer_job_id=%s: %s: %s",
@@ -1595,7 +2069,7 @@ class ApiWorkQueueClient:
                 type(e).__name__,
                 e,
             )
-            return
+            return 0
 
         stale_leased_request_ids = [str(request_id) for request_id in stale_leased_request_ids]
         pending_leased_request_ids = [
@@ -1605,13 +2079,13 @@ class ApiWorkQueueClient:
         ]
         for request_id in pending_leased_request_ids:
             try:
-                future_store.fail(
+                await future_store.async_fail(
                     request_id,
                     "api server restarted while request was dequeued before execution began",
                 )
             except Exception as e:
                 logger.warning(
-                    "[api_work_queue] future_store.fail failed for stale leased request_id=%s consumer_job_id=%s: %s: %s",
+                    "[api_work_queue] future_store.async_fail failed for stale leased request_id=%s consumer_job_id=%s: %s: %s",
                     str(request_id),
                     str(consumer_job_id),
                     type(e).__name__,
@@ -1620,7 +2094,7 @@ class ApiWorkQueueClient:
 
         all_stale_request_ids = [*stale_request_ids, *pending_leased_request_ids]
         if not all_stale_request_ids:
-            return
+            return 0
 
         for request_id in all_stale_request_ids:
             try:
@@ -1638,58 +2112,43 @@ class ApiWorkQueueClient:
             len(all_stale_request_ids),
             all_stale_request_ids,
         )
+        return len(all_stale_request_ids)
 
-    async def start_workers(self, *, num_workers: int) -> None:
-        import ray
+    def _clear_execution_ready(self) -> None:
+        self._execution_ready_event.clear()
+        self._execution_ready_generation_id = None
+        self._execution_ready_at = None
 
-        if self._running:
+    def _mark_execution_ready(self, generation_id: int) -> None:
+        self._execution_ready_generation_id = int(generation_id)
+        self._execution_ready_at = time.time()
+        self._execution_ready_event.set()
+
+    async def wait_until_execution_ready(self, *, timeout_s: float = 60.0) -> dict[str, Any]:
+        await asyncio.wait_for(self._execution_ready_event.wait(), timeout=float(timeout_s))
+        return {
+            "execution_ready": True,
+            "generation_id": self._execution_ready_generation_id,
+            "ready_at": self._execution_ready_at,
+        }
+
+    async def _ensure_local_workers_running(self, num_workers: int) -> None:
+        alive = [task for task in self._worker_tasks if not task.done()]
+        self._worker_tasks = alive
+        if self._worker_tasks:
             return
-        self._running = True
-
-        try:
-            job_id = str(ray.get_runtime_context().get_job_id())
-            self._consumer_job_id = job_id
-            start_timeout_s = max(
-                10.0,
-                float(os.environ.get("MINT_API_WORK_QUEUE_START_TIMEOUT_S", "60.0")),
-            )
-            last_error: Exception | None = None
-            for attempt in range(1, 4):
-                try:
-                    actor = await self._get_ray_actor_async()
-                    ref = actor.set_active_job_id.remote(job_id)
-                    await self._await_ray_ref(ref, timeout_s=start_timeout_s)
-                    last_error = None
-                    break
-                except Exception as e:
-                    last_error = e
-                    logger.warning(
-                        "[api_work_queue] set_active_job_id attempt=%s failed (%s: %s); recreating actor",
-                        attempt,
-                        type(e).__name__,
-                        e,
-                    )
-                    self._ray_actor = None
-            if last_error is not None:
-                raise last_error
-            await self._reconcile_stale_running_requests(job_id)
-        except Exception as e:
-            self._running = False
-            self._consumer_job_id = None
-            raise RuntimeError(f"Failed to set ApiWorkQueue active job id: {type(e).__name__}: {e}") from e
-
         n = int(num_workers)
         if n < 1:
             n = 1
         self._worker_tasks = [asyncio.create_task(self._worker_loop(i)) for i in range(n)]
 
-    async def shutdown(self) -> None:
-        self._running = False
+    async def _stop_local_workers(self) -> None:
         for t in self._worker_tasks:
             t.cancel()
         if self._worker_tasks:
             await asyncio.gather(*self._worker_tasks, return_exceptions=True)
         self._worker_tasks = []
+        self._clear_execution_ready()
         actor = None
         consumer_job_id = self._consumer_job_id
         if consumer_job_id is not None:
@@ -1703,12 +2162,143 @@ class ApiWorkQueueClient:
                 await self._await_ray_ref(ref, timeout_s=5.0)
             except Exception:
                 pass
+
+    async def _queue_supervisor_loop(self) -> None:
+        from .queue_supervisor import queue_supervisor
+
+        start_timeout_s = max(
+            10.0,
+            float(os.environ.get("MINT_API_WORK_QUEUE_START_TIMEOUT_S", "60.0")),
+        )
+
+        self._clear_execution_ready()
+        while self._running:
+            try:
+                snapshot = await queue_supervisor.async_claim_generation(timeout_s=start_timeout_s)
+                generation_id = int(snapshot.get("generation_id") or 0)
+                owner_id = snapshot.get("owner_id")
+                generation_state = str(snapshot.get("state") or "")
+                owns_generation = bool(owner_id) and str(owner_id) == queue_supervisor.owner_id() and generation_id > 0
+                if owns_generation:
+                    consumer_job_id = f"{queue_supervisor.owner_id()}:{generation_id}"
+                    generation_changed = (
+                        self._consumer_generation_id != generation_id
+                        or self._consumer_job_id != consumer_job_id
+                    )
+                    needs_reconcile = generation_changed or generation_state != "active"
+                    actor = await self._get_ray_actor_async()
+                    if generation_changed:
+                        self._clear_execution_ready()
+                        ref = actor.set_active_job_id.remote(consumer_job_id)
+                        await self._await_ray_ref(ref, timeout_s=start_timeout_s)
+                        self._consumer_job_id = consumer_job_id
+                        self._consumer_generation_id = generation_id
+                    if needs_reconcile:
+                        await queue_supervisor.async_begin_reconcile(generation_id=generation_id)
+                        stale_reconciled = await self._reconcile_stale_running_requests(consumer_job_id)
+                        await queue_supervisor.async_finish_reconcile(
+                            generation_id=generation_id,
+                            stale_reconciled=stale_reconciled,
+                        )
+                    await self._ensure_local_workers_running(self._desired_num_workers)
+                    ok = await queue_supervisor.async_heartbeat(generation_id=generation_id)
+                    if ok:
+                        self._mark_execution_ready(generation_id)
+                    else:
+                        await self._stop_local_workers()
+                        self._consumer_job_id = None
+                        self._consumer_generation_id = None
+                else:
+                    self._clear_execution_ready()
+                    if self._worker_tasks:
+                        await self._stop_local_workers()
+                    self._consumer_job_id = None
+                    self._consumer_generation_id = None
+            except Exception as e:
+                self._clear_execution_ready()
+                logger.error(
+                    "[api_work_queue] queue supervisor loop failed: %s: %s",
+                    type(e).__name__,
+                    e,
+                )
+            await asyncio.sleep(queue_supervisor.poll_s())
+
+    async def start_workers(self, *, num_workers: int) -> None:
+        self._desired_num_workers = max(1, int(num_workers))
+        if self._running:
+            alive = [task for task in self._worker_tasks if not task.done()]
+            self._worker_tasks = alive
+            if not self._worker_tasks or self._queue_supervisor_task is None or self._queue_supervisor_task.done():
+                self._clear_execution_ready()
+                if self._queue_supervisor_task is None or self._queue_supervisor_task.done():
+                    self._queue_supervisor_task = asyncio.create_task(self._queue_supervisor_loop())
+            return
+
+        hydrate_retries = max(
+            1,
+            int(os.environ.get("MINT_API_WORK_QUEUE_METRICS_HYDRATE_STARTUP_RETRIES", "3")),
+        )
+        hydrate_retry_delay_s = max(
+            0.0,
+            float(os.environ.get("MINT_API_WORK_QUEUE_METRICS_HYDRATE_RETRY_DELAY_S", "0.2")),
+        )
+        hydrate_timeout_s = max(
+            10.0,
+            float(os.environ.get("MINT_API_WORK_QUEUE_START_TIMEOUT_S", "60.0")),
+        )
+        hydrated = False
+        hydrate_error: Exception | None = None
+        for attempt in range(1, hydrate_retries + 1):
+            try:
+                hydrated = bool(self.hydrate_metrics_snapshot(timeout_s=hydrate_timeout_s, force=True))
+                hydrate_error = None
+            except Exception as e:
+                hydrated = False
+                hydrate_error = e
+                logger.warning(
+                    "[api_work_queue] metrics snapshot hydration startup attempt=%s failed: %s: %s",
+                    attempt,
+                    type(e).__name__,
+                    e,
+                )
+            if hydrated:
+                break
+            if attempt < hydrate_retries and hydrate_retry_delay_s > 0.0:
+                await asyncio.sleep(hydrate_retry_delay_s)
+
+        if not hydrated:
+            if hydrate_error is not None:
+                logger.warning(
+                    "[api_work_queue] metrics snapshot hydration unavailable at startup; continuing without scheduler metrics: %s: %s",
+                    type(hydrate_error).__name__,
+                    hydrate_error,
+                )
+            else:
+                logger.warning(
+                    "[api_work_queue] metrics snapshot hydration unavailable at startup; continuing without scheduler metrics"
+                )
+
+        self._clear_execution_ready()
+        self._running = True
+        self._queue_supervisor_task = asyncio.create_task(self._queue_supervisor_loop())
+
+    async def shutdown(self) -> None:
+        self._running = False
+        if self._queue_supervisor_task is not None:
+            self._queue_supervisor_task.cancel()
+            await asyncio.gather(self._queue_supervisor_task, return_exceptions=True)
+            self._queue_supervisor_task = None
+        await self._stop_local_workers()
+        self._clear_execution_ready()
         self._consumer_job_id = None
+        self._consumer_generation_id = None
 
     async def _worker_loop(self, worker_idx: int) -> None:
 
         from .capacity_manager import capacity_manager
         from .future_store import FutureStatus, future_store
+        from .queue_execution_context import queue_execution_context
+        from .queue_supervisor import queue_supervisor
 
         async def _finalize_request_slot(request_id: str) -> None:
             try:
@@ -1768,6 +2358,40 @@ class ApiWorkQueueClient:
                 trace_id = extract_trace_id_from_traceparent(item_traceparent)
             set_trace_id(trace_id)
             set_request_id(item.request_id)
+
+            current_generation_id = self._consumer_generation_id
+            is_current = False
+            if current_generation_id is not None:
+                try:
+                    is_current = await queue_supervisor.async_is_generation_current(
+                        generation_id=int(current_generation_id)
+                    )
+                except Exception:
+                    is_current = False
+            if current_generation_id is None or not is_current:
+                try:
+                    await future_store.async_fail(
+                        item.request_id,
+                        "queue generation fenced before execution",
+                    )
+                except Exception:
+                    pass
+                try:
+                    await capacity_manager.async_release_all(item.request_id)
+                except Exception:
+                    pass
+                try:
+                    await queue_supervisor.async_record_fenced_worker(generation_id=int(current_generation_id or -1))
+                except Exception:
+                    pass
+                await _finalize_request_slot(item.request_id)
+                logger.warning(
+                    "[api_work_queue] fenced stale generation before execution request_id=%s worker_idx=%s generation_id=%s",
+                    str(item.request_id),
+                    int(worker_idx),
+                    current_generation_id,
+                )
+                break
 
             if str(item.op) == "training.create_model":
                 try:
@@ -1881,6 +2505,7 @@ class ApiWorkQueueClient:
                         meta={
                             "worker_idx": int(worker_idx),
                             "consumer_job_id": str(self._consumer_job_id),
+                            "generation_id": None if self._consumer_generation_id is None else int(self._consumer_generation_id),
                             "op": item.op,
                             "queue_state": "running",
                             "stage": "prefill",
@@ -1980,40 +2605,44 @@ class ApiWorkQueueClient:
                         int(worker_idx),
                     )
                     tracer = get_otel_tracer()
-                    if tracer is None:
-                        await ex(item)
-                    else:
-                        try:
-                            from opentelemetry.propagate import extract
-                            from opentelemetry.trace import SpanKind, Status, StatusCode
-                        except Exception:
-                            # Best-effort: never block execution if OTel deps are unavailable.
+                    with queue_execution_context(
+                        consumer_id=self._consumer_job_id,
+                        generation_id=self._consumer_generation_id,
+                    ):
+                        if tracer is None:
                             await ex(item)
                         else:
-                            span_context = None
-                            traceparent = None
-                            if isinstance(item.extra, dict):
-                                traceparent = item.extra.get("_traceparent")
-                            if isinstance(traceparent, str) and traceparent:
-                                try:
-                                    span_context = extract({"traceparent": traceparent})
-                                except Exception:
-                                    span_context = None
-                            with tracer.start_as_current_span(
-                                "queue.execute",
-                                kind=SpanKind.INTERNAL,
-                                context=span_context,
-                            ) as span:
-                                span.set_attribute("component", "api_work_queue")
-                                span.set_attribute("op", str(item.op))
-                                span.set_attribute("request_id", str(item.request_id))
-                                span.set_attribute("worker_idx", int(worker_idx))
-                                try:
-                                    await ex(item)
-                                except Exception as e:
-                                    span.record_exception(e)
-                                    span.set_status(Status(StatusCode.ERROR, str(e)))
-                                    raise
+                            try:
+                                from opentelemetry.propagate import extract
+                                from opentelemetry.trace import SpanKind, Status, StatusCode
+                            except Exception:
+                                # Best-effort: never block execution if OTel deps are unavailable.
+                                await ex(item)
+                            else:
+                                span_context = None
+                                traceparent = None
+                                if isinstance(item.extra, dict):
+                                    traceparent = item.extra.get("_traceparent")
+                                if isinstance(traceparent, str) and traceparent:
+                                    try:
+                                        span_context = extract({"traceparent": traceparent})
+                                    except Exception:
+                                        span_context = None
+                                with tracer.start_as_current_span(
+                                    "queue.execute",
+                                    kind=SpanKind.INTERNAL,
+                                    context=span_context,
+                                ) as span:
+                                    span.set_attribute("component", "api_work_queue")
+                                    span.set_attribute("op", str(item.op))
+                                    span.set_attribute("request_id", str(item.request_id))
+                                    span.set_attribute("worker_idx", int(worker_idx))
+                                    try:
+                                        await ex(item)
+                                    except Exception as e:
+                                        span.record_exception(e)
+                                        span.set_status(Status(StatusCode.ERROR, str(e)))
+                                        raise
                     logger.debug(
                         "[api_work_queue] executor completed request_id=%s op=%s worker_idx=%s",
                         str(item.request_id),
@@ -2078,9 +2707,17 @@ class ApiWorkQueueClient:
                     await _finalize_request_slot(item.request_id)
 
     async def stats(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
-        actor = self._get_cached_ray_actor_for_async_request_path()
+        try:
+            actor = self._get_cached_ray_actor_for_async_request_path()
+        except ApiWorkQueueUnavailableError:
+            if not self._snapshot_hydrated:
+                self.hydrate_metrics_snapshot(timeout_s=float(timeout_s), force=True)
+            return self.metrics_snapshot()
         ref = actor.stats.remote()
-        return await self._await_ray_ref(ref, timeout_s=float(timeout_s))
+        out = await self._await_ray_ref(ref, timeout_s=float(timeout_s))
+        if not isinstance(out, dict):
+            raise TypeError(f"ApiWorkQueue.stats returned non-dict: {type(out)}")
+        return self._trim_unready_scheduler_metrics(out)
 
     async def rss_bytes(self, *, timeout_s: float = 10.0) -> int:
         actor = self._get_cached_ray_actor_for_async_request_path()
@@ -2099,6 +2736,27 @@ class ApiWorkQueueClient:
         v = await self._await_ray_ref(ref, timeout_s=float(timeout_s))
         if not isinstance(v, dict):
             raise TypeError(f"ApiWorkQueue.debug_state returned non-dict: {type(v)}")
+        return v
+
+    async def scheduler_decisions(
+        self,
+        *,
+        limit: int = 100,
+        scheduler_domain: str | None = None,
+        reason: str | None = None,
+        since_seq: int | None = None,
+        timeout_s: float = 10.0,
+    ) -> dict[str, Any]:
+        actor = await self._get_ray_actor_async()
+        ref = actor.scheduler_decisions.remote(
+            limit=int(limit),
+            scheduler_domain=None if scheduler_domain is None else str(scheduler_domain),
+            reason=None if reason is None else str(reason),
+            since_seq=None if since_seq is None else int(since_seq),
+        )
+        v = await self._await_ray_ref(ref, timeout_s=float(timeout_s))
+        if not isinstance(v, dict):
+            raise TypeError(f"ApiWorkQueue.scheduler_decisions returned non-dict: {type(v)}")
         return v
 
 

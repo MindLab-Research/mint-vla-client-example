@@ -18,10 +18,15 @@ from .auth_identity import get_request_observability_context
 from .backend.api_work_queue import ApiWorkQueueUnavailableError
 from .backend.capacity_manager import CapacityManagerUnavailableError
 from .backend.future_store import FutureStoreUnavailableError
-from .backend.session_manager import DEFAULT_INACTIVITY_TIMEOUT, SessionManager
+from .backend.session_manager import SessionManager
 from .config import config
 from .gateway import close_http_clients
-from .health_state import clear_startup_degraded_state, set_startup_degraded_state
+from .health_state import (
+    clear_runtime_degraded_state,
+    clear_startup_degraded_state,
+    set_runtime_degraded_state,
+    set_startup_degraded_state,
+)
 from .gateway_auth import extract_gateway_auth_context, has_gateway_auth_headers
 from .logging_context import (
     classify_failure_reason,
@@ -31,11 +36,11 @@ from .logging_context import (
     get_trace_id,
     get_otel_tracer,
     record_http_server_metrics,
-    run_async_with_otel_span,
     set_trace_id,
 )
-from .ray_utils import init_ray
+from .ray_utils import init_ray, ray_address_source_configured, ray_connection_epoch, ray_reconnect_poll_s
 from .routes import futures, internal, mint, openai_compat, sampling, service, training, weights
+from .server_info import _git_sha
 from .token_encryptor import TokenEncryptor
 
 if TYPE_CHECKING:
@@ -47,6 +52,7 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+_STARTUP_LEASE_ROLE = os.environ.get("MINT_STARTUP_LEASE_ROLE", "mint_api_startup_owner")
 
 
 def _http_route_label(request: Request) -> str:
@@ -57,295 +63,100 @@ def _http_route_label(request: Request) -> str:
     return request.url.path
 
 
-async def _cleanup_stale_actors() -> None:
-    """Clean up stale Ray actors and register alive ones with ResourcePool.
-
-    Detached actors survive server restarts and can block resources.
-    This function:
-    1. Kills dead/unresponsive actors in the configured Ray namespace
-    2. Registers alive actors with ResourcePool for proper GPU tracking
-    """
-    # Skip cleanup if disabled (useful for debugging)
-    if config.skip_actor_cleanup:
-        logger.info("Skipping actor cleanup (MINT_SKIP_ACTOR_CLEANUP=1)")
-        return
-
+def _should_preload_openai_tokenizers() -> bool:
+    raw = os.environ.get("MINT_OAI_PRELOAD_TOKENIZERS", "auto").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    if raw in {"1", "true", "yes", "on"}:
+        return True
     try:
-        import ray
-        from .backend import ray_kill
-        from .backend.multi_lora_engine import PERSISTENT_NAMESPACE
-        from .backend.resource_pool import get_resource_pool, ActorType
+        workers = max(1, int(os.environ.get("MINT_UVICORN_WORKERS", "1")))
+    except Exception:
+        workers = 1
+    return workers <= 1
 
-        if not ray.is_initialized():
-            init_ray(
-                namespace=PERSISTENT_NAMESPACE,
-                ignore_reinit_error=True,
-            )
 
-        def _normalize_model_part(s: str) -> str:
-            return s.lower().replace("-", "_").replace(".", "_")
+async def _cleanup_stale_actors() -> None:
+    try:
+        from .backend.actor_reconciliation import cleanup_stale_actors_once
 
-        def _lookup_model_config(model_part: str):
-            try:
-                from tinker_server.backend.model_registry import MODEL_CONFIGS
-            except Exception:
-                return "", None
-
-            needle = _normalize_model_part(model_part)
-            for model_name, cfg in MODEL_CONFIGS.items():
-                if _normalize_model_part(model_name.split("/")[-1]) == needle:
-                    return model_name, cfg
-            return "", None
-
-        # Get all named actors in the configured namespace
-        actors = ray.util.list_named_actors(all_namespaces=True)
-        tinker_actors = [a for a in actors if a.get("namespace") == PERSISTENT_NAMESPACE]
-
-        if not tinker_actors:
-            logger.info(f"No actors found in namespace {PERSISTENT_NAMESPACE}")
-            return
-
-        logger.info(f"Found {len(tinker_actors)} actors in namespace {PERSISTENT_NAMESPACE}, checking status...")
-
-        resource_pool = get_resource_pool()
-        cleaned = 0
-        registered = 0
-
-        for actor_info in tinker_actors:
-            name = actor_info["name"]
-            try:
-                actor = ray.get_actor(name, namespace=PERSISTENT_NAMESPACE)
-
-                # Hard break: legacy dense trainer actor names are no longer supported.
-                # Kill them proactively to avoid consuming GPUs indefinitely.
-                if name.startswith("dense_trainer_pool_"):
-                    try:
-                        ray_kill.kill(
-                            actor,
-                            reason="legacy_dense_trainer_prefix",
-                            actor_name=name,
-                            namespace=PERSISTENT_NAMESPACE,
-                            no_restart=True,
-                        )
-                        cleaned += 1
-                    except Exception as kill_err:
-                        logger.warning(f"Failed to kill legacy dense trainer actor {name}: {kill_err}")
-                    try:
-                        resource_pool.unregister(name)
-                    except Exception:
-                        pass
-                    continue
-
-                # Check if actor is alive.
-                # WARNING: __ray_ready__ is a normal actor task and can time out if the actor is busy.
-                # Do not treat GetTimeoutError as death; killing busy detached actors breaks in-flight work.
-                try:
-                    ray.get(actor.__ray_ready__.remote(), timeout=2)
-
-                    # Actor is alive - register it with ResourcePool
-                    # Determine actor type and GPU count from name/diagnostics
-                    def _pg_total_gpus(actor_name: str) -> int | None:
-                        try:
-                            pg = ray.util.get_placement_group(f"{actor_name}_pg")
-                            info = ray.util.placement_group_table(pg)
-                        except Exception:
-                            return None
-                        bundles = info.get("bundles") or {}
-                        total = sum(
-                            int(b.get("GPU", 0) or 0)
-                            for b in bundles.values()
-                            if isinstance(b, dict)
-                        )
-                        return total or None
-
-                    if name.startswith("tinker_vllm_") or name.startswith("multinode_vllm_"):
-                        actor_type = ActorType.VLLM
-                        base_model = ""
-                        num_gpus: int | None = None
-                        if name.startswith("tinker_vllm_"):
-                            model_part = name[len("tinker_vllm_"):]
-                        else:
-                            model_part = name[len("multinode_vllm_"):]
-                        model_name, cfg = _lookup_model_config(model_part)
-                        if cfg is not None:
-                            base_model = model_name
-                            num_gpus = cfg.total_gpus
-                        num_gpus = _pg_total_gpus(name) or num_gpus
-                        if num_gpus is None:
-                            logger.warning(
-                                f"Skipping restored vLLM actor with unknown GPU count: actor={name}"
-                            )
-                            continue
-                    elif name.startswith("peft_trainer_"):
-                        actor_type = ActorType.DENSE
-                        num_gpus = 1
-                        base_model = ""
-                    elif name.startswith("megatron_"):
-                        # MegatronWorkerGroup actors: megatron_{model_name}
-                        actor_type = ActorType.MEGATRON
-                        base_model = ""
-                        num_gpus: int | None = None
-                        model_part = name[len("megatron_"):]
-                        model_name, cfg = _lookup_model_config(model_part)
-                        if cfg is not None:
-                            base_model = model_name
-                            num_gpus = cfg.train_gpus
-
-                        # Prefer real world_size when actor is responsive.
-                        try:
-                            diag = ray.get(actor.get_diagnostics.remote(), timeout=10)
-                            num_gpus = int(diag.get("world_size", num_gpus))
-                            base_model = diag.get("base_model", "") or base_model
-                        except Exception:
-                            pass
-                        num_gpus = _pg_total_gpus(name) or num_gpus
-                        if num_gpus is None:
-                            logger.warning(
-                                f"Skipping restored Megatron actor with unknown GPU count: actor={name}"
-                            )
-                            continue
-                    else:
-                        logger.debug(f"Unknown actor type for {name}, skipping registration")
-                        continue
-
-                    from tinker_server.backend.model_registry import is_persistent_model
-
-                    resource_pool.register(
-                        actor_name=name,
-                        actor_type=actor_type,
-                        num_gpus=num_gpus,
-                        actor_handle=actor,
-                        namespace=PERSISTENT_NAMESPACE,
-                        base_model=base_model,
-                        protected=bool(base_model and is_persistent_model(base_model)),
-                    )
-                    # Mark as ready since the actor passed health check
-                    resource_pool.mark_ready(name)
-                    registered += 1
-                    logger.info(f"Registered existing actor: {name} ({actor_type.value}, {num_gpus} GPUs)")
-
-                except ray.exceptions.RayActorError:
-                    # Actor is dead
-                    logger.info(f"Cleaning up dead actor: {name}")
-                    try:
-                        ray_kill.kill(
-                            actor,
-                            reason="startup_cleanup_dead_actor",
-                            actor_name=name,
-                            namespace=PERSISTENT_NAMESPACE,
-                            no_restart=True,
-                        )
-                        cleaned += 1
-                    except Exception as kill_err:
-                        logger.warning(f"Failed to kill actor {name}: {kill_err}")
-                except ray.exceptions.GetTimeoutError:
-                    # Actor might be busy; do not treat a timeout as readiness.
-                    # Register it as "creating" so operators can see reconciliation uncertainty.
-                    logger.warning(
-                        f"Actor {name} __ray_ready__ timed out; registering without marking ready"
-                    )
-                    try:
-                        def _pg_total_gpus(actor_name: str) -> int | None:
-                            try:
-                                pg = ray.util.get_placement_group(f"{actor_name}_pg")
-                                info = ray.util.placement_group_table(pg)
-                            except Exception:
-                                return None
-                            bundles = info.get("bundles") or {}
-                            total = sum(
-                                int(b.get("GPU", 0) or 0)
-                                for b in bundles.values()
-                                if isinstance(b, dict)
-                            )
-                            return total or None
-
-                        if name.startswith("tinker_vllm_") or name.startswith("multinode_vllm_"):
-                            actor_type = ActorType.VLLM
-                            num_gpus: int | None = None
-                            base_model = ""
-                            if name.startswith("tinker_vllm_"):
-                                model_part = name[len("tinker_vllm_"):]
-                            else:
-                                model_part = name[len("multinode_vllm_"):]
-                            model_name, cfg = _lookup_model_config(model_part)
-                            if cfg is not None:
-                                base_model = model_name
-                                num_gpus = cfg.total_gpus
-                            num_gpus = _pg_total_gpus(name) or num_gpus
-                            if num_gpus is None:
-                                logger.warning(
-                                    f"Skipping busy restored vLLM actor with unknown GPU count: actor={name}"
-                                )
-                                continue
-                        elif name.startswith("peft_trainer_"):
-                            actor_type = ActorType.DENSE
-                            num_gpus = 1
-                            base_model = ""
-                        elif name.startswith("megatron_"):
-                            actor_type = ActorType.MEGATRON
-                            base_model = ""
-                            num_gpus: int | None = None
-                            model_part = name[len("megatron_"):]
-                            model_name, cfg = _lookup_model_config(model_part)
-                            if cfg is not None:
-                                base_model = model_name
-                                num_gpus = cfg.train_gpus
-                            num_gpus = _pg_total_gpus(name) or num_gpus
-                            if num_gpus is None:
-                                logger.warning(
-                                    f"Skipping busy restored Megatron actor with unknown GPU count: actor={name}"
-                                )
-                                continue
-                        else:
-                            logger.debug(f"Unknown actor type for {name}, skipping registration")
-                            continue
-
-                        from tinker_server.backend.model_registry import is_persistent_model
-
-                        resource_pool.register(
-                            actor_name=name,
-                            actor_type=actor_type,
-                            num_gpus=num_gpus,
-                            actor_handle=actor,
-                            namespace=PERSISTENT_NAMESPACE,
-                            base_model=base_model,
-                            protected=bool(base_model and is_persistent_model(base_model)),
-                            metadata={"startup_reconcile": "__ray_ready__timeout"},
-                        )
-                        registered += 1
-                        logger.info(
-                            f"Registered busy actor (not ready): {name} ({actor_type.value}, {num_gpus} GPUs)"
-                        )
-                    except Exception as reg_err:
-                        logger.warning(f"Failed to register busy actor {name}: {reg_err}")
-
-            except ValueError:
-                # Actor name registered but no actor exists
-                logger.debug(f"Actor {name} not found (name registered but no actor)")
-                try:
-                    resource_pool.unregister(name)
-                except Exception:
-                    pass
-                try:
-                    pg_name = f"{name}_pg"
-                    pg = ray.util.get_placement_group(pg_name)
-                    ray.util.remove_placement_group(pg)
-                    logger.warning(f"Removed orphan placement_group={pg_name}")
-                except Exception:
-                    pass
-
-        logger.info(f"Actor cleanup complete: {cleaned} cleaned, {registered} registered")
-
+        await cleanup_stale_actors_once()
     except Exception as e:
-        # Surface reconciliation failures via degraded health rather than silently continuing.
         set_startup_degraded_state(
             reason="startup_actor_cleanup_failed",
             error=f"{type(e).__name__}: {e}",
         )
         logger.error(f"Actor cleanup failed; healthz will be degraded: {type(e).__name__}: {e}")
 
+
+async def _cancel_task(task: asyncio.Task | None) -> None:
+    if task is None:
+        return
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def _shutdown_local_inference_runtime(inference_manager: SessionManager) -> None:
+    await _cancel_task(getattr(inference_manager, "_cleanup_task", None))
+    if hasattr(inference_manager, "_cleanup_task"):
+        inference_manager._cleanup_task = None
+
+    sessions = dict(getattr(inference_manager, "_sessions", {}))
+    getattr(inference_manager, "_sessions", {}).clear()
+    for session_id, info in sessions.items():
+        engine = getattr(info, "engine", None)
+        if engine is None or bool(getattr(info, "is_shared", False)):
+            continue
+        try:
+            await engine.shutdown()
+            logger.info("Locally shutdown inference engine for session %s", session_id)
+        except Exception as e:
+            logger.warning("Local inference runtime shutdown failed session=%s: %s", session_id, e)
+
+    shared_engine = getattr(inference_manager, "_shared_engine", None)
+    if shared_engine is not None:
+        try:
+            await shared_engine.shutdown()
+            logger.info("Locally shutdown shared inference engine")
+        except Exception as e:
+            logger.warning("Local shared inference engine shutdown failed: %s", e)
+        inference_manager._shared_engine = None
+
+
+async def _shutdown_local_training_runtime(train_manager) -> None:
+    await _cancel_task(getattr(train_manager, "_cleanup_task", None))
+    if hasattr(train_manager, "_cleanup_task"):
+        train_manager._cleanup_task = None
+
+    sessions = dict(getattr(train_manager, "_sessions", {}))
+    getattr(train_manager, "_sessions", {}).clear()
+    for model_id, session in sessions.items():
+        inference_engine = getattr(session, "inference_engine", None)
+        if inference_engine is None:
+            continue
+        try:
+            await inference_engine.shutdown()
+            logger.info("Locally shutdown training-side inference engine for model %s", model_id)
+        except Exception as e:
+            logger.warning("Local training runtime shutdown failed model=%s: %s", model_id, e)
+
+
+def _clear_local_execution_route_globals() -> None:
+    from .routes import mint, sampling, service, training, weights
+
+    service.session_manager = None
+    sampling.session_manager = None
+    training.training_manager = None
+    training.training_engine = None
+    training.inference_manager = None
+    mint.training_manager = None
+    mint.training_engine = None
+    weights.training_manager = None
+    weights.training_engine = None
+    weights.inference_manager = None
+
 async def _prewarm_persistent_models(
-    train_engine: VerlTrainingEngine,
+    train_engine: VerlTrainingEngine | None,
     multi_model_manager: MultiModelInferenceManager | None,
 ) -> None:
     """Pre-create and protect persistent actors at server startup.
@@ -383,8 +194,14 @@ async def _prewarm_persistent_models(
     lora_rank = int(config.prewarm_train_lora_rank)
     learning_rate = float(config.prewarm_train_lr)
     megatron_ready_timeout_s = float(config.prewarm_megatron_ready_timeout_s)
-    prewarm_training = bool(config.prewarm_enable_training)
+    prewarm_training_requested = bool(config.prewarm_enable_training)
+    prewarm_training = prewarm_training_requested and train_engine is not None
     prewarm_inference = bool(config.prewarm_enable_inference)
+    if prewarm_training_requested and train_engine is None:
+        raise RuntimeError(
+            "persistent prewarm training configured but unavailable in API process; "
+            "detached queue runtime owns training execution state"
+        )
 
     from tinker_server.backend.model_registry import (
         get_model_config,
@@ -522,6 +339,7 @@ async def _prewarm_persistent_models(
                         learning_rate=learning_rate,
                         distributed_config=distributed_config,
                         session_id=None,
+                        observability_base_model=model_name,
                     )
                     actor_name = _make_megatron_actor_name(base_model or model_name)
                     # Protect as soon as the actor is registered, so readiness timeouts don't leave it evictable.
@@ -713,6 +531,27 @@ async def _prewarm_persistent_models(
     _raise_if_failures()
 
 
+async def _restore_sampling_sessions(inference_manager: SessionManager) -> int:
+    """Restore detached sampling-session metadata into SessionManager."""
+    from .backend.sampling_session_store import async_list_sampling_sessions
+
+    restored = 0
+    for info in await async_list_sampling_sessions():
+        try:
+            if inference_manager.restore_sampling_session(info):
+                restored += 1
+        except Exception as e:
+            logger.warning(
+                "Failed to restore sampling session %r from detached store: %s: %s",
+                info.get("session_id"),
+                type(e).__name__,
+                e,
+            )
+    if restored:
+        logger.info("Restored %s sampling session(s) from detached store", restored)
+    return restored
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager.
@@ -724,21 +563,49 @@ async def lifespan(app: FastAPI):
     # Ray: hard requirement (fail fast)
     # ==========================================================================
     clear_startup_degraded_state()
+    clear_runtime_degraded_state()
     from .backend.future_store import future_store
     from .backend.gateway_session_store import ensure_ready as ensure_gateway_session_store_ready
+    from .backend.owner_runtime_supervisor import owner_runtime_supervisor
+    from .backend.sampling_session_store import ensure_ready as ensure_sampling_session_store_ready
+    from .backend.session_heartbeat_store import session_heartbeat_store
     from .backend.session_index_store import ensure_ready as ensure_session_index_store_ready
+    from .backend.startup_lease import acquire_startup_lease
     from .backend.training_session_store import ensure_ready as ensure_training_session_store_ready
-    from .checkpoints import (
-        get_checkpoint_mirror_poll_s,
-        get_checkpoint_reap_interval_s,
-        process_pending_checkpoint_mirrors,
-        reap_runtime_checkpoints,
+    from .config import RAY_NAMESPACE
+
+    if ray_address_source_configured():
+        init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
+
+    startup_lease = await acquire_startup_lease(_STARTUP_LEASE_ROLE)
+    startup_owner = bool(startup_lease.is_owner)
+    startup_lease_task: asyncio.Task | None = None
+    if startup_owner and not startup_lease.local_only:
+        startup_lease_task = asyncio.create_task(startup_lease.heartbeat_loop())
+    logger.info(
+        "startup lease role=%s is_owner=%s local_only=%s owner_id=%s",
+        _STARTUP_LEASE_ROLE,
+        startup_owner,
+        startup_lease.local_only,
+        startup_lease.owner_id,
     )
 
-    future_store.ensure_ready()
-    ensure_gateway_session_store_ready()
-    ensure_session_index_store_ready()
-    ensure_training_session_store_ready()
+    owner_runtime_local_only = os.environ.get("MINT_OWNER_RUNTIME_SUPERVISOR_LOCAL_ONLY", "").strip().lower() in {"1", "true", "yes", "on"}
+
+    if startup_owner:
+        await future_store.async_ensure_started()
+        ensure_gateway_session_store_ready()
+        ensure_sampling_session_store_ready()
+        session_heartbeat_store.ensure_ready()
+        ensure_session_index_store_ready()
+        ensure_training_session_store_ready()
+        from .backend.future_replay import ensure_future_replay_sweeper
+
+        ensure_future_replay_sweeper()
+    if owner_runtime_local_only:
+        owner_runtime = {"actor_name": "local_owner_runtime_supervisor", "epoch_id": "local"}
+    else:
+        owner_runtime = await owner_runtime_supervisor.async_ensure_started()
 
     try:
         from .backend.dense_session_state import cleanup_legacy_dense_session_state_once
@@ -771,553 +638,232 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("dense session-state startup cleanup failed")
 
-    # ==========================================================================
-    # Cleanup: Kill stale actors from previous server runs
-    # ==========================================================================
-    await _cleanup_stale_actors()
-
-    # ==========================================================================
-    # Inference: Initialize SessionManager
-    # ==========================================================================
-    logger.info("Initializing inference session manager")
-
-    inference_manager = SessionManager(
-        tensor_parallel_size=config.tensor_parallel_size,
-        data_parallel_size=config.data_parallel_size,
-        gpu_memory_utilization=config.gpu_memory_utilization,
-        max_model_len=config.max_model_len,
-        inactivity_timeout=config.session_inactivity_timeout_s
-        if config.session_inactivity_timeout_s is not None
-        else DEFAULT_INACTIVITY_TIMEOUT,
+    app_module_git_sha = _git_sha()
+    logger.info(
+        "owner runtime supervisor ready actor=%s epoch=%s",
+        owner_runtime.get("actor_name"),
+        owner_runtime.get("epoch_id"),
     )
 
-    # Make session manager available to routes
-    service.session_manager = inference_manager
-    sampling.session_manager = inference_manager
+    def _owner_runtime_health_error(snapshot: dict[str, object]) -> tuple[str, str, dict[str, object]] | None:
+        code_identity = snapshot.get("code_identity")
+        if code_identity != app_module_git_sha:
+            return (
+                "owner_runtime_supervisor_code_mismatch",
+                f"expected code_identity={app_module_git_sha!r} actual={code_identity!r}",
+                {"snapshot": snapshot},
+            )
+        loops = snapshot.get("loops")
+        if isinstance(loops, dict):
+            for loop_name, raw in loops.items():
+                if not isinstance(raw, dict):
+                    continue
+                last_error = raw.get("last_error")
+                last_error_at = raw.get("last_error_at")
+                last_success_at = raw.get("last_success_at")
+                if last_error and last_error_at is not None and (
+                    last_success_at is None or float(last_error_at) >= float(last_success_at)
+                ):
+                    return (
+                        "owner_runtime_supervisor_loop_error",
+                        f"loop={loop_name} last_error={last_error}",
+                        {"snapshot": snapshot},
+                    )
+        return None
 
-    # Start background cleanup task
-    await inference_manager.start_cleanup_task()
+    async def _owner_runtime_health_loop() -> None:
+        while True:
+            try:
+                snapshot = await owner_runtime_supervisor.async_health_snapshot(timeout_s=10.0)
+                err = _owner_runtime_health_error(snapshot)
+                if err is None:
+                    clear_runtime_degraded_state()
+                else:
+                    reason, error, details = err
+                    set_runtime_degraded_state(reason=reason, error=error, details=details)
+            except Exception as e:
+                set_runtime_degraded_state(
+                    reason="owner_runtime_supervisor_unavailable",
+                    error=f"{type(e).__name__}: {e}",
+                    details={},
+                )
+            await asyncio.sleep(5.0)
 
-    logger.info("Inference session manager initialized")
-
-    # ==========================================================================
-    # Multi-Model Inference: Initialize manager for dynamic engine creation
-    # ==========================================================================
-    multi_model_manager: MultiModelInferenceManager | None = None
-
-    if config.enable_multi_lora:
-        from .backend.multi_lora_engine import MultiModelInferenceManager
-
-        logger.info(
-            f"Initializing Multi-Model Inference Manager: max_loras={config.max_loras}, "
-            f"max_cpu_loras={config.max_cpu_loras}, max_lora_rank={config.max_lora_rank}"
-        )
-
-        # Create manager - engines are created lazily per model
-        multi_model_manager = MultiModelInferenceManager(
-            gpu_memory_utilization=config.gpu_memory_utilization,
-            max_model_len=config.max_model_len,
-            max_loras=config.max_loras,
-            max_cpu_loras=config.max_cpu_loras,
-            max_lora_rank=config.max_lora_rank,
-        )
-
-        # Register with session manager
-        inference_manager.set_multi_model_manager(multi_model_manager)
-        logger.info("Multi-model inference manager initialized (engines created on-demand)")
+    if owner_runtime_local_only:
+        clear_runtime_degraded_state()
+        owner_runtime_health_task = None
     else:
-        logger.info("Multi-LoRA disabled, using per-session engines")
+        owner_runtime_health_task = asyncio.create_task(_owner_runtime_health_loop())
+    ray_reconnect_watch_task: asyncio.Task | None = None
+    last_ray_connection_epoch = ray_connection_epoch()
 
-    # ==========================================================================
-    # Training: Initialize TrainingSessionManager and VerlTrainingEngine
-    # ==========================================================================
-    logger.info("Initializing training components")
+    inference_manager = None
+    train_manager = None
+    multi_model_manager = None
+    stale_training_heartbeat_task = None
 
-    from .backend.training_session_manager import TrainingSessionManager
-    from .backend.verl_training import VerlTrainingEngine
-
-    train_manager = TrainingSessionManager(
-        inactivity_timeout=config.training_inactivity_timeout_s,
-    )
-    train_engine = VerlTrainingEngine()
-    await train_engine.initialize()
-
-    # Make training components available to routes
-    training.training_manager = train_manager
-    training.training_engine = train_engine
-    training.inference_manager = inference_manager  # For ephemeral save flow
-    mint.training_manager = train_manager
-    mint.training_engine = train_engine
-
-    # Weights router also needs training components and inference manager
-    weights.training_manager = train_manager
-    weights.training_engine = train_engine
-    weights.inference_manager = inference_manager  # For multi-LoRA sampling registration
-
-    # Start background cleanup task for idle training sessions
-    await train_manager.start_cleanup_task(train_engine)
-
-    logger.info("Training components initialized")
-
-    # ==========================================================================
-    # Persistent actors: pre-create and protect at startup
-    # ==========================================================================
-    await _prewarm_persistent_models(train_engine, multi_model_manager)
-
-    # ==========================================================================
-    # OpenAI compat: preload tokenizers so request paths stay non-blocking
-    # ==========================================================================
     try:
-        preload_failures = openai_compat.preload_supported_tokenizers()
-        if preload_failures:
-            logger.warning(
-                "OpenAI-compatible tokenizer preload incomplete: %s",
-                preload_failures,
-            )
+        # ==========================================================================
+        # Cleanup: Kill stale actors from previous server runs
+        # ==========================================================================
+        if startup_owner:
+            if owner_runtime_local_only:
+                from .backend.actor_reconciliation import cleanup_stale_actors_once
+
+                await asyncio.to_thread(cleanup_stale_actors_once)
+            else:
+                await owner_runtime_supervisor.async_run_once("actor_reconciliation", timeout_s=60.0)
         else:
-            logger.info("OpenAI-compatible tokenizers preloaded")
-    except Exception as e:
-        logger.exception("OpenAI-compatible tokenizer preload failed: %s", e)
+            logger.info("Skipping stale-actor cleanup on follower worker")
 
-    # ==========================================================================
-    # Issue #84: Admission control + API work queue workers + future reaper
-    # ==========================================================================
-    from .backend.api_work_queue import api_work_queue
-    from .backend.capacity_manager import capacity_manager
-    from .models.types import (
-        ComputeLogprobsRequest,
-        CreateModelFromStateRequest,
-        CreateModelRequest,
-        ForwardRequest,
-        ForwardBackwardRequest,
-        LoadStateRequest,
-        OptimStepRequest,
-        ResetExpertBiasRequest,
-        SampleRequest,
-        SaveStateRequest,
-        SaveWeightsForSamplerRequest,
-        TrainStepRequest,
-    )
-    from .models.mint_types import (
-        ForwardBackwardReverseKLRequest,
-        InterpolateCheckpointsRequest,
-    )
+        # ==========================================================================
+        # Inference route layer: stateless API path uses detached stores only
+        # ==========================================================================
+        inference_manager = None
+        service.session_manager = None
+        sampling.session_manager = None
+        multi_model_manager: MultiModelInferenceManager | None = None
 
-    capacity_manager.ensure_ready()
-    api_work_queue.ensure_ready()
-
-    async def _exec_sampling_asample(item):
-        async def _run():
-            logger.info(
-                "[api_work_queue] sampling.asample request_id=%s stage=before_model_validate",
-                str(item.request_id),
-            )
-            req = SampleRequest.model_validate_json(item.request_json)
-            logger.info(
-                "[api_work_queue] sampling.asample request_id=%s stage=after_model_validate",
-                str(item.request_id),
-            )
-            await sampling._do_sample(
-                item.request_id,
-                req,
-                item.user_id,
-                (item.extra or {}).get("gateway_auth"),
-            )
-
-        await run_async_with_otel_span(
-            "queue.stage.sampling.asample",
-            _run,
-            component="api_work_queue",
-            op=str(item.op),
-            request_id=str(item.request_id),
-            attributes={"queue.stage": "queue.stage.sampling.asample"},
+        # ==========================================================================
+        # Training route layer: stateless API path uses detached stores only
+        # ==========================================================================
+        training.training_manager = None
+        training.training_engine = None
+        training.inference_manager = None
+        mint.training_manager = None
+        mint.training_engine = None
+        weights.training_manager = None
+        weights.training_engine = None
+        weights.inference_manager = None
+        logger.info(
+            "Training route globals left unbound in API process; detached queue runtime owns training execution state"
         )
 
-    async def _exec_sampling_compute_logprobs(item):
-        async def _run():
-            req = ComputeLogprobsRequest.model_validate_json(item.request_json)
-            await sampling._do_compute_logprobs(
-                item.request_id,
-                req,
-                item.user_id,
-                (item.extra or {}).get("gateway_auth"),
-            )
+        # ==========================================================================
+        # Persistent prewarm hook (API process has no local training runtime)
+        # ==========================================================================
+        if startup_owner:
+            await _prewarm_persistent_models(None, multi_model_manager)
+        else:
+            logger.info("Skipping persistent prewarm on follower worker")
 
-        await run_async_with_otel_span(
-            "queue.stage.sampling.compute_logprobs",
-            _run,
-            component="api_work_queue",
-            op=str(item.op),
-            request_id=str(item.request_id),
-            attributes={"queue.stage": "queue.stage.sampling.compute_logprobs"},
-        )
-
-    async def _exec_training_create_model(item):
-        async def _run():
-            req = CreateModelRequest.model_validate_json(item.request_json)
-            await training._do_create_model(item.request_id, req, item.user_id, item.webhook_url)
-
-        await run_async_with_otel_span(
-            "queue.stage.training.create_model",
-            _run,
-            component="api_work_queue",
-            op=str(item.op),
-            request_id=str(item.request_id),
-            attributes={"queue.stage": "queue.stage.training.create_model"},
-        )
-
-    async def _exec_training_create_model_from_state(item):
-        async def _run():
-            req = CreateModelFromStateRequest.model_validate_json(item.request_json)
-            await training._do_create_model_from_state(item.request_id, req, item.user_id)
-
-        await run_async_with_otel_span(
-            "queue.stage.training.create_model_from_state",
-            _run,
-            component="api_work_queue",
-            op=str(item.op),
-            request_id=str(item.request_id),
-            attributes={"queue.stage": "queue.stage.training.create_model_from_state"},
-        )
-
-    async def _exec_training_train_step(item):
-        async def _run():
-            req = TrainStepRequest.model_validate_json(item.request_json)
-            await training._do_train_step(
-                item.request_id,
-                req,
-                item.user_id,
-                (item.extra or {}).get("gateway_auth"),
-            )
-
-        await run_async_with_otel_span(
-            "queue.stage.training.train_step",
-            _run,
-            component="api_work_queue",
-            op=str(item.op),
-            request_id=str(item.request_id),
-            attributes={"queue.stage": "queue.stage.training.train_step"},
-        )
-
-    async def _exec_training_forward(item):
-        async def _run():
-            req = ForwardRequest.model_validate_json(item.request_json)
-            await training._do_forward(
-                item.request_id,
-                req,
-                (item.extra or {}).get("gateway_auth"),
-            )
-
-        await run_async_with_otel_span(
-            "queue.stage.training.forward",
-            _run,
-            component="api_work_queue",
-            op=str(item.op),
-            request_id=str(item.request_id),
-            attributes={"queue.stage": "queue.stage.training.forward"},
-        )
-
-    async def _exec_training_forward_backward(item):
-        async def _run():
-            req = ForwardBackwardRequest.model_validate_json(item.request_json)
-            await training._do_forward_backward(
-                item.request_id,
-                req,
-                item.user_id,
-                (item.extra or {}).get("gateway_auth"),
-            )
-
-        await run_async_with_otel_span(
-            "queue.stage.training.forward_backward",
-            _run,
-            component="api_work_queue",
-            op=str(item.op),
-            request_id=str(item.request_id),
-            attributes={"queue.stage": "queue.stage.training.forward_backward"},
-        )
-
-    async def _exec_training_save_weights_for_sampler(item):
-        async def _run():
-            req = SaveWeightsForSamplerRequest.model_validate_json(item.request_json)
-            prefer_tinker = bool((item.extra or {}).get("prefer_tinker"))
-            is_admin = bool((item.extra or {}).get("is_admin"))
-            await training._do_save_weights_for_sampler(
-                item.request_id,
-                req,
-                item.user_id,
-                prefer_tinker,
-                is_admin,
-            )
-
-        await run_async_with_otel_span(
-            "queue.stage.training.save_weights_for_sampler",
-            _run,
-            component="api_work_queue",
-            op=str(item.op),
-            request_id=str(item.request_id),
-            attributes={"queue.stage": "queue.stage.training.save_weights_for_sampler"},
-        )
-
-    async def _exec_training_optim_step(item):
-        async def _run():
-            req = OptimStepRequest.model_validate_json(item.request_json)
-            await training._do_optim_step(item.request_id, req, item.user_id)
-
-        await run_async_with_otel_span(
-            "queue.stage.training.optim_step",
-            _run,
-            component="api_work_queue",
-            op=str(item.op),
-            request_id=str(item.request_id),
-            attributes={"queue.stage": "queue.stage.training.optim_step"},
-        )
-
-    async def _exec_training_reset_expert_bias(item):
-        async def _run():
-            req = ResetExpertBiasRequest.model_validate_json(item.request_json)
-            await training._do_reset_expert_bias(item.request_id, req)
-
-        await run_async_with_otel_span(
-            "queue.stage.training.reset_expert_bias",
-            _run,
-            component="api_work_queue",
-            op=str(item.op),
-            request_id=str(item.request_id),
-            attributes={"queue.stage": "queue.stage.training.reset_expert_bias"},
-        )
-
-    async def _exec_training_delete_model(item):
-        async def _run():
-            payload = json.loads(item.request_json.decode("utf-8"))
-            model_id = payload.get("model_id")
-            if not isinstance(model_id, str) or not model_id:
-                raise ValueError("training.delete_model missing model_id")
-            await training._do_delete_model(item.request_id, model_id)
-
-        await run_async_with_otel_span(
-            "queue.stage.training.delete_model",
-            _run,
-            component="api_work_queue",
-            op=str(item.op),
-            request_id=str(item.request_id),
-            attributes={"queue.stage": "queue.stage.training.delete_model"},
-        )
-
-    async def _exec_weights_save_weights(item):
-        async def _run():
-            req = SaveStateRequest.model_validate_json(item.request_json)
-            prefer_tinker = bool((item.extra or {}).get("prefer_tinker"))
-            # Tinker SDK calls POST /api/v1/save_weights for TrainingClient.save_state(...).
-            # This must produce a training checkpoint (weights + optimizer state).
-            await weights._do_save_state(
-                item.request_id,
-                req,
-                user_id=item.user_id,
-                webhook_url=item.webhook_url,
-                prefer_tinker=prefer_tinker,
-            )
-
-        await run_async_with_otel_span(
-            "queue.stage.weights.save_weights",
-            _run,
-            component="api_work_queue",
-            op=str(item.op),
-            request_id=str(item.request_id),
-            attributes={"queue.stage": "queue.stage.weights.save_weights"},
-        )
-
-    async def _exec_weights_save_state(item):
-        async def _run():
-            req = SaveStateRequest.model_validate_json(item.request_json)
-            prefer_tinker = bool((item.extra or {}).get("prefer_tinker"))
-            await weights._do_save_state(
-                item.request_id,
-                req,
-                user_id=item.user_id,
-                webhook_url=item.webhook_url,
-                prefer_tinker=prefer_tinker,
-            )
-
-        await run_async_with_otel_span(
-            "queue.stage.weights.save_state",
-            _run,
-            component="api_work_queue",
-            op=str(item.op),
-            request_id=str(item.request_id),
-            attributes={"queue.stage": "queue.stage.weights.save_state"},
-        )
-
-    async def _exec_weights_load_state(item):
-        async def _run():
-            req = LoadStateRequest.model_validate_json(item.request_json)
-            await weights._do_load_state(item.request_id, req, item.user_id)
-
-        await run_async_with_otel_span(
-            "queue.stage.weights.load_state",
-            _run,
-            component="api_work_queue",
-            op=str(item.op),
-            request_id=str(item.request_id),
-            attributes={"queue.stage": "queue.stage.weights.load_state"},
-        )
-
-    async def _exec_internal_noop(item):
-        async def _run():
-            from .backend.future_store import future_store
-
-            future_store.resolve(
-                str(item.request_id),
-                {"ok": True, "op": "internal.noop", "ts": time.time()},
-            )
-
-        await run_async_with_otel_span(
-            "queue.stage.internal.noop",
-            _run,
-            component="api_work_queue",
-            op=str(item.op),
-            request_id=str(item.request_id),
-            attributes={"queue.stage": "queue.stage.internal.noop"},
-        )
-
-    async def _exec_mint_interpolate_checkpoints(item):
-        async def _run():
-            req = InterpolateCheckpointsRequest.model_validate_json(item.request_json)
-            await mint._do_interpolate_checkpoints(item.request_id, req, item.user_id)
-
-        await run_async_with_otel_span(
-            "queue.stage.mint.interpolate_checkpoints",
-            _run,
-            component="api_work_queue",
-            op=str(item.op),
-            request_id=str(item.request_id),
-            attributes={"queue.stage": "queue.stage.mint.interpolate_checkpoints"},
-        )
-
-    async def _exec_mint_forward_backward_reverse_kl(item):
-        async def _run():
-            req = ForwardBackwardReverseKLRequest.model_validate_json(item.request_json)
-            await mint._do_forward_backward_reverse_kl(item.request_id, req, item.user_id)
-
-        await run_async_with_otel_span(
-            "queue.stage.mint.forward_backward_reverse_kl",
-            _run,
-            component="api_work_queue",
-            op=str(item.op),
-            request_id=str(item.request_id),
-            attributes={"queue.stage": "queue.stage.mint.forward_backward_reverse_kl"},
-        )
-
-    api_work_queue.set_executor("sampling.asample", _exec_sampling_asample)
-    api_work_queue.set_executor("sampling.compute_logprobs", _exec_sampling_compute_logprobs)
-    api_work_queue.set_executor("training.create_model", _exec_training_create_model)
-    api_work_queue.set_executor("training.create_model_from_state", _exec_training_create_model_from_state)
-    api_work_queue.set_executor("training.train_step", _exec_training_train_step)
-    api_work_queue.set_executor("training.forward", _exec_training_forward)
-    api_work_queue.set_executor("training.forward_backward", _exec_training_forward_backward)
-    api_work_queue.set_executor("training.save_weights_for_sampler", _exec_training_save_weights_for_sampler)
-    api_work_queue.set_executor("training.optim_step", _exec_training_optim_step)
-    api_work_queue.set_executor("training.reset_expert_bias", _exec_training_reset_expert_bias)
-    api_work_queue.set_executor("training.delete_model", _exec_training_delete_model)
-    api_work_queue.set_executor("weights.save_weights", _exec_weights_save_weights)
-    api_work_queue.set_executor("weights.save_state", _exec_weights_save_state)
-    api_work_queue.set_executor("weights.load_state", _exec_weights_load_state)
-    api_work_queue.set_executor("internal.noop", _exec_internal_noop)
-    api_work_queue.set_executor("mint.interpolate_checkpoints", _exec_mint_interpolate_checkpoints)
-    api_work_queue.set_executor("mint.forward_backward_reverse_kl", _exec_mint_forward_backward_reverse_kl)
-
-    await api_work_queue.start_workers(num_workers=int(config.api_work_queue_num_workers))
-
-    async def _future_reaper_loop() -> None:
-        while True:
-            await asyncio.sleep(float(config.api_work_queue_reap_interval_s))
+        # ==========================================================================
+        # OpenAI compat: preload tokenizers only for single-worker startup.
+        # Multi-worker preloading duplicates large tokenizer state in every API process
+        # and can destabilize worker startup; lazy loading remains available per request.
+        # ==========================================================================
+        if _should_preload_openai_tokenizers():
             try:
-                reaped = future_store.reap()
-                for rid in list(reaped.get("expired", [])) + list(reaped.get("timed_out", [])):
-                    capacity_manager.release_all(str(rid))
-            except Exception:
-                pass
-
-    future_reaper_task = asyncio.create_task(_future_reaper_loop())
-
-    async def _stale_training_heartbeat_loop() -> None:
-        while True:
-            await asyncio.sleep(float(config.api_work_queue_reap_interval_s))
-            try:
-                cleaned = await training.cleanup_stale_training_sessions_once()
-                if cleaned:
+                preload_failures = openai_compat.preload_supported_tokenizers()
+                if preload_failures:
                     logger.warning(
-                        "auto-terminated %d stale training session(s): %s",
-                        len(cleaned),
-                        cleaned,
+                        "OpenAI-compatible tokenizer preload incomplete: %s",
+                        preload_failures,
                     )
-            except Exception:
-                logger.exception("stale training heartbeat cleanup failed")
+                else:
+                    logger.info("OpenAI-compatible tokenizers preloaded")
+            except Exception as e:
+                logger.exception("OpenAI-compatible tokenizer preload failed: %s", e)
+        else:
+            logger.info("Skipping OpenAI-compatible tokenizer preload for multi-worker startup")
 
-    stale_training_heartbeat_task = asyncio.create_task(_stale_training_heartbeat_loop())
+        # ==========================================================================
+        # Issue #84: Admission control + API work queue workers + future reaper
+        # ==========================================================================
+        from .backend.api_work_queue import api_work_queue
+        from .backend.capacity_manager import capacity_manager
+        from .backend.queue_execution_runtime import queue_execution_runtime
 
-    async def _checkpoint_reaper_loop() -> None:
-        while True:
-            await asyncio.sleep(float(get_checkpoint_reap_interval_s()))
-            try:
-                reaped = await asyncio.to_thread(reap_runtime_checkpoints)
-                total = len(reaped["ephemeral"]) + len(reaped["persistent_cache"]) + len(reaped["persistent"])
-                if total:
-                    logger.info(
-                        "checkpoint reaper removed ephemeral=%s persistent_cache=%s persistent=%s",
-                        len(reaped["ephemeral"]),
-                        len(reaped["persistent_cache"]),
-                        len(reaped["persistent"]),
+        await capacity_manager.async_ensure_ready(timeout_s=180.0)
+        await api_work_queue.async_ensure_started()
+        if os.environ.get("MINT_QUEUE_EXECUTION_RUNTIME_LOCAL_ONLY", "").strip().lower() in {"1", "true", "yes", "on"}:
+            from .backend.api_work_queue_dispatch import register_api_work_queue_executors
+            from .backend.queue_execution_runtime import _initialize_execution_bindings
+
+            logger.warning(
+                "Using local queue execution runtime fallback in API process "
+                "(MINT_QUEUE_EXECUTION_RUNTIME_LOCAL_ONLY=1)"
+            )
+            bindings = await _initialize_execution_bindings()
+            inference_manager = bindings.get("inference_manager")
+            train_manager = bindings.get("train_manager")
+            multi_model_manager = bindings.get("multi_model_manager")
+            register_api_work_queue_executors(api_work_queue)
+            await api_work_queue.start_workers(num_workers=int(config.api_work_queue_num_workers))
+            await api_work_queue.wait_until_execution_ready(timeout_s=120.0)
+        else:
+            await queue_execution_runtime.async_ensure_started(num_workers=int(config.api_work_queue_num_workers))
+
+        async def _ray_reconnect_watch_loop() -> None:
+            nonlocal last_ray_connection_epoch
+            poll_s = ray_reconnect_poll_s()
+            while True:
+                await asyncio.sleep(poll_s)
+                try:
+                    init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
+                    current_epoch = ray_connection_epoch()
+                    if current_epoch == last_ray_connection_epoch:
+                        continue
+                    last_ray_connection_epoch = current_epoch
+                    logger.warning(
+                        "Ray connection epoch advanced to %s; refreshing detached control-plane handles",
+                        current_epoch,
                     )
-            except Exception:
-                logger.exception("checkpoint reaper failed")
+                    await future_store.async_ensure_started()
+                    ensure_gateway_session_store_ready()
+                    ensure_sampling_session_store_ready()
+                    session_heartbeat_store.ensure_ready()
+                    ensure_session_index_store_ready()
+                    ensure_training_session_store_ready()
+                    await capacity_manager.async_ensure_ready()
+                    await api_work_queue.async_ensure_started()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Ray reconnect watch failed")
 
-    checkpoint_reaper_task = asyncio.create_task(_checkpoint_reaper_loop())
+        if ray_address_source_configured():
+            ray_reconnect_watch_task = asyncio.create_task(_ray_reconnect_watch_loop())
 
-    async def _checkpoint_mirror_loop() -> None:
-        while True:
-            try:
-                mirrored = await asyncio.to_thread(process_pending_checkpoint_mirrors)
-                if mirrored["mirrored"] or mirrored["failed"]:
-                    logger.info(
-                        "checkpoint mirror processed mirrored=%s failed=%s",
-                        len(mirrored["mirrored"]),
-                        len(mirrored["failed"]),
-                    )
-            except Exception:
-                logger.exception("checkpoint mirror loop failed")
-            await asyncio.sleep(float(get_checkpoint_mirror_poll_s()))
+        stale_training_heartbeat_task = None
 
-    checkpoint_mirror_task = asyncio.create_task(_checkpoint_mirror_loop())
+    except Exception:
+        await _cancel_task(ray_reconnect_watch_task)
+        await _cancel_task(startup_lease_task)
+        await startup_lease.release()
+        if train_manager is not None:
+            await _shutdown_local_training_runtime(train_manager)
+        if inference_manager is not None:
+            await _shutdown_local_inference_runtime(inference_manager)
+        if multi_model_manager is not None:
+            await multi_model_manager.shutdown_all()
+        _clear_local_execution_route_globals()
+        raise
 
     yield
 
     # ==========================================================================
     # Shutdown
     # ==========================================================================
-    future_reaper_task.cancel()
-    stale_training_heartbeat_task.cancel()
-    checkpoint_reaper_task.cancel()
-    checkpoint_mirror_task.cancel()
-    await asyncio.gather(
-        future_reaper_task,
-        stale_training_heartbeat_task,
-        checkpoint_reaper_task,
-        checkpoint_mirror_task,
-        return_exceptions=True,
-    )
+    await _cancel_task(ray_reconnect_watch_task)
+    await _cancel_task(owner_runtime_health_task)
+    await _cancel_task(stale_training_heartbeat_task)
+    await _cancel_task(startup_lease_task)
     await api_work_queue.shutdown()
-    logger.info("Shutting down all sessions")
+    await startup_lease.release()
+    logger.info("Shutting down local runtime state")
 
-    # Shutdown training sessions
-    await train_manager.shutdown_all(train_engine)
-
-    # Shutdown inference sessions
-    await inference_manager.shutdown_all()
+    # Do not let an arbitrary API worker exit delete shared metadata or global actors.
+    if train_manager is not None:
+        await _shutdown_local_training_runtime(train_manager)
+    if inference_manager is not None:
+        await _shutdown_local_inference_runtime(inference_manager)
 
     # Shutdown multi-model inference manager
     if multi_model_manager is not None:
         await multi_model_manager.shutdown_all()
         logger.info("Multi-model inference manager shutdown")
+    _clear_local_execution_route_globals()
 
     openai_compat.shutdown_tokenizer_executor()
 
@@ -1602,6 +1148,7 @@ async def api_key_auth_middleware(request: Request, call_next):
         )
         request.state.trace_id = final_trace_id
         response.headers["X-Trace-Id"] = final_trace_id
+        response.headers["X-MinT-Server-Pid"] = str(os.getpid())
         apikey_id = get_request_apikey_id(request)
         if apikey_id:
             response.headers["X-MinT-Apikey-Id"] = apikey_id

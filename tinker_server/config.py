@@ -7,13 +7,12 @@ import secrets
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .config_file import TinkerConfigFile
 
 from .runtime_env import (
-    DEFAULT_HF_MODULES_PATH,
     build_runtime_pythonpath,
     env_nonempty as _runtime_env_nonempty,
 )
@@ -35,6 +34,12 @@ def _resolve_env_or_config(name: str, env_value: str | None, file_value: str | N
 
 def _parse_bool(s: str) -> bool:
     return str(s).strip().lower() in ("true", "1", "yes", "y", "on")
+
+
+def _default_future_replay_root_dir(*, auth_enabled: bool) -> str:
+    if auth_enabled:
+        return "/vePFS-Mindverse/share/mint-prod-data/future-replay"
+    return "/vePFS-Mindverse/share/mint-prod-dev/future-replay"
 
 
 def _load_config_file_for_process(environ: dict[str, str]) -> tuple[str | None, object | None]:
@@ -163,6 +168,14 @@ def otel_env_vars() -> dict[str, str]:
     return out
 
 
+def _env_nonempty_any(environ: dict[str, str], *names: str) -> tuple[str | None, str | None]:
+    for name in names:
+        value = _env_nonempty(environ, name)
+        if value is not None:
+            return value, name
+    return None, None
+
+
 def actor_runtime_env_vars(*, pythonpath: str, extra: dict[str, str] | None = None) -> dict[str, str]:
     ensure_runtime_env_configured()
     out = {
@@ -187,10 +200,19 @@ def actor_runtime_env_vars(*, pythonpath: str, extra: dict[str, str] | None = No
         "TINKER_DENSE_SESSION_STATE_ROOT",
         "TINKER_RUNTIME_CHECKPOINT_DIR",
         "TINKER_LEGACY_DENSE_SESSION_STATE_ROOTS",
+        "MINT_DETACHED_ACTOR_NODE_IP",
+        "MINT_RAY_HEAD_ADDRESS_PATH",
     ):
         value = _env_nonempty(os.environ, key)
         if value is not None:
             out[key] = value
+    for primary, aliases in (
+        ("MINT_API_WORK_QUEUE_ACTOR_NAME", ("TINKER_API_WORK_QUEUE_ACTOR_NAME",)),
+        ("MINT_CAPACITY_MANAGER_ACTOR_NAME", ("TINKER_CAPACITY_MANAGER_ACTOR_NAME",)),
+    ):
+        value, _source = _env_nonempty_any(os.environ, primary, *aliases)
+        if value is not None:
+            out[primary] = value
     if extra:
         out.update(extra)
     return out
@@ -208,12 +230,34 @@ def actor_runtime_env(*, pythonpath: str, extra: dict[str, str] | None = None) -
     return runtime_env
 
 
+def detached_actor_resource_key(ray_module: Any | None = None) -> str | None:
+    pinned_ip = _env_nonempty(os.environ, "MINT_DETACHED_ACTOR_NODE_IP")
+    if pinned_ip is not None:
+        return f"node:{pinned_ip}"
+    try:
+        cluster_resources = (ray_module or __import__("ray")).cluster_resources()
+    except Exception:
+        return None
+    if "node:__internal_head__" in cluster_resources:
+        return "node:__internal_head__"
+    return None
+
+
+def apply_detached_actor_resources(options: dict[str, object], ray_module: Any | None = None) -> None:
+    key = detached_actor_resource_key(ray_module)
+    if key is not None:
+        options["resources"] = {key: 0.001}
+
+
 def preferred_vllm_python_executable() -> str | None:
+    explicit = _env_nonempty(os.environ, "MINT_VLLM_CHILD_PYTHON_EXECUTABLE")
+    if explicit:
+        return explicit
     if PFS_TINKER_PATH:
         candidate = Path(PFS_TINKER_PATH) / "scripts" / "vllm_worker_python.py"
         if candidate.exists():
             return str(candidate)
-    return _env_nonempty(os.environ, "MINT_VLLM_CHILD_PYTHON_EXECUTABLE")
+    return None
 
 
 def preferred_torch_lib_dirs(environ: dict[str, str] | None = None) -> list[str]:
@@ -330,6 +374,10 @@ class ServerConfig:
     future_store_queue_ttl_s: float = 7 * 86400.0
     future_store_done_ttl_s: float = 7200.0
     future_store_tombstone_ttl_s: float = 300.0
+    future_replay_root_dir: str = "/vePFS-Mindverse/share/mint-prod-dev/future-replay"
+    future_replay_hot_ttl_s: float = 60.0
+    future_replay_disk_ttl_s: float = 86400.0
+    future_replay_sweep_interval_s: float = 21600.0
 
     # Admission control + API work queue (issue #84)
     capacity_manager_actor_name: str = "tinker_capacity_manager"
@@ -350,6 +398,7 @@ class ServerConfig:
     )
     training_reinit_lora_timeout_s: float = 0.0
     training_actor_ready_timeout_s: float | None = None
+    training_remote_call_timeout_s: float | None = None
 
     # Persistent-prewarm settings (app.py)
     prewarm_persistent_models_csv: str = ""
@@ -382,6 +431,7 @@ class ServerConfig:
         api_key = environ.get("TINKER_API_KEY", "")
         token_secret_key = environ.get("TINKER_TOKEN_SECRET_KEY", "")
         # Auth disabled (dev mode) if neither api_key nor token_secret_key is set
+        auth_enabled = bool(api_key or token_secret_key)
         inactivity_s = environ.get("TINKER_SESSION_INACTIVITY_TIMEOUT_S") or environ.get("TINKER_INACTIVITY_TIMEOUT_S")
         file_server = config_file.server if config_file is not None else None
         file_sampling = config_file.sampling if config_file is not None else None
@@ -398,6 +448,10 @@ class ServerConfig:
 
         def _pick_str(name: str, file_value: str | None, default: str) -> str:
             v = _env_nonempty(environ, name)
+            return v if v is not None else (file_value if file_value is not None else default)
+
+        def _pick_str_alias(primary: str, aliases: tuple[str, ...], file_value: str | None, default: str) -> str:
+            v, _source = _env_nonempty_any(environ, primary, *aliases)
             return v if v is not None else (file_value if file_value is not None else default)
 
         def _pick_int(name: str, file_value: int | None, default: int) -> int:
@@ -421,6 +475,16 @@ class ServerConfig:
             float(actor_ready_timeout_env)
             if actor_ready_timeout_env is not None
             else (float(file_training.actor_ready_timeout_s) if file_training is not None and file_training.actor_ready_timeout_s is not None else None)
+        )
+        remote_call_timeout_env = _env_nonempty(environ, "MINT_TRAINING_REMOTE_CALL_TIMEOUT_S")
+        remote_call_timeout_s = (
+            float(remote_call_timeout_env)
+            if remote_call_timeout_env is not None
+            else (
+                float(file_training.remote_call_timeout_s)
+                if file_training is not None and file_training.remote_call_timeout_s is not None
+                else None
+            )
         )
 
         return cls(
@@ -611,14 +675,36 @@ class ServerConfig:
                 file_future_store.tombstone_ttl_s if file_future_store is not None else None,
                 300.0,
             ),
+            future_replay_root_dir=_pick_str(
+                "MINT_FUTURE_REPLAY_ROOT_DIR",
+                file_future_store.replay_root_dir if file_future_store is not None else None,
+                _default_future_replay_root_dir(auth_enabled=auth_enabled),
+            ),
+            future_replay_hot_ttl_s=_pick_float(
+                "MINT_FUTURE_REPLAY_HOT_TTL_S",
+                file_future_store.replay_hot_ttl_s if file_future_store is not None else None,
+                60.0,
+            ),
+            future_replay_disk_ttl_s=_pick_float(
+                "MINT_FUTURE_REPLAY_DISK_TTL_S",
+                file_future_store.replay_disk_ttl_s if file_future_store is not None else None,
+                86400.0,
+            ),
+            future_replay_sweep_interval_s=_pick_float(
+                "MINT_FUTURE_REPLAY_SWEEP_INTERVAL_S",
+                file_future_store.replay_sweep_interval_s if file_future_store is not None else None,
+                21600.0,
+            ),
             # Admission control + API work queue (issue #84)
-            capacity_manager_actor_name=_pick_str(
-                "TINKER_CAPACITY_MANAGER_ACTOR_NAME",
+            capacity_manager_actor_name=_pick_str_alias(
+                "MINT_CAPACITY_MANAGER_ACTOR_NAME",
+                ("TINKER_CAPACITY_MANAGER_ACTOR_NAME",),
                 None,
                 "tinker_capacity_manager",
             ),
-            api_work_queue_actor_name=_pick_str(
-                "TINKER_API_WORK_QUEUE_ACTOR_NAME",
+            api_work_queue_actor_name=_pick_str_alias(
+                "MINT_API_WORK_QUEUE_ACTOR_NAME",
+                ("TINKER_API_WORK_QUEUE_ACTOR_NAME",),
                 None,
                 "tinker_api_work_queue",
             ),
@@ -674,6 +760,7 @@ class ServerConfig:
                 0.0,
             ),
             training_actor_ready_timeout_s=actor_ready_timeout_s,
+            training_remote_call_timeout_s=remote_call_timeout_s,
             router_replay_mode=_pick_str(
                 "MINT_ROUTER_REPLAY_MODE",
                 None,

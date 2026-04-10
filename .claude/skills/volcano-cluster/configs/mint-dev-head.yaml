@@ -16,6 +16,10 @@ Entrypoint: |
   from ray._private.parameter import RayParams
 
   HEAD_IP_PATH = "/vePFS-Mindverse/share/code/tinker-server/ray_head_ip.txt"
+  RAY_TMP_ROOT_REAL = "/vePFS-Mindverse/share/mint_data/dev_cluster_tmp/head"
+  RAY_TMP_LINK = "/tmp/mdh"
+  RAY_TEMP_DIR = f"{RAY_TMP_LINK}/t"
+  RAY_OBJECT_SPILLING_DIR = f"{RAY_TMP_LINK}/s"
   CHECK_INTERVAL_S = 10
 
 
@@ -42,6 +46,19 @@ Entrypoint: |
   while True:
       ip = ray.util.get_node_ip_address()
       print(f"Local node IP: {ip}", flush=True)
+      os.makedirs(RAY_TMP_ROOT_REAL, exist_ok=True)
+      if os.path.lexists(RAY_TMP_LINK):
+          if os.path.islink(RAY_TMP_LINK) or os.path.isfile(RAY_TMP_LINK):
+              os.unlink(RAY_TMP_LINK)
+          else:
+              raise RuntimeError(f"refusing to replace non-link temp path: {RAY_TMP_LINK}")
+      os.symlink(RAY_TMP_ROOT_REAL, RAY_TMP_LINK)
+      os.makedirs(RAY_TEMP_DIR, exist_ok=True)
+      os.makedirs(RAY_OBJECT_SPILLING_DIR, exist_ok=True)
+      print(
+          f"mint-dev head using temp_dir={RAY_TEMP_DIR} object_spilling_directory={RAY_OBJECT_SPILLING_DIR} real_root={RAY_TMP_ROOT_REAL}",
+          flush=True,
+      )
 
       ray_params = RayParams(
           num_cpus=4,
@@ -51,6 +68,8 @@ Entrypoint: |
           dashboard_port=8265,
           gcs_server_port=6379,
           ray_client_server_port=10001,
+          temp_dir=RAY_TEMP_DIR,
+          object_spilling_directory=RAY_OBJECT_SPILLING_DIR,
       )
       node = None
       try:
@@ -96,3 +115,11 @@ Storages:
       MountPath: "/vePFS-Mindverse/share"
       SubPath: "share"
       ReadOnly: false
+    - Type: "TosFuse"
+      MountPath: "/tos-mindverse"
+      Bucket: "tos-mindverse-dev"
+      Prefix: "/"
+    - Type: "TosFuse"
+      MountPath: "/tos-mindverse-prod"
+      Bucket: "tos-mindverse"
+      Prefix: "/"

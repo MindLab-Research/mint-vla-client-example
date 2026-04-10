@@ -5,6 +5,7 @@ Uses verl's Ray-based vLLM infrastructure for scalable inference.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 
@@ -25,7 +26,7 @@ from typing import TYPE_CHECKING, Any
 import ray
 
 from tinker_server.backend.model_registry import get_model_config
-from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
+from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, otel_env_vars
 from tinker_server.config import config as server_config
 from tinker_server.logging_context import (
     get_current_traceparent,
@@ -41,12 +42,26 @@ from tinker_server.runtime_env import (
 )
 
 from . import ray_kill
+from .vllm_scheduler_observability import VllmStatsObserver, attach_vllm_stats_logger
 
 if TYPE_CHECKING:
     import torch
     from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
 
 logger = logging.getLogger(__name__)
+
+
+def _strip_empty_targets(value: object) -> object:
+    if isinstance(value, dict):
+        out: dict[object, object] = {}
+        for k, v in value.items():
+            if k == "_target_" and v in ("", None):
+                continue
+            out[k] = _strip_empty_targets(v)
+        return out
+    if isinstance(value, list):
+        return [_strip_empty_targets(v) for v in value]
+    return value
 
 
 def _sampled_logprob_entry_meta(entry: Any) -> dict[str, Any]:
@@ -646,17 +661,26 @@ def _create_extended_server_class(
                 from verl.workers.config import RolloutConfig as VerlRolloutConfig
 
                 if isinstance(rollout_cfg, dict):
+                    rollout_cfg_data = _strip_empty_targets(dict(rollout_cfg))
                     rollout_cfg = omega_conf_to_dataclass(
-                        rollout_cfg, dataclass_type=VerlRolloutConfig
+                        rollout_cfg_data, dataclass_type=VerlRolloutConfig
                     )
                 elif is_dataclass(rollout_cfg):
+                    rollout_cfg_data = _strip_empty_targets(asdict(rollout_cfg))
                     rollout_cfg = omega_conf_to_dataclass(
-                        asdict(rollout_cfg), dataclass_type=VerlRolloutConfig
+                        rollout_cfg_data, dataclass_type=VerlRolloutConfig
                     )
                 elif not isinstance(rollout_cfg, VerlRolloutConfig):
+                    rollout_cfg_data = _strip_empty_targets(dict(rollout_cfg))
                     rollout_cfg = omega_conf_to_dataclass(
-                        dict(rollout_cfg), dataclass_type=VerlRolloutConfig
+                        rollout_cfg_data, dataclass_type=VerlRolloutConfig
                     )
+
+                # Current verl BaseConfig fields are effectively frozen after init.
+                # Override via object.__setattr__ so the config remains a RolloutConfig
+                # instance for the base server.
+                if hasattr(rollout_cfg, "disable_log_stats"):
+                    object.__setattr__(rollout_cfg, "disable_log_stats", False)
                 print(
                     f"[ExtendedVLLMHttpServer] rollout config normalized type={type(rollout_cfg).__name__} _target_={getattr(rollout_cfg, '_target_', None)!r}",
                     flush=True,
@@ -686,6 +710,7 @@ def _create_extended_server_class(
                             dropped,
                         )
             super(ExtendedVLLMHttpServer, self).__init__(*args, **call_kwargs)
+            self._vllm_stats_observer = VllmStatsObserver()
             # Track local paths for multi-LoRA (needed for GPU/CPU swap)
             self._lora_paths: dict[int, str] = {}
             self._timing = os.environ.get("MINT_VLLM_REQUEST_TIMING", "").strip().lower() in (
@@ -700,7 +725,6 @@ def _create_extended_server_class(
             )
             self._mint_pack_moe_patched = False
             self._progress_last: dict[str, float] = {}
-
         def _progress_meta(self, tokens_generated: int, max_tokens: int) -> dict[str, Any]:
             return {
                 "tokens_generated": int(tokens_generated),
@@ -729,7 +753,7 @@ def _create_extended_server_class(
             try:
                 from tinker_server.backend.future_store import future_store
 
-                future_store.update_meta(
+                await future_store.async_update_meta(
                     request_id,
                     meta={
                         "stage": stage,
@@ -753,6 +777,30 @@ def _create_extended_server_class(
             rss_pages = int(parts[1])
             page_size = int(os.sysconf("SC_PAGE_SIZE"))
             return rss_pages * page_size
+
+        async def get_observability_binding(self) -> dict[str, object]:
+            import socket
+
+            gpu_indices: list[int] = []
+            try:
+                for gpu_id in ray.get_gpu_ids():
+                    if isinstance(gpu_id, (int, float)):
+                        gpu_indices.append(int(gpu_id))
+                    else:
+                        gpu_indices.append(int(float(str(gpu_id))))
+            except Exception:
+                gpu_indices = []
+            node_id = None
+            try:
+                node_id = str(ray.get_runtime_context().get_node_id())
+            except Exception:
+                node_id = None
+            return {
+                "hostname": socket.gethostname(),
+                "node_id": node_id,
+                "gpu_indices": gpu_indices,
+                **self._vllm_stats_observer.snapshot(),
+            }
 
         async def is_engine_ready(self) -> bool:
             """Check if vLLM engine is properly initialized.
@@ -834,15 +882,25 @@ def _create_extended_server_class(
                 args.max_cpu_loras = self.MULTI_LORA_MAX_CPU_LORAS
                 _logger.info(f"Multi-LoRA: overriding max_cpu_loras={args.max_cpu_loras}")
 
+        def _attach_stats_logger_if_ready(self) -> None:
+            engine = getattr(self, "engine", None)
+            if engine is None:
+                return
+            attach_vllm_stats_logger(engine, self._vllm_stats_observer)
+
         async def run_server(self, args):
             """Override to inject multi-LoRA config (rank-0 node)."""
             self._patch_lora_args(args)
-            return await super().run_server(args)
+            out = await super().run_server(args)
+            self._attach_stats_logger_if_ready()
+            return out
 
         async def run_headless(self, args):
             """Override to inject multi-LoRA config (non-rank-0 nodes)."""
             self._patch_lora_args(args)
-            return await super().run_headless(args)
+            out = await super().run_headless(args)
+            self._attach_stats_logger_if_ready()
+            return out
 
         async def add_lora(self, lora_request) -> None:
             """Add LoRA adapter to running engine.
@@ -1061,6 +1119,16 @@ def _create_extended_server_class(
                 lora_path=lora_path,
             )
 
+            deadline = time.time() + float(os.environ.get("MINT_VLLM_ENGINE_READY_WAIT_S", "30"))
+            engine_ready = False
+            while time.time() < deadline:
+                if await self.is_engine_ready():
+                    engine_ready = True
+                    break
+                await asyncio.sleep(0.1)
+            if not engine_ready:
+                raise RuntimeError("vLLM engine not ready before add_lora_from_path")
+
             await self._maybe_ensure_pack_moe_patched_for_adapter_dir(lora_path)
             await self.engine.add_lora(lora_request)
 
@@ -1170,7 +1238,7 @@ def _create_extended_server_class(
             try:
                 from tinker_server.backend.future_store import future_store
 
-                future_store.update_meta(
+                await future_store.async_update_meta(
                     request_id,
                     meta={
                         "stage": "prefill",
@@ -1344,7 +1412,7 @@ def _create_extended_server_class(
                         "stop_reason": out_stop_reason,
                         "_timing_total_s": float(total_s),
                         "_timing_first_tok_s": float(first_tok_s) if first_tok_s is not None else None,
-                    }
+                            }
                 )
             self._progress_last.pop(request_id, None)
             return outs
@@ -1435,7 +1503,7 @@ def _create_extended_server_class(
             try:
                 from tinker_server.backend.future_store import future_store
 
-                future_store.update_meta(
+                await future_store.async_update_meta(
                     request_id,
                     meta={
                         "stage": "prefill",
@@ -1609,7 +1677,7 @@ def _create_extended_server_class(
                         "stop_reason": out_stop_reason,
                         "_timing_total_s": float(total_s),
                         "_timing_first_tok_s": float(first_tok_s) if first_tok_s is not None else None,
-                    }
+                            }
                 )
             self._progress_last.pop(request_id, None)
             return outs
@@ -2571,11 +2639,8 @@ class VerlInferenceEngine:
             lora_rank=self.lora_rank,
             lora_adapter_path=self.lora_adapter_path,
         )
-        rollout_payload = asdict(rollout_config)
-        if not rollout_payload.get("_target_"):
-            rollout_payload["_target_"] = "verl.workers.config.RolloutConfig"
         remote_kwargs: dict[str, object] = {
-            "config": rollout_payload,
+            "config": rollout_config,
             "model_config": model_config,
             "rollout_mode": RolloutMode.STANDALONE,
             "workers": [],
