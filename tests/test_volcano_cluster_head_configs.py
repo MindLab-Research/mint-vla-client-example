@@ -27,6 +27,7 @@ def test_dev_head_keeps_dashboard_and_ray_client_enabled() -> None:
     assert 'Bucket: "tos-mindverse-dev"' in text
     assert 'MountPath: "/tos-mindverse-prod"' in text
     assert 'Bucket: "tos-mindverse"' in text
+    assert 'Flavor: "ml.r3i.4xlarge"' in text
 
 
 def test_dev_worker_uses_short_temp_paths() -> None:

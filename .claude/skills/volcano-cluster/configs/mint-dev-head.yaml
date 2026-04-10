@@ -103,7 +103,7 @@ Framework: "Custom"
 TaskRoleSpecs:
     - RoleName: "worker"
       RoleReplicas: 1
-      Flavor: "ml.g3a.2xlarge"  # CPU instance
+      Flavor: "ml.r3i.4xlarge"  # CPU instance
 
 # No timeout (0 = unlimited)
 ActiveDeadlineSeconds: 0
