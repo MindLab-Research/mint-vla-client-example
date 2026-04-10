@@ -4385,7 +4385,6 @@ class MegatronRankWorker:
         train_mlp: bool | None = None,
         train_unembed: bool | None = None,
         traceparent: str | None = None,
-        reload_optimizer_model_params: bool = True,
     ) -> dict:
         """Load LoRA adapter weights from checkpoint.
 
@@ -4460,11 +4459,6 @@ class MegatronRankWorker:
                         continue
                     if isinstance(bias_value, torch.Tensor):
                         module.expert_bias.copy_(bias_value.to(module.expert_bias.device))
-
-            optimizer = getattr(self.engine, "optimizer", None)
-            reload_model_params = getattr(optimizer, "reload_model_params", None)
-            if reload_optimizer_model_params and callable(reload_model_params):
-                reload_model_params(state_dict=adapter_state)
 
             train_attn = True if train_attn is None else bool(train_attn)
             train_mlp = True if train_mlp is None else bool(train_mlp)
@@ -5878,7 +5872,6 @@ class MegatronWorkerGroup:
         train_attn: bool | None = None,
         train_mlp: bool | None = None,
         train_unembed: bool | None = None,
-        reload_optimizer_model_params: bool = True,
     ) -> dict[str, object]:
         """Ensure the specified session's state is loaded (LoRA + optimizer + gradients).
 
@@ -6137,7 +6130,8 @@ class MegatronWorkerGroup:
         if session_id is None:
             return
         self._bind_traceparent(traceparent)
-        if self._current_session == session_id:
+        current_session = getattr(self, "_current_session", None)
+        if current_session == session_id:
             return
         session_manager = getattr(self, "_session_manager", None)
         current_is_dirty = False
@@ -6145,24 +6139,24 @@ class MegatronWorkerGroup:
         target_has_actor_only_state = False
         if session_manager is not None:
             has_actor_only_state = getattr(session_manager, "has_actor_only_state", None)
-            if callable(has_actor_only_state) and self._current_session is not None:
-                current_is_dirty = bool(has_actor_only_state(self._current_session))
+            if callable(has_actor_only_state) and current_session is not None:
+                current_is_dirty = bool(has_actor_only_state(current_session))
                 target_has_actor_only_state = bool(has_actor_only_state(session_id))
             session_exists = getattr(session_manager, "session_exists", None)
             if callable(session_exists):
                 target_exists = bool(session_exists(session_id))
 
-        if self._current_session is not None and session_manager is not None and current_is_dirty:
-            old_path = session_manager.get_session_path(self._current_session)
-            logger.info(f"[MegatronWorkerGroup] Saving outgoing session {self._current_session}")
+        if current_session is not None and session_manager is not None and current_is_dirty:
+            old_path = session_manager.get_session_path(current_session)
+            logger.info(f"[MegatronWorkerGroup] Saving outgoing session {current_session}")
             self.save_adapter_state(old_path, traceparent=traceparent)
             save_metadata = getattr(session_manager, "save_metadata", None)
             if save_metadata is not None:
                 save_metadata(
-                    self._current_session,
-                    self._step_count,
-                    self.learning_rate,
-                    self._actual_rank,
+                    current_session,
+                    getattr(self, "_step_count", 0),
+                    getattr(self, "learning_rate", None),
+                    getattr(self, "_actual_rank", None),
                 )
         clear_refs = [
             w.clear_session_state.remote(session_id, traceparent=traceparent)
@@ -6251,21 +6245,15 @@ class MegatronWorkerGroup:
         train_attn: bool | None,
         train_mlp: bool | None,
         train_unembed: bool | None,
-        reload_optimizer_model_params: bool = True,
     ) -> tuple[str, dict[str, object]]:
         """Resolve and restore session state for forward/backward/step style requests."""
         effective_session_id = self._resolve_required_session_id(session_id, op=op)
-        ensure_kwargs = {
-            "traceparent": traceparent,
-            "train_attn": train_attn,
-            "train_mlp": train_mlp,
-            "train_unembed": train_unembed,
-        }
-        if not reload_optimizer_model_params:
-            ensure_kwargs["reload_optimizer_model_params"] = False
         switch_stats = self._ensure_session_loaded(
             effective_session_id,
-            **ensure_kwargs,
+            traceparent=traceparent,
+            train_attn=train_attn,
+            train_mlp=train_mlp,
+            train_unembed=train_unembed,
         )
         if not isinstance(switch_stats, dict):
             switch_stats = dict(getattr(self, "_last_session_switch_stats", None) or {})
@@ -6556,7 +6544,6 @@ class MegatronWorkerGroup:
             train_attn=train_attn,
             train_mlp=train_mlp,
             train_unembed=train_unembed,
-            reload_optimizer_model_params=False,
         )
 
         # Send raw data_items to workers (TensorDict created locally on each worker
@@ -6656,7 +6643,6 @@ class MegatronWorkerGroup:
             train_attn=train_attn,
             train_mlp=train_mlp,
             train_unembed=train_unembed,
-            reload_optimizer_model_params=False,
         )
 
         futures = [
@@ -6707,7 +6693,6 @@ class MegatronWorkerGroup:
             train_attn=train_attn,
             train_mlp=train_mlp,
             train_unembed=train_unembed,
-            reload_optimizer_model_params=False,
         )
         futures = [
             w.forward_reference_full_log_probs.remote(
@@ -7202,7 +7187,6 @@ class MegatronWorkerGroup:
             train_attn=train_attn,
             train_mlp=train_mlp,
             train_unembed=train_unembed,
-            reload_optimizer_model_params=load_optimizer,
         )
         result["load_method"] = "load_adapter_state"
 

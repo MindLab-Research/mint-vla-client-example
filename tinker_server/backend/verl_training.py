@@ -1635,6 +1635,7 @@ class VerlTrainingEngine:
         self._resource_pool_actor_names: dict[str, str] = {}
         self._actor_loaded_sessions: dict[str, str] = {}
         self._actor_volatile_sessions: dict[str, set[str]] = {}
+        self._poisoned_sessions: dict[str, str] = {}
 
     async def initialize(self) -> None:
         """Initialize Ray connection."""
@@ -1693,6 +1694,17 @@ class VerlTrainingEngine:
                 return base_model, requested_model
             return self.default_base_model, requested_model
         return requested_model, requested_model
+
+    def _resolve_megatron_base_model(self, session: "TrainingSession") -> tuple[str, str]:
+        requested_model = session.base_model or self.default_base_model
+        if not requested_model:
+            raise RuntimeError(f"[{session.model_id}] could not resolve Megatron base model: missing requested model")
+        if requested_model.startswith("/"):
+            return requested_model, requested_model
+        base_model = self._resolve_hf_model_path(requested_model)
+        if not base_model:
+            raise RuntimeError(f"[{session.model_id}] could not resolve Megatron base model: {requested_model}")
+        return base_model, requested_model
 
     async def _recover_dense_worker(self, session: "TrainingSession", *, reason: str) -> ray.actor.ActorHandle:
         """Rebind a dense trainer actor after eviction/death."""
@@ -2139,24 +2151,6 @@ class VerlTrainingEngine:
             session.backend = "peft"
             logger.info(f"[{model_id}] Dense trainer ready for {base_model} (max_rank={dense.max_lora_rank})")
 
-        # For Megatron: avoid blocking create_session on __ray_ready__.
-        #
-        # __ray_ready__ is a normal actor task, so it can queue behind long-running
-        # initialization/work tasks and appear to "hang" for hours even when the actor
-        # is healthy. Returning early lets clients proceed; subsequent training calls
-        # will naturally queue until the actor is ready.
-        if session.backend == "megatron":
-            actor_name = self._resource_pool_actor_names.get(model_id)
-            if actor_name:
-                from .resource_pool import get_resource_pool
-
-                get_resource_pool().mark_ready(actor_name)
-
-            self._workers[model_id] = worker
-            session.is_active = True
-            logger.info(f"[{model_id}] TrainingWorker ready (backend={session.backend})")
-            return
-
         # Wait for actor to be ready (model loaded)
         # Use await instead of ray.get() to not block the event loop
         default_ready_timeout_s = 3600.0 if session.backend == "megatron" else 900.0
@@ -2517,7 +2511,12 @@ class VerlTrainingEngine:
             )
         else:
             pending = worker.optim_step.remote(lr, session.model_id, traceparent=traceparent)
-        result = await self._await_with_keepalive(pending, session, interval_s=30.0)
+        result = await self._await_with_keepalive(
+            pending,
+            session,
+            interval_s=30.0,
+            timeout_s=server_config.training_remote_call_timeout_s,
+        )
 
         # Update session state
         session.current_step += 1
@@ -2789,6 +2788,7 @@ class VerlTrainingEngine:
         self,
         session: TrainingSession,
         save_path: str,
+        use_per_expert_lora: bool = False,
     ) -> str:
         """Save minimal PEFT LoRA artifacts for sampling (no optimizer/resume artifacts)."""
         import os
@@ -2823,6 +2823,7 @@ class VerlTrainingEngine:
             abs_path,
             session_id=session.model_id,
             traceparent=traceparent,
+            use_per_expert_lora=use_per_expert_lora,
             train_attn=train_attn,
             train_mlp=train_mlp,
             train_unembed=train_unembed,
@@ -2848,6 +2849,7 @@ class VerlTrainingEngine:
         self,
         session: TrainingSession,
         save_path: str,
+        use_per_expert_lora: bool = False,
     ) -> str:
         """Save checkpoint via Ray actor.
 
@@ -2896,6 +2898,7 @@ class VerlTrainingEngine:
                 abs_path,
                 traceparent=traceparent,
                 session_id=session.model_id,
+                use_per_expert_lora=use_per_expert_lora,
                 train_attn=train_attn,
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
@@ -2990,7 +2993,12 @@ class VerlTrainingEngine:
         )
 
         if session.backend == "megatron":
-            actual_rank = meta.get("actual_rank")
+            load_meta = meta if isinstance(meta, dict) else {}
+            actual_rank = load_meta.get("actual_rank")
+            lora_cfg = getattr(session, "lora_config", None)
+            train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
+            train_mlp = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
+            train_unembed = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
             await asyncio.to_thread(
                 ray.get,
                 worker.mark_session_loaded.remote(
@@ -2998,6 +3006,12 @@ class VerlTrainingEngine:
                     step_count=session.current_step,
                     learning_rate=session.learning_rate,
                     actual_rank=actual_rank,
+                    actor_only_state_dirty=bool(load_optimizer),
+                    checkpoint_path=load_path,
+                    optimizer_restored=bool(load_optimizer),
+                    train_attn=train_attn,
+                    train_mlp=train_mlp,
+                    train_unembed=train_unembed,
                 ),
                 timeout=30,
             )
@@ -3119,6 +3133,10 @@ class VerlTrainingEngine:
 
         session.is_active = False
         logger.info(f"[{model_id}] TrainingWorker shutdown")
+
+    async def unbind_session(self, session: TrainingSession) -> None:
+        """Backward-compatible alias for detaching one session from a shared actor."""
+        await self.shutdown_session(session)
 
     async def delete_session(self, session: TrainingSession) -> None:
         """Backward-compatible alias for session deletion paths."""

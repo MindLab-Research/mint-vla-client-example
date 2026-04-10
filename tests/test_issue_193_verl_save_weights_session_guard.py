@@ -747,6 +747,12 @@ def test_issue_193_megatron_load_weights_passes_explicit_session_id_and_keepaliv
                 "step_count": 5,
                 "learning_rate": pytest.approx(3e-4),
                 "actual_rank": None,
+                "actor_only_state_dirty": False,
+                "checkpoint_path": "/tmp/issue_193_megatron_load",
+                "optimizer_restored": False,
+                "train_attn": False,
+                "train_mlp": True,
+                "train_unembed": False,
             },
         )
     ]
@@ -931,6 +937,12 @@ def test_issue_193_megatron_load_weights_missing_actor_can_recreate_from_checkpo
                 "step_count": 4,
                 "learning_rate": pytest.approx(3e-4),
                 "actual_rank": 6,
+                "actor_only_state_dirty": True,
+                "checkpoint_path": "/tmp/issue_193_megatron_load_missing_actor",
+                "optimizer_restored": True,
+                "train_attn": True,
+                "train_mlp": True,
+                "train_unembed": True,
             },
         )
     ]
@@ -2051,14 +2063,14 @@ def test_issue_193_megatron_load_checkpoint_uses_ensure_session_loaded(tmp_path:
         encoding="utf-8",
     )
 
-    ensure_calls: list[tuple[str, dict]] = []
+    prepare_calls: list[tuple[str, str | None]] = []
     load_adapter_calls: list[tuple[str, dict]] = []
     reset_optimizer_calls: list[tuple[tuple, dict]] = []
     group.workers = []
     group._bind_traceparent = lambda traceparent: None
     group._resolve_required_session_id = lambda session_id, op: session_id
-    group._ensure_session_loaded = (
-        lambda session_id, **kwargs: ensure_calls.append((session_id, kwargs)) or {"switched": False}
+    group._prepare_session_for_explicit_load = (
+        lambda session_id, traceparent=None: prepare_calls.append((session_id, traceparent))
     )
     group.load_adapter_state = lambda load_path, **kwargs: load_adapter_calls.append((load_path, kwargs)) or {}
     group.reset_optimizer = lambda *args, **kwargs: reset_optimizer_calls.append((args, kwargs)) or None
@@ -2070,17 +2082,7 @@ def test_issue_193_megatron_load_checkpoint_uses_ensure_session_loaded(tmp_path:
 
     result = group.load_checkpoint(str(ckpt_dir), load_optimizer=False, session_id="session_target")
 
-    assert ensure_calls == [
-        (
-            "session_target",
-            {
-                "traceparent": None,
-                "train_attn": None,
-                "train_mlp": None,
-                "train_unembed": None,
-            },
-        )
-    ]
+    assert prepare_calls == [("session_target", None)]
     assert load_adapter_calls == [
         (
             str(ckpt_dir),
@@ -2096,7 +2098,7 @@ def test_issue_193_megatron_load_checkpoint_uses_ensure_session_loaded(tmp_path:
     assert reset_optimizer_calls == [
         (
             (2e-4,),
-            {"traceparent": None},
+            {"traceparent": None, "zero_grad_buffers": False},
         )
     ]
     assert result["optimizer_reset"] is True
@@ -2297,12 +2299,26 @@ def test_issue_193_megatron_load_weights_invalid_meta_marks_session_loaded_with_
         )
 
     with caplog.at_level(logging.WARNING):
-        with pytest.raises(AttributeError, match="get"):
-            asyncio.run(_run())
+        asyncio.run(_run())
 
     assert session.current_step == 12
     assert session.learning_rate == pytest.approx(9e-5)
-    assert worker.mark_session_loaded.calls == []
+    assert worker.mark_session_loaded.calls == [
+        (
+            (model_id,),
+            {
+                "step_count": 12,
+                "learning_rate": pytest.approx(9e-5),
+                "actual_rank": None,
+                "actor_only_state_dirty": True,
+                "checkpoint_path": "/tmp/issue_193_invalid_meta_megatron_load",
+                "optimizer_restored": True,
+                "train_attn": True,
+                "train_mlp": True,
+                "train_unembed": True,
+            },
+        )
+    ]
     assert any("load_weights" in rec.getMessage() for rec in caplog.records)
 
 
@@ -2354,7 +2370,7 @@ def test_issue_193_megatron_create_training_session_marks_ready_without_waiting(
 
     asyncio.run(_run())
 
-    assert keepalive_calls == []
+    assert keepalive_calls == [("fake-load-ready-ref", model_id, 30.0, 3600.0)]
     assert engine._workers[model_id] is worker
     assert session.backend == "megatron"
     assert session.is_active is True
