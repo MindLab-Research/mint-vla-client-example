@@ -212,11 +212,19 @@ class _StubOwnerRuntimeSupervisor:
 
 
 class _StubQueueExecutionRuntime:
-    def __init__(self):
-        self.ensure_started_calls: list[int] = []
+    def __init__(self, *, fail_async_ensure_started: str | None = None):
+        self.fail_async_ensure_started = fail_async_ensure_started
+        self.ensure_started_calls: list[dict[str, float | int]] = []
 
     async def async_ensure_started(self, *, num_workers: int, timeout_s: float = 120.0):
-        self.ensure_started_calls.append(int(num_workers))
+        self.ensure_started_calls.append(
+            {
+                "num_workers": int(num_workers),
+                "timeout_s": float(timeout_s),
+            }
+        )
+        if self.fail_async_ensure_started is not None:
+            raise RuntimeError(self.fail_async_ensure_started)
         return {
             "actor_name": "tinker_queue_execution_runtime",
             "desired_workers": int(num_workers),
@@ -322,20 +330,18 @@ def _install_lifespan_stubs(
     monkeypatch.setattr(usage_store_module, "close_usage_store", _noop_async)
 
 
-def test_lifespan_waits_for_prewarm_and_fails_startup(monkeypatch) -> None:
+def test_lifespan_surfaces_queue_runtime_prewarm_failure(monkeypatch) -> None:
     queue = _StubApiWorkQueue()
     owner_runtime = _StubOwnerRuntimeSupervisor()
-    queue_execution_runtime = _StubQueueExecutionRuntime()
+    queue_execution_runtime = _StubQueueExecutionRuntime(
+        fail_async_ensure_started="prewarm failed: pinned worker full"
+    )
     _install_lifespan_stubs(monkeypatch, queue, owner_runtime, queue_execution_runtime)
     lease = _StubStartupLease(is_owner=True)
-
-    async def _fail_prewarm(*_args, **_kwargs) -> None:
-        raise RuntimeError("prewarm failed: pinned worker full")
 
     async def _acquire_startup_lease(*_args, **_kwargs):
         return lease
 
-    monkeypatch.setattr(app_module, "_prewarm_persistent_models", _fail_prewarm)
     monkeypatch.setattr(
         "tinker_server.backend.startup_lease.acquire_startup_lease",
         _acquire_startup_lease,
@@ -344,17 +350,19 @@ def test_lifespan_waits_for_prewarm_and_fails_startup(monkeypatch) -> None:
     async def _run() -> None:
         with pytest.raises(RuntimeError, match="prewarm failed: pinned worker full"):
             async with app_module.lifespan(app_module.app):
-                raise AssertionError("lifespan should not yield on prewarm failure")
+                raise AssertionError("lifespan should not yield on queue runtime prewarm failure")
 
     asyncio.run(_run())
     assert queue.started_workers == 0
     assert owner_runtime.started == 1
     assert lease.released is True
     assert app_module.service.session_manager is None
-    assert queue_execution_runtime.ensure_started_calls == []
+    assert queue_execution_runtime.ensure_started_calls == [
+        {"num_workers": 1, "timeout_s": 120.0}
+    ]
 
 
-def test_lifespan_fails_loudly_when_training_prewarm_configured_without_local_runtime(monkeypatch) -> None:
+def test_lifespan_routes_persistent_prewarm_to_queue_runtime(monkeypatch) -> None:
     queue = _StubApiWorkQueue()
     owner_runtime = _StubOwnerRuntimeSupervisor()
     queue_execution_runtime = _StubQueueExecutionRuntime()
@@ -364,28 +372,64 @@ def test_lifespan_fails_loudly_when_training_prewarm_configured_without_local_ru
     async def _acquire_startup_lease(*_args, **_kwargs):
         return lease
 
+    async def _fail_if_called(*_args, **_kwargs) -> None:
+        raise AssertionError("API-process prewarm path should be unused in detached runtime mode")
+
     monkeypatch.setattr(app_module.config, "prewarm_persistent_models_csv", "Qwen/Qwen3-30B-A3B-Instruct-2507")
     monkeypatch.setattr(app_module.config, "prewarm_enable_training", True)
     monkeypatch.setattr(app_module.config, "prewarm_enable_inference", False)
+    monkeypatch.setattr(app_module, "_prewarm_persistent_models", _fail_if_called)
     monkeypatch.setattr(
         "tinker_server.backend.startup_lease.acquire_startup_lease",
         _acquire_startup_lease,
     )
 
     async def _run() -> None:
-        with pytest.raises(
-            RuntimeError,
-            match="persistent prewarm training configured but unavailable in API process",
-        ):
-            async with app_module.lifespan(app_module.app):
-                raise AssertionError("lifespan should not yield when detached prewarm is unavailable")
+        async with app_module.lifespan(app_module.app):
+            return None
 
     asyncio.run(_run())
     assert queue.started_workers == 0
     assert owner_runtime.started == 1
     assert lease.released is True
     assert app_module.service.session_manager is None
-    assert queue_execution_runtime.ensure_started_calls == []
+    assert queue_execution_runtime.ensure_started_calls == [
+        {
+            "num_workers": 1,
+            "timeout_s": app_module._queue_execution_runtime_start_timeout_s(),
+        }
+    ]
+
+
+@pytest.mark.anyio
+async def test_initialize_execution_runtime_runs_prewarm_after_bindings(monkeypatch) -> None:
+    runtime_module = importlib.import_module("tinker_server.backend.queue_execution_runtime")
+    calls: list[tuple[object, object]] = []
+    train_engine = object()
+    multi_model_manager = object()
+
+    async def _fake_initialize_execution_bindings():
+        return {
+            "inference_manager": object(),
+            "train_manager": object(),
+            "train_engine": train_engine,
+            "multi_model_manager": multi_model_manager,
+        }
+
+    async def _fake_prewarm(train_engine_arg, multi_model_manager_arg) -> None:
+        calls.append((train_engine_arg, multi_model_manager_arg))
+
+    monkeypatch.setattr(runtime_module, "_initialize_execution_bindings", _fake_initialize_execution_bindings)
+    monkeypatch.setattr(
+        "tinker_server.backend.persistent_prewarm.prewarm_persistent_models",
+        _fake_prewarm,
+    )
+
+    bindings = await runtime_module._initialize_execution_runtime(prewarm=True)
+
+    assert bindings["train_engine"] is train_engine
+    assert bindings["multi_model_manager"] is multi_model_manager
+    assert calls == [(train_engine, multi_model_manager)]
 
 
 def test_lifespan_follower_skips_leader_only_startup(monkeypatch) -> None:
@@ -426,7 +470,9 @@ def test_lifespan_follower_skips_leader_only_startup(monkeypatch) -> None:
     assert lease.heartbeat_started is False
     assert lease.released is True
     assert app_module.service.session_manager is None
-    assert queue_execution_runtime.ensure_started_calls == [1]
+    assert queue_execution_runtime.ensure_started_calls == [
+        {"num_workers": 1, "timeout_s": 120.0}
+    ]
     assert len(init_ray_calls) == 0
 
 
@@ -499,7 +545,9 @@ def test_lifespan_uses_started_probes_for_queue_and_future_store(monkeypatch) ->
     assert future_store.async_ensure_ready_calls == 0
     assert queue.async_ensure_started_calls == 1
     assert queue.async_ensure_ready_calls == 0
-    assert queue_execution_runtime.ensure_started_calls == [1]
+    assert queue_execution_runtime.ensure_started_calls == [
+        {"num_workers": 1, "timeout_s": 120.0}
+    ]
     assert lease.released is True
 
 
@@ -557,7 +605,9 @@ def test_lifespan_keeps_training_route_globals_unbound_in_stateless_api(monkeypa
     assert queue.started_workers == 0
     assert owner_runtime.started == 1
     assert lease.released is True
-    assert queue_execution_runtime.ensure_started_calls == [1]
+    assert queue_execution_runtime.ensure_started_calls == [
+        {"num_workers": 1, "timeout_s": 120.0}
+    ]
 
 
 def test_lifespan_local_queue_runtime_cleans_up_bound_handles(monkeypatch) -> None:
@@ -774,7 +824,9 @@ def test_lifespan_skips_tokenizer_preload_for_multi_worker_startup(monkeypatch) 
     asyncio.run(_run())
 
     assert preload_calls == []
-    assert queue_execution_runtime.ensure_started_calls == [1]
+    assert queue_execution_runtime.ensure_started_calls == [
+        {"num_workers": 1, "timeout_s": 120.0}
+    ]
 
 
 @pytest.mark.anyio
@@ -785,7 +837,7 @@ async def test_prewarm_raises_when_training_prewarm_unavailable_in_stateless_api
 
     with pytest.raises(
         RuntimeError,
-        match="persistent prewarm training configured but unavailable in API process",
+        match="persistent prewarm training configured but unavailable in the execution runtime",
     ):
         await app_module._prewarm_persistent_models(None, SimpleNamespace())
 

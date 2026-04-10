@@ -272,20 +272,23 @@ def ensure_ready() -> None:
         raise TypeError(f"Session index store returned non-list: {type(out)}")
 
 
-def upsert_session_index(info: dict[str, Any]) -> None:
+def _require_write_actor(op: str):
     import ray
 
     if not ray.is_initialized():
-        logger.warning("Session index store write skipped: Ray not initialized")
-        return
+        raise RuntimeError(f"Session index store write failed: {op}: Ray not initialized")
+    try:
+        return _get_or_create_actor()
+    except Exception as e:
+        raise RuntimeError(f"Session index store write failed: {op}: {e}") from e
+
+
+def upsert_session_index(info: dict[str, Any]) -> None:
     session_id = str(info.get("session_id") or "")
     if not session_id:
         return
-    try:
-        actor = _get_or_create_actor()
-        actor.upsert_session.remote(session_id, dict(info))
-    except Exception as e:
-        logger.warning("Session index store write failed: upsert_session: %s", e)
+    actor = _require_write_actor("upsert_session")
+    actor.upsert_session.remote(session_id, dict(info))
 
 
 def add_training_run_to_session(
@@ -295,18 +298,10 @@ def add_training_run_to_session(
     user_id: str | None = None,
     created_at: str | None = None,
 ) -> None:
-    import ray
-
-    if not ray.is_initialized():
-        logger.warning("Session index store write skipped: Ray not initialized")
-        return
     if not session_id or not training_run_id:
         return
-    try:
-        actor = _get_or_create_actor()
-        actor.add_training_run.remote(session_id, training_run_id, user_id, created_at)
-    except Exception as e:
-        logger.warning("Session index store write failed: add_training_run: %s", e)
+    actor = _require_write_actor("add_training_run")
+    actor.add_training_run.remote(session_id, training_run_id, user_id, created_at)
 
 
 def add_sampler_to_session(
@@ -316,18 +311,10 @@ def add_sampler_to_session(
     user_id: str | None = None,
     created_at: str | None = None,
 ) -> None:
-    import ray
-
-    if not ray.is_initialized():
-        logger.warning("Session index store write skipped: Ray not initialized")
-        return
     if not session_id or not sampler_id:
         return
-    try:
-        actor = _get_or_create_actor()
-        actor.add_sampler.remote(session_id, sampler_id, user_id, created_at)
-    except Exception as e:
-        logger.warning("Session index store write failed: add_sampler: %s", e)
+    actor = _require_write_actor("add_sampler")
+    actor.add_sampler.remote(session_id, sampler_id, user_id, created_at)
 
 
 def remove_sampler_from_session(session_id: str, sampler_id: str) -> None:
@@ -354,37 +341,31 @@ def add_heartbeat_sampler_to_session(
 ) -> None:
     import ray
 
-    if not ray.is_initialized():
-        logger.warning("Session index store write skipped: Ray not initialized")
-        return
     if not session_id or not sampler_id:
         return
+    actor = _require_write_actor("add_heartbeat_sampler")
     try:
-        actor = _get_or_create_actor()
-        try:
-            actor.add_heartbeat_sampler.remote(session_id, sampler_id, user_id, created_at)
-            return
-        except AttributeError:
-            logger.warning(
-                "Session index store actor missing add_heartbeat_sampler; using compatibility upsert"
-            )
-
-        actor.add_sampler.remote(session_id, sampler_id, user_id, created_at)
-        current = ray.get(actor.get_session.remote(session_id))
-        heartbeat_samplers = []
-        if isinstance(current, dict):
-            heartbeat_samplers = list(current.get("heartbeat_sampler_ids") or [])
-        if sampler_id not in heartbeat_samplers:
-            heartbeat_samplers.append(sampler_id)
-        actor.upsert_session.remote(
-            session_id,
-            {
-                "session_id": session_id,
-                "heartbeat_sampler_ids": heartbeat_samplers,
-            },
+        actor.add_heartbeat_sampler.remote(session_id, sampler_id, user_id, created_at)
+        return
+    except AttributeError:
+        logger.warning(
+            "Session index store actor missing add_heartbeat_sampler; using compatibility upsert"
         )
-    except Exception as e:
-        logger.warning("Session index store write failed: add_heartbeat_sampler: %s", e)
+
+    actor.add_sampler.remote(session_id, sampler_id, user_id, created_at)
+    current = ray.get(actor.get_session.remote(session_id))
+    heartbeat_samplers = []
+    if isinstance(current, dict):
+        heartbeat_samplers = list(current.get("heartbeat_sampler_ids") or [])
+    if sampler_id not in heartbeat_samplers:
+        heartbeat_samplers.append(sampler_id)
+    actor.upsert_session.remote(
+        session_id,
+        {
+            "session_id": session_id,
+            "heartbeat_sampler_ids": heartbeat_samplers,
+        },
+    )
 
 
 def get_session_index(session_id: str) -> dict[str, Any] | None:
@@ -426,19 +407,11 @@ async def async_list_session_index() -> list[dict[str, Any]]:
 
 
 def upsert_sampler_index(info: dict[str, Any]) -> None:
-    import ray
-
-    if not ray.is_initialized():
-        logger.warning("Session index store write skipped: Ray not initialized")
-        return
     sampler_id = str(info.get("sampler_id") or "")
     if not sampler_id:
         return
-    try:
-        actor = _get_or_create_actor()
-        actor.upsert_sampler.remote(sampler_id, dict(info))
-    except Exception as e:
-        logger.warning("Session index store write failed: upsert_sampler: %s", e)
+    actor = _require_write_actor("upsert_sampler")
+    actor.upsert_sampler.remote(sampler_id, dict(info))
 
 
 def delete_sampler_index(sampler_id: str) -> None:

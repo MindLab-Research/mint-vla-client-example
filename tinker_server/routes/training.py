@@ -1236,45 +1236,39 @@ async def _do_create_model(
         )
         _refresh_training_observability(model_id)
 
-        try:
-            from ..backend.training_session_store import upsert_training_session
+        from ..backend.training_session_store import upsert_training_session
 
-            actor_name = getattr(training_engine, "_resource_pool_actor_names", {}).get(model_id)
-            upsert_training_session({
-                "model_id": model_id,
-                "session_id": request.session_id,
-                "model_seq_id": request.model_seq_id,
-                "base_model": request.base_model,
-                "lora_config": request.lora_config.model_dump() if request.lora_config else None,
-                "rollout_correction_config": request.rollout_correction_config.model_dump(exclude_none=True)
-                if request.rollout_correction_config
-                else None,
-                "user_metadata": request.user_metadata or {},
-                "learning_rate": session.learning_rate,
-                "current_step": session.current_step,
-                "backend": session.backend,
-                "actor_name": actor_name,
-                "namespace": RAY_NAMESPACE,
-                "user_id": user_id,
-                "created_at": session.created_at,
-                "last_activity": session.last_activity,
-                "metadata_version": getattr(session, "metadata_version", 1),
-            })
-            training_manager.mark_persisted(model_id)
-        except Exception as e:
-            logger.warning("[create_model] training session store write failed: %s", e)
+        actor_name = getattr(training_engine, "_resource_pool_actor_names", {}).get(model_id)
+        upsert_training_session({
+            "model_id": model_id,
+            "session_id": request.session_id,
+            "model_seq_id": request.model_seq_id,
+            "base_model": request.base_model,
+            "lora_config": request.lora_config.model_dump() if request.lora_config else None,
+            "rollout_correction_config": request.rollout_correction_config.model_dump(exclude_none=True)
+            if request.rollout_correction_config
+            else None,
+            "user_metadata": request.user_metadata or {},
+            "learning_rate": session.learning_rate,
+            "current_step": session.current_step,
+            "backend": session.backend,
+            "actor_name": actor_name,
+            "namespace": RAY_NAMESPACE,
+            "user_id": user_id,
+            "created_at": session.created_at,
+            "last_activity": session.last_activity,
+            "metadata_version": getattr(session, "metadata_version", 1),
+        })
+        training_manager.mark_persisted(model_id)
 
-        try:
-            from ..backend.session_index_store import add_training_run_to_session
+        from ..backend.session_index_store import add_training_run_to_session
 
-            add_training_run_to_session(
-                session_id=request.session_id,
-                training_run_id=model_id,
-                user_id=user_id,
-                created_at=session.created_at,
-            )
-        except Exception as e:
-            logger.warning("[create_model] session index write failed: %s", e)
+        add_training_run_to_session(
+            session_id=request.session_id,
+            training_run_id=model_id,
+            user_id=user_id,
+            created_at=session.created_at,
+        )
 
         response = CreateModelResponse(
             request_id=request_id,
@@ -1618,45 +1612,39 @@ async def _do_create_model_from_state(
         )
         _refresh_training_observability(model_id)
 
-        try:
-            from ..backend.training_session_store import upsert_training_session
+        from ..backend.training_session_store import upsert_training_session
 
-            actor_name = getattr(training_engine, "_resource_pool_actor_names", {}).get(model_id)
-            upsert_training_session({
-                "model_id": model_id,
-                "session_id": request.session_id,
-                "model_seq_id": request.model_seq_id,
-                "base_model": request.base_model,
-                "lora_config": request.lora_config.model_dump() if request.lora_config else None,
-                "rollout_correction_config": request.rollout_correction_config.model_dump(exclude_none=True)
-                if request.rollout_correction_config
-                else None,
-                "user_metadata": request.user_metadata or {},
-                "learning_rate": session.learning_rate,
-                "current_step": session.current_step,
-                "backend": session.backend,
-                "actor_name": actor_name,
-                "namespace": RAY_NAMESPACE,
-                "user_id": user_id,
-                "created_at": session.created_at,
-                "last_activity": session.last_activity,
-                "metadata_version": getattr(session, "metadata_version", 1),
-            })
-            training_manager.mark_persisted(model_id)
-        except Exception as e:
-            logger.warning("[create_model_from_state] training session store write failed: %s", e)
+        actor_name = getattr(training_engine, "_resource_pool_actor_names", {}).get(model_id)
+        upsert_training_session({
+            "model_id": model_id,
+            "session_id": request.session_id,
+            "model_seq_id": request.model_seq_id,
+            "base_model": request.base_model,
+            "lora_config": request.lora_config.model_dump() if request.lora_config else None,
+            "rollout_correction_config": request.rollout_correction_config.model_dump(exclude_none=True)
+            if request.rollout_correction_config
+            else None,
+            "user_metadata": request.user_metadata or {},
+            "learning_rate": session.learning_rate,
+            "current_step": session.current_step,
+            "backend": session.backend,
+            "actor_name": actor_name,
+            "namespace": RAY_NAMESPACE,
+            "user_id": user_id,
+            "created_at": session.created_at,
+            "last_activity": session.last_activity,
+            "metadata_version": getattr(session, "metadata_version", 1),
+        })
+        training_manager.mark_persisted(model_id)
 
-        try:
-            from ..backend.session_index_store import add_training_run_to_session
+        from ..backend.session_index_store import add_training_run_to_session
 
-            add_training_run_to_session(
-                session_id=request.session_id,
-                training_run_id=model_id,
-                user_id=user_id,
-                created_at=session.created_at,
-            )
-        except Exception as e:
-            logger.warning("[create_model_from_state] session index write failed: %s", e)
+        add_training_run_to_session(
+            session_id=request.session_id,
+            training_run_id=model_id,
+            user_id=user_id,
+            created_at=session.created_at,
+        )
 
         logger.info(
             f"[{model_id}] Created model from state: {request.state_path} "
