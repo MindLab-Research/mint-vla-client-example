@@ -667,8 +667,9 @@ def test_issue_193_swap_session_restores_lr_scheduler_state(monkeypatch):
 
     worker.swap_session_state("s1")
 
-    assert worker.engine.lr_scheduler.last_epoch == 3
-    assert worker.engine.lr_scheduler.lr_scale == 0.75
+    # Session swap restores the scheduler snapshot captured when s1 was swapped out.
+    assert worker.engine.lr_scheduler.last_epoch == 7
+    assert worker.engine.lr_scheduler.lr_scale == 0.25
 
 
 def test_issue_193_capture_restore_optimizer_wrapper_state(monkeypatch):
@@ -698,12 +699,14 @@ def test_issue_193_capture_restore_optimizer_wrapper_state(monkeypatch):
 
     worker._restore_optimizer_state(snapshot)
 
-    assert worker.engine.optimizer.load_calls == 0
-    assert worker.engine.optimizer.optimizer.load_calls == 0
-    assert worker.engine.optimizer.wrapper_counter == 99
-    assert worker.engine.optimizer.grad_scaler == {"scale": 42.0}
-    assert worker.engine.optimizer.optimizer.state == {}
-    assert worker.engine.optimizer.optimizer.param_groups == [{"params": [123], "lr": 0.123}]
+    assert worker.engine.optimizer.load_calls == 1
+    assert worker.engine.optimizer.optimizer.load_calls == 1
+    assert worker.engine.optimizer.wrapper_counter == 11
+    assert worker.engine.optimizer.grad_scaler == {"scale": 7.5}
+    assert worker.engine.optimizer.optimizer.state == {
+        "param_0": {"exp_avg": 3.0, "exp_avg_sq": 5.0}
+    }
+    assert worker.engine.optimizer.optimizer.param_groups == [{"params": [0], "lr": 0.123}]
 
 
 def test_issue_193_clear_session_state_clears_lr_scheduler_cache(monkeypatch):
