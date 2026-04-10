@@ -466,6 +466,7 @@ def test_issue_193_megatron_load_checkpoint_uses_explicit_load_prepare(tmp_path:
                 "train_attn": None,
                 "train_mlp": None,
                 "train_unembed": None,
+                "reload_optimizer_model_params": False,
             },
         )
     ]

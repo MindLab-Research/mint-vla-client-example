@@ -6130,8 +6130,7 @@ class MegatronWorkerGroup:
         if session_id is None:
             return
         self._bind_traceparent(traceparent)
-        current_session = getattr(self, "_current_session", None)
-        if current_session == session_id:
+        if self._current_session == session_id:
             return
         session_manager = getattr(self, "_session_manager", None)
         current_is_dirty = False
@@ -6139,24 +6138,24 @@ class MegatronWorkerGroup:
         target_has_actor_only_state = False
         if session_manager is not None:
             has_actor_only_state = getattr(session_manager, "has_actor_only_state", None)
-            if callable(has_actor_only_state) and current_session is not None:
-                current_is_dirty = bool(has_actor_only_state(current_session))
+            if callable(has_actor_only_state) and self._current_session is not None:
+                current_is_dirty = bool(has_actor_only_state(self._current_session))
                 target_has_actor_only_state = bool(has_actor_only_state(session_id))
             session_exists = getattr(session_manager, "session_exists", None)
             if callable(session_exists):
                 target_exists = bool(session_exists(session_id))
 
-        if current_session is not None and session_manager is not None and current_is_dirty:
-            old_path = session_manager.get_session_path(current_session)
-            logger.info(f"[MegatronWorkerGroup] Saving outgoing session {current_session}")
+        if self._current_session is not None and session_manager is not None and current_is_dirty:
+            old_path = session_manager.get_session_path(self._current_session)
+            logger.info(f"[MegatronWorkerGroup] Saving outgoing session {self._current_session}")
             self.save_adapter_state(old_path, traceparent=traceparent)
             save_metadata = getattr(session_manager, "save_metadata", None)
             if save_metadata is not None:
                 save_metadata(
-                    current_session,
-                    getattr(self, "_step_count", 0),
-                    getattr(self, "learning_rate", None),
-                    getattr(self, "_actual_rank", None),
+                    self._current_session,
+                    self._step_count,
+                    self.learning_rate,
+                    self._actual_rank,
                 )
         clear_refs = [
             w.clear_session_state.remote(session_id, traceparent=traceparent)

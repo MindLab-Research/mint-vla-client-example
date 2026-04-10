@@ -1476,88 +1476,81 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
                 continue
             seen.add(key)
 
-            view_paths: list[str] = []
-            flat_metadata = os.path.join(ckpt_path, "metadata.json")
-            if os.path.exists(flat_metadata):
-                view_paths.append(ckpt_path)
-            for checkpoint_type in ("training", "sampler"):
-                typed_path = os.path.join(ckpt_path, checkpoint_type)
-                if os.path.isdir(typed_path) and os.path.exists(os.path.join(typed_path, "metadata.json")):
-                    view_paths.append(typed_path)
+            metadata_path = os.path.join(ckpt_path, "metadata.json")
+            if not os.path.exists(metadata_path):
+                continue  # refuse unauthenticated legacy dirs
+            try:
+                import json
 
-            for view_path in view_paths:
-                metadata_path = os.path.join(view_path, "metadata.json")
+                with open(metadata_path) as f:
+                    metadata = json.load(f)
+            except Exception:
+                continue
+
+            if metadata.get("model_id") != model_id:
+                continue
+            if not is_admin_request(request) and metadata.get("owner_id") != user_id:
+                continue
+
+            # Try to parse step from directory name
+            step = None
+            if name.startswith("checkpoint-"):
                 try:
-                    import json
+                    step = int(name.split("-")[1])
+                except (IndexError, ValueError):
+                    pass
 
-                    with open(metadata_path) as f:
-                        metadata = json.load(f)
-                except Exception:
-                    continue
+            created_at = datetime.fromtimestamp(os.path.getctime(ckpt_path)).isoformat()
+            checkpoint_type = metadata.get("checkpoint_type")
+            if checkpoint_type not in ("training", "sampler"):
+                continue
+            try:
+                if checkpoint_type == "sampler":
+                    validate_sampler_checkpoint_for_sampling(ckpt_path)
+                else:
+                    validate_checkpoint_dir(ckpt_path, checkpoint_type=checkpoint_type)
+            except ValueError:
+                continue
+            storage_tier = metadata.get("storage_tier")
+            mirror_status = metadata.get("mirror_status")
+            mirror_error = metadata.get("mirror_error")
 
-                if metadata.get("model_id") != model_id:
-                    continue
-                if not is_admin_request(request) and metadata.get("owner_id") != user_id:
-                    continue
+            created_at = metadata.get("created_at") or created_at
+            try:
+                created_time = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            except Exception:
+                created_time = datetime.fromtimestamp(os.path.getctime(ckpt_path))
 
-                step = None
-                if name.startswith("checkpoint-"):
-                    try:
-                        step = int(name.split("-")[1])
-                    except (IndexError, ValueError):
-                        pass
+            checkpoint_id = (
+                f"weights/{name}" if checkpoint_type == "training" else f"sampler_weights/{name}"
+            )
+            tinker_path = checkpoint_uri(
+                model_id,
+                name,
+                prefer_tinker=True,
+                checkpoint_type=checkpoint_type,
+            )
+            path_uri = checkpoint_uri(
+                model_id,
+                name,
+                prefer_tinker=prefer_tinker,
+                checkpoint_type=checkpoint_type,
+            )
 
-                created_at = datetime.fromtimestamp(os.path.getctime(view_path)).isoformat()
-                checkpoint_type = metadata.get("checkpoint_type")
-                if checkpoint_type not in ("training", "sampler"):
-                    continue
-                try:
-                    if checkpoint_type == "sampler":
-                        validate_sampler_checkpoint_for_sampling(view_path)
-                    else:
-                        validate_checkpoint_dir(view_path, checkpoint_type=checkpoint_type)
-                except ValueError:
-                    continue
-                storage_tier = metadata.get("storage_tier")
-                mirror_status = metadata.get("mirror_status")
-                mirror_error = metadata.get("mirror_error")
-
-                created_at = metadata.get("created_at") or created_at
-                try:
-                    created_time = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-                except Exception:
-                    created_time = datetime.fromtimestamp(os.path.getctime(view_path))
-
-                checkpoint_id = (
-                    f"weights/{name}" if checkpoint_type == "training" else f"sampler_weights/{name}"
-                )
-                tinker_path = checkpoint_uri(
-                    model_id,
-                    name,
-                    prefer_tinker=True,
+            _store_checkpoint(
+                CheckpointInfo(
+                    checkpoint_id=checkpoint_id,
                     checkpoint_type=checkpoint_type,
+                    time=created_time,
+                    tinker_path=tinker_path,
+                    path=path_uri,
+                    step=step,
+                    created_at=created_at,
+                    storage_tier=storage_tier,
+                    mirror_status=mirror_status,
+                    mirror_error=mirror_error,
                 )
-                path_uri = checkpoint_uri(
-                    model_id,
-                    name,
-                    prefer_tinker=prefer_tinker,
-                    checkpoint_type=checkpoint_type,
-                )
-
-                _store_checkpoint(
-                    CheckpointInfo(
-                        checkpoint_id=checkpoint_id,
-                        checkpoint_type=checkpoint_type,
-                        time=created_time,
-                        tinker_path=tinker_path,
-                        path=path_uri,
-                        step=step,
-                        created_at=created_at,
-                        storage_tier=storage_tier,
-                        mirror_status=mirror_status,
-                        mirror_error=mirror_error,
-                    )
-                )
+            )
 
     # Also include uploaded checkpoints stored as /checkpoints/{owner}/{checkpoint_id}/ if metadata.model_id matches.
     owner_roots: list[str]
@@ -1776,20 +1769,7 @@ async def download_checkpoint_archive(
     # This avoids false 404s when both "training" and "sampler" checkpoints share the same name.
     import json
 
-    existing: list[str] = []
-    seen_paths: set[str] = set()
-    for p in candidates:
-        for candidate in (
-            os.path.join(p, expected_type) if expected_type in ("training", "sampler") else None,
-            p,
-        ):
-            if not candidate or not os.path.isdir(candidate):
-                continue
-            real = os.path.realpath(candidate)
-            if real in seen_paths:
-                continue
-            seen_paths.add(real)
-            existing.append(candidate)
+    existing = [p for p in candidates if os.path.isdir(p)]
     if not existing:
         raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found")
 
@@ -1839,10 +1819,10 @@ async def download_checkpoint_archive(
 
     def stream_tar_gz():
         """Stream tar.gz via subprocess to avoid memory explosion."""
-        archive_name = os.path.basename(ckpt_path)
+        # Run tar in parent directory, archive the checkpoint_id folder
         parent_dir = os.path.dirname(ckpt_path)
         proc = subprocess.Popen(
-            ["tar", "czf", "-", archive_name],
+            ["tar", "czf", "-", checkpoint_name],
             cwd=parent_dir,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,

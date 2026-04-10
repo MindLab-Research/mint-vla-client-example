@@ -183,7 +183,9 @@ def test_issue_193_megatron_load_weights_missing_actor_can_recreate_from_checkpo
 
     asyncio.run(_run())
 
-    assert get_live_calls == [("load_weights", False)]
+    assert get_live_calls[0] == ("load_weights", False)
+    assert get_live_calls[-1] == ("load_weights", False)
+    assert len(get_live_calls) == 3
     assert worker.mark_session_loaded.calls == [
         (
             (model_id,),

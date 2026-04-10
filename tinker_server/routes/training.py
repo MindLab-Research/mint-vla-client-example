@@ -601,13 +601,9 @@ async def _best_effort_delete_training_session(
     shutdown_attempted = False
     if session is not None:
         if allow_actor_shutdown:
-            shutdown = getattr(training_engine, "shutdown_session", None)
-            if shutdown is None:
-                shutdown = getattr(training_engine, "delete_session", None)
             try:
                 shutdown_attempted = True
-                if shutdown is not None:
-                    await shutdown(session)
+                await training_engine.shutdown_session(session)
             except Exception as e:
                 logger.warning(
                     "[%s] best-effort stale training cleanup shutdown failed (%s): %s: %s",
@@ -692,17 +688,6 @@ def _training_run_from_info(info: dict) -> TrainingRun:
         except Exception:
             pass
 
-    raw_last_activity = info.get("last_activity")
-    last_activity = None
-    idle_for_s = None
-    if raw_last_activity is not None:
-        try:
-            last_activity = float(raw_last_activity)
-            idle_for_s = max(0.0, time.time() - last_activity)
-        except (TypeError, ValueError, OverflowError):
-            last_activity = None
-            idle_for_s = None
-
     return TrainingRun(
         training_run_id=str(info.get("model_id", "")),
         base_model=str(info.get("base_model", "")),
@@ -713,8 +698,6 @@ def _training_run_from_info(info: dict) -> TrainingRun:
         last_request_time=str(
             info.get("last_request_time") or info.get("created_at") or datetime.now().isoformat()
         ),
-        last_activity=last_activity,
-        idle_for_s=idle_for_s,
         last_checkpoint=None,
         last_sampler_checkpoint=None,
         user_metadata=info.get("user_metadata") or {},
@@ -733,24 +716,6 @@ def _compute_token_stats(data: list[Datum]) -> tuple[int, int]:
         if seq_len > max_seq_len:
             max_seq_len = seq_len
     return total_tokens, max_seq_len
-
-
-def _validate_training_batch_has_explicit_loss_masks_or_422(data: list[Datum]) -> None:
-    for i, datum in enumerate(data):
-        loss_inputs = getattr(datum, "loss_fn_inputs", None)
-        if loss_inputs is None:
-            raise HTTPException(status_code=422, detail=f"Item {i} missing loss_mask/mask/weights")
-        keys = set()
-        if hasattr(loss_inputs, "keys"):
-            try:
-                keys.update(str(k) for k in loss_inputs.keys())
-            except Exception:
-                pass
-        for key in ("loss_mask", "mask", "weights"):
-            if key in keys or getattr(loss_inputs, key, None) is not None:
-                break
-        else:
-            raise HTTPException(status_code=422, detail=f"Item {i} missing loss_mask/mask/weights")
 
 
 def _normalize_megatron_scheduler_domain_key(base_model: str) -> str:
@@ -890,26 +855,6 @@ def _build_create_scheduler_extra(
         "scheduler_session_key": str(model_id),
         "execution_serial_key": f"training_session:{model_id}",
         "training_op": str(training_op),
-    }
-
-
-def _build_training_queued_meta(
-    *,
-    op: str,
-    model_id: str,
-    session_info: dict[str, Any],
-    seq_id: int | None = None,
-) -> dict[str, Any]:
-    return {
-        "op": op,
-        "model_id": model_id,
-        "session_id": str(session_info.get("session_id") or model_id),
-        "base_model": session_info.get("base_model"),
-        "backend": session_info.get("backend"),
-        "seq_id": seq_id,
-        "queue_state": "queued",
-        "stage": "queued",
-        "queued_at": time.time(),
     }
 
 
@@ -1725,8 +1670,6 @@ async def forward_backward(
 ) -> UntypedAPIFuture:
     """Perform forward + backward pass on training data."""
     route_start_s = time.perf_counter()
-    if request.forward_backward_input.loss_fn == "importance_sampling":
-        _validate_training_batch_has_explicit_loss_masks_or_422(request.forward_backward_input.data)
     from ..gateway import (
         async_remote_training_model,
         encode_request_id,
@@ -1832,12 +1775,7 @@ async def forward_backward(
         created = True
         await future_store.async_mark_queued(
             request_id,
-            meta=_build_training_queued_meta(
-                op="training.forward_backward",
-                model_id=request.model_id,
-                session_info=route_session_info,
-                seq_id=request.seq_id,
-            ),
+            meta={"op": "training.forward_backward", "model_id": request.model_id},
         )
         await _enqueue_training_request_with_trace(
             route_start_s=route_start_s,
@@ -1969,8 +1907,6 @@ async def train_step(
 ) -> UntypedAPIFuture:
     """Perform a combined forward_backward + optim_step."""
     route_start_s = time.perf_counter()
-    if request.forward_backward_input.loss_fn == "importance_sampling":
-        _validate_training_batch_has_explicit_loss_masks_or_422(request.forward_backward_input.data)
     from ..gateway import (
         async_remote_training_model,
         encode_request_id,
@@ -2071,15 +2007,7 @@ async def train_step(
             scheduler_extra["gateway_auth"] = gateway_auth.__dict__
         await future_store.async_create_with_id(request_id)
         created = True
-        await future_store.async_mark_queued(
-            request_id,
-            meta=_build_training_queued_meta(
-                op="training.train_step",
-                model_id=request.model_id,
-                session_info=route_session_info,
-                seq_id=request.seq_id,
-            ),
-        )
+        await future_store.async_mark_queued(request_id, meta={"op": "training.train_step", "model_id": request.model_id})
         await _enqueue_training_request_with_trace(
             route_start_s=route_start_s,
             request_id=request_id,
@@ -2525,15 +2453,7 @@ async def optim_step(
         )
         await future_store.async_create_with_id(request_id)
         created = True
-        await future_store.async_mark_queued(
-            request_id,
-            meta=_build_training_queued_meta(
-                op="training.optim_step",
-                model_id=request.model_id,
-                session_info=route_session_info,
-                seq_id=request.seq_id,
-            ),
-        )
+        await future_store.async_mark_queued(request_id, meta={"op": "training.optim_step", "model_id": request.model_id})
         await _enqueue_training_request_with_trace(
             route_start_s=route_start_s,
             request_id=request_id,
@@ -3262,15 +3182,6 @@ async def get_model_info(model_id: str):
         _drop_local_training_session(model_id)
         raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
 
-    last_activity = info.get("last_activity")
-    idle_for_s = None
-    if last_activity is not None:
-        try:
-            last_activity = float(last_activity)
-            idle_for_s = max(0.0, time.time() - last_activity)
-        except (TypeError, ValueError, OverflowError):
-            last_activity = None
-
     return {
         "model_id": str(info.get("model_id") or model_id),
         "session_id": info.get("session_id"),
@@ -3284,8 +3195,6 @@ async def get_model_info(model_id: str):
         "is_active": info.get("is_active", False),
         "backend": info.get("backend"),
         "user_id": info.get("user_id"),
-        "last_activity": last_activity,
-        "idle_for_s": idle_for_s,
     }
 
 
@@ -3372,14 +3281,6 @@ async def list_models():
         model_id = str(info.get("model_id") or "")
         if not model_id:
             continue
-        last_activity = info.get("last_activity")
-        idle_for_s = None
-        if last_activity is not None:
-            try:
-                last_activity = float(last_activity)
-                idle_for_s = max(0.0, time.time() - last_activity)
-            except (TypeError, ValueError, OverflowError):
-                last_activity = None
         models.append(
             {
                 "model_id": info.get("model_id"),
@@ -3389,8 +3290,6 @@ async def list_models():
                 "created_at": info.get("created_at"),
                 "current_step": info.get("current_step", 0),
                 "is_active": info.get("is_active", False),
-                "last_activity": last_activity,
-                "idle_for_s": idle_for_s,
             }
         )
 
@@ -3456,12 +3355,7 @@ async def _do_delete_model(request_id: str, model_id: str) -> None:
 
         session = training_manager.get_session(model_id)
         if session is not None:
-            shutdown = getattr(training_engine, "shutdown_session", None)
-            if shutdown is None:
-                shutdown = getattr(training_engine, "delete_session", None)
-            if shutdown is None:
-                raise AttributeError("training_engine has neither shutdown_session nor delete_session")
-            await shutdown(session)
+            await training_engine.shutdown_session(session)
             training_manager.delete_session(model_id)
 
         try:
