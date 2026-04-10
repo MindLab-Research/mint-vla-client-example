@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from ..auth_identity import get_user_data as _request_user_data
 from ..auth_identity import get_user_id as _request_user_id
@@ -372,6 +373,7 @@ async def _create_sampling_session_impl(
         try:
             from ..backend.session_index_store import add_sampler_to_session, upsert_sampler_index
 
+            # Generic create_sampling_session children stay out of root heartbeat fanout.
             add_sampler_to_session(
                 session_id=request.session_id,
                 sampler_id=sampler_id,
@@ -794,21 +796,83 @@ def _load_adapter_from_path(adapter_path: str, lora_rank: int) -> tuple[dict, di
     return state_dict, peft_config
 
 
+async def _child_sampler_ids_for_heartbeat(
+    root_session_id: str,
+    request_user_data: dict | None,
+) -> list[str]:
+    try:
+        from ..backend.session_index_store import get_session_index
+
+        info = await run_in_threadpool(get_session_index, root_session_id)
+    except Exception as e:
+        logger.warning("[session_heartbeat] session index lookup failed for %s: %s", root_session_id, e)
+        return []
+
+    if not isinstance(info, dict):
+        return []
+    if not _user_visible(request_user_data, info.get("user_id")):
+        logger.warning("[session_heartbeat] child sampler propagation denied for %s", root_session_id)
+        return []
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for sampler_id in info.get("heartbeat_sampler_ids") or []:
+        if not isinstance(sampler_id, str) or not sampler_id or sampler_id in seen:
+            continue
+        seen.add(sampler_id)
+        out.append(sampler_id)
+    return out
+
+
+async def _touch_child_sampler_sessions(root_session_id: str, request_user_data: dict | None) -> None:
+    if session_manager is None:
+        return
+    for sampler_id in await _child_sampler_ids_for_heartbeat(root_session_id, request_user_data):
+        session_manager.mark_session_inflight(sampler_id, 0)
+
+
+async def _update_session_heartbeat_store(session_id: str) -> None:
+    async_update = getattr(session_heartbeat_store, "async_update", None)
+    if callable(async_update):
+        await async_update(session_id)
+        return
+    update = getattr(session_heartbeat_store, "update", None)
+    if callable(update):
+        update(session_id)
+        return
+    raise AttributeError("session_heartbeat_store has neither async_update nor update")
+
+
 @router.post("/session_heartbeat")
 async def session_heartbeat(
     request: SessionHeartbeatRequest,
+    http_request: Request = None,
 ) -> SessionHeartbeatResponse:
     """Keep session alive.
 
     Accepts heartbeat and returns acknowledgment. Session validation not implemented.
     """
-    await session_heartbeat_store.async_update(request.session_id)
+    await _update_session_heartbeat_store(request.session_id)
     try:
         from ..backend.sampling_session_store import async_set_sampling_session_last_activity
 
         await async_set_sampling_session_last_activity(request.session_id, time.time())
     except Exception as e:
-        raise HTTPException(status_code=503, detail="Sampling session store unavailable") from e
+        if session_manager is None:
+            raise HTTPException(status_code=503, detail="Sampling session store unavailable") from e
+        logger.warning(
+            "[session_heartbeat] detached sampling last_activity update failed for %s: %s: %s",
+            request.session_id,
+            type(e).__name__,
+            e,
+        )
+    if session_manager is not None:
+        # Keep the root session alive and refresh heartbeat-eligible child sampler sessions.
+        session_manager.mark_session_inflight(request.session_id, 0)
+        await _touch_child_sampler_sessions(
+            request.session_id,
+            _get_user_data(http_request) if http_request is not None else None,
+        )
     return SessionHeartbeatResponse()
 
 

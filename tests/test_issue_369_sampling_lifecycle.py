@@ -171,7 +171,7 @@ async def test_issue_369_sampling_heartbeat_updates_detached_last_activity(monke
     assert touched[1][0] == "sampling_last_activity"
     assert touched[1][1] == "sess-heartbeat"
     assert touched[1][2] is True
-    assert local_refresh == []
+    assert local_refresh == [("sess-heartbeat", 0)]
 
 
 def test_issue_369_session_manager_base_model_getter_restores_from_detached_store(monkeypatch) -> None:

@@ -744,6 +744,18 @@ def _compute_token_stats(data: list[Datum]) -> tuple[int, int]:
     return total_tokens, max_seq_len
 
 
+def _validate_training_batch_has_explicit_loss_masks_or_422(data: list[Datum]) -> None:
+    """Reject batches that omit the explicit per-token training mask contract."""
+    for item_index, datum in enumerate(data):
+        loss_fn_inputs = datum.loss_fn_inputs or {}
+        if any(key in loss_fn_inputs for key in ("loss_mask", "mask", "weights")):
+            continue
+        raise HTTPException(
+            status_code=422,
+            detail=f"Item {item_index} missing loss_mask/mask/weights",
+        )
+
+
 def _normalize_megatron_scheduler_domain_key(base_model: str) -> str:
     hf_cache_pattern = r"models--([^/]+)--([^/]+)/snapshots"
     match = re.search(hf_cache_pattern, base_model)
@@ -1708,6 +1720,7 @@ async def forward_backward(
         upstream_for_alias,
     )
 
+    _validate_training_batch_has_explicit_loss_masks_or_422(request.forward_backward_input.data)
     route_session_info = await _get_training_route_session_info(request.model_id)
 
     if not isinstance(route_session_info, dict):
@@ -1945,6 +1958,7 @@ async def train_step(
         upstream_for_alias,
     )
 
+    _validate_training_batch_has_explicit_loss_masks_or_422(request.forward_backward_input.data)
     route_session_info = await _get_training_route_session_info(request.model_id)
 
     if not isinstance(route_session_info, dict):
@@ -3087,10 +3101,10 @@ async def _do_save_weights_for_sampler(
                 )
 
             try:
-                from ..backend.session_index_store import add_sampler_to_session, upsert_sampler_index
+                from ..backend.session_index_store import add_heartbeat_sampler_to_session, upsert_sampler_index
 
                 created_at = datetime.now().isoformat()
-                add_sampler_to_session(
+                add_heartbeat_sampler_to_session(
                     session_id=session.session_id,
                     sampler_id=sampling_session_id,
                     user_id=user_id,
