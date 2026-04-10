@@ -402,15 +402,15 @@ async def retrieve_future(
             meta = None
         if isinstance(meta, dict):
             actor_name = meta.get("actor_name")
-            session_id = meta.get("model_id")
+            tracked_session_id = meta.get("model_id")
             if actor_name:
                 try:
                     from ..backend.resource_pool import get_resource_pool
 
                     rp = get_resource_pool()
                     rp.touch(actor_name)
-                    if session_id:
-                        rp.set_session(actor_name, session_id)
+                    if tracked_session_id:
+                        rp.set_session(actor_name, tracked_session_id)
                 except Exception:
                     pass
 
@@ -436,6 +436,12 @@ async def retrieve_future(
         generate_s = None
         scheduler_domain_key_source = None
         scheduler_capacity_owner = None
+        model_id = None
+        session_id = None
+        sampling_session_id = None
+        seq_id = None
+        base_model = None
+        backend = None
         if isinstance(meta, dict):
             queue_state = meta.get("queue_state")
             queue_state_reason = meta.get("queue_state_reason")
@@ -458,6 +464,12 @@ async def retrieve_future(
             generate_s = meta.get("generate_s")
             scheduler_domain_key_source = meta.get("scheduler_domain_key_source")
             scheduler_capacity_owner = meta.get("scheduler_capacity_owner")
+            model_id = meta.get("model_id")
+            session_id = meta.get("session_id")
+            sampling_session_id = meta.get("sampling_session_id")
+            seq_id = meta.get("seq_id")
+            base_model = meta.get("base_model")
+            backend = meta.get("backend")
         if not isinstance(queue_state_reason, str) or not queue_state_reason.strip():
             queue_state_reason = None
 
@@ -637,6 +649,12 @@ async def retrieve_future(
                 "scheduler_session_id": scheduler_session_id,
                 "scheduler_domain_key_source": scheduler_domain_key_source,
                 "scheduler_capacity_owner": scheduler_capacity_owner,
+                "model_id": model_id,
+                "session_id": session_id,
+                "sampling_session_id": sampling_session_id,
+                "seq_id": seq_id,
+                "base_model": base_model,
+                "backend": backend,
                 "queue_depth_legacy": queue_depth_legacy,
                 "queue_depth_scheduled": queue_depth_scheduled,
                 "queue_depth_domain": queue_depth_domain,

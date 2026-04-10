@@ -117,6 +117,38 @@ def _build_execution_serial_extra(*, model_id: str, extra: dict | None = None) -
     return payload
 
 
+def _build_weights_future_meta(
+    *,
+    op: str,
+    model_id: str,
+    store_info: dict | None = None,
+    seq_id: int | None = None,
+) -> dict[str, Any]:
+    meta: dict[str, Any] = {
+        "op": str(op),
+        "model_id": str(model_id),
+        "queue_state": "queued",
+        "stage": "queued",
+        "queued_at": time.time(),
+    }
+    if isinstance(store_info, dict):
+        session_id = store_info.get("session_id")
+        base_model = store_info.get("base_model")
+        backend = store_info.get("backend")
+        if session_id:
+            meta["session_id"] = str(session_id)
+        if base_model:
+            meta["base_model"] = str(base_model)
+        if backend:
+            meta["backend"] = str(backend)
+    if seq_id is not None:
+        try:
+            meta["seq_id"] = int(seq_id)
+        except Exception:
+            meta["seq_id"] = None
+    return meta
+
+
 async def _get_route_training_store_info(model_id: str) -> dict | None:
     from ..routes.training import _get_training_route_session_info
 
@@ -577,7 +609,15 @@ async def save_weights(
             inflight_marked = True
         await future_store.async_create_with_id(request_id)
         created = True
-        await future_store.async_mark_queued(request_id, meta={"op": "weights.save_weights", "model_id": request.model_id})
+        await future_store.async_mark_queued(
+            request_id,
+            meta=_build_weights_future_meta(
+                op="weights.save_weights",
+                model_id=request.model_id,
+                store_info=store_info,
+                seq_id=getattr(request, "seq_id", None),
+            ),
+        )
         await _enqueue_weights_request_with_trace(
             route_start_s=route_start_s,
             request_id=request_id,
@@ -703,7 +743,15 @@ async def save_state(
             inflight_marked = True
         await future_store.async_create_with_id(request_id)
         created = True
-        await future_store.async_mark_queued(request_id, meta={"op": "weights.save_state", "model_id": request.model_id})
+        await future_store.async_mark_queued(
+            request_id,
+            meta=_build_weights_future_meta(
+                op="weights.save_state",
+                model_id=request.model_id,
+                store_info=store_info,
+                seq_id=getattr(request, "seq_id", None),
+            ),
+        )
         await _enqueue_weights_request_with_trace(
             route_start_s=route_start_s,
             request_id=request_id,
@@ -1232,7 +1280,15 @@ async def load_state(
             inflight_marked = True
         await future_store.async_create_with_id(request_id)
         created = True
-        await future_store.async_mark_queued(request_id, meta={"op": "weights.load_state", "model_id": request.model_id})
+        await future_store.async_mark_queued(
+            request_id,
+            meta=_build_weights_future_meta(
+                op="weights.load_state",
+                model_id=request.model_id,
+                store_info=store_info,
+                seq_id=getattr(request, "seq_id", None),
+            ),
+        )
         await _enqueue_weights_request_with_trace(
             route_start_s=route_start_s,
             request_id=request_id,

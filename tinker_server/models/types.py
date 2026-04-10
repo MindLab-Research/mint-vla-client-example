@@ -266,6 +266,8 @@ class TrainingRun(BaseModel):
     corrupted: bool
     lora_rank: int | None = None
     last_request_time: str | None = None
+    last_activity: float | None = None
+    idle_for_s: float | None = None
     last_checkpoint: Any | None = None
     last_sampler_checkpoint: Any | None = None
     user_metadata: dict[str, Any] | None = None
