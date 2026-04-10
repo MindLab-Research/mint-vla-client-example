@@ -714,6 +714,10 @@ def _training_run_from_info(info: dict) -> TrainingRun:
         except Exception:
             pass
 
+    raw_last_activity = info.get("last_activity")
+    last_activity = float(raw_last_activity) if isinstance(raw_last_activity, (int, float)) else None
+    idle_for_s = max(0.0, time.time() - last_activity) if last_activity is not None else None
+
     return TrainingRun(
         training_run_id=str(info.get("model_id", "")),
         base_model=str(info.get("base_model", "")),
@@ -724,6 +728,8 @@ def _training_run_from_info(info: dict) -> TrainingRun:
         last_request_time=str(
             info.get("last_request_time") or info.get("created_at") or datetime.now().isoformat()
         ),
+        last_activity=last_activity,
+        idle_for_s=idle_for_s,
         last_checkpoint=None,
         last_sampler_checkpoint=None,
         user_metadata=info.get("user_metadata") or {},
@@ -742,6 +748,18 @@ def _compute_token_stats(data: list[Datum]) -> tuple[int, int]:
         if seq_len > max_seq_len:
             max_seq_len = seq_len
     return total_tokens, max_seq_len
+
+
+def _validate_training_batch_has_explicit_loss_masks_or_422(data: list[Datum]) -> None:
+    """Reject batches that omit the explicit per-token training mask contract."""
+    for item_index, datum in enumerate(data):
+        loss_fn_inputs = datum.loss_fn_inputs or {}
+        if any(key in loss_fn_inputs for key in ("loss_mask", "mask", "weights")):
+            continue
+        raise HTTPException(
+            status_code=422,
+            detail=f"Item {item_index} missing loss_mask/mask/weights",
+        )
 
 
 def _normalize_megatron_scheduler_domain_key(base_model: str) -> str:
@@ -890,6 +908,41 @@ def _build_create_scheduler_extra(
     }
 
 
+def _build_training_future_meta(
+    *,
+    op: str,
+    model_id: str,
+    session: Any | None = None,
+    seq_id: int | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    meta: dict[str, Any] = {
+        "op": str(op),
+        "model_id": str(model_id),
+        "queue_state": "queued",
+        "stage": "queued",
+        "queued_at": time.time(),
+    }
+    if session is not None:
+        session_id = _field(session, "session_id")
+        base_model = _field(session, "base_model")
+        backend = _field(session, "backend")
+        if session_id:
+            meta["session_id"] = str(session_id)
+        if base_model:
+            meta["base_model"] = str(base_model)
+        if backend:
+            meta["backend"] = str(backend)
+    if seq_id is not None:
+        try:
+            meta["seq_id"] = int(seq_id)
+        except Exception:
+            meta["seq_id"] = None
+    if extra:
+        meta.update(dict(extra))
+    return meta
+
+
 def _sync_route_wait_timeout_s() -> float:
     try:
         return max(1.0, float(str(os.environ.get("MINT_SYNC_ROUTE_WAIT_TIMEOUT_S", "3600")).strip()))
@@ -978,7 +1031,10 @@ async def _enqueue_internal_serialized_model_op(
             inflight_marked = True
         await future_store.async_create_with_id(request_id)
         created = True
-        await future_store.async_mark_queued(request_id, meta={"op": op, "model_id": model_id})
+        await future_store.async_mark_queued(
+            request_id,
+            meta=_build_training_future_meta(op=op, model_id=model_id),
+        )
         await api_work_queue.enqueue(
             request_id=request_id,
             op=op,
@@ -1121,7 +1177,18 @@ async def create_model(
     try:
         await future_store.async_create_with_id(request_id)
         created = True
-        await future_store.async_mark_queued(request_id, meta={"op": "training.create_model", "model_id": model_id})
+        await future_store.async_mark_queued(
+            request_id,
+            meta=_build_training_future_meta(
+                op="training.create_model",
+                model_id=model_id,
+                extra={
+                    "session_id": str(request.session_id),
+                    "model_seq_id": int(request.model_seq_id),
+                    "base_model": str(request.base_model),
+                },
+            ),
+        )
         await _enqueue_training_request_with_trace(
             route_start_s=route_start_s,
             request_id=request_id,
@@ -1532,7 +1599,15 @@ async def create_model_from_state(
         created = True
         await future_store.async_mark_queued(
             request_id,
-            meta={"op": "training.create_model_from_state", "model_id": model_id},
+            meta=_build_training_future_meta(
+                op="training.create_model_from_state",
+                model_id=model_id,
+                extra={
+                    "session_id": str(request.session_id),
+                    "model_seq_id": int(request.model_seq_id),
+                    "base_model": str(request.base_model),
+                },
+            ),
         )
         await _enqueue_training_request_with_trace(
             route_start_s=route_start_s,
@@ -1730,6 +1805,7 @@ async def forward_backward(
         upstream_for_alias,
     )
 
+    _validate_training_batch_has_explicit_loss_masks_or_422(request.forward_backward_input.data)
     route_session_info = await _get_training_route_session_info(request.model_id)
 
     if not isinstance(route_session_info, dict):
@@ -1795,7 +1871,12 @@ async def forward_backward(
 
     # Set request_id in context for logging
     set_request_id(request_id)
-    logger.info(f"forward_backward request received: model_id={request.model_id}")
+    logger.info(
+        "forward_backward request received: model_id=%s seq_id=%s datums=%s",
+        request.model_id,
+        request.seq_id,
+        len(request.forward_backward_input.data),
+    )
 
     reserve = await capacity_manager.async_try_reserve(
         request_id,
@@ -1828,7 +1909,12 @@ async def forward_backward(
         created = True
         await future_store.async_mark_queued(
             request_id,
-            meta={"op": "training.forward_backward", "model_id": request.model_id},
+            meta=_build_training_future_meta(
+                op="training.forward_backward",
+                model_id=request.model_id,
+                session=route_session_info,
+                seq_id=request.seq_id,
+            ),
         )
         await _enqueue_training_request_with_trace(
             route_start_s=route_start_s,
@@ -1967,6 +2053,7 @@ async def train_step(
         upstream_for_alias,
     )
 
+    _validate_training_batch_has_explicit_loss_masks_or_422(request.forward_backward_input.data)
     route_session_info = await _get_training_route_session_info(request.model_id)
 
     if not isinstance(route_session_info, dict):
@@ -2060,7 +2147,15 @@ async def train_step(
             scheduler_extra["gateway_auth"] = gateway_auth.__dict__
         await future_store.async_create_with_id(request_id)
         created = True
-        await future_store.async_mark_queued(request_id, meta={"op": "training.train_step", "model_id": request.model_id})
+        await future_store.async_mark_queued(
+            request_id,
+            meta=_build_training_future_meta(
+                op="training.train_step",
+                model_id=request.model_id,
+                session=route_session_info,
+                seq_id=request.seq_id,
+            ),
+        )
         await _enqueue_training_request_with_trace(
             route_start_s=route_start_s,
             request_id=request_id,
@@ -2287,7 +2382,15 @@ async def forward(
             scheduler_extra["gateway_auth"] = gateway_auth.__dict__
         await future_store.async_create_with_id(request_id)
         created = True
-        await future_store.async_mark_queued(request_id, meta={"op": "training.forward", "model_id": request.model_id})
+        await future_store.async_mark_queued(
+            request_id,
+            meta=_build_training_future_meta(
+                op="training.forward",
+                model_id=request.model_id,
+                session=route_session_info,
+                seq_id=request.seq_id,
+            ),
+        )
         await _enqueue_training_request_with_trace(
             route_start_s=route_start_s,
             request_id=request_id,
@@ -2506,7 +2609,15 @@ async def optim_step(
         )
         await future_store.async_create_with_id(request_id)
         created = True
-        await future_store.async_mark_queued(request_id, meta={"op": "training.optim_step", "model_id": request.model_id})
+        await future_store.async_mark_queued(
+            request_id,
+            meta=_build_training_future_meta(
+                op="training.optim_step",
+                model_id=request.model_id,
+                session=route_session_info,
+                seq_id=request.seq_id,
+            ),
+        )
         await _enqueue_training_request_with_trace(
             route_start_s=route_start_s,
             request_id=request_id,
@@ -2822,7 +2933,12 @@ async def save_weights_for_sampler(
         created = True
         await future_store.async_mark_queued(
             request_id,
-            meta={"op": "training.save_weights_for_sampler", "model_id": request.model_id},
+            meta=_build_training_future_meta(
+                op="training.save_weights_for_sampler",
+                model_id=request.model_id,
+                session=route_session_info,
+                seq_id=request.seq_id,
+            ),
         )
         await _enqueue_training_request_with_trace(
             route_start_s=route_start_s,
@@ -2977,7 +3093,6 @@ async def _do_save_weights_for_sampler(
                 user_id=None if is_admin else user_id,
                 model_id=session.model_id,
                 checkpoint_name=checkpoint_name,
-                checkpoint_type="sampler",
             )
 
         from ..client_compat import checkpoint_uri
@@ -3110,10 +3225,10 @@ async def _do_save_weights_for_sampler(
                 )
 
             try:
-                from ..backend.session_index_store import add_sampler_to_session, upsert_sampler_index
+                from ..backend.session_index_store import add_heartbeat_sampler_to_session, upsert_sampler_index
 
                 created_at = datetime.now().isoformat()
-                add_sampler_to_session(
+                add_heartbeat_sampler_to_session(
                     session_id=session.session_id,
                     sampler_id=sampling_session_id,
                     user_id=user_id,
@@ -3256,6 +3371,11 @@ async def get_model_info(model_id: str):
         _drop_local_training_session(model_id)
         raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
 
+    last_activity = info.get("last_activity")
+    idle_for_s = None
+    if isinstance(last_activity, (int, float)):
+        idle_for_s = max(0.0, time.time() - float(last_activity))
+
     return {
         "model_id": str(info.get("model_id") or model_id),
         "session_id": info.get("session_id"),
@@ -3265,6 +3385,8 @@ async def get_model_info(model_id: str):
         "user_metadata": info.get("user_metadata") or {},
         "learning_rate": info.get("learning_rate"),
         "created_at": info.get("created_at"),
+        "last_activity": last_activity,
+        "idle_for_s": idle_for_s,
         "current_step": info.get("current_step", 0),
         "is_active": info.get("is_active", False),
         "backend": info.get("backend"),
@@ -3355,6 +3477,10 @@ async def list_models():
         model_id = str(info.get("model_id") or "")
         if not model_id:
             continue
+        last_activity = info.get("last_activity")
+        idle_for_s = None
+        if isinstance(last_activity, (int, float)):
+            idle_for_s = max(0.0, time.time() - float(last_activity))
         models.append(
             {
                 "model_id": info.get("model_id"),
@@ -3362,6 +3488,8 @@ async def list_models():
                 "model_seq_id": info.get("model_seq_id"),
                 "base_model": info.get("base_model"),
                 "created_at": info.get("created_at"),
+                "last_activity": last_activity,
+                "idle_for_s": idle_for_s,
                 "current_step": info.get("current_step", 0),
                 "is_active": info.get("is_active", False),
             }

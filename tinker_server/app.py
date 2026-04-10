@@ -142,6 +142,21 @@ async def _shutdown_local_training_runtime(train_manager) -> None:
         except Exception as e:
             logger.warning("Local training runtime shutdown failed model=%s: %s", model_id, e)
 
+
+def _clear_local_execution_route_globals() -> None:
+    from .routes import mint, sampling, service, training, weights
+
+    service.session_manager = None
+    sampling.session_manager = None
+    training.training_manager = None
+    training.training_engine = None
+    training.inference_manager = None
+    mint.training_manager = None
+    mint.training_engine = None
+    weights.training_manager = None
+    weights.training_engine = None
+    weights.inference_manager = None
+
 async def _prewarm_persistent_models(
     train_engine: TrainingEngineRouter | VerlTrainingEngine | None,
     multi_model_manager: MultiModelInferenceManager | None,
@@ -577,6 +592,8 @@ async def lifespan(app: FastAPI):
         startup_lease.owner_id,
     )
 
+    owner_runtime_local_only = os.environ.get("MINT_OWNER_RUNTIME_SUPERVISOR_LOCAL_ONLY", "").strip().lower() in {"1", "true", "yes", "on"}
+
     if startup_owner:
         await future_store.async_ensure_started()
         ensure_gateway_session_store_ready()
@@ -587,7 +604,10 @@ async def lifespan(app: FastAPI):
         from .backend.future_replay import ensure_future_replay_sweeper
 
         ensure_future_replay_sweeper()
-    owner_runtime = await owner_runtime_supervisor.async_ensure_started()
+    if owner_runtime_local_only:
+        owner_runtime = {"actor_name": "local_owner_runtime_supervisor", "epoch_id": "local"}
+    else:
+        owner_runtime = await owner_runtime_supervisor.async_ensure_started()
 
     from .backend.action_session_manager import ActionSessionRouter
 
@@ -676,7 +696,11 @@ async def lifespan(app: FastAPI):
                 )
             await asyncio.sleep(5.0)
 
-    owner_runtime_health_task = asyncio.create_task(_owner_runtime_health_loop())
+    if owner_runtime_local_only:
+        clear_runtime_degraded_state()
+        owner_runtime_health_task = None
+    else:
+        owner_runtime_health_task = asyncio.create_task(_owner_runtime_health_loop())
     ray_reconnect_watch_task: asyncio.Task | None = None
     last_ray_connection_epoch = ray_connection_epoch()
 
@@ -690,7 +714,12 @@ async def lifespan(app: FastAPI):
         # Cleanup: Kill stale actors from previous server runs
         # ==========================================================================
         if startup_owner:
-            await owner_runtime_supervisor.async_run_once("actor_reconciliation", timeout_s=60.0)
+            if owner_runtime_local_only:
+                from .backend.actor_reconciliation import cleanup_stale_actors_once
+
+                await asyncio.to_thread(cleanup_stale_actors_once)
+            else:
+                await owner_runtime_supervisor.async_run_once("actor_reconciliation", timeout_s=60.0)
         else:
             logger.info("Skipping stale-actor cleanup on follower worker")
 
@@ -759,9 +788,25 @@ async def lifespan(app: FastAPI):
         from .backend.capacity_manager import capacity_manager
         from .backend.queue_execution_runtime import queue_execution_runtime
 
-        await capacity_manager.async_ensure_ready()
+        await capacity_manager.async_ensure_ready(timeout_s=180.0)
         await api_work_queue.async_ensure_started()
-        await queue_execution_runtime.async_ensure_started(num_workers=int(config.api_work_queue_num_workers))
+        if os.environ.get("MINT_QUEUE_EXECUTION_RUNTIME_LOCAL_ONLY", "").strip().lower() in {"1", "true", "yes", "on"}:
+            from .backend.api_work_queue_dispatch import register_api_work_queue_executors
+            from .backend.queue_execution_runtime import _initialize_execution_bindings
+
+            logger.warning(
+                "Using local queue execution runtime fallback in API process "
+                "(MINT_QUEUE_EXECUTION_RUNTIME_LOCAL_ONLY=1)"
+            )
+            bindings = await _initialize_execution_bindings()
+            inference_manager = bindings.get("inference_manager")
+            train_manager = bindings.get("train_manager")
+            multi_model_manager = bindings.get("multi_model_manager")
+            register_api_work_queue_executors(api_work_queue)
+            await api_work_queue.start_workers(num_workers=int(config.api_work_queue_num_workers))
+            await api_work_queue.wait_until_execution_ready(timeout_s=120.0)
+        else:
+            await queue_execution_runtime.async_ensure_started(num_workers=int(config.api_work_queue_num_workers))
 
         async def _ray_reconnect_watch_loop() -> None:
             nonlocal last_ray_connection_epoch
@@ -806,6 +851,7 @@ async def lifespan(app: FastAPI):
             await _shutdown_local_inference_runtime(inference_manager)
         if multi_model_manager is not None:
             await multi_model_manager.shutdown_all()
+        _clear_local_execution_route_globals()
         raise
 
     yield
@@ -831,6 +877,7 @@ async def lifespan(app: FastAPI):
     if multi_model_manager is not None:
         await multi_model_manager.shutdown_all()
         logger.info("Multi-model inference manager shutdown")
+    _clear_local_execution_route_globals()
 
     openai_compat.shutdown_tokenizer_executor()
 

@@ -102,7 +102,13 @@ class VllmStatsLogger:
         self._observer = observer
         self.engine_index = engine_index
 
-    def record(self, scheduler_stats: Any, iteration_stats: Any, engine_idx: int = 0):
+    def record(
+        self,
+        scheduler_stats: Any,
+        iteration_stats: Any,
+        engine_idx: int = 0,
+        **_kwargs: Any,
+    ):
         self._observer.record(scheduler_stats, iteration_stats)
 
     def log_engine_initialized(self):
@@ -124,5 +130,14 @@ def attach_vllm_stats_logger(engine: Any, observer: VllmStatsObserver) -> None:
     vllm_config = getattr(engine, "vllm_config", None)
     if logger_manager is None:
         return
-    for engine_idx, loggers in logger_manager.per_engine_logger_dict.items():
-        loggers.append(VllmStatsLogger(observer, vllm_config, engine_idx))
+
+    per_engine = getattr(logger_manager, "per_engine_logger_dict", None)
+    if isinstance(per_engine, dict):
+        for engine_idx, loggers in per_engine.items():
+            if isinstance(loggers, list):
+                loggers.append(VllmStatsLogger(observer, vllm_config, engine_idx))
+        return
+
+    # Newer vLLM / wrapper variants may expose a different logger-manager shape.
+    # Observability must not be startup-critical.
+    return

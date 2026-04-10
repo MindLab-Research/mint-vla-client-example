@@ -52,14 +52,29 @@ def _awaitable(ref: Any) -> Any:
 def _get_or_create_actor():
     import ray
 
+    from ..ray_utils import force_reconnect_ray, is_wrong_cluster_error
+
     global _ACTOR_HANDLE
     name = _actor_name()
     namespace = _ray_namespace()
+
+    def _get_existing_actor() -> Any | None:
+        try:
+            return ray.get_actor(name, namespace=namespace)
+        except ValueError:
+            return None
+
     try:
-        _ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)
-        return _ACTOR_HANDLE
-    except ValueError:
-        pass
+        _ACTOR_HANDLE = _get_existing_actor()
+        if _ACTOR_HANDLE is not None:
+            return _ACTOR_HANDLE
+    except Exception as e:
+        if not is_wrong_cluster_error(e):
+            raise
+        force_reconnect_ray(namespace=namespace)
+        _ACTOR_HANDLE = _get_existing_actor()
+        if _ACTOR_HANDLE is not None:
+            return _ACTOR_HANDLE
 
     @ray.remote(num_cpus=0)
     class _RaySessionHeartbeatStore:
@@ -119,16 +134,30 @@ def _get_or_create_actor():
     apply_detached_actor_resources(options, ray)
     options["runtime_env"] = actor_runtime_env(pythonpath=PFS_PYTHONPATH, extra=otel_env_vars())
 
-    try:
+    def _create_actor() -> Any:
         created = _RaySessionHeartbeatStore.options(**options).remote()
         try:
             ray.get(created.size.remote())
-            _ACTOR_HANDLE = created
-        except Exception:
-            _ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)
+            return created
+        except Exception as e:
+            existing = _get_existing_actor()
+            if existing is not None:
+                return existing
+            raise e
+
+    try:
+        _ACTOR_HANDLE = _create_actor()
         return _ACTOR_HANDLE
-    except Exception:
-        _ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)
+    except Exception as e:
+        if is_wrong_cluster_error(e):
+            force_reconnect_ray(namespace=namespace)
+            _ACTOR_HANDLE = _get_existing_actor()
+            if _ACTOR_HANDLE is None:
+                _ACTOR_HANDLE = _create_actor()
+            return _ACTOR_HANDLE
+        _ACTOR_HANDLE = _get_existing_actor()
+        if _ACTOR_HANDLE is None:
+            raise
         return _ACTOR_HANDLE
 
 

@@ -44,6 +44,8 @@ STAGE_SAVE = "save_weights_and_get_sampling_client"
 STAGE_ROLLOUT = "rollout_sample"
 STAGE_ROLLOUT_ITEM = "rollout_sample_item"
 STAGE_COMPUTE_LOGPROBS = "compute_logprobs"
+STAGE_REWARD_GROUP_READY = "reward_group_ready"
+STAGE_FORWARD_BACKWARD_SUBMIT = "forward_backward_submit"
 STAGE_FORWARD_BACKWARD = "forward_backward"
 STAGE_OPTIM_STEP = "optim_step"
 STAGE_HEARTBEAT = "heartbeat"
@@ -639,6 +641,21 @@ def _run_single(
                         # reward-mean_reward produces all-zero advantages, which can yield num_tokens=0
                         # in PPO and trigger NaN loss logging in Megatron.
                         baseline = 0.5 if len(set(rewards)) <= 1 else mean_reward
+                        adv_scalars = [float(reward - baseline) for reward in rewards]
+                        _emit(
+                            STAGE_REWARD_GROUP_READY,
+                            step_idx=step,
+                            elapsed_s=time.time() - rollout_t0,
+                            prompt_idx=p_idx,
+                            sample_latency_s=sample_latency_s,
+                            rewards=[float(r) for r in rewards],
+                            mean_reward=float(mean_reward),
+                            baseline=float(baseline),
+                            advantages=adv_scalars,
+                            has_mixed_binary_rewards=sorted(set(rewards)) == [0.0, 1.0],
+                            reward_zero_count=sum(1 for r in rewards if float(r) == 0.0),
+                            reward_one_count=sum(1 for r in rewards if float(r) == 1.0),
+                        )
                         n = cfg.max_seq_len - 1
                         for full_tokens, prompt_len, completion_tokens, completion_logprobs, reward in payloads:
                             adv_scalar = float(reward - baseline)
@@ -686,6 +703,19 @@ def _run_single(
                 )
                 fb_t0 = time.time()
                 fb_future = training_client.forward_backward(mb, loss_fn="ppo")
+                _emit(
+                    STAGE_FORWARD_BACKWARD_SUBMIT,
+                    step_idx=step,
+                    elapsed_s=time.time() - fb_total_t0,
+                    microbatch_idx=mb_idx,
+                    microbatch_count=len(microbatches),
+                    microbatch_size=len(mb),
+                    request_id=getattr(fb_future, "request_id", None),
+                    is_first_forward_backward_for_step=(mb_idx == 0),
+                    step_reward_min=float(min(step_rewards)) if step_rewards else None,
+                    step_reward_max=float(max(step_rewards)) if step_rewards else None,
+                    step_reward_mean=float(sum(step_rewards) / len(step_rewards)) if step_rewards else None,
+                )
                 _wait_future(
                     fb_future,
                     label=f"forward_backward model={model} session={session_idx} step {step+1}/{cfg.steps} microbatch {mb_idx+1}/{len(microbatches)}",

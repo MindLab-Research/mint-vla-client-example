@@ -383,6 +383,36 @@ async def _protect_training_session_enqueue_window(session_info: dict) -> None:
     await _training_protect(session_info)
 
 
+def _build_mint_future_meta(
+    *,
+    op: str,
+    model_id: str | None = None,
+    session_info: dict | None = None,
+    extra: dict | None = None,
+) -> dict[str, object]:
+    meta: dict[str, object] = {
+        "op": str(op),
+        "queue_state": "queued",
+        "stage": "queued",
+        "queued_at": time.time(),
+    }
+    if model_id:
+        meta["model_id"] = str(model_id)
+    if isinstance(session_info, dict):
+        session_id = session_info.get("session_id")
+        base_model = session_info.get("base_model")
+        backend = session_info.get("backend")
+        if session_id:
+            meta["session_id"] = str(session_id)
+        if base_model:
+            meta["base_model"] = str(base_model)
+        if backend:
+            meta["backend"] = str(backend)
+    if isinstance(extra, dict):
+        meta.update(extra)
+    return meta
+
+
 @router.post("/checkpoints/interpolate", response_model=UntypedAPIFuture)
 async def interpolate_checkpoints(
     request: InterpolateCheckpointsRequest,
@@ -412,7 +442,13 @@ async def interpolate_checkpoints(
         created = True
         await future_store.async_mark_queued(
             request_id,
-            meta={"op": "mint.interpolate_checkpoints"},
+            meta=_build_mint_future_meta(
+                op="mint.interpolate_checkpoints",
+                extra={
+                    "checkpoint_count": len(request.source_paths),
+                    "output_path": request.output_path,
+                },
+            ),
         )
         await api_work_queue.enqueue(
             request_id=request_id,
@@ -561,7 +597,11 @@ async def forward_backward_reverse_kl(
         created = True
         await future_store.async_mark_queued(
             request_id,
-            meta={"op": "mint.forward_backward_reverse_kl", "model_id": request.model_id},
+            meta=_build_mint_future_meta(
+                op="mint.forward_backward_reverse_kl",
+                model_id=request.model_id,
+                session_info=info,
+            ),
         )
         await api_work_queue.enqueue(
             request_id=request_id,

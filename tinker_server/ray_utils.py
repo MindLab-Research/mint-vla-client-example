@@ -128,6 +128,22 @@ def ray_connection_epoch() -> int:
     return int(_RAY_CONNECTION_EPOCH)
 
 
+def is_wrong_cluster_error(exc: BaseException) -> bool:
+    return "WrongClusterID" in str(exc)
+
+
+def force_reconnect_ray(*, namespace: str | None = None) -> None:
+    import ray
+
+    global _RAY_LAST_INIT_ADDRESS
+
+    if ray.is_initialized():
+        ray.shutdown()
+    _RAY_LAST_INIT_ADDRESS = None
+    _run_ray_reconnect_invalidators()
+    init_ray(address="auto", namespace=namespace, ignore_reinit_error=True)
+
+
 def register_ray_reconnect_invalidator(callback: Callable[[], None]) -> None:
     if callback not in _RAY_RECONNECT_INVALIDATORS:
         _RAY_RECONNECT_INVALIDATORS.append(callback)

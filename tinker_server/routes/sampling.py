@@ -1901,6 +1901,9 @@ async def compute_logprobs(
             meta={
                 "op": "sampling.compute_logprobs",
                 "sampling_session_id": str(request.sampling_session_id),
+                "queue_state": "queued",
+                "queued_at": time.time(),
+                "stage": "queued",
             },
         )
         base_model = snapshot.base_model if snapshot is not None else None

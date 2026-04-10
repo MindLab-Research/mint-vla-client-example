@@ -150,6 +150,7 @@ async def _initialize_execution_bindings() -> dict[str, Any]:
     from ..config import config
     from ..routes import action_sampling, mint, sampling, service, training, weights
     from .action_session_manager import ActionSessionRouter
+    from .sampling_session_store import ensure_ready as ensure_sampling_session_store_ready
     from .session_manager import DEFAULT_INACTIVITY_TIMEOUT, SessionManager
     from .training_engine_router import TrainingEngineRouter
     from .training_session_manager import TrainingSessionManager
@@ -165,7 +166,20 @@ async def _initialize_execution_bindings() -> dict[str, Any]:
     )
     service.session_manager = inference_manager
     sampling.session_manager = inference_manager
-    restored_sampling_sessions = await _restore_sampling_sessions_for_worker(inference_manager)
+
+    # Detached sampling-session metadata may still be racing API-process startup on a fresh
+    # namespace. Missing restore data must not crash the entire API server; restore is a
+    # best-effort optimization for detached inference sessions, not a hard startup requirement.
+    restored_sampling_sessions = 0
+    try:
+        await asyncio.to_thread(ensure_sampling_session_store_ready)
+        restored_sampling_sessions = await _restore_sampling_sessions_for_worker(inference_manager)
+    except Exception as e:
+        logger.warning(
+            "queue_execution_runtime sampling-session restore skipped: %s: %s",
+            type(e).__name__,
+            e,
+        )
 
     multi_model_manager = None
     if config.enable_multi_lora:
@@ -199,7 +213,10 @@ async def _initialize_execution_bindings() -> dict[str, Any]:
     weights.inference_manager = inference_manager
 
     return {
-        "restored_sampling_sessions": restored_sampling_sessions,
+        "inference_manager": inference_manager,
+        "train_manager": train_manager,
+        "multi_model_manager": multi_model_manager,
+        "restored_sampling_sessions": int(restored_sampling_sessions),
         "multi_model_enabled": bool(config.enable_multi_lora),
     }
 

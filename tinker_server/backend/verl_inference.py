@@ -51,6 +51,19 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _strip_empty_targets(value: object) -> object:
+    if isinstance(value, dict):
+        out: dict[object, object] = {}
+        for k, v in value.items():
+            if k == "_target_" and v in ("", None):
+                continue
+            out[k] = _strip_empty_targets(v)
+        return out
+    if isinstance(value, list):
+        return [_strip_empty_targets(v) for v in value]
+    return value
+
+
 def _sampled_logprob_entry_meta(entry: Any) -> dict[str, Any]:
     """Return safe structure metadata for one per-step logprob entry."""
     meta: dict[str, Any] = {
@@ -648,23 +661,30 @@ def _create_extended_server_class(
                 from verl.workers.config import RolloutConfig as VerlRolloutConfig
 
                 if isinstance(rollout_cfg, dict):
+                    rollout_cfg_data = _strip_empty_targets(dict(rollout_cfg))
                     rollout_cfg = omega_conf_to_dataclass(
-                        rollout_cfg, dataclass_type=VerlRolloutConfig
+                        rollout_cfg_data, dataclass_type=VerlRolloutConfig
                     )
                 elif is_dataclass(rollout_cfg):
+                    rollout_cfg_data = _strip_empty_targets(asdict(rollout_cfg))
                     rollout_cfg = omega_conf_to_dataclass(
-                        asdict(rollout_cfg), dataclass_type=VerlRolloutConfig
+                        rollout_cfg_data, dataclass_type=VerlRolloutConfig
                     )
                 elif not isinstance(rollout_cfg, VerlRolloutConfig):
+                    rollout_cfg_data = _strip_empty_targets(dict(rollout_cfg))
                     rollout_cfg = omega_conf_to_dataclass(
-                        dict(rollout_cfg), dataclass_type=VerlRolloutConfig
+                        rollout_cfg_data, dataclass_type=VerlRolloutConfig
                     )
+
+                # Current verl BaseConfig fields are effectively frozen after init.
+                # Override via object.__setattr__ so the config remains a RolloutConfig
+                # instance for the base server.
+                if hasattr(rollout_cfg, "disable_log_stats"):
+                    object.__setattr__(rollout_cfg, "disable_log_stats", False)
                 print(
                     f"[ExtendedVLLMHttpServer] rollout config normalized type={type(rollout_cfg).__name__} _target_={getattr(rollout_cfg, '_target_', None)!r}",
                     flush=True,
                 )
-                if hasattr(rollout_cfg, "disable_log_stats"):
-                    rollout_cfg.disable_log_stats = False
                 call_kwargs["config"] = rollout_cfg
 
             if sig is not None:
@@ -691,7 +711,6 @@ def _create_extended_server_class(
                         )
             super(ExtendedVLLMHttpServer, self).__init__(*args, **call_kwargs)
             self._vllm_stats_observer = VllmStatsObserver()
-            attach_vllm_stats_logger(self.engine, self._vllm_stats_observer)
             # Track local paths for multi-LoRA (needed for GPU/CPU swap)
             self._lora_paths: dict[int, str] = {}
             self._timing = os.environ.get("MINT_VLLM_REQUEST_TIMING", "").strip().lower() in (
@@ -863,15 +882,25 @@ def _create_extended_server_class(
                 args.max_cpu_loras = self.MULTI_LORA_MAX_CPU_LORAS
                 _logger.info(f"Multi-LoRA: overriding max_cpu_loras={args.max_cpu_loras}")
 
+        def _attach_stats_logger_if_ready(self) -> None:
+            engine = getattr(self, "engine", None)
+            if engine is None:
+                return
+            attach_vllm_stats_logger(engine, self._vllm_stats_observer)
+
         async def run_server(self, args):
             """Override to inject multi-LoRA config (rank-0 node)."""
             self._patch_lora_args(args)
-            return await super().run_server(args)
+            out = await super().run_server(args)
+            self._attach_stats_logger_if_ready()
+            return out
 
         async def run_headless(self, args):
             """Override to inject multi-LoRA config (non-rank-0 nodes)."""
             self._patch_lora_args(args)
-            return await super().run_headless(args)
+            out = await super().run_headless(args)
+            self._attach_stats_logger_if_ready()
+            return out
 
         async def add_lora(self, lora_request) -> None:
             """Add LoRA adapter to running engine.
@@ -2610,11 +2639,8 @@ class VerlInferenceEngine:
             lora_rank=self.lora_rank,
             lora_adapter_path=self.lora_adapter_path,
         )
-        rollout_payload = asdict(rollout_config)
-        if not rollout_payload.get("_target_"):
-            rollout_payload["_target_"] = "verl.workers.config.RolloutConfig"
         remote_kwargs: dict[str, object] = {
-            "config": rollout_payload,
+            "config": rollout_config,
             "model_config": model_config,
             "rollout_mode": RolloutMode.STANDALONE,
             "workers": [],

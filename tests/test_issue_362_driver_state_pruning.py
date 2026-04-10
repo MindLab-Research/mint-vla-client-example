@@ -1,7 +1,11 @@
 import copy
+import sys
+import types
 
 import pytest
 
+import tinker_server.backend.session_heartbeat_store as session_heartbeat_store_module
+import tinker_server.ray_utils as ray_utils
 from tinker_server.backend.session_heartbeat_store import SessionHeartbeatStore
 from tinker_server.backend.session_manager import SessionManager
 from tinker_server.backend.training_session_manager import TrainingSessionManager
@@ -56,13 +60,25 @@ class _FakeHeartbeatActor:
         return len(to_delete)
 
 
+def _ensure_fake_ray_module(monkeypatch: pytest.MonkeyPatch):
+    try:
+        import ray
+
+        return ray
+    except ModuleNotFoundError:
+        ray_module = types.ModuleType("ray")
+        ray_module.get = lambda ref, *args, **kwargs: ref
+        monkeypatch.setitem(sys.modules, "ray", ray_module)
+        return ray_module
+
+
 def _install_fake_heartbeat_store(monkeypatch: pytest.MonkeyPatch) -> SessionHeartbeatStore:
     store = SessionHeartbeatStore()
     actor = _FakeHeartbeatActor()
     monkeypatch.setattr(store, "_get_actor", lambda: actor)
-    import ray
+    ray = _ensure_fake_ray_module(monkeypatch)
 
-    monkeypatch.setattr(ray, "get", lambda ref, *args, **kwargs: ref)
+    monkeypatch.setattr(ray, "get", lambda ref, *args, **kwargs: ref, raising=False)
     return store
 
 
@@ -90,6 +106,70 @@ def test_issue_362_session_heartbeat_store_manual_prune_removes_stale_entries(mo
     assert removed == 1
     assert store.last_seen("keep") == 100.0
     assert store.last_seen("drop") is None
+
+
+def test_issue_362_session_heartbeat_store_recreates_actor_after_wrong_cluster_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created: list[_FakeHeartbeatActor] = []
+    reconnects: list[str | None] = []
+    get_actor_calls = 0
+
+    def _get_actor(_name: str, namespace: str | None = None):
+        nonlocal get_actor_calls
+        get_actor_calls += 1
+        if get_actor_calls == 1:
+            raise RuntimeError("WrongClusterID: stale driver connection")
+        if created:
+            return created[-1]
+        raise ValueError(f"actor missing in namespace {namespace}")
+
+    class _RemoteFactory:
+        def __call__(self, *decorator_args, **_decorator_kwargs):
+            def _decorate(_cls):
+                class _RemoteClass:
+                    @staticmethod
+                    def options(**_options):
+                        class _Options:
+                            @staticmethod
+                            def remote():
+                                actor = _FakeHeartbeatActor()
+                                created.append(actor)
+                                return actor
+
+                        return _Options()
+
+                return _RemoteClass
+
+            if decorator_args and isinstance(decorator_args[0], type):
+                return _decorate(decorator_args[0])
+            return _decorate
+
+    fake_ray = _ensure_fake_ray_module(monkeypatch)
+    monkeypatch.setattr(fake_ray, "get", lambda ref, *args, **kwargs: ref, raising=False)
+    monkeypatch.setattr(fake_ray, "get_actor", _get_actor, raising=False)
+    monkeypatch.setattr(fake_ray, "remote", _RemoteFactory(), raising=False)
+    monkeypatch.setattr(session_heartbeat_store_module, "apply_detached_actor_resources", lambda options, ray: None)
+    monkeypatch.setattr(session_heartbeat_store_module, "actor_runtime_env", lambda *, pythonpath, extra=None: {})
+    monkeypatch.setattr(session_heartbeat_store_module, "_ACTOR_HANDLE", None)
+    monkeypatch.setattr(
+        ray_utils,
+        "force_reconnect_ray",
+        lambda *, namespace=None: reconnects.append(namespace),
+    )
+    monkeypatch.setattr(
+        ray_utils,
+        "is_wrong_cluster_error",
+        lambda exc: "WrongClusterID" in str(exc),
+    )
+
+    actor = session_heartbeat_store_module._get_or_create_actor()
+
+    assert isinstance(actor, _FakeHeartbeatActor)
+    assert session_heartbeat_store_module._ACTOR_HANDLE is actor
+    assert reconnects == [session_heartbeat_store_module._ray_namespace()]
+    assert get_actor_calls == 2
+    assert len(created) == 1
 
 
 def test_issue_362_observability_snapshot_excludes_base_model_sessions_from_lora_loaded() -> None:

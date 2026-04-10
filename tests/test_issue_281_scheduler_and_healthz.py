@@ -202,9 +202,18 @@ async def test_issue_281_training_routes_mark_queued_stage_metadata(
     monkeypatch.setattr(awq, "api_work_queue", SimpleNamespace(enqueue=_fake_enqueue))
     monkeypatch.setattr(cm, "capacity_manager", _AsyncCapacityManager())
 
-    await getattr(tr, route_name)(request_obj(model_types), _DummyRequest())
+    req = request_obj(model_types)
+    await getattr(tr, route_name)(req, _DummyRequest())
 
-    assert queued_meta == {"op": f"training.{training_op}", "model_id": "run-281"}
+    assert queued_meta["op"] == f"training.{training_op}"
+    assert queued_meta["model_id"] == "run-281"
+    assert queued_meta["session_id"] == "run-281"
+    assert queued_meta["base_model"] == "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    assert queued_meta["backend"] == "megatron"
+    assert queued_meta["seq_id"] == req.seq_id
+    assert queued_meta["queue_state"] == "queued"
+    assert queued_meta["stage"] == "queued"
+    assert isinstance(queued_meta["queued_at"], float)
     assert captured["extra"]["scheduler_enabled"] is True
     assert captured["extra"]["scheduler_domain"] == "megatron:megatron_qwen3_30b_a3b_instruct_2507"
     assert captured["extra"]["scheduler_session_key"] == "run-281"
@@ -316,9 +325,14 @@ async def test_issue_281_compute_logprobs_enqueues_scheduler_metadata(monkeypatc
     monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "1")
 
     captured: dict = {}
+    queued_meta: dict = {}
 
     async def _fake_enqueue(**kwargs):
         captured.update(kwargs)
+
+    class _QueuedFutureStore(_AsyncFutureStore):
+        async def async_mark_queued(self, _request_id: str, meta=None) -> None:
+            queued_meta.update(meta or {})
 
     monkeypatch.setattr(
         sr,
@@ -330,7 +344,7 @@ async def test_issue_281_compute_logprobs_enqueues_scheduler_metadata(monkeypatc
             get_session_replica_key=lambda _session_id: "Qwen/Qwen3-0.6B::replica::1",
         ),
     )
-    monkeypatch.setattr(sr, "future_store", _AsyncFutureStore())
+    monkeypatch.setattr(sr, "future_store", _QueuedFutureStore())
     monkeypatch.setattr(awq, "api_work_queue", SimpleNamespace(enqueue=_fake_enqueue))
     monkeypatch.setattr(cm, "capacity_manager", _AsyncCapacityManager())
     monkeypatch.setattr(rse, "estimate_compute_logprobs_result_bytes", lambda _req: 0)
@@ -343,6 +357,11 @@ async def test_issue_281_compute_logprobs_enqueues_scheduler_metadata(monkeypatc
     )
     await sr.compute_logprobs(req, _DummyRequest(user_id="owner-a"))
 
+    assert queued_meta["op"] == "sampling.compute_logprobs"
+    assert queued_meta["sampling_session_id"] == "sess-281"
+    assert queued_meta["queue_state"] == "queued"
+    assert queued_meta["stage"] == "queued"
+    assert isinstance(queued_meta["queued_at"], float)
     assert captured["extra"] == {"queue_priority": 0}
 
 

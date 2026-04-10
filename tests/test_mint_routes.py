@@ -519,9 +519,14 @@ def test_mint_interpolate_route_enqueues_expected_request(monkeypatch) -> None:
     body = resp.json()
     assert "request_id" in body
     assert future_store.created == [body["request_id"]]
-    assert future_store.queued == [
-        (body["request_id"], {"op": "mint.interpolate_checkpoints"})
-    ]
+    queued_request_id, queued_meta = future_store.queued[0]
+    assert queued_request_id == body["request_id"]
+    assert queued_meta["op"] == "mint.interpolate_checkpoints"
+    assert queued_meta["queue_state"] == "queued"
+    assert queued_meta["stage"] == "queued"
+    assert isinstance(queued_meta["queued_at"], float)
+    assert queued_meta["checkpoint_count"] == 2
+    assert queued_meta["output_path"] == "ema-0010"
     assert len(queue.calls) == 1
     queued = queue.calls[0]
     assert queued["op"] == "mint.interpolate_checkpoints"
@@ -577,9 +582,13 @@ def test_mint_reverse_kl_route_and_background_path(monkeypatch) -> None:
         if model_id == "model-123":
             return {
                 "model_id": model_id,
+                "session_id": "sess-123",
                 "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
                 "backend": "megatron",
             }
+        return None
+
+    async def _noop_protect(_info: dict) -> None:
         return None
 
     monkeypatch.setattr(mint_routes, "future_store", future_store)
@@ -588,6 +597,7 @@ def test_mint_reverse_kl_route_and_background_path(monkeypatch) -> None:
     monkeypatch.setattr(mint_routes, "_get_user_id", lambda _request: "user-a")
     monkeypatch.setattr(mint_routes, "is_admin_request", lambda _request: False)
     monkeypatch.setattr(mint_routes, "_resolve_checkpoint_for_user", lambda path, **_: "/resolved/ref-step-0010")
+    monkeypatch.setattr(mint_routes, "_protect_training_session_enqueue_window", _noop_protect)
     monkeypatch.setattr(mint_routes, "_get_max_model_len", lambda _base_model: 2048, raising=False)
 
     import tinker_server.backend.capacity_manager as capacity_module
@@ -620,9 +630,16 @@ def test_mint_reverse_kl_route_and_background_path(monkeypatch) -> None:
     assert resp.status_code == 200, resp.text
     request_id = resp.json()["request_id"]
     assert future_store.created == [request_id]
-    assert future_store.queued == [
-        (request_id, {"op": "mint.forward_backward_reverse_kl", "model_id": "model-123"})
-    ]
+    queued_request_id, queued_meta = future_store.queued[0]
+    assert queued_request_id == request_id
+    assert queued_meta["op"] == "mint.forward_backward_reverse_kl"
+    assert queued_meta["model_id"] == "model-123"
+    assert queued_meta["session_id"] == "sess-123"
+    assert queued_meta["base_model"] == "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    assert queued_meta["backend"] == "megatron"
+    assert queued_meta["queue_state"] == "queued"
+    assert queued_meta["stage"] == "queued"
+    assert isinstance(queued_meta["queued_at"], float)
     assert len(queue.calls) == 1
     queued = queue.calls[0]
     assert queued["op"] == "mint.forward_backward_reverse_kl"
@@ -671,9 +688,13 @@ def test_mint_reverse_kl_route_uses_detached_training_info_without_route_runtime
         if model_id == "model-123":
             return {
                 "model_id": model_id,
+                "session_id": "sess-123",
                 "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
                 "backend": "megatron",
             }
+        return None
+
+    async def _noop_protect(_info: dict) -> None:
         return None
 
     monkeypatch.setattr(mint_routes, "future_store", future_store)
@@ -682,6 +703,7 @@ def test_mint_reverse_kl_route_uses_detached_training_info_without_route_runtime
     monkeypatch.setattr(mint_routes, "_get_user_id", lambda _request: "user-a")
     monkeypatch.setattr(mint_routes, "is_admin_request", lambda _request: False)
     monkeypatch.setattr(mint_routes, "_resolve_checkpoint_for_user", lambda path, **_: "/resolved/ref-step-0010")
+    monkeypatch.setattr(mint_routes, "_protect_training_session_enqueue_window", _noop_protect)
     monkeypatch.setattr(training_routes, "_get_training_route_session_info", _get_training_route_session_info)
 
     import tinker_server.backend.capacity_manager as capacity_module
@@ -713,9 +735,16 @@ def test_mint_reverse_kl_route_uses_detached_training_info_without_route_runtime
     assert resp.status_code == 200, resp.text
     request_id = resp.json()["request_id"]
     assert future_store.created == [request_id]
-    assert future_store.queued == [
-        (request_id, {"op": "mint.forward_backward_reverse_kl", "model_id": "model-123"})
-    ]
+    queued_request_id, queued_meta = future_store.queued[0]
+    assert queued_request_id == request_id
+    assert queued_meta["op"] == "mint.forward_backward_reverse_kl"
+    assert queued_meta["model_id"] == "model-123"
+    assert queued_meta["session_id"] == "sess-123"
+    assert queued_meta["base_model"] == "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    assert queued_meta["backend"] == "megatron"
+    assert queued_meta["queue_state"] == "queued"
+    assert queued_meta["stage"] == "queued"
+    assert isinstance(queued_meta["queued_at"], float)
     assert len(queue.calls) == 1
     queued = queue.calls[0]
     assert queued["op"] == "mint.forward_backward_reverse_kl"

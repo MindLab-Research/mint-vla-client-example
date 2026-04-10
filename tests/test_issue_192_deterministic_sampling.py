@@ -125,9 +125,27 @@ def _dummy_request(user_id: str | None = None):
     return SimpleNamespace(state=SimpleNamespace(user_data=user_data), headers={})
 
 
+def _install_detached_sampling_store(monkeypatch):
+    detached_sessions: dict[str, dict] = {}
+
+    import tinker_server.backend.sampling_session_store as sss
+
+    def _upsert_sampling_session(info: dict) -> None:
+        detached_sessions[str(info["session_id"])] = dict(info)
+
+    async def _async_get_sampling_session_info(session_id: str):
+        info = detached_sessions.get(str(session_id))
+        return None if info is None else dict(info)
+
+    monkeypatch.setattr(sss, "upsert_sampling_session", _upsert_sampling_session)
+    monkeypatch.setattr(sss, "async_get_sampling_session_info", _async_get_sampling_session_info)
+    return detached_sessions
+
+
 def test_create_sampling_session_deterministic_idempotent(monkeypatch):
     stub = _StubSessionManager()
     monkeypatch.setattr(service_route, "session_manager", stub)
+    _install_detached_sampling_store(monkeypatch)
 
     import tinker_server.supported_models_gate as gate
     import tinker_server.gateway as gw
@@ -155,6 +173,7 @@ def test_create_sampling_session_deterministic_idempotent(monkeypatch):
 def test_create_sampling_session_conflict(monkeypatch):
     stub = _StubSessionManager()
     monkeypatch.setattr(service_route, "session_manager", stub)
+    _install_detached_sampling_store(monkeypatch)
 
     import tinker_server.supported_models_gate as gate
     import tinker_server.gateway as gw
@@ -184,6 +203,76 @@ def test_create_sampling_session_conflict(monkeypatch):
         assert exc.status_code == 409
     else:
         raise AssertionError("expected HTTPException")
+
+
+def test_create_sampling_session_keeps_generic_samplers_out_of_heartbeat_fanout(monkeypatch):
+    stub = _StubSessionManager()
+    sampler_calls: list[tuple[str, str, str | None, str | None]] = []
+    heartbeat_calls: list[tuple[str, str, str | None, str | None]] = []
+    sampler_index_updates: list[dict] = []
+    detached_sampling_updates = _install_detached_sampling_store(monkeypatch)
+
+    monkeypatch.setattr(service_route, "session_manager", stub)
+
+    import tinker_server.backend.session_index_store as sis
+    import tinker_server.supported_models_gate as gate
+    import tinker_server.gateway as gw
+
+    async def _allow(base_model: str, http_request=None):
+        return base_model
+
+    monkeypatch.setattr(gate, "enforce_base_model_allowed", _allow)
+    monkeypatch.setattr(service_route, "can_access_model", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(gw, "upstream_for_model", lambda _model: None)
+    monkeypatch.setattr(
+        sis,
+        "add_sampler_to_session",
+        lambda session_id, sampler_id, user_id=None, created_at=None: sampler_calls.append(
+            (session_id, sampler_id, user_id, created_at)
+        ),
+    )
+    monkeypatch.setattr(
+        sis,
+        "add_heartbeat_sampler_to_session",
+        lambda session_id, sampler_id, user_id=None, created_at=None: heartbeat_calls.append(
+            (session_id, sampler_id, user_id, created_at)
+        ),
+    )
+    monkeypatch.setattr(sis, "upsert_sampler_index", sampler_index_updates.append)
+    req = CreateSamplingSessionRequest(
+        session_id="sess",
+        sampling_session_seq_id=11,
+        base_model="Qwen/Qwen3-4B-Instruct-2507",
+    )
+    out = anyio.run(service_route.create_sampling_session, req, _dummy_request("u"))
+
+    assert out.sampling_session_id == "sess:sample:11"
+    assert sampler_calls == [("sess", "sess:sample:11", "u", sampler_calls[0][3])]
+    assert heartbeat_calls == []
+    assert detached_sampling_updates == {
+        "sess:sample:11": {
+            "session_id": "sess:sample:11",
+            "base_model": "Qwen/Qwen3-4B-Instruct-2507",
+            "lora_rank": 0,
+            "adapter_path": None,
+            "lora_loaded": False,
+            "lora_int_id": None,
+            "uses_base_model": True,
+            "last_activity": detached_sampling_updates["sess:sample:11"]["last_activity"],
+            "inflight_requests": 0,
+            "metadata_version": 1,
+        }
+    }
+    assert sampler_index_updates == [
+        {
+            "sampler_id": "sess:sample:11",
+            "session_id": "sess",
+            "base_model": "Qwen/Qwen3-4B-Instruct-2507",
+            "user_id": "u",
+            "created_at": sampler_calls[0][3],
+            "source_type": "base_model",
+        }
+    ]
 
 
 def test_asample_deterministic_request_id_dedup(monkeypatch):

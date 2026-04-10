@@ -2592,6 +2592,7 @@ class ApiWorkQueueClient:
                     continue
 
                 try:
+                    running_stage = "prefill" if str(item.op).startswith("sampling.") else "running"
                     await future_store.async_mark_running(
                         item.request_id,
                         meta={
@@ -2600,7 +2601,7 @@ class ApiWorkQueueClient:
                             "generation_id": None if self._consumer_generation_id is None else int(self._consumer_generation_id),
                             "op": item.op,
                             "queue_state": "running",
-                            "stage": "prefill",
+                            "stage": running_stage,
                             "running_at": time.time(),
                         },
                     )
