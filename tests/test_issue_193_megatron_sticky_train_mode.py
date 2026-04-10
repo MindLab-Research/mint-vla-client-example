@@ -2627,6 +2627,79 @@ def test_issue_467_get_lora_state_dict_fails_when_bridge_export_is_missing(monke
         worker.get_lora_state_dict()
 
 
+def test_issue_489_get_lora_state_dict_patches_cpu_ep_gather(monkeypatch):
+    import torch
+    import types
+    from types import SimpleNamespace
+
+    worker, _ = _make_worker(monkeypatch, close_on_optim="0")
+    worker.engine.module = object()
+
+    monkeypatch.setattr(
+        "tinker_server.backend.megatron_distributed.get_model_config",
+        lambda _model: SimpleNamespace(is_moe=True),
+    )
+
+    fake_megatron_module = types.ModuleType("megatron")
+    fake_core_module = types.ModuleType("megatron.core")
+    fake_parallel_state_module = types.ModuleType("megatron.core.parallel_state")
+    fake_parallel_state_module.get_expert_model_parallel_world_size = lambda: 2
+    fake_parallel_state_module.get_expert_model_parallel_rank = lambda: 0
+    fake_parallel_state_module.get_expert_model_parallel_group = lambda: "ep-group"
+    fake_core_module.parallel_state = fake_parallel_state_module
+    fake_bridge_module = types.ModuleType("megatron.bridge")
+    fake_bridge_models_module = types.ModuleType("megatron.bridge.models")
+    fake_bridge_conversion_module = types.ModuleType("megatron.bridge.models.conversion")
+    fake_bridge_param_mapping_module = types.ModuleType("megatron.bridge.models.conversion.param_mapping")
+
+    class _FakeMegatronParamMapping:
+        gather_from_tp_ranks = staticmethod(lambda mapping, tensor: [tensor])
+
+    fake_bridge_param_mapping_module.MegatronParamMapping = _FakeMegatronParamMapping
+    monkeypatch.setitem(sys.modules, "megatron", fake_megatron_module)
+    monkeypatch.setitem(sys.modules, "megatron.core", fake_core_module)
+    monkeypatch.setitem(sys.modules, "megatron.core.parallel_state", fake_parallel_state_module)
+    monkeypatch.setitem(sys.modules, "megatron.bridge", fake_bridge_module)
+    monkeypatch.setitem(sys.modules, "megatron.bridge.models", fake_bridge_models_module)
+    monkeypatch.setitem(sys.modules, "megatron.bridge.models.conversion", fake_bridge_conversion_module)
+    monkeypatch.setitem(sys.modules, "megatron.bridge.models.conversion.param_mapping", fake_bridge_param_mapping_module)
+
+    import torch.distributed as dist
+
+    all_gather_calls: list[tuple[str, object, int]] = []
+    monkeypatch.setattr(dist, "is_gloo_available", lambda: True, raising=False)
+    monkeypatch.setattr(dist, "get_process_group_ranks", lambda _group: [0, 1], raising=False)
+    monkeypatch.setattr(dist, "new_group", lambda *, ranks, backend: (backend, tuple(ranks)), raising=False)
+
+    def fake_all_gather(outputs, tensor, group=None):
+        all_gather_calls.append((tensor.device.type, group, len(outputs)))
+        for out in outputs:
+            out.copy_(tensor)
+
+    monkeypatch.setattr(dist, "all_gather", fake_all_gather, raising=False)
+
+    class FakeBridge:
+        __module__ = "megatron.bridge.fake"
+
+        def _gather_expert_adapter_weight(self, weight):
+            raise RuntimeError("cpu EP gather was not patched")
+
+        def export_adapter_weights(self, _module, cpu=True, show_progress=False):
+            assert cpu is True
+            gathered = self._gather_expert_adapter_weight(torch.ones(2))
+            assert len(gathered) == 2
+            return [("adapter.weight", torch.ones(1))]
+
+    worker.engine.bridge = FakeBridge()
+    original_gather = FakeBridge._gather_expert_adapter_weight
+
+    state_dict = worker.get_lora_state_dict(train_attn=False, train_mlp=True, train_unembed=False)
+
+    assert list(state_dict.keys()) == ["adapter.weight"]
+    assert all_gather_calls == [("cpu", ("gloo", (0, 1)), 2)]
+    assert FakeBridge._gather_expert_adapter_weight is original_gather
+
+
 def test_issue_193_load_optimizer_state_releases_sticky_before_train_mode(monkeypatch, tmp_path):
     worker, _ = _make_worker(monkeypatch, close_on_optim="0")
     import types

@@ -3376,7 +3376,6 @@ class MegatronRankWorker:
                     "Megatron-Bridge export_adapter_weights() is missing "
                     "_megatron_global_adapters_info_all_pp_ranks; cannot apply single-PP export fix"
                 )
-            from collections import defaultdict
             import itertools
 
             from megatron.bridge.models.conversion.model_bridge import _megatron_local_name_to_global
@@ -3482,6 +3481,8 @@ class MegatronRankWorker:
 
             restore_bridge_patch = _restore_bridge_patch
 
+        restore_expert_gather = None
+        bridge_cls = type(bridge)
         if use_bridge_internal_patches:
             import torch
             from megatron.bridge.models.conversion import param_mapping as bridge_param_mapping
@@ -3517,6 +3518,38 @@ class MegatronRankWorker:
                 return gathered
 
             bridge_param_mapping.MegatronParamMapping.gather_from_tp_ranks = _cpu_gloo_gather_from_tp_ranks
+
+            candidate_expert_gather = getattr(bridge_cls, "_gather_expert_adapter_weight", None)
+            if train_mlp and callable(candidate_expert_gather):
+                original_expert_gather = candidate_expert_gather
+                gloo_ep_groups: dict[tuple[int, ...], object] = {}
+
+                def _cpu_safe_gather_expert_adapter_weight(bridge_self, weight: torch.Tensor):
+                    if not isinstance(weight, torch.Tensor) or weight.device.type != "cpu":
+                        return original_expert_gather(bridge_self, weight)
+
+                    from megatron.core import parallel_state as patch_mpu
+
+                    local_ep_size = int(patch_mpu.get_expert_model_parallel_world_size())
+                    if local_ep_size <= 1:
+                        return None
+                    if not dist.is_gloo_available():
+                        raise RuntimeError("Gloo backend is unavailable; cannot run CPU EP gather for adapter export")
+
+                    ep_group_for_ranks = patch_mpu.get_expert_model_parallel_group()
+                    group_ranks = tuple(dist.get_process_group_ranks(ep_group_for_ranks))
+                    gloo_group = gloo_ep_groups.get(group_ranks)
+                    if gloo_group is None:
+                        gloo_group = dist.new_group(ranks=list(group_ranks), backend="gloo")
+                        gloo_ep_groups[group_ranks] = gloo_group
+
+                    cpu_weight = weight.detach().cpu().contiguous()
+                    gathered = [torch.empty_like(cpu_weight) for _ in range(local_ep_size)]
+                    dist.all_gather(gathered, cpu_weight, group=gloo_group)
+                    return gathered
+
+                bridge_cls._gather_expert_adapter_weight = _cpu_safe_gather_expert_adapter_weight
+                restore_expert_gather = original_expert_gather
         else:
             bridge_param_mapping = None
             restore_tp_gather = None
@@ -3534,6 +3567,8 @@ class MegatronRankWorker:
         finally:
             if bridge_param_mapping is not None and restore_tp_gather is not None:
                 bridge_param_mapping.MegatronParamMapping.gather_from_tp_ranks = restore_tp_gather
+            if restore_expert_gather is not None:
+                bridge_cls._gather_expert_adapter_weight = restore_expert_gather
             if restore_bridge_patch is not None:
                 restore_bridge_patch()
 
