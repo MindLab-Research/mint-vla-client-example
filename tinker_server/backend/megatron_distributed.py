@@ -3308,7 +3308,6 @@ class MegatronRankWorker:
 
     def get_lora_state_dict(
         self,
-        use_per_expert_lora: bool = False,
         *,
         train_attn: bool | None = None,
         train_mlp: bool | None = None,
@@ -3325,9 +3324,8 @@ class MegatronRankWorker:
         tensors; other ranks return an empty dict.
         """
         logger.info(
-            "[Rank %s] get_lora_state_dict: ENTRY use_per_expert_lora=%s train_attn=%s train_mlp=%s train_unembed=%s",
+            "[Rank %s] get_lora_state_dict: ENTRY train_attn=%s train_mlp=%s train_unembed=%s",
             self.rank,
-            use_per_expert_lora,
             train_attn,
             train_mlp,
             train_unembed,
@@ -3346,6 +3344,18 @@ class MegatronRankWorker:
                 "Megatron-Bridge export_adapter_weights() is required for LoRA export; "
                 "the legacy custom export path has been removed"
             )
+        bridge_module = type(bridge).__module__
+        use_bridge_internal_patches = bridge_module.startswith("megatron.bridge.")
+
+        def _allow_exported_name(export_name: str) -> bool:
+            tgt = self._classify_lora_param_target(export_name.lower())
+            if tgt == "attn":
+                return train_attn
+            if tgt == "mlp":
+                return train_mlp
+            if tgt == "unembed":
+                return train_unembed
+            return True
 
         try:
             from megatron.core import parallel_state as mpu
@@ -3355,7 +3365,7 @@ class MegatronRankWorker:
             pipeline_world_size = None
 
         restore_bridge_patch = None
-        if pipeline_world_size == 1:
+        if use_bridge_internal_patches and pipeline_world_size == 1:
             from megatron.bridge.models.conversion import model_bridge as bridge_dispatch
 
             bridge_impl = bridge_dispatch.get_model_bridge(bridge._causal_lm_architecture)
@@ -3472,40 +3482,44 @@ class MegatronRankWorker:
 
             restore_bridge_patch = _restore_bridge_patch
 
-        import torch
-        from megatron.bridge.models.conversion import param_mapping as bridge_param_mapping
-        import torch.distributed as dist
+        if use_bridge_internal_patches:
+            import torch
+            from megatron.bridge.models.conversion import param_mapping as bridge_param_mapping
+            import torch.distributed as dist
 
-        restore_tp_gather = bridge_param_mapping.MegatronParamMapping.gather_from_tp_ranks
-        gloo_tp_groups: dict[tuple[int, ...], object] = {}
+            restore_tp_gather = bridge_param_mapping.MegatronParamMapping.gather_from_tp_ranks
+            gloo_tp_groups: dict[tuple[int, ...], object] = {}
 
-        def _cpu_gloo_gather_from_tp_ranks(mapping, tensor: torch.Tensor) -> list[torch.Tensor]:
-            if mapping.tp_size == 1:
-                return [tensor]
+            def _cpu_gloo_gather_from_tp_ranks(mapping, tensor: torch.Tensor) -> list[torch.Tensor]:
+                if mapping.tp_size == 1:
+                    return [tensor]
 
-            if not dist.is_gloo_available():
-                raise RuntimeError("Gloo backend is unavailable; cannot run CPU TP gather for adapter export")
+                if not dist.is_gloo_available():
+                    raise RuntimeError("Gloo backend is unavailable; cannot run CPU TP gather for adapter export")
 
-            group_ranks = tuple(dist.get_process_group_ranks(mapping.tp_group))
-            gloo_group = gloo_tp_groups.get(group_ranks)
-            if gloo_group is None:
-                gloo_group = dist.new_group(ranks=list(group_ranks), backend="gloo")
-                gloo_tp_groups[group_ranks] = gloo_group
+                group_ranks = tuple(dist.get_process_group_ranks(mapping.tp_group))
+                gloo_group = gloo_tp_groups.get(group_ranks)
+                if gloo_group is None:
+                    gloo_group = dist.new_group(ranks=list(group_ranks), backend="gloo")
+                    gloo_tp_groups[group_ranks] = gloo_group
 
-            try:
-                cpu_tensor = tensor.detach().cpu().contiguous()
-            except Exception as exc:
-                raise RuntimeError(
-                    "Megatron-Bridge adapter export failed before TP gather could start: "
-                    f"hf_param={getattr(mapping, 'hf_param', None)!r} "
-                    f"shape={tuple(tensor.shape)} dtype={tensor.dtype} device={tensor.device} "
-                    f"tp_rank={getattr(mapping, 'tp_rank', None)!r} tp_size={getattr(mapping, 'tp_size', None)!r}"
-                ) from exc
-            gathered = [torch.empty_like(cpu_tensor) for _ in range(mapping.tp_size)]
-            dist.all_gather(gathered, cpu_tensor, group=gloo_group)
-            return gathered
+                try:
+                    cpu_tensor = tensor.detach().cpu().contiguous()
+                except Exception as exc:
+                    raise RuntimeError(
+                        "Megatron-Bridge adapter export failed before TP gather could start: "
+                        f"hf_param={getattr(mapping, 'hf_param', None)!r} "
+                        f"shape={tuple(tensor.shape)} dtype={tensor.dtype} device={tensor.device} "
+                        f"tp_rank={getattr(mapping, 'tp_rank', None)!r} tp_size={getattr(mapping, 'tp_size', None)!r}"
+                    ) from exc
+                gathered = [torch.empty_like(cpu_tensor) for _ in range(mapping.tp_size)]
+                dist.all_gather(gathered, cpu_tensor, group=gloo_group)
+                return gathered
 
-        bridge_param_mapping.MegatronParamMapping.gather_from_tp_ranks = _cpu_gloo_gather_from_tp_ranks
+            bridge_param_mapping.MegatronParamMapping.gather_from_tp_ranks = _cpu_gloo_gather_from_tp_ranks
+        else:
+            bridge_param_mapping = None
+            restore_tp_gather = None
 
         adapter_state: dict[str, torch.Tensor] = {}
         try:
@@ -3515,10 +3529,11 @@ class MegatronRankWorker:
                     cpu=True,
                     show_progress=False,
                 ):
-                    if self.rank == 0:
+                    if self.rank == 0 and _allow_exported_name(str(name)):
                         adapter_state[str(name)] = tensor.clone()
         finally:
-            bridge_param_mapping.MegatronParamMapping.gather_from_tp_ranks = restore_tp_gather
+            if bridge_param_mapping is not None and restore_tp_gather is not None:
+                bridge_param_mapping.MegatronParamMapping.gather_from_tp_ranks = restore_tp_gather
             if restore_bridge_patch is not None:
                 restore_bridge_patch()
 
@@ -4078,7 +4093,9 @@ class MegatronRankWorker:
         save_path: str,
         step_count: int = 0,
         actual_rank: int | None = None,
-        use_per_expert_lora: bool = False,
+        train_attn: bool | None = None,
+        train_mlp: bool | None = None,
+        train_unembed: bool | None = None,
         traceparent: str | None = None,
     ) -> dict:
         """Save checkpoint: LoRA weights + config + training metadata.
@@ -4091,8 +4108,6 @@ class MegatronRankWorker:
             step_count: Current training step (passed from MegatronWorkerGroup).
             actual_rank: Actual LoRA rank for current session (Phase 7).
                          If None, falls back to self.lora_rank (max_lora_rank).
-            use_per_expert_lora: If True, expand shared MLP LoRA to per-expert format for MoE.
-
         Returns:
             Dict with training metadata (rank 0 only, others return empty).
         """
@@ -4105,7 +4120,11 @@ class MegatronRankWorker:
 
         # ALL ranks must call get_lora_state_dict - it uses NCCL collectives
         # Only rank 0 gets actual data, others get empty dict
-        state_dict = self.get_lora_state_dict(use_per_expert_lora=use_per_expert_lora)
+        state_dict = self.get_lora_state_dict(
+            train_attn=train_attn,
+            train_mlp=train_mlp,
+            train_unembed=train_unembed,
+        )
 
         os.makedirs(save_path, exist_ok=True)
 
@@ -4144,9 +4163,8 @@ class MegatronRankWorker:
             "q_proj", "k_proj", "v_proj", "o_proj",
         ] if not model_is_mla else [
             "q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj",
-        ]
-        # MoE: include MLP/expert targets only when exporting per-expert LoRA.
-        if (not model_is_moe) or use_per_expert_lora:
+        ] if train_attn else []
+        if train_mlp:
             target_modules += ["gate_proj", "up_proj", "down_proj"]
         target_modules = self._infer_target_modules_from_state_dict(
             state_dict=state_dict,
@@ -4184,7 +4202,6 @@ class MegatronRankWorker:
         save_path: str,
         step_count: int = 0,
         actual_rank: int | None = None,
-        use_per_expert_lora: bool = False,
         train_attn: bool | None = None,
         train_mlp: bool | None = None,
         train_unembed: bool | None = None,
@@ -4203,7 +4220,6 @@ class MegatronRankWorker:
 
         # ALL ranks must call get_lora_state_dict - it uses NCCL collectives.
         state_dict = self.get_lora_state_dict(
-            use_per_expert_lora=use_per_expert_lora,
             train_attn=train_attn,
             train_mlp=train_mlp,
             train_unembed=train_unembed,
@@ -4228,9 +4244,8 @@ class MegatronRankWorker:
             "q_proj", "k_proj", "v_proj", "o_proj",
         ] if not model_is_mla else [
             "q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj",
-        ]
-        # MoE: include MLP/expert targets only when exporting per-expert LoRA.
-        if (not model_is_moe) or use_per_expert_lora:
+        ] if train_attn else []
+        if train_mlp:
             target_modules += ["gate_proj", "up_proj", "down_proj"]
         target_modules = self._infer_target_modules_from_state_dict(
             state_dict=state_dict,
@@ -6797,23 +6812,35 @@ class MegatronWorkerGroup:
             }
         }
 
-    def get_lora_state_dict(self, use_per_expert_lora: bool = False) -> dict:
+    def get_lora_state_dict(
+        self,
+        *,
+        train_attn: bool | None = None,
+        train_mlp: bool | None = None,
+        train_unembed: bool | None = None,
+    ) -> dict:
         """Get LoRA state dict from all workers (rank 0 returns data, others empty).
 
         IMPORTANT: Must call ALL workers in parallel because bridge.export_weights()
         may use NCCL collectives internally. Calling only rank 0 would deadlock.
-
-        Args:
-            use_per_expert_lora: If True, expand shared MLP LoRA to per-expert format
-                for vLLM FusedMoEWithLoRA compatibility.
         """
-        logger.info(f"[MegatronWorkerGroup] get_lora_state_dict: ENTRY (use_per_expert_lora={use_per_expert_lora})")
+        logger.info(
+            f"[MegatronWorkerGroup] get_lora_state_dict: ENTRY "
+            f"(train_attn={train_attn}, train_mlp={train_mlp}, train_unembed={train_unembed})"
+        )
         logger.info(f"[MegatronWorkerGroup] Calling get_lora_state_dict.remote() on all {len(self.workers)} workers...")
 
         try:
             # Call ALL workers - bridge.export_weights() may use NCCL allgather
             # Rank 0 returns actual data, other ranks return empty dict
-            futures = [w.get_lora_state_dict.remote(use_per_expert_lora) for w in self.workers]
+            futures = [
+                w.get_lora_state_dict.remote(
+                    train_attn=train_attn,
+                    train_mlp=train_mlp,
+                    train_unembed=train_unembed,
+                )
+                for w in self.workers
+            ]
             results = ray.get(futures, timeout=300)  # Increased timeout for large MoE models
 
             # Rank 0's result has the actual data
@@ -7249,7 +7276,6 @@ class MegatronWorkerGroup:
     def save_checkpoint(
         self,
         save_path: str,
-        use_per_expert_lora: bool = False,
         traceparent: str | None = None,
         *,
         session_id: str | None = None,
@@ -7265,8 +7291,6 @@ class MegatronWorkerGroup:
 
         Args:
             save_path: Directory path to save checkpoint files.
-            use_per_expert_lora: If True, expand shared MLP LoRA to per-expert format for MoE.
-
         Returns:
             Dict with training metadata (from rank 0).
         """
@@ -7285,7 +7309,7 @@ class MegatronWorkerGroup:
 
         logger.info(
             f"[MegatronWorkerGroup] save_checkpoint: {save_path} "
-            f"(session_id={effective_session_id}, actual_rank={self._actual_rank}, use_per_expert_lora={use_per_expert_lora})"
+            f"(session_id={effective_session_id}, actual_rank={self._actual_rank})"
         )
         # Call ALL workers - get_lora_state_dict uses NCCL allgather
         # Rank 0 saves to disk, other ranks participate in collectives then return empty
@@ -7294,7 +7318,9 @@ class MegatronWorkerGroup:
                 save_path,
                 self._step_count,
                 self._actual_rank,
-                use_per_expert_lora,
+                train_attn=train_attn,
+                train_mlp=train_mlp,
+                train_unembed=train_unembed,
                 traceparent=traceparent,
             )
             for w in self.workers
@@ -7352,7 +7378,6 @@ class MegatronWorkerGroup:
     def save_lora_weights(
         self,
         save_path: str,
-        use_per_expert_lora: bool = False,
         traceparent: str | None = None,
         *,
         session_id: str | None = None,
@@ -7379,14 +7404,13 @@ class MegatronWorkerGroup:
 
         logger.info(
             f"[MegatronWorkerGroup] save_lora_weights: {save_path} "
-            f"(session_id={effective_session_id}, actual_rank={self._actual_rank}, use_per_expert_lora={use_per_expert_lora})"
+            f"(session_id={effective_session_id}, actual_rank={self._actual_rank})"
         )
         futures = [
             w.save_lora_weights.remote(
                 save_path,
                 self._step_count,
                 self._actual_rank,
-                use_per_expert_lora,
                 train_attn=train_attn,
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
