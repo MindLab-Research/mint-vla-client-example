@@ -67,6 +67,9 @@ def test_issue_439_megatron_diagnostics_report_requested_nodes() -> None:
     group.workers = [object(), object(), object(), object()]
     group.base_model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
     group.lora_rank = 8
+    group._current_session = None
+    group._session_manager = SimpleNamespace(list_persisted_actor_only_state=lambda actor_name=None: {})
+    group._get_session_cache_store_diagnostics = lambda: {"global": {}, "actor": {}}
     group._placement_bundle_node_ips = ["192.168.38.175"] * 4
     group._placement_requested_node_ips = ["192.168.38.175"] * 4
 

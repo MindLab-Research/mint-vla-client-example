@@ -3,6 +3,7 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 
 future_store_module = importlib.import_module("tinker_server.backend.future_store")
 from tinker_server.backend import sampling_cleanup_executor as cleanup_executor_module
@@ -146,6 +147,31 @@ async def test_issue_369_detached_sampling_cleanup_keeps_shared_adapter_loaded(m
 
 
 @pytest.mark.anyio
+async def test_issue_369_sampling_heartbeat_sampling_store_failure_is_503(monkeypatch) -> None:
+    touched = []
+
+    class _StubSessionManager:
+        def mark_session_inflight(self, session_id: str, delta: int) -> None:
+            touched.append((session_id, delta))
+
+    async def _async_update(session_id: str):
+        touched.append(("heartbeat", session_id))
+
+    async def _async_set_last_activity(_session_id: str, _last_activity: float):
+        raise RuntimeError("store down")
+
+    service_route.session_manager = _StubSessionManager()
+    monkeypatch.setattr("tinker_server.routes.service.session_heartbeat_store.async_update", _async_update)
+    monkeypatch.setattr(sampling_store_module, "async_set_sampling_session_last_activity", _async_set_last_activity)
+
+    http_request = SimpleNamespace(state=SimpleNamespace(user_data=None))
+    with pytest.raises(HTTPException, match="Sampling session store unavailable"):
+        await service_route.session_heartbeat(SimpleNamespace(session_id="sess-heartbeat"), http_request)
+
+    assert touched == [("heartbeat", "sess-heartbeat")]
+
+
+@pytest.mark.anyio
 async def test_issue_369_sampling_heartbeat_updates_detached_last_activity(monkeypatch) -> None:
     touched = []
     local_refresh = []
@@ -165,7 +191,13 @@ async def test_issue_369_sampling_heartbeat_updates_detached_last_activity(monke
     monkeypatch.setattr("tinker_server.routes.service.session_heartbeat_store.async_update", _async_update)
     monkeypatch.setattr(sampling_store_module, "async_set_sampling_session_last_activity", _async_set_last_activity)
 
-    await service_route.session_heartbeat(SimpleNamespace(session_id="sess-heartbeat"))
+    async def _noop_touch_child_sampler_sessions(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(service_route, "_touch_child_sampler_sessions", _noop_touch_child_sampler_sessions)
+
+    http_request = SimpleNamespace(state=SimpleNamespace(user_data=None))
+    await service_route.session_heartbeat(SimpleNamespace(session_id="sess-heartbeat"), http_request)
 
     assert touched[0] == ("heartbeat", "sess-heartbeat")
     assert touched[1][0] == "sampling_last_activity"

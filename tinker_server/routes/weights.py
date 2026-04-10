@@ -1615,6 +1615,13 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
                 checkpoint_type = metadata.get("checkpoint_type")
                 if checkpoint_type not in ("training", "sampler"):
                     continue
+                try:
+                    if checkpoint_type == "sampler":
+                        validate_sampler_checkpoint_for_sampling(ckpt_path)
+                    else:
+                        validate_checkpoint_dir(ckpt_path, checkpoint_type=checkpoint_type)
+                except ValueError:
+                    continue
                 storage_tier = metadata.get("storage_tier")
                 mirror_status = metadata.get("mirror_status")
                 mirror_error = metadata.get("mirror_error")

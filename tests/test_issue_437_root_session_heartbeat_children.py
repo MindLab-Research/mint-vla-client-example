@@ -16,6 +16,16 @@ def _dummy_request(user_id: str | None = None):
     return SimpleNamespace(state=SimpleNamespace(user_data=user_data))
 
 
+def _stub_sampling_last_activity(monkeypatch) -> None:
+    async def _noop_async_set_last_activity(_session_id: str, _last_activity: float):
+        return None
+
+    monkeypatch.setattr(
+        "tinker_server.backend.sampling_session_store.async_set_sampling_session_last_activity",
+        _noop_async_set_last_activity,
+    )
+
+
 @pytest.mark.anyio
 async def test_issue_437_root_heartbeat_touches_explicit_heartbeat_children(monkeypatch) -> None:
     from tinker_server.models.types import SessionHeartbeatRequest
@@ -34,6 +44,7 @@ async def test_issue_437_root_heartbeat_touches_explicit_heartbeat_children(monk
     monkeypatch.setattr(service, "session_manager", _SessionManager())
     monkeypatch.setattr(service, "session_heartbeat_store", SimpleNamespace(update=updates.append))
     monkeypatch.setattr(service, "run_in_threadpool", _fake_run_in_threadpool)
+    _stub_sampling_last_activity(monkeypatch)
 
     import tinker_server.backend.session_index_store as sis
 
@@ -62,7 +73,7 @@ async def test_issue_437_root_heartbeat_touches_explicit_heartbeat_children(monk
 
 
 @pytest.mark.anyio
-async def test_issue_437_root_heartbeat_skips_children_without_explicit_heartbeat_ids(monkeypatch) -> None:
+async def test_issue_437_root_heartbeat_derives_training_checkpoint_children_only(monkeypatch) -> None:
     from tinker_server.models.types import SessionHeartbeatRequest
     from tinker_server.routes import service
 
@@ -79,6 +90,7 @@ async def test_issue_437_root_heartbeat_skips_children_without_explicit_heartbea
     monkeypatch.setattr(service, "session_manager", _SessionManager())
     monkeypatch.setattr(service, "session_heartbeat_store", SimpleNamespace(update=updates.append))
     monkeypatch.setattr(service, "run_in_threadpool", _fake_run_in_threadpool)
+    _stub_sampling_last_activity(monkeypatch)
 
     import tinker_server.backend.session_index_store as sis
 
@@ -92,6 +104,15 @@ async def test_issue_437_root_heartbeat_skips_children_without_explicit_heartbea
             "sampler_ids": ["child-sampler", "other-checkpoint", "base-model"],
         },
     )
+    monkeypatch.setattr(
+        sis,
+        "get_sampler_index",
+        lambda sampler_id: {
+            "child-sampler": {"source_type": "checkpoint", "model_id": "train-a"},
+            "other-checkpoint": {"source_type": "checkpoint", "model_id": "train-b"},
+            "base-model": {"source_type": "base_model"},
+        }.get(sampler_id),
+    )
 
     resp = await service.session_heartbeat(
         SessionHeartbeatRequest(session_id="root-session"),
@@ -100,7 +121,10 @@ async def test_issue_437_root_heartbeat_skips_children_without_explicit_heartbea
 
     assert resp.type == "session_heartbeat"
     assert updates == ["root-session"]
-    assert touched == [("root-session", 0)]
+    assert touched == [
+        ("root-session", 0),
+        ("child-sampler", 0),
+    ]
 
 
 @pytest.mark.anyio
@@ -123,6 +147,7 @@ async def test_issue_437_root_heartbeat_ignores_missing_child_samplers(monkeypat
     monkeypatch.setattr(service, "session_manager", _SessionManager())
     monkeypatch.setattr(service, "session_heartbeat_store", SimpleNamespace(update=updates.append))
     monkeypatch.setattr(service, "run_in_threadpool", _fake_run_in_threadpool)
+    _stub_sampling_last_activity(monkeypatch)
 
     import tinker_server.backend.session_index_store as sis
 
@@ -167,6 +192,7 @@ async def test_issue_437_root_heartbeat_skips_child_fanout_for_owner_mismatch(mo
     monkeypatch.setattr(service, "session_manager", _SessionManager())
     monkeypatch.setattr(service, "session_heartbeat_store", SimpleNamespace(update=updates.append))
     monkeypatch.setattr(service, "run_in_threadpool", _fake_run_in_threadpool)
+    _stub_sampling_last_activity(monkeypatch)
 
     import tinker_server.backend.session_index_store as sis
 
@@ -210,6 +236,7 @@ async def test_issue_437_root_heartbeat_keeps_best_effort_on_index_failure(monke
     monkeypatch.setattr(service, "session_manager", _SessionManager())
     monkeypatch.setattr(service, "session_heartbeat_store", SimpleNamespace(update=updates.append))
     monkeypatch.setattr(service, "run_in_threadpool", _fake_run_in_threadpool)
+    _stub_sampling_last_activity(monkeypatch)
 
     import tinker_server.backend.session_index_store as sis
 

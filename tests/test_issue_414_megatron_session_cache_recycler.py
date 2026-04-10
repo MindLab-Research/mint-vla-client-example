@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import sys
 import time
 from pathlib import Path
 
@@ -204,7 +203,7 @@ def test_issue_414_load_checkpoint_without_optimizer_invalidates_existing_extern
     group._resolve_required_session_id = lambda session_id, op: session_id
     group._prepare_session_for_explicit_load = lambda session_id, traceparent=None: None
     group.load_adapter_state = lambda *args, **kwargs: {"status": "ok"}
-    group.reset_optimizer = lambda learning_rate, traceparent=None: {"status": "ok", "learning_rate": learning_rate}
+    group.reset_optimizer = lambda learning_rate, traceparent=None, zero_grad_buffers=True: {"status": "ok", "learning_rate": learning_rate}
     group._session_manager = manager
 
     out = group.load_checkpoint(str(load_path), load_optimizer=False, session_id="sess-2")
@@ -249,7 +248,7 @@ def test_issue_414_load_checkpoint_without_optimizer_stales_marker_before_reset(
     group._resolve_required_session_id = lambda session_id, op: session_id
     group._prepare_session_for_explicit_load = lambda session_id, traceparent=None: None
     group.load_adapter_state = lambda *args, **kwargs: {"status": "ok"}
-    group.reset_optimizer = lambda learning_rate, traceparent=None: (_ for _ in ()).throw(RuntimeError("reset failed"))
+    group.reset_optimizer = lambda learning_rate, traceparent=None, zero_grad_buffers=True: (_ for _ in ()).throw(RuntimeError("reset failed"))
     group._session_manager = manager
 
     with pytest.raises(RuntimeError, match="reset failed"):
@@ -297,7 +296,7 @@ def test_issue_414_reinit_lora_weights_invalidates_existing_external_checkpoint(
     group._bind_traceparent = lambda traceparent: None
     group._session_manager = manager
 
-    monkeypatch.setattr(sys.modules[MegatronWorkerGroup.__module__].ray, "get", lambda refs: refs)
+    monkeypatch.setattr("tinker_server.backend.megatron_distributed.ray.get", lambda refs, timeout=None: refs)
 
     out = group.reinit_lora_weights()
 
@@ -309,11 +308,16 @@ def test_issue_414_reinit_lora_weights_invalidates_existing_external_checkpoint(
 
 
 def test_issue_414_save_checkpoint_marks_external_checkpoint(monkeypatch: pytest.MonkeyPatch):
+    class _RemoteSaveCheckpoint:
+        def remote(self, *args, **kwargs):
+            return {}
+
     group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
     group = object.__new__(group_cls)
-    group.workers = []
+    group.workers = [type("W", (), {"save_checkpoint": _RemoteSaveCheckpoint()})()]
     group.base_model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
     group.config = type("Cfg", (), {"world_size": 1})()
+    group._step_count = 0
     group._actual_rank = 8
     group._bind_traceparent = lambda traceparent: None
     group._resolve_required_session_id = lambda session_id, op: session_id
@@ -332,7 +336,7 @@ def test_issue_414_save_checkpoint_marks_external_checkpoint(monkeypatch: pytest
         },
     )()
 
-    monkeypatch.setattr(sys.modules[MegatronWorkerGroup.__module__].ray, "get", lambda refs, timeout=None: [{}])
+    monkeypatch.setattr("tinker_server.backend.megatron_distributed.ray.get", lambda refs, timeout=None: [{}])
 
     out = group.save_checkpoint("/checkpoints/alice/model_x/ckpt_7", session_id="sess-1")
 
