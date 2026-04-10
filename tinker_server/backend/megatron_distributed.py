@@ -4073,7 +4073,7 @@ class MegatronRankWorker:
         import re
 
         pat = re.compile(
-            r"\.(q_a_proj|q_b_proj|kv_a_proj_with_mqa|kv_b_proj|q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)\.lora_[AB]\.weight$"
+            r"\.(q_a_proj|q_b_proj|kv_a_proj_with_mqa|kv_b_proj|q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj|lm_head|output_layer|unembed)\.lora_[AB]\.weight$"
         )
         present: set[str] = set()
         for key in state_dict.keys():
@@ -4087,6 +4087,36 @@ class MegatronRankWorker:
         ordered = [name for name in fallback_modules if name in present]
         extras = sorted(present.difference(set(fallback_modules)))
         return ordered + extras
+
+    @staticmethod
+    def _target_modules_for_export(
+        *,
+        model_is_mla: bool,
+        train_attn: bool | None,
+        train_mlp: bool | None,
+        train_unembed: bool | None,
+        state_dict: dict,
+    ) -> list[str]:
+        fallback_modules: list[str] = []
+        if train_attn:
+            if model_is_mla:
+                fallback_modules += [
+                    "q_a_proj",
+                    "q_b_proj",
+                    "kv_a_proj_with_mqa",
+                    "kv_b_proj",
+                    "o_proj",
+                ]
+            else:
+                fallback_modules += ["q_proj", "k_proj", "v_proj", "o_proj"]
+        if train_mlp:
+            fallback_modules += ["gate_proj", "up_proj", "down_proj"]
+        if train_unembed:
+            fallback_modules += ["lm_head", "output_layer"]
+        return MegatronRankWorker._infer_target_modules_from_state_dict(
+            state_dict=state_dict,
+            fallback_modules=fallback_modules,
+        )
 
     def save_checkpoint(
         self,
@@ -4155,20 +4185,14 @@ class MegatronRankWorker:
         try:
             cfg = get_model_config(self.base_model)
             model_is_mla = cfg.is_mla
-            model_is_moe = cfg.is_moe
         except ValueError:
             model_is_mla = False
-            model_is_moe = False
-        target_modules = [
-            "q_proj", "k_proj", "v_proj", "o_proj",
-        ] if not model_is_mla else [
-            "q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj",
-        ] if train_attn else []
-        if train_mlp:
-            target_modules += ["gate_proj", "up_proj", "down_proj"]
-        target_modules = self._infer_target_modules_from_state_dict(
+        target_modules = self._target_modules_for_export(
+            model_is_mla=model_is_mla,
+            train_attn=train_attn,
+            train_mlp=train_mlp,
+            train_unembed=train_unembed,
             state_dict=state_dict,
-            fallback_modules=target_modules,
         )
         # Include attention modules; add MLP modules only when trained
         config = {
@@ -4236,20 +4260,14 @@ class MegatronRankWorker:
         try:
             cfg = get_model_config(self.base_model)
             model_is_mla = cfg.is_mla
-            model_is_moe = cfg.is_moe
         except ValueError:
             model_is_mla = False
-            model_is_moe = False
-        target_modules = [
-            "q_proj", "k_proj", "v_proj", "o_proj",
-        ] if not model_is_mla else [
-            "q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj",
-        ] if train_attn else []
-        if train_mlp:
-            target_modules += ["gate_proj", "up_proj", "down_proj"]
-        target_modules = self._infer_target_modules_from_state_dict(
+        target_modules = self._target_modules_for_export(
+            model_is_mla=model_is_mla,
+            train_attn=train_attn,
+            train_mlp=train_mlp,
+            train_unembed=train_unembed,
             state_dict=state_dict,
-            fallback_modules=target_modules,
         )
         config = {
             "r": effective_rank,
