@@ -2646,6 +2646,8 @@ def test_issue_489_get_lora_state_dict_patches_cpu_ep_gather(monkeypatch):
     fake_megatron_module = types.ModuleType("megatron")
     fake_core_module = types.ModuleType("megatron.core")
     fake_parallel_state_module = types.ModuleType("megatron.core.parallel_state")
+    fake_parallel_state_module.get_tensor_model_parallel_group = lambda: "tp-group"
+    fake_parallel_state_module.get_expert_tensor_parallel_group = lambda: "etp-group"
     fake_parallel_state_module.get_expert_model_parallel_world_size = lambda: 2
     fake_parallel_state_module.get_expert_model_parallel_rank = lambda: 0
     fake_parallel_state_module.get_expert_model_parallel_group = lambda: "ep-group"
@@ -2671,8 +2673,21 @@ def test_issue_489_get_lora_state_dict_patches_cpu_ep_gather(monkeypatch):
 
     all_gather_calls: list[tuple[str, object, int]] = []
     monkeypatch.setattr(dist, "is_gloo_available", lambda: True, raising=False)
+    monkeypatch.setattr(dist, "get_rank", lambda: 0, raising=False)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 2, raising=False)
     monkeypatch.setattr(dist, "get_process_group_ranks", lambda _group: [0, 1], raising=False)
-    monkeypatch.setattr(dist, "new_group", lambda *, ranks, backend: (backend, tuple(ranks)), raising=False)
+    monkeypatch.setattr(
+        dist,
+        "new_group",
+        lambda *, ranks, backend, timeout=None: (backend, tuple(ranks)),
+        raising=False,
+    )
+
+    def fake_all_gather_object(outputs, value):
+        for i in range(len(outputs)):
+            outputs[i] = value
+
+    monkeypatch.setattr(dist, "all_gather_object", fake_all_gather_object, raising=False)
 
     def fake_all_gather(outputs, tensor, group=None):
         all_gather_calls.append((tensor.device.type, group, len(outputs)))

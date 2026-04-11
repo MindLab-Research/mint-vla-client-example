@@ -3519,9 +3519,12 @@ class MegatronRankWorker:
 
             restore_bridge_patch = _restore_bridge_patch
         elif use_bridge_internal_patches:
-            from megatron.bridge.models.conversion import model_bridge as bridge_dispatch
-
-            peft_bridge_cls = type(bridge_dispatch.get_model_bridge(bridge._causal_lm_architecture))
+            try:
+                from megatron.bridge.models.conversion import model_bridge as bridge_dispatch
+            except ImportError:
+                bridge_dispatch = None
+            if bridge_dispatch is not None and hasattr(bridge, "_causal_lm_architecture"):
+                peft_bridge_cls = type(bridge_dispatch.get_model_bridge(bridge._causal_lm_architecture))
 
         restore_expert_gather = None
         bridge_cls = type(bridge)
