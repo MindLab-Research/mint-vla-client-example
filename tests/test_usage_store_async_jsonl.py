@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import multiprocessing
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -11,6 +12,29 @@ from tinker_server.usage_store import UsageEvent
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
+
+
+def _write_usage_event_in_process(
+    path_str: str,
+    request_id: str,
+    charge_item: str,
+    label: str,
+    quantity: int,
+    event_time_iso: str,
+    start_event,
+) -> None:
+    start_event.wait(timeout=5)
+    store = usage_store_module.JsonlUsageStore(path=path_str)
+    event = UsageEvent(
+        account_id="aaaaaaaaaaaaaaaaaaaaaaaa",
+        apikey_id="bbbbbbbbbbbbbbbbbbbbbbbb",
+        charge_item=charge_item,
+        quantity=quantity,
+        request_id=request_id,
+        label=label,
+        event_time=datetime.fromisoformat(event_time_iso),
+    )
+    asyncio.run(store.write_event(event))
 
 
 def test_usage_event_defaults():
@@ -326,6 +350,74 @@ async def test_jsonl_usage_store_two_instances_refresh_dedupe_state_before_appen
 
 
 @pytest.mark.anyio
+async def test_jsonl_usage_store_stale_reader_refreshes_after_external_append(tmp_path):
+    path = tmp_path / "usage_event.jsonl"
+    reader = usage_store_module.JsonlUsageStore(path=path)
+    writer = usage_store_module.JsonlUsageStore(path=path)
+
+    logs, count, _ = await reader.query_logs(account_id="aaaaaaaaaaaaaaaaaaaaaaaa", limit=10, offset=0)
+    assert logs == []
+    assert count == 0
+
+    await writer.write_event(
+        UsageEvent(
+            account_id="aaaaaaaaaaaaaaaaaaaaaaaa",
+            apikey_id="bbbbbbbbbbbbbbbbbbbbbbbb",
+            charge_item="training",
+            quantity=10,
+            request_id="req-external-refresh",
+            label="route=training.train_step",
+            event_time=datetime(2026, 3, 12, 10, 0, tzinfo=timezone.utc),
+        )
+    )
+
+    logs, count, _ = await reader.query_logs(account_id="aaaaaaaaaaaaaaaaaaaaaaaa", limit=10, offset=0)
+    assert count == 1
+    assert logs[0]["request_id"] == "req-external-refresh"
+
+
+@pytest.mark.anyio
+async def test_jsonl_usage_store_steady_state_writes_do_not_full_reload(tmp_path, monkeypatch):
+    path = tmp_path / "usage_event.jsonl"
+    store = usage_store_module.JsonlUsageStore(path=path)
+
+    await store.write_event(
+        UsageEvent(
+            account_id="aaaaaaaaaaaaaaaaaaaaaaaa",
+            apikey_id="bbbbbbbbbbbbbbbbbbbbbbbb",
+            charge_item="training",
+            quantity=10,
+            request_id="req-initial",
+            label="route=training.train_step",
+            event_time=datetime(2026, 3, 12, 10, 0, tzinfo=timezone.utc),
+        )
+    )
+
+    calls = {"count": 0}
+    real = store._load_from_stream_locked
+
+    def _counting_load(stream):
+        calls["count"] += 1
+        return real(stream)
+
+    monkeypatch.setattr(store, "_load_from_stream_locked", _counting_load)
+
+    await store.write_event(
+        UsageEvent(
+            account_id="aaaaaaaaaaaaaaaaaaaaaaaa",
+            apikey_id="bbbbbbbbbbbbbbbbbbbbbbbb",
+            charge_item="sampling",
+            quantity=5,
+            request_id="req-second",
+            label="route=sampling.asample",
+            event_time=datetime(2026, 3, 12, 10, 0, 1, tzinfo=timezone.utc),
+        )
+    )
+
+    assert calls["count"] == 0
+
+
+@pytest.mark.anyio
 async def test_jsonl_usage_store_concurrent_writers_preserve_unique_indices(tmp_path):
     path = tmp_path / "usage_event.jsonl"
     base_time = datetime(2026, 3, 12, 10, 0, tzinfo=timezone.utc)
@@ -363,3 +455,49 @@ async def test_jsonl_usage_store_concurrent_writers_preserve_unique_indices(tmp_
     assert count == 2
     assert sorted(log["source_index"] for log in logs) == [1, 2]
     assert sorted(log["request_id"] for log in logs) == ["req-concurrent-1", "req-concurrent-2"]
+
+
+def test_jsonl_usage_store_multiprocess_writers_preserve_unique_indices(tmp_path):
+    path = tmp_path / "usage_event.jsonl"
+    ctx = multiprocessing.get_context("fork")
+    start_event = ctx.Event()
+    p1 = ctx.Process(
+        target=_write_usage_event_in_process,
+        args=(
+            str(path),
+            "req-mp-1",
+            "training",
+            "route=training.train_step",
+            10,
+            datetime(2026, 3, 12, 10, 0, tzinfo=timezone.utc).isoformat(),
+            start_event,
+        ),
+    )
+    p2 = ctx.Process(
+        target=_write_usage_event_in_process,
+        args=(
+            str(path),
+            "req-mp-2",
+            "sampling",
+            "route=sampling.asample",
+            5,
+            datetime(2026, 3, 12, 10, 0, 1, tzinfo=timezone.utc).isoformat(),
+            start_event,
+        ),
+    )
+
+    p1.start()
+    p2.start()
+    start_event.set()
+    p1.join(timeout=10)
+    p2.join(timeout=10)
+
+    assert p1.exitcode == 0
+    assert p2.exitcode == 0
+
+    store = usage_store_module.JsonlUsageStore(path=path)
+    logs, count, _ = asyncio.run(store.query_logs(account_id="aaaaaaaaaaaaaaaaaaaaaaaa", limit=10, offset=0))
+
+    assert count == 2
+    assert sorted(log["source_index"] for log in logs) == [1, 2]
+    assert sorted(log["request_id"] for log in logs) == ["req-mp-1", "req-mp-2"]

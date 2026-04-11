@@ -578,10 +578,28 @@ class JsonlUsageStore:
             raise ValueError(f"invalid usage_event record at {source_name}:{line_no}") from e
         return record
 
+    def _apply_stream_record_locked(self, record: dict) -> None:
+        identity = (
+            record["request_id"],
+            record["charge_item"],
+            record["label"],
+        )
+        if identity in self._known_identities:
+            logger.warning(
+                "skipping duplicate usage_event JSONL row: request_id=%s charge_item=%s label=%s",
+                record["request_id"],
+                record["charge_item"],
+                record["label"],
+            )
+            return
+        self._records.append(record)
+        self._known_identities.add(identity)
+        self._next_source_index = max(self._next_source_index, int(record["source_index"]) + 1)
+
     def _load_from_stream_locked(self, stream) -> None:
-        records: list[dict] = []
-        known_identities: set[tuple[str, str, str]] = set()
-        next_source_index = 1
+        self._records = []
+        self._known_identities = set()
+        self._next_source_index = 1
         stream.seek(0)
         for line_no, raw_line in enumerate(stream, start=1):
             line = raw_line.decode("utf-8").strip()
@@ -593,28 +611,36 @@ class JsonlUsageStore:
             except Exception as e:
                 logger.warning("skipping malformed usage_event JSONL row: %s", e)
                 continue
-            identity = (
-                record["request_id"],
-                record["charge_item"],
-                record["label"],
-            )
-            if identity in known_identities:
-                logger.warning(
-                    "skipping duplicate usage_event JSONL row: request_id=%s charge_item=%s label=%s",
-                    record["request_id"],
-                    record["charge_item"],
-                    record["label"],
-                )
-                continue
-            records.append(record)
-            known_identities.add(identity)
-            next_source_index = max(next_source_index, int(record["source_index"]) + 1)
+            self._apply_stream_record_locked(record)
         stat = os.fstat(stream.fileno())
-        self._records = records
-        self._known_identities = known_identities
-        self._next_source_index = next_source_index
         self._stat_size = int(stat.st_size)
         self._stat_mtime_ns = int(stat.st_mtime_ns)
+        self._loaded = True
+
+    def _refresh_from_stream_locked(self, stream) -> None:
+        stat = os.fstat(stream.fileno())
+        size = int(stat.st_size)
+        mtime_ns = int(stat.st_mtime_ns)
+        if not self._loaded or size < self._stat_size:
+            self._load_from_stream_locked(stream)
+            return
+        if size == self._stat_size and mtime_ns == self._stat_mtime_ns:
+            return
+        stream.seek(self._stat_size)
+        start_line_no = len(self._records) + 1
+        for line_no, raw_line in enumerate(stream, start=start_line_no):
+            line = raw_line.decode("utf-8").strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+                record = self._coerce_record(payload, source_name=str(self._path), line_no=line_no)
+            except Exception as e:
+                logger.warning("skipping malformed usage_event JSONL row: %s", e)
+                continue
+            self._apply_stream_record_locked(record)
+        self._stat_size = size
+        self._stat_mtime_ns = mtime_ns
         self._loaded = True
 
     def _reload_from_disk_locked(self) -> None:
@@ -622,7 +648,7 @@ class JsonlUsageStore:
         with self._path.open("a+b") as f:
             fcntl.flock(f.fileno(), fcntl.LOCK_SH)
             try:
-                self._load_from_stream_locked(f)
+                self._refresh_from_stream_locked(f)
             finally:
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
@@ -631,7 +657,7 @@ class JsonlUsageStore:
         with self._path.open("a+b") as f:
             fcntl.flock(f.fileno(), fcntl.LOCK_EX)
             try:
-                self._load_from_stream_locked(f)
+                self._refresh_from_stream_locked(f)
                 fresh_records: list[dict] = []
                 next_source_index = self._next_source_index
                 for event in events:
@@ -652,7 +678,12 @@ class JsonlUsageStore:
                     fresh_records.append(record)
                 if fresh_records:
                     self._append_records_to_stream_locked(f, fresh_records)
-                    self._load_from_stream_locked(f)
+                    stat = os.fstat(f.fileno())
+                    for record in fresh_records:
+                        self._apply_stream_record_locked(record)
+                    self._stat_size = int(stat.st_size)
+                    self._stat_mtime_ns = int(stat.st_mtime_ns)
+                    self._loaded = True
             finally:
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
