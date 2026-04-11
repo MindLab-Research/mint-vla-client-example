@@ -248,28 +248,77 @@ def test_build_usage_store_warns_when_pg_config_falls_back_to_default_tmp(monkey
     assert "set TINKER_USAGE_LOG_DIR explicitly for a shared pull target" in caplog.text
 
 
-def test_build_usage_store_ignores_non_postgres_backend(monkeypatch, tmp_path, caplog):
+def test_build_usage_store_fails_fast_for_non_postgres_backend(monkeypatch, tmp_path):
     monkeypatch.setattr(usage_store_module.config, "usage_backend", "sqlite")
     monkeypatch.setattr(usage_store_module.config, "usage_pg_dsn", "")
     monkeypatch.setattr(usage_store_module.config, "usage_log_dir", str(tmp_path))
 
-    with caplog.at_level(logging.WARNING):
-        store = usage_store_module._build_usage_store()
-
-    assert isinstance(store, usage_store_module.JsonlUsageStore)
-    assert store._path == tmp_path / "usage_event.jsonl"
-    assert "usage backend 'sqlite' is deprecated and ignored" in caplog.text
+    with pytest.raises(ValueError, match="Unsupported usage backend 'sqlite'"):
+        usage_store_module._build_usage_store()
 
 
-def test_build_usage_store_warns_when_legacy_backend_uses_default_tmp(monkeypatch, caplog):
-    monkeypatch.setattr(usage_store_module.config, "usage_backend", "sqlite")
-    monkeypatch.setattr(usage_store_module.config, "usage_pg_dsn", "")
-    monkeypatch.setattr(usage_store_module.config, "usage_log_dir", "/tmp/tinker_usage")
+@pytest.mark.anyio
+async def test_jsonl_usage_store_two_instances_refresh_source_index_before_append(tmp_path):
+    path = tmp_path / "usage_event.jsonl"
+    base_time = datetime(2026, 3, 12, 10, 0, tzinfo=timezone.utc)
+    first_store = usage_store_module.JsonlUsageStore(path=path)
+    second_store = usage_store_module.JsonlUsageStore(path=path)
 
-    with caplog.at_level(logging.WARNING):
-        store = usage_store_module._build_usage_store()
+    await first_store.query_logs(account_id="aaaaaaaaaaaaaaaaaaaaaaaa", limit=10, offset=0)
+    await second_store.query_logs(account_id="aaaaaaaaaaaaaaaaaaaaaaaa", limit=10, offset=0)
 
-    assert isinstance(store, usage_store_module.JsonlUsageStore)
-    assert store._path == usage_store_module.Path("/tmp/tinker_usage/usage_event.jsonl")
-    assert "usage backend 'sqlite' is deprecated and ignored" in caplog.text
-    assert "set TINKER_USAGE_LOG_DIR explicitly for a shared pull target" in caplog.text
+    await first_store.write_event(
+        UsageEvent(
+            account_id="aaaaaaaaaaaaaaaaaaaaaaaa",
+            apikey_id="bbbbbbbbbbbbbbbbbbbbbbbb",
+            charge_item="training",
+            quantity=10,
+            request_id="req-1",
+            label="route=training.train_step",
+            event_time=base_time,
+        )
+    )
+    await second_store.write_event(
+        UsageEvent(
+            account_id="aaaaaaaaaaaaaaaaaaaaaaaa",
+            apikey_id="bbbbbbbbbbbbbbbbbbbbbbbb",
+            charge_item="sampling",
+            quantity=5,
+            request_id="req-2",
+            label="route=sampling.asample",
+            event_time=base_time + timedelta(seconds=1),
+        )
+    )
+
+    reloaded = usage_store_module.JsonlUsageStore(path=path)
+    logs, count, _ = await reloaded.query_logs(account_id="aaaaaaaaaaaaaaaaaaaaaaaa", limit=10, offset=0)
+
+    assert count == 2
+    assert [log["source_index"] for log in logs] == [2, 1]
+    assert [log["request_id"] for log in logs] == ["req-2", "req-1"]
+
+
+@pytest.mark.anyio
+async def test_jsonl_usage_store_two_instances_refresh_dedupe_state_before_append(tmp_path):
+    path = tmp_path / "usage_event.jsonl"
+    store_a = usage_store_module.JsonlUsageStore(path=path)
+    store_b = usage_store_module.JsonlUsageStore(path=path)
+
+    await store_a.query_logs(account_id="aaaaaaaaaaaaaaaaaaaaaaaa", limit=10, offset=0)
+    await store_b.query_logs(account_id="aaaaaaaaaaaaaaaaaaaaaaaa", limit=10, offset=0)
+
+    event = UsageEvent(
+        account_id="aaaaaaaaaaaaaaaaaaaaaaaa",
+        apikey_id="bbbbbbbbbbbbbbbbbbbbbbbb",
+        charge_item="training",
+        quantity=10,
+        request_id="req-dup",
+        label="route=training.train_step",
+        event_time=datetime(2026, 3, 12, 10, 0, tzinfo=timezone.utc),
+    )
+
+    await store_a.write_event(event)
+    await store_b.write_event(event)
+
+    lines = path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
