@@ -17,7 +17,6 @@ from .runtime_env import (
     env_nonempty as _runtime_env_nonempty,
 )
 from .checkpoints import DEFAULT_RUNTIME_CHECKPOINTS_DIR
-from .ray_utils import require_ray_address
 
 
 def _env_nonempty(environ: dict[str, str], name: str) -> str | None:
@@ -351,10 +350,10 @@ class ServerConfig:
     token_secret_key: str = ""  # Secret for sk- token decryption. If set, accepts encrypted tokens.
     internal_api_token: str = ""  # Shared token for trusting gateway-forwarded billing headers.
 
-    # Usage billing (Postgres only)
-    usage_log_dir: str = "/tmp/tinker_usage"  # deprecated, kept for compatibility
-    usage_backend: str = "postgres"  # postgres
-    usage_pg_dsn: str = ""  # Full PostgreSQL DSN (preferred)
+    # Usage billing
+    usage_log_dir: str = "/tmp/tinker_usage"  # active JSONL sink
+    usage_backend: str = "postgres"  # deprecated, ignored by the producer path
+    usage_pg_dsn: str = ""  # deprecated, ignored by the producer path
     usage_pg_host: str = ""
     usage_pg_port: int = 5432
     usage_pg_database: str = "mint_billing"

@@ -36,10 +36,6 @@ def _default_jsonl_usage_path() -> Path:
     return Path(config.checkpoint_dir) / ".billing" / "usage_event.jsonl"
 
 
-def _is_missing_asyncpg(exc: ModuleNotFoundError) -> bool:
-    return str(getattr(exc, "name", "") or "").strip() == "asyncpg"
-
-
 def _usage_pg_dsn() -> str:
     return str(config.usage_pg_dsn or "").strip()
 
@@ -752,35 +748,29 @@ _usage_store_guard = asyncio.Lock()
 
 
 def _build_usage_store() -> UsageStore:
-    if str(config.usage_backend or "postgres").strip().lower() != "postgres":
-        raise ValueError("Unsupported usage backend. Only postgres is supported")
-    if not _usage_pg_dsn():
-        path = _default_jsonl_usage_path()
+    path = _default_jsonl_usage_path()
+    backend = str(config.usage_backend or "postgres").strip().lower()
+    dsn = _usage_pg_dsn()
+    default_tmp_path = Path("/tmp/tinker_usage/usage_event.jsonl")
+    if backend and backend != "postgres":
         logger.warning(
-            "usage postgres backend has no PG DSN configured; falling back to JSONL usage_event store at %s",
+            "usage backend %r is deprecated and ignored; JSONL usage_event store remains active at %s",
+            backend,
             path,
         )
-        return JsonlUsageStore(path=path)
-    try:
-        _import_asyncpg()
-    except ModuleNotFoundError as e:
-        if not _is_missing_asyncpg(e):
-            raise
-        path = _default_jsonl_usage_path()
+    elif dsn:
         logger.warning(
-            "asyncpg unavailable for postgres usage backend; falling back to JSONL usage_event store at %s: %s",
+            "usage PG config is deprecated and ignored; JSONL usage_event store remains active at %s",
             path,
-            e,
         )
-        return JsonlUsageStore(path=path)
-    return PostgresUsageStore(
-        dsn=_usage_pg_dsn(),
-        pool_min=config.usage_pg_pool_min,
-        pool_max=config.usage_pg_pool_max,
-        write_timeout_ms=config.usage_write_timeout_ms,
-        table=config.usage_pg_table,
-        outbox_path=os.path.join(config.checkpoint_dir, ".billing", "usage_outbox.sqlite3"),
-    )
+    else:
+        logger.info("usage JSONL store active at %s", path)
+    if path == default_tmp_path and (dsn or (backend and backend != "postgres")):
+        logger.warning(
+            "usage JSONL store is using default tmp path %s; set TINKER_USAGE_LOG_DIR explicitly for a shared pull target",
+            path,
+        )
+    return JsonlUsageStore(path=path)
 
 
 async def get_usage_store() -> UsageStore:

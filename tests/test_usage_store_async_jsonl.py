@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -201,44 +202,74 @@ async def test_jsonl_usage_store_does_not_mutate_memory_when_append_fails(tmp_pa
     assert logs[0]["source_index"] == 1
 
 
-def test_build_usage_store_falls_back_to_jsonl_when_asyncpg_missing(monkeypatch, tmp_path):
-    monkeypatch.setattr(usage_store_module.config, "usage_backend", "postgres")
-    monkeypatch.setattr(usage_store_module.config, "usage_pg_dsn", "postgresql://fake")
-    monkeypatch.setattr(usage_store_module.config, "usage_log_dir", str(tmp_path))
-    missing = ModuleNotFoundError("No module named 'asyncpg'")
-    missing.name = "asyncpg"
-    monkeypatch.setattr(usage_store_module, "_import_asyncpg", lambda: (_ for _ in ()).throw(missing))
-
-    store = usage_store_module._build_usage_store()
-
-    assert isinstance(store, usage_store_module.JsonlUsageStore)
-    assert store._path == tmp_path / "usage_event.jsonl"
-
-
-def test_build_usage_store_does_not_mask_non_missing_asyncpg_errors(monkeypatch):
-    monkeypatch.setattr(usage_store_module.config, "usage_backend", "postgres")
-    monkeypatch.setattr(usage_store_module.config, "usage_pg_dsn", "postgresql://fake")
-    monkeypatch.setattr(
-        usage_store_module,
-        "_import_asyncpg",
-        lambda: (_ for _ in ()).throw(RuntimeError("broken asyncpg import")),
-    )
-
-    with pytest.raises(RuntimeError, match="broken asyncpg import"):
-        usage_store_module._build_usage_store()
-
-
-def test_build_usage_store_falls_back_to_jsonl_when_pg_dsn_missing(monkeypatch, tmp_path):
+def test_build_usage_store_logs_jsonl_path_without_pg_config(monkeypatch, tmp_path, caplog):
     monkeypatch.setattr(usage_store_module.config, "usage_backend", "postgres")
     monkeypatch.setattr(usage_store_module.config, "usage_pg_dsn", "")
     monkeypatch.setattr(usage_store_module.config, "usage_log_dir", str(tmp_path))
-    monkeypatch.setattr(
-        usage_store_module,
-        "_import_asyncpg",
-        lambda: (_ for _ in ()).throw(AssertionError("asyncpg import should not run without PG DSN")),
-    )
 
-    store = usage_store_module._build_usage_store()
+    with caplog.at_level(logging.INFO):
+        store = usage_store_module._build_usage_store()
 
     assert isinstance(store, usage_store_module.JsonlUsageStore)
     assert store._path == tmp_path / "usage_event.jsonl"
+    assert f"usage JSONL store active at {tmp_path / 'usage_event.jsonl'}" in caplog.text
+
+
+def test_build_usage_store_ignores_pg_dsn_and_keeps_jsonl(monkeypatch, tmp_path, caplog):
+    monkeypatch.setattr(usage_store_module.config, "usage_backend", "postgres")
+    monkeypatch.setattr(usage_store_module.config, "usage_pg_dsn", "postgresql://fake")
+    monkeypatch.setattr(usage_store_module.config, "usage_log_dir", str(tmp_path))
+    monkeypatch.setattr(
+        usage_store_module,
+        "_import_asyncpg",
+        lambda: (_ for _ in ()).throw(AssertionError("asyncpg import should not run for deprecated PG path")),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        store = usage_store_module._build_usage_store()
+
+    assert isinstance(store, usage_store_module.JsonlUsageStore)
+    assert store._path == tmp_path / "usage_event.jsonl"
+    assert "usage PG config is deprecated and ignored" in caplog.text
+    assert str(tmp_path / "usage_event.jsonl") in caplog.text
+
+
+def test_build_usage_store_warns_when_pg_config_falls_back_to_default_tmp(monkeypatch, caplog):
+    monkeypatch.setattr(usage_store_module.config, "usage_backend", "postgres")
+    monkeypatch.setattr(usage_store_module.config, "usage_pg_dsn", "postgresql://fake")
+    monkeypatch.setattr(usage_store_module.config, "usage_log_dir", "/tmp/tinker_usage")
+
+    with caplog.at_level(logging.WARNING):
+        store = usage_store_module._build_usage_store()
+
+    assert isinstance(store, usage_store_module.JsonlUsageStore)
+    assert store._path == usage_store_module.Path("/tmp/tinker_usage/usage_event.jsonl")
+    assert "usage PG config is deprecated and ignored" in caplog.text
+    assert "set TINKER_USAGE_LOG_DIR explicitly for a shared pull target" in caplog.text
+
+
+def test_build_usage_store_ignores_non_postgres_backend(monkeypatch, tmp_path, caplog):
+    monkeypatch.setattr(usage_store_module.config, "usage_backend", "sqlite")
+    monkeypatch.setattr(usage_store_module.config, "usage_pg_dsn", "")
+    monkeypatch.setattr(usage_store_module.config, "usage_log_dir", str(tmp_path))
+
+    with caplog.at_level(logging.WARNING):
+        store = usage_store_module._build_usage_store()
+
+    assert isinstance(store, usage_store_module.JsonlUsageStore)
+    assert store._path == tmp_path / "usage_event.jsonl"
+    assert "usage backend 'sqlite' is deprecated and ignored" in caplog.text
+
+
+def test_build_usage_store_warns_when_legacy_backend_uses_default_tmp(monkeypatch, caplog):
+    monkeypatch.setattr(usage_store_module.config, "usage_backend", "sqlite")
+    monkeypatch.setattr(usage_store_module.config, "usage_pg_dsn", "")
+    monkeypatch.setattr(usage_store_module.config, "usage_log_dir", "/tmp/tinker_usage")
+
+    with caplog.at_level(logging.WARNING):
+        store = usage_store_module._build_usage_store()
+
+    assert isinstance(store, usage_store_module.JsonlUsageStore)
+    assert store._path == usage_store_module.Path("/tmp/tinker_usage/usage_event.jsonl")
+    assert "usage backend 'sqlite' is deprecated and ignored" in caplog.text
+    assert "set TINKER_USAGE_LOG_DIR explicitly for a shared pull target" in caplog.text
