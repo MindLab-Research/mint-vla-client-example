@@ -222,3 +222,12 @@ def test_server_config_reads_usage_log_dir_from_file(tmp_path):
     )
 
     assert cfg.usage_log_dir == "/vePFS/shared/from-file"
+
+
+def test_server_config_fails_fast_for_non_postgres_usage_backend():
+    with pytest.raises(ValueError, match="Unsupported usage backend 'sqlite'"):
+        ServerConfig.from_sources(
+            environ={"TINKER_USAGE_BACKEND": "sqlite"},
+            config_path=None,
+            config_file=None,
+        )

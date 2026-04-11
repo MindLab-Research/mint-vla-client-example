@@ -19,7 +19,7 @@ class _ServerSection(BaseModel):
 
     internal_api_token: str | None = None
     usage_log_dir: str | None = None  # active JSONL sink
-    usage_backend: str | None = None  # deprecated, ignored by the producer path
+    usage_backend: str | None = None  # deprecated compatibility field; if set, it must remain 'postgres'
     usage_pg_dsn: str | None = None  # deprecated, ignored by the producer path
     usage_pg_host: str | None = None
     usage_pg_port: int | None = None

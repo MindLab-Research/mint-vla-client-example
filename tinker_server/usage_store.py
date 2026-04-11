@@ -626,6 +626,36 @@ class JsonlUsageStore:
             finally:
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
+    def _write_events_to_disk_locked(self, events: list[UsageEvent]) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        with self._path.open("a+b") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                self._load_from_stream_locked(f)
+                fresh_records: list[dict] = []
+                next_source_index = self._next_source_index
+                for event in events:
+                    identity = self._event_identity(event)
+                    if identity in self._known_identities:
+                        continue
+                    record = {
+                        "source_index": next_source_index,
+                        "event_time": self._to_iso8601(self._normalize_event_time(event.event_time)),
+                        "account_id": str(event.account_id),
+                        "apikey_id": str(event.apikey_id),
+                        "charge_item": str(event.charge_item),
+                        "quantity": max(0, int(event.quantity)),
+                        "request_id": str(event.request_id),
+                        "label": str(event.label or ""),
+                    }
+                    next_source_index += 1
+                    fresh_records.append(record)
+                if fresh_records:
+                    self._append_records_to_stream_locked(f, fresh_records)
+                    self._load_from_stream_locked(f)
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
     def _disk_state_changed_locked(self) -> bool:
         if not self._loaded:
             return True
@@ -638,7 +668,7 @@ class JsonlUsageStore:
     async def _ensure_loaded(self) -> None:
         async with self._lock:
             if self._disk_state_changed_locked():
-                self._reload_from_disk_locked()
+                await asyncio.to_thread(self._reload_from_disk_locked)
 
     def _append_records_to_stream_locked(self, stream, records: list[dict]) -> None:
         payload = "".join(
@@ -675,34 +705,7 @@ class JsonlUsageStore:
     async def write_events(self, events: list[UsageEvent]) -> None:
         normalized = self._validate_events(events)
         async with self._lock:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            with self._path.open("a+b") as f:
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                try:
-                    self._load_from_stream_locked(f)
-                    fresh_records: list[dict] = []
-                    next_source_index = self._next_source_index
-                    for event in normalized:
-                        identity = self._event_identity(event)
-                        if identity in self._known_identities:
-                            continue
-                        record = {
-                            "source_index": next_source_index,
-                            "event_time": self._to_iso8601(self._normalize_event_time(event.event_time)),
-                            "account_id": str(event.account_id),
-                            "apikey_id": str(event.apikey_id),
-                            "charge_item": str(event.charge_item),
-                            "quantity": max(0, int(event.quantity)),
-                            "request_id": str(event.request_id),
-                            "label": str(event.label or ""),
-                        }
-                        next_source_index += 1
-                        fresh_records.append(record)
-                    if fresh_records:
-                        self._append_records_to_stream_locked(f, fresh_records)
-                        self._load_from_stream_locked(f)
-                finally:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            await asyncio.to_thread(self._write_events_to_disk_locked, normalized)
 
     async def flush_outbox(self, limit: int = _OUTBOX_BATCH_SIZE) -> int:
         return 0
