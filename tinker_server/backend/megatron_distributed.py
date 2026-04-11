@@ -3365,11 +3365,13 @@ class MegatronRankWorker:
             pipeline_world_size = None
 
         restore_bridge_patch = None
+        peft_bridge_cls = None
         if use_bridge_internal_patches and pipeline_world_size == 1:
             from megatron.bridge.models.conversion import model_bridge as bridge_dispatch
 
             bridge_impl = bridge_dispatch.get_model_bridge(bridge._causal_lm_architecture)
             bridge_cls = type(bridge_impl)
+            peft_bridge_cls = bridge_cls
             original_collect = getattr(bridge_cls, "_megatron_global_adapters_info_all_pp_ranks", None)
             if not callable(original_collect):
                 raise RuntimeError(
@@ -3458,9 +3460,45 @@ class MegatronRankWorker:
                             )
                         )
 
+                # The bridge export path relies on every rank iterating adapter tasks in
+                # exactly the same order. Sorting only on `extract_sort_key(x[0])` leaves
+                # ties to the hash-randomized `set(...)` iteration order, which can diverge
+                # across ranks and deadlock subsequent collectives. Use a total ordering.
+                deduped_param_objects = {
+                    (
+                        str(global_base_name),
+                        str(local_base_prefix),
+                        bool(input_is_parallel),
+                        bool(base_linear_is_parallel),
+                        int(alpha),
+                        int(dim),
+                        int(pp_rank),
+                        int(vp_stage),
+                    ): None
+                    for (
+                        global_base_name,
+                        local_base_prefix,
+                        input_is_parallel,
+                        base_linear_is_parallel,
+                        alpha,
+                        dim,
+                        pp_rank,
+                        vp_stage,
+                    ) in global_param_objects
+                }
                 gathered_global_param_objects = sorted(
-                    list(set(global_param_objects)),
-                    key=lambda x: extract_sort_key(x[0]),
+                    deduped_param_objects.keys(),
+                    key=lambda x: (
+                        extract_sort_key(x[0]),
+                        x[0],
+                        x[1],
+                        int(x[2]),
+                        int(x[3]),
+                        x[4],
+                        x[5],
+                        x[6],
+                        x[7],
+                    ),
                 )
                 self._cached_param_objects_adapter = gathered_global_param_objects
                 return gathered_global_param_objects
@@ -3480,29 +3518,95 @@ class MegatronRankWorker:
                         setattr(bridge_cls, attr_name, previous_value)
 
             restore_bridge_patch = _restore_bridge_patch
+        elif use_bridge_internal_patches:
+            from megatron.bridge.models.conversion import model_bridge as bridge_dispatch
+
+            peft_bridge_cls = type(bridge_dispatch.get_model_bridge(bridge._causal_lm_architecture))
 
         restore_expert_gather = None
         bridge_cls = type(bridge)
+        gloo_timeout_s = max(1, _env_int("MINT_MBRIDGE_EXPORT_GLOO_TIMEOUT_S", 120))
+        gloo_debug = _env_flag("MINT_MBRIDGE_EXPORT_GATHER_DEBUG", False)
+        gloo_barrier_debug = _env_flag("MINT_MBRIDGE_EXPORT_GLOO_BARRIER_DEBUG", gloo_debug)
         if use_bridge_internal_patches:
             import torch
+            from datetime import timedelta
             from megatron.bridge.models.conversion import param_mapping as bridge_param_mapping
             import torch.distributed as dist
 
             restore_tp_gather = bridge_param_mapping.MegatronParamMapping.gather_from_tp_ranks
             gloo_tp_groups: dict[tuple[int, ...], object] = {}
+            tp_gather_counter = 0
+            current_rank = dist.get_rank()
+
+            def _prepare_export_gloo_groups(*, include_ep: bool) -> tuple[dict[tuple[int, ...], object], dict[tuple[int, ...], object]]:
+                from megatron.core import parallel_state as prep_mpu
+
+                local_spec = {
+                    "tp": tuple(dist.get_process_group_ranks(prep_mpu.get_tensor_model_parallel_group())),
+                    "etp": tuple(dist.get_process_group_ranks(prep_mpu.get_expert_tensor_parallel_group())),
+                    "ep": (
+                        tuple(dist.get_process_group_ranks(prep_mpu.get_expert_model_parallel_group()))
+                        if include_ep and prep_mpu.get_expert_model_parallel_world_size() > 1
+                        else None
+                    ),
+                }
+                gathered_specs = [None] * dist.get_world_size()
+                dist.all_gather_object(gathered_specs, local_spec)
+
+                tp_group_keys: set[tuple[int, ...]] = set()
+                ep_group_keys: set[tuple[int, ...]] = set()
+                for spec in gathered_specs:
+                    if not isinstance(spec, dict):
+                        continue
+                    for key in ("tp", "etp"):
+                        group_ranks = tuple(spec.get(key) or ())
+                        if group_ranks:
+                            tp_group_keys.add(group_ranks)
+                    ep_group_ranks = tuple(spec.get("ep") or ())
+                    if ep_group_ranks:
+                        ep_group_keys.add(ep_group_ranks)
+
+                tp_cache: dict[tuple[int, ...], object] = {}
+                ep_cache: dict[tuple[int, ...], object] = {}
+                for group_ranks in sorted(tp_group_keys):
+                    group = dist.new_group(
+                        ranks=list(group_ranks),
+                        backend="gloo",
+                        timeout=timedelta(seconds=gloo_timeout_s),
+                    )
+                    if current_rank in group_ranks and group is not dist.GroupMember.NON_GROUP_MEMBER:
+                        tp_cache[group_ranks] = group
+                for group_ranks in sorted(ep_group_keys):
+                    group = dist.new_group(
+                        ranks=list(group_ranks),
+                        backend="gloo",
+                        timeout=timedelta(seconds=gloo_timeout_s),
+                    )
+                    if current_rank in group_ranks and group is not dist.GroupMember.NON_GROUP_MEMBER:
+                        ep_cache[group_ranks] = group
+                return tp_cache, ep_cache
+
+            gloo_tp_groups, gloo_ep_groups = _prepare_export_gloo_groups(include_ep=bool(train_mlp))
 
             def _cpu_gloo_gather_from_tp_ranks(mapping, tensor: torch.Tensor) -> list[torch.Tensor]:
+                nonlocal tp_gather_counter
                 if mapping.tp_size == 1:
                     return [tensor]
 
                 if not dist.is_gloo_available():
                     raise RuntimeError("Gloo backend is unavailable; cannot run CPU TP gather for adapter export")
 
+                tp_gather_counter += 1
                 group_ranks = tuple(dist.get_process_group_ranks(mapping.tp_group))
                 gloo_group = gloo_tp_groups.get(group_ranks)
                 if gloo_group is None:
-                    gloo_group = dist.new_group(ranks=list(group_ranks), backend="gloo")
-                    gloo_tp_groups[group_ranks] = gloo_group
+                    raise RuntimeError(
+                        "Megatron-Bridge TP adapter export missing precreated Gloo process group: "
+                        f"rank={self.rank} gather_idx={tp_gather_counter} "
+                        f"hf_param={getattr(mapping, 'hf_param', None)!r} "
+                        f"group_ranks={group_ranks} timeout_s={gloo_timeout_s}"
+                    )
 
                 try:
                     cpu_tensor = tensor.detach().cpu().contiguous()
@@ -3513,18 +3617,71 @@ class MegatronRankWorker:
                         f"shape={tuple(tensor.shape)} dtype={tensor.dtype} device={tensor.device} "
                         f"tp_rank={getattr(mapping, 'tp_rank', None)!r} tp_size={getattr(mapping, 'tp_size', None)!r}"
                     ) from exc
+                if gloo_debug:
+                    logger.info(
+                        "[Rank %s] TP gather start idx=%s hf_param=%r shape=%s dtype=%s "
+                        "tp_rank=%s tp_size=%s group_ranks=%s timeout_s=%s",
+                        self.rank,
+                        tp_gather_counter,
+                        getattr(mapping, "hf_param", None),
+                        tuple(cpu_tensor.shape),
+                        cpu_tensor.dtype,
+                        getattr(mapping, "tp_rank", None),
+                        getattr(mapping, "tp_size", None),
+                        group_ranks,
+                        gloo_timeout_s,
+                    )
+                if gloo_barrier_debug:
+                    try:
+                        dist.monitored_barrier(
+                            group=gloo_group,
+                            timeout=timedelta(seconds=gloo_timeout_s),
+                            wait_all_ranks=True,
+                        )
+                    except Exception as exc:
+                        raise RuntimeError(
+                            "Megatron-Bridge TP adapter export barrier failed before gather: "
+                            f"rank={self.rank} gather_idx={tp_gather_counter} "
+                            f"hf_param={getattr(mapping, 'hf_param', None)!r} "
+                            f"shape={tuple(cpu_tensor.shape)} dtype={cpu_tensor.dtype} "
+                            f"tp_rank={getattr(mapping, 'tp_rank', None)!r} "
+                            f"tp_size={getattr(mapping, 'tp_size', None)!r} "
+                            f"group_ranks={group_ranks} timeout_s={gloo_timeout_s}"
+                        ) from exc
                 gathered = [torch.empty_like(cpu_tensor) for _ in range(mapping.tp_size)]
-                dist.all_gather(gathered, cpu_tensor, group=gloo_group)
+                gather_started = time.monotonic()
+                try:
+                    dist.all_gather(gathered, cpu_tensor, group=gloo_group)
+                except Exception as exc:
+                    raise RuntimeError(
+                        "Megatron-Bridge TP adapter export gather failed: "
+                        f"rank={self.rank} gather_idx={tp_gather_counter} "
+                        f"hf_param={getattr(mapping, 'hf_param', None)!r} "
+                        f"shape={tuple(cpu_tensor.shape)} dtype={cpu_tensor.dtype} "
+                        f"tp_rank={getattr(mapping, 'tp_rank', None)!r} "
+                        f"tp_size={getattr(mapping, 'tp_size', None)!r} "
+                        f"group_ranks={group_ranks} timeout_s={gloo_timeout_s}"
+                    ) from exc
+                if gloo_debug:
+                    logger.info(
+                        "[Rank %s] TP gather done idx=%s hf_param=%r elapsed_s=%.3f",
+                        self.rank,
+                        tp_gather_counter,
+                        getattr(mapping, "hf_param", None),
+                        time.monotonic() - gather_started,
+                    )
                 return gathered
 
             bridge_param_mapping.MegatronParamMapping.gather_from_tp_ranks = _cpu_gloo_gather_from_tp_ranks
 
-            candidate_expert_gather = getattr(bridge_cls, "_gather_expert_adapter_weight", None)
+            target_bridge_cls = peft_bridge_cls or bridge_cls
+            candidate_expert_gather = getattr(target_bridge_cls, "_gather_expert_adapter_weight", None)
             if train_mlp and callable(candidate_expert_gather):
                 original_expert_gather = candidate_expert_gather
-                gloo_ep_groups: dict[tuple[int, ...], object] = {}
+                expert_gather_counter = 0
 
                 def _cpu_safe_gather_expert_adapter_weight(bridge_self, weight: torch.Tensor):
+                    nonlocal expert_gather_counter
                     if not isinstance(weight, torch.Tensor) or weight.device.type != "cpu":
                         return original_expert_gather(bridge_self, weight)
 
@@ -3536,25 +3693,87 @@ class MegatronRankWorker:
                     if not dist.is_gloo_available():
                         raise RuntimeError("Gloo backend is unavailable; cannot run CPU EP gather for adapter export")
 
+                    expert_gather_counter += 1
                     ep_group_for_ranks = patch_mpu.get_expert_model_parallel_group()
                     group_ranks = tuple(dist.get_process_group_ranks(ep_group_for_ranks))
                     gloo_group = gloo_ep_groups.get(group_ranks)
                     if gloo_group is None:
-                        gloo_group = dist.new_group(ranks=list(group_ranks), backend="gloo")
-                        gloo_ep_groups[group_ranks] = gloo_group
+                        raise RuntimeError(
+                            "Megatron-Bridge EP adapter export missing precreated Gloo process group: "
+                            f"rank={self.rank} gather_idx={expert_gather_counter} "
+                            f"group_ranks={group_ranks} local_ep_size={local_ep_size} "
+                            f"timeout_s={gloo_timeout_s}"
+                        )
 
                     cpu_weight = weight.detach().cpu().contiguous()
+                    if gloo_debug:
+                        logger.info(
+                            "[Rank %s] EP gather start idx=%s shape=%s dtype=%s group_ranks=%s "
+                            "local_ep_size=%s timeout_s=%s",
+                            self.rank,
+                            expert_gather_counter,
+                            tuple(cpu_weight.shape),
+                            cpu_weight.dtype,
+                            group_ranks,
+                            local_ep_size,
+                            gloo_timeout_s,
+                        )
+                    if gloo_barrier_debug:
+                        try:
+                            dist.monitored_barrier(
+                                group=gloo_group,
+                                timeout=timedelta(seconds=gloo_timeout_s),
+                                wait_all_ranks=True,
+                            )
+                        except Exception as exc:
+                            raise RuntimeError(
+                                "Megatron-Bridge EP adapter export barrier failed before gather: "
+                                f"rank={self.rank} gather_idx={expert_gather_counter} "
+                                f"shape={tuple(cpu_weight.shape)} dtype={cpu_weight.dtype} "
+                                f"group_ranks={group_ranks} local_ep_size={local_ep_size} "
+                                f"timeout_s={gloo_timeout_s}"
+                            ) from exc
                     gathered = [torch.empty_like(cpu_weight) for _ in range(local_ep_size)]
-                    dist.all_gather(gathered, cpu_weight, group=gloo_group)
+                    gather_started = time.monotonic()
+                    try:
+                        dist.all_gather(gathered, cpu_weight, group=gloo_group)
+                    except Exception as exc:
+                        raise RuntimeError(
+                            "Megatron-Bridge EP adapter export gather failed: "
+                            f"rank={self.rank} gather_idx={expert_gather_counter} "
+                            f"shape={tuple(cpu_weight.shape)} dtype={cpu_weight.dtype} "
+                            f"group_ranks={group_ranks} local_ep_size={local_ep_size} "
+                            f"timeout_s={gloo_timeout_s}"
+                        ) from exc
+                    if gloo_debug:
+                        logger.info(
+                            "[Rank %s] EP gather done idx=%s elapsed_s=%.3f shape=%s group_ranks=%s",
+                            self.rank,
+                            expert_gather_counter,
+                            time.monotonic() - gather_started,
+                            tuple(cpu_weight.shape),
+                            group_ranks,
+                        )
                     return gathered
 
-                bridge_cls._gather_expert_adapter_weight = _cpu_safe_gather_expert_adapter_weight
+                target_bridge_cls._gather_expert_adapter_weight = _cpu_safe_gather_expert_adapter_weight
                 restore_expert_gather = original_expert_gather
         else:
             bridge_param_mapping = None
             restore_tp_gather = None
 
         adapter_state: dict[str, torch.Tensor] = {}
+        export_started = time.monotonic()
+        logger.info(
+            "[Rank %s] bridge.export_adapter_weights start train_attn=%s train_mlp=%s "
+            "train_unembed=%s gloo_timeout_s=%s gloo_debug=%s",
+            self.rank,
+            train_attn,
+            train_mlp,
+            train_unembed,
+            gloo_timeout_s,
+            gloo_debug,
+        )
         try:
             with self.engine.eval_mode():
                 for name, tensor in bridge.export_adapter_weights(
@@ -3568,9 +3787,15 @@ class MegatronRankWorker:
             if bridge_param_mapping is not None and restore_tp_gather is not None:
                 bridge_param_mapping.MegatronParamMapping.gather_from_tp_ranks = restore_tp_gather
             if restore_expert_gather is not None:
-                bridge_cls._gather_expert_adapter_weight = restore_expert_gather
+                target_bridge_cls._gather_expert_adapter_weight = restore_expert_gather
             if restore_bridge_patch is not None:
                 restore_bridge_patch()
+        logger.info(
+            "[Rank %s] bridge.export_adapter_weights done elapsed_s=%.3f exported_tensors=%s",
+            self.rank,
+            time.monotonic() - export_started,
+            len(adapter_state) if self.rank == 0 else "non-rank-0",
+        )
 
         if self.rank != 0:
             logger.info(
@@ -4322,6 +4547,52 @@ class MegatronRankWorker:
         abs_path = os.path.abspath(save_path)
         logger.info(f"[MegatronRankWorker] Saved LoRA weights to {abs_path} (step={step_count})")
         return meta
+
+    def debug_tp_gloo_all_gather(self) -> dict:
+        from datetime import timedelta
+
+        import torch
+        import torch.distributed as dist
+        from megatron.core import parallel_state as mpu
+
+        tp_group = mpu.get_tensor_model_parallel_group()
+        group_ranks = tuple(dist.get_process_group_ranks(tp_group))
+        timeout_s = max(1, _env_int("MINT_MBRIDGE_EXPORT_GLOO_TIMEOUT_S", 120))
+
+        gathered_group_ranks = [None] * dist.get_world_size()
+        dist.all_gather_object(gathered_group_ranks, group_ranks)
+        gloo_groups = getattr(self, "_debug_tp_gloo_groups", None)
+        if gloo_groups is None:
+            gloo_groups = {}
+            for ranks in sorted({tuple(item) for item in gathered_group_ranks if item}):
+                group = dist.new_group(
+                    ranks=list(ranks),
+                    backend="gloo",
+                    timeout=timedelta(seconds=timeout_s),
+                )
+                if dist.get_rank() in ranks and group is not dist.GroupMember.NON_GROUP_MEMBER:
+                    gloo_groups[ranks] = group
+            self._debug_tp_gloo_groups = gloo_groups
+        gloo_group = gloo_groups[group_ranks]
+
+        payload = torch.tensor([self.rank], dtype=torch.int64)
+        gathered = [torch.empty_like(payload) for _ in group_ranks]
+        started = time.monotonic()
+        dist.monitored_barrier(
+            group=gloo_group,
+            timeout=timedelta(seconds=timeout_s),
+            wait_all_ranks=True,
+        )
+        dist.all_gather(gathered, payload, group=gloo_group)
+        return {
+            "rank": self.rank,
+            "tp_rank": int(mpu.get_tensor_model_parallel_rank()),
+            "ep_rank": int(mpu.get_expert_model_parallel_rank()),
+            "group_ranks": list(group_ranks),
+            "gathered": [int(t.item()) for t in gathered],
+            "elapsed_s": time.monotonic() - started,
+            "hostname": socket.gethostname(),
+        }
 
     def load_optimizer_state(self, checkpoint_path: str, traceparent: str | None = None) -> dict:
         """Load per-rank optimizer shard from disk (if present)."""
@@ -5087,7 +5358,10 @@ class MegatronSessionStateManager:
         return session_path
 
     def _session_last_updated_at(self, session_path: str) -> float:
-        latest = os.path.getmtime(session_path)
+        try:
+            latest = os.path.getmtime(session_path)
+        except FileNotFoundError:
+            return 0.0
         if os.path.isdir(session_path) and not os.path.islink(session_path):
             for root, _dirs, files in os.walk(session_path):
                 for name in files:
@@ -7474,6 +7748,19 @@ class MegatronWorkerGroup:
         logger.info(f"[MegatronWorkerGroup] save_lora_weights: completed, step={result.get('current_step', 'unknown')}")
         return result
 
+    def debug_tp_gloo_all_gather(self) -> list[dict]:
+        futures = [w.debug_tp_gloo_all_gather.remote() for w in self.workers]
+        timeout_s = max(1, _env_int("MINT_MBRIDGE_EXPORT_GLOO_TIMEOUT_S", 120))
+        session_id = getattr(self, "_current_session_id", None)
+        if session_id is None:
+            session_id = getattr(self, "_current_session", None)
+        return self._ray_get_group_results(
+            futures,
+            op="debug_tp_gloo_all_gather",
+            session_id=session_id,
+            timeout_s=timeout_s,
+        )
+
     def _get_session_cache_store_diagnostics(self) -> dict:
         actor_name = _make_megatron_actor_name(self.base_model)
         get_cache_usage = getattr(self._session_manager, "get_cache_usage", None)
@@ -8126,11 +8413,31 @@ def get_or_create_megatron_worker_group(
             except Exception as e:
                 raise RuntimeError(f"Failed to remove orphan placement group {pg_name!r}: {e}") from e
 
-        # Check available GPUs and evict LRU actors if necessary.
-        # For large, full-cluster Megatron jobs, allow preempting idle protected actors
-        # (e.g., inference "always-on" actors) to avoid deadlocking on a fixed-size cluster.
-        allow_evict_protected = os.environ.get("MINT_MEGATRON_EVICT_PROTECTED", "0") == "1"
-        resource_pool.ensure_gpus_available(num_gpus, allow_evict_protected=allow_evict_protected)
+        preferred_node_ips = _preferred_worker_node_ips_for_model(base_model)
+        if preferred_node_ips:
+            gpus_per_node = 8
+            nodes_needed = (int(num_gpus) + int(gpus_per_node) - 1) // int(gpus_per_node)
+            if len(preferred_node_ips) < nodes_needed:
+                raise ValueError(
+                    f"MINT_MODEL_NODE_IPS_JSON too short for base_model={base_model!r}: "
+                    f"need {nodes_needed} nodes for world_size={num_gpus}, got {len(preferred_node_ips)}"
+                )
+            required_by_node_ip: dict[str, int] = {}
+            for i in range(num_gpus):
+                node_ip = preferred_node_ips[i // int(gpus_per_node)]
+                required_by_node_ip[node_ip] = required_by_node_ip.get(node_ip, 0) + 1
+            # For strict node-pinned launches, unrelated GPUs outside the requested slice
+            # must not block bringup. Check the requested nodes directly and fail closed.
+            assert_node_ip_capacity(
+                required_gpus_by_node_ip=required_by_node_ip,
+                context=f"[MegatronWorkerGroup] precreate node pinning base_model={base_model}",
+            )
+        else:
+            # Check available GPUs and evict LRU actors if necessary.
+            # For large, full-cluster Megatron jobs, allow preempting idle protected actors
+            # (e.g., inference "always-on" actors) to avoid deadlocking on a fixed-size cluster.
+            allow_evict_protected = os.environ.get("MINT_MEGATRON_EVICT_PROTECTED", "0") == "1"
+            resource_pool.ensure_gpus_available(num_gpus, allow_evict_protected=allow_evict_protected)
 
         # Reserve GPUs to prevent race conditions with concurrent requests
         # This must be done AFTER ensure_gpus_available and BEFORE actor creation
@@ -8181,6 +8488,8 @@ def get_or_create_megatron_worker_group(
                 "MINT_MEGATRON_STICKY_TIMING_DIAG",
                 "MINT_MEGATRON_STACK_DUMP_TIMEOUT_S",
                 "MINT_MEGATRON_STACK_DUMP_LIMIT",
+                "MINT_MBRIDGE_EXPORT_GLOO_TIMEOUT_S",
+                "MINT_MBRIDGE_EXPORT_GATHER_DEBUG",
             ):
                 v = os.environ.get(k)
                 if v is not None:
