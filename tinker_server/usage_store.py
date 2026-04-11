@@ -624,7 +624,11 @@ class JsonlUsageStore:
         if not self._loaded or size < self._stat_size:
             self._load_from_stream_locked(stream)
             return
-        if size == self._stat_size and mtime_ns == self._stat_mtime_ns:
+        if size == self._stat_size:
+            if mtime_ns == self._stat_mtime_ns:
+                return
+            # Same-size rewrites break append-only assumptions; rebuild from start.
+            self._load_from_stream_locked(stream)
             return
         stream.seek(self._stat_size)
         start_line_no = len(self._records) + 1

@@ -377,6 +377,37 @@ async def test_jsonl_usage_store_stale_reader_refreshes_after_external_append(tm
 
 
 @pytest.mark.anyio
+async def test_jsonl_usage_store_stale_reader_reloads_after_same_size_rewrite(tmp_path):
+    path = tmp_path / "usage_event.jsonl"
+    reader = usage_store_module.JsonlUsageStore(path=path)
+    writer = usage_store_module.JsonlUsageStore(path=path)
+
+    await writer.write_event(
+        UsageEvent(
+            account_id="aaaaaaaaaaaaaaaaaaaaaaaa",
+            apikey_id="bbbbbbbbbbbbbbbbbbbbbbbb",
+            charge_item="training",
+            quantity=10,
+            request_id="req-old-payload",
+            label="route=training.train_step",
+            event_time=datetime(2026, 3, 12, 10, 0, tzinfo=timezone.utc),
+        )
+    )
+    logs, count, _ = await reader.query_logs(account_id="aaaaaaaaaaaaaaaaaaaaaaaa", limit=10, offset=0)
+    assert count == 1
+    assert logs[0]["request_id"] == "req-old-payload"
+
+    original = path.read_text(encoding="utf-8")
+    rewritten = original.replace("req-old-payload", "req-new-payload")
+    assert len(rewritten) == len(original)
+    path.write_text(rewritten, encoding="utf-8")
+
+    logs, count, _ = await reader.query_logs(account_id="aaaaaaaaaaaaaaaaaaaaaaaa", limit=10, offset=0)
+    assert count == 1
+    assert logs[0]["request_id"] == "req-new-payload"
+
+
+@pytest.mark.anyio
 async def test_jsonl_usage_store_steady_state_writes_do_not_full_reload(tmp_path, monkeypatch):
     path = tmp_path / "usage_event.jsonl"
     store = usage_store_module.JsonlUsageStore(path=path)
