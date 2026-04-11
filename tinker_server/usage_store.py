@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import logging
 import os
@@ -34,10 +35,6 @@ def _default_jsonl_usage_path() -> Path:
     if usage_log_dir:
         return Path(usage_log_dir) / "usage_event.jsonl"
     return Path(config.checkpoint_dir) / ".billing" / "usage_event.jsonl"
-
-
-def _is_missing_asyncpg(exc: ModuleNotFoundError) -> bool:
-    return str(getattr(exc, "name", "") or "").strip() == "asyncpg"
 
 
 def _usage_pg_dsn() -> str:
@@ -527,6 +524,8 @@ class JsonlUsageStore:
         self._records: list[dict] = []
         self._known_identities: set[tuple[str, str, str]] = set()
         self._next_source_index = 1
+        self._stat_size = 0
+        self._stat_mtime_ns = 0
 
     @staticmethod
     def _normalize_event_time(ts: datetime) -> datetime:
@@ -579,73 +578,150 @@ class JsonlUsageStore:
             raise ValueError(f"invalid usage_event record at {source_name}:{line_no}") from e
         return record
 
-    def _load_from_disk_locked(self) -> None:
-        if self._loaded:
+    def _apply_stream_record_locked(self, record: dict) -> None:
+        identity = (
+            record["request_id"],
+            record["charge_item"],
+            record["label"],
+        )
+        if identity in self._known_identities:
+            logger.warning(
+                "skipping duplicate usage_event JSONL row: request_id=%s charge_item=%s label=%s",
+                record["request_id"],
+                record["charge_item"],
+                record["label"],
+            )
             return
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        records: list[dict] = []
-        known_identities: set[tuple[str, str, str]] = set()
-        next_source_index = 1
-        if self._path.exists():
-            with self._path.open("r", encoding="utf-8") as f:
-                for line_no, raw_line in enumerate(f, start=1):
-                    line = raw_line.strip()
-                    if not line:
-                        continue
-                    try:
-                        payload = json.loads(line)
-                        record = self._coerce_record(payload, source_name=str(self._path), line_no=line_no)
-                    except Exception as e:
-                        logger.warning("skipping malformed usage_event JSONL row: %s", e)
-                        continue
-                    identity = (
-                        record["request_id"],
-                        record["charge_item"],
-                        record["label"],
-                    )
-                    if identity in known_identities:
-                        logger.warning(
-                            "skipping duplicate usage_event JSONL row: request_id=%s charge_item=%s label=%s",
-                            record["request_id"],
-                            record["charge_item"],
-                            record["label"],
-                        )
-                        continue
-                    records.append(record)
-                    known_identities.add(identity)
-                    next_source_index = max(next_source_index, int(record["source_index"]) + 1)
-        self._records = records
-        self._known_identities = known_identities
-        self._next_source_index = next_source_index
+        self._records.append(record)
+        self._known_identities.add(identity)
+        self._next_source_index = max(self._next_source_index, int(record["source_index"]) + 1)
+
+    def _load_from_stream_locked(self, stream) -> None:
+        self._records = []
+        self._known_identities = set()
+        self._next_source_index = 1
+        stream.seek(0)
+        for line_no, raw_line in enumerate(stream, start=1):
+            line = raw_line.decode("utf-8").strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+                record = self._coerce_record(payload, source_name=str(self._path), line_no=line_no)
+            except Exception as e:
+                logger.warning("skipping malformed usage_event JSONL row: %s", e)
+                continue
+            self._apply_stream_record_locked(record)
+        stat = os.fstat(stream.fileno())
+        self._stat_size = int(stat.st_size)
+        self._stat_mtime_ns = int(stat.st_mtime_ns)
         self._loaded = True
 
-    async def _ensure_loaded(self) -> None:
-        if self._loaded:
+    def _refresh_from_stream_locked(self, stream) -> None:
+        stat = os.fstat(stream.fileno())
+        size = int(stat.st_size)
+        mtime_ns = int(stat.st_mtime_ns)
+        if not self._loaded or size < self._stat_size:
+            self._load_from_stream_locked(stream)
             return
-        async with self._lock:
-            if self._loaded:
+        if size == self._stat_size:
+            if mtime_ns == self._stat_mtime_ns:
                 return
-            self._load_from_disk_locked()
+            # Same-size rewrites break append-only assumptions; rebuild from start.
+            self._load_from_stream_locked(stream)
+            return
+        stream.seek(self._stat_size)
+        start_line_no = len(self._records) + 1
+        for line_no, raw_line in enumerate(stream, start=start_line_no):
+            line = raw_line.decode("utf-8").strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+                record = self._coerce_record(payload, source_name=str(self._path), line_no=line_no)
+            except Exception as e:
+                logger.warning("skipping malformed usage_event JSONL row: %s", e)
+                continue
+            self._apply_stream_record_locked(record)
+        self._stat_size = size
+        self._stat_mtime_ns = mtime_ns
+        self._loaded = True
 
-    def _append_records_locked(self, records: list[dict]) -> None:
+    def _reload_from_disk_locked(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        with self._path.open("a+b") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+            try:
+                self._refresh_from_stream_locked(f)
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+    def _write_events_to_disk_locked(self, events: list[UsageEvent]) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        with self._path.open("a+b") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                self._refresh_from_stream_locked(f)
+                fresh_records: list[dict] = []
+                next_source_index = self._next_source_index
+                for event in events:
+                    identity = self._event_identity(event)
+                    if identity in self._known_identities:
+                        continue
+                    record = {
+                        "source_index": next_source_index,
+                        "event_time": self._to_iso8601(self._normalize_event_time(event.event_time)),
+                        "account_id": str(event.account_id),
+                        "apikey_id": str(event.apikey_id),
+                        "charge_item": str(event.charge_item),
+                        "quantity": max(0, int(event.quantity)),
+                        "request_id": str(event.request_id),
+                        "label": str(event.label or ""),
+                    }
+                    next_source_index += 1
+                    fresh_records.append(record)
+                if fresh_records:
+                    self._append_records_to_stream_locked(f, fresh_records)
+                    stat = os.fstat(f.fileno())
+                    for record in fresh_records:
+                        self._apply_stream_record_locked(record)
+                    self._stat_size = int(stat.st_size)
+                    self._stat_mtime_ns = int(stat.st_mtime_ns)
+                    self._loaded = True
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+    def _disk_state_changed_locked(self) -> bool:
+        if not self._loaded:
+            return True
+        try:
+            stat = self._path.stat()
+        except FileNotFoundError:
+            return self._stat_size != 0 or self._stat_mtime_ns != 0
+        return int(stat.st_size) != self._stat_size or int(stat.st_mtime_ns) != self._stat_mtime_ns
+
+    async def _ensure_loaded(self) -> None:
+        async with self._lock:
+            if self._disk_state_changed_locked():
+                await asyncio.to_thread(self._reload_from_disk_locked)
+
+    def _append_records_to_stream_locked(self, stream, records: list[dict]) -> None:
         payload = "".join(
             json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n" for record in records
         ).encode("utf-8")
-        with self._path.open("ab+") as f:
-            f.seek(0, os.SEEK_END)
-            start_offset = f.tell()
-            try:
-                f.write(payload)
-                f.flush()
-                os.fsync(f.fileno())
-            except Exception:
-                with suppress(Exception):
-                    f.seek(start_offset)
-                    f.truncate()
-                    f.flush()
-                    os.fsync(f.fileno())
-                raise
+        stream.seek(0, os.SEEK_END)
+        start_offset = stream.tell()
+        try:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        except Exception:
+            with suppress(Exception):
+                stream.seek(start_offset)
+                stream.truncate()
+                stream.flush()
+                os.fsync(stream.fileno())
+            raise
 
     @staticmethod
     def _record_matches_since(record: dict, since: datetime | None) -> bool:
@@ -663,37 +739,8 @@ class JsonlUsageStore:
 
     async def write_events(self, events: list[UsageEvent]) -> None:
         normalized = self._validate_events(events)
-        await self._ensure_loaded()
         async with self._lock:
-            fresh_records: list[dict] = []
-            next_source_index = self._next_source_index
-            for event in normalized:
-                identity = self._event_identity(event)
-                if identity in self._known_identities:
-                    continue
-                record = {
-                    "source_index": next_source_index,
-                    "event_time": self._to_iso8601(self._normalize_event_time(event.event_time)),
-                    "account_id": str(event.account_id),
-                    "apikey_id": str(event.apikey_id),
-                    "charge_item": str(event.charge_item),
-                    "quantity": max(0, int(event.quantity)),
-                    "request_id": str(event.request_id),
-                    "label": str(event.label or ""),
-                }
-                next_source_index += 1
-                fresh_records.append(record)
-            if fresh_records:
-                self._append_records_locked(fresh_records)
-                for record in fresh_records:
-                    identity = (
-                        record["request_id"],
-                        record["charge_item"],
-                        record["label"],
-                    )
-                    self._known_identities.add(identity)
-                    self._records.append(record)
-                self._next_source_index = next_source_index
+            await asyncio.to_thread(self._write_events_to_disk_locked, normalized)
 
     async def flush_outbox(self, limit: int = _OUTBOX_BATCH_SIZE) -> int:
         return 0
@@ -737,7 +784,11 @@ class JsonlUsageStore:
             await self._ensure_loaded()
             async with self._lock:
                 self._path.parent.mkdir(parents=True, exist_ok=True)
-                self._path.touch(exist_ok=True)
+                if not self._path.exists():
+                    self._path.touch(exist_ok=True)
+                    stat = self._path.stat()
+                    self._stat_size = int(stat.st_size)
+                    self._stat_mtime_ns = int(stat.st_mtime_ns)
             return True
         except Exception as e:
             logger.warning("usage_event JSONL health check failed: %s", e)
@@ -752,35 +803,25 @@ _usage_store_guard = asyncio.Lock()
 
 
 def _build_usage_store() -> UsageStore:
-    if str(config.usage_backend or "postgres").strip().lower() != "postgres":
-        raise ValueError("Unsupported usage backend. Only postgres is supported")
-    if not _usage_pg_dsn():
-        path = _default_jsonl_usage_path()
+    path = _default_jsonl_usage_path()
+    backend = str(config.usage_backend or "postgres").strip().lower()
+    dsn = _usage_pg_dsn()
+    default_tmp_path = Path("/tmp/tinker_usage/usage_event.jsonl")
+    if backend and backend != "postgres":
+        raise ValueError(f"Unsupported usage backend {backend!r}; only 'postgres' is accepted")
+    if dsn:
         logger.warning(
-            "usage postgres backend has no PG DSN configured; falling back to JSONL usage_event store at %s",
+            "usage PG config is deprecated and ignored; JSONL usage_event store remains active at %s",
             path,
         )
-        return JsonlUsageStore(path=path)
-    try:
-        _import_asyncpg()
-    except ModuleNotFoundError as e:
-        if not _is_missing_asyncpg(e):
-            raise
-        path = _default_jsonl_usage_path()
+    else:
+        logger.info("usage JSONL store active at %s", path)
+    if path == default_tmp_path and dsn:
         logger.warning(
-            "asyncpg unavailable for postgres usage backend; falling back to JSONL usage_event store at %s: %s",
+            "usage JSONL store is using default tmp path %s; set TINKER_USAGE_LOG_DIR explicitly for a shared pull target",
             path,
-            e,
         )
-        return JsonlUsageStore(path=path)
-    return PostgresUsageStore(
-        dsn=_usage_pg_dsn(),
-        pool_min=config.usage_pg_pool_min,
-        pool_max=config.usage_pg_pool_max,
-        write_timeout_ms=config.usage_write_timeout_ms,
-        table=config.usage_pg_table,
-        outbox_path=os.path.join(config.checkpoint_dir, ".billing", "usage_outbox.sqlite3"),
-    )
+    return JsonlUsageStore(path=path)
 
 
 async def get_usage_store() -> UsageStore:

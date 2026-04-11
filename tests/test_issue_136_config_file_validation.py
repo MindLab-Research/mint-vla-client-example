@@ -198,3 +198,49 @@ def test_server_config_future_replay_partial_env_override_preserves_untouched_fi
     assert cfg.future_replay_hot_ttl_s == 30.0
     assert cfg.future_replay_disk_ttl_s == 301.0
     assert cfg.future_replay_sweep_interval_s == 600.0
+
+
+def test_server_config_reads_usage_log_dir_from_env():
+    cfg = ServerConfig.from_sources(
+        environ={"TINKER_USAGE_LOG_DIR": "/vePFS/shared/billing"},
+        config_path=None,
+        config_file=None,
+    )
+
+    assert cfg.usage_log_dir == "/vePFS/shared/billing"
+
+
+def test_server_config_reads_usage_log_dir_from_file(tmp_path):
+    p = tmp_path / "usage.toml"
+    p.write_text("[server]\nusage_log_dir = '/vePFS/shared/from-file'\n", encoding="utf-8")
+    file_cfg = load_tinker_config_file(p)
+
+    cfg = ServerConfig.from_sources(
+        environ={},
+        config_path=str(p),
+        config_file=file_cfg,
+    )
+
+    assert cfg.usage_log_dir == "/vePFS/shared/from-file"
+
+
+def test_server_config_fails_fast_for_non_postgres_usage_backend():
+    with pytest.raises(ValueError, match="Unsupported usage backend 'sqlite'"):
+        ServerConfig.from_sources(
+            environ={"TINKER_USAGE_BACKEND": "sqlite"},
+            config_path=None,
+            config_file=None,
+        )
+
+
+def test_server_config_fails_fast_for_non_postgres_usage_backend_from_file(tmp_path):
+    p = tmp_path / "bad-usage-backend.toml"
+    p.write_text("[server]\nusage_backend = 'sqlite'\n", encoding="utf-8")
+    file_cfg = load_tinker_config_file(p)
+
+    with pytest.raises(ValueError, match="Unsupported usage backend 'sqlite'"):
+        ServerConfig.from_sources(
+            environ={},
+            config_path=str(p),
+            config_file=file_cfg,
+        )

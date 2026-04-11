@@ -17,7 +17,6 @@ from .runtime_env import (
     env_nonempty as _runtime_env_nonempty,
 )
 from .checkpoints import DEFAULT_RUNTIME_CHECKPOINTS_DIR
-from .ray_utils import require_ray_address
 
 
 def _env_nonempty(environ: dict[str, str], name: str) -> str | None:
@@ -351,10 +350,10 @@ class ServerConfig:
     token_secret_key: str = ""  # Secret for sk- token decryption. If set, accepts encrypted tokens.
     internal_api_token: str = ""  # Shared token for trusting gateway-forwarded billing headers.
 
-    # Usage billing (Postgres only)
-    usage_log_dir: str = "/tmp/tinker_usage"  # deprecated, kept for compatibility
-    usage_backend: str = "postgres"  # postgres
-    usage_pg_dsn: str = ""  # Full PostgreSQL DSN (preferred)
+    # Usage billing
+    usage_log_dir: str = "/tmp/tinker_usage"  # active JSONL sink
+    usage_backend: str = "postgres"  # deprecated compatibility field; if set, it must remain 'postgres'
+    usage_pg_dsn: str = ""  # deprecated, ignored by the producer path
     usage_pg_host: str = ""
     usage_pg_port: int = 5432
     usage_pg_database: str = "mint_billing"
@@ -516,7 +515,7 @@ class ServerConfig:
             )
         )
 
-        return cls(
+        cfg = cls(
             host=_pick_str("TINKER_HOST", file_server.host if file_server is not None else None, "0.0.0.0"),
             port=_pick_int("TINKER_PORT", file_server.port if file_server is not None else None, 8000),
             api_key=api_key,
@@ -838,6 +837,8 @@ class ServerConfig:
             ),
             config_path=config_path,
         )
+        cfg.validate_deprecated_usage_config()
+        return cfg
 
     @property
     def auth_enabled(self) -> bool:
@@ -849,6 +850,11 @@ class ServerConfig:
         if not self.api_key:
             return False
         return secrets.compare_digest(self.api_key, provided_key)
+
+    def validate_deprecated_usage_config(self) -> None:
+        backend = str(self.usage_backend or "").strip().lower()
+        if backend and backend != "postgres":
+            raise ValueError(f"Unsupported usage backend {self.usage_backend!r}; only 'postgres' is accepted")
 
 # Global config instance
 config = ServerConfig.from_sources(environ=os.environ, config_path=_CONFIG_PATH, config_file=_CONFIG_FILE)
