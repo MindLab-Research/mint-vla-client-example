@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -322,3 +323,43 @@ async def test_jsonl_usage_store_two_instances_refresh_dedupe_state_before_appen
 
     lines = path.read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) == 1
+
+
+@pytest.mark.anyio
+async def test_jsonl_usage_store_concurrent_writers_preserve_unique_indices(tmp_path):
+    path = tmp_path / "usage_event.jsonl"
+    base_time = datetime(2026, 3, 12, 10, 0, tzinfo=timezone.utc)
+    first_store = usage_store_module.JsonlUsageStore(path=path)
+    second_store = usage_store_module.JsonlUsageStore(path=path)
+
+    await asyncio.gather(
+        first_store.write_event(
+            UsageEvent(
+                account_id="aaaaaaaaaaaaaaaaaaaaaaaa",
+                apikey_id="bbbbbbbbbbbbbbbbbbbbbbbb",
+                charge_item="training",
+                quantity=10,
+                request_id="req-concurrent-1",
+                label="route=training.train_step",
+                event_time=base_time,
+            )
+        ),
+        second_store.write_event(
+            UsageEvent(
+                account_id="aaaaaaaaaaaaaaaaaaaaaaaa",
+                apikey_id="bbbbbbbbbbbbbbbbbbbbbbbb",
+                charge_item="sampling",
+                quantity=5,
+                request_id="req-concurrent-2",
+                label="route=sampling.asample",
+                event_time=base_time + timedelta(seconds=1),
+            )
+        ),
+    )
+
+    reloaded = usage_store_module.JsonlUsageStore(path=path)
+    logs, count, _ = await reloaded.query_logs(account_id="aaaaaaaaaaaaaaaaaaaaaaaa", limit=10, offset=0)
+
+    assert count == 2
+    assert sorted(log["source_index"] for log in logs) == [1, 2]
+    assert sorted(log["request_id"] for log in logs) == ["req-concurrent-1", "req-concurrent-2"]

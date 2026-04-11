@@ -749,7 +749,11 @@ class JsonlUsageStore:
             await self._ensure_loaded()
             async with self._lock:
                 self._path.parent.mkdir(parents=True, exist_ok=True)
-                self._path.touch(exist_ok=True)
+                if not self._path.exists():
+                    self._path.touch(exist_ok=True)
+                    stat = self._path.stat()
+                    self._stat_size = int(stat.st_size)
+                    self._stat_mtime_ns = int(stat.st_mtime_ns)
             return True
         except Exception as e:
             logger.warning("usage_event JSONL health check failed: %s", e)

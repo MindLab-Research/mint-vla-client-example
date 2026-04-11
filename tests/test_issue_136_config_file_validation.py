@@ -231,3 +231,16 @@ def test_server_config_fails_fast_for_non_postgres_usage_backend():
             config_path=None,
             config_file=None,
         )
+
+
+def test_server_config_fails_fast_for_non_postgres_usage_backend_from_file(tmp_path):
+    p = tmp_path / "bad-usage-backend.toml"
+    p.write_text("[server]\nusage_backend = 'sqlite'\n", encoding="utf-8")
+    file_cfg = load_tinker_config_file(p)
+
+    with pytest.raises(ValueError, match="Unsupported usage backend 'sqlite'"):
+        ServerConfig.from_sources(
+            environ={},
+            config_path=str(p),
+            config_file=file_cfg,
+        )
