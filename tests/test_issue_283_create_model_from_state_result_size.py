@@ -278,6 +278,120 @@ def test_issue_283_create_model_from_state_background_uses_resolved_path(tmp_pat
     assert session_index_updates == [("s283-bg", "s283-bg_0", None, "2026-03-13T00:00:00Z")]
 
 
+def test_issue_283_create_model_from_state_background_restores_openpi_training_checkpoint(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from tinker_server.routes import training as training_routes
+    from tinker_server.backend.training_engine_router import TrainingEngineRouter
+    from tinker_server.models.types import CreateModelFromStateRequest
+
+    checkpoint_dir = tmp_path / "openpi-training"
+    (checkpoint_dir / "1" / "params").mkdir(parents=True)
+    (checkpoint_dir / "1" / "train_state").mkdir(parents=True)
+    (checkpoint_dir / "1" / "assets" / "physical-intelligence" / "libero").mkdir(parents=True)
+    (checkpoint_dir / "1" / "params" / "_METADATA").write_text("", encoding="utf-8")
+    (checkpoint_dir / "1" / "train_state" / "_METADATA").write_text("", encoding="utf-8")
+    (checkpoint_dir / "1" / "assets" / "physical-intelligence" / "libero" / "norm_stats.json").write_text(
+        "{}",
+        encoding="utf-8",
+    )
+
+    class StubSession:
+        def __init__(self) -> None:
+            self.model_id = "s283-openpi_0"
+            self.current_step = 3
+            self.learning_rate = 1e-4
+            self.base_model = "openpi/pi0-fast-libero-low-mem-finetune"
+            self.backend = "openpi_fast"
+            self.created_at = "2026-03-28T00:00:00Z"
+            self.last_activity = 0.0
+
+    class StubTrainingManager:
+        def get_session(self, model_id: str):
+            return None
+
+        def mark_inflight(self, model_id: str, delta: int) -> None:
+            _ = (model_id, delta)
+
+        def delete_session(self, model_id: str) -> None:
+            return None
+
+        def create_session(self, **kwargs):
+            return StubSession()
+
+    class _RecordingEngine:
+        def __init__(self, label: str) -> None:
+            self.label = label
+            self.calls: list[tuple[str, dict]] = []
+
+        async def create_training_session(self, session) -> None:
+            self.calls.append(("create_training_session", {"base_model": session.base_model}))
+
+        async def load_weights(self, session, load_path: str, load_optimizer: bool = True) -> None:
+            self.calls.append(
+                (
+                    "load_weights",
+                    {
+                        "base_model": session.base_model,
+                        "load_path": load_path,
+                        "load_optimizer": load_optimizer,
+                    },
+                )
+            )
+
+    class StubFutureStore:
+        def __init__(self) -> None:
+            self.resolved: list[tuple[str, dict]] = []
+
+        def resolve(self, request_id: str, payload: dict) -> None:
+            self.resolved.append((request_id, payload))
+
+        async def async_fail(self, request_id: str, error: str) -> None:
+            raise AssertionError(f"unexpected fail({request_id}): {error}")
+
+    text_engine = _RecordingEngine("text")
+    openpi_fast_engine = _RecordingEngine("openpi-fast")
+    router = TrainingEngineRouter(text_engine=text_engine, openpi_fast_engine=openpi_fast_engine)
+    stub_future_store = StubFutureStore()
+
+    monkeypatch.setattr(training_routes, "training_engine", router)
+    monkeypatch.setattr(training_routes, "training_manager", StubTrainingManager())
+    monkeypatch.setattr(training_routes, "future_store", stub_future_store)
+
+    req = CreateModelFromStateRequest(
+        session_id="s283-openpi",
+        model_seq_id=0,
+        base_model="openpi/pi0-fast-libero-low-mem-finetune",
+        state_path=str(checkpoint_dir),
+        load_optimizer=True,
+    )
+
+    asyncio.run(training_routes._do_create_model_from_state("req-283-openpi", req, user_id=None))
+
+    assert openpi_fast_engine.calls == [
+        ("create_training_session", {"base_model": "openpi/pi0-fast-libero-low-mem-finetune"}),
+        (
+            "load_weights",
+            {
+                "base_model": "openpi/pi0-fast-libero-low-mem-finetune",
+                "load_path": str(checkpoint_dir),
+                "load_optimizer": True,
+            },
+        ),
+    ]
+    assert text_engine.calls == []
+    assert stub_future_store.resolved == [
+        (
+            "req-283-openpi",
+            {
+                "request_id": "req-283-openpi",
+                "model_id": "s283-openpi_0",
+                "type": "create_model_from_state",
+            },
+        )
+    ]
+
+
 def test_issue_283_load_state_route_queues_resolved_path(tmp_path: Path, monkeypatch) -> None:
     from tinker_server.routes import training as training_routes
     from tinker_server.routes import weights as weights_routes

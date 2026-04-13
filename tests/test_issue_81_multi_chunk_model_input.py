@@ -14,7 +14,7 @@ def test_issue_81_flattens_multi_chunk_model_input() -> None:
 def test_issue_81_ignores_non_encoded_chunks() -> None:
     model_input = {
         "chunks": [
-            {"type": "other", "tokens": [1, 2]},
+            {"type": "image", "data": "Zm9v", "format": "png", "expected_tokens": 8},
             {"type": "encoded_text", "tokens": [3]},
         ]
     }

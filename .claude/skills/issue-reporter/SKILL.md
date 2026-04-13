@@ -77,6 +77,17 @@ State the problem precisely. Include:
 
 Omit anything that doesn't help fix the bug. No boilerplate headers. No padding.
 
+### Hard self-containment requirement
+
+The issue body must be understandable to a repo reader with no access to your local session.
+
+Hard rules:
+- Do not mention PR numbers, prompt files, rollout ids, local conversations, or "in this PR" / "the user asked" style context.
+- Do not refer to local-only paths, local images, scratch notes, or private workstation state.
+- Do not refer to untracked `scripts/wip/*` files as if they are durable repo interfaces. If a script is needed as part of the issue context, either promote it into tracked repo state first or rewrite the issue so it stands on code references and observed behavior without depending on that script.
+- If you cite artifacts, prefer tracked repo paths or durable result paths that other engineers on the shared environment can inspect. Do not write things like "local curve copy" or "see my local image".
+- The reader should be able to understand the bug from the issue body plus the repository itself, without needing your personal environment or prior turns.
+
 ### Create
 
 ```bash
@@ -94,3 +105,4 @@ gh issue create --repo MindLab-Research/tinker-server \
 - Do not create duplicate issues
 - Do not substitute a simpler problem for the reported one
 - If unable to reproduce, say so - do not invent explanations
+- Issue bodies must be self-contained and must not depend on private local context

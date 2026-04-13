@@ -69,6 +69,38 @@ def test_issue_94_init_ray_does_not_override_explicit_kwarg(monkeypatch) -> None
     assert calls[-1]["address"] == "127.0.0.1:6379"
 
 
+def test_issue_94_init_ray_injects_client_working_dir_for_ray_client(monkeypatch) -> None:
+    calls: list[dict] = []
+    _install_ray_stub(calls, monkeypatch)
+
+    from tinker_server.ray_utils import init_ray
+
+    monkeypatch.setenv("RAY_ADDRESS", "ray://192.168.38.143:10001")
+    monkeypatch.setenv("PFS_TINKER_PATH", "/vePFS-Mindverse/share/code/conley/tinker-server")
+    init_ray(namespace="ns", ignore_reinit_error=True)
+    assert calls[-1]["address"] == "ray://192.168.38.143:10001"
+    assert calls[-1]["runtime_env"]["working_dir"] == "/vePFS-Mindverse/share/code/conley/tinker-server"
+
+
+def test_issue_94_init_ray_merges_runtime_env_without_overriding_working_dir(monkeypatch) -> None:
+    calls: list[dict] = []
+    _install_ray_stub(calls, monkeypatch)
+
+    from tinker_server.ray_utils import init_ray
+
+    monkeypatch.setenv("RAY_ADDRESS", "ray://192.168.38.143:10001")
+    monkeypatch.setenv("PFS_TINKER_PATH", "/vePFS-Mindverse/share/code/conley/tinker-server")
+    init_ray(
+        namespace="ns",
+        ignore_reinit_error=True,
+        runtime_env={"env_vars": {"A": "1"}, "working_dir": "/tmp/custom"},
+    )
+    assert calls[-1]["runtime_env"] == {
+        "env_vars": {"A": "1"},
+        "working_dir": "/tmp/custom",
+    }
+
+
 def test_issue_94_init_ray_requires_explicit_address(monkeypatch) -> None:
     calls: list[dict] = []
     _install_ray_stub(calls, monkeypatch)

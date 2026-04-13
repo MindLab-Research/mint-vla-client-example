@@ -12,7 +12,7 @@ import logging
 import os
 from typing import Any
 
-from ..config import otel_env_vars
+from ..config import otel_env_vars, preferred_control_plane_resources, preferred_control_plane_resources
 
 logger = logging.getLogger(__name__)
 _ACTOR_HANDLE = None

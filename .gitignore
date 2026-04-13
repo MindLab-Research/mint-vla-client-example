@@ -142,7 +142,7 @@ celerybeat.pid
 .envrc
 .secrets.env
 .secrets.env*
-.venv
+.venv*
 env/
 venv/
 ENV/
@@ -235,7 +235,11 @@ ray_head_ip.txt
 *.key
 
 # Work-in-progress investigation scripts
-scripts/wip/
+scripts/wip/*
+!scripts/wip/openpi_libero_sft.py
+!scripts/wip/openpi_libero_fast_rl.py
+!scripts/wip/openpi_libero_resume_sft.py
+!scripts/wip/openpi_vla_pressure_threads.py
 
 # Experiment outputs in root
 *_training_curves.png
@@ -252,3 +256,9 @@ REFLECTION_*.md
 node_modules/
 .pnpm-store/
 .learnings/ERRORS.md
+!scripts/wip/openpi_vla_start_server.sh
+!scripts/wip/openpi_libero_fixed_eval_abs.py
+!scripts/wip/openpi_libero_fast_group_rl.py
+!scripts/wip/openpi_libero_fast_real_eval.py
+!scripts/wip/openpi_libero_fast_real_eval_report.py
+!scripts/wip/openpi_vla_smoke.py

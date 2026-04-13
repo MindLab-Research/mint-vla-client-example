@@ -87,7 +87,7 @@ class _StubFutureStore:
         self.async_ensure_started_calls += 1
         return None
 
-    async def async_ensure_ready(self) -> None:
+    async def async_ensure_ready(self, **_kwargs) -> None:
         self.async_ensure_ready_calls += 1
         if self.fail_async_ensure_ready:
             raise RuntimeError("future store stats probe failed")
@@ -169,7 +169,6 @@ class _StubApiWorkQueue:
         if self.fail_async_ensure_ready:
             raise RuntimeError("api work queue stats probe failed")
         return {"depth": 0, "enqueued": 0, "dequeued": 0, "timeout_s": float(timeout_s)}
-
     def set_executor(self, _op: str, _executor) -> None:
         return None
 
@@ -571,6 +570,126 @@ async def test_acquire_startup_lease_fails_closed_to_follower(monkeypatch) -> No
     assert lease.local_only is False
 
 
+def test_startup_lease_creation_prefers_explicit_pinned_node(monkeypatch) -> None:
+    _install_fake_ray(monkeypatch)
+    startup_lease_module = importlib.import_module("tinker_server.backend.startup_lease")
+    config_module = importlib.import_module("tinker_server.config")
+    fake_ray = importlib.import_module("ray")
+    created_options = {}
+
+    class _FakeRemoteCall:
+        def remote(self, *_args, **_kwargs):
+            return object()
+
+    class _FakeActorHandle:
+        def __init__(self) -> None:
+            self.try_acquire = _FakeRemoteCall()
+
+    class _FakeRemoteBuilder:
+        def remote(self):
+            return _FakeActorHandle()
+
+    class _FakeRemoteClass:
+        @staticmethod
+        def options(**kwargs):
+            created_options.update(kwargs)
+            return _FakeRemoteBuilder()
+
+    def _fake_remote(**kwargs):
+        assert kwargs == {"num_cpus": 0}
+
+        def _decorator(_cls):
+            return _FakeRemoteClass
+
+        return _decorator
+
+    monkeypatch.setattr(fake_ray, "remote", _fake_remote, raising=False)
+    monkeypatch.setattr(
+        fake_ray,
+        "get_actor",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("actor not found")),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        fake_ray,
+        "cluster_resources",
+        lambda: {"node:__internal_head__": 1.0},
+        raising=False,
+    )
+    monkeypatch.setattr(fake_ray, "get", lambda *_args, **_kwargs: {"owner": True}, raising=False)
+    monkeypatch.setattr(config_module, "PFS_RUNTIME_ENV_ROOT", "/tmp/runtime-root")
+    monkeypatch.setattr(config_module, "PFS_TINKER_PATH", "/tmp/tinker-root")
+    monkeypatch.setattr(config_module, "PFS_HF_MODULES_PATH", "/tmp/hf-modules")
+    monkeypatch.setattr(config_module, "PFS_PYTHONPATH", "/tmp/runtime-root/site-packages:/tmp/tinker-root")
+    monkeypatch.setenv("RAY_ADDRESS", "192.168.38.184:6379")
+    monkeypatch.setenv("MINT_STARTUP_LEASE_PINNED_NODE_IP", "192.168.38.176")
+    monkeypatch.setattr(startup_lease_module, "_ACTOR_HANDLE", None)
+
+    startup_lease_module._get_or_create_actor()
+
+    assert created_options["resources"] == {"node:192.168.38.176": 0.001}
+
+
+def test_startup_lease_creation_defaults_to_head_pin(monkeypatch) -> None:
+    _install_fake_ray(monkeypatch)
+    startup_lease_module = importlib.import_module("tinker_server.backend.startup_lease")
+    config_module = importlib.import_module("tinker_server.config")
+    fake_ray = importlib.import_module("ray")
+    created_options = {}
+
+    class _FakeRemoteCall:
+        def remote(self, *_args, **_kwargs):
+            return object()
+
+    class _FakeActorHandle:
+        def __init__(self) -> None:
+            self.try_acquire = _FakeRemoteCall()
+
+    class _FakeRemoteBuilder:
+        def remote(self):
+            return _FakeActorHandle()
+
+    class _FakeRemoteClass:
+        @staticmethod
+        def options(**kwargs):
+            created_options.update(kwargs)
+            return _FakeRemoteBuilder()
+
+    def _fake_remote(**kwargs):
+        assert kwargs == {"num_cpus": 0}
+
+        def _decorator(_cls):
+            return _FakeRemoteClass
+
+        return _decorator
+
+    monkeypatch.setattr(fake_ray, "remote", _fake_remote, raising=False)
+    monkeypatch.setattr(
+        fake_ray,
+        "get_actor",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("actor not found")),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        fake_ray,
+        "cluster_resources",
+        lambda: {"node:__internal_head__": 1.0},
+        raising=False,
+    )
+    monkeypatch.setattr(fake_ray, "get", lambda *_args, **_kwargs: {"owner": True}, raising=False)
+    monkeypatch.setattr(config_module, "PFS_RUNTIME_ENV_ROOT", "/tmp/runtime-root")
+    monkeypatch.setattr(config_module, "PFS_TINKER_PATH", "/tmp/tinker-root")
+    monkeypatch.setattr(config_module, "PFS_HF_MODULES_PATH", "/tmp/hf-modules")
+    monkeypatch.setattr(config_module, "PFS_PYTHONPATH", "/tmp/runtime-root/site-packages:/tmp/tinker-root")
+    monkeypatch.setenv("RAY_ADDRESS", "192.168.38.184:6379")
+    monkeypatch.delenv("MINT_STARTUP_LEASE_PINNED_NODE_IP", raising=False)
+    monkeypatch.setattr(startup_lease_module, "_ACTOR_HANDLE", None)
+
+    startup_lease_module._get_or_create_actor()
+
+    assert created_options["resources"] == {"node:__internal_head__": 0.001}
+
+
 def test_lifespan_keeps_training_route_globals_unbound_in_stateless_api(monkeypatch) -> None:
     queue = _StubApiWorkQueue()
     owner_runtime = _StubOwnerRuntimeSupervisor()
@@ -868,6 +987,75 @@ async def test_prewarm_raises_when_inference_prewarm_fails(monkeypatch) -> None:
 
     with pytest.raises(RuntimeError, match="pinned worker full"):
         await app_module._prewarm_persistent_models(SimpleNamespace(), _FailingManager())
+
+
+@pytest.mark.anyio
+async def test_cleanup_stale_actors_registers_openpi_shared_actor(monkeypatch) -> None:
+    _install_fake_ray(monkeypatch)
+    from tinker_server.backend import multi_lora_engine
+
+    ray = sys.modules["ray"]
+    actor_name = "openpi_shared_runtime_deadbeef"
+    actor = SimpleNamespace(
+        __ray_ready__=SimpleNamespace(remote=lambda: "ready-ref"),
+        describe=SimpleNamespace(remote=lambda: "describe-ref"),
+    )
+    registered: dict[str, object] = {}
+
+    ray.is_initialized = lambda: True  # type: ignore[attr-defined]
+    ray.get_actor = lambda name, namespace=None: actor  # type: ignore[attr-defined]
+    ray.util.list_named_actors = lambda all_namespaces=True: [  # type: ignore[attr-defined]
+        {"name": actor_name, "namespace": multi_lora_engine.PERSISTENT_NAMESPACE}
+    ]
+
+    def _fake_ray_get(ref, *args, **kwargs):
+        _ = args, kwargs
+        if ref == "ready-ref":
+            return None
+        if ref == "describe-ref":
+            return {
+                "pool_key": {
+                    "base_model": "openpi/pi0-fast-libero-low-mem-finetune",
+                    "worker_module": "tinker_server.backend.openpi_fast_worker",
+                },
+                "actor_id": "actor-123",
+                "node_id": "node-456",
+                "node_ip": "192.168.0.8",
+                "pid": 999,
+                "cuda_visible_devices": "0",
+                "current_session_id": "session-a",
+            }
+        raise AssertionError(f"unexpected ray.get ref: {ref!r}")
+
+    ray.get = _fake_ray_get  # type: ignore[attr-defined]
+
+    resource_pool_module = importlib.import_module("tinker_server.backend.resource_pool")
+
+    class _FakePool:
+        def register(self, **kwargs):
+            registered["register"] = kwargs
+
+        def mark_ready(self, actor_name):
+            registered["mark_ready"] = actor_name
+
+    monkeypatch.setattr(resource_pool_module, "get_resource_pool", lambda: _FakePool())
+    monkeypatch.setattr(app_module.config, "skip_actor_cleanup", False)
+
+    await app_module._cleanup_stale_actors()
+
+    register = registered["register"]
+    assert register["actor_name"] == actor_name
+    assert register["actor_type"].value == "openpi"
+    assert register["num_gpus"] == 1
+    assert register["base_model"] == "openpi/pi0-fast-libero-low-mem-finetune"
+    assert register["session_id"] == "session-a"
+    assert register["node_id"] == "node-456"
+    assert register["metadata"]["pool_key"]["worker_module"] == "tinker_server.backend.openpi_fast_worker"
+    assert register["metadata"]["actor_id"] == "actor-123"
+    assert register["metadata"]["node_ip"] == "192.168.0.8"
+    assert register["metadata"]["pid"] == 999
+    assert register["metadata"]["cuda_visible_devices"] == "0"
+    assert registered["mark_ready"] == actor_name
 
 
 @pytest.mark.anyio

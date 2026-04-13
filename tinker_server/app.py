@@ -40,7 +40,7 @@ from .logging_context import (
     set_trace_id,
 )
 from .ray_utils import init_ray, ray_address_source_configured, ray_connection_epoch, ray_reconnect_poll_s
-from .routes import futures, internal, mint, openai_compat, sampling, service, training, weights
+from .routes import action_sampling, futures, internal, mint, openai_compat, sampling, service, training, weights
 from .server_info import _git_sha
 from .token_encryptor import TokenEncryptor
 
@@ -174,7 +174,6 @@ def _clear_local_execution_route_globals() -> None:
     weights.training_engine = None
     weights.inference_manager = None
 
-
 async def _restore_sampling_sessions(inference_manager: SessionManager) -> int:
     """Restore detached sampling-session metadata into SessionManager."""
     from .backend.sampling_session_store import async_list_sampling_sessions
@@ -251,6 +250,11 @@ async def lifespan(app: FastAPI):
     else:
         owner_runtime = await owner_runtime_supervisor.async_ensure_started()
 
+    from .backend.action_session_manager import ActionSessionRouter
+
+    action_manager = ActionSessionRouter()
+    action_sampling.action_session_manager = action_manager
+    mint.action_session_manager = action_manager
     try:
         from .backend.dense_session_state import cleanup_legacy_dense_session_state_once
         from .backend.training_session_store import list_training_sessions
@@ -359,6 +363,13 @@ async def lifespan(app: FastAPI):
                 await owner_runtime_supervisor.async_run_once("actor_reconciliation", timeout_s=60.0)
         else:
             logger.info("Skipping stale-actor cleanup on follower worker")
+
+        # ==========================================================================
+        # Action route layer: process-local router can recover detached runtimes
+        # from ResourcePool metadata after API or worker restarts.
+        # ==========================================================================
+        action_sampling.action_session_manager = action_manager
+        mint.action_session_manager = action_manager
 
         # ==========================================================================
         # Inference route layer: stateless API path uses detached stores only
@@ -921,6 +932,7 @@ async def api_key_auth_middleware(request: Request, call_next):
 
 # Register routes with API prefix
 app.include_router(service.router, prefix="/api/v1", tags=["service"])
+app.include_router(action_sampling.router, prefix="/api/v1", tags=["action_sampling"])
 app.include_router(sampling.router, prefix="/api/v1", tags=["sampling"])
 app.include_router(futures.router, prefix="/api/v1", tags=["futures"])
 app.include_router(training.router, prefix="/api/v1", tags=["training"])

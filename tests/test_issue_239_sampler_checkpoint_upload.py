@@ -49,6 +49,35 @@ def test_issue_239_sampler_only_upload_is_supported(tmp_path: Path) -> None:
     assert meta["optimizer_present"] is False
 
 
+def test_issue_239_openpi_sampler_upload_is_supported(tmp_path: Path) -> None:
+    from tinker_server.routes import weights as weights_routes
+
+    weights_routes.CHECKPOINTS_DIR = str(tmp_path)
+
+    payload = _make_tar_gz_bytes(
+        "ckpt_openpi_sampler",
+        {
+            "params/_METADATA": b"orbax",
+            "assets/physical-intelligence/libero/norm_stats.json": b"{}",
+        },
+    )
+
+    app = FastAPI()
+    app.include_router(weights_routes.router, prefix="/api/v1")
+    client = TestClient(app)
+
+    resp = client.post(
+        "/api/v1/checkpoints/upload",
+        files={"file": ("ckpt_openpi.tar.gz", payload, "application/gzip")},
+    )
+    assert resp.status_code == 200, resp.text
+    ckpt_id = resp.json()["checkpoint_id"]
+
+    meta = json.loads((tmp_path / "anonymous" / ckpt_id / "metadata.json").read_text("utf-8"))
+    assert meta["checkpoint_type"] == "sampler"
+    assert meta["optimizer_present"] is False
+
+
 def test_issue_239_training_declared_without_optimizer_is_rejected(tmp_path: Path) -> None:
     from tinker_server.routes import weights as weights_routes
 
@@ -72,4 +101,3 @@ def test_issue_239_training_declared_without_optimizer_is_rejected(tmp_path: Pat
     )
     assert resp.status_code == 400
     assert "declares checkpoint_type" in resp.text
-

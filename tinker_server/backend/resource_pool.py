@@ -24,7 +24,7 @@ from typing import Any, cast
 
 import ray
 
-from ..config import config as server_config, otel_env_vars
+from ..config import config as server_config, otel_env_vars, preferred_control_plane_resources
 from . import ray_kill
 
 logger = logging.getLogger(__name__)
@@ -36,9 +36,10 @@ class ResourcePoolStaleError(RuntimeError):
 
 
 class ActorType(Enum):
-    MEGATRON = "megatron"
-    DENSE = "dense"
-    VLLM = "vllm"
+    MEGATRON = "megatron"  # MoE training (8 GPUs)
+    DENSE = "dense"        # Dense training (1 GPU)
+    OPENPI = "openpi"      # OpenPI shared training (1 GPU)
+    VLLM = "vllm"          # Inference (1-4 GPUs)
 
 
 @dataclass
@@ -499,6 +500,8 @@ def _record_to_entry(record: dict[str, Any], *, actor_handle: ActorHandle | None
 def _backend_for_entry(entry: ActorEntry) -> str:
     if entry.actor_type == ActorType.DENSE:
         return "peft"
+    if entry.actor_type == ActorType.OPENPI:
+        return "openpi"
     if entry.actor_type == ActorType.MEGATRON:
         return "megatron"
     return "vllm"

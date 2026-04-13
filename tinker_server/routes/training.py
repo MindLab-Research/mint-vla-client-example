@@ -812,6 +812,9 @@ def _build_training_scheduler_extra(
     )
     backend = str(_field(session, "backend", "") or "unknown")
     base_model = str(_field(session, "base_model", "") or "")
+    openpi_train_step = training_op == "train_step" and backend in {"openpi_fast", "openpi_pi05"}
+    if openpi_train_step:
+        enabled = True
     if backend == "megatron" and base_model:
         domain_key = _normalize_megatron_scheduler_domain_key(base_model)
     else:
@@ -827,6 +830,9 @@ def _build_training_scheduler_extra(
         "execution_serial_key": f"training_session:{model_id}",
         "training_op": str(training_op),
     }
+    if openpi_train_step:
+        extra["scheduler_fairness"] = "rr"
+        extra["scheduler_max_consecutive"] = 1
     if seq_id is not None:
         try:
             extra["seq_id"] = int(seq_id)
@@ -984,6 +990,14 @@ async def create_model(
         base_model=request.base_model,
         rollout_correction_config=request.rollout_correction_config,
     )
+    try:
+        from ..backend.openpi_fast_training import validate_openpi_fast_create_request
+        from ..backend.openpi_pi05_training import validate_openpi_pi05_create_request
+
+        validate_openpi_fast_create_request(request)
+        validate_openpi_pi05_create_request(request)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     # Check model access permissions
     user_data = _get_user_data(http_request)
@@ -1335,6 +1349,14 @@ async def create_model_from_state(
         base_model=request.base_model,
         rollout_correction_config=request.rollout_correction_config,
     )
+    try:
+        from ..backend.openpi_fast_training import validate_openpi_fast_create_request
+        from ..backend.openpi_pi05_training import validate_openpi_pi05_create_request
+
+        validate_openpi_fast_create_request(request)
+        validate_openpi_pi05_create_request(request)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     # Check model access permissions
     user_data = _get_user_data(http_request)
