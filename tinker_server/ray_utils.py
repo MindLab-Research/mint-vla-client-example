@@ -91,8 +91,8 @@ def ray_client_working_dir() -> str | None:
     addr = os.environ.get("RAY_ADDRESS", "").strip()
     if not addr.startswith("ray://"):
         return None
-    pfs_tinker_path = os.environ.get("PFS_TINKER_PATH", "").strip()
-    return pfs_tinker_path or None
+    working_dir = os.environ.get("MINT_RAY_WORKING_DIR", "").strip()
+    return working_dir or None
 
 
 def require_ray_address() -> str:
@@ -160,10 +160,13 @@ def _run_ray_reconnect_invalidators() -> None:
 def _driver_runtime_env() -> dict[str, Any]:
     runtime_env: dict[str, Any] = {}
 
+    # Only package a Ray Client working_dir when the operator asks for it.
+    # `PFS_TINKER_PATH` is already a shared cluster path in Mint deployments,
+    # so auto-uploading it through runtime_env just creates redundant node-side
+    # working_dir caches.
     working_dir = (
         os.environ.get("MINT_RAY_JOB_WORKING_DIR", "").strip()
         or os.environ.get("MINT_RAY_WORKING_DIR", "").strip()
-        or os.environ.get("PFS_TINKER_PATH", "").strip()
     )
     if working_dir:
         runtime_env["working_dir"] = working_dir
