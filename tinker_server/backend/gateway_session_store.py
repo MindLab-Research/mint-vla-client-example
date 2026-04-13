@@ -142,16 +142,8 @@ def _get_or_create_actor():
 def _ensure_ray_initialized() -> None:
     import ray
 
-    if ray.is_initialized():
-        return
-    try:
-        from tinker_server.ray_utils import init_ray
-
-        init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
-    except Exception as e:
-        raise RuntimeError(f"Failed to initialize Ray for gateway session store: {type(e).__name__}: {e}") from e
     if not ray.is_initialized():
-        raise RuntimeError("Ray is not initialized after init_ray() for gateway session store")
+        raise RuntimeError("Ray not initialized")
 
 
 def _get_cached_actor_for_async_request_path():

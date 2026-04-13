@@ -273,6 +273,13 @@ def test_issue_364_end_session_cleans_sampler_index_and_parent_session_link(
     )
 
     calls: list[tuple[str, str, str | None]] = []
+    detached_info = {
+        "session_id": "sess-364-cleanup",
+        "base_model": "Qwen/Qwen3-4B-Instruct-2507",
+        "uses_base_model": True,
+        "metadata_version": 1,
+        "last_activity": 1.0,
+    }
 
     monkeypatch.setattr(
         "tinker_server.backend.session_index_store.get_sampler_index",
@@ -290,8 +297,17 @@ def test_issue_364_end_session_cleans_sampler_index_and_parent_session_link(
         lambda session_id, sampler_id: calls.append(("unlink", sampler_id, session_id)),
     )
     monkeypatch.setattr(
+        "tinker_server.backend.sampling_session_store.get_sampling_session_info",
+        lambda session_id: dict(detached_info) if session_id == detached_info.get("session_id") else None,
+    )
+
+    def _delete_sampling_session(session_id: str) -> None:
+        calls.append(("sampling-store", session_id, None))
+        detached_info.clear()
+
+    monkeypatch.setattr(
         "tinker_server.backend.sampling_session_store.delete_sampling_session",
-        lambda session_id: calls.append(("sampling-store", session_id, None)),
+        _delete_sampling_session,
     )
 
     ended = anyio.run(manager.end_session, "sess-364-cleanup")
@@ -433,9 +449,13 @@ def test_issue_364_restore_sampling_session_merges_last_activity_without_version
     assert snapshot.metadata_version == 3
 
 
-def test_issue_364_resource_pool_wrapper_preserves_metadata_without_ray() -> None:
-    from tinker_server.backend.resource_pool import ActorType, get_resource_pool
+def test_issue_364_resource_pool_wrapper_preserves_metadata_without_ray(monkeypatch: pytest.MonkeyPatch) -> None:
+    import tinker_server.backend.resource_pool as resource_pool_module
+    from tinker_server.backend.resource_pool import ActorType, ResourcePool, get_resource_pool
 
+    monkeypatch.setattr(resource_pool_module, "_detached_enabled", lambda: False)
+    monkeypatch.setattr(resource_pool_module.ray, "is_initialized", lambda: False)
+    monkeypatch.setattr(ResourcePool, "_instance", None)
     pool = get_resource_pool()
     actor_name = "actor-364-wrapper-local"
     pool.unregister(actor_name)
@@ -635,6 +655,10 @@ async def test_issue_364_sampling_restore_drops_stale_local_snapshot_when_store_
     monkeypatch.setattr(
         "tinker_server.backend.sampling_session_store.async_get_sampling_session_info",
         _async_get_sampling_session_info,
+    )
+    monkeypatch.setattr(
+        "tinker_server.backend.sampling_session_store.get_sampling_session_info",
+        lambda _session_id: None,
     )
     monkeypatch.setattr(
         "tinker_server.backend.sampling_session_store.delete_sampling_session",

@@ -250,6 +250,11 @@ def init_ray(**kwargs: Any) -> Any:
     Adds log_to_driver=True when MINT_RAY_LOG_TO_DRIVER is enabled, unless explicitly
     set by the caller. When the caller leaves address unset or uses "auto", prefer
     the configured head-address file, then Ray Client endpoints, then direct attach.
+
+    When attaching through Ray Client, local repo paths must be supplied at the job
+    level rather than per-actor runtime_env. `MINT_RAY_JOB_WORKING_DIR` provides
+    that path for `ray.init(runtime_env=...)` without forcing every actor runtime_env
+    to use a local-path working_dir, which Ray rejects in client mode.
     """
     import ray
     global _RAY_CONNECTION_EPOCH, _RAY_LAST_INIT_ADDRESS
@@ -283,12 +288,18 @@ def init_ray(**kwargs: Any) -> Any:
     if temp_dir and "_temp_dir" not in kwargs:
         kwargs["_temp_dir"] = temp_dir
 
-    working_dir = ray_client_working_dir()
-    runtime_env = kwargs.get("runtime_env")
-    if working_dir and (runtime_env is None or isinstance(runtime_env, dict)):
-        payload = {} if runtime_env is None else dict(runtime_env)
-        payload.setdefault("working_dir", working_dir)
-        kwargs["runtime_env"] = payload
+    job_working_dir = os.environ.get("MINT_RAY_JOB_WORKING_DIR", "").strip()
+    if job_working_dir:
+        runtime_env = dict(kwargs.get("runtime_env") or {})
+        runtime_env.setdefault("working_dir", job_working_dir)
+        kwargs["runtime_env"] = runtime_env
+    else:
+        working_dir = ray_client_working_dir()
+        runtime_env = kwargs.get("runtime_env")
+        if working_dir and (runtime_env is None or isinstance(runtime_env, dict)):
+            payload = {} if runtime_env is None else dict(runtime_env)
+            payload.setdefault("working_dir", working_dir)
+            kwargs["runtime_env"] = payload
 
     for k, v in ray_log_to_driver_kwargs().items():
         kwargs.setdefault(k, v)

@@ -4,10 +4,14 @@ import pytest
 
 pytest.importorskip("ray")
 
-from tinker_server.backend.resource_pool import ActorType, get_resource_pool
+import tinker_server.backend.resource_pool as resource_pool_module
+from tinker_server.backend.resource_pool import ActorType, ResourcePool, get_resource_pool
 
 
-def test_resource_pool_list_actors_includes_metadata() -> None:
+def test_resource_pool_list_actors_includes_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(resource_pool_module, "_detached_enabled", lambda: False)
+    monkeypatch.setattr(resource_pool_module.ray, "is_initialized", lambda: False)
+    monkeypatch.setattr(ResourcePool, "_instance", None)
     pool = get_resource_pool()
     actor_name = f"test_issue_40_dense_{uuid.uuid4().hex}"
 

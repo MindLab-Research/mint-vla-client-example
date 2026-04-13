@@ -224,8 +224,8 @@ checkpoints/
 # Codex task files (do not commit)
 PROMPT.md
 LOG.md
-PROMPT.md
 transcript.txt
+context/
 results/*
 .claude/skills/merge-gate/results/
 
@@ -247,6 +247,10 @@ scripts/wip/*
 *_ANALYSIS.md
 *_REPORT.md
 REFLECTION_*.md
+
+# Local pytest scratch and logs
+.tmp/
+.pi/logs/
 
 # Frontend package managers
 node_modules/

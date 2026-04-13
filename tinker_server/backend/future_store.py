@@ -983,14 +983,6 @@ class FutureStore:
             raise FutureStoreUnavailableError("Ray import failed") from e
 
         if not ray.is_initialized():
-            try:
-                from ..ray_utils import init_ray
-
-                init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
-            except Exception as e:
-                raise FutureStoreUnavailableError("Ray not initialized (init_ray failed)") from e
-
-        if not ray.is_initialized():
             raise FutureStoreUnavailableError("Ray not initialized")
 
         actor = self._ray_actor
@@ -1013,12 +1005,6 @@ class FutureStore:
         except Exception as e:
             raise FutureStoreUnavailableError("Ray import failed") from e
 
-        try:
-            from ..ray_utils import init_ray
-
-            init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
-        except Exception as e:
-            raise FutureStoreUnavailableError("Ray not initialized (init_ray failed)") from e
         if not ray.is_initialized():
             raise FutureStoreUnavailableError("Ray not initialized")
 
@@ -1113,12 +1099,6 @@ class FutureStore:
         except Exception as e:
             raise FutureStoreUnavailableError("Ray import failed") from e
 
-        try:
-            from ..ray_utils import init_ray
-
-            init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
-        except Exception as e:
-            raise FutureStoreUnavailableError("Ray not initialized (init_ray failed)") from e
         if not ray.is_initialized():
             raise FutureStoreUnavailableError("Ray not initialized")
 
@@ -1144,12 +1124,6 @@ class FutureStore:
         except Exception as e:
             raise FutureStoreUnavailableError("Ray import failed") from e
 
-        try:
-            from ..ray_utils import init_ray
-
-            init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
-        except Exception as e:
-            raise FutureStoreUnavailableError("Ray not initialized (init_ray failed)") from e
         if not ray.is_initialized():
             raise FutureStoreUnavailableError("Ray not initialized")
 

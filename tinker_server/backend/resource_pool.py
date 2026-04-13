@@ -949,7 +949,11 @@ class ResourcePool:
         self._clear_cached_handle(actor_name)
         if not self._use_detached():
             return bool(self._local(self._local_state.unregister, actor_name))
-        return bool(_call_actor_sync("unregister", actor_name))
+        try:
+            return bool(_call_actor_sync("unregister", actor_name))
+        except ray.exceptions.GetTimeoutError:
+            logger.warning("[ResourcePool] unregister timed out for actor=%s", actor_name)
+            return False
 
     def get(self, actor_name: str) -> ActorEntry | None:
         if not self._use_detached():

@@ -194,11 +194,17 @@ def test_issue_283_create_model_from_state_background_uses_resolved_path(tmp_pat
             self.last_activity = 0.0
 
     class StubTrainingManager:
+        def __init__(self) -> None:
+            self.persisted: list[str] = []
+
         def get_session(self, model_id: str):
             return None
 
         def mark_inflight(self, model_id: str, delta: int) -> None:
             _ = (model_id, delta)
+
+        def mark_persisted(self, model_id: str) -> None:
+            self.persisted.append(model_id)
 
         def delete_session(self, model_id: str) -> None:
             return None
@@ -233,9 +239,22 @@ def test_issue_283_create_model_from_state_background_uses_resolved_path(tmp_pat
     stub_engine = StubTrainingEngine()
     stub_future_store = StubFutureStore()
 
+    import tinker_server.backend.session_index_store as session_index_store_module
+    import tinker_server.backend.training_session_store as training_store_module
+
+    training_store_updates: list[dict] = []
+    session_index_updates: list[tuple[str, str, str | None, str]] = []
     monkeypatch.setattr(training_routes, "training_engine", stub_engine)
     monkeypatch.setattr(training_routes, "training_manager", StubTrainingManager())
     monkeypatch.setattr(training_routes, "future_store", stub_future_store)
+    monkeypatch.setattr(training_store_module, "upsert_training_session", lambda info: training_store_updates.append(dict(info)))
+    monkeypatch.setattr(
+        session_index_store_module,
+        "add_training_run_to_session",
+        lambda session_id, training_run_id, user_id=None, created_at=None: session_index_updates.append(
+            (session_id, training_run_id, user_id, created_at)
+        ),
+    )
 
     req = CreateModelFromStateRequest(
         session_id="s283-bg",
@@ -254,6 +273,9 @@ def test_issue_283_create_model_from_state_background_uses_resolved_path(tmp_pat
     assert stub_future_store.resolved == [
         ("req-283-bg", {"request_id": "req-283-bg", "model_id": "s283-bg_0", "type": "create_model_from_state"})
     ]
+    assert training_store_updates[0]["model_id"] == "s283-bg_0"
+    assert training_store_updates[0]["base_model"] == "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    assert session_index_updates == [("s283-bg", "s283-bg_0", None, "2026-03-13T00:00:00Z")]
 
 
 def test_issue_283_create_model_from_state_background_restores_openpi_training_checkpoint(

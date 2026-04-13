@@ -1068,6 +1068,31 @@ def test_server_config_prefers_mint_actor_names_and_accepts_legacy_tinker_aliase
     assert legacy_only.capacity_manager_actor_name == "legacy-cap"
 
 
+def test_actor_runtime_env_vars_requires_ray_address(tmp_path):
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env(env_root)
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from tinker_server.config import actor_runtime_env_vars; "
+                "actor_runtime_env_vars(pythonpath='X')"
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        env={
+            "PFS_RUNTIME_ENV_ROOT": str(env_root),
+            "PFS_TINKER_PATH": str(tmp_path / 'repo'),
+            "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
+        },
+    )
+    assert out.returncode != 0
+    assert "RAY_ADDRESS is required" in (out.stdout + out.stderr)
+
+
 def test_actor_runtime_env_vars_canonicalize_legacy_tinker_actor_aliases(tmp_path):
     env_root = tmp_path / "runtime"
     _materialize_runtime_env(env_root)
@@ -1099,3 +1124,36 @@ def test_actor_runtime_env_vars_canonicalize_legacy_tinker_actor_aliases(tmp_pat
     assert data["MINT_CAPACITY_MANAGER_ACTOR_NAME"] == "legacy-capacity-manager"
     assert "TINKER_API_WORK_QUEUE_ACTOR_NAME" not in data
     assert "TINKER_CAPACITY_MANAGER_ACTOR_NAME" not in data
+
+
+def test_actor_runtime_env_vars_forwards_usage_envs(tmp_path):
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env(env_root)
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json; "
+                "from tinker_server.config import actor_runtime_env_vars; "
+                "print(json.dumps(actor_runtime_env_vars(pythonpath='X')))"
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            "PFS_RUNTIME_ENV_ROOT": str(env_root),
+            "PFS_TINKER_PATH": str(tmp_path / 'repo'),
+            "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
+            "RAY_ADDRESS": "ray://cfg-test",
+            "TINKER_USAGE_LOG_DIR": "/vePFS/shared/usage",
+            "TINKER_USAGE_BACKEND": "postgres",
+            "TINKER_USAGE_PG_DSN": "postgresql://mint:test@db/usage",
+        },
+    )
+    data = json.loads(out.stdout)
+    assert data["TINKER_USAGE_LOG_DIR"] == "/vePFS/shared/usage"
+    assert data["TINKER_USAGE_BACKEND"] == "postgres"
+    assert data["TINKER_USAGE_PG_DSN"] == "postgresql://mint:test@db/usage"

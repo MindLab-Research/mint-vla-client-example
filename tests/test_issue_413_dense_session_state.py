@@ -9,7 +9,8 @@ import pytest
 pytest.importorskip("ray")
 
 from tinker_server.backend import dense_session_state as dense_state_module
-from tinker_server.backend.resource_pool import ActorType, get_resource_pool
+import tinker_server.backend.resource_pool as resource_pool_module
+from tinker_server.backend.resource_pool import ActorType, ResourcePool, get_resource_pool
 from tinker_server.backend.training_session_manager import TrainingSession
 from tinker_server.backend.verl_training import SessionStateManager, TrainingWorker, VerlTrainingEngine
 from tinker_server.config import config as server_config
@@ -123,6 +124,9 @@ def test_issue_413_shutdown_session_reclaims_dense_state_for_shared_actor(
     monkeypatch.setattr(config_module, "PFS_RUNTIME_ENV_ROOT", str(runtime_env_root))
     monkeypatch.setattr(config_module, "PFS_PYTHONPATH", str((tmp_path / "runtime_py").resolve()))
 
+    monkeypatch.setattr(resource_pool_module, "_detached_enabled", lambda: False)
+    monkeypatch.setattr(resource_pool_module.ray, "is_initialized", lambda: False)
+    monkeypatch.setattr(ResourcePool, "_instance", None)
     pool = get_resource_pool()
     actor_name = f"peft_trainer_test_{uuid.uuid4().hex}_maxr64"
     model_id = f"model_{uuid.uuid4().hex}"
@@ -158,7 +162,7 @@ def test_issue_413_shutdown_session_reclaims_dense_state_for_shared_actor(
 
     monkeypatch.setattr(verl_training.ray, "get", lambda value, timeout=None: value)
 
-    asyncio.run(engine.shutdown_session(session))
+    asyncio.run(engine.delete_session(session))
 
     assert worker.delete_calls == [model_id]
     assert not session_dir.exists()
@@ -171,7 +175,8 @@ def test_issue_413_shutdown_session_reclaims_dense_state_for_shared_actor(
 
 @pytest.mark.anyio
 async def test_issue_413_internal_metrics_include_dense_session_state(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def _fake_admission_stats() -> dict:
+    async def _fake_admission_stats(*, include_actor_rss: bool = True) -> dict:
+        assert include_actor_rss is False
         return {
             "driver_state": {
                 "dense_session_state_bytes": 1234,

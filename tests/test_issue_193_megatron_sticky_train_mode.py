@@ -2,6 +2,7 @@ import inspect
 import logging
 import time
 import sys
+import builtins
 
 import pytest
 
@@ -10,10 +11,8 @@ pytest.importorskip("ray")
 from tinker_server.backend.megatron_distributed import (
     DistributedConfig,
     MegatronRankWorker,
-    MegatronSessionStateManager,
     MegatronWorkerGroup,
     _GRADIENTS_CONSUMED,
-    _make_megatron_actor_name,
 )
 
 
@@ -31,6 +30,20 @@ class _FakeTrainMode:
         return None
 
 
+class _FakeEvalMode:
+    def __init__(self, state: dict):
+        self._state = state
+
+    def __enter__(self):
+        self._state["eval_enter"] += 1
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        _ = (exc_type, exc, tb)
+        self._state["eval_exit"] += 1
+        return None
+
+
 class _FakeEngine:
     def __init__(self, state: dict):
         self._state = state
@@ -39,6 +52,9 @@ class _FakeEngine:
 
     def train_mode(self):
         return _FakeTrainMode(self._state)
+
+    def eval_mode(self):
+        return _FakeEvalMode(self._state)
 
     def forward_backward_batch(self, *args, **kwargs):
         """Default no-op; override in tests to raise."""
@@ -195,7 +211,7 @@ def _make_worker(
     monkeypatch.setenv("MINT_MEGATRON_STICKY_TRAIN_MODE", "1")
     monkeypatch.setenv("MINT_MEGATRON_STICKY_IDLE_TIMEOUT_S", idle_timeout_s)
     monkeypatch.setenv("MINT_MEGATRON_STICKY_CLOSE_ON_OPTIM", close_on_optim)
-    state = {"enter": 0, "exit": 0}
+    state = {"enter": 0, "exit": 0, "eval_enter": 0, "eval_exit": 0}
     impl_cls = MegatronRankWorker.__ray_metadata__.modified_class
     worker = impl_cls(
         rank=0,
@@ -651,8 +667,9 @@ def test_issue_193_swap_session_restores_lr_scheduler_state(monkeypatch):
 
     worker.swap_session_state("s1")
 
-    assert worker.engine.lr_scheduler.last_epoch == 3
-    assert worker.engine.lr_scheduler.lr_scale == 0.75
+    # Session swap restores the scheduler snapshot captured when s1 was swapped out.
+    assert worker.engine.lr_scheduler.last_epoch == 7
+    assert worker.engine.lr_scheduler.lr_scale == 0.25
 
 
 def test_issue_193_capture_restore_optimizer_wrapper_state(monkeypatch):
@@ -682,12 +699,14 @@ def test_issue_193_capture_restore_optimizer_wrapper_state(monkeypatch):
 
     worker._restore_optimizer_state(snapshot)
 
-    assert worker.engine.optimizer.load_calls == 0
-    assert worker.engine.optimizer.optimizer.load_calls == 0
-    assert worker.engine.optimizer.wrapper_counter == 99
-    assert worker.engine.optimizer.grad_scaler == {"scale": 42.0}
-    assert worker.engine.optimizer.optimizer.state == {}
-    assert worker.engine.optimizer.optimizer.param_groups == [{"params": [123], "lr": 0.123}]
+    assert worker.engine.optimizer.load_calls == 1
+    assert worker.engine.optimizer.optimizer.load_calls == 1
+    assert worker.engine.optimizer.wrapper_counter == 11
+    assert worker.engine.optimizer.grad_scaler == {"scale": 7.5}
+    assert worker.engine.optimizer.optimizer.state == {
+        "param_0": {"exp_avg": 3.0, "exp_avg_sq": 5.0}
+    }
+    assert worker.engine.optimizer.optimizer.param_groups == [{"params": [0], "lr": 0.123}]
 
 
 def test_issue_193_clear_session_state_clears_lr_scheduler_cache(monkeypatch):
@@ -1375,8 +1394,6 @@ def _make_group_with_unknown_session_after_partial_swap(monkeypatch):
 
     group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
     group = object.__new__(group_cls)
-    group.base_model = "/resolved/Qwen/Qwen3-30B-A3B-Instruct-2507"
-    group.observability_base_model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
     group._current_session = "s1"
 
     class _FakeRemoteMethod:
@@ -1400,23 +1417,6 @@ def _make_group_with_unknown_session_after_partial_swap(monkeypatch):
     assert group._current_session is None
     assert group._session_unknown_due_to_partial_swap is True
     return group
-
-
-def test_issue_193_partial_swap_failure_uses_observability_base_model(monkeypatch):
-    import tinker_server.backend.runtime_observability as runtime_obs_mod
-
-    obs = runtime_obs_mod.RuntimeObservability()
-    monkeypatch.setattr(runtime_obs_mod, "runtime_observability", obs)
-
-    _make_group_with_unknown_session_after_partial_swap(monkeypatch)
-
-    assert obs.snapshot()["megatron_session_switch_failures"] == [
-        {
-            "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
-            "reason": "partial_swap",
-            "count": 1,
-        }
-    ]
 
 
 # ---------------------------------------------------------------------------
@@ -1907,8 +1907,8 @@ def test_issue_193_partial_swap_explicit_session_recovers_save_checkpoint(monkey
         def __init__(self):
             self.calls = []
 
-        def remote(self, save_path, step_count, actual_rank, use_per_expert_lora, **kwargs):
-            self.calls.append((save_path, step_count, actual_rank, use_per_expert_lora, kwargs))
+        def remote(self, save_path, step_count, actual_rank, **kwargs):
+            self.calls.append((save_path, step_count, actual_rank, kwargs))
             return f"future-{len(self.calls)}"
 
     class _FakeWorker:
@@ -1928,7 +1928,6 @@ def test_issue_193_partial_swap_explicit_session_recovers_save_checkpoint(monkey
 
     result = group.save_checkpoint(
         "/tmp/recovery_ckpt",
-        use_per_expert_lora=True,
         session_id="recovered_session",
         train_attn=False,
         train_mlp=True,
@@ -1948,10 +1947,30 @@ def test_issue_193_partial_swap_explicit_session_recovers_save_checkpoint(monkey
         )
     ]
     assert worker_0.save_checkpoint.calls == [
-        ("/tmp/recovery_ckpt", 12, 16, True, {"traceparent": None})
+        (
+            "/tmp/recovery_ckpt",
+            12,
+            16,
+            {
+                "train_attn": False,
+                "train_mlp": True,
+                "train_unembed": False,
+                "traceparent": None,
+            },
+        )
     ]
     assert worker_1.save_checkpoint.calls == [
-        ("/tmp/recovery_ckpt", 12, 16, True, {"traceparent": None})
+        (
+            "/tmp/recovery_ckpt",
+            12,
+            16,
+            {
+                "train_attn": False,
+                "train_mlp": True,
+                "train_unembed": False,
+                "traceparent": None,
+            },
+        )
     ]
     assert prime_calls == []
     assert clear_actor_only_calls == []
@@ -2128,8 +2147,8 @@ def test_issue_193_partial_swap_explicit_session_recovers_save_lora_weights(monk
         def __init__(self):
             self.calls = []
 
-        def remote(self, save_path, step_count, actual_rank, use_per_expert_lora, **kwargs):
-            self.calls.append((save_path, step_count, actual_rank, use_per_expert_lora, kwargs))
+        def remote(self, save_path, step_count, actual_rank, **kwargs):
+            self.calls.append((save_path, step_count, actual_rank, kwargs))
             return "future-save-lora"
 
     class _FakeWorker:
@@ -2148,7 +2167,6 @@ def test_issue_193_partial_swap_explicit_session_recovers_save_lora_weights(monk
 
     result = group.save_lora_weights(
         "/tmp/recovery_lora",
-        use_per_expert_lora=True,
         session_id="recovered_session",
         train_attn=False,
         train_mlp=True,
@@ -2168,7 +2186,17 @@ def test_issue_193_partial_swap_explicit_session_recovers_save_lora_weights(monk
         )
     ]
     assert worker.save_lora_weights.calls == [
-        ("/tmp/recovery_lora", 9, 8, True, {"traceparent": None})
+        (
+            "/tmp/recovery_lora",
+            9,
+            8,
+            {
+                "train_attn": False,
+                "train_mlp": True,
+                "train_unembed": False,
+                "traceparent": None,
+            },
+        )
     ]
 
 
@@ -2410,7 +2438,6 @@ def test_issue_193_get_lora_state_dict_releases_sticky_before_eval_mode(monkeypa
     from types import SimpleNamespace
 
     worker, _ = _make_worker(monkeypatch, close_on_optim="0")
-    worker.engine.eval_mode = worker.engine.train_mode  # type: ignore[attr-defined]
     worker.engine.module = object()
     worker.engine.bridge = SimpleNamespace(
         export_adapter_weights=lambda *args, **kwargs: [("adapter.weight", torch.ones(1))]
@@ -2432,6 +2459,405 @@ def test_issue_193_get_lora_state_dict_releases_sticky_before_eval_mode(monkeypa
 
     assert release_calls == [("get_lora_state_dict", True)]
     assert list(state_dict.keys()) == ["adapter.weight"]
+
+
+def test_issue_467_get_lora_state_dict_enters_eval_mode_for_bridge_export(monkeypatch):
+    import torch
+
+    worker, state = _make_worker(monkeypatch, close_on_optim="0")
+    worker.engine.module = object()
+
+    calls: list[tuple[object, bool, bool]] = []
+
+    class _Bridge:
+        def export_adapter_weights(self, module, cpu=True, show_progress=True):
+            calls.append((module, cpu, show_progress))
+            return [("adapter.weight", torch.ones(1))]
+
+    worker.engine.bridge = _Bridge()
+
+    state_dict = worker.get_lora_state_dict()
+
+    assert calls == [(worker.engine.module, True, False)]
+    assert list(state_dict.keys()) == ["adapter.weight"]
+    assert state["enter"] == 0
+    assert state["exit"] == 0
+    assert state["eval_enter"] == 1
+    assert state["eval_exit"] == 1
+
+
+def test_issue_467_get_lora_state_dict_uses_bridge_export_without_custom_fallback(monkeypatch):
+    import torch
+
+    worker, _ = _make_worker(monkeypatch, close_on_optim="0")
+    worker.engine.module = object()
+
+    calls: list[tuple[object, bool, bool]] = []
+
+    class _Bridge:
+        def export_adapter_weights(self, module, cpu=True, show_progress=True):
+            calls.append((module, cpu, show_progress))
+            return [("base_model.model.layers.0.self_attn.q_proj.lora_A.weight", torch.ones(2, 3))]
+
+    worker.engine.bridge = _Bridge()
+
+    state_dict = worker.get_lora_state_dict()
+
+    assert calls == [(worker.engine.module, True, False)]
+    assert list(state_dict.keys()) == ["base_model.model.layers.0.self_attn.q_proj.lora_A.weight"]
+
+
+def test_issue_467_get_lora_state_dict_stub_bridge_does_not_require_megatron_bridge_imports(monkeypatch):
+    import torch
+
+    worker, _ = _make_worker(monkeypatch, close_on_optim="0")
+    worker.engine.module = object()
+
+    class _Bridge:
+        def export_adapter_weights(self, module, cpu=True, show_progress=True):
+            return [("adapter.weight", torch.ones(1))]
+
+    worker.engine.bridge = _Bridge()
+    original_import = builtins.__import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name.startswith("megatron.bridge"):
+            raise ModuleNotFoundError(name)
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    state_dict = worker.get_lora_state_dict()
+
+    assert list(state_dict.keys()) == ["adapter.weight"]
+
+
+def test_issue_467_get_lora_state_dict_filters_exported_names_on_stub_bridge(monkeypatch):
+    import torch
+
+    worker, _ = _make_worker(monkeypatch, close_on_optim="0")
+    worker.engine.module = object()
+
+    class _Bridge:
+        def export_adapter_weights(self, module, cpu=True, show_progress=True):
+            return [
+                ("model.layers.0.self_attn.q_proj.lora_A.weight", torch.ones(1)),
+                ("model.layers.0.mlp.gate_proj.lora_A.weight", torch.ones(1)),
+            ]
+
+    worker.engine.bridge = _Bridge()
+
+    state_dict = worker.get_lora_state_dict(
+        train_attn=True,
+        train_mlp=False,
+        train_unembed=False,
+    )
+
+    assert list(state_dict.keys()) == ["model.layers.0.self_attn.q_proj.lora_A.weight"]
+
+
+def test_issue_467_get_lora_state_dict_allows_moe_mlp_export_without_layout_flag(monkeypatch):
+    import torch
+
+    worker, _ = _make_worker(monkeypatch, close_on_optim="0")
+    worker.base_model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    worker.engine.module = object()
+
+    class _Bridge:
+        def export_adapter_weights(self, module, cpu=True, show_progress=True):
+            return [("model.layers.0.mlp.gate_proj.lora_A.weight", torch.ones(1))]
+
+    worker.engine.bridge = _Bridge()
+    monkeypatch.setattr(
+        "tinker_server.backend.megatron_distributed.get_model_config",
+        lambda _: type("Cfg", (), {"is_moe": True})(),
+    )
+
+    state_dict = worker.get_lora_state_dict(
+        train_attn=False,
+        train_mlp=True,
+        train_unembed=False,
+    )
+
+    assert list(state_dict.keys()) == ["model.layers.0.mlp.gate_proj.lora_A.weight"]
+
+
+def test_issue_482_save_lora_weights_writes_unembed_target_modules(monkeypatch, tmp_path):
+    import json
+    import torch
+
+    worker, _ = _make_worker(monkeypatch, close_on_optim="0")
+    worker.get_lora_state_dict = lambda **kwargs: {
+        "base_model.model.output_layer.lora_A.weight": torch.ones(1, 1),
+        "base_model.model.output_layer.lora_B.weight": torch.ones(1, 1),
+    }
+    monkeypatch.setattr(
+        "tinker_server.backend.megatron_distributed.get_model_config",
+        lambda _: type("Cfg", (), {"is_mla": False, "is_moe": False})(),
+    )
+
+    worker.save_lora_weights(
+        str(tmp_path),
+        train_attn=False,
+        train_mlp=False,
+        train_unembed=True,
+    )
+
+    config = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
+    assert config["target_modules"] == ["output_layer"]
+
+
+def test_issue_482_target_modules_unembed_fallback_excludes_attention(monkeypatch):
+    worker, _ = _make_worker(monkeypatch, close_on_optim="0")
+
+    target_modules = worker._target_modules_for_export(
+        model_is_mla=False,
+        train_attn=False,
+        train_mlp=False,
+        train_unembed=True,
+        state_dict={},
+    )
+
+    assert target_modules == ["lm_head", "output_layer"]
+
+
+def test_issue_467_get_lora_state_dict_fails_when_bridge_export_is_missing(monkeypatch):
+    worker, _ = _make_worker(monkeypatch, close_on_optim="0")
+    worker.engine.module = object()
+    worker.engine.bridge = object()
+
+    with pytest.raises(RuntimeError, match="export_adapter_weights"):
+        worker.get_lora_state_dict()
+
+
+def test_issue_489_get_lora_state_dict_patches_cpu_ep_gather(monkeypatch):
+    import torch
+    import types
+    from types import SimpleNamespace
+
+    worker, _ = _make_worker(monkeypatch, close_on_optim="0")
+    worker.engine.module = object()
+
+    monkeypatch.setattr(
+        "tinker_server.backend.megatron_distributed.get_model_config",
+        lambda _model: SimpleNamespace(is_moe=True),
+    )
+
+    fake_megatron_module = types.ModuleType("megatron")
+    fake_core_module = types.ModuleType("megatron.core")
+    fake_parallel_state_module = types.ModuleType("megatron.core.parallel_state")
+    fake_parallel_state_module.get_tensor_model_parallel_group = lambda: "tp-group"
+    fake_parallel_state_module.get_expert_tensor_parallel_group = lambda: "etp-group"
+    fake_parallel_state_module.get_expert_model_parallel_world_size = lambda: 2
+    fake_parallel_state_module.get_expert_model_parallel_rank = lambda: 0
+    fake_parallel_state_module.get_expert_model_parallel_group = lambda: "ep-group"
+    fake_core_module.parallel_state = fake_parallel_state_module
+    fake_bridge_module = types.ModuleType("megatron.bridge")
+    fake_bridge_models_module = types.ModuleType("megatron.bridge.models")
+    fake_bridge_conversion_module = types.ModuleType("megatron.bridge.models.conversion")
+    fake_bridge_param_mapping_module = types.ModuleType("megatron.bridge.models.conversion.param_mapping")
+
+    class _FakeMegatronParamMapping:
+        gather_from_tp_ranks = staticmethod(lambda mapping, tensor: [tensor])
+
+    fake_bridge_param_mapping_module.MegatronParamMapping = _FakeMegatronParamMapping
+    monkeypatch.setitem(sys.modules, "megatron", fake_megatron_module)
+    monkeypatch.setitem(sys.modules, "megatron.core", fake_core_module)
+    monkeypatch.setitem(sys.modules, "megatron.core.parallel_state", fake_parallel_state_module)
+    monkeypatch.setitem(sys.modules, "megatron.bridge", fake_bridge_module)
+    monkeypatch.setitem(sys.modules, "megatron.bridge.models", fake_bridge_models_module)
+    monkeypatch.setitem(sys.modules, "megatron.bridge.models.conversion", fake_bridge_conversion_module)
+    monkeypatch.setitem(sys.modules, "megatron.bridge.models.conversion.param_mapping", fake_bridge_param_mapping_module)
+
+    import torch.distributed as dist
+
+    all_gather_calls: list[tuple[str, object, int]] = []
+    monkeypatch.setattr(dist, "is_gloo_available", lambda: True, raising=False)
+    monkeypatch.setattr(dist, "get_rank", lambda: 0, raising=False)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 2, raising=False)
+    monkeypatch.setattr(dist, "get_process_group_ranks", lambda _group: [0, 1], raising=False)
+    monkeypatch.setattr(
+        dist,
+        "new_group",
+        lambda *, ranks, backend, timeout=None: (backend, tuple(ranks)),
+        raising=False,
+    )
+
+    def fake_all_gather_object(outputs, value):
+        for i in range(len(outputs)):
+            outputs[i] = value
+
+    monkeypatch.setattr(dist, "all_gather_object", fake_all_gather_object, raising=False)
+
+    def fake_all_gather(outputs, tensor, group=None):
+        all_gather_calls.append((tensor.device.type, group, len(outputs)))
+        for out in outputs:
+            out.copy_(tensor)
+
+    monkeypatch.setattr(dist, "all_gather", fake_all_gather, raising=False)
+
+    class FakeBridge:
+        __module__ = "megatron.bridge.fake"
+
+        def _gather_expert_adapter_weight(self, weight):
+            raise RuntimeError("cpu EP gather was not patched")
+
+        def export_adapter_weights(self, _module, cpu=True, show_progress=False):
+            assert cpu is True
+            gathered = self._gather_expert_adapter_weight(torch.ones(2))
+            assert len(gathered) == 2
+            return [("adapter.weight", torch.ones(1))]
+
+    worker.engine.bridge = FakeBridge()
+    original_gather = FakeBridge._gather_expert_adapter_weight
+
+    state_dict = worker.get_lora_state_dict(train_attn=False, train_mlp=True, train_unembed=False)
+
+    assert list(state_dict.keys()) == ["adapter.weight"]
+    assert all_gather_calls == [("cpu", ("gloo", (0, 1)), 2)]
+    assert FakeBridge._gather_expert_adapter_weight is original_gather
+
+
+def test_issue_495_get_lora_state_dict_single_pp_path_restores_bridge_patch(monkeypatch):
+    import torch
+    import types
+    from types import SimpleNamespace
+
+    worker, _ = _make_worker(monkeypatch, close_on_optim="0")
+    worker.engine.module = object()
+
+    monkeypatch.setattr(
+        "tinker_server.backend.megatron_distributed.get_model_config",
+        lambda _model: SimpleNamespace(is_moe=True),
+    )
+
+    fake_megatron_module = types.ModuleType("megatron")
+    fake_core_module = types.ModuleType("megatron.core")
+    fake_parallel_state_module = types.ModuleType("megatron.core.parallel_state")
+    fake_parallel_state_module.get_pipeline_model_parallel_world_size = lambda: 1
+    fake_parallel_state_module.get_pipeline_model_parallel_group = lambda: "pp-group"
+    fake_parallel_state_module.get_tensor_model_parallel_group = lambda: "tp-group"
+    fake_parallel_state_module.get_expert_tensor_parallel_group = lambda: "etp-group"
+    fake_parallel_state_module.get_expert_model_parallel_world_size = lambda: 2
+    fake_parallel_state_module.get_expert_model_parallel_rank = lambda: 0
+    fake_parallel_state_module.get_expert_model_parallel_group = lambda: "ep-group"
+    fake_core_module.parallel_state = fake_parallel_state_module
+
+    fake_core_utils_module = types.ModuleType("megatron.core.utils")
+    fake_core_utils_module.get_pg_rank = lambda _group: 0
+    fake_core_utils_module.unwrap_model = lambda models: models
+
+    fake_bridge_module = types.ModuleType("megatron.bridge")
+    fake_bridge_models_module = types.ModuleType("megatron.bridge.models")
+    fake_bridge_conversion_module = types.ModuleType("megatron.bridge.models.conversion")
+    fake_bridge_model_bridge_module = types.ModuleType("megatron.bridge.models.conversion.model_bridge")
+    fake_bridge_utils_module = types.ModuleType("megatron.bridge.models.conversion.utils")
+    fake_bridge_param_mapping_module = types.ModuleType("megatron.bridge.models.conversion.param_mapping")
+    fake_bridge_peft_module = types.ModuleType("megatron.bridge.peft")
+    fake_bridge_canonical_lora_module = types.ModuleType("megatron.bridge.peft.canonical_lora")
+    fake_bridge_peft_utils_module = types.ModuleType("megatron.bridge.peft.utils")
+
+    class _FakeModuleDict(dict):
+        pass
+
+    class _FakeParallelLinearAdapter:
+        input_is_parallel = False
+
+    class _FakeMegatronParamMapping:
+        gather_from_tp_ranks = staticmethod(lambda mapping, tensor: [tensor])
+
+    fake_bridge_canonical_lora_module.ModuleDict = _FakeModuleDict
+    fake_bridge_peft_utils_module.ParallelLinearAdapter = _FakeParallelLinearAdapter
+    fake_bridge_peft_utils_module.get_adapter_attributes_from_linear = lambda _to_wrap: (False, None, None, None, None, False)
+    fake_bridge_utils_module.extract_sort_key = lambda name: (name,)
+    fake_bridge_utils_module.persistent_buffers = lambda _model: []
+    fake_bridge_param_mapping_module.MegatronParamMapping = _FakeMegatronParamMapping
+
+    class FakeBridge:
+        __module__ = "megatron.bridge.fake"
+        _causal_lm_architecture = "qwen"
+
+        def _megatron_global_adapters_info_all_pp_ranks(self, _megatron_model):
+            return [("orig",)]
+
+        def _gather_expert_adapter_weight(self, weight):
+            raise RuntimeError("cpu EP gather was not patched")
+
+        def export_adapter_weights(self, _module, cpu=True, show_progress=False):
+            assert cpu is True
+            assert show_progress is False
+            assert getattr(type(self), "_tinker_export_train_attn") is False
+            assert getattr(type(self), "_tinker_export_train_mlp") is True
+            assert getattr(type(self), "_tinker_export_train_unembed") is False
+            gathered = self._gather_expert_adapter_weight(torch.ones(2))
+            assert len(gathered) == 2
+            return [("adapter.weight", torch.ones(1))]
+
+    bridge = FakeBridge()
+    original_collect = FakeBridge._megatron_global_adapters_info_all_pp_ranks
+    original_gather = FakeBridge._gather_expert_adapter_weight
+
+    fake_bridge_model_bridge_module.get_model_bridge = lambda _arch: bridge
+    fake_bridge_model_bridge_module._megatron_local_name_to_global = (
+        lambda _models, _config, local_name, _vp_stage: local_name
+    )
+    fake_bridge_conversion_module.model_bridge = fake_bridge_model_bridge_module
+    fake_bridge_conversion_module.utils = fake_bridge_utils_module
+    fake_bridge_conversion_module.param_mapping = fake_bridge_param_mapping_module
+
+    monkeypatch.setitem(sys.modules, "megatron", fake_megatron_module)
+    monkeypatch.setitem(sys.modules, "megatron.core", fake_core_module)
+    monkeypatch.setitem(sys.modules, "megatron.core.parallel_state", fake_parallel_state_module)
+    monkeypatch.setitem(sys.modules, "megatron.core.utils", fake_core_utils_module)
+    monkeypatch.setitem(sys.modules, "megatron.bridge", fake_bridge_module)
+    monkeypatch.setitem(sys.modules, "megatron.bridge.models", fake_bridge_models_module)
+    monkeypatch.setitem(sys.modules, "megatron.bridge.models.conversion", fake_bridge_conversion_module)
+    monkeypatch.setitem(sys.modules, "megatron.bridge.models.conversion.model_bridge", fake_bridge_model_bridge_module)
+    monkeypatch.setitem(sys.modules, "megatron.bridge.models.conversion.utils", fake_bridge_utils_module)
+    monkeypatch.setitem(sys.modules, "megatron.bridge.models.conversion.param_mapping", fake_bridge_param_mapping_module)
+    monkeypatch.setitem(sys.modules, "megatron.bridge.peft", fake_bridge_peft_module)
+    monkeypatch.setitem(sys.modules, "megatron.bridge.peft.canonical_lora", fake_bridge_canonical_lora_module)
+    monkeypatch.setitem(sys.modules, "megatron.bridge.peft.utils", fake_bridge_peft_utils_module)
+
+    import torch.distributed as dist
+
+    all_gather_calls: list[tuple[str, object, int]] = []
+    monkeypatch.setattr(dist, "is_gloo_available", lambda: True, raising=False)
+    monkeypatch.setattr(dist, "get_rank", lambda: 0, raising=False)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 2, raising=False)
+    monkeypatch.setattr(dist, "get_process_group_ranks", lambda _group: [0, 1], raising=False)
+    monkeypatch.setattr(
+        dist,
+        "new_group",
+        lambda *, ranks, backend, timeout=None: (backend, tuple(ranks)),
+        raising=False,
+    )
+
+    def fake_all_gather_object(outputs, value, group=None):
+        _ = group
+        for i in range(len(outputs)):
+            outputs[i] = value
+
+    def fake_all_gather(outputs, tensor, group=None):
+        all_gather_calls.append((tensor.device.type, group, len(outputs)))
+        for out in outputs:
+            out.copy_(tensor)
+
+    monkeypatch.setattr(dist, "all_gather_object", fake_all_gather_object, raising=False)
+    monkeypatch.setattr(dist, "all_gather", fake_all_gather, raising=False)
+
+    worker.engine.bridge = bridge
+
+    state_dict = worker.get_lora_state_dict(train_attn=False, train_mlp=True, train_unembed=False)
+
+    assert list(state_dict.keys()) == ["adapter.weight"]
+    assert all_gather_calls == [("cpu", ("gloo", (0, 1)), 2)]
+    assert FakeBridge._gather_expert_adapter_weight is original_gather
+    assert FakeBridge._megatron_global_adapters_info_all_pp_ranks is original_collect
+    assert not hasattr(FakeBridge, "_tinker_export_train_attn")
+    assert not hasattr(FakeBridge, "_tinker_export_train_mlp")
+    assert not hasattr(FakeBridge, "_tinker_export_train_unembed")
+
 
 
 def test_issue_193_load_optimizer_state_releases_sticky_before_train_mode(monkeypatch, tmp_path):
@@ -2482,169 +2908,3 @@ def test_issue_193_long_forward_backward_refreshes_sticky_idle_timer(monkeypatch
 
     assert reused["reused"] is True
     assert state["exit"] == 0
-
-
-def test_issue_193_swap_session_persists_actor_only_state_and_recovers_cold(monkeypatch, tmp_path):
-    monkeypatch.setenv("MINT_MEGATRON_SESSIONS_BASE_PATH", str(tmp_path))
-    worker, _ = _make_worker(monkeypatch)
-
-    snapshots = {
-        "s1": {
-            "grads": ["grad-s1"],
-            "opt": {"optimizer_0": {"step": 3}},
-            "lr": {"last_epoch": 5},
-        },
-        "s2": {
-            "grads": ["grad-s2"],
-            "opt": {"optimizer_0": {"step": 4}},
-            "lr": {"last_epoch": 7},
-        },
-    }
-    restored = {"grads": None, "opt": None, "lr": None, "reset_count": 0, "zero_count": 0}
-
-    worker._current_session_id = "s1"
-    worker._capture_gradients = lambda: list(snapshots[worker._current_session_id]["grads"])  # type: ignore[index,method-assign]
-    worker._capture_optimizer_state = lambda: dict(snapshots[worker._current_session_id]["opt"])  # type: ignore[index,method-assign]
-    worker._capture_lr_scheduler_state = lambda: dict(snapshots[worker._current_session_id]["lr"])  # type: ignore[index,method-assign]
-    worker._restore_gradients = lambda grads: restored.__setitem__("grads", list(grads))  # type: ignore[method-assign]
-    worker._restore_optimizer_state = lambda state: restored.__setitem__("opt", state)  # type: ignore[method-assign]
-    worker._restore_lr_scheduler_state = lambda state: restored.__setitem__("lr", state)  # type: ignore[method-assign]
-    worker._reset_optimizer_state = lambda: restored.__setitem__("reset_count", restored["reset_count"] + 1)  # type: ignore[method-assign]
-    worker.engine.optimizer_zero_grad = lambda: restored.__setitem__("zero_count", restored["zero_count"] + 1)  # type: ignore[method-assign]
-
-    first = worker.swap_session_state("s2")
-
-    manifest_path = tmp_path / "s1_checkpoint" / "actor_only_state" / "rank_0000.pt"
-    assert first["incoming_source"] == "new"
-    assert first["outgoing_persisted"]["bytes"] > 0
-    assert manifest_path.exists()
-    assert worker._session_hot_cache.keys() == {"s1"}
-
-    worker._drop_hot_session("s1")
-    worker._current_session_id = "s2"
-    restored["grads"] = None
-    restored["opt"] = None
-    restored["lr"] = None
-
-    second = worker.swap_session_state("s1", require_persisted=True)
-
-    assert second["incoming_source"] == "cold"
-    assert restored["grads"] == ["grad-s1"]
-    assert restored["opt"] == {"optimizer_0": {"step": 3}}
-    assert restored["lr"] == {"last_epoch": 5}
-
-
-def test_issue_193_hot_cache_eviction_keeps_persisted_snapshots(monkeypatch, tmp_path):
-    monkeypatch.setenv("MINT_MEGATRON_SESSIONS_BASE_PATH", str(tmp_path))
-    monkeypatch.setenv("MINT_MEGATRON_MAX_HOT_SESSIONS_PER_ACTOR", "1")
-    worker, _ = _make_worker(monkeypatch)
-
-    snapshots = {
-        "s1": {"grads": ["grad-s1"], "opt": {"optimizer_0": {"step": 1}}, "lr": {}},
-        "s2": {"grads": ["grad-s2"], "opt": {"optimizer_0": {"step": 2}}, "lr": {}},
-    }
-    worker._current_session_id = "s1"
-    worker._capture_gradients = lambda: list(snapshots[worker._current_session_id]["grads"])  # type: ignore[index,method-assign]
-    worker._capture_optimizer_state = lambda: dict(snapshots[worker._current_session_id]["opt"])  # type: ignore[index,method-assign]
-    worker._capture_lr_scheduler_state = lambda: dict(snapshots[worker._current_session_id]["lr"])  # type: ignore[index,method-assign]
-    worker._restore_gradients = lambda grads: None  # type: ignore[method-assign]
-    worker._restore_optimizer_state = lambda state: None  # type: ignore[method-assign]
-    worker._restore_lr_scheduler_state = lambda state: None  # type: ignore[method-assign]
-    worker._reset_optimizer_state = lambda: None  # type: ignore[method-assign]
-    worker.engine.optimizer_zero_grad = lambda: None  # type: ignore[method-assign]
-
-    worker.swap_session_state("s2")
-    cache_after_first = worker.get_hot_cache_info()
-    assert cache_after_first["hot_sessions"] == ["s1"]
-
-    worker._current_session_id = "s2"
-    worker.swap_session_state("s3")
-
-    cache_after_second = worker.get_hot_cache_info()
-    assert cache_after_second["hot_sessions"] == ["s2"]
-    assert cache_after_second["last_eviction_reason"] == "max_hot_sessions>1"
-
-    s1_rank_snapshot = tmp_path / "s1_checkpoint" / "actor_only_state" / "rank_0000.pt"
-    assert s1_rank_snapshot.exists()
-    assert worker._session_hot_cache.keys() == {"s2"}
-
-
-
-def test_issue_193_session_cache_diagnostics_reports_partial_residency(monkeypatch, tmp_path):
-    monkeypatch.setenv("MINT_MEGATRON_SESSIONS_BASE_PATH", str(tmp_path))
-
-    manager = MegatronSessionStateManager(base_path=str(tmp_path))
-    actor_name = _make_megatron_actor_name("Qwen/Qwen3-0.6B")
-    manager.save_persisted_actor_only_state(
-        "s-hot",
-        actor_name=actor_name,
-        worker_entries=[
-            {"rank": 0, "path": str(tmp_path / "s-hot-r0.pt"), "bytes": 40},
-            {"rank": 1, "path": str(tmp_path / "s-hot-r1.pt"), "bytes": 61},
-        ],
-    )
-    manager.save_persisted_actor_only_state(
-        "s-partial",
-        actor_name=actor_name,
-        worker_entries=[
-            {"rank": 0, "path": str(tmp_path / "s-partial-r0.pt"), "bytes": 100},
-            {"rank": 1, "path": str(tmp_path / "s-partial-r1.pt"), "bytes": 102},
-        ],
-    )
-    manager.save_persisted_actor_only_state(
-        "s-cold",
-        actor_name=actor_name,
-        worker_entries=[
-            {"rank": 0, "path": str(tmp_path / "s-cold-r0.pt"), "bytes": 101},
-            {"rank": 1, "path": str(tmp_path / "s-cold-r1.pt"), "bytes": 202},
-        ],
-    )
-    manager.save_persisted_actor_only_state(
-        "s-current",
-        actor_name=actor_name,
-        worker_entries=[
-            {"rank": 0, "path": str(tmp_path / "s-current-r0.pt"), "bytes": 200},
-            {"rank": 1, "path": str(tmp_path / "s-current-r1.pt"), "bytes": 204},
-        ],
-    )
-
-    class _RemoteCall:
-        def __init__(self, result):
-            self._result = result
-
-        def remote(self):
-            return self._result
-
-    class _Worker:
-        def __init__(self, hot_sessions, hot_bytes, last_eviction_reason=None):
-            self.get_hot_cache_info = _RemoteCall(
-                {
-                    "hot_sessions": hot_sessions,
-                    "hot_bytes": hot_bytes,
-                    "last_eviction_reason": last_eviction_reason,
-                }
-            )
-
-    group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
-    group = object.__new__(group_cls)
-    group.workers = [
-        _Worker(["s-hot", "s-partial"], 111, None),
-        _Worker(["s-hot"], 222, "max_hot_bytes>256"),
-    ]
-    group.base_model = "Qwen/Qwen3-0.6B"
-    group._session_manager = manager
-    group._current_session = "s-current"
-
-    monkeypatch.setattr(sys.modules[MegatronWorkerGroup.__module__].ray, "get", lambda refs: refs)
-
-    diagnostics = group._get_session_cache_diagnostics()
-
-    assert diagnostics["hot_sessions"] == ["s-hot"]
-    assert diagnostics["hot_session_count"] == 1
-    assert diagnostics["partially_hot_sessions"] == ["s-partial"]
-    assert diagnostics["partially_hot_session_count"] == 1
-    assert diagnostics["cold_sessions"] == ["s-cold"]
-    assert diagnostics["cold_session_count"] == 1
-    assert diagnostics["hot_bytes"] == 333
-    assert diagnostics["cold_bytes"] == 303
-    assert diagnostics["last_eviction_reason"] == "max_hot_bytes>256"

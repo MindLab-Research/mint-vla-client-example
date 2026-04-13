@@ -466,7 +466,8 @@ def test_api_work_queue_start_workers_continues_when_hydration_baseline_missing(
     asyncio.run(q.shutdown())
 
 
-def test_resource_pool_cached_snapshot_exposes_rss_cache_state() -> None:
+def test_resource_pool_cached_snapshot_exposes_rss_cache_state(monkeypatch) -> None:
+    monkeypatch.setattr(resource_pool_mod, "_detached_enabled", lambda: False)
     pool = get_resource_pool()
     pool.clear(kill_actors=False)
     old_ttl = pool.RSS_TTL_S
@@ -510,6 +511,7 @@ def test_resource_pool_cached_snapshot_exposes_rss_cache_state() -> None:
 
 
 def test_resource_pool_cached_snapshot_refreshes_vllm_observability_on_ttl(monkeypatch) -> None:
+    monkeypatch.setattr(resource_pool_mod, "_detached_enabled", lambda: False)
     pool = get_resource_pool()
     pool.clear(kill_actors=False)
     old_ttl = pool.METADATA_TTL_S
@@ -558,6 +560,7 @@ def test_resource_pool_cached_snapshot_refreshes_vllm_observability_on_ttl(monke
 
 
 def test_resource_pool_cached_snapshot_refreshes_megatron_observability_on_ttl(monkeypatch) -> None:
+    monkeypatch.setattr(resource_pool_mod, "_detached_enabled", lambda: False)
     pool = get_resource_pool()
     pool.clear(kill_actors=False)
     old_ttl = pool.METADATA_TTL_S
@@ -606,6 +609,7 @@ def test_resource_pool_cached_snapshot_refreshes_megatron_observability_on_ttl(m
 
 
 def test_resource_pool_cached_snapshot_uses_fresh_metadata_without_refresh(monkeypatch) -> None:
+    monkeypatch.setattr(resource_pool_mod, "_detached_enabled", lambda: False)
     pool = get_resource_pool()
     pool.clear(kill_actors=False)
     old_ttl = pool.METADATA_TTL_S
@@ -637,6 +641,7 @@ def test_resource_pool_cached_snapshot_uses_fresh_metadata_without_refresh(monke
 
 
 def test_resource_pool_cached_snapshot_tracks_refresh_failure(monkeypatch) -> None:
+    monkeypatch.setattr(resource_pool_mod, "_detached_enabled", lambda: False)
     pool = get_resource_pool()
     pool.clear(kill_actors=False)
     old_ttl = pool.METADATA_TTL_S

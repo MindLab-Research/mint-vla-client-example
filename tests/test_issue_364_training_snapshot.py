@@ -152,7 +152,10 @@ async def test_issue_364_training_route_refreshes_step_without_version_bump(
             "metadata_version": 7,
         }
 
+    monkeypatch.setattr(manager, "get_session", lambda model_id: manager._sessions.get(model_id))
     monkeypatch.setattr(training_route, "training_manager", manager)
+    monkeypatch.setattr(training_route, "training_engine", SimpleNamespace(_workers={}, _resource_pool_actor_names={}))
+    monkeypatch.setattr(training_route, "_has_training_worker_binding", lambda _model_id: True)
     monkeypatch.setattr(
         "tinker_server.backend.training_session_store.async_get_training_session_info",
         _async_get_training_session_info,

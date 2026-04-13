@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 
 from ..config import config
 from ..ray_utils import init_ray
@@ -78,6 +79,7 @@ async def cleanup_stale_actors_once() -> dict[str, int]:
     resource_pool = get_resource_pool()
     cleaned = 0
     registered = 0
+    ready_timeout_s = float(os.environ.get("MINT_STARTUP_RECONCILE_READY_TIMEOUT_S", "5"))
 
     def _pg_total_gpus(actor_name: str) -> int | None:
         try:
@@ -112,7 +114,7 @@ async def cleanup_stale_actors_once() -> dict[str, int]:
                 continue
 
             try:
-                ray.get(actor.__ray_ready__.remote(), timeout=2)
+                ray.get(actor.__ray_ready__.remote(), timeout=ready_timeout_s)
                 session_id: str | None = None
                 node_id: str | None = None
                 metadata: dict[str, object] = {}

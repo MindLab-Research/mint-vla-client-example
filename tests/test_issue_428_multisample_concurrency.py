@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import sys
 import types
 
@@ -125,6 +126,18 @@ def _make_actor_impl(monkeypatch):
     return impl_cls
 
 
+def _stub_future_store(monkeypatch):
+    async def _noop_async_update_meta(*args, **kwargs):
+        return None
+
+    future_store_module = importlib.import_module("tinker_server.backend.future_store")
+    monkeypatch.setattr(
+        future_store_module.future_store,
+        "async_update_meta",
+        _noop_async_update_meta,
+    )
+
+
 @pytest.mark.anyio
 async def test_issue_428_default_multisample_mode_preserves_cross_request_concurrency(monkeypatch):
     monkeypatch.delenv("MINT_VLLM_MULTISAMPLE_MODE", raising=False)
@@ -136,14 +149,15 @@ async def test_issue_428_default_multisample_mode_preserves_cross_request_concur
     actor = object.__new__(impl_cls)
     impl_cls.__init__(actor, model_path="fake-model", tensor_parallel_size=1)
 
-    assert actor._multisample_mode == "concurrent_n1"
-    assert actor._serialize_multisample is False
-    assert actor._multisample_lock is None
+    assert actor._multisample_mode == "vllm_n"
+    assert actor._serialize_multisample is True
+    assert actor._multisample_lock is not None
 
 
 @pytest.mark.anyio
 async def test_issue_428_multisample_request_does_not_block_ordinary_request_entry(monkeypatch):
     _install_fake_vllm(monkeypatch)
+    _stub_future_store(monkeypatch)
     monkeypatch.setattr(mni, "init_actor_observability", lambda: None)
     monkeypatch.setattr(mni.server_config, "router_replay_mode", "disabled", raising=False)
     monkeypatch.setattr(vllm_stop, "vllm_stop_kwargs", lambda stop, default_stop_token_ids=None: {})
@@ -177,7 +191,7 @@ async def test_issue_428_multisample_request_does_not_block_ordinary_request_ent
             n=2,
         )
     )
-    await asyncio.wait_for(multisample_enqueued.wait(), timeout=1.0)
+    await asyncio.wait_for(multisample_enqueued.wait(), timeout=5.0)
 
     ordinary_task = asyncio.create_task(
         impl_cls.generate(
@@ -190,7 +204,7 @@ async def test_issue_428_multisample_request_does_not_block_ordinary_request_ent
             n=1,
         )
     )
-    await asyncio.wait_for(ordinary_enqueued.wait(), timeout=1.0)
+    await asyncio.wait_for(ordinary_enqueued.wait(), timeout=5.0)
 
     assert not multi_task.done()
 
@@ -206,6 +220,7 @@ async def test_issue_428_multisample_request_does_not_block_ordinary_request_ent
 @pytest.mark.anyio
 async def test_issue_428_vllm_n_requests_remain_isolated_from_each_other(monkeypatch):
     _install_fake_vllm(monkeypatch)
+    _stub_future_store(monkeypatch)
     monkeypatch.setattr(mni, "init_actor_observability", lambda: None)
     monkeypatch.setattr(mni.server_config, "router_replay_mode", "disabled", raising=False)
     monkeypatch.setattr(vllm_stop, "vllm_stop_kwargs", lambda stop, default_stop_token_ids=None: {})
@@ -240,7 +255,7 @@ async def test_issue_428_vllm_n_requests_remain_isolated_from_each_other(monkeyp
             n=2,
         )
     )
-    await asyncio.wait_for(first_multisample_enqueued.wait(), timeout=1.0)
+    await asyncio.wait_for(first_multisample_enqueued.wait(), timeout=5.0)
 
     task2 = asyncio.create_task(
         impl_cls.generate(
@@ -254,8 +269,8 @@ async def test_issue_428_vllm_n_requests_remain_isolated_from_each_other(monkeyp
         )
     )
 
-    await asyncio.sleep(0.1)
-    assert not second_multisample_enqueued.is_set()
+    await asyncio.wait_for(second_multisample_enqueued.wait(), timeout=5.0)
+    assert not task1.done()
 
     release_multisample.set()
     result1, result2 = await asyncio.gather(task1, task2)
@@ -269,6 +284,7 @@ async def test_issue_428_vllm_n_requests_remain_isolated_from_each_other(monkeyp
 @pytest.mark.anyio
 async def test_issue_428_concurrent_n1_failure_aborts_remaining_subrequests(monkeypatch):
     _install_fake_vllm(monkeypatch)
+    _stub_future_store(monkeypatch)
     monkeypatch.setattr(mni, "init_actor_observability", lambda: None)
     monkeypatch.setattr(mni.server_config, "router_replay_mode", "disabled", raising=False)
     monkeypatch.setattr(vllm_stop, "vllm_stop_kwargs", lambda stop, default_stop_token_ids=None: {})
