@@ -32,8 +32,11 @@ Entrypoint: |
   from ray._private.parameter import RayParams
 
   HEAD_IP_PATH = "/vePFS-Mindverse/share/code/tinker-server/ray_head_ip.txt"
-  RAY_TMP_ROOT_BASE = "/vePFS-Mindverse/share/mint_data/dev_cluster_tmp/worker"
+  TMP_ROOT = os.environ.get("MINT_TMP_ROOT", "/vePFS-Mindverse/share/mint-data/dev")
+  RAY_TMP_ROOT_BASE = f"{TMP_ROOT}/worker"
   RAY_TMP_LINK = "/tmp/mdw"
+  RAY_RUNTIME_ENV_WORKING_DIR_CACHE_SIZE_GB = "2"
+  RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB = "2"
   CHECK_INTERVAL_S = 10
 
 
@@ -75,6 +78,8 @@ Entrypoint: |
   ray_tmp_root_real = f"{RAY_TMP_ROOT_BASE}/{ip.replace('.', '-')}"
   ray_temp_dir = f"{RAY_TMP_LINK}/t"
   ray_object_spilling_dir = f"{RAY_TMP_LINK}/s"
+  ray_os_tmpdir = f"{RAY_TMP_LINK}/tmp"
+  ray_xdg_cache_home = f"{RAY_TMP_LINK}/cache"
 
   while True:
       os.makedirs(ray_tmp_root_real, exist_ok=True)
@@ -86,8 +91,16 @@ Entrypoint: |
       os.symlink(ray_tmp_root_real, RAY_TMP_LINK)
       os.makedirs(ray_temp_dir, exist_ok=True)
       os.makedirs(ray_object_spilling_dir, exist_ok=True)
+      os.makedirs(ray_os_tmpdir, exist_ok=True)
+      os.makedirs(ray_xdg_cache_home, exist_ok=True)
+      os.environ["TMPDIR"] = ray_os_tmpdir
+      os.environ["XDG_CACHE_HOME"] = ray_xdg_cache_home
+      os.environ.setdefault("RAY_RUNTIME_ENV_WORKING_DIR_CACHE_SIZE_GB", RAY_RUNTIME_ENV_WORKING_DIR_CACHE_SIZE_GB)
+      os.environ.setdefault("RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB", RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB)
       print(
-          f"mint-dev worker using temp_dir={ray_temp_dir} object_spilling_directory={ray_object_spilling_dir} real_root={ray_tmp_root_real}",
+          "mint-dev worker using "
+          f"temp_dir={ray_temp_dir} object_spilling_directory={ray_object_spilling_dir} "
+          f"tmpdir={ray_os_tmpdir} xdg_cache_home={ray_xdg_cache_home} tmp_root={TMP_ROOT} real_root={ray_tmp_root_real}",
           flush=True,
       )
       head = _read_head()
