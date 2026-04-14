@@ -117,6 +117,10 @@ def preferred_driver_ray_address() -> str:
     )
 
 
+def _preferred_ray_init_address() -> str:
+    return preferred_driver_ray_address()
+
+
 def preferred_ray_address() -> str | None:
     try:
         return preferred_driver_ray_address()
@@ -247,6 +251,32 @@ def _ray_init_interprocess_lock() -> Iterator[float]:
             lock_fh.close()
 
 
+def _job_level_runtime_env(address: str, existing: Any) -> dict[str, Any] | Any:
+    if not isinstance(address, str) or not address.startswith("ray://"):
+        return existing
+
+    runtime_env: dict[str, Any]
+    if existing is None:
+        runtime_env = {}
+    elif isinstance(existing, dict):
+        runtime_env = dict(existing)
+    else:
+        return existing
+
+    # Ray Client actor creation serializes code on the job side before actor-level
+    # runtime_env takes effect. Give the job a working_dir so detached actors can
+    # import `tinker_server` from the current checkout during startup.
+    job_working_dir = os.environ.get("MINT_RAY_JOB_WORKING_DIR", "").strip()
+    if not job_working_dir:
+        candidate = os.environ.get("PFS_TINKER_PATH", "").strip()
+        if candidate and os.path.isdir(candidate):
+            job_working_dir = candidate
+    if job_working_dir and "working_dir" not in runtime_env and "py_modules" not in runtime_env:
+        runtime_env["working_dir"] = job_working_dir
+
+    return runtime_env or existing
+
+
 def init_ray(**kwargs: Any) -> Any:
     """Initialize Ray with optional log forwarding to driver.
 
@@ -273,15 +303,20 @@ def init_ray(**kwargs: Any) -> Any:
                 f"(or set {_RAY_HEAD_ADDRESS_PATH_ENV}; "
                 "optionally set MINT_RAY_CLIENT_ADDRESS or RAY_CLIENT_ADDRESS for the driver)"
             )
-        kwargs["address"] = configured_address
+        desired_address: Any = configured_address
     elif isinstance(current, str):
-        kwargs["address"] = _normalize_ray_address(current.strip())
+        desired_address = _normalize_ray_address(current.strip())
+    else:
+        desired_address = current
+    kwargs["address"] = desired_address
 
-    desired_address = str(kwargs["address"])
-
-    runtime_env = client_job_runtime_env(address=desired_address)
+    existing_runtime_env = kwargs.get("runtime_env")
+    if existing_runtime_env is None:
+        runtime_env = client_job_runtime_env(address=desired_address)
+    else:
+        runtime_env = _job_level_runtime_env(desired_address, existing_runtime_env)
     if runtime_env is not None:
-        kwargs.setdefault("runtime_env", runtime_env)
+        kwargs["runtime_env"] = runtime_env
 
     node_ip = os.environ.get("MINT_RAY_NODE_IP_ADDRESS", "").strip()
     if node_ip and "_node_ip_address" not in kwargs:

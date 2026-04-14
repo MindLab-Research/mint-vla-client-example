@@ -28,6 +28,7 @@ from ..logging_context import (
     record_sampling_admission_metric,
     run_async_with_otel_span,
     set_request_id,
+    start_as_current_span,
 )
 from ..model_access_control import can_access_model, get_access_denied_error
 from ..queue_priority import merge_queue_priority_extra
@@ -423,20 +424,44 @@ async def _ensure_session_lora_loaded(
         raise RuntimeError(f"Session {session_id} has lora_rank={snap.lora_rank} but no adapter_path")
 
     lock = await _get_lora_load_lock(session_id)
-    async with lock:
-        refreshed = _get_sampling_snapshot(session_id)
-        if refreshed is not None and refreshed.lora_loaded and refreshed.lora_int_id is not None:
-            return
-        if refreshed is not None and refreshed.adapter_path:
-            adapter_path = refreshed.adapter_path
+    with start_as_current_span(
+        "sampling.ensure_session_lora_loaded.lock_and_reload",
+        component="routes.sampling",
+        op="sampling.ensure_session_lora_loaded.lock_and_reload",
+        attributes={
+            "sampling_session_id": str(session_id),
+            "base_model": str(snap.base_model) if snap.base_model else None,
+            "lora_rank": int(snap.lora_rank),
+            "lora_loaded_before": bool(snap.lora_loaded),
+        },
+    ):
+        async with lock:
+            refreshed = _get_sampling_snapshot(session_id)
+            if refreshed is not None and refreshed.lora_loaded and refreshed.lora_int_id is not None:
+                return
+            if refreshed is not None and refreshed.adapter_path:
+                adapter_path = refreshed.adapter_path
 
-        # Prefer path-based loading to avoid sending large tensors through Ray.
-        add_from_path = getattr(engine, "add_lora_for_session_from_path", None)
-        if add_from_path is None:
-            raise RuntimeError(f"Engine for session {session_id} does not support add_lora_for_session_from_path()")
+            # Prefer path-based loading to avoid sending large tensors through Ray.
+            add_from_path = getattr(engine, "add_lora_for_session_from_path", None)
+            if add_from_path is None:
+                raise RuntimeError(f"Engine for session {session_id} does not support add_lora_for_session_from_path()")
 
-        lora_int_id = await add_from_path(sampling_session_id=session_id, lora_path=adapter_path)
-        session_manager.mark_session_lora_loaded(session_id, True, lora_int_id=lora_int_id)
+            load_snapshot = refreshed or snap
+            with start_as_current_span(
+                "sampling.ensure_session_lora_loaded.add_from_path",
+                component="routes.sampling",
+                op="sampling.ensure_session_lora_loaded.add_from_path",
+                attributes={
+                    "sampling_session_id": str(session_id),
+                    "base_model": str(load_snapshot.base_model) if load_snapshot.base_model else None,
+                    "lora_rank": int(load_snapshot.lora_rank),
+                    "adapter_path": str(adapter_path),
+                    "lora_loaded_before": bool(load_snapshot.lora_loaded),
+                },
+            ):
+                lora_int_id = await add_from_path(sampling_session_id=session_id, lora_path=adapter_path)
+            session_manager.mark_session_lora_loaded(session_id, True, lora_int_id=lora_int_id)
 
 
 async def _register_coalesced_abort_aliases(waiters: list[tuple], engine_request_id: str) -> None:
@@ -1286,7 +1311,19 @@ async def sample_once(
                     ),
                 )
 
-            engine = await session_manager.get_engine_for_session(session_id)
+            engine = await run_async_with_otel_span(
+                "sampling.get_engine_for_session",
+                lambda: session_manager.get_engine_for_session(session_id),
+                component="sampling",
+                op="sampling.get_engine_for_session",
+                request_id=request_id,
+                attributes={
+                    "sampling_session_id": session_id,
+                    "base_model": snapshot.base_model if snapshot is not None else None,
+                    "lora_rank": int(snapshot.lora_rank) if snapshot is not None else None,
+                    "lora_loaded_before": bool(snapshot.lora_loaded) if snapshot is not None else None,
+                },
+            )
             if engine is None:
                 raise RuntimeError(f"No engine found for session {session_id}")
 
@@ -1299,7 +1336,20 @@ async def sample_once(
                     f"Engine for session {session_id} missing actor_name; cannot protect from eviction"
                 )
             resource_pool.mark_inflight(resource_pool_actor_name, +1)
-            await _ensure_session_lora_loaded(engine, session_id, snapshot=snapshot)
+            await run_async_with_otel_span(
+                "sampling.ensure_lora_loaded",
+                lambda: _ensure_session_lora_loaded(engine, session_id, snapshot=snapshot),
+                component="sampling",
+                op="sampling.ensure_lora_loaded",
+                request_id=request_id,
+                attributes={
+                    "sampling_session_id": session_id,
+                    "base_model": snapshot.base_model if snapshot is not None else None,
+                    "lora_rank": int(snapshot.lora_rank) if snapshot is not None else None,
+                    "lora_loaded_before": bool(snapshot.lora_loaded) if snapshot is not None else None,
+                    "has_adapter_path": bool(snapshot.adapter_path) if snapshot is not None else None,
+                },
+            )
             result = await _await_with_external_fail_abort(
                 engine=engine,
                 request_id=request_id,
@@ -1452,7 +1502,12 @@ async def _do_sample(
                     component="sampling",
                     op="sampling.get_engine_for_session",
                     request_id=request_id,
-                    attributes={"sampling_session_id": session_id},
+                    attributes={
+                        "sampling_session_id": session_id,
+                        "base_model": snapshot.base_model if snapshot is not None else None,
+                        "lora_rank": int(snapshot.lora_rank) if snapshot is not None else None,
+                        "lora_loaded_before": bool(snapshot.lora_loaded) if snapshot is not None else None,
+                    },
                 )
                 logger.info(
                     f"[sample path] request_id={request_id} session_id={session_id} stage=after_get_engine"
@@ -1485,7 +1540,13 @@ async def _do_sample(
                     component="sampling",
                     op="sampling.ensure_lora_loaded",
                     request_id=request_id,
-                    attributes={"sampling_session_id": session_id},
+                    attributes={
+                        "sampling_session_id": session_id,
+                        "base_model": snapshot.base_model if snapshot is not None else None,
+                        "lora_rank": int(snapshot.lora_rank) if snapshot is not None else None,
+                        "lora_loaded_before": bool(snapshot.lora_loaded) if snapshot is not None else None,
+                        "has_adapter_path": bool(snapshot.adapter_path) if snapshot is not None else None,
+                    },
                 )
                 logger.info(f"[sample path] session_id={session_id} stage=after_lora_load")
 
@@ -1985,7 +2046,19 @@ async def _do_compute_logprobs(
                     )
 
             if is_multi_lora:
-                multi_lora_engine = await session_manager.get_engine_for_session(session_id)
+                multi_lora_engine = await run_async_with_otel_span(
+                    "sampling.get_engine_for_session",
+                    lambda: session_manager.get_engine_for_session(session_id),
+                    component="sampling",
+                    op="sampling.get_engine_for_session",
+                    request_id=request_id,
+                    attributes={
+                        "sampling_session_id": session_id,
+                        "base_model": snapshot.base_model if snapshot is not None else None,
+                        "lora_rank": int(snapshot.lora_rank) if snapshot is not None else None,
+                        "lora_loaded_before": bool(snapshot.lora_loaded) if snapshot is not None else None,
+                    },
+                )
                 if multi_lora_engine is None:
                     raise RuntimeError(f"No engine found for session {session_id}")
                 from ..backend.resource_pool import get_resource_pool
@@ -2003,7 +2076,20 @@ async def _do_compute_logprobs(
                     op="compute_logprobs",
                 )
                 workload_started = True
-                await _ensure_session_lora_loaded(multi_lora_engine, session_id, snapshot=snapshot)
+                await run_async_with_otel_span(
+                    "sampling.ensure_lora_loaded",
+                    lambda: _ensure_session_lora_loaded(multi_lora_engine, session_id, snapshot=snapshot),
+                    component="sampling",
+                    op="sampling.ensure_lora_loaded",
+                    request_id=request_id,
+                    attributes={
+                        "sampling_session_id": session_id,
+                        "base_model": snapshot.base_model if snapshot is not None else None,
+                        "lora_rank": int(snapshot.lora_rank) if snapshot is not None else None,
+                        "lora_loaded_before": bool(snapshot.lora_loaded) if snapshot is not None else None,
+                        "has_adapter_path": bool(snapshot.adapter_path) if snapshot is not None else None,
+                    },
+                )
                 return await multi_lora_engine.compute_logprobs(
                     sampling_session_id=session_id,
                     prompt_ids=token_ids,

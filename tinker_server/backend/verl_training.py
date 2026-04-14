@@ -26,6 +26,8 @@ from ..logging_context import (
     get_request_id,
     init_actor_observability,
     restore_trace_id_from_traceparent,
+    run_async_with_otel_span,
+    start_as_current_span,
 )
 
 # Default idle timeout for TrainingWorker (seconds)
@@ -1983,17 +1985,28 @@ class VerlTrainingEngine:
         use_megatron = get_model_config(requested_model or "").is_moe
 
         # Resolve model path based on backend
-        if requested_model and not requested_model.startswith("/"):
-            # HuggingFace model ID - resolve to local cache path
-            base_model = self._resolve_hf_model_path(requested_model)
-            if base_model:
-                logger.info(f"[{model_id}] Resolved HF model to local: {base_model}")
+        with start_as_current_span(
+            "training.create_model.resolve_base_model",
+            component="backend.verl_training",
+            op="training.create_model.resolve_base_model",
+            request_id=str(get_request_id() or "") or None,
+            attributes={
+                "model_id": str(model_id),
+                "requested_model": str(requested_model) if requested_model is not None else None,
+                "use_megatron": bool(use_megatron),
+            },
+        ):
+            if requested_model and not requested_model.startswith("/"):
+                # HuggingFace model ID - resolve to local cache path
+                base_model = self._resolve_hf_model_path(requested_model)
+                if base_model:
+                    logger.info(f"[{model_id}] Resolved HF model to local: {base_model}")
+                else:
+                    # Fall back to default (works for dense models on same architecture)
+                    base_model = self.default_base_model
+                    logger.info(f"[{model_id}] Using default model path: {base_model} (requested: {requested_model})")
             else:
-                # Fall back to default (works for dense models on same architecture)
-                base_model = self.default_base_model
-                logger.info(f"[{model_id}] Using default model path: {base_model} (requested: {requested_model})")
-        else:
-            base_model = requested_model
+                base_model = requested_model
 
         print(
             f"[DEBUG {model_id}] create_training_session start: requested_model={requested_model} use_megatron={use_megatron} base_model={base_model}",
@@ -2030,15 +2043,33 @@ class VerlTrainingEngine:
                 flush=True,
             )
             try:
-                worker = await asyncio.wait_for(
-                    async_get_or_create_megatron_worker_group(
-                        base_model=base_model,
-                        lora_rank=lora_rank,
-                        learning_rate=session.learning_rate,
-                        distributed_config=distributed_config,
-                        session_id=session.model_id,
+                worker = await run_async_with_otel_span(
+                    "training.create_model.get_or_create_megatron_worker_group",
+                    lambda: asyncio.wait_for(
+                        async_get_or_create_megatron_worker_group(
+                            base_model=base_model,
+                            lora_rank=lora_rank,
+                            learning_rate=session.learning_rate,
+                            distributed_config=distributed_config,
+                            session_id=session.model_id,
+                            observability_base_model=observability_base_model,
+                        ),
+                        timeout=megatron_timeout_s,
                     ),
-                    timeout=megatron_timeout_s,
+                    component="backend.verl_training",
+                    op="training.create_model.get_or_create_megatron_worker_group",
+                    request_id=str(get_request_id() or "") or None,
+                    attributes={
+                        "model_id": str(model_id),
+                        "base_model": str(base_model),
+                        "requested_model": str(requested_model) if requested_model is not None else None,
+                        "world_size": int(distributed_config.world_size),
+                        "train_tp": int(train_tp),
+                        "train_pp": int(train_pp),
+                        "train_ep": int(train_ep),
+                        "train_cp": int(train_cp),
+                        "megatron_timeout_s": float(megatron_timeout_s),
+                    },
                 )
             except asyncio.TimeoutError:
                 # Best-effort: kill the persistent Megatron actor to unblock retries.
@@ -2775,11 +2806,24 @@ class VerlTrainingEngine:
             traceparent=traceparent,
             session_id=session.model_id,
         )
-        _ = await self._await_with_keepalive(
-            ref,
-            session,
-            interval_s=30.0,
-            timeout_s=timeout_s,
+        _ = await run_async_with_otel_span(
+            "training.save_weights_for_sampler.remote_save",
+            lambda: self._await_with_keepalive(
+                ref,
+                session,
+                interval_s=30.0,
+                timeout_s=timeout_s,
+            ),
+            component="backend.verl_training",
+            op="training.save_weights_for_sampler.remote_save",
+            request_id=str(get_request_id() or "") or None,
+            attributes={
+                "model_id": str(model_id),
+                "base_model": str(session.base_model),
+                "backend": str(session.backend),
+                "save_path": str(abs_path),
+                "timeout_s": int(timeout_s),
+            },
         )
 
         logger.info(f"[{model_id}] save_dense_lora_weights_for_sampler: {abs_path}")
@@ -2827,11 +2871,28 @@ class VerlTrainingEngine:
             train_mlp=train_mlp,
             train_unembed=train_unembed,
         )
-        meta = await self._await_with_keepalive(
-            meta_ref,
-            session,
-            interval_s=30.0,
-            timeout_s=timeout_s,
+        meta = await run_async_with_otel_span(
+            "training.save_weights_for_sampler.remote_save",
+            lambda: self._await_with_keepalive(
+                meta_ref,
+                session,
+                interval_s=30.0,
+                timeout_s=timeout_s,
+            ),
+            component="backend.verl_training",
+            op="training.save_weights_for_sampler.remote_save",
+            request_id=str(get_request_id() or "") or None,
+            attributes={
+                "model_id": str(model_id),
+                "base_model": str(session.base_model),
+                "backend": str(session.backend),
+                "save_path": str(abs_path),
+                "timeout_s": int(timeout_s),
+                "use_per_expert_lora": bool(use_per_expert_lora),
+                "train_attn": bool(train_attn),
+                "train_mlp": bool(train_mlp),
+                "train_unembed": bool(train_unembed),
+            },
         )
         strict_meta = self._strict_megatron_save_meta_enabled()
         self._update_session_step_monotonic(

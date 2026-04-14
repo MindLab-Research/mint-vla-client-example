@@ -248,6 +248,53 @@ def extract_otel_context_from_traceparent(traceparent: str | None) -> Any | None
 
 
 @contextmanager
+def start_as_current_span(
+    span_name: str,
+    *,
+    component: str | None = None,
+    op: str | None = None,
+    request_id: str | None = None,
+    attributes: dict[str, Any] | None = None,
+    kind: Any | None = None,
+    context: Any | None = None,
+) -> Iterator[Any | None]:
+    """Start an OTel span in the current process context."""
+    tracer = get_otel_tracer()
+    if tracer is None:
+        yield None
+        return
+
+    try:
+        from opentelemetry.trace import SpanKind, Status, StatusCode
+    except Exception:
+        yield None
+        return
+
+    span_kind = SpanKind.INTERNAL if kind is None else kind
+    with tracer.start_as_current_span(str(span_name), kind=span_kind, context=context) as span:
+        if component:
+            span.set_attribute("component", str(component))
+        if op:
+            span.set_attribute("op", str(op))
+        if request_id:
+            span.set_attribute("request_id", str(request_id))
+        if attributes:
+            for key, value in attributes.items():
+                if value is None:
+                    continue
+                try:
+                    span.set_attribute(str(key), value)
+                except Exception:
+                    span.set_attribute(str(key), str(value))
+        try:
+            yield span
+        except Exception as e:
+            span.record_exception(e)
+            span.set_status(Status(StatusCode.ERROR, str(e)))
+            raise
+
+
+@contextmanager
 def start_as_current_span_from_traceparent(
     span_name: str,
     *,
@@ -262,39 +309,16 @@ def start_as_current_span_from_traceparent(
     trace_id = extract_trace_id_from_traceparent(traceparent)
     context = extract_otel_context_from_traceparent(traceparent)
     with bind_request_trace_context(request_id=request_id, trace_id=trace_id):
-        tracer = get_otel_tracer()
-        if tracer is None:
-            yield None
-            return
-
-        try:
-            from opentelemetry.trace import SpanKind, Status, StatusCode
-        except Exception:
-            yield None
-            return
-
-        span_kind = SpanKind.INTERNAL if kind is None else kind
-        with tracer.start_as_current_span(str(span_name), kind=span_kind, context=context) as span:
-            if component:
-                span.set_attribute("component", str(component))
-            if op:
-                span.set_attribute("op", str(op))
-            if request_id:
-                span.set_attribute("request_id", str(request_id))
-            if attributes:
-                for key, value in attributes.items():
-                    if value is None:
-                        continue
-                    try:
-                        span.set_attribute(str(key), value)
-                    except Exception:
-                        span.set_attribute(str(key), str(value))
-            try:
-                yield span
-            except Exception as e:
-                span.record_exception(e)
-                span.set_status(Status(StatusCode.ERROR, str(e)))
-                raise
+        with start_as_current_span(
+            span_name,
+            component=component,
+            op=op,
+            request_id=request_id,
+            attributes=attributes,
+            kind=kind,
+            context=context,
+        ) as span:
+            yield span
 
 
 def traced_async_from_traceparent(

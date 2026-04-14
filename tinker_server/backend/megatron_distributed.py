@@ -30,9 +30,12 @@ import ray
 
 from . import ray_kill
 from ..logging_context import (
+    get_current_traceparent,
     get_request_id,
     init_actor_observability,
     restore_trace_id_from_traceparent,
+    start_as_current_span,
+    start_as_current_span_from_traceparent,
 )
 
 logger = logging.getLogger(__name__)
@@ -389,6 +392,8 @@ class MegatronRankWorker:
         lora_rank: int,
         learning_rate: float,
         distributed_config: DistributedConfig,
+        traceparent: str | None = None,
+        request_id: str | None = None,
     ):
         """Create worker but don't initialize distributed yet.
         
@@ -397,6 +402,9 @@ class MegatronRankWorker:
         simultaneously so they can reach init_process_group barrier together.
         """
         init_actor_observability()
+        self._startup_traceparent = traceparent
+        self._startup_request_id = str(request_id or get_request_id() or "") or None
+        self._bind_traceparent(traceparent)
         self.rank = rank
         self.world_size = world_size
         self.master_addr = master_addr
@@ -1563,53 +1571,102 @@ class MegatronRankWorker:
         self._current_session_id = session_id
         logger.info(f"[Rank {self.rank}] Marked loaded session active: {session_id}")
 
-    def initialize(self):
+    def initialize(self, traceparent: str | None = None, request_id: str | None = None):
         """Initialize distributed backend and Megatron engine.
         
         Must be called on all workers simultaneously after all workers are created.
         This ensures all workers reach init_process_group barrier together.
         """
-        # Ray sets CUDA_VISIBLE_DEVICES before process starts when using num_gpus=1
-        # Import torch HERE (lazy) - CUDA_VISIBLE_DEVICES must be set before torch initializes CUDA
-        import torch
+        traceparent = traceparent or self._startup_traceparent
+        request_id = str(request_id or self._startup_request_id or get_request_id() or "") or None
+        self._bind_traceparent(traceparent)
+        with start_as_current_span_from_traceparent(
+            "training.create_model.megatron.rank_worker.initialize",
+            traceparent=traceparent,
+            component="backend.megatron_distributed",
+            op="training.create_model.megatron.rank_worker.initialize",
+            request_id=request_id,
+            attributes={
+                "rank": int(self.rank),
+                "world_size": int(self.world_size),
+                "base_model": str(self.base_model),
+            },
+        ):
+            # Ray sets CUDA_VISIBLE_DEVICES before process starts when using num_gpus=1
+            # Import torch HERE (lazy) - CUDA_VISIBLE_DEVICES must be set before torch initializes CUDA
+            import torch
 
-        cuda_device = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-        ray_gpu_ids = ray.get_gpu_ids()
-        device_count = torch.cuda.device_count()
+            cuda_device = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+            ray_gpu_ids = ray.get_gpu_ids()
+            device_count = torch.cuda.device_count()
 
-        logger.info(
-            f"[Rank {self.rank}] initialize() starting: CUDA_VISIBLE_DEVICES={cuda_device!r}, "
-            f"ray_gpu_ids={ray_gpu_ids}, torch.cuda.device_count()={device_count}, "
-            f"request_id={get_request_id() or '-'}"
-        )
-
-        if device_count != 1:
-            raise RuntimeError(
-                f"MegatronRankWorker rank {self.rank} expected 1 GPU, but torch sees {device_count}. "
-                f"CUDA_VISIBLE_DEVICES={cuda_device}, ray_gpu_ids={ray_gpu_ids}. "
-                f"Check that Ray actor was created with num_gpus=1."
+            logger.info(
+                f"[Rank {self.rank}] initialize() starting: CUDA_VISIBLE_DEVICES={cuda_device!r}, "
+                f"ray_gpu_ids={ray_gpu_ids}, torch.cuda.device_count()={device_count}, "
+                f"request_id={get_request_id() or '-'}"
             )
 
-        # Set environment for torch.distributed
-        os.environ["MASTER_ADDR"] = self.master_addr
-        os.environ["MASTER_PORT"] = str(self.master_port)
-        os.environ["WORLD_SIZE"] = str(self.world_size)
-        os.environ["RANK"] = str(self.rank)
-        # LOCAL_RANK is always 0 because CUDA_VISIBLE_DEVICES limits to single GPU
-        os.environ["LOCAL_RANK"] = "0"
+            if device_count != 1:
+                raise RuntimeError(
+                    f"MegatronRankWorker rank {self.rank} expected 1 GPU, but torch sees {device_count}. "
+                    f"CUDA_VISIBLE_DEVICES={cuda_device}, ray_gpu_ids={ray_gpu_ids}. "
+                    f"Check that Ray actor was created with num_gpus=1."
+                )
 
-        # HuggingFace offline mode
-        os.environ["HF_HOME"] = "/vePFS-Mindverse/share/huggingface"
-        os.environ["HF_HUB_OFFLINE"] = "1"
-        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+            # Set environment for torch.distributed
+            os.environ["MASTER_ADDR"] = self.master_addr
+            os.environ["MASTER_PORT"] = str(self.master_port)
+            os.environ["WORLD_SIZE"] = str(self.world_size)
+            os.environ["RANK"] = str(self.rank)
+            # LOCAL_RANK is always 0 because CUDA_VISIBLE_DEVICES limits to single GPU
+            os.environ["LOCAL_RANK"] = "0"
 
-        self._initialize_distributed()
-        self._initialize_megatron()
+            # HuggingFace offline mode
+            os.environ["HF_HOME"] = "/vePFS-Mindverse/share/huggingface"
+            os.environ["HF_HUB_OFFLINE"] = "1"
+            os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
-        # Log memory after initialization
-        self.log_memory_breakdown("after_init")
+            with start_as_current_span_from_traceparent(
+                "training.create_model.megatron.rank_worker.initialize_distributed",
+                traceparent=traceparent,
+                component="backend.megatron_distributed",
+                op="training.create_model.megatron.rank_worker.initialize_distributed",
+                request_id=request_id,
+                attributes={
+                    "rank": int(self.rank),
+                    "world_size": int(self.world_size),
+                    "base_model": str(self.base_model),
+                },
+            ):
+                self._initialize_distributed()
+            with start_as_current_span_from_traceparent(
+                "training.create_model.megatron.rank_worker.initialize_megatron",
+                traceparent=traceparent,
+                component="backend.megatron_distributed",
+                op="training.create_model.megatron.rank_worker.initialize_megatron",
+                request_id=request_id,
+                attributes={
+                    "rank": int(self.rank),
+                    "world_size": int(self.world_size),
+                    "base_model": str(self.base_model),
+                },
+            ):
+                self._initialize_megatron()
+            with start_as_current_span_from_traceparent(
+                "training.create_model.megatron.rank_worker.post_init_memory",
+                traceparent=traceparent,
+                component="backend.megatron_distributed",
+                op="training.create_model.megatron.rank_worker.post_init_memory",
+                request_id=request_id,
+                attributes={
+                    "rank": int(self.rank),
+                    "world_size": int(self.world_size),
+                    "base_model": str(self.base_model),
+                },
+            ):
+                self.log_memory_breakdown("after_init")
 
-        logger.info(f"[Rank {self.rank}] initialize() complete")
+            logger.info(f"[Rank {self.rank}] initialize() complete")
 
     def _initialize_distributed(self):
         """Initialize torch.distributed with NCCL backend."""
@@ -1652,29 +1709,42 @@ class MegatronRankWorker:
 
     def _initialize_megatron(self):
         """Initialize Megatron model parallel and engine."""
-        # CRITICAL: Enable determinism FIRST, before ANY Megatron/TE imports
-        # This must happen before FlashAttention code is loaded to take effect
-        # Without this, consecutive forward passes differ by ~0.46 nats
-        from tinker_server.backend.verl_patches import _enable_megatron_determinism
-        _enable_megatron_determinism(seed=42)
+        request_id = self._startup_request_id
 
-        # Apply MLA patches for DeepseekV3/K2/Moonlight models BEFORE importing Megatron
-        # These patches enable Flash Attention 2 with MLA by padding value tensors
-        # Must be applied before MLASelfAttention class is imported/instantiated
-        try:
-            from verl.models.mcore.patch_v012 import apply_patch
-            apply_patch()
-            logger.info(f"[Rank {self.rank}] Applied MLA patches from verl.models.mcore.patch_v012")
-        except Exception as e:
-            logger.warning(f"[Rank {self.rank}] Could not apply MLA patch: {e}")
+        with start_as_current_span(
+            "training.create_model.megatron.rank_worker.apply_startup_patches",
+            component="backend.megatron_distributed",
+            op="training.create_model.megatron.rank_worker.apply_startup_patches",
+            request_id=request_id,
+            attributes={
+                "rank": int(self.rank),
+                "world_size": int(self.world_size),
+                "base_model": str(self.base_model),
+            },
+        ):
+            # CRITICAL: Enable determinism FIRST, before ANY Megatron/TE imports
+            # This must happen before FlashAttention code is loaded to take effect
+            # Without this, consecutive forward passes differ by ~0.46 nats
+            from tinker_server.backend.verl_patches import _enable_megatron_determinism
+            _enable_megatron_determinism(seed=42)
 
-        # Apply label shift patch to fix log_prob alignment
-        # Must be applied BEFORE importing MegatronEngineWithLMHead
-        try:
-            from tinker_server.backend.verl_patches import apply_verl_patches
-            apply_verl_patches()
-        except Exception as e:
-            logger.warning(f"[Rank {self.rank}] Could not apply verl patches: {e}")
+            # Apply MLA patches for DeepseekV3/K2/Moonlight models BEFORE importing Megatron
+            # These patches enable Flash Attention 2 with MLA by padding value tensors
+            # Must be applied before MLASelfAttention class is imported/instantiated
+            try:
+                from verl.models.mcore.patch_v012 import apply_patch
+                apply_patch()
+                logger.info(f"[Rank {self.rank}] Applied MLA patches from verl.models.mcore.patch_v012")
+            except Exception as e:
+                logger.warning(f"[Rank {self.rank}] Could not apply MLA patch: {e}")
+
+            # Apply label shift patch to fix log_prob alignment
+            # Must be applied BEFORE importing MegatronEngineWithLMHead
+            try:
+                from tinker_server.backend.verl_patches import apply_verl_patches
+                apply_verl_patches()
+            except Exception as e:
+                logger.warning(f"[Rank {self.rank}] Could not apply verl patches: {e}")
 
         from verl.workers.engine.megatron.transformer_impl import MegatronEngineWithLMHead
         from verl.workers.config import (
@@ -1686,14 +1756,25 @@ class MegatronRankWorker:
         from verl.utils.fs import copy_to_local
         from transformers import AutoConfig
 
-        # Note: mpu.initialize_model_parallel() is called by MegatronEngine
-        # Copy model to local (returns path unchanged if not HDFS)
-        local_path = copy_to_local(self.base_model)
+        with start_as_current_span(
+            "training.create_model.megatron.rank_worker.load_model_config",
+            component="backend.megatron_distributed",
+            op="training.create_model.megatron.rank_worker.load_model_config",
+            request_id=request_id,
+            attributes={
+                "rank": int(self.rank),
+                "world_size": int(self.world_size),
+                "base_model": str(self.base_model),
+            },
+        ):
+            # Note: mpu.initialize_model_parallel() is called by MegatronEngine
+            # Copy model to local (returns path unchanged if not HDFS)
+            local_path = copy_to_local(self.base_model)
 
-        # Build configs
-        hf_config = AutoConfig.from_pretrained(
-            local_path, trust_remote_code=True, local_files_only=True
-        )
+            # Build configs
+            hf_config = AutoConfig.from_pretrained(
+                local_path, trust_remote_code=True, local_files_only=True
+            )
 
         num_experts = getattr(hf_config, "num_experts", None) or getattr(hf_config, "n_routed_experts", None)
         try:
@@ -1918,96 +1999,136 @@ class MegatronRankWorker:
 
         logger.info(f"[Rank {self.rank}] override_transformer_config: {override_tf_config}")
 
-        engine_kwargs: dict[str, object] = {
-            "tensor_model_parallel_size": self.config.tensor_parallel_size,
-            "pipeline_model_parallel_size": self.config.pipeline_parallel_size,
-            "expert_model_parallel_size": self.config.expert_parallel_size,
-            "expert_tensor_parallel_size": self.config.expert_tensor_parallel_size,
-            "context_parallel_size": self.config.context_parallel_size,
-            "param_offload": True,
-            "optimizer_offload": True,
-            "grad_offload": use_grad_offload,
-            "dtype": "bfloat16",  # Base dtype, FP8 handled via override_transformer_config
-            # THD ("remove padding") path in TransformerEngine disables FlashAttention when there is
-            # any padding between sequences; verl's THD preprocessing pads sequences for alignment,
-            # causing long-context training to fall back to O(seq^2) softmax and OOM at ~38K tokens.
-            #
-            # Disable remove-padding for non-MLA models so FlashAttention can be selected in BSHD.
-            "use_remove_padding": has_mla_attention,
-            "use_mbridge": True,
-            "vanilla_mbridge": False,  # Required for LoRA - enables provider initialization
-            "use_distributed_optimizer": True,  # Keep distributed optimizer for efficiency
-            "override_transformer_config": override_tf_config,
-        }
+        with start_as_current_span(
+            "training.create_model.megatron.rank_worker.build_engine_config",
+            component="backend.megatron_distributed",
+            op="training.create_model.megatron.rank_worker.build_engine_config",
+            request_id=request_id,
+            attributes={
+                "rank": int(self.rank),
+                "world_size": int(self.world_size),
+                "base_model": str(self.base_model),
+                "num_experts": None if num_experts is None else int(num_experts),
+                "uses_mla_attention": bool(has_mla_attention),
+                "use_fp8": bool(self.config.use_fp8),
+                "use_grad_offload": bool(use_grad_offload),
+            },
+        ):
+            engine_kwargs: dict[str, object] = {
+                "tensor_model_parallel_size": self.config.tensor_parallel_size,
+                "pipeline_model_parallel_size": self.config.pipeline_parallel_size,
+                "expert_model_parallel_size": self.config.expert_parallel_size,
+                "expert_tensor_parallel_size": self.config.expert_tensor_parallel_size,
+                "context_parallel_size": self.config.context_parallel_size,
+                "param_offload": True,
+                "optimizer_offload": True,
+                "grad_offload": use_grad_offload,
+                "dtype": "bfloat16",  # Base dtype, FP8 handled via override_transformer_config
+                # THD ("remove padding") path in TransformerEngine disables FlashAttention when there is
+                # any padding between sequences; verl's THD preprocessing pads sequences for alignment,
+                # causing long-context training to fall back to O(seq^2) softmax and OOM at ~38K tokens.
+                #
+                # Disable remove-padding for non-MLA models so FlashAttention can be selected in BSHD.
+                "use_remove_padding": has_mla_attention,
+                "use_mbridge": True,
+                "vanilla_mbridge": False,  # Required for LoRA - enables provider initialization
+                "use_distributed_optimizer": True,  # Keep distributed optimizer for efficiency
+                "override_transformer_config": override_tf_config,
+            }
 
-        # Compatibility: older verl branches do not expose EngineRouterReplayConfig nor
-        # McoreEngineConfig.router_replay. Skip router replay config in that case.
-        engine_fields = getattr(McoreEngineConfig, "__dataclass_fields__", {}) or {}
-        if "router_replay" in engine_fields:
-            router_replay_cfg = None
-            try:
-                from verl.workers.config.engine import EngineRouterReplayConfig
-
-                router_replay_cfg = EngineRouterReplayConfig(mode=self.config.router_replay_mode)
-            except Exception:
+            # Compatibility: older verl branches do not expose EngineRouterReplayConfig nor
+            # McoreEngineConfig.router_replay. Skip router replay config in that case.
+            engine_fields = getattr(McoreEngineConfig, "__dataclass_fields__", {}) or {}
+            if "router_replay" in engine_fields:
+                router_replay_cfg = None
                 try:
-                    from verl.workers.config.actor import RouterReplayConfig
+                    from verl.workers.config.engine import EngineRouterReplayConfig
 
-                    router_replay_cfg = RouterReplayConfig(mode=self.config.router_replay_mode)
-                except Exception as e:
-                    logger.warning(
-                        f"[Rank {self.rank}] router_replay config unavailable; disabling router replay: {e}"
-                    )
-            if router_replay_cfg is not None:
-                engine_kwargs["router_replay"] = router_replay_cfg
-        elif self.config.router_replay_mode != "disabled":
-            logger.warning(
-                f"[Rank {self.rank}] McoreEngineConfig has no router_replay field; "
-                "router replay mode ignored"
+                    router_replay_cfg = EngineRouterReplayConfig(mode=self.config.router_replay_mode)
+                except Exception:
+                    try:
+                        from verl.workers.config.actor import RouterReplayConfig
+
+                        router_replay_cfg = RouterReplayConfig(mode=self.config.router_replay_mode)
+                    except Exception as e:
+                        logger.warning(
+                            f"[Rank {self.rank}] router_replay config unavailable; disabling router replay: {e}"
+                        )
+                if router_replay_cfg is not None:
+                    engine_kwargs["router_replay"] = router_replay_cfg
+            elif self.config.router_replay_mode != "disabled":
+                logger.warning(
+                    f"[Rank {self.rank}] McoreEngineConfig has no router_replay field; "
+                    "router replay mode ignored"
+                )
+
+            engine_config = McoreEngineConfig(**engine_kwargs)
+            print(
+                f"[Rank {self.rank}] McoreEngineConfig: TP={engine_config.tensor_model_parallel_size}, "
+                f"EP={engine_config.expert_model_parallel_size}, ETP={engine_config.expert_tensor_parallel_size}, "
+                f"CP={engine_config.context_parallel_size}, PP={engine_config.pipeline_model_parallel_size}",
+                flush=True
             )
 
-        engine_config = McoreEngineConfig(**engine_kwargs)
-        print(
-            f"[Rank {self.rank}] McoreEngineConfig: TP={engine_config.tensor_model_parallel_size}, "
-            f"EP={engine_config.expert_model_parallel_size}, ETP={engine_config.expert_tensor_parallel_size}, "
-            f"CP={engine_config.context_parallel_size}, PP={engine_config.pipeline_model_parallel_size}",
-            flush=True
-        )
+            optimizer_config = McoreOptimizerConfig(
+                lr=self.learning_rate,
+                weight_decay=0.01,
+                betas=(0.9, 0.999),
+                clip_grad=1.0,
+                lr_decay_steps=100000,
+                lr_decay_style="constant",
+                lr_warmup_steps=0,
+            )
 
-        optimizer_config = McoreOptimizerConfig(
-            lr=self.learning_rate,
-            weight_decay=0.01,
-            betas=(0.9, 0.999),
-            clip_grad=1.0,
-            lr_decay_steps=100000,
-            lr_decay_style="constant",
-            lr_warmup_steps=0,
-        )
-
-        checkpoint_config = CheckpointConfig()
+            checkpoint_config = CheckpointConfig()
 
         # Create and initialize engine
         # Use MegatronEngineWithLMHead which implements forward_step for LM training
-        self.engine = MegatronEngineWithLMHead(
-            model_config=model_config,
-            engine_config=engine_config,
-            optimizer_config=optimizer_config,
-            checkpoint_config=checkpoint_config,
-        )
-        self.engine.initialize()
+        with start_as_current_span(
+            "training.create_model.megatron.rank_worker.engine_initialize",
+            component="backend.megatron_distributed",
+            op="training.create_model.megatron.rank_worker.engine_initialize",
+            request_id=request_id,
+            attributes={
+                "rank": int(self.rank),
+                "world_size": int(self.world_size),
+                "base_model": str(self.base_model),
+                "tensor_parallel_size": int(self.config.tensor_parallel_size),
+                "pipeline_parallel_size": int(self.config.pipeline_parallel_size),
+                "expert_parallel_size": int(self.config.expert_parallel_size),
+            },
+        ):
+            self.engine = MegatronEngineWithLMHead(
+                model_config=model_config,
+                engine_config=engine_config,
+                optimizer_config=optimizer_config,
+                checkpoint_config=checkpoint_config,
+            )
+            self.engine.initialize()
         logger.info(f"[Rank {self.rank}] MegatronEngineWithLMHead initialized")
 
         # CUDA sync and test to detect corruption early
         import torch
-        torch.cuda.synchronize()
-        try:
-            test_tensor = torch.ones(1, device="cuda:0")
-            torch.cuda.synchronize()  # Force error detection
-            logger.info(f"[Rank {self.rank}] Post-init CUDA test passed: {test_tensor.item()}")
-            del test_tensor
-        except Exception as e:
-            logger.error(f"[Rank {self.rank}] Post-init CUDA test FAILED: {e}")
-            raise RuntimeError(f"CUDA corrupted after engine init: {e}")
+        with start_as_current_span(
+            "training.create_model.megatron.rank_worker.cuda_sanity_check",
+            component="backend.megatron_distributed",
+            op="training.create_model.megatron.rank_worker.cuda_sanity_check",
+            request_id=request_id,
+            attributes={
+                "rank": int(self.rank),
+                "world_size": int(self.world_size),
+                "base_model": str(self.base_model),
+            },
+        ):
+            torch.cuda.synchronize()
+            try:
+                test_tensor = torch.ones(1, device="cuda:0")
+                torch.cuda.synchronize()  # Force error detection
+                logger.info(f"[Rank {self.rank}] Post-init CUDA test passed: {test_tensor.item()}")
+                del test_tensor
+            except Exception as e:
+                logger.error(f"[Rank {self.rank}] Post-init CUDA test FAILED: {e}")
+                raise RuntimeError(f"CUDA corrupted after engine init: {e}")
 
         # Warmup disabled: nested tensors with CUDA cause issues
         # If warmup is needed in the future, ensure CUDA operations work correctly first
@@ -5681,8 +5802,13 @@ class MegatronWorkerGroup:
         learning_rate: float,
         distributed_config: DistributedConfig | None = None,
         observability_base_model: str | None = None,
+        traceparent: str | None = None,
+        request_id: str | None = None,
     ):
         init_actor_observability()
+        self._startup_traceparent = traceparent
+        self._startup_request_id = str(request_id or get_request_id() or "") or None
+        self._bind_traceparent(traceparent)
         self.base_model = base_model
         self.observability_base_model = str(observability_base_model or base_model or "unknown")
         self.lora_rank = lora_rank  # This is max_lora_rank for Phase 7
@@ -5702,7 +5828,19 @@ class MegatronWorkerGroup:
         self._placement_bundle_node_ips: list[str | None] = []
         self._placement_requested_node_ips: list[str] = []
 
-        self._initialize()
+        with start_as_current_span_from_traceparent(
+            "training.create_model.megatron.worker_group.initialize",
+            traceparent=self._startup_traceparent,
+            component="backend.megatron_distributed",
+            op="training.create_model.megatron.worker_group.initialize",
+            request_id=self._startup_request_id,
+            attributes={
+                "base_model": str(self.base_model),
+                "world_size": int(self.config.world_size),
+                "lora_rank": int(self.lora_rank),
+            },
+        ):
+            self._initialize()
 
     def get_rss_bytes(self) -> int:
         with open("/proc/self/statm", encoding="utf-8") as f:
@@ -5814,6 +5952,8 @@ class MegatronWorkerGroup:
     def _initialize(self):
         """Create placement group, spawn workers, then initialize them all together."""
         world_size = self.config.world_size
+        traceparent = self._startup_traceparent
+        request_id = self._startup_request_id
 
         # Create placement group with N GPU bundles
         bundles = [{"GPU": 1, "CPU": 1} for _ in range(world_size)]
@@ -5862,8 +6002,23 @@ class MegatronWorkerGroup:
                     cpu_per_gpu=1,
                 )
                 logger.info(f"[MegatronWorkerGroup] Model placement preferred nodes={node_ips}")
-        self._placement_bundle_node_ips = [_bundle_node_ip(bundle) for bundle in bundles]
-        self._placement_requested_node_ips = [ip for ip in self._placement_bundle_node_ips if ip is not None]
+        with start_as_current_span_from_traceparent(
+            "training.create_model.megatron.worker_group.select_bundles",
+            traceparent=traceparent,
+            component="backend.megatron_distributed",
+            op="training.create_model.megatron.worker_group.select_bundles",
+            request_id=request_id,
+            attributes={
+                "base_model": str(self.base_model),
+                "world_size": int(world_size),
+                "allowed_ip_count": int(len(allowed_ips)),
+            },
+        ) as bundle_span:
+            self._placement_bundle_node_ips = [_bundle_node_ip(bundle) for bundle in bundles]
+            self._placement_requested_node_ips = [ip for ip in self._placement_bundle_node_ips if ip is not None]
+            if bundle_span is not None:
+                bundle_span.set_attribute("requested_node_ip_count", int(len(self._placement_requested_node_ips)))
+                bundle_span.set_attribute("uses_node_allowlist", bool(allowed_ips))
         logger.info(
             f"[MegatronWorkerGroup] Placement bundle node IPs={self._placement_bundle_node_ips}"
         )
@@ -5871,11 +6026,23 @@ class MegatronWorkerGroup:
         # PACK: try to colocate but allow multi-node for large models (K2: 16+ GPUs)
         # STRICT_PACK would require single node, blocking on 8-GPU nodes
         pg_name = _make_megatron_pg_name(self.base_model)
-        self.placement_group = _get_or_create_megatron_placement_group(
-            pg_name=pg_name,
-            bundles=bundles,
-        )
-        ray.get(self.placement_group.ready())
+        with start_as_current_span_from_traceparent(
+            "training.create_model.megatron.worker_group.placement_group_ready",
+            traceparent=traceparent,
+            component="backend.megatron_distributed",
+            op="training.create_model.megatron.worker_group.placement_group_ready",
+            request_id=request_id,
+            attributes={
+                "base_model": str(self.base_model),
+                "pg_name": str(pg_name),
+                "world_size": int(world_size),
+            },
+        ):
+            self.placement_group = _get_or_create_megatron_placement_group(
+                pg_name=pg_name,
+                bundles=bundles,
+            )
+            ray.get(self.placement_group.ready())
 
         logger.info(f"[MegatronWorkerGroup] Placement group ready with {world_size} GPUs")
 
@@ -5949,53 +6116,103 @@ class MegatronWorkerGroup:
             runtime_env["env_vars"]["NCCL_IB_DISABLE"] = "0"
 
         # Get master address from first bundle's node
-        master_addr, master_port = ray.get(
-            get_node_ip_and_free_port.options(
-                scheduling_strategy=ray.util.scheduling_strategies.PlacementGroupSchedulingStrategy(
-                    placement_group=self.placement_group,
-                    placement_group_bundle_index=0,
-                ),
-                resources=_node_affinity_resources(self._placement_bundle_node_ips[0]),
-                runtime_env=runtime_env,
-            ).remote()
-        )
+        with start_as_current_span(
+            "training.create_model.megatron.worker_group.resolve_master_addr",
+            component="backend.megatron_distributed",
+            op="training.create_model.megatron.worker_group.resolve_master_addr",
+            request_id=request_id,
+            attributes={
+                "base_model": str(self.base_model),
+                "world_size": int(world_size),
+                "bundle_index": 0,
+                "preferred_node_ip": self._placement_bundle_node_ips[0],
+            },
+        ):
+            master_addr, master_port = ray.get(
+                get_node_ip_and_free_port.options(
+                    scheduling_strategy=ray.util.scheduling_strategies.PlacementGroupSchedulingStrategy(
+                        placement_group=self.placement_group,
+                        placement_group_bundle_index=0,
+                    ),
+                    resources=_node_affinity_resources(self._placement_bundle_node_ips[0]),
+                    runtime_env=runtime_env,
+                ).remote()
+            )
 
         logger.info(f"[MegatronWorkerGroup] Master: {master_addr}:{master_port}")
         self._master_addr = master_addr
         self._master_port = int(master_port)
 
         # Spawn workers - __init__ is lightweight, no distributed init yet
-        for rank in range(world_size):
-            logger.info(f"[MegatronWorkerGroup] Spawning rank {rank}")
-            worker = MegatronRankWorker.options(
-                num_gpus=1,  # Ray sets CUDA_VISIBLE_DEVICES before process starts
-                num_cpus=0,
-                scheduling_strategy=ray.util.scheduling_strategies.PlacementGroupSchedulingStrategy(
-                    placement_group=self.placement_group,
-                    placement_group_bundle_index=rank,
-                ),
-                resources=_node_affinity_resources(self._placement_bundle_node_ips[rank]),
-                runtime_env=runtime_env,
-            ).remote(
-                rank=rank,
-                world_size=world_size,
-                master_addr=master_addr,
-                master_port=master_port,
-                base_model=self.base_model,
-                lora_rank=self.lora_rank,
-                learning_rate=self.learning_rate,
-                distributed_config=self.config,
-            )
-            self.workers.append(worker)
+        with start_as_current_span_from_traceparent(
+            "training.create_model.megatron.worker_group.spawn_rank_workers",
+            traceparent=traceparent,
+            component="backend.megatron_distributed",
+            op="training.create_model.megatron.worker_group.spawn_rank_workers",
+            request_id=request_id,
+            attributes={
+                "base_model": str(self.base_model),
+                "world_size": int(world_size),
+            },
+        ):
+            for rank in range(world_size):
+                logger.info(f"[MegatronWorkerGroup] Spawning rank {rank}")
+                worker = MegatronRankWorker.options(
+                    num_gpus=1,  # Ray sets CUDA_VISIBLE_DEVICES before process starts
+                    num_cpus=0,
+                    scheduling_strategy=ray.util.scheduling_strategies.PlacementGroupSchedulingStrategy(
+                        placement_group=self.placement_group,
+                        placement_group_bundle_index=rank,
+                    ),
+                    resources=_node_affinity_resources(self._placement_bundle_node_ips[rank]),
+                    runtime_env=runtime_env,
+                ).remote(
+                    rank=rank,
+                    world_size=world_size,
+                    master_addr=master_addr,
+                    master_port=master_port,
+                    base_model=self.base_model,
+                    lora_rank=self.lora_rank,
+                    learning_rate=self.learning_rate,
+                    distributed_config=self.config,
+                    traceparent=traceparent,
+                    request_id=request_id,
+                )
+                self.workers.append(worker)
 
         # Wait for all worker actors to be created (lightweight __init__ only)
-        ray.get([w.__ray_ready__.remote() for w in self.workers])
+        with start_as_current_span_from_traceparent(
+            "training.create_model.megatron.worker_group.rank_worker_ctor_ready",
+            traceparent=traceparent,
+            component="backend.megatron_distributed",
+            op="training.create_model.megatron.worker_group.rank_worker_ctor_ready",
+            request_id=request_id,
+            attributes={
+                "base_model": str(self.base_model),
+                "world_size": int(world_size),
+            },
+        ):
+            ray.get([w.__ray_ready__.remote() for w in self.workers])
         logger.info(f"[MegatronWorkerGroup] All {world_size} worker actors created")
 
         # Now initialize all workers simultaneously - they will reach
         # init_process_group barrier together, avoiding deadlock
         logger.info("[MegatronWorkerGroup] Calling initialize() on all workers...")
-        ray.get([w.initialize.remote() for w in self.workers])
+        with start_as_current_span_from_traceparent(
+            "training.create_model.megatron.worker_group.rank_worker_initialize_all",
+            traceparent=traceparent,
+            component="backend.megatron_distributed",
+            op="training.create_model.megatron.worker_group.rank_worker_initialize_all",
+            request_id=request_id,
+            attributes={
+                "base_model": str(self.base_model),
+                "world_size": int(world_size),
+            },
+        ):
+            ray.get([
+                w.initialize.remote(traceparent=traceparent, request_id=request_id)
+                for w in self.workers
+            ])
 
         logger.info(f"[MegatronWorkerGroup] All {world_size} workers initialized and ready")
 
@@ -8284,6 +8501,8 @@ def get_or_create_megatron_worker_group(
     distributed_config: DistributedConfig | None = None,
     session_id: str | None = None,
     observability_base_model: str | None = None,
+    traceparent: str | None = None,
+    request_id: str | None = None,
 ) -> ray.actor.ActorHandle:
     """Get existing or create new persistent MegatronWorkerGroup for this model.
 
@@ -8311,6 +8530,7 @@ def get_or_create_megatron_worker_group(
     num_gpus = config.world_size
     is_persistent = is_persistent_model(base_model)
     observability_model = str(observability_base_model or base_model or "unknown")
+    request_id = str(request_id or get_request_id() or "") or None
 
     if not ray.is_initialized():
         init_ray(
@@ -8326,12 +8546,36 @@ def get_or_create_megatron_worker_group(
         # Try to get existing persistent actor for this model.
         # Must be inside a per-actor lock to avoid concurrent create_lora_training_client races.
         try:
-            actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
+            with start_as_current_span_from_traceparent(
+                "training.create_model.megatron.actor_lookup",
+                traceparent=traceparent,
+                component="backend.megatron_distributed",
+                op="training.create_model.megatron.actor_lookup",
+                request_id=request_id,
+                attributes={
+                    "actor_name": str(actor_name),
+                    "base_model": str(base_model),
+                    "world_size": int(num_gpus),
+                },
+            ):
+                actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
             logger.info(f"Connected to existing Megatron actor: {actor_name}")
 
             # Verify actor is alive
             try:
-                ray.get(actor.get_diagnostics.remote(), timeout=10)
+                with start_as_current_span_from_traceparent(
+                    "training.create_model.megatron.actor_diagnostics",
+                    traceparent=traceparent,
+                    component="backend.megatron_distributed",
+                    op="training.create_model.megatron.actor_diagnostics",
+                    request_id=request_id,
+                    attributes={
+                        "actor_name": str(actor_name),
+                        "base_model": str(base_model),
+                        "diagnostics_timeout_s": 10,
+                    },
+                ):
+                    ray.get(actor.get_diagnostics.remote(), timeout=10)
             except ray.exceptions.RayActorError:
                 # Actor is dead, kill to free name
                 logger.warning(f"Megatron actor {actor_name} is dead, killing to free name")
@@ -8359,19 +8603,32 @@ def get_or_create_megatron_worker_group(
                     f"Megatron actor {actor_name} get_diagnostics timed out; assuming busy and reusing actor"
                 )
 
-            # Register with resource pool (reconnection case)
-            resource_pool.register(
-                actor_name=actor_name,
-                actor_type=ActorType.MEGATRON,
-                num_gpus=num_gpus,
-                actor_handle=actor,
-                namespace=PERSISTENT_NAMESPACE,
-                base_model=observability_model,
-                protected=is_persistent,
-                metadata=dict(actor_observability_metadata(actor) or {}),
-            )
-            # Existing actor is already ready
-            resource_pool.mark_ready(actor_name)
+            with start_as_current_span_from_traceparent(
+                "training.create_model.megatron.register_existing_actor",
+                traceparent=traceparent,
+                component="backend.megatron_distributed",
+                op="training.create_model.megatron.register_existing_actor",
+                request_id=request_id,
+                attributes={
+                    "actor_name": str(actor_name),
+                    "base_model": str(base_model),
+                    "world_size": int(num_gpus),
+                    "is_persistent": bool(is_persistent),
+                },
+            ):
+                # Register with resource pool (reconnection case)
+                resource_pool.register(
+                    actor_name=actor_name,
+                    actor_type=ActorType.MEGATRON,
+                    num_gpus=num_gpus,
+                    actor_handle=actor,
+                    namespace=PERSISTENT_NAMESPACE,
+                    base_model=observability_model,
+                    protected=is_persistent,
+                    metadata=dict(actor_observability_metadata(actor) or {}),
+                )
+                # Existing actor is already ready
+                resource_pool.mark_ready(actor_name)
             # NOTE: Do NOT reinit weights here for existing actors.
             # Session swapping + reinit happens inside MegatronWorkerGroup._ensure_session_loaded()
             # to avoid clobbering active sessions during create_model.
@@ -8385,7 +8642,19 @@ def get_or_create_megatron_worker_group(
         # make ensure_gpus_available() block forever even though nothing is actually running.
         pg_name = _make_megatron_pg_name(base_model)
         try:
-            orphan_pg = ray.util.get_placement_group(pg_name)
+            with start_as_current_span_from_traceparent(
+                "training.create_model.megatron.orphan_pg_probe",
+                traceparent=traceparent,
+                component="backend.megatron_distributed",
+                op="training.create_model.megatron.orphan_pg_probe",
+                request_id=request_id,
+                attributes={
+                    "actor_name": str(actor_name),
+                    "pg_name": str(pg_name),
+                    "base_model": str(base_model),
+                },
+            ):
+                orphan_pg = ray.util.get_placement_group(pg_name)
         except ValueError:
             orphan_pg = None
         except Exception as e:
@@ -8398,21 +8667,62 @@ def get_or_create_megatron_worker_group(
             # SIGTERM the in-flight Megatron workers (Ray reports: "placement group was removed").
             import time
 
-            for _ in range(30):
-                try:
-                    actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
-                    logger.info(
-                        f"Megatron actor appeared after PG probe; reusing actor={actor_name} pg={pg_name}"
-                    )
-                    return actor
-                except ValueError:
-                    time.sleep(1)
+            guard_start = time.perf_counter()
+            guard_attempts = 0
+            guard_max_attempts = 30
+            guard_sleep_s = 1.0
+            with start_as_current_span_from_traceparent(
+                "training.create_model.megatron.orphan_pg_race_guard",
+                traceparent=traceparent,
+                component="backend.megatron_distributed",
+                op="training.create_model.megatron.orphan_pg_race_guard",
+                request_id=request_id,
+                attributes={
+                    "actor_name": str(actor_name),
+                    "pg_name": str(pg_name),
+                    "base_model": str(base_model),
+                    "max_attempts": int(guard_max_attempts),
+                    "sleep_s": float(guard_sleep_s),
+                },
+            ) as guard_span:
+                for attempt in range(guard_max_attempts):
+                    guard_attempts = attempt + 1
+                    try:
+                        actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
+                        logger.info(
+                            f"Megatron actor appeared after PG probe; reusing actor={actor_name} pg={pg_name}"
+                        )
+                        if guard_span is not None:
+                            guard_span.set_attribute("resolved_without_pg_remove", True)
+                            guard_span.set_attribute("attempts", int(guard_attempts))
+                            guard_span.set_attribute(
+                                "elapsed_s", float(time.perf_counter() - guard_start)
+                            )
+                        return actor
+                    except ValueError:
+                        time.sleep(guard_sleep_s)
+                if guard_span is not None:
+                    guard_span.set_attribute("resolved_without_pg_remove", False)
+                    guard_span.set_attribute("attempts", int(guard_attempts))
+                    guard_span.set_attribute("elapsed_s", float(time.perf_counter() - guard_start))
 
             logger.warning(
                 f"Found orphan Megatron placement group without actor; removing to unblock recreate: {pg_name}"
             )
             try:
-                ray.util.remove_placement_group(orphan_pg)
+                with start_as_current_span_from_traceparent(
+                    "training.create_model.megatron.orphan_pg_remove",
+                    traceparent=traceparent,
+                    component="backend.megatron_distributed",
+                    op="training.create_model.megatron.orphan_pg_remove",
+                    request_id=request_id,
+                    attributes={
+                        "actor_name": str(actor_name),
+                        "pg_name": str(pg_name),
+                        "base_model": str(base_model),
+                    },
+                ):
+                    ray.util.remove_placement_group(orphan_pg)
             except Exception as e:
                 raise RuntimeError(f"Failed to remove orphan placement group {pg_name!r}: {e}") from e
 
@@ -8440,11 +8750,36 @@ def get_or_create_megatron_worker_group(
             # For large, full-cluster Megatron jobs, allow preempting idle protected actors
             # (e.g., inference "always-on" actors) to avoid deadlocking on a fixed-size cluster.
             allow_evict_protected = os.environ.get("MINT_MEGATRON_EVICT_PROTECTED", "0") == "1"
-            resource_pool.ensure_gpus_available(num_gpus, allow_evict_protected=allow_evict_protected)
+            with start_as_current_span_from_traceparent(
+                "training.create_model.megatron.ensure_gpus_available",
+                traceparent=traceparent,
+                component="backend.megatron_distributed",
+                op="training.create_model.megatron.ensure_gpus_available",
+                request_id=request_id,
+                attributes={
+                    "actor_name": str(actor_name),
+                    "base_model": str(base_model),
+                    "world_size": int(num_gpus),
+                    "allow_evict_protected": bool(allow_evict_protected),
+                },
+            ):
+                resource_pool.ensure_gpus_available(num_gpus, allow_evict_protected=allow_evict_protected)
 
         # Reserve GPUs to prevent race conditions with concurrent requests
         # This must be done AFTER ensure_gpus_available and BEFORE actor creation
-        resource_pool.reserve_gpus(num_gpus)
+        with start_as_current_span_from_traceparent(
+            "training.create_model.megatron.reserve_gpus",
+            traceparent=traceparent,
+            component="backend.megatron_distributed",
+            op="training.create_model.megatron.reserve_gpus",
+            request_id=request_id,
+            attributes={
+                "actor_name": str(actor_name),
+                "base_model": str(base_model),
+                "world_size": int(num_gpus),
+            },
+        ):
+            resource_pool.reserve_gpus(num_gpus)
 
         try:
             from ..config import actor_runtime_env_vars, otel_env_vars
@@ -8523,43 +8858,77 @@ def get_or_create_megatron_worker_group(
                 runtime_env["env_vars"]["MINT_MEGATRON_MODEL_NODE_IPS_JSON"] = megatron_node_pin_json
 
             # Create detached Ray actor with per-model name
-            try:
-                actor = MegatronWorkerGroup.options(
-                    name=actor_name,
-                    namespace=PERSISTENT_NAMESPACE,
-                    lifetime="detached",
-                    runtime_env=runtime_env,
-                ).remote(
-                    base_model=base_model,
-                    lora_rank=lora_rank,
-                    learning_rate=learning_rate,
-                    distributed_config=config,
-                    observability_base_model=observability_model,
-                )
-            except Exception as e:
-                msg = str(e)
-                if actor_name in msg and "already exists" in msg:
-                    logger.warning(
-                        f"Megatron actor create raced (already exists): {actor_name}; reusing existing actor"
+            with start_as_current_span_from_traceparent(
+                "training.create_model.megatron.actor_create",
+                traceparent=traceparent,
+                component="backend.megatron_distributed",
+                op="training.create_model.megatron.actor_create",
+                request_id=request_id,
+                attributes={
+                    "actor_name": str(actor_name),
+                    "base_model": str(base_model),
+                    "world_size": int(num_gpus),
+                    "session_id": str(session_id) if session_id is not None else None,
+                    "is_persistent": bool(is_persistent),
+                },
+            ) as create_span:
+                try:
+                    actor = MegatronWorkerGroup.options(
+                        name=actor_name,
+                        namespace=PERSISTENT_NAMESPACE,
+                        lifetime="detached",
+                        runtime_env=runtime_env,
+                    ).remote(
+                        base_model=base_model,
+                        lora_rank=lora_rank,
+                        learning_rate=learning_rate,
+                        distributed_config=config,
+                        observability_base_model=observability_model,
+                        traceparent=traceparent,
+                        request_id=request_id,
                     )
-                    actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
-                else:
-                    raise
+                    if create_span is not None:
+                        create_span.set_attribute("create_raced_existing_actor", False)
+                except Exception as e:
+                    msg = str(e)
+                    if actor_name in msg and "already exists" in msg:
+                        logger.warning(
+                            f"Megatron actor create raced (already exists): {actor_name}; reusing existing actor"
+                        )
+                        actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
+                        if create_span is not None:
+                            create_span.set_attribute("create_raced_existing_actor", True)
+                    else:
+                        raise
 
-            # Register immediately (creating=True) to account for GPU usage and prevent eviction.
-            # Actor readiness is awaited in VerlTrainingEngine.create_training_session, which also
-            # marks the entry ready (creating=False) after __ray_ready__ completes.
-            resource_pool.register(
-                actor_name=actor_name,
-                actor_type=ActorType.MEGATRON,
-                num_gpus=num_gpus,
-                actor_handle=actor,
-                namespace=PERSISTENT_NAMESPACE,
-                base_model=observability_model,
-                session_id=session_id,
-                protected=is_persistent,
-                metadata=dict(actor_observability_metadata(actor) or {}),
-            )
+            with start_as_current_span_from_traceparent(
+                "training.create_model.megatron.register_new_actor",
+                traceparent=traceparent,
+                component="backend.megatron_distributed",
+                op="training.create_model.megatron.register_new_actor",
+                request_id=request_id,
+                attributes={
+                    "actor_name": str(actor_name),
+                    "base_model": str(base_model),
+                    "world_size": int(num_gpus),
+                    "session_id": str(session_id) if session_id is not None else None,
+                    "is_persistent": bool(is_persistent),
+                },
+            ):
+                # Register immediately (creating=True) to account for GPU usage and prevent eviction.
+                # Actor readiness is awaited in VerlTrainingEngine.create_training_session, which also
+                # marks the entry ready (creating=False) after __ray_ready__ completes.
+                resource_pool.register(
+                    actor_name=actor_name,
+                    actor_type=ActorType.MEGATRON,
+                    num_gpus=num_gpus,
+                    actor_handle=actor,
+                    namespace=PERSISTENT_NAMESPACE,
+                    base_model=observability_model,
+                    session_id=session_id,
+                    protected=is_persistent,
+                    metadata=dict(actor_observability_metadata(actor) or {}),
+                )
             return actor
         finally:
             # Release pending GPU reservation (GPUs now tracked by registered actor or freed on failure)
@@ -8573,6 +8942,8 @@ async def async_get_or_create_megatron_worker_group(
     distributed_config: DistributedConfig | None = None,
     session_id: str | None = None,
     observability_base_model: str | None = None,
+    traceparent: str | None = None,
+    request_id: str | None = None,
 ) -> ray.actor.ActorHandle:
     """Async version of get_or_create_megatron_worker_group.
 
@@ -8591,6 +8962,9 @@ async def async_get_or_create_megatron_worker_group(
     """
     import asyncio
 
+    traceparent = traceparent or get_current_traceparent()
+    request_id = request_id or get_request_id()
+
     return await asyncio.to_thread(
         get_or_create_megatron_worker_group,
         base_model,
@@ -8599,6 +8973,8 @@ async def async_get_or_create_megatron_worker_group(
         distributed_config,
         session_id,
         observability_base_model,
+        traceparent,
+        request_id,
     )
 
 
