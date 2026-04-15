@@ -610,6 +610,58 @@ async def test_issue_360_api_work_queue_request_helpers_use_async_actor(monkeypa
 
 
 @pytest.mark.anyio
+async def test_issue_360_api_work_queue_describe_pending_request_falls_back_for_old_actor(monkeypatch):
+    import importlib
+
+    _install_minimal_ray_module(monkeypatch)
+    wq = importlib.import_module("tinker_server.backend.api_work_queue")
+    client = wq.ApiWorkQueueClient()
+    calls: list[tuple[str, object]] = []
+
+    class _MissingDescribe:
+        def __getattr__(self, name: str):
+            if name == "remote":
+                raise AttributeError(name)
+            raise AttributeError(name)
+
+    class _FindPositionHandle:
+        def remote(self, *, request_id: str):
+            calls.append(("find_position.remote", request_id))
+            return object()
+
+    class _EtaHandle:
+        def remote(self, op: str | None):
+            calls.append(("get_eta_state.remote", op))
+            return object()
+
+    class _OldActor:
+        describe_pending_request = _MissingDescribe()
+        find_position = _FindPositionHandle()
+        get_eta_state = _EtaHandle()
+
+    async def _fake_get_async(*, require_ready: bool = True):
+        calls.append(("_get_ray_actor_async", require_ready))
+        return _OldActor()
+
+    async def _fake_await(_ref, *, timeout_s=None):
+        calls.append(("_await_ray_ref", timeout_s))
+        idx = len([item for item in calls if item[0] == "_await_ray_ref"])
+        if idx == 1:
+            return {"found": True, "position": 2, "depth": 5}
+        return {"ema_exec_s": 4.0}
+
+    monkeypatch.setattr(client, "_get_ray_actor_async", _fake_get_async)
+    monkeypatch.setattr(client, "_await_ray_ref", _fake_await)
+
+    pending = await client.describe_pending_request("rid-old", "sampling.asample")
+
+    assert pending == {"found": True, "position": 2, "depth": 5, "ema_exec_s": 4.0}
+    assert ("_get_ray_actor_async", False) in calls
+    assert ("find_position.remote", "rid-old") in calls
+    assert ("get_eta_state.remote", "sampling.asample") in calls
+
+
+@pytest.mark.anyio
 async def test_issue_360_api_work_queue_stats_omits_unready_scheduler_metrics(monkeypatch):
     import importlib
 

@@ -2164,11 +2164,29 @@ class ApiWorkQueueClient:
 
     async def describe_pending_request(self, request_id: str, op: str | None) -> dict[str, Any]:
         actor = await self._get_ray_actor_async(require_ready=False)
-        ref = actor.describe_pending_request.remote(str(request_id), None if op is None else str(op))
-        result = await self._await_ray_ref(ref, timeout_s=5.0)
-        if not isinstance(result, dict):
-            raise TypeError(f"ApiWorkQueue.describe_pending_request returned non-dict: {type(result)}")
-        return result
+        rid = str(request_id)
+        op_key = None if op is None else str(op)
+        try:
+            ref = actor.describe_pending_request.remote(rid, op_key)
+            result = await self._await_ray_ref(ref, timeout_s=5.0)
+            if not isinstance(result, dict):
+                raise TypeError(f"ApiWorkQueue.describe_pending_request returned non-dict: {type(result)}")
+            return result
+        except AttributeError:
+            ref = actor.find_position.remote(request_id=rid)
+            result = await self._await_ray_ref(ref, timeout_s=5.0)
+            if not isinstance(result, dict):
+                raise TypeError(f"ApiWorkQueue.find_position returned non-dict: {type(result)}")
+            pos = result.get("position")
+            if pos is None or op_key is None:
+                result["ema_exec_s"] = None
+                return result
+            eta_ref = actor.get_eta_state.remote(op_key)
+            eta_state = await self._await_ray_ref(eta_ref, timeout_s=5.0)
+            if not isinstance(eta_state, dict):
+                raise TypeError(f"ApiWorkQueue.get_eta_state returned non-dict: {type(eta_state)}")
+            result["ema_exec_s"] = eta_state.get("ema_exec_s")
+            return result
 
     async def record_execution_time(self, op: str, duration_s: float) -> None:
         actor = await self._get_ray_actor_async()
