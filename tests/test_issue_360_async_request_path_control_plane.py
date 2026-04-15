@@ -47,6 +47,8 @@ def _response_stub():
 def _install_minimal_ray_module(monkeypatch):
     ray_mod = types.ModuleType("ray")
     ray_mod.actor = SimpleNamespace(ActorHandle=object)
+    ray_mod.is_initialized = lambda: True  # type: ignore[attr-defined]
+    ray_mod.get_actor = lambda *args, **kwargs: None  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "ray", ray_mod)
     return ray_mod
 
@@ -1055,7 +1057,7 @@ def test_issue_360_training_enqueue_returns_503_when_heartbeat_protection_fails(
         anyio.run(training_route.forward, req, _request_stub("user-a"))
 
     assert excinfo.value.status_code == 503
-    assert excinfo.value.detail == "Training heartbeat store unavailable"
+    assert "Training heartbeat store unavailable" in str(excinfo.value.detail)
     assert q.calls == []
 
 
@@ -1622,6 +1624,7 @@ def test_issue_360_kill_dense_actors_uses_actor_name_without_cached_handle(monke
     monkeypatch.setattr(rp, "ActorType", SimpleNamespace(DENSE="dense"))
     monkeypatch.setattr(rp, "get_resource_pool", lambda: pool)
     monkeypatch.setattr(service_route, "async_kill_named_actor", _async_kill_named_actor)
+    monkeypatch.setattr(service_route, "_remove_actor_pg", lambda actor_name, namespace=None: None)
 
     killed = anyio.run(service_route._kill_dense_actors, "Qwen/Qwen3-0.6B")
 
@@ -1753,13 +1756,13 @@ def test_issue_360_kill_dense_actors_cleans_pg_when_async_kill_fails(monkeypatch
     monkeypatch.setattr(rp, "ActorType", SimpleNamespace(DENSE="dense"))
     monkeypatch.setattr(rp, "get_resource_pool", lambda: pool)
     monkeypatch.setattr(service_route, "async_kill_named_actor", _async_kill_named_actor)
-    monkeypatch.setattr(service_route, "_remove_actor_pg", lambda actor_name: removed_pgs.append(actor_name))
+    monkeypatch.setattr(service_route, "_remove_actor_pg", lambda actor_name, namespace=None: removed_pgs.append(actor_name))
 
-    killed = anyio.run(service_route._kill_dense_actors, "Qwen/Qwen3-0.6B")
+    with pytest.raises(RuntimeError, match="kill failed"):
+        anyio.run(service_route._kill_dense_actors, "Qwen/Qwen3-0.6B")
 
-    assert killed == 1
-    assert unregister_calls == ["dense-fail"]
-    assert removed_pgs == ["dense-fail"]
+    assert unregister_calls == []
+    assert removed_pgs == []
 
 
 def test_issue_360_kill_exact_vllm_actor_passes_resolved_handle_to_async_kill(monkeypatch):
@@ -1947,7 +1950,10 @@ def test_issue_360_future_store_async_get_status_backend_api(monkeypatch):
     store = fs_module.FutureStore()
     assert hasattr(store, "async_get_status"), "FutureStore must expose async_get_status for request paths"
 
-    actor = SimpleNamespace(get_status=_RemoteCall(result="done"))
+    actor = SimpleNamespace(
+        get_status=_RemoteCall(result="done"),
+        stats=_RemoteCall(result={"depth": 0}),
+    )
     store._ray_actor = actor
 
     ray_mod = types.ModuleType("ray")

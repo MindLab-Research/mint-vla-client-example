@@ -27,7 +27,8 @@ import re
 import time
 import uuid
 from datetime import datetime
-from typing import TYPE_CHECKING, Any
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, cast
 
 from fastapi import APIRouter, HTTPException, Request
 
@@ -693,6 +694,70 @@ def _compute_token_stats(data: list[Datum]) -> tuple[int, int]:
         if seq_len > max_seq_len:
             max_seq_len = seq_len
     return total_tokens, max_seq_len
+
+
+def _validate_training_batch_has_explicit_loss_masks_or_422(data: list[Datum]) -> None:
+    for item_index, datum in enumerate(data):
+        loss_fn_inputs = datum.loss_fn_inputs or {}
+        if any(key in loss_fn_inputs for key in ("loss_mask", "mask", "weights")):
+            continue
+        raise HTTPException(status_code=422, detail=f"Item {item_index} missing loss_mask/mask/weights")
+
+
+def _field(obj: Any, key: str, default=None):
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+async def _get_training_route_session_info(model_id: str) -> dict[str, Any] | None:
+    try:
+        from ..backend.training_session_store import async_get_training_session_info
+
+        info = await async_get_training_session_info(model_id)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail="Training session store unavailable") from e
+    return info if isinstance(info, dict) else None
+
+
+def _session_view_from_info(model_id: str, info: dict[str, Any]) -> Any:
+    return SimpleNamespace(
+        model_id=str(info.get("model_id") or model_id),
+        session_id=str(info.get("session_id") or ""),
+        base_model=str(info.get("base_model") or ""),
+        backend=str(info.get("backend") or "peft"),
+        user_id=info.get("user_id"),
+        lora_config=None,
+    )
+
+
+async def _resolve_training_route_session(model_id: str) -> tuple[Any | None, dict[str, Any] | None]:
+    session = None
+    if training_manager is not None:
+        session = training_manager.get_session(model_id)
+        if session is None:
+            session = await _restore_training_session(model_id)
+        if session is not None:
+            return session, None
+
+    info = await _get_training_route_session_info(model_id)
+    if isinstance(info, dict):
+        return _session_view_from_info(model_id, info), info
+    return None, None
+
+
+async def _protect_training_session_enqueue_window(session_info: dict[str, Any] | None) -> None:
+    if not isinstance(session_info, dict):
+        return
+    session_id = str(session_info.get("session_id") or "").strip()
+    if not session_id:
+        return
+    try:
+        from ..backend.session_heartbeat_store import session_heartbeat_store
+
+        await session_heartbeat_store.async_update(session_id=session_id, now=time.time())
+    except Exception as e:
+        raise HTTPException(status_code=503, detail="Training heartbeat store unavailable") from e
 
 
 def _normalize_megatron_scheduler_domain_key(base_model: str) -> str:
@@ -1674,11 +1739,7 @@ async def forward_backward(
 
     _validate_training_batch_has_explicit_loss_masks_or_422(request.forward_backward_input.data)
 
-    session = None
-    if training_manager is not None:
-        session = training_manager.get_session(request.model_id)
-        if session is None:
-            session = await _restore_training_session(request.model_id)
+    session, route_session_info = await _resolve_training_route_session(request.model_id)
 
     if session is None:
         remote = await async_remote_training_model(request.model_id)
@@ -1716,7 +1777,8 @@ async def forward_backward(
             )
 
     if training_engine is None or training_manager is None:
-        raise HTTPException(status_code=503, detail="Training engine not initialized")
+        if route_session_info is None:
+            raise HTTPException(status_code=503, detail="Training engine not initialized")
 
     if session is None:
         raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
@@ -1759,7 +1821,8 @@ async def forward_backward(
     created = False
     inflight_marked = False
     try:
-        training_manager.mark_inflight(request.model_id, +1)
+        await _protect_training_session_enqueue_window(route_session_info)
+        _mark_training_inflight(request.model_id, +1)
         inflight_marked = True
         scheduler_extra = _build_training_scheduler_extra(
             session=session,
@@ -1914,11 +1977,7 @@ async def train_step(
 
     _validate_training_batch_has_explicit_loss_masks_or_422(request.forward_backward_input.data)
 
-    session = None
-    if training_manager is not None:
-        session = training_manager.get_session(request.model_id)
-        if session is None:
-            session = await _restore_training_session(request.model_id)
+    session, route_session_info = await _resolve_training_route_session(request.model_id)
 
     if session is None:
         remote = await async_remote_training_model(request.model_id)
@@ -1958,7 +2017,8 @@ async def train_step(
             )
 
     if training_engine is None or training_manager is None:
-        raise HTTPException(status_code=503, detail="Training engine not initialized")
+        if route_session_info is None:
+            raise HTTPException(status_code=503, detail="Training engine not initialized")
 
     if session is None:
         raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
@@ -1996,7 +2056,8 @@ async def train_step(
     created = False
     inflight_marked = False
     try:
-        training_manager.mark_inflight(request.model_id, +1)
+        await _protect_training_session_enqueue_window(route_session_info)
+        _mark_training_inflight(request.model_id, +1)
         inflight_marked = True
         scheduler_extra = _build_training_scheduler_extra(
             session=session,
@@ -2140,11 +2201,7 @@ async def forward(
         upstream_for_alias,
     )
 
-    session = None
-    if training_manager is not None:
-        session = training_manager.get_session(request.model_id)
-        if session is None:
-            session = await _restore_training_session(request.model_id)
+    session, route_session_info = await _resolve_training_route_session(request.model_id)
 
     if session is None:
         remote = await async_remote_training_model(request.model_id)
@@ -2184,7 +2241,8 @@ async def forward(
             )
 
     if training_engine is None or training_manager is None:
-        raise HTTPException(status_code=503, detail="Training engine not initialized")
+        if route_session_info is None:
+            raise HTTPException(status_code=503, detail="Training engine not initialized")
 
     if session is None:
         raise HTTPException(
@@ -2224,7 +2282,8 @@ async def forward(
     created = False
     inflight_marked = False
     try:
-        training_manager.mark_inflight(request.model_id, +1)
+        await _protect_training_session_enqueue_window(route_session_info)
+        _mark_training_inflight(request.model_id, +1)
         inflight_marked = True
         scheduler_extra = _build_training_scheduler_extra(
             session=session,
@@ -2360,18 +2419,14 @@ async def optim_step(
         upstream_for_alias,
     )
 
-    session = None
-    if training_manager is not None:
-        session = training_manager.get_session(request.model_id)
-        if session is None:
-            restore_start_s = time.perf_counter()
-            session = await _restore_training_session(request.model_id)
-            logger.info(
-                "[optim_step route] model_id=%s stage=restore_session elapsed_ms=%.3f restored=%s",
-                str(request.model_id),
-                (time.perf_counter() - restore_start_s) * 1000.0,
-                bool(session is not None),
-            )
+    session, route_session_info = await _resolve_training_route_session(request.model_id)
+    if training_manager is not None and route_session_info is None and session is not None:
+        logger.info(
+            "[optim_step route] model_id=%s stage=restore_session elapsed_ms=%.3f restored=%s",
+            str(request.model_id),
+            0.0,
+            True,
+        )
 
     if session is None:
         remote = await async_remote_training_model(request.model_id)
@@ -2410,7 +2465,8 @@ async def optim_step(
             )
 
     if training_engine is None or training_manager is None:
-        raise HTTPException(status_code=503, detail="Training engine not initialized")
+        if route_session_info is None:
+            raise HTTPException(status_code=503, detail="Training engine not initialized")
 
     if session is None:
         raise HTTPException(
@@ -2446,7 +2502,8 @@ async def optim_step(
     created = False
     inflight_marked = False
     try:
-        training_manager.mark_inflight(request.model_id, +1)
+        await _protect_training_session_enqueue_window(route_session_info)
+        _mark_training_inflight(request.model_id, +1)
         inflight_marked = True
         scheduler_extra = _build_training_scheduler_extra(
             session=session,
@@ -2683,11 +2740,7 @@ async def save_weights_for_sampler(
         upstream_for_alias,
     )
 
-    session = None
-    if training_manager is not None:
-        session = training_manager.get_session(request.model_id)
-        if session is None:
-            session = await _restore_training_session(request.model_id)
+    session, route_session_info = await _resolve_training_route_session(request.model_id)
 
     if session is None:
         remote = await async_remote_training_model(request.model_id)
@@ -2731,7 +2784,8 @@ async def save_weights_for_sampler(
             )
 
     if training_engine is None or training_manager is None:
-        raise HTTPException(status_code=503, detail="Training engine not initialized")
+        if route_session_info is None:
+            raise HTTPException(status_code=503, detail="Training engine not initialized")
 
     if session is None:
         raise HTTPException(
@@ -2762,7 +2816,8 @@ async def save_weights_for_sampler(
     created = False
     inflight_marked = False
     try:
-        training_manager.mark_inflight(request.model_id, +1)
+        await _protect_training_session_enqueue_window(route_session_info)
+        _mark_training_inflight(request.model_id, +1)
         inflight_marked = True
         scheduler_extra = _build_training_scheduler_extra(
             session=session,
@@ -2982,8 +3037,6 @@ async def _do_save_weights_for_sampler(
             # Matches Tinker SDK semantics where each save creates isolated snapshot.
             if inference_manager is None:
                 raise RuntimeError("Inference manager not initialized")
-
-            import time
 
             sampling_session_id = str(uuid.uuid4())
             lora_rank = session.lora_config.rank if session.lora_config else 32
