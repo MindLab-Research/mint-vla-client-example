@@ -77,6 +77,7 @@ from ..models.types import (
     ForwardRequest,
     GetInfoRequest,
     GetInfoResponse,
+    LoRAConfig,
     ModelData,
     OptimStepRequest,
     ResetExpertBiasRequest,
@@ -842,6 +843,18 @@ def _validate_rollout_correction_config_or_400(
             status_code=400,
             detail=f"Invalid rollout_correction_config for verl: {type(e).__name__}: {e}",
         )
+
+
+def _field(source: Any, key: str, default=None):
+    if isinstance(source, dict):
+        return source.get(key, default)
+    return getattr(source, key, default)
+
+
+def _validate_training_batch_has_explicit_loss_masks_or_422(data: list[Any]) -> None:
+    for i, item in enumerate(data):
+        if _field(item, "weights", None) is None:
+            raise HTTPException(status_code=422, detail=f"data[{i}].weights is required")
 
 
 def _build_training_scheduler_extra(

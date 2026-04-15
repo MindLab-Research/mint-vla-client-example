@@ -9,6 +9,7 @@ from fastapi import APIRouter, HTTPException, Request
 from ..auth_identity import can_bypass_ownership
 from ..auth_identity import get_user_data as _request_user_data
 from ..auth_identity import get_user_id as _request_user_id
+from ..auth_identity import is_admin_request
 from ..backend.future_store import future_store
 from ..backend.mintx_ops import interpolate_checkpoints_to_dir
 from ..checkpoints import (
