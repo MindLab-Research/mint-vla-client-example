@@ -25,25 +25,19 @@ logger = logging.getLogger(__name__)
 
 
 def _retrieve_grace_s() -> float:
-    v = (
-        os.environ.get("MINT_RETRIEVE_FUTURE_GRACE_S")
-        or os.environ.get("TINKER_RETRIEVE_FUTURE_GRACE_S")
-        or "120"
-    ).strip()
+    from ..config import config as server_config
+
     try:
-        return max(0.0, float(v))
+        return max(0.0, float(server_config.retrieve_future_grace_s))
     except Exception:
         return 120.0
 
 
 def _retrieve_pending_min_poll_s() -> float:
-    v = (
-        os.environ.get("MINT_RETRIEVE_FUTURE_MIN_POLL_S")
-        or os.environ.get("TINKER_RETRIEVE_FUTURE_MIN_POLL_S")
-        or "1.0"
-    ).strip()
+    from ..config import config as server_config
+
     try:
-        return max(0.0, float(v))
+        return max(0.0, float(server_config.retrieve_future_min_poll_s))
     except Exception:
         return 1.0
 
@@ -408,9 +402,9 @@ async def retrieve_future(
                     from ..backend.resource_pool import get_resource_pool
 
                     rp = get_resource_pool()
-                    rp.touch(actor_name)
+                    await rp.async_touch(actor_name)
                     if tracked_session_id:
-                        rp.set_session(actor_name, tracked_session_id)
+                        await rp.async_set_session(actor_name, tracked_session_id)
                 except Exception:
                     pass
 
@@ -501,14 +495,16 @@ async def retrieve_future(
         from ..backend.api_work_queue import ApiWorkQueueUnavailableError, api_work_queue
 
         pos = None
-        try:
-            pos = await api_work_queue.find_position(body.request_id)
-        except ApiWorkQueueUnavailableError as e:
-            if status_field == "queued" and queue_kind != "scheduled":
-                raise HTTPException(status_code=503, detail=f"ApiWorkQueue unavailable: {e}") from e
-        except Exception as e:
-            if status_field == "queued" and queue_kind != "scheduled":
-                raise HTTPException(status_code=503, detail=f"ApiWorkQueue position lookup failed: {type(e).__name__}: {e}") from e
+        eta_state = None
+        if status_field == "queued":
+            try:
+                pos = await api_work_queue.find_position(body.request_id)
+            except ApiWorkQueueUnavailableError as e:
+                if queue_kind != "scheduled":
+                    raise HTTPException(status_code=503, detail=f"ApiWorkQueue unavailable: {e}") from e
+            except Exception as e:
+                if queue_kind != "scheduled":
+                    raise HTTPException(status_code=503, detail=f"ApiWorkQueue position lookup failed: {type(e).__name__}: {e}") from e
 
         if isinstance(pos, dict):
             pos_queue_kind = pos.get("queue_kind")
@@ -573,15 +569,6 @@ async def retrieve_future(
 
         if queue_kind == "legacy" and isinstance(queue_depth_scheduled, int) and queue_depth_scheduled > 0:
             queue_position = None
-        if queue_state_reason is None and status_field == "queued":
-            if queue_kind == "scheduled":
-                queue_state_reason = "scheduled_queue"
-            elif queue_kind == "legacy" and isinstance(queue_depth_scheduled, int) and queue_depth_scheduled > 0:
-                queue_state_reason = "mixed_queue_arbitration"
-            elif isinstance(queue_depth, int) and queue_depth > 0:
-                queue_state_reason = "queue_backlog"
-            elif queue_position is None:
-                queue_state_reason = "queue_position_unknown"
         if status_field == "queued" and queue_position is not None:
             try:
                 from ..config import config as server_config
@@ -595,8 +582,20 @@ async def retrieve_future(
                     estimated_wait_s = (float(queue_position) + 1.0) * float(ema_exec_s) / float(worker_count)
             except ApiWorkQueueUnavailableError as e:
                 raise HTTPException(status_code=503, detail=f"ApiWorkQueue unavailable: {e}") from e
+            except HTTPException:
+                raise
             except Exception as e:
                 raise HTTPException(status_code=503, detail=f"ApiWorkQueue ETA lookup failed: {type(e).__name__}: {e}") from e
+
+        if queue_state_reason is None and status_field == "queued":
+            if queue_kind == "scheduled":
+                queue_state_reason = "scheduled_queue"
+            elif queue_kind == "legacy" and isinstance(queue_depth_scheduled, int) and queue_depth_scheduled > 0:
+                queue_state_reason = "mixed_queue_arbitration"
+            elif isinstance(queue_depth, int) and queue_depth > 0:
+                queue_state_reason = "queue_backlog"
+            elif queue_position is None:
+                queue_state_reason = "queue_position_unknown"
 
         progress_payload = None
         if isinstance(progress, dict):
@@ -698,7 +697,7 @@ async def retrieve_future(
             extra_headers["X-Queue-Tokens-Generated"] = str(int(progress_payload.get("tokens_generated", 0)))
             extra_headers["X-Queue-Max-Tokens"] = str(int(progress_payload.get("max_tokens", 0)))
 
-        # Tinker client expects HTTP 408 for pending
+        # Tinker client expects HTTP 408 for pending.
         _pending_hint_note_pending(body.request_id)
         pending = pending_future_http_response(
             retry_after_s=retry_after_s,

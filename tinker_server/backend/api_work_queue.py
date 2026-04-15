@@ -144,7 +144,7 @@ def _create_ray_actor(*, require_ready: bool = True):
             from collections import deque
 
             init_actor_observability()
-            logger.warning(
+            logger.info(
                 "[api_work_queue] actor (re)initializing (max_restarts=%d)",
                 max_restarts,
             )
@@ -1831,7 +1831,7 @@ class ApiWorkQueueClient:
 
         actor = None
         try:
-            actor = ray.get_actor(actor_name, namespace=_ray_namespace())
+            actor = await asyncio.to_thread(ray.get_actor, actor_name, namespace=_ray_namespace())
             if not require_ready:
                 self._ray_actor = actor
                 return actor
@@ -1843,7 +1843,7 @@ class ApiWorkQueueClient:
             logger.info("[api_work_queue] actor %s not found; creating", actor_name)
         except ray.exceptions.GetTimeoutError:
             if fail_fast_on_probe_timeout:
-                logger.warning(
+                logger.info(
                     "[api_work_queue] actor %s alive but unresponsive (probe_timeout_s=%.2f); failing fast",
                     actor_name,
                     probe_timeout_s,
@@ -1851,7 +1851,7 @@ class ApiWorkQueueClient:
                 raise ApiWorkQueueUnavailableError(
                     f"queue actor {actor_name} unresponsive (restarting?)"
                 )
-            logger.warning(
+            logger.info(
                 "[api_work_queue] actor %s probe timed out (probe_timeout_s=%.2f); reusing existing actor",
                 actor_name,
                 probe_timeout_s,
@@ -1860,7 +1860,7 @@ class ApiWorkQueueClient:
                 self._ray_actor = actor
                 return actor
         except (ray.exceptions.ActorDiedError, ray.exceptions.RayActorError) as e:
-            logger.warning(
+            logger.info(
                 "[api_work_queue] actor %s dead (%s: %s); Ray auto-restart will recover",
                 actor_name,
                 type(e).__name__,
@@ -1870,7 +1870,7 @@ class ApiWorkQueueClient:
                 f"queue actor {actor_name} restarting ({type(e).__name__})"
             ) from e
         except Exception as e:
-            logger.warning(
+            logger.info(
                 "[api_work_queue] failed to fetch detached actor %s (%s: %s); creating",
                 actor_name,
                 type(e).__name__,
@@ -2144,7 +2144,7 @@ class ApiWorkQueueClient:
         )
 
     async def find_position(self, request_id: str) -> dict[str, Any]:
-        actor = self._get_cached_ray_actor_for_async_request_path()
+        actor = await self._get_ray_actor_async(require_ready=False)
         ref = actor.find_position.remote(request_id=str(request_id))
         result = await self._await_ray_ref(ref, timeout_s=5.0)
         if not isinstance(result, dict):
@@ -2157,7 +2157,7 @@ class ApiWorkQueueClient:
         await self._await_ray_ref(ref, timeout_s=5.0)
 
     async def get_eta_state(self, op: str | None) -> dict[str, Any]:
-        actor = self._get_cached_ray_actor_for_async_request_path()
+        actor = await self._get_ray_actor_async(require_ready=False)
         ref = actor.get_eta_state.remote(None if op is None else str(op))
         result = await self._await_ray_ref(ref, timeout_s=5.0)
         if not isinstance(result, dict):
