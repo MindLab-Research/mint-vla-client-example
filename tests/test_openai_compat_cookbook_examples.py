@@ -7,8 +7,10 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
 from openai import AsyncOpenAI
+from types import SimpleNamespace
 
 from tinker_server.models.types import SampledSequence
+from tinker_server.routes import futures as futures_route
 from tinker_server.routes import openai_compat
 from tinker_server.routes import sampling as sampling_route
 from tinker_server.routes import service as service_route
@@ -246,6 +248,267 @@ def test_cookbook_openai_chat_completions_example_shape(monkeypatch):
     assert seen["model_path"] == "tinker://exp/sampler_weights/000081"
     assert tokenizer.chat_calls == [[{"role": "user", "content": "What is 2+2?"}]]
     assert tokenizer.chat_tools == [None]
+
+
+def test_openai_completions_falls_back_to_service_session_manager(monkeypatch):
+    _reset_openai_compat_state(monkeypatch)
+    tokenizer = _DummyTokenizer()
+
+    class _Engine:
+        async def generate(self, **_kwargs):
+            return SimpleNamespace(
+                token_ids=[41, 42],
+                logprobs=None,
+                routed_experts=None,
+                stop_reason="eos",
+            )
+
+    class _Manager:
+        def __init__(self):
+            self.engine = _Engine()
+            self.inflight: list[tuple[str, int]] = []
+
+        def get_sampling_session_snapshot(self, session_id: str):
+            return SimpleNamespace(
+                session_id=session_id,
+                uses_multi_lora=False,
+                uses_base_model=True,
+                base_model="Qwen/Qwen3-4B-Instruct-2507",
+                lora_rank=0,
+                adapter_path=None,
+                lora_loaded=False,
+                lora_int_id=None,
+                metadata_version=1,
+            )
+
+        def mark_session_inflight(self, session_id: str, delta: int) -> None:
+            self.inflight.append((session_id, int(delta)))
+
+        def is_multi_lora_session(self, _session_id: str) -> bool:
+            return False
+
+        def get_engine(self, _session_id: str):
+            return self.engine
+
+        def get_session_base_model(self, _session_id: str) -> str:
+            return "Qwen/Qwen3-4B-Instruct-2507"
+
+    async def _fake_get_tokenizer(_base_model: str):
+        return tokenizer
+
+    async def _fake_create_sampling_session(_request, _http_request):
+        return SimpleNamespace(sampling_session_id="sample-local")
+
+    async def _fake_no_usage(**_kwargs):
+        return None
+
+    async def _fake_snapshot(_sid: str):
+        return None
+
+    manager = _Manager()
+
+    monkeypatch.setattr(openai_compat, "_get_tokenizer", _fake_get_tokenizer)
+    monkeypatch.setattr(openai_compat, "ensure_sampling_session", service_route.ensure_sampling_session)
+    monkeypatch.setattr(openai_compat, "sample_once", sampling_route.sample_once)
+    monkeypatch.setattr(service_route, "create_sampling_session", _fake_create_sampling_session)
+    monkeypatch.setattr(service_route, "session_manager", manager)
+    monkeypatch.setattr(sampling_route, "session_manager", None)
+    monkeypatch.setattr(sampling_route, "_async_get_detached_sampling_snapshot", _fake_snapshot)
+    monkeypatch.setattr(sampling_route, "_persist_usage_events", _fake_no_usage)
+    monkeypatch.setattr(sampling_route, "build_billing_auth_context", lambda *_a, **_k: None)
+
+    import tinker_server.gateway as gw
+
+    async def _fake_async_remote_sampling_session(_sid: str):
+        return None
+
+    monkeypatch.setattr(gw, "async_remote_sampling_session", _fake_async_remote_sampling_session)
+    monkeypatch.setattr(gw, "remote_sampling_session", lambda _sid: None)
+
+    client = TestClient(_build_app())
+    response = client.post(
+        "/oai/api/v1/completions",
+        json={
+            "model": "Qwen/Qwen3-4B-Instruct-2507",
+            "prompt": "Say hi",
+            "max_tokens": 8,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["choices"][0]["text"] == "41|42"
+    assert manager.inflight == [("sample-local", 1), ("sample-local", -1)]
+
+
+def test_openai_completions_uses_detached_queue_when_route_session_managers_unbound(monkeypatch):
+    _reset_openai_compat_state(monkeypatch)
+    tokenizer = _DummyTokenizer()
+    seen: dict[str, object] = {"polls": 0}
+
+    async def _fake_ensure_sampling_session(*, model_path: str, http_request: Request, parent_session_id=None):
+        seen["model_path"] = model_path
+        return "sample-queue", "Qwen/Qwen3-4B-Instruct-2507"
+
+    async def _fake_get_tokenizer(_base_model: str):
+        return tokenizer
+
+    async def _fake_snapshot(_sid: str):
+        return sampling_route.SamplingSessionSnapshot(
+            session_id="sample-queue",
+            uses_multi_lora=False,
+            uses_base_model=True,
+            base_model="Qwen/Qwen3-4B-Instruct-2507",
+            lora_rank=0,
+            adapter_path=None,
+            lora_loaded=False,
+            lora_int_id=None,
+            metadata_version=1,
+        )
+
+    async def _fake_asample(request, _http_request):
+        seen["queued_session_id"] = request.sampling_session_id
+        seen["queued_prompt"] = request.prompt.to_token_ids()
+        return SimpleNamespace(request_id="req-queue-1")
+
+    async def _fake_retrieve_future(body, _http_request, response):
+        seen["polls"] = int(seen["polls"]) + 1
+        if int(seen["polls"]) == 1:
+            response.status_code = 408
+            return {}
+        response.status_code = 200
+        return {
+            "sequences": [
+                {
+                    "tokens": [51, 52],
+                    "logprobs": None,
+                    "routed_experts": None,
+                    "stop_reason": "eos",
+                }
+            ],
+            "prompt_logprobs": None,
+            "topk_prompt_logprobs": None,
+        }
+
+    monkeypatch.setattr(openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session)
+    monkeypatch.setattr(openai_compat, "_get_tokenizer", _fake_get_tokenizer)
+    monkeypatch.setattr(openai_compat, "sample_once", sampling_route.sample_once)
+    monkeypatch.setattr(service_route, "session_manager", None)
+    monkeypatch.setattr(sampling_route, "session_manager", None)
+    monkeypatch.setattr(sampling_route, "_async_get_detached_sampling_snapshot", _fake_snapshot)
+    monkeypatch.setattr(sampling_route, "asample", _fake_asample)
+    monkeypatch.setattr(futures_route, "retrieve_future", _fake_retrieve_future)
+
+    import tinker_server.gateway as gw
+
+    async def _fake_async_remote_sampling_session(_sid: str):
+        return None
+
+    monkeypatch.setattr(gw, "async_remote_sampling_session", _fake_async_remote_sampling_session)
+    monkeypatch.setattr(gw, "remote_sampling_session", lambda _sid: None)
+
+    client = TestClient(_build_app())
+    response = client.post(
+        "/oai/api/v1/completions",
+        json={
+            "model": "Qwen/Qwen3-4B-Instruct-2507",
+            "prompt": "Say hi",
+            "max_tokens": 8,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["choices"][0]["text"] == "51|52"
+    assert seen["queued_session_id"] == "sample-queue"
+    assert seen["polls"] == 2
+
+
+def test_openai_chat_completions_uses_detached_queue_when_route_session_managers_unbound(monkeypatch):
+    _reset_openai_compat_state(monkeypatch)
+    tokenizer = _DummyTokenizer()
+    seen: dict[str, object] = {"polls": 0}
+
+    async def _fake_ensure_sampling_session(*, model_path: str, http_request: Request, parent_session_id=None):
+        seen["model_path"] = model_path
+        return "sample-chat-queue", "Qwen/Qwen3-4B-Instruct-2507"
+
+    async def _fake_get_tokenizer(_base_model: str):
+        return tokenizer
+
+    async def _fake_snapshot(_sid: str):
+        return sampling_route.SamplingSessionSnapshot(
+            session_id="sample-chat-queue",
+            uses_multi_lora=False,
+            uses_base_model=True,
+            base_model="Qwen/Qwen3-4B-Instruct-2507",
+            lora_rank=0,
+            adapter_path=None,
+            lora_loaded=False,
+            lora_int_id=None,
+            metadata_version=1,
+        )
+
+    async def _fake_asample(request, _http_request):
+        seen["queued_session_id"] = request.sampling_session_id
+        seen["queued_prompt"] = request.prompt.to_token_ids()
+        return SimpleNamespace(request_id="req-chat-queue-1")
+
+    async def _fake_retrieve_future(body, _http_request, response):
+        seen["last_request_id"] = body.request_id
+        seen["polls"] = int(seen["polls"]) + 1
+        if int(seen["polls"]) == 1:
+            response.status_code = 408
+            return {}
+        response.status_code = 200
+        return {
+            "sequences": [
+                {
+                    "tokens": [61, 62, 63],
+                    "logprobs": None,
+                    "routed_experts": None,
+                    "stop_reason": "length",
+                }
+            ],
+            "prompt_logprobs": None,
+            "topk_prompt_logprobs": None,
+        }
+
+    monkeypatch.setattr(openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session)
+    monkeypatch.setattr(openai_compat, "_get_tokenizer", _fake_get_tokenizer)
+    monkeypatch.setattr(openai_compat, "sample_once", sampling_route.sample_once)
+    monkeypatch.setattr(service_route, "session_manager", None)
+    monkeypatch.setattr(sampling_route, "session_manager", None)
+    monkeypatch.setattr(sampling_route, "_async_get_detached_sampling_snapshot", _fake_snapshot)
+    monkeypatch.setattr(sampling_route, "asample", _fake_asample)
+    monkeypatch.setattr(futures_route, "retrieve_future", _fake_retrieve_future)
+
+    import tinker_server.gateway as gw
+
+    async def _fake_async_remote_sampling_session(_sid: str):
+        return None
+
+    monkeypatch.setattr(gw, "async_remote_sampling_session", _fake_async_remote_sampling_session)
+    monkeypatch.setattr(gw, "remote_sampling_session", lambda _sid: None)
+
+    client = TestClient(_build_app())
+    response = client.post(
+        "/oai/api/v1/chat/completions",
+        json={
+            "model": "Qwen/Qwen3-4B-Instruct-2507",
+            "messages": [{"role": "user", "content": "Say hi"}],
+            "max_tokens": 8,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["choices"][0]["message"]["content"] == "61|62|63"
+    assert body["choices"][0]["finish_reason"] == "length"
+    assert seen["queued_session_id"] == "sample-chat-queue"
+    assert seen["last_request_id"] == "req-chat-queue-1"
+    assert seen["polls"] == 2
+    assert tokenizer.chat_calls == [[{"role": "user", "content": "Say hi"}]]
 
 
 def test_openai_chat_completions_accepts_tools_and_parses_tool_calls(monkeypatch):
