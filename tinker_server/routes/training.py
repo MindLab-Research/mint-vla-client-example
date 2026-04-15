@@ -32,9 +32,11 @@ from typing import TYPE_CHECKING, Any, cast
 
 from fastapi import APIRouter, HTTPException, Request
 
+from ..auth_identity import can_bypass_ownership_user_data
+from ..auth_identity import can_manage_system
+from ..auth_identity import can_write
 from ..auth_identity import get_user_data as _request_user_data
 from ..auth_identity import get_user_id as _request_user_id
-from ..auth_identity import is_admin_request, is_admin_user_data
 from ..backend.async_ray_control import async_lookup_actor_handle
 from ..gateway_auth import GatewayAuthContext, build_billing_auth_context
 from ..logging_context import (
@@ -75,7 +77,6 @@ from ..models.types import (
     ForwardRequest,
     GetInfoRequest,
     GetInfoResponse,
-    LoRAConfig,
     ModelData,
     OptimStepRequest,
     ResetExpertBiasRequest,
@@ -102,6 +103,11 @@ router = APIRouter()
 training_manager: TrainingSessionManager | None = None
 training_engine: VerlTrainingEngine | None = None
 inference_manager: SessionManager | None = None  # For ephemeral flow
+
+
+def _require_write_access(request: Request) -> None:
+    if not can_write(request):
+        raise HTTPException(status_code=403, detail="Write access required")
 
 
 def _mark_training_inflight(model_id: str, delta: int) -> None:
@@ -1022,6 +1028,7 @@ async def create_model(
     http_request: Request,
 ) -> UntypedAPIFuture:
     """Create a new training model with LoRA."""
+    _require_write_access(http_request)
     route_start_s = time.perf_counter()
     from ..supported_models_gate import enforce_base_model_allowed
 
@@ -1379,6 +1386,7 @@ async def create_model_from_state(
     Composes create_model + load_state into single operation.
     Useful for resuming training from a saved checkpoint.
     """
+    _require_write_access(http_request)
     route_start_s = time.perf_counter()
     from ..supported_models_gate import enforce_base_model_allowed
 
@@ -1414,7 +1422,7 @@ async def create_model_from_state(
         try:
             from ..checkpoints import validate_checkpoint_load_contract
 
-            local_path = _resolve_state_path(request.state_path, user_id=user_id, is_admin=is_admin_request(http_request))
+            local_path = _resolve_state_path(request.state_path, user_id=user_id, is_admin=can_manage_system(http_request))
             if os.path.isdir(local_path) and os.path.exists(os.path.join(local_path, "metadata.json")):
                 validate_checkpoint_load_contract(local_path, load_optimizer=True)
         except ValueError as e:
@@ -1435,7 +1443,7 @@ async def create_model_from_state(
         await _raise_if_local_model_id_exists(model_id)
         incoming_headers = dict(http_request.headers)
         if request.state_path.startswith(("tinker://", "mint://", "ckpt_")):
-            local_path = _resolve_state_path(request.state_path, user_id=user_id, is_admin=is_admin_request(http_request))
+            local_path = _resolve_state_path(request.state_path, user_id=user_id, is_admin=can_manage_system(http_request))
             if os.path.isdir(local_path):
                 proxy_timeout_s = float(os.environ.get("MINT_GATEWAY_CHECKPOINT_PROXY_TIMEOUT_S", "600"))
                 tmp_archive = build_gateway_proxy_archive_path()
@@ -1512,7 +1520,7 @@ async def create_model_from_state(
     resolved_state_path = _resolve_state_path(
         request.state_path,
         user_id=user_id,
-        is_admin=is_admin_request(http_request),
+        is_admin=can_manage_system(http_request),
     )
     if request.state_path.startswith(("tinker://", "mint://", "ckpt_")) and not os.path.isdir(resolved_state_path):
         raise HTTPException(status_code=404, detail=f"Checkpoint not found: {request.state_path}")
@@ -1729,6 +1737,7 @@ async def forward_backward(
     http_request: Request,
 ) -> UntypedAPIFuture:
     """Perform forward + backward pass on training data."""
+    _require_write_access(http_request)
     route_start_s = time.perf_counter()
     from ..gateway import (
         async_remote_training_model,
@@ -1967,6 +1976,7 @@ async def train_step(
     http_request: Request,
 ) -> UntypedAPIFuture:
     """Perform a combined forward_backward + optim_step."""
+    _require_write_access(http_request)
     route_start_s = time.perf_counter()
     from ..gateway import (
         async_remote_training_model,
@@ -2411,6 +2421,7 @@ async def optim_step(
     http_request: Request,
 ) -> UntypedAPIFuture:
     """Perform optimizer step to update weights."""
+    _require_write_access(http_request)
     route_start_s = time.perf_counter()
     from ..gateway import (
         async_remote_training_model,
@@ -2611,6 +2622,7 @@ async def reset_expert_bias(
 
     Call this before computing logprobs to ensure consistent routing with vLLM.
     """
+    _require_write_access(http_request)
     from ..gateway import async_remote_training_model, forward_json, upstream_for_alias
 
     session = None
@@ -2731,6 +2743,7 @@ async def save_weights_for_sampler(
     http_request: Request,
 ) -> UntypedAPIFuture:
     """Save model weights for inference use."""
+    _require_write_access(http_request)
     route_start_s = time.perf_counter()
     from ..gateway import (
         async_remote_training_model,
@@ -2826,7 +2839,7 @@ async def save_weights_for_sampler(
             seq_id=request.seq_id,
         )
         scheduler_extra["prefer_tinker"] = bool(prefer_tinker)
-        scheduler_extra["is_admin"] = is_admin_request(http_request)
+        scheduler_extra["is_admin"] = can_manage_system(http_request)
         await future_store.async_create_with_id(request_id)
         created = True
         await future_store.async_mark_queued(
@@ -3220,7 +3233,7 @@ def _owner_visible(request_user_data: dict | None, owner: str | None) -> bool:
     request_user_id = str(request_user_data.get("user_id")) if request_user_data and request_user_data.get("user_id") else None
     if request_user_id is None:
         return True
-    if is_admin_user_data(request_user_data):
+    if can_bypass_ownership_user_data(request_user_data):
         return True
     return bool(owner) and owner == request_user_id
 
@@ -3434,8 +3447,9 @@ async def list_models():
 
 
 @router.delete("/models/{model_id}")
-async def delete_model(model_id: str):
+async def delete_model(model_id: str, http_request: Request):
     """Delete a training model and release resources."""
+    _require_write_access(http_request)
     if training_engine is None or training_manager is None:
         raise HTTPException(status_code=503, detail="Training engine not initialized")
 

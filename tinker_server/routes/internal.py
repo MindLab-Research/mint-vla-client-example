@@ -18,9 +18,9 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
+from ..auth_identity import can_bypass_ownership
 from ..auth_identity import get_user_data as _request_user_data
 from ..auth_identity import get_user_id as _request_user_id
-from ..auth_identity import is_admin_request
 from ..checkpoints import _iter_metadata_paths, get_persistent_search_roots, get_resolution_roots
 from ..config import config as server_config
 from ..health_checks import deep_healthz_response
@@ -143,7 +143,7 @@ async def get_usage_logs(
     """
     # Get account_id from gateway forwarded auth headers
     account_id = _get_account_id(request)
-    if account_id is None and not is_admin_request(request):
+    if account_id is None and not can_bypass_ownership(request):
         raise HTTPException(status_code=403, detail="Access denied")
 
     # Parse 'since' timestamp if provided
@@ -178,9 +178,9 @@ async def get_usage_summary(account_id: str, request: Request):
         account_id: The account ID to get summary for
     """
     request_account_id = _get_account_id(request)
-    if not is_admin_request(request) and request_account_id is None:
+    if not can_bypass_ownership(request) and request_account_id is None:
         raise HTTPException(status_code=403, detail="Access denied")
-    if not is_admin_request(request) and account_id != request_account_id:
+    if not can_bypass_ownership(request) and account_id != request_account_id:
         raise HTTPException(status_code=403, detail="Access denied")
 
     usage_store = await get_usage_store()
@@ -1551,7 +1551,7 @@ async def list_checkpoints(request: Request):
     if user_id is None:
         raise HTTPException(status_code=401, detail="Authentication required")
 
-    checkpoints = _scan_checkpoints(user_id, is_admin=is_admin_request(request))
+    checkpoints = _scan_checkpoints(user_id, is_admin=can_bypass_ownership(request))
     return CheckpointsListResponse(checkpoints=checkpoints)
 
 
@@ -1570,14 +1570,14 @@ async def download_checkpoint(checkpoint_id: str, request: Request):
     resolved = _resolve_checkpoint_entry(
         checkpoint_id,
         user_id=user_id,
-        is_admin=is_admin_request(request),
+        is_admin=can_bypass_ownership(request),
     )
     if resolved is None:
         raise HTTPException(status_code=404, detail="Checkpoint not found")
 
     ckpt_path, metadata = resolved
 
-    if not is_admin_request(request) and metadata.get("owner_id") != user_id:
+    if not can_bypass_ownership(request) and metadata.get("owner_id") != user_id:
         raise HTTPException(status_code=403, detail="Access denied")
 
     def stream_tar_gz():

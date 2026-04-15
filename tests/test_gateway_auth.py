@@ -60,6 +60,39 @@ def test_extract_gateway_auth_context_accepts_optional_session_id():
     assert ctx.session_id == "sess-123"
 
 
+def test_extract_gateway_auth_context_defaults_write_true_when_header_omitted():
+    ctx = extract_gateway_auth_context_from_headers(
+        {
+            "X-MinT-User-Id": "aaaaaaaaaaaaaaaaaaaaaaaa",
+            "X-MinT-Apikey-Id": "bbbbbbbbbbbbbbbbbbbbbbbb",
+            "X-MinT-Request-Id": "req-123",
+            "X-MinT-Cap-View-Internal-Errors": "false",
+            "X-Internal-Token": "secret",
+        },
+        internal_api_token="secret",
+    )
+
+    assert ctx.caps_from_headers is True
+    assert ctx.cap_write is True
+
+
+def test_extract_gateway_auth_context_ignores_write_false_header():
+    ctx = extract_gateway_auth_context_from_headers(
+        {
+            "X-MinT-User-Id": "aaaaaaaaaaaaaaaaaaaaaaaa",
+            "X-MinT-Apikey-Id": "bbbbbbbbbbbbbbbbbbbbbbbb",
+            "X-MinT-Request-Id": "req-123",
+            "X-MinT-Cap-Write": "false",
+            "X-MinT-Cap-View-Internal-Errors": "false",
+            "X-Internal-Token": "secret",
+        },
+        internal_api_token="secret",
+    )
+
+    assert ctx.caps_from_headers is True
+    assert ctx.cap_write is True
+
+
 def test_extract_gateway_auth_context_requires_internal_token_configuration():
     with pytest.raises(HTTPException) as exc:
         extract_gateway_auth_context_from_headers(

@@ -24,9 +24,11 @@ from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import RedirectResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
+from ..auth_identity import can_bypass_ownership
+from ..auth_identity import can_manage_system
+from ..auth_identity import can_write
 from ..auth_identity import get_user_data as _request_user_data
 from ..auth_identity import get_user_id as _request_user_id
-from ..auth_identity import is_admin_request
 from ..backend.future_store import future_store
 from ..checkpoints import (
     CHECKPOINTS_DIR,
@@ -72,6 +74,11 @@ router = APIRouter()
 training_manager: TrainingSessionManager | None = None
 training_engine: VerlTrainingEngine | None = None
 inference_manager: SessionManager | None = None  # For multi-LoRA sampling registration
+
+
+def _require_write_access(request: Request) -> None:
+    if not can_write(request):
+        raise HTTPException(status_code=403, detail="Write access required")
 
 
 def _mark_training_inflight(model_id: str, delta: int) -> None:
@@ -338,7 +345,7 @@ async def _forward_remote_checkpoint_route(*, model_id: str, request: Request):
     _require_checkpoint_owner(
         request_user_id=_get_user_id(request),
         owner_id=owner_id,
-        is_admin=is_admin_request(request),
+        is_admin=can_bypass_ownership(request),
     )
 
     try:
@@ -385,7 +392,7 @@ async def _forward_remote_checkpoint_archive(*, model_id: str, checkpoint_id: st
     _require_checkpoint_owner(
         request_user_id=_get_user_id(request),
         owner_id=owner_id,
-        is_admin=is_admin_request(request),
+        is_admin=can_bypass_ownership(request),
     )
 
     params = dict(request.query_params)
@@ -464,6 +471,7 @@ async def save_weights(
     Tinker SDK calls POST /api/v1/save_weights for TrainingClient.save_state(...).
     This must produce a training checkpoint (weights + optimizer state).
     """
+    _require_write_access(http_request)
     route_start_s = time.perf_counter()
     from ..gateway import (
         async_remote_training_model,
@@ -591,6 +599,7 @@ async def save_state(
 
     This endpoint produces a training checkpoint intended for resume, including optimizer state.
     """
+    _require_write_access(http_request)
     route_start_s = time.perf_counter()
     from ..gateway import (
         async_remote_training_model,
@@ -1053,6 +1062,7 @@ async def load_state(
     http_request: Request,
 ) -> UntypedAPIFuture:
     """Load model state from checkpoint."""
+    _require_write_access(http_request)
     route_start_s = time.perf_counter()
     from ..gateway import (
         async_remote_training_model,
@@ -1077,10 +1087,11 @@ async def load_state(
         user_id = _get_user_id(http_request)
         incoming_headers = dict(http_request.headers)
         json_body = request.model_dump()
+        can_system = can_manage_system(http_request)
         if request.path.startswith(("tinker://", "mint://", "ckpt_")):
-            local_path = resolve_checkpoint_path(request.path, user_id=user_id, is_admin=is_admin_request(http_request))
+            local_path = resolve_checkpoint_path(request.path, user_id=user_id, is_admin=can_system)
             try:
-                ensure_checkpoint_path_allowed(local_path, user_id=user_id, is_admin=is_admin_request(http_request))
+                ensure_checkpoint_path_allowed(local_path, user_id=user_id, is_admin=can_system)
             except PermissionError as e:
                 raise HTTPException(status_code=403, detail=str(e)) from e
             if os.path.isdir(local_path):
@@ -1139,7 +1150,7 @@ async def load_state(
 
     await _protect_training_session_enqueue_window(store_info)
     user_id = _get_user_id(http_request)
-    load_path = _resolve_mint_path(request.path, user_id=user_id, is_admin=is_admin_request(http_request))
+    load_path = _resolve_mint_path(request.path, user_id=user_id, is_admin=can_manage_system(http_request))
     request = request.model_copy(update={"path": load_path})
     if request.optimizer:
         try:
@@ -1283,6 +1294,7 @@ async def upload_checkpoint_archive(
     Stores extracted checkpoint under /checkpoints/{owner}/{checkpoint_id}/ with metadata.json.
     Returns a checkpoint identifier usable by load_state/create_model_from_state.
     """
+    _require_write_access(http_request)
     import json
     import tempfile
 
@@ -1443,7 +1455,7 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
                 os.path.join(root, model_id),
             ]
         )
-        if is_admin_request(request) and os.path.isdir(root):
+        if can_bypass_ownership(request) and os.path.isdir(root):
             try:
                 for owner in os.listdir(root):
                     candidate_paths.append(os.path.join(root, owner, model_id))
@@ -1489,7 +1501,7 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
 
             if metadata.get("model_id") != model_id:
                 continue
-            if not is_admin_request(request) and metadata.get("owner_id") != user_id:
+            if not can_bypass_ownership(request) and metadata.get("owner_id") != user_id:
                 continue
 
             # Try to parse step from directory name
@@ -1554,7 +1566,7 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
 
     # Also include uploaded checkpoints stored as /checkpoints/{owner}/{checkpoint_id}/ if metadata.model_id matches.
     owner_roots: list[str]
-    if is_admin_request(request):
+    if can_bypass_ownership(request):
         try:
             owner_roots = []
             for root in [*persistent_roots, cache_root]:
@@ -1591,7 +1603,7 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
                 continue
             if metadata.get("model_id") != model_id:
                 continue
-            if not is_admin_request(request) and metadata.get("owner_id") != user_id:
+            if not can_bypass_ownership(request) and metadata.get("owner_id") != user_id:
                 continue
             created_at = datetime.fromtimestamp(os.path.getctime(ckpt_path)).isoformat()
             checkpoint_type = metadata.get("checkpoint_type")
@@ -1675,6 +1687,7 @@ async def delete_checkpoint(model_id: str, checkpoint_id: str, request: Request)
 
     Ownership verified via metadata.json (admin can delete all).
     """
+    _require_write_access(request)
     user_id = _get_user_id(request)
 
     checkpoint_name, expected_type = _split_tinker_checkpoint_id(checkpoint_id)
@@ -1682,7 +1695,7 @@ async def delete_checkpoint(model_id: str, checkpoint_id: str, request: Request)
         model_id=model_id,
         checkpoint_name=checkpoint_name,
         user_id=user_id,
-        is_admin=is_admin_request(request),
+        is_admin=can_bypass_ownership(request),
     )
 
     ckpt_path = next((p for p in candidates if os.path.isdir(p)), None)
@@ -1702,7 +1715,7 @@ async def delete_checkpoint(model_id: str, checkpoint_id: str, request: Request)
 
     if metadata.get("model_id") != model_id:
         raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found")
-    if not is_admin_request(request) and metadata.get("owner_id") != user_id:
+    if not can_bypass_ownership(request) and metadata.get("owner_id") != user_id:
         raise HTTPException(status_code=403, detail="Access denied")
     if expected_type is not None and metadata.get("checkpoint_type") != expected_type:
         raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found")
@@ -1762,7 +1775,7 @@ async def download_checkpoint_archive(
         model_id=model_id,
         checkpoint_name=checkpoint_name,
         user_id=user_id,
-        is_admin=is_admin_request(request),
+        is_admin=can_bypass_ownership(request),
     )
 
     # Prefer a candidate whose metadata matches the requested type.
@@ -1792,7 +1805,7 @@ async def download_checkpoint_archive(
             continue
         if expected_type is not None and md.get("checkpoint_type") != expected_type:
             continue
-        if not is_admin_request(request) and md.get("owner_id") != user_id:
+        if not can_bypass_ownership(request) and md.get("owner_id") != user_id:
             saw_unowned = True
             continue
         ckpt_path = p

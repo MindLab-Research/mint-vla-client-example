@@ -1,4 +1,4 @@
-"""Helpers for request identity and admin-role checks."""
+"""Helpers for request identity, legacy role fallback, and capability checks."""
 
 from __future__ import annotations
 
@@ -30,6 +30,77 @@ def get_user_role_from_user_data(user_data: dict | None) -> str | None:
     if user_id:
         return "user"
     return None
+
+
+def _coerce_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _caps_from_headers(user_data: dict | None) -> bool:
+    if not isinstance(user_data, dict):
+        return False
+    return _coerce_bool(user_data.get("caps_from_headers"))
+
+
+def _legacy_caps_for_role(role: str | None) -> tuple[bool, bool, bool, bool]:
+    normalized = str(role or "").strip().lower()
+    if normalized == "admin":
+        return True, True, True, True
+    if normalized == "internal":
+        return True, True, False, False
+    if normalized == "user":
+        return True, False, False, False
+    return False, False, False, False
+
+
+def _cap_from_user_data(user_data: dict | None, key: str, index: int) -> bool:
+    if not isinstance(user_data, dict):
+        return False
+    if key == "cap_write":
+        return bool(
+            get_user_role_from_user_data(user_data)
+            or str(user_data.get("user_id") or "").strip()
+            or str(user_data.get("apikey_id") or user_data.get("key_id") or "").strip()
+        )
+    if _caps_from_headers(user_data):
+        return _coerce_bool(user_data.get(key))
+    return _legacy_caps_for_role(get_user_role_from_user_data(user_data))[index]
+
+
+def can_write_user_data(user_data: dict | None) -> bool:
+    return _cap_from_user_data(user_data, "cap_write", 0)
+
+
+def can_view_internal_errors_user_data(user_data: dict | None) -> bool:
+    return _cap_from_user_data(user_data, "cap_view_internal_errors", 1)
+
+
+def can_bypass_ownership_user_data(user_data: dict | None) -> bool:
+    return _cap_from_user_data(user_data, "cap_bypass_ownership", 2)
+
+
+def can_manage_system_user_data(user_data: dict | None) -> bool:
+    return _cap_from_user_data(user_data, "cap_manage_system", 3)
+
+
+def can_write(request: Request) -> bool:
+    return can_write_user_data(get_user_data(request))
+
+
+def can_view_internal_errors(request: Request) -> bool:
+    return can_view_internal_errors_user_data(get_user_data(request))
+
+
+def can_bypass_ownership(request: Request) -> bool:
+    return can_bypass_ownership_user_data(get_user_data(request))
+
+
+def can_manage_system(request: Request) -> bool:
+    return can_manage_system_user_data(get_user_data(request))
 
 
 def get_apikey_id(request: Request) -> str | None:
