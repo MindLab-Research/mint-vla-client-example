@@ -744,13 +744,13 @@ class ServerConfig:
             retrieve_future_grace_s=_pick_float_alias(
                 "MINT_RETRIEVE_FUTURE_GRACE_S",
                 ("TINKER_RETRIEVE_FUTURE_GRACE_S",),
-                None,
+                file_future_store.retrieve_future_grace_s if file_future_store is not None else None,
                 120.0,
             ),
             retrieve_future_min_poll_s=_pick_float_alias(
                 "MINT_RETRIEVE_FUTURE_MIN_POLL_S",
                 ("TINKER_RETRIEVE_FUTURE_MIN_POLL_S",),
-                None,
+                file_future_store.retrieve_future_min_poll_s if file_future_store is not None else None,
                 1.0,
             ),
             future_replay_disk_ttl_s=_pick_float(

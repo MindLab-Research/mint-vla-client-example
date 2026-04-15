@@ -495,10 +495,14 @@ async def retrieve_future(
         from ..backend.api_work_queue import ApiWorkQueueUnavailableError, api_work_queue
 
         pos = None
-        eta_state = None
+        queue_probe = None
         if status_field == "queued":
             try:
-                pos = await api_work_queue.find_position(body.request_id)
+                queue_probe = await api_work_queue.describe_pending_request(
+                    body.request_id,
+                    op if isinstance(op, str) else None,
+                )
+                pos = queue_probe
             except ApiWorkQueueUnavailableError as e:
                 if queue_kind != "scheduled":
                     raise HTTPException(status_code=503, detail=f"ApiWorkQueue unavailable: {e}") from e
@@ -570,22 +574,12 @@ async def retrieve_future(
         if queue_kind == "legacy" and isinstance(queue_depth_scheduled, int) and queue_depth_scheduled > 0:
             queue_position = None
         if status_field == "queued" and queue_position is not None:
-            try:
-                from ..config import config as server_config
+            from ..config import config as server_config
 
-                eta_state = await api_work_queue.get_eta_state(op if isinstance(op, str) else None)
-                ema_exec_s = None
-                if isinstance(eta_state, dict):
-                    ema_exec_s = eta_state.get("ema_exec_s")
-                worker_count = int(server_config.api_work_queue_num_workers)
-                if worker_count > 0 and isinstance(ema_exec_s, (int, float)):
-                    estimated_wait_s = (float(queue_position) + 1.0) * float(ema_exec_s) / float(worker_count)
-            except ApiWorkQueueUnavailableError as e:
-                raise HTTPException(status_code=503, detail=f"ApiWorkQueue unavailable: {e}") from e
-            except HTTPException:
-                raise
-            except Exception as e:
-                raise HTTPException(status_code=503, detail=f"ApiWorkQueue ETA lookup failed: {type(e).__name__}: {e}") from e
+            ema_exec_s = queue_probe.get("ema_exec_s") if isinstance(queue_probe, dict) else None
+            worker_count = int(server_config.api_work_queue_num_workers)
+            if worker_count > 0 and isinstance(ema_exec_s, (int, float)):
+                estimated_wait_s = (float(queue_position) + 1.0) * float(ema_exec_s) / float(worker_count)
 
         if queue_state_reason is None and status_field == "queued":
             if queue_kind == "scheduled":

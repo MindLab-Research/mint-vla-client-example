@@ -1338,6 +1338,17 @@ def _create_ray_actor(*, require_ready: bool = True):
                     break
             return {"found": pos is not None, "position": pos, "depth": depth}
 
+        def describe_pending_request(self, request_id: str, op: str | None = None) -> dict[str, Any]:
+            out = self.find_position(request_id)
+            pos = out.get("position")
+            if pos is None or op is None:
+                out["ema_exec_s"] = None
+                return out
+            key = str(op).strip() or "unknown"
+            v = self._ema_exec_s_by_op.get(key)
+            out["ema_exec_s"] = None if v is None else float(v)
+            return out
+
         def record_execution_time(self, op: str, duration_s: float) -> None:
             key = str(op).strip() or "unknown"
             try:
@@ -2149,6 +2160,14 @@ class ApiWorkQueueClient:
         result = await self._await_ray_ref(ref, timeout_s=5.0)
         if not isinstance(result, dict):
             raise TypeError(f"ApiWorkQueue.find_position returned non-dict: {type(result)}")
+        return result
+
+    async def describe_pending_request(self, request_id: str, op: str | None) -> dict[str, Any]:
+        actor = await self._get_ray_actor_async(require_ready=False)
+        ref = actor.describe_pending_request.remote(str(request_id), None if op is None else str(op))
+        result = await self._await_ray_ref(ref, timeout_s=5.0)
+        if not isinstance(result, dict):
+            raise TypeError(f"ApiWorkQueue.describe_pending_request returned non-dict: {type(result)}")
         return result
 
     async def record_execution_time(self, op: str, duration_s: float) -> None:

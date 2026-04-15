@@ -47,8 +47,18 @@ class _StubApiWorkQueue:
         self._position = position
         self._ema_exec_s = ema_exec_s
         self._result = dict(result) if result is not None else None
+        self.describe_pending_request_calls: list[tuple[str, str | None]] = []
         self.find_position_calls: list[str] = []
         self.get_eta_state_calls: list[str | None] = []
+
+    async def describe_pending_request(self, request_id: str, op: str | None) -> dict:
+        self.describe_pending_request_calls.append((request_id, op))
+        if self._result is not None:
+            out = dict(self._result)
+        else:
+            out = {"found": True, "queue_kind": "legacy", "position": self._position, "depth": self._depth}
+        out.setdefault("ema_exec_s", self._ema_exec_s)
+        return out
 
     async def find_position(self, request_id: str, *, timeout_s: float = 5.0) -> dict:
         _ = timeout_s
@@ -64,6 +74,10 @@ class _StubApiWorkQueue:
 
 
 class _StubApiWorkQueueUnavailable:
+    async def describe_pending_request(self, request_id: str, op: str | None) -> dict:
+        _ = request_id, op
+        raise ApiWorkQueueUnavailableError("stub unavailable")
+
     async def find_position(self, request_id: str, *, timeout_s: float = 5.0) -> dict:
         _ = timeout_s
         raise ApiWorkQueueUnavailableError("stub unavailable")
@@ -73,10 +87,10 @@ class _StubApiWorkQueueUnavailable:
         raise ApiWorkQueueUnavailableError("stub unavailable")
 
 
-class _StubApiWorkQueueEtaUnavailable(_StubApiWorkQueue):
-    async def get_eta_state(self, op: str | None, *, timeout_s: float = 5.0) -> dict:
-        _ = timeout_s
-        raise ApiWorkQueueUnavailableError("eta unavailable")
+class _StubApiWorkQueueProbeUnavailable(_StubApiWorkQueue):
+    async def describe_pending_request(self, request_id: str, op: str | None) -> dict:
+        _ = request_id, op
+        raise ApiWorkQueueUnavailableError("probe unavailable")
 
 
 def _request_stub():
@@ -110,6 +124,9 @@ def test_issue_182_pending_payload_queue_backlog_reason(monkeypatch):
     assert payload.get("estimated_wait_s") == pytest.approx(6.0)
     assert response.headers.get("X-Queue-ETA-S") == "6.000"
     assert payload.get("retry_after_s") == int(response.headers.get("Retry-After"))
+    assert wq.api_work_queue.describe_pending_request_calls == [("rid_queue", "sampling.asample")]
+    assert wq.api_work_queue.find_position_calls == []
+    assert wq.api_work_queue.get_eta_state_calls == []
 
 
 def test_issue_182_pending_payload_reason_null_when_not_queued(monkeypatch):
@@ -132,6 +149,7 @@ def test_issue_182_pending_payload_reason_null_when_not_queued(monkeypatch):
     assert payload.get("type") == "try_again"
     assert payload.get("status") == "prefill"
     assert payload.get("queue_state_reason") is None
+    assert queue.describe_pending_request_calls == []
     assert queue.find_position_calls == []
     assert queue.get_eta_state_calls == []
 
@@ -498,12 +516,12 @@ def test_issue_182_running_payload_survives_queue_actor_unavailable(monkeypatch)
     assert payload.get("scheduler_domain") == "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507"
 
 
-def test_issue_182_legacy_queue_eta_lookup_unavailable_maps_503(monkeypatch):
+def test_issue_182_legacy_queue_probe_unavailable_maps_503(monkeypatch):
     meta = {"queue_state": "queued", "stage": "queued", "op": "sampling.asample"}
     monkeypatch.setattr(futures_route, "future_store", _StubFutureStore(meta))
     import tinker_server.backend.api_work_queue as wq
 
-    monkeypatch.setattr(wq, "api_work_queue", _StubApiWorkQueueEtaUnavailable(depth=4, position=1, ema_exec_s=None))
+    monkeypatch.setattr(wq, "api_work_queue", _StubApiWorkQueueProbeUnavailable(depth=4, position=1, ema_exec_s=None))
     import tinker_server.config as config_module
 
     monkeypatch.setattr(config_module.config, "api_work_queue_num_workers", 2, raising=False)
@@ -523,7 +541,7 @@ def test_issue_182_scheduler_enabled_skips_eta_lookup_for_scheduled_queue(monkey
     monkeypatch.setattr(
         wq,
         "api_work_queue",
-        _StubApiWorkQueueEtaUnavailable(
+        _StubApiWorkQueue(
             depth=8,
             ema_exec_s=None,
             result={

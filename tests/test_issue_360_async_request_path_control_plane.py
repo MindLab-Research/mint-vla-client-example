@@ -224,6 +224,10 @@ class _AsyncOnlyUnknownFutureStore:
 
 
 class _StubApiWorkQueue:
+    async def describe_pending_request(self, request_id: str, op: str | None) -> dict:
+        _ = request_id, op
+        return {"found": True, "position": 0, "depth": 1, "ema_exec_s": 2.0}
+
     async def find_position(self, request_id: str) -> dict:
         return {"found": True, "position": 0, "depth": 1}
 
@@ -552,6 +556,11 @@ async def test_issue_360_api_work_queue_request_helpers_use_async_actor(monkeypa
     client = wq.ApiWorkQueueClient()
     calls: list[tuple[str, object]] = []
 
+    class _DescribePendingHandle:
+        def remote(self, request_id: str, op: str | None):
+            calls.append(("describe_pending_request.remote", (request_id, op)))
+            return object()
+
     class _FindPositionHandle:
         def remote(self, *, request_id: str):
             calls.append(("find_position.remote", request_id))
@@ -563,6 +572,7 @@ async def test_issue_360_api_work_queue_request_helpers_use_async_actor(monkeypa
             return object()
 
     class _Actor:
+        describe_pending_request = _DescribePendingHandle()
         find_position = _FindPositionHandle()
         get_eta_state = _EtaHandle()
 
@@ -575,7 +585,10 @@ async def test_issue_360_api_work_queue_request_helpers_use_async_actor(monkeypa
 
     async def _fake_await(_ref, *, timeout_s=None):
         calls.append(("_await_ray_ref", timeout_s))
-        if len([item for item in calls if item[0] == "_await_ray_ref"]) == 1:
+        idx = len([item for item in calls if item[0] == "_await_ray_ref"])
+        if idx == 1:
+            return {"found": True, "position": 0, "depth": 1, "ema_exec_s": 2.0}
+        if idx == 2:
             return {"found": True, "position": 0, "depth": 1}
         return {"ema_exec_s": 2.0}
 
@@ -583,12 +596,15 @@ async def test_issue_360_api_work_queue_request_helpers_use_async_actor(monkeypa
     monkeypatch.setattr(client, "_get_ray_actor", _unexpected_get_sync)
     monkeypatch.setattr(client, "_await_ray_ref", _fake_await)
 
+    pending = await client.describe_pending_request("rid-360", "sampling.asample")
     pos = await client.find_position("rid-360")
     eta = await client.get_eta_state("sampling.asample")
 
+    assert pending == {"found": True, "position": 0, "depth": 1, "ema_exec_s": 2.0}
     assert pos == {"found": True, "position": 0, "depth": 1}
     assert eta == {"ema_exec_s": 2.0}
     assert ("_get_ray_actor_async", False) in calls
+    assert ("describe_pending_request.remote", ("rid-360", "sampling.asample")) in calls
     assert ("find_position.remote", "rid-360") in calls
     assert ("get_eta_state.remote", "sampling.asample") in calls
 
