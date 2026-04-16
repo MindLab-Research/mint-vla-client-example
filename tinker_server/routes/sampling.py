@@ -8,6 +8,7 @@ Endpoints:
 from __future__ import annotations
 
 import asyncio
+import copy
 import array
 import hashlib
 import logging
@@ -713,6 +714,35 @@ async def _flush_group(g: dict) -> None:
             fut0, _ns0, _rid0 = waiters[0]
             if not fut0.done():
                 fut0.set_result([res])
+            return
+
+        if float(g["temperature"]) == 0.0:
+            # vLLM forces greedy sampling to n=1, so identical coalesced requests
+            # must share one engine.generate() result and fan it back out locally.
+            vllm_request_id = f"{g['leader_request_id']}_coalesced"
+            rid_ns = ",".join(f"{rid}:{int(ns)}" for _fut, ns, rid in waiters)
+            logger.info(
+                f"[coalesce flush greedy] leader={g['leader_request_id']} vllm_req={vllm_request_id} "
+                f"waiters={len(waiters)} total_samples={total} rid_ns={rid_ns}"
+            )
+            await _register_coalesced_abort_aliases(waiters, vllm_request_id)
+            try:
+                res = await g["engine"].generate(
+                    sampling_session_id=g["sampling_session_id"],
+                    prompt_ids=g["prompt_ids"],
+                    request_id=vllm_request_id,
+                    max_tokens=g["max_tokens"],
+                    stop=g.get("stop"),
+                    temperature=g["temperature"],
+                    top_k=g["top_k"],
+                    top_p=g["top_p"],
+                    logprobs=True,
+                )
+            finally:
+                await _unregister_coalesced_abort_aliases(waiters, vllm_request_id)
+            for fut, ns, _rid in waiters:
+                if not fut.done():
+                    fut.set_result([copy.deepcopy(res) for _ in range(int(ns))])
             return
 
         vllm_request_id = f"{g['leader_request_id']}_coalesced"
