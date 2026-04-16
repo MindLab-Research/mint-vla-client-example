@@ -174,6 +174,3 @@ def is_admin_user_data(user_data: dict | None) -> bool:
     role = get_user_role_from_user_data(user_data)
     return role == "admin"
 
-
-def is_admin_request(request: Request) -> bool:
-    return is_admin_user_data(get_user_data(request))
