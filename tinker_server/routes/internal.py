@@ -863,10 +863,28 @@ async def metrics() -> Response:
                         "prefill_time_s",
                         "decode_time_s",
                         "time_per_output_token_s",
+                        "seq_slot_wait_s",
+                        "generate_lock_wait_s",
+                        "engine_read_lock_wait_s",
+                        "add_request_wait_s",
+                        "add_request_exec_s",
+                        "first_token_observed_s",
                     ):
                         _append_metric(lines, f"mint_vllm_{stem}_sum", metadata.get(f"{stem}_total"), labels=vllm_labels)
                         _append_metric(lines, f"mint_vllm_{stem}_count", metadata.get(f"{stem}_count"), labels=vllm_labels)
                         _append_metric(lines, f"mint_vllm_{stem}_max", metadata.get(f"{stem}_max"), labels=vllm_labels)
+                        _append_metric(
+                            lines,
+                            f"mint_vllm_{stem}_p50_recent",
+                            metadata.get(f"{stem}_p50_recent"),
+                            labels=vllm_labels,
+                        )
+                        _append_metric(
+                            lines,
+                            f"mint_vllm_{stem}_p95_recent",
+                            metadata.get(f"{stem}_p95_recent"),
+                            labels=vllm_labels,
+                        )
                 elif actor_type.strip().lower() == "megatron":
                     megatron_labels = {"actor_name": actor_name, "base_model": model}
                     for stem in (

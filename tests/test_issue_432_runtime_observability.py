@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import tinker_server.logging_context as logging_context
 from tinker_server.backend.runtime_observability import RuntimeObservability
 from tinker_server.backend.verl_training import VerlTrainingEngine
@@ -33,6 +34,53 @@ def test_issue_432_verl_training_records_megatron_switch_metrics(monkeypatch) ->
     assert snap["megatron_session_switch"][0]["session_state"] == "existing"
     assert snap["megatron_session_switch"][0]["total_s_total"] == 6.25
 
+
+
+def test_issue_432_vllm_stats_observer_tracks_request_stage_timings() -> None:
+    obs = VllmStatsObserver()
+
+    obs.observe_actor_timing(
+        seq_slot_wait_s=0.4,
+        generate_lock_wait_s=0.1,
+        engine_read_lock_wait_s=0.05,
+        add_request_wait_s=0.2,
+        add_request_exec_s=0.08,
+        first_token_observed_s=1.3,
+    )
+    obs.observe_actor_timing(
+        seq_slot_wait_s=1.0,
+        generate_lock_wait_s=0.3,
+        engine_read_lock_wait_s=0.15,
+        add_request_wait_s=0.5,
+        add_request_exec_s=0.12,
+        first_token_observed_s=1.8,
+    )
+
+    snap = obs.snapshot()
+    assert snap["seq_slot_wait_s_count"] == 2
+    assert snap["seq_slot_wait_s_total"] == pytest.approx(1.4)
+    assert snap["seq_slot_wait_s_max"] == pytest.approx(1.0)
+    assert snap["seq_slot_wait_s_p50_recent"] == pytest.approx(0.7)
+    assert snap["seq_slot_wait_s_p95_recent"] == pytest.approx(0.97)
+    assert snap["add_request_wait_s_total"] == pytest.approx(0.7)
+    assert snap["add_request_exec_s_max"] == pytest.approx(0.12)
+    assert snap["first_token_observed_s_p50_recent"] == pytest.approx(1.55)
+    assert snap["first_token_observed_s_p95_recent"] == pytest.approx(1.775)
+
+
+def test_issue_432_vllm_stats_observer_drops_non_finite_actor_timings() -> None:
+    obs = VllmStatsObserver()
+
+    obs.observe_actor_timing(
+        seq_slot_wait_s=float("nan"),
+        add_request_wait_s=float("inf"),
+        add_request_exec_s=float("-inf"),
+    )
+
+    snap = obs.snapshot()
+    assert snap["seq_slot_wait_s_count"] == 0
+    assert snap["add_request_wait_s_count"] == 0
+    assert snap["add_request_exec_s_count"] == 0
 
 
 def test_issue_432_runtime_observability_tracks_megatron_session_switch() -> None:
@@ -312,27 +360,29 @@ def test_issue_432_vllm_stats_observer_tracks_scheduler_and_finished_request_met
     obs.record(scheduler_stats, iteration_stats)
     snap = obs.snapshot()
 
-    assert snap == {
-        "scheduler_waiting_requests": 4,
-        "scheduler_running_requests": 2,
-        "scheduler_kv_cache_usage_ratio": 0.75,
-        "prefix_cache_queries_total": 100,
-        "prefix_cache_hits_total": 60,
-        "prefix_cache_hit_ratio": 0.6,
-        "preemptions_total": 3,
-        "queue_time_s_total": 4.0,
-        "queue_time_s_count": 2,
-        "queue_time_s_max": 2.5,
-        "prefill_time_s_total": 5.0,
-        "prefill_time_s_count": 2,
-        "prefill_time_s_max": 3.0,
-        "decode_time_s_total": 12.0,
-        "decode_time_s_count": 2,
-        "decode_time_s_max": 7.0,
-        "time_per_output_token_s_total": 0.2,
-        "time_per_output_token_s_count": 2,
-        "time_per_output_token_s_max": 0.12,
-    }
+    assert snap["scheduler_waiting_requests"] == 4
+    assert snap["scheduler_running_requests"] == 2
+    assert snap["scheduler_kv_cache_usage_ratio"] == 0.75
+    assert snap["prefix_cache_queries_total"] == 100
+    assert snap["prefix_cache_hits_total"] == 60
+    assert snap["prefix_cache_hit_ratio"] == 0.6
+    assert snap["preemptions_total"] == 3
+    assert snap["queue_time_s_total"] == pytest.approx(4.0)
+    assert snap["queue_time_s_count"] == 2
+    assert snap["queue_time_s_max"] == pytest.approx(2.5)
+    assert snap["queue_time_s_p50_recent"] == pytest.approx(2.0)
+    assert snap["queue_time_s_p95_recent"] == pytest.approx(2.45)
+    assert snap["prefill_time_s_total"] == pytest.approx(5.0)
+    assert snap["prefill_time_s_count"] == 2
+    assert snap["prefill_time_s_max"] == pytest.approx(3.0)
+    assert snap["decode_time_s_total"] == pytest.approx(12.0)
+    assert snap["decode_time_s_count"] == 2
+    assert snap["decode_time_s_max"] == pytest.approx(7.0)
+    assert snap["time_per_output_token_s_total"] == pytest.approx(0.2)
+    assert snap["time_per_output_token_s_count"] == 2
+    assert snap["time_per_output_token_s_max"] == pytest.approx(0.12)
+    assert snap["seq_slot_wait_s_count"] == 0
+    assert snap["add_request_wait_s_count"] == 0
 
 
 def test_issue_432_scheduler_decision_otel_records_experience_metrics(monkeypatch) -> None:
