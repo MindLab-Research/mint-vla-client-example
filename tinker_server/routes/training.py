@@ -382,6 +382,7 @@ async def _restore_training_session(model_id: str):
                 "created_at": session.created_at,
                 "current_step": session.current_step,
                 "is_active": session.is_active,
+                "metadata_version": getattr(session, "metadata_version", 1),
             }
 
         session.backend = str(info.get("backend", session.backend))
@@ -438,6 +439,34 @@ async def _restore_training_session(model_id: str):
         return session
     except Exception as e:
         logger.exception(f"[{model_id}] restore_training_session failed: {e}")
+
+
+async def _async_get_training_store_info(model_id: str) -> dict[str, Any] | None:
+    try:
+        from ..backend.training_session_store import async_get_training_session_info
+
+        info = await async_get_training_session_info(model_id)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail="Training session store unavailable") from e
+    return info if isinstance(info, dict) else None
+
+
+async def _get_training_route_session_info(model_id: str) -> dict[str, Any] | None:
+    """Resolve route-time session metadata from detached store only."""
+    return await _async_get_training_store_info(model_id)
+
+
+async def _protect_training_session_enqueue_window(session_info: dict[str, Any]) -> None:
+    """Write detached heartbeat at enqueue-time so stale cleanup cannot race queued work."""
+    session_id = str(session_info.get("session_id") or "")
+    if not session_id:
+        return
+    try:
+        from ..backend.session_heartbeat_store import session_heartbeat_store
+
+        await session_heartbeat_store.async_update(session_id=session_id, now=time.time())
+    except Exception as e:
+        raise HTTPException(status_code=503, detail="Training heartbeat store unavailable") from e
         return None
 
 
