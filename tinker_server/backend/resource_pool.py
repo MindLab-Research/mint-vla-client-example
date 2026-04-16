@@ -24,7 +24,8 @@ from typing import Any, cast
 
 import ray
 
-from ..config import config as server_config, otel_env_vars, preferred_control_plane_resources
+from ..config import config as server_config, otel_env_vars
+from ..ray_utils import register_ray_reconnect_invalidator as _register_ray_reconnect_invalidator
 from . import ray_kill
 
 logger = logging.getLogger(__name__)
@@ -569,7 +570,6 @@ def _reset_cached_actor_handle() -> None:
     global _RESOURCE_POOL_ACTOR_HANDLE
     _RESOURCE_POOL_ACTOR_HANDLE = None
 
-from ..ray_utils import register_ray_reconnect_invalidator as _register_ray_reconnect_invalidator
 _register_ray_reconnect_invalidator(_reset_cached_actor_handle)
 
 
@@ -737,6 +737,22 @@ def _call_actor_sync(method_name: str, *args, retry_on_actor_restart: bool = Fal
         actor = _get_or_create_actor_sync()
         remote_method = getattr(actor, method_name)
         return ray.get(remote_method.remote(*args, **kwargs))
+
+
+async def _call_actor_async(method_name: str, *args, retry_on_actor_restart: bool = False, **kwargs) -> Any:
+    global _RESOURCE_POOL_ACTOR_HANDLE
+
+    actor = await asyncio.to_thread(_get_or_create_actor_sync)
+    remote_method = getattr(actor, method_name)
+    try:
+        return await _await_ray_ref(remote_method.remote(*args, **kwargs))
+    except Exception:
+        if not retry_on_actor_restart:
+            raise
+        _RESOURCE_POOL_ACTOR_HANDLE = None
+        actor = await asyncio.to_thread(_get_or_create_actor_sync)
+        remote_method = getattr(actor, method_name)
+        return await _await_ray_ref(remote_method.remote(*args, **kwargs))
 
 
 def actor_observability_metadata(actor_handle: ActorHandle | None, *, timeout_s: float = 5.0) -> dict[str, Any] | None:
@@ -972,6 +988,12 @@ class ResourcePool:
             return
         _call_actor_sync("set_session", actor_name, session_id)
 
+    async def async_set_session(self, actor_name: str, session_id: str | None) -> None:
+        if not self._use_detached():
+            await asyncio.to_thread(self._local, self._local_state.set_session, actor_name, session_id)
+            return
+        await _call_actor_async("set_session", actor_name, session_id)
+
     def set_protected(self, actor_name: str, protected: bool = True) -> bool:
         if not self._use_detached():
             return bool(self._local(self._local_state.set_protected, actor_name, protected))
@@ -986,6 +1008,11 @@ class ResourcePool:
         if not self._use_detached():
             return bool(self._local(self._local_state.touch, actor_name))
         return bool(_call_actor_sync("touch", actor_name))
+
+    async def async_touch(self, actor_name: str) -> bool:
+        if not self._use_detached():
+            return bool(await asyncio.to_thread(self._local, self._local_state.touch, actor_name))
+        return bool(await _call_actor_async("touch", actor_name))
 
     def mark_inflight(self, actor_name: str, delta: int) -> None:
         if not self._use_detached():

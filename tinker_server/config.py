@@ -428,6 +428,8 @@ class ServerConfig:
     future_replay_hot_ttl_s: float = 60.0
     future_replay_disk_ttl_s: float = 86400.0
     future_replay_sweep_interval_s: float = 21600.0
+    retrieve_future_grace_s: float = 120.0
+    retrieve_future_min_poll_s: float = 1.0
 
     # Admission control + API work queue (issue #84)
     capacity_manager_actor_name: str = "tinker_capacity_manager"
@@ -510,6 +512,10 @@ class ServerConfig:
 
         def _pick_float(name: str, file_value: float | None, default: float) -> float:
             v = _env_nonempty(environ, name)
+            return float(v) if v is not None else (float(file_value) if file_value is not None else float(default))
+
+        def _pick_float_alias(primary: str, aliases: tuple[str, ...], file_value: float | None, default: float) -> float:
+            v, _source = _env_nonempty_any(environ, primary, *aliases)
             return float(v) if v is not None else (float(file_value) if file_value is not None else float(default))
 
         def _pick_bool(name: str, file_value: bool | None, default: bool) -> bool:
@@ -734,6 +740,18 @@ class ServerConfig:
                 "MINT_FUTURE_REPLAY_HOT_TTL_S",
                 file_future_store.replay_hot_ttl_s if file_future_store is not None else None,
                 60.0,
+            ),
+            retrieve_future_grace_s=_pick_float_alias(
+                "MINT_RETRIEVE_FUTURE_GRACE_S",
+                ("TINKER_RETRIEVE_FUTURE_GRACE_S",),
+                file_future_store.retrieve_future_grace_s if file_future_store is not None else None,
+                120.0,
+            ),
+            retrieve_future_min_poll_s=_pick_float_alias(
+                "MINT_RETRIEVE_FUTURE_MIN_POLL_S",
+                ("TINKER_RETRIEVE_FUTURE_MIN_POLL_S",),
+                file_future_store.retrieve_future_min_poll_s if file_future_store is not None else None,
+                1.0,
             ),
             future_replay_disk_ttl_s=_pick_float(
                 "MINT_FUTURE_REPLAY_DISK_TTL_S",

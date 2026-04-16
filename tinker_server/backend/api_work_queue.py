@@ -144,7 +144,7 @@ def _create_ray_actor(*, require_ready: bool = True):
             from collections import deque
 
             init_actor_observability()
-            logger.warning(
+            logger.info(
                 "[api_work_queue] actor (re)initializing (max_restarts=%d)",
                 max_restarts,
             )
@@ -1338,6 +1338,17 @@ def _create_ray_actor(*, require_ready: bool = True):
                     break
             return {"found": pos is not None, "position": pos, "depth": depth}
 
+        def describe_pending_request(self, request_id: str, op: str | None = None) -> dict[str, Any]:
+            out = self.find_position(request_id)
+            pos = out.get("position")
+            if pos is None or op is None:
+                out["ema_exec_s"] = None
+                return out
+            key = str(op).strip() or "unknown"
+            v = self._ema_exec_s_by_op.get(key)
+            out["ema_exec_s"] = None if v is None else float(v)
+            return out
+
         def record_execution_time(self, op: str, duration_s: float) -> None:
             key = str(op).strip() or "unknown"
             try:
@@ -1831,7 +1842,7 @@ class ApiWorkQueueClient:
 
         actor = None
         try:
-            actor = ray.get_actor(actor_name, namespace=_ray_namespace())
+            actor = await asyncio.to_thread(ray.get_actor, actor_name, namespace=_ray_namespace())
             if not require_ready:
                 self._ray_actor = actor
                 return actor
@@ -1843,7 +1854,7 @@ class ApiWorkQueueClient:
             logger.info("[api_work_queue] actor %s not found; creating", actor_name)
         except ray.exceptions.GetTimeoutError:
             if fail_fast_on_probe_timeout:
-                logger.warning(
+                logger.info(
                     "[api_work_queue] actor %s alive but unresponsive (probe_timeout_s=%.2f); failing fast",
                     actor_name,
                     probe_timeout_s,
@@ -1851,7 +1862,7 @@ class ApiWorkQueueClient:
                 raise ApiWorkQueueUnavailableError(
                     f"queue actor {actor_name} unresponsive (restarting?)"
                 )
-            logger.warning(
+            logger.info(
                 "[api_work_queue] actor %s probe timed out (probe_timeout_s=%.2f); reusing existing actor",
                 actor_name,
                 probe_timeout_s,
@@ -1860,7 +1871,7 @@ class ApiWorkQueueClient:
                 self._ray_actor = actor
                 return actor
         except (ray.exceptions.ActorDiedError, ray.exceptions.RayActorError) as e:
-            logger.warning(
+            logger.info(
                 "[api_work_queue] actor %s dead (%s: %s); Ray auto-restart will recover",
                 actor_name,
                 type(e).__name__,
@@ -1870,7 +1881,7 @@ class ApiWorkQueueClient:
                 f"queue actor {actor_name} restarting ({type(e).__name__})"
             ) from e
         except Exception as e:
-            logger.warning(
+            logger.info(
                 "[api_work_queue] failed to fetch detached actor %s (%s: %s); creating",
                 actor_name,
                 type(e).__name__,
@@ -2144,12 +2155,38 @@ class ApiWorkQueueClient:
         )
 
     async def find_position(self, request_id: str) -> dict[str, Any]:
-        actor = self._get_cached_ray_actor_for_async_request_path()
+        actor = await self._get_ray_actor_async(require_ready=False)
         ref = actor.find_position.remote(request_id=str(request_id))
         result = await self._await_ray_ref(ref, timeout_s=5.0)
         if not isinstance(result, dict):
             raise TypeError(f"ApiWorkQueue.find_position returned non-dict: {type(result)}")
         return result
+
+    async def describe_pending_request(self, request_id: str, op: str | None) -> dict[str, Any]:
+        actor = await self._get_ray_actor_async(require_ready=False)
+        rid = str(request_id)
+        op_key = None if op is None else str(op)
+        try:
+            ref = actor.describe_pending_request.remote(rid, op_key)
+            result = await self._await_ray_ref(ref, timeout_s=5.0)
+            if not isinstance(result, dict):
+                raise TypeError(f"ApiWorkQueue.describe_pending_request returned non-dict: {type(result)}")
+            return result
+        except AttributeError:
+            ref = actor.find_position.remote(request_id=rid)
+            result = await self._await_ray_ref(ref, timeout_s=5.0)
+            if not isinstance(result, dict):
+                raise TypeError(f"ApiWorkQueue.find_position returned non-dict: {type(result)}")
+            pos = result.get("position")
+            if pos is None or op_key is None:
+                result["ema_exec_s"] = None
+                return result
+            eta_ref = actor.get_eta_state.remote(op_key)
+            eta_state = await self._await_ray_ref(eta_ref, timeout_s=5.0)
+            if not isinstance(eta_state, dict):
+                raise TypeError(f"ApiWorkQueue.get_eta_state returned non-dict: {type(eta_state)}")
+            result["ema_exec_s"] = eta_state.get("ema_exec_s")
+            return result
 
     async def record_execution_time(self, op: str, duration_s: float) -> None:
         actor = await self._get_ray_actor_async()
@@ -2157,7 +2194,7 @@ class ApiWorkQueueClient:
         await self._await_ray_ref(ref, timeout_s=5.0)
 
     async def get_eta_state(self, op: str | None) -> dict[str, Any]:
-        actor = self._get_cached_ray_actor_for_async_request_path()
+        actor = await self._get_ray_actor_async(require_ready=False)
         ref = actor.get_eta_state.remote(None if op is None else str(op))
         result = await self._await_ray_ref(ref, timeout_s=5.0)
         if not isinstance(result, dict):

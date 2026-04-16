@@ -97,6 +97,8 @@ class _FutureStoreSection(BaseModel):
     replay_hot_ttl_s: float | None = None
     replay_disk_ttl_s: float | None = None
     replay_sweep_interval_s: float | None = None
+    retrieve_future_grace_s: float | None = None
+    retrieve_future_min_poll_s: float | None = None
 
 
 class _TrainingSection(BaseModel):
