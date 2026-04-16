@@ -66,6 +66,7 @@ from ..checkpoints import (
 )
 from ..config import RAY_NAMESPACE
 from ..model_access_control import can_access_model, get_access_denied_error
+from ..queue_priority import merge_queue_priority_extra
 from ..models.types import (
     CreateModelFromStateRequest,
     CreateModelFromStateResponse,
@@ -1792,7 +1793,7 @@ async def forward_backward(
 
     session, route_session_info = await _resolve_training_route_session(request.model_id)
 
-    if session is None:
+    if not isinstance(route_session_info, dict):
         remote = await async_remote_training_model(request.model_id)
         if remote is not None:
             upstream_alias, base_model = remote
@@ -1834,14 +1835,17 @@ async def forward_backward(
     if session is None:
         raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
 
-    max_model_len = _get_max_model_len(session.base_model)
+    await _protect_training_session_enqueue_window(route_session_info)
+    base_model = str(route_session_info.get("base_model") or "")
+    backend = str(route_session_info.get("backend") or "unknown")
+    max_model_len = _get_max_model_len(base_model)
     _, max_seq_len = _compute_token_stats(request.forward_backward_input.data)
     if max_seq_len > max_model_len:
         raise HTTPException(
             status_code=400,
             detail=(
                 f"Input sequence length {max_seq_len} exceeds max_model_len {max_model_len} "
-                f"for model {session.base_model}"
+                f"for model {base_model}"
             ),
         )
 
@@ -1854,7 +1858,6 @@ async def forward_backward(
     request_id = uuid.uuid4().hex
     gateway_auth = build_billing_auth_context(http_request, fallback_request_id=request_id)
 
-    # Set request_id in context for logging
     set_request_id(request_id)
     logger.info(f"forward_backward request received: model_id={request.model_id}")
 
@@ -1875,11 +1878,14 @@ async def forward_backward(
         await _protect_training_session_enqueue_window(route_session_info)
         _mark_training_inflight(request.model_id, +1)
         inflight_marked = True
-        scheduler_extra = _build_training_scheduler_extra(
-            session=session,
-            model_id=request.model_id,
-            training_op="forward_backward",
-            seq_id=request.seq_id,
+        scheduler_extra = merge_queue_priority_extra(
+            _build_training_scheduler_extra(
+                session=route_session_info,
+                model_id=request.model_id,
+                training_op="forward_backward",
+                seq_id=request.seq_id,
+            ),
+            request=http_request,
         )
         if gateway_auth is not None:
             scheduler_extra["gateway_auth"] = gateway_auth.__dict__
@@ -1894,8 +1900,8 @@ async def forward_backward(
             request_id=request_id,
             op="training.forward_backward",
             model_id=request.model_id,
-            base_model=session.base_model,
-            backend=session.backend,
+            base_model=base_model,
+            backend=backend,
             enqueue_coro=api_work_queue.enqueue(
                 request_id=request_id,
                 op="training.forward_backward",
@@ -1907,7 +1913,7 @@ async def forward_backward(
         )
     except Exception as e:
         if inflight_marked and training_manager is not None:
-            training_manager.mark_inflight(request.model_id, -1)
+            _mark_training_inflight(request.model_id, -1)
         await capacity_manager.async_release_all(request_id)
         if created:
             await future_store.async_cleanup(request_id)
@@ -2031,7 +2037,7 @@ async def train_step(
 
     session, route_session_info = await _resolve_training_route_session(request.model_id)
 
-    if session is None:
+    if not isinstance(route_session_info, dict):
         remote = await async_remote_training_model(request.model_id)
         if remote is not None:
             upstream_alias, base_model = remote
@@ -2075,14 +2081,17 @@ async def train_step(
     if session is None:
         raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
 
-    max_model_len = _get_max_model_len(session.base_model)
+    await _protect_training_session_enqueue_window(route_session_info)
+    base_model = str(route_session_info.get("base_model") or "")
+    backend = str(route_session_info.get("backend") or "unknown")
+    max_model_len = _get_max_model_len(base_model)
     _, max_seq_len = _compute_token_stats(request.forward_backward_input.data)
     if max_seq_len > max_model_len:
         raise HTTPException(
             status_code=400,
             detail=(
                 f"Input sequence length {max_seq_len} exceeds max_model_len {max_model_len} "
-                f"for model {session.base_model}"
+                f"for model {base_model}"
             ),
         )
 
@@ -2111,11 +2120,14 @@ async def train_step(
         await _protect_training_session_enqueue_window(route_session_info)
         _mark_training_inflight(request.model_id, +1)
         inflight_marked = True
-        scheduler_extra = _build_training_scheduler_extra(
-            session=session,
-            model_id=request.model_id,
-            training_op="train_step",
-            seq_id=request.seq_id,
+        scheduler_extra = merge_queue_priority_extra(
+            _build_training_scheduler_extra(
+                session=route_session_info,
+                model_id=request.model_id,
+                training_op="train_step",
+                seq_id=request.seq_id,
+            ),
+            request=http_request,
         )
         if gateway_auth is not None:
             scheduler_extra["gateway_auth"] = gateway_auth.__dict__
@@ -2127,8 +2139,8 @@ async def train_step(
             request_id=request_id,
             op="training.train_step",
             model_id=request.model_id,
-            base_model=session.base_model,
-            backend=session.backend,
+            base_model=base_model,
+            backend=backend,
             enqueue_coro=api_work_queue.enqueue(
                 request_id=request_id,
                 op="training.train_step",
@@ -2140,7 +2152,7 @@ async def train_step(
         )
     except Exception as e:
         if inflight_marked and training_manager is not None:
-            training_manager.mark_inflight(request.model_id, -1)
+            _mark_training_inflight(request.model_id, -1)
         await capacity_manager.async_release_all(request_id)
         if created:
             await future_store.async_cleanup(request_id)
@@ -2255,7 +2267,7 @@ async def forward(
 
     session, route_session_info = await _resolve_training_route_session(request.model_id)
 
-    if session is None:
+    if not isinstance(route_session_info, dict):
         remote = await async_remote_training_model(request.model_id)
         if remote is not None:
             upstream_alias, base_model = remote
@@ -2301,14 +2313,17 @@ async def forward(
             status_code=404, detail=f"Model '{request.model_id}' not found"
         )
 
-    max_model_len = _get_max_model_len(session.base_model)
+    await _protect_training_session_enqueue_window(route_session_info)
+    base_model = str(route_session_info.get("base_model") or "")
+    backend = str(route_session_info.get("backend") or "unknown")
+    max_model_len = _get_max_model_len(base_model)
     _, max_seq_len = _compute_token_stats(request.forward_input.data)
     if max_seq_len > max_model_len:
         raise HTTPException(
             status_code=400,
             detail=(
                 f"Input sequence length {max_seq_len} exceeds max_model_len {max_model_len} "
-                f"for model {session.base_model}"
+                f"for model {base_model}"
             ),
         )
 
@@ -2337,11 +2352,14 @@ async def forward(
         await _protect_training_session_enqueue_window(route_session_info)
         _mark_training_inflight(request.model_id, +1)
         inflight_marked = True
-        scheduler_extra = _build_training_scheduler_extra(
-            session=session,
-            model_id=request.model_id,
-            training_op="forward",
-            seq_id=request.seq_id,
+        scheduler_extra = merge_queue_priority_extra(
+            _build_training_scheduler_extra(
+                session=route_session_info,
+                model_id=request.model_id,
+                training_op="forward",
+                seq_id=request.seq_id,
+            ),
+            request=http_request,
         )
         if gateway_auth is not None:
             scheduler_extra["gateway_auth"] = gateway_auth.__dict__
@@ -2353,8 +2371,8 @@ async def forward(
             request_id=request_id,
             op="training.forward",
             model_id=request.model_id,
-            base_model=session.base_model,
-            backend=session.backend,
+            base_model=base_model,
+            backend=backend,
             enqueue_coro=api_work_queue.enqueue(
                 request_id=request_id,
                 op="training.forward",
@@ -2366,7 +2384,7 @@ async def forward(
         )
     except Exception as e:
         if inflight_marked and training_manager is not None:
-            training_manager.mark_inflight(request.model_id, -1)
+            _mark_training_inflight(request.model_id, -1)
         await capacity_manager.async_release_all(request_id)
         if created:
             await future_store.async_cleanup(request_id)
@@ -2481,7 +2499,7 @@ async def optim_step(
             True,
         )
 
-    if session is None:
+    if not isinstance(route_session_info, dict):
         remote = await async_remote_training_model(request.model_id)
         if remote is not None:
             upstream_alias, base_model = remote
@@ -2526,6 +2544,10 @@ async def optim_step(
             status_code=404, detail=f"Model '{request.model_id}' not found"
         )
 
+    await _protect_training_session_enqueue_window(route_session_info)
+    base_model = str(route_session_info.get("base_model") or "")
+    backend = str(route_session_info.get("backend") or "unknown")
+
     user_id = _get_user_id(http_request)
     from ..backend.api_work_queue import api_work_queue
     from ..backend.capacity_manager import capacity_manager
@@ -2558,11 +2580,14 @@ async def optim_step(
         await _protect_training_session_enqueue_window(route_session_info)
         _mark_training_inflight(request.model_id, +1)
         inflight_marked = True
-        scheduler_extra = _build_training_scheduler_extra(
-            session=session,
-            model_id=request.model_id,
-            training_op="optim_step",
-            seq_id=request.seq_id,
+        scheduler_extra = merge_queue_priority_extra(
+            _build_training_scheduler_extra(
+                session=route_session_info,
+                model_id=request.model_id,
+                training_op="optim_step",
+                seq_id=request.seq_id,
+            ),
+            request=http_request,
         )
         await future_store.async_create_with_id(request_id)
         created = True
@@ -2572,8 +2597,8 @@ async def optim_step(
             request_id=request_id,
             op="training.optim_step",
             model_id=request.model_id,
-            base_model=session.base_model,
-            backend=session.backend,
+            base_model=base_model,
+            backend=backend,
             enqueue_coro=api_work_queue.enqueue(
                 request_id=request_id,
                 op="training.optim_step",
@@ -2585,7 +2610,7 @@ async def optim_step(
         )
     except Exception as e:
         if inflight_marked and training_manager is not None:
-            training_manager.mark_inflight(request.model_id, -1)
+            _mark_training_inflight(request.model_id, -1)
         await capacity_manager.async_release_all(request_id)
         if created:
             await future_store.async_cleanup(request_id)
@@ -2797,7 +2822,7 @@ async def save_weights_for_sampler(
 
     session, route_session_info = await _resolve_training_route_session(request.model_id)
 
-    if session is None:
+    if not isinstance(route_session_info, dict):
         remote = await async_remote_training_model(request.model_id)
         if remote is not None:
             upstream_alias, base_model = remote
@@ -2847,6 +2872,10 @@ async def save_weights_for_sampler(
             status_code=404, detail=f"Model '{request.model_id}' not found"
         )
 
+    await _protect_training_session_enqueue_window(route_session_info)
+    base_model = str(route_session_info.get("base_model") or "")
+    backend = str(route_session_info.get("backend") or "unknown")
+
     user_id = _get_user_id(http_request)
     from ..client_compat import prefer_tinker_uri
 
@@ -2874,11 +2903,14 @@ async def save_weights_for_sampler(
         await _protect_training_session_enqueue_window(route_session_info)
         _mark_training_inflight(request.model_id, +1)
         inflight_marked = True
-        scheduler_extra = _build_training_scheduler_extra(
-            session=session,
-            model_id=request.model_id,
-            training_op="save_weights_for_sampler",
-            seq_id=request.seq_id,
+        scheduler_extra = merge_queue_priority_extra(
+            _build_training_scheduler_extra(
+                session=route_session_info,
+                model_id=request.model_id,
+                training_op="save_weights_for_sampler",
+                seq_id=request.seq_id,
+            ),
+            request=http_request,
         )
         scheduler_extra["prefer_tinker"] = bool(prefer_tinker)
         scheduler_extra["is_admin"] = can_manage_system(http_request)
@@ -2893,8 +2925,8 @@ async def save_weights_for_sampler(
             request_id=request_id,
             op="training.save_weights_for_sampler",
             model_id=request.model_id,
-            base_model=session.base_model,
-            backend=session.backend,
+            base_model=base_model,
+            backend=backend,
             enqueue_coro=api_work_queue.enqueue(
                 request_id=request_id,
                 op="training.save_weights_for_sampler",
@@ -2906,7 +2938,7 @@ async def save_weights_for_sampler(
         )
     except Exception as e:
         if inflight_marked and training_manager is not None:
-            training_manager.mark_inflight(request.model_id, -1)
+            _mark_training_inflight(request.model_id, -1)
         await capacity_manager.async_release_all(request_id)
         if created:
             await future_store.async_cleanup(request_id)

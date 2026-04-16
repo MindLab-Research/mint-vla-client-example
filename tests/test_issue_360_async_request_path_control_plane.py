@@ -810,7 +810,6 @@ def _install_stateless_training_enqueue_stubs(monkeypatch, *, route_session_info
     monkeypatch.setattr(training_route, "_get_training_route_session_info", _get_training_route_session_info)
     monkeypatch.setattr(training_route, "build_billing_auth_context", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(training_route, "can_access_model", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(training_route, "is_admin_request", lambda _request: False)
     monkeypatch.setattr(cm, "capacity_manager", cap)
     monkeypatch.setattr(awq, "api_work_queue", q)
     monkeypatch.setattr(rse, "estimate_small_result_bytes", lambda: 0)
