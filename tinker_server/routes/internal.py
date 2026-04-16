@@ -265,6 +265,8 @@ async def admission_stats(*, include_actor_rss: bool = True) -> dict:
     try:
         if not include_actor_rss and hasattr(future_store, "metrics_snapshot"):
             fs = future_store.metrics_snapshot()
+        elif hasattr(future_store, "async_ensure_ready"):
+            fs = await future_store.async_ensure_ready(timeout_s=timeout_s)
         else:
             fs = future_store.ensure_ready(timeout_s=timeout_s)
     except Exception as e:

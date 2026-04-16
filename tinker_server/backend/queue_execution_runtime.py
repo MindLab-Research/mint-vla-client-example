@@ -26,6 +26,9 @@ def _runtime_env_overrides() -> dict[str, str]:
     direct_keys = (
         "MINT_QUEUE_EXECUTION_RUNTIME_ACTOR_NAME",
         "MINT_QUEUE_SUPERVISOR_ACTOR_NAME",
+        "TINKER_API_WORK_QUEUE_ACTOR_NAME",
+        "MINT_API_WORK_QUEUE_ACTOR_NAME",
+        "MINT_API_WORK_QUEUE_PINNED_NODE_IP",
         "MINT_FUTURE_STORE_ACTOR_NAME",
         "MINT_GATEWAY_SESSION_STORE_ACTOR_NAME",
         "MINT_SAMPLING_SESSION_STORE_ACTOR_NAME",
@@ -37,6 +40,20 @@ def _runtime_env_overrides() -> dict[str, str]:
         "MINT_TRAINING_CLEANUP_EXECUTOR_ACTOR_NAME",
         "MINT_SAMPLING_CLEANUP_EXECUTOR_ACTOR_NAME",
         "MINT_API_WORK_QUEUE_ACTOR_MAX_CONCURRENCY",
+        "MINT_SUPPORTED_MODELS",
+        "TINKER_SUPPORTED_MODELS",
+        "ALLOW_UNSUPPORTED_MODELS",
+        "TINKER_ENABLE_MULTI_LORA",
+        "MINT_MODEL_NODE_IPS_JSON",
+        "MINT_DENSE_MODEL_NODE_IPS_JSON",
+        "MINT_MEGATRON_MODEL_NODE_IPS_JSON",
+        "MINT_VLLM_MODEL_NODE_IPS_JSON",
+        "MINT_VLLM_PINNED_NODE_IP_JSON",
+        "HF_HOME",
+        "HF_HUB_OFFLINE",
+        "OPENPI_DATA_HOME",
+        "XDG_CACHE_HOME",
+        "TMPDIR",
         "TINKER_RAY_NAMESPACE",
         "MINT_RAY_NAMESPACE",
         "MINT_K2_INFER_VOLC_RESOURCE_QUEUE_ID",
@@ -48,6 +65,9 @@ def _runtime_env_overrides() -> dict[str, str]:
         "MINT_MEGATRON_MODEL_NODE_IPS_JSON",
         "MINT_MEGATRON_NODE_IPS_CSV",
         "MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID",
+        "MINT_MBRIDGE_EXPORT_GLOO_TIMEOUT_S",
+        "MINT_MBRIDGE_EXPORT_GATHER_DEBUG",
+        "MINT_MBRIDGE_EXPORT_GLOO_BARRIER_DEBUG",
         "MINT_SUPPORTED_MODELS",
         "MINT_RUNTIME_OBSERVABILITY_FLUSH_S",
     )
@@ -55,6 +75,9 @@ def _runtime_env_overrides() -> dict[str, str]:
         value = os.environ.get(key, "").strip()
         if value:
             out[key] = value
+    for key, value in os.environ.items():
+        if key.startswith("MINT_OPENPI_") and value.strip():
+            out[key] = value.strip()
 
     # Canonicalize legacy actor-name envs before detached runtime actors inherit them.
     compat_keys = {
@@ -128,11 +151,12 @@ async def _restore_sampling_sessions_for_worker(inference_manager) -> int:
 
 async def _initialize_execution_bindings() -> dict[str, Any]:
     from ..config import config
-    from ..routes import mint, sampling, service, training, weights
+    from ..routes import action_sampling, mint, sampling, service, training, weights
+    from .action_session_manager import ActionSessionRouter
     from .sampling_session_store import ensure_ready as ensure_sampling_session_store_ready
     from .session_manager import DEFAULT_INACTIVITY_TIMEOUT, SessionManager
+    from .training_engine_router import TrainingEngineRouter
     from .training_session_manager import TrainingSessionManager
-    from .verl_training import VerlTrainingEngine
 
     inference_manager = SessionManager(
         tensor_parallel_size=config.tensor_parallel_size,
@@ -176,14 +200,17 @@ async def _initialize_execution_bindings() -> dict[str, Any]:
     train_manager = TrainingSessionManager(
         inactivity_timeout=config.training_inactivity_timeout_s,
     )
-    train_engine = VerlTrainingEngine()
+    train_engine = TrainingEngineRouter()
+    action_manager = ActionSessionRouter()
     await train_engine.initialize()
 
+    action_sampling.action_session_manager = action_manager
     training.training_manager = train_manager
     training.training_engine = train_engine
     training.inference_manager = inference_manager
     mint.training_manager = train_manager
     mint.training_engine = train_engine
+    mint.action_session_manager = action_manager
     weights.training_manager = train_manager
     weights.training_engine = train_engine
     weights.inference_manager = inference_manager
@@ -191,10 +218,23 @@ async def _initialize_execution_bindings() -> dict[str, Any]:
     return {
         "inference_manager": inference_manager,
         "train_manager": train_manager,
+        "train_engine": train_engine,
         "multi_model_manager": multi_model_manager,
         "restored_sampling_sessions": int(restored_sampling_sessions),
         "multi_model_enabled": bool(config.enable_multi_lora),
     }
+
+
+async def _initialize_execution_runtime(*, prewarm: bool) -> dict[str, Any]:
+    bindings = await _initialize_execution_bindings()
+    if prewarm:
+        from .persistent_prewarm import prewarm_persistent_models
+
+        await prewarm_persistent_models(
+            bindings.get("train_engine"),
+            bindings.get("multi_model_manager"),
+        )
+    return bindings
 
 
 def _get_or_create_actor():
@@ -251,7 +291,7 @@ def _get_or_create_actor():
             async with self._lock:
                 try:
                     if not self._runtime_initialized:
-                        await _initialize_execution_bindings()
+                        await _initialize_execution_runtime(prewarm=True)
                         self._runtime_initialized = True
                     await self._ensure_observability_flush_task()
                     await capacity_manager.async_ensure_ready()
@@ -272,7 +312,7 @@ def _get_or_create_actor():
             from ..routes import training
 
             if not self._runtime_initialized:
-                await _initialize_execution_bindings()
+                await _initialize_execution_runtime(prewarm=True)
                 self._runtime_initialized = True
             session, _snapshot = await training._get_training_session_for_request(str(model_id))
             if session is None:

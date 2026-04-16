@@ -70,9 +70,6 @@ class _StubTrainingEngine:
         self.unbind_calls.append(session.model_id)
         session.is_active = False
 
-    async def shutdown_session(self, session):
-        await self.delete_session(session)
-
     async def delete_session(self, session):
         self.delete_calls.append(session.model_id)
         worker = self._workers.get(session.model_id)

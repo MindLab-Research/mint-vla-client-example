@@ -11,8 +11,8 @@ export TINKER_PORT=8000
 export TINKER_CHECKPOINT_DIR=/tos-mindverse/tinker_checkpoints
 export TINKER_USAGE_LOG_DIR=/vePFS-Mindverse/share/mint-prod-data/billing
 
-export TINKER_RAY_NAMESPACE=tinker_leixiang 
-export MINT_RAY_NAMESPACE=tinker_leixiang 
+export TINKER_RAY_NAMESPACE=tinker_leixiang
+export MINT_RAY_NAMESPACE=tinker_leixiang
 
 export MINT_SUPPORTED_MODELS="Qwen/Qwen3-0.6B,Qwen/Qwen3-4B-Instruct-2507,Qwen/Qwen3-4B-Thinking-2507,Qwen/Qwen3-30B-A3B-Instruct-2507"
 export MINT_PERSISTENT_MODELS="Qwen/Qwen3-0.6B,Qwen/Qwen3-4B-Instruct-2507,Qwen/Qwen3-4B-Thinking-2507,Qwen/Qwen3-30B-A3B-Instruct-2507"
@@ -69,7 +69,8 @@ export PYTHONDONTWRITEBYTECODE=1
 export MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID=q-20251126180002-26lwz
 export MINT_VLLM_VOLC_RESOURCE_QUEUE_ID=q-20251126180002-26lwz
 export RAY_ADDRESS=192.168.38.184:6379
-
+export MINT_TMP_ROOT="${MINT_TMP_ROOT:-/vePFS-Mindverse/share/mint-data/dev}"
+export TINKER_RUNTIME_CHECKPOINT_DIR=/vePFS-Mindverse/share/tinker_runtime_checkpoints
 
 export MINT_API_WORK_QUEUE_ACTOR_NAME=tinker_api_work_queue_leixiang
 export MINT_API_WORK_QUEUE_ACTOR_MAX_CONCURRENCY=1024

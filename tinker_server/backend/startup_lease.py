@@ -12,7 +12,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from ..config import otel_env_vars
+from ..config import otel_env_vars, preferred_control_plane_resources, preferred_control_plane_resources
 
 logger = logging.getLogger(__name__)
 _ACTOR_HANDLE = None
@@ -125,10 +125,20 @@ def _get_or_create_actor():
         "namespace": namespace,
         "lifetime": "detached",
     }
+    try:
+        resources = preferred_control_plane_resources(
+            ray.cluster_resources(),
+            env_var="MINT_STARTUP_LEASE_PINNED_NODE_IP",
+        )
+        if resources is not None:
+            options["resources"] = resources
+    except Exception:
+        pass
     actor_otel_env = otel_env_vars()
     from ..config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources
 
-    apply_detached_actor_resources(options, ray)
+    if "resources" not in options:
+        apply_detached_actor_resources(options, ray)
     options["runtime_env"] = actor_runtime_env(
         pythonpath=PFS_PYTHONPATH,
         extra=actor_otel_env,

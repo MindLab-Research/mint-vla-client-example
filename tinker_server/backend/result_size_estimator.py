@@ -67,7 +67,15 @@ def _estimate_training_logprobs_result_bytes(data) -> int:
         except Exception:
             n = 0
         if n <= 0:
-            n = len(datum.model_input.to_token_ids())
+            try:
+                n = len(datum.model_input.to_token_ids())
+            except Exception:
+                try:
+                    # Multimodal VLA requests (for example pi0.5 flow matching)
+                    # are not flattenable to token ids; use chunk length instead.
+                    n = int(datum.model_input.length)
+                except Exception:
+                    n = 1
         total_targets += int(n)
 
     # Result payloads for training forward/forward_backward are Python dicts of Python lists

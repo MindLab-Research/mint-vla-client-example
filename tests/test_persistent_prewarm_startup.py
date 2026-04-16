@@ -87,7 +87,7 @@ class _StubFutureStore:
         self.async_ensure_started_calls += 1
         return None
 
-    async def async_ensure_ready(self) -> None:
+    async def async_ensure_ready(self, **_kwargs) -> None:
         self.async_ensure_ready_calls += 1
         if self.fail_async_ensure_ready:
             raise RuntimeError("future store stats probe failed")
@@ -169,7 +169,6 @@ class _StubApiWorkQueue:
         if self.fail_async_ensure_ready:
             raise RuntimeError("api work queue stats probe failed")
         return {"depth": 0, "enqueued": 0, "dequeued": 0, "timeout_s": float(timeout_s)}
-
     def set_executor(self, _op: str, _executor) -> None:
         return None
 
@@ -212,11 +211,19 @@ class _StubOwnerRuntimeSupervisor:
 
 
 class _StubQueueExecutionRuntime:
-    def __init__(self):
-        self.ensure_started_calls: list[int] = []
+    def __init__(self, *, fail_async_ensure_started: str | None = None):
+        self.fail_async_ensure_started = fail_async_ensure_started
+        self.ensure_started_calls: list[dict[str, float | int]] = []
 
     async def async_ensure_started(self, *, num_workers: int, timeout_s: float = 120.0):
-        self.ensure_started_calls.append(int(num_workers))
+        self.ensure_started_calls.append(
+            {
+                "num_workers": int(num_workers),
+                "timeout_s": float(timeout_s),
+            }
+        )
+        if self.fail_async_ensure_started is not None:
+            raise RuntimeError(self.fail_async_ensure_started)
         return {
             "actor_name": "tinker_queue_execution_runtime",
             "desired_workers": int(num_workers),
@@ -322,20 +329,18 @@ def _install_lifespan_stubs(
     monkeypatch.setattr(usage_store_module, "close_usage_store", _noop_async)
 
 
-def test_lifespan_waits_for_prewarm_and_fails_startup(monkeypatch) -> None:
+def test_lifespan_surfaces_queue_runtime_prewarm_failure(monkeypatch) -> None:
     queue = _StubApiWorkQueue()
     owner_runtime = _StubOwnerRuntimeSupervisor()
-    queue_execution_runtime = _StubQueueExecutionRuntime()
+    queue_execution_runtime = _StubQueueExecutionRuntime(
+        fail_async_ensure_started="prewarm failed: pinned worker full"
+    )
     _install_lifespan_stubs(monkeypatch, queue, owner_runtime, queue_execution_runtime)
     lease = _StubStartupLease(is_owner=True)
-
-    async def _fail_prewarm(*_args, **_kwargs) -> None:
-        raise RuntimeError("prewarm failed: pinned worker full")
 
     async def _acquire_startup_lease(*_args, **_kwargs):
         return lease
 
-    monkeypatch.setattr(app_module, "_prewarm_persistent_models", _fail_prewarm)
     monkeypatch.setattr(
         "tinker_server.backend.startup_lease.acquire_startup_lease",
         _acquire_startup_lease,
@@ -344,17 +349,19 @@ def test_lifespan_waits_for_prewarm_and_fails_startup(monkeypatch) -> None:
     async def _run() -> None:
         with pytest.raises(RuntimeError, match="prewarm failed: pinned worker full"):
             async with app_module.lifespan(app_module.app):
-                raise AssertionError("lifespan should not yield on prewarm failure")
+                raise AssertionError("lifespan should not yield on queue runtime prewarm failure")
 
     asyncio.run(_run())
     assert queue.started_workers == 0
     assert owner_runtime.started == 1
     assert lease.released is True
     assert app_module.service.session_manager is None
-    assert queue_execution_runtime.ensure_started_calls == []
+    assert queue_execution_runtime.ensure_started_calls == [
+        {"num_workers": 1, "timeout_s": 120.0}
+    ]
 
 
-def test_lifespan_fails_loudly_when_training_prewarm_configured_without_local_runtime(monkeypatch) -> None:
+def test_lifespan_routes_persistent_prewarm_to_queue_runtime(monkeypatch) -> None:
     queue = _StubApiWorkQueue()
     owner_runtime = _StubOwnerRuntimeSupervisor()
     queue_execution_runtime = _StubQueueExecutionRuntime()
@@ -364,28 +371,64 @@ def test_lifespan_fails_loudly_when_training_prewarm_configured_without_local_ru
     async def _acquire_startup_lease(*_args, **_kwargs):
         return lease
 
+    async def _fail_if_called(*_args, **_kwargs) -> None:
+        raise AssertionError("API-process prewarm path should be unused in detached runtime mode")
+
     monkeypatch.setattr(app_module.config, "prewarm_persistent_models_csv", "Qwen/Qwen3-30B-A3B-Instruct-2507")
     monkeypatch.setattr(app_module.config, "prewarm_enable_training", True)
     monkeypatch.setattr(app_module.config, "prewarm_enable_inference", False)
+    monkeypatch.setattr(app_module, "_prewarm_persistent_models", _fail_if_called)
     monkeypatch.setattr(
         "tinker_server.backend.startup_lease.acquire_startup_lease",
         _acquire_startup_lease,
     )
 
     async def _run() -> None:
-        with pytest.raises(
-            RuntimeError,
-            match="persistent prewarm training configured but unavailable in API process",
-        ):
-            async with app_module.lifespan(app_module.app):
-                raise AssertionError("lifespan should not yield when detached prewarm is unavailable")
+        async with app_module.lifespan(app_module.app):
+            return None
 
     asyncio.run(_run())
     assert queue.started_workers == 0
     assert owner_runtime.started == 1
     assert lease.released is True
     assert app_module.service.session_manager is None
-    assert queue_execution_runtime.ensure_started_calls == []
+    assert queue_execution_runtime.ensure_started_calls == [
+        {
+            "num_workers": 1,
+            "timeout_s": app_module._queue_execution_runtime_start_timeout_s(),
+        }
+    ]
+
+
+@pytest.mark.anyio
+async def test_initialize_execution_runtime_runs_prewarm_after_bindings(monkeypatch) -> None:
+    runtime_module = importlib.import_module("tinker_server.backend.queue_execution_runtime")
+    calls: list[tuple[object, object]] = []
+    train_engine = object()
+    multi_model_manager = object()
+
+    async def _fake_initialize_execution_bindings():
+        return {
+            "inference_manager": object(),
+            "train_manager": object(),
+            "train_engine": train_engine,
+            "multi_model_manager": multi_model_manager,
+        }
+
+    async def _fake_prewarm(train_engine_arg, multi_model_manager_arg) -> None:
+        calls.append((train_engine_arg, multi_model_manager_arg))
+
+    monkeypatch.setattr(runtime_module, "_initialize_execution_bindings", _fake_initialize_execution_bindings)
+    monkeypatch.setattr(
+        "tinker_server.backend.persistent_prewarm.prewarm_persistent_models",
+        _fake_prewarm,
+    )
+
+    bindings = await runtime_module._initialize_execution_runtime(prewarm=True)
+
+    assert bindings["train_engine"] is train_engine
+    assert bindings["multi_model_manager"] is multi_model_manager
+    assert calls == [(train_engine, multi_model_manager)]
 
 
 def test_lifespan_follower_skips_leader_only_startup(monkeypatch) -> None:
@@ -426,7 +469,9 @@ def test_lifespan_follower_skips_leader_only_startup(monkeypatch) -> None:
     assert lease.heartbeat_started is False
     assert lease.released is True
     assert app_module.service.session_manager is None
-    assert queue_execution_runtime.ensure_started_calls == [1]
+    assert queue_execution_runtime.ensure_started_calls == [
+        {"num_workers": 1, "timeout_s": 120.0}
+    ]
     assert len(init_ray_calls) == 0
 
 
@@ -499,7 +544,9 @@ def test_lifespan_uses_started_probes_for_queue_and_future_store(monkeypatch) ->
     assert future_store.async_ensure_ready_calls == 0
     assert queue.async_ensure_started_calls == 1
     assert queue.async_ensure_ready_calls == 0
-    assert queue_execution_runtime.ensure_started_calls == [1]
+    assert queue_execution_runtime.ensure_started_calls == [
+        {"num_workers": 1, "timeout_s": 120.0}
+    ]
     assert lease.released is True
 
 
@@ -521,6 +568,126 @@ async def test_acquire_startup_lease_fails_closed_to_follower(monkeypatch) -> No
     assert lease.role == "test-role"
     assert lease.is_owner is False
     assert lease.local_only is False
+
+
+def test_startup_lease_creation_prefers_explicit_pinned_node(monkeypatch) -> None:
+    _install_fake_ray(monkeypatch)
+    startup_lease_module = importlib.import_module("tinker_server.backend.startup_lease")
+    config_module = importlib.import_module("tinker_server.config")
+    fake_ray = importlib.import_module("ray")
+    created_options = {}
+
+    class _FakeRemoteCall:
+        def remote(self, *_args, **_kwargs):
+            return object()
+
+    class _FakeActorHandle:
+        def __init__(self) -> None:
+            self.try_acquire = _FakeRemoteCall()
+
+    class _FakeRemoteBuilder:
+        def remote(self):
+            return _FakeActorHandle()
+
+    class _FakeRemoteClass:
+        @staticmethod
+        def options(**kwargs):
+            created_options.update(kwargs)
+            return _FakeRemoteBuilder()
+
+    def _fake_remote(**kwargs):
+        assert kwargs == {"num_cpus": 0}
+
+        def _decorator(_cls):
+            return _FakeRemoteClass
+
+        return _decorator
+
+    monkeypatch.setattr(fake_ray, "remote", _fake_remote, raising=False)
+    monkeypatch.setattr(
+        fake_ray,
+        "get_actor",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("actor not found")),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        fake_ray,
+        "cluster_resources",
+        lambda: {"node:__internal_head__": 1.0},
+        raising=False,
+    )
+    monkeypatch.setattr(fake_ray, "get", lambda *_args, **_kwargs: {"owner": True}, raising=False)
+    monkeypatch.setattr(config_module, "PFS_RUNTIME_ENV_ROOT", "/tmp/runtime-root")
+    monkeypatch.setattr(config_module, "PFS_TINKER_PATH", "/tmp/tinker-root")
+    monkeypatch.setattr(config_module, "PFS_HF_MODULES_PATH", "/tmp/hf-modules")
+    monkeypatch.setattr(config_module, "PFS_PYTHONPATH", "/tmp/runtime-root/site-packages:/tmp/tinker-root")
+    monkeypatch.setenv("RAY_ADDRESS", "192.168.38.184:6379")
+    monkeypatch.setenv("MINT_STARTUP_LEASE_PINNED_NODE_IP", "192.168.38.176")
+    monkeypatch.setattr(startup_lease_module, "_ACTOR_HANDLE", None)
+
+    startup_lease_module._get_or_create_actor()
+
+    assert created_options["resources"] == {"node:192.168.38.176": 0.001}
+
+
+def test_startup_lease_creation_defaults_to_head_pin(monkeypatch) -> None:
+    _install_fake_ray(monkeypatch)
+    startup_lease_module = importlib.import_module("tinker_server.backend.startup_lease")
+    config_module = importlib.import_module("tinker_server.config")
+    fake_ray = importlib.import_module("ray")
+    created_options = {}
+
+    class _FakeRemoteCall:
+        def remote(self, *_args, **_kwargs):
+            return object()
+
+    class _FakeActorHandle:
+        def __init__(self) -> None:
+            self.try_acquire = _FakeRemoteCall()
+
+    class _FakeRemoteBuilder:
+        def remote(self):
+            return _FakeActorHandle()
+
+    class _FakeRemoteClass:
+        @staticmethod
+        def options(**kwargs):
+            created_options.update(kwargs)
+            return _FakeRemoteBuilder()
+
+    def _fake_remote(**kwargs):
+        assert kwargs == {"num_cpus": 0}
+
+        def _decorator(_cls):
+            return _FakeRemoteClass
+
+        return _decorator
+
+    monkeypatch.setattr(fake_ray, "remote", _fake_remote, raising=False)
+    monkeypatch.setattr(
+        fake_ray,
+        "get_actor",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("actor not found")),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        fake_ray,
+        "cluster_resources",
+        lambda: {"node:__internal_head__": 1.0},
+        raising=False,
+    )
+    monkeypatch.setattr(fake_ray, "get", lambda *_args, **_kwargs: {"owner": True}, raising=False)
+    monkeypatch.setattr(config_module, "PFS_RUNTIME_ENV_ROOT", "/tmp/runtime-root")
+    monkeypatch.setattr(config_module, "PFS_TINKER_PATH", "/tmp/tinker-root")
+    monkeypatch.setattr(config_module, "PFS_HF_MODULES_PATH", "/tmp/hf-modules")
+    monkeypatch.setattr(config_module, "PFS_PYTHONPATH", "/tmp/runtime-root/site-packages:/tmp/tinker-root")
+    monkeypatch.setenv("RAY_ADDRESS", "192.168.38.184:6379")
+    monkeypatch.delenv("MINT_STARTUP_LEASE_PINNED_NODE_IP", raising=False)
+    monkeypatch.setattr(startup_lease_module, "_ACTOR_HANDLE", None)
+
+    startup_lease_module._get_or_create_actor()
+
+    assert created_options["resources"] == {"node:__internal_head__": 0.001}
 
 
 def test_lifespan_keeps_training_route_globals_unbound_in_stateless_api(monkeypatch) -> None:
@@ -557,7 +724,9 @@ def test_lifespan_keeps_training_route_globals_unbound_in_stateless_api(monkeypa
     assert queue.started_workers == 0
     assert owner_runtime.started == 1
     assert lease.released is True
-    assert queue_execution_runtime.ensure_started_calls == [1]
+    assert queue_execution_runtime.ensure_started_calls == [
+        {"num_workers": 1, "timeout_s": 120.0}
+    ]
 
 
 def test_lifespan_local_queue_runtime_cleans_up_bound_handles(monkeypatch) -> None:
@@ -774,7 +943,9 @@ def test_lifespan_skips_tokenizer_preload_for_multi_worker_startup(monkeypatch) 
     asyncio.run(_run())
 
     assert preload_calls == []
-    assert queue_execution_runtime.ensure_started_calls == [1]
+    assert queue_execution_runtime.ensure_started_calls == [
+        {"num_workers": 1, "timeout_s": 120.0}
+    ]
 
 
 @pytest.mark.anyio
@@ -785,7 +956,7 @@ async def test_prewarm_raises_when_training_prewarm_unavailable_in_stateless_api
 
     with pytest.raises(
         RuntimeError,
-        match="persistent prewarm training configured but unavailable in API process",
+        match="persistent prewarm training configured but unavailable in the execution runtime",
     ):
         await app_module._prewarm_persistent_models(None, SimpleNamespace())
 
@@ -816,6 +987,75 @@ async def test_prewarm_raises_when_inference_prewarm_fails(monkeypatch) -> None:
 
     with pytest.raises(RuntimeError, match="pinned worker full"):
         await app_module._prewarm_persistent_models(SimpleNamespace(), _FailingManager())
+
+
+@pytest.mark.anyio
+async def test_cleanup_stale_actors_registers_openpi_shared_actor(monkeypatch) -> None:
+    _install_fake_ray(monkeypatch)
+    from tinker_server.backend import multi_lora_engine
+
+    ray = sys.modules["ray"]
+    actor_name = "openpi_shared_runtime_deadbeef"
+    actor = SimpleNamespace(
+        __ray_ready__=SimpleNamespace(remote=lambda: "ready-ref"),
+        describe=SimpleNamespace(remote=lambda: "describe-ref"),
+    )
+    registered: dict[str, object] = {}
+
+    ray.is_initialized = lambda: True  # type: ignore[attr-defined]
+    ray.get_actor = lambda name, namespace=None: actor  # type: ignore[attr-defined]
+    ray.util.list_named_actors = lambda all_namespaces=True: [  # type: ignore[attr-defined]
+        {"name": actor_name, "namespace": multi_lora_engine.PERSISTENT_NAMESPACE}
+    ]
+
+    def _fake_ray_get(ref, *args, **kwargs):
+        _ = args, kwargs
+        if ref == "ready-ref":
+            return None
+        if ref == "describe-ref":
+            return {
+                "pool_key": {
+                    "base_model": "openpi/pi0-fast-libero-low-mem-finetune",
+                    "worker_module": "tinker_server.backend.openpi_fast_worker",
+                },
+                "actor_id": "actor-123",
+                "node_id": "node-456",
+                "node_ip": "192.168.0.8",
+                "pid": 999,
+                "cuda_visible_devices": "0",
+                "current_session_id": "session-a",
+            }
+        raise AssertionError(f"unexpected ray.get ref: {ref!r}")
+
+    ray.get = _fake_ray_get  # type: ignore[attr-defined]
+
+    resource_pool_module = importlib.import_module("tinker_server.backend.resource_pool")
+
+    class _FakePool:
+        def register(self, **kwargs):
+            registered["register"] = kwargs
+
+        def mark_ready(self, actor_name):
+            registered["mark_ready"] = actor_name
+
+    monkeypatch.setattr(resource_pool_module, "get_resource_pool", lambda: _FakePool())
+    monkeypatch.setattr(app_module.config, "skip_actor_cleanup", False)
+
+    await app_module._cleanup_stale_actors()
+
+    register = registered["register"]
+    assert register["actor_name"] == actor_name
+    assert register["actor_type"].value == "openpi"
+    assert register["num_gpus"] == 1
+    assert register["base_model"] == "openpi/pi0-fast-libero-low-mem-finetune"
+    assert register["session_id"] == "session-a"
+    assert register["node_id"] == "node-456"
+    assert register["metadata"]["pool_key"]["worker_module"] == "tinker_server.backend.openpi_fast_worker"
+    assert register["metadata"]["actor_id"] == "actor-123"
+    assert register["metadata"]["node_ip"] == "192.168.0.8"
+    assert register["metadata"]["pid"] == 999
+    assert register["metadata"]["cuda_visible_devices"] == "0"
+    assert registered["mark_ready"] == actor_name
 
 
 @pytest.mark.anyio
@@ -891,3 +1131,58 @@ async def test_get_engine_checks_capacity_when_named_actor_probe_fails(monkeypat
 
     with pytest.raises(RuntimeError, match="capacity check ran"):
         await manager.get_engine("Qwen/Qwen3-0.6B")
+
+
+@pytest.mark.anyio
+async def test_issue_489_cleanup_stale_actors_uses_relaxed_ready_timeout(monkeypatch) -> None:
+    _install_fake_ray(monkeypatch)
+    import importlib
+
+    ray = importlib.import_module("ray")
+    actor_reconciliation_module = importlib.import_module("tinker_server.backend.actor_reconciliation")
+    resource_pool_module = importlib.import_module("tinker_server.backend.resource_pool")
+    multi_lora_engine_module = importlib.import_module("tinker_server.backend.multi_lora_engine")
+
+    timeout_calls: list[float] = []
+    register_calls: list[dict] = []
+    mark_ready_calls: list[str] = []
+
+    actor_handle = SimpleNamespace(
+        __ray_ready__=SimpleNamespace(remote=lambda: "ready-ref"),
+    )
+
+    monkeypatch.delenv("MINT_STARTUP_RECONCILE_READY_TIMEOUT_S", raising=False)
+    monkeypatch.setattr(app_module.config, "skip_actor_cleanup", False)
+    monkeypatch.setattr(actor_reconciliation_module, "init_ray", lambda **_kwargs: None)
+    monkeypatch.setattr(ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(ray.util, "list_named_actors", lambda **_kwargs: [
+        {"name": "megatron_qwen3_30b_a3b_instruct_2507", "namespace": multi_lora_engine_module.PERSISTENT_NAMESPACE}
+    ])
+    monkeypatch.setattr(ray, "get_actor", lambda *_args, **_kwargs: actor_handle)
+
+    def fake_get(_ref, timeout=None, **_kwargs):
+        timeout_calls.append(timeout)
+        raise ray.exceptions.GetTimeoutError("busy")
+
+    monkeypatch.setattr(ray, "get", fake_get)
+    monkeypatch.setattr(ray.util, "get_placement_group", lambda _name: object())
+    monkeypatch.setattr(ray.util, "placement_group_table", lambda _pg: {"bundles": {"0": {"GPU": 4}}})
+
+    class _FakePool:
+        def register(self, **kwargs):
+            register_calls.append(kwargs)
+
+        def mark_ready(self, actor_name):
+            mark_ready_calls.append(actor_name)
+
+        def unregister(self, _name):
+            return None
+
+    monkeypatch.setattr(resource_pool_module, "get_resource_pool", lambda: _FakePool())
+
+    await app_module._cleanup_stale_actors()
+
+    assert timeout_calls == [5.0]
+    assert len(register_calls) == 1
+    assert register_calls[0]["metadata"] == {"startup_reconcile": "__ray_ready__timeout"}
+    assert mark_ready_calls == []

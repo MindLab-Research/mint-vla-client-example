@@ -21,18 +21,33 @@ from ..checkpoints import (
 )
 from ..client_compat import checkpoint_uri
 from ..logging_context import classify_failure_reason, set_request_id
+from ..model_access_control import can_access_model, get_access_denied_error
 from ..queue_priority import merge_queue_priority_extra
 from ..models.mint_types import (
     ForwardBackwardReverseKLRequest,
     InterpolateCheckpointsRequest,
+    MintCreateActionSessionRequest,
+    MintCreateActionSessionResponse,
+    MintDeleteActionSessionResponse,
+    VLAActRequest,
+    VLADatum,
+    VLATrainStepRequest,
 )
-from ..models.types import UntypedAPIFuture
+from ..models.types import (
+    ActRequest,
+    Datum,
+    ForwardBackwardInput,
+    TrainStepRequest,
+    UntypedAPIFuture,
+)
+from .service import _infer_base_model_from_checkpoint
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 training_manager = None
 training_engine = None
+action_session_manager = None
 
 
 def _get_user_data(request: Request) -> dict | None:
@@ -50,6 +65,12 @@ def _resolve_checkpoint_for_user(path: str, *, user_id: str | None, is_admin: bo
         raise HTTPException(status_code=400, detail=str(e)) from e
     ensure_checkpoint_path_allowed(resolved, user_id=user_id, is_admin=is_admin)
     return materialize_persistent_checkpoint(resolved)
+
+
+def _session_field(session: object, key: str, default=None):
+    if isinstance(session, dict):
+        return session.get(key, default)
+    return getattr(session, key, default)
 
 
 def _reverse_kl_token_stats(data: list) -> tuple[int, int]:
@@ -80,6 +101,263 @@ def _reverse_kl_token_stats(data: list) -> tuple[int, int]:
         )
     return total_tokens, max_seq_len
 
+def _vla_token_stats(data: list[VLADatum]) -> tuple[int, int]:
+    total_tokens = 0
+    max_seq_len = 0
+    for item in data:
+        seq_len = 0
+        for chunk in item.observation.model_input.chunks:
+            if chunk.type == "encoded_text":
+                seq_len += len(chunk.tokens)
+        target_tokens = item.supervision.get("target_tokens")
+        if target_tokens is not None:
+            target_shape = list(target_tokens.shape)
+            if len(target_shape) != 1:
+                raise ValueError(f"target_tokens must be rank-1, got shape={target_shape}")
+            seq_len += int(target_shape[0])
+        total_tokens += seq_len
+        if seq_len > max_seq_len:
+            max_seq_len = seq_len
+    return total_tokens, max_seq_len
+
+
+def _lower_vla_datum(item: VLADatum) -> Datum:
+    if "state" in item.supervision:
+        raise ValueError("VLADatum.supervision must not contain 'state'; use observation.state")
+    return Datum(
+        model_input=item.observation.model_input,
+        loss_fn_inputs={
+            "state": item.observation.state,
+            **item.supervision,
+        },
+    )
+
+
+def _lower_vla_train_step_request(request: VLATrainStepRequest) -> TrainStepRequest:
+    return TrainStepRequest(
+        model_id=request.model_id,
+        seq_id=request.seq_id,
+        adam_params=request.adam_params,
+        forward_backward_input=ForwardBackwardInput(
+            data=[_lower_vla_datum(item) for item in request.data],
+            loss_fn=request.loss_fn,
+            loss_fn_config=request.loss_fn_config,
+        ),
+    )
+@router.post("/action_sessions", response_model=MintCreateActionSessionResponse)
+async def create_action_session(
+    request: MintCreateActionSessionRequest,
+    http_request: Request,
+) -> MintCreateActionSessionResponse:
+    if action_session_manager is None:
+        raise HTTPException(status_code=503, detail="Action session manager not initialized")
+
+    user_id = _get_user_id(http_request)
+    is_admin = is_admin_request(http_request)
+    base_model = request.base_model
+    if not base_model and request.model_path:
+        base_model = _infer_base_model_from_checkpoint(
+            request.model_path,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+    if not base_model:
+        raise HTTPException(status_code=422, detail="base_model is required")
+
+    from ..supported_models_gate import enforce_base_model_allowed
+
+    base_model = await enforce_base_model_allowed(base_model=base_model, http_request=http_request)
+
+    user_data = _get_user_data(http_request)
+    if not can_access_model(base_model, user_data):
+        raise HTTPException(status_code=403, detail=get_access_denied_error(base_model))
+
+    model_path = request.model_path
+    if model_path:
+        model_path = _resolve_checkpoint_for_user(
+            model_path,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    try:
+        action_session_id = await action_session_manager.create_session(  # type: ignore[attr-defined]
+            session_id=request.session_id,
+            action_session_seq_id=request.action_session_seq_id,
+            base_model=base_model,
+            model_path=model_path,
+            user_id=user_id,
+        )
+    except RuntimeError as exc:
+        message = str(exc)
+        if 'pinned node capacity check failed' in message:
+            raise HTTPException(status_code=503, detail=message) from exc
+        raise
+    return MintCreateActionSessionResponse(action_session_id=str(action_session_id))
+
+
+@router.post("/action_sessions/{action_session_id}/act", response_model=UntypedAPIFuture)
+async def act(
+    action_session_id: str,
+    request: VLAActRequest,
+    http_request: Request,
+) -> UntypedAPIFuture:
+    if action_session_manager is None:
+        raise HTTPException(status_code=503, detail="Action session manager not initialized")
+
+    from ..backend.api_work_queue import api_work_queue
+    from ..backend.capacity_manager import capacity_manager
+    from ..backend.result_size_estimator import estimate_small_result_bytes
+
+    queued_request = ActRequest(
+        action_session_id=action_session_id,
+        seq_id=request.seq_id,
+        observation=request.observation.model_input,
+        extra_inputs={"state": request.observation.state},
+        temperature=request.temperature,
+    )
+    request_json = queued_request.model_dump_json().encode("utf-8")
+    request_id = f"act_{uuid.uuid4().hex}"
+    reserve = await capacity_manager.async_try_reserve(
+        request_id,
+        queue_bytes=len(request_json),
+        object_store_bytes=estimate_small_result_bytes(),
+    )
+    if not bool(reserve.get("ok")):
+        raise HTTPException(
+            status_code=429,
+            detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
+        )
+
+    created = False
+    try:
+        await future_store.async_create_with_id(request_id)
+        created = True
+        await future_store.async_mark_queued(
+            request_id,
+            meta={"op": "mint.action.act", "action_session_id": action_session_id},
+        )
+        await api_work_queue.enqueue(
+            request_id=request_id,
+            op="mint.action.act",
+            request_json=request_json,
+            user_id=_get_user_id(http_request),
+            webhook_url=None,
+        )
+    except Exception as e:
+        await capacity_manager.async_release_all(request_id)
+        if created:
+            await future_store.async_cleanup(request_id)
+        raise HTTPException(status_code=503, detail=f"Failed to enqueue action act request: {e}")
+
+    return UntypedAPIFuture(request_id=request_id)
+
+
+@router.post("/vla/train_step", response_model=UntypedAPIFuture)
+async def vla_train_step(
+    request: VLATrainStepRequest,
+    http_request: Request,
+) -> UntypedAPIFuture:
+    route_start_s = time.perf_counter()
+    from . import training as training_routes
+
+    session = None
+    if training_manager is not None:
+        get_session = getattr(training_manager, "get_session", None)
+        if callable(get_session):
+            session = get_session(request.model_id)
+    if session is None:
+        session = await _get_route_training_store_info(request.model_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
+
+    try:
+        _, max_seq_len = _vla_token_stats(request.data)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    base_model = str(_session_field(session, "base_model", "") or "")
+    backend = str(_session_field(session, "backend", "unknown") or "unknown")
+    max_model_len = training_routes._get_max_model_len(base_model)
+    if max_seq_len > max_model_len:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Input sequence length {max_seq_len} exceeds max_model_len {max_model_len} "
+                f"for model {base_model}"
+            ),
+        )
+
+    user_id = _get_user_id(http_request)
+    from ..backend.api_work_queue import api_work_queue
+    from ..backend.capacity_manager import capacity_manager
+    from ..backend.result_size_estimator import estimate_small_result_bytes
+
+    request_json = request.model_dump_json().encode("utf-8")
+    request_id = uuid.uuid4().hex
+    reserve = await capacity_manager.async_try_reserve(
+        request_id,
+        queue_bytes=len(request_json),
+        object_store_bytes=estimate_small_result_bytes(),
+    )
+    if not bool(reserve.get("ok")):
+        raise HTTPException(
+            status_code=429,
+            detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
+        )
+
+    created = False
+    inflight_marked = False
+    try:
+        if training_manager is not None:
+            training_manager.mark_inflight(request.model_id, +1)
+            inflight_marked = True
+        scheduler_extra = training_routes._build_training_scheduler_extra(
+            session=session,
+            model_id=request.model_id,
+            training_op="train_step",
+            seq_id=request.seq_id,
+        )
+        await future_store.async_create_with_id(request_id)
+        created = True
+        await future_store.async_mark_queued(
+            request_id,
+            meta={"op": "mint.vla.train_step", "model_id": request.model_id},
+        )
+        await training_routes._enqueue_training_request_with_trace(
+            route_start_s=route_start_s,
+            request_id=request_id,
+            op="mint.vla.train_step",
+            model_id=request.model_id,
+            base_model=base_model,
+            backend=backend,
+            enqueue_coro=api_work_queue.enqueue(
+                request_id=request_id,
+                op="mint.vla.train_step",
+                request_json=request_json,
+                user_id=user_id,
+                webhook_url=None,
+                extra=scheduler_extra,
+            ),
+        )
+    except Exception as e:
+        if inflight_marked and training_manager is not None:
+            training_manager.mark_inflight(request.model_id, -1)
+        await capacity_manager.async_release_all(request_id)
+        if created:
+            await future_store.async_cleanup(request_id)
+        raise HTTPException(status_code=503, detail=f"Failed to enqueue VLA train_step request: {e}")
+
+    return UntypedAPIFuture(request_id=request_id)
+
+
+@router.delete("/action_sessions/{action_session_id}", response_model=MintDeleteActionSessionResponse)
+async def delete_action_session(action_session_id: str) -> MintDeleteActionSessionResponse:
+    if action_session_manager is None:
+        raise HTTPException(status_code=503, detail="Action session manager not initialized")
+
+    await action_session_manager.shutdown_session(action_session_id)  # type: ignore[attr-defined]
+    return MintDeleteActionSessionResponse(action_session_id=action_session_id)
 
 async def _get_route_training_store_info(model_id: str) -> dict | None:
     from ..routes.training import _get_training_route_session_info
@@ -103,6 +381,36 @@ async def _protect_training_session_enqueue_window(session_info: dict) -> None:
     from ..routes.training import _protect_training_session_enqueue_window as _training_protect
 
     await _training_protect(session_info)
+
+
+def _build_mint_future_meta(
+    *,
+    op: str,
+    model_id: str | None = None,
+    session_info: dict | None = None,
+    extra: dict | None = None,
+) -> dict[str, object]:
+    meta: dict[str, object] = {
+        "op": str(op),
+        "queue_state": "queued",
+        "stage": "queued",
+        "queued_at": time.time(),
+    }
+    if model_id:
+        meta["model_id"] = str(model_id)
+    if isinstance(session_info, dict):
+        session_id = session_info.get("session_id")
+        base_model = session_info.get("base_model")
+        backend = session_info.get("backend")
+        if session_id:
+            meta["session_id"] = str(session_id)
+        if base_model:
+            meta["base_model"] = str(base_model)
+        if backend:
+            meta["backend"] = str(backend)
+    if isinstance(extra, dict):
+        meta.update(extra)
+    return meta
 
 
 @router.post("/checkpoints/interpolate", response_model=UntypedAPIFuture)
@@ -134,7 +442,13 @@ async def interpolate_checkpoints(
         created = True
         await future_store.async_mark_queued(
             request_id,
-            meta={"op": "mint.interpolate_checkpoints"},
+            meta=_build_mint_future_meta(
+                op="mint.interpolate_checkpoints",
+                extra={
+                    "checkpoint_count": len(request.source_paths),
+                    "output_path": request.output_path,
+                },
+            ),
         )
         await api_work_queue.enqueue(
             request_id=request_id,
@@ -283,7 +597,11 @@ async def forward_backward_reverse_kl(
         created = True
         await future_store.async_mark_queued(
             request_id,
-            meta={"op": "mint.forward_backward_reverse_kl", "model_id": request.model_id},
+            meta=_build_mint_future_meta(
+                op="mint.forward_backward_reverse_kl",
+                model_id=request.model_id,
+                session_info=info,
+            ),
         )
         await api_work_queue.enqueue(
             request_id=request_id,
@@ -351,3 +669,29 @@ async def _do_forward_backward_reverse_kl(
             "check_reference_checkpoint_and_reverse_kl_batch_shape",
         )
         await future_store.async_fail(request_id, str(e))
+
+
+async def _do_vla_train_step(
+    request_id: str,
+    request: VLATrainStepRequest,
+    user_id: str | None,
+) -> None:
+    from . import training as training_routes
+
+    try:
+        internal_request = _lower_vla_train_step_request(request)
+    except Exception as e:
+        logger.exception(
+            "[mint.vla.train_step] failed request_id=%s model_id=%s failure_reason=%s error_type=%s next_action=%s",
+            str(request_id),
+            str(request.model_id),
+            classify_failure_reason(e),
+            type(e).__name__,
+            "check_vla_observation_and_supervision_shapes",
+        )
+        await future_store.async_fail(request_id, str(e))
+        if training_manager is not None:
+            training_manager.mark_inflight(request.model_id, -1)
+        return
+
+    await training_routes._do_train_step(request_id, internal_request, user_id)

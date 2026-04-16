@@ -19,6 +19,7 @@ if os.path.isdir("/vllm"):
 
 import math
 import logging
+import shutil
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -713,6 +714,7 @@ def _create_extended_server_class(
             self._vllm_stats_observer = VllmStatsObserver()
             # Track local paths for multi-LoRA (needed for GPU/CPU swap)
             self._lora_paths: dict[int, str] = {}
+            self._owned_lora_paths: set[int] = set()
             self._timing = os.environ.get("MINT_VLLM_REQUEST_TIMING", "").strip().lower() in (
                 "1",
                 "true",
@@ -735,6 +737,17 @@ def _create_extended_server_class(
         def _bind_traceparent(self, traceparent: str | None) -> None:
             if isinstance(traceparent, str) and traceparent:
                 restore_trace_id_from_traceparent(traceparent)
+
+        def _release_tracked_lora_path(self, lora_int_id: int) -> None:
+            path = self._lora_paths.pop(lora_int_id, None)
+            owned = lora_int_id in self._owned_lora_paths
+            self._owned_lora_paths.discard(lora_int_id)
+            if not owned or not path:
+                return
+            try:
+                shutil.rmtree(path, ignore_errors=True)
+            except Exception:
+                logger.exception("failed to clean up temporary LoRA path id=%s path=%s", lora_int_id, path)
 
         async def _update_progress(
             self,
@@ -908,6 +921,8 @@ def _create_extended_server_class(
             Args:
                 lora_request: LoRARequest with lora_path pointing to adapter directory.
             """
+            from .lora_utils import validate_peft_adapter_checkpoint_shapes
+
             # Remove existing LoRA first if present
             try:
                 loaded = await self.engine.list_loras()
@@ -917,6 +932,10 @@ def _create_extended_server_class(
                 pass  # May not have any LoRA loaded
 
             # Add new LoRA
+            validate_peft_adapter_checkpoint_shapes(
+                getattr(lora_request, "lora_path", None),
+                self.model_config.local_path,
+            )
             await self._maybe_ensure_pack_moe_patched_for_adapter_dir(getattr(lora_request, "lora_path", None))
             await self.engine.add_lora(lora_request)
 
@@ -946,6 +965,7 @@ def _create_extended_server_class(
 
             from safetensors.torch import save_file
             from vllm.lora.request import LoRARequest
+            from .lora_utils import validate_peft_adapter_checkpoint_shapes
 
             from verl.workers.rollout.vllm_rollout.utils import (
                 VLLM_LORA_INT_ID,
@@ -973,14 +993,22 @@ def _create_extended_server_class(
                 loaded = await self.engine.list_loras()
                 if VLLM_LORA_INT_ID in loaded:
                     await self.engine.remove_lora(VLLM_LORA_INT_ID)
+                    self._release_tracked_lora_path(VLLM_LORA_INT_ID)
             except Exception:
                 pass
 
-            await self._maybe_ensure_pack_moe_patched_for_state_dict(
-                state_dict,
-                base_model_name_or_path=peft_config.get("base_model_name_or_path"),
-            )
-            await self.engine.add_lora(lora_request)
+            try:
+                await self._maybe_ensure_pack_moe_patched_for_state_dict(
+                    state_dict,
+                    base_model_name_or_path=peft_config.get("base_model_name_or_path"),
+                )
+                await self.engine.add_lora(lora_request)
+            except Exception:
+                shutil.rmtree(adapter_path, ignore_errors=True)
+                raise
+
+            self._lora_paths[VLLM_LORA_INT_ID] = adapter_path
+            self._owned_lora_paths.add(VLLM_LORA_INT_ID)
             return adapter_path
 
         async def list_loras(self) -> set[int]:
@@ -994,8 +1022,7 @@ def _create_extended_server_class(
                 lora_int_id: The LoRA adapter ID to remove.
             """
             await self.engine.remove_lora(lora_int_id)
-            # Clean up path tracking
-            self._lora_paths.pop(lora_int_id, None)
+            self._release_tracked_lora_path(lora_int_id)
 
         async def add_lora_with_id(
             self,
@@ -1058,9 +1085,6 @@ def _create_extended_server_class(
             if debug:
                 print(f"[DEBUG vLLM add_lora_with_id] Saved to {adapter_path}", flush=True)
 
-            # Track path for this lora_int_id (needed for GPU/CPU swap in generate)
-            self._lora_paths[lora_int_id] = adapter_path
-
             # Create LoRARequest with the specific ID
             lora_request = LoRARequest(
                 lora_name=str(lora_int_id),
@@ -1068,12 +1092,23 @@ def _create_extended_server_class(
                 lora_path=adapter_path,
             )
 
-            # Add to engine (no need to remove - this is a new unique ID)
-            await self._maybe_ensure_pack_moe_patched_for_state_dict(
-                state_dict,
-                base_model_name_or_path=peft_config.get("base_model_name_or_path"),
-            )
-            await self.engine.add_lora(lora_request)
+            try:
+                validate_peft_adapter_checkpoint_shapes(
+                    adapter_path,
+                    self.model_config.local_path,
+                )
+                await self._maybe_ensure_pack_moe_patched_for_state_dict(
+                    state_dict,
+                    base_model_name_or_path=peft_config.get("base_model_name_or_path"),
+                )
+                await self.engine.add_lora(lora_request)
+            except Exception:
+                shutil.rmtree(adapter_path, ignore_errors=True)
+                raise
+
+            self._release_tracked_lora_path(lora_int_id)
+            self._lora_paths[lora_int_id] = adapter_path
+            self._owned_lora_paths.add(lora_int_id)
             return adapter_path
 
         @traced_async_from_traceparent(
@@ -1106,6 +1141,7 @@ def _create_extended_server_class(
             """
             self._bind_traceparent(traceparent)
             from vllm.lora.request import LoRARequest
+            from .lora_utils import validate_peft_adapter_checkpoint_shapes
 
             debug = os.environ.get("MINT_VLLM_LORA_DEBUG", "0").strip() in {"1", "true", "yes"}
             if debug:
@@ -1129,9 +1165,14 @@ def _create_extended_server_class(
             if not engine_ready:
                 raise RuntimeError("vLLM engine not ready before add_lora_from_path")
 
+            validate_peft_adapter_checkpoint_shapes(
+                lora_path,
+                self.model_config.local_path,
+            )
             await self._maybe_ensure_pack_moe_patched_for_adapter_dir(lora_path)
             await self.engine.add_lora(lora_request)
 
+            self._release_tracked_lora_path(lora_int_id)
             # Track path for generate_with_lora (needed for GPU/CPU swap)
             self._lora_paths[lora_int_id] = lora_path
             if debug:

@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 import math
-from functools import lru_cache
 import os
 import re
 import subprocess
@@ -24,29 +23,6 @@ class VolcGpuNode:
     volc_job_id: str | None
     volc_resource_queue_id: str | None
 
-
-
-
-@lru_cache(maxsize=1)
-def _available_resources_per_node_remote():
-    @ray.remote(num_cpus=0)
-    def _task():
-        from ray._private import state as ray_state
-
-        return ray_state.available_resources_per_node()
-
-    return _task
-
-
-def _available_resources_per_node_safe() -> dict[str, dict[str, float]]:
-    from ray._private import state as ray_state
-
-    try:
-        return ray_state.available_resources_per_node()
-    except Exception as e:
-        if "Ray has not been started yet" not in str(e):
-            raise
-        return ray.get(_available_resources_per_node_remote().remote())
 
 def parse_csv(value: str | None) -> list[str]:
     if value is None:
@@ -94,15 +70,137 @@ def _volc_job_id_to_resource_queue_id(*, limit: int = 200) -> dict[str, str]:
     return out
 
 
+def _iter_pg_bundle_items(bundles: object) -> list[tuple[str, dict[str, object]]]:
+    items: list[tuple[str, dict[str, object]]] = []
+    if isinstance(bundles, dict):
+        iterator = bundles.items()
+    elif isinstance(bundles, list):
+        iterator = ((str(i), bundle) for i, bundle in enumerate(bundles))
+    else:
+        iterator = ()
+    for bundle_key, bundle in iterator:
+        if isinstance(bundle, dict):
+            items.append((str(bundle_key), bundle))
+    return items
+
+
+def _available_resources_per_node_with_pg_fallback(
+    *,
+    context: str,
+) -> tuple[dict[str, dict[str, float]], bool]:
+    try:
+        from ray._private import state as ray_state
+
+        return ray_state.available_resources_per_node(), True
+    except Exception as e:
+        logger.warning(
+            "%s: available_resources_per_node failed, using placement-group fallback: %s",
+            context,
+            e,
+        )
+
+    alive_nodes = [n for n in ray.nodes() if n.get("Alive")]
+    node_ip_to_id = {
+        str(n.get("NodeManagerAddress") or ""): str(n.get("NodeID") or "")
+        for n in alive_nodes
+        if n.get("NodeManagerAddress") and n.get("NodeID")
+    }
+
+    try:
+        table = ray.util.placement_group_table()
+    except Exception as e:
+        logger.warning("%s: placement_group_table fallback failed: %s", context, e)
+        infos = ()
+    else:
+        if isinstance(table, dict):
+            infos = table.values()
+        elif isinstance(table, list):
+            infos = table
+        else:
+            infos = ()
+
+    used_gpus_by_node: dict[str, float] = {}
+    for info in infos:
+        if not isinstance(info, dict):
+            continue
+        if str(info.get("state") or "") == "REMOVED":
+            continue
+
+        bundles_to_node_id = info.get("bundles_to_node_id") or {}
+        if not isinstance(bundles_to_node_id, dict):
+            bundles_to_node_id = {}
+
+        for bundle_key, bundle in _iter_pg_bundle_items(info.get("bundles") or {}):
+            gpu = float(bundle.get("GPU", 0) or 0)
+            if gpu <= 0:
+                continue
+
+            bundle_idx = int(bundle_key) if bundle_key.isdigit() else None
+            node_id = str(
+                bundles_to_node_id.get(bundle_key)
+                or (bundles_to_node_id.get(bundle_idx) if bundle_idx is not None else "")
+                or ""
+            )
+            if not node_id:
+                pinned_ips = [
+                    key.split("node:", 1)[1]
+                    for key, value in bundle.items()
+                    if isinstance(key, str)
+                    and key.startswith("node:")
+                    and float(value or 0) > 0
+                ]
+                if len(pinned_ips) == 1:
+                    node_id = node_ip_to_id.get(pinned_ips[0], "")
+            if not node_id:
+                continue
+            used_gpus_by_node[node_id] = used_gpus_by_node.get(node_id, 0.0) + gpu
+
+    try:
+        from .resource_pool import get_resource_pool
+
+        for node_id, used_gpus in get_resource_pool().gpus_used_by_node().items():
+            used_gpus_by_node[node_id] = max(
+                used_gpus_by_node.get(node_id, 0.0),
+                float(used_gpus),
+            )
+    except Exception as e:
+        logger.debug("%s: resource_pool fallback failed: %s", context, e)
+
+    fail_closed_on_missing = True
+
+    return (
+        {node_id: {"GPU": -used_gpus} for node_id, used_gpus in used_gpus_by_node.items()},
+        fail_closed_on_missing,
+    )
+
+
+def _available_gpus_for_node(
+    *,
+    total_gpus: int,
+    avail: dict[str, dict[str, float]],
+    node_id: str,
+    fail_closed_on_missing: bool,
+) -> int:
+    node_avail = avail.get(node_id) or {}
+    raw_available = node_avail.get("GPU")
+    if raw_available is None:
+        return 0 if fail_closed_on_missing else total_gpus
+    raw_available_f = float(raw_available or 0)
+    if raw_available_f < 0:
+        reserved_gpus = int(math.ceil(-raw_available_f))
+        return max(0, total_gpus - reserved_gpus)
+    return max(0, int(raw_available_f))
+
+
 def _list_volc_gpu_nodes(*, resource_queue_id: str) -> list[VolcGpuNode]:
     if not ray.is_initialized():
         raise RuntimeError("ray is not initialized (expected to be connected already)")
 
-    from ray._private import state as ray_state
-
     # Volcano CLI can return non-zero for very large limits; keep this bounded.
     job_to_queue = _volc_job_id_to_resource_queue_id(limit=200)
-    avail = _available_resources_per_node_safe()
+    avail, fail_closed_on_missing = _available_resources_per_node_with_pg_fallback(
+        context="_list_volc_gpu_nodes",
+    )
 
     nodes: list[VolcGpuNode] = []
     for n in ray.nodes():
@@ -121,8 +219,12 @@ def _list_volc_gpu_nodes(*, resource_queue_id: str) -> list[VolcGpuNode]:
             continue
 
         total_gpus = int(float(res.get("GPU", 0) or 0))
-        node_avail = avail.get(node_id) or {}
-        available_gpus = int(float(node_avail.get("GPU", 0) or 0))
+        available_gpus = _available_gpus_for_node(
+            total_gpus=total_gpus,
+            avail=avail,
+            node_id=node_id,
+            fail_closed_on_missing=fail_closed_on_missing,
+        )
 
         nodes.append(
             VolcGpuNode(
@@ -152,9 +254,10 @@ def _list_alive_gpu_nodes() -> list[VolcGpuNode]:
     if not ray.is_initialized():
         raise RuntimeError("ray is not initialized (expected to be connected already)")
 
-    from ray._private import state as ray_state
+    avail, fail_closed_on_missing = _available_resources_per_node_with_pg_fallback(
+        context="_list_alive_gpu_nodes",
+    )
 
-    avail = _available_resources_per_node_safe()
     nodes: list[VolcGpuNode] = []
     for n in ray.nodes():
         if not n.get("Alive"):
@@ -167,8 +270,12 @@ def _list_alive_gpu_nodes() -> list[VolcGpuNode]:
         node_ip = str(n.get("NodeManagerAddress") or "")
         hostname = str(n.get("NodeManagerHostname") or "")
         total_gpus = int(float(res.get("GPU", 0) or 0))
-        node_avail = avail.get(node_id) or {}
-        available_gpus = int(float(node_avail.get("GPU", 0) or 0))
+        available_gpus = _available_gpus_for_node(
+            total_gpus=total_gpus,
+            avail=avail,
+            node_id=node_id,
+            fail_closed_on_missing=fail_closed_on_missing,
+        )
         nodes.append(
             VolcGpuNode(
                 node_id=node_id,
@@ -190,7 +297,13 @@ def _gpu_placement_groups() -> list[dict[str, object]]:
         return []
 
     groups: list[dict[str, object]] = []
-    for info in table.values():
+    if isinstance(table, dict):
+        infos = table.values()
+    elif isinstance(table, list):
+        infos = table
+    else:
+        infos = ()
+    for info in infos:
         if not isinstance(info, dict):
             continue
         state = str(info.get("state") or "")
@@ -371,7 +484,9 @@ def _check_cross_namespace_conflicts(requested_node_ips: dict[str, int]) -> str:
         if not ray.is_initialized():
             return ""
 
-        current_namespace = os.environ.get("MINT_RAY_NAMESPACE") or os.environ.get("TINKER_RAY_NAMESPACE")
+        from ..config import RAY_NAMESPACE
+
+        current_namespace = RAY_NAMESPACE
         all_actors = ray.util.list_named_actors(all_namespaces=True)
 
         # Group actors by namespace and node
@@ -457,38 +572,7 @@ def select_free_nodes_from_allowed_ips(
     if required <= 0:
         raise ValueError(f"required_gpus must be > 0, got {required_gpus!r}")
 
-    from ray._private import state as ray_state
-
-    avail = _available_resources_per_node_safe()
-    nodes: list[VolcGpuNode] = []
-    for n in ray.nodes():
-        if not n.get("Alive"):
-            continue
-        res = n.get("Resources") or {}
-        if float(res.get("GPU", 0) or 0) <= 0:
-            continue
-
-        node_ip = str(n.get("NodeManagerAddress") or "")
-        if node_ip not in allowed:
-            continue
-
-        node_id = str(n.get("NodeID") or "")
-        hostname = str(n.get("NodeManagerHostname") or "")
-        total_gpus = int(float(res.get("GPU", 0) or 0))
-        node_avail = avail.get(node_id) or {}
-        available_gpus = int(float(node_avail.get("GPU", 0) or 0))
-
-        nodes.append(
-            VolcGpuNode(
-                node_id=node_id,
-                node_ip=node_ip,
-                hostname=hostname,
-                total_gpus=total_gpus,
-                available_gpus=available_gpus,
-                volc_job_id=_parse_volc_job_id_from_hostname(hostname),
-                volc_resource_queue_id=None,
-            )
-        )
+    nodes = [n for n in _list_alive_gpu_nodes() if n.node_ip in allowed]
 
     if not nodes:
         raise RuntimeError(f"no alive GPU Ray nodes found within allowed_node_ips={sorted(allowed)}")

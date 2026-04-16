@@ -20,6 +20,15 @@ Entrypoint: |
   from ray._private.parameter import RayParams
 
   HEAD_IP_PATH = "/vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt"
+  TMP_ROOT = os.environ.get("MINT_TMP_ROOT", "/vePFS-Mindverse/share/mint-data/prod")
+  RAY_TMP_ROOT_REAL = f"{TMP_ROOT}/head"
+  RAY_TMP_LINK = "/tmp/mph"
+  RAY_TEMP_DIR = f"{RAY_TMP_LINK}/t"
+  RAY_OBJECT_SPILLING_DIR = f"{RAY_TMP_LINK}/s"
+  RAY_OS_TMPDIR = f"{RAY_TMP_LINK}/tmp"
+  RAY_XDG_CACHE_HOME = f"{RAY_TMP_LINK}/cache"
+  RAY_RUNTIME_ENV_WORKING_DIR_CACHE_SIZE_GB = "2"
+  RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB = "2"
   CHECK_INTERVAL_S = 10
   BACKOFF_INITIAL_S = 5
   BACKOFF_MAX_S = 60
@@ -49,12 +58,35 @@ Entrypoint: |
   while True:
       ip = ray.util.get_node_ip_address()
       print(f"Local node IP: {ip}", flush=True)
+      os.makedirs(RAY_TMP_ROOT_REAL, exist_ok=True)
+      if os.path.lexists(RAY_TMP_LINK):
+          if os.path.islink(RAY_TMP_LINK) or os.path.isfile(RAY_TMP_LINK):
+              os.unlink(RAY_TMP_LINK)
+          else:
+              raise RuntimeError(f"refusing to replace non-link temp path: {RAY_TMP_LINK}")
+      os.symlink(RAY_TMP_ROOT_REAL, RAY_TMP_LINK)
+      os.makedirs(RAY_TEMP_DIR, exist_ok=True)
+      os.makedirs(RAY_OBJECT_SPILLING_DIR, exist_ok=True)
+      os.makedirs(RAY_OS_TMPDIR, exist_ok=True)
+      os.makedirs(RAY_XDG_CACHE_HOME, exist_ok=True)
+      os.environ["TMPDIR"] = RAY_OS_TMPDIR
+      os.environ["XDG_CACHE_HOME"] = RAY_XDG_CACHE_HOME
+      os.environ.setdefault("RAY_RUNTIME_ENV_WORKING_DIR_CACHE_SIZE_GB", RAY_RUNTIME_ENV_WORKING_DIR_CACHE_SIZE_GB)
+      os.environ.setdefault("RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB", RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB)
+      print(
+          "mint-prod head using "
+          f"temp_dir={RAY_TEMP_DIR} object_spilling_directory={RAY_OBJECT_SPILLING_DIR} "
+          f"tmpdir={RAY_OS_TMPDIR} xdg_cache_home={RAY_XDG_CACHE_HOME} tmp_root={TMP_ROOT} real_root={RAY_TMP_ROOT_REAL}",
+          flush=True,
+      )
 
       ray_params = RayParams(
           num_cpus=4,
           num_gpus=0,
           include_dashboard=False,
           gcs_server_port=6379,
+          temp_dir=RAY_TEMP_DIR,
+          object_spilling_directory=RAY_OBJECT_SPILLING_DIR,
       )
       node = None
       healthy_checks = 0

@@ -1,7 +1,14 @@
 from __future__ import annotations
 
 from tinker_server.backend.result_size_estimator import estimate_forward_result_bytes
-from tinker_server.models.types import Datum, ForwardBackwardInput, ForwardRequest, ModelInput
+from tinker_server.models.types import (
+    Datum,
+    EncodedTextChunk,
+    ForwardBackwardInput,
+    ForwardRequest,
+    ImageChunk,
+    ModelInput,
+)
 
 
 def _mk_forward_req(*, prompt_tokens: int, target_tokens: int | None) -> ForwardRequest:
@@ -29,3 +36,20 @@ def test_estimate_forward_result_bytes_falls_back_to_model_input_len() -> None:
     req = _mk_forward_req(prompt_tokens=10, target_tokens=None)
     assert estimate_forward_result_bytes(req) == 8192 + 10 * 64 + 1 * 4096
 
+
+def test_estimate_forward_result_bytes_supports_multimodal_without_target_tokens() -> None:
+    datum = Datum(
+        model_input=ModelInput(
+            chunks=[
+                ImageChunk(data=b"\x89PNG", format="png", expected_tokens=256),
+                EncodedTextChunk(tokens=[11, 12]),
+            ]
+        ),
+        loss_fn_inputs={},
+    )
+    req = ForwardRequest(
+        model_id="m",
+        forward_input=ForwardBackwardInput(data=[datum], loss_fn="cross_entropy"),
+    )
+    # raw = 8192 + total_targets*64 + num_items*4096.
+    assert estimate_forward_result_bytes(req) == 8192 + (256 + 2) * 64 + 1 * 4096

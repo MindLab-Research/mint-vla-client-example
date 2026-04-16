@@ -17,7 +17,6 @@ from .runtime_env import (
     env_nonempty as _runtime_env_nonempty,
 )
 from .checkpoints import DEFAULT_RUNTIME_CHECKPOINTS_DIR
-from .ray_utils import require_ray_address
 
 
 def _env_nonempty(environ: dict[str, str], name: str) -> str | None:
@@ -168,6 +167,21 @@ def otel_env_vars() -> dict[str, str]:
     return out
 
 
+def preferred_control_plane_resources(
+    cluster_resources: dict[str, float] | None,
+    *,
+    env_var: str | None = None,
+) -> dict[str, float] | None:
+    for candidate in (env_var, "MINT_CONTROL_PLANE_PINNED_NODE_IP"):
+        if not candidate:
+            continue
+        pinned_node_ip = _env_nonempty(os.environ, candidate)
+        if pinned_node_ip is not None:
+            return {f"node:{pinned_node_ip}": 0.001}
+    if cluster_resources and "node:__internal_head__" in cluster_resources:
+        return {"node:__internal_head__": 0.001}
+    return None
+
 def _env_nonempty_any(environ: dict[str, str], *names: str) -> tuple[str | None, str | None]:
     for name in names:
         value = _env_nonempty(environ, name)
@@ -177,23 +191,32 @@ def _env_nonempty_any(environ: dict[str, str], *names: str) -> tuple[str | None,
 
 
 def actor_runtime_env_vars(*, pythonpath: str, extra: dict[str, str] | None = None) -> dict[str, str]:
-    ensure_runtime_env_configured()
+    if not PFS_RUNTIME_ENV_ROOT:
+        raise RuntimeError("PFS_RUNTIME_ENV_ROOT is required")
+    if not PFS_TINKER_PATH:
+        raise RuntimeError("PFS_TINKER_PATH is required")
+    if not PFS_HF_MODULES_PATH:
+        raise RuntimeError("PFS_HF_MODULES_PATH is required")
+    ray_address = _env_nonempty(os.environ, "RAY_ADDRESS")
+    if ray_address is None:
+        raise RuntimeError("RAY_ADDRESS is required")
+
     out = {
+        "TINKER_RAY_NAMESPACE": RAY_NAMESPACE,
+        "PYTHONPATH": pythonpath,
         "PFS_RUNTIME_ENV_ROOT": PFS_RUNTIME_ENV_ROOT,
         "PFS_TINKER_PATH": PFS_TINKER_PATH,
         "PFS_HF_MODULES_PATH": PFS_HF_MODULES_PATH,
-        "RAY_ADDRESS": require_ray_address(),
-        "TINKER_RAY_NAMESPACE": RAY_NAMESPACE,
-        "PYTHONPATH": pythonpath,
+        "RAY_ADDRESS": ray_address,
     }
-    ray_address = _env_nonempty(os.environ, "RAY_ADDRESS")
-    if ray_address is not None:
-        out["RAY_ADDRESS"] = ray_address
     config_path = _env_nonempty(os.environ, "TINKER_CONFIG_PATH")
     if config_path is not None:
         out["TINKER_CONFIG_PATH"] = config_path
     for key in (
         "MINT_VLLM_CHILD_PYTHON_EXECUTABLE",
+        "MINT_CONTROL_PLANE_PINNED_NODE_IP",
+        "MINT_API_WORK_QUEUE_PINNED_NODE_IP",
+        "MINT_STARTUP_LEASE_PINNED_NODE_IP",
         "TINKER_ACTOR_LD_LIBRARY_PATH",
         "MINT_SFT_DIAG_FAIL",
         "MINT_REVERSE_KL_DIAG_FAIL",
@@ -202,6 +225,9 @@ def actor_runtime_env_vars(*, pythonpath: str, extra: dict[str, str] | None = No
         "TINKER_LEGACY_DENSE_SESSION_STATE_ROOTS",
         "MINT_DETACHED_ACTOR_NODE_IP",
         "MINT_RAY_HEAD_ADDRESS_PATH",
+        "TINKER_USAGE_LOG_DIR",
+        "TINKER_USAGE_BACKEND",
+        "TINKER_USAGE_PG_DSN",
     ):
         value = _env_nonempty(os.environ, key)
         if value is not None:
@@ -238,8 +264,9 @@ def detached_actor_resource_key(ray_module: Any | None = None) -> str | None:
         cluster_resources = (ray_module or __import__("ray")).cluster_resources()
     except Exception:
         return None
-    if "node:__internal_head__" in cluster_resources:
-        return "node:__internal_head__"
+    preferred = preferred_control_plane_resources(cluster_resources)
+    if preferred is not None:
+        return next(iter(preferred))
     return None
 
 
@@ -249,6 +276,29 @@ def apply_detached_actor_resources(options: dict[str, object], ray_module: Any |
         options["resources"] = {key: 0.001}
 
 
+def _worker_visible_py_executable(path: str | None) -> str | None:
+    raw = str(path or "").strip()
+    if not raw:
+        return None
+
+    job_working_dir = _env_nonempty(os.environ, "MINT_RAY_JOB_WORKING_DIR")
+    if not job_working_dir:
+        return raw
+
+    try:
+        rel = Path(raw).resolve().relative_to(Path(job_working_dir).resolve())
+    except Exception:
+        return raw
+
+    rel_path = f"./{rel.as_posix()}"
+    # Ray Client uploads `working_dir` as a package on the cluster. Workers cannot
+    # see the driver's absolute repo path. `.py` wrappers also lose their executable
+    # bit after packaging on this cluster, so invoke them through `python`.
+    if rel.suffix == ".py":
+        return f"python {rel_path}"
+    return rel_path
+
+
 def preferred_vllm_python_executable() -> str | None:
     explicit = _env_nonempty(os.environ, "MINT_VLLM_CHILD_PYTHON_EXECUTABLE")
     if explicit:
@@ -256,8 +306,8 @@ def preferred_vllm_python_executable() -> str | None:
     if PFS_TINKER_PATH:
         candidate = Path(PFS_TINKER_PATH) / "scripts" / "vllm_worker_python.py"
         if candidate.exists():
-            return str(candidate)
-    return None
+            return _worker_visible_py_executable(str(candidate))
+    return _worker_visible_py_executable(_env_nonempty(os.environ, "MINT_VLLM_CHILD_PYTHON_EXECUTABLE"))
 
 
 def preferred_torch_lib_dirs(environ: dict[str, str] | None = None) -> list[str]:
@@ -322,10 +372,10 @@ class ServerConfig:
     token_secret_key: str = ""  # Secret for sk- token decryption. If set, accepts encrypted tokens.
     internal_api_token: str = ""  # Shared token for trusting gateway-forwarded billing headers.
 
-    # Usage billing (Postgres only)
-    usage_log_dir: str = "/tmp/tinker_usage"  # deprecated, kept for compatibility
-    usage_backend: str = "postgres"  # postgres
-    usage_pg_dsn: str = ""  # Full PostgreSQL DSN (preferred)
+    # Usage billing
+    usage_log_dir: str = "/tmp/tinker_usage"  # active JSONL sink
+    usage_backend: str = "postgres"  # deprecated compatibility field; if set, it must remain 'postgres'
+    usage_pg_dsn: str = ""  # deprecated, ignored by the producer path
     usage_pg_host: str = ""
     usage_pg_port: int = 5432
     usage_pg_database: str = "mint_billing"
@@ -378,6 +428,8 @@ class ServerConfig:
     future_replay_hot_ttl_s: float = 60.0
     future_replay_disk_ttl_s: float = 86400.0
     future_replay_sweep_interval_s: float = 21600.0
+    retrieve_future_grace_s: float = 120.0
+    retrieve_future_min_poll_s: float = 1.0
 
     # Admission control + API work queue (issue #84)
     capacity_manager_actor_name: str = "tinker_capacity_manager"
@@ -462,6 +514,10 @@ class ServerConfig:
             v = _env_nonempty(environ, name)
             return float(v) if v is not None else (float(file_value) if file_value is not None else float(default))
 
+        def _pick_float_alias(primary: str, aliases: tuple[str, ...], file_value: float | None, default: float) -> float:
+            v, _source = _env_nonempty_any(environ, primary, *aliases)
+            return float(v) if v is not None else (float(file_value) if file_value is not None else float(default))
+
         def _pick_bool(name: str, file_value: bool | None, default: bool) -> bool:
             v = _env_nonempty(environ, name)
             return _parse_bool(v) if v is not None else (bool(file_value) if file_value is not None else bool(default))
@@ -487,7 +543,7 @@ class ServerConfig:
             )
         )
 
-        return cls(
+        cfg = cls(
             host=_pick_str("TINKER_HOST", file_server.host if file_server is not None else None, "0.0.0.0"),
             port=_pick_int("TINKER_PORT", file_server.port if file_server is not None else None, 8000),
             api_key=api_key,
@@ -685,6 +741,18 @@ class ServerConfig:
                 file_future_store.replay_hot_ttl_s if file_future_store is not None else None,
                 60.0,
             ),
+            retrieve_future_grace_s=_pick_float_alias(
+                "MINT_RETRIEVE_FUTURE_GRACE_S",
+                ("TINKER_RETRIEVE_FUTURE_GRACE_S",),
+                file_future_store.retrieve_future_grace_s if file_future_store is not None else None,
+                120.0,
+            ),
+            retrieve_future_min_poll_s=_pick_float_alias(
+                "MINT_RETRIEVE_FUTURE_MIN_POLL_S",
+                ("TINKER_RETRIEVE_FUTURE_MIN_POLL_S",),
+                file_future_store.retrieve_future_min_poll_s if file_future_store is not None else None,
+                1.0,
+            ),
             future_replay_disk_ttl_s=_pick_float(
                 "MINT_FUTURE_REPLAY_DISK_TTL_S",
                 file_future_store.replay_disk_ttl_s if file_future_store is not None else None,
@@ -809,6 +877,8 @@ class ServerConfig:
             ),
             config_path=config_path,
         )
+        cfg.validate_deprecated_usage_config()
+        return cfg
 
     @property
     def auth_enabled(self) -> bool:
@@ -820,6 +890,11 @@ class ServerConfig:
         if not self.api_key:
             return False
         return secrets.compare_digest(self.api_key, provided_key)
+
+    def validate_deprecated_usage_config(self) -> None:
+        backend = str(self.usage_backend or "").strip().lower()
+        if backend and backend != "postgres":
+            raise ValueError(f"Unsupported usage backend {self.usage_backend!r}; only 'postgres' is accepted")
 
 # Global config instance
 config = ServerConfig.from_sources(environ=os.environ, config_path=_CONFIG_PATH, config_file=_CONFIG_FILE)

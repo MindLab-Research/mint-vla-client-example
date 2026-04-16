@@ -3,7 +3,12 @@ from pathlib import Path
 
 import pytest
 
-from tinker_server.checkpoints import validate_checkpoint_load_contract, write_checkpoint_metadata
+from tinker_server.checkpoints import (
+    checkpoint_has_optimizer_state,
+    validate_checkpoint_dir,
+    validate_checkpoint_load_contract,
+    write_checkpoint_metadata,
+)
 
 
 def _touch(path: Path) -> None:
@@ -36,6 +41,57 @@ def test_issue_187_training_checkpoint_allows_optimizer_restore(tmp_path: Path) 
     )
     assert checkpoint_type == "training"
     assert optimizer_present is True
+
+
+def test_issue_187_orbax_training_checkpoint_reports_optimizer_state(tmp_path: Path) -> None:
+    ckpt = tmp_path / "ckpt_orbax_training"
+    _touch(ckpt / "1" / "train_state" / "_METADATA")
+
+    assert checkpoint_has_optimizer_state(str(ckpt)) is True
+
+
+def test_issue_187_orbax_training_checkpoint_allows_optimizer_restore(tmp_path: Path) -> None:
+    ckpt = tmp_path / "ckpt_orbax_training"
+    _touch(ckpt / "1" / "train_state" / "_METADATA")
+    write_checkpoint_metadata(
+        str(ckpt),
+        {
+            "checkpoint_id": "ckpt_orbax_training",
+            "owner_id": None,
+            "model_id": "m1",
+            "model_name": "openpi/pi0-fast-libero-low-mem-finetune",
+            "created_at": "2026-01-01T00:00:00Z",
+            "step": 1,
+            "checkpoint_type": "training",
+            "backend": "openpi_fast",
+            "type": "training",
+        },
+    )
+
+    checkpoint_type, optimizer_present = validate_checkpoint_load_contract(
+        str(ckpt), load_optimizer=True
+    )
+    assert checkpoint_type == "training"
+    assert optimizer_present is True
+
+
+def test_issue_187_openpi_training_checkpoint_dir_is_valid(tmp_path: Path) -> None:
+    ckpt = tmp_path / "ckpt_openpi_training"
+    _touch(ckpt / "1" / "params" / "_METADATA")
+    _touch(ckpt / "1" / "assets" / "physical-intelligence" / "libero" / "norm_stats.json")
+    _touch(ckpt / "1" / "train_state" / "_METADATA")
+
+    validate_checkpoint_dir(str(ckpt), checkpoint_type="training")
+
+
+def test_issue_187_openpi_training_checkpoint_dir_rejects_empty_layout(tmp_path: Path) -> None:
+    ckpt = tmp_path / "ckpt_openpi_training_incomplete"
+    (ckpt / "1" / "params").mkdir(parents=True)
+    (ckpt / "1" / "assets").mkdir()
+    _touch(ckpt / "1" / "train_state" / "_METADATA")
+
+    with pytest.raises(ValueError, match="Missing LoRA weights in extracted checkpoint"):
+        validate_checkpoint_dir(str(ckpt), checkpoint_type="training")
 
 
 def test_issue_187_sampler_checkpoint_rejects_optimizer_restore(tmp_path: Path) -> None:
@@ -89,4 +145,3 @@ def test_issue_187_sampler_checkpoint_allows_non_optimizer_load(tmp_path: Path) 
     )
     assert checkpoint_type == "sampler"
     assert optimizer_present is False
-

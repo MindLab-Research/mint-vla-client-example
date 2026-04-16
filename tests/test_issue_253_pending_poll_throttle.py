@@ -21,10 +21,12 @@ class _StubFutureStore:
 
 
 class _StubApiWorkQueue:
-    async def find_position(self, request_id: str) -> dict:
+    async def find_position(self, request_id: str, *, timeout_s: float = 5.0) -> dict:
+        _ = timeout_s
         return {"found": True, "position": None, "depth": 0}
 
-    async def get_eta_state(self, op: str | None) -> dict:
+    async def get_eta_state(self, op: str | None, *, timeout_s: float = 5.0) -> dict:
+        _ = timeout_s
         return {"ema_exec_s": None}
 
 

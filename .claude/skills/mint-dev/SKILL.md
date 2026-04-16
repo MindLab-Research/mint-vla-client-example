@@ -140,6 +140,67 @@ Required dev overrides after sourcing `configs/prod_volcano.env.sh`:
 - `MINT_PERSISTENT_MODELS` if you need a reduced dev prewarm set
 - `USE_MBRIDGE_LORA_EXPORT=1` when validating Megatron LoRA sampler export / vLLM hot-load behavior
 
+## Ray Attach Mode On The API Host
+
+Hard rule:
+
+- On `mint-dev`, do not point Python `ray.init(...)` or `scripts/run_server.py` at raw GCS `192.168.39.31:6379`.
+- From the API host, use the Ray client endpoint for Python attach: `ray://<RAY_HEAD_IP>:10001`.
+- Symptom of getting this wrong: startup stalls around Ray attach and logs `Can't find a node_ip_address.json`.
+
+Use this split:
+
+- CLI health checks: `ray status --address=<RAY_HEAD_IP>:6379`
+- Python attach on the API host: `ray.init(address="ray://<RAY_HEAD_IP>:10001")`
+- Isolated API server startup: set both `RAY_ADDRESS` and `MINT_RAY_CLIENT_ADDRESS` to `ray://<RAY_HEAD_IP>:10001`
+
+If a Python attach on the API host still uses `:6379`, stop and fix that first.
+
+## Isolated Debug Server For Path-Based Checkpoints
+
+Use this when you need a private dev server for checkpoint loading or issue-specific evaluation.
+
+Hard rules:
+
+- Use a fresh `TINKER_RAY_NAMESPACE` and the same `MINT_RAY_NAMESPACE`.
+- Use a fresh `MINT_STARTUP_LEASE_ACTOR_NAME`, otherwise the server may come up as a follower and `/asample` can fail because detached stores belong to some other run.
+- Set `MINT_UVICORN_WORKERS=1` for isolated debug bring-up. Multi-worker startup can thrash on the Ray init lock and hide the real issue.
+- If requests will pass absolute checkpoint directories in `model_path` or `state_path`, enable auth with a known admin key (for example `TINKER_API_KEY=dummy`) and send the same key in client requests. Absolute paths are rejected for non-admin requests.
+- If you do not need absolute paths, prefer `mint://...` or `ckpt_...` identifiers.
+
+Minimal isolated bring-up pattern:
+
+```bash
+ssh -f -N -L 8010:localhost:8010 mint-dev
+
+ssh mint-dev "cd /root/tinker_project/tinker-server && nohup bash -c \
+  \"PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/mint-runtime-py31213 \
+   PFS_HF_MODULES_PATH=/vePFS-Mindverse/share/huggingface/modules \
+   HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
+   PYTHONDONTWRITEBYTECODE=1 \
+   PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server \
+   LD_LIBRARY_PATH=/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/lib/python3.12/site-packages/torch/lib:/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64 \
+   RAY_ADDRESS=ray://<RAY_HEAD_IP>:10001 \
+   MINT_RAY_CLIENT_ADDRESS=ray://<RAY_HEAD_IP>:10001 \
+   TINKER_API_KEY=dummy \
+   TINKER_PORT=8010 \
+   TINKER_LOG_FILE=/tmp/tinker_server_issue.log \
+   TINKER_USAGE_LOG_DIR=/tmp/tinker_usage_issue \
+   TINKER_RAY_NAMESPACE=tinker_<issue> \
+   MINT_RAY_NAMESPACE=tinker_<issue> \
+   MINT_STARTUP_LEASE_ACTOR_NAME=tinker_startup_lease_<issue> \
+   MINT_UVICORN_WORKERS=1 \
+   /vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python scripts/run_server.py\" >> /tmp/tinker_server_issue.log 2>&1 &"
+```
+
+Before debugging model behavior, verify this private server can:
+
+1. return `200` on `/api/v1/healthz`;
+2. create a sampling session against the intended checkpoint;
+3. accept one `/api/v1/asample` request.
+
+If one of those fails, fix that first. Do not pretend the model logic is under test yet.
+
 ## Pin Override Discipline
 
 If you source `configs/prod_volcano.env.sh` and then target a different worker slice, you must override **all** relevant pinning variables together.
@@ -766,14 +827,15 @@ ssh mint-dev '/root/.volc/bin/volc ml_task logs -t <head_task_id> -i worker_0' |
 **Safe connectivity check with Ray client mode:**
 ```bash
 ssh mint-dev "/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/ray status --address='<RAY_HEAD_IP>:6379'"
-ssh mint-dev "/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python - <<'PY'\nimport ray\nray.init(address='<RAY_HEAD_IP>:6379')\nprint(ray.cluster_resources())\nray.shutdown()\nPY"
+ssh mint-dev "/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python - <<'PY'\nimport ray\nray.init(address='ray://<RAY_HEAD_IP>:10001')\nprint(ray.cluster_resources())\nray.shutdown()\nPY"
 ```
 
 **Canonical dev server bring-up after cluster rebuild:**
 - 1. Verify the head is healthy with `ray status --address=...`.
-- 2. Verify Python connectivity with `ray.init(address=...)`.
+- 2. Verify Python connectivity from the API host with `ray.init(address='ray://<RAY_HEAD_IP>:10001')`.
 - 3. Then start `scripts/run_server.py`.
 - 4. If `ray.init` fails before startup completes, fix head connectivity first. Do not thrash on server env, healthz, or training logic before the client connection is correct.
+- 5. If you are starting a private issue server, use a fresh namespace, a fresh startup-lease actor name, and `MINT_UVICORN_WORKERS=1`.
 
 **For cluster create/teardown, invoke the `volcano-cluster` skill.**
 
@@ -806,7 +868,7 @@ Before starting any MoE test, run:
 # Quick status command (MANDATORY before any work)
 ssh mint-dev '/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python << "PYEOF"
 import ray
-ray.init(address="<RAY_HEAD_IP>:6379", ignore_reinit_error=True)
+ray.init(address="ray://<RAY_HEAD_IP>:10001", ignore_reinit_error=True)
 r = ray.available_resources()
 t = ray.cluster_resources()
 gpu_avail = r.get("GPU", 0)

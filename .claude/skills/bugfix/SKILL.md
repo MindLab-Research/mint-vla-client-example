@@ -83,6 +83,21 @@ curl http://localhost:8000/api/v1/healthz
 
 If dev server is not running, use the `mint-dev` skill to start it.
 
+### 2.1.1 Path-Based Checkpoint Repros On Dev
+
+If reproduction requires `model_path` or `state_path` pointing at an absolute checkpoint directory:
+
+- Use an admin API key on the dev server. Absolute paths are rejected for non-admin requests.
+- If you need a private dev server, follow the `mint-dev` skill's isolated debug server rules:
+  - Python attach uses `ray://<head_ip>:10001`, not raw `:6379`
+  - fresh `TINKER_RAY_NAMESPACE` and `MINT_RAY_NAMESPACE`
+  - fresh `MINT_STARTUP_LEASE_ACTOR_NAME`
+  - `MINT_UVICORN_WORKERS=1`
+- Do not spend time on model-level debugging until that private server can pass:
+  1. `/api/v1/healthz`
+  2. `create_sampling_session`
+  3. one `/api/v1/asample`
+
 ### 2.2 Reproduce on Development
 
 ```bash
