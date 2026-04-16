@@ -8,6 +8,7 @@ Endpoints:
 from __future__ import annotations
 
 import asyncio
+import copy
 import array
 import hashlib
 import logging
@@ -17,7 +18,7 @@ import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
 
 from ..config import config as server_config
 from ..backend.future_store import FutureStatus, FutureStoreUnavailableError, future_store
@@ -75,6 +76,19 @@ _lora_load_locks: dict[str, asyncio.Lock] = {}
 _ASAMPLE_ROUTE = "/api/v1/asample"
 _COMPUTE_LOGPROBS_ROUTE = "/api/v1/compute_logprobs"
 _SAMPLE_ONCE_ROUTE = "sample_once"
+
+
+def _active_session_manager() -> SessionManager | None:
+    if session_manager is not None:
+        return session_manager
+    try:
+        from . import service as service_route
+    except Exception:
+        return None
+    manager = getattr(service_route, "session_manager", None)
+    if manager is None:
+        return None
+    return manager
 
 
 @dataclass(frozen=True)
@@ -175,21 +189,22 @@ def _record_vllm_workload_finish(
 
 
 def _snapshot_from_legacy_getters(session_id: str) -> SamplingSessionSnapshot | None:
-    if session_manager is None:
+    manager = _active_session_manager()
+    if manager is None:
         return None
-    is_multi_lora = bool(session_manager.is_multi_lora_session(session_id))
-    get_engine = getattr(session_manager, "get_engine", None)
+    is_multi_lora = bool(manager.is_multi_lora_session(session_id))
+    get_engine = getattr(manager, "get_engine", None)
     if not is_multi_lora and callable(get_engine):
         if get_engine(session_id) is None:
             return None
 
-    get_base_model = getattr(session_manager, "get_session_base_model", None)
-    get_lora_rank = getattr(session_manager, "get_session_lora_rank", None)
-    get_adapter_path = getattr(session_manager, "get_session_adapter_path", None)
-    get_loaded = getattr(session_manager, "is_session_lora_loaded", None)
-    get_lora_int_id = getattr(session_manager, "get_session_lora_int_id", None)
-    is_base_model_session = getattr(session_manager, "is_base_model_session", None)
-    get_metadata_version = getattr(session_manager, "get_session_metadata_version", None)
+    get_base_model = getattr(manager, "get_session_base_model", None)
+    get_lora_rank = getattr(manager, "get_session_lora_rank", None)
+    get_adapter_path = getattr(manager, "get_session_adapter_path", None)
+    get_loaded = getattr(manager, "is_session_lora_loaded", None)
+    get_lora_int_id = getattr(manager, "get_session_lora_int_id", None)
+    is_base_model_session = getattr(manager, "is_base_model_session", None)
+    get_metadata_version = getattr(manager, "get_session_metadata_version", None)
 
     base_model = get_base_model(session_id) if callable(get_base_model) else None
     lora_rank = int(get_lora_rank(session_id) or 0) if callable(get_lora_rank) else 0
@@ -233,9 +248,10 @@ def _coerce_sampling_snapshot(raw: object, session_id: str) -> SamplingSessionSn
 
 
 def _get_sampling_snapshot(session_id: str) -> SamplingSessionSnapshot | None:
-    if session_manager is None:
+    manager = _active_session_manager()
+    if manager is None:
         return None
-    get_snapshot = getattr(session_manager, "get_sampling_session_snapshot", None)
+    get_snapshot = getattr(manager, "get_sampling_session_snapshot", None)
     if callable(get_snapshot):
         snapshot = _coerce_sampling_snapshot(get_snapshot(session_id), session_id)
         if snapshot is not None:
@@ -249,11 +265,13 @@ async def _async_get_detached_sampling_snapshot(session_id: str) -> SamplingSess
 
         info = await async_get_sampling_session_info(session_id)
     except Exception:
-        if session_manager is not None:
+        manager = _active_session_manager()
+        if manager is not None:
             return _get_sampling_snapshot(session_id)
         return None
     if not isinstance(info, dict):
-        if session_manager is not None:
+        manager = _active_session_manager()
+        if manager is not None:
             return _get_sampling_snapshot(session_id)
         return None
     return SamplingSessionSnapshot(
@@ -270,17 +288,19 @@ async def _async_get_detached_sampling_snapshot(session_id: str) -> SamplingSess
 
 
 def _has_local_sampling_session(session_id: str) -> bool:
-    if session_manager is None:
+    manager = _active_session_manager()
+    if manager is None:
         return False
-    if session_manager.is_multi_lora_session(session_id):
+    if manager.is_multi_lora_session(session_id):
         return True
-    return session_manager.get_engine(session_id) is not None
+    return manager.get_engine(session_id) is not None
 
 
 async def _drop_local_sampling_session(session_id: str) -> None:
-    if session_manager is None:
+    manager = _active_session_manager()
+    if manager is None:
         return
-    end_session = getattr(session_manager, "end_session", None)
+    end_session = getattr(manager, "end_session", None)
     if not callable(end_session):
         return
     try:
@@ -296,10 +316,11 @@ async def _restore_local_sampling_session_if_needed(session_id: str) -> bool:
     if snapshot is not None:
         refreshed = await _refresh_sampling_session_if_stale(session_id, snapshot)
         return refreshed is not None
-    if session_manager is None:
+    manager = _active_session_manager()
+    if manager is None:
         return False
 
-    restore_session = getattr(session_manager, "restore_sampling_session", None)
+    restore_session = getattr(manager, "restore_sampling_session", None)
     if not callable(restore_session):
         return _has_local_sampling_session(session_id)
 
@@ -327,7 +348,8 @@ async def _refresh_sampling_session_if_stale(
     session_id: str,
     snapshot: SamplingSessionSnapshot,
 ) -> SamplingSessionSnapshot | None:
-    if session_manager is None or not snapshot.uses_multi_lora:
+    manager = _active_session_manager()
+    if manager is None or not snapshot.uses_multi_lora:
         return snapshot
     try:
         from ..backend.sampling_session_store import async_get_sampling_session_info
@@ -346,7 +368,7 @@ async def _refresh_sampling_session_if_stale(
         return snapshot
 
     try:
-        restored = bool(session_manager.restore_sampling_session(info))
+        restored = bool(manager.restore_sampling_session(info))
     except ValueError:
         restored = False
     if not restored:
@@ -402,7 +424,8 @@ async def _ensure_session_lora_loaded(
     *,
     snapshot: SamplingSessionSnapshot | None = None,
 ) -> None:
-    if session_manager is None:
+    manager = _active_session_manager()
+    if manager is None:
         raise RuntimeError("Session manager not initialized")
 
     snap = snapshot or _get_sampling_snapshot(session_id)
@@ -461,7 +484,7 @@ async def _ensure_session_lora_loaded(
                 },
             ):
                 lora_int_id = await add_from_path(sampling_session_id=session_id, lora_path=adapter_path)
-            session_manager.mark_session_lora_loaded(session_id, True, lora_int_id=lora_int_id)
+            manager.mark_session_lora_loaded(session_id, True, lora_int_id=lora_int_id)
 
 
 async def _register_coalesced_abort_aliases(waiters: list[tuple], engine_request_id: str) -> None:
@@ -718,6 +741,35 @@ async def _flush_group(g: dict) -> None:
                 fut0.set_result([res])
             return
 
+        if float(g["temperature"]) == 0.0:
+            # vLLM forces greedy sampling to n=1, so identical coalesced requests
+            # must share one engine.generate() result and fan it back out locally.
+            vllm_request_id = f"{g['leader_request_id']}_coalesced"
+            rid_ns = ",".join(f"{rid}:{int(ns)}" for _fut, ns, rid in waiters)
+            logger.info(
+                f"[coalesce flush greedy] leader={g['leader_request_id']} vllm_req={vllm_request_id} "
+                f"waiters={len(waiters)} total_samples={total} rid_ns={rid_ns}"
+            )
+            await _register_coalesced_abort_aliases(waiters, vllm_request_id)
+            try:
+                res = await g["engine"].generate(
+                    sampling_session_id=g["sampling_session_id"],
+                    prompt_ids=g["prompt_ids"],
+                    request_id=vllm_request_id,
+                    max_tokens=g["max_tokens"],
+                    stop=g.get("stop"),
+                    temperature=g["temperature"],
+                    top_k=g["top_k"],
+                    top_p=g["top_p"],
+                    logprobs=True,
+                )
+            finally:
+                await _unregister_coalesced_abort_aliases(waiters, vllm_request_id)
+            for fut, ns, _rid in waiters:
+                if not fut.done():
+                    fut.set_result([copy.deepcopy(res) for _ in range(int(ns))])
+            return
+
         vllm_request_id = f"{g['leader_request_id']}_coalesced"
         rid_ns = ",".join(f"{rid}:{int(ns)}" for _fut, ns, rid in waiters)
         logger.info(
@@ -892,6 +944,7 @@ async def asample(
             detail="seq_id is required when sampling_session_id or model_id is provided",
         )
     session_id = request.get_session_id()
+    manager = _active_session_manager()
     snapshot = await _async_get_detached_sampling_snapshot(session_id)
     remote = None
     if snapshot is None:
@@ -906,7 +959,7 @@ async def asample(
                 remote = remote_sampling_session(session_id)
             except Exception:
                 remote = None
-    if snapshot is None and remote is None and session_manager is None:
+    if snapshot is None and remote is None and manager is None:
         raise HTTPException(status_code=503, detail="Sampling session store unavailable")
     if remote is not None:
         upstream_alias, base_model = remote
@@ -1167,6 +1220,7 @@ async def sample_once(
         )
         raise HTTPException(status_code=429, detail="Sampling backpressure: server overloaded")
 
+    manager = _active_session_manager()
     snapshot = await _async_get_detached_sampling_snapshot(session_id)
     remote = None
     if snapshot is None:
@@ -1181,7 +1235,7 @@ async def sample_once(
                 remote = remote_sampling_session(session_id)
             except Exception:
                 remote = None
-    if snapshot is None and remote is None and session_manager is None:
+    if snapshot is None and remote is None and manager is None:
         raise HTTPException(status_code=503, detail="Sampling session store unavailable")
     if remote is not None:
         upstream_alias, base_model = remote
@@ -1270,21 +1324,82 @@ async def sample_once(
                 )
             return sample_response.sequences[0]
 
-    if session_manager is None:
-        raise HTTPException(status_code=503, detail="Session manager not initialized")
+    if manager is None:
+        from ..models.types import FutureRetrieveRequest
+        from .futures import retrieve_future
+
+        future = await asample(
+            SampleRequest(
+                sampling_session_id=session_id,
+                num_samples=1,
+                prompt=ModelInput.from_ints(token_ids),
+                sampling_params=SamplingParams(
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    stop=stop,
+                ),
+            ),
+            http_request,
+        )
+        poll_timeout_s = float(os.environ.get("TINKER_POLL_TIMEOUT_S", "1800"))
+        poll_sleep_s = float(os.environ.get("TINKER_POLL_SLEEP_S", "0.2"))
+        deadline = time.time() + poll_timeout_s
+        while True:
+            poll_response = Response()
+            payload = await retrieve_future(
+                FutureRetrieveRequest(request_id=future.request_id),
+                http_request,
+                poll_response,
+            )
+            if poll_response.status_code == 408:
+                if time.time() > deadline:
+                    raise HTTPException(
+                        status_code=504,
+                        detail=(
+                            "Local retrieve_future timed out after "
+                            f"{poll_timeout_s:.1f}s for request_id={future.request_id!r}"
+                        ),
+                    )
+                await asyncio.sleep(poll_sleep_s)
+                continue
+            if poll_response.status_code >= 400:
+                if isinstance(payload, dict) and "detail" in payload:
+                    detail = payload["detail"]
+                else:
+                    detail = payload
+                raise HTTPException(status_code=poll_response.status_code, detail=detail)
+            if isinstance(payload, dict) and "error" in payload:
+                raise HTTPException(status_code=500, detail=payload["error"])
+            try:
+                sample_response = SampleResponse.model_validate(payload)
+            except Exception as e:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Local retrieve_future returned invalid sample payload: {type(e).__name__}: {e}",
+                ) from e
+            if len(sample_response.sequences) != 1:
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        f"Local retrieve_future returned {len(sample_response.sequences)} sequences "
+                        "for sample_once(num_samples=1)"
+                    ),
+                )
+            return sample_response.sequences[0]
 
     engine = None
     resource_pool = None
     resource_pool_actor_name: str | None = None
-    session_manager.mark_session_inflight(session_id, +1)
+    manager.mark_session_inflight(session_id, +1)
     try:
         snapshot = _get_sampling_snapshot(session_id)
         if snapshot is None:
             await _restore_local_sampling_session_if_needed(session_id)
             snapshot = _get_sampling_snapshot(session_id)
-        is_multi_lora = bool(snapshot.uses_multi_lora) if snapshot is not None else session_manager.is_multi_lora_session(session_id)
+        is_multi_lora = bool(snapshot.uses_multi_lora) if snapshot is not None else manager.is_multi_lora_session(session_id)
         if is_multi_lora:
-            base_model = snapshot.base_model if snapshot is not None else session_manager.get_session_base_model(session_id)
+            base_model = snapshot.base_model if snapshot is not None else manager.get_session_base_model(session_id)
             if not base_model:
                 raise HTTPException(status_code=500, detail=f"Session {session_id!r} missing base_model")
 
@@ -1313,7 +1428,7 @@ async def sample_once(
 
             engine = await run_async_with_otel_span(
                 "sampling.get_engine_for_session",
-                lambda: session_manager.get_engine_for_session(session_id),
+                lambda: manager.get_engine_for_session(session_id),
                 component="sampling",
                 op="sampling.get_engine_for_session",
                 request_id=request_id,
@@ -1366,7 +1481,7 @@ async def sample_once(
                 ),
             )
         else:
-            engine = session_manager.get_engine(session_id)
+            engine = manager.get_engine(session_id)
             if engine is None:
                 raise RuntimeError(f"No engine found for session {session_id}")
             result = await _await_with_external_fail_abort(
@@ -1427,7 +1542,7 @@ async def sample_once(
     finally:
         if resource_pool is not None and resource_pool_actor_name is not None:
             resource_pool.mark_inflight(resource_pool_actor_name, -1)
-        session_manager.mark_session_inflight(session_id, -1)
+        manager.mark_session_inflight(session_id, -1)
 
 
 async def _do_sample(
