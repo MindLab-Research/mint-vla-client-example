@@ -775,7 +775,23 @@ async def _resolve_training_route_session(model_id: str) -> tuple[Any | None, di
         if session is None:
             session = await _restore_training_session(model_id)
         if session is not None:
-            return session, None
+            lora_config = _field(session, "lora_config", None)
+            if lora_config is not None and hasattr(lora_config, "model_dump"):
+                lora_config = lora_config.model_dump()
+            return session, {
+                "model_id": str(_field(session, "model_id", model_id) or model_id),
+                "session_id": str(_field(session, "session_id", "") or ""),
+                "model_seq_id": int(_field(session, "model_seq_id", 0) or 0),
+                "base_model": str(_field(session, "base_model", "") or ""),
+                "lora_config": lora_config,
+                "user_metadata": _field(session, "user_metadata", {}) or {},
+                "learning_rate": float(_field(session, "learning_rate", 1e-4) or 1e-4),
+                "current_step": int(_field(session, "current_step", 0) or 0),
+                "is_active": bool(_field(session, "is_active", True)),
+                "created_at": _field(session, "created_at", ""),
+                "backend": str(_field(session, "backend", "peft") or "peft"),
+                "user_id": _field(session, "user_id", None),
+            }
 
     info = await _get_training_route_session_info(model_id)
     if isinstance(info, dict):
@@ -1835,7 +1851,6 @@ async def forward_backward(
     if session is None:
         raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
 
-    await _protect_training_session_enqueue_window(route_session_info)
     base_model = str(route_session_info.get("base_model") or "")
     backend = str(route_session_info.get("backend") or "unknown")
     max_model_len = _get_max_model_len(base_model)
@@ -2081,7 +2096,6 @@ async def train_step(
     if session is None:
         raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
 
-    await _protect_training_session_enqueue_window(route_session_info)
     base_model = str(route_session_info.get("base_model") or "")
     backend = str(route_session_info.get("backend") or "unknown")
     max_model_len = _get_max_model_len(base_model)
@@ -2313,7 +2327,6 @@ async def forward(
             status_code=404, detail=f"Model '{request.model_id}' not found"
         )
 
-    await _protect_training_session_enqueue_window(route_session_info)
     base_model = str(route_session_info.get("base_model") or "")
     backend = str(route_session_info.get("backend") or "unknown")
     max_model_len = _get_max_model_len(base_model)
@@ -2544,7 +2557,6 @@ async def optim_step(
             status_code=404, detail=f"Model '{request.model_id}' not found"
         )
 
-    await _protect_training_session_enqueue_window(route_session_info)
     base_model = str(route_session_info.get("base_model") or "")
     backend = str(route_session_info.get("backend") or "unknown")
 
@@ -2872,7 +2884,6 @@ async def save_weights_for_sampler(
             status_code=404, detail=f"Model '{request.model_id}' not found"
         )
 
-    await _protect_training_session_enqueue_window(route_session_info)
     base_model = str(route_session_info.get("base_model") or "")
     backend = str(route_session_info.get("backend") or "unknown")
 
