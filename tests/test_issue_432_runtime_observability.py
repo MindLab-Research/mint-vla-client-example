@@ -338,9 +338,20 @@ def test_issue_432_vllm_stats_observer_tracks_scheduler_and_finished_request_met
         num_running_reqs=2,
         kv_cache_usage=0.75,
         prefix_cache_stats=SimpleNamespace(queries=100, hits=60),
+        mint_total_scheduled_tokens=96,
+        mint_scheduled_new_requests=3,
+        mint_scheduled_cached_requests=5,
+        mint_executor_execute_model_s=0.42,
+        mint_worker_execute_model_s=0.31,
     )
     iteration_stats = SimpleNamespace(
         num_preempted_reqs=3,
+        num_prompt_tokens=80,
+        num_generation_tokens=16,
+        mint_prefill_requests=3,
+        mint_decode_requests=5,
+        time_to_first_tokens_iter=[0.9, 1.2],
+        inter_token_latencies_iter=[0.05, 0.07, 0.08],
         finished_requests=[
             SimpleNamespace(
                 queued_time=1.5,
@@ -381,6 +392,17 @@ def test_issue_432_vllm_stats_observer_tracks_scheduler_and_finished_request_met
     assert snap["time_per_output_token_s_total"] == pytest.approx(0.2)
     assert snap["time_per_output_token_s_count"] == 2
     assert snap["time_per_output_token_s_max"] == pytest.approx(0.12)
+    assert snap["scheduled_tokens_iter_total"] == pytest.approx(96)
+    assert snap["scheduled_new_requests_iter_total"] == pytest.approx(3)
+    assert snap["scheduled_cached_requests_iter_total"] == pytest.approx(5)
+    assert snap["prefill_requests_iter_total"] == pytest.approx(3)
+    assert snap["decode_requests_iter_total"] == pytest.approx(5)
+    assert snap["prompt_tokens_iter_total"] == pytest.approx(80)
+    assert snap["generation_tokens_iter_total"] == pytest.approx(16)
+    assert snap["time_to_first_token_s_total"] == pytest.approx(2.1)
+    assert snap["inter_token_latency_s_total"] == pytest.approx(0.2)
+    assert snap["executor_execute_model_s_total"] == pytest.approx(0.42)
+    assert snap["worker_execute_model_s_total"] == pytest.approx(0.31)
     assert snap["seq_slot_wait_s_count"] == 0
     assert snap["add_request_wait_s_count"] == 0
 

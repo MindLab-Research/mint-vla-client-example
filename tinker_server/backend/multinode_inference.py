@@ -39,7 +39,11 @@ from . import ray_kill
 from .multinode_resources import compute_multinode_engine_resources
 from .ray_placement_groups import PlacementGroupMismatchError, get_named_placement_group
 from .ray_keepalive import ray_get_with_resource_pool_keepalive
-from .vllm_scheduler_observability import VllmStatsObserver, make_vllm_stats_logger_factory
+from .vllm_scheduler_observability import (
+    VllmStatsObserver,
+    install_vllm_iteration_observability_patches,
+    make_vllm_stats_logger_factory,
+)
 from .volc_placement import (
     assert_node_ip_capacity,
     parse_model_node_ip_list,
@@ -989,6 +993,10 @@ def _create_multinode_vllm_actor(
                 f"max_num_batched_tokens={max_num_batched_tokens}, "
                 f"prefix_caching={enable_prefix_caching}"
             )
+
+            # Install vLLM-side hooks before engine creation so scheduler stats
+            # include per-iteration token and executor timing signals.
+            install_vllm_iteration_observability_patches()
 
             # Create engine - vLLM will spawn Ray workers across nodes
             self.engine = AsyncLLMEngine.from_engine_args(

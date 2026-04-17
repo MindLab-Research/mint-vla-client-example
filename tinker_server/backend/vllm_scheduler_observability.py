@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
@@ -53,6 +54,137 @@ class _LatencyAgg:
         }
 
 
+_VLLM_PATCH_LOCK = threading.Lock()
+_VLLM_PATCHES_INSTALLED = False
+
+
+def install_vllm_iteration_observability_patches() -> None:
+    """Patch vLLM once so Mint can export iteration-level scheduler metrics."""
+
+    global _VLLM_PATCHES_INSTALLED
+    with _VLLM_PATCH_LOCK:
+        if _VLLM_PATCHES_INSTALLED:
+            return
+
+        from vllm.v1.core.sched.scheduler import Scheduler
+        from vllm.v1.engine.core import EngineCore
+        from vllm.v1.engine.output_processor import OutputProcessor
+
+        original_schedule = getattr(Scheduler, "schedule", None)
+        if original_schedule is None:
+            raise RuntimeError("vLLM Scheduler missing schedule")
+        if not getattr(original_schedule, "_mint_iteration_observability", False):
+            def schedule(self, *args: Any, **kwargs: Any):
+                out = original_schedule(self, *args, **kwargs)
+                setattr(
+                    self,
+                    "_mint_last_schedule_metrics",
+                    {
+                        "total_scheduled_tokens": int(getattr(out, "total_num_scheduled_tokens", 0) or 0),
+                        "scheduled_new_requests": len(getattr(out, "scheduled_new_reqs", []) or []),
+                        "scheduled_cached_requests": int(
+                            getattr(getattr(out, "scheduled_cached_reqs", None), "num_reqs", 0) or 0
+                        ),
+                    },
+                )
+                return out
+
+            schedule._mint_iteration_observability = True  # type: ignore[attr-defined]
+            Scheduler.schedule = schedule  # type: ignore[assignment]
+
+        original_make_stats = getattr(Scheduler, "make_stats", None)
+        if original_make_stats is None:
+            raise RuntimeError("vLLM Scheduler missing make_stats")
+        if not getattr(original_make_stats, "_mint_iteration_observability", False):
+            def make_stats(self, *args: Any, **kwargs: Any):
+                stats = original_make_stats(self, *args, **kwargs)
+                if stats is None:
+                    return None
+                for key, value in (getattr(self, "_mint_last_schedule_metrics", None) or {}).items():
+                    setattr(stats, f"mint_{key}", value)
+                for key in ("executor_execute_model_s", "worker_execute_model_s"):
+                    value = getattr(self, f"_mint_last_{key}", None)
+                    if value is not None:
+                        setattr(stats, f"mint_{key}", value)
+                return stats
+
+            make_stats._mint_iteration_observability = True  # type: ignore[attr-defined]
+            Scheduler.make_stats = make_stats  # type: ignore[assignment]
+
+        original_execute_model_with_error_logging = getattr(EngineCore, "execute_model_with_error_logging", None)
+        if original_execute_model_with_error_logging is None:
+            raise RuntimeError("vLLM EngineCore missing execute_model_with_error_logging")
+        if not getattr(original_execute_model_with_error_logging, "_mint_iteration_observability", False):
+            def execute_model_with_error_logging(self, model_fn, scheduler_output):  # type: ignore[no-untyped-def]
+                t0 = time.perf_counter()
+                out = original_execute_model_with_error_logging(self, model_fn, scheduler_output)
+                elapsed_s = time.perf_counter() - t0
+                setattr(self.scheduler, "_mint_last_executor_execute_model_s", elapsed_s)
+                worker_elapsed_s = getattr(out, "_mint_worker_execute_model_s", None)
+                if worker_elapsed_s is not None:
+                    setattr(self.scheduler, "_mint_last_worker_execute_model_s", worker_elapsed_s)
+                return out
+
+            execute_model_with_error_logging._mint_iteration_observability = True  # type: ignore[attr-defined]
+            EngineCore.execute_model_with_error_logging = execute_model_with_error_logging  # type: ignore[assignment]
+
+        original_update_stats_from_output = getattr(OutputProcessor, "_update_stats_from_output", None)
+        if original_update_stats_from_output is None:
+            raise RuntimeError("vLLM OutputProcessor missing _update_stats_from_output")
+        if not getattr(original_update_stats_from_output, "_mint_iteration_observability", False):
+            def _update_stats_from_output(self, req_state, engine_core_output, engine_core_timestamp, iteration_stats):  # type: ignore[no-untyped-def]
+                if iteration_stats is not None:
+                    if getattr(req_state, "is_prefilling", False):
+                        setattr(
+                            iteration_stats,
+                            "mint_prefill_requests",
+                            int(getattr(iteration_stats, "mint_prefill_requests", 0) or 0) + 1,
+                        )
+                    else:
+                        setattr(
+                            iteration_stats,
+                            "mint_decode_requests",
+                            int(getattr(iteration_stats, "mint_decode_requests", 0) or 0) + 1,
+                        )
+                return original_update_stats_from_output(
+                    self,
+                    req_state,
+                    engine_core_output,
+                    engine_core_timestamp,
+                    iteration_stats,
+                )
+
+            _update_stats_from_output._mint_iteration_observability = True  # type: ignore[attr-defined]
+            OutputProcessor._update_stats_from_output = _update_stats_from_output  # type: ignore[assignment]
+
+        try:
+            from vllm.v1.worker.gpu_worker import Worker
+        except Exception:
+            Worker = None
+        if Worker is not None:
+            original_worker_execute_model = getattr(Worker, "execute_model", None)
+            if original_worker_execute_model is not None and not getattr(
+                original_worker_execute_model,
+                "_mint_iteration_observability",
+                False,
+            ):
+                def worker_execute_model(self, scheduler_output):  # type: ignore[no-untyped-def]
+                    t0 = time.perf_counter()
+                    out = original_worker_execute_model(self, scheduler_output)
+                    elapsed_s = time.perf_counter() - t0
+                    if out is not None:
+                        try:
+                            setattr(out, "_mint_worker_execute_model_s", elapsed_s)
+                        except Exception:
+                            pass
+                    return out
+
+                worker_execute_model._mint_iteration_observability = True  # type: ignore[attr-defined]
+                Worker.execute_model = worker_execute_model  # type: ignore[assignment]
+
+        _VLLM_PATCHES_INSTALLED = True
+
+
 class VllmStatsObserver:
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -66,6 +198,17 @@ class VllmStatsObserver:
         self._prefill_time = _LatencyAgg()
         self._decode_time = _LatencyAgg()
         self._output_token_time = _LatencyAgg()
+        self._scheduled_tokens_iter = _LatencyAgg()
+        self._scheduled_new_requests_iter = _LatencyAgg()
+        self._scheduled_cached_requests_iter = _LatencyAgg()
+        self._prefill_requests_iter = _LatencyAgg()
+        self._decode_requests_iter = _LatencyAgg()
+        self._prompt_tokens_iter = _LatencyAgg()
+        self._generation_tokens_iter = _LatencyAgg()
+        self._ttft_time = _LatencyAgg()
+        self._inter_token_latency_time = _LatencyAgg()
+        self._executor_execute_model_time = _LatencyAgg()
+        self._worker_execute_model_time = _LatencyAgg()
         self._seq_slot_wait_time = _LatencyAgg()
         self._generate_lock_wait_time = _LatencyAgg()
         self._engine_read_lock_wait_time = _LatencyAgg()
@@ -89,11 +232,24 @@ class VllmStatsObserver:
                 if pcs is not None:
                     self._prefix_cache_queries_total += max(0, int(getattr(pcs, "queries", 0) or 0))
                     self._prefix_cache_hits_total += max(0, int(getattr(pcs, "hits", 0) or 0))
+                self._scheduled_tokens_iter.observe(getattr(scheduler_stats, "mint_total_scheduled_tokens", None))
+                self._scheduled_new_requests_iter.observe(getattr(scheduler_stats, "mint_scheduled_new_requests", None))
+                self._scheduled_cached_requests_iter.observe(getattr(scheduler_stats, "mint_scheduled_cached_requests", None))
+                self._executor_execute_model_time.observe(getattr(scheduler_stats, "mint_executor_execute_model_s", None))
+                self._worker_execute_model_time.observe(getattr(scheduler_stats, "mint_worker_execute_model_s", None))
 
             if iteration_stats is None:
                 return
 
             self._preemptions_total += max(0, int(getattr(iteration_stats, "num_preempted_reqs", 0) or 0))
+            self._prefill_requests_iter.observe(getattr(iteration_stats, "mint_prefill_requests", None))
+            self._decode_requests_iter.observe(getattr(iteration_stats, "mint_decode_requests", None))
+            self._prompt_tokens_iter.observe(getattr(iteration_stats, "num_prompt_tokens", None))
+            self._generation_tokens_iter.observe(getattr(iteration_stats, "num_generation_tokens", None))
+            for value in getattr(iteration_stats, "time_to_first_tokens_iter", []) or []:
+                self._ttft_time.observe(value)
+            for value in getattr(iteration_stats, "inter_token_latencies_iter", []) or []:
+                self._inter_token_latency_time.observe(value)
             for req in getattr(iteration_stats, "finished_requests", []) or []:
                 self._queue_time.observe(getattr(req, "queued_time", None))
                 self._prefill_time.observe(getattr(req, "prefill_time", None))
@@ -148,6 +304,17 @@ class VllmStatsObserver:
                 ("prefill_time_s", self._prefill_time),
                 ("decode_time_s", self._decode_time),
                 ("time_per_output_token_s", self._output_token_time),
+                ("scheduled_tokens_iter", self._scheduled_tokens_iter),
+                ("scheduled_new_requests_iter", self._scheduled_new_requests_iter),
+                ("scheduled_cached_requests_iter", self._scheduled_cached_requests_iter),
+                ("prefill_requests_iter", self._prefill_requests_iter),
+                ("decode_requests_iter", self._decode_requests_iter),
+                ("prompt_tokens_iter", self._prompt_tokens_iter),
+                ("generation_tokens_iter", self._generation_tokens_iter),
+                ("time_to_first_token_s", self._ttft_time),
+                ("inter_token_latency_s", self._inter_token_latency_time),
+                ("executor_execute_model_s", self._executor_execute_model_time),
+                ("worker_execute_model_s", self._worker_execute_model_time),
                 ("seq_slot_wait_s", self._seq_slot_wait_time),
                 ("generate_lock_wait_s", self._generate_lock_wait_time),
                 ("engine_read_lock_wait_s", self._engine_read_lock_wait_time),
