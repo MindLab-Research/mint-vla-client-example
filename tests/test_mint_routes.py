@@ -28,9 +28,6 @@ class _StubFutureStore:
     async def async_resolve(self, request_id: str, payload: dict) -> None:
         self.resolved.append((request_id, payload))
 
-    async def async_resolve(self, request_id: str, payload: dict) -> None:
-        self.resolve(request_id, payload)
-
     async def async_fail(self, request_id: str, message: str) -> None:
         self.failed.append((request_id, message))
 
@@ -161,6 +158,7 @@ def test_mint_create_action_session_maps_capacity_runtime_error_to_503(monkeypat
     monkeypatch.setattr(mint_routes, 'action_session_manager', _StubActionSessionManager(), raising=False)
     monkeypatch.setattr(mint_routes, 'can_access_model', lambda base_model, user_data: True)
     monkeypatch.setattr(mint_routes, '_get_user_data', lambda request: None)
+    monkeypatch.setattr(mint_routes, '_resolve_checkpoint_for_user', lambda path, **_: '/resolved/checkpoint')
     monkeypatch.setattr(supported_models_gate, 'enforce_base_model_allowed', _allow_model)
 
     app = FastAPI()
@@ -179,6 +177,75 @@ def test_mint_create_action_session_maps_capacity_runtime_error_to_503(monkeypat
 
     assert resp.status_code == 503, resp.text
     assert 'pinned node capacity check failed' in resp.text
+
+
+def test_mint_create_action_session_uses_bypass_cap_for_checkpoint_paths(monkeypatch) -> None:
+    from tinker_server.routes import mint as mint_routes
+    import tinker_server.supported_models_gate as supported_models_gate
+
+    captured: dict[str, object] = {}
+
+    class _StubActionSessionManager:
+        async def create_session(self, **kwargs):
+            captured['create_session_kwargs'] = kwargs
+            return 'action-session-123'
+
+    async def _allow_model(*, base_model: str, http_request):
+        _ = http_request
+        return base_model
+
+    def _infer(model_path: str, *, user_id: str | None, is_admin: bool) -> str:
+        captured['infer'] = {
+            'model_path': model_path,
+            'user_id': user_id,
+            'is_admin': is_admin,
+        }
+        return 'openpi/pi0-fast-libero-low-mem-finetune'
+
+    def _resolve(path: str, *, user_id: str | None, is_admin: bool) -> str:
+        captured['resolve'] = {
+            'path': path,
+            'user_id': user_id,
+            'is_admin': is_admin,
+        }
+        return '/resolved/user-a/checkpoint'
+
+    monkeypatch.setattr(mint_routes, 'action_session_manager', _StubActionSessionManager(), raising=False)
+    monkeypatch.setattr(mint_routes, 'can_access_model', lambda base_model, user_data: True)
+    monkeypatch.setattr(mint_routes, '_get_user_data', lambda request: None)
+    monkeypatch.setattr(mint_routes, '_get_user_id', lambda request: 'user-a')
+    monkeypatch.setattr(mint_routes, 'can_bypass_ownership', lambda request: True)
+    monkeypatch.setattr(mint_routes, '_infer_base_model_from_checkpoint', _infer)
+    monkeypatch.setattr(mint_routes, '_resolve_checkpoint_for_user', _resolve)
+    monkeypatch.setattr(supported_models_gate, 'enforce_base_model_allowed', _allow_model)
+
+    app = FastAPI()
+    app.include_router(mint_routes.router, prefix='/api/v1/mint')
+    client = TestClient(app)
+
+    resp = client.post(
+        '/api/v1/mint/action_sessions',
+        json={
+            'session_id': 'act-test',
+            'action_session_seq_id': 0,
+            'model_path': 'mint://model/checkpoint',
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()['action_session_id'] == 'action-session-123'
+    assert captured['infer'] == {
+        'model_path': 'mint://model/checkpoint',
+        'user_id': 'user-a',
+        'is_admin': True,
+    }
+    assert captured['resolve'] == {
+        'path': 'mint://model/checkpoint',
+        'user_id': 'user-a',
+        'is_admin': True,
+    }
+    assert captured['create_session_kwargs']['model_path'] == '/resolved/user-a/checkpoint'
+    assert captured['create_session_kwargs']['base_model'] == 'openpi/pi0-fast-libero-low-mem-finetune'
 
 
 def test_mint_vla_train_step_route_enqueues_expected_request(monkeypatch) -> None:
@@ -493,11 +560,14 @@ def test_mint_interpolate_route_enqueues_expected_request(monkeypatch) -> None:
     monkeypatch.setattr(capacity_module, "capacity_manager", capacity)
     monkeypatch.setattr(queue_module, "api_work_queue", queue)
 
-    monkeypatch.setattr(
-        mint_routes,
-        "_resolve_checkpoint_for_user",
-        lambda path, *, user_id, is_admin: f"/resolved/{user_id}/{path.rsplit('/', 1)[-1]}",
-    )
+    resolved_flags: list[bool] = []
+
+    def _resolve(path: str, *, user_id, is_admin):
+        resolved_flags.append(bool(is_admin))
+        return f"/resolved/{user_id}/{path.rsplit('/', 1)[-1]}"
+
+    monkeypatch.setattr(mint_routes, "can_bypass_ownership", lambda _request: True)
+    monkeypatch.setattr(mint_routes, "_resolve_checkpoint_for_user", _resolve)
 
     app = FastAPI()
     app.include_router(mint_routes.router, prefix="/api/v1/mint")
@@ -532,9 +602,10 @@ def test_mint_interpolate_route_enqueues_expected_request(monkeypatch) -> None:
     assert queued["op"] == "mint.interpolate_checkpoints"
     assert queued["user_id"] == "user-a"
     assert queued["request_json"]["source_paths"] == [
-        "mint://teacher/sampler_weights/ckpt-a",
-        "mint://student/sampler_weights/ckpt-b",
+        "/resolved/user-a/ckpt-a",
+        "/resolved/user-a/ckpt-b",
     ]
+    assert resolved_flags == [True, True]
 
 
 def test_mint_reverse_kl_route_and_background_path(monkeypatch) -> None:
@@ -591,12 +662,18 @@ def test_mint_reverse_kl_route_and_background_path(monkeypatch) -> None:
     async def _noop_protect(_info: dict) -> None:
         return None
 
+    resolved_flags: list[bool] = []
+
+    def _resolve(path, **kwargs):
+        resolved_flags.append(bool(kwargs.get("is_admin")))
+        return "/resolved/ref-step-0010"
+
     monkeypatch.setattr(mint_routes, "future_store", future_store)
     monkeypatch.setattr(mint_routes, "training_engine", _StubTrainingEngine())
     monkeypatch.setattr(mint_routes, "training_manager", _StubTrainingManager())
     monkeypatch.setattr(mint_routes, "_get_user_id", lambda _request: "user-a")
-    monkeypatch.setattr(mint_routes, "is_admin_request", lambda _request: False)
-    monkeypatch.setattr(mint_routes, "_resolve_checkpoint_for_user", lambda path, **_: "/resolved/ref-step-0010")
+    monkeypatch.setattr(mint_routes, "can_bypass_ownership", lambda _request: True)
+    monkeypatch.setattr(mint_routes, "_resolve_checkpoint_for_user", _resolve)
     monkeypatch.setattr(mint_routes, "_protect_training_session_enqueue_window", _noop_protect)
     monkeypatch.setattr(mint_routes, "_get_max_model_len", lambda _base_model: 2048, raising=False)
 
@@ -606,7 +683,7 @@ def test_mint_reverse_kl_route_and_background_path(monkeypatch) -> None:
     monkeypatch.setattr(capacity_module, "capacity_manager", capacity)
     monkeypatch.setattr(queue_module, "api_work_queue", queue)
     monkeypatch.setattr(training_routes, "_get_max_model_len", lambda _base_model: 2048)
-    monkeypatch.setattr(training_routes, "_get_training_route_session_info", _get_training_route_session_info)
+    monkeypatch.setattr(mint_routes, "_get_route_training_store_info", _get_training_route_session_info)
 
     app = FastAPI()
     app.include_router(mint_routes.router, prefix="/api/v1/mint")
@@ -644,6 +721,7 @@ def test_mint_reverse_kl_route_and_background_path(monkeypatch) -> None:
     queued = queue.calls[0]
     assert queued["op"] == "mint.forward_backward_reverse_kl"
     assert queued["request_json"]["reference_model_path"] == "/resolved/ref-step-0010"
+    assert resolved_flags == [True]
     assert capacity.calls[0]["object_store_bytes"] == 256 * 1024
 
     request = ForwardBackwardReverseKLRequest.model_validate(queued["request_json"])
@@ -701,10 +779,10 @@ def test_mint_reverse_kl_route_uses_detached_training_info_without_route_runtime
     monkeypatch.setattr(mint_routes, "training_engine", None)
     monkeypatch.setattr(mint_routes, "training_manager", None)
     monkeypatch.setattr(mint_routes, "_get_user_id", lambda _request: "user-a")
-    monkeypatch.setattr(mint_routes, "is_admin_request", lambda _request: False)
+    monkeypatch.setattr(mint_routes, "can_bypass_ownership", lambda _request: False)
     monkeypatch.setattr(mint_routes, "_resolve_checkpoint_for_user", lambda path, **_: "/resolved/ref-step-0010")
     monkeypatch.setattr(mint_routes, "_protect_training_session_enqueue_window", _noop_protect)
-    monkeypatch.setattr(training_routes, "_get_training_route_session_info", _get_training_route_session_info)
+    monkeypatch.setattr(mint_routes, "_get_route_training_store_info", _get_training_route_session_info)
 
     import tinker_server.backend.capacity_manager as capacity_module
     import tinker_server.backend.api_work_queue as queue_module
@@ -752,18 +830,13 @@ def test_mint_reverse_kl_route_uses_detached_training_info_without_route_runtime
 
 
 def test_mint_reverse_kl_route_propagates_detached_store_503(monkeypatch) -> None:
+    from fastapi import HTTPException
     from tinker_server.routes import mint as mint_routes
-    from tinker_server.routes import training as training_routes
-    import tinker_server.backend.training_session_store as training_store_module
 
-    async def _get_training_route_session_info(_model_id: str):
-        return None
+    async def _raise_store_error(_model_id: str):
+        raise HTTPException(status_code=503, detail="Training session store unavailable")
 
-    async def _async_get_training_session_info(_model_id: str):
-        raise RuntimeError("store down")
-
-    monkeypatch.setattr(training_routes, "_get_training_route_session_info", _get_training_route_session_info)
-    monkeypatch.setattr(training_store_module, "async_get_training_session_info", _async_get_training_session_info)
+    monkeypatch.setattr(mint_routes, "_get_route_training_store_info", _raise_store_error)
     monkeypatch.setattr(mint_routes, "training_manager", None)
     monkeypatch.setattr(mint_routes, "training_engine", None)
 
@@ -815,10 +888,10 @@ def test_mint_reverse_kl_route_refreshes_detached_enqueue_protection(monkeypatch
     monkeypatch.setattr(mint_routes, "training_engine", None)
     monkeypatch.setattr(mint_routes, "training_manager", None)
     monkeypatch.setattr(mint_routes, "_get_user_id", lambda _request: "user-a")
-    monkeypatch.setattr(mint_routes, "is_admin_request", lambda _request: False)
+    monkeypatch.setattr(mint_routes, "can_bypass_ownership", lambda _request: False)
     monkeypatch.setattr(mint_routes, "_resolve_checkpoint_for_user", lambda path, **_: "/resolved/ref-step-0010")
     monkeypatch.setattr(mint_routes, "_protect_training_session_enqueue_window", _protect_training_session_enqueue_window)
-    monkeypatch.setattr(training_routes, "_get_training_route_session_info", _get_training_route_session_info)
+    monkeypatch.setattr(mint_routes, "_get_route_training_store_info", _get_training_route_session_info)
 
     import tinker_server.backend.capacity_manager as capacity_module
     import tinker_server.backend.api_work_queue as queue_module

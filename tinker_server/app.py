@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import time
@@ -18,7 +17,6 @@ from .auth_identity import get_request_observability_context
 from .backend.api_work_queue import ApiWorkQueueUnavailableError
 from .backend.capacity_manager import CapacityManagerUnavailableError
 from .backend.future_store import FutureStoreUnavailableError
-from .backend.persistent_prewarm import prewarm_persistent_models as _prewarm_persistent_models
 from .backend.session_manager import SessionManager
 from .config import config
 from .gateway import close_http_clients
@@ -865,6 +863,11 @@ async def api_key_auth_middleware(request: Request, call_next):
                 "apikey_id": auth_ctx.apikey_id,
                 "request_id": auth_ctx.request_id,
                 "session_id": auth_ctx.session_id,
+                "cap_write": auth_ctx.cap_write,
+                "cap_view_internal_errors": auth_ctx.cap_view_internal_errors,
+                "cap_bypass_ownership": auth_ctx.cap_bypass_ownership,
+                "cap_manage_system": auth_ctx.cap_manage_system,
+                "caps_from_headers": auth_ctx.caps_from_headers,
             }
             with bind_request_trace_context(
                 request_id=auth_ctx.request_id,

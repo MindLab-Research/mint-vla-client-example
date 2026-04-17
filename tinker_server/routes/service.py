@@ -26,9 +26,11 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
+from ..auth_identity import can_bypass_ownership_user_data
+from ..auth_identity import can_manage_system
+from ..auth_identity import can_manage_system_user_data
 from ..auth_identity import get_user_data as _request_user_data
 from ..auth_identity import get_user_id as _request_user_id
-from ..auth_identity import is_admin_request, is_admin_user_data
 from ..backend.async_ray_control import (
     _await_ray_ref,
     async_kill_named_actor,
@@ -77,7 +79,7 @@ def _user_visible(request_user_data: dict | None, owner: str | None) -> bool:
     request_user_id = str(request_user_data.get("user_id")) if request_user_data and request_user_data.get("user_id") else None
     if request_user_id is None:
         return True
-    if is_admin_user_data(request_user_data):
+    if can_bypass_ownership_user_data(request_user_data):
         return True
     return bool(owner) and owner == request_user_id
 
@@ -727,18 +729,18 @@ def _resolve_model_path(
         resolve_checkpoint_uri,
     )
 
-    is_admin = is_admin_request(http_request)
-    if not is_admin and not model_path.startswith(("tinker://", "mint://", "ckpt_")):
+    can_system = can_manage_system(http_request)
+    if not can_system and not model_path.startswith(("tinker://", "mint://", "ckpt_")):
         raise HTTPException(status_code=403, detail="Access denied")
 
     try:
-        resolved = resolve_checkpoint_uri(model_path, "", user_id=user_id, is_admin=is_admin)
+        resolved = resolve_checkpoint_uri(model_path, "", user_id=user_id, is_admin=can_system)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     if model_path.startswith("ckpt_") and resolved == model_path:
         raise HTTPException(status_code=404, detail="Checkpoint not found")
     try:
-        ensure_checkpoint_path_allowed(resolved, user_id=user_id, is_admin=is_admin)
+        ensure_checkpoint_path_allowed(resolved, user_id=user_id, is_admin=can_system)
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
     return materialize_persistent_checkpoint(resolved)
@@ -944,13 +946,13 @@ async def send_telemetry(request: TelemetryRequest) -> TelemetryResponse:
 # Admin endpoints for actor management
 # =============================================================================
 def _require_admin(request: Request) -> None:
-    """Raise 403 if not admin user."""
+    """Raise 403 if caller lacks system-management capability."""
     from ..config import config as server_config
     if not server_config.auth_enabled:
         return
     user_data = getattr(request.state, "user_data", None)
-    if not is_admin_user_data(user_data):
-        raise HTTPException(status_code=403, detail="Admin access required")
+    if not can_manage_system_user_data(user_data):
+        raise HTTPException(status_code=403, detail="System management access required")
 
 
 async def _augment_with_placement_groups(actors: list[dict]) -> None:
@@ -1121,7 +1123,7 @@ def _request_audit_fields(request: Request) -> dict[str, object]:
         "origin": request.headers.get("origin"),
         "referer": request.headers.get("referer"),
         "user_id": user_data.get("user_id") if isinstance(user_data, dict) else None,
-        "is_admin": bool(is_admin_user_data(user_data)),
+        "is_admin": bool(can_manage_system_user_data(user_data)),
     }
 
 

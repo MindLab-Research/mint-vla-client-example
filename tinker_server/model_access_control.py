@@ -1,14 +1,13 @@
-"""Model access control for restricting certain models to specific user types.
+"""Product-level model catalog gating.
 
-MINT platform users (identified by sk- tokens) have restricted access to certain models.
-Admin users (using hardcoded API keys) have full access to all models.
+`RESTRICTED_MODELS` stays hidden from regular Mint platform API users.
+Privileged callers still bypass that product gate through an explicit policy helper.
 """
 
 from typing import Optional
 
-from .auth_identity import is_admin_user_data
+from .auth_identity import can_access_restricted_models_user_data
 
-# Models that are restricted from MINT platform users
 RESTRICTED_MODELS = {
     "moonshotai/Kimi-K2-Instruct",
     "moonshotai/Kimi-K2-Thinking",
@@ -16,40 +15,25 @@ RESTRICTED_MODELS = {
 
 
 def is_mint_platform_user(user_data: Optional[dict]) -> bool:
-    """Check if user is from MINT platform (sk- token user).
-
-    Args:
-        user_data: User data from auth middleware (contains user_id)
-
-    Returns:
-        True if user is from MINT platform, False if admin or unauthenticated
-    """
+    """Return whether the caller should receive the restricted model catalog."""
     if user_data is None:
         return False
 
-    if is_admin_user_data(user_data):
+    if can_access_restricted_models_user_data(user_data):
         return False
 
-    # Any other user_id means it's a MINT platform user (sk- token)
     user_id = user_data.get("user_id")
     return user_id is not None
 
 
 def can_access_model(model_name: str, user_data: Optional[dict]) -> bool:
-    """Check if user can access the specified model.
+    """Return whether this caller may use `model_name`."""
+    if can_access_restricted_models_user_data(user_data):
+        return True
 
-    Args:
-        model_name: Model name to check access for
-        user_data: User data from auth middleware
-
-    Returns:
-        True if user can access the model, False otherwise
-    """
-    # Admin users can access all models
     if not is_mint_platform_user(user_data):
         return True
 
-    # MINT platform users cannot access restricted models
     if model_name in RESTRICTED_MODELS:
         return False
 

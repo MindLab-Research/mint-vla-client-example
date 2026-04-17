@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from types import SimpleNamespace
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -167,7 +166,7 @@ def test_create_action_session_route_resolves_checkpoint_path_before_manager(mon
     monkeypatch.setenv("MINT_SUPPORTED_MODELS", OPENPI_FAST_MODEL)
     monkeypatch.setattr(mint_routes, "action_session_manager", manager, raising=False)
     monkeypatch.setattr(mint_routes, "_get_user_id", lambda _request: "user-1")
-    monkeypatch.setattr(mint_routes, "is_admin_request", lambda _request: False)
+    monkeypatch.setattr(mint_routes, "_can_bypass_checkpoint_ownership", lambda _request: False)
     monkeypatch.setattr(
         mint_routes,
         "_resolve_checkpoint_for_user",
@@ -219,7 +218,7 @@ def test_create_action_session_route_infers_base_model_with_admin_scope(monkeypa
     monkeypatch.setenv("MINT_SUPPORTED_MODELS", OPENPI_FAST_MODEL)
     monkeypatch.setattr(mint_routes, "action_session_manager", manager, raising=False)
     monkeypatch.setattr(mint_routes, "_get_user_id", lambda _request: "admin")
-    monkeypatch.setattr(mint_routes, "is_admin_request", lambda _request: True)
+    monkeypatch.setattr(mint_routes, "_can_bypass_checkpoint_ownership", lambda _request: True)
     monkeypatch.setattr(
         mint_routes,
         "_infer_base_model_from_checkpoint",

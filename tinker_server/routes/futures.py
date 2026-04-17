@@ -14,7 +14,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, Response
 
-from ..auth_identity import is_admin_request
+from ..auth_identity import can_view_internal_errors
 from ..backend.future_replay import ReplayEntry, future_replay_store, should_persist_training_future
 from ..backend.future_store import FutureStatus, FutureStoreUnavailableError, future_store
 from ..futures_utils import pending_future_http_response
@@ -155,11 +155,11 @@ def _public_error(error: str | None) -> str:
 
 
 def _is_privileged(request: Request) -> bool:
-    """Check if request is from privileged user (admin API key)."""
+    """Check if request may see internal failure details."""
     from ..config import config as server_config
     if not server_config.auth_enabled:
         return True
-    return is_admin_request(request)
+    return can_view_internal_errors(request)
 
 
 def _failed_payload(error: str | None, request: Request) -> dict[str, str]:
