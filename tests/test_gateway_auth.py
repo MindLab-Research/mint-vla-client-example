@@ -129,7 +129,7 @@ def test_has_gateway_auth_headers_detects_forwarded_auth():
     assert has_gateway_auth_headers({"Authorization": "Bearer sk-abc"}) is False
 
 
-def test_can_access_model_treats_gateway_admin_as_privileged():
+def test_can_access_model_allows_privileged_restricted_model_access():
     assert can_access_model(
         "moonshotai/Kimi-K2-Instruct",
         {"user_id": "aaaaaaaaaaaaaaaaaaaaaaaa", "user_role": "admin", "is_admin": True},

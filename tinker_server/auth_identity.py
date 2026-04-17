@@ -170,7 +170,7 @@ def get_request_observability_context(request: Request) -> dict[str, str]:
     return out
 
 
-def is_admin_user_data(user_data: dict | None) -> bool:
+def can_access_restricted_models_user_data(user_data: dict | None) -> bool:
     role = get_user_role_from_user_data(user_data)
     return role == "admin"
 
