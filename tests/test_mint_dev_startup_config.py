@@ -32,6 +32,8 @@ def test_start_dev_server_script_sources_env_and_uses_runtime_python() -> None:
 def test_prod_volcano_env_pins_runtime_paths_for_prod_host() -> None:
     text = (REPO_ROOT / "configs" / "prod_volcano.env.sh").read_text()
 
+    assert 'zai-org/GLM-5.1' in text
+    assert 'export TINKER_GATEWAY_GLM51_BASE_URL="http://123.57.26.97:18000"' in text
     assert 'export MINT_TMP_ROOT="${MINT_TMP_ROOT:-/vePFS-Mindverse/share/mint-data/prod}"' in text
     assert "export TINKER_RUNTIME_CHECKPOINT_DIR=" in text
 
@@ -40,6 +42,10 @@ def test_start_prod_server_script_uses_tmp_root_shortlink() -> None:
     text = (REPO_ROOT / "scripts" / "start_prod_server.sh").read_text()
 
     assert '. ./configs/prod_volcano.env.sh' in text
+    assert 'if [ -n "${TINKER_GATEWAY_GLM51_BASE_URL:-}" ]; then' in text
+    assert 'missing TINKER_API_KEY for GLM5.1 static gateway auth' in text
+    assert 'model_to_upstream[model] = alias' in text
+    assert 'upstreams[alias] = {' in text
     assert 'api_tmp_root="${MINT_TMP_ROOT}/api/${USER:-unknown}"' in text
     assert 'api_tmp_link="/tmp/mpa"' in text
     assert 'export TMPDIR="${api_tmp_link}/t"' in text

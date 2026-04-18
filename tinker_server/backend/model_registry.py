@@ -1,5 +1,6 @@
 """Model configuration registry for hardware requirements."""
 
+import json
 import logging
 import os
 import types
@@ -613,6 +614,23 @@ def requires_fp8(model_name: str) -> bool:
     return config.quantization == "fp8"
 
 
+def _gateway_supported_models() -> set[str]:
+    raw = os.environ.get("TINKER_GATEWAY_CONFIG_JSON", "").strip()
+    if not raw:
+        return set()
+
+    data = json.loads(raw)
+    model_map = (
+        data.get("model_to_upstream")
+        or data.get("model_to_deployment_target")
+        or data.get("model_to_target")
+        or {}
+    )
+    if not isinstance(model_map, dict):
+        raise ValueError("TINKER_GATEWAY_CONFIG_JSON model routing must be a JSON object")
+    return {str(name).strip() for name in model_map if str(name).strip()}
+
+
 def list_supported_models() -> list[str]:
     """Return list of supported model names."""
     raw = (os.environ.get("MINT_SUPPORTED_MODELS") or os.environ.get("TINKER_SUPPORTED_MODELS") or "").strip()
@@ -625,7 +643,8 @@ def list_supported_models() -> list[str]:
                 continue
             seen.add(m)
             models.append(m)
-        unknown = [m for m in models if m not in MODEL_CONFIGS]
+        gateway_models = _gateway_supported_models()
+        unknown = [m for m in models if m not in MODEL_CONFIGS and m not in gateway_models]
         if unknown:
             raise ValueError(f"Unsupported models in MINT_SUPPORTED_MODELS: {unknown}")
         return models

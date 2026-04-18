@@ -24,6 +24,31 @@ def test_list_supported_models_env_unknown_raises(monkeypatch):
         raise AssertionError("expected ValueError")
 
 
+def test_list_supported_models_env_accepts_gateway_routed_model(monkeypatch):
+    from tinker_server.backend import model_registry as mr
+
+    monkeypatch.setenv("MINT_SUPPORTED_MODELS", "Qwen/Qwen3-0.6B, zai-org/GLM-5.1")
+    monkeypatch.setenv(
+        "TINKER_GATEWAY_CONFIG_JSON",
+        json.dumps(
+            {
+                "model_to_upstream": {"zai-org/GLM-5.1": "glm51"},
+                "upstreams": {
+                    "glm51": {
+                        "base_url": "http://example.com:18000",
+                        "auth_mode": "static_api_key",
+                        "api_key": "secret",
+                    }
+                },
+            }
+        ),
+    )
+
+    got = mr.list_supported_models()
+
+    assert got == ["Qwen/Qwen3-0.6B", "zai-org/GLM-5.1"]
+
+
 def test_model_config_overrides_json(monkeypatch):
     from tinker_server.backend import model_registry as mr
 

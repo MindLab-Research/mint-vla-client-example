@@ -11,7 +11,7 @@ export TINKER_PORT=18000
 export TINKER_CHECKPOINT_DIR=/tos-mindverse/tinker_checkpoints
 export TINKER_USAGE_LOG_DIR=/vePFS-Mindverse/share/mint-prod-data/billing
 
-export MINT_SUPPORTED_MODELS="Qwen/Qwen3-0.6B,Qwen/Qwen3-4B-Instruct-2507,Qwen/Qwen3-4B-Thinking-2507,Qwen/Qwen3-30B-A3B-Instruct-2507,Qwen/Qwen3-235B-A22B-Instruct-2507"
+export MINT_SUPPORTED_MODELS="Qwen/Qwen3-0.6B,Qwen/Qwen3-4B-Instruct-2507,Qwen/Qwen3-4B-Thinking-2507,Qwen/Qwen3-30B-A3B-Instruct-2507,Qwen/Qwen3-235B-A22B-Instruct-2507,zai-org/GLM-5.1"
 export MINT_PERSISTENT_MODELS="Qwen/Qwen3-0.6B,Qwen/Qwen3-4B-Instruct-2507,Qwen/Qwen3-4B-Thinking-2507,Qwen/Qwen3-30B-A3B-Instruct-2507,Qwen/Qwen3-235B-A22B-Instruct-2507"
 export MINT_PERSISTENT_PREWARM_INFERENCE=1
 export MINT_PERSISTENT_PREWARM_TRAINING=1
@@ -20,18 +20,23 @@ export MINT_PERSISTENT_TRAIN_LR=5e-5
 export MINT_PERSISTENT_MEGATRON_READY_TIMEOUT_S=3600
 
 export TINKER_GATEWAY_CONFIG_JSON=""
+export TINKER_GATEWAY_GLM51_MODEL="zai-org/GLM-5.1"
+export TINKER_GATEWAY_GLM51_ALIAS="mint-prod-glm51"
+export TINKER_GATEWAY_GLM51_BASE_URL="http://123.57.26.97:18000"
+export TINKER_GATEWAY_GLM51_AUTH_MODE="static_api_key"
 export MINT_SAVE_LORA_TIMEOUT_S=1800
 export MINT_SCHEDULER_ENABLE=1
 
-# Current worker topology after 2026-03-12 rebuild:
-# active dense/vllm pin node: 192.168.38.153
-# worker2=192.168.37.160 worker3=192.168.37.161 worker4=192.168.37.162
-# worker5=192.168.37.163 worker6=192.168.37.156 worker7=192.168.37.157 worker8=192.168.37.158 worker9=192.168.38.153
-export MINT_VLLM_PINNED_NODE_IP_JSON='{"Qwen/Qwen3-0.6B":"192.168.38.153","Qwen/Qwen3-4B-Instruct-2507":"192.168.38.153","Qwen/Qwen3-4B-Thinking-2507":"192.168.38.153","Qwen/Qwen3-30B-A3B-Instruct-2507":"192.168.37.160"}'
-export MINT_DENSE_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.38.153"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.38.153"],"Qwen/Qwen3-4B-Thinking-2507":["192.168.38.153"]}'
-export MINT_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.38.153"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.38.153"],"Qwen/Qwen3-4B-Thinking-2507":["192.168.38.153"],"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.37.160"]}'
-export MINT_VLLM_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.38.153"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.38.153"],"Qwen/Qwen3-4B-Thinking-2507":["192.168.38.153"],"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.37.160"],"Qwen/Qwen3-235B-A22B-Instruct-2507":["192.168.37.161","192.168.37.162"],"Qwen/Qwen3-235B-A22B-Thinking-2507":["192.168.37.161","192.168.37.162"]}'
-export MINT_MEGATRON_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.37.160"],"Qwen/Qwen3-235B-A22B-Instruct-2507":["192.168.37.163","192.168.37.156","192.168.37.157","192.168.37.158"],"Qwen/Qwen3-235B-A22B-Thinking-2507":["192.168.37.163","192.168.37.156","192.168.37.157","192.168.37.158"]}'
+# Current worker topology after 2026-04-10 head/worker rebuild:
+# worker1 dense + small vLLM: 192.168.39.53
+# worker2 30B vLLM + megatron: 192.168.39.52
+# worker3-4 235B vLLM: 192.168.39.51,192.168.39.54
+# worker5-8 235B megatron: 192.168.39.50,192.168.39.56,192.168.39.55,192.168.39.57
+export MINT_VLLM_PINNED_NODE_IP_JSON='{"Qwen/Qwen3-0.6B":"192.168.39.53","Qwen/Qwen3-4B-Instruct-2507":"192.168.39.53","Qwen/Qwen3-4B-Thinking-2507":"192.168.39.53","Qwen/Qwen3-30B-A3B-Instruct-2507":"192.168.39.52"}'
+export MINT_DENSE_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.39.53"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.39.53"],"Qwen/Qwen3-4B-Thinking-2507":["192.168.39.53"]}'
+export MINT_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.39.53"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.39.53"],"Qwen/Qwen3-4B-Thinking-2507":["192.168.39.53"],"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.39.52"]}'
+export MINT_VLLM_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.39.53"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.39.53"],"Qwen/Qwen3-4B-Thinking-2507":["192.168.39.53"],"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.39.52"],"Qwen/Qwen3-235B-A22B-Instruct-2507":["192.168.39.51","192.168.39.54"],"Qwen/Qwen3-235B-A22B-Thinking-2507":["192.168.39.51","192.168.39.54"]}'
+export MINT_MEGATRON_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.39.52"],"Qwen/Qwen3-235B-A22B-Instruct-2507":["192.168.39.50","192.168.39.56","192.168.39.55","192.168.39.57"],"Qwen/Qwen3-235B-A22B-Thinking-2507":["192.168.39.50","192.168.39.56","192.168.39.55","192.168.39.57"]}'
 
 export MINT_MODEL_CONFIG_OVERRIDES_JSON=''
 

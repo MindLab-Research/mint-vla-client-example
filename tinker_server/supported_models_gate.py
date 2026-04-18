@@ -27,15 +27,10 @@ async def enforce_base_model_allowed(*, base_model: str, http_request: Request) 
     from .gateway import get_upstream_capabilities, upstream_for_model
 
     local_name = _normalize_local_model_name(base_model)
+    supported = set(list_supported_models())
 
-    if not ALLOW_UNSUPPORTED_MODELS:
-        if local_name is None:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unsupported base_model: {base_model!r}. Not present in MODEL_CONFIGS.",
-            )
-        supported = set(list_supported_models())
-        if local_name not in supported:
+    if local_name is not None:
+        if not ALLOW_UNSUPPORTED_MODELS and local_name not in supported:
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -45,23 +40,34 @@ async def enforce_base_model_allowed(*, base_model: str, http_request: Request) 
             )
         return local_name
 
-    if local_name is not None:
-        return local_name
-
     if base_model in MODEL_CONFIGS:
         return base_model
 
     upstream = upstream_for_model(base_model)
-    if upstream is None:
+    if upstream is not None:
+        if not ALLOW_UNSUPPORTED_MODELS and base_model not in supported:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Unsupported base_model: {base_model!r}. "
+                    "Not present in MINT_SUPPORTED_MODELS; set ALLOW_UNSUPPORTED_MODELS=1 to override."
+                ),
+            )
+        caps = await get_upstream_capabilities(upstream=upstream, incoming_headers=dict(http_request.headers))
+        if base_model not in caps:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Gateway misconfig: model {base_model!r} not present in upstream {upstream.alias!r} capabilities",
+            )
+        return base_model
+
+    if not ALLOW_UNSUPPORTED_MODELS:
         raise HTTPException(
             status_code=400,
             detail=f"Unsupported base_model: {base_model!r}. Not present in MODEL_CONFIGS and not gateway-routed.",
         )
 
-    caps = await get_upstream_capabilities(upstream=upstream, incoming_headers=dict(http_request.headers))
-    if base_model not in caps:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Gateway misconfig: model {base_model!r} not present in upstream {upstream.alias!r} capabilities",
-        )
-    return base_model
+    raise HTTPException(
+        status_code=400,
+        detail=f"Unsupported base_model: {base_model!r}. Not present in MODEL_CONFIGS and not gateway-routed.",
+    )
