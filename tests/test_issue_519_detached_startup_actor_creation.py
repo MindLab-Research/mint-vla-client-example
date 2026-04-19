@@ -56,6 +56,7 @@ def _install_fake_ray(monkeypatch):
         ("tinker_server.backend.capacity_manager", "_get_or_create_ray_actor"),
         ("tinker_server.backend.owner_runtime_supervisor", "_get_or_create_actor"),
         ("tinker_server.backend.queue_execution_runtime", "_get_or_create_actor"),
+        ("tinker_server.backend.queue_supervisor", "_get_or_create_actor"),
         ("tinker_server.backend.training_cleanup_executor", "_get_or_create_actor"),
         ("tinker_server.backend.sampling_cleanup_executor", "_get_or_create_actor"),
     ],

@@ -204,6 +204,11 @@ def _ray_init_lock_poll_s() -> float:
         return 0.05
 
 
+def _ray_init_requires_interprocess_lock(address: str | None) -> bool:
+    value = "" if address is None else str(address).strip().lower()
+    return value in {"", "local"}
+
+
 @contextlib.contextmanager
 def _ray_init_interprocess_lock() -> Iterator[float]:
     lock_path = _ray_init_lock_path()
@@ -278,6 +283,35 @@ def init_ray(**kwargs: Any) -> Any:
     for k, v in ray_log_to_driver_kwargs().items():
         kwargs.setdefault(k, v)
 
+    def _reuse_existing_worker_connection(namespace: Any) -> bool:
+        nonlocal desired_address
+        global _RAY_LAST_INIT_ADDRESS
+        if not ray.is_initialized():
+            return False
+        try:
+            ctx = ray.get_runtime_context()
+            worker = getattr(ctx, "worker", None)
+            worker_mode = getattr(worker, "mode", None)
+        except Exception:
+            return False
+        if worker_mode != getattr(ray, "WORKER_MODE", None):
+            return False
+        current_namespace = getattr(ctx, "namespace", None)
+        if namespace is not None and current_namespace not in (None, "") and str(current_namespace) != str(namespace):
+            logger.warning(
+                "ray already initialized in worker context namespace=%r; requested namespace=%r; reusing existing worker connection",
+                current_namespace,
+                namespace,
+            )
+        else:
+            logger.info(
+                "ray already initialized in worker context; reusing existing worker connection namespace=%r desired=%r",
+                current_namespace,
+                desired_address,
+            )
+        _RAY_LAST_INIT_ADDRESS = desired_address
+        return True
+
     def _reconnect_if_address_drift(namespace: Any) -> bool:
         nonlocal desired_address
         global _RAY_LAST_INIT_ADDRESS
@@ -298,9 +332,18 @@ def init_ray(**kwargs: Any) -> Any:
 
     with _RAY_INIT_THREAD_LOCK:
         namespace = kwargs.get("namespace")
+        if _reuse_existing_worker_connection(namespace):
+            return None
         if _reconnect_if_address_drift(namespace):
             return None
-        with _ray_init_interprocess_lock() as lock_wait_s:
+        lock_cm = (
+            _ray_init_interprocess_lock()
+            if _ray_init_requires_interprocess_lock(desired_address)
+            else contextlib.nullcontext(0.0)
+        )
+        with lock_cm as lock_wait_s:
+            if _reuse_existing_worker_connection(namespace):
+                return None
             if _reconnect_if_address_drift(namespace):
                 return None
             pid = os.getpid()
