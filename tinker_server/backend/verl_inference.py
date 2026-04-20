@@ -43,7 +43,11 @@ from tinker_server.runtime_env import (
 )
 
 from . import ray_kill
-from .vllm_scheduler_observability import VllmStatsObserver, attach_vllm_stats_logger
+from .vllm_scheduler_observability import (
+    VllmStatsObserver,
+    attach_vllm_stats_logger,
+    install_vllm_iteration_observability_patches,
+)
 
 if TYPE_CHECKING:
     import torch
@@ -899,6 +903,7 @@ def _create_extended_server_class(
             engine = getattr(self, "engine", None)
             if engine is None:
                 return
+            install_vllm_iteration_observability_patches()
             attach_vllm_stats_logger(engine, self._vllm_stats_observer)
 
         async def run_server(self, args):

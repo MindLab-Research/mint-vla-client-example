@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import threading
 import time
+import traceback
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -26,6 +28,44 @@ from ..logging_context import (
 from ..queue_priority import QUEUE_PRIORITY_AGING_S, effective_queue_priority, normalize_queue_priority
 
 logger = logging.getLogger(__name__)
+
+
+def _api_work_queue_debug_log_path() -> str:
+    raw = os.environ.get("MINT_API_WORK_QUEUE_DEBUG_LOG_PATH", "").strip()
+    if raw:
+        return raw
+    fallback = os.environ.get("MINT_QUEUE_EXECUTION_RUNTIME_DEBUG_LOG_PATH", "").strip()
+    if fallback:
+        return fallback
+    return "/tmp/tinker_api_work_queue.debug.jsonl"
+
+
+def _summarize_debug_runtime_env(runtime_env: Any) -> Any:
+    if not isinstance(runtime_env, dict):
+        return runtime_env
+    summary = dict(runtime_env)
+    env_vars = summary.get("env_vars")
+    if isinstance(env_vars, dict):
+        summary["env_var_keys"] = sorted(str(key) for key in env_vars)
+        summary.pop("env_vars", None)
+    return summary
+
+
+def _append_api_work_queue_debug(event: str, **fields: Any) -> None:
+    record = {
+        "ts": round(time.time(), 6),
+        "pid": os.getpid(),
+        "event": event,
+        "actor_name": _ray_api_work_queue_actor_name(),
+        "namespace": _ray_namespace(),
+        **fields,
+    }
+    try:
+        with open(_api_work_queue_debug_log_path(), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=True, sort_keys=True, default=str))
+            fh.write("\n")
+    except Exception:
+        logger.debug("api work queue debug log write failed", exc_info=True)
 
 
 class ApiWorkQueueUnavailableError(RuntimeError):
@@ -141,66 +181,81 @@ def _create_ray_actor(*, require_ready: bool = True):
     @ray.remote(num_cpus=0, max_concurrency=max_concurrency, max_restarts=max_restarts)
     class _RayApiWorkQueueActor:
         def __init__(self) -> None:
-            from collections import deque
+            _append_api_work_queue_debug("actor_init_begin")
+            try:
+                from collections import deque
 
-            init_actor_observability()
-            logger.info(
-                "[api_work_queue] actor (re)initializing (max_restarts=%d)",
-                max_restarts,
-            )
-            self._items = deque()
-            self._cv = asyncio.Condition()
-            self._enqueued = 0
-            self._dequeued = 0
-            debug_max = int(os.environ.get("MINT_API_WORK_QUEUE_DEBUG_MAX", "50"))
-            self._recent_dequeues = deque(maxlen=debug_max)
-            self._recent_enqueues = deque(maxlen=debug_max)
-            self._recent_scheduler_decisions = deque(
-                maxlen=int(os.environ.get("MINT_API_WORK_QUEUE_SCHED_DEBUG_MAX", str(debug_max)))
-            )
-            self._scheduler_decision_seq = 0
-            self._active_job_id: str | None = None
-            self._ema_exec_s_by_op: dict[str, float] = {}
-            self._last_exec_s_by_op: dict[str, float] = {}
-            self._sum_exec_s_by_op: dict[str, float] = {}
-            self._count_exec_by_op: dict[str, int] = {}
-            self._max_exec_s_by_op: dict[str, float] = {}
-            self._ema_alpha = float(os.environ.get("MINT_API_WORK_QUEUE_ETA_ALPHA", "0.1"))
-            self._max_pending_asample_per_apikey = int(
-                getattr(server_config, "sampling_max_pending_asample_per_apikey", 64)
-            )
-            self._queued_asample_by_principal: dict[str, int] = {}
-            self._queued_asample_by_apikey: dict[str, int] = {}
-            self._queued_asample_request_state: dict[str, tuple[str | None, str | None, str | None]] = {}
-            self._scheduler_request_meta: dict[str, tuple[str, str, str]] = {}
-            self._scheduler_lease_consumer: dict[str, str] = {}
-            self._scheduler_enabled = self._to_bool(os.environ.get("MINT_SCHEDULER_ENABLE", "1"))
-            self._scheduler_max_consecutive = max(
-                1,
-                int(os.environ.get("MINT_SCHEDULER_MAX_CONSECUTIVE", "8")),
-            )
-            fairness = str(os.environ.get("MINT_SCHEDULER_FAIRNESS", "oldest")).strip().lower()
-            if fairness not in ("oldest", "rr"):
-                fairness = "oldest"
-            self._scheduler_fairness = fairness
-            self._scheduler_starvation_s = max(
-                0.0,
-                float(os.environ.get("MINT_SCHEDULER_STARVATION_S", "30")),
-            )
-            self._scheduler_coalesce_ms = max(
-                0.0,
-                float(os.environ.get("MINT_SCHEDULER_COALESCE_MS", "20")),
-            )
-            self._sched_domains: dict[str, dict[str, Any]] = {}
-            self._sched_stats: dict[str, Any] = {
-                "picks_total": 0,
-                "switches_total": 0,
-                "starvation_picks_total": 0,
-                "wait_s_sum": 0.0,
-                "switch_reasons": {},
-            }
-            self._execution_serial_seq_by_key: dict[str, int] = {}
-            self._execution_serial_epoch = uuid.uuid4().hex
+                init_actor_observability()
+                logger.info(
+                    "[api_work_queue] actor (re)initializing (max_restarts=%d)",
+                    max_restarts,
+                )
+                self._items = deque()
+                self._cv = asyncio.Condition()
+                self._enqueued = 0
+                self._dequeued = 0
+                debug_max = int(os.environ.get("MINT_API_WORK_QUEUE_DEBUG_MAX", "50"))
+                self._recent_dequeues = deque(maxlen=debug_max)
+                self._recent_enqueues = deque(maxlen=debug_max)
+                self._recent_scheduler_decisions = deque(
+                    maxlen=int(os.environ.get("MINT_API_WORK_QUEUE_SCHED_DEBUG_MAX", str(debug_max)))
+                )
+                self._scheduler_decision_seq = 0
+                self._active_job_id: str | None = None
+                self._ema_exec_s_by_op: dict[str, float] = {}
+                self._last_exec_s_by_op: dict[str, float] = {}
+                self._sum_exec_s_by_op: dict[str, float] = {}
+                self._count_exec_by_op: dict[str, int] = {}
+                self._max_exec_s_by_op: dict[str, float] = {}
+                self._ema_alpha = float(os.environ.get("MINT_API_WORK_QUEUE_ETA_ALPHA", "0.1"))
+                self._max_pending_asample_per_apikey = int(
+                    getattr(server_config, "sampling_max_pending_asample_per_apikey", 64)
+                )
+                self._queued_asample_by_principal: dict[str, int] = {}
+                self._queued_asample_by_apikey: dict[str, int] = {}
+                self._queued_asample_request_state: dict[str, tuple[str | None, str | None, str | None]] = {}
+                self._scheduler_request_meta: dict[str, tuple[str, str, str]] = {}
+                self._scheduler_lease_consumer: dict[str, str] = {}
+                self._scheduler_enabled = self._to_bool(os.environ.get("MINT_SCHEDULER_ENABLE", "1"))
+                self._scheduler_max_consecutive = max(
+                    1,
+                    int(os.environ.get("MINT_SCHEDULER_MAX_CONSECUTIVE", "8")),
+                )
+                fairness = str(os.environ.get("MINT_SCHEDULER_FAIRNESS", "oldest")).strip().lower()
+                if fairness not in ("oldest", "rr"):
+                    fairness = "oldest"
+                self._scheduler_fairness = fairness
+                self._scheduler_starvation_s = max(
+                    0.0,
+                    float(os.environ.get("MINT_SCHEDULER_STARVATION_S", "30")),
+                )
+                self._scheduler_coalesce_ms = max(
+                    0.0,
+                    float(os.environ.get("MINT_SCHEDULER_COALESCE_MS", "20")),
+                )
+                self._sched_domains: dict[str, dict[str, Any]] = {}
+                self._sched_stats: dict[str, Any] = {
+                    "picks_total": 0,
+                    "switches_total": 0,
+                    "starvation_picks_total": 0,
+                    "wait_s_sum": 0.0,
+                    "switch_reasons": {},
+                }
+                self._execution_serial_seq_by_key: dict[str, int] = {}
+                self._execution_serial_epoch = uuid.uuid4().hex
+                _append_api_work_queue_debug(
+                    "actor_init_ok",
+                    cwd=os.getcwd(),
+                    debug_log_path=_api_work_queue_debug_log_path(),
+                    pythonpath=os.environ.get("PYTHONPATH", ""),
+                )
+            except Exception as e:
+                _append_api_work_queue_debug(
+                    "actor_init_error",
+                    error=f"{type(e).__name__}: {e}",
+                    traceback=traceback.format_exc(),
+                )
+                raise
 
         def _asample_throttle_identity(self, item: dict[str, Any]) -> tuple[str | None, str | None]:
             if str(item.get("op")) != "sampling.asample":
@@ -1391,6 +1446,7 @@ def _create_ray_actor(*, require_ready: bool = True):
         "max_task_retries": -1,
     }
     actor_otel_env = otel_env_vars()
+    actor_otel_env.setdefault("MINT_API_WORK_QUEUE_DEBUG_LOG_PATH", _api_work_queue_debug_log_path())
     from ..config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources
     if resources is not None:
         options["resources"] = resources
@@ -1400,16 +1456,28 @@ def _create_ray_actor(*, require_ready: bool = True):
         pythonpath=PFS_PYTHONPATH,
         extra=actor_otel_env,
     )
+    _append_api_work_queue_debug(
+        "driver_create_attempt",
+        runtime_env=_summarize_debug_runtime_env(options.get("runtime_env")),
+        resources=options.get("resources"),
+    )
 
     created = _RayApiWorkQueueActor.options(  # type: ignore[attr-defined]
         **options
     ).remote()
+    _append_api_work_queue_debug("driver_create_remote_returned", require_ready=bool(require_ready))
     if not require_ready:
         return created
     try:
         ray.get(created.stats.remote(), timeout=1.0)
+        _append_api_work_queue_debug("driver_create_ready_ok")
         return created
-    except Exception:
+    except Exception as e:
+        _append_api_work_queue_debug(
+            "driver_create_ready_probe_failed",
+            error=f"{type(e).__name__}: {e}",
+            traceback=traceback.format_exc(),
+        )
         return ray.get_actor(actor_name, namespace=_ray_namespace())
 
 
@@ -1798,9 +1866,16 @@ class ApiWorkQueueClient:
         return self._get_ray_actor(require_ready=False)
 
     async def _get_ray_actor_async(self, *, require_ready: bool = True):
+        _append_api_work_queue_debug("get_ray_actor_async_begin", require_ready=bool(require_ready))
         try:
             import ray
         except Exception as e:
+            _append_api_work_queue_debug(
+                "get_ray_actor_async_import_error",
+                require_ready=bool(require_ready),
+                error=f"{type(e).__name__}: {e}",
+                traceback=traceback.format_exc(),
+            )
             raise ApiWorkQueueUnavailableError("Ray import failed") from e
 
         async def _ensure_active_job_binding(actor: Any, *, timeout_s: float) -> None:
@@ -1814,17 +1889,28 @@ class ApiWorkQueueClient:
             ref = actor.set_active_job_id.remote(self._consumer_job_id)
             await self._await_ray_ref(ref, timeout_s=timeout_s)
 
-        try:
-            from ..ray_utils import init_ray
+        if not ray.is_initialized():
+            try:
+                from ..ray_utils import init_ray
 
-            init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
-        except Exception as e:
-            raise ApiWorkQueueUnavailableError("Ray not initialized (init_ray failed)") from e
+                init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
+                _append_api_work_queue_debug("get_ray_actor_async_after_init_ray", require_ready=bool(require_ready))
+            except Exception as e:
+                _append_api_work_queue_debug(
+                    "get_ray_actor_async_init_ray_error",
+                    require_ready=bool(require_ready),
+                    error=f"{type(e).__name__}: {e}",
+                    traceback=traceback.format_exc(),
+                )
+                raise ApiWorkQueueUnavailableError("Ray not initialized (init_ray failed)") from e
+        else:
+            _append_api_work_queue_debug("get_ray_actor_async_using_existing_ray", require_ready=bool(require_ready))
         if not ray.is_initialized():
             raise ApiWorkQueueUnavailableError("Ray not initialized")
 
         if self._ray_actor is not None:
             if not require_ready:
+                _append_api_work_queue_debug("get_ray_actor_async_return_cached", require_ready=False)
                 return self._ray_actor
             try:
                 await self._await_ray_ref(self._ray_actor.stats.remote(), timeout_s=1.0)
@@ -1845,6 +1931,7 @@ class ApiWorkQueueClient:
             actor = await asyncio.to_thread(ray.get_actor, actor_name, namespace=_ray_namespace())
             if not require_ready:
                 self._ray_actor = actor
+                _append_api_work_queue_debug("get_ray_actor_async_found_existing", require_ready=False)
                 return actor
             await self._await_ray_ref(actor.stats.remote(), timeout_s=probe_timeout_s)
             await _ensure_active_job_binding(actor, timeout_s=max(5.0, probe_timeout_s))
@@ -1890,9 +1977,19 @@ class ApiWorkQueueClient:
 
         try:
             self._ray_actor = _create_ray_actor(require_ready=require_ready)
+            _append_api_work_queue_debug(
+                "get_ray_actor_async_created",
+                require_ready=bool(require_ready),
+            )
             if require_ready:
                 await _ensure_active_job_binding(self._ray_actor, timeout_s=max(5.0, probe_timeout_s))
         except Exception as e:
+            _append_api_work_queue_debug(
+                "get_ray_actor_async_error",
+                require_ready=bool(require_ready),
+                error=f"{type(e).__name__}: {e}",
+                traceback=traceback.format_exc(),
+            )
             raise ApiWorkQueueUnavailableError("Failed to get/create detached Ray ApiWorkQueue actor") from e
         return self._ray_actor
 

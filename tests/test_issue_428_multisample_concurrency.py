@@ -119,9 +119,9 @@ def _install_fake_vllm(monkeypatch):
     monkeypatch.setitem(sys.modules, "vllm.lora.request", request_mod)
 
 
-def _make_actor_impl(monkeypatch):
+def _make_actor_impl(monkeypatch, **actor_kwargs):
     monkeypatch.setattr(mni, "init_actor_observability", lambda: None)
-    remote_cls = mni._create_multinode_vllm_actor()
+    remote_cls = mni._create_multinode_vllm_actor(**actor_kwargs)
     impl_cls = remote_cls.__ray_metadata__.modified_class
     return impl_cls
 
@@ -355,3 +355,168 @@ async def test_issue_428_concurrent_n1_failure_aborts_remaining_subrequests(monk
         n=1,
     )
     assert result["token_ids"] == [11, 21]
+
+
+@pytest.mark.anyio
+async def test_issue_428_register_generate_start_failure_releases_seq_slot(monkeypatch):
+    _install_fake_vllm(monkeypatch)
+    _stub_future_store(monkeypatch)
+    monkeypatch.setattr(mni, "init_actor_observability", lambda: None)
+    monkeypatch.setattr(mni.server_config, "router_replay_mode", "disabled", raising=False)
+    monkeypatch.setattr(vllm_stop, "vllm_stop_kwargs", lambda stop, default_stop_token_ids=None: {})
+
+    monkeypatch.setenv("MINT_VLLM_MULTISAMPLE_MODE", "vllm_n")
+    monkeypatch.setenv("MINT_VLLM_SERIALIZE_MULTISAMPLE", "1")
+    monkeypatch.setenv("MINT_VLLM_SERIALIZE_GENERATE", "0")
+    monkeypatch.setenv("MINT_VLLM_SERIALIZE_ADD_REQUEST", "1")
+
+    impl_cls = _make_actor_impl(monkeypatch, max_num_seqs=1)
+    actor = object.__new__(impl_cls)
+    impl_cls.__init__(actor, model_path="fake-model", tensor_parallel_size=1)
+
+    actor.engine = _FakeEngine(
+        multisample_enqueued=asyncio.Event(),
+        ordinary_enqueued=asyncio.Event(),
+        release_multisample=asyncio.Event(),
+    )
+
+    async def _failing_register_generate_start() -> None:
+        raise RuntimeError("register_start_failed")
+
+    actor._register_generate_start = _failing_register_generate_start
+
+    with pytest.raises(RuntimeError, match="register_start_failed"):
+        await impl_cls.generate(
+            actor,
+            prompt_ids=[1, 2, 3],
+            request_id="will-fail",
+            lora_int_id=None,
+            lora_path=None,
+            max_tokens=8,
+            n=1,
+        )
+
+    assert actor._active_seq_slots == 0
+    assert actor._active_generates == 0
+    assert actor.engine.calls == []
+
+    actor._register_generate_start = impl_cls._register_generate_start.__get__(actor, impl_cls)
+    ordinary_enqueued = asyncio.Event()
+    actor.engine = _FakeEngine(
+        multisample_enqueued=asyncio.Event(),
+        ordinary_enqueued=ordinary_enqueued,
+        release_multisample=asyncio.Event(),
+    )
+
+    result = await asyncio.wait_for(
+        impl_cls.generate(
+            actor,
+            prompt_ids=[9, 8, 7],
+            request_id="ordinary",
+            lora_int_id=None,
+            lora_path=None,
+            max_tokens=8,
+            n=1,
+        ),
+        timeout=2.0,
+    )
+    assert result["token_ids"] == [11, 21]
+
+
+@pytest.mark.anyio
+async def test_issue_428_generate_emits_request_stage_spans(monkeypatch):
+    _install_fake_vllm(monkeypatch)
+    _stub_future_store(monkeypatch)
+    monkeypatch.setattr(mni, "init_actor_observability", lambda: None)
+    monkeypatch.setattr(mni.server_config, "router_replay_mode", "disabled", raising=False)
+    monkeypatch.setattr(vllm_stop, "vllm_stop_kwargs", lambda stop, default_stop_token_ids=None: {})
+
+    monkeypatch.setenv("MINT_VLLM_MULTISAMPLE_MODE", "vllm_n")
+    monkeypatch.setenv("MINT_VLLM_SERIALIZE_MULTISAMPLE", "1")
+    monkeypatch.setenv("MINT_VLLM_SERIALIZE_GENERATE", "0")
+    monkeypatch.setenv("MINT_VLLM_SERIALIZE_ADD_REQUEST", "1")
+
+    spans: list[dict[str, object]] = []
+
+    class _RecordedSpan:
+        def __init__(self, attrs: dict[str, object]):
+            self.attrs = attrs
+
+        def set_attribute(self, key, value):
+            self.attrs[str(key)] = value
+
+    class _SpanContext:
+        def __init__(self, span):
+            self._span = span
+
+        def __enter__(self):
+            return self._span
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def _record_span(
+        span_name: str,
+        *,
+        component: str | None = None,
+        op: str | None = None,
+        request_id: str | None = None,
+        attributes: dict[str, object] | None = None,
+        **_kwargs,
+    ):
+        attrs = dict(attributes or {})
+        rec = {
+            "span_name": span_name,
+            "component": component,
+            "op": op,
+            "request_id": request_id,
+            "attrs": attrs,
+        }
+        spans.append(rec)
+        return _SpanContext(_RecordedSpan(attrs))
+
+    monkeypatch.setattr(mni, "start_as_current_span", _record_span)
+
+    impl_cls = _make_actor_impl(monkeypatch, max_num_seqs=1)
+    actor = object.__new__(impl_cls)
+    impl_cls.__init__(actor, model_path="fake-model", tensor_parallel_size=1)
+    actor.engine = _FakeEngine(
+        multisample_enqueued=asyncio.Event(),
+        ordinary_enqueued=asyncio.Event(),
+        release_multisample=asyncio.Event(),
+    )
+
+    result = await impl_cls.generate(
+        actor,
+        prompt_ids=[9, 8, 7],
+        request_id="ordinary",
+        lora_int_id=None,
+        lora_path=None,
+        max_tokens=8,
+        n=1,
+    )
+
+    assert result["token_ids"] == [11, 21]
+    names = [str(s["span_name"]) for s in spans]
+    assert "sampling.multinode_vllm_actor.seq_slot_wait" in names
+    assert "sampling.multinode_vllm_actor.add_request" in names
+
+    seq_span = next(s for s in spans if s["span_name"] == "sampling.multinode_vllm_actor.seq_slot_wait")
+    add_span = next(s for s in spans if s["span_name"] == "sampling.multinode_vllm_actor.add_request")
+
+    assert seq_span["component"] == "multinode_vllm_actor"
+    assert seq_span["op"] == "sampling.seq_slot_wait"
+    assert seq_span["request_id"] == "ordinary"
+    assert seq_span["attrs"]["prompt_tokens"] == 3
+    assert seq_span["attrs"]["num_samples"] == 1
+    assert seq_span["attrs"]["max_tokens"] == 8
+    assert float(seq_span["attrs"]["wait_s"]) >= 0.0
+
+    assert add_span["component"] == "multinode_vllm_actor"
+    assert add_span["op"] == "sampling.vllm_add_request"
+    assert add_span["request_id"] == "ordinary"
+    assert add_span["attrs"]["prompt_tokens"] == 3
+    assert add_span["attrs"]["num_samples"] == 1
+    assert add_span["attrs"]["max_tokens"] == 8
+    assert float(add_span["attrs"]["wait_s"]) >= 0.0
+    assert float(add_span["attrs"]["exec_s"]) >= 0.0
