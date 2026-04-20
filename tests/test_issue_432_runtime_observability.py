@@ -1,7 +1,10 @@
+import sys
+import types
 from types import SimpleNamespace
 
 import pytest
 import tinker_server.logging_context as logging_context
+import tinker_server.backend.vllm_scheduler_observability as vllm_obs_mod
 from tinker_server.backend.runtime_observability import RuntimeObservability
 from tinker_server.backend.verl_training import VerlTrainingEngine
 from tinker_server.backend.vllm_scheduler_observability import VllmStatsObserver
@@ -81,6 +84,138 @@ def test_issue_432_vllm_stats_observer_drops_non_finite_actor_timings() -> None:
     assert snap["seq_slot_wait_s_count"] == 0
     assert snap["add_request_wait_s_count"] == 0
     assert snap["add_request_exec_s_count"] == 0
+
+
+def test_issue_432_install_vllm_iteration_observability_patches_fails_open(monkeypatch) -> None:
+    monkeypatch.setattr(vllm_obs_mod, "_VLLM_PATCHES_INSTALLED", False)
+
+    original_import = __import__
+
+    def _explode(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "vllm.v1.core.sched.scheduler":
+            raise ImportError("boom")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr("builtins.__import__", _explode)
+
+    # Missing private vLLM symbols must not make engine startup fail.
+    vllm_obs_mod.install_vllm_iteration_observability_patches()
+
+    assert vllm_obs_mod._VLLM_PATCHES_INSTALLED is False
+
+
+def test_issue_432_vllm_iteration_patch_resets_stale_step_timings(monkeypatch) -> None:
+    monkeypatch.setattr(vllm_obs_mod, "_VLLM_PATCHES_INSTALLED", False)
+
+    fake_sched_mod = types.ModuleType("vllm.v1.core.sched.scheduler")
+    fake_core_mod = types.ModuleType("vllm.v1.engine.core")
+    fake_output_mod = types.ModuleType("vllm.v1.engine.output_processor")
+    fake_worker_mod = types.ModuleType("vllm.v1.worker.gpu_worker")
+
+    class FakeScheduler:
+        def __init__(self) -> None:
+            self._mode = "first"
+
+        def schedule(self):
+            if self._mode == "first":
+                return SimpleNamespace(
+                    total_num_scheduled_tokens=8,
+                    scheduled_new_reqs=[object()],
+                    scheduled_cached_reqs=SimpleNamespace(num_reqs=0),
+                )
+            return SimpleNamespace(
+                total_num_scheduled_tokens=4,
+                scheduled_new_reqs=[],
+                scheduled_cached_reqs=SimpleNamespace(num_reqs=1),
+            )
+
+        def make_stats(self):
+            return SimpleNamespace()
+
+    class FakeEngineCore:
+        def __init__(self, scheduler) -> None:
+            self.scheduler = scheduler
+
+        def execute_model_with_error_logging(self, *_args, **_kwargs):
+            return SimpleNamespace(_mint_worker_execute_model_s=0.3)
+
+    class FakeOutputProcessor:
+        def _update_stats_from_output(self, *_args, **_kwargs):
+            return None
+
+    class FakeWorker:
+        def execute_model(self, *_args, **_kwargs):
+            return SimpleNamespace()
+
+    fake_sched_mod.Scheduler = FakeScheduler
+    fake_core_mod.EngineCore = FakeEngineCore
+    fake_output_mod.OutputProcessor = FakeOutputProcessor
+    fake_worker_mod.Worker = FakeWorker
+
+    monkeypatch.setitem(sys.modules, "vllm.v1.core.sched.scheduler", fake_sched_mod)
+    monkeypatch.setitem(sys.modules, "vllm.v1.engine.core", fake_core_mod)
+    monkeypatch.setitem(sys.modules, "vllm.v1.engine.output_processor", fake_output_mod)
+    monkeypatch.setitem(sys.modules, "vllm.v1.worker.gpu_worker", fake_worker_mod)
+
+    vllm_obs_mod.install_vllm_iteration_observability_patches()
+
+    scheduler = FakeScheduler()
+    engine_core = FakeEngineCore(scheduler)
+    scheduler.schedule()
+    engine_core.execute_model_with_error_logging(lambda *_a, **_k: None, None)
+    stats = scheduler.make_stats()
+    assert stats.mint_executor_execute_model_s >= 0.0
+    assert stats.mint_worker_execute_model_s == pytest.approx(0.3)
+
+    scheduler._mode = "second"
+    scheduler.schedule()
+    stats = scheduler.make_stats()
+    assert not hasattr(stats, "mint_executor_execute_model_s")
+    assert not hasattr(stats, "mint_worker_execute_model_s")
+
+
+def test_issue_432_vllm_iteration_timings_do_not_replay_stale_values() -> None:
+    obs = VllmStatsObserver()
+    scheduler_stats = SimpleNamespace(
+        num_waiting_reqs=1,
+        num_running_reqs=1,
+        kv_cache_usage=0.25,
+        prefix_cache_stats=SimpleNamespace(queries=10, hits=4),
+        mint_total_scheduled_tokens=8,
+        mint_scheduled_new_requests=1,
+        mint_scheduled_cached_requests=0,
+        mint_executor_execute_model_s=0.4,
+        mint_worker_execute_model_s=0.3,
+    )
+    iteration_stats = SimpleNamespace(
+        num_preempted_reqs=0,
+        num_prompt_tokens=8,
+        num_generation_tokens=1,
+        mint_prefill_requests=1,
+        mint_decode_requests=0,
+        time_to_first_tokens_iter=[],
+        inter_token_latencies_iter=[],
+        finished_requests=[],
+    )
+
+    obs.record(scheduler_stats, iteration_stats)
+    snap = obs.snapshot()
+    assert snap["executor_execute_model_s_count"] == 1
+    assert snap["worker_execute_model_s_count"] == 1
+
+    scheduler_stats_2 = SimpleNamespace(
+        num_waiting_reqs=0,
+        num_running_reqs=1,
+        kv_cache_usage=0.1,
+        prefix_cache_stats=SimpleNamespace(queries=0, hits=0),
+        mint_total_scheduled_tokens=4,
+        mint_scheduled_new_requests=0,
+        mint_scheduled_cached_requests=1,
+    )
+    obs.record(scheduler_stats_2, iteration_stats)
+    snap = obs.snapshot()
+    assert snap["executor_execute_model_s_count"] == 1
+    assert snap["worker_execute_model_s_count"] == 1
 
 
 def test_issue_432_runtime_observability_tracks_megatron_session_switch() -> None:

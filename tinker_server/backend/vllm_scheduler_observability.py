@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 import threading
 import time
@@ -54,6 +55,8 @@ class _LatencyAgg:
         }
 
 
+logger = logging.getLogger(__name__)
+
 _VLLM_PATCH_LOCK = threading.Lock()
 _VLLM_PATCHES_INSTALLED = False
 
@@ -66,123 +69,134 @@ def install_vllm_iteration_observability_patches() -> None:
         if _VLLM_PATCHES_INSTALLED:
             return
 
-        from vllm.v1.core.sched.scheduler import Scheduler
-        from vllm.v1.engine.core import EngineCore
-        from vllm.v1.engine.output_processor import OutputProcessor
-
-        original_schedule = getattr(Scheduler, "schedule", None)
-        if original_schedule is None:
-            raise RuntimeError("vLLM Scheduler missing schedule")
-        if not getattr(original_schedule, "_mint_iteration_observability", False):
-            def schedule(self, *args: Any, **kwargs: Any):
-                out = original_schedule(self, *args, **kwargs)
-                setattr(
-                    self,
-                    "_mint_last_schedule_metrics",
-                    {
-                        "total_scheduled_tokens": int(getattr(out, "total_num_scheduled_tokens", 0) or 0),
-                        "scheduled_new_requests": len(getattr(out, "scheduled_new_reqs", []) or []),
-                        "scheduled_cached_requests": int(
-                            getattr(getattr(out, "scheduled_cached_reqs", None), "num_reqs", 0) or 0
-                        ),
-                    },
-                )
-                return out
-
-            schedule._mint_iteration_observability = True  # type: ignore[attr-defined]
-            Scheduler.schedule = schedule  # type: ignore[assignment]
-
-        original_make_stats = getattr(Scheduler, "make_stats", None)
-        if original_make_stats is None:
-            raise RuntimeError("vLLM Scheduler missing make_stats")
-        if not getattr(original_make_stats, "_mint_iteration_observability", False):
-            def make_stats(self, *args: Any, **kwargs: Any):
-                stats = original_make_stats(self, *args, **kwargs)
-                if stats is None:
-                    return None
-                for key, value in (getattr(self, "_mint_last_schedule_metrics", None) or {}).items():
-                    setattr(stats, f"mint_{key}", value)
-                for key in ("executor_execute_model_s", "worker_execute_model_s"):
-                    value = getattr(self, f"_mint_last_{key}", None)
-                    if value is not None:
-                        setattr(stats, f"mint_{key}", value)
-                return stats
-
-            make_stats._mint_iteration_observability = True  # type: ignore[attr-defined]
-            Scheduler.make_stats = make_stats  # type: ignore[assignment]
-
-        original_execute_model_with_error_logging = getattr(EngineCore, "execute_model_with_error_logging", None)
-        if original_execute_model_with_error_logging is None:
-            raise RuntimeError("vLLM EngineCore missing execute_model_with_error_logging")
-        if not getattr(original_execute_model_with_error_logging, "_mint_iteration_observability", False):
-            def execute_model_with_error_logging(self, model_fn, scheduler_output):  # type: ignore[no-untyped-def]
-                t0 = time.perf_counter()
-                out = original_execute_model_with_error_logging(self, model_fn, scheduler_output)
-                elapsed_s = time.perf_counter() - t0
-                setattr(self.scheduler, "_mint_last_executor_execute_model_s", elapsed_s)
-                worker_elapsed_s = getattr(out, "_mint_worker_execute_model_s", None)
-                if worker_elapsed_s is not None:
-                    setattr(self.scheduler, "_mint_last_worker_execute_model_s", worker_elapsed_s)
-                return out
-
-            execute_model_with_error_logging._mint_iteration_observability = True  # type: ignore[attr-defined]
-            EngineCore.execute_model_with_error_logging = execute_model_with_error_logging  # type: ignore[assignment]
-
-        original_update_stats_from_output = getattr(OutputProcessor, "_update_stats_from_output", None)
-        if original_update_stats_from_output is None:
-            raise RuntimeError("vLLM OutputProcessor missing _update_stats_from_output")
-        if not getattr(original_update_stats_from_output, "_mint_iteration_observability", False):
-            def _update_stats_from_output(self, req_state, engine_core_output, engine_core_timestamp, iteration_stats):  # type: ignore[no-untyped-def]
-                if iteration_stats is not None:
-                    if getattr(req_state, "is_prefilling", False):
-                        setattr(
-                            iteration_stats,
-                            "mint_prefill_requests",
-                            int(getattr(iteration_stats, "mint_prefill_requests", 0) or 0) + 1,
-                        )
-                    else:
-                        setattr(
-                            iteration_stats,
-                            "mint_decode_requests",
-                            int(getattr(iteration_stats, "mint_decode_requests", 0) or 0) + 1,
-                        )
-                return original_update_stats_from_output(
-                    self,
-                    req_state,
-                    engine_core_output,
-                    engine_core_timestamp,
-                    iteration_stats,
-                )
-
-            _update_stats_from_output._mint_iteration_observability = True  # type: ignore[attr-defined]
-            OutputProcessor._update_stats_from_output = _update_stats_from_output  # type: ignore[assignment]
-
         try:
-            from vllm.v1.worker.gpu_worker import Worker
-        except Exception:
-            Worker = None
-        if Worker is not None:
-            original_worker_execute_model = getattr(Worker, "execute_model", None)
-            if original_worker_execute_model is not None and not getattr(
-                original_worker_execute_model,
-                "_mint_iteration_observability",
-                False,
-            ):
-                def worker_execute_model(self, scheduler_output):  # type: ignore[no-untyped-def]
-                    t0 = time.perf_counter()
-                    out = original_worker_execute_model(self, scheduler_output)
-                    elapsed_s = time.perf_counter() - t0
-                    if out is not None:
-                        try:
-                            setattr(out, "_mint_worker_execute_model_s", elapsed_s)
-                        except Exception:
-                            pass
+            from vllm.v1.core.sched.scheduler import Scheduler
+            from vllm.v1.engine.core import EngineCore
+            from vllm.v1.engine.output_processor import OutputProcessor
+
+            original_schedule = getattr(Scheduler, "schedule", None)
+            if original_schedule is None:
+                raise RuntimeError("vLLM Scheduler missing schedule")
+            if not getattr(original_schedule, "_mint_iteration_observability", False):
+                def schedule(self, *args: Any, **kwargs: Any):
+                    setattr(self, "_mint_last_executor_execute_model_s", None)
+                    setattr(self, "_mint_last_worker_execute_model_s", None)
+                    out = original_schedule(self, *args, **kwargs)
+                    setattr(
+                        self,
+                        "_mint_last_schedule_metrics",
+                        {
+                            "total_scheduled_tokens": int(getattr(out, "total_num_scheduled_tokens", 0) or 0),
+                            "scheduled_new_requests": len(getattr(out, "scheduled_new_reqs", []) or []),
+                            "scheduled_cached_requests": int(
+                                getattr(getattr(out, "scheduled_cached_reqs", None), "num_reqs", 0) or 0
+                            ),
+                        },
+                    )
                     return out
 
-                worker_execute_model._mint_iteration_observability = True  # type: ignore[attr-defined]
-                Worker.execute_model = worker_execute_model  # type: ignore[assignment]
+                schedule._mint_iteration_observability = True  # type: ignore[attr-defined]
+                Scheduler.schedule = schedule  # type: ignore[assignment]
 
-        _VLLM_PATCHES_INSTALLED = True
+            original_make_stats = getattr(Scheduler, "make_stats", None)
+            if original_make_stats is None:
+                raise RuntimeError("vLLM Scheduler missing make_stats")
+            if not getattr(original_make_stats, "_mint_iteration_observability", False):
+                def make_stats(self, *args: Any, **kwargs: Any):
+                    stats = original_make_stats(self, *args, **kwargs)
+                    if stats is None:
+                        return None
+                    for key, value in (getattr(self, "_mint_last_schedule_metrics", None) or {}).items():
+                        setattr(stats, f"mint_{key}", value)
+                    for key in ("executor_execute_model_s", "worker_execute_model_s"):
+                        attr = f"_mint_last_{key}"
+                        value = getattr(self, attr, None)
+                        if value is not None:
+                            setattr(stats, f"mint_{key}", value)
+                        setattr(self, attr, None)
+                    return stats
+
+                make_stats._mint_iteration_observability = True  # type: ignore[attr-defined]
+                Scheduler.make_stats = make_stats  # type: ignore[assignment]
+
+            original_execute_model_with_error_logging = getattr(EngineCore, "execute_model_with_error_logging", None)
+            if original_execute_model_with_error_logging is None:
+                raise RuntimeError("vLLM EngineCore missing execute_model_with_error_logging")
+            if not getattr(original_execute_model_with_error_logging, "_mint_iteration_observability", False):
+                def execute_model_with_error_logging(self, *args: Any, **kwargs: Any):
+                    t0 = time.perf_counter()
+                    out = original_execute_model_with_error_logging(self, *args, **kwargs)
+                    elapsed_s = time.perf_counter() - t0
+                    setattr(self.scheduler, "_mint_last_executor_execute_model_s", elapsed_s)
+                    worker_elapsed_s = getattr(out, "_mint_worker_execute_model_s", None)
+                    if worker_elapsed_s is not None:
+                        setattr(self.scheduler, "_mint_last_worker_execute_model_s", worker_elapsed_s)
+                    return out
+
+                execute_model_with_error_logging._mint_iteration_observability = True  # type: ignore[attr-defined]
+                EngineCore.execute_model_with_error_logging = execute_model_with_error_logging  # type: ignore[assignment]
+
+            original_update_stats_from_output = getattr(OutputProcessor, "_update_stats_from_output", None)
+            if original_update_stats_from_output is None:
+                raise RuntimeError("vLLM OutputProcessor missing _update_stats_from_output")
+            if not getattr(original_update_stats_from_output, "_mint_iteration_observability", False):
+                def _update_stats_from_output(self, *args: Any, **kwargs: Any):
+                    req_state = kwargs.get("req_state")
+                    iteration_stats = kwargs.get("iteration_stats")
+                    if req_state is None and len(args) >= 1:
+                        req_state = args[0]
+                    if iteration_stats is None and len(args) >= 4:
+                        iteration_stats = args[3]
+                    if iteration_stats is not None:
+                        if getattr(req_state, "is_prefilling", False):
+                            setattr(
+                                iteration_stats,
+                                "mint_prefill_requests",
+                                int(getattr(iteration_stats, "mint_prefill_requests", 0) or 0) + 1,
+                            )
+                        else:
+                            setattr(
+                                iteration_stats,
+                                "mint_decode_requests",
+                                int(getattr(iteration_stats, "mint_decode_requests", 0) or 0) + 1,
+                            )
+                    return original_update_stats_from_output(self, *args, **kwargs)
+
+                _update_stats_from_output._mint_iteration_observability = True  # type: ignore[attr-defined]
+                OutputProcessor._update_stats_from_output = _update_stats_from_output  # type: ignore[assignment]
+
+            try:
+                from vllm.v1.worker.gpu_worker import Worker
+            except Exception:
+                Worker = None
+            if Worker is not None:
+                original_worker_execute_model = getattr(Worker, "execute_model", None)
+                if original_worker_execute_model is not None and not getattr(
+                    original_worker_execute_model,
+                    "_mint_iteration_observability",
+                    False,
+                ):
+                    def worker_execute_model(self, *args: Any, **kwargs: Any):
+                        t0 = time.perf_counter()
+                        out = original_worker_execute_model(self, *args, **kwargs)
+                        elapsed_s = time.perf_counter() - t0
+                        if out is not None:
+                            try:
+                                setattr(out, "_mint_worker_execute_model_s", elapsed_s)
+                            except Exception:
+                                pass
+                        return out
+
+                    worker_execute_model._mint_iteration_observability = True  # type: ignore[attr-defined]
+                    Worker.execute_model = worker_execute_model  # type: ignore[assignment]
+
+            _VLLM_PATCHES_INSTALLED = True
+        except Exception:
+            logger.warning(
+                "vllm_iteration_observability_patch_install_failed",
+                exc_info=True,
+            )
+            return
 
 
 class VllmStatsObserver:

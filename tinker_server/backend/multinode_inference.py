@@ -1644,7 +1644,10 @@ def _create_multinode_vllm_actor(
                 add_request_exec_s=add_request_exec_s,
                 first_token_observed_s=first_tok_s,
             )
-            slow_log_threshold_s = float(os.environ.get("MINT_VLLM_SLOW_REQUEST_LOG_THRESHOLD_S", "30"))
+            try:
+                slow_log_threshold_s = float(os.environ.get("MINT_VLLM_SLOW_REQUEST_LOG_THRESHOLD_S", "30"))
+            except ValueError:
+                slow_log_threshold_s = 30.0
             if total_s >= slow_log_threshold_s or n_req > 1:
                 logger.info(
                     "multinode_vllm_generate_summary request_id=%s outer_request_id=%s prompt_len=%s max_tokens=%s n=%s total_s=%.3f first_tok_s=%s generate_lock_wait_s=%.3f seq_slot_wait_s=%.3f engine_read_lock_wait_s=%.3f add_request_wait_s=%.3f add_request_exec_s=%.3f",
