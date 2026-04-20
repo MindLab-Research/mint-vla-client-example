@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    pass
+    import torch
 
 import ray
 # NOTE: torch and tensordict imports are LAZY - done inside MegatronRankWorker.__init__
@@ -38,8 +38,6 @@ from ..logging_context import (
     start_as_current_span_from_traceparent,
 )
 
-logger = logging.getLogger(__name__)
-
 # Import centralized PFS paths from config
 from tinker_server.config import PFS_PYTHONPATH, PFS_TINKER_PATH, RAY_NAMESPACE, config as server_config
 from tinker_server.backend.model_registry import get_model_config
@@ -47,6 +45,8 @@ from tinker_server.ray_utils import init_ray
 from tinker_server.model_input_utils import flatten_encoded_text_chunks
 from tinker_server.backend.volc_placement import assert_node_ip_capacity, parse_model_node_ip_list
 from tinker_server.backend.ray_placement_groups import PlacementGroupMismatchError, get_named_placement_group
+
+logger = logging.getLogger(__name__)
 
 # Persistent actor configuration
 PERSISTENT_NAMESPACE = RAY_NAMESPACE  # Same namespace as vLLM
@@ -58,6 +58,12 @@ _megatron_create_locks_guard = threading.Lock()
 # Using a unique object() (not None) so dict.get() returning None ("never cached")
 # is distinguishable from "consumed".  All consumers must check with `is`.
 _GRADIENTS_CONSUMED = object()
+
+
+def _get_torch():
+    import torch
+
+    return torch
 
 
 def _get_megatron_create_lock(actor_name: str) -> threading.Lock:
