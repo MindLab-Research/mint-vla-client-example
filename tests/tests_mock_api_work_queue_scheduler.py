@@ -459,3 +459,59 @@ def test_issue_324_consumer_handoff_releases_leased_slots(monkeypatch):
 
     accepted = asyncio.run(actor.enqueue(dict(item, request_id="r2")))
     assert accepted == {"ok": True}
+
+
+def test_issue_353_actor_stats_expose_scheduler_snapshots(monkeypatch):
+    api_work_queue = _load_api_work_queue_module(monkeypatch)
+    actor = api_work_queue._get_or_create_ray_actor()
+    actor.set_active_job_id("consumer-job")
+
+    legacy = _legacy_item("legacy-1", created_at=1.0)
+    sched_a = _item(
+        "sched-a",
+        domain="vllm:Qwen/Qwen3-4B-Instruct-2507::replica::0",
+        session_key="A",
+        created_at=2.0,
+    )
+    sched_b = _item(
+        "sched-b",
+        domain="vllm:Qwen/Qwen3-4B-Instruct-2507::replica::0",
+        session_key="B",
+        created_at=3.0,
+    )
+
+    asyncio.run(actor.enqueue(legacy))
+    asyncio.run(actor.enqueue(sched_a))
+    asyncio.run(actor.enqueue(sched_b))
+
+    first = asyncio.run(actor.dequeue("consumer-job"))
+    assert first["request_id"] == "legacy-1"
+
+    second = asyncio.run(actor.dequeue("consumer-job"))
+    assert second["request_id"] == "sched-a"
+
+    stats = actor.stats()
+    domain = stats["scheduler_domains"]["vllm:Qwen/Qwen3-4B-Instruct-2507::replica::0"]
+    assert stats["scheduler_metrics_ready"] is True
+    assert stats["scheduler_arbitration_total"] == 2
+    assert stats["scheduler_arbitration_by_winner"] == {"legacy": 1, "scheduled": 1}
+    assert stats["scheduler_arbitration_by_reason"]["legacy_head_older"] == 1
+    scheduled_reasons = {
+        key: value
+        for key, value in stats["scheduler_arbitration_by_reason"].items()
+        if key.startswith("scheduled_")
+    }
+    assert sum(int(value) for value in scheduled_reasons.values()) == 1
+    assert stats["legacy_dequeue_stats"] == [{"op": "sampling.asample", "reason": "fifo", "total": 1}]
+    assert len(stats["scheduled_dequeue_stats"]) == 1
+    assert stats["scheduled_dequeue_stats"][0]["op"] == "training.forward_backward"
+    assert stats["scheduled_dequeue_stats"][0]["scheduler_domain"] == "vllm:Qwen/Qwen3-4B-Instruct-2507::replica::0"
+    assert stats["scheduled_dequeue_stats"][0]["total"] == 1
+    assert domain["backend"] == "vllm"
+    assert domain["pending_requests"] == 1
+    assert domain["active_sessions"] == 1
+    assert domain["inflight_workers"] == 1
+    assert domain["capacity_workers"] == 1
+    assert domain["admissible"] is False
+    assert domain["stats"]["picks"] == 1
+    assert domain["stats"]["starvation_picks"] == 1

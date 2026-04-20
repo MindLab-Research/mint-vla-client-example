@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    pass
+    import torch
 
 import ray
 # NOTE: torch and tensordict imports are LAZY - done inside MegatronRankWorker.__init__
@@ -38,8 +38,6 @@ from ..logging_context import (
     start_as_current_span_from_traceparent,
 )
 
-logger = logging.getLogger(__name__)
-
 # Import centralized PFS paths from config
 from tinker_server.config import PFS_PYTHONPATH, PFS_TINKER_PATH, RAY_NAMESPACE, config as server_config
 from tinker_server.backend.model_registry import get_model_config
@@ -47,6 +45,8 @@ from tinker_server.ray_utils import init_ray
 from tinker_server.model_input_utils import flatten_encoded_text_chunks
 from tinker_server.backend.volc_placement import assert_node_ip_capacity, parse_model_node_ip_list
 from tinker_server.backend.ray_placement_groups import PlacementGroupMismatchError, get_named_placement_group
+
+logger = logging.getLogger(__name__)
 
 # Persistent actor configuration
 PERSISTENT_NAMESPACE = RAY_NAMESPACE  # Same namespace as vLLM
@@ -58,6 +58,12 @@ _megatron_create_locks_guard = threading.Lock()
 # Using a unique object() (not None) so dict.get() returning None ("never cached")
 # is distinguishable from "consumed".  All consumers must check with `is`.
 _GRADIENTS_CONSUMED = object()
+
+
+def _get_torch():
+    import torch
+
+    return torch
 
 
 def _get_megatron_create_lock(actor_name: str) -> threading.Lock:
@@ -5822,6 +5828,8 @@ class MegatronWorkerGroup:
         self._session_unknown_due_to_partial_swap = False
         self._actual_rank: int | None = None  # Phase 7: actual LoRA rank for current session
         self._last_session_switch_stats: dict[str, object] | None = None
+        self._observability_gpu_bindings_cache: list[dict[str, object]] = []
+        self._observability_memory_cache: dict[str, int] = {}
         self._session_manager = MegatronSessionStateManager()  # Issue #44: session state management
         self._master_addr: str | None = None
         self._master_port: int | None = None
@@ -8080,39 +8088,67 @@ class MegatronWorkerGroup:
         reserved_bytes = 0
         fragmentation_bytes = 0
         saw_memory = False
+        total_workers = len(self.workers)
+        responded_workers = 0
+        pending: list[object] = []
         for worker in self.workers:
             try:
-                binding = ray.get(worker.get_observability_binding.remote(), timeout=5)
+                pending.append(worker.get_observability_binding.remote())
             except Exception:
                 continue
-            if not isinstance(binding, dict):
-                continue
-            gpu_indices = binding.get("gpu_indices")
-            if isinstance(gpu_indices, list):
-                for gpu_index in gpu_indices:
-                    bindings.append(
-                        {
-                            "hostname": binding.get("hostname"),
-                            "node_id": binding.get("node_id"),
-                            "gpu_index": int(gpu_index),
-                            "rank": binding.get("rank"),
-                        }
-                    )
-            for field_name, total_name in (
-                ("gpu_memory_allocated_bytes", "allocated"),
-                ("gpu_memory_reserved_bytes", "reserved"),
-                ("gpu_memory_fragmentation_bytes", "fragmentation"),
-            ):
-                value = binding.get(field_name)
-                if not isinstance(value, (int, float)):
+        deadline = time.time() + 5.0
+        while pending and time.time() < deadline:
+            timeout_s = max(0.0, deadline - time.time())
+            ready, pending = ray.wait(pending, num_returns=1, timeout=timeout_s)
+            if not ready:
+                break
+            for ref in ready:
+                try:
+                    binding = ray.get(ref, timeout=0)
+                except Exception:
                     continue
-                saw_memory = True
-                if total_name == "allocated":
-                    allocated_bytes += max(0, int(value))
-                elif total_name == "reserved":
-                    reserved_bytes += max(0, int(value))
-                else:
-                    fragmentation_bytes += max(0, int(value))
+                if not isinstance(binding, dict):
+                    continue
+                responded_workers += 1
+                gpu_indices = binding.get("gpu_indices")
+                if isinstance(gpu_indices, list):
+                    for gpu_index in gpu_indices:
+                        bindings.append(
+                            {
+                                "hostname": binding.get("hostname"),
+                                "node_id": binding.get("node_id"),
+                                "gpu_index": int(gpu_index),
+                                "rank": binding.get("rank"),
+                            }
+                        )
+                for field_name, total_name in (
+                    ("gpu_memory_allocated_bytes", "allocated"),
+                    ("gpu_memory_reserved_bytes", "reserved"),
+                    ("gpu_memory_fragmentation_bytes", "fragmentation"),
+                ):
+                    value = binding.get(field_name)
+                    if not isinstance(value, (int, float)):
+                        continue
+                    saw_memory = True
+                    if total_name == "allocated":
+                        allocated_bytes += max(0, int(value))
+                    elif total_name == "reserved":
+                        reserved_bytes += max(0, int(value))
+                    else:
+                        fragmentation_bytes += max(0, int(value))
+        full_snapshot = total_workers > 0 and responded_workers == total_workers
+        if full_snapshot:
+            self._observability_gpu_bindings_cache = list(bindings)
+            if saw_memory:
+                self._observability_memory_cache = {
+                    "gpu_memory_allocated_bytes": int(allocated_bytes),
+                    "gpu_memory_reserved_bytes": int(reserved_bytes),
+                    "gpu_memory_fragmentation_bytes": int(fragmentation_bytes),
+                }
+            else:
+                self._observability_memory_cache = {}
+        else:
+            bindings = list(self._observability_gpu_bindings_cache)
         out: dict[str, object] = {
             "gpu_bindings": bindings,
             "active_sessions": int(self._current_session is not None),
@@ -8120,14 +8156,8 @@ class MegatronWorkerGroup:
             "session_step": max(0, int(self._step_count)),
             "learning_rate": max(0.0, float(self.learning_rate)),
         }
-        if saw_memory:
-            out.update(
-                {
-                    "gpu_memory_allocated_bytes": allocated_bytes,
-                    "gpu_memory_reserved_bytes": reserved_bytes,
-                    "gpu_memory_fragmentation_bytes": fragmentation_bytes,
-                }
-            )
+        if self._observability_memory_cache:
+            out.update(dict(self._observability_memory_cache))
         return out
 
 
@@ -8493,6 +8523,8 @@ class MegatronWorkerGroup:
 
         self.workers = []
         self.placement_group = None
+        self._observability_gpu_bindings_cache = []
+        self._observability_memory_cache = {}
 
 def get_or_create_megatron_worker_group(
     base_model: str,

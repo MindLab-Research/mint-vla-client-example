@@ -10,6 +10,48 @@ from tinker_server.backend.future_store import FutureStatus, FutureStore, Future
 from tinker_server.backend.resource_pool import ActorType, get_resource_pool
 
 
+def test_actor_observability_metadata_preserves_recent_latency_and_gpu_fields(monkeypatch) -> None:
+    class _Getter:
+        def __call__(self):
+            return None
+
+        def remote(self):
+            return "binding-ref"
+
+    class _Handle:
+        get_observability_binding = _Getter()
+
+    monkeypatch.setattr(
+        resource_pool_mod.ray,
+        "get",
+        lambda _ref, timeout=None: {
+            "hostname": "host-a",
+            "node_id": "node-a",
+            "scheduler_waiting_requests": 4,
+            "seq_slot_wait_s_p95_recent": 1.2,
+            "generate_lock_wait_s_p50_recent": 0.1,
+            "time_per_output_token_s_total": 0.96,
+            "gpu_memory_allocated_bytes": 48000000000,
+            "gpu_memory_reserved_bytes": 52000000000,
+            "gpu_memory_fragmentation_bytes": 4000000000,
+        },
+    )
+
+    out = resource_pool_mod.actor_observability_metadata(_Handle(), timeout_s=0.5)
+
+    assert out == {
+        "hostname": "host-a",
+        "node_id": "node-a",
+        "scheduler_waiting_requests": 4,
+        "seq_slot_wait_s_p95_recent": 1.2,
+        "generate_lock_wait_s_p50_recent": 0.1,
+        "time_per_output_token_s_total": 0.96,
+        "gpu_memory_allocated_bytes": 48000000000,
+        "gpu_memory_reserved_bytes": 52000000000,
+        "gpu_memory_fragmentation_bytes": 4000000000,
+    }
+
+
 def test_api_work_queue_metrics_snapshot_tracks_local_state() -> None:
     q = ApiWorkQueueClient()
     now = time.time()
