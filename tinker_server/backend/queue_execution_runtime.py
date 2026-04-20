@@ -2,21 +2,50 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import json
 import logging
 import os
 import time
+import traceback
 from typing import Any
 
 from ..config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources, config as server_config, otel_env_vars
+from ..ray_utils import register_ray_reconnect_invalidator as _register_ray_reconnect_invalidator
 
 logger = logging.getLogger(__name__)
 _ACTOR_HANDLE = None
+
+
+def _queue_runtime_debug_log_path() -> str:
+    raw = os.environ.get("MINT_QUEUE_EXECUTION_RUNTIME_DEBUG_LOG_PATH", "").strip()
+    if raw:
+        return raw
+    actor_name = _actor_name().replace("/", "_")
+    namespace = _ray_namespace().replace("/", "_")
+    return f"/tmp/{actor_name}.{namespace}.debug.jsonl"
+
+
+def _append_queue_runtime_debug(event: str, **fields: Any) -> None:
+    record = {
+        "ts": round(time.time(), 6),
+        "pid": os.getpid(),
+        "event": event,
+        "actor_name": _actor_name(),
+        "namespace": _ray_namespace(),
+        **fields,
+    }
+    try:
+        with open(_queue_runtime_debug_log_path(), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=True, sort_keys=True, default=str))
+            fh.write("\n")
+    except Exception:
+        logger.debug("queue runtime debug log write failed", exc_info=True)
+
 
 def _reset_cached_actor_handle() -> None:
     global _ACTOR_HANDLE
     _ACTOR_HANDLE = None
 
-from ..ray_utils import register_ray_reconnect_invalidator as _register_ray_reconnect_invalidator
 _register_ray_reconnect_invalidator(_reset_cached_actor_handle)
 
 
@@ -70,6 +99,7 @@ def _runtime_env_overrides() -> dict[str, str]:
         "MINT_MBRIDGE_EXPORT_GLOO_BARRIER_DEBUG",
         "MINT_SUPPORTED_MODELS",
         "MINT_RUNTIME_OBSERVABILITY_FLUSH_S",
+        "MINT_QUEUE_EXECUTION_RUNTIME_DEBUG_LOG_PATH",
     )
     for key in direct_keys:
         value = os.environ.get(key, "").strip()
@@ -114,6 +144,13 @@ def _ray_namespace() -> str:
 
 def _actor_name() -> str:
     return os.environ.get("MINT_QUEUE_EXECUTION_RUNTIME_ACTOR_NAME", "tinker_queue_execution_runtime")
+
+
+_append_queue_runtime_debug(
+    "module_import",
+    cwd=os.getcwd(),
+    pythonpath=os.environ.get("PYTHONPATH", ""),
+)
 
 
 async def _await_ray_ref(ref: Any) -> Any:
@@ -252,20 +289,35 @@ def _get_or_create_actor():
     @ray.remote(num_cpus=0, max_concurrency=32)
     class _QueueExecutionRuntimeActor:
         def __init__(self) -> None:
-            from ..logging_context import init_actor_observability
+            _append_queue_runtime_debug("actor_init_begin")
+            try:
+                from ..logging_context import init_actor_observability
 
-            init_actor_observability()
-            self._started_at = time.time()
-            self._runtime_initialized = False
-            self._desired_workers = 0
-            self._last_error = None
-            self._last_started_at = None
-            self._observability_flush_task: asyncio.Task | None = None
-            self._observability_flush_interval_s = max(
-                5.0,
-                float(os.environ.get("MINT_RUNTIME_OBSERVABILITY_FLUSH_S", "15.0")),
-            )
-            self._lock = asyncio.Lock()
+                init_actor_observability()
+                self._started_at = time.time()
+                self._runtime_initialized = False
+                self._desired_workers = 0
+                self._last_error = None
+                self._last_started_at = None
+                self._observability_flush_task: asyncio.Task | None = None
+                self._observability_flush_interval_s = max(
+                    5.0,
+                    float(os.environ.get("MINT_RUNTIME_OBSERVABILITY_FLUSH_S", "15.0")),
+                )
+                self._lock = asyncio.Lock()
+                _append_queue_runtime_debug(
+                    "actor_init_ok",
+                    cwd=os.getcwd(),
+                    debug_log_path=_queue_runtime_debug_log_path(),
+                    pythonpath=os.environ.get("PYTHONPATH", ""),
+                )
+            except Exception as e:
+                _append_queue_runtime_debug(
+                    "actor_init_error",
+                    error=f"{type(e).__name__}: {e}",
+                    traceback=traceback.format_exc(),
+                )
+                raise
 
         async def _ensure_observability_flush_task(self) -> None:
             if self._observability_flush_task is not None and not self._observability_flush_task.done():
@@ -288,24 +340,47 @@ def _get_or_create_actor():
             from .capacity_manager import capacity_manager
             from .future_store import future_store
 
+            _append_queue_runtime_debug(
+                "ensure_started_begin",
+                num_workers=int(num_workers),
+                runtime_initialized=bool(self._runtime_initialized),
+            )
             async with self._lock:
                 try:
                     if not self._runtime_initialized:
+                        _append_queue_runtime_debug("ensure_started_before_initialize_runtime")
                         await _initialize_execution_runtime(prewarm=True)
                         self._runtime_initialized = True
+                        _append_queue_runtime_debug("ensure_started_after_initialize_runtime")
                     await self._ensure_observability_flush_task()
+                    _append_queue_runtime_debug("ensure_started_after_observability_task")
                     await capacity_manager.async_ensure_ready()
+                    _append_queue_runtime_debug("ensure_started_after_capacity_manager")
                     await future_store.async_ensure_started()
+                    _append_queue_runtime_debug("ensure_started_after_future_store")
                     await api_work_queue.async_ensure_started()
+                    _append_queue_runtime_debug("ensure_started_after_api_work_queue_started")
                     register_api_work_queue_executors(api_work_queue)
+                    _append_queue_runtime_debug("ensure_started_after_register_executors")
                     self._desired_workers = max(1, int(num_workers))
                     await api_work_queue.start_workers(num_workers=self._desired_workers)
+                    _append_queue_runtime_debug(
+                        "ensure_started_after_start_workers",
+                        desired_workers=int(self._desired_workers),
+                    )
                     await api_work_queue.wait_until_execution_ready(timeout_s=120.0)
+                    _append_queue_runtime_debug("ensure_started_after_execution_ready")
                     self._last_started_at = time.time()
                     self._last_error = None
                 except Exception as e:
                     self._last_error = f"{type(e).__name__}: {e}"
+                    _append_queue_runtime_debug(
+                        "ensure_started_error",
+                        error=self._last_error,
+                        traceback=traceback.format_exc(),
+                    )
                     raise
+            _append_queue_runtime_debug("ensure_started_ok")
             return await self.health_snapshot()
 
         async def get_tokenizer_info(self, *, model_id: str) -> dict[str, Any]:
@@ -375,6 +450,11 @@ def _get_or_create_actor():
     env = otel_env_vars()
     env.update(_runtime_env_overrides())
     options["runtime_env"] = actor_runtime_env(pythonpath=PFS_PYTHONPATH, extra=env)
+    _append_queue_runtime_debug(
+        "driver_create_attempt",
+        runtime_env=options.get("runtime_env"),
+        resources=options.get("resources"),
+    )
 
     try:
         created = _QueueExecutionRuntimeActor.options(**options).remote()
