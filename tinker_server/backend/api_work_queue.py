@@ -26,6 +26,7 @@ from ..logging_context import (
     set_trace_id,
 )
 from ..queue_priority import QUEUE_PRIORITY_AGING_S, effective_queue_priority, normalize_queue_priority
+from .work_classification import infer_scheduler_capacity_owner
 
 logger = logging.getLogger(__name__)
 
@@ -241,6 +242,11 @@ def _create_ray_actor(*, require_ready: bool = True):
                     "wait_s_sum": 0.0,
                     "switch_reasons": {},
                 }
+                self._scheduler_arbitration_total = 0
+                self._scheduler_arbitration_by_winner: dict[str, int] = {}
+                self._scheduler_arbitration_by_reason: dict[str, int] = {}
+                self._scheduled_dequeue_stats: dict[tuple[str, str, str], int] = {}
+                self._legacy_dequeue_stats: dict[tuple[str, str], int] = {}
                 self._execution_serial_seq_by_key: dict[str, int] = {}
                 self._execution_serial_epoch = uuid.uuid4().hex
                 _append_api_work_queue_debug(
@@ -491,9 +497,11 @@ def _create_ray_actor(*, require_ready: bool = True):
                 "ready_set": set(),
                 "current_session": None,
                 "last_session": None,
+                "last_pick_ts": 0.0,
                 "consecutive_count": 0,
                 "scheduler_fairness_override": None,
                 "scheduler_max_consecutive_override": None,
+                "capacity_owner": None,
                 "leased_request_id": None,
                 "leased_session": None,
                 "stats": {
@@ -553,6 +561,101 @@ def _create_ray_actor(*, require_ready: bool = True):
                         oldest = ts
             return oldest
 
+        def _domain_capacity_workers(self, domain: str, state: dict[str, Any]) -> int | None:
+            owner = state.get("capacity_owner")
+            if owner is None:
+                owner = infer_scheduler_capacity_owner(domain)
+            owner = None if owner is None else str(owner).strip()
+            if owner in {"single_worker", "vllm_replica_single_worker"}:
+                return 1
+            return None
+
+        def _scheduler_domain_snapshot(self, *, domain: str, state: dict[str, Any], now: float) -> dict[str, Any] | None:
+            queues_by_session = state.get("queues_by_session", {}) or {}
+            pending_requests = 0
+            active_sessions = 0
+            oldest_created_at: float | None = None
+            for q in queues_by_session.values():
+                if not q:
+                    continue
+                active_sessions += 1
+                pending_requests += int(len(q))
+                ts = self._item_created_at(q[0], now=now)
+                if oldest_created_at is None or ts < oldest_created_at:
+                    oldest_created_at = ts
+            if pending_requests <= 0 and int((state.get("stats") or {}).get("picks", 0)) == 0:
+                return None
+            inflight_workers = 1 if state.get("leased_request_id") else 0
+            capacity_workers = self._domain_capacity_workers(domain, state)
+            last_pick_ts = float(state.get("last_pick_ts", 0.0) or 0.0)
+            oldest_queued_s = 0.0 if oldest_created_at is None else max(0.0, now - oldest_created_at)
+            service_gap_s = oldest_queued_s if last_pick_ts <= 0 else max(0.0, now - last_pick_ts)
+            return {
+                "backend": self._scheduler_backend(domain),
+                "pending_requests": int(pending_requests),
+                "active_sessions": int(active_sessions),
+                "oldest_queued_s": float(oldest_queued_s),
+                "inflight_workers": int(inflight_workers),
+                "capacity_owner": state.get("capacity_owner"),
+                "capacity_workers": capacity_workers,
+                "admissible": False if capacity_workers is None else bool(inflight_workers < capacity_workers),
+                "service_gap_s": float(service_gap_s),
+                "stats": {
+                    "picks": int((state.get("stats") or {}).get("picks", 0)),
+                    "starvation_picks": int((state.get("stats") or {}).get("starvation_picks", 0)),
+                },
+            }
+
+        def _scheduler_metrics_snapshot(self, *, now: float | None = None) -> dict[str, Any]:
+            ts = time.time() if now is None else float(now)
+            scheduler_domains: dict[str, Any] = {}
+            for domain, state in self._sched_domains.items():
+                snapshot = self._scheduler_domain_snapshot(domain=str(domain), state=state, now=ts)
+                if snapshot is not None:
+                    scheduler_domains[str(domain)] = snapshot
+            scheduled_dequeue_stats = [
+                {
+                    "scheduler_domain": scheduler_domain,
+                    "reason": reason,
+                    "op": op,
+                    "total": int(total),
+                }
+                for (scheduler_domain, reason, op), total in sorted(self._scheduled_dequeue_stats.items())
+            ]
+            legacy_dequeue_stats = [
+                {
+                    "reason": reason,
+                    "op": op,
+                    "total": int(total),
+                }
+                for (reason, op), total in sorted(self._legacy_dequeue_stats.items())
+            ]
+            return {
+                "scheduler_arbitration_total": int(self._scheduler_arbitration_total),
+                "scheduler_arbitration_by_winner": dict(sorted(self._scheduler_arbitration_by_winner.items())),
+                "scheduler_arbitration_by_reason": dict(sorted(self._scheduler_arbitration_by_reason.items())),
+                "scheduled_dequeue_stats": scheduled_dequeue_stats,
+                "legacy_dequeue_stats": legacy_dequeue_stats,
+                "scheduler_domains": scheduler_domains,
+            }
+
+        def _record_scheduler_arbitration(self, *, winner_bucket: str, reason: str) -> None:
+            bucket = str(winner_bucket).strip() or "legacy"
+            why = str(reason).strip() or "unknown"
+            self._scheduler_arbitration_total += 1
+            self._scheduler_arbitration_by_winner[bucket] = int(self._scheduler_arbitration_by_winner.get(bucket, 0)) + 1
+            self._scheduler_arbitration_by_reason[why] = int(self._scheduler_arbitration_by_reason.get(why, 0)) + 1
+
+        def _record_dequeue_stat(self, *, scheduler_domain: str | None, reason: str, op: str) -> None:
+            op_key = str(op).strip() or "unknown"
+            reason_key = str(reason).strip() or "unknown"
+            if scheduler_domain is None:
+                key = (reason_key, op_key)
+                self._legacy_dequeue_stats[key] = int(self._legacy_dequeue_stats.get(key, 0)) + 1
+                return
+            key = (str(scheduler_domain), reason_key, op_key)
+            self._scheduled_dequeue_stats[key] = int(self._scheduled_dequeue_stats.get(key, 0)) + 1
+
         def _enqueue_scheduled(self, item: dict[str, Any], *, domain: str, session_id: str) -> None:
             from collections import deque
 
@@ -575,6 +678,20 @@ def _create_ray_actor(*, require_ready: bool = True):
                     raise RuntimeError(
                         "scheduler max_consecutive override conflict: "
                         f"domain={domain!r} existing={current_max_consecutive!r} incoming={max_consecutive!r}"
+                    )
+            extra = item.get("extra") if isinstance(item.get("extra"), dict) else {}
+            owner = extra.get("scheduler_capacity_owner") if isinstance(extra, dict) else None
+            if owner is None:
+                owner = infer_scheduler_capacity_owner(domain)
+            if owner is not None:
+                current_owner = state.get("capacity_owner")
+                owner = str(owner)
+                if current_owner is None:
+                    state["capacity_owner"] = owner
+                elif str(current_owner) != owner:
+                    raise RuntimeError(
+                        "scheduler capacity_owner conflict: "
+                        f"domain={domain!r} existing={current_owner!r} incoming={owner!r}"
                     )
             queues_by_session = state["queues_by_session"]
             q = queues_by_session.get(session_id)
@@ -1069,6 +1186,8 @@ def _create_ray_actor(*, require_ready: bool = True):
                     scheduler_domain = None
                     scheduler_session_id = None
                     decision_ctx = None
+                    arbitration_winner = "legacy"
+                    arbitration_reason = "legacy_only"
 
                     if has_legacy and sched_choice is not None:
                         legacy_head = self._items[0]
@@ -1083,12 +1202,16 @@ def _create_ray_actor(*, require_ready: bool = True):
                         )
                         if not sched_queue:
                             item = self._items.popleft()
+                            arbitration_winner = "legacy"
+                            arbitration_reason = "legacy_only"
                         else:
                             sched_head = sched_queue[0]
                             sched_priority = self._item_effective_priority(sched_head, now=now)
                             sched_head_ts = self._item_created_at(sched_head, now=now)
                             if (legacy_priority, -legacy_ts) >= (sched_priority, -sched_head_ts):
                                 item = self._items.popleft()
+                                arbitration_winner = "legacy"
+                                arbitration_reason = "legacy_head_older"
                             else:
                                 decision_ctx = self._scheduler_decision_context(
                                     domain=str(sched_domain),
@@ -1105,7 +1228,11 @@ def _create_ray_actor(*, require_ready: bool = True):
                                 dequeue_reason = str(sched_reason)
                                 scheduler_domain = str(sched_domain)
                                 scheduler_session_id = str(sched_session_id)
+                                arbitration_winner = "scheduled"
+                                arbitration_reason = f"scheduled_{sched_reason}"
                     elif has_legacy:
+                        arbitration_winner = "legacy"
+                        arbitration_reason = "legacy_only"
                         best_idx = 0
                         best_priority = self._item_effective_priority(self._items[0], now=now)
                         best_ts = self._item_created_at(self._items[0], now=now)
@@ -1141,6 +1268,8 @@ def _create_ray_actor(*, require_ready: bool = True):
                         dequeue_reason = str(sched_reason)
                         scheduler_domain = str(sched_domain)
                         scheduler_session_id = str(sched_session_id)
+                        arbitration_winner = "scheduled"
+                        arbitration_reason = f"scheduled_{sched_reason}"
                     serial_key = self._execution_serial_key(item)
                     if serial_key is not None:
                         extra = item.get("extra")
@@ -1161,6 +1290,15 @@ def _create_ray_actor(*, require_ready: bool = True):
                 self._dequeued += 1
                 dequeue_ts = time.time()
                 wait_s = max(0.0, dequeue_ts - self._item_created_at(item, now=dequeue_ts))
+                self._record_scheduler_arbitration(
+                    winner_bucket=arbitration_winner,
+                    reason=arbitration_reason,
+                )
+                self._record_dequeue_stat(
+                    scheduler_domain=scheduler_domain,
+                    reason=str(dequeue_reason),
+                    op=str(item.get("op") or "unknown"),
+                )
                 self._annotate_queue_priority(
                     item,
                     now=dequeue_ts,
@@ -1270,6 +1408,7 @@ def _create_ray_actor(*, require_ready: bool = True):
             }
 
         def stats(self) -> dict[str, Any]:
+            now = time.time()
             depth_legacy = int(len(self._items))
             depth_scheduled = int(self._scheduled_depth())
             by_executor: dict[str, int] = {}
@@ -1310,6 +1449,7 @@ def _create_ray_actor(*, require_ready: bool = True):
                 "scheduler_starvation_picks_total": int(self._sched_stats.get("starvation_picks_total", 0)),
                 "scheduler_wait_s_sum": float(self._sched_stats.get("wait_s_sum", 0.0)),
                 "scheduler_domains_total": int(len(self._sched_domains)),
+                **self._scheduler_metrics_snapshot(now=now),
             }
 
         def metrics_seed_snapshot(self) -> dict[str, Any]:
@@ -1565,6 +1705,7 @@ class ApiWorkQueueClient:
         self._snapshot_by_executor: dict[str, int] = {}
         self._snapshot_by_apikey_id: dict[str, int] = {}
         self._snapshot_by_throttle_principal: dict[str, int] = {}
+        self._snapshot_scheduler_view: dict[str, Any] = {}
         self._snapshot_hydrated = False
         self._snapshot_hydrate_last_attempt_s = 0.0
         self._snapshot_hydrate_min_interval_s = float(
@@ -1578,12 +1719,38 @@ class ApiWorkQueueClient:
         self._ray_actor = None
 
     @staticmethod
+    def _scheduler_metrics_view(snapshot: dict[str, Any]) -> dict[str, Any]:
+        trimmed = ApiWorkQueueClient._trim_unready_scheduler_metrics(snapshot)
+        out: dict[str, Any] = {}
+        for key in (
+            "scheduler_metrics_ready",
+            "depth_scheduled",
+            "scheduler_enabled",
+            "scheduler_picks_total",
+            "scheduler_switches_total",
+            "scheduler_starvation_picks_total",
+            "scheduler_wait_s_sum",
+            "scheduler_domains_total",
+            "scheduler_arbitration_total",
+            "scheduler_arbitration_by_winner",
+            "scheduler_arbitration_by_reason",
+            "scheduled_dequeue_stats",
+            "legacy_dequeue_stats",
+            "scheduler_domains",
+        ):
+            if key in trimmed:
+                out[key] = trimmed.get(key)
+        return out
+
+    @staticmethod
     def _trim_unready_scheduler_metrics(snapshot: dict[str, Any]) -> dict[str, Any]:
         if bool(snapshot.get("scheduler_metrics_ready", True)):
             return snapshot
         out = dict(snapshot)
         out.pop("depth_scheduled", None)
         out.pop("scheduled_depth_by_priority", None)
+        out.pop("scheduled_dequeue_stats", None)
+        out.pop("legacy_dequeue_stats", None)
         for key in list(out):
             if key.startswith("scheduler_") and key != "scheduler_metrics_ready":
                 out.pop(key, None)
@@ -1759,12 +1926,10 @@ class ApiWorkQueueClient:
     def hydrate_metrics_snapshot(self, *, timeout_s: float = 10.0, force: bool = False) -> bool:
         now = time.time()
         with self._snapshot_lock:
-            if self._snapshot_hydrated and not force:
-                return True
             if not force and (now - float(self._snapshot_hydrate_last_attempt_s)) < float(
                 self._snapshot_hydrate_min_interval_s
             ):
-                return False
+                return bool(self._snapshot_hydrated)
             self._snapshot_hydrate_last_attempt_s = now
 
         actor = self._get_ray_actor()
@@ -1828,6 +1993,7 @@ class ApiWorkQueueClient:
             dequeued = max(0, int(stats.get("dequeued", 0)))
         except Exception:
             dequeued = 0
+        scheduler_view = self._scheduler_metrics_view(stats)
 
         with self._snapshot_lock:
             self._snapshot_items_by_request_id = next_items
@@ -1836,10 +2002,15 @@ class ApiWorkQueueClient:
             self._snapshot_by_throttle_principal = next_by_principal
             self._snapshot_enqueued = int(enqueued)
             self._snapshot_dequeued = int(dequeued)
+            self._snapshot_scheduler_view = scheduler_view
             self._snapshot_hydrated = True
         return True
 
     def metrics_snapshot(self) -> dict[str, Any]:
+        try:
+            self.hydrate_metrics_snapshot(timeout_s=1.0, force=False)
+        except Exception:
+            pass
         with self._snapshot_lock:
             now = time.time()
             ages = [
@@ -1847,7 +2018,7 @@ class ApiWorkQueueClient:
                 for rec in self._snapshot_items_by_request_id.values()
             ]
             depth = int(len(self._snapshot_items_by_request_id))
-            return {
+            out = {
                 "depth": depth,
                 "depth_legacy": depth,
                 "enqueued": int(self._snapshot_enqueued),
@@ -1861,6 +2032,15 @@ class ApiWorkQueueClient:
                 },
                 "scheduler_metrics_ready": False,
             }
+            scheduler_view = dict(self._snapshot_scheduler_view)
+            if scheduler_view:
+                out.update(scheduler_view)
+                try:
+                    depth_scheduled = int(scheduler_view.get("depth_scheduled", 0) or 0)
+                except Exception:
+                    depth_scheduled = 0
+                out["depth_legacy"] = max(0, depth - depth_scheduled)
+            return out
 
     def _get_cached_ray_actor_for_async_request_path(self):
         return self._get_ray_actor(require_ready=False)

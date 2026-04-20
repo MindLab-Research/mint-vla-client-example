@@ -594,6 +594,95 @@ def test_issue_248_admission_stats_metrics_path_uses_cached_pool_snapshot(monkey
     assert isinstance(stats.get("actors", {}).get("resource_pool"), list)
 
 
+def test_issue_248_metrics_path_exports_cached_scheduler_model_load(monkeypatch) -> None:
+    api_work_queue_module = importlib.import_module("tinker_server.backend.api_work_queue")
+    capacity_manager_module = importlib.import_module("tinker_server.backend.capacity_manager")
+    future_store_module = importlib.import_module("tinker_server.backend.future_store")
+    resource_pool_module = importlib.import_module("tinker_server.backend.resource_pool")
+
+    @dataclass
+    class _CapSnapshot:
+        capacity: int
+        inflight: int
+
+    class _FakeCapacityManager:
+        async def async_snapshot(self, *, timeout_s: float = 10.0) -> _CapSnapshot:
+            return _CapSnapshot(capacity=16, inflight=1)
+
+    class _FakeApiWorkQueue:
+        def metrics_snapshot(self) -> dict:
+            return {
+                "depth": 5,
+                "depth_legacy": 3,
+                "depth_scheduled": 2,
+                "enqueued": 9,
+                "dequeued": 4,
+                "scheduler_metrics_ready": True,
+                "scheduler_enabled": True,
+                "scheduler_domains_total": 1,
+                "scheduler_domains": {
+                    "vllm:Qwen/Qwen3-4B-Instruct-2507::replica::0": {
+                        "backend": "vllm",
+                        "pending_requests": 3,
+                        "active_sessions": 2,
+                        "oldest_queued_s": 11.0,
+                        "inflight_workers": 1,
+                        "capacity_workers": 2,
+                        "admissible": True,
+                        "service_gap_s": 5.5,
+                        "stats": {"picks": 6, "starvation_picks": 1},
+                    }
+                },
+            }
+
+        async def stats(self, *, timeout_s: float = 10.0) -> dict:
+            raise AssertionError("metrics scrape must not call api_work_queue.stats")
+
+    class _FakeFutureStore:
+        def metrics_snapshot(self) -> dict:
+            return {"pending": 0, "results": 0, "errors": 0}
+
+        def ensure_ready(self, *, timeout_s: float = 10.0) -> dict:
+            raise AssertionError("metrics scrape must not call future_store.ensure_ready")
+
+    class _FakePool:
+        def cached_snapshot(self) -> list[dict]:
+            return []
+
+        def metadata_cache_metrics_snapshot(self) -> list[dict]:
+            return []
+
+        def lifecycle_metrics_snapshot(self) -> list[dict]:
+            return []
+
+        def rss_snapshot(self, *, timeout_s: float = 10.0) -> list[dict]:
+            raise AssertionError("metrics scrape must not call resource_pool.rss_snapshot")
+
+    monkeypatch.setattr(capacity_manager_module, "capacity_manager", _FakeCapacityManager())
+    monkeypatch.setattr(api_work_queue_module, "api_work_queue", _FakeApiWorkQueue())
+    monkeypatch.setattr(future_store_module, "future_store", _FakeFutureStore())
+    monkeypatch.setattr(resource_pool_module, "get_resource_pool", lambda: _FakePool())
+
+    resp = asyncio.run(internal_routes.metrics())
+    text = resp.body.decode("utf-8")
+
+    assert "mint_work_queue_depth_scheduled 2" in text
+    assert "mint_work_queue_scheduler_enabled 1" in text
+    assert "mint_work_queue_scheduler_domains_total 1" in text
+    assert (
+        'mint_work_queue_scheduler_domain_pending_requests{backend="vllm",execution_scope="local",scheduler_domain="vllm:Qwen/Qwen3-4B-Instruct-2507::replica::0"} 3'
+        in text
+    )
+    assert (
+        'mint_model_load_pct{base_model="Qwen/Qwen3-4B-Instruct-2507",workload="sample"} 50'
+        in text
+    )
+    assert (
+        'mint_model_pending_requests{base_model="Qwen/Qwen3-4B-Instruct-2507",workload="sample"} 3'
+        in text
+    )
+
+
 def test_issue_248_scheduler_decisions_debug_route_proxies_filters(monkeypatch) -> None:
     api_work_queue_module = importlib.import_module("tinker_server.backend.api_work_queue")
     captured: dict[str, object] = {}
