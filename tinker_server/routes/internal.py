@@ -1087,6 +1087,29 @@ async def metrics() -> Response:
 
         runtime_observability = queue_execution.get("runtime_observability")
         if isinstance(runtime_observability, dict):
+            megatron_switch = runtime_observability.get("megatron_session_switch")
+            if isinstance(megatron_switch, list):
+                for row in megatron_switch:
+                    if not isinstance(row, dict):
+                        continue
+                    labels = {
+                        "base_model": row.get("base_model") or "unknown",
+                        "session_state": row.get("session_state") or "unknown",
+                    }
+                    for phase, field_name in (
+                        ("save", "save_s_total"),
+                        ("swap", "swap_s_total"),
+                        ("load", "load_s_total"),
+                        ("reset_bias", "reset_bias_s_total"),
+                        ("total", "total_s_total"),
+                    ):
+                        _append_metric(
+                            lines,
+                            "mint_megatron_session_switch_duration_s_total",
+                            row.get(field_name),
+                            labels={**labels, "phase": phase},
+                        )
+
             megatron_switch_failures = runtime_observability.get("megatron_session_switch_failures")
             if isinstance(megatron_switch_failures, list):
                 for row in megatron_switch_failures:

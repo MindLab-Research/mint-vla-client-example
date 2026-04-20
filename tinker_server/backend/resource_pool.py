@@ -797,50 +797,37 @@ def actor_observability_metadata(actor_handle: ActorHandle | None, *, timeout_s:
             )
         if clean_bindings:
             out["gpu_bindings"] = clean_bindings
-    int_fields = (
+    int_fields = {
         "scheduler_waiting_requests",
         "scheduler_running_requests",
         "prefix_cache_queries_total",
         "prefix_cache_hits_total",
         "preemptions_total",
-        "queue_time_s_count",
-        "prefill_time_s_count",
-        "decode_time_s_count",
-        "time_per_output_token_s_count",
         "active_sessions",
         "session_unknown",
         "session_step",
         "gpu_memory_allocated_bytes",
         "gpu_memory_reserved_bytes",
         "gpu_memory_fragmentation_bytes",
-    )
-    float_fields = (
+    }
+    float_fields = {
         "scheduler_kv_cache_usage_ratio",
         "prefix_cache_hit_ratio",
-        "queue_time_s_total",
-        "queue_time_s_max",
-        "prefill_time_s_total",
-        "prefill_time_s_max",
-        "decode_time_s_total",
-        "decode_time_s_max",
-        "time_per_output_token_s_total",
-        "time_per_output_token_s_max",
         "learning_rate",
-    )
-    for src in int_fields:
-        value = payload.get(src)
-        if isinstance(value, (int, float, str)) and str(value).strip():
-            try:
+    }
+    skip_fields = {"hostname", "node_id", "gpu_indices", "gpu_bindings", "rank"}
+    for src, value in payload.items():
+        if src in skip_fields:
+            continue
+        if not isinstance(value, (int, float, str)) or not str(value).strip():
+            continue
+        try:
+            if src in int_fields or src.endswith(("_count", "_bytes")):
                 out[src] = max(0, int(value))
-            except (TypeError, ValueError):
-                pass
-    for src in float_fields:
-        value = payload.get(src)
-        if isinstance(value, (int, float, str)) and str(value).strip():
-            try:
+            elif src in float_fields or src.endswith(("_ratio", "_total", "_max", "_p50_recent", "_p95_recent")):
                 out[src] = max(0.0, float(value))
-            except (TypeError, ValueError):
-                pass
+        except (TypeError, ValueError):
+            pass
     return out or None
 
 
