@@ -1,7 +1,9 @@
+import asyncio
 import json
 
 from tinker_server.backend import api_work_queue as api_work_queue_module
 from tinker_server.backend import queue_execution_runtime as runtime_module
+from tinker_server import ray_utils as ray_utils_module
 
 
 def test_issue_440_queue_execution_runtime_propagates_mint_actor_and_routing_overrides(monkeypatch):
@@ -75,3 +77,51 @@ def test_issue_440_api_work_queue_debug_log_helpers(monkeypatch, tmp_path):
     assert payload["detail"] == "y"
     assert payload["actor_name"] == "api-work-queue"
     assert payload["namespace"] == "ns-issue-440"
+
+
+def test_issue_440_debug_runtime_env_summary_redacts_env_values():
+    runtime_env = {
+        "env_vars": {
+            "OTEL_EXPORTER_OTLP_HEADERS": "authorization=secret",
+            "MINT_APMPLUS_APP_KEY": "secret-app-key",
+            "PFS_TINKER_PATH": "/tmp/mint",
+        },
+        "working_dir": "/tmp/mint",
+    }
+
+    queue_summary = runtime_module._summarize_debug_runtime_env(runtime_env)
+    api_summary = api_work_queue_module._summarize_debug_runtime_env(runtime_env)
+
+    for summary in (queue_summary, api_summary):
+        assert summary["working_dir"] == "/tmp/mint"
+        assert summary["env_var_keys"] == [
+            "MINT_APMPLUS_APP_KEY",
+            "OTEL_EXPORTER_OTLP_HEADERS",
+            "PFS_TINKER_PATH",
+        ]
+        assert "env_vars" not in summary
+
+
+def test_issue_440_api_work_queue_async_existing_ray_skips_init(monkeypatch):
+    client = api_work_queue_module.ApiWorkQueueClient()
+    actor = object()
+
+    async def _fake_to_thread(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    def _unexpected_init_ray(*args, **kwargs):
+        raise AssertionError("init_ray should not run when ray is already initialized")
+
+    monkeypatch.setattr(api_work_queue_module.asyncio, "to_thread", _fake_to_thread)
+    monkeypatch.setattr(api_work_queue_module, "_append_api_work_queue_debug", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ray_utils_module, "init_ray", _unexpected_init_ray)
+
+    import ray
+
+    monkeypatch.setattr(ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(ray, "get_actor", lambda *args, **kwargs: actor)
+
+    out = asyncio.run(client._get_ray_actor_async(require_ready=False))
+
+    assert out is actor
+    assert client._ray_actor is actor

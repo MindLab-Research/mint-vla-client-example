@@ -25,6 +25,17 @@ def _queue_runtime_debug_log_path() -> str:
     return f"/tmp/{actor_name}.{namespace}.debug.jsonl"
 
 
+def _summarize_debug_runtime_env(runtime_env: Any) -> Any:
+    if not isinstance(runtime_env, dict):
+        return runtime_env
+    summary = dict(runtime_env)
+    env_vars = summary.get("env_vars")
+    if isinstance(env_vars, dict):
+        summary["env_var_keys"] = sorted(str(key) for key in env_vars)
+        summary.pop("env_vars", None)
+    return summary
+
+
 def _append_queue_runtime_debug(event: str, **fields: Any) -> None:
     record = {
         "ts": round(time.time(), 6),
@@ -452,7 +463,7 @@ def _get_or_create_actor():
     options["runtime_env"] = actor_runtime_env(pythonpath=PFS_PYTHONPATH, extra=env)
     _append_queue_runtime_debug(
         "driver_create_attempt",
-        runtime_env=options.get("runtime_env"),
+        runtime_env=_summarize_debug_runtime_env(options.get("runtime_env")),
         resources=options.get("resources"),
     )
 
