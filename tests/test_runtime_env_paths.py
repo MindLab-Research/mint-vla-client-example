@@ -1157,3 +1157,39 @@ def test_actor_runtime_env_vars_forwards_usage_envs(tmp_path):
     assert data["TINKER_USAGE_LOG_DIR"] == "/vePFS/shared/usage"
     assert data["TINKER_USAGE_BACKEND"] == "postgres"
     assert data["TINKER_USAGE_PG_DSN"] == "postgresql://mint:test@db/usage"
+
+
+def test_actor_runtime_env_vars_forwards_ray_attach_hints(tmp_path):
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env(env_root)
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json; "
+                "from tinker_server.config import actor_runtime_env_vars; "
+                "print(json.dumps(actor_runtime_env_vars(pythonpath='X')))"
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            "PFS_RUNTIME_ENV_ROOT": str(env_root),
+            "PFS_TINKER_PATH": str(tmp_path / 'repo'),
+            "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
+            "RAY_ADDRESS": "192.168.39.87:6379",
+            "MINT_RAY_CLIENT_ADDRESS": "ray://192.168.39.87:10001",
+            "RAY_CLIENT_ADDRESS": "ray://192.168.39.87:10001",
+            "MINT_RAY_NODE_IP_ADDRESS": "192.168.33.190",
+            "MINT_RAY_TEMP_DIR": "/tmp/mdw/t",
+        },
+    )
+    data = json.loads(out.stdout)
+    assert data["RAY_ADDRESS"] == "192.168.39.87:6379"
+    assert data["MINT_RAY_CLIENT_ADDRESS"] == "ray://192.168.39.87:10001"
+    assert data["RAY_CLIENT_ADDRESS"] == "ray://192.168.39.87:10001"
+    assert data["MINT_RAY_NODE_IP_ADDRESS"] == "192.168.33.190"
+    assert data["MINT_RAY_TEMP_DIR"] == "/tmp/mdw/t"
