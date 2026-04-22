@@ -1716,7 +1716,25 @@ class VerlTrainingEngine:
         )
         self._workers[model_id] = dense.actor
         self._resource_pool_actor_names[model_id] = dense.actor_name
+        session.actor_name = dense.actor_name
+        session.namespace = RAY_NAMESPACE
         self._touch_actor(session)
+        try:
+            from .training_session_store import upsert_training_session
+
+            upsert_training_session(
+                {
+                    "model_id": session.model_id,
+                    "actor_name": dense.actor_name,
+                    "namespace": RAY_NAMESPACE,
+                    "backend": session.backend,
+                    "current_step": session.current_step,
+                    "last_activity": session.last_activity,
+                    "metadata_version": getattr(session, "metadata_version", 1),
+                }
+            )
+        except Exception:
+            pass
         logger.warning(
             "[%s] rebound dense trainer actor=%s reason=%s base_model=%s",
             model_id,
@@ -1725,6 +1743,40 @@ class VerlTrainingEngine:
             base_model,
         )
         return dense.actor
+
+    async def _rebind_worker_from_session_metadata(
+        self,
+        session: "TrainingSession",
+        *,
+        reason: str,
+    ) -> ray.actor.ActorHandle | None:
+        actor_name = str(getattr(session, "actor_name", "") or "")
+        if not actor_name:
+            return None
+        namespace = str(getattr(session, "namespace", "") or RAY_NAMESPACE)
+        try:
+            worker = await asyncio.to_thread(ray.get_actor, actor_name, namespace=namespace)
+        except Exception as e:
+            logger.warning(
+                "[%s] failed to rebind actor=%s reason=%s error_type=%s error=%s",
+                str(getattr(session, "model_id", "")),
+                actor_name,
+                reason,
+                type(e).__name__,
+                e,
+            )
+            return None
+        self._workers[session.model_id] = worker
+        self._resource_pool_actor_names[session.model_id] = actor_name
+        self._touch_actor(session)
+        logger.warning(
+            "[%s] rebound worker actor=%s reason=%s backend=%s",
+            session.model_id,
+            actor_name,
+            reason,
+            session.backend,
+        )
+        return worker
 
     async def _get_live_worker(
         self,
@@ -1736,6 +1788,14 @@ class VerlTrainingEngine:
         """Return a live worker handle, rebinding dense trainers when evicted."""
         model_id = session.model_id
         worker = self._workers.get(model_id)
+        authoritative_actor_name = str(getattr(session, "actor_name", "") or "")
+        bound_actor_name = str(self._resource_pool_actor_names.get(model_id) or "")
+        if authoritative_actor_name and bound_actor_name and bound_actor_name != authoritative_actor_name:
+            self._workers.pop(model_id, None)
+            self._resource_pool_actor_names[model_id] = authoritative_actor_name
+            worker = None
+        if worker is None:
+            worker = await self._rebind_worker_from_session_metadata(session, reason=f"{op}:metadata_rebind")
         if worker is None:
             if session.backend == "peft" and allow_recover:
                 return await self._recover_dense_worker(session, reason=f"{op}:missing_worker")
@@ -3071,6 +3131,15 @@ class VerlTrainingEngine:
 
         actor_name = self._resource_pool_actor_names.get(model_id)
         worker = self._workers.get(model_id)
+        authoritative_actor_name = str(getattr(session, "actor_name", "") or "")
+        if authoritative_actor_name and actor_name and actor_name != authoritative_actor_name:
+            self._workers.pop(model_id, None)
+            self._resource_pool_actor_names[model_id] = authoritative_actor_name
+            worker = None
+            actor_name = authoritative_actor_name
+        if worker is None:
+            worker = await self._rebind_worker_from_session_metadata(session, reason="shutdown_session")
+            actor_name = self._resource_pool_actor_names.get(model_id) or str(getattr(session, "actor_name", "") or "") or None
         traceparent = get_current_traceparent()
 
         if worker is not None:
@@ -3095,6 +3164,21 @@ class VerlTrainingEngine:
         other_users: list[str] = []
         if actor_name:
             other_users = [mid for mid, an in self._resource_pool_actor_names.items() if an == actor_name and mid != model_id]
+            try:
+                from .training_session_store import list_training_sessions
+
+                for info in list_training_sessions():
+                    if not isinstance(info, dict):
+                        continue
+                    other_model_id = str(info.get("model_id") or "")
+                    if not other_model_id or other_model_id == model_id:
+                        continue
+                    if str(info.get("actor_name") or "") != actor_name:
+                        continue
+                    if other_model_id not in other_users:
+                        other_users.append(other_model_id)
+            except Exception:
+                pass
         replacement_session = other_users[0] if other_users else None
         should_kill_actor = not other_users
         if actor_name:
@@ -3139,6 +3223,7 @@ class VerlTrainingEngine:
         except Exception:
             pass
 
+        actor_namespace = str(getattr(session, "namespace", "") or RAY_NAMESPACE)
         if should_kill_actor:
             if worker:
                 try:
@@ -3150,7 +3235,7 @@ class VerlTrainingEngine:
                         worker,
                         reason="shutdown_session",
                         actor_name=actor_name,
-                        namespace=RAY_NAMESPACE,
+                        namespace=actor_namespace,
                         no_restart=True,
                         model_id=model_id,
                     )
@@ -3158,12 +3243,12 @@ class VerlTrainingEngine:
                     pass
             elif actor_name:
                 try:
-                    actor = ray.get_actor(actor_name, namespace=RAY_NAMESPACE)
+                    actor = ray.get_actor(actor_name, namespace=actor_namespace)
                     ray_kill.kill(
                         actor,
                         reason="shutdown_session_race_no_worker",
                         actor_name=actor_name,
-                        namespace=RAY_NAMESPACE,
+                        namespace=actor_namespace,
                         no_restart=True,
                         model_id=model_id,
                     )
