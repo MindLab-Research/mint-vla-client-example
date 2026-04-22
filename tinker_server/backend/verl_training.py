@@ -2120,6 +2120,7 @@ class VerlTrainingEngine:
             f"[DEBUG {model_id}] create_training_session start: requested_model={requested_model} use_megatron={use_megatron} base_model={base_model}",
             flush=True,
         )
+        observability_base_model = str(requested_model or base_model or "")
 
         if use_megatron:
             import asyncio

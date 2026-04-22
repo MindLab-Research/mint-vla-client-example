@@ -24,6 +24,18 @@ class _RecordingEngine:
         self.calls.append(("forward_backward_reverse_kl", session.base_model))
         return {"engine": self.label, "request": request}
 
+    async def get_session_guard_state(self, session):
+        self.calls.append(("get_session_guard_state", session.base_model))
+        return {
+            "session_id": session.model_id,
+            "contaminated": False,
+            "blocked": False,
+            "contamination_reason": None,
+            "block_reason": None,
+            "external_checkpoint": None,
+            "trusted_recovery_baseline": None,
+        }
+
     def _resolve_hf_model_path(self, model_name: str):
         self.calls.append(("resolve", model_name))
         return f"/models/{model_name}"
@@ -102,3 +114,39 @@ def test_training_engine_router_keeps_reverse_kl_on_text_engine() -> None:
     assert result == {"engine": "text", "request": {"batch": 3}}
     assert text_engine.calls == [("forward_backward_reverse_kl", "Qwen/Qwen3-0.6B")]
     assert openpi_fast_engine.calls == []
+
+
+def test_training_engine_router_delegates_session_guard_state() -> None:
+    text_engine = _RecordingEngine("text")
+    router = TrainingEngineRouter(text_engine=text_engine, openpi_fast_engine=_RecordingEngine("openpi-fast"))
+    session = SimpleNamespace(base_model="Qwen/Qwen3-0.6B", model_id="m-1")
+
+    result = asyncio.run(router.get_session_guard_state(session))
+
+    assert result["session_id"] == "m-1"
+    assert result["contaminated"] is False
+    assert text_engine.calls == [("get_session_guard_state", "Qwen/Qwen3-0.6B")]
+
+
+def test_training_engine_router_session_guard_state_fallback_when_backend_missing_method(monkeypatch) -> None:
+    text_engine = _RecordingEngine("text")
+    openpi_fast_engine = SimpleNamespace()
+    router = TrainingEngineRouter(text_engine=text_engine, openpi_fast_engine=openpi_fast_engine)
+    session = SimpleNamespace(base_model="openpi/no-guard", model_id="m-2")
+
+    monkeypatch.setattr(
+        "tinker_server.backend.training_engine_router.get_model_config",
+        lambda base_model: SimpleNamespace(training_backend="openpi_fast"),
+    )
+
+    result = asyncio.run(router.get_session_guard_state(session))
+
+    assert result == {
+        "session_id": "m-2",
+        "contaminated": False,
+        "blocked": False,
+        "contamination_reason": None,
+        "block_reason": None,
+        "external_checkpoint": None,
+        "trusted_recovery_baseline": None,
+    }

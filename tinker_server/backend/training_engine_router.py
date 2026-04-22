@@ -115,5 +115,20 @@ class TrainingEngineRouter:
             load_optimizer=load_optimizer,
         )
 
+    async def get_session_guard_state(self, session: Any) -> dict[str, Any]:
+        engine = self._engine_for_session(session)
+        method = getattr(engine, "get_session_guard_state", None)
+        if callable(method):
+            return await method(session)
+        return {
+            "session_id": getattr(session, "model_id", None),
+            "contaminated": False,
+            "blocked": False,
+            "contamination_reason": None,
+            "block_reason": None,
+            "external_checkpoint": None,
+            "trusted_recovery_baseline": None,
+        }
+
     async def shutdown_session(self, session: Any) -> Any:
         return await self._engine_for_session(session).shutdown_session(session)

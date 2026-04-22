@@ -4094,7 +4094,16 @@ async def get_session_guard_state(model_id: str):
     if session is None:
         raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
 
-    guard_state = await training_engine.get_session_guard_state(session)
+    try:
+        guard_state = await training_engine.get_session_guard_state(session)
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Failed to query session guard state: "
+                f"{type(e).__name__}: {e}"
+            ),
+        )
     return {
         "model_id": model_id,
         "backend": session.backend,
