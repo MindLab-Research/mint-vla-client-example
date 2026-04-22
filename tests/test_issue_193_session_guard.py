@@ -760,3 +760,30 @@ def test_issue_527_invalidate_session_durability_invalidates_external_and_baseli
     assert ("baseline", "session_target", "test_reason") in calls
 
 
+def test_issue_527_get_session_guard_state_reports_markers_and_latches():
+    group_cls = MegatronWorkerGroup.__ray_actor_class__
+    group = group_cls.__new__(group_cls)
+    group._contaminated_sessions = {"session_target": "forward_backward:group_timeout:600s"}
+    group._blocked_sessions = {"session_target": "trusted_pair_mismatch:deadbeef!=cafebabe"}
+    group._session_manager = SimpleNamespace(
+        get_external_checkpoint=lambda session_id: {
+            "checkpoint_path": "/tmp/external",
+            "checkpoint_identity": "identity-a",
+            "is_fresh": True,
+        },
+        get_trusted_recovery_baseline=lambda session_id: {
+            "checkpoint_path": "/tmp/baseline",
+            "checkpoint_identity": "identity-a",
+            "is_fresh": True,
+        },
+    )
+
+    state = group.get_session_guard_state("session_target")
+
+    assert state["session_id"] == "session_target"
+    assert state["contaminated"] is True
+    assert state["blocked"] is True
+    assert state["external_checkpoint"]["checkpoint_identity"] == "identity-a"
+    assert state["trusted_recovery_baseline"]["checkpoint_identity"] == "identity-a"
+
+

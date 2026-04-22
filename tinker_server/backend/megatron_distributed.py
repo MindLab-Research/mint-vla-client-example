@@ -8838,6 +8838,50 @@ class MegatronWorkerGroup:
             self._session_unknown_due_to_partial_swap = False
         return {"status": "ok", "session_id": session_id, "deleted": bool(deleted)}
 
+    def get_session_guard_state(
+        self,
+        session_id: str | None = None,
+    ) -> dict:
+        target_session_id = session_id
+        if target_session_id is None:
+            target_session_id = getattr(self, "_current_session", None)
+        if target_session_id is None:
+            return {
+                "session_id": None,
+                "contaminated": False,
+                "blocked": False,
+                "contamination_reason": None,
+                "block_reason": None,
+                "external_checkpoint": None,
+                "trusted_recovery_baseline": None,
+            }
+
+        session_manager = getattr(self, "_session_manager", None)
+        get_external_checkpoint = getattr(session_manager, "get_external_checkpoint", None)
+        get_trusted_recovery_baseline = getattr(session_manager, "get_trusted_recovery_baseline", None)
+
+        external_checkpoint = (
+            get_external_checkpoint(target_session_id)
+            if callable(get_external_checkpoint)
+            else None
+        )
+        trusted_recovery_baseline = (
+            get_trusted_recovery_baseline(target_session_id)
+            if callable(get_trusted_recovery_baseline)
+            else None
+        )
+        contamination_reason = self._contaminated_map().get(target_session_id)
+        block_reason = self._blocked_map().get(target_session_id)
+        return {
+            "session_id": target_session_id,
+            "contaminated": contamination_reason is not None,
+            "blocked": block_reason is not None,
+            "contamination_reason": contamination_reason,
+            "block_reason": block_reason,
+            "external_checkpoint": external_checkpoint,
+            "trusted_recovery_baseline": trusted_recovery_baseline,
+        }
+
     def get_session_info(self) -> dict:
         """Get current session info.
 
