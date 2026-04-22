@@ -4809,8 +4809,10 @@ class MegatronRankWorker:
 
         import torch
 
+        import importlib
+
         from tinker_server.backend.lora_utils import pad_lora_state_dict
-        from verl.utils.megatron_peft_utils import _get_rank_checkpoint_path
+        peft_utils = importlib.import_module("verl.utils.megatron_peft_utils")
         from verl.utils.megatron_utils import unwrap_model
 
         self._release_sticky_for_aux_mode_transition(
@@ -4821,7 +4823,7 @@ class MegatronRankWorker:
         # Use train_mode context to ensure model is on GPU for loading
         with self.engine.train_mode():
             # Get rank-specific checkpoint path
-            rank_path = _get_rank_checkpoint_path(checkpoint_path)
+            rank_path = peft_utils._get_rank_checkpoint_path(checkpoint_path)
             adapter_file = rank_path + "_adapter.pt"
 
             if not os.path.isfile(adapter_file):
@@ -4830,6 +4832,16 @@ class MegatronRankWorker:
             checkpoint = torch.load(adapter_file, map_location="cpu")
             adapter_state = checkpoint.get("adapter_state_dict", {})
             expert_bias_state = checkpoint.get("expert_bias_state_dict", {})
+            if not isinstance(adapter_state, dict):
+                raise RuntimeError(
+                    f"Adapter checkpoint {adapter_file} has invalid adapter_state_dict type "
+                    f"{type(adapter_state).__name__}"
+                )
+            if not isinstance(expert_bias_state, dict):
+                raise RuntimeError(
+                    f"Adapter checkpoint {adapter_file} has invalid expert_bias_state_dict type "
+                    f"{type(expert_bias_state).__name__}"
+                )
 
             # Phase 7: Apply padding if actual_rank < trainer_rank
             if actual_rank is not None and trainer_rank is not None and actual_rank < trainer_rank:
@@ -4846,20 +4858,55 @@ class MegatronRankWorker:
             if isinstance(unwrapped, list):
                 unwrapped = unwrapped[0]
 
+            get_adapter_state_dict = getattr(peft_utils, "get_adapter_state_dict", None)
+            if callable(get_adapter_state_dict):
+                expected_adapter_state = get_adapter_state_dict(self.engine.module)
+                if not isinstance(expected_adapter_state, dict):
+                    raise RuntimeError(
+                        "get_adapter_state_dict returned invalid type "
+                        f"{type(expected_adapter_state).__name__}"
+                    )
+                expected_adapter_keys = set(expected_adapter_state.keys())
+                found_adapter_keys = set(adapter_state.keys())
+                if expected_adapter_keys != found_adapter_keys:
+                    missing_keys = sorted(expected_adapter_keys - found_adapter_keys)
+                    unexpected_keys = sorted(found_adapter_keys - expected_adapter_keys)
+                    raise RuntimeError(
+                        "Adapter checkpoint key mismatch: "
+                        f"missing_keys={missing_keys[:10]} unexpected_keys={unexpected_keys[:10]}"
+                    )
+
+            named_modules = dict(unwrapped.named_modules())
+            expected_expert_bias_keys = {
+                module_name
+                for module_name, module in named_modules.items()
+                if module_name and hasattr(module, "expert_bias") and getattr(module, "expert_bias") is not None
+            }
+            found_expert_bias_keys = {
+                module_name for module_name in expert_bias_state.keys() if isinstance(module_name, str)
+            }
+            if expected_expert_bias_keys != found_expert_bias_keys:
+                missing_keys = sorted(expected_expert_bias_keys - found_expert_bias_keys)
+                unexpected_keys = sorted(found_expert_bias_keys - expected_expert_bias_keys)
+                raise RuntimeError(
+                    "Expert-bias checkpoint key mismatch: "
+                    f"missing_keys={missing_keys[:10]} unexpected_keys={unexpected_keys[:10]}"
+                )
+
             _, unexpected = unwrapped.load_state_dict(adapter_state, strict=False)
             if unexpected:
-                logger.warning(f"[Rank {self.rank}] Unexpected keys in checkpoint: {unexpected[:5]}...")
+                raise RuntimeError(
+                    f"Adapter checkpoint load reported unexpected keys after parity check: {unexpected[:10]}"
+                )
 
-            if isinstance(expert_bias_state, dict):
-                named_modules = dict(unwrapped.named_modules())
-                for module_name, bias_value in expert_bias_state.items():
-                    if not isinstance(module_name, str):
-                        continue
-                    module = named_modules.get(module_name)
-                    if module is None or not hasattr(module, "expert_bias"):
-                        continue
-                    if isinstance(bias_value, torch.Tensor):
-                        module.expert_bias.copy_(bias_value.to(module.expert_bias.device))
+            for module_name, bias_value in expert_bias_state.items():
+                if not isinstance(module_name, str):
+                    continue
+                module = named_modules.get(module_name)
+                if module is None or not hasattr(module, "expert_bias"):
+                    continue
+                if isinstance(bias_value, torch.Tensor):
+                    module.expert_bias.copy_(bias_value.to(module.expert_bias.device))
 
             train_attn = True if train_attn is None else bool(train_attn)
             train_mlp = True if train_mlp is None else bool(train_mlp)

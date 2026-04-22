@@ -139,6 +139,9 @@ async def test_issue_319_save_weights_for_sampler_fails_before_metadata(monkeypa
         _StubFutureStore(resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail),
     )
     monkeypatch.setattr(tr, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
+    monkeypatch.setattr(tr, "get_persistent_cache_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(tr, "get_ephemeral_checkpoints_dir", lambda: str(tmp_path / "ephemeral"))
+    monkeypatch.setattr(tr, "get_persistent_checkpoints_dir", lambda: str(tmp_path / "persistent"))
     request = SaveWeightsForSamplerRequest(model_id="run-319", seq_id=0, path="sampler-bad")
     await tr._do_save_weights_for_sampler(
         request_id="req-319-sampler",
@@ -149,7 +152,7 @@ async def test_issue_319_save_weights_for_sampler_fails_before_metadata(monkeypa
 
     assert failed["request_id"] == "req-319-sampler"
     assert "invalid sampler checkpoint" in failed["error"]
-    assert not (ckpt_dir / "metadata.json").exists()
+    assert not ckpt_dir.exists()
 
 
 @pytest.mark.anyio
@@ -272,6 +275,9 @@ async def test_issue_319_save_weights_for_sampler_rejects_corrupt_safetensors(
         _StubFutureStore(resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail),
     )
     monkeypatch.setattr(tr, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
+    monkeypatch.setattr(tr, "get_persistent_cache_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(tr, "get_ephemeral_checkpoints_dir", lambda: str(tmp_path / "ephemeral"))
+    monkeypatch.setattr(tr, "get_persistent_checkpoints_dir", lambda: str(tmp_path / "persistent"))
     request = SaveWeightsForSamplerRequest(model_id="run-319", seq_id=0, path="sampler-corrupt")
     await tr._do_save_weights_for_sampler(
         request_id="req-319-sampler-corrupt",
@@ -282,7 +288,7 @@ async def test_issue_319_save_weights_for_sampler_rejects_corrupt_safetensors(
 
     assert failed["request_id"] == "req-319-sampler-corrupt"
     assert "Unreadable adapter_model.safetensors" in failed["error"]
-    assert not (ckpt_dir / "metadata.json").exists()
+    assert not ckpt_dir.exists()
 
 
 @pytest.mark.anyio

@@ -749,7 +749,9 @@ def test_issue_193_save_adapter_state_persists_expert_bias(tmp_path, monkeypatch
     worker.save_adapter_state(str(tmp_path))
 
     payload = torch.load(tmp_path / "mp_rank_00_adapter.pt", map_location="cpu")
-    assert payload == {"adapter_state_dict": {"adapter.weight": torch.tensor([3.0])}}
+    assert set(payload.keys()) == {"adapter_state_dict", "expert_bias_state_dict"}
+    assert torch.equal(payload["adapter_state_dict"]["adapter.weight"], torch.tensor([3.0]))
+    assert torch.equal(payload["expert_bias_state_dict"]["router"], torch.tensor([1.5, -0.5]))
 
 
 def test_issue_193_load_adapter_state_restores_expert_bias(tmp_path, monkeypatch):
@@ -770,6 +772,7 @@ def test_issue_193_load_adapter_state_restores_expert_bias(tmp_path, monkeypatch
             self.router = _Router()
 
     chunk = _Chunk()
+    chunk.load_state_dict = lambda state, strict=False: ([], [])  # type: ignore[method-assign]
     worker.engine.module = [chunk]
     worker._freeze_non_lora_params = lambda *_a, **_kw: None  # type: ignore[method-assign]
     worker._zero_disabled_lora_params = lambda *_a, **_kw: None  # type: ignore[method-assign]
@@ -785,12 +788,16 @@ def test_issue_193_load_adapter_state_restores_expert_bias(tmp_path, monkeypatch
 
     adapter_file = tmp_path / "mp_rank_00_adapter.pt"
     torch.save(
-        {"adapter_state_dict": {"adapter.weight": torch.tensor([3.0])}},
+        {
+            "adapter_state_dict": {"adapter.weight": torch.tensor([3.0])},
+            "expert_bias_state_dict": {"router": torch.tensor([3.0, -2.0])},
+        },
         adapter_file,
     )
 
     fake_peft = types.ModuleType("verl.utils.megatron_peft_utils")
     fake_peft._get_rank_checkpoint_path = lambda checkpoint_path: str(tmp_path / "mp_rank_00")  # type: ignore[attr-defined]
+    fake_peft.get_adapter_state_dict = lambda module: {"adapter.weight": torch.tensor([0.0])}  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "verl.utils.megatron_peft_utils", fake_peft)
 
     fake_utils = types.ModuleType("verl.utils.megatron_utils")
@@ -803,8 +810,45 @@ def test_issue_193_load_adapter_state_restores_expert_bias(tmp_path, monkeypatch
 
     worker.load_adapter_state(str(tmp_path))
 
-    assert chunk.router.expert_bias.tolist() == [9.0, 9.0]
+    assert chunk.router.expert_bias.tolist() == [3.0, -2.0]
     assert worker.engine.optimizer.reload_calls == 0
+
+
+def test_issue_193_load_adapter_state_rejects_key_mismatch(tmp_path, monkeypatch):
+    import types
+
+    import pytest
+    import torch
+
+    worker, _ = _make_worker(monkeypatch)
+    worker.engine.module = [torch.nn.Module()]
+    worker._freeze_non_lora_params = lambda *_a, **_kw: None  # type: ignore[method-assign]
+    worker._zero_disabled_lora_params = lambda *_a, **_kw: None  # type: ignore[method-assign]
+
+    adapter_file = tmp_path / "mp_rank_00_adapter.pt"
+    torch.save(
+        {
+            "adapter_state_dict": {"adapter.only_in_checkpoint": torch.tensor([1.0])},
+            "expert_bias_state_dict": {},
+        },
+        adapter_file,
+    )
+
+    fake_peft = types.ModuleType("verl.utils.megatron_peft_utils")
+    fake_peft._get_rank_checkpoint_path = lambda checkpoint_path: str(tmp_path / "mp_rank_00")  # type: ignore[attr-defined]
+    fake_peft.get_adapter_state_dict = lambda module: {"adapter.expected": torch.tensor([0.0])}  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "verl.utils.megatron_peft_utils", fake_peft)
+
+    fake_utils = types.ModuleType("verl.utils.megatron_utils")
+    fake_utils.unwrap_model = lambda model: model  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "verl.utils.megatron_utils", fake_utils)
+
+    fake_lora_utils = types.ModuleType("tinker_server.backend.lora_utils")
+    fake_lora_utils.pad_lora_state_dict = lambda state, *_args, **_kwargs: state  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "tinker_server.backend.lora_utils", fake_lora_utils)
+
+    with pytest.raises(RuntimeError, match="Adapter checkpoint key mismatch"):
+        worker.load_adapter_state(str(tmp_path))
 
 
 # ---------------------------------------------------------------------------

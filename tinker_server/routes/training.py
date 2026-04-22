@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import time
 import uuid
 from datetime import datetime, timezone
@@ -69,7 +70,9 @@ from ..checkpoints import (
     checkpoint_has_optimizer_state,
     async_create_checkpoint_archive,
     ensure_checkpoint_path_allowed,
+    get_ephemeral_checkpoints_dir,
     get_persistent_cache_dir,
+    get_persistent_checkpoints_dir,
     materialize_persistent_checkpoint,
     resolve_checkpoint_path,
     validate_sampler_checkpoint_for_sampling,
@@ -192,6 +195,25 @@ def _get_user_id(request: Request) -> str | None:
 
 def _build_training_usage_label(*, model: str, route: str) -> str:
     return f"model={model},route={route},dimension=train"
+
+
+def _cleanup_generated_checkpoint_dir(path: str | None) -> None:
+    if not path:
+        return
+    try:
+        real = os.path.realpath(path)
+    except Exception:
+        return
+    managed_roots = [
+        os.path.realpath(get_ephemeral_checkpoints_dir()),
+        os.path.realpath(get_persistent_cache_dir()),
+        os.path.realpath(get_persistent_checkpoints_dir()),
+    ]
+    if not any(real == root or real.startswith(root + os.sep) for root in managed_roots):
+        logger.warning("Refusing to cleanup checkpoint outside managed roots: %s", path)
+        return
+    if os.path.isdir(real):
+        shutil.rmtree(real, ignore_errors=True)
 
 
 def _training_heartbeat_stale_timeout_s() -> float:
@@ -3540,6 +3562,9 @@ async def _do_save_weights_for_sampler(
     inflight_marked = False
     claimed_ckpt_id: str | None = None
     mirror_started = False
+    save_path: str | None = None
+    persistent_path: str | None = None
+    sampling_session_id: str | None = None
     try:
         set_request_id(request_id)
         engine = training_engine
@@ -3890,6 +3915,27 @@ async def _do_save_weights_for_sampler(
     except Exception as e:
         if not mirror_started:
             await _mark_checkpoint_failed_safe(claimed_ckpt_id, fail_reason="upload_error")
+        if sampling_session_id is not None and inference_manager is not None:
+            try:
+                await inference_manager.end_session(sampling_session_id)
+            except Exception as cleanup_error:
+                logger.warning(
+                    "[save_weights_for_sampler] failed to cleanup sampling session %s: %s: %s",
+                    sampling_session_id,
+                    type(cleanup_error).__name__,
+                    cleanup_error,
+                )
+        if not mirror_started:
+            for candidate in (persistent_path, save_path):
+                try:
+                    _cleanup_generated_checkpoint_dir(candidate)
+                except Exception as cleanup_error:
+                    logger.warning(
+                        "[save_weights_for_sampler] failed to cleanup checkpoint path %s: %s: %s",
+                        candidate,
+                        type(cleanup_error).__name__,
+                        cleanup_error,
+                    )
         logger.exception(
             "[save_weights_for_sampler] failed request_id=%s model_id=%s failure_reason=%s error_type=%s next_action=%s",
             str(request_id),
