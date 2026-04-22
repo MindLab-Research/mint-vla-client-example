@@ -6675,7 +6675,7 @@ class MegatronWorkerGroup:
                 if save_persisted_actor_only_state is not None:
                     save_persisted_actor_only_state(
                         outgoing_session_id,
-                        actor_name=_make_megatron_actor_name(self.base_model),
+                        actor_name=_make_megatron_actor_name(str(getattr(self, "base_model", "unknown"))),
                         worker_entries=persisted_entries,
                     )
                 clear_actor_only_state = getattr(self._session_manager, "clear_actor_only_state", None)
@@ -7118,21 +7118,18 @@ class MegatronWorkerGroup:
             t3 = time.perf_counter() if timing else 0.0
         finally:
             self._stop_slow_group_watchdog(watchdog)
-        self._session_manager.mark_actor_only_state(
-            effective_session_id,
-            reason="forward_backward",
-            actor_name=_make_megatron_actor_name(self.base_model),
-        )
-        invalidate_external_checkpoint = getattr(
-            self._session_manager,
-            "invalidate_external_checkpoint",
-            None,
-        )
-        if invalidate_external_checkpoint is not None:
-            invalidate_external_checkpoint(
+        session_manager = getattr(self, "_session_manager", None)
+        mark_actor_only_state = getattr(session_manager, "mark_actor_only_state", None)
+        if callable(mark_actor_only_state):
+            mark_actor_only_state(
                 effective_session_id,
                 reason="forward_backward",
+                actor_name=_make_megatron_actor_name(str(getattr(self, "base_model", "unknown"))),
             )
+        self._invalidate_session_durability(
+            effective_session_id,
+            reason="forward_backward",
+        )
         if timing:
             logger.info(
                 f"[MegatronWorkerGroup] forward_backward timing: "
@@ -7598,21 +7595,18 @@ class MegatronWorkerGroup:
         lr = rank0_result.get("lr", learning_rate)
 
         self._step_count += 1
-        self._session_manager.mark_actor_only_state(
-            effective_session_id,
-            reason="optim_step",
-            actor_name=_make_megatron_actor_name(self.base_model),
-        )
-        invalidate_external_checkpoint = getattr(
-            self._session_manager,
-            "invalidate_external_checkpoint",
-            None,
-        )
-        if invalidate_external_checkpoint is not None:
-            invalidate_external_checkpoint(
+        session_manager = getattr(self, "_session_manager", None)
+        mark_actor_only_state = getattr(session_manager, "mark_actor_only_state", None)
+        if callable(mark_actor_only_state):
+            mark_actor_only_state(
                 effective_session_id,
                 reason="optim_step",
+                actor_name=_make_megatron_actor_name(str(getattr(self, "base_model", "unknown"))),
             )
+        self._invalidate_session_durability(
+            effective_session_id,
+            reason="optim_step",
+        )
 
         print(
             f"[MegatronWorkerGroup] optim_step: grad_norm={grad_norm:.4f}, "
@@ -8081,7 +8075,7 @@ class MegatronWorkerGroup:
                 session_manager.mark_actor_only_state(
                     effective_session_id,
                     reason="load_weights",
-                    actor_name=_make_megatron_actor_name(self.base_model),
+                    actor_name=_make_megatron_actor_name(str(getattr(self, "base_model", "unknown"))),
                 )
 
         self._step_count = checkpoint_step
@@ -8103,7 +8097,7 @@ class MegatronWorkerGroup:
                         effective_session_id,
                         checkpoint_path=load_path,
                         reason="load_checkpoint",
-                        actor_name=_make_megatron_actor_name(self.base_model),
+                        actor_name=_make_megatron_actor_name(str(getattr(self, "base_model", "unknown"))),
                         checkpoint_identity=checkpoint_identity,
                     )
                 except TypeError:
@@ -8111,7 +8105,7 @@ class MegatronWorkerGroup:
                         effective_session_id,
                         checkpoint_path=load_path,
                         reason="load_checkpoint",
-                        actor_name=_make_megatron_actor_name(self.base_model),
+                        actor_name=_make_megatron_actor_name(str(getattr(self, "base_model", "unknown"))),
                     )
             mark_trusted_recovery_baseline = getattr(
                 session_manager,
@@ -8124,7 +8118,7 @@ class MegatronWorkerGroup:
                     checkpoint_path=load_path,
                     checkpoint_identity=checkpoint_identity,
                     reason="load_checkpoint",
-                    actor_name=_make_megatron_actor_name(self.base_model),
+                    actor_name=_make_megatron_actor_name(str(getattr(self, "base_model", "unknown"))),
                 )
 
         self._clear_session_guards(effective_session_id)
@@ -8228,7 +8222,7 @@ class MegatronWorkerGroup:
                     effective_session_id,
                     checkpoint_path=save_path,
                     reason="save_checkpoint",
-                    actor_name=_make_megatron_actor_name(self.base_model),
+                    actor_name=_make_megatron_actor_name(str(getattr(self, "base_model", "unknown"))),
                     checkpoint_identity=checkpoint_identity,
                 )
             except TypeError:
@@ -8236,7 +8230,7 @@ class MegatronWorkerGroup:
                     effective_session_id,
                     checkpoint_path=save_path,
                     reason="save_checkpoint",
-                    actor_name=_make_megatron_actor_name(self.base_model),
+                    actor_name=_make_megatron_actor_name(str(getattr(self, "base_model", "unknown"))),
                 )
         mark_trusted_recovery_baseline = getattr(
             session_manager,
@@ -8249,7 +8243,7 @@ class MegatronWorkerGroup:
                 checkpoint_path=save_path,
                 checkpoint_identity=checkpoint_identity,
                 reason="save_checkpoint",
-                actor_name=_make_megatron_actor_name(self.base_model),
+                actor_name=_make_megatron_actor_name(str(getattr(self, "base_model", "unknown"))),
             )
         if session_manager is not None:
             prime_session = getattr(session_manager, "prime_session", None)
@@ -8360,7 +8354,7 @@ class MegatronWorkerGroup:
         )
 
     def _get_session_cache_store_diagnostics(self) -> dict:
-        actor_name = _make_megatron_actor_name(self.base_model)
+        actor_name = _make_megatron_actor_name(str(getattr(self, "base_model", "unknown")))
         get_cache_usage = getattr(self._session_manager, "get_cache_usage", None)
         if get_cache_usage is None:
             return {
@@ -8410,7 +8404,7 @@ class MegatronWorkerGroup:
             ),
             None,
         )
-        actor_name = _make_megatron_actor_name(self.base_model)
+        actor_name = _make_megatron_actor_name(str(getattr(self, "base_model", "unknown")))
         persisted = getattr(
             self._session_manager,
             "list_persisted_actor_only_state",
@@ -8788,7 +8782,7 @@ class MegatronWorkerGroup:
                 session_manager.mark_actor_only_state(
                     session_id,
                     reason="load_weights",
-                    actor_name=_make_megatron_actor_name(self.base_model),
+                    actor_name=_make_megatron_actor_name(str(getattr(self, "base_model", "unknown"))),
                 )
             else:
                 clear_actor_only_state = getattr(session_manager, "clear_actor_only_state", None)
