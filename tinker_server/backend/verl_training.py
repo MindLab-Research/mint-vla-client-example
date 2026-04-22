@@ -1638,6 +1638,52 @@ class VerlTrainingEngine:
         self._actor_loaded_sessions: dict[str, str] = {}
         self._actor_volatile_sessions: dict[str, set[str]] = {}
 
+    def _megatron_guard_preflight_enabled(self) -> bool:
+        raw = os.environ.get("MINT_MEGATRON_GUARD_PREFLIGHT", "1").strip().lower()
+        return raw not in ("0", "false", "no", "off")
+
+    async def _ensure_megatron_session_guard_clean(
+        self,
+        session: "TrainingSession",
+        *,
+        op: str,
+        worker: ray.actor.ActorHandle,
+    ) -> None:
+        if session.backend != "megatron" or not self._megatron_guard_preflight_enabled():
+            return
+        get_guard_state = getattr(worker, "get_session_guard_state", None)
+        if get_guard_state is None:
+            return
+        try:
+            guard_state = await self._await_with_keepalive(
+                get_guard_state.remote(session.model_id),
+                session,
+                interval_s=30.0,
+                timeout_s=30.0,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"[{session.model_id}] failed to query megatron session guard before op={op}: "
+                f"{type(e).__name__}: {e}"
+            ) from e
+        if not isinstance(guard_state, dict):
+            raise RuntimeError(
+                f"[{session.model_id}] invalid megatron session guard payload type "
+                f"{type(guard_state).__name__} before op={op}"
+            )
+        contaminated = bool(guard_state.get("contaminated", False))
+        blocked = bool(guard_state.get("blocked", False))
+        if not contaminated and not blocked:
+            return
+        contamination_reason = guard_state.get("contamination_reason")
+        block_reason = guard_state.get("block_reason")
+        raise RuntimeError(
+            f"[{session.model_id}] megatron session guard denied op={op}: "
+            f"contaminated={contaminated} blocked={blocked} "
+            f"contamination_reason={contamination_reason!r} block_reason={block_reason!r}; "
+            "requires clean reload"
+        )
+
     async def initialize(self) -> None:
         """Initialize Ray connection."""
         if not ray.is_initialized():
@@ -2312,6 +2358,11 @@ class VerlTrainingEngine:
 
         # Mark actor as recently used to prevent LRU eviction during training
         self._touch_actor(session)
+        await self._ensure_megatron_session_guard_clean(
+            session,
+            op="forward_backward",
+            worker=worker,
+        )
 
         # Serialize data for Ray
         data_items = [item.model_dump() for item in request.forward_backward_input.data]
@@ -2520,6 +2571,11 @@ class VerlTrainingEngine:
 
         # Mark actor as recently used to prevent LRU eviction during training
         self._touch_actor(session)
+        await self._ensure_megatron_session_guard_clean(
+            session,
+            op="forward",
+            worker=worker,
+        )
 
         # Serialize data for Ray
         # ForwardRequest uses forward_input (not forward_backward_input)
@@ -2587,6 +2643,11 @@ class VerlTrainingEngine:
 
         # Mark actor as recently used to prevent LRU eviction during training
         self._touch_actor(session)
+        await self._ensure_megatron_session_guard_clean(
+            session,
+            op="optim_step",
+            worker=worker,
+        )
 
         # Extract learning rate
         lr = request.adam_params.learning_rate if request.adam_params else None
@@ -2650,6 +2711,11 @@ class VerlTrainingEngine:
 
         # Mark actor as recently used to prevent LRU eviction during training
         self._touch_actor(session)
+        await self._ensure_megatron_session_guard_clean(
+            session,
+            op="train_step",
+            worker=worker,
+        )
 
         # Serialize data for Ray
         data_items = [item.model_dump() for item in request.forward_backward_input.data]
@@ -2794,6 +2860,11 @@ class VerlTrainingEngine:
 
         # Mark actor as recently used
         self._touch_actor(session)
+        await self._ensure_megatron_session_guard_clean(
+            session,
+            op="reset_expert_bias",
+            worker=worker,
+        )
 
         logger.info(f"[{model_id}] reset_expert_bias: calling worker...")
 
@@ -2913,6 +2984,11 @@ class VerlTrainingEngine:
 
         model_id = session.model_id
         worker = await self._get_live_worker(session, op="save_lora_weights_for_sampler")
+        await self._ensure_megatron_session_guard_clean(
+            session,
+            op="save_lora_weights_for_sampler",
+            worker=worker,
+        )
         abs_path = os.path.abspath(save_path)
 
         try:
@@ -3009,6 +3085,11 @@ class VerlTrainingEngine:
 
         model_id = session.model_id
         worker = await self._get_live_worker(session, op="save_weights")
+        await self._ensure_megatron_session_guard_clean(
+            session,
+            op="save_weights",
+            worker=worker,
+        )
         abs_path = os.path.abspath(save_path)
 
         # Save on worker - returns metadata
