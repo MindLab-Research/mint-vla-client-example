@@ -5125,6 +5125,9 @@ class MegatronSessionStateManager:
 
     def _external_checkpoint_marker_path(self, session_id: str) -> str:
         return os.path.join(self.base_path, f"{session_id}_external_checkpoint.json")
+
+    def _trusted_recovery_baseline_path(self, session_id: str) -> str:
+        return os.path.join(self.base_path, f"{session_id}_trusted_recovery_baseline.json")
     def session_exists(self, session_id: str) -> bool:
         """Check if a session has saved adapter state."""
         session_path = self.get_session_path(session_id)
@@ -5261,6 +5264,7 @@ class MegatronSessionStateManager:
         checkpoint_path: str,
         reason: str,
         actor_name: str | None = None,
+        checkpoint_identity: str | None = None,
     ) -> dict:
         session_path = self.get_session_path(session_id)
         os.makedirs(session_path, exist_ok=True)
@@ -5268,6 +5272,7 @@ class MegatronSessionStateManager:
         tmp_path = f"{marker_path}.tmp"
         payload = {
             "checkpoint_path": str(checkpoint_path),
+            "checkpoint_identity": checkpoint_identity or self.checkpoint_identity(checkpoint_path),
             "reason": str(reason),
             "actor_name": None if actor_name is None else str(actor_name),
             "updated_at": time.time(),
@@ -5306,6 +5311,65 @@ class MegatronSessionStateManager:
 
     def clear_external_checkpoint(self, session_id: str) -> None:
         marker_path = self._external_checkpoint_marker_path(session_id)
+        try:
+            os.remove(marker_path)
+        except FileNotFoundError:
+            return
+
+    def mark_trusted_recovery_baseline(
+        self,
+        session_id: str,
+        *,
+        checkpoint_path: str,
+        checkpoint_identity: str,
+        reason: str,
+        actor_name: str | None = None,
+    ) -> dict:
+        session_path = self.get_session_path(session_id)
+        os.makedirs(session_path, exist_ok=True)
+        marker_path = self._trusted_recovery_baseline_path(session_id)
+        tmp_path = f"{marker_path}.tmp"
+        payload = {
+            "checkpoint_path": str(checkpoint_path),
+            "checkpoint_identity": str(checkpoint_identity),
+            "reason": str(reason),
+            "actor_name": None if actor_name is None else str(actor_name),
+            "updated_at": time.time(),
+            "is_fresh": True,
+            "invalidated_at": None,
+            "invalidated_reason": None,
+        }
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.replace(tmp_path, marker_path)
+        self._maybe_recycle_cache()
+        return payload
+
+    def get_trusted_recovery_baseline(self, session_id: str) -> dict | None:
+        marker_path = self._trusted_recovery_baseline_path(session_id)
+        if not os.path.exists(marker_path):
+            return None
+        return self._read_trusted_recovery_baseline(marker_path)
+
+    def invalidate_trusted_recovery_baseline(self, session_id: str, *, reason: str) -> dict | None:
+        marker_path = self._trusted_recovery_baseline_path(session_id)
+        if not os.path.exists(marker_path):
+            return None
+        payload = self._read_trusted_recovery_baseline(marker_path)
+        if not payload.get("is_fresh", False) and payload.get("invalidated_reason") == str(reason):
+            return payload
+        payload["is_fresh"] = False
+        payload["invalidated_at"] = time.time()
+        payload["invalidated_reason"] = str(reason)
+        tmp_path = f"{marker_path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.replace(tmp_path, marker_path)
+        self._maybe_recycle_cache()
+        return payload
+
+    def clear_trusted_recovery_baseline(self, session_id: str) -> None:
+        marker_path = self._trusted_recovery_baseline_path(session_id)
         try:
             os.remove(marker_path)
         except FileNotFoundError:
@@ -5412,9 +5476,26 @@ class MegatronSessionStateManager:
             raise RuntimeError(
                 f"Invalid external checkpoint marker invalidated_reason={invalidated_reason!r} in {marker_path}"
             )
+        checkpoint_identity = payload.get("checkpoint_identity")
+        if checkpoint_identity is not None and (
+            not isinstance(checkpoint_identity, str) or not checkpoint_identity
+        ):
+            raise RuntimeError(
+                f"Invalid external checkpoint marker checkpoint_identity={checkpoint_identity!r} in {marker_path}"
+            )
         payload["is_fresh"] = is_fresh
         payload["invalidated_at"] = invalidated_at
         payload["invalidated_reason"] = invalidated_reason
+        payload["checkpoint_identity"] = checkpoint_identity
+        return payload
+
+    def _read_trusted_recovery_baseline(self, marker_path: str) -> dict:
+        payload = self._read_external_checkpoint(marker_path)
+        checkpoint_identity = payload.get("checkpoint_identity")
+        if not isinstance(checkpoint_identity, str) or not checkpoint_identity:
+            raise RuntimeError(
+                f"Invalid trusted recovery baseline checkpoint_identity={checkpoint_identity!r} in {marker_path}"
+            )
         return payload
 
     def _read_persisted_actor_only_state(self, manifest_path: str) -> dict:
@@ -5824,6 +5905,7 @@ class MegatronSessionStateManager:
                 shutil.rmtree(session_path)
             deleted = True
         self.clear_external_checkpoint(session_id)
+        self.clear_trusted_recovery_baseline(session_id)
         if session_id in self._session_metadata:
             del self._session_metadata[session_id]
             deleted = True
@@ -5878,6 +5960,8 @@ class MegatronWorkerGroup:
         self._observability_gpu_bindings_cache: list[dict[str, object]] = []
         self._observability_memory_cache: dict[str, int] = {}
         self._session_manager = MegatronSessionStateManager()  # Issue #44: session state management
+        self._contaminated_sessions: dict[str, str] = {}
+        self._blocked_sessions: dict[str, str] = {}
         self._master_addr: str | None = None
         self._master_port: int | None = None
         self._placement_bundle_node_ips: list[str | None] = []
@@ -5999,10 +6083,20 @@ class MegatronWorkerGroup:
                 return list(futures)
             raise
         except ray.exceptions.GetTimeoutError as e:
+            self._mark_session_contaminated(
+                session_id,
+                reason=f"{op}:group_timeout:{timeout_s}s",
+            )
             raise RuntimeError(
                 f"Megatron worker group {op} timed out after {timeout_s}s "
                 f"session_id={session_id!r} workers={len(self.workers)}"
             ) from e
+        except Exception as e:
+            self._mark_session_contaminated(
+                session_id,
+                reason=f"{op}:group_error:{type(e).__name__}",
+            )
+            raise
 
     def _initialize(self):
         """Create placement group, spawn workers, then initialize them all together."""
@@ -6760,6 +6854,110 @@ class MegatronWorkerGroup:
             )
         return effective_session_id
 
+    def _contaminated_map(self) -> dict[str, str]:
+        mapping = getattr(self, "_contaminated_sessions", None)
+        if not isinstance(mapping, dict):
+            mapping = {}
+            self._contaminated_sessions = mapping
+        return mapping
+
+    def _blocked_map(self) -> dict[str, str]:
+        mapping = getattr(self, "_blocked_sessions", None)
+        if not isinstance(mapping, dict):
+            mapping = {}
+            self._blocked_sessions = mapping
+        return mapping
+
+    def _mark_session_contaminated(self, session_id: str | None, *, reason: str) -> None:
+        if session_id is None:
+            return
+        self._contaminated_map()[session_id] = str(reason)
+        self._invalidate_session_durability(
+            session_id,
+            reason=f"contaminated:{reason}",
+            preserve_existing_reason=True,
+        )
+
+    def _mark_session_blocked(self, session_id: str | None, *, reason: str) -> None:
+        if session_id is None:
+            return
+        self._blocked_map()[session_id] = str(reason)
+
+    def _clear_session_guards(self, session_id: str | None) -> None:
+        if session_id is None:
+            return
+        self._contaminated_map().pop(session_id, None)
+        self._blocked_map().pop(session_id, None)
+
+    def _assert_session_request_allowed(self, session_id: str, *, op: str) -> None:
+        blocked_reason = self._blocked_map().get(session_id)
+        if blocked_reason is not None:
+            raise RuntimeError(
+                f"session {session_id} is blocked for {op}: {blocked_reason}; "
+                "requires clean reload or reinitialization"
+            )
+        contaminated_reason = self._contaminated_map().get(session_id)
+        if contaminated_reason is not None:
+            raise RuntimeError(
+                f"session {session_id} is contaminated for {op}: {contaminated_reason}; "
+                "requires clean reload or reinitialization"
+            )
+
+    def _strict_trusted_pair_enforced(self) -> bool:
+        raw = os.environ.get("MINT_MEGATRON_ENFORCE_TRUSTED_PAIR", "0").strip().lower()
+        return raw not in ("0", "false", "no", "off")
+
+    def _validate_trusted_pair_for_request(self, session_id: str, *, op: str) -> None:
+        session_manager = getattr(self, "_session_manager", None)
+        if session_manager is None:
+            return
+        get_external_checkpoint = getattr(session_manager, "get_external_checkpoint", None)
+        get_recovery_baseline = getattr(session_manager, "get_trusted_recovery_baseline", None)
+        if not callable(get_external_checkpoint) and not callable(get_recovery_baseline):
+            return
+
+        external = get_external_checkpoint(session_id) if callable(get_external_checkpoint) else None
+        baseline = get_recovery_baseline(session_id) if callable(get_recovery_baseline) else None
+
+        strict = self._strict_trusted_pair_enforced()
+
+        if isinstance(external, dict) and not bool(external.get("is_fresh", False)):
+            reason = f"external_checkpoint_stale:{external.get('invalidated_reason') or 'unknown'}"
+            self._mark_session_blocked(session_id, reason=reason)
+            raise RuntimeError(
+                f"session {session_id} blocked for {op}: external checkpoint stale ({reason})"
+            )
+        if isinstance(baseline, dict) and not bool(baseline.get("is_fresh", False)):
+            reason = f"trusted_recovery_baseline_stale:{baseline.get('invalidated_reason') or 'unknown'}"
+            self._mark_session_blocked(session_id, reason=reason)
+            raise RuntimeError(
+                f"session {session_id} blocked for {op}: trusted recovery baseline stale ({reason})"
+            )
+
+        has_external = isinstance(external, dict)
+        has_baseline = isinstance(baseline, dict)
+        if has_external and has_baseline:
+            external_identity = external.get("checkpoint_identity")
+            baseline_identity = baseline.get("checkpoint_identity")
+            if (
+                isinstance(external_identity, str)
+                and isinstance(baseline_identity, str)
+                and external_identity
+                and baseline_identity
+                and external_identity != baseline_identity
+            ):
+                reason = f"trusted_pair_mismatch:{external_identity[:8]}!={baseline_identity[:8]}"
+                self._mark_session_blocked(session_id, reason=reason)
+                raise RuntimeError(
+                    f"session {session_id} blocked for {op}: trusted pair checkpoint_identity mismatch"
+                )
+        elif strict and (has_external or has_baseline):
+            reason = "trusted_pair_missing_counterpart"
+            self._mark_session_blocked(session_id, reason=reason)
+            raise RuntimeError(
+                f"session {session_id} blocked for {op}: strict trusted-pair enforcement requires both markers"
+            )
+
     def _invalidate_session_durability(
         self,
         session_id: str | None,
@@ -6778,14 +6976,32 @@ class MegatronWorkerGroup:
                 marker = get_external_checkpoint(session_id)
                 if isinstance(marker, dict) and not bool(marker.get("is_fresh", False)):
                     return marker
+            get_trusted_recovery_baseline = getattr(
+                session_manager,
+                "get_trusted_recovery_baseline",
+                None,
+            )
+            if callable(get_trusted_recovery_baseline):
+                baseline = get_trusted_recovery_baseline(session_id)
+                if isinstance(baseline, dict) and not bool(baseline.get("is_fresh", False)):
+                    return baseline
         invalidate_external_checkpoint = getattr(
             session_manager,
             "invalidate_external_checkpoint",
             None,
         )
-        if invalidate_external_checkpoint is None:
-            return None
-        return invalidate_external_checkpoint(session_id, reason=reason)
+        marker = None
+        if callable(invalidate_external_checkpoint):
+            marker = invalidate_external_checkpoint(session_id, reason=reason)
+
+        invalidate_trusted_recovery_baseline = getattr(
+            session_manager,
+            "invalidate_trusted_recovery_baseline",
+            None,
+        )
+        if callable(invalidate_trusted_recovery_baseline):
+            invalidate_trusted_recovery_baseline(session_id, reason=reason)
+        return marker
 
     def _ensure_session_for_request(
         self,
@@ -6800,14 +7016,23 @@ class MegatronWorkerGroup:
     ) -> tuple[str, dict[str, object]]:
         """Resolve and restore session state for forward/backward/step style requests."""
         effective_session_id = self._resolve_required_session_id(session_id, op=op)
-        switch_stats = self._ensure_session_loaded(
-            effective_session_id,
-            traceparent=traceparent,
-            actual_rank=actual_rank,
-            train_attn=train_attn,
-            train_mlp=train_mlp,
-            train_unembed=train_unembed,
-        )
+        self._assert_session_request_allowed(effective_session_id, op=op)
+        self._validate_trusted_pair_for_request(effective_session_id, op=op)
+        try:
+            switch_stats = self._ensure_session_loaded(
+                effective_session_id,
+                traceparent=traceparent,
+                actual_rank=actual_rank,
+                train_attn=train_attn,
+                train_mlp=train_mlp,
+                train_unembed=train_unembed,
+            )
+        except Exception as e:
+            self._mark_session_contaminated(
+                effective_session_id,
+                reason=f"{op}:ensure_session_loaded:{type(e).__name__}",
+            )
+            raise
         if not isinstance(switch_stats, dict):
             switch_stats = dict(getattr(self, "_last_session_switch_stats", None) or {})
         return effective_session_id, switch_stats
@@ -7862,19 +8087,47 @@ class MegatronWorkerGroup:
         self._step_count = checkpoint_step
         self.learning_rate = checkpoint_lr
         if load_optimizer:
+            checkpoint_identity = None
+            if session_manager is not None:
+                checkpoint_identity_fn = getattr(session_manager, "checkpoint_identity", None)
+                if callable(checkpoint_identity_fn):
+                    checkpoint_identity = checkpoint_identity_fn(load_path)
             mark_external_checkpoint = getattr(
                 session_manager,
                 "mark_external_checkpoint",
                 None,
             )
             if mark_external_checkpoint is not None:
-                mark_external_checkpoint(
+                try:
+                    mark_external_checkpoint(
+                        effective_session_id,
+                        checkpoint_path=load_path,
+                        reason="load_checkpoint",
+                        actor_name=_make_megatron_actor_name(self.base_model),
+                        checkpoint_identity=checkpoint_identity,
+                    )
+                except TypeError:
+                    mark_external_checkpoint(
+                        effective_session_id,
+                        checkpoint_path=load_path,
+                        reason="load_checkpoint",
+                        actor_name=_make_megatron_actor_name(self.base_model),
+                    )
+            mark_trusted_recovery_baseline = getattr(
+                session_manager,
+                "mark_trusted_recovery_baseline",
+                None,
+            )
+            if callable(mark_trusted_recovery_baseline) and isinstance(checkpoint_identity, str):
+                mark_trusted_recovery_baseline(
                     effective_session_id,
                     checkpoint_path=load_path,
+                    checkpoint_identity=checkpoint_identity,
                     reason="load_checkpoint",
                     actor_name=_make_megatron_actor_name(self.base_model),
                 )
 
+        self._clear_session_guards(effective_session_id)
         return result
 
 
@@ -7905,14 +8158,23 @@ class MegatronWorkerGroup:
             session_id,
             op="save_checkpoint",
         )
-        self._ensure_session_loaded(
-            effective_session_id,
-            traceparent=traceparent,
-            actual_rank=actual_rank,
-            train_attn=train_attn,
-            train_mlp=train_mlp,
-            train_unembed=train_unembed,
-        )
+        self._assert_session_request_allowed(effective_session_id, op="save_checkpoint")
+        self._validate_trusted_pair_for_request(effective_session_id, op="save_checkpoint")
+        try:
+            self._ensure_session_loaded(
+                effective_session_id,
+                traceparent=traceparent,
+                actual_rank=actual_rank,
+                train_attn=train_attn,
+                train_mlp=train_mlp,
+                train_unembed=train_unembed,
+            )
+        except Exception as e:
+            self._mark_session_contaminated(
+                effective_session_id,
+                reason=f"save_checkpoint:ensure_session_loaded:{type(e).__name__}",
+            )
+            raise
 
         logger.info(
             f"[MegatronWorkerGroup] save_checkpoint: {save_path} "
@@ -7955,10 +8217,37 @@ class MegatronWorkerGroup:
             "mark_external_checkpoint",
             None,
         )
+        checkpoint_identity = None
+        if session_manager is not None:
+            checkpoint_identity_fn = getattr(session_manager, "checkpoint_identity", None)
+            if callable(checkpoint_identity_fn):
+                checkpoint_identity = checkpoint_identity_fn(save_path)
         if mark_external_checkpoint is not None:
-            mark_external_checkpoint(
+            try:
+                mark_external_checkpoint(
+                    effective_session_id,
+                    checkpoint_path=save_path,
+                    reason="save_checkpoint",
+                    actor_name=_make_megatron_actor_name(self.base_model),
+                    checkpoint_identity=checkpoint_identity,
+                )
+            except TypeError:
+                mark_external_checkpoint(
+                    effective_session_id,
+                    checkpoint_path=save_path,
+                    reason="save_checkpoint",
+                    actor_name=_make_megatron_actor_name(self.base_model),
+                )
+        mark_trusted_recovery_baseline = getattr(
+            session_manager,
+            "mark_trusted_recovery_baseline",
+            None,
+        )
+        if callable(mark_trusted_recovery_baseline) and isinstance(checkpoint_identity, str):
+            mark_trusted_recovery_baseline(
                 effective_session_id,
                 checkpoint_path=save_path,
+                checkpoint_identity=checkpoint_identity,
                 reason="save_checkpoint",
                 actor_name=_make_megatron_actor_name(self.base_model),
             )
@@ -7979,6 +8268,7 @@ class MegatronWorkerGroup:
             clear_actor_only_state = getattr(session_manager, "clear_actor_only_state", None)
             if clear_actor_only_state is not None:
                 clear_actor_only_state(effective_session_id)
+        self._clear_session_guards(effective_session_id)
         logger.info(f"[MegatronWorkerGroup] save_checkpoint: completed, step={result.get('current_step', 'unknown')}")
         return result
 
@@ -8002,14 +8292,23 @@ class MegatronWorkerGroup:
             session_id,
             op="save_lora_weights",
         )
-        self._ensure_session_loaded(
-            effective_session_id,
-            traceparent=traceparent,
-            actual_rank=actual_rank,
-            train_attn=train_attn,
-            train_mlp=train_mlp,
-            train_unembed=train_unembed,
-        )
+        self._assert_session_request_allowed(effective_session_id, op="save_lora_weights")
+        self._validate_trusted_pair_for_request(effective_session_id, op="save_lora_weights")
+        try:
+            self._ensure_session_loaded(
+                effective_session_id,
+                traceparent=traceparent,
+                actual_rank=actual_rank,
+                train_attn=train_attn,
+                train_mlp=train_mlp,
+                train_unembed=train_unembed,
+            )
+        except Exception as e:
+            self._mark_session_contaminated(
+                effective_session_id,
+                reason=f"save_lora_weights:ensure_session_loaded:{type(e).__name__}",
+            )
+            raise
 
         logger.info(
             f"[MegatronWorkerGroup] save_lora_weights: {save_path} "
@@ -8539,6 +8838,7 @@ class MegatronWorkerGroup:
         self._bind_traceparent(traceparent)
         ray.get([w.clear_session_state.remote(session_id, traceparent=traceparent) for w in self.workers])
         deleted = self._session_manager.delete_session(session_id)
+        self._clear_session_guards(session_id)
         if self._current_session == session_id:
             self._current_session = None
             self._session_unknown_due_to_partial_swap = False
