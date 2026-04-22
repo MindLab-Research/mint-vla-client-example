@@ -2624,6 +2624,45 @@ class VerlTrainingEngine:
 
         return result
 
+    async def get_session_guard_state(
+        self,
+        session: TrainingSession,
+    ) -> dict:
+        if session.backend != "megatron":
+            return {
+                "session_id": session.model_id,
+                "contaminated": False,
+                "blocked": False,
+                "contamination_reason": None,
+                "block_reason": None,
+                "external_checkpoint": None,
+                "trusted_recovery_baseline": None,
+            }
+        worker = await self._get_live_worker(session, op="get_session_guard_state")
+        get_guard_state = getattr(worker, "get_session_guard_state", None)
+        if get_guard_state is None:
+            return {
+                "session_id": session.model_id,
+                "contaminated": False,
+                "blocked": False,
+                "contamination_reason": None,
+                "block_reason": None,
+                "external_checkpoint": None,
+                "trusted_recovery_baseline": None,
+            }
+        self._touch_actor(session)
+        state = await self._await_with_keepalive(
+            get_guard_state.remote(session.model_id),
+            session,
+            interval_s=30.0,
+            timeout_s=30.0,
+        )
+        if not isinstance(state, dict):
+            raise RuntimeError(
+                f"[{session.model_id}] invalid get_session_guard_state payload type={type(state).__name__}"
+            )
+        return state
+
     async def optim_step(
         self,
         session: TrainingSession,

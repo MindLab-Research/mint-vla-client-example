@@ -97,3 +97,60 @@ def test_issue_527_verl_forward_allows_clean_guard(monkeypatch):
     result = asyncio.run(_run())
     assert result["loss_fn_outputs"][0]["loss"]["data"] == [0.0]
     assert len(worker.forward.calls) == 1
+
+
+def test_issue_527_verl_get_session_guard_state_reads_worker(monkeypatch):
+    engine = VerlTrainingEngine()
+    session = TrainingSession(
+        model_id="model_issue_527_guard_query",
+        session_id="session_issue_527_guard_query",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        backend="megatron",
+    )
+    worker = _FakeGuardedForwardWorker(
+        guard_ref="guard-ref",
+        forward_ref="forward-ref",
+    )
+
+    async def fake_get_live_worker(*args, **kwargs):
+        return worker
+
+    async def fake_keepalive(awaitable, *_args, **_kwargs):
+        assert awaitable == "guard-ref"
+        return {
+            "session_id": session.model_id,
+            "contaminated": True,
+            "blocked": False,
+            "contamination_reason": "optim_step:group_timeout:600s",
+            "block_reason": None,
+        }
+
+    monkeypatch.setattr(engine, "_get_live_worker", fake_get_live_worker)
+    monkeypatch.setattr(engine, "_await_with_keepalive", fake_keepalive)
+    monkeypatch.setattr(engine, "_touch_actor", lambda *_args, **_kwargs: None)
+
+    async def _run():
+        return await engine.get_session_guard_state(session)
+
+    state = asyncio.run(_run())
+    assert state["contaminated"] is True
+    assert state["contamination_reason"] == "optim_step:group_timeout:600s"
+
+
+def test_issue_527_verl_get_session_guard_state_returns_clean_for_dense_backend():
+    engine = VerlTrainingEngine()
+    session = TrainingSession(
+        model_id="model_issue_527_guard_dense",
+        session_id="session_issue_527_guard_dense",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-0.6B",
+        backend="peft",
+    )
+
+    async def _run():
+        return await engine.get_session_guard_state(session)
+
+    state = asyncio.run(_run())
+    assert state["contaminated"] is False
+    assert state["blocked"] is False

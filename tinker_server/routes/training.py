@@ -14,6 +14,7 @@ Endpoints:
 - GET /models: List training models
 - GET /models/{model_id}: Get model info
 - GET /models/{model_id}/tokenizer: Get tokenizer config
+- GET /models/{model_id}/session_guard_state: Get contamination/block guard state
 - DELETE /models/{model_id}: Delete a model
 """
 
@@ -4078,6 +4079,26 @@ async def get_model_info(model_id: str):
         "user_id": info.get("user_id"),
         "last_activity": info.get("last_activity"),
         "idle_for_s": max(0.0, time.time() - float(info.get("last_activity") or 0.0)) if info.get("last_activity") is not None else None,
+    }
+
+
+@router.get("/models/{model_id}/session_guard_state")
+async def get_session_guard_state(model_id: str):
+    """Get megatron contamination/block guard state for one training model."""
+    if training_manager is None or training_engine is None:
+        raise HTTPException(status_code=503, detail="Training manager not initialized")
+
+    session = training_manager.get_session(model_id)
+    if session is None:
+        session = await _restore_training_session(model_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
+
+    guard_state = await training_engine.get_session_guard_state(session)
+    return {
+        "model_id": model_id,
+        "backend": session.backend,
+        "guard_state": guard_state,
     }
 
 
