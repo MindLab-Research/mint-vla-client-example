@@ -4517,6 +4517,7 @@ class MegatronRankWorker:
         train_mlp: bool | None = None,
         train_unembed: bool | None = None,
         traceparent: str | None = None,
+        use_per_expert_lora: bool = False,
     ) -> dict:
         """Save checkpoint: LoRA weights + config + training metadata.
 
@@ -7051,6 +7052,7 @@ class MegatronWorkerGroup:
         train_attn: bool | None = None,
         train_mlp: bool | None = None,
         train_unembed: bool | None = None,
+        invalidate_durability: bool = True,
     ) -> dict:
         """Run forward-backward on all workers.
 
@@ -7118,18 +7120,19 @@ class MegatronWorkerGroup:
             t3 = time.perf_counter() if timing else 0.0
         finally:
             self._stop_slow_group_watchdog(watchdog)
-        session_manager = getattr(self, "_session_manager", None)
-        mark_actor_only_state = getattr(session_manager, "mark_actor_only_state", None)
-        if callable(mark_actor_only_state):
-            mark_actor_only_state(
+        if invalidate_durability:
+            session_manager = getattr(self, "_session_manager", None)
+            mark_actor_only_state = getattr(session_manager, "mark_actor_only_state", None)
+            if callable(mark_actor_only_state):
+                mark_actor_only_state(
+                    effective_session_id,
+                    reason="forward_backward",
+                    actor_name=_make_megatron_actor_name(str(getattr(self, "base_model", "unknown"))),
+                )
+            self._invalidate_session_durability(
                 effective_session_id,
                 reason="forward_backward",
-                actor_name=_make_megatron_actor_name(str(getattr(self, "base_model", "unknown"))),
             )
-        self._invalidate_session_durability(
-            effective_session_id,
-            reason="forward_backward",
-        )
         if timing:
             logger.info(
                 f"[MegatronWorkerGroup] forward_backward timing: "
@@ -7272,6 +7275,9 @@ class MegatronWorkerGroup:
             train_attn=train_attn,
             train_mlp=train_mlp,
             train_unembed=train_unembed,
+            # train_step is one mutating transaction. Keep trusted-pair freshness
+            # until optim_step finishes, then invalidate once in optim_step.
+            invalidate_durability=False,
         )
 
         lr = learning_rate if learning_rate is not None else self.learning_rate
@@ -8135,6 +8141,7 @@ class MegatronWorkerGroup:
         train_attn: bool | None = None,
         train_mlp: bool | None = None,
         train_unembed: bool | None = None,
+        use_per_expert_lora: bool = False,
     ) -> dict:
         """Save checkpoint using all workers (rank 0 saves, others participate in NCCL).
 
@@ -8153,7 +8160,9 @@ class MegatronWorkerGroup:
             op="save_checkpoint",
         )
         self._assert_session_request_allowed(effective_session_id, op="save_checkpoint")
-        self._validate_trusted_pair_for_request(effective_session_id, op="save_checkpoint")
+        # save_checkpoint is the recovery boundary that establishes a new trusted pair.
+        # Do not enforce trusted-pair freshness before saving, otherwise stale markers
+        # can deadlock the session and prevent checkpoint-based recovery.
         try:
             self._ensure_session_loaded(
                 effective_session_id,
@@ -8172,7 +8181,8 @@ class MegatronWorkerGroup:
 
         logger.info(
             f"[MegatronWorkerGroup] save_checkpoint: {save_path} "
-            f"(session_id={effective_session_id}, actual_rank={self._actual_rank})"
+            f"(session_id={effective_session_id}, actual_rank={self._actual_rank}, "
+            f"use_per_expert_lora={bool(use_per_expert_lora)})"
         )
         # Call ALL workers - get_lora_state_dict uses NCCL allgather
         # Rank 0 saves to disk, other ranks participate in collectives then return empty
@@ -8185,6 +8195,7 @@ class MegatronWorkerGroup:
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
                 traceparent=traceparent,
+                use_per_expert_lora=use_per_expert_lora,
             )
             for w in self.workers
         ]

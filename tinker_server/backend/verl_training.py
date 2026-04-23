@@ -3109,6 +3109,10 @@ class VerlTrainingEngine:
         Args:
             session: Training session.
             save_path: Directory path for checkpoint.
+            use_per_expert_lora: Router compatibility flag from backend-agnostic
+                save_weights() interface. Megatron checkpoint export currently
+                uses train_attn/train_mlp/train_unembed gating and ignores this
+                flag.
 
         Returns:
             Absolute path to saved checkpoint directory.
@@ -3163,6 +3167,7 @@ class VerlTrainingEngine:
                 train_attn=train_attn,
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
+                use_per_expert_lora=bool(use_per_expert_lora),
             )
         else:
             traceparent = get_current_traceparent()
