@@ -608,6 +608,189 @@ def test_mint_interpolate_route_enqueues_expected_request(monkeypatch) -> None:
     assert resolved_flags == [True, True]
 
 
+def test_mint_interpolate_do_path_claims_checkpoint_and_writes_ckpt_id(monkeypatch, tmp_path) -> None:
+    from tinker_server.models.mint_types import InterpolateCheckpointsRequest
+    from tinker_server.routes import mint as mint_routes
+    import tinker_server.backend.mintx_ops as mintx_ops
+
+    future_store = _StubFutureStore()
+    written: dict[str, object] = {}
+    claimed: dict[str, object] = {}
+
+    async def _claim(**kwargs):
+        claimed.update(kwargs)
+        return "ckpt-rec-1"
+
+    monkeypatch.setattr(mint_routes, "future_store", future_store)
+    monkeypatch.setattr(mint_routes, "_claim_sampler_checkpoint_or_raise", _claim)
+    monkeypatch.setattr(
+        mintx_ops,
+        "_validate_source_metadata",
+        lambda _paths: ("model-123", "Qwen/Qwen3-0.6B", "dense", {}),
+    )
+    monkeypatch.setattr(
+        mint_routes,
+        "build_persistent_cache_dir",
+        lambda **_kwargs: str(tmp_path / "persistent_cache" / "owner-a" / "model-123" / "ema-0010"),
+    )
+    monkeypatch.setattr(
+        mint_routes,
+        "interpolate_checkpoints_to_dir",
+        lambda **_kwargs: SimpleNamespace(output_checkpoint_type="sampler", has_rank_shards=False),
+    )
+    monkeypatch.setattr(
+        mint_routes,
+        "read_checkpoint_metadata",
+        lambda _path: {"checkpoint_id": "ema-0010", "checkpoint_type": "sampler"},
+    )
+    monkeypatch.setattr(
+        mint_routes,
+        "write_checkpoint_metadata",
+        lambda path, metadata: written.update({"path": path, "metadata": metadata}),
+    )
+    monkeypatch.setattr(
+        mint_routes,
+        "begin_async_checkpoint_mirror",
+        lambda *_args, **_kwargs: "/tos-mindverse/tinker_checkpoints/owner-a/model-123/ema-0010/sampler",
+    )
+    monkeypatch.setattr(
+        mint_routes,
+        "checkpoint_uri",
+        lambda model_id, checkpoint_name, prefer_tinker, checkpoint_type: (
+            f"mint://{model_id}/sampler_weights/{checkpoint_name}"
+        ),
+    )
+
+    request = InterpolateCheckpointsRequest(
+        source_paths=["/resolved/ckpt-a", "/resolved/ckpt-b"],
+        coefficients=[0.9, 0.1],
+        output_path="ema-0010",
+        retry=True,
+    )
+
+    asyncio.run(mint_routes._do_interpolate_checkpoints("req-interp-1", request, "owner-a"))
+
+    assert claimed["owner_id"] == "owner-a"
+    assert claimed["model_id"] == "model-123"
+    assert claimed["raw_checkpoint_id"] == "ema-0010"
+    assert claimed["retry"] is True
+    assert written["path"].endswith("ema-0010")
+    assert written["metadata"]["ckpt_id"] == "ckpt-rec-1"
+    assert "created_at" in written["metadata"]
+    assert future_store.failed == []
+    assert future_store.resolved == [
+        (
+            "req-interp-1",
+            {
+                "checkpoint_id": "ema-0010",
+                "checkpoint_record_id": "ckpt-rec-1",
+                "path": "mint://model-123/sampler_weights/ema-0010",
+                "checkpoint_type": "sampler",
+                "source_paths": ["/resolved/ckpt-a", "/resolved/ckpt-b"],
+                "coefficients": [0.9, 0.1],
+                "has_rank_shards": False,
+                "filesystem_path": str(tmp_path / "persistent_cache" / "owner-a" / "model-123" / "ema-0010"),
+                "persistent_filesystem_path": "/tos-mindverse/tinker_checkpoints/owner-a/model-123/ema-0010/sampler",
+                "mirror_status": "pending",
+                "type": "mint_interpolate_checkpoints",
+            },
+        )
+    ]
+
+
+def test_mint_interpolate_do_path_marks_failed_checkpoint(monkeypatch, tmp_path) -> None:
+    from tinker_server.models.mint_types import InterpolateCheckpointsRequest
+    from tinker_server.routes import mint as mint_routes
+    import tinker_server.backend.mintx_ops as mintx_ops
+
+    future_store = _StubFutureStore()
+    failed_marks: list[tuple[str | None, str]] = []
+
+    async def _claim(**_kwargs):
+        return "ckpt-rec-failed"
+
+    async def _mark_failed(ckpt_id: str | None, *, fail_reason: str) -> None:
+        failed_marks.append((ckpt_id, fail_reason))
+
+    monkeypatch.setattr(mint_routes, "future_store", future_store)
+    monkeypatch.setattr(mint_routes, "_claim_sampler_checkpoint_or_raise", _claim)
+    monkeypatch.setattr(mint_routes, "mark_checkpoint_failed", _mark_failed)
+    monkeypatch.setattr(
+        mintx_ops,
+        "_validate_source_metadata",
+        lambda _paths: ("model-123", "Qwen/Qwen3-0.6B", "dense", {}),
+    )
+    monkeypatch.setattr(
+        mint_routes,
+        "build_persistent_cache_dir",
+        lambda **_kwargs: str(tmp_path / "persistent_cache" / "owner-a" / "model-123" / "ema-0011"),
+    )
+
+    def _raise_interpolate(**_kwargs):
+        raise RuntimeError("interpolate_failed")
+
+    monkeypatch.setattr(mint_routes, "interpolate_checkpoints_to_dir", _raise_interpolate)
+
+    request = InterpolateCheckpointsRequest(
+        source_paths=["/resolved/ckpt-a", "/resolved/ckpt-b"],
+        coefficients=[0.9, 0.1],
+        output_path="ema-0011",
+        retry=False,
+    )
+
+    asyncio.run(mint_routes._do_interpolate_checkpoints("req-interp-err", request, "owner-a"))
+
+    assert failed_marks == [("ckpt-rec-failed", "upload_error")]
+    assert future_store.resolved == []
+    assert future_store.failed == [("req-interp-err", "interpolate_failed")]
+
+
+def test_mint_interpolate_do_path_mark_failed_error_does_not_mask_root_failure(monkeypatch, tmp_path) -> None:
+    from tinker_server.models.mint_types import InterpolateCheckpointsRequest
+    from tinker_server.routes import mint as mint_routes
+    import tinker_server.backend.mintx_ops as mintx_ops
+
+    future_store = _StubFutureStore()
+
+    async def _claim(**_kwargs):
+        return "ckpt-rec-failed"
+
+    async def _mark_failed(_ckpt_id: str | None, *, fail_reason: str) -> None:
+        assert fail_reason == "upload_error"
+        raise RuntimeError("mark_failed_broken")
+
+    monkeypatch.setattr(mint_routes, "future_store", future_store)
+    monkeypatch.setattr(mint_routes, "_claim_sampler_checkpoint_or_raise", _claim)
+    monkeypatch.setattr(mint_routes, "mark_checkpoint_failed", _mark_failed)
+    monkeypatch.setattr(
+        mintx_ops,
+        "_validate_source_metadata",
+        lambda _paths: ("model-123", "Qwen/Qwen3-0.6B", "dense", {}),
+    )
+    monkeypatch.setattr(
+        mint_routes,
+        "build_persistent_cache_dir",
+        lambda **_kwargs: str(tmp_path / "persistent_cache" / "owner-a" / "model-123" / "ema-0012"),
+    )
+
+    def _raise_interpolate(**_kwargs):
+        raise RuntimeError("interpolate_failed")
+
+    monkeypatch.setattr(mint_routes, "interpolate_checkpoints_to_dir", _raise_interpolate)
+
+    request = InterpolateCheckpointsRequest(
+        source_paths=["/resolved/ckpt-a", "/resolved/ckpt-b"],
+        coefficients=[0.9, 0.1],
+        output_path="ema-0012",
+        retry=False,
+    )
+
+    asyncio.run(mint_routes._do_interpolate_checkpoints("req-interp-err-2", request, "owner-a"))
+
+    assert future_store.resolved == []
+    assert future_store.failed == [("req-interp-err-2", "interpolate_failed")]
+
+
 def test_mint_reverse_kl_route_and_background_path(monkeypatch) -> None:
     from tinker_server.routes import mint as mint_routes
     from tinker_server.routes import training as training_routes

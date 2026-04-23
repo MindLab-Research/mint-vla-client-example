@@ -2809,6 +2809,8 @@ class VerlTrainingEngine:
         session: TrainingSession,
         checkpoint_name: str,
         checkpoint_base_dir: str,
+        use_per_expert_lora: bool = False,
+        checkpoint_type: str | None = None,
     ) -> str:
         """Save LoRA weights for inference use.
 
@@ -2824,7 +2826,12 @@ class VerlTrainingEngine:
         """
         import os
 
+        if use_per_expert_lora:
+            raise ValueError("Dense/megatron backend does not support per-expert LoRA sampler export")
+
         save_path = os.path.join(checkpoint_base_dir, session.model_id, checkpoint_name)
+        if checkpoint_type:
+            save_path = os.path.join(save_path, checkpoint_type)
         if session.backend == "megatron":
             return await self.save_lora_weights_for_sampler(session, save_path)
         return await self.save_dense_lora_weights_for_sampler(session, save_path)

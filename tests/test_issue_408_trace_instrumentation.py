@@ -46,6 +46,11 @@ async def test_issue_408_save_weights_for_sampler_emits_trace_spans(
 
     tr = _import_training_route()
 
+    async def _identity_materialize(session):
+        return session
+
+    monkeypatch.setattr(tr, "_materialize_training_session_for_stateful_use", _identity_materialize)
+
     ckpt_dir = tmp_path / "sampler_ephemeral"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 

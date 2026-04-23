@@ -389,7 +389,8 @@ class OpenPIFastTrainingEngine:
         session: Any,
         checkpoint_name: str,
         checkpoint_base_dir: str,
-        use_per_expert_lora: bool,
+        use_per_expert_lora: bool = False,
+        checkpoint_type: str | None = None,
     ) -> str:
         if use_per_expert_lora:
             raise ValueError("OpenPI FAST does not support per-expert LoRA sampler export")
@@ -397,6 +398,8 @@ class OpenPIFastTrainingEngine:
         runtime = self._runtime_for_session(session)
         checkpoint_root = Path(checkpoint_base_dir).expanduser().resolve() / str(session.model_id)
         export_dir = checkpoint_root / checkpoint_name
+        if checkpoint_type:
+            export_dir = export_dir / str(checkpoint_type)
         if export_dir.exists():
             raise FileExistsError(f"OpenPI FAST sampler export path already exists: {export_dir}")
 

@@ -389,6 +389,8 @@ class ServerConfig:
     usage_pg_pool_max: int = 30
     usage_write_timeout_ms: int = 2000
     usage_pg_table: str = "billing.usage_event"
+    checkpoint_index_pg_dsn: str = ""
+    checkpoint_index_write_timeout_ms: int = 2000
     skip_actor_cleanup: bool = False  # MINT_SKIP_ACTOR_CLEANUP
 
     # Model settings (no default model - clients specify per-request)
@@ -630,6 +632,16 @@ class ServerConfig:
                 "TINKER_USAGE_PG_TABLE",
                 file_server.usage_pg_table if file_server is not None else None,
                 "billing.usage_event",
+            ),
+            checkpoint_index_pg_dsn=_pick_str(
+                "TINKER_CHECKPOINT_INDEX_PG_DSN",
+                file_server.checkpoint_index_pg_dsn if file_server is not None else None,
+                "",
+            ),
+            checkpoint_index_write_timeout_ms=_pick_int(
+                "TINKER_CHECKPOINT_INDEX_WRITE_TIMEOUT_MS",
+                file_server.checkpoint_index_write_timeout_ms if file_server is not None else None,
+                2000,
             ),
             skip_actor_cleanup=_pick_bool(
                 "MINT_SKIP_ACTOR_CLEANUP", file_server.skip_actor_cleanup if file_server is not None else None, False
