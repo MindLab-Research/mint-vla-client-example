@@ -209,11 +209,11 @@ def test_issue_94_client_job_runtime_env_uses_working_dir(monkeypatch, tmp_path:
     assert client_job_runtime_env() == {"working_dir": str(tmp_path)}
 
 
-def test_issue_94_client_job_runtime_env_ignores_shared_pfs_tinker_path(monkeypatch) -> None:
+def test_issue_94_client_job_runtime_env_does_not_auto_package_pfs_tinker_path(monkeypatch, tmp_path: Path) -> None:
     from tinker_server.ray_utils import client_job_runtime_env
 
     monkeypatch.setenv("MINT_RAY_CLIENT_ADDRESS", "ray://192.168.39.23:10002")
-    monkeypatch.setenv("PFS_TINKER_PATH", "/vePFS-Mindverse/share/code/conley/tinker-server")
+    monkeypatch.setenv("PFS_TINKER_PATH", str(tmp_path))
     monkeypatch.delenv("MINT_RAY_JOB_WORKING_DIR", raising=False)
     monkeypatch.delenv("MINT_RAY_WORKING_DIR", raising=False)
 

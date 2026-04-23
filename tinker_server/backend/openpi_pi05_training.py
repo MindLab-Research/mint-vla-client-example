@@ -368,12 +368,8 @@ class OpenPIPi05TrainingEngine:
         session: Any,
         checkpoint_name: str,
         checkpoint_base_dir: str,
-        use_per_expert_lora: bool = False,
         checkpoint_type: str | None = None,
     ) -> str:
-        if use_per_expert_lora:
-            raise ValueError("OpenPI pi0.5 does not support per-expert LoRA sampler export")
-
         runtime = self._runtime_for_session(session)
         checkpoint_root = Path(checkpoint_base_dir).expanduser().resolve() / str(session.model_id)
         export_dir = checkpoint_root / checkpoint_name
@@ -400,9 +396,7 @@ class OpenPIPi05TrainingEngine:
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
-    async def save_weights(self, session: Any, save_path: str, use_per_expert_lora: bool = False) -> str:
-        if use_per_expert_lora:
-            raise ValueError("OpenPI pi0.5 does not support per-expert LoRA export")
+    async def save_weights(self, session: Any, save_path: str) -> str:
         runtime = self._runtime_for_session(session)
         result = await self._request_runtime(runtime, "save_weights", {"save_path": save_path})
         return str(result["path"])

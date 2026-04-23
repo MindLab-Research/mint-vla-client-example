@@ -6,7 +6,9 @@ import math
 import os
 import re
 import subprocess
+import sys
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 import ray
 
@@ -84,6 +86,92 @@ def _iter_pg_bundle_items(bundles: object) -> list[tuple[str, dict[str, object]]
     return items
 
 
+def _ray_state_api_address() -> str | None:
+    for name in ("MINT_RAY_CLIENT_ADDRESS", "RAY_CLIENT_ADDRESS", "RAY_ADDRESS"):
+        raw = str(os.environ.get(name) or "").strip()
+        if not raw:
+            continue
+        if raw.startswith("ray://"):
+            parsed = urlsplit(raw)
+            if parsed.hostname:
+                return f"{parsed.hostname}:6379"
+            continue
+        return raw
+    return None
+
+
+def _actor_used_gpus_by_node_from_state_api(*, context: str) -> tuple[dict[str, float], bool]:
+    try:
+        from ray.util import state as ray_util_state
+    except Exception:
+        ray_util_state = getattr(getattr(ray, "util", None), "state", None)
+    if ray_util_state is None:
+        logger.debug("%s: ray.util.state unavailable for actor fallback", context)
+        return {}, False
+
+    list_actors = getattr(ray_util_state, "list_actors", None)
+    if list_actors is None:
+        logger.debug("%s: ray.util.state.list_actors unavailable for actor fallback", context)
+        return {}, False
+
+    address = _ray_state_api_address()
+    if not address:
+        logger.debug("%s: no Ray state API address configured for actor fallback", context)
+        return {}, False
+
+    try:
+        actors = list_actors(
+            detail=True,
+            limit=10000,
+        )
+    except Exception as e:
+        if not address:
+            logger.warning("%s: actor state fallback failed: %s", context, e)
+            return {}, False
+        try:
+            child_env = dict(os.environ)
+            for name in ("RAY_ADDRESS", "MINT_RAY_CLIENT_ADDRESS", "RAY_CLIENT_ADDRESS"):
+                child_env.pop(name, None)
+            raw = subprocess.check_output(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import json, sys\n"
+                        "from ray.util import state as ray_state\n"
+                        "rows = ray_state.list_actors(address=sys.argv[1], detail=True, limit=10000)\n"
+                        "print(json.dumps([row.asdict() for row in rows]))\n"
+                    ),
+                    address,
+                ],
+                text=True,
+                timeout=60,
+                env=child_env,
+            )
+            actors = json.loads(raw)
+        except Exception as e2:
+            logger.warning("%s: actor state fallback failed: %s", context, e2)
+            return {}, False
+
+    used_gpus_by_node: dict[str, float] = {}
+    for actor in actors:
+        if not isinstance(actor, dict):
+            continue
+        if str(actor.get("state") or "") != "ALIVE":
+            continue
+        node_id = str(actor.get("node_id") or "")
+        if not node_id:
+            continue
+        resources = actor.get("required_resources") or {}
+        if not isinstance(resources, dict):
+            continue
+        gpu = float(resources.get("GPU", 0) or 0)
+        if gpu <= 0:
+            continue
+        used_gpus_by_node[node_id] = used_gpus_by_node.get(node_id, 0.0) + gpu
+    return used_gpus_by_node, True
+
+
 def _available_resources_per_node_with_pg_fallback(
     *,
     context: str,
@@ -155,6 +243,14 @@ def _available_resources_per_node_with_pg_fallback(
                 continue
             used_gpus_by_node[node_id] = used_gpus_by_node.get(node_id, 0.0) + gpu
 
+    actor_used_gpus_by_node, actor_state_ok = _actor_used_gpus_by_node_from_state_api(context=context)
+    if actor_state_ok:
+        for node_id, used_gpus in actor_used_gpus_by_node.items():
+            used_gpus_by_node[node_id] = max(
+                used_gpus_by_node.get(node_id, 0.0),
+                float(used_gpus),
+            )
+
     try:
         from .resource_pool import get_resource_pool
 
@@ -166,7 +262,7 @@ def _available_resources_per_node_with_pg_fallback(
     except Exception as e:
         logger.debug("%s: resource_pool fallback failed: %s", context, e)
 
-    fail_closed_on_missing = True
+    fail_closed_on_missing = not actor_state_ok
 
     return (
         {node_id: {"GPU": -used_gpus} for node_id, used_gpus in used_gpus_by_node.items()},

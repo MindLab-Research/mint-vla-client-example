@@ -186,7 +186,7 @@ def client_job_runtime_env(*, address: str | None = None) -> dict[str, Any] | No
     addr = preferred_ray_address() if address is None else _normalize_ray_address(address)
     if not addr or not addr.startswith("ray://"):
         return None
-    runtime_env = _driver_runtime_env()
+    runtime_env = _job_level_runtime_env(addr, _driver_runtime_env())
     return runtime_env or None
 
 
@@ -264,13 +264,11 @@ def _job_level_runtime_env(address: str, existing: Any) -> dict[str, Any] | Any:
         return existing
 
     # Ray Client actor creation serializes code on the job side before actor-level
-    # runtime_env takes effect. Give the job a working_dir so detached actors can
-    # import `tinker_server` from the current checkout during startup.
+    # runtime_env takes effect. Only package a job-level working_dir when the
+    # operator explicitly requests it. Auto-packaging `PFS_TINKER_PATH` causes
+    # remote API-host startup to hash/upload the whole shared checkout on every
+    # restart even though that path is already directly visible on the host.
     job_working_dir = os.environ.get("MINT_RAY_JOB_WORKING_DIR", "").strip()
-    if not job_working_dir:
-        candidate = os.environ.get("PFS_TINKER_PATH", "").strip()
-        if candidate and os.path.isdir(candidate):
-            job_working_dir = candidate
     if job_working_dir and "working_dir" not in runtime_env and "py_modules" not in runtime_env:
         runtime_env["working_dir"] = job_working_dir
 
