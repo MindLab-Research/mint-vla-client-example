@@ -2634,7 +2634,12 @@ class ApiWorkQueueClient:
                         or self._consumer_job_id != consumer_job_id
                     )
                     needs_reconcile = generation_changed or generation_state != "active"
-                    actor = await self._get_ray_actor_async()
+                    # This loop is the mechanism that transitions the queue path
+                    # into the execution-ready state. Do not recurse through the
+                    # "require_ready" probe path here or startup can deadlock on
+                    # repeated ready checks against an actor that is waiting for
+                    # this very loop to advance.
+                    actor = await self._get_ray_actor_async(require_ready=False)
                     if generation_changed:
                         self._clear_execution_ready()
                         ref = actor.set_active_job_id.remote(consumer_job_id)

@@ -2008,6 +2008,8 @@ class VerlTrainingEngine:
             else:
                 base_model = requested_model
 
+        observability_base_model = requested_model or base_model or "unknown"
+
         print(
             f"[DEBUG {model_id}] create_training_session start: requested_model={requested_model} use_megatron={use_megatron} base_model={base_model}",
             flush=True,
@@ -2285,6 +2287,7 @@ class VerlTrainingEngine:
                 loss_fn_config,
                 rollout_correction_config,
                 session.model_id,
+                session.lora_config.rank if session.lora_config else None,
                 traceparent=traceparent,
                 train_attn=train_attn,
                 train_mlp=train_mlp,
@@ -2473,6 +2476,7 @@ class VerlTrainingEngine:
             pending = worker.forward.remote(
                 data_items,
                 session.model_id,
+                session.lora_config.rank if session.lora_config else None,
                 traceparent=traceparent,
                 train_attn=train_attn,
                 train_mlp=train_mlp,
@@ -2541,6 +2545,7 @@ class VerlTrainingEngine:
             pending = worker.optim_step.remote(
                 lr,
                 session.model_id,
+                session.lora_config.rank if session.lora_config else None,
                 traceparent=traceparent,
                 train_attn=train_attn,
                 train_mlp=train_mlp,
@@ -2649,6 +2654,7 @@ class VerlTrainingEngine:
                     loss_fn_config,
                     rollout_correction_config,
                     session.model_id,
+                    session.lora_config.rank if session.lora_config else None,
                     traceparent=traceparent,
                     train_attn=train_attn,
                     train_mlp=train_mlp,
@@ -2667,6 +2673,7 @@ class VerlTrainingEngine:
                 opt_pending = worker.optim_step.remote(
                     lr,
                     session.model_id,
+                    session.lora_config.rank if session.lora_config else None,
                     traceparent=traceparent,
                     train_attn=train_attn,
                     train_mlp=train_mlp,
@@ -2866,6 +2873,7 @@ class VerlTrainingEngine:
         meta_ref = worker.save_lora_weights.remote(
             abs_path,
             session_id=session.model_id,
+            actual_rank=session.lora_config.rank if session.lora_config else None,
             traceparent=traceparent,
             train_attn=train_attn,
             train_mlp=train_mlp,
@@ -2888,7 +2896,6 @@ class VerlTrainingEngine:
                 "backend": str(session.backend),
                 "save_path": str(abs_path),
                 "timeout_s": int(timeout_s),
-                "use_per_expert_lora": bool(use_per_expert_lora),
                 "train_attn": bool(train_attn),
                 "train_mlp": bool(train_mlp),
                 "train_unembed": bool(train_unembed),
@@ -2957,6 +2964,7 @@ class VerlTrainingEngine:
                 abs_path,
                 traceparent=traceparent,
                 session_id=session.model_id,
+                actual_rank=session.lora_config.rank if session.lora_config else None,
                 train_attn=train_attn,
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,

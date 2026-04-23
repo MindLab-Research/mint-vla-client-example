@@ -64,7 +64,7 @@ from ..checkpoints import (
     validate_sampler_checkpoint_for_sampling,
     write_checkpoint_metadata,
 )
-from ..config import RAY_NAMESPACE
+from ..config import RAY_NAMESPACE, config as server_config
 from ..model_access_control import can_access_model, get_access_denied_error
 from ..queue_priority import merge_queue_priority_extra
 from ..models.types import (
@@ -891,6 +891,18 @@ def _validate_rollout_correction_config_or_400(
         )
 
 
+def _validate_lora_rank_or_400(lora_config: LoRAConfig | None) -> None:
+    if lora_config is None:
+        return
+    requested_rank = int(lora_config.rank)
+    max_rank = int(server_config.max_lora_rank)
+    if requested_rank > max_rank:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Requested LoRA rank {requested_rank} exceeds server max_lora_rank={max_rank}",
+        )
+
+
 def _field(source: Any, key: str, default=None):
     if isinstance(source, dict):
         return source.get(key, default)
@@ -1098,6 +1110,7 @@ async def create_model(
         base_model=request.base_model,
         rollout_correction_config=request.rollout_correction_config,
     )
+    _validate_lora_rank_or_400(request.lora_config)
     try:
         from ..backend.openpi_fast_training import validate_openpi_fast_create_request
         from ..backend.openpi_pi05_training import validate_openpi_pi05_create_request
@@ -1456,6 +1469,7 @@ async def create_model_from_state(
         base_model=request.base_model,
         rollout_correction_config=request.rollout_correction_config,
     )
+    _validate_lora_rank_or_400(request.lora_config)
     try:
         from ..backend.openpi_fast_training import validate_openpi_fast_create_request
         from ..backend.openpi_pi05_training import validate_openpi_pi05_create_request

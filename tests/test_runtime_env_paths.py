@@ -1193,3 +1193,63 @@ def test_actor_runtime_env_vars_forwards_ray_attach_hints(tmp_path):
     assert data["RAY_CLIENT_ADDRESS"] == "ray://192.168.39.87:10001"
     assert data["MINT_RAY_NODE_IP_ADDRESS"] == "192.168.33.190"
     assert data["MINT_RAY_TEMP_DIR"] == "/tmp/mdw/t"
+
+
+def test_actor_runtime_env_skips_local_working_dir_in_ray_client_mode(tmp_path):
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env(env_root)
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json; "
+                "from tinker_server.config import actor_runtime_env; "
+                "print(json.dumps(actor_runtime_env(pythonpath='X')))"
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            "PFS_RUNTIME_ENV_ROOT": str(env_root),
+            "PFS_TINKER_PATH": str(tmp_path / "repo"),
+            "PFS_HF_MODULES_PATH": str(tmp_path / "hf"),
+            "RAY_ADDRESS": "ray://192.168.39.87:10001",
+            "MINT_RAY_WORKING_DIR": str(tmp_path / "repo"),
+        },
+    )
+    data = json.loads(out.stdout)
+    assert "working_dir" not in data
+
+
+def test_actor_runtime_env_skips_local_py_modules_in_ray_client_mode(tmp_path):
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env(env_root)
+    repo_pkg = tmp_path / "repo" / "tinker_server"
+    repo_pkg.mkdir(parents=True)
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json; "
+                "from tinker_server.config import actor_runtime_env; "
+                "print(json.dumps(actor_runtime_env(pythonpath='X')))"
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            "PFS_RUNTIME_ENV_ROOT": str(env_root),
+            "PFS_TINKER_PATH": str(tmp_path / "repo"),
+            "PFS_HF_MODULES_PATH": str(tmp_path / "hf"),
+            "RAY_ADDRESS": "ray://192.168.39.87:10001",
+            "MINT_RAY_PY_MODULES_CSV": str(repo_pkg),
+        },
+    )
+    data = json.loads(out.stdout)
+    assert "py_modules" not in data

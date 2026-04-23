@@ -38,7 +38,7 @@ from .logging_context import (
     set_trace_id,
 )
 from .ray_utils import init_ray, ray_address_source_configured, ray_connection_epoch, ray_reconnect_poll_s
-from .routes import action_sampling, futures, internal, mint, openai_compat, sampling, service, training, weights
+from .routes import action_sampling, futures, internal, openai_compat, sampling, service, training, weights
 from .server_info import _git_sha
 from .token_encryptor import TokenEncryptor
 
@@ -51,6 +51,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 _STARTUP_LEASE_ROLE = os.environ.get("MINT_STARTUP_LEASE_ROLE", "mint_api_startup_owner")
+_DISABLE_MINT_ROUTE = os.environ.get("MINT_DISABLE_MINT_ROUTE", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+if _DISABLE_MINT_ROUTE:
+    mint = None
+else:
+    from .routes import mint
 
 
 def _http_route_label(request: Request) -> str:
@@ -91,6 +102,11 @@ def _queue_execution_runtime_start_timeout_s() -> float:
     if prewarm_requested:
         return max(1800.0, float(config.prewarm_megatron_ready_timeout_s) + 300.0)
     return 120.0
+
+
+def _skip_api_work_queue_execution_ready_wait() -> bool:
+    raw = os.environ.get("MINT_API_WORK_QUEUE_SKIP_READY_WAIT", "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 async def _cleanup_stale_actors() -> None:
@@ -159,15 +175,16 @@ async def _shutdown_local_training_runtime(train_manager) -> None:
 
 
 def _clear_local_execution_route_globals() -> None:
-    from .routes import mint, sampling, service, training, weights
+    from .routes import sampling, service, training, weights
 
     service.session_manager = None
     sampling.session_manager = None
     training.training_manager = None
     training.training_engine = None
     training.inference_manager = None
-    mint.training_manager = None
-    mint.training_engine = None
+    if mint is not None:
+        mint.training_manager = None
+        mint.training_engine = None
     weights.training_manager = None
     weights.training_engine = None
     weights.inference_manager = None
@@ -252,7 +269,8 @@ async def lifespan(app: FastAPI):
 
     action_manager = ActionSessionRouter()
     action_sampling.action_session_manager = action_manager
-    mint.action_session_manager = action_manager
+    if mint is not None:
+        mint.action_session_manager = action_manager
     try:
         from .backend.dense_session_state import cleanup_legacy_dense_session_state_once
         from .backend.training_session_store import list_training_sessions
@@ -367,7 +385,8 @@ async def lifespan(app: FastAPI):
         # from ResourcePool metadata after API or worker restarts.
         # ==========================================================================
         action_sampling.action_session_manager = action_manager
-        mint.action_session_manager = action_manager
+        if mint is not None:
+            mint.action_session_manager = action_manager
 
         # ==========================================================================
         # Inference route layer: stateless API path uses detached stores only
@@ -383,8 +402,9 @@ async def lifespan(app: FastAPI):
         training.training_manager = None
         training.training_engine = None
         training.inference_manager = None
-        mint.training_manager = None
-        mint.training_engine = None
+        if mint is not None:
+            mint.training_manager = None
+            mint.training_engine = None
         weights.training_manager = None
         weights.training_engine = None
         weights.inference_manager = None
@@ -425,8 +445,12 @@ async def lifespan(app: FastAPI):
         from .backend.capacity_manager import capacity_manager
         from .backend.queue_execution_runtime import queue_execution_runtime
 
+        logger.info("startup stage=before_capacity_manager_ready")
         await capacity_manager.async_ensure_ready(timeout_s=180.0)
+        logger.info("startup stage=after_capacity_manager_ready")
+        logger.info("startup stage=before_api_work_queue_started")
         await api_work_queue.async_ensure_started()
+        logger.info("startup stage=after_api_work_queue_started")
         if os.environ.get("MINT_QUEUE_EXECUTION_RUNTIME_LOCAL_ONLY", "").strip().lower() in {"1", "true", "yes", "on"}:
             from .backend.api_work_queue_dispatch import register_api_work_queue_executors
             from .backend.queue_execution_runtime import _initialize_execution_runtime
@@ -435,20 +459,36 @@ async def lifespan(app: FastAPI):
                 "Using local queue execution runtime fallback in API process "
                 "(MINT_QUEUE_EXECUTION_RUNTIME_LOCAL_ONLY=1)"
             )
+            logger.info("startup stage=before_local_initialize_execution_runtime")
             bindings = await _initialize_execution_runtime(prewarm=startup_owner)
+            logger.info("startup stage=after_local_initialize_execution_runtime")
             inference_manager = bindings.get("inference_manager")
             train_manager = bindings.get("train_manager")
             multi_model_manager = bindings.get("multi_model_manager")
+            logger.info("startup stage=before_register_api_work_queue_executors")
             register_api_work_queue_executors(api_work_queue)
+            logger.info("startup stage=after_register_api_work_queue_executors")
+            logger.info("startup stage=before_api_work_queue_start_workers")
             await api_work_queue.start_workers(num_workers=int(config.api_work_queue_num_workers))
-            await api_work_queue.wait_until_execution_ready(
-                timeout_s=_queue_execution_runtime_start_timeout_s()
-            )
+            logger.info("startup stage=after_api_work_queue_start_workers")
+            if _skip_api_work_queue_execution_ready_wait():
+                logger.warning(
+                    "Skipping api_work_queue execution-ready startup wait "
+                    "(MINT_API_WORK_QUEUE_SKIP_READY_WAIT=1)"
+                )
+            else:
+                logger.info("startup stage=before_api_work_queue_execution_ready_wait")
+                await api_work_queue.wait_until_execution_ready(
+                    timeout_s=_queue_execution_runtime_start_timeout_s()
+                )
+                logger.info("startup stage=after_api_work_queue_execution_ready_wait")
         else:
+            logger.info("startup stage=before_remote_queue_execution_runtime_started")
             await queue_execution_runtime.async_ensure_started(
                 num_workers=int(config.api_work_queue_num_workers),
                 timeout_s=_queue_execution_runtime_start_timeout_s(),
             )
+            logger.info("startup stage=after_remote_queue_execution_runtime_started")
 
         async def _ray_reconnect_watch_loop() -> None:
             nonlocal last_ray_connection_epoch
@@ -940,7 +980,8 @@ app.include_router(sampling.router, prefix="/api/v1", tags=["sampling"])
 app.include_router(futures.router, prefix="/api/v1", tags=["futures"])
 app.include_router(training.router, prefix="/api/v1", tags=["training"])
 app.include_router(weights.router, prefix="/api/v1", tags=["weights"])
-app.include_router(mint.router, prefix="/api/v1/mint", tags=["mint"])
+if mint is not None:
+    app.include_router(mint.router, prefix="/api/v1/mint", tags=["mint"])
 app.include_router(openai_compat.router, prefix="/oai/api/v1", tags=["openai-compat"])
 app.include_router(internal.router, prefix="/internal", tags=["internal"])
 

@@ -199,12 +199,22 @@ async def _restore_sampling_sessions_for_worker(inference_manager) -> int:
 
 async def _initialize_execution_bindings() -> dict[str, Any]:
     from ..config import config
-    from ..routes import action_sampling, mint, sampling, service, training, weights
+    from ..routes import action_sampling, sampling, service, training, weights
     from .action_session_manager import ActionSessionRouter
     from .sampling_session_store import ensure_ready as ensure_sampling_session_store_ready
     from .session_manager import DEFAULT_INACTIVITY_TIMEOUT, SessionManager
     from .training_engine_router import TrainingEngineRouter
     from .training_session_manager import TrainingSessionManager
+
+    disable_mint_route = os.environ.get("MINT_DISABLE_MINT_ROUTE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    mint = None
+    if not disable_mint_route:
+        from ..routes import mint
 
     inference_manager = SessionManager(
         tensor_parallel_size=config.tensor_parallel_size,
@@ -256,9 +266,10 @@ async def _initialize_execution_bindings() -> dict[str, Any]:
     training.training_manager = train_manager
     training.training_engine = train_engine
     training.inference_manager = inference_manager
-    mint.training_manager = train_manager
-    mint.training_engine = train_engine
-    mint.action_session_manager = action_manager
+    if mint is not None:
+        mint.training_manager = train_manager
+        mint.training_engine = train_engine
+        mint.action_session_manager = action_manager
     weights.training_manager = train_manager
     weights.training_engine = train_engine
     weights.inference_manager = inference_manager

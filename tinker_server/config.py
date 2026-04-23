@@ -251,11 +251,16 @@ def actor_runtime_env(*, pythonpath: str, extra: dict[str, str] | None = None) -
     runtime_env: dict[str, object] = {
         "env_vars": actor_runtime_env_vars(pythonpath=pythonpath, extra=extra)
     }
+    ray_address = _env_nonempty(os.environ, "RAY_ADDRESS") or ""
     py_modules_csv = _env_nonempty(os.environ, "MINT_RAY_PY_MODULES_CSV")
     if py_modules_csv:
-        runtime_env["py_modules"] = [x.strip() for x in py_modules_csv.split(",") if x.strip()]
+        py_modules = [x.strip() for x in py_modules_csv.split(",") if x.strip()]
+        if ray_address.startswith("ray://"):
+            py_modules = [x for x in py_modules if "://" in x]
+        if py_modules:
+            runtime_env["py_modules"] = py_modules
     working_dir = _env_nonempty(os.environ, "MINT_RAY_WORKING_DIR")
-    if working_dir:
+    if working_dir and not (ray_address.startswith("ray://") and "://" not in working_dir):
         runtime_env["working_dir"] = working_dir
     return runtime_env
 

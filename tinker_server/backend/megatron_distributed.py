@@ -6371,6 +6371,7 @@ class MegatronWorkerGroup:
         session_id: str | None,
         traceparent: str | None = None,
         *,
+        actual_rank: int | None = None,
         train_attn: bool | None = None,
         train_mlp: bool | None = None,
         train_unembed: bool | None = None,
@@ -6567,13 +6568,15 @@ class MegatronWorkerGroup:
             # New session: reinitialize LoRA weights
             logger.info(f"[MegatronWorkerGroup] New session {session_id}, reinitializing LoRA")
             self.reinit_lora_weights(
+                actual_rank=actual_rank,
+                new_session_id=session_id,
                 traceparent=traceparent,
                 train_attn=train_attn,
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
             )
             self._step_count = 0
-            self._actual_rank = self.lora_rank
+            self._actual_rank = actual_rank if actual_rank is not None else self.lora_rank
         t_load1 = time.perf_counter() if timing else 0.0
 
         # Reset expert_bias only for fresh sessions. Existing sessions may have
@@ -6743,6 +6746,7 @@ class MegatronWorkerGroup:
         op: str,
         session_id: str | None,
         traceparent: str | None,
+        actual_rank: int | None,
         train_attn: bool | None,
         train_mlp: bool | None,
         train_unembed: bool | None,
@@ -6752,6 +6756,7 @@ class MegatronWorkerGroup:
         switch_stats = self._ensure_session_loaded(
             effective_session_id,
             traceparent=traceparent,
+            actual_rank=actual_rank,
             train_attn=train_attn,
             train_mlp=train_mlp,
             train_unembed=train_unembed,
@@ -6767,6 +6772,7 @@ class MegatronWorkerGroup:
         loss_fn_config: dict | None = None,
         rollout_correction_config: dict | None = None,
         session_id: str | None = None,
+        actual_rank: int | None = None,
         reset_bias: bool | None = None,
         traceparent: str | None = None,
         *,
@@ -6810,6 +6816,7 @@ class MegatronWorkerGroup:
                 op="forward_backward",
                 session_id=effective_session_id,
                 traceparent=traceparent,
+                actual_rank=actual_rank,
                 train_attn=train_attn,
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
@@ -6956,6 +6963,7 @@ class MegatronWorkerGroup:
         rollout_correction_config: dict | None = None,
         learning_rate: float | None = None,
         session_id: str | None = None,
+        actual_rank: int | None = None,
         traceparent: str | None = None,
         *,
         train_attn: bool | None = None,
@@ -6990,6 +6998,7 @@ class MegatronWorkerGroup:
             loss_fn_config=loss_fn_config,
             rollout_correction_config=rollout_correction_config,
             session_id=effective_session_id,
+            actual_rank=actual_rank,
             traceparent=traceparent,
             train_attn=train_attn,
             train_mlp=train_mlp,
@@ -7000,6 +7009,7 @@ class MegatronWorkerGroup:
         opt_result = self.optim_step(
             lr,
             session_id=effective_session_id,
+            actual_rank=actual_rank,
             traceparent=traceparent,
             train_attn=train_attn,
             train_mlp=train_mlp,
@@ -7015,6 +7025,7 @@ class MegatronWorkerGroup:
         self,
         data_items: list[dict],
         session_id: str | None = None,  # Accepted for API consistency with TrainingWorker
+        actual_rank: int | None = None,
         reset_bias: bool | None = None,
         traceparent: str | None = None,
         *,
@@ -7042,6 +7053,7 @@ class MegatronWorkerGroup:
             op="forward",
             session_id=session_id,
             traceparent=traceparent,
+            actual_rank=actual_rank,
             train_attn=train_attn,
             train_mlp=train_mlp,
             train_unembed=train_unembed,
@@ -7125,6 +7137,7 @@ class MegatronWorkerGroup:
         reference_checkpoint_path: str | None,
         temperature: float,
         session_id: str | None = None,
+        actual_rank: int | None = None,
         traceparent: str | None = None,
         *,
         train_attn: bool | None = None,
@@ -7141,6 +7154,7 @@ class MegatronWorkerGroup:
         self._ensure_session_loaded(
             effective_session_id,
             traceparent=traceparent,
+            actual_rank=actual_rank,
             train_attn=train_attn,
             train_mlp=train_mlp,
             train_unembed=train_unembed,
@@ -7177,6 +7191,7 @@ class MegatronWorkerGroup:
         data_items: list[dict],
         temperature: float,
         session_id: str | None = None,
+        actual_rank: int | None = None,
         traceparent: str | None = None,
         *,
         train_attn: bool | None = None,
@@ -7191,6 +7206,7 @@ class MegatronWorkerGroup:
         self._ensure_session_loaded(
             effective_session_id,
             traceparent=traceparent,
+            actual_rank=actual_rank,
             train_attn=train_attn,
             train_mlp=train_mlp,
             train_unembed=train_unembed,
@@ -7215,6 +7231,7 @@ class MegatronWorkerGroup:
     def debug_lora_storage(
         self,
         session_id: str | None = None,
+        actual_rank: int | None = None,
         traceparent: str | None = None,
         *,
         train_attn: bool | None = None,
@@ -7229,6 +7246,7 @@ class MegatronWorkerGroup:
         self._ensure_session_loaded(
             effective_session_id,
             traceparent=traceparent,
+            actual_rank=actual_rank,
             train_attn=train_attn,
             train_mlp=train_mlp,
             train_unembed=train_unembed,
@@ -7240,6 +7258,7 @@ class MegatronWorkerGroup:
         self,
         learning_rate: float,
         session_id: str | None = None,
+        actual_rank: int | None = None,
         traceparent: str | None = None,
         *,
         train_attn: bool | None = None,
@@ -7269,6 +7288,7 @@ class MegatronWorkerGroup:
             op="optim_step",
             session_id=session_id,
             traceparent=traceparent,
+            actual_rank=actual_rank,
             train_attn=train_attn,
             train_mlp=train_mlp,
             train_unembed=train_unembed,
@@ -7817,6 +7837,7 @@ class MegatronWorkerGroup:
         traceparent: str | None = None,
         *,
         session_id: str | None = None,
+        actual_rank: int | None = None,
         train_attn: bool | None = None,
         train_mlp: bool | None = None,
         train_unembed: bool | None = None,
@@ -7840,6 +7861,7 @@ class MegatronWorkerGroup:
         self._ensure_session_loaded(
             effective_session_id,
             traceparent=traceparent,
+            actual_rank=actual_rank,
             train_attn=train_attn,
             train_mlp=train_mlp,
             train_unembed=train_unembed,
@@ -7919,6 +7941,7 @@ class MegatronWorkerGroup:
         traceparent: str | None = None,
         *,
         session_id: str | None = None,
+        actual_rank: int | None = None,
         train_attn: bool | None = None,
         train_mlp: bool | None = None,
         train_unembed: bool | None = None,
@@ -7935,6 +7958,7 @@ class MegatronWorkerGroup:
         self._ensure_session_loaded(
             effective_session_id,
             traceparent=traceparent,
+            actual_rank=actual_rank,
             train_attn=train_attn,
             train_mlp=train_mlp,
             train_unembed=train_unembed,
