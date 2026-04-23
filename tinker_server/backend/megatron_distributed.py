@@ -6934,6 +6934,15 @@ class MegatronWorkerGroup:
         raw = os.environ.get("MINT_MEGATRON_ENFORCE_TRUSTED_PAIR", "0").strip().lower()
         return raw not in ("0", "false", "no", "off")
 
+    def _allow_live_session_continuation_without_fresh_pair(self, session_id: str, *, op: str) -> bool:
+        if op not in {"forward", "forward_backward", "optim_step"}:
+            return False
+        if getattr(self, "_session_unknown_due_to_partial_swap", False):
+            return False
+        if getattr(self, "_current_session", None) != session_id:
+            return False
+        return bool(self._session_state_cached_on_workers(session_id))
+
     def _validate_trusted_pair_for_request(self, session_id: str, *, op: str) -> None:
         session_manager = getattr(self, "_session_manager", None)
         if session_manager is None:
@@ -6949,17 +6958,35 @@ class MegatronWorkerGroup:
         strict = self._strict_trusted_pair_enforced()
 
         if isinstance(external, dict) and not bool(external.get("is_fresh", False)):
-            reason = f"external_checkpoint_stale:{external.get('invalidated_reason') or 'unknown'}"
-            self._mark_session_blocked(session_id, reason=reason)
-            raise RuntimeError(
-                f"session {session_id} blocked for {op}: external checkpoint stale ({reason})"
-            )
+            if self._allow_live_session_continuation_without_fresh_pair(session_id, op=op):
+                logger.warning(
+                    "[MegatronWorkerGroup] allow live continuation despite stale external checkpoint "
+                    "session_id=%s op=%s invalidated_reason=%s",
+                    session_id,
+                    op,
+                    external.get("invalidated_reason"),
+                )
+            else:
+                reason = f"external_checkpoint_stale:{external.get('invalidated_reason') or 'unknown'}"
+                self._mark_session_blocked(session_id, reason=reason)
+                raise RuntimeError(
+                    f"session {session_id} blocked for {op}: external checkpoint stale ({reason})"
+                )
         if isinstance(baseline, dict) and not bool(baseline.get("is_fresh", False)):
-            reason = f"trusted_recovery_baseline_stale:{baseline.get('invalidated_reason') or 'unknown'}"
-            self._mark_session_blocked(session_id, reason=reason)
-            raise RuntimeError(
-                f"session {session_id} blocked for {op}: trusted recovery baseline stale ({reason})"
-            )
+            if self._allow_live_session_continuation_without_fresh_pair(session_id, op=op):
+                logger.warning(
+                    "[MegatronWorkerGroup] allow live continuation despite stale trusted baseline "
+                    "session_id=%s op=%s invalidated_reason=%s",
+                    session_id,
+                    op,
+                    baseline.get("invalidated_reason"),
+                )
+            else:
+                reason = f"trusted_recovery_baseline_stale:{baseline.get('invalidated_reason') or 'unknown'}"
+                self._mark_session_blocked(session_id, reason=reason)
+                raise RuntimeError(
+                    f"session {session_id} blocked for {op}: trusted recovery baseline stale ({reason})"
+                )
 
         has_external = isinstance(external, dict)
         has_baseline = isinstance(baseline, dict)

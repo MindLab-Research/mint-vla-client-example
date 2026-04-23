@@ -1,5 +1,7 @@
 from types import MethodType, SimpleNamespace
 
+import pytest
+
 from tinker_server.backend.megatron_distributed import MegatronWorkerGroup
 
 
@@ -102,3 +104,56 @@ def test_save_checkpoint_does_not_require_fresh_trusted_pair() -> None:
     out = group.save_checkpoint("/tmp/ckpt", session_id="session-a")
 
     assert out["current_step"] == 3
+
+
+def test_trusted_pair_stale_allows_live_session_continuation() -> None:
+    group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
+    group = object.__new__(group_cls)
+
+    group._current_session = "session-a"
+    group._session_unknown_due_to_partial_swap = False
+    group._blocked_sessions = {}
+    group._contaminated_sessions = {}
+    group._session_state_cached_on_workers = MethodType(lambda self, session_id: True, group)
+
+    group._session_manager = SimpleNamespace(
+        get_external_checkpoint=lambda session_id: {
+            "is_fresh": False,
+            "invalidated_reason": "optim_step",
+            "checkpoint_identity": "id-a",
+        },
+        get_trusted_recovery_baseline=lambda session_id: {
+            "is_fresh": False,
+            "invalidated_reason": "optim_step",
+            "checkpoint_identity": "id-a",
+        },
+    )
+
+    group._validate_trusted_pair_for_request("session-a", op="forward_backward")
+
+    assert group._blocked_sessions == {}
+
+
+def test_trusted_pair_stale_blocks_when_not_live_continuation() -> None:
+    group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
+    group = object.__new__(group_cls)
+
+    group._current_session = "session-b"
+    group._session_unknown_due_to_partial_swap = False
+    group._blocked_sessions = {}
+    group._contaminated_sessions = {}
+    group._session_state_cached_on_workers = MethodType(lambda self, session_id: False, group)
+
+    group._session_manager = SimpleNamespace(
+        get_external_checkpoint=lambda session_id: {
+            "is_fresh": False,
+            "invalidated_reason": "optim_step",
+            "checkpoint_identity": "id-a",
+        },
+        get_trusted_recovery_baseline=lambda session_id: None,
+    )
+
+    with pytest.raises(RuntimeError, match="external checkpoint stale"):
+        group._validate_trusted_pair_for_request("session-a", op="forward_backward")
+
+    assert group._blocked_sessions["session-a"] == "external_checkpoint_stale:optim_step"
