@@ -12,25 +12,28 @@ import asyncio
 import concurrent.futures
 import logging
 import os
+import inspect
 import time
 from typing import Any
 
-from ..config import otel_env_vars, preferred_control_plane_resources, preferred_control_plane_resources
+from ..config import otel_env_vars
+from ..ray_utils import register_ray_reconnect_invalidator as _register_ray_reconnect_invalidator
 
 
 logger = logging.getLogger(__name__)
 _ACTOR_HANDLE = None
 
+
 def _reset_cached_actor_handle() -> None:
     global _ACTOR_HANDLE
     _ACTOR_HANDLE = None
 
-from ..ray_utils import register_ray_reconnect_invalidator as _register_ray_reconnect_invalidator
+
 _register_ray_reconnect_invalidator(_reset_cached_actor_handle)
 
 
 async def _await_ray_ref(ref: Any) -> Any:
-    if hasattr(ref, "__await__"):
+    if inspect.isawaitable(ref):
         return await ref
 
     to_future = getattr(ref, "future", None)
@@ -40,7 +43,7 @@ async def _await_ray_ref(ref: Any) -> Any:
             return await fut
         if isinstance(fut, concurrent.futures.Future):
             return await asyncio.wrap_future(fut)
-        if hasattr(fut, "__await__"):
+        if inspect.isawaitable(fut):
             return await fut
 
     raise TypeError(f"Ray ref is not awaitable: {type(ref)}")
@@ -243,6 +246,15 @@ def upsert_training_session(info: dict[str, Any]) -> None:
     payload["metadata_version"] = max(1, int(payload.get("metadata_version") or 1))
     actor = _require_write_actor("upsert")
     actor.upsert.remote(str(payload.get("model_id", "")), payload)
+
+
+async def async_upsert_training_session(info: dict[str, Any]) -> None:
+    payload = dict(info)
+    payload.setdefault("current_step", 0)
+    payload.setdefault("last_activity", time.time())
+    payload["metadata_version"] = max(1, int(payload.get("metadata_version") or 1))
+    actor = await asyncio.to_thread(_get_or_create_actor)
+    await _await_ray_ref(actor.upsert.remote(str(payload.get("model_id", "")), payload))
 
 
 def delete_training_session(model_id: str) -> None:
