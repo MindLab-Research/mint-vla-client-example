@@ -59,20 +59,43 @@ def _find_trainer_actor(
     current_session: str | None = None,
     base_model: str | None = None,
 ) -> dict | None:
-    def _matches_base_model(actual: object, expected: str) -> bool:
-        if not isinstance(actual, str) or not actual:
+    def _norm_model_label(value: object) -> str:
+        if not isinstance(value, str):
+            return ""
+        return "".join(ch for ch in value.lower() if ch.isalnum())
+
+    def _matches_base_model(actor: dict, expected: str) -> bool:
+        expected_norm = _norm_model_label(expected)
+        if not expected_norm:
             return False
-        if actual == expected:
-            return True
-        if expected in actual:
-            return True
-        # Common case: ResourcePool reports a resolved HF snapshot path like:
-        #   /.../models--Qwen--Qwen3-.../snapshots/<sha>
-        # while callers use the repo id: Qwen/Qwen3-...
-        if "/" in expected and expected.count("/") == 1:
-            org, name = expected.split("/", 1)
-            needle = f"models--{org}--{name}"
-            if needle in actual:
+
+        candidates: list[str] = []
+
+        base_model_value = actor.get("base_model")
+        if isinstance(base_model_value, str) and base_model_value:
+            candidates.append(base_model_value)
+
+        metadata = actor.get("metadata")
+        if isinstance(metadata, dict):
+            for key in ("model_key", "base_model", "model_name"):
+                v = metadata.get(key)
+                if isinstance(v, str) and v:
+                    candidates.append(v)
+
+        actor_name = actor.get("actor_name")
+        if isinstance(actor_name, str) and actor_name:
+            candidates.append(actor_name)
+
+        for candidate in candidates:
+            if candidate == expected:
+                return True
+            if expected in candidate:
+                return True
+            if "/" in expected and expected.count("/") == 1:
+                org, name = expected.split("/", 1)
+                if f"models--{org}--{name}" in candidate:
+                    return True
+            if expected_norm and expected_norm in _norm_model_label(candidate):
                 return True
         return False
 
@@ -88,7 +111,7 @@ def _find_trainer_actor(
             continue
         if current_session is not None and a.get("current_session") != current_session:
             continue
-        if base_model is not None and not _matches_base_model(a.get("base_model"), base_model):
+        if base_model is not None and not _matches_base_model(a, base_model):
             continue
         return a
     return None
