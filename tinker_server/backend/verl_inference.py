@@ -926,7 +926,7 @@ def _create_extended_server_class(
             Args:
                 lora_request: LoRARequest with lora_path pointing to adapter directory.
             """
-            from .lora_utils import validate_peft_adapter_checkpoint_shapes
+            from .lora_utils import maybe_validate_peft_adapter_checkpoint_shapes
 
             # Remove existing LoRA first if present
             try:
@@ -937,7 +937,7 @@ def _create_extended_server_class(
                 pass  # May not have any LoRA loaded
 
             # Add new LoRA
-            validate_peft_adapter_checkpoint_shapes(
+            maybe_validate_peft_adapter_checkpoint_shapes(
                 getattr(lora_request, "lora_path", None),
                 self.model_config.local_path,
             )
@@ -970,7 +970,6 @@ def _create_extended_server_class(
 
             from safetensors.torch import save_file
             from vllm.lora.request import LoRARequest
-            from .lora_utils import validate_peft_adapter_checkpoint_shapes
 
             from verl.workers.rollout.vllm_rollout.utils import (
                 VLLM_LORA_INT_ID,
@@ -1098,7 +1097,9 @@ def _create_extended_server_class(
             )
 
             try:
-                validate_peft_adapter_checkpoint_shapes(
+                from .lora_utils import maybe_validate_peft_adapter_checkpoint_shapes
+
+                maybe_validate_peft_adapter_checkpoint_shapes(
                     adapter_path,
                     self.model_config.local_path,
                 )
@@ -1146,7 +1147,7 @@ def _create_extended_server_class(
             """
             self._bind_traceparent(traceparent)
             from vllm.lora.request import LoRARequest
-            from .lora_utils import validate_peft_adapter_checkpoint_shapes
+            from .lora_utils import maybe_validate_peft_adapter_checkpoint_shapes
 
             debug = os.environ.get("MINT_VLLM_LORA_DEBUG", "0").strip() in {"1", "true", "yes"}
             if debug:
@@ -1170,7 +1171,7 @@ def _create_extended_server_class(
             if not engine_ready:
                 raise RuntimeError("vLLM engine not ready before add_lora_from_path")
 
-            validate_peft_adapter_checkpoint_shapes(
+            maybe_validate_peft_adapter_checkpoint_shapes(
                 lora_path,
                 self.model_config.local_path,
             )

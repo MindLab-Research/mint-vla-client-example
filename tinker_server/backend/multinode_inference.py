@@ -637,6 +637,11 @@ def _create_multinode_vllm_actor(
             self._generate_timeout_s = float(os.environ.get("MINT_VLLM_GENERATE_TIMEOUT_S", "0"))
             self._post_generate_delay_s = float(os.environ.get("MINT_VLLM_POST_GENERATE_DELAY_S", "0"))
             self._gate_lock = asyncio.Lock()
+            # Default behavior preserves the current drain-until-idle gate.
+            # issue529 experiments can disable it for new-id add via env.
+            self._serialize_add_lora_until_idle = _env_flag(
+                "MINT_VLLM_SERIALIZE_ADD_LORA_UNTIL_IDLE", default=True
+            )
             self._vllm_stats_observer = VllmStatsObserver()
             self._active_generates = 0
             self._active_generates_cond = asyncio.Condition()
@@ -836,6 +841,14 @@ def _create_multinode_vllm_actor(
                     while self._active_generates > 0:
                         await self._active_generates_cond.wait()
                 yield
+
+        @asynccontextmanager
+        async def _maybe_add_lora_idle_gate(self):
+            if self._serialize_add_lora_until_idle:
+                async with self._exclusive_engine_op():
+                    yield
+                return
+            yield
 
         async def initialize(self) -> None:
             """Initialize vLLM engine with Ray distributed backend."""
@@ -1065,7 +1078,7 @@ def _create_multinode_vllm_actor(
             """
             self._bind_traceparent(traceparent)
             from vllm.lora.request import LoRARequest
-            from .lora_utils import validate_peft_adapter_checkpoint_shapes
+            from .lora_utils import maybe_validate_peft_adapter_checkpoint_shapes
 
             lora_request = LoRARequest(
                 lora_name=lora_name,
@@ -1074,13 +1087,22 @@ def _create_multinode_vllm_actor(
             )
 
             t0 = time.perf_counter()
-            async with self._exclusive_engine_op():
+            async with self._maybe_add_lora_idle_gate():
                 async with self._lock_write():
                     t1 = time.perf_counter()
                     try:
-                        validate_peft_adapter_checkpoint_shapes(
+                        fully_sharded_loras = (
+                            _env_flag("MINT_VLLM_FULLY_SHARDED_LORAS", default=True)
+                            and self.enable_lora
+                            and self.max_lora_rank is not None
+                            and self.tensor_parallel_size > 1
+                            and self.max_lora_rank % self.tensor_parallel_size == 0
+                        )
+                        maybe_validate_peft_adapter_checkpoint_shapes(
                             lora_path,
                             self.model_path,
+                            tensor_parallel_size=self.tensor_parallel_size,
+                            fully_sharded_loras=fully_sharded_loras,
                         )
                         await self.engine.add_lora(lora_request)
                     except Exception:
@@ -1117,18 +1139,16 @@ def _create_multinode_vllm_actor(
                         except Exception as summarize_e:
                             summary["summary_error"] = f"{type(summarize_e).__name__}: {summarize_e}"
 
-                        print(
-                            f"[vLLM add_lora failed] adapter_summary={summary}",
-                            flush=True,
-                        )
                         logger.exception("vLLM add_lora failed; adapter_summary=%s", summary)
                         raise
             t2 = time.perf_counter()
             if self._timing:
-                print(
-                    f"[vLLM timing] add_lora id={lora_int_id} lock_wait_s={t1 - t0:.3f} engine_s={t2 - t1:.3f} total_s={t2 - t0:.3f}"
-                    ,
-                    flush=True,
+                logger.info(
+                    "[vLLM timing] add_lora id=%s lock_wait_s=%.3f engine_s=%.3f total_s=%.3f",
+                    lora_int_id,
+                    t1 - t0,
+                    t2 - t1,
+                    t2 - t0,
                 )
             logger.info(f"Added LoRA {lora_name} (id={lora_int_id}) from {lora_path}")
 
@@ -1142,10 +1162,12 @@ def _create_multinode_vllm_actor(
                     await self.engine.remove_lora(lora_int_id)
             t2 = time.perf_counter()
             if self._timing:
-                print(
-                    f"[vLLM timing] remove_lora id={lora_int_id} lock_wait_s={t1 - t0:.3f} engine_s={t2 - t1:.3f} total_s={t2 - t0:.3f}"
-                    ,
-                    flush=True,
+                logger.info(
+                    "[vLLM timing] remove_lora id=%s lock_wait_s=%.3f engine_s=%.3f total_s=%.3f",
+                    lora_int_id,
+                    t1 - t0,
+                    t2 - t1,
+                    t2 - t0,
                 )
             logger.info(f"Removed LoRA id={lora_int_id}")
 
@@ -1665,13 +1687,21 @@ def _create_multinode_vllm_actor(
                     add_request_exec_s,
                 )
             if self._timing:
-                print(
-                    f"[vLLM timing] generate req={request_id} prompt_len={len(prompt_ids)} max_tokens={max_tokens} "
-                    f"lora_id={lora_int_id} generate_lock_wait_s={generate_lock_wait_s:.3f} "
-                    f"seq_slot_wait_s={seq_slot_wait_s:.3f} engine_read_lock_wait_s={engine_read_lock_wait_s:.3f} "
-                    f"add_request_wait_s={add_request_wait_s:.3f} add_request_exec_s={add_request_exec_s:.3f} "
-                    f"total_s={total_s:.3f} first_tok_s={first_tok_s}",
-                    flush=True,
+                logger.info(
+                    "[vLLM timing] generate req=%s prompt_len=%s max_tokens=%s lora_id=%s "
+                    "generate_lock_wait_s=%.3f seq_slot_wait_s=%.3f engine_read_lock_wait_s=%.3f "
+                    "add_request_wait_s=%.3f add_request_exec_s=%.3f total_s=%.3f first_tok_s=%s",
+                    request_id,
+                    len(prompt_ids),
+                    max_tokens,
+                    lora_int_id,
+                    generate_lock_wait_s,
+                    seq_slot_wait_s,
+                    engine_read_lock_wait_s,
+                    add_request_wait_s,
+                    add_request_exec_s,
+                    total_s,
+                    first_tok_s,
                 )
 
             if n_req == 1:
@@ -1960,11 +1990,13 @@ def _create_multinode_vllm_actor(
                         assert final_res is not None
             t2 = time.perf_counter()
             if self._timing:
-                print(
-                    f"[vLLM timing] prompt_logprobs req={request_id} prompt_len={len(prompt_ids)} "
-                    f"lora_id={lora_int_id} lock_wait_s={t1 - t0:.3f} total_s={t2 - t0:.3f}"
-                    ,
-                    flush=True,
+                logger.info(
+                    "[vLLM timing] prompt_logprobs req=%s prompt_len=%s lora_id=%s lock_wait_s=%.3f total_s=%.3f",
+                    request_id,
+                    len(prompt_ids),
+                    lora_int_id,
+                    t1 - t0,
+                    t2 - t0,
                 )
 
             # Extract prompt logprobs
@@ -2084,10 +2116,14 @@ def _create_multinode_vllm_actor(
                     assert final_res is not None
             t2 = time.perf_counter()
             if self._timing:
-                print(
-                    f"[vLLM timing] prompt_topk req={request_id} prompt_len={len(prompt_ids)} "
-                    f"k={kk} lora_id={lora_int_id} lock_wait_s={t1 - t0:.3f} total_s={t2 - t0:.3f}",
-                    flush=True,
+                logger.info(
+                    "[vLLM timing] prompt_topk req=%s prompt_len=%s k=%s lora_id=%s lock_wait_s=%.3f total_s=%.3f",
+                    request_id,
+                    len(prompt_ids),
+                    kk,
+                    lora_int_id,
+                    t1 - t0,
+                    t2 - t0,
                 )
 
             prompt_logprobs = final_res.prompt_logprobs
@@ -2954,11 +2990,6 @@ class MultiNodeInferenceEngine:
                 lora_id,
             )
         except Exception:
-            print(
-                "[vLLM add_lora_for_session_from_path failed] "
-                f"sampling_session_id={sampling_session_id} lora_int_id={lora_id} path={lora_path}",
-                flush=True,
-            )
             logger.exception(
                 "Failed to add LoRA from path for sampling_session_id=%s lora_int_id=%s path=%s",
                 sampling_session_id,

@@ -214,6 +214,8 @@ def actor_runtime_env_vars(*, pythonpath: str, extra: dict[str, str] | None = No
         out["TINKER_CONFIG_PATH"] = config_path
     for key in (
         "MINT_VLLM_CHILD_PYTHON_EXECUTABLE",
+        "MINT_VLLM_SERIALIZE_ADD_LORA_UNTIL_IDLE",
+        "MINT_VLLM_SKIP_PEFT_SHAPE_VALIDATION",
         "MINT_CONTROL_PLANE_PINNED_NODE_IP",
         "MINT_API_WORK_QUEUE_PINNED_NODE_IP",
         "MINT_STARTUP_LEASE_PINNED_NODE_IP",
