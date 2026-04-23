@@ -112,7 +112,7 @@ def _create_model(session_id: str, rank: int) -> str:
     return model_id
 
 
-def _forward_backward(model_id: str) -> dict[str, Any]:
+def _train_step(model_id: str, *, learning_rate: float = 2e-4) -> dict[str, Any]:
     target_tokens = [1, 2, 3]
     weights = [1.0, 1.0, 1.0]
     datum = {
@@ -141,19 +141,20 @@ def _forward_backward(model_id: str) -> dict[str, Any]:
         },
     }
     out = _post_json(
-        "/api/v1/forward_backward",
+        "/api/v1/train_step",
         {
             "model_id": model_id,
             "forward_backward_input": {
                 "data": [datum],
                 "loss_fn": "cross_entropy",
             },
+            "adam_params": {"learning_rate": learning_rate},
         },
         timeout_s=120.0,
     )
     request_id = out.get("request_id")
     if not isinstance(request_id, str) or not request_id:
-        raise RuntimeError(f"forward_backward missing request_id: {out!r}")
+        raise RuntimeError(f"train_step missing request_id: {out!r}")
     return _poll_future(request_id, timeout_s=2400.0)
 
 
@@ -262,14 +263,14 @@ def main() -> int:
         session_64 = _create_session(f"issue476-rank-{HIGH_RANK}-{uuid.uuid4().hex[:8]}")
         model_64 = _create_model(session_64, HIGH_RANK)
         print(f"rank={HIGH_RANK} create_model -> model_id={model_64}")
-        fb_64 = _forward_backward(model_64)
-        print(f"rank={HIGH_RANK} forward_backward -> keys={sorted(fb_64.keys())}")
+        train_64 = _train_step(model_64)
+        print(f"rank={HIGH_RANK} train_step -> keys={sorted(train_64.keys())}")
 
         session_16 = _create_session(f"issue476-rank-{LOW_RANK}-{uuid.uuid4().hex[:8]}")
         model_16 = _create_model(session_16, LOW_RANK)
         print(f"rank={LOW_RANK} create_model -> model_id={model_16}")
-        fb_16 = _forward_backward(model_16)
-        print(f"rank={LOW_RANK} forward_backward -> keys={sorted(fb_16.keys())}")
+        train_16 = _train_step(model_16)
+        print(f"rank={LOW_RANK} train_step -> keys={sorted(train_16.keys())}")
 
         save_result = _save_state(model_16, f"issue476-r16-{uuid.uuid4().hex[:8]}")
         filesystem_path = save_result.get("filesystem_path")

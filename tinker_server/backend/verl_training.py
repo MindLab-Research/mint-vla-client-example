@@ -2638,6 +2638,7 @@ class VerlTrainingEngine:
                 rollout_correction_config,
                 lr,
                 session.model_id,
+                session.lora_config.rank if session.lora_config else None,
                 traceparent=traceparent,
                 train_attn=train_attn,
                 train_mlp=train_mlp,
