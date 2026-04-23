@@ -30,6 +30,13 @@ from ..auth_identity import can_write
 from ..auth_identity import get_user_data as _request_user_data
 from ..auth_identity import get_user_id as _request_user_id
 from ..backend.future_store import future_store
+from ..checkpoint_index import (
+    CheckpointAlreadyExistsError,
+    CheckpointAlreadyFailedError,
+    CheckpointAlreadyUploadingError,
+    claim_checkpoint_publication,
+    mark_checkpoint_failed,
+)
 from ..checkpoints import (
     CHECKPOINTS_DIR,
     MIRROR_STATUS_PENDING,
@@ -74,6 +81,42 @@ router = APIRouter()
 training_manager: TrainingSessionManager | None = None
 training_engine: VerlTrainingEngine | None = None
 inference_manager: SessionManager | None = None  # For multi-LoRA sampling registration
+
+
+async def _claim_checkpoint_or_raise(
+    *,
+    owner_id: str | None,
+    model_id: str,
+    raw_checkpoint_id: str,
+    checkpoint_type: str,
+    model_name: str | None,
+    checkpoint_created_at: str,
+    retry: bool,
+) -> str | None:
+    try:
+        return await claim_checkpoint_publication(
+            owner_id=owner_id,
+            model_id=model_id,
+            raw_checkpoint_id=raw_checkpoint_id,
+            checkpoint_type=checkpoint_type,
+            storage_root=get_persistent_cache_dir(),
+            model_name=model_name,
+            checkpoint_created_at=checkpoint_created_at,
+            retry=retry,
+        )
+    except (CheckpointAlreadyUploadingError, CheckpointAlreadyExistsError, CheckpointAlreadyFailedError) as e:
+        raise RuntimeError(str(e)) from e
+
+
+async def _mark_checkpoint_failed_safe(ckpt_id: str | None, *, fail_reason: str) -> None:
+    try:
+        await mark_checkpoint_failed(ckpt_id, fail_reason=fail_reason)
+    except Exception:
+        logger.exception(
+            "[weights.checkpoint_index] mark_failed failed ckpt_id=%s fail_reason=%s",
+            ckpt_id,
+            fail_reason,
+        )
 
 
 def _require_write_access(request: Request) -> None:
@@ -726,6 +769,8 @@ async def _do_save_state(
     """
     session = None
     inflight_marked = False
+    claimed_ckpt_id: str | None = None
+    mirror_started = False
 
     try:
         set_request_id(request_id)
@@ -743,10 +788,22 @@ async def _do_save_state(
         else:
             checkpoint_name = f"ckpt_{uuid.uuid4().hex[:12]}"
 
+        created_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        claimed_ckpt_id = await _claim_checkpoint_or_raise(
+            owner_id=user_id,
+            model_id=session.model_id,
+            raw_checkpoint_id=checkpoint_name,
+            checkpoint_type="training",
+            model_name=session.base_model,
+            checkpoint_created_at=created_at,
+            retry=bool(request.retry),
+        )
+
         save_path = build_persistent_cache_dir(
             user_id=user_id,
             model_id=session.model_id,
             checkpoint_name=checkpoint_name,
+            checkpoint_type="training",
         )
 
         logger.info(f"[{session.model_id}] Saving state to: {save_path}")
@@ -789,7 +846,7 @@ async def _do_save_state(
             "owner_id": user_id,
             "model_id": session.model_id,
             "model_name": session.base_model,
-            "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "created_at": created_at,
             "step": session.current_step,
             "checkpoint_type": "training",
             "optimizer_present": optimizer_present,
@@ -797,6 +854,7 @@ async def _do_save_state(
             "type": "training",
             "storage_tier": "persistent_cache",
             "ttl_seconds": request.ttl_seconds,
+            "ckpt_id": claimed_ckpt_id,
         }
         write_checkpoint_metadata(save_path, metadata)
 
@@ -805,7 +863,9 @@ async def _do_save_state(
             user_id=user_id,
             model_id=session.model_id,
             checkpoint_name=checkpoint_name,
+            checkpoint_type="training",
         )
+        mirror_started = True
 
         # Sampling engines load checkpoints on demand via checkpoint_uri/create_sampling_session.
         # Do not block save_state completion on vLLM engine creation or LoRA hot-load.
@@ -829,6 +889,7 @@ async def _do_save_state(
 
         await future_store.async_resolve(request_id, {
             "checkpoint_id": checkpoint_name,
+            "checkpoint_record_id": claimed_ckpt_id,
             "path": selected_path,
             "mint_path": mint_path,
             "tinker_path": tinker_path,
@@ -856,6 +917,8 @@ async def _do_save_state(
             )
 
     except Exception as e:
+        if not mirror_started:
+            await _mark_checkpoint_failed_safe(claimed_ckpt_id, fail_reason="upload_error")
         logger.exception(
             "[weights.save_state] failed request_id=%s model_id=%s failure_reason=%s error_type=%s next_action=%s",
             str(request_id),
@@ -899,6 +962,8 @@ async def _do_save_weights(
     """
     session = None
     inflight_marked = False
+    claimed_ckpt_id: str | None = None
+    mirror_started = False
     try:
         set_request_id(request_id)
         if training_engine is None or training_manager is None:
@@ -915,10 +980,22 @@ async def _do_save_weights(
         else:
             checkpoint_name = f"ckpt_{uuid.uuid4().hex[:12]}"
 
+        created_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        claimed_ckpt_id = await _claim_checkpoint_or_raise(
+            owner_id=user_id,
+            model_id=session.model_id,
+            raw_checkpoint_id=checkpoint_name,
+            checkpoint_type="sampler",
+            model_name=session.base_model,
+            checkpoint_created_at=created_at,
+            retry=bool(request.retry),
+        )
+
         save_path = build_persistent_cache_dir(
             user_id=user_id,
             model_id=session.model_id,
             checkpoint_name=checkpoint_name,
+            checkpoint_type="sampler",
         )
 
         logger.info(f"[{session.model_id}] Saving sampler weights to: {save_path}")
@@ -928,7 +1005,8 @@ async def _do_save_weights(
             lambda: training_engine.save_weights_for_sampler(
                 session=session,
                 checkpoint_name=checkpoint_name,
-                checkpoint_base_dir=os.path.dirname(os.path.dirname(save_path)),
+                checkpoint_base_dir=os.path.dirname(os.path.dirname(os.path.dirname(save_path))),
+                checkpoint_type="sampler",
             ),
             component="routes.weights",
             op="weights.save_weights",
@@ -954,7 +1032,7 @@ async def _do_save_weights(
             "owner_id": user_id,
             "model_id": session.model_id,
             "model_name": session.base_model,
-            "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "created_at": created_at,
             "step": session.current_step,
             "checkpoint_type": "sampler",
             "optimizer_present": False,
@@ -962,6 +1040,7 @@ async def _do_save_weights(
             "type": "sampler",
             "storage_tier": "persistent_cache",
             "ttl_seconds": request.ttl_seconds,
+            "ckpt_id": claimed_ckpt_id,
         }
         write_checkpoint_metadata(save_path, metadata)
 
@@ -970,7 +1049,9 @@ async def _do_save_weights(
             user_id=user_id,
             model_id=session.model_id,
             checkpoint_name=checkpoint_name,
+            checkpoint_type="sampler",
         )
+        mirror_started = True
 
         # Keep save_weights completion scoped to checkpoint export + metadata publication.
         # Sampler clients can load the returned checkpoint path on demand.
@@ -996,6 +1077,7 @@ async def _do_save_weights(
             request_id,
             {
                 "checkpoint_id": checkpoint_name,
+                "checkpoint_record_id": claimed_ckpt_id,
                 "path": selected_path,
                 "mint_path": mint_path,
                 "tinker_path": tinker_path,
@@ -1023,6 +1105,8 @@ async def _do_save_weights(
             )
 
     except Exception as e:
+        if not mirror_started:
+            await _mark_checkpoint_failed_safe(claimed_ckpt_id, fail_reason="upload_error")
         logger.exception(
             "[weights.save_weights] failed request_id=%s model_id=%s failure_reason=%s error_type=%s next_action=%s",
             str(request_id),

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Request
 
@@ -16,10 +17,20 @@ from ..checkpoints import (
     begin_async_checkpoint_mirror,
     build_persistent_cache_dir,
     ensure_checkpoint_path_allowed,
+    get_persistent_cache_dir,
     materialize_persistent_checkpoint,
+    read_checkpoint_metadata,
     resolve_checkpoint_path,
+    write_checkpoint_metadata,
 )
 from ..client_compat import checkpoint_uri
+from ..checkpoint_index import (
+    CheckpointAlreadyExistsError,
+    CheckpointAlreadyFailedError,
+    CheckpointAlreadyUploadingError,
+    claim_checkpoint_publication,
+    mark_checkpoint_failed,
+)
 from ..logging_context import classify_failure_reason, set_request_id
 from ..model_access_control import can_access_model, get_access_denied_error
 from ..queue_priority import merge_queue_priority_extra
@@ -91,6 +102,41 @@ def _session_field(session: object, key: str, default=None):
     if isinstance(session, dict):
         return session.get(key, default)
     return getattr(session, key, default)
+
+
+async def _claim_sampler_checkpoint_or_raise(
+    *,
+    owner_id: str | None,
+    model_id: str,
+    raw_checkpoint_id: str,
+    model_name: str | None,
+    checkpoint_created_at: str,
+    retry: bool,
+) -> str | None:
+    try:
+        return await claim_checkpoint_publication(
+            owner_id=owner_id,
+            model_id=model_id,
+            raw_checkpoint_id=raw_checkpoint_id,
+            checkpoint_type="sampler",
+            storage_root=get_persistent_cache_dir(),
+            model_name=model_name,
+            checkpoint_created_at=checkpoint_created_at,
+            retry=retry,
+        )
+    except (CheckpointAlreadyUploadingError, CheckpointAlreadyExistsError, CheckpointAlreadyFailedError) as e:
+        raise RuntimeError(str(e)) from e
+
+
+async def _mark_checkpoint_failed_safe(ckpt_id: str | None, *, fail_reason: str) -> None:
+    try:
+        await mark_checkpoint_failed(ckpt_id, fail_reason=fail_reason)
+    except Exception:
+        logger.exception(
+            "[mint.checkpoint_index] mark_failed failed ckpt_id=%s fail_reason=%s",
+            ckpt_id,
+            fail_reason,
+        )
 
 
 def _reverse_kl_token_stats(data: list) -> tuple[int, int]:
@@ -486,21 +532,40 @@ async def _do_interpolate_checkpoints(
     request: InterpolateCheckpointsRequest,
     user_id: str | None,
 ) -> None:
+    claimed_ckpt_id: str | None = None
+    mirror_started = False
     set_request_id(request_id)
     try:
         resolved_sources = list(request.source_paths)
+        output_checkpoint_type = str(request.output_checkpoint_type or "sampler")
+        if output_checkpoint_type != "sampler":
+            raise ValueError(
+                f"output_checkpoint_type={output_checkpoint_type!r} is not supported; only 'sampler' is allowed"
+            )
+
         # validate metadata/model lineage before choosing output location
         from ..backend.mintx_ops import _validate_source_metadata
 
-        model_id, _model_name, _backend, _first_meta = _validate_source_metadata(resolved_sources)
+        model_id, model_name, _backend, _first_meta = _validate_source_metadata(resolved_sources)
         checkpoint_name = request.output_path.strip() if request.output_path else f"mintx-{uuid.uuid4().hex[:12]}"
         if checkpoint_name in (".", "..") or "/" in checkpoint_name or "\\" in checkpoint_name:
             raise ValueError(f"Invalid output_path: {request.output_path!r}")
+
+        created_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        claimed_ckpt_id = await _claim_sampler_checkpoint_or_raise(
+            owner_id=user_id,
+            model_id=model_id,
+            raw_checkpoint_id=checkpoint_name,
+            model_name=model_name,
+            checkpoint_created_at=created_at,
+            retry=bool(request.retry),
+        )
 
         save_path = build_persistent_cache_dir(
             user_id=user_id,
             model_id=model_id,
             checkpoint_name=checkpoint_name,
+            checkpoint_type=output_checkpoint_type,
         )
         artifacts = interpolate_checkpoints_to_dir(
             source_paths=resolved_sources,
@@ -508,23 +573,33 @@ async def _do_interpolate_checkpoints(
             output_dir=save_path,
             checkpoint_name=checkpoint_name,
             user_id=user_id,
-            output_checkpoint_type=request.output_checkpoint_type,
+            output_checkpoint_type=output_checkpoint_type,
         )
+
+        metadata = read_checkpoint_metadata(save_path)
+        metadata["created_at"] = created_at
+        metadata["ckpt_id"] = claimed_ckpt_id
+        write_checkpoint_metadata(save_path, metadata)
+
         persistent_path = begin_async_checkpoint_mirror(
             save_path,
             user_id=user_id,
             model_id=model_id,
             checkpoint_name=checkpoint_name,
+            checkpoint_type=output_checkpoint_type,
         )
+        mirror_started = True
         path_uri = checkpoint_uri(
             model_id,
             checkpoint_name,
             prefer_tinker=False,
-            checkpoint_type="sampler",
+            checkpoint_type=output_checkpoint_type,
         )
         await future_store.async_resolve(
             request_id,
             {
+                "checkpoint_id": checkpoint_name,
+                "checkpoint_record_id": claimed_ckpt_id,
                 "path": path_uri,
                 "checkpoint_type": artifacts.output_checkpoint_type,
                 "source_paths": request.source_paths,
@@ -537,6 +612,8 @@ async def _do_interpolate_checkpoints(
             },
         )
     except Exception as e:
+        if not mirror_started:
+            await _mark_checkpoint_failed_safe(claimed_ckpt_id, fail_reason="upload_error")
         logger.exception(
             "[mint.interpolate_checkpoints] failed request_id=%s failure_reason=%s error_type=%s next_action=%s",
             str(request_id),
