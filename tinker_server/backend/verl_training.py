@@ -1642,6 +1642,14 @@ class VerlTrainingEngine:
         raw = os.environ.get("MINT_MEGATRON_GUARD_PREFLIGHT", "1").strip().lower()
         return raw not in ("0", "false", "no", "off")
 
+    def _megatron_guard_query_timeout_s(self) -> float:
+        raw = os.environ.get("MINT_MEGATRON_GUARD_QUERY_TIMEOUT_S", "30").strip()
+        try:
+            timeout_s = float(raw)
+        except Exception:
+            timeout_s = 30.0
+        return max(1.0, timeout_s)
+
     async def _ensure_megatron_session_guard_clean(
         self,
         session: "TrainingSession",
@@ -1654,12 +1662,13 @@ class VerlTrainingEngine:
         get_guard_state = getattr(worker, "get_session_guard_state", None)
         if get_guard_state is None:
             return
+        guard_timeout_s = self._megatron_guard_query_timeout_s()
         try:
             guard_state = await self._await_with_keepalive(
                 get_guard_state.remote(session.model_id),
                 session,
                 interval_s=30.0,
-                timeout_s=30.0,
+                timeout_s=guard_timeout_s,
             )
         except Exception as e:
             raise RuntimeError(

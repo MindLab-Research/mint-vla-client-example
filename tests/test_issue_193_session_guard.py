@@ -200,6 +200,80 @@ def test_issue_193_megatron_current_session_corruption_fails_closed():
         group._ensure_session_loaded("session_current")
 
 
+def test_issue_193_megatron_explicit_load_prepare_converges_outgoing_actor_only_state(monkeypatch):
+    group_cls = MegatronWorkerGroup.__ray_actor_class__
+    group = group_cls.__new__(group_cls)
+    group._current_session = "session_outgoing"
+    group.base_model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    group.learning_rate = 1e-4
+    group._step_count = 0
+    group._actual_rank = 8
+    group.lora_rank = 8
+    group._session_unknown_due_to_partial_swap = False
+
+    swap_calls: list[str] = []
+    mark_calls: list[str] = []
+    clear_calls: list[str] = []
+    clear_persisted_calls: list[str] = []
+    save_metadata_calls: list[tuple] = []
+    persisted_manifest_calls: list[dict] = []
+
+    class _FakeWorker:
+        class clear_session_state:
+            @staticmethod
+            def remote(session_id, traceparent=None):
+                clear_calls.append(session_id)
+                return object()
+
+        class mark_session_loaded:
+            @staticmethod
+            def remote(session_id):
+                mark_calls.append(session_id)
+                return object()
+
+    group.workers = [_FakeWorker()]
+    group._session_manager = SimpleNamespace(
+        get_session_path=lambda session_id: f"/tmp/{session_id}",
+        has_actor_only_state=lambda session_id: session_id == "session_outgoing",
+        session_exists=lambda session_id: session_id == "session_target",
+        save_metadata=lambda *args: save_metadata_calls.append(args),
+        clear_persisted_actor_only_state=lambda session_id: clear_persisted_calls.append(session_id),
+        clear_actor_only_state=lambda session_id: clear_calls.append(session_id),
+        save_persisted_actor_only_state=lambda session_id, actor_name, worker_entries: persisted_manifest_calls.append(
+            {
+                "session_id": session_id,
+                "actor_name": actor_name,
+                "worker_entries": worker_entries,
+            }
+        ),
+    )
+    group._bind_traceparent = lambda traceparent: None
+    group.save_adapter_state = lambda *args, **kwargs: None
+    group._swap_session_on_workers = lambda session_id: (
+        swap_calls.append(session_id)
+        or [{"outgoing_persisted": {"rank": 0, "path": "/tmp/r0.pt", "bytes": 123}}]
+    )
+    monkeypatch.setattr(ray, "get", lambda refs, timeout=None: None)
+
+    group._prepare_session_for_explicit_load("session_target")
+
+    assert swap_calls == ["session_target"]
+    assert mark_calls == []
+    assert save_metadata_calls and save_metadata_calls[0][0] == "session_outgoing"
+    assert clear_persisted_calls == ["session_target"]
+    assert persisted_manifest_calls == [
+        {
+            "session_id": "session_outgoing",
+            "actor_name": "megatron_qwen3_30b_a3b_instruct_2507",
+            "worker_entries": [{"rank": 0, "path": "/tmp/r0.pt", "bytes": 123}],
+        }
+    ]
+    # clear_session_state(target) + clear_actor_only_state(target) + clear_actor_only_state(outgoing)
+    assert clear_calls.count("session_target") == 2
+    assert clear_calls.count("session_outgoing") == 1
+    assert group._current_session == "session_target"
+
+
 def test_issue_193_megatron_explicit_load_prepare_allows_dirty_target_on_fresh_actor(monkeypatch):
     group_cls = MegatronWorkerGroup.__ray_actor_class__
     group = group_cls.__new__(group_cls)

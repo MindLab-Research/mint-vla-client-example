@@ -638,6 +638,38 @@ def _checkpoint_view_matches_owner(path: str, *, owner_dir: str) -> bool:
     return actual == owner_dir
 
 
+def _prefer_cached_checkpoint_view(
+    path_part: str,
+    *,
+    checkpoint_type: CheckpointType,
+    owner_dir: str,
+    is_admin: bool,
+) -> str | None:
+    """Return persistent-cache checkpoint view when available.
+
+    Newly saved checkpoints are immediately present under persistent_cache and
+    may take time to mirror into persistent storage. Prefer cache first so
+    save_state -> load_state can run deterministically in one session.
+    """
+    cache_root = get_persistent_cache_dir()
+    if is_admin:
+        candidates = [
+            os.path.join(cache_root, path_part),
+            *glob.glob(os.path.join(cache_root, "*", path_part)),
+        ]
+    else:
+        candidates = [os.path.join(cache_root, owner_dir, path_part)]
+
+    for candidate in candidates:
+        resolved = _existing_checkpoint_view(candidate, checkpoint_type=checkpoint_type)
+        if resolved is None:
+            continue
+        if is_admin and not _checkpoint_view_matches_owner(resolved, owner_dir=owner_dir):
+            continue
+        return resolved
+    return None
+
+
 def resolve_checkpoint_uri(
     uri: str,
     checkpoints_dir: str,
@@ -669,6 +701,15 @@ def resolve_checkpoint_uri(
         )
     owner_dir = _scoped_checkpoint_owner_dir(user_id, is_admin=is_admin)
     path_part = _strip_tinker_checkpoint_kind(raw_path_part)
+
+    cached = _prefer_cached_checkpoint_view(
+        path_part,
+        checkpoint_type=checkpoint_type,
+        owner_dir=owner_dir,
+        is_admin=is_admin,
+    )
+    if cached is not None:
+        return cached
 
     for candidate in _deterministic_checkpoint_candidates(roots, owner_dir=owner_dir, path_part=path_part):
         resolved = _existing_checkpoint_view(candidate, checkpoint_type=checkpoint_type)

@@ -6493,6 +6493,49 @@ class MegatronWorkerGroup:
         logger.info("[MegatronWorkerGroup] Session state swapped on all workers")
         return results
 
+    def _finalize_outgoing_actor_only_snapshot(
+        self,
+        *,
+        outgoing_session_id: str | None,
+        swap_results: list[dict] | None,
+    ) -> None:
+        """Persist outgoing actor-only snapshot manifest and clear dirty marker.
+
+        Worker swaps persist per-rank snapshots. Group-level manifest + marker
+        cleanup must happen in manager state so follow-up session restores can
+        locate persisted state deterministically.
+        """
+        if outgoing_session_id is None:
+            return
+        swap_results = [] if swap_results is None else list(swap_results)
+        if not swap_results:
+            return
+        persisted_entries = [
+            result.get("outgoing_persisted")
+            for result in swap_results
+            if isinstance(result, dict) and result.get("outgoing_persisted")
+        ]
+        if len(persisted_entries) != len(swap_results):
+            raise RuntimeError(
+                f"Failed to persist actor-only state for outgoing session {outgoing_session_id}: "
+                f"expected {len(swap_results)} rank snapshots, got {len(persisted_entries)}"
+            )
+        session_manager = getattr(self, "_session_manager", None)
+        save_persisted_actor_only_state = getattr(
+            session_manager,
+            "save_persisted_actor_only_state",
+            None,
+        )
+        if save_persisted_actor_only_state is not None:
+            save_persisted_actor_only_state(
+                outgoing_session_id,
+                actor_name=_make_megatron_actor_name(str(getattr(self, "base_model", "unknown"))),
+                worker_entries=persisted_entries,
+            )
+        clear_actor_only_state = getattr(session_manager, "clear_actor_only_state", None)
+        if clear_actor_only_state is not None:
+            clear_actor_only_state(outgoing_session_id)
+
     def _session_state_cached_on_workers(self, session_id: str) -> bool:
         """Whether every live worker still has actor-only state for this session in memory."""
         if not self.workers:
@@ -6655,33 +6698,10 @@ class MegatronWorkerGroup:
             )
         except TypeError:
             swap_results = self._swap_session_on_workers(session_id)
-        if outgoing_session_id is not None:
-            swap_results = [] if swap_results is None else swap_results
-            if swap_results:
-                persisted_entries = [
-                    result.get("outgoing_persisted")
-                    for result in swap_results
-                    if isinstance(result, dict) and result.get("outgoing_persisted")
-                ]
-                if len(persisted_entries) != len(swap_results):
-                    raise RuntimeError(
-                        f"Failed to persist actor-only state for outgoing session {outgoing_session_id}: "
-                        f"expected {len(swap_results)} rank snapshots, got {len(persisted_entries)}"
-                    )
-                save_persisted_actor_only_state = getattr(
-                    self._session_manager,
-                    "save_persisted_actor_only_state",
-                    None,
-                )
-                if save_persisted_actor_only_state is not None:
-                    save_persisted_actor_only_state(
-                        outgoing_session_id,
-                        actor_name=_make_megatron_actor_name(str(getattr(self, "base_model", "unknown"))),
-                        worker_entries=persisted_entries,
-                    )
-                clear_actor_only_state = getattr(self._session_manager, "clear_actor_only_state", None)
-                if clear_actor_only_state is not None:
-                    clear_actor_only_state(outgoing_session_id)
+        self._finalize_outgoing_actor_only_snapshot(
+            outgoing_session_id=outgoing_session_id,
+            swap_results=swap_results,
+        )
         t_swap1 = time.perf_counter() if timing else 0.0
 
         # Load new session's LoRA weights from disk (or reset for new session)
@@ -6792,14 +6812,15 @@ class MegatronWorkerGroup:
             if callable(session_exists):
                 target_exists = bool(session_exists(session_id))
 
-        if self._current_session is not None and session_manager is not None and current_is_dirty:
-            old_path = session_manager.get_session_path(self._current_session)
-            logger.info(f"[MegatronWorkerGroup] Saving outgoing session {self._current_session}")
+        outgoing_session_id = self._current_session
+        if outgoing_session_id is not None and session_manager is not None and current_is_dirty:
+            old_path = session_manager.get_session_path(outgoing_session_id)
+            logger.info(f"[MegatronWorkerGroup] Saving outgoing session {outgoing_session_id}")
             self.save_adapter_state(old_path, traceparent=traceparent)
             save_metadata = getattr(session_manager, "save_metadata", None)
             if save_metadata is not None:
                 save_metadata(
-                    self._current_session,
+                    outgoing_session_id,
                     self._step_count,
                     self.learning_rate,
                     self._actual_rank,
@@ -6822,7 +6843,8 @@ class MegatronWorkerGroup:
             clear_actor_only_state = getattr(session_manager, "clear_actor_only_state", None)
             if clear_actor_only_state is not None:
                 clear_actor_only_state(session_id)
-        if target_exists and not target_has_actor_only_state:
+        swap_results: list[dict] | None = None
+        if target_exists and not target_has_actor_only_state and outgoing_session_id is None:
             mark_refs = [
                 w.mark_session_loaded.remote(session_id)
                 for w in self.workers
@@ -6831,7 +6853,11 @@ class MegatronWorkerGroup:
             if mark_refs:
                 ray.get(mark_refs)
         else:
-            self._swap_session_on_workers(session_id)
+            swap_results = self._swap_session_on_workers(session_id)
+        self._finalize_outgoing_actor_only_snapshot(
+            outgoing_session_id=outgoing_session_id,
+            swap_results=swap_results,
+        )
         self._current_session = session_id
         self._session_unknown_due_to_partial_swap = False
 
