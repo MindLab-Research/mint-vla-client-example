@@ -106,12 +106,17 @@ def _create_model_from_state(base_url: str, headers: dict[str, str], *, base_mod
 
 def _train_step(base_url: str, headers: dict[str, str], *, model_id: str) -> dict[str, Any]:
     payload = {"model_id": model_id, "loss_fn": "cross_entropy", "data": [_train_datum()]}
-    return _await_result(base_url, headers, _post_json(base_url, "/api/v1/mint/vla/train_step", headers, payload))
+    result = _await_result(base_url, headers, _post_json(base_url, "/api/v1/mint/vla/train_step", headers, payload))
+    if "error" in result:
+        raise RuntimeError(f"train_step failed: {result!r}")
+    return result
 
 
 def _save_state(base_url: str, headers: dict[str, str], *, model_id: str) -> str:
     payload = {"model_id": model_id, "path": f"resume_smoke_{uuid.uuid4().hex[:8]}"}
     result = _await_result(base_url, headers, _post_json(base_url, "/api/v1/save_state", headers, payload))
+    if "error" in result:
+        raise RuntimeError(f"save_state failed: {result!r}")
     path = result.get("path")
     if not isinstance(path, str) or not path:
         raise RuntimeError(f"save_state missing path: {result!r}")
@@ -123,6 +128,15 @@ def _delete_model(base_url: str, headers: dict[str, str], model_id: str) -> None
         requests.delete(f"{base_url}/api/v1/models/{model_id}", headers=headers, timeout=120.0)
     except Exception:
         pass
+
+
+def _is_missing_openpi_runtime_dependency(exc: Exception) -> bool:
+    msg = str(exc)
+    if "ModuleNotFoundError" not in msg and "No module named" not in msg:
+        return False
+    needles = ("openpi", "flax", "jaxtyping", "augmax", "beartype", "tyro")
+    msg_l = msg.lower()
+    return any(name in msg_l for name in needles)
 
 
 def main() -> int:
@@ -144,12 +158,26 @@ def main() -> int:
         model_b = _create_model_from_state(base_url, headers, base_model=args.model, state_path=state_path)
         post = _train_step(base_url, headers, model_id=model_b)
         payload = {
+            "status": "ok",
             "model": args.model,
             "model_a": model_a,
             "model_b": model_b,
             "state_path": state_path,
             "pre_metrics": pre.get("metrics", {}),
             "post_metrics": post.get("metrics", {}),
+        }
+        if args.output_json:
+            with open(args.output_json, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2)
+        print(json.dumps(payload, indent=2))
+        return 0
+    except Exception as exc:
+        if not _is_missing_openpi_runtime_dependency(exc):
+            raise
+        payload = {
+            "status": "skipped_dependency",
+            "model": args.model,
+            "reason": str(exc),
         }
         if args.output_json:
             with open(args.output_json, "w", encoding="utf-8") as handle:

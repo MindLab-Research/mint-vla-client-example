@@ -3988,9 +3988,6 @@ async def list_training_runs(
 @router.get("/models/{model_id}")
 async def get_model_info(model_id: str):
     """Get information about a training model."""
-    if training_manager is None:
-        raise HTTPException(status_code=503, detail="Training manager not initialized")
-
     try:
         info = await _get_authoritative_training_info(model_id)
     except Exception as e:
@@ -4059,9 +4056,6 @@ async def get_info(request: GetInfoRequest, http_request: Request) -> GetInfoRes
                 raise HTTPException(status_code=resp.status_code, detail=resp.text)
             return GetInfoResponse.model_validate(resp.json())
 
-    if training_manager is None:
-        raise HTTPException(status_code=503, detail="Training manager not initialized")
-
     if info is None:
         raise HTTPException(
             status_code=404, detail=f"Model '{request.model_id}' not found"
@@ -4089,9 +4083,6 @@ async def get_info(request: GetInfoRequest, http_request: Request) -> GetInfoRes
 @router.get("/models")
 async def list_models():
     """List all training models."""
-    if training_manager is None:
-        raise HTTPException(status_code=503, detail="Training manager not initialized")
-
     try:
         infos_by_id = await _list_authoritative_training_infos()
     except Exception as e:

@@ -73,6 +73,28 @@ class ModelInput(BaseModel):
 
     chunks: list[ModelInputChunk]
 
+    @field_validator("chunks", mode="before")
+    @classmethod
+    def _normalize_legacy_chunks(cls, value: Any) -> Any:
+        if not isinstance(value, list):
+            return value
+        normalized: list[Any] = []
+        for chunk in value:
+            if not isinstance(chunk, dict) or "type" in chunk:
+                normalized.append(chunk)
+                continue
+            if "tokens" in chunk:
+                normalized.append({"type": "encoded_text", **chunk})
+                continue
+            if "data" in chunk and "format" in chunk:
+                normalized.append({"type": "image", **chunk})
+                continue
+            if "location" in chunk and "format" in chunk:
+                normalized.append({"type": "image_asset_pointer", **chunk})
+                continue
+            normalized.append(chunk)
+        return normalized
+
     @property
     def length(self) -> int:
         return sum(chunk.length for chunk in self.chunks)
