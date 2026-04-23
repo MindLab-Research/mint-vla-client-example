@@ -30,6 +30,8 @@ class _ServerSection(BaseModel):
     usage_pg_pool_max: int | None = None
     usage_write_timeout_ms: int | None = None
     usage_pg_table: str | None = None
+    checkpoint_index_pg_dsn: str | None = None
+    checkpoint_index_write_timeout_ms: int | None = None
     skip_actor_cleanup: bool | None = None
 
     tensor_parallel_size: int | None = None

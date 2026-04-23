@@ -20,13 +20,16 @@ Endpoints:
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import inspect
 import json
 import logging
 import os
 import re
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
+from functools import lru_cache
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -50,6 +53,13 @@ from ..logging_context import (
 )
 
 from ..backend.future_store import FutureStatus, future_store
+from ..checkpoint_index import (
+    CheckpointAlreadyExistsError,
+    CheckpointAlreadyFailedError,
+    CheckpointAlreadyUploadingError,
+    claim_checkpoint_publication,
+    mark_checkpoint_failed,
+)
 from ..checkpoints import (
     MIRROR_STATUS_PENDING,
     begin_async_checkpoint_mirror,
@@ -59,6 +69,7 @@ from ..checkpoints import (
     checkpoint_has_optimizer_state,
     async_create_checkpoint_archive,
     ensure_checkpoint_path_allowed,
+    get_persistent_cache_dir,
     materialize_persistent_checkpoint,
     resolve_checkpoint_path,
     validate_sampler_checkpoint_for_sampling,
@@ -101,6 +112,41 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+
+async def _claim_sampler_checkpoint_or_raise(
+    *,
+    owner_id: str | None,
+    model_id: str,
+    raw_checkpoint_id: str,
+    model_name: str | None,
+    checkpoint_created_at: str,
+    retry: bool,
+) -> str | None:
+    try:
+        return await claim_checkpoint_publication(
+            owner_id=owner_id,
+            model_id=model_id,
+            raw_checkpoint_id=raw_checkpoint_id,
+            checkpoint_type="sampler",
+            storage_root=get_persistent_cache_dir(),
+            model_name=model_name,
+            checkpoint_created_at=checkpoint_created_at,
+            retry=retry,
+        )
+    except (CheckpointAlreadyUploadingError, CheckpointAlreadyExistsError, CheckpointAlreadyFailedError) as e:
+        raise RuntimeError(str(e)) from e
+
+
+async def _mark_checkpoint_failed_safe(ckpt_id: str | None, *, fail_reason: str) -> None:
+    try:
+        await mark_checkpoint_failed(ckpt_id, fail_reason=fail_reason)
+    except Exception:
+        logger.exception(
+            "[training.checkpoint_index] mark_failed failed ckpt_id=%s fail_reason=%s",
+            ckpt_id,
+            fail_reason,
+        )
+
 # Global references (set by app lifespan)
 training_manager: TrainingSessionManager | None = None
 training_engine: VerlTrainingEngine | None = None
@@ -123,7 +169,9 @@ def _mark_training_inflight(model_id: str, delta: int) -> None:
 async def _fail_future(request_id: str, error: str) -> None:
     async_fail = getattr(future_store, "async_fail", None)
     if callable(async_fail):
-        await async_fail(request_id, error)
+        result = async_fail(request_id, error)
+        if inspect.isawaitable(result):
+            await result
         return
     fail = getattr(future_store, "fail", None)
     if callable(fail):
@@ -289,9 +337,28 @@ def _refresh_training_session_from_info_if_needed(model_id: str, info: dict, sna
 
     incoming_version = max(1, int(info.get("metadata_version") or 1))
     incoming_step = max(0, int(info.get("current_step") or 0))
+    incoming_actor_name = str(info.get("actor_name") or "") or None
+    incoming_namespace = str(info.get("namespace") or "") or None
     current_version = max(1, int(getattr(snap, "metadata_version", 1) or 1))
     current_step = max(0, int(getattr(snap, "current_step", 0) or 0))
-    if incoming_version <= current_version and incoming_step <= current_step:
+    current_session = None
+    if training_manager is not None:
+        get_local_session = getattr(training_manager, "get_local_session", None)
+        current_session = get_local_session(model_id) if callable(get_local_session) else None
+    current_actor_name = str(getattr(current_session, "actor_name", "") or "") or None
+    current_namespace = str(getattr(current_session, "namespace", "") or "") or None
+    actor_binding_changed = (
+        incoming_actor_name is not None and incoming_actor_name != current_actor_name
+    ) or (
+        incoming_namespace is not None and incoming_namespace != current_namespace
+    )
+    if actor_binding_changed and training_engine is not None:
+        getattr(training_engine, "_workers", {}).pop(model_id, None)
+        if incoming_actor_name is not None:
+            getattr(training_engine, "_resource_pool_actor_names", {})[model_id] = incoming_actor_name
+        else:
+            getattr(training_engine, "_resource_pool_actor_names", {}).pop(model_id, None)
+    if incoming_version <= current_version and incoming_step <= current_step and not actor_binding_changed:
         return snap
     _restore_training_session_info_compat(info)
     return _get_training_snapshot(model_id)
@@ -330,6 +397,12 @@ def _restore_training_session_info_compat(info: dict):
                 user_id=info.get("user_id"),
                 learning_rate=float(info.get("learning_rate", 1e-4) or 1e-4),
                 metadata_version=max(1, int(info.get("metadata_version", 1) or 1)),
+                materialization_state=info.get("materialization_state"),
+                tokenizer_info=info.get("tokenizer_info") if isinstance(info.get("tokenizer_info"), dict) else None,
+                tokenizer_identity=info.get("tokenizer_identity"),
+                tokenizer_source_path=info.get("tokenizer_source_path"),
+                actor_name=info.get("actor_name"),
+                namespace=info.get("namespace"),
             ),
         )
 
@@ -343,6 +416,18 @@ def _restore_training_session_info_compat(info: dict):
     session.backend = str(info.get("backend", getattr(session, "backend", "peft")) or "peft")
     session.current_step = int(info.get("current_step", getattr(session, "current_step", 0)) or 0)
     session.metadata_version = max(1, int(info.get("metadata_version", getattr(session, "metadata_version", 1)) or 1))
+    if hasattr(session, "materialization_state"):
+        session.materialization_state = str(info.get("materialization_state") or getattr(session, "materialization_state", "ready"))
+    if isinstance(info.get("tokenizer_info"), dict):
+        session.tokenizer_info = dict(info.get("tokenizer_info") or {})
+    if info.get("tokenizer_identity") is not None:
+        session.tokenizer_identity = str(info.get("tokenizer_identity") or "") or None
+    if info.get("tokenizer_source_path") is not None:
+        session.tokenizer_source_path = str(info.get("tokenizer_source_path") or "") or None
+    if info.get("actor_name") is not None:
+        session.actor_name = str(info.get("actor_name") or "") or None
+    if info.get("namespace") is not None:
+        session.namespace = str(info.get("namespace") or "") or None
     return session
 
 
@@ -361,7 +446,8 @@ async def _restore_training_session(model_id: str):
         if info.get("lora_config"):
             lora_cfg = LoRAConfig(**info["lora_config"])
 
-        session = training_manager.get_session(model_id)
+        get_local_session = getattr(training_manager, "get_local_session", None)
+        session = get_local_session(model_id) if callable(get_local_session) else training_manager.get_session(model_id)
         created_session = False
         original_session_state = None
         if session is None:
@@ -375,6 +461,13 @@ async def _restore_training_session(model_id: str):
                 user_metadata=info.get("user_metadata") or {},
                 user_id=info.get("user_id"),
                 learning_rate=float(info.get("learning_rate", 1e-4)),
+                metadata_version=max(1, int(info.get("metadata_version") or 1)),
+                materialization_state=info.get("materialization_state"),
+                tokenizer_info=info.get("tokenizer_info") if isinstance(info.get("tokenizer_info"), dict) else None,
+                tokenizer_identity=info.get("tokenizer_identity"),
+                tokenizer_source_path=info.get("tokenizer_source_path"),
+                actor_name=info.get("actor_name"),
+                namespace=info.get("namespace"),
             )
             created_session = True
         else:
@@ -384,6 +477,12 @@ async def _restore_training_session(model_id: str):
                 "current_step": session.current_step,
                 "is_active": session.is_active,
                 "metadata_version": getattr(session, "metadata_version", 1),
+                "materialization_state": getattr(session, "materialization_state", "ready"),
+                "tokenizer_info": getattr(session, "tokenizer_info", None),
+                "tokenizer_identity": getattr(session, "tokenizer_identity", None),
+                "tokenizer_source_path": getattr(session, "tokenizer_source_path", None),
+                "actor_name": getattr(session, "actor_name", None),
+                "namespace": getattr(session, "namespace", None),
             }
 
         session.backend = str(info.get("backend", session.backend))
@@ -413,6 +512,18 @@ async def _restore_training_session(model_id: str):
             session.current_step = int(info.get("current_step", session.current_step))
         except Exception:
             pass
+        if hasattr(session, "materialization_state"):
+            session.materialization_state = str(info.get("materialization_state") or getattr(session, "materialization_state", "ready"))
+        if isinstance(info.get("tokenizer_info"), dict):
+            session.tokenizer_info = dict(info.get("tokenizer_info") or {})
+        if info.get("tokenizer_identity") is not None:
+            session.tokenizer_identity = str(info.get("tokenizer_identity") or "") or None
+        if info.get("tokenizer_source_path") is not None:
+            session.tokenizer_source_path = str(info.get("tokenizer_source_path") or "") or None
+        if info.get("actor_name") is not None:
+            session.actor_name = str(info.get("actor_name") or "") or None
+        if info.get("namespace") is not None:
+            session.namespace = str(info.get("namespace") or "") or None
         session.is_active = True
 
         actor_name = info.get("actor_name")
@@ -433,6 +544,13 @@ async def _restore_training_session(model_id: str):
                     session.current_step = original_session_state["current_step"]
                     session.is_active = original_session_state["is_active"]
                     session.metadata_version = original_session_state["metadata_version"]
+                    if hasattr(session, "materialization_state"):
+                        session.materialization_state = original_session_state["materialization_state"]
+                        session.tokenizer_info = original_session_state["tokenizer_info"]
+                        session.tokenizer_identity = original_session_state["tokenizer_identity"]
+                        session.tokenizer_source_path = original_session_state["tokenizer_source_path"]
+                        session.actor_name = original_session_state["actor_name"]
+                        session.namespace = original_session_state["namespace"]
                 return None
             getattr(training_engine, "_workers", {})[model_id] = worker
             getattr(training_engine, "_resource_pool_actor_names", {})[model_id] = actor_name
@@ -442,39 +560,12 @@ async def _restore_training_session(model_id: str):
         logger.exception(f"[{model_id}] restore_training_session failed: {e}")
 
 
-async def _async_get_training_store_info(model_id: str) -> dict[str, Any] | None:
-    try:
-        from ..backend.training_session_store import async_get_training_session_info
-
-        info = await async_get_training_session_info(model_id)
-    except Exception as e:
-        raise HTTPException(status_code=503, detail="Training session store unavailable") from e
-    return info if isinstance(info, dict) else None
-
-
-async def _get_training_route_session_info(model_id: str) -> dict[str, Any] | None:
-    """Resolve route-time session metadata from detached store only."""
-    return await _async_get_training_store_info(model_id)
-
-
-async def _protect_training_session_enqueue_window(session_info: dict[str, Any]) -> None:
-    """Write detached heartbeat at enqueue-time so stale cleanup cannot race queued work."""
-    session_id = str(session_info.get("session_id") or "")
-    if not session_id:
-        return
-    try:
-        from ..backend.session_heartbeat_store import session_heartbeat_store
-
-        await session_heartbeat_store.async_update(session_id=session_id, now=time.time())
-    except Exception as e:
-        raise HTTPException(status_code=503, detail="Training heartbeat store unavailable") from e
-        return None
-
-
 async def _raise_if_local_model_id_exists(model_id: str) -> None:
     if training_engine is None or training_manager is None:
         return
-    if training_manager.get_session(model_id) is not None:
+    get_local_session = getattr(training_manager, "get_local_session", None)
+    local_session = get_local_session(model_id) if callable(get_local_session) else training_manager.get_session(model_id)
+    if local_session is not None:
         raise HTTPException(status_code=409, detail=f"Model_id conflict: local model already exists: {model_id!r}")
     try:
         from ..backend.training_session_store import async_get_training_session_info
@@ -503,8 +594,11 @@ def _session_info_from_live(session) -> dict:
         "current_step": session.current_step,
         "is_active": session.is_active,
         "created_at": session.created_at,
+        "last_activity": getattr(session, "last_activity", None),
         "backend": session.backend,
         "user_id": session.user_id,
+        "actor_name": getattr(session, "actor_name", None),
+        "namespace": getattr(session, "namespace", None),
     }
 
 
@@ -518,17 +612,19 @@ async def _best_effort_delete_training_session(
         return False
 
     try:
-        failed_request_ids = future_store.fail_training_requests_for_model(
-            model_id,
-            f"Training session terminated due to {reason}",
-        )
-        if failed_request_ids:
-            logger.warning(
-                "[%s] failed pending training futures during stale cleanup (%s): request_ids=%s",
+        fail_pending = getattr(future_store, "fail_training_requests_for_model", None)
+        if callable(fail_pending):
+            failed_request_ids = fail_pending(
                 model_id,
-                reason,
-                failed_request_ids,
+                f"Training session terminated due to {reason}",
             )
+            if failed_request_ids:
+                logger.warning(
+                    "[%s] failed pending training futures during stale cleanup (%s): request_ids=%s",
+                    model_id,
+                    reason,
+                    failed_request_ids,
+                )
     except Exception as e:
         logger.warning(
             "[%s] stale training cleanup aborted because pending future fail failed (%s): %s: %s",
@@ -546,12 +642,14 @@ async def _best_effort_delete_training_session(
         restored = session is not None
 
     shutdown_attempted = False
+    cleanup_ok = True
     if session is not None:
         if allow_actor_shutdown:
             try:
                 shutdown_attempted = True
                 await training_engine.shutdown_session(session)
             except Exception as e:
+                cleanup_ok = False
                 logger.warning(
                     "[%s] best-effort stale training cleanup shutdown failed (%s): %s: %s",
                     model_id,
@@ -568,13 +666,38 @@ async def _best_effort_delete_training_session(
                 restored,
                 allow_actor_shutdown,
             )
+            actor_name = str(getattr(session, "actor_name", "") or "")
+            other_users = [
+                mid
+                for mid, bound_actor in getattr(training_engine, "_resource_pool_actor_names", {}).items()
+                if bound_actor == actor_name and mid != model_id
+            ]
+            replacement_session = other_users[0] if other_users else None
             worker = getattr(training_engine, "_workers", {}).get(model_id)
+            if worker is None:
+                actor_name = str(getattr(session, "actor_name", "") or "")
+                namespace = str(getattr(session, "namespace", "") or RAY_NAMESPACE)
+                if actor_name:
+                    try:
+                        import ray
+
+                        worker = await asyncio.to_thread(ray.get_actor, actor_name, namespace=namespace)
+                    except Exception as e:
+                        logger.warning(
+                            "[%s] best-effort stale training cleanup rebind failed (%s): %s: %s",
+                            model_id,
+                            reason,
+                            type(e).__name__,
+                            e,
+                        )
             delete_session = getattr(worker, "delete_session", None) if worker is not None else None
+            delete_ok = worker is None and not str(getattr(session, "actor_name", "") or "")
             if delete_session is not None:
                 try:
                     import ray
 
                     await asyncio.to_thread(ray.get, delete_session.remote(model_id), timeout=30)
+                    delete_ok = True
                 except Exception as e:
                     logger.warning(
                         "[%s] best-effort stale training cleanup remote delete failed (%s): %s: %s",
@@ -583,9 +706,20 @@ async def _best_effort_delete_training_session(
                         type(e).__name__,
                         e,
                     )
+            cleanup_ok = cleanup_ok and delete_ok
             getattr(training_engine, "_resource_pool_actor_names", {}).pop(model_id, None)
             getattr(training_engine, "_workers", {}).pop(model_id, None)
             session.is_active = False
+            if actor_name:
+                try:
+                    from ..backend.resource_pool import get_resource_pool
+
+                    get_resource_pool().set_session(actor_name, replacement_session)
+                except Exception:
+                    pass
+
+    if not cleanup_ok:
+        return False
 
     try:
         training_manager.delete_session(model_id)
@@ -703,6 +837,14 @@ def _training_run_from_info(info: dict) -> TrainingRun:
         except Exception:
             pass
 
+    last_activity = info.get("last_activity")
+    idle_for_s = info.get("idle_for_s")
+    if idle_for_s is None and last_activity is not None:
+        try:
+            idle_for_s = max(0.0, time.time() - float(last_activity))
+        except Exception:
+            idle_for_s = None
+
     return TrainingRun(
         training_run_id=str(info.get("model_id", "")),
         base_model=str(info.get("base_model", "")),
@@ -713,6 +855,8 @@ def _training_run_from_info(info: dict) -> TrainingRun:
         last_request_time=str(
             info.get("last_request_time") or info.get("created_at") or datetime.now().isoformat()
         ),
+        last_activity=float(last_activity) if last_activity is not None else None,
+        idle_for_s=float(idle_for_s) if idle_for_s is not None else None,
         last_checkpoint=None,
         last_sampler_checkpoint=None,
         user_metadata=info.get("user_metadata") or {},
@@ -768,6 +912,32 @@ def _session_view_from_info(model_id: str, info: dict[str, Any]) -> Any:
     )
 
 
+def _has_training_worker_binding(model_id: str) -> bool:
+    if training_engine is None:
+        return False
+    if model_id in getattr(training_engine, "_workers", {}):
+        return True
+    return model_id in getattr(training_engine, "_resource_pool_actor_names", {})
+
+
+async def _get_training_session_for_request(model_id: str):
+    snapshot = _get_training_snapshot(model_id)
+    info = await _get_training_route_session_info(model_id)
+    if not isinstance(info, dict):
+        _drop_local_training_session(model_id)
+        return None, None
+
+    snapshot = _refresh_training_session_from_info_if_needed(model_id, info, snapshot=snapshot)
+    session = training_manager.get_session(model_id) if training_manager is not None else None
+    if session is not None and _has_training_worker_binding(model_id):
+        return session, snapshot
+
+    restored = await _restore_training_session(model_id)
+    if restored is not None:
+        return restored, _get_training_snapshot(model_id) or snapshot
+    return session, snapshot
+
+
 async def _resolve_training_route_session(model_id: str) -> tuple[Any | None, dict[str, Any] | None]:
     session = None
     if training_manager is not None:
@@ -799,6 +969,19 @@ async def _resolve_training_route_session(model_id: str) -> tuple[Any | None, di
     return None, None
 
 
+def _ensure_route_session_info(
+    *,
+    model_id: str,
+    session: Any | None,
+    route_session_info: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if isinstance(route_session_info, dict):
+        return route_session_info
+    if session is not None:
+        return _session_info_from_live(session)
+    raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
+
+
 async def _protect_training_session_enqueue_window(session_info: dict[str, Any] | None) -> None:
     if not isinstance(session_info, dict):
         return
@@ -822,6 +1005,315 @@ def _normalize_megatron_scheduler_domain_key(base_model: str) -> str:
     else:
         model_name = base_model.split("/")[-1].lower().replace("-", "_").replace(".", "_")
     return f"megatron_{model_name}"
+
+
+_TOKENIZER_METADATA_FILES = (
+    "tokenizer.json",
+    "tokenizer.model",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "added_tokens.json",
+    "vocab.json",
+    "merges.txt",
+)
+
+
+def _infer_training_backend_for_base_model(base_model: str) -> str:
+    from ..backend.model_registry import get_model_config
+
+    cfg = get_model_config(base_model)
+    training_backend = str(getattr(cfg, "training_backend", "mint_text") or "mint_text")
+    if training_backend == "openpi_fast":
+        return "openpi_fast"
+    if training_backend == "openpi_pi05":
+        return "openpi_pi05"
+    return "megatron" if bool(getattr(cfg, "is_moe", False)) else "peft"
+
+
+def _supports_control_plane_tokenizer_metadata(backend: str) -> bool:
+    return str(backend) in {"megatron", "peft"}
+
+
+def _resolve_local_tokenizer_source_path(base_model: str) -> str:
+    candidate = str(base_model or "").strip()
+    if not candidate:
+        raise RuntimeError("base_model is empty")
+    if os.path.exists(candidate):
+        return os.path.realpath(candidate)
+    resolver = getattr(training_engine, "_resolve_hf_model_path", None)
+    if callable(resolver):
+        resolved = resolver(candidate)
+        resolved_path = os.fspath(resolved) if isinstance(resolved, os.PathLike) else resolved
+        if isinstance(resolved_path, str) and resolved_path and os.path.exists(resolved_path):
+            return os.path.realpath(resolved_path)
+    raise RuntimeError(f"Tokenizer source is not available on this API host for base_model {candidate!r}")
+
+
+def _tokenizer_identity_from_source_path(source_path: str) -> str:
+    path = os.path.realpath(str(source_path))
+    if os.path.isdir(path):
+        candidates = []
+        for name in _TOKENIZER_METADATA_FILES:
+            candidate = os.path.join(path, name)
+            if os.path.exists(candidate):
+                candidates.append(candidate)
+        if not candidates:
+            candidates.append(path)
+    else:
+        candidates = [path]
+
+    payload = []
+    for candidate in candidates:
+        stat = os.stat(candidate)
+        payload.append(
+            {
+                "name": os.path.basename(candidate),
+                "size": int(stat.st_size),
+                "mtime_ns": int(stat.st_mtime_ns),
+            }
+        )
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+    return f"{path}#{digest}"
+
+
+@lru_cache(maxsize=256)
+def _load_tokenizer_info_from_local_source(
+    source_path: str,
+    tokenizer_identity: str,
+    backend: str,
+) -> dict[str, Any]:
+    del tokenizer_identity
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(source_path, trust_remote_code=True, local_files_only=True)
+    info = {
+        "vocab_size": getattr(tokenizer, "vocab_size", len(tokenizer)),
+        "model_max_length": getattr(tokenizer, "model_max_length", None),
+        "pad_token": getattr(tokenizer, "pad_token", None),
+        "pad_token_id": getattr(tokenizer, "pad_token_id", None),
+        "eos_token": getattr(tokenizer, "eos_token", None),
+        "eos_token_id": getattr(tokenizer, "eos_token_id", None),
+        "bos_token": getattr(tokenizer, "bos_token", None),
+        "bos_token_id": getattr(tokenizer, "bos_token_id", None),
+        "unk_token": getattr(tokenizer, "unk_token", None),
+        "unk_token_id": getattr(tokenizer, "unk_token_id", None),
+    }
+    if str(backend) == "megatron":
+        info["vocab_size"] = len(tokenizer)
+    return info
+
+
+def _build_local_tokenizer_metadata(base_model: str, backend: str) -> dict[str, Any]:
+    source_path = _resolve_local_tokenizer_source_path(base_model)
+    tokenizer_identity = _tokenizer_identity_from_source_path(source_path)
+    tokenizer_info = _load_tokenizer_info_from_local_source(source_path, tokenizer_identity, backend)
+    return {
+        "tokenizer_source_path": source_path,
+        "tokenizer_identity": tokenizer_identity,
+        "tokenizer_info": dict(tokenizer_info),
+    }
+
+
+async def _collect_control_plane_tokenizer_metadata(session: Any) -> dict[str, Any]:
+    if training_engine is None:
+        raise RuntimeError("Training engine not initialized")
+    tokenizer_metadata: dict[str, Any] = {
+        "tokenizer_info": dict(await training_engine.get_tokenizer_info(session))
+    }
+    try:
+        local_metadata = await asyncio.to_thread(
+            _build_local_tokenizer_metadata,
+            str(getattr(session, "base_model", "") or ""),
+            str(getattr(session, "backend", "") or ""),
+        )
+        tokenizer_metadata["tokenizer_identity"] = local_metadata.get("tokenizer_identity")
+        tokenizer_metadata["tokenizer_source_path"] = local_metadata.get("tokenizer_source_path")
+    except Exception as e:
+        logger.info(
+            "[tokenizer-metadata] local identity unavailable model_id=%s error_type=%s error=%s",
+            str(getattr(session, "model_id", "")),
+            type(e).__name__,
+            e,
+        )
+    return tokenizer_metadata
+
+
+def _next_training_session_metadata_version(session: Any) -> int:
+    from ..backend.training_session_manager import TRAINING_SESSION_METADATA_VERSION
+
+    current = max(
+        int(getattr(session, "metadata_version", TRAINING_SESSION_METADATA_VERSION - 1) or 0),
+        TRAINING_SESSION_METADATA_VERSION - 1,
+    )
+    next_version = current + 1
+    session.metadata_version = next_version
+    return next_version
+
+
+async def _best_effort_local_tokenizer_metadata_for_session(session: Any) -> dict[str, Any] | None:
+    if not _supports_control_plane_tokenizer_metadata(str(getattr(session, "backend", "") or "")):
+        return None
+    try:
+        return await asyncio.to_thread(
+            _build_local_tokenizer_metadata,
+            str(getattr(session, "base_model", "") or ""),
+            str(getattr(session, "backend", "") or ""),
+        )
+    except Exception as e:
+        logger.info(
+            "[tokenizer-metadata] local metadata unavailable model_id=%s error_type=%s error=%s",
+            str(getattr(session, "model_id", "")),
+            type(e).__name__,
+            e,
+        )
+        return None
+
+
+def _build_training_session_store_payload(
+    *,
+    session: Any,
+    user_id: str | None,
+    lora_config: Any,
+    rollout_correction_config: dict[str, Any] | None,
+    user_metadata: dict[str, Any] | None,
+    actor_name: str | None,
+    materialization_state: str,
+    tokenizer_metadata: dict[str, Any] | None,
+    metadata_version: int | None = None,
+    extra_fields: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    from ..backend.training_session_manager import TRAINING_SESSION_METADATA_VERSION
+
+    if lora_config is None:
+        lora_payload = None
+    elif hasattr(lora_config, "model_dump") and callable(getattr(lora_config, "model_dump")):
+        lora_payload = lora_config.model_dump()
+    elif isinstance(lora_config, dict):
+        lora_payload = dict(lora_config)
+    else:
+        lora_payload = dict(getattr(lora_config, "__dict__", {}))
+
+    payload = {
+        "model_id": str(getattr(session, "model_id", "") or ""),
+        "session_id": str(getattr(session, "session_id", "") or ""),
+        "model_seq_id": int(getattr(session, "model_seq_id", 0) or 0),
+        "base_model": str(getattr(session, "base_model", "") or ""),
+        "lora_config": lora_payload,
+        "rollout_correction_config": rollout_correction_config,
+        "user_metadata": dict(user_metadata or {}),
+        "learning_rate": float(getattr(session, "learning_rate", 1e-4) or 1e-4),
+        "current_step": int(getattr(session, "current_step", 0) or 0),
+        "backend": str(getattr(session, "backend", "peft") or "peft"),
+        "actor_name": actor_name,
+        "namespace": str(getattr(session, "namespace", None) or RAY_NAMESPACE),
+        "user_id": user_id,
+        "created_at": getattr(session, "created_at", None),
+        "last_activity": float(getattr(session, "last_activity", time.time()) or time.time()),
+        "metadata_version": max(
+            TRAINING_SESSION_METADATA_VERSION,
+            int(metadata_version if metadata_version is not None else getattr(session, "metadata_version", TRAINING_SESSION_METADATA_VERSION)),
+        ),
+        "materialization_state": materialization_state,
+    }
+    if isinstance(tokenizer_metadata, dict):
+        payload["tokenizer_info"] = dict(tokenizer_metadata.get("tokenizer_info") or {})
+        payload["tokenizer_identity"] = tokenizer_metadata.get("tokenizer_identity")
+        payload["tokenizer_source_path"] = tokenizer_metadata.get("tokenizer_source_path")
+    if isinstance(extra_fields, dict):
+        payload.update(extra_fields)
+    return payload
+
+
+async def _materialize_training_session_for_stateful_use(session: Any) -> Any:
+    from ..backend.training_session_manager import (
+        MATERIALIZATION_STATE_FAILED,
+        MATERIALIZATION_STATE_MATERIALIZING,
+        MATERIALIZATION_STATE_READY,
+    )
+    from ..backend.training_session_store import async_upsert_training_session
+
+    if training_engine is None:
+        raise RuntimeError("Training engine not initialized")
+
+    state = str(getattr(session, "materialization_state", MATERIALIZATION_STATE_READY) or MATERIALIZATION_STATE_READY)
+    if bool(getattr(session, "is_active", False)) and state == MATERIALIZATION_STATE_READY:
+        return session
+
+    session.materialization_state = MATERIALIZATION_STATE_MATERIALIZING
+    materializing_version = _next_training_session_metadata_version(session)
+    await async_upsert_training_session(
+        _build_training_session_store_payload(
+            session=session,
+            user_id=getattr(session, "user_id", None),
+            lora_config=getattr(session, "lora_config", None),
+            rollout_correction_config=getattr(session, "rollout_correction_config", None),
+            user_metadata=getattr(session, "user_metadata", None),
+            actor_name=None,
+            materialization_state=MATERIALIZATION_STATE_MATERIALIZING,
+            tokenizer_metadata={
+                "tokenizer_info": getattr(session, "tokenizer_info", None),
+                "tokenizer_identity": getattr(session, "tokenizer_identity", None),
+                "tokenizer_source_path": getattr(session, "tokenizer_source_path", None),
+            },
+            metadata_version=materializing_version,
+        )
+    )
+
+    try:
+        await training_engine.create_training_session(session)
+        tokenizer_metadata = None
+        if _supports_control_plane_tokenizer_metadata(str(getattr(session, "backend", "") or "")):
+            tokenizer_metadata = await _collect_control_plane_tokenizer_metadata(session)
+            session.tokenizer_info = dict(tokenizer_metadata.get("tokenizer_info") or {})
+            session.tokenizer_identity = str(tokenizer_metadata.get("tokenizer_identity") or "") or None
+            session.tokenizer_source_path = str(tokenizer_metadata.get("tokenizer_source_path") or "") or None
+        actor_name = getattr(training_engine, "_resource_pool_actor_names", {}).get(session.model_id)
+        session.actor_name = str(actor_name or "") or None
+        session.namespace = RAY_NAMESPACE
+        session.materialization_state = MATERIALIZATION_STATE_READY
+        ready_version = _next_training_session_metadata_version(session)
+        await async_upsert_training_session(
+            _build_training_session_store_payload(
+                session=session,
+                user_id=getattr(session, "user_id", None),
+                lora_config=getattr(session, "lora_config", None),
+                rollout_correction_config=getattr(session, "rollout_correction_config", None),
+                user_metadata=getattr(session, "user_metadata", None),
+                actor_name=actor_name,
+                materialization_state=MATERIALIZATION_STATE_READY,
+                tokenizer_metadata=tokenizer_metadata,
+                metadata_version=ready_version,
+            )
+        )
+        if training_manager is not None:
+            training_manager.mark_persisted(session.model_id)
+        return session
+    except Exception as e:
+        session.materialization_state = MATERIALIZATION_STATE_FAILED
+        failed_version = _next_training_session_metadata_version(session)
+        try:
+            await async_upsert_training_session(
+                _build_training_session_store_payload(
+                    session=session,
+                    user_id=getattr(session, "user_id", None),
+                    lora_config=getattr(session, "lora_config", None),
+                    rollout_correction_config=getattr(session, "rollout_correction_config", None),
+                    user_metadata=getattr(session, "user_metadata", None),
+                    actor_name=None,
+                    materialization_state=MATERIALIZATION_STATE_FAILED,
+                    tokenizer_metadata={
+                        "tokenizer_info": getattr(session, "tokenizer_info", None),
+                        "tokenizer_identity": getattr(session, "tokenizer_identity", None),
+                        "tokenizer_source_path": getattr(session, "tokenizer_source_path", None),
+                    },
+                    metadata_version=failed_version,
+                    extra_fields={"materialization_error": f"{type(e).__name__}: {e}"},
+                )
+            )
+        except Exception:
+            pass
+        raise
+
 
 def _get_max_model_len(base_model: str | None) -> int:
     """Return the configured max_model_len for a supported model name.
@@ -872,7 +1364,10 @@ def _validate_rollout_correction_config_or_400(
         )
 
     try:
-        from verl.trainer.config import RolloutCorrectionConfig as VerlRolloutCorrectionConfig
+        import importlib
+
+        verl_cfg_module = importlib.import_module("verl.trainer.config")
+        VerlRolloutCorrectionConfig = getattr(verl_cfg_module, "RolloutCorrectionConfig")
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -901,20 +1396,6 @@ def _validate_lora_rank_or_400(lora_config: LoRAConfig | None) -> None:
             status_code=400,
             detail=f"Requested LoRA rank {requested_rank} exceeds server max_lora_rank={max_rank}",
         )
-
-
-def _field(source: Any, key: str, default=None):
-    if isinstance(source, dict):
-        return source.get(key, default)
-    return getattr(source, key, default)
-
-
-def _validate_training_batch_has_explicit_loss_masks_or_422(data: list[Any]) -> None:
-    for i, item in enumerate(data):
-        if _field(item, "weights", None) is None:
-            raise HTTPException(status_code=422, detail=f"data[{i}].weights is required")
-
-
 def _build_training_scheduler_extra(
     *,
     session: Any,
@@ -973,10 +1454,13 @@ def _build_create_scheduler_extra(
     else:
         backend = "peft"
         domain_key = base_model
+    scheduler_domain = f"{backend}:{domain_key}"
+    if training_op == "create_model":
+        scheduler_domain = f"{backend}:create:{domain_key}"
     return {
         "scheduler_enabled": str(os.environ.get("MINT_SCHEDULER_ENABLE", "1")).strip().lower()
         in ("1", "true", "yes", "y", "on"),
-        "scheduler_domain": f"{backend}:{domain_key}",
+        "scheduler_domain": scheduler_domain,
         "scheduler_session_key": str(model_id),
         "execution_serial_key": f"training_session:{model_id}",
         "training_op": str(training_op),
@@ -1174,9 +1658,6 @@ async def create_model(
             request_id=encode_request_id(upstream_alias=upstream.alias, upstream_request_id=upstream_request_id)
         )
 
-    if training_engine is None or training_manager is None:
-        raise HTTPException(status_code=503, detail="Training engine not initialized")
-
     cfg = get_gateway_config()
     if cfg is not None and cfg.model_to_upstream:
         remote = await async_remote_training_model(model_id)
@@ -1279,16 +1760,22 @@ async def _do_create_model(
     webhook_url: str | None,
 ) -> None:
     """Background task to create training model."""
+    from ..backend.training_session_manager import (
+        MATERIALIZATION_STATE_UNMATERIALIZED,
+        TRAINING_SESSION_METADATA_VERSION,
+    )
+
     model_id = _generate_model_id(request.session_id, request.model_seq_id)
     inflight_marked = False
     session_created = False
+    planned_backend = _infer_training_backend_for_base_model(request.base_model)
     try:
         set_request_id(request_id)
         if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
 
-        # Check if model already exists (from failed previous attempt)
-        existing = training_manager.get_session(model_id)
+        get_local_session = getattr(training_manager, "get_local_session", None)
+        existing = get_local_session(model_id) if callable(get_local_session) else training_manager.get_session(model_id)
         if existing is not None:
             if bool(getattr(existing, "is_active", False)):
                 raise RuntimeError(f"Model '{model_id}' already exists")
@@ -1296,67 +1783,51 @@ async def _do_create_model(
             await training_engine.shutdown_session(existing)
             training_manager.delete_session(model_id)
 
-        # Create session metadata first
+        rollout_correction_config = (
+            request.rollout_correction_config.model_dump(exclude_none=True)
+            if request.rollout_correction_config
+            else None
+        )
         session = training_manager.create_session(
             model_id=model_id,
             session_id=request.session_id,
             model_seq_id=request.model_seq_id,
             base_model=request.base_model,
             lora_config=request.lora_config,
-            rollout_correction_config=request.rollout_correction_config.model_dump(exclude_none=True)
-            if request.rollout_correction_config
-            else None,
+            rollout_correction_config=rollout_correction_config,
             user_metadata=request.user_metadata,
             user_id=user_id,
+            backend=planned_backend,
+            metadata_version=TRAINING_SESSION_METADATA_VERSION,
+            materialization_state=MATERIALIZATION_STATE_UNMATERIALIZED,
         )
         session_created = True
 
-        # Mark inflight immediately so the idle cleanup loop does not evict
-        # the session during the potentially slow actor creation below.
         training_manager.mark_inflight(model_id, +1)
         inflight_marked = True
 
-        # Create Ray actor - if this fails, session will be cleaned up in except block
-        await run_async_with_otel_span(
-            "training.create_model.execute",
-            lambda: training_engine.create_training_session(session),
-            component="routes.training",
-            op="training.create_model",
-            request_id=str(request_id),
-            attributes={
-                "model_id": str(model_id),
-                "base_model": str(request.base_model),
-                "backend": str(session.backend),
-                "lora_enabled": bool(request.lora_config is not None),
-                "lora_rank": int(request.lora_config.rank) if request.lora_config is not None else None,
-            },
+        tokenizer_metadata = await _best_effort_local_tokenizer_metadata_for_session(session)
+        if isinstance(tokenizer_metadata, dict):
+            session.tokenizer_info = dict(tokenizer_metadata.get("tokenizer_info") or {})
+            session.tokenizer_identity = str(tokenizer_metadata.get("tokenizer_identity") or "") or None
+            session.tokenizer_source_path = str(tokenizer_metadata.get("tokenizer_source_path") or "") or None
+        session.namespace = RAY_NAMESPACE
+
+        from ..backend.training_session_store import async_upsert_training_session
+
+        await async_upsert_training_session(
+            _build_training_session_store_payload(
+                session=session,
+                user_id=user_id,
+                lora_config=request.lora_config,
+                rollout_correction_config=rollout_correction_config,
+                user_metadata=request.user_metadata,
+                actor_name=None,
+                materialization_state=MATERIALIZATION_STATE_UNMATERIALIZED,
+                tokenizer_metadata=tokenizer_metadata,
+            )
         )
-
-        try:
-            from ..backend.training_session_store import upsert_training_session
-
-            actor_name = getattr(training_engine, "_resource_pool_actor_names", {}).get(model_id)
-            upsert_training_session({
-                "model_id": model_id,
-                "session_id": request.session_id,
-                "model_seq_id": request.model_seq_id,
-                "base_model": request.base_model,
-                "lora_config": request.lora_config.model_dump() if request.lora_config else None,
-                "rollout_correction_config": request.rollout_correction_config.model_dump(exclude_none=True)
-                if request.rollout_correction_config
-                else None,
-                "user_metadata": request.user_metadata or {},
-                "learning_rate": session.learning_rate,
-                "current_step": session.current_step,
-                "backend": session.backend,
-                "actor_name": actor_name,
-                "namespace": RAY_NAMESPACE,
-                "user_id": user_id,
-                "created_at": session.created_at,
-                "last_activity": session.last_activity,
-            })
-        except Exception as e:
-            logger.warning("[create_model] training session store write failed: %s", e)
+        training_manager.mark_persisted(model_id)
 
         try:
             from ..backend.session_index_store import add_training_run_to_session
@@ -1374,15 +1845,14 @@ async def _do_create_model(
             request_id=request_id,
             model_id=model_id,
             type="create_model",
-            backend=session.backend,  # "megatron" or "peft"
+            backend=planned_backend,
         )
         future_store.resolve(request_id, response.model_dump())
 
-        # 2. 发送 running 状态 - 模型创建成功，训练就绪
         if webhook_url and user_id:
             send_task_event(
                 webhook_url=webhook_url,
-                event_type=EventType.TASK_STARTED,  # running
+                event_type=EventType.TASK_STARTED,
                 user_id=user_id,
                 session_id=model_id,
                 task_name=f"Training {request.base_model}",
@@ -1400,11 +1870,17 @@ async def _do_create_model(
             type(e).__name__,
             "check_training_session_and_actor",
         )
-        # Clean up session if it was created
-        if session_created and training_manager and training_manager.get_session(model_id):
-            training_manager.delete_session(model_id)
-        # If session tracking was updated in ResourcePool during a partially-failed
-        # create_training_session, clear it to avoid pinning actors as non-idle.
+        if session_created and training_manager is not None:
+            get_local_session = getattr(training_manager, "get_local_session", None)
+            session = get_local_session(model_id) if callable(get_local_session) else training_manager.get_session(model_id)
+            if session is not None:
+                training_manager.delete_session(model_id)
+        try:
+            from ..backend.training_session_store import delete_training_session
+
+            delete_training_session(model_id)
+        except Exception:
+            pass
         try:
             from ..backend.resource_pool import get_resource_pool
 
@@ -1413,7 +1889,6 @@ async def _do_create_model(
             pass
         await future_store.async_fail(request_id, str(e))
 
-        # 发送 failed 状态
         if webhook_url and user_id:
             send_task_event(
                 webhook_url=webhook_url,
@@ -1573,9 +2048,6 @@ async def create_model_from_state(
             request_id=encode_request_id(upstream_alias=upstream.alias, upstream_request_id=upstream_request_id)
         )
 
-    if training_engine is None or training_manager is None:
-        raise HTTPException(status_code=503, detail="Training engine not initialized")
-
     cfg = get_gateway_config()
     if cfg is not None and cfg.model_to_upstream:
         remote = await async_remote_training_model(model_id)
@@ -1655,48 +2127,62 @@ async def _do_create_model_from_state(
     request_id: str, request: CreateModelFromStateRequest, user_id: str | None
 ) -> None:
     """Background task to create model and load checkpoint."""
+    from ..backend.training_session_manager import (
+        MATERIALIZATION_STATE_READY,
+        TRAINING_SESSION_METADATA_VERSION,
+    )
+
     model_id = _generate_model_id(request.session_id, request.model_seq_id)
     inflight_marked = False
     session_created = False
+    session_materialized = False
     try:
         set_request_id(request_id)
-        if training_engine is None or training_manager is None:
+        engine = training_engine
+        manager = training_manager
+        if engine is None or manager is None:
             raise RuntimeError("Training engine not initialized")
 
-        # Queue-time validation hands the background worker a concrete local path.
         load_path = request.state_path
 
-        # Check if model already exists (from failed previous attempt)
-        existing = training_manager.get_session(model_id)
+        get_local_session = getattr(manager, "get_local_session", None)
+        existing = get_local_session(model_id) if callable(get_local_session) else manager.get_session(model_id)
         if existing is not None:
             if bool(getattr(existing, "is_active", False)):
                 raise RuntimeError(f"Model '{model_id}' already exists")
             logger.warning(f"[{model_id}] Cleaning up stale inactive session from previous attempt")
-            await training_engine.shutdown_session(existing)
-            training_manager.delete_session(model_id)
+            await engine.shutdown_session(existing)
+            manager.delete_session(model_id)
 
-        # Create session metadata
-        session = training_manager.create_session(
+        rollout_correction_config = (
+            request.rollout_correction_config.model_dump(exclude_none=True)
+            if request.rollout_correction_config
+            else None
+        )
+        planned_backend = _infer_training_backend_for_base_model(request.base_model)
+        tokenizer_metadata = None
+
+        session = manager.create_session(
             model_id=model_id,
             session_id=request.session_id,
             model_seq_id=request.model_seq_id,
             base_model=request.base_model,
             lora_config=request.lora_config,
-            rollout_correction_config=request.rollout_correction_config.model_dump(exclude_none=True)
-            if request.rollout_correction_config
-            else None,
+            rollout_correction_config=rollout_correction_config,
             user_metadata=request.user_metadata,
             user_id=user_id,
+            backend=planned_backend,
+            metadata_version=TRAINING_SESSION_METADATA_VERSION,
+            materialization_state=MATERIALIZATION_STATE_READY,
         )
         session_created = True
 
-        # Mark inflight immediately (same rationale as _do_create_model).
-        training_manager.mark_inflight(model_id, +1)
+        manager.mark_inflight(model_id, +1)
         inflight_marked = True
 
         async def _create_and_restore_model():
-            await training_engine.create_training_session(session)
-            await training_engine.load_weights(
+            await engine.create_training_session(session)
+            await engine.load_weights(
                 session=session,
                 load_path=load_path,
                 load_optimizer=request.load_optimizer,
@@ -1717,32 +2203,31 @@ async def _do_create_model_from_state(
                 "lora_rank": int(request.lora_config.rank) if request.lora_config is not None else None,
             },
         )
+        session_materialized = True
+        if _supports_control_plane_tokenizer_metadata(str(getattr(session, "backend", "") or "")):
+            tokenizer_metadata = await _collect_control_plane_tokenizer_metadata(session)
+            session.tokenizer_info = dict(tokenizer_metadata.get("tokenizer_info") or {})
+            session.tokenizer_identity = str(tokenizer_metadata.get("tokenizer_identity") or "") or None
+            session.tokenizer_source_path = str(tokenizer_metadata.get("tokenizer_source_path") or "") or None
 
-        try:
-            from ..backend.training_session_store import upsert_training_session
+        from ..backend.training_session_store import async_upsert_training_session
 
-            actor_name = getattr(training_engine, "_resource_pool_actor_names", {}).get(model_id)
-            upsert_training_session({
-                "model_id": model_id,
-                "session_id": request.session_id,
-                "model_seq_id": request.model_seq_id,
-                "base_model": request.base_model,
-                "lora_config": request.lora_config.model_dump() if request.lora_config else None,
-                "rollout_correction_config": request.rollout_correction_config.model_dump(exclude_none=True)
-                if request.rollout_correction_config
-                else None,
-                "user_metadata": request.user_metadata or {},
-                "learning_rate": session.learning_rate,
-                "current_step": session.current_step,
-                "backend": session.backend,
-                "actor_name": actor_name,
-                "namespace": RAY_NAMESPACE,
-                "user_id": user_id,
-                "created_at": session.created_at,
-                "last_activity": session.last_activity,
-            })
-        except Exception as e:
-            logger.warning("[create_model_from_state] training session store write failed: %s", e)
+        actor_name = getattr(engine, "_resource_pool_actor_names", {}).get(model_id)
+        session.actor_name = str(actor_name or "") or None
+        session.namespace = RAY_NAMESPACE
+        await async_upsert_training_session(
+            _build_training_session_store_payload(
+                session=session,
+                user_id=user_id,
+                lora_config=request.lora_config,
+                rollout_correction_config=rollout_correction_config,
+                user_metadata=request.user_metadata,
+                actor_name=actor_name,
+                materialization_state=MATERIALIZATION_STATE_READY,
+                tokenizer_metadata=tokenizer_metadata,
+            )
+        )
+        manager.mark_persisted(model_id)
 
         try:
             from ..backend.session_index_store import add_training_run_to_session
@@ -1778,15 +2263,21 @@ async def _do_create_model_from_state(
             type(e).__name__,
             "check_checkpoint_path_and_training_actor",
         )
-        # Clean up session if it was created
-        if session_created and training_manager and training_manager.get_session(model_id):
-            try:
-                session = training_manager.get_session(model_id)
-                if session:
+        if session_created and training_manager is not None:
+            get_local_session = getattr(training_manager, "get_local_session", None)
+            session = get_local_session(model_id) if callable(get_local_session) else training_manager.get_session(model_id)
+            if session is not None and session_materialized and training_engine is not None:
+                try:
                     await training_engine.shutdown_session(session)
-            except Exception:
-                pass  # Ignore cleanup errors
-            training_manager.delete_session(model_id)
+                except Exception as shutdown_error:
+                    logger.warning(
+                        "[create_model_from_state] cleanup shutdown failed model_id=%s error_type=%s error=%s",
+                        str(model_id),
+                        type(shutdown_error).__name__,
+                        shutdown_error,
+                    )
+            if session is not None:
+                training_manager.delete_session(model_id)
         try:
             from ..backend.training_session_store import delete_training_session
 
@@ -1865,6 +2356,11 @@ async def forward_backward(
     if session is None:
         raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
 
+    route_session_info = _ensure_route_session_info(
+        model_id=request.model_id,
+        session=session,
+        route_session_info=route_session_info,
+    )
     base_model = str(route_session_info.get("base_model") or "")
     backend = str(route_session_info.get("backend") or "unknown")
     max_model_len = _get_max_model_len(base_model)
@@ -1963,15 +2459,18 @@ async def _do_forward_backward(
     inflight_marked = False
 
     try:
-        if training_engine is None or training_manager is None:
+        engine = training_engine
+        manager = training_manager
+        if engine is None or manager is None:
             raise RuntimeError("Training engine not initialized")
         inflight_marked = True
 
-        session = training_manager.get_session(request.model_id)
+        session = manager.get_session(request.model_id)
         if session is None:
             session = await _restore_training_session(request.model_id)
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
+        session = await _materialize_training_session_for_stateful_use(session)
         max_model_len = _get_max_model_len(session.base_model)
         _, max_seq_len = _compute_token_stats(request.forward_backward_input.data)
         if max_seq_len > max_model_len:
@@ -1990,7 +2489,7 @@ async def _do_forward_backward(
         )
         result = await run_async_with_otel_span(
             "training.forward_backward.execute",
-            lambda: training_engine.forward_backward(session, request),
+            lambda: engine.forward_backward(session, request),
             component="routes.training",
             op="training.forward_backward",
             request_id=str(request_id),
@@ -2110,6 +2609,11 @@ async def train_step(
     if session is None:
         raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
 
+    route_session_info = _ensure_route_session_info(
+        model_id=request.model_id,
+        session=session,
+        route_session_info=route_session_info,
+    )
     base_model = str(route_session_info.get("base_model") or "")
     backend = str(route_session_info.get("backend") or "unknown")
     max_model_len = _get_max_model_len(base_model)
@@ -2199,15 +2703,18 @@ async def _do_train_step(
     inflight_marked = False
     try:
         set_request_id(request_id)
-        if training_engine is None or training_manager is None:
+        engine = training_engine
+        manager = training_manager
+        if engine is None or manager is None:
             raise RuntimeError("Training engine not initialized")
         inflight_marked = True
 
-        session = training_manager.get_session(request.model_id)
+        session = manager.get_session(request.model_id)
         if session is None:
             session = await _restore_training_session(request.model_id)
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
+        session = await _materialize_training_session_for_stateful_use(session)
         batch = request.forward_backward_input.data
         token_count, max_seq_len = _compute_token_stats(batch)
         t0 = time.time()
@@ -2218,7 +2725,7 @@ async def _do_train_step(
         logger.info(msg)
         result = await run_async_with_otel_span(
             "training.train_step.execute",
-            lambda: training_engine.train_step(session, request),
+            lambda: engine.train_step(session, request),
             component="routes.training",
             op="training.train_step",
             request_id=str(request_id),
@@ -2341,6 +2848,11 @@ async def forward(
             status_code=404, detail=f"Model '{request.model_id}' not found"
         )
 
+    route_session_info = _ensure_route_session_info(
+        model_id=request.model_id,
+        session=session,
+        route_session_info=route_session_info,
+    )
     base_model = str(route_session_info.get("base_model") or "")
     backend = str(route_session_info.get("backend") or "unknown")
     max_model_len = _get_max_model_len(base_model)
@@ -2429,15 +2941,18 @@ async def _do_forward(
     inflight_marked = False
     try:
         set_request_id(request_id)
-        if training_engine is None or training_manager is None:
+        engine = training_engine
+        manager = training_manager
+        if engine is None or manager is None:
             raise RuntimeError("Training engine not initialized")
         inflight_marked = True
 
-        session = training_manager.get_session(request.model_id)
+        session = manager.get_session(request.model_id)
         if session is None:
             session = await _restore_training_session(request.model_id)
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
+        session = await _materialize_training_session_for_stateful_use(session)
         batch = request.forward_input.data
         token_count, max_seq_len = _compute_token_stats(batch)
         t0 = time.time()
@@ -2447,7 +2962,7 @@ async def _do_forward(
         )
         result = await run_async_with_otel_span(
             "training.forward.execute",
-            lambda: training_engine.forward(session, request),
+            lambda: engine.forward(session, request),
             component="routes.training",
             op="training.forward",
             request_id=str(request_id),
@@ -2571,6 +3086,11 @@ async def optim_step(
             status_code=404, detail=f"Model '{request.model_id}' not found"
         )
 
+    route_session_info = _ensure_route_session_info(
+        model_id=request.model_id,
+        session=session,
+        route_session_info=route_session_info,
+    )
     base_model = str(route_session_info.get("base_model") or "")
     backend = str(route_session_info.get("backend") or "unknown")
 
@@ -2650,22 +3170,25 @@ async def _do_optim_step(request_id: str, request: OptimStepRequest, user_id: st
     inflight_marked = False
     try:
         set_request_id(request_id)
-        if training_engine is None or training_manager is None:
+        engine = training_engine
+        manager = training_manager
+        if engine is None or manager is None:
             raise RuntimeError("Training engine not initialized")
         inflight_marked = True
 
-        session = training_manager.get_session(request.model_id)
+        session = manager.get_session(request.model_id)
         if session is None:
             session = await _restore_training_session(request.model_id)
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
+        session = await _materialize_training_session_for_stateful_use(session)
         lr = request.adam_params.learning_rate if request.adam_params else None
         t0 = time.time()
         msg = f"[{session.model_id}] optim_step start request_id={request_id} lr={lr}"
         logger.info(msg)
         result = await run_async_with_otel_span(
             "training.optim_step.execute",
-            lambda: training_engine.optim_step(session, request),
+            lambda: engine.optim_step(session, request),
             component="routes.training",
             op="training.optim_step",
             request_id=str(request_id),
@@ -2898,6 +3421,11 @@ async def save_weights_for_sampler(
             status_code=404, detail=f"Model '{request.model_id}' not found"
         )
 
+    route_session_info = _ensure_route_session_info(
+        model_id=request.model_id,
+        session=session,
+        route_session_info=route_session_info,
+    )
     base_model = str(route_session_info.get("base_model") or "")
     backend = str(route_session_info.get("backend") or "unknown")
 
@@ -2988,33 +3516,52 @@ async def _do_save_weights_for_sampler(
     - Ephemeral (path is None): Use per-session inference engine for isolated concurrent access
     """
     inflight_marked = False
+    claimed_ckpt_id: str | None = None
+    mirror_started = False
     try:
         set_request_id(request_id)
-        if training_engine is None or training_manager is None:
+        engine = training_engine
+        manager = training_manager
+        if engine is None or manager is None:
             raise RuntimeError("Training engine not initialized")
         inflight_marked = True
 
-        session = training_manager.get_session(request.model_id)
+        session = manager.get_session(request.model_id)
         if session is None:
             session = await _restore_training_session(request.model_id)
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
+        session = await _materialize_training_session_for_stateful_use(session)
         # Determine checkpoint name
         if request.path is not None:
             # Named save - use provided path
-            checkpoint_name = request.path
+            checkpoint_name = request.path.strip()
+            if not checkpoint_name or checkpoint_name in (".", "..") or "/" in checkpoint_name or "\\" in checkpoint_name:
+                raise ValueError(f"Invalid checkpoint name: {request.path!r}")
+            created_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            claimed_ckpt_id = await _claim_sampler_checkpoint_or_raise(
+                owner_id=None if is_admin else user_id,
+                model_id=session.model_id,
+                raw_checkpoint_id=checkpoint_name,
+                model_name=session.base_model,
+                checkpoint_created_at=created_at,
+                retry=bool(request.retry),
+            )
             save_path = build_persistent_cache_dir(
                 user_id=None if is_admin else user_id,
                 model_id=session.model_id,
                 checkpoint_name=checkpoint_name,
+                checkpoint_type="sampler",
             )
         else:
             # Ephemeral save - generate unique temp name
             checkpoint_name = f"_ephemeral_{uuid.uuid4().hex[:8]}"
+            created_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
             save_path = build_ephemeral_checkpoint_dir(
                 user_id=None if is_admin else user_id,
                 model_id=session.model_id,
                 checkpoint_name=checkpoint_name,
+                checkpoint_type="sampler",
             )
 
         train_mlp = bool(getattr(getattr(session, "lora_config", None), "train_mlp", False))
@@ -3022,10 +3569,11 @@ async def _do_save_weights_for_sampler(
         # Save weights
         save_path = await run_async_with_otel_span(
             "training.save_weights_for_sampler.execute",
-            lambda: training_engine.save_weights_for_sampler(
+            lambda: engine.save_weights_for_sampler(
                 session=session,
                 checkpoint_name=checkpoint_name,
-                checkpoint_base_dir=os.path.dirname(os.path.dirname(save_path)),
+                checkpoint_base_dir=os.path.dirname(os.path.dirname(os.path.dirname(save_path))),
+                checkpoint_type="sampler",
             ),
             component="routes.training",
             op="training.save_weights_for_sampler",
@@ -3080,10 +3628,10 @@ async def _do_save_weights_for_sampler(
                 save_path,
                 {
                     "checkpoint_id": checkpoint_name,
-                    "owner_id": user_id,
+                    "owner_id": None if is_admin else user_id,
                     "model_id": session.model_id,
                     "model_name": session.base_model,
-                    "created_at": datetime.utcnow().isoformat() + "Z",
+                    "created_at": created_at,
                     "step": session.current_step,
                     "checkpoint_type": "sampler",
                     "optimizer_present": False,
@@ -3091,6 +3639,7 @@ async def _do_save_weights_for_sampler(
                     "type": "sampler",
                     "storage_tier": "ephemeral_pfs" if request.path is None else "persistent_cache",
                     "ttl_seconds": request.ttl_seconds,
+                    "ckpt_id": claimed_ckpt_id,
                 },
             )
 
@@ -3112,7 +3661,9 @@ async def _do_save_weights_for_sampler(
                     user_id=None if is_admin else user_id,
                     model_id=session.model_id,
                     checkpoint_name=checkpoint_name,
+                    checkpoint_type="sampler",
                 )
+                mirror_started = True
 
         from ..client_compat import checkpoint_uri
 
@@ -3137,6 +3688,7 @@ async def _do_save_weights_for_sampler(
                 sampling_session_id=None,
             ).model_dump()
             response.update(
+                checkpoint_record_id=claimed_ckpt_id,
                 filesystem_path=save_path,
                 persistent_filesystem_path=persistent_path,
                 mirror_status=MIRROR_STATUS_PENDING,
@@ -3147,7 +3699,8 @@ async def _do_save_weights_for_sampler(
             # Ephemeral flow: Use multi-LoRA engine for frozen per-session weights
             # Each sampling session gets unique lora_int_id with frozen weights.
             # Matches Tinker SDK semantics where each save creates isolated snapshot.
-            if inference_manager is None:
+            inf_mgr = inference_manager
+            if inf_mgr is None:
                 raise RuntimeError("Inference manager not initialized")
 
             sampling_session_id = str(uuid.uuid4())
@@ -3175,12 +3728,12 @@ async def _do_save_weights_for_sampler(
                         "save_mode": "ephemeral",
                     },
                 ):
-                    await inference_manager.get_engine_for_model(base_model)
+                    await inf_mgr.get_engine_for_model(base_model)
 
-            pending_warms = getattr(inference_manager, "_background_engine_warm_tasks", None)
+            pending_warms = getattr(inf_mgr, "_background_engine_warm_tasks", None)
             if not isinstance(pending_warms, dict):
                 pending_warms = {}
-                setattr(inference_manager, "_background_engine_warm_tasks", pending_warms)
+                setattr(inf_mgr, "_background_engine_warm_tasks", pending_warms)
 
             existing_warm = pending_warms.get(base_model)
             with start_as_current_span(
@@ -3249,7 +3802,7 @@ async def _do_save_weights_for_sampler(
                     "warm_completed_inline": bool(warm_completed_inline),
                 },
             ):
-                inference_manager.register_multi_lora_session(
+                inf_mgr.register_multi_lora_session(
                     session_id=sampling_session_id,
                     base_model=base_model,
                     lora_rank=lora_rank,
@@ -3306,9 +3859,15 @@ async def _do_save_weights_for_sampler(
                 sampling_session_id=sampling_session_id,
             ).model_dump()
 
-        future_store.resolve(request_id, response)
+        async_resolve = getattr(future_store, "async_resolve", None)
+        if callable(async_resolve):
+            await async_resolve(request_id, response)
+        else:
+            future_store.resolve(request_id, response)
 
     except Exception as e:
+        if not mirror_started:
+            await _mark_checkpoint_failed_safe(claimed_ckpt_id, fail_reason="upload_error")
         logger.exception(
             "[save_weights_for_sampler] failed request_id=%s model_id=%s failure_reason=%s error_type=%s next_action=%s",
             str(request_id),
@@ -3337,25 +3896,43 @@ def _owner_visible(request_user_data: dict | None, owner: str | None) -> bool:
     return bool(owner) and owner == request_user_id
 
 
+async def _get_authoritative_training_info(model_id: str) -> dict[str, Any] | None:
+    info = await _get_training_route_session_info(model_id)
+    if isinstance(info, dict):
+        _refresh_training_session_from_info_if_needed(model_id, info)
+        return info
+    _drop_local_training_session(model_id)
+    return None
+
+
+async def _list_authoritative_training_infos() -> dict[str, dict[str, Any]]:
+    from ..backend.training_session_store import async_list_training_sessions
+
+    infos_by_id: dict[str, dict[str, Any]] = {}
+    for info in await async_list_training_sessions():
+        model_id = info.get("model_id")
+        if not isinstance(model_id, str) or not model_id:
+            continue
+        info = dict(info)
+        infos_by_id[model_id] = info
+        _refresh_training_session_from_info_if_needed(model_id, info)
+
+    if training_manager is not None:
+        for model_id, session in list(getattr(training_manager, "_sessions", {}).items()):
+            if model_id in infos_by_id:
+                continue
+            if not bool(getattr(session, "pending_persist", False)):
+                _drop_local_training_session(model_id)
+    return infos_by_id
+
+
 @router.get("/training_runs/{training_run_id}", response_model=TrainingRun)
 async def get_training_run(training_run_id: str, http_request: Request) -> TrainingRun:
     request_user_data = _get_user_data(http_request)
-    info = None
-
-    if training_manager is not None:
-        session = training_manager.get_session(training_run_id)
-        if session is None:
-            session = await _restore_training_session(training_run_id)
-        if session is not None:
-            info = _session_info_from_live(session)
-
-    if info is None:
-        try:
-            from ..backend.training_session_store import async_get_training_session_info
-
-            info = await async_get_training_session_info(training_run_id)
-        except Exception as e:
-            raise HTTPException(status_code=503, detail="Training session store unavailable") from e
+    try:
+        info = await _get_authoritative_training_info(training_run_id)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail="Training session store unavailable") from e
 
     if not isinstance(info, dict):
         raise HTTPException(status_code=404, detail=f"Training run '{training_run_id}' not found")
@@ -3371,31 +3948,14 @@ async def get_training_run(training_run_id: str, http_request: Request) -> Train
 
 
 @router.get("/training_runs", response_model=TrainingRunsResponse)
-async def list_training_runs(limit: int = 20, offset: int = 0, http_request: Request = None) -> TrainingRunsResponse:
+async def list_training_runs(
+    limit: int = 20,
+    offset: int = 0,
+    http_request: Request = cast(Request, None),
+) -> TrainingRunsResponse:
     request_user_data = _get_user_data(http_request) if http_request else None
-    infos_by_id: dict[str, dict] = {}
-
-    if training_manager is not None:
-        for session in training_manager.list_sessions():
-            infos_by_id[session.model_id] = _session_info_from_live(session)
-
     try:
-        from ..backend.training_session_store import async_list_training_sessions
-
-        for info in await async_list_training_sessions():
-            model_id = info.get("model_id")
-            if not isinstance(model_id, str) or not model_id:
-                continue
-            if model_id in infos_by_id:
-                existing = infos_by_id[model_id]
-                if not existing.get("user_id") and info.get("user_id"):
-                    existing["user_id"] = info.get("user_id")
-                if not existing.get("created_at") and info.get("created_at"):
-                    existing["created_at"] = info.get("created_at")
-                if not existing.get("user_metadata") and info.get("user_metadata"):
-                    existing["user_metadata"] = info.get("user_metadata")
-                continue
-            infos_by_id[model_id] = info
+        infos_by_id = await _list_authoritative_training_infos()
     except Exception as e:
         raise HTTPException(status_code=503, detail="Training session store unavailable") from e
 
@@ -3431,25 +3991,28 @@ async def get_model_info(model_id: str):
     if training_manager is None:
         raise HTTPException(status_code=503, detail="Training manager not initialized")
 
-    session = training_manager.get_session(model_id)
-    if session is None:
-        session = await _restore_training_session(model_id)
-    if session is None:
+    try:
+        info = await _get_authoritative_training_info(model_id)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail="Training session store unavailable") from e
+    if not isinstance(info, dict):
         raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
 
     return {
-        "model_id": session.model_id,
-        "session_id": session.session_id,
-        "model_seq_id": session.model_seq_id,
-        "base_model": session.base_model,
-        "lora_config": session.lora_config.model_dump() if session.lora_config else None,
-        "user_metadata": session.user_metadata,
-        "learning_rate": session.learning_rate,
-        "created_at": session.created_at,
-        "current_step": session.current_step,
-        "is_active": session.is_active,
-        "backend": session.backend,
-        "user_id": session.user_id,
+        "model_id": str(info.get("model_id") or model_id),
+        "session_id": str(info.get("session_id") or ""),
+        "model_seq_id": int(info.get("model_seq_id") or 0),
+        "base_model": str(info.get("base_model") or ""),
+        "lora_config": info.get("lora_config"),
+        "user_metadata": info.get("user_metadata") or {},
+        "learning_rate": float(info.get("learning_rate") or 1e-4),
+        "created_at": info.get("created_at"),
+        "current_step": int(info.get("current_step") or 0),
+        "is_active": bool(info.get("is_active", True)),
+        "backend": str(info.get("backend") or "peft"),
+        "user_id": info.get("user_id"),
+        "last_activity": info.get("last_activity"),
+        "idle_for_s": max(0.0, time.time() - float(info.get("last_activity") or 0.0)) if info.get("last_activity") is not None else None,
     }
 
 
@@ -3461,13 +4024,13 @@ async def get_info(request: GetInfoRequest, http_request: Request) -> GetInfoRes
     """
     from ..gateway import async_remote_training_model, forward_json, upstream_for_alias
 
-    session = None
-    if training_manager is not None:
-        session = training_manager.get_session(request.model_id)
-        if session is None:
-            session = await _restore_training_session(request.model_id)
+    info = None
+    try:
+        info = await _get_authoritative_training_info(request.model_id)
+    except Exception:
+        info = None
 
-    if session is None:
+    if info is None:
         remote = await async_remote_training_model(request.model_id)
         if remote is not None:
             upstream_alias, base_model = remote
@@ -3499,23 +4062,25 @@ async def get_info(request: GetInfoRequest, http_request: Request) -> GetInfoRes
     if training_manager is None:
         raise HTTPException(status_code=503, detail="Training manager not initialized")
 
-    if session is None:
+    if info is None:
         raise HTTPException(
             status_code=404, detail=f"Model '{request.model_id}' not found"
         )
 
-    # Build response matching tinker client expectations
-    lora_rank = session.lora_config.rank if session.lora_config else None
-    is_lora = session.lora_config is not None
+    lora_cfg = info.get("lora_config") if isinstance(info.get("lora_config"), dict) else None
+    lora_rank = lora_cfg.get("rank") if isinstance(lora_cfg, dict) else None
+    is_lora = lora_cfg is not None
+    base_model = str(info.get("base_model") or "")
+    model_id = str(info.get("model_id") or request.model_id)
 
     return GetInfoResponse(
-        model_id=session.model_id,
+        model_id=model_id,
         model_data=ModelData(
-            arch="transformer",  # Generic architecture identifier
-            model_name=session.base_model,
-            tokenizer_id=session.base_model,  # Use base model as tokenizer ID
+            arch="transformer",
+            model_name=base_model,
+            tokenizer_id=base_model,
         ),
-        model_name=session.base_model,
+        model_name=base_model,
         is_lora=is_lora,
         lora_rank=lora_rank,
     )
@@ -3527,21 +4092,30 @@ async def list_models():
     if training_manager is None:
         raise HTTPException(status_code=503, detail="Training manager not initialized")
 
-    sessions = training_manager.list_sessions()
+    try:
+        infos_by_id = await _list_authoritative_training_infos()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail="Training session store unavailable") from e
+
+    infos = list(infos_by_id.values())
+    infos.sort(key=lambda info: str(info.get("model_id") or ""))
     return {
         "models": [
             {
-                "model_id": s.model_id,
-                "session_id": s.session_id,
-                "model_seq_id": s.model_seq_id,
-                "base_model": s.base_model,
-                "created_at": s.created_at,
-                "current_step": s.current_step,
-                "is_active": s.is_active,
+                "model_id": str(info.get("model_id") or ""),
+                "session_id": str(info.get("session_id") or ""),
+                "model_seq_id": int(info.get("model_seq_id") or 0),
+                "base_model": str(info.get("base_model") or ""),
+                "created_at": info.get("created_at"),
+                "current_step": int(info.get("current_step") or 0),
+                "is_active": bool(info.get("is_active", True)),
+                "last_activity": info.get("last_activity"),
+                "idle_for_s": max(0.0, time.time() - float(info.get("last_activity") or 0.0)) if info.get("last_activity") is not None else None,
+                "backend": str(info.get("backend") or "peft"),
             }
-            for s in sessions
+            for info in infos
         ],
-        "total": len(sessions),
+        "total": len(infos),
     }
 
 
@@ -3549,25 +4123,21 @@ async def list_models():
 async def delete_model(model_id: str, http_request: Request):
     """Delete a training model and release resources."""
     _require_write_access(http_request)
-    if training_engine is None or training_manager is None:
-        raise HTTPException(status_code=503, detail="Training engine not initialized")
 
-    session = training_manager.get_session(model_id)
-    if session is None:
-        raise HTTPException(
-            status_code=404, detail=f"Model '{model_id}' not found"
-        )
+    _session, route_session_info = await _resolve_training_route_session(model_id)
+    if route_session_info is None:
+        raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
 
     request_id = await _enqueue_internal_serialized_model_op(
         model_id=model_id,
         op="training.delete_model",
         request_json=json.dumps({"model_id": model_id}).encode("utf-8"),
         extra=_build_training_scheduler_extra(
-            session=session,
+            session=route_session_info,
             model_id=model_id,
             training_op="delete_model",
         ),
-        user_id=session.user_id,
+        user_id=str(route_session_info.get("user_id") or ""),
     )
     try:
         return await _wait_internal_future_result(request_id)
@@ -3621,6 +4191,63 @@ async def _do_delete_model(request_id: str, model_id: str) -> None:
             training_manager.mark_inflight(model_id, -1)
 
 
+async def _get_control_plane_tokenizer_info(model_id: str, info: dict[str, Any]) -> dict[str, Any]:
+    from ..backend.training_session_manager import MATERIALIZATION_STATE_READY, TRAINING_SESSION_METADATA_VERSION
+
+    backend = str(info.get("backend") or _infer_training_backend_for_base_model(str(info.get("base_model") or "")))
+    tokenizer_info = info.get("tokenizer_info")
+    if isinstance(tokenizer_info, dict):
+        return dict(tokenizer_info)
+
+    tokenizer_metadata = None
+    if training_manager is not None and training_engine is not None:
+        session = training_manager.get_session(model_id)
+        if session is None:
+            session = await _restore_training_session(model_id)
+        if session is not None and _supports_control_plane_tokenizer_metadata(str(getattr(session, "backend", "") or "")):
+            try:
+                tokenizer_metadata = await _collect_control_plane_tokenizer_metadata(session)
+            except Exception as e:
+                logger.warning(
+                    "[get_tokenizer] worker tokenizer fetch failed model_id=%s error_type=%s error=%s; falling back to local metadata",
+                    str(model_id),
+                    type(e).__name__,
+                    e,
+                )
+    if tokenizer_metadata is None:
+        tokenizer_metadata = await asyncio.to_thread(
+            _build_local_tokenizer_metadata,
+            str(info.get("base_model") or ""),
+            backend,
+        )
+
+    backfill_payload = {
+        "model_id": str(model_id),
+        "metadata_version": max(int(info.get("metadata_version") or 1) + 1, TRAINING_SESSION_METADATA_VERSION),
+        "materialization_state": str(info.get("materialization_state") or MATERIALIZATION_STATE_READY),
+        "tokenizer_info": dict(tokenizer_metadata.get("tokenizer_info") or {}),
+    }
+    if tokenizer_metadata.get("tokenizer_identity") is not None:
+        backfill_payload["tokenizer_identity"] = tokenizer_metadata.get("tokenizer_identity")
+    if tokenizer_metadata.get("tokenizer_source_path") is not None:
+        backfill_payload["tokenizer_source_path"] = tokenizer_metadata.get("tokenizer_source_path")
+    try:
+        from ..backend.training_session_store import async_upsert_training_session
+
+        await async_upsert_training_session(backfill_payload)
+        merged_info = dict(info)
+        merged_info.update(backfill_payload)
+        _refresh_training_session_from_info_if_needed(model_id, merged_info)
+    except Exception as e:
+        logger.warning(
+            "[get_tokenizer] detached metadata backfill failed model_id=%s error_type=%s error=%s",
+            str(model_id),
+            type(e).__name__,
+            e,
+        )
+    return dict(tokenizer_metadata["tokenizer_info"])
+
+
 @router.get("/models/{model_id}/tokenizer")
 async def get_tokenizer(model_id: str):
     """Get tokenizer configuration for a training model.
@@ -3628,16 +4255,34 @@ async def get_tokenizer(model_id: str):
     Returns tokenizer info (vocab_size, special tokens, etc.)
     for client-side tokenization.
     """
-    if training_engine is None or training_manager is None:
-        raise HTTPException(status_code=503, detail="Training engine not initialized")
+    info = await _get_training_route_session_info(model_id)
+    if not isinstance(info, dict):
+        raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
+    _refresh_training_session_from_info_if_needed(model_id, info)
 
-    session = training_manager.get_session(model_id)
-    if session is None:
+    backend = str(info.get("backend") or _infer_training_backend_for_base_model(str(info.get("base_model") or "")))
+    try:
+        if _supports_control_plane_tokenizer_metadata(backend):
+            tokenizer_info = await _get_control_plane_tokenizer_info(model_id, info)
+        else:
+            if training_engine is None:
+                raise HTTPException(status_code=503, detail="Training engine not initialized")
+            if training_manager is None:
+                raise HTTPException(status_code=503, detail="Training manager not initialized")
+            session = training_manager.get_session(model_id)
+            if session is None:
+                session = await _restore_training_session(model_id)
+            if session is None:
+                raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
+            tokenizer_info = await training_engine.get_tokenizer_info(session)
+    except HTTPException:
+        raise
+    except Exception as e:
         raise HTTPException(
-            status_code=404, detail=f"Model '{model_id}' not found"
-        )
+            status_code=500,
+            detail=f"Failed to load tokenizer for model {model_id!r}: {type(e).__name__}: {e}",
+        ) from e
 
-    tokenizer_info = await training_engine.get_tokenizer_info(session)
     return {
         "model_id": model_id,
         "tokenizer": tokenizer_info,

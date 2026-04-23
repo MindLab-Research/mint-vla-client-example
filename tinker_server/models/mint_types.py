@@ -15,6 +15,7 @@ class InterpolateCheckpointsRequest(MintBaseModel):
     source_paths: list[str]
     coefficients: list[float]
     output_path: str | None = None
+    retry: bool = False
     output_checkpoint_type: Literal["sampler"] = "sampler"
     type: Literal["mint_interpolate_checkpoints"] = "mint_interpolate_checkpoints"
 

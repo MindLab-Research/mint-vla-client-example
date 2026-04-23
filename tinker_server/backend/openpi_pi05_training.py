@@ -368,10 +368,13 @@ class OpenPIPi05TrainingEngine:
         session: Any,
         checkpoint_name: str,
         checkpoint_base_dir: str,
+        checkpoint_type: str | None = None,
     ) -> str:
         runtime = self._runtime_for_session(session)
         checkpoint_root = Path(checkpoint_base_dir).expanduser().resolve() / str(session.model_id)
         export_dir = checkpoint_root / checkpoint_name
+        if checkpoint_type:
+            export_dir = export_dir / str(checkpoint_type)
         if export_dir.exists():
             raise FileExistsError(f"OpenPI pi0.5 sampler export path already exists: {export_dir}")
 

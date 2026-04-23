@@ -84,11 +84,13 @@ class TrainingEngineRouter:
         session: Any,
         checkpoint_name: str,
         checkpoint_base_dir: str,
+        checkpoint_type: str | None = None,
     ) -> Any:
         return await self._engine_for_session(session).save_weights_for_sampler(
             session=session,
             checkpoint_name=checkpoint_name,
             checkpoint_base_dir=checkpoint_base_dir,
+            checkpoint_type=checkpoint_type,
         )
 
     async def save_weights(

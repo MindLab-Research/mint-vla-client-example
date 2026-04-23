@@ -750,6 +750,7 @@ class SaveWeightsForSamplerRequest(BaseModel):
     model_id: str
     path: str | None = None  # checkpoint name for named save (None for ephemeral)
     ttl_seconds: int | None = None
+    retry: bool = False
     seq_id: int | None = None
     sampling_session_seq_id: int | None = None  # For ephemeral flow
     type: Literal["save_weights_for_sampler"] = "save_weights_for_sampler"
@@ -776,6 +777,7 @@ class SaveStateRequest(BaseModel):
     model_id: str
     path: str | None = None  # checkpoint name, e.g. "checkpoint-100"
     ttl_seconds: int | None = None
+    retry: bool = False
     seq_id: int | None = None
     type: Literal["save_weights"] = "save_weights"
 
