@@ -322,6 +322,44 @@ def test_mock_scheduler_does_not_idle_wait_for_missing_followup(monkeypatch):
     assert _session_key_from_item(second) == "B"
 
 
+def test_issue_517_create_lane_not_blocked_by_live_training_lease(monkeypatch):
+    monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "1")
+    monkeypatch.setenv("MINT_SCHEDULER_FAIRNESS", "oldest")
+    monkeypatch.setenv("MINT_SCHEDULER_MAX_CONSECUTIVE", "8")
+    monkeypatch.setenv("MINT_SCHEDULER_COALESCE_MS", "0")
+
+    api_work_queue = _load_api_work_queue_module(monkeypatch)
+    actor = api_work_queue._get_or_create_ray_actor()
+
+    live = _item(
+        "live-train-1",
+        domain="megatron_qwen3_235b_a22b_instruct_2507",
+        session_key="train-session",
+        created_at=1.0,
+    )
+    live["op"] = "training.forward_backward"
+
+    create = _item(
+        "create-1",
+        domain="megatron:create:megatron_qwen3_235b_a22b_instruct_2507",
+        session_key="create-session",
+        created_at=2.0,
+    )
+    create["op"] = "training.create_model"
+
+    asyncio.run(_enqueue_many(actor, [live, create]))
+
+    first = asyncio.run(actor.dequeue("consumer-job"))
+    assert first["request_id"] == "live-train-1"
+
+    second = asyncio.run(asyncio.wait_for(actor.dequeue("consumer-job"), timeout=0.05))
+    assert second["request_id"] == "create-1"
+    assert str((second.get("extra") or {}).get("scheduler_domain")) == "megatron:create:megatron_qwen3_235b_a22b_instruct_2507"
+
+    asyncio.run(actor.finalize_request("create-1"))
+    asyncio.run(actor.finalize_request("live-train-1"))
+
+
 def test_issue_194_dequeue_assigns_monotonic_execution_serial_seq(monkeypatch):
     monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "1")
 

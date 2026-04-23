@@ -6,6 +6,7 @@ Each training session gets a dedicated TrainingWorker Ray actor with its own GPU
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import threading
@@ -13,12 +14,6 @@ import time
 from typing import TYPE_CHECKING, Any
 
 import ray
-torch = None  # type: ignore[assignment]
-
-if TYPE_CHECKING:
-    from .training_session_manager import TrainingSession
-
-logger = logging.getLogger(__name__)
 
 from . import ray_kill
 from ..logging_context import (
@@ -29,15 +24,20 @@ from ..logging_context import (
     run_async_with_otel_span,
     start_as_current_span,
 )
+from tinker_server.config import RAY_NAMESPACE
+from tinker_server.config import config as server_config
+from tinker_server.ray_utils import init_ray
+
+torch = None  # type: ignore[assignment]
+
+if TYPE_CHECKING:
+    from .training_session_manager import TrainingSession
+
+logger = logging.getLogger(__name__)
 
 # Default idle timeout for TrainingWorker (seconds)
 # Set to 0 to disable self-termination (ResourcePool LRU eviction handles lifecycle)
 DEFAULT_IDLE_TIMEOUT = 0  # Disabled - LRU eviction manages actor lifecycle
-
-# Import centralized PFS paths from config
-from tinker_server.config import RAY_NAMESPACE
-from tinker_server.config import config as server_config
-from tinker_server.ray_utils import init_ray
 
 
 # =====================================================================
@@ -2068,6 +2068,8 @@ class VerlTrainingEngine:
             else:
                 base_model = requested_model
 
+        observability_base_model = str(requested_model or base_model or "")
+
         print(
             f"[DEBUG {model_id}] create_training_session start: requested_model={requested_model} use_megatron={use_megatron} base_model={base_model}",
             flush=True,
@@ -2558,7 +2560,6 @@ class VerlTrainingEngine:
         Returns:
             Dict with tokenizer configuration.
         """
-        model_id = session.model_id
         worker = await self._get_live_worker(session, op="get_tokenizer_info")
 
         result = await worker.get_tokenizer_info.remote()
@@ -2948,7 +2949,6 @@ class VerlTrainingEngine:
                 "backend": str(session.backend),
                 "save_path": str(abs_path),
                 "timeout_s": int(timeout_s),
-                "use_per_expert_lora": bool(use_per_expert_lora),
                 "train_attn": bool(train_attn),
                 "train_mlp": bool(train_mlp),
                 "train_unembed": bool(train_unembed),

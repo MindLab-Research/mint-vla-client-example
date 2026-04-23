@@ -12,6 +12,7 @@ import asyncio
 import concurrent.futures
 import logging
 import os
+import inspect
 import time
 from typing import Any
 
@@ -32,7 +33,7 @@ _register_ray_reconnect_invalidator(_reset_cached_actor_handle)
 
 
 async def _await_ray_ref(ref: Any) -> Any:
-    if hasattr(ref, "__await__"):
+    if inspect.isawaitable(ref):
         return await ref
 
     to_future = getattr(ref, "future", None)
@@ -42,7 +43,7 @@ async def _await_ray_ref(ref: Any) -> Any:
             return await fut
         if isinstance(fut, concurrent.futures.Future):
             return await asyncio.wrap_future(fut)
-        if hasattr(fut, "__await__"):
+        if inspect.isawaitable(fut):
             return await fut
 
     raise TypeError(f"Ray ref is not awaitable: {type(ref)}")

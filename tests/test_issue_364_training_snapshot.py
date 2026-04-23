@@ -566,8 +566,6 @@ async def test_issue_364_list_models_refreshes_read_only_metadata_from_store(
 async def test_issue_364_get_tokenizer_uses_detached_store_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    manager = TrainingSessionManager()
-
     async def _async_get_training_session_info(model_id: str):
         assert model_id == "model-364-tokenizer"
         return {
@@ -593,7 +591,7 @@ async def test_issue_364_get_tokenizer_uses_detached_store_metadata(
             },
         }
 
-    monkeypatch.setattr(training_route, "training_manager", manager)
+    monkeypatch.setattr(training_route, "training_manager", None)
     monkeypatch.setattr(training_route, "training_engine", None)
     monkeypatch.setattr(
         "tinker_server.backend.training_session_store.async_get_training_session_info",
@@ -935,11 +933,18 @@ async def test_issue_364_get_tokenizer_falls_back_to_local_metadata_when_worker_
     async def _restore_none(_model_id: str):
         return None
 
+    async def _async_upsert_training_session(_info: dict[str, object]) -> None:
+        return None
+
     monkeypatch.setattr(training_route, "_build_local_tokenizer_metadata", _fake_build_local_tokenizer_metadata)
     monkeypatch.setattr(training_route, "_restore_training_session", _restore_none)
     monkeypatch.setattr(
         "tinker_server.backend.training_session_store.async_get_training_session_info",
         _async_get_training_session_info,
+    )
+    monkeypatch.setattr(
+        "tinker_server.backend.training_session_store.async_upsert_training_session",
+        _async_upsert_training_session,
     )
 
     out = await training_route.get_tokenizer("model-364-tokenizer-fallback")
