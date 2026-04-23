@@ -3027,6 +3027,7 @@ class VerlTrainingEngine:
         self,
         session: TrainingSession,
         save_path: str,
+        use_per_expert_lora: bool = False,
     ) -> str:
         """Save minimal PEFT LoRA artifacts for sampling (no optimizer/resume artifacts)."""
         import os
