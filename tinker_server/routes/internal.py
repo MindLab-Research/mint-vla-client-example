@@ -1775,42 +1775,25 @@ async def list_checkpoints(request: Request):
 
     is_admin = can_bypass_ownership(request)
 
-    catalog_checkpoints: list[CheckpointInfo] = []
-    shadow_fs_ids: set[str] = set()
     if checkpoint_index_enabled():
         try:
-            catalog_checkpoints, shadow_fs_ids = await _scan_checkpoints_from_catalog(
+            # Catalog-backed list avoids recursively sizing uncataloged
+            # filesystem checkpoints, which is too slow for prod list calls.
+            catalog_checkpoints, _shadow_fs_ids = await _scan_checkpoints_from_catalog(
                 user_id,
                 is_admin=is_admin,
             )
         except Exception:
             logger.exception(
-                "[internal.list_checkpoints] catalog query failed, fallback to filesystem scan"
+                "[internal.list_checkpoints] catalog query failed; filesystem fallback disabled"
             )
-            catalog_checkpoints = []
-            shadow_fs_ids = set()
+            raise HTTPException(status_code=503, detail="Checkpoint catalog unavailable")
+        return CheckpointsListResponse(checkpoints=catalog_checkpoints)
 
-    # Catalog-backed ids already have a cheaper source of truth than walking
-    # the checkpoint tree and sizing every directory again.
     checkpoints = _scan_checkpoints(
         user_id,
         is_admin=is_admin,
-        exclude_public_ids=shadow_fs_ids,
     )
-    if shadow_fs_ids:
-        checkpoints = [
-            item for item in checkpoints if item.checkpoint_id not in shadow_fs_ids
-        ]
-
-    if catalog_checkpoints:
-        merged_by_id: dict[str, CheckpointInfo] = {
-            item.checkpoint_id: item for item in checkpoints
-        }
-        for item in catalog_checkpoints:
-            merged_by_id[item.checkpoint_id] = item
-        checkpoints = list(merged_by_id.values())
-        checkpoints.sort(key=lambda x: x.created_at, reverse=True)
-
     return CheckpointsListResponse(checkpoints=checkpoints)
 
 
