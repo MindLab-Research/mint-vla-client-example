@@ -69,12 +69,24 @@ def _get_user_id(request: Request) -> str | None:
     return _request_user_id(request)
 
 
-def _resolve_checkpoint_for_user(path: str, *, user_id: str | None, is_admin: bool) -> str:
+def _resolve_checkpoint_for_user(
+    path: str,
+    *,
+    user_id: str | None,
+    is_admin: bool,
+    owner_id: str | None = None,
+) -> str:
+    owner_scope = owner_id if is_admin else user_id
     try:
-        resolved = resolve_checkpoint_path(path, user_id=user_id, is_admin=is_admin)
+        resolved = resolve_checkpoint_path(path, user_id=owner_scope, is_admin=is_admin)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
-    ensure_checkpoint_path_allowed(resolved, user_id=user_id, is_admin=is_admin)
+    if path.startswith("ckpt_") and resolved == path:
+        raise HTTPException(status_code=404, detail="Checkpoint not found")
+    try:
+        ensure_checkpoint_path_allowed(resolved, user_id=owner_scope, is_admin=is_admin)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
     return materialize_persistent_checkpoint(resolved)
 
 
@@ -82,20 +94,29 @@ def _can_bypass_checkpoint_ownership(request: Request) -> bool:
     return can_bypass_ownership(request)
 
 
-def _resolve_checkpoint_for_request(path: str, request: Request) -> str:
+def _resolve_checkpoint_for_request(path: str, request: Request, *, owner_id: str | None = None) -> str:
     return _resolve_checkpoint_for_user(
         path,
         user_id=_get_user_id(request),
         is_admin=_can_bypass_checkpoint_ownership(request),
+        owner_id=owner_id,
     )
 
 
-def _infer_base_model_from_checkpoint_for_request(model_path: str, request: Request) -> str:
-    return _infer_base_model_from_checkpoint(
-        model_path,
-        user_id=_get_user_id(request),
-        is_admin=_can_bypass_checkpoint_ownership(request),
-    )
+def _infer_base_model_from_checkpoint_for_request(
+    model_path: str,
+    request: Request,
+    *,
+    owner_id: str | None = None,
+) -> str:
+    try:
+        return _infer_base_model_from_checkpoint(
+            model_path,
+            user_id=(owner_id if _can_bypass_checkpoint_ownership(request) else _get_user_id(request)),
+            is_admin=_can_bypass_checkpoint_ownership(request),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 def _session_field(session: object, key: str, default=None):
@@ -221,7 +242,11 @@ async def create_action_session(
     user_id = _get_user_id(http_request)
     base_model = request.base_model
     if not base_model and request.model_path:
-        base_model = _infer_base_model_from_checkpoint_for_request(request.model_path, http_request)
+        base_model = _infer_base_model_from_checkpoint_for_request(
+            request.model_path,
+            http_request,
+            owner_id=request.owner_id,
+        )
     if not base_model:
         raise HTTPException(status_code=422, detail="base_model is required")
 
@@ -235,7 +260,7 @@ async def create_action_session(
 
     model_path = request.model_path
     if model_path:
-        model_path = _resolve_checkpoint_for_request(model_path, http_request)
+        model_path = _resolve_checkpoint_for_request(model_path, http_request, owner_id=request.owner_id)
 
     try:
         action_session_id = await action_session_manager.create_session(  # type: ignore[attr-defined]
@@ -477,7 +502,12 @@ async def interpolate_checkpoints(
 ) -> UntypedAPIFuture:
     user_id = _get_user_id(http_request)
     request = request.model_copy(
-        update={"source_paths": [_resolve_checkpoint_for_request(path, http_request) for path in request.source_paths]}
+        update={
+            "source_paths": [
+                _resolve_checkpoint_for_request(path, http_request, owner_id=request.owner_id)
+                for path in request.source_paths
+            ]
+        }
     )
     from ..backend.api_work_queue import api_work_queue
     from ..backend.capacity_manager import capacity_manager
@@ -653,7 +683,11 @@ async def forward_backward_reverse_kl(
         )
 
     user_id = _get_user_id(http_request)
-    resolved_reference_path = _resolve_checkpoint_for_request(request.reference_model_path, http_request)
+    resolved_reference_path = _resolve_checkpoint_for_request(
+        request.reference_model_path,
+        http_request,
+        owner_id=request.owner_id,
+    )
     request = request.model_copy(update={"reference_model_path": resolved_reference_path})
 
     from ..backend.api_work_queue import api_work_queue

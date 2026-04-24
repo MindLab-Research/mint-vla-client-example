@@ -472,6 +472,22 @@ def _catalog_order_key(row: dict[str, Any]) -> tuple[str, str]:
     return created_text, published_text
 
 
+def _catalog_row_to_dict(row: Any) -> dict[str, Any]:
+    record = dict(row)
+    for key in (
+        "ckpt_id",
+        "owner_id",
+        "model_id",
+        "raw_checkpoint_id",
+        "checkpoint_type",
+        "storage_root",
+    ):
+        value = record.get(key)
+        if value is not None and not isinstance(value, str):
+            record[key] = str(value)
+    return record
+
+
 async def list_catalog_checkpoints(*, owner_id: str | None, is_admin: bool) -> list[dict[str, Any]]:
     if not checkpoint_index_enabled():
         return []
@@ -502,7 +518,51 @@ async def list_catalog_checkpoints(*, owner_id: str | None, is_admin: bool) -> l
                 """,
                 str(owner_id or "anonymous"),
             )
-        return [dict(row) for row in rows]
+        return [_catalog_row_to_dict(row) for row in rows]
+    finally:
+        await conn.close()
+
+
+async def list_catalog_checkpoints_for_model(
+    model_id: str,
+    *,
+    owner_id: str | None,
+    is_admin: bool,
+) -> list[dict[str, Any]]:
+    if not checkpoint_index_enabled():
+        return []
+    conn = await _connect()
+    try:
+        await _ensure_schema(conn)
+        if is_admin:
+            rows = await conn.fetch(
+                f"""
+                SELECT ckpt_id, owner_id, model_id, raw_checkpoint_id, checkpoint_type,
+                       storage_root, storage_layout_version, model_name,
+                       checkpoint_created_at, size_bytes, published_at, updated_at
+                FROM {_CHECKPOINT_CATALOG_TABLE}
+                WHERE deleted_at IS NULL
+                  AND model_id = $1
+                ORDER BY COALESCE(checkpoint_created_at, published_at) DESC, published_at DESC
+                """,
+                str(model_id),
+            )
+        else:
+            rows = await conn.fetch(
+                f"""
+                SELECT ckpt_id, owner_id, model_id, raw_checkpoint_id, checkpoint_type,
+                       storage_root, storage_layout_version, model_name,
+                       checkpoint_created_at, size_bytes, published_at, updated_at
+                FROM {_CHECKPOINT_CATALOG_TABLE}
+                WHERE deleted_at IS NULL
+                  AND owner_id = $1
+                  AND model_id = $2
+                ORDER BY COALESCE(checkpoint_created_at, published_at) DESC, published_at DESC
+                """,
+                str(owner_id or "anonymous"),
+                str(model_id),
+            )
+        return [_catalog_row_to_dict(row) for row in rows]
     finally:
         await conn.close()
 
@@ -544,6 +604,80 @@ async def get_catalog_checkpoint(
                 checkpoint_id,
                 str(owner_id or "anonymous"),
             )
-        return dict(row) if row is not None else None
+        return _catalog_row_to_dict(row) if row is not None else None
+    finally:
+        await conn.close()
+
+
+async def get_catalog_checkpoint_by_key(
+    *,
+    owner_id: str | None,
+    model_id: str,
+    raw_checkpoint_id: str,
+    checkpoint_type: str,
+) -> dict[str, Any] | None:
+    if not checkpoint_index_enabled():
+        return None
+    conn = await _connect()
+    try:
+        await _ensure_schema(conn)
+        row = await conn.fetchrow(
+            f"""
+            SELECT ckpt_id, owner_id, model_id, raw_checkpoint_id, checkpoint_type,
+                   storage_root, storage_layout_version, model_name,
+                   checkpoint_created_at, size_bytes, published_at, updated_at
+            FROM {_CHECKPOINT_CATALOG_TABLE}
+            WHERE deleted_at IS NULL
+              AND owner_id = $1
+              AND model_id = $2
+              AND raw_checkpoint_id = $3
+              AND checkpoint_type = $4
+            """,
+            str(owner_id or "anonymous"),
+            str(model_id),
+            str(raw_checkpoint_id),
+            str(checkpoint_type),
+        )
+        return _catalog_row_to_dict(row) if row is not None else None
+    finally:
+        await conn.close()
+
+
+async def mark_catalog_checkpoint_deleted(
+    ckpt_id: str,
+    *,
+    owner_id: str | None,
+    is_admin: bool,
+) -> bool:
+    if not checkpoint_index_enabled():
+        return False
+    conn = await _connect()
+    try:
+        await _ensure_schema(conn)
+        if is_admin:
+            status = await conn.execute(
+                f"""
+                UPDATE {_CHECKPOINT_CATALOG_TABLE}
+                SET deleted_at = now(),
+                    updated_at = now()
+                WHERE ckpt_id = $1
+                  AND deleted_at IS NULL
+                """,
+                str(ckpt_id),
+            )
+        else:
+            status = await conn.execute(
+                f"""
+                UPDATE {_CHECKPOINT_CATALOG_TABLE}
+                SET deleted_at = now(),
+                    updated_at = now()
+                WHERE ckpt_id = $1
+                  AND owner_id = $2
+                  AND deleted_at IS NULL
+                """,
+                str(ckpt_id),
+                str(owner_id or "anonymous"),
+            )
+        return status.endswith(" 1")
     finally:
         await conn.close()
