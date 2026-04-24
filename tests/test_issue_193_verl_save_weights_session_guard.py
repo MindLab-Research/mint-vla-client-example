@@ -715,7 +715,17 @@ def test_issue_193_megatron_load_weights_passes_explicit_session_id_and_keepaliv
 
     async def fake_keepalive(awaitable, keepalive_session, interval_s=30.0, timeout_s=None):
         keepalive_calls.append((awaitable, keepalive_session.model_id, interval_s, timeout_s))
-        return {"current_step": 5, "learning_rate": 3e-4}
+        return {
+            "current_step": 5,
+            "learning_rate": 3e-4,
+            "actual_rank": 8,
+            "actor_only_state_dirty": False,
+            "checkpoint_path": "/tmp/issue_193_megatron_load",
+            "optimizer_restored": False,
+            "train_attn": False,
+            "train_mlp": True,
+            "train_unembed": False,
+        }
 
     monkeypatch.setattr(engine, "_await_with_keepalive", fake_keepalive)
     monkeypatch.setattr(ray, "get", lambda ref, timeout=None: {"status": "ok"})
@@ -746,7 +756,13 @@ def test_issue_193_megatron_load_weights_passes_explicit_session_id_and_keepaliv
             {
                 "step_count": 5,
                 "learning_rate": pytest.approx(3e-4),
-                "actual_rank": None,
+                "actual_rank": 8,
+                "actor_only_state_dirty": False,
+                "checkpoint_path": "/tmp/issue_193_megatron_load",
+                "optimizer_restored": False,
+                "train_attn": False,
+                "train_mlp": True,
+                "train_unembed": False,
             },
         )
     ]
@@ -2045,7 +2061,10 @@ def test_issue_193_megatron_load_checkpoint_uses_ensure_session_loaded(tmp_path:
     ckpt_dir = tmp_path / "ckpt"
     ckpt_dir.mkdir()
     (ckpt_dir / "mp_rank_00_000_000_adapter.pt").write_bytes(b"adapter")
-    (ckpt_dir / "adapter_config.json").write_text(json.dumps({"r": 8}), encoding="utf-8")
+    (ckpt_dir / "adapter_config.json").write_text(
+        json.dumps({"r": 8, "target_modules": ["gate_proj", "up_proj", "down_proj"]}),
+        encoding="utf-8",
+    )
     (ckpt_dir / "training_meta.json").write_text(
         json.dumps({"current_step": 3, "learning_rate": 2e-4}),
         encoding="utf-8",
@@ -2075,9 +2094,9 @@ def test_issue_193_megatron_load_checkpoint_uses_ensure_session_loaded(tmp_path:
             "session_target",
             {
                 "traceparent": None,
-                "train_attn": None,
-                "train_mlp": None,
-                "train_unembed": None,
+                "train_attn": False,
+                "train_mlp": True,
+                "train_unembed": False,
             },
         )
     ]
@@ -2087,9 +2106,9 @@ def test_issue_193_megatron_load_checkpoint_uses_ensure_session_loaded(tmp_path:
             {
                 "actual_rank": 8,
                 "traceparent": None,
-                "train_attn": None,
-                "train_mlp": None,
-                "train_unembed": None,
+                "train_attn": False,
+                "train_mlp": True,
+                "train_unembed": False,
             },
         )
     ]
@@ -2261,7 +2280,7 @@ def test_issue_193_load_weights_invalid_meta_warns_without_pollution(monkeypatch
     assert any("load_weights" in rec.getMessage() for rec in caplog.records)
 
 
-def test_issue_193_megatron_load_weights_invalid_meta_marks_session_loaded_with_null_actual_rank(monkeypatch, caplog):
+def test_issue_193_megatron_load_weights_invalid_meta_fails_loud(monkeypatch):
     engine = VerlTrainingEngine()
     model_id = "model_issue_193_invalid_meta_megatron_load"
     worker = _FakeLoadWorker(ref="invalid-meta-megatron-load-ref")
@@ -2296,14 +2315,12 @@ def test_issue_193_megatron_load_weights_invalid_meta_marks_session_loaded_with_
             load_optimizer=True,
         )
 
-    with caplog.at_level(logging.WARNING):
-        with pytest.raises(AttributeError, match="get"):
-            asyncio.run(_run())
+    with pytest.raises(RuntimeError, match="Megatron load_checkpoint returned invalid metadata"):
+        asyncio.run(_run())
 
     assert session.current_step == 12
     assert session.learning_rate == pytest.approx(9e-5)
     assert worker.mark_session_loaded.calls == []
-    assert any("load_weights" in rec.getMessage() for rec in caplog.records)
 
 
 def test_issue_193_megatron_create_training_session_marks_ready_without_waiting(monkeypatch):

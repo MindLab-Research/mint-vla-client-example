@@ -190,6 +190,7 @@ def test_issue_283_create_model_from_state_background_uses_resolved_path(tmp_pat
             self.learning_rate = 1e-4
             self.base_model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
             self.backend = "megatron"
+            self.lora_config = LoRAConfig(rank=8)
             self.created_at = "2026-03-13T00:00:00Z"
             self.last_activity = 0.0
 
@@ -226,9 +227,16 @@ def test_issue_283_create_model_from_state_background_uses_resolved_path(tmp_pat
         async def load_weights(self, *, session, load_path: str, load_optimizer: bool) -> None:
             self.load_calls.append({"load_path": load_path, "load_optimizer": load_optimizer})
 
+        async def get_tokenizer_info(self, session) -> dict:
+            _ = session
+            return {}
+
     class StubFutureStore:
         def __init__(self) -> None:
             self.resolved: list[tuple[str, dict]] = []
+
+        def resolve(self, request_id: str, payload: dict) -> None:
+            self.resolved.append((request_id, payload))
 
         async def async_resolve(self, request_id: str, payload: dict) -> None:
             self.resolved.append((request_id, payload))
@@ -244,10 +252,14 @@ def test_issue_283_create_model_from_state_background_uses_resolved_path(tmp_pat
 
     training_store_updates: list[dict] = []
     session_index_updates: list[tuple[str, str, str | None, str]] = []
+
+    async def _async_upsert_training_session(info: dict) -> None:
+        training_store_updates.append(dict(info))
+
     monkeypatch.setattr(training_routes, "training_engine", stub_engine)
     monkeypatch.setattr(training_routes, "training_manager", StubTrainingManager())
     monkeypatch.setattr(training_routes, "future_store", stub_future_store)
-    monkeypatch.setattr(training_store_module, "upsert_training_session", lambda info: training_store_updates.append(dict(info)))
+    monkeypatch.setattr(training_store_module, "async_upsert_training_session", _async_upsert_training_session)
     monkeypatch.setattr(
         session_index_store_module,
         "add_training_run_to_session",
@@ -275,7 +287,98 @@ def test_issue_283_create_model_from_state_background_uses_resolved_path(tmp_pat
     ]
     assert training_store_updates[0]["model_id"] == "s283-bg_0"
     assert training_store_updates[0]["base_model"] == "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    assert training_store_updates[0]["lora_config"]["rank"] == 8
     assert session_index_updates == [("s283-bg", "s283-bg_0", None, "2026-03-13T00:00:00Z")]
+
+
+def test_issue_417_create_model_from_state_persists_loaded_lora_config(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from tinker_server.routes import training as training_routes
+    from tinker_server.backend.training_session_manager import TrainingSessionManager
+    from tinker_server.models.types import CreateModelFromStateRequest, LoRAConfig
+    import tinker_server.backend.session_index_store as session_index_store_module
+    import tinker_server.backend.training_session_store as training_store_module
+
+    checkpoint_dir = tmp_path / "loaded-config-checkpoint"
+    checkpoint_dir.mkdir()
+    model_id = "s417-cmfs_0"
+    manager = TrainingSessionManager()
+
+    class StubTrainingEngine:
+        def __init__(self) -> None:
+            self._resource_pool_actor_names = {model_id: "megatron-actor-417"}
+
+        async def create_training_session(self, session) -> None:
+            return None
+
+        async def load_weights(self, *, session, load_path: str, load_optimizer: bool) -> None:
+            assert load_path == str(checkpoint_dir)
+            assert load_optimizer is True
+            session.current_step = 17
+            session.learning_rate = 3e-4
+            session.lora_config = LoRAConfig(
+                rank=16,
+                train_attn=False,
+                train_mlp=True,
+                train_unembed=False,
+            )
+
+        async def get_tokenizer_info(self, session) -> dict:
+            _ = session
+            return {}
+
+        async def shutdown_session(self, session) -> None:
+            _ = session
+
+    class StubFutureStore:
+        def __init__(self) -> None:
+            self.resolved: list[tuple[str, dict]] = []
+
+        def resolve(self, request_id: str, payload: dict) -> None:
+            self.resolved.append((request_id, payload))
+
+        async def async_fail(self, request_id: str, error: str) -> None:
+            raise AssertionError(f"unexpected fail({request_id}): {error}")
+
+    training_store_updates: list[dict] = []
+
+    async def _async_upsert_training_session(info: dict) -> None:
+        training_store_updates.append(dict(info))
+
+    monkeypatch.setattr(training_routes, "training_engine", StubTrainingEngine())
+    monkeypatch.setattr(training_routes, "training_manager", manager)
+    monkeypatch.setattr(training_routes, "future_store", StubFutureStore())
+    monkeypatch.setattr(training_store_module, "async_upsert_training_session", _async_upsert_training_session)
+    monkeypatch.setattr(
+        session_index_store_module,
+        "add_training_run_to_session",
+        lambda *args, **kwargs: None,
+    )
+
+    req = CreateModelFromStateRequest(
+        session_id="s417-cmfs",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        state_path=str(checkpoint_dir),
+        lora_config=LoRAConfig(rank=4, train_attn=True, train_mlp=True, train_unembed=True),
+        load_optimizer=True,
+    )
+    asyncio.run(training_routes._do_create_model_from_state("req-417-cmfs", req, user_id="user-417"))
+
+    assert len(training_store_updates) == 1
+    payload = training_store_updates[0]
+    assert payload["model_id"] == model_id
+    assert payload["current_step"] == 17
+    assert payload["learning_rate"] == 3e-4
+    assert payload["actor_name"] == "megatron-actor-417"
+    assert payload["lora_config"] == {
+        "rank": 16,
+        "seed": None,
+        "train_unembed": False,
+        "train_mlp": True,
+        "train_attn": False,
+    }
 
 
 def test_issue_283_create_model_from_state_background_restores_openpi_training_checkpoint(
@@ -284,6 +387,8 @@ def test_issue_283_create_model_from_state_background_restores_openpi_training_c
     from tinker_server.routes import training as training_routes
     from tinker_server.backend.training_engine_router import TrainingEngineRouter
     from tinker_server.models.types import CreateModelFromStateRequest
+    import tinker_server.backend.session_index_store as session_index_store_module
+    import tinker_server.backend.training_session_store as training_store_module
 
     checkpoint_dir = tmp_path / "openpi-training"
     (checkpoint_dir / "1" / "params").mkdir(parents=True)
@@ -303,6 +408,7 @@ def test_issue_283_create_model_from_state_background_restores_openpi_training_c
             self.learning_rate = 1e-4
             self.base_model = "openpi/pi0-fast-libero-low-mem-finetune"
             self.backend = "openpi_fast"
+            self.lora_config = None
             self.created_at = "2026-03-28T00:00:00Z"
             self.last_activity = 0.0
 
@@ -315,6 +421,9 @@ def test_issue_283_create_model_from_state_background_restores_openpi_training_c
 
         def delete_session(self, model_id: str) -> None:
             return None
+
+        def mark_persisted(self, model_id: str) -> None:
+            _ = model_id
 
         def create_session(self, **kwargs):
             return StubSession()
@@ -353,10 +462,20 @@ def test_issue_283_create_model_from_state_background_restores_openpi_training_c
     openpi_fast_engine = _RecordingEngine("openpi-fast")
     router = TrainingEngineRouter(text_engine=text_engine, openpi_fast_engine=openpi_fast_engine)
     stub_future_store = StubFutureStore()
+    training_store_updates: list[dict] = []
+
+    async def _async_upsert_training_session(info: dict) -> None:
+        training_store_updates.append(dict(info))
 
     monkeypatch.setattr(training_routes, "training_engine", router)
     monkeypatch.setattr(training_routes, "training_manager", StubTrainingManager())
     monkeypatch.setattr(training_routes, "future_store", stub_future_store)
+    monkeypatch.setattr(training_store_module, "async_upsert_training_session", _async_upsert_training_session)
+    monkeypatch.setattr(
+        session_index_store_module,
+        "add_training_run_to_session",
+        lambda *args, **kwargs: None,
+    )
 
     req = CreateModelFromStateRequest(
         session_id="s283-openpi",
@@ -380,6 +499,7 @@ def test_issue_283_create_model_from_state_background_restores_openpi_training_c
         ),
     ]
     assert text_engine.calls == []
+    assert training_store_updates[0]["lora_config"] is None
     assert stub_future_store.resolved == [
         (
             "req-283-openpi",
@@ -527,6 +647,7 @@ def test_issue_283_load_state_route_queues_resolved_path(tmp_path: Path, monkeyp
 def test_issue_283_load_state_background_uses_resolved_path(tmp_path: Path, monkeypatch) -> None:
     from tinker_server.routes import weights as weights_routes
     from tinker_server.models.types import LoadStateRequest
+    import tinker_server.backend.training_session_store as training_store_module
 
     checkpoint_dir = tmp_path / "resolved-load-state"
     checkpoint_dir.mkdir()
@@ -550,8 +671,25 @@ def test_issue_283_load_state_background_uses_resolved_path(tmp_path: Path, monk
 
     class StubSession:
         model_id = "model-283"
+        session_id = "session-283"
+        model_seq_id = 0
         base_model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
         backend = "megatron"
+        lora_config = None
+        rollout_correction_config = None
+        user_metadata = {}
+        user_id = None
+        learning_rate = 1e-4
+        current_step = 0
+        metadata_version = 2
+        materialization_state = "ready"
+        created_at = "2026-03-13T00:00:00Z"
+        last_activity = 1.0
+        tokenizer_info = None
+        tokenizer_identity = None
+        tokenizer_source_path = None
+        actor_name = None
+        namespace = None
 
     class StubTrainingManager:
         def get_session(self, model_id: str):
@@ -579,10 +717,19 @@ def test_issue_283_load_state_background_uses_resolved_path(tmp_path: Path, monk
 
     stub_engine = StubTrainingEngine()
     stub_future_store = StubFutureStore()
+    training_store_updates: list[dict] = []
+
+    async def _async_upsert_training_session(info: dict) -> None:
+        training_store_updates.append(dict(info))
 
     monkeypatch.setattr(weights_routes, "training_engine", stub_engine)
     monkeypatch.setattr(weights_routes, "training_manager", StubTrainingManager())
     monkeypatch.setattr(weights_routes, "future_store", stub_future_store)
+    monkeypatch.setattr(
+        training_store_module,
+        "async_upsert_training_session",
+        _async_upsert_training_session,
+    )
 
     req = LoadStateRequest(model_id="model-283", path=str(checkpoint_dir), optimizer=True)
 
@@ -593,6 +740,132 @@ def test_issue_283_load_state_background_uses_resolved_path(tmp_path: Path, monk
     ]
     assert stub_future_store.resolved == [
         ("req-283-load", {"path": str(checkpoint_dir), "type": "load_weights"})
+    ]
+    assert training_store_updates[0]["model_id"] == "model-283"
+    assert training_store_updates[0]["session_id"] == "session-283"
+    assert training_store_updates[0]["metadata_version"] == 3
+
+
+def test_issue_417_load_state_persists_loaded_lora_config(tmp_path: Path, monkeypatch) -> None:
+    from tinker_server.routes import weights as weights_routes
+    from tinker_server.models.types import LoadStateRequest, LoRAConfig
+    import tinker_server.backend.training_session_store as training_store_module
+
+    checkpoint_dir = tmp_path / "issue-417-load"
+    checkpoint_dir.mkdir()
+
+    class StubSession:
+        model_id = "model-417"
+        session_id = "session-417"
+        model_seq_id = 0
+        base_model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+        backend = "megatron"
+        lora_config = LoRAConfig(rank=4, train_attn=True, train_mlp=True, train_unembed=True)
+        rollout_correction_config = None
+        user_metadata = {"created": "before-load"}
+        user_id = "original-user"
+        learning_rate = 1e-4
+        current_step = 0
+        metadata_version = 2
+        materialization_state = "ready"
+        created_at = "2026-03-13T00:00:00Z"
+        last_activity = 1.0
+        tokenizer_info = {"source": "create"}
+        tokenizer_identity = "tok-identity"
+        tokenizer_source_path = "/models/tokenizer"
+        actor_name = None
+        namespace = None
+
+    session = StubSession()
+
+    class StubTrainingManager:
+        def __init__(self) -> None:
+            self.persisted: list[str] = []
+
+        def get_session(self, model_id: str):
+            assert model_id == "model-417"
+            return session
+
+        def mark_inflight(self, model_id: str, delta: int) -> None:
+            _ = (model_id, delta)
+
+        def mark_persisted(self, model_id: str) -> None:
+            self.persisted.append(model_id)
+
+    class StubTrainingEngine:
+        def __init__(self) -> None:
+            self._resource_pool_actor_names = {"model-417": "megatron-actor-417"}
+
+        async def load_weights(self, session, load_path: str, load_optimizer: bool) -> None:
+            assert load_path == str(checkpoint_dir)
+            assert load_optimizer is False
+            session.current_step = 12
+            session.learning_rate = 2e-4
+            session.lora_config = LoRAConfig(
+                rank=16,
+                train_attn=False,
+                train_mlp=True,
+                train_unembed=False,
+            )
+
+    class StubFutureStore:
+        def __init__(self) -> None:
+            self.resolved: list[tuple[str, dict]] = []
+
+        async def async_resolve(self, request_id: str, payload: dict) -> None:
+            self.resolved.append((request_id, payload))
+
+        async def async_fail(self, request_id: str, error: str) -> None:
+            raise AssertionError(f"unexpected fail({request_id}): {error}")
+
+    training_manager = StubTrainingManager()
+    future_store = StubFutureStore()
+    training_store_updates: list[dict] = []
+
+    async def _async_upsert_training_session(info: dict) -> None:
+        training_store_updates.append(dict(info))
+
+    monkeypatch.setattr(weights_routes, "training_engine", StubTrainingEngine())
+    monkeypatch.setattr(weights_routes, "training_manager", training_manager)
+    monkeypatch.setattr(weights_routes, "future_store", future_store)
+    monkeypatch.setattr(training_store_module, "async_upsert_training_session", _async_upsert_training_session)
+
+    req = LoadStateRequest(model_id="model-417", path=str(checkpoint_dir), optimizer=False)
+    asyncio.run(weights_routes._do_load_state("req-417-load", req, user_id="user-417"))
+
+    assert future_store.resolved == [
+        ("req-417-load", {"path": str(checkpoint_dir), "type": "load_weights"})
+    ]
+    assert training_manager.persisted == ["model-417"]
+    assert training_store_updates == [
+        {
+            "model_id": "model-417",
+            "session_id": "session-417",
+            "model_seq_id": 0,
+            "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "lora_config": {
+                "rank": 16,
+                "seed": None,
+                "train_attn": False,
+                "train_mlp": True,
+                "train_unembed": False,
+            },
+            "rollout_correction_config": None,
+            "user_metadata": {"created": "before-load"},
+            "learning_rate": 2e-4,
+            "current_step": 12,
+            "backend": "megatron",
+            "actor_name": "megatron-actor-417",
+            "namespace": "tinker",
+            "user_id": "user-417",
+            "created_at": "2026-03-13T00:00:00Z",
+            "last_activity": 1.0,
+            "metadata_version": 3,
+            "materialization_state": "ready",
+            "tokenizer_info": {"source": "create"},
+            "tokenizer_identity": "tok-identity",
+            "tokenizer_source_path": "/models/tokenizer",
+        }
     ]
 
 

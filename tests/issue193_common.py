@@ -41,6 +41,7 @@ __all__ = [
     "_FakeSamplerWorker",
     "_FakeLoadWorker",
     "_noop_log_worker_request_context",
+    "_megatron_load_meta",
 ]
 
 
@@ -81,3 +82,28 @@ class _FakeLoadWorker(_HeartbeatWorkerMixin):
 
 async def _noop_log_worker_request_context(*args, **kwargs):
     return None
+
+
+def _megatron_load_meta(
+    *,
+    current_step: int,
+    learning_rate: float,
+    actual_rank: int,
+    checkpoint_path: str,
+    optimizer_restored: bool = True,
+    actor_only_state_dirty: bool | None = None,
+    train_attn: bool = True,
+    train_mlp: bool = True,
+    train_unembed: bool = True,
+) -> dict:
+    return {
+        "current_step": current_step,
+        "learning_rate": learning_rate,
+        "actual_rank": actual_rank,
+        "actor_only_state_dirty": optimizer_restored if actor_only_state_dirty is None else actor_only_state_dirty,
+        "checkpoint_path": checkpoint_path,
+        "optimizer_restored": optimizer_restored,
+        "train_attn": train_attn,
+        "train_mlp": train_mlp,
+        "train_unembed": train_unembed,
+    }

@@ -218,6 +218,71 @@ def _make_megatron_actor_name(base_model: str) -> str:
     return f"megatron_{model_name}"
 
 
+def _infer_lora_train_flags_from_target_modules(
+    target_modules: object,
+    *,
+    adapter_config_path: str,
+) -> tuple[bool, bool, bool]:
+    if not isinstance(target_modules, list) or not all(isinstance(name, str) for name in target_modules):
+        raise RuntimeError(
+            f"Invalid adapter_config.json target_modules in {adapter_config_path}: "
+            "expected a list of strings"
+        )
+
+    names = set(target_modules)
+    attn_names = {
+        "linear_qkv",
+        "linear_proj",
+        "linear_q_proj",
+        "linear_kv_down_proj",
+        "linear_kv_up_proj",
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "q_a_proj",
+        "q_b_proj",
+        "kv_a_proj_with_mqa",
+        "kv_b_proj",
+        "wq_b",
+        "wk",
+        "weights_proj",
+    }
+    mlp_names = {"linear_fc1", "linear_fc2", "gate_proj", "up_proj", "down_proj", "gate"}
+    unembed_names = {"lm_head", "output_layer", "unembed"}
+    return bool(names & attn_names), bool(names & mlp_names), bool(names & unembed_names)
+
+
+def _resolve_lora_train_flags_for_checkpoint(
+    adapter_config: dict,
+    *,
+    adapter_config_path: str,
+    train_attn: bool | None,
+    train_mlp: bool | None,
+    train_unembed: bool | None,
+) -> tuple[bool, bool, bool]:
+    requested = (train_attn, train_mlp, train_unembed)
+    if all(value is not None for value in requested):
+        return bool(train_attn), bool(train_mlp), bool(train_unembed)
+
+    inferred = _infer_lora_train_flags_from_target_modules(
+        adapter_config.get("target_modules"),
+        adapter_config_path=adapter_config_path,
+    )
+    for name, explicit, actual in zip(
+        ("train_attn", "train_mlp", "train_unembed"),
+        requested,
+        inferred,
+        strict=True,
+    ):
+        if explicit is not None and bool(explicit) != actual:
+            raise RuntimeError(
+                f"Checkpoint train-target mismatch for {name}: "
+                f"caller requested {bool(explicit)!r}, checkpoint has {actual!r}"
+            )
+    return inferred
+
+
 def _bundle_node_ip(bundle: dict[str, float | int]) -> str | None:
     for key, value in bundle.items():
         if isinstance(key, str) and key.startswith("node:") and float(value or 0) > 0:
@@ -364,6 +429,37 @@ class _HotSessionCacheEntry:
     bytes: int
     last_accessed_s: float
     durable: bool
+
+
+@dataclass(frozen=True)
+class _MegatronSessionAuthoritySource:
+    kind: str
+    path: str | None = None
+    identity: str | None = None
+    actor_name: str | None = None
+    manifest_path: str | None = None
+
+
+@dataclass(frozen=True)
+class _MegatronSessionAuthorityRecord:
+    session_id: str
+    weights_source: _MegatronSessionAuthoritySource
+    optimizer_source: _MegatronSessionAuthoritySource
+    gradient_source: _MegatronSessionAuthoritySource
+    scheduler_source: _MegatronSessionAuthoritySource
+    external_checkpoint_is_fresh: bool | None = None
+
+    @property
+    def actor_name(self) -> str | None:
+        for source in (
+            self.optimizer_source,
+            self.gradient_source,
+            self.scheduler_source,
+            self.weights_source,
+        ):
+            if source.actor_name:
+                return source.actor_name
+        return None
 
 
 @dataclass
@@ -5110,13 +5206,171 @@ class MegatronSessionStateManager:
             rel_root = os.path.relpath(root, checkpoint_path)
             digest.update(rel_root.encode("utf-8"))
             for filename in filenames:
+                if filename == "metadata.json":
+                    continue
                 path = os.path.join(root, filename)
-                stat = os.stat(path, follow_symlinks=False)
                 rel_path = os.path.relpath(path, checkpoint_path)
                 digest.update(rel_path.encode("utf-8"))
-                digest.update(str(stat.st_size).encode("utf-8"))
-                digest.update(str(stat.st_mtime_ns).encode("utf-8"))
+                with open(path, "rb") as f:
+                    for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                        digest.update(chunk)
         return digest.hexdigest()
+
+    def _path_matches_identity(self, checkpoint_path: str, checkpoint_identity: str | None) -> bool:
+        if not isinstance(checkpoint_identity, str) or not checkpoint_identity:
+            return False
+        if not os.path.isdir(checkpoint_path):
+            return False
+        try:
+            return self.checkpoint_identity(checkpoint_path) == checkpoint_identity
+        except OSError:
+            return False
+
+    def _path_has_optimizer_source(self, path: str) -> bool:
+        import glob
+
+        return (
+            os.path.exists(os.path.join(path, "optimizer.pt"))
+            or bool(glob.glob(os.path.join(path, "*_optimizer.pt")))
+            or bool(glob.glob(os.path.join(path, "*", "train_state", "_METADATA")))
+        )
+
+    def get_authority_record(self, session_id: str) -> _MegatronSessionAuthorityRecord:
+        session_path = self.get_session_path(session_id)
+        none_source = _MegatronSessionAuthoritySource("none")
+        metadata = self.get_metadata(session_id)
+        external_marker = self.get_external_checkpoint(session_id)
+        external_is_fresh = None
+        external_checkpoint_path = None
+        external_actor_name = None
+        if isinstance(external_marker, dict):
+            external_is_fresh = bool(external_marker.get("is_fresh", False))
+            raw_checkpoint_path = external_marker.get("checkpoint_path")
+            if isinstance(raw_checkpoint_path, str) and raw_checkpoint_path:
+                external_checkpoint_path = raw_checkpoint_path
+            raw_actor_name = external_marker.get("actor_name")
+            if isinstance(raw_actor_name, str) and raw_actor_name:
+                external_actor_name = raw_actor_name
+
+        if isinstance(metadata, dict):
+            checkpoint_path = metadata["checkpoint_path"]
+            checkpoint_identity = metadata["checkpoint_identity"]
+            source_path = os.path.realpath(checkpoint_path)
+            session_realpath = os.path.realpath(session_path)
+            if (
+                external_is_fresh
+                and external_checkpoint_path is not None
+                and self._path_matches_identity(external_checkpoint_path, checkpoint_identity)
+            ):
+                weights_source = _MegatronSessionAuthoritySource(
+                    "checkpoint",
+                    path=external_checkpoint_path,
+                    identity=checkpoint_identity,
+                    actor_name=external_actor_name,
+                )
+            elif (
+                source_path != session_realpath
+                and self._path_matches_identity(checkpoint_path, checkpoint_identity)
+            ):
+                weights_source = _MegatronSessionAuthoritySource(
+                    "checkpoint",
+                    path=checkpoint_path,
+                    identity=checkpoint_identity,
+                    actor_name=external_actor_name,
+                )
+            else:
+                weights_source = _MegatronSessionAuthoritySource(
+                    "session_cache",
+                    path=session_path,
+                    identity=checkpoint_identity,
+                    actor_name=external_actor_name,
+                )
+        elif os.path.isdir(session_path):
+            weights_source = _MegatronSessionAuthoritySource(
+                "session_cache",
+                path=session_path,
+                identity=self.checkpoint_identity(session_path),
+                actor_name=external_actor_name,
+            )
+        else:
+            weights_source = none_source
+
+        dirty_marker = None
+        actor_marker_path = self._actor_only_state_path(session_id)
+        if os.path.exists(actor_marker_path):
+            dirty_marker = self._read_actor_only_state(actor_marker_path)
+        if dirty_marker is not None:
+            actor_name = dirty_marker.get("actor_name")
+            live_actor = _MegatronSessionAuthoritySource(
+                "live_actor",
+                actor_name=actor_name if isinstance(actor_name, str) else None,
+            )
+            reason = dirty_marker.get("reason")
+            if reason == "load_weights":
+                optimizer_source = live_actor
+                gradient_source = none_source
+                scheduler_source = none_source
+            elif reason == "forward_backward":
+                optimizer_source = none_source
+                gradient_source = live_actor
+                scheduler_source = none_source
+            else:
+                weights_source = live_actor
+                optimizer_source = live_actor
+                gradient_source = live_actor
+                scheduler_source = live_actor
+            return _MegatronSessionAuthorityRecord(
+                session_id=session_id,
+                weights_source=weights_source,
+                optimizer_source=optimizer_source,
+                gradient_source=gradient_source,
+                scheduler_source=scheduler_source,
+                external_checkpoint_is_fresh=None,
+            )
+
+        persisted = self.get_persisted_actor_only_state(session_id)
+        if isinstance(persisted, dict):
+            source = _MegatronSessionAuthoritySource(
+                "actor_snapshot",
+                actor_name=persisted.get("actor_name") if isinstance(persisted.get("actor_name"), str) else None,
+                manifest_path=self._actor_only_snapshot_manifest_path(session_id),
+            )
+            return _MegatronSessionAuthorityRecord(
+                session_id=session_id,
+                weights_source=weights_source,
+                optimizer_source=source,
+                gradient_source=source,
+                scheduler_source=source,
+                external_checkpoint_is_fresh=None,
+            )
+
+        checkpoint_source = none_source
+        if (
+            isinstance(metadata, dict)
+            and bool(metadata.get("optimizer_restored"))
+            and external_is_fresh is not False
+        ):
+            checkpoint_path = external_checkpoint_path or str(metadata["checkpoint_path"])
+            checkpoint_identity = str(metadata["checkpoint_identity"])
+            if (
+                self._path_matches_identity(checkpoint_path, checkpoint_identity)
+                and self._path_has_optimizer_source(checkpoint_path)
+            ):
+                checkpoint_source = _MegatronSessionAuthoritySource(
+                    "checkpoint",
+                    path=checkpoint_path,
+                    identity=checkpoint_identity,
+                    actor_name=external_actor_name,
+                )
+
+        return _MegatronSessionAuthorityRecord(
+            session_id=session_id,
+            weights_source=weights_source,
+            optimizer_source=checkpoint_source,
+            gradient_source=none_source,
+            scheduler_source=none_source,
+            external_checkpoint_is_fresh=external_is_fresh,
+        )
 
     def _replace_session_dir_with_snapshot(self, session_id: str, checkpoint_path: str) -> str:
         import shutil
@@ -5147,21 +5401,38 @@ class MegatronSessionStateManager:
         *,
         optimizer_restored: bool = True,
         checkpoint_path: str | None = None,
-        train_attn: bool = True,
-        train_mlp: bool = True,
-        train_unembed: bool = True,
+        train_attn: bool | None = None,
+        train_mlp: bool | None = None,
+        train_unembed: bool | None = None,
         checkpoint_identity: str | None = None,
     ):
         """Save session metadata (step count, learning rate, actual rank)."""
+        existing = self.get_metadata(session_id)
+        existing_flags = existing if isinstance(existing, dict) else {}
+        resolved_train_attn = (
+            bool(train_attn)
+            if train_attn is not None
+            else bool(existing_flags.get("train_attn", True))
+        )
+        resolved_train_mlp = (
+            bool(train_mlp)
+            if train_mlp is not None
+            else bool(existing_flags.get("train_mlp", True))
+        )
+        resolved_train_unembed = (
+            bool(train_unembed)
+            if train_unembed is not None
+            else bool(existing_flags.get("train_unembed", True))
+        )
         meta = {
             "step": step,
             "lr": lr,
             "actual_rank": actual_rank,
             "optimizer_restored": bool(optimizer_restored),
             "checkpoint_path": os.path.realpath(checkpoint_path or self.get_session_path(session_id)),
-            "train_attn": bool(train_attn),
-            "train_mlp": bool(train_mlp),
-            "train_unembed": bool(train_unembed),
+            "train_attn": resolved_train_attn,
+            "train_mlp": resolved_train_mlp,
+            "train_unembed": resolved_train_unembed,
             "checkpoint_identity": checkpoint_identity
             or self.checkpoint_identity(checkpoint_path or self.get_session_path(session_id)),
         }
@@ -5527,29 +5798,28 @@ class MegatronSessionStateManager:
             if not session_dir.endswith("_checkpoint"):
                 continue
             session_id = session_dir[: -len("_checkpoint")]
-            actor_name = None
+            authority = self.get_authority_record(session_id)
+            actor_name = authority.actor_name
             cold_safe = False
             skip_reason = None
-            if os.path.islink(session_path):
+            if (
+                authority.optimizer_source.kind in {"live_actor", "actor_snapshot"}
+                or authority.gradient_source.kind in {"live_actor", "actor_snapshot"}
+                or authority.scheduler_source.kind in {"live_actor", "actor_snapshot"}
+            ):
+                skip_reason = "actor_only_state_dirty"
+            elif os.path.islink(session_path):
                 cold_safe = True
                 skip_reason = None
+            elif authority.external_checkpoint_is_fresh is False:
+                skip_reason = "stale_external_checkpoint"
+            elif (
+                authority.weights_source.kind == "checkpoint"
+                and authority.optimizer_source.kind == "checkpoint"
+            ):
+                cold_safe = True
             else:
-                external_marker = self.get_external_checkpoint(session_id)
-                dirty_marker = self.has_actor_only_state(session_id)
-                persisted = self.get_persisted_actor_only_state(session_id)
-                if external_marker is not None and bool(external_marker.get("is_fresh", False)):
-                    actor_name = external_marker.get("actor_name")
-                    cold_safe = True
-                elif dirty_marker:
-                    actor_name = self._read_actor_only_state(self._actor_only_state_path(session_id)).get("actor_name")
-                    skip_reason = "actor_only_state_dirty"
-                elif external_marker is not None:
-                    actor_name = external_marker.get("actor_name")
-                    skip_reason = "stale_external_checkpoint"
-                else:
-                    skip_reason = "no_external_checkpoint"
-                if actor_name is None and isinstance(persisted, dict):
-                    actor_name = persisted.get("actor_name")
+                skip_reason = "no_external_checkpoint"
             updated_at = self._session_last_updated_at(session_path)
             entries.append(
                 _MegatronSessionCacheEntry(
@@ -5827,6 +6097,9 @@ class MegatronWorkerGroup:
         self._current_session: str | None = None  # Phase 6: session tracking
         self._session_unknown_due_to_partial_swap = False
         self._actual_rank: int | None = None  # Phase 7: actual LoRA rank for current session
+        self._train_attn = True
+        self._train_mlp = True
+        self._train_unembed = True
         self._last_session_switch_stats: dict[str, object] | None = None
         self._observability_gpu_bindings_cache: list[dict[str, object]] = []
         self._observability_memory_cache: dict[str, int] = {}
@@ -6420,9 +6693,9 @@ class MegatronWorkerGroup:
             self._last_session_switch_stats = None
             return {"switched": False}
 
-        train_attn = True if train_attn is None else bool(train_attn)
-        train_mlp = True if train_mlp is None else bool(train_mlp)
-        train_unembed = True if train_unembed is None else bool(train_unembed)
+        requested_train_attn = True if train_attn is None else bool(train_attn)
+        requested_train_mlp = True if train_mlp is None else bool(train_mlp)
+        requested_train_unembed = True if train_unembed is None else bool(train_unembed)
 
         timing = _env_flag("MINT_TIMING_DIAG", default=False)
         t0 = time.perf_counter() if timing else 0.0
@@ -6499,6 +6772,9 @@ class MegatronWorkerGroup:
                 self._step_count,
                 self.learning_rate,
                 self._actual_rank,
+                train_attn=getattr(self, "_train_attn", True),
+                train_mlp=getattr(self, "_train_mlp", True),
+                train_unembed=getattr(self, "_train_unembed", True),
             )
         t_save1 = time.perf_counter() if timing else 0.0
 
@@ -6550,20 +6826,30 @@ class MegatronWorkerGroup:
             new_path = self._session_manager.get_session_path(session_id)
             meta = self._session_manager.get_metadata(session_id)
             actual_rank = meta.get("actual_rank") if meta else None
+            load_train_attn = bool(meta.get("train_attn", requested_train_attn)) if meta else requested_train_attn
+            load_train_mlp = bool(meta.get("train_mlp", requested_train_mlp)) if meta else requested_train_mlp
+            load_train_unembed = (
+                bool(meta.get("train_unembed", requested_train_unembed))
+                if meta
+                else requested_train_unembed
+            )
             logger.info(f"[MegatronWorkerGroup] Loading session {session_id} from {new_path}")
             self.load_adapter_state(
                 new_path,
                 actual_rank=actual_rank,
                 traceparent=traceparent,
-                train_attn=train_attn,
-                train_mlp=train_mlp,
-                train_unembed=train_unembed,
+                train_attn=load_train_attn,
+                train_mlp=load_train_mlp,
+                train_unembed=load_train_unembed,
             )
             # Restore metadata
             if meta:
                 self._step_count = meta.get("step", 0)
                 self.learning_rate = meta.get("lr", self.learning_rate)
                 self._actual_rank = meta.get("actual_rank", self.lora_rank)
+                self._train_attn = load_train_attn
+                self._train_mlp = load_train_mlp
+                self._train_unembed = load_train_unembed
         else:
             # New session: reinitialize LoRA weights
             logger.info(f"[MegatronWorkerGroup] New session {session_id}, reinitializing LoRA")
@@ -6571,12 +6857,15 @@ class MegatronWorkerGroup:
                 actual_rank=actual_rank,
                 new_session_id=session_id,
                 traceparent=traceparent,
-                train_attn=train_attn,
-                train_mlp=train_mlp,
-                train_unembed=train_unembed,
+                train_attn=requested_train_attn,
+                train_mlp=requested_train_mlp,
+                train_unembed=requested_train_unembed,
             )
             self._step_count = 0
             self._actual_rank = actual_rank if actual_rank is not None else self.lora_rank
+            self._train_attn = requested_train_attn
+            self._train_mlp = requested_train_mlp
+            self._train_unembed = requested_train_unembed
         t_load1 = time.perf_counter() if timing else 0.0
 
         # Reset expert_bias only for fresh sessions. Existing sessions may have
@@ -6639,16 +6928,19 @@ class MegatronWorkerGroup:
             return
         session_manager = getattr(self, "_session_manager", None)
         current_is_dirty = False
-        target_exists = False
-        target_has_actor_only_state = False
+        target_has_persisted_actor_only_state = False
         if session_manager is not None:
             has_actor_only_state = getattr(session_manager, "has_actor_only_state", None)
-            if callable(has_actor_only_state) and self._current_session is not None:
-                current_is_dirty = bool(has_actor_only_state(self._current_session))
-                target_has_actor_only_state = bool(has_actor_only_state(session_id))
-            session_exists = getattr(session_manager, "session_exists", None)
-            if callable(session_exists):
-                target_exists = bool(session_exists(session_id))
+            if callable(has_actor_only_state):
+                if self._current_session is not None:
+                    current_is_dirty = bool(has_actor_only_state(self._current_session))
+            has_persisted_actor_only_state = getattr(
+                session_manager,
+                "has_persisted_actor_only_state",
+                None,
+            )
+            if callable(has_persisted_actor_only_state):
+                target_has_persisted_actor_only_state = bool(has_persisted_actor_only_state(session_id))
 
         if self._current_session is not None and session_manager is not None and current_is_dirty:
             old_path = session_manager.get_session_path(self._current_session)
@@ -6661,37 +6953,43 @@ class MegatronWorkerGroup:
                     self._step_count,
                     self.learning_rate,
                     self._actual_rank,
+                    train_attn=getattr(self, "_train_attn", True),
+                    train_mlp=getattr(self, "_train_mlp", True),
+                    train_unembed=getattr(self, "_train_unembed", True),
                 )
-        clear_refs = [
-            w.clear_session_state.remote(session_id, traceparent=traceparent)
-            for w in self.workers
-            if hasattr(w, "clear_session_state")
-        ]
-        if clear_refs:
-            ray.get(clear_refs)
-        if session_manager is not None:
-            clear_persisted_actor_only_state = getattr(
-                session_manager,
-                "clear_persisted_actor_only_state",
-                None,
-            )
-            if clear_persisted_actor_only_state is not None:
-                clear_persisted_actor_only_state(session_id)
-            clear_actor_only_state = getattr(session_manager, "clear_actor_only_state", None)
-            if clear_actor_only_state is not None:
-                clear_actor_only_state(session_id)
-        if target_exists and not target_has_actor_only_state:
-            mark_refs = [
-                w.mark_session_loaded.remote(session_id)
-                for w in self.workers
-                if hasattr(w, "mark_session_loaded")
-            ]
-            if mark_refs:
-                ray.get(mark_refs)
-        else:
-            self._swap_session_on_workers(session_id)
-        self._current_session = session_id
-        self._session_unknown_due_to_partial_swap = False
+            try:
+                swap_results = self._swap_session_on_workers(
+                    session_id,
+                    require_persisted_actor_only_state=target_has_persisted_actor_only_state,
+                )
+            except TypeError:
+                swap_results = self._swap_session_on_workers(session_id)
+            swap_results = [] if swap_results is None else swap_results
+            if swap_results:
+                persisted_entries = [
+                    result.get("outgoing_persisted")
+                    for result in swap_results
+                    if isinstance(result, dict) and result.get("outgoing_persisted")
+                ]
+                if len(persisted_entries) != len(swap_results):
+                    raise RuntimeError(
+                        f"Failed to persist actor-only state for outgoing session {self._current_session}: "
+                        f"expected {len(swap_results)} rank snapshots, got {len(persisted_entries)}"
+                    )
+                save_persisted_actor_only_state = getattr(
+                    session_manager,
+                    "save_persisted_actor_only_state",
+                    None,
+                )
+                if save_persisted_actor_only_state is not None:
+                    save_persisted_actor_only_state(
+                        self._current_session,
+                        actor_name=_make_megatron_actor_name(self.base_model),
+                        worker_entries=persisted_entries,
+                    )
+                clear_actor_only_state = getattr(session_manager, "clear_actor_only_state", None)
+                if clear_actor_only_state is not None:
+                    clear_actor_only_state(self._current_session)
 
     def _resolve_required_session_id(self, session_id: str | None, *, op: str) -> str:
         """Resolve session_id with fail-closed behavior for unknown group state."""
@@ -7557,6 +7855,9 @@ class MegatronWorkerGroup:
                     step=self._step_count,
                     lr=self.learning_rate,
                     actual_rank=self._actual_rank,
+                    train_attn=getattr(self, "_train_attn", True),
+                    train_mlp=getattr(self, "_train_mlp", True),
+                    train_unembed=getattr(self, "_train_unembed", True),
                 )
             except Exception as e:
                 logger.warning(f"[MegatronWorkerGroup] reinit_lora_weights: failed to save session {self._current_session}: {e}")
@@ -7603,6 +7904,12 @@ class MegatronWorkerGroup:
         # Update actual_rank for save_checkpoint (Phase 7)
         if actual_rank is not None:
             self._actual_rank = actual_rank
+        if train_attn is not None:
+            self._train_attn = bool(train_attn)
+        if train_mlp is not None:
+            self._train_mlp = bool(train_mlp)
+        if train_unembed is not None:
+            self._train_unembed = bool(train_unembed)
 
         # NOTE: Do NOT set _current_session here!
         # Session switching must go through _ensure_session_loaded() which calls
@@ -7670,14 +7977,6 @@ class MegatronWorkerGroup:
                     "Optimizer restore requested, but optimizer shard(s) not found: "
                     + ", ".join(missing)
                 )
-        self._prepare_session_for_explicit_load(
-            effective_session_id,
-            traceparent=traceparent,
-        )
-
-        logger.info(f"[MegatronWorkerGroup] load_checkpoint: path={load_path}, load_optimizer={load_optimizer}")
-        logger.info(f"[MegatronWorkerGroup] load_checkpoint: found {len(adapter_files)} adapter files")
-
         adapter_config_path = os.path.join(load_path, "adapter_config.json")
         if not os.path.isfile(adapter_config_path):
             raise FileNotFoundError(
@@ -7694,141 +7993,176 @@ class MegatronWorkerGroup:
             raise RuntimeError(
                 f"Invalid adapter rank in {adapter_config_path}: expected positive int, got {checkpoint_rank!r}"
             )
-
-        if not load_optimizer:
-            self._invalidate_session_durability(
-                effective_session_id,
-                reason="load_checkpoint_without_optimizer",
+        checkpoint_train_attn, checkpoint_train_mlp, checkpoint_train_unembed = (
+            _resolve_lora_train_flags_for_checkpoint(
+                adapter_config,
+                adapter_config_path=adapter_config_path,
+                train_attn=train_attn,
+                train_mlp=train_mlp,
+                train_unembed=train_unembed,
             )
-        # Delegate to load_adapter_state
-        result = self.load_adapter_state(
-            load_path,
-            actual_rank=checkpoint_rank,
-            traceparent=traceparent,
-            train_attn=train_attn,
-            train_mlp=train_mlp,
-            train_unembed=train_unembed,
         )
-        result["load_method"] = "load_adapter_state"
-
-        if load_optimizer:
-            opt_results = ray.get(
-                [w.load_optimizer_state.remote(load_path, traceparent=traceparent) for w in self.workers]
-            )
-            optimizer_restored = any(
-                isinstance(r, dict) and r.get("status") == "ok" for r in opt_results
-            )
-            if not optimizer_restored:
-                raise RuntimeError(
-                    "Optimizer restore requested, but no rank reported optimizer restored"
-                )
-            result["optimizer_restored"] = True
-        else:
-            result["optimizer_restored"] = False
-
-        result["checkpoint_path"] = load_path
-        result["train_attn"] = True if train_attn is None else bool(train_attn)
-        result["train_mlp"] = True if train_mlp is None else bool(train_mlp)
-        result["train_unembed"] = True if train_unembed is None else bool(train_unembed)
-
         meta_path = os.path.join(load_path, "training_meta.json")
-        checkpoint_lr = self.learning_rate
-        checkpoint_step = self._step_count
-        if os.path.exists(meta_path):
-            with open(meta_path, "r") as f:
-                loaded_meta = json.load(f)
-            if isinstance(loaded_meta, dict):
-                meta = loaded_meta
-                result.update(meta)
-                if "current_step" in meta:
-                    meta_step = meta["current_step"]
-                    if isinstance(meta_step, int) and not isinstance(meta_step, bool):
-                        checkpoint_step = meta_step
-                    else:
-                        logger.warning(
-                            "[MegatronWorkerGroup] Invalid current_step type=%s value=%r in %s; "
-                            "preserving step=%s",
-                            type(meta_step).__name__,
-                            meta_step,
-                            meta_path,
-                            checkpoint_step,
-                        )
-                checkpoint_lr_value = meta.get("learning_rate", checkpoint_lr)
-                try:
-                    checkpoint_lr = float(checkpoint_lr_value)
-                except Exception:
-                    logger.warning(
-                        "[MegatronWorkerGroup] Invalid learning_rate value=%r in %s; "
-                        "preserving lr=%s",
-                        checkpoint_lr_value,
-                        meta_path,
-                        checkpoint_lr,
-                    )
-            else:
-                logger.warning(
-                    "[MegatronWorkerGroup] Invalid checkpoint metadata type %s in %s; "
-                    "preserving step/lr state",
-                    type(loaded_meta).__name__,
-                    meta_path,
-                )
-
-        session_manager = getattr(self, "_session_manager", None)
-        if not load_optimizer:
-            result["actor_only_state_dirty"] = False
-            clear_refs = [
-                w.clear_session_state.remote(effective_session_id, traceparent=traceparent)
-                for w in self.workers
-                if hasattr(w, "clear_session_state")
-            ]
-            if clear_refs:
-                ray.get(clear_refs)
-            if session_manager is not None:
-                clear_persisted_actor_only_state = getattr(
-                    session_manager,
-                    "clear_persisted_actor_only_state",
-                    None,
-                )
-                if clear_persisted_actor_only_state is not None:
-                    clear_persisted_actor_only_state(effective_session_id)
-                clear_actor_only_state = getattr(session_manager, "clear_actor_only_state", None)
-                if clear_actor_only_state is not None:
-                    clear_actor_only_state(effective_session_id)
-            self.reset_optimizer(checkpoint_lr, traceparent=traceparent, zero_grad_buffers=False)
-            result["optimizer_reset"] = True
-        else:
-            result["optimizer_reset"] = False
-            result["actor_only_state_dirty"] = True
-            if session_manager is not None:
-                clear_persisted_actor_only_state = getattr(
-                    session_manager,
-                    "clear_persisted_actor_only_state",
-                    None,
-                )
-                if clear_persisted_actor_only_state is not None:
-                    clear_persisted_actor_only_state(effective_session_id)
-                session_manager.mark_actor_only_state(
-                    effective_session_id,
-                    reason="load_weights",
-                    actor_name=_make_megatron_actor_name(self.base_model),
-                )
-
-        self._step_count = checkpoint_step
-        self.learning_rate = checkpoint_lr
-        if load_optimizer:
-            mark_external_checkpoint = getattr(
-                session_manager,
-                "mark_external_checkpoint",
-                None,
+        if not os.path.isfile(meta_path):
+            raise FileNotFoundError(f"Missing training_meta.json required to recover checkpoint step/lr: {meta_path}")
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        if not isinstance(meta, dict):
+            raise RuntimeError(f"Invalid training_meta.json type {type(meta).__name__} in {meta_path}")
+        protected_keys = {
+            "actual_rank",
+            "actor_only_state_dirty",
+            "checkpoint_path",
+            "load_method",
+            "optimizer_reset",
+            "optimizer_restored",
+            "train_attn",
+            "train_mlp",
+            "train_unembed",
+        }
+        protected_present = sorted(protected_keys & set(meta))
+        if protected_present:
+            raise RuntimeError(
+                f"Invalid training_meta.json in {meta_path}: protected load metadata keys "
+                f"must be derived from the checkpoint load, got {protected_present}"
             )
-            if mark_external_checkpoint is not None:
-                mark_external_checkpoint(
-                    effective_session_id,
-                    checkpoint_path=load_path,
-                    reason="load_checkpoint",
-                    actor_name=_make_megatron_actor_name(self.base_model),
-                )
+        checkpoint_step = meta.get("current_step")
+        if not isinstance(checkpoint_step, int) or isinstance(checkpoint_step, bool) or checkpoint_step < 0:
+            raise RuntimeError(
+                f"Invalid current_step in {meta_path}: expected non-negative int, got {checkpoint_step!r}"
+            )
+        checkpoint_lr_value = meta.get("learning_rate")
+        if isinstance(checkpoint_lr_value, bool) or not isinstance(checkpoint_lr_value, (int, float)):
+            raise RuntimeError(
+                f"Invalid learning_rate in {meta_path}: expected finite number, got {checkpoint_lr_value!r}"
+            )
+        checkpoint_lr = float(checkpoint_lr_value)
+        if not math.isfinite(checkpoint_lr):
+            raise RuntimeError(
+                f"Invalid learning_rate in {meta_path}: expected finite number, got {checkpoint_lr_value!r}"
+            )
 
-        return result
+        self._prepare_session_for_explicit_load(
+            effective_session_id,
+            traceparent=traceparent,
+        )
+
+        try:
+            logger.info(f"[MegatronWorkerGroup] load_checkpoint: path={load_path}, load_optimizer={load_optimizer}")
+            logger.info(f"[MegatronWorkerGroup] load_checkpoint: found {len(adapter_files)} adapter files")
+
+            if not load_optimizer:
+                self._invalidate_session_durability(
+                    effective_session_id,
+                    reason="load_checkpoint_without_optimizer",
+                )
+            # Delegate to load_adapter_state
+            result = self.load_adapter_state(
+                load_path,
+                actual_rank=checkpoint_rank,
+                traceparent=traceparent,
+                train_attn=checkpoint_train_attn,
+                train_mlp=checkpoint_train_mlp,
+                train_unembed=checkpoint_train_unembed,
+            )
+            result["load_method"] = "load_adapter_state"
+
+            if load_optimizer:
+                opt_results = ray.get(
+                    [w.load_optimizer_state.remote(load_path, traceparent=traceparent) for w in self.workers]
+                )
+                optimizer_restored = any(
+                    isinstance(r, dict) and r.get("status") == "ok" for r in opt_results
+                )
+                if not optimizer_restored:
+                    raise RuntimeError(
+                        "Optimizer restore requested, but no rank reported optimizer restored"
+                    )
+                result["optimizer_restored"] = True
+            else:
+                result["optimizer_restored"] = False
+
+            result["checkpoint_path"] = load_path
+            result["train_attn"] = checkpoint_train_attn
+            result["train_mlp"] = checkpoint_train_mlp
+            result["train_unembed"] = checkpoint_train_unembed
+            result["current_step"] = checkpoint_step
+            result["learning_rate"] = checkpoint_lr
+
+            session_manager = getattr(self, "_session_manager", None)
+            if not load_optimizer:
+                result["actor_only_state_dirty"] = False
+                clear_refs = [
+                    w.clear_session_state.remote(effective_session_id, traceparent=traceparent)
+                    for w in self.workers
+                    if hasattr(w, "clear_session_state")
+                ]
+                if clear_refs:
+                    ray.get(clear_refs)
+                if session_manager is not None:
+                    clear_persisted_actor_only_state = getattr(
+                        session_manager,
+                        "clear_persisted_actor_only_state",
+                        None,
+                    )
+                    if clear_persisted_actor_only_state is not None:
+                        clear_persisted_actor_only_state(effective_session_id)
+                    clear_actor_only_state = getattr(session_manager, "clear_actor_only_state", None)
+                    if clear_actor_only_state is not None:
+                        clear_actor_only_state(effective_session_id)
+                self.reset_optimizer(checkpoint_lr, traceparent=traceparent, zero_grad_buffers=False)
+                result["optimizer_reset"] = True
+            else:
+                result["optimizer_reset"] = False
+                result["actor_only_state_dirty"] = True
+                if session_manager is not None:
+                    clear_persisted_actor_only_state = getattr(
+                        session_manager,
+                        "clear_persisted_actor_only_state",
+                        None,
+                    )
+                    if clear_persisted_actor_only_state is not None:
+                        clear_persisted_actor_only_state(effective_session_id)
+                    session_manager.mark_actor_only_state(
+                        effective_session_id,
+                        reason="load_weights",
+                        actor_name=_make_megatron_actor_name(self.base_model),
+                    )
+
+            self._step_count = checkpoint_step
+            self.learning_rate = checkpoint_lr
+            self._actual_rank = checkpoint_rank
+            self._train_attn = checkpoint_train_attn
+            self._train_mlp = checkpoint_train_mlp
+            self._train_unembed = checkpoint_train_unembed
+            if load_optimizer:
+                mark_external_checkpoint = getattr(
+                    session_manager,
+                    "mark_external_checkpoint",
+                    None,
+                )
+                if mark_external_checkpoint is not None:
+                    mark_external_checkpoint(
+                        effective_session_id,
+                        checkpoint_path=load_path,
+                        reason="load_checkpoint",
+                        actor_name=_make_megatron_actor_name(self.base_model),
+                    )
+
+            mark_refs = [
+                w.mark_session_loaded.remote(effective_session_id)
+                for w in self.workers
+                if hasattr(w, "mark_session_loaded")
+            ]
+            if mark_refs:
+                ray.get(mark_refs)
+            self._current_session = effective_session_id
+            self._session_unknown_due_to_partial_swap = False
+            return result
+        except Exception:
+            self._current_session = None
+            self._session_unknown_due_to_partial_swap = True
+            raise
 
 
     def save_checkpoint(
@@ -7866,6 +8200,13 @@ class MegatronWorkerGroup:
             train_mlp=train_mlp,
             train_unembed=train_unembed,
         )
+        effective_train_attn = getattr(self, "_train_attn", True) if train_attn is None else bool(train_attn)
+        effective_train_mlp = getattr(self, "_train_mlp", True) if train_mlp is None else bool(train_mlp)
+        effective_train_unembed = (
+            getattr(self, "_train_unembed", True)
+            if train_unembed is None
+            else bool(train_unembed)
+        )
 
         logger.info(
             f"[MegatronWorkerGroup] save_checkpoint: {save_path} "
@@ -7878,9 +8219,9 @@ class MegatronWorkerGroup:
                 save_path,
                 self._step_count,
                 self._actual_rank,
-                train_attn=train_attn,
-                train_mlp=train_mlp,
-                train_unembed=train_unembed,
+                train_attn=effective_train_attn,
+                train_mlp=effective_train_mlp,
+                train_unembed=effective_train_unembed,
                 traceparent=traceparent,
             )
             for w in self.workers
@@ -7925,9 +8266,9 @@ class MegatronWorkerGroup:
                     lr=self.learning_rate,
                     actual_rank=self._actual_rank,
                     optimizer_restored=True,
-                    train_attn=True if train_attn is None else bool(train_attn),
-                    train_mlp=True if train_mlp is None else bool(train_mlp),
-                    train_unembed=True if train_unembed is None else bool(train_unembed),
+                    train_attn=effective_train_attn,
+                    train_mlp=effective_train_mlp,
+                    train_unembed=effective_train_unembed,
                 )
             clear_actor_only_state = getattr(session_manager, "clear_actor_only_state", None)
             if clear_actor_only_state is not None:
@@ -8401,6 +8742,9 @@ class MegatronWorkerGroup:
         self._step_count = int(step_count)
         self.learning_rate = float(learning_rate)
         self._actual_rank = actual_rank if actual_rank is not None else self.lora_rank
+        self._train_attn = bool(train_attn)
+        self._train_mlp = bool(train_mlp)
+        self._train_unembed = bool(train_unembed)
         session_manager = getattr(self, "_session_manager", None)
         if session_manager is not None:
             if checkpoint_path is not None:

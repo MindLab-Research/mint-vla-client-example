@@ -830,6 +830,25 @@ class LoadStateResponse(BaseModel):
     type: Literal["load_weights"] = "load_weights"
 
 
+class WeightsInfoRequest(BaseModel):
+    """Request to inspect checkpoint metadata by tinker, mint, or file path."""
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    tinker_path: str
+
+
+class WeightsInfoResponse(BaseModel):
+    """Minimal checkpoint metadata required to recreate a training client."""
+
+    base_model: str
+    is_lora: bool
+    lora_rank: int | None = None
+    train_unembed: bool | None = None
+    train_mlp: bool | None = None
+    train_attn: bool | None = None
+
+
 class CheckpointInfo(BaseModel):
     """Information about a checkpoint."""
 

@@ -2219,7 +2219,7 @@ async def _do_create_model_from_state(
             _build_training_session_store_payload(
                 session=session,
                 user_id=user_id,
-                lora_config=request.lora_config,
+                lora_config=session.lora_config,
                 rollout_correction_config=rollout_correction_config,
                 user_metadata=request.user_metadata,
                 actor_name=actor_name,

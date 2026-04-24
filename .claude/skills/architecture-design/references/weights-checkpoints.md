@@ -20,6 +20,48 @@ Patterns used:
 Key knobs and locations:
 - `TINKER_CHECKPOINT_DIR` controls where server-side code expects checkpoints/adapters for `file://` and `tinker://` URIs (see `tinker_server/routes/service.py` and `tinker_server/backend/session_manager.py`).
 
+## Resume metadata lookup
+
+The Tinker SDK `create_training_client_from_state(...)` and `create_training_client_from_state_with_optimizer(...)` first call `POST /api/v1/weights_info`. Mint implements that endpoint by resolving the checkpoint path, validating that it is a training checkpoint, then reading:
+- base model from `metadata.json` `model_name`, or `adapter_config.json` `base_model_name_or_path`
+- LoRA rank from `adapter_config.json` `r`
+- training target flags from `adapter_config.json` `target_modules`
+
+Sampler checkpoints are rejected for this endpoint because it recreates a training client, not a sampling client.
+
+## Megatron session authority
+
+Megatron session state has an explicit authority model. Code should not infer truth independently from the sidecars.
+
+The authority record answers four questions:
+- weights source: checkpoint path plus identity, or the internal session cache path plus identity
+- optimizer source: checkpoint, live actor, actor snapshot manifest, or none
+- gradient source: live actor, actor snapshot manifest, or none
+- scheduler source: live actor, actor snapshot manifest, or none
+
+The current storage layout remains:
+- `{session_id}_checkpoint/`
+- `{session_id}_checkpoint.session_metadata.json`
+- `{session_id}_checkpoint.actor_only_state.json`
+- `{session_id}_external_checkpoint.json`
+- `{session_id}_checkpoint/actor_only_state_manifest.json`
+
+`MegatronSessionStateManager.get_authority_record(...)` is the single place that interprets those files. Cache recycling and future session-state checks should consume that record instead of re-reading sidecars with separate precedence rules.
+
+Cache recycling can delete an internal session cache only when the external checkpoint path still exists and contains optimizer state. If the external checkpoint disappears, the internal cache becomes the only known copy and must not be treated as cold-safe.
+
+The external checkpoint must also match the `checkpoint_identity` recorded when the session cache was primed. This identity is a byte-content digest over checkpoint state files; route ownership metadata such as `metadata.json` is excluded. A reused path with different checkpoint contents is a different checkpoint, even if it still contains optimizer shards.
+
+An external checkpoint marker without session metadata and checkpoint identity is not cold-safe. Treat the internal session cache as the only known copy until a validated metadata record proves an external checkpoint has the same bytes.
+
+After `load_state(..., optimizer=True)`, the session cache is primed from the loaded checkpoint, but optimizer authority remains in the live actor while `actor_only_state.json` exists. Gradient and scheduler authority remain `none` unless a later operation or actor snapshot actually creates them. The marker prevents the cache from being treated as a cold durable checkpoint.
+
+The loaded checkpoint's LoRA rank and train-target flags become the session's active LoRA configuration. The `/load_state` route must persist those metadata-derived flags back to the detached training-session store before resolving the future; otherwise an API restart can restore stale create-time defaults. Later Megatron operations must use those metadata-derived flags instead of the stale create-time request defaults.
+
+The same persistence rule applies to `/create_model_from_state`: after checkpoint load, detached training-session metadata must use the session's post-load LoRA configuration, not the raw request payload.
+
+After `optim_step`, weights as well as optimizer state are actor-local until a later session switch or save writes them to a checkpoint/cache. The authority record should represent those live actor weights directly.
+
 ## Filesystem visibility contract
 
 `file://` and `tinker://` URIs are resolved to filesystem paths in the API server process.

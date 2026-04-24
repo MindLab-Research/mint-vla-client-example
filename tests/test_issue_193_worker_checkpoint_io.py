@@ -612,6 +612,7 @@ def test_issue_193_megatron_load_weights_passes_explicit_session_id_and_keepaliv
     worker = _FakeLoadWorker(ref="megatron-load-ref")
     engine._workers[model_id] = worker
     engine._resource_pool_actor_names[model_id] = "megatron-actor"
+    monkeypatch.setenv("MINT_LOAD_CHECKPOINT_TIMEOUT_S", "4321")
 
     session = TrainingSession(
         model_id=model_id,
@@ -630,10 +631,26 @@ def test_issue_193_megatron_load_weights_passes_explicit_session_id_and_keepaliv
 
     async def fake_keepalive(awaitable, keepalive_session, interval_s=30.0, timeout_s=None):
         keepalive_calls.append((awaitable, keepalive_session.model_id, interval_s, timeout_s))
-        return {"current_step": 5, "learning_rate": 3e-4}
+        return _megatron_load_meta(
+            current_step=5,
+            learning_rate=3e-4,
+            actual_rank=8,
+            checkpoint_path="/tmp/issue_193_megatron_load",
+            optimizer_restored=False,
+            actor_only_state_dirty=False,
+            train_attn=False,
+            train_mlp=True,
+            train_unembed=False,
+        )
 
     monkeypatch.setattr(engine, "_await_with_keepalive", fake_keepalive)
-    monkeypatch.setattr(ray, "get", lambda ref, timeout=None: {"status": "ok"})
+    ray_get_calls: list[tuple[object, float | None]] = []
+
+    def fake_ray_get(ref, timeout=None):
+        ray_get_calls.append((ref, timeout))
+        return {"status": "ok"}
+
+    monkeypatch.setattr(ray, "get", fake_ray_get)
 
     async def _run():
         await engine.load_weights(
@@ -646,22 +663,23 @@ def test_issue_193_megatron_load_weights_passes_explicit_session_id_and_keepaliv
 
     assert keepalive_calls == [
         ("fake-load-ready-ref", model_id, 30.0, 1800.0),
-        ("megatron-load-ref", model_id, 30.0, 1800.0),
+        ("megatron-load-ref", model_id, 30.0, 4321.0),
     ]
+    assert ray_get_calls == [("fake-mark-session-loaded-ref", 4321.0)]
     args, kwargs = worker.load_checkpoint.calls[0]
     assert args == ("/tmp/issue_193_megatron_load", False)
     assert kwargs["traceparent"] is None
     assert kwargs["session_id"] == model_id
-    assert kwargs["train_attn"] is False
-    assert kwargs["train_mlp"] is True
-    assert kwargs["train_unembed"] is False
+    assert "train_attn" not in kwargs
+    assert "train_mlp" not in kwargs
+    assert "train_unembed" not in kwargs
     assert worker.mark_session_loaded.calls == [
         (
             (model_id,),
             {
                 "step_count": 5,
                 "learning_rate": pytest.approx(3e-4),
-                "actual_rank": None,
+                "actual_rank": 8,
                 "actor_only_state_dirty": False,
                 "checkpoint_path": "/tmp/issue_193_megatron_load",
                 "optimizer_restored": False,
@@ -673,5 +691,7 @@ def test_issue_193_megatron_load_weights_passes_explicit_session_id_and_keepaliv
     ]
     assert session.current_step == 5
     assert session.learning_rate == pytest.approx(3e-4)
-
-
+    assert session.lora_config.rank == 8
+    assert session.lora_config.train_attn is False
+    assert session.lora_config.train_mlp is True
+    assert session.lora_config.train_unembed is False

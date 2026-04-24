@@ -30,7 +30,12 @@ def test_issue_193_megatron_load_weights_marks_recycled_worker_loaded(monkeypatc
 
     async def fake_run_with_recycle(*args, **kwargs):
         engine._workers[model_id] = recovered_worker
-        return {"current_step": 9, "learning_rate": 2e-4, "actual_rank": 7}
+        return _megatron_load_meta(
+            current_step=9,
+            learning_rate=2e-4,
+            actual_rank=7,
+            checkpoint_path="/tmp/issue_193_megatron_load_recycle",
+        )
 
     monkeypatch.setattr(engine, "_get_live_worker", fake_get_live_worker)
     monkeypatch.setattr(engine, "_await_with_keepalive", fake_keepalive)
@@ -105,7 +110,12 @@ def test_issue_193_megatron_load_weights_recovers_when_ready_probe_actor_dies(mo
         return recovered_worker
 
     async def fake_run_with_recycle(*args, **kwargs):
-        return {"current_step": 6, "learning_rate": 4e-4, "actual_rank": 3}
+        return _megatron_load_meta(
+            current_step=6,
+            learning_rate=4e-4,
+            actual_rank=3,
+            checkpoint_path="/tmp/issue_193_megatron_ready_recycle",
+        )
 
     monkeypatch.setattr(engine, "_get_live_worker", fake_get_live_worker)
     monkeypatch.setattr(engine, "_await_with_keepalive", fake_keepalive)
@@ -168,7 +178,12 @@ def test_issue_193_megatron_load_weights_missing_actor_can_recreate_from_checkpo
         if awaitable == "fake-load-ready-ref":
             return {"status": "ok"}
         assert awaitable == "missing-actor-load-ref"
-        return {"current_step": 4, "learning_rate": 3e-4, "actual_rank": 6}
+        return _megatron_load_meta(
+            current_step=4,
+            learning_rate=3e-4,
+            actual_rank=6,
+            checkpoint_path="/tmp/issue_193_megatron_load_missing_actor",
+        )
 
     monkeypatch.setattr(engine, "_get_live_worker", fake_get_live_worker)
     monkeypatch.setattr(engine, "_await_with_keepalive", fake_keepalive)
@@ -488,7 +503,12 @@ def test_issue_193_megatron_load_weights_with_optimizer_keeps_session_volatile(m
         if awaitable == "fake-load-ready-ref":
             return {"status": "ok"}
         assert awaitable == "megatron-load-with-optimizer-ref"
-        return {"current_step": 4, "learning_rate": 7e-5, "actual_rank": 6}
+        return _megatron_load_meta(
+            current_step=4,
+            learning_rate=7e-5,
+            actual_rank=6,
+            checkpoint_path="/tmp/issue_193_megatron_load_with_optimizer",
+        )
 
     monkeypatch.setattr(engine, "_await_with_keepalive", fake_keepalive)
     monkeypatch.setattr(ray, "get", lambda ref, timeout=None: {"status": "ok"})
@@ -525,7 +545,12 @@ def test_issue_193_megatron_load_weights_keeps_session_volatile_until_mark_loade
         if awaitable == "fake-load-ready-ref":
             return {"status": "ok"}
         assert awaitable == "megatron-load-mark-gap-ref"
-        return {"current_step": 8, "learning_rate": 1e-4, "actual_rank": 5}
+        return _megatron_load_meta(
+            current_step=8,
+            learning_rate=1e-4,
+            actual_rank=5,
+            checkpoint_path="/tmp/issue_193_megatron_load_mark_gap",
+        )
 
     def fake_ray_get(ref, timeout=None):
         if ref == "mark-loaded-gap-ref":
@@ -1053,5 +1078,3 @@ def test_issue_193_megatron_missing_actor_with_dirty_sibling_fails_closed(monkey
         asyncio.run(_run())
 
     assert model_id in engine._poisoned_sessions
-
-
