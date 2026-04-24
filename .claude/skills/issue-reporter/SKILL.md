@@ -9,9 +9,16 @@ description: |
 
   **CRITICAL: Treat production as READ-ONLY unless the user explicitly requests production operations.**
   For any production operations (restart/kill actors/logs on prod hosts), invoke `mint-prod`.
+
+  Procedure contract: read this SKILL.md end-to-end before acting. Do not slice it on demand or use it as a lookup table mid-run.
 ---
 
 # Issue Reporter
+
+Procedure contract:
+- Read this SKILL.md end-to-end before taking any action.
+- Do not sample sections opportunistically while already in motion.
+- If the procedure is missing something important, update the skill. Do not improvise around the gap.
 
 ## 1. Reproduce
 

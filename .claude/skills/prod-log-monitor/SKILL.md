@@ -11,9 +11,16 @@ description: |
   On anomaly, collects evidence and files a GitHub issue via the issue-reporter workflow.
 
   Triggers: "prod log monitor", "production log monitor", "monitor prod logs", "watch prod logs"
+
+  Procedure contract: read this SKILL.md end-to-end before acting. Do not slice it on demand or use it as a lookup table mid-run.
 ---
 
 # prod-log-monitor
+
+Procedure contract:
+- Read this SKILL.md end-to-end before taking any action.
+- Do not sample sections opportunistically while already in motion.
+- If the procedure is missing something important, update the skill. Do not improvise around the gap.
 
 Hard rule: production is READ-ONLY. This skill must not restart servers, kill actors, or mutate state.
 

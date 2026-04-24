@@ -10,9 +10,16 @@ description: |
 
   This skill is not a deterministic PASS/FAIL gate. It runs explicitly selected scenario items,
   gathers evidence, classifies failures, and co-iterates the server and the scenario runners.
+
+  Procedure contract: read this SKILL.md end-to-end before acting. Do not slice it on demand or use it as a lookup table mid-run.
 ---
 
 # merge-gate
+
+Procedure contract:
+- Read this SKILL.md end-to-end before taking any action.
+- Do not sample sections opportunistically while already in motion.
+- If the procedure is missing something important, update the skill. Do not improvise around the gap.
 
 ## Intent
 
