@@ -643,3 +643,47 @@ def test_issue_441_internal_checkpoint_archive_catalog_missing_path_falls_back_f
     resp = client.get("/internal/v1/checkpoints/catalog-id/archive")
     assert resp.status_code == 200, resp.text
     assert resp.headers["content-disposition"] == 'attachment; filename="ckpt-fs.tar.gz"'
+
+
+def test_issue_441_internal_checkpoint_list_catalog_passes_shadow_ids_to_fs_scan(monkeypatch, tmp_path: Path) -> None:
+    _configure_checkpoint_roots(tmp_path)
+
+    captured: dict[str, object] = {}
+
+    async def _scan_checkpoints_from_catalog(user_id: str | None, *, is_admin: bool = False):
+        assert user_id == "owner-a"
+        assert is_admin is False
+        return (
+            [
+                internal_routes.CheckpointInfo(
+                    checkpoint_id="5d6fbbf8-6c5b-4e91-8e9f-f7e51f0d7d11",
+                    model_name="Qwen/Qwen3-0.6B",
+                    created_at="2026-01-03T00:00:00Z",
+                    type="sampler",
+                    size_bytes=2048,
+                )
+            ],
+            {"model-catalog_ckpt-catalog"},
+        )
+
+    def _scan_checkpoints(user_id: str | None, *, is_admin: bool = False, exclude_public_ids=None):
+        captured["user_id"] = user_id
+        captured["is_admin"] = is_admin
+        captured["exclude_public_ids"] = set(exclude_public_ids or set())
+        return []
+
+    monkeypatch.setattr(internal_routes, "checkpoint_index_enabled", lambda: True)
+    monkeypatch.setattr(internal_routes, "_scan_checkpoints_from_catalog", _scan_checkpoints_from_catalog)
+    monkeypatch.setattr(internal_routes, "_scan_checkpoints", _scan_checkpoints)
+
+    client = _make_app({"user_id": "owner-a", "user_role": "user"})
+    resp = client.get("/internal/v1/checkpoints")
+    assert resp.status_code == 200, resp.text
+    assert captured == {
+        "user_id": "owner-a",
+        "is_admin": False,
+        "exclude_public_ids": {"model-catalog_ckpt-catalog"},
+    }
+    assert [item["checkpoint_id"] for item in resp.json()["checkpoints"]] == [
+        "5d6fbbf8-6c5b-4e91-8e9f-f7e51f0d7d11"
+    ]

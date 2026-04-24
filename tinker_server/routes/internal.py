@@ -1510,13 +1510,25 @@ def _iter_legacy_checkpoint_entries(user_id: str | None, *, is_admin: bool = Fal
             yield metadata, sub_path, metadata["checkpoint_id"]
 
 
-def _scan_checkpoints(user_id: str | None, *, is_admin: bool = False) -> list[CheckpointInfo]:
+def _scan_checkpoints(
+    user_id: str | None,
+    *,
+    is_admin: bool = False,
+    exclude_public_ids: set[str] | None = None,
+) -> list[CheckpointInfo]:
     """Scan metadata-backed checkpoints and return the newest visible entry per checkpoint_id."""
     checkpoints_by_id: dict[str, tuple[int, CheckpointInfo]] = {}
+    excluded = exclude_public_ids or set()
 
     for metadata, ckpt_path, public_id in list(_iter_checkpoint_entries(user_id, is_admin=is_admin)) + list(
         _iter_legacy_checkpoint_entries(user_id, is_admin=is_admin)
     ):
+        # Catalog-backed entries already have a cheaper source of truth.
+        # Skip their filesystem walk here and keep filesystem fallback only for
+        # uncataloged, legacy, or otherwise unshadowed checkpoint ids.
+        if public_id in excluded:
+            continue
+
         model_name = metadata.get("model_name")
         if not isinstance(model_name, str) or not model_name:
             adapter_config_path = os.path.join(ckpt_path, "adapter_config.json")
@@ -1756,26 +1768,41 @@ async def list_checkpoints(request: Request):
 
     is_admin = can_bypass_ownership(request)
 
-    checkpoints = _scan_checkpoints(user_id, is_admin=is_admin)
-
+    catalog_checkpoints: list[CheckpointInfo] = []
+    shadow_fs_ids: set[str] = set()
     if checkpoint_index_enabled():
         try:
-            catalog_checkpoints, shadow_fs_ids = await _scan_checkpoints_from_catalog(user_id, is_admin=is_admin)
-            if catalog_checkpoints:
-                filtered_checkpoints = [
-                    item for item in checkpoints if item.checkpoint_id not in shadow_fs_ids
-                ]
-                merged_by_id: dict[str, CheckpointInfo] = {
-                    item.checkpoint_id: item for item in filtered_checkpoints
-                }
-                for item in catalog_checkpoints:
-                    merged_by_id[item.checkpoint_id] = item
-                checkpoints = list(merged_by_id.values())
-                checkpoints.sort(key=lambda x: x.created_at, reverse=True)
+            catalog_checkpoints, shadow_fs_ids = await _scan_checkpoints_from_catalog(
+                user_id,
+                is_admin=is_admin,
+            )
         except Exception:
             logger.exception(
                 "[internal.list_checkpoints] catalog query failed, fallback to filesystem scan"
             )
+            catalog_checkpoints = []
+            shadow_fs_ids = set()
+
+    # Catalog-backed ids already have a cheaper source of truth than walking
+    # the checkpoint tree and sizing every directory again.
+    checkpoints = _scan_checkpoints(
+        user_id,
+        is_admin=is_admin,
+        exclude_public_ids=shadow_fs_ids,
+    )
+    if shadow_fs_ids:
+        checkpoints = [
+            item for item in checkpoints if item.checkpoint_id not in shadow_fs_ids
+        ]
+
+    if catalog_checkpoints:
+        merged_by_id: dict[str, CheckpointInfo] = {
+            item.checkpoint_id: item for item in checkpoints
+        }
+        for item in catalog_checkpoints:
+            merged_by_id[item.checkpoint_id] = item
+        checkpoints = list(merged_by_id.values())
+        checkpoints.sort(key=lambda x: x.created_at, reverse=True)
 
     return CheckpointsListResponse(checkpoints=checkpoints)
 
