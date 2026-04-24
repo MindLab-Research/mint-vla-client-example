@@ -234,6 +234,10 @@ def actor_runtime_env_vars(*, pythonpath: str, extra: dict[str, str] | None = No
         "TINKER_USAGE_LOG_DIR",
         "TINKER_USAGE_BACKEND",
         "TINKER_USAGE_PG_DSN",
+        "TINKER_CHECKPOINT_INDEX_PG_DSN",
+        "TINKER_CHECKPOINT_INDEX_WRITE_TIMEOUT_MS",
+        "TINKER_CHECKPOINT_INDEX_UPLOADING_STALE_S",
+        "MINT_CHECKPOINT_INDEX_PUBLISH_RETRY_S",
     ):
         value = _env_nonempty(os.environ, key)
         if value is not None:
