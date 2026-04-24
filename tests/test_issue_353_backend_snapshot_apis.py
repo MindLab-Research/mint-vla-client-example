@@ -10,6 +10,48 @@ from tinker_server.backend.future_store import FutureStatus, FutureStore, Future
 from tinker_server.backend.resource_pool import ActorType, get_resource_pool
 
 
+def test_actor_observability_metadata_preserves_recent_latency_and_gpu_fields(monkeypatch) -> None:
+    class _Getter:
+        def __call__(self):
+            return None
+
+        def remote(self):
+            return "binding-ref"
+
+    class _Handle:
+        get_observability_binding = _Getter()
+
+    monkeypatch.setattr(
+        resource_pool_mod.ray,
+        "get",
+        lambda _ref, timeout=None: {
+            "hostname": "host-a",
+            "node_id": "node-a",
+            "scheduler_waiting_requests": 4,
+            "seq_slot_wait_s_p95_recent": 1.2,
+            "generate_lock_wait_s_p50_recent": 0.1,
+            "time_per_output_token_s_total": 0.96,
+            "gpu_memory_allocated_bytes": 48000000000,
+            "gpu_memory_reserved_bytes": 52000000000,
+            "gpu_memory_fragmentation_bytes": 4000000000,
+        },
+    )
+
+    out = resource_pool_mod.actor_observability_metadata(_Handle(), timeout_s=0.5)
+
+    assert out == {
+        "hostname": "host-a",
+        "node_id": "node-a",
+        "scheduler_waiting_requests": 4,
+        "seq_slot_wait_s_p95_recent": 1.2,
+        "generate_lock_wait_s_p50_recent": 0.1,
+        "time_per_output_token_s_total": 0.96,
+        "gpu_memory_allocated_bytes": 48000000000,
+        "gpu_memory_reserved_bytes": 52000000000,
+        "gpu_memory_fragmentation_bytes": 4000000000,
+    }
+
+
 def test_api_work_queue_metrics_snapshot_tracks_local_state() -> None:
     q = ApiWorkQueueClient()
     now = time.time()
@@ -466,7 +508,8 @@ def test_api_work_queue_start_workers_continues_when_hydration_baseline_missing(
     asyncio.run(q.shutdown())
 
 
-def test_resource_pool_cached_snapshot_exposes_rss_cache_state() -> None:
+def test_resource_pool_cached_snapshot_exposes_rss_cache_state(monkeypatch) -> None:
+    monkeypatch.setattr(resource_pool_mod, "_detached_enabled", lambda: False)
     pool = get_resource_pool()
     pool.clear(kill_actors=False)
     old_ttl = pool.RSS_TTL_S
@@ -510,6 +553,7 @@ def test_resource_pool_cached_snapshot_exposes_rss_cache_state() -> None:
 
 
 def test_resource_pool_cached_snapshot_refreshes_vllm_observability_on_ttl(monkeypatch) -> None:
+    monkeypatch.setattr(resource_pool_mod, "_detached_enabled", lambda: False)
     pool = get_resource_pool()
     pool.clear(kill_actors=False)
     old_ttl = pool.METADATA_TTL_S
@@ -558,6 +602,7 @@ def test_resource_pool_cached_snapshot_refreshes_vllm_observability_on_ttl(monke
 
 
 def test_resource_pool_cached_snapshot_refreshes_megatron_observability_on_ttl(monkeypatch) -> None:
+    monkeypatch.setattr(resource_pool_mod, "_detached_enabled", lambda: False)
     pool = get_resource_pool()
     pool.clear(kill_actors=False)
     old_ttl = pool.METADATA_TTL_S
@@ -606,6 +651,7 @@ def test_resource_pool_cached_snapshot_refreshes_megatron_observability_on_ttl(m
 
 
 def test_resource_pool_cached_snapshot_uses_fresh_metadata_without_refresh(monkeypatch) -> None:
+    monkeypatch.setattr(resource_pool_mod, "_detached_enabled", lambda: False)
     pool = get_resource_pool()
     pool.clear(kill_actors=False)
     old_ttl = pool.METADATA_TTL_S
@@ -637,6 +683,7 @@ def test_resource_pool_cached_snapshot_uses_fresh_metadata_without_refresh(monke
 
 
 def test_resource_pool_cached_snapshot_tracks_refresh_failure(monkeypatch) -> None:
+    monkeypatch.setattr(resource_pool_mod, "_detached_enabled", lambda: False)
     pool = get_resource_pool()
     pool.clear(kill_actors=False)
     old_ttl = pool.METADATA_TTL_S

@@ -15,12 +15,19 @@ description: |
   - `mint-dev` skill for dev environment constraints (SSH host `mint-dev`; default port 8000)
   - `architecture-design` skill for architecture docs alignment
 
+  Procedure contract: read this SKILL.md end-to-end before acting. Do not slice it on demand or use it as a lookup table mid-run.
+
   Triggers: "auto-bugfix", "bot queue", "assign-to-bot"
 ---
 
 # auto-bugfix (orchestrator)
 
 This skill runs a loop: drain the `assign-to-bot` issue queue by producing reviewed PRs merged into `develop`.
+
+Procedure contract:
+- Read this SKILL.md end-to-end before taking any action.
+- Do not sample sections opportunistically while already in motion.
+- If the procedure is missing something important, update the skill. Do not improvise around the gap.
 
 Responsibility split:
 - Orchestrator (this SKILL.md): queue management, branch management, bot-identity commit/push, PR creation, spawning reviewer, merge orchestration.

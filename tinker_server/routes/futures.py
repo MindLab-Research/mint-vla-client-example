@@ -14,7 +14,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, Response
 
-from ..auth_identity import is_admin_request
+from ..auth_identity import can_view_internal_errors
 from ..backend.future_replay import ReplayEntry, future_replay_store, should_persist_training_future
 from ..backend.future_store import FutureStatus, FutureStoreUnavailableError, future_store
 from ..futures_utils import pending_future_http_response
@@ -25,25 +25,19 @@ logger = logging.getLogger(__name__)
 
 
 def _retrieve_grace_s() -> float:
-    v = (
-        os.environ.get("MINT_RETRIEVE_FUTURE_GRACE_S")
-        or os.environ.get("TINKER_RETRIEVE_FUTURE_GRACE_S")
-        or "120"
-    ).strip()
+    from ..config import config as server_config
+
     try:
-        return max(0.0, float(v))
+        return max(0.0, float(server_config.retrieve_future_grace_s))
     except Exception:
         return 120.0
 
 
 def _retrieve_pending_min_poll_s() -> float:
-    v = (
-        os.environ.get("MINT_RETRIEVE_FUTURE_MIN_POLL_S")
-        or os.environ.get("TINKER_RETRIEVE_FUTURE_MIN_POLL_S")
-        or "1.0"
-    ).strip()
+    from ..config import config as server_config
+
     try:
-        return max(0.0, float(v))
+        return max(0.0, float(server_config.retrieve_future_min_poll_s))
     except Exception:
         return 1.0
 
@@ -161,11 +155,11 @@ def _public_error(error: str | None) -> str:
 
 
 def _is_privileged(request: Request) -> bool:
-    """Check if request is from privileged user (admin API key)."""
+    """Check if request may see internal failure details."""
     from ..config import config as server_config
     if not server_config.auth_enabled:
         return True
-    return is_admin_request(request)
+    return can_view_internal_errors(request)
 
 
 def _failed_payload(error: str | None, request: Request) -> dict[str, str]:
@@ -402,15 +396,15 @@ async def retrieve_future(
             meta = None
         if isinstance(meta, dict):
             actor_name = meta.get("actor_name")
-            session_id = meta.get("model_id")
+            tracked_session_id = meta.get("model_id")
             if actor_name:
                 try:
                     from ..backend.resource_pool import get_resource_pool
 
                     rp = get_resource_pool()
-                    rp.touch(actor_name)
-                    if session_id:
-                        rp.set_session(actor_name, session_id)
+                    await rp.async_touch(actor_name)
+                    if tracked_session_id:
+                        await rp.async_set_session(actor_name, tracked_session_id)
                 except Exception:
                     pass
 
@@ -436,6 +430,12 @@ async def retrieve_future(
         generate_s = None
         scheduler_domain_key_source = None
         scheduler_capacity_owner = None
+        model_id = None
+        session_id = None
+        sampling_session_id = None
+        seq_id = None
+        base_model = None
+        backend = None
         if isinstance(meta, dict):
             queue_state = meta.get("queue_state")
             queue_state_reason = meta.get("queue_state_reason")
@@ -458,6 +458,12 @@ async def retrieve_future(
             generate_s = meta.get("generate_s")
             scheduler_domain_key_source = meta.get("scheduler_domain_key_source")
             scheduler_capacity_owner = meta.get("scheduler_capacity_owner")
+            model_id = meta.get("model_id")
+            session_id = meta.get("session_id")
+            sampling_session_id = meta.get("sampling_session_id")
+            seq_id = meta.get("seq_id")
+            base_model = meta.get("base_model")
+            backend = meta.get("backend")
         if not isinstance(queue_state_reason, str) or not queue_state_reason.strip():
             queue_state_reason = None
 
@@ -489,14 +495,20 @@ async def retrieve_future(
         from ..backend.api_work_queue import ApiWorkQueueUnavailableError, api_work_queue
 
         pos = None
-        try:
-            pos = await api_work_queue.find_position(body.request_id)
-        except ApiWorkQueueUnavailableError as e:
-            if status_field == "queued" and queue_kind != "scheduled":
-                raise HTTPException(status_code=503, detail=f"ApiWorkQueue unavailable: {e}") from e
-        except Exception as e:
-            if status_field == "queued" and queue_kind != "scheduled":
-                raise HTTPException(status_code=503, detail=f"ApiWorkQueue position lookup failed: {type(e).__name__}: {e}") from e
+        queue_probe = None
+        if status_field == "queued":
+            try:
+                queue_probe = await api_work_queue.describe_pending_request(
+                    body.request_id,
+                    op if isinstance(op, str) else None,
+                )
+                pos = queue_probe
+            except ApiWorkQueueUnavailableError as e:
+                if queue_kind != "scheduled":
+                    raise HTTPException(status_code=503, detail=f"ApiWorkQueue unavailable: {e}") from e
+            except Exception as e:
+                if queue_kind != "scheduled":
+                    raise HTTPException(status_code=503, detail=f"ApiWorkQueue position lookup failed: {type(e).__name__}: {e}") from e
 
         if isinstance(pos, dict):
             pos_queue_kind = pos.get("queue_kind")
@@ -561,6 +573,14 @@ async def retrieve_future(
 
         if queue_kind == "legacy" and isinstance(queue_depth_scheduled, int) and queue_depth_scheduled > 0:
             queue_position = None
+        if status_field == "queued" and queue_position is not None:
+            from ..config import config as server_config
+
+            ema_exec_s = queue_probe.get("ema_exec_s") if isinstance(queue_probe, dict) else None
+            worker_count = int(server_config.api_work_queue_num_workers)
+            if worker_count > 0 and isinstance(ema_exec_s, (int, float)):
+                estimated_wait_s = (float(queue_position) + 1.0) * float(ema_exec_s) / float(worker_count)
+
         if queue_state_reason is None and status_field == "queued":
             if queue_kind == "scheduled":
                 queue_state_reason = "scheduled_queue"
@@ -570,21 +590,6 @@ async def retrieve_future(
                 queue_state_reason = "queue_backlog"
             elif queue_position is None:
                 queue_state_reason = "queue_position_unknown"
-        if status_field == "queued" and queue_position is not None:
-            try:
-                from ..config import config as server_config
-
-                eta_state = await api_work_queue.get_eta_state(op if isinstance(op, str) else None)
-                ema_exec_s = None
-                if isinstance(eta_state, dict):
-                    ema_exec_s = eta_state.get("ema_exec_s")
-                worker_count = int(server_config.api_work_queue_num_workers)
-                if worker_count > 0 and isinstance(ema_exec_s, (int, float)):
-                    estimated_wait_s = (float(queue_position) + 1.0) * float(ema_exec_s) / float(worker_count)
-            except ApiWorkQueueUnavailableError as e:
-                raise HTTPException(status_code=503, detail=f"ApiWorkQueue unavailable: {e}") from e
-            except Exception as e:
-                raise HTTPException(status_code=503, detail=f"ApiWorkQueue ETA lookup failed: {type(e).__name__}: {e}") from e
 
         progress_payload = None
         if isinstance(progress, dict):
@@ -637,6 +642,12 @@ async def retrieve_future(
                 "scheduler_session_id": scheduler_session_id,
                 "scheduler_domain_key_source": scheduler_domain_key_source,
                 "scheduler_capacity_owner": scheduler_capacity_owner,
+                "model_id": model_id,
+                "session_id": session_id,
+                "sampling_session_id": sampling_session_id,
+                "seq_id": seq_id,
+                "base_model": base_model,
+                "backend": backend,
                 "queue_depth_legacy": queue_depth_legacy,
                 "queue_depth_scheduled": queue_depth_scheduled,
                 "queue_depth_domain": queue_depth_domain,
@@ -680,7 +691,7 @@ async def retrieve_future(
             extra_headers["X-Queue-Tokens-Generated"] = str(int(progress_payload.get("tokens_generated", 0)))
             extra_headers["X-Queue-Max-Tokens"] = str(int(progress_payload.get("max_tokens", 0)))
 
-        # Tinker client expects HTTP 408 for pending
+        # Tinker client expects HTTP 408 for pending.
         _pending_hint_note_pending(body.request_id)
         pending = pending_future_http_response(
             retry_after_s=retry_after_s,

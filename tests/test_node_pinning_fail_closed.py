@@ -12,7 +12,10 @@ def _import_volc_placement(monkeypatch: pytest.MonkeyPatch):
     ray = types.ModuleType("ray")
     ray.is_initialized = lambda: True  # type: ignore[attr-defined]
     ray.nodes = lambda: []  # type: ignore[attr-defined]
-    ray.util = SimpleNamespace(placement_group_table=lambda: {})
+    ray.util = SimpleNamespace(
+        placement_group_table=lambda: {},
+        state=SimpleNamespace(list_actors=lambda **kwargs: []),
+    )
     monkeypatch.setitem(sys.modules, "ray", ray)
 
     ray_private = types.ModuleType("ray._private")
@@ -114,26 +117,354 @@ def test_assert_node_ip_capacity_reports_missing_node(
         )
 
 
-def test_available_resources_per_node_safe_falls_back_in_ray_client_mode(
+def test_list_alive_gpu_nodes_fails_closed_when_state_and_pg_fallback_fail(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     vp = _import_volc_placement(monkeypatch)
-    expected = {"node-1": {"GPU": 4.0}}
-
-    class _RaySystemError(RuntimeError):
-        pass
-
-    calls: list[str] = []
 
     monkeypatch.setattr(
-        sys.modules["ray._private"].state,
-        "available_resources_per_node",
-        lambda: (_ for _ in ()).throw(_RaySystemError("Ray has not been started yet")),
+        vp.ray,
+        "nodes",
+        lambda: [
+            {
+                "Alive": True,
+                "NodeID": "node-1",
+                "NodeManagerAddress": "10.0.0.7",
+                "NodeManagerHostname": "worker-7",
+                "Resources": {"GPU": 8},
+            }
+        ],
     )
-    vp.ray.remote = lambda **_kwargs: (  # type: ignore[attr-defined]
-        lambda fn: SimpleNamespace(remote=lambda: (calls.append("remote"), expected)[1])
+    monkeypatch.setitem(
+        sys.modules,
+        "ray._private",
+        types.ModuleType("ray._private"),
     )
-    vp.ray.get = lambda ref: ref  # type: ignore[attr-defined]
+    sys.modules["ray._private"].state = SimpleNamespace(  # type: ignore[attr-defined]
+        available_resources_per_node=lambda: (_ for _ in ()).throw(RuntimeError("state down"))
+    )
+    monkeypatch.setattr(
+        vp.ray.util,
+        "placement_group_table",
+        lambda: (_ for _ in ()).throw(RuntimeError("pg down")),
+    )
+    monkeypatch.setattr(
+        vp.ray.util.state,
+        "list_actors",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("actors down")),
+    )
+    monkeypatch.setattr(
+        vp.ray.util,
+        "list_named_actors",
+        lambda all_namespaces=True: [{"name": "foreign-actor", "namespace": "other"}],
+        raising=False,
+    )
 
-    assert vp._available_resources_per_node_safe() == expected
-    assert calls == ["remote"]
+    nodes = vp._list_alive_gpu_nodes()
+
+    assert len(nodes) == 1
+    assert nodes[0].node_ip == "10.0.0.7"
+    assert nodes[0].available_gpus == 0
+
+
+def test_list_alive_gpu_nodes_accounts_pending_list_bundles_via_pinned_ip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vp = _import_volc_placement(monkeypatch)
+
+    monkeypatch.setattr(
+        vp.ray,
+        "nodes",
+        lambda: [
+            {
+                "Alive": True,
+                "NodeID": "node-1",
+                "NodeManagerAddress": "10.0.0.7",
+                "NodeManagerHostname": "worker-7",
+                "Resources": {"GPU": 8},
+            }
+        ],
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "ray._private",
+        types.ModuleType("ray._private"),
+    )
+    sys.modules["ray._private"].state = SimpleNamespace(  # type: ignore[attr-defined]
+        available_resources_per_node=lambda: (_ for _ in ()).throw(RuntimeError("state down"))
+    )
+    monkeypatch.setattr(
+        vp.ray.util,
+        "placement_group_table",
+        lambda: {
+            "pg-1": {
+                "state": "PENDING",
+                "bundles": [{"GPU": 4, "node:10.0.0.7": 0.001}],
+                "bundles_to_node_id": {},
+            }
+        },
+    )
+
+    nodes = vp._list_alive_gpu_nodes()
+
+    assert len(nodes) == 1
+    assert nodes[0].node_ip == "10.0.0.7"
+    assert nodes[0].available_gpus == 4
+
+
+def test_select_free_nodes_from_allowed_ips_uses_fail_closed_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vp = _import_volc_placement(monkeypatch)
+
+    monkeypatch.setattr(
+        vp.ray,
+        "nodes",
+        lambda: [
+            {
+                "Alive": True,
+                "NodeID": "node-1",
+                "NodeManagerAddress": "10.0.0.7",
+                "NodeManagerHostname": "worker-7",
+                "Resources": {"GPU": 8},
+            }
+        ],
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "ray._private",
+        types.ModuleType("ray._private"),
+    )
+    sys.modules["ray._private"].state = SimpleNamespace(  # type: ignore[attr-defined]
+        available_resources_per_node=lambda: (_ for _ in ()).throw(RuntimeError("state down"))
+    )
+    monkeypatch.setattr(vp.ray.util, "placement_group_table", lambda: {})
+    monkeypatch.setattr(
+        vp.ray.util.state,
+        "list_actors",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("actors down")),
+    )
+    monkeypatch.setattr(
+        vp.ray.util,
+        "list_named_actors",
+        lambda all_namespaces=True: [{"name": "foreign-actor", "namespace": "other"}],
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError, match="insufficient free nodes within allowlist"):
+        vp.select_free_nodes_from_allowed_ips(allowed_node_ips=["10.0.0.7"], required_gpus=1)
+
+
+def test_list_alive_gpu_nodes_treats_missing_state_entry_as_zero_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vp = _import_volc_placement(monkeypatch)
+
+    monkeypatch.setattr(
+        vp.ray,
+        "nodes",
+        lambda: [
+            {
+                "Alive": True,
+                "NodeID": "node-1",
+                "NodeManagerAddress": "10.0.0.7",
+                "NodeManagerHostname": "worker-7",
+                "Resources": {"GPU": 8},
+            }
+        ],
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "ray._private",
+        types.ModuleType("ray._private"),
+    )
+    sys.modules["ray._private"].state = SimpleNamespace(available_resources_per_node=lambda: {})  # type: ignore[attr-defined]
+
+    nodes = vp._list_alive_gpu_nodes()
+
+    assert len(nodes) == 1
+    assert nodes[0].available_gpus == 0
+
+
+def test_list_alive_gpu_nodes_uses_actor_state_fallback_when_private_state_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vp = _import_volc_placement(monkeypatch)
+
+    monkeypatch.setenv("RAY_ADDRESS", "ray://192.168.39.87:10001")
+    monkeypatch.setattr(
+        vp.ray,
+        "nodes",
+        lambda: [
+            {
+                "Alive": True,
+                "NodeID": "node-1",
+                "NodeManagerAddress": "10.0.0.7",
+                "NodeManagerHostname": "worker-7",
+                "Resources": {"GPU": 8},
+            }
+        ],
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "ray._private",
+        types.ModuleType("ray._private"),
+    )
+    sys.modules["ray._private"].state = SimpleNamespace(  # type: ignore[attr-defined]
+        available_resources_per_node=lambda: (_ for _ in ()).throw(RuntimeError("state down"))
+    )
+    monkeypatch.setattr(vp.ray.util, "placement_group_table", lambda: {})
+    monkeypatch.setattr(vp.ray.util.state, "list_actors", lambda **kwargs: [])
+
+    nodes = vp._list_alive_gpu_nodes()
+
+    assert len(nodes) == 1
+    assert nodes[0].node_ip == "10.0.0.7"
+    assert nodes[0].available_gpus == 8
+
+
+def test_list_alive_gpu_nodes_actor_state_fallback_accounts_alive_gpu_actors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vp = _import_volc_placement(monkeypatch)
+
+    monkeypatch.setenv("RAY_ADDRESS", "ray://192.168.39.87:10001")
+    monkeypatch.setattr(
+        vp.ray,
+        "nodes",
+        lambda: [
+            {
+                "Alive": True,
+                "NodeID": "node-1",
+                "NodeManagerAddress": "10.0.0.7",
+                "NodeManagerHostname": "worker-7",
+                "Resources": {"GPU": 8},
+            }
+        ],
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "ray._private",
+        types.ModuleType("ray._private"),
+    )
+    sys.modules["ray._private"].state = SimpleNamespace(  # type: ignore[attr-defined]
+        available_resources_per_node=lambda: (_ for _ in ()).throw(RuntimeError("state down"))
+    )
+    monkeypatch.setattr(vp.ray.util, "placement_group_table", lambda: {})
+    monkeypatch.setattr(
+        vp.ray.util.state,
+        "list_actors",
+        lambda **kwargs: [
+            {
+                "state": "ALIVE",
+                "node_id": "node-1",
+                "required_resources": {"GPU": 4},
+            }
+        ],
+    )
+
+    nodes = vp._list_alive_gpu_nodes()
+
+    assert len(nodes) == 1
+    assert nodes[0].available_gpus == 4
+
+
+def test_actor_state_fallback_omits_address_when_ray_is_already_initialized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vp = _import_volc_placement(monkeypatch)
+
+    monkeypatch.setenv("RAY_ADDRESS", "ray://192.168.39.87:10001")
+
+    seen: dict[str, object] = {}
+
+    def _list_actors(**kwargs):
+        seen.update(kwargs)
+        return []
+
+    monkeypatch.setattr(vp.ray.util.state, "list_actors", _list_actors)
+
+    used, ok = vp._actor_used_gpus_by_node_from_state_api(context="test")
+
+    assert ok is True
+    assert used == {}
+    assert "address" not in seen
+    assert seen["detail"] is True
+    assert seen["limit"] == 10000
+
+
+def test_actor_state_fallback_uses_subprocess_after_direct_lookup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vp = _import_volc_placement(monkeypatch)
+
+    monkeypatch.setenv("RAY_ADDRESS", "ray://192.168.39.87:10001")
+
+    calls: list[dict[str, object]] = []
+
+    def _list_actors(**kwargs):
+        calls.append(dict(kwargs))
+        raise RuntimeError("not initialized in this thread")
+
+    monkeypatch.setattr(vp.ray.util.state, "list_actors", _list_actors)
+    subprocess_calls: list[list[str]] = []
+
+    def _check_output(cmd, text, timeout, env):
+        subprocess_calls.append(list(cmd))
+        assert text is True
+        assert timeout == 60
+        assert "RAY_ADDRESS" not in env
+        assert "MINT_RAY_CLIENT_ADDRESS" not in env
+        assert "RAY_CLIENT_ADDRESS" not in env
+        return "[]"
+
+    monkeypatch.setattr(vp.subprocess, "check_output", _check_output)
+
+    used, ok = vp._actor_used_gpus_by_node_from_state_api(context="test")
+
+    assert ok is True
+    assert used == {}
+    assert len(calls) == 1
+    assert "address" not in calls[0]
+    assert len(subprocess_calls) == 1
+    assert subprocess_calls[0][-1] == "192.168.39.87:6379"
+
+
+def test_assert_node_ip_capacity_handles_list_shaped_pg_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vp = _import_volc_placement(monkeypatch)
+
+    monkeypatch.setattr(
+        vp,
+        "_list_alive_gpu_nodes",
+        lambda: [
+            vp.VolcGpuNode(
+                node_id="node-1",
+                node_ip="10.0.0.7",
+                hostname="worker-7",
+                total_gpus=8,
+                available_gpus=0,
+                volc_job_id=None,
+                volc_resource_queue_id=None,
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        vp.ray.util,
+        "placement_group_table",
+        lambda: [
+            {
+                "name": "megatron_qwen_pg",
+                "state": "CREATED",
+                "bundles": [{"GPU": 8, "node:10.0.0.7": 0.001}],
+                "bundles_to_node_id": {0: "node-1"},
+            }
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="megatron_qwen_pg:CREATED"):
+        vp.assert_node_ip_capacity(
+            required_gpus_by_node_ip={"10.0.0.7": 8},
+            context="single-node vllm pin",
+        )

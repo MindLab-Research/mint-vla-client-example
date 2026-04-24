@@ -8,9 +8,16 @@ description: |
   and files GitHub issues when evidence supports it.
 
   Triggers: "alpha user", "alpha-user", "prod battle test", "production battle-test", "continuous prod testing"
+
+  Procedure contract: read this SKILL.md end-to-end before acting. Do not slice it on demand or use it as a lookup table mid-run.
 ---
 
 # alpha-user-prod
+
+Procedure contract:
+- Read this SKILL.md end-to-end before taking any action.
+- Do not sample sections opportunistically while already in motion.
+- If the procedure is missing something important, update the skill. Do not improvise around the gap.
 
 You behave like a curious, technically competent alpha user of the MinT SDK on production.
 

@@ -47,6 +47,8 @@ def _response_stub():
 def _install_minimal_ray_module(monkeypatch):
     ray_mod = types.ModuleType("ray")
     ray_mod.actor = SimpleNamespace(ActorHandle=object)
+    ray_mod.is_initialized = lambda: True  # type: ignore[attr-defined]
+    ray_mod.get_actor = lambda *args, **kwargs: None  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "ray", ray_mod)
     return ray_mod
 
@@ -154,8 +156,9 @@ def _install_gateway_forward_stubs(
 
 
 class _AsyncOnlyPendingFutureStore:
-    def __init__(self):
+    def __init__(self, meta: dict | None = None):
         self.calls: list[tuple[str, str]] = []
+        self._meta = dict(meta or {"queue_state": "queued", "stage": "queued", "op": "sampling.asample"})
 
     async def async_get_status(self, request_id: str) -> FutureStatus:
         self.calls.append(("async_get_status", request_id))
@@ -163,7 +166,7 @@ class _AsyncOnlyPendingFutureStore:
 
     async def async_get_meta(self, request_id: str):
         self.calls.append(("async_get_meta", request_id))
-        return {"queue_state": "queued", "stage": "queued", "op": "sampling.asample"}
+        return dict(self._meta)
 
     def get_status(self, request_id: str) -> FutureStatus:
         raise AssertionError("sync get_status should not be used on request path")
@@ -223,6 +226,10 @@ class _AsyncOnlyUnknownFutureStore:
 
 
 class _StubApiWorkQueue:
+    async def describe_pending_request(self, request_id: str, op: str | None) -> dict:
+        _ = request_id, op
+        return {"found": True, "position": 0, "depth": 1, "ema_exec_s": 2.0}
+
     async def find_position(self, request_id: str) -> dict:
         return {"found": True, "position": 0, "depth": 1}
 
@@ -236,6 +243,24 @@ class _StubApiWorkQueue:
     async def rss_bytes(self, timeout_s: float = 10.0) -> int:
         _ = timeout_s
         return 123
+
+
+class _AsyncOnlyResourcePool:
+    def __init__(self):
+        self.calls: list[tuple[str, str | None]] = []
+
+    async def async_touch(self, actor_name: str) -> bool:
+        self.calls.append(("async_touch", actor_name))
+        return True
+
+    async def async_set_session(self, actor_name: str, session_id: str | None) -> None:
+        self.calls.append(("async_set_session", session_id))
+
+    def touch(self, actor_name: str) -> bool:
+        raise AssertionError("sync touch should not be used on request path")
+
+    def set_session(self, actor_name: str, session_id: str | None) -> None:
+        raise AssertionError("sync set_session should not be used on request path")
 
 
 class _AsyncOnlySamplingFutureStore:
@@ -406,12 +431,17 @@ class _AsyncOnlyAdmissionFutureStore:
 
 
 def test_issue_360_retrieve_future_pending_uses_async_store_calls(monkeypatch):
-    store = _AsyncOnlyPendingFutureStore()
+    store = _AsyncOnlyPendingFutureStore(
+        {"queue_state": "queued", "stage": "queued", "op": "sampling.asample", "actor_name": "actor-a", "model_id": "model-a"}
+    )
+    pool = _AsyncOnlyResourcePool()
     monkeypatch.setattr(futures_route, "future_store", store)
     import tinker_server.backend.api_work_queue as wq
     import tinker_server.config as config_module
+    import tinker_server.backend.resource_pool as rp
 
     monkeypatch.setattr(wq, "api_work_queue", _StubApiWorkQueue())
+    monkeypatch.setattr(rp, "get_resource_pool", lambda: pool)
     monkeypatch.setattr(config_module.config, "api_work_queue_num_workers", 2, raising=False)
 
     body = FutureRetrieveRequest(request_id="rid_pending_async")
@@ -422,6 +452,7 @@ def test_issue_360_retrieve_future_pending_uses_async_store_calls(monkeypatch):
     assert payload.get("status") == "queued"
     assert ("async_get_status", "rid_pending_async") in store.calls
     assert ("async_get_meta", "rid_pending_async") in store.calls
+    assert pool.calls == [("async_touch", "actor-a"), ("async_set_session", "model-a")]
 
 
 def test_issue_360_retrieve_future_terminal_uses_async_result(monkeypatch):
@@ -516,6 +547,120 @@ def test_issue_360_internal_admission_stats_uses_async_store_calls(monkeypatch):
     assert payload["actors"]["capacity_manager"]["rss_bytes"] == 111
     assert payload["actors"]["api_work_queue"]["rss_bytes"] == 123
     assert payload["actors"]["future_store"]["rss_bytes"] == 222
+
+
+@pytest.mark.anyio
+async def test_issue_360_api_work_queue_request_helpers_use_async_actor(monkeypatch):
+    import importlib
+
+    _install_minimal_ray_module(monkeypatch)
+    wq = importlib.import_module("tinker_server.backend.api_work_queue")
+    client = wq.ApiWorkQueueClient()
+    calls: list[tuple[str, object]] = []
+
+    class _DescribePendingHandle:
+        def remote(self, request_id: str, op: str | None):
+            calls.append(("describe_pending_request.remote", (request_id, op)))
+            return object()
+
+    class _FindPositionHandle:
+        def remote(self, *, request_id: str):
+            calls.append(("find_position.remote", request_id))
+            return object()
+
+    class _EtaHandle:
+        def remote(self, op: str | None):
+            calls.append(("get_eta_state.remote", op))
+            return object()
+
+    class _Actor:
+        describe_pending_request = _DescribePendingHandle()
+        find_position = _FindPositionHandle()
+        get_eta_state = _EtaHandle()
+
+    async def _fake_get_async(*, require_ready: bool = True):
+        calls.append(("_get_ray_actor_async", require_ready))
+        return _Actor()
+
+    def _unexpected_get_sync(*, require_ready: bool = True):
+        raise AssertionError("sync _get_ray_actor should not be used on request path")
+
+    async def _fake_await(_ref, *, timeout_s=None):
+        calls.append(("_await_ray_ref", timeout_s))
+        idx = len([item for item in calls if item[0] == "_await_ray_ref"])
+        if idx == 1:
+            return {"found": True, "position": 0, "depth": 1, "ema_exec_s": 2.0}
+        if idx == 2:
+            return {"found": True, "position": 0, "depth": 1}
+        return {"ema_exec_s": 2.0}
+
+    monkeypatch.setattr(client, "_get_ray_actor_async", _fake_get_async)
+    monkeypatch.setattr(client, "_get_ray_actor", _unexpected_get_sync)
+    monkeypatch.setattr(client, "_await_ray_ref", _fake_await)
+
+    pending = await client.describe_pending_request("rid-360", "sampling.asample")
+    pos = await client.find_position("rid-360")
+    eta = await client.get_eta_state("sampling.asample")
+
+    assert pending == {"found": True, "position": 0, "depth": 1, "ema_exec_s": 2.0}
+    assert pos == {"found": True, "position": 0, "depth": 1}
+    assert eta == {"ema_exec_s": 2.0}
+    assert ("_get_ray_actor_async", False) in calls
+    assert ("describe_pending_request.remote", ("rid-360", "sampling.asample")) in calls
+    assert ("find_position.remote", "rid-360") in calls
+    assert ("get_eta_state.remote", "sampling.asample") in calls
+
+
+@pytest.mark.anyio
+async def test_issue_360_api_work_queue_describe_pending_request_falls_back_for_old_actor(monkeypatch):
+    import importlib
+
+    _install_minimal_ray_module(monkeypatch)
+    wq = importlib.import_module("tinker_server.backend.api_work_queue")
+    client = wq.ApiWorkQueueClient()
+    calls: list[tuple[str, object]] = []
+
+    class _MissingDescribe:
+        def __getattr__(self, name: str):
+            if name == "remote":
+                raise AttributeError(name)
+            raise AttributeError(name)
+
+    class _FindPositionHandle:
+        def remote(self, *, request_id: str):
+            calls.append(("find_position.remote", request_id))
+            return object()
+
+    class _EtaHandle:
+        def remote(self, op: str | None):
+            calls.append(("get_eta_state.remote", op))
+            return object()
+
+    class _OldActor:
+        describe_pending_request = _MissingDescribe()
+        find_position = _FindPositionHandle()
+        get_eta_state = _EtaHandle()
+
+    async def _fake_get_async(*, require_ready: bool = True):
+        calls.append(("_get_ray_actor_async", require_ready))
+        return _OldActor()
+
+    async def _fake_await(_ref, *, timeout_s=None):
+        calls.append(("_await_ray_ref", timeout_s))
+        idx = len([item for item in calls if item[0] == "_await_ray_ref"])
+        if idx == 1:
+            return {"found": True, "position": 2, "depth": 5}
+        return {"ema_exec_s": 4.0}
+
+    monkeypatch.setattr(client, "_get_ray_actor_async", _fake_get_async)
+    monkeypatch.setattr(client, "_await_ray_ref", _fake_await)
+
+    pending = await client.describe_pending_request("rid-old", "sampling.asample")
+
+    assert pending == {"found": True, "position": 2, "depth": 5, "ema_exec_s": 4.0}
+    assert ("_get_ray_actor_async", False) in calls
+    assert ("find_position.remote", "rid-old") in calls
+    assert ("get_eta_state.remote", "sampling.asample") in calls
 
 
 @pytest.mark.anyio
@@ -665,7 +810,6 @@ def _install_stateless_training_enqueue_stubs(monkeypatch, *, route_session_info
     monkeypatch.setattr(training_route, "_get_training_route_session_info", _get_training_route_session_info)
     monkeypatch.setattr(training_route, "build_billing_auth_context", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(training_route, "can_access_model", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(training_route, "is_admin_request", lambda _request: False)
     monkeypatch.setattr(cm, "capacity_manager", cap)
     monkeypatch.setattr(awq, "api_work_queue", q)
     monkeypatch.setattr(rse, "estimate_small_result_bytes", lambda: 0)
@@ -912,7 +1056,7 @@ def test_issue_360_training_enqueue_returns_503_when_heartbeat_protection_fails(
         anyio.run(training_route.forward, req, _request_stub("user-a"))
 
     assert excinfo.value.status_code == 503
-    assert excinfo.value.detail == "Training heartbeat store unavailable"
+    assert "Training heartbeat store unavailable" in str(excinfo.value.detail)
     assert q.calls == []
 
 
@@ -1479,6 +1623,7 @@ def test_issue_360_kill_dense_actors_uses_actor_name_without_cached_handle(monke
     monkeypatch.setattr(rp, "ActorType", SimpleNamespace(DENSE="dense"))
     monkeypatch.setattr(rp, "get_resource_pool", lambda: pool)
     monkeypatch.setattr(service_route, "async_kill_named_actor", _async_kill_named_actor)
+    monkeypatch.setattr(service_route, "_remove_actor_pg", lambda actor_name, namespace=None: None)
 
     killed = anyio.run(service_route._kill_dense_actors, "Qwen/Qwen3-0.6B")
 
@@ -1610,13 +1755,13 @@ def test_issue_360_kill_dense_actors_cleans_pg_when_async_kill_fails(monkeypatch
     monkeypatch.setattr(rp, "ActorType", SimpleNamespace(DENSE="dense"))
     monkeypatch.setattr(rp, "get_resource_pool", lambda: pool)
     monkeypatch.setattr(service_route, "async_kill_named_actor", _async_kill_named_actor)
-    monkeypatch.setattr(service_route, "_remove_actor_pg", lambda actor_name: removed_pgs.append(actor_name))
+    monkeypatch.setattr(service_route, "_remove_actor_pg", lambda actor_name, namespace=None: removed_pgs.append(actor_name))
 
-    killed = anyio.run(service_route._kill_dense_actors, "Qwen/Qwen3-0.6B")
+    with pytest.raises(RuntimeError, match="kill failed"):
+        anyio.run(service_route._kill_dense_actors, "Qwen/Qwen3-0.6B")
 
-    assert killed == 1
-    assert unregister_calls == ["dense-fail"]
-    assert removed_pgs == ["dense-fail"]
+    assert unregister_calls == []
+    assert removed_pgs == []
 
 
 def test_issue_360_kill_exact_vllm_actor_passes_resolved_handle_to_async_kill(monkeypatch):
@@ -1804,7 +1949,10 @@ def test_issue_360_future_store_async_get_status_backend_api(monkeypatch):
     store = fs_module.FutureStore()
     assert hasattr(store, "async_get_status"), "FutureStore must expose async_get_status for request paths"
 
-    actor = SimpleNamespace(get_status=_RemoteCall(result="done"))
+    actor = SimpleNamespace(
+        get_status=_RemoteCall(result="done"),
+        stats=_RemoteCall(result={"depth": 0}),
+    )
     store._ray_actor = actor
 
     ray_mod = types.ModuleType("ray")

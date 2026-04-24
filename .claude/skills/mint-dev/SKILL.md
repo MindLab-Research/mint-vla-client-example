@@ -10,9 +10,16 @@ description: |
   **Do NOT invoke this skill for production deployment. Use mint-prod instead.**
 
   For cluster lifecycle (create/teardown tasks), invoke the volcano-cluster skill.
+
+  Procedure contract: read this SKILL.md end-to-end before acting. Do not slice it on demand or use it as a lookup table mid-run.
 ---
 
 # Mint Development Environment
+
+Procedure contract:
+- Read this SKILL.md end-to-end before taking any action.
+- Do not sample sections opportunistically while already in motion.
+- If the procedure is missing something important, update the skill. Do not improvise around the gap.
 
 > **STOP. USE THESE COMMANDS EXACTLY.**
 >
@@ -116,33 +123,179 @@ runtime env root matches the intended PFS environment.
 For long-running dev validation, merge-gate work, or any dev server bring-up:
 
 - Do **not** assemble the server environment from scratch.
-- Start from the authoritative prod runtime baseline:
-  [configs/prod_volcano.env.sh](/home/yiwen/tinker_project/tinker-server/configs/prod_volcano.env.sh)
+- Start from the checked-in dev template:
+  [configs/dev_volcano.env.sh](../../../configs/dev_volcano.env.sh)
 - Then override **only** the dev-specific values that must differ.
 
 Hard rule:
 - If you are typing a long list of `export ...` lines by hand, you are probably doing it wrong.
 - The default move is:
   1. `cd /root/tinker_project/tinker-server`
-  2. `. ./configs/prod_volcano.env.sh`
+  2. `. ./configs/dev_volcano.env.sh`
   3. override the minimum required dev values
   4. run `scripts/run_server.py`
+- Any ad hoc startup command that does not follow that pattern is invalid evidence.
+- Do not debug failures from a hand-built startup command. Stop, throw it away, and return to the runbook.
+- If the startup needs many overrides, write them in a small script file on the server and execute that file after sourcing `configs/dev_volcano.env.sh`. Do not keep nesting shell quotes until the env becomes unverifiable.
 
-Required dev overrides after sourcing `configs/prod_volcano.env.sh`:
+Required overrides after sourcing `configs/dev_volcano.env.sh`:
 
-- `TINKER_PORT=8000`
-- `TINKER_LOG_FILE=/tmp/tinker_server.log`
-- `TINKER_USAGE_LOG_DIR` to a dev-safe path
-- `RAY_ADDRESS` for the current dev head
+- `RAY_ADDRESS` and `MINT_RAY_CLIENT_ADDRESS` for the current dev head (`ray://<RAY_HEAD_IP>:10001` for Python attach)
 - `PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server`
 - `MINT_VLLM_CHILD_PYTHON_EXECUTABLE=/vePFS-Mindverse/share/code/$USER/tinker-server/scripts/vllm_worker_python.py`
 - `TINKER_RAY_NAMESPACE` and `MINT_RAY_NAMESPACE` to a fresh per-run namespace
-- `MINT_PERSISTENT_MODELS` if you need a reduced dev prewarm set
+- `MINT_SUPPORTED_MODELS` / `MINT_PERSISTENT_MODELS` if you need a reduced dev prewarm set
+- any pinning JSONs and control-plane pin vars needed for your assigned node slice
 - `USE_MBRIDGE_LORA_EXPORT=1` when validating Megatron LoRA sampler export / vLLM hot-load behavior
+
+Why these overrides are still mandatory:
+
+- `configs/dev_volcano.env.sh` is the right dev baseline, but it contains checked-in example values for a specific prior dev setup.
+- In particular, do not trust its checked-in `RAY_ADDRESS`, namespace, or `PFS_TINKER_PATH` for your run.
+- Source it first, then overwrite those run-specific values explicitly.
+
+## Ray Attach Mode On The API Host
+
+Hard rule:
+
+- On `mint-dev`, do not point Python `ray.init(...)` or `scripts/run_server.py` at raw GCS `192.168.39.31:6379`.
+- From the API host, use the Ray client endpoint for Python attach: `ray://<RAY_HEAD_IP>:10001`.
+- Symptom of getting this wrong: startup stalls around Ray attach and logs `Can't find a node_ip_address.json`.
+
+Use this split:
+
+- CLI health checks: `ray status --address=<RAY_HEAD_IP>:6379`
+- Python attach on the API host: `ray.init(address="ray://<RAY_HEAD_IP>:10001")`
+- Isolated API server startup: set both `RAY_ADDRESS` and `MINT_RAY_CLIENT_ADDRESS` to `ray://<RAY_HEAD_IP>:10001`
+
+If a Python attach on the API host still uses `:6379`, stop and fix that first.
+
+## Isolated Debug Server For Path-Based Checkpoints
+
+Use this when you need a private dev server for checkpoint loading or issue-specific evaluation.
+
+Hard rules:
+
+- Use a fresh `TINKER_RAY_NAMESPACE` and the same `MINT_RAY_NAMESPACE`.
+- Use a fresh `MINT_STARTUP_LEASE_ACTOR_NAME`, otherwise the server may come up as a follower and `/asample` can fail because detached stores belong to some other run.
+- Set `MINT_UVICORN_WORKERS=1` for isolated debug bring-up. Multi-worker startup can thrash on the Ray init lock and hide the real issue.
+- If requests will pass absolute checkpoint directories in `model_path` or `state_path`, enable auth with a known admin key (for example `TINKER_API_KEY=dummy`) and send the same key in client requests. Absolute paths are rejected for non-admin requests.
+- If you do not need absolute paths, prefer `mint://...` or `ckpt_...` identifiers.
+
+Minimal isolated bring-up pattern:
+
+```bash
+ssh -f -N -L 8010:localhost:8010 mint-dev
+
+ssh mint-dev 'cat > /tmp/start_tinker_issue.sh <<'\''SH'\'''
+#!/bin/bash
+set -euo pipefail
+cd /root/tinker_project/tinker-server
+. ./configs/dev_volcano.env.sh
+export RAY_ADDRESS=ray://<RAY_HEAD_IP>:10001
+export MINT_RAY_CLIENT_ADDRESS=ray://<RAY_HEAD_IP>:10001
+export PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server
+export MINT_VLLM_CHILD_PYTHON_EXECUTABLE=/vePFS-Mindverse/share/code/$USER/tinker-server/scripts/vllm_worker_python.py
+export TINKER_API_KEY=dummy
+export TINKER_PORT=8010
+export MINT_LOG_FILE=/tmp/tinker_server_issue.log
+export TINKER_USAGE_LOG_DIR=/tmp/tinker_usage_issue
+export TINKER_RAY_NAMESPACE=tinker_<issue>
+export MINT_RAY_NAMESPACE=tinker_<issue>
+export MINT_STARTUP_LEASE_ACTOR_NAME=tinker_startup_lease_<issue>
+export MINT_UVICORN_WORKERS=1
+exec /vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python scripts/run_server.py
+SH
+chmod +x /tmp/start_tinker_issue.sh
+nohup /tmp/start_tinker_issue.sh >> /tmp/tinker_server_issue.log 2>&1 &'
+```
+
+Preflight gate before **any** isolated startup or retry:
+
+1. API-host import probe must pass from the intended issue PFS root.
+2. Ray `runtime_env` import probe must pass using the same `actor_runtime_env(PFS_PYTHONPATH)` path that detached actors will use.
+3. If either probe fails, do **not** start `run_server.py`. Fix the import path first.
+
+API-host import probe:
+
+```bash
+ssh mint-dev 'cd /root/tinker_project/tinker-server-issue-<ISSUE> && \
+  PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/mint-runtime-py31213 \
+  PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server-issue-<ISSUE> \
+  PFS_HF_MODULES_PATH=/vePFS-Mindverse/share/huggingface/modules \
+  PYTHONPATH=/vePFS-Mindverse/share/code/$USER/tinker-server-issue-<ISSUE> \
+  /vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python - <<'\''PY'\'''
+import json
+import os
+import tinker_server
+from tinker_server.runtime_env import build_runtime_pythonpath
+
+print(json.dumps({
+    "tinker_server_file": tinker_server.__file__,
+    "runtime_pythonpath": build_runtime_pythonpath(
+        env_root=os.environ["PFS_RUNTIME_ENV_ROOT"],
+        pfs_tinker_path=os.environ["PFS_TINKER_PATH"],
+        pfs_hf_modules_path=os.environ["PFS_HF_MODULES_PATH"],
+    ),
+}, indent=2))
+PY'
+```
+
+Ray `runtime_env` import probe:
+
+```bash
+ssh mint-dev 'cd /root/tinker_project/tinker-server-issue-<ISSUE> && \
+  PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/mint-runtime-py31213 \
+  PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server-issue-<ISSUE> \
+  PFS_HF_MODULES_PATH=/vePFS-Mindverse/share/huggingface/modules \
+  RAY_ADDRESS=ray://<RAY_HEAD_IP>:10001 \
+  MINT_RAY_CLIENT_ADDRESS=ray://<RAY_HEAD_IP>:10001 \
+  TINKER_RAY_NAMESPACE=tinker_<issue> \
+  MINT_RAY_NAMESPACE=tinker_<issue> \
+  MINT_DETACHED_ACTOR_NODE_IP=<CONTROL_PLANE_IP> \
+  PYTHONPATH=/vePFS-Mindverse/share/code/$USER/tinker-server-issue-<ISSUE> \
+  /vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python - <<'\''PY'\'''
+import json
+import os
+import ray
+from tinker_server.config import PFS_PYTHONPATH, actor_runtime_env
+
+ray.init(address=os.environ["RAY_ADDRESS"], ignore_reinit_error=True)
+
+@ray.remote(num_cpus=0, runtime_env=actor_runtime_env(pythonpath=PFS_PYTHONPATH))
+def probe():
+    import os
+    import sys
+    import tinker_server
+    return {
+        "tinker_server_file": tinker_server.__file__,
+        "pythonpath": os.environ.get("PYTHONPATH", ""),
+        "sys_path_head": sys.path[:8],
+    }
+
+print(json.dumps(ray.get(probe.remote()), indent=2))
+PY'
+```
+
+Hard bans for isolated startup:
+
+- Do **not** invent a new startup command when one retry fails.
+- Do **not** debug `run_server.py` startup until both import probes pass.
+- Do **not** treat `connection reset by peer` as a model bug or server bug before the import probes pass.
+- Do **not** use system `python3` for these probes.
+- Do **not** “quickly test” a modified env inline if you cannot print and verify the exact values first.
+
+Before debugging model behavior, verify this private server can:
+
+1. return `200` on `/api/v1/healthz`;
+2. create a sampling session against the intended checkpoint;
+3. accept one `/api/v1/asample` request.
+
+If one of those fails, fix that first. Do not pretend the model logic is under test yet.
 
 ## Pin Override Discipline
 
-If you source `configs/prod_volcano.env.sh` and then target a different worker slice, you must override **all** relevant pinning variables together.
+If you source `configs/dev_volcano.env.sh` and then target a different worker slice, you must override **all** relevant pinning variables together.
 
 Do not override only one of them.
 
@@ -462,14 +615,13 @@ export LD_LIBRARY_PATH=$TINKER_HOST_TORCH_LIB:/usr/local/cuda/compat/lib:/usr/lo
 
 ```bash
 ssh mint-dev "cd /root/tinker_project/tinker-server && nohup bash -c \
-  \"PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/mint-runtime-py31213 \
-   PFS_HF_MODULES_PATH=/vePFS-Mindverse/share/huggingface/modules \
-   HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
-   PYTHONDONTWRITEBYTECODE=1 \
-   PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server \
-   LD_LIBRARY_PATH=/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/lib/python3.12/site-packages/torch/lib:/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64 \
-   TINKER_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
-   MINT_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
+  \". ./configs/dev_volcano.env.sh && \
+   export RAY_ADDRESS=\${RAY_ADDRESS:?set to ray://<head>:10001} && \
+   export MINT_RAY_CLIENT_ADDRESS=\${MINT_RAY_CLIENT_ADDRESS:-\$RAY_ADDRESS} && \
+   export PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server && \
+   export MINT_VLLM_CHILD_PYTHON_EXECUTABLE=/vePFS-Mindverse/share/code/$USER/tinker-server/scripts/vllm_worker_python.py && \
+   export TINKER_RAY_NAMESPACE=\${TINKER_RAY_NAMESPACE:-tinker_$USER} && \
+   export MINT_RAY_NAMESPACE=\${TINKER_RAY_NAMESPACE:-tinker_$USER} && \
    /vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
 ```
 
@@ -665,14 +817,13 @@ Use this after server-only code changes. If you killed any actors, restart the s
 ```bash
 ssh mint-dev 'pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true'
 ssh mint-dev "cd /root/tinker_project/tinker-server && nohup bash -c \
-  \"PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/mint-runtime-py31213 \
-   PFS_HF_MODULES_PATH=/vePFS-Mindverse/share/huggingface/modules \
-   HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
-   PYTHONDONTWRITEBYTECODE=1 \
-   PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server \
-   LD_LIBRARY_PATH=/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/lib/python3.12/site-packages/torch/lib:/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64 \
-   TINKER_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
-   MINT_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
+  \". ./configs/dev_volcano.env.sh && \
+   export RAY_ADDRESS=\${RAY_ADDRESS:?set to ray://<head>:10001} && \
+   export MINT_RAY_CLIENT_ADDRESS=\${MINT_RAY_CLIENT_ADDRESS:-\$RAY_ADDRESS} && \
+   export PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server && \
+   export MINT_VLLM_CHILD_PYTHON_EXECUTABLE=/vePFS-Mindverse/share/code/$USER/tinker-server/scripts/vllm_worker_python.py && \
+   export TINKER_RAY_NAMESPACE=\${TINKER_RAY_NAMESPACE:-tinker_$USER} && \
+   export MINT_RAY_NAMESPACE=\${TINKER_RAY_NAMESPACE:-tinker_$USER} && \
    /vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
 ```
 
@@ -684,14 +835,13 @@ Use this after vLLM actor code changes, OOM, or switching base model.
 curl -X POST http://localhost:8000/api/v1/kill_vllm
 ssh mint-dev 'pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true'
 ssh mint-dev "cd /root/tinker_project/tinker-server && nohup bash -c \
-  \"PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/mint-runtime-py31213 \
-   PFS_HF_MODULES_PATH=/vePFS-Mindverse/share/huggingface/modules \
-   HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
-   PYTHONDONTWRITEBYTECODE=1 \
-   PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server \
-   LD_LIBRARY_PATH=/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/lib/python3.12/site-packages/torch/lib:/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64 \
-   TINKER_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
-   MINT_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
+  \". ./configs/dev_volcano.env.sh && \
+   export RAY_ADDRESS=\${RAY_ADDRESS:?set to ray://<head>:10001} && \
+   export MINT_RAY_CLIENT_ADDRESS=\${MINT_RAY_CLIENT_ADDRESS:-\$RAY_ADDRESS} && \
+   export PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server && \
+   export MINT_VLLM_CHILD_PYTHON_EXECUTABLE=/vePFS-Mindverse/share/code/$USER/tinker-server/scripts/vllm_worker_python.py && \
+   export TINKER_RAY_NAMESPACE=\${TINKER_RAY_NAMESPACE:-tinker_$USER} && \
+   export MINT_RAY_NAMESPACE=\${TINKER_RAY_NAMESPACE:-tinker_$USER} && \
    /vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
 sleep 80 && curl -s http://localhost:8000/api/v1/healthz
 ```
@@ -704,14 +854,13 @@ Use this after Megatron actor code changes, OOM, or switching base model.
 curl -X POST http://localhost:8000/api/v1/kill_megatron
 ssh mint-dev 'pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true'
 ssh mint-dev "cd /root/tinker_project/tinker-server && nohup bash -c \
-  \"PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/mint-runtime-py31213 \
-   PFS_HF_MODULES_PATH=/vePFS-Mindverse/share/huggingface/modules \
-   HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
-   PYTHONDONTWRITEBYTECODE=1 \
-   PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server \
-   LD_LIBRARY_PATH=/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/lib/python3.12/site-packages/torch/lib:/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64 \
-   TINKER_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
-   MINT_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
+  \". ./configs/dev_volcano.env.sh && \
+   export RAY_ADDRESS=\${RAY_ADDRESS:?set to ray://<head>:10001} && \
+   export MINT_RAY_CLIENT_ADDRESS=\${MINT_RAY_CLIENT_ADDRESS:-\$RAY_ADDRESS} && \
+   export PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server && \
+   export MINT_VLLM_CHILD_PYTHON_EXECUTABLE=/vePFS-Mindverse/share/code/$USER/tinker-server/scripts/vllm_worker_python.py && \
+   export TINKER_RAY_NAMESPACE=\${TINKER_RAY_NAMESPACE:-tinker_$USER} && \
+   export MINT_RAY_NAMESPACE=\${TINKER_RAY_NAMESPACE:-tinker_$USER} && \
    /vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
 curl -s http://localhost:8000/api/v1/healthz
 ```
@@ -766,14 +915,15 @@ ssh mint-dev '/root/.volc/bin/volc ml_task logs -t <head_task_id> -i worker_0' |
 **Safe connectivity check with Ray client mode:**
 ```bash
 ssh mint-dev "/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/ray status --address='<RAY_HEAD_IP>:6379'"
-ssh mint-dev "/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python - <<'PY'\nimport ray\nray.init(address='<RAY_HEAD_IP>:6379')\nprint(ray.cluster_resources())\nray.shutdown()\nPY"
+ssh mint-dev "/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python - <<'PY'\nimport ray\nray.init(address='ray://<RAY_HEAD_IP>:10001')\nprint(ray.cluster_resources())\nray.shutdown()\nPY"
 ```
 
 **Canonical dev server bring-up after cluster rebuild:**
 - 1. Verify the head is healthy with `ray status --address=...`.
-- 2. Verify Python connectivity with `ray.init(address=...)`.
+- 2. Verify Python connectivity from the API host with `ray.init(address='ray://<RAY_HEAD_IP>:10001')`.
 - 3. Then start `scripts/run_server.py`.
 - 4. If `ray.init` fails before startup completes, fix head connectivity first. Do not thrash on server env, healthz, or training logic before the client connection is correct.
+- 5. If you are starting a private issue server, use a fresh namespace, a fresh startup-lease actor name, and `MINT_UVICORN_WORKERS=1`.
 
 **For cluster create/teardown, invoke the `volcano-cluster` skill.**
 
@@ -806,7 +956,7 @@ Before starting any MoE test, run:
 # Quick status command (MANDATORY before any work)
 ssh mint-dev '/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python << "PYEOF"
 import ray
-ray.init(address="<RAY_HEAD_IP>:6379", ignore_reinit_error=True)
+ray.init(address="ray://<RAY_HEAD_IP>:10001", ignore_reinit_error=True)
 r = ray.available_resources()
 t = ray.cluster_resources()
 gpu_avail = r.get("GPU", 0)

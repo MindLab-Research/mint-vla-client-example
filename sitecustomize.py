@@ -415,6 +415,18 @@ def _patch_vllm_ray_executor_use_explicit_cluster_address() -> None:
                     "refusing to start nested local Ray inside EngineCore"
                 )
             addr = env_addr
+
+        # Reuse Mint's Ray init helper so EngineCore children inherit Ray Client
+        # attach hints and temp-dir/node-ip overrides instead of falling back to a
+        # fresh local-driver attach inside the worker process.
+        import ray
+        from tinker_server.ray_utils import init_ray as mint_init_ray
+
+        if not ray.is_initialized():
+            mint_init_ray(
+                address=addr,
+                runtime_env=getattr(parallel_config, "ray_runtime_env", None),
+            )
         return original(parallel_config, ray_address=addr)
 
     initialize_ray_cluster._tinker_patched_explicit_cluster_address = True  # type: ignore[attr-defined]

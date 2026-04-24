@@ -25,6 +25,7 @@ from typing import Any, cast
 import ray
 
 from ..config import config as server_config, otel_env_vars
+from ..ray_utils import register_ray_reconnect_invalidator as _register_ray_reconnect_invalidator
 from . import ray_kill
 
 logger = logging.getLogger(__name__)
@@ -36,9 +37,10 @@ class ResourcePoolStaleError(RuntimeError):
 
 
 class ActorType(Enum):
-    MEGATRON = "megatron"
-    DENSE = "dense"
-    VLLM = "vllm"
+    MEGATRON = "megatron"  # MoE training (8 GPUs)
+    DENSE = "dense"        # Dense training (1 GPU)
+    OPENPI = "openpi"      # OpenPI shared training (1 GPU)
+    VLLM = "vllm"          # Inference (1-4 GPUs)
 
 
 @dataclass
@@ -499,6 +501,8 @@ def _record_to_entry(record: dict[str, Any], *, actor_handle: ActorHandle | None
 def _backend_for_entry(entry: ActorEntry) -> str:
     if entry.actor_type == ActorType.DENSE:
         return "peft"
+    if entry.actor_type == ActorType.OPENPI:
+        return "openpi"
     if entry.actor_type == ActorType.MEGATRON:
         return "megatron"
     return "vllm"
@@ -566,7 +570,6 @@ def _reset_cached_actor_handle() -> None:
     global _RESOURCE_POOL_ACTOR_HANDLE
     _RESOURCE_POOL_ACTOR_HANDLE = None
 
-from ..ray_utils import register_ray_reconnect_invalidator as _register_ray_reconnect_invalidator
 _register_ray_reconnect_invalidator(_reset_cached_actor_handle)
 
 
@@ -736,6 +739,22 @@ def _call_actor_sync(method_name: str, *args, retry_on_actor_restart: bool = Fal
         return ray.get(remote_method.remote(*args, **kwargs))
 
 
+async def _call_actor_async(method_name: str, *args, retry_on_actor_restart: bool = False, **kwargs) -> Any:
+    global _RESOURCE_POOL_ACTOR_HANDLE
+
+    actor = await asyncio.to_thread(_get_or_create_actor_sync)
+    remote_method = getattr(actor, method_name)
+    try:
+        return await _await_ray_ref(remote_method.remote(*args, **kwargs))
+    except Exception:
+        if not retry_on_actor_restart:
+            raise
+        _RESOURCE_POOL_ACTOR_HANDLE = None
+        actor = await asyncio.to_thread(_get_or_create_actor_sync)
+        remote_method = getattr(actor, method_name)
+        return await _await_ray_ref(remote_method.remote(*args, **kwargs))
+
+
 def actor_observability_metadata(actor_handle: ActorHandle | None, *, timeout_s: float = 5.0) -> dict[str, Any] | None:
     if actor_handle is None:
         return None
@@ -778,50 +797,37 @@ def actor_observability_metadata(actor_handle: ActorHandle | None, *, timeout_s:
             )
         if clean_bindings:
             out["gpu_bindings"] = clean_bindings
-    int_fields = (
+    int_fields = {
         "scheduler_waiting_requests",
         "scheduler_running_requests",
         "prefix_cache_queries_total",
         "prefix_cache_hits_total",
         "preemptions_total",
-        "queue_time_s_count",
-        "prefill_time_s_count",
-        "decode_time_s_count",
-        "time_per_output_token_s_count",
         "active_sessions",
         "session_unknown",
         "session_step",
         "gpu_memory_allocated_bytes",
         "gpu_memory_reserved_bytes",
         "gpu_memory_fragmentation_bytes",
-    )
-    float_fields = (
+    }
+    float_fields = {
         "scheduler_kv_cache_usage_ratio",
         "prefix_cache_hit_ratio",
-        "queue_time_s_total",
-        "queue_time_s_max",
-        "prefill_time_s_total",
-        "prefill_time_s_max",
-        "decode_time_s_total",
-        "decode_time_s_max",
-        "time_per_output_token_s_total",
-        "time_per_output_token_s_max",
         "learning_rate",
-    )
-    for src in int_fields:
-        value = payload.get(src)
-        if isinstance(value, (int, float, str)) and str(value).strip():
-            try:
+    }
+    skip_fields = {"hostname", "node_id", "gpu_indices", "gpu_bindings", "rank"}
+    for src, value in payload.items():
+        if src in skip_fields:
+            continue
+        if not isinstance(value, (int, float, str)) or not str(value).strip():
+            continue
+        try:
+            if src in int_fields or src.endswith(("_count", "_bytes")):
                 out[src] = max(0, int(value))
-            except (TypeError, ValueError):
-                pass
-    for src in float_fields:
-        value = payload.get(src)
-        if isinstance(value, (int, float, str)) and str(value).strip():
-            try:
+            elif src in float_fields or src.endswith(("_ratio", "_total", "_max", "_p50_recent", "_p95_recent")):
                 out[src] = max(0.0, float(value))
-            except (TypeError, ValueError):
-                pass
+        except (TypeError, ValueError):
+            pass
     return out or None
 
 
@@ -946,7 +952,11 @@ class ResourcePool:
         self._clear_cached_handle(actor_name)
         if not self._use_detached():
             return bool(self._local(self._local_state.unregister, actor_name))
-        return bool(_call_actor_sync("unregister", actor_name))
+        try:
+            return bool(_call_actor_sync("unregister", actor_name))
+        except ray.exceptions.GetTimeoutError:
+            logger.warning("[ResourcePool] unregister timed out for actor=%s", actor_name)
+            return False
 
     def get(self, actor_name: str) -> ActorEntry | None:
         if not self._use_detached():
@@ -965,6 +975,12 @@ class ResourcePool:
             return
         _call_actor_sync("set_session", actor_name, session_id)
 
+    async def async_set_session(self, actor_name: str, session_id: str | None) -> None:
+        if not self._use_detached():
+            await asyncio.to_thread(self._local, self._local_state.set_session, actor_name, session_id)
+            return
+        await _call_actor_async("set_session", actor_name, session_id)
+
     def set_protected(self, actor_name: str, protected: bool = True) -> bool:
         if not self._use_detached():
             return bool(self._local(self._local_state.set_protected, actor_name, protected))
@@ -979,6 +995,11 @@ class ResourcePool:
         if not self._use_detached():
             return bool(self._local(self._local_state.touch, actor_name))
         return bool(_call_actor_sync("touch", actor_name))
+
+    async def async_touch(self, actor_name: str) -> bool:
+        if not self._use_detached():
+            return bool(await asyncio.to_thread(self._local, self._local_state.touch, actor_name))
+        return bool(await _call_actor_async("touch", actor_name))
 
     def mark_inflight(self, actor_name: str, delta: int) -> None:
         if not self._use_detached():
@@ -1212,6 +1233,7 @@ class ResourcePool:
             }
             handle = entry.actor_handle or self._lookup_handle(entry.actor_name, entry.namespace)
             if handle is None:
+                rec["rss_bytes"] = 0
                 rec["error"] = "missing actor_handle"
                 out.append(rec)
                 continue
@@ -1219,6 +1241,7 @@ class ResourcePool:
                 rss = ray.get(handle.get_rss_bytes.remote(), timeout=float(timeout_s))
                 rec["rss_bytes"] = int(cast(Any, rss))
             except Exception as ex:
+                rec["rss_bytes"] = 0
                 rec["error"] = f"{type(ex).__name__}: {ex}"
             out.append(rec)
         return out

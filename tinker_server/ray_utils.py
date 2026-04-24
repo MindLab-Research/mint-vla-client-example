@@ -87,6 +87,14 @@ def ray_log_to_driver_kwargs() -> dict[str, Any]:
     return {"log_to_driver": ray_log_to_driver_enabled()}
 
 
+def ray_client_working_dir() -> str | None:
+    addr = os.environ.get("RAY_ADDRESS", "").strip()
+    if not addr.startswith("ray://"):
+        return None
+    working_dir = os.environ.get("MINT_RAY_WORKING_DIR", "").strip()
+    return working_dir or None
+
+
 def require_ray_address() -> str:
     addr = os.environ.get("RAY_ADDRESS", "").strip()
     if not addr:
@@ -107,6 +115,10 @@ def preferred_driver_ray_address() -> str:
         f"(or set {_RAY_HEAD_ADDRESS_PATH_ENV}; "
         "optionally set MINT_RAY_CLIENT_ADDRESS or RAY_CLIENT_ADDRESS for the driver)"
     )
+
+
+def _preferred_ray_init_address() -> str:
+    return preferred_driver_ray_address()
 
 
 def preferred_ray_address() -> str | None:
@@ -152,10 +164,13 @@ def _run_ray_reconnect_invalidators() -> None:
 def _driver_runtime_env() -> dict[str, Any]:
     runtime_env: dict[str, Any] = {}
 
+    # Only package a Ray Client working_dir when the operator asks for it.
+    # `PFS_TINKER_PATH` is already a shared cluster path in Mint deployments,
+    # so auto-uploading it through runtime_env just creates redundant node-side
+    # working_dir caches.
     working_dir = (
         os.environ.get("MINT_RAY_JOB_WORKING_DIR", "").strip()
         or os.environ.get("MINT_RAY_WORKING_DIR", "").strip()
-        or os.environ.get("PFS_TINKER_PATH", "").strip()
     )
     if working_dir:
         runtime_env["working_dir"] = working_dir
@@ -171,7 +186,7 @@ def client_job_runtime_env(*, address: str | None = None) -> dict[str, Any] | No
     addr = preferred_ray_address() if address is None else _normalize_ray_address(address)
     if not addr or not addr.startswith("ray://"):
         return None
-    runtime_env = _driver_runtime_env()
+    runtime_env = _job_level_runtime_env(addr, _driver_runtime_env())
     return runtime_env or None
 
 
@@ -241,12 +256,41 @@ def _ray_init_interprocess_lock() -> Iterator[float]:
             lock_fh.close()
 
 
+def _job_level_runtime_env(address: str, existing: Any) -> dict[str, Any] | Any:
+    if not isinstance(address, str) or not address.startswith("ray://"):
+        return existing
+
+    runtime_env: dict[str, Any]
+    if existing is None:
+        runtime_env = {}
+    elif isinstance(existing, dict):
+        runtime_env = dict(existing)
+    else:
+        return existing
+
+    # Ray Client actor creation serializes code on the job side before actor-level
+    # runtime_env takes effect. Only package a job-level working_dir when the
+    # operator explicitly requests it. Auto-packaging `PFS_TINKER_PATH` causes
+    # remote API-host startup to hash/upload the whole shared checkout on every
+    # restart even though that path is already directly visible on the host.
+    job_working_dir = os.environ.get("MINT_RAY_JOB_WORKING_DIR", "").strip()
+    if job_working_dir and "working_dir" not in runtime_env and "py_modules" not in runtime_env:
+        runtime_env["working_dir"] = job_working_dir
+
+    return runtime_env or existing
+
+
 def init_ray(**kwargs: Any) -> Any:
     """Initialize Ray with optional log forwarding to driver.
 
     Adds log_to_driver=True when MINT_RAY_LOG_TO_DRIVER is enabled, unless explicitly
     set by the caller. When the caller leaves address unset or uses "auto", prefer
     the configured head-address file, then Ray Client endpoints, then direct attach.
+
+    When attaching through Ray Client, local repo paths must be supplied at the job
+    level rather than per-actor runtime_env. `MINT_RAY_JOB_WORKING_DIR` provides
+    that path for `ray.init(runtime_env=...)` without forcing every actor runtime_env
+    to use a local-path working_dir, which Ray rejects in client mode.
     """
     import ray
     global _RAY_CONNECTION_EPOCH, _RAY_LAST_INIT_ADDRESS
@@ -262,15 +306,20 @@ def init_ray(**kwargs: Any) -> Any:
                 f"(or set {_RAY_HEAD_ADDRESS_PATH_ENV}; "
                 "optionally set MINT_RAY_CLIENT_ADDRESS or RAY_CLIENT_ADDRESS for the driver)"
             )
-        kwargs["address"] = configured_address
+        desired_address: Any = configured_address
     elif isinstance(current, str):
-        kwargs["address"] = _normalize_ray_address(current.strip())
+        desired_address = _normalize_ray_address(current.strip())
+    else:
+        desired_address = current
+    kwargs["address"] = desired_address
 
-    desired_address = str(kwargs["address"])
-
-    runtime_env = client_job_runtime_env(address=desired_address)
+    existing_runtime_env = kwargs.get("runtime_env")
+    if existing_runtime_env is None:
+        runtime_env = client_job_runtime_env(address=desired_address)
+    else:
+        runtime_env = _job_level_runtime_env(desired_address, existing_runtime_env)
     if runtime_env is not None:
-        kwargs.setdefault("runtime_env", runtime_env)
+        kwargs["runtime_env"] = runtime_env
 
     node_ip = os.environ.get("MINT_RAY_NODE_IP_ADDRESS", "").strip()
     if node_ip and "_node_ip_address" not in kwargs:
@@ -279,6 +328,19 @@ def init_ray(**kwargs: Any) -> Any:
     temp_dir = os.environ.get("MINT_RAY_TEMP_DIR", "").strip()
     if temp_dir and "_temp_dir" not in kwargs:
         kwargs["_temp_dir"] = temp_dir
+
+    job_working_dir = os.environ.get("MINT_RAY_JOB_WORKING_DIR", "").strip()
+    if job_working_dir:
+        runtime_env = dict(kwargs.get("runtime_env") or {})
+        runtime_env.setdefault("working_dir", job_working_dir)
+        kwargs["runtime_env"] = runtime_env
+    else:
+        working_dir = ray_client_working_dir()
+        runtime_env = kwargs.get("runtime_env")
+        if working_dir and (runtime_env is None or isinstance(runtime_env, dict)):
+            payload = {} if runtime_env is None else dict(runtime_env)
+            payload.setdefault("working_dir", working_dir)
+            kwargs["runtime_env"] = payload
 
     for k, v in ray_log_to_driver_kwargs().items():
         kwargs.setdefault(k, v)

@@ -3,10 +3,11 @@
 These types match the tinker client API for compatibility.
 """
 
+import base64
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
 
 
 class EncodedTextChunk(BaseModel):
@@ -15,24 +16,109 @@ class EncodedTextChunk(BaseModel):
     tokens: list[int]
     type: Literal["encoded_text"] = "encoded_text"
 
+    @property
+    def length(self) -> int:
+        return len(self.tokens)
+
+
+class ImageAssetPointerChunk(BaseModel):
+    """A pointer to an image asset plus its expected token footprint."""
+
+    format: Literal["png", "jpeg"]
+    location: str
+    expected_tokens: int | None = None
+    type: Literal["image_asset_pointer"] = "image_asset_pointer"
+
+    @property
+    def length(self) -> int:
+        if self.expected_tokens is None:
+            raise ValueError("ImageAssetPointerChunk expected_tokens needs to be set in order to compute the length")
+        return self.expected_tokens
+
+
+class ImageChunk(BaseModel):
+    """Inline image bytes plus their expected token footprint."""
+
+    data: bytes
+    format: Literal["png", "jpeg"]
+    expected_tokens: int | None = None
+    type: Literal["image"] = "image"
+
+    @field_validator("data", mode="before")
+    @classmethod
+    def validate_data(cls, value: bytes | str) -> bytes:
+        if isinstance(value, str):
+            return base64.b64decode(value)
+        return value
+
+    @field_serializer("data")
+    def serialize_data(self, value: bytes) -> str:
+        return base64.b64encode(value).decode("utf-8")
+
+    @property
+    def length(self) -> int:
+        if self.expected_tokens is None:
+            raise ValueError("ImageChunk expected_tokens needs to be set in order to compute the length")
+        return self.expected_tokens
+
+
+ModelInputChunk = Annotated[
+    EncodedTextChunk | ImageAssetPointerChunk | ImageChunk,
+    Field(discriminator="type"),
+]
+
 
 class ModelInput(BaseModel):
     """Input to the model as a list of chunks."""
 
-    chunks: list[EncodedTextChunk]
+    chunks: list[ModelInputChunk]
+
+    @field_validator("chunks", mode="before")
+    @classmethod
+    def _normalize_legacy_chunks(cls, value: Any) -> Any:
+        if not isinstance(value, list):
+            return value
+        normalized: list[Any] = []
+        for chunk in value:
+            if not isinstance(chunk, dict) or "type" in chunk:
+                normalized.append(chunk)
+                continue
+            if "tokens" in chunk:
+                normalized.append({"type": "encoded_text", **chunk})
+                continue
+            if "data" in chunk and "format" in chunk:
+                normalized.append({"type": "image", **chunk})
+                continue
+            if "location" in chunk and "format" in chunk:
+                normalized.append({"type": "image_asset_pointer", **chunk})
+                continue
+            normalized.append(chunk)
+        return normalized
+
+    @property
+    def length(self) -> int:
+        return sum(chunk.length for chunk in self.chunks)
+
+    def to_ints(self) -> list[int]:
+        if not all(isinstance(chunk, EncodedTextChunk) for chunk in self.chunks):
+            raise ValueError(
+                "to_ints only supported for ModelInput with EncodedTextChunks, "
+                f"got {[type(chunk).__name__ for chunk in self.chunks]}"
+            )
+        return [token for chunk in self.chunks for token in chunk.tokens]
 
     def to_token_ids(self) -> list[int]:
-        """Flatten all chunks into a single list of token IDs."""
-        tokens = []
-        for chunk in self.chunks:
-            if chunk.type == "encoded_text":
-                tokens.extend(chunk.tokens)
-        return tokens
+        """Backward-compatible alias for strict text-only flattening."""
+        return self.to_ints()
 
     @classmethod
     def from_ints(cls, tokens: list[int]) -> "ModelInput":
         """Create ModelInput from a list of token IDs."""
         return cls(chunks=[EncodedTextChunk(tokens=tokens)])
+
+    @classmethod
+    def empty(cls) -> "ModelInput":
+        return cls(chunks=[])
 
 
 class SamplingParams(BaseModel):
@@ -178,6 +264,21 @@ class CreateSamplingSessionResponse(BaseModel):
     sampling_session_id: str
 
 
+class CreateActionSessionRequest(BaseModel):
+    """Request to create an action inference session."""
+
+    session_id: str
+    action_session_seq_id: int | None = None
+    base_model: str | None = None
+    model_path: str | None = None
+
+
+class CreateActionSessionResponse(BaseModel):
+    """Response from action session creation."""
+
+    action_session_id: str
+
+
 class UntypedAPIFuture(BaseModel):
     """An async operation handle that can be polled for results."""
 
@@ -266,6 +367,8 @@ class TrainingRun(BaseModel):
     corrupted: bool
     lora_rank: int | None = None
     last_request_time: str | None = None
+    last_activity: float | None = None
+    idle_for_s: float | None = None
     last_checkpoint: Any | None = None
     last_sampler_checkpoint: Any | None = None
     user_metadata: dict[str, Any] | None = None
@@ -314,6 +417,24 @@ class TensorData(BaseModel):
     data: list[float] | float
     shape: list[int]
     dtype: str = "float32"
+
+
+class ActRequest(BaseModel):
+    """Request to run action inference."""
+
+    action_session_id: str
+    seq_id: int | None = None
+    observation: ModelInput
+    extra_inputs: dict[str, TensorData] = {}
+    temperature: float | None = None
+
+
+class ActResponse(BaseModel):
+    """Response containing action outputs."""
+
+    actions: TensorData
+    policy_timing: dict[str, float] | None = None
+    type: Literal["act"] = "act"
 
 
 class LossFnOutput(BaseModel):
@@ -651,9 +772,9 @@ class SaveWeightsForSamplerRequest(BaseModel):
     model_id: str
     path: str | None = None  # checkpoint name for named save (None for ephemeral)
     ttl_seconds: int | None = None
+    retry: bool = False
     seq_id: int | None = None
     sampling_session_seq_id: int | None = None  # For ephemeral flow
-    use_per_expert_lora: bool = False  # If True, expand shared MLP LoRA to per-expert format for MoE
     type: Literal["save_weights_for_sampler"] = "save_weights_for_sampler"
 
 
@@ -678,6 +799,7 @@ class SaveStateRequest(BaseModel):
     model_id: str
     path: str | None = None  # checkpoint name, e.g. "checkpoint-100"
     ttl_seconds: int | None = None
+    retry: bool = False
     seq_id: int | None = None
     type: Literal["save_weights"] = "save_weights"
 

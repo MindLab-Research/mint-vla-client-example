@@ -4,7 +4,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
 
-from .types import ModelInput, TensorData
+from .types import AdamParams, ModelInput, TensorData
 
 
 class MintBaseModel(BaseModel):
@@ -15,6 +15,7 @@ class InterpolateCheckpointsRequest(MintBaseModel):
     source_paths: list[str]
     coefficients: list[float]
     output_path: str | None = None
+    retry: bool = False
     output_checkpoint_type: Literal["sampler"] = "sampler"
     type: Literal["mint_interpolate_checkpoints"] = "mint_interpolate_checkpoints"
 
@@ -52,3 +53,45 @@ class ForwardBackwardReverseKLResponse(MintBaseModel):
     outputs: list[ReverseKLItemOutput]
     metrics: dict[str, float]
     type: Literal["mint_forward_backward_reverse_kl"] = "mint_forward_backward_reverse_kl"
+
+
+class VLAObservation(MintBaseModel):
+    model_input: ModelInput
+    state: TensorData
+
+
+class VLADatum(MintBaseModel):
+    observation: VLAObservation
+    supervision: dict[str, TensorData]
+
+
+class VLATrainStepRequest(MintBaseModel):
+    model_id: str
+    data: list[VLADatum]
+    loss_fn: str
+    loss_fn_config: dict[str, Any] | None = None
+    adam_params: AdamParams | None = None
+    seq_id: int | None = None
+    type: Literal["mint_vla_train_step"] = "mint_vla_train_step"
+
+
+class MintCreateActionSessionRequest(MintBaseModel):
+    session_id: str
+    action_session_seq_id: int | None = None
+    base_model: str | None = None
+    model_path: str | None = None
+
+
+class MintCreateActionSessionResponse(MintBaseModel):
+    action_session_id: str
+
+
+class VLAActRequest(MintBaseModel):
+    seq_id: int | None = None
+    observation: VLAObservation
+    temperature: float | None = None
+
+
+class MintDeleteActionSessionResponse(MintBaseModel):
+    action_session_id: str
+    status: Literal["deleted"] = "deleted"

@@ -23,6 +23,28 @@ logger = logging.getLogger(__name__)
 # computation, etc.), so use a longer timeout than inference (30 min).
 DEFAULT_TRAINING_INACTIVITY_TIMEOUT = 3600
 
+TRAINING_SESSION_METADATA_VERSION = 2
+MATERIALIZATION_STATE_UNMATERIALIZED = "unmaterialized"
+MATERIALIZATION_STATE_MATERIALIZING = "materializing"
+MATERIALIZATION_STATE_READY = "ready"
+MATERIALIZATION_STATE_FAILED = "failed"
+MATERIALIZATION_STATE_DELETED = "deleted"
+
+_VALID_MATERIALIZATION_STATES = {
+    MATERIALIZATION_STATE_UNMATERIALIZED,
+    MATERIALIZATION_STATE_MATERIALIZING,
+    MATERIALIZATION_STATE_READY,
+    MATERIALIZATION_STATE_FAILED,
+    MATERIALIZATION_STATE_DELETED,
+}
+
+
+def normalize_materialization_state(value: Any) -> str:
+    state = str(value or "").strip().lower()
+    if state in _VALID_MATERIALIZATION_STATES:
+        return state
+    return MATERIALIZATION_STATE_READY
+
 
 @dataclass
 class TrainingSession:
@@ -47,7 +69,13 @@ class TrainingSession:
     last_activity: float = field(default_factory=time.time)
     inflight_ops: int = 0  # Prevent cleanup while requests are queued or running
     backend: str = "peft"  # "peft" for dense models, "megatron" for MoE
-    metadata_version: int = 1  # Monotonic metadata version for cache coherence
+    metadata_version: int = TRAINING_SESSION_METADATA_VERSION  # Monotonic metadata version for cache coherence
+    materialization_state: str = MATERIALIZATION_STATE_READY
+    tokenizer_info: dict[str, Any] | None = None
+    tokenizer_identity: str | None = None
+    tokenizer_source_path: str | None = None
+    actor_name: str | None = None
+    namespace: str | None = None
     pending_persist: bool = True  # Local create path before detached state is visible
 
     # Per-session inference engine for isolated concurrent access
@@ -71,6 +99,7 @@ class TrainingSession:
             "created_at": self.created_at,
             "learning_rate": self.learning_rate,
             "backend": self.backend,
+            "materialization_state": self.materialization_state,
         }
 
 
@@ -126,7 +155,14 @@ class TrainingSessionManager:
         user_metadata: dict | None = None,
         user_id: str | None = None,
         learning_rate: float = 1e-4,
+        backend: str | None = None,
         metadata_version: int | None = None,
+        materialization_state: str | None = None,
+        tokenizer_info: dict[str, Any] | None = None,
+        tokenizer_identity: str | None = None,
+        tokenizer_source_path: str | None = None,
+        actor_name: str | None = None,
+        namespace: str | None = None,
     ) -> TrainingSession:
         """Create a new training session.
 
@@ -159,7 +195,17 @@ class TrainingSessionManager:
             rollout_correction_config=rollout_correction_config,
             user_metadata=user_metadata or {},
             learning_rate=learning_rate,
-            metadata_version=max(1, int(metadata_version) if metadata_version is not None else 1),
+            backend=str(backend) if backend else "peft",
+            metadata_version=max(
+                1,
+                int(metadata_version) if metadata_version is not None else TRAINING_SESSION_METADATA_VERSION,
+            ),
+            materialization_state=normalize_materialization_state(materialization_state),
+            tokenizer_info=dict(tokenizer_info) if isinstance(tokenizer_info, dict) else None,
+            tokenizer_identity=str(tokenizer_identity) if tokenizer_identity else None,
+            tokenizer_source_path=str(tokenizer_source_path) if tokenizer_source_path else None,
+            actor_name=str(actor_name) if actor_name else None,
+            namespace=str(namespace) if namespace else None,
         )
 
         session.pending_persist = True
@@ -204,6 +250,12 @@ class TrainingSessionManager:
             return None
 
         incoming_version = max(1, int(info.get("metadata_version") or 1))
+        incoming_state = normalize_materialization_state(info.get("materialization_state"))
+        incoming_tokenizer_info = info.get("tokenizer_info") if isinstance(info.get("tokenizer_info"), dict) else None
+        incoming_tokenizer_identity = str(info.get("tokenizer_identity") or "") or None
+        incoming_tokenizer_source_path = str(info.get("tokenizer_source_path") or "") or None
+        incoming_actor_name = str(info.get("actor_name") or "") or None
+        incoming_namespace = str(info.get("namespace") or "") or None
         session = self._sessions.get(model_id)
 
         lora_cfg = None
@@ -227,9 +279,21 @@ class TrainingSessionManager:
                 user_id=info.get("user_id"),
                 learning_rate=float(info.get("learning_rate", 1e-4)),
                 metadata_version=incoming_version,
+                materialization_state=incoming_state,
+                tokenizer_info=incoming_tokenizer_info,
+                tokenizer_identity=incoming_tokenizer_identity,
+                tokenizer_source_path=incoming_tokenizer_source_path,
+                actor_name=incoming_actor_name,
+                namespace=incoming_namespace,
             )
             before = TrainingSession(**vars(session))
             session.backend = str(info.get("backend", session.backend))
+            session.materialization_state = incoming_state
+            session.tokenizer_info = dict(incoming_tokenizer_info) if incoming_tokenizer_info is not None else None
+            session.tokenizer_identity = incoming_tokenizer_identity
+            session.tokenizer_source_path = incoming_tokenizer_source_path
+            session.actor_name = incoming_actor_name
+            session.namespace = incoming_namespace
             session.pending_persist = False
             try:
                 session.current_step = int(info.get("current_step", session.current_step))
@@ -248,6 +312,18 @@ class TrainingSessionManager:
                     session.last_activity = max(session.last_activity, float(raw_last_activity))
             except Exception:
                 pass
+            if session.tokenizer_info is None and incoming_tokenizer_info is not None:
+                session.tokenizer_info = dict(incoming_tokenizer_info)
+            if session.tokenizer_identity is None and incoming_tokenizer_identity is not None:
+                session.tokenizer_identity = incoming_tokenizer_identity
+            if session.tokenizer_source_path is None and incoming_tokenizer_source_path is not None:
+                session.tokenizer_source_path = incoming_tokenizer_source_path
+            if incoming_actor_name is not None:
+                session.actor_name = incoming_actor_name
+            if incoming_namespace is not None:
+                session.namespace = incoming_namespace
+            if incoming_state != MATERIALIZATION_STATE_READY or not session.is_active:
+                session.materialization_state = incoming_state
             return session
         else:
             before = TrainingSession(**vars(session))
@@ -263,6 +339,12 @@ class TrainingSessionManager:
             except Exception:
                 pass
             session.backend = str(info.get("backend", session.backend))
+            session.materialization_state = incoming_state
+            session.tokenizer_info = dict(incoming_tokenizer_info) if incoming_tokenizer_info is not None else None
+            session.tokenizer_identity = incoming_tokenizer_identity
+            session.tokenizer_source_path = incoming_tokenizer_source_path
+            session.actor_name = incoming_actor_name
+            session.namespace = incoming_namespace
             try:
                 session.current_step = max(session.current_step, int(info.get("current_step", session.current_step)))
             except Exception:
@@ -287,6 +369,9 @@ class TrainingSessionManager:
         if session is not None:
             session.pending_persist = False
 
+    def get_local_session(self, model_id: str) -> TrainingSession | None:
+        return self._sessions.get(model_id)
+
     def get_session(self, model_id: str) -> TrainingSession | None:
         """Get training session by model_id.
 
@@ -295,19 +380,19 @@ class TrainingSessionManager:
         """
         session = self._sessions.get(model_id)
         if session is not None and bool(getattr(session, "pending_persist", False)):
-            return session
+            return None
 
         try:
             from .training_session_store import get_training_session_info
 
             info = get_training_session_info(model_id)
         except Exception:
-            return session
+            return None
 
         if not isinstance(info, dict):
             if session is not None and not bool(getattr(session, "pending_persist", False)):
                 self._sessions.pop(model_id, None)
-            return session if session is not None and bool(getattr(session, "pending_persist", False)) else None
+            return None
 
         restored = self.restore_training_session_info(info)
         if restored is not None:
@@ -491,26 +576,44 @@ class TrainingSessionManager:
 
     async def _cleanup_inactive(self) -> None:
         """Cleanup training sessions inactive for longer than timeout."""
-        for model_id, session in list(self._sessions.items()):
-            try:
-                from .training_session_store import async_get_training_session_info
+        try:
+            from .training_session_store import async_list_training_sessions
 
-                detached = await async_get_training_session_info(model_id)
+            detached_infos = await async_list_training_sessions()
+        except Exception:
+            return
+
+        detached_by_id: dict[str, dict[str, Any]] = {}
+        for info in detached_infos:
+            if not isinstance(info, dict):
+                continue
+            model_id = str(info.get("model_id") or "")
+            if not model_id:
+                continue
+            detached_by_id[model_id] = info
+            self.restore_training_session_info(info)
+
+        for model_id in list(self._sessions.keys()):
+            if model_id not in detached_by_id and not bool(getattr(self._sessions[model_id], "pending_persist", False)):
+                self.delete_session(model_id)
+
+        for model_id, session in list(self._sessions.items()):
+            detached = detached_by_id.get(model_id)
+            if not isinstance(detached, dict):
+                continue
+            try:
+                session.last_activity = max(
+                    float(session.last_activity),
+                    float(detached.get("last_activity", session.last_activity)),
+                )
             except Exception:
-                detached = None
-            if isinstance(detached, dict):
-                try:
-                    session.last_activity = max(
-                        float(session.last_activity),
-                        float(detached.get("last_activity", session.last_activity)),
-                    )
-                except Exception:
-                    pass
+                pass
 
         now = time.time()
         inactive = [
             model_id
             for model_id, session in self._sessions.items()
+            if model_id in detached_by_id
             if session.inflight_ops == 0
             if now - session.last_activity > self._inactivity_timeout
         ]
@@ -555,6 +658,7 @@ class TrainingSessionManager:
                     f"Failed to delete training session {model_id} "
                     f"during idle cleanup: {e}"
                 )
+                return
 
         # 2. Shutdown per-session inference engine if present
         if session.inference_engine is not None:

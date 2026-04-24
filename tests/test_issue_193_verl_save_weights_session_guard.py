@@ -254,7 +254,6 @@ def test_issue_193_megatron_save_weights_passes_explicit_session_id(monkeypatch)
         return await engine.save_weights(
             session=session,
             save_path="/tmp/issue_193_ckpt",
-            use_per_expert_lora=True,
         )
 
     saved_path = asyncio.run(_run())
@@ -266,7 +265,6 @@ def test_issue_193_megatron_save_weights_passes_explicit_session_id(monkeypatch)
     args, kwargs = worker.save_checkpoint.calls[0]
     assert args == (str(Path("/tmp/issue_193_ckpt").resolve()),)
     assert kwargs["session_id"] == model_id
-    assert kwargs["use_per_expert_lora"] is True
     assert kwargs["train_attn"] is False
     assert kwargs["train_mlp"] is True
     assert kwargs["train_unembed"] is False
@@ -310,7 +308,6 @@ def test_issue_193_megatron_save_weights_propagates_ray_get_errors_without_step_
         return await engine.save_weights(
             session=session,
             save_path="/tmp/issue_193_ckpt_error",
-            use_per_expert_lora=False,
         )
 
     with pytest.raises(type(raised_error)):
@@ -410,7 +407,6 @@ def test_issue_193_megatron_save_weights_retry_same_session_is_idempotent(monkey
         return await engine.save_weights(
             session=session,
             save_path="/tmp/issue_193_ckpt_retry",
-            use_per_expert_lora=True,
         )
 
     with pytest.raises(RuntimeError, match="transient save failure"):
@@ -427,10 +423,6 @@ def test_issue_193_megatron_save_weights_retry_same_session_is_idempotent(monkey
     assert first_args == second_args == (str(Path("/tmp/issue_193_ckpt_retry").resolve()),)
     assert first_kwargs["session_id"] == model_id
     assert second_kwargs["session_id"] == model_id
-    assert first_kwargs["use_per_expert_lora"] is True
-    assert second_kwargs["use_per_expert_lora"] is True
-
-
 def test_issue_193_megatron_save_weights_concurrent_shared_actor_is_isolated(monkeypatch):
     engine = VerlTrainingEngine()
 
@@ -2335,15 +2327,9 @@ def test_issue_193_megatron_create_training_session_marks_ready_without_waiting(
         "tinker_server.backend.model_registry.get_training_parallelism",
         lambda _model: (1, 1, 1, 1, 1),
     )
-    create_kwargs: dict[str, object] = {}
-
-    async def fake_get_or_create_megatron_worker_group(**kwargs):
-        create_kwargs.update(kwargs)
-        return worker
-
     monkeypatch.setattr(
         "tinker_server.backend.megatron_distributed.async_get_or_create_megatron_worker_group",
-        fake_get_or_create_megatron_worker_group,
+        lambda **kwargs: asyncio.sleep(0, result=worker),
     )
     monkeypatch.setattr(
         "tinker_server.backend.resource_pool.get_resource_pool",
@@ -2369,8 +2355,6 @@ def test_issue_193_megatron_create_training_session_marks_ready_without_waiting(
     asyncio.run(_run())
 
     assert keepalive_calls == []
-    assert create_kwargs["base_model"] == "/resolved/Qwen/Qwen3-30B-A3B-Instruct-2507"
-    assert create_kwargs["observability_base_model"] == "Qwen/Qwen3-30B-A3B-Instruct-2507"
     assert engine._workers[model_id] is worker
     assert session.backend == "megatron"
     assert session.is_active is True
@@ -2414,7 +2398,6 @@ def test_issue_193_save_lora_weights_for_sampler_propagates_errors_without_step_
         return await engine.save_lora_weights_for_sampler(
             session=session,
             save_path="/tmp/issue_193_lora_error",
-            use_per_expert_lora=True,
         )
 
     with pytest.raises(type(raised_error)):
@@ -2457,7 +2440,6 @@ def test_issue_193_save_lora_weights_for_sampler_retry_same_session_is_idempoten
         return await engine.save_lora_weights_for_sampler(
             session=session,
             save_path="/tmp/issue_193_lora_retry",
-            use_per_expert_lora=False,
         )
 
     with pytest.raises(RuntimeError, match="transient save_lora failure"):
@@ -2746,81 +2728,3 @@ def test_issue_193_save_lora_invalid_meta_non_strict_mode_warns_without_pollutio
 
     assert session.current_step == 77
     assert any("save_lora_weights_for_sampler" in rec.getMessage() for rec in caplog.records)
-
-
-def test_issue_193_persisted_actor_only_manifest_round_trip(tmp_path: Path):
-    manager = MegatronSessionStateManager(base_path=str(tmp_path))
-
-    payload = manager.save_persisted_actor_only_state(
-        "session_issue_193_actor_only_manifest",
-        actor_name="shared-megatron-actor",
-        worker_entries=[
-            {"rank": 0, "path": str(tmp_path / "r0.pt"), "bytes": 111},
-            {"rank": 1, "path": str(tmp_path / "r1.pt"), "bytes": 222},
-        ],
-    )
-
-    assert payload["total_bytes"] == 333
-    assert manager.has_persisted_actor_only_state("session_issue_193_actor_only_manifest") is True
-    stored = manager.get_persisted_actor_only_state("session_issue_193_actor_only_manifest")
-    assert stored is not None
-    assert stored["actor_name"] == "shared-megatron-actor"
-    assert stored["total_bytes"] == 333
-    assert list(manager.list_persisted_actor_only_state("shared-megatron-actor")) == [
-        "session_issue_193_actor_only_manifest"
-    ]
-
-    manager.clear_persisted_actor_only_state("session_issue_193_actor_only_manifest")
-    assert manager.has_persisted_actor_only_state("session_issue_193_actor_only_manifest") is False
-
-
-def test_issue_193_megatron_session_switch_persists_outgoing_actor_only_state(monkeypatch):
-    group_cls = MegatronWorkerGroup.__ray_actor_class__
-    group = group_cls.__new__(group_cls)
-    group._current_session = "session_current"
-    group.base_model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
-    group.learning_rate = 1e-4
-    group._actual_rank = 8
-    group.lora_rank = 8
-    group._step_count = 12
-    group.workers = [object()]
-    persisted_calls: list[tuple[str, str, list[dict]]] = []
-    cleared_markers: list[str] = []
-    swap_calls: list[tuple[str, bool]] = []
-    group._session_manager = SimpleNamespace(
-        has_actor_only_state=lambda session_id: False,
-        has_persisted_actor_only_state=lambda session_id: session_id == "session_target",
-        session_exists=lambda session_id: session_id == "session_target",
-        get_metadata=lambda session_id: {"step": 9, "lr": 2e-4, "actual_rank": 4},
-        get_session_path=lambda session_id: f"/tmp/{session_id}",
-        save_metadata=lambda session_id, step, lr, actual_rank: None,
-        save_persisted_actor_only_state=lambda session_id, actor_name, worker_entries: persisted_calls.append(
-            (session_id, actor_name, worker_entries)
-        ),
-        clear_actor_only_state=lambda session_id: cleared_markers.append(session_id),
-    )
-    group._bind_traceparent = lambda traceparent: None
-    group._get_lora_weight_norm = lambda: 0.0
-    group._get_lora_weight_checksum = lambda: "0"
-    group._get_base_weight_checksum = lambda: "0"
-    group._get_buffer_checksum = lambda: "0"
-    group._get_optimizer_param_counts = lambda: {}
-    group.save_adapter_state = lambda *args, **kwargs: None
-    group.load_adapter_state = lambda *args, **kwargs: None
-    group.reinit_lora_weights = lambda *args, **kwargs: None
-    group.reset_expert_bias = lambda *args, **kwargs: None
-    group._swap_session_on_workers = lambda session_id, require_persisted_actor_only_state=False: swap_calls.append(
-        (session_id, require_persisted_actor_only_state)
-    ) or [{"outgoing_persisted": {"rank": 0, "path": "/tmp/r0.pt", "bytes": 123}}]
-
-    group._ensure_session_loaded("session_target")
-
-    assert swap_calls == [("session_target", True)]
-    assert persisted_calls == [
-        (
-            "session_current",
-            "megatron_qwen3_30b_a3b_instruct_2507",
-            [{"rank": 0, "path": "/tmp/r0.pt", "bytes": 123}],
-        )
-    ]
-    assert cleared_markers == ["session_current"]

@@ -18,9 +18,9 @@ class _ServerSection(BaseModel):
     port: int | None = None
 
     internal_api_token: str | None = None
-    usage_log_dir: str | None = None  # deprecated, kept for compatibility
-    usage_backend: str | None = None
-    usage_pg_dsn: str | None = None
+    usage_log_dir: str | None = None  # active JSONL sink
+    usage_backend: str | None = None  # deprecated compatibility field; if set, it must remain 'postgres'
+    usage_pg_dsn: str | None = None  # deprecated, ignored by the producer path
     usage_pg_host: str | None = None
     usage_pg_port: int | None = None
     usage_pg_database: str | None = None
@@ -30,6 +30,8 @@ class _ServerSection(BaseModel):
     usage_pg_pool_max: int | None = None
     usage_write_timeout_ms: int | None = None
     usage_pg_table: str | None = None
+    checkpoint_index_pg_dsn: str | None = None
+    checkpoint_index_write_timeout_ms: int | None = None
     skip_actor_cleanup: bool | None = None
 
     tensor_parallel_size: int | None = None
@@ -97,6 +99,8 @@ class _FutureStoreSection(BaseModel):
     replay_hot_ttl_s: float | None = None
     replay_disk_ttl_s: float | None = None
     replay_sweep_interval_s: float | None = None
+    retrieve_future_grace_s: float | None = None
+    retrieve_future_min_poll_s: float | None = None
 
 
 class _TrainingSection(BaseModel):

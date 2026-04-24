@@ -8,9 +8,16 @@ description: |
   and report a final incident report to a Feishu bot when issues are encountered.
 
   Triggers: "sanity check", "sanity-check", "prod sanity", "production sanity"
+
+  Procedure contract: read this SKILL.md end-to-end before acting. Do not slice it on demand or use it as a lookup table mid-run.
 ---
 
 # sanity-check
+
+Procedure contract:
+- Read this SKILL.md end-to-end before taking any action.
+- Do not sample sections opportunistically while already in motion.
+- If the procedure is missing something important, update the skill. Do not improvise around the gap.
 
 Hard rules:
 - Production only. Refuse to run if base URL points to dev (port 8000).

@@ -8,9 +8,16 @@ description: |
   Triggers: "create cluster", "tear down", "list tasks", "cancel task", "Ray dashboard", "stale actor", "GPU", "volc"
 
   This skill covers generic Volcano/Ray operations. For environment-specific server operations, use mint-dev or mint-prod.
+
+  Procedure contract: read this SKILL.md end-to-end before acting. Do not slice it on demand or use it as a lookup table mid-run.
 ---
 
 # Volcano Cluster Management
+
+Procedure contract:
+- Read this SKILL.md end-to-end before taking any action.
+- Do not sample sections opportunistically while already in motion.
+- If the procedure is missing something important, update the skill. Do not improvise around the gap.
 
 ## Quick Reference
 

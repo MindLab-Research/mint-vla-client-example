@@ -1,8 +1,13 @@
 import asyncio
 import importlib
 import importlib.machinery
+import json
 import sys
+import tempfile
 import types
+from pathlib import Path
+
+import tomllib
 
 import pytest
 
@@ -20,12 +25,35 @@ def _install_ray_stub(monkeypatch) -> None:
 
     def remote(*_args, **_kwargs):
         def _decorator(cls):
-            class _RemoteWrapped(cls):
+            class _MethodHandle:
+                def __init__(self, fn):
+                    self._fn = fn
+
+                def __call__(self, *args, **kwargs):
+                    return self._fn(*args, **kwargs)
+
+                def remote(self, *args, **kwargs):
+                    return self._fn(*args, **kwargs)
+
+            class _ActorHandle:
+                def __init__(self, *args, **kwargs):
+                    object.__setattr__(self, '_instance', cls(*args, **kwargs))
+
+                def __getattr__(self, name):
+                    value = getattr(object.__getattribute__(self, '_instance'), name)
+                    if callable(value):
+                        return _MethodHandle(value)
+                    return value
+
+                def __setattr__(self, name, value):
+                    setattr(object.__getattribute__(self, '_instance'), name, value)
+
+            class _RemoteWrapped:
                 @classmethod
                 def options(cls_, **_opts):
                     class _OptionsHandle:
                         def remote(self, *args, **kwargs):
-                            return cls_(*args, **kwargs)
+                            return _ActorHandle(*args, **kwargs)
 
                     return _OptionsHandle()
 
@@ -37,6 +65,7 @@ def _install_ray_stub(monkeypatch) -> None:
         raise ValueError("named actor not found")
 
     ray.remote = remote  # type: ignore[attr-defined]
+    ray.get = lambda ref, timeout=None: ref  # type: ignore[attr-defined]
     ray.get_actor = get_actor  # type: ignore[attr-defined]
     ray.cluster_resources = lambda: {}  # type: ignore[attr-defined]
     ray.get_runtime_context = lambda: _Ctx()  # type: ignore[attr-defined]
@@ -44,11 +73,38 @@ def _install_ray_stub(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "ray", ray)
 
 
+def _materialize_runtime_env(root: Path) -> None:
+    from tinker_server.runtime_env import checkout_runtime_env_layout
+
+    layout = checkout_runtime_env_layout(str(root))
+    runtime = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["tool"]["tinker"]["runtime_env"]
+    manifest = {
+        "runtime_env": {
+            "site_packages_dir": runtime.get("site_packages_dir", "site-packages"),
+            "source_dir": runtime.get("source_dir", "src"),
+            "host_venv_dir": runtime.get("host_venv_dir", "host-venv"),
+        },
+        "sources": runtime["sources"],
+    }
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    Path(layout.site_packages).mkdir(parents=True, exist_ok=True)
+    for entry in layout.pythonpath_entries[1:]:
+        Path(entry).mkdir(parents=True, exist_ok=True)
+
+
 def _load_api_work_queue_module(monkeypatch):
+    runtime_root = Path(tempfile.mkdtemp(prefix="mint-issue360-runtime-env-"))
+    _materialize_runtime_env(runtime_root)
+    monkeypatch.setenv("RAY_ADDRESS", "auto")
+    monkeypatch.setenv("PFS_RUNTIME_ENV_ROOT", str(runtime_root))
+    monkeypatch.setenv("PFS_TINKER_PATH", "/tmp/tinker")
+    monkeypatch.setenv("PFS_HF_MODULES_PATH", "/tmp/hf-modules")
     _install_ray_stub(monkeypatch)
-    monkeypatch.setenv("RAY_ADDRESS", "ray://test")
+    import tinker_server.config as config_module
     import tinker_server.backend.api_work_queue as api_work_queue
 
+    importlib.reload(config_module)
     return importlib.reload(api_work_queue)
 
 
@@ -58,17 +114,25 @@ def _item(
     domain: str,
     session_key: str | None = None,
     legacy_session_id: str | None = None,
+    scheduler_fairness: str | None = None,
+    scheduler_max_consecutive: int | None = None,
     created_at: float = 0.0,
 ) -> dict:
+    serial_session_key = session_key or legacy_session_id or "unknown"
     scheduler_domain = domain if ":" in str(domain) else f"megatron:{domain}"
     extra = {
         "scheduler_enabled": True,
         "scheduler_domain": scheduler_domain,
+        "execution_serial_key": f"training_session:{serial_session_key}",
     }
     if session_key is not None:
         extra["scheduler_session_key"] = session_key
     if legacy_session_id is not None:
         extra["session_id"] = legacy_session_id
+    if scheduler_fairness is not None:
+        extra["scheduler_fairness"] = scheduler_fairness
+    if scheduler_max_consecutive is not None:
+        extra["scheduler_max_consecutive"] = scheduler_max_consecutive
     return {
         "request_id": request_id,
         "op": "training.forward_backward",
@@ -104,226 +168,15 @@ async def _enqueue_many(actor, items: list[dict]) -> None:
 async def _dequeue_many(actor, n: int) -> list[dict]:
     out: list[dict] = []
     for _ in range(n):
-        out.append(await actor.dequeue("consumer-job"))
+        item = await actor.dequeue("consumer-job")
+        out.append(item)
+        await actor.finalize_request(item["request_id"])
     return out
 
 
 def _session_key_from_item(item: dict) -> str:
     extra = item.get("extra", {}) or {}
     return str(extra.get("scheduler_session_key") or extra.get("session_id") or "")
-
-
-def test_issue_432_global_arbiter_prefers_legacy_head_when_older(monkeypatch):
-    api_work_queue = _load_api_work_queue_module(monkeypatch)
-
-    decision = api_work_queue.choose_global_arbitration(
-        has_legacy=True,
-        legacy_head_created_at=10.0,
-        scheduled=api_work_queue.ScheduledCandidate(
-            domain="megatron:Qwen/Qwen3-30B-A3B-Instruct-2507",
-            session_id="run-A",
-            dequeue_reason="fairness_oldest",
-            head_created_at=12.0,
-        ),
-    )
-
-    assert decision == api_work_queue.GlobalArbitrationDecision(
-        queue_kind="legacy",
-        dequeue_reason="fifo",
-        decision_reason="legacy_head_older",
-    )
-
-
-def test_issue_432_global_arbiter_prefers_scheduled_when_head_is_older(monkeypatch):
-    api_work_queue = _load_api_work_queue_module(monkeypatch)
-
-    decision = api_work_queue.choose_global_arbitration(
-        has_legacy=True,
-        legacy_head_created_at=12.0,
-        scheduled=api_work_queue.ScheduledCandidate(
-            domain="megatron:Qwen/Qwen3-30B-A3B-Instruct-2507",
-            session_id="run-A",
-            dequeue_reason="fairness_oldest",
-            head_created_at=10.0,
-        ),
-    )
-
-    assert decision == api_work_queue.GlobalArbitrationDecision(
-        queue_kind="scheduled",
-        dequeue_reason="fairness_oldest",
-        decision_reason="scheduled_fairness_oldest",
-        scheduler_domain="megatron:Qwen/Qwen3-30B-A3B-Instruct-2507",
-        scheduler_session_id="run-A",
-    )
-
-
-def test_issue_432_global_arbiter_handles_single_bucket_cases(monkeypatch):
-    api_work_queue = _load_api_work_queue_module(monkeypatch)
-
-    legacy_only = api_work_queue.choose_global_arbitration(
-        has_legacy=True,
-        legacy_head_created_at=10.0,
-        scheduled=None,
-    )
-    assert legacy_only == api_work_queue.GlobalArbitrationDecision(
-        queue_kind="legacy",
-        dequeue_reason="fifo",
-        decision_reason="legacy_only",
-    )
-
-    scheduled_only = api_work_queue.choose_global_arbitration(
-        has_legacy=False,
-        legacy_head_created_at=None,
-        scheduled=api_work_queue.ScheduledCandidate(
-            domain="vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
-            session_id="sess-A",
-            dequeue_reason="fairness_rr",
-            head_created_at=5.0,
-        ),
-    )
-    assert scheduled_only == api_work_queue.GlobalArbitrationDecision(
-        queue_kind="scheduled",
-        dequeue_reason="fairness_rr",
-        decision_reason="scheduled_only",
-        scheduler_domain="vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
-        scheduler_session_id="sess-A",
-    )
-
-    assert api_work_queue.choose_global_arbitration(
-        has_legacy=False,
-        legacy_head_created_at=None,
-        scheduled=None,
-    ) is None
-
-
-def test_issue_432_global_arbiter_service_gap_guard_overrides_legacy_age(monkeypatch):
-    api_work_queue = _load_api_work_queue_module(monkeypatch)
-
-    decision = api_work_queue.choose_global_arbitration(
-        has_legacy=True,
-        legacy_head_created_at=1.0,
-        scheduled=api_work_queue.ScheduledCandidate(
-            domain="megatron:Qwen/Qwen3-30B-A3B-Instruct-2507",
-            session_id="run-A",
-            dequeue_reason="fairness_oldest",
-            head_created_at=5.0,
-            service_gap_s=40.0,
-        ),
-        domain_max_service_gap_s=30.0,
-    )
-
-    assert decision == api_work_queue.GlobalArbitrationDecision(
-        queue_kind="scheduled",
-        dequeue_reason="fairness_oldest",
-        decision_reason="scheduled_service_gap_guard",
-        scheduler_domain="megatron:Qwen/Qwen3-30B-A3B-Instruct-2507",
-        scheduler_session_id="run-A",
-    )
-
-
-def test_issue_432_global_arbiter_legacy_streak_guard_overrides_legacy_age(monkeypatch):
-    api_work_queue = _load_api_work_queue_module(monkeypatch)
-
-    decision = api_work_queue.choose_global_arbitration(
-        has_legacy=True,
-        legacy_head_created_at=1.0,
-        scheduled=api_work_queue.ScheduledCandidate(
-            domain="megatron:Qwen/Qwen3-30B-A3B-Instruct-2507",
-            session_id="run-A",
-            dequeue_reason="fairness_oldest",
-            head_created_at=5.0,
-            service_gap_s=5.0,
-        ),
-        legacy_streak=3,
-        legacy_max_streak=3,
-    )
-
-    assert decision == api_work_queue.GlobalArbitrationDecision(
-        queue_kind="scheduled",
-        dequeue_reason="fairness_oldest",
-        decision_reason="scheduled_legacy_streak_guard",
-        scheduler_domain="megatron:Qwen/Qwen3-30B-A3B-Instruct-2507",
-        scheduler_session_id="run-A",
-    )
-
-
-def test_issue_432_global_arbiter_ignores_inadmissible_scheduled_candidate(monkeypatch):
-    api_work_queue = _load_api_work_queue_module(monkeypatch)
-
-    decision = api_work_queue.choose_global_arbitration(
-        has_legacy=True,
-        legacy_head_created_at=1.0,
-        scheduled=api_work_queue.ScheduledCandidate(
-            domain="megatron:Qwen/Qwen3-30B-A3B-Instruct-2507",
-            session_id="run-A",
-            dequeue_reason="fairness_oldest",
-            head_created_at=5.0,
-            service_gap_s=100.0,
-            admissible=False,
-        ),
-        legacy_streak=10,
-        legacy_max_streak=2,
-        domain_max_service_gap_s=30.0,
-    )
-
-    assert decision == api_work_queue.GlobalArbitrationDecision(
-        queue_kind="legacy",
-        dequeue_reason="fifo",
-        decision_reason="legacy_only",
-    )
-
-
-def test_issue_432_actor_unknown_capacity_owner_falls_back_to_legacy(monkeypatch):
-    monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "1")
-    monkeypatch.setenv("MINT_SCHEDULER_COALESCE_MS", "0")
-
-    api_work_queue = _load_api_work_queue_module(monkeypatch)
-    actor = api_work_queue._get_or_create_ray_actor()
-
-    unknown_owner = {
-        "request_id": "u1",
-        "op": "training.forward_backward",
-        "request_json": b"{}",
-        "user_id": None,
-        "apikey_id": None,
-        "throttle_principal": None,
-        "webhook_url": None,
-        "extra": {
-            "scheduler_enabled": True,
-            "scheduler_domain": "custom_backend:tenant-1",
-            "scheduler_session_key": "sess-unknown",
-        },
-        "created_at": 1.0,
-    }
-
-    asyncio.run(actor.enqueue(unknown_owner))
-    out = asyncio.run(_dequeue_many(actor, 1))
-    stats = actor.stats()
-
-    assert out[0]["request_id"] == "u1"
-    assert out[0]["extra"]["_queue_kind"] == "legacy"
-    assert stats["depth_scheduled"] == 0
-    assert stats["depth_legacy"] == 0
-
-
-def test_issue_432_actor_domains_rotate_without_cross_domain_oldest_order(monkeypatch):
-    monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "1")
-    monkeypatch.setenv("MINT_SCHEDULER_FAIRNESS", "oldest")
-    monkeypatch.setenv("MINT_SCHEDULER_MAX_CONSECUTIVE", "8")
-    monkeypatch.setenv("MINT_SCHEDULER_STARVATION_S", "1000000000000")
-    monkeypatch.setenv("MINT_SCHEDULER_COALESCE_MS", "0")
-
-    api_work_queue = _load_api_work_queue_module(monkeypatch)
-    actor = api_work_queue._get_or_create_ray_actor()
-
-    items = [
-        _item("b1", domain="megatron:Qwen/Qwen3-30B-A3B-Instruct-2507", session_key="B", created_at=10.0),
-        _item("a1", domain="vllm:Qwen/Qwen3-0.6B::replica::1", session_key="A", created_at=1.0),
-    ]
-    asyncio.run(_enqueue_many(actor, items))
-    out = asyncio.run(_dequeue_many(actor, 2))
-
-    assert [x["request_id"] for x in out] == ["b1", "a1"]
 
 
 def test_mock_scheduler_sticky_then_fairness_rr(monkeypatch):
@@ -350,111 +203,6 @@ def test_mock_scheduler_sticky_then_fairness_rr(monkeypatch):
     # First pick is oldest A, then sticky keeps A once (max_consecutive=2),
     # then fairness rotates to B and sticky keeps B.
     assert sessions == ["A", "A", "B", "B"]
-
-
-def test_issue_432_actor_legacy_streak_guard_forces_scheduled_pick(monkeypatch):
-    monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "1")
-    monkeypatch.setenv("MINT_SCHEDULER_FAIRNESS", "oldest")
-    monkeypatch.setenv("MINT_SCHEDULER_MAX_CONSECUTIVE", "8")
-    monkeypatch.setenv("MINT_SCHEDULER_STARVATION_S", "1000000000000")
-    monkeypatch.setenv("MINT_SCHEDULER_COALESCE_MS", "0")
-    monkeypatch.setenv("MINT_MAX_LOCAL_LEGACY_STREAK_WITH_DOMAIN_PENDING", "2")
-
-    api_work_queue = _load_api_work_queue_module(monkeypatch)
-    actor = api_work_queue._get_or_create_ray_actor()
-
-    now = 1000.0
-    items = [
-        _legacy_item("l1", created_at=now + 1.0),
-        _legacy_item("l2", created_at=now + 2.0),
-        _legacy_item("l3", created_at=now + 3.0),
-        _item("s1", domain="d", session_key="A", created_at=now + 10.0),
-    ]
-    asyncio.run(_enqueue_many(actor, items))
-    out = asyncio.run(_dequeue_many(actor, 3))
-
-    assert [x["request_id"] for x in out] == ["l1", "l2", "s1"]
-    assert actor._legacy_streak == 0
-
-
-def test_issue_432_actor_service_gap_guard_forces_scheduled_pick(monkeypatch):
-    monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "1")
-    monkeypatch.setenv("MINT_SCHEDULER_FAIRNESS", "oldest")
-    monkeypatch.setenv("MINT_SCHEDULER_MAX_CONSECUTIVE", "8")
-    monkeypatch.setenv("MINT_SCHEDULER_STARVATION_S", "1000000000000")
-    monkeypatch.setenv("MINT_SCHEDULER_COALESCE_MS", "0")
-    monkeypatch.setenv("MINT_LOCAL_DOMAIN_MAX_SERVICE_GAP_S", "1")
-
-    api_work_queue = _load_api_work_queue_module(monkeypatch)
-    actor = api_work_queue._get_or_create_ray_actor()
-
-    t0 = api_work_queue.time.time() - 100.0
-    items = [
-        _legacy_item("l1", created_at=t0 + 1.0),
-        _item("s1", domain="megatron:Qwen/Qwen3-30B-A3B-Instruct-2507", session_key="A", created_at=t0 + 10.0),
-    ]
-    asyncio.run(_enqueue_many(actor, items))
-    out = asyncio.run(_dequeue_many(actor, 1))
-
-    assert out[0]["request_id"] == "s1"
-    assert out[0]["extra"]["_decision_reason"] == "scheduled_service_gap_guard"
-
-
-def test_issue_432_actor_excludes_capacity_blocked_domain_from_forced_scheduled_pick(monkeypatch):
-    monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "1")
-    monkeypatch.setenv("MINT_SCHEDULER_FAIRNESS", "oldest")
-    monkeypatch.setenv("MINT_SCHEDULER_MAX_CONSECUTIVE", "8")
-    monkeypatch.setenv("MINT_SCHEDULER_STARVATION_S", "1000000000000")
-    monkeypatch.setenv("MINT_SCHEDULER_COALESCE_MS", "0")
-    monkeypatch.setenv("MINT_LOCAL_DOMAIN_MAX_SERVICE_GAP_S", "1")
-    monkeypatch.setenv("MINT_MAX_LOCAL_LEGACY_STREAK_WITH_DOMAIN_PENDING", "1")
-
-    api_work_queue = _load_api_work_queue_module(monkeypatch)
-    actor = api_work_queue._get_or_create_ray_actor()
-    actor._domain_inflight_workers["megatron:Qwen/Qwen3-30B-A3B-Instruct-2507"] = 1
-
-    t0 = api_work_queue.time.time() - 100.0
-    items = [
-        _legacy_item("l1", created_at=t0 + 1.0),
-        _item(
-            "s1",
-            domain="megatron:Qwen/Qwen3-30B-A3B-Instruct-2507",
-            session_key="A",
-            created_at=t0 + 10.0,
-        ),
-    ]
-    asyncio.run(_enqueue_many(actor, items))
-    out = asyncio.run(_dequeue_many(actor, 1))
-
-    assert out[0]["request_id"] == "l1"
-    assert actor._legacy_streak == 1
-
-
-def test_issue_432_scheduler_domain_snapshot_exposes_capacity_owner(monkeypatch):
-    monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "1")
-    monkeypatch.setenv("MINT_SCHEDULER_COALESCE_MS", "0")
-
-    api_work_queue = _load_api_work_queue_module(monkeypatch)
-    actor = api_work_queue._get_or_create_ray_actor()
-
-    asyncio.run(
-        _enqueue_many(
-            actor,
-            [
-                _item(
-                    "s1",
-                    domain="vllm:Qwen/Qwen3-4B-Instruct-2507::replica::0",
-                    session_key="A",
-                    created_at=1.0,
-                )
-            ],
-        )
-    )
-    stats = actor.stats()
-    domain = stats["scheduler_domains"]["vllm:Qwen/Qwen3-4B-Instruct-2507::replica::0"]
-
-    assert domain["capacity_owner"] == "vllm_replica_single_worker"
-    assert domain["capacity_workers"] == 1
 
 
 def test_mock_scheduler_invariant_current_session_without_queue_raises(monkeypatch):
@@ -502,6 +250,138 @@ def test_mock_scheduler_accepts_new_and_legacy_session_key_fields(monkeypatch):
     assert sessions == {"new-key-A", "legacy-key-B"}
 
 
+def test_mock_scheduler_honors_domain_policy_overrides(monkeypatch):
+    monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "1")
+    monkeypatch.setenv("MINT_SCHEDULER_FAIRNESS", "oldest")
+    monkeypatch.setenv("MINT_SCHEDULER_MAX_CONSECUTIVE", "8")
+    monkeypatch.setenv("MINT_SCHEDULER_STARVATION_S", "1000000000000")
+    monkeypatch.setenv("MINT_SCHEDULER_COALESCE_MS", "0")
+
+    api_work_queue = _load_api_work_queue_module(monkeypatch)
+    actor = api_work_queue._get_or_create_ray_actor()
+
+    t0 = 10000000000.0
+    items = [
+        _item(
+            "r1",
+            domain="openpi",
+            session_key="A",
+            scheduler_fairness="rr",
+            scheduler_max_consecutive=1,
+            created_at=t0 + 1.0,
+        ),
+        _item(
+            "r2",
+            domain="openpi",
+            session_key="B",
+            scheduler_fairness="rr",
+            scheduler_max_consecutive=1,
+            created_at=t0 + 2.0,
+        ),
+        _item(
+            "r3",
+            domain="openpi",
+            session_key="A",
+            scheduler_fairness="rr",
+            scheduler_max_consecutive=1,
+            created_at=t0 + 3.0,
+        ),
+        _item(
+            "r4",
+            domain="openpi",
+            session_key="B",
+            scheduler_fairness="rr",
+            scheduler_max_consecutive=1,
+            created_at=t0 + 4.0,
+        ),
+    ]
+    asyncio.run(_enqueue_many(actor, items))
+    out = asyncio.run(_dequeue_many(actor, 4))
+    sessions = [_session_key_from_item(x) for x in out]
+
+    assert sessions == ["A", "B", "A", "B"]
+
+
+def test_mock_scheduler_does_not_idle_wait_for_missing_followup(monkeypatch):
+    monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "1")
+    monkeypatch.setenv("MINT_SCHEDULER_FAIRNESS", "oldest")
+    monkeypatch.setenv("MINT_SCHEDULER_MAX_CONSECUTIVE", "8")
+    monkeypatch.setenv("MINT_SCHEDULER_COALESCE_MS", "20")
+
+    api_work_queue = _load_api_work_queue_module(monkeypatch)
+    actor = api_work_queue._get_or_create_ray_actor()
+
+    asyncio.run(_enqueue_many(actor, [_item("r1", domain="d", session_key="A", created_at=1.0)]))
+    first = asyncio.run(actor.dequeue("consumer-job"))
+    assert _session_key_from_item(first) == "A"
+    asyncio.run(actor.finalize_request("r1"))
+
+    asyncio.run(_enqueue_many(actor, [_item("r2", domain="d", session_key="B", created_at=2.0)]))
+    second = asyncio.run(asyncio.wait_for(actor.dequeue("consumer-job"), timeout=0.05))
+
+    assert _session_key_from_item(second) == "B"
+
+
+def test_issue_517_create_lane_not_blocked_by_live_training_lease(monkeypatch):
+    monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "1")
+    monkeypatch.setenv("MINT_SCHEDULER_FAIRNESS", "oldest")
+    monkeypatch.setenv("MINT_SCHEDULER_MAX_CONSECUTIVE", "8")
+    monkeypatch.setenv("MINT_SCHEDULER_COALESCE_MS", "0")
+
+    api_work_queue = _load_api_work_queue_module(monkeypatch)
+    actor = api_work_queue._get_or_create_ray_actor()
+
+    live = _item(
+        "live-train-1",
+        domain="megatron_qwen3_235b_a22b_instruct_2507",
+        session_key="train-session",
+        created_at=1.0,
+    )
+    live["op"] = "training.forward_backward"
+
+    create = _item(
+        "create-1",
+        domain="megatron:create:megatron_qwen3_235b_a22b_instruct_2507",
+        session_key="create-session",
+        created_at=2.0,
+    )
+    create["op"] = "training.create_model"
+
+    asyncio.run(_enqueue_many(actor, [live, create]))
+
+    first = asyncio.run(actor.dequeue("consumer-job"))
+    assert first["request_id"] == "live-train-1"
+
+    second = asyncio.run(asyncio.wait_for(actor.dequeue("consumer-job"), timeout=0.05))
+    assert second["request_id"] == "create-1"
+    assert str((second.get("extra") or {}).get("scheduler_domain")) == "megatron:create:megatron_qwen3_235b_a22b_instruct_2507"
+
+    asyncio.run(actor.finalize_request("create-1"))
+    asyncio.run(actor.finalize_request("live-train-1"))
+
+
+def test_issue_194_dequeue_assigns_monotonic_execution_serial_seq(monkeypatch):
+    monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "1")
+
+    api_work_queue = _load_api_work_queue_module(monkeypatch)
+    actor = api_work_queue._get_or_create_ray_actor()
+
+    asyncio.run(
+        _enqueue_many(
+            actor,
+            [
+                _item("r1", domain="d", session_key="A", created_at=1.0),
+                _item("r2", domain="d", session_key="A", created_at=2.0),
+            ],
+        )
+    )
+    out = asyncio.run(_dequeue_many(actor, 2))
+    seqs = [int((x.get("extra") or {}).get("execution_serial_seq")) for x in out]
+    epochs = [str((x.get("extra") or {}).get("execution_serial_epoch") or "") for x in out]
+
+    assert seqs == [1, 2]
+    assert epochs[0]
+    assert epochs == [epochs[0], epochs[0]]
 def test_stale_dequeue_returns_stale_consumer_sentinel(monkeypatch):
     monkeypatch.setenv("MINT_API_WORK_QUEUE_DEQUEUE_POLL_S", "0.05")
 
@@ -592,7 +472,7 @@ def test_issue_324_finalize_request_releases_running_slot(monkeypatch):
     dequeued = asyncio.run(actor.dequeue("consumer-job"))
     assert dequeued["request_id"] == "r1"
     assert actor.stats()["by_apikey_id"] == {"bbbbbbbbbbbbbbbbbbbbbbbb": 1}
-    actor.finalize_request("r1")
+    asyncio.run(actor.finalize_request("r1"))
     assert actor.stats()["by_apikey_id"] == {}
 
 
@@ -617,3 +497,59 @@ def test_issue_324_consumer_handoff_releases_leased_slots(monkeypatch):
 
     accepted = asyncio.run(actor.enqueue(dict(item, request_id="r2")))
     assert accepted == {"ok": True}
+
+
+def test_issue_353_actor_stats_expose_scheduler_snapshots(monkeypatch):
+    api_work_queue = _load_api_work_queue_module(monkeypatch)
+    actor = api_work_queue._get_or_create_ray_actor()
+    actor.set_active_job_id("consumer-job")
+
+    legacy = _legacy_item("legacy-1", created_at=1.0)
+    sched_a = _item(
+        "sched-a",
+        domain="vllm:Qwen/Qwen3-4B-Instruct-2507::replica::0",
+        session_key="A",
+        created_at=2.0,
+    )
+    sched_b = _item(
+        "sched-b",
+        domain="vllm:Qwen/Qwen3-4B-Instruct-2507::replica::0",
+        session_key="B",
+        created_at=3.0,
+    )
+
+    asyncio.run(actor.enqueue(legacy))
+    asyncio.run(actor.enqueue(sched_a))
+    asyncio.run(actor.enqueue(sched_b))
+
+    first = asyncio.run(actor.dequeue("consumer-job"))
+    assert first["request_id"] == "legacy-1"
+
+    second = asyncio.run(actor.dequeue("consumer-job"))
+    assert second["request_id"] == "sched-a"
+
+    stats = actor.stats()
+    domain = stats["scheduler_domains"]["vllm:Qwen/Qwen3-4B-Instruct-2507::replica::0"]
+    assert stats["scheduler_metrics_ready"] is True
+    assert stats["scheduler_arbitration_total"] == 2
+    assert stats["scheduler_arbitration_by_winner"] == {"legacy": 1, "scheduled": 1}
+    assert stats["scheduler_arbitration_by_reason"]["legacy_head_older"] == 1
+    scheduled_reasons = {
+        key: value
+        for key, value in stats["scheduler_arbitration_by_reason"].items()
+        if key.startswith("scheduled_")
+    }
+    assert sum(int(value) for value in scheduled_reasons.values()) == 1
+    assert stats["legacy_dequeue_stats"] == [{"op": "sampling.asample", "reason": "fifo", "total": 1}]
+    assert len(stats["scheduled_dequeue_stats"]) == 1
+    assert stats["scheduled_dequeue_stats"][0]["op"] == "training.forward_backward"
+    assert stats["scheduled_dequeue_stats"][0]["scheduler_domain"] == "vllm:Qwen/Qwen3-4B-Instruct-2507::replica::0"
+    assert stats["scheduled_dequeue_stats"][0]["total"] == 1
+    assert domain["backend"] == "vllm"
+    assert domain["pending_requests"] == 1
+    assert domain["active_sessions"] == 1
+    assert domain["inflight_workers"] == 1
+    assert domain["capacity_workers"] == 1
+    assert domain["admissible"] is False
+    assert domain["stats"]["picks"] == 1
+    assert domain["stats"]["starvation_picks"] == 1

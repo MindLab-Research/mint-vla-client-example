@@ -44,6 +44,14 @@ def _materialize_runtime_env(root: Path) -> None:
     Path(layout.host_python).chmod(0o755)
 
 
+def _materialize_runtime_env_with_real_host_python(root: Path) -> None:
+    _materialize_runtime_env(root)
+    layout = checkout_runtime_env_layout(str(root))
+    host_python = Path(layout.host_python)
+    host_python.unlink()
+    host_python.symlink_to(Path(sys.executable))
+
+
 def test_build_runtime_pythonpath_uses_canonical_root(tmp_path):
     env_root = tmp_path / "runtime"
     _materialize_runtime_env(env_root)
@@ -59,6 +67,7 @@ def test_build_runtime_pythonpath_uses_canonical_root(tmp_path):
     assert str(env_root / "src" / "Megatron-Bridge" / "src") in parts
     assert str(env_root / "src" / "Megatron-Bridge") in parts
     assert str(env_root / "src" / "verl") in parts
+    assert str(env_root / "src" / "openpi" / "src") in parts
     assert str(env_root / "src" / "Megatron-LM") in parts
     assert parts[-2] == "/vePFS/code/yiwen/tinker-server"
     assert parts[-1] == "/vePFS/hf/modules"
@@ -178,6 +187,277 @@ def test_runtime_env_layout_tracks_host_only_pythonpaths():
     assert list(layout.host_pythonpath_entries) == expected
 
 
+def test_runtime_env_layout_includes_openpi_source_checkout():
+    layout = checkout_runtime_env_layout("/tmp/runtime")
+
+    assert str(Path("/tmp/runtime/src/openpi/src")) in layout.pythonpath_entries
+
+
+def test_runtime_env_layout_includes_openpi_client_source_checkout():
+    layout = checkout_runtime_env_layout("/tmp/runtime")
+
+    assert str(Path("/tmp/runtime/src/openpi/packages/openpi-client/src")) in layout.pythonpath_entries
+
+
+def test_runtime_env_host_dependencies_include_openpi_worker_stack():
+    from scripts import build_runtime_env as build_runtime_env
+
+    deps = build_runtime_env._host_deps(build_runtime_env._load_pyproject())
+    lerobot_requirement = (
+        "lerobot @ git+https://github.com/huggingface/lerobot.git"
+        "@0cf864870cf29f4738d3ade893e6fd13fbd7cdb5"
+    )
+
+    for requirement in (
+        "augmax>=0.3.4",
+        "beartype==0.19.0",
+        "flax==0.10.2",
+        "filelock>=3.16.1",
+        "fsspec[gcs]>=2024.6.0",
+        "jax[cuda12]==0.5.3",
+        "jaxtyping==0.2.36",
+        lerobot_requirement,
+        "ml_collections==1.0.0",
+        "numpydantic>=1.6.6",
+        "optax==0.2.4",
+        "orbax-checkpoint==0.11.13",
+        "pytest>=7.0.0",
+        "tqdm-loggable>=0.2",
+        "tyro>=0.9.5",
+    ):
+        assert requirement in deps
+
+
+def test_subprocess_env_sets_default_uv_http_timeout(monkeypatch):
+    from scripts import build_runtime_env as build_runtime_env
+
+    monkeypatch.delenv("UV_HTTP_TIMEOUT", raising=False)
+
+    env = build_runtime_env._subprocess_env()
+
+    assert env["UV_HTTP_TIMEOUT"] == "300"
+
+
+def test_subprocess_env_respects_existing_uv_http_timeout(monkeypatch):
+    from scripts import build_runtime_env as build_runtime_env
+
+    monkeypatch.setenv("UV_HTTP_TIMEOUT", "900")
+
+    env = build_runtime_env._subprocess_env()
+
+    assert env["UV_HTTP_TIMEOUT"] == "900"
+
+
+def test_resolve_uv_prefers_explicit_uv_bin_override(tmp_path, monkeypatch):
+    from scripts import build_runtime_env as build_runtime_env
+
+    fake_uv = tmp_path / "bin" / "uv"
+    fake_uv.parent.mkdir(parents=True, exist_ok=True)
+    fake_uv.write_text("", encoding="utf-8")
+    fake_uv.chmod(0o755)
+
+    monkeypatch.setenv("UV_BIN", str(fake_uv))
+    monkeypatch.setattr(build_runtime_env.shutil, "which", lambda _: "/usr/bin/uv")
+
+    assert build_runtime_env._resolve_uv() == str(fake_uv)
+
+
+def test_subprocess_env_sets_tmpdir_under_xdg_cache_home(monkeypatch, tmp_path):
+    from scripts import build_runtime_env as build_runtime_env
+
+    xdg_cache_home = tmp_path / "cache"
+    monkeypatch.delenv("TMPDIR", raising=False)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(xdg_cache_home))
+
+    env = build_runtime_env._subprocess_env()
+
+    assert env["TMPDIR"] == str(xdg_cache_home / "tmp")
+    assert (xdg_cache_home / "tmp").is_dir()
+
+
+def test_subprocess_env_sets_uv_cache_dir_under_xdg_cache_home(monkeypatch, tmp_path):
+    from scripts import build_runtime_env as build_runtime_env
+
+    xdg_cache_home = tmp_path / "cache"
+    monkeypatch.delenv("UV_CACHE_DIR", raising=False)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(xdg_cache_home))
+
+    env = build_runtime_env._subprocess_env()
+
+    assert env["UV_CACHE_DIR"] == str(xdg_cache_home / "uv")
+
+
+def test_subprocess_env_respects_existing_tmpdir(monkeypatch, tmp_path):
+    from scripts import build_runtime_env as build_runtime_env
+
+    custom_tmpdir = tmp_path / "custom-tmp"
+    monkeypatch.setenv("TMPDIR", str(custom_tmpdir))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+
+    env = build_runtime_env._subprocess_env()
+
+    assert env["TMPDIR"] == str(custom_tmpdir)
+
+
+def test_export_host_requirements_writes_runtime_worker_stack(tmp_path):
+    from scripts import build_runtime_env as build_runtime_env
+
+    out = tmp_path / "host-requirements.txt"
+    build_runtime_env._export_host_requirements(build_runtime_env._load_pyproject(), out)
+    text = out.read_text(encoding="utf-8")
+    lerobot_requirement = (
+        "lerobot @ git+https://github.com/huggingface/lerobot.git"
+        "@0cf864870cf29f4738d3ade893e6fd13fbd7cdb5"
+    )
+
+    for requirement in (
+        "torch==2.9.1+cpu",
+        "jax[cuda12]==0.5.3",
+        "flax==0.10.2",
+        "optax==0.2.4",
+        "orbax-checkpoint==0.11.13",
+        "ml_collections==1.0.0",
+        "jaxtyping==0.2.36",
+        "augmax>=0.3.4",
+        lerobot_requirement,
+        "pytest>=7.0.0",
+        "tqdm-loggable>=0.2",
+        "tyro>=0.9.5",
+    ):
+        assert requirement in text
+
+
+def test_default_inspect_probe_modules_cover_openpi_training_loader():
+    from scripts import build_runtime_env as build_runtime_env
+
+    assert "openpi.training.data_loader" in build_runtime_env.DEFAULT_INSPECT_PROBE_MODULES
+
+
+def test_partition_host_requirements_keeps_only_torch_on_torch_backend():
+    from scripts import build_runtime_env as build_runtime_env
+
+    torch_backend_reqs, generic_reqs = build_runtime_env._partition_host_requirements(
+        [
+            "torch==2.9.1+cpu",
+            "flax==0.10.2",
+            "lerobot @ git+https://github.com/huggingface/lerobot.git@0cf864870cf29f4738d3ade893e6fd13fbd7cdb5",
+        ]
+    )
+
+    assert torch_backend_reqs == ["torch==2.9.1+cpu"]
+    assert generic_reqs == [
+        "flax==0.10.2",
+        "lerobot @ git+https://github.com/huggingface/lerobot.git@0cf864870cf29f4738d3ade893e6fd13fbd7cdb5",
+    ]
+
+
+def test_create_host_venv_installs_torch_backend_and_generic_requirements_separately(tmp_path, monkeypatch):
+    from scripts import build_runtime_env as build_runtime_env
+
+    base_python = tmp_path / "base-python" / "bin" / "python3.12"
+    base_python.parent.mkdir(parents=True, exist_ok=True)
+    base_python.write_text("", encoding="utf-8")
+    host_venv = tmp_path / "host-venv"
+    host_requirements = tmp_path / "host-requirements.txt"
+    host_requirements.write_text(
+        "\n".join(
+            [
+                "torch==2.9.1+cpu",
+                "flax==0.10.2",
+                "lerobot @ git+https://github.com/huggingface/lerobot.git@0cf864870cf29f4738d3ade893e6fd13fbd7cdb5",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None):
+        calls.append(cmd)
+        if cmd[:4] == [str(base_python), "-m", "venv", "--copies"]:
+            python = host_venv / "bin" / "python"
+            python.parent.mkdir(parents=True, exist_ok=True)
+            python.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(build_runtime_env, "_run", fake_run)
+    monkeypatch.setattr(build_runtime_env, "_resolve_uv", lambda: "/fake/uv")
+
+    python = build_runtime_env._create_host_venv(base_python, host_venv, host_requirements)
+
+    generic_requirements = tmp_path / "host-requirements-generic.txt"
+    assert python == host_venv / "bin" / "python"
+    assert calls[0] == [str(base_python), "-m", "venv", "--copies", str(host_venv)]
+    assert calls[1] == [str(python), "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"]
+    assert calls[2] == [
+        "/fake/uv",
+        "pip",
+        "install",
+        "--python",
+        str(python),
+        "torch==2.9.1+cpu",
+        "--torch-backend",
+        "cpu",
+    ]
+    assert calls[3] == [
+        "/fake/uv",
+        "pip",
+        "install",
+        "--python",
+        str(python),
+        "--torch-backend",
+        "cpu",
+        "--requirements",
+        str(generic_requirements),
+    ]
+    assert generic_requirements.read_text(encoding="utf-8").splitlines() == [
+        "flax==0.10.2",
+        "lerobot @ git+https://github.com/huggingface/lerobot.git@0cf864870cf29f4738d3ade893e6fd13fbd7cdb5",
+    ]
+
+
+def test_write_host_pth_prepends_runtime_paths(tmp_path, monkeypatch):
+    from scripts import build_runtime_env as build_runtime_env
+
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env(env_root)
+    purelib = tmp_path / "purelib"
+    purelib.mkdir()
+
+    monkeypatch.setattr(
+        build_runtime_env.subprocess,
+        "check_output",
+        lambda *args, **kwargs: str(purelib),
+    )
+
+    build_runtime_env._write_host_pth(env_root, env_root / "host-venv" / "bin" / "python")
+
+    line = (purelib / "tinker_runtime_env.pth").read_text(encoding="utf-8").strip()
+    original_sys_path = sys.path[:]
+    sys.path[:] = [
+        "/host/site-packages",
+        str(env_root / "src" / "openpi" / "src"),
+        "/other",
+    ]
+    try:
+        exec(line, {})
+        actual = sys.path[:]
+    finally:
+        sys.path[:] = original_sys_path
+
+    expected = [
+        str(env_root / "site-packages"),
+        str(env_root / "src" / "Megatron-LM"),
+        str(env_root / "src" / "Megatron-Bridge" / "src"),
+        str(env_root / "src" / "Megatron-Bridge"),
+        str(env_root / "src" / "verl"),
+        str(env_root / "src" / "openpi" / "src"),
+        str(env_root / "src" / "openpi" / "packages" / "openpi-client" / "src"),
+        str(env_root / "src" / "vllm"),
+    ]
+    assert actual[: len(expected)] == expected
+    assert actual.count(str(env_root / "src" / "openpi" / "src")) == 1
+
+
 def test_build_runtime_env_normalizes_host_only_vllm_source_metadata(tmp_path):
     from scripts import build_runtime_env as build_runtime_env
 
@@ -218,6 +498,111 @@ def test_build_runtime_env_normalizes_host_only_vllm_source_metadata(tmp_path):
     pkg_info_text = pkg_info.read_text(encoding="utf-8")
     assert "Name: vllm" in pkg_info_text
     assert "Version: 0.16.0" in pkg_info_text
+
+
+def test_materialize_base_python_uses_current_uv_find_args(tmp_path, monkeypatch):
+    from scripts import build_runtime_env as build_runtime_env
+
+    bootstrap_root = tmp_path / "bootstrap-root"
+    bootstrap_python = bootstrap_root / "bin" / "python3.12"
+    bootstrap_python.parent.mkdir(parents=True, exist_ok=True)
+    bootstrap_python.write_text("", encoding="utf-8")
+    seen: list[list[str]] = []
+
+    def fake_capture(cmd, *, cwd=None, env=None):
+        seen.append(cmd)
+        return str(bootstrap_python)
+
+    monkeypatch.setattr(build_runtime_env, "sys", type("FakeSys", (), {"version_info": (3, 12, 13), "_base_executable": "/missing/python", "executable": "/missing/python"})())
+    monkeypatch.setattr(build_runtime_env, "_resolve_uv", lambda: "/tmp/fake-uv")
+    monkeypatch.setattr(build_runtime_env, "_capture", fake_capture)
+
+    materialized = build_runtime_env._materialize_base_python("3.12.14", tmp_path / "runtime" / "base-python")
+
+    assert seen == [["/tmp/fake-uv", "python", "find", "--managed-python", "3.12.14"]]
+    assert materialized == tmp_path / "runtime" / "base-python" / "bin" / "python3.12"
+    assert materialized.exists()
+
+
+def test_materialize_base_python_reuses_current_base_executable(tmp_path, monkeypatch):
+    from scripts import build_runtime_env as build_runtime_env
+
+    bootstrap_root = tmp_path / "bootstrap-root"
+    bootstrap_python = bootstrap_root / "bin" / "python3.12"
+    bootstrap_python.parent.mkdir(parents=True, exist_ok=True)
+    bootstrap_python.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(
+        build_runtime_env,
+        "sys",
+        type(
+            "FakeSys",
+            (),
+            {
+                "version_info": (3, 12, 13),
+                "_base_executable": str(bootstrap_python),
+                "executable": str(tmp_path / "venv" / "bin" / "python3.12"),
+            },
+        )(),
+    )
+
+    def fail_resolve_uv():
+        raise AssertionError("uv lookup should not run when current base executable matches")
+
+    monkeypatch.setattr(build_runtime_env, "_resolve_uv", fail_resolve_uv)
+
+    materialized = build_runtime_env._materialize_base_python("3.12.13", tmp_path / "runtime" / "base-python")
+
+    assert materialized == tmp_path / "runtime" / "base-python" / "bin" / "python3.12"
+    assert materialized.exists()
+
+
+def test_inspect_runtime_env_reports_probe_results(tmp_path):
+    from scripts import build_runtime_env as build_runtime_env
+
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env_with_real_host_python(env_root)
+
+    snapshot = build_runtime_env.inspect_runtime_env(
+        env_root,
+        probe_modules=["json", "pathlib"],
+    )
+
+    assert snapshot["env_root"] == str(env_root)
+    assert snapshot["manifest_path"] == str(env_root / "manifest.json")
+    assert snapshot["valid_layout"] is True
+    assert snapshot["missing_paths"] == []
+    assert snapshot["host_python"] == str(env_root / "host-venv" / "bin" / "python")
+    assert snapshot["probe_results"]["json"]["ok"] is True
+    assert snapshot["probe_results"]["pathlib"]["ok"] is True
+
+
+def test_build_runtime_env_inspect_cli_returns_nonzero_on_probe_failure(tmp_path):
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env_with_real_host_python(env_root)
+
+    out = subprocess.run(
+        [
+            sys.executable,
+            "scripts/build_runtime_env.py",
+            "--inspect",
+            "--env-root",
+            str(env_root),
+            "--probe-module",
+            "json",
+            "--probe-module",
+            "does_not_exist_for_runtime_env_probe",
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+    )
+
+    assert out.returncode == 1
+    snapshot = json.loads(out.stdout)
+    assert snapshot["valid_layout"] is True
+    assert snapshot["probe_results"]["json"]["ok"] is True
+    assert snapshot["probe_results"]["does_not_exist_for_runtime_env_probe"]["ok"] is False
 
 
 def test_runtime_env_layout_prefers_manifest_sources(tmp_path):
@@ -567,6 +952,39 @@ def test_set_exact_pythonpath_removes_local_checkout_masking(monkeypatch):
     assert "/usr/lib/python3.12" in run_server.sys.path
 
 
+def test_actor_runtime_env_vars_forwards_control_plane_pin_envs(tmp_path):
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env(env_root)
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json; "
+                "from tinker_server.config import actor_runtime_env_vars; "
+                "print(json.dumps(actor_runtime_env_vars(pythonpath='X')))"
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            "PFS_RUNTIME_ENV_ROOT": str(env_root),
+            "PFS_TINKER_PATH": str(tmp_path / 'repo'),
+            "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
+            "RAY_ADDRESS": "ray://cfg-test",
+            "MINT_CONTROL_PLANE_PINNED_NODE_IP": "192.168.38.176",
+            "MINT_API_WORK_QUEUE_PINNED_NODE_IP": "192.168.38.176",
+            "MINT_STARTUP_LEASE_PINNED_NODE_IP": "192.168.38.176",
+        },
+    )
+    data = json.loads(out.stdout)
+    assert data["MINT_CONTROL_PLANE_PINNED_NODE_IP"] == "192.168.38.176"
+    assert data["MINT_API_WORK_QUEUE_PINNED_NODE_IP"] == "192.168.38.176"
+    assert data["MINT_STARTUP_LEASE_PINNED_NODE_IP"] == "192.168.38.176"
+
+
 def test_actor_runtime_env_vars_forwards_config_path(tmp_path):
     env_root = tmp_path / "runtime"
     _materialize_runtime_env(env_root)
@@ -650,6 +1068,31 @@ def test_server_config_prefers_mint_actor_names_and_accepts_legacy_tinker_aliase
     assert legacy_only.capacity_manager_actor_name == "legacy-cap"
 
 
+def test_actor_runtime_env_vars_requires_ray_address(tmp_path):
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env(env_root)
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from tinker_server.config import actor_runtime_env_vars; "
+                "actor_runtime_env_vars(pythonpath='X')"
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        env={
+            "PFS_RUNTIME_ENV_ROOT": str(env_root),
+            "PFS_TINKER_PATH": str(tmp_path / 'repo'),
+            "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
+        },
+    )
+    assert out.returncode != 0
+    assert "RAY_ADDRESS is required" in (out.stdout + out.stderr)
+
+
 def test_actor_runtime_env_vars_canonicalize_legacy_tinker_actor_aliases(tmp_path):
     env_root = tmp_path / "runtime"
     _materialize_runtime_env(env_root)
@@ -681,3 +1124,132 @@ def test_actor_runtime_env_vars_canonicalize_legacy_tinker_actor_aliases(tmp_pat
     assert data["MINT_CAPACITY_MANAGER_ACTOR_NAME"] == "legacy-capacity-manager"
     assert "TINKER_API_WORK_QUEUE_ACTOR_NAME" not in data
     assert "TINKER_CAPACITY_MANAGER_ACTOR_NAME" not in data
+
+
+def test_actor_runtime_env_vars_forwards_usage_envs(tmp_path):
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env(env_root)
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json; "
+                "from tinker_server.config import actor_runtime_env_vars; "
+                "print(json.dumps(actor_runtime_env_vars(pythonpath='X')))"
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            "PFS_RUNTIME_ENV_ROOT": str(env_root),
+            "PFS_TINKER_PATH": str(tmp_path / 'repo'),
+            "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
+            "RAY_ADDRESS": "ray://cfg-test",
+            "TINKER_USAGE_LOG_DIR": "/vePFS/shared/usage",
+            "TINKER_USAGE_BACKEND": "postgres",
+            "TINKER_USAGE_PG_DSN": "postgresql://mint:test@db/usage",
+        },
+    )
+    data = json.loads(out.stdout)
+    assert data["TINKER_USAGE_LOG_DIR"] == "/vePFS/shared/usage"
+    assert data["TINKER_USAGE_BACKEND"] == "postgres"
+    assert data["TINKER_USAGE_PG_DSN"] == "postgresql://mint:test@db/usage"
+
+
+def test_actor_runtime_env_vars_forwards_ray_attach_hints(tmp_path):
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env(env_root)
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json; "
+                "from tinker_server.config import actor_runtime_env_vars; "
+                "print(json.dumps(actor_runtime_env_vars(pythonpath='X')))"
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            "PFS_RUNTIME_ENV_ROOT": str(env_root),
+            "PFS_TINKER_PATH": str(tmp_path / 'repo'),
+            "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
+            "RAY_ADDRESS": "192.168.39.87:6379",
+            "MINT_RAY_CLIENT_ADDRESS": "ray://192.168.39.87:10001",
+            "RAY_CLIENT_ADDRESS": "ray://192.168.39.87:10001",
+            "MINT_RAY_NODE_IP_ADDRESS": "192.168.33.190",
+            "MINT_RAY_TEMP_DIR": "/tmp/mdw/t",
+        },
+    )
+    data = json.loads(out.stdout)
+    assert data["RAY_ADDRESS"] == "192.168.39.87:6379"
+    assert data["MINT_RAY_CLIENT_ADDRESS"] == "ray://192.168.39.87:10001"
+    assert data["RAY_CLIENT_ADDRESS"] == "ray://192.168.39.87:10001"
+    assert data["MINT_RAY_NODE_IP_ADDRESS"] == "192.168.33.190"
+    assert data["MINT_RAY_TEMP_DIR"] == "/tmp/mdw/t"
+
+
+def test_actor_runtime_env_skips_local_working_dir_in_ray_client_mode(tmp_path):
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env(env_root)
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json; "
+                "from tinker_server.config import actor_runtime_env; "
+                "print(json.dumps(actor_runtime_env(pythonpath='X')))"
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            "PFS_RUNTIME_ENV_ROOT": str(env_root),
+            "PFS_TINKER_PATH": str(tmp_path / "repo"),
+            "PFS_HF_MODULES_PATH": str(tmp_path / "hf"),
+            "RAY_ADDRESS": "ray://192.168.39.87:10001",
+            "MINT_RAY_WORKING_DIR": str(tmp_path / "repo"),
+        },
+    )
+    data = json.loads(out.stdout)
+    assert "working_dir" not in data
+
+
+def test_actor_runtime_env_skips_local_py_modules_in_ray_client_mode(tmp_path):
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env(env_root)
+    repo_pkg = tmp_path / "repo" / "tinker_server"
+    repo_pkg.mkdir(parents=True)
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json; "
+                "from tinker_server.config import actor_runtime_env; "
+                "print(json.dumps(actor_runtime_env(pythonpath='X')))"
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            "PFS_RUNTIME_ENV_ROOT": str(env_root),
+            "PFS_TINKER_PATH": str(tmp_path / "repo"),
+            "PFS_HF_MODULES_PATH": str(tmp_path / "hf"),
+            "RAY_ADDRESS": "ray://192.168.39.87:10001",
+            "MINT_RAY_PY_MODULES_CSV": str(repo_pkg),
+        },
+    )
+    data = json.loads(out.stdout)
+    assert "py_modules" not in data

@@ -72,6 +72,12 @@ class _StubOwnerRuntimeSupervisor:
             "timeout_s": float(timeout_s),
         }
 
+    async def async_run_once(self, loop_name: str, *, timeout_s: float = 60.0):
+        return {
+            "loop_name": str(loop_name),
+            "timeout_s": float(timeout_s),
+        }
+
 
 class _StubQueueExecutionRuntime:
     async def async_ensure_started(self, *, num_workers: int, timeout_s: float = 120.0):

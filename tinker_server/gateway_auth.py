@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from fastapi import HTTPException, Request
 
 _OBJECT_ID_RE = re.compile(r"^[0-9a-fA-F]{24}$")
+_TRUE_VALUES = {"1", "true", "yes", "on"}
+_FALSE_VALUES = {"0", "false", "no", "off"}
 
 
 @dataclass(frozen=True)
@@ -18,6 +20,11 @@ class GatewayAuthContext:
     apikey_id: str
     request_id: str
     session_id: str = ""
+    cap_write: bool = False
+    cap_view_internal_errors: bool = False
+    cap_bypass_ownership: bool = False
+    cap_manage_system: bool = False
+    caps_from_headers: bool = False
 
 
 _USER_ID_HEADERS = ("x-mint-user-id",)
@@ -27,7 +34,11 @@ _APIKEY_ID_HEADERS = ("x-mint-apikey-id",)
 _REQUEST_ID_HEADERS = ("x-mint-request-id",)
 _SESSION_ID_HEADERS = ("x-mint-session-id",)
 _INTERNAL_TOKEN_HEADERS = ("x-internal-token",)
-_SUPPORTED_USER_ROLES = {"user", "admin"}
+_CAP_WRITE_HEADERS = ("x-mint-cap-write",)
+_CAP_VIEW_INTERNAL_ERRORS_HEADERS = ("x-mint-cap-view-internal-errors",)
+_CAP_BYPASS_OWNERSHIP_HEADERS = ("x-mint-cap-bypass-ownership",)
+_CAP_MANAGE_SYSTEM_HEADERS = ("x-mint-cap-manage-system",)
+_SUPPORTED_USER_ROLES = {"user", "admin", "internal"}
 
 
 def _canonical_headers(headers: dict[str, str]) -> dict[str, str]:
@@ -40,6 +51,13 @@ def _get_first_header(headers: dict[str, str], names: tuple[str, ...]) -> str:
         if value:
             return value
     return ""
+
+
+def _has_any_header(headers: dict[str, str], names: tuple[str, ...]) -> bool:
+    for name in names:
+        if name in headers:
+            return True
+    return False
 
 
 def _require_header(headers: dict[str, str], names: tuple[str, ...], field_name: str) -> str:
@@ -58,16 +76,6 @@ def _validate_object_id(value: str, field_name: str) -> str:
     return value.lower()
 
 
-def has_gateway_auth_headers(headers: dict[str, str]) -> bool:
-    headers = _canonical_headers(headers)
-    return bool(
-        _get_first_header(headers, _USER_ID_HEADERS)
-        or _get_first_header(headers, _USER_ROLE_HEADERS)
-        or _get_first_header(headers, _ACCOUNT_ID_HEADERS)
-        or _get_first_header(headers, _APIKEY_ID_HEADERS)
-    )
-
-
 def _validate_internal_token(headers: dict[str, str], internal_api_token: str) -> None:
     if not internal_api_token:
         raise HTTPException(status_code=503, detail="Gateway auth is not configured on this server")
@@ -83,6 +91,55 @@ def _validate_user_role(value: str) -> str:
     return role
 
 
+def _parse_bool_header(headers: dict[str, str], names: tuple[str, ...], field_name: str) -> bool:
+    raw = _get_first_header(headers, names)
+    if raw == "":
+        return False
+    normalized = raw.strip().lower()
+    if normalized in _TRUE_VALUES:
+        return True
+    if normalized in _FALSE_VALUES:
+        return False
+    raise HTTPException(status_code=400, detail=f"Invalid {field_name}: expected boolean")
+
+
+def _extract_cap_headers(headers: dict[str, str]) -> tuple[bool, bool, bool, bool, bool]:
+    cap_names = (
+        _CAP_WRITE_HEADERS,
+        _CAP_VIEW_INTERNAL_ERRORS_HEADERS,
+        _CAP_BYPASS_OWNERSHIP_HEADERS,
+        _CAP_MANAGE_SYSTEM_HEADERS,
+    )
+    caps_from_headers = any(_has_any_header(headers, names) for names in cap_names)
+    if not caps_from_headers:
+        return False, False, False, False, False
+    return (
+        True,
+        True,
+        _parse_bool_header(
+            headers,
+            _CAP_VIEW_INTERNAL_ERRORS_HEADERS,
+            "X-MinT-Cap-View-Internal-Errors",
+        ),
+        _parse_bool_header(headers, _CAP_BYPASS_OWNERSHIP_HEADERS, "X-MinT-Cap-Bypass-Ownership"),
+        _parse_bool_header(headers, _CAP_MANAGE_SYSTEM_HEADERS, "X-MinT-Cap-Manage-System"),
+    )
+
+
+def has_gateway_auth_headers(headers: dict[str, str]) -> bool:
+    headers = _canonical_headers(headers)
+    return bool(
+        _get_first_header(headers, _USER_ID_HEADERS)
+        or _get_first_header(headers, _USER_ROLE_HEADERS)
+        or _get_first_header(headers, _ACCOUNT_ID_HEADERS)
+        or _get_first_header(headers, _APIKEY_ID_HEADERS)
+        or _has_any_header(headers, _CAP_WRITE_HEADERS)
+        or _has_any_header(headers, _CAP_VIEW_INTERNAL_ERRORS_HEADERS)
+        or _has_any_header(headers, _CAP_BYPASS_OWNERSHIP_HEADERS)
+        or _has_any_header(headers, _CAP_MANAGE_SYSTEM_HEADERS)
+    )
+
+
 def extract_gateway_auth_context_from_headers(
     headers: dict[str, str],
     *,
@@ -95,9 +152,14 @@ def extract_gateway_auth_context_from_headers(
         _require_header(headers, _USER_ID_HEADERS, "X-MinT-User-Id"),
         "X-MinT-User-Id",
     )
-    user_role = _validate_user_role(
-        _require_header(headers, _USER_ROLE_HEADERS, "X-MinT-User-Role")
-    )
+    caps_from_headers, cap_write, cap_view_internal_errors, cap_bypass_ownership, cap_manage_system = _extract_cap_headers(headers)
+    role_value = _get_first_header(headers, _USER_ROLE_HEADERS)
+    if caps_from_headers:
+        user_role = _validate_user_role(role_value) if role_value else "user"
+    else:
+        user_role = _validate_user_role(
+            _require_header(headers, _USER_ROLE_HEADERS, "X-MinT-User-Role")
+        )
     account_id_raw = _get_first_header(headers, _ACCOUNT_ID_HEADERS) or user_id
     account_id = _validate_object_id(account_id_raw, "X-MinT-Account-Id")
     apikey_id = _validate_object_id(
@@ -113,6 +175,11 @@ def extract_gateway_auth_context_from_headers(
         apikey_id=apikey_id,
         request_id=request_id,
         session_id=session_id,
+        cap_write=cap_write,
+        cap_view_internal_errors=cap_view_internal_errors,
+        cap_bypass_ownership=cap_bypass_ownership,
+        cap_manage_system=cap_manage_system,
+        caps_from_headers=caps_from_headers,
     )
 
 
@@ -142,6 +209,11 @@ def build_billing_auth_context(
             apikey_id=ctx.apikey_id,
             request_id=request_id,
             session_id=ctx.session_id,
+            cap_write=ctx.cap_write,
+            cap_view_internal_errors=ctx.cap_view_internal_errors,
+            cap_bypass_ownership=ctx.cap_bypass_ownership,
+            cap_manage_system=ctx.cap_manage_system,
+            caps_from_headers=ctx.caps_from_headers,
         )
 
     user_data = getattr(request.state, "user_data", None)
@@ -171,6 +243,11 @@ def build_billing_auth_context(
             apikey_id=_validate_object_id(apikey_id, "apikey_id"),
             request_id=request_id,
             session_id=session_id,
+            cap_write=True,
+            cap_view_internal_errors=bool(user_data.get("cap_view_internal_errors")),
+            cap_bypass_ownership=bool(user_data.get("cap_bypass_ownership")),
+            cap_manage_system=bool(user_data.get("cap_manage_system")),
+            caps_from_headers=bool(user_data.get("caps_from_headers")),
         )
     except HTTPException:
         return None

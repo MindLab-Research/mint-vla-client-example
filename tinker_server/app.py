@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import time
@@ -39,13 +38,12 @@ from .logging_context import (
     set_trace_id,
 )
 from .ray_utils import init_ray, ray_address_source_configured, ray_connection_epoch, ray_reconnect_poll_s
-from .routes import futures, internal, mint, openai_compat, sampling, service, training, weights
+from .routes import action_sampling, futures, internal, openai_compat, sampling, service, training, weights
 from .server_info import _git_sha
 from .token_encryptor import TokenEncryptor
 
 if TYPE_CHECKING:
     from .backend.multi_lora_engine import MultiModelInferenceManager
-    from .backend.verl_training import VerlTrainingEngine
 
 logging.basicConfig(
     level=logging.INFO,
@@ -53,6 +51,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 _STARTUP_LEASE_ROLE = os.environ.get("MINT_STARTUP_LEASE_ROLE", "mint_api_startup_owner")
+_DISABLE_MINT_ROUTE = os.environ.get("MINT_DISABLE_MINT_ROUTE", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+if _DISABLE_MINT_ROUTE:
+    mint = None
+else:
+    from .routes import mint
 
 
 def _http_route_label(request: Request) -> str:
@@ -74,6 +83,30 @@ def _should_preload_openai_tokenizers() -> bool:
     except Exception:
         workers = 1
     return workers <= 1
+
+
+def _queue_execution_runtime_start_timeout_s() -> float:
+    raw = os.environ.get("MINT_QUEUE_EXECUTION_RUNTIME_START_TIMEOUT_S", "").strip()
+    if raw:
+        try:
+            return max(1.0, float(raw))
+        except ValueError:
+            logger.warning(
+                "Invalid MINT_QUEUE_EXECUTION_RUNTIME_START_TIMEOUT_S=%r, using default",
+                raw,
+            )
+    models_csv = (config.prewarm_persistent_models_csv or "").strip()
+    prewarm_requested = bool(models_csv) and (
+        bool(config.prewarm_enable_training) or bool(config.prewarm_enable_inference)
+    )
+    if prewarm_requested:
+        return max(1800.0, float(config.prewarm_megatron_ready_timeout_s) + 300.0)
+    return 120.0
+
+
+def _skip_api_work_queue_execution_ready_wait() -> bool:
+    raw = os.environ.get("MINT_API_WORK_QUEUE_SKIP_READY_WAIT", "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 async def _cleanup_stale_actors() -> None:
@@ -142,394 +175,19 @@ async def _shutdown_local_training_runtime(train_manager) -> None:
 
 
 def _clear_local_execution_route_globals() -> None:
-    from .routes import mint, sampling, service, training, weights
+    from .routes import sampling, service, training, weights
 
     service.session_manager = None
     sampling.session_manager = None
     training.training_manager = None
     training.training_engine = None
     training.inference_manager = None
-    mint.training_manager = None
-    mint.training_engine = None
+    if mint is not None:
+        mint.training_manager = None
+        mint.training_engine = None
     weights.training_manager = None
     weights.training_engine = None
     weights.inference_manager = None
-
-async def _prewarm_persistent_models(
-    train_engine: VerlTrainingEngine | None,
-    multi_model_manager: MultiModelInferenceManager | None,
-) -> None:
-    """Pre-create and protect persistent actors at server startup.
-
-    Controlled by:
-      - MINT_PERSISTENT_MODELS: comma-separated HF model names
-      - MINT_PERSISTENT_TRAIN_LORA_RANK (default: 16)
-      - MINT_PERSISTENT_TRAIN_LR (default: 5e-5)
-
-    When enabled, creates:
-      - Training actors (pooled PEFT trainers and MegatronWorkerGroup)
-      - vLLM inference actors (MultiModelInferenceManager)
-
-    and marks them as ResourcePool protected to prevent LRU eviction.
-    """
-    failures: list[str] = []
-
-    def _record_failure(stage: str, model_name: str, exc: Exception) -> None:
-        failures.append(f"{stage} failed model={model_name}: {type(exc).__name__}: {exc}")
-
-    def _raise_if_failures() -> None:
-        if failures:
-            raise RuntimeError("persistent prewarm failed:\n" + "\n".join(failures))
-
-    models_csv = (config.prewarm_persistent_models_csv or "").strip()
-    if not models_csv:
-        logger.info("No persistent models configured (MINT_PERSISTENT_MODELS empty); skipping prewarm")
-        return
-
-    models = [m.strip() for m in models_csv.split(",") if m.strip()]
-    if not models:
-        logger.info("No persistent models configured (MINT_PERSISTENT_MODELS parsed empty); skipping prewarm")
-        return
-
-    lora_rank = int(config.prewarm_train_lora_rank)
-    learning_rate = float(config.prewarm_train_lr)
-    megatron_ready_timeout_s = float(config.prewarm_megatron_ready_timeout_s)
-    prewarm_training_requested = bool(config.prewarm_enable_training)
-    prewarm_training = prewarm_training_requested and train_engine is not None
-    prewarm_inference = bool(config.prewarm_enable_inference)
-    if prewarm_training_requested and train_engine is None:
-        raise RuntimeError(
-            "persistent prewarm training configured but unavailable in API process; "
-            "detached queue runtime owns training execution state"
-        )
-
-    from tinker_server.backend.model_registry import (
-        get_model_config,
-        get_training_parallelism,
-        normalize_model_name,
-        requires_fp8,
-    )
-    from tinker_server.backend.resource_pool import get_resource_pool
-
-    resource_pool = get_resource_pool()
-    import ray
-
-    pinned_vllm_node_ip: dict[str, str] = {}
-    pinned_vllm_node_ip_json = os.environ.get("MINT_VLLM_PINNED_NODE_IP_JSON")
-    if pinned_vllm_node_ip_json:
-        try:
-            parsed = json.loads(pinned_vllm_node_ip_json)
-            if isinstance(parsed, dict):
-                pinned_vllm_node_ip = {str(k): str(v) for k, v in parsed.items()}
-        except Exception:
-            pinned_vllm_node_ip = {}
-
-    def _preferred_pg_node_id(pg_name: str, model_name: str) -> str | None:
-        preferred_ips: list[str] = []
-        for env_name in ("MINT_MEGATRON_MODEL_NODE_IPS_JSON", "MINT_MODEL_NODE_IPS_JSON"):
-            raw = os.environ.get(env_name, "").strip()
-            if not raw:
-                continue
-            try:
-                data = json.loads(raw)
-            except Exception:
-                continue
-            if not isinstance(data, dict):
-                continue
-            selected = None
-            for key in (model_name, model_name.lower()):
-                selected = data.get(key)
-                if selected is not None:
-                    break
-            if isinstance(selected, list):
-                preferred_ips.extend(str(ip).strip() for ip in selected if str(ip).strip())
-            if preferred_ips:
-                break
-
-        node_ip_by_id = {
-            str(n.get("NodeID") or ""): str(n.get("NodeManagerAddress") or "").strip()
-            for n in ray.nodes()
-            if n.get("Alive")
-        }
-        candidate_node_ids: list[str] = []
-        for info in ray.util.placement_group_table().values():
-            if info.get("state") != "CREATED" or info.get("name") != pg_name:
-                continue
-            bundles_to_node_id = info.get("bundles_to_node_id") or {}
-            for node_id in bundles_to_node_id.values():
-                node_id_str = str(node_id or "").strip()
-                if node_id_str:
-                    candidate_node_ids.append(node_id_str)
-        if not candidate_node_ids:
-            return None
-        if preferred_ips:
-            for node_id in candidate_node_ids:
-                if node_ip_by_id.get(node_id) in preferred_ips:
-                    return node_id
-            return None
-        return candidate_node_ids[0]
-
-    logger.info(
-        f"[prewarm] persistent models={models} train_lora_rank={lora_rank} train_lr={learning_rate} "
-        f"megatron_ready_timeout_s={megatron_ready_timeout_s} "
-        f"prewarm_training={prewarm_training} prewarm_inference={prewarm_inference}"
-    )
-
-    # Order by descending GPU footprint to avoid fragmenting the cluster before
-    # large multi-node actors (e.g., 235B vLLM TP=16) are created.
-    ordered: list[tuple[int, str, str]] = []
-    for model in models:
-        try:
-            model_name = normalize_model_name(model)
-        except Exception:
-            model_name = model
-        try:
-            cfg = get_model_config(model_name)
-            gpus = max(cfg.train_gpus, cfg.total_gpus)
-        except Exception:
-            gpus = 0
-        ordered.append((gpus, model_name, model))
-    ordered.sort(key=lambda x: (-x[0], x[1]))
-
-    deferred_dense_training: list[tuple[str, str]] = []
-
-    for _, model_name, _raw_model in ordered:
-        try:
-            cfg = get_model_config(model_name)
-        except Exception as e:
-            logger.exception(f"[prewarm] unknown model in MINT_PERSISTENT_MODELS: {model_name}: {e}")
-            continue
-
-        if prewarm_training:
-            # -------------------------
-            # Training actor prewarm
-            # -------------------------
-            try:
-                base_model = model_name
-                if model_name and not model_name.startswith("/"):
-                    base_model = train_engine._resolve_hf_model_path(model_name)
-                    if not base_model:
-                        raise RuntimeError(f"HF cache path not found for {model_name}")
-
-                if cfg.is_moe:
-                    from tinker_server.backend.megatron_distributed import (
-                        DistributedConfig,
-                        _make_megatron_actor_name,
-                        async_get_or_create_megatron_worker_group,
-                    )
-
-                    train_tp, train_pp, train_ep, train_cp, train_etp = get_training_parallelism(model_name)
-                    use_fp8 = requires_fp8(model_name)
-                    distributed_config = DistributedConfig(
-                        tensor_parallel_size=train_tp,
-                        pipeline_parallel_size=train_pp,
-                        expert_parallel_size=train_ep,
-                        context_parallel_size=train_cp,
-                        expert_tensor_parallel_size=train_etp,
-                        use_fp8=use_fp8,
-                    )
-
-                    logger.info(
-                        f"[prewarm] training create start model={model_name} backend=megatron "
-                        f"TP={train_tp} PP={train_pp} EP={train_ep} CP={train_cp} ETP={train_etp} world_size={distributed_config.world_size}"
-                    )
-                    actor = await async_get_or_create_megatron_worker_group(
-                        base_model=base_model,
-                        lora_rank=lora_rank,
-                        learning_rate=learning_rate,
-                        distributed_config=distributed_config,
-                        session_id=None,
-                        observability_base_model=model_name,
-                    )
-                    actor_name = _make_megatron_actor_name(base_model or model_name)
-                    # Protect as soon as the actor is registered, so readiness timeouts don't leave it evictable.
-                    resource_pool.set_protected(actor_name, True)
-                    logger.info(f"[prewarm] training __ray_ready__ scheduled model={model_name} actor={actor_name}")
-
-                    if (
-                        cfg.vllm_engine == "async"
-                        and cfg.vllm_distributed_executor_backend == "mp"
-                        and (cfg.train_gpus + cfg.total_gpus) <= 8
-                    ):
-                        try:
-                            pg_name = f"{actor_name}_pg"
-                            node_id = None
-                            deadline = time.monotonic() + 30.0
-                            while time.monotonic() < deadline and not node_id:
-                                node_id = _preferred_pg_node_id(pg_name, model_name)
-                                if not node_id:
-                                    await asyncio.sleep(0.5)
-                            if node_id:
-                                for n in ray.nodes():
-                                    if n.get("NodeID") == node_id:
-                                        ip = n.get("NodeManagerAddress")
-                                        if isinstance(ip, str) and ip.strip():
-                                            pinned_vllm_node_ip[model_name] = ip.strip()
-                                            logger.info(
-                                                f"[prewarm] pin_infer model={model_name} pg={pg_name} node_ip={ip.strip()}"
-                                            )
-                                        break
-                        except Exception as pin_err:
-                            logger.warning(
-                                f"[prewarm] training pin_infer_to_pg_node failed model={model_name}: {pin_err}"
-                            )
-
-                    try:
-                        await asyncio.to_thread(
-                            ray.get,
-                            actor.__ray_ready__.remote(),
-                            timeout=megatron_ready_timeout_s,
-                        )
-                        resource_pool.mark_ready(actor_name)
-                        logger.info(f"[prewarm] training ready+protected model={model_name} actor={actor_name}")
-                    except SystemExit as ready_err:
-                        if getattr(ready_err, "code", None) == 15:
-                            raise
-                        raise RuntimeError(
-                            f"[prewarm] training __ray_ready__ SystemExit model={model_name} actor={actor_name}: {ready_err}"
-                        ) from ready_err
-                    except Exception as ready_err:
-                        raise RuntimeError(
-                            f"[prewarm] training __ray_ready__ failed/timeout model={model_name} actor={actor_name}: {ready_err}"
-                        ) from ready_err
-                else:
-                    # Defer dense pool creation until after multi-node vLLM inference is initialized,
-                    # to avoid fragmenting the remaining 8-GPU nodes into 1-2 free GPUs each.
-                    deferred_dense_training.append((model_name, base_model))
-                    logger.info(f"[prewarm] training deferred model={model_name} backend=dense_pool")
-            except Exception as e:
-                _record_failure("training", model_name, e)
-                logger.exception(f"[prewarm] training failed model={model_name}: {e}")
-        else:
-            logger.info(f"[prewarm] training skipped model={model_name} (MINT_PERSISTENT_PREWARM_TRAINING=0)")
-
-        # -------------------------
-        # Inference (vLLM) prewarm
-        # -------------------------
-        if multi_model_manager is None:
-            logger.warning(f"[prewarm] inference skipped (multi-LoRA disabled) model={model_name}")
-            continue
-
-        # NOTE: prewarm inference is scheduled after training loop, ordered to avoid
-        # multi-node vLLM initialization fragmenting the cluster before 4-GPU single-node vLLM
-        # actors (e.g., Qwen3-30B TP=4) can be placed.
-
-    if not prewarm_inference:
-        _raise_if_failures()
-        return
-
-    if multi_model_manager is None:
-        _raise_if_failures()
-        return
-
-    def _infer_gpus(model_name: str) -> int:
-        try:
-            cfg = get_model_config(model_name)
-            return int(cfg.total_gpus)
-        except Exception:
-            return 0
-
-    def _infer_is_moe(model_name: str) -> bool:
-        try:
-            cfg = get_model_config(model_name)
-            return bool(cfg.is_moe)
-        except Exception:
-            return False
-
-    # Order inference:
-    # - Single-node MoE first (e.g., Qwen3-30B TP=4) to ensure a 4-GPU slot exists.
-    # - Multi-node next (e.g., Qwen3-235B TP=16) while 8-GPU nodes are still mostly free.
-    # - Dense models last (0.6B/4B) to avoid consuming 1 GPU on every free node.
-    infer_models = [m for _, m, _ in ordered]
-    infer_moe_single = [m for m in infer_models if _infer_is_moe(m) and _infer_gpus(m) <= 8]
-    infer_multi = [m for m in infer_models if _infer_gpus(m) > 8]
-    infer_multi.sort(key=lambda m: (-_infer_gpus(m), m))
-    infer_dense = [m for m in infer_models if not _infer_is_moe(m) and _infer_gpus(m) <= 8]
-    infer_moe_single.sort(key=lambda m: (-_infer_gpus(m), m))
-    infer_dense.sort(key=lambda m: (-_infer_gpus(m), m))
-
-    # For 2-node clusters (e.g., 16 GPUs as 2x 8-GPU nodes), avoid fragmenting nodes by
-    # pinning dense models to a separate node from single-node MoE models.
-    try:
-        gpu_node_ips = sorted(
-            {
-                str(n.get("NodeManagerAddress") or "").strip()
-                for n in ray.nodes()
-                if n.get("Alive")
-                and float((n.get("Resources") or {}).get("GPU", 0) or 0) > 0
-                and str(n.get("NodeManagerAddress") or "").strip()
-            }
-        )
-        if len(gpu_node_ips) == 2:
-            moe_ip, dense_ip = gpu_node_ips[0], gpu_node_ips[1]
-            for m in infer_moe_single:
-                pinned_vllm_node_ip.setdefault(m, moe_ip)
-            for m in infer_dense:
-                pinned_vllm_node_ip.setdefault(m, dense_ip)
-    except Exception:
-        pass
-
-    if pinned_vllm_node_ip:
-        os.environ["MINT_VLLM_PINNED_NODE_IP_JSON"] = json.dumps(pinned_vllm_node_ip)
-        logger.info(f"[prewarm] MINT_VLLM_PINNED_NODE_IP_JSON={os.environ['MINT_VLLM_PINNED_NODE_IP_JSON']}")
-
-    timeout_s = float(os.environ.get("MINT_PERSISTENT_INFER_TIMEOUT_S", "1800"))
-
-    for model_name in infer_moe_single + infer_multi + infer_dense:
-        try:
-            logger.info(f"[prewarm] inference create start model={model_name} timeout_s={timeout_s}")
-            engine = await asyncio.wait_for(multi_model_manager.get_engine(model_name), timeout=timeout_s)
-            actor_name = getattr(engine, "actor_name", None)
-            if not actor_name:
-                raise RuntimeError("engine has no actor_name")
-            ok = resource_pool.set_protected(actor_name, True)
-            if not ok:
-                for _ in range(50):
-                    await asyncio.sleep(0.1)
-                    ok = resource_pool.set_protected(actor_name, True)
-                    if ok:
-                        break
-            if ok:
-                logger.info(f"[prewarm] inference ready+protected model={model_name} actor={actor_name}")
-            else:
-                logger.warning(f"[prewarm] inference ready (but not in ResourcePool) model={model_name} actor={actor_name}")
-        except SystemExit as e:
-            if getattr(e, "code", None) == 15:
-                raise
-            _record_failure("inference", model_name, e)
-            logger.exception(f"[prewarm] inference SystemExit model={model_name}: {e}")
-        except Exception as e:
-            _record_failure("inference", model_name, e)
-            logger.exception(f"[prewarm] inference failed model={model_name}: {e}")
-
-    # -------------------------
-    # Dense training pools (deferred)
-    # -------------------------
-    if prewarm_training and deferred_dense_training:
-        from tinker_server.backend.dense_trainer import get_or_create_dense_trainer
-        from tinker_server.backend.verl_training import TrainingWorker
-
-        for model_name, base_model in deferred_dense_training:
-            try:
-                logger.info(f"[prewarm] training create start model={model_name} backend=peft_trainer")
-                dense = await asyncio.to_thread(
-                    get_or_create_dense_trainer,
-                    training_worker_cls=TrainingWorker,
-                    base_model=base_model,
-                    model_key=model_name,
-                    lora_rank=lora_rank,
-                    learning_rate=learning_rate,
-                    session_id=None,
-                )
-                actor_name = dense.actor_name
-                resource_pool.set_protected(actor_name, True)
-                logger.info(f"[prewarm] training ready+protected model={model_name} actor={actor_name}")
-            except Exception as e:
-                _record_failure("training", model_name, e)
-                logger.exception(f"[prewarm] training failed model={model_name} backend=peft_trainer: {e}")
-
-    _raise_if_failures()
-
 
 async def _restore_sampling_sessions(inference_manager: SessionManager) -> int:
     """Restore detached sampling-session metadata into SessionManager."""
@@ -607,6 +265,12 @@ async def lifespan(app: FastAPI):
     else:
         owner_runtime = await owner_runtime_supervisor.async_ensure_started()
 
+    from .backend.action_session_manager import ActionSessionRouter
+
+    action_manager = ActionSessionRouter()
+    action_sampling.action_session_manager = action_manager
+    if mint is not None:
+        mint.action_session_manager = action_manager
     try:
         from .backend.dense_session_state import cleanup_legacy_dense_session_state_once
         from .backend.training_session_store import list_training_sessions
@@ -717,6 +381,14 @@ async def lifespan(app: FastAPI):
             logger.info("Skipping stale-actor cleanup on follower worker")
 
         # ==========================================================================
+        # Action route layer: process-local router can recover detached runtimes
+        # from ResourcePool metadata after API or worker restarts.
+        # ==========================================================================
+        action_sampling.action_session_manager = action_manager
+        if mint is not None:
+            mint.action_session_manager = action_manager
+
+        # ==========================================================================
         # Inference route layer: stateless API path uses detached stores only
         # ==========================================================================
         inference_manager = None
@@ -730,8 +402,9 @@ async def lifespan(app: FastAPI):
         training.training_manager = None
         training.training_engine = None
         training.inference_manager = None
-        mint.training_manager = None
-        mint.training_engine = None
+        if mint is not None:
+            mint.training_manager = None
+            mint.training_engine = None
         weights.training_manager = None
         weights.training_engine = None
         weights.inference_manager = None
@@ -740,12 +413,10 @@ async def lifespan(app: FastAPI):
         )
 
         # ==========================================================================
-        # Persistent prewarm hook (API process has no local training runtime)
+        # Persistent prewarm runs inside the execution runtime that owns training state.
         # ==========================================================================
-        if startup_owner:
-            await _prewarm_persistent_models(None, multi_model_manager)
-        else:
-            logger.info("Skipping persistent prewarm on follower worker")
+        if not startup_owner:
+            logger.info("Skipping execution-runtime prewarm on follower worker")
 
         # ==========================================================================
         # OpenAI compat: preload tokenizers only for single-worker startup.
@@ -774,25 +445,50 @@ async def lifespan(app: FastAPI):
         from .backend.capacity_manager import capacity_manager
         from .backend.queue_execution_runtime import queue_execution_runtime
 
+        logger.info("startup stage=before_capacity_manager_ready")
         await capacity_manager.async_ensure_ready(timeout_s=180.0)
+        logger.info("startup stage=after_capacity_manager_ready")
+        logger.info("startup stage=before_api_work_queue_started")
         await api_work_queue.async_ensure_started()
+        logger.info("startup stage=after_api_work_queue_started")
         if os.environ.get("MINT_QUEUE_EXECUTION_RUNTIME_LOCAL_ONLY", "").strip().lower() in {"1", "true", "yes", "on"}:
             from .backend.api_work_queue_dispatch import register_api_work_queue_executors
-            from .backend.queue_execution_runtime import _initialize_execution_bindings
+            from .backend.queue_execution_runtime import _initialize_execution_runtime
 
             logger.warning(
                 "Using local queue execution runtime fallback in API process "
                 "(MINT_QUEUE_EXECUTION_RUNTIME_LOCAL_ONLY=1)"
             )
-            bindings = await _initialize_execution_bindings()
+            logger.info("startup stage=before_local_initialize_execution_runtime")
+            bindings = await _initialize_execution_runtime(prewarm=startup_owner)
+            logger.info("startup stage=after_local_initialize_execution_runtime")
             inference_manager = bindings.get("inference_manager")
             train_manager = bindings.get("train_manager")
             multi_model_manager = bindings.get("multi_model_manager")
+            logger.info("startup stage=before_register_api_work_queue_executors")
             register_api_work_queue_executors(api_work_queue)
+            logger.info("startup stage=after_register_api_work_queue_executors")
+            logger.info("startup stage=before_api_work_queue_start_workers")
             await api_work_queue.start_workers(num_workers=int(config.api_work_queue_num_workers))
-            await api_work_queue.wait_until_execution_ready(timeout_s=120.0)
+            logger.info("startup stage=after_api_work_queue_start_workers")
+            if _skip_api_work_queue_execution_ready_wait():
+                logger.warning(
+                    "Skipping api_work_queue execution-ready startup wait "
+                    "(MINT_API_WORK_QUEUE_SKIP_READY_WAIT=1)"
+                )
+            else:
+                logger.info("startup stage=before_api_work_queue_execution_ready_wait")
+                await api_work_queue.wait_until_execution_ready(
+                    timeout_s=_queue_execution_runtime_start_timeout_s()
+                )
+                logger.info("startup stage=after_api_work_queue_execution_ready_wait")
         else:
-            await queue_execution_runtime.async_ensure_started(num_workers=int(config.api_work_queue_num_workers))
+            logger.info("startup stage=before_remote_queue_execution_runtime_started")
+            await queue_execution_runtime.async_ensure_started(
+                num_workers=int(config.api_work_queue_num_workers),
+                timeout_s=_queue_execution_runtime_start_timeout_s(),
+            )
+            logger.info("startup stage=after_remote_queue_execution_runtime_started")
 
         async def _ray_reconnect_watch_loop() -> None:
             nonlocal last_ray_connection_epoch
@@ -1207,6 +903,11 @@ async def api_key_auth_middleware(request: Request, call_next):
                 "apikey_id": auth_ctx.apikey_id,
                 "request_id": auth_ctx.request_id,
                 "session_id": auth_ctx.session_id,
+                "cap_write": auth_ctx.cap_write,
+                "cap_view_internal_errors": auth_ctx.cap_view_internal_errors,
+                "cap_bypass_ownership": auth_ctx.cap_bypass_ownership,
+                "cap_manage_system": auth_ctx.cap_manage_system,
+                "caps_from_headers": auth_ctx.caps_from_headers,
             }
             with bind_request_trace_context(
                 request_id=auth_ctx.request_id,
@@ -1274,11 +975,13 @@ async def api_key_auth_middleware(request: Request, call_next):
 
 # Register routes with API prefix
 app.include_router(service.router, prefix="/api/v1", tags=["service"])
+app.include_router(action_sampling.router, prefix="/api/v1", tags=["action_sampling"])
 app.include_router(sampling.router, prefix="/api/v1", tags=["sampling"])
 app.include_router(futures.router, prefix="/api/v1", tags=["futures"])
 app.include_router(training.router, prefix="/api/v1", tags=["training"])
 app.include_router(weights.router, prefix="/api/v1", tags=["weights"])
-app.include_router(mint.router, prefix="/api/v1/mint", tags=["mint"])
+if mint is not None:
+    app.include_router(mint.router, prefix="/api/v1/mint", tags=["mint"])
 app.include_router(openai_compat.router, prefix="/oai/api/v1", tags=["openai-compat"])
 app.include_router(internal.router, prefix="/internal", tags=["internal"])
 

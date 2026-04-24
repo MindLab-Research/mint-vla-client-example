@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -16,26 +17,60 @@ except ModuleNotFoundError:  # pragma: no cover
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PYPROJECT = REPO_ROOT / "pyproject.toml"
+DEFAULT_INSPECT_PROBE_MODULES = (
+    "openpi.training.config",
+    "openpi.training.data_loader",
+    "openpi_client.image_tools",
+    "jax",
+    "flax",
+    "optax",
+    "orbax.checkpoint",
+)
+DEFAULT_UV_HTTP_TIMEOUT = "300"
 
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+def _subprocess_env(env: dict[str, str] | None = None) -> dict[str, str]:
+    merged = os.environ.copy()
+    if env:
+        merged.update(env)
+    merged.setdefault("UV_HTTP_TIMEOUT", DEFAULT_UV_HTTP_TIMEOUT)
+    xdg_cache_home = merged.get("XDG_CACHE_HOME")
+    if "UV_CACHE_DIR" not in merged and xdg_cache_home:
+        uv_cache_dir = Path(xdg_cache_home) / "uv"
+        uv_cache_dir.mkdir(parents=True, exist_ok=True)
+        merged["UV_CACHE_DIR"] = str(uv_cache_dir)
+    if "TMPDIR" not in merged:
+        if xdg_cache_home:
+            tmpdir = Path(xdg_cache_home) / "tmp"
+            tmpdir.mkdir(parents=True, exist_ok=True)
+            merged["TMPDIR"] = str(tmpdir)
+    return merged
+
+
 def _run(cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
-    subprocess.run(cmd, cwd=cwd, env=env, check=True)
+    subprocess.run(cmd, cwd=cwd, env=_subprocess_env(env), check=True)
 
 
 def _capture(cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None) -> str:
-    return subprocess.check_output(cmd, cwd=cwd, env=env, text=True)
+    return subprocess.check_output(cmd, cwd=cwd, env=_subprocess_env(env), text=True)
 
 
 def _resolve_uv() -> str:
+    explicit = (os.environ.get("UV_BIN") or "").strip()
+    if explicit:
+        candidate = Path(explicit)
+        if candidate.exists():
+            return str(candidate)
+        raise RuntimeError(f"UV_BIN points to a missing path: {explicit}")
     uv = shutil.which("uv")
     if uv:
         return uv
     candidate = Path.home() / ".local" / "bin" / "uv"
     if candidate.exists():
         return str(candidate)
-    raise RuntimeError("uv executable not found; install uv or add it to PATH")
+    raise RuntimeError("uv executable not found; set UV_BIN, install uv, or add it to PATH")
 
 
 def _load_pyproject() -> dict[str, Any]:
@@ -53,7 +88,36 @@ def _shared_deps(pyproject: dict[str, Any]) -> list[str]:
 
 def _host_deps(pyproject: dict[str, Any]) -> list[str]:
     groups = pyproject.get("dependency-groups", {})
-    return list(groups.get("host-runtime", []))
+    deps = list(groups.get("host-runtime", []))
+    deps.extend(_runtime_table(pyproject).get("host_requirements", []))
+    seen: set[str] = set()
+    out: list[str] = []
+    for dep in deps:
+        if dep in seen:
+            continue
+        seen.add(dep)
+        out.append(dep)
+    return out
+
+
+def _requirement_name(requirement: str) -> str:
+    name = requirement.split(";", 1)[0].strip()
+    name = name.split("@", 1)[0].strip()
+    for marker in ("==", ">=", "<=", "~=", "!=", ">", "<"):
+        name = name.split(marker, 1)[0].strip()
+    name = name.split("[", 1)[0].strip()
+    return name.lower().replace("_", "-")
+
+
+def _partition_host_requirements(requirements: list[str]) -> tuple[list[str], list[str]]:
+    torch_backend_requirements: list[str] = []
+    generic_requirements: list[str] = []
+    for requirement in requirements:
+        if _requirement_name(requirement) == "torch":
+            torch_backend_requirements.append(requirement)
+            continue
+        generic_requirements.append(requirement)
+    return torch_backend_requirements, generic_requirements
 
 
 def _runtime_env_symbols():
@@ -63,6 +127,7 @@ def _runtime_env_symbols():
         DEFAULT_SITE_PACKAGES_DIRNAME,
         DEFAULT_SOURCE_DIRNAME,
         checkout_runtime_env_layout,
+        runtime_env_layout,
     )
 
     return {
@@ -71,7 +136,49 @@ def _runtime_env_symbols():
         "DEFAULT_SITE_PACKAGES_DIRNAME": DEFAULT_SITE_PACKAGES_DIRNAME,
         "DEFAULT_SOURCE_DIRNAME": DEFAULT_SOURCE_DIRNAME,
         "checkout_runtime_env_layout": checkout_runtime_env_layout,
+        "runtime_env_layout": runtime_env_layout,
     }
+
+
+def _load_manifest(env_root: Path) -> dict[str, Any]:
+    manifest_path = env_root / "manifest.json"
+    if not manifest_path.exists():
+        raise RuntimeError(f"missing manifest.json under {env_root}")
+    return json.loads(manifest_path.read_text(encoding="utf-8"))
+
+
+def _required_runtime_paths(layout) -> list[str]:
+    return [
+        layout.site_packages,
+        *layout.pythonpath_entries[1:],
+        layout.base_python_root,
+        layout.host_venv_root,
+        layout.host_python,
+        *layout.host_pythonpath_entries,
+    ]
+
+
+def _probe_module(host_python: str, module: str) -> dict[str, Any]:
+    out = subprocess.run(
+        [
+            host_python,
+            "-c",
+            (
+                "import importlib, sys; "
+                "importlib.import_module(sys.argv[1])"
+            ),
+            module,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    detail = (out.stderr or out.stdout).strip()
+    result = {
+        "ok": out.returncode == 0,
+    }
+    if detail:
+        result["detail"] = detail
+    return result
 
 def _clone_checkout(target: Path, *, repo: str, commit: str) -> None:
     if target.exists():
@@ -105,22 +212,13 @@ def _export_shared_requirements(pyproject: dict[str, Any], output: Path) -> None
     )
 
 
-def _export_host_requirements(output: Path) -> None:
-    _run(
-        [
-            _resolve_uv(),
-            "export",
-            "--frozen",
-            "--no-hashes",
-            "--no-emit-project",
-            "--no-dev",
-            "--only-group",
-            "host-runtime",
-            "--output-file",
-            str(output),
-        ],
-        cwd=REPO_ROOT,
-    )
+def _export_host_requirements(pyproject: dict[str, Any], output: Path) -> None:
+    lines = [
+        "# Direct host requirements for the Mint runtime host venv.",
+        *(_host_deps(pyproject)),
+        "",
+    ]
+    output.write_text("\n".join(lines), encoding="utf-8")
 
 
 def _install_target(python: Path, target: Path, requirements_file: Path) -> None:
@@ -147,20 +245,35 @@ def _materialize_base_python(
     python_request: str,
     base_python_root: Path,
 ) -> Path:
-    uv = _resolve_uv()
-    find_cmd = [uv, "python", "find", "--managed-python", "--resolve-links", python_request]
-    try:
-        bootstrap_python = Path(_capture(find_cmd, cwd=REPO_ROOT).strip())
-    except subprocess.CalledProcessError:
-        _run([uv, "python", "install", python_request], cwd=REPO_ROOT)
-        bootstrap_python = Path(_capture(find_cmd, cwd=REPO_ROOT).strip())
-    if not bootstrap_python.exists():
-        raise RuntimeError(f"uv python find returned missing interpreter: {bootstrap_python}")
-    bootstrap_root = bootstrap_python.resolve().parent.parent
+    requested = tuple(int(part) for part in python_request.split("."))
+    current = tuple(sys.version_info[: len(requested)])
+    if current == requested:
+        base_executable = Path(getattr(sys, "_base_executable", sys.executable)).resolve()
+        if base_executable.exists():
+            bootstrap_root = base_executable.parent.parent
+        else:
+            bootstrap_root = None
+    else:
+        bootstrap_root = None
+    if bootstrap_root is None:
+        uv = _resolve_uv()
+        find_cmd = [uv, "python", "find", "--managed-python", python_request]
+        try:
+            bootstrap_python = Path(_capture(find_cmd, cwd=REPO_ROOT).strip())
+        except subprocess.CalledProcessError:
+            _run([uv, "python", "install", python_request], cwd=REPO_ROOT)
+            bootstrap_python = Path(_capture(find_cmd, cwd=REPO_ROOT).strip())
+        if not bootstrap_python.exists():
+            raise RuntimeError(f"uv python find returned missing interpreter: {bootstrap_python}")
+        bootstrap_root = bootstrap_python.resolve().parent.parent
     if base_python_root.exists():
         shutil.rmtree(base_python_root)
     shutil.copytree(bootstrap_root, base_python_root)
-    materialized_python = base_python_root / "bin" / bootstrap_python.name
+    materialized_python = base_python_root / "bin" / "python3.12"
+    if not materialized_python.exists():
+        executables = sorted((base_python_root / "bin").glob("python*"))
+        if executables:
+            materialized_python = executables[0]
     if not materialized_python.exists():
         raise RuntimeError(
             f"materialized base python missing after copy: {materialized_python}"
@@ -178,20 +291,45 @@ def _create_host_venv(
     _run([str(base_python), "-m", "venv", "--copies", str(host_venv)])
     python = host_venv / "bin" / "python"
     _run([str(python), "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
-    _run(
-        [
-            _resolve_uv(),
-            "pip",
-            "install",
-            "--python",
-            str(python),
-            "--requirements",
-            str(host_requirements),
-            "--torch-backend",
-            "cpu",
-        ],
-        cwd=REPO_ROOT,
-    )
+    requirements = [
+        line.strip()
+        for line in host_requirements.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    torch_backend_requirements, generic_requirements = _partition_host_requirements(requirements)
+    if torch_backend_requirements:
+        _run(
+            [
+                _resolve_uv(),
+                "pip",
+                "install",
+                "--python",
+                str(python),
+                *torch_backend_requirements,
+                "--torch-backend",
+                "cpu",
+            ],
+            cwd=REPO_ROOT,
+        )
+    if generic_requirements:
+        generic_requirements_path = host_requirements.with_name(
+            f"{host_requirements.stem}-generic{host_requirements.suffix}"
+        )
+        generic_requirements_path.write_text("\n".join([*generic_requirements, ""]), encoding="utf-8")
+        _run(
+            [
+                _resolve_uv(),
+                "pip",
+                "install",
+                "--python",
+                str(python),
+                "--torch-backend",
+                "cpu",
+                "--requirements",
+                str(generic_requirements_path),
+            ],
+            cwd=REPO_ROOT,
+        )
     return python
 
 
@@ -239,7 +377,13 @@ def _write_host_pth(env_root: Path, host_python: Path) -> None:
     ).strip()
     pth = Path(purelib) / "tinker_runtime_env.pth"
     lines = [layout.site_packages, *layout.pythonpath_entries[1:], *layout.host_pythonpath_entries]
-    pth.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    code = (
+        "import sys; "
+        f"paths = {lines!r}; "
+        "sys.path[:] = [p for p in sys.path if p not in paths]; "
+        "sys.path[:0] = paths"
+    )
+    pth.write_text(code + "\n", encoding="utf-8")
 
 
 def _write_host_source_dist_info(pyproject: dict[str, Any], host_python: Path) -> None:
@@ -356,6 +500,53 @@ def _write_host_wrappers(env_root: Path, host_python: Path) -> None:
         script.chmod(0o755)
 
 
+def inspect_runtime_env(
+    env_root: Path,
+    *,
+    probe_modules: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    env_root = env_root.resolve()
+    runtime_env = _runtime_env_symbols()
+    snapshot: dict[str, Any] = {
+        "env_root": str(env_root),
+        "manifest_path": str(env_root / "manifest.json"),
+        "manifest_present": False,
+        "valid_layout": False,
+        "missing_paths": [],
+        "probe_modules": list(probe_modules or DEFAULT_INSPECT_PROBE_MODULES),
+        "probe_results": {},
+    }
+    try:
+        manifest = _load_manifest(env_root)
+    except Exception as exc:
+        snapshot["layout_error"] = f"{type(exc).__name__}: {exc}"
+        return snapshot
+
+    snapshot["manifest_present"] = True
+    snapshot["runtime_env"] = manifest.get("runtime_env", {})
+    snapshot["sources"] = [source.get("name", "") for source in manifest.get("sources", [])]
+
+    layout = runtime_env["runtime_env_layout"](str(env_root))
+    snapshot["host_python"] = layout.host_python
+    snapshot["site_packages"] = layout.site_packages
+    snapshot["pythonpath_entries"] = list(layout.pythonpath_entries)
+    snapshot["host_pythonpath_entries"] = list(layout.host_pythonpath_entries)
+
+    missing_paths = [path for path in _required_runtime_paths(layout) if not Path(path).exists()]
+    snapshot["missing_paths"] = missing_paths
+    snapshot["valid_layout"] = not missing_paths
+    if missing_paths:
+        snapshot["layout_error"] = (
+            "PFS runtime env root is incomplete. "
+            f"root={env_root!s} missing={missing_paths!r}"
+        )
+        return snapshot
+
+    for module in snapshot["probe_modules"]:
+        snapshot["probe_results"][module] = _probe_module(layout.host_python, module)
+    return snapshot
+
+
 def build_runtime_env(env_root: Path) -> None:
     pyproject = _load_pyproject()
     runtime = _runtime_table(pyproject)
@@ -371,7 +562,7 @@ def build_runtime_env(env_root: Path) -> None:
     shared_requirements = env_root / "shared-requirements.txt"
     host_requirements = env_root / "host-requirements.txt"
 
-    _export_host_requirements(host_requirements)
+    _export_host_requirements(pyproject, host_requirements)
     base_python = _materialize_base_python(runtime["python_version"], base_python_root)
     host_python = _create_host_venv(base_python, host_venv, host_requirements)
     _export_shared_requirements(pyproject, shared_requirements)
@@ -395,12 +586,25 @@ def build_runtime_env(env_root: Path) -> None:
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--env-root", required=True, help="Destination PFS runtime env root")
+    p.add_argument("--inspect", action="store_true", help="Inspect an existing runtime env root")
+    p.add_argument(
+        "--probe-module",
+        action="append",
+        default=None,
+        help="Module name to import with the runtime env host python during --inspect",
+    )
     return p.parse_args(argv)
 
 
 def main(argv: list[str]) -> int:
     args = _parse_args(argv)
-    build_runtime_env(Path(args.env_root).resolve())
+    env_root = Path(args.env_root).resolve()
+    if args.inspect:
+        snapshot = inspect_runtime_env(env_root, probe_modules=args.probe_module)
+        print(json.dumps(snapshot, indent=2))
+        probe_failed = any(not result["ok"] for result in snapshot["probe_results"].values())
+        return 0 if snapshot["valid_layout"] and not probe_failed else 1
+    build_runtime_env(env_root)
     return 0
 
 

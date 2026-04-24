@@ -4,7 +4,271 @@ Provides functions for padding/truncating LoRA weights to support unified rank
 training where a trainer with max_rank can train adapters with any rank <= max_rank.
 """
 
+import json
+import os
+import re
+from functools import lru_cache
+
 import torch
+from safetensors import safe_open
+
+
+_LORA_WEIGHT_RE = re.compile(r"^(?P<module>.+)\.(?P<kind>lora_A|lora_B)\.weight$")
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _normalize_lora_module_name(module_name: str) -> str:
+    if module_name.startswith("base_model.model."):
+        module_name = module_name[len("base_model.model.") :]
+    if not module_name.startswith(("model.", "language_model.", "llava_model.")):
+        module_name = f"model.{module_name}"
+    if module_name.endswith(".experts.base_layer"):
+        return module_name[: -len(".base_layer")] + ".gate_up_proj"
+    if module_name.endswith(".shared_expert.base_layer"):
+        return module_name[: -len(".base_layer")] + ".gate_up_proj"
+    return module_name
+
+
+@lru_cache(maxsize=128)
+def _model_weight_map(base_model_path: str) -> dict[str, str] | None:
+    index_path = os.path.join(base_model_path, "model.safetensors.index.json")
+    if not os.path.isfile(index_path):
+        return None
+    with open(index_path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    weight_map = payload.get("weight_map")
+    if not isinstance(weight_map, dict):
+        raise ValueError(f"Invalid safetensors index: {index_path}")
+    return {str(k): str(v) for k, v in weight_map.items()}
+
+
+def _resolve_base_weight_file(base_model_path: str, tensor_name: str) -> str:
+    weight_map = _model_weight_map(base_model_path)
+    if weight_map is not None:
+        shard_name = weight_map.get(tensor_name)
+        if not shard_name:
+            raise KeyError(f"Base weight not found in index: {tensor_name}")
+        return os.path.join(base_model_path, shard_name)
+
+    single_path = os.path.join(base_model_path, "model.safetensors")
+    if os.path.isfile(single_path):
+        return single_path
+
+    shard_paths = [
+        os.path.join(base_model_path, name)
+        for name in sorted(os.listdir(base_model_path))
+        if name.endswith(".safetensors")
+    ]
+    for path in shard_paths:
+        with safe_open(path, framework="pt", device="cpu") as handle:
+            if tensor_name in handle.keys():
+                return path
+    raise FileNotFoundError(
+        f"Could not resolve base weight {tensor_name!r} under base model path {base_model_path!r}"
+    )
+
+
+@lru_cache(maxsize=4096)
+def _base_weight_shape(base_model_path: str, tensor_name: str) -> tuple[int, ...]:
+    path = _resolve_base_weight_file(base_model_path, tensor_name)
+    with safe_open(path, framework="pt", device="cpu") as handle:
+        if tensor_name not in handle.keys():
+            raise KeyError(f"Base weight {tensor_name!r} not found in {path!r}")
+        tensor = handle.get_tensor(tensor_name)
+        return tuple(int(dim) for dim in tensor.shape)
+
+
+def _is_tp_sharded_dim(base_dim: int, shard_dim: int, *, tp_size: int) -> bool:
+    if base_dim <= 0 or shard_dim <= 0:
+        return False
+    if shard_dim > base_dim:
+        return False
+    if base_dim % shard_dim != 0:
+        return False
+    shard_factor = base_dim // shard_dim
+    return 1 < shard_factor <= tp_size
+
+
+def _is_tp_fused_qkv_dim(
+    module_name: str,
+    shard_dim: int,
+    base_model_path: str,
+    *,
+    tp_size: int,
+) -> bool:
+    if not module_name.endswith(".self_attn.q_proj"):
+        return False
+    try:
+        k_shape = _base_weight_shape(base_model_path, module_name[:-len("q_proj")] + "k_proj.weight")
+        v_shape = _base_weight_shape(base_model_path, module_name[:-len("q_proj")] + "v_proj.weight")
+        q_shape = _base_weight_shape(base_model_path, f"{module_name}.weight")
+    except Exception:
+        return False
+    if len(q_shape) != 2 or len(k_shape) != 2 or len(v_shape) != 2:
+        return False
+    fused_out = int(q_shape[0]) + int(k_shape[0]) + int(v_shape[0])
+    if fused_out <= 0 or fused_out % tp_size != 0:
+        return False
+    return int(shard_dim) == fused_out // tp_size
+
+
+def validate_peft_adapter_checkpoint_shapes(
+    adapter_dir: str,
+    base_model_path: str,
+    *,
+    tensor_parallel_size: int | None = None,
+    fully_sharded_loras: bool = False,
+) -> None:
+    """Fail fast for clearly invalid adapter checkpoints.
+
+    Strict full-shape checks are valid for unsharded adapters.
+    For fully-sharded LoRAs, vLLM accepts TP-local dimensions, so we permit
+    dimensions and ranks that are exact divisors of the full checkpoint shape.
+    """
+    if not adapter_dir or not os.path.isdir(adapter_dir):
+        raise ValueError(f"Adapter directory not found: {adapter_dir!r}")
+    if not base_model_path or not os.path.isdir(base_model_path):
+        raise ValueError(f"Base model path not found: {base_model_path!r}")
+
+    weights_path = os.path.join(adapter_dir, "adapter_model.safetensors")
+    if not os.path.isfile(weights_path):
+        raise ValueError(f"Adapter weights not found: {weights_path!r}")
+
+    tp_size = max(1, int(tensor_parallel_size or 1))
+    allow_tp_shards = bool(fully_sharded_loras and tp_size > 1)
+
+    config_rank: int | None = None
+    config_path = os.path.join(adapter_dir, "adapter_config.json")
+    if os.path.isfile(config_path):
+        with open(config_path, "r", encoding="utf-8") as handle:
+            adapter_config = json.load(handle)
+        raw_rank = adapter_config.get("r")
+        if isinstance(raw_rank, int) and raw_rank > 0:
+            config_rank = raw_rank
+
+    module_shapes: dict[str, dict[str, tuple[int, ...]]] = {}
+    errors: list[str] = []
+    matched = 0
+
+    with safe_open(weights_path, framework="pt", device="cpu") as handle:
+        for key in handle.keys():
+            match = _LORA_WEIGHT_RE.match(str(key))
+            if match is None:
+                continue
+            matched += 1
+            module_name = _normalize_lora_module_name(match.group("module"))
+            kind = match.group("kind")
+            tensor_shape = tuple(int(dim) for dim in handle.get_tensor(key).shape)
+            if len(tensor_shape) != 2:
+                errors.append(f"{key}: expected rank-2 tensor, got shape={tensor_shape}")
+                continue
+
+            base_weight_name = f"{module_name}.weight"
+            try:
+                base_shape = _base_weight_shape(base_model_path, base_weight_name)
+            except Exception as exc:
+                errors.append(f"{key}: could not resolve base weight {base_weight_name!r}: {exc}")
+                continue
+
+            if len(base_shape) != 2:
+                errors.append(f"{key}: expected rank-2 base weight, got shape={base_shape}")
+                continue
+
+            expected_out, expected_in = int(base_shape[0]), int(base_shape[1])
+            if kind == "lora_A" and tensor_shape[1] != expected_in:
+                if not (
+                    allow_tp_shards
+                    and _is_tp_sharded_dim(expected_in, int(tensor_shape[1]), tp_size=tp_size)
+                ):
+                    errors.append(
+                        f"{key}: lora_A input dim mismatch got={tensor_shape} expected=(*, {expected_in}) "
+                        f"from {base_weight_name} shape={base_shape}"
+                    )
+            if kind == "lora_B" and tensor_shape[0] != expected_out:
+                if not (
+                    allow_tp_shards
+                    and (
+                        _is_tp_sharded_dim(expected_out, int(tensor_shape[0]), tp_size=tp_size)
+                        or _is_tp_fused_qkv_dim(
+                            module_name,
+                            int(tensor_shape[0]),
+                            base_model_path,
+                            tp_size=tp_size,
+                        )
+                    )
+                ):
+                    errors.append(
+                        f"{key}: lora_B output dim mismatch got={tensor_shape} expected=({expected_out}, *) "
+                        f"from {base_weight_name} shape={base_shape}"
+                    )
+            module_shapes.setdefault(module_name, {})[kind] = tensor_shape
+
+    if matched == 0:
+        raise ValueError(f"No LoRA tensors found in adapter checkpoint: {weights_path!r}")
+
+    for module_name, shapes in module_shapes.items():
+        lora_a_shape = shapes.get("lora_A")
+        lora_b_shape = shapes.get("lora_B")
+        if lora_a_shape is not None and lora_b_shape is not None and lora_a_shape[0] != lora_b_shape[1]:
+            if not (
+                allow_tp_shards
+                and _is_tp_sharded_dim(int(lora_b_shape[1]), int(lora_a_shape[0]), tp_size=tp_size)
+            ):
+                errors.append(
+                    f"{module_name}: rank mismatch between lora_A={lora_a_shape} and lora_B={lora_b_shape}"
+                )
+        if config_rank is not None:
+            if lora_a_shape is not None and lora_a_shape[0] != config_rank:
+                if not (
+                    allow_tp_shards
+                    and _is_tp_sharded_dim(int(config_rank), int(lora_a_shape[0]), tp_size=tp_size)
+                ):
+                    errors.append(
+                        f"{module_name}: adapter_config.r={config_rank} but lora_A shape={lora_a_shape}"
+                    )
+            if lora_b_shape is not None and lora_b_shape[1] != config_rank:
+                if not (
+                    allow_tp_shards
+                    and _is_tp_sharded_dim(int(config_rank), int(lora_b_shape[1]), tp_size=tp_size)
+                ):
+                    errors.append(
+                        f"{module_name}: adapter_config.r={config_rank} but lora_B shape={lora_b_shape}"
+                    )
+
+    if errors:
+        preview = errors[:16]
+        remaining = len(errors) - len(preview)
+        if remaining > 0:
+            preview.append(f"... {remaining} more shape errors")
+        raise ValueError(
+            "PEFT adapter shape validation failed against the base model:\n" + "\n".join(preview)
+        )
+
+
+
+def maybe_validate_peft_adapter_checkpoint_shapes(
+    adapter_dir: str,
+    base_model_path: str,
+    *,
+    tensor_parallel_size: int | None = None,
+    fully_sharded_loras: bool = False,
+) -> None:
+    """Run shape validation unless the explicit runtime bypass flag is set."""
+    if _env_flag("MINT_VLLM_SKIP_PEFT_SHAPE_VALIDATION", default=False):
+        return
+    validate_peft_adapter_checkpoint_shapes(
+        adapter_dir,
+        base_model_path,
+        tensor_parallel_size=tensor_parallel_size,
+        fully_sharded_loras=fully_sharded_loras,
+    )
+
 
 
 def pad_lora_state_dict(
@@ -149,4 +413,6 @@ __all__ = [
     "truncate_lora_state_dict",
     "compute_lora_scaling",
     "get_lora_rank_from_state_dict",
+    "maybe_validate_peft_adapter_checkpoint_shapes",
+    "validate_peft_adapter_checkpoint_shapes",
 ]

@@ -10,6 +10,7 @@ def test_issue_439_dense_trainer_does_not_pass_removed_session_state_root(monkey
     monkeypatch.setattr(cfg, "PFS_RUNTIME_ENV_ROOT", "/tmp/runtime-root")
     monkeypatch.setattr(cfg, "PFS_TINKER_PATH", "/tmp/tinker-root")
     monkeypatch.setattr(cfg, "PFS_HF_MODULES_PATH", "/tmp/hf-modules")
+    monkeypatch.setenv("RAY_ADDRESS", "192.168.38.184:6379")
     monkeypatch.setattr(cfg, "require_ray_address", lambda: "192.168.38.184:6379")
 
     remote_kwargs: dict[str, object] = {}

@@ -10,9 +10,16 @@ description: |
   **Do NOT invoke this skill for development work. Use mint-dev instead.**
 
   For cluster lifecycle (create/teardown tasks), invoke the volcano-cluster skill.
+
+  Procedure contract: read this SKILL.md end-to-end before acting. Do not slice it on demand or use it as a lookup table mid-run.
 ---
 
 # Mint Production Environment
+
+Procedure contract:
+- Read this SKILL.md end-to-end before taking any action.
+- Do not sample sections opportunistically while already in motion.
+- If the procedure is missing something important, update the skill. Do not improvise around the gap.
 
 > **STOP. USE THESE COMMANDS EXACTLY.**
 >

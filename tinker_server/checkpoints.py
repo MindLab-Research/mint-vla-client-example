@@ -17,6 +17,13 @@ from pathlib import Path
 from typing import Literal
 import fcntl
 
+from .checkpoint_index import (
+    CheckpointNotFoundError,
+    checkpoint_index_enabled,
+    mark_checkpoint_failed,
+    publish_checkpoint_catalog,
+)
+
 DEFAULT_PERSISTENT_CHECKPOINTS_DIR = "/tos-mindverse/tinker_checkpoints"
 DEFAULT_RUNTIME_CHECKPOINTS_DIR = "/vePFS-Mindverse/share/tinker_runtime_checkpoints"
 DEFAULT_LEGACY_PFS_CHECKPOINTS_DIR = "/vePFS-Mindverse/share/tinker_checkpoints"
@@ -25,6 +32,7 @@ DEFAULT_EPHEMERAL_TTL_S = 24 * 60 * 60
 DEFAULT_PERSISTENT_CACHE_TTL_S = 24 * 60 * 60
 DEFAULT_REAP_INTERVAL_S = 10 * 60
 DEFAULT_MIRROR_POLL_S = 5
+DEFAULT_PUBLISH_RETRY_BACKOFF_S = 60
 
 # Backward-compatible module globals. Existing tests patch CHECKPOINTS_DIR directly.
 CHECKPOINTS_DIR = os.environ.get("TINKER_CHECKPOINT_DIR", DEFAULT_PERSISTENT_CHECKPOINTS_DIR)
@@ -104,6 +112,14 @@ def get_checkpoint_reap_interval_s() -> int:
 
 def get_checkpoint_mirror_poll_s() -> float:
     return float(os.environ.get("MINT_CHECKPOINT_MIRROR_POLL_S", str(DEFAULT_MIRROR_POLL_S)))
+
+
+def get_checkpoint_publish_retry_backoff_s() -> float:
+    raw = os.environ.get("MINT_CHECKPOINT_INDEX_PUBLISH_RETRY_S", str(DEFAULT_PUBLISH_RETRY_BACKOFF_S))
+    try:
+        return max(0.0, float(raw))
+    except Exception:
+        return float(DEFAULT_PUBLISH_RETRY_BACKOFF_S)
 
 
 def get_legacy_checkpoint_dirs() -> list[str]:
@@ -209,9 +225,36 @@ def checkpoint_has_sampling_adapter_weights(path: str) -> bool:
     return os.path.exists(os.path.join(path, "adapter_model.safetensors"))
 
 
+def _checkpoint_has_openpi_norm_stats(root: Path) -> bool:
+    assets_root = root / "assets"
+    if not assets_root.is_dir():
+        return False
+    return any(path.is_file() for path in assets_root.glob("**/norm_stats.json"))
+
+
+def checkpoint_has_openpi_policy_weights(path: str) -> bool:
+    root = Path(path)
+    return (root / "params" / "_METADATA").exists() and _checkpoint_has_openpi_norm_stats(root)
+
+
+def checkpoint_has_openpi_training_state(path: str) -> bool:
+    root = Path(path)
+    candidates = [
+        child
+        for child in root.iterdir()
+        if child.is_dir() and child.name.isdigit() and checkpoint_has_openpi_policy_weights(str(child))
+    ]
+    if not candidates:
+        return False
+    latest = max(candidates, key=lambda child: int(child.name))
+    return (latest / "train_state" / "_METADATA").exists()
+
+
 def checkpoint_has_optimizer_state(path: str) -> bool:
-    return os.path.exists(os.path.join(path, "optimizer.pt")) or bool(
-        glob.glob(os.path.join(path, "*_optimizer.pt"))
+    return (
+        os.path.exists(os.path.join(path, "optimizer.pt"))
+        or bool(glob.glob(os.path.join(path, "*_optimizer.pt")))
+        or bool(glob.glob(os.path.join(path, "*", "train_state", "_METADATA")))
     )
 
 
@@ -372,25 +415,38 @@ def safe_extract_checkpoint_archive(archive_path: str, dest_dir: str) -> None:
 def validate_checkpoint_dir(path: str, *, checkpoint_type: CheckpointType | None = None) -> None:
     has_lora = checkpoint_has_lora_weights(path)
     has_optimizer = checkpoint_has_optimizer_state(path)
+    has_openpi_sampler = checkpoint_has_openpi_policy_weights(path)
+    has_openpi_training = checkpoint_has_openpi_training_state(path)
 
-    if not has_lora:
-        raise ValueError("Missing LoRA weights in extracted checkpoint")
-    if checkpoint_type == "training":
-        if not has_optimizer:
-            raise ValueError("Missing optimizer state in extracted checkpoint")
-    elif checkpoint_type == "sampler":
+    if checkpoint_type == "sampler":
+        if not has_lora and not has_openpi_sampler:
+            raise ValueError("Missing sampler weights in extracted checkpoint")
         if has_optimizer:
             raise ValueError("Sampler checkpoint must not include optimizer state")
-    else:
+        return
+
+    if checkpoint_type == "training":
+        if not has_lora and not has_openpi_training:
+            raise ValueError("Missing LoRA weights in extracted checkpoint")
         if not has_optimizer:
             raise ValueError("Missing optimizer state in extracted checkpoint")
+        return
+
+    if not has_lora and not has_openpi_training:
+        raise ValueError("Missing LoRA weights in extracted checkpoint")
+    if not has_optimizer:
+        raise ValueError("Missing optimizer state in extracted checkpoint")
 
 
 def validate_sampler_checkpoint_for_sampling(path: str) -> None:
-    if not checkpoint_has_sampling_adapter_weights(path):
-        raise ValueError("Missing adapter_model.safetensors for sampling")
+    if not checkpoint_has_sampling_adapter_weights(path) and not checkpoint_has_openpi_policy_weights(path):
+        raise ValueError(
+            "Missing sampling weights: expected adapter_model.safetensors or OpenPI params/_METADATA with assets/**/norm_stats.json"
+        )
     if checkpoint_has_optimizer_state(path):
         raise ValueError("Sampler checkpoint must not include optimizer state")
+    if checkpoint_has_openpi_policy_weights(path):
+        return
     try:
         from safetensors import safe_open
 
@@ -692,6 +748,17 @@ def ensure_checkpoint_path_allowed(
         raise PermissionError("Access denied")
 
 
+def _dir_size_bytes(path: str) -> int:
+    total = 0
+    for dirpath, _, filenames in os.walk(path):
+        for filename in filenames:
+            try:
+                total += os.path.getsize(os.path.join(dirpath, filename))
+            except OSError:
+                pass
+    return total
+
+
 def sync_checkpoint_tree(src_dir: str, dst_dir: str) -> str:
     if os.path.realpath(src_dir) == os.path.realpath(dst_dir):
         return dst_dir
@@ -756,6 +823,7 @@ def _mirror_target_path(metadata: dict) -> str:
         return configured
     checkpoint_name = metadata.get("checkpoint_id")
     model_id = metadata.get("model_id")
+    checkpoint_type = metadata.get("checkpoint_type") or metadata.get("type")
     if not isinstance(checkpoint_name, str) or not checkpoint_name:
         raise ValueError("mirror metadata missing checkpoint_id")
     if not isinstance(model_id, str) or not model_id:
@@ -764,6 +832,7 @@ def _mirror_target_path(metadata: dict) -> str:
         user_id=metadata.get("owner_id"),
         model_id=model_id,
         checkpoint_name=checkpoint_name,
+        checkpoint_type=checkpoint_type if checkpoint_type in _CHECKPOINT_TYPES else None,
     )
 
 
@@ -795,11 +864,13 @@ def begin_async_checkpoint_mirror(
     user_id: str | None,
     model_id: str,
     checkpoint_name: str,
+    checkpoint_type: CheckpointType | None = None,
 ) -> str:
     dst_dir = build_persistent_checkpoint_dir(
         user_id=user_id,
         model_id=model_id,
         checkpoint_name=checkpoint_name,
+        checkpoint_type=checkpoint_type,
     )
     update_checkpoint_metadata(
         src_dir,
@@ -844,6 +915,7 @@ def _process_pending_checkpoint_mirror(checkpoint_path: str) -> tuple[str, str]:
             "storage_tier": "persistent_tos",
             "mirror_status": MIRROR_STATUS_COMPLETE,
             "mirror_error": None,
+            "next_publish_retry_at": None,
             "persistent_mirror_path": mirrored_path,
             "mirror_completed_at": mirrored_at,
         }
@@ -854,10 +926,39 @@ def _process_pending_checkpoint_mirror(checkpoint_path: str) -> tuple[str, str]:
         {
             "mirror_status": MIRROR_STATUS_COMPLETE,
             "mirror_error": None,
+            "next_publish_retry_at": None,
             "persistent_mirror_path": mirrored_path,
             "mirror_completed_at": mirrored_at,
         },
     )
+    ckpt_id = persistent_meta.get("ckpt_id")
+    if isinstance(ckpt_id, str) and ckpt_id and checkpoint_index_enabled():
+        try:
+            asyncio.run(
+                publish_checkpoint_catalog(
+                    ckpt_id,
+                    storage_root=get_persistent_checkpoints_dir(),
+                    size_bytes=_dir_size_bytes(mirrored_path),
+                )
+            )
+        except CheckpointNotFoundError:
+            update_checkpoint_metadata(
+                checkpoint_path,
+                {
+                    "mirror_status": MIRROR_STATUS_FAILED,
+                    "mirror_error": "checkpoint_index_publish_not_found",
+                },
+            )
+            raise
+        except Exception:
+            update_checkpoint_metadata(
+                checkpoint_path,
+                {
+                    "mirror_status": MIRROR_STATUS_FAILED,
+                    "mirror_error": "checkpoint_index_publish_failed",
+                },
+            )
+            raise
     return checkpoint_path, mirrored_path
 
 
@@ -877,20 +978,59 @@ def process_pending_checkpoint_mirrors(*, max_items: int | None = None) -> dict[
             if metadata.get("storage_tier") != "persistent_cache":
                 continue
             status = metadata.get("mirror_status")
-            if status in (MIRROR_STATUS_COMPLETE, MIRROR_STATUS_FAILED):
+            if status == MIRROR_STATUS_COMPLETE:
                 continue
+            if status == MIRROR_STATUS_FAILED and metadata.get("mirror_error") != "checkpoint_index_publish_failed":
+                continue
+
+            if status == MIRROR_STATUS_PENDING and metadata.get("mirror_error") == "checkpoint_index_publish_failed":
+                retry_at = metadata.get("next_publish_retry_at")
+                if isinstance(retry_at, str) and retry_at:
+                    try:
+                        retry_at_ts = datetime.fromisoformat(retry_at.replace("Z", "+00:00")).timestamp()
+                        if time.time() < retry_at_ts:
+                            continue
+                    except ValueError:
+                        pass
+
             try:
                 _, mirrored_path = _process_pending_checkpoint_mirror(checkpoint_path)
                 results["mirrored"].append(mirrored_path)
             except Exception as e:
-                update_checkpoint_metadata(
-                    checkpoint_path,
-                    {
-                        "mirror_status": MIRROR_STATUS_FAILED,
-                        "mirror_error": f"{type(e).__name__}: {e}",
-                        "last_mirror_failure_at": _isoformat_utc(time.time()),
-                    },
-                )
+                current_error = None
+                try:
+                    current_error = read_checkpoint_metadata(checkpoint_path).get("mirror_error")
+                except Exception:
+                    current_error = None
+
+                if current_error == "checkpoint_index_publish_failed":
+                    update_checkpoint_metadata(
+                        checkpoint_path,
+                        {
+                            "mirror_status": MIRROR_STATUS_PENDING,
+                            "last_mirror_failure_at": _isoformat_utc(time.time()),
+                            "next_publish_retry_at": _isoformat_utc(
+                                time.time() + get_checkpoint_publish_retry_backoff_s()
+                            ),
+                        },
+                    )
+                else:
+                    update_checkpoint_metadata(
+                        checkpoint_path,
+                        {
+                            "mirror_status": MIRROR_STATUS_FAILED,
+                            "mirror_error": f"{type(e).__name__}: {e}",
+                            "last_mirror_failure_at": _isoformat_utc(time.time()),
+                            "next_publish_retry_at": None,
+                        },
+                    )
+                    try:
+                        metadata = read_checkpoint_metadata(checkpoint_path)
+                        ckpt_id = metadata.get("ckpt_id")
+                        if isinstance(ckpt_id, str) and ckpt_id and checkpoint_index_enabled():
+                            asyncio.run(mark_checkpoint_failed(ckpt_id, fail_reason="mirror_failed"))
+                    except Exception:
+                        pass
                 results["failed"].append(checkpoint_path)
         return results
     finally:

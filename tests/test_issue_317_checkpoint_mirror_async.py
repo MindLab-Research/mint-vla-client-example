@@ -89,7 +89,7 @@ def test_issue_317_process_pending_checkpoint_mirrors_updates_metadata(monkeypat
     cache_meta = checkpoints.read_checkpoint_metadata(str(cache_dir))
     assert cache_meta["mirror_status"] == checkpoints.MIRROR_STATUS_COMPLETE
 
-    persistent_dir = persistent_root / "owner-a" / "run-317" / "ckpt-a"
+    persistent_dir = persistent_root / "owner-a" / "run-317" / "ckpt-a" / "training"
     persistent_meta = checkpoints.read_checkpoint_metadata(str(persistent_dir))
     assert persistent_meta["storage_tier"] == "persistent_tos"
     assert persistent_meta["mirror_status"] == checkpoints.MIRROR_STATUS_COMPLETE
@@ -167,6 +167,99 @@ def test_issue_317_failed_mirror_status_is_stable(monkeypatch, tmp_path: Path) -
     meta = checkpoints.read_checkpoint_metadata(str(cache_dir))
     assert meta["mirror_status"] == checkpoints.MIRROR_STATUS_FAILED
     assert meta["mirror_error"] == "RuntimeError: previous failure"
+
+
+def test_issue_317_publish_not_found_stays_failed(monkeypatch, tmp_path: Path) -> None:
+    from tinker_server import checkpoints
+    from tinker_server.checkpoint_index import CheckpointNotFoundError
+
+    runtime_root = tmp_path / "runtime"
+    persistent_root = tmp_path / "tos"
+    cache_dir = runtime_root / "persistent_cache" / "owner-a" / "run-317" / "ckpt-not-found"
+    _touch(cache_dir / "adapter_model.safetensors")
+    _touch(cache_dir / "optimizer.pt")
+    checkpoints.write_checkpoint_metadata(
+        str(cache_dir),
+        {
+            "checkpoint_id": "ckpt-not-found",
+            "owner_id": "owner-a",
+            "model_id": "run-317",
+            "checkpoint_type": "training",
+            "optimizer_present": True,
+            "storage_tier": "persistent_cache",
+            "mirror_status": checkpoints.MIRROR_STATUS_PENDING,
+            "type": "training",
+            "ckpt_id": "11111111-1111-1111-1111-111111111111",
+        },
+    )
+
+    async def _raise_not_found(*_args, **_kwargs):
+        raise CheckpointNotFoundError("staging row missing")
+
+    async def _mark_failed(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(checkpoints, "RUNTIME_CHECKPOINTS_DIR", str(runtime_root))
+    monkeypatch.setattr(checkpoints, "PERSISTENT_CHECKPOINTS_DIR", str(persistent_root))
+    monkeypatch.setattr(checkpoints, "checkpoint_index_enabled", lambda: True)
+    monkeypatch.setattr(checkpoints, "publish_checkpoint_catalog", _raise_not_found)
+    monkeypatch.setattr(checkpoints, "mark_checkpoint_failed", _mark_failed)
+
+    result = checkpoints.process_pending_checkpoint_mirrors()
+    assert result["mirrored"] == []
+    assert str(cache_dir) in result["failed"]
+    meta = checkpoints.read_checkpoint_metadata(str(cache_dir))
+    assert meta["mirror_status"] == checkpoints.MIRROR_STATUS_FAILED
+    assert "CheckpointNotFoundError" in str(meta.get("mirror_error"))
+
+
+def test_issue_317_publish_retry_backoff_skips_immediate_retries(monkeypatch, tmp_path: Path) -> None:
+    from tinker_server import checkpoints
+
+    runtime_root = tmp_path / "runtime"
+    persistent_root = tmp_path / "tos"
+    cache_dir = runtime_root / "persistent_cache" / "owner-a" / "run-317" / "ckpt-retry"
+    _touch(cache_dir / "adapter_model.safetensors")
+    _touch(cache_dir / "optimizer.pt")
+    checkpoints.write_checkpoint_metadata(
+        str(cache_dir),
+        {
+            "checkpoint_id": "ckpt-retry",
+            "owner_id": "owner-a",
+            "model_id": "run-317",
+            "checkpoint_type": "training",
+            "optimizer_present": True,
+            "storage_tier": "persistent_cache",
+            "mirror_status": checkpoints.MIRROR_STATUS_PENDING,
+            "type": "training",
+            "ckpt_id": "22222222-2222-2222-2222-222222222222",
+        },
+    )
+
+    async def _raise_publish(*_args, **_kwargs):
+        raise RuntimeError("pg unavailable")
+
+    async def _mark_failed(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(checkpoints, "RUNTIME_CHECKPOINTS_DIR", str(runtime_root))
+    monkeypatch.setattr(checkpoints, "PERSISTENT_CHECKPOINTS_DIR", str(persistent_root))
+    monkeypatch.setattr(checkpoints, "checkpoint_index_enabled", lambda: True)
+    monkeypatch.setattr(checkpoints, "publish_checkpoint_catalog", _raise_publish)
+    monkeypatch.setattr(checkpoints, "mark_checkpoint_failed", _mark_failed)
+    monkeypatch.setenv("MINT_CHECKPOINT_INDEX_PUBLISH_RETRY_S", "60")
+
+    first = checkpoints.process_pending_checkpoint_mirrors()
+    assert first["mirrored"] == []
+    assert str(cache_dir) in first["failed"]
+
+    meta = checkpoints.read_checkpoint_metadata(str(cache_dir))
+    assert meta["mirror_status"] == checkpoints.MIRROR_STATUS_PENDING
+    assert meta["mirror_error"] == "checkpoint_index_publish_failed"
+    assert isinstance(meta.get("next_publish_retry_at"), str)
+
+    second = checkpoints.process_pending_checkpoint_mirrors()
+    assert second == {"mirrored": [], "failed": []}
 
 
 def test_issue_317_list_checkpoints_includes_pending_cache_status(monkeypatch, tmp_path: Path) -> None:
@@ -348,16 +441,27 @@ async def test_issue_317_named_save_weights_for_sampler_preserves_type(
     from tinker_server.models.types import SaveWeightsForSamplerRequest
     from tinker_server.routes import training as tr
 
-    ckpt_dir = tmp_path / "sampler_named"
-    resolved: dict[str, dict] = {}
+    async def _identity_materialize(session):
+        return session
 
-    async def _fake_save_weights_for_sampler(**_kwargs):
+    monkeypatch.setattr(tr, "_materialize_training_session_for_stateful_use", _identity_materialize)
+
+    ckpt_dir = tmp_path / "runtime" / "persistent_cache" / "user-a" / "run-317" / "sampler-a" / "sampler"
+    resolved: dict[str, dict] = {}
+    save_kwargs: dict[str, object] = {}
+
+    async def _fake_save_weights_for_sampler(**kwargs):
         import numpy as np
         from safetensors.numpy import save_file
 
-        ckpt_dir.mkdir(parents=True, exist_ok=True)
-        save_file({"lora_A.weight": np.zeros((1, 1), dtype=np.float32)}, str(ckpt_dir / "adapter_model.safetensors"))
-        return str(ckpt_dir)
+        save_kwargs.update(kwargs)
+        export_dir = Path(kwargs["checkpoint_base_dir"]) / "run-317" / "sampler-a" / "sampler"
+        export_dir.mkdir(parents=True, exist_ok=True)
+        save_file(
+            {"lora_A.weight": np.zeros((1, 1), dtype=np.float32)},
+            str(export_dir / "adapter_model.safetensors"),
+        )
+        return str(export_dir)
 
     async def _async_resolve(request_id: str, response: dict) -> None:
         resolved["request_id"] = request_id
@@ -409,3 +513,82 @@ async def test_issue_317_named_save_weights_for_sampler_preserves_type(
     assert resolved["response"]["type"] == "save_weights_for_sampler"
     assert resolved["response"]["storage_tier"] == "persistent_cache"
     assert resolved["response"]["mirror_status"] == tr.MIRROR_STATUS_PENDING
+    assert save_kwargs["checkpoint_type"] == "sampler"
+    assert save_kwargs["checkpoint_base_dir"] == str(tmp_path / "runtime" / "persistent_cache" / "user-a")
+
+
+@pytest.mark.anyio
+async def test_issue_317_named_save_weights_for_sampler_admin_owner_is_anonymous(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from tinker_server.checkpoints import read_checkpoint_metadata
+    from tinker_server.models.types import SaveWeightsForSamplerRequest
+    from tinker_server.routes import training as tr
+
+    async def _identity_materialize(session):
+        return session
+
+    monkeypatch.setattr(tr, "_materialize_training_session_for_stateful_use", _identity_materialize)
+
+    ckpt_dir = tmp_path / "runtime" / "persistent_cache" / "anonymous" / "run-317" / "sampler-admin" / "sampler"
+
+    async def _fake_save_weights_for_sampler(**kwargs):
+        import numpy as np
+        from safetensors.numpy import save_file
+
+        export_dir = Path(kwargs["checkpoint_base_dir"]) / "run-317" / "sampler-admin" / "sampler"
+        export_dir.mkdir(parents=True, exist_ok=True)
+        save_file(
+            {"lora_A.weight": np.zeros((1, 1), dtype=np.float32)},
+            str(export_dir / "adapter_model.safetensors"),
+        )
+        return str(export_dir)
+
+    async def _async_resolve(_request_id: str, _response: dict) -> None:
+        return None
+
+    async def _async_fail(request_id: str, error: str) -> None:
+        raise AssertionError(f"unexpected async_fail({request_id}): {error}")
+
+    monkeypatch.setattr(
+        tr,
+        "training_manager",
+        SimpleNamespace(
+            get_session=lambda _model_id: SimpleNamespace(
+                model_id="run-317",
+                base_model="Qwen/Qwen3-0.6B",
+                current_step=9,
+                backend="dense",
+                lora_config=SimpleNamespace(rank=8, train_mlp=False),
+            ),
+            mark_inflight=lambda *_args, **_kwargs: None,
+        ),
+    )
+    monkeypatch.setattr(
+        tr,
+        "training_engine",
+        SimpleNamespace(save_weights_for_sampler=_fake_save_weights_for_sampler),
+    )
+    monkeypatch.setattr(
+        tr,
+        "future_store",
+        SimpleNamespace(async_resolve=_async_resolve, async_fail=_async_fail),
+    )
+    monkeypatch.setattr(tr, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
+    monkeypatch.setattr(
+        tr,
+        "begin_async_checkpoint_mirror",
+        lambda *_args, **_kwargs: "/tos-mindverse/tinker_checkpoints/anonymous/run-317/sampler-admin",
+    )
+
+    request = SaveWeightsForSamplerRequest(model_id="run-317", seq_id=0, path="sampler-admin")
+    await tr._do_save_weights_for_sampler(
+        request_id="req-317-sampler-admin",
+        request=request,
+        user_id="admin-user",
+        prefer_tinker=True,
+        is_admin=True,
+    )
+
+    metadata = read_checkpoint_metadata(str(ckpt_dir))
+    assert metadata["owner_id"] is None

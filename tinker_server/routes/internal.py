@@ -6,21 +6,27 @@ Checkpoint endpoints follow /internal/v1/checkpoints spec:
 """
 
 import json
+import logging
 import math
 import os
 import subprocess
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
+from ..auth_identity import can_bypass_ownership
 from ..auth_identity import get_user_data as _request_user_data
 from ..auth_identity import get_user_id as _request_user_id
-from ..auth_identity import is_admin_request
+from ..checkpoint_index import (
+    checkpoint_index_enabled,
+    get_catalog_checkpoint,
+    list_catalog_checkpoints,
+)
 from ..checkpoints import _iter_metadata_paths, get_persistent_search_roots, get_resolution_roots
 from ..config import config as server_config
 from ..health_checks import deep_healthz_response
@@ -34,6 +40,7 @@ from ..usage_store import get_usage_store
 CHECKPOINTS_DIR = server_config.checkpoint_dir
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 async def _enqueue_internal_request_with_trace(
@@ -143,7 +150,7 @@ async def get_usage_logs(
     """
     # Get account_id from gateway forwarded auth headers
     account_id = _get_account_id(request)
-    if account_id is None and not is_admin_request(request):
+    if account_id is None and not can_bypass_ownership(request):
         raise HTTPException(status_code=403, detail="Access denied")
 
     # Parse 'since' timestamp if provided
@@ -178,9 +185,9 @@ async def get_usage_summary(account_id: str, request: Request):
         account_id: The account ID to get summary for
     """
     request_account_id = _get_account_id(request)
-    if not is_admin_request(request) and request_account_id is None:
+    if not can_bypass_ownership(request) and request_account_id is None:
         raise HTTPException(status_code=403, detail="Access denied")
-    if not is_admin_request(request) and account_id != request_account_id:
+    if not can_bypass_ownership(request) and account_id != request_account_id:
         raise HTTPException(status_code=403, detail="Access denied")
 
     usage_store = await get_usage_store()
@@ -265,6 +272,8 @@ async def admission_stats(*, include_actor_rss: bool = True) -> dict:
     try:
         if not include_actor_rss and hasattr(future_store, "metrics_snapshot"):
             fs = future_store.metrics_snapshot()
+        elif hasattr(future_store, "async_ensure_ready"):
+            fs = await future_store.async_ensure_ready(timeout_s=timeout_s)
         else:
             fs = future_store.ensure_ready(timeout_s=timeout_s)
     except Exception as e:
@@ -861,10 +870,39 @@ async def metrics() -> Response:
                         "prefill_time_s",
                         "decode_time_s",
                         "time_per_output_token_s",
+                        "scheduled_tokens_iter",
+                        "scheduled_new_requests_iter",
+                        "scheduled_cached_requests_iter",
+                        "prefill_requests_iter",
+                        "decode_requests_iter",
+                        "prompt_tokens_iter",
+                        "generation_tokens_iter",
+                        "time_to_first_token_s",
+                        "inter_token_latency_s",
+                        "executor_execute_model_s",
+                        "worker_execute_model_s",
+                        "seq_slot_wait_s",
+                        "generate_lock_wait_s",
+                        "engine_read_lock_wait_s",
+                        "add_request_wait_s",
+                        "add_request_exec_s",
+                        "first_token_observed_s",
                     ):
                         _append_metric(lines, f"mint_vllm_{stem}_sum", metadata.get(f"{stem}_total"), labels=vllm_labels)
                         _append_metric(lines, f"mint_vllm_{stem}_count", metadata.get(f"{stem}_count"), labels=vllm_labels)
                         _append_metric(lines, f"mint_vllm_{stem}_max", metadata.get(f"{stem}_max"), labels=vllm_labels)
+                        _append_metric(
+                            lines,
+                            f"mint_vllm_{stem}_p50_recent",
+                            metadata.get(f"{stem}_p50_recent"),
+                            labels=vllm_labels,
+                        )
+                        _append_metric(
+                            lines,
+                            f"mint_vllm_{stem}_p95_recent",
+                            metadata.get(f"{stem}_p95_recent"),
+                            labels=vllm_labels,
+                        )
                 elif actor_type.strip().lower() == "megatron":
                     megatron_labels = {"actor_name": actor_name, "base_model": model}
                     for stem in (
@@ -1056,6 +1094,29 @@ async def metrics() -> Response:
 
         runtime_observability = queue_execution.get("runtime_observability")
         if isinstance(runtime_observability, dict):
+            megatron_switch = runtime_observability.get("megatron_session_switch")
+            if isinstance(megatron_switch, list):
+                for row in megatron_switch:
+                    if not isinstance(row, dict):
+                        continue
+                    labels = {
+                        "base_model": row.get("base_model") or "unknown",
+                        "session_state": row.get("session_state") or "unknown",
+                    }
+                    for phase, field_name in (
+                        ("save", "save_s_total"),
+                        ("swap", "swap_s_total"),
+                        ("load", "load_s_total"),
+                        ("reset_bias", "reset_bias_s_total"),
+                        ("total", "total_s_total"),
+                    ):
+                        _append_metric(
+                            lines,
+                            "mint_megatron_session_switch_duration_s_total",
+                            row.get(field_name),
+                            labels={**labels, "phase": phase},
+                        )
+
             megatron_switch_failures = runtime_observability.get("megatron_session_switch_failures")
             if isinstance(megatron_switch_failures, list):
                 for row in megatron_switch_failures:
@@ -1496,15 +1557,155 @@ def _scan_checkpoints(user_id: str | None, *, is_admin: bool = False) -> list[Ch
     return checkpoints
 
 
+def _catalog_timestamp_text(row: dict[str, Any]) -> str:
+    for key in ("checkpoint_created_at", "published_at", "updated_at"):
+        value = row.get(key)
+        if isinstance(value, datetime):
+            return value.astimezone(timezone.utc).isoformat()
+        if isinstance(value, str) and value:
+            return value
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _catalog_checkpoint_path(row: dict[str, Any]) -> str | None:
+    storage_root = row.get("storage_root")
+    owner_id = row.get("owner_id")
+    model_id = row.get("model_id")
+    raw_checkpoint_id = row.get("raw_checkpoint_id")
+    checkpoint_type = row.get("checkpoint_type")
+
+    if not isinstance(storage_root, str) or not storage_root:
+        return None
+    if not isinstance(model_id, str) or not model_id:
+        return None
+    if not isinstance(raw_checkpoint_id, str) or not raw_checkpoint_id:
+        return None
+    if checkpoint_type not in ("training", "sampler"):
+        return None
+
+    owner = str(owner_id or "anonymous").strip() or "anonymous"
+
+    def _valid_segment(value: str) -> bool:
+        if not value or value in (".", ".."):
+            return False
+        if "/" in value or "\\" in value:
+            return False
+        return True
+
+    if not _valid_segment(owner):
+        return None
+    if not _valid_segment(model_id):
+        return None
+    if not _valid_segment(raw_checkpoint_id):
+        return None
+
+    root_real = os.path.realpath(storage_root)
+    candidate = os.path.join(storage_root, owner, model_id, raw_checkpoint_id, checkpoint_type)
+    candidate_real = os.path.realpath(candidate)
+    if not (candidate_real == root_real or candidate_real.startswith(root_real + os.sep)):
+        return None
+    return candidate_real
+
+
+def _catalog_filesystem_ids(row: dict[str, Any], *, is_admin: bool) -> list[str]:
+    model_id = row.get("model_id")
+    raw_checkpoint_id = row.get("raw_checkpoint_id")
+    if not isinstance(raw_checkpoint_id, str) or not raw_checkpoint_id:
+        raw_checkpoint_id = row.get("checkpoint_id")
+    if not isinstance(model_id, str) or not model_id:
+        return []
+    if not isinstance(raw_checkpoint_id, str) or not raw_checkpoint_id:
+        return []
+
+    ids = [f"{model_id}_{raw_checkpoint_id}"]
+    owner = str(row.get("owner_id") or "anonymous").strip() or "anonymous"
+    if is_admin:
+        ids.append(f"{owner}:{ids[0]}")
+    return ids
+
+
+async def _scan_checkpoints_from_catalog(
+    user_id: str | None,
+    *,
+    is_admin: bool = False,
+) -> tuple[list[CheckpointInfo], set[str]]:
+    rows = await list_catalog_checkpoints(owner_id=user_id, is_admin=is_admin)
+    checkpoints: list[CheckpointInfo] = []
+    shadow_fs_ids: set[str] = set()
+    for row in rows:
+        ckpt_id = row.get("ckpt_id")
+        if not isinstance(ckpt_id, str) or not ckpt_id:
+            continue
+        model_name = row.get("model_name")
+        if not isinstance(model_name, str) or not model_name:
+            model_name = "unknown"
+        ckpt_type = row.get("checkpoint_type")
+        if ckpt_type not in ("training", "sampler"):
+            ckpt_type = "training"
+        size_bytes = row.get("size_bytes")
+        try:
+            size = int(size_bytes)
+        except Exception:
+            size = 0
+
+        checkpoints.append(
+            CheckpointInfo(
+                checkpoint_id=ckpt_id,
+                model_name=model_name,
+                created_at=_catalog_timestamp_text(row),
+                type=ckpt_type,
+                size_bytes=max(0, size),
+            )
+        )
+        shadow_fs_ids.update(_catalog_filesystem_ids(row, is_admin=is_admin))
+
+    checkpoints.sort(key=lambda x: x.created_at, reverse=True)
+    return checkpoints, shadow_fs_ids
+
+
+async def _resolve_catalog_checkpoint_entry(
+    checkpoint_id: str,
+    *,
+    user_id: str | None,
+    is_admin: bool,
+) -> tuple[str, dict[str, Any]] | None:
+    row = await get_catalog_checkpoint(checkpoint_id, owner_id=user_id, is_admin=is_admin)
+    if row is None:
+        return None
+
+    ckpt_path = _catalog_checkpoint_path(row)
+    if ckpt_path is None:
+        return None
+
+    metadata = {
+        "checkpoint_id": row.get("raw_checkpoint_id") or checkpoint_id,
+        "owner_id": row.get("owner_id"),
+        "model_id": row.get("model_id"),
+        "model_name": row.get("model_name"),
+        "checkpoint_type": row.get("checkpoint_type"),
+        "created_at": _catalog_timestamp_text(row),
+    }
+    return ckpt_path, metadata
+
+
 def _resolve_checkpoint_entry(
     checkpoint_id: str,
     *,
     user_id: str | None,
     is_admin: bool,
+    expected_checkpoint_type: str | None = None,
 ) -> tuple[str, dict] | None:
+    def _matches_checkpoint_type(metadata: dict) -> bool:
+        if expected_checkpoint_type not in ("training", "sampler"):
+            return True
+        checkpoint_type = metadata.get("checkpoint_type") or metadata.get("type")
+        return checkpoint_type == expected_checkpoint_type
+
     def _collect(scope_user_id: str | None, scope_is_admin: bool, *, allow_raw: bool) -> list[tuple[int, str, str, dict]]:
         matches: list[tuple[int, str, str, dict]] = []
         for metadata, ckpt_path, public_id in _iter_checkpoint_entries(scope_user_id, is_admin=scope_is_admin):
+            if not _matches_checkpoint_type(metadata):
+                continue
             raw_checkpoint_id = metadata.get("checkpoint_id")
             user_public_id = _public_checkpoint_id(metadata, is_admin=False)
             if public_id == checkpoint_id or user_public_id == checkpoint_id:
@@ -1517,6 +1718,8 @@ def _resolve_checkpoint_entry(
     matches = _collect(user_id, is_admin, allow_raw=not is_admin)
     if not matches:
         for metadata, ckpt_path, public_id in _iter_legacy_checkpoint_entries(user_id, is_admin=is_admin):
+            if not _matches_checkpoint_type(metadata):
+                continue
             if public_id == checkpoint_id:
                 matches.append((0, public_id, ckpt_path, metadata))
 
@@ -1524,6 +1727,8 @@ def _resolve_checkpoint_entry(
         matches = _collect(None, True, allow_raw=False)
         if not matches:
             for metadata, ckpt_path, public_id in _iter_legacy_checkpoint_entries(None, is_admin=True):
+                if not _matches_checkpoint_type(metadata):
+                    continue
                 if public_id == checkpoint_id:
                     matches.append((0, public_id, ckpt_path, metadata))
     if not matches:
@@ -1549,7 +1754,29 @@ async def list_checkpoints(request: Request):
     if user_id is None:
         raise HTTPException(status_code=401, detail="Authentication required")
 
-    checkpoints = _scan_checkpoints(user_id, is_admin=is_admin_request(request))
+    is_admin = can_bypass_ownership(request)
+
+    checkpoints = _scan_checkpoints(user_id, is_admin=is_admin)
+
+    if checkpoint_index_enabled():
+        try:
+            catalog_checkpoints, shadow_fs_ids = await _scan_checkpoints_from_catalog(user_id, is_admin=is_admin)
+            if catalog_checkpoints:
+                filtered_checkpoints = [
+                    item for item in checkpoints if item.checkpoint_id not in shadow_fs_ids
+                ]
+                merged_by_id: dict[str, CheckpointInfo] = {
+                    item.checkpoint_id: item for item in filtered_checkpoints
+                }
+                for item in catalog_checkpoints:
+                    merged_by_id[item.checkpoint_id] = item
+                checkpoints = list(merged_by_id.values())
+                checkpoints.sort(key=lambda x: x.created_at, reverse=True)
+        except Exception:
+            logger.exception(
+                "[internal.list_checkpoints] catalog query failed, fallback to filesystem scan"
+            )
+
     return CheckpointsListResponse(checkpoints=checkpoints)
 
 
@@ -1564,19 +1791,58 @@ async def download_checkpoint(checkpoint_id: str, request: Request):
     if user_id is None:
         raise HTTPException(status_code=401, detail="Authentication required")
 
+    is_admin = can_bypass_ownership(request)
+
+    resolved = None
+    if checkpoint_index_enabled():
+        try:
+            resolved = await _resolve_catalog_checkpoint_entry(
+                checkpoint_id,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+        except Exception:
+            logger.exception(
+                "[internal.download_checkpoint] catalog lookup failed checkpoint_id=%s, fallback to filesystem",
+                checkpoint_id,
+            )
+
+    if resolved is not None:
+        catalog_path, catalog_meta = resolved
+        if not os.path.isdir(catalog_path):
+            logger.warning(
+                "[internal.download_checkpoint] catalog path missing checkpoint_id=%s path=%s, fallback to filesystem",
+                checkpoint_id,
+                catalog_path,
+            )
+            resolved = None
+            expected_type = catalog_meta.get("checkpoint_type")
+            for candidate_id in _catalog_filesystem_ids(catalog_meta, is_admin=is_admin):
+                resolved = _resolve_checkpoint_entry(
+                    candidate_id,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                    expected_checkpoint_type=expected_type if isinstance(expected_type, str) else None,
+                )
+                if resolved is not None:
+                    break
+
     # Resolve checkpoint path via metadata-backed checkpoint ids.
-    resolved = _resolve_checkpoint_entry(
-        checkpoint_id,
-        user_id=user_id,
-        is_admin=is_admin_request(request),
-    )
+    if resolved is None:
+        resolved = _resolve_checkpoint_entry(
+            checkpoint_id,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
     if resolved is None:
         raise HTTPException(status_code=404, detail="Checkpoint not found")
 
     ckpt_path, metadata = resolved
 
-    if not is_admin_request(request) and metadata.get("owner_id") != user_id:
+    if not is_admin and metadata.get("owner_id") != user_id:
         raise HTTPException(status_code=403, detail="Access denied")
+    if not os.path.isdir(ckpt_path):
+        raise HTTPException(status_code=404, detail="Checkpoint not found")
 
     def stream_tar_gz():
         """Stream tar.gz via subprocess to avoid memory explosion."""

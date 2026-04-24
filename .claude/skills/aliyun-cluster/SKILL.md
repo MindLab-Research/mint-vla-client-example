@@ -6,9 +6,16 @@ description: |
   Use for: create/stop/list DLC jobs, fetch logs, and extract pod/IP details for multi-node jobs.
 
   Triggers: "aliyun cluster", "dlc", "mint-prod-aliyun", "create aliyun job", "stop aliyun job", "aliyun logs"
+
+  Procedure contract: read this SKILL.md end-to-end before acting. Do not slice it on demand or use it as a lookup table mid-run.
 ---
 
 # Aliyun Cluster Management (PAI-DLC)
+
+Procedure contract:
+- Read this SKILL.md end-to-end before taking any action.
+- Do not sample sections opportunistically while already in motion.
+- If the procedure is missing something important, update the skill. Do not improvise around the gap.
 
 This skill mirrors `volcano-cluster`, but uses Aliyun PAI DLC CLI (`dlc`) instead of `volc`.
 

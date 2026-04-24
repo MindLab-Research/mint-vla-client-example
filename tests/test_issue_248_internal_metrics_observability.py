@@ -31,15 +31,108 @@ async def _fake_admission_stats(*, include_actor_rss: bool = True) -> dict:
                     "queue_time_s_total": 12.0,
                     "queue_time_s_count": 8,
                     "queue_time_s_max": 3.5,
+                    "queue_time_s_p50_recent": 1.4,
+                    "queue_time_s_p95_recent": 3.2,
                     "prefill_time_s_total": 16.0,
                     "prefill_time_s_count": 8,
                     "prefill_time_s_max": 4.0,
+                    "prefill_time_s_p50_recent": 1.8,
+                    "prefill_time_s_p95_recent": 3.8,
                     "decode_time_s_total": 40.0,
                     "decode_time_s_count": 8,
                     "decode_time_s_max": 9.0,
+                    "decode_time_s_p50_recent": 4.1,
+                    "decode_time_s_p95_recent": 8.7,
                     "time_per_output_token_s_total": 0.96,
                     "time_per_output_token_s_count": 8,
                     "time_per_output_token_s_max": 0.2,
+                    "time_per_output_token_s_p50_recent": 0.09,
+                    "time_per_output_token_s_p95_recent": 0.19,
+                    "scheduled_tokens_iter_total": 512.0,
+                    "scheduled_tokens_iter_count": 8,
+                    "scheduled_tokens_iter_max": 96.0,
+                    "scheduled_tokens_iter_p50_recent": 64.0,
+                    "scheduled_tokens_iter_p95_recent": 92.8,
+                    "scheduled_new_requests_iter_total": 24.0,
+                    "scheduled_new_requests_iter_count": 8,
+                    "scheduled_new_requests_iter_max": 5.0,
+                    "scheduled_new_requests_iter_p50_recent": 3.0,
+                    "scheduled_new_requests_iter_p95_recent": 4.8,
+                    "scheduled_cached_requests_iter_total": 40.0,
+                    "scheduled_cached_requests_iter_count": 8,
+                    "scheduled_cached_requests_iter_max": 7.0,
+                    "scheduled_cached_requests_iter_p50_recent": 5.0,
+                    "scheduled_cached_requests_iter_p95_recent": 6.8,
+                    "prefill_requests_iter_total": 20.0,
+                    "prefill_requests_iter_count": 8,
+                    "prefill_requests_iter_max": 4.0,
+                    "prefill_requests_iter_p50_recent": 2.5,
+                    "prefill_requests_iter_p95_recent": 3.8,
+                    "decode_requests_iter_total": 44.0,
+                    "decode_requests_iter_count": 8,
+                    "decode_requests_iter_max": 8.0,
+                    "decode_requests_iter_p50_recent": 5.5,
+                    "decode_requests_iter_p95_recent": 7.7,
+                    "prompt_tokens_iter_total": 4096.0,
+                    "prompt_tokens_iter_count": 8,
+                    "prompt_tokens_iter_max": 768.0,
+                    "prompt_tokens_iter_p50_recent": 512.0,
+                    "prompt_tokens_iter_p95_recent": 742.4,
+                    "generation_tokens_iter_total": 320.0,
+                    "generation_tokens_iter_count": 8,
+                    "generation_tokens_iter_max": 64.0,
+                    "generation_tokens_iter_p50_recent": 40.0,
+                    "generation_tokens_iter_p95_recent": 60.8,
+                    "time_to_first_token_s_total": 9.6,
+                    "time_to_first_token_s_count": 8,
+                    "time_to_first_token_s_max": 1.8,
+                    "time_to_first_token_s_p50_recent": 1.1,
+                    "time_to_first_token_s_p95_recent": 1.7,
+                    "inter_token_latency_s_total": 0.88,
+                    "inter_token_latency_s_count": 8,
+                    "inter_token_latency_s_max": 0.16,
+                    "inter_token_latency_s_p50_recent": 0.1,
+                    "inter_token_latency_s_p95_recent": 0.15,
+                    "executor_execute_model_s_total": 3.2,
+                    "executor_execute_model_s_count": 8,
+                    "executor_execute_model_s_max": 0.52,
+                    "executor_execute_model_s_p50_recent": 0.39,
+                    "executor_execute_model_s_p95_recent": 0.5,
+                    "worker_execute_model_s_total": 2.56,
+                    "worker_execute_model_s_count": 8,
+                    "worker_execute_model_s_max": 0.41,
+                    "worker_execute_model_s_p50_recent": 0.31,
+                    "worker_execute_model_s_p95_recent": 0.4,
+                    "seq_slot_wait_s_total": 5.0,
+                    "seq_slot_wait_s_count": 8,
+                    "seq_slot_wait_s_max": 1.4,
+                    "seq_slot_wait_s_p50_recent": 0.5,
+                    "seq_slot_wait_s_p95_recent": 1.2,
+                    "generate_lock_wait_s_total": 1.2,
+                    "generate_lock_wait_s_count": 8,
+                    "generate_lock_wait_s_max": 0.4,
+                    "generate_lock_wait_s_p50_recent": 0.1,
+                    "generate_lock_wait_s_p95_recent": 0.35,
+                    "engine_read_lock_wait_s_total": 0.8,
+                    "engine_read_lock_wait_s_count": 8,
+                    "engine_read_lock_wait_s_max": 0.3,
+                    "engine_read_lock_wait_s_p50_recent": 0.08,
+                    "engine_read_lock_wait_s_p95_recent": 0.28,
+                    "add_request_wait_s_total": 2.4,
+                    "add_request_wait_s_count": 8,
+                    "add_request_wait_s_max": 0.7,
+                    "add_request_wait_s_p50_recent": 0.2,
+                    "add_request_wait_s_p95_recent": 0.6,
+                    "add_request_exec_s_total": 0.64,
+                    "add_request_exec_s_count": 8,
+                    "add_request_exec_s_max": 0.16,
+                    "add_request_exec_s_p50_recent": 0.07,
+                    "add_request_exec_s_p95_recent": 0.15,
+                    "first_token_observed_s_total": 10.4,
+                    "first_token_observed_s_count": 8,
+                    "first_token_observed_s_max": 1.9,
+                    "first_token_observed_s_p50_recent": 1.1,
+                    "first_token_observed_s_p95_recent": 1.8,
                 },
             },
             {
@@ -187,17 +280,17 @@ async def _fake_admission_stats(*, include_actor_rss: bool = True) -> dict:
                     {
                         "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
                         "session_state": "existing",
-                        "count": 3,
-                        "save_s_total": 9.0,
-                        "save_s_max": 4.0,
-                        "swap_s_total": 6.0,
-                        "swap_s_max": 2.5,
-                        "load_s_total": 12.0,
-                        "load_s_max": 5.0,
-                        "reset_bias_s_total": 1.5,
-                        "reset_bias_s_max": 0.8,
-                        "total_s_total": 28.5,
-                        "total_s_max": 10.5,
+                        "count": 4,
+                        "save_s_total": 8.0,
+                        "save_s_max": 3.0,
+                        "swap_s_total": 2.0,
+                        "swap_s_max": 0.9,
+                        "load_s_total": 6.0,
+                        "load_s_max": 2.4,
+                        "reset_bias_s_total": 1.0,
+                        "reset_bias_s_max": 0.4,
+                        "total_s_total": 17.0,
+                        "total_s_max": 6.5,
                     }
                 ],
                 "megatron_session_switch_failures": [
@@ -348,13 +441,35 @@ def test_issue_248_internal_metrics_omits_unknown_resource_pool_rss(monkeypatch)
         'mint_vllm_prefix_cache_hit_ratio{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 0.6',
         'mint_vllm_preemptions_total{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 3',
         'mint_vllm_queue_time_s_sum{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 12',
+        'mint_vllm_queue_time_s_p50_recent{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 1.4',
+        'mint_vllm_queue_time_s_p95_recent{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 3.2',
         'mint_vllm_prefill_time_s_sum{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 16',
         'mint_vllm_decode_time_s_sum{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 40',
         'mint_vllm_time_per_output_token_s_sum{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 0.96',
+        'mint_vllm_scheduled_tokens_iter_sum{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 512',
+        'mint_vllm_scheduled_new_requests_iter_p95_recent{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 4.8',
+        'mint_vllm_prefill_requests_iter_sum{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 20',
+        'mint_vllm_decode_requests_iter_sum{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 44',
+        'mint_vllm_prompt_tokens_iter_p50_recent{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 512',
+        'mint_vllm_generation_tokens_iter_max{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 64',
+        'mint_vllm_time_to_first_token_s_sum{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 9.6',
+        'mint_vllm_inter_token_latency_s_p95_recent{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 0.15',
+        'mint_vllm_executor_execute_model_s_sum{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 3.2',
+        'mint_vllm_worker_execute_model_s_p50_recent{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 0.31',
+        'mint_vllm_seq_slot_wait_s_sum{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 5',
+        'mint_vllm_seq_slot_wait_s_p95_recent{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 1.2',
+        'mint_vllm_generate_lock_wait_s_sum{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 1.2',
+        'mint_vllm_generate_lock_wait_s_p95_recent{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 0.35',
+        'mint_vllm_engine_read_lock_wait_s_sum{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 0.8',
+        'mint_vllm_engine_read_lock_wait_s_p95_recent{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 0.28',
+        'mint_vllm_add_request_wait_s_sum{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 2.4',
+        'mint_vllm_add_request_exec_s_p50_recent{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 0.07',
+        'mint_vllm_first_token_observed_s_max{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 1.9',
         'mint_megatron_active_sessions{actor_name="megatron-1",base_model="Qwen/Qwen3-30B-A3B-Instruct-2507"} 1',
         'mint_megatron_session_unknown{actor_name="megatron-1",base_model="Qwen/Qwen3-30B-A3B-Instruct-2507"} 0',
         'mint_megatron_session_step{actor_name="megatron-1",base_model="Qwen/Qwen3-30B-A3B-Instruct-2507"} 17',
         'mint_megatron_learning_rate{actor_name="megatron-1",base_model="Qwen/Qwen3-30B-A3B-Instruct-2507"} 5e-05',
+        'mint_megatron_session_switch_duration_s_total{base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",phase="total",session_state="existing"} 17',
         'mint_megatron_gpu_memory_allocated_bytes{actor_name="megatron-1",base_model="Qwen/Qwen3-30B-A3B-Instruct-2507"} 48000000000',
         'mint_megatron_gpu_memory_reserved_bytes{actor_name="megatron-1",base_model="Qwen/Qwen3-30B-A3B-Instruct-2507"} 52000000000',
         'mint_megatron_gpu_memory_fragmentation_bytes{actor_name="megatron-1",base_model="Qwen/Qwen3-30B-A3B-Instruct-2507"} 4000000000',
@@ -478,6 +593,95 @@ def test_issue_248_admission_stats_metrics_path_uses_cached_pool_snapshot(monkey
 
     assert calls["cached_snapshot"] == 1
     assert isinstance(stats.get("actors", {}).get("resource_pool"), list)
+
+
+def test_issue_248_metrics_path_exports_cached_scheduler_model_load(monkeypatch) -> None:
+    api_work_queue_module = importlib.import_module("tinker_server.backend.api_work_queue")
+    capacity_manager_module = importlib.import_module("tinker_server.backend.capacity_manager")
+    future_store_module = importlib.import_module("tinker_server.backend.future_store")
+    resource_pool_module = importlib.import_module("tinker_server.backend.resource_pool")
+
+    @dataclass
+    class _CapSnapshot:
+        capacity: int
+        inflight: int
+
+    class _FakeCapacityManager:
+        async def async_snapshot(self, *, timeout_s: float = 10.0) -> _CapSnapshot:
+            return _CapSnapshot(capacity=16, inflight=1)
+
+    class _FakeApiWorkQueue:
+        def metrics_snapshot(self) -> dict:
+            return {
+                "depth": 5,
+                "depth_legacy": 3,
+                "depth_scheduled": 2,
+                "enqueued": 9,
+                "dequeued": 4,
+                "scheduler_metrics_ready": True,
+                "scheduler_enabled": True,
+                "scheduler_domains_total": 1,
+                "scheduler_domains": {
+                    "vllm:Qwen/Qwen3-4B-Instruct-2507::replica::0": {
+                        "backend": "vllm",
+                        "pending_requests": 3,
+                        "active_sessions": 2,
+                        "oldest_queued_s": 11.0,
+                        "inflight_workers": 1,
+                        "capacity_workers": 2,
+                        "admissible": True,
+                        "service_gap_s": 5.5,
+                        "stats": {"picks": 6, "starvation_picks": 1},
+                    }
+                },
+            }
+
+        async def stats(self, *, timeout_s: float = 10.0) -> dict:
+            raise AssertionError("metrics scrape must not call api_work_queue.stats")
+
+    class _FakeFutureStore:
+        def metrics_snapshot(self) -> dict:
+            return {"pending": 0, "results": 0, "errors": 0}
+
+        def ensure_ready(self, *, timeout_s: float = 10.0) -> dict:
+            raise AssertionError("metrics scrape must not call future_store.ensure_ready")
+
+    class _FakePool:
+        def cached_snapshot(self) -> list[dict]:
+            return []
+
+        def metadata_cache_metrics_snapshot(self) -> list[dict]:
+            return []
+
+        def lifecycle_metrics_snapshot(self) -> list[dict]:
+            return []
+
+        def rss_snapshot(self, *, timeout_s: float = 10.0) -> list[dict]:
+            raise AssertionError("metrics scrape must not call resource_pool.rss_snapshot")
+
+    monkeypatch.setattr(capacity_manager_module, "capacity_manager", _FakeCapacityManager())
+    monkeypatch.setattr(api_work_queue_module, "api_work_queue", _FakeApiWorkQueue())
+    monkeypatch.setattr(future_store_module, "future_store", _FakeFutureStore())
+    monkeypatch.setattr(resource_pool_module, "get_resource_pool", lambda: _FakePool())
+
+    resp = asyncio.run(internal_routes.metrics())
+    text = resp.body.decode("utf-8")
+
+    assert "mint_work_queue_depth_scheduled 2" in text
+    assert "mint_work_queue_scheduler_enabled 1" in text
+    assert "mint_work_queue_scheduler_domains_total 1" in text
+    assert (
+        'mint_work_queue_scheduler_domain_pending_requests{backend="vllm",execution_scope="local",scheduler_domain="vllm:Qwen/Qwen3-4B-Instruct-2507::replica::0"} 3'
+        in text
+    )
+    assert (
+        'mint_model_load_pct{base_model="Qwen/Qwen3-4B-Instruct-2507",workload="sample"} 50'
+        in text
+    )
+    assert (
+        'mint_model_pending_requests{base_model="Qwen/Qwen3-4B-Instruct-2507",workload="sample"} 3'
+        in text
+    )
 
 
 def test_issue_248_scheduler_decisions_debug_route_proxies_filters(monkeypatch) -> None:

@@ -6,6 +6,7 @@ Each training session gets a dedicated TrainingWorker Ray actor with its own GPU
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import threading
@@ -13,12 +14,6 @@ import time
 from typing import TYPE_CHECKING, Any
 
 import ray
-torch = None  # type: ignore[assignment]
-
-if TYPE_CHECKING:
-    from .training_session_manager import TrainingSession
-
-logger = logging.getLogger(__name__)
 
 from . import ray_kill
 from ..logging_context import (
@@ -26,16 +21,23 @@ from ..logging_context import (
     get_request_id,
     init_actor_observability,
     restore_trace_id_from_traceparent,
+    run_async_with_otel_span,
+    start_as_current_span,
 )
+from tinker_server.config import RAY_NAMESPACE
+from tinker_server.config import config as server_config
+from tinker_server.ray_utils import init_ray
+
+torch = None  # type: ignore[assignment]
+
+if TYPE_CHECKING:
+    from .training_session_manager import TrainingSession
+
+logger = logging.getLogger(__name__)
 
 # Default idle timeout for TrainingWorker (seconds)
 # Set to 0 to disable self-termination (ResourcePool LRU eviction handles lifecycle)
 DEFAULT_IDLE_TIMEOUT = 0  # Disabled - LRU eviction manages actor lifecycle
-
-# Import centralized PFS paths from config
-from tinker_server.config import RAY_NAMESPACE
-from tinker_server.config import config as server_config
-from tinker_server.ray_utils import init_ray
 
 
 # =====================================================================
@@ -465,23 +467,6 @@ class TrainingWorker:
         )
         logger.debug(f"[TrainingWorker] Saved session {session_id} state (step={self._step_count})")
 
-    def delete_session(
-        self,
-        session_id: str,
-        *,
-        traceparent: str | None = None,
-    ) -> dict:
-        """Delete cached state for a specific session without killing the actor."""
-        _ = traceparent
-        self._touch()
-        deleted = self._state_manager.delete_session(session_id)
-        if self._current_session_id == session_id:
-            self._current_session_id = None
-            self.optimizer.zero_grad(set_to_none=True)
-            self._step_count = 0
-        logger.info(f"[TrainingWorker] Deleted session cache for {session_id} (deleted={deleted})")
-        return {"status": "ok", "session_id": session_id, "deleted": bool(deleted)}
-
     def _idle_watchdog(self) -> None:
         """Background thread that monitors for idle timeout.
 
@@ -533,29 +518,6 @@ class TrainingWorker:
         rss_pages = int(parts[1])
         page_size = int(os.sysconf("SC_PAGE_SIZE"))
         return rss_pages * page_size
-
-    def get_observability_binding(self) -> dict[str, object]:
-        import socket
-
-        gpu_indices: list[int] = []
-        try:
-            for gpu_id in ray.get_gpu_ids():
-                if isinstance(gpu_id, (int, float)):
-                    gpu_indices.append(int(gpu_id))
-                else:
-                    gpu_indices.append(int(float(str(gpu_id))))
-        except Exception:
-            gpu_indices = []
-        node_id = None
-        try:
-            node_id = str(ray.get_runtime_context().get_node_id())
-        except Exception:
-            node_id = None
-        return {
-            "hostname": socket.gethostname(),
-            "node_id": node_id,
-            "gpu_indices": gpu_indices,
-        }
 
     def forward_backward(
         self,
@@ -1136,12 +1098,8 @@ class TrainingWorker:
             "type": "optim_step",
         }
 
-    def get_lora_state_dict(self, use_per_expert_lora: bool = False) -> dict[str, torch.Tensor]:
+    def get_lora_state_dict(self) -> dict[str, torch.Tensor]:
         """Extract LoRA adapter weights as state dict.
-
-        Args:
-            use_per_expert_lora: Ignored for dense models (TrainingWorker).
-                Only applies to MoE models using MegatronWorkerGroup.
 
         Returns:
             Dict mapping parameter names to tensors (on CPU).
@@ -1728,52 +1686,6 @@ class VerlTrainingEngine:
             total_s=float(metrics.get("session_switch_total_s:sum", 0.0) or 0.0),
         )
 
-    def _record_training_operation(
-        self,
-        session: "TrainingSession",
-        *,
-        op: str,
-        status: str,
-        duration_s: float,
-    ) -> None:
-        from .runtime_observability import runtime_observability
-
-        runtime_observability.record_training_operation(
-            base_model=session.base_model,
-            backend=session.backend,
-            op=op,
-            status=status,
-            duration_s=duration_s,
-        )
-
-    def _record_training_operation_from_result(
-        self,
-        session: "TrainingSession",
-        *,
-        op: str,
-        result: dict | None,
-    ) -> None:
-        if not isinstance(result, dict):
-            return
-        metrics = result.get("metrics")
-        if not isinstance(metrics, dict):
-            return
-        ms_key = {
-            "forward_backward": "forward_backward_batch_ms",
-            "optim_step": "optim_step_batch_ms",
-        }.get(op)
-        if ms_key is None:
-            return
-        duration_ms = metrics.get(ms_key)
-        if not isinstance(duration_ms, (int, float)):
-            return
-        self._record_training_operation(
-            session,
-            op=op,
-            status="ok",
-            duration_s=max(0.0, float(duration_ms) / 1000.0),
-        )
-
     def _resolve_session_base_model(self, session: "TrainingSession") -> tuple[str | None, str | None]:
         """Resolve session base model to a local path (same policy as create_training_session)."""
         requested_model = session.base_model or self.default_base_model
@@ -1804,7 +1716,25 @@ class VerlTrainingEngine:
         )
         self._workers[model_id] = dense.actor
         self._resource_pool_actor_names[model_id] = dense.actor_name
+        session.actor_name = dense.actor_name
+        session.namespace = RAY_NAMESPACE
         self._touch_actor(session)
+        try:
+            from .training_session_store import upsert_training_session
+
+            upsert_training_session(
+                {
+                    "model_id": session.model_id,
+                    "actor_name": dense.actor_name,
+                    "namespace": RAY_NAMESPACE,
+                    "backend": session.backend,
+                    "current_step": session.current_step,
+                    "last_activity": session.last_activity,
+                    "metadata_version": getattr(session, "metadata_version", 1),
+                }
+            )
+        except Exception:
+            pass
         logger.warning(
             "[%s] rebound dense trainer actor=%s reason=%s base_model=%s",
             model_id,
@@ -1813,6 +1743,40 @@ class VerlTrainingEngine:
             base_model,
         )
         return dense.actor
+
+    async def _rebind_worker_from_session_metadata(
+        self,
+        session: "TrainingSession",
+        *,
+        reason: str,
+    ) -> ray.actor.ActorHandle | None:
+        actor_name = str(getattr(session, "actor_name", "") or "")
+        if not actor_name:
+            return None
+        namespace = str(getattr(session, "namespace", "") or RAY_NAMESPACE)
+        try:
+            worker = await asyncio.to_thread(ray.get_actor, actor_name, namespace=namespace)
+        except Exception as e:
+            logger.warning(
+                "[%s] failed to rebind actor=%s reason=%s error_type=%s error=%s",
+                str(getattr(session, "model_id", "")),
+                actor_name,
+                reason,
+                type(e).__name__,
+                e,
+            )
+            return None
+        self._workers[session.model_id] = worker
+        self._resource_pool_actor_names[session.model_id] = actor_name
+        self._touch_actor(session)
+        logger.warning(
+            "[%s] rebound worker actor=%s reason=%s backend=%s",
+            session.model_id,
+            actor_name,
+            reason,
+            session.backend,
+        )
+        return worker
 
     async def _get_live_worker(
         self,
@@ -1824,6 +1788,14 @@ class VerlTrainingEngine:
         """Return a live worker handle, rebinding dense trainers when evicted."""
         model_id = session.model_id
         worker = self._workers.get(model_id)
+        authoritative_actor_name = str(getattr(session, "actor_name", "") or "")
+        bound_actor_name = str(self._resource_pool_actor_names.get(model_id) or "")
+        if authoritative_actor_name and bound_actor_name and bound_actor_name != authoritative_actor_name:
+            self._workers.pop(model_id, None)
+            self._resource_pool_actor_names[model_id] = authoritative_actor_name
+            worker = None
+        if worker is None:
+            worker = await self._rebind_worker_from_session_metadata(session, reason=f"{op}:metadata_rebind")
         if worker is None:
             if session.backend == "peft" and allow_recover:
                 return await self._recover_dense_worker(session, reason=f"{op}:missing_worker")
@@ -2003,16 +1975,6 @@ class VerlTrainingEngine:
             except ray.exceptions.GetTimeoutError:
                 continue
 
-    def _training_remote_call_timeout_s(self, session: "TrainingSession", op: str) -> float | None:
-        configured = server_config.training_remote_call_timeout_s
-        if configured is not None:
-            configured = float(configured)
-            return configured if configured > 0 else None
-
-        if op == "train_step":
-            return 3600.0 if session.backend == "megatron" else 1200.0
-        return 1800.0 if session.backend == "megatron" else 600.0
-
     def _resolve_hf_model_path(self, hf_model_id: str) -> str | None:
         """Resolve HuggingFace model ID to local cache path.
 
@@ -2083,23 +2045,35 @@ class VerlTrainingEngine:
         use_megatron = get_model_config(requested_model or "").is_moe
 
         # Resolve model path based on backend
-        if requested_model and not requested_model.startswith("/"):
-            # HuggingFace model ID - resolve to local cache path
-            base_model = self._resolve_hf_model_path(requested_model)
-            if base_model:
-                logger.info(f"[{model_id}] Resolved HF model to local: {base_model}")
+        with start_as_current_span(
+            "training.create_model.resolve_base_model",
+            component="backend.verl_training",
+            op="training.create_model.resolve_base_model",
+            request_id=str(get_request_id() or "") or None,
+            attributes={
+                "model_id": str(model_id),
+                "requested_model": str(requested_model) if requested_model is not None else None,
+                "use_megatron": bool(use_megatron),
+            },
+        ):
+            if requested_model and not requested_model.startswith("/"):
+                # HuggingFace model ID - resolve to local cache path
+                base_model = self._resolve_hf_model_path(requested_model)
+                if base_model:
+                    logger.info(f"[{model_id}] Resolved HF model to local: {base_model}")
+                else:
+                    # Fall back to default (works for dense models on same architecture)
+                    base_model = self.default_base_model
+                    logger.info(f"[{model_id}] Using default model path: {base_model} (requested: {requested_model})")
             else:
-                # Fall back to default (works for dense models on same architecture)
-                base_model = self.default_base_model
-                logger.info(f"[{model_id}] Using default model path: {base_model} (requested: {requested_model})")
-        else:
-            base_model = requested_model
+                base_model = requested_model
+
+        observability_base_model = str(requested_model or base_model or "unknown")
 
         print(
             f"[DEBUG {model_id}] create_training_session start: requested_model={requested_model} use_megatron={use_megatron} base_model={base_model}",
             flush=True,
         )
-        observability_base_model = str(session.base_model or requested_model or base_model or "unknown")
 
         if use_megatron:
             import asyncio
@@ -2131,26 +2105,38 @@ class VerlTrainingEngine:
                 flush=True,
             )
             try:
-                worker = await asyncio.wait_for(
-                    async_get_or_create_megatron_worker_group(
-                        base_model=base_model,
-                        lora_rank=lora_rank,
-                        learning_rate=session.learning_rate,
-                        distributed_config=distributed_config,
-                        session_id=session.model_id,
-                        observability_base_model=observability_base_model,
+                worker = await run_async_with_otel_span(
+                    "training.create_model.get_or_create_megatron_worker_group",
+                    lambda: asyncio.wait_for(
+                        async_get_or_create_megatron_worker_group(
+                            base_model=base_model,
+                            lora_rank=lora_rank,
+                            learning_rate=session.learning_rate,
+                            distributed_config=distributed_config,
+                            session_id=session.model_id,
+                            observability_base_model=observability_base_model,
+                        ),
+                        timeout=megatron_timeout_s,
                     ),
-                    timeout=megatron_timeout_s,
+                    component="backend.verl_training",
+                    op="training.create_model.get_or_create_megatron_worker_group",
+                    request_id=str(get_request_id() or "") or None,
+                    attributes={
+                        "model_id": str(model_id),
+                        "base_model": str(base_model),
+                        "requested_model": str(requested_model) if requested_model is not None else None,
+                        "world_size": int(distributed_config.world_size),
+                        "train_tp": int(train_tp),
+                        "train_pp": int(train_pp),
+                        "train_ep": int(train_ep),
+                        "train_cp": int(train_cp),
+                        "megatron_timeout_s": float(megatron_timeout_s),
+                    },
                 )
             except asyncio.TimeoutError:
                 # Best-effort: kill the persistent Megatron actor to unblock retries.
                 from .megatron_distributed import _make_megatron_actor_name
-                from .runtime_observability import runtime_observability
 
-                runtime_observability.record_megatron_actor_lifecycle(
-                    base_model=observability_base_model,
-                    event="startup_timeout",
-                )
                 actor_name = _make_megatron_actor_name(base_model or requested_model or "")
                 try:
                     actor = ray.get_actor(actor_name, namespace=RAY_NAMESPACE)
@@ -2322,8 +2308,6 @@ class VerlTrainingEngine:
             Dict with loss_fn_outputs and metrics.
         """
         model_id = session.model_id
-        op_started_at = time.perf_counter()
-        workload_status = "error"
         worker = await self._get_live_worker(session, op="forward_backward")
 
         # Mark actor as recently used to prevent LRU eviction during training
@@ -2363,6 +2347,7 @@ class VerlTrainingEngine:
                 loss_fn_config,
                 rollout_correction_config,
                 session.model_id,
+                session.lora_config.rank if session.lora_config else None,
                 traceparent=traceparent,
                 train_attn=train_attn,
                 train_mlp=train_mlp,
@@ -2376,33 +2361,14 @@ class VerlTrainingEngine:
                 session.model_id,
                 traceparent=traceparent,
             )
-        try:
-            result = await self._await_with_keepalive(
-                pending,
-                session,
-                interval_s=30.0,
-                timeout_s=self._training_remote_call_timeout_s(session, "forward_backward"),
-            )
-        except asyncio.CancelledError:
-            workload_status = "canceled"
-            raise
-        except Exception:
-            workload_status = "error"
-            raise
-        else:
-            workload_status = "ok"
-            # Update session state
-            session.accumulated_gradients += 1
-            self._record_megatron_result_metrics(session, result)
-            logger.info(f"[{model_id}] forward_backward completed (loss_fn={loss_fn})")
-            return result
-        finally:
-            self._record_training_operation(
-                session,
-                op="forward_backward",
-                status=workload_status,
-                duration_s=max(0.0, time.perf_counter() - op_started_at),
-            )
+        result = await self._await_with_keepalive(pending, session, interval_s=30.0)
+
+        # Update session state
+        session.accumulated_gradients += 1
+        self._record_megatron_result_metrics(session, result)
+
+        logger.info(f"[{model_id}] forward_backward completed (loss_fn={loss_fn})")
+        return result
 
     async def forward_backward_reverse_kl(
         self,
@@ -2570,6 +2536,7 @@ class VerlTrainingEngine:
             pending = worker.forward.remote(
                 data_items,
                 session.model_id,
+                session.lora_config.rank if session.lora_config else None,
                 traceparent=traceparent,
                 train_attn=train_attn,
                 train_mlp=train_mlp,
@@ -2577,12 +2544,7 @@ class VerlTrainingEngine:
             )
         else:
             pending = worker.forward.remote(data_items, session.model_id, traceparent=traceparent)
-        result = await self._await_with_keepalive(
-            pending,
-            session,
-            interval_s=30.0,
-            timeout_s=self._training_remote_call_timeout_s(session, "forward"),
-        )
+        result = await self._await_with_keepalive(pending, session, interval_s=30.0)
         self._record_megatron_result_metrics(session, result)
 
         logger.info(f"[{model_id}] forward completed")
@@ -2600,7 +2562,6 @@ class VerlTrainingEngine:
         Returns:
             Dict with tokenizer configuration.
         """
-        model_id = session.model_id
         worker = await self._get_live_worker(session, op="get_tokenizer_info")
 
         result = await worker.get_tokenizer_info.remote()
@@ -2622,8 +2583,6 @@ class VerlTrainingEngine:
             Dict with metrics.
         """
         model_id = session.model_id
-        op_started_at = time.perf_counter()
-        workload_status = "error"
         worker = await self._get_live_worker(session, op="optim_step")
 
         # Mark actor as recently used to prevent LRU eviction during training
@@ -2645,6 +2604,7 @@ class VerlTrainingEngine:
             pending = worker.optim_step.remote(
                 lr,
                 session.model_id,
+                session.lora_config.rank if session.lora_config else None,
                 traceparent=traceparent,
                 train_attn=train_attn,
                 train_mlp=train_mlp,
@@ -2652,38 +2612,18 @@ class VerlTrainingEngine:
             )
         else:
             pending = worker.optim_step.remote(lr, session.model_id, traceparent=traceparent)
-        try:
-            result = await self._await_with_keepalive(
-                pending,
-                session,
-                interval_s=30.0,
-                timeout_s=self._training_remote_call_timeout_s(session, "optim_step"),
-            )
-        except asyncio.CancelledError:
-            workload_status = "canceled"
-            raise
-        except Exception:
-            workload_status = "error"
-            raise
-        else:
-            workload_status = "ok"
-            # Update session state
-            session.current_step += 1
-            session.accumulated_gradients = 0
+        result = await self._await_with_keepalive(pending, session, interval_s=30.0)
 
-            # Add step to result metrics
-            result["metrics"]["step"] = session.current_step
-            self._record_megatron_result_metrics(session, result)
+        # Update session state
+        session.current_step += 1
+        session.accumulated_gradients = 0
 
-            logger.info(f"[{model_id}] optim_step: step={session.current_step}")
-            return result
-        finally:
-            self._record_training_operation(
-                session,
-                op="optim_step",
-                status=workload_status,
-                duration_s=max(0.0, time.perf_counter() - op_started_at),
-            )
+        # Add step to result metrics
+        result["metrics"]["step"] = session.current_step
+        self._record_megatron_result_metrics(session, result)
+
+        logger.info(f"[{model_id}] optim_step: step={session.current_step}")
+        return result
 
     async def train_step(
         self,
@@ -2757,19 +2697,13 @@ class VerlTrainingEngine:
                 rollout_correction_config,
                 lr,
                 session.model_id,
+                session.lora_config.rank if session.lora_config else None,
                 traceparent=traceparent,
                 train_attn=train_attn,
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
             )
-            result = await self._await_with_keepalive(
-                pending,
-                session,
-                interval_s=30.0,
-                timeout_s=self._training_remote_call_timeout_s(session, "train_step"),
-            )
-            self._record_training_operation_from_result(session, op="forward_backward", result=result)
-            self._record_training_operation_from_result(session, op="optim_step", result=result)
+            result = await self._await_with_keepalive(pending, session, interval_s=30.0)
         else:
             # Dense models: Use separate calls (they don't have param_offload issues)
             # Pass session_id for stateless trainer pattern
@@ -2780,6 +2714,7 @@ class VerlTrainingEngine:
                     loss_fn_config,
                     rollout_correction_config,
                     session.model_id,
+                    session.lora_config.rank if session.lora_config else None,
                     traceparent=traceparent,
                     train_attn=train_attn,
                     train_mlp=train_mlp,
@@ -2793,34 +2728,12 @@ class VerlTrainingEngine:
                     session.model_id,
                     traceparent=traceparent,
                 )
-            fb_started_at = time.perf_counter()
-            fb_status = "error"
-            try:
-                fb_result = await self._await_with_keepalive(
-                    fb_pending,
-                    session,
-                    interval_s=30.0,
-                    timeout_s=self._training_remote_call_timeout_s(session, "forward_backward"),
-                )
-            except asyncio.CancelledError:
-                fb_status = "canceled"
-                raise
-            except Exception:
-                fb_status = "error"
-                raise
-            else:
-                fb_status = "ok"
-            finally:
-                self._record_training_operation(
-                    session,
-                    op="forward_backward",
-                    status=fb_status,
-                    duration_s=max(0.0, time.perf_counter() - fb_started_at),
-                )
+            fb_result = await self._await_with_keepalive(fb_pending, session, interval_s=30.0)
             if session.backend == "megatron":
                 opt_pending = worker.optim_step.remote(
                     lr,
                     session.model_id,
+                    session.lora_config.rank if session.lora_config else None,
                     traceparent=traceparent,
                     train_attn=train_attn,
                     train_mlp=train_mlp,
@@ -2828,30 +2741,7 @@ class VerlTrainingEngine:
                 )
             else:
                 opt_pending = worker.optim_step.remote(lr, session.model_id, traceparent=traceparent)
-            opt_started_at = time.perf_counter()
-            opt_status = "error"
-            try:
-                opt_result = await self._await_with_keepalive(
-                    opt_pending,
-                    session,
-                    interval_s=30.0,
-                    timeout_s=self._training_remote_call_timeout_s(session, "optim_step"),
-                )
-            except asyncio.CancelledError:
-                opt_status = "canceled"
-                raise
-            except Exception:
-                opt_status = "error"
-                raise
-            else:
-                opt_status = "ok"
-            finally:
-                self._record_training_operation(
-                    session,
-                    op="optim_step",
-                    status=opt_status,
-                    duration_s=max(0.0, time.perf_counter() - opt_started_at),
-                )
+            opt_result = await self._await_with_keepalive(opt_pending, session, interval_s=30.0)
 
             # Merge results
             result = fb_result.copy()
@@ -2925,8 +2815,8 @@ class VerlTrainingEngine:
         session: TrainingSession,
         checkpoint_name: str,
         checkpoint_base_dir: str,
-        checkpoint_type: str | None = None,
         use_per_expert_lora: bool = False,
+        checkpoint_type: str | None = None,
     ) -> str:
         """Save LoRA weights for inference use.
 
@@ -2936,21 +2826,20 @@ class VerlTrainingEngine:
             session: Training session with model.
             checkpoint_name: Name for this checkpoint.
             checkpoint_base_dir: Base directory for checkpoints.
-            use_per_expert_lora: If True, export MoE MLP LoRA in per-expert format
-                (required by vLLM's MoE LoRA support).
 
         Returns:
             Absolute path to saved checkpoint directory.
         """
         import os
 
+        if use_per_expert_lora:
+            raise ValueError("Dense/megatron backend does not support per-expert LoRA sampler export")
+
         save_path = os.path.join(checkpoint_base_dir, session.model_id, checkpoint_name)
-        if checkpoint_type is not None:
+        if checkpoint_type:
             save_path = os.path.join(save_path, checkpoint_type)
         if session.backend == "megatron":
-            return await self.save_lora_weights_for_sampler(
-                session, save_path, use_per_expert_lora=use_per_expert_lora
-            )
+            return await self.save_lora_weights_for_sampler(session, save_path)
         return await self.save_dense_lora_weights_for_sampler(session, save_path)
 
     async def save_dense_lora_weights_for_sampler(
@@ -2991,11 +2880,24 @@ class VerlTrainingEngine:
             traceparent=traceparent,
             session_id=session.model_id,
         )
-        _ = await self._await_with_keepalive(
-            ref,
-            session,
-            interval_s=30.0,
-            timeout_s=timeout_s,
+        _ = await run_async_with_otel_span(
+            "training.save_weights_for_sampler.remote_save",
+            lambda: self._await_with_keepalive(
+                ref,
+                session,
+                interval_s=30.0,
+                timeout_s=timeout_s,
+            ),
+            component="backend.verl_training",
+            op="training.save_weights_for_sampler.remote_save",
+            request_id=str(get_request_id() or "") or None,
+            attributes={
+                "model_id": str(model_id),
+                "base_model": str(session.base_model),
+                "backend": str(session.backend),
+                "save_path": str(abs_path),
+                "timeout_s": int(timeout_s),
+            },
         )
 
         logger.info(f"[{model_id}] save_dense_lora_weights_for_sampler: {abs_path}")
@@ -3005,7 +2907,6 @@ class VerlTrainingEngine:
         self,
         session: TrainingSession,
         save_path: str,
-        use_per_expert_lora: bool = False,
     ) -> str:
         """Save minimal PEFT LoRA artifacts for sampling (no optimizer/resume artifacts)."""
         import os
@@ -3038,18 +2939,34 @@ class VerlTrainingEngine:
         traceparent = get_current_traceparent()
         meta_ref = worker.save_lora_weights.remote(
             abs_path,
-            use_per_expert_lora=use_per_expert_lora,
             session_id=session.model_id,
+            actual_rank=session.lora_config.rank if session.lora_config else None,
             traceparent=traceparent,
             train_attn=train_attn,
             train_mlp=train_mlp,
             train_unembed=train_unembed,
         )
-        meta = await self._await_with_keepalive(
-            meta_ref,
-            session,
-            interval_s=30.0,
-            timeout_s=timeout_s,
+        meta = await run_async_with_otel_span(
+            "training.save_weights_for_sampler.remote_save",
+            lambda: self._await_with_keepalive(
+                meta_ref,
+                session,
+                interval_s=30.0,
+                timeout_s=timeout_s,
+            ),
+            component="backend.verl_training",
+            op="training.save_weights_for_sampler.remote_save",
+            request_id=str(get_request_id() or "") or None,
+            attributes={
+                "model_id": str(model_id),
+                "base_model": str(session.base_model),
+                "backend": str(session.backend),
+                "save_path": str(abs_path),
+                "timeout_s": int(timeout_s),
+                "train_attn": bool(train_attn),
+                "train_mlp": bool(train_mlp),
+                "train_unembed": bool(train_unembed),
+            },
         )
         strict_meta = self._strict_megatron_save_meta_enabled()
         self._update_session_step_monotonic(
@@ -3076,12 +2993,16 @@ class VerlTrainingEngine:
         Args:
             session: Training session.
             save_path: Directory path for checkpoint.
-            use_per_expert_lora: If True, export MoE MLP LoRA in per-expert format
-                (required by vLLM for MoE models).
 
         Returns:
             Absolute path to saved checkpoint directory.
         """
+        if use_per_expert_lora:
+            logger.warning(
+                "[%s] save_weights called with use_per_expert_lora=True; full training checkpoints ignore this sampler-only flag",
+                session.model_id,
+            )
+
         import os
 
         from .model_registry import get_model_config
@@ -3115,9 +3036,9 @@ class VerlTrainingEngine:
             train_unembed = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
             meta_ref = worker.save_checkpoint.remote(
                 abs_path,
-                use_per_expert_lora=use_per_expert_lora,
                 traceparent=traceparent,
                 session_id=session.model_id,
+                actual_rank=session.lora_config.rank if session.lora_config else None,
                 train_attn=train_attn,
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
@@ -3226,19 +3147,60 @@ class VerlTrainingEngine:
 
         logger.info(f"[{model_id}] load_weights: step={session.current_step}")
 
-    def _build_session_unbind_plan(self, session: "TrainingSession") -> dict[str, Any]:
+    async def shutdown_session(self, session: TrainingSession) -> None:
+        """Delete actor-local session state, then release or unbind the worker."""
         model_id = session.model_id
+
         actor_name = self._resource_pool_actor_names.get(model_id)
         worker = self._workers.get(model_id)
+        authoritative_actor_name = str(getattr(session, "actor_name", "") or "")
+        if authoritative_actor_name and actor_name and actor_name != authoritative_actor_name:
+            self._workers.pop(model_id, None)
+            self._resource_pool_actor_names[model_id] = authoritative_actor_name
+            worker = None
+            actor_name = authoritative_actor_name
+        if worker is None:
+            worker = await self._rebind_worker_from_session_metadata(session, reason="shutdown_session")
+            actor_name = self._resource_pool_actor_names.get(model_id) or str(getattr(session, "actor_name", "") or "") or None
+        traceparent = get_current_traceparent()
+
+        if worker is not None:
+            delete_session = getattr(worker, "delete_session", None)
+            if delete_session is not None:
+                try:
+                    await asyncio.to_thread(
+                        ray.get,
+                        delete_session.remote(model_id, traceparent=traceparent),
+                        timeout=30,
+                    )
+                except TypeError:
+                    await asyncio.to_thread(ray.get, delete_session.remote(model_id), timeout=30)
+                except Exception:
+                    logger.warning(
+                        "[%s] delete_session remote cleanup failed",
+                        model_id,
+                        exc_info=True,
+                    )
 
         actor_protected = False
         other_users: list[str] = []
         if actor_name:
-            other_users = [
-                mid
-                for mid, existing_actor_name in self._resource_pool_actor_names.items()
-                if existing_actor_name == actor_name and mid != model_id
-            ]
+            other_users = [mid for mid, an in self._resource_pool_actor_names.items() if an == actor_name and mid != model_id]
+            try:
+                from .training_session_store import list_training_sessions
+
+                for info in list_training_sessions():
+                    if not isinstance(info, dict):
+                        continue
+                    other_model_id = str(info.get("model_id") or "")
+                    if not other_model_id or other_model_id == model_id:
+                        continue
+                    if str(info.get("actor_name") or "") != actor_name:
+                        continue
+                    if other_model_id not in other_users:
+                        other_users.append(other_model_id)
+            except Exception:
+                pass
         replacement_session = other_users[0] if other_users else None
         should_kill_actor = not other_users
         if actor_name:
@@ -3250,66 +3212,6 @@ class VerlTrainingEngine:
                     should_kill_actor = False
             except Exception:
                 pass
-
-        return {
-            "actor_name": actor_name,
-            "worker": worker,
-            "actor_protected": actor_protected,
-            "other_users": other_users,
-            "should_kill_actor": should_kill_actor,
-            "replacement_session": replacement_session,
-        }
-
-    async def _delete_actor_local_session_state(
-        self,
-        session: "TrainingSession",
-        *,
-        worker: ray.actor.ActorHandle | None = None,
-    ) -> None:
-        model_id = session.model_id
-        traceparent = get_current_traceparent()
-        worker = worker or self._workers.get(model_id)
-        delete_session = getattr(worker, "delete_session", None) if worker is not None else None
-
-        if delete_session is not None:
-            try:
-                try:
-                    pending = delete_session.remote(model_id, traceparent=traceparent)
-                except TypeError:
-                    pending = delete_session.remote(model_id)
-                await asyncio.to_thread(ray.get, pending)
-                logger.info(f"[{model_id}] delete_session: actor-local session state deleted")
-                return
-            except Exception:
-                logger.exception(f"[{model_id}] delete_session: actor-local session cleanup failed")
-                raise
-
-        if session.backend == "megatron":
-            from .megatron_distributed import MegatronSessionStateManager
-
-            deleted = MegatronSessionStateManager().delete_session(model_id)
-        else:
-            deleted = SessionStateManager().delete_session(model_id)
-        logger.info(f"[{model_id}] delete_session: local session checkpoint deleted={deleted}")
-
-    async def unbind_session(self, session: TrainingSession) -> None:
-        """Unbind a model_id from the live engine and release its actor if possible."""
-        await self._unbind_session(session)
-
-    async def _unbind_session(
-        self,
-        session: TrainingSession,
-        *,
-        plan: dict[str, Any] | None = None,
-    ) -> None:
-        model_id = session.model_id
-        plan = plan or self._build_session_unbind_plan(session)
-        actor_name = plan["actor_name"]
-        worker = plan["worker"]
-        actor_protected = bool(plan["actor_protected"])
-        other_users = list(plan["other_users"])
-        should_kill_actor = bool(plan["should_kill_actor"])
-        replacement_session = plan["replacement_session"]
 
         self._resource_pool_actor_names.pop(model_id, None)
         self._workers.pop(model_id, None)
@@ -3343,6 +3245,7 @@ class VerlTrainingEngine:
         except Exception:
             pass
 
+        actor_namespace = str(getattr(session, "namespace", "") or RAY_NAMESPACE)
         if should_kill_actor:
             if worker:
                 try:
@@ -3352,9 +3255,9 @@ class VerlTrainingEngine:
                 try:
                     ray_kill.kill(
                         worker,
-                        reason="unbind_session",
+                        reason="shutdown_session",
                         actor_name=actor_name,
-                        namespace=RAY_NAMESPACE,
+                        namespace=actor_namespace,
                         no_restart=True,
                         model_id=model_id,
                     )
@@ -3362,12 +3265,12 @@ class VerlTrainingEngine:
                     pass
             elif actor_name:
                 try:
-                    actor = ray.get_actor(actor_name, namespace=RAY_NAMESPACE)
+                    actor = ray.get_actor(actor_name, namespace=actor_namespace)
                     ray_kill.kill(
                         actor,
-                        reason="unbind_session_race_no_worker",
+                        reason="shutdown_session_race_no_worker",
                         actor_name=actor_name,
-                        namespace=RAY_NAMESPACE,
+                        namespace=actor_namespace,
                         no_restart=True,
                         model_id=model_id,
                     )
@@ -3375,25 +3278,15 @@ class VerlTrainingEngine:
                     pass
         else:
             if actor_protected:
-                logger.info(f"[{model_id}] unbind_session: session released; keeping protected actor {actor_name}")
+                logger.info(f"[{model_id}] shutdown_session: session deleted; keeping protected actor {actor_name}")
             else:
                 logger.info(
-                    f"[{model_id}] unbind_session: session released; keeping shared actor {actor_name} "
+                    f"[{model_id}] shutdown_session: session deleted; keeping shared actor {actor_name} "
                     f"(still referenced by {len(other_users)} other model_id(s))"
                 )
 
         session.is_active = False
-        logger.info(f"[{model_id}] TrainingWorker unbound")
-
-    async def shutdown_session(self, session: TrainingSession) -> None:
-        """Backward-compatible alias for delete_session()."""
-        await self.delete_session(session)
-
-    async def delete_session(self, session: TrainingSession) -> None:
-        """Delete actor-local and persisted state, then unbind the session."""
-        plan = self._build_session_unbind_plan(session)
-        await self._delete_actor_local_session_state(session, worker=plan["worker"])
-        await self._unbind_session(session, plan=plan)
+        logger.info(f"[{model_id}] TrainingWorker shutdown")
 
     async def delete_session(self, session: TrainingSession) -> None:
         """Backward-compatible alias for session deletion paths."""

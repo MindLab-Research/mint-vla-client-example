@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import threading
 import time
+import traceback
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
-from ..config import config as server_config, otel_env_vars
+from ..config import config as server_config, otel_env_vars, preferred_control_plane_resources
 from ..logging_context import (
     classify_failure_reason,
     ensure_trace_id,
@@ -23,8 +25,48 @@ from ..logging_context import (
     set_request_id,
     set_trace_id,
 )
+from ..queue_priority import QUEUE_PRIORITY_AGING_S, effective_queue_priority, normalize_queue_priority
+from .work_classification import infer_scheduler_capacity_owner
 
 logger = logging.getLogger(__name__)
+
+
+def _api_work_queue_debug_log_path() -> str:
+    raw = os.environ.get("MINT_API_WORK_QUEUE_DEBUG_LOG_PATH", "").strip()
+    if raw:
+        return raw
+    fallback = os.environ.get("MINT_QUEUE_EXECUTION_RUNTIME_DEBUG_LOG_PATH", "").strip()
+    if fallback:
+        return fallback
+    return "/tmp/tinker_api_work_queue.debug.jsonl"
+
+
+def _summarize_debug_runtime_env(runtime_env: Any) -> Any:
+    if not isinstance(runtime_env, dict):
+        return runtime_env
+    summary = dict(runtime_env)
+    env_vars = summary.get("env_vars")
+    if isinstance(env_vars, dict):
+        summary["env_var_keys"] = sorted(str(key) for key in env_vars)
+        summary.pop("env_vars", None)
+    return summary
+
+
+def _append_api_work_queue_debug(event: str, **fields: Any) -> None:
+    record = {
+        "ts": round(time.time(), 6),
+        "pid": os.getpid(),
+        "event": event,
+        "actor_name": _ray_api_work_queue_actor_name(),
+        "namespace": _ray_namespace(),
+        **fields,
+    }
+    try:
+        with open(_api_work_queue_debug_log_path(), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=True, sort_keys=True, default=str))
+            fh.write("\n")
+    except Exception:
+        logger.debug("api work queue debug log write failed", exc_info=True)
 
 
 class ApiWorkQueueUnavailableError(RuntimeError):
@@ -84,7 +126,25 @@ def _ray_namespace() -> str:
 
 
 def _ray_api_work_queue_actor_name() -> str:
+    env_value = (
+        os.environ.get("TINKER_API_WORK_QUEUE_ACTOR_NAME")
+        or os.environ.get("MINT_API_WORK_QUEUE_ACTOR_NAME")
+    )
+    if env_value:
+        return str(env_value)
     return str(getattr(server_config, "api_work_queue_actor_name", "tinker_api_work_queue"))
+
+
+def _api_work_queue_actor_resources() -> dict[str, float] | None:
+    pinned_ip = str(os.environ.get("MINT_API_WORK_QUEUE_PINNED_NODE_IP") or "").strip()
+    if pinned_ip:
+        return {f"node:{pinned_ip}": 0.001}
+    try:
+        import ray
+
+        return preferred_control_plane_resources(ray.cluster_resources())
+    except Exception:
+        return None
 
 
 @dataclass(frozen=True)
@@ -122,66 +182,86 @@ def _create_ray_actor(*, require_ready: bool = True):
     @ray.remote(num_cpus=0, max_concurrency=max_concurrency, max_restarts=max_restarts)
     class _RayApiWorkQueueActor:
         def __init__(self) -> None:
-            from collections import deque
+            _append_api_work_queue_debug("actor_init_begin")
+            try:
+                from collections import deque
 
-            init_actor_observability()
-            logger.warning(
-                "[api_work_queue] actor (re)initializing (max_restarts=%d)",
-                max_restarts,
-            )
-            self._items = deque()
-            self._cv = asyncio.Condition()
-            self._enqueued = 0
-            self._dequeued = 0
-            debug_max = int(os.environ.get("MINT_API_WORK_QUEUE_DEBUG_MAX", "50"))
-            self._recent_dequeues = deque(maxlen=debug_max)
-            self._recent_enqueues = deque(maxlen=debug_max)
-            self._recent_scheduler_decisions = deque(
-                maxlen=int(os.environ.get("MINT_API_WORK_QUEUE_SCHED_DEBUG_MAX", str(debug_max)))
-            )
-            self._scheduler_decision_seq = 0
-            self._active_job_id: str | None = None
-            self._ema_exec_s_by_op: dict[str, float] = {}
-            self._last_exec_s_by_op: dict[str, float] = {}
-            self._sum_exec_s_by_op: dict[str, float] = {}
-            self._count_exec_by_op: dict[str, int] = {}
-            self._max_exec_s_by_op: dict[str, float] = {}
-            self._ema_alpha = float(os.environ.get("MINT_API_WORK_QUEUE_ETA_ALPHA", "0.1"))
-            self._max_pending_asample_per_apikey = int(
-                getattr(server_config, "sampling_max_pending_asample_per_apikey", 64)
-            )
-            self._queued_asample_by_principal: dict[str, int] = {}
-            self._queued_asample_by_apikey: dict[str, int] = {}
-            self._queued_asample_request_state: dict[str, tuple[str | None, str | None, str | None]] = {}
-            self._scheduler_request_meta: dict[str, tuple[str, str, str]] = {}
-            self._scheduler_lease_consumer: dict[str, str] = {}
-            self._scheduler_enabled = self._to_bool(os.environ.get("MINT_SCHEDULER_ENABLE", "1"))
-            self._scheduler_max_consecutive = max(
-                1,
-                int(os.environ.get("MINT_SCHEDULER_MAX_CONSECUTIVE", "8")),
-            )
-            fairness = str(os.environ.get("MINT_SCHEDULER_FAIRNESS", "oldest")).strip().lower()
-            if fairness not in ("oldest", "rr"):
-                fairness = "oldest"
-            self._scheduler_fairness = fairness
-            self._scheduler_starvation_s = max(
-                0.0,
-                float(os.environ.get("MINT_SCHEDULER_STARVATION_S", "30")),
-            )
-            self._scheduler_coalesce_ms = max(
-                0.0,
-                float(os.environ.get("MINT_SCHEDULER_COALESCE_MS", "20")),
-            )
-            self._sched_domains: dict[str, dict[str, Any]] = {}
-            self._sched_stats: dict[str, Any] = {
-                "picks_total": 0,
-                "switches_total": 0,
-                "starvation_picks_total": 0,
-                "wait_s_sum": 0.0,
-                "switch_reasons": {},
-            }
-            self._execution_serial_seq_by_key: dict[str, int] = {}
-            self._execution_serial_epoch = uuid.uuid4().hex
+                init_actor_observability()
+                logger.info(
+                    "[api_work_queue] actor (re)initializing (max_restarts=%d)",
+                    max_restarts,
+                )
+                self._items = deque()
+                self._cv = asyncio.Condition()
+                self._enqueued = 0
+                self._dequeued = 0
+                debug_max = int(os.environ.get("MINT_API_WORK_QUEUE_DEBUG_MAX", "50"))
+                self._recent_dequeues = deque(maxlen=debug_max)
+                self._recent_enqueues = deque(maxlen=debug_max)
+                self._recent_scheduler_decisions = deque(
+                    maxlen=int(os.environ.get("MINT_API_WORK_QUEUE_SCHED_DEBUG_MAX", str(debug_max)))
+                )
+                self._scheduler_decision_seq = 0
+                self._active_job_id: str | None = None
+                self._ema_exec_s_by_op: dict[str, float] = {}
+                self._last_exec_s_by_op: dict[str, float] = {}
+                self._sum_exec_s_by_op: dict[str, float] = {}
+                self._count_exec_by_op: dict[str, int] = {}
+                self._max_exec_s_by_op: dict[str, float] = {}
+                self._ema_alpha = float(os.environ.get("MINT_API_WORK_QUEUE_ETA_ALPHA", "0.1"))
+                self._max_pending_asample_per_apikey = int(
+                    getattr(server_config, "sampling_max_pending_asample_per_apikey", 64)
+                )
+                self._queued_asample_by_principal: dict[str, int] = {}
+                self._queued_asample_by_apikey: dict[str, int] = {}
+                self._queued_asample_request_state: dict[str, tuple[str | None, str | None, str | None]] = {}
+                self._scheduler_request_meta: dict[str, tuple[str, str, str]] = {}
+                self._scheduler_lease_consumer: dict[str, str] = {}
+                self._scheduler_enabled = self._to_bool(os.environ.get("MINT_SCHEDULER_ENABLE", "1"))
+                self._scheduler_max_consecutive = max(
+                    1,
+                    int(os.environ.get("MINT_SCHEDULER_MAX_CONSECUTIVE", "8")),
+                )
+                fairness = str(os.environ.get("MINT_SCHEDULER_FAIRNESS", "oldest")).strip().lower()
+                if fairness not in ("oldest", "rr"):
+                    fairness = "oldest"
+                self._scheduler_fairness = fairness
+                self._scheduler_starvation_s = max(
+                    0.0,
+                    float(os.environ.get("MINT_SCHEDULER_STARVATION_S", "30")),
+                )
+                self._scheduler_coalesce_ms = max(
+                    0.0,
+                    float(os.environ.get("MINT_SCHEDULER_COALESCE_MS", "20")),
+                )
+                self._sched_domains: dict[str, dict[str, Any]] = {}
+                self._sched_stats: dict[str, Any] = {
+                    "picks_total": 0,
+                    "switches_total": 0,
+                    "starvation_picks_total": 0,
+                    "wait_s_sum": 0.0,
+                    "switch_reasons": {},
+                }
+                self._scheduler_arbitration_total = 0
+                self._scheduler_arbitration_by_winner: dict[str, int] = {}
+                self._scheduler_arbitration_by_reason: dict[str, int] = {}
+                self._scheduled_dequeue_stats: dict[tuple[str, str, str], int] = {}
+                self._legacy_dequeue_stats: dict[tuple[str, str], int] = {}
+                self._execution_serial_seq_by_key: dict[str, int] = {}
+                self._execution_serial_epoch = uuid.uuid4().hex
+                _append_api_work_queue_debug(
+                    "actor_init_ok",
+                    cwd=os.getcwd(),
+                    debug_log_path=_api_work_queue_debug_log_path(),
+                    pythonpath=os.environ.get("PYTHONPATH", ""),
+                )
+            except Exception as e:
+                _append_api_work_queue_debug(
+                    "actor_init_error",
+                    error=f"{type(e).__name__}: {e}",
+                    traceback=traceback.format_exc(),
+                )
+                raise
 
         def _asample_throttle_identity(self, item: dict[str, Any]) -> tuple[str | None, str | None]:
             if str(item.get("op")) != "sampling.asample":
@@ -329,6 +409,29 @@ def _create_ray_actor(*, require_ready: bool = True):
             except Exception:
                 return fallback
 
+        def _item_raw_priority(self, item: dict[str, Any]) -> int:
+            extra = item.get("extra")
+            if not isinstance(extra, dict):
+                return 0
+            return normalize_queue_priority(extra.get("queue_priority", 0))
+
+        def _item_effective_priority(self, item: dict[str, Any], *, now: float) -> int:
+            return effective_queue_priority(
+                raw_priority=self._item_raw_priority(item),
+                created_at=self._item_created_at(item, now=now),
+                now=now,
+                aging_s=QUEUE_PRIORITY_AGING_S,
+            )
+
+        def _annotate_queue_priority(self, item: dict[str, Any], *, now: float, kind: str) -> None:
+            extra = item.get("extra")
+            if not isinstance(extra, dict):
+                extra = {}
+                item["extra"] = extra
+            extra["_queue_priority_raw"] = self._item_raw_priority(item)
+            extra["_queue_priority_effective"] = self._item_effective_priority(item, now=now)
+            extra["_queue_kind"] = str(kind)
+
         def _item_log_context(self, item: dict[str, Any]) -> tuple[str, str]:
             request_id = str(item.get("request_id") or "-")
             trace_id: str | None = None
@@ -362,6 +465,26 @@ def _create_ray_actor(*, require_ready: bool = True):
                 return False, "", ""
             return True, domain, session_id
 
+        def _scheduler_domain_policy(self, item: dict[str, Any]) -> tuple[str | None, int | None]:
+            extra = item.get("extra")
+            if not isinstance(extra, dict):
+                return None, None
+            fairness_raw = extra.get("scheduler_fairness")
+            fairness: str | None = None
+            if fairness_raw is not None:
+                fairness = str(fairness_raw).strip().lower()
+                if fairness not in ("oldest", "rr"):
+                    raise ValueError(f"invalid scheduler_fairness override: {fairness_raw!r}")
+            max_consecutive_raw = extra.get("scheduler_max_consecutive")
+            max_consecutive: int | None = None
+            if max_consecutive_raw is not None:
+                max_consecutive = int(max_consecutive_raw)
+                if max_consecutive < 1:
+                    raise ValueError(
+                        f"scheduler_max_consecutive override must be >= 1, got {max_consecutive_raw!r}"
+                    )
+            return fairness, max_consecutive
+
         def _get_domain_state(self, domain: str) -> dict[str, Any]:
             from collections import deque
 
@@ -374,7 +497,11 @@ def _create_ray_actor(*, require_ready: bool = True):
                 "ready_set": set(),
                 "current_session": None,
                 "last_session": None,
+                "last_pick_ts": 0.0,
                 "consecutive_count": 0,
+                "scheduler_fairness_override": None,
+                "scheduler_max_consecutive_override": None,
+                "capacity_owner": None,
                 "leased_request_id": None,
                 "leased_session": None,
                 "stats": {
@@ -434,10 +561,138 @@ def _create_ray_actor(*, require_ready: bool = True):
                         oldest = ts
             return oldest
 
+        def _domain_capacity_workers(self, domain: str, state: dict[str, Any]) -> int | None:
+            owner = state.get("capacity_owner")
+            if owner is None:
+                owner = infer_scheduler_capacity_owner(domain)
+            owner = None if owner is None else str(owner).strip()
+            if owner in {"single_worker", "vllm_replica_single_worker"}:
+                return 1
+            return None
+
+        def _scheduler_domain_snapshot(self, *, domain: str, state: dict[str, Any], now: float) -> dict[str, Any] | None:
+            queues_by_session = state.get("queues_by_session", {}) or {}
+            pending_requests = 0
+            active_sessions = 0
+            oldest_created_at: float | None = None
+            for q in queues_by_session.values():
+                if not q:
+                    continue
+                active_sessions += 1
+                pending_requests += int(len(q))
+                ts = self._item_created_at(q[0], now=now)
+                if oldest_created_at is None or ts < oldest_created_at:
+                    oldest_created_at = ts
+            if pending_requests <= 0 and int((state.get("stats") or {}).get("picks", 0)) == 0:
+                return None
+            inflight_workers = 1 if state.get("leased_request_id") else 0
+            capacity_workers = self._domain_capacity_workers(domain, state)
+            last_pick_ts = float(state.get("last_pick_ts", 0.0) or 0.0)
+            oldest_queued_s = 0.0 if oldest_created_at is None else max(0.0, now - oldest_created_at)
+            service_gap_s = oldest_queued_s if last_pick_ts <= 0 else max(0.0, now - last_pick_ts)
+            return {
+                "backend": self._scheduler_backend(domain),
+                "pending_requests": int(pending_requests),
+                "active_sessions": int(active_sessions),
+                "oldest_queued_s": float(oldest_queued_s),
+                "inflight_workers": int(inflight_workers),
+                "capacity_owner": state.get("capacity_owner"),
+                "capacity_workers": capacity_workers,
+                "admissible": False if capacity_workers is None else bool(inflight_workers < capacity_workers),
+                "service_gap_s": float(service_gap_s),
+                "stats": {
+                    "picks": int((state.get("stats") or {}).get("picks", 0)),
+                    "starvation_picks": int((state.get("stats") or {}).get("starvation_picks", 0)),
+                },
+            }
+
+        def _scheduler_metrics_snapshot(self, *, now: float | None = None) -> dict[str, Any]:
+            ts = time.time() if now is None else float(now)
+            scheduler_domains: dict[str, Any] = {}
+            for domain, state in self._sched_domains.items():
+                snapshot = self._scheduler_domain_snapshot(domain=str(domain), state=state, now=ts)
+                if snapshot is not None:
+                    scheduler_domains[str(domain)] = snapshot
+            scheduled_dequeue_stats = [
+                {
+                    "scheduler_domain": scheduler_domain,
+                    "reason": reason,
+                    "op": op,
+                    "total": int(total),
+                }
+                for (scheduler_domain, reason, op), total in sorted(self._scheduled_dequeue_stats.items())
+            ]
+            legacy_dequeue_stats = [
+                {
+                    "reason": reason,
+                    "op": op,
+                    "total": int(total),
+                }
+                for (reason, op), total in sorted(self._legacy_dequeue_stats.items())
+            ]
+            return {
+                "scheduler_arbitration_total": int(self._scheduler_arbitration_total),
+                "scheduler_arbitration_by_winner": dict(sorted(self._scheduler_arbitration_by_winner.items())),
+                "scheduler_arbitration_by_reason": dict(sorted(self._scheduler_arbitration_by_reason.items())),
+                "scheduled_dequeue_stats": scheduled_dequeue_stats,
+                "legacy_dequeue_stats": legacy_dequeue_stats,
+                "scheduler_domains": scheduler_domains,
+            }
+
+        def _record_scheduler_arbitration(self, *, winner_bucket: str, reason: str) -> None:
+            bucket = str(winner_bucket).strip() or "legacy"
+            why = str(reason).strip() or "unknown"
+            self._scheduler_arbitration_total += 1
+            self._scheduler_arbitration_by_winner[bucket] = int(self._scheduler_arbitration_by_winner.get(bucket, 0)) + 1
+            self._scheduler_arbitration_by_reason[why] = int(self._scheduler_arbitration_by_reason.get(why, 0)) + 1
+
+        def _record_dequeue_stat(self, *, scheduler_domain: str | None, reason: str, op: str) -> None:
+            op_key = str(op).strip() or "unknown"
+            reason_key = str(reason).strip() or "unknown"
+            if scheduler_domain is None:
+                key = (reason_key, op_key)
+                self._legacy_dequeue_stats[key] = int(self._legacy_dequeue_stats.get(key, 0)) + 1
+                return
+            key = (str(scheduler_domain), reason_key, op_key)
+            self._scheduled_dequeue_stats[key] = int(self._scheduled_dequeue_stats.get(key, 0)) + 1
+
         def _enqueue_scheduled(self, item: dict[str, Any], *, domain: str, session_id: str) -> None:
             from collections import deque
 
             state = self._get_domain_state(domain)
+            fairness, max_consecutive = self._scheduler_domain_policy(item)
+            current_fairness = state.get("scheduler_fairness_override")
+            if fairness is not None:
+                if current_fairness is None:
+                    state["scheduler_fairness_override"] = fairness
+                elif current_fairness != fairness:
+                    raise RuntimeError(
+                        "scheduler fairness override conflict: "
+                        f"domain={domain!r} existing={current_fairness!r} incoming={fairness!r}"
+                    )
+            current_max_consecutive = state.get("scheduler_max_consecutive_override")
+            if max_consecutive is not None:
+                if current_max_consecutive is None:
+                    state["scheduler_max_consecutive_override"] = max_consecutive
+                elif int(current_max_consecutive) != int(max_consecutive):
+                    raise RuntimeError(
+                        "scheduler max_consecutive override conflict: "
+                        f"domain={domain!r} existing={current_max_consecutive!r} incoming={max_consecutive!r}"
+                    )
+            extra = item.get("extra") if isinstance(item.get("extra"), dict) else {}
+            owner = extra.get("scheduler_capacity_owner") if isinstance(extra, dict) else None
+            if owner is None:
+                owner = infer_scheduler_capacity_owner(domain)
+            if owner is not None:
+                current_owner = state.get("capacity_owner")
+                owner = str(owner)
+                if current_owner is None:
+                    state["capacity_owner"] = owner
+                elif str(current_owner) != owner:
+                    raise RuntimeError(
+                        "scheduler capacity_owner conflict: "
+                        f"domain={domain!r} existing={current_owner!r} incoming={owner!r}"
+                    )
             queues_by_session = state["queues_by_session"]
             q = queues_by_session.get(session_id)
             if q is None:
@@ -506,6 +761,11 @@ def _create_ray_actor(*, require_ready: bool = True):
             if not rr_order:
                 return None
 
+            fairness = str(state.get("scheduler_fairness_override") or self._scheduler_fairness)
+            max_consecutive = int(
+                state.get("scheduler_max_consecutive_override") or self._scheduler_max_consecutive
+            )
+
             if self._scheduler_starvation_s > 0:
                 chosen_starved_sid: str | None = None
                 max_wait = self._scheduler_starvation_s
@@ -525,12 +785,12 @@ def _create_ray_actor(*, require_ready: bool = True):
                 isinstance(current, str)
                 and current
                 and queues_by_session.get(current)
-                and int(state.get("consecutive_count", 0)) < int(self._scheduler_max_consecutive)
+                and int(state.get("consecutive_count", 0)) < int(max_consecutive)
             ):
                 return current, "sticky"
 
             avoid = current if isinstance(current, str) and current and len(rr_order) > 1 else None
-            if self._scheduler_fairness == "oldest":
+            if fairness == "oldest":
                 sid = self._pick_oldest_session(state, now=now, avoid=avoid)
                 reason = "fairness_oldest"
             else:
@@ -541,7 +801,7 @@ def _create_ray_actor(*, require_ready: bool = True):
             return sid, reason
 
         def _pick_scheduled_candidate(self, *, now: float) -> tuple[str, str, str] | None:
-            best: tuple[float, str, str, str] | None = None
+            best: tuple[int, float, str, str, str] | None = None
             for domain, state in self._sched_domains.items():
                 if state.get("leased_request_id") is not None:
                     continue
@@ -552,12 +812,15 @@ def _create_ray_actor(*, require_ready: bool = True):
                 q = state["queues_by_session"].get(sid)
                 if not q:
                     continue
-                created_at = self._item_created_at(q[0], now=now)
-                if best is None or created_at < best[0]:
-                    best = (created_at, domain, sid, reason)
+                head = q[0]
+                priority = self._item_effective_priority(head, now=now)
+                created_at = self._item_created_at(head, now=now)
+                candidate = (-priority, created_at, domain, sid, reason)
+                if best is None or candidate < best:
+                    best = candidate
             if best is None:
                 return None
-            return best[1], best[2], best[3]
+            return best[2], best[3], best[4]
 
         def _record_switch_reason(self, reason: str) -> None:
             reasons = self._sched_stats.get("switch_reasons")
@@ -718,6 +981,12 @@ def _create_ray_actor(*, require_ready: bool = True):
                 domains[str(domain)] = {
                     "current_session": state.get("current_session"),
                     "consecutive_count": int(state.get("consecutive_count", 0)),
+                    "scheduler_fairness": str(
+                        state.get("scheduler_fairness_override") or self._scheduler_fairness
+                    ),
+                    "scheduler_max_consecutive": int(
+                        state.get("scheduler_max_consecutive_override") or self._scheduler_max_consecutive
+                    ),
                     "queue_depths": queue_depths,
                     "ready_rr": [str(x) for x in list(state.get("ready_rr", []))],
                     "stats": {
@@ -917,9 +1186,12 @@ def _create_ray_actor(*, require_ready: bool = True):
                     scheduler_domain = None
                     scheduler_session_id = None
                     decision_ctx = None
+                    arbitration_winner = "legacy"
+                    arbitration_reason = "legacy_only"
 
                     if has_legacy and sched_choice is not None:
                         legacy_head = self._items[0]
+                        legacy_priority = self._item_effective_priority(legacy_head, now=now)
                         legacy_ts = self._item_created_at(legacy_head, now=now)
                         sched_domain, sched_session_id, sched_reason = sched_choice
                         sched_state = self._sched_domains.get(sched_domain)
@@ -928,31 +1200,54 @@ def _create_ray_actor(*, require_ready: bool = True):
                             if sched_state is None
                             else (sched_state.get("queues_by_session", {}) or {}).get(sched_session_id)
                         )
-                        sched_head_ts = (
-                            legacy_ts
-                            if not sched_queue
-                            else self._item_created_at(sched_queue[0], now=now)
-                        )
-                        if legacy_ts <= sched_head_ts:
+                        if not sched_queue:
+                            item = self._items.popleft()
+                            arbitration_winner = "legacy"
+                            arbitration_reason = "legacy_only"
+                        else:
+                            sched_head = sched_queue[0]
+                            sched_priority = self._item_effective_priority(sched_head, now=now)
+                            sched_head_ts = self._item_created_at(sched_head, now=now)
+                            if (legacy_priority, -legacy_ts) >= (sched_priority, -sched_head_ts):
+                                item = self._items.popleft()
+                                arbitration_winner = "legacy"
+                                arbitration_reason = "legacy_head_older"
+                            else:
+                                decision_ctx = self._scheduler_decision_context(
+                                    domain=str(sched_domain),
+                                    session_id=str(sched_session_id),
+                                    reason=str(sched_reason),
+                                    coalesce_applied=coalesce_applied,
+                                )
+                                item = self._pop_scheduled(
+                                    domain=sched_domain,
+                                    session_id=sched_session_id,
+                                    reason=sched_reason,
+                                    now=now,
+                                )
+                                dequeue_reason = str(sched_reason)
+                                scheduler_domain = str(sched_domain)
+                                scheduler_session_id = str(sched_session_id)
+                                arbitration_winner = "scheduled"
+                                arbitration_reason = f"scheduled_{sched_reason}"
+                    elif has_legacy:
+                        arbitration_winner = "legacy"
+                        arbitration_reason = "legacy_only"
+                        best_idx = 0
+                        best_priority = self._item_effective_priority(self._items[0], now=now)
+                        best_ts = self._item_created_at(self._items[0], now=now)
+                        for idx, candidate in enumerate(list(self._items)[1:], start=1):
+                            candidate_priority = self._item_effective_priority(candidate, now=now)
+                            candidate_ts = self._item_created_at(candidate, now=now)
+                            if (candidate_priority, -candidate_ts) > (best_priority, -best_ts):
+                                best_idx = idx
+                                best_priority = candidate_priority
+                                best_ts = candidate_ts
+                        if best_idx == 0:
                             item = self._items.popleft()
                         else:
-                            decision_ctx = self._scheduler_decision_context(
-                                domain=str(sched_domain),
-                                session_id=str(sched_session_id),
-                                reason=str(sched_reason),
-                                coalesce_applied=coalesce_applied,
-                            )
-                            item = self._pop_scheduled(
-                                domain=sched_domain,
-                                session_id=sched_session_id,
-                                reason=sched_reason,
-                                now=now,
-                            )
-                            dequeue_reason = str(sched_reason)
-                            scheduler_domain = str(sched_domain)
-                            scheduler_session_id = str(sched_session_id)
-                    elif has_legacy:
-                        item = self._items.popleft()
+                            item = self._items[best_idx]
+                            del self._items[best_idx]
                     else:
                         if sched_choice is None:
                             await self._cv.wait()
@@ -973,6 +1268,8 @@ def _create_ray_actor(*, require_ready: bool = True):
                         dequeue_reason = str(sched_reason)
                         scheduler_domain = str(sched_domain)
                         scheduler_session_id = str(sched_session_id)
+                        arbitration_winner = "scheduled"
+                        arbitration_reason = f"scheduled_{sched_reason}"
                     serial_key = self._execution_serial_key(item)
                     if serial_key is not None:
                         extra = item.get("extra")
@@ -993,6 +1290,20 @@ def _create_ray_actor(*, require_ready: bool = True):
                 self._dequeued += 1
                 dequeue_ts = time.time()
                 wait_s = max(0.0, dequeue_ts - self._item_created_at(item, now=dequeue_ts))
+                self._record_scheduler_arbitration(
+                    winner_bucket=arbitration_winner,
+                    reason=arbitration_reason,
+                )
+                self._record_dequeue_stat(
+                    scheduler_domain=scheduler_domain,
+                    reason=str(dequeue_reason),
+                    op=str(item.get("op") or "unknown"),
+                )
+                self._annotate_queue_priority(
+                    item,
+                    now=dequeue_ts,
+                    kind="scheduled" if scheduler_domain is not None else "legacy",
+                )
                 self._record_scheduler_metrics(
                     item=item,
                     scheduler_domain=scheduler_domain,
@@ -1097,6 +1408,7 @@ def _create_ray_actor(*, require_ready: bool = True):
             }
 
         def stats(self) -> dict[str, Any]:
+            now = time.time()
             depth_legacy = int(len(self._items))
             depth_scheduled = int(self._scheduled_depth())
             by_executor: dict[str, int] = {}
@@ -1137,6 +1449,7 @@ def _create_ray_actor(*, require_ready: bool = True):
                 "scheduler_starvation_picks_total": int(self._sched_stats.get("starvation_picks_total", 0)),
                 "scheduler_wait_s_sum": float(self._sched_stats.get("wait_s_sum", 0.0)),
                 "scheduler_domains_total": int(len(self._sched_domains)),
+                **self._scheduler_metrics_snapshot(now=now),
             }
 
         def metrics_seed_snapshot(self) -> dict[str, Any]:
@@ -1220,6 +1533,17 @@ def _create_ray_actor(*, require_ready: bool = True):
                     break
             return {"found": pos is not None, "position": pos, "depth": depth}
 
+        def describe_pending_request(self, request_id: str, op: str | None = None) -> dict[str, Any]:
+            out = self.find_position(request_id)
+            pos = out.get("position")
+            if pos is None or op is None:
+                out["ema_exec_s"] = None
+                return out
+            key = str(op).strip() or "unknown"
+            v = self._ema_exec_s_by_op.get(key)
+            out["ema_exec_s"] = None if v is None else float(v)
+            return out
+
         def record_execution_time(self, op: str, duration_s: float) -> None:
             key = str(op).strip() or "unknown"
             try:
@@ -1248,6 +1572,10 @@ def _create_ray_actor(*, require_ready: bool = True):
 
     # Keep the detached queue actor on a stable control-plane node. By default
     # this is the head, but MINT_DETACHED_ACTOR_NODE_IP can move it elsewhere.
+    # The API work queue still has its own higher-priority pin: if
+    # MINT_API_WORK_QUEUE_PINNED_NODE_IP is set we honor that first, otherwise we
+    # fall back to the general detached/control-plane placement rules.
+    resources = _api_work_queue_actor_resources()
 
     options: dict[str, Any] = {
         "name": actor_name,
@@ -1258,22 +1586,38 @@ def _create_ray_actor(*, require_ready: bool = True):
         "max_task_retries": -1,
     }
     actor_otel_env = otel_env_vars()
+    actor_otel_env.setdefault("MINT_API_WORK_QUEUE_DEBUG_LOG_PATH", _api_work_queue_debug_log_path())
     from ..config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources
-    apply_detached_actor_resources(options, ray)
+    if resources is not None:
+        options["resources"] = resources
+    else:
+        apply_detached_actor_resources(options, ray)
     options["runtime_env"] = actor_runtime_env(
         pythonpath=PFS_PYTHONPATH,
         extra=actor_otel_env,
+    )
+    _append_api_work_queue_debug(
+        "driver_create_attempt",
+        runtime_env=_summarize_debug_runtime_env(options.get("runtime_env")),
+        resources=options.get("resources"),
     )
 
     created = _RayApiWorkQueueActor.options(  # type: ignore[attr-defined]
         **options
     ).remote()
+    _append_api_work_queue_debug("driver_create_remote_returned", require_ready=bool(require_ready))
     if not require_ready:
         return created
     try:
         ray.get(created.stats.remote(), timeout=1.0)
+        _append_api_work_queue_debug("driver_create_ready_ok")
         return created
-    except Exception:
+    except Exception as e:
+        _append_api_work_queue_debug(
+            "driver_create_ready_probe_failed",
+            error=f"{type(e).__name__}: {e}",
+            traceback=traceback.format_exc(),
+        )
         return ray.get_actor(actor_name, namespace=_ray_namespace())
 
 
@@ -1361,6 +1705,7 @@ class ApiWorkQueueClient:
         self._snapshot_by_executor: dict[str, int] = {}
         self._snapshot_by_apikey_id: dict[str, int] = {}
         self._snapshot_by_throttle_principal: dict[str, int] = {}
+        self._snapshot_scheduler_view: dict[str, Any] = {}
         self._snapshot_hydrated = False
         self._snapshot_hydrate_last_attempt_s = 0.0
         self._snapshot_hydrate_min_interval_s = float(
@@ -1374,12 +1719,38 @@ class ApiWorkQueueClient:
         self._ray_actor = None
 
     @staticmethod
+    def _scheduler_metrics_view(snapshot: dict[str, Any]) -> dict[str, Any]:
+        trimmed = ApiWorkQueueClient._trim_unready_scheduler_metrics(snapshot)
+        out: dict[str, Any] = {}
+        for key in (
+            "scheduler_metrics_ready",
+            "depth_scheduled",
+            "scheduler_enabled",
+            "scheduler_picks_total",
+            "scheduler_switches_total",
+            "scheduler_starvation_picks_total",
+            "scheduler_wait_s_sum",
+            "scheduler_domains_total",
+            "scheduler_arbitration_total",
+            "scheduler_arbitration_by_winner",
+            "scheduler_arbitration_by_reason",
+            "scheduled_dequeue_stats",
+            "legacy_dequeue_stats",
+            "scheduler_domains",
+        ):
+            if key in trimmed:
+                out[key] = trimmed.get(key)
+        return out
+
+    @staticmethod
     def _trim_unready_scheduler_metrics(snapshot: dict[str, Any]) -> dict[str, Any]:
         if bool(snapshot.get("scheduler_metrics_ready", True)):
             return snapshot
         out = dict(snapshot)
         out.pop("depth_scheduled", None)
         out.pop("scheduled_depth_by_priority", None)
+        out.pop("scheduled_dequeue_stats", None)
+        out.pop("legacy_dequeue_stats", None)
         for key in list(out):
             if key.startswith("scheduler_") and key != "scheduler_metrics_ready":
                 out.pop(key, None)
@@ -1479,12 +1850,6 @@ class ApiWorkQueueClient:
         except Exception as e:
             raise ApiWorkQueueUnavailableError("Ray import failed") from e
 
-        try:
-            from ..ray_utils import init_ray
-
-            init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
-        except Exception as e:
-            raise ApiWorkQueueUnavailableError("Ray not initialized (init_ray failed)") from e
         if not ray.is_initialized():
             raise ApiWorkQueueUnavailableError("Ray not initialized")
 
@@ -1561,12 +1926,10 @@ class ApiWorkQueueClient:
     def hydrate_metrics_snapshot(self, *, timeout_s: float = 10.0, force: bool = False) -> bool:
         now = time.time()
         with self._snapshot_lock:
-            if self._snapshot_hydrated and not force:
-                return True
             if not force and (now - float(self._snapshot_hydrate_last_attempt_s)) < float(
                 self._snapshot_hydrate_min_interval_s
             ):
-                return False
+                return bool(self._snapshot_hydrated)
             self._snapshot_hydrate_last_attempt_s = now
 
         actor = self._get_ray_actor()
@@ -1630,6 +1993,7 @@ class ApiWorkQueueClient:
             dequeued = max(0, int(stats.get("dequeued", 0)))
         except Exception:
             dequeued = 0
+        scheduler_view = self._scheduler_metrics_view(stats)
 
         with self._snapshot_lock:
             self._snapshot_items_by_request_id = next_items
@@ -1638,10 +2002,15 @@ class ApiWorkQueueClient:
             self._snapshot_by_throttle_principal = next_by_principal
             self._snapshot_enqueued = int(enqueued)
             self._snapshot_dequeued = int(dequeued)
+            self._snapshot_scheduler_view = scheduler_view
             self._snapshot_hydrated = True
         return True
 
     def metrics_snapshot(self) -> dict[str, Any]:
+        try:
+            self.hydrate_metrics_snapshot(timeout_s=1.0, force=False)
+        except Exception:
+            pass
         with self._snapshot_lock:
             now = time.time()
             ages = [
@@ -1649,7 +2018,7 @@ class ApiWorkQueueClient:
                 for rec in self._snapshot_items_by_request_id.values()
             ]
             depth = int(len(self._snapshot_items_by_request_id))
-            return {
+            out = {
                 "depth": depth,
                 "depth_legacy": depth,
                 "enqueued": int(self._snapshot_enqueued),
@@ -1663,30 +2032,69 @@ class ApiWorkQueueClient:
                 },
                 "scheduler_metrics_ready": False,
             }
+            scheduler_view = dict(self._snapshot_scheduler_view)
+            if scheduler_view:
+                out.update(scheduler_view)
+                try:
+                    depth_scheduled = int(scheduler_view.get("depth_scheduled", 0) or 0)
+                except Exception:
+                    depth_scheduled = 0
+                out["depth_legacy"] = max(0, depth - depth_scheduled)
+            return out
 
     def _get_cached_ray_actor_for_async_request_path(self):
         return self._get_ray_actor(require_ready=False)
 
     async def _get_ray_actor_async(self, *, require_ready: bool = True):
+        _append_api_work_queue_debug("get_ray_actor_async_begin", require_ready=bool(require_ready))
         try:
             import ray
         except Exception as e:
+            _append_api_work_queue_debug(
+                "get_ray_actor_async_import_error",
+                require_ready=bool(require_ready),
+                error=f"{type(e).__name__}: {e}",
+                traceback=traceback.format_exc(),
+            )
             raise ApiWorkQueueUnavailableError("Ray import failed") from e
 
-        try:
-            from ..ray_utils import init_ray
+        async def _ensure_active_job_binding(actor: Any, *, timeout_s: float) -> None:
+            if self._consumer_job_id is None:
+                return
+            state = await self._await_ray_ref(actor.debug_state.remote(), timeout_s=timeout_s)
+            if not isinstance(state, dict):
+                raise TypeError(f"ApiWorkQueue.debug_state returned non-dict: {type(state)}")
+            if state.get("active_job_id") == self._consumer_job_id:
+                return
+            ref = actor.set_active_job_id.remote(self._consumer_job_id)
+            await self._await_ray_ref(ref, timeout_s=timeout_s)
 
-            init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
-        except Exception as e:
-            raise ApiWorkQueueUnavailableError("Ray not initialized (init_ray failed)") from e
+        if not ray.is_initialized():
+            try:
+                from ..ray_utils import init_ray
+
+                init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
+                _append_api_work_queue_debug("get_ray_actor_async_after_init_ray", require_ready=bool(require_ready))
+            except Exception as e:
+                _append_api_work_queue_debug(
+                    "get_ray_actor_async_init_ray_error",
+                    require_ready=bool(require_ready),
+                    error=f"{type(e).__name__}: {e}",
+                    traceback=traceback.format_exc(),
+                )
+                raise ApiWorkQueueUnavailableError("Ray not initialized (init_ray failed)") from e
+        else:
+            _append_api_work_queue_debug("get_ray_actor_async_using_existing_ray", require_ready=bool(require_ready))
         if not ray.is_initialized():
             raise ApiWorkQueueUnavailableError("Ray not initialized")
 
         if self._ray_actor is not None:
             if not require_ready:
+                _append_api_work_queue_debug("get_ray_actor_async_return_cached", require_ready=False)
                 return self._ray_actor
             try:
                 await self._await_ray_ref(self._ray_actor.stats.remote(), timeout_s=1.0)
+                await _ensure_active_job_binding(self._ray_actor, timeout_s=5.0)
                 return self._ray_actor
             except Exception:
                 self._ray_actor = None
@@ -1700,18 +2108,20 @@ class ApiWorkQueueClient:
 
         actor = None
         try:
-            actor = ray.get_actor(actor_name, namespace=_ray_namespace())
+            actor = await asyncio.to_thread(ray.get_actor, actor_name, namespace=_ray_namespace())
             if not require_ready:
                 self._ray_actor = actor
+                _append_api_work_queue_debug("get_ray_actor_async_found_existing", require_ready=False)
                 return actor
             await self._await_ray_ref(actor.stats.remote(), timeout_s=probe_timeout_s)
+            await _ensure_active_job_binding(actor, timeout_s=max(5.0, probe_timeout_s))
             self._ray_actor = actor
             return actor
         except ValueError:
             logger.info("[api_work_queue] actor %s not found; creating", actor_name)
         except ray.exceptions.GetTimeoutError:
             if fail_fast_on_probe_timeout:
-                logger.warning(
+                logger.info(
                     "[api_work_queue] actor %s alive but unresponsive (probe_timeout_s=%.2f); failing fast",
                     actor_name,
                     probe_timeout_s,
@@ -1719,7 +2129,7 @@ class ApiWorkQueueClient:
                 raise ApiWorkQueueUnavailableError(
                     f"queue actor {actor_name} unresponsive (restarting?)"
                 )
-            logger.warning(
+            logger.info(
                 "[api_work_queue] actor %s probe timed out (probe_timeout_s=%.2f); reusing existing actor",
                 actor_name,
                 probe_timeout_s,
@@ -1728,7 +2138,7 @@ class ApiWorkQueueClient:
                 self._ray_actor = actor
                 return actor
         except (ray.exceptions.ActorDiedError, ray.exceptions.RayActorError) as e:
-            logger.warning(
+            logger.info(
                 "[api_work_queue] actor %s dead (%s: %s); Ray auto-restart will recover",
                 actor_name,
                 type(e).__name__,
@@ -1738,7 +2148,7 @@ class ApiWorkQueueClient:
                 f"queue actor {actor_name} restarting ({type(e).__name__})"
             ) from e
         except Exception as e:
-            logger.warning(
+            logger.info(
                 "[api_work_queue] failed to fetch detached actor %s (%s: %s); creating",
                 actor_name,
                 type(e).__name__,
@@ -1747,7 +2157,19 @@ class ApiWorkQueueClient:
 
         try:
             self._ray_actor = _create_ray_actor(require_ready=require_ready)
+            _append_api_work_queue_debug(
+                "get_ray_actor_async_created",
+                require_ready=bool(require_ready),
+            )
+            if require_ready:
+                await _ensure_active_job_binding(self._ray_actor, timeout_s=max(5.0, probe_timeout_s))
         except Exception as e:
+            _append_api_work_queue_debug(
+                "get_ray_actor_async_error",
+                require_ready=bool(require_ready),
+                error=f"{type(e).__name__}: {e}",
+                traceback=traceback.format_exc(),
+            )
             raise ApiWorkQueueUnavailableError("Failed to get/create detached Ray ApiWorkQueue actor") from e
         return self._ray_actor
 
@@ -1892,7 +2314,7 @@ class ApiWorkQueueClient:
     ) -> None:
         import ray
 
-        actor = self._get_cached_ray_actor_for_async_request_path()
+        actor = await self._get_ray_actor_async()
         tracer = get_otel_tracer()
         producer_job_id = None
         try:
@@ -2010,12 +2432,38 @@ class ApiWorkQueueClient:
         )
 
     async def find_position(self, request_id: str) -> dict[str, Any]:
-        actor = self._get_cached_ray_actor_for_async_request_path()
+        actor = await self._get_ray_actor_async(require_ready=False)
         ref = actor.find_position.remote(request_id=str(request_id))
         result = await self._await_ray_ref(ref, timeout_s=5.0)
         if not isinstance(result, dict):
             raise TypeError(f"ApiWorkQueue.find_position returned non-dict: {type(result)}")
         return result
+
+    async def describe_pending_request(self, request_id: str, op: str | None) -> dict[str, Any]:
+        actor = await self._get_ray_actor_async(require_ready=False)
+        rid = str(request_id)
+        op_key = None if op is None else str(op)
+        try:
+            ref = actor.describe_pending_request.remote(rid, op_key)
+            result = await self._await_ray_ref(ref, timeout_s=5.0)
+            if not isinstance(result, dict):
+                raise TypeError(f"ApiWorkQueue.describe_pending_request returned non-dict: {type(result)}")
+            return result
+        except AttributeError:
+            ref = actor.find_position.remote(request_id=rid)
+            result = await self._await_ray_ref(ref, timeout_s=5.0)
+            if not isinstance(result, dict):
+                raise TypeError(f"ApiWorkQueue.find_position returned non-dict: {type(result)}")
+            pos = result.get("position")
+            if pos is None or op_key is None:
+                result["ema_exec_s"] = None
+                return result
+            eta_ref = actor.get_eta_state.remote(op_key)
+            eta_state = await self._await_ray_ref(eta_ref, timeout_s=5.0)
+            if not isinstance(eta_state, dict):
+                raise TypeError(f"ApiWorkQueue.get_eta_state returned non-dict: {type(eta_state)}")
+            result["ema_exec_s"] = eta_state.get("ema_exec_s")
+            return result
 
     async def record_execution_time(self, op: str, duration_s: float) -> None:
         actor = await self._get_ray_actor_async()
@@ -2023,7 +2471,7 @@ class ApiWorkQueueClient:
         await self._await_ray_ref(ref, timeout_s=5.0)
 
     async def get_eta_state(self, op: str | None) -> dict[str, Any]:
-        actor = self._get_cached_ray_actor_for_async_request_path()
+        actor = await self._get_ray_actor_async(require_ready=False)
         ref = actor.get_eta_state.remote(None if op is None else str(op))
         result = await self._await_ray_ref(ref, timeout_s=5.0)
         if not isinstance(result, dict):
@@ -2186,7 +2634,12 @@ class ApiWorkQueueClient:
                         or self._consumer_job_id != consumer_job_id
                     )
                     needs_reconcile = generation_changed or generation_state != "active"
-                    actor = await self._get_ray_actor_async()
+                    # This loop is the mechanism that transitions the queue path
+                    # into the execution-ready state. Do not recurse through the
+                    # "require_ready" probe path here or startup can deadlock on
+                    # repeated ready checks against an actor that is waiting for
+                    # this very loop to advance.
+                    actor = await self._get_ray_actor_async(require_ready=False)
                     if generation_changed:
                         self._clear_execution_ready()
                         ref = actor.set_active_job_id.remote(consumer_job_id)
@@ -2500,6 +2953,7 @@ class ApiWorkQueueClient:
                     continue
 
                 try:
+                    running_stage = "prefill" if str(item.op).startswith("sampling.") else "running"
                     await future_store.async_mark_running(
                         item.request_id,
                         meta={
@@ -2508,7 +2962,7 @@ class ApiWorkQueueClient:
                             "generation_id": None if self._consumer_generation_id is None else int(self._consumer_generation_id),
                             "op": item.op,
                             "queue_state": "running",
-                            "stage": "prefill",
+                            "stage": running_stage,
                             "running_at": time.time(),
                         },
                     )

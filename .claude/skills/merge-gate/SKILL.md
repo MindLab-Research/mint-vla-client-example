@@ -10,9 +10,16 @@ description: |
 
   This skill is not a deterministic PASS/FAIL gate. It runs explicitly selected scenario items,
   gathers evidence, classifies failures, and co-iterates the server and the scenario runners.
+
+  Procedure contract: read this SKILL.md end-to-end before acting. Do not slice it on demand or use it as a lookup table mid-run.
 ---
 
 # merge-gate
+
+Procedure contract:
+- Read this SKILL.md end-to-end before taking any action.
+- Do not sample sections opportunistically while already in motion.
+- If the procedure is missing something important, update the skill. Do not improvise around the gap.
 
 ## Intent
 
@@ -186,6 +193,8 @@ Categories are organizational only. None of them are "secondary" by definition.
 
 Every item below is runnable now and tied either to a related issue/PR or to a current live integration surface.
 
+VLA rows below target the active Mint API server surface. Use `MINT_BASE_URL` (default `http://localhost:8000`) and `MINT_API_KEY` for auth-enabled servers. Use a dedicated VLA server only when you need isolation from other workloads, not as a mandatory requirement.
+
 ### Sanity
 
 | id | provenance | model | gpu_required | runner | reveals |
@@ -203,6 +212,9 @@ Every item below is runnable now and tied either to a related issue/PR or to a c
 | `dpo_moe_30b` | current MoE DPO path | `Qwen/Qwen3-30B-A3B-Instruct-2507` | 8 | `python scripts/tools/verify_convergence_matrix.py --models Qwen/Qwen3-30B-A3B-Instruct-2507 --loss-fns dpo --seeds 1 --steps 3 --output-dir results/merge-gate/<ts>/dpo_moe_30b` | MoE DPO path on the real server using the cookbook preference-pair dataset. |
 | `sdpo_dense_0p6b` | PR 375 | `Qwen/Qwen3-0.6B` | 2 | `python scripts/tools/mintx_sdpo_train.py --base-url http://localhost:8000 --api-key dummy --model Qwen/Qwen3-0.6B --output-dir results/merge-gate/<ts>/sdpo_dense_0p6b --steps 4 --train-batch-size 4 --eval-size 16 --train-size 64 --probe-size 8 --max-tokens 32` | MintX reverse-KL and checkpoint interpolation path on a small dense model. |
 | `sdpo_moe_30b` | PR 375 | `Qwen/Qwen3-30B-A3B-Instruct-2507` | 8 | `python scripts/tools/mintx_sdpo_train.py --base-url http://localhost:8000 --api-key dummy --model Qwen/Qwen3-30B-A3B-Instruct-2507 --output-dir results/merge-gate/<ts>/sdpo_moe_30b --steps 4 --train-batch-size 4 --eval-size 16 --train-size 64 --probe-size 8 --max-tokens 32` | MintX reverse-KL path on the 30B MoE training stack. |
+| `vla_sft_pi0_fast_libero` | PR 422 current-server SFT smoke | `openpi/pi0-fast-libero-low-mem-finetune` | 1 | `python scripts/wip/openpi_vla_smoke.py --base-url "${MINT_BASE_URL:-http://localhost:8000}" --api-key "${MINT_API_KEY:-dummy}" --model openpi/pi0-fast-libero-low-mem-finetune --skip-action --output-json results/merge-gate/<ts>/vla_sft_pi0_fast_libero.json` | VLA train-step path for FAST model on the active server endpoint. |
+| `vla_sft_pi05_libero` | PR 422 current-server SFT smoke | `openpi/pi05-libero-low-mem-finetune` | 1 | `python scripts/wip/openpi_vla_smoke.py --base-url "${MINT_BASE_URL:-http://localhost:8000}" --api-key "${MINT_API_KEY:-dummy}" --model openpi/pi05-libero-low-mem-finetune --skip-action --output-json results/merge-gate/<ts>/vla_sft_pi05_libero.json` | VLA train-step path for pi0.5 model on the active server endpoint. |
+| `vla_rl_pi0_fast_libero` | PR 422 current-server RL probe | `openpi/pi0-fast-libero-low-mem-finetune` | 2 | `python scripts/wip/openpi_libero_fast_group_rl.py --base-url "${MINT_BASE_URL:-http://localhost:8000}" --task-index 16 --steps 6 --groups-per-step 4 --group-size 4 --learning-rate 1e-5 --temperature 0.05 --eval-temperature 0.0 --training-state-path mint://sft-cc060b0c47f6_0/sampler_weights/live-broad-83a61bef --train-item-indices 0,4,7,10,2,6,3 --eval-item-indices 1,5,8,9 --output-dir results/merge-gate/<ts>/vla_rl_pi0_fast_libero` | FAST RL loop coverage on the active server endpoint. |
 
 ### Checkpoint and Resume
 
@@ -210,6 +222,8 @@ Every item below is runnable now and tied either to a related issue/PR or to a c
 |---|---|---|---:|---|---|
 | `resume_training_dense_0p6b` | PR 315 contract generalized to dense | `Qwen/Qwen3-0.6B` | 1 | `TINKER_MODEL=Qwen/Qwen3-0.6B python scripts/tools/reproduce_issue_315_resume_training.py` | Exercises three resume surfaces explicitly: live-session `load_state(..., optimizer=true)`, fresh-session weights-only rollback to an older checkpoint, `create_model_from_state(..., load_optimizer=true)`, and a fresh `create_model` followed by `load_state(..., optimizer=true)`, then checks post-resume training continuity. |
 | `resume_training_moe_30b` | PR 315, issue 283, and issue 404 follow-up | `Qwen/Qwen3-30B-A3B-Instruct-2507` | 4 | `TINKER_MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507 python scripts/tools/reproduce_issue_315_resume_training.py` | Exercises the 30B Megatron resume family explicitly: live-session `load_state(..., optimizer=true)`, fresh-session weights-only rollback to an older checkpoint while the actor is on a newer checkpoint, `create_model_from_state(..., load_optimizer=true)`, and a fresh `create_model` plus `load_state(..., optimizer=true)`. This is the current merge-gate coverage for the illegal-CUDA same-actor resume family. |
+| `vla_resume_pi0_fast_libero` | PR 422 current-server resume smoke | `openpi/pi0-fast-libero-low-mem-finetune` | 1 | `python scripts/wip/openpi_vla_resume_smoke.py --base-url "${MINT_BASE_URL:-http://localhost:8000}" --api-key "${MINT_API_KEY:-}" --model openpi/pi0-fast-libero-low-mem-finetune --output-json results/merge-gate/<ts>/vla_resume_pi0_fast_libero.json` | Save-resume continuity on the active server endpoint without external OpenPI Python package dependencies. |
+| `vla_resume_pi05_libero` | PR 422 current-server resume smoke | `openpi/pi05-libero-low-mem-finetune` | 1 | `python scripts/wip/openpi_vla_resume_smoke.py --base-url "${MINT_BASE_URL:-http://localhost:8000}" --api-key "${MINT_API_KEY:-}" --model openpi/pi05-libero-low-mem-finetune --output-json results/merge-gate/<ts>/vla_resume_pi05_libero.json` | Save-resume continuity for pi0.5 model on the active server endpoint without external OpenPI Python package dependencies. |
 
 ### Concurrency and Isolation
 
@@ -220,6 +234,9 @@ Every item below is runnable now and tied either to a related issue/PR or to a c
 | `interleaved_loss_spike_moe_30b` | PR 350 built on issues 193 and 194 | `Qwen/Qwen3-30B-A3B-Instruct-2507` | 4 | `python scripts/tools/reproduce_issue_193_194_high_load.py --model Qwen/Qwen3-30B-A3B-Instruct-2507 --steps 8 --batch-size 8 --background-models 2 --output-dir results/merge-gate/<ts>/issue193_194_moe` | Shared 30B Megatron trainer under session-switch load does not reproduce the old correlated loss-spike signature. |
 | `transition_sequence_moe_30b` | PR 370 | `Qwen/Qwen3-30B-A3B-Instruct-2507` | 8 | `TINKER_MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507 python scripts/tools/reproduce_issue_370_transition_sequence.py` | PR 370 transition sequence `A forward_backward -> B forward -> A optim_step` completes on a shared Megatron actor without retention-induced failure. |
 | `transition_sequence_235b_max_context` | PR 370 heavy variant | `Qwen/Qwen3-235B-A22B-Instruct-2507` | 32 | `TINKER_MODEL=Qwen/Qwen3-235B-A22B-Instruct-2507 python scripts/tools/reproduce_issue_370_transition_sequence.py` | 235B max-context transition sequence `A forward_backward -> B forward -> A optim_step` does not OOM or fail on the shared Megatron path. |
+| `vla_sampling_isolation_dual_fast` | current-server dual-train isolation probe | `openpi/pi0-fast-libero-low-mem-finetune` | 1 | `python scripts/wip/openpi_vla_dual_train_isolation.py --base-url "${MINT_BASE_URL:-http://localhost:8000}" --api-key "${MINT_API_KEY:-}" --model openpi/pi0-fast-libero-low-mem-finetune --steps-per-model 3 --output-json results/merge-gate/<ts>/vla_sampling_isolation_dual_fast.json` | Concurrent dual-session VLA train-step isolation path on the active server endpoint. |
+| `vla_sampling_switch_pi0_fast` | current-server repeat-session churn probe | `openpi/pi0-fast-libero-low-mem-finetune` | 1 | `python scripts/wip/openpi_vla_dual_train_isolation.py --base-url "${MINT_BASE_URL:-http://localhost:8000}" --api-key "${MINT_API_KEY:-}" --model openpi/pi0-fast-libero-low-mem-finetune --steps-per-model 2 --output-json results/merge-gate/<ts>/vla_sampling_switch_pi0_fast.run1.json && python scripts/wip/openpi_vla_dual_train_isolation.py --base-url "${MINT_BASE_URL:-http://localhost:8000}" --api-key "${MINT_API_KEY:-}" --model openpi/pi0-fast-libero-low-mem-finetune --steps-per-model 2 --output-json results/merge-gate/<ts>/vla_sampling_switch_pi0_fast.run2.json` | Repeated dual-session churn probe on the same endpoint to detect cross-session regressions. |
+| `vla_pressure_shared_openpi` | PR 422 mixed-client pressure run | `mixed OpenPI` | 2 | `python scripts/wip/openpi_vla_pressure_train_threads.py --base-url "${MINT_BASE_URL:-http://localhost:8000}" --api-key "${MINT_API_KEY:-}" --workers 6 --steps-per-worker 2 --output-json results/merge-gate/<ts>/vla_pressure_shared_openpi.json` | Concurrent VLA train-step pressure against the active server endpoint. |
 
 ### Server Control Plane
 

@@ -7,9 +7,16 @@ description: |
   run the backend under supervisor, and expose one URL where the Python backend serves both UI and API.
 
   Triggers: "mint ops", "deploy ops", "ops console", "sync mint-ops", "start mint-ops"
+
+  Procedure contract: read this SKILL.md end-to-end before acting. Do not slice it on demand or use it as a lookup table mid-run.
 ---
 
 # Mint Ops
+
+Procedure contract:
+- Read this SKILL.md end-to-end before taking any action.
+- Do not sample sections opportunistically while already in motion.
+- If the procedure is missing something important, update the skill. Do not improvise around the gap.
 
 Use this skill when the task is specifically about the standalone ops console under `ops/`.
 

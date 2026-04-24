@@ -129,6 +129,7 @@ def _install_detached_sampling_store(monkeypatch):
     detached_sessions: dict[str, dict] = {}
 
     import tinker_server.backend.sampling_session_store as sss
+    import tinker_server.backend.session_index_store as sis
 
     def _upsert_sampling_session(info: dict) -> None:
         detached_sessions[str(info["session_id"])] = dict(info)
@@ -139,6 +140,8 @@ def _install_detached_sampling_store(monkeypatch):
 
     monkeypatch.setattr(sss, "upsert_sampling_session", _upsert_sampling_session)
     monkeypatch.setattr(sss, "async_get_sampling_session_info", _async_get_sampling_session_info)
+    monkeypatch.setattr(sis, "add_sampler_to_session", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(sis, "upsert_sampler_index", lambda *_args, **_kwargs: None)
     return detached_sessions
 
 

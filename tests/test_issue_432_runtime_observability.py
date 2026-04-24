@@ -1,6 +1,10 @@
+import sys
+import types
 from types import SimpleNamespace
 
+import pytest
 import tinker_server.logging_context as logging_context
+import tinker_server.backend.vllm_scheduler_observability as vllm_obs_mod
 from tinker_server.backend.runtime_observability import RuntimeObservability
 from tinker_server.backend.verl_training import VerlTrainingEngine
 from tinker_server.backend.vllm_scheduler_observability import VllmStatsObserver
@@ -33,6 +37,185 @@ def test_issue_432_verl_training_records_megatron_switch_metrics(monkeypatch) ->
     assert snap["megatron_session_switch"][0]["session_state"] == "existing"
     assert snap["megatron_session_switch"][0]["total_s_total"] == 6.25
 
+
+
+def test_issue_432_vllm_stats_observer_tracks_request_stage_timings() -> None:
+    obs = VllmStatsObserver()
+
+    obs.observe_actor_timing(
+        seq_slot_wait_s=0.4,
+        generate_lock_wait_s=0.1,
+        engine_read_lock_wait_s=0.05,
+        add_request_wait_s=0.2,
+        add_request_exec_s=0.08,
+        first_token_observed_s=1.3,
+    )
+    obs.observe_actor_timing(
+        seq_slot_wait_s=1.0,
+        generate_lock_wait_s=0.3,
+        engine_read_lock_wait_s=0.15,
+        add_request_wait_s=0.5,
+        add_request_exec_s=0.12,
+        first_token_observed_s=1.8,
+    )
+
+    snap = obs.snapshot()
+    assert snap["seq_slot_wait_s_count"] == 2
+    assert snap["seq_slot_wait_s_total"] == pytest.approx(1.4)
+    assert snap["seq_slot_wait_s_max"] == pytest.approx(1.0)
+    assert snap["seq_slot_wait_s_p50_recent"] == pytest.approx(0.7)
+    assert snap["seq_slot_wait_s_p95_recent"] == pytest.approx(0.97)
+    assert snap["add_request_wait_s_total"] == pytest.approx(0.7)
+    assert snap["add_request_exec_s_max"] == pytest.approx(0.12)
+    assert snap["first_token_observed_s_p50_recent"] == pytest.approx(1.55)
+    assert snap["first_token_observed_s_p95_recent"] == pytest.approx(1.775)
+
+
+def test_issue_432_vllm_stats_observer_drops_non_finite_actor_timings() -> None:
+    obs = VllmStatsObserver()
+
+    obs.observe_actor_timing(
+        seq_slot_wait_s=float("nan"),
+        add_request_wait_s=float("inf"),
+        add_request_exec_s=float("-inf"),
+    )
+
+    snap = obs.snapshot()
+    assert snap["seq_slot_wait_s_count"] == 0
+    assert snap["add_request_wait_s_count"] == 0
+    assert snap["add_request_exec_s_count"] == 0
+
+
+def test_issue_432_install_vllm_iteration_observability_patches_fails_open(monkeypatch) -> None:
+    monkeypatch.setattr(vllm_obs_mod, "_VLLM_PATCHES_INSTALLED", False)
+
+    original_import = __import__
+
+    def _explode(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "vllm.v1.core.sched.scheduler":
+            raise ImportError("boom")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr("builtins.__import__", _explode)
+
+    # Missing private vLLM symbols must not make engine startup fail.
+    vllm_obs_mod.install_vllm_iteration_observability_patches()
+
+    assert vllm_obs_mod._VLLM_PATCHES_INSTALLED is False
+
+
+def test_issue_432_vllm_iteration_patch_resets_stale_step_timings(monkeypatch) -> None:
+    monkeypatch.setattr(vllm_obs_mod, "_VLLM_PATCHES_INSTALLED", False)
+
+    fake_sched_mod = types.ModuleType("vllm.v1.core.sched.scheduler")
+    fake_core_mod = types.ModuleType("vllm.v1.engine.core")
+    fake_output_mod = types.ModuleType("vllm.v1.engine.output_processor")
+    fake_worker_mod = types.ModuleType("vllm.v1.worker.gpu_worker")
+
+    class FakeScheduler:
+        def __init__(self) -> None:
+            self._mode = "first"
+
+        def schedule(self):
+            if self._mode == "first":
+                return SimpleNamespace(
+                    total_num_scheduled_tokens=8,
+                    scheduled_new_reqs=[object()],
+                    scheduled_cached_reqs=SimpleNamespace(num_reqs=0),
+                )
+            return SimpleNamespace(
+                total_num_scheduled_tokens=4,
+                scheduled_new_reqs=[],
+                scheduled_cached_reqs=SimpleNamespace(num_reqs=1),
+            )
+
+        def make_stats(self):
+            return SimpleNamespace()
+
+    class FakeEngineCore:
+        def __init__(self, scheduler) -> None:
+            self.scheduler = scheduler
+
+        def execute_model_with_error_logging(self, *_args, **_kwargs):
+            return SimpleNamespace(_mint_worker_execute_model_s=0.3)
+
+    class FakeOutputProcessor:
+        def _update_stats_from_output(self, *_args, **_kwargs):
+            return None
+
+    class FakeWorker:
+        def execute_model(self, *_args, **_kwargs):
+            return SimpleNamespace()
+
+    fake_sched_mod.Scheduler = FakeScheduler
+    fake_core_mod.EngineCore = FakeEngineCore
+    fake_output_mod.OutputProcessor = FakeOutputProcessor
+    fake_worker_mod.Worker = FakeWorker
+
+    monkeypatch.setitem(sys.modules, "vllm.v1.core.sched.scheduler", fake_sched_mod)
+    monkeypatch.setitem(sys.modules, "vllm.v1.engine.core", fake_core_mod)
+    monkeypatch.setitem(sys.modules, "vllm.v1.engine.output_processor", fake_output_mod)
+    monkeypatch.setitem(sys.modules, "vllm.v1.worker.gpu_worker", fake_worker_mod)
+
+    vllm_obs_mod.install_vllm_iteration_observability_patches()
+
+    scheduler = FakeScheduler()
+    engine_core = FakeEngineCore(scheduler)
+    scheduler.schedule()
+    engine_core.execute_model_with_error_logging(lambda *_a, **_k: None, None)
+    stats = scheduler.make_stats()
+    assert stats.mint_executor_execute_model_s >= 0.0
+    assert stats.mint_worker_execute_model_s == pytest.approx(0.3)
+
+    scheduler._mode = "second"
+    scheduler.schedule()
+    stats = scheduler.make_stats()
+    assert not hasattr(stats, "mint_executor_execute_model_s")
+    assert not hasattr(stats, "mint_worker_execute_model_s")
+
+
+def test_issue_432_vllm_iteration_timings_do_not_replay_stale_values() -> None:
+    obs = VllmStatsObserver()
+    scheduler_stats = SimpleNamespace(
+        num_waiting_reqs=1,
+        num_running_reqs=1,
+        kv_cache_usage=0.25,
+        prefix_cache_stats=SimpleNamespace(queries=10, hits=4),
+        mint_total_scheduled_tokens=8,
+        mint_scheduled_new_requests=1,
+        mint_scheduled_cached_requests=0,
+        mint_executor_execute_model_s=0.4,
+        mint_worker_execute_model_s=0.3,
+    )
+    iteration_stats = SimpleNamespace(
+        num_preempted_reqs=0,
+        num_prompt_tokens=8,
+        num_generation_tokens=1,
+        mint_prefill_requests=1,
+        mint_decode_requests=0,
+        time_to_first_tokens_iter=[],
+        inter_token_latencies_iter=[],
+        finished_requests=[],
+    )
+
+    obs.record(scheduler_stats, iteration_stats)
+    snap = obs.snapshot()
+    assert snap["executor_execute_model_s_count"] == 1
+    assert snap["worker_execute_model_s_count"] == 1
+
+    scheduler_stats_2 = SimpleNamespace(
+        num_waiting_reqs=0,
+        num_running_reqs=1,
+        kv_cache_usage=0.1,
+        prefix_cache_stats=SimpleNamespace(queries=0, hits=0),
+        mint_total_scheduled_tokens=4,
+        mint_scheduled_new_requests=0,
+        mint_scheduled_cached_requests=1,
+    )
+    obs.record(scheduler_stats_2, iteration_stats)
+    snap = obs.snapshot()
+    assert snap["executor_execute_model_s_count"] == 1
+    assert snap["worker_execute_model_s_count"] == 1
 
 
 def test_issue_432_runtime_observability_tracks_megatron_session_switch() -> None:
@@ -290,9 +473,20 @@ def test_issue_432_vllm_stats_observer_tracks_scheduler_and_finished_request_met
         num_running_reqs=2,
         kv_cache_usage=0.75,
         prefix_cache_stats=SimpleNamespace(queries=100, hits=60),
+        mint_total_scheduled_tokens=96,
+        mint_scheduled_new_requests=3,
+        mint_scheduled_cached_requests=5,
+        mint_executor_execute_model_s=0.42,
+        mint_worker_execute_model_s=0.31,
     )
     iteration_stats = SimpleNamespace(
         num_preempted_reqs=3,
+        num_prompt_tokens=80,
+        num_generation_tokens=16,
+        mint_prefill_requests=3,
+        mint_decode_requests=5,
+        time_to_first_tokens_iter=[0.9, 1.2],
+        inter_token_latencies_iter=[0.05, 0.07, 0.08],
         finished_requests=[
             SimpleNamespace(
                 queued_time=1.5,
@@ -312,27 +506,40 @@ def test_issue_432_vllm_stats_observer_tracks_scheduler_and_finished_request_met
     obs.record(scheduler_stats, iteration_stats)
     snap = obs.snapshot()
 
-    assert snap == {
-        "scheduler_waiting_requests": 4,
-        "scheduler_running_requests": 2,
-        "scheduler_kv_cache_usage_ratio": 0.75,
-        "prefix_cache_queries_total": 100,
-        "prefix_cache_hits_total": 60,
-        "prefix_cache_hit_ratio": 0.6,
-        "preemptions_total": 3,
-        "queue_time_s_total": 4.0,
-        "queue_time_s_count": 2,
-        "queue_time_s_max": 2.5,
-        "prefill_time_s_total": 5.0,
-        "prefill_time_s_count": 2,
-        "prefill_time_s_max": 3.0,
-        "decode_time_s_total": 12.0,
-        "decode_time_s_count": 2,
-        "decode_time_s_max": 7.0,
-        "time_per_output_token_s_total": 0.2,
-        "time_per_output_token_s_count": 2,
-        "time_per_output_token_s_max": 0.12,
-    }
+    assert snap["scheduler_waiting_requests"] == 4
+    assert snap["scheduler_running_requests"] == 2
+    assert snap["scheduler_kv_cache_usage_ratio"] == 0.75
+    assert snap["prefix_cache_queries_total"] == 100
+    assert snap["prefix_cache_hits_total"] == 60
+    assert snap["prefix_cache_hit_ratio"] == 0.6
+    assert snap["preemptions_total"] == 3
+    assert snap["queue_time_s_total"] == pytest.approx(4.0)
+    assert snap["queue_time_s_count"] == 2
+    assert snap["queue_time_s_max"] == pytest.approx(2.5)
+    assert snap["queue_time_s_p50_recent"] == pytest.approx(2.0)
+    assert snap["queue_time_s_p95_recent"] == pytest.approx(2.45)
+    assert snap["prefill_time_s_total"] == pytest.approx(5.0)
+    assert snap["prefill_time_s_count"] == 2
+    assert snap["prefill_time_s_max"] == pytest.approx(3.0)
+    assert snap["decode_time_s_total"] == pytest.approx(12.0)
+    assert snap["decode_time_s_count"] == 2
+    assert snap["decode_time_s_max"] == pytest.approx(7.0)
+    assert snap["time_per_output_token_s_total"] == pytest.approx(0.2)
+    assert snap["time_per_output_token_s_count"] == 2
+    assert snap["time_per_output_token_s_max"] == pytest.approx(0.12)
+    assert snap["scheduled_tokens_iter_total"] == pytest.approx(96)
+    assert snap["scheduled_new_requests_iter_total"] == pytest.approx(3)
+    assert snap["scheduled_cached_requests_iter_total"] == pytest.approx(5)
+    assert snap["prefill_requests_iter_total"] == pytest.approx(3)
+    assert snap["decode_requests_iter_total"] == pytest.approx(5)
+    assert snap["prompt_tokens_iter_total"] == pytest.approx(80)
+    assert snap["generation_tokens_iter_total"] == pytest.approx(16)
+    assert snap["time_to_first_token_s_total"] == pytest.approx(2.1)
+    assert snap["inter_token_latency_s_total"] == pytest.approx(0.2)
+    assert snap["executor_execute_model_s_total"] == pytest.approx(0.42)
+    assert snap["worker_execute_model_s_total"] == pytest.approx(0.31)
+    assert snap["seq_slot_wait_s_count"] == 0
+    assert snap["add_request_wait_s_count"] == 0
 
 
 def test_issue_432_scheduler_decision_otel_records_experience_metrics(monkeypatch) -> None:

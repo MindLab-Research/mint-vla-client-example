@@ -16,7 +16,7 @@ import os
 import time
 from typing import Any
 
-from ..config import otel_env_vars
+from ..config import otel_env_vars, preferred_control_plane_resources, preferred_control_plane_resources
 
 
 logger = logging.getLogger(__name__)
@@ -197,24 +197,26 @@ def ensure_ready() -> None:
         raise TypeError(f"Sampling session store returned non-list: {type(out)}")
 
 
-def upsert_sampling_session(info: dict[str, Any]) -> None:
+def _require_write_actor(op: str):
     import ray
 
     if not ray.is_initialized():
-        logger.warning("Sampling session store write skipped: Ray not initialized")
-        return
+        raise RuntimeError(f"Sampling session store write failed: {op}: Ray not initialized")
+    try:
+        return _get_or_create_actor()
+    except Exception as e:
+        raise RuntimeError(f"Sampling session store write failed: {op}: {e}") from e
+
+
+def upsert_sampling_session(info: dict[str, Any]) -> None:
     payload = dict(info)
     session_id = str(payload.get("session_id", ""))
     if not session_id:
-        logger.warning("Sampling session store write skipped: missing session_id")
-        return
+        raise RuntimeError("Sampling session store write failed: upsert: missing session_id")
     payload.setdefault("last_activity", time.time())
     payload["metadata_version"] = max(1, int(payload.get("metadata_version") or 1))
-    try:
-        actor = _get_or_create_actor()
-        actor.upsert.remote(session_id, payload)
-    except Exception as e:
-        logger.warning("Sampling session store write failed: upsert: %s", e)
+    actor = _require_write_actor("upsert")
+    actor.upsert.remote(session_id, payload)
 
 
 def delete_sampling_session(session_id: str) -> None:
