@@ -1645,8 +1645,15 @@ async def _scan_checkpoints_from_catalog(
     checkpoints: list[CheckpointInfo] = []
     shadow_fs_ids: set[str] = set()
     for row in rows:
-        ckpt_id = row.get("ckpt_id")
-        if not isinstance(ckpt_id, str) or not ckpt_id:
+        raw_ckpt_id = row.get("ckpt_id")
+        # asyncpg returns PostgreSQL UUID columns as uuid.UUID, not str.
+        if isinstance(raw_ckpt_id, uuid.UUID):
+            ckpt_id = str(raw_ckpt_id)
+        elif isinstance(raw_ckpt_id, str):
+            ckpt_id = raw_ckpt_id.strip()
+        else:
+            continue
+        if not ckpt_id:
             continue
         model_name = row.get("model_name")
         if not isinstance(model_name, str) or not model_name:

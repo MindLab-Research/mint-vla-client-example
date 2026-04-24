@@ -1,6 +1,7 @@
 import io
 import json
 import tarfile
+import uuid
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -526,6 +527,53 @@ def test_issue_441_internal_checkpoint_list_catalog_hides_same_fs_checkpoint(mon
     assert resp.status_code == 200, resp.text
     checkpoint_ids = [item["checkpoint_id"] for item in resp.json()["checkpoints"]]
     assert checkpoint_ids == ["5d6fbbf8-6c5b-4e91-8e9f-f7e51f0d7d11"]
+
+
+
+def test_issue_441_internal_checkpoint_list_accepts_uuid_catalog_ids(monkeypatch, tmp_path: Path) -> None:
+    _configure_checkpoint_roots(tmp_path)
+
+    ckpt_id = uuid.UUID("5d6fbbf8-6c5b-4e91-8e9f-f7e51f0d7d11")
+
+    async def _list_catalog_checkpoints(*, owner_id: str | None, is_admin: bool):
+        assert owner_id == "owner-a"
+        assert is_admin is False
+        return [
+            {
+                "ckpt_id": ckpt_id,
+                "owner_id": "owner-a",
+                "model_id": "model-catalog",
+                "raw_checkpoint_id": "ckpt-catalog",
+                "checkpoint_type": "sampler",
+                "model_name": "Qwen/Qwen3-0.6B",
+                "checkpoint_created_at": "2026-01-03T00:00:00Z",
+                "published_at": "2026-01-03T00:00:01Z",
+                "size_bytes": 2048,
+                "storage_root": str(tmp_path),
+            }
+        ]
+
+    monkeypatch.setattr(internal_routes, "checkpoint_index_enabled", lambda: True)
+    monkeypatch.setattr(internal_routes, "list_catalog_checkpoints", _list_catalog_checkpoints)
+    monkeypatch.setattr(
+        internal_routes,
+        "_scan_checkpoints",
+        lambda *_args, **_kwargs: [
+            internal_routes.CheckpointInfo(
+                checkpoint_id="model-catalog_ckpt-catalog",
+                model_name="Qwen/Qwen3-0.6B",
+                created_at="2026-01-03T00:00:00Z",
+                type="sampler",
+                size_bytes=2048,
+            )
+        ],
+    )
+
+    client = _make_app({"user_id": "owner-a", "user_role": "user"})
+    resp = client.get("/internal/v1/checkpoints")
+    assert resp.status_code == 200, resp.text
+    assert [item["checkpoint_id"] for item in resp.json()["checkpoints"]] == [str(ckpt_id)]
+
 
 
 def test_issue_441_internal_checkpoint_archive_uses_catalog_entry(monkeypatch, tmp_path: Path) -> None:
