@@ -179,11 +179,7 @@ def _get_or_create_actor():
 
     try:
         created = _QueueSupervisorActor.options(**options).remote()
-        try:
-            ray.get(created.snapshot.remote())
-            _ACTOR_HANDLE = created
-        except Exception:
-            _ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)
+        _ACTOR_HANDLE = created
         return _ACTOR_HANDLE
     except Exception:
         _ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)

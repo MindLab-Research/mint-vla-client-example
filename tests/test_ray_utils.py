@@ -96,6 +96,29 @@ def test_init_ray_resolves_auto_address(monkeypatch):
     assert calls[0]["log_to_driver"] is False
 
 
+def test_init_ray_skips_lock_when_attaching_to_existing_cluster(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    fake_ray = SimpleNamespace(
+        is_initialized=lambda: False,
+        init=lambda **kwargs: calls.append(dict(kwargs)) or {"ok": True},
+    )
+
+    @contextlib.contextmanager
+    def _unexpected_lock():
+        raise AssertionError("interprocess lock should not run for remote ray attach")
+        yield 0.0
+
+    monkeypatch.setenv("RAY_ADDRESS", "192.168.38.184:6379")
+    monkeypatch.setattr(ray_utils, "_ray_init_interprocess_lock", _unexpected_lock)
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+
+    out = ray_utils.init_ray(namespace="tinker", ignore_reinit_error=True)
+
+    assert out == {"ok": True}
+    assert calls[0]["address"] == "192.168.38.184:6379"
+
+
 def test_init_ray_skips_when_already_initialized(monkeypatch):
     fake_ray = SimpleNamespace(
         is_initialized=lambda: True,
@@ -106,3 +129,23 @@ def test_init_ray_skips_when_already_initialized(monkeypatch):
 
     out = ray_utils.init_ray(namespace="tinker", ignore_reinit_error=True)
     assert out is None
+
+
+def test_init_ray_reuses_existing_worker_context(monkeypatch):
+    fake_worker = SimpleNamespace(mode=1)
+    fake_ray = SimpleNamespace(
+        WORKER_MODE=1,
+        is_initialized=lambda: True,
+        get_runtime_context=lambda: SimpleNamespace(worker=fake_worker, namespace="tinker"),
+        init=lambda **kwargs: (_ for _ in ()).throw(RuntimeError("init should not run inside worker context")),
+        shutdown=lambda: (_ for _ in ()).throw(RuntimeError("shutdown should not run inside worker context")),
+    )
+
+    monkeypatch.setenv("RAY_ADDRESS", "192.168.38.184:6379")
+    monkeypatch.setattr(ray_utils, "_RAY_LAST_INIT_ADDRESS", None)
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+
+    out = ray_utils.init_ray(namespace="tinker", ignore_reinit_error=True)
+
+    assert out is None
+    assert ray_utils._RAY_LAST_INIT_ADDRESS == "192.168.38.184:6379"

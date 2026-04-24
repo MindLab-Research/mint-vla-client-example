@@ -231,15 +231,7 @@ def _get_or_create_ray_actor():
         # Race: another request may have created the detached actor first.
         return ray.get_actor(actor_name, namespace=_ray_namespace())
 
-    probe_timeout_s = max(
-        1.0,
-        float(os.environ.get("MINT_CAPACITY_MANAGER_PROBE_TIMEOUT_S", "5.0")),
-    )
-    try:
-        ray.get(created.snapshot.remote(), timeout=probe_timeout_s)
-        return created
-    except Exception:
-        return ray.get_actor(actor_name, namespace=_ray_namespace())
+    return created
 
 
 class CapacityManager:
