@@ -19,6 +19,7 @@ import os
 import threading
 import time
 
+import pytest
 from transformers import AutoTokenizer
 
 from .conftest import (
@@ -29,6 +30,7 @@ from .conftest import (
     optim_step,
     save_weights,
     list_actors,
+    get_admission_stats,
 )
 from .framework import (
     LRUEvictionData,
@@ -413,6 +415,16 @@ class TestStress:
         """
         start_time = time.time()
         idle_wait_s = float(os.environ.get("TINKER_EVICTION_IDLE_WAIT_S", "6"))
+
+        try:
+            stats = get_admission_stats()
+            gpu_total = float(
+                (((stats.get("ray_cluster") or {}).get("resources") or {}).get("gpu_total") or 0.0)
+            )
+        except Exception:
+            gpu_total = 0.0
+        if gpu_total > 8.0:
+            pytest.skip(f"eviction sentry requires constrained cluster (gpu_total={gpu_total})")
 
         data = LRUEvictionData()
 

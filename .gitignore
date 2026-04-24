@@ -240,6 +240,9 @@ scripts/wip/*
 !scripts/wip/openpi_libero_fast_rl.py
 !scripts/wip/openpi_libero_resume_sft.py
 !scripts/wip/openpi_vla_pressure_threads.py
+!scripts/wip/openpi_vla_resume_smoke.py
+!scripts/wip/openpi_vla_dual_train_isolation.py
+!scripts/wip/openpi_vla_pressure_train_threads.py
 
 # Experiment outputs in root
 *_training_curves.png

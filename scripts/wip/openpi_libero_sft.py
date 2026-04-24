@@ -18,6 +18,35 @@ import pandas as pd
 import requests
 from PIL import Image, ImageDraw
 
+
+def _request_headers() -> dict[str, str]:
+    api_key = (os.environ.get('MINT_API_KEY') or os.environ.get('TINKER_API_KEY') or '').strip()
+    if not api_key:
+        return {}
+    return {'X-API-Key': api_key}
+
+
+_orig_post = requests.post
+_orig_delete = requests.delete
+
+
+def _post(*args, **kwargs):
+    headers = dict(kwargs.pop('headers', {}) or {})
+    headers.update(_request_headers())
+    kwargs['headers'] = headers
+    return _orig_post(*args, **kwargs)
+
+
+def _delete(*args, **kwargs):
+    headers = dict(kwargs.pop('headers', {}) or {})
+    headers.update(_request_headers())
+    kwargs['headers'] = headers
+    return _orig_delete(*args, **kwargs)
+
+
+requests.post = _post
+requests.delete = _delete
+
 import openpi.training.config as config_mod
 from openpi import transforms as T
 from tinker_server.backend.model_registry import MODEL_CONFIGS

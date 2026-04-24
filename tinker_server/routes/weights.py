@@ -809,20 +809,40 @@ async def _do_save_state(
         logger.info(f"[{session.model_id}] Saving state to: {save_path}")
 
         # Save training checkpoint on worker, returns path
-        await run_async_with_otel_span(
-            "weights.save_state.execute",
-            lambda: training_engine.save_weights(session, save_path),
-            component="routes.weights",
-            op="weights.save_state",
-            request_id=str(request_id),
-            attributes={
-                "model_id": str(request.model_id),
-                "base_model": str(session.base_model),
-                "backend": str(getattr(session, "backend", "unknown")),
-                "checkpoint_type": "training",
-                "checkpoint_name": str(checkpoint_name),
-            },
-        )
+        async def _save_state_once() -> None:
+            await run_async_with_otel_span(
+                "weights.save_state.execute",
+                lambda: training_engine.save_weights(session, save_path),
+                component="routes.weights",
+                op="weights.save_state",
+                request_id=str(request_id),
+                attributes={
+                    "model_id": str(request.model_id),
+                    "base_model": str(session.base_model),
+                    "backend": str(getattr(session, "backend", "unknown")),
+                    "checkpoint_type": "training",
+                    "checkpoint_name": str(checkpoint_name),
+                },
+            )
+
+        try:
+            await _save_state_once()
+        except Exception as save_exc:
+            text = str(save_exc)
+            recoverable = (
+                "missing worker for backend" in text
+                or "non-create_session request before initialization" in text
+                or "OpenPI FAST runtime session is not initialized" in text
+            )
+            if not recoverable:
+                raise
+            logger.warning(
+                "[weights.save_state] rematerializing training session after checkpoint export failure: model_id=%s error=%s",
+                request.model_id,
+                save_exc,
+            )
+            await training_engine.create_training_session(session)
+            await _save_state_once()
 
         # Save ownership metadata (for user-scoped checkpoint API)
         # Note: Directory is created by Ray Worker on GPU node, but shared filesystem
@@ -1000,25 +1020,45 @@ async def _do_save_weights(
 
         logger.info(f"[{session.model_id}] Saving sampler weights to: {save_path}")
 
-        await run_async_with_otel_span(
-            "weights.save_weights.execute",
-            lambda: training_engine.save_weights_for_sampler(
-                session=session,
-                checkpoint_name=checkpoint_name,
-                checkpoint_base_dir=os.path.dirname(os.path.dirname(os.path.dirname(save_path))),
-                checkpoint_type="sampler",
-            ),
-            component="routes.weights",
-            op="weights.save_weights",
-            request_id=str(request_id),
-            attributes={
-                "model_id": str(request.model_id),
-                "base_model": str(session.base_model),
-                "backend": str(getattr(session, "backend", "unknown")),
-                "checkpoint_type": "sampler",
-                "checkpoint_name": str(checkpoint_name),
-            },
-        )
+        async def _save_weights_once() -> None:
+            await run_async_with_otel_span(
+                "weights.save_weights.execute",
+                lambda: training_engine.save_weights_for_sampler(
+                    session=session,
+                    checkpoint_name=checkpoint_name,
+                    checkpoint_base_dir=os.path.dirname(os.path.dirname(os.path.dirname(save_path))),
+                    checkpoint_type="sampler",
+                ),
+                component="routes.weights",
+                op="weights.save_weights",
+                request_id=str(request_id),
+                attributes={
+                    "model_id": str(request.model_id),
+                    "base_model": str(session.base_model),
+                    "backend": str(getattr(session, "backend", "unknown")),
+                    "checkpoint_type": "sampler",
+                    "checkpoint_name": str(checkpoint_name),
+                },
+            )
+
+        try:
+            await _save_weights_once()
+        except Exception as save_exc:
+            text = str(save_exc)
+            recoverable = (
+                "missing worker for backend" in text
+                or "non-create_session request before initialization" in text
+                or "OpenPI FAST runtime session is not initialized" in text
+            )
+            if not recoverable:
+                raise
+            logger.warning(
+                "[weights.save_weights] rematerializing training session after sampler export failure: model_id=%s error=%s",
+                request.model_id,
+                save_exc,
+            )
+            await training_engine.create_training_session(session)
+            await _save_weights_once()
 
         os.makedirs(save_path, exist_ok=True)
 
@@ -1329,19 +1369,39 @@ async def _do_load_state(
             validate_checkpoint_load_contract(load_path, load_optimizer=True)
 
         # Call training engine to load checkpoint
-        await run_async_with_otel_span(
-            "weights.load_state.execute",
-            lambda: training_engine.load_weights(session, load_path, load_optimizer=request.optimizer),
-            component="routes.weights",
-            op="weights.load_state",
-            request_id=str(request_id),
-            attributes={
-                "model_id": str(request.model_id),
-                "base_model": str(session.base_model),
-                "backend": str(getattr(session, "backend", "unknown")),
-                "load_optimizer": bool(request.optimizer),
-            },
-        )
+        async def _load_state_once() -> None:
+            await run_async_with_otel_span(
+                "weights.load_state.execute",
+                lambda: training_engine.load_weights(session, load_path, load_optimizer=request.optimizer),
+                component="routes.weights",
+                op="weights.load_state",
+                request_id=str(request_id),
+                attributes={
+                    "model_id": str(request.model_id),
+                    "base_model": str(session.base_model),
+                    "backend": str(getattr(session, "backend", "unknown")),
+                    "load_optimizer": bool(request.optimizer),
+                },
+            )
+
+        try:
+            await _load_state_once()
+        except Exception as load_exc:
+            text = str(load_exc)
+            recoverable = (
+                "missing worker for backend" in text
+                or "non-create_session request before initialization" in text
+                or "OpenPI FAST runtime session is not initialized" in text
+            )
+            if not recoverable:
+                raise
+            logger.warning(
+                "[weights.load_state] rematerializing training session after load failure: model_id=%s error=%s",
+                request.model_id,
+                load_exc,
+            )
+            await training_engine.create_training_session(session)
+            await _load_state_once()
 
         await future_store.async_resolve(request_id, {
             "path": request.path,

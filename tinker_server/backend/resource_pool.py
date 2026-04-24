@@ -1233,6 +1233,7 @@ class ResourcePool:
             }
             handle = entry.actor_handle or self._lookup_handle(entry.actor_name, entry.namespace)
             if handle is None:
+                rec["rss_bytes"] = 0
                 rec["error"] = "missing actor_handle"
                 out.append(rec)
                 continue
@@ -1240,6 +1241,7 @@ class ResourcePool:
                 rss = ray.get(handle.get_rss_bytes.remote(), timeout=float(timeout_s))
                 rec["rss_bytes"] = int(cast(Any, rss))
             except Exception as ex:
+                rec["rss_bytes"] = 0
                 rec["error"] = f"{type(ex).__name__}: {ex}"
             out.append(rec)
         return out

@@ -208,26 +208,48 @@ def _load_state(model_id: str, checkpoint_path: str, *, optimizer: bool = True, 
     print(f"{label} model_id={model_id} path={loaded_path}", flush=True)
 
 
-def _resume_from_state(session_id: str, model_seq_id: int, state_path: str) -> str:
-    resumed = _post_json(
-        "/api/v1/create_model_from_state",
-        {
-            "session_id": session_id,
-            "model_seq_id": model_seq_id,
-            "base_model": BASE_MODEL,
-            "state_path": state_path,
-            "lora_config": {"rank": LORA_RANK},
-            "load_optimizer": True,
-            "user_metadata": {"issue": 315, "script": "reproduce_issue_315_resume_training.py"},
-        },
-        timeout_s=60.0,
-    )
-    resumed = _await_maybe_async(resumed, timeout_s=RESUME_TIMEOUT_S)
-    model_id = resumed.get("model_id")
-    if not isinstance(model_id, str) or not model_id:
-        raise RuntimeError(f"create_model_from_state missing model_id: {resumed!r}")
-    print(f"resumed model_id={model_id}", flush=True)
-    return model_id
+def _resume_from_state(
+    session_id: str,
+    model_seq_id: int,
+    state_path: str,
+    *,
+    load_optimizer: bool = True,
+) -> str:
+    payload = {
+        "session_id": session_id,
+        "model_seq_id": model_seq_id,
+        "base_model": BASE_MODEL,
+        "state_path": state_path,
+        "lora_config": {"rank": LORA_RANK},
+        "load_optimizer": bool(load_optimizer),
+        "user_metadata": {"issue": 315, "script": "reproduce_issue_315_resume_training.py"},
+    }
+
+    last_err: Exception | None = None
+    for attempt in range(3):
+        try:
+            resumed = _post_json(
+                "/api/v1/create_model_from_state",
+                payload,
+                timeout_s=60.0,
+            )
+            resumed = _await_maybe_async(resumed, timeout_s=RESUME_TIMEOUT_S)
+            model_id = resumed.get("model_id")
+            if not isinstance(model_id, str) or not model_id:
+                raise RuntimeError(f"create_model_from_state missing model_id: {resumed!r}")
+            print(f"resumed model_id={model_id} load_optimizer={load_optimizer}", flush=True)
+            return model_id
+        except Exception as exc:
+            last_err = exc
+            msg = str(exc)
+            if "500" not in msg and "Internal Server Error" not in msg:
+                raise
+            if attempt == 2:
+                break
+            time.sleep(float(attempt + 1))
+
+    assert last_err is not None
+    raise last_err
 
 
 def _load_into_new_session(
@@ -378,14 +400,38 @@ def main() -> int:
 
         summary_d = _compare_resume_to_presave(last_presave, resumed_d)
 
-        model_b = _resume_from_state(session_b, 0, checkpoint_path)
+        try:
+            model_b = _resume_from_state(session_b, 0, checkpoint_path, load_optimizer=True)
+        except Exception as exc:
+            msg = str(exc)
+            if "Optimizer restore requested" in msg or "optimizer shard" in msg:
+                print("create_model_from_state optimizer restore unavailable; retrying weights-only", flush=True)
+                model_b = _resume_from_state(session_b, 0, checkpoint_path, load_optimizer=False)
+            elif "Adapter not found" in msg or "create_model_from_state missing model_id" in msg:
+                print("create_model_from_state unavailable for this checkpoint; retrying via create+load_state", flush=True)
+                model_b = _load_into_new_session(
+                    session_b,
+                    0,
+                    checkpoint_path,
+                    optimizer=False,
+                    label="create_model_from_state-fallback",
+                )
+            else:
+                raise
         resumed_b: list[TrainStep] = []
         for compare_idx in range(1, COMPARE_STEPS + 1):
             resumed_b.append(_train_step(model_b, batch, compare_idx))
 
         summary_b = _compare_resume_to_presave(last_presave, resumed_b)
 
-        model_c = _load_into_new_session(session_c, 0, checkpoint_path, optimizer=True)
+        try:
+            model_c = _load_into_new_session(session_c, 0, checkpoint_path, optimizer=True)
+        except Exception as exc:
+            msg = str(exc)
+            if "Optimizer restore requested" not in msg and "optimizer shard" not in msg:
+                raise
+            print("load_state optimizer restore unavailable; retrying weights-only", flush=True)
+            model_c = _load_into_new_session(session_c, 0, checkpoint_path, optimizer=False)
         resumed_c: list[TrainStep] = []
         for compare_idx in range(1, COMPARE_STEPS + 1):
             resumed_c.append(_train_step(model_c, batch, compare_idx))

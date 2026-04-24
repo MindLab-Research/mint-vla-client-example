@@ -227,13 +227,33 @@ class OpenPIFastTrainingEngine:
         ensure_openpi_ray_initialized()
         return None
 
-    def _runtime_for_session(self, session: Any) -> Any:
-        try:
-            return self._runtime_clients[session.model_id]
-        except KeyError as exc:
+    async def _runtime_for_session(
+        self,
+        session: Any,
+        *,
+        attach_if_missing: bool,
+    ) -> Any:
+        runtime = self._runtime_clients.get(session.model_id)
+        if runtime is not None:
+            return runtime
+        if not attach_if_missing:
             raise ValueError(
                 f"OpenPI FAST runtime session is not initialized for {session.model_id!r}"
-            ) from exc
+            )
+
+        model_config = self._model_config(session.base_model)
+        config_name = get_openpi_fast_config_name(session.base_model)
+        runtime = await self._runtime_factory(
+            session=session,
+            model_config=model_config,
+            config_name=config_name,
+        )
+        self._runtime_clients[session.model_id] = runtime
+        logger.warning(
+            "[%s] Reattached OpenPI FAST runtime client for stateful op; process-local cache was empty",
+            session.model_id,
+        )
+        return runtime
 
     def _model_config(self, base_model: str) -> ModelConfig:
         config = get_model_config(base_model)
@@ -322,7 +342,7 @@ class OpenPIFastTrainingEngine:
                 "and ppo forward_backward requests"
             )
         model_config = self._model_config(session.base_model)
-        runtime = self._runtime_for_session(session)
+        runtime = await self._runtime_for_session(session, attach_if_missing=True)
         result = await self._request_runtime(
             runtime,
             "forward_backward",
@@ -350,7 +370,7 @@ class OpenPIFastTrainingEngine:
         )
 
     async def optim_step(self, session: Any, request: Any) -> dict[str, Any]:
-        runtime = self._runtime_for_session(session)
+        runtime = await self._runtime_for_session(session, attach_if_missing=True)
         result = await self._request_runtime(
             runtime,
             "optim_step",
@@ -391,7 +411,7 @@ class OpenPIFastTrainingEngine:
         checkpoint_base_dir: str,
         checkpoint_type: str | None = None,
     ) -> str:
-        runtime = self._runtime_for_session(session)
+        runtime = await self._runtime_for_session(session, attach_if_missing=True)
         checkpoint_root = Path(checkpoint_base_dir).expanduser().resolve() / str(session.model_id)
         export_dir = checkpoint_root / checkpoint_name
         if checkpoint_type:
@@ -422,7 +442,7 @@ class OpenPIFastTrainingEngine:
         session: Any,
         save_path: str,
     ) -> str:
-        runtime = self._runtime_for_session(session)
+        runtime = await self._runtime_for_session(session, attach_if_missing=True)
         result = await self._request_runtime(runtime, "save_weights", {"save_path": save_path})
         return str(result["path"])
 
@@ -432,7 +452,7 @@ class OpenPIFastTrainingEngine:
         load_path: str,
         load_optimizer: bool = True,
     ) -> None:
-        runtime = self._runtime_for_session(session)
+        runtime = await self._runtime_for_session(session, attach_if_missing=True)
         result = await self._request_runtime(
             runtime,
             "load_weights",

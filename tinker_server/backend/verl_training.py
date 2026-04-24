@@ -2983,6 +2983,7 @@ class VerlTrainingEngine:
         self,
         session: TrainingSession,
         save_path: str,
+        use_per_expert_lora: bool = False,
     ) -> str:
         """Save checkpoint via Ray actor.
 
@@ -2996,6 +2997,12 @@ class VerlTrainingEngine:
         Returns:
             Absolute path to saved checkpoint directory.
         """
+        if use_per_expert_lora:
+            logger.warning(
+                "[%s] save_weights called with use_per_expert_lora=True; full training checkpoints ignore this sampler-only flag",
+                session.model_id,
+            )
+
         import os
 
         from .model_registry import get_model_config
