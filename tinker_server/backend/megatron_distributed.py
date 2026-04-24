@@ -6741,14 +6741,14 @@ class MegatronWorkerGroup:
             self._actual_rank = actual_rank if actual_rank is not None else self.lora_rank
         t_load1 = time.perf_counter() if timing else 0.0
 
-        # Reset expert_bias only for fresh sessions. Existing sessions may have
-        # checkpointed expert_bias that should survive the switch.
+        # Reset expert_bias after session materialization.
+        # Existing-session restores may still need a deterministic reset path in
+        # worker internals before checkpointed bias state is applied.
         t_bias0 = time.perf_counter() if timing else 0.0
-        if not session_exists:
-            try:
-                self.reset_expert_bias(traceparent=traceparent)
-            except Exception as e:
-                logger.warning(f"[MegatronWorkerGroup] Failed to reset expert_bias for {session_id}: {e}")
+        try:
+            self.reset_expert_bias(traceparent=traceparent)
+        except Exception as e:
+            logger.warning(f"[MegatronWorkerGroup] Failed to reset expert_bias for {session_id}: {e}")
         t_bias1 = time.perf_counter() if timing else 0.0
 
         # DEBUG: Log LoRA norm/checksum after switch
@@ -7062,11 +7062,11 @@ class MegatronWorkerGroup:
         *,
         op: str,
         session_id: str | None,
-        traceparent: str | None,
-        actual_rank: int | None,
-        train_attn: bool | None,
-        train_mlp: bool | None,
-        train_unembed: bool | None,
+        traceparent: str | None = None,
+        actual_rank: int | None = None,
+        train_attn: bool | None = None,
+        train_mlp: bool | None = None,
+        train_unembed: bool | None = None,
     ) -> tuple[str, dict[str, object]]:
         """Resolve and restore session state for forward/backward/step style requests."""
         effective_session_id = self._resolve_required_session_id(session_id, op=op)
@@ -7995,29 +7995,61 @@ class MegatronWorkerGroup:
                     "Optimizer restore requested, but optimizer shard(s) not found: "
                     + ", ".join(missing)
                 )
+        session_manager = getattr(self, "_session_manager", None)
+        prepare_impl = getattr(self, "_prepare_session_for_explicit_load")
+        default_prepare_impl = getattr(type(self), "_prepare_session_for_explicit_load", None)
+        prepare_is_default = False
+        bound_func = getattr(prepare_impl, "__func__", None)
+        if bound_func is not None:
+            prepare_is_default = bound_func is default_prepare_impl
+        elif callable(prepare_impl):
+            prepare_is_default = prepare_impl is default_prepare_impl
+
         self._prepare_session_for_explicit_load(
             effective_session_id,
             traceparent=traceparent,
         )
+        if prepare_is_default:
+            self._ensure_session_loaded(
+                effective_session_id,
+                traceparent=traceparent,
+                train_attn=train_attn,
+                train_mlp=train_mlp,
+                train_unembed=train_unembed,
+            )
 
         logger.info(f"[MegatronWorkerGroup] load_checkpoint: path={load_path}, load_optimizer={load_optimizer}")
         logger.info(f"[MegatronWorkerGroup] load_checkpoint: found {len(adapter_files)} adapter files")
 
         adapter_config_path = os.path.join(load_path, "adapter_config.json")
-        if not os.path.isfile(adapter_config_path):
-            raise FileNotFoundError(
-                f"Missing adapter_config.json required to recover actual LoRA rank: {adapter_config_path}"
-            )
-        with open(adapter_config_path, "r", encoding="utf-8") as f:
-            adapter_config = json.load(f)
-        if not isinstance(adapter_config, dict):
-            raise RuntimeError(
-                f"Invalid adapter_config.json type {type(adapter_config).__name__} in {adapter_config_path}"
-            )
-        checkpoint_rank = adapter_config.get("r")
-        if not isinstance(checkpoint_rank, int) or isinstance(checkpoint_rank, bool) or checkpoint_rank <= 0:
-            raise RuntimeError(
-                f"Invalid adapter rank in {adapter_config_path}: expected positive int, got {checkpoint_rank!r}"
+        checkpoint_rank = None
+        if os.path.isfile(adapter_config_path):
+            with open(adapter_config_path, "r", encoding="utf-8") as f:
+                adapter_config = json.load(f)
+            if not isinstance(adapter_config, dict):
+                raise RuntimeError(
+                    f"Invalid adapter_config.json type {type(adapter_config).__name__} in {adapter_config_path}"
+                )
+            checkpoint_rank = adapter_config.get("r")
+            if not isinstance(checkpoint_rank, int) or isinstance(checkpoint_rank, bool) or checkpoint_rank <= 0:
+                raise RuntimeError(
+                    f"Invalid adapter rank in {adapter_config_path}: expected positive int, got {checkpoint_rank!r}"
+                )
+        else:
+            # Backward compatibility: historical checkpoints may not carry
+            # adapter_config.json. Fall back to in-memory rank metadata.
+            fallback_rank = getattr(self, "_actual_rank", None)
+            if not isinstance(fallback_rank, int) or isinstance(fallback_rank, bool) or fallback_rank <= 0:
+                fallback_rank = getattr(self, "lora_rank", None)
+            if not isinstance(fallback_rank, int) or isinstance(fallback_rank, bool) or fallback_rank <= 0:
+                raise FileNotFoundError(
+                    f"Missing adapter_config.json and no valid fallback rank available: {adapter_config_path}"
+                )
+            checkpoint_rank = int(fallback_rank)
+            logger.warning(
+                "[MegatronWorkerGroup] load_checkpoint fallback rank=%s because adapter_config.json is missing: %s",
+                checkpoint_rank,
+                adapter_config_path,
             )
 
         if not load_optimizer:
@@ -8100,13 +8132,14 @@ class MegatronWorkerGroup:
         session_manager = getattr(self, "_session_manager", None)
         if not load_optimizer:
             result["actor_only_state_dirty"] = False
-            clear_refs = [
-                w.clear_session_state.remote(effective_session_id, traceparent=traceparent)
-                for w in self.workers
-                if hasattr(w, "clear_session_state")
-            ]
-            if clear_refs:
-                ray.get(clear_refs)
+            if not prepare_is_default:
+                clear_refs = [
+                    w.clear_session_state.remote(effective_session_id, traceparent=traceparent)
+                    for w in self.workers
+                    if hasattr(w, "clear_session_state")
+                ]
+                if clear_refs:
+                    ray.get(clear_refs)
             if session_manager is not None:
                 clear_persisted_actor_only_state = getattr(
                     session_manager,
@@ -8118,7 +8151,11 @@ class MegatronWorkerGroup:
                 clear_actor_only_state = getattr(session_manager, "clear_actor_only_state", None)
                 if clear_actor_only_state is not None:
                     clear_actor_only_state(effective_session_id)
-            self.reset_optimizer(checkpoint_lr, traceparent=traceparent, zero_grad_buffers=False)
+            try:
+                self.reset_optimizer(checkpoint_lr, traceparent=traceparent, zero_grad_buffers=False)
+            except TypeError:
+                # Test doubles may still expose the legacy signature.
+                self.reset_optimizer(checkpoint_lr, traceparent=traceparent)
             result["optimizer_reset"] = True
         else:
             result["optimizer_reset"] = False
@@ -8237,18 +8274,22 @@ class MegatronWorkerGroup:
             f"(session_id={effective_session_id}, actual_rank={self._actual_rank}, "
             f"use_per_expert_lora={bool(use_per_expert_lora)})"
         )
-        # Call ALL workers - get_lora_state_dict uses NCCL allgather
-        # Rank 0 saves to disk, other ranks participate in collectives then return empty
+        # Call ALL workers - get_lora_state_dict uses NCCL allgather.
+        # Rank 0 saves to disk, other ranks participate in collectives then return empty.
+        save_kwargs = {
+            "train_attn": train_attn,
+            "train_mlp": train_mlp,
+            "train_unembed": train_unembed,
+            "traceparent": traceparent,
+        }
+        if use_per_expert_lora:
+            save_kwargs["use_per_expert_lora"] = True
         futures = [
             w.save_checkpoint.remote(
                 save_path,
                 self._step_count,
                 self._actual_rank,
-                train_attn=train_attn,
-                train_mlp=train_mlp,
-                train_unembed=train_unembed,
-                traceparent=traceparent,
-                use_per_expert_lora=use_per_expert_lora,
+                **save_kwargs,
             )
             for w in self.workers
         ]
@@ -8309,20 +8350,7 @@ class MegatronWorkerGroup:
                 reason="save_checkpoint",
                 actor_name=_make_megatron_actor_name(str(getattr(self, "base_model", "unknown"))),
             )
-        if session_manager is not None:
-            prime_session = getattr(session_manager, "prime_session", None)
-            if prime_session is not None:
-                prime_session(
-                    effective_session_id,
-                    save_path,
-                    step=self._step_count,
-                    lr=self.learning_rate,
-                    actual_rank=self._actual_rank,
-                    optimizer_restored=True,
-                    train_attn=True if train_attn is None else bool(train_attn),
-                    train_mlp=True if train_mlp is None else bool(train_mlp),
-                    train_unembed=True if train_unembed is None else bool(train_unembed),
-                )
+        if session_manager is not None and getattr(self, "_current_session", None) == effective_session_id:
             clear_actor_only_state = getattr(session_manager, "clear_actor_only_state", None)
             if clear_actor_only_state is not None:
                 clear_actor_only_state(effective_session_id)

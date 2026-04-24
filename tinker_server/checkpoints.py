@@ -272,6 +272,26 @@ def read_checkpoint_metadata(path: str) -> dict:
         return json.load(f)
 
 
+def _checkpoint_metadata_lock_path(path: str) -> str:
+    return os.path.join(path, ".metadata.lock")
+
+
+def _locked_checkpoint_metadata(path: str):
+    os.makedirs(path, exist_ok=True)
+    lock_path = _checkpoint_metadata_lock_path(path)
+    lock_file = open(lock_path, "a+", encoding="utf-8")
+    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+    return lock_file
+
+
+def _load_checkpoint_metadata_locked(path: str) -> dict:
+    meta_path = os.path.join(path, "metadata.json")
+    if not os.path.exists(meta_path):
+        return {}
+    with open(meta_path) as f:
+        return json.load(f)
+
+
 def _isoformat_utc(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -321,19 +341,65 @@ def write_checkpoint_metadata(path: str, metadata: dict) -> None:
 
     os.makedirs(path, exist_ok=True)
     meta_path = os.path.join(path, "metadata.json")
-    with open(meta_path, "w") as f:
-        json.dump(data, f, indent=2, sort_keys=True)
+    temp_path = f"{meta_path}.tmp-{uuid.uuid4().hex[:8]}"
+    lock_file = _locked_checkpoint_metadata(path)
+    try:
+        with open(temp_path, "w") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, meta_path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
 
 
 def update_checkpoint_metadata(path: str, updates: dict) -> dict:
-    current = {}
+    os.makedirs(path, exist_ok=True)
+    meta_path = os.path.join(path, "metadata.json")
+    temp_path = f"{meta_path}.tmp-{uuid.uuid4().hex[:8]}"
+    lock_file = _locked_checkpoint_metadata(path)
     try:
-        current = read_checkpoint_metadata(path)
-    except Exception:
-        current = {}
-    current.update(dict(updates))
-    write_checkpoint_metadata(path, current)
-    return current
+        try:
+            current = _load_checkpoint_metadata_locked(path)
+        except (json.JSONDecodeError, OSError) as e:
+            if os.path.exists(meta_path):
+                raise RuntimeError(
+                    f"Refusing to overwrite invalid checkpoint metadata at {meta_path}: {type(e).__name__}: {e}"
+                ) from e
+            current = {}
+        current.update(dict(updates))
+
+        created_at = current.get("created_at")
+        if not isinstance(created_at, str) or not created_at:
+            created_at = _isoformat_utc(time.time())
+            current["created_at"] = created_at
+
+        ttl_raw = current.get("ttl_seconds")
+        if ttl_raw is not None:
+            try:
+                ttl_int = int(ttl_raw)
+            except (TypeError, ValueError):
+                current.pop("ttl_seconds", None)
+            else:
+                current["ttl_seconds"] = ttl_int
+                if ttl_int > 0 and not current.get("expires_at"):
+                    created_dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                    current["expires_at"] = _isoformat_utc(created_dt.timestamp() + ttl_int)
+
+        with open(temp_path, "w") as f:
+            json.dump(current, f, indent=2, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, meta_path)
+        return current
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
 
 
 def validate_checkpoint_load_contract(
