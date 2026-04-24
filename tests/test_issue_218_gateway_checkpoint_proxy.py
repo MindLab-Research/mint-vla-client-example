@@ -226,3 +226,124 @@ def test_issue_218_gateway_load_state_proxies_local_checkpoint_dir(tmp_path, mon
     assert gw.decode_request_id(out.request_id) == ("up", "rid")
     assert archive_called and archive_called[0][0] == str(ckpt_dir)
     assert archive_called[0][2] == 600.0
+
+
+def test_issue_218_gateway_create_model_from_state_forwards_owner_scope(tmp_path, monkeypatch):
+    import tinker_server.gateway as gw
+    from tinker_server.gateway import Upstream
+    from tinker_server.models.types import CreateModelFromStateRequest, LoRAConfig
+    from tinker_server.routes import training as tr
+
+    ckpt_dir = tmp_path / "ckpt_local"
+    ckpt_dir.mkdir()
+
+    monkeypatch.setattr(tr, "can_access_model", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(tr, "resolve_checkpoint_path", lambda *_args, **_kwargs: str(ckpt_dir))
+
+    async def _fake_async_create_archive(checkpoint_dir: str, archive_path: str, *, timeout_s: float = 600.0) -> None:
+        Path(archive_path).write_bytes(b"fake")
+
+    monkeypatch.setattr(tr, "async_create_checkpoint_archive", _fake_async_create_archive)
+
+    upstream = Upstream(alias="up", base_url="http://upstream.example", auth_mode="none")
+    monkeypatch.setattr(gw, "upstream_for_model", lambda _model: upstream)
+
+    async def _fake_forward_file(*, upstream, path, incoming_headers, file_path, **_kwargs):
+        return _DummyResponse(status_code=200, payload={"checkpoint_id": "ckpt_up"})
+
+    async def _fake_forward_json(*, upstream, method, path, incoming_headers, json_body, **_kwargs):
+        assert json_body["state_path"] == "ckpt_up"
+        assert json_body["owner_id"] == "owner-a"
+        return _DummyResponse(status_code=200, payload={"request_id": "rid"})
+
+    monkeypatch.setattr(gw, "forward_file", _fake_forward_file)
+    monkeypatch.setattr(gw, "forward_json", _fake_forward_json)
+    monkeypatch.setattr(gw, "register_remote_training_model", lambda **_kwargs: None)
+    monkeypatch.setattr(tr, "enforce_base_model_allowed", lambda model_name: model_name, raising=False)
+
+    req = CreateModelFromStateRequest(
+        session_id="sess",
+        model_seq_id=1,
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        state_path="ckpt_local",
+        owner_id="owner-a",
+        lora_config=LoRAConfig(rank=8),
+        load_optimizer=True,
+        user_metadata={},
+    )
+    out = asyncio.run(
+        tr.create_model_from_state(
+            request=req,
+            http_request=_DummyRequest(
+                url_path="/api/v1/create_model_from_state",
+                user_data={
+                    "user_id": "admin",
+                    "caps_from_headers": True,
+                    "cap_write": True,
+                    "cap_manage_system": True,
+                },
+            ),
+        )
+    )
+
+    assert gw.decode_request_id(out.request_id) == ("up", "rid")
+
+
+def test_issue_218_gateway_load_state_forwards_owner_scope(tmp_path, monkeypatch):
+    import tinker_server.gateway as gw
+    from tinker_server.gateway import Upstream
+    from tinker_server.models.types import LoadStateRequest
+    from tinker_server.routes import weights as wt
+
+    ckpt_dir = tmp_path / "ckpt_local"
+    ckpt_dir.mkdir()
+
+    monkeypatch.setattr(wt, "can_access_model", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(wt, "resolve_checkpoint_path", lambda *_args, **_kwargs: str(ckpt_dir))
+
+    async def _fake_async_create_archive(checkpoint_dir: str, archive_path: str, *, timeout_s: float = 600.0) -> None:
+        Path(archive_path).write_bytes(b"fake")
+
+    monkeypatch.setattr(wt, "async_create_checkpoint_archive", _fake_async_create_archive)
+
+    async def _fake_route_training_store_info(_model_id: str):
+        return None
+
+    monkeypatch.setattr(wt, "_get_route_training_store_info", _fake_route_training_store_info)
+
+    upstream = Upstream(alias="up", base_url="http://upstream.example", auth_mode="none")
+
+    async def _fake_async_remote_training_model(_model_id: str):
+        return ("up", "Qwen/Qwen3-30B-A3B-Instruct-2507")
+
+    monkeypatch.setattr(gw, "async_remote_training_model", _fake_async_remote_training_model)
+    monkeypatch.setattr(gw, "upstream_for_alias", lambda _alias: upstream)
+
+    async def _fake_forward_file(*, upstream, path, incoming_headers, file_path, **_kwargs):
+        return _DummyResponse(status_code=200, payload={"checkpoint_id": "ckpt_up"})
+
+    async def _fake_forward_json(*, upstream, method, path, incoming_headers, json_body, **_kwargs):
+        assert json_body["path"] == "ckpt_up"
+        assert json_body["owner_id"] == "owner-a"
+        return _DummyResponse(status_code=200, payload={"request_id": "rid"})
+
+    monkeypatch.setattr(gw, "forward_file", _fake_forward_file)
+    monkeypatch.setattr(gw, "forward_json", _fake_forward_json)
+
+    req = LoadStateRequest(model_id="m1", path="ckpt_local", owner_id="owner-a", optimizer=True)
+    out = asyncio.run(
+        wt.load_state(
+            request=req,
+            http_request=_DummyRequest(
+                url_path="/api/v1/load_state",
+                user_data={
+                    "user_id": "admin",
+                    "caps_from_headers": True,
+                    "cap_write": True,
+                    "cap_manage_system": True,
+                },
+            ),
+        )
+    )
+
+    assert gw.decode_request_id(out.request_id) == ("up", "rid")

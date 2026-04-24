@@ -67,6 +67,14 @@ def checkpoint_owner_dir(user_id: str | None) -> str:
     return user_id or "anonymous"
 
 
+def _is_valid_checkpoint_segment(value: str) -> bool:
+    if not value or value in (".", ".."):
+        return False
+    if "/" in value or "\\" in value:
+        return False
+    return True
+
+
 def checkpoint_logical_name(path: str) -> str:
     base = os.path.basename(os.path.normpath(path))
     if base in _CHECKPOINT_TYPES:
@@ -574,6 +582,41 @@ def _iter_metadata_paths(
     return out
 
 
+def _scoped_checkpoint_owner_dir(user_id: str | None, *, is_admin: bool) -> str:
+    raw = str(user_id or "").strip()
+    if is_admin and not raw:
+        raise ValueError("owner_id is required for admin checkpoint references")
+    owner_dir = checkpoint_owner_dir(raw or None)
+    if not _is_valid_checkpoint_segment(owner_dir):
+        raise ValueError("Invalid owner_id")
+    return owner_dir
+
+
+def _deterministic_checkpoint_candidates(
+    roots: list[str],
+    *,
+    owner_dir: str,
+    path_part: str,
+) -> list[str]:
+    candidates: list[str] = []
+    for root in roots:
+        candidates.extend(
+            [
+                os.path.join(root, owner_dir, path_part),
+                os.path.join(root, path_part),
+            ]
+        )
+    out: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        real = os.path.realpath(candidate)
+        if real in seen:
+            continue
+        seen.add(real)
+        out.append(candidate)
+    return out
+
+
 def resolve_checkpoint_id(
     checkpoint_id: str,
     checkpoints_dir: str,
@@ -581,18 +624,15 @@ def resolve_checkpoint_id(
     user_id: str | None = None,
     is_admin: bool = False,
 ) -> str | None:
-    for metadata_path in _iter_metadata_paths(
-        get_resolution_roots(primary_root=checkpoints_dir),
-        user_id=user_id,
-        is_admin=is_admin,
-    ):
-        try:
-            with open(metadata_path) as f:
-                metadata = json.load(f)
-        except (json.JSONDecodeError, OSError):
+    roots = get_resolution_roots(primary_root=checkpoints_dir)
+    owner_dir = _scoped_checkpoint_owner_dir(user_id, is_admin=is_admin)
+    for candidate in _deterministic_checkpoint_candidates(roots, owner_dir=owner_dir, path_part=checkpoint_id):
+        resolved = _existing_checkpoint_view(candidate, checkpoint_type=None)
+        if resolved is None:
             continue
-        if metadata.get("checkpoint_id") == checkpoint_id:
-            return os.path.dirname(metadata_path)
+        if is_admin and not _checkpoint_view_matches_owner(resolved, owner_dir=owner_dir):
+            continue
+        return resolved
     return None
 
 
@@ -631,6 +671,19 @@ def _existing_checkpoint_view(
     return None
 
 
+def _checkpoint_view_matches_owner(path: str, *, owner_dir: str) -> bool:
+    metadata_path = os.path.join(path, "metadata.json")
+    if not os.path.exists(metadata_path):
+        return False
+    try:
+        with open(metadata_path) as f:
+            metadata = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return False
+    actual = checkpoint_owner_dir(metadata.get("owner_id"))
+    return actual == owner_dir
+
+
 def resolve_checkpoint_uri(
     uri: str,
     checkpoints_dir: str,
@@ -642,10 +695,9 @@ def resolve_checkpoint_uri(
         return uri[7:]
 
     roots = get_resolution_roots(primary_root=checkpoints_dir)
-    owner_dir = checkpoint_owner_dir(user_id)
 
     if uri.startswith("ckpt_"):
-        resolved = resolve_checkpoint_id(uri, checkpoints_dir, user_id=owner_dir, is_admin=is_admin)
+        resolved = resolve_checkpoint_id(uri, checkpoints_dir, user_id=user_id, is_admin=is_admin)
         return resolved or uri
 
     if uri.startswith("tinker://"):
@@ -661,23 +713,17 @@ def resolve_checkpoint_uri(
             "Checkpoint URIs must include an explicit checkpoint type "
             "('/weights/' or '/sampler_weights/')."
         )
+    owner_dir = _scoped_checkpoint_owner_dir(user_id, is_admin=is_admin)
     path_part = _strip_tinker_checkpoint_kind(raw_path_part)
 
-    if is_admin:
-        for root in roots:
-            for candidate in [os.path.join(root, path_part), *glob.glob(os.path.join(root, "*", path_part))]:
-                resolved = _existing_checkpoint_view(candidate, checkpoint_type=checkpoint_type)
-                if resolved is not None:
-                    return resolved
-        base = os.path.join(get_persistent_checkpoints_dir(), path_part)
-        fallback_type = checkpoint_namespace_dir(checkpoint_type)
-        return os.path.join(base, fallback_type) if fallback_type else base
-
-    for root in roots:
-        candidate = os.path.join(root, owner_dir, path_part)
+    for candidate in _deterministic_checkpoint_candidates(roots, owner_dir=owner_dir, path_part=path_part):
         resolved = _existing_checkpoint_view(candidate, checkpoint_type=checkpoint_type)
-        if resolved is not None:
-            return resolved
+        if resolved is None:
+            continue
+        if is_admin and not _checkpoint_view_matches_owner(resolved, owner_dir=owner_dir):
+            continue
+        return resolved
+
     base = os.path.join(get_persistent_checkpoints_dir(), owner_dir, path_part)
     fallback_type = checkpoint_namespace_dir(checkpoint_type)
     return os.path.join(base, fallback_type) if fallback_type else base

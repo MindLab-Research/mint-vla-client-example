@@ -1909,15 +1909,25 @@ async def _do_create_model(
 # create_model_from_state - async (composes create_model + load_state)
 # =============================================================================
 
-def _resolve_state_path(state_uri: str, *, user_id: str | None, is_admin: bool = False) -> str:
+def _resolve_state_path(
+    state_uri: str,
+    *,
+    user_id: str | None,
+    is_admin: bool = False,
+    owner_id: str | None = None,
+) -> str:
     if not is_admin and not state_uri.startswith(("tinker://", "mint://", "ckpt_")):
         raise HTTPException(status_code=403, detail="Access denied")
 
-    resolved = resolve_checkpoint_path(state_uri, user_id=user_id, is_admin=is_admin)
+    owner_scope = owner_id if is_admin else user_id
+    try:
+        resolved = resolve_checkpoint_path(state_uri, user_id=owner_scope, is_admin=is_admin)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     if state_uri.startswith("ckpt_") and resolved == state_uri:
         raise HTTPException(status_code=404, detail="Checkpoint not found")
     try:
-        ensure_checkpoint_path_allowed(resolved, user_id=user_id, is_admin=is_admin)
+        ensure_checkpoint_path_allowed(resolved, user_id=owner_scope, is_admin=is_admin)
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
     return materialize_persistent_checkpoint(resolved)
@@ -1970,7 +1980,12 @@ async def create_model_from_state(
         try:
             from ..checkpoints import validate_checkpoint_load_contract
 
-            local_path = _resolve_state_path(request.state_path, user_id=user_id, is_admin=can_manage_system(http_request))
+            local_path = _resolve_state_path(
+                request.state_path,
+                user_id=user_id,
+                is_admin=can_manage_system(http_request),
+                owner_id=request.owner_id,
+            )
             if os.path.isdir(local_path) and os.path.exists(os.path.join(local_path, "metadata.json")):
                 validate_checkpoint_load_contract(local_path, load_optimizer=True)
         except ValueError as e:
@@ -1991,7 +2006,12 @@ async def create_model_from_state(
         await _raise_if_local_model_id_exists(model_id)
         incoming_headers = dict(http_request.headers)
         if request.state_path.startswith(("tinker://", "mint://", "ckpt_")):
-            local_path = _resolve_state_path(request.state_path, user_id=user_id, is_admin=can_manage_system(http_request))
+            local_path = _resolve_state_path(
+                request.state_path,
+                user_id=user_id,
+                is_admin=can_manage_system(http_request),
+                owner_id=request.owner_id,
+            )
             if os.path.isdir(local_path):
                 proxy_timeout_s = float(os.environ.get("MINT_GATEWAY_CHECKPOINT_PROXY_TIMEOUT_S", "600"))
                 tmp_archive = build_gateway_proxy_archive_path()
@@ -2018,7 +2038,8 @@ async def create_model_from_state(
                         status_code=502,
                         detail="Upstream checkpoints/upload returned invalid checkpoint_id",
                     )
-                request = request.model_copy(update={"state_path": ckpt_id})
+                owner_scope = request.owner_id if can_manage_system(http_request) else user_id
+                request = request.model_copy(update={"state_path": ckpt_id, "owner_id": owner_scope})
         try:
             resp = await forward_json(
                 upstream=upstream,
@@ -2066,6 +2087,7 @@ async def create_model_from_state(
         request.state_path,
         user_id=user_id,
         is_admin=can_manage_system(http_request),
+        owner_id=request.owner_id,
     )
     if request.state_path.startswith(("tinker://", "mint://", "ckpt_")) and not os.path.isdir(resolved_state_path):
         raise HTTPException(status_code=404, detail=f"Checkpoint not found: {request.state_path}")

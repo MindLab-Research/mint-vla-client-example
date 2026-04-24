@@ -1775,26 +1775,22 @@ async def list_checkpoints(request: Request):
 
     is_admin = can_bypass_ownership(request)
 
-    if checkpoint_index_enabled():
-        try:
-            # Catalog-backed list avoids recursively sizing uncataloged
-            # filesystem checkpoints, which is too slow for prod list calls.
-            catalog_checkpoints, _shadow_fs_ids = await _scan_checkpoints_from_catalog(
-                user_id,
-                is_admin=is_admin,
-            )
-        except Exception:
-            logger.exception(
-                "[internal.list_checkpoints] catalog query failed; filesystem fallback disabled"
-            )
-            raise HTTPException(status_code=503, detail="Checkpoint catalog unavailable")
-        return CheckpointsListResponse(checkpoints=catalog_checkpoints)
+    if not checkpoint_index_enabled():
+        raise HTTPException(status_code=503, detail="Checkpoint catalog unavailable")
 
-    checkpoints = _scan_checkpoints(
-        user_id,
-        is_admin=is_admin,
-    )
-    return CheckpointsListResponse(checkpoints=checkpoints)
+    try:
+        # Catalog-backed list avoids recursively sizing uncataloged
+        # filesystem checkpoints, which is too slow for prod list calls.
+        catalog_checkpoints, _shadow_fs_ids = await _scan_checkpoints_from_catalog(
+            user_id,
+            is_admin=is_admin,
+        )
+    except Exception:
+        logger.exception(
+            "[internal.list_checkpoints] catalog query failed; filesystem fallback disabled"
+        )
+        raise HTTPException(status_code=503, detail="Checkpoint catalog unavailable")
+    return CheckpointsListResponse(checkpoints=catalog_checkpoints)
 
 
 @router.get("/v1/checkpoints/{checkpoint_id}/archive")
@@ -1810,47 +1806,22 @@ async def download_checkpoint(checkpoint_id: str, request: Request):
 
     is_admin = can_bypass_ownership(request)
 
-    resolved = None
-    if checkpoint_index_enabled():
-        try:
-            resolved = await _resolve_catalog_checkpoint_entry(
-                checkpoint_id,
-                user_id=user_id,
-                is_admin=is_admin,
-            )
-        except Exception:
-            logger.exception(
-                "[internal.download_checkpoint] catalog lookup failed checkpoint_id=%s, fallback to filesystem",
-                checkpoint_id,
-            )
+    if not checkpoint_index_enabled():
+        raise HTTPException(status_code=503, detail="Checkpoint catalog unavailable")
 
-    if resolved is not None:
-        catalog_path, catalog_meta = resolved
-        if not os.path.isdir(catalog_path):
-            logger.warning(
-                "[internal.download_checkpoint] catalog path missing checkpoint_id=%s path=%s, fallback to filesystem",
-                checkpoint_id,
-                catalog_path,
-            )
-            resolved = None
-            expected_type = catalog_meta.get("checkpoint_type")
-            for candidate_id in _catalog_filesystem_ids(catalog_meta, is_admin=is_admin):
-                resolved = _resolve_checkpoint_entry(
-                    candidate_id,
-                    user_id=user_id,
-                    is_admin=is_admin,
-                    expected_checkpoint_type=expected_type if isinstance(expected_type, str) else None,
-                )
-                if resolved is not None:
-                    break
-
-    # Resolve checkpoint path via metadata-backed checkpoint ids.
-    if resolved is None:
-        resolved = _resolve_checkpoint_entry(
+    try:
+        resolved = await _resolve_catalog_checkpoint_entry(
             checkpoint_id,
             user_id=user_id,
             is_admin=is_admin,
         )
+    except Exception:
+        logger.exception(
+            "[internal.download_checkpoint] catalog lookup failed checkpoint_id=%s",
+            checkpoint_id,
+        )
+        raise HTTPException(status_code=503, detail="Checkpoint catalog unavailable")
+
     if resolved is None:
         raise HTTPException(status_code=404, detail="Checkpoint not found")
 

@@ -255,6 +255,7 @@ class CreateSamplingSessionRequest(BaseModel):
     sampling_session_seq_id: int | None = None  # Sequence within session
     base_model: str | None = None
     model_path: str | None = None  # tinker://, mint://, or file:// path to weights
+    owner_id: str | None = None  # admin-only owner scope for checkpoint references
     lora_rank: int = 32  # LoRA rank for per-session adapter
 
 
@@ -818,6 +819,7 @@ class LoadStateRequest(BaseModel):
 
     model_id: str
     path: str  # tinker://, mint://, or file:// path
+    owner_id: str | None = None  # admin-only owner scope for checkpoint references
     optimizer: bool = True  # whether to restore optimizer state
     seq_id: int | None = None
     type: Literal["load_weights"] = "load_weights"
@@ -839,6 +841,7 @@ class CheckpointInfo(BaseModel):
     tinker_path: str
 
     # Compatibility fields (ignored by Tinker clients; used by Mint tooling).
+    owner_id: str | None = None
     path: str | None = None
     step: int | None = None  # parsed from checkpoint name if available
     created_at: str | None = None  # ISO timestamp
@@ -876,6 +879,7 @@ class CreateModelFromStateRequest(BaseModel):
     model_seq_id: int
     base_model: str
     state_path: str  # mint:// or file:// path to checkpoint
+    owner_id: str | None = None  # admin-only owner scope for checkpoint references
     lora_config: LoRAConfig | None = None
     rollout_correction_config: RolloutCorrectionConfig | None = None
     load_optimizer: bool = True  # whether to restore optimizer state

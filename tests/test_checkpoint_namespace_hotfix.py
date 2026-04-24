@@ -159,14 +159,14 @@ def test_checkpoint_namespace_reap_typed_ephemeral_leaf(monkeypatch) -> None:
         assert str(ephemeral_dir) in reaped["ephemeral"]
 
 
-def test_checkpoint_namespace_list_exposes_training_and_sampler_views(tmp_path: Path) -> None:
+def test_checkpoint_namespace_list_exposes_training_and_sampler_views(tmp_path: Path, monkeypatch) -> None:
     from tinker_server import checkpoints
     from tinker_server.routes import weights as weights_routes
 
     weights_routes.CHECKPOINTS_DIR = str(tmp_path)
     checkpoints.CHECKPOINTS_DIR = str(tmp_path)
     checkpoints.PERSISTENT_CHECKPOINTS_DIR = str(tmp_path)
-    _mk_checkpoint_view(
+    training_dir = _mk_checkpoint_view(
         tmp_path,
         owner="anonymous",
         run_id="run-hotfix",
@@ -174,7 +174,7 @@ def test_checkpoint_namespace_list_exposes_training_and_sampler_views(tmp_path: 
         checkpoint_type="training",
         typed=True,
     )
-    _mk_checkpoint_view(
+    sampler_dir = _mk_checkpoint_view(
         tmp_path,
         owner="anonymous",
         run_id="run-hotfix",
@@ -183,16 +183,47 @@ def test_checkpoint_namespace_list_exposes_training_and_sampler_views(tmp_path: 
         typed=True,
     )
 
+    async def _no_remote(**_kwargs):
+        return None
+
+    async def _list_catalog_checkpoints_for_model(model_id: str, *, owner_id: str | None, is_admin: bool):
+        assert model_id == "run-hotfix"
+        assert owner_id is None
+        assert is_admin is False
+        return [
+            {
+                "ckpt_id": "11111111-1111-1111-1111-111111111111",
+                "owner_id": "anonymous",
+                "model_id": "run-hotfix",
+                "raw_checkpoint_id": "0003",
+                "checkpoint_type": "training",
+                "storage_root": str(tmp_path),
+                "checkpoint_created_at": "2026-04-07T00:00:00Z",
+            },
+            {
+                "ckpt_id": "22222222-2222-2222-2222-222222222222",
+                "owner_id": "anonymous",
+                "model_id": "run-hotfix",
+                "raw_checkpoint_id": "0003",
+                "checkpoint_type": "sampler",
+                "storage_root": str(tmp_path),
+                "checkpoint_created_at": "2026-04-07T00:00:00Z",
+            },
+        ]
+
+    monkeypatch.setattr(weights_routes, "checkpoint_index_enabled", lambda: True)
+    monkeypatch.setattr(weights_routes, "list_catalog_checkpoints_for_model", _list_catalog_checkpoints_for_model)
+    monkeypatch.setattr(weights_routes, "_forward_remote_checkpoint_route", _no_remote)
+
     app = FastAPI()
     app.include_router(weights_routes.router, prefix="/api/v1")
     client = TestClient(app)
 
     resp = client.get("/api/v1/training_runs/run-hotfix/checkpoints")
-    assert resp.status_code == 200
+    assert resp.status_code == 200, resp.text
     payload = resp.json()
     ids = {item["checkpoint_id"] for item in payload["checkpoints"]}
-    assert "weights/0003" in ids
-    assert "sampler_weights/0003" in ids
+    assert ids == {"weights/0003", "sampler_weights/0003"}
 
 
 def test_checkpoint_namespace_archive_prefers_requested_type(tmp_path: Path) -> None:
