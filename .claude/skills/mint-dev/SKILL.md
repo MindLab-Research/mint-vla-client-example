@@ -124,7 +124,7 @@ For long-running dev validation, merge-gate work, or any dev server bring-up:
 
 - Do **not** assemble the server environment from scratch.
 - Start from the checked-in dev template:
-  [configs/dev_volcano.env.sh](/home/yiwen/tinker_project/tinker-server/configs/dev_volcano.env.sh)
+  [configs/dev_volcano.env.sh](../../../configs/dev_volcano.env.sh)
 - Then override **only** the dev-specific values that must differ.
 
 Hard rule:
