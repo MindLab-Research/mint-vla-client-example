@@ -19,7 +19,11 @@ async def test_issue_444_api_work_queue_rebinds_active_job_id_when_actor_recreat
     class _FakeActor:
         class _StatsRemote:
             def remote(self):
-                return {"ok": True}
+                return {
+                    "ok": True,
+                    "code_identity": api_work_queue_module.CURRENT_CODE_IDENTITY,
+                    "runtime_contract_digest": api_work_queue_module._api_work_queue_runtime_contract_digest(),
+                }
 
         class _DebugStateRemote:
             def remote(self):

@@ -14,6 +14,7 @@ class MintBaseModel(BaseModel):
 class InterpolateCheckpointsRequest(MintBaseModel):
     source_paths: list[str]
     coefficients: list[float]
+    owner_id: str | None = None  # admin-only owner scope applied to all source checkpoint references
     output_path: str | None = None
     retry: bool = False
     output_checkpoint_type: Literal["sampler"] = "sampler"
@@ -39,6 +40,7 @@ class ReverseKLDatum(MintBaseModel):
 class ForwardBackwardReverseKLRequest(MintBaseModel):
     model_id: str
     reference_model_path: str
+    owner_id: str | None = None  # admin-only owner scope for checkpoint references
     data: list[ReverseKLDatum]
     temperature: float = 1.0
     seq_id: int | None = None
@@ -80,6 +82,7 @@ class MintCreateActionSessionRequest(MintBaseModel):
     action_session_seq_id: int | None = None
     base_model: str | None = None
     model_path: str | None = None
+    owner_id: str | None = None  # admin-only owner scope for checkpoint references
 
 
 class MintCreateActionSessionResponse(MintBaseModel):

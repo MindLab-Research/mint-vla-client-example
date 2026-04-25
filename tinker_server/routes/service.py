@@ -303,6 +303,7 @@ async def _create_sampling_session_impl(
         base_model=request.base_model,
         model_path=request.model_path,
         user_id=user_id,
+        owner_id=request.owner_id,
         http_request=http_request,
     )
 
@@ -364,7 +365,10 @@ async def _create_sampling_session_impl(
         # Resolve adapter directory (file://, typed checkpoint URI, absolute path).
         if adapter_path is None:
             adapter_path = _resolve_model_path(
-                request.model_path, user_id=user_id, http_request=http_request
+                request.model_path,
+                user_id=user_id,
+                owner_id=request.owner_id,
+                http_request=http_request,
             )
 
         # Fast validation: ensure weights exist; loading happens on first /asample.
@@ -713,7 +717,11 @@ async def get_sampler(sampler_id: str, http_request: Request) -> GetSamplerRespo
 
 
 def _resolve_model_path(
-    model_path: str, *, user_id: str | None, http_request: Request
+    model_path: str,
+    *,
+    user_id: str | None,
+    owner_id: str | None = None,
+    http_request: Request,
 ) -> str:
     """Resolve model_path URI to filesystem path.
 
@@ -733,14 +741,15 @@ def _resolve_model_path(
     if not can_system and not model_path.startswith(("tinker://", "mint://", "ckpt_")):
         raise HTTPException(status_code=403, detail="Access denied")
 
+    owner_scope = owner_id if can_system else user_id
     try:
-        resolved = resolve_checkpoint_uri(model_path, "", user_id=user_id, is_admin=can_system)
+        resolved = resolve_checkpoint_uri(model_path, "", user_id=owner_scope, is_admin=can_system)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     if model_path.startswith("ckpt_") and resolved == model_path:
         raise HTTPException(status_code=404, detail="Checkpoint not found")
     try:
-        ensure_checkpoint_path_allowed(resolved, user_id=user_id, is_admin=can_system)
+        ensure_checkpoint_path_allowed(resolved, user_id=owner_scope, is_admin=can_system)
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
     return materialize_persistent_checkpoint(resolved)
@@ -751,6 +760,7 @@ def _resolve_base_model_for_sampling_request(
     base_model: str | None,
     model_path: str | None,
     user_id: str | None,
+    owner_id: str | None,
     http_request: Request,
 ) -> tuple[str | None, str | None]:
     """Return the effective base_model and resolved adapter path for a sampling request."""
@@ -759,6 +769,7 @@ def _resolve_base_model_for_sampling_request(
         adapter_path = _resolve_model_path(
             model_path,
             user_id=user_id,
+            owner_id=owner_id,
             http_request=http_request,
         )
         base_model = _infer_base_model_from_adapter(adapter_path)

@@ -48,7 +48,12 @@ async def test_issue_364_queue_supervisor_claim_and_heartbeat(monkeypatch) -> No
 
         class _SnapshotRemote:
             def remote(self):
-                return {"generation_id": 1, "state": "active"}
+                return {
+                    "generation_id": 1,
+                    "state": "active",
+                    "code_identity": qs.CURRENT_CODE_IDENTITY,
+                    "runtime_contract_digest": qs._runtime_contract_digest(),
+                }
 
         @property
         def claim_generation(self):
@@ -236,7 +241,8 @@ async def test_issue_364_api_work_queue_waits_for_first_generation_claim(monkeyp
         def set_active_job_id(self):
             return self._SetActiveRemote()
 
-    async def _get_actor_async():
+    async def _get_actor_async(*, require_ready: bool = True):
+        _ = require_ready
         return _FakeActor()
 
     async def _await_ref(ref, *, timeout_s: float | None = None):

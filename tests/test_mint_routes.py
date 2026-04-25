@@ -202,11 +202,12 @@ def test_mint_create_action_session_uses_bypass_cap_for_checkpoint_paths(monkeyp
         }
         return 'openpi/pi0-fast-libero-low-mem-finetune'
 
-    def _resolve(path: str, *, user_id: str | None, is_admin: bool) -> str:
+    def _resolve(path: str, *, user_id: str | None, is_admin: bool, owner_id: str | None = None) -> str:
         captured['resolve'] = {
             'path': path,
             'user_id': user_id,
             'is_admin': is_admin,
+            'owner_id': owner_id,
         }
         return '/resolved/user-a/checkpoint'
 
@@ -229,6 +230,7 @@ def test_mint_create_action_session_uses_bypass_cap_for_checkpoint_paths(monkeyp
             'session_id': 'act-test',
             'action_session_seq_id': 0,
             'model_path': 'mint://model/checkpoint',
+            'owner_id': 'user-a',
         },
     )
 
@@ -243,6 +245,7 @@ def test_mint_create_action_session_uses_bypass_cap_for_checkpoint_paths(monkeyp
         'path': 'mint://model/checkpoint',
         'user_id': 'user-a',
         'is_admin': True,
+        'owner_id': 'user-a',
     }
     assert captured['create_session_kwargs']['model_path'] == '/resolved/user-a/checkpoint'
     assert captured['create_session_kwargs']['base_model'] == 'openpi/pi0-fast-libero-low-mem-finetune'
@@ -562,7 +565,7 @@ def test_mint_interpolate_route_enqueues_expected_request(monkeypatch) -> None:
 
     resolved_flags: list[bool] = []
 
-    def _resolve(path: str, *, user_id, is_admin):
+    def _resolve(path: str, *, user_id, is_admin, owner_id=None):
         resolved_flags.append(bool(is_admin))
         return f"/resolved/{user_id}/{path.rsplit('/', 1)[-1]}"
 

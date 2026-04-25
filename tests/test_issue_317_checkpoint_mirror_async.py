@@ -290,6 +290,22 @@ def test_issue_317_list_checkpoints_includes_pending_cache_status(monkeypatch, t
     async def _no_remote(**_kwargs):
         return None
 
+    async def _list_catalog_checkpoints_for_model(*, model_id: str, owner_id: str | None, is_admin: bool):
+        assert model_id == "run-317"
+        assert owner_id is None
+        assert is_admin is False
+        return [
+            {
+                "ckpt_id": "31700000-0000-0000-0000-000000000001",
+                "owner_id": "anonymous",
+                "model_id": "run-317",
+                "raw_checkpoint_id": "ckpt-a",
+                "checkpoint_type": "training",
+                "storage_root": str(runtime_root / "persistent_cache"),
+                "checkpoint_created_at": "2026-03-15T00:00:00Z",
+            }
+        ]
+
     monkeypatch.setattr(wt, "CHECKPOINTS_DIR", str(root))
     monkeypatch.setattr(wt, "PERSISTENT_CHECKPOINTS_DIR", str(root), raising=False)
     monkeypatch.setattr(wt, "RUNTIME_CHECKPOINTS_DIR", str(runtime_root), raising=False)
@@ -298,6 +314,8 @@ def test_issue_317_list_checkpoints_includes_pending_cache_status(monkeypatch, t
     monkeypatch.setattr(checkpoints, "CHECKPOINTS_DIR", str(root))
     monkeypatch.setattr(checkpoints, "PERSISTENT_CHECKPOINTS_DIR", str(root))
     monkeypatch.setattr(checkpoints, "RUNTIME_CHECKPOINTS_DIR", str(runtime_root))
+    monkeypatch.setattr(wt, "checkpoint_index_enabled", lambda: True)
+    monkeypatch.setattr(wt, "list_catalog_checkpoints_for_model", _list_catalog_checkpoints_for_model)
     monkeypatch.setattr(wt, "_forward_remote_checkpoint_route", _no_remote)
 
     app = FastAPI()
@@ -344,6 +362,22 @@ def test_issue_317_list_checkpoints_finds_owner_scoped_pending_cache(
     async def _no_remote(**_kwargs):
         return None
 
+    async def _list_catalog_checkpoints_for_model(*, model_id: str, owner_id: str | None, is_admin: bool):
+        assert model_id == "run-317"
+        assert owner_id == "user-a"
+        assert is_admin is False
+        return [
+            {
+                "ckpt_id": "31700000-0000-0000-0000-000000000002",
+                "owner_id": "user-a",
+                "model_id": "run-317",
+                "raw_checkpoint_id": "ckpt-a",
+                "checkpoint_type": "training",
+                "storage_root": str(runtime_root / "persistent_cache"),
+                "checkpoint_created_at": "2026-03-15T00:00:00Z",
+            }
+        ]
+
     monkeypatch.setattr(wt, "CHECKPOINTS_DIR", str(root))
     monkeypatch.setattr(wt, "PERSISTENT_CHECKPOINTS_DIR", str(root), raising=False)
     monkeypatch.setattr(wt, "get_persistent_search_roots", lambda primary_root=None: [str(root)])
@@ -351,6 +385,8 @@ def test_issue_317_list_checkpoints_finds_owner_scoped_pending_cache(
     monkeypatch.setattr(checkpoints, "CHECKPOINTS_DIR", str(root))
     monkeypatch.setattr(checkpoints, "PERSISTENT_CHECKPOINTS_DIR", str(root))
     monkeypatch.setattr(checkpoints, "RUNTIME_CHECKPOINTS_DIR", str(runtime_root))
+    monkeypatch.setattr(wt, "checkpoint_index_enabled", lambda: True)
+    monkeypatch.setattr(wt, "list_catalog_checkpoints_for_model", _list_catalog_checkpoints_for_model)
     monkeypatch.setattr(wt, "_forward_remote_checkpoint_route", _no_remote)
     monkeypatch.setattr(wt, "_get_user_id", lambda _request: "user-a")
 

@@ -28,14 +28,14 @@ export MINT_SAVE_LORA_TIMEOUT_S=1800
 export MINT_SCHEDULER_ENABLE=1
 
 # Current worker topology after 2026-04-10 head/worker rebuild:
-# worker1 dense + small vLLM: 192.168.39.53
+# worker1 dense + small vLLM: 192.168.39.146
 # worker2 30B vLLM + megatron: 192.168.39.52
 # worker3-4 235B vLLM: 192.168.39.51,192.168.39.54
 # worker5-8 235B megatron: 192.168.39.50,192.168.39.56,192.168.39.55,192.168.39.57
-export MINT_VLLM_PINNED_NODE_IP_JSON='{"Qwen/Qwen3-0.6B":"192.168.39.53","Qwen/Qwen3-4B-Instruct-2507":"192.168.39.53","Qwen/Qwen3-4B-Thinking-2507":"192.168.39.53","Qwen/Qwen3-30B-A3B-Instruct-2507":"192.168.39.52"}'
-export MINT_DENSE_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.39.53"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.39.53"],"Qwen/Qwen3-4B-Thinking-2507":["192.168.39.53"]}'
-export MINT_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.39.53"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.39.53"],"Qwen/Qwen3-4B-Thinking-2507":["192.168.39.53"],"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.39.52"]}'
-export MINT_VLLM_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.39.53"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.39.53"],"Qwen/Qwen3-4B-Thinking-2507":["192.168.39.53"],"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.39.52"],"Qwen/Qwen3-235B-A22B-Instruct-2507":["192.168.39.51","192.168.39.54"],"Qwen/Qwen3-235B-A22B-Thinking-2507":["192.168.39.51","192.168.39.54"]}'
+export MINT_VLLM_PINNED_NODE_IP_JSON='{"Qwen/Qwen3-0.6B":"192.168.39.146","Qwen/Qwen3-4B-Instruct-2507":"192.168.39.146","Qwen/Qwen3-4B-Thinking-2507":"192.168.39.146","Qwen/Qwen3-30B-A3B-Instruct-2507":"192.168.39.52"}'
+export MINT_DENSE_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.39.146"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.39.146"],"Qwen/Qwen3-4B-Thinking-2507":["192.168.39.146"]}'
+export MINT_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.39.146"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.39.146"],"Qwen/Qwen3-4B-Thinking-2507":["192.168.39.146"],"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.39.52"]}'
+export MINT_VLLM_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.39.146"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.39.146"],"Qwen/Qwen3-4B-Thinking-2507":["192.168.39.146"],"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.39.52"],"Qwen/Qwen3-235B-A22B-Instruct-2507":["192.168.39.51","192.168.39.54"],"Qwen/Qwen3-235B-A22B-Thinking-2507":["192.168.39.51","192.168.39.54"]}'
 export MINT_MEGATRON_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.39.52"],"Qwen/Qwen3-235B-A22B-Instruct-2507":["192.168.39.50","192.168.39.56","192.168.39.55","192.168.39.57"],"Qwen/Qwen3-235B-A22B-Thinking-2507":["192.168.39.50","192.168.39.56","192.168.39.55","192.168.39.57"]}'
 
 export MINT_MODEL_CONFIG_OVERRIDES_JSON=''
@@ -77,7 +77,9 @@ else
   return 1 2>/dev/null || exit 1
 fi
 
-export MINT_API_WORK_QUEUE_ACTOR_NAME=tinker_api_work_queue_v20260309
+export MINT_API_WORK_QUEUE_ACTOR_NAME=tinker_api_work_queue
+export MINT_QUEUE_EXECUTION_RUNTIME_ACTOR_NAME=tinker_queue_execution_runtime
+export MINT_QUEUE_SUPERVISOR_ACTOR_NAME=tinker_queue_supervisor
 export MINT_API_WORK_QUEUE_ACTOR_MAX_CONCURRENCY=1024
 
 export PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/mint-runtime-py31213
