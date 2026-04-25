@@ -462,6 +462,63 @@ class _MegatronSessionAuthorityRecord:
         return None
 
 
+def _authority_source_to_payload(source: _MegatronSessionAuthoritySource) -> dict[str, object]:
+    payload: dict[str, object] = {"kind": source.kind}
+    if source.path is not None:
+        payload["path"] = source.path
+    if source.identity is not None:
+        payload["identity"] = source.identity
+    if source.actor_name is not None:
+        payload["actor_name"] = source.actor_name
+    if source.manifest_path is not None:
+        payload["manifest_path"] = source.manifest_path
+    return payload
+
+
+def _authority_source_from_payload(
+    payload: object,
+    *,
+    field_name: str,
+    marker_path: str,
+    default_actor_name: str | None = None,
+    default_manifest_path: str | None = None,
+) -> _MegatronSessionAuthoritySource:
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            f"Invalid authority source {field_name} in {marker_path}: expected object, got {type(payload).__name__}"
+        )
+    kind = payload.get("kind")
+    if not isinstance(kind, str) or not kind:
+        raise RuntimeError(f"Invalid authority source {field_name} kind={kind!r} in {marker_path}")
+    if kind not in {"checkpoint", "session_cache", "live_actor", "actor_snapshot", "none"}:
+        raise RuntimeError(f"Unsupported authority source {field_name} kind={kind!r} in {marker_path}")
+    path = payload.get("path")
+    identity = payload.get("identity")
+    actor_name = payload.get("actor_name")
+    manifest_path = payload.get("manifest_path")
+    if actor_name is None and kind == "live_actor":
+        actor_name = default_actor_name
+    if manifest_path is None and kind == "actor_snapshot":
+        manifest_path = default_manifest_path
+    for name, value in (
+        ("path", path),
+        ("identity", identity),
+        ("actor_name", actor_name),
+        ("manifest_path", manifest_path),
+    ):
+        if value is not None and (not isinstance(value, str) or not value):
+            raise RuntimeError(
+                f"Invalid authority source {field_name} {name}={value!r} in {marker_path}"
+            )
+    return _MegatronSessionAuthoritySource(
+        kind=kind,
+        path=path,
+        identity=identity,
+        actor_name=actor_name,
+        manifest_path=manifest_path,
+    )
+
+
 @dataclass
 class _MegatronSessionCacheEntry:
     session_id: str
@@ -1454,12 +1511,13 @@ class MegatronRankWorker:
         session_path = self._session_path(session_id)
         rank_path = self._actor_only_rank_snapshot_path(session_id)
         os.makedirs(os.path.dirname(rank_path), exist_ok=True)
+        gradients_payload = self._serialize_gradients_for_snapshot(gradients)
         payload = {
             "version": 1,
             "session_id": session_id,
             "rank": self.rank,
             "saved_at": time.time(),
-            "gradients": self._serialize_gradients_for_snapshot(gradients),
+            "gradients": gradients_payload,
             "optimizer_state": optimizer_state,
             "lr_scheduler_state": lr_scheduler_state,
         }
@@ -1471,6 +1529,9 @@ class MegatronRankWorker:
             "path": rank_path,
             "bytes": int(os.path.getsize(rank_path)),
             "session_path": session_path,
+            "gradient_kind": gradients_payload["kind"],
+            "optimizer_state_present": True,
+            "scheduler_state_present": bool(lr_scheduler_state),
         }
 
     def _load_persisted_actor_only_state(
@@ -5300,25 +5361,58 @@ class MegatronSessionStateManager:
         if os.path.exists(actor_marker_path):
             dirty_marker = self._read_actor_only_state(actor_marker_path)
         if dirty_marker is not None:
-            actor_name = dirty_marker.get("actor_name")
-            live_actor = _MegatronSessionAuthoritySource(
-                "live_actor",
-                actor_name=actor_name if isinstance(actor_name, str) else None,
-            )
-            reason = dirty_marker.get("reason")
-            if reason == "load_weights":
-                optimizer_source = live_actor
-                gradient_source = none_source
-                scheduler_source = none_source
-            elif reason == "forward_backward":
-                optimizer_source = none_source
-                gradient_source = live_actor
-                scheduler_source = none_source
+            sources = dirty_marker.get("sources")
+            if isinstance(sources, dict):
+                actor_name = dirty_marker.get("actor_name")
+                marker_actor_name = actor_name if isinstance(actor_name, str) else None
+                weights_source = _authority_source_from_payload(
+                    sources.get("weights"),
+                    field_name="weights",
+                    marker_path=actor_marker_path,
+                    default_actor_name=marker_actor_name,
+                )
+                optimizer_source = _authority_source_from_payload(
+                    sources.get("optimizer"),
+                    field_name="optimizer",
+                    marker_path=actor_marker_path,
+                    default_actor_name=marker_actor_name,
+                )
+                gradient_source = _authority_source_from_payload(
+                    sources.get("gradient"),
+                    field_name="gradient",
+                    marker_path=actor_marker_path,
+                    default_actor_name=marker_actor_name,
+                )
+                scheduler_source = _authority_source_from_payload(
+                    sources.get("scheduler"),
+                    field_name="scheduler",
+                    marker_path=actor_marker_path,
+                    default_actor_name=marker_actor_name,
+                )
             else:
-                weights_source = live_actor
-                optimizer_source = live_actor
-                gradient_source = live_actor
-                scheduler_source = live_actor
+                actor_name = dirty_marker.get("actor_name")
+                live_actor = _MegatronSessionAuthoritySource(
+                    "live_actor",
+                    actor_name=actor_name if isinstance(actor_name, str) else None,
+                )
+                reason = dirty_marker.get("reason")
+                if reason == "load_weights":
+                    optimizer_source = live_actor
+                    gradient_source = none_source
+                    scheduler_source = none_source
+                elif reason == "forward_backward":
+                    optimizer_source = none_source
+                    gradient_source = live_actor
+                    scheduler_source = none_source
+                elif reason == "optim_step":
+                    weights_source = live_actor
+                    optimizer_source = live_actor
+                    gradient_source = none_source
+                    scheduler_source = live_actor
+                else:
+                    raise RuntimeError(
+                        f"Unsupported actor_only_state marker reason={reason!r} in {actor_marker_path}"
+                    )
             return _MegatronSessionAuthorityRecord(
                 session_id=session_id,
                 weights_source=weights_source,
@@ -5330,17 +5424,47 @@ class MegatronSessionStateManager:
 
         persisted = self.get_persisted_actor_only_state(session_id)
         if isinstance(persisted, dict):
-            source = _MegatronSessionAuthoritySource(
-                "actor_snapshot",
-                actor_name=persisted.get("actor_name") if isinstance(persisted.get("actor_name"), str) else None,
-                manifest_path=self._actor_only_snapshot_manifest_path(session_id),
-            )
+            manifest_path = self._actor_only_snapshot_manifest_path(session_id)
+            sources = persisted.get("sources")
+            if isinstance(sources, dict):
+                actor_name = persisted.get("actor_name")
+                marker_actor_name = actor_name if isinstance(actor_name, str) else None
+                optimizer_source = _authority_source_from_payload(
+                    sources.get("optimizer"),
+                    field_name="optimizer",
+                    marker_path=manifest_path,
+                    default_actor_name=marker_actor_name,
+                    default_manifest_path=manifest_path,
+                )
+                gradient_source = _authority_source_from_payload(
+                    sources.get("gradient"),
+                    field_name="gradient",
+                    marker_path=manifest_path,
+                    default_actor_name=marker_actor_name,
+                    default_manifest_path=manifest_path,
+                )
+                scheduler_source = _authority_source_from_payload(
+                    sources.get("scheduler"),
+                    field_name="scheduler",
+                    marker_path=manifest_path,
+                    default_actor_name=marker_actor_name,
+                    default_manifest_path=manifest_path,
+                )
+            else:
+                source = _MegatronSessionAuthoritySource(
+                    "actor_snapshot",
+                    actor_name=persisted.get("actor_name") if isinstance(persisted.get("actor_name"), str) else None,
+                    manifest_path=manifest_path,
+                )
+                optimizer_source = source
+                gradient_source = source
+                scheduler_source = source
             return _MegatronSessionAuthorityRecord(
                 session_id=session_id,
                 weights_source=weights_source,
-                optimizer_source=source,
-                gradient_source=source,
-                scheduler_source=source,
+                optimizer_source=optimizer_source,
+                gradient_source=gradient_source,
+                scheduler_source=scheduler_source,
                 external_checkpoint_is_fresh=None,
             )
 
@@ -5449,16 +5573,58 @@ class MegatronSessionStateManager:
         *,
         reason: str,
         actor_name: str | None = None,
+        checkpoint_path: str | None = None,
+        checkpoint_identity: str | None = None,
     ) -> None:
+        actor_name = None if actor_name is None else str(actor_name)
+        if actor_name is None or not actor_name:
+            raise RuntimeError(f"Cannot mark actor-only state for {session_id} with empty actor_name")
+        previous = self.get_authority_record(session_id)
+        live_actor = _MegatronSessionAuthoritySource("live_actor", actor_name=actor_name)
+        none_source = _MegatronSessionAuthoritySource("none")
+        if reason == "load_weights":
+            if checkpoint_path is not None:
+                resolved_identity = checkpoint_identity or self.checkpoint_identity(checkpoint_path)
+                weights_source = _MegatronSessionAuthoritySource(
+                    "checkpoint",
+                    path=os.path.realpath(checkpoint_path),
+                    identity=resolved_identity,
+                    actor_name=actor_name,
+                )
+            else:
+                weights_source = previous.weights_source
+            optimizer_source = live_actor
+            gradient_source = none_source
+            scheduler_source = none_source
+        elif reason == "forward_backward":
+            weights_source = previous.weights_source
+            optimizer_source = previous.optimizer_source
+            gradient_source = live_actor
+            scheduler_source = previous.scheduler_source
+        elif reason == "optim_step":
+            weights_source = live_actor
+            optimizer_source = live_actor
+            gradient_source = none_source
+            scheduler_source = live_actor
+        else:
+            raise RuntimeError(f"Unsupported actor-only authority transition reason={reason!r}")
+
         session_path = self.get_session_path(session_id)
         self._detach_session_path_from_checkpoint(session_id)
         os.makedirs(session_path, exist_ok=True)
         marker_path = self._actor_only_state_path(session_id)
         tmp_path = f"{marker_path}.tmp"
         payload = {
+            "version": 2,
             "reason": str(reason),
-            "actor_name": None if actor_name is None else str(actor_name),
+            "actor_name": actor_name,
             "updated_at": time.time(),
+            "sources": {
+                "weights": _authority_source_to_payload(weights_source),
+                "optimizer": _authority_source_to_payload(optimizer_source),
+                "gradient": _authority_source_to_payload(gradient_source),
+                "scheduler": _authority_source_to_payload(scheduler_source),
+            },
         }
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(payload, f)
@@ -5548,6 +5714,9 @@ class MegatronSessionStateManager:
         tmp_path = f"{manifest_path}.tmp"
         normalized_entries = []
         total_bytes = 0
+        gradient_kinds: set[str] = set()
+        optimizer_state_present = False
+        scheduler_state_present = False
         for entry in worker_entries:
             if not isinstance(entry, dict):
                 raise RuntimeError(
@@ -5562,8 +5731,30 @@ class MegatronSessionStateManager:
                 raise RuntimeError(f"Invalid path in persisted actor-only entry for session {session_id}: {entry!r}")
             if not isinstance(byte_count, int) or byte_count < 0:
                 raise RuntimeError(f"Invalid bytes in persisted actor-only entry for session {session_id}: {entry!r}")
-            normalized_entries.append({"rank": rank, "path": path, "bytes": byte_count})
+            gradient_kind = entry.get("gradient_kind")
+            if gradient_kind is not None:
+                if not isinstance(gradient_kind, str) or not gradient_kind:
+                    raise RuntimeError(
+                        f"Invalid gradient_kind in persisted actor-only entry for session {session_id}: {entry!r}"
+                    )
+                gradient_kinds.add(gradient_kind)
+            optimizer_state_present = optimizer_state_present or bool(entry.get("optimizer_state_present", False))
+            scheduler_state_present = scheduler_state_present or bool(entry.get("scheduler_state_present", False))
+            normalized_entries.append({
+                "rank": rank,
+                "path": path,
+                "bytes": byte_count,
+                "gradient_kind": gradient_kind,
+                "optimizer_state_present": bool(entry.get("optimizer_state_present", False)),
+                "scheduler_state_present": bool(entry.get("scheduler_state_present", False)),
+            })
             total_bytes += byte_count
+        snapshot_source = _MegatronSessionAuthoritySource(
+            "actor_snapshot",
+            actor_name=actor_name,
+            manifest_path=manifest_path,
+        )
+        none_source = _MegatronSessionAuthoritySource("none")
         payload = {
             "version": 1,
             "session_id": session_id,
@@ -5571,6 +5762,13 @@ class MegatronSessionStateManager:
             "updated_at": time.time(),
             "total_bytes": total_bytes,
             "rank_files": sorted(normalized_entries, key=lambda item: item["rank"]),
+            "sources": {
+                "optimizer": _authority_source_to_payload(snapshot_source if optimizer_state_present else none_source),
+                "gradient": _authority_source_to_payload(
+                    snapshot_source if "buffers" in gradient_kinds else none_source
+                ),
+                "scheduler": _authority_source_to_payload(snapshot_source if scheduler_state_present else none_source),
+            },
         }
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(payload, f)
@@ -8003,44 +8201,52 @@ class MegatronWorkerGroup:
             )
         )
         meta_path = os.path.join(load_path, "training_meta.json")
-        if not os.path.isfile(meta_path):
-            raise FileNotFoundError(f"Missing training_meta.json required to recover checkpoint step/lr: {meta_path}")
-        with open(meta_path, "r", encoding="utf-8") as f:
-            meta = json.load(f)
-        if not isinstance(meta, dict):
-            raise RuntimeError(f"Invalid training_meta.json type {type(meta).__name__} in {meta_path}")
-        protected_keys = {
-            "actual_rank",
-            "actor_only_state_dirty",
-            "checkpoint_path",
-            "load_method",
-            "optimizer_reset",
-            "optimizer_restored",
-            "train_attn",
-            "train_mlp",
-            "train_unembed",
-        }
-        protected_present = sorted(protected_keys & set(meta))
-        if protected_present:
-            raise RuntimeError(
-                f"Invalid training_meta.json in {meta_path}: protected load metadata keys "
-                f"must be derived from the checkpoint load, got {protected_present}"
-            )
-        checkpoint_step = meta.get("current_step")
-        if not isinstance(checkpoint_step, int) or isinstance(checkpoint_step, bool) or checkpoint_step < 0:
-            raise RuntimeError(
-                f"Invalid current_step in {meta_path}: expected non-negative int, got {checkpoint_step!r}"
-            )
-        checkpoint_lr_value = meta.get("learning_rate")
-        if isinstance(checkpoint_lr_value, bool) or not isinstance(checkpoint_lr_value, (int, float)):
-            raise RuntimeError(
-                f"Invalid learning_rate in {meta_path}: expected finite number, got {checkpoint_lr_value!r}"
-            )
-        checkpoint_lr = float(checkpoint_lr_value)
+        checkpoint_step = 0
+        checkpoint_lr = float(self.learning_rate)
         if not math.isfinite(checkpoint_lr):
             raise RuntimeError(
-                f"Invalid learning_rate in {meta_path}: expected finite number, got {checkpoint_lr_value!r}"
+                f"Cannot load optimizerless checkpoint without finite session learning_rate, got {self.learning_rate!r}"
             )
+        if not os.path.isfile(meta_path):
+            if load_optimizer:
+                raise FileNotFoundError(f"Missing training_meta.json required to recover checkpoint step/lr: {meta_path}")
+        else:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            if not isinstance(meta, dict):
+                raise RuntimeError(f"Invalid training_meta.json type {type(meta).__name__} in {meta_path}")
+            protected_keys = {
+                "actual_rank",
+                "actor_only_state_dirty",
+                "checkpoint_path",
+                "load_method",
+                "optimizer_reset",
+                "optimizer_restored",
+                "train_attn",
+                "train_mlp",
+                "train_unembed",
+            }
+            protected_present = sorted(protected_keys & set(meta))
+            if protected_present:
+                raise RuntimeError(
+                    f"Invalid training_meta.json in {meta_path}: protected load metadata keys "
+                    f"must be derived from the checkpoint load, got {protected_present}"
+                )
+            checkpoint_step = meta.get("current_step")
+            if not isinstance(checkpoint_step, int) or isinstance(checkpoint_step, bool) or checkpoint_step < 0:
+                raise RuntimeError(
+                    f"Invalid current_step in {meta_path}: expected non-negative int, got {checkpoint_step!r}"
+                )
+            checkpoint_lr_value = meta.get("learning_rate")
+            if isinstance(checkpoint_lr_value, bool) or not isinstance(checkpoint_lr_value, (int, float)):
+                raise RuntimeError(
+                    f"Invalid learning_rate in {meta_path}: expected finite number, got {checkpoint_lr_value!r}"
+                )
+            checkpoint_lr = float(checkpoint_lr_value)
+            if not math.isfinite(checkpoint_lr):
+                raise RuntimeError(
+                    f"Invalid learning_rate in {meta_path}: expected finite number, got {checkpoint_lr_value!r}"
+                )
 
         self._prepare_session_for_explicit_load(
             effective_session_id,
@@ -8127,6 +8333,7 @@ class MegatronWorkerGroup:
                         effective_session_id,
                         reason="load_weights",
                         actor_name=_make_megatron_actor_name(self.base_model),
+                        checkpoint_path=load_path,
                     )
 
             self._step_count = checkpoint_step
@@ -8787,6 +8994,7 @@ class MegatronWorkerGroup:
                     session_id,
                     reason="load_weights",
                     actor_name=_make_megatron_actor_name(self.base_model),
+                    checkpoint_path=checkpoint_path,
                 )
             else:
                 clear_actor_only_state = getattr(session_manager, "clear_actor_only_state", None)

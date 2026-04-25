@@ -390,8 +390,78 @@ def test_issue_417_optim_step_marks_live_actor_weights_authoritative(tmp_path: P
 
     assert authority.weights_source.kind == "live_actor"
     assert authority.optimizer_source.kind == "live_actor"
-    assert authority.gradient_source.kind == "live_actor"
+    assert authority.gradient_source.kind == "none"
+    assert authority.gradient_source.actor_name is None
     assert authority.scheduler_source.kind == "live_actor"
+
+
+def test_issue_417_forward_backward_preserves_loaded_optimizer_authority(tmp_path: Path):
+    manager = MegatronSessionStateManager(base_path=str(tmp_path / "session_store"))
+    checkpoint_path = tmp_path / "loaded_checkpoint"
+    _write_training_checkpoint(checkpoint_path, size=128)
+    manager.prime_session(
+        "session_loaded_then_backward",
+        str(checkpoint_path),
+        step=5,
+        lr=2e-4,
+        actual_rank=8,
+        optimizer_restored=True,
+    )
+    manager.mark_external_checkpoint(
+        "session_loaded_then_backward",
+        checkpoint_path=str(checkpoint_path),
+        reason="load_checkpoint",
+        actor_name="actor-a",
+    )
+    manager.mark_actor_only_state(
+        "session_loaded_then_backward",
+        reason="load_weights",
+        actor_name="actor-a",
+    )
+    manager.mark_actor_only_state(
+        "session_loaded_then_backward",
+        reason="forward_backward",
+        actor_name="actor-a",
+    )
+
+    authority = manager.get_authority_record("session_loaded_then_backward")
+
+    assert authority.weights_source.kind == "checkpoint"
+    assert authority.optimizer_source.kind == "live_actor"
+    assert authority.gradient_source.kind == "live_actor"
+    assert authority.scheduler_source.kind == "none"
+    assert authority.scheduler_source.actor_name is None
+
+
+def test_issue_417_load_weights_marker_records_current_checkpoint_weights(tmp_path: Path):
+    manager = MegatronSessionStateManager(base_path=str(tmp_path / "session_store"))
+    old_checkpoint = tmp_path / "adapter_only_checkpoint"
+    new_checkpoint = tmp_path / "optimizer_checkpoint"
+    _write_training_checkpoint(old_checkpoint, size=128)
+    _write_training_checkpoint(new_checkpoint, size=256)
+    manager.prime_session(
+        "session_reloaded",
+        str(old_checkpoint),
+        step=0,
+        lr=1e-4,
+        actual_rank=8,
+        optimizer_restored=False,
+    )
+    manager.mark_actor_only_state(
+        "session_reloaded",
+        reason="load_weights",
+        actor_name="actor-a",
+        checkpoint_path=str(new_checkpoint),
+    )
+
+    authority = manager.get_authority_record("session_reloaded")
+
+    assert authority.weights_source.kind == "checkpoint"
+    assert authority.weights_source.path == str(new_checkpoint.resolve())
+    assert authority.weights_source.identity == manager.checkpoint_identity(str(new_checkpoint))
+    assert authority.optimizer_source.kind == "live_actor"
+    assert authority.gradient_source.kind == "none"
+    assert authority.scheduler_source.kind == "none"
 
 
 def test_issue_417_save_metadata_preserves_existing_train_flags(tmp_path: Path):
@@ -461,11 +531,46 @@ def test_issue_417_authority_record_keeps_live_actor_state_non_evictable(tmp_pat
     assert authority.weights_source.path == str(checkpoint_path)
     assert authority.optimizer_source.kind == "live_actor"
     assert authority.gradient_source.kind == "none"
+    assert authority.gradient_source.actor_name is None
     assert authority.scheduler_source.kind == "none"
+    assert authority.scheduler_source.actor_name is None
 
     usage = manager.get_cache_usage(actor_name="actor-a")
     assert usage["evictable_session_count"] == 0
     assert usage["actor_only_state_dirty_sessions"] == ["session_loaded"]
+
+
+def test_issue_417_actor_snapshot_manifest_records_exact_sources(tmp_path: Path):
+    manager = MegatronSessionStateManager(base_path=str(tmp_path / "session_store"))
+    session_path = Path(manager.get_session_path("session_snapshot"))
+    _write_adapter(session_path, size=128)
+    snapshot_dir = session_path / "actor_only_state"
+    snapshot_dir.mkdir()
+    rank_path = snapshot_dir / "rank_0.pt"
+    rank_path.write_bytes(b"snapshot")
+    manager.save_persisted_actor_only_state(
+        "session_snapshot",
+        actor_name="actor-a",
+        worker_entries=[
+            {
+                "rank": 0,
+                "path": str(rank_path),
+                "bytes": len(b"snapshot"),
+                "gradient_kind": "consumed",
+                "optimizer_state_present": True,
+                "scheduler_state_present": False,
+            }
+        ],
+    )
+
+    authority = manager.get_authority_record("session_snapshot")
+
+    assert authority.weights_source.kind == "session_cache"
+    assert authority.optimizer_source.kind == "actor_snapshot"
+    assert authority.gradient_source.kind == "none"
+    assert authority.gradient_source.manifest_path is None
+    assert authority.scheduler_source.kind == "none"
+    assert authority.scheduler_source.manifest_path is None
 
 
 def test_issue_414_load_checkpoint_without_optimizer_invalidates_existing_external_checkpoint(tmp_path: Path):

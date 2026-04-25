@@ -363,6 +363,32 @@ print(json.dumps(ray.get(probe.remote()), indent=2))
 PY'
 ```
 
+Ray client `working_dir` packaging:
+
+- In Ray client mode, detached actor creation may deserialize actor classes before
+  the `PYTHONPATH` runtime env is applied. If a detached actor fails with
+  `ModuleNotFoundError: No module named 'tinker_server'` even though the
+  `runtime_env` import probe passes, package the issue checkout into a PFS zip
+  and set `MINT_RAY_JOB_WORKING_DIR=file:///...zip` before starting the server.
+- Build the zip from the synced issue checkout, not from a stale shared tree.
+  Include the repo packages and runtime config needed for class import, for
+  example `tinker_server`, `scripts`, and `configs`.
+- Make the zip filename or URI versioned for every code change that affects
+  detached actors. Ray caches `working_dir` by URI; reusing the same URI can run
+  old actor code after a server restart.
+- This package is only for Ray client class distribution. It does not replace
+  unison; unison remains the source of truth for syncing the issue checkout to
+  PFS.
+
+Example:
+
+```bash
+ssh mint-dev 'cd /vePFS-Mindverse/share/code/$USER/tinker-server-issue-<ISSUE> && \
+  ZIP=/vePFS-Mindverse/share/code/$USER/tinker_server_issue<ISSUE>_working_dir_$(date +%s).zip && \
+  /usr/bin/python3 -m zipfile -c "$ZIP" tinker_server scripts configs && \
+  echo "export MINT_RAY_JOB_WORKING_DIR=file://$ZIP"'
+```
+
 Hard bans for isolated startup:
 
 - Do **not** invent a new startup command when one retry fails.

@@ -46,6 +46,10 @@ The current storage layout remains:
 - `{session_id}_external_checkpoint.json`
 - `{session_id}_checkpoint/actor_only_state_manifest.json`
 
+`actor_only_state.json` stores independent source fields for `weights`, `optimizer`, `gradient`, and `scheduler`. Do not collapse those fields back into a single dirty reason. A later `forward_backward` can make gradients actor-local without changing optimizer authority; a later `optim_step` makes weights, optimizer, and scheduler actor-local and consumes gradients.
+
+Actor snapshot manifests also store independent source fields. If a rank snapshot contains optimizer state but only a "consumed gradients" sentinel, the manifest records `optimizer=actor_snapshot`, `gradient=none`, and `scheduler=none` unless scheduler state was actually serialized.
+
 `MegatronSessionStateManager.get_authority_record(...)` is the single place that interprets those files. Cache recycling and future session-state checks should consume that record instead of re-reading sidecars with separate precedence rules.
 
 Cache recycling can delete an internal session cache only when the external checkpoint path still exists and contains optimizer state. If the external checkpoint disappears, the internal cache becomes the only known copy and must not be treated as cold-safe.
@@ -56,7 +60,11 @@ An external checkpoint marker without session metadata and checkpoint identity i
 
 After `load_state(..., optimizer=True)`, the session cache is primed from the loaded checkpoint, but optimizer authority remains in the live actor while `actor_only_state.json` exists. Gradient and scheduler authority remain `none` unless a later operation or actor snapshot actually creates them. The marker prevents the cache from being treated as a cold durable checkpoint.
 
+After `load_state(..., optimizer=False)`, `training_meta.json` is optional. If the file exists, `current_step` and `learning_rate` are validated strictly and used. If it is absent, step resets to `0`, the session learning rate is preserved, and optimizer, gradient, and scheduler authority are `none`.
+
 The loaded checkpoint's LoRA rank and train-target flags become the session's active LoRA configuration. The `/load_state` route must persist those metadata-derived flags back to the detached training-session store before resolving the future; otherwise an API restart can restore stale create-time defaults. Later Megatron operations must use those metadata-derived flags instead of the stale create-time request defaults.
+
+If `/load_state` mutates the live actor successfully but the detached training-session metadata mirror fails to persist afterward, the load future reports success with `metadata_persisted=false` and the error string. Reporting a failed load after actor state changed is a split-brain signal unless the implementation also rolls the actor back.
 
 The same persistence rule applies to `/create_model_from_state`: after checkpoint load, detached training-session metadata must use the session's post-load LoRA configuration, not the raw request payload.
 

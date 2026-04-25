@@ -43,6 +43,8 @@ from ..checkpoints import (
     begin_async_checkpoint_mirror,
     build_gateway_proxy_archive_path,
     build_persistent_cache_dir,
+    checkpoint_has_lora_weights,
+    checkpoint_has_openpi_training_state,
     checkpoint_has_optimizer_state,
     async_create_checkpoint_archive,
     ensure_checkpoint_path_allowed,
@@ -359,6 +361,19 @@ def _infer_train_flags_from_target_modules(target_modules: object) -> tuple[bool
     return bool(names & attn_names), bool(names & mlp_names), bool(names & unembed_names)
 
 
+def _read_checkpoint_json_object(path: str, *, label: str) -> dict[str, object]:
+    try:
+        with open(path, encoding="utf-8") as f:
+            payload = json.load(f)
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail=f"Malformed {label}: {e.msg}") from e
+    except OSError as e:
+        raise HTTPException(status_code=400, detail=f"Unable to read {label}: {e}") from e
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail=f"Invalid {label}: expected JSON object")
+    return payload
+
+
 @router.post("/weights_info", response_model=WeightsInfoResponse)
 async def weights_info(
     request: WeightsInfoRequest,
@@ -371,7 +386,6 @@ async def weights_info(
             user_id=user_id,
             is_admin=can_bypass_ownership(http_request),
         )
-        validate_checkpoint_dir(path, checkpoint_type="training")
     except PermissionError:
         raise HTTPException(status_code=403, detail="Access denied")
     except FileNotFoundError:
@@ -379,29 +393,32 @@ async def weights_info(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    if not os.path.isdir(path):
+        raise HTTPException(status_code=404, detail="Checkpoint not found")
+    if not checkpoint_has_lora_weights(path) and not checkpoint_has_openpi_training_state(path):
+        raise HTTPException(status_code=400, detail="Missing training weights in checkpoint")
+
     metadata_path = os.path.join(path, "metadata.json")
     adapter_cfg_path = os.path.join(path, "adapter_config.json")
     adapter_model_path = os.path.join(path, "adapter_model.safetensors")
 
     metadata: dict[str, object] = {}
     if os.path.exists(metadata_path):
-        with open(metadata_path, encoding="utf-8") as f:
-            loaded_metadata = json.load(f)
-        if isinstance(loaded_metadata, dict):
-            metadata = loaded_metadata
+        metadata = _read_checkpoint_json_object(metadata_path, label="metadata.json")
+
+    declared_type = metadata.get("checkpoint_type", metadata.get("type"))
+    if declared_type == "sampler" or "/sampler_weights/" in request.tinker_path:
+        raise HTTPException(status_code=400, detail="Sampler checkpoint cannot recreate a training client")
 
     adapter_cfg: dict[str, object] = {}
     if os.path.exists(adapter_cfg_path):
-        with open(adapter_cfg_path, encoding="utf-8") as f:
-            loaded_adapter_cfg = json.load(f)
-        if isinstance(loaded_adapter_cfg, dict):
-            adapter_cfg = loaded_adapter_cfg
+        adapter_cfg = _read_checkpoint_json_object(adapter_cfg_path, label="adapter_config.json")
 
     base_model = metadata.get("model_name")
     if not isinstance(base_model, str) or not base_model:
         base_model = adapter_cfg.get("base_model_name_or_path")
     if not isinstance(base_model, str) or not base_model:
-        raise HTTPException(status_code=500, detail="Checkpoint metadata missing base model")
+        raise HTTPException(status_code=400, detail="Checkpoint metadata missing base model")
 
     is_lora = bool(
         os.path.exists(adapter_cfg_path)
@@ -1583,11 +1600,28 @@ async def _do_load_state(
             await training_engine.create_training_session(session)
             await _load_state_once()
 
-        await _persist_loaded_training_session(session, user_id=user_id)
-        await future_store.async_resolve(request_id, {
+        metadata_persisted = True
+        metadata_persist_error = None
+        try:
+            await _persist_loaded_training_session(session, user_id=user_id)
+        except Exception as persist_exc:
+            metadata_persisted = False
+            metadata_persist_error = f"{type(persist_exc).__name__}: {persist_exc}"
+            logger.exception(
+                "[weights.load_state] detached metadata persistence failed after actor load succeeded: "
+                "request_id=%s model_id=%s error_type=%s",
+                str(request_id),
+                str(request.model_id),
+                type(persist_exc).__name__,
+            )
+        payload = {
             "path": request.path,
             "type": "load_weights",
-        })
+        }
+        if not metadata_persisted:
+            payload["metadata_persisted"] = False
+            payload["metadata_persist_error"] = metadata_persist_error
+        await future_store.async_resolve(request_id, payload)
 
     except Exception as e:
         logger.exception(
