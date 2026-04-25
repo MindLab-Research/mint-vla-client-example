@@ -311,6 +311,51 @@ def test_issue_193_megatron_explicit_load_prepare_allows_dirty_target_on_fresh_a
     assert group._current_session == "session_target"
 
 
+def test_issue_527_megatron_explicit_load_prepare_same_session_discards_target_actor_only_state(monkeypatch):
+    group_cls = MegatronWorkerGroup.__ray_actor_class__
+    group = group_cls.__new__(group_cls)
+    group._current_session = "session_target"
+    group.base_model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    group.learning_rate = 1e-4
+    group._step_count = 12
+    group._actual_rank = 8
+    group.lora_rank = 8
+    group._session_unknown_due_to_partial_swap = True
+
+    worker_clear_calls: list[tuple[str, object]] = []
+    clear_persisted_calls: list[str] = []
+    clear_actor_calls: list[str] = []
+
+    class _FakeWorker:
+        class clear_session_state:
+            @staticmethod
+            def remote(session_id, traceparent=None):
+                worker_clear_calls.append((session_id, traceparent))
+                return object()
+
+    group.workers = [_FakeWorker()]
+    group._session_manager = SimpleNamespace(
+        clear_persisted_actor_only_state=lambda session_id: clear_persisted_calls.append(session_id),
+        clear_actor_only_state=lambda session_id: clear_actor_calls.append(session_id),
+    )
+    group._bind_traceparent = lambda traceparent: None
+    group.save_adapter_state = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("same-session explicit load must not resave outgoing state")
+    )
+    group._swap_session_on_workers = lambda session_id: (_ for _ in ()).throw(
+        AssertionError("same-session explicit load must discard state instead of swapping")
+    )
+    monkeypatch.setattr(ray, "get", lambda refs, timeout=None: None)
+
+    group._prepare_session_for_explicit_load("session_target")
+
+    assert worker_clear_calls == [("session_target", None)]
+    assert clear_persisted_calls == ["session_target"]
+    assert clear_actor_calls == ["session_target"]
+    assert group._current_session == "session_target"
+    assert group._session_unknown_due_to_partial_swap is False
+
+
 def test_issue_193_megatron_forward_uses_ensure_session_loaded(monkeypatch):
     group_cls = MegatronWorkerGroup.__ray_actor_class__
     group = group_cls.__new__(group_cls)
