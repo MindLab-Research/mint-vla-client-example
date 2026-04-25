@@ -5,7 +5,6 @@ Checkpoint endpoints follow /internal/v1/checkpoints spec:
 - GET /checkpoints/{checkpoint_id}/archive: Download checkpoint as tar.gz
 """
 
-import json
 import logging
 import math
 import os
@@ -27,17 +26,12 @@ from ..checkpoint_index import (
     get_catalog_checkpoint,
     list_catalog_checkpoints,
 )
-from ..checkpoints import _iter_metadata_paths, get_persistent_search_roots, get_resolution_roots
-from ..config import config as server_config
 from ..health_checks import deep_healthz_response
 from ..logging_context import get_otel_tracer
 from ..queue_priority import merge_queue_priority_extra
 from ..ray_cluster_health import get_ray_cluster_health_snapshot
 from ..ray_gcs_metrics import get_ray_gcs_metrics_snapshot
 from ..usage_store import get_usage_store
-
-# Checkpoint directory (shared filesystem)
-CHECKPOINTS_DIR = server_config.checkpoint_dir
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -1390,185 +1384,6 @@ class CheckpointsListResponse(BaseModel):
     checkpoints: list[CheckpointInfo]
 
 
-def _get_dir_size(path: str) -> int:
-    """Calculate total size of directory."""
-    total = 0
-    for dirpath, _, filenames in os.walk(path):
-        for f in filenames:
-            try:
-                total += os.path.getsize(os.path.join(dirpath, f))
-            except OSError:
-                pass
-    return total
-
-
-def _checkpoint_rank(storage_tier: str | None) -> int:
-    if storage_tier == "persistent_tos":
-        return 2
-    if storage_tier == "persistent_cache":
-        return 1
-    return 0
-
-
-def _public_checkpoint_id(metadata: dict, *, is_admin: bool) -> str | None:
-    raw_checkpoint_id = metadata.get("checkpoint_id")
-    if not isinstance(raw_checkpoint_id, str) or not raw_checkpoint_id:
-        return None
-
-    model_id = metadata.get("model_id")
-    public_id = raw_checkpoint_id
-    if isinstance(model_id, str) and model_id:
-        public_id = f"{model_id}_{raw_checkpoint_id}"
-
-    if is_admin:
-        owner_id = metadata.get("owner_id")
-        owner = str(owner_id or "anonymous").strip() or "anonymous"
-        public_id = f"{owner}:{public_id}"
-
-    return public_id
-
-
-def _iter_checkpoint_entries(user_id: str | None, *, is_admin: bool = False):
-    for metadata_path in _iter_metadata_paths(
-        get_resolution_roots(primary_root=CHECKPOINTS_DIR),
-        user_id=user_id,
-        is_admin=is_admin,
-    ):
-        ckpt_path = os.path.dirname(metadata_path)
-        try:
-            with open(metadata_path) as f:
-                metadata = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            continue
-
-        owner_id = metadata.get("owner_id")
-        if not is_admin and owner_id != user_id:
-            continue
-
-        public_id = _public_checkpoint_id(metadata, is_admin=is_admin)
-        if public_id is None:
-            continue
-
-        yield metadata, ckpt_path, public_id
-
-
-def _looks_like_legacy_checkpoint_dir(path: str) -> bool:
-    try:
-        entries = os.listdir(path)
-    except OSError:
-        return False
-    for entry in entries:
-        if os.path.isfile(os.path.join(path, entry)):
-            return True
-    return False
-
-
-
-def _iter_legacy_checkpoint_entries(user_id: str | None, *, is_admin: bool = False):
-    """Yield metadata-less legacy checkpoints from the old /owner/checkpoint layout."""
-    seen: set[str] = set()
-    roots = get_persistent_search_roots(primary_root=CHECKPOINTS_DIR)
-
-    if is_admin:
-        top_level_dirs: list[tuple[str, str]] = []
-        for root in roots:
-            if not os.path.isdir(root):
-                continue
-            top_level_dirs.extend(
-                (root, d) for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))
-            )
-    else:
-        top_level_dirs = []
-        if user_id is None:
-            return
-        for root in roots:
-            user_dir = os.path.join(root, user_id)
-            if os.path.isdir(user_dir):
-                top_level_dirs.append((root, user_id))
-
-    for root, owner_dir in top_level_dirs:
-        top_path = os.path.join(root, owner_dir)
-        for sub_dir in os.listdir(top_path):
-            sub_path = os.path.join(top_path, sub_dir)
-            if not os.path.isdir(sub_path):
-                continue
-            if os.path.exists(os.path.join(sub_path, "metadata.json")):
-                continue
-            if not _looks_like_legacy_checkpoint_dir(sub_path):
-                continue
-
-            real = os.path.realpath(sub_path)
-            if real in seen:
-                continue
-            seen.add(real)
-
-            metadata = {
-                "checkpoint_id": f"{owner_dir}_{sub_dir}",
-                "owner_id": owner_dir,
-                "type": "training",
-            }
-            yield metadata, sub_path, metadata["checkpoint_id"]
-
-
-def _scan_checkpoints(
-    user_id: str | None,
-    *,
-    is_admin: bool = False,
-    exclude_public_ids: set[str] | None = None,
-) -> list[CheckpointInfo]:
-    """Scan metadata-backed checkpoints and return the newest visible entry per checkpoint_id."""
-    checkpoints_by_id: dict[str, tuple[int, CheckpointInfo]] = {}
-    excluded = exclude_public_ids or set()
-
-    for metadata, ckpt_path, public_id in list(_iter_checkpoint_entries(user_id, is_admin=is_admin)) + list(
-        _iter_legacy_checkpoint_entries(user_id, is_admin=is_admin)
-    ):
-        # Catalog-backed entries already have a cheaper source of truth.
-        # Skip their filesystem walk here and keep filesystem fallback only for
-        # uncataloged, legacy, or otherwise unshadowed checkpoint ids.
-        if public_id in excluded:
-            continue
-
-        model_name = metadata.get("model_name")
-        if not isinstance(model_name, str) or not model_name:
-            adapter_config_path = os.path.join(ckpt_path, "adapter_config.json")
-            if os.path.exists(adapter_config_path):
-                try:
-                    with open(adapter_config_path) as f:
-                        adapter_config = json.load(f)
-                    model_name = adapter_config.get("base_model_name_or_path") or "unknown"
-                except (json.JSONDecodeError, OSError):
-                    model_name = "unknown"
-            else:
-                model_name = "unknown"
-
-        created_at = metadata.get("created_at")
-        if not isinstance(created_at, str) or not created_at:
-            try:
-                mtime = os.path.getmtime(ckpt_path)
-                created_at = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
-            except OSError:
-                created_at = datetime.now(timezone.utc).isoformat()
-
-        ckpt_type = metadata.get("checkpoint_type") or metadata.get("type") or "training"
-        size_bytes = _get_dir_size(ckpt_path)
-        info = CheckpointInfo(
-            checkpoint_id=public_id,
-            model_name=model_name,
-            created_at=created_at,
-            type=ckpt_type,
-            size_bytes=size_bytes,
-        )
-        rank = _checkpoint_rank(metadata.get("storage_tier"))
-        current = checkpoints_by_id.get(public_id)
-        if current is None or rank >= current[0]:
-            checkpoints_by_id[public_id] = (rank, info)
-
-    checkpoints = [entry[1] for entry in checkpoints_by_id.values()]
-    checkpoints.sort(key=lambda x: x.created_at, reverse=True)
-    return checkpoints
-
-
 def _catalog_timestamp_text(row: dict[str, Any]) -> str:
     for key in ("checkpoint_created_at", "published_at", "updated_at"):
         value = row.get(key)
@@ -1619,31 +1434,13 @@ def _catalog_checkpoint_path(row: dict[str, Any]) -> str | None:
     return candidate_real
 
 
-def _catalog_filesystem_ids(row: dict[str, Any], *, is_admin: bool) -> list[str]:
-    model_id = row.get("model_id")
-    raw_checkpoint_id = row.get("raw_checkpoint_id")
-    if not isinstance(raw_checkpoint_id, str) or not raw_checkpoint_id:
-        raw_checkpoint_id = row.get("checkpoint_id")
-    if not isinstance(model_id, str) or not model_id:
-        return []
-    if not isinstance(raw_checkpoint_id, str) or not raw_checkpoint_id:
-        return []
-
-    ids = [f"{model_id}_{raw_checkpoint_id}"]
-    owner = str(row.get("owner_id") or "anonymous").strip() or "anonymous"
-    if is_admin:
-        ids.append(f"{owner}:{ids[0]}")
-    return ids
-
-
 async def _scan_checkpoints_from_catalog(
     user_id: str | None,
     *,
     is_admin: bool = False,
-) -> tuple[list[CheckpointInfo], set[str]]:
+) -> list[CheckpointInfo]:
     rows = await list_catalog_checkpoints(owner_id=user_id, is_admin=is_admin)
     checkpoints: list[CheckpointInfo] = []
-    shadow_fs_ids: set[str] = set()
     for row in rows:
         raw_ckpt_id = row.get("ckpt_id")
         # asyncpg returns PostgreSQL UUID columns as uuid.UUID, not str.
@@ -1676,10 +1473,9 @@ async def _scan_checkpoints_from_catalog(
                 size_bytes=max(0, size),
             )
         )
-        shadow_fs_ids.update(_catalog_filesystem_ids(row, is_admin=is_admin))
 
     checkpoints.sort(key=lambda x: x.created_at, reverse=True)
-    return checkpoints, shadow_fs_ids
+    return checkpoints
 
 
 async def _resolve_catalog_checkpoint_entry(
@@ -1707,61 +1503,6 @@ async def _resolve_catalog_checkpoint_entry(
     return ckpt_path, metadata
 
 
-def _resolve_checkpoint_entry(
-    checkpoint_id: str,
-    *,
-    user_id: str | None,
-    is_admin: bool,
-    expected_checkpoint_type: str | None = None,
-) -> tuple[str, dict] | None:
-    def _matches_checkpoint_type(metadata: dict) -> bool:
-        if expected_checkpoint_type not in ("training", "sampler"):
-            return True
-        checkpoint_type = metadata.get("checkpoint_type") or metadata.get("type")
-        return checkpoint_type == expected_checkpoint_type
-
-    def _collect(scope_user_id: str | None, scope_is_admin: bool, *, allow_raw: bool) -> list[tuple[int, str, str, dict]]:
-        matches: list[tuple[int, str, str, dict]] = []
-        for metadata, ckpt_path, public_id in _iter_checkpoint_entries(scope_user_id, is_admin=scope_is_admin):
-            if not _matches_checkpoint_type(metadata):
-                continue
-            raw_checkpoint_id = metadata.get("checkpoint_id")
-            user_public_id = _public_checkpoint_id(metadata, is_admin=False)
-            if public_id == checkpoint_id or user_public_id == checkpoint_id:
-                matches.append((_checkpoint_rank(metadata.get("storage_tier")), public_id, ckpt_path, metadata))
-                continue
-            if allow_raw and isinstance(raw_checkpoint_id, str) and raw_checkpoint_id == checkpoint_id:
-                matches.append((_checkpoint_rank(metadata.get("storage_tier")), public_id, ckpt_path, metadata))
-        return matches
-
-    matches = _collect(user_id, is_admin, allow_raw=not is_admin)
-    if not matches:
-        for metadata, ckpt_path, public_id in _iter_legacy_checkpoint_entries(user_id, is_admin=is_admin):
-            if not _matches_checkpoint_type(metadata):
-                continue
-            if public_id == checkpoint_id:
-                matches.append((0, public_id, ckpt_path, metadata))
-
-    if not matches and not is_admin:
-        matches = _collect(None, True, allow_raw=False)
-        if not matches:
-            for metadata, ckpt_path, public_id in _iter_legacy_checkpoint_entries(None, is_admin=True):
-                if not _matches_checkpoint_type(metadata):
-                    continue
-                if public_id == checkpoint_id:
-                    matches.append((0, public_id, ckpt_path, metadata))
-    if not matches:
-        return None
-
-    public_ids = {match[1] for match in matches}
-    if len(public_ids) > 1:
-        return None
-
-    matches.sort(key=lambda item: item[0], reverse=True)
-    _, _, ckpt_path, metadata = matches[0]
-    return ckpt_path, metadata
-
-
 @router.get("/v1/checkpoints", response_model=CheckpointsListResponse)
 async def list_checkpoints(request: Request):
     """List all checkpoints for the authenticated user.
@@ -1781,7 +1522,7 @@ async def list_checkpoints(request: Request):
     try:
         # Catalog-backed list avoids recursively sizing uncataloged
         # filesystem checkpoints, which is too slow for prod list calls.
-        catalog_checkpoints, _shadow_fs_ids = await _scan_checkpoints_from_catalog(
+        catalog_checkpoints = await _scan_checkpoints_from_catalog(
             user_id,
             is_admin=is_admin,
         )

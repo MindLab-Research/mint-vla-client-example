@@ -536,52 +536,6 @@ async def async_create_checkpoint_archive(
         raise
 
 
-def _iter_metadata_paths(
-    roots: list[str],
-    *,
-    user_id: str | None = None,
-    is_admin: bool = False,
-) -> list[str]:
-    patterns: list[str] = []
-    if user_id and not is_admin:
-        base = os.path.join("", checkpoint_owner_dir(user_id))
-        prefixes = [base]
-    else:
-        prefixes = ["*", ""]
-
-    for root in roots:
-        if not os.path.exists(root):
-            continue
-        for prefix in prefixes:
-            if prefix:
-                patterns.extend(
-                    [
-                        os.path.join(root, prefix, "*", "metadata.json"),
-                        os.path.join(root, prefix, "*", "*", "metadata.json"),
-                        os.path.join(root, prefix, "*", "*", "*", "metadata.json"),
-                    ]
-                )
-            else:
-                patterns.extend(
-                    [
-                        os.path.join(root, "*", "metadata.json"),
-                        os.path.join(root, "*", "*", "metadata.json"),
-                        os.path.join(root, "*", "*", "*", "metadata.json"),
-                    ]
-                )
-
-    out: list[str] = []
-    seen: set[str] = set()
-    for pattern in patterns:
-        for metadata_path in glob.glob(pattern):
-            real = os.path.realpath(metadata_path)
-            if real in seen:
-                continue
-            seen.add(real)
-            out.append(metadata_path)
-    return out
-
-
 def _scoped_checkpoint_owner_dir(user_id: str | None, *, is_admin: bool) -> str:
     raw = str(user_id or "").strip()
     if is_admin and not raw:

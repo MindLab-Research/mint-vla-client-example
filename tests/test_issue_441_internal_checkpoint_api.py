@@ -28,11 +28,6 @@ def _make_app(user_data: dict) -> TestClient:
 
 def test_issue_441_internal_checkpoint_list_requires_catalog(monkeypatch) -> None:
     monkeypatch.setattr(internal_routes, "checkpoint_index_enabled", lambda: False)
-    monkeypatch.setattr(
-        internal_routes,
-        "_scan_checkpoints",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("filesystem list fallback not expected")),
-    )
 
     client = _make_app({"user_id": "owner-a", "user_role": "user"})
     resp = client.get("/internal/v1/checkpoints")
@@ -63,11 +58,6 @@ def test_issue_441_internal_checkpoint_list_uses_catalog_when_available(monkeypa
 
     monkeypatch.setattr(internal_routes, "checkpoint_index_enabled", lambda: True)
     monkeypatch.setattr(internal_routes, "list_catalog_checkpoints", _list_catalog_checkpoints)
-    monkeypatch.setattr(
-        internal_routes,
-        "_scan_checkpoints",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("filesystem list fallback not expected")),
-    )
 
     client = _make_app({"user_id": "owner-a", "user_role": "user"})
     resp = client.get("/internal/v1/checkpoints")
@@ -98,6 +88,7 @@ def test_issue_441_internal_checkpoint_list_accepts_uuid_catalog_ids(monkeypatch
 
     monkeypatch.setattr(internal_routes, "checkpoint_index_enabled", lambda: True)
     monkeypatch.setattr(internal_routes, "list_catalog_checkpoints", _list_catalog_checkpoints)
+
     client = _make_app({"user_id": "owner-a", "user_role": "user"})
     resp = client.get("/internal/v1/checkpoints")
     assert resp.status_code == 200, resp.text
@@ -112,11 +103,6 @@ def test_issue_441_internal_checkpoint_list_returns_503_when_catalog_query_fails
 
     monkeypatch.setattr(internal_routes, "checkpoint_index_enabled", lambda: True)
     monkeypatch.setattr(internal_routes, "_scan_checkpoints_from_catalog", _scan_checkpoints_from_catalog)
-    monkeypatch.setattr(
-        internal_routes,
-        "_scan_checkpoints",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("filesystem list fallback not expected")),
-    )
 
     client = _make_app({"user_id": "owner-a", "user_role": "user"})
     resp = client.get("/internal/v1/checkpoints")
@@ -148,11 +134,6 @@ def test_issue_441_internal_checkpoint_archive_uses_catalog_entry(monkeypatch, t
 
     monkeypatch.setattr(internal_routes, "checkpoint_index_enabled", lambda: True)
     monkeypatch.setattr(internal_routes, "get_catalog_checkpoint", _get_catalog_checkpoint)
-    monkeypatch.setattr(
-        internal_routes,
-        "_resolve_checkpoint_entry",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("filesystem fallback not expected")),
-    )
 
     client = _make_app({"user_id": "owner-a", "user_role": "user"})
     resp = client.get("/internal/v1/checkpoints/5d6fbbf8-6c5b-4e91-8e9f-f7e51f0d7d11/archive")
@@ -183,11 +164,6 @@ def test_issue_441_internal_checkpoint_archive_returns_404_when_catalog_path_mis
 
     monkeypatch.setattr(internal_routes, "checkpoint_index_enabled", lambda: True)
     monkeypatch.setattr(internal_routes, "get_catalog_checkpoint", _get_catalog_checkpoint)
-    monkeypatch.setattr(
-        internal_routes,
-        "_resolve_checkpoint_entry",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("filesystem fallback not expected")),
-    )
 
     client = _make_app({"user_id": "owner-a", "user_role": "user"})
     resp = client.get("/internal/v1/checkpoints/catalog-id/archive")
@@ -197,11 +173,6 @@ def test_issue_441_internal_checkpoint_archive_returns_404_when_catalog_path_mis
 
 def test_issue_441_internal_checkpoint_archive_requires_catalog(monkeypatch) -> None:
     monkeypatch.setattr(internal_routes, "checkpoint_index_enabled", lambda: False)
-    monkeypatch.setattr(
-        internal_routes,
-        "_resolve_checkpoint_entry",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("filesystem fallback not expected")),
-    )
 
     client = _make_app({"user_id": "owner-a", "user_role": "user"})
     resp = client.get("/internal/v1/checkpoints/catalog-id/archive")
