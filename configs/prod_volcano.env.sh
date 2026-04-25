@@ -77,11 +77,7 @@ else
   return 1 2>/dev/null || exit 1
 fi
 
-# Bump detached queue actor names after node-pin changes so long-lived queue workers
-# reload the current MINT_*_NODE_IPS_JSON values instead of reusing stale env.
-export MINT_API_WORK_QUEUE_ACTOR_NAME=tinker_api_work_queue_v20260425a
-export MINT_QUEUE_EXECUTION_RUNTIME_ACTOR_NAME=tinker_queue_execution_runtime_v20260425a
-export MINT_QUEUE_SUPERVISOR_ACTOR_NAME=tinker_queue_supervisor_v20260425a
+export MINT_API_WORK_QUEUE_ACTOR_NAME=tinker_api_work_queue_v20260309
 export MINT_API_WORK_QUEUE_ACTOR_MAX_CONCURRENCY=1024
 
 export PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/mint-runtime-py31213

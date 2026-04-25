@@ -293,7 +293,11 @@ def _get_or_create_actor():
 
     try:
         created = _OwnerRuntimeSupervisorActor.options(**options).remote()
-        _ACTOR_HANDLE = created
+        try:
+            ray.get(created.health_snapshot.remote())
+            _ACTOR_HANDLE = created
+        except Exception:
+            _ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)
         return _ACTOR_HANDLE
     except Exception:
         _ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)

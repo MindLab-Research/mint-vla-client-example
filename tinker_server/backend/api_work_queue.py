@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -26,9 +27,39 @@ from ..logging_context import (
     set_trace_id,
 )
 from ..queue_priority import QUEUE_PRIORITY_AGING_S, effective_queue_priority, normalize_queue_priority
+from ..server_info import _git_sha
 from .work_classification import infer_scheduler_capacity_owner
 
 logger = logging.getLogger(__name__)
+CURRENT_CODE_IDENTITY = os.environ.get("MINT_GIT_SHA") or _git_sha()
+
+
+def _api_work_queue_runtime_contract_payload() -> dict[str, Any]:
+    return {
+        "actor_name": _ray_api_work_queue_actor_name(),
+        "namespace": _ray_namespace(),
+        "code_identity": CURRENT_CODE_IDENTITY,
+        "pinned_node_ip": str(os.environ.get("MINT_API_WORK_QUEUE_PINNED_NODE_IP") or "").strip(),
+        "max_concurrency": int(os.environ.get("MINT_API_WORK_QUEUE_ACTOR_MAX_CONCURRENCY", "256")),
+        "max_restarts": int(os.environ.get("MINT_API_WORK_QUEUE_MAX_RESTARTS", "3")),
+        "debug_max": int(os.environ.get("MINT_API_WORK_QUEUE_DEBUG_MAX", "50")),
+        "sched_debug_max": str(os.environ.get("MINT_API_WORK_QUEUE_SCHED_DEBUG_MAX", "")).strip(),
+        "eta_alpha": str(os.environ.get("MINT_API_WORK_QUEUE_ETA_ALPHA", "0.1")).strip(),
+        "scheduler_enabled": str(os.environ.get("MINT_SCHEDULER_ENABLE", "1")).strip(),
+        "scheduler_max_consecutive": str(os.environ.get("MINT_SCHEDULER_MAX_CONSECUTIVE", "8")).strip(),
+        "scheduler_fairness": str(os.environ.get("MINT_SCHEDULER_FAIRNESS", "oldest")).strip(),
+        "scheduler_starvation_s": str(os.environ.get("MINT_SCHEDULER_STARVATION_S", "30")).strip(),
+        "scheduler_coalesce_ms": str(os.environ.get("MINT_SCHEDULER_COALESCE_MS", "20")).strip(),
+        "sampling_max_pending_asample_per_apikey": int(
+            getattr(server_config, "sampling_max_pending_asample_per_apikey", 64)
+        ),
+    }
+
+
+def _api_work_queue_runtime_contract_digest() -> str:
+    payload = _api_work_queue_runtime_contract_payload()
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _api_work_queue_debug_log_path() -> str:
@@ -171,6 +202,18 @@ class _ExecutionSerialState:
     refs: int = 0
 
 
+def _kill_ray_actor(actor: Any, *, reason: str) -> None:
+    from . import ray_kill
+
+    ray_kill.kill(
+        actor,
+        reason=reason,
+        actor_name=_ray_api_work_queue_actor_name(),
+        namespace=_ray_namespace(),
+        no_restart=True,
+        verify_absent=True,
+    )
+
 
 def _create_ray_actor(*, require_ready: bool = True):
     import ray
@@ -191,6 +234,8 @@ def _create_ray_actor(*, require_ready: bool = True):
                     "[api_work_queue] actor (re)initializing (max_restarts=%d)",
                     max_restarts,
                 )
+                self._code_identity = CURRENT_CODE_IDENTITY
+                self._runtime_contract_digest = _api_work_queue_runtime_contract_digest()
                 self._items = deque()
                 self._cv = asyncio.Condition()
                 self._enqueued = 0
@@ -1417,6 +1462,10 @@ def _create_ray_actor(*, require_ready: bool = True):
                 by_executor[executor] = int(by_executor.get(executor, 0)) + 1
             scheduler_metrics_ready = bool(self._active_job_id)
             return {
+                "actor_name": _ray_api_work_queue_actor_name(),
+                "namespace": _ray_namespace(),
+                "code_identity": self._code_identity,
+                "runtime_contract_digest": self._runtime_contract_digest,
                 "depth": int(depth_legacy + depth_scheduled),
                 "depth_legacy": int(depth_legacy),
                 "depth_scheduled": int(depth_scheduled),
@@ -1684,6 +1733,7 @@ Executor = Callable[[WorkItem], Awaitable[None]]
 class ApiWorkQueueClient:
     def __init__(self) -> None:
         self._ray_actor = None
+        self._runtime_contract_verified = False
         self._executors: dict[str, Executor] = {}
         self._worker_tasks: list[Any] = []
         self._queue_supervisor_task: asyncio.Task | None = None
@@ -1717,6 +1767,49 @@ class ApiWorkQueueClient:
 
     def _reset_ray_actor(self) -> None:
         self._ray_actor = None
+        self._runtime_contract_verified = False
+
+    @staticmethod
+    def _runtime_contract_matches(snapshot: dict[str, Any]) -> bool:
+        if snapshot.get("code_identity") != CURRENT_CODE_IDENTITY:
+            return False
+        return snapshot.get("runtime_contract_digest") == _api_work_queue_runtime_contract_digest()
+
+    def _ensure_runtime_contract_sync(self, actor: Any, snapshot: dict[str, Any]) -> Any:
+        if self._runtime_contract_matches(snapshot):
+            self._runtime_contract_verified = True
+            return actor
+        self._reset_ray_actor()
+        _kill_ray_actor(actor, reason="api_work_queue_runtime_contract_mismatch")
+        import ray
+
+        fresh = _create_ray_actor(require_ready=True)
+        refreshed = ray.get(fresh.stats.remote(), timeout=5.0)
+        if not isinstance(refreshed, dict) or not self._runtime_contract_matches(refreshed):
+            raise RuntimeError(
+                "api_work_queue runtime contract mismatch after recreate: "
+                f"snapshot={refreshed!r}"
+            )
+        self._ray_actor = fresh
+        self._runtime_contract_verified = True
+        return fresh
+
+    async def _ensure_runtime_contract_async(self, actor: Any, snapshot: dict[str, Any]) -> Any:
+        if self._runtime_contract_matches(snapshot):
+            self._runtime_contract_verified = True
+            return actor
+        self._reset_ray_actor()
+        await asyncio.to_thread(_kill_ray_actor, actor, reason="api_work_queue_runtime_contract_mismatch")
+        fresh = _create_ray_actor(require_ready=True)
+        refreshed = await self._await_ray_ref(fresh.stats.remote(), timeout_s=5.0)
+        if not isinstance(refreshed, dict) or not self._runtime_contract_matches(refreshed):
+            raise RuntimeError(
+                "api_work_queue runtime contract mismatch after recreate: "
+                f"snapshot={refreshed!r}"
+            )
+        self._ray_actor = fresh
+        self._runtime_contract_verified = True
+        return fresh
 
     @staticmethod
     def _scheduler_metrics_view(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -1865,10 +1958,13 @@ class ApiWorkQueueClient:
             if not require_ready:
                 return actor
             try:
-                ray.get(actor.stats.remote(), timeout=1.0)
+                stats = ray.get(actor.stats.remote(), timeout=1.0)
+                if not isinstance(stats, dict):
+                    raise TypeError(f"ApiWorkQueue.stats returned non-dict: {type(stats)}")
+                actor = self._ensure_runtime_contract_sync(actor, stats)
                 return actor
             except Exception:
-                self._ray_actor = None
+                self._reset_ray_actor()
 
         actor = None
         try:
@@ -1876,7 +1972,10 @@ class ApiWorkQueueClient:
             if not require_ready:
                 self._ray_actor = actor
                 return actor
-            ray.get(actor.stats.remote(), timeout=probe_timeout_s)
+            stats = ray.get(actor.stats.remote(), timeout=probe_timeout_s)
+            if not isinstance(stats, dict):
+                raise TypeError(f"ApiWorkQueue.stats returned non-dict: {type(stats)}")
+            actor = self._ensure_runtime_contract_sync(actor, stats)
             self._ray_actor = actor
             return actor
         except ValueError:
@@ -1919,6 +2018,7 @@ class ApiWorkQueueClient:
 
         try:
             self._ray_actor = _create_ray_actor(require_ready=require_ready)
+            self._runtime_contract_verified = bool(require_ready)
         except Exception as e:
             raise ApiWorkQueueUnavailableError("Failed to get/create detached Ray ApiWorkQueue actor") from e
         return self._ray_actor
@@ -2093,11 +2193,15 @@ class ApiWorkQueueClient:
                 _append_api_work_queue_debug("get_ray_actor_async_return_cached", require_ready=False)
                 return self._ray_actor
             try:
-                await self._await_ray_ref(self._ray_actor.stats.remote(), timeout_s=1.0)
-                await _ensure_active_job_binding(self._ray_actor, timeout_s=5.0)
-                return self._ray_actor
+                stats = await self._await_ray_ref(self._ray_actor.stats.remote(), timeout_s=1.0)
+                if not isinstance(stats, dict):
+                    raise TypeError(f"ApiWorkQueue.stats returned non-dict: {type(stats)}")
+                actor = await self._ensure_runtime_contract_async(self._ray_actor, stats)
+                await _ensure_active_job_binding(actor, timeout_s=5.0)
+                self._ray_actor = actor
+                return actor
             except Exception:
-                self._ray_actor = None
+                self._reset_ray_actor()
 
         actor_name = _ray_api_work_queue_actor_name()
         probe_timeout_s = float(os.environ.get("MINT_API_WORK_QUEUE_PROBE_TIMEOUT_S", "1.0"))
@@ -2113,7 +2217,10 @@ class ApiWorkQueueClient:
                 self._ray_actor = actor
                 _append_api_work_queue_debug("get_ray_actor_async_found_existing", require_ready=False)
                 return actor
-            await self._await_ray_ref(actor.stats.remote(), timeout_s=probe_timeout_s)
+            stats = await self._await_ray_ref(actor.stats.remote(), timeout_s=probe_timeout_s)
+            if not isinstance(stats, dict):
+                raise TypeError(f"ApiWorkQueue.stats returned non-dict: {type(stats)}")
+            actor = await self._ensure_runtime_contract_async(actor, stats)
             await _ensure_active_job_binding(actor, timeout_s=max(5.0, probe_timeout_s))
             self._ray_actor = actor
             return actor
@@ -2157,6 +2264,7 @@ class ApiWorkQueueClient:
 
         try:
             self._ray_actor = _create_ray_actor(require_ready=require_ready)
+            self._runtime_contract_verified = bool(require_ready)
             _append_api_work_queue_debug(
                 "get_ray_actor_async_created",
                 require_ready=bool(require_ready),
@@ -2198,7 +2306,7 @@ class ApiWorkQueueClient:
             raise ray.exceptions.GetTimeoutError(f"timed out after {float(timeout_s):.3f}s") from e
 
     async def async_ensure_started(self) -> None:
-        await self._get_ray_actor_async(require_ready=False)
+        await self._get_ray_actor_async(require_ready=True)
 
     async def async_ensure_ready(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
         actor = await self._get_ray_actor_async(require_ready=False)
