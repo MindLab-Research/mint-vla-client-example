@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import hashlib
 import json
 import logging
@@ -213,6 +214,24 @@ def _kill_ray_actor(actor: Any, *, reason: str) -> None:
         no_restart=True,
         verify_absent=True,
     )
+
+
+def _await_ray_ref_sync(ref: Any, *, timeout_s: float | None = None) -> Any:
+    if hasattr(ref, "__await__"):
+        coro = ref
+        if timeout_s is None:
+            return asyncio.run(coro)
+        return asyncio.run(asyncio.wait_for(coro, timeout=float(timeout_s)))
+    to_future = getattr(ref, "future", None)
+    if callable(to_future):
+        fut = to_future()
+        if isinstance(fut, concurrent.futures.Future):
+            return fut.result(timeout=timeout_s)
+        if isinstance(fut, asyncio.Future) or hasattr(fut, "__await__"):
+            if timeout_s is None:
+                return asyncio.run(fut)
+            return asyncio.run(asyncio.wait_for(fut, timeout=float(timeout_s)))
+    return ref
 
 
 def _create_ray_actor(*, require_ready: bool = True):
@@ -1658,7 +1677,7 @@ def _create_ray_actor(*, require_ready: bool = True):
     if not require_ready:
         return created
     try:
-        ray.get(created.stats.remote(), timeout=1.0)
+        _await_ray_ref_sync(created.stats.remote(), timeout_s=1.0)
         _append_api_work_queue_debug("driver_create_ready_ok")
         return created
     except Exception as e:
@@ -1685,7 +1704,7 @@ def _get_or_create_ray_actor():
         # Quick liveness probe: if the actor is mid-restart, stats() will hang
         # until Ray finishes re-initializing it. Use a short timeout so the
         # request path fails fast with 503 instead of blocking.
-        ray.get(actor.stats.remote(), timeout=probe_timeout_s)
+        _await_ray_ref_sync(actor.stats.remote(), timeout_s=probe_timeout_s)
         return actor
     except ValueError:
         logger.info("[api_work_queue] actor %s not found; creating", actor_name)
@@ -1784,7 +1803,7 @@ class ApiWorkQueueClient:
         import ray
 
         fresh = _create_ray_actor(require_ready=True)
-        refreshed = ray.get(fresh.stats.remote(), timeout=5.0)
+        refreshed = _await_ray_ref_sync(fresh.stats.remote(), timeout_s=5.0)
         if not isinstance(refreshed, dict) or not self._runtime_contract_matches(refreshed):
             raise RuntimeError(
                 "api_work_queue runtime contract mismatch after recreate: "
@@ -1958,7 +1977,7 @@ class ApiWorkQueueClient:
             if not require_ready:
                 return actor
             try:
-                stats = ray.get(actor.stats.remote(), timeout=1.0)
+                stats = _await_ray_ref_sync(actor.stats.remote(), timeout_s=1.0)
                 if not isinstance(stats, dict):
                     raise TypeError(f"ApiWorkQueue.stats returned non-dict: {type(stats)}")
                 actor = self._ensure_runtime_contract_sync(actor, stats)
@@ -1972,7 +1991,7 @@ class ApiWorkQueueClient:
             if not require_ready:
                 self._ray_actor = actor
                 return actor
-            stats = ray.get(actor.stats.remote(), timeout=probe_timeout_s)
+            stats = _await_ray_ref_sync(actor.stats.remote(), timeout_s=probe_timeout_s)
             if not isinstance(stats, dict):
                 raise TypeError(f"ApiWorkQueue.stats returned non-dict: {type(stats)}")
             actor = self._ensure_runtime_contract_sync(actor, stats)
@@ -2036,7 +2055,7 @@ class ApiWorkQueueClient:
         try:
             import ray
 
-            payload = ray.get(actor.metrics_seed_snapshot.remote(), timeout=float(timeout_s))
+            payload = _await_ray_ref_sync(actor.metrics_seed_snapshot.remote(), timeout_s=float(timeout_s))
         except Exception as e:
             logger.warning(
                 "[api_work_queue] metrics snapshot hydration failed: %s: %s",
@@ -2299,8 +2318,8 @@ class ApiWorkQueueClient:
                 return await awaitable
             return await asyncio.wait_for(awaitable, timeout=float(timeout_s))
         except asyncio.TimeoutError as e:
-            # Preserve the previous surface where timeout on ray.get(...) raised
-            # a Ray GetTimeoutError instead of asyncio.TimeoutError.
+            # Preserve the previous surface where a timed-out Ray ref probe raised
+            # Ray GetTimeoutError instead of asyncio.TimeoutError.
             import ray
 
             raise ray.exceptions.GetTimeoutError(f"timed out after {float(timeout_s):.3f}s") from e

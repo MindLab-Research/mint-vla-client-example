@@ -210,6 +210,24 @@ def _kill_named_actor(actor: Any) -> None:
     )
 
 
+def _await_ray_ref_sync(ref: Any, *, timeout_s: float | None = None) -> Any:
+    if hasattr(ref, "__await__"):
+        coro = ref
+        if timeout_s is None:
+            return asyncio.run(coro)
+        return asyncio.run(asyncio.wait_for(coro, timeout=float(timeout_s)))
+    to_future = getattr(ref, "future", None)
+    if callable(to_future):
+        fut = to_future()
+        if isinstance(fut, concurrent.futures.Future):
+            return fut.result(timeout=timeout_s)
+        if isinstance(fut, asyncio.Future) or hasattr(fut, "__await__"):
+            if timeout_s is None:
+                return asyncio.run(fut)
+            return asyncio.run(asyncio.wait_for(fut, timeout=float(timeout_s)))
+    return ref
+
+
 async def _restore_sampling_sessions_for_worker(inference_manager) -> int:
     from .sampling_session_store import async_list_sampling_sessions
 
@@ -516,7 +534,7 @@ def _get_or_create_actor():
     try:
         created = _QueueExecutionRuntimeActor.options(**options).remote()
         try:
-            ray.get(created.health_snapshot.remote())
+            _await_ray_ref_sync(created.health_snapshot.remote(), timeout_s=15.0)
             _ACTOR_HANDLE = created
         except Exception:
             _ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)

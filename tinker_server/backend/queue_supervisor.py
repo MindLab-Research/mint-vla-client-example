@@ -94,6 +94,24 @@ def _kill_named_actor(actor: Any) -> None:
     )
 
 
+def _await_ray_ref_sync(ref: Any, *, timeout_s: float | None = None) -> Any:
+    if hasattr(ref, "__await__"):
+        coro = ref
+        if timeout_s is None:
+            return asyncio.run(coro)
+        return asyncio.run(asyncio.wait_for(coro, timeout=float(timeout_s)))
+    to_future = getattr(ref, "future", None)
+    if callable(to_future):
+        fut = to_future()
+        if isinstance(fut, concurrent.futures.Future):
+            return fut.result(timeout=timeout_s)
+        if isinstance(fut, asyncio.Future) or hasattr(fut, "__await__"):
+            if timeout_s is None:
+                return asyncio.run(fut)
+            return asyncio.run(asyncio.wait_for(fut, timeout=float(timeout_s)))
+    return ref
+
+
 def _get_or_create_actor():
     import ray
 
@@ -213,7 +231,7 @@ def _get_or_create_actor():
     try:
         created = _QueueSupervisorActor.options(**options).remote()
         try:
-            ray.get(created.snapshot.remote())
+            _await_ray_ref_sync(created.snapshot.remote(), timeout_s=15.0)
             _ACTOR_HANDLE = created
         except Exception:
             _ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)
@@ -351,9 +369,9 @@ class QueueSupervisor:
 
         actor = self._get_ray_actor()
         return bool(
-            ray.get(
+            _await_ray_ref_sync(
                 actor.is_generation_current.remote(owner_id=self._owner_id, generation_id=int(generation_id)),
-                timeout=float(timeout_s),
+                timeout_s=float(timeout_s),
             )
         )
 
@@ -361,7 +379,7 @@ class QueueSupervisor:
         import ray
 
         actor = self._get_ray_actor()
-        out = ray.get(actor.snapshot.remote(), timeout=float(timeout_s))
+        out = _await_ray_ref_sync(actor.snapshot.remote(), timeout_s=float(timeout_s))
         if not isinstance(out, dict):
             raise TypeError(f"QueueSupervisor.snapshot returned non-dict: {type(out)}")
         return out
