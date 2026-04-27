@@ -842,7 +842,7 @@ def test_issue_417_load_state_persists_loaded_lora_config(tmp_path: Path, monkey
     monkeypatch.setattr(training_store_module, "async_upsert_training_session", _async_upsert_training_session)
 
     req = LoadStateRequest(model_id="model-417", path=str(checkpoint_dir), optimizer=False)
-    asyncio.run(weights_routes._do_load_state("req-417-load", req, user_id="user-417"))
+    asyncio.run(weights_routes._do_load_state("req-417-load", req, user_id="admin-user"))
 
     assert future_store.resolved == [
         ("req-417-load", {"path": str(checkpoint_dir), "type": "load_weights"})
@@ -868,7 +868,7 @@ def test_issue_417_load_state_persists_loaded_lora_config(tmp_path: Path, monkey
             "backend": "megatron",
             "actor_name": "megatron-actor-417",
             "namespace": "tinker",
-            "user_id": "user-417",
+            "user_id": "original-user",
             "created_at": "2026-03-13T00:00:00Z",
             "last_activity": 1.0,
             "metadata_version": 3,

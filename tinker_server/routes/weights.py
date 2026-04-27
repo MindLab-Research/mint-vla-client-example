@@ -43,7 +43,6 @@ from ..checkpoints import (
     begin_async_checkpoint_mirror,
     build_gateway_proxy_archive_path,
     build_persistent_cache_dir,
-    checkpoint_has_lora_weights,
     checkpoint_has_openpi_training_state,
     checkpoint_has_optimizer_state,
     async_create_checkpoint_archive,
@@ -112,7 +111,7 @@ def _next_loaded_training_session_metadata_version(session: Any) -> int:
     return next_version
 
 
-async def _persist_loaded_training_session(session: Any, *, user_id: str | None) -> None:
+async def _persist_loaded_training_session(session: Any, *, request_user_id: str | None) -> None:
     from ..backend.training_session_manager import MATERIALIZATION_STATE_READY
     from ..backend.training_session_store import async_upsert_training_session
     from ..config import RAY_NAMESPACE
@@ -149,7 +148,7 @@ async def _persist_loaded_training_session(session: Any, *, user_id: str | None)
             "backend": str(getattr(session, "backend")),
             "actor_name": getattr(session, "actor_name", None),
             "namespace": str(getattr(session, "namespace", RAY_NAMESPACE) or RAY_NAMESPACE),
-            "user_id": user_id if user_id is not None else getattr(session, "user_id", None),
+            "user_id": getattr(session, "user_id", None) or request_user_id,
             "created_at": getattr(session, "created_at", None),
             "last_activity": float(getattr(session, "last_activity")),
             "metadata_version": metadata_version,
@@ -374,6 +373,20 @@ def _read_checkpoint_json_object(path: str, *, label: str) -> dict[str, object]:
     return payload
 
 
+def _checkpoint_can_recreate_training_client(path: str) -> bool:
+    if checkpoint_has_openpi_training_state(path):
+        return True
+    try:
+        names = os.listdir(path)
+    except OSError:
+        return False
+    has_rank_adapter = any(name.startswith("mp_rank_") and name.endswith("_adapter.pt") for name in names)
+    if has_rank_adapter:
+        return True
+    has_adapter_model = "adapter_model.safetensors" in names
+    return has_adapter_model and checkpoint_has_optimizer_state(path)
+
+
 @router.post("/weights_info", response_model=WeightsInfoResponse)
 async def weights_info(
     request: WeightsInfoRequest,
@@ -395,8 +408,6 @@ async def weights_info(
 
     if not os.path.isdir(path):
         raise HTTPException(status_code=404, detail="Checkpoint not found")
-    if not checkpoint_has_lora_weights(path) and not checkpoint_has_openpi_training_state(path):
-        raise HTTPException(status_code=400, detail="Missing training weights in checkpoint")
 
     metadata_path = os.path.join(path, "metadata.json")
     adapter_cfg_path = os.path.join(path, "adapter_config.json")
@@ -409,6 +420,8 @@ async def weights_info(
     declared_type = metadata.get("checkpoint_type", metadata.get("type"))
     if declared_type == "sampler" or "/sampler_weights/" in request.tinker_path:
         raise HTTPException(status_code=400, detail="Sampler checkpoint cannot recreate a training client")
+    if not _checkpoint_can_recreate_training_client(path):
+        raise HTTPException(status_code=400, detail="Missing training weights in checkpoint")
 
     adapter_cfg: dict[str, object] = {}
     if os.path.exists(adapter_cfg_path):
@@ -1603,7 +1616,7 @@ async def _do_load_state(
         metadata_persisted = True
         metadata_persist_error = None
         try:
-            await _persist_loaded_training_session(session, user_id=user_id)
+            await _persist_loaded_training_session(session, request_user_id=user_id)
         except Exception as persist_exc:
             metadata_persisted = False
             metadata_persist_error = f"{type(persist_exc).__name__}: {persist_exc}"
