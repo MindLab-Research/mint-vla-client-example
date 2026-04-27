@@ -2203,9 +2203,11 @@ class VerlTrainingEngine:
         while True:
             try:
                 pending = submit_fn(worker)
-                result = await self._await_with_keepalive(
+                result = await self._await_worker_call(
                     pending,
                     session,
+                    op=op,
+                    worker=worker,
                     interval_s=interval_s,
                     timeout_s=timeout_s,
                 )
@@ -2237,6 +2239,123 @@ class VerlTrainingEngine:
                     stage="after_recycle",
                     batch_stats=batch_stats,
                 )
+
+    @staticmethod
+    def _iter_exception_chain(error: BaseException) -> list[BaseException]:
+        chain: list[BaseException] = []
+        seen: set[int] = set()
+        current: BaseException | None = error
+        while current is not None and id(current) not in seen:
+            chain.append(current)
+            seen.add(id(current))
+            next_error = getattr(current, "cause", None)
+            if not isinstance(next_error, BaseException):
+                next_error = getattr(current, "__cause__", None)
+            if not isinstance(next_error, BaseException):
+                next_error = getattr(current, "__context__", None)
+            current = next_error if isinstance(next_error, BaseException) else None
+        return chain
+
+    @classmethod
+    def _format_exception_summary(cls, error: BaseException) -> str:
+        parts: list[str] = []
+        for exc in cls._iter_exception_chain(error)[:3]:
+            msg = str(exc).strip()
+            if msg:
+                parts.append(f"{type(exc).__name__}: {msg}")
+            else:
+                parts.append(type(exc).__name__)
+        return " | ".join(parts)
+
+    @classmethod
+    def _dense_fatal_error_reason(cls, error: BaseException) -> str | None:
+        keywords = (
+            "acceleratorerror",
+            "cuda error",
+            "device-side assert",
+            "device side assert",
+            "illegal memory access",
+        )
+        for exc in cls._iter_exception_chain(error):
+            haystack = f"{type(exc).__name__}: {exc}".lower()
+            if any(keyword in haystack for keyword in keywords):
+                return cls._format_exception_summary(error)
+        return None
+
+    async def _handle_dense_worker_failure(
+        self,
+        session: "TrainingSession",
+        *,
+        op: str,
+        error: BaseException,
+        worker: ray.actor.ActorHandle | None = None,
+    ) -> None:
+        if session.backend != "peft":
+            return
+        if isinstance(error, asyncio.TimeoutError):
+            return
+        if isinstance(error, getattr(ray.exceptions, "GetTimeoutError", tuple())):
+            return
+
+        fatal_reason = self._dense_fatal_error_reason(error)
+        if fatal_reason is None:
+            return
+
+        actor_name = str(self._resource_pool_actor_names.get(session.model_id) or getattr(session, "actor_name", "") or "")
+        if not actor_name:
+            return
+
+        logger.warning(
+            "[%s] retiring dense trainer after fatal op=%s actor_name=%s error=%s",
+            session.model_id,
+            op,
+            actor_name,
+            fatal_reason,
+        )
+
+        from .dense_trainer import retire_dense_trainer
+
+        await asyncio.to_thread(
+            retire_dense_trainer,
+            actor_name=actor_name,
+            actor=worker,
+            reason=f"{op}:{fatal_reason}",
+            base_model=session.base_model,
+            session_id=session.model_id,
+            namespace=str(getattr(session, "namespace", "") or RAY_NAMESPACE),
+        )
+
+        self._workers.pop(session.model_id, None)
+        self._resource_pool_actor_names.pop(session.model_id, None)
+        if str(getattr(session, "actor_name", "") or "") == actor_name:
+            session.actor_name = None
+            session.namespace = None
+
+    async def _await_worker_call(
+        self,
+        awaitable,
+        session: "TrainingSession",
+        *,
+        op: str,
+        worker: ray.actor.ActorHandle | None = None,
+        interval_s: float = 30.0,
+        timeout_s: float | None = None,
+    ):
+        try:
+            return await self._await_with_keepalive(
+                awaitable,
+                session,
+                interval_s=interval_s,
+                timeout_s=timeout_s,
+            )
+        except Exception as e:
+            await self._handle_dense_worker_failure(
+                session,
+                op=op,
+                error=e,
+                worker=worker,
+            )
+            raise
 
     def _record_megatron_result_metrics(self, session: "TrainingSession", result: dict | None) -> None:
         if session.backend != "megatron" or not isinstance(result, dict):
@@ -2318,6 +2437,18 @@ class VerlTrainingEngine:
         if not actor_name:
             return None
         namespace = str(getattr(session, "namespace", "") or RAY_NAMESPACE)
+        if session.backend == "peft":
+            from .dense_trainer import dense_trainer_reuse_block_reason
+
+            reuse_block_reason = dense_trainer_reuse_block_reason(actor_name)
+            if reuse_block_reason is not None:
+                logger.warning(
+                    "[%s] refusing to rebind poisoned dense trainer actor=%s reason=%s",
+                    str(getattr(session, "model_id", "")),
+                    actor_name,
+                    reuse_block_reason,
+                )
+                return None
         try:
             worker = await asyncio.to_thread(ray.get_actor, actor_name, namespace=namespace)
         except Exception as e:
@@ -2778,9 +2909,11 @@ class VerlTrainingEngine:
             )
             traceparent = get_current_traceparent()
             try:
-                result = await self._await_with_keepalive(
+                result = await self._await_worker_call(
                     worker.reinit_lora_weights.remote(session.learning_rate, traceparent=traceparent),
                     session,
+                    op="create_training_session.reinit_lora_weights",
+                    worker=worker,
                     interval_s=30.0,
                     timeout_s=effective_reinit_timeout_s,
                 )
@@ -2842,9 +2975,11 @@ class VerlTrainingEngine:
             flush=True,
         )
         try:
-            await self._await_with_keepalive(
+            await self._await_worker_call(
                 worker.__ray_ready__.remote(),
                 session,
+                op="create_training_session.ready",
+                worker=worker,
                 interval_s=30.0,
                 timeout_s=ready_timeout_s,
             )
@@ -2945,7 +3080,13 @@ class VerlTrainingEngine:
                 session.model_id,
                 traceparent=traceparent,
             )
-        result = await self._await_with_keepalive(pending, session, interval_s=30.0)
+        result = await self._await_worker_call(
+            pending,
+            session,
+            op="forward_backward",
+            worker=worker,
+            interval_s=30.0,
+        )
 
         # Update session state
         session.accumulated_gradients += 1
@@ -3058,7 +3199,13 @@ class VerlTrainingEngine:
                     train_unembed=train_unembed,
                     reference_full_log_prob_chunks=reference_chunks,
                 )
-                result = await self._await_with_keepalive(pending, session, interval_s=30.0)
+                result = await self._await_worker_call(
+                    pending,
+                    session,
+                    op="forward_backward_reverse_kl",
+                    worker=worker,
+                    interval_s=30.0,
+                )
             finally:
                 try:
                     await asyncio.to_thread(
@@ -3080,7 +3227,13 @@ class VerlTrainingEngine:
                 session.model_id,
                 traceparent=traceparent,
             )
-            result = await self._await_with_keepalive(pending, session, interval_s=30.0)
+            result = await self._await_worker_call(
+                pending,
+                session,
+                op="forward_backward_reverse_kl",
+                worker=worker,
+                interval_s=30.0,
+            )
         session.accumulated_gradients += 1
         logger.info(f"[{model_id}] forward_backward_reverse_kl completed")
         return result
@@ -3133,7 +3286,13 @@ class VerlTrainingEngine:
             )
         else:
             pending = worker.forward.remote(data_items, session.model_id, traceparent=traceparent)
-        result = await self._await_with_keepalive(pending, session, interval_s=30.0)
+        result = await self._await_worker_call(
+            pending,
+            session,
+            op="forward",
+            worker=worker,
+            interval_s=30.0,
+        )
         self._record_megatron_result_metrics(session, result)
 
         logger.info(f"[{model_id}] forward completed")
@@ -3245,7 +3404,13 @@ class VerlTrainingEngine:
             )
         else:
             pending = worker.optim_step.remote(lr, session.model_id, traceparent=traceparent)
-        result = await self._await_with_keepalive(pending, session, interval_s=30.0)
+        result = await self._await_worker_call(
+            pending,
+            session,
+            op="optim_step",
+            worker=worker,
+            interval_s=30.0,
+        )
 
         # Update session state
         session.current_step += 1
@@ -3341,7 +3506,13 @@ class VerlTrainingEngine:
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
             )
-            result = await self._await_with_keepalive(pending, session, interval_s=30.0)
+            result = await self._await_worker_call(
+                pending,
+                session,
+                op="train_step",
+                worker=worker,
+                interval_s=30.0,
+            )
         else:
             # Dense models: Use separate calls (they don't have param_offload issues)
             # Pass session_id for stateless trainer pattern
@@ -3366,7 +3537,13 @@ class VerlTrainingEngine:
                     session.model_id,
                     traceparent=traceparent,
                 )
-            fb_result = await self._await_with_keepalive(fb_pending, session, interval_s=30.0)
+            fb_result = await self._await_worker_call(
+                fb_pending,
+                session,
+                op="forward_backward",
+                worker=worker,
+                interval_s=30.0,
+            )
             if session.backend == "megatron":
                 opt_pending = worker.optim_step.remote(
                     lr,
@@ -3379,7 +3556,13 @@ class VerlTrainingEngine:
                 )
             else:
                 opt_pending = worker.optim_step.remote(lr, session.model_id, traceparent=traceparent)
-            opt_result = await self._await_with_keepalive(opt_pending, session, interval_s=30.0)
+            opt_result = await self._await_worker_call(
+                opt_pending,
+                session,
+                op="optim_step",
+                worker=worker,
+                interval_s=30.0,
+            )
 
             # Merge results
             result = fb_result.copy()
@@ -3525,9 +3708,11 @@ class VerlTrainingEngine:
         )
         _ = await run_async_with_otel_span(
             "training.save_weights_for_sampler.remote_save",
-            lambda: self._await_with_keepalive(
+            lambda: self._await_worker_call(
                 ref,
                 session,
+                op="save_dense_lora_weights_for_sampler",
+                worker=worker,
                 interval_s=30.0,
                 timeout_s=timeout_s,
             ),
@@ -3597,9 +3782,11 @@ class VerlTrainingEngine:
         )
         meta = await run_async_with_otel_span(
             "training.save_weights_for_sampler.remote_save",
-            lambda: self._await_with_keepalive(
+            lambda: self._await_worker_call(
                 meta_ref,
                 session,
+                op="save_lora_weights_for_sampler",
+                worker=worker,
                 interval_s=30.0,
                 timeout_s=timeout_s,
             ),
@@ -3709,9 +3896,11 @@ class VerlTrainingEngine:
                 traceparent=traceparent,
                 session_id=session.model_id,
             )
-        meta = await self._await_with_keepalive(
+        meta = await self._await_worker_call(
             meta_ref,
             session,
+            op="save_weights",
+            worker=worker,
             interval_s=30.0,
             timeout_s=timeout_s,
         )
