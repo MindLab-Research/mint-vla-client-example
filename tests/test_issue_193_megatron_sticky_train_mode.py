@@ -2061,6 +2061,7 @@ def test_issue_193_partial_swap_explicit_session_recovers_save_checkpoint(monkey
             "recovered_session",
             {
                 "traceparent": None,
+                "actual_rank": None,
                 "train_attn": False,
                 "train_mlp": True,
                 "train_unembed": False,
@@ -2157,6 +2158,7 @@ def test_issue_193_partial_swap_explicit_session_recovers_forward(monkeypatch):
             "recovered_session",
             {
                 "traceparent": None,
+                "actual_rank": None,
                 "train_attn": False,
                 "train_mlp": True,
                 "train_unembed": False,
@@ -2221,6 +2223,7 @@ def test_issue_193_partial_swap_explicit_session_recovers_optim_step(monkeypatch
             "recovered_session",
             {
                 "traceparent": None,
+                "actual_rank": None,
                 "train_attn": False,
                 "train_mlp": True,
                 "train_unembed": False,
@@ -2300,6 +2303,7 @@ def test_issue_193_partial_swap_explicit_session_recovers_save_lora_weights(monk
             "recovered_session",
             {
                 "traceparent": None,
+                "actual_rank": None,
                 "train_attn": False,
                 "train_mlp": True,
                 "train_unembed": False,
