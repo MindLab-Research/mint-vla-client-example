@@ -803,6 +803,7 @@ async def metrics() -> Response:
         resource_pool = actors.get("resource_pool")
         if isinstance(resource_pool, list):
             grouped: dict[tuple[str, str], dict[str, float]] = {}
+            dense_poisoned_grouped: dict[tuple[str, str], float] = {}
             for rec in resource_pool:
                 if not isinstance(rec, dict):
                     continue
@@ -909,6 +910,24 @@ async def metrics() -> Response:
                         "gpu_memory_fragmentation_bytes",
                     ):
                         _append_metric(lines, f"mint_megatron_{stem}", metadata.get(stem), labels=megatron_labels)
+                elif actor_type.strip().lower() == "dense" and bool(metadata.get("poisoned")):
+                    last_fatal_op = str(metadata.get("last_fatal_op") or "unknown")
+                    poisoned_labels = {
+                        "actor_name": actor_name,
+                        "base_model": model,
+                        "last_fatal_op": last_fatal_op,
+                    }
+                    _append_metric(lines, "mint_dense_actor_poisoned", 1, labels=poisoned_labels)
+                    poisoned_at = _prom_number(metadata.get("poisoned_at"))
+                    if poisoned_at is not None:
+                        _append_metric(
+                            lines,
+                            "mint_dense_actor_poisoned_age_s",
+                            max(0.0, time.time() - poisoned_at),
+                            labels=poisoned_labels,
+                        )
+                    key = (model, last_fatal_op)
+                    dense_poisoned_grouped[key] = float(dense_poisoned_grouped.get(key, 0.0)) + 1.0
                 for binding in _resource_pool_gpu_bindings(rec):
                     _append_metric(lines, "mint_resource_pool_actor_gpu_binding", 1, labels=binding)
 
@@ -969,6 +988,14 @@ async def metrics() -> Response:
                             agg[key],
                             labels={**labels, "state": state},
                         )
+
+            for (base_model, last_fatal_op), count in sorted(dense_poisoned_grouped.items()):
+                _append_metric(
+                    lines,
+                    "mint_dense_poisoned_actors",
+                    count,
+                    labels={"base_model": base_model, "last_fatal_op": last_fatal_op},
+                )
 
         resource_pool_metadata_cache = actors.get("resource_pool_metadata_cache")
         if isinstance(resource_pool_metadata_cache, list):

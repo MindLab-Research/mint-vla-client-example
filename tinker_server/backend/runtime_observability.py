@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass
 
 from ..logging_context import (
@@ -47,6 +48,23 @@ class _OperationAggregate:
     duration_s_max: float = 0.0
 
 
+@dataclass
+class _RecentTrainingIncident:
+    ts: float
+    kind: str
+    base_model: str
+    backend: str
+    op: str
+    status: str
+    failure_class: str
+    actor_name: str | None = None
+    node_id: str | None = None
+    request_id: str | None = None
+    session_id: str | None = None
+    detail: str | None = None
+    context: dict[str, object] | None = None
+
+
 class RuntimeObservability:
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -60,6 +78,8 @@ class RuntimeObservability:
         self._dense_actor_bind_decision: dict[tuple[str, str], int] = {}
         self._dense_actor_fatal: dict[tuple[str, str, str], int] = {}
         self._dense_actor_retire: dict[tuple[str, str], int] = {}
+        self._recent_training_incidents: list[_RecentTrainingIncident] = []
+        self._recent_training_incidents_limit = 64
 
     def record_megatron_session_switch(
         self,
@@ -200,6 +220,42 @@ class RuntimeObservability:
         with self._lock:
             self._dense_actor_retire[key] = int(self._dense_actor_retire.get(key, 0)) + 1
 
+    def record_training_incident(
+        self,
+        *,
+        kind: str,
+        base_model: str,
+        backend: str,
+        op: str,
+        status: str,
+        failure_class: str,
+        actor_name: str | None = None,
+        node_id: str | None = None,
+        request_id: str | None = None,
+        session_id: str | None = None,
+        detail: str | None = None,
+        context: dict[str, object] | None = None,
+    ) -> None:
+        incident = _RecentTrainingIncident(
+            ts=time.time(),
+            kind=str(kind or "unknown"),
+            base_model=str(base_model or "unknown"),
+            backend=str(backend or "unknown"),
+            op=str(op or "unknown"),
+            status=str(status or "unknown"),
+            failure_class=str(failure_class or "unknown"),
+            actor_name=None if actor_name is None else str(actor_name),
+            node_id=None if node_id is None else str(node_id),
+            request_id=None if request_id is None else str(request_id),
+            session_id=None if session_id is None else str(session_id),
+            detail=None if detail is None else str(detail),
+            context=dict(context or {}) if context else None,
+        )
+        with self._lock:
+            self._recent_training_incidents.append(incident)
+            if len(self._recent_training_incidents) > self._recent_training_incidents_limit:
+                del self._recent_training_incidents[: len(self._recent_training_incidents) - self._recent_training_incidents_limit]
+
     def flush_otel(self) -> None:
         with self._lock:
             pending = self._megatron_session_switch_pending
@@ -334,6 +390,25 @@ class RuntimeObservability:
                 for (base_model, outcome), count in sorted(self._dense_actor_retire.items())
             ]
 
+            recent_training_incidents = [
+                {
+                    "ts": float(incident.ts),
+                    "kind": incident.kind,
+                    "base_model": incident.base_model,
+                    "backend": incident.backend,
+                    "op": incident.op,
+                    "status": incident.status,
+                    "failure_class": incident.failure_class,
+                    "actor_name": incident.actor_name,
+                    "node_id": incident.node_id,
+                    "request_id": incident.request_id,
+                    "session_id": incident.session_id,
+                    "detail": incident.detail,
+                    "context": None if incident.context is None else dict(incident.context),
+                }
+                for incident in self._recent_training_incidents
+            ]
+
         return {
             "megatron_session_switch": megatron,
             "megatron_session_switch_failures": megatron_session_switch_failures,
@@ -344,6 +419,7 @@ class RuntimeObservability:
             "dense_actor_bind_decision": dense_actor_bind_decision,
             "dense_actor_fatal": dense_actor_fatal,
             "dense_actor_retire": dense_actor_retire,
+            "recent_training_incidents": recent_training_incidents,
         }
 
 

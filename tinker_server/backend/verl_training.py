@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -553,6 +554,18 @@ class TrainingWorker:
                 break
         return bad
 
+    @staticmethod
+    def _invalid_numeric_positions(values: list[Any], *, limit: int = 8) -> list[int]:
+        bad: list[int] = []
+        for idx, value in enumerate(values):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                bad.append(idx)
+            elif not math.isfinite(float(value)):
+                bad.append(idx)
+            if len(bad) >= limit:
+                break
+        return bad
+
     def _raise_forward_backward_contract_violation(
         self,
         *,
@@ -590,12 +603,38 @@ class TrainingWorker:
                 self._invalid_token_positions(target_tokens, vocab_size=vocab_size),
                 separators=(",", ":"),
             ),
+            "bad_weight_positions": json.dumps(
+                self._invalid_numeric_positions(weights),
+                separators=(",", ":"),
+            ),
+            "bad_old_logprob_positions": json.dumps(
+                self._invalid_numeric_positions(old_logprobs or []),
+                separators=(",", ":"),
+            ),
+            "bad_advantage_positions": json.dumps(
+                self._invalid_numeric_positions(advantages or []),
+                separators=(",", ":"),
+            ),
         }
         logger.error(
             "[TrainingWorker] dense_input_contract_violation %s",
             json.dumps(attrs, sort_keys=True, ensure_ascii=True),
         )
         record_span_event_otel("mint.training_input_contract_violation", attributes=attrs)
+        from .runtime_observability import runtime_observability
+
+        runtime_observability.record_training_incident(
+            kind="contract_violation",
+            base_model=str(getattr(self, "_base_model", "unknown") or "unknown"),
+            backend="peft",
+            op="forward_backward",
+            status="error",
+            failure_class="input_contract",
+            request_id=str(get_request_id() or "") or None,
+            session_id=None if session_id is None else str(session_id),
+            detail=str(reason),
+            context=attrs,
+        )
         raise ValueError(
             "dense_input_contract_violation: "
             f"reason={reason} input_len={len(input_ids)} target_len={len(target_tokens)} weights_len={len(weights)}"
@@ -635,6 +674,17 @@ class TrainingWorker:
                 old_logprobs=old_logprobs,
                 advantages=advantages,
             )
+        if self._invalid_numeric_positions(weights):
+            self._raise_forward_backward_contract_violation(
+                session_id=session_id,
+                loss_fn=loss_fn,
+                reason="weights_non_finite_or_non_numeric",
+                input_ids=input_ids,
+                target_tokens=target_tokens,
+                weights=weights,
+                old_logprobs=old_logprobs,
+                advantages=advantages,
+            )
         if len(target_tokens) != len(weights):
             self._raise_forward_backward_contract_violation(
                 session_id=session_id,
@@ -657,11 +707,33 @@ class TrainingWorker:
                 old_logprobs=old_logprobs,
                 advantages=advantages,
             )
+        if old_logprobs is not None and old_logprobs and self._invalid_numeric_positions(old_logprobs):
+            self._raise_forward_backward_contract_violation(
+                session_id=session_id,
+                loss_fn=loss_fn,
+                reason="old_logprobs_non_finite_or_non_numeric",
+                input_ids=input_ids,
+                target_tokens=target_tokens,
+                weights=weights,
+                old_logprobs=old_logprobs,
+                advantages=advantages,
+            )
         if old_logprobs is not None and old_logprobs and len(old_logprobs) != len(target_tokens):
             self._raise_forward_backward_contract_violation(
                 session_id=session_id,
                 loss_fn=loss_fn,
                 reason="old_logprobs_len_mismatch",
+                input_ids=input_ids,
+                target_tokens=target_tokens,
+                weights=weights,
+                old_logprobs=old_logprobs,
+                advantages=advantages,
+            )
+        if advantages is not None and advantages and self._invalid_numeric_positions(advantages):
+            self._raise_forward_backward_contract_violation(
+                session_id=session_id,
+                loss_fn=loss_fn,
+                reason="advantages_non_finite_or_non_numeric",
                 input_ids=input_ids,
                 target_tokens=target_tokens,
                 weights=weights,
@@ -2470,11 +2542,18 @@ class VerlTrainingEngine:
         if cls._dense_fatal_error_reason(error) is not None:
             return "error", "cuda_fatal"
         if isinstance(error, Exception):
-            failure_class = classify_failure_reason(error)
-            if failure_class == "canceled":
-                return "canceled", failure_class
-            if failure_class == "timeout":
-                return "timeout", failure_class
+            failure_class = "internal_error"
+            for exc in cls._iter_exception_chain(error):
+                if not isinstance(exc, Exception):
+                    continue
+                candidate = classify_failure_reason(exc)
+                if candidate == "canceled":
+                    return "canceled", candidate
+                if candidate == "timeout":
+                    return "timeout", candidate
+                if candidate != "internal_error":
+                    failure_class = candidate
+                    break
             return "error", failure_class
         return "error", "internal_error"
 
@@ -2522,6 +2601,19 @@ class VerlTrainingEngine:
             base_model=session.base_model,
             op=op,
             failure_class="cuda_fatal",
+        )
+        runtime_observability.record_training_incident(
+            kind="dense_actor_fatal",
+            base_model=session.base_model,
+            backend=session.backend,
+            op=op,
+            status="error",
+            failure_class="cuda_fatal",
+            actor_name=actor_name,
+            node_id=self._resolve_actor_node_id(actor_name),
+            request_id=str(get_request_id() or "") or None,
+            session_id=str(getattr(session, "session_id", "") or session.model_id),
+            detail=fatal_reason,
         )
         record_span_event_otel(
             "mint.dense_actor.fatal_gpu_error",
@@ -2615,6 +2707,19 @@ class VerlTrainingEngine:
                 failure_class=failure_class,
                 duration_s=duration_s,
             )
+            runtime_observability.record_training_incident(
+                kind="training_failure",
+                base_model=session.base_model,
+                backend=session.backend,
+                op=op,
+                status=status,
+                failure_class=failure_class,
+                actor_name=actor_name or None,
+                node_id=node_id,
+                request_id=str(get_request_id() or "") or None,
+                session_id=str(getattr(session, "session_id", "") or session.model_id),
+                detail=self._format_exception_summary(e),
+            )
             logger.warning(
                 "[%s] training op failed op=%s backend=%s status=%s failure_class=%s actor_name=%s node_id=%s request_id=%s session_id=%s error=%s",
                 session.model_id,
@@ -2702,6 +2807,18 @@ class VerlTrainingEngine:
             base_model=session.base_model,
             decision="recover",
         )
+        runtime_observability.record_training_incident(
+            kind="dense_actor_bind_decision",
+            base_model=session.base_model,
+            backend=session.backend,
+            op="bind",
+            status="ok",
+            failure_class="none",
+            actor_name=dense.actor_name,
+            request_id=str(get_request_id() or "") or None,
+            session_id=str(getattr(session, "session_id", "") or session.model_id),
+            detail=f"recover:{reason}",
+        )
         logger.warning(
             "[%s] rebound dense trainer actor=%s reason=%s base_model=%s",
             model_id,
@@ -2732,6 +2849,18 @@ class VerlTrainingEngine:
                     base_model=session.base_model,
                     decision="rebind_refused_poisoned",
                 )
+                runtime_observability.record_training_incident(
+                    kind="dense_actor_bind_decision",
+                    base_model=session.base_model,
+                    backend=session.backend,
+                    op="bind",
+                    status="error",
+                    failure_class="poisoned_actor",
+                    actor_name=actor_name,
+                    request_id=str(get_request_id() or "") or None,
+                    session_id=str(getattr(session, "session_id", "") or session.model_id),
+                    detail=f"rebind_refused_poisoned:{reuse_block_reason}",
+                )
                 logger.warning(
                     "[%s] refusing to rebind poisoned dense trainer actor=%s reason=%s",
                     str(getattr(session, "model_id", "")),
@@ -2754,10 +2883,23 @@ class VerlTrainingEngine:
         self._workers[session.model_id] = worker
         self._resource_pool_actor_names[session.model_id] = actor_name
         self._touch_actor(session)
-        runtime_observability.record_dense_actor_bind_decision(
-            base_model=session.base_model,
-            decision="reuse",
-        )
+        if session.backend == "peft":
+            runtime_observability.record_dense_actor_bind_decision(
+                base_model=session.base_model,
+                decision="reuse",
+            )
+            runtime_observability.record_training_incident(
+                kind="dense_actor_bind_decision",
+                base_model=session.base_model,
+                backend=session.backend,
+                op="bind",
+                status="ok",
+                failure_class="none",
+                actor_name=actor_name,
+                request_id=str(get_request_id() or "") or None,
+                session_id=str(getattr(session, "session_id", "") or session.model_id),
+                detail=f"reuse:{reason}",
+            )
         logger.warning(
             "[%s] rebound worker actor=%s reason=%s backend=%s",
             session.model_id,

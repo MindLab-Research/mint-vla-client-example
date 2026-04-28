@@ -355,6 +355,19 @@ def retire_dense_trainer(
         retire_outcome = "actor_still_present"
 
     runtime_observability.record_dense_actor_retire(base_model=base_model, outcome=retire_outcome)
+    runtime_observability.record_training_incident(
+        kind="dense_actor_retire",
+        base_model=base_model,
+        backend="peft",
+        op=str(fatal_op or "retire"),
+        status="ok" if retire_outcome == "ok" else "error",
+        failure_class="none" if retire_outcome == "ok" else retire_outcome,
+        actor_name=actor_name,
+        request_id=None if request_id is None else str(request_id),
+        session_id=None if session_id is None else str(session_id),
+        detail=str(reason),
+        context={"outcome": retire_outcome},
+    )
 
 
 def get_or_create_dense_trainer(
@@ -523,6 +536,18 @@ def get_or_create_dense_trainer(
             pool.mark_ready(actor_name)
             entry.current_session = session_id
             runtime_observability.record_dense_actor_bind_decision(base_model=base_model, decision=bind_decision)
+            runtime_observability.record_training_incident(
+                kind="dense_actor_bind_decision",
+                base_model=base_model,
+                backend="peft",
+                op="bind",
+                status="ok",
+                failure_class="none",
+                actor_name=actor_name,
+                session_id=None if session_id is None else str(session_id),
+                detail=bind_decision,
+                context={"protected": bool(is_persistent)},
+            )
 
             return DenseTrainerHandle(
                 actor=actor,

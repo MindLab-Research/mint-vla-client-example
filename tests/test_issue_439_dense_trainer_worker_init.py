@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 import tinker_server.backend.runtime_observability as runtime_obs_module
 
 
@@ -72,7 +74,14 @@ def test_issue_439_dense_trainer_does_not_pass_removed_session_state_root(monkey
     }
 
 
-def test_issue_561_poisoned_dense_trainer_is_not_reused(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("base_model", "actor_name"),
+    [
+        ("Qwen/Qwen3-0.6B", "peft_trainer_qwen__qwen3_0_6b_maxr64"),
+        ("Qwen/Qwen3-4B-Instruct-2507", "peft_trainer_qwen__qwen3_4b_instruct_2507_maxr64"),
+    ],
+)
+def test_issue_561_poisoned_dense_trainer_is_not_reused(monkeypatch, base_model: str, actor_name: str) -> None:
     from tinker_server.backend import dense_trainer as dt
     from tinker_server import config as cfg
 
@@ -84,7 +93,6 @@ def test_issue_561_poisoned_dense_trainer_is_not_reused(monkeypatch) -> None:
     monkeypatch.setattr(cfg, "PFS_HF_MODULES_PATH", "/tmp/hf-modules")
     monkeypatch.setenv("RAY_ADDRESS", "192.168.38.184:6379")
 
-    actor_name = "peft_trainer_qwen__qwen3_0_6b_maxr64"
     remote_kwargs: dict[str, object] = {}
     retire_calls: list[dict[str, object]] = []
 
@@ -144,7 +152,7 @@ def test_issue_561_poisoned_dense_trainer_is_not_reused(monkeypatch) -> None:
 
     dt.get_or_create_dense_trainer(
         training_worker_cls=_FakeTrainingWorker,
-        base_model="Qwen/Qwen3-0.6B",
+        base_model=base_model,
         lora_rank=8,
         learning_rate=1e-4,
         session_id="model-561",
@@ -155,13 +163,13 @@ def test_issue_561_poisoned_dense_trainer_is_not_reused(monkeypatch) -> None:
     assert "reuse_blocked" in str(retire_calls[0]["reason"])
     assert obs.snapshot()["dense_actor_bind_decision"] == [
         {
-            "base_model": "Qwen/Qwen3-0.6B",
+            "base_model": base_model,
             "decision": "recreate_poisoned",
             "count": 1,
         }
     ]
     assert remote_kwargs == {
-        "base_model": "Qwen/Qwen3-0.6B",
+        "base_model": base_model,
         "lora_rank": 64,
         "learning_rate": 1e-4,
     }

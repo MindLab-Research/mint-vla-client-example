@@ -555,6 +555,14 @@ def classify_failure_reason(error: Exception) -> str:
         return "permission_denied"
     if "not found" in text:
         return "not_found"
+    if (
+        "dense_input_contract_violation" in text
+        or "contract_violation" in text
+        or "out_of_range" in text
+        or "len_mismatch" in text
+        or "non_finite" in text
+    ):
+        return "input_contract"
     if "validation" in text or "invalid" in text:
         return "validation"
     return "internal_error"

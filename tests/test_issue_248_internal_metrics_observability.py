@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import time
 from dataclasses import dataclass
 
 import tinker_server.routes.internal as internal_routes
@@ -156,6 +157,23 @@ async def _fake_admission_stats(*, include_actor_rss: bool = True) -> dict:
                     "gpu_memory_allocated_bytes": 48000000000,
                     "gpu_memory_reserved_bytes": 52000000000,
                     "gpu_memory_fragmentation_bytes": 4000000000,
+                },
+            },
+            {
+                "actor_type": "dense",
+                "base_model": "Qwen/Qwen3-4B-Instruct-2507",
+                "actor_name": "peft_trainer_qwen__qwen3_4b_instruct_2507_maxr64",
+                "idle_time": 1,
+                "age": 33,
+                "rss_bytes": 150,
+                "node_id": "node-c",
+                "metadata": {
+                    "hostname": "host-c",
+                    "gpu_indices": [2],
+                    "poisoned": True,
+                    "poisoned_at": time.time() - 12.0,
+                    "last_fatal_op": "reinit_lora_weights",
+                    "poison_reason": "reinit_lora_weights:CUDA error: device-side assert triggered",
                 },
             },
         ],
@@ -512,9 +530,12 @@ def test_issue_248_internal_metrics_omits_unknown_resource_pool_rss(monkeypatch)
         'mint_dense_actor_bind_decision_total{base_model="Qwen/Qwen3-0.6B",decision="rebind_refused_poisoned"} 1',
         'mint_dense_actor_fatal_total{base_model="Qwen/Qwen3-0.6B",failure_class="cuda_fatal",op="forward_backward"} 1',
         'mint_dense_actor_retire_total{base_model="Qwen/Qwen3-0.6B",outcome="ok"} 1',
+        'mint_dense_actor_poisoned{actor_name="peft_trainer_qwen__qwen3_4b_instruct_2507_maxr64",base_model="Qwen/Qwen3-4B-Instruct-2507",last_fatal_op="reinit_lora_weights"} 1',
+        'mint_dense_poisoned_actors{base_model="Qwen/Qwen3-4B-Instruct-2507",last_fatal_op="reinit_lora_weights"} 1',
     )
     for line in extra_lines:
         assert line in text, f"missing metric line: {line}"
+    assert 'mint_dense_actor_poisoned_age_s{actor_name="peft_trainer_qwen__qwen3_4b_instruct_2507_maxr64",base_model="Qwen/Qwen3-4B-Instruct-2507",last_fatal_op="reinit_lora_weights"}' in text
 
     assert 'mint_actor_rss_bytes{actor="future_store"}' not in text
     assert 'mint_resource_pool_actor_rss_bytes{actor_name="vllm-1"' not in text

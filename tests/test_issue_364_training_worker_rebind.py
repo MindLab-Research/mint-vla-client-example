@@ -224,6 +224,7 @@ def test_issue_561_training_worker_validates_input_contract_before_gpu(monkeypat
     worker = object.__new__(impl_cls)
 
     worker.device = "cuda"
+    worker._base_model = "Qwen/Qwen3-0.6B"
     worker._touch = lambda: None
     worker._bind_traceparent = lambda traceparent: None
     worker._ensure_session_loaded = lambda session_id: None
@@ -233,8 +234,10 @@ def test_issue_561_training_worker_validates_input_contract_before_gpu(monkeypat
     )
     worker.tokenizer = SimpleNamespace(vocab_size=16)
 
+    obs = runtime_obs_module.RuntimeObservability()
     events: list[tuple[str, dict[str, object] | None]] = []
     monkeypatch.setattr("tinker_server.backend.verl_training._get_torch", lambda: SimpleNamespace())
+    monkeypatch.setattr(runtime_obs_module, "runtime_observability", obs)
     monkeypatch.setattr(
         "tinker_server.backend.verl_training.record_span_event_otel",
         lambda name, *, attributes=None: events.append((name, attributes)),
@@ -274,6 +277,65 @@ def test_issue_561_training_worker_validates_input_contract_before_gpu(monkeypat
                 "target_max": "2",
                 "bad_input_positions": "[2]",
                 "bad_target_positions": "[]",
+                "bad_weight_positions": "[]",
+                "bad_old_logprob_positions": "[]",
+                "bad_advantage_positions": "[]",
             },
         )
     ]
+    incidents = obs.snapshot()["recent_training_incidents"]
+    assert len(incidents) == 1
+    incident = incidents[0]
+    assert incident["kind"] == "contract_violation"
+    assert incident["base_model"] == "Qwen/Qwen3-0.6B"
+    assert incident["backend"] == "peft"
+    assert incident["op"] == "forward_backward"
+    assert incident["failure_class"] == "input_contract"
+    assert incident["session_id"] == "session-561-contract"
+    assert incident["detail"] == "input_ids_out_of_range"
+    assert incident["context"]["bad_input_positions"] == "[2]"
+
+
+def test_issue_561_rejects_non_finite_weight_inputs_before_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    impl_cls = TrainingWorker.__ray_metadata__.modified_class
+    worker = object.__new__(impl_cls)
+
+    worker.device = "cuda"
+    worker._base_model = "Qwen/Qwen3-4B-Instruct-2507"
+    worker._touch = lambda: None
+    worker._bind_traceparent = lambda traceparent: None
+    worker._ensure_session_loaded = lambda session_id: None
+    worker.model = SimpleNamespace(
+        config=SimpleNamespace(vocab_size=16),
+        train=lambda: None,
+    )
+    worker.tokenizer = SimpleNamespace(vocab_size=16)
+
+    monkeypatch.setattr("tinker_server.backend.verl_training._get_torch", lambda: SimpleNamespace())
+    monkeypatch.setattr("tinker_server.backend.verl_training.record_span_event_otel", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runtime_obs_module, "runtime_observability", runtime_obs_module.RuntimeObservability())
+
+    bad_item = {
+        "model_input": {
+            "chunks": [
+                {"type": "encoded_text", "tokens": [0, 1, 2]},
+            ]
+        },
+        "loss_fn_inputs": {
+            "target_tokens": {"data": [0, 1, 2]},
+            "weights": {"data": [1.0, float("nan"), 1.0]},
+        },
+    }
+
+    with pytest.raises(ValueError, match="weights_non_finite_or_non_numeric"):
+        worker.forward_backward([bad_item], loss_fn="cross_entropy", session_id="session-561-nan")
+
+
+def test_issue_561_classifies_wrapped_input_contract_failure() -> None:
+    err = RuntimeError("ray wrapper")
+    err.__cause__ = ValueError("dense_input_contract_violation: reason=weights_non_finite_or_non_numeric")
+
+    status, failure_class = VerlTrainingEngine._classify_training_failure(err)
+
+    assert status == "error"
+    assert failure_class == "input_contract"

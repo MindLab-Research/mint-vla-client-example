@@ -363,6 +363,38 @@ def test_issue_432_runtime_observability_tracks_training_ops_and_dense_actor_eve
     ]
 
 
+def test_issue_432_runtime_observability_keeps_recent_training_incidents() -> None:
+    obs = RuntimeObservability()
+
+    obs.record_training_incident(
+        kind="contract_violation",
+        base_model="Qwen/Qwen3-0.6B",
+        backend="peft",
+        op="forward_backward",
+        status="error",
+        failure_class="input_contract",
+        request_id="req-561",
+        session_id="session-561",
+        detail="input_ids_out_of_range",
+        context={"bad_input_positions": "[2]"},
+    )
+
+    snap = obs.snapshot()
+    assert len(snap["recent_training_incidents"]) == 1
+    incident = snap["recent_training_incidents"][0]
+    assert incident["kind"] == "contract_violation"
+    assert incident["base_model"] == "Qwen/Qwen3-0.6B"
+    assert incident["backend"] == "peft"
+    assert incident["op"] == "forward_backward"
+    assert incident["status"] == "error"
+    assert incident["failure_class"] == "input_contract"
+    assert incident["request_id"] == "req-561"
+    assert incident["session_id"] == "session-561"
+    assert incident["detail"] == "input_ids_out_of_range"
+    assert incident["context"] == {"bad_input_positions": "[2]"}
+    assert isinstance(incident["ts"], float)
+
+
 def test_issue_432_runtime_observability_tracks_vllm_workload_and_active_requests() -> None:
     obs = RuntimeObservability()
 
@@ -439,6 +471,7 @@ def test_issue_432_runtime_observability_tracks_vllm_workload_and_active_request
     assert snap["dense_actor_bind_decision"] == []
     assert snap["dense_actor_fatal"] == []
     assert snap["dense_actor_retire"] == []
+    assert snap["recent_training_incidents"] == []
 
 
 class _Recorder:
