@@ -373,9 +373,14 @@ def _read_checkpoint_json_object(path: str, *, label: str) -> dict[str, object]:
     return payload
 
 
-def _checkpoint_can_recreate_training_client(path: str) -> bool:
-    if checkpoint_has_openpi_training_state(path):
-        return True
+def _checkpoint_can_recreate_training_client(path: str, *, backend: str) -> bool:
+    if backend in {"openpi_fast", "openpi_pi05"}:
+        return checkpoint_has_openpi_training_state(path)
+    if backend == "megatron":
+        try:
+            return any(name.startswith("mp_rank_") and name.endswith("_adapter.pt") for name in os.listdir(path))
+        except OSError:
+            return False
     try:
         names = os.listdir(path)
     except OSError:
@@ -420,8 +425,6 @@ async def weights_info(
     declared_type = metadata.get("checkpoint_type", metadata.get("type"))
     if declared_type == "sampler" or "/sampler_weights/" in request.tinker_path:
         raise HTTPException(status_code=400, detail="Sampler checkpoint cannot recreate a training client")
-    if not _checkpoint_can_recreate_training_client(path):
-        raise HTTPException(status_code=400, detail="Missing training weights in checkpoint")
 
     adapter_cfg: dict[str, object] = {}
     if os.path.exists(adapter_cfg_path):
@@ -432,6 +435,17 @@ async def weights_info(
         base_model = adapter_cfg.get("base_model_name_or_path")
     if not isinstance(base_model, str) or not base_model:
         raise HTTPException(status_code=400, detail="Checkpoint metadata missing base model")
+    from ..routes.training import _infer_training_backend_for_base_model
+
+    try:
+        backend = _infer_training_backend_for_base_model(base_model)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if not _checkpoint_can_recreate_training_client(path, backend=backend):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Checkpoint artifacts cannot recreate a {backend} training client",
+        )
 
     is_lora = bool(
         os.path.exists(adapter_cfg_path)

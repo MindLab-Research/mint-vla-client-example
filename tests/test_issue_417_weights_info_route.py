@@ -40,6 +40,7 @@ def test_issue_417_weights_info_reads_training_checkpoint_metadata(tmp_path: Pat
         encoding="utf-8",
     )
     (ckpt / "adapter_model.safetensors").write_bytes(b"adapter")
+    (ckpt / "mp_rank_00_adapter.pt").write_bytes(b"adapter-rank")
     (ckpt / "mp_rank_00_optimizer.pt").write_bytes(b"optimizer")
 
     monkeypatch.setattr(
@@ -134,7 +135,108 @@ def test_issue_417_weights_info_rejects_metadata_less_sampler_shape(
     response = client.post("/api/v1/weights_info", json={"tinker_path": f"file://{ckpt}"})
 
     assert response.status_code == 400, response.text
-    assert "Missing training weights" in response.text
+    assert "Checkpoint artifacts cannot recreate a peft training client" in response.text
+
+
+def test_issue_417_weights_info_rejects_megatron_peft_shape_without_rank_shards(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from tinker_server.routes import weights as weights_routes
+
+    ckpt = tmp_path / "megatron_peft_shape_ckpt"
+    ckpt.mkdir()
+    (ckpt / "metadata.json").write_text(
+        json.dumps(
+            {
+                "model_name": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+                "checkpoint_type": "training",
+                "optimizer_present": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (ckpt / "adapter_config.json").write_text(
+        json.dumps(
+            {
+                "r": 8,
+                "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+                "base_model_name_or_path": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (ckpt / "adapter_model.safetensors").write_bytes(b"adapter")
+    (ckpt / "optimizer.pt").write_bytes(b"optimizer")
+
+    monkeypatch.setattr(
+        weights_routes,
+        "_resolve_mint_path",
+        lambda mint_uri, *, user_id, is_admin=False: str(ckpt),
+    )
+
+    app = FastAPI()
+    app.include_router(weights_routes.router, prefix="/api/v1")
+    client = TestClient(app)
+
+    response = client.post("/api/v1/weights_info", json={"tinker_path": "tinker://run/weights/megatron-peft"})
+
+    assert response.status_code == 400, response.text
+    assert "Checkpoint artifacts cannot recreate a megatron training client" in response.text
+
+
+def test_issue_417_weights_info_accepts_peft_training_adapter_checkpoint(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from tinker_server.routes import weights as weights_routes
+
+    ckpt = tmp_path / "peft_training_ckpt"
+    ckpt.mkdir()
+    (ckpt / "metadata.json").write_text(
+        json.dumps(
+            {
+                "model_name": "Qwen/Qwen3-0.6B",
+                "checkpoint_type": "training",
+                "optimizer_present": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (ckpt / "adapter_config.json").write_text(
+        json.dumps(
+            {
+                "r": 8,
+                "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+                "base_model_name_or_path": "Qwen/Qwen3-0.6B",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (ckpt / "adapter_model.safetensors").write_bytes(b"adapter")
+    (ckpt / "optimizer.pt").write_bytes(b"optimizer")
+
+    monkeypatch.setattr(
+        weights_routes,
+        "_resolve_mint_path",
+        lambda mint_uri, *, user_id, is_admin=False: str(ckpt),
+    )
+
+    app = FastAPI()
+    app.include_router(weights_routes.router, prefix="/api/v1")
+    client = TestClient(app)
+
+    response = client.post("/api/v1/weights_info", json={"tinker_path": "tinker://run/weights/peft"})
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "base_model": "Qwen/Qwen3-0.6B",
+        "is_lora": True,
+        "lora_rank": 8,
+        "train_unembed": False,
+        "train_mlp": False,
+        "train_attn": True,
+    }
 
 
 def test_issue_417_weights_info_accepts_optimizerless_training_adapter_checkpoint(
@@ -225,6 +327,7 @@ def test_issue_417_weights_info_rejects_lora_checkpoint_without_rank(
         encoding="utf-8",
     )
     (ckpt / "adapter_model.safetensors").write_bytes(b"adapter")
+    (ckpt / "mp_rank_00_adapter.pt").write_bytes(b"adapter-rank")
     (ckpt / "mp_rank_00_optimizer.pt").write_bytes(b"optimizer")
 
     monkeypatch.setattr(
@@ -335,7 +438,7 @@ def test_issue_417_weights_info_accepts_non_lora_training_checkpoint(
     (ckpt / "metadata.json").write_text(
         json.dumps(
             {
-                "model_name": "openpi/pi0",
+                "model_name": "openpi/pi0-fast-libero-low-mem-finetune",
                 "checkpoint_type": "training",
                 "optimizer_present": True,
             }
@@ -357,7 +460,7 @@ def test_issue_417_weights_info_accepts_non_lora_training_checkpoint(
 
     assert response.status_code == 200, response.text
     assert response.json() == {
-        "base_model": "openpi/pi0",
+        "base_model": "openpi/pi0-fast-libero-low-mem-finetune",
         "is_lora": False,
         "lora_rank": None,
         "train_unembed": None,
