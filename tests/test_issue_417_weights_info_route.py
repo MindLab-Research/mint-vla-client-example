@@ -239,6 +239,59 @@ def test_issue_417_weights_info_accepts_peft_training_adapter_checkpoint(
     }
 
 
+def test_issue_417_weights_info_accepts_peft_optimizerless_training_adapter_checkpoint(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from tinker_server.routes import weights as weights_routes
+
+    ckpt = tmp_path / "peft_optimizerless_training_ckpt"
+    ckpt.mkdir()
+    (ckpt / "metadata.json").write_text(
+        json.dumps(
+            {
+                "model_name": "Qwen/Qwen3-0.6B",
+                "checkpoint_type": "training",
+                "optimizer_present": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (ckpt / "adapter_config.json").write_text(
+        json.dumps(
+            {
+                "r": 8,
+                "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+                "base_model_name_or_path": "Qwen/Qwen3-0.6B",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (ckpt / "adapter_model.safetensors").write_bytes(b"adapter")
+
+    monkeypatch.setattr(
+        weights_routes,
+        "_resolve_mint_path",
+        lambda mint_uri, *, user_id, is_admin=False: str(ckpt),
+    )
+
+    app = FastAPI()
+    app.include_router(weights_routes.router, prefix="/api/v1")
+    client = TestClient(app)
+
+    response = client.post("/api/v1/weights_info", json={"tinker_path": "tinker://run/weights/peft-no-opt"})
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "base_model": "Qwen/Qwen3-0.6B",
+        "is_lora": True,
+        "lora_rank": 8,
+        "train_unembed": False,
+        "train_mlp": False,
+        "train_attn": True,
+    }
+
+
 def test_issue_417_weights_info_rejects_peft_rank_shard_without_peft_artifacts(
     tmp_path: Path,
     monkeypatch,

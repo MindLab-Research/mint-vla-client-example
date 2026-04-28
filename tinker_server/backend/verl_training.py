@@ -3143,7 +3143,7 @@ class VerlTrainingEngine:
                 abs_path,
                 traceparent=traceparent,
                 session_id=session.model_id,
-                actual_rank=session.lora_config.rank if session.lora_config else None,
+                actual_rank=getattr(lora_cfg, "rank", None),
                 train_attn=train_attn,
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
@@ -3216,6 +3216,15 @@ class VerlTrainingEngine:
             "traceparent": traceparent,
             "session_id": session.model_id,
         }
+        if session.backend == "megatron":
+            lora_cfg = getattr(session, "lora_config", None)
+            kwargs.update(
+                {
+                    "train_attn": True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True)),
+                    "train_mlp": True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True)),
+                    "train_unembed": True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True)),
+                }
+            )
         meta_ref = worker.load_checkpoint.remote(load_path, load_optimizer, **kwargs)
         meta = await self._await_with_keepalive(
             meta_ref,

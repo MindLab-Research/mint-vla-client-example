@@ -373,7 +373,7 @@ def _read_checkpoint_json_object(path: str, *, label: str) -> dict[str, object]:
     return payload
 
 
-def _checkpoint_can_recreate_training_client(path: str, *, backend: str) -> bool:
+def _checkpoint_can_recreate_training_client(path: str, *, backend: str, declared_type: object) -> bool:
     if backend in {"openpi_fast", "openpi_pi05"}:
         return checkpoint_has_openpi_training_state(path)
     if backend == "megatron":
@@ -388,7 +388,7 @@ def _checkpoint_can_recreate_training_client(path: str, *, backend: str) -> bool
     except OSError:
         return False
     has_adapter_model = "adapter_model.safetensors" in names
-    return has_adapter_model and checkpoint_has_optimizer_state(path)
+    return has_adapter_model and (declared_type == "training" or checkpoint_has_optimizer_state(path))
 
 
 @router.post("/weights_info", response_model=WeightsInfoResponse)
@@ -440,7 +440,7 @@ async def weights_info(
         backend = _infer_training_backend_for_base_model(base_model)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
-    if not _checkpoint_can_recreate_training_client(path, backend=backend):
+    if not _checkpoint_can_recreate_training_client(path, backend=backend, declared_type=declared_type):
         raise HTTPException(
             status_code=400,
             detail=f"Checkpoint artifacts cannot recreate a {backend} training client",

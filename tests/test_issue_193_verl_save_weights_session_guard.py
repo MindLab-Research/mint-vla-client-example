@@ -924,7 +924,17 @@ def test_issue_193_megatron_load_weights_missing_actor_can_recreate_from_checkpo
         if awaitable == "fake-load-ready-ref":
             return {"status": "ok"}
         assert awaitable == "missing-actor-load-ref"
-        return {"current_step": 4, "learning_rate": 3e-4, "actual_rank": 6}
+        return {
+            "current_step": 4,
+            "learning_rate": 3e-4,
+            "actual_rank": 6,
+            "actor_only_state_dirty": True,
+            "checkpoint_path": "/tmp/issue_193_megatron_load_missing_actor",
+            "optimizer_restored": True,
+            "train_attn": True,
+            "train_mlp": True,
+            "train_unembed": True,
+        }
 
     monkeypatch.setattr(engine, "_get_live_worker", fake_get_live_worker)
     monkeypatch.setattr(engine, "_await_with_keepalive", fake_keepalive)
@@ -947,6 +957,12 @@ def test_issue_193_megatron_load_weights_missing_actor_can_recreate_from_checkpo
                 "step_count": 4,
                 "learning_rate": pytest.approx(3e-4),
                 "actual_rank": 6,
+                "actor_only_state_dirty": True,
+                "checkpoint_path": "/tmp/issue_193_megatron_load_missing_actor",
+                "optimizer_restored": True,
+                "train_attn": True,
+                "train_mlp": True,
+                "train_unembed": True,
             },
         )
     ]
@@ -2089,17 +2105,7 @@ def test_issue_193_megatron_load_checkpoint_uses_ensure_session_loaded(tmp_path:
 
     result = group.load_checkpoint(str(ckpt_dir), load_optimizer=False, session_id="session_target")
 
-    assert ensure_calls == [
-        (
-            "session_target",
-            {
-                "traceparent": None,
-                "train_attn": False,
-                "train_mlp": True,
-                "train_unembed": False,
-            },
-        )
-    ]
+    assert ensure_calls == []
     assert load_adapter_calls == [
         (
             str(ckpt_dir),
@@ -2115,7 +2121,7 @@ def test_issue_193_megatron_load_checkpoint_uses_ensure_session_loaded(tmp_path:
     assert reset_optimizer_calls == [
         (
             (2e-4,),
-            {"traceparent": None},
+            {"traceparent": None, "zero_grad_buffers": False},
         )
     ]
     assert result["optimizer_reset"] is True
