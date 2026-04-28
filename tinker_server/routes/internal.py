@@ -1165,6 +1165,56 @@ async def metrics() -> Response:
                     }
                     _append_metric(lines, "mint_vllm_workload_active_requests", row.get("active_requests"), labels=labels)
 
+            training_operation_latency = runtime_observability.get("training_operation_latency")
+            if isinstance(training_operation_latency, list):
+                for row in training_operation_latency:
+                    if not isinstance(row, dict):
+                        continue
+                    labels = {
+                        "base_model": row.get("base_model") or "unknown",
+                        "backend": row.get("backend") or "unknown",
+                        "op": row.get("op") or "unknown",
+                        "status": row.get("status") or "unknown",
+                        "failure_class": row.get("failure_class") or "none",
+                    }
+                    _append_metric(lines, "mint_training_operation_total", row.get("count"), labels=labels)
+                    _append_metric(lines, "mint_training_operation_duration_s_sum", row.get("duration_s_total"), labels=labels)
+                    _append_metric(lines, "mint_training_operation_duration_s_max", row.get("duration_s_max"), labels=labels)
+
+            dense_actor_bind_decision = runtime_observability.get("dense_actor_bind_decision")
+            if isinstance(dense_actor_bind_decision, list):
+                for row in dense_actor_bind_decision:
+                    if not isinstance(row, dict):
+                        continue
+                    labels = {
+                        "base_model": row.get("base_model") or "unknown",
+                        "decision": row.get("decision") or "unknown",
+                    }
+                    _append_metric(lines, "mint_dense_actor_bind_decision_total", row.get("count"), labels=labels)
+
+            dense_actor_fatal = runtime_observability.get("dense_actor_fatal")
+            if isinstance(dense_actor_fatal, list):
+                for row in dense_actor_fatal:
+                    if not isinstance(row, dict):
+                        continue
+                    labels = {
+                        "base_model": row.get("base_model") or "unknown",
+                        "op": row.get("op") or "unknown",
+                        "failure_class": row.get("failure_class") or "unknown",
+                    }
+                    _append_metric(lines, "mint_dense_actor_fatal_total", row.get("count"), labels=labels)
+
+            dense_actor_retire = runtime_observability.get("dense_actor_retire")
+            if isinstance(dense_actor_retire, list):
+                for row in dense_actor_retire:
+                    if not isinstance(row, dict):
+                        continue
+                    labels = {
+                        "base_model": row.get("base_model") or "unknown",
+                        "outcome": row.get("outcome") or "unknown",
+                    }
+                    _append_metric(lines, "mint_dense_actor_retire_total", row.get("count"), labels=labels)
+
     for (base_model, event), count in sorted(megatron_actor_lifecycle_counts.items()):
         _append_metric(
             lines,

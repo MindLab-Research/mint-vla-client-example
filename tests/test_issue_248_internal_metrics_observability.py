@@ -356,9 +356,32 @@ async def _fake_admission_stats(*, include_actor_rss: bool = True) -> dict:
                         "backend": "megatron",
                         "op": "forward_backward",
                         "status": "ok",
+                        "failure_class": "none",
                         "count": 4,
                         "duration_s_total": 18.0,
                         "duration_s_max": 6.0,
+                    }
+                ],
+                "dense_actor_bind_decision": [
+                    {
+                        "base_model": "Qwen/Qwen3-0.6B",
+                        "decision": "rebind_refused_poisoned",
+                        "count": 1,
+                    }
+                ],
+                "dense_actor_fatal": [
+                    {
+                        "base_model": "Qwen/Qwen3-0.6B",
+                        "op": "forward_backward",
+                        "failure_class": "cuda_fatal",
+                        "count": 1,
+                    }
+                ],
+                "dense_actor_retire": [
+                    {
+                        "base_model": "Qwen/Qwen3-0.6B",
+                        "outcome": "ok",
+                        "count": 1,
                     }
                 ],
             },
@@ -484,6 +507,11 @@ def test_issue_248_internal_metrics_omits_unknown_resource_pool_rss(monkeypatch)
         'mint_megatron_session_switch_failures_total{base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",reason="partial_swap"} 2',
         'mint_megatron_actor_lifecycle_events_total{base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",event="evicted"} 1',
         'mint_megatron_actor_lifecycle_events_total{base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",event="startup_timeout"} 1',
+        'mint_training_operation_total{backend="megatron",base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",failure_class="none",op="forward_backward",status="ok"} 4',
+        'mint_training_operation_duration_s_sum{backend="megatron",base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",failure_class="none",op="forward_backward",status="ok"} 18',
+        'mint_dense_actor_bind_decision_total{base_model="Qwen/Qwen3-0.6B",decision="rebind_refused_poisoned"} 1',
+        'mint_dense_actor_fatal_total{base_model="Qwen/Qwen3-0.6B",failure_class="cuda_fatal",op="forward_backward"} 1',
+        'mint_dense_actor_retire_total{base_model="Qwen/Qwen3-0.6B",outcome="ok"} 1',
     )
     for line in extra_lines:
         assert line in text, f"missing metric line: {line}"

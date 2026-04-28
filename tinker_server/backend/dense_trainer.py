@@ -38,6 +38,8 @@ DENSE_POISONED_KEY = "poisoned"
 DENSE_POISON_REASON_KEY = "poison_reason"
 DENSE_POISONED_AT_KEY = "poisoned_at"
 DENSE_POISONED_SESSION_KEY = "poisoned_session_id"
+DENSE_LAST_FATAL_OP_KEY = "last_fatal_op"
+DENSE_LAST_FATAL_REQUEST_ID_KEY = "last_fatal_request_id"
 
 _lock = threading.Lock()
 _inflight: dict[str, threading.Event] = {}
@@ -93,10 +95,19 @@ def _base_dense_metadata(*, actual_rank: int, max_lora_rank: int, model_key: str
         DENSE_POISON_REASON_KEY: None,
         DENSE_POISONED_AT_KEY: None,
         DENSE_POISONED_SESSION_KEY: None,
+        DENSE_LAST_FATAL_OP_KEY: None,
+        DENSE_LAST_FATAL_REQUEST_ID_KEY: None,
     }
 
 
-def _poison_metadata(metadata: dict[str, object] | None, *, reason: str, session_id: str | None) -> dict[str, object]:
+def _poison_metadata(
+    metadata: dict[str, object] | None,
+    *,
+    reason: str,
+    session_id: str | None,
+    fatal_op: str | None = None,
+    request_id: str | None = None,
+) -> dict[str, object]:
     poisoned = dict(metadata or {})
     poisoned.update(
         {
@@ -104,6 +115,8 @@ def _poison_metadata(metadata: dict[str, object] | None, *, reason: str, session
             DENSE_POISON_REASON_KEY: str(reason),
             DENSE_POISONED_AT_KEY: time.time(),
             DENSE_POISONED_SESSION_KEY: session_id,
+            DENSE_LAST_FATAL_OP_KEY: None if fatal_op is None else str(fatal_op),
+            DENSE_LAST_FATAL_REQUEST_ID_KEY: None if request_id is None else str(request_id),
         }
     )
     return poisoned
@@ -222,21 +235,33 @@ def retire_dense_trainer(
     reason: str,
     base_model: str,
     session_id: str | None = None,
+    fatal_op: str | None = None,
+    request_id: str | None = None,
     namespace: str = PERSISTENT_DENSE_NAMESPACE,
     actor: ray.actor.ActorHandle | None = None,
 ) -> None:
     """Poison a dense trainer so it cannot be reused after fatal GPU failures."""
+    from .runtime_observability import runtime_observability
+
     pool = get_resource_pool()
     entry = pool.get(actor_name)
+    retire_outcome = "ok"
 
     if entry is not None:
         try:
             pool.update_metadata(
                 actor_name,
-                metadata=_poison_metadata(entry.metadata, reason=reason, session_id=session_id),
+                metadata=_poison_metadata(
+                    entry.metadata,
+                    reason=reason,
+                    session_id=session_id,
+                    fatal_op=fatal_op,
+                    request_id=request_id,
+                ),
                 sample_source="dense_retire",
             )
         except Exception:
+            retire_outcome = "metadata_update_failed"
             logger.warning(
                 "[dense_trainer] failed to persist poison metadata actor_name=%s reason=%s",
                 actor_name,
@@ -247,6 +272,8 @@ def retire_dense_trainer(
         try:
             pool.clear_session(session_id, actor_type=ActorType.DENSE)
         except Exception:
+            if retire_outcome == "ok":
+                retire_outcome = "clear_session_failed"
             logger.warning(
                 "[dense_trainer] failed clear_session actor_name=%s session_id=%s",
                 actor_name,
@@ -257,6 +284,8 @@ def retire_dense_trainer(
         try:
             pool.set_session(actor_name, None)
         except Exception:
+            if retire_outcome == "ok":
+                retire_outcome = "clear_binding_failed"
             logger.warning(
                 "[dense_trainer] failed to clear bound session actor_name=%s",
                 actor_name,
@@ -270,6 +299,8 @@ def retire_dense_trainer(
         except ValueError:
             actor_absent = True
         except Exception:
+            if retire_outcome == "ok":
+                retire_outcome = "actor_lookup_failed"
             logger.warning(
                 "[dense_trainer] failed actor lookup during retire actor_name=%s reason=%s",
                 actor_name,
@@ -297,6 +328,8 @@ def retire_dense_trainer(
             )
             actor_absent = True
         except Exception:
+            if retire_outcome == "ok":
+                retire_outcome = "kill_failed"
             logger.warning(
                 "[dense_trainer] failed retire actor_name=%s reason=%s",
                 actor_name,
@@ -310,12 +343,18 @@ def retire_dense_trainer(
         try:
             pool.unregister(actor_name)
         except Exception:
+            if retire_outcome == "ok":
+                retire_outcome = "unregister_failed"
             logger.warning(
                 "[dense_trainer] failed unregister after retire actor_name=%s reason=%s",
                 actor_name,
                 reason,
                 exc_info=True,
             )
+    elif retire_outcome == "ok":
+        retire_outcome = "actor_still_present"
+
+    runtime_observability.record_dense_actor_retire(base_model=base_model, outcome=retire_outcome)
 
 
 def get_or_create_dense_trainer(
@@ -361,9 +400,11 @@ def get_or_create_dense_trainer(
             effective_max_rank = max(int(lora_rank), int(max_lora_rank or 0), int(DEFAULT_MAX_LORA_RANK))
             name_key = model_key or base_model
             actor_name = _make_actor_name(model_key=name_key, max_rank=effective_max_rank)
+            bind_decision = "create"
 
             pool = get_resource_pool()
             from .model_registry import is_persistent_model
+            from .runtime_observability import runtime_observability
 
             is_persistent = is_persistent_model(base_model)
 
@@ -372,6 +413,7 @@ def get_or_create_dense_trainer(
             try:
                 actor = ray.get_actor(actor_name, namespace=PERSISTENT_DENSE_NAMESPACE)
                 if reuse_block_reason is not None:
+                    bind_decision = "recreate_poisoned"
                     retire_dense_trainer(
                         actor_name=actor_name,
                         actor=actor,
@@ -381,6 +423,7 @@ def get_or_create_dense_trainer(
                     )
                     actor = None
                 if actor is not None:
+                    bind_decision = "reuse"
                     # Heartbeat: if busy, we still treat as alive.
                     try:
                         ray.get(actor.heartbeat.remote(), timeout=5)
@@ -479,6 +522,7 @@ def get_or_create_dense_trainer(
             )
             pool.mark_ready(actor_name)
             entry.current_session = session_id
+            runtime_observability.record_dense_actor_bind_decision(base_model=base_model, decision=bind_decision)
 
             return DenseTrainerHandle(
                 actor=actor,

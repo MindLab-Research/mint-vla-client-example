@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import tinker_server.backend.runtime_observability as runtime_obs_module
+
 
 def test_issue_439_dense_trainer_does_not_pass_removed_session_state_root(monkeypatch) -> None:
     from tinker_server.backend import dense_trainer as dt
@@ -73,6 +75,9 @@ def test_issue_439_dense_trainer_does_not_pass_removed_session_state_root(monkey
 def test_issue_561_poisoned_dense_trainer_is_not_reused(monkeypatch) -> None:
     from tinker_server.backend import dense_trainer as dt
     from tinker_server import config as cfg
+
+    obs = runtime_obs_module.RuntimeObservability()
+    monkeypatch.setattr(runtime_obs_module, "runtime_observability", obs)
 
     monkeypatch.setattr(cfg, "PFS_RUNTIME_ENV_ROOT", "/tmp/runtime-root")
     monkeypatch.setattr(cfg, "PFS_TINKER_PATH", "/tmp/tinker-root")
@@ -148,8 +153,74 @@ def test_issue_561_poisoned_dense_trainer_is_not_reused(monkeypatch) -> None:
     assert len(retire_calls) == 1
     assert retire_calls[0]["actor_name"] == actor_name
     assert "reuse_blocked" in str(retire_calls[0]["reason"])
+    assert obs.snapshot()["dense_actor_bind_decision"] == [
+        {
+            "base_model": "Qwen/Qwen3-0.6B",
+            "decision": "recreate_poisoned",
+            "count": 1,
+        }
+    ]
     assert remote_kwargs == {
         "base_model": "Qwen/Qwen3-0.6B",
         "lora_rank": 64,
         "learning_rate": 1e-4,
     }
+
+
+def test_issue_561_retire_dense_trainer_persists_fatal_metadata(monkeypatch) -> None:
+    from tinker_server.backend import dense_trainer as dt
+
+    metadata_updates: list[dict[str, object]] = []
+    clears: list[tuple[str, object]] = []
+    unregisters: list[str] = []
+    obs = runtime_obs_module.RuntimeObservability()
+
+    entry = SimpleNamespace(metadata={"poisoned": False})
+
+    class _FakePool:
+        def get(self, actor_name: str):
+            assert actor_name == "peft_trainer_qwen__qwen3_0_6b_maxr64"
+            return entry
+
+        def update_metadata(self, actor_name: str, *, metadata, sample_source=None):
+            metadata_updates.append({"actor_name": actor_name, "metadata": dict(metadata), "sample_source": sample_source})
+
+        def clear_session(self, session_id: str, actor_type=None):
+            clears.append((session_id, actor_type))
+
+        def unregister(self, actor_name: str):
+            unregisters.append(actor_name)
+
+    monkeypatch.setattr(dt, "get_resource_pool", lambda: _FakePool())
+    monkeypatch.setattr(runtime_obs_module, "runtime_observability", obs)
+    monkeypatch.setattr(dt.ray, "get_actor", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("missing")))
+    monkeypatch.setattr(dt, "_remove_pg", lambda actor_name: None)
+
+    dt.retire_dense_trainer(
+        actor_name="peft_trainer_qwen__qwen3_0_6b_maxr64",
+        reason="forward_backward:CUDA error: device-side assert triggered",
+        base_model="Qwen/Qwen3-0.6B",
+        session_id="model-561",
+        fatal_op="forward_backward",
+        request_id="req-561",
+    )
+
+    assert len(metadata_updates) == 1
+    update = metadata_updates[0]
+    assert update["actor_name"] == "peft_trainer_qwen__qwen3_0_6b_maxr64"
+    assert update["sample_source"] == "dense_retire"
+    assert update["metadata"]["poisoned"] is True
+    assert update["metadata"]["poison_reason"] == "forward_backward:CUDA error: device-side assert triggered"
+    assert update["metadata"]["poisoned_session_id"] == "model-561"
+    assert update["metadata"]["last_fatal_op"] == "forward_backward"
+    assert update["metadata"]["last_fatal_request_id"] == "req-561"
+    assert isinstance(update["metadata"]["poisoned_at"], float)
+    assert clears == [("model-561", dt.ActorType.DENSE)]
+    assert unregisters == ["peft_trainer_qwen__qwen3_0_6b_maxr64"]
+    assert obs.snapshot()["dense_actor_retire"] == [
+        {
+            "base_model": "Qwen/Qwen3-0.6B",
+            "outcome": "ok",
+            "count": 1,
+        }
+    ]
