@@ -173,7 +173,7 @@ def test_issue_193_megatron_save_weights_passes_explicit_session_id(monkeypatch)
     args, kwargs = worker.save_checkpoint.calls[0]
     assert args == (str(Path("/tmp/issue_193_ckpt").resolve()),)
     assert kwargs["session_id"] == model_id
-    assert kwargs["use_per_expert_lora"] is True
+    assert "use_per_expert_lora" not in kwargs
     assert kwargs["train_attn"] is False
     assert kwargs["train_mlp"] is True
     assert kwargs["train_unembed"] is False
@@ -334,8 +334,8 @@ def test_issue_193_megatron_save_weights_retry_same_session_is_idempotent(monkey
     assert first_args == second_args == (str(Path("/tmp/issue_193_ckpt_retry").resolve()),)
     assert first_kwargs["session_id"] == model_id
     assert second_kwargs["session_id"] == model_id
-    assert first_kwargs["use_per_expert_lora"] is True
-    assert second_kwargs["use_per_expert_lora"] is True
+    assert "use_per_expert_lora" not in first_kwargs
+    assert "use_per_expert_lora" not in second_kwargs
 
 
 def test_issue_193_megatron_save_weights_concurrent_shared_actor_is_isolated(monkeypatch):

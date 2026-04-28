@@ -747,9 +747,9 @@ def test_issue_193_megatron_load_weights_passes_explicit_session_id_and_keepaliv
     assert args == ("/tmp/issue_193_megatron_load", False)
     assert kwargs["traceparent"] is None
     assert kwargs["session_id"] == model_id
-    assert kwargs["train_attn"] is False
-    assert kwargs["train_mlp"] is True
-    assert kwargs["train_unembed"] is False
+    assert "train_attn" not in kwargs
+    assert "train_mlp" not in kwargs
+    assert "train_unembed" not in kwargs
     assert worker.mark_session_loaded.calls == [
         (
             (model_id,),
