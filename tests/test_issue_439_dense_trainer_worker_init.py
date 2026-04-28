@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -173,6 +174,30 @@ def test_issue_561_poisoned_dense_trainer_is_not_reused(monkeypatch, base_model:
         "lora_rank": 64,
         "learning_rate": 1e-4,
     }
+
+
+def test_issue_561_inflight_guard_uses_actor_identity(monkeypatch) -> None:
+    from tinker_server.backend import dense_trainer as dt
+
+    actor_name = dt._make_actor_name(model_key="Qwen/Qwen3-0.6B", max_rank=dt.DEFAULT_MAX_LORA_RANK)
+    monkeypatch.setenv("MINT_DENSE_INFLIGHT_WAIT_S", "0.001")
+    monkeypatch.setattr(dt, "_inflight", {actor_name: threading.Event()})
+    monkeypatch.setattr(dt, "_inflight_errors", {})
+    monkeypatch.setattr(
+        dt,
+        "get_resource_pool",
+        lambda: (_ for _ in ()).throw(AssertionError("creation path should be guarded by actor identity")),
+    )
+
+    with pytest.raises(TimeoutError, match=actor_name):
+        dt.get_or_create_dense_trainer(
+            training_worker_cls=object,
+            base_model="/mnt/hf-snapshots/qwen3-0.6b-a",
+            model_key="Qwen/Qwen3-0.6B",
+            lora_rank=8,
+            learning_rate=1e-4,
+            session_id="model-561-a",
+        )
 
 
 def test_issue_561_retire_dense_trainer_persists_fatal_metadata(monkeypatch) -> None:

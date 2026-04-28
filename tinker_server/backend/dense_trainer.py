@@ -2,7 +2,7 @@
 
 This module replaces the previous DenseTrainerPool tracking dictionary with:
 - deterministic actor naming
-- a small inflight-creation guard (per base_model)
+- a small inflight-creation guard keyed by Ray actor identity
 - ResourcePool registration for lifecycle and eviction
 """
 
@@ -387,7 +387,10 @@ def get_or_create_dense_trainer(
       - actual_rank (current session rank)
     """
     wait_timeout_s = float(os.environ.get("MINT_DENSE_INFLIGHT_WAIT_S", "1800"))
-    key = base_model
+    effective_max_rank = max(int(lora_rank), int(max_lora_rank or 0), int(DEFAULT_MAX_LORA_RANK))
+    name_key = model_key or base_model
+    actor_name = _make_actor_name(model_key=name_key, max_rank=effective_max_rank)
+    key = actor_name
 
     while True:
         with _lock:
@@ -402,7 +405,10 @@ def get_or_create_dense_trainer(
 
         if not creator:
             if not inflight.wait(timeout=wait_timeout_s):
-                raise TimeoutError(f"dense_trainer inflight create timed out after {wait_timeout_s}s base_model={base_model}")
+                raise TimeoutError(
+                    f"dense_trainer inflight create timed out after {wait_timeout_s}s "
+                    f"actor_name={actor_name} base_model={base_model}"
+                )
             with _lock:
                 err = _inflight_errors.get(key)
             if err:
@@ -410,9 +416,6 @@ def get_or_create_dense_trainer(
             continue
 
         try:
-            effective_max_rank = max(int(lora_rank), int(max_lora_rank or 0), int(DEFAULT_MAX_LORA_RANK))
-            name_key = model_key or base_model
-            actor_name = _make_actor_name(model_key=name_key, max_rank=effective_max_rank)
             bind_decision = "create"
 
             pool = get_resource_pool()
