@@ -420,10 +420,7 @@ def test_issue_193_megatron_load_checkpoint_uses_explicit_load_prepare(tmp_path:
     ckpt_dir = tmp_path / "ckpt"
     ckpt_dir.mkdir()
     (ckpt_dir / "mp_rank_00_000_000_adapter.pt").write_bytes(b"adapter")
-    (ckpt_dir / "adapter_config.json").write_text(
-        json.dumps({"r": 8, "target_modules": ["gate_proj", "up_proj", "down_proj"]}),
-        encoding="utf-8",
-    )
+    (ckpt_dir / "adapter_config.json").write_text(json.dumps({"r": 8}), encoding="utf-8")
     (ckpt_dir / "training_meta.json").write_text(
         json.dumps({"current_step": 3, "learning_rate": 2e-4}),
         encoding="utf-8",
@@ -466,9 +463,9 @@ def test_issue_193_megatron_load_checkpoint_uses_explicit_load_prepare(tmp_path:
             {
                 "actual_rank": 8,
                 "traceparent": None,
-                "train_attn": False,
-                "train_mlp": True,
-                "train_unembed": False,
+                "train_attn": None,
+                "train_mlp": None,
+                "train_unembed": None,
                 "reload_optimizer_model_params": False,
             },
         )
@@ -592,4 +589,5 @@ def test_issue_193_dense_recycle_fails_loud_after_dead_worker_during_forward(mon
 
     assert model_id in engine._poisoned_sessions
     assert model_id in engine._poisoned_sessions
+
 
