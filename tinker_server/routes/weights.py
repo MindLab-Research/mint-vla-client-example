@@ -381,13 +381,12 @@ def _checkpoint_can_recreate_training_client(path: str, *, backend: str) -> bool
             return any(name.startswith("mp_rank_") and name.endswith("_adapter.pt") for name in os.listdir(path))
         except OSError:
             return False
+    if backend != "peft":
+        return False
     try:
         names = os.listdir(path)
     except OSError:
         return False
-    has_rank_adapter = any(name.startswith("mp_rank_") and name.endswith("_adapter.pt") for name in names)
-    if has_rank_adapter:
-        return True
     has_adapter_model = "adapter_model.safetensors" in names
     return has_adapter_model and checkpoint_has_optimizer_state(path)
 

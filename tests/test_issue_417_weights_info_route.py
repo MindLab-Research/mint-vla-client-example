@@ -239,6 +239,51 @@ def test_issue_417_weights_info_accepts_peft_training_adapter_checkpoint(
     }
 
 
+def test_issue_417_weights_info_rejects_peft_rank_shard_without_peft_artifacts(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from tinker_server.routes import weights as weights_routes
+
+    ckpt = tmp_path / "peft_rank_shard_only_ckpt"
+    ckpt.mkdir()
+    (ckpt / "metadata.json").write_text(
+        json.dumps(
+            {
+                "model_name": "Qwen/Qwen3-0.6B",
+                "checkpoint_type": "training",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (ckpt / "adapter_config.json").write_text(
+        json.dumps(
+            {
+                "r": 8,
+                "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+                "base_model_name_or_path": "Qwen/Qwen3-0.6B",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (ckpt / "mp_rank_00_adapter.pt").write_bytes(b"adapter-rank")
+
+    monkeypatch.setattr(
+        weights_routes,
+        "_resolve_mint_path",
+        lambda mint_uri, *, user_id, is_admin=False: str(ckpt),
+    )
+
+    app = FastAPI()
+    app.include_router(weights_routes.router, prefix="/api/v1")
+    client = TestClient(app)
+
+    response = client.post("/api/v1/weights_info", json={"tinker_path": "tinker://run/weights/peft-rank"})
+
+    assert response.status_code == 400, response.text
+    assert "Checkpoint artifacts cannot recreate a peft training client" in response.text
+
+
 def test_issue_417_weights_info_accepts_optimizerless_training_adapter_checkpoint(
     tmp_path: Path,
     monkeypatch,
