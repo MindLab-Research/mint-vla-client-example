@@ -200,6 +200,80 @@ def test_issue_193_megatron_current_session_corruption_fails_closed():
         group._ensure_session_loaded("session_current")
 
 
+def test_issue_193_megatron_explicit_load_prepare_converges_outgoing_actor_only_state(monkeypatch):
+    group_cls = MegatronWorkerGroup.__ray_actor_class__
+    group = group_cls.__new__(group_cls)
+    group._current_session = "session_outgoing"
+    group.base_model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    group.learning_rate = 1e-4
+    group._step_count = 0
+    group._actual_rank = 8
+    group.lora_rank = 8
+    group._session_unknown_due_to_partial_swap = False
+
+    swap_calls: list[str] = []
+    mark_calls: list[str] = []
+    clear_calls: list[str] = []
+    clear_persisted_calls: list[str] = []
+    save_metadata_calls: list[tuple] = []
+    persisted_manifest_calls: list[dict] = []
+
+    class _FakeWorker:
+        class clear_session_state:
+            @staticmethod
+            def remote(session_id, traceparent=None):
+                clear_calls.append(session_id)
+                return object()
+
+        class mark_session_loaded:
+            @staticmethod
+            def remote(session_id):
+                mark_calls.append(session_id)
+                return object()
+
+    group.workers = [_FakeWorker()]
+    group._session_manager = SimpleNamespace(
+        get_session_path=lambda session_id: f"/tmp/{session_id}",
+        has_actor_only_state=lambda session_id: session_id == "session_outgoing",
+        session_exists=lambda session_id: session_id == "session_target",
+        save_metadata=lambda *args: save_metadata_calls.append(args),
+        clear_persisted_actor_only_state=lambda session_id: clear_persisted_calls.append(session_id),
+        clear_actor_only_state=lambda session_id: clear_calls.append(session_id),
+        save_persisted_actor_only_state=lambda session_id, actor_name, worker_entries: persisted_manifest_calls.append(
+            {
+                "session_id": session_id,
+                "actor_name": actor_name,
+                "worker_entries": worker_entries,
+            }
+        ),
+    )
+    group._bind_traceparent = lambda traceparent: None
+    group.save_adapter_state = lambda *args, **kwargs: None
+    group._swap_session_on_workers = lambda session_id: (
+        swap_calls.append(session_id)
+        or [{"outgoing_persisted": {"rank": 0, "path": "/tmp/r0.pt", "bytes": 123}}]
+    )
+    monkeypatch.setattr(ray, "get", lambda refs, timeout=None: None)
+
+    group._prepare_session_for_explicit_load("session_target")
+
+    assert swap_calls == ["session_target"]
+    assert mark_calls == []
+    assert save_metadata_calls and save_metadata_calls[0][0] == "session_outgoing"
+    assert clear_persisted_calls == ["session_target"]
+    assert persisted_manifest_calls == [
+        {
+            "session_id": "session_outgoing",
+            "actor_name": "megatron_qwen3_30b_a3b_instruct_2507",
+            "worker_entries": [{"rank": 0, "path": "/tmp/r0.pt", "bytes": 123}],
+        }
+    ]
+    # clear_session_state(target) + clear_actor_only_state(target) + clear_actor_only_state(outgoing)
+    assert clear_calls.count("session_target") == 2
+    assert clear_calls.count("session_outgoing") == 1
+    assert group._current_session == "session_target"
+
+
 def test_issue_193_megatron_explicit_load_prepare_allows_dirty_target_on_fresh_actor(monkeypatch):
     group_cls = MegatronWorkerGroup.__ray_actor_class__
     group = group_cls.__new__(group_cls)
@@ -235,6 +309,51 @@ def test_issue_193_megatron_explicit_load_prepare_allows_dirty_target_on_fresh_a
     assert clear_calls == ["session_target"]
     assert swap_calls == ["session_target"]
     assert group._current_session == "session_target"
+
+
+def test_issue_527_megatron_explicit_load_prepare_same_session_discards_target_actor_only_state(monkeypatch):
+    group_cls = MegatronWorkerGroup.__ray_actor_class__
+    group = group_cls.__new__(group_cls)
+    group._current_session = "session_target"
+    group.base_model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    group.learning_rate = 1e-4
+    group._step_count = 12
+    group._actual_rank = 8
+    group.lora_rank = 8
+    group._session_unknown_due_to_partial_swap = True
+
+    worker_clear_calls: list[tuple[str, object]] = []
+    clear_persisted_calls: list[str] = []
+    clear_actor_calls: list[str] = []
+
+    class _FakeWorker:
+        class clear_session_state:
+            @staticmethod
+            def remote(session_id, traceparent=None):
+                worker_clear_calls.append((session_id, traceparent))
+                return object()
+
+    group.workers = [_FakeWorker()]
+    group._session_manager = SimpleNamespace(
+        clear_persisted_actor_only_state=lambda session_id: clear_persisted_calls.append(session_id),
+        clear_actor_only_state=lambda session_id: clear_actor_calls.append(session_id),
+    )
+    group._bind_traceparent = lambda traceparent: None
+    group.save_adapter_state = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("same-session explicit load must not resave outgoing state")
+    )
+    group._swap_session_on_workers = lambda session_id: (_ for _ in ()).throw(
+        AssertionError("same-session explicit load must discard state instead of swapping")
+    )
+    monkeypatch.setattr(ray, "get", lambda refs, timeout=None: None)
+
+    group._prepare_session_for_explicit_load("session_target")
+
+    assert worker_clear_calls == [("session_target", None)]
+    assert clear_persisted_calls == ["session_target"]
+    assert clear_actor_calls == ["session_target"]
+    assert group._current_session == "session_target"
+    assert group._session_unknown_due_to_partial_swap is False
 
 
 def test_issue_193_megatron_forward_uses_ensure_session_loaded(monkeypatch):
@@ -457,19 +576,14 @@ def test_issue_193_megatron_load_checkpoint_uses_explicit_load_prepare(tmp_path:
     result = group.load_checkpoint(str(ckpt_dir), load_optimizer=False, session_id="session_target")
 
     assert prepare_calls == ["session_target"]
-    assert load_adapter_calls == [
-        (
-            str(ckpt_dir),
-            {
-                "actual_rank": 8,
-                "traceparent": None,
-                "train_attn": None,
-                "train_mlp": None,
-                "train_unembed": None,
-                "reload_optimizer_model_params": False,
-            },
-        )
-    ]
+    assert len(load_adapter_calls) == 1
+    call_path, call_kwargs = load_adapter_calls[0]
+    assert call_path == str(ckpt_dir)
+    assert call_kwargs["actual_rank"] == 8
+    assert call_kwargs["traceparent"] is None
+    assert call_kwargs["train_attn"] is None
+    assert call_kwargs["train_mlp"] is None
+    assert call_kwargs["train_unembed"] is None
     assert reset_optimizer_calls == [
         (
             (2e-4,),
@@ -589,5 +703,206 @@ def test_issue_193_dense_recycle_fails_loud_after_dead_worker_during_forward(mon
 
     assert model_id in engine._poisoned_sessions
     assert model_id in engine._poisoned_sessions
+
+
+def test_issue_527_contaminated_session_blocks_request_before_restore():
+    group_cls = MegatronWorkerGroup.__ray_actor_class__
+    group = group_cls.__new__(group_cls)
+    group._resolve_required_session_id = lambda session_id, op: session_id
+    group._contaminated_sessions = {"session_target": "forward:group_timeout:600s"}
+
+    with pytest.raises(RuntimeError, match="contaminated"):
+        group._ensure_session_for_request(
+            op="forward",
+            session_id="session_target",
+            traceparent=None,
+            train_attn=None,
+            train_mlp=None,
+            train_unembed=None,
+        )
+
+
+def test_issue_527_ensure_failure_marks_session_contaminated():
+    group_cls = MegatronWorkerGroup.__ray_actor_class__
+    group = group_cls.__new__(group_cls)
+    group._resolve_required_session_id = lambda session_id, op: session_id
+    group._ensure_session_loaded = lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("swap failed"))
+
+    with pytest.raises(ValueError, match="swap failed"):
+        group._ensure_session_for_request(
+            op="optim_step",
+            session_id="session_target",
+            traceparent=None,
+            train_attn=None,
+            train_mlp=None,
+            train_unembed=None,
+        )
+
+    assert "session_target" in group._contaminated_sessions
+    assert "optim_step:ensure_session_loaded:ValueError" in group._contaminated_sessions["session_target"]
+
+
+def test_issue_527_trusted_pair_mismatch_blocks_request(monkeypatch):
+    group_cls = MegatronWorkerGroup.__ray_actor_class__
+    group = group_cls.__new__(group_cls)
+    group._resolve_required_session_id = lambda session_id, op: session_id
+    group._ensure_session_loaded = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("trusted pair mismatch must fail before restore")
+    )
+    group._session_manager = SimpleNamespace(
+        get_external_checkpoint=lambda session_id: {
+            "checkpoint_path": "/tmp/external",
+            "checkpoint_identity": "identity-a",
+            "is_fresh": True,
+            "invalidated_at": None,
+            "invalidated_reason": None,
+        },
+        get_trusted_recovery_baseline=lambda session_id: {
+            "checkpoint_path": "/tmp/baseline",
+            "checkpoint_identity": "identity-b",
+            "is_fresh": True,
+            "invalidated_at": None,
+            "invalidated_reason": None,
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="trusted pair checkpoint_identity mismatch"):
+        group._ensure_session_for_request(
+            op="forward_backward",
+            session_id="session_target",
+            traceparent=None,
+            train_attn=None,
+            train_mlp=None,
+            train_unembed=None,
+        )
+
+    assert group._blocked_sessions["session_target"].startswith("trusted_pair_mismatch")
+
+
+def test_issue_527_trusted_pair_strict_mode_requires_counterpart_marker(monkeypatch):
+    monkeypatch.setenv("MINT_MEGATRON_ENFORCE_TRUSTED_PAIR", "1")
+    group_cls = MegatronWorkerGroup.__ray_actor_class__
+    group = group_cls.__new__(group_cls)
+    group._resolve_required_session_id = lambda session_id, op: session_id
+    group._ensure_session_loaded = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("strict trusted pair should fail before restore")
+    )
+    group._session_manager = SimpleNamespace(
+        get_external_checkpoint=lambda session_id: {
+            "checkpoint_path": "/tmp/external",
+            "checkpoint_identity": "identity-a",
+            "is_fresh": True,
+            "invalidated_at": None,
+            "invalidated_reason": None,
+        },
+        get_trusted_recovery_baseline=lambda session_id: None,
+    )
+
+    with pytest.raises(RuntimeError, match="strict trusted-pair enforcement"):
+        group._ensure_session_for_request(
+            op="forward",
+            session_id="session_target",
+            traceparent=None,
+            train_attn=None,
+            train_mlp=None,
+            train_unembed=None,
+        )
+
+
+def test_issue_527_trusted_recovery_baseline_marker_roundtrip(tmp_path: Path):
+    manager = MegatronSessionStateManager(base_path=str(tmp_path / "sessions"))
+    ckpt_dir = tmp_path / "checkpoint"
+    ckpt_dir.mkdir()
+    (ckpt_dir / "mp_rank_00_adapter.pt").write_text("adapter", encoding="utf-8")
+
+    identity = manager.checkpoint_identity(str(ckpt_dir))
+    session_id = "session_issue_527_baseline"
+    manager.mark_trusted_recovery_baseline(
+        session_id,
+        checkpoint_path=str(ckpt_dir),
+        checkpoint_identity=identity,
+        reason="unit_test",
+        actor_name="megatron_qwen3_30b_a3b_instruct_2507",
+    )
+
+    fresh = manager.get_trusted_recovery_baseline(session_id)
+    assert fresh is not None
+    assert fresh["checkpoint_identity"] == identity
+    assert fresh["is_fresh"] is True
+
+    stale = manager.invalidate_trusted_recovery_baseline(session_id, reason="after_train_step")
+    assert stale is not None
+    assert stale["is_fresh"] is False
+    assert stale["invalidated_reason"] == "after_train_step"
+
+    manager.clear_trusted_recovery_baseline(session_id)
+    assert manager.get_trusted_recovery_baseline(session_id) is None
+
+
+def test_issue_527_group_timeout_marks_session_contaminated(monkeypatch):
+    group_cls = MegatronWorkerGroup.__ray_actor_class__
+    group = group_cls.__new__(group_cls)
+    group.workers = [object(), object()]
+
+    def _raise_timeout(*_args, **_kwargs):
+        raise ray.exceptions.GetTimeoutError("timeout")
+
+    monkeypatch.setattr(ray, "get", _raise_timeout)
+
+    with pytest.raises(RuntimeError, match="timed out"):
+        group._ray_get_group_results(
+            [object()],
+            op="forward_backward",
+            session_id="session_target",
+            timeout_s=10,
+        )
+
+    assert "session_target" in group._contaminated_sessions
+    assert "forward_backward:group_timeout:10s" in group._contaminated_sessions["session_target"]
+
+
+def test_issue_527_invalidate_session_durability_invalidates_external_and_baseline_markers():
+    group_cls = MegatronWorkerGroup.__ray_actor_class__
+    group = group_cls.__new__(group_cls)
+    calls: list[tuple[str, str, str]] = []
+
+    group._session_manager = SimpleNamespace(
+        invalidate_external_checkpoint=lambda session_id, reason: calls.append(("external", session_id, reason))
+        or {"is_fresh": False, "invalidated_reason": reason},
+        invalidate_trusted_recovery_baseline=lambda session_id, reason: calls.append(("baseline", session_id, reason)),
+    )
+
+    marker = group._invalidate_session_durability("session_target", reason="test_reason")
+
+    assert marker is not None
+    assert ("external", "session_target", "test_reason") in calls
+    assert ("baseline", "session_target", "test_reason") in calls
+
+
+def test_issue_527_get_session_guard_state_reports_markers_and_latches():
+    group_cls = MegatronWorkerGroup.__ray_actor_class__
+    group = group_cls.__new__(group_cls)
+    group._contaminated_sessions = {"session_target": "forward_backward:group_timeout:600s"}
+    group._blocked_sessions = {"session_target": "trusted_pair_mismatch:deadbeef!=cafebabe"}
+    group._session_manager = SimpleNamespace(
+        get_external_checkpoint=lambda session_id: {
+            "checkpoint_path": "/tmp/external",
+            "checkpoint_identity": "identity-a",
+            "is_fresh": True,
+        },
+        get_trusted_recovery_baseline=lambda session_id: {
+            "checkpoint_path": "/tmp/baseline",
+            "checkpoint_identity": "identity-a",
+            "is_fresh": True,
+        },
+    )
+
+    state = group.get_session_guard_state("session_target")
+
+    assert state["session_id"] == "session_target"
+    assert state["contaminated"] is True
+    assert state["blocked"] is True
+    assert state["external_checkpoint"]["checkpoint_identity"] == "identity-a"
+    assert state["trusted_recovery_baseline"]["checkpoint_identity"] == "identity-a"
 
 

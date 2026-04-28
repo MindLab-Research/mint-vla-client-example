@@ -86,6 +86,22 @@ def _iter_pg_bundle_items(bundles: object) -> list[tuple[str, dict[str, object]]
     return items
 
 
+def _is_ray_client_mode() -> bool:
+    try:
+        client_mod = getattr(ray.util, "client", None)
+        if client_mod is None:
+            return False
+        ray_client = getattr(client_mod, "ray", None)
+        if ray_client is None:
+            return False
+        is_connected = getattr(ray_client, "is_connected", None)
+        if callable(is_connected):
+            return bool(is_connected())
+    except Exception:
+        return False
+    return False
+
+
 def _ray_state_api_address() -> str | None:
     for name in ("MINT_RAY_CLIENT_ADDRESS", "RAY_CLIENT_ADDRESS", "RAY_ADDRESS"):
         raw = str(os.environ.get(name) or "").strip()
@@ -262,7 +278,10 @@ def _available_resources_per_node_with_pg_fallback(
     except Exception as e:
         logger.debug("%s: resource_pool fallback failed: %s", context, e)
 
-    fail_closed_on_missing = not actor_state_ok
+    # Ray Client mode cannot always access per-node availability via ray._private.state.
+    # If actor-state fallback succeeds we can still trust the derived reservations. Otherwise,
+    # treat Ray Client runs as schedulable unless explicit reservations say otherwise.
+    fail_closed_on_missing = not (actor_state_ok or _is_ray_client_mode())
 
     return (
         {node_id: {"GPU": -used_gpus} for node_id, used_gpus in used_gpus_by_node.items()},

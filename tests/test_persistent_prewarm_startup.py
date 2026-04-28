@@ -475,6 +475,42 @@ def test_lifespan_follower_skips_leader_only_startup(monkeypatch) -> None:
     assert len(init_ray_calls) == 0
 
 
+def test_lifespan_owner_runtime_local_only_uses_async_cleanup_helper(monkeypatch) -> None:
+    queue = _StubApiWorkQueue()
+    owner_runtime = _StubOwnerRuntimeSupervisor()
+    queue_execution_runtime = _StubQueueExecutionRuntime()
+    _install_lifespan_stubs(monkeypatch, queue, owner_runtime, queue_execution_runtime)
+    lease = _StubStartupLease(is_owner=True)
+    cleanup_calls: list[str] = []
+
+    async def _acquire_startup_lease(*_args, **_kwargs):
+        return lease
+
+    async def _count_cleanup(*_args, **_kwargs) -> None:
+        cleanup_calls.append("cleanup")
+
+    monkeypatch.setenv("MINT_OWNER_RUNTIME_SUPERVISOR_LOCAL_ONLY", "1")
+    monkeypatch.setattr(app_module, "_cleanup_stale_actors", _count_cleanup)
+    monkeypatch.setattr(
+        "tinker_server.backend.startup_lease.acquire_startup_lease",
+        _acquire_startup_lease,
+    )
+
+    async def _run() -> None:
+        async with app_module.lifespan(app_module.app):
+            return None
+
+    asyncio.run(_run())
+
+    assert cleanup_calls == ["cleanup"]
+    assert owner_runtime.started == 0
+    assert lease.heartbeat_started is True
+    assert lease.released is True
+    assert queue_execution_runtime.ensure_started_calls == [
+        {"num_workers": 1, "timeout_s": 120.0}
+    ]
+
+
 def test_lifespan_init_ray_when_head_address_path_configured(monkeypatch, tmp_path: Path) -> None:
     queue = _StubApiWorkQueue()
     owner_runtime = _StubOwnerRuntimeSupervisor()

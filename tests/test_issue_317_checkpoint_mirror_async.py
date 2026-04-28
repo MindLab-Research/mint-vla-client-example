@@ -54,7 +54,26 @@ def test_issue_317_begin_async_checkpoint_mirror_marks_pending(monkeypatch, tmp_
     meta = checkpoints.read_checkpoint_metadata(str(cache_dir))
     assert meta["mirror_status"] == checkpoints.MIRROR_STATUS_PENDING
     assert meta["persistent_mirror_path"] == persistent_path
+    assert meta["checkpoint_type"] == "training"
+    assert meta["type"] == "training"
     assert kicked == ["kicked"]
+
+
+def test_issue_317_update_checkpoint_metadata_refuses_to_clobber_invalid_json(tmp_path: Path) -> None:
+    from tinker_server import checkpoints
+
+    cache_dir = tmp_path / "runtime" / "persistent_cache" / "owner-a" / "run-317" / "ckpt-a"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    meta_path = cache_dir / "metadata.json"
+    meta_path.write_text('{"checkpoint_type": "training"', encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="Refusing to overwrite invalid checkpoint metadata"):
+        checkpoints.update_checkpoint_metadata(
+            str(cache_dir),
+            {"mirror_status": checkpoints.MIRROR_STATUS_PENDING},
+        )
+
+    assert meta_path.read_text(encoding="utf-8") == '{"checkpoint_type": "training"'
 
 
 def test_issue_317_process_pending_checkpoint_mirrors_updates_metadata(monkeypatch, tmp_path: Path) -> None:

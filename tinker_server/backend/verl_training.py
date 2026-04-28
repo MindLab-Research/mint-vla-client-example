@@ -1637,6 +1637,66 @@ class VerlTrainingEngine:
         self._resource_pool_actor_names: dict[str, str] = {}
         self._actor_loaded_sessions: dict[str, str] = {}
         self._actor_volatile_sessions: dict[str, set[str]] = {}
+        # Session-level poisoned marker for mid-call actor failures.
+        # Value stores the user-facing reason that requires reload boundary.
+        self._poisoned_sessions: dict[str, str] = {}
+        self._megatron_recycle_locks: dict[str, asyncio.Lock] = {}
+        self._megatron_recycle_locks_guard = asyncio.Lock()
+
+    def _megatron_guard_preflight_enabled(self) -> bool:
+        raw = os.environ.get("MINT_MEGATRON_GUARD_PREFLIGHT", "1").strip().lower()
+        return raw not in ("0", "false", "no", "off")
+
+    def _megatron_guard_query_timeout_s(self) -> float:
+        raw = os.environ.get("MINT_MEGATRON_GUARD_QUERY_TIMEOUT_S", "30").strip()
+        try:
+            timeout_s = float(raw)
+        except Exception:
+            timeout_s = 30.0
+        return max(1.0, timeout_s)
+
+    async def _ensure_megatron_session_guard_clean(
+        self,
+        session: "TrainingSession",
+        *,
+        op: str,
+        worker: ray.actor.ActorHandle,
+    ) -> None:
+        if session.backend != "megatron" or not self._megatron_guard_preflight_enabled():
+            return
+        get_guard_state = getattr(worker, "get_session_guard_state", None)
+        if get_guard_state is None:
+            return
+        guard_timeout_s = self._megatron_guard_query_timeout_s()
+        try:
+            guard_state = await self._await_with_keepalive(
+                get_guard_state.remote(session.model_id),
+                session,
+                interval_s=30.0,
+                timeout_s=guard_timeout_s,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"[{session.model_id}] failed to query megatron session guard before op={op}: "
+                f"{type(e).__name__}: {e}"
+            ) from e
+        if not isinstance(guard_state, dict):
+            raise RuntimeError(
+                f"[{session.model_id}] invalid megatron session guard payload type "
+                f"{type(guard_state).__name__} before op={op}"
+            )
+        contaminated = bool(guard_state.get("contaminated", False))
+        blocked = bool(guard_state.get("blocked", False))
+        if not contaminated and not blocked:
+            return
+        contamination_reason = guard_state.get("contamination_reason")
+        block_reason = guard_state.get("block_reason")
+        raise RuntimeError(
+            f"[{session.model_id}] megatron session guard denied op={op}: "
+            f"contaminated={contaminated} blocked={blocked} "
+            f"contamination_reason={contamination_reason!r} block_reason={block_reason!r}; "
+            "requires clean reload"
+        )
 
     async def initialize(self) -> None:
         """Initialize Ray connection."""
@@ -1658,11 +1718,525 @@ class VerlTrainingEngine:
         actor_name = self._resource_pool_actor_names.get(session.model_id)
         if not actor_name:
             return
-        from .resource_pool import get_resource_pool
+        try:
+            from .resource_pool import get_resource_pool
 
-        resource_pool = get_resource_pool()
-        resource_pool.touch(actor_name)
-        resource_pool.set_session(actor_name, session.model_id)
+            resource_pool = get_resource_pool()
+            resource_pool.touch(actor_name)
+            resource_pool.set_session(actor_name, session.model_id)
+        except Exception:
+            logger.debug("[%s] skip touch_actor for %s", session.model_id, actor_name, exc_info=True)
+
+    def _actor_name_for_session(self, session: "TrainingSession") -> str | None:
+        return self._resource_pool_actor_names.get(session.model_id)
+
+    def _raise_if_session_poisoned(self, session: "TrainingSession", *, op: str) -> None:
+        if op == "load_weights":
+            return
+        error = self._poisoned_sessions.get(session.model_id)
+        if error is not None:
+            raise RuntimeError(error)
+
+    def _note_successful_worker_call(self, session: "TrainingSession", *, op: str) -> None:
+        actor_name = self._actor_name_for_session(session)
+        if not actor_name:
+            return
+        self._actor_loaded_sessions[actor_name] = session.model_id
+        if op in {"forward_backward", "optim_step", "train_step"}:
+            self._actor_volatile_sessions.setdefault(actor_name, set()).add(session.model_id)
+        if op == "load_weights":
+            self._poisoned_sessions.pop(session.model_id, None)
+
+    def _megatron_op_requires_fail_closed_after_actor_death(self, op: str) -> bool:
+        return op in {
+            "forward_backward",
+            "optim_step",
+            "train_step",
+            "save_weights",
+            "save_lora_weights_for_sampler",
+            "load_weights",
+        }
+
+    def _megatron_missing_actor_recovery_error(
+        self,
+        session: "TrainingSession",
+        *,
+        op: str,
+        cause: BaseException,
+    ) -> str | None:
+        if not isinstance(cause, RuntimeError) or "missing worker" not in str(cause):
+            return None
+
+        from .megatron_distributed import MegatronSessionStateManager, _make_megatron_actor_name
+
+        session_manager = MegatronSessionStateManager()
+        actor_name = self._resource_pool_actor_names.get(session.model_id)
+        if not actor_name:
+            actor_name = _make_megatron_actor_name(session.base_model or "")
+
+        list_actor_only_state_sessions = getattr(session_manager, "list_actor_only_state_sessions", None)
+        dirty_sessions: list[str] = []
+        if callable(list_actor_only_state_sessions):
+            raw_dirty = list_actor_only_state_sessions(actor_name)
+            if isinstance(raw_dirty, (list, tuple, set)):
+                dirty_sessions = [str(s) for s in raw_dirty if isinstance(s, str)]
+
+        sibling_dirty = sorted([sid for sid in dirty_sessions if sid != session.model_id])
+        if sibling_dirty:
+            siblings = ", ".join(sibling_dirty)
+            return (
+                f"[{session.model_id}] megatron actor was missing before op={op}; "
+                f"dirty_sibling session(s) detected on shared actor cache: {siblings}. "
+                "Reload all dirty sessions from explicit checkpoints before continuing."
+            )
+        if session.model_id in dirty_sessions:
+            return (
+                f"[{session.model_id}] megatron actor was missing before op={op}, and this session has "
+                "actor-only training state that was never fully persisted. Reload from an explicit "
+                "checkpoint before continuing."
+            )
+
+        if not session_manager.session_exists(session.model_id):
+            return (
+                f"[{session.model_id}] megatron actor was missing before op={op}, but the session "
+                "has no persisted Megatron session cache. The request was not retried because "
+                "that would recreate blank in-memory state. Recreate or reload the session from "
+                "a checkpoint before continuing."
+            )
+        meta = session_manager.get_metadata(session.model_id)
+        if not isinstance(meta, dict):
+            return (
+                f"[{session.model_id}] megatron actor was missing before op={op}, and the session "
+                "cache is missing session_metadata.json. Reload the session from an explicit "
+                "checkpoint before continuing."
+            )
+        return None
+
+    async def _recycle_worker_after_failure(
+        self,
+        session: "TrainingSession",
+        *,
+        op: str,
+        cause: BaseException,
+        request_started: bool = False,
+    ) -> ray.actor.ActorHandle:
+        actor_name = self._actor_name_for_session(session)
+        lost_session_ids: list[str] = []
+        if actor_name is not None:
+            lost_session_ids = sorted(self._actor_volatile_sessions.get(actor_name, set()))
+
+        if session.backend == "megatron" and lost_session_ids:
+            joined = ", ".join(lost_session_ids)
+            err = (
+                f"[{session.model_id}] megatron actor recycle detected after op={op}, but "
+                f"session(s) {joined} had live in-memory state that was never persisted. "
+                "The request was not retried because that would hide rollback. "
+                "Reload the lost session from a checkpoint before continuing."
+            )
+            for sid in lost_session_ids:
+                self._poisoned_sessions[sid] = err
+            if actor_name:
+                self._actor_loaded_sessions.pop(actor_name, None)
+                self._actor_volatile_sessions.pop(actor_name, None)
+            raise RuntimeError(err) from cause
+
+        if session.backend == "megatron":
+            missing_actor_error = self._megatron_missing_actor_recovery_error(
+                session,
+                op=op,
+                cause=cause,
+            )
+            if missing_actor_error is not None:
+                self._poisoned_sessions[session.model_id] = missing_actor_error
+                if actor_name:
+                    self._actor_loaded_sessions.pop(actor_name, None)
+                    self._actor_volatile_sessions.pop(actor_name, None)
+                raise RuntimeError(missing_actor_error) from cause
+            if request_started and self._megatron_op_requires_fail_closed_after_actor_death(op):
+                worker = await self._recycle_megatron_actor(session, op=op, cause=cause)
+                err = (
+                    f"[{session.model_id}] megatron actor died during op={op}; "
+                    "operation may have partially executed before the crash; "
+                    "reload from checkpoint before retrying."
+                )
+                self._poisoned_sessions[session.model_id] = err
+                if actor_name:
+                    self._actor_loaded_sessions.pop(actor_name, None)
+                    self._actor_volatile_sessions.pop(actor_name, None)
+                raise RuntimeError(err) from cause
+            worker = await self._recycle_megatron_actor(session, op=op, cause=cause)
+            if actor_name:
+                self._actor_loaded_sessions.pop(actor_name, None)
+                self._actor_volatile_sessions.pop(actor_name, None)
+            return worker
+
+        worker = await self._recycle_dense_actor(session, op=op, cause=cause)
+        if op != "load_weights":
+            err = (
+                f"[{session.model_id}] dense actor recycle detected after op={op}; "
+                "operation may have partially executed before the crash; "
+                "reload from checkpoint before retrying."
+            )
+            self._poisoned_sessions[session.model_id] = err
+            raise RuntimeError(err) from cause
+        return worker
+
+    def _resolve_megatron_base_model(self, session: "TrainingSession") -> tuple[str, str]:
+        """Resolve Megatron base model path strictly; never fallback to unrelated defaults."""
+        requested_model = session.base_model or self.default_base_model
+        if not requested_model:
+            raise RuntimeError(f"[{session.model_id}] could not resolve Megatron base model: empty model id")
+        if requested_model.startswith("/"):
+            return requested_model, requested_model
+        resolved = self._resolve_hf_model_path(requested_model)
+        if not resolved:
+            raise RuntimeError(
+                f"[{session.model_id}] could not resolve Megatron base model {requested_model!r} to local path"
+            )
+        return resolved, requested_model
+
+    def _resolve_session_base_model(self, session: "TrainingSession") -> tuple[str | None, str | None]:
+        requested_model = session.base_model or self.default_base_model
+        if requested_model and not requested_model.startswith("/"):
+            base_model = self._resolve_hf_model_path(requested_model)
+            if base_model:
+                return base_model, requested_model
+            return self.default_base_model, requested_model
+        return requested_model, requested_model
+
+    def _build_megatron_distributed_config(
+        self,
+        *,
+        requested_model: str | None,
+        base_model: str | None,
+    ):
+        from .megatron_distributed import DistributedConfig
+        from .model_registry import get_model_config, get_training_parallelism
+
+        cfg = get_model_config(requested_model or base_model or "")
+        train_tp, train_pp, train_ep, train_cp, train_etp = get_training_parallelism(
+            requested_model or base_model or ""
+        )
+        return DistributedConfig(
+            tensor_parallel_size=train_tp,
+            pipeline_parallel_size=train_pp,
+            expert_parallel_size=train_ep,
+            context_parallel_size=train_cp,
+            expert_tensor_parallel_size=train_etp,
+            use_fp8=bool(getattr(cfg, "train_use_fp8", False)),
+            router_replay_mode=server_config.router_replay_mode,
+        )
+
+    async def _rebind_megatron_worker(
+        self,
+        session: "TrainingSession",
+        *,
+        reason: str,
+        allow_create: bool = True,
+    ) -> ray.actor.ActorHandle:
+        from .megatron_distributed import (
+            PERSISTENT_NAMESPACE,
+            _make_megatron_actor_name,
+            async_get_or_create_megatron_worker_group,
+        )
+        from .model_registry import is_persistent_model
+        from .resource_pool import ActorType, get_resource_pool
+
+        base_model, requested_model = self._resolve_megatron_base_model(session)
+        actor_name = _make_megatron_actor_name(base_model or requested_model or session.base_model or "")
+        lora_rank = session.lora_config.rank if session.lora_config else self.default_lora_rank
+        distributed_config = self._build_megatron_distributed_config(
+            requested_model=requested_model,
+            base_model=base_model,
+        )
+
+        if allow_create:
+            worker = await async_get_or_create_megatron_worker_group(
+                base_model=base_model,
+                lora_rank=lora_rank,
+                learning_rate=session.learning_rate,
+                distributed_config=distributed_config,
+                session_id=session.model_id,
+            )
+            ready_timeout_s = (
+                float(server_config.training_actor_ready_timeout_s)
+                if server_config.training_actor_ready_timeout_s is not None
+                else 3600.0
+            )
+            try:
+                await self._await_with_keepalive(
+                    worker.__ray_ready__.remote(),
+                    session,
+                    interval_s=30.0,
+                    timeout_s=ready_timeout_s,
+                )
+            except Exception as e:
+                if self._is_dead_actor_error(e):
+                    raise RuntimeError(f"[{session.model_id}] missing worker for backend=megatron") from e
+                raise
+        else:
+            try:
+                worker = await asyncio.to_thread(
+                    ray.get_actor,
+                    actor_name,
+                    namespace=PERSISTENT_NAMESPACE,
+                )
+            except ValueError as e:
+                raise RuntimeError(f"[{session.model_id}] missing worker for backend=megatron") from e
+
+        get_resource_pool().register(
+            actor_name=actor_name,
+            actor_type=ActorType.MEGATRON,
+            num_gpus=distributed_config.world_size,
+            actor_handle=worker,
+            namespace=PERSISTENT_NAMESPACE,
+            base_model=base_model or requested_model or "",
+            session_id=session.model_id,
+            protected=is_persistent_model(base_model or requested_model or ""),
+        )
+        get_resource_pool().mark_ready(actor_name)
+        self._resource_pool_actor_names[session.model_id] = actor_name
+        self._workers[session.model_id] = worker
+        self._touch_actor(session)
+        session.backend = "megatron"
+        session.is_active = True
+        logger.warning(
+            "[%s] megatron worker rebound without recycle actor=%s reason=%s",
+            session.model_id,
+            actor_name,
+            reason,
+        )
+        return worker
+
+    async def _get_actor_recycle_lock(self, actor_name: str) -> asyncio.Lock:
+        async with self._megatron_recycle_locks_guard:
+            lock = self._megatron_recycle_locks.get(actor_name)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._megatron_recycle_locks[actor_name] = lock
+            return lock
+
+    @staticmethod
+    def _walk_exception_chain(error: BaseException) -> list[BaseException]:
+        pending = [error]
+        seen: set[int] = set()
+        ordered: list[BaseException] = []
+        while pending:
+            exc = pending.pop()
+            exc_id = id(exc)
+            if exc_id in seen:
+                continue
+            seen.add(exc_id)
+            ordered.append(exc)
+            for attr in ("cause", "__cause__", "__context__"):
+                child = getattr(exc, attr, None)
+                if isinstance(child, BaseException):
+                    pending.append(child)
+        return ordered
+
+    @classmethod
+    def _is_dead_actor_error(cls, error: BaseException) -> bool:
+        dead_types = (
+            ray.exceptions.ActorDiedError,
+            ray.exceptions.RayActorError,
+        )
+        for exc in cls._walk_exception_chain(error):
+            if isinstance(exc, dead_types):
+                return True
+        text = " | ".join(f"{type(exc).__name__}: {exc}" for exc in cls._walk_exception_chain(error)).lower()
+        return (
+            "actordiederror" in text
+            or "rayactorerror" in text
+            or "the actor died unexpectedly" in text
+            or "worker process has died" in text
+        )
+
+    @staticmethod
+    def _actor_state_name_by_handle(worker: ray.actor.ActorHandle) -> str | None:
+        actor_id_obj = getattr(worker, "_actor_id", None)
+        actor_id_hex = None
+        if actor_id_obj is not None:
+            try:
+                actor_id_hex = actor_id_obj.hex()
+            except Exception:
+                actor_id_hex = None
+        try:
+            info = ray._private.state.actors(actor_id=actor_id_hex) if actor_id_hex else None
+        except Exception:
+            return None
+        if isinstance(info, dict):
+            state = info.get("State")
+            if isinstance(state, str):
+                return state
+        return None
+
+    async def _classify_actor_timeout(
+        self,
+        *,
+        worker: ray.actor.ActorHandle,
+        actor_name: str,
+        namespace: str,
+    ) -> str:
+        def _inspect() -> str:
+            state_name = self._actor_state_name_by_handle(worker)
+            if isinstance(state_name, str) and state_name:
+                return state_name
+            try:
+                ray.get_actor(actor_name, namespace=namespace)
+            except ValueError:
+                return "DEAD"
+            except Exception:
+                return "UNKNOWN"
+            return "ALIVE"
+
+        try:
+            return await asyncio.to_thread(_inspect)
+        except Exception:
+            return "UNKNOWN"
+
+    async def _maybe_collect_worker_cuda_memory_summary(
+        self,
+        worker: ray.actor.ActorHandle,
+    ) -> dict[str, Any] | None:
+        timeout_s = float(os.environ.get("MINT_WORKER_CUDA_SUMMARY_TIMEOUT_S", "2.0"))
+        try:
+            try:
+                return await asyncio.to_thread(
+                    ray.get,
+                    worker.get_cuda_memory_summary.remote(),
+                    timeout=timeout_s,
+                )
+            except AttributeError:
+                return await asyncio.to_thread(
+                    ray.get,
+                    worker.get_cuda_memory_stats.remote(),
+                    timeout=timeout_s,
+                )
+        except Exception as e:
+            return {
+                "cuda_available": False,
+                "error_type": type(e).__name__,
+                "error": str(e),
+            }
+
+    async def _log_worker_request_context(
+        self,
+        session: "TrainingSession",
+        worker: ray.actor.ActorHandle,
+        *,
+        op: str,
+        stage: str,
+        batch_stats: dict[str, int] | None = None,
+    ) -> None:
+        cuda_summary = await self._maybe_collect_worker_cuda_memory_summary(worker)
+        logger.info(
+            "[%s] worker_request_context backend=%s op=%s stage=%s batch_size=%s total_tokens=%s max_seq_len=%s cuda_summary=%s",
+            session.model_id,
+            session.backend,
+            op,
+            stage,
+            None if batch_stats is None else batch_stats.get("batch_size"),
+            None if batch_stats is None else batch_stats.get("total_tokens"),
+            None if batch_stats is None else batch_stats.get("max_seq_len"),
+            cuda_summary,
+        )
+
+    async def _recycle_megatron_actor(
+        self,
+        session: "TrainingSession",
+        *,
+        op: str,
+        cause: BaseException,
+    ) -> ray.actor.ActorHandle:
+        actor_name = self._actor_name_for_session(session)
+        if not actor_name:
+            from .megatron_distributed import _make_megatron_actor_name
+
+            actor_name = _make_megatron_actor_name(session.base_model or "")
+        lock = await self._get_actor_recycle_lock(actor_name)
+        async with lock:
+            self._workers.pop(session.model_id, None)
+            return await self._rebind_megatron_worker(
+                session,
+                reason=f"{op}:{type(cause).__name__}",
+                allow_create=True,
+            )
+
+    async def _recycle_dense_actor(
+        self,
+        session: "TrainingSession",
+        *,
+        op: str,
+        cause: BaseException,
+    ) -> ray.actor.ActorHandle:
+        return await self._recover_dense_worker(session, reason=f"{op}:{type(cause).__name__}")
+
+    async def _run_worker_call_with_actor_recycle(
+        self,
+        session: "TrainingSession",
+        *,
+        op: str,
+        submit_fn,
+        batch_stats: dict[str, int] | None = None,
+        interval_s: float = 30.0,
+        timeout_s: float | None = None,
+        allow_recover: bool = False,
+    ):
+        self._raise_if_session_poisoned(session, op=op)
+        try:
+            worker = await self._get_live_worker(session, op=op, allow_recover=allow_recover)
+        except RuntimeError as e:
+            if "missing worker" not in str(e):
+                raise
+            worker = await self._recycle_worker_after_failure(session, op=op, cause=e)
+
+        self._touch_actor(session)
+        await self._log_worker_request_context(
+            session,
+            worker,
+            op=op,
+            stage="before_submit",
+            batch_stats=batch_stats,
+        )
+
+        attempts = 0
+        while True:
+            try:
+                pending = submit_fn(worker)
+                result = await self._await_with_keepalive(
+                    pending,
+                    session,
+                    interval_s=interval_s,
+                    timeout_s=timeout_s,
+                )
+                self._note_successful_worker_call(session, op=op)
+                return result
+            except Exception as e:
+                if not self._is_dead_actor_error(e):
+                    raise
+                if attempts >= 1:
+                    raise
+                attempts += 1
+                logger.warning(
+                    "[%s] actor_recycle_retry op=%s attempt=%s error_type=%s",
+                    session.model_id,
+                    op,
+                    attempts,
+                    type(e).__name__,
+                )
+                worker = await self._recycle_worker_after_failure(
+                    session,
+                    op=op,
+                    cause=e,
+                    request_started=True,
+                )
+                await self._log_worker_request_context(
+                    session,
+                    worker,
+                    op=op,
+                    stage="after_recycle",
+                    batch_stats=batch_stats,
+                )
 
     def _record_megatron_result_metrics(self, session: "TrainingSession", result: dict | None) -> None:
         if session.backend != "megatron" or not isinstance(result, dict):
@@ -1685,16 +2259,6 @@ class VerlTrainingEngine:
             reset_bias_s=float(metrics.get("session_switch_reset_bias_s:sum", 0.0) or 0.0),
             total_s=float(metrics.get("session_switch_total_s:sum", 0.0) or 0.0),
         )
-
-    def _resolve_session_base_model(self, session: "TrainingSession") -> tuple[str | None, str | None]:
-        """Resolve session base model to a local path (same policy as create_training_session)."""
-        requested_model = session.base_model or self.default_base_model
-        if requested_model and not requested_model.startswith("/"):
-            base_model = self._resolve_hf_model_path(requested_model)
-            if base_model:
-                return base_model, requested_model
-            return self.default_base_model, requested_model
-        return requested_model, requested_model
 
     async def _recover_dense_worker(self, session: "TrainingSession", *, reason: str) -> ray.actor.ActorHandle:
         """Rebind a dense trainer actor after eviction/death."""
@@ -1797,6 +2361,12 @@ class VerlTrainingEngine:
         if worker is None:
             worker = await self._rebind_worker_from_session_metadata(session, reason=f"{op}:metadata_rebind")
         if worker is None:
+            if session.backend == "megatron":
+                return await self._rebind_megatron_worker(
+                    session,
+                    reason=f"{op}:missing_worker",
+                    allow_create=allow_recover,
+                )
             if session.backend == "peft" and allow_recover:
                 return await self._recover_dense_worker(session, reason=f"{op}:missing_worker")
             raise RuntimeError(f"[{model_id}] missing worker for backend={session.backend}")
@@ -2074,6 +2644,7 @@ class VerlTrainingEngine:
             f"[DEBUG {model_id}] create_training_session start: requested_model={requested_model} use_megatron={use_megatron} base_model={base_model}",
             flush=True,
         )
+        observability_base_model = str(requested_model or base_model or "")
 
         if use_megatron:
             import asyncio
@@ -2232,23 +2803,31 @@ class VerlTrainingEngine:
             session.backend = "peft"
             logger.info(f"[{model_id}] Dense trainer ready for {base_model} (max_rank={dense.max_lora_rank})")
 
-        # For Megatron: avoid blocking create_session on __ray_ready__.
-        #
-        # __ray_ready__ is a normal actor task, so it can queue behind long-running
-        # initialization/work tasks and appear to "hang" for hours even when the actor
-        # is healthy. Returning early lets clients proceed; subsequent training calls
-        # will naturally queue until the actor is ready.
+        # Optional non-blocking create for Megatron actors.
+        # Default remains blocking __ray_ready__ wait for deterministic API
+        # semantics and unit-test contract compatibility.
         if session.backend == "megatron":
-            actor_name = self._resource_pool_actor_names.get(model_id)
-            if actor_name:
-                from .resource_pool import get_resource_pool
+            skip_ready_wait = os.environ.get("MINT_MEGATRON_SKIP_CREATE_READY_WAIT", "0").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+            if skip_ready_wait:
+                actor_name = self._resource_pool_actor_names.get(model_id)
+                if actor_name:
+                    from .resource_pool import get_resource_pool
 
-                get_resource_pool().mark_ready(actor_name)
+                    get_resource_pool().mark_ready(actor_name)
 
-            self._workers[model_id] = worker
-            session.is_active = True
-            logger.info(f"[{model_id}] TrainingWorker ready (backend={session.backend})")
-            return
+                self._workers[model_id] = worker
+                session.is_active = True
+                logger.info(
+                    "[%s] TrainingWorker ready (backend=%s, skip_ready_wait=1)",
+                    model_id,
+                    session.backend,
+                )
+                return
 
         # Wait for actor to be ready (model loaded)
         # Use await instead of ray.get() to not block the event loop
@@ -2312,6 +2891,11 @@ class VerlTrainingEngine:
 
         # Mark actor as recently used to prevent LRU eviction during training
         self._touch_actor(session)
+        await self._ensure_megatron_session_guard_clean(
+            session,
+            op="forward_backward",
+            worker=worker,
+        )
 
         # Serialize data for Ray
         data_items = [item.model_dump() for item in request.forward_backward_input.data]
@@ -2520,6 +3104,11 @@ class VerlTrainingEngine:
 
         # Mark actor as recently used to prevent LRU eviction during training
         self._touch_actor(session)
+        await self._ensure_megatron_session_guard_clean(
+            session,
+            op="forward",
+            worker=worker,
+        )
 
         # Serialize data for Ray
         # ForwardRequest uses forward_input (not forward_backward_input)
@@ -2568,6 +3157,45 @@ class VerlTrainingEngine:
 
         return result
 
+    async def get_session_guard_state(
+        self,
+        session: TrainingSession,
+    ) -> dict:
+        if session.backend != "megatron":
+            return {
+                "session_id": session.model_id,
+                "contaminated": False,
+                "blocked": False,
+                "contamination_reason": None,
+                "block_reason": None,
+                "external_checkpoint": None,
+                "trusted_recovery_baseline": None,
+            }
+        worker = await self._get_live_worker(session, op="get_session_guard_state")
+        get_guard_state = getattr(worker, "get_session_guard_state", None)
+        if get_guard_state is None:
+            return {
+                "session_id": session.model_id,
+                "contaminated": False,
+                "blocked": False,
+                "contamination_reason": None,
+                "block_reason": None,
+                "external_checkpoint": None,
+                "trusted_recovery_baseline": None,
+            }
+        self._touch_actor(session)
+        state = await self._await_with_keepalive(
+            get_guard_state.remote(session.model_id),
+            session,
+            interval_s=30.0,
+            timeout_s=30.0,
+        )
+        if not isinstance(state, dict):
+            raise RuntimeError(
+                f"[{session.model_id}] invalid get_session_guard_state payload type={type(state).__name__}"
+            )
+        return state
+
     async def optim_step(
         self,
         session: TrainingSession,
@@ -2587,6 +3215,11 @@ class VerlTrainingEngine:
 
         # Mark actor as recently used to prevent LRU eviction during training
         self._touch_actor(session)
+        await self._ensure_megatron_session_guard_clean(
+            session,
+            op="optim_step",
+            worker=worker,
+        )
 
         # Extract learning rate
         lr = request.adam_params.learning_rate if request.adam_params else None
@@ -2650,6 +3283,11 @@ class VerlTrainingEngine:
 
         # Mark actor as recently used to prevent LRU eviction during training
         self._touch_actor(session)
+        await self._ensure_megatron_session_guard_clean(
+            session,
+            op="train_step",
+            worker=worker,
+        )
 
         # Serialize data for Ray
         data_items = [item.model_dump() for item in request.forward_backward_input.data]
@@ -2794,6 +3432,11 @@ class VerlTrainingEngine:
 
         # Mark actor as recently used
         self._touch_actor(session)
+        await self._ensure_megatron_session_guard_clean(
+            session,
+            op="reset_expert_bias",
+            worker=worker,
+        )
 
         logger.info(f"[{model_id}] reset_expert_bias: calling worker...")
 
@@ -2907,12 +3550,18 @@ class VerlTrainingEngine:
         self,
         session: TrainingSession,
         save_path: str,
+        use_per_expert_lora: bool = False,
     ) -> str:
         """Save minimal PEFT LoRA artifacts for sampling (no optimizer/resume artifacts)."""
         import os
 
         model_id = session.model_id
         worker = await self._get_live_worker(session, op="save_lora_weights_for_sampler")
+        await self._ensure_megatron_session_guard_clean(
+            session,
+            op="save_lora_weights_for_sampler",
+            worker=worker,
+        )
         abs_path = os.path.abspath(save_path)
 
         try:
@@ -2993,6 +3642,10 @@ class VerlTrainingEngine:
         Args:
             session: Training session.
             save_path: Directory path for checkpoint.
+            use_per_expert_lora: Router compatibility flag from backend-agnostic
+                save_weights() interface. Megatron checkpoint export currently
+                uses train_attn/train_mlp/train_unembed gating and ignores this
+                flag.
 
         Returns:
             Absolute path to saved checkpoint directory.
@@ -3009,6 +3662,11 @@ class VerlTrainingEngine:
 
         model_id = session.model_id
         worker = await self._get_live_worker(session, op="save_weights")
+        await self._ensure_megatron_session_guard_clean(
+            session,
+            op="save_weights",
+            worker=worker,
+        )
         abs_path = os.path.abspath(save_path)
 
         # Save on worker - returns metadata
@@ -3042,6 +3700,7 @@ class VerlTrainingEngine:
                 train_attn=train_attn,
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
+                use_per_expert_lora=bool(use_per_expert_lora),
             )
         else:
             traceparent = get_current_traceparent()
@@ -3083,11 +3742,16 @@ class VerlTrainingEngine:
             load_optimizer: Whether to restore optimizer state.
         """
         model_id = session.model_id
-        worker = await self._get_live_worker(
-            session,
-            op="load_weights",
-            allow_recover=(session.backend == "peft"),
-        )
+        try:
+            worker = await self._get_live_worker(
+                session,
+                op="load_weights",
+                allow_recover=(session.backend == "peft"),
+            )
+        except RuntimeError as e:
+            if "missing worker" not in str(e):
+                raise
+            worker = await self._recycle_worker_after_failure(session, op="load_weights", cause=e)
 
         if session.backend == "megatron":
             ready_timeout_s = (
@@ -3095,37 +3759,56 @@ class VerlTrainingEngine:
                 if server_config.training_actor_ready_timeout_s is not None
                 else 1800.0
             )
-            await self._await_with_keepalive(
-                worker.__ray_ready__.remote(),
-                session,
-                interval_s=30.0,
-                timeout_s=ready_timeout_s,
-            )
+            ready_attempts = 0
+            while True:
+                try:
+                    await self._await_with_keepalive(
+                        worker.__ray_ready__.remote(),
+                        session,
+                        interval_s=30.0,
+                        timeout_s=ready_timeout_s,
+                    )
+                    break
+                except Exception as e:
+                    if not self._is_dead_actor_error(e) or ready_attempts >= 1:
+                        raise
+                    ready_attempts += 1
+                    worker = await self._recycle_worker_after_failure(session, op="load_weights", cause=e)
 
         default_timeout_s = 1800.0 if session.backend == "megatron" else 120.0
         load_timeout_s = float(os.environ.get("MINT_LOAD_CHECKPOINT_TIMEOUT_S", str(default_timeout_s)))
 
-        # Remote call to load checkpoint while keeping the pooled actor marked active.
         traceparent = get_current_traceparent()
         kwargs: dict[str, object] = {
             "traceparent": traceparent,
             "session_id": session.model_id,
         }
+        lora_cfg = getattr(session, "lora_config", None)
+        train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
+        train_mlp = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
+        train_unembed = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
         if session.backend == "megatron":
-            lora_cfg = getattr(session, "lora_config", None)
-            kwargs["train_attn"] = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
-            kwargs["train_mlp"] = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
-            kwargs["train_unembed"] = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
-        meta_ref = worker.load_checkpoint.remote(load_path, load_optimizer, **kwargs)
-        meta = await self._await_with_keepalive(
-            meta_ref,
+            kwargs["train_attn"] = train_attn
+            kwargs["train_mlp"] = train_mlp
+            kwargs["train_unembed"] = train_unembed
+
+        def _submit(call_worker):
+            return call_worker.load_checkpoint.remote(load_path, load_optimizer, **kwargs)
+
+        meta = await self._run_worker_call_with_actor_recycle(
             session,
+            op="load_weights",
+            submit_fn=_submit,
             interval_s=30.0,
             timeout_s=load_timeout_s,
+            allow_recover=(session.backend == "peft"),
         )
 
-        # Update session state from loaded metadata without polluting existing
-        # client-side state when old/corrupt checkpoints omit metadata.
+        if session.backend == "megatron":
+            actor_name = self._actor_name_for_session(session)
+            if actor_name and load_optimizer:
+                self._actor_volatile_sessions.setdefault(actor_name, set()).add(session.model_id)
+
         self._update_session_from_load_meta(
             session,
             meta,
@@ -3133,7 +3816,8 @@ class VerlTrainingEngine:
         )
 
         if session.backend == "megatron":
-            actual_rank = meta.get("actual_rank")
+            worker = await self._get_live_worker(session, op="load_weights", allow_recover=False)
+            actual_rank = meta.get("actual_rank") if isinstance(meta, dict) else None
             await asyncio.to_thread(
                 ray.get,
                 worker.mark_session_loaded.remote(
@@ -3141,9 +3825,25 @@ class VerlTrainingEngine:
                     step_count=session.current_step,
                     learning_rate=session.learning_rate,
                     actual_rank=actual_rank,
+                    actor_only_state_dirty=bool(load_optimizer),
+                    checkpoint_path=load_path,
+                    optimizer_restored=bool(load_optimizer),
+                    train_attn=train_attn,
+                    train_mlp=train_mlp,
+                    train_unembed=train_unembed,
                 ),
                 timeout=30,
             )
+            if not load_optimizer:
+                actor_name = self._actor_name_for_session(session)
+                if actor_name:
+                    volatile_sessions = self._actor_volatile_sessions.get(actor_name)
+                    if volatile_sessions:
+                        volatile_sessions.discard(session.model_id)
+                        if not volatile_sessions:
+                            self._actor_volatile_sessions.pop(actor_name, None)
+
+        self._poisoned_sessions.pop(session.model_id, None)
 
         logger.info(f"[{model_id}] load_weights: step={session.current_step}")
 
