@@ -167,6 +167,44 @@ def test_list_alive_gpu_nodes_fails_closed_when_state_and_pg_fallback_fail(
     assert nodes[0].available_gpus == 0
 
 
+def test_list_alive_gpu_nodes_ray_client_mode_treats_missing_state_entry_as_schedulable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vp = _import_volc_placement(monkeypatch)
+
+    monkeypatch.setattr(
+        vp.ray,
+        "nodes",
+        lambda: [
+            {
+                "Alive": True,
+                "NodeID": "node-1",
+                "NodeManagerAddress": "10.0.0.7",
+                "NodeManagerHostname": "worker-7",
+                "Resources": {"GPU": 8},
+            }
+        ],
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "ray._private",
+        types.ModuleType("ray._private"),
+    )
+    sys.modules["ray._private"].state = SimpleNamespace(  # type: ignore[attr-defined]
+        available_resources_per_node=lambda: (_ for _ in ()).throw(RuntimeError("state down"))
+    )
+    monkeypatch.setattr(vp.ray.util, "placement_group_table", lambda: {})
+
+    client_ray = SimpleNamespace(is_connected=lambda: True)
+    monkeypatch.setattr(vp.ray.util, "client", SimpleNamespace(ray=client_ray), raising=False)
+
+    nodes = vp._list_alive_gpu_nodes()
+
+    assert len(nodes) == 1
+    assert nodes[0].node_ip == "10.0.0.7"
+    assert nodes[0].available_gpus == 8
+
+
 def test_list_alive_gpu_nodes_accounts_pending_list_bundles_via_pinned_ip(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

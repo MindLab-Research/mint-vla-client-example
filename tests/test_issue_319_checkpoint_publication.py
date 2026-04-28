@@ -139,6 +139,9 @@ async def test_issue_319_save_weights_for_sampler_fails_before_metadata(monkeypa
         _StubFutureStore(resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail),
     )
     monkeypatch.setattr(tr, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
+    monkeypatch.setattr(tr, "get_persistent_cache_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(tr, "get_ephemeral_checkpoints_dir", lambda: str(tmp_path / "ephemeral"))
+    monkeypatch.setattr(tr, "get_persistent_checkpoints_dir", lambda: str(tmp_path / "persistent"))
     request = SaveWeightsForSamplerRequest(model_id="run-319", seq_id=0, path="sampler-bad")
     await tr._do_save_weights_for_sampler(
         request_id="req-319-sampler",
@@ -149,7 +152,7 @@ async def test_issue_319_save_weights_for_sampler_fails_before_metadata(monkeypa
 
     assert failed["request_id"] == "req-319-sampler"
     assert "invalid sampler checkpoint" in failed["error"]
-    assert not (ckpt_dir / "metadata.json").exists()
+    assert not ckpt_dir.exists()
 
 
 @pytest.mark.anyio
@@ -272,6 +275,9 @@ async def test_issue_319_save_weights_for_sampler_rejects_corrupt_safetensors(
         _StubFutureStore(resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail),
     )
     monkeypatch.setattr(tr, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
+    monkeypatch.setattr(tr, "get_persistent_cache_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(tr, "get_ephemeral_checkpoints_dir", lambda: str(tmp_path / "ephemeral"))
+    monkeypatch.setattr(tr, "get_persistent_checkpoints_dir", lambda: str(tmp_path / "persistent"))
     request = SaveWeightsForSamplerRequest(model_id="run-319", seq_id=0, path="sampler-corrupt")
     await tr._do_save_weights_for_sampler(
         request_id="req-319-sampler-corrupt",
@@ -282,7 +288,7 @@ async def test_issue_319_save_weights_for_sampler_rejects_corrupt_safetensors(
 
     assert failed["request_id"] == "req-319-sampler-corrupt"
     assert "Unreadable adapter_model.safetensors" in failed["error"]
-    assert not (ckpt_dir / "metadata.json").exists()
+    assert not ckpt_dir.exists()
 
 
 @pytest.mark.anyio
@@ -504,8 +510,35 @@ def test_issue_319_list_checkpoints_skips_invalid_sampler_dirs(monkeypatch, tmp_
     async def _no_remote(**_kwargs):
         return None
 
+    async def _list_catalog_checkpoints_for_model(*, model_id: str, owner_id: str | None, is_admin: bool):
+        assert model_id == "run-319"
+        assert owner_id is None
+        assert is_admin is False
+        return [
+            {
+                "ckpt_id": "31900000-0000-0000-0000-000000000001",
+                "owner_id": "anonymous",
+                "model_id": model_id,
+                "raw_checkpoint_id": "sampler-bad",
+                "checkpoint_type": "sampler",
+                "storage_root": str(root),
+                "checkpoint_created_at": "2026-03-14T00:00:00Z",
+            },
+            {
+                "ckpt_id": "31900000-0000-0000-0000-000000000002",
+                "owner_id": "anonymous",
+                "model_id": model_id,
+                "raw_checkpoint_id": "training-good",
+                "checkpoint_type": "training",
+                "storage_root": str(root),
+                "checkpoint_created_at": "2026-03-14T00:00:00Z",
+            },
+        ]
+
     monkeypatch.setattr(wt, "CHECKPOINTS_DIR", str(root))
     monkeypatch.setattr(wt, "get_persistent_search_roots", lambda primary_root=None: [str(root)])
+    monkeypatch.setattr(wt, "checkpoint_index_enabled", lambda: True)
+    monkeypatch.setattr(wt, "list_catalog_checkpoints_for_model", _list_catalog_checkpoints_for_model)
     monkeypatch.setattr(wt, "_forward_remote_checkpoint_route", _no_remote)
 
     app = FastAPI()
@@ -550,8 +583,26 @@ def test_issue_319_list_checkpoints_skips_shard_only_sampler_dirs(monkeypatch, t
     async def _no_remote(**_kwargs):
         return None
 
+    async def _list_catalog_checkpoints_for_model(*, model_id: str, owner_id: str | None, is_admin: bool):
+        assert model_id == "run-319-mismatch"
+        assert owner_id is None
+        assert is_admin is False
+        return [
+            {
+                "ckpt_id": "31900000-0000-0000-0000-000000000003",
+                "owner_id": "anonymous",
+                "model_id": model_id,
+                "raw_checkpoint_id": "sampler-sharded-only",
+                "checkpoint_type": "sampler",
+                "storage_root": str(root),
+                "checkpoint_created_at": "2026-03-14T00:00:00Z",
+            }
+        ]
+
     monkeypatch.setattr(wt, "CHECKPOINTS_DIR", str(root))
     monkeypatch.setattr(wt, "get_persistent_search_roots", lambda primary_root=None: [str(root)])
+    monkeypatch.setattr(wt, "checkpoint_index_enabled", lambda: True)
+    monkeypatch.setattr(wt, "list_catalog_checkpoints_for_model", _list_catalog_checkpoints_for_model)
     monkeypatch.setattr(wt, "_forward_remote_checkpoint_route", _no_remote)
 
     app = FastAPI()
@@ -559,9 +610,8 @@ def test_issue_319_list_checkpoints_skips_shard_only_sampler_dirs(monkeypatch, t
     client = TestClient(app)
 
     resp = client.get(f"/api/v1/training_runs/{model_id}/checkpoints")
-    assert resp.status_code == 200, resp.text
-    payload = resp.json()
-    assert payload["checkpoints"] == []
+    assert resp.status_code == 404, resp.text
+    assert resp.json() == {"detail": f"No checkpoints found for model '{model_id}'"}
 
 
 def test_issue_319_list_checkpoints_skips_corrupt_sampler_dirs(monkeypatch, tmp_path: Path) -> None:
@@ -593,8 +643,26 @@ def test_issue_319_list_checkpoints_skips_corrupt_sampler_dirs(monkeypatch, tmp_
     async def _no_remote(**_kwargs):
         return None
 
+    async def _list_catalog_checkpoints_for_model(*, model_id: str, owner_id: str | None, is_admin: bool):
+        assert model_id == "run-319-corrupt"
+        assert owner_id is None
+        assert is_admin is False
+        return [
+            {
+                "ckpt_id": "31900000-0000-0000-0000-000000000004",
+                "owner_id": "anonymous",
+                "model_id": model_id,
+                "raw_checkpoint_id": "sampler-corrupt",
+                "checkpoint_type": "sampler",
+                "storage_root": str(root),
+                "checkpoint_created_at": "2026-03-14T00:00:00Z",
+            }
+        ]
+
     monkeypatch.setattr(wt, "CHECKPOINTS_DIR", str(root))
     monkeypatch.setattr(wt, "get_persistent_search_roots", lambda primary_root=None: [str(root)])
+    monkeypatch.setattr(wt, "checkpoint_index_enabled", lambda: True)
+    monkeypatch.setattr(wt, "list_catalog_checkpoints_for_model", _list_catalog_checkpoints_for_model)
     monkeypatch.setattr(wt, "_forward_remote_checkpoint_route", _no_remote)
 
     app = FastAPI()
@@ -602,6 +670,5 @@ def test_issue_319_list_checkpoints_skips_corrupt_sampler_dirs(monkeypatch, tmp_
     client = TestClient(app)
 
     resp = client.get(f"/api/v1/training_runs/{model_id}/checkpoints")
-    assert resp.status_code == 200, resp.text
-    payload = resp.json()
-    assert payload["checkpoints"] == []
+    assert resp.status_code == 404, resp.text
+    assert resp.json() == {"detail": f"No checkpoints found for model '{model_id}'"}

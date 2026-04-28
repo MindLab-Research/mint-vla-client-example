@@ -34,3 +34,28 @@ def test_issue_439_queue_execution_runtime_forwards_actor_name_and_placement_ove
     assert out["MINT_MBRIDGE_EXPORT_GLOO_TIMEOUT_S"] == "123"
     assert out["MINT_MBRIDGE_EXPORT_GATHER_DEBUG"] == "1"
     assert out["MINT_MBRIDGE_EXPORT_GLOO_BARRIER_DEBUG"] == "1"
+
+
+def test_issue_439_actor_runtime_env_vars_forwards_checkpoint_index_settings(monkeypatch) -> None:
+    from tinker_server import config as server_config
+
+    monkeypatch.setattr(server_config, "PFS_RUNTIME_ENV_ROOT", "/runtime")
+    monkeypatch.setattr(server_config, "PFS_TINKER_PATH", "/repo")
+    monkeypatch.setattr(server_config, "PFS_HF_MODULES_PATH", "/hf-modules")
+    monkeypatch.setattr(server_config, "RAY_NAMESPACE", "tinker-test")
+
+    monkeypatch.setenv("RAY_ADDRESS", "ray://127.0.0.1:10001")
+    monkeypatch.setenv("TINKER_CHECKPOINT_INDEX_PG_DSN", "postgres://mint:pw@db:5432/mint")
+    monkeypatch.setenv("TINKER_CHECKPOINT_INDEX_WRITE_TIMEOUT_MS", "4500")
+    monkeypatch.setenv("TINKER_CHECKPOINT_INDEX_UPLOADING_STALE_S", "7200")
+    monkeypatch.setenv("MINT_CHECKPOINT_INDEX_PUBLISH_RETRY_S", "30")
+
+    env_vars = server_config.actor_runtime_env_vars(pythonpath="/runtime/pythonpath")
+
+    assert env_vars["TINKER_RAY_NAMESPACE"] == "tinker-test"
+    assert env_vars["RAY_ADDRESS"] == "ray://127.0.0.1:10001"
+    assert env_vars["PYTHONPATH"] == "/runtime/pythonpath"
+    assert env_vars["TINKER_CHECKPOINT_INDEX_PG_DSN"] == "postgres://mint:pw@db:5432/mint"
+    assert env_vars["TINKER_CHECKPOINT_INDEX_WRITE_TIMEOUT_MS"] == "4500"
+    assert env_vars["TINKER_CHECKPOINT_INDEX_UPLOADING_STALE_S"] == "7200"
+    assert env_vars["MINT_CHECKPOINT_INDEX_PUBLISH_RETRY_S"] == "30"

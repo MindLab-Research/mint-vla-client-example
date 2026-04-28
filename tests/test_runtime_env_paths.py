@@ -1198,6 +1198,8 @@ def test_actor_runtime_env_vars_forwards_ray_attach_hints(tmp_path):
 def test_actor_runtime_env_skips_local_working_dir_in_ray_client_mode(tmp_path):
     env_root = tmp_path / "runtime"
     _materialize_runtime_env(env_root)
+    local_repo = tmp_path / "repo"
+    local_repo.mkdir()
     out = subprocess.run(
         [
             sys.executable,
@@ -1214,10 +1216,11 @@ def test_actor_runtime_env_skips_local_working_dir_in_ray_client_mode(tmp_path):
         text=True,
         env={
             "PFS_RUNTIME_ENV_ROOT": str(env_root),
-            "PFS_TINKER_PATH": str(tmp_path / "repo"),
+            "PFS_TINKER_PATH": str(local_repo),
             "PFS_HF_MODULES_PATH": str(tmp_path / "hf"),
             "RAY_ADDRESS": "ray://192.168.39.87:10001",
-            "MINT_RAY_WORKING_DIR": str(tmp_path / "repo"),
+            "MINT_RAY_CLIENT_ADDRESS": "ray://192.168.39.87:10001",
+            "MINT_RAY_WORKING_DIR": str(local_repo),
         },
     )
     data = json.loads(out.stdout)
@@ -1253,3 +1256,34 @@ def test_actor_runtime_env_skips_local_py_modules_in_ray_client_mode(tmp_path):
     )
     data = json.loads(out.stdout)
     assert "py_modules" not in data
+
+
+def test_actor_runtime_env_keeps_local_working_dir_for_direct_ray(tmp_path):
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env(env_root)
+    local_repo = tmp_path / "repo"
+    local_repo.mkdir()
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json; "
+                "from tinker_server.config import actor_runtime_env; "
+                "print(json.dumps(actor_runtime_env(pythonpath='X')))"
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            "PFS_RUNTIME_ENV_ROOT": str(env_root),
+            "PFS_TINKER_PATH": str(local_repo),
+            "PFS_HF_MODULES_PATH": str(tmp_path / "hf"),
+            "RAY_ADDRESS": "192.168.39.87:6379",
+            "MINT_RAY_WORKING_DIR": str(local_repo),
+        },
+    )
+    data = json.loads(out.stdout)
+    assert data["working_dir"] == str(local_repo)

@@ -234,6 +234,10 @@ def actor_runtime_env_vars(*, pythonpath: str, extra: dict[str, str] | None = No
         "TINKER_USAGE_LOG_DIR",
         "TINKER_USAGE_BACKEND",
         "TINKER_USAGE_PG_DSN",
+        "TINKER_CHECKPOINT_INDEX_PG_DSN",
+        "TINKER_CHECKPOINT_INDEX_WRITE_TIMEOUT_MS",
+        "TINKER_CHECKPOINT_INDEX_UPLOADING_STALE_S",
+        "MINT_CHECKPOINT_INDEX_PUBLISH_RETRY_S",
     ):
         value = _env_nonempty(os.environ, key)
         if value is not None:
@@ -249,20 +253,36 @@ def actor_runtime_env_vars(*, pythonpath: str, extra: dict[str, str] | None = No
         out.update(extra)
     return out
 
+def _runtime_env_value_is_uri(value: str) -> bool:
+    head = str(value or "").split("://", 1)
+    return len(head) == 2 and bool(head[0]) and all(ch.isalnum() or ch in "+-." for ch in head[0])
+
+
+def _actor_runtime_env_allows_local_paths() -> bool:
+    for name in ("MINT_RAY_CLIENT_ADDRESS", "RAY_CLIENT_ADDRESS", "RAY_ADDRESS"):
+        value = _env_nonempty(os.environ, name)
+        if value and value.startswith("ray://"):
+            return False
+    return True
+
+
 def actor_runtime_env(*, pythonpath: str, extra: dict[str, str] | None = None) -> dict[str, object]:
     runtime_env: dict[str, object] = {
         "env_vars": actor_runtime_env_vars(pythonpath=pythonpath, extra=extra)
     }
-    ray_address = _env_nonempty(os.environ, "RAY_ADDRESS") or ""
+    allow_local_paths = _actor_runtime_env_allows_local_paths()
     py_modules_csv = _env_nonempty(os.environ, "MINT_RAY_PY_MODULES_CSV")
     if py_modules_csv:
         py_modules = [x.strip() for x in py_modules_csv.split(",") if x.strip()]
-        if ray_address.startswith("ray://"):
-            py_modules = [x for x in py_modules if "://" in x]
-        if py_modules:
+        if allow_local_paths:
             runtime_env["py_modules"] = py_modules
+        else:
+            uri_modules = [x for x in py_modules if _runtime_env_value_is_uri(x)]
+            if uri_modules:
+                runtime_env["py_modules"] = uri_modules
     working_dir = _env_nonempty(os.environ, "MINT_RAY_WORKING_DIR")
-    if working_dir and not (ray_address.startswith("ray://") and "://" not in working_dir):
+    # Ray Client accepts local-path working_dir only at ray.init(job) level.
+    if working_dir and (allow_local_paths or _runtime_env_value_is_uri(working_dir)):
         runtime_env["working_dir"] = working_dir
     return runtime_env
 

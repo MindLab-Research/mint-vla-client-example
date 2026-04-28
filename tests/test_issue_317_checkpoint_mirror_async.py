@@ -54,7 +54,26 @@ def test_issue_317_begin_async_checkpoint_mirror_marks_pending(monkeypatch, tmp_
     meta = checkpoints.read_checkpoint_metadata(str(cache_dir))
     assert meta["mirror_status"] == checkpoints.MIRROR_STATUS_PENDING
     assert meta["persistent_mirror_path"] == persistent_path
+    assert meta["checkpoint_type"] == "training"
+    assert meta["type"] == "training"
     assert kicked == ["kicked"]
+
+
+def test_issue_317_update_checkpoint_metadata_refuses_to_clobber_invalid_json(tmp_path: Path) -> None:
+    from tinker_server import checkpoints
+
+    cache_dir = tmp_path / "runtime" / "persistent_cache" / "owner-a" / "run-317" / "ckpt-a"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    meta_path = cache_dir / "metadata.json"
+    meta_path.write_text('{"checkpoint_type": "training"', encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="Refusing to overwrite invalid checkpoint metadata"):
+        checkpoints.update_checkpoint_metadata(
+            str(cache_dir),
+            {"mirror_status": checkpoints.MIRROR_STATUS_PENDING},
+        )
+
+    assert meta_path.read_text(encoding="utf-8") == '{"checkpoint_type": "training"'
 
 
 def test_issue_317_process_pending_checkpoint_mirrors_updates_metadata(monkeypatch, tmp_path: Path) -> None:
@@ -290,6 +309,22 @@ def test_issue_317_list_checkpoints_includes_pending_cache_status(monkeypatch, t
     async def _no_remote(**_kwargs):
         return None
 
+    async def _list_catalog_checkpoints_for_model(*, model_id: str, owner_id: str | None, is_admin: bool):
+        assert model_id == "run-317"
+        assert owner_id is None
+        assert is_admin is False
+        return [
+            {
+                "ckpt_id": "31700000-0000-0000-0000-000000000001",
+                "owner_id": "anonymous",
+                "model_id": "run-317",
+                "raw_checkpoint_id": "ckpt-a",
+                "checkpoint_type": "training",
+                "storage_root": str(runtime_root / "persistent_cache"),
+                "checkpoint_created_at": "2026-03-15T00:00:00Z",
+            }
+        ]
+
     monkeypatch.setattr(wt, "CHECKPOINTS_DIR", str(root))
     monkeypatch.setattr(wt, "PERSISTENT_CHECKPOINTS_DIR", str(root), raising=False)
     monkeypatch.setattr(wt, "RUNTIME_CHECKPOINTS_DIR", str(runtime_root), raising=False)
@@ -298,6 +333,8 @@ def test_issue_317_list_checkpoints_includes_pending_cache_status(monkeypatch, t
     monkeypatch.setattr(checkpoints, "CHECKPOINTS_DIR", str(root))
     monkeypatch.setattr(checkpoints, "PERSISTENT_CHECKPOINTS_DIR", str(root))
     monkeypatch.setattr(checkpoints, "RUNTIME_CHECKPOINTS_DIR", str(runtime_root))
+    monkeypatch.setattr(wt, "checkpoint_index_enabled", lambda: True)
+    monkeypatch.setattr(wt, "list_catalog_checkpoints_for_model", _list_catalog_checkpoints_for_model)
     monkeypatch.setattr(wt, "_forward_remote_checkpoint_route", _no_remote)
 
     app = FastAPI()
@@ -344,6 +381,22 @@ def test_issue_317_list_checkpoints_finds_owner_scoped_pending_cache(
     async def _no_remote(**_kwargs):
         return None
 
+    async def _list_catalog_checkpoints_for_model(*, model_id: str, owner_id: str | None, is_admin: bool):
+        assert model_id == "run-317"
+        assert owner_id == "user-a"
+        assert is_admin is False
+        return [
+            {
+                "ckpt_id": "31700000-0000-0000-0000-000000000002",
+                "owner_id": "user-a",
+                "model_id": "run-317",
+                "raw_checkpoint_id": "ckpt-a",
+                "checkpoint_type": "training",
+                "storage_root": str(runtime_root / "persistent_cache"),
+                "checkpoint_created_at": "2026-03-15T00:00:00Z",
+            }
+        ]
+
     monkeypatch.setattr(wt, "CHECKPOINTS_DIR", str(root))
     monkeypatch.setattr(wt, "PERSISTENT_CHECKPOINTS_DIR", str(root), raising=False)
     monkeypatch.setattr(wt, "get_persistent_search_roots", lambda primary_root=None: [str(root)])
@@ -351,6 +404,8 @@ def test_issue_317_list_checkpoints_finds_owner_scoped_pending_cache(
     monkeypatch.setattr(checkpoints, "CHECKPOINTS_DIR", str(root))
     monkeypatch.setattr(checkpoints, "PERSISTENT_CHECKPOINTS_DIR", str(root))
     monkeypatch.setattr(checkpoints, "RUNTIME_CHECKPOINTS_DIR", str(runtime_root))
+    monkeypatch.setattr(wt, "checkpoint_index_enabled", lambda: True)
+    monkeypatch.setattr(wt, "list_catalog_checkpoints_for_model", _list_catalog_checkpoints_for_model)
     monkeypatch.setattr(wt, "_forward_remote_checkpoint_route", _no_remote)
     monkeypatch.setattr(wt, "_get_user_id", lambda _request: "user-a")
 

@@ -19,7 +19,11 @@ async def test_issue_444_api_work_queue_rebinds_active_job_id_when_actor_recreat
     class _FakeActor:
         class _StatsRemote:
             def remote(self):
-                return {"ok": True}
+                return {
+                    "ok": True,
+                    "code_identity": api_work_queue_module.CURRENT_CODE_IDENTITY,
+                    "runtime_contract_digest": api_work_queue_module._api_work_queue_runtime_contract_digest(),
+                }
 
         class _DebugStateRemote:
             def remote(self):
@@ -191,6 +195,7 @@ def test_issue_444_queue_actor_resources_prefers_pinned_node_ip(monkeypatch) -> 
 def test_issue_444_queue_execution_runtime_forwards_runtime_contract_env(monkeypatch) -> None:
     queue_execution_runtime_module = importlib.import_module("tinker_server.backend.queue_execution_runtime")
 
+    monkeypatch.setattr(queue_execution_runtime_module, "CURRENT_CODE_IDENTITY", "sha-test")
     monkeypatch.delenv("TINKER_API_WORK_QUEUE_ACTOR_NAME", raising=False)
     monkeypatch.delenv("MINT_API_WORK_QUEUE_ACTOR_NAME", raising=False)
     monkeypatch.delenv("MINT_MODEL_NODE_IPS_JSON", raising=False)
@@ -206,6 +211,7 @@ def test_issue_444_queue_execution_runtime_forwards_runtime_contract_env(monkeyp
 
     overrides = queue_execution_runtime_module._runtime_env_overrides()
 
+    assert overrides["MINT_GIT_SHA"] == "sha-test"
     assert overrides["TINKER_RAY_NAMESPACE"] == "ns-test"
     assert overrides["TINKER_API_WORK_QUEUE_ACTOR_NAME"] == "queue-custom"
     assert overrides["MINT_MODEL_NODE_IPS_JSON"] == '{"openpi/pi0-fast-libero-low-mem-finetune":["192.168.38.176"]}'
@@ -213,3 +219,7 @@ def test_issue_444_queue_execution_runtime_forwards_runtime_contract_env(monkeyp
     assert overrides["OPENPI_DATA_HOME"] == "/tmp/openpi-data"
     assert overrides["MINT_OPENPI_FAST_WEIGHTS_PATH"] == "/tmp/pi0-fast-weights"
     assert overrides["MINT_API_WORK_QUEUE_ACTOR_NAME"] == "queue-custom"
+    assert (
+        queue_execution_runtime_module.RUNTIME_CONTRACT_DIGEST_ENV
+        == "MINT_QUEUE_EXECUTION_RUNTIME_CONTRACT_DIGEST"
+    )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import hashlib
 import json
 import logging
 import os
@@ -11,9 +12,27 @@ from typing import Any
 
 from ..config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources, config as server_config, otel_env_vars
 from ..ray_utils import register_ray_reconnect_invalidator as _register_ray_reconnect_invalidator
+from ..server_info import _git_sha
 
 logger = logging.getLogger(__name__)
+CURRENT_CODE_IDENTITY = os.environ.get("MINT_GIT_SHA") or _git_sha()
+RUNTIME_CONTRACT_DIGEST_ENV = "MINT_QUEUE_EXECUTION_RUNTIME_CONTRACT_DIGEST"
 _ACTOR_HANDLE = None
+
+
+def _runtime_contract_payload() -> dict[str, Any]:
+    return {
+        "actor_name": _actor_name(),
+        "namespace": _ray_namespace(),
+        "code_identity": CURRENT_CODE_IDENTITY,
+        "runtime_env_overrides": _runtime_env_overrides(),
+    }
+
+
+def _runtime_contract_digest() -> str:
+    payload = _runtime_contract_payload()
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _queue_runtime_debug_log_path() -> str:
@@ -62,6 +81,8 @@ _register_ray_reconnect_invalidator(_reset_cached_actor_handle)
 
 def _runtime_env_overrides() -> dict[str, str]:
     out: dict[str, str] = {}
+    if CURRENT_CODE_IDENTITY:
+        out["MINT_GIT_SHA"] = str(CURRENT_CODE_IDENTITY)
 
     direct_keys = (
         "MINT_QUEUE_EXECUTION_RUNTIME_ACTOR_NAME",
@@ -177,6 +198,37 @@ async def _await_ray_ref(ref: Any) -> Any:
         if hasattr(fut, "__await__"):
             return await fut
     raise TypeError(f"Ray ref is not awaitable: {type(ref)}")
+
+
+def _kill_named_actor(actor: Any) -> None:
+    from . import ray_kill
+
+    ray_kill.kill(
+        actor,
+        reason="queue_execution_runtime_contract_mismatch",
+        actor_name=_actor_name(),
+        namespace=_ray_namespace(),
+        no_restart=True,
+        verify_absent=True,
+    )
+
+
+def _await_ray_ref_sync(ref: Any, *, timeout_s: float | None = None) -> Any:
+    if hasattr(ref, "__await__"):
+        coro = ref
+        if timeout_s is None:
+            return asyncio.run(coro)
+        return asyncio.run(asyncio.wait_for(coro, timeout=float(timeout_s)))
+    to_future = getattr(ref, "future", None)
+    if callable(to_future):
+        fut = to_future()
+        if isinstance(fut, concurrent.futures.Future):
+            return fut.result(timeout=timeout_s)
+        if isinstance(fut, asyncio.Future) or hasattr(fut, "__await__"):
+            if timeout_s is None:
+                return asyncio.run(fut)
+            return asyncio.run(asyncio.wait_for(fut, timeout=float(timeout_s)))
+    return ref
 
 
 async def _restore_sampling_sessions_for_worker(inference_manager) -> int:
@@ -321,6 +373,8 @@ def _get_or_create_actor():
                 self._desired_workers = 0
                 self._last_error = None
                 self._last_started_at = None
+                self._code_identity = CURRENT_CODE_IDENTITY
+                self._runtime_contract_digest = os.environ.get(RUNTIME_CONTRACT_DIGEST_ENV) or _runtime_contract_digest()
                 self._observability_flush_task: asyncio.Task | None = None
                 self._observability_flush_interval_s = max(
                     5.0,
@@ -444,6 +498,8 @@ def _get_or_create_actor():
             return {
                 "actor_name": _actor_name(),
                 "namespace": _ray_namespace(),
+                "code_identity": self._code_identity,
+                "runtime_contract_digest": self._runtime_contract_digest,
                 "started_at": float(self._started_at),
                 "runtime_initialized": bool(self._runtime_initialized),
                 "desired_workers": int(self._desired_workers),
@@ -471,6 +527,7 @@ def _get_or_create_actor():
     apply_detached_actor_resources(options, ray)
     env = otel_env_vars()
     env.update(_runtime_env_overrides())
+    env[RUNTIME_CONTRACT_DIGEST_ENV] = _runtime_contract_digest()
     options["runtime_env"] = actor_runtime_env(pythonpath=PFS_PYTHONPATH, extra=env)
     _append_queue_runtime_debug(
         "driver_create_attempt",
@@ -481,7 +538,7 @@ def _get_or_create_actor():
     try:
         created = _QueueExecutionRuntimeActor.options(**options).remote()
         try:
-            ray.get(created.health_snapshot.remote())
+            _await_ray_ref_sync(created.health_snapshot.remote(), timeout_s=15.0)
             _ACTOR_HANDLE = created
         except Exception:
             _ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)
@@ -494,6 +551,37 @@ def _get_or_create_actor():
 class QueueExecutionRuntime:
     def __init__(self) -> None:
         self._ray_actor = None
+        self._runtime_contract_verified = False
+
+    def _reset_cached_actor(self) -> None:
+        global _ACTOR_HANDLE
+        _ACTOR_HANDLE = None
+        self._ray_actor = None
+        self._runtime_contract_verified = False
+
+    @staticmethod
+    def _runtime_contract_matches(snapshot: dict[str, Any]) -> bool:
+        if snapshot.get("code_identity") != CURRENT_CODE_IDENTITY:
+            return False
+        return snapshot.get("runtime_contract_digest") == _runtime_contract_digest()
+
+    async def _ensure_runtime_contract_async(self, snapshot: dict[str, Any]) -> None:
+        if self._runtime_contract_verified and self._runtime_contract_matches(snapshot):
+            return
+        if self._runtime_contract_matches(snapshot):
+            self._runtime_contract_verified = True
+            return
+        actor = self._get_ray_actor()
+        self._reset_cached_actor()
+        await asyncio.to_thread(_kill_named_actor, actor)
+        actor = self._get_ray_actor()
+        refreshed = await asyncio.wait_for(_await_ray_ref(actor.health_snapshot.remote()), timeout=15.0)
+        if not isinstance(refreshed, dict) or not self._runtime_contract_matches(refreshed):
+            raise RuntimeError(
+                "queue execution runtime contract mismatch after recreate: "
+                f"snapshot={refreshed!r}"
+            )
+        self._runtime_contract_verified = True
 
     def _get_ray_actor(self):
         import ray
@@ -511,6 +599,11 @@ class QueueExecutionRuntime:
 
     async def async_ensure_started(self, *, num_workers: int, timeout_s: float = 120.0) -> dict[str, Any]:
         actor = self._get_ray_actor()
+        snapshot = await asyncio.wait_for(_await_ray_ref(actor.health_snapshot.remote()), timeout=15.0)
+        if not isinstance(snapshot, dict):
+            raise TypeError(f"QueueExecutionRuntime.health_snapshot returned non-dict: {type(snapshot)}")
+        await self._ensure_runtime_contract_async(snapshot)
+        actor = self._get_ray_actor()
         out = await asyncio.wait_for(
             _await_ray_ref(actor.ensure_started.remote(num_workers=int(num_workers))),
             timeout=float(timeout_s),
@@ -521,6 +614,11 @@ class QueueExecutionRuntime:
 
     async def async_get_tokenizer_info(self, *, model_id: str, timeout_s: float = 60.0) -> dict[str, Any]:
         actor = self._get_ray_actor()
+        snapshot = await asyncio.wait_for(_await_ray_ref(actor.health_snapshot.remote()), timeout=15.0)
+        if not isinstance(snapshot, dict):
+            raise TypeError(f"QueueExecutionRuntime.health_snapshot returned non-dict: {type(snapshot)}")
+        await self._ensure_runtime_contract_async(snapshot)
+        actor = self._get_ray_actor()
         out = await asyncio.wait_for(
             _await_ray_ref(actor.get_tokenizer_info.remote(model_id=str(model_id))),
             timeout=float(timeout_s),
@@ -530,6 +628,11 @@ class QueueExecutionRuntime:
         return out
 
     async def async_health_snapshot(self, *, timeout_s: float = 30.0) -> dict[str, Any]:
+        actor = self._get_ray_actor()
+        out = await asyncio.wait_for(_await_ray_ref(actor.health_snapshot.remote()), timeout=float(timeout_s))
+        if not isinstance(out, dict):
+            raise TypeError(f"QueueExecutionRuntime.health_snapshot returned non-dict: {type(out)}")
+        await self._ensure_runtime_contract_async(out)
         actor = self._get_ray_actor()
         out = await asyncio.wait_for(_await_ray_ref(actor.health_snapshot.remote()), timeout=float(timeout_s))
         if not isinstance(out, dict):

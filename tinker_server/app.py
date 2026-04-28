@@ -372,9 +372,7 @@ async def lifespan(app: FastAPI):
         # ==========================================================================
         if startup_owner:
             if owner_runtime_local_only:
-                from .backend.actor_reconciliation import cleanup_stale_actors_once
-
-                await asyncio.to_thread(cleanup_stale_actors_once)
+                await _cleanup_stale_actors()
             else:
                 await owner_runtime_supervisor.async_run_once("actor_reconciliation", timeout_s=60.0)
         else:

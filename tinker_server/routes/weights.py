@@ -20,7 +20,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
-from fastapi import APIRouter, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import RedirectResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
@@ -34,9 +34,14 @@ from ..checkpoint_index import (
     CheckpointAlreadyExistsError,
     CheckpointAlreadyFailedError,
     CheckpointAlreadyUploadingError,
+    checkpoint_index_enabled,
     claim_checkpoint_publication,
+    get_catalog_checkpoint_by_key,
+    list_catalog_checkpoints_for_model,
+    mark_catalog_checkpoint_deleted,
     mark_checkpoint_failed,
 )
+from ..client_compat import checkpoint_uri, prefer_tinker_uri
 from ..checkpoints import (
     CHECKPOINTS_DIR,
     MIRROR_STATUS_PENDING,
@@ -53,6 +58,7 @@ from ..checkpoints import (
     materialize_persistent_checkpoint,
     resolve_checkpoint_path,
     safe_extract_checkpoint_archive,
+    _existing_checkpoint_view,
     validate_checkpoint_dir,
     validate_sampler_checkpoint_for_sampling,
     write_checkpoint_metadata,
@@ -310,21 +316,25 @@ async def _enqueue_weights_request_with_trace(
         )
 
 
-def _resolve_mint_path(mint_uri: str, *, user_id: str | None, is_admin: bool = False) -> str:
-    """Convert path identifier to filesystem path.
-
-    Args:
-        mint_uri: One of:
-            - checkpoint_id (ckpt_xxx): Search in all checkpoint directories
-            - mint://{model_id}/{name}: Legacy format -> /checkpoints/{model_id}/{name}
-            - file:///path: Strip prefix
-            - Absolute path: Return as-is
-
-    Returns:
-        Filesystem path.
-    """
-    resolved = resolve_checkpoint_path(mint_uri, user_id=user_id, is_admin=is_admin)
-    ensure_checkpoint_path_allowed(resolved, user_id=user_id, is_admin=is_admin)
+def _resolve_mint_path(
+    mint_uri: str,
+    *,
+    user_id: str | None,
+    is_admin: bool = False,
+    owner_id: str | None = None,
+) -> str:
+    """Convert path identifier to filesystem path without checkpoint-root scans."""
+    owner_scope = owner_id if is_admin else user_id
+    try:
+        resolved = resolve_checkpoint_path(mint_uri, user_id=owner_scope, is_admin=is_admin)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if mint_uri.startswith("ckpt_") and resolved == mint_uri:
+        raise HTTPException(status_code=404, detail="Checkpoint not found")
+    try:
+        ensure_checkpoint_path_allowed(resolved, user_id=owner_scope, is_admin=is_admin)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
     return materialize_persistent_checkpoint(resolved)
 
 
@@ -499,16 +509,44 @@ def _persistent_owner_root(user_id: str | None) -> str:
     return os.path.join(get_persistent_checkpoints_dir(), user_id or "anonymous")
 
 
+def _is_valid_checkpoint_segment(value: str) -> bool:
+    if not value or value in (".", ".."):
+        return False
+    if "/" in value or "\\" in value:
+        return False
+    return True
+
+
+def _checkpoint_owner_scope(
+    *,
+    request_user_id: str | None,
+    requested_owner_id: str | None,
+    is_admin: bool,
+) -> str | None:
+    if is_admin:
+        owner_id = str(requested_owner_id or "").strip()
+        if not owner_id:
+            raise HTTPException(status_code=400, detail="owner_id is required for admin checkpoint access")
+        if not _is_valid_checkpoint_segment(owner_id):
+            raise HTTPException(status_code=400, detail="Invalid owner_id")
+        return owner_id
+    owner_id = str(request_user_id or "anonymous").strip() or "anonymous"
+    if requested_owner_id is not None and str(requested_owner_id).strip() != owner_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    if not _is_valid_checkpoint_segment(owner_id):
+        raise HTTPException(status_code=403, detail="Access denied")
+    return owner_id
+
+
 def _persistent_candidate_paths(
     *,
     model_id: str,
     checkpoint_name: str,
-    user_id: str | None,
-    is_admin: bool = False,
+    owner_id: str | None,
 ) -> list[str]:
     candidates: list[str] = []
+    owner_dir = owner_id or "anonymous"
     for root in get_persistent_search_roots(primary_root=CHECKPOINTS_DIR):
-        owner_dir = user_id or "anonymous"
         candidates.extend(
             [
                 os.path.join(root, owner_dir, model_id, checkpoint_name),
@@ -516,14 +554,6 @@ def _persistent_candidate_paths(
                 os.path.join(root, owner_dir, checkpoint_name),
             ]
         )
-        if is_admin and os.path.isdir(root):
-            try:
-                for owner in os.listdir(root):
-                    candidates.append(os.path.join(root, owner, model_id, checkpoint_name))
-                    candidates.append(os.path.join(root, owner, checkpoint_name))
-            except OSError:
-                pass
-    # Preserve order while dropping duplicates.
     out: list[str] = []
     seen: set[str] = set()
     for path in candidates:
@@ -533,6 +563,137 @@ def _persistent_candidate_paths(
         seen.add(real)
         out.append(path)
     return out
+
+
+def _catalog_row_text(row: dict[str, Any], key: str) -> str | None:
+    value = row.get(key)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _catalog_checkpoint_path(row: dict[str, Any]) -> str | None:
+    storage_root = _catalog_row_text(row, "storage_root")
+    owner_id = _catalog_row_text(row, "owner_id")
+    model_id = _catalog_row_text(row, "model_id")
+    raw_checkpoint_id = _catalog_row_text(row, "raw_checkpoint_id")
+    checkpoint_type = _catalog_row_text(row, "checkpoint_type")
+    if not storage_root or not model_id or not raw_checkpoint_id:
+        return None
+    if checkpoint_type not in ("training", "sampler"):
+        return None
+    owner_dir = owner_id or "anonymous"
+    if not all(
+        _is_valid_checkpoint_segment(value)
+        for value in (owner_dir, model_id, raw_checkpoint_id)
+    ):
+        return None
+    root_real = os.path.realpath(storage_root)
+    base = os.path.join(storage_root, owner_dir, model_id, raw_checkpoint_id)
+    base_real = os.path.realpath(base)
+    if not (base_real == root_real or base_real.startswith(root_real + os.sep)):
+        return None
+    selected = _existing_checkpoint_view(base, checkpoint_type=checkpoint_type)
+    if selected is not None:
+        return selected
+    candidate = os.path.join(base, checkpoint_type)
+    candidate_real = os.path.realpath(candidate)
+    if not (candidate_real == root_real or candidate_real.startswith(root_real + os.sep)):
+        return None
+    return candidate
+
+
+def _storage_tier_from_catalog_row(row: dict[str, Any]) -> str | None:
+    storage_root = os.path.realpath(_catalog_row_text(row, "storage_root") or "")
+    if not storage_root:
+        return None
+    if storage_root == os.path.realpath(get_persistent_cache_dir()):
+        return "persistent_cache"
+    if storage_root == os.path.realpath(get_persistent_checkpoints_dir()):
+        return "persistent_tos"
+    return None
+
+
+def _catalog_created_at(row: dict[str, Any]) -> str:
+    for key in ("checkpoint_created_at", "published_at", "updated_at"):
+        value = row.get(key)
+        if isinstance(value, datetime):
+            return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        if value is not None:
+            text = str(value).strip()
+            if text:
+                return text
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _parse_checkpoint_time(created_at: str, *, fallback_path: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        return datetime.fromtimestamp(os.path.getctime(fallback_path), tz=timezone.utc)
+
+
+def _build_catalog_checkpoint_info(
+    row: dict[str, Any],
+    *,
+    prefer_tinker: bool,
+) -> CheckpointInfo | None:
+    ckpt_path = _catalog_checkpoint_path(row)
+    if ckpt_path is None or not os.path.isdir(ckpt_path):
+        return None
+
+    checkpoint_type = _catalog_row_text(row, "checkpoint_type")
+    if checkpoint_type not in ("training", "sampler"):
+        return None
+    try:
+        if checkpoint_type == "sampler":
+            validate_sampler_checkpoint_for_sampling(ckpt_path)
+        else:
+            validate_checkpoint_dir(ckpt_path, checkpoint_type=checkpoint_type)
+    except ValueError:
+        return None
+
+    metadata: dict[str, Any] = {}
+    metadata_path = os.path.join(ckpt_path, "metadata.json")
+    if os.path.exists(metadata_path):
+        try:
+            with open(metadata_path) as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                metadata = loaded
+        except Exception:
+            metadata = {}
+
+    model_id = _catalog_row_text(row, "model_id")
+    raw_checkpoint_id = _catalog_row_text(row, "raw_checkpoint_id")
+    if not model_id or not raw_checkpoint_id:
+        return None
+
+    created_at = str(metadata.get("created_at") or _catalog_created_at(row))
+    step = metadata.get("step")
+    if step is None and raw_checkpoint_id.startswith("checkpoint-"):
+        try:
+            step = int(raw_checkpoint_id.split("-", 1)[1])
+        except (IndexError, ValueError):
+            step = None
+
+    return CheckpointInfo(
+        checkpoint_id=(f"weights/{raw_checkpoint_id}" if checkpoint_type == "training" else f"sampler_weights/{raw_checkpoint_id}"),
+        checkpoint_type=checkpoint_type,
+        time=_parse_checkpoint_time(created_at, fallback_path=ckpt_path),
+        owner_id=_catalog_row_text(row, "owner_id"),
+        tinker_path=checkpoint_uri(model_id, raw_checkpoint_id, prefer_tinker=True, checkpoint_type=checkpoint_type),
+        path=checkpoint_uri(model_id, raw_checkpoint_id, prefer_tinker=prefer_tinker, checkpoint_type=checkpoint_type),
+        step=int(step) if isinstance(step, int) else None,
+        created_at=created_at,
+        storage_tier=str(metadata.get("storage_tier") or _storage_tier_from_catalog_row(row) or "") or None,
+        mirror_status=str(metadata.get("mirror_status") or "") or None,
+        mirror_error=str(metadata.get("mirror_error") or "") or None,
+    )
 
 
 def _build_sdk_archive_redirect_response(
@@ -563,11 +724,17 @@ def _build_sdk_archive_redirect_response(
         host = f"{host}:{xf_port}"
 
     base = URL(f"{scheme}://{host}")
-    direct_url_obj = base.replace(path=request.url.path).include_query_params(direct="1")
+    passthrough_params = {
+        key: value
+        for key, value in request.query_params.multi_items()
+        if key not in {"direct", "download_token"}
+    }
+    direct_url_obj = base.replace(path=request.url.path).include_query_params(**passthrough_params, direct="1")
+    effective_user_id = passthrough_params.get("owner_id") or user_id
     if secret:
         token, exp = make_archive_download_token(
             secret=secret,
-            user_id=user_id,
+            user_id=effective_user_id,
             model_id=model_id,
             checkpoint_id=checkpoint_id,
             ttl_s=15 * 60,
@@ -1436,9 +1603,14 @@ async def load_state(
         json_body = request.model_dump()
         can_system = can_manage_system(http_request)
         if request.path.startswith(("tinker://", "mint://", "ckpt_")):
-            local_path = resolve_checkpoint_path(request.path, user_id=user_id, is_admin=can_system)
+            owner_scope = request.owner_id if can_system else user_id
             try:
-                ensure_checkpoint_path_allowed(local_path, user_id=user_id, is_admin=can_system)
+                local_path = resolve_checkpoint_path(request.path, user_id=owner_scope, is_admin=can_system)
+                if request.path.startswith("ckpt_") and local_path == request.path:
+                    raise HTTPException(status_code=404, detail="Checkpoint not found")
+                ensure_checkpoint_path_allowed(local_path, user_id=owner_scope, is_admin=can_system)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
             except PermissionError as e:
                 raise HTTPException(status_code=403, detail=str(e)) from e
             if os.path.isdir(local_path):
@@ -1468,6 +1640,7 @@ async def load_state(
                         detail="Upstream checkpoints/upload returned invalid checkpoint_id",
                     )
                 json_body["path"] = ckpt_id
+                json_body["owner_id"] = owner_scope
 
         try:
             resp = await forward_json(
@@ -1497,7 +1670,12 @@ async def load_state(
 
     await _protect_training_session_enqueue_window(store_info)
     user_id = _get_user_id(http_request)
-    load_path = _resolve_mint_path(request.path, user_id=user_id, is_admin=can_manage_system(http_request))
+    load_path = _resolve_mint_path(
+        request.path,
+        user_id=user_id,
+        is_admin=can_manage_system(http_request),
+        owner_id=request.owner_id,
+    )
     request = request.model_copy(update={"path": load_path})
     if request.optimizer:
         try:
@@ -1814,241 +1992,43 @@ async def upload_checkpoint_archive(
 
 @router.get("/training_runs/{model_id}/checkpoints", response_model=CheckpointsListResponse)
 async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListResponse:
-    """List all checkpoints for a model.
-
-    Works for both active training sessions and saved checkpoints.
-    Ownership verified via metadata.json (admin can access all).
-    """
+    """List catalog-backed checkpoints for a model without scanning filesystem roots."""
     remote_response = await _forward_remote_checkpoint_route(model_id=model_id, request=request)
     if remote_response is not None:
         return remote_response
 
-    user_id = _get_user_id(request)
-    owner_dir = user_id or "anonymous"
-    from ..client_compat import checkpoint_uri, prefer_tinker_uri
+    if not checkpoint_index_enabled():
+        raise HTTPException(status_code=503, detail="Checkpoint catalog unavailable")
 
+    user_id = _get_user_id(request)
+    is_admin = can_bypass_ownership(request)
     prefer_tinker = prefer_tinker_uri(request)
 
-    persistent_roots = get_persistent_search_roots(primary_root=CHECKPOINTS_DIR)
-    cache_root = get_persistent_cache_dir()
-
-    candidate_paths: list[str] = []
-    for root in [*persistent_roots, cache_root]:
-        candidate_paths.extend(
-            [
-                os.path.join(root, owner_dir, model_id),
-                os.path.join(root, model_id),
-            ]
+    try:
+        rows = await list_catalog_checkpoints_for_model(
+            model_id=model_id,
+            owner_id=user_id,
+            is_admin=is_admin,
         )
-        if can_bypass_ownership(request) and os.path.isdir(root):
-            try:
-                for owner in os.listdir(root):
-                    candidate_paths.append(os.path.join(root, owner, model_id))
-            except OSError:
-                pass
-
-    if not any(os.path.exists(p) for p in candidate_paths):
-        raise HTTPException(
-            status_code=404, detail=f"No checkpoints found for model '{model_id}'"
+    except Exception:
+        logger.exception(
+            "[weights.list_checkpoints] catalog query failed model_id=%s is_admin=%s",
+            model_id,
+            is_admin,
         )
+        raise HTTPException(status_code=503, detail="Checkpoint catalog unavailable")
 
-    checkpoints_by_id: dict[str, tuple[int, CheckpointInfo]] = {}
+    checkpoints: list[CheckpointInfo] = []
+    for row in rows:
+        info = _build_catalog_checkpoint_info(row, prefer_tinker=prefer_tinker)
+        if info is not None:
+            checkpoints.append(info)
 
-    def _store_checkpoint(info: CheckpointInfo) -> None:
-        rank = _checkpoint_rank(info.storage_tier)
-        current = checkpoints_by_id.get(info.checkpoint_id)
-        if current is None or rank >= current[0]:
-            checkpoints_by_id[info.checkpoint_id] = (rank, info)
+    if not checkpoints:
+        raise HTTPException(status_code=404, detail=f"No checkpoints found for model '{model_id}'")
 
-    seen: set[str] = set()
-    for checkpoints_path in candidate_paths:
-        if not os.path.isdir(checkpoints_path):
-            continue
-        for name in os.listdir(checkpoints_path):
-            ckpt_path = os.path.join(checkpoints_path, name)
-            if not os.path.isdir(ckpt_path):
-                continue
-            key = f"{checkpoints_path}:{name}"
-            if key in seen:
-                continue
-            seen.add(key)
-
-            metadata_path = os.path.join(ckpt_path, "metadata.json")
-            if not os.path.exists(metadata_path):
-                continue  # refuse unauthenticated legacy dirs
-            try:
-                import json
-
-                with open(metadata_path) as f:
-                    metadata = json.load(f)
-            except Exception:
-                continue
-
-            if metadata.get("model_id") != model_id:
-                continue
-            if not can_bypass_ownership(request) and metadata.get("owner_id") != user_id:
-                continue
-
-            # Try to parse step from directory name
-            step = None
-            if name.startswith("checkpoint-"):
-                try:
-                    step = int(name.split("-")[1])
-                except (IndexError, ValueError):
-                    pass
-
-            created_at = datetime.fromtimestamp(os.path.getctime(ckpt_path)).isoformat()
-            checkpoint_type = metadata.get("checkpoint_type")
-            if checkpoint_type not in ("training", "sampler"):
-                continue
-            try:
-                if checkpoint_type == "sampler":
-                    validate_sampler_checkpoint_for_sampling(ckpt_path)
-                else:
-                    validate_checkpoint_dir(ckpt_path, checkpoint_type=checkpoint_type)
-            except ValueError:
-                continue
-            storage_tier = metadata.get("storage_tier")
-            mirror_status = metadata.get("mirror_status")
-            mirror_error = metadata.get("mirror_error")
-
-            created_at = metadata.get("created_at") or created_at
-            try:
-                created_time = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-            except Exception:
-                created_time = datetime.fromtimestamp(os.path.getctime(ckpt_path))
-
-            checkpoint_id = (
-                f"weights/{name}" if checkpoint_type == "training" else f"sampler_weights/{name}"
-            )
-            tinker_path = checkpoint_uri(
-                model_id,
-                name,
-                prefer_tinker=True,
-                checkpoint_type=checkpoint_type,
-            )
-            path_uri = checkpoint_uri(
-                model_id,
-                name,
-                prefer_tinker=prefer_tinker,
-                checkpoint_type=checkpoint_type,
-            )
-
-            _store_checkpoint(
-                CheckpointInfo(
-                    checkpoint_id=checkpoint_id,
-                    checkpoint_type=checkpoint_type,
-                    time=created_time,
-                    tinker_path=tinker_path,
-                    path=path_uri,
-                    step=step,
-                    created_at=created_at,
-                    storage_tier=storage_tier,
-                    mirror_status=mirror_status,
-                    mirror_error=mirror_error,
-                )
-            )
-
-    # Also include uploaded checkpoints stored as /checkpoints/{owner}/{checkpoint_id}/ if metadata.model_id matches.
-    owner_roots: list[str]
-    if can_bypass_ownership(request):
-        try:
-            owner_roots = []
-            for root in [*persistent_roots, cache_root]:
-                if not os.path.isdir(root):
-                    continue
-                owner_roots.extend(
-                    os.path.join(root, d)
-                    for d in os.listdir(root)
-                    if os.path.isdir(os.path.join(root, d))
-                )
-        except OSError:
-            owner_roots = []
-    else:
-        owner_roots = [os.path.join(root, owner_dir) for root in [*persistent_roots, cache_root]]
-
-    for root in owner_roots:
-        if not os.path.isdir(root):
-            continue
-        for name in os.listdir(root):
-            if not name.startswith("ckpt_"):
-                continue
-            ckpt_path = os.path.join(root, name)
-            if not os.path.isdir(ckpt_path):
-                continue
-            metadata_path = os.path.join(ckpt_path, "metadata.json")
-            if not os.path.exists(metadata_path):
-                continue
-            try:
-                import json
-
-                with open(metadata_path) as f:
-                    metadata = json.load(f)
-            except Exception:
-                continue
-            if metadata.get("model_id") != model_id:
-                continue
-            if not can_bypass_ownership(request) and metadata.get("owner_id") != user_id:
-                continue
-            created_at = datetime.fromtimestamp(os.path.getctime(ckpt_path)).isoformat()
-            checkpoint_type = metadata.get("checkpoint_type")
-            if checkpoint_type not in ("training", "sampler"):
-                continue
-            try:
-                if checkpoint_type == "sampler":
-                    validate_sampler_checkpoint_for_sampling(ckpt_path)
-                else:
-                    validate_checkpoint_dir(ckpt_path, checkpoint_type=checkpoint_type)
-            except ValueError:
-                continue
-            storage_tier = metadata.get("storage_tier")
-            mirror_status = metadata.get("mirror_status")
-            mirror_error = metadata.get("mirror_error")
-
-            created_at = metadata.get("created_at") or created_at
-            try:
-                created_time = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-            except Exception:
-                created_time = datetime.fromtimestamp(os.path.getctime(ckpt_path))
-
-            checkpoint_id = (
-                f"weights/{name}" if checkpoint_type == "training" else f"sampler_weights/{name}"
-            )
-            tinker_path = checkpoint_uri(
-                model_id,
-                name,
-                prefer_tinker=True,
-                checkpoint_type=checkpoint_type,
-            )
-            path_uri = checkpoint_uri(
-                model_id,
-                name,
-                prefer_tinker=prefer_tinker,
-                checkpoint_type=checkpoint_type,
-            )
-            _store_checkpoint(
-                CheckpointInfo(
-                    checkpoint_id=checkpoint_id,
-                    checkpoint_type=checkpoint_type,
-                    time=created_time,
-                    tinker_path=tinker_path,
-                    path=path_uri,
-                    step=None,
-                    created_at=created_at,
-                    storage_tier=storage_tier,
-                    mirror_status=mirror_status,
-                    mirror_error=mirror_error,
-                )
-            )
-
-    # Sort by step (descending)
-    checkpoints = [item for _, item in checkpoints_by_id.values()]
-    checkpoints.sort(key=lambda x: x.step or 0, reverse=True)
-
-    return CheckpointsListResponse(
-        model_id=model_id,
-        checkpoints=checkpoints,
-    )
+    checkpoints.sort(key=lambda item: (item.step or 0, item.time), reverse=True)
+    return CheckpointsListResponse(model_id=model_id, checkpoints=checkpoints)
 
 
 # =============================================================================
@@ -2066,49 +2046,178 @@ def _split_tinker_checkpoint_id(checkpoint_id: str) -> tuple[str, str | None]:
     return checkpoint_id, None
 
 
-@router.delete("/training_runs/{model_id}/checkpoints/{checkpoint_id:path}")
-async def delete_checkpoint(model_id: str, checkpoint_id: str, request: Request):
-    """Delete a specific checkpoint.
+def _select_exact_checkpoint_from_candidates(
+    candidates: list[str],
+    *,
+    model_id: str,
+    required_owner_id: str | None,
+    expected_type: str | None,
+) -> tuple[str, dict[str, Any]] | None:
+    import json
 
-    Ownership verified via metadata.json (admin can delete all).
-    """
-    _require_write_access(request)
-    user_id = _get_user_id(request)
+    existing = [p for p in candidates if os.path.isdir(p)]
+    saw_unowned = False
+    saw_unreadable_metadata = False
+    for p in existing:
+        selected = _existing_checkpoint_view(
+            p,
+            checkpoint_type=(expected_type if expected_type in ("training", "sampler") else None),
+        )
+        if selected is None:
+            training_view = _existing_checkpoint_view(p, checkpoint_type="training")
+            sampler_view = _existing_checkpoint_view(p, checkpoint_type="sampler")
+            if expected_type == "training" and sampler_view is not None:
+                continue
+            if expected_type == "sampler" and training_view is not None:
+                continue
+            if expected_type is None:
+                if training_view is not None and sampler_view is None:
+                    selected = training_view
+                elif sampler_view is not None and training_view is None:
+                    selected = sampler_view
+                elif training_view is not None or sampler_view is not None:
+                    continue
+            if selected is None:
+                any_type = _existing_checkpoint_view(p, checkpoint_type=None)
+                if any_type is not None:
+                    continue
+                saw_unreadable_metadata = True
+                continue
+        metadata_path = os.path.join(selected, "metadata.json")
+        if not os.path.exists(metadata_path):
+            saw_unreadable_metadata = True
+            continue
+        try:
+            with open(metadata_path) as f:
+                metadata = json.load(f)
+        except Exception:
+            saw_unreadable_metadata = True
+            continue
+        if metadata.get("model_id") != model_id:
+            continue
+        if expected_type is not None and metadata.get("checkpoint_type") != expected_type:
+            continue
+        actual_owner = str(metadata.get("owner_id") or "anonymous").strip() or "anonymous"
+        expected_owner = str(required_owner_id or "anonymous").strip() or "anonymous"
+        if actual_owner != expected_owner:
+            saw_unowned = True
+            continue
+        return selected, metadata
 
+    if saw_unowned or saw_unreadable_metadata:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return None
+
+
+async def _resolve_weight_checkpoint(
+    *,
+    model_id: str,
+    checkpoint_id: str,
+    request_user_id: str | None,
+    owner_id: str | None,
+    is_admin: bool,
+) -> tuple[str, dict[str, Any], dict[str, Any] | None]:
     checkpoint_name, expected_type = _split_tinker_checkpoint_id(checkpoint_id)
+    scoped_owner_id = _checkpoint_owner_scope(
+        request_user_id=request_user_id,
+        requested_owner_id=owner_id,
+        is_admin=is_admin,
+    )
+
+    catalog_row = None
+    if checkpoint_index_enabled() and expected_type in ("training", "sampler"):
+        try:
+            catalog_row = await get_catalog_checkpoint_by_key(
+                owner_id=scoped_owner_id,
+                model_id=model_id,
+                raw_checkpoint_id=checkpoint_name,
+                checkpoint_type=expected_type,
+            )
+        except Exception:
+            logger.exception(
+                "[weights.checkpoint_lookup] catalog query failed model_id=%s checkpoint_id=%s owner_id=%s",
+                model_id,
+                checkpoint_id,
+                scoped_owner_id,
+            )
+
+    if catalog_row is not None:
+        ckpt_path = _catalog_checkpoint_path(catalog_row)
+        if ckpt_path is not None and os.path.isdir(ckpt_path):
+            metadata_path = os.path.join(ckpt_path, "metadata.json")
+            metadata: dict[str, Any] = {}
+            if os.path.exists(metadata_path):
+                try:
+                    import json
+
+                    with open(metadata_path) as f:
+                        loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        metadata = loaded
+                except Exception:
+                    metadata = {}
+            actual_owner = str(metadata.get("owner_id") or scoped_owner_id or "anonymous").strip() or "anonymous"
+            actual_model_id = str(metadata.get("model_id") or model_id).strip() or model_id
+            actual_type = str(metadata.get("checkpoint_type") or expected_type or "").strip() or expected_type
+            if actual_owner == str(scoped_owner_id or "anonymous").strip() and actual_model_id == str(model_id):
+                if expected_type is None or actual_type == expected_type:
+                    metadata.setdefault("owner_id", scoped_owner_id)
+                    metadata.setdefault("model_id", model_id)
+                    metadata.setdefault("checkpoint_type", expected_type)
+                    return ckpt_path, metadata, catalog_row
+
     candidates = _persistent_candidate_paths(
         model_id=model_id,
         checkpoint_name=checkpoint_name,
-        user_id=user_id,
-        is_admin=can_bypass_ownership(request),
+        owner_id=scoped_owner_id,
+    )
+    resolved = _select_exact_checkpoint_from_candidates(
+        candidates,
+        model_id=model_id,
+        required_owner_id=scoped_owner_id,
+        expected_type=expected_type,
+    )
+    if resolved is None:
+        raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found")
+    ckpt_path, metadata = resolved
+    return ckpt_path, metadata, catalog_row
+
+
+@router.delete("/training_runs/{model_id}/checkpoints/{checkpoint_id:path}")
+async def delete_checkpoint(
+    model_id: str,
+    checkpoint_id: str,
+    request: Request,
+    owner_id: str | None = Query(default=None),
+):
+    """Delete a specific checkpoint without scanning owner roots."""
+    _require_write_access(request)
+    user_id = _get_user_id(request)
+    is_admin = can_bypass_ownership(request)
+
+    ckpt_path, _metadata, catalog_row = await _resolve_weight_checkpoint(
+        model_id=model_id,
+        checkpoint_id=checkpoint_id,
+        request_user_id=user_id,
+        owner_id=owner_id,
+        is_admin=is_admin,
     )
 
-    ckpt_path = next((p for p in candidates if os.path.isdir(p)), None)
-    if ckpt_path is None:
-        raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found")
-
-    metadata_path = os.path.join(ckpt_path, "metadata.json")
-    if not os.path.exists(metadata_path):
-        raise HTTPException(status_code=403, detail="Access denied")
-    try:
-        import json
-
-        with open(metadata_path) as f:
-            metadata = json.load(f)
-    except Exception:
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    if metadata.get("model_id") != model_id:
-        raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found")
-    if not can_bypass_ownership(request) and metadata.get("owner_id") != user_id:
-        raise HTTPException(status_code=403, detail="Access denied")
-    if expected_type is not None and metadata.get("checkpoint_type") != expected_type:
-        raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found")
-
     shutil.rmtree(ckpt_path)
+    if catalog_row is not None:
+        ckpt_id = _catalog_row_text(catalog_row, "ckpt_id")
+        if ckpt_id:
+            try:
+                await mark_catalog_checkpoint_deleted(ckpt_id, owner_id=user_id, is_admin=is_admin)
+            except Exception:
+                logger.exception(
+                    "[weights.delete_checkpoint] catalog tombstone failed model_id=%s checkpoint_id=%s ckpt_id=%s",
+                    model_id,
+                    checkpoint_id,
+                    ckpt_id,
+                )
 
     logger.info(f"[{model_id}] Deleted checkpoint: {checkpoint_id}")
-
     return {"status": "deleted", "checkpoint_id": checkpoint_id}
 
 
@@ -2123,6 +2232,7 @@ async def download_checkpoint_archive(
     checkpoint_id: str,
     request: Request,
     direct: bool = False,
+    owner_id: str | None = Query(default=None),
 ):
     """Download checkpoint as tar.gz archive.
 
@@ -2155,52 +2265,13 @@ async def download_checkpoint_archive(
         ):
             user_id = payload.get("user_id")
 
-    checkpoint_name, expected_type = _split_tinker_checkpoint_id(checkpoint_id)
-    candidates = _persistent_candidate_paths(
+    ckpt_path, metadata, _catalog_row = await _resolve_weight_checkpoint(
         model_id=model_id,
-        checkpoint_name=checkpoint_name,
-        user_id=user_id,
+        checkpoint_id=checkpoint_id,
+        request_user_id=user_id,
+        owner_id=owner_id,
         is_admin=can_bypass_ownership(request),
     )
-
-    # Prefer a candidate whose metadata matches the requested type.
-    # This avoids false 404s when both "training" and "sampler" checkpoints share the same name.
-    import json
-
-    existing = [p for p in candidates if os.path.isdir(p)]
-    if not existing:
-        raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found")
-
-    ckpt_path: str | None = None
-    metadata: dict | None = None
-    saw_unowned = False
-    saw_unreadable_metadata = False
-    for p in existing:
-        metadata_path = os.path.join(p, "metadata.json")
-        if not os.path.exists(metadata_path):
-            saw_unreadable_metadata = True
-            continue
-        try:
-            with open(metadata_path) as f:
-                md = json.load(f)
-        except Exception:
-            saw_unreadable_metadata = True
-            continue
-        if md.get("model_id") != model_id:
-            continue
-        if expected_type is not None and md.get("checkpoint_type") != expected_type:
-            continue
-        if not can_bypass_ownership(request) and md.get("owner_id") != user_id:
-            saw_unowned = True
-            continue
-        ckpt_path = p
-        metadata = md
-        break
-
-    if ckpt_path is None or metadata is None:
-        if saw_unowned or saw_unreadable_metadata:
-            raise HTTPException(status_code=403, detail="Access denied")
-        raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found")
 
     # Tinker SDK expects this endpoint to respond with 302 + Location.
     # It does not follow redirects automatically; it treats Location as a signed URL.
@@ -2215,9 +2286,10 @@ async def download_checkpoint_archive(
                 checkpoint_id=checkpoint_id,
             )
 
+    checkpoint_name = os.path.basename(ckpt_path)
+
     def stream_tar_gz():
         """Stream tar.gz via subprocess to avoid memory explosion."""
-        # Run tar in parent directory, archive the checkpoint_id folder
         parent_dir = os.path.dirname(ckpt_path)
         proc = subprocess.Popen(
             ["tar", "czf", "-", checkpoint_name],

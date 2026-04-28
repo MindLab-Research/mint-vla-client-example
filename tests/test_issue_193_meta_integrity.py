@@ -94,7 +94,7 @@ def test_issue_193_megatron_load_weights_invalid_meta_fails_loud(monkeypatch):
     assert worker.mark_session_loaded.calls == []
 
 
-def test_issue_193_megatron_create_training_session_skips_ready_probe(monkeypatch):
+def test_issue_193_megatron_create_training_session_waits_for_ready_probe(monkeypatch):
     engine = VerlTrainingEngine()
     model_id = "model_issue_193_megatron_create_ready"
     worker = _FakeLoadWorker(ref="unused-load-ref")
@@ -142,7 +142,7 @@ def test_issue_193_megatron_create_training_session_skips_ready_probe(monkeypatc
 
     asyncio.run(_run())
 
-    assert keepalive_calls == []
+    assert keepalive_calls == [("fake-load-ready-ref", model_id, 30.0, 3600.0)]
     assert engine._workers[model_id] is worker
     assert session.backend == "megatron"
     assert session.is_active is True

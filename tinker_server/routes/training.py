@@ -14,6 +14,7 @@ Endpoints:
 - GET /models: List training models
 - GET /models/{model_id}: Get model info
 - GET /models/{model_id}/tokenizer: Get tokenizer config
+- GET /models/{model_id}/session_guard_state: Get contamination/block guard state
 - DELETE /models/{model_id}: Delete a model
 """
 
@@ -26,6 +27,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import time
 import uuid
 from datetime import datetime, timezone
@@ -69,7 +71,9 @@ from ..checkpoints import (
     checkpoint_has_optimizer_state,
     async_create_checkpoint_archive,
     ensure_checkpoint_path_allowed,
+    get_ephemeral_checkpoints_dir,
     get_persistent_cache_dir,
+    get_persistent_checkpoints_dir,
     materialize_persistent_checkpoint,
     resolve_checkpoint_path,
     validate_sampler_checkpoint_for_sampling,
@@ -192,6 +196,25 @@ def _get_user_id(request: Request) -> str | None:
 
 def _build_training_usage_label(*, model: str, route: str) -> str:
     return f"model={model},route={route},dimension=train"
+
+
+def _cleanup_generated_checkpoint_dir(path: str | None) -> None:
+    if not path:
+        return
+    try:
+        real = os.path.realpath(path)
+    except Exception:
+        return
+    managed_roots = [
+        os.path.realpath(get_ephemeral_checkpoints_dir()),
+        os.path.realpath(get_persistent_cache_dir()),
+        os.path.realpath(get_persistent_checkpoints_dir()),
+    ]
+    if not any(real == root or real.startswith(root + os.sep) for root in managed_roots):
+        logger.warning("Refusing to cleanup checkpoint outside managed roots: %s", path)
+        return
+    if os.path.isdir(real):
+        shutil.rmtree(real, ignore_errors=True)
 
 
 def _training_heartbeat_stale_timeout_s() -> float:
@@ -1847,7 +1870,7 @@ async def _do_create_model(
             type="create_model",
             backend=planned_backend,
         )
-        future_store.resolve(request_id, response.model_dump())
+        await future_store.async_resolve(request_id, response.model_dump())
 
         if webhook_url and user_id:
             send_task_event(
@@ -1909,15 +1932,25 @@ async def _do_create_model(
 # create_model_from_state - async (composes create_model + load_state)
 # =============================================================================
 
-def _resolve_state_path(state_uri: str, *, user_id: str | None, is_admin: bool = False) -> str:
+def _resolve_state_path(
+    state_uri: str,
+    *,
+    user_id: str | None,
+    is_admin: bool = False,
+    owner_id: str | None = None,
+) -> str:
     if not is_admin and not state_uri.startswith(("tinker://", "mint://", "ckpt_")):
         raise HTTPException(status_code=403, detail="Access denied")
 
-    resolved = resolve_checkpoint_path(state_uri, user_id=user_id, is_admin=is_admin)
+    owner_scope = owner_id if is_admin else user_id
+    try:
+        resolved = resolve_checkpoint_path(state_uri, user_id=owner_scope, is_admin=is_admin)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     if state_uri.startswith("ckpt_") and resolved == state_uri:
         raise HTTPException(status_code=404, detail="Checkpoint not found")
     try:
-        ensure_checkpoint_path_allowed(resolved, user_id=user_id, is_admin=is_admin)
+        ensure_checkpoint_path_allowed(resolved, user_id=owner_scope, is_admin=is_admin)
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
     return materialize_persistent_checkpoint(resolved)
@@ -1970,7 +2003,12 @@ async def create_model_from_state(
         try:
             from ..checkpoints import validate_checkpoint_load_contract
 
-            local_path = _resolve_state_path(request.state_path, user_id=user_id, is_admin=can_manage_system(http_request))
+            local_path = _resolve_state_path(
+                request.state_path,
+                user_id=user_id,
+                is_admin=can_manage_system(http_request),
+                owner_id=request.owner_id,
+            )
             if os.path.isdir(local_path) and os.path.exists(os.path.join(local_path, "metadata.json")):
                 validate_checkpoint_load_contract(local_path, load_optimizer=True)
         except ValueError as e:
@@ -1991,7 +2029,12 @@ async def create_model_from_state(
         await _raise_if_local_model_id_exists(model_id)
         incoming_headers = dict(http_request.headers)
         if request.state_path.startswith(("tinker://", "mint://", "ckpt_")):
-            local_path = _resolve_state_path(request.state_path, user_id=user_id, is_admin=can_manage_system(http_request))
+            local_path = _resolve_state_path(
+                request.state_path,
+                user_id=user_id,
+                is_admin=can_manage_system(http_request),
+                owner_id=request.owner_id,
+            )
             if os.path.isdir(local_path):
                 proxy_timeout_s = float(os.environ.get("MINT_GATEWAY_CHECKPOINT_PROXY_TIMEOUT_S", "600"))
                 tmp_archive = build_gateway_proxy_archive_path()
@@ -2018,7 +2061,8 @@ async def create_model_from_state(
                         status_code=502,
                         detail="Upstream checkpoints/upload returned invalid checkpoint_id",
                     )
-                request = request.model_copy(update={"state_path": ckpt_id})
+                owner_scope = request.owner_id if can_manage_system(http_request) else user_id
+                request = request.model_copy(update={"state_path": ckpt_id, "owner_id": owner_scope})
         try:
             resp = await forward_json(
                 upstream=upstream,
@@ -2066,6 +2110,7 @@ async def create_model_from_state(
         request.state_path,
         user_id=user_id,
         is_admin=can_manage_system(http_request),
+        owner_id=request.owner_id,
     )
     if request.state_path.startswith(("tinker://", "mint://", "ckpt_")) and not os.path.isdir(resolved_state_path):
         raise HTTPException(status_code=404, detail=f"Checkpoint not found: {request.state_path}")
@@ -2251,7 +2296,7 @@ async def _do_create_model_from_state(
             model_id=model_id,
             type="create_model_from_state",
         )
-        future_store.resolve(request_id, response.model_dump())
+        await future_store.async_resolve(request_id, response.model_dump())
 
     except Exception as e:
         logger.exception(
@@ -2524,7 +2569,7 @@ async def _do_forward_backward(
                     )
                 ]
             )
-        future_store.resolve(request_id, result)
+        await future_store.async_resolve(request_id, result)
 
     except Exception as e:
         logger.exception(
@@ -2760,7 +2805,7 @@ async def _do_train_step(
                     )
                 ]
             )
-        future_store.resolve(request_id, result)
+        await future_store.async_resolve(request_id, result)
 
     except Exception as e:
         logger.exception(
@@ -2995,7 +3040,7 @@ async def _do_forward(
                     )
                 ]
             )
-        future_store.resolve(request_id, result)
+        await future_store.async_resolve(request_id, result)
 
     except Exception as e:
         logger.exception(
@@ -3203,7 +3248,7 @@ async def _do_optim_step(request_id: str, request: OptimStepRequest, user_id: st
         elapsed_s = time.time() - t0
         msg = f"[{session.model_id}] optim_step done request_id={request_id} elapsed_s={elapsed_s:.3f}"
         logger.info(msg)
-        future_store.resolve(request_id, result)
+        await future_store.async_resolve(request_id, result)
 
     except Exception as e:
         logger.exception(
@@ -3326,7 +3371,7 @@ async def _do_reset_expert_bias(
 
         result = await training_engine.reset_expert_bias(session)
         modules_reset = int(result.get("modules_reset", 0) or 0)
-        future_store.resolve(
+        await future_store.async_resolve(
             request_id,
             ResetExpertBiasResponse(
                 model_id=request.model_id,
@@ -3518,6 +3563,9 @@ async def _do_save_weights_for_sampler(
     inflight_marked = False
     claimed_ckpt_id: str | None = None
     mirror_started = False
+    save_path: str | None = None
+    persistent_path: str | None = None
+    sampling_session_id: str | None = None
     try:
         set_request_id(request_id)
         engine = training_engine
@@ -3863,11 +3911,32 @@ async def _do_save_weights_for_sampler(
         if callable(async_resolve):
             await async_resolve(request_id, response)
         else:
-            future_store.resolve(request_id, response)
+            await future_store.async_resolve(request_id, response)
 
     except Exception as e:
         if not mirror_started:
             await _mark_checkpoint_failed_safe(claimed_ckpt_id, fail_reason="upload_error")
+        if sampling_session_id is not None and inference_manager is not None:
+            try:
+                await inference_manager.end_session(sampling_session_id)
+            except Exception as cleanup_error:
+                logger.warning(
+                    "[save_weights_for_sampler] failed to cleanup sampling session %s: %s: %s",
+                    sampling_session_id,
+                    type(cleanup_error).__name__,
+                    cleanup_error,
+                )
+        if not mirror_started:
+            for candidate in (persistent_path, save_path):
+                try:
+                    _cleanup_generated_checkpoint_dir(candidate)
+                except Exception as cleanup_error:
+                    logger.warning(
+                        "[save_weights_for_sampler] failed to cleanup checkpoint path %s: %s: %s",
+                        candidate,
+                        type(cleanup_error).__name__,
+                        cleanup_error,
+                    )
         logger.exception(
             "[save_weights_for_sampler] failed request_id=%s model_id=%s failure_reason=%s error_type=%s next_action=%s",
             str(request_id),
@@ -4010,6 +4079,35 @@ async def get_model_info(model_id: str):
         "user_id": info.get("user_id"),
         "last_activity": info.get("last_activity"),
         "idle_for_s": max(0.0, time.time() - float(info.get("last_activity") or 0.0)) if info.get("last_activity") is not None else None,
+    }
+
+
+@router.get("/models/{model_id}/session_guard_state")
+async def get_session_guard_state(model_id: str):
+    """Get megatron contamination/block guard state for one training model."""
+    if training_manager is None or training_engine is None:
+        raise HTTPException(status_code=503, detail="Training manager not initialized")
+
+    session = training_manager.get_session(model_id)
+    if session is None:
+        session = await _restore_training_session(model_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
+
+    try:
+        guard_state = await training_engine.get_session_guard_state(session)
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Failed to query session guard state: "
+                f"{type(e).__name__}: {e}"
+            ),
+        )
+    return {
+        "model_id": model_id,
+        "backend": session.backend,
+        "guard_state": guard_state,
     }
 
 
@@ -4167,7 +4265,7 @@ async def _do_delete_model(request_id: str, model_id: str) -> None:
         except Exception:
             pass
 
-        future_store.resolve(request_id, {"model_id": model_id, "status": "deleted"})
+        await future_store.async_resolve(request_id, {"model_id": model_id, "status": "deleted"})
     except Exception as e:
         logger.exception(
             "[training.delete_model] failed request_id=%s model_id=%s error_type=%s error=%s",

@@ -349,6 +349,9 @@ def test_issue_417_create_model_from_state_persists_loaded_lora_config(
         def resolve(self, request_id: str, payload: dict) -> None:
             self.resolved.append((request_id, payload))
 
+        async def async_resolve(self, request_id: str, payload: dict) -> None:
+            self.resolved.append((request_id, payload))
+
         async def async_fail(self, request_id: str, error: str) -> None:
             raise AssertionError(f"unexpected fail({request_id}): {error}")
 
@@ -464,6 +467,9 @@ def test_issue_283_create_model_from_state_background_restores_openpi_training_c
             self.resolved: list[tuple[str, dict]] = []
 
         def resolve(self, request_id: str, payload: dict) -> None:
+            self.resolved.append((request_id, payload))
+
+        async def async_resolve(self, request_id: str, payload: dict) -> None:
             self.resolved.append((request_id, payload))
 
         async def async_fail(self, request_id: str, error: str) -> None:

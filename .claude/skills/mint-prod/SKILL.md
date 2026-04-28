@@ -32,7 +32,7 @@ Procedure contract:
 > | Health check | `curl http://localhost:18000/api/v1/healthz` |
 > | Restart server | `ssh mint-prod-volcano 'supervisorctl restart tinker-server-auth'` |
 > | Stop server (fallback) | `ssh mint-prod-volcano 'fuser -k 18000/tcp'` (NOT pkill) |
-> | Kill vLLM | `curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_vllm` |
+> | Kill vLLM | `curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/json" -d '{"actor_type":"vllm"}' http://localhost:18000/api/v1/actors/kill` |
 >
 > If you find yourself guessing or trial-and-error debugging basic infrastructure, **STOP and re-read this skill**.
 >
@@ -208,7 +208,7 @@ ssh mint-prod-volcano "tail -50 /tmp/tinker_server_auth.log"
 curl -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/vllm_status
 
 # Kill vLLM (auth required)
-curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_vllm
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/json" -d '{"actor_type":"vllm"}' http://localhost:18000/api/v1/actors/kill
 ```
 
 ---
@@ -421,34 +421,36 @@ ssh mint-prod-volcano "ps aux | grep run_server | grep -v grep"
 
 ---
 
-## 3. vLLM Actor
+## 3. GPU Actor Admin
 
 | Operation | Time | When to use |
 |-----------|------|-------------|
-| Reconnect (existing) | ~2s | Server restart, vLLM actor still alive |
-| Kill + restart | ~80s | Base model changed, OOM, vLLM code changed |
+| Reconnect (existing) | ~2s | Server restart, GPU actor still alive |
+| Kill + restart | ~80s | Base model changed, OOM, GPU actor code changed |
+
+Current admin route:
+- `POST /api/v1/actors/kill`
+- `actor_type`: `vllm`, `megatron`, `dense`, or `all`
+- optional filters: `model_name`, `actor_name`, `force`, `reason`
 
 ### Kill vLLM Actor
 
 ```bash
-# Via API (admin only when auth is enabled)
-curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_vllm
+# Kill all tracked vLLM actors
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/json"   -d '{"actor_type":"vllm"}' http://localhost:18000/api/v1/actors/kill
 
-# Kill specific model's vLLM actor
-curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/json" \
-  -d '{"model_name": "Qwen/Qwen3-30B-A3B-Instruct-2507"}' \
-  http://localhost:18000/api/v1/kill_vllm
+# Kill one model's vLLM actor
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/json"   -d '{"actor_type":"vllm","model_name":"Qwen/Qwen3-30B-A3B-Instruct-2507"}'   http://localhost:18000/api/v1/actors/kill
 ```
 
 ### Kill Megatron Actor
 
 ```bash
-curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_megatron
+# Kill all tracked Megatron actors
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/json"   -d '{"actor_type":"megatron"}' http://localhost:18000/api/v1/actors/kill
 
-# Kill specific model's Megatron actor
-curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/json" \
-  -d '{"base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507"}' \
-  http://localhost:18000/api/v1/kill_megatron
+# Kill one model's Megatron actor
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/json"   -d '{"actor_type":"megatron","model_name":"Qwen/Qwen3-30B-A3B-Instruct-2507"}'   http://localhost:18000/api/v1/actors/kill
 ```
 
 ### Check Actor Status
@@ -460,9 +462,17 @@ curl -s -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/vllm_statu
 # Megatron status
 curl -s -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/megatron_status | jq
 
-# Kill all actors (nuclear option; admin only when auth is enabled)
-curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_all_actors
+# Full tracked actor inventory
+curl -s -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/actors | jq '.actors[] | {actor_name,actor_type,base_model,idle,current_session,num_gpus}'
 ```
+
+### Kill all tracked GPU actors
+
+```bash
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/json"   -d '{"actor_type":"all"}' http://localhost:18000/api/v1/actors/kill
+```
+
+`{"actor_type":"all"}` kills only ResourcePool-tracked GPU actors. It does not clear detached queue/runtime/store actors.
 
 ---
 
@@ -472,7 +482,7 @@ curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_
 
 The API server is a Python process. Ray actors are separate Python processes.
 
-Detached actors (vLLM, Megatron, DenseTrainerPool, stores) survive server restarts and keep running old code until killed.
+Detached actors (GPU actors, queue/control-plane actors, stores) survive server restarts and keep running old code until killed.
 
 Hard rule: never create/get/kill actors outside `TINKER_RAY_NAMESPACE` unless the user explicitly requests cross-namespace action.
 
@@ -480,69 +490,112 @@ Hard rule: never create/get/kill actors outside `TINKER_RAY_NAMESPACE` unless th
 
 Always restart the server after code changes.
 
-Kill detached actors only if the change can be imported/executed inside that actor process:
+Kill GPU actors only if the change can be imported/executed inside that actor process:
 - vLLM: `tinker_server/backend/verl_inference.py`, `tinker_server/backend/multi_lora_engine.py`, `tinker_server/backend/multinode_inference.py`, `tinker_server/backend/vllm_*.py`
 - Megatron: `tinker_server/backend/megatron_distributed.py`, `tinker_server/backend/megatron_training.py`, `tinker_server/backend/verl_patches.py`
 - Dense training pool: `tinker_server/backend/verl_training.py`
-- Detached stores: `tinker_server/backend/future_store.py`, `tinker_server/backend/training_session_store.py`, `tinker_server/backend/gateway_session_store.py`
-- Shared (kills required for all GPU actor types): `tinker_server/config.py`, `tinker_server/ray_utils.py`, `tinker_server/backend/ray_kill.py`, `tinker_server/backend/model_registry.py`
+
+Kill detached control-plane actors in the current namespace if the diff can be imported/executed inside the queued request path, detached stores, or detached cleanup loops:
+- control plane core: `tinker_server/backend/api_work_queue.py`, `tinker_server/backend/api_work_queue_dispatch.py`, `tinker_server/backend/queue_execution_runtime.py`, `tinker_server/backend/queue_supervisor.py`, `tinker_server/backend/owner_runtime_supervisor.py`
+- detached state: `tinker_server/backend/capacity_manager.py`, `tinker_server/backend/resource_pool.py`, `tinker_server/backend/startup_lease.py`, `tinker_server/backend/future_store.py`, `tinker_server/backend/future_replay.py`
+- detached stores: `tinker_server/backend/sampling_session_store.py`, `tinker_server/backend/training_session_store.py`, `tinker_server/backend/gateway_session_store.py`, `tinker_server/backend/session_heartbeat_store.py`, `tinker_server/backend/session_index_store.py`
+- detached cleanup executors: `tinker_server/backend/sampling_cleanup_executor.py`, `tinker_server/backend/training_cleanup_executor.py`
+- queued auth/handler path: `tinker_server/gateway_auth.py`, `tinker_server/routes/sampling.py`, `tinker_server/routes/training.py`, `tinker_server/routes/weights.py`, `tinker_server/routes/mint.py`
+- shared imports used by both API and detached actors: `tinker_server/config.py`, `tinker_server/ray_utils.py`, `tinker_server/backend/ray_kill.py`, `tinker_server/backend/model_registry.py`
 
 If none of the above changed: restart server only.
 
+Checkpoint index rollout spans two detached actor families:
+- `tinker_queue_execution_runtime` and `tinker_api_work_queue*` handle queued checkpoint claim/write, so they must be recreated before fresh named checkpoint writes will emit non-null `checkpoint_record_id` and `metadata.json.ckpt_id`
+- `tinker_owner_runtime_supervisor` runs the periodic checkpoint mirror/publish loop, so it must also be recreated before fresh rows will drain from `checkpoint_staging` into `checkpoint_catalog`
+
+If `TINKER_CHECKPOINT_INDEX_PG_DSN` or checkpoint publication code changes and only the first actor family is recycled, checkpoints can mirror to disk while remaining stranded in `checkpoint_staging`.
+
 ### Kill Actors
 
-Preferred: use the HTTP endpoints documented above (auth required) for vLLM and Megatron.
+The current admin route is `POST /api/v1/actors/kill`.
+Use it for ResourcePool-tracked GPU actor families only:
 
 ```bash
-# Quick reference (admin only when auth is enabled)
-curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_megatron
-curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_vllm
+# Kill one GPU actor family (admin only when auth is enabled)
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H 'Content-Type: application/json'   -d '{"actor_type":"vllm"}' http://localhost:18000/api/v1/actors/kill
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H 'Content-Type: application/json'   -d '{"actor_type":"megatron"}' http://localhost:18000/api/v1/actors/kill
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H 'Content-Type: application/json'   -d '{"actor_type":"dense"}' http://localhost:18000/api/v1/actors/kill
+
+# Kill all tracked GPU actors
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H 'Content-Type: application/json'   -d '{"actor_type":"all"}' http://localhost:18000/api/v1/actors/kill
 ```
 
-No dedicated endpoints exist for dense trainer pool actors or detached store actors. Use Ray name lookup on the API host:
+`{"actor_type":"all"}` kills only `vllm`, `megatron`, and `dense` actors.
+It does not kill detached queue/runtime/store actors.
+It does not remove residual placement groups left behind by dead actors.
+Do not treat it as a full control-plane reset.
+
+No HTTP endpoint currently clears detached control-plane actors. Use Ray name lookup on the API host, scoped to the current namespace:
 
 ```bash
-# Kill dense trainer pool actors in current namespace (prefix match)
-ssh mint-prod-volcano "TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:-tinker}' MINT_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:-tinker}' python3 -c \"
-import os
-import ray
-ray.init(address='auto', ignore_reinit_error=True)
-ns = os.environ.get('TINKER_RAY_NAMESPACE', 'tinker')
-actors = ray.util.list_named_actors(all_namespaces=True)
-killed = 0
-for a in actors:
-    if a.get('namespace') != ns:
-        continue
-    name = a.get('name') or ''
-    if not name.startswith('dense_trainer_pool_'):
-        continue
-    try:
-        ray.kill(ray.get_actor(name, namespace=ns))
-        killed += 1
-    except Exception as e:
-        print(f\"kill_failed name={name!r} namespace={ns!r} err={e!r}\")
-print(f\"killed={killed} prefix='dense_trainer_pool_' namespace={ns}\")
-\""
+# Stop service first if you need a clean detached control-plane reset.
+ssh mint-prod-volcano 'supervisorctl stop tinker-server-auth'
 
-# Kill detached store actors in current namespace (name match)
-ssh mint-prod-volcano "TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:-tinker}' MINT_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:-tinker}' python3 -c \"
+# Kill detached control-plane actors in current namespace and remove their named placement groups.
+ssh mint-prod-volcano "TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:-tinker}' MINT_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:-tinker}' python3 - <<'PY'
 import os
 import ray
+from ray.util import get_placement_group, remove_placement_group
+from ray.util.placement_group import placement_group_table
+
 ray.init(address='auto', ignore_reinit_error=True)
 ns = os.environ.get('TINKER_RAY_NAMESPACE', 'tinker')
-names = ['tinker_future_store', 'tinker_training_session_store', 'tinker_gateway_session_store']
-killed = 0
-for name in names:
+exact_names = {
+    'tinker_queue_execution_runtime',
+    'tinker_queue_supervisor',
+    'tinker_owner_runtime_supervisor',
+    'tinker_capacity_manager',
+    'tinker_resource_pool',
+    'tinker_startup_lease_store',
+    'tinker_future_store',
+    'mint_future_replay_sweeper',
+    'tinker_sampling_session_store',
+    'tinker_training_session_store',
+    'tinker_gateway_session_store',
+    'tinker_session_heartbeat_store',
+    'tinker_session_index_store',
+    'tinker_sampling_cleanup_executor',
+    'tinker_training_cleanup_executor',
+}
+prefixes = ('tinker_api_work_queue',)
+victims = []
+for row in ray.util.list_named_actors(all_namespaces=True):
+    if row.get('namespace') != ns:
+        continue
+    name = str(row.get('name') or '')
+    if name in exact_names or any(name.startswith(p) for p in prefixes):
+        victims.append(name)
+for name in sorted(set(victims)):
     try:
-        ray.kill(ray.get_actor(name, namespace=ns))
-        killed += 1
+        ray.kill(ray.get_actor(name, namespace=ns), no_restart=True)
+        print(f'killed_actor={name} namespace={ns}')
     except ValueError:
         pass
     except Exception as e:
-        print(f\"kill_failed name={name!r} namespace={ns!r} err={e!r}\")
-print(f\"killed={killed} kind='stores' namespace={ns}\")
-\""
+        print(f'kill_failed actor={name} namespace={ns} err={type(e).__name__}: {e}')
+pg_names = {f'{name}_pg' for name in victims}
+for info in placement_group_table().values():
+    if info.get('state') == 'REMOVED':
+        continue
+    pg_name = str(info.get('name') or '')
+    if pg_name not in pg_names:
+        continue
+    try:
+        remove_placement_group(get_placement_group(pg_name))
+        print(f'removed_pg={pg_name}')
+    except Exception as e:
+        print(f'remove_pg_failed pg={pg_name} err={type(e).__name__}: {e}')
+PY"
 ```
+
+Keep this cleanup namespace-scoped.
+Do not touch unrelated namespaces or OpenPI-specific actor families unless the diff actually changes them.
 
 ### Restart Server
 
@@ -553,32 +606,26 @@ ssh mint-prod-volcano 'supervisorctl restart tinker-server-auth'
 ### Restart after killing vLLM
 
 ```bash
-# Kill vLLM (admin only when auth is enabled)
-curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_vllm
-
-# Restart server
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H 'Content-Type: application/json'   -d '{"actor_type":"vllm"}' http://localhost:18000/api/v1/actors/kill
 ssh mint-prod-volcano 'supervisorctl restart tinker-server-auth'
-
-# Wait for vLLM init (~80s)
 sleep 80 && curl -s http://localhost:18000/api/v1/healthz
 ```
 
 ### Restart after killing Megatron
 
 ```bash
-curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_megatron
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H 'Content-Type: application/json'   -d '{"actor_type":"megatron"}' http://localhost:18000/api/v1/actors/kill
 ssh mint-prod-volcano 'supervisorctl restart tinker-server-auth'
 curl -s http://localhost:18000/api/v1/healthz
 ```
 
 ### Restart after killing all tracked GPU actors
 
-Use this after shared actor code changes (for example `tinker_server/backend/model_registry.py`) or when GPUs are exhausted.
-
-Note: `/api/v1/kill_all_actors` kills ResourcePool-tracked GPU actors (vLLM, Megatron, dense trainer pool). It does not kill detached store actors.
+Use this after shared GPU actor code changes or when GPUs are exhausted.
+Use the full detached control-plane reset above when queued-path or control-plane code changed.
 
 ```bash
-curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_all_actors
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H 'Content-Type: application/json'   -d '{"actor_type":"all"}' http://localhost:18000/api/v1/actors/kill
 ssh mint-prod-volcano 'supervisorctl restart tinker-server-auth'
 sleep 80 && curl -s http://localhost:18000/api/v1/healthz
 ```
