@@ -21,6 +21,7 @@ _SQL_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _EVENT_ID_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "mindlab.mint.billing.usage_event.v1")
 _PENDING_WRITE_TASKS: set[asyncio.Task] = set()
 _MAX_PENDING_WRITE_TASKS = max(1, int(os.environ.get("MINT_USAGE_MAX_PENDING_WRITE_TASKS", "1024")))
+_USAGE_STORE_CLOSING = False
 
 
 def _import_asyncpg():
@@ -145,23 +146,39 @@ class PostgresUsageStore:
         normalized: list[UsageEvent] = []
         seen: set[str] = set()
         for event in raw:
+            account_id = str(event.account_id or "").strip()
+            apikey_id = str(event.apikey_id or "").strip()
             request_id = str(event.request_id or "").strip()
+            charge_item = str(event.charge_item or "").strip()
+            label = str(event.label or "").strip()
             if not request_id:
                 raise ValueError("usage_event request_id must be non-empty")
             quantity = int(event.quantity)
             if quantity < 0:
                 raise ValueError("usage_event quantity must be non-negative")
-            event_id = str(event.event_id or "").strip() or self.build_event_id(event)
+            event_id = str(event.event_id or "").strip() or self.build_event_id(
+                replace(
+                    event,
+                    account_id=account_id,
+                    apikey_id=apikey_id,
+                    request_id=request_id,
+                    charge_item=charge_item,
+                    label=label,
+                )
+            )
             if event_id in seen:
                 raise ValueError(f"duplicate usage_event event_id in batch: {event_id!r}")
             seen.add(event_id)
             normalized.append(
                 replace(
                     event,
+                    account_id=account_id,
+                    apikey_id=apikey_id,
                     request_id=request_id,
+                    charge_item=charge_item,
                     event_id=event_id,
                     quantity=quantity,
-                    label=str(event.label or ""),
+                    label=label,
                 )
             )
         return normalized
@@ -215,6 +232,12 @@ class PostgresUsageStore:
                 await conn.execute(f"CREATE SCHEMA IF NOT EXISTS {self._schema}")
             await conn.execute(f"CREATE SEQUENCE IF NOT EXISTS {self._sequence} AS BIGINT")
             await conn.execute(f"ALTER TABLE {self._table} ADD COLUMN IF NOT EXISTS event_id TEXT")
+            null_event_ids = await conn.fetchval(f"SELECT COUNT(*) FROM {self._table} WHERE event_id IS NULL")
+            if int(null_event_ids or 0) > 0:
+                raise RuntimeError(
+                    f"{self._table} contains usage_event rows with NULL event_id; "
+                    "run backend/db/migrations/004_direct_pg_usage_event_id.sql before starting MinT direct-PG billing"
+                )
             await conn.execute(f"ALTER TABLE {self._table} ALTER COLUMN event_id SET NOT NULL")
             await conn.execute(
                 f"ALTER TABLE {self._table} ALTER COLUMN source_index SET DEFAULT nextval('{self._sequence}'::regclass)"
@@ -477,6 +500,12 @@ def schedule_usage_events(events: list[UsageEvent]) -> None:
     normalized = list(events)
     if not normalized:
         return
+    if _USAGE_STORE_CLOSING:
+        logger.error(
+            "usage_event async persistence dropped because usage store is closing: request_ids=%s",
+            [event.request_id for event in normalized],
+        )
+        return
     if len(_PENDING_WRITE_TASKS) >= _MAX_PENDING_WRITE_TASKS:
         logger.error(
             "usage_event async persistence dropped because pending task limit is full: pending=%s limit=%s request_ids=%s",
@@ -491,7 +520,8 @@ def schedule_usage_events(events: list[UsageEvent]) -> None:
 
 
 async def close_usage_store() -> None:
-    global _usage_store
+    global _usage_store, _USAGE_STORE_CLOSING
+    _USAGE_STORE_CLOSING = True
     for task in list(_PENDING_WRITE_TASKS):
         task.cancel()
     if _PENDING_WRITE_TASKS:

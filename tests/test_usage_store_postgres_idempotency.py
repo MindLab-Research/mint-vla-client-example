@@ -52,6 +52,8 @@ class _FakeConn:
             return 1
         if "FROM pg_index" in text:
             return bool(self._state.get("event_id_unique_index", True))
+        if "WHERE event_id IS NULL" in text:
+            return int(self._state.get("null_event_id_count", 0))
         if sql.startswith("SELECT COUNT(*)"):
             return len(self._filter_rows(sql, args))
         if sql.startswith("SELECT COALESCE(SUM(quantity), 0)"):
@@ -423,5 +425,93 @@ def test_postgres_usage_store_delete_events_accepts_explicit_event_id_without_re
         await store.delete_events([deletion])
         await store.close()
         assert state["rows"] == []
+
+    asyncio.run(_run())
+
+
+def test_postgres_usage_store_normalizes_event_id_fields_for_storage(monkeypatch):
+    state = _state()
+    _install_fake_asyncpg(monkeypatch, state)
+
+    store = PostgresUsageStore(dsn="postgresql://fake")
+    event = UsageEvent(
+        account_id="  aaaaaaaaaaaaaaaaaaaaaaaa  ",
+        apikey_id="  bbbbbbbbbbbbbbbbbbbbbbbb  ",
+        charge_item="  training  ",
+        quantity=1,
+        request_id="  req-normalized  ",
+        label="  route=training.train_step  ",
+    )
+
+    async def _run():
+        await store.write_event(event)
+        await store.close()
+        row = state["rows"][0]
+        assert row["account_id"] == "aaaaaaaaaaaaaaaaaaaaaaaa"
+        assert row["apikey_id"] == "bbbbbbbbbbbbbbbbbbbbbbbb"
+        assert row["charge_item"] == "training"
+        assert row["request_id"] == "req-normalized"
+        assert row["label"] == "route=training.train_step"
+        assert row["event_id"] == PostgresUsageStore.build_event_id(
+            UsageEvent(
+                account_id="aaaaaaaaaaaaaaaaaaaaaaaa",
+                apikey_id="bbbbbbbbbbbbbbbbbbbbbbbb",
+                charge_item="training",
+                quantity=1,
+                request_id="req-normalized",
+                label="route=training.train_step",
+            )
+        )
+
+    asyncio.run(_run())
+
+
+def test_postgres_usage_store_requires_migration_when_event_id_nulls_exist(monkeypatch):
+    state = _state(null_event_id_count=1)
+    _install_fake_asyncpg(monkeypatch, state)
+
+    store = PostgresUsageStore(dsn="postgresql://fake")
+    event = UsageEvent(
+        account_id="aaaaaaaaaaaaaaaaaaaaaaaa",
+        apikey_id="bbbbbbbbbbbbbbbbbbbbbbbb",
+        charge_item="training",
+        quantity=1,
+        request_id="req-null-event-id",
+        label="route=training.train_step",
+    )
+
+    async def _run():
+        with pytest.raises(RuntimeError, match="004_direct_pg_usage_event_id"):
+            await store.write_event(event)
+        await store.close()
+
+    asyncio.run(_run())
+
+
+def test_schedule_usage_events_rejects_new_tasks_after_close_started(monkeypatch):
+    import tinker_server.usage_store as usage_store_module
+
+    async def _never_write(events):
+        await asyncio.sleep(60)
+
+    async def _run():
+        usage_store_module._USAGE_STORE_CLOSING = False
+        usage_store_module._PENDING_WRITE_TASKS.clear()
+        monkeypatch.setattr(usage_store_module, "_write_usage_events_safely", _never_write)
+        event = UsageEvent(
+            account_id="aaaaaaaaaaaaaaaaaaaaaaaa",
+            apikey_id="bbbbbbbbbbbbbbbbbbbbbbbb",
+            charge_item="training",
+            quantity=1,
+            request_id="req-close",
+            label="route=training.train_step",
+        )
+        usage_store_module.schedule_usage_events([event])
+        assert len(usage_store_module._PENDING_WRITE_TASKS) == 1
+        await usage_store_module.close_usage_store()
+        assert usage_store_module._USAGE_STORE_CLOSING is True
+        usage_store_module.schedule_usage_events([event])
+        assert len(usage_store_module._PENDING_WRITE_TASKS) == 0
+        usage_store_module._USAGE_STORE_CLOSING = False
 
     asyncio.run(_run())
