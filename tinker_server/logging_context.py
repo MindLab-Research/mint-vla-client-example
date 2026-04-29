@@ -555,6 +555,14 @@ def classify_failure_reason(error: Exception) -> str:
         return "permission_denied"
     if "not found" in text:
         return "not_found"
+    if (
+        "dense_input_contract_violation" in text
+        or "contract_violation" in text
+        or "out_of_range" in text
+        or "len_mismatch" in text
+        or "non_finite" in text
+    ):
+        return "input_contract"
     if "validation" in text or "invalid" in text:
         return "validation"
     return "internal_error"
@@ -687,12 +695,12 @@ def _configure_opentelemetry(root_logger: logging.Logger) -> None:
         _TRAINING_OPERATION_COUNTER = meter.create_counter(
             "mint_training_operations_total",
             unit="{operation}",
-            description="Successful training operations observed by mint",
+            description="Training operations observed by mint",
         )
         _TRAINING_OPERATION_DURATION_HISTOGRAM = meter.create_histogram(
             "mint_training_operation_duration_s",
             unit="s",
-            description="Successful training operation duration in seconds",
+            description="Training operation duration in seconds",
         )
         _MEGATRON_SESSION_SWITCH_COUNTER = meter.create_counter(
             "mint_megatron_session_switch_total",
@@ -836,6 +844,10 @@ def _record_current_span_event(event_name: str, attrs: dict[str, object]) -> Non
         pass
 
 
+def record_span_event_otel(event_name: str, *, attributes: dict[str, object] | None = None) -> None:
+    _record_current_span_event(str(event_name), dict(attributes or {}))
+
+
 def record_vllm_actor_latency_otel(
     *,
     actor_name: str | None,
@@ -932,6 +944,7 @@ def record_training_operation_latency_otel(
     backend: str,
     op: str,
     status: str,
+    failure_class: str | None = None,
     duration_s: float,
 ) -> None:
     if not _OTEL_ENABLED:
@@ -940,18 +953,19 @@ def record_training_operation_latency_otel(
         "base_model": str(base_model),
         "backend": str(backend),
         "op": str(op),
+        "status": str(status),
+        "failure_class": str(failure_class or "none"),
     }
     try:
+        if _TRAINING_OPERATION_COUNTER is not None:
+            _TRAINING_OPERATION_COUNTER.add(1, attributes=attrs)
+        if _TRAINING_OPERATION_DURATION_HISTOGRAM is not None:
+            _TRAINING_OPERATION_DURATION_HISTOGRAM.record(float(duration_s), attributes=attrs)
         if str(status) != "ok":
             _record_current_span_event(
                 "mint.training_operation.failure",
                 {**attrs, "status": str(status), "duration_s": float(duration_s)},
             )
-            return
-        if _TRAINING_OPERATION_COUNTER is not None:
-            _TRAINING_OPERATION_COUNTER.add(1, attributes=attrs)
-        if _TRAINING_OPERATION_DURATION_HISTOGRAM is not None:
-            _TRAINING_OPERATION_DURATION_HISTOGRAM.record(float(duration_s), attributes=attrs)
     except Exception:
         pass
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -17,9 +18,11 @@ import ray
 
 from . import ray_kill
 from ..logging_context import (
+    classify_failure_reason,
     get_current_traceparent,
     get_request_id,
     init_actor_observability,
+    record_span_event_otel,
     restore_trace_id_from_traceparent,
     run_async_with_otel_span,
     start_as_current_span,
@@ -519,6 +522,236 @@ class TrainingWorker:
         page_size = int(os.sysconf("SC_PAGE_SIZE"))
         return rss_pages * page_size
 
+    def _resolve_vocab_size(self) -> int | None:
+        config = getattr(self.model, "config", None)
+        vocab_size = getattr(config, "vocab_size", None)
+        if isinstance(vocab_size, int) and vocab_size > 0:
+            return int(vocab_size)
+        tokenizer_vocab = getattr(self.tokenizer, "vocab_size", None)
+        if isinstance(tokenizer_vocab, int) and tokenizer_vocab > 0:
+            return int(tokenizer_vocab)
+        return None
+
+    @staticmethod
+    def _numeric_bounds(values: list[Any]) -> tuple[int | float | None, int | float | None]:
+        numeric = [value for value in values if isinstance(value, (int, float)) and not isinstance(value, bool)]
+        if not numeric:
+            return None, None
+        return min(numeric), max(numeric)
+
+    @staticmethod
+    def _invalid_token_positions(values: list[Any], *, vocab_size: int | None, limit: int = 8) -> list[int]:
+        bad: list[int] = []
+        for idx, value in enumerate(values):
+            is_valid_int = isinstance(value, int) and not isinstance(value, bool)
+            if not is_valid_int:
+                bad.append(idx)
+            elif int(value) < 0:
+                bad.append(idx)
+            elif vocab_size is not None and int(value) >= int(vocab_size):
+                bad.append(idx)
+            if len(bad) >= limit:
+                break
+        return bad
+
+    @staticmethod
+    def _invalid_numeric_positions(values: list[Any], *, limit: int = 8) -> list[int]:
+        bad: list[int] = []
+        for idx, value in enumerate(values):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                bad.append(idx)
+            elif not math.isfinite(float(value)):
+                bad.append(idx)
+            if len(bad) >= limit:
+                break
+        return bad
+
+    def _raise_forward_backward_contract_violation(
+        self,
+        *,
+        session_id: str | None,
+        loss_fn: str,
+        reason: str,
+        input_ids: list[Any],
+        target_tokens: list[Any],
+        weights: list[Any],
+        old_logprobs: list[Any] | None = None,
+        advantages: list[Any] | None = None,
+    ) -> None:
+        vocab_size = self._resolve_vocab_size()
+        input_min, input_max = self._numeric_bounds(input_ids)
+        target_min, target_max = self._numeric_bounds(target_tokens)
+        attrs = {
+            "session_id": str(session_id or "-"),
+            "loss_fn": str(loss_fn),
+            "reason": str(reason),
+            "vocab_size": -1 if vocab_size is None else int(vocab_size),
+            "input_len": len(input_ids),
+            "target_len": len(target_tokens),
+            "weights_len": len(weights),
+            "old_logprobs_len": len(old_logprobs or []),
+            "advantages_len": len(advantages or []),
+            "input_min": "none" if input_min is None else str(input_min),
+            "input_max": "none" if input_max is None else str(input_max),
+            "target_min": "none" if target_min is None else str(target_min),
+            "target_max": "none" if target_max is None else str(target_max),
+            "bad_input_positions": json.dumps(
+                self._invalid_token_positions(input_ids, vocab_size=vocab_size),
+                separators=(",", ":"),
+            ),
+            "bad_target_positions": json.dumps(
+                self._invalid_token_positions(target_tokens, vocab_size=vocab_size),
+                separators=(",", ":"),
+            ),
+            "bad_weight_positions": json.dumps(
+                self._invalid_numeric_positions(weights),
+                separators=(",", ":"),
+            ),
+            "bad_old_logprob_positions": json.dumps(
+                self._invalid_numeric_positions(old_logprobs or []),
+                separators=(",", ":"),
+            ),
+            "bad_advantage_positions": json.dumps(
+                self._invalid_numeric_positions(advantages or []),
+                separators=(",", ":"),
+            ),
+        }
+        logger.error(
+            "[TrainingWorker] dense_input_contract_violation %s",
+            json.dumps(attrs, sort_keys=True, ensure_ascii=True),
+        )
+        record_span_event_otel("mint.training_input_contract_violation", attributes=attrs)
+        from .runtime_observability import runtime_observability
+
+        runtime_observability.record_training_incident(
+            kind="contract_violation",
+            base_model=str(getattr(self, "_base_model", "unknown") or "unknown"),
+            backend="peft",
+            op="forward_backward",
+            status="error",
+            failure_class="input_contract",
+            request_id=str(get_request_id() or "") or None,
+            session_id=None if session_id is None else str(session_id),
+            detail=str(reason),
+            context=attrs,
+        )
+        raise ValueError(
+            "dense_input_contract_violation: "
+            f"reason={reason} input_len={len(input_ids)} target_len={len(target_tokens)} weights_len={len(weights)}"
+        )
+
+    def _validate_forward_backward_contract(
+        self,
+        *,
+        session_id: str | None,
+        loss_fn: str,
+        input_ids: list[Any],
+        target_tokens: list[Any],
+        weights: list[Any],
+        old_logprobs: list[Any] | None = None,
+        advantages: list[Any] | None = None,
+    ) -> None:
+        vocab_size = self._resolve_vocab_size()
+        if self._invalid_token_positions(input_ids, vocab_size=vocab_size):
+            self._raise_forward_backward_contract_violation(
+                session_id=session_id,
+                loss_fn=loss_fn,
+                reason="input_ids_out_of_range",
+                input_ids=input_ids,
+                target_tokens=target_tokens,
+                weights=weights,
+                old_logprobs=old_logprobs,
+                advantages=advantages,
+            )
+        if self._invalid_token_positions(target_tokens, vocab_size=vocab_size):
+            self._raise_forward_backward_contract_violation(
+                session_id=session_id,
+                loss_fn=loss_fn,
+                reason="target_tokens_out_of_range",
+                input_ids=input_ids,
+                target_tokens=target_tokens,
+                weights=weights,
+                old_logprobs=old_logprobs,
+                advantages=advantages,
+            )
+        if self._invalid_numeric_positions(weights):
+            self._raise_forward_backward_contract_violation(
+                session_id=session_id,
+                loss_fn=loss_fn,
+                reason="weights_non_finite_or_non_numeric",
+                input_ids=input_ids,
+                target_tokens=target_tokens,
+                weights=weights,
+                old_logprobs=old_logprobs,
+                advantages=advantages,
+            )
+        if len(target_tokens) != len(weights):
+            self._raise_forward_backward_contract_violation(
+                session_id=session_id,
+                loss_fn=loss_fn,
+                reason="target_weights_len_mismatch",
+                input_ids=input_ids,
+                target_tokens=target_tokens,
+                weights=weights,
+                old_logprobs=old_logprobs,
+                advantages=advantages,
+            )
+        if len(target_tokens) != len(input_ids):
+            self._raise_forward_backward_contract_violation(
+                session_id=session_id,
+                loss_fn=loss_fn,
+                reason="target_seq_len_mismatch",
+                input_ids=input_ids,
+                target_tokens=target_tokens,
+                weights=weights,
+                old_logprobs=old_logprobs,
+                advantages=advantages,
+            )
+        if old_logprobs is not None and old_logprobs and self._invalid_numeric_positions(old_logprobs):
+            self._raise_forward_backward_contract_violation(
+                session_id=session_id,
+                loss_fn=loss_fn,
+                reason="old_logprobs_non_finite_or_non_numeric",
+                input_ids=input_ids,
+                target_tokens=target_tokens,
+                weights=weights,
+                old_logprobs=old_logprobs,
+                advantages=advantages,
+            )
+        if old_logprobs is not None and old_logprobs and len(old_logprobs) != len(target_tokens):
+            self._raise_forward_backward_contract_violation(
+                session_id=session_id,
+                loss_fn=loss_fn,
+                reason="old_logprobs_len_mismatch",
+                input_ids=input_ids,
+                target_tokens=target_tokens,
+                weights=weights,
+                old_logprobs=old_logprobs,
+                advantages=advantages,
+            )
+        if advantages is not None and advantages and self._invalid_numeric_positions(advantages):
+            self._raise_forward_backward_contract_violation(
+                session_id=session_id,
+                loss_fn=loss_fn,
+                reason="advantages_non_finite_or_non_numeric",
+                input_ids=input_ids,
+                target_tokens=target_tokens,
+                weights=weights,
+                old_logprobs=old_logprobs,
+                advantages=advantages,
+            )
+        if advantages is not None and advantages and len(advantages) != len(target_tokens):
+            self._raise_forward_backward_contract_violation(
+                session_id=session_id,
+                loss_fn=loss_fn,
+                reason="advantages_len_mismatch",
+                input_ids=input_ids,
+                target_tokens=target_tokens,
+                weights=weights,
+                old_logprobs=old_logprobs,
+                advantages=advantages,
+            )
+
     def forward_backward(
         self,
         data_items: list[dict],
@@ -622,6 +855,14 @@ class TrainingWorker:
                 )
                 continue
 
+            self._validate_forward_backward_contract(
+                session_id=session_id,
+                loss_fn=loss_fn,
+                input_ids=input_ids,
+                target_tokens=target_tokens,
+                weights=weights,
+            )
+
             # Convert to tensors
             input_ids_t = torch.tensor([input_ids], dtype=torch.long, device=self.device)
             target_ids_t = torch.tensor([target_tokens], dtype=torch.long, device=self.device)
@@ -694,6 +935,16 @@ class TrainingWorker:
                         f"[TrainingWorker] Missing logprobs or advantages for {loss_fn}, skipping item"
                     )
                     continue
+
+                self._validate_forward_backward_contract(
+                    session_id=session_id,
+                    loss_fn=loss_fn,
+                    input_ids=input_ids,
+                    target_tokens=target_tokens,
+                    weights=weights,
+                    old_logprobs=old_logprobs,
+                    advantages=advantages,
+                )
 
                 old_logprobs_t = torch.tensor(old_logprobs, dtype=torch.float32, device=self.device)
                 advantages_t = torch.tensor(advantages, dtype=torch.float32, device=self.device)
@@ -1640,6 +1891,7 @@ class VerlTrainingEngine:
         # Session-level poisoned marker for mid-call actor failures.
         # Value stores the user-facing reason that requires reload boundary.
         self._poisoned_sessions: dict[str, str] = {}
+        self._hard_poisoned_sessions: dict[str, str] = {}
         self._megatron_recycle_locks: dict[str, asyncio.Lock] = {}
         self._megatron_recycle_locks_guard = asyncio.Lock()
 
@@ -1731,6 +1983,9 @@ class VerlTrainingEngine:
         return self._resource_pool_actor_names.get(session.model_id)
 
     def _raise_if_session_poisoned(self, session: "TrainingSession", *, op: str) -> None:
+        hard_error = self._hard_poisoned_sessions.get(session.model_id)
+        if hard_error is not None:
+            raise RuntimeError(hard_error)
         if op == "load_weights":
             return
         error = self._poisoned_sessions.get(session.model_id)
@@ -1746,6 +2001,7 @@ class VerlTrainingEngine:
             self._actor_volatile_sessions.setdefault(actor_name, set()).add(session.model_id)
         if op == "load_weights":
             self._poisoned_sessions.pop(session.model_id, None)
+            self._hard_poisoned_sessions.pop(session.model_id, None)
 
     def _megatron_op_requires_fail_closed_after_actor_death(self, op: str) -> bool:
         return op in {
@@ -2203,9 +2459,11 @@ class VerlTrainingEngine:
         while True:
             try:
                 pending = submit_fn(worker)
-                result = await self._await_with_keepalive(
+                result = await self._await_worker_call(
                     pending,
                     session,
+                    op=op,
+                    worker=worker,
                     interval_s=interval_s,
                     timeout_s=timeout_s,
                 )
@@ -2238,6 +2496,278 @@ class VerlTrainingEngine:
                     batch_stats=batch_stats,
                 )
 
+    @staticmethod
+    def _iter_exception_chain(error: BaseException) -> list[BaseException]:
+        chain: list[BaseException] = []
+        seen: set[int] = set()
+        current: BaseException | None = error
+        while current is not None and id(current) not in seen:
+            chain.append(current)
+            seen.add(id(current))
+            next_error = getattr(current, "cause", None)
+            if not isinstance(next_error, BaseException):
+                next_error = getattr(current, "__cause__", None)
+            if not isinstance(next_error, BaseException):
+                next_error = getattr(current, "__context__", None)
+            current = next_error if isinstance(next_error, BaseException) else None
+        return chain
+
+    @classmethod
+    def _format_exception_summary(cls, error: BaseException) -> str:
+        parts: list[str] = []
+        for exc in cls._iter_exception_chain(error)[:3]:
+            msg = str(exc).strip()
+            if msg:
+                parts.append(f"{type(exc).__name__}: {msg}")
+            else:
+                parts.append(type(exc).__name__)
+        return " | ".join(parts)
+
+    @classmethod
+    def _dense_fatal_error_reason(cls, error: BaseException) -> str | None:
+        keywords = (
+            "acceleratorerror",
+            "cuda error",
+            "device-side assert",
+            "device side assert",
+            "illegal memory access",
+        )
+        for exc in cls._iter_exception_chain(error):
+            haystack = f"{type(exc).__name__}: {exc}".lower()
+            if any(keyword in haystack for keyword in keywords):
+                return cls._format_exception_summary(error)
+        return None
+
+    @classmethod
+    def _classify_training_failure(cls, error: BaseException) -> tuple[str, str]:
+        if isinstance(error, asyncio.TimeoutError):
+            return "timeout", "timeout"
+        if isinstance(error, getattr(ray.exceptions, "GetTimeoutError", tuple())):
+            return "timeout", "timeout"
+        if cls._dense_fatal_error_reason(error) is not None:
+            return "error", "cuda_fatal"
+        if isinstance(error, Exception):
+            failure_class = "internal_error"
+            for exc in cls._iter_exception_chain(error):
+                if not isinstance(exc, Exception):
+                    continue
+                candidate = classify_failure_reason(exc)
+                if candidate == "canceled":
+                    return "canceled", candidate
+                if candidate == "timeout":
+                    return "timeout", candidate
+                if candidate != "internal_error":
+                    failure_class = candidate
+                    break
+            return "error", failure_class
+        return "error", "internal_error"
+
+    @staticmethod
+    def _resolve_actor_node_id(actor_name: str | None) -> str | None:
+        if not actor_name:
+            return None
+        try:
+            from .resource_pool import get_resource_pool
+
+            entry = get_resource_pool().get(str(actor_name))
+        except Exception:
+            return None
+        node_id = getattr(entry, "node_id", None) if entry is not None else None
+        if isinstance(node_id, str) and node_id.strip():
+            return node_id.strip()
+        return None
+
+    async def _handle_dense_worker_failure(
+        self,
+        session: "TrainingSession",
+        *,
+        op: str,
+        error: BaseException,
+        worker: ray.actor.ActorHandle | None = None,
+    ) -> None:
+        if session.backend != "peft":
+            return
+        if isinstance(error, asyncio.TimeoutError):
+            return
+        if isinstance(error, getattr(ray.exceptions, "GetTimeoutError", tuple())):
+            return
+
+        fatal_reason = self._dense_fatal_error_reason(error)
+        if fatal_reason is None:
+            return
+
+        actor_name = str(self._resource_pool_actor_names.get(session.model_id) or getattr(session, "actor_name", "") or "")
+        if not actor_name:
+            return
+
+        from .runtime_observability import runtime_observability
+
+        runtime_observability.record_dense_actor_fatal(
+            base_model=session.base_model,
+            op=op,
+            failure_class="cuda_fatal",
+        )
+        runtime_observability.record_training_incident(
+            kind="dense_actor_fatal",
+            base_model=session.base_model,
+            backend=session.backend,
+            op=op,
+            status="error",
+            failure_class="cuda_fatal",
+            actor_name=actor_name,
+            node_id=self._resolve_actor_node_id(actor_name),
+            request_id=str(get_request_id() or "") or None,
+            session_id=str(getattr(session, "session_id", "") or session.model_id),
+            detail=fatal_reason,
+        )
+        record_span_event_otel(
+            "mint.dense_actor.fatal_gpu_error",
+            attributes={
+                "model_id": str(session.model_id),
+                "session_id": str(getattr(session, "session_id", "") or session.model_id),
+                "base_model": str(session.base_model or "unknown"),
+                "backend": str(session.backend or "unknown"),
+                "op": str(op),
+                "actor_name": actor_name,
+                "node_id": str(self._resolve_actor_node_id(actor_name) or "unknown"),
+                "request_id": str(get_request_id() or "-"),
+                "error": fatal_reason,
+            },
+        )
+
+        logger.warning(
+            "[%s] retiring dense trainer after fatal op=%s actor_name=%s node_id=%s request_id=%s session_id=%s error=%s",
+            session.model_id,
+            op,
+            actor_name,
+            self._resolve_actor_node_id(actor_name) or "unknown",
+            get_request_id() or "-",
+            getattr(session, "session_id", "") or session.model_id,
+            fatal_reason,
+        )
+
+        from .dense_trainer import retire_dense_trainer
+
+        retire_outcome = await asyncio.to_thread(
+            retire_dense_trainer,
+            actor_name=actor_name,
+            actor=worker,
+            reason=f"{op}:{fatal_reason}",
+            base_model=session.base_model,
+            session_id=session.model_id,
+            fatal_op=op,
+            request_id=str(get_request_id() or "") or None,
+            namespace=str(getattr(session, "namespace", "") or RAY_NAMESPACE),
+        )
+        if retire_outcome != "ok":
+            retire_failure = (
+                f"[{session.model_id}] dense actor retirement failed after fatal op={op}; "
+                f"actor_name={actor_name} outcome={retire_outcome}. "
+                "Operator must recycle the actor before this session can continue."
+            )
+            self._poisoned_sessions[session.model_id] = retire_failure
+            self._hard_poisoned_sessions[session.model_id] = retire_failure
+            runtime_observability.record_training_incident(
+                kind="dense_actor_retire_failed",
+                base_model=session.base_model,
+                backend=session.backend,
+                op=op,
+                status="error",
+                failure_class=str(retire_outcome or "unknown"),
+                actor_name=actor_name,
+                node_id=self._resolve_actor_node_id(actor_name),
+                request_id=str(get_request_id() or "") or None,
+                session_id=str(getattr(session, "session_id", "") or session.model_id),
+                detail=retire_failure,
+            )
+            logger.error(retire_failure)
+
+        self._workers.pop(session.model_id, None)
+        self._resource_pool_actor_names.pop(session.model_id, None)
+        if str(getattr(session, "actor_name", "") or "") == actor_name:
+            session.actor_name = None
+            session.namespace = None
+
+    async def _await_worker_call(
+        self,
+        awaitable,
+        session: "TrainingSession",
+        *,
+        op: str,
+        worker: ray.actor.ActorHandle | None = None,
+        interval_s: float = 30.0,
+        timeout_s: float | None = None,
+    ):
+        from .runtime_observability import runtime_observability
+
+        started = time.monotonic()
+        try:
+            result = await self._await_with_keepalive(
+                awaitable,
+                session,
+                interval_s=interval_s,
+                timeout_s=timeout_s,
+            )
+            runtime_observability.record_training_operation(
+                base_model=session.base_model,
+                backend=session.backend,
+                op=op,
+                status="ok",
+                failure_class="none",
+                duration_s=time.monotonic() - started,
+            )
+            return result
+        except Exception as e:
+            status, failure_class = self._classify_training_failure(e)
+            actor_name = str(
+                self._resource_pool_actor_names.get(session.model_id)
+                or getattr(session, "actor_name", "")
+                or ""
+            )
+            node_id = self._resolve_actor_node_id(actor_name)
+            duration_s = time.monotonic() - started
+            runtime_observability.record_training_operation(
+                base_model=session.base_model,
+                backend=session.backend,
+                op=op,
+                status=status,
+                failure_class=failure_class,
+                duration_s=duration_s,
+            )
+            runtime_observability.record_training_incident(
+                kind="training_failure",
+                base_model=session.base_model,
+                backend=session.backend,
+                op=op,
+                status=status,
+                failure_class=failure_class,
+                actor_name=actor_name or None,
+                node_id=node_id,
+                request_id=str(get_request_id() or "") or None,
+                session_id=str(getattr(session, "session_id", "") or session.model_id),
+                detail=self._format_exception_summary(e),
+            )
+            logger.warning(
+                "[%s] training op failed op=%s backend=%s status=%s failure_class=%s actor_name=%s node_id=%s request_id=%s session_id=%s error=%s",
+                session.model_id,
+                op,
+                session.backend,
+                status,
+                failure_class,
+                actor_name or "-",
+                node_id or "unknown",
+                get_request_id() or "-",
+                getattr(session, "session_id", "") or session.model_id,
+                self._format_exception_summary(e),
+            )
+            await self._handle_dense_worker_failure(
+                session,
+                op=op,
+                error=e,
+                worker=worker,
+            )
+            raise
+
     def _record_megatron_result_metrics(self, session: "TrainingSession", result: dict | None) -> None:
         if session.backend != "megatron" or not isinstance(result, dict):
             return
@@ -2263,6 +2793,7 @@ class VerlTrainingEngine:
     async def _recover_dense_worker(self, session: "TrainingSession", *, reason: str) -> ray.actor.ActorHandle:
         """Rebind a dense trainer actor after eviction/death."""
         from .dense_trainer import get_or_create_dense_trainer
+        from .runtime_observability import runtime_observability
 
         model_id = session.model_id
         base_model, name_key = self._resolve_session_base_model(session)
@@ -2299,6 +2830,22 @@ class VerlTrainingEngine:
             )
         except Exception:
             pass
+        runtime_observability.record_dense_actor_bind_decision(
+            base_model=session.base_model,
+            decision="recover",
+        )
+        runtime_observability.record_training_incident(
+            kind="dense_actor_bind_decision",
+            base_model=session.base_model,
+            backend=session.backend,
+            op="bind",
+            status="ok",
+            failure_class="none",
+            actor_name=dense.actor_name,
+            request_id=str(get_request_id() or "") or None,
+            session_id=str(getattr(session, "session_id", "") or session.model_id),
+            detail=f"recover:{reason}",
+        )
         logger.warning(
             "[%s] rebound dense trainer actor=%s reason=%s base_model=%s",
             model_id,
@@ -2318,6 +2865,36 @@ class VerlTrainingEngine:
         if not actor_name:
             return None
         namespace = str(getattr(session, "namespace", "") or RAY_NAMESPACE)
+        from .runtime_observability import runtime_observability
+
+        if session.backend == "peft":
+            from .dense_trainer import dense_trainer_reuse_block_reason
+
+            reuse_block_reason = dense_trainer_reuse_block_reason(actor_name)
+            if reuse_block_reason is not None:
+                runtime_observability.record_dense_actor_bind_decision(
+                    base_model=session.base_model,
+                    decision="rebind_refused_poisoned",
+                )
+                runtime_observability.record_training_incident(
+                    kind="dense_actor_bind_decision",
+                    base_model=session.base_model,
+                    backend=session.backend,
+                    op="bind",
+                    status="error",
+                    failure_class="poisoned_actor",
+                    actor_name=actor_name,
+                    request_id=str(get_request_id() or "") or None,
+                    session_id=str(getattr(session, "session_id", "") or session.model_id),
+                    detail=f"rebind_refused_poisoned:{reuse_block_reason}",
+                )
+                logger.warning(
+                    "[%s] refusing to rebind poisoned dense trainer actor=%s reason=%s",
+                    str(getattr(session, "model_id", "")),
+                    actor_name,
+                    reuse_block_reason,
+                )
+                return None
         try:
             worker = await asyncio.to_thread(ray.get_actor, actor_name, namespace=namespace)
         except Exception as e:
@@ -2333,6 +2910,23 @@ class VerlTrainingEngine:
         self._workers[session.model_id] = worker
         self._resource_pool_actor_names[session.model_id] = actor_name
         self._touch_actor(session)
+        if session.backend == "peft":
+            runtime_observability.record_dense_actor_bind_decision(
+                base_model=session.base_model,
+                decision="reuse",
+            )
+            runtime_observability.record_training_incident(
+                kind="dense_actor_bind_decision",
+                base_model=session.base_model,
+                backend=session.backend,
+                op="bind",
+                status="ok",
+                failure_class="none",
+                actor_name=actor_name,
+                request_id=str(get_request_id() or "") or None,
+                session_id=str(getattr(session, "session_id", "") or session.model_id),
+                detail=f"reuse:{reason}",
+            )
         logger.warning(
             "[%s] rebound worker actor=%s reason=%s backend=%s",
             session.model_id,
@@ -2778,9 +3372,11 @@ class VerlTrainingEngine:
             )
             traceparent = get_current_traceparent()
             try:
-                result = await self._await_with_keepalive(
+                result = await self._await_worker_call(
                     worker.reinit_lora_weights.remote(session.learning_rate, traceparent=traceparent),
                     session,
+                    op="create_training_session.reinit_lora_weights",
+                    worker=worker,
                     interval_s=30.0,
                     timeout_s=effective_reinit_timeout_s,
                 )
@@ -2842,9 +3438,11 @@ class VerlTrainingEngine:
             flush=True,
         )
         try:
-            await self._await_with_keepalive(
+            await self._await_worker_call(
                 worker.__ray_ready__.remote(),
                 session,
+                op="create_training_session.ready",
+                worker=worker,
                 interval_s=30.0,
                 timeout_s=ready_timeout_s,
             )
@@ -2945,7 +3543,13 @@ class VerlTrainingEngine:
                 session.model_id,
                 traceparent=traceparent,
             )
-        result = await self._await_with_keepalive(pending, session, interval_s=30.0)
+        result = await self._await_worker_call(
+            pending,
+            session,
+            op="forward_backward",
+            worker=worker,
+            interval_s=30.0,
+        )
 
         # Update session state
         session.accumulated_gradients += 1
@@ -3058,7 +3662,13 @@ class VerlTrainingEngine:
                     train_unembed=train_unembed,
                     reference_full_log_prob_chunks=reference_chunks,
                 )
-                result = await self._await_with_keepalive(pending, session, interval_s=30.0)
+                result = await self._await_worker_call(
+                    pending,
+                    session,
+                    op="forward_backward_reverse_kl",
+                    worker=worker,
+                    interval_s=30.0,
+                )
             finally:
                 try:
                     await asyncio.to_thread(
@@ -3080,7 +3690,13 @@ class VerlTrainingEngine:
                 session.model_id,
                 traceparent=traceparent,
             )
-            result = await self._await_with_keepalive(pending, session, interval_s=30.0)
+            result = await self._await_worker_call(
+                pending,
+                session,
+                op="forward_backward_reverse_kl",
+                worker=worker,
+                interval_s=30.0,
+            )
         session.accumulated_gradients += 1
         logger.info(f"[{model_id}] forward_backward_reverse_kl completed")
         return result
@@ -3133,7 +3749,13 @@ class VerlTrainingEngine:
             )
         else:
             pending = worker.forward.remote(data_items, session.model_id, traceparent=traceparent)
-        result = await self._await_with_keepalive(pending, session, interval_s=30.0)
+        result = await self._await_worker_call(
+            pending,
+            session,
+            op="forward",
+            worker=worker,
+            interval_s=30.0,
+        )
         self._record_megatron_result_metrics(session, result)
 
         logger.info(f"[{model_id}] forward completed")
@@ -3245,7 +3867,13 @@ class VerlTrainingEngine:
             )
         else:
             pending = worker.optim_step.remote(lr, session.model_id, traceparent=traceparent)
-        result = await self._await_with_keepalive(pending, session, interval_s=30.0)
+        result = await self._await_worker_call(
+            pending,
+            session,
+            op="optim_step",
+            worker=worker,
+            interval_s=30.0,
+        )
 
         # Update session state
         session.current_step += 1
@@ -3341,7 +3969,13 @@ class VerlTrainingEngine:
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
             )
-            result = await self._await_with_keepalive(pending, session, interval_s=30.0)
+            result = await self._await_worker_call(
+                pending,
+                session,
+                op="train_step",
+                worker=worker,
+                interval_s=30.0,
+            )
         else:
             # Dense models: Use separate calls (they don't have param_offload issues)
             # Pass session_id for stateless trainer pattern
@@ -3366,7 +4000,13 @@ class VerlTrainingEngine:
                     session.model_id,
                     traceparent=traceparent,
                 )
-            fb_result = await self._await_with_keepalive(fb_pending, session, interval_s=30.0)
+            fb_result = await self._await_worker_call(
+                fb_pending,
+                session,
+                op="forward_backward",
+                worker=worker,
+                interval_s=30.0,
+            )
             if session.backend == "megatron":
                 opt_pending = worker.optim_step.remote(
                     lr,
@@ -3379,7 +4019,13 @@ class VerlTrainingEngine:
                 )
             else:
                 opt_pending = worker.optim_step.remote(lr, session.model_id, traceparent=traceparent)
-            opt_result = await self._await_with_keepalive(opt_pending, session, interval_s=30.0)
+            opt_result = await self._await_worker_call(
+                opt_pending,
+                session,
+                op="optim_step",
+                worker=worker,
+                interval_s=30.0,
+            )
 
             # Merge results
             result = fb_result.copy()
@@ -3525,9 +4171,11 @@ class VerlTrainingEngine:
         )
         _ = await run_async_with_otel_span(
             "training.save_weights_for_sampler.remote_save",
-            lambda: self._await_with_keepalive(
+            lambda: self._await_worker_call(
                 ref,
                 session,
+                op="save_dense_lora_weights_for_sampler",
+                worker=worker,
                 interval_s=30.0,
                 timeout_s=timeout_s,
             ),
@@ -3597,9 +4245,11 @@ class VerlTrainingEngine:
         )
         meta = await run_async_with_otel_span(
             "training.save_weights_for_sampler.remote_save",
-            lambda: self._await_with_keepalive(
+            lambda: self._await_worker_call(
                 meta_ref,
                 session,
+                op="save_lora_weights_for_sampler",
+                worker=worker,
                 interval_s=30.0,
                 timeout_s=timeout_s,
             ),
@@ -3709,9 +4359,11 @@ class VerlTrainingEngine:
                 traceparent=traceparent,
                 session_id=session.model_id,
             )
-        meta = await self._await_with_keepalive(
+        meta = await self._await_worker_call(
             meta_ref,
             session,
+            op="save_weights",
+            worker=worker,
             interval_s=30.0,
             timeout_s=timeout_s,
         )

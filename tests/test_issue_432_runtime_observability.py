@@ -283,6 +283,118 @@ def test_issue_432_runtime_observability_tracks_megatron_session_switch() -> Non
     ]
 
 
+def test_issue_432_runtime_observability_tracks_training_ops_and_dense_actor_events() -> None:
+    obs = RuntimeObservability()
+
+    obs.record_training_operation(
+        base_model="Qwen/Qwen3-0.6B",
+        backend="peft",
+        op="forward_backward",
+        status="ok",
+        failure_class="none",
+        duration_s=1.5,
+    )
+    obs.record_training_operation(
+        base_model="Qwen/Qwen3-0.6B",
+        backend="peft",
+        op="forward_backward",
+        status="error",
+        failure_class="cuda_fatal",
+        duration_s=0.25,
+    )
+    obs.record_dense_actor_bind_decision(
+        base_model="Qwen/Qwen3-0.6B",
+        decision="rebind_refused_poisoned",
+    )
+    obs.record_dense_actor_fatal(
+        base_model="Qwen/Qwen3-0.6B",
+        op="forward_backward",
+        failure_class="cuda_fatal",
+    )
+    obs.record_dense_actor_retire(
+        base_model="Qwen/Qwen3-0.6B",
+        outcome="ok",
+    )
+
+    snap = obs.snapshot()
+    assert snap["training_operation_latency"] == [
+        {
+            "base_model": "Qwen/Qwen3-0.6B",
+            "backend": "peft",
+            "op": "forward_backward",
+            "status": "error",
+            "failure_class": "cuda_fatal",
+            "count": 1,
+            "duration_s_total": 0.25,
+            "duration_s_max": 0.25,
+        },
+        {
+            "base_model": "Qwen/Qwen3-0.6B",
+            "backend": "peft",
+            "op": "forward_backward",
+            "status": "ok",
+            "failure_class": "none",
+            "count": 1,
+            "duration_s_total": 1.5,
+            "duration_s_max": 1.5,
+        },
+    ]
+    assert snap["dense_actor_bind_decision"] == [
+        {
+            "base_model": "Qwen/Qwen3-0.6B",
+            "decision": "rebind_refused_poisoned",
+            "count": 1,
+        }
+    ]
+    assert snap["dense_actor_fatal"] == [
+        {
+            "base_model": "Qwen/Qwen3-0.6B",
+            "op": "forward_backward",
+            "failure_class": "cuda_fatal",
+            "count": 1,
+        }
+    ]
+    assert snap["dense_actor_retire"] == [
+        {
+            "base_model": "Qwen/Qwen3-0.6B",
+            "outcome": "ok",
+            "count": 1,
+        }
+    ]
+
+
+def test_issue_432_runtime_observability_keeps_recent_training_incidents() -> None:
+    obs = RuntimeObservability()
+
+    obs.record_training_incident(
+        kind="contract_violation",
+        base_model="Qwen/Qwen3-0.6B",
+        backend="peft",
+        op="forward_backward",
+        status="error",
+        failure_class="input_contract",
+        request_id="req-561",
+        session_id="session-561",
+        detail="input_ids_out_of_range",
+        context={"bad_input_positions": "[2]"},
+    )
+
+    snap = obs.snapshot()
+    assert len(snap["recent_training_incidents"]) == 1
+    incident = snap["recent_training_incidents"][0]
+    assert incident["kind"] == "contract_violation"
+    assert incident["base_model"] == "Qwen/Qwen3-0.6B"
+    assert incident["backend"] == "peft"
+    assert incident["op"] == "forward_backward"
+    assert incident["status"] == "error"
+    assert incident["failure_class"] == "input_contract"
+    assert incident["request_id"] == "req-561"
+    assert incident["session_id"] == "session-561"
+    assert incident["detail"] == "input_ids_out_of_range"
+    assert incident["context"] == {"bad_input_positions": "[2]"}
+    assert isinstance(incident["ts"], float)
+
+
 def test_issue_432_runtime_observability_tracks_vllm_workload_and_active_requests() -> None:
     obs = RuntimeObservability()
 
@@ -355,7 +467,11 @@ def test_issue_432_runtime_observability_tracks_vllm_workload_and_active_request
         },
     ]
     assert "vllm_actor_latency" not in snap
-    assert "training_operation_latency" not in snap
+    assert snap["training_operation_latency"] == []
+    assert snap["dense_actor_bind_decision"] == []
+    assert snap["dense_actor_fatal"] == []
+    assert snap["dense_actor_retire"] == []
+    assert snap["recent_training_incidents"] == []
 
 
 class _Recorder:
@@ -369,7 +485,7 @@ class _Recorder:
         self.calls.append(("record", value, attributes))
 
 
-def test_issue_432_otel_latency_metrics_ignore_failures(monkeypatch) -> None:
+def test_issue_432_otel_latency_metrics_include_failure_labels(monkeypatch) -> None:
     events = []
     counter = _Recorder()
     hist = _Recorder()
@@ -400,6 +516,7 @@ def test_issue_432_otel_latency_metrics_ignore_failures(monkeypatch) -> None:
         backend="megatron",
         op="forward_backward",
         status="ok",
+        failure_class="none",
         duration_s=6.0,
     )
     logging_context.record_training_operation_latency_otel(
@@ -407,6 +524,7 @@ def test_issue_432_otel_latency_metrics_ignore_failures(monkeypatch) -> None:
         backend="megatron",
         op="forward_backward",
         status="canceled",
+        failure_class="canceled",
         duration_s=3.0,
     )
 
@@ -423,6 +541,19 @@ def test_issue_432_otel_latency_metrics_ignore_failures(monkeypatch) -> None:
                 "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
                 "backend": "megatron",
                 "op": "forward_backward",
+                "status": "ok",
+                "failure_class": "none",
+            },
+        ),
+        (
+            "add",
+            1,
+            {
+                "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+                "backend": "megatron",
+                "op": "forward_backward",
+                "status": "canceled",
+                "failure_class": "canceled",
             },
         ),
     ]
@@ -439,6 +570,19 @@ def test_issue_432_otel_latency_metrics_ignore_failures(monkeypatch) -> None:
                 "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
                 "backend": "megatron",
                 "op": "forward_backward",
+                "status": "ok",
+                "failure_class": "none",
+            },
+        ),
+        (
+            "record",
+            3.0,
+            {
+                "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+                "backend": "megatron",
+                "op": "forward_backward",
+                "status": "canceled",
+                "failure_class": "canceled",
             },
         ),
     ]
@@ -460,6 +604,7 @@ def test_issue_432_otel_latency_metrics_ignore_failures(monkeypatch) -> None:
                 "backend": "megatron",
                 "op": "forward_backward",
                 "status": "canceled",
+                "failure_class": "canceled",
                 "duration_s": 3.0,
             },
         ),

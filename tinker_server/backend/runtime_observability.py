@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass
 
 from ..logging_context import (
@@ -40,6 +41,30 @@ class _VllmAggregate:
     tpot_s_count: int = 0
 
 
+@dataclass
+class _OperationAggregate:
+    count: int = 0
+    duration_s_total: float = 0.0
+    duration_s_max: float = 0.0
+
+
+@dataclass
+class _RecentTrainingIncident:
+    ts: float
+    kind: str
+    base_model: str
+    backend: str
+    op: str
+    status: str
+    failure_class: str
+    actor_name: str | None = None
+    node_id: str | None = None
+    request_id: str | None = None
+    session_id: str | None = None
+    detail: str | None = None
+    context: dict[str, object] | None = None
+
+
 class RuntimeObservability:
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -49,6 +74,12 @@ class RuntimeObservability:
         self._megatron_actor_lifecycle: dict[tuple[str, str], int] = {}
         self._vllm_workload: dict[tuple[str, str, str, str], _VllmAggregate] = {}
         self._vllm_active_requests: dict[tuple[str, str, str], int] = {}
+        self._training_operation_latency: dict[tuple[str, str, str, str, str], _OperationAggregate] = {}
+        self._dense_actor_bind_decision: dict[tuple[str, str], int] = {}
+        self._dense_actor_fatal: dict[tuple[str, str, str], int] = {}
+        self._dense_actor_retire: dict[tuple[str, str], int] = {}
+        self._recent_training_incidents: list[_RecentTrainingIncident] = []
+        self._recent_training_incidents_limit = 64
 
     def record_megatron_session_switch(
         self,
@@ -145,15 +176,85 @@ class RuntimeObservability:
         backend: str,
         op: str,
         status: str,
+        failure_class: str | None,
         duration_s: float,
     ) -> None:
+        key = (
+            str(base_model or "unknown"),
+            str(backend or "unknown"),
+            str(op or "unknown"),
+            str(status or "unknown"),
+            str(failure_class or "none"),
+        )
+        duration = max(0.0, float(duration_s))
+        with self._lock:
+            agg = self._training_operation_latency.setdefault(key, _OperationAggregate())
+            agg.count += 1
+            agg.duration_s_total += duration
+            agg.duration_s_max = max(agg.duration_s_max, duration)
         record_training_operation_latency_otel(
             base_model=str(base_model or "unknown"),
             backend=str(backend or "unknown"),
             op=str(op or "unknown"),
             status=str(status or "unknown"),
-            duration_s=max(0.0, float(duration_s)),
+            failure_class=str(failure_class or "none"),
+            duration_s=duration,
         )
+
+    def record_dense_actor_bind_decision(self, *, base_model: str, decision: str) -> None:
+        key = (str(base_model or "unknown"), str(decision or "unknown"))
+        with self._lock:
+            self._dense_actor_bind_decision[key] = int(self._dense_actor_bind_decision.get(key, 0)) + 1
+
+    def record_dense_actor_fatal(self, *, base_model: str, op: str, failure_class: str) -> None:
+        key = (
+            str(base_model or "unknown"),
+            str(op or "unknown"),
+            str(failure_class or "unknown"),
+        )
+        with self._lock:
+            self._dense_actor_fatal[key] = int(self._dense_actor_fatal.get(key, 0)) + 1
+
+    def record_dense_actor_retire(self, *, base_model: str, outcome: str) -> None:
+        key = (str(base_model or "unknown"), str(outcome or "unknown"))
+        with self._lock:
+            self._dense_actor_retire[key] = int(self._dense_actor_retire.get(key, 0)) + 1
+
+    def record_training_incident(
+        self,
+        *,
+        kind: str,
+        base_model: str,
+        backend: str,
+        op: str,
+        status: str,
+        failure_class: str,
+        actor_name: str | None = None,
+        node_id: str | None = None,
+        request_id: str | None = None,
+        session_id: str | None = None,
+        detail: str | None = None,
+        context: dict[str, object] | None = None,
+    ) -> None:
+        incident = _RecentTrainingIncident(
+            ts=time.time(),
+            kind=str(kind or "unknown"),
+            base_model=str(base_model or "unknown"),
+            backend=str(backend or "unknown"),
+            op=str(op or "unknown"),
+            status=str(status or "unknown"),
+            failure_class=str(failure_class or "unknown"),
+            actor_name=None if actor_name is None else str(actor_name),
+            node_id=None if node_id is None else str(node_id),
+            request_id=None if request_id is None else str(request_id),
+            session_id=None if session_id is None else str(session_id),
+            detail=None if detail is None else str(detail),
+            context=dict(context or {}) if context else None,
+        )
+        with self._lock:
+            self._recent_training_incidents.append(incident)
+            if len(self._recent_training_incidents) > self._recent_training_incidents_limit:
+                del self._recent_training_incidents[: len(self._recent_training_incidents) - self._recent_training_incidents_limit]
 
     def flush_otel(self) -> None:
         with self._lock:
@@ -246,12 +347,79 @@ class RuntimeObservability:
                     }
                 )
 
+            training_operation_latency = []
+            for (base_model, backend, op, status, failure_class), agg in sorted(self._training_operation_latency.items()):
+                training_operation_latency.append(
+                    {
+                        "base_model": base_model,
+                        "backend": backend,
+                        "op": op,
+                        "status": status,
+                        "failure_class": failure_class,
+                        "count": int(agg.count),
+                        "duration_s_total": float(agg.duration_s_total),
+                        "duration_s_max": float(agg.duration_s_max),
+                    }
+                )
+
+            dense_actor_bind_decision = [
+                {
+                    "base_model": base_model,
+                    "decision": decision,
+                    "count": int(count),
+                }
+                for (base_model, decision), count in sorted(self._dense_actor_bind_decision.items())
+            ]
+
+            dense_actor_fatal = [
+                {
+                    "base_model": base_model,
+                    "op": op,
+                    "failure_class": failure_class,
+                    "count": int(count),
+                }
+                for (base_model, op, failure_class), count in sorted(self._dense_actor_fatal.items())
+            ]
+
+            dense_actor_retire = [
+                {
+                    "base_model": base_model,
+                    "outcome": outcome,
+                    "count": int(count),
+                }
+                for (base_model, outcome), count in sorted(self._dense_actor_retire.items())
+            ]
+
+            recent_training_incidents = [
+                {
+                    "ts": float(incident.ts),
+                    "kind": incident.kind,
+                    "base_model": incident.base_model,
+                    "backend": incident.backend,
+                    "op": incident.op,
+                    "status": incident.status,
+                    "failure_class": incident.failure_class,
+                    "actor_name": incident.actor_name,
+                    "node_id": incident.node_id,
+                    "request_id": incident.request_id,
+                    "session_id": incident.session_id,
+                    "detail": incident.detail,
+                    "context": None if incident.context is None else dict(incident.context),
+                }
+                for incident in self._recent_training_incidents
+            ]
+
         return {
             "megatron_session_switch": megatron,
             "megatron_session_switch_failures": megatron_session_switch_failures,
             "megatron_actor_lifecycle": megatron_actor_lifecycle,
             "vllm_workload": vllm,
             "vllm_active_requests": active,
+            "training_operation_latency": training_operation_latency,
+            "dense_actor_bind_decision": dense_actor_bind_decision,
+            "dense_actor_fatal": dense_actor_fatal,
+            "dense_actor_retire": dense_actor_retire,
+            "recent_training_incidents": recent_training_incidents,
         }
 
 
