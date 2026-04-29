@@ -691,7 +691,7 @@ def test_issue_193_dense_load_weights_rebinds_after_worker_death(monkeypatch):
     assert session.learning_rate == pytest.approx(3e-4)
 
 
-def test_issue_193_megatron_load_weights_passes_explicit_session_id_and_keepalive(monkeypatch):
+def test_issue_193_megatron_load_weights_passes_explicit_session_id_and_keepalive(monkeypatch, tmp_path):
     engine = VerlTrainingEngine()
     model_id = "model_issue_193_megatron_load"
     worker = _FakeLoadWorker(ref="megatron-load-ref")
@@ -710,6 +710,12 @@ def test_issue_193_megatron_load_weights_passes_explicit_session_id_and_keepaliv
             train_unembed=False,
         ),
     )
+    load_path = tmp_path / "issue_193_megatron_load"
+    load_path.mkdir()
+    (load_path / "adapter_config.json").write_text(
+        '{"r": 8, "target_modules": ["gate_proj", "up_proj", "down_proj"]}',
+        encoding="utf-8",
+    )
 
     keepalive_calls: list[tuple[object, str, float, float | None]] = []
 
@@ -720,7 +726,7 @@ def test_issue_193_megatron_load_weights_passes_explicit_session_id_and_keepaliv
             "learning_rate": 3e-4,
             "actual_rank": 8,
             "actor_only_state_dirty": False,
-            "checkpoint_path": "/tmp/issue_193_megatron_load",
+            "checkpoint_path": str(load_path),
             "optimizer_restored": False,
             "train_attn": False,
             "train_mlp": True,
@@ -733,7 +739,7 @@ def test_issue_193_megatron_load_weights_passes_explicit_session_id_and_keepaliv
     async def _run():
         await engine.load_weights(
             session=session,
-            load_path="/tmp/issue_193_megatron_load",
+            load_path=str(load_path),
             load_optimizer=False,
         )
 
@@ -744,7 +750,7 @@ def test_issue_193_megatron_load_weights_passes_explicit_session_id_and_keepaliv
         ("megatron-load-ref", model_id, 30.0, 1800.0),
     ]
     args, kwargs = worker.load_checkpoint.calls[0]
-    assert args == ("/tmp/issue_193_megatron_load", False)
+    assert args == (str(load_path), False)
     assert kwargs["traceparent"] is None
     assert kwargs["session_id"] == model_id
     assert "train_attn" not in kwargs
@@ -758,7 +764,7 @@ def test_issue_193_megatron_load_weights_passes_explicit_session_id_and_keepaliv
                 "learning_rate": pytest.approx(3e-4),
                 "actual_rank": 8,
                 "actor_only_state_dirty": False,
-                "checkpoint_path": "/tmp/issue_193_megatron_load",
+                "checkpoint_path": str(load_path),
                 "optimizer_restored": False,
                 "train_attn": False,
                 "train_mlp": True,

@@ -3887,6 +3887,13 @@ class VerlTrainingEngine:
             "traceparent": traceparent,
             "session_id": session.model_id,
         }
+        if session.backend == "megatron" and not os.path.isfile(os.path.join(load_path, "adapter_config.json")):
+            lora_config = getattr(session, "lora_config", None)
+            for key in ("train_attn", "train_mlp", "train_unembed"):
+                value = getattr(lora_config, key, None)
+                if value is not None:
+                    kwargs[key] = bool(value)
+
         def _submit(call_worker):
             return call_worker.load_checkpoint.remote(load_path, load_optimizer, **kwargs)
 
