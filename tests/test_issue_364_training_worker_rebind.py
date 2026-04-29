@@ -134,8 +134,9 @@ async def test_issue_561_dense_fatal_error_retires_actor(monkeypatch: pytest.Mon
 
     retire_calls: list[dict[str, object]] = []
 
-    def _fake_retire_dense_trainer(**kwargs) -> None:
+    def _fake_retire_dense_trainer(**kwargs) -> str:
         retire_calls.append(dict(kwargs))
+        return "ok"
 
     monkeypatch.setattr(engine, "_get_live_worker", _fake_get_live_worker)
     monkeypatch.setattr(engine, "_await_with_keepalive", _fake_await_with_keepalive)
@@ -180,6 +181,72 @@ async def test_issue_561_dense_fatal_error_retires_actor(monkeypatch: pytest.Mon
             "count": 1,
         }
     ]
+
+
+@pytest.mark.anyio
+async def test_issue_561_dense_retire_failure_hard_poisons_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    engine = VerlTrainingEngine()
+    obs = runtime_obs_module.RuntimeObservability()
+    monkeypatch.setattr(runtime_obs_module, "runtime_observability", obs)
+    session = TrainingSession(
+        model_id="run-561-retire-failed",
+        session_id="session-561-retire-failed",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-0.6B",
+        backend="peft",
+    )
+    session.actor_name = "peft_trainer_qwen__qwen3_0_6b_maxr64"
+    session.namespace = "tinker"
+    engine._resource_pool_actor_names[session.model_id] = session.actor_name
+
+    worker = SimpleNamespace(forward_backward=_RemoteCall())
+
+    class AcceleratorError(RuntimeError):
+        pass
+
+    class _RayTaskError(RuntimeError):
+        def __init__(self, msg: str, *, cause=None) -> None:
+            super().__init__(msg)
+            self.cause = cause
+
+    async def _fake_get_live_worker(s, *, op: str, allow_recover: bool = False):
+        assert s is session
+        return worker
+
+    async def _fake_await_with_keepalive(ref, _session, interval_s: float = 30.0, timeout_s=None):
+        _ = ref, _session, interval_s, timeout_s
+        raise _RayTaskError(
+            "RayTaskError(AcceleratorError)",
+            cause=AcceleratorError("CUDA error: device-side assert triggered"),
+        )
+
+    monkeypatch.setattr(engine, "_get_live_worker", _fake_get_live_worker)
+    monkeypatch.setattr(engine, "_await_with_keepalive", _fake_await_with_keepalive)
+    monkeypatch.setattr(dense_trainer, "retire_dense_trainer", lambda **kwargs: "kill_failed")
+
+    request = SimpleNamespace(
+        forward_backward_input=SimpleNamespace(
+            data=[SimpleNamespace(model_dump=lambda: {"model_input": {}, "loss_fn_inputs": {}})],
+            loss_fn="cross_entropy",
+            loss_fn_config={},
+        )
+    )
+
+    with pytest.raises(_RayTaskError, match="RayTaskError"):
+        await engine.forward_backward(session, request)
+
+    hard_error = engine._hard_poisoned_sessions[session.model_id]
+    assert "dense actor retirement failed" in hard_error
+    assert "outcome=kill_failed" in hard_error
+    with pytest.raises(RuntimeError, match="dense actor retirement failed"):
+        engine._raise_if_session_poisoned(session, op="load_weights")
+    assert session.model_id not in engine._resource_pool_actor_names
+    assert session.actor_name is None
+    assert session.namespace is None
+    assert any(
+        row["kind"] == "dense_actor_retire_failed" and row["failure_class"] == "kill_failed"
+        for row in obs.snapshot()["recent_training_incidents"]
+    )
 
 
 @pytest.mark.anyio

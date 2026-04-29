@@ -1891,6 +1891,7 @@ class VerlTrainingEngine:
         # Session-level poisoned marker for mid-call actor failures.
         # Value stores the user-facing reason that requires reload boundary.
         self._poisoned_sessions: dict[str, str] = {}
+        self._hard_poisoned_sessions: dict[str, str] = {}
         self._megatron_recycle_locks: dict[str, asyncio.Lock] = {}
         self._megatron_recycle_locks_guard = asyncio.Lock()
 
@@ -1982,6 +1983,9 @@ class VerlTrainingEngine:
         return self._resource_pool_actor_names.get(session.model_id)
 
     def _raise_if_session_poisoned(self, session: "TrainingSession", *, op: str) -> None:
+        hard_error = self._hard_poisoned_sessions.get(session.model_id)
+        if hard_error is not None:
+            raise RuntimeError(hard_error)
         if op == "load_weights":
             return
         error = self._poisoned_sessions.get(session.model_id)
@@ -1997,6 +2001,7 @@ class VerlTrainingEngine:
             self._actor_volatile_sessions.setdefault(actor_name, set()).add(session.model_id)
         if op == "load_weights":
             self._poisoned_sessions.pop(session.model_id, None)
+            self._hard_poisoned_sessions.pop(session.model_id, None)
 
     def _megatron_op_requires_fail_closed_after_actor_death(self, op: str) -> bool:
         return op in {
@@ -2643,7 +2648,7 @@ class VerlTrainingEngine:
 
         from .dense_trainer import retire_dense_trainer
 
-        await asyncio.to_thread(
+        retire_outcome = await asyncio.to_thread(
             retire_dense_trainer,
             actor_name=actor_name,
             actor=worker,
@@ -2654,6 +2659,28 @@ class VerlTrainingEngine:
             request_id=str(get_request_id() or "") or None,
             namespace=str(getattr(session, "namespace", "") or RAY_NAMESPACE),
         )
+        if retire_outcome != "ok":
+            retire_failure = (
+                f"[{session.model_id}] dense actor retirement failed after fatal op={op}; "
+                f"actor_name={actor_name} outcome={retire_outcome}. "
+                "Operator must recycle the actor before this session can continue."
+            )
+            self._poisoned_sessions[session.model_id] = retire_failure
+            self._hard_poisoned_sessions[session.model_id] = retire_failure
+            runtime_observability.record_training_incident(
+                kind="dense_actor_retire_failed",
+                base_model=session.base_model,
+                backend=session.backend,
+                op=op,
+                status="error",
+                failure_class=str(retire_outcome or "unknown"),
+                actor_name=actor_name,
+                node_id=self._resolve_actor_node_id(actor_name),
+                request_id=str(get_request_id() or "") or None,
+                session_id=str(getattr(session, "session_id", "") or session.model_id),
+                detail=retire_failure,
+            )
+            logger.error(retire_failure)
 
         self._workers.pop(session.model_id, None)
         self._resource_pool_actor_names.pop(session.model_id, None)

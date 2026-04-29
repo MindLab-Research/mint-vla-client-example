@@ -54,11 +54,7 @@ def test_issue_439_dense_trainer_does_not_pass_removed_session_state_root(monkey
     monkeypatch.setattr(dt, "_get_or_create_pg", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(dt.ray, "get_actor", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("missing")))
     monkeypatch.setattr(dt.ray, "get", lambda value, timeout=None: value)
-    monkeypatch.setattr(
-        dt.ray.util,
-        "scheduling_strategies",
-        SimpleNamespace(PlacementGroupSchedulingStrategy=lambda **kwargs: kwargs),
-    )
+    monkeypatch.setattr(dt, "PlacementGroupSchedulingStrategy", lambda **kwargs: kwargs)
 
     dt.get_or_create_dense_trainer(
         training_worker_cls=_FakeTrainingWorker,
@@ -146,11 +142,7 @@ def test_issue_561_poisoned_dense_trainer_is_not_reused(monkeypatch, base_model:
     monkeypatch.setattr(dt, "_get_or_create_pg", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(dt.ray, "get_actor", lambda *args, **kwargs: _ExistingActor())
     monkeypatch.setattr(dt.ray, "get", lambda value, timeout=None: value)
-    monkeypatch.setattr(
-        dt.ray.util,
-        "scheduling_strategies",
-        SimpleNamespace(PlacementGroupSchedulingStrategy=lambda **kwargs: kwargs),
-    )
+    monkeypatch.setattr(dt, "PlacementGroupSchedulingStrategy", lambda **kwargs: kwargs)
 
     dt.get_or_create_dense_trainer(
         training_worker_cls=_FakeTrainingWorker,
