@@ -131,3 +131,21 @@ async def test_issue_559_api_work_queue_recreates_on_contract_mismatch(monkeypat
     assert killed == ["api_work_queue_runtime_contract_mismatch"]
     assert actor is fresh
     assert client._ray_actor is fresh
+
+
+def test_queue_execution_runtime_contract_ignores_volatile_temp_env(monkeypatch) -> None:
+    module = importlib.import_module("tinker_server.backend.queue_execution_runtime")
+
+    monkeypatch.setenv("TMPDIR", "/tmp/driver-a")
+    monkeypatch.setenv("XDG_CACHE_HOME", "/tmp/cache-a")
+    first = module._runtime_contract_digest()
+
+    monkeypatch.setenv("TMPDIR", "/tmp/worker-b")
+    monkeypatch.setenv("XDG_CACHE_HOME", "/tmp/cache-b")
+    second = module._runtime_contract_digest()
+
+    assert first == second
+    assert module._runtime_env_overrides()["TMPDIR"] == "/tmp/worker-b"
+    assert module._runtime_env_overrides()["XDG_CACHE_HOME"] == "/tmp/cache-b"
+    assert "TMPDIR" not in module._runtime_contract_payload()["runtime_env_overrides"]
+    assert "XDG_CACHE_HOME" not in module._runtime_contract_payload()["runtime_env_overrides"]

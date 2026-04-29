@@ -1,18 +1,15 @@
-"""Async usage storage backend for billing usage_event."""
+"""PostgreSQL usage storage backend for billing usage_event."""
 
 from __future__ import annotations
 
 import asyncio
-import fcntl
-import json
 import logging
 import os
 import re
-import sqlite3
+import uuid
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Literal, Protocol
 
 from .config import config
@@ -21,20 +18,15 @@ logger = logging.getLogger(__name__)
 
 ChargeItem = Literal["sampling", "inference", "training", "checkpoint_storage"]
 _SQL_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_OUTBOX_BATCH_SIZE = 128
+_EVENT_ID_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "mindlab.mint.billing.usage_event.v1")
+_PENDING_WRITE_TASKS: set[asyncio.Task] = set()
+_MAX_PENDING_WRITE_TASKS = max(1, int(os.environ.get("MINT_USAGE_MAX_PENDING_WRITE_TASKS", "1024")))
 
 
 def _import_asyncpg():
     import asyncpg
 
     return asyncpg
-
-
-def _default_jsonl_usage_path() -> Path:
-    usage_log_dir = str(config.usage_log_dir or "").strip()
-    if usage_log_dir:
-        return Path(usage_log_dir) / "usage_event.jsonl"
-    return Path(config.checkpoint_dir) / ".billing" / "usage_event.jsonl"
 
 
 def _usage_pg_dsn() -> str:
@@ -49,15 +41,20 @@ class UsageEvent:
     quantity: int
     request_id: str
     label: str = ""
+    event_id: str = ""
     event_time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class UsageStore(Protocol):
-    async def write_event(self, event: UsageEvent) -> None: ...
+    async def write_event(self, event: UsageEvent) -> list[str]: ...
 
-    async def write_events(self, events: list[UsageEvent]) -> None: ...
+    async def write_events(self, events: list[UsageEvent]) -> list[str]: ...
 
-    async def flush_outbox(self, limit: int = _OUTBOX_BATCH_SIZE) -> int: ...
+    async def flush_outbox(self, limit: int = 0) -> int: ...
+
+    async def delete_events(self, events: list[UsageEvent]) -> None: ...
+
+    async def delete_event_ids(self, event_ids: list[str]) -> None: ...
 
     async def query_logs(
         self,
@@ -87,28 +84,23 @@ class PostgresUsageStore:
         pool_min: int = 1,
         pool_max: int = 10,
         write_timeout_ms: int = 2000,
-        table: str = "billing.usage_event",
+        table: str = "usage_event",
         outbox_path: str | None = None,
-        outbox_flush_interval_s: float = 5.0,
+        outbox_flush_interval_s: float = 0.0,
     ):
         if not dsn:
             raise ValueError("Postgres DSN is required for usage backend")
+        _ = outbox_path, outbox_flush_interval_s
         self._dsn = dsn
         self._pool_min = max(1, int(pool_min))
         self._pool_max = max(self._pool_min, int(pool_max))
         self._write_timeout_s = max(0.1, float(write_timeout_ms) / 1000.0)
         self._pool = None
         self._pool_lock = asyncio.Lock()
-        self._table = str(table or "billing.usage_event").strip()
-        self._sequence = self._build_sequence_name(self._table)
-        self._dedupe_index = self._build_dedupe_index_name(self._table)
-        default_outbox = Path(config.checkpoint_dir) / ".billing" / "usage_outbox.sqlite3"
-        self._outbox_path = Path(outbox_path) if outbox_path else default_outbox
-        self._outbox_lock = asyncio.Lock()
-        self._outbox_ready = False
-        self._flush_interval_s = max(0.5, float(outbox_flush_interval_s))
-        self._close_event = asyncio.Event()
-        self._flush_task: asyncio.Task[None] | None = None
+        self._schema, self._name = self._parse_qualified_name(str(table or "usage_event").strip())
+        self._table = f"{self._schema}.{self._name}"
+        self._sequence = f"{self._schema}.{self._name}_source_index_seq"
+        self._dedupe_index = f"idx_{self._name}_event_id_uniq"
 
     @staticmethod
     def _parse_qualified_name(value: str) -> tuple[str, str]:
@@ -119,17 +111,7 @@ class PostgresUsageStore:
             schema, name = parts
         if not _SQL_IDENT_RE.match(schema) or not _SQL_IDENT_RE.match(name):
             raise ValueError(f"Unsupported SQL identifier: {value!r}")
-        return schema, name
-
-    @classmethod
-    def _build_sequence_name(cls, table: str) -> str:
-        schema, name = cls._parse_qualified_name(table)
-        return f"{schema}.{name}_source_index_seq"
-
-    @classmethod
-    def _build_dedupe_index_name(cls, table: str) -> str:
-        _, name = cls._parse_qualified_name(table)
-        return f"idx_{name}_request_charge_label_uniq"
+        return schema.lower(), name.lower()
 
     @staticmethod
     def _normalize_event_time(ts: datetime) -> datetime:
@@ -144,25 +126,66 @@ class PostgresUsageStore:
         return ts.astimezone(timezone.utc).isoformat()
 
     @staticmethod
-    def _event_identity(event: UsageEvent) -> tuple[str, str, str]:
-        return (str(event.request_id), str(event.charge_item), str(event.label or ""))
+    def build_event_id(event: UsageEvent) -> str:
+        key = "|".join(
+            [
+                str(event.account_id).strip(),
+                str(event.apikey_id).strip(),
+                str(event.request_id).strip(),
+                str(event.charge_item).strip(),
+                str(event.label or "").strip(),
+            ]
+        )
+        return uuid.uuid5(_EVENT_ID_NAMESPACE, key).hex
 
-    def _validate_events(self, events: list[UsageEvent]) -> list[UsageEvent]:
-        normalized = list(events)
-        if not normalized:
+    def _normalize_events(self, events: list[UsageEvent]) -> list[UsageEvent]:
+        raw = list(events)
+        if not raw:
             raise ValueError("write_events requires at least one event")
-        seen: set[tuple[str, str, str]] = set()
-        for event in normalized:
+        normalized: list[UsageEvent] = []
+        seen: set[str] = set()
+        for event in raw:
             request_id = str(event.request_id or "").strip()
             if not request_id:
                 raise ValueError("usage_event request_id must be non-empty")
-            key = self._event_identity(event)
-            if key in seen:
-                raise ValueError(f"duplicate usage_event identity in batch: {key!r}")
-            seen.add(key)
+            quantity = int(event.quantity)
+            if quantity < 0:
+                raise ValueError("usage_event quantity must be non-negative")
+            event_id = str(event.event_id or "").strip() or self.build_event_id(event)
+            if event_id in seen:
+                raise ValueError(f"duplicate usage_event event_id in batch: {event_id!r}")
+            seen.add(event_id)
+            normalized.append(
+                replace(
+                    event,
+                    request_id=request_id,
+                    event_id=event_id,
+                    quantity=quantity,
+                    label=str(event.label or ""),
+                )
+            )
         return normalized
 
-    async def _ensure_pool(self, *, start_flush_task: bool = True):
+    def _event_ids_for_delete(self, events: list[UsageEvent]) -> list[str]:
+        raw = list(events)
+        if not raw:
+            return []
+        event_ids: list[str] = []
+        seen: set[str] = set()
+        for event in raw:
+            event_id = str(event.event_id or "").strip()
+            if not event_id:
+                request_id = str(event.request_id or "").strip()
+                if not request_id:
+                    raise ValueError("usage_event request_id must be non-empty")
+                event_id = self.build_event_id(event)
+            if event_id in seen:
+                continue
+            seen.add(event_id)
+            event_ids.append(event_id)
+        return event_ids
+
+    async def _ensure_pool(self):
         if self._pool is not None:
             return self._pool
         async with self._pool_lock:
@@ -181,9 +204,6 @@ class PostgresUsageStore:
                 server_settings={"application_name": "tinker_server_usage"},
             )
             await self._ensure_pg_schema()
-            await self._ensure_outbox()
-            if start_flush_task:
-                self._ensure_flush_task()
             return self._pool
 
     async def _ensure_pg_schema(self) -> None:
@@ -191,117 +211,56 @@ class PostgresUsageStore:
         if pool is None:
             raise RuntimeError("usage pool is not initialized")
         async with pool.acquire() as conn:
+            if self._schema != "public":
+                await conn.execute(f"CREATE SCHEMA IF NOT EXISTS {self._schema}")
             await conn.execute(f"CREATE SEQUENCE IF NOT EXISTS {self._sequence} AS BIGINT")
+            await conn.execute(f"ALTER TABLE {self._table} ADD COLUMN IF NOT EXISTS event_id TEXT")
+            await conn.execute(f"ALTER TABLE {self._table} ALTER COLUMN event_id SET NOT NULL")
             await conn.execute(
-                f"CREATE UNIQUE INDEX IF NOT EXISTS {self._dedupe_index} "
-                f"ON {self._table} (request_id, charge_item, label)"
+                f"ALTER TABLE {self._table} ALTER COLUMN source_index SET DEFAULT nextval('{self._sequence}'::regclass)"
             )
-
-    async def _ensure_outbox(self) -> None:
-        if self._outbox_ready:
-            return
-        async with self._outbox_lock:
-            if self._outbox_ready:
-                return
-            await asyncio.to_thread(self._init_outbox_db)
-            self._outbox_ready = True
-
-    def _init_outbox_db(self) -> None:
-        self._outbox_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self._outbox_path)
-        try:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS pending_usage_event (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    request_id TEXT NOT NULL,
-                    charge_item TEXT NOT NULL,
-                    label TEXT NOT NULL,
-                    account_id TEXT NOT NULL,
-                    apikey_id TEXT NOT NULL,
-                    quantity INTEGER NOT NULL,
-                    event_time TEXT NOT NULL,
-                    UNIQUE(request_id, charge_item, label)
+            await conn.execute(
+                f"""
+                SELECT setval(
+                    '{self._sequence}',
+                    GREATEST(
+                        (SELECT COALESCE(MAX(source_index), 0) FROM {self._table}),
+                        (SELECT last_value FROM {self._sequence})
+                    ),
+                    true
                 )
                 """
             )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_pending_usage_event_id ON pending_usage_event(id)"
+            await conn.execute(
+                f"CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS {self._dedupe_index} ON {self._table} (event_id)"
             )
-            conn.commit()
-        finally:
-            conn.close()
+            await self._assert_event_id_unique_index(conn)
 
-    def _ensure_flush_task(self) -> None:
-        if self._flush_task is None or self._flush_task.done():
-            self._flush_task = asyncio.create_task(self._flush_outbox_loop())
-
-    def _outbox_upsert(self, events: list[UsageEvent]) -> int:
-        conn = sqlite3.connect(self._outbox_path)
-        try:
-            conn.executemany(
-                """
-                INSERT INTO pending_usage_event
-                    (request_id, charge_item, label, account_id, apikey_id, quantity, event_time)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(request_id, charge_item, label) DO NOTHING
-                """,
-                [
-                    (
-                        event.request_id,
-                        event.charge_item,
-                        event.label or "",
-                        event.account_id,
-                        event.apikey_id,
-                        int(event.quantity),
-                        self._to_iso8601(self._normalize_event_time(event.event_time)),
-                    )
-                    for event in events
-                ],
+    async def _assert_event_id_unique_index(self, conn) -> None:
+        exists = await conn.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_index i
+                JOIN pg_class t ON t.oid = i.indrelid
+                JOIN pg_namespace n ON n.oid = t.relnamespace
+                JOIN pg_attribute a
+                  ON a.attrelid = t.oid
+                 AND a.attnum = (i.indkey::smallint[])[0]
+                WHERE n.nspname = $1
+                  AND t.relname = $2
+                  AND i.indisunique
+                  AND i.indisvalid
+                  AND i.indpred IS NULL
+                  AND COALESCE((to_jsonb(i)->>'indnkeyatts')::int, i.indnatts) = 1
+                  AND a.attname = 'event_id'
             )
-            conn.commit()
-            return int(conn.total_changes)
-        finally:
-            conn.close()
-
-    def _outbox_fetch_batch(self, limit: int) -> list[dict]:
-        conn = sqlite3.connect(self._outbox_path)
-        conn.row_factory = sqlite3.Row
-        try:
-            rows = conn.execute(
-                """
-                SELECT id, request_id, charge_item, label, account_id, apikey_id, quantity, event_time
-                FROM pending_usage_event
-                ORDER BY id ASC
-                LIMIT ?
-                """,
-                (int(limit),),
-            ).fetchall()
-            return [dict(row) for row in rows]
-        finally:
-            conn.close()
-
-    def _outbox_delete_ids(self, ids: list[int]) -> None:
-        if not ids:
-            return
-        conn = sqlite3.connect(self._outbox_path)
-        try:
-            conn.executemany("DELETE FROM pending_usage_event WHERE id = ?", [(int(i),) for i in ids])
-            conn.commit()
-        finally:
-            conn.close()
-
-    async def _enqueue_outbox(self, events: list[UsageEvent], error: Exception) -> None:
-        await self._ensure_outbox()
-        changed = await asyncio.to_thread(self._outbox_upsert, events)
-        logger.warning(
-            "usage_event write diverted to outbox: request_ids=%s enqueued=%s err=%s",
-            [event.request_id for event in events],
-            changed,
-            error,
+            """,
+            self._schema,
+            self._name,
         )
-        self._ensure_flush_task()
+        if not exists:
+            raise RuntimeError(f"{self._table} requires a full-table unique index on event_id")
 
     @asynccontextmanager
     async def _maybe_transaction(self, conn):
@@ -313,38 +272,40 @@ class PostgresUsageStore:
         async with _null_async_context():
             yield
 
-    async def _write_events_to_pg(self, events: list[UsageEvent]) -> None:
+    async def _write_events_to_pg(self, events: list[UsageEvent]) -> list[str]:
         pool = await self._ensure_pool()
         sql = f"""
         INSERT INTO {self._table}
-            (source_index, event_time, account_id, apikey_id, charge_item, quantity, request_id, label)
+            (event_id, event_time, account_id, apikey_id, charge_item, quantity, request_id, label)
         VALUES
             ($1, $2, $3, $4, $5, $6, $7, $8)
-        ON CONFLICT (request_id, charge_item, label) DO NOTHING
+        ON CONFLICT (event_id) DO NOTHING
         """
 
         last_error: Exception | None = None
         for attempt in range(3):
             try:
+                inserted_event_ids: list[str] = []
                 async with pool.acquire() as conn:
                     async with self._maybe_transaction(conn):
                         for event in events:
-                            source_index = int(await conn.fetchval(f"SELECT nextval('{self._sequence}')"))
-                            await asyncio.wait_for(
+                            result = await asyncio.wait_for(
                                 conn.execute(
                                     sql,
-                                    source_index,
+                                    event.event_id,
                                     self._normalize_event_time(event.event_time),
                                     event.account_id,
                                     event.apikey_id,
                                     event.charge_item,
-                                    max(0, int(event.quantity)),
+                                    event.quantity,
                                     event.request_id,
                                     event.label or "",
                                 ),
                                 timeout=self._write_timeout_s,
                             )
-                return
+                            if str(result).strip().endswith(" 1"):
+                                inserted_event_ids.append(event.event_id)
+                return inserted_event_ids
             except Exception as e:
                 last_error = e
                 if attempt < 2:
@@ -363,59 +324,29 @@ class PostgresUsageStore:
             raise last_error
         raise RuntimeError("usage_event write failed with unknown error")
 
-    async def write_event(self, event: UsageEvent) -> None:
-        await self.write_events([event])
+    async def write_event(self, event: UsageEvent) -> list[str]:
+        return await self.write_events([event])
 
-    async def write_events(self, events: list[UsageEvent]) -> None:
-        normalized = self._validate_events(events)
-        try:
-            await self._write_events_to_pg(normalized)
-        except Exception as pg_error:
-            try:
-                await self._enqueue_outbox(normalized, pg_error)
-            except Exception as outbox_error:
-                logger.error(
-                    "usage_event persistence failed: request_ids=%s pg_err=%s outbox_err=%s",
-                    [event.request_id for event in normalized],
-                    pg_error,
-                    outbox_error,
-                )
-                raise RuntimeError("usage_event persistence failed") from outbox_error
+    async def write_events(self, events: list[UsageEvent]) -> list[str]:
+        return await self._write_events_to_pg(self._normalize_events(events))
 
-    async def flush_outbox(self, limit: int = _OUTBOX_BATCH_SIZE) -> int:
-        await self._ensure_outbox()
-        rows = await asyncio.to_thread(self._outbox_fetch_batch, max(1, int(limit)))
-        if not rows:
-            return 0
-        events = [
-            UsageEvent(
-                account_id=str(row["account_id"]),
-                apikey_id=str(row["apikey_id"]),
-                charge_item=str(row["charge_item"]),
-                quantity=int(row["quantity"]),
-                request_id=str(row["request_id"]),
-                label=str(row["label"] or ""),
-                event_time=datetime.fromisoformat(str(row["event_time"]).replace("Z", "+00:00")),
+    async def flush_outbox(self, limit: int = 0) -> int:
+        _ = limit
+        return 0
+
+    async def delete_events(self, events: list[UsageEvent]) -> None:
+        await self.delete_event_ids(self._event_ids_for_delete(events))
+
+    async def delete_event_ids(self, event_ids: list[str]) -> None:
+        normalized = [str(event_id).strip() for event_id in event_ids if str(event_id).strip()]
+        if not normalized:
+            return
+        pool = await self._ensure_pool()
+        async with pool.acquire() as conn:
+            await asyncio.wait_for(
+                conn.execute(f"DELETE FROM {self._table} WHERE event_id = ANY($1::text[])", normalized),
+                timeout=self._write_timeout_s,
             )
-            for row in rows
-        ]
-        await self._write_events_to_pg(events)
-        await asyncio.to_thread(self._outbox_delete_ids, [int(row["id"]) for row in rows])
-        return len(rows)
-
-    async def _flush_outbox_loop(self) -> None:
-        while not self._close_event.is_set():
-            wait_s = self._flush_interval_s
-            try:
-                flushed = await self.flush_outbox(limit=_OUTBOX_BATCH_SIZE)
-                if flushed > 0:
-                    wait_s = 0.2
-            except Exception as e:
-                logger.warning("usage outbox flush failed: %s", e)
-            try:
-                await asyncio.wait_for(self._close_event.wait(), timeout=wait_s)
-            except asyncio.TimeoutError:
-                continue
 
     def _build_where(
         self,
@@ -450,7 +381,7 @@ class PostgresUsageStore:
         query_sql = (
             "SELECT source_index, event_time, account_id, apikey_id, charge_item, quantity, request_id, label "
             f"FROM {self._table}{where_sql} "
-            f"ORDER BY event_time DESC LIMIT ${len(args) + 1} OFFSET ${len(args) + 2}"
+            f"ORDER BY event_time DESC, source_index DESC LIMIT ${len(args) + 1} OFFSET ${len(args) + 2}"
         )
 
         async with pool.acquire() as conn:
@@ -493,309 +424,10 @@ class PostgresUsageStore:
         return int(val) == 1
 
     async def close(self) -> None:
-        self._close_event.set()
-        if self._flush_task is not None:
-            self._flush_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._flush_task
-            self._flush_task = None
-        if self._outbox_ready:
-            if self._pool is None:
-                try:
-                    await self._ensure_pool(start_flush_task=False)
-                except Exception as e:
-                    logger.warning("usage outbox final drain could not initialize pool during shutdown: %s", e)
-            if self._pool is not None:
-                try:
-                    while await self.flush_outbox(limit=_OUTBOX_BATCH_SIZE):
-                        pass
-                except Exception as e:
-                    logger.warning("usage outbox final drain failed during shutdown: %s", e)
         if self._pool is not None:
-            await self._pool.close()
-            self._pool = None
-
-
-class JsonlUsageStore:
-    def __init__(self, *, path: str | Path):
-        self._path = Path(path)
-        self._lock = asyncio.Lock()
-        self._loaded = False
-        self._records: list[dict] = []
-        self._known_identities: set[tuple[str, str, str]] = set()
-        self._next_source_index = 1
-        self._stat_size = 0
-        self._stat_mtime_ns = 0
-
-    @staticmethod
-    def _normalize_event_time(ts: datetime) -> datetime:
-        if ts.tzinfo is None:
-            return ts.replace(tzinfo=timezone.utc)
-        return ts.astimezone(timezone.utc)
-
-    @staticmethod
-    def _to_iso8601(ts: datetime) -> str:
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        return ts.astimezone(timezone.utc).isoformat()
-
-    @staticmethod
-    def _event_identity(event: UsageEvent) -> tuple[str, str, str]:
-        return (str(event.request_id), str(event.charge_item), str(event.label or ""))
-
-    def _validate_events(self, events: list[UsageEvent]) -> list[UsageEvent]:
-        normalized = list(events)
-        if not normalized:
-            raise ValueError("write_events requires at least one event")
-        seen: set[tuple[str, str, str]] = set()
-        for event in normalized:
-            request_id = str(event.request_id or "").strip()
-            if not request_id:
-                raise ValueError("usage_event request_id must be non-empty")
-            key = self._event_identity(event)
-            if key in seen:
-                raise ValueError(f"duplicate usage_event identity in batch: {key!r}")
-            seen.add(key)
-        return normalized
-
-    def _coerce_record(self, payload: dict, *, source_name: str, line_no: int) -> dict:
-        try:
-            source_index = int(payload["source_index"])
-            event_time = self._to_iso8601(
-                datetime.fromisoformat(str(payload["event_time"]).replace("Z", "+00:00"))
-            )
-            record = {
-                "source_index": source_index,
-                "event_time": event_time,
-                "account_id": str(payload["account_id"]),
-                "apikey_id": str(payload["apikey_id"]),
-                "charge_item": str(payload["charge_item"]),
-                "quantity": int(payload["quantity"]),
-                "request_id": str(payload["request_id"]),
-                "label": str(payload.get("label") or ""),
-            }
-        except Exception as e:
-            raise ValueError(f"invalid usage_event record at {source_name}:{line_no}") from e
-        return record
-
-    def _apply_stream_record_locked(self, record: dict) -> None:
-        identity = (
-            record["request_id"],
-            record["charge_item"],
-            record["label"],
-        )
-        if identity in self._known_identities:
-            logger.warning(
-                "skipping duplicate usage_event JSONL row: request_id=%s charge_item=%s label=%s",
-                record["request_id"],
-                record["charge_item"],
-                record["label"],
-            )
-            return
-        self._records.append(record)
-        self._known_identities.add(identity)
-        self._next_source_index = max(self._next_source_index, int(record["source_index"]) + 1)
-
-    def _load_from_stream_locked(self, stream) -> None:
-        self._records = []
-        self._known_identities = set()
-        self._next_source_index = 1
-        stream.seek(0)
-        for line_no, raw_line in enumerate(stream, start=1):
-            line = raw_line.decode("utf-8").strip()
-            if not line:
-                continue
-            try:
-                payload = json.loads(line)
-                record = self._coerce_record(payload, source_name=str(self._path), line_no=line_no)
-            except Exception as e:
-                logger.warning("skipping malformed usage_event JSONL row: %s", e)
-                continue
-            self._apply_stream_record_locked(record)
-        stat = os.fstat(stream.fileno())
-        self._stat_size = int(stat.st_size)
-        self._stat_mtime_ns = int(stat.st_mtime_ns)
-        self._loaded = True
-
-    def _refresh_from_stream_locked(self, stream) -> None:
-        stat = os.fstat(stream.fileno())
-        size = int(stat.st_size)
-        mtime_ns = int(stat.st_mtime_ns)
-        if not self._loaded or size < self._stat_size:
-            self._load_from_stream_locked(stream)
-            return
-        if size == self._stat_size:
-            if mtime_ns == self._stat_mtime_ns:
-                return
-            # Same-size rewrites break append-only assumptions; rebuild from start.
-            self._load_from_stream_locked(stream)
-            return
-        stream.seek(self._stat_size)
-        start_line_no = len(self._records) + 1
-        for line_no, raw_line in enumerate(stream, start=start_line_no):
-            line = raw_line.decode("utf-8").strip()
-            if not line:
-                continue
-            try:
-                payload = json.loads(line)
-                record = self._coerce_record(payload, source_name=str(self._path), line_no=line_no)
-            except Exception as e:
-                logger.warning("skipping malformed usage_event JSONL row: %s", e)
-                continue
-            self._apply_stream_record_locked(record)
-        self._stat_size = size
-        self._stat_mtime_ns = mtime_ns
-        self._loaded = True
-
-    def _reload_from_disk_locked(self) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        with self._path.open("a+b") as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_SH)
-            try:
-                self._refresh_from_stream_locked(f)
-            finally:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-
-    def _write_events_to_disk_locked(self, events: list[UsageEvent]) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        with self._path.open("a+b") as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-            try:
-                self._refresh_from_stream_locked(f)
-                fresh_records: list[dict] = []
-                next_source_index = self._next_source_index
-                for event in events:
-                    identity = self._event_identity(event)
-                    if identity in self._known_identities:
-                        continue
-                    record = {
-                        "source_index": next_source_index,
-                        "event_time": self._to_iso8601(self._normalize_event_time(event.event_time)),
-                        "account_id": str(event.account_id),
-                        "apikey_id": str(event.apikey_id),
-                        "charge_item": str(event.charge_item),
-                        "quantity": max(0, int(event.quantity)),
-                        "request_id": str(event.request_id),
-                        "label": str(event.label or ""),
-                    }
-                    next_source_index += 1
-                    fresh_records.append(record)
-                if fresh_records:
-                    self._append_records_to_stream_locked(f, fresh_records)
-                    stat = os.fstat(f.fileno())
-                    for record in fresh_records:
-                        self._apply_stream_record_locked(record)
-                    self._stat_size = int(stat.st_size)
-                    self._stat_mtime_ns = int(stat.st_mtime_ns)
-                    self._loaded = True
-            finally:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-
-    def _disk_state_changed_locked(self) -> bool:
-        if not self._loaded:
-            return True
-        try:
-            stat = self._path.stat()
-        except FileNotFoundError:
-            return self._stat_size != 0 or self._stat_mtime_ns != 0
-        return int(stat.st_size) != self._stat_size or int(stat.st_mtime_ns) != self._stat_mtime_ns
-
-    async def _ensure_loaded(self) -> None:
-        async with self._lock:
-            if self._disk_state_changed_locked():
-                await asyncio.to_thread(self._reload_from_disk_locked)
-
-    def _append_records_to_stream_locked(self, stream, records: list[dict]) -> None:
-        payload = "".join(
-            json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n" for record in records
-        ).encode("utf-8")
-        stream.seek(0, os.SEEK_END)
-        start_offset = stream.tell()
-        try:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        except Exception:
             with suppress(Exception):
-                stream.seek(start_offset)
-                stream.truncate()
-                stream.flush()
-                os.fsync(stream.fileno())
-            raise
-
-    @staticmethod
-    def _record_matches_since(record: dict, since: datetime | None) -> bool:
-        if since is None:
-            return True
-        record_dt = datetime.fromisoformat(str(record["event_time"]).replace("Z", "+00:00"))
-        if record_dt.tzinfo is None:
-            record_dt = record_dt.replace(tzinfo=timezone.utc)
-        return record_dt >= (
-            since if since.tzinfo is not None else since.replace(tzinfo=timezone.utc)
-        )
-
-    async def write_event(self, event: UsageEvent) -> None:
-        await self.write_events([event])
-
-    async def write_events(self, events: list[UsageEvent]) -> None:
-        normalized = self._validate_events(events)
-        async with self._lock:
-            await asyncio.to_thread(self._write_events_to_disk_locked, normalized)
-
-    async def flush_outbox(self, limit: int = _OUTBOX_BATCH_SIZE) -> int:
-        return 0
-
-    async def query_logs(
-        self,
-        since: datetime | None = None,
-        account_id: str | None = None,
-        limit: int = 100,
-        offset: int = 0,
-    ) -> tuple[list[dict], int, bool]:
-        await self._ensure_loaded()
-        async with self._lock:
-            filtered = [
-                dict(record)
-                for record in self._records
-                if (account_id is None or record["account_id"] == account_id)
-                and self._record_matches_since(record, since)
-            ]
-        filtered.sort(key=lambda record: (record["event_time"], int(record["source_index"])), reverse=True)
-        total_count = len(filtered)
-        page = filtered[int(offset) : int(offset) + int(limit)]
-        has_more = int(offset) + int(limit) < total_count
-        return page, total_count, has_more
-
-    async def get_account_summary(self, account_id: str) -> dict:
-        await self._ensure_loaded()
-        async with self._lock:
-            records = [record for record in self._records if record["account_id"] == account_id]
-        charge_item_totals: dict[str, int] = {}
-        total_quantity = 0
-        for record in records:
-            quantity = int(record["quantity"])
-            total_quantity += quantity
-            charge_item = str(record["charge_item"])
-            charge_item_totals[charge_item] = charge_item_totals.get(charge_item, 0) + quantity
-        return {"total_quantity": total_quantity, "charge_item_totals": charge_item_totals}
-
-    async def health_check(self) -> bool:
-        try:
-            await self._ensure_loaded()
-            async with self._lock:
-                self._path.parent.mkdir(parents=True, exist_ok=True)
-                if not self._path.exists():
-                    self._path.touch(exist_ok=True)
-                    stat = self._path.stat()
-                    self._stat_size = int(stat.st_size)
-                    self._stat_mtime_ns = int(stat.st_mtime_ns)
-            return True
-        except Exception as e:
-            logger.warning("usage_event JSONL health check failed: %s", e)
-            return False
-
-    async def close(self) -> None:
-        return None
+                await self._pool.close()
+            self._pool = None
 
 
 _usage_store: UsageStore | None = None
@@ -803,25 +435,19 @@ _usage_store_guard = asyncio.Lock()
 
 
 def _build_usage_store() -> UsageStore:
-    path = _default_jsonl_usage_path()
     backend = str(config.usage_backend or "postgres").strip().lower()
-    dsn = _usage_pg_dsn()
-    default_tmp_path = Path("/tmp/tinker_usage/usage_event.jsonl")
-    if backend and backend != "postgres":
+    if backend != "postgres":
         raise ValueError(f"Unsupported usage backend {backend!r}; only 'postgres' is accepted")
-    if dsn:
-        logger.warning(
-            "usage PG config is deprecated and ignored; JSONL usage_event store remains active at %s",
-            path,
-        )
-    else:
-        logger.info("usage JSONL store active at %s", path)
-    if path == default_tmp_path and dsn:
-        logger.warning(
-            "usage JSONL store is using default tmp path %s; set TINKER_USAGE_LOG_DIR explicitly for a shared pull target",
-            path,
-        )
-    return JsonlUsageStore(path=path)
+    dsn = _usage_pg_dsn()
+    if not dsn:
+        raise ValueError("TINKER_USAGE_PG_DSN or TINKER_USAGE_PG_HOST is required for postgres usage backend")
+    return PostgresUsageStore(
+        dsn=dsn,
+        pool_min=config.usage_pg_pool_min,
+        pool_max=config.usage_pg_pool_max,
+        write_timeout_ms=config.usage_write_timeout_ms,
+        table=config.usage_pg_table,
+    )
 
 
 async def get_usage_store() -> UsageStore:
@@ -834,8 +460,43 @@ async def get_usage_store() -> UsageStore:
     return _usage_store
 
 
+async def _write_usage_events_safely(events: list[UsageEvent]) -> None:
+    try:
+        usage_store = await get_usage_store()
+        await usage_store.write_events(events)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception(
+            "usage_event async persistence failed after user result completed: request_ids=%s",
+            [event.request_id for event in events],
+        )
+
+
+def schedule_usage_events(events: list[UsageEvent]) -> None:
+    normalized = list(events)
+    if not normalized:
+        return
+    if len(_PENDING_WRITE_TASKS) >= _MAX_PENDING_WRITE_TASKS:
+        logger.error(
+            "usage_event async persistence dropped because pending task limit is full: pending=%s limit=%s request_ids=%s",
+            len(_PENDING_WRITE_TASKS),
+            _MAX_PENDING_WRITE_TASKS,
+            [event.request_id for event in normalized],
+        )
+        return
+    task = asyncio.create_task(_write_usage_events_safely(normalized))
+    _PENDING_WRITE_TASKS.add(task)
+    task.add_done_callback(_PENDING_WRITE_TASKS.discard)
+
+
 async def close_usage_store() -> None:
     global _usage_store
+    for task in list(_PENDING_WRITE_TASKS):
+        task.cancel()
+    if _PENDING_WRITE_TASKS:
+        await asyncio.gather(*list(_PENDING_WRITE_TASKS), return_exceptions=True)
+        _PENDING_WRITE_TASKS.clear()
     async with _usage_store_guard:
         if _usage_store is not None:
             await _usage_store.close()
