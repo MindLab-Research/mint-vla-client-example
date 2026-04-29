@@ -181,7 +181,7 @@ def test_openpi_fast_action_worker_act_falls_back_on_missing_action_prefix() -> 
     assert np.count_nonzero(np.asarray(result["actions"]["data"], dtype=np.float32)) == 0
 
 
-def test_openpi_fast_action_worker_act_fails_on_strict_decode_shape_mismatch() -> None:
+def test_openpi_fast_action_worker_act_fails_on_strict_decode_short_payload() -> None:
     from tinker_server.backend.openpi_fast_action_worker import OpenPIFastActionSession
 
     session = OpenPIFastActionSession.__new__(OpenPIFastActionSession)
@@ -225,7 +225,7 @@ def test_openpi_fast_action_worker_act_fails_on_strict_decode_shape_mismatch() -
         _act_tokens_to_paligemma_tokens=lambda tokens: tokens,
     )
 
-    with pytest.raises(RuntimeError, match="decoded action token count is not divisible"):
+    with pytest.raises(RuntimeError, match="decoded action token count is smaller than the configured action shape"):
         session.act({"observation": {"chunks": []}, "extra_inputs": {"state": {"data": [0.0], "shape": [1], "dtype": "float32"}}})
 
 
@@ -264,6 +264,50 @@ def test_openpi_fast_action_worker_extracts_action_tokens_without_text_roundtrip
     actions = session._extract_actions_strict(np.asarray([10, 11, 101, 102, 99], dtype=np.int32))
 
     assert actions.shape == (1, 7)
+
+
+def test_openpi_fast_action_worker_truncates_excess_decoded_dct_tokens(monkeypatch) -> None:
+    from tinker_server.backend.openpi_fast_action_worker import OpenPIFastActionSession
+
+    warnings: list[str] = []
+
+    session = OpenPIFastActionSession.__new__(OpenPIFastActionSession)
+    session._action_horizon = 1
+    session._action_dim = 7
+    session._scipy_idct = lambda arr, axis=0, norm="ortho": arr
+    session._action_prefix_tokens = np.asarray([10, 11], dtype=np.int32)
+    session._pipe_tokens = np.asarray([99], dtype=np.int32)
+
+    class _FakePaligemmaTokenizer:
+        @staticmethod
+        def decode(tokens):
+            _ = tokens
+            return "Action: <loc0001><loc0002>|"
+
+    class _FakeBpeTokenizer:
+        @staticmethod
+        def decode(tokens):
+            assert tokens == [1, 2, 3]
+            return "ABCDEFGH"
+
+    session._tokenizer = SimpleNamespace(
+        _paligemma_tokenizer=_FakePaligemmaTokenizer(),
+        _fast_tokenizer=SimpleNamespace(bpe_tokenizer=_FakeBpeTokenizer(), min_token=0, scale=1),
+        _act_tokens_to_paligemma_tokens=lambda tokens: np.asarray([1, 2, 3], dtype=np.int32),
+    )
+    monkeypatch.setattr(
+        "tinker_server.backend.openpi_fast_action_worker.logger.warning",
+        lambda msg, *args: warnings.append(msg % args if args else msg),
+    )
+
+    actions = session._extract_actions_strict(np.asarray([10, 11, 101, 102, 99], dtype=np.int32))
+
+    assert actions.shape == (1, 7)
+    assert actions.reshape(-1).tolist() == [65.0, 66.0, 67.0, 68.0, 69.0, 70.0, 71.0]
+    assert warnings == [
+        "OpenPI FAST decoded action token count exceeds expected action shape; truncating decoded DCT prefix "
+        "(count=8 expected=7 action_dim=7 sampled_token_count=5 raw_action_token_count=2 has_pipe=True)"
+    ]
 
 
 def test_openpi_fast_action_worker_act_bounds_decoding_to_expected_suffix_len() -> None:

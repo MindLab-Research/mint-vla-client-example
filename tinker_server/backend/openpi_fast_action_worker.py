@@ -307,8 +307,28 @@ class OpenPIFastActionSession:
         )
         decoded_action_text = str(bpe_tokenizer.decode(fast_action_tokens.tolist()))
         decoded_dct_coeff = np.asarray(list(map(ord, decoded_action_text)), dtype=np.float32) + float(min_token)
+        expected_count = self._action_horizon * self._action_dim
+        if decoded_dct_coeff.size < expected_count:
+            raise RuntimeError(
+                "OpenPI FAST decoded action token count is smaller than the configured action shape "
+                f"(count={decoded_dct_coeff.size}, expected={expected_count}, action_dim={self._action_dim}, "
+                f"sampled_token_count={action_tokens.size}, raw_action_token_count={raw_action_tokens.size}, "
+                f"has_pipe={has_pipe}, action_text_prefix={action_text[:120]!r})"
+            )
+        if decoded_dct_coeff.size > expected_count:
+            logger.warning(
+                "OpenPI FAST decoded action token count exceeds expected action shape; truncating decoded DCT prefix "
+                "(count=%s expected=%s action_dim=%s sampled_token_count=%s raw_action_token_count=%s has_pipe=%s)",
+                decoded_dct_coeff.size,
+                expected_count,
+                self._action_dim,
+                action_tokens.size,
+                raw_action_tokens.size,
+                has_pipe,
+            )
+            decoded_dct_coeff = decoded_dct_coeff[:expected_count]
         try:
-            decoded_dct_coeff = decoded_dct_coeff.reshape(-1, self._action_dim)
+            decoded_dct_coeff = decoded_dct_coeff.reshape(self._action_horizon, self._action_dim)
         except ValueError as exc:
             raise RuntimeError(
                 "OpenPI FAST decoded action token count is not divisible by the configured action_dim "
@@ -316,15 +336,6 @@ class OpenPIFastActionSession:
                 f"sampled_token_count={action_tokens.size}, raw_action_token_count={raw_action_tokens.size}, "
                 f"has_pipe={has_pipe}, action_text_prefix={action_text[:120]!r})"
             ) from exc
-
-        expected_shape = (self._action_horizon, self._action_dim)
-        if decoded_dct_coeff.shape != expected_shape:
-            raise RuntimeError(
-                "OpenPI FAST decoded action token matrix has the wrong shape "
-                f"(got={decoded_dct_coeff.shape}, expected={expected_shape}, "
-                f"sampled_token_count={action_tokens.size}, raw_action_token_count={raw_action_tokens.size}, "
-                f"has_pipe={has_pipe}, action_text_prefix={action_text[:120]!r})"
-            )
         return np.asarray(
             self._scipy_idct(decoded_dct_coeff / float(scale), axis=0, norm="ortho"),
             dtype=np.float32,
