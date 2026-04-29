@@ -13,17 +13,25 @@ CREATE TABLE IF NOT EXISTS usage_event (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-ALTER TABLE usage_event
-    ALTER COLUMN source_index SET DEFAULT nextval('usage_event_source_index_seq'::regclass);
-
+WITH sequence_state AS (
+    SELECT
+        COALESCE((SELECT MAX(source_index) FROM usage_event), 0) AS max_source_index,
+        (SELECT last_value FROM usage_event_source_index_seq) AS seq_last_value
+)
 SELECT setval(
     'usage_event_source_index_seq',
-    GREATEST(
-        (SELECT COALESCE(MAX(source_index), 0) FROM usage_event),
-        (SELECT last_value FROM usage_event_source_index_seq)
-    ),
-    true
-);
+    CASE
+        WHEN max_source_index > 0 THEN GREATEST(max_source_index, seq_last_value)
+        WHEN seq_last_value > 1 THEN seq_last_value
+        ELSE 1
+    END,
+    CASE
+        WHEN max_source_index > 0 THEN true
+        WHEN seq_last_value > 1 THEN true
+        ELSE false
+    END
+)
+FROM sequence_state;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_event_event_id_uniq
     ON usage_event (event_id);

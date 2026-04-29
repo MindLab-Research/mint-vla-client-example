@@ -17,6 +17,7 @@ from .config import config
 logger = logging.getLogger(__name__)
 
 ChargeItem = Literal["sampling", "inference", "training", "checkpoint_storage"]
+_ALLOWED_CHARGE_ITEMS = {"sampling", "inference", "training", "checkpoint_storage"}
 _SQL_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _EVENT_ID_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "mindlab.mint.billing.usage_event.v1")
 _PENDING_WRITE_TASKS: set[asyncio.Task] = set()
@@ -151,6 +152,8 @@ class PostgresUsageStore:
             request_id = str(event.request_id or "").strip()
             charge_item = str(event.charge_item or "").strip()
             label = str(event.label or "").strip()
+            if charge_item not in _ALLOWED_CHARGE_ITEMS:
+                raise ValueError(f"unsupported usage_event charge_item: {charge_item!r}")
             if not request_id:
                 raise ValueError("usage_event request_id must be non-empty")
             quantity = int(event.quantity)
@@ -228,36 +231,83 @@ class PostgresUsageStore:
         if pool is None:
             raise RuntimeError("usage pool is not initialized")
         async with pool.acquire() as conn:
-            if self._schema != "public":
-                await conn.execute(f"CREATE SCHEMA IF NOT EXISTS {self._schema}")
-            await conn.execute(f"CREATE SEQUENCE IF NOT EXISTS {self._sequence} AS BIGINT")
-            await conn.execute(f"ALTER TABLE {self._table} ADD COLUMN IF NOT EXISTS event_id TEXT")
-            null_event_ids = await conn.fetchval(f"SELECT COUNT(*) FROM {self._table} WHERE event_id IS NULL")
-            if int(null_event_ids or 0) > 0:
-                raise RuntimeError(
-                    f"{self._table} contains usage_event rows with NULL event_id; "
-                    "run backend/db/migrations/004_direct_pg_usage_event_id.sql before starting MinT direct-PG billing"
-                )
-            await conn.execute(f"ALTER TABLE {self._table} ALTER COLUMN event_id SET NOT NULL")
-            await conn.execute(
-                f"ALTER TABLE {self._table} ALTER COLUMN source_index SET DEFAULT nextval('{self._sequence}'::regclass)"
-            )
-            await conn.execute(
-                f"""
-                SELECT setval(
-                    '{self._sequence}',
-                    GREATEST(
-                        (SELECT COALESCE(MAX(source_index), 0) FROM {self._table}),
-                        (SELECT last_value FROM {self._sequence})
-                    ),
-                    true
-                )
-                """
-            )
-            await conn.execute(
-                f"CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS {self._dedupe_index} ON {self._table} (event_id)"
-            )
+            await self._assert_pg_schema_ready(conn)
             await self._assert_event_id_unique_index(conn)
+
+    async def _assert_pg_schema_ready(self, conn) -> None:
+        required_columns = [
+            "source_index",
+            "event_id",
+            "event_time",
+            "account_id",
+            "apikey_id",
+            "charge_item",
+            "quantity",
+            "request_id",
+            "label",
+            "created_at",
+        ]
+        required_not_null = [
+            "source_index",
+            "event_id",
+            "event_time",
+            "account_id",
+            "apikey_id",
+            "charge_item",
+            "quantity",
+            "request_id",
+            "label",
+        ]
+        migration_hint = "run backend/db/migrations/004_direct_pg_usage_event_id.sql before starting MinT direct-PG billing"
+        table_exists = await conn.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema = $1
+                  AND table_name = $2
+            )
+            """,
+            self._schema,
+            self._name,
+        )
+        if not table_exists:
+            raise RuntimeError(f"{self._table} is missing; {migration_hint}")
+
+        column_count = await conn.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM information_schema.columns
+            WHERE table_schema = $1
+              AND table_name = $2
+              AND column_name = ANY($3::text[])
+            """,
+            self._schema,
+            self._name,
+            required_columns,
+        )
+        if int(column_count or 0) != len(required_columns):
+            raise RuntimeError(f"{self._table} schema is missing direct-PG usage_event columns; {migration_hint}")
+
+        not_null_count = await conn.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM information_schema.columns
+            WHERE table_schema = $1
+              AND table_name = $2
+              AND column_name = ANY($3::text[])
+              AND is_nullable = 'NO'
+            """,
+            self._schema,
+            self._name,
+            required_not_null,
+        )
+        if int(not_null_count or 0) != len(required_not_null):
+            raise RuntimeError(f"{self._table} schema has nullable direct-PG usage_event columns; {migration_hint}")
+
+        null_event_ids = await conn.fetchval(f"SELECT COUNT(*) FROM {self._table} WHERE event_id IS NULL")
+        if int(null_event_ids or 0) > 0:
+            raise RuntimeError(f"{self._table} contains usage_event rows with NULL event_id; {migration_hint}")
 
     async def _assert_event_id_unique_index(self, conn) -> None:
         exists = await conn.fetchval(

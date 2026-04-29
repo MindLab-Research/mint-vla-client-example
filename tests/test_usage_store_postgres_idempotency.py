@@ -50,6 +50,12 @@ class _FakeConn:
         text = sql.strip()
         if text == "SELECT 1":
             return 1
+        if "FROM information_schema.tables" in text:
+            return bool(self._state.get("usage_event_table_exists", True))
+        if "FROM information_schema.columns" in text and "is_nullable = 'NO'" in text:
+            return int(self._state.get("usage_event_not_null_column_count", 9))
+        if "FROM information_schema.columns" in text:
+            return int(self._state.get("usage_event_column_count", 10))
         if "FROM pg_index" in text:
             return bool(self._state.get("event_id_unique_index", True))
         if "WHERE event_id IS NULL" in text:
@@ -122,6 +128,9 @@ def _state(**overrides):
         "nextval": 1000,
         "seen_event_ids": set(),
         "schema_statements": [],
+        "usage_event_table_exists": True,
+        "usage_event_column_count": 10,
+        "usage_event_not_null_column_count": 9,
     }
     state.update(overrides)
     return state
@@ -228,8 +237,7 @@ def test_postgres_usage_store_retry_does_not_use_local_source_index(monkeypatch)
 
         assert len(state["rows"]) == 1
         assert state["rows"][0]["source_index"] == 1001
-        assert any("ALTER COLUMN source_index SET DEFAULT nextval" in stmt for stmt in state["schema_statements"])
-        assert not any(stmt.startswith("CREATE TABLE") for stmt in state["schema_statements"])
+        assert state["schema_statements"] == []
 
     asyncio.run(_run())
 
@@ -513,5 +521,52 @@ def test_schedule_usage_events_rejects_new_tasks_after_close_started(monkeypatch
         usage_store_module.schedule_usage_events([event])
         assert len(usage_store_module._PENDING_WRITE_TASKS) == 0
         usage_store_module._USAGE_STORE_CLOSING = False
+
+    asyncio.run(_run())
+
+
+def test_postgres_usage_store_rejects_unsupported_charge_item(monkeypatch):
+    state = _state()
+    _install_fake_asyncpg(monkeypatch, state)
+
+    store = PostgresUsageStore(dsn="postgresql://fake")
+    event = UsageEvent(
+        account_id="aaaaaaaaaaaaaaaaaaaaaaaa",
+        apikey_id="bbbbbbbbbbbbbbbbbbbbbbbb",
+        charge_item="unsupported",
+        quantity=1,
+        request_id="req-bad-charge",
+        label="route=training.train_step",
+    )
+
+    async def _run():
+        with pytest.raises(ValueError, match="unsupported usage_event charge_item"):
+            await store.write_event(event)
+        await store.close()
+        assert state["rows"] == []
+        assert state["schema_statements"] == []
+
+    asyncio.run(_run())
+
+
+def test_postgres_usage_store_schema_check_is_read_only_when_migration_missing(monkeypatch):
+    state = _state(usage_event_column_count=9)
+    _install_fake_asyncpg(monkeypatch, state)
+
+    store = PostgresUsageStore(dsn="postgresql://fake")
+    event = UsageEvent(
+        account_id="aaaaaaaaaaaaaaaaaaaaaaaa",
+        apikey_id="bbbbbbbbbbbbbbbbbbbbbbbb",
+        charge_item="training",
+        quantity=1,
+        request_id="req-missing-schema",
+        label="route=training.train_step",
+    )
+
+    async def _run():
+        with pytest.raises(RuntimeError, match="missing direct-PG usage_event columns"):
+            await store.write_event(event)
+        await store.close()
+        assert state["schema_statements"] == []
 
     asyncio.run(_run())
