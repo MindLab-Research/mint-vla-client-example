@@ -143,8 +143,10 @@ def test_openpi_fast_action_worker_dispatch_cleans_up_replaced_session(monkeypat
     assert session is None
 
 
-def test_openpi_fast_action_worker_act_fails_on_missing_action_prefix() -> None:
+def test_openpi_fast_action_worker_act_falls_back_on_missing_action_prefix() -> None:
     from tinker_server.backend.openpi_fast_action_worker import OpenPIFastActionSession
+
+    fallback_calls: list[tuple[list[int], int, int]] = []
 
     session = OpenPIFastActionSession.__new__(OpenPIFastActionSession)
     session._observation_from_payload = lambda payload: {"payload": payload}
@@ -164,15 +166,19 @@ def test_openpi_fast_action_worker_act_fails_on_missing_action_prefix() -> None:
     class _FakeTokenizer:
         _paligemma_tokenizer = SimpleNamespace(decode=lambda tokens: "bad output without action prefix")
 
-        def extract_actions(self, *args, **kwargs):
-            raise AssertionError("extract_actions should not run when the sampled suffix is malformed")
+        def extract_actions(self, tokens, action_horizon, action_dim):
+            fallback_calls.append((np.asarray(tokens, dtype=np.int32).tolist(), action_horizon, action_dim))
+            return np.zeros((action_horizon, action_dim), dtype=np.float32)
 
     session._tokenizer = _FakeTokenizer()
     session._action_horizon = 10
     session._action_dim = 7
 
-    with pytest.raises(RuntimeError, match="missing 'Action: ' prefix"):
-        session.act({"observation": {"chunks": []}, "extra_inputs": {"state": {"data": [0.0], "shape": [1], "dtype": "float32"}}})
+    result = session.act({"observation": {"chunks": []}, "extra_inputs": {"state": {"data": [0.0], "shape": [1], "dtype": "float32"}}})
+
+    assert fallback_calls == [([1], 10, 7)]
+    assert result["actions"]["shape"] == [10, 7]
+    assert np.count_nonzero(np.asarray(result["actions"]["data"], dtype=np.float32)) == 0
 
 
 def test_openpi_fast_action_worker_act_fails_on_strict_decode_shape_mismatch() -> None:
@@ -223,6 +229,43 @@ def test_openpi_fast_action_worker_act_fails_on_strict_decode_shape_mismatch() -
         session.act({"observation": {"chunks": []}, "extra_inputs": {"state": {"data": [0.0], "shape": [1], "dtype": "float32"}}})
 
 
+def test_openpi_fast_action_worker_extracts_action_tokens_without_text_roundtrip() -> None:
+    from tinker_server.backend.openpi_fast_action_worker import OpenPIFastActionSession
+
+    session = OpenPIFastActionSession.__new__(OpenPIFastActionSession)
+    session._action_horizon = 1
+    session._action_dim = 7
+    session._scipy_idct = lambda arr, axis=0, norm="ortho": arr
+    session._action_prefix_tokens = np.asarray([10, 11], dtype=np.int32)
+    session._pipe_tokens = np.asarray([99], dtype=np.int32)
+
+    class _FakePaligemmaTokenizer:
+        @staticmethod
+        def decode(tokens):
+            _ = tokens
+            return "Action: <loc0001><loc0002>|"
+
+        @staticmethod
+        def encode(text):
+            raise AssertionError("strict decode should not re-encode action text")
+
+    class _FakeBpeTokenizer:
+        @staticmethod
+        def decode(tokens):
+            assert tokens == [1, 2, 3, 4, 5, 6, 7]
+            return "ABCDEFG"
+
+    session._tokenizer = SimpleNamespace(
+        _paligemma_tokenizer=_FakePaligemmaTokenizer(),
+        _fast_tokenizer=SimpleNamespace(bpe_tokenizer=_FakeBpeTokenizer(), min_token=0, scale=1),
+        _act_tokens_to_paligemma_tokens=lambda tokens: np.asarray([1, 2, 3, 4, 5, 6, 7], dtype=np.int32),
+    )
+
+    actions = session._extract_actions_strict(np.asarray([10, 11, 101, 102, 99], dtype=np.int32))
+
+    assert actions.shape == (1, 7)
+
+
 def test_openpi_fast_action_worker_act_bounds_decoding_to_expected_suffix_len() -> None:
     from tinker_server.backend.openpi_fast_action_worker import OpenPIFastActionSession
 
@@ -268,6 +311,42 @@ def test_openpi_fast_action_worker_act_bounds_decoding_to_expected_suffix_len() 
             "temperature": 0.3,
         }
     ]
+    assert result["actions"]["shape"] == [10, 7]
+
+
+def test_openpi_fast_action_worker_trims_sampled_tokens_at_first_eos() -> None:
+    from tinker_server.backend.openpi_fast_action_worker import OpenPIFastActionSession
+
+    seen_tokens: list[np.ndarray] = []
+
+    session = OpenPIFastActionSession.__new__(OpenPIFastActionSession)
+    session._observation_from_payload = lambda payload: {"payload": payload}
+    session._jax = SimpleNamespace(
+        random=SimpleNamespace(
+            split=lambda rng: ("next-rng", "sample-rng"),
+            key_data=lambda rng: np.asarray([0, 0], dtype=np.uint32),
+        )
+    )
+    session._rng = "seed-rng"
+    session._sample_counter = 0
+    session._action_token_budget = 8
+    session._action_horizon = 10
+    session._action_dim = 7
+    session._paligemma_eos_id = 1
+    session._model = SimpleNamespace(
+        sample_actions=lambda rng, observation, max_decoding_steps=None, temperature=0.0: np.asarray(
+            [[9, 8, 1, 0, 0, 0]], dtype=np.int32
+        )
+    )
+    session._extract_actions_strict = lambda action_tokens: (
+        seen_tokens.append(np.asarray(action_tokens, dtype=np.int32).copy()) or np.ones((10, 7), dtype=np.float32)
+    )
+
+    result = session.act(
+        {"observation": {"chunks": []}, "extra_inputs": {"state": {"data": [0.0], "shape": [1], "dtype": "float32"}}}
+    )
+
+    assert [token.tolist() for token in seen_tokens] == [[9, 8, 1]]
     assert result["actions"]["shape"] == [10, 7]
 
 
@@ -855,7 +934,6 @@ def test_openpi_fast_save_weights_for_sampler_exports_policy_loadable_checkpoint
             session=session,
             checkpoint_name="export-1",
             checkpoint_base_dir=str(tmp_path),
-            use_per_expert_lora=False,
         )
     )
 
@@ -894,7 +972,7 @@ def test_action_session_manager_create_session_starts_runtime_from_checkpoint(tm
             "checkpoint_path": str(checkpoint_dir.resolve()),
             "config_name": "pi0_fast_libero_low_mem_finetune",
             "camera_layout": ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"),
-            "action_token_budget": 21,
+            "action_token_budget": 64,
         }
     ]
     assert factory.clients[0].calls[0] == (
@@ -903,14 +981,14 @@ def test_action_session_manager_create_session_starts_runtime_from_checkpoint(tm
             "action_session_id": "session-1:action:3",
             "base_model": OPENPI_FAST_MODEL,
             "checkpoint_path": str(checkpoint_dir.resolve()),
-            "config_name": "pi0_fast_libero_low_mem_finetune",
-            "action_dim": 7,
-            "action_horizon": 10,
-            "action_token_budget": 21,
-            "max_token_len": 180,
-            "camera_layout": ["base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"],
-        },
-    )
+                "config_name": "pi0_fast_libero_low_mem_finetune",
+                "action_dim": 7,
+                "action_horizon": 10,
+                "action_token_budget": 64,
+                "max_token_len": 180,
+                "camera_layout": ["base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"],
+            },
+        )
 
 
 def test_action_session_manager_act_returns_actions(tmp_path: Path) -> None:

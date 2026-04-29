@@ -368,6 +368,8 @@ def test_start_openpi_shared_ray_runtime_applies_single_node_pin(monkeypatch) ->
     state: dict[str, object] = {}
     node_id = "a" * 56
 
+    monkeypatch.setenv("PFS_TINKER_PATH", "/repo")
+
     class _FakeActorBuilder:
         def options(self, **kwargs):
             state["options"] = kwargs
@@ -649,6 +651,118 @@ def test_shared_client_close_does_not_kill_actor_after_successful_create_session
     assert state["unregister"] == []
     assert state["shutdown_refs"] == []
     assert state["kill_calls"] == []
+
+
+def test_shared_client_shutdown_reclaims_actor_when_last_session_exits(monkeypatch) -> None:
+    from tinker_server.backend import openpi_shared_ray_runtime
+
+    state: dict[str, object] = {
+        "unregister": [],
+        "kill_calls": [],
+        "shutdown_refs": [],
+        "inflight": [],
+        "sessions": [],
+        "touch": [],
+    }
+
+    class _FakeActorHandle:
+        class ready_metadata:
+            @staticmethod
+            def remote():
+                return "ready-ref"
+
+        class register_session:
+            @staticmethod
+            def remote(*_args, **_kwargs):
+                return "create-ref"
+
+        class request_for_session:
+            @staticmethod
+            def remote(*_args, **_kwargs):
+                return "request-ref"
+
+        class shutdown:
+            @staticmethod
+            def remote():
+                return "shutdown-ref"
+
+    class _FakeActorBuilder:
+        def options(self, **kwargs):
+            _ = kwargs
+            return self
+
+        def remote(self, **kwargs):
+            _ = kwargs
+            actor = _FakeActorHandle()
+            state["actor"] = actor
+            return actor
+
+    class _FakePool:
+        def register(self, **kwargs):
+            state["register"] = kwargs
+
+        def mark_ready(self, actor_name):
+            state["mark_ready"] = actor_name
+
+        def touch(self, actor_name):
+            state["touch"].append(actor_name)
+
+        def mark_inflight(self, actor_name, delta):
+            state["inflight"].append((actor_name, delta))
+
+        def set_session(self, actor_name, session_id):
+            state["sessions"].append((actor_name, session_id))
+
+        def unregister(self, actor_name):
+            state["unregister"].append(actor_name)
+
+    def _raise_missing_actor(*_args, **_kwargs):
+        raise ValueError("actor not found")
+
+    def _fake_ray_get(ref, timeout=None):
+        if ref == "ready-ref":
+            return {"actor_id": "actor-123", "current_session_id": None}
+        if ref == "create-ref":
+            return {"backend": "openpi_fast", "config_name": "pi0_fast_libero_low_mem_finetune"}
+        if ref == "request-ref":
+            return {"stopped": True, "known_session_ids": []}
+        if ref == "shutdown-ref":
+            state["shutdown_refs"].append((ref, timeout))
+            return None
+        raise AssertionError(f"unexpected ref {ref!r}")
+
+    def _fake_ray_kill(actor, *, no_restart=True):
+        state["kill_calls"].append((actor, no_restart))
+
+    _reset_shared_runtime_test_state(monkeypatch, openpi_shared_ray_runtime)
+    monkeypatch.setattr(openpi_shared_ray_runtime, "ensure_openpi_ray_initialized", lambda: None)
+    monkeypatch.setattr(openpi_shared_ray_runtime, "OpenPISharedRayRuntimeActor", _FakeActorBuilder())
+    monkeypatch.setattr(openpi_shared_ray_runtime, "get_resource_pool", lambda: _FakePool())
+    monkeypatch.setattr(openpi_shared_ray_runtime.ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(openpi_shared_ray_runtime.ray, "get_actor", _raise_missing_actor)
+    monkeypatch.setattr(openpi_shared_ray_runtime.ray, "get", _fake_ray_get)
+    monkeypatch.setattr(openpi_shared_ray_runtime.ray, "kill", _fake_ray_kill)
+
+    session = _make_session("model-a", "session-a")
+    client = asyncio.run(
+        openpi_shared_ray_runtime.start_openpi_shared_ray_runtime(
+            session=session,
+            spec=_spec(),
+            config_name="pi0_fast_libero_low_mem_finetune",
+            model_config=_model_config(),
+        )
+    )
+
+    asyncio.run(client.request("create_session", _create_payload(session)))
+    result = asyncio.run(client.request("shutdown", {"model_id": session.model_id}))
+
+    actor_name = state["register"]["actor_name"]
+    assert result["stopped"] is True
+    assert state["sessions"][-1] == (actor_name, None)
+    assert actor_name in state["unregister"]
+    assert state["shutdown_refs"] == [("shutdown-ref", 5.0)]
+    assert state["kill_calls"] == [(state["actor"], True)]
+    assert openpi_shared_ray_runtime._SHARED_ACTORS == {}
 
 
 def test_start_openpi_shared_ray_runtime_uses_model_id_as_runtime_session_key(monkeypatch) -> None:

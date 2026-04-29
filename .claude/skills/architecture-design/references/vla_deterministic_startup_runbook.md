@@ -27,8 +27,14 @@ nohup bash scripts/wip/openpi_vla_start_server.sh tinker_root_vla_pr422_20260404
 - Use a namespace-specific queue actor name via `TINKER_API_WORK_QUEUE_ACTOR_NAME` and `MINT_API_WORK_QUEUE_ACTOR_NAME`.
 - Pin the queue actor with `MINT_API_WORK_QUEUE_PINNED_NODE_IP=192.168.38.176`.
 - Pin the detached control-plane actors with `MINT_CONTROL_PLANE_PINNED_NODE_IP=192.168.38.176`.
-- Set `MINT_OPENPI_FAST_WEIGHTS_PATH` to the actual params directory: `/vePFS-Mindverse/share/code/root/.openpi-data-vla-pr422/openpi-assets/checkpoints/pi0_fast_base/params.partial/params`. Do not point it at the wrapper `params.partial` root.
-- Optional: set `MINT_VLA_FAST_WEIGHTS_PATH` before running the startup script if you need to seed from a different known-good `params` checkpoint.
+- Set `MINT_OPENPI_FAST_WEIGHTS_PATH` to the shared params directory: `/vePFS-Mindverse/share/models/openpi/pi0_fast_base/params`.
+- Set `MINT_OPENPI_PI05_WEIGHTS_PATH` to the shared params directory: `/vePFS-Mindverse/share/models/openpi/pi05_base/params`.
+- Set `MINT_OPENPI_FAST_ASSETS_BASE_DIR` to a source assets tree that actually contains `assets/**/norm_stats.json`:
+  `/vePFS-Mindverse/share/models/openpi/pi0_fast_base_official_20260428/assets`.
+- Set `MINT_OPENPI_PI05_ASSETS_BASE_DIR` to the shared pi0.5 source assets tree:
+  `/vePFS-Mindverse/share/models/openpi/pi05_base/assets`.
+- Optional: set `MINT_VLA_FAST_WEIGHTS_PATH`, `MINT_VLA_PI05_WEIGHTS_PATH`, `MINT_VLA_FAST_ASSETS_PATH`, or `MINT_VLA_PI05_ASSETS_PATH` before running the startup script if you need a different known-good bundle.
+- Do not point `MINT_OPENPI_*_ASSETS_BASE_DIR` at a run output directory such as `results/.../assets`; that is not a valid source of OpenPI `norm_stats`.
 - Do not rely on inherited shell env. Explicitly unset stray actor-name overrides before starting.
 
 ## Root Cause Fixed

@@ -222,6 +222,7 @@ def test_runtime_env_host_dependencies_include_openpi_worker_stack():
         "optax==0.2.4",
         "orbax-checkpoint==0.11.13",
         "pytest>=7.0.0",
+        "torchvision==0.24.1+cpu",
         "tqdm-loggable>=0.2",
         "tyro>=0.9.5",
     ):

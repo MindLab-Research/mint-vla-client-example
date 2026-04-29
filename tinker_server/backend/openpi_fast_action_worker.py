@@ -132,6 +132,18 @@ class OpenPIFastActionSession:
                     _resolve_fast_tokenizer_path(tokenizer_kwargs.get("fast_tokenizer_path") or "physical-intelligence/fast"),
                 )
             self._tokenizer = tokenizer_cls(self._config.model.max_token_len, **tokenizer_kwargs)
+            paligemma_tokenizer = getattr(self._tokenizer, "_paligemma_tokenizer", None)
+            self._paligemma_eos_id = int(paligemma_tokenizer.eos_id()) if paligemma_tokenizer is not None else 1
+            self._action_prefix_tokens = (
+                np.asarray(paligemma_tokenizer.encode("Action: "), dtype=np.int32)
+                if paligemma_tokenizer is not None
+                else np.asarray([], dtype=np.int32)
+            )
+            self._pipe_tokens = (
+                np.asarray(paligemma_tokenizer.encode("|"), dtype=np.int32)
+                if paligemma_tokenizer is not None
+                else np.asarray([], dtype=np.int32)
+            )
             phase = "session_state"
             state_root = str(os.environ.get("MINT_OPENPI_FAST_ACTION_SESSION_STATE_ROOT") or "").strip()
             if not state_root:
@@ -236,6 +248,28 @@ class OpenPIFastActionSession:
             raise RuntimeError("OpenPI FAST action tokenizer is missing the PaliGemma decoder")
         return str(paligemma_tokenizer.decode(action_tokens.tolist()))
 
+    def _trim_sampled_tokens(self, action_tokens: np.ndarray) -> np.ndarray:
+        trimmed = np.asarray(action_tokens, dtype=np.int32).reshape(-1)
+        eos_id = int(getattr(self, "_paligemma_eos_id", 1))
+        eos_positions = np.flatnonzero(trimmed == eos_id)
+        if eos_positions.size:
+            return trimmed[: int(eos_positions[0]) + 1]
+
+        nonzero_positions = np.flatnonzero(trimmed)
+        if nonzero_positions.size and int(nonzero_positions[-1]) + 1 < trimmed.size:
+            return trimmed[: int(nonzero_positions[-1]) + 1]
+        return trimmed
+
+    @staticmethod
+    def _find_subsequence(tokens: np.ndarray, pattern: np.ndarray) -> int:
+        if pattern.size == 0:
+            return 0
+        last_start = tokens.size - pattern.size
+        for start in range(max(last_start + 1, 0)):
+            if np.array_equal(tokens[start : start + pattern.size], pattern):
+                return start
+        return -1
+
     def _extract_actions_strict(self, action_tokens: np.ndarray) -> np.ndarray:
         decoded_tokens = self._decode_sampled_tokens(action_tokens)
         if "Action: " not in decoded_tokens:
@@ -256,12 +290,17 @@ class OpenPIFastActionSession:
             raise RuntimeError("OpenPI FAST action tokenizer cannot decode actions strictly")
 
         suffix_text = decoded_tokens.split("Action: ", 1)[1]
-        has_pipe = "|" in suffix_text
+        action_prefix_tokens = np.asarray(getattr(self, "_action_prefix_tokens", np.asarray([], dtype=np.int32)), dtype=np.int32)
+        pipe_tokens = np.asarray(getattr(self, "_pipe_tokens", np.asarray([], dtype=np.int32)), dtype=np.int32)
+        action_start = self._find_subsequence(action_tokens, action_prefix_tokens)
+        if action_start < 0:
+            raise RuntimeError("OpenPI FAST sampler output is missing the tokenized 'Action: ' prefix")
+        action_start += int(action_prefix_tokens.size)
+        pipe_index = self._find_subsequence(action_tokens[action_start:], pipe_tokens)
+        has_pipe = pipe_index >= 0
+        action_end = action_start + pipe_index if has_pipe else action_tokens.size
+        raw_action_tokens = np.asarray(action_tokens[action_start:action_end], dtype=np.int32)
         action_text = suffix_text.split("|", 1)[0].strip()
-        raw_action_tokens = np.asarray(
-            paligemma_tokenizer.encode(action_text),
-            dtype=np.int32,
-        )
         fast_action_tokens = np.asarray(
             self._tokenizer._act_tokens_to_paligemma_tokens(raw_action_tokens),
             dtype=np.int32,
@@ -291,6 +330,33 @@ class OpenPIFastActionSession:
             dtype=np.float32,
         )
 
+    def _extract_actions_with_fallback(self, action_tokens: np.ndarray) -> np.ndarray:
+        try:
+            return self._extract_actions_strict(action_tokens)
+        except Exception as exc:
+            extract_actions = getattr(self._tokenizer, "extract_actions", None)
+            if extract_actions is None:
+                raise
+            logger.warning(
+                "OpenPI FAST strict action decode failed; falling back to tokenizer.extract_actions: %s",
+                exc,
+            )
+            actions = np.asarray(
+                extract_actions(
+                    np.asarray(action_tokens, dtype=np.int32),
+                    self._action_horizon,
+                    self._action_dim,
+                ),
+                dtype=np.float32,
+            )
+            expected_shape = (self._action_horizon, self._action_dim)
+            if actions.shape != expected_shape:
+                raise RuntimeError(
+                    "OpenPI FAST fallback action decode returned unexpected shape "
+                    f"(got={actions.shape}, expected={expected_shape})"
+                ) from exc
+            return actions
+
     def act(self, payload: dict[str, Any]) -> dict[str, Any]:
         observation = self._observation_from_payload(payload)
         rng_before = [
@@ -315,9 +381,10 @@ class OpenPIFastActionSession:
             )[0],
             dtype=np.int32,
         )
+        action_tokens = self._trim_sampled_tokens(action_tokens)
         debug_tokens_enabled = os.environ.get("MINT_OPENPI_FAST_DEBUG_TOKENS", "").strip() == "1"
         decoded_tokens = self._decode_sampled_tokens(action_tokens) if debug_tokens_enabled else None
-        actions = self._extract_actions_strict(action_tokens)
+        actions = self._extract_actions_with_fallback(action_tokens)
         infer_ms = (time.monotonic() - started) * 1000.0
         self._sample_counter += 1
         result = {
