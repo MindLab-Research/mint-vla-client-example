@@ -15,8 +15,11 @@ import json
 import re
 import time
 from dataclasses import dataclass
+from typing import Any
 
 import ray
+from ray.exceptions import GetTimeoutError, RayActorError
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from . import ray_kill
 from .ray_placement_groups import PlacementGroupMismatchError, get_named_placement_group
@@ -48,7 +51,7 @@ _inflight_errors: dict[str, str] = {}
 
 @dataclass(frozen=True)
 class DenseTrainerHandle:
-    actor: ray.actor.ActorHandle
+    actor: Any
     actor_name: str
     base_model: str
     max_lora_rank: int
@@ -159,7 +162,7 @@ def _preferred_worker_node_ip_for_model(model_key: str | None, base_model: str) 
         return None
 
     candidates = None
-    lookup_keys = []
+    lookup_keys: list[str] = []
     for key in (model_key, base_model):
         if not key:
             continue
@@ -176,10 +179,10 @@ def _preferred_worker_node_ip_for_model(model_key: str | None, base_model: str) 
     return ip or None
 
 
-def _get_or_create_pg(actor_name: str, *, model_key: str | None, base_model: str) -> ray.util.placement_group.PlacementGroup:
+def _get_or_create_pg(actor_name: str, *, model_key: str | None, base_model: str) -> Any:
     """Ensure a detached 1-GPU placement group exists for this actor."""
     pg_name = _pg_name(actor_name)
-    bundle = {"GPU": 1, "CPU": 1}
+    bundle: dict[str, float] = {"GPU": 1.0, "CPU": 1.0}
     preferred_ip = _preferred_worker_node_ip_for_model(model_key, base_model)
     if preferred_ip:
         bundle[f"node:{preferred_ip}"] = 0.001
@@ -241,8 +244,8 @@ def retire_dense_trainer(
     fatal_op: str | None = None,
     request_id: str | None = None,
     namespace: str = PERSISTENT_DENSE_NAMESPACE,
-    actor: ray.actor.ActorHandle | None = None,
-) -> None:
+    actor: Any | None = None,
+) -> str:
     """Poison a dense trainer so it cannot be reused after fatal GPU failures."""
     from .runtime_observability import runtime_observability
 
@@ -324,6 +327,7 @@ def retire_dense_trainer(
                 actor_name=actor_name,
                 namespace=namespace,
                 no_restart=True,
+                verify_absent=True,
                 base_model=base_model,
                 session_id=session_id,
                 retire_reason=reason,
@@ -370,6 +374,7 @@ def retire_dense_trainer(
         detail=str(reason),
         context={"outcome": retire_outcome},
     )
+    return retire_outcome
 
 
 def get_or_create_dense_trainer(
@@ -432,37 +437,53 @@ def get_or_create_dense_trainer(
                 actor = ray.get_actor(actor_name, namespace=PERSISTENT_DENSE_NAMESPACE)
                 if reuse_block_reason is not None:
                     bind_decision = "recreate_poisoned"
-                    retire_dense_trainer(
+                    retire_outcome = retire_dense_trainer(
                         actor_name=actor_name,
                         actor=actor,
                         reason=f"reuse_blocked:{reuse_block_reason}",
                         base_model=base_model,
                         session_id=session_id,
                     )
+                    if retire_outcome != "ok":
+                        raise RuntimeError(
+                            f"dense_trainer retire failed before recreate "
+                            f"actor_name={actor_name} outcome={retire_outcome}"
+                        )
                     actor = None
                 if actor is not None:
                     bind_decision = "reuse"
                     # Heartbeat: if busy, we still treat as alive.
                     try:
                         ray.get(actor.heartbeat.remote(), timeout=5)
-                    except ray.exceptions.RayActorError:
+                    except RayActorError:
                         raise
-                    except ray.exceptions.GetTimeoutError:
+                    except GetTimeoutError:
                         pass
-            except ray.exceptions.RayActorError:
-                # Dead actor name: best-effort kill to free name, then recreate.
+            except RayActorError:
+                # Dead actor name: prove the Ray name is absent or kill the remaining named actor before recreate.
                 try:
                     actor = ray.get_actor(actor_name, namespace=PERSISTENT_DENSE_NAMESPACE)
-                    ray_kill.kill(
-                        actor,
-                        reason="dense_trainer_dead",
-                        actor_name=actor_name,
-                        namespace=PERSISTENT_DENSE_NAMESPACE,
-                        no_restart=True,
-                        base_model=base_model,
-                    )
-                except Exception:
-                    pass
+                except ValueError:
+                    actor = None
+                except Exception as e:
+                    raise RuntimeError(
+                        f"dense_trainer dead actor lookup failed before recreate actor_name={actor_name}"
+                    ) from e
+                if actor is not None:
+                    try:
+                        ray_kill.kill(
+                            actor,
+                            reason="dense_trainer_dead",
+                            actor_name=actor_name,
+                            namespace=PERSISTENT_DENSE_NAMESPACE,
+                            no_restart=True,
+                            verify_absent=True,
+                            base_model=base_model,
+                        )
+                    except Exception as e:
+                        raise RuntimeError(
+                            f"dense_trainer dead actor cleanup failed before recreate actor_name={actor_name}"
+                        ) from e
                 _remove_pg(actor_name)
                 actor = None
             except ValueError:
@@ -470,7 +491,7 @@ def get_or_create_dense_trainer(
 
             if actor is None:
                 pool.ensure_gpus_available(DEFAULT_NUM_GPUS)
-                from ..config import actor_runtime_env_vars, config as server_config, otel_env_vars
+                from ..config import actor_runtime_env_vars, otel_env_vars
                 runtime_env = {
                     "env_vars": actor_runtime_env_vars(
                         pythonpath=PFS_PYTHONPATH_DENSE,
@@ -490,7 +511,7 @@ def get_or_create_dense_trainer(
                     namespace=PERSISTENT_DENSE_NAMESPACE,
                     lifetime="detached",
                     num_gpus=1,
-                    scheduling_strategy=ray.util.scheduling_strategies.PlacementGroupSchedulingStrategy(
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
                         placement_group=pg,
                         placement_group_bundle_index=0,
                     ),
@@ -504,7 +525,7 @@ def get_or_create_dense_trainer(
                 init_timeout_s = float(os.environ.get("MINT_DENSE_ACTOR_INIT_TIMEOUT_S", "600"))
                 try:
                     ray.get(actor.__ray_ready__.remote(), timeout=init_timeout_s)
-                except ray.exceptions.GetTimeoutError:
+                except GetTimeoutError:
                     try:
                         ray_kill.kill(
                             actor,

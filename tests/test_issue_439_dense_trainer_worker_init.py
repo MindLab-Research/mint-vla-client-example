@@ -137,8 +137,9 @@ def test_issue_561_poisoned_dense_trainer_is_not_reused(monkeypatch, base_model:
         def mark_ready(self, _actor_name: str) -> None:
             return None
 
-    def _fake_retire_dense_trainer(**kwargs) -> None:
+    def _fake_retire_dense_trainer(**kwargs) -> str:
         retire_calls.append(dict(kwargs))
+        return "ok"
 
     monkeypatch.setattr(dt, "get_resource_pool", lambda: _FakePool())
     monkeypatch.setattr(dt, "retire_dense_trainer", _fake_retire_dense_trainer)
@@ -174,6 +175,112 @@ def test_issue_561_poisoned_dense_trainer_is_not_reused(monkeypatch, base_model:
         "lora_rank": 64,
         "learning_rate": 1e-4,
     }
+
+
+def test_issue_561_poisoned_dense_trainer_recreate_aborts_when_retire_fails(monkeypatch) -> None:
+    from tinker_server.backend import dense_trainer as dt
+
+    actor_name = "peft_trainer_qwen__qwen3_0_6b_maxr64"
+    poisoned_entry = SimpleNamespace(
+        metadata={"poisoned": True, "poison_reason": "forward_backward:CUDA error"},
+        current_session="stale-session",
+    )
+
+    class _FakePool:
+        def get(self, queried_actor_name: str):
+            assert queried_actor_name == actor_name
+            return poisoned_entry
+
+        def ensure_gpus_available(self, _num_gpus: int) -> None:
+            raise AssertionError("creation must not start after failed retire")
+
+    monkeypatch.setattr(dt, "get_resource_pool", lambda: _FakePool())
+    monkeypatch.setattr(dt.ray, "get_actor", lambda *args, **kwargs: object())
+    monkeypatch.setattr(dt, "retire_dense_trainer", lambda **kwargs: "kill_failed")
+
+    with pytest.raises(RuntimeError, match="outcome=kill_failed"):
+        dt.get_or_create_dense_trainer(
+            training_worker_cls=object,
+            base_model="Qwen/Qwen3-0.6B",
+            lora_rank=8,
+            learning_rate=1e-4,
+            session_id="model-561",
+        )
+
+
+def test_issue_561_dead_dense_actor_absent_name_recreates(monkeypatch) -> None:
+    from tinker_server.backend import dense_trainer as dt
+    from tinker_server import config as cfg
+
+    monkeypatch.setattr(cfg, "PFS_RUNTIME_ENV_ROOT", "/tmp/runtime-root")
+    monkeypatch.setattr(cfg, "PFS_TINKER_PATH", "/tmp/tinker-root")
+    monkeypatch.setattr(cfg, "PFS_HF_MODULES_PATH", "/tmp/hf-modules")
+    monkeypatch.setenv("RAY_ADDRESS", "192.168.38.184:6379")
+
+    class _DeadActorError(RuntimeError):
+        pass
+
+    class _Heartbeat:
+        def remote(self):
+            raise _DeadActorError("dead")
+
+    class _ExistingActor:
+        heartbeat = _Heartbeat()
+
+    class _ReadyRemote:
+        def remote(self):
+            return "ready-ref"
+
+    class _NewActor:
+        def __init__(self) -> None:
+            self.__ray_ready__ = _ReadyRemote()
+
+    class _FakeRemoteBuilder:
+        def remote(self, **_kwargs):
+            return _NewActor()
+
+    class _FakeTrainingWorker:
+        @staticmethod
+        def options(**_kwargs):
+            return _FakeRemoteBuilder()
+
+    class _FakePool:
+        def get(self, _actor_name: str):
+            return None
+
+        def ensure_gpus_available(self, _num_gpus: int) -> None:
+            return None
+
+        def register(self, **kwargs):
+            return SimpleNamespace(current_session=kwargs.get("session_id"))
+
+        def mark_ready(self, _actor_name: str) -> None:
+            return None
+
+    actors = [_ExistingActor(), ValueError("missing")]
+
+    def _fake_get_actor(*_args, **_kwargs):
+        out = actors.pop(0)
+        if isinstance(out, Exception):
+            raise out
+        return out
+
+    monkeypatch.setattr(dt, "RayActorError", _DeadActorError)
+    monkeypatch.setattr(dt, "get_resource_pool", lambda: _FakePool())
+    monkeypatch.setattr(dt.ray, "get_actor", _fake_get_actor)
+    monkeypatch.setattr(dt.ray, "get", lambda value, timeout=None: value)
+    monkeypatch.setattr(dt, "_get_or_create_pg", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(dt, "_remove_pg", lambda actor_name: None)
+
+    handle = dt.get_or_create_dense_trainer(
+        training_worker_cls=_FakeTrainingWorker,
+        base_model="Qwen/Qwen3-0.6B",
+        lora_rank=8,
+        learning_rate=1e-4,
+        session_id="model-561",
+    )
+
+    assert handle.actor_name == "peft_trainer_qwen__qwen3_0_6b_maxr64"
 
 
 def test_issue_561_inflight_guard_uses_actor_identity(monkeypatch) -> None:
@@ -232,6 +339,7 @@ def test_issue_561_retire_dense_trainer_persists_fatal_metadata(monkeypatch) -> 
     clears: list[tuple[str, object]] = []
     set_sessions: list[tuple[str, object]] = []
     unregisters: list[str] = []
+    killed: list[dict[str, object]] = []
     obs = runtime_obs_module.RuntimeObservability()
 
     entry = SimpleNamespace(metadata={"poisoned": False})
@@ -255,7 +363,7 @@ def test_issue_561_retire_dense_trainer_persists_fatal_metadata(monkeypatch) -> 
 
     monkeypatch.setattr(dt, "get_resource_pool", lambda: _FakePool())
     monkeypatch.setattr(runtime_obs_module, "runtime_observability", obs)
-    monkeypatch.setattr(dt.ray, "get_actor", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("missing")))
+    monkeypatch.setattr(dt.ray_kill, "kill", lambda *args, **kwargs: killed.append(dict(kwargs)))
     monkeypatch.setattr(dt, "_remove_pg", lambda actor_name: None)
 
     dt.retire_dense_trainer(
@@ -265,21 +373,25 @@ def test_issue_561_retire_dense_trainer_persists_fatal_metadata(monkeypatch) -> 
         session_id="model-561",
         fatal_op="forward_backward",
         request_id="req-561",
+        actor=object(),
     )
 
     assert len(metadata_updates) == 1
     update = metadata_updates[0]
     assert update["actor_name"] == "peft_trainer_qwen__qwen3_0_6b_maxr64"
     assert update["sample_source"] == "dense_retire"
-    assert update["metadata"]["poisoned"] is True
-    assert update["metadata"]["poison_reason"] == "forward_backward:CUDA error: device-side assert triggered"
-    assert update["metadata"]["poisoned_session_id"] == "model-561"
-    assert update["metadata"]["last_fatal_op"] == "forward_backward"
-    assert update["metadata"]["last_fatal_request_id"] == "req-561"
-    assert isinstance(update["metadata"]["poisoned_at"], float)
+    metadata = update["metadata"]
+    assert isinstance(metadata, dict)
+    assert metadata["poisoned"] is True
+    assert metadata["poison_reason"] == "forward_backward:CUDA error: device-side assert triggered"
+    assert metadata["poisoned_session_id"] == "model-561"
+    assert metadata["last_fatal_op"] == "forward_backward"
+    assert metadata["last_fatal_request_id"] == "req-561"
+    assert isinstance(metadata["poisoned_at"], float)
     assert clears == [("model-561", dt.ActorType.DENSE)]
     assert set_sessions == [("peft_trainer_qwen__qwen3_0_6b_maxr64", None)]
     assert unregisters == ["peft_trainer_qwen__qwen3_0_6b_maxr64"]
+    assert killed[0]["verify_absent"] is True
     assert obs.snapshot()["dense_actor_retire"] == [
         {
             "base_model": "Qwen/Qwen3-0.6B",
