@@ -3907,11 +3907,7 @@ async def _do_save_weights_for_sampler(
                 sampling_session_id=sampling_session_id,
             ).model_dump()
 
-        async_resolve = getattr(future_store, "async_resolve", None)
-        if callable(async_resolve):
-            await async_resolve(request_id, response)
-        else:
-            await future_store.async_resolve(request_id, response)
+        await future_store.async_resolve(request_id, response)
 
     except Exception as e:
         if not mirror_started:

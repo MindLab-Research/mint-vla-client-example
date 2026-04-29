@@ -18,7 +18,7 @@ import uuid
 import json
 import time
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import RedirectResponse, StreamingResponse
@@ -97,7 +97,10 @@ def _loaded_training_session_lora_payload(lora_config: Any) -> dict[str, Any] | 
         return None
     model_dump = getattr(lora_config, "model_dump", None)
     if callable(model_dump):
-        return dict(model_dump())
+        payload = model_dump()
+        if not isinstance(payload, dict) or not all(isinstance(key, str) for key in payload):
+            raise TypeError(f"Unsupported lora_config payload type: {type(payload).__name__}")
+        return dict(cast(dict[str, Any], payload))
     if isinstance(lora_config, dict):
         return dict(lora_config)
     if hasattr(lora_config, "__dict__"):
@@ -1818,7 +1821,7 @@ async def _do_load_state(
                 str(request.model_id),
                 type(persist_exc).__name__,
             )
-        payload = {
+        payload: dict[str, object] = {
             "path": request.path,
             "type": "load_weights",
         }

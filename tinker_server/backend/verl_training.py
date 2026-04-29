@@ -12,7 +12,7 @@ import math
 import os
 import threading
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import ray
 
@@ -2417,7 +2417,7 @@ class VerlTrainingEngine:
         if lora_cfg is None:
             return
         updates = {
-            "rank": int(meta["actual_rank"]),
+            "rank": int(cast(int, meta["actual_rank"])),
             "train_attn": bool(meta["train_attn"]),
             "train_mlp": bool(meta["train_mlp"]),
             "train_unembed": bool(meta["train_unembed"]),
@@ -3901,8 +3901,8 @@ class VerlTrainingEngine:
 
         if session.backend == "megatron":
             meta = self._validate_megatron_load_meta(meta, op="load_weights")
-            session.current_step = int(meta["current_step"])
-            session.learning_rate = float(meta["learning_rate"])
+            session.current_step = int(cast(int, meta["current_step"]))
+            session.learning_rate = float(cast(float, meta["learning_rate"]))
             self._apply_megatron_loaded_lora_config(session, meta)
             actor_name = self._actor_name_for_session(session)
             if actor_name and bool(meta["optimizer_restored"]):
