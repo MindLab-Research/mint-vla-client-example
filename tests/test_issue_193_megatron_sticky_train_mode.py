@@ -1849,6 +1849,115 @@ def test_issue_417_optimizerless_load_accepts_adapter_checkpoint_without_trainin
     assert group.learning_rate == pytest.approx(1e-4)
 
 
+def test_issue_417_optimizerless_load_warns_for_legacy_rank_shard_without_adapter_config(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
+    group = object.__new__(group_cls)
+    group._current_session = "current_session"
+    group._session_unknown_due_to_partial_swap = False
+    group._step_count = 99
+    group.learning_rate = 1e-4
+    group._actual_rank = 12
+    group.lora_rank = 8
+    group._session_manager = None
+
+    prepare_calls: list[tuple[str, object]] = []
+    load_adapter_calls: list[tuple[str, dict]] = []
+    reset_calls: list[float | None] = []
+
+    group._resolve_required_session_id = lambda session_id, op: session_id
+    group._prepare_session_for_explicit_load = (
+        lambda session_id, traceparent=None: prepare_calls.append((session_id, traceparent))
+    )
+    group.load_adapter_state = lambda load_path, **kwargs: load_adapter_calls.append((load_path, kwargs)) or {"status": "ok"}
+    group.reset_optimizer = (
+        lambda learning_rate=None, traceparent=None, zero_grad_buffers=True: reset_calls.append((learning_rate, traceparent))
+        or {"status": "ok"}
+    )
+    group.workers = []
+
+    import ray as ray_module
+
+    monkeypatch.setattr(ray_module, "get", lambda futures, timeout=None: futures)
+
+    ckpt_dir = tmp_path / "legacy_rank_shard"
+    ckpt_dir.mkdir()
+    (ckpt_dir / "mp_rank_00_adapter.pt").write_bytes(b"stub")
+
+    with caplog.at_level(logging.WARNING):
+        result = group.load_checkpoint(str(ckpt_dir), load_optimizer=False, session_id="target_session")
+
+    assert prepare_calls == [("target_session", None)]
+    assert load_adapter_calls == [
+        (
+            str(ckpt_dir),
+            {
+                "actual_rank": 12,
+                "traceparent": None,
+                "train_attn": True,
+                "train_mlp": True,
+                "train_unembed": True,
+            },
+        )
+    ]
+    assert reset_calls == [(pytest.approx(1e-4), None)]
+    assert result["checkpoint_format"] == "legacy_rank_shard_without_adapter_config"
+    assert "Legacy Megatron rank-shard checkpoint is missing adapter_config.json" in result["warning"]
+    assert result["current_step"] == 0
+    assert result["learning_rate"] == pytest.approx(1e-4)
+    assert result["train_attn"] is True
+    assert result["train_mlp"] is True
+    assert result["train_unembed"] is True
+    assert group._actual_rank == 12
+    assert group._step_count == 0
+    assert group.learning_rate == pytest.approx(1e-4)
+    assert any("Legacy Megatron rank-shard checkpoint is missing adapter_config.json" in rec.getMessage() for rec in caplog.records)
+
+
+def test_issue_417_optimizer_resume_rejects_legacy_rank_shard_without_adapter_config(tmp_path, monkeypatch):
+    import ray as ray_module
+
+    group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
+    group = object.__new__(group_cls)
+    group._current_session = "current_session"
+    group._session_unknown_due_to_partial_swap = False
+    group._actual_rank = 12
+    group.lora_rank = 8
+
+    prepare_calls: list[tuple[str, object]] = []
+    load_adapter_calls: list[tuple[str, dict]] = []
+
+    group._resolve_required_session_id = lambda session_id, op: session_id
+    group._prepare_session_for_explicit_load = (
+        lambda session_id, traceparent=None: prepare_calls.append((session_id, traceparent))
+    )
+    group.load_adapter_state = lambda load_path, **kwargs: load_adapter_calls.append((load_path, kwargs)) or {"status": "ok"}
+
+    class _FakeCheckOptimizerStateExistsRemoteMethod:
+        def remote(self, load_path, **kwargs):
+            return {"rank": 0, "exists": True, "optimizer_file": "rank0_optimizer.pt"}
+
+    class _FakeWorker:
+        check_optimizer_state_exists = _FakeCheckOptimizerStateExistsRemoteMethod()
+
+    group.workers = [_FakeWorker()]
+    monkeypatch.setattr(ray_module, "get", lambda futures, timeout=None: futures)
+
+    ckpt_dir = tmp_path / "legacy_rank_shard_with_optimizer"
+    ckpt_dir.mkdir()
+    (ckpt_dir / "mp_rank_00_adapter.pt").write_bytes(b"stub")
+    (ckpt_dir / "mp_rank_00_optimizer.pt").write_bytes(b"optimizer")
+
+    with pytest.raises(FileNotFoundError, match="required for optimizer resume"):
+        group.load_checkpoint(str(ckpt_dir), load_optimizer=True, session_id="target_session")
+
+    assert prepare_calls == []
+    assert load_adapter_calls == []
+
+
 def test_issue_193_load_checkpoint_invalid_meta_fails_before_state_changes(tmp_path, monkeypatch):
     group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
     group = object.__new__(group_cls)

@@ -8598,30 +8598,58 @@ class MegatronWorkerGroup:
                     + ", ".join(missing)
                 )
         adapter_config_path = os.path.join(load_path, "adapter_config.json")
-        if not os.path.isfile(adapter_config_path):
-            raise FileNotFoundError(
-                f"Missing adapter_config.json required to recover actual LoRA rank: {adapter_config_path}"
+        checkpoint_format = "adapter_config"
+        checkpoint_warning = None
+        if os.path.isfile(adapter_config_path):
+            with open(adapter_config_path, "r", encoding="utf-8") as f:
+                adapter_config = json.load(f)
+            if not isinstance(adapter_config, dict):
+                raise RuntimeError(
+                    f"Invalid adapter_config.json type {type(adapter_config).__name__} in {adapter_config_path}"
+                )
+            checkpoint_rank = adapter_config.get("r")
+            if not isinstance(checkpoint_rank, int) or isinstance(checkpoint_rank, bool) or checkpoint_rank <= 0:
+                raise RuntimeError(
+                    f"Invalid adapter rank in {adapter_config_path}: expected positive int, got {checkpoint_rank!r}"
+                )
+            checkpoint_train_attn, checkpoint_train_mlp, checkpoint_train_unembed = (
+                _resolve_lora_train_flags_for_checkpoint(
+                    adapter_config,
+                    adapter_config_path=adapter_config_path,
+                    train_attn=train_attn,
+                    train_mlp=train_mlp,
+                    train_unembed=train_unembed,
+                )
             )
-        with open(adapter_config_path, "r", encoding="utf-8") as f:
-            adapter_config = json.load(f)
-        if not isinstance(adapter_config, dict):
-            raise RuntimeError(
-                f"Invalid adapter_config.json type {type(adapter_config).__name__} in {adapter_config_path}"
+        else:
+            if load_optimizer:
+                raise FileNotFoundError(
+                    f"Missing adapter_config.json required for optimizer resume: {adapter_config_path}"
+                )
+            fallback_rank = getattr(self, "_actual_rank", None)
+            if not isinstance(fallback_rank, int) or isinstance(fallback_rank, bool) or fallback_rank <= 0:
+                fallback_rank = getattr(self, "lora_rank", None)
+            if not isinstance(fallback_rank, int) or isinstance(fallback_rank, bool) or fallback_rank <= 0:
+                raise FileNotFoundError(
+                    f"Missing adapter_config.json and no valid fallback rank available: {adapter_config_path}"
+                )
+            checkpoint_rank = int(fallback_rank)
+            checkpoint_train_attn = True if train_attn is None else bool(train_attn)
+            checkpoint_train_mlp = True if train_mlp is None else bool(train_mlp)
+            checkpoint_train_unembed = True if train_unembed is None else bool(train_unembed)
+            checkpoint_format = "legacy_rank_shard_without_adapter_config"
+            checkpoint_warning = (
+                "Legacy Megatron rank-shard checkpoint is missing adapter_config.json; "
+                f"optimizerless load is using fallback rank={checkpoint_rank} and "
+                "fallback train flags "
+                f"(train_attn={checkpoint_train_attn}, train_mlp={checkpoint_train_mlp}, "
+                f"train_unembed={checkpoint_train_unembed})."
             )
-        checkpoint_rank = adapter_config.get("r")
-        if not isinstance(checkpoint_rank, int) or isinstance(checkpoint_rank, bool) or checkpoint_rank <= 0:
-            raise RuntimeError(
-                f"Invalid adapter rank in {adapter_config_path}: expected positive int, got {checkpoint_rank!r}"
+            logger.warning(
+                "[MegatronWorkerGroup] %s path=%s",
+                checkpoint_warning,
+                load_path,
             )
-        checkpoint_train_attn, checkpoint_train_mlp, checkpoint_train_unembed = (
-            _resolve_lora_train_flags_for_checkpoint(
-                adapter_config,
-                adapter_config_path=adapter_config_path,
-                train_attn=train_attn,
-                train_mlp=train_mlp,
-                train_unembed=train_unembed,
-            )
-        )
         meta_path = os.path.join(load_path, "training_meta.json")
         checkpoint_step = 0
         checkpoint_lr = float(self.learning_rate)
@@ -8711,6 +8739,9 @@ class MegatronWorkerGroup:
                 result["optimizer_restored"] = False
 
             result["checkpoint_path"] = load_path
+            result["checkpoint_format"] = checkpoint_format
+            if checkpoint_warning is not None:
+                result["warning"] = checkpoint_warning
             result["train_attn"] = checkpoint_train_attn
             result["train_mlp"] = checkpoint_train_mlp
             result["train_unembed"] = checkpoint_train_unembed
