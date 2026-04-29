@@ -8622,10 +8622,6 @@ class MegatronWorkerGroup:
                 )
             )
         else:
-            if load_optimizer:
-                raise FileNotFoundError(
-                    f"Missing adapter_config.json required for optimizer resume: {adapter_config_path}"
-                )
             fallback_rank = getattr(self, "_actual_rank", None)
             if not isinstance(fallback_rank, int) or isinstance(fallback_rank, bool) or fallback_rank <= 0:
                 fallback_rank = getattr(self, "lora_rank", None)
@@ -8646,7 +8642,7 @@ class MegatronWorkerGroup:
             checkpoint_format = "legacy_rank_shard_without_adapter_config"
             checkpoint_warning = (
                 "Legacy Megatron rank-shard checkpoint is missing adapter_config.json; "
-                f"optimizerless load is using fallback rank={checkpoint_rank} and "
+                f"load_optimizer={bool(load_optimizer)} is using fallback rank={checkpoint_rank} and "
                 "fallback train flags "
                 f"(train_attn={checkpoint_train_attn}, train_mlp={checkpoint_train_mlp}, "
                 f"train_unembed={checkpoint_train_unembed})."
