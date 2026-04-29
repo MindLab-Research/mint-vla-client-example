@@ -18,7 +18,7 @@ import uuid
 import json
 import time
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import RedirectResponse, StreamingResponse
@@ -48,6 +48,7 @@ from ..checkpoints import (
     begin_async_checkpoint_mirror,
     build_gateway_proxy_archive_path,
     build_persistent_cache_dir,
+    checkpoint_has_openpi_training_state,
     checkpoint_has_optimizer_state,
     async_create_checkpoint_archive,
     ensure_checkpoint_path_allowed,
@@ -69,6 +70,8 @@ from ..models.types import (
     LoadStateRequest,
     SaveStateRequest,
     UntypedAPIFuture,
+    WeightsInfoRequest,
+    WeightsInfoResponse,
 )
 from ..logging_context import classify_failure_reason, get_otel_tracer, run_async_with_otel_span, set_request_id
 from ..model_access_control import can_access_model, get_access_denied_error
@@ -87,6 +90,87 @@ router = APIRouter()
 training_manager: TrainingSessionManager | None = None
 training_engine: VerlTrainingEngine | None = None
 inference_manager: SessionManager | None = None  # For multi-LoRA sampling registration
+
+
+def _loaded_training_session_lora_payload(lora_config: Any) -> dict[str, Any] | None:
+    if lora_config is None:
+        return None
+    model_dump = getattr(lora_config, "model_dump", None)
+    if callable(model_dump):
+        payload = model_dump()
+        if not isinstance(payload, dict) or not all(isinstance(key, str) for key in payload):
+            raise TypeError(f"Unsupported lora_config payload type: {type(payload).__name__}")
+        return dict(cast(dict[str, Any], payload))
+    if isinstance(lora_config, dict):
+        return dict(lora_config)
+    if hasattr(lora_config, "__dict__"):
+        return dict(lora_config.__dict__)
+    raise TypeError(f"Unsupported lora_config type: {type(lora_config).__name__}")
+
+
+def _next_loaded_training_session_metadata_version(session: Any) -> int:
+    from ..backend.training_session_manager import TRAINING_SESSION_METADATA_VERSION
+
+    current = max(
+        int(getattr(session, "metadata_version")),
+        TRAINING_SESSION_METADATA_VERSION - 1,
+    )
+    next_version = current + 1
+    session.metadata_version = next_version
+    return next_version
+
+
+async def _persist_loaded_training_session(session: Any, *, request_user_id: str | None) -> None:
+    from ..backend.training_session_manager import MATERIALIZATION_STATE_READY
+    from ..backend.training_session_store import async_upsert_training_session
+    from ..config import RAY_NAMESPACE
+
+    model_id = str(getattr(session, "model_id", "") or "")
+    session_id = str(getattr(session, "session_id", "") or "")
+    base_model = str(getattr(session, "base_model", "") or "")
+    if not model_id or not session_id or not base_model:
+        raise RuntimeError("Cannot persist loaded training session without model_id, session_id, and base_model")
+
+    actor_name = None
+    if training_engine is not None:
+        actor_name = getattr(training_engine, "_resource_pool_actor_names", {}).get(model_id)
+    if actor_name is not None:
+        session.actor_name = str(actor_name or "") or None
+    if not getattr(session, "namespace", None):
+        session.namespace = RAY_NAMESPACE
+
+    metadata_version = _next_loaded_training_session_metadata_version(session)
+    materialization_state = str(
+        getattr(session, "materialization_state", MATERIALIZATION_STATE_READY) or MATERIALIZATION_STATE_READY
+    )
+    await async_upsert_training_session(
+        {
+            "model_id": model_id,
+            "session_id": session_id,
+            "model_seq_id": int(getattr(session, "model_seq_id")),
+            "base_model": base_model,
+            "lora_config": _loaded_training_session_lora_payload(getattr(session, "lora_config", None)),
+            "rollout_correction_config": getattr(session, "rollout_correction_config", None),
+            "user_metadata": dict(getattr(session, "user_metadata", {}) or {}),
+            "learning_rate": float(getattr(session, "learning_rate")),
+            "current_step": int(getattr(session, "current_step")),
+            "backend": str(getattr(session, "backend")),
+            "actor_name": getattr(session, "actor_name", None),
+            "namespace": str(getattr(session, "namespace", RAY_NAMESPACE) or RAY_NAMESPACE),
+            "user_id": getattr(session, "user_id", None) or request_user_id,
+            "created_at": getattr(session, "created_at", None),
+            "last_activity": float(getattr(session, "last_activity")),
+            "metadata_version": metadata_version,
+            "materialization_state": materialization_state,
+            "tokenizer_info": getattr(session, "tokenizer_info", None),
+            "tokenizer_identity": getattr(session, "tokenizer_identity", None),
+            "tokenizer_source_path": getattr(session, "tokenizer_source_path", None),
+        }
+    )
+    if training_manager is not None:
+        mark_persisted = getattr(training_manager, "mark_persisted", None)
+        if callable(mark_persisted):
+            mark_persisted(model_id)
 
 
 async def _claim_checkpoint_or_raise(
@@ -260,6 +344,148 @@ def _resolve_mint_path(
 def _to_mint_path(model_id: str, checkpoint_name: str) -> str:
     """Convert to mint://{model_id}/ URI (legacy format)."""
     return f"mint://{model_id}/{checkpoint_name}"
+
+
+def _infer_train_flags_from_target_modules(target_modules: object) -> tuple[bool, bool, bool]:
+    if not isinstance(target_modules, list) or not all(isinstance(name, str) for name in target_modules):
+        raise ValueError("Checkpoint adapter_config.json target_modules must be a list of strings")
+    names = set(target_modules)
+    attn_names = {
+        "linear_qkv",
+        "linear_proj",
+        "linear_q_proj",
+        "linear_kv_down_proj",
+        "linear_kv_up_proj",
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "q_a_proj",
+        "q_b_proj",
+        "kv_a_proj_with_mqa",
+        "kv_b_proj",
+        "wq_b",
+        "wk",
+        "weights_proj",
+    }
+    mlp_names = {"linear_fc1", "linear_fc2", "gate_proj", "up_proj", "down_proj", "gate"}
+    unembed_names = {"lm_head", "output_layer", "unembed"}
+    return bool(names & attn_names), bool(names & mlp_names), bool(names & unembed_names)
+
+
+def _read_checkpoint_json_object(path: str, *, label: str) -> dict[str, object]:
+    try:
+        with open(path, encoding="utf-8") as f:
+            payload = json.load(f)
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail=f"Malformed {label}: {e.msg}") from e
+    except OSError as e:
+        raise HTTPException(status_code=400, detail=f"Unable to read {label}: {e}") from e
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail=f"Invalid {label}: expected JSON object")
+    return payload
+
+
+def _checkpoint_can_recreate_training_client(path: str, *, backend: str, declared_type: object) -> bool:
+    if backend in {"openpi_fast", "openpi_pi05"}:
+        return checkpoint_has_openpi_training_state(path)
+    if backend == "megatron":
+        try:
+            return any(name.startswith("mp_rank_") and name.endswith("_adapter.pt") for name in os.listdir(path))
+        except OSError:
+            return False
+    if backend != "peft":
+        return False
+    try:
+        names = os.listdir(path)
+    except OSError:
+        return False
+    has_adapter_model = "adapter_model.safetensors" in names
+    return has_adapter_model and (declared_type == "training" or checkpoint_has_optimizer_state(path))
+
+
+@router.post("/weights_info", response_model=WeightsInfoResponse)
+async def weights_info(
+    request: WeightsInfoRequest,
+    http_request: Request,
+) -> WeightsInfoResponse:
+    user_id = _get_user_id(http_request)
+    try:
+        path = _resolve_mint_path(
+            request.tinker_path,
+            user_id=user_id,
+            is_admin=can_bypass_ownership(http_request),
+        )
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="Access denied")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Checkpoint not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if not os.path.isdir(path):
+        raise HTTPException(status_code=404, detail="Checkpoint not found")
+
+    metadata_path = os.path.join(path, "metadata.json")
+    adapter_cfg_path = os.path.join(path, "adapter_config.json")
+    adapter_model_path = os.path.join(path, "adapter_model.safetensors")
+
+    metadata: dict[str, object] = {}
+    if os.path.exists(metadata_path):
+        metadata = _read_checkpoint_json_object(metadata_path, label="metadata.json")
+
+    declared_type = metadata.get("checkpoint_type", metadata.get("type"))
+    if declared_type == "sampler" or "/sampler_weights/" in request.tinker_path:
+        raise HTTPException(status_code=400, detail="Sampler checkpoint cannot recreate a training client")
+
+    adapter_cfg: dict[str, object] = {}
+    if os.path.exists(adapter_cfg_path):
+        adapter_cfg = _read_checkpoint_json_object(adapter_cfg_path, label="adapter_config.json")
+
+    base_model = metadata.get("model_name")
+    if not isinstance(base_model, str) or not base_model:
+        base_model = adapter_cfg.get("base_model_name_or_path")
+    if not isinstance(base_model, str) or not base_model:
+        raise HTTPException(status_code=400, detail="Checkpoint metadata missing base model")
+    from ..routes.training import _infer_training_backend_for_base_model
+
+    try:
+        backend = _infer_training_backend_for_base_model(base_model)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if not _checkpoint_can_recreate_training_client(path, backend=backend, declared_type=declared_type):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Checkpoint artifacts cannot recreate a {backend} training client",
+        )
+
+    is_lora = bool(
+        os.path.exists(adapter_cfg_path)
+        or os.path.exists(adapter_model_path)
+        or any(name.endswith("_adapter.pt") for name in os.listdir(path))
+    )
+    lora_rank = adapter_cfg.get("r")
+    if not isinstance(lora_rank, int) or isinstance(lora_rank, bool) or lora_rank <= 0:
+        if is_lora:
+            raise HTTPException(status_code=400, detail="Invalid or missing LoRA rank in adapter_config.json")
+        lora_rank = None
+
+    train_attn = train_mlp = train_unembed = None
+    if is_lora:
+        try:
+            train_attn, train_mlp, train_unembed = _infer_train_flags_from_target_modules(
+                adapter_cfg.get("target_modules")
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+    return WeightsInfoResponse(
+        base_model=base_model,
+        is_lora=is_lora,
+        lora_rank=lora_rank,
+        train_unembed=train_unembed,
+        train_mlp=train_mlp,
+        train_attn=train_attn,
+    )
 
 
 def _checkpoint_rank(storage_tier: str | None) -> int:
@@ -1581,10 +1807,28 @@ async def _do_load_state(
             await training_engine.create_training_session(session)
             await _load_state_once()
 
-        await future_store.async_resolve(request_id, {
+        metadata_persisted = True
+        metadata_persist_error = None
+        try:
+            await _persist_loaded_training_session(session, request_user_id=user_id)
+        except Exception as persist_exc:
+            metadata_persisted = False
+            metadata_persist_error = f"{type(persist_exc).__name__}: {persist_exc}"
+            logger.exception(
+                "[weights.load_state] detached metadata persistence failed after actor load succeeded: "
+                "request_id=%s model_id=%s error_type=%s",
+                str(request_id),
+                str(request.model_id),
+                type(persist_exc).__name__,
+            )
+        payload: dict[str, object] = {
             "path": request.path,
             "type": "load_weights",
-        })
+        }
+        if not metadata_persisted:
+            payload["metadata_persisted"] = False
+            payload["metadata_persist_error"] = metadata_persist_error
+        await future_store.async_resolve(request_id, payload)
 
     except Exception as e:
         logger.exception(

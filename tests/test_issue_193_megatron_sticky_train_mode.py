@@ -3,6 +3,7 @@ import logging
 import time
 import sys
 import builtins
+from pathlib import Path
 
 import pytest
 
@@ -1710,14 +1711,19 @@ def test_issue_193_load_checkpoint_without_optimizer_clears_session_cache_and_re
     group.lora_rank = 8
 
     ensure_calls: list[tuple[str, dict]] = []
+    prepare_calls: list[tuple[str, object]] = []
     load_adapter_calls: list[tuple[str, dict]] = []
     reset_calls: list[float | None] = []
 
     group._resolve_required_session_id = lambda session_id, op: session_id
     group._ensure_session_loaded = lambda session_id, **kwargs: ensure_calls.append((session_id, kwargs))
+    group._prepare_session_for_explicit_load = (
+        lambda session_id, traceparent=None: prepare_calls.append((session_id, traceparent))
+    )
     group.load_adapter_state = lambda load_path, **kwargs: load_adapter_calls.append((load_path, kwargs)) or {"status": "ok"}
     group.reset_optimizer = (
-        lambda learning_rate=None, traceparent=None: reset_calls.append((learning_rate, traceparent)) or {"status": "ok"}
+        lambda learning_rate=None, traceparent=None, zero_grad_buffers=True: reset_calls.append((learning_rate, traceparent))
+        or {"status": "ok"}
     )
 
     class _FakeClearRemoteMethod:
@@ -1743,6 +1749,10 @@ def test_issue_193_load_checkpoint_without_optimizer_clears_session_cache_and_re
     ckpt_dir = tmp_path / "megatron_nonresume"
     ckpt_dir.mkdir()
     (ckpt_dir / "mp_rank_00_adapter.pt").write_bytes(b"stub")
+    (ckpt_dir / "adapter_config.json").write_text(
+        '{"r": 8, "target_modules": ["gate_proj", "up_proj", "down_proj"]}',
+        encoding="utf-8",
+    )
     (ckpt_dir / "training_meta.json").write_text('{"current_step": 42, "learning_rate": 0.0007}')
 
     result = group.load_checkpoint(
@@ -1754,12 +1764,8 @@ def test_issue_193_load_checkpoint_without_optimizer_clears_session_cache_and_re
         train_unembed=False,
     )
 
-    assert ensure_calls == [
-        (
-            "target_session",
-            {"traceparent": None, "train_attn": False, "train_mlp": True, "train_unembed": False},
-        )
-    ]
+    assert ensure_calls == []
+    assert prepare_calls == [("target_session", None)]
     assert load_adapter_calls == [
         (
             str(ckpt_dir),
@@ -1781,7 +1787,222 @@ def test_issue_193_load_checkpoint_without_optimizer_clears_session_cache_and_re
     assert group.learning_rate == pytest.approx(7e-4)
 
 
-def test_issue_193_load_checkpoint_invalid_meta_preserves_step_and_lr(tmp_path, monkeypatch, caplog):
+def test_issue_417_optimizerless_load_accepts_adapter_checkpoint_without_training_meta(tmp_path, monkeypatch):
+    group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
+    group = object.__new__(group_cls)
+    group._current_session = "current_session"
+    group._session_unknown_due_to_partial_swap = False
+    group._step_count = 99
+    group.learning_rate = 1e-4
+    group._actual_rank = 8
+    group.lora_rank = 8
+    group._session_manager = None
+
+    prepare_calls: list[tuple[str, object]] = []
+    load_adapter_calls: list[tuple[str, dict]] = []
+    reset_calls: list[float | None] = []
+
+    group._resolve_required_session_id = lambda session_id, op: session_id
+    group._prepare_session_for_explicit_load = (
+        lambda session_id, traceparent=None: prepare_calls.append((session_id, traceparent))
+    )
+    group.load_adapter_state = lambda load_path, **kwargs: load_adapter_calls.append((load_path, kwargs)) or {"status": "ok"}
+    group.reset_optimizer = (
+        lambda learning_rate=None, traceparent=None, zero_grad_buffers=True: reset_calls.append((learning_rate, traceparent))
+        or {"status": "ok"}
+    )
+    group.workers = []
+
+    import ray as ray_module
+
+    monkeypatch.setattr(ray_module, "get", lambda futures, timeout=None: futures)
+
+    ckpt_dir = tmp_path / "megatron_adapter_only"
+    ckpt_dir.mkdir()
+    (ckpt_dir / "mp_rank_00_adapter.pt").write_bytes(b"stub")
+    (ckpt_dir / "adapter_config.json").write_text(
+        '{"r": 8, "target_modules": ["gate_proj", "up_proj", "down_proj"]}',
+        encoding="utf-8",
+    )
+
+    result = group.load_checkpoint(str(ckpt_dir), load_optimizer=False, session_id="target_session")
+
+    assert prepare_calls == [("target_session", None)]
+    assert load_adapter_calls == [
+        (
+            str(ckpt_dir),
+            {
+                "actual_rank": 8,
+                "traceparent": None,
+                "train_attn": False,
+                "train_mlp": True,
+                "train_unembed": False,
+            },
+        )
+    ]
+    assert reset_calls == [(pytest.approx(1e-4), None)]
+    assert result["current_step"] == 0
+    assert result["learning_rate"] == pytest.approx(1e-4)
+    assert result["optimizer_restored"] is False
+    assert result["optimizer_reset"] is True
+    assert group._step_count == 0
+    assert group.learning_rate == pytest.approx(1e-4)
+
+
+def test_issue_417_optimizerless_load_warns_for_legacy_rank_shard_without_adapter_config(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
+    group = object.__new__(group_cls)
+    group._current_session = "current_session"
+    group._session_unknown_due_to_partial_swap = False
+    group._step_count = 99
+    group.learning_rate = 1e-4
+    group._actual_rank = 12
+    group.lora_rank = 8
+    group._train_attn = False
+    group._train_mlp = True
+    group._train_unembed = False
+    group._session_manager = None
+
+    prepare_calls: list[tuple[str, object]] = []
+    load_adapter_calls: list[tuple[str, dict]] = []
+    reset_calls: list[float | None] = []
+
+    group._resolve_required_session_id = lambda session_id, op: session_id
+    group._prepare_session_for_explicit_load = (
+        lambda session_id, traceparent=None: prepare_calls.append((session_id, traceparent))
+    )
+    group.load_adapter_state = lambda load_path, **kwargs: load_adapter_calls.append((load_path, kwargs)) or {"status": "ok"}
+    group.reset_optimizer = (
+        lambda learning_rate=None, traceparent=None, zero_grad_buffers=True: reset_calls.append((learning_rate, traceparent))
+        or {"status": "ok"}
+    )
+    group.workers = []
+
+    import ray as ray_module
+
+    monkeypatch.setattr(ray_module, "get", lambda futures, timeout=None: futures)
+
+    ckpt_dir = tmp_path / "legacy_rank_shard"
+    ckpt_dir.mkdir()
+    (ckpt_dir / "mp_rank_00_adapter.pt").write_bytes(b"stub")
+
+    with caplog.at_level(logging.WARNING):
+        result = group.load_checkpoint(str(ckpt_dir), load_optimizer=False, session_id="target_session")
+
+    assert prepare_calls == [("target_session", None)]
+    assert load_adapter_calls == [
+        (
+            str(ckpt_dir),
+            {
+                "actual_rank": 12,
+                "traceparent": None,
+                "train_attn": False,
+                "train_mlp": True,
+                "train_unembed": False,
+            },
+        )
+    ]
+    assert reset_calls == [(pytest.approx(1e-4), None)]
+    assert result["checkpoint_format"] == "legacy_rank_shard_without_adapter_config"
+    assert "Legacy Megatron rank-shard checkpoint is missing adapter_config.json" in result["warning"]
+    assert result["current_step"] == 0
+    assert result["learning_rate"] == pytest.approx(1e-4)
+    assert result["train_attn"] is False
+    assert result["train_mlp"] is True
+    assert result["train_unembed"] is False
+    assert group._actual_rank == 12
+    assert group._step_count == 0
+    assert group.learning_rate == pytest.approx(1e-4)
+    assert any("Legacy Megatron rank-shard checkpoint is missing adapter_config.json" in rec.getMessage() for rec in caplog.records)
+
+
+def test_issue_417_optimizer_resume_accepts_legacy_rank_shard_without_adapter_config(tmp_path, monkeypatch):
+    import ray as ray_module
+
+    group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
+    group = object.__new__(group_cls)
+    group._current_session = "current_session"
+    group._session_unknown_due_to_partial_swap = False
+    group._actual_rank = 12
+    group.lora_rank = 8
+    group._train_attn = False
+    group._train_mlp = True
+    group._train_unembed = False
+    group._session_manager = None
+    group._step_count = 99
+    group.learning_rate = 1e-4
+
+    prepare_calls: list[tuple[str, object]] = []
+    load_adapter_calls: list[tuple[str, dict]] = []
+
+    group._resolve_required_session_id = lambda session_id, op: session_id
+    group._prepare_session_for_explicit_load = (
+        lambda session_id, traceparent=None: prepare_calls.append((session_id, traceparent))
+    )
+    group.load_adapter_state = lambda load_path, **kwargs: load_adapter_calls.append((load_path, kwargs)) or {"status": "ok"}
+
+    class _FakeCheckOptimizerStateExistsRemoteMethod:
+        def remote(self, load_path, **kwargs):
+            return {"rank": 0, "exists": True, "optimizer_file": "rank0_optimizer.pt"}
+
+    class _FakeLoadOptimizerStateRemoteMethod:
+        def remote(self, load_path, **kwargs):
+            return {"rank": 0, "status": "ok"}
+
+    class _FakeMarkSessionLoadedRemoteMethod:
+        def remote(self, session_id):
+            return {"session_id": session_id, "status": "ok"}
+
+    class _FakeWorker:
+        check_optimizer_state_exists = _FakeCheckOptimizerStateExistsRemoteMethod()
+        load_optimizer_state = _FakeLoadOptimizerStateRemoteMethod()
+        mark_session_loaded = _FakeMarkSessionLoadedRemoteMethod()
+
+    group.workers = [_FakeWorker()]
+    monkeypatch.setattr(ray_module, "get", lambda futures, timeout=None: futures)
+
+    ckpt_dir = tmp_path / "legacy_rank_shard_with_optimizer"
+    ckpt_dir.mkdir()
+    (ckpt_dir / "mp_rank_00_adapter.pt").write_bytes(b"stub")
+    (ckpt_dir / "mp_rank_00_optimizer.pt").write_bytes(b"optimizer")
+    (ckpt_dir / "training_meta.json").write_text(
+        '{"current_step": 7, "learning_rate": 0.0003}',
+        encoding="utf-8",
+    )
+
+    result = group.load_checkpoint(str(ckpt_dir), load_optimizer=True, session_id="target_session")
+
+    assert prepare_calls == [("target_session", None)]
+    assert load_adapter_calls == [
+        (
+            str(ckpt_dir),
+            {
+                "actual_rank": 12,
+                "traceparent": None,
+                "train_attn": False,
+                "train_mlp": True,
+                "train_unembed": False,
+            },
+        )
+    ]
+    assert result["optimizer_restored"] is True
+    assert result["optimizer_reset"] is False
+    assert result["checkpoint_format"] == "legacy_rank_shard_without_adapter_config"
+    assert result["current_step"] == 7
+    assert result["learning_rate"] == pytest.approx(3e-4)
+    assert result["train_attn"] is False
+    assert result["train_mlp"] is True
+    assert result["train_unembed"] is False
+    assert group._actual_rank == 12
+    assert group._step_count == 7
+    assert group.learning_rate == pytest.approx(3e-4)
+
+
+def test_issue_193_load_checkpoint_invalid_meta_fails_before_state_changes(tmp_path, monkeypatch):
     group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
     group = object.__new__(group_cls)
     group._current_session = "current_session"
@@ -1792,14 +2013,19 @@ def test_issue_193_load_checkpoint_invalid_meta_preserves_step_and_lr(tmp_path, 
     group.lora_rank = 8
 
     ensure_calls: list[tuple[str, dict]] = []
+    prepare_calls: list[tuple[str, object]] = []
     load_adapter_calls: list[tuple[str, dict]] = []
     reset_calls: list[float | None] = []
 
     group._resolve_required_session_id = lambda session_id, op: session_id
     group._ensure_session_loaded = lambda session_id, **kwargs: ensure_calls.append((session_id, kwargs))
+    group._prepare_session_for_explicit_load = (
+        lambda session_id, traceparent=None: prepare_calls.append((session_id, traceparent))
+    )
     group.load_adapter_state = lambda load_path, **kwargs: load_adapter_calls.append((load_path, kwargs)) or {"status": "ok"}
     group.reset_optimizer = (
-        lambda learning_rate=None, traceparent=None: reset_calls.append((learning_rate, traceparent)) or {"status": "ok"}
+        lambda learning_rate=None, traceparent=None, zero_grad_buffers=True: reset_calls.append((learning_rate, traceparent))
+        or {"status": "ok"}
     )
 
     class _FakeClearRemoteMethod:
@@ -1825,37 +2051,230 @@ def test_issue_193_load_checkpoint_invalid_meta_preserves_step_and_lr(tmp_path, 
     ckpt_dir = tmp_path / "megatron_invalid_meta"
     ckpt_dir.mkdir()
     (ckpt_dir / "mp_rank_00_adapter.pt").write_bytes(b"stub")
+    (ckpt_dir / "adapter_config.json").write_text(
+        '{"r": 8, "target_modules": ["gate_proj", "up_proj", "down_proj"]}',
+        encoding="utf-8",
+    )
     (ckpt_dir / "training_meta.json").write_text('{"current_step": "bad", "learning_rate": "oops"}')
 
-    with caplog.at_level(logging.WARNING):
-        result = group.load_checkpoint(
+    with pytest.raises(RuntimeError, match="Invalid current_step"):
+        group.load_checkpoint(
             str(ckpt_dir),
             load_optimizer=False,
             session_id="target_session",
         )
 
-    assert ensure_calls == [("target_session", {"traceparent": None, "train_attn": None, "train_mlp": None, "train_unembed": None})]
-    assert load_adapter_calls == [
-        (
-            str(ckpt_dir),
-            {
-                "actual_rank": 8,
-                "traceparent": None,
-                "train_attn": None,
-                "train_mlp": None,
-                "train_unembed": None,
-            },
-        )
-    ]
-    assert worker_0.clear_session_state.calls == [("target_session", {"traceparent": None})]
-    assert worker_1.clear_session_state.calls == [("target_session", {"traceparent": None})]
-    assert reset_calls == [(pytest.approx(1e-4), None)]
-    assert result["current_step"] == "bad"
-    assert result["learning_rate"] == "oops"
+    assert ensure_calls == []
+    assert prepare_calls == []
+    assert load_adapter_calls == []
+    assert worker_0.clear_session_state.calls == []
+    assert worker_1.clear_session_state.calls == []
+    assert reset_calls == []
     assert group._step_count == 99
     assert group.learning_rate == pytest.approx(1e-4)
-    assert any("Invalid current_step" in rec.getMessage() for rec in caplog.records)
-    assert any("Invalid learning_rate" in rec.getMessage() for rec in caplog.records)
+
+
+def test_issue_417_load_checkpoint_negative_step_fails_before_state_changes(tmp_path, monkeypatch):
+    group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
+    group = object.__new__(group_cls)
+    group._current_session = "current_session"
+    group._session_unknown_due_to_partial_swap = False
+    group._step_count = 99
+    group.learning_rate = 1e-4
+    group._actual_rank = 8
+    group.lora_rank = 8
+
+    prepare_calls: list[tuple[str, object]] = []
+    load_adapter_calls: list[tuple[str, dict]] = []
+
+    group._resolve_required_session_id = lambda session_id, op: session_id
+    group._prepare_session_for_explicit_load = (
+        lambda session_id, traceparent=None: prepare_calls.append((session_id, traceparent))
+    )
+    group.load_adapter_state = lambda load_path, **kwargs: load_adapter_calls.append((load_path, kwargs)) or {"status": "ok"}
+    group.workers = []
+
+    import ray as ray_module
+
+    monkeypatch.setattr(ray_module, "get", lambda futures, timeout=None: futures)
+
+    ckpt_dir = tmp_path / "megatron_negative_step"
+    ckpt_dir.mkdir()
+    (ckpt_dir / "mp_rank_00_adapter.pt").write_bytes(b"stub")
+    (ckpt_dir / "adapter_config.json").write_text(
+        '{"r": 8, "target_modules": ["gate_proj", "up_proj", "down_proj"]}',
+        encoding="utf-8",
+    )
+    (ckpt_dir / "training_meta.json").write_text(
+        '{"current_step": -1, "learning_rate": 0.0007}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="expected non-negative int"):
+        group.load_checkpoint(str(ckpt_dir), load_optimizer=False, session_id="target_session")
+
+    assert prepare_calls == []
+    assert load_adapter_calls == []
+    assert group._step_count == 99
+    assert group.learning_rate == pytest.approx(1e-4)
+
+
+def test_issue_417_training_meta_cannot_override_load_authority(tmp_path, monkeypatch):
+    group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
+    group = object.__new__(group_cls)
+    group._current_session = "current_session"
+    group._session_unknown_due_to_partial_swap = False
+    group._step_count = 99
+    group.learning_rate = 1e-4
+    group._actual_rank = 8
+    group.lora_rank = 8
+
+    prepare_calls: list[tuple[str, object]] = []
+    load_adapter_calls: list[tuple[str, dict]] = []
+
+    group._resolve_required_session_id = lambda session_id, op: session_id
+    group._prepare_session_for_explicit_load = (
+        lambda session_id, traceparent=None: prepare_calls.append((session_id, traceparent))
+    )
+    group.load_adapter_state = lambda load_path, **kwargs: load_adapter_calls.append((load_path, kwargs)) or {"status": "ok"}
+    group.workers = []
+
+    import ray as ray_module
+
+    monkeypatch.setattr(ray_module, "get", lambda futures, timeout=None: futures)
+
+    ckpt_dir = tmp_path / "megatron_protected_meta"
+    ckpt_dir.mkdir()
+    (ckpt_dir / "mp_rank_00_adapter.pt").write_bytes(b"stub")
+    (ckpt_dir / "adapter_config.json").write_text(
+        '{"r": 8, "target_modules": ["gate_proj", "up_proj", "down_proj"]}',
+        encoding="utf-8",
+    )
+    (ckpt_dir / "training_meta.json").write_text(
+        '{"current_step": 42, "learning_rate": 0.0007, "checkpoint_path": "/tmp/wrong"}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="protected load metadata keys"):
+        group.load_checkpoint(str(ckpt_dir), load_optimizer=False, session_id="target_session")
+
+    assert prepare_calls == []
+    assert load_adapter_calls == []
+    assert group._step_count == 99
+    assert group.learning_rate == pytest.approx(1e-4)
+
+
+def test_issue_417_failed_explicit_load_leaves_session_unknown(tmp_path, monkeypatch):
+    group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
+    group = object.__new__(group_cls)
+    group._current_session = "old_session"
+    group._session_unknown_due_to_partial_swap = False
+    group._step_count = 99
+    group.learning_rate = 1e-4
+    group._actual_rank = 8
+    group.lora_rank = 8
+    group.workers = []
+    group._session_manager = None
+    group._bind_traceparent = lambda traceparent: None
+    group._swap_session_on_workers = lambda session_id: {"switched": True}
+    group.load_adapter_state = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("adapter failed"))
+
+    import ray as ray_module
+
+    monkeypatch.setattr(ray_module, "get", lambda futures, timeout=None: futures)
+
+    ckpt_dir = tmp_path / "megatron_failed_load"
+    ckpt_dir.mkdir()
+    (ckpt_dir / "mp_rank_00_adapter.pt").write_bytes(b"stub")
+    (ckpt_dir / "adapter_config.json").write_text(
+        '{"r": 8, "target_modules": ["gate_proj", "up_proj", "down_proj"]}',
+        encoding="utf-8",
+    )
+    (ckpt_dir / "training_meta.json").write_text(
+        '{"current_step": 42, "learning_rate": 0.0007}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="adapter failed"):
+        group.load_checkpoint(str(ckpt_dir), load_optimizer=False, session_id="target_session")
+
+    assert group._current_session is None
+    assert group._session_unknown_due_to_partial_swap is True
+    assert group._step_count == 99
+    assert group.learning_rate == pytest.approx(1e-4)
+
+
+def test_issue_417_failed_explicit_load_preserves_target_actor_authority(tmp_path, monkeypatch):
+    from tinker_server.backend.megatron_distributed import MegatronSessionStateManager
+
+    manager = MegatronSessionStateManager(base_path=str(tmp_path / "session_store"))
+    target_path = tmp_path / "target_checkpoint"
+    target_path.mkdir()
+    (target_path / "mp_rank_00_adapter.pt").write_bytes(b"target")
+    session_path = Path(manager.get_session_path("target_session"))
+    session_path.mkdir(parents=True, exist_ok=True)
+    (session_path / "mp_rank_00_adapter.pt").write_bytes(b"cached")
+    manager.save_metadata(
+        "target_session",
+        step=7,
+        lr=1e-4,
+        actual_rank=8,
+        checkpoint_path=str(target_path),
+    )
+    manager.mark_actor_only_state(
+        "target_session",
+        reason="optim_step",
+        actor_name="actor-a",
+    )
+    snapshot_dir = session_path / "actor_only_state"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    rank_path = snapshot_dir / "rank_0000.pt"
+    rank_path.write_bytes(b"rank-state")
+    manager.save_persisted_actor_only_state(
+        "target_session",
+        actor_name="actor-a",
+        worker_entries=[{"rank": 0, "path": str(rank_path), "bytes": len(b"rank-state")}],
+    )
+
+    group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
+    group = object.__new__(group_cls)
+    group._current_session = "old_session"
+    group._session_unknown_due_to_partial_swap = False
+    group._step_count = 99
+    group.learning_rate = 1e-4
+    group._actual_rank = 8
+    group.lora_rank = 8
+    group.workers = []
+    group._session_manager = manager
+    group._bind_traceparent = lambda traceparent: None
+    group.load_adapter_state = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("adapter failed"))
+
+    import ray as ray_module
+
+    monkeypatch.setattr(ray_module, "get", lambda futures, timeout=None: futures)
+
+    ckpt_dir = tmp_path / "megatron_failed_preserve"
+    ckpt_dir.mkdir()
+    (ckpt_dir / "mp_rank_00_adapter.pt").write_bytes(b"stub")
+    (ckpt_dir / "adapter_config.json").write_text(
+        '{"r": 8, "target_modules": ["gate_proj", "up_proj", "down_proj"]}',
+        encoding="utf-8",
+    )
+    (ckpt_dir / "training_meta.json").write_text(
+        '{"current_step": 42, "learning_rate": 0.0007}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="adapter failed"):
+        group.load_checkpoint(str(ckpt_dir), load_optimizer=False, session_id="target_session")
+
+    assert manager.has_actor_only_state("target_session") is True
+    persisted = manager.get_persisted_actor_only_state("target_session")
+    assert persisted is not None
+    assert persisted["actor_name"] == "actor-a"
+    assert rank_path.exists()
+    assert group._current_session is None
+    assert group._session_unknown_due_to_partial_swap is True
 
 
 def _make_group_with_current_session(current_session: str | None = "s1"):
@@ -1884,6 +2303,7 @@ def test_issue_193_existing_session_switch_does_not_reset_expert_bias(monkeypatc
     group._get_optimizer_param_counts = lambda: {}
 
     calls = {"load": 0, "reset": 0, "reinit": 0}
+    load_calls: list[tuple[tuple, dict]] = []
 
     class _SessionManager:
         def get_session_path(self, session_id):
@@ -1897,7 +2317,14 @@ def test_issue_193_existing_session_switch_does_not_reset_expert_bias(monkeypatc
 
         def get_metadata(self, session_id):
             if session_id == "existing-session":
-                return {"step": 11, "lr": 3e-4, "actual_rank": 6}
+                return {
+                    "step": 11,
+                    "lr": 3e-4,
+                    "actual_rank": 6,
+                    "train_attn": False,
+                    "train_mlp": True,
+                    "train_unembed": False,
+                }
             return None
 
     group._session_manager = _SessionManager()
@@ -1905,6 +2332,7 @@ def test_issue_193_existing_session_switch_does_not_reset_expert_bias(monkeypatc
 
     def fake_load(*args, **kwargs):
         calls["load"] += 1
+        load_calls.append((args, kwargs))
         return {"status": "ok"}
 
     def fake_reset(*args, **kwargs):
@@ -1921,10 +2349,16 @@ def test_issue_193_existing_session_switch_does_not_reset_expert_bias(monkeypatc
 
     group._ensure_session_loaded("existing-session")
 
-    assert calls == {"load": 1, "reset": 1, "reinit": 0}
+    assert calls == {"load": 1, "reset": 0, "reinit": 0}
     assert group._step_count == 11
     assert group.learning_rate == pytest.approx(3e-4)
     assert group._actual_rank == 6
+    assert load_calls[0][1]["train_attn"] is False
+    assert load_calls[0][1]["train_mlp"] is True
+    assert load_calls[0][1]["train_unembed"] is False
+    assert group._train_attn is False
+    assert group._train_mlp is True
+    assert group._train_unembed is False
 
 
 # ---------------------------------------------------------------------------
@@ -2094,8 +2528,30 @@ def test_issue_193_partial_swap_explicit_session_recovers_save_checkpoint(monkey
             },
         )
     ]
-    assert prime_calls == []
-    assert clear_actor_only_calls == []
+    assert len(prime_calls) == 1
+    (
+        prime_session_id,
+        prime_path,
+        prime_step,
+        prime_lr,
+        prime_rank,
+        prime_optimizer_restored,
+        prime_checkpoint_identity,
+        prime_kwargs,
+    ) = prime_calls[0]
+    assert prime_session_id == "recovered_session"
+    assert prime_path == "/tmp/recovery_ckpt"
+    assert prime_step == 12
+    assert prime_lr == pytest.approx(3e-4)
+    assert prime_rank == 16
+    assert prime_optimizer_restored is True
+    assert prime_checkpoint_identity is None
+    assert prime_kwargs == {
+        "train_attn": False,
+        "train_mlp": True,
+        "train_unembed": False,
+    }
+    assert clear_actor_only_calls == ["recovered_session"]
 
 
 # ---------------------------------------------------------------------------
@@ -2180,6 +2636,7 @@ def test_issue_193_partial_swap_explicit_session_recovers_optim_step(monkeypatch
     group = object.__new__(group_cls)
     group._current_session = None
     group._step_count = 5
+    group.base_model = "Qwen/Qwen3-0.6B"
 
     ensure_calls: list[tuple[str, dict]] = []
 
@@ -2188,6 +2645,11 @@ def test_issue_193_partial_swap_explicit_session_recovers_optim_step(monkeypatch
         return {"switched": False}
 
     group._ensure_session_loaded = fake_ensure_session_loaded
+    group._session_manager = type(
+        "SessionMgr",
+        (),
+        {"mark_actor_only_state": staticmethod(lambda *args, **kwargs: None)},
+    )()
 
     class _FakeOptimStepRemoteMethod:
         def __init__(self):
@@ -2332,6 +2794,10 @@ def test_issue_193_partial_swap_explicit_session_recovers_load_checkpoint(monkey
     ckpt_dir = tmp_path / "recovery_ckpt"
     ckpt_dir.mkdir()
     (ckpt_dir / "mp_rank_00_adapter.pt").write_text("placeholder", encoding="utf-8")
+    (ckpt_dir / "adapter_config.json").write_text(
+        json.dumps({"r": 8, "target_modules": ["gate_proj", "up_proj", "down_proj"]}),
+        encoding="utf-8",
+    )
     (ckpt_dir / "training_meta.json").write_text(
         json.dumps({"current_step": 21, "learning_rate": 3e-4}),
         encoding="utf-8",
@@ -2342,20 +2808,20 @@ def test_issue_193_partial_swap_explicit_session_recovers_load_checkpoint(monkey
     group._current_session = None
     group._actual_rank = 8
     group.lora_rank = 16
+    group.base_model = "Qwen/Qwen3-0.6B"
     group.learning_rate = 1e-4
     group._step_count = 0
 
-    ensure_calls: list[tuple[str, dict]] = []
+    prepare_calls: list[tuple[str, object]] = []
     load_adapter_calls: list[tuple[str, dict]] = []
-
-    def fake_ensure_session_loaded(session_id, **kwargs):
-        ensure_calls.append((session_id, kwargs))
 
     def fake_load_adapter_state(load_path, **kwargs):
         load_adapter_calls.append((load_path, kwargs))
         return {"status": "ok"}
 
-    group._ensure_session_loaded = fake_ensure_session_loaded
+    group._prepare_session_for_explicit_load = (
+        lambda session_id, traceparent=None: prepare_calls.append((session_id, traceparent))
+    )
     group.load_adapter_state = fake_load_adapter_state
 
     class _FakeLoadOptimizerStateRemoteMethod:
@@ -2407,17 +2873,7 @@ def test_issue_193_partial_swap_explicit_session_recovers_load_checkpoint(monkey
         train_unembed=False,
     )
 
-    assert ensure_calls == [
-        (
-            "recovered_session",
-            {
-                "traceparent": None,
-                "train_attn": False,
-                "train_mlp": True,
-                "train_unembed": False,
-            },
-        )
-    ]
+    assert prepare_calls == [("recovered_session", None)]
     assert load_adapter_calls == [
         (
             str(ckpt_dir),
@@ -2447,7 +2903,10 @@ def test_issue_193_same_path_fast_path_requires_checkpoint_optimizer_when_reques
     ckpt_dir = tmp_path / "same_path_ckpt"
     ckpt_dir.mkdir()
     (ckpt_dir / "mp_rank_00_adapter.pt").write_text("placeholder", encoding="utf-8")
-    (ckpt_dir / "adapter_config.json").write_text(json.dumps({"r": 8}), encoding="utf-8")
+    (ckpt_dir / "adapter_config.json").write_text(
+        json.dumps({"r": 8, "target_modules": ["gate_proj", "up_proj", "down_proj"]}),
+        encoding="utf-8",
+    )
     (ckpt_dir / "training_meta.json").write_text(
         json.dumps({"current_step": 5, "learning_rate": 2e-4}),
         encoding="utf-8",
@@ -2458,15 +2917,20 @@ def test_issue_193_same_path_fast_path_requires_checkpoint_optimizer_when_reques
     group._current_session = "current_session"
     group._actual_rank = 8
     group.lora_rank = 16
+    group.base_model = "Qwen/Qwen3-0.6B"
     group.learning_rate = 1e-4
     group._step_count = 0
     group._session_unknown_due_to_partial_swap = False
 
     ensure_calls: list[tuple[str, dict]] = []
+    prepare_calls: list[tuple[str, object]] = []
     load_adapter_calls: list[tuple[str, dict]] = []
 
     group._ensure_session_loaded = (
         lambda session_id, **kwargs: ensure_calls.append((session_id, kwargs)) or {"switched": False}
+    )
+    group._prepare_session_for_explicit_load = (
+        lambda session_id, traceparent=None: prepare_calls.append((session_id, traceparent))
     )
     group.load_adapter_state = lambda load_path, **kwargs: load_adapter_calls.append((load_path, kwargs)) or {"status": "ok"}
     group._bind_traceparent = lambda traceparent: None
@@ -2532,26 +2996,17 @@ def test_issue_193_same_path_fast_path_requires_checkpoint_optimizer_when_reques
 
     result = group.load_checkpoint(str(ckpt_dir), load_optimizer=True, session_id="target_session")
 
-    assert ensure_calls == [
-        (
-            "target_session",
-            {
-                "traceparent": None,
-                "train_attn": None,
-                "train_mlp": None,
-                "train_unembed": None,
-            },
-        )
-    ]
+    assert ensure_calls == []
+    assert prepare_calls == [("target_session", None)]
     assert load_adapter_calls == [
         (
             str(ckpt_dir),
             {
                 "actual_rank": 8,
                 "traceparent": None,
-                "train_attn": None,
-                "train_mlp": None,
-                "train_unembed": None,
+                "train_attn": False,
+                "train_mlp": True,
+                "train_unembed": False,
             },
         )
     ]

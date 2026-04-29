@@ -51,7 +51,7 @@ def test_issue_193_load_weights_invalid_meta_warns_without_pollution(monkeypatch
     assert any("load_weights" in rec.getMessage() for rec in caplog.records)
 
 
-def test_issue_193_megatron_load_weights_invalid_meta_marks_session_loaded_with_null_actual_rank(monkeypatch, caplog):
+def test_issue_193_megatron_load_weights_invalid_meta_fails_loud(monkeypatch):
     engine = VerlTrainingEngine()
     model_id = "model_issue_193_invalid_meta_megatron_load"
     worker = _FakeLoadWorker(ref="invalid-meta-megatron-load-ref")
@@ -86,31 +86,15 @@ def test_issue_193_megatron_load_weights_invalid_meta_marks_session_loaded_with_
             load_optimizer=True,
         )
 
-    with caplog.at_level(logging.WARNING):
+    with pytest.raises(RuntimeError, match="Megatron load_checkpoint returned invalid metadata"):
         asyncio.run(_run())
 
     assert session.current_step == 12
     assert session.learning_rate == pytest.approx(9e-5)
-    assert worker.mark_session_loaded.calls == [
-        (
-            (model_id,),
-            {
-                "step_count": 12,
-                "learning_rate": pytest.approx(9e-5),
-                "actual_rank": None,
-                "actor_only_state_dirty": True,
-                "checkpoint_path": "/tmp/issue_193_invalid_meta_megatron_load",
-                "optimizer_restored": True,
-                "train_attn": True,
-                "train_mlp": True,
-                "train_unembed": True,
-            },
-        )
-    ]
-    assert any("load_weights" in rec.getMessage() for rec in caplog.records)
+    assert worker.mark_session_loaded.calls == []
 
 
-def test_issue_193_megatron_create_training_session_waits_for_ready(monkeypatch):
+def test_issue_193_megatron_create_training_session_waits_for_ready_probe(monkeypatch):
     engine = VerlTrainingEngine()
     model_id = "model_issue_193_megatron_create_ready"
     worker = _FakeLoadWorker(ref="unused-load-ref")
@@ -202,7 +186,6 @@ def test_issue_193_save_lora_weights_for_sampler_propagates_errors_without_step_
         return await engine.save_lora_weights_for_sampler(
             session=session,
             save_path="/tmp/issue_193_lora_error",
-            use_per_expert_lora=True,
         )
 
     with pytest.raises(type(raised_error)):
@@ -245,7 +228,6 @@ def test_issue_193_save_lora_weights_for_sampler_retry_same_session_is_idempoten
         return await engine.save_lora_weights_for_sampler(
             session=session,
             save_path="/tmp/issue_193_lora_retry",
-            use_per_expert_lora=False,
         )
 
     with pytest.raises(RuntimeError, match="transient save_lora failure"):

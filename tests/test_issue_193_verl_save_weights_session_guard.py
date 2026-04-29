@@ -691,7 +691,7 @@ def test_issue_193_dense_load_weights_rebinds_after_worker_death(monkeypatch):
     assert session.learning_rate == pytest.approx(3e-4)
 
 
-def test_issue_193_megatron_load_weights_passes_explicit_session_id_and_keepalive(monkeypatch):
+def test_issue_193_megatron_load_weights_passes_explicit_session_id_and_keepalive(monkeypatch, tmp_path):
     engine = VerlTrainingEngine()
     model_id = "model_issue_193_megatron_load"
     worker = _FakeLoadWorker(ref="megatron-load-ref")
@@ -710,12 +710,28 @@ def test_issue_193_megatron_load_weights_passes_explicit_session_id_and_keepaliv
             train_unembed=False,
         ),
     )
+    load_path = tmp_path / "issue_193_megatron_load"
+    load_path.mkdir()
+    (load_path / "adapter_config.json").write_text(
+        '{"r": 8, "target_modules": ["gate_proj", "up_proj", "down_proj"]}',
+        encoding="utf-8",
+    )
 
     keepalive_calls: list[tuple[object, str, float, float | None]] = []
 
     async def fake_keepalive(awaitable, keepalive_session, interval_s=30.0, timeout_s=None):
         keepalive_calls.append((awaitable, keepalive_session.model_id, interval_s, timeout_s))
-        return {"current_step": 5, "learning_rate": 3e-4}
+        return {
+            "current_step": 5,
+            "learning_rate": 3e-4,
+            "actual_rank": 8,
+            "actor_only_state_dirty": False,
+            "checkpoint_path": str(load_path),
+            "optimizer_restored": False,
+            "train_attn": False,
+            "train_mlp": True,
+            "train_unembed": False,
+        }
 
     monkeypatch.setattr(engine, "_await_with_keepalive", fake_keepalive)
     monkeypatch.setattr(ray, "get", lambda ref, timeout=None: {"status": "ok"})
@@ -723,7 +739,7 @@ def test_issue_193_megatron_load_weights_passes_explicit_session_id_and_keepaliv
     async def _run():
         await engine.load_weights(
             session=session,
-            load_path="/tmp/issue_193_megatron_load",
+            load_path=str(load_path),
             load_optimizer=False,
         )
 
@@ -734,19 +750,25 @@ def test_issue_193_megatron_load_weights_passes_explicit_session_id_and_keepaliv
         ("megatron-load-ref", model_id, 30.0, 1800.0),
     ]
     args, kwargs = worker.load_checkpoint.calls[0]
-    assert args == ("/tmp/issue_193_megatron_load", False)
+    assert args == (str(load_path), False)
     assert kwargs["traceparent"] is None
     assert kwargs["session_id"] == model_id
-    assert kwargs["train_attn"] is False
-    assert kwargs["train_mlp"] is True
-    assert kwargs["train_unembed"] is False
+    assert "train_attn" not in kwargs
+    assert "train_mlp" not in kwargs
+    assert "train_unembed" not in kwargs
     assert worker.mark_session_loaded.calls == [
         (
             (model_id,),
             {
                 "step_count": 5,
                 "learning_rate": pytest.approx(3e-4),
-                "actual_rank": None,
+                "actual_rank": 8,
+                "actor_only_state_dirty": False,
+                "checkpoint_path": str(load_path),
+                "optimizer_restored": False,
+                "train_attn": False,
+                "train_mlp": True,
+                "train_unembed": False,
             },
         )
     ]
@@ -908,7 +930,17 @@ def test_issue_193_megatron_load_weights_missing_actor_can_recreate_from_checkpo
         if awaitable == "fake-load-ready-ref":
             return {"status": "ok"}
         assert awaitable == "missing-actor-load-ref"
-        return {"current_step": 4, "learning_rate": 3e-4, "actual_rank": 6}
+        return {
+            "current_step": 4,
+            "learning_rate": 3e-4,
+            "actual_rank": 6,
+            "actor_only_state_dirty": True,
+            "checkpoint_path": "/tmp/issue_193_megatron_load_missing_actor",
+            "optimizer_restored": True,
+            "train_attn": True,
+            "train_mlp": True,
+            "train_unembed": True,
+        }
 
     monkeypatch.setattr(engine, "_get_live_worker", fake_get_live_worker)
     monkeypatch.setattr(engine, "_await_with_keepalive", fake_keepalive)
@@ -923,7 +955,11 @@ def test_issue_193_megatron_load_weights_missing_actor_can_recreate_from_checkpo
 
     asyncio.run(_run())
 
-    assert get_live_calls == [("load_weights", False)]
+    assert get_live_calls == [
+        ("load_weights", False),
+        ("load_weights", False),
+        ("load_weights", False),
+    ]
     assert worker.mark_session_loaded.calls == [
         (
             (model_id,),
@@ -931,6 +967,12 @@ def test_issue_193_megatron_load_weights_missing_actor_can_recreate_from_checkpo
                 "step_count": 4,
                 "learning_rate": pytest.approx(3e-4),
                 "actual_rank": 6,
+                "actor_only_state_dirty": True,
+                "checkpoint_path": "/tmp/issue_193_megatron_load_missing_actor",
+                "optimizer_restored": True,
+                "train_attn": True,
+                "train_mlp": True,
+                "train_unembed": True,
             },
         )
     ]
@@ -2045,7 +2087,10 @@ def test_issue_193_megatron_load_checkpoint_uses_ensure_session_loaded(tmp_path:
     ckpt_dir = tmp_path / "ckpt"
     ckpt_dir.mkdir()
     (ckpt_dir / "mp_rank_00_000_000_adapter.pt").write_bytes(b"adapter")
-    (ckpt_dir / "adapter_config.json").write_text(json.dumps({"r": 8}), encoding="utf-8")
+    (ckpt_dir / "adapter_config.json").write_text(
+        json.dumps({"r": 8, "target_modules": ["gate_proj", "up_proj", "down_proj"]}),
+        encoding="utf-8",
+    )
     (ckpt_dir / "training_meta.json").write_text(
         json.dumps({"current_step": 3, "learning_rate": 2e-4}),
         encoding="utf-8",
@@ -2070,33 +2115,23 @@ def test_issue_193_megatron_load_checkpoint_uses_ensure_session_loaded(tmp_path:
 
     result = group.load_checkpoint(str(ckpt_dir), load_optimizer=False, session_id="session_target")
 
-    assert ensure_calls == [
-        (
-            "session_target",
-            {
-                "traceparent": None,
-                "train_attn": None,
-                "train_mlp": None,
-                "train_unembed": None,
-            },
-        )
-    ]
+    assert ensure_calls == []
     assert load_adapter_calls == [
         (
             str(ckpt_dir),
             {
                 "actual_rank": 8,
                 "traceparent": None,
-                "train_attn": None,
-                "train_mlp": None,
-                "train_unembed": None,
+                "train_attn": False,
+                "train_mlp": True,
+                "train_unembed": False,
             },
         )
     ]
     assert reset_optimizer_calls == [
         (
             (2e-4,),
-            {"traceparent": None},
+            {"traceparent": None, "zero_grad_buffers": False},
         )
     ]
     assert result["optimizer_reset"] is True
@@ -2261,7 +2296,7 @@ def test_issue_193_load_weights_invalid_meta_warns_without_pollution(monkeypatch
     assert any("load_weights" in rec.getMessage() for rec in caplog.records)
 
 
-def test_issue_193_megatron_load_weights_invalid_meta_marks_session_loaded_with_null_actual_rank(monkeypatch, caplog):
+def test_issue_193_megatron_load_weights_invalid_meta_fails_loud(monkeypatch):
     engine = VerlTrainingEngine()
     model_id = "model_issue_193_invalid_meta_megatron_load"
     worker = _FakeLoadWorker(ref="invalid-meta-megatron-load-ref")
@@ -2296,17 +2331,15 @@ def test_issue_193_megatron_load_weights_invalid_meta_marks_session_loaded_with_
             load_optimizer=True,
         )
 
-    with caplog.at_level(logging.WARNING):
-        with pytest.raises(AttributeError, match="get"):
-            asyncio.run(_run())
+    with pytest.raises(RuntimeError, match="Megatron load_checkpoint returned invalid metadata"):
+        asyncio.run(_run())
 
     assert session.current_step == 12
     assert session.learning_rate == pytest.approx(9e-5)
     assert worker.mark_session_loaded.calls == []
-    assert any("load_weights" in rec.getMessage() for rec in caplog.records)
 
 
-def test_issue_193_megatron_create_training_session_marks_ready_without_waiting(monkeypatch):
+def test_issue_193_megatron_create_training_session_waits_before_marking_ready(monkeypatch):
     engine = VerlTrainingEngine()
     model_id = "model_issue_193_megatron_create_ready"
     worker = _FakeLoadWorker(ref="unused-load-ref")
@@ -2354,7 +2387,7 @@ def test_issue_193_megatron_create_training_session_marks_ready_without_waiting(
 
     asyncio.run(_run())
 
-    assert keepalive_calls == []
+    assert keepalive_calls == [("fake-load-ready-ref", model_id, 30.0, 3600.0)]
     assert engine._workers[model_id] is worker
     assert session.backend == "megatron"
     assert session.is_active is True

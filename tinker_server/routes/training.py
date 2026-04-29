@@ -1870,7 +1870,7 @@ async def _do_create_model(
             type="create_model",
             backend=planned_backend,
         )
-        future_store.resolve(request_id, response.model_dump())
+        await future_store.async_resolve(request_id, response.model_dump())
 
         if webhook_url and user_id:
             send_task_event(
@@ -2264,7 +2264,7 @@ async def _do_create_model_from_state(
             _build_training_session_store_payload(
                 session=session,
                 user_id=user_id,
-                lora_config=request.lora_config,
+                lora_config=session.lora_config,
                 rollout_correction_config=rollout_correction_config,
                 user_metadata=request.user_metadata,
                 actor_name=actor_name,
@@ -2296,7 +2296,7 @@ async def _do_create_model_from_state(
             model_id=model_id,
             type="create_model_from_state",
         )
-        future_store.resolve(request_id, response.model_dump())
+        await future_store.async_resolve(request_id, response.model_dump())
 
     except Exception as e:
         logger.exception(
@@ -2569,7 +2569,7 @@ async def _do_forward_backward(
                     )
                 ]
             )
-        future_store.resolve(request_id, result)
+        await future_store.async_resolve(request_id, result)
 
     except Exception as e:
         logger.exception(
@@ -2805,7 +2805,7 @@ async def _do_train_step(
                     )
                 ]
             )
-        future_store.resolve(request_id, result)
+        await future_store.async_resolve(request_id, result)
 
     except Exception as e:
         logger.exception(
@@ -3040,7 +3040,7 @@ async def _do_forward(
                     )
                 ]
             )
-        future_store.resolve(request_id, result)
+        await future_store.async_resolve(request_id, result)
 
     except Exception as e:
         logger.exception(
@@ -3248,7 +3248,7 @@ async def _do_optim_step(request_id: str, request: OptimStepRequest, user_id: st
         elapsed_s = time.time() - t0
         msg = f"[{session.model_id}] optim_step done request_id={request_id} elapsed_s={elapsed_s:.3f}"
         logger.info(msg)
-        future_store.resolve(request_id, result)
+        await future_store.async_resolve(request_id, result)
 
     except Exception as e:
         logger.exception(
@@ -3371,7 +3371,7 @@ async def _do_reset_expert_bias(
 
         result = await training_engine.reset_expert_bias(session)
         modules_reset = int(result.get("modules_reset", 0) or 0)
-        future_store.resolve(
+        await future_store.async_resolve(
             request_id,
             ResetExpertBiasResponse(
                 model_id=request.model_id,
@@ -3907,11 +3907,7 @@ async def _do_save_weights_for_sampler(
                 sampling_session_id=sampling_session_id,
             ).model_dump()
 
-        async_resolve = getattr(future_store, "async_resolve", None)
-        if callable(async_resolve):
-            await async_resolve(request_id, response)
-        else:
-            future_store.resolve(request_id, response)
+        await future_store.async_resolve(request_id, response)
 
     except Exception as e:
         if not mirror_started:
@@ -4265,7 +4261,7 @@ async def _do_delete_model(request_id: str, model_id: str) -> None:
         except Exception:
             pass
 
-        future_store.resolve(request_id, {"model_id": model_id, "status": "deleted"})
+        await future_store.async_resolve(request_id, {"model_id": model_id, "status": "deleted"})
     except Exception as e:
         logger.exception(
             "[training.delete_model] failed request_id=%s model_id=%s error_type=%s error=%s",

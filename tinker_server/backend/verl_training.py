@@ -12,7 +12,7 @@ import math
 import os
 import threading
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import ray
 
@@ -3001,6 +3001,110 @@ class VerlTrainingEngine:
         raw = os.environ.get("MINT_MEGATRON_STRICT_SAVE_META", "1").strip().lower()
         return raw not in ("0", "false", "no", "off")
 
+    def _apply_megatron_loaded_lora_config(
+        self,
+        session: "TrainingSession",
+        meta: dict[str, object],
+    ) -> None:
+        lora_cfg = getattr(session, "lora_config", None)
+        if lora_cfg is None:
+            return
+        updates = {
+            "rank": int(cast(int, meta["actual_rank"])),
+            "train_attn": bool(meta["train_attn"]),
+            "train_mlp": bool(meta["train_mlp"]),
+            "train_unembed": bool(meta["train_unembed"]),
+        }
+        if hasattr(lora_cfg, "model_copy"):
+            session.lora_config = lora_cfg.model_copy(update=updates)
+            return
+        if hasattr(lora_cfg, "copy"):
+            session.lora_config = lora_cfg.copy(update=updates)
+            return
+        for key, value in updates.items():
+            setattr(lora_cfg, key, value)
+
+    def _validate_megatron_load_meta(self, meta: Any, *, op: str) -> dict[str, object]:
+        if not isinstance(meta, dict):
+            raise RuntimeError(
+                f"Megatron load_checkpoint returned invalid metadata for {op}: "
+                f"expected dict, got {type(meta).__name__}"
+            )
+
+        required_keys = {
+            "current_step",
+            "learning_rate",
+            "actual_rank",
+            "actor_only_state_dirty",
+            "checkpoint_path",
+            "optimizer_restored",
+            "train_attn",
+            "train_mlp",
+            "train_unembed",
+        }
+        missing = sorted(required_keys - set(meta))
+        if missing:
+            raise RuntimeError(
+                "Megatron load_checkpoint returned invalid metadata for "
+                f"{op}: missing keys {missing}"
+            )
+
+        current_step = meta["current_step"]
+        if not isinstance(current_step, int) or isinstance(current_step, bool) or current_step < 0:
+            raise RuntimeError(
+                "Megatron load_checkpoint returned invalid metadata for "
+                f"{op}: current_step must be a non-negative int, got {current_step!r}"
+            )
+
+        lr_value = meta["learning_rate"]
+        if not isinstance(lr_value, (int, float)) or isinstance(lr_value, bool):
+            raise RuntimeError(
+                "Megatron load_checkpoint returned invalid metadata for "
+                f"{op}: learning_rate must be finite, got {lr_value!r}"
+            )
+        learning_rate = float(lr_value)
+        if not math.isfinite(learning_rate):
+            raise RuntimeError(
+                "Megatron load_checkpoint returned invalid metadata for "
+                f"{op}: learning_rate must be finite, got {lr_value!r}"
+            )
+
+        actual_rank = meta["actual_rank"]
+        if not isinstance(actual_rank, int) or isinstance(actual_rank, bool) or actual_rank <= 0:
+            raise RuntimeError(
+                "Megatron load_checkpoint returned invalid metadata for "
+                f"{op}: actual_rank must be a positive int, got {actual_rank!r}"
+            )
+
+        checkpoint_path = meta["checkpoint_path"]
+        if not isinstance(checkpoint_path, str) or not checkpoint_path:
+            raise RuntimeError(
+                "Megatron load_checkpoint returned invalid metadata for "
+                f"{op}: checkpoint_path must be a non-empty string, got {checkpoint_path!r}"
+            )
+
+        normalized: dict[str, object] = {
+            "current_step": current_step,
+            "learning_rate": learning_rate,
+            "actual_rank": actual_rank,
+            "checkpoint_path": checkpoint_path,
+        }
+        for key in (
+            "actor_only_state_dirty",
+            "optimizer_restored",
+            "train_attn",
+            "train_mlp",
+            "train_unembed",
+        ):
+            value = meta[key]
+            if not isinstance(value, bool):
+                raise RuntimeError(
+                    "Megatron load_checkpoint returned invalid metadata for "
+                    f"{op}: {key} must be bool, got {value!r}"
+                )
+            normalized[key] = value
+        return normalized
+
     def _update_session_step_monotonic(
         self,
         session: "TrainingSession",
@@ -4346,11 +4450,10 @@ class VerlTrainingEngine:
                 abs_path,
                 traceparent=traceparent,
                 session_id=session.model_id,
-                actual_rank=session.lora_config.rank if session.lora_config else None,
+                actual_rank=getattr(lora_cfg, "rank", None),
                 train_attn=train_attn,
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
-                use_per_expert_lora=bool(use_per_expert_lora),
             )
         else:
             traceparent = get_current_traceparent()
@@ -4435,14 +4538,12 @@ class VerlTrainingEngine:
             "traceparent": traceparent,
             "session_id": session.model_id,
         }
-        lora_cfg = getattr(session, "lora_config", None)
-        train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
-        train_mlp = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
-        train_unembed = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
-        if session.backend == "megatron":
-            kwargs["train_attn"] = train_attn
-            kwargs["train_mlp"] = train_mlp
-            kwargs["train_unembed"] = train_unembed
+        if session.backend == "megatron" and not os.path.isfile(os.path.join(load_path, "adapter_config.json")):
+            lora_config = getattr(session, "lora_config", None)
+            for key in ("train_attn", "train_mlp", "train_unembed"):
+                value = getattr(lora_config, key, None)
+                if value is not None:
+                    kwargs[key] = bool(value)
 
         def _submit(call_worker):
             return call_worker.load_checkpoint.remote(load_path, load_optimizer, **kwargs)
@@ -4457,34 +4558,46 @@ class VerlTrainingEngine:
         )
 
         if session.backend == "megatron":
+            meta = self._validate_megatron_load_meta(meta, op="load_weights")
+            session.current_step = int(cast(int, meta["current_step"]))
+            session.learning_rate = float(cast(float, meta["learning_rate"]))
+            self._apply_megatron_loaded_lora_config(session, meta)
             actor_name = self._actor_name_for_session(session)
-            if actor_name and load_optimizer:
+            if actor_name and bool(meta["optimizer_restored"]):
                 self._actor_volatile_sessions.setdefault(actor_name, set()).add(session.model_id)
 
-        self._update_session_from_load_meta(
-            session,
-            meta,
-            op="load_weights",
-        )
-
-        if session.backend == "megatron":
             worker = await self._get_live_worker(session, op="load_weights", allow_recover=False)
-            actual_rank = meta.get("actual_rank") if isinstance(meta, dict) else None
             await asyncio.to_thread(
                 ray.get,
                 worker.mark_session_loaded.remote(
                     session.model_id,
                     step_count=session.current_step,
                     learning_rate=session.learning_rate,
-                    actual_rank=actual_rank,
-                    actor_only_state_dirty=bool(load_optimizer),
-                    checkpoint_path=load_path,
-                    optimizer_restored=bool(load_optimizer),
-                    train_attn=train_attn,
-                    train_mlp=train_mlp,
-                    train_unembed=train_unembed,
+                    actual_rank=meta["actual_rank"],
+                    actor_only_state_dirty=meta["actor_only_state_dirty"],
+                    checkpoint_path=meta["checkpoint_path"],
+                    optimizer_restored=meta["optimizer_restored"],
+                    train_attn=meta["train_attn"],
+                    train_mlp=meta["train_mlp"],
+                    train_unembed=meta["train_unembed"],
                 ),
-                timeout=30,
+                timeout=load_timeout_s,
+            )
+            if not bool(meta["optimizer_restored"]):
+                actor_name = self._actor_name_for_session(session)
+                if actor_name:
+                    volatile_sessions = self._actor_volatile_sessions.get(actor_name)
+                    if volatile_sessions:
+                        volatile_sessions.discard(session.model_id)
+                        if not volatile_sessions:
+                            self._actor_volatile_sessions.pop(actor_name, None)
+        else:
+            # Dense workers keep the older lenient metadata path because legacy
+            # PEFT checkpoints can omit training_meta.json.
+            self._update_session_from_load_meta(
+                session,
+                meta,
+                op="load_weights",
             )
             if not load_optimizer:
                 actor_name = self._actor_name_for_session(session)

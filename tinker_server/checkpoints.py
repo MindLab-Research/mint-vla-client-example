@@ -1147,8 +1147,11 @@ def process_pending_checkpoint_mirrors(*, max_items: int | None = None) -> dict[
 def materialize_persistent_checkpoint(path: str) -> str:
     if not os.path.isdir(path):
         return path
-    persistent_root = os.path.realpath(get_persistent_checkpoints_dir())
     path_real = os.path.realpath(path)
+    runtime_root = os.path.realpath(get_runtime_checkpoints_dir())
+    if path_real == runtime_root or path_real.startswith(runtime_root + os.sep):
+        return path
+    persistent_root = os.path.realpath(get_persistent_checkpoints_dir())
     if not (path_real == persistent_root or path_real.startswith(persistent_root + os.sep)):
         return path
 

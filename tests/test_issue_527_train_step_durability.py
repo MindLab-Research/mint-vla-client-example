@@ -24,6 +24,7 @@ def test_train_step_keeps_durability_fresh_until_optim_step() -> None:
         loss_fn_config=None,
         rollout_correction_config=None,
         session_id=None,
+        actual_rank=None,
         reset_bias=None,
         traceparent=None,
         *,
@@ -40,6 +41,7 @@ def test_train_step_keeps_durability_fresh_until_optim_step() -> None:
         self,
         learning_rate,
         session_id=None,
+        actual_rank=None,
         traceparent=None,
         *,
         train_attn=None,
@@ -77,7 +79,7 @@ def test_save_checkpoint_does_not_require_fresh_trusted_pair() -> None:
         group,
     )
     group._ensure_session_loaded = MethodType(
-        lambda self, session_id, traceparent=None, train_attn=None, train_mlp=None, train_unembed=None: {
+        lambda self, session_id, traceparent=None, actual_rank=None, train_attn=None, train_mlp=None, train_unembed=None: {
             "switched": False
         },
         group,
