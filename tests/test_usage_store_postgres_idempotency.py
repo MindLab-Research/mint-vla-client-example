@@ -148,7 +148,9 @@ def _state(**overrides):
 def _install_fake_asyncpg(monkeypatch, state: dict):
     async def _create_pool(**kwargs):
         state["pool_kwargs"] = kwargs
-        return _FakePool(state)
+        pool = _FakePool(state)
+        state["pool"] = pool
+        return pool
 
     monkeypatch.setitem(sys.modules, "asyncpg", SimpleNamespace(create_pool=_create_pool))
 
@@ -666,5 +668,28 @@ def test_postgres_usage_store_batches_write_events(monkeypatch):
         assert len(inserted) == 2
         assert len(state["rows"]) == 2
         assert state["insert_fetch_calls"] == 1
+
+    asyncio.run(_run())
+
+
+def test_postgres_usage_store_closes_pool_when_schema_check_fails(monkeypatch):
+    state = _state(event_id_unique_index=False)
+    _install_fake_asyncpg(monkeypatch, state)
+
+    store = PostgresUsageStore(dsn="postgresql://fake")
+    event = UsageEvent(
+        account_id="aaaaaaaaaaaaaaaaaaaaaaaa",
+        apikey_id="bbbbbbbbbbbbbbbbbbbbbbbb",
+        charge_item="training",
+        quantity=1,
+        request_id="req-schema-fail",
+        label="route=training.train_step",
+    )
+
+    async def _run():
+        with pytest.raises(RuntimeError, match="requires a full-table unique index"):
+            await store.write_event(event)
+        assert store._pool is None
+        assert state["pool"].closed is True
 
     asyncio.run(_run())

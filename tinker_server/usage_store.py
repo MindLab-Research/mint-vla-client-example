@@ -237,18 +237,22 @@ class PostgresUsageStore:
             except Exception as e:
                 raise RuntimeError("asyncpg is required for postgres usage backend") from e
 
-            self._pool = await asyncpg.create_pool(
+            pool = await asyncpg.create_pool(
                 dsn=self._dsn,
                 min_size=self._pool_min,
                 max_size=self._pool_max,
                 command_timeout=max(5.0, self._write_timeout_s),
                 server_settings={"application_name": "tinker_server_usage"},
             )
-            await self._ensure_pg_schema()
-            return self._pool
+            try:
+                await self._ensure_pg_schema(pool)
+            except Exception:
+                await pool.close()
+                raise
+            self._pool = pool
+            return pool
 
-    async def _ensure_pg_schema(self) -> None:
-        pool = self._pool
+    async def _ensure_pg_schema(self, pool) -> None:
         if pool is None:
             raise RuntimeError("usage pool is not initialized")
         async with pool.acquire() as conn:
@@ -619,7 +623,7 @@ async def close_usage_store() -> None:
     if pending:
         done, pending_set = await asyncio.wait(pending, timeout=_SHUTDOWN_FLUSH_TIMEOUT_S)
         for task in done:
-            with suppress(Exception):
+            with suppress(Exception, asyncio.CancelledError):
                 task.result()
         for task in pending_set:
             task.cancel()
