@@ -8634,9 +8634,15 @@ class MegatronWorkerGroup:
                     f"Missing adapter_config.json and no valid fallback rank available: {adapter_config_path}"
                 )
             checkpoint_rank = int(fallback_rank)
-            checkpoint_train_attn = True if train_attn is None else bool(train_attn)
-            checkpoint_train_mlp = True if train_mlp is None else bool(train_mlp)
-            checkpoint_train_unembed = True if train_unembed is None else bool(train_unembed)
+            checkpoint_train_attn = (
+                bool(getattr(self, "_train_attn", True)) if train_attn is None else bool(train_attn)
+            )
+            checkpoint_train_mlp = (
+                bool(getattr(self, "_train_mlp", True)) if train_mlp is None else bool(train_mlp)
+            )
+            checkpoint_train_unembed = (
+                bool(getattr(self, "_train_unembed", True)) if train_unembed is None else bool(train_unembed)
+            )
             checkpoint_format = "legacy_rank_shard_without_adapter_config"
             checkpoint_warning = (
                 "Legacy Megatron rank-shard checkpoint is missing adapter_config.json; "

@@ -1862,6 +1862,9 @@ def test_issue_417_optimizerless_load_warns_for_legacy_rank_shard_without_adapte
     group.learning_rate = 1e-4
     group._actual_rank = 12
     group.lora_rank = 8
+    group._train_attn = False
+    group._train_mlp = True
+    group._train_unembed = False
     group._session_manager = None
 
     prepare_calls: list[tuple[str, object]] = []
@@ -1897,9 +1900,9 @@ def test_issue_417_optimizerless_load_warns_for_legacy_rank_shard_without_adapte
             {
                 "actual_rank": 12,
                 "traceparent": None,
-                "train_attn": True,
+                "train_attn": False,
                 "train_mlp": True,
-                "train_unembed": True,
+                "train_unembed": False,
             },
         )
     ]
@@ -1908,9 +1911,9 @@ def test_issue_417_optimizerless_load_warns_for_legacy_rank_shard_without_adapte
     assert "Legacy Megatron rank-shard checkpoint is missing adapter_config.json" in result["warning"]
     assert result["current_step"] == 0
     assert result["learning_rate"] == pytest.approx(1e-4)
-    assert result["train_attn"] is True
+    assert result["train_attn"] is False
     assert result["train_mlp"] is True
-    assert result["train_unembed"] is True
+    assert result["train_unembed"] is False
     assert group._actual_rank == 12
     assert group._step_count == 0
     assert group.learning_rate == pytest.approx(1e-4)
