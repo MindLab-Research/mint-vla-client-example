@@ -21,9 +21,33 @@ _ALLOWED_CHARGE_ITEMS = {"sampling", "inference", "training", "checkpoint_storag
 _SQL_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _EVENT_ID_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "mindlab.mint.billing.usage_event.v1")
 _PENDING_WRITE_TASKS: set[asyncio.Task] = set()
-_MAX_PENDING_WRITE_TASKS = max(1, int(os.environ.get("MINT_USAGE_MAX_PENDING_WRITE_TASKS", "1024")))
-_SHUTDOWN_FLUSH_TIMEOUT_S = max(0.0, float(os.environ.get("MINT_USAGE_SHUTDOWN_FLUSH_TIMEOUT_S", "5.0")))
 _USAGE_STORE_CLOSING = False
+
+
+def _env_int(name: str, default: int, *, minimum: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        logger.warning("Invalid %s=%r; using default %s", name, raw, default)
+        return default
+
+
+def _env_float(name: str, default: float, *, minimum: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return max(minimum, float(raw))
+    except ValueError:
+        logger.warning("Invalid %s=%r; using default %s", name, raw, default)
+        return default
+
+
+_MAX_PENDING_WRITE_TASKS = _env_int("MINT_USAGE_MAX_PENDING_WRITE_TASKS", 1024, minimum=1)
+_SHUTDOWN_FLUSH_TIMEOUT_S = _env_float("MINT_USAGE_SHUTDOWN_FLUSH_TIMEOUT_S", 5.0, minimum=0.0)
 
 
 def _import_asyncpg():
@@ -88,7 +112,8 @@ class PostgresUsageStore:
     ):
         if not dsn:
             raise ValueError("Postgres DSN is required for usage backend")
-        _ = outbox_path, outbox_flush_interval_s
+        if outbox_path or float(outbox_flush_interval_s or 0.0) != 0.0:
+            logger.warning("PostgresUsageStore ignores outbox configuration; direct PostgreSQL usage writes are required")
         self._dsn = dsn
         self._pool_min = max(1, int(pool_min))
         self._pool_max = max(self._pool_min, int(pool_max))

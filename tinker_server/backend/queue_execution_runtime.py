@@ -92,9 +92,6 @@ _register_ray_reconnect_invalidator(_reset_cached_actor_handle)
 
 def _runtime_env_overrides() -> dict[str, str]:
     out: dict[str, str] = {}
-    if CURRENT_CODE_IDENTITY:
-        out["MINT_GIT_SHA"] = str(CURRENT_CODE_IDENTITY)
-
     direct_keys = (
         "MINT_QUEUE_EXECUTION_RUNTIME_ACTOR_NAME",
         "MINT_QUEUE_SUPERVISOR_ACTOR_NAME",
