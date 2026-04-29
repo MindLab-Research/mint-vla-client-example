@@ -18,33 +18,8 @@ class _FakeConn:
             self._state["rows"] = [row for row in self._state["rows"] if row["event_id"] not in event_ids]
             self._state["seen_event_ids"] -= event_ids
             return "DELETE"
-        if not text.startswith("INSERT INTO"):
-            self._state["schema_statements"].append(text)
-            return "OK"
-
-        if self._state.get("fail_always"):
-            raise RuntimeError("simulated persistent pg error")
-        if self._state["fail_once"]:
-            self._state["fail_once"] = False
-            raise RuntimeError("simulated transient pg error")
-
-        self._state["nextval"] += 1
-        row = {
-            "source_index": self._state["nextval"],
-            "event_id": str(args[0]),
-            "event_time": args[1],
-            "account_id": str(args[2]),
-            "apikey_id": str(args[3]),
-            "charge_item": str(args[4]),
-            "quantity": int(args[5]),
-            "request_id": str(args[6]),
-            "label": str(args[7]),
-        }
-        if row["event_id"] in self._state["seen_event_ids"]:
-            return "INSERT 0 0"
-        self._state["seen_event_ids"].add(row["event_id"])
-        self._state["rows"].append(row)
-        return "INSERT 0 1"
+        self._state["schema_statements"].append(text)
+        return "OK"
 
     async def fetchval(self, sql: str, *args):
         text = sql.strip()
@@ -61,7 +36,7 @@ class _FakeConn:
         if "FROM pg_index" in text:
             return bool(self._state.get("event_id_unique_index", True))
         if "WHERE event_id IS NULL" in text:
-            return int(self._state.get("null_event_id_count", 0))
+            return int(self._state.get("null_event_id_count", 0)) > 0
         if sql.startswith("SELECT COUNT(*)"):
             return len(self._filter_rows(sql, args))
         if sql.startswith("SELECT COALESCE(SUM(quantity), 0)"):
@@ -70,6 +45,36 @@ class _FakeConn:
         raise AssertionError(f"unexpected SQL for fetchval: {sql}")
 
     async def fetch(self, sql: str, *args):
+        if sql.strip().startswith("INSERT INTO"):
+            self._state["insert_fetch_calls"] += 1
+            if self._state.get("fail_always"):
+                raise RuntimeError("simulated persistent pg error")
+            if self._state["fail_once"]:
+                self._state["fail_once"] = False
+                raise RuntimeError("simulated transient pg error")
+            inserted = []
+            for event_id, event_time, account_id, apikey_id, charge_item, quantity, request_id, label in zip(
+                *args, strict=True
+            ):
+                row = {
+                    "source_index": self._state["nextval"] + 1,
+                    "event_id": str(event_id),
+                    "event_time": event_time,
+                    "account_id": str(account_id),
+                    "apikey_id": str(apikey_id),
+                    "charge_item": str(charge_item),
+                    "quantity": int(quantity),
+                    "request_id": str(request_id),
+                    "label": str(label),
+                }
+                self._state["nextval"] += 1
+                if row["event_id"] in self._state["seen_event_ids"]:
+                    continue
+                self._state["seen_event_ids"].add(row["event_id"])
+                self._state["rows"].append(row)
+                inserted.append({"event_id": row["event_id"]})
+            return inserted
+
         if sql.startswith("SELECT charge_item, COALESCE(SUM(quantity), 0) AS total_quantity"):
             account_id = str(args[0])
             grouped: dict[str, int] = {}
@@ -134,6 +139,7 @@ def _state(**overrides):
         "usage_event_column_count": 10,
         "usage_event_not_null_column_count": 10,
         "source_index_column_default": "nextval('usage_event_source_index_seq'::regclass)",
+        "insert_fetch_calls": 0,
     }
     state.update(overrides)
     return state
@@ -626,5 +632,39 @@ def test_close_usage_store_flushes_pending_tasks_before_cancel(monkeypatch):
         assert wrote == ["req-flush-close"]
         assert usage_store_module._PENDING_WRITE_TASKS == set()
         usage_store_module._USAGE_STORE_CLOSING = False
+
+    asyncio.run(_run())
+
+
+def test_postgres_usage_store_batches_write_events(monkeypatch):
+    state = _state()
+    _install_fake_asyncpg(monkeypatch, state)
+
+    store = PostgresUsageStore(dsn="postgresql://fake")
+    events = [
+        UsageEvent(
+            account_id="aaaaaaaaaaaaaaaaaaaaaaaa",
+            apikey_id="bbbbbbbbbbbbbbbbbbbbbbbb",
+            charge_item="training",
+            quantity=1,
+            request_id="req-batch-1",
+            label="route=training.train_step",
+        ),
+        UsageEvent(
+            account_id="aaaaaaaaaaaaaaaaaaaaaaaa",
+            apikey_id="bbbbbbbbbbbbbbbbbbbbbbbb",
+            charge_item="training",
+            quantity=2,
+            request_id="req-batch-2",
+            label="route=training.train_step",
+        ),
+    ]
+
+    async def _run():
+        inserted = await store.write_events(events)
+        await store.close()
+        assert len(inserted) == 2
+        assert len(state["rows"]) == 2
+        assert state["insert_fetch_calls"] == 1
 
     asyncio.run(_run())

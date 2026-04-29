@@ -7,7 +7,7 @@ import logging
 import os
 import re
 import uuid
-from contextlib import asynccontextmanager, suppress
+from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Literal, Protocol
@@ -72,11 +72,6 @@ class UsageStore(Protocol):
     async def health_check(self) -> bool: ...
 
     async def close(self) -> None: ...
-
-
-@asynccontextmanager
-async def _null_async_context():
-    yield
 
 
 class PostgresUsageStore:
@@ -321,12 +316,14 @@ class PostgresUsageStore:
             self._schema,
             self._name,
         )
-        expected_sequence = f"{self._name}_source_index_seq"
+        expected_sequence = self._sequence.split(".")[-1]
         if "nextval(" not in str(source_index_default or "") or expected_sequence not in str(source_index_default or ""):
-            raise RuntimeError(f"{self._table}.source_index is missing the expected sequence default; {migration_hint}")
+            raise RuntimeError(
+                f"{self._table}.source_index is missing the expected sequence default {self._sequence}; {migration_hint}"
+            )
 
-        null_event_ids = await conn.fetchval(f"SELECT COUNT(*) FROM {self._table} WHERE event_id IS NULL")
-        if int(null_event_ids or 0) > 0:
+        has_null_event_id = await conn.fetchval(f"SELECT EXISTS(SELECT 1 FROM {self._table} WHERE event_id IS NULL)")
+        if bool(has_null_event_id):
             raise RuntimeError(f"{self._table} contains usage_event rows with NULL event_id; {migration_hint}")
 
     async def _assert_event_id_unique_index(self, conn) -> None:
@@ -353,52 +350,47 @@ class PostgresUsageStore:
             self._name,
         )
         if not exists:
-            raise RuntimeError(f"{self._table} requires a full-table unique index on event_id")
-
-    @asynccontextmanager
-    async def _maybe_transaction(self, conn):
-        tx_factory = getattr(conn, "transaction", None)
-        if callable(tx_factory):
-            async with tx_factory():
-                yield
-            return
-        async with _null_async_context():
-            yield
+            raise RuntimeError(f"{self._table} requires a full-table unique index on event_id, expected {self._dedupe_index}")
 
     async def _write_events_to_pg(self, events: list[UsageEvent]) -> list[str]:
         pool = await self._ensure_pool()
         sql = f"""
         INSERT INTO {self._table}
             (event_id, event_time, account_id, apikey_id, charge_item, quantity, request_id, label)
-        VALUES
-            ($1, $2, $3, $4, $5, $6, $7, $8)
+        SELECT *
+        FROM UNNEST(
+            $1::text[],
+            $2::timestamptz[],
+            $3::text[],
+            $4::text[],
+            $5::text[],
+            $6::bigint[],
+            $7::text[],
+            $8::text[]
+        )
         ON CONFLICT (event_id) DO NOTHING
+        RETURNING event_id
         """
 
         last_error: Exception | None = None
         for attempt in range(3):
             try:
-                inserted_event_ids: list[str] = []
                 async with pool.acquire() as conn:
-                    async with self._maybe_transaction(conn):
-                        for event in events:
-                            result = await asyncio.wait_for(
-                                conn.execute(
-                                    sql,
-                                    event.event_id,
-                                    self._normalize_event_time(event.event_time),
-                                    event.account_id,
-                                    event.apikey_id,
-                                    event.charge_item,
-                                    event.quantity,
-                                    event.request_id,
-                                    event.label or "",
-                                ),
-                                timeout=self._write_timeout_s,
-                            )
-                            if str(result).strip().endswith(" 1"):
-                                inserted_event_ids.append(event.event_id)
-                return inserted_event_ids
+                    rows = await asyncio.wait_for(
+                        conn.fetch(
+                            sql,
+                            [event.event_id for event in events],
+                            [self._normalize_event_time(event.event_time) for event in events],
+                            [event.account_id for event in events],
+                            [event.apikey_id for event in events],
+                            [event.charge_item for event in events],
+                            [event.quantity for event in events],
+                            [event.request_id for event in events],
+                            [event.label or "" for event in events],
+                        ),
+                        timeout=self._write_timeout_s,
+                    )
+                return [str(row["event_id"]) for row in rows]
             except Exception as e:
                 last_error = e
                 if attempt < 2:
