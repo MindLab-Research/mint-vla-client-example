@@ -109,16 +109,19 @@ def _poison_metadata(
     request_id: str | None = None,
 ) -> dict[str, object]:
     poisoned = dict(metadata or {})
-    poisoned.update(
-        {
-            DENSE_POISONED_KEY: True,
-            DENSE_POISON_REASON_KEY: str(reason),
-            DENSE_POISONED_AT_KEY: time.time(),
-            DENSE_POISONED_SESSION_KEY: session_id,
-            DENSE_LAST_FATAL_OP_KEY: None if fatal_op is None else str(fatal_op),
-            DENSE_LAST_FATAL_REQUEST_ID_KEY: None if request_id is None else str(request_id),
-        }
-    )
+    already_poisoned = bool(poisoned.get(DENSE_POISONED_KEY))
+
+    poisoned[DENSE_POISONED_KEY] = True
+    if not already_poisoned or poisoned.get(DENSE_POISON_REASON_KEY) is None:
+        poisoned[DENSE_POISON_REASON_KEY] = str(reason)
+    if not already_poisoned or poisoned.get(DENSE_POISONED_AT_KEY) is None:
+        poisoned[DENSE_POISONED_AT_KEY] = time.time()
+    if not already_poisoned or poisoned.get(DENSE_POISONED_SESSION_KEY) is None:
+        poisoned[DENSE_POISONED_SESSION_KEY] = session_id
+    if not already_poisoned or poisoned.get(DENSE_LAST_FATAL_OP_KEY) is None:
+        poisoned[DENSE_LAST_FATAL_OP_KEY] = None if fatal_op is None else str(fatal_op)
+    if not already_poisoned or poisoned.get(DENSE_LAST_FATAL_REQUEST_ID_KEY) is None:
+        poisoned[DENSE_LAST_FATAL_REQUEST_ID_KEY] = None if request_id is None else str(request_id)
     return poisoned
 
 
@@ -280,17 +283,16 @@ def retire_dense_trainer(
                 session_id,
                 exc_info=True,
             )
-    else:
-        try:
-            pool.set_session(actor_name, None)
-        except Exception:
-            if retire_outcome == "ok":
-                retire_outcome = "clear_binding_failed"
-            logger.warning(
-                "[dense_trainer] failed to clear bound session actor_name=%s",
-                actor_name,
-                exc_info=True,
-            )
+    try:
+        pool.set_session(actor_name, None)
+    except Exception:
+        if retire_outcome == "ok":
+            retire_outcome = "clear_binding_failed"
+        logger.warning(
+            "[dense_trainer] failed to clear bound session actor_name=%s",
+            actor_name,
+            exc_info=True,
+        )
 
     actor_absent = False
     if actor is None:

@@ -200,11 +200,37 @@ def test_issue_561_inflight_guard_uses_actor_identity(monkeypatch) -> None:
         )
 
 
+def test_issue_561_poison_metadata_preserves_first_fault() -> None:
+    from tinker_server.backend import dense_trainer as dt
+
+    metadata = dt._poison_metadata(
+        {
+            dt.DENSE_POISONED_KEY: True,
+            dt.DENSE_POISON_REASON_KEY: "forward_backward:first fault",
+            dt.DENSE_POISONED_AT_KEY: 123.0,
+            dt.DENSE_POISONED_SESSION_KEY: "model-first",
+            dt.DENSE_LAST_FATAL_OP_KEY: "forward_backward",
+            dt.DENSE_LAST_FATAL_REQUEST_ID_KEY: "req-first",
+        },
+        reason="reuse_blocked:second retire",
+        session_id="model-second",
+        fatal_op="save_weights_for_sampler",
+        request_id="req-second",
+    )
+
+    assert metadata[dt.DENSE_POISON_REASON_KEY] == "forward_backward:first fault"
+    assert metadata[dt.DENSE_POISONED_AT_KEY] == 123.0
+    assert metadata[dt.DENSE_POISONED_SESSION_KEY] == "model-first"
+    assert metadata[dt.DENSE_LAST_FATAL_OP_KEY] == "forward_backward"
+    assert metadata[dt.DENSE_LAST_FATAL_REQUEST_ID_KEY] == "req-first"
+
+
 def test_issue_561_retire_dense_trainer_persists_fatal_metadata(monkeypatch) -> None:
     from tinker_server.backend import dense_trainer as dt
 
     metadata_updates: list[dict[str, object]] = []
     clears: list[tuple[str, object]] = []
+    set_sessions: list[tuple[str, object]] = []
     unregisters: list[str] = []
     obs = runtime_obs_module.RuntimeObservability()
 
@@ -220,6 +246,9 @@ def test_issue_561_retire_dense_trainer_persists_fatal_metadata(monkeypatch) -> 
 
         def clear_session(self, session_id: str, actor_type=None):
             clears.append((session_id, actor_type))
+
+        def set_session(self, actor_name: str, session_id):
+            set_sessions.append((actor_name, session_id))
 
         def unregister(self, actor_name: str):
             unregisters.append(actor_name)
@@ -249,6 +278,7 @@ def test_issue_561_retire_dense_trainer_persists_fatal_metadata(monkeypatch) -> 
     assert update["metadata"]["last_fatal_request_id"] == "req-561"
     assert isinstance(update["metadata"]["poisoned_at"], float)
     assert clears == [("model-561", dt.ActorType.DENSE)]
+    assert set_sessions == [("peft_trainer_qwen__qwen3_0_6b_maxr64", None)]
     assert unregisters == ["peft_trainer_qwen__qwen3_0_6b_maxr64"]
     assert obs.snapshot()["dense_actor_retire"] == [
         {
