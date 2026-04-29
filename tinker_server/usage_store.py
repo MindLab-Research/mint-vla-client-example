@@ -22,6 +22,7 @@ _SQL_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _EVENT_ID_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "mindlab.mint.billing.usage_event.v1")
 _PENDING_WRITE_TASKS: set[asyncio.Task] = set()
 _MAX_PENDING_WRITE_TASKS = max(1, int(os.environ.get("MINT_USAGE_MAX_PENDING_WRITE_TASKS", "1024")))
+_SHUTDOWN_FLUSH_TIMEOUT_S = max(0.0, float(os.environ.get("MINT_USAGE_SHUTDOWN_FLUSH_TIMEOUT_S", "5.0")))
 _USAGE_STORE_CLOSING = False
 
 
@@ -257,8 +258,12 @@ class PostgresUsageStore:
             "quantity",
             "request_id",
             "label",
+            "created_at",
         ]
-        migration_hint = "run backend/db/migrations/004_direct_pg_usage_event_id.sql before starting MinT direct-PG billing"
+        migration_hint = (
+            "run the platform direct-PG billing migration, or scripts/tools/init_usage_pg.sql "
+            "for a standalone MinT usage DB, before starting MinT direct-PG billing"
+        )
         table_exists = await conn.fetchval(
             """
             SELECT EXISTS (
@@ -304,6 +309,21 @@ class PostgresUsageStore:
         )
         if int(not_null_count or 0) != len(required_not_null):
             raise RuntimeError(f"{self._table} schema has nullable direct-PG usage_event columns; {migration_hint}")
+
+        source_index_default = await conn.fetchval(
+            """
+            SELECT column_default
+            FROM information_schema.columns
+            WHERE table_schema = $1
+              AND table_name = $2
+              AND column_name = 'source_index'
+            """,
+            self._schema,
+            self._name,
+        )
+        expected_sequence = f"{self._name}_source_index_seq"
+        if "nextval(" not in str(source_index_default or "") or expected_sequence not in str(source_index_default or ""):
+            raise RuntimeError(f"{self._table}.source_index is missing the expected sequence default; {migration_hint}")
 
         null_event_ids = await conn.fetchval(f"SELECT COUNT(*) FROM {self._table} WHERE event_id IS NULL")
         if int(null_event_ids or 0) > 0:
@@ -546,6 +566,12 @@ async def _write_usage_events_safely(events: list[UsageEvent]) -> None:
         )
 
 
+async def persist_usage_events(events: list[UsageEvent]) -> None:
+    normalized = list(events)
+    if normalized:
+        await _write_usage_events_safely(normalized)
+
+
 def schedule_usage_events(events: list[UsageEvent]) -> None:
     normalized = list(events)
     if not normalized:
@@ -572,10 +598,16 @@ def schedule_usage_events(events: list[UsageEvent]) -> None:
 async def close_usage_store() -> None:
     global _usage_store, _USAGE_STORE_CLOSING
     _USAGE_STORE_CLOSING = True
-    for task in list(_PENDING_WRITE_TASKS):
-        task.cancel()
-    if _PENDING_WRITE_TASKS:
-        await asyncio.gather(*list(_PENDING_WRITE_TASKS), return_exceptions=True)
+    pending = list(_PENDING_WRITE_TASKS)
+    if pending:
+        done, pending_set = await asyncio.wait(pending, timeout=_SHUTDOWN_FLUSH_TIMEOUT_S)
+        for task in done:
+            with suppress(Exception):
+                task.result()
+        for task in pending_set:
+            task.cancel()
+        if pending_set:
+            await asyncio.gather(*pending_set, return_exceptions=True)
         _PENDING_WRITE_TASKS.clear()
     async with _usage_store_guard:
         if _usage_store is not None:

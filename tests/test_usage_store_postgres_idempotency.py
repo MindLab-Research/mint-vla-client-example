@@ -52,8 +52,10 @@ class _FakeConn:
             return 1
         if "FROM information_schema.tables" in text:
             return bool(self._state.get("usage_event_table_exists", True))
+        if "FROM information_schema.columns" in text and "column_default" in text:
+            return self._state.get("source_index_column_default", "nextval('usage_event_source_index_seq'::regclass)")
         if "FROM information_schema.columns" in text and "is_nullable = 'NO'" in text:
-            return int(self._state.get("usage_event_not_null_column_count", 9))
+            return int(self._state.get("usage_event_not_null_column_count", 10))
         if "FROM information_schema.columns" in text:
             return int(self._state.get("usage_event_column_count", 10))
         if "FROM pg_index" in text:
@@ -130,7 +132,8 @@ def _state(**overrides):
         "schema_statements": [],
         "usage_event_table_exists": True,
         "usage_event_column_count": 10,
-        "usage_event_not_null_column_count": 9,
+        "usage_event_not_null_column_count": 10,
+        "source_index_column_default": "nextval('usage_event_source_index_seq'::regclass)",
     }
     state.update(overrides)
     return state
@@ -489,7 +492,7 @@ def test_postgres_usage_store_requires_migration_when_event_id_nulls_exist(monke
     )
 
     async def _run():
-        with pytest.raises(RuntimeError, match="004_direct_pg_usage_event_id"):
+        with pytest.raises(RuntimeError, match="direct-PG billing migration"):
             await store.write_event(event)
         await store.close()
 
@@ -505,6 +508,7 @@ def test_schedule_usage_events_rejects_new_tasks_after_close_started(monkeypatch
     async def _run():
         usage_store_module._USAGE_STORE_CLOSING = False
         usage_store_module._PENDING_WRITE_TASKS.clear()
+        monkeypatch.setattr(usage_store_module, "_SHUTDOWN_FLUSH_TIMEOUT_S", 0.01)
         monkeypatch.setattr(usage_store_module, "_write_usage_events_safely", _never_write)
         event = UsageEvent(
             account_id="aaaaaaaaaaaaaaaaaaaaaaaa",
@@ -568,5 +572,59 @@ def test_postgres_usage_store_schema_check_is_read_only_when_migration_missing(m
             await store.write_event(event)
         await store.close()
         assert state["schema_statements"] == []
+
+    asyncio.run(_run())
+
+
+def test_postgres_usage_store_requires_source_index_default(monkeypatch):
+    state = _state(source_index_column_default=None)
+    _install_fake_asyncpg(monkeypatch, state)
+
+    store = PostgresUsageStore(dsn="postgresql://fake")
+    event = UsageEvent(
+        account_id="aaaaaaaaaaaaaaaaaaaaaaaa",
+        apikey_id="bbbbbbbbbbbbbbbbbbbbbbbb",
+        charge_item="training",
+        quantity=1,
+        request_id="req-no-source-default",
+        label="route=training.train_step",
+    )
+
+    async def _run():
+        with pytest.raises(RuntimeError, match="source_index is missing the expected sequence default"):
+            await store.write_event(event)
+        await store.close()
+        assert state["rows"] == []
+
+    asyncio.run(_run())
+
+
+def test_close_usage_store_flushes_pending_tasks_before_cancel(monkeypatch):
+    import tinker_server.usage_store as usage_store_module
+
+    wrote: list[str] = []
+
+    async def _write(events):
+        await asyncio.sleep(0)
+        wrote.extend(event.request_id for event in events)
+
+    async def _run():
+        usage_store_module._USAGE_STORE_CLOSING = False
+        usage_store_module._PENDING_WRITE_TASKS.clear()
+        monkeypatch.setattr(usage_store_module, "_SHUTDOWN_FLUSH_TIMEOUT_S", 1.0)
+        monkeypatch.setattr(usage_store_module, "_write_usage_events_safely", _write)
+        event = UsageEvent(
+            account_id="aaaaaaaaaaaaaaaaaaaaaaaa",
+            apikey_id="bbbbbbbbbbbbbbbbbbbbbbbb",
+            charge_item="training",
+            quantity=1,
+            request_id="req-flush-close",
+            label="route=training.train_step",
+        )
+        usage_store_module.schedule_usage_events([event])
+        await usage_store_module.close_usage_store()
+        assert wrote == ["req-flush-close"]
+        assert usage_store_module._PENDING_WRITE_TASKS == set()
+        usage_store_module._USAGE_STORE_CLOSING = False
 
     asyncio.run(_run())

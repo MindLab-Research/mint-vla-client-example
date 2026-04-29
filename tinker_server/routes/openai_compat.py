@@ -30,7 +30,7 @@ from ..models.types import (
     OAIToolCall,
     OAIUsage,
 )
-from ..usage_store import schedule_usage_events
+from ..usage_store import persist_usage_events
 from .sampling import build_sample_once_usage_events, sample_once
 from .service import ensure_sampling_session
 
@@ -38,8 +38,8 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-async def _schedule_usage_events_after_response(events) -> None:
-    schedule_usage_events(events)
+async def _write_usage_events_after_response(events) -> None:
+    await persist_usage_events(events)
 
 
 @dataclass
@@ -703,7 +703,7 @@ async def completions(request: OAICompletionRequest, http_request: Request, back
                     raise
         text = tokenizer.decode(sequence.tokens, skip_special_tokens=True)
         background_tasks.add_task(
-            _schedule_usage_events_after_response,
+            _write_usage_events_after_response,
             build_sample_once_usage_events(
                 session_id=sampling_session_id,
                 token_ids=prompt_token_ids,
@@ -830,7 +830,7 @@ async def chat_completions(request: OAIChatCompletionRequest, http_request: Requ
             _validate_tool_calls(request, tool_calls=tool_calls)
             finish_reason = "tool_calls" if tool_calls else _finish_reason(sequence.stop_reason)
             background_tasks.add_task(
-                _schedule_usage_events_after_response,
+                _write_usage_events_after_response,
                 build_sample_once_usage_events(
                     session_id=sampling_session_id,
                     token_ids=prompt_token_ids,
