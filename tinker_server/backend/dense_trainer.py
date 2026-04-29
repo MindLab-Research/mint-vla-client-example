@@ -251,7 +251,8 @@ def retire_dense_trainer(
 
     pool = get_resource_pool()
     entry = pool.get(actor_name)
-    retire_outcome = "ok"
+    retire_error: str | None = None
+    auxiliary_failures: list[str] = []
 
     if entry is not None:
         try:
@@ -267,7 +268,7 @@ def retire_dense_trainer(
                 sample_source="dense_retire",
             )
         except Exception:
-            retire_outcome = "metadata_update_failed"
+            auxiliary_failures.append("metadata_update_failed")
             logger.warning(
                 "[dense_trainer] failed to persist poison metadata actor_name=%s reason=%s",
                 actor_name,
@@ -278,8 +279,7 @@ def retire_dense_trainer(
         try:
             pool.clear_session(session_id, actor_type=ActorType.DENSE)
         except Exception:
-            if retire_outcome == "ok":
-                retire_outcome = "clear_session_failed"
+            auxiliary_failures.append("clear_session_failed")
             logger.warning(
                 "[dense_trainer] failed clear_session actor_name=%s session_id=%s",
                 actor_name,
@@ -289,8 +289,7 @@ def retire_dense_trainer(
     try:
         pool.set_session(actor_name, None)
     except Exception:
-        if retire_outcome == "ok":
-            retire_outcome = "clear_binding_failed"
+        auxiliary_failures.append("clear_binding_failed")
         logger.warning(
             "[dense_trainer] failed to clear bound session actor_name=%s",
             actor_name,
@@ -304,8 +303,7 @@ def retire_dense_trainer(
         except ValueError:
             actor_absent = True
         except Exception:
-            if retire_outcome == "ok":
-                retire_outcome = "actor_lookup_failed"
+            retire_error = "actor_lookup_failed"
             logger.warning(
                 "[dense_trainer] failed actor lookup during retire actor_name=%s reason=%s",
                 actor_name,
@@ -334,8 +332,7 @@ def retire_dense_trainer(
             )
             actor_absent = True
         except Exception:
-            if retire_outcome == "ok":
-                retire_outcome = "kill_failed"
+            retire_error = "kill_failed"
             logger.warning(
                 "[dense_trainer] failed retire actor_name=%s reason=%s",
                 actor_name,
@@ -349,16 +346,20 @@ def retire_dense_trainer(
         try:
             pool.unregister(actor_name)
         except Exception:
-            if retire_outcome == "ok":
-                retire_outcome = "unregister_failed"
+            auxiliary_failures.append("unregister_failed")
             logger.warning(
                 "[dense_trainer] failed unregister after retire actor_name=%s reason=%s",
                 actor_name,
                 reason,
                 exc_info=True,
             )
-    elif retire_outcome == "ok":
-        retire_outcome = "actor_still_present"
+    elif retire_error is None:
+        retire_error = "actor_still_present"
+
+    retire_outcome = retire_error or "ok"
+    incident_context: dict[str, object] = {"outcome": retire_outcome}
+    if auxiliary_failures:
+        incident_context["auxiliary_failures"] = list(auxiliary_failures)
 
     runtime_observability.record_dense_actor_retire(base_model=base_model, outcome=retire_outcome)
     runtime_observability.record_training_incident(
@@ -372,8 +373,22 @@ def retire_dense_trainer(
         request_id=None if request_id is None else str(request_id),
         session_id=None if session_id is None else str(session_id),
         detail=str(reason),
-        context={"outcome": retire_outcome},
+        context=incident_context,
     )
+    for auxiliary_failure in auxiliary_failures:
+        runtime_observability.record_training_incident(
+            kind="dense_actor_retire_auxiliary_failure",
+            base_model=base_model,
+            backend="peft",
+            op=str(fatal_op or "retire"),
+            status="error",
+            failure_class=auxiliary_failure,
+            actor_name=actor_name,
+            request_id=None if request_id is None else str(request_id),
+            session_id=None if session_id is None else str(session_id),
+            detail=str(reason),
+            context={"retire_outcome": retire_outcome},
+        )
     return retire_outcome
 
 

@@ -399,3 +399,61 @@ def test_issue_561_retire_dense_trainer_persists_fatal_metadata(monkeypatch) -> 
             "count": 1,
         }
     ]
+
+
+def test_issue_561_retire_metadata_failure_does_not_block_recreate(monkeypatch) -> None:
+    from tinker_server.backend import dense_trainer as dt
+
+    unregisters: list[str] = []
+    obs = runtime_obs_module.RuntimeObservability()
+
+    class _FakePool:
+        def get(self, actor_name: str):
+            assert actor_name == "peft_trainer_qwen__qwen3_0_6b_maxr64"
+            return SimpleNamespace(metadata={"poisoned": True})
+
+        def update_metadata(self, actor_name: str, *, metadata, sample_source=None):
+            raise RuntimeError("metadata store unavailable")
+
+        def clear_session(self, session_id: str, actor_type=None):
+            return None
+
+        def set_session(self, actor_name: str, session_id):
+            return None
+
+        def unregister(self, actor_name: str):
+            unregisters.append(actor_name)
+
+    monkeypatch.setattr(dt, "get_resource_pool", lambda: _FakePool())
+    monkeypatch.setattr(runtime_obs_module, "runtime_observability", obs)
+    monkeypatch.setattr(dt.ray_kill, "kill", lambda *args, **kwargs: None)
+    monkeypatch.setattr(dt, "_remove_pg", lambda actor_name: None)
+
+    outcome = dt.retire_dense_trainer(
+        actor_name="peft_trainer_qwen__qwen3_0_6b_maxr64",
+        reason="reuse_blocked:first fault",
+        base_model="Qwen/Qwen3-0.6B",
+        session_id="model-561",
+        fatal_op="retire",
+        actor=object(),
+    )
+
+    snap = obs.snapshot()
+    assert outcome == "ok"
+    assert unregisters == ["peft_trainer_qwen__qwen3_0_6b_maxr64"]
+    assert snap["dense_actor_retire"] == [
+        {
+            "base_model": "Qwen/Qwen3-0.6B",
+            "outcome": "ok",
+            "count": 1,
+        }
+    ]
+    assert [row["kind"] for row in snap["recent_training_incidents"]] == [
+        "dense_actor_retire",
+        "dense_actor_retire_auxiliary_failure",
+    ]
+    assert snap["recent_training_incidents"][0]["context"] == {
+        "outcome": "ok",
+        "auxiliary_failures": ["metadata_update_failed"],
+    }
+    assert snap["recent_training_incidents"][1]["failure_class"] == "metadata_update_failed"
