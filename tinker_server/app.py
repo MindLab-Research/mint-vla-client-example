@@ -924,9 +924,27 @@ async def api_key_auth_middleware(request: Request, call_next):
             ):
                 return await _next_with_trace()
 
-        # Legacy auth disabled => dev mode pass-through.
+        # Legacy auth disabled => dev mode pass-through with explicit write caps.
         if not config.auth_enabled:
-            with bind_request_trace_context(trace_id=trace_id):
+            request.state.user_data = {
+                "user_id": "000000000000000000000001",
+                "user_role": "admin",
+                "is_admin": True,
+                "account_id": "000000000000000000000001",
+                "apikey_id": "000000000000000000000002",
+                "cap_write": True,
+                "cap_view_internal_errors": True,
+                "cap_bypass_ownership": True,
+                "cap_manage_system": True,
+                "caps_from_headers": True,
+            }
+            with bind_request_trace_context(
+                trace_id=trace_id,
+                user_id="000000000000000000000001",
+                user_role="admin",
+                account_id="000000000000000000000001",
+                apikey_id="000000000000000000000002",
+            ):
                 return await _next_with_trace()
 
         api_key = request.headers.get("X-API-Key", "")
