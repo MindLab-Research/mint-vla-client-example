@@ -5305,7 +5305,6 @@ class MegatronRankWorker:
 
         import torch
 
-        from tinker_server.backend.lora_utils import truncate_lora_state_dict
         from verl.utils.megatron_peft_utils import _get_rank_checkpoint_path, get_adapter_state_dict
 
         os.makedirs(checkpoint_path, exist_ok=True)
@@ -5330,13 +5329,6 @@ class MegatronRankWorker:
                     if key in expert_bias_state:
                         key = f"chunk{chunk_idx}.{module_name}"
                     expert_bias_state[key] = module.expert_bias.detach().cpu().clone()
-
-            # Phase 7: Apply truncation if actual_rank < trainer_rank
-            if actual_rank is not None and trainer_rank is not None and actual_rank < trainer_rank:
-                logger.info(
-                    f"[Rank {self.rank}] Truncating adapter from rank {trainer_rank} to {actual_rank}"
-                )
-                adapter_state = truncate_lora_state_dict(adapter_state, trainer_rank, actual_rank)
 
             # Get rank-specific path
             Path(checkpoint_path).mkdir(parents=True, exist_ok=True)

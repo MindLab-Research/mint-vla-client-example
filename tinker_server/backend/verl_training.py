@@ -1598,10 +1598,25 @@ class TrainingWorker:
         state_dict = load_file(adapter_path, device=str(self.device))
         from tinker_server.backend.lora_utils import get_lora_rank_from_state_dict, pad_lora_state_dict
 
-        raw_meta_rank = meta.get("actual_rank")
-        meta_rank = int(raw_meta_rank) if isinstance(raw_meta_rank, int) and not isinstance(raw_meta_rank, bool) else None
+        meta_rank: int | None = None
+        if "actual_rank" in meta:
+            raw_meta_rank = meta["actual_rank"]
+            if not isinstance(raw_meta_rank, int) or isinstance(raw_meta_rank, bool):
+                raise ValueError(f"training_meta.actual_rank must be an int, got {raw_meta_rank!r}")
+            meta_rank = int(raw_meta_rank)
         inferred_rank = get_lora_rank_from_state_dict(state_dict)
-        actual_rank = meta_rank or config_rank or inferred_rank
+        rank_sources = [
+            ("training_meta.actual_rank", meta_rank),
+            ("adapter_config.r", config_rank),
+            ("adapter_model.safetensors", inferred_rank),
+        ]
+        present_ranks = [(name, rank) for name, rank in rank_sources if rank is not None]
+        if not present_ranks:
+            raise ValueError(f"No LoRA rank metadata or tensors found in checkpoint: {load_path}")
+        rank_values = {int(rank) for _, rank in present_ranks}
+        if len(rank_values) != 1:
+            raise ValueError(f"Checkpoint LoRA rank metadata mismatch: {present_ranks}")
+        actual_rank = next(iter(rank_values))
         actual_rank = self._resolve_actual_rank(actual_rank)
 
         if session_id is not None:
@@ -3539,6 +3554,7 @@ class VerlTrainingEngine:
                     base_model=base_model,
                     model_key=requested_model,
                     lora_rank=lora_rank,
+                    max_lora_rank=int(server_config.max_lora_rank),
                     learning_rate=session.learning_rate,
                     session_id=session.model_id,
                 ),

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import asyncio
 from types import ModuleType
 from types import SimpleNamespace
 
@@ -254,6 +255,92 @@ def test_issue_572_dense_load_checkpoint_pads_actual_rank_adapter(tmp_path, monk
     assert torch.all(b[:, 16:] == 0)
 
 
+def test_issue_572_dense_load_checkpoint_rejects_rank_metadata_mismatch(tmp_path) -> None:
+    from safetensors.torch import save_file
+    from tinker_server.backend.verl_training import TrainingWorker
+
+    save_file(
+        {
+            "base_model.model.layers.0.self_attn.q_proj.lora_A.default.weight": torch.ones(16, 3),
+            "base_model.model.layers.0.self_attn.q_proj.lora_B.default.weight": torch.ones(5, 16),
+        },
+        tmp_path / "adapter_model.safetensors",
+    )
+    (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 16, "target_modules": ["linear_qkv"]}))
+    (tmp_path / "training_meta.json").write_text(json.dumps({"actual_rank": 64, "current_step": 7}))
+
+    worker_cls = TrainingWorker.__ray_metadata__.modified_class
+    worker = object.__new__(worker_cls)
+    worker.device = "cpu"
+    worker.max_lora_rank = 64
+    worker._bind_traceparent = lambda traceparent: None
+    worker._touch = lambda: None
+
+    with pytest.raises(ValueError, match="Checkpoint LoRA rank metadata mismatch"):
+        worker.load_checkpoint(str(tmp_path), load_optimizer=False, session_id="session-r16")
+
+
+def test_issue_572_dense_create_passes_configured_max_rank(monkeypatch) -> None:
+    import tinker_server.backend.dense_trainer as dense_trainer
+    import tinker_server.backend.model_registry as model_registry
+    import tinker_server.backend.resource_pool as resource_pool
+    import tinker_server.backend.verl_training as verl_training
+    from tinker_server.backend.verl_training import VerlTrainingEngine
+
+    monkeypatch.setattr(verl_training.server_config, "max_lora_rank", 96, raising=False)
+    monkeypatch.setattr(verl_training.server_config, "training_dense_get_or_create_timeout_s", 10, raising=False)
+    monkeypatch.setattr(verl_training.server_config, "training_reinit_lora_timeout_s", 10, raising=False)
+    monkeypatch.setattr(verl_training.server_config, "training_actor_ready_timeout_s", 10, raising=False)
+    monkeypatch.setattr(model_registry, "get_model_config", lambda _model: SimpleNamespace(is_moe=False))
+
+    captured: dict[str, object] = {}
+
+    class _RemoteMethod:
+        def __init__(self, value):
+            self.value = value
+
+        def remote(self, *args, **kwargs):
+            return self.value
+
+    class _FakeActor:
+        def __init__(self):
+            self.reinit_lora_weights = _RemoteMethod({"reinit_count": 1, "lr_updated": True})
+            self.__ray_ready__ = _RemoteMethod("ready")
+
+    def _fake_get_or_create_dense_trainer(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(actor=_FakeActor(), actor_name="peft_trainer_test_maxr96", max_lora_rank=96)
+
+    class _Pool:
+        def mark_ready(self, actor_name):
+            captured["mark_ready"] = actor_name
+
+    async def _fake_await_worker_call(ref, *_args, **_kwargs):
+        return ref
+
+    monkeypatch.setattr(dense_trainer, "get_or_create_dense_trainer", _fake_get_or_create_dense_trainer)
+    monkeypatch.setattr(resource_pool, "get_resource_pool", lambda: _Pool())
+
+    engine = VerlTrainingEngine(default_base_model="/models/qwen", default_lora_rank=8)
+    engine._await_worker_call = _fake_await_worker_call
+    engine._touch_actor = lambda session: None
+    session = SimpleNamespace(
+        model_id="session-dense-r12",
+        base_model="/models/qwen",
+        lora_config=SimpleNamespace(rank=12),
+        learning_rate=1e-4,
+        backend=None,
+        is_active=False,
+    )
+
+    asyncio.run(engine.create_training_session(session))
+
+    assert captured["lora_rank"] == 12
+    assert captured["max_lora_rank"] == 96
+    assert session.backend == "peft"
+    assert session.is_active is True
+
+
 def test_issue_572_megatron_group_reinit_passes_actual_rank_to_rank_workers() -> None:
     ray = pytest.importorskip("ray")
     if not hasattr(ray, "remote"):
@@ -334,6 +421,55 @@ def test_issue_572_megatron_peft_export_truncates_to_actual_rank(tmp_path) -> No
     config = json.loads((tmp_path / "adapter_config.json").read_text())
     assert config["r"] == 16
     assert meta["actual_rank"] == 16
+
+
+def test_issue_572_megatron_rank_checkpoint_preserves_tp_local_rank_for_rank32(tmp_path, monkeypatch) -> None:
+    ray = pytest.importorskip("ray")
+    if not hasattr(ray, "remote"):
+        pytest.skip("ray runtime without actor decorators is not usable for Megatron tests")
+
+    from tinker_server.backend.megatron_distributed import MegatronRankWorker
+
+    verl_mod = ModuleType("verl")
+    verl_utils_mod = ModuleType("verl.utils")
+    peft_utils_mod = ModuleType("verl.utils.megatron_peft_utils")
+    peft_utils_mod._get_rank_checkpoint_path = lambda checkpoint_path: str(tmp_path / "mp_rank_00")
+    peft_utils_mod.get_adapter_state_dict = lambda _module: {
+        "layers.0.mlp.adapter.linear_in.weight": torch.ones(16, 3),
+        "layers.0.mlp.adapter.linear_out.weight": torch.ones(5, 16),
+    }
+    verl_utils_mod.megatron_peft_utils = peft_utils_mod
+    verl_mod.utils = verl_utils_mod
+    monkeypatch.setitem(sys.modules, "verl", verl_mod)
+    monkeypatch.setitem(sys.modules, "verl.utils", verl_utils_mod)
+    monkeypatch.setitem(sys.modules, "verl.utils.megatron_peft_utils", peft_utils_mod)
+
+    class _Module:
+        def named_modules(self):
+            return []
+
+    class _TrainMode:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *_args):
+            return False
+
+    worker_cls = MegatronRankWorker.__ray_metadata__.modified_class
+    worker = object.__new__(worker_cls)
+    worker.rank = 0
+    worker.engine = SimpleNamespace(module=_Module(), train_mode=lambda: _TrainMode())
+    worker._bind_traceparent = lambda traceparent: None
+    worker._release_sticky_for_aux_mode_transition = lambda **_kwargs: None
+    worker._zero_lora_rank_tail = lambda *args, **kwargs: {"params": 2, "grads": 0}
+
+    result = worker.save_adapter_state(str(tmp_path), actual_rank=32, trainer_rank=64)
+
+    checkpoint = torch.load(tmp_path / "mp_rank_00_adapter.pt", map_location="cpu")
+    adapter = checkpoint["adapter_state_dict"]
+    assert result == {"status": "ok", "path": str(tmp_path), "actual_rank": 32}
+    assert adapter["layers.0.mlp.adapter.linear_in.weight"].shape == (16, 3)
+    assert adapter["layers.0.mlp.adapter.linear_out.weight"].shape == (5, 16)
 
 
 def test_issue_572_megatron_load_checkpoint_accepts_matching_actual_rank_metadata(tmp_path, monkeypatch) -> None:
