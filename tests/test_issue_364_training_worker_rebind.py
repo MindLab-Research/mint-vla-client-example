@@ -94,6 +94,55 @@ async def test_issue_364_save_dense_lora_weights_allows_dense_recover(monkeypatc
 
 
 @pytest.mark.anyio
+async def test_save_dense_lora_weights_materializes_worker_payload_on_api_server(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    import json
+
+    import torch
+    from safetensors.torch import load_file
+
+    engine = VerlTrainingEngine()
+    session = TrainingSession(
+        model_id="run-dense-sampler-materialize",
+        session_id="session-dense-sampler-materialize",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-0.6B",
+        backend="peft",
+    )
+    payload = {
+        "state_dict": {"adapter.lora_A.weight": torch.zeros(2, 3)},
+        "peft_config": {"r": 2, "lora_alpha": 4, "target_modules": ["adapter"]},
+        "current_step": 7,
+        "learning_rate": 3e-4,
+    }
+    worker = SimpleNamespace(save_lora_weights=_AwaitableRemote(payload))
+
+    async def _fake_get_live_worker(s, *, op: str, allow_recover: bool = False):
+        assert s is session
+        return worker
+
+    async def _fake_await_with_keepalive(ref, _session, interval_s: float = 30.0, timeout_s=None):
+        _ = _session, interval_s, timeout_s
+        return await ref
+
+    monkeypatch.setattr(engine, "_get_live_worker", _fake_get_live_worker)
+    monkeypatch.setattr(engine, "_await_with_keepalive", _fake_await_with_keepalive)
+
+    out = await engine.save_dense_lora_weights_for_sampler(session, str(tmp_path / "ckpt"))
+
+    assert out == str((tmp_path / "ckpt").resolve())
+    assert set(load_file(str(tmp_path / "ckpt" / "adapter_model.safetensors")).keys()) == {
+        "adapter.lora_A.weight"
+    }
+    assert json.loads((tmp_path / "ckpt" / "adapter_config.json").read_text())["r"] == 2
+    assert json.loads((tmp_path / "ckpt" / "training_meta.json").read_text()) == {
+        "current_step": 7,
+        "learning_rate": 3e-4,
+    }
+
+
+@pytest.mark.anyio
 async def test_issue_561_dense_fatal_error_retires_actor(monkeypatch: pytest.MonkeyPatch) -> None:
     engine = VerlTrainingEngine()
     obs = runtime_obs_module.RuntimeObservability()
@@ -294,7 +343,7 @@ def test_issue_561_training_worker_validates_input_contract_before_gpu(monkeypat
     worker._base_model = "Qwen/Qwen3-0.6B"
     worker._touch = lambda: None
     worker._bind_traceparent = lambda traceparent: None
-    worker._ensure_session_loaded = lambda session_id: None
+    worker._ensure_session_loaded = lambda session_id, actual_rank=None: None
     worker.model = SimpleNamespace(
         config=SimpleNamespace(vocab_size=16),
         train=lambda: None,
@@ -371,7 +420,7 @@ def test_issue_561_rejects_non_finite_weight_inputs_before_gpu(monkeypatch: pyte
     worker._base_model = "Qwen/Qwen3-4B-Instruct-2507"
     worker._touch = lambda: None
     worker._bind_traceparent = lambda traceparent: None
-    worker._ensure_session_loaded = lambda session_id: None
+    worker._ensure_session_loaded = lambda session_id, actual_rank=None: None
     worker.model = SimpleNamespace(
         config=SimpleNamespace(vocab_size=16),
         train=lambda: None,

@@ -104,6 +104,30 @@ def test_checkpoint_namespace_resolution_falls_back_to_legacy_flat_dir(tmp_path,
     ) == str(legacy_dir)
 
 
+def test_checkpoint_namespace_resolution_allows_legacy_anonymous_cache(tmp_path, monkeypatch) -> None:
+    from tinker_server import checkpoints
+
+    persistent_root = tmp_path / "tos"
+    runtime_root = tmp_path / "runtime"
+    anonymous_dir = _mk_checkpoint_view(
+        runtime_root / "persistent_cache",
+        owner="anonymous",
+        run_id="run-hotfix",
+        name="0003",
+        checkpoint_type="sampler",
+        typed=True,
+    )
+
+    monkeypatch.setattr(checkpoints, "CHECKPOINTS_DIR", str(persistent_root))
+    monkeypatch.setattr(checkpoints, "PERSISTENT_CHECKPOINTS_DIR", str(persistent_root))
+    monkeypatch.setattr(checkpoints, "RUNTIME_CHECKPOINTS_DIR", str(runtime_root))
+
+    assert checkpoints.resolve_checkpoint_path(
+        "tinker://run-hotfix/sampler_weights/0003",
+        user_id="owner-a",
+    ) == str(anonymous_dir)
+
+
 def test_checkpoint_namespace_rejects_untyped_uri(tmp_path, monkeypatch) -> None:
     from tinker_server import checkpoints
 

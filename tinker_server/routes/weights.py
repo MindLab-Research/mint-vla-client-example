@@ -92,6 +92,35 @@ training_engine: VerlTrainingEngine | None = None
 inference_manager: SessionManager | None = None  # For multi-LoRA sampling registration
 
 
+def _wait_for_checkpoint_artifacts(
+    path: str,
+    *,
+    checkpoint_type: str,
+    timeout_s: float | None = None,
+) -> None:
+    deadline = time.monotonic() + float(
+        timeout_s
+        if timeout_s is not None
+        else os.environ.get("MINT_CHECKPOINT_EXPORT_VISIBLE_TIMEOUT_S", "60")
+    )
+    last_error: Exception | None = None
+    while True:
+        try:
+            if checkpoint_type == "sampler":
+                validate_sampler_checkpoint_for_sampling(path)
+            else:
+                validate_checkpoint_dir(path, checkpoint_type=cast(Any, checkpoint_type))
+            return
+        except Exception as e:
+            last_error = e
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.25)
+    raise RuntimeError(
+        f"{checkpoint_type} checkpoint artifacts are not visible at {path}: {last_error}"
+    ) from last_error
+
+
 def _loaded_training_session_lora_payload(lora_config: Any) -> dict[str, Any] | None:
     if lora_config is None:
         return None
@@ -1454,6 +1483,7 @@ async def _do_save_weights(
             await _save_weights_once()
 
         os.makedirs(save_path, exist_ok=True)
+        _wait_for_checkpoint_artifacts(save_path, checkpoint_type="sampler")
 
         if checkpoint_has_optimizer_state(save_path):
             raise RuntimeError(
