@@ -633,3 +633,27 @@ def test_issue_572_megatron_load_checkpoint_rejects_mismatched_actual_rank_metad
 
     with pytest.raises(RuntimeError, match="metadata rank 64 does not match adapter_config rank 16"):
         group.load_checkpoint(str(tmp_path), load_optimizer=False, session_id="session-r16")
+
+
+def test_issue_572_megatron_load_checkpoint_rejects_rank_above_trainer_before_load(tmp_path) -> None:
+    ray = pytest.importorskip("ray")
+    if not hasattr(ray, "remote"):
+        pytest.skip("ray runtime without actor decorators is not usable for Megatron tests")
+
+    from tinker_server.backend.megatron_distributed import MegatronWorkerGroup
+
+    (tmp_path / "mp_rank_00_adapter.pt").write_bytes(b"adapter")
+    (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 80, "target_modules": ["linear_qkv"]}))
+
+    group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
+    group = object.__new__(group_cls)
+    group.lora_rank = 64
+    group.learning_rate = 1e-4
+    group._bind_traceparent = lambda traceparent: None
+    group._resolve_required_session_id = lambda session_id, op: session_id or "session-r80"
+    load_calls = []
+    group.load_adapter_state = lambda *args, **kwargs: load_calls.append((args, kwargs))
+
+    with pytest.raises(RuntimeError, match="checkpoint rank 80 exceeds trainer max_lora_rank 64"):
+        group.load_checkpoint(str(tmp_path), load_optimizer=False, session_id="session-r80")
+    assert load_calls == []

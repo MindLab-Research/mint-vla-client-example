@@ -8718,6 +8718,11 @@ class MegatronWorkerGroup:
                 raise RuntimeError(
                     f"Invalid adapter rank in {adapter_config_path}: expected positive int, got {checkpoint_rank!r}"
                 )
+            if int(checkpoint_rank) > int(self.lora_rank):
+                raise RuntimeError(
+                    f"Invalid adapter rank in {adapter_config_path}: checkpoint rank {checkpoint_rank} "
+                    f"exceeds trainer max_lora_rank {self.lora_rank}"
+                )
             checkpoint_train_attn, checkpoint_train_mlp, checkpoint_train_unembed = (
                 _resolve_lora_train_flags_for_checkpoint(
                     adapter_config,
@@ -8736,6 +8741,10 @@ class MegatronWorkerGroup:
                     f"Missing adapter_config.json and no valid fallback rank available: {adapter_config_path}"
                 )
             checkpoint_rank = int(fallback_rank)
+            if int(checkpoint_rank) > int(self.lora_rank):
+                raise RuntimeError(
+                    f"Invalid fallback checkpoint rank {checkpoint_rank}: exceeds trainer max_lora_rank {self.lora_rank}"
+                )
             checkpoint_train_attn = (
                 bool(getattr(self, "_train_attn", True)) if train_attn is None else bool(train_attn)
             )
@@ -9889,7 +9898,33 @@ def get_or_create_megatron_worker_group(
                         "diagnostics_timeout_s": 10,
                     },
                 ):
-                    ray.get(actor.get_diagnostics.remote(), timeout=10)
+                    diagnostics = ray.get(actor.get_diagnostics.remote(), timeout=10)
+                observed_rank = None
+                if isinstance(diagnostics, dict):
+                    observed_rank = diagnostics.get("lora_rank", diagnostics.get("max_lora_rank"))
+                if not isinstance(observed_rank, int) or isinstance(observed_rank, bool):
+                    raise RuntimeError(
+                        f"Megatron actor {actor_name} diagnostics missing integer lora_rank: {diagnostics!r}"
+                    )
+                if int(observed_rank) != int(lora_rank):
+                    logger.warning(
+                        "Megatron actor %s has lora_rank=%s but configured max_lora_rank=%s; recreating",
+                        actor_name,
+                        observed_rank,
+                        lora_rank,
+                    )
+                    ray_kill.kill(
+                        actor,
+                        reason="megatron_actor_lora_rank_mismatch",
+                        actor_name=actor_name,
+                        namespace=PERSISTENT_NAMESPACE,
+                        no_restart=True,
+                        verify_absent=True,
+                        base_model=base_model,
+                        observed_lora_rank=observed_rank,
+                        expected_lora_rank=int(lora_rank),
+                    )
+                    raise ValueError("Actor lora_rank mismatch, will recreate")
             except ray.exceptions.RayActorError:
                 # Actor is dead, kill to free name
                 logger.warning(f"Megatron actor {actor_name} is dead, killing to free name")
@@ -9911,10 +9946,9 @@ def get_or_create_megatron_worker_group(
                     pass
                 raise ValueError("Actor dead, will recreate")
             except ray.exceptions.GetTimeoutError:
-                # Actor might be busy (queued tasks) rather than dead.
-                # Killing on timeout will terminate active training and corrupt in-flight requests.
-                logger.warning(
-                    f"Megatron actor {actor_name} get_diagnostics timed out; assuming busy and reusing actor"
+                raise RuntimeError(
+                    f"Megatron actor {actor_name} get_diagnostics timed out; cannot verify "
+                    f"lora_rank={lora_rank} without risking stale actor reuse"
                 )
 
             with start_as_current_span_from_traceparent(
