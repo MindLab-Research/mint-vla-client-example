@@ -216,10 +216,25 @@ class PostgresUsageStore:
         for event in raw:
             event_id = str(event.event_id or "").strip()
             if not event_id:
+                account_id = str(event.account_id or "").strip()
+                apikey_id = str(event.apikey_id or "").strip()
                 request_id = str(event.request_id or "").strip()
-                if not request_id:
-                    raise ValueError("usage_event request_id must be non-empty")
-                event_id = self.build_event_id(event)
+                charge_item = str(event.charge_item or "").strip()
+                label = str(event.label or "").strip()
+                if not account_id or not apikey_id or not request_id:
+                    raise ValueError("usage_event delete requires event_id or complete identity fields")
+                if charge_item not in _ALLOWED_CHARGE_ITEMS:
+                    raise ValueError(f"unsupported usage_event charge_item: {charge_item!r}")
+                event_id = self.build_event_id(
+                    replace(
+                        event,
+                        account_id=account_id,
+                        apikey_id=apikey_id,
+                        request_id=request_id,
+                        charge_item=charge_item,
+                        label=label,
+                    )
+                )
             if event_id in seen:
                 continue
             seen.add(event_id)

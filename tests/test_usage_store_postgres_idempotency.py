@@ -693,3 +693,49 @@ def test_postgres_usage_store_closes_pool_when_schema_check_fails(monkeypatch):
         assert state["pool"].closed is True
 
     asyncio.run(_run())
+
+
+def test_postgres_usage_store_delete_events_requires_identity_fields_without_event_id(monkeypatch):
+    state = _state()
+    _install_fake_asyncpg(monkeypatch, state)
+
+    store = PostgresUsageStore(dsn="postgresql://fake")
+    event = UsageEvent(
+        account_id="",
+        apikey_id="bbbbbbbbbbbbbbbbbbbbbbbb",
+        charge_item="training",
+        quantity=-1,
+        request_id="req-delete-missing-account",
+        label="route=training.train_step",
+    )
+
+    async def _run():
+        with pytest.raises(ValueError, match="event_id or complete identity fields"):
+            await store.delete_events([event])
+        await store.close()
+        assert state["rows"] == []
+
+    asyncio.run(_run())
+
+
+def test_postgres_usage_store_delete_events_validates_charge_item_without_event_id(monkeypatch):
+    state = _state()
+    _install_fake_asyncpg(monkeypatch, state)
+
+    store = PostgresUsageStore(dsn="postgresql://fake")
+    event = UsageEvent(
+        account_id="aaaaaaaaaaaaaaaaaaaaaaaa",
+        apikey_id="bbbbbbbbbbbbbbbbbbbbbbbb",
+        charge_item="unsupported",
+        quantity=-1,
+        request_id="req-delete-bad-charge",
+        label="route=training.train_step",
+    )
+
+    async def _run():
+        with pytest.raises(ValueError, match="unsupported usage_event charge_item"):
+            await store.delete_events([event])
+        await store.close()
+        assert state["rows"] == []
+
+    asyncio.run(_run())
