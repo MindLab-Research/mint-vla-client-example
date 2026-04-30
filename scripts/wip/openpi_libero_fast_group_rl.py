@@ -54,6 +54,20 @@ from openpi_libero_fast_rl import (
 from openpi_libero_sft import _build_transform, _collect_transformed_items, _load_tasks, _plot_curve
 
 
+def _save_training_state(base_url: str, model_id: str, checkpoint_name: str) -> str:
+    resp = requests.post(
+        f'{base_url}/api/v1/save_weights',
+        json={'model_id': model_id, 'path': checkpoint_name},
+        timeout=120,
+    )
+    resp.raise_for_status()
+    result = _poll_future(base_url, resp.json()['request_id'], timeout_s=3600)
+    path = result.get('path')
+    if not isinstance(path, str) or not path:
+        raise RuntimeError(f'save_weights missing path: {result!r}')
+    return path
+
+
 def _ppo_train_step_batch(base_url: str, model_id: str, datums: list[dict], *, learning_rate: float) -> dict:
     resp = requests.post(
         f'{base_url}/api/v1/train_step',
@@ -239,6 +253,11 @@ def main() -> int:
     parser.add_argument('--temperature', type=float, default=float(os.environ.get('OPENPI_VLA_ACTION_TEMPERATURE', '0.3')))
     parser.add_argument('--eval-count', type=int, default=int(os.environ.get('OPENPI_VLA_EVAL_COUNT', '4')))
     parser.add_argument('--eval-temperature', type=float, default=float(os.environ.get('OPENPI_VLA_EVAL_TEMPERATURE', '0.0')))
+    parser.add_argument(
+        '--serialize-runtime-roles',
+        action=argparse.BooleanOptionalAction,
+        default=(os.environ.get('OPENPI_VLA_SERIALIZE_RUNTIME_ROLES', '1').strip().lower() in {'1', 'true', 'yes', 'on'}),
+    )
     parser.add_argument('--eval-item-indices', default=os.environ.get('OPENPI_VLA_EVAL_ITEM_INDICES', ''))
     parser.add_argument('--train-item-indices', default=os.environ.get('OPENPI_VLA_TRAIN_ITEM_INDICES', ''))
     parser.add_argument('--diversity-probe-count', type=int, default=3)
@@ -319,9 +338,19 @@ def main() -> int:
     baseline_train_reward = None
     baseline_train_reward_std = None
     try:
+        baseline_state_ckpt = None
+        if args.serialize_runtime_roles:
+            with run_log.open('a', encoding='utf-8') as handle:
+                handle.write('BASELINE save_train_state\n')
+            baseline_state_ckpt = _save_training_state(base_url, model_id, 'group-rl-state-baseline')
+            with run_log.open('a', encoding='utf-8') as handle:
+                handle.write(json.dumps({'event': 'baseline_state_ckpt', 'path': baseline_state_ckpt}) + '\n')
         with run_log.open('a', encoding='utf-8') as handle:
             handle.write('BASELINE save_eval_weights\n')
         baseline_eval_ckpt = _save_weights_for_sampler(base_url, model_id, 'group-rl-eval-baseline')
+        if args.serialize_runtime_roles:
+            _delete_model(base_url, model_id)
+            model_id = None
         with run_log.open('a', encoding='utf-8') as handle:
             handle.write(json.dumps({'event': 'baseline_eval_ckpt', 'path': baseline_eval_ckpt}) + '\n')
             handle.write('BASELINE train_action_session\n')
@@ -356,10 +385,52 @@ def main() -> int:
                 )
                 + '\n'
             )
+        if args.serialize_runtime_roles:
+            if not baseline_state_ckpt:
+                raise RuntimeError('serialize_runtime_roles requires a baseline training checkpoint')
+            with run_log.open('a', encoding='utf-8') as handle:
+                handle.write('BASELINE reload_train_state\n')
+            model_id = _create_model_from_state(
+                base_url,
+                base_model=base_model,
+                state_path=baseline_state_ckpt,
+                load_optimizer=True,
+            )
+            with run_log.open('a', encoding='utf-8') as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            'event': 'baseline_state_reloaded',
+                            'path': baseline_state_ckpt,
+                            'model_id': model_id,
+                        }
+                    )
+                    + '\n'
+                )
         for step in range(1, args.steps + 1):
+            presample_state_ckpt = None
+            if args.serialize_runtime_roles:
+                with run_log.open('a', encoding='utf-8') as handle:
+                    handle.write(f'STEP {step} save_train_state_presample\n')
+                presample_state_ckpt = _save_training_state(base_url, model_id, f'group-rl-state-{step}-presample')
+                with run_log.open('a', encoding='utf-8') as handle:
+                    handle.write(
+                        json.dumps(
+                            {
+                                'event': 'train_state_ckpt',
+                                'step': step,
+                                'phase': 'presample',
+                                'path': presample_state_ckpt,
+                            }
+                        )
+                        + '\n'
+                    )
             with run_log.open('a', encoding='utf-8') as handle:
                 handle.write(f'STEP {step} save_weights\n')
             ckpt = _save_weights_for_sampler(base_url, model_id, f'group-rl-{step}')
+            if args.serialize_runtime_roles:
+                _delete_model(base_url, model_id)
+                model_id = None
             if action_session_id:
                 _delete_action_session(base_url, action_session_id)
             with run_log.open('a', encoding='utf-8') as handle:
@@ -487,6 +558,34 @@ def main() -> int:
                     centered_rewards.append(float(centered_reward))
                 raw_rewards.extend(group_rewards)
 
+            if args.serialize_runtime_roles:
+                if action_session_id:
+                    _delete_action_session(base_url, action_session_id)
+                    action_session_id = None
+                if not presample_state_ckpt:
+                    raise RuntimeError(f'serialize_runtime_roles requires presample state checkpoint at step {step}')
+                with run_log.open('a', encoding='utf-8') as handle:
+                    handle.write(f'STEP {step} reload_train_state_presample\n')
+                model_id = _create_model_from_state(
+                    base_url,
+                    base_model=base_model,
+                    state_path=presample_state_ckpt,
+                    load_optimizer=True,
+                )
+                with run_log.open('a', encoding='utf-8') as handle:
+                    handle.write(
+                        json.dumps(
+                            {
+                                'event': 'train_state_reloaded',
+                                'step': step,
+                                'phase': 'presample',
+                                'path': presample_state_ckpt,
+                                'model_id': model_id,
+                            }
+                        )
+                        + '\n'
+                    )
+
             if not candidate_datums:
                 continue
 
@@ -587,9 +686,29 @@ def main() -> int:
                 record['clipfrac_mean'] = float(sum(epoch_clipfracs) / len(epoch_clipfracs))
             record['post_update_ratio_mean'] = post_update_ratio_mean
             record['post_update_clipfrac_mean'] = post_update_clipfrac_mean
+            posttrain_state_ckpt = None
+            if args.serialize_runtime_roles:
+                with run_log.open('a', encoding='utf-8') as handle:
+                    handle.write(f'STEP {step} save_train_state_posttrain\n')
+                posttrain_state_ckpt = _save_training_state(base_url, model_id, f'group-rl-state-{step}-posttrain')
+                with run_log.open('a', encoding='utf-8') as handle:
+                    handle.write(
+                        json.dumps(
+                            {
+                                'event': 'train_state_ckpt',
+                                'step': step,
+                                'phase': 'posttrain',
+                                'path': posttrain_state_ckpt,
+                            }
+                        )
+                        + '\n'
+                    )
             with run_log.open('a', encoding='utf-8') as handle:
                 handle.write(f'STEP {step} save_eval_weights\n')
             eval_ckpt = _save_weights_for_sampler(base_url, model_id, f'group-rl-eval-{step}')
+            if args.serialize_runtime_roles:
+                _delete_model(base_url, model_id)
+                model_id = None
             with run_log.open('a', encoding='utf-8') as handle:
                 handle.write(json.dumps({'event': 'eval_ckpt', 'step': step, 'path': eval_ckpt}) + '\n')
                 handle.write(f'STEP {step} train_action_session\n')
@@ -625,6 +744,30 @@ def main() -> int:
                     )
                     + '\n'
                 )
+            if args.serialize_runtime_roles:
+                if not posttrain_state_ckpt:
+                    raise RuntimeError(f'serialize_runtime_roles requires posttrain state checkpoint at step {step}')
+                with run_log.open('a', encoding='utf-8') as handle:
+                    handle.write(f'STEP {step} reload_train_state_posttrain\n')
+                model_id = _create_model_from_state(
+                    base_url,
+                    base_model=base_model,
+                    state_path=posttrain_state_ckpt,
+                    load_optimizer=True,
+                )
+                with run_log.open('a', encoding='utf-8') as handle:
+                    handle.write(
+                        json.dumps(
+                            {
+                                'event': 'train_state_reloaded',
+                                'step': step,
+                                'phase': 'posttrain',
+                                'path': posttrain_state_ckpt,
+                                'model_id': model_id,
+                            }
+                        )
+                        + '\n'
+                    )
             record['eval_reward'] = eval_reward
             record['eval_reward_std'] = eval_reward_std
             record['eval_count'] = len(eval_items)
@@ -677,6 +820,7 @@ def main() -> int:
             'eval_reward_curve_path': str(out_dir / 'eval_reward_curve.png'),
             'eval_indices': eval_indices,
             'train_indices': train_indices,
+            'serialize_runtime_roles': bool(args.serialize_runtime_roles),
             **pool_meta,
         }
         (out_dir / 'summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
@@ -688,7 +832,8 @@ def main() -> int:
     finally:
         if action_session_id:
             _delete_action_session(base_url, action_session_id)
-        _delete_model(base_url, model_id)
+        if model_id:
+            _delete_model(base_url, model_id)
     return 0
 
 

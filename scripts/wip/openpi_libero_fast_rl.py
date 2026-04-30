@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import time
 import uuid
@@ -73,6 +74,9 @@ def _create_model_from_state(
         "load_optimizer": bool(load_optimizer),
         "user_metadata": {"script": "scripts/wip/openpi_libero_fast_rl.py"},
     }
+    owner_id = _checkpoint_owner_id_from_uri(state_path)
+    if owner_id is not None:
+        payload["owner_id"] = owner_id
     resp = requests.post(f"{base_url}/api/v1/create_model_from_state", json=payload, timeout=120)
     resp.raise_for_status()
     result = _poll_future(base_url, resp.json()["request_id"], timeout_s=3600)
@@ -103,12 +107,80 @@ def _save_weights_for_sampler(base_url: str, model_id: str, checkpoint_name: str
     return path
 
 
+def _checkpoint_owner_id_from_uri(checkpoint_uri: str) -> str | None:
+    if not checkpoint_uri.startswith(("mint://", "tinker://", "ckpt_")):
+        return None
+
+    env_override = (
+        os.environ.get("OPENPI_VLA_CHECKPOINT_OWNER_ID")
+        or os.environ.get("TINKER_CHECKPOINT_OWNER_ID")
+        or ""
+    ).strip()
+    if env_override:
+        return env_override
+
+    search_roots = [
+        Path("/vePFS-Mindverse/share/tinker_runtime_checkpoints/persistent_cache"),
+        Path("/vePFS-Mindverse/share/tinker_runtime_checkpoints/ephemeral"),
+        Path("/tos-mindverse/tinker_checkpoints"),
+        Path("/vePFS-Mindverse/share/tinker_checkpoints"),
+        Path("/vePFS-Mindverse/share/code/tinker-server/checkpoints"),
+    ]
+    owner_ids: set[str] = set()
+
+    if checkpoint_uri.startswith("ckpt_"):
+        patterns = [f"*/{checkpoint_uri}/**/metadata.json"]
+    else:
+        raw_path = checkpoint_uri.split("://", 1)[1]
+        parts = [part for part in raw_path.split("/") if part]
+        if len(parts) < 3:
+            return None
+        model_id = parts[0]
+        checkpoint_kind = parts[1]
+        checkpoint_name = "/".join(parts[2:])
+        checkpoint_type = {
+            "weights": "training",
+            "sampler_weights": "sampler",
+        }.get(checkpoint_kind)
+        if checkpoint_type is None:
+            return None
+        patterns = [f"*/{model_id}/{checkpoint_name}/{checkpoint_type}/metadata.json"]
+
+    for root in search_roots:
+        if not root.exists():
+            continue
+        for pattern in patterns:
+            for metadata_path in root.glob(pattern):
+                try:
+                    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                owner_id = str(metadata.get("owner_id") or "anonymous").strip() or "anonymous"
+                owner_ids.add(owner_id)
+
+    if not owner_ids:
+        return None
+    if len(owner_ids) > 1:
+        raise RuntimeError(
+            f"checkpoint owner is ambiguous for {checkpoint_uri!r}: {sorted(owner_ids)}"
+        )
+    return next(iter(owner_ids))
+
+
 def _create_action_session(base_url: str, base_model: str, model_path: str, *, timeout_s: float = 3600.0) -> str:
     deadline = time.time() + timeout_s
+    payload = {
+        "session_id": f"act-{uuid.uuid4().hex[:12]}",
+        "base_model": base_model,
+        "model_path": model_path,
+    }
+    owner_id = _checkpoint_owner_id_from_uri(model_path)
+    if owner_id is not None:
+        payload["owner_id"] = owner_id
     while True:
         resp = requests.post(
             f"{base_url}/api/v1/mint/action_sessions",
-            json={"session_id": f"act-{uuid.uuid4().hex[:12]}", "base_model": base_model, "model_path": model_path},
+            json=payload,
             timeout=3600,
         )
         if resp.status_code in {429, 503} and time.time() < deadline:
