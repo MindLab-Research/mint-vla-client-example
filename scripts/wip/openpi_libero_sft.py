@@ -8,6 +8,7 @@ import io
 import json
 import os
 import random
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -18,12 +19,20 @@ import pandas as pd
 import requests
 from PIL import Image, ImageDraw
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parents[1]
+for _path in (REPO_ROOT, SCRIPT_DIR):
+    resolved = str(_path)
+    if resolved not in sys.path:
+        sys.path.insert(0, resolved)
+
 
 def _request_headers() -> dict[str, str]:
+    headers = {'Connection': 'close'}
     api_key = (os.environ.get('MINT_API_KEY') or os.environ.get('TINKER_API_KEY') or '').strip()
-    if not api_key:
-        return {}
-    return {'X-API-Key': api_key}
+    if api_key:
+        headers['X-API-Key'] = api_key
+    return headers
 
 
 _orig_post = requests.post

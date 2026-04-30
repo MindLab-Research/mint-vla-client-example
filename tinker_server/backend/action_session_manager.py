@@ -174,6 +174,125 @@ def _shared_actor_known_sessions(actor_handle: Any) -> set[str]:
     return {str(session_id) for session_id in list(payload.get("known_session_ids") or []) if session_id}
 
 
+def _is_retryable_openpi_runtime_error(exc: BaseException | None) -> bool:
+    if exc is None:
+        return False
+
+    retryable_types = tuple(
+        error_type
+        for error_type in (
+            getattr(ray.exceptions, "ActorDiedError", None),
+            getattr(ray.exceptions, "RayActorError", None),
+            getattr(ray.exceptions, "ActorUnavailableError", None),
+        )
+        if isinstance(error_type, type)
+    )
+    if retryable_types and isinstance(exc, retryable_types):
+        return True
+
+    cause = getattr(exc, "__cause__", None) or getattr(exc, "cause", None)
+    if cause is not None and cause is not exc and _is_retryable_openpi_runtime_error(cause):
+        return True
+
+    messages = [type(exc).__name__, str(exc)]
+    messages.extend(str(note) for note in list(getattr(exc, "__notes__", ()) or ()))
+    return any(
+        marker in message
+        for message in messages
+        for marker in (
+            "ActorDiedError",
+            "RayActorError",
+            "ActorUnavailableError",
+            "killed by `ray.kill`",
+            "The actor died unexpectedly",
+        )
+    )
+
+
+async def _close_runtime_client(client: Any) -> None:
+    close = getattr(client, "close", None)
+    if callable(close):
+        await close()
+
+
+async def _create_openpi_action_runtime_client(
+    *,
+    runtime_factory: Callable[..., Awaitable[Any]],
+    action_session_id: str,
+    base_model: str,
+    checkpoint_path: str,
+    model_config: Any,
+    config_name: str,
+    create_payload: dict[str, Any],
+    log_label: str,
+    max_attempts: int = 2,
+) -> Any:
+    for attempt in range(1, max_attempts + 1):
+        try:
+            client = await runtime_factory(
+                action_session_id=action_session_id,
+                base_model=base_model,
+                checkpoint_path=checkpoint_path,
+                model_config=model_config,
+                config_name=config_name,
+            )
+        except Exception as exc:
+            if attempt < max_attempts and _is_retryable_openpi_runtime_error(exc):
+                logger.warning(
+                    "[%s] runtime_factory hit retryable actor error; retrying action-session bootstrap "
+                    "attempt=%s/%s action_session_id=%s base_model=%s checkpoint_path=%s error_type=%s error=%s",
+                    log_label,
+                    attempt,
+                    max_attempts,
+                    action_session_id,
+                    base_model,
+                    checkpoint_path,
+                    type(exc).__name__,
+                    exc,
+                )
+                continue
+            logger.exception(
+                "[%s] runtime_factory failed: action_session_id=%s base_model=%s checkpoint_path=%s",
+                log_label,
+                action_session_id,
+                base_model,
+                checkpoint_path,
+            )
+            raise
+
+        try:
+            await client.request("create_session", create_payload)
+            return client
+        except Exception as exc:
+            await _close_runtime_client(client)
+            if attempt < max_attempts and _is_retryable_openpi_runtime_error(exc):
+                logger.warning(
+                    "[%s] create_session hit retryable actor error; retrying action-session bootstrap "
+                    "attempt=%s/%s action_session_id=%s base_model=%s checkpoint_path=%s error_type=%s error=%s",
+                    log_label,
+                    attempt,
+                    max_attempts,
+                    action_session_id,
+                    base_model,
+                    checkpoint_path,
+                    type(exc).__name__,
+                    exc,
+                )
+                continue
+            logger.exception(
+                "[%s] create_session failed: action_session_id=%s base_model=%s checkpoint_path=%s",
+                log_label,
+                action_session_id,
+                base_model,
+                checkpoint_path,
+            )
+            raise
+
+    raise RuntimeError(
+        f"[{log_label}] action-session bootstrap exhausted retry budget for {action_session_id!r}"
+    )
+
+
 class OpenPIFastActionSessionManager:
     def __init__(
         self,
@@ -214,48 +333,26 @@ class OpenPIFastActionSessionManager:
         checkpoint_path = self._resolve_model_path(model_path, user_id)
         action_session_id = self._action_session_id(session_id, action_session_seq_id)
         config_name = get_openpi_fast_config_name(base_model)
-        try:
-            client = await self._runtime_factory(
-                action_session_id=action_session_id,
-                base_model=base_model,
-                checkpoint_path=checkpoint_path,
-                model_config=model_config,
-                config_name=config_name,
-            )
-        except Exception:
-            logger.exception(
-                "[openpi_fast_action] runtime_factory failed: action_session_id=%s base_model=%s checkpoint_path=%s",
-                action_session_id,
-                base_model,
-                checkpoint_path,
-            )
-            raise
-        try:
-            await client.request(
-                "create_session",
-                {
-                    "action_session_id": action_session_id,
-                    "base_model": base_model,
-                    "checkpoint_path": checkpoint_path,
-                    "config_name": config_name,
-                    "action_dim": int(model_config.action_dim or 0),
-                    "action_horizon": int(model_config.action_horizon or 0),
-                    "action_token_budget": int(model_config.action_token_budget or 0),
-                    "max_token_len": int(model_config.max_model_len),
-                    "camera_layout": list(model_config.camera_layout),
-                },
-            )
-        except Exception:
-            logger.exception(
-                "[openpi_fast_action] create_session failed: action_session_id=%s base_model=%s checkpoint_path=%s",
-                action_session_id,
-                base_model,
-                checkpoint_path,
-            )
-            close = getattr(client, "close", None)
-            if callable(close):
-                await close()
-            raise
+        client = await _create_openpi_action_runtime_client(
+            runtime_factory=self._runtime_factory,
+            action_session_id=action_session_id,
+            base_model=base_model,
+            checkpoint_path=checkpoint_path,
+            model_config=model_config,
+            config_name=config_name,
+            create_payload={
+                "action_session_id": action_session_id,
+                "base_model": base_model,
+                "checkpoint_path": checkpoint_path,
+                "config_name": config_name,
+                "action_dim": int(model_config.action_dim or 0),
+                "action_horizon": int(model_config.action_horizon or 0),
+                "action_token_budget": int(model_config.action_token_budget or 0),
+                "max_token_len": int(model_config.max_model_len),
+                "camera_layout": list(model_config.camera_layout),
+            },
+            log_label="openpi_fast_action",
+        )
 
         self._runtime_clients[action_session_id] = client
         return action_session_id
@@ -351,32 +448,25 @@ class OpenPIPi05ActionSessionManager:
         checkpoint_path = self._resolve_model_path(model_path, user_id)
         action_session_id = self._action_session_id(session_id, action_session_seq_id)
         config_name = get_openpi_pi05_config_name(base_model)
-        client = await self._runtime_factory(
+        client = await _create_openpi_action_runtime_client(
+            runtime_factory=self._runtime_factory,
             action_session_id=action_session_id,
             base_model=base_model,
             checkpoint_path=checkpoint_path,
             model_config=model_config,
             config_name=config_name,
+            create_payload={
+                "action_session_id": action_session_id,
+                "base_model": base_model,
+                "checkpoint_path": checkpoint_path,
+                "config_name": config_name,
+                "action_dim": int(model_config.action_dim or 0),
+                "action_horizon": int(model_config.action_horizon or 0),
+                "max_token_len": int(model_config.max_model_len),
+                "camera_layout": list(model_config.camera_layout),
+            },
+            log_label="openpi_pi05_action",
         )
-        try:
-            await client.request(
-                "create_session",
-                {
-                    "action_session_id": action_session_id,
-                    "base_model": base_model,
-                    "checkpoint_path": checkpoint_path,
-                    "config_name": config_name,
-                    "action_dim": int(model_config.action_dim or 0),
-                    "action_horizon": int(model_config.action_horizon or 0),
-                    "max_token_len": int(model_config.max_model_len),
-                    "camera_layout": list(model_config.camera_layout),
-                },
-            )
-        except Exception:
-            close = getattr(client, "close", None)
-            if callable(close):
-                await close()
-            raise
 
         self._runtime_clients[action_session_id] = client
         return action_session_id

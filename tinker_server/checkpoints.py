@@ -245,17 +245,19 @@ def checkpoint_has_openpi_policy_weights(path: str) -> bool:
     return (root / "params" / "_METADATA").exists() and _checkpoint_has_openpi_norm_stats(root)
 
 
-def checkpoint_has_openpi_training_state(path: str) -> bool:
+def _latest_openpi_step_dir(path: str) -> Path | None:
     root = Path(path)
-    candidates = [
-        child
-        for child in root.iterdir()
-        if child.is_dir() and child.name.isdigit() and checkpoint_has_openpi_policy_weights(str(child))
-    ]
+    candidates = [child for child in root.iterdir() if child.is_dir() and child.name.isdigit()]
     if not candidates:
+        return None
+    return max(candidates, key=lambda child: int(child.name))
+
+
+def checkpoint_has_openpi_training_state(path: str) -> bool:
+    latest = _latest_openpi_step_dir(path)
+    if latest is None:
         return False
-    latest = max(candidates, key=lambda child: int(child.name))
-    return (latest / "train_state" / "_METADATA").exists()
+    return (latest / "params" / "_METADATA").exists() and (latest / "train_state" / "_METADATA").exists()
 
 
 def checkpoint_has_optimizer_state(path: str) -> bool:
