@@ -29,14 +29,15 @@ def test_issue_476_reused_shared_actor_preserves_new_session_actual_rank():
     reinit_calls: list[dict] = []
     reset_calls: list[tuple] = []
 
+    def save_metadata(session_id, step, lr, actual_rank, **_kwargs):
+        saved_metadata.append((session_id, step, lr, actual_rank))
+
     group._session_manager = SimpleNamespace(
         session_exists=lambda session_id: session_id == "session_rank64",
         has_actor_only_state=lambda session_id: False,
         has_persisted_actor_only_state=lambda session_id: False,
         get_session_path=lambda session_id: f"/tmp/{session_id}",
-        save_metadata=lambda session_id, step, lr, actual_rank: saved_metadata.append(
-            (session_id, step, lr, actual_rank)
-        ),
+        save_metadata=save_metadata,
     )
     group._bind_traceparent = lambda traceparent: None
     group._get_lora_weight_norm = lambda: 0.0
@@ -120,7 +121,7 @@ def test_issue_476_megatron_train_step_passes_actual_rank(monkeypatch):
     monkeypatch.setattr(engine, "_touch_actor", lambda _session: None)
     monkeypatch.setattr(engine, "_record_megatron_result_metrics", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
-        "tinker_server.backend.verl_training.get_model_config",
+        "tinker_server.backend.model_registry.get_model_config",
         lambda _model: SimpleNamespace(is_moe=True),
     )
 

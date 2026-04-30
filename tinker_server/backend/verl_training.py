@@ -107,6 +107,7 @@ class SessionStateManager:
         lr: float,
         device: torch.device,
         save_gradients: bool = True,
+        actual_rank: int | None = None,
     ) -> str:
         """Save session state (LoRA weights + optimizer + gradients + metadata).
 
@@ -158,6 +159,8 @@ class SessionStateManager:
 
         # 4. Save metadata
         meta = {"current_step": step, "learning_rate": lr}
+        if actual_rank is not None:
+            meta["actual_rank"] = int(actual_rank)
         with open(os.path.join(session_path, "training_meta.json"), "w") as f:
             json.dump(meta, f, indent=2)
 
@@ -376,6 +379,8 @@ class TrainingWorker:
         # Session state management for stateless trainer pattern
         self._state_manager = SessionStateManager(base_path=session_state_root)
         self._current_session_id: str | None = None
+        self.max_lora_rank = int(lora_rank)
+        self._current_actual_rank: int | None = None
 
         logger.info("[TrainingWorker] Ready")
 
@@ -400,7 +405,28 @@ class TrainingWorker:
         """Update last activity timestamp. Call at start of every method."""
         self._last_activity = time.time()
 
-    def _ensure_session_loaded(self, session_id: str) -> None:
+    def _resolve_actual_rank(self, actual_rank: int | None = None) -> int:
+        rank = self._current_actual_rank if actual_rank is None else int(actual_rank)
+        if rank is None:
+            rank = self.max_lora_rank
+        if rank <= 0 or rank > self.max_lora_rank:
+            raise ValueError(f"actual_rank {rank} must be in [1, {self.max_lora_rank}]")
+        return int(rank)
+
+    def _zero_lora_rank_tail(self, actual_rank: int | None = None, *, zero_grads: bool = True) -> dict[str, int]:
+        from tinker_server.backend.lora_utils import zero_lora_rank_tail_named_parameters
+
+        effective_rank = self._resolve_actual_rank(actual_rank)
+        stats = zero_lora_rank_tail_named_parameters(
+            self.model.named_parameters(),
+            actual_rank=effective_rank,
+            trainer_rank=self.max_lora_rank,
+            zero_grads=zero_grads,
+        )
+        self._current_actual_rank = effective_rank
+        return stats
+
+    def _ensure_session_loaded(self, session_id: str, actual_rank: int | None = None) -> None:
         """Ensure the specified session's state is loaded.
 
         If a different session is currently loaded, this saves its state first,
@@ -414,6 +440,7 @@ class TrainingWorker:
         if self._current_session_id == session_id:
             # Already loaded
             print(f"[DEBUG] Session {session_id} already loaded, no switch needed", flush=True)
+            self._zero_lora_rank_tail(actual_rank, zero_grads=True)
             return
 
         # Save outgoing session's state INCLUDING gradients
@@ -427,7 +454,8 @@ class TrainingWorker:
             lr = self.optimizer.param_groups[0]["lr"] if self.optimizer.param_groups else 1e-4
             self._state_manager.save_state(
                 self._current_session_id, self.model, self.optimizer,
-                self._step_count, lr, self.device, save_gradients=True
+                self._step_count, lr, self.device, save_gradients=True,
+                actual_rank=self._current_actual_rank,
             )
             print(f"[DEBUG] Saved outgoing session {self._current_session_id} before switch", flush=True)
 
@@ -437,24 +465,26 @@ class TrainingWorker:
                 session_id, self.model, self.optimizer, self.device, load_gradients=True
             )
             self._step_count = meta.get("current_step", 0)
+            actual_rank = actual_rank if actual_rank is not None else meta.get("actual_rank")
             # Update learning rate if saved
             if "learning_rate" in meta:
                 for pg in self.optimizer.param_groups:
                     pg["lr"] = meta["learning_rate"]
+            self._zero_lora_rank_tail(actual_rank, zero_grads=True)
             # Check actual gradient state after loading
             grad_count = sum(1 for _, p in self.model.named_parameters() if p.requires_grad and p.grad is not None)
             grad_norm = sum((p.grad.norm().item() ** 2) for _, p in self.model.named_parameters() if p.requires_grad and p.grad is not None) ** 0.5
             print(f"[DEBUG] Loaded session {session_id}: step={self._step_count}, actual_grads={grad_count}, norm={grad_norm:.4f}", flush=True)
         else:
             # New session: reinitialize weights and zero gradients
-            self.reinit_lora_weights()
+            self.reinit_lora_weights(actual_rank=actual_rank)
             self.optimizer.zero_grad()
             self._step_count = 0
             print(f"[DEBUG] New session {session_id}, initialized fresh weights", flush=True)
 
         self._current_session_id = session_id
 
-    def _save_session_state(self, session_id: str) -> None:
+    def _save_session_state(self, session_id: str, actual_rank: int | None = None) -> None:
         """Save current session state to disk.
 
         Called at the end of optim_step to persist state.
@@ -464,9 +494,12 @@ class TrainingWorker:
             session_id: Session ID to save state for.
         """
         lr = self.optimizer.param_groups[0]["lr"] if self.optimizer.param_groups else 1e-4
+        actual_rank = self._resolve_actual_rank(actual_rank)
+        self._zero_lora_rank_tail(actual_rank, zero_grads=True)
         self._state_manager.save_state(
             session_id, self.model, self.optimizer, self._step_count, lr, self.device,
-            save_gradients=False  # Gradients already applied and zeroed
+            save_gradients=False,  # Gradients already applied and zeroed
+            actual_rank=actual_rank,
         )
         logger.debug(f"[TrainingWorker] Saved session {session_id} state (step={self._step_count})")
 
@@ -758,6 +791,7 @@ class TrainingWorker:
         loss_fn: str = "cross_entropy",
         loss_fn_config: dict | None = None,
         session_id: str | None = None,
+        actual_rank: int | None = None,
         traceparent: str | None = None,
     ) -> dict:
         """Forward + backward pass using tinker Datum format.
@@ -785,7 +819,9 @@ class TrainingWorker:
 
         # Stateless trainer: load session state if session_id provided
         if session_id:
-            self._ensure_session_loaded(session_id)
+            self._ensure_session_loaded(session_id, actual_rank=actual_rank)
+        elif actual_rank is not None:
+            self._zero_lora_rank_tail(actual_rank, zero_grads=True)
 
         loss_fn_config = loss_fn_config or {}
 
@@ -1005,6 +1041,7 @@ class TrainingWorker:
             total_tokens += token_count
 
         avg_loss = total_loss / max(total_tokens, 1)
+        self._zero_lora_rank_tail(actual_rank, zero_grads=True)
 
         metrics = {
             "loss:mean": avg_loss,
@@ -1307,6 +1344,7 @@ class TrainingWorker:
         self,
         learning_rate: float | None,
         session_id: str | None = None,
+        actual_rank: int | None = None,
         traceparent: str | None = None,
     ) -> dict:
         """Optimizer update step.
@@ -1325,22 +1363,26 @@ class TrainingWorker:
 
         # Stateless trainer: ensure session state is loaded
         if session_id:
-            self._ensure_session_loaded(session_id)
+            self._ensure_session_loaded(session_id, actual_rank=actual_rank)
+        elif actual_rank is not None:
+            self._zero_lora_rank_tail(actual_rank, zero_grads=True)
 
         # Update learning rate if provided
         if learning_rate is not None:
             for pg in self.optimizer.param_groups:
                 pg["lr"] = learning_rate
 
+        self._zero_lora_rank_tail(actual_rank, zero_grads=True)
         grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
+        self._zero_lora_rank_tail(actual_rank, zero_grads=True)
         self.optimizer.zero_grad()
 
         self._step_count += 1
 
         # Stateless trainer: save session state after update
         if session_id:
-            self._save_session_state(session_id)
+            self._save_session_state(session_id, actual_rank=actual_rank)
 
         logger.info(f"[TrainingWorker] optim_step: grad_norm={grad_norm:.4f}, step={self._step_count}")
 
@@ -1362,16 +1404,18 @@ class TrainingWorker:
         # Move to CPU for serialization
         return {k: v.cpu() for k, v in state_dict.items()}
 
-    def get_lora_config(self) -> dict:
+    def get_lora_config(self, actual_rank: int | None = None) -> dict:
         """Get LoRA configuration as dictionary.
 
         Returns:
             PEFT config dict compatible with vLLM's PEFTHelper.
         """
         peft_config = self.model.peft_config.get("default")
+        effective_rank = self._resolve_actual_rank(actual_rank)
+        alpha_per_rank = peft_config.lora_alpha / peft_config.r
         return {
-            "r": peft_config.r,
-            "lora_alpha": peft_config.lora_alpha,
+            "r": effective_rank,
+            "lora_alpha": int(alpha_per_rank * effective_rank),
             "lora_dropout": peft_config.lora_dropout,
             "target_modules": list(peft_config.target_modules),
             "bias": peft_config.bias,
@@ -1386,6 +1430,7 @@ class TrainingWorker:
         traceparent: str | None = None,
         *,
         session_id: str | None = None,
+        actual_rank: int | None = None,
     ) -> str:
         """Save LoRA adapter to directory.
 
@@ -1399,20 +1444,24 @@ class TrainingWorker:
         self._bind_traceparent(traceparent)
         self._touch()
         if session_id is not None:
-            self._ensure_session_loaded(session_id)
+            self._ensure_session_loaded(session_id, actual_rank=actual_rank)
         import json
         import os
 
         from safetensors.torch import save_file
+        from tinker_server.backend.lora_utils import truncate_lora_state_dict
 
         os.makedirs(save_path, exist_ok=True)
+        effective_rank = self._resolve_actual_rank(actual_rank)
+        self._zero_lora_rank_tail(effective_rank, zero_grads=True)
 
         # Save adapter weights
         state_dict = self.get_lora_state_dict()
+        state_dict = truncate_lora_state_dict(state_dict, self.max_lora_rank, effective_rank)
         save_file(state_dict, os.path.join(save_path, "adapter_model.safetensors"))
 
         # Save adapter config
-        config = self.get_lora_config()
+        config = self.get_lora_config(effective_rank)
         with open(os.path.join(save_path, "adapter_config.json"), "w") as f:
             json.dump(config, f, indent=2)
 
@@ -1426,6 +1475,7 @@ class TrainingWorker:
         traceparent: str | None = None,
         *,
         session_id: str | None = None,
+        actual_rank: int | None = None,
     ) -> dict:
         """Save full checkpoint: LoRA weights + optimizer state + training metadata.
 
@@ -1439,21 +1489,25 @@ class TrainingWorker:
         self._bind_traceparent(traceparent)
         self._touch()
         if session_id is not None:
-            self._ensure_session_loaded(session_id)
+            self._ensure_session_loaded(session_id, actual_rank=actual_rank)
         import json
         import os
 
         torch = _get_torch()
         from safetensors.torch import save_file
+        from tinker_server.backend.lora_utils import truncate_lora_state_dict
 
         os.makedirs(save_path, exist_ok=True)
+        effective_rank = self._resolve_actual_rank(actual_rank)
+        self._zero_lora_rank_tail(effective_rank, zero_grads=True)
 
         # 1. LoRA weights
         state_dict = self.get_lora_state_dict()
+        state_dict = truncate_lora_state_dict(state_dict, self.max_lora_rank, effective_rank)
         save_file(state_dict, os.path.join(save_path, "adapter_model.safetensors"))
 
         # 2. LoRA config
-        peft_config = self.get_lora_config()
+        peft_config = self.get_lora_config(effective_rank)
         with open(os.path.join(save_path, "adapter_config.json"), "w") as f:
             json.dump(peft_config, f, indent=2)
 
@@ -1464,6 +1518,7 @@ class TrainingWorker:
         meta = {
             "current_step": self._step_count,
             "learning_rate": self.optimizer.param_groups[0]["lr"],
+            "actual_rank": effective_rank,
             # Include state_dict and config for multi-LoRA registration
             # (API server can't read files from Ray worker filesystem)
             "state_dict": state_dict,
@@ -1503,29 +1558,11 @@ class TrainingWorker:
         torch = _get_torch()
         from safetensors.torch import load_file
 
-        # 1. Load LoRA weights
+        # 1. Load LoRA weights and metadata
         adapter_path = os.path.join(load_path, "adapter_model.safetensors")
         if not os.path.exists(adapter_path):
             raise FileNotFoundError(f"Adapter not found: {adapter_path}")
 
-        # 2. Optionally load optimizer state
-        optimizer_path = os.path.join(load_path, "optimizer.pt")
-        if load_optimizer:
-            if not os.path.exists(optimizer_path):
-                raise FileNotFoundError(
-                    f"Optimizer restore requested, but optimizer state not found: {optimizer_path}"
-                )
-
-        if session_id is not None:
-            self._ensure_session_loaded(session_id)
-
-        state_dict = load_file(adapter_path, device=str(self.device))
-        # Load into PEFT model
-        from peft.utils.save_and_load import set_peft_model_state_dict
-        set_peft_model_state_dict(self.model, state_dict)
-        logger.info(f"[TrainingWorker] Loaded LoRA weights from {adapter_path}")
-
-        # 3. Load and return metadata
         meta: dict[str, object] = {}
         meta_path = os.path.join(load_path, "training_meta.json")
         if os.path.exists(meta_path):
@@ -1541,6 +1578,43 @@ class TrainingWorker:
                     meta_path,
                 )
 
+        config_rank: int | None = None
+        adapter_config_path = os.path.join(load_path, "adapter_config.json")
+        if os.path.exists(adapter_config_path):
+            with open(adapter_config_path, "r") as f:
+                adapter_config = json.load(f)
+            raw_config_rank = adapter_config.get("r") if isinstance(adapter_config, dict) else None
+            if isinstance(raw_config_rank, int) and not isinstance(raw_config_rank, bool):
+                config_rank = int(raw_config_rank)
+
+        # 2. Optionally load optimizer state
+        optimizer_path = os.path.join(load_path, "optimizer.pt")
+        if load_optimizer:
+            if not os.path.exists(optimizer_path):
+                raise FileNotFoundError(
+                    f"Optimizer restore requested, but optimizer state not found: {optimizer_path}"
+                )
+
+        state_dict = load_file(adapter_path, device=str(self.device))
+        from tinker_server.backend.lora_utils import get_lora_rank_from_state_dict, pad_lora_state_dict
+
+        raw_meta_rank = meta.get("actual_rank")
+        meta_rank = int(raw_meta_rank) if isinstance(raw_meta_rank, int) and not isinstance(raw_meta_rank, bool) else None
+        inferred_rank = get_lora_rank_from_state_dict(state_dict)
+        actual_rank = meta_rank or config_rank or inferred_rank
+        actual_rank = self._resolve_actual_rank(actual_rank)
+
+        if session_id is not None:
+            self._ensure_session_loaded(session_id, actual_rank=actual_rank)
+
+        state_dict = pad_lora_state_dict(state_dict, actual_rank, self.max_lora_rank)
+        # Load into PEFT model
+        from peft.utils.save_and_load import set_peft_model_state_dict
+        set_peft_model_state_dict(self.model, state_dict)
+        self._zero_lora_rank_tail(actual_rank=actual_rank, zero_grads=True)
+        logger.info(f"[TrainingWorker] Loaded LoRA weights from {adapter_path}")
+
+        # 3. Apply metadata and optimizer state
         if "current_step" in meta:
             meta_step = meta["current_step"]
             if isinstance(meta_step, int) and not isinstance(meta_step, bool):
@@ -1625,6 +1699,10 @@ class TrainingWorker:
         from peft.utils.save_and_load import set_peft_model_state_dict
 
         set_peft_model_state_dict(self.model, state_dict)
+        self._zero_lora_rank_tail(
+            actual_rank if actual_rank is not None else trainer_rank,
+            zero_grads=True,
+        )
         logger.info(f"[TrainingWorker] Loaded adapter state from {checkpoint_path}")
 
         return {"status": "ok", "path": checkpoint_path, "actual_rank": actual_rank}
@@ -1655,6 +1733,8 @@ class TrainingWorker:
         from tinker_server.backend.lora_utils import truncate_lora_state_dict
 
         os.makedirs(checkpoint_path, exist_ok=True)
+        if actual_rank is not None:
+            self._zero_lora_rank_tail(actual_rank, zero_grads=True)
 
         # Get LoRA state dict
         state_dict = get_peft_model_state_dict(self.model)
@@ -1701,6 +1781,7 @@ class TrainingWorker:
     def reinit_lora_weights(
         self,
         learning_rate: float | None = None,
+        actual_rank: int | None = None,
         traceparent: str | None = None,
     ) -> dict:
         """Reinitialize LoRA weights AND optimizer state for fresh session.
@@ -1752,6 +1833,7 @@ class TrainingWorker:
 
         # Zero gradients
         self.optimizer.zero_grad()
+        tail_zeroed = self._zero_lora_rank_tail(actual_rank, zero_grads=True)
 
         # Reset optimizer state (momentum/variance)
         opt_state_reset = len(self.optimizer.state)
@@ -1765,9 +1847,11 @@ class TrainingWorker:
         return {
             "status": "ok",
             "reinit_count": reinit_count,
+            "tail_zeroed": tail_zeroed,
             "opt_state_reset": opt_state_reset,
             "lr_updated": lr_updated,
             "learning_rate": learning_rate,
+            "actual_rank": self._resolve_actual_rank(actual_rank),
         }
 
     def get_session_info(self) -> dict:
@@ -2200,7 +2284,8 @@ class VerlTrainingEngine:
 
         base_model, requested_model = self._resolve_megatron_base_model(session)
         actor_name = _make_megatron_actor_name(base_model or requested_model or session.base_model or "")
-        lora_rank = session.lora_config.rank if session.lora_config else self.default_lora_rank
+        actual_rank = session.lora_config.rank if session.lora_config else self.default_lora_rank
+        trainer_lora_rank = int(server_config.max_lora_rank)
         distributed_config = self._build_megatron_distributed_config(
             requested_model=requested_model,
             base_model=base_model,
@@ -2209,10 +2294,11 @@ class VerlTrainingEngine:
         if allow_create:
             worker = await async_get_or_create_megatron_worker_group(
                 base_model=base_model,
-                lora_rank=lora_rank,
+                lora_rank=trainer_lora_rank,
                 learning_rate=session.learning_rate,
                 distributed_config=distributed_config,
                 session_id=session.model_id,
+                actual_rank=actual_rank,
             )
             ready_timeout_s = (
                 float(server_config.training_actor_ready_timeout_s)
@@ -3353,6 +3439,7 @@ class VerlTrainingEngine:
             cfg = get_model_config(requested_model or base_model or "")
             train_tp, train_pp, train_ep, train_cp, train_etp = get_training_parallelism(requested_model or base_model or "")
             use_fp8 = bool(getattr(cfg, "train_use_fp8", False))
+            trainer_lora_rank = int(server_config.max_lora_rank)
             distributed_config = DistributedConfig(
                 tensor_parallel_size=train_tp,
                 pipeline_parallel_size=train_pp,
@@ -3362,7 +3449,7 @@ class VerlTrainingEngine:
                 use_fp8=use_fp8,
                 router_replay_mode=server_config.router_replay_mode,
             )
-            logger.info(f"[{model_id}] Creating MegatronWorkerGroup for MoE model (base={base_model}, lora_rank={lora_rank}, TP={train_tp}, PP={train_pp}, EP={train_ep}, CP={train_cp}, ETP={train_etp}, world_size={distributed_config.world_size}, fp8={use_fp8})")
+            logger.info(f"[{model_id}] Creating MegatronWorkerGroup for MoE model (base={base_model}, actual_rank={lora_rank}, trainer_lora_rank={trainer_lora_rank}, TP={train_tp}, PP={train_pp}, EP={train_ep}, CP={train_cp}, ETP={train_etp}, world_size={distributed_config.world_size}, fp8={use_fp8})")
 
             # Get or create persistent Megatron worker group
             # Uses detached Ray actor pattern like vLLM for crash resilience
@@ -3379,10 +3466,11 @@ class VerlTrainingEngine:
                     lambda: asyncio.wait_for(
                         async_get_or_create_megatron_worker_group(
                             base_model=base_model,
-                            lora_rank=lora_rank,
+                            lora_rank=trainer_lora_rank,
                             learning_rate=session.learning_rate,
                             distributed_config=distributed_config,
                             session_id=session.model_id,
+                            actual_rank=lora_rank,
                             observability_base_model=observability_base_model,
                         ),
                         timeout=megatron_timeout_s,
@@ -3477,7 +3565,11 @@ class VerlTrainingEngine:
             traceparent = get_current_traceparent()
             try:
                 result = await self._await_worker_call(
-                    worker.reinit_lora_weights.remote(session.learning_rate, traceparent=traceparent),
+                    worker.reinit_lora_weights.remote(
+                        session.learning_rate,
+                        actual_rank=lora_rank,
+                        traceparent=traceparent,
+                    ),
                     session,
                     op="create_training_session.reinit_lora_weights",
                     worker=worker,
@@ -3645,6 +3737,7 @@ class VerlTrainingEngine:
                 loss_fn,
                 loss_fn_config,
                 session.model_id,
+                session.lora_config.rank if session.lora_config else None,
                 traceparent=traceparent,
             )
         result = await self._await_worker_call(
@@ -3970,7 +4063,12 @@ class VerlTrainingEngine:
                 train_unembed=train_unembed,
             )
         else:
-            pending = worker.optim_step.remote(lr, session.model_id, traceparent=traceparent)
+            pending = worker.optim_step.remote(
+                lr,
+                session.model_id,
+                session.lora_config.rank if session.lora_config else None,
+                traceparent=traceparent,
+            )
         result = await self._await_worker_call(
             pending,
             session,
@@ -4102,6 +4200,7 @@ class VerlTrainingEngine:
                     loss_fn,
                     loss_fn_config,
                     session.model_id,
+                    session.lora_config.rank if session.lora_config else None,
                     traceparent=traceparent,
                 )
             fb_result = await self._await_worker_call(
@@ -4122,7 +4221,12 @@ class VerlTrainingEngine:
                     train_unembed=train_unembed,
                 )
             else:
-                opt_pending = worker.optim_step.remote(lr, session.model_id, traceparent=traceparent)
+                opt_pending = worker.optim_step.remote(
+                    lr,
+                    session.model_id,
+                    session.lora_config.rank if session.lora_config else None,
+                    traceparent=traceparent,
+                )
             opt_result = await self._await_worker_call(
                 opt_pending,
                 session,
@@ -4272,6 +4376,7 @@ class VerlTrainingEngine:
             abs_path,
             traceparent=traceparent,
             session_id=session.model_id,
+            actual_rank=session.lora_config.rank if session.lora_config else None,
         )
         _ = await run_async_with_otel_span(
             "training.save_weights_for_sampler.remote_save",
@@ -4461,6 +4566,7 @@ class VerlTrainingEngine:
                 abs_path,
                 traceparent=traceparent,
                 session_id=session.model_id,
+                actual_rank=session.lora_config.rank if session.lora_config else None,
             )
         meta = await self._await_worker_call(
             meta_ref,

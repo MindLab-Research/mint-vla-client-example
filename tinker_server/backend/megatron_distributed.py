@@ -574,6 +574,7 @@ class MegatronRankWorker:
         self.config = distributed_config
         self.engine = None  # Set in initialize()
         self._current_session_id = None
+        self._current_actual_rank: int | None = None
         # Per-session gradient storage (CPU).
         # Values: list[torch.Tensor] (valid gradients) or _GRADIENTS_CONSUMED (consumed by optim_step)
         self._session_gradients: dict[str, list[torch.Tensor] | object] = {}
@@ -1832,11 +1833,51 @@ class MegatronRankWorker:
         if self._current_session_id == session_id:
             return True
         return session_id in self._session_hot_cache
-    def mark_session_loaded(self, session_id: str) -> None:
+    def mark_session_loaded(self, session_id: str, actual_rank: int | None = None) -> None:
         """Record that a checkpoint-loaded session is now active on this rank."""
         self._drop_hot_session(session_id)
         self._current_session_id = session_id
+        if actual_rank is not None:
+            self._current_actual_rank = self._resolve_actual_rank(actual_rank)
         logger.info(f"[Rank {self.rank}] Marked loaded session active: {session_id}")
+
+    def _resolve_actual_rank(self, actual_rank: int | None = None) -> int:
+        rank = self._current_actual_rank if actual_rank is None else int(actual_rank)
+        if rank is None:
+            rank = self.lora_rank
+        if rank <= 0 or rank > self.lora_rank:
+            raise ValueError(f"actual_rank {rank} must be in [1, {self.lora_rank}]")
+        return int(rank)
+
+    def _zero_lora_rank_tail(self, model=None, actual_rank: int | None = None, *, zero_grads: bool = True) -> dict[str, int]:
+        from tinker_server.backend.lora_utils import zero_lora_rank_tail_named_parameters
+        from verl.utils.megatron_utils import unwrap_model
+
+        effective_rank = self._resolve_actual_rank(actual_rank)
+        if model is None:
+            model = unwrap_model(self.engine.module)
+            while isinstance(model, list):
+                model = model[0]
+        rank_shard_index = 0
+        rank_shard_count = 1
+        try:
+            from megatron.core import parallel_state as mpu
+
+            rank_shard_index = int(mpu.get_tensor_model_parallel_rank())
+            rank_shard_count = int(mpu.get_tensor_model_parallel_world_size())
+        except Exception:
+            rank_shard_index = 0
+            rank_shard_count = 1
+        stats = zero_lora_rank_tail_named_parameters(
+            model.named_parameters(),
+            actual_rank=effective_rank,
+            trainer_rank=self.lora_rank,
+            zero_grads=zero_grads,
+            rank_shard_index=rank_shard_index,
+            rank_shard_count=rank_shard_count,
+        )
+        self._current_actual_rank = effective_rank
+        return stats
 
     def initialize(self, traceparent: str | None = None, request_id: str | None = None):
         """Initialize distributed backend and Megatron engine.
@@ -2580,6 +2621,7 @@ class MegatronRankWorker:
         loss_fn_config: dict,
         rollout_correction_config: dict | None = None,
         session_id: str | None = None,
+        actual_rank: int | None = None,
         reset_bias: bool | None = None,
         traceparent: str | None = None,
     ) -> dict:
@@ -2719,6 +2761,7 @@ class MegatronRankWorker:
             cached_grads = self._session_gradients.get(session_id)
             if cached_grads is not None and cached_grads is not _GRADIENTS_CONSUMED and not train_mode_reused:
                 self._restore_gradients(cached_grads)
+                self._zero_lora_rank_tail(actual_rank=actual_rank, zero_grads=True)
                 logger.debug(f"[Rank {self.rank}] Restored gradients for session {session_id}")
             elif train_mode_reused:
                 grad_restore_skipped = True
@@ -2731,6 +2774,7 @@ class MegatronRankWorker:
 
             try:
                 _run_forward_backward_compute()
+                self._zero_lora_rank_tail(actual_rank=actual_rank, zero_grads=True)
                 self._sticky_train_mode_last_used_s = time.perf_counter()
             except Exception as original_error:
                 # On error, GPU state is undefined -- release sticky context without
@@ -2762,6 +2806,7 @@ class MegatronRankWorker:
                 cached_grads = self._session_gradients.get(session_id) if session_id else None
                 if cached_grads is not None and cached_grads is not _GRADIENTS_CONSUMED:
                     self._restore_gradients(cached_grads)
+                    self._zero_lora_rank_tail(actual_rank=actual_rank, zero_grads=True)
                     logger.debug(f"[Rank {self.rank}] Restored gradients for session {session_id}")
                 else:
                     logger.debug(
@@ -2770,6 +2815,7 @@ class MegatronRankWorker:
                     )
 
                 _run_forward_backward_compute()
+                self._zero_lora_rank_tail(actual_rank=actual_rank, zero_grads=True)
 
                 # Capture gradients BEFORE exiting train_mode (exit destroys GPU grads)
                 if session_id is not None:
@@ -3506,6 +3552,7 @@ class MegatronRankWorker:
         self,
         learning_rate: float,
         session_id: str | None = None,
+        actual_rank: int | None = None,
         train_attn: bool | None = None,
         train_mlp: bool | None = None,
         train_unembed: bool | None = None,
@@ -3575,6 +3622,7 @@ class MegatronRankWorker:
                                     flush=True,
                                 )
 
+                self._zero_lora_rank_tail(actual_rank=actual_rank, zero_grads=True)
                 grad_norm = self.engine.optimizer_step()
                 current_lr = self.engine.lr_scheduler_step()
 
@@ -3587,6 +3635,7 @@ class MegatronRankWorker:
                     self._zero_disabled_lora_params(
                         model, train_attn=train_attn, train_mlp=train_mlp, train_unembed=train_unembed
                     )
+                    self._zero_lora_rank_tail(model, actual_rank=actual_rank, zero_grads=True)
                 except Exception:
                     pass
 
@@ -3617,6 +3666,7 @@ class MegatronRankWorker:
             cached_grads = self._session_gradients.get(session_id)
             if cached_grads is not None and cached_grads is not _GRADIENTS_CONSUMED and not train_mode_reused:
                 self._restore_gradients(cached_grads)
+                self._zero_lora_rank_tail(actual_rank=actual_rank, zero_grads=True)
                 logger.debug(f"[Rank {self.rank}] Restored gradients for optim_step, session {session_id}")
             elif train_mode_reused:
                 grad_restore_skipped = True
@@ -3666,6 +3716,7 @@ class MegatronRankWorker:
                 cached_grads = self._session_gradients.get(session_id) if session_id else None
                 if cached_grads is not None and cached_grads is not _GRADIENTS_CONSUMED:
                     self._restore_gradients(cached_grads)
+                    self._zero_lora_rank_tail(actual_rank=actual_rank, zero_grads=True)
                     logger.debug(f"[Rank {self.rank}] Restored gradients for optim_step, session {session_id}")
                 _run_optim_core()
                 tm_exit_t0 = time.perf_counter()
@@ -4405,6 +4456,7 @@ class MegatronRankWorker:
     def reinit_lora_weights(
         self,
         learning_rate: float | None = None,
+        actual_rank: int | None = None,
         train_attn: bool | None = None,
         train_mlp: bool | None = None,
         train_unembed: bool | None = None,
@@ -4439,7 +4491,8 @@ class MegatronRankWorker:
 
         logger.info(
             f"[Rank {self.rank}] reinit_lora_weights: ENTRY (lr={learning_rate}, "
-            f"train_attn={train_attn}, train_mlp={train_mlp}, train_unembed={train_unembed})"
+            f"actual_rank={actual_rank}, train_attn={train_attn}, train_mlp={train_mlp}, "
+            f"train_unembed={train_unembed})"
         )
 
         # NOTE: Do NOT clear _session_gradients or _session_optimizer_states here!
@@ -4493,6 +4546,9 @@ class MegatronRankWorker:
             )
             if self.rank == 0 and zeroed:
                 print(f"[Rank 0] reinit_lora_weights: zeroed_disabled_lora_params={zeroed}", flush=True)
+            tail_zeroed = self._zero_lora_rank_tail(model, actual_rank=actual_rank, zero_grads=True)
+            if self.rank == 0 and tail_zeroed.get("params"):
+                print(f"[Rank 0] reinit_lora_weights: zeroed_rank_tail={tail_zeroed}", flush=True)
 
             # Zero gradients
             if hasattr(self.engine, 'optimizer') and self.engine.optimizer is not None:
@@ -4587,7 +4643,14 @@ class MegatronRankWorker:
                 f"sample_skipped={skipped[:10]}",
                 flush=True,
             )
-        return {"status": "ok", "reinit_count": reinit_count, "opt_state_reset": opt_state_reset_count, "lr_updated": lr_updated, "learning_rate": learning_rate}
+        return {
+            "status": "ok",
+            "reinit_count": reinit_count,
+            "opt_state_reset": opt_state_reset_count,
+            "lr_updated": lr_updated,
+            "learning_rate": learning_rate,
+            "actual_rank": self._resolve_actual_rank(actual_rank),
+        }
 
     @staticmethod
     def _classify_lora_param_target(name_lower: str) -> str:
@@ -4798,7 +4861,12 @@ class MegatronRankWorker:
         import torch
 
         from safetensors.torch import save_file
+        from tinker_server.backend.lora_utils import truncate_lora_state_dict
         from verl.utils.megatron_peft_utils import _get_rank_checkpoint_path
+
+        effective_rank = actual_rank if actual_rank is not None else self.lora_rank
+        with self.engine.train_mode():
+            self._zero_lora_rank_tail(actual_rank=effective_rank, zero_grads=True)
 
         # ALL ranks must call get_lora_state_dict - it uses NCCL collectives
         # Only rank 0 gets actual data, others get empty dict
@@ -4812,7 +4880,6 @@ class MegatronRankWorker:
 
         # Save distributed adapter state for training resume (per-rank mp_rank_*_adapter.pt).
         # ALL ranks must participate due to NCCL collectives.
-        effective_rank = actual_rank if actual_rank is not None else self.lora_rank
         self.save_adapter_state(
             checkpoint_path=save_path,
             actual_rank=effective_rank,
@@ -4830,6 +4897,7 @@ class MegatronRankWorker:
             return {}
 
         # 1. LoRA weights (PEFT format)
+        state_dict = truncate_lora_state_dict(state_dict, self.lora_rank, effective_rank)
         save_file(state_dict, os.path.join(save_path, "adapter_model.safetensors"))
 
         # 2. LoRA config
@@ -4862,6 +4930,7 @@ class MegatronRankWorker:
         meta = {
             "current_step": step_count,
             "learning_rate": self.learning_rate,
+            "actual_rank": effective_rank,
         }
         with open(os.path.join(save_path, "training_meta.json"), "w") as f:
             json.dump(meta, f, indent=2)
@@ -4893,6 +4962,11 @@ class MegatronRankWorker:
         import os
 
         from safetensors.torch import save_file
+        from tinker_server.backend.lora_utils import truncate_lora_state_dict
+
+        effective_rank = actual_rank if actual_rank is not None else self.lora_rank
+        with self.engine.train_mode():
+            self._zero_lora_rank_tail(actual_rank=effective_rank, zero_grads=True)
 
         # ALL ranks must call get_lora_state_dict - it uses NCCL collectives.
         state_dict = self.get_lora_state_dict(
@@ -4906,9 +4980,9 @@ class MegatronRankWorker:
         if self.rank != 0:
             return {}
 
+        state_dict = truncate_lora_state_dict(state_dict, self.lora_rank, effective_rank)
         save_file(state_dict, os.path.join(save_path, "adapter_model.safetensors"))
 
-        effective_rank = actual_rank if actual_rank is not None else self.lora_rank
         try:
             cfg = get_model_config(self.base_model)
             model_is_mla = cfg.is_mla
@@ -4932,7 +5006,7 @@ class MegatronRankWorker:
         with open(os.path.join(save_path, "adapter_config.json"), "w") as f:
             json.dump(config, f, indent=2)
 
-        meta = {"current_step": step_count, "learning_rate": self.learning_rate}
+        meta = {"current_step": step_count, "learning_rate": self.learning_rate, "actual_rank": effective_rank}
         with open(os.path.join(save_path, "training_meta.json"), "w") as f:
             json.dump(meta, f, indent=2)
 
@@ -5073,7 +5147,7 @@ class MegatronRankWorker:
 
         import importlib
 
-        from tinker_server.backend.lora_utils import pad_lora_state_dict
+        from tinker_server.backend.lora_utils import fit_lora_state_dict_to_reference, pad_lora_state_dict
         peft_utils = importlib.import_module("verl.utils.megatron_peft_utils")
         from verl.utils.megatron_utils import unwrap_model
 
@@ -5105,13 +5179,6 @@ class MegatronRankWorker:
                     f"{type(expert_bias_state).__name__}"
                 )
 
-            # Phase 7: Apply padding if actual_rank < trainer_rank
-            if actual_rank is not None and trainer_rank is not None and actual_rank < trainer_rank:
-                logger.info(
-                    f"[Rank {self.rank}] Padding adapter from rank {actual_rank} to {trainer_rank}"
-                )
-                adapter_state = pad_lora_state_dict(adapter_state, actual_rank, trainer_rank)
-
             # Load into model
             model = self.engine.module
             if isinstance(model, list):
@@ -5137,6 +5204,12 @@ class MegatronRankWorker:
                         "Adapter checkpoint key mismatch: "
                         f"missing_keys={missing_keys[:10]} unexpected_keys={unexpected_keys[:10]}"
                     )
+                adapter_state = fit_lora_state_dict_to_reference(adapter_state, expected_adapter_state)
+            elif actual_rank is not None and trainer_rank is not None and actual_rank < trainer_rank:
+                logger.info(
+                    f"[Rank {self.rank}] Padding adapter from rank {actual_rank} to {trainer_rank}"
+                )
+                adapter_state = pad_lora_state_dict(adapter_state, actual_rank, trainer_rank)
 
             named_modules = dict(unwrapped.named_modules())
             expected_expert_bias_keys = {
@@ -5179,6 +5252,7 @@ class MegatronRankWorker:
             self._zero_disabled_lora_params(
                 unwrapped, train_attn=train_attn, train_mlp=train_mlp, train_unembed=train_unembed
             )
+            self._zero_lora_rank_tail(unwrapped, actual_rank=actual_rank, zero_grads=True)
 
         logger.info(f"[Rank {self.rank}] Loaded adapter state from {checkpoint_path}")
 
@@ -5227,6 +5301,8 @@ class MegatronRankWorker:
 
         # Use train_mode context to ensure model is on GPU for saving
         with self.engine.train_mode():
+            if actual_rank is not None:
+                self._zero_lora_rank_tail(actual_rank=actual_rank, zero_grads=True)
             # Get adapter state dict
             adapter_state = get_adapter_state_dict(self.engine.module)
             expert_bias_state = {}
@@ -7159,6 +7235,11 @@ class MegatronWorkerGroup:
         self._bind_traceparent(traceparent)
 
         if self._current_session == session_id:
+            if actual_rank is not None and int(actual_rank) != int(self._actual_rank):
+                raise RuntimeError(
+                    f"Session {session_id} requested actual_rank={actual_rank}, "
+                    f"but loaded rank is {self._actual_rank}"
+                )
             session_exists = self._session_manager.session_exists(session_id)
             if session_exists:
                 has_actor_only_state = getattr(
@@ -7753,6 +7834,7 @@ class MegatronWorkerGroup:
                     loss_fn_config,
                     rollout_correction_config,
                     effective_session_id,
+                    self._actual_rank,
                     reset_bias,
                     traceparent=traceparent,
                 )
@@ -8221,6 +8303,7 @@ class MegatronWorkerGroup:
             w.optim_step.remote(
                 learning_rate,
                 effective_session_id,
+                self._actual_rank,
                 train_attn=train_attn,
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
@@ -8496,6 +8579,7 @@ class MegatronWorkerGroup:
         futures = [
             w.reinit_lora_weights.remote(
                 learning_rate,
+                actual_rank=actual_rank,
                 train_attn=train_attn,
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
@@ -8668,7 +8752,6 @@ class MegatronWorkerGroup:
             if not isinstance(meta, dict):
                 raise RuntimeError(f"Invalid training_meta.json type {type(meta).__name__} in {meta_path}")
             protected_keys = {
-                "actual_rank",
                 "actor_only_state_dirty",
                 "checkpoint_path",
                 "load_method",
@@ -8684,6 +8767,21 @@ class MegatronWorkerGroup:
                     f"Invalid training_meta.json in {meta_path}: protected load metadata keys "
                     f"must be derived from the checkpoint load, got {protected_present}"
                 )
+            meta_actual_rank = meta.get("actual_rank")
+            if meta_actual_rank is not None:
+                if (
+                    not isinstance(meta_actual_rank, int)
+                    or isinstance(meta_actual_rank, bool)
+                    or meta_actual_rank <= 0
+                ):
+                    raise RuntimeError(
+                        f"Invalid actual_rank in {meta_path}: expected positive int, got {meta_actual_rank!r}"
+                    )
+                if int(meta_actual_rank) != int(checkpoint_rank):
+                    raise RuntimeError(
+                        f"Invalid actual_rank in {meta_path}: metadata rank {meta_actual_rank} "
+                        f"does not match adapter_config rank {checkpoint_rank}"
+                    )
             checkpoint_step = meta.get("current_step")
             if not isinstance(checkpoint_step, int) or isinstance(checkpoint_step, bool) or checkpoint_step < 0:
                 raise RuntimeError(
@@ -8831,7 +8929,7 @@ class MegatronWorkerGroup:
                     )
 
             mark_refs = [
-                w.mark_session_loaded.remote(effective_session_id)
+                w.mark_session_loaded.remote(effective_session_id, self._actual_rank)
                 for w in self.workers
                 if hasattr(w, "mark_session_loaded")
             ]
@@ -9179,7 +9277,10 @@ class MegatronWorkerGroup:
             "base_model": self.base_model,
             "lora_rank": self.lora_rank,
             "session_cache": self._get_session_cache_diagnostics(),
-            "session_cache_store": self._get_session_cache_store_diagnostics(),
+            "session_cache_store": {
+                "sampled": False,
+                "reason": "omitted_from_liveness_diagnostics",
+            },
             "placement_bundle_node_ips": list(self._placement_bundle_node_ips),
             "placement_requested_node_ips": list(dict.fromkeys(self._placement_requested_node_ips)),
         }
@@ -9257,6 +9358,8 @@ class MegatronWorkerGroup:
             "session_unknown": int(bool(self._session_unknown_due_to_partial_swap)),
             "session_step": max(0, int(self._step_count)),
             "learning_rate": max(0.0, float(self.learning_rate)),
+            "max_lora_rank": max(0, int(self.lora_rank)),
+            "actual_rank": max(0, int(self._actual_rank or self.lora_rank)),
         }
         if self._observability_memory_cache:
             out.update(dict(self._observability_memory_cache))
@@ -9474,11 +9577,12 @@ class MegatronWorkerGroup:
         train_unembed: bool = True,
     ) -> dict:
         """Record that a checkpoint-loaded session is the current active session."""
-        ray.get([w.mark_session_loaded.remote(session_id) for w in self.workers])
+        effective_rank = actual_rank if actual_rank is not None else self.lora_rank
+        ray.get([w.mark_session_loaded.remote(session_id, effective_rank) for w in self.workers])
         self._current_session = session_id
         self._step_count = int(step_count)
         self.learning_rate = float(learning_rate)
-        self._actual_rank = actual_rank if actual_rank is not None else self.lora_rank
+        self._actual_rank = effective_rank
         self._train_attn = bool(train_attn)
         self._train_mlp = bool(train_mlp)
         self._train_unembed = bool(train_unembed)
@@ -9683,6 +9787,7 @@ def get_or_create_megatron_worker_group(
     learning_rate: float,
     distributed_config: DistributedConfig | None = None,
     session_id: str | None = None,
+    actual_rank: int | None = None,
     observability_base_model: str | None = None,
     traceparent: str | None = None,
     request_id: str | None = None,
@@ -9714,6 +9819,10 @@ def get_or_create_megatron_worker_group(
     is_persistent = is_persistent_model(base_model)
     observability_model = str(observability_base_model or base_model or "unknown")
     request_id = str(request_id or get_request_id() or "") or None
+    rank_metadata = {
+        "max_lora_rank": int(lora_rank),
+        "actual_rank": int(actual_rank if actual_rank is not None else lora_rank),
+    }
 
     if not ray.is_initialized():
         init_ray(
@@ -9808,7 +9917,7 @@ def get_or_create_megatron_worker_group(
                     namespace=PERSISTENT_NAMESPACE,
                     base_model=observability_model,
                     protected=is_persistent,
-                    metadata=dict(actor_observability_metadata(actor) or {}),
+                    metadata={**dict(actor_observability_metadata(actor) or {}), **rank_metadata},
                 )
                 # Existing actor is already ready
                 resource_pool.mark_ready(actor_name)
@@ -9965,7 +10074,7 @@ def get_or_create_megatron_worker_group(
             resource_pool.reserve_gpus(num_gpus)
 
         try:
-            from ..config import actor_runtime_env_vars, otel_env_vars
+            from ..config import actor_runtime_env_vars, apply_detached_actor_resources, otel_env_vars
 
             # Runtime env for PFS code access
             runtime_env = {
@@ -10056,12 +10165,14 @@ def get_or_create_megatron_worker_group(
                 },
             ) as create_span:
                 try:
-                    actor = MegatronWorkerGroup.options(
-                        name=actor_name,
-                        namespace=PERSISTENT_NAMESPACE,
-                        lifetime="detached",
-                        runtime_env=runtime_env,
-                    ).remote(
+                    actor_options = {
+                        "name": actor_name,
+                        "namespace": PERSISTENT_NAMESPACE,
+                        "lifetime": "detached",
+                        "runtime_env": runtime_env,
+                    }
+                    apply_detached_actor_resources(actor_options, ray)
+                    actor = MegatronWorkerGroup.options(**actor_options).remote(
                         base_model=base_model,
                         lora_rank=lora_rank,
                         learning_rate=learning_rate,
@@ -10110,7 +10221,7 @@ def get_or_create_megatron_worker_group(
                     base_model=observability_model,
                     session_id=session_id,
                     protected=is_persistent,
-                    metadata=dict(actor_observability_metadata(actor) or {}),
+                    metadata={**dict(actor_observability_metadata(actor) or {}), **rank_metadata},
                 )
             return actor
         finally:
@@ -10124,6 +10235,7 @@ async def async_get_or_create_megatron_worker_group(
     learning_rate: float,
     distributed_config: DistributedConfig | None = None,
     session_id: str | None = None,
+    actual_rank: int | None = None,
     observability_base_model: str | None = None,
     traceparent: str | None = None,
     request_id: str | None = None,
@@ -10155,6 +10267,7 @@ async def async_get_or_create_megatron_worker_group(
         learning_rate,
         distributed_config,
         session_id,
+        actual_rank,
         observability_base_model,
         traceparent,
         request_id,

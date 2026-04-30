@@ -290,6 +290,7 @@ async def test_issue_408_async_get_or_create_megatron_worker_group_propagates_co
         2e-4,
         None,
         "sess-async",
+        None,
         "Qwen/Qwen3-30B-A3B-Instruct-2507",
         "00-" + ("c" * 32) + "-" + ("3" * 16) + "-01",
         "req-408-async",
