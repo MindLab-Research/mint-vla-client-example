@@ -510,6 +510,9 @@ def truncate_lora_state_dict(
 def fit_lora_state_dict_to_reference(
     state_dict: dict[str, torch.Tensor],
     reference_state_dict: dict[str, torch.Tensor],
+    *,
+    rank_shard_index: int = 0,
+    rank_shard_count: int = 1,
 ) -> dict[str, torch.Tensor]:
     """Resize LoRA rank dimensions to match a reference state dict.
 
@@ -517,6 +520,16 @@ def fit_lora_state_dict_to_reference(
     rank-64 tensors while the local model rank dimension is rank-64 / TP.
     Non-rank dimensions must already match.
     """
+    rank_shard_index = int(rank_shard_index)
+    rank_shard_count = int(rank_shard_count)
+    if rank_shard_index < 0:
+        raise ValueError(f"rank_shard_index must be non-negative, got {rank_shard_index}")
+    if rank_shard_count <= 0:
+        raise ValueError(f"rank_shard_count must be positive, got {rank_shard_count}")
+    if rank_shard_index >= rank_shard_count:
+        raise ValueError(
+            f"rank_shard_index {rank_shard_index} must be smaller than rank_shard_count {rank_shard_count}"
+        )
     fitted = {}
     for name, tensor in state_dict.items():
         reference = reference_state_dict.get(name)
@@ -542,12 +555,20 @@ def fit_lora_state_dict_to_reference(
                 f"expected shape={target_shape}"
             )
         output = torch.zeros(target_shape, dtype=tensor.dtype, device=tensor.device)
-        overlap = min(source_shape[rank_axis], target_shape[rank_axis])
+        local_rank_dim = target_shape[rank_axis]
+        shard_start = rank_shard_index * local_rank_dim
+        shard_stop = shard_start + local_rank_dim
+        source_rank_dim = source_shape[rank_axis]
+        if source_rank_dim < shard_start:
+            overlap = 0
+        else:
+            overlap = max(0, min(shard_stop, source_rank_dim) - shard_start)
         source_slice = [slice(None)] * tensor.ndim
         target_slice = [slice(None)] * tensor.ndim
-        source_slice[rank_axis] = slice(0, overlap)
+        source_slice[rank_axis] = slice(shard_start, shard_start + overlap)
         target_slice[rank_axis] = slice(0, overlap)
-        output[tuple(target_slice)] = tensor[tuple(source_slice)]
+        if overlap:
+            output[tuple(target_slice)] = tensor[tuple(source_slice)]
         fitted[name] = output
     return fitted
 

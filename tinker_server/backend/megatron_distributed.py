@@ -5204,7 +5204,22 @@ class MegatronRankWorker:
                         "Adapter checkpoint key mismatch: "
                         f"missing_keys={missing_keys[:10]} unexpected_keys={unexpected_keys[:10]}"
                     )
-                adapter_state = fit_lora_state_dict_to_reference(adapter_state, expected_adapter_state)
+                rank_shard_index = 0
+                rank_shard_count = 1
+                try:
+                    from megatron.core import parallel_state as mpu
+
+                    rank_shard_index = int(mpu.get_tensor_model_parallel_rank())
+                    rank_shard_count = int(mpu.get_tensor_model_parallel_world_size())
+                except Exception:
+                    rank_shard_index = 0
+                    rank_shard_count = 1
+                adapter_state = fit_lora_state_dict_to_reference(
+                    adapter_state,
+                    expected_adapter_state,
+                    rank_shard_index=rank_shard_index,
+                    rank_shard_count=rank_shard_count,
+                )
             elif actual_rank is not None and trainer_rank is not None and actual_rank < trainer_rank:
                 logger.info(
                     f"[Rank {self.rank}] Padding adapter from rank {actual_rank} to {trainer_rank}"

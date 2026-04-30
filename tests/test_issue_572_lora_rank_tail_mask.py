@@ -130,6 +130,42 @@ def test_issue_572_fit_lora_state_dict_to_tp_local_reference() -> None:
     assert torch.equal(fitted["layers.0.mlp.adapter.linear_in.weight"], state["layers.0.mlp.adapter.linear_in.weight"][:16])
     assert torch.equal(fitted["layers.0.mlp.adapter.linear_out.weight"], state["layers.0.mlp.adapter.linear_out.weight"][:, :16])
 
+    shard1 = fit_lora_state_dict_to_reference(
+        state,
+        reference,
+        rank_shard_index=1,
+        rank_shard_count=4,
+    )
+    assert torch.equal(
+        shard1["layers.0.mlp.adapter.linear_in.weight"],
+        state["layers.0.mlp.adapter.linear_in.weight"][16:32],
+    )
+    assert torch.equal(
+        shard1["layers.0.mlp.adapter.linear_out.weight"],
+        state["layers.0.mlp.adapter.linear_out.weight"][:, 16:32],
+    )
+
+    rank20 = {
+        "layers.0.mlp.adapter.linear_in.weight": torch.arange(20 * 4).reshape(20, 4),
+        "layers.0.mlp.adapter.linear_out.weight": torch.arange(9 * 20).reshape(9, 20),
+    }
+    shard1_partial = fit_lora_state_dict_to_reference(
+        rank20,
+        reference,
+        rank_shard_index=1,
+        rank_shard_count=4,
+    )
+    assert torch.equal(
+        shard1_partial["layers.0.mlp.adapter.linear_in.weight"][:4],
+        rank20["layers.0.mlp.adapter.linear_in.weight"][16:20],
+    )
+    assert torch.all(shard1_partial["layers.0.mlp.adapter.linear_in.weight"][4:] == 0)
+    assert torch.equal(
+        shard1_partial["layers.0.mlp.adapter.linear_out.weight"][:, :4],
+        rank20["layers.0.mlp.adapter.linear_out.weight"][:, 16:20],
+    )
+    assert torch.all(shard1_partial["layers.0.mlp.adapter.linear_out.weight"][:, 4:] == 0)
+
 
 def test_issue_572_dense_export_config_uses_actual_rank() -> None:
     from tinker_server.backend.verl_training import TrainingWorker
