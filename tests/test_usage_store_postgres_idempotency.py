@@ -739,3 +739,17 @@ def test_postgres_usage_store_delete_events_validates_charge_item_without_event_
         assert state["rows"] == []
 
     asyncio.run(_run())
+
+
+def test_postgres_usage_store_health_check_returns_false_on_schema_failure(monkeypatch):
+    state = _state(event_id_unique_index=False)
+    _install_fake_asyncpg(monkeypatch, state)
+
+    store = PostgresUsageStore(dsn="postgresql://fake")
+
+    async def _run():
+        assert await store.health_check() is False
+        assert store._pool is None
+        assert state["pool"].closed is True
+
+    asyncio.run(_run())

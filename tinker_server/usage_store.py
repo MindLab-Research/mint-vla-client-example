@@ -547,10 +547,16 @@ class PostgresUsageStore:
         return {"total_quantity": total_quantity, "charge_item_totals": charge_item_totals}
 
     async def health_check(self) -> bool:
-        pool = await self._ensure_pool()
-        async with pool.acquire() as conn:
-            val = await conn.fetchval("SELECT 1")
-        return int(val) == 1
+        try:
+            pool = await self._ensure_pool()
+            async with pool.acquire() as conn:
+                val = await conn.fetchval("SELECT 1")
+            return int(val) == 1
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("usage_event postgres health check failed", exc_info=True)
+            return False
 
     async def close(self) -> None:
         if self._pool is not None:
