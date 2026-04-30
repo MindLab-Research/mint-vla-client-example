@@ -702,16 +702,15 @@ async def completions(request: OAICompletionRequest, http_request: Request, back
                 if attempt == 1:
                     raise
         text = tokenizer.decode(sequence.tokens, skip_special_tokens=True)
-        background_tasks.add_task(
-            _write_usage_events_after_response,
-            build_sample_once_usage_events(
-                session_id=sampling_session_id,
-                token_ids=prompt_token_ids,
-                sequence=sequence,
-                http_request=http_request,
-                request_id=sampling_request_id,
-            ),
+        usage_events = build_sample_once_usage_events(
+            session_id=sampling_session_id,
+            token_ids=prompt_token_ids,
+            sequence=sequence,
+            http_request=http_request,
+            request_id=sampling_request_id,
         )
+        if usage_events:
+            background_tasks.add_task(_write_usage_events_after_response, usage_events)
         return OAICompletionResponse(
             id=f"cmpl-{uuid.uuid4().hex}",
             created=int(time.time()),
@@ -829,16 +828,15 @@ async def chat_completions(request: OAIChatCompletionRequest, http_request: Requ
 
             _validate_tool_calls(request, tool_calls=tool_calls)
             finish_reason = "tool_calls" if tool_calls else _finish_reason(sequence.stop_reason)
-            background_tasks.add_task(
-                _write_usage_events_after_response,
-                build_sample_once_usage_events(
-                    session_id=sampling_session_id,
-                    token_ids=prompt_token_ids,
-                    sequence=sequence,
-                    http_request=http_request,
-                    request_id=sampling_request_id,
-                ),
+            usage_events = build_sample_once_usage_events(
+                session_id=sampling_session_id,
+                token_ids=prompt_token_ids,
+                sequence=sequence,
+                http_request=http_request,
+                request_id=sampling_request_id,
             )
+            if usage_events:
+                background_tasks.add_task(_write_usage_events_after_response, usage_events)
             return OAIChatCompletionResponse(
                 id=f"chatcmpl-{uuid.uuid4().hex}",
                 created=int(time.time()),

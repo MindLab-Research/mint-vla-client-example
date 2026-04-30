@@ -75,9 +75,13 @@ def test_cookbook_openai_completions_example_shape(monkeypatch):
         seen["sample_kwargs"] = kwargs
         return SampledSequence(tokens=[11, 12], logprobs=None, stop_reason="eos")
 
+    async def _unexpected_usage_write(_events):
+        raise AssertionError("empty usage events should not schedule background persistence")
+
     monkeypatch.setattr(openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session)
     monkeypatch.setattr(openai_compat, "_get_tokenizer", _fake_get_tokenizer)
     monkeypatch.setattr(openai_compat, "sample_once", _fake_sample_once)
+    monkeypatch.setattr(openai_compat, "_write_usage_events_after_response", _unexpected_usage_write)
 
     app = _build_app()
 
@@ -218,9 +222,13 @@ def test_cookbook_openai_chat_completions_example_shape(monkeypatch):
         seen["sample_kwargs"] = kwargs
         return SampledSequence(tokens=[21, 22, 23], logprobs=None, stop_reason="length")
 
+    async def _unexpected_usage_write(_events):
+        raise AssertionError("empty usage events should not schedule background persistence")
+
     monkeypatch.setattr(openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session)
     monkeypatch.setattr(openai_compat, "_get_tokenizer", _fake_get_tokenizer)
     monkeypatch.setattr(openai_compat, "sample_once", _fake_sample_once)
+    monkeypatch.setattr(openai_compat, "_write_usage_events_after_response", _unexpected_usage_write)
 
     app = _build_app()
 
