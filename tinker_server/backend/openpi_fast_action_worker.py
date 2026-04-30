@@ -348,6 +348,8 @@ class OpenPIFastActionSession:
             extract_actions = getattr(self._tokenizer, "extract_actions", None)
             if extract_actions is None:
                 raise
+            # Temporary workaround for the current OpenPI FAST decode-contract gap.
+            # Strict decode failures are still logged so this path is not treated as a contract fix.
             logger.warning(
                 "OpenPI FAST strict action decode failed; falling back to tokenizer.extract_actions: %s",
                 exc,
