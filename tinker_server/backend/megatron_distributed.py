@@ -5206,14 +5206,29 @@ class MegatronRankWorker:
                     )
                 rank_shard_index = 0
                 rank_shard_count = 1
-                try:
-                    from megatron.core import parallel_state as mpu
+                needs_rank_fit = False
+                for key, tensor in adapter_state.items():
+                    reference = expected_adapter_state.get(key)
+                    if reference is None:
+                        continue
+                    lowered = str(key).lower()
+                    if (
+                        ("lora_a" in lowered or "lora_b" in lowered or ("adapter" in lowered and "linear_" in lowered))
+                        and tuple(tensor.shape) != tuple(reference.shape)
+                    ):
+                        needs_rank_fit = True
+                        break
+                if needs_rank_fit:
+                    try:
+                        from megatron.core import parallel_state as mpu
 
-                    rank_shard_index = int(mpu.get_tensor_model_parallel_rank())
-                    rank_shard_count = int(mpu.get_tensor_model_parallel_world_size())
-                except Exception:
-                    rank_shard_index = 0
-                    rank_shard_count = 1
+                        rank_shard_index = int(mpu.get_tensor_model_parallel_rank())
+                        rank_shard_count = int(mpu.get_tensor_model_parallel_world_size())
+                    except Exception as exc:
+                        raise RuntimeError(
+                            "Cannot fit global LoRA checkpoint tensors to TP-local adapter shards "
+                            "because Megatron tensor-parallel state is unavailable"
+                        ) from exc
                 adapter_state = fit_lora_state_dict_to_reference(
                     adapter_state,
                     expected_adapter_state,

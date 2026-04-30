@@ -1583,9 +1583,14 @@ class TrainingWorker:
         if os.path.exists(adapter_config_path):
             with open(adapter_config_path, "r") as f:
                 adapter_config = json.load(f)
-            raw_config_rank = adapter_config.get("r") if isinstance(adapter_config, dict) else None
-            if isinstance(raw_config_rank, int) and not isinstance(raw_config_rank, bool):
-                config_rank = int(raw_config_rank)
+            if not isinstance(adapter_config, dict):
+                raise ValueError(
+                    f"adapter_config.json must contain a JSON object, got {type(adapter_config).__name__}"
+                )
+            raw_config_rank = adapter_config.get("r")
+            if not isinstance(raw_config_rank, int) or isinstance(raw_config_rank, bool):
+                raise ValueError(f"adapter_config.r must be an int, got {raw_config_rank!r}")
+            config_rank = int(raw_config_rank)
 
         # 2. Optionally load optimizer state
         optimizer_path = os.path.join(load_path, "optimizer.pt")

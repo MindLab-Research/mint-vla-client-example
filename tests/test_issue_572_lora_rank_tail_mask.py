@@ -112,6 +112,18 @@ def test_issue_572_pad_and_truncate_support_megatron_adapter_names() -> None:
     assert accepted["layers.0.mlp.adapter.linear_out.weight"].shape == (9, 64)
 
 
+def test_issue_572_rank_inference_rejects_mixed_lora_tensor_ranks() -> None:
+    from tinker_server.backend.lora_utils import get_lora_rank_from_state_dict
+
+    with pytest.raises(ValueError, match="LoRA tensor rank mismatch"):
+        get_lora_rank_from_state_dict(
+            {
+                "layer.q_proj.lora_A.weight": torch.ones(16, 3),
+                "layer.q_proj.lora_B.weight": torch.ones(5, 64),
+            }
+        )
+
+
 def test_issue_572_fit_lora_state_dict_to_tp_local_reference() -> None:
     from tinker_server.backend.lora_utils import fit_lora_state_dict_to_reference
 
@@ -277,6 +289,30 @@ def test_issue_572_dense_load_checkpoint_rejects_rank_metadata_mismatch(tmp_path
     worker._touch = lambda: None
 
     with pytest.raises(ValueError, match="Checkpoint LoRA rank metadata mismatch"):
+        worker.load_checkpoint(str(tmp_path), load_optimizer=False, session_id="session-r16")
+
+
+def test_issue_572_dense_load_checkpoint_rejects_non_int_adapter_config_rank(tmp_path) -> None:
+    from safetensors.torch import save_file
+    from tinker_server.backend.verl_training import TrainingWorker
+
+    save_file(
+        {
+            "base_model.model.layers.0.self_attn.q_proj.lora_A.default.weight": torch.ones(16, 3),
+            "base_model.model.layers.0.self_attn.q_proj.lora_B.default.weight": torch.ones(5, 16),
+        },
+        tmp_path / "adapter_model.safetensors",
+    )
+    (tmp_path / "adapter_config.json").write_text(json.dumps({"r": "16", "target_modules": ["linear_qkv"]}))
+
+    worker_cls = TrainingWorker.__ray_metadata__.modified_class
+    worker = object.__new__(worker_cls)
+    worker.device = "cpu"
+    worker.max_lora_rank = 64
+    worker._bind_traceparent = lambda traceparent: None
+    worker._touch = lambda: None
+
+    with pytest.raises(ValueError, match="adapter_config.r must be an int"):
         worker.load_checkpoint(str(tmp_path), load_optimizer=False, session_id="session-r16")
 
 
@@ -470,6 +506,57 @@ def test_issue_572_megatron_rank_checkpoint_preserves_tp_local_rank_for_rank32(t
     assert result == {"status": "ok", "path": str(tmp_path), "actual_rank": 32}
     assert adapter["layers.0.mlp.adapter.linear_in.weight"].shape == (16, 3)
     assert adapter["layers.0.mlp.adapter.linear_out.weight"].shape == (5, 16)
+
+
+def test_issue_572_megatron_global_to_tp_load_requires_parallel_state(tmp_path, monkeypatch) -> None:
+    ray = pytest.importorskip("ray")
+    if not hasattr(ray, "remote"):
+        pytest.skip("ray runtime without actor decorators is not usable for Megatron tests")
+
+    from tinker_server.backend.megatron_distributed import MegatronRankWorker
+
+    torch.save(
+        {
+            "adapter_state_dict": {
+                "layers.0.mlp.adapter.linear_in.weight": torch.ones(64, 3),
+                "layers.0.mlp.adapter.linear_out.weight": torch.ones(5, 64),
+            },
+            "expert_bias_state_dict": {},
+        },
+        tmp_path / "mp_rank_00_adapter.pt",
+    )
+
+    peft_utils_mod = ModuleType("verl.utils.megatron_peft_utils")
+    peft_utils_mod._get_rank_checkpoint_path = lambda checkpoint_path: str(tmp_path / "mp_rank_00")
+    peft_utils_mod.get_adapter_state_dict = lambda _module: {
+        "layers.0.mlp.adapter.linear_in.weight": torch.zeros(16, 3),
+        "layers.0.mlp.adapter.linear_out.weight": torch.zeros(5, 16),
+    }
+    megatron_utils_mod = ModuleType("verl.utils.megatron_utils")
+    megatron_utils_mod.unwrap_model = lambda model: model
+    monkeypatch.setitem(sys.modules, "verl.utils.megatron_peft_utils", peft_utils_mod)
+    monkeypatch.setitem(sys.modules, "verl.utils.megatron_utils", megatron_utils_mod)
+
+    monkeypatch.setitem(sys.modules, "megatron", ModuleType("megatron"))
+    monkeypatch.setitem(sys.modules, "megatron.core", ModuleType("megatron.core"))
+    monkeypatch.delitem(sys.modules, "megatron.core.parallel_state", raising=False)
+
+    class _TrainMode:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *_args):
+            return False
+
+    worker_cls = MegatronRankWorker.__ray_metadata__.modified_class
+    worker = object.__new__(worker_cls)
+    worker.rank = 0
+    worker.engine = SimpleNamespace(module=torch.nn.Module(), train_mode=lambda: _TrainMode())
+    worker._bind_traceparent = lambda traceparent: None
+    worker._release_sticky_for_aux_mode_transition = lambda **_kwargs: None
+
+    with pytest.raises(RuntimeError, match="Megatron tensor-parallel state is unavailable"):
+        worker.load_adapter_state(str(tmp_path), actual_rank=16, trainer_rank=64)
 
 
 def test_issue_572_megatron_load_checkpoint_accepts_matching_actual_rank_metadata(tmp_path, monkeypatch) -> None:

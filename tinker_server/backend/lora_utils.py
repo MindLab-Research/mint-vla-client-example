@@ -604,7 +604,7 @@ def compute_lora_scaling(
 
 
 def get_lora_rank_from_state_dict(state_dict: dict[str, torch.Tensor]) -> int | None:
-    """Infer LoRA rank from state dict by examining tensor shapes.
+    """Infer LoRA rank from state dict by validating all LoRA tensor shapes.
 
     Args:
         state_dict: Adapter state dict.
@@ -612,14 +612,22 @@ def get_lora_rank_from_state_dict(state_dict: dict[str, torch.Tensor]) -> int | 
     Returns:
         Inferred rank, or None if no LoRA parameters found.
     """
+    ranks: list[tuple[str, int]] = []
     for name, tensor in state_dict.items():
+        if not isinstance(tensor, torch.Tensor):
+            continue
+        if (_is_lora_a_name(name) or _is_lora_b_name(name)) and tensor.ndim < 2:
+            raise ValueError(f"{name}: expected rank-2+ LoRA tensor, got shape={tuple(tensor.shape)}")
         if _is_lora_a_name(name):
-            # lora_A has shape (rank, hidden)
-            return tensor.shape[0]
+            ranks.append((name, int(tensor.shape[0])))
         elif _is_lora_b_name(name):
-            # lora_B has shape (hidden, rank)
-            return tensor.shape[-1]
-    return None
+            ranks.append((name, int(tensor.shape[-1])))
+    if not ranks:
+        return None
+    rank_values = {rank for _, rank in ranks}
+    if len(rank_values) != 1:
+        raise ValueError(f"LoRA tensor rank mismatch: {ranks}")
+    return ranks[0][1]
 
 
 __all__ = [
