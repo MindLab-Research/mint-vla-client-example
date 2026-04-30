@@ -136,7 +136,12 @@ def test_issue_572_fit_lora_state_dict_to_tp_local_reference() -> None:
         "layers.0.mlp.adapter.linear_out.weight": torch.empty(9, 16),
     }
 
-    fitted = fit_lora_state_dict_to_reference(state, reference)
+    fitted = fit_lora_state_dict_to_reference(
+        state,
+        reference,
+        rank_shard_index=0,
+        rank_shard_count=4,
+    )
 
     assert fitted["layers.0.mlp.adapter.linear_in.weight"].shape == (16, 4)
     assert fitted["layers.0.mlp.adapter.linear_out.weight"].shape == (9, 16)
@@ -178,6 +183,18 @@ def test_issue_572_fit_lora_state_dict_to_tp_local_reference() -> None:
         rank20["layers.0.mlp.adapter.linear_out.weight"][:, 16:20],
     )
     assert torch.all(shard1_partial["layers.0.mlp.adapter.linear_out.weight"][:, 4:] == 0)
+
+    overflow = {
+        "layers.0.mlp.adapter.linear_in.weight": torch.ones(80, 4),
+        "layers.0.mlp.adapter.linear_out.weight": torch.ones(9, 80),
+    }
+    with pytest.raises(ValueError, match="exceeds represented trainer rank 64"):
+        fit_lora_state_dict_to_reference(
+            overflow,
+            reference,
+            rank_shard_index=0,
+            rank_shard_count=4,
+        )
 
 
 def test_issue_572_dense_export_config_uses_actual_rank() -> None:

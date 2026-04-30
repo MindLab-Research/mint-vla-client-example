@@ -559,6 +559,12 @@ def fit_lora_state_dict_to_reference(
         shard_start = rank_shard_index * local_rank_dim
         shard_stop = shard_start + local_rank_dim
         source_rank_dim = source_shape[rank_axis]
+        represented_rank_dim = local_rank_dim * rank_shard_count
+        if source_rank_dim > represented_rank_dim:
+            raise ValueError(
+                f"{name}: checkpoint LoRA rank dim {source_rank_dim} exceeds represented trainer rank "
+                f"{represented_rank_dim} for rank_shard_count {rank_shard_count}"
+            )
         if source_rank_dim < shard_start:
             overlap = 0
         else:

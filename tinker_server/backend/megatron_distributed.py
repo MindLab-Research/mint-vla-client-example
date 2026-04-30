@@ -9855,6 +9855,65 @@ def get_or_create_megatron_worker_group(
         "actual_rank": int(actual_rank if actual_rank is not None else lora_rank),
     }
 
+    def _verify_actor_lora_rank_or_recreate(
+        actor: ray.actor.ActorHandle,
+        *,
+        diagnostics_timeout_s: float = 10.0,
+    ) -> None:
+        try:
+            diagnostics = ray.get(actor.get_diagnostics.remote(), timeout=diagnostics_timeout_s)
+        except ray.exceptions.RayActorError:
+            logger.warning(f"Megatron actor {actor_name} is dead, killing to free name")
+            from .runtime_observability import runtime_observability
+
+            runtime_observability.record_megatron_actor_lifecycle(
+                base_model=observability_model,
+                event="recreate",
+            )
+            try:
+                ray_kill.kill(
+                    actor,
+                    reason="megatron_actor_dead_free_name",
+                    actor_name=actor_name,
+                    namespace=PERSISTENT_NAMESPACE,
+                    no_restart=True,
+                )
+            except Exception:
+                pass
+            raise ValueError("Actor dead, will recreate") from None
+        except ray.exceptions.GetTimeoutError as exc:
+            raise RuntimeError(
+                f"Megatron actor {actor_name} get_diagnostics timed out; cannot verify "
+                f"lora_rank={lora_rank} without risking stale actor reuse"
+            ) from exc
+
+        observed_rank = None
+        if isinstance(diagnostics, dict):
+            observed_rank = diagnostics.get("lora_rank", diagnostics.get("max_lora_rank"))
+        if not isinstance(observed_rank, int) or isinstance(observed_rank, bool):
+            raise RuntimeError(
+                f"Megatron actor {actor_name} diagnostics missing integer lora_rank: {diagnostics!r}"
+            )
+        if int(observed_rank) != int(lora_rank):
+            logger.warning(
+                "Megatron actor %s has lora_rank=%s but configured max_lora_rank=%s; recreating",
+                actor_name,
+                observed_rank,
+                lora_rank,
+            )
+            ray_kill.kill(
+                actor,
+                reason="megatron_actor_lora_rank_mismatch",
+                actor_name=actor_name,
+                namespace=PERSISTENT_NAMESPACE,
+                no_restart=True,
+                verify_absent=True,
+                base_model=base_model,
+                observed_lora_rank=observed_rank,
+                expected_lora_rank=int(lora_rank),
+            )
+            raise ValueError("Actor lora_rank mismatch, will recreate")
+
     if not ray.is_initialized():
         init_ray(
             namespace=PERSISTENT_NAMESPACE,
@@ -9885,71 +9944,19 @@ def get_or_create_megatron_worker_group(
             logger.info(f"Connected to existing Megatron actor: {actor_name}")
 
             # Verify actor is alive
-            try:
-                with start_as_current_span_from_traceparent(
-                    "training.create_model.megatron.actor_diagnostics",
-                    traceparent=traceparent,
-                    component="backend.megatron_distributed",
-                    op="training.create_model.megatron.actor_diagnostics",
-                    request_id=request_id,
-                    attributes={
-                        "actor_name": str(actor_name),
-                        "base_model": str(base_model),
-                        "diagnostics_timeout_s": 10,
-                    },
-                ):
-                    diagnostics = ray.get(actor.get_diagnostics.remote(), timeout=10)
-                observed_rank = None
-                if isinstance(diagnostics, dict):
-                    observed_rank = diagnostics.get("lora_rank", diagnostics.get("max_lora_rank"))
-                if not isinstance(observed_rank, int) or isinstance(observed_rank, bool):
-                    raise RuntimeError(
-                        f"Megatron actor {actor_name} diagnostics missing integer lora_rank: {diagnostics!r}"
-                    )
-                if int(observed_rank) != int(lora_rank):
-                    logger.warning(
-                        "Megatron actor %s has lora_rank=%s but configured max_lora_rank=%s; recreating",
-                        actor_name,
-                        observed_rank,
-                        lora_rank,
-                    )
-                    ray_kill.kill(
-                        actor,
-                        reason="megatron_actor_lora_rank_mismatch",
-                        actor_name=actor_name,
-                        namespace=PERSISTENT_NAMESPACE,
-                        no_restart=True,
-                        verify_absent=True,
-                        base_model=base_model,
-                        observed_lora_rank=observed_rank,
-                        expected_lora_rank=int(lora_rank),
-                    )
-                    raise ValueError("Actor lora_rank mismatch, will recreate")
-            except ray.exceptions.RayActorError:
-                # Actor is dead, kill to free name
-                logger.warning(f"Megatron actor {actor_name} is dead, killing to free name")
-                from .runtime_observability import runtime_observability
-
-                runtime_observability.record_megatron_actor_lifecycle(
-                    base_model=observability_model,
-                    event="recreate",
-                )
-                try:
-                    ray_kill.kill(
-                        actor,
-                        reason="megatron_actor_dead_free_name",
-                        actor_name=actor_name,
-                        namespace=PERSISTENT_NAMESPACE,
-                        no_restart=True,
-                    )
-                except Exception:
-                    pass
-                raise ValueError("Actor dead, will recreate")
-            except ray.exceptions.GetTimeoutError:
-                raise RuntimeError(
-                    f"Megatron actor {actor_name} get_diagnostics timed out; cannot verify "
-                    f"lora_rank={lora_rank} without risking stale actor reuse"
-                )
+            with start_as_current_span_from_traceparent(
+                "training.create_model.megatron.actor_diagnostics",
+                traceparent=traceparent,
+                component="backend.megatron_distributed",
+                op="training.create_model.megatron.actor_diagnostics",
+                request_id=request_id,
+                attributes={
+                    "actor_name": str(actor_name),
+                    "base_model": str(base_model),
+                    "diagnostics_timeout_s": 10,
+                },
+            ):
+                _verify_actor_lora_rank_or_recreate(actor)
 
             with start_as_current_span_from_traceparent(
                 "training.create_model.megatron.register_existing_actor",
@@ -10040,6 +10047,7 @@ def get_or_create_megatron_worker_group(
                         logger.info(
                             f"Megatron actor appeared after PG probe; reusing actor={actor_name} pg={pg_name}"
                         )
+                        _verify_actor_lora_rank_or_recreate(actor)
                         if guard_span is not None:
                             guard_span.set_attribute("resolved_without_pg_remove", True)
                             guard_span.set_attribute("attempts", int(guard_attempts))
@@ -10246,6 +10254,7 @@ def get_or_create_megatron_worker_group(
                             f"Megatron actor create raced (already exists): {actor_name}; reusing existing actor"
                         )
                         actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
+                        _verify_actor_lora_rank_or_recreate(actor)
                         if create_span is not None:
                             create_span.set_attribute("create_raced_existing_actor", True)
                     else:
