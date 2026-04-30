@@ -16,8 +16,30 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import mint
 from mint import mint as mintx
+import mint.mint._mintx as mintx_impl
 import tinker
 from transformers import AutoTokenizer
+
+OWNER_ID = (
+    os.environ.get("TINKER_OWNER_ID")
+    or os.environ.get("TINKER_USER_ID")
+    or os.environ.get("MINT_GATEWAY_USER_ID")
+    or "mintx_sdpo_user"
+)
+_MINTX_MODEL_DUMP = mintx_impl.model_dump
+
+
+def _model_dump_with_owner(obj, *args, **kwargs):
+    body = _MINTX_MODEL_DUMP(obj, *args, **kwargs)
+    if isinstance(body, dict) and body.get("type") in {
+        "mint_forward_backward_reverse_kl",
+        "mint_interpolate_checkpoints",
+    }:
+        body["owner_id"] = OWNER_ID
+    return body
+
+
+mintx_impl.model_dump = _model_dump_with_owner
 
 @dataclass(frozen=True)
 class Example:
@@ -224,9 +246,11 @@ def plot_curves(rows: list[dict[str, float]], out_dir: Path) -> None:
 
 
 def main() -> None:
+    global OWNER_ID
     parser = argparse.ArgumentParser(description="Run MintX SDPO training against /api/v1/mint endpoints")
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--api-key", default="dummy")
+    parser.add_argument("--owner-id", default=OWNER_ID)
     parser.add_argument("--model", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--steps", type=int, default=20)
@@ -250,6 +274,8 @@ def main() -> None:
     parser.add_argument("--bootstrap-teacher-steps", type=int, default=0)
     parser.add_argument("--probe-size", type=int, default=8)
     args = parser.parse_args()
+
+    OWNER_ID = args.owner_id
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
