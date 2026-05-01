@@ -180,6 +180,7 @@ def test_postgres_usage_store_dedupes_by_event_id(monkeypatch):
         summary = await store.get_account_summary("aaaaaaaaaaaaaaaaaaaaaaaa")
         await store.close()
 
+        assert state["pool_kwargs"]["statement_cache_size"] == 0
         assert count == 1
         assert has_more is False
         assert len(logs) == 1

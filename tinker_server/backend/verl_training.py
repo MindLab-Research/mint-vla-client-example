@@ -1539,7 +1539,13 @@ class TrainingWorker:
 
         abs_path = os.path.abspath(save_path)
         logger.info(f"[TrainingWorker] Saved LoRA weights to {abs_path}")
-        return abs_path
+        return {
+            "path": abs_path,
+            "state_dict": state_dict,
+            "peft_config": config,
+            "current_step": self._step_count,
+            "learning_rate": self.optimizer.param_groups[0]["lr"],
+        }
 
     def save_checkpoint(
         self,
@@ -3930,6 +3936,7 @@ class VerlTrainingEngine:
                         data_items=reference_items,
                         temperature=float(request.temperature),
                         session_id=ref_session_id,
+                        actual_rank=reference_actual_rank,
                         traceparent=traceparent,
                         train_attn=train_attn,
                         train_mlp=train_mlp,
@@ -3946,6 +3953,7 @@ class VerlTrainingEngine:
                     None,
                     float(request.temperature),
                     session.model_id,
+                    session.lora_config.rank if session.lora_config else None,
                     traceparent=traceparent,
                     train_attn=train_attn,
                     train_mlp=train_mlp,
@@ -4472,7 +4480,7 @@ class VerlTrainingEngine:
             session_id=session.model_id,
             actual_rank=session.lora_config.rank if session.lora_config else None,
         )
-        _ = await run_async_with_otel_span(
+        result = await run_async_with_otel_span(
             "training.save_weights_for_sampler.remote_save",
             lambda: self._await_worker_call(
                 ref,
@@ -4493,6 +4501,22 @@ class VerlTrainingEngine:
                 "timeout_s": int(timeout_s),
             },
         )
+
+        if isinstance(result, dict) and "state_dict" in result and "peft_config" in result:
+            import json
+
+            from safetensors.torch import save_file
+
+            os.makedirs(abs_path, exist_ok=True)
+            save_file(result["state_dict"], os.path.join(abs_path, "adapter_model.safetensors"))
+            with open(os.path.join(abs_path, "adapter_config.json"), "w", encoding="utf-8") as f:
+                json.dump(result["peft_config"], f, indent=2)
+            training_meta = {
+                "current_step": int(result.get("current_step", session.current_step)),
+                "learning_rate": float(result.get("learning_rate", session.learning_rate)),
+            }
+            with open(os.path.join(abs_path, "training_meta.json"), "w", encoding="utf-8") as f:
+                json.dump(training_meta, f, indent=2)
 
         logger.info(f"[{model_id}] save_dense_lora_weights_for_sampler: {abs_path}")
         return abs_path

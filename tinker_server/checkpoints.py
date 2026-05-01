@@ -720,19 +720,27 @@ def _prefer_cached_checkpoint_view(
     save_state -> load_state can run deterministically in one session.
     """
     cache_root = get_persistent_cache_dir()
+    anonymous_dir = checkpoint_owner_dir(None)
     if is_admin:
         candidates = [
             os.path.join(cache_root, path_part),
+            os.path.join(cache_root, owner_dir, path_part),
+            os.path.join(cache_root, anonymous_dir, path_part),
             *glob.glob(os.path.join(cache_root, "*", path_part)),
         ]
     else:
         candidates = [os.path.join(cache_root, owner_dir, path_part)]
+        if owner_dir != anonymous_dir:
+            candidates.append(os.path.join(cache_root, anonymous_dir, path_part))
 
-    for candidate in candidates:
+    for candidate in _dedupe_paths(candidates):
         resolved = _existing_checkpoint_view(candidate, checkpoint_type=checkpoint_type)
         if resolved is None:
             continue
-        if is_admin and not _checkpoint_view_matches_owner(resolved, owner_dir=owner_dir):
+        if is_admin and not (
+            _checkpoint_view_matches_owner(resolved, owner_dir=owner_dir)
+            or _checkpoint_view_matches_owner(resolved, owner_dir=anonymous_dir)
+        ):
             continue
         return resolved
     return None

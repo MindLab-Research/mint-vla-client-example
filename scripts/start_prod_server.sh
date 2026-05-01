@@ -59,4 +59,28 @@ export TMPDIR="${api_tmp_link}/t"
 export XDG_CACHE_HOME="${api_tmp_link}/c"
 mkdir -p "${TMPDIR}" "${XDG_CACHE_HOME}" "${TINKER_RUNTIME_CHECKPOINT_DIR}"
 
+ray_node_ip="$(python - <<'PY'
+import socket
+
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+try:
+    s.connect(("8.8.8.8", 80))
+    print(s.getsockname()[0])
+finally:
+    s.close()
+PY
+)"
+ray_temp_dir="${api_tmp_link}/ray"
+mkdir -p "${ray_temp_dir}"
+"${PFS_RUNTIME_ENV_ROOT}/host-venv/bin/ray" start \
+  --address="${RAY_ADDRESS}" \
+  --node-ip-address="${ray_node_ip}" \
+  --num-cpus=0 \
+  --num-gpus=0 \
+  --temp-dir="${ray_temp_dir}" \
+  --disable-usage-stats >/tmp/mint_prod_api_ray_start.log 2>&1 || {
+    cat /tmp/mint_prod_api_ray_start.log >&2
+    exit 1
+  }
+
 exec "${PFS_RUNTIME_ENV_ROOT}/host-venv/bin/python" scripts/run_server.py

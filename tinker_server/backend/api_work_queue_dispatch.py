@@ -32,7 +32,19 @@ KNOWN_QUEUE_OPS = (
 )
 
 
+def _ensure_ray_context_for_dispatch() -> None:
+    import ray
+
+    if ray.is_initialized():
+        return
+    from ..config import RAY_NAMESPACE
+    from ..ray_utils import init_ray
+
+    init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
+
+
 async def execute_work_item(item: Any) -> None:
+    _ensure_ray_context_for_dispatch()
     from ..models.mint_types import (
         ForwardBackwardReverseKLRequest,
         InterpolateCheckpointsRequest,

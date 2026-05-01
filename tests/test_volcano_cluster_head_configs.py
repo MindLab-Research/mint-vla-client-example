@@ -19,7 +19,10 @@ def test_dev_head_keeps_dashboard_and_ray_client_enabled() -> None:
     assert 'RAY_XDG_CACHE_HOME = f"{RAY_TMP_LINK}/cache"' in text
     assert 'temp_dir=RAY_TEMP_DIR' in text
     assert 'object_spilling_directory=RAY_OBJECT_SPILLING_DIR' in text
+    assert 'import shutil' in text
+    assert 'shutil.rmtree(RAY_TMP_LINK)' in text
     assert 'os.symlink(RAY_TMP_ROOT_REAL, RAY_TMP_LINK)' in text
+    assert 'os.path.realpath(RAY_TMP_LINK) != os.path.realpath(RAY_TMP_ROOT_REAL)' in text
     assert 'os.environ["TMPDIR"] = RAY_OS_TMPDIR' in text
     assert 'os.environ["XDG_CACHE_HOME"] = RAY_XDG_CACHE_HOME' in text
     assert 'RAY_RUNTIME_ENV_WORKING_DIR_CACHE_SIZE_GB' in text
@@ -49,7 +52,10 @@ def test_dev_worker_uses_short_temp_paths() -> None:
     assert "ip.replace('.', '-')" in text
     assert 'temp_dir=ray_temp_dir' in text
     assert 'object_spilling_directory=ray_object_spilling_dir' in text
+    assert 'import shutil' in text
+    assert 'shutil.rmtree(RAY_TMP_LINK)' in text
     assert 'os.symlink(ray_tmp_root_real, RAY_TMP_LINK)' in text
+    assert 'os.path.realpath(RAY_TMP_LINK) != os.path.realpath(ray_tmp_root_real)' in text
     assert 'os.environ["TMPDIR"] = ray_os_tmpdir' in text
     assert 'os.environ["XDG_CACHE_HOME"] = ray_xdg_cache_home' in text
     assert 'RAY_RUNTIME_ENV_WORKING_DIR_CACHE_SIZE_GB' in text
@@ -72,7 +78,10 @@ def test_prod_head_self_heals_without_dashboard_or_ray_client() -> None:
     assert 'RAY_XDG_CACHE_HOME = f"{RAY_TMP_LINK}/cache"' in text
     assert 'temp_dir=RAY_TEMP_DIR' in text
     assert 'object_spilling_directory=RAY_OBJECT_SPILLING_DIR' in text
+    assert 'import shutil' in text
+    assert 'shutil.rmtree(RAY_TMP_LINK)' in text
     assert 'os.symlink(RAY_TMP_ROOT_REAL, RAY_TMP_LINK)' in text
+    assert 'os.path.realpath(RAY_TMP_LINK) != os.path.realpath(RAY_TMP_ROOT_REAL)' in text
     assert 'os.environ["TMPDIR"] = RAY_OS_TMPDIR' in text
     assert 'os.environ["XDG_CACHE_HOME"] = RAY_XDG_CACHE_HOME' in text
     assert "BACKOFF_INITIAL_S = 5" in text
@@ -97,7 +106,10 @@ def test_prod_worker_self_heals_with_backoff() -> None:
     assert 'RAY_TMP_LINK = "/tmp/mpw"' in text
     assert 'temp_dir=ray_temp_dir' in text
     assert 'object_spilling_directory=ray_object_spilling_dir' in text
+    assert 'import shutil' in text
+    assert 'shutil.rmtree(RAY_TMP_LINK)' in text
     assert 'os.symlink(ray_tmp_root_real, RAY_TMP_LINK)' in text
+    assert 'os.path.realpath(RAY_TMP_LINK) != os.path.realpath(ray_tmp_root_real)' in text
     assert 'os.environ["TMPDIR"] = ray_os_tmpdir' in text
     assert 'os.environ["XDG_CACHE_HOME"] = ray_xdg_cache_home' in text
     assert "BACKOFF_INITIAL_S = 5" in text

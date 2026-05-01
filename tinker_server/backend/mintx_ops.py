@@ -167,7 +167,8 @@ def _validate_source_metadata(source_paths: list[str]) -> tuple[str, str | None,
             raise ValueError("All source checkpoints must have the same model_name")
         if backend is not None and meta.get("backend") != backend:
             raise ValueError("All source checkpoints must have the same backend")
-        if owner_id is not None and meta.get("owner_id") != owner_id:
+        other_owner_id = meta.get("owner_id") if isinstance(meta.get("owner_id"), str) else None
+        if owner_id is not None and other_owner_id is not None and other_owner_id != owner_id:
             raise ValueError("All source checkpoints must have the same owner_id")
 
     return model_id, model_name, backend, first_meta

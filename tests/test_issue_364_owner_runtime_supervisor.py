@@ -63,7 +63,7 @@ def test_issue_364_training_cleanup_runner_proxies_results(monkeypatch) -> None:
     from tinker_server.backend import owner_runtime_supervisor as ors
 
     class _FakeTrainingCleanupExecutor:
-        async def async_cleanup_stale_sessions_once(self):
+        async def async_cleanup_stale_sessions_once(self, *, stale_after_s=None):
             return ["model-a", "model-b"]
 
     monkeypatch.setattr(
@@ -72,6 +72,14 @@ def test_issue_364_training_cleanup_runner_proxies_results(monkeypatch) -> None:
     )
 
     assert ors.run_training_cleanup_once() == {"cleaned": ["model-a", "model-b"]}
+
+
+def test_issue_364_training_cleanup_runner_respects_disable_env(monkeypatch) -> None:
+    from tinker_server.backend import owner_runtime_supervisor as ors
+
+    monkeypatch.setenv("MINT_TRAINING_HEARTBEAT_STALE_S", "0")
+
+    assert ors.run_training_cleanup_once() == {"cleaned": []}
 
 
 def test_issue_364_sampling_cleanup_runner_proxies_results(monkeypatch) -> None:
