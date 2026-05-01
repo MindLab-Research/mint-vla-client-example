@@ -245,17 +245,19 @@ def checkpoint_has_openpi_policy_weights(path: str) -> bool:
     return (root / "params" / "_METADATA").exists() and _checkpoint_has_openpi_norm_stats(root)
 
 
-def checkpoint_has_openpi_training_state(path: str) -> bool:
+def _latest_openpi_step_dir(path: str) -> Path | None:
     root = Path(path)
-    candidates = [
-        child
-        for child in root.iterdir()
-        if child.is_dir() and child.name.isdigit() and checkpoint_has_openpi_policy_weights(str(child))
-    ]
+    candidates = [child for child in root.iterdir() if child.is_dir() and child.name.isdigit()]
     if not candidates:
+        return None
+    return max(candidates, key=lambda child: int(child.name))
+
+
+def checkpoint_has_openpi_training_state(path: str) -> bool:
+    latest = _latest_openpi_step_dir(path)
+    if latest is None:
         return False
-    latest = max(candidates, key=lambda child: int(child.name))
-    return (latest / "train_state" / "_METADATA").exists()
+    return (latest / "params" / "_METADATA").exists() and (latest / "train_state" / "_METADATA").exists()
 
 
 def checkpoint_has_optimizer_state(path: str) -> bool:
@@ -268,6 +270,26 @@ def checkpoint_has_optimizer_state(path: str) -> bool:
 
 def read_checkpoint_metadata(path: str) -> dict:
     meta_path = os.path.join(path, "metadata.json")
+    with open(meta_path) as f:
+        return json.load(f)
+
+
+def _checkpoint_metadata_lock_path(path: str) -> str:
+    return os.path.join(path, ".metadata.lock")
+
+
+def _locked_checkpoint_metadata(path: str):
+    os.makedirs(path, exist_ok=True)
+    lock_path = _checkpoint_metadata_lock_path(path)
+    lock_file = open(lock_path, "a+", encoding="utf-8")
+    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+    return lock_file
+
+
+def _load_checkpoint_metadata_locked(path: str) -> dict:
+    meta_path = os.path.join(path, "metadata.json")
+    if not os.path.exists(meta_path):
+        return {}
     with open(meta_path) as f:
         return json.load(f)
 
@@ -321,19 +343,65 @@ def write_checkpoint_metadata(path: str, metadata: dict) -> None:
 
     os.makedirs(path, exist_ok=True)
     meta_path = os.path.join(path, "metadata.json")
-    with open(meta_path, "w") as f:
-        json.dump(data, f, indent=2, sort_keys=True)
+    temp_path = f"{meta_path}.tmp-{uuid.uuid4().hex[:8]}"
+    lock_file = _locked_checkpoint_metadata(path)
+    try:
+        with open(temp_path, "w") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, meta_path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
 
 
 def update_checkpoint_metadata(path: str, updates: dict) -> dict:
-    current = {}
+    os.makedirs(path, exist_ok=True)
+    meta_path = os.path.join(path, "metadata.json")
+    temp_path = f"{meta_path}.tmp-{uuid.uuid4().hex[:8]}"
+    lock_file = _locked_checkpoint_metadata(path)
     try:
-        current = read_checkpoint_metadata(path)
-    except Exception:
-        current = {}
-    current.update(dict(updates))
-    write_checkpoint_metadata(path, current)
-    return current
+        try:
+            current = _load_checkpoint_metadata_locked(path)
+        except (json.JSONDecodeError, OSError) as e:
+            if os.path.exists(meta_path):
+                raise RuntimeError(
+                    f"Refusing to overwrite invalid checkpoint metadata at {meta_path}: {type(e).__name__}: {e}"
+                ) from e
+            current = {}
+        current.update(dict(updates))
+
+        created_at = current.get("created_at")
+        if not isinstance(created_at, str) or not created_at:
+            created_at = _isoformat_utc(time.time())
+            current["created_at"] = created_at
+
+        ttl_raw = current.get("ttl_seconds")
+        if ttl_raw is not None:
+            try:
+                ttl_int = int(ttl_raw)
+            except (TypeError, ValueError):
+                current.pop("ttl_seconds", None)
+            else:
+                current["ttl_seconds"] = ttl_int
+                if ttl_int > 0 and not current.get("expires_at"):
+                    created_dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                    current["expires_at"] = _isoformat_utc(created_dt.timestamp() + ttl_int)
+
+        with open(temp_path, "w") as f:
+            json.dump(current, f, indent=2, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, meta_path)
+        return current
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
 
 
 def validate_checkpoint_load_contract(
@@ -638,6 +706,46 @@ def _checkpoint_view_matches_owner(path: str, *, owner_dir: str) -> bool:
     return actual == owner_dir
 
 
+def _prefer_cached_checkpoint_view(
+    path_part: str,
+    *,
+    checkpoint_type: CheckpointType,
+    owner_dir: str,
+    is_admin: bool,
+) -> str | None:
+    """Return persistent-cache checkpoint view when available.
+
+    Newly saved checkpoints are immediately present under persistent_cache and
+    may take time to mirror into persistent storage. Prefer cache first so
+    save_state -> load_state can run deterministically in one session.
+    """
+    cache_root = get_persistent_cache_dir()
+    anonymous_dir = checkpoint_owner_dir(None)
+    if is_admin:
+        candidates = [
+            os.path.join(cache_root, path_part),
+            os.path.join(cache_root, owner_dir, path_part),
+            os.path.join(cache_root, anonymous_dir, path_part),
+            *glob.glob(os.path.join(cache_root, "*", path_part)),
+        ]
+    else:
+        candidates = [os.path.join(cache_root, owner_dir, path_part)]
+        if owner_dir != anonymous_dir:
+            candidates.append(os.path.join(cache_root, anonymous_dir, path_part))
+
+    for candidate in _dedupe_paths(candidates):
+        resolved = _existing_checkpoint_view(candidate, checkpoint_type=checkpoint_type)
+        if resolved is None:
+            continue
+        if is_admin and not (
+            _checkpoint_view_matches_owner(resolved, owner_dir=owner_dir)
+            or _checkpoint_view_matches_owner(resolved, owner_dir=anonymous_dir)
+        ):
+            continue
+        return resolved
+    return None
+
+
 def resolve_checkpoint_uri(
     uri: str,
     checkpoints_dir: str,
@@ -669,6 +777,15 @@ def resolve_checkpoint_uri(
         )
     owner_dir = _scoped_checkpoint_owner_dir(user_id, is_admin=is_admin)
     path_part = _strip_tinker_checkpoint_kind(raw_path_part)
+
+    cached = _prefer_cached_checkpoint_view(
+        path_part,
+        checkpoint_type=checkpoint_type,
+        owner_dir=owner_dir,
+        is_admin=is_admin,
+    )
+    if cached is not None:
+        return cached
 
     for candidate in _deterministic_checkpoint_candidates(roots, owner_dir=owner_dir, path_part=path_part):
         resolved = _existing_checkpoint_view(candidate, checkpoint_type=checkpoint_type)
@@ -1040,8 +1157,11 @@ def process_pending_checkpoint_mirrors(*, max_items: int | None = None) -> dict[
 def materialize_persistent_checkpoint(path: str) -> str:
     if not os.path.isdir(path):
         return path
-    persistent_root = os.path.realpath(get_persistent_checkpoints_dir())
     path_real = os.path.realpath(path)
+    runtime_root = os.path.realpath(get_runtime_checkpoints_dir())
+    if path_real == runtime_root or path_real.startswith(runtime_root + os.sep):
+        return path
+    persistent_root = os.path.realpath(get_persistent_checkpoints_dir())
     if not (path_real == persistent_root or path_real.startswith(persistent_root + os.sep)):
         return path
 

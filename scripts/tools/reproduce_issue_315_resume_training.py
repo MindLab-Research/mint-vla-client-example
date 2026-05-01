@@ -15,6 +15,7 @@ import requests
 
 BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000").rstrip("/")
 API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
+OWNER_ID = os.environ.get("TINKER_OWNER_ID") or os.environ.get("TINKER_USER_ID", "issue_315_user")
 BASE_MODEL = os.environ.get("TINKER_MODEL", "Qwen/Qwen3-0.6B")
 LORA_RANK = int(os.environ.get("TINKER_LORA_RANK", "8"))
 LEARNING_RATE = float(os.environ.get("TINKER_LEARNING_RATE", "1e-4"))
@@ -197,7 +198,7 @@ def _load_state(model_id: str, checkpoint_path: str, *, optimizer: bool = True, 
     loaded = _await_maybe_async(
         _post_json(
             "/api/v1/load_state",
-            {"model_id": model_id, "path": checkpoint_path, "optimizer": optimizer},
+            {"model_id": model_id, "path": checkpoint_path, "optimizer": optimizer, "owner_id": OWNER_ID},
             timeout_s=60.0,
         ),
         timeout_s=RESUME_TIMEOUT_S,
@@ -222,6 +223,7 @@ def _resume_from_state(
         "state_path": state_path,
         "lora_config": {"rank": LORA_RANK},
         "load_optimizer": bool(load_optimizer),
+        "owner_id": OWNER_ID,
         "user_metadata": {"issue": 315, "script": "reproduce_issue_315_resume_training.py"},
     }
 

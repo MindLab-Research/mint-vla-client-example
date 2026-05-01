@@ -586,6 +586,14 @@ class OpenPISharedRayRuntimeClient:
             self._bootstrap_session_pending = False
         if op == "shutdown":
             await _pool_call("set_session", self._actor_name, None)
+            if not list(result.get("known_session_ids") or []):
+                _drop_shared_actor_entry(self._actor_name, actor=self._actor)
+                cleanup_errors = await _cleanup_failed_shared_actor_start(
+                    actor_name=self._actor_name,
+                    actor=self._actor,
+                )
+                for note in cleanup_errors:
+                    logger.warning("%s", note)
         else:
             await _pool_call("set_session", self._actor_name, self._session_id)
         await _pool_call("touch", self._actor_name)

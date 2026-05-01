@@ -14,6 +14,7 @@ Endpoints:
 - GET /models: List training models
 - GET /models/{model_id}: Get model info
 - GET /models/{model_id}/tokenizer: Get tokenizer config
+- GET /models/{model_id}/session_guard_state: Get contamination/block guard state
 - DELETE /models/{model_id}: Delete a model
 """
 
@@ -26,6 +27,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import time
 import uuid
 from datetime import datetime, timezone
@@ -69,7 +71,9 @@ from ..checkpoints import (
     checkpoint_has_optimizer_state,
     async_create_checkpoint_archive,
     ensure_checkpoint_path_allowed,
+    get_ephemeral_checkpoints_dir,
     get_persistent_cache_dir,
+    get_persistent_checkpoints_dir,
     materialize_persistent_checkpoint,
     resolve_checkpoint_path,
     validate_sampler_checkpoint_for_sampling,
@@ -101,7 +105,7 @@ from ..models.types import (
     TrainStepRequest,
     UntypedAPIFuture,
 )
-from ..usage_store import UsageEvent, get_usage_store
+from ..usage_store import UsageEvent, schedule_usage_events
 from ..webhook import EventType, send_task_event
 
 if TYPE_CHECKING:
@@ -194,6 +198,25 @@ def _build_training_usage_label(*, model: str, route: str) -> str:
     return f"model={model},route={route},dimension=train"
 
 
+def _cleanup_generated_checkpoint_dir(path: str | None) -> None:
+    if not path:
+        return
+    try:
+        real = os.path.realpath(path)
+    except Exception:
+        return
+    managed_roots = [
+        os.path.realpath(get_ephemeral_checkpoints_dir()),
+        os.path.realpath(get_persistent_cache_dir()),
+        os.path.realpath(get_persistent_checkpoints_dir()),
+    ]
+    if not any(real == root or real.startswith(root + os.sep) for root in managed_roots):
+        logger.warning("Refusing to cleanup checkpoint outside managed roots: %s", path)
+        return
+    if os.path.isdir(real):
+        shutil.rmtree(real, ignore_errors=True)
+
+
 def _training_heartbeat_stale_timeout_s() -> float:
     raw = os.environ.get("MINT_TRAINING_HEARTBEAT_STALE_S", "300")
     try:
@@ -204,8 +227,7 @@ def _training_heartbeat_stale_timeout_s() -> float:
 
 
 async def _persist_usage_events(*, events: list[UsageEvent]) -> None:
-    usage_store = await get_usage_store()
-    await usage_store.write_events(events)
+    schedule_usage_events(events)
 
 
 async def _enqueue_training_request_with_trace(
@@ -1847,7 +1869,7 @@ async def _do_create_model(
             type="create_model",
             backend=planned_backend,
         )
-        future_store.resolve(request_id, response.model_dump())
+        await future_store.async_resolve(request_id, response.model_dump())
 
         if webhook_url and user_id:
             send_task_event(
@@ -2241,7 +2263,7 @@ async def _do_create_model_from_state(
             _build_training_session_store_payload(
                 session=session,
                 user_id=user_id,
-                lora_config=request.lora_config,
+                lora_config=session.lora_config,
                 rollout_correction_config=rollout_correction_config,
                 user_metadata=request.user_metadata,
                 actor_name=actor_name,
@@ -2273,7 +2295,7 @@ async def _do_create_model_from_state(
             model_id=model_id,
             type="create_model_from_state",
         )
-        future_store.resolve(request_id, response.model_dump())
+        await future_store.async_resolve(request_id, response.model_dump())
 
     except Exception as e:
         logger.exception(
@@ -2529,6 +2551,7 @@ async def _do_forward_backward(
         logger.info(
             f"[{session.model_id}] forward_backward done: elapsed_s={elapsed_s:.3f}"
         )
+        await future_store.async_resolve(request_id, result)
         if gateway_auth:
             auth_ctx = GatewayAuthContext(**gateway_auth)
             await _persist_usage_events(
@@ -2546,8 +2569,9 @@ async def _do_forward_backward(
                     )
                 ]
             )
-        future_store.resolve(request_id, result)
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.exception(
             "[forward_backward] failed request_id=%s model_id=%s failure_reason=%s error_type=%s next_action=%s",
@@ -2765,6 +2789,7 @@ async def _do_train_step(
         elapsed_s = time.time() - t0
         msg = f"[{session.model_id}] train_step done request_id={request_id} elapsed_s={elapsed_s:.3f}"
         logger.info(msg)
+        await future_store.async_resolve(request_id, result)
         if gateway_auth:
             auth_ctx = GatewayAuthContext(**gateway_auth)
             await _persist_usage_events(
@@ -2782,8 +2807,9 @@ async def _do_train_step(
                     )
                 ]
             )
-        future_store.resolve(request_id, result)
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.exception(
             "[train_step] failed request_id=%s model_id=%s failure_reason=%s error_type=%s next_action=%s",
@@ -3000,6 +3026,7 @@ async def _do_forward(
         )
         elapsed_s = time.time() - t0
         logger.info(f"[{session.model_id}] forward done: elapsed_s={elapsed_s:.3f}")
+        await future_store.async_resolve(request_id, result)
         if gateway_auth:
             auth_ctx = GatewayAuthContext(**gateway_auth)
             await _persist_usage_events(
@@ -3017,8 +3044,9 @@ async def _do_forward(
                     )
                 ]
             )
-        future_store.resolve(request_id, result)
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.exception(
             "[forward] failed request_id=%s model_id=%s failure_reason=%s error_type=%s next_action=%s",
@@ -3225,7 +3253,7 @@ async def _do_optim_step(request_id: str, request: OptimStepRequest, user_id: st
         elapsed_s = time.time() - t0
         msg = f"[{session.model_id}] optim_step done request_id={request_id} elapsed_s={elapsed_s:.3f}"
         logger.info(msg)
-        future_store.resolve(request_id, result)
+        await future_store.async_resolve(request_id, result)
 
     except Exception as e:
         logger.exception(
@@ -3348,7 +3376,7 @@ async def _do_reset_expert_bias(
 
         result = await training_engine.reset_expert_bias(session)
         modules_reset = int(result.get("modules_reset", 0) or 0)
-        future_store.resolve(
+        await future_store.async_resolve(
             request_id,
             ResetExpertBiasResponse(
                 model_id=request.model_id,
@@ -3540,6 +3568,9 @@ async def _do_save_weights_for_sampler(
     inflight_marked = False
     claimed_ckpt_id: str | None = None
     mirror_started = False
+    save_path: str | None = None
+    persistent_path: str | None = None
+    sampling_session_id: str | None = None
     try:
         set_request_id(request_id)
         engine = training_engine
@@ -3881,15 +3912,32 @@ async def _do_save_weights_for_sampler(
                 sampling_session_id=sampling_session_id,
             ).model_dump()
 
-        async_resolve = getattr(future_store, "async_resolve", None)
-        if callable(async_resolve):
-            await async_resolve(request_id, response)
-        else:
-            future_store.resolve(request_id, response)
+        await future_store.async_resolve(request_id, response)
 
     except Exception as e:
         if not mirror_started:
             await _mark_checkpoint_failed_safe(claimed_ckpt_id, fail_reason="upload_error")
+        if sampling_session_id is not None and inference_manager is not None:
+            try:
+                await inference_manager.end_session(sampling_session_id)
+            except Exception as cleanup_error:
+                logger.warning(
+                    "[save_weights_for_sampler] failed to cleanup sampling session %s: %s: %s",
+                    sampling_session_id,
+                    type(cleanup_error).__name__,
+                    cleanup_error,
+                )
+        if not mirror_started:
+            for candidate in (persistent_path, save_path):
+                try:
+                    _cleanup_generated_checkpoint_dir(candidate)
+                except Exception as cleanup_error:
+                    logger.warning(
+                        "[save_weights_for_sampler] failed to cleanup checkpoint path %s: %s: %s",
+                        candidate,
+                        type(cleanup_error).__name__,
+                        cleanup_error,
+                    )
         logger.exception(
             "[save_weights_for_sampler] failed request_id=%s model_id=%s failure_reason=%s error_type=%s next_action=%s",
             str(request_id),
@@ -4032,6 +4080,35 @@ async def get_model_info(model_id: str):
         "user_id": info.get("user_id"),
         "last_activity": info.get("last_activity"),
         "idle_for_s": max(0.0, time.time() - float(info.get("last_activity") or 0.0)) if info.get("last_activity") is not None else None,
+    }
+
+
+@router.get("/models/{model_id}/session_guard_state")
+async def get_session_guard_state(model_id: str):
+    """Get megatron contamination/block guard state for one training model."""
+    if training_manager is None or training_engine is None:
+        raise HTTPException(status_code=503, detail="Training manager not initialized")
+
+    session = training_manager.get_session(model_id)
+    if session is None:
+        session = await _restore_training_session(model_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
+
+    try:
+        guard_state = await training_engine.get_session_guard_state(session)
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Failed to query session guard state: "
+                f"{type(e).__name__}: {e}"
+            ),
+        )
+    return {
+        "model_id": model_id,
+        "backend": session.backend,
+        "guard_state": guard_state,
     }
 
 
@@ -4189,7 +4266,7 @@ async def _do_delete_model(request_id: str, model_id: str) -> None:
         except Exception:
             pass
 
-        future_store.resolve(request_id, {"model_id": model_id, "status": "deleted"})
+        await future_store.async_resolve(request_id, {"model_id": model_id, "status": "deleted"})
     except Exception as e:
         logger.exception(
             "[training.delete_model] failed request_id=%s model_id=%s error_type=%s error=%s",

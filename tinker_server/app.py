@@ -250,6 +250,11 @@ async def lifespan(app: FastAPI):
 
     owner_runtime_local_only = os.environ.get("MINT_OWNER_RUNTIME_SUPERVISOR_LOCAL_ONLY", "").strip().lower() in {"1", "true", "yes", "on"}
 
+    from .usage_store import get_usage_store
+
+    usage_store = await get_usage_store()
+    if not await usage_store.health_check():
+        raise RuntimeError("usage billing postgres health check failed")
     if startup_owner:
         await future_store.async_ensure_started()
         ensure_gateway_session_store_ready()
@@ -372,9 +377,7 @@ async def lifespan(app: FastAPI):
         # ==========================================================================
         if startup_owner:
             if owner_runtime_local_only:
-                from .backend.actor_reconciliation import cleanup_stale_actors_once
-
-                await asyncio.to_thread(cleanup_stale_actors_once)
+                await _cleanup_stale_actors()
             else:
                 await owner_runtime_supervisor.async_run_once("actor_reconciliation", timeout_s=60.0)
         else:
@@ -921,9 +924,27 @@ async def api_key_auth_middleware(request: Request, call_next):
             ):
                 return await _next_with_trace()
 
-        # Legacy auth disabled => dev mode pass-through.
+        # Legacy auth disabled => dev mode pass-through with explicit write caps.
         if not config.auth_enabled:
-            with bind_request_trace_context(trace_id=trace_id):
+            request.state.user_data = {
+                "user_id": "000000000000000000000001",
+                "user_role": "admin",
+                "is_admin": True,
+                "account_id": "000000000000000000000001",
+                "apikey_id": "000000000000000000000002",
+                "cap_write": True,
+                "cap_view_internal_errors": True,
+                "cap_bypass_ownership": True,
+                "cap_manage_system": True,
+                "caps_from_headers": True,
+            }
+            with bind_request_trace_context(
+                trace_id=trace_id,
+                user_id="000000000000000000000001",
+                user_role="admin",
+                account_id="000000000000000000000001",
+                apikey_id="000000000000000000000002",
+            ):
                 return await _next_with_trace()
 
         api_key = request.headers.get("X-API-Key", "")

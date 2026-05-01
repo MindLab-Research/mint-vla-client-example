@@ -68,6 +68,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "matplotlib>=3.10.7",
     "pytest>=7.0.0",
     "trio>=0.33.0",
 ]
@@ -91,6 +92,7 @@ host-runtime = [
     "torch==2.9.1+cpu",
 ]
 dev = [
+    "matplotlib>=3.10.7",
     "trio>=0.33.0",
 ]
 
@@ -113,6 +115,7 @@ host_requirements = [
     "optax==0.2.4",
     "orbax-checkpoint==0.11.13",
     "pytest>=7.0.0",
+    "torchvision==0.24.1+cpu",
     "tqdm-loggable>=0.2",
     "tyro>=0.9.5",
 ]

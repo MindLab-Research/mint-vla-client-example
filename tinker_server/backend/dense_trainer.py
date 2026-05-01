@@ -2,7 +2,7 @@
 
 This module replaces the previous DenseTrainerPool tracking dictionary with:
 - deterministic actor naming
-- a small inflight-creation guard (per base_model)
+- a small inflight-creation guard keyed by Ray actor identity
 - ResourcePool registration for lifecycle and eviction
 """
 
@@ -13,9 +13,13 @@ import threading
 import logging
 import json
 import re
+import time
 from dataclasses import dataclass
+from typing import Any
 
 import ray
+from ray.exceptions import GetTimeoutError, RayActorError
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from . import ray_kill
 from .ray_placement_groups import PlacementGroupMismatchError, get_named_placement_group
@@ -33,6 +37,13 @@ PFS_PYTHONPATH_DENSE = PFS_PYTHONPATH
 DEFAULT_MAX_LORA_RANK = 64
 DEFAULT_NUM_GPUS = 1
 
+DENSE_POISONED_KEY = "poisoned"
+DENSE_POISON_REASON_KEY = "poison_reason"
+DENSE_POISONED_AT_KEY = "poisoned_at"
+DENSE_POISONED_SESSION_KEY = "poisoned_session_id"
+DENSE_LAST_FATAL_OP_KEY = "last_fatal_op"
+DENSE_LAST_FATAL_REQUEST_ID_KEY = "last_fatal_request_id"
+
 _lock = threading.Lock()
 _inflight: dict[str, threading.Event] = {}
 _inflight_errors: dict[str, str] = {}
@@ -40,7 +51,7 @@ _inflight_errors: dict[str, str] = {}
 
 @dataclass(frozen=True)
 class DenseTrainerHandle:
-    actor: ray.actor.ActorHandle
+    actor: Any
     actor_name: str
     base_model: str
     max_lora_rank: int
@@ -78,6 +89,61 @@ def _pg_name(actor_name: str) -> str:
     return f"{actor_name}_{_sanitize_pg_component(PERSISTENT_DENSE_NAMESPACE)}_pg"
 
 
+def _base_dense_metadata(*, actual_rank: int, max_lora_rank: int, model_key: str | None) -> dict[str, object]:
+    return {
+        "max_lora_rank": int(max_lora_rank),
+        "actual_rank": int(actual_rank),
+        "model_key": model_key,
+        DENSE_POISONED_KEY: False,
+        DENSE_POISON_REASON_KEY: None,
+        DENSE_POISONED_AT_KEY: None,
+        DENSE_POISONED_SESSION_KEY: None,
+        DENSE_LAST_FATAL_OP_KEY: None,
+        DENSE_LAST_FATAL_REQUEST_ID_KEY: None,
+    }
+
+
+def _poison_metadata(
+    metadata: dict[str, object] | None,
+    *,
+    reason: str,
+    session_id: str | None,
+    fatal_op: str | None = None,
+    request_id: str | None = None,
+) -> dict[str, object]:
+    poisoned = dict(metadata or {})
+    already_poisoned = bool(poisoned.get(DENSE_POISONED_KEY))
+
+    poisoned[DENSE_POISONED_KEY] = True
+    if not already_poisoned or poisoned.get(DENSE_POISON_REASON_KEY) is None:
+        poisoned[DENSE_POISON_REASON_KEY] = str(reason)
+    if not already_poisoned or poisoned.get(DENSE_POISONED_AT_KEY) is None:
+        poisoned[DENSE_POISONED_AT_KEY] = time.time()
+    if not already_poisoned or poisoned.get(DENSE_POISONED_SESSION_KEY) is None:
+        poisoned[DENSE_POISONED_SESSION_KEY] = session_id
+    if not already_poisoned or poisoned.get(DENSE_LAST_FATAL_OP_KEY) is None:
+        poisoned[DENSE_LAST_FATAL_OP_KEY] = None if fatal_op is None else str(fatal_op)
+    if not already_poisoned or poisoned.get(DENSE_LAST_FATAL_REQUEST_ID_KEY) is None:
+        poisoned[DENSE_LAST_FATAL_REQUEST_ID_KEY] = None if request_id is None else str(request_id)
+    return poisoned
+
+
+def _dense_reuse_block_reason_from_metadata(metadata: dict | None) -> str | None:
+    if not isinstance(metadata, dict):
+        return None
+    if not bool(metadata.get(DENSE_POISONED_KEY)):
+        return None
+    reason = str(metadata.get(DENSE_POISON_REASON_KEY) or "dense_actor_poisoned")
+    return reason
+
+
+def dense_trainer_reuse_block_reason(actor_name: str) -> str | None:
+    entry = get_resource_pool().get(actor_name)
+    if entry is None:
+        return None
+    return _dense_reuse_block_reason_from_metadata(entry.metadata)
+
+
 def _preferred_worker_node_ip_for_model(model_key: str | None, base_model: str) -> str | None:
     raw = os.environ.get("MINT_DENSE_MODEL_NODE_IPS_JSON", "").strip()
     source = "MINT_DENSE_MODEL_NODE_IPS_JSON"
@@ -96,7 +162,7 @@ def _preferred_worker_node_ip_for_model(model_key: str | None, base_model: str) 
         return None
 
     candidates = None
-    lookup_keys = []
+    lookup_keys: list[str] = []
     for key in (model_key, base_model):
         if not key:
             continue
@@ -113,10 +179,10 @@ def _preferred_worker_node_ip_for_model(model_key: str | None, base_model: str) 
     return ip or None
 
 
-def _get_or_create_pg(actor_name: str, *, model_key: str | None, base_model: str) -> ray.util.placement_group.PlacementGroup:
+def _get_or_create_pg(actor_name: str, *, model_key: str | None, base_model: str) -> Any:
     """Ensure a detached 1-GPU placement group exists for this actor."""
     pg_name = _pg_name(actor_name)
-    bundle = {"GPU": 1, "CPU": 1}
+    bundle: dict[str, float] = {"GPU": 1.0, "CPU": 1.0}
     preferred_ip = _preferred_worker_node_ip_for_model(model_key, base_model)
     if preferred_ip:
         bundle[f"node:{preferred_ip}"] = 0.001
@@ -169,6 +235,163 @@ def clear_dense_trainer_session(session_id: str) -> int:
     return get_resource_pool().clear_session(session_id, actor_type=ActorType.DENSE)
 
 
+def retire_dense_trainer(
+    *,
+    actor_name: str,
+    reason: str,
+    base_model: str,
+    session_id: str | None = None,
+    fatal_op: str | None = None,
+    request_id: str | None = None,
+    namespace: str = PERSISTENT_DENSE_NAMESPACE,
+    actor: Any | None = None,
+) -> str:
+    """Poison a dense trainer so it cannot be reused after fatal GPU failures."""
+    from .runtime_observability import runtime_observability
+
+    pool = get_resource_pool()
+    entry = pool.get(actor_name)
+    retire_error: str | None = None
+    auxiliary_failures: list[str] = []
+
+    if entry is not None:
+        try:
+            pool.update_metadata(
+                actor_name,
+                metadata=_poison_metadata(
+                    entry.metadata,
+                    reason=reason,
+                    session_id=session_id,
+                    fatal_op=fatal_op,
+                    request_id=request_id,
+                ),
+                sample_source="dense_retire",
+            )
+        except Exception:
+            auxiliary_failures.append("metadata_update_failed")
+            logger.warning(
+                "[dense_trainer] failed to persist poison metadata actor_name=%s reason=%s",
+                actor_name,
+                reason,
+                exc_info=True,
+            )
+    if session_id is not None:
+        try:
+            pool.clear_session(session_id, actor_type=ActorType.DENSE)
+        except Exception:
+            auxiliary_failures.append("clear_session_failed")
+            logger.warning(
+                "[dense_trainer] failed clear_session actor_name=%s session_id=%s",
+                actor_name,
+                session_id,
+                exc_info=True,
+            )
+    try:
+        pool.set_session(actor_name, None)
+    except Exception:
+        auxiliary_failures.append("clear_binding_failed")
+        logger.warning(
+            "[dense_trainer] failed to clear bound session actor_name=%s",
+            actor_name,
+            exc_info=True,
+        )
+
+    actor_absent = False
+    if actor is None:
+        try:
+            actor = ray.get_actor(actor_name, namespace=namespace)
+        except ValueError:
+            actor_absent = True
+        except Exception:
+            retire_error = "actor_lookup_failed"
+            logger.warning(
+                "[dense_trainer] failed actor lookup during retire actor_name=%s reason=%s",
+                actor_name,
+                reason,
+                exc_info=True,
+            )
+
+    if actor is not None:
+        try:
+            shutdown = getattr(actor, "shutdown", None)
+            if shutdown is not None:
+                try:
+                    ray.get(shutdown.remote(), timeout=30)
+                except Exception:
+                    pass
+            ray_kill.kill(
+                actor,
+                reason="dense_trainer_retire",
+                actor_name=actor_name,
+                namespace=namespace,
+                no_restart=True,
+                verify_absent=True,
+                base_model=base_model,
+                session_id=session_id,
+                retire_reason=reason,
+            )
+            actor_absent = True
+        except Exception:
+            retire_error = "kill_failed"
+            logger.warning(
+                "[dense_trainer] failed retire actor_name=%s reason=%s",
+                actor_name,
+                reason,
+                exc_info=True,
+            )
+
+    _remove_pg(actor_name)
+
+    if actor_absent:
+        try:
+            pool.unregister(actor_name)
+        except Exception:
+            auxiliary_failures.append("unregister_failed")
+            logger.warning(
+                "[dense_trainer] failed unregister after retire actor_name=%s reason=%s",
+                actor_name,
+                reason,
+                exc_info=True,
+            )
+    elif retire_error is None:
+        retire_error = "actor_still_present"
+
+    retire_outcome = retire_error or "ok"
+    incident_context: dict[str, object] = {"outcome": retire_outcome}
+    if auxiliary_failures:
+        incident_context["auxiliary_failures"] = list(auxiliary_failures)
+
+    runtime_observability.record_dense_actor_retire(base_model=base_model, outcome=retire_outcome)
+    runtime_observability.record_training_incident(
+        kind="dense_actor_retire",
+        base_model=base_model,
+        backend="peft",
+        op=str(fatal_op or "retire"),
+        status="ok" if retire_outcome == "ok" else "error",
+        failure_class="none" if retire_outcome == "ok" else retire_outcome,
+        actor_name=actor_name,
+        request_id=None if request_id is None else str(request_id),
+        session_id=None if session_id is None else str(session_id),
+        detail=str(reason),
+        context=incident_context,
+    )
+    for auxiliary_failure in auxiliary_failures:
+        runtime_observability.record_training_incident(
+            kind="dense_actor_retire_auxiliary_failure",
+            base_model=base_model,
+            backend="peft",
+            op=str(fatal_op or "retire"),
+            status="error",
+            failure_class=auxiliary_failure,
+            actor_name=actor_name,
+            request_id=None if request_id is None else str(request_id),
+            session_id=None if session_id is None else str(session_id),
+            detail=str(reason),
+            context={"retire_outcome": retire_outcome},
+        )
+    return retire_outcome
+
+
 def get_or_create_dense_trainer(
     *,
     training_worker_cls,
@@ -186,7 +409,10 @@ def get_or_create_dense_trainer(
       - actual_rank (current session rank)
     """
     wait_timeout_s = float(os.environ.get("MINT_DENSE_INFLIGHT_WAIT_S", "1800"))
-    key = base_model
+    effective_max_rank = max(int(lora_rank), int(max_lora_rank or 0), int(DEFAULT_MAX_LORA_RANK))
+    name_key = model_key or base_model
+    actor_name = _make_actor_name(model_key=name_key, max_rank=effective_max_rank)
+    key = actor_name
 
     while True:
         with _lock:
@@ -201,7 +427,10 @@ def get_or_create_dense_trainer(
 
         if not creator:
             if not inflight.wait(timeout=wait_timeout_s):
-                raise TimeoutError(f"dense_trainer inflight create timed out after {wait_timeout_s}s base_model={base_model}")
+                raise TimeoutError(
+                    f"dense_trainer inflight create timed out after {wait_timeout_s}s "
+                    f"actor_name={actor_name} base_model={base_model}"
+                )
             with _lock:
                 err = _inflight_errors.get(key)
             if err:
@@ -209,38 +438,67 @@ def get_or_create_dense_trainer(
             continue
 
         try:
-            effective_max_rank = max(int(lora_rank), int(max_lora_rank or 0), int(DEFAULT_MAX_LORA_RANK))
-            name_key = model_key or base_model
-            actor_name = _make_actor_name(model_key=name_key, max_rank=effective_max_rank)
+            bind_decision = "create"
 
             pool = get_resource_pool()
             from .model_registry import is_persistent_model
+            from .runtime_observability import runtime_observability
 
             is_persistent = is_persistent_model(base_model)
 
+            reuse_block_reason = dense_trainer_reuse_block_reason(actor_name)
+
             try:
                 actor = ray.get_actor(actor_name, namespace=PERSISTENT_DENSE_NAMESPACE)
-                # Heartbeat: if busy, we still treat as alive.
-                try:
-                    ray.get(actor.heartbeat.remote(), timeout=5)
-                except ray.exceptions.RayActorError:
-                    raise
-                except ray.exceptions.GetTimeoutError:
-                    pass
-            except ray.exceptions.RayActorError:
-                # Dead actor name: best-effort kill to free name, then recreate.
+                if reuse_block_reason is not None:
+                    bind_decision = "recreate_poisoned"
+                    retire_outcome = retire_dense_trainer(
+                        actor_name=actor_name,
+                        actor=actor,
+                        reason=f"reuse_blocked:{reuse_block_reason}",
+                        base_model=base_model,
+                        session_id=session_id,
+                    )
+                    if retire_outcome != "ok":
+                        raise RuntimeError(
+                            f"dense_trainer retire failed before recreate "
+                            f"actor_name={actor_name} outcome={retire_outcome}"
+                        )
+                    actor = None
+                if actor is not None:
+                    bind_decision = "reuse"
+                    # Heartbeat: if busy, we still treat as alive.
+                    try:
+                        ray.get(actor.heartbeat.remote(), timeout=5)
+                    except RayActorError:
+                        raise
+                    except GetTimeoutError:
+                        pass
+            except RayActorError:
+                # Dead actor name: prove the Ray name is absent or kill the remaining named actor before recreate.
                 try:
                     actor = ray.get_actor(actor_name, namespace=PERSISTENT_DENSE_NAMESPACE)
-                    ray_kill.kill(
-                        actor,
-                        reason="dense_trainer_dead",
-                        actor_name=actor_name,
-                        namespace=PERSISTENT_DENSE_NAMESPACE,
-                        no_restart=True,
-                        base_model=base_model,
-                    )
-                except Exception:
-                    pass
+                except ValueError:
+                    actor = None
+                except Exception as e:
+                    raise RuntimeError(
+                        f"dense_trainer dead actor lookup failed before recreate actor_name={actor_name}"
+                    ) from e
+                if actor is not None:
+                    try:
+                        ray_kill.kill(
+                            actor,
+                            reason="dense_trainer_dead",
+                            actor_name=actor_name,
+                            namespace=PERSISTENT_DENSE_NAMESPACE,
+                            no_restart=True,
+                            verify_absent=True,
+                            base_model=base_model,
+                        )
+                    except Exception as e:
+                        raise RuntimeError(
+                            f"dense_trainer dead actor cleanup failed before recreate actor_name={actor_name}"
+                        ) from e
                 _remove_pg(actor_name)
                 actor = None
             except ValueError:
@@ -248,7 +506,7 @@ def get_or_create_dense_trainer(
 
             if actor is None:
                 pool.ensure_gpus_available(DEFAULT_NUM_GPUS)
-                from ..config import actor_runtime_env_vars, config as server_config, otel_env_vars
+                from ..config import actor_runtime_env_vars, otel_env_vars
                 runtime_env = {
                     "env_vars": actor_runtime_env_vars(
                         pythonpath=PFS_PYTHONPATH_DENSE,
@@ -268,7 +526,7 @@ def get_or_create_dense_trainer(
                     namespace=PERSISTENT_DENSE_NAMESPACE,
                     lifetime="detached",
                     num_gpus=1,
-                    scheduling_strategy=ray.util.scheduling_strategies.PlacementGroupSchedulingStrategy(
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
                         placement_group=pg,
                         placement_group_bundle_index=0,
                     ),
@@ -282,7 +540,7 @@ def get_or_create_dense_trainer(
                 init_timeout_s = float(os.environ.get("MINT_DENSE_ACTOR_INIT_TIMEOUT_S", "600"))
                 try:
                     ray.get(actor.__ray_ready__.remote(), timeout=init_timeout_s)
-                except ray.exceptions.GetTimeoutError:
+                except GetTimeoutError:
                     try:
                         ray_kill.kill(
                             actor,
@@ -308,14 +566,29 @@ def get_or_create_dense_trainer(
                 session_id=session_id,
                 protected=is_persistent,
                 metadata={
-                    "max_lora_rank": effective_max_rank,
-                    "actual_rank": int(lora_rank),
-                    "model_key": name_key,
+                    **_base_dense_metadata(
+                        actual_rank=int(lora_rank),
+                        max_lora_rank=effective_max_rank,
+                        model_key=name_key,
+                    ),
                     **dict(actor_observability_metadata(actor) or {}),
                 },
             )
             pool.mark_ready(actor_name)
             entry.current_session = session_id
+            runtime_observability.record_dense_actor_bind_decision(base_model=base_model, decision=bind_decision)
+            runtime_observability.record_training_incident(
+                kind="dense_actor_bind_decision",
+                base_model=base_model,
+                backend="peft",
+                op="bind",
+                status="ok",
+                failure_class="none",
+                actor_name=actor_name,
+                session_id=None if session_id is None else str(session_id),
+                detail=bind_decision,
+                context={"protected": bool(is_persistent)},
+            )
 
             return DenseTrainerHandle(
                 actor=actor,

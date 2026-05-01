@@ -12,10 +12,12 @@ import uuid
 from typing import Any
 
 from ..config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources, otel_env_vars
+from ..ray_utils import register_ray_reconnect_invalidator as _register_ray_reconnect_invalidator
 from ..server_info import _git_sha
 
 logger = logging.getLogger(__name__)
 CURRENT_CODE_IDENTITY = os.environ.get("MINT_GIT_SHA") or _git_sha()
+RUNTIME_CONTRACT_DIGEST_ENV = "MINT_QUEUE_SUPERVISOR_RUNTIME_CONTRACT_DIGEST"
 _ACTOR_HANDLE = None
 
 
@@ -33,11 +35,12 @@ def _runtime_contract_digest() -> str:
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
+
 def _reset_cached_actor_handle() -> None:
     global _ACTOR_HANDLE
     _ACTOR_HANDLE = None
 
-from ..ray_utils import register_ray_reconnect_invalidator as _register_ray_reconnect_invalidator
+
 _register_ray_reconnect_invalidator(_reset_cached_actor_handle)
 _PROCESS_INSTANCE_ID = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex}"
 
@@ -131,7 +134,7 @@ def _get_or_create_actor():
 
             init_actor_observability()
             self._code_identity = CURRENT_CODE_IDENTITY
-            self._runtime_contract_digest = _runtime_contract_digest()
+            self._runtime_contract_digest = os.environ.get(RUNTIME_CONTRACT_DIGEST_ENV) or _runtime_contract_digest()
             self._generation_id = 0
             self._owner_id: str | None = None
             self._expires_at = 0.0
@@ -226,7 +229,11 @@ def _get_or_create_actor():
         "lifetime": "detached",
     }
     apply_detached_actor_resources(options, ray)
-    options["runtime_env"] = actor_runtime_env(pythonpath=PFS_PYTHONPATH, extra=otel_env_vars())
+    extra_env = otel_env_vars()
+    if CURRENT_CODE_IDENTITY:
+        extra_env["MINT_GIT_SHA"] = str(CURRENT_CODE_IDENTITY)
+    extra_env[RUNTIME_CONTRACT_DIGEST_ENV] = _runtime_contract_digest()
+    options["runtime_env"] = actor_runtime_env(pythonpath=PFS_PYTHONPATH, extra=extra_env)
 
     try:
         created = _QueueSupervisorActor.options(**options).remote()
@@ -365,8 +372,6 @@ class QueueSupervisor:
         return out
 
     def is_generation_current(self, *, generation_id: int, timeout_s: float = 10.0) -> bool:
-        import ray
-
         actor = self._get_ray_actor()
         return bool(
             _await_ray_ref_sync(
@@ -376,8 +381,6 @@ class QueueSupervisor:
         )
 
     def snapshot(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
-        import ray
-
         actor = self._get_ray_actor()
         out = _await_ray_ref_sync(actor.snapshot.remote(), timeout_s=float(timeout_s))
         if not isinstance(out, dict):

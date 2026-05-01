@@ -33,6 +33,7 @@ from .work_classification import infer_scheduler_capacity_owner
 
 logger = logging.getLogger(__name__)
 CURRENT_CODE_IDENTITY = os.environ.get("MINT_GIT_SHA") or _git_sha()
+RUNTIME_CONTRACT_DIGEST_ENV = "MINT_API_WORK_QUEUE_RUNTIME_CONTRACT_DIGEST"
 
 
 def _api_work_queue_runtime_contract_payload() -> dict[str, Any]:
@@ -254,7 +255,9 @@ def _create_ray_actor(*, require_ready: bool = True):
                     max_restarts,
                 )
                 self._code_identity = CURRENT_CODE_IDENTITY
-                self._runtime_contract_digest = _api_work_queue_runtime_contract_digest()
+                self._runtime_contract_digest = os.environ.get(
+                    RUNTIME_CONTRACT_DIGEST_ENV
+                ) or _api_work_queue_runtime_contract_digest()
                 self._items = deque()
                 self._cv = asyncio.Condition()
                 self._enqueued = 0
@@ -1654,6 +1657,9 @@ def _create_ray_actor(*, require_ready: bool = True):
         "max_task_retries": -1,
     }
     actor_otel_env = otel_env_vars()
+    if CURRENT_CODE_IDENTITY:
+        actor_otel_env["MINT_GIT_SHA"] = str(CURRENT_CODE_IDENTITY)
+    actor_otel_env[RUNTIME_CONTRACT_DIGEST_ENV] = _api_work_queue_runtime_contract_digest()
     actor_otel_env.setdefault("MINT_API_WORK_QUEUE_DEBUG_LOG_PATH", _api_work_queue_debug_log_path())
     from ..config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources
     if resources is not None:
@@ -1800,7 +1806,6 @@ class ApiWorkQueueClient:
             return actor
         self._reset_ray_actor()
         _kill_ray_actor(actor, reason="api_work_queue_runtime_contract_mismatch")
-        import ray
 
         fresh = _create_ray_actor(require_ready=True)
         refreshed = _await_ray_ref_sync(fresh.stats.remote(), timeout_s=5.0)
@@ -2053,8 +2058,6 @@ class ApiWorkQueueClient:
 
         actor = self._get_ray_actor()
         try:
-            import ray
-
             payload = _await_ray_ref_sync(actor.metrics_seed_snapshot.remote(), timeout_s=float(timeout_s))
         except Exception as e:
             logger.warning(

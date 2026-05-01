@@ -139,7 +139,9 @@ MODEL_CONFIGS = {
         camera_layout=("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"),
         action_dim=7,
         action_horizon=10,
-        action_token_budget=21,
+        # Leave headroom so FAST action decoding can emit the full action suffix,
+        # terminator, and EOS without truncating at the Mint-side cap.
+        action_token_budget=64,
     ),
     "openpi/pi05-libero-low-mem-finetune": ModelConfig(
         num_parameters=3.0,

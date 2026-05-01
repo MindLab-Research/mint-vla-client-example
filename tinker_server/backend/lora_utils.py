@@ -16,6 +16,115 @@ from safetensors import safe_open
 _LORA_WEIGHT_RE = re.compile(r"^(?P<module>.+)\.(?P<kind>lora_A|lora_B)\.weight$")
 
 
+def _validate_rank_pair(actual_rank: int, trainer_rank: int) -> tuple[int, int]:
+    actual_rank = int(actual_rank)
+    trainer_rank = int(trainer_rank)
+    if actual_rank <= 0:
+        raise ValueError(f"actual_rank must be positive, got {actual_rank}")
+    if trainer_rank <= 0:
+        raise ValueError(f"trainer_rank must be positive, got {trainer_rank}")
+    if actual_rank > trainer_rank:
+        raise ValueError(f"actual_rank {actual_rank} exceeds trainer_rank {trainer_rank}")
+    return actual_rank, trainer_rank
+
+
+def _is_lora_a_name(name: str) -> bool:
+    lowered = name.lower()
+    return "lora_a" in lowered or ("adapter" in lowered and "linear_in" in lowered)
+
+
+def _is_lora_b_name(name: str) -> bool:
+    lowered = name.lower()
+    return "lora_b" in lowered or ("adapter" in lowered and "linear_out" in lowered)
+
+
+def lora_rank_tail_slice(
+    name: str,
+    tensor: torch.Tensor,
+    actual_rank: int,
+    trainer_rank: int,
+    *,
+    rank_shard_index: int = 0,
+    rank_shard_count: int = 1,
+) -> tuple[slice, ...] | None:
+    """Return the slice covering padded LoRA rank dimensions for a tensor."""
+    actual_rank, trainer_rank = _validate_rank_pair(actual_rank, trainer_rank)
+    if actual_rank == trainer_rank:
+        return None
+    if not (_is_lora_a_name(name) or _is_lora_b_name(name)):
+        return None
+    if tensor.ndim < 2:
+        raise ValueError(f"{name}: expected rank-2+ LoRA tensor, got shape={tuple(tensor.shape)}")
+    rank_shard_index = int(rank_shard_index)
+    rank_shard_count = int(rank_shard_count)
+    if rank_shard_index < 0:
+        raise ValueError(f"rank_shard_index must be non-negative, got {rank_shard_index}")
+    if rank_shard_count <= 0:
+        raise ValueError(f"rank_shard_count must be positive, got {rank_shard_count}")
+    if rank_shard_index >= rank_shard_count:
+        raise ValueError(
+            f"rank_shard_index {rank_shard_index} must be smaller than rank_shard_count {rank_shard_count}"
+        )
+
+    def _local_tail(local_rank_dim: int) -> slice | None:
+        if local_rank_dim == trainer_rank:
+            return slice(actual_rank, trainer_rank)
+        if rank_shard_count > 1 and local_rank_dim * rank_shard_count == trainer_rank:
+            shard_start = rank_shard_index * local_rank_dim
+            active_local = max(0, min(local_rank_dim, actual_rank - shard_start))
+            if active_local == local_rank_dim:
+                return None
+            return slice(active_local, local_rank_dim)
+        raise ValueError(
+            f"{name}: LoRA rank dim is {local_rank_dim}, expected trainer_rank {trainer_rank} "
+            f"or a TP-sharded local dim for rank_shard_count {rank_shard_count}"
+        )
+
+    if _is_lora_a_name(name):
+        tail = _local_tail(int(tensor.shape[0]))
+        if tail is None:
+            return None
+        return (tail,) + (slice(None),) * (tensor.ndim - 1)
+    tail = _local_tail(int(tensor.shape[-1]))
+    if tail is None:
+        return None
+    return (slice(None),) * (tensor.ndim - 1) + (tail,)
+
+
+def zero_lora_rank_tail_named_parameters(
+    named_parameters,
+    actual_rank: int,
+    trainer_rank: int,
+    *,
+    zero_grads: bool = True,
+    rank_shard_index: int = 0,
+    rank_shard_count: int = 1,
+) -> dict[str, int]:
+    """Project padded LoRA rank tails and optionally their gradients to exact zero."""
+    _validate_rank_pair(actual_rank, trainer_rank)
+    stats = {"params": 0, "grads": 0}
+    if actual_rank == trainer_rank:
+        return stats
+    for name, param in named_parameters:
+        tail = lora_rank_tail_slice(
+            name,
+            param.data,
+            actual_rank,
+            trainer_rank,
+            rank_shard_index=rank_shard_index,
+            rank_shard_count=rank_shard_count,
+        )
+        if tail is None:
+            continue
+        with torch.no_grad():
+            param.data[tail].zero_()
+        stats["params"] += 1
+        if zero_grads and param.grad is not None:
+            param.grad[tail].zero_()
+            stats["grads"] += 1
+    return stats
+
+
 def _env_flag(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
     if value is None:
@@ -292,26 +401,45 @@ def pad_lora_state_dict(
     Returns:
         New state dict with padded weights.
     """
-    if actual_rank >= trainer_rank:
+    actual_rank, trainer_rank = _validate_rank_pair(actual_rank, trainer_rank)
+    if actual_rank == trainer_rank:
         return state_dict  # No padding needed
 
     padded = {}
     for name, tensor in state_dict.items():
-        if "lora_a" in name.lower():
+        if _is_lora_a_name(name):
             # lora_A: (actual_rank, hidden) -> (trainer_rank, hidden)
             # Pad rows
+            rank_dim = int(tensor.shape[0])
+            if rank_dim == trainer_rank:
+                padded[name] = tensor
+                continue
+            if rank_dim != actual_rank:
+                raise ValueError(
+                    f"{name}: lora_A/linear_in rank dim is {rank_dim}, "
+                    f"expected actual_rank {actual_rank} or trainer_rank {trainer_rank}"
+                )
             padded_tensor = torch.zeros(
-                trainer_rank, tensor.shape[1], dtype=tensor.dtype, device=tensor.device
+                trainer_rank, *tensor.shape[1:], dtype=tensor.dtype, device=tensor.device
             )
             padded_tensor[:actual_rank] = tensor
             padded[name] = padded_tensor
-        elif "lora_b" in name.lower():
+        elif _is_lora_b_name(name):
             # lora_B: (hidden, actual_rank) -> (hidden, trainer_rank)
             # Pad columns
+            rank_dim = int(tensor.shape[-1])
+            if rank_dim == trainer_rank:
+                padded[name] = tensor
+                continue
+            if rank_dim != actual_rank:
+                raise ValueError(
+                    f"{name}: lora_B/linear_out rank dim is {rank_dim}, "
+                    f"expected actual_rank {actual_rank} or trainer_rank {trainer_rank}"
+                )
             padded_tensor = torch.zeros(
-                tensor.shape[0], trainer_rank, dtype=tensor.dtype, device=tensor.device
+                *tensor.shape[:-1], trainer_rank, dtype=tensor.dtype, device=tensor.device
             )
-            padded_tensor[:, :actual_rank] = tensor
+            padded_tensor[..., :actual_rank] = tensor
             padded[name] = padded_tensor
         else:
             # Non-LoRA parameters pass through unchanged
@@ -340,24 +468,115 @@ def truncate_lora_state_dict(
     Returns:
         New state dict with truncated weights.
     """
-    if actual_rank >= trainer_rank:
+    actual_rank, trainer_rank = _validate_rank_pair(actual_rank, trainer_rank)
+    if actual_rank == trainer_rank:
         return state_dict  # No truncation needed
 
     truncated = {}
     for name, tensor in state_dict.items():
-        if "lora_a" in name.lower():
+        if _is_lora_a_name(name):
             # lora_A: (trainer_rank, hidden) -> (actual_rank, hidden)
             # Truncate rows
+            rank_dim = int(tensor.shape[0])
+            if rank_dim == actual_rank:
+                truncated[name] = tensor.clone()
+                continue
+            if rank_dim != trainer_rank:
+                raise ValueError(
+                    f"{name}: lora_A/linear_in rank dim is {rank_dim}, "
+                    f"expected actual_rank {actual_rank} or trainer_rank {trainer_rank}"
+                )
             truncated[name] = tensor[:actual_rank].clone()
-        elif "lora_b" in name.lower():
+        elif _is_lora_b_name(name):
             # lora_B: (hidden, trainer_rank) -> (hidden, actual_rank)
             # Truncate columns
-            truncated[name] = tensor[:, :actual_rank].clone()
+            rank_dim = int(tensor.shape[-1])
+            if rank_dim == actual_rank:
+                truncated[name] = tensor.clone()
+                continue
+            if rank_dim != trainer_rank:
+                raise ValueError(
+                    f"{name}: lora_B/linear_out rank dim is {rank_dim}, "
+                    f"expected actual_rank {actual_rank} or trainer_rank {trainer_rank}"
+                )
+            truncated[name] = tensor[..., :actual_rank].clone()
         else:
             # Non-LoRA parameters pass through unchanged
             truncated[name] = tensor
 
     return truncated
+
+
+def fit_lora_state_dict_to_reference(
+    state_dict: dict[str, torch.Tensor],
+    reference_state_dict: dict[str, torch.Tensor],
+    *,
+    rank_shard_index: int = 0,
+    rank_shard_count: int = 1,
+) -> dict[str, torch.Tensor]:
+    """Resize LoRA rank dimensions to match a reference state dict.
+
+    This is for Megatron TP-local adapter shards, where a checkpoint may store
+    rank-64 tensors while the local model rank dimension is rank-64 / TP.
+    Non-rank dimensions must already match.
+    """
+    rank_shard_index = int(rank_shard_index)
+    rank_shard_count = int(rank_shard_count)
+    if rank_shard_index < 0:
+        raise ValueError(f"rank_shard_index must be non-negative, got {rank_shard_index}")
+    if rank_shard_count <= 0:
+        raise ValueError(f"rank_shard_count must be positive, got {rank_shard_count}")
+    if rank_shard_index >= rank_shard_count:
+        raise ValueError(
+            f"rank_shard_index {rank_shard_index} must be smaller than rank_shard_count {rank_shard_count}"
+        )
+    fitted = {}
+    for name, tensor in state_dict.items():
+        reference = reference_state_dict.get(name)
+        if reference is None or not (_is_lora_a_name(name) or _is_lora_b_name(name)):
+            fitted[name] = tensor
+            continue
+        target_shape = tuple(int(dim) for dim in reference.shape)
+        source_shape = tuple(int(dim) for dim in tensor.shape)
+        if source_shape == target_shape:
+            fitted[name] = tensor
+            continue
+        if tensor.ndim != reference.ndim:
+            raise ValueError(
+                f"{name}: LoRA tensor rank mismatch, checkpoint shape={source_shape}, "
+                f"expected shape={target_shape}"
+            )
+        rank_axis = 0 if _is_lora_a_name(name) else tensor.ndim - 1
+        source_non_rank = source_shape[:rank_axis] + source_shape[rank_axis + 1 :]
+        target_non_rank = target_shape[:rank_axis] + target_shape[rank_axis + 1 :]
+        if source_non_rank != target_non_rank:
+            raise ValueError(
+                f"{name}: LoRA non-rank dimensions mismatch, checkpoint shape={source_shape}, "
+                f"expected shape={target_shape}"
+            )
+        output = torch.zeros(target_shape, dtype=tensor.dtype, device=tensor.device)
+        local_rank_dim = target_shape[rank_axis]
+        shard_start = rank_shard_index * local_rank_dim
+        shard_stop = shard_start + local_rank_dim
+        source_rank_dim = source_shape[rank_axis]
+        represented_rank_dim = local_rank_dim * rank_shard_count
+        if source_rank_dim > represented_rank_dim:
+            raise ValueError(
+                f"{name}: checkpoint LoRA rank dim {source_rank_dim} exceeds represented trainer rank "
+                f"{represented_rank_dim} for rank_shard_count {rank_shard_count}"
+            )
+        if source_rank_dim < shard_start:
+            overlap = 0
+        else:
+            overlap = max(0, min(shard_stop, source_rank_dim) - shard_start)
+        source_slice = [slice(None)] * tensor.ndim
+        target_slice = [slice(None)] * tensor.ndim
+        source_slice[rank_axis] = slice(shard_start, shard_start + overlap)
+        target_slice[rank_axis] = slice(0, overlap)
+        if overlap:
+            output[tuple(target_slice)] = tensor[tuple(source_slice)]
+        fitted[name] = output
+    return fitted
 
 
 def compute_lora_scaling(
@@ -382,7 +601,8 @@ def compute_lora_scaling(
     Returns:
         Scaling factor to multiply LoRA output by.
     """
-    if actual_rank >= trainer_rank:
+    actual_rank, trainer_rank = _validate_rank_pair(actual_rank, trainer_rank)
+    if actual_rank == trainer_rank:
         return 1.0  # No scaling needed
 
     # Scaling correction: trainer_rank / actual_rank
@@ -390,7 +610,7 @@ def compute_lora_scaling(
 
 
 def get_lora_rank_from_state_dict(state_dict: dict[str, torch.Tensor]) -> int | None:
-    """Infer LoRA rank from state dict by examining tensor shapes.
+    """Infer LoRA rank from state dict by validating all LoRA tensor shapes.
 
     Args:
         state_dict: Adapter state dict.
@@ -398,21 +618,32 @@ def get_lora_rank_from_state_dict(state_dict: dict[str, torch.Tensor]) -> int | 
     Returns:
         Inferred rank, or None if no LoRA parameters found.
     """
+    ranks: list[tuple[str, int]] = []
     for name, tensor in state_dict.items():
-        if "lora_a" in name.lower():
-            # lora_A has shape (rank, hidden)
-            return tensor.shape[0]
-        elif "lora_b" in name.lower():
-            # lora_B has shape (hidden, rank)
-            return tensor.shape[1]
-    return None
+        if not isinstance(tensor, torch.Tensor):
+            continue
+        if (_is_lora_a_name(name) or _is_lora_b_name(name)) and tensor.ndim < 2:
+            raise ValueError(f"{name}: expected rank-2+ LoRA tensor, got shape={tuple(tensor.shape)}")
+        if _is_lora_a_name(name):
+            ranks.append((name, int(tensor.shape[0])))
+        elif _is_lora_b_name(name):
+            ranks.append((name, int(tensor.shape[-1])))
+    if not ranks:
+        return None
+    rank_values = {rank for _, rank in ranks}
+    if len(rank_values) != 1:
+        raise ValueError(f"LoRA tensor rank mismatch: {ranks}")
+    return ranks[0][1]
 
 
 __all__ = [
     "pad_lora_state_dict",
     "truncate_lora_state_dict",
+    "fit_lora_state_dict_to_reference",
     "compute_lora_scaling",
     "get_lora_rank_from_state_dict",
+    "lora_rank_tail_slice",
     "maybe_validate_peft_adapter_checkpoint_shapes",
     "validate_peft_adapter_checkpoint_shapes",
+    "zero_lora_rank_tail_named_parameters",
 ]

@@ -105,4 +105,6 @@ Eviction is still possible when a session stops making requests long enough to b
 Time-slicing swap (this document) is an internal mechanism to multiplex a limited number of GPU trainers.
 
 Durable resume is a separate concern handled by `/save_state` and `/load_state` in `tinker_server/routes/weights.py`.
-These endpoints currently document that optimizer saving is not implemented for the public checkpoint API, so do not assume that API-level checkpoints preserve optimizer momentum.
+For Megatron, public training checkpoints include per-rank optimizer shards, so optimizer resume can be backed by a checkpoint. Actor-only snapshots also include LR scheduler state, but public Megatron checkpoints do not currently write scheduler state. Treat optimizer state and scheduler state as separate sources in docs and code.
+
+`load_state(..., optimizer=True)` loads checkpoint weights and optimizer into the live Megatron actor, then primes the session cache from that exact checkpoint. The cache metadata records the checkpoint path and identity, while `actor_only_state.json` records that optimizer authority is actor-local until a durable save or actor snapshot changes that source. Public Megatron checkpoints do not currently restore gradient or scheduler state.

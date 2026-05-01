@@ -20,7 +20,7 @@ from enum import Enum
 from typing import Any
 
 from .queue_execution_context import get_current_queue_generation_id
-from ..config import config as server_config, otel_env_vars, preferred_control_plane_resources, preferred_control_plane_resources
+from ..config import config as server_config, otel_env_vars
 
 
 class FutureStoreUnavailableError(RuntimeError):

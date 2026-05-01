@@ -8,18 +8,21 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import threading
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import ray
 
 from . import ray_kill
 from ..logging_context import (
+    classify_failure_reason,
     get_current_traceparent,
     get_request_id,
     init_actor_observability,
+    record_span_event_otel,
     restore_trace_id_from_traceparent,
     run_async_with_otel_span,
     start_as_current_span,
@@ -104,6 +107,7 @@ class SessionStateManager:
         lr: float,
         device: torch.device,
         save_gradients: bool = True,
+        actual_rank: int | None = None,
     ) -> str:
         """Save session state (LoRA weights + optimizer + gradients + metadata).
 
@@ -155,6 +159,8 @@ class SessionStateManager:
 
         # 4. Save metadata
         meta = {"current_step": step, "learning_rate": lr}
+        if actual_rank is not None:
+            meta["actual_rank"] = int(actual_rank)
         with open(os.path.join(session_path, "training_meta.json"), "w") as f:
             json.dump(meta, f, indent=2)
 
@@ -373,6 +379,8 @@ class TrainingWorker:
         # Session state management for stateless trainer pattern
         self._state_manager = SessionStateManager(base_path=session_state_root)
         self._current_session_id: str | None = None
+        self.max_lora_rank = int(lora_rank)
+        self._current_actual_rank: int | None = None
 
         logger.info("[TrainingWorker] Ready")
 
@@ -397,7 +405,28 @@ class TrainingWorker:
         """Update last activity timestamp. Call at start of every method."""
         self._last_activity = time.time()
 
-    def _ensure_session_loaded(self, session_id: str) -> None:
+    def _resolve_actual_rank(self, actual_rank: int | None = None) -> int:
+        rank = self._current_actual_rank if actual_rank is None else int(actual_rank)
+        if rank is None:
+            rank = self.max_lora_rank
+        if rank <= 0 or rank > self.max_lora_rank:
+            raise ValueError(f"actual_rank {rank} must be in [1, {self.max_lora_rank}]")
+        return int(rank)
+
+    def _zero_lora_rank_tail(self, actual_rank: int | None = None, *, zero_grads: bool = True) -> dict[str, int]:
+        from tinker_server.backend.lora_utils import zero_lora_rank_tail_named_parameters
+
+        effective_rank = self._resolve_actual_rank(actual_rank)
+        stats = zero_lora_rank_tail_named_parameters(
+            self.model.named_parameters(),
+            actual_rank=effective_rank,
+            trainer_rank=self.max_lora_rank,
+            zero_grads=zero_grads,
+        )
+        self._current_actual_rank = effective_rank
+        return stats
+
+    def _ensure_session_loaded(self, session_id: str, actual_rank: int | None = None) -> None:
         """Ensure the specified session's state is loaded.
 
         If a different session is currently loaded, this saves its state first,
@@ -411,6 +440,7 @@ class TrainingWorker:
         if self._current_session_id == session_id:
             # Already loaded
             print(f"[DEBUG] Session {session_id} already loaded, no switch needed", flush=True)
+            self._zero_lora_rank_tail(actual_rank, zero_grads=True)
             return
 
         # Save outgoing session's state INCLUDING gradients
@@ -424,7 +454,8 @@ class TrainingWorker:
             lr = self.optimizer.param_groups[0]["lr"] if self.optimizer.param_groups else 1e-4
             self._state_manager.save_state(
                 self._current_session_id, self.model, self.optimizer,
-                self._step_count, lr, self.device, save_gradients=True
+                self._step_count, lr, self.device, save_gradients=True,
+                actual_rank=self._current_actual_rank,
             )
             print(f"[DEBUG] Saved outgoing session {self._current_session_id} before switch", flush=True)
 
@@ -434,24 +465,26 @@ class TrainingWorker:
                 session_id, self.model, self.optimizer, self.device, load_gradients=True
             )
             self._step_count = meta.get("current_step", 0)
+            actual_rank = actual_rank if actual_rank is not None else meta.get("actual_rank")
             # Update learning rate if saved
             if "learning_rate" in meta:
                 for pg in self.optimizer.param_groups:
                     pg["lr"] = meta["learning_rate"]
+            self._zero_lora_rank_tail(actual_rank, zero_grads=True)
             # Check actual gradient state after loading
             grad_count = sum(1 for _, p in self.model.named_parameters() if p.requires_grad and p.grad is not None)
             grad_norm = sum((p.grad.norm().item() ** 2) for _, p in self.model.named_parameters() if p.requires_grad and p.grad is not None) ** 0.5
             print(f"[DEBUG] Loaded session {session_id}: step={self._step_count}, actual_grads={grad_count}, norm={grad_norm:.4f}", flush=True)
         else:
             # New session: reinitialize weights and zero gradients
-            self.reinit_lora_weights()
+            self.reinit_lora_weights(actual_rank=actual_rank)
             self.optimizer.zero_grad()
             self._step_count = 0
             print(f"[DEBUG] New session {session_id}, initialized fresh weights", flush=True)
 
         self._current_session_id = session_id
 
-    def _save_session_state(self, session_id: str) -> None:
+    def _save_session_state(self, session_id: str, actual_rank: int | None = None) -> None:
         """Save current session state to disk.
 
         Called at the end of optim_step to persist state.
@@ -461,9 +494,12 @@ class TrainingWorker:
             session_id: Session ID to save state for.
         """
         lr = self.optimizer.param_groups[0]["lr"] if self.optimizer.param_groups else 1e-4
+        actual_rank = self._resolve_actual_rank(actual_rank)
+        self._zero_lora_rank_tail(actual_rank, zero_grads=True)
         self._state_manager.save_state(
             session_id, self.model, self.optimizer, self._step_count, lr, self.device,
-            save_gradients=False  # Gradients already applied and zeroed
+            save_gradients=False,  # Gradients already applied and zeroed
+            actual_rank=actual_rank,
         )
         logger.debug(f"[TrainingWorker] Saved session {session_id} state (step={self._step_count})")
 
@@ -519,12 +555,243 @@ class TrainingWorker:
         page_size = int(os.sysconf("SC_PAGE_SIZE"))
         return rss_pages * page_size
 
+    def _resolve_vocab_size(self) -> int | None:
+        config = getattr(self.model, "config", None)
+        vocab_size = getattr(config, "vocab_size", None)
+        if isinstance(vocab_size, int) and vocab_size > 0:
+            return int(vocab_size)
+        tokenizer_vocab = getattr(self.tokenizer, "vocab_size", None)
+        if isinstance(tokenizer_vocab, int) and tokenizer_vocab > 0:
+            return int(tokenizer_vocab)
+        return None
+
+    @staticmethod
+    def _numeric_bounds(values: list[Any]) -> tuple[int | float | None, int | float | None]:
+        numeric = [value for value in values if isinstance(value, (int, float)) and not isinstance(value, bool)]
+        if not numeric:
+            return None, None
+        return min(numeric), max(numeric)
+
+    @staticmethod
+    def _invalid_token_positions(values: list[Any], *, vocab_size: int | None, limit: int = 8) -> list[int]:
+        bad: list[int] = []
+        for idx, value in enumerate(values):
+            is_valid_int = isinstance(value, int) and not isinstance(value, bool)
+            if not is_valid_int:
+                bad.append(idx)
+            elif int(value) < 0:
+                bad.append(idx)
+            elif vocab_size is not None and int(value) >= int(vocab_size):
+                bad.append(idx)
+            if len(bad) >= limit:
+                break
+        return bad
+
+    @staticmethod
+    def _invalid_numeric_positions(values: list[Any], *, limit: int = 8) -> list[int]:
+        bad: list[int] = []
+        for idx, value in enumerate(values):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                bad.append(idx)
+            elif not math.isfinite(float(value)):
+                bad.append(idx)
+            if len(bad) >= limit:
+                break
+        return bad
+
+    def _raise_forward_backward_contract_violation(
+        self,
+        *,
+        session_id: str | None,
+        loss_fn: str,
+        reason: str,
+        input_ids: list[Any],
+        target_tokens: list[Any],
+        weights: list[Any],
+        old_logprobs: list[Any] | None = None,
+        advantages: list[Any] | None = None,
+    ) -> None:
+        vocab_size = self._resolve_vocab_size()
+        input_min, input_max = self._numeric_bounds(input_ids)
+        target_min, target_max = self._numeric_bounds(target_tokens)
+        attrs = {
+            "session_id": str(session_id or "-"),
+            "loss_fn": str(loss_fn),
+            "reason": str(reason),
+            "vocab_size": -1 if vocab_size is None else int(vocab_size),
+            "input_len": len(input_ids),
+            "target_len": len(target_tokens),
+            "weights_len": len(weights),
+            "old_logprobs_len": len(old_logprobs or []),
+            "advantages_len": len(advantages or []),
+            "input_min": "none" if input_min is None else str(input_min),
+            "input_max": "none" if input_max is None else str(input_max),
+            "target_min": "none" if target_min is None else str(target_min),
+            "target_max": "none" if target_max is None else str(target_max),
+            "bad_input_positions": json.dumps(
+                self._invalid_token_positions(input_ids, vocab_size=vocab_size),
+                separators=(",", ":"),
+            ),
+            "bad_target_positions": json.dumps(
+                self._invalid_token_positions(target_tokens, vocab_size=vocab_size),
+                separators=(",", ":"),
+            ),
+            "bad_weight_positions": json.dumps(
+                self._invalid_numeric_positions(weights),
+                separators=(",", ":"),
+            ),
+            "bad_old_logprob_positions": json.dumps(
+                self._invalid_numeric_positions(old_logprobs or []),
+                separators=(",", ":"),
+            ),
+            "bad_advantage_positions": json.dumps(
+                self._invalid_numeric_positions(advantages or []),
+                separators=(",", ":"),
+            ),
+        }
+        logger.error(
+            "[TrainingWorker] dense_input_contract_violation %s",
+            json.dumps(attrs, sort_keys=True, ensure_ascii=True),
+        )
+        record_span_event_otel("mint.training_input_contract_violation", attributes=attrs)
+        from .runtime_observability import runtime_observability
+
+        runtime_observability.record_training_incident(
+            kind="contract_violation",
+            base_model=str(getattr(self, "_base_model", "unknown") or "unknown"),
+            backend="peft",
+            op="forward_backward",
+            status="error",
+            failure_class="input_contract",
+            request_id=str(get_request_id() or "") or None,
+            session_id=None if session_id is None else str(session_id),
+            detail=str(reason),
+            context=attrs,
+        )
+        raise ValueError(
+            "dense_input_contract_violation: "
+            f"reason={reason} input_len={len(input_ids)} target_len={len(target_tokens)} weights_len={len(weights)}"
+        )
+
+    def _validate_forward_backward_contract(
+        self,
+        *,
+        session_id: str | None,
+        loss_fn: str,
+        input_ids: list[Any],
+        target_tokens: list[Any],
+        weights: list[Any],
+        old_logprobs: list[Any] | None = None,
+        advantages: list[Any] | None = None,
+    ) -> None:
+        vocab_size = self._resolve_vocab_size()
+        if self._invalid_token_positions(input_ids, vocab_size=vocab_size):
+            self._raise_forward_backward_contract_violation(
+                session_id=session_id,
+                loss_fn=loss_fn,
+                reason="input_ids_out_of_range",
+                input_ids=input_ids,
+                target_tokens=target_tokens,
+                weights=weights,
+                old_logprobs=old_logprobs,
+                advantages=advantages,
+            )
+        if self._invalid_token_positions(target_tokens, vocab_size=vocab_size):
+            self._raise_forward_backward_contract_violation(
+                session_id=session_id,
+                loss_fn=loss_fn,
+                reason="target_tokens_out_of_range",
+                input_ids=input_ids,
+                target_tokens=target_tokens,
+                weights=weights,
+                old_logprobs=old_logprobs,
+                advantages=advantages,
+            )
+        if self._invalid_numeric_positions(weights):
+            self._raise_forward_backward_contract_violation(
+                session_id=session_id,
+                loss_fn=loss_fn,
+                reason="weights_non_finite_or_non_numeric",
+                input_ids=input_ids,
+                target_tokens=target_tokens,
+                weights=weights,
+                old_logprobs=old_logprobs,
+                advantages=advantages,
+            )
+        if len(target_tokens) != len(weights):
+            self._raise_forward_backward_contract_violation(
+                session_id=session_id,
+                loss_fn=loss_fn,
+                reason="target_weights_len_mismatch",
+                input_ids=input_ids,
+                target_tokens=target_tokens,
+                weights=weights,
+                old_logprobs=old_logprobs,
+                advantages=advantages,
+            )
+        if len(target_tokens) != len(input_ids):
+            self._raise_forward_backward_contract_violation(
+                session_id=session_id,
+                loss_fn=loss_fn,
+                reason="target_seq_len_mismatch",
+                input_ids=input_ids,
+                target_tokens=target_tokens,
+                weights=weights,
+                old_logprobs=old_logprobs,
+                advantages=advantages,
+            )
+        if old_logprobs is not None and old_logprobs and self._invalid_numeric_positions(old_logprobs):
+            self._raise_forward_backward_contract_violation(
+                session_id=session_id,
+                loss_fn=loss_fn,
+                reason="old_logprobs_non_finite_or_non_numeric",
+                input_ids=input_ids,
+                target_tokens=target_tokens,
+                weights=weights,
+                old_logprobs=old_logprobs,
+                advantages=advantages,
+            )
+        if old_logprobs is not None and old_logprobs and len(old_logprobs) != len(target_tokens):
+            self._raise_forward_backward_contract_violation(
+                session_id=session_id,
+                loss_fn=loss_fn,
+                reason="old_logprobs_len_mismatch",
+                input_ids=input_ids,
+                target_tokens=target_tokens,
+                weights=weights,
+                old_logprobs=old_logprobs,
+                advantages=advantages,
+            )
+        if advantages is not None and advantages and self._invalid_numeric_positions(advantages):
+            self._raise_forward_backward_contract_violation(
+                session_id=session_id,
+                loss_fn=loss_fn,
+                reason="advantages_non_finite_or_non_numeric",
+                input_ids=input_ids,
+                target_tokens=target_tokens,
+                weights=weights,
+                old_logprobs=old_logprobs,
+                advantages=advantages,
+            )
+        if advantages is not None and advantages and len(advantages) != len(target_tokens):
+            self._raise_forward_backward_contract_violation(
+                session_id=session_id,
+                loss_fn=loss_fn,
+                reason="advantages_len_mismatch",
+                input_ids=input_ids,
+                target_tokens=target_tokens,
+                weights=weights,
+                old_logprobs=old_logprobs,
+                advantages=advantages,
+            )
+
     def forward_backward(
         self,
         data_items: list[dict],
         loss_fn: str = "cross_entropy",
         loss_fn_config: dict | None = None,
         session_id: str | None = None,
+        actual_rank: int | None = None,
         traceparent: str | None = None,
     ) -> dict:
         """Forward + backward pass using tinker Datum format.
@@ -552,7 +819,9 @@ class TrainingWorker:
 
         # Stateless trainer: load session state if session_id provided
         if session_id:
-            self._ensure_session_loaded(session_id)
+            self._ensure_session_loaded(session_id, actual_rank=actual_rank)
+        elif actual_rank is not None:
+            self._zero_lora_rank_tail(actual_rank, zero_grads=True)
 
         loss_fn_config = loss_fn_config or {}
 
@@ -621,6 +890,14 @@ class TrainingWorker:
                     f"target_tokens len: {len(target_tokens)}"
                 )
                 continue
+
+            self._validate_forward_backward_contract(
+                session_id=session_id,
+                loss_fn=loss_fn,
+                input_ids=input_ids,
+                target_tokens=target_tokens,
+                weights=weights,
+            )
 
             # Convert to tensors
             input_ids_t = torch.tensor([input_ids], dtype=torch.long, device=self.device)
@@ -695,6 +972,16 @@ class TrainingWorker:
                     )
                     continue
 
+                self._validate_forward_backward_contract(
+                    session_id=session_id,
+                    loss_fn=loss_fn,
+                    input_ids=input_ids,
+                    target_tokens=target_tokens,
+                    weights=weights,
+                    old_logprobs=old_logprobs,
+                    advantages=advantages,
+                )
+
                 old_logprobs_t = torch.tensor(old_logprobs, dtype=torch.float32, device=self.device)
                 advantages_t = torch.tensor(advantages, dtype=torch.float32, device=self.device)
 
@@ -754,6 +1041,7 @@ class TrainingWorker:
             total_tokens += token_count
 
         avg_loss = total_loss / max(total_tokens, 1)
+        self._zero_lora_rank_tail(actual_rank, zero_grads=True)
 
         metrics = {
             "loss:mean": avg_loss,
@@ -920,12 +1208,70 @@ class TrainingWorker:
             },
         }
 
+    def _infer_adapter_checkpoint_rank(self, checkpoint_path: str) -> int:
+        """Infer adapter rank from checkpoint metadata and tensor shapes."""
+        from safetensors import safe_open
+
+        rank_sources: list[tuple[str, int]] = []
+
+        meta_path = os.path.join(checkpoint_path, "training_meta.json")
+        if os.path.exists(meta_path):
+            with open(meta_path, encoding="utf-8") as f:
+                meta = json.load(f)
+            if not isinstance(meta, dict):
+                raise ValueError(f"training_meta.json must contain a JSON object, got {type(meta).__name__}")
+            if "actual_rank" in meta:
+                rank = meta["actual_rank"]
+                if not isinstance(rank, int) or isinstance(rank, bool) or rank <= 0:
+                    raise ValueError(f"training_meta.actual_rank must be a positive int, got {rank!r}")
+                rank_sources.append(("training_meta.actual_rank", int(rank)))
+
+        config_path = os.path.join(checkpoint_path, "adapter_config.json")
+        if os.path.exists(config_path):
+            with open(config_path, encoding="utf-8") as f:
+                adapter_config = json.load(f)
+            if not isinstance(adapter_config, dict):
+                raise ValueError(f"adapter_config.json must contain a JSON object, got {type(adapter_config).__name__}")
+            rank = adapter_config.get("r")
+            if not isinstance(rank, int) or isinstance(rank, bool) or rank <= 0:
+                raise ValueError(f"adapter_config.r must be a positive int, got {rank!r}")
+            rank_sources.append(("adapter_config.r", int(rank)))
+
+        weights_path = os.path.join(checkpoint_path, "adapter_model.safetensors")
+        if not os.path.exists(weights_path):
+            raise FileNotFoundError(f"Adapter not found: {weights_path}")
+        tensor_ranks: list[tuple[str, int]] = []
+        with safe_open(weights_path, framework="pt", device="cpu") as handle:
+            for key in handle.keys():
+                lowered = str(key).lower()
+                is_lora_a = "lora_a" in lowered or ("adapter" in lowered and "linear_in" in lowered)
+                is_lora_b = "lora_b" in lowered or ("adapter" in lowered and "linear_out" in lowered)
+                if not (is_lora_a or is_lora_b):
+                    continue
+                shape = tuple(int(dim) for dim in handle.get_slice(key).get_shape())
+                if len(shape) < 2:
+                    raise ValueError(f"{key}: expected rank-2+ LoRA tensor, got shape={shape}")
+                tensor_ranks.append((str(key), int(shape[0] if is_lora_a else shape[-1])))
+        if tensor_ranks:
+            values = {rank for _, rank in tensor_ranks}
+            if len(values) != 1:
+                raise ValueError(f"LoRA tensor rank mismatch: {tensor_ranks}")
+            rank_sources.append(("adapter_model.safetensors", next(iter(values))))
+
+        if not rank_sources:
+            raise ValueError(f"No LoRA rank metadata or tensors found in checkpoint: {checkpoint_path}")
+        values = {rank for _, rank in rank_sources}
+        if len(values) != 1:
+            raise ValueError(f"Checkpoint LoRA rank metadata mismatch: {rank_sources}")
+        return self._resolve_actual_rank(next(iter(values)))
+
     def forward_backward_reverse_kl(
         self,
         data_items: list[dict],
         reference_checkpoint_path: str,
         temperature: float,
         session_id: str | None = None,
+        actual_rank: int | None = None,
         traceparent: str | None = None,
     ) -> dict:
         """Forward/backward for Mint reverse-KL distillation against a fixed reference checkpoint."""
@@ -936,7 +1282,8 @@ class TrainingWorker:
         if temperature <= 0:
             raise ValueError(f"temperature must be positive, got {temperature!r}")
         if session_id:
-            self._ensure_session_loaded(session_id)
+            self._ensure_session_loaded(session_id, actual_rank=actual_rank)
+        current_actual_rank = self._resolve_actual_rank(actual_rank)
 
         from .mintx_ops import (
             build_scoring_sequence,
@@ -954,10 +1301,19 @@ class TrainingWorker:
         prev_training = self.model.training
         try:
             with temporary_adapter_snapshot_dir("mintx_dense_ref_") as snapshot_dir:
-                self.save_adapter_state(snapshot_dir)
+                self.save_adapter_state(
+                    snapshot_dir,
+                    actual_rank=current_actual_rank,
+                    trainer_rank=self.max_lora_rank,
+                )
                 try:
                     self.model.eval()
-                    self.load_adapter_state(reference_checkpoint_path)
+                    reference_actual_rank = self._infer_adapter_checkpoint_rank(reference_checkpoint_path)
+                    self.load_adapter_state(
+                        reference_checkpoint_path,
+                        actual_rank=reference_actual_rank,
+                        trainer_rank=self.max_lora_rank,
+                    )
                     with torch.no_grad():
                         for batch in reference_batches:
                             scoring_input, completion_start = build_scoring_sequence(
@@ -979,7 +1335,11 @@ class TrainingWorker:
                                 )
                             )
                 finally:
-                    self.load_adapter_state(snapshot_dir)
+                    self.load_adapter_state(
+                        snapshot_dir,
+                        actual_rank=current_actual_rank,
+                        trainer_rank=self.max_lora_rank,
+                    )
 
             self.model.train()
             outputs = []
@@ -1056,6 +1416,7 @@ class TrainingWorker:
         self,
         learning_rate: float | None,
         session_id: str | None = None,
+        actual_rank: int | None = None,
         traceparent: str | None = None,
     ) -> dict:
         """Optimizer update step.
@@ -1074,22 +1435,26 @@ class TrainingWorker:
 
         # Stateless trainer: ensure session state is loaded
         if session_id:
-            self._ensure_session_loaded(session_id)
+            self._ensure_session_loaded(session_id, actual_rank=actual_rank)
+        elif actual_rank is not None:
+            self._zero_lora_rank_tail(actual_rank, zero_grads=True)
 
         # Update learning rate if provided
         if learning_rate is not None:
             for pg in self.optimizer.param_groups:
                 pg["lr"] = learning_rate
 
+        self._zero_lora_rank_tail(actual_rank, zero_grads=True)
         grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
+        self._zero_lora_rank_tail(actual_rank, zero_grads=True)
         self.optimizer.zero_grad()
 
         self._step_count += 1
 
         # Stateless trainer: save session state after update
         if session_id:
-            self._save_session_state(session_id)
+            self._save_session_state(session_id, actual_rank=actual_rank)
 
         logger.info(f"[TrainingWorker] optim_step: grad_norm={grad_norm:.4f}, step={self._step_count}")
 
@@ -1111,16 +1476,18 @@ class TrainingWorker:
         # Move to CPU for serialization
         return {k: v.cpu() for k, v in state_dict.items()}
 
-    def get_lora_config(self) -> dict:
+    def get_lora_config(self, actual_rank: int | None = None) -> dict:
         """Get LoRA configuration as dictionary.
 
         Returns:
             PEFT config dict compatible with vLLM's PEFTHelper.
         """
         peft_config = self.model.peft_config.get("default")
+        effective_rank = self._resolve_actual_rank(actual_rank)
+        alpha_per_rank = peft_config.lora_alpha / peft_config.r
         return {
-            "r": peft_config.r,
-            "lora_alpha": peft_config.lora_alpha,
+            "r": effective_rank,
+            "lora_alpha": int(alpha_per_rank * effective_rank),
             "lora_dropout": peft_config.lora_dropout,
             "target_modules": list(peft_config.target_modules),
             "bias": peft_config.bias,
@@ -1135,6 +1502,7 @@ class TrainingWorker:
         traceparent: str | None = None,
         *,
         session_id: str | None = None,
+        actual_rank: int | None = None,
     ) -> str:
         """Save LoRA adapter to directory.
 
@@ -1148,26 +1516,36 @@ class TrainingWorker:
         self._bind_traceparent(traceparent)
         self._touch()
         if session_id is not None:
-            self._ensure_session_loaded(session_id)
+            self._ensure_session_loaded(session_id, actual_rank=actual_rank)
         import json
         import os
 
         from safetensors.torch import save_file
+        from tinker_server.backend.lora_utils import truncate_lora_state_dict
 
         os.makedirs(save_path, exist_ok=True)
+        effective_rank = self._resolve_actual_rank(actual_rank)
+        self._zero_lora_rank_tail(effective_rank, zero_grads=True)
 
         # Save adapter weights
         state_dict = self.get_lora_state_dict()
+        state_dict = truncate_lora_state_dict(state_dict, self.max_lora_rank, effective_rank)
         save_file(state_dict, os.path.join(save_path, "adapter_model.safetensors"))
 
         # Save adapter config
-        config = self.get_lora_config()
+        config = self.get_lora_config(effective_rank)
         with open(os.path.join(save_path, "adapter_config.json"), "w") as f:
             json.dump(config, f, indent=2)
 
         abs_path = os.path.abspath(save_path)
         logger.info(f"[TrainingWorker] Saved LoRA weights to {abs_path}")
-        return abs_path
+        return {
+            "path": abs_path,
+            "state_dict": state_dict,
+            "peft_config": config,
+            "current_step": self._step_count,
+            "learning_rate": self.optimizer.param_groups[0]["lr"],
+        }
 
     def save_checkpoint(
         self,
@@ -1175,6 +1553,7 @@ class TrainingWorker:
         traceparent: str | None = None,
         *,
         session_id: str | None = None,
+        actual_rank: int | None = None,
     ) -> dict:
         """Save full checkpoint: LoRA weights + optimizer state + training metadata.
 
@@ -1188,21 +1567,25 @@ class TrainingWorker:
         self._bind_traceparent(traceparent)
         self._touch()
         if session_id is not None:
-            self._ensure_session_loaded(session_id)
+            self._ensure_session_loaded(session_id, actual_rank=actual_rank)
         import json
         import os
 
         torch = _get_torch()
         from safetensors.torch import save_file
+        from tinker_server.backend.lora_utils import truncate_lora_state_dict
 
         os.makedirs(save_path, exist_ok=True)
+        effective_rank = self._resolve_actual_rank(actual_rank)
+        self._zero_lora_rank_tail(effective_rank, zero_grads=True)
 
         # 1. LoRA weights
         state_dict = self.get_lora_state_dict()
+        state_dict = truncate_lora_state_dict(state_dict, self.max_lora_rank, effective_rank)
         save_file(state_dict, os.path.join(save_path, "adapter_model.safetensors"))
 
         # 2. LoRA config
-        peft_config = self.get_lora_config()
+        peft_config = self.get_lora_config(effective_rank)
         with open(os.path.join(save_path, "adapter_config.json"), "w") as f:
             json.dump(peft_config, f, indent=2)
 
@@ -1213,6 +1596,7 @@ class TrainingWorker:
         meta = {
             "current_step": self._step_count,
             "learning_rate": self.optimizer.param_groups[0]["lr"],
+            "actual_rank": effective_rank,
             # Include state_dict and config for multi-LoRA registration
             # (API server can't read files from Ray worker filesystem)
             "state_dict": state_dict,
@@ -1252,29 +1636,11 @@ class TrainingWorker:
         torch = _get_torch()
         from safetensors.torch import load_file
 
-        # 1. Load LoRA weights
+        # 1. Load LoRA weights and metadata
         adapter_path = os.path.join(load_path, "adapter_model.safetensors")
         if not os.path.exists(adapter_path):
             raise FileNotFoundError(f"Adapter not found: {adapter_path}")
 
-        # 2. Optionally load optimizer state
-        optimizer_path = os.path.join(load_path, "optimizer.pt")
-        if load_optimizer:
-            if not os.path.exists(optimizer_path):
-                raise FileNotFoundError(
-                    f"Optimizer restore requested, but optimizer state not found: {optimizer_path}"
-                )
-
-        if session_id is not None:
-            self._ensure_session_loaded(session_id)
-
-        state_dict = load_file(adapter_path, device=str(self.device))
-        # Load into PEFT model
-        from peft.utils.save_and_load import set_peft_model_state_dict
-        set_peft_model_state_dict(self.model, state_dict)
-        logger.info(f"[TrainingWorker] Loaded LoRA weights from {adapter_path}")
-
-        # 3. Load and return metadata
         meta: dict[str, object] = {}
         meta_path = os.path.join(load_path, "training_meta.json")
         if os.path.exists(meta_path):
@@ -1290,6 +1656,63 @@ class TrainingWorker:
                     meta_path,
                 )
 
+        config_rank: int | None = None
+        adapter_config_path = os.path.join(load_path, "adapter_config.json")
+        if os.path.exists(adapter_config_path):
+            with open(adapter_config_path, "r") as f:
+                adapter_config = json.load(f)
+            if not isinstance(adapter_config, dict):
+                raise ValueError(
+                    f"adapter_config.json must contain a JSON object, got {type(adapter_config).__name__}"
+                )
+            raw_config_rank = adapter_config.get("r")
+            if not isinstance(raw_config_rank, int) or isinstance(raw_config_rank, bool):
+                raise ValueError(f"adapter_config.r must be an int, got {raw_config_rank!r}")
+            config_rank = int(raw_config_rank)
+
+        # 2. Optionally load optimizer state
+        optimizer_path = os.path.join(load_path, "optimizer.pt")
+        if load_optimizer:
+            if not os.path.exists(optimizer_path):
+                raise FileNotFoundError(
+                    f"Optimizer restore requested, but optimizer state not found: {optimizer_path}"
+                )
+
+        state_dict = load_file(adapter_path, device=str(self.device))
+        from tinker_server.backend.lora_utils import get_lora_rank_from_state_dict, pad_lora_state_dict
+
+        meta_rank: int | None = None
+        if "actual_rank" in meta:
+            raw_meta_rank = meta["actual_rank"]
+            if not isinstance(raw_meta_rank, int) or isinstance(raw_meta_rank, bool):
+                raise ValueError(f"training_meta.actual_rank must be an int, got {raw_meta_rank!r}")
+            meta_rank = int(raw_meta_rank)
+        inferred_rank = get_lora_rank_from_state_dict(state_dict)
+        rank_sources = [
+            ("training_meta.actual_rank", meta_rank),
+            ("adapter_config.r", config_rank),
+            ("adapter_model.safetensors", inferred_rank),
+        ]
+        present_ranks = [(name, rank) for name, rank in rank_sources if rank is not None]
+        if not present_ranks:
+            raise ValueError(f"No LoRA rank metadata or tensors found in checkpoint: {load_path}")
+        rank_values = {int(rank) for _, rank in present_ranks}
+        if len(rank_values) != 1:
+            raise ValueError(f"Checkpoint LoRA rank metadata mismatch: {present_ranks}")
+        actual_rank = next(iter(rank_values))
+        actual_rank = self._resolve_actual_rank(actual_rank)
+
+        if session_id is not None:
+            self._ensure_session_loaded(session_id, actual_rank=actual_rank)
+
+        state_dict = pad_lora_state_dict(state_dict, actual_rank, self.max_lora_rank)
+        # Load into PEFT model
+        from peft.utils.save_and_load import set_peft_model_state_dict
+        set_peft_model_state_dict(self.model, state_dict)
+        self._zero_lora_rank_tail(actual_rank=actual_rank, zero_grads=True)
+        logger.info(f"[TrainingWorker] Loaded LoRA weights from {adapter_path}")
+
+        # 3. Apply metadata and optimizer state
         if "current_step" in meta:
             meta_step = meta["current_step"]
             if isinstance(meta_step, int) and not isinstance(meta_step, bool):
@@ -1374,6 +1797,10 @@ class TrainingWorker:
         from peft.utils.save_and_load import set_peft_model_state_dict
 
         set_peft_model_state_dict(self.model, state_dict)
+        self._zero_lora_rank_tail(
+            actual_rank if actual_rank is not None else trainer_rank,
+            zero_grads=True,
+        )
         logger.info(f"[TrainingWorker] Loaded adapter state from {checkpoint_path}")
 
         return {"status": "ok", "path": checkpoint_path, "actual_rank": actual_rank}
@@ -1404,6 +1831,8 @@ class TrainingWorker:
         from tinker_server.backend.lora_utils import truncate_lora_state_dict
 
         os.makedirs(checkpoint_path, exist_ok=True)
+        if actual_rank is not None:
+            self._zero_lora_rank_tail(actual_rank, zero_grads=True)
 
         # Get LoRA state dict
         state_dict = get_peft_model_state_dict(self.model)
@@ -1450,6 +1879,7 @@ class TrainingWorker:
     def reinit_lora_weights(
         self,
         learning_rate: float | None = None,
+        actual_rank: int | None = None,
         traceparent: str | None = None,
     ) -> dict:
         """Reinitialize LoRA weights AND optimizer state for fresh session.
@@ -1501,6 +1931,7 @@ class TrainingWorker:
 
         # Zero gradients
         self.optimizer.zero_grad()
+        tail_zeroed = self._zero_lora_rank_tail(actual_rank, zero_grads=True)
 
         # Reset optimizer state (momentum/variance)
         opt_state_reset = len(self.optimizer.state)
@@ -1514,9 +1945,11 @@ class TrainingWorker:
         return {
             "status": "ok",
             "reinit_count": reinit_count,
+            "tail_zeroed": tail_zeroed,
             "opt_state_reset": opt_state_reset,
             "lr_updated": lr_updated,
             "learning_rate": learning_rate,
+            "actual_rank": self._resolve_actual_rank(actual_rank),
         }
 
     def get_session_info(self) -> dict:
@@ -1637,6 +2070,67 @@ class VerlTrainingEngine:
         self._resource_pool_actor_names: dict[str, str] = {}
         self._actor_loaded_sessions: dict[str, str] = {}
         self._actor_volatile_sessions: dict[str, set[str]] = {}
+        # Session-level poisoned marker for mid-call actor failures.
+        # Value stores the user-facing reason that requires reload boundary.
+        self._poisoned_sessions: dict[str, str] = {}
+        self._hard_poisoned_sessions: dict[str, str] = {}
+        self._megatron_recycle_locks: dict[str, asyncio.Lock] = {}
+        self._megatron_recycle_locks_guard = asyncio.Lock()
+
+    def _megatron_guard_preflight_enabled(self) -> bool:
+        raw = os.environ.get("MINT_MEGATRON_GUARD_PREFLIGHT", "1").strip().lower()
+        return raw not in ("0", "false", "no", "off")
+
+    def _megatron_guard_query_timeout_s(self) -> float:
+        raw = os.environ.get("MINT_MEGATRON_GUARD_QUERY_TIMEOUT_S", "30").strip()
+        try:
+            timeout_s = float(raw)
+        except Exception:
+            timeout_s = 30.0
+        return max(1.0, timeout_s)
+
+    async def _ensure_megatron_session_guard_clean(
+        self,
+        session: "TrainingSession",
+        *,
+        op: str,
+        worker: ray.actor.ActorHandle,
+    ) -> None:
+        if session.backend != "megatron" or not self._megatron_guard_preflight_enabled():
+            return
+        get_guard_state = getattr(worker, "get_session_guard_state", None)
+        if get_guard_state is None:
+            return
+        guard_timeout_s = self._megatron_guard_query_timeout_s()
+        try:
+            guard_state = await self._await_with_keepalive(
+                get_guard_state.remote(session.model_id),
+                session,
+                interval_s=30.0,
+                timeout_s=guard_timeout_s,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"[{session.model_id}] failed to query megatron session guard before op={op}: "
+                f"{type(e).__name__}: {e}"
+            ) from e
+        if not isinstance(guard_state, dict):
+            raise RuntimeError(
+                f"[{session.model_id}] invalid megatron session guard payload type "
+                f"{type(guard_state).__name__} before op={op}"
+            )
+        contaminated = bool(guard_state.get("contaminated", False))
+        blocked = bool(guard_state.get("blocked", False))
+        if not contaminated and not blocked:
+            return
+        contamination_reason = guard_state.get("contamination_reason")
+        block_reason = guard_state.get("block_reason")
+        raise RuntimeError(
+            f"[{session.model_id}] megatron session guard denied op={op}: "
+            f"contaminated={contaminated} blocked={blocked} "
+            f"contamination_reason={contamination_reason!r} block_reason={block_reason!r}; "
+            "requires clean reload"
+        )
 
     async def initialize(self) -> None:
         """Initialize Ray connection."""
@@ -1658,11 +2152,805 @@ class VerlTrainingEngine:
         actor_name = self._resource_pool_actor_names.get(session.model_id)
         if not actor_name:
             return
-        from .resource_pool import get_resource_pool
+        try:
+            from .resource_pool import get_resource_pool
 
-        resource_pool = get_resource_pool()
-        resource_pool.touch(actor_name)
-        resource_pool.set_session(actor_name, session.model_id)
+            resource_pool = get_resource_pool()
+            resource_pool.touch(actor_name)
+            resource_pool.set_session(actor_name, session.model_id)
+        except Exception:
+            logger.debug("[%s] skip touch_actor for %s", session.model_id, actor_name, exc_info=True)
+
+    def _actor_name_for_session(self, session: "TrainingSession") -> str | None:
+        return self._resource_pool_actor_names.get(session.model_id)
+
+    def _raise_if_session_poisoned(self, session: "TrainingSession", *, op: str) -> None:
+        hard_error = self._hard_poisoned_sessions.get(session.model_id)
+        if hard_error is not None:
+            raise RuntimeError(hard_error)
+        if op == "load_weights":
+            return
+        error = self._poisoned_sessions.get(session.model_id)
+        if error is not None:
+            raise RuntimeError(error)
+
+    def _note_successful_worker_call(self, session: "TrainingSession", *, op: str) -> None:
+        actor_name = self._actor_name_for_session(session)
+        if not actor_name:
+            return
+        self._actor_loaded_sessions[actor_name] = session.model_id
+        if op in {"forward_backward", "optim_step", "train_step"}:
+            self._actor_volatile_sessions.setdefault(actor_name, set()).add(session.model_id)
+        if op == "load_weights":
+            self._poisoned_sessions.pop(session.model_id, None)
+            self._hard_poisoned_sessions.pop(session.model_id, None)
+
+    def _megatron_op_requires_fail_closed_after_actor_death(self, op: str) -> bool:
+        return op in {
+            "forward_backward",
+            "optim_step",
+            "train_step",
+            "save_weights",
+            "save_lora_weights_for_sampler",
+            "load_weights",
+        }
+
+    def _megatron_missing_actor_recovery_error(
+        self,
+        session: "TrainingSession",
+        *,
+        op: str,
+        cause: BaseException,
+    ) -> str | None:
+        if not isinstance(cause, RuntimeError) or "missing worker" not in str(cause):
+            return None
+
+        from .megatron_distributed import MegatronSessionStateManager, _make_megatron_actor_name
+
+        session_manager = MegatronSessionStateManager()
+        actor_name = self._resource_pool_actor_names.get(session.model_id)
+        if not actor_name:
+            actor_name = _make_megatron_actor_name(session.base_model or "")
+
+        list_actor_only_state_sessions = getattr(session_manager, "list_actor_only_state_sessions", None)
+        dirty_sessions: list[str] = []
+        if callable(list_actor_only_state_sessions):
+            raw_dirty = list_actor_only_state_sessions(actor_name)
+            if isinstance(raw_dirty, (list, tuple, set)):
+                dirty_sessions = [str(s) for s in raw_dirty if isinstance(s, str)]
+
+        sibling_dirty = sorted([sid for sid in dirty_sessions if sid != session.model_id])
+        if sibling_dirty:
+            siblings = ", ".join(sibling_dirty)
+            return (
+                f"[{session.model_id}] megatron actor was missing before op={op}; "
+                f"dirty_sibling session(s) detected on shared actor cache: {siblings}. "
+                "Reload all dirty sessions from explicit checkpoints before continuing."
+            )
+        if session.model_id in dirty_sessions:
+            return (
+                f"[{session.model_id}] megatron actor was missing before op={op}, and this session has "
+                "actor-only training state that was never fully persisted. Reload from an explicit "
+                "checkpoint before continuing."
+            )
+
+        if not session_manager.session_exists(session.model_id):
+            return (
+                f"[{session.model_id}] megatron actor was missing before op={op}, but the session "
+                "has no persisted Megatron session cache. The request was not retried because "
+                "that would recreate blank in-memory state. Recreate or reload the session from "
+                "a checkpoint before continuing."
+            )
+        meta = session_manager.get_metadata(session.model_id)
+        if not isinstance(meta, dict):
+            return (
+                f"[{session.model_id}] megatron actor was missing before op={op}, and the session "
+                "cache is missing session_metadata.json. Reload the session from an explicit "
+                "checkpoint before continuing."
+            )
+        return None
+
+    async def _recycle_worker_after_failure(
+        self,
+        session: "TrainingSession",
+        *,
+        op: str,
+        cause: BaseException,
+        request_started: bool = False,
+    ) -> ray.actor.ActorHandle:
+        actor_name = self._actor_name_for_session(session)
+        lost_session_ids: list[str] = []
+        if actor_name is not None:
+            lost_session_ids = sorted(self._actor_volatile_sessions.get(actor_name, set()))
+
+        if session.backend == "megatron" and lost_session_ids:
+            joined = ", ".join(lost_session_ids)
+            err = (
+                f"[{session.model_id}] megatron actor recycle detected after op={op}, but "
+                f"session(s) {joined} had live in-memory state that was never persisted. "
+                "The request was not retried because that would hide rollback. "
+                "Reload the lost session from a checkpoint before continuing."
+            )
+            for sid in lost_session_ids:
+                self._poisoned_sessions[sid] = err
+            if actor_name:
+                self._actor_loaded_sessions.pop(actor_name, None)
+                self._actor_volatile_sessions.pop(actor_name, None)
+            raise RuntimeError(err) from cause
+
+        if session.backend == "megatron":
+            missing_actor_error = self._megatron_missing_actor_recovery_error(
+                session,
+                op=op,
+                cause=cause,
+            )
+            if missing_actor_error is not None:
+                self._poisoned_sessions[session.model_id] = missing_actor_error
+                if actor_name:
+                    self._actor_loaded_sessions.pop(actor_name, None)
+                    self._actor_volatile_sessions.pop(actor_name, None)
+                raise RuntimeError(missing_actor_error) from cause
+            if request_started and self._megatron_op_requires_fail_closed_after_actor_death(op):
+                worker = await self._recycle_megatron_actor(session, op=op, cause=cause)
+                err = (
+                    f"[{session.model_id}] megatron actor died during op={op}; "
+                    "operation may have partially executed before the crash; "
+                    "reload from checkpoint before retrying."
+                )
+                self._poisoned_sessions[session.model_id] = err
+                if actor_name:
+                    self._actor_loaded_sessions.pop(actor_name, None)
+                    self._actor_volatile_sessions.pop(actor_name, None)
+                raise RuntimeError(err) from cause
+            worker = await self._recycle_megatron_actor(session, op=op, cause=cause)
+            if actor_name:
+                self._actor_loaded_sessions.pop(actor_name, None)
+                self._actor_volatile_sessions.pop(actor_name, None)
+            return worker
+
+        worker = await self._recycle_dense_actor(session, op=op, cause=cause)
+        if op != "load_weights":
+            err = (
+                f"[{session.model_id}] dense actor recycle detected after op={op}; "
+                "operation may have partially executed before the crash; "
+                "reload from checkpoint before retrying."
+            )
+            self._poisoned_sessions[session.model_id] = err
+            raise RuntimeError(err) from cause
+        return worker
+
+    def _resolve_megatron_base_model(self, session: "TrainingSession") -> tuple[str, str]:
+        """Resolve Megatron base model path strictly; never fallback to unrelated defaults."""
+        requested_model = session.base_model or self.default_base_model
+        if not requested_model:
+            raise RuntimeError(f"[{session.model_id}] could not resolve Megatron base model: empty model id")
+        if requested_model.startswith("/"):
+            return requested_model, requested_model
+        resolved = self._resolve_hf_model_path(requested_model)
+        if not resolved:
+            raise RuntimeError(
+                f"[{session.model_id}] could not resolve Megatron base model {requested_model!r} to local path"
+            )
+        return resolved, requested_model
+
+    def _resolve_session_base_model(self, session: "TrainingSession") -> tuple[str | None, str | None]:
+        requested_model = session.base_model or self.default_base_model
+        if requested_model and not requested_model.startswith("/"):
+            base_model = self._resolve_hf_model_path(requested_model)
+            if base_model:
+                return base_model, requested_model
+            return self.default_base_model, requested_model
+        return requested_model, requested_model
+
+    def _build_megatron_distributed_config(
+        self,
+        *,
+        requested_model: str | None,
+        base_model: str | None,
+    ):
+        from .megatron_distributed import DistributedConfig
+        from .model_registry import get_model_config, get_training_parallelism
+
+        cfg = get_model_config(requested_model or base_model or "")
+        train_tp, train_pp, train_ep, train_cp, train_etp = get_training_parallelism(
+            requested_model or base_model or ""
+        )
+        return DistributedConfig(
+            tensor_parallel_size=train_tp,
+            pipeline_parallel_size=train_pp,
+            expert_parallel_size=train_ep,
+            context_parallel_size=train_cp,
+            expert_tensor_parallel_size=train_etp,
+            use_fp8=bool(getattr(cfg, "train_use_fp8", False)),
+            router_replay_mode=server_config.router_replay_mode,
+        )
+
+    async def _rebind_megatron_worker(
+        self,
+        session: "TrainingSession",
+        *,
+        reason: str,
+        allow_create: bool = True,
+    ) -> ray.actor.ActorHandle:
+        from .megatron_distributed import (
+            PERSISTENT_NAMESPACE,
+            _make_megatron_actor_name,
+            async_get_or_create_megatron_worker_group,
+        )
+        from .model_registry import is_persistent_model
+        from .resource_pool import ActorType, get_resource_pool
+
+        base_model, requested_model = self._resolve_megatron_base_model(session)
+        actor_name = _make_megatron_actor_name(base_model or requested_model or session.base_model or "")
+        actual_rank = session.lora_config.rank if session.lora_config else self.default_lora_rank
+        trainer_lora_rank = int(server_config.max_lora_rank)
+        distributed_config = self._build_megatron_distributed_config(
+            requested_model=requested_model,
+            base_model=base_model,
+        )
+
+        if allow_create:
+            worker = await async_get_or_create_megatron_worker_group(
+                base_model=base_model,
+                lora_rank=trainer_lora_rank,
+                learning_rate=session.learning_rate,
+                distributed_config=distributed_config,
+                session_id=session.model_id,
+                actual_rank=actual_rank,
+            )
+            ready_timeout_s = (
+                float(server_config.training_actor_ready_timeout_s)
+                if server_config.training_actor_ready_timeout_s is not None
+                else 3600.0
+            )
+            try:
+                await self._await_with_keepalive(
+                    worker.__ray_ready__.remote(),
+                    session,
+                    interval_s=30.0,
+                    timeout_s=ready_timeout_s,
+                )
+            except Exception as e:
+                if self._is_dead_actor_error(e):
+                    raise RuntimeError(f"[{session.model_id}] missing worker for backend=megatron") from e
+                raise
+        else:
+            try:
+                worker = await asyncio.to_thread(
+                    ray.get_actor,
+                    actor_name,
+                    namespace=PERSISTENT_NAMESPACE,
+                )
+            except ValueError as e:
+                raise RuntimeError(f"[{session.model_id}] missing worker for backend=megatron") from e
+
+        get_resource_pool().register(
+            actor_name=actor_name,
+            actor_type=ActorType.MEGATRON,
+            num_gpus=distributed_config.world_size,
+            actor_handle=worker,
+            namespace=PERSISTENT_NAMESPACE,
+            base_model=base_model or requested_model or "",
+            session_id=session.model_id,
+            protected=is_persistent_model(base_model or requested_model or ""),
+        )
+        get_resource_pool().mark_ready(actor_name)
+        self._resource_pool_actor_names[session.model_id] = actor_name
+        self._workers[session.model_id] = worker
+        self._touch_actor(session)
+        session.backend = "megatron"
+        session.is_active = True
+        logger.warning(
+            "[%s] megatron worker rebound without recycle actor=%s reason=%s",
+            session.model_id,
+            actor_name,
+            reason,
+        )
+        return worker
+
+    async def _get_actor_recycle_lock(self, actor_name: str) -> asyncio.Lock:
+        async with self._megatron_recycle_locks_guard:
+            lock = self._megatron_recycle_locks.get(actor_name)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._megatron_recycle_locks[actor_name] = lock
+            return lock
+
+    @staticmethod
+    def _walk_exception_chain(error: BaseException) -> list[BaseException]:
+        pending = [error]
+        seen: set[int] = set()
+        ordered: list[BaseException] = []
+        while pending:
+            exc = pending.pop()
+            exc_id = id(exc)
+            if exc_id in seen:
+                continue
+            seen.add(exc_id)
+            ordered.append(exc)
+            for attr in ("cause", "__cause__", "__context__"):
+                child = getattr(exc, attr, None)
+                if isinstance(child, BaseException):
+                    pending.append(child)
+        return ordered
+
+    @classmethod
+    def _is_dead_actor_error(cls, error: BaseException) -> bool:
+        dead_types = (
+            ray.exceptions.ActorDiedError,
+            ray.exceptions.RayActorError,
+        )
+        for exc in cls._walk_exception_chain(error):
+            if isinstance(exc, dead_types):
+                return True
+        text = " | ".join(f"{type(exc).__name__}: {exc}" for exc in cls._walk_exception_chain(error)).lower()
+        return (
+            "actordiederror" in text
+            or "rayactorerror" in text
+            or "the actor died unexpectedly" in text
+            or "worker process has died" in text
+        )
+
+    @staticmethod
+    def _actor_state_name_by_handle(worker: ray.actor.ActorHandle) -> str | None:
+        actor_id_obj = getattr(worker, "_actor_id", None)
+        actor_id_hex = None
+        if actor_id_obj is not None:
+            try:
+                actor_id_hex = actor_id_obj.hex()
+            except Exception:
+                actor_id_hex = None
+        try:
+            info = ray._private.state.actors(actor_id=actor_id_hex) if actor_id_hex else None
+        except Exception:
+            return None
+        if isinstance(info, dict):
+            state = info.get("State")
+            if isinstance(state, str):
+                return state
+        return None
+
+    async def _classify_actor_timeout(
+        self,
+        *,
+        worker: ray.actor.ActorHandle,
+        actor_name: str,
+        namespace: str,
+    ) -> str:
+        def _inspect() -> str:
+            state_name = self._actor_state_name_by_handle(worker)
+            if isinstance(state_name, str) and state_name:
+                return state_name
+            try:
+                ray.get_actor(actor_name, namespace=namespace)
+            except ValueError:
+                return "DEAD"
+            except Exception:
+                return "UNKNOWN"
+            return "ALIVE"
+
+        try:
+            return await asyncio.to_thread(_inspect)
+        except Exception:
+            return "UNKNOWN"
+
+    async def _maybe_collect_worker_cuda_memory_summary(
+        self,
+        worker: ray.actor.ActorHandle,
+    ) -> dict[str, Any] | None:
+        timeout_s = float(os.environ.get("MINT_WORKER_CUDA_SUMMARY_TIMEOUT_S", "2.0"))
+        try:
+            try:
+                return await asyncio.to_thread(
+                    ray.get,
+                    worker.get_cuda_memory_summary.remote(),
+                    timeout=timeout_s,
+                )
+            except AttributeError:
+                return await asyncio.to_thread(
+                    ray.get,
+                    worker.get_cuda_memory_stats.remote(),
+                    timeout=timeout_s,
+                )
+        except Exception as e:
+            return {
+                "cuda_available": False,
+                "error_type": type(e).__name__,
+                "error": str(e),
+            }
+
+    async def _log_worker_request_context(
+        self,
+        session: "TrainingSession",
+        worker: ray.actor.ActorHandle,
+        *,
+        op: str,
+        stage: str,
+        batch_stats: dict[str, int] | None = None,
+    ) -> None:
+        cuda_summary = await self._maybe_collect_worker_cuda_memory_summary(worker)
+        logger.info(
+            "[%s] worker_request_context backend=%s op=%s stage=%s batch_size=%s total_tokens=%s max_seq_len=%s cuda_summary=%s",
+            session.model_id,
+            session.backend,
+            op,
+            stage,
+            None if batch_stats is None else batch_stats.get("batch_size"),
+            None if batch_stats is None else batch_stats.get("total_tokens"),
+            None if batch_stats is None else batch_stats.get("max_seq_len"),
+            cuda_summary,
+        )
+
+    async def _recycle_megatron_actor(
+        self,
+        session: "TrainingSession",
+        *,
+        op: str,
+        cause: BaseException,
+    ) -> ray.actor.ActorHandle:
+        actor_name = self._actor_name_for_session(session)
+        if not actor_name:
+            from .megatron_distributed import _make_megatron_actor_name
+
+            actor_name = _make_megatron_actor_name(session.base_model or "")
+        lock = await self._get_actor_recycle_lock(actor_name)
+        async with lock:
+            self._workers.pop(session.model_id, None)
+            return await self._rebind_megatron_worker(
+                session,
+                reason=f"{op}:{type(cause).__name__}",
+                allow_create=True,
+            )
+
+    async def _recycle_dense_actor(
+        self,
+        session: "TrainingSession",
+        *,
+        op: str,
+        cause: BaseException,
+    ) -> ray.actor.ActorHandle:
+        return await self._recover_dense_worker(session, reason=f"{op}:{type(cause).__name__}")
+
+    async def _run_worker_call_with_actor_recycle(
+        self,
+        session: "TrainingSession",
+        *,
+        op: str,
+        submit_fn,
+        batch_stats: dict[str, int] | None = None,
+        interval_s: float = 30.0,
+        timeout_s: float | None = None,
+        allow_recover: bool = False,
+    ):
+        self._raise_if_session_poisoned(session, op=op)
+        try:
+            worker = await self._get_live_worker(session, op=op, allow_recover=allow_recover)
+        except RuntimeError as e:
+            if "missing worker" not in str(e):
+                raise
+            worker = await self._recycle_worker_after_failure(session, op=op, cause=e)
+
+        self._touch_actor(session)
+        await self._log_worker_request_context(
+            session,
+            worker,
+            op=op,
+            stage="before_submit",
+            batch_stats=batch_stats,
+        )
+
+        attempts = 0
+        while True:
+            try:
+                pending = submit_fn(worker)
+                result = await self._await_worker_call(
+                    pending,
+                    session,
+                    op=op,
+                    worker=worker,
+                    interval_s=interval_s,
+                    timeout_s=timeout_s,
+                )
+                self._note_successful_worker_call(session, op=op)
+                return result
+            except Exception as e:
+                if not self._is_dead_actor_error(e):
+                    raise
+                if attempts >= 1:
+                    raise
+                attempts += 1
+                logger.warning(
+                    "[%s] actor_recycle_retry op=%s attempt=%s error_type=%s",
+                    session.model_id,
+                    op,
+                    attempts,
+                    type(e).__name__,
+                )
+                worker = await self._recycle_worker_after_failure(
+                    session,
+                    op=op,
+                    cause=e,
+                    request_started=True,
+                )
+                await self._log_worker_request_context(
+                    session,
+                    worker,
+                    op=op,
+                    stage="after_recycle",
+                    batch_stats=batch_stats,
+                )
+
+    @staticmethod
+    def _iter_exception_chain(error: BaseException) -> list[BaseException]:
+        chain: list[BaseException] = []
+        seen: set[int] = set()
+        current: BaseException | None = error
+        while current is not None and id(current) not in seen:
+            chain.append(current)
+            seen.add(id(current))
+            next_error = getattr(current, "cause", None)
+            if not isinstance(next_error, BaseException):
+                next_error = getattr(current, "__cause__", None)
+            if not isinstance(next_error, BaseException):
+                next_error = getattr(current, "__context__", None)
+            current = next_error if isinstance(next_error, BaseException) else None
+        return chain
+
+    @classmethod
+    def _format_exception_summary(cls, error: BaseException) -> str:
+        parts: list[str] = []
+        for exc in cls._iter_exception_chain(error)[:3]:
+            msg = str(exc).strip()
+            if msg:
+                parts.append(f"{type(exc).__name__}: {msg}")
+            else:
+                parts.append(type(exc).__name__)
+        return " | ".join(parts)
+
+    @classmethod
+    def _dense_fatal_error_reason(cls, error: BaseException) -> str | None:
+        keywords = (
+            "acceleratorerror",
+            "cuda error",
+            "device-side assert",
+            "device side assert",
+            "illegal memory access",
+        )
+        for exc in cls._iter_exception_chain(error):
+            haystack = f"{type(exc).__name__}: {exc}".lower()
+            if any(keyword in haystack for keyword in keywords):
+                return cls._format_exception_summary(error)
+        return None
+
+    @classmethod
+    def _classify_training_failure(cls, error: BaseException) -> tuple[str, str]:
+        if isinstance(error, asyncio.TimeoutError):
+            return "timeout", "timeout"
+        if isinstance(error, getattr(ray.exceptions, "GetTimeoutError", tuple())):
+            return "timeout", "timeout"
+        if cls._dense_fatal_error_reason(error) is not None:
+            return "error", "cuda_fatal"
+        if isinstance(error, Exception):
+            failure_class = "internal_error"
+            for exc in cls._iter_exception_chain(error):
+                if not isinstance(exc, Exception):
+                    continue
+                candidate = classify_failure_reason(exc)
+                if candidate == "canceled":
+                    return "canceled", candidate
+                if candidate == "timeout":
+                    return "timeout", candidate
+                if candidate != "internal_error":
+                    failure_class = candidate
+                    break
+            return "error", failure_class
+        return "error", "internal_error"
+
+    @staticmethod
+    def _resolve_actor_node_id(actor_name: str | None) -> str | None:
+        if not actor_name:
+            return None
+        try:
+            from .resource_pool import get_resource_pool
+
+            entry = get_resource_pool().get(str(actor_name))
+        except Exception:
+            return None
+        node_id = getattr(entry, "node_id", None) if entry is not None else None
+        if isinstance(node_id, str) and node_id.strip():
+            return node_id.strip()
+        return None
+
+    async def _handle_dense_worker_failure(
+        self,
+        session: "TrainingSession",
+        *,
+        op: str,
+        error: BaseException,
+        worker: ray.actor.ActorHandle | None = None,
+    ) -> None:
+        if session.backend != "peft":
+            return
+        if isinstance(error, asyncio.TimeoutError):
+            return
+        if isinstance(error, getattr(ray.exceptions, "GetTimeoutError", tuple())):
+            return
+
+        fatal_reason = self._dense_fatal_error_reason(error)
+        if fatal_reason is None:
+            return
+
+        actor_name = str(self._resource_pool_actor_names.get(session.model_id) or getattr(session, "actor_name", "") or "")
+        if not actor_name:
+            return
+
+        from .runtime_observability import runtime_observability
+
+        runtime_observability.record_dense_actor_fatal(
+            base_model=session.base_model,
+            op=op,
+            failure_class="cuda_fatal",
+        )
+        runtime_observability.record_training_incident(
+            kind="dense_actor_fatal",
+            base_model=session.base_model,
+            backend=session.backend,
+            op=op,
+            status="error",
+            failure_class="cuda_fatal",
+            actor_name=actor_name,
+            node_id=self._resolve_actor_node_id(actor_name),
+            request_id=str(get_request_id() or "") or None,
+            session_id=str(getattr(session, "session_id", "") or session.model_id),
+            detail=fatal_reason,
+        )
+        record_span_event_otel(
+            "mint.dense_actor.fatal_gpu_error",
+            attributes={
+                "model_id": str(session.model_id),
+                "session_id": str(getattr(session, "session_id", "") or session.model_id),
+                "base_model": str(session.base_model or "unknown"),
+                "backend": str(session.backend or "unknown"),
+                "op": str(op),
+                "actor_name": actor_name,
+                "node_id": str(self._resolve_actor_node_id(actor_name) or "unknown"),
+                "request_id": str(get_request_id() or "-"),
+                "error": fatal_reason,
+            },
+        )
+
+        logger.warning(
+            "[%s] retiring dense trainer after fatal op=%s actor_name=%s node_id=%s request_id=%s session_id=%s error=%s",
+            session.model_id,
+            op,
+            actor_name,
+            self._resolve_actor_node_id(actor_name) or "unknown",
+            get_request_id() or "-",
+            getattr(session, "session_id", "") or session.model_id,
+            fatal_reason,
+        )
+
+        from .dense_trainer import retire_dense_trainer
+
+        retire_outcome = await asyncio.to_thread(
+            retire_dense_trainer,
+            actor_name=actor_name,
+            actor=worker,
+            reason=f"{op}:{fatal_reason}",
+            base_model=session.base_model,
+            session_id=session.model_id,
+            fatal_op=op,
+            request_id=str(get_request_id() or "") or None,
+            namespace=str(getattr(session, "namespace", "") or RAY_NAMESPACE),
+        )
+        if retire_outcome != "ok":
+            retire_failure = (
+                f"[{session.model_id}] dense actor retirement failed after fatal op={op}; "
+                f"actor_name={actor_name} outcome={retire_outcome}. "
+                "Operator must recycle the actor before this session can continue."
+            )
+            self._poisoned_sessions[session.model_id] = retire_failure
+            self._hard_poisoned_sessions[session.model_id] = retire_failure
+            runtime_observability.record_training_incident(
+                kind="dense_actor_retire_failed",
+                base_model=session.base_model,
+                backend=session.backend,
+                op=op,
+                status="error",
+                failure_class=str(retire_outcome or "unknown"),
+                actor_name=actor_name,
+                node_id=self._resolve_actor_node_id(actor_name),
+                request_id=str(get_request_id() or "") or None,
+                session_id=str(getattr(session, "session_id", "") or session.model_id),
+                detail=retire_failure,
+            )
+            logger.error(retire_failure)
+
+        self._workers.pop(session.model_id, None)
+        self._resource_pool_actor_names.pop(session.model_id, None)
+        if str(getattr(session, "actor_name", "") or "") == actor_name:
+            session.actor_name = None
+            session.namespace = None
+
+    async def _await_worker_call(
+        self,
+        awaitable,
+        session: "TrainingSession",
+        *,
+        op: str,
+        worker: ray.actor.ActorHandle | None = None,
+        interval_s: float = 30.0,
+        timeout_s: float | None = None,
+    ):
+        from .runtime_observability import runtime_observability
+
+        started = time.monotonic()
+        try:
+            result = await self._await_with_keepalive(
+                awaitable,
+                session,
+                interval_s=interval_s,
+                timeout_s=timeout_s,
+            )
+            runtime_observability.record_training_operation(
+                base_model=session.base_model,
+                backend=session.backend,
+                op=op,
+                status="ok",
+                failure_class="none",
+                duration_s=time.monotonic() - started,
+            )
+            return result
+        except Exception as e:
+            status, failure_class = self._classify_training_failure(e)
+            actor_name = str(
+                self._resource_pool_actor_names.get(session.model_id)
+                or getattr(session, "actor_name", "")
+                or ""
+            )
+            node_id = self._resolve_actor_node_id(actor_name)
+            duration_s = time.monotonic() - started
+            runtime_observability.record_training_operation(
+                base_model=session.base_model,
+                backend=session.backend,
+                op=op,
+                status=status,
+                failure_class=failure_class,
+                duration_s=duration_s,
+            )
+            runtime_observability.record_training_incident(
+                kind="training_failure",
+                base_model=session.base_model,
+                backend=session.backend,
+                op=op,
+                status=status,
+                failure_class=failure_class,
+                actor_name=actor_name or None,
+                node_id=node_id,
+                request_id=str(get_request_id() or "") or None,
+                session_id=str(getattr(session, "session_id", "") or session.model_id),
+                detail=self._format_exception_summary(e),
+            )
+            logger.warning(
+                "[%s] training op failed op=%s backend=%s status=%s failure_class=%s actor_name=%s node_id=%s request_id=%s session_id=%s error=%s",
+                session.model_id,
+                op,
+                session.backend,
+                status,
+                failure_class,
+                actor_name or "-",
+                node_id or "unknown",
+                get_request_id() or "-",
+                getattr(session, "session_id", "") or session.model_id,
+                self._format_exception_summary(e),
+            )
+            await self._handle_dense_worker_failure(
+                session,
+                op=op,
+                error=e,
+                worker=worker,
+            )
+            raise
 
     def _record_megatron_result_metrics(self, session: "TrainingSession", result: dict | None) -> None:
         if session.backend != "megatron" or not isinstance(result, dict):
@@ -1686,19 +2974,10 @@ class VerlTrainingEngine:
             total_s=float(metrics.get("session_switch_total_s:sum", 0.0) or 0.0),
         )
 
-    def _resolve_session_base_model(self, session: "TrainingSession") -> tuple[str | None, str | None]:
-        """Resolve session base model to a local path (same policy as create_training_session)."""
-        requested_model = session.base_model or self.default_base_model
-        if requested_model and not requested_model.startswith("/"):
-            base_model = self._resolve_hf_model_path(requested_model)
-            if base_model:
-                return base_model, requested_model
-            return self.default_base_model, requested_model
-        return requested_model, requested_model
-
     async def _recover_dense_worker(self, session: "TrainingSession", *, reason: str) -> ray.actor.ActorHandle:
         """Rebind a dense trainer actor after eviction/death."""
         from .dense_trainer import get_or_create_dense_trainer
+        from .runtime_observability import runtime_observability
 
         model_id = session.model_id
         base_model, name_key = self._resolve_session_base_model(session)
@@ -1735,6 +3014,22 @@ class VerlTrainingEngine:
             )
         except Exception:
             pass
+        runtime_observability.record_dense_actor_bind_decision(
+            base_model=session.base_model,
+            decision="recover",
+        )
+        runtime_observability.record_training_incident(
+            kind="dense_actor_bind_decision",
+            base_model=session.base_model,
+            backend=session.backend,
+            op="bind",
+            status="ok",
+            failure_class="none",
+            actor_name=dense.actor_name,
+            request_id=str(get_request_id() or "") or None,
+            session_id=str(getattr(session, "session_id", "") or session.model_id),
+            detail=f"recover:{reason}",
+        )
         logger.warning(
             "[%s] rebound dense trainer actor=%s reason=%s base_model=%s",
             model_id,
@@ -1754,6 +3049,36 @@ class VerlTrainingEngine:
         if not actor_name:
             return None
         namespace = str(getattr(session, "namespace", "") or RAY_NAMESPACE)
+        from .runtime_observability import runtime_observability
+
+        if session.backend == "peft":
+            from .dense_trainer import dense_trainer_reuse_block_reason
+
+            reuse_block_reason = dense_trainer_reuse_block_reason(actor_name)
+            if reuse_block_reason is not None:
+                runtime_observability.record_dense_actor_bind_decision(
+                    base_model=session.base_model,
+                    decision="rebind_refused_poisoned",
+                )
+                runtime_observability.record_training_incident(
+                    kind="dense_actor_bind_decision",
+                    base_model=session.base_model,
+                    backend=session.backend,
+                    op="bind",
+                    status="error",
+                    failure_class="poisoned_actor",
+                    actor_name=actor_name,
+                    request_id=str(get_request_id() or "") or None,
+                    session_id=str(getattr(session, "session_id", "") or session.model_id),
+                    detail=f"rebind_refused_poisoned:{reuse_block_reason}",
+                )
+                logger.warning(
+                    "[%s] refusing to rebind poisoned dense trainer actor=%s reason=%s",
+                    str(getattr(session, "model_id", "")),
+                    actor_name,
+                    reuse_block_reason,
+                )
+                return None
         try:
             worker = await asyncio.to_thread(ray.get_actor, actor_name, namespace=namespace)
         except Exception as e:
@@ -1769,6 +3094,23 @@ class VerlTrainingEngine:
         self._workers[session.model_id] = worker
         self._resource_pool_actor_names[session.model_id] = actor_name
         self._touch_actor(session)
+        if session.backend == "peft":
+            runtime_observability.record_dense_actor_bind_decision(
+                base_model=session.base_model,
+                decision="reuse",
+            )
+            runtime_observability.record_training_incident(
+                kind="dense_actor_bind_decision",
+                base_model=session.base_model,
+                backend=session.backend,
+                op="bind",
+                status="ok",
+                failure_class="none",
+                actor_name=actor_name,
+                request_id=str(get_request_id() or "") or None,
+                session_id=str(getattr(session, "session_id", "") or session.model_id),
+                detail=f"reuse:{reason}",
+            )
         logger.warning(
             "[%s] rebound worker actor=%s reason=%s backend=%s",
             session.model_id,
@@ -1797,6 +3139,12 @@ class VerlTrainingEngine:
         if worker is None:
             worker = await self._rebind_worker_from_session_metadata(session, reason=f"{op}:metadata_rebind")
         if worker is None:
+            if session.backend == "megatron":
+                return await self._rebind_megatron_worker(
+                    session,
+                    reason=f"{op}:missing_worker",
+                    allow_create=allow_recover,
+                )
             if session.backend == "peft" and allow_recover:
                 return await self._recover_dense_worker(session, reason=f"{op}:missing_worker")
             raise RuntimeError(f"[{model_id}] missing worker for backend={session.backend}")
@@ -1836,6 +3184,110 @@ class VerlTrainingEngine:
         """Whether invalid save metadata should fail the request for megatron."""
         raw = os.environ.get("MINT_MEGATRON_STRICT_SAVE_META", "1").strip().lower()
         return raw not in ("0", "false", "no", "off")
+
+    def _apply_megatron_loaded_lora_config(
+        self,
+        session: "TrainingSession",
+        meta: dict[str, object],
+    ) -> None:
+        lora_cfg = getattr(session, "lora_config", None)
+        if lora_cfg is None:
+            return
+        updates = {
+            "rank": int(cast(int, meta["actual_rank"])),
+            "train_attn": bool(meta["train_attn"]),
+            "train_mlp": bool(meta["train_mlp"]),
+            "train_unembed": bool(meta["train_unembed"]),
+        }
+        if hasattr(lora_cfg, "model_copy"):
+            session.lora_config = lora_cfg.model_copy(update=updates)
+            return
+        if hasattr(lora_cfg, "copy"):
+            session.lora_config = lora_cfg.copy(update=updates)
+            return
+        for key, value in updates.items():
+            setattr(lora_cfg, key, value)
+
+    def _validate_megatron_load_meta(self, meta: Any, *, op: str) -> dict[str, object]:
+        if not isinstance(meta, dict):
+            raise RuntimeError(
+                f"Megatron load_checkpoint returned invalid metadata for {op}: "
+                f"expected dict, got {type(meta).__name__}"
+            )
+
+        required_keys = {
+            "current_step",
+            "learning_rate",
+            "actual_rank",
+            "actor_only_state_dirty",
+            "checkpoint_path",
+            "optimizer_restored",
+            "train_attn",
+            "train_mlp",
+            "train_unembed",
+        }
+        missing = sorted(required_keys - set(meta))
+        if missing:
+            raise RuntimeError(
+                "Megatron load_checkpoint returned invalid metadata for "
+                f"{op}: missing keys {missing}"
+            )
+
+        current_step = meta["current_step"]
+        if not isinstance(current_step, int) or isinstance(current_step, bool) or current_step < 0:
+            raise RuntimeError(
+                "Megatron load_checkpoint returned invalid metadata for "
+                f"{op}: current_step must be a non-negative int, got {current_step!r}"
+            )
+
+        lr_value = meta["learning_rate"]
+        if not isinstance(lr_value, (int, float)) or isinstance(lr_value, bool):
+            raise RuntimeError(
+                "Megatron load_checkpoint returned invalid metadata for "
+                f"{op}: learning_rate must be finite, got {lr_value!r}"
+            )
+        learning_rate = float(lr_value)
+        if not math.isfinite(learning_rate):
+            raise RuntimeError(
+                "Megatron load_checkpoint returned invalid metadata for "
+                f"{op}: learning_rate must be finite, got {lr_value!r}"
+            )
+
+        actual_rank = meta["actual_rank"]
+        if not isinstance(actual_rank, int) or isinstance(actual_rank, bool) or actual_rank <= 0:
+            raise RuntimeError(
+                "Megatron load_checkpoint returned invalid metadata for "
+                f"{op}: actual_rank must be a positive int, got {actual_rank!r}"
+            )
+
+        checkpoint_path = meta["checkpoint_path"]
+        if not isinstance(checkpoint_path, str) or not checkpoint_path:
+            raise RuntimeError(
+                "Megatron load_checkpoint returned invalid metadata for "
+                f"{op}: checkpoint_path must be a non-empty string, got {checkpoint_path!r}"
+            )
+
+        normalized: dict[str, object] = {
+            "current_step": current_step,
+            "learning_rate": learning_rate,
+            "actual_rank": actual_rank,
+            "checkpoint_path": checkpoint_path,
+        }
+        for key in (
+            "actor_only_state_dirty",
+            "optimizer_restored",
+            "train_attn",
+            "train_mlp",
+            "train_unembed",
+        ):
+            value = meta[key]
+            if not isinstance(value, bool):
+                raise RuntimeError(
+                    "Megatron load_checkpoint returned invalid metadata for "
+                    f"{op}: {key} must be bool, got {value!r}"
+                )
+            normalized[key] = value
+        return normalized
 
     def _update_session_step_monotonic(
         self,
@@ -2074,6 +3526,7 @@ class VerlTrainingEngine:
             f"[DEBUG {model_id}] create_training_session start: requested_model={requested_model} use_megatron={use_megatron} base_model={base_model}",
             flush=True,
         )
+        observability_base_model = str(requested_model or base_model or "")
 
         if use_megatron:
             import asyncio
@@ -2084,6 +3537,7 @@ class VerlTrainingEngine:
             cfg = get_model_config(requested_model or base_model or "")
             train_tp, train_pp, train_ep, train_cp, train_etp = get_training_parallelism(requested_model or base_model or "")
             use_fp8 = bool(getattr(cfg, "train_use_fp8", False))
+            trainer_lora_rank = int(server_config.max_lora_rank)
             distributed_config = DistributedConfig(
                 tensor_parallel_size=train_tp,
                 pipeline_parallel_size=train_pp,
@@ -2093,7 +3547,7 @@ class VerlTrainingEngine:
                 use_fp8=use_fp8,
                 router_replay_mode=server_config.router_replay_mode,
             )
-            logger.info(f"[{model_id}] Creating MegatronWorkerGroup for MoE model (base={base_model}, lora_rank={lora_rank}, TP={train_tp}, PP={train_pp}, EP={train_ep}, CP={train_cp}, ETP={train_etp}, world_size={distributed_config.world_size}, fp8={use_fp8})")
+            logger.info(f"[{model_id}] Creating MegatronWorkerGroup for MoE model (base={base_model}, actual_rank={lora_rank}, trainer_lora_rank={trainer_lora_rank}, TP={train_tp}, PP={train_pp}, EP={train_ep}, CP={train_cp}, ETP={train_etp}, world_size={distributed_config.world_size}, fp8={use_fp8})")
 
             # Get or create persistent Megatron worker group
             # Uses detached Ray actor pattern like vLLM for crash resilience
@@ -2110,10 +3564,11 @@ class VerlTrainingEngine:
                     lambda: asyncio.wait_for(
                         async_get_or_create_megatron_worker_group(
                             base_model=base_model,
-                            lora_rank=lora_rank,
+                            lora_rank=trainer_lora_rank,
                             learning_rate=session.learning_rate,
                             distributed_config=distributed_config,
                             session_id=session.model_id,
+                            actual_rank=lora_rank,
                             observability_base_model=observability_base_model,
                         ),
                         timeout=megatron_timeout_s,
@@ -2182,6 +3637,7 @@ class VerlTrainingEngine:
                     base_model=base_model,
                     model_key=requested_model,
                     lora_rank=lora_rank,
+                    max_lora_rank=int(server_config.max_lora_rank),
                     learning_rate=session.learning_rate,
                     session_id=session.model_id,
                 ),
@@ -2207,9 +3663,15 @@ class VerlTrainingEngine:
             )
             traceparent = get_current_traceparent()
             try:
-                result = await self._await_with_keepalive(
-                    worker.reinit_lora_weights.remote(session.learning_rate, traceparent=traceparent),
+                result = await self._await_worker_call(
+                    worker.reinit_lora_weights.remote(
+                        session.learning_rate,
+                        actual_rank=lora_rank,
+                        traceparent=traceparent,
+                    ),
                     session,
+                    op="create_training_session.reinit_lora_weights",
+                    worker=worker,
                     interval_s=30.0,
                     timeout_s=effective_reinit_timeout_s,
                 )
@@ -2232,23 +3694,31 @@ class VerlTrainingEngine:
             session.backend = "peft"
             logger.info(f"[{model_id}] Dense trainer ready for {base_model} (max_rank={dense.max_lora_rank})")
 
-        # For Megatron: avoid blocking create_session on __ray_ready__.
-        #
-        # __ray_ready__ is a normal actor task, so it can queue behind long-running
-        # initialization/work tasks and appear to "hang" for hours even when the actor
-        # is healthy. Returning early lets clients proceed; subsequent training calls
-        # will naturally queue until the actor is ready.
+        # Optional non-blocking create for Megatron actors.
+        # Default remains blocking __ray_ready__ wait for deterministic API
+        # semantics and unit-test contract compatibility.
         if session.backend == "megatron":
-            actor_name = self._resource_pool_actor_names.get(model_id)
-            if actor_name:
-                from .resource_pool import get_resource_pool
+            skip_ready_wait = os.environ.get("MINT_MEGATRON_SKIP_CREATE_READY_WAIT", "0").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+            if skip_ready_wait:
+                actor_name = self._resource_pool_actor_names.get(model_id)
+                if actor_name:
+                    from .resource_pool import get_resource_pool
 
-                get_resource_pool().mark_ready(actor_name)
+                    get_resource_pool().mark_ready(actor_name)
 
-            self._workers[model_id] = worker
-            session.is_active = True
-            logger.info(f"[{model_id}] TrainingWorker ready (backend={session.backend})")
-            return
+                self._workers[model_id] = worker
+                session.is_active = True
+                logger.info(
+                    "[%s] TrainingWorker ready (backend=%s, skip_ready_wait=1)",
+                    model_id,
+                    session.backend,
+                )
+                return
 
         # Wait for actor to be ready (model loaded)
         # Use await instead of ray.get() to not block the event loop
@@ -2263,9 +3733,11 @@ class VerlTrainingEngine:
             flush=True,
         )
         try:
-            await self._await_with_keepalive(
+            await self._await_worker_call(
                 worker.__ray_ready__.remote(),
                 session,
+                op="create_training_session.ready",
+                worker=worker,
                 interval_s=30.0,
                 timeout_s=ready_timeout_s,
             )
@@ -2312,6 +3784,11 @@ class VerlTrainingEngine:
 
         # Mark actor as recently used to prevent LRU eviction during training
         self._touch_actor(session)
+        await self._ensure_megatron_session_guard_clean(
+            session,
+            op="forward_backward",
+            worker=worker,
+        )
 
         # Serialize data for Ray
         data_items = [item.model_dump() for item in request.forward_backward_input.data]
@@ -2359,9 +3836,16 @@ class VerlTrainingEngine:
                 loss_fn,
                 loss_fn_config,
                 session.model_id,
+                session.lora_config.rank if session.lora_config else None,
                 traceparent=traceparent,
             )
-        result = await self._await_with_keepalive(pending, session, interval_s=30.0)
+        result = await self._await_worker_call(
+            pending,
+            session,
+            op="forward_backward",
+            worker=worker,
+            interval_s=30.0,
+        )
 
         # Update session state
         session.accumulated_gradients += 1
@@ -2452,6 +3936,7 @@ class VerlTrainingEngine:
                         data_items=reference_items,
                         temperature=float(request.temperature),
                         session_id=ref_session_id,
+                        actual_rank=reference_actual_rank,
                         traceparent=traceparent,
                         train_attn=train_attn,
                         train_mlp=train_mlp,
@@ -2468,13 +3953,20 @@ class VerlTrainingEngine:
                     None,
                     float(request.temperature),
                     session.model_id,
+                    session.lora_config.rank if session.lora_config else None,
                     traceparent=traceparent,
                     train_attn=train_attn,
                     train_mlp=train_mlp,
                     train_unembed=train_unembed,
                     reference_full_log_prob_chunks=reference_chunks,
                 )
-                result = await self._await_with_keepalive(pending, session, interval_s=30.0)
+                result = await self._await_worker_call(
+                    pending,
+                    session,
+                    op="forward_backward_reverse_kl",
+                    worker=worker,
+                    interval_s=30.0,
+                )
             finally:
                 try:
                     await asyncio.to_thread(
@@ -2494,9 +3986,16 @@ class VerlTrainingEngine:
                 request.reference_model_path,
                 float(request.temperature),
                 session.model_id,
+                session.lora_config.rank if session.lora_config else None,
                 traceparent=traceparent,
             )
-            result = await self._await_with_keepalive(pending, session, interval_s=30.0)
+            result = await self._await_worker_call(
+                pending,
+                session,
+                op="forward_backward_reverse_kl",
+                worker=worker,
+                interval_s=30.0,
+            )
         session.accumulated_gradients += 1
         logger.info(f"[{model_id}] forward_backward_reverse_kl completed")
         return result
@@ -2520,6 +4019,11 @@ class VerlTrainingEngine:
 
         # Mark actor as recently used to prevent LRU eviction during training
         self._touch_actor(session)
+        await self._ensure_megatron_session_guard_clean(
+            session,
+            op="forward",
+            worker=worker,
+        )
 
         # Serialize data for Ray
         # ForwardRequest uses forward_input (not forward_backward_input)
@@ -2544,7 +4048,13 @@ class VerlTrainingEngine:
             )
         else:
             pending = worker.forward.remote(data_items, session.model_id, traceparent=traceparent)
-        result = await self._await_with_keepalive(pending, session, interval_s=30.0)
+        result = await self._await_worker_call(
+            pending,
+            session,
+            op="forward",
+            worker=worker,
+            interval_s=30.0,
+        )
         self._record_megatron_result_metrics(session, result)
 
         logger.info(f"[{model_id}] forward completed")
@@ -2568,6 +4078,45 @@ class VerlTrainingEngine:
 
         return result
 
+    async def get_session_guard_state(
+        self,
+        session: TrainingSession,
+    ) -> dict:
+        if session.backend != "megatron":
+            return {
+                "session_id": session.model_id,
+                "contaminated": False,
+                "blocked": False,
+                "contamination_reason": None,
+                "block_reason": None,
+                "external_checkpoint": None,
+                "trusted_recovery_baseline": None,
+            }
+        worker = await self._get_live_worker(session, op="get_session_guard_state")
+        get_guard_state = getattr(worker, "get_session_guard_state", None)
+        if get_guard_state is None:
+            return {
+                "session_id": session.model_id,
+                "contaminated": False,
+                "blocked": False,
+                "contamination_reason": None,
+                "block_reason": None,
+                "external_checkpoint": None,
+                "trusted_recovery_baseline": None,
+            }
+        self._touch_actor(session)
+        state = await self._await_with_keepalive(
+            get_guard_state.remote(session.model_id),
+            session,
+            interval_s=30.0,
+            timeout_s=30.0,
+        )
+        if not isinstance(state, dict):
+            raise RuntimeError(
+                f"[{session.model_id}] invalid get_session_guard_state payload type={type(state).__name__}"
+            )
+        return state
+
     async def optim_step(
         self,
         session: TrainingSession,
@@ -2587,6 +4136,11 @@ class VerlTrainingEngine:
 
         # Mark actor as recently used to prevent LRU eviction during training
         self._touch_actor(session)
+        await self._ensure_megatron_session_guard_clean(
+            session,
+            op="optim_step",
+            worker=worker,
+        )
 
         # Extract learning rate
         lr = request.adam_params.learning_rate if request.adam_params else None
@@ -2611,8 +4165,19 @@ class VerlTrainingEngine:
                 train_unembed=train_unembed,
             )
         else:
-            pending = worker.optim_step.remote(lr, session.model_id, traceparent=traceparent)
-        result = await self._await_with_keepalive(pending, session, interval_s=30.0)
+            pending = worker.optim_step.remote(
+                lr,
+                session.model_id,
+                session.lora_config.rank if session.lora_config else None,
+                traceparent=traceparent,
+            )
+        result = await self._await_worker_call(
+            pending,
+            session,
+            op="optim_step",
+            worker=worker,
+            interval_s=30.0,
+        )
 
         # Update session state
         session.current_step += 1
@@ -2650,6 +4215,11 @@ class VerlTrainingEngine:
 
         # Mark actor as recently used to prevent LRU eviction during training
         self._touch_actor(session)
+        await self._ensure_megatron_session_guard_clean(
+            session,
+            op="train_step",
+            worker=worker,
+        )
 
         # Serialize data for Ray
         data_items = [item.model_dump() for item in request.forward_backward_input.data]
@@ -2703,7 +4273,13 @@ class VerlTrainingEngine:
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
             )
-            result = await self._await_with_keepalive(pending, session, interval_s=30.0)
+            result = await self._await_worker_call(
+                pending,
+                session,
+                op="train_step",
+                worker=worker,
+                interval_s=30.0,
+            )
         else:
             # Dense models: Use separate calls (they don't have param_offload issues)
             # Pass session_id for stateless trainer pattern
@@ -2726,9 +4302,16 @@ class VerlTrainingEngine:
                     loss_fn,
                     loss_fn_config,
                     session.model_id,
+                    session.lora_config.rank if session.lora_config else None,
                     traceparent=traceparent,
                 )
-            fb_result = await self._await_with_keepalive(fb_pending, session, interval_s=30.0)
+            fb_result = await self._await_worker_call(
+                fb_pending,
+                session,
+                op="forward_backward",
+                worker=worker,
+                interval_s=30.0,
+            )
             if session.backend == "megatron":
                 opt_pending = worker.optim_step.remote(
                     lr,
@@ -2740,8 +4323,19 @@ class VerlTrainingEngine:
                     train_unembed=train_unembed,
                 )
             else:
-                opt_pending = worker.optim_step.remote(lr, session.model_id, traceparent=traceparent)
-            opt_result = await self._await_with_keepalive(opt_pending, session, interval_s=30.0)
+                opt_pending = worker.optim_step.remote(
+                    lr,
+                    session.model_id,
+                    session.lora_config.rank if session.lora_config else None,
+                    traceparent=traceparent,
+                )
+            opt_result = await self._await_worker_call(
+                opt_pending,
+                session,
+                op="optim_step",
+                worker=worker,
+                interval_s=30.0,
+            )
 
             # Merge results
             result = fb_result.copy()
@@ -2794,6 +4388,11 @@ class VerlTrainingEngine:
 
         # Mark actor as recently used
         self._touch_actor(session)
+        await self._ensure_megatron_session_guard_clean(
+            session,
+            op="reset_expert_bias",
+            worker=worker,
+        )
 
         logger.info(f"[{model_id}] reset_expert_bias: calling worker...")
 
@@ -2879,12 +4478,15 @@ class VerlTrainingEngine:
             abs_path,
             traceparent=traceparent,
             session_id=session.model_id,
+            actual_rank=session.lora_config.rank if session.lora_config else None,
         )
-        _ = await run_async_with_otel_span(
+        result = await run_async_with_otel_span(
             "training.save_weights_for_sampler.remote_save",
-            lambda: self._await_with_keepalive(
+            lambda: self._await_worker_call(
                 ref,
                 session,
+                op="save_dense_lora_weights_for_sampler",
+                worker=worker,
                 interval_s=30.0,
                 timeout_s=timeout_s,
             ),
@@ -2900,6 +4502,22 @@ class VerlTrainingEngine:
             },
         )
 
+        if isinstance(result, dict) and "state_dict" in result and "peft_config" in result:
+            import json
+
+            from safetensors.torch import save_file
+
+            os.makedirs(abs_path, exist_ok=True)
+            save_file(result["state_dict"], os.path.join(abs_path, "adapter_model.safetensors"))
+            with open(os.path.join(abs_path, "adapter_config.json"), "w", encoding="utf-8") as f:
+                json.dump(result["peft_config"], f, indent=2)
+            training_meta = {
+                "current_step": int(result.get("current_step", session.current_step)),
+                "learning_rate": float(result.get("learning_rate", session.learning_rate)),
+            }
+            with open(os.path.join(abs_path, "training_meta.json"), "w", encoding="utf-8") as f:
+                json.dump(training_meta, f, indent=2)
+
         logger.info(f"[{model_id}] save_dense_lora_weights_for_sampler: {abs_path}")
         return abs_path
 
@@ -2907,12 +4525,18 @@ class VerlTrainingEngine:
         self,
         session: TrainingSession,
         save_path: str,
+        use_per_expert_lora: bool = False,
     ) -> str:
         """Save minimal PEFT LoRA artifacts for sampling (no optimizer/resume artifacts)."""
         import os
 
         model_id = session.model_id
         worker = await self._get_live_worker(session, op="save_lora_weights_for_sampler")
+        await self._ensure_megatron_session_guard_clean(
+            session,
+            op="save_lora_weights_for_sampler",
+            worker=worker,
+        )
         abs_path = os.path.abspath(save_path)
 
         try:
@@ -2948,9 +4572,11 @@ class VerlTrainingEngine:
         )
         meta = await run_async_with_otel_span(
             "training.save_weights_for_sampler.remote_save",
-            lambda: self._await_with_keepalive(
+            lambda: self._await_worker_call(
                 meta_ref,
                 session,
+                op="save_lora_weights_for_sampler",
+                worker=worker,
                 interval_s=30.0,
                 timeout_s=timeout_s,
             ),
@@ -2993,6 +4619,10 @@ class VerlTrainingEngine:
         Args:
             session: Training session.
             save_path: Directory path for checkpoint.
+            use_per_expert_lora: Router compatibility flag from backend-agnostic
+                save_weights() interface. Megatron checkpoint export currently
+                uses train_attn/train_mlp/train_unembed gating and ignores this
+                flag.
 
         Returns:
             Absolute path to saved checkpoint directory.
@@ -3009,6 +4639,11 @@ class VerlTrainingEngine:
 
         model_id = session.model_id
         worker = await self._get_live_worker(session, op="save_weights")
+        await self._ensure_megatron_session_guard_clean(
+            session,
+            op="save_weights",
+            worker=worker,
+        )
         abs_path = os.path.abspath(save_path)
 
         # Save on worker - returns metadata
@@ -3038,7 +4673,7 @@ class VerlTrainingEngine:
                 abs_path,
                 traceparent=traceparent,
                 session_id=session.model_id,
-                actual_rank=session.lora_config.rank if session.lora_config else None,
+                actual_rank=getattr(lora_cfg, "rank", None),
                 train_attn=train_attn,
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
@@ -3049,10 +4684,13 @@ class VerlTrainingEngine:
                 abs_path,
                 traceparent=traceparent,
                 session_id=session.model_id,
+                actual_rank=session.lora_config.rank if session.lora_config else None,
             )
-        meta = await self._await_with_keepalive(
+        meta = await self._await_worker_call(
             meta_ref,
             session,
+            op="save_weights",
+            worker=worker,
             interval_s=30.0,
             timeout_s=timeout_s,
         )
@@ -3083,11 +4721,16 @@ class VerlTrainingEngine:
             load_optimizer: Whether to restore optimizer state.
         """
         model_id = session.model_id
-        worker = await self._get_live_worker(
-            session,
-            op="load_weights",
-            allow_recover=(session.backend == "peft"),
-        )
+        try:
+            worker = await self._get_live_worker(
+                session,
+                op="load_weights",
+                allow_recover=(session.backend == "peft"),
+            )
+        except RuntimeError as e:
+            if "missing worker" not in str(e):
+                raise
+            worker = await self._recycle_worker_after_failure(session, op="load_weights", cause=e)
 
         if session.backend == "megatron":
             ready_timeout_s = (
@@ -3095,55 +4738,101 @@ class VerlTrainingEngine:
                 if server_config.training_actor_ready_timeout_s is not None
                 else 1800.0
             )
-            await self._await_with_keepalive(
-                worker.__ray_ready__.remote(),
-                session,
-                interval_s=30.0,
-                timeout_s=ready_timeout_s,
-            )
+            ready_attempts = 0
+            while True:
+                try:
+                    await self._await_with_keepalive(
+                        worker.__ray_ready__.remote(),
+                        session,
+                        interval_s=30.0,
+                        timeout_s=ready_timeout_s,
+                    )
+                    break
+                except Exception as e:
+                    if not self._is_dead_actor_error(e) or ready_attempts >= 1:
+                        raise
+                    ready_attempts += 1
+                    worker = await self._recycle_worker_after_failure(session, op="load_weights", cause=e)
 
         default_timeout_s = 1800.0 if session.backend == "megatron" else 120.0
         load_timeout_s = float(os.environ.get("MINT_LOAD_CHECKPOINT_TIMEOUT_S", str(default_timeout_s)))
 
-        # Remote call to load checkpoint while keeping the pooled actor marked active.
         traceparent = get_current_traceparent()
         kwargs: dict[str, object] = {
             "traceparent": traceparent,
             "session_id": session.model_id,
         }
-        if session.backend == "megatron":
-            lora_cfg = getattr(session, "lora_config", None)
-            kwargs["train_attn"] = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
-            kwargs["train_mlp"] = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
-            kwargs["train_unembed"] = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
-        meta_ref = worker.load_checkpoint.remote(load_path, load_optimizer, **kwargs)
-        meta = await self._await_with_keepalive(
-            meta_ref,
+        if session.backend == "megatron" and not os.path.isfile(os.path.join(load_path, "adapter_config.json")):
+            lora_config = getattr(session, "lora_config", None)
+            for key in ("train_attn", "train_mlp", "train_unembed"):
+                value = getattr(lora_config, key, None)
+                if value is not None:
+                    kwargs[key] = bool(value)
+
+        def _submit(call_worker):
+            return call_worker.load_checkpoint.remote(load_path, load_optimizer, **kwargs)
+
+        meta = await self._run_worker_call_with_actor_recycle(
             session,
+            op="load_weights",
+            submit_fn=_submit,
             interval_s=30.0,
             timeout_s=load_timeout_s,
-        )
-
-        # Update session state from loaded metadata without polluting existing
-        # client-side state when old/corrupt checkpoints omit metadata.
-        self._update_session_from_load_meta(
-            session,
-            meta,
-            op="load_weights",
+            allow_recover=(session.backend == "peft"),
         )
 
         if session.backend == "megatron":
-            actual_rank = meta.get("actual_rank")
+            meta = self._validate_megatron_load_meta(meta, op="load_weights")
+            session.current_step = int(cast(int, meta["current_step"]))
+            session.learning_rate = float(cast(float, meta["learning_rate"]))
+            self._apply_megatron_loaded_lora_config(session, meta)
+            actor_name = self._actor_name_for_session(session)
+            if actor_name and bool(meta["optimizer_restored"]):
+                self._actor_volatile_sessions.setdefault(actor_name, set()).add(session.model_id)
+
+            worker = await self._get_live_worker(session, op="load_weights", allow_recover=False)
             await asyncio.to_thread(
                 ray.get,
                 worker.mark_session_loaded.remote(
                     session.model_id,
                     step_count=session.current_step,
                     learning_rate=session.learning_rate,
-                    actual_rank=actual_rank,
+                    actual_rank=meta["actual_rank"],
+                    actor_only_state_dirty=meta["actor_only_state_dirty"],
+                    checkpoint_path=meta["checkpoint_path"],
+                    optimizer_restored=meta["optimizer_restored"],
+                    train_attn=meta["train_attn"],
+                    train_mlp=meta["train_mlp"],
+                    train_unembed=meta["train_unembed"],
                 ),
-                timeout=30,
+                timeout=load_timeout_s,
             )
+            if not bool(meta["optimizer_restored"]):
+                actor_name = self._actor_name_for_session(session)
+                if actor_name:
+                    volatile_sessions = self._actor_volatile_sessions.get(actor_name)
+                    if volatile_sessions:
+                        volatile_sessions.discard(session.model_id)
+                        if not volatile_sessions:
+                            self._actor_volatile_sessions.pop(actor_name, None)
+        else:
+            # Dense workers keep the older lenient metadata path because legacy
+            # PEFT checkpoints can omit training_meta.json.
+            self._update_session_from_load_meta(
+                session,
+                meta,
+                op="load_weights",
+            )
+            if not load_optimizer:
+                actor_name = self._actor_name_for_session(session)
+                if actor_name:
+                    volatile_sessions = self._actor_volatile_sessions.get(actor_name)
+                    if volatile_sessions:
+                        volatile_sessions.discard(session.model_id)
+                        if not volatile_sessions:
+                            self._actor_volatile_sessions.pop(actor_name, None)
+
+        self._poisoned_sessions.pop(session.model_id, None)
 
         logger.info(f"[{model_id}] load_weights: step={session.current_step}")
 

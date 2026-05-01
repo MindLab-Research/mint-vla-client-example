@@ -44,7 +44,7 @@ from ..models.types import (
     UntypedAPIFuture,
 )
 from ..sampling_utils import normalize_prompt_logprobs_for_tinker, sampled_sequence_from_result
-from ..usage_store import UsageEvent, get_usage_store
+from ..usage_store import UsageEvent, schedule_usage_events
 
 if TYPE_CHECKING:
     from ..backend.session_manager import SessionManager
@@ -134,6 +134,46 @@ def _resolve_billing_model(session_id: str) -> str:
 
 def _build_sampling_usage_label(*, model: str, route: str, dimension: str) -> str:
     return f"model={model},route={route},dimension={dimension}"
+
+
+def build_sample_once_usage_events(
+    *,
+    session_id: str,
+    token_ids: list[int],
+    sequence,
+    http_request: Request,
+    request_id: str,
+) -> list[UsageEvent]:
+    billing_auth = build_billing_auth_context(http_request, fallback_request_id=request_id)
+    if billing_auth is None:
+        return []
+    label_model = _resolve_billing_model(session_id)
+    return [
+        UsageEvent(
+            account_id=billing_auth.account_id,
+            apikey_id=billing_auth.apikey_id,
+            charge_item="sampling",
+            quantity=len(token_ids),
+            request_id=billing_auth.request_id,
+            label=_build_sampling_usage_label(
+                model=label_model,
+                route="sampling.sample_once",
+                dimension="prefill",
+            ),
+        ),
+        UsageEvent(
+            account_id=billing_auth.account_id,
+            apikey_id=billing_auth.apikey_id,
+            charge_item="sampling",
+            quantity=len(sequence.tokens),
+            request_id=billing_auth.request_id,
+            label=_build_sampling_usage_label(
+                model=label_model,
+                route="sampling.sample_once",
+                dimension="sample",
+            ),
+        ),
+    ]
 
 
 def _record_vllm_workload_start(*, actor_name: str | None, base_model: str, op: str) -> None:
@@ -897,8 +937,8 @@ def _get_asample_throttle_identity(
 
 
 async def _persist_usage_events(*, auth_ctx: GatewayAuthContext, events: list[UsageEvent]) -> None:
-    usage_store = await get_usage_store()
-    await usage_store.write_events(events)
+    _ = auth_ctx
+    schedule_usage_events(events)
 
 
 @router.post("/asample")
@@ -1208,6 +1248,7 @@ async def sample_once(
     request_id: str,
     http_request: Request,
     user_id: str | None,
+    bill_usage: bool = True,
 ) -> SampledSequence:
     """Synchronously execute one sampling request using the multi-LoRA path."""
     from ..gateway import async_remote_sampling_session, forward_json, upstream_for_alias
@@ -1500,37 +1541,15 @@ async def sample_once(
             )
 
         sequence = sampled_sequence_from_result(result)
-        billing_auth = build_billing_auth_context(http_request, fallback_request_id=request_id)
-        if billing_auth is not None:
-            label_model = _resolve_billing_model(session_id)
-            await _persist_usage_events(
-                auth_ctx=billing_auth,
-                events=[
-                    UsageEvent(
-                        account_id=billing_auth.account_id,
-                        apikey_id=billing_auth.apikey_id,
-                        charge_item="sampling",
-                        quantity=len(token_ids),
-                        request_id=billing_auth.request_id,
-                        label=_build_sampling_usage_label(
-                            model=label_model,
-                            route="sampling.sample_once",
-                            dimension="prefill",
-                        ),
-                    ),
-                    UsageEvent(
-                        account_id=billing_auth.account_id,
-                        apikey_id=billing_auth.apikey_id,
-                        charge_item="sampling",
-                        quantity=len(sequence.tokens),
-                        request_id=billing_auth.request_id,
-                        label=_build_sampling_usage_label(
-                            model=label_model,
-                            route="sampling.sample_once",
-                            dimension="sample",
-                        ),
-                    ),
-                ],
+        if bill_usage:
+            schedule_usage_events(
+                build_sample_once_usage_events(
+                    session_id=session_id,
+                    token_ids=token_ids,
+                    sequence=sequence,
+                    http_request=http_request,
+                    request_id=request_id,
+                )
             )
         return sequence
     except HTTPException:
@@ -1900,11 +1919,10 @@ async def _do_sample(
                         ),
                     ]
                 )
-            if usage_events:
-                await _persist_usage_events(auth_ctx=auth_ctx, events=usage_events)
-
             # Compatibility: older tinker clients don't accept a top-level `type` field on SampleResponse.
             await future_store.async_resolve(request_id, response.model_dump(exclude={"type"}))
+            if usage_events:
+                await _persist_usage_events(auth_ctx=auth_ctx, events=usage_events)
             workload_status = "ok"
             workload_generated_tokens = sum(len(seq.tokens) for seq in sequences)
             workload_obs = _vllm_request_observation(results, workload_generated_tokens)
@@ -2241,6 +2259,8 @@ async def _do_compute_logprobs(
 
         logprobs = normalize_prompt_logprobs_for_tinker(logprobs, prompt_len=len(token_ids))
         response = ComputeLogprobsResponse(logprobs=logprobs)
+        # Compatibility: older tinker clients don't accept a top-level `type` field on ComputeLogprobsResponse.
+        await future_store.async_resolve(request_id, response.model_dump(exclude={"type"}))
         if gateway_auth:
             auth_ctx = GatewayAuthContext(**gateway_auth)
             await _persist_usage_events(
@@ -2260,8 +2280,6 @@ async def _do_compute_logprobs(
                     )
                 ],
             )
-        # Compatibility: older tinker clients don't accept a top-level `type` field on ComputeLogprobsResponse.
-        await future_store.async_resolve(request_id, response.model_dump(exclude={"type"}))
         workload_status = "ok"
         logger.debug(f"Request {request_id} computed {len(logprobs)} logprobs")
 

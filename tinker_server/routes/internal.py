@@ -803,6 +803,7 @@ async def metrics() -> Response:
         resource_pool = actors.get("resource_pool")
         if isinstance(resource_pool, list):
             grouped: dict[tuple[str, str], dict[str, float]] = {}
+            dense_poisoned_grouped: dict[tuple[str, str], float] = {}
             for rec in resource_pool:
                 if not isinstance(rec, dict):
                     continue
@@ -909,6 +910,24 @@ async def metrics() -> Response:
                         "gpu_memory_fragmentation_bytes",
                     ):
                         _append_metric(lines, f"mint_megatron_{stem}", metadata.get(stem), labels=megatron_labels)
+                elif actor_type.strip().lower() == "dense" and bool(metadata.get("poisoned")):
+                    last_fatal_op = str(metadata.get("last_fatal_op") or "unknown")
+                    poisoned_labels = {
+                        "actor_name": actor_name,
+                        "base_model": model,
+                        "last_fatal_op": last_fatal_op,
+                    }
+                    _append_metric(lines, "mint_dense_actor_poisoned", 1, labels=poisoned_labels)
+                    poisoned_at = _prom_number(metadata.get("poisoned_at"))
+                    if poisoned_at is not None:
+                        _append_metric(
+                            lines,
+                            "mint_dense_actor_poisoned_age_s",
+                            max(0.0, time.time() - poisoned_at),
+                            labels=poisoned_labels,
+                        )
+                    key = (model, last_fatal_op)
+                    dense_poisoned_grouped[key] = float(dense_poisoned_grouped.get(key, 0.0)) + 1.0
                 for binding in _resource_pool_gpu_bindings(rec):
                     _append_metric(lines, "mint_resource_pool_actor_gpu_binding", 1, labels=binding)
 
@@ -969,6 +988,14 @@ async def metrics() -> Response:
                             agg[key],
                             labels={**labels, "state": state},
                         )
+
+            for (base_model, last_fatal_op), count in sorted(dense_poisoned_grouped.items()):
+                _append_metric(
+                    lines,
+                    "mint_dense_poisoned_actors",
+                    count,
+                    labels={"base_model": base_model, "last_fatal_op": last_fatal_op},
+                )
 
         resource_pool_metadata_cache = actors.get("resource_pool_metadata_cache")
         if isinstance(resource_pool_metadata_cache, list):
@@ -1164,6 +1191,56 @@ async def metrics() -> Response:
                         "op": row.get("op") or "unknown",
                     }
                     _append_metric(lines, "mint_vllm_workload_active_requests", row.get("active_requests"), labels=labels)
+
+            training_operation_latency = runtime_observability.get("training_operation_latency")
+            if isinstance(training_operation_latency, list):
+                for row in training_operation_latency:
+                    if not isinstance(row, dict):
+                        continue
+                    labels = {
+                        "base_model": row.get("base_model") or "unknown",
+                        "backend": row.get("backend") or "unknown",
+                        "op": row.get("op") or "unknown",
+                        "status": row.get("status") or "unknown",
+                        "failure_class": row.get("failure_class") or "none",
+                    }
+                    _append_metric(lines, "mint_training_operation_total", row.get("count"), labels=labels)
+                    _append_metric(lines, "mint_training_operation_duration_s_sum", row.get("duration_s_total"), labels=labels)
+                    _append_metric(lines, "mint_training_operation_duration_s_max", row.get("duration_s_max"), labels=labels)
+
+            dense_actor_bind_decision = runtime_observability.get("dense_actor_bind_decision")
+            if isinstance(dense_actor_bind_decision, list):
+                for row in dense_actor_bind_decision:
+                    if not isinstance(row, dict):
+                        continue
+                    labels = {
+                        "base_model": row.get("base_model") or "unknown",
+                        "decision": row.get("decision") or "unknown",
+                    }
+                    _append_metric(lines, "mint_dense_actor_bind_decision_total", row.get("count"), labels=labels)
+
+            dense_actor_fatal = runtime_observability.get("dense_actor_fatal")
+            if isinstance(dense_actor_fatal, list):
+                for row in dense_actor_fatal:
+                    if not isinstance(row, dict):
+                        continue
+                    labels = {
+                        "base_model": row.get("base_model") or "unknown",
+                        "op": row.get("op") or "unknown",
+                        "failure_class": row.get("failure_class") or "unknown",
+                    }
+                    _append_metric(lines, "mint_dense_actor_fatal_total", row.get("count"), labels=labels)
+
+            dense_actor_retire = runtime_observability.get("dense_actor_retire")
+            if isinstance(dense_actor_retire, list):
+                for row in dense_actor_retire:
+                    if not isinstance(row, dict):
+                        continue
+                    labels = {
+                        "base_model": row.get("base_model") or "unknown",
+                        "outcome": row.get("outcome") or "unknown",
+                    }
+                    _append_metric(lines, "mint_dense_actor_retire_total", row.get("count"), labels=labels)
 
     for (base_model, event), count in sorted(megatron_actor_lifecycle_counts.items()):
         _append_metric(

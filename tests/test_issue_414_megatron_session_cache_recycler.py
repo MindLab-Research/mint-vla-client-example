@@ -16,6 +16,33 @@ def _write_adapter(session_path: Path, *, size: int = 64) -> None:
     (session_path / "mp_rank_00_adapter.pt").write_bytes(b"a" * size)
 
 
+def _write_training_checkpoint(path: Path, *, size: int = 64) -> None:
+    _write_adapter(path, size=size)
+    (path / "mp_rank_00_optimizer.pt").write_bytes(b"optimizer")
+
+
+def _mark_checkpoint_authority(
+    manager: MegatronSessionStateManager,
+    session_id: str,
+    checkpoint_path: Path,
+    actor_name: str,
+) -> None:
+    manager.save_metadata(
+        session_id,
+        step=0,
+        lr=1e-4,
+        actual_rank=8,
+        checkpoint_path=str(checkpoint_path),
+        optimizer_restored=True,
+    )
+    manager.mark_external_checkpoint(
+        session_id,
+        checkpoint_path=str(checkpoint_path),
+        reason="save_checkpoint",
+        actor_name=actor_name,
+    )
+
+
 def _set_tree_mtime(path: Path, when: float) -> None:
     for root, dirs, files in os.walk(path):
         for name in files:
@@ -32,13 +59,21 @@ def test_issue_414_cache_usage_reports_skipped_and_evictable(tmp_path: Path):
     dirty_path = Path(manager.get_session_path("session_dirty"))
     _write_adapter(safe_path, size=128)
     _write_adapter(dirty_path, size=256)
+    safe_checkpoint = tmp_path / "external" / "session_safe"
+    _write_training_checkpoint(safe_checkpoint, size=128)
 
-    manager.save_metadata("session_safe", step=1, lr=1e-4, actual_rank=8)
-    manager.mark_external_checkpoint(
+    manager.save_metadata(
         "session_safe",
-        checkpoint_path="/checkpoints/alice/model_a/ckpt_1",
-        reason="save_checkpoint",
-        actor_name="shared-megatron-actor",
+        step=1,
+        lr=1e-4,
+        actual_rank=8,
+        checkpoint_path=str(safe_checkpoint),
+    )
+    _mark_checkpoint_authority(
+        manager,
+        "session_safe",
+        safe_checkpoint,
+        "shared-megatron-actor",
     )
     manager.mark_actor_only_state(
         "session_dirty",
@@ -65,18 +100,22 @@ def test_issue_414_recycle_cache_respects_age_and_dirty_markers(tmp_path: Path):
     _write_adapter(old_safe, size=111)
     _write_adapter(new_safe, size=222)
     _write_adapter(dirty, size=333)
+    old_checkpoint = tmp_path / "external" / "session_old_safe"
+    new_checkpoint = tmp_path / "external" / "session_new_safe"
+    _write_training_checkpoint(old_checkpoint, size=111)
+    _write_training_checkpoint(new_checkpoint, size=222)
 
-    manager.mark_external_checkpoint(
+    _mark_checkpoint_authority(
+        manager,
         "session_old_safe",
-        checkpoint_path="/checkpoints/alice/model_a/ckpt_old",
-        reason="save_checkpoint",
-        actor_name="actor-a",
+        old_checkpoint,
+        "actor-a",
     )
-    manager.mark_external_checkpoint(
+    _mark_checkpoint_authority(
+        manager,
         "session_new_safe",
-        checkpoint_path="/checkpoints/alice/model_a/ckpt_new",
-        reason="save_checkpoint",
-        actor_name="actor-a",
+        new_checkpoint,
+        "actor-a",
     )
     manager.mark_actor_only_state(
         "session_dirty",
@@ -107,11 +146,13 @@ def test_issue_414_recycle_cache_enforces_per_actor_budget(tmp_path: Path):
     ):
         session_path = Path(manager.get_session_path(session_id))
         _write_adapter(session_path, size=size)
-        manager.mark_external_checkpoint(
+        checkpoint_path = tmp_path / "external" / actor_name / session_id
+        _write_training_checkpoint(checkpoint_path, size=size)
+        _mark_checkpoint_authority(
+            manager,
             session_id,
-            checkpoint_path=f"/checkpoints/{actor_name}/{session_id}",
-            reason="save_checkpoint",
-            actor_name=actor_name,
+            checkpoint_path,
+            actor_name,
         )
 
     _set_tree_mtime(Path(manager.get_session_path("session_a_old")), time.time() - 7200)
@@ -156,16 +197,19 @@ def test_issue_414_fresh_external_checkpoint_restores_evictability(tmp_path: Pat
 
     session_path = Path(manager.get_session_path("session_saved"))
     _write_adapter(session_path, size=144)
+    checkpoint_path = tmp_path / "external" / "session_saved"
+    _write_training_checkpoint(checkpoint_path, size=144)
     manager.mark_actor_only_state(
         "session_saved",
         reason="forward_backward",
         actor_name="actor-a",
     )
-    manager.mark_external_checkpoint(
+    manager.clear_actor_only_state("session_saved")
+    _mark_checkpoint_authority(
+        manager,
         "session_saved",
-        checkpoint_path="/checkpoints/actor-a/session_saved",
-        reason="save_checkpoint",
-        actor_name="actor-a",
+        checkpoint_path,
+        "actor-a",
     )
 
     usage = manager.get_cache_usage(actor_name="actor-a")
@@ -175,11 +219,368 @@ def test_issue_414_fresh_external_checkpoint_restores_evictability(tmp_path: Pat
     assert usage["actor_only_state_dirty_count"] == 0
 
 
+def test_issue_417_missing_external_checkpoint_is_not_evictable(tmp_path: Path):
+    manager = MegatronSessionStateManager(base_path=str(tmp_path / "session_store"))
+    original_checkpoint = tmp_path / "external" / "deleted_checkpoint"
+    _write_training_checkpoint(original_checkpoint, size=128)
+
+    session_path = Path(
+        manager.prime_session(
+            "session_deleted_external",
+            str(original_checkpoint),
+            step=5,
+            lr=2e-4,
+            actual_rank=8,
+            optimizer_restored=True,
+        )
+    )
+    manager.mark_external_checkpoint(
+        "session_deleted_external",
+        checkpoint_path=str(original_checkpoint),
+        reason="save_checkpoint",
+        actor_name="actor-a",
+    )
+    for child in original_checkpoint.iterdir():
+        child.unlink()
+    original_checkpoint.rmdir()
+
+    authority = manager.get_authority_record("session_deleted_external")
+    usage = manager.get_cache_usage(actor_name="actor-a")
+    result = manager.recycle_cache(max_age_s=0, max_total_bytes=1, max_bytes_per_actor=0)
+
+    assert session_path.exists()
+    assert authority.weights_source.kind == "session_cache"
+    assert authority.optimizer_source.kind == "none"
+    assert usage["evictable_session_count"] == 0
+    assert result["evicted_sessions"] == []
+    assert session_path.exists()
+
+
+def test_issue_417_metadata_less_external_checkpoint_is_not_cold_safe(tmp_path: Path):
+    manager = MegatronSessionStateManager(base_path=str(tmp_path / "session_store"))
+    session_path = Path(manager.get_session_path("session_without_metadata"))
+    _write_adapter(session_path, size=128)
+    external_checkpoint = tmp_path / "external" / "metadata_less"
+    _write_training_checkpoint(external_checkpoint, size=128)
+    manager.mark_external_checkpoint(
+        "session_without_metadata",
+        checkpoint_path=str(external_checkpoint),
+        reason="save_checkpoint",
+        actor_name="actor-a",
+    )
+    _set_tree_mtime(session_path, time.time() - 7200)
+
+    authority = manager.get_authority_record("session_without_metadata")
+    usage = manager.get_cache_usage(actor_name="actor-a")
+    result = manager.recycle_cache(max_age_s=0, max_total_bytes=1, max_bytes_per_actor=0)
+
+    assert authority.weights_source.kind == "session_cache"
+    assert authority.optimizer_source.kind == "none"
+    assert usage["evictable_session_count"] == 0
+    assert usage["no_external_checkpoint_sessions"] == ["session_without_metadata"]
+    assert result["evicted_sessions"] == []
+    assert session_path.exists()
+
+
+def test_issue_417_external_checkpoint_identity_mismatch_is_not_evictable(tmp_path: Path):
+    manager = MegatronSessionStateManager(base_path=str(tmp_path / "session_store"))
+    original_checkpoint = tmp_path / "external" / "mutated_checkpoint"
+    _write_training_checkpoint(original_checkpoint, size=128)
+
+    session_path = Path(
+        manager.prime_session(
+            "session_mutated_external",
+            str(original_checkpoint),
+            step=5,
+            lr=2e-4,
+            actual_rank=8,
+            optimizer_restored=True,
+        )
+    )
+    manager.mark_external_checkpoint(
+        "session_mutated_external",
+        checkpoint_path=str(original_checkpoint),
+        reason="save_checkpoint",
+        actor_name="actor-a",
+    )
+    (original_checkpoint / "mp_rank_00_adapter.pt").write_bytes(b"changed adapter")
+
+    authority = manager.get_authority_record("session_mutated_external")
+    usage = manager.get_cache_usage(actor_name="actor-a")
+    result = manager.recycle_cache(max_age_s=0, max_total_bytes=1, max_bytes_per_actor=0)
+
+    assert session_path.exists()
+    assert authority.weights_source.kind == "session_cache"
+    assert authority.optimizer_source.kind == "none"
+    assert usage["evictable_session_count"] == 0
+    assert result["evicted_sessions"] == []
+    assert session_path.exists()
+
+
+def test_issue_417_checkpoint_identity_hashes_content_and_ignores_route_metadata(tmp_path: Path):
+    manager = MegatronSessionStateManager(base_path=str(tmp_path / "session_store"))
+    checkpoint_path = tmp_path / "external" / "checkpoint"
+    _write_training_checkpoint(checkpoint_path, size=4)
+
+    original_identity = manager.checkpoint_identity(str(checkpoint_path))
+    (checkpoint_path / "metadata.json").write_text('{"owner_id": "user-a"}', encoding="utf-8")
+
+    adapter_path = checkpoint_path / "mp_rank_00_adapter.pt"
+    stat = adapter_path.stat()
+    adapter_path.write_bytes(b"bbbb")
+    os.utime(adapter_path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+
+    assert manager.checkpoint_identity(str(checkpoint_path)) != original_identity
+    adapter_path.write_bytes(b"aaaa")
+    os.utime(adapter_path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    assert manager.checkpoint_identity(str(checkpoint_path)) == original_identity
+
+
+def test_issue_417_route_metadata_write_does_not_break_external_authority(tmp_path: Path):
+    manager = MegatronSessionStateManager(base_path=str(tmp_path / "session_store"))
+    checkpoint_path = tmp_path / "external" / "checkpoint"
+    _write_training_checkpoint(checkpoint_path, size=128)
+
+    session_path = Path(
+        manager.prime_session(
+            "session_with_route_metadata",
+            str(checkpoint_path),
+            step=5,
+            lr=2e-4,
+            actual_rank=8,
+            optimizer_restored=True,
+        )
+    )
+    manager.mark_external_checkpoint(
+        "session_with_route_metadata",
+        checkpoint_path=str(checkpoint_path),
+        reason="save_checkpoint",
+        actor_name="actor-a",
+    )
+    (checkpoint_path / "metadata.json").write_text('{"checkpoint_type": "training"}', encoding="utf-8")
+
+    authority = manager.get_authority_record("session_with_route_metadata")
+    usage = manager.get_cache_usage(actor_name="actor-a")
+
+    assert session_path.exists()
+    assert authority.weights_source.kind == "checkpoint"
+    assert authority.optimizer_source.kind == "checkpoint"
+    assert usage["evictable_session_count"] == 1
+
+
+def test_issue_417_optim_step_marks_live_actor_weights_authoritative(tmp_path: Path):
+    manager = MegatronSessionStateManager(base_path=str(tmp_path / "session_store"))
+    checkpoint_path = tmp_path / "external" / "checkpoint"
+    _write_training_checkpoint(checkpoint_path, size=128)
+    manager.prime_session(
+        "session_after_optim",
+        str(checkpoint_path),
+        step=5,
+        lr=2e-4,
+        actual_rank=8,
+        optimizer_restored=True,
+    )
+    manager.mark_actor_only_state(
+        "session_after_optim",
+        reason="optim_step",
+        actor_name="actor-a",
+    )
+
+    authority = manager.get_authority_record("session_after_optim")
+
+    assert authority.weights_source.kind == "live_actor"
+    assert authority.optimizer_source.kind == "live_actor"
+    assert authority.gradient_source.kind == "none"
+    assert authority.gradient_source.actor_name is None
+    assert authority.scheduler_source.kind == "live_actor"
+
+
+def test_issue_417_forward_backward_preserves_loaded_optimizer_authority(tmp_path: Path):
+    manager = MegatronSessionStateManager(base_path=str(tmp_path / "session_store"))
+    checkpoint_path = tmp_path / "loaded_checkpoint"
+    _write_training_checkpoint(checkpoint_path, size=128)
+    manager.prime_session(
+        "session_loaded_then_backward",
+        str(checkpoint_path),
+        step=5,
+        lr=2e-4,
+        actual_rank=8,
+        optimizer_restored=True,
+    )
+    manager.mark_external_checkpoint(
+        "session_loaded_then_backward",
+        checkpoint_path=str(checkpoint_path),
+        reason="load_checkpoint",
+        actor_name="actor-a",
+    )
+    manager.mark_actor_only_state(
+        "session_loaded_then_backward",
+        reason="load_weights",
+        actor_name="actor-a",
+    )
+    manager.mark_actor_only_state(
+        "session_loaded_then_backward",
+        reason="forward_backward",
+        actor_name="actor-a",
+    )
+
+    authority = manager.get_authority_record("session_loaded_then_backward")
+
+    assert authority.weights_source.kind == "checkpoint"
+    assert authority.optimizer_source.kind == "live_actor"
+    assert authority.gradient_source.kind == "live_actor"
+    assert authority.scheduler_source.kind == "none"
+    assert authority.scheduler_source.actor_name is None
+
+
+def test_issue_417_load_weights_marker_records_current_checkpoint_weights(tmp_path: Path):
+    manager = MegatronSessionStateManager(base_path=str(tmp_path / "session_store"))
+    old_checkpoint = tmp_path / "adapter_only_checkpoint"
+    new_checkpoint = tmp_path / "optimizer_checkpoint"
+    _write_training_checkpoint(old_checkpoint, size=128)
+    _write_training_checkpoint(new_checkpoint, size=256)
+    manager.prime_session(
+        "session_reloaded",
+        str(old_checkpoint),
+        step=0,
+        lr=1e-4,
+        actual_rank=8,
+        optimizer_restored=False,
+    )
+    manager.mark_actor_only_state(
+        "session_reloaded",
+        reason="load_weights",
+        actor_name="actor-a",
+        checkpoint_path=str(new_checkpoint),
+    )
+
+    authority = manager.get_authority_record("session_reloaded")
+
+    assert authority.weights_source.kind == "checkpoint"
+    assert authority.weights_source.path == str(new_checkpoint.resolve())
+    assert authority.weights_source.identity == manager.checkpoint_identity(str(new_checkpoint))
+    assert authority.optimizer_source.kind == "live_actor"
+    assert authority.gradient_source.kind == "none"
+    assert authority.scheduler_source.kind == "none"
+
+
+def test_issue_417_save_metadata_preserves_existing_train_flags(tmp_path: Path):
+    manager = MegatronSessionStateManager(base_path=str(tmp_path / "session_store"))
+    checkpoint_path = tmp_path / "external" / "checkpoint"
+    _write_training_checkpoint(checkpoint_path, size=128)
+
+    manager.save_metadata(
+        "session_train_flags",
+        step=1,
+        lr=1e-4,
+        actual_rank=8,
+        checkpoint_path=str(checkpoint_path),
+        train_attn=False,
+        train_mlp=True,
+        train_unembed=False,
+    )
+    manager.save_metadata(
+        "session_train_flags",
+        step=2,
+        lr=2e-4,
+        actual_rank=8,
+        checkpoint_path=str(checkpoint_path),
+    )
+
+    metadata = manager.get_metadata("session_train_flags")
+    assert metadata is not None
+    assert metadata["step"] == 2
+    assert metadata["lr"] == pytest.approx(2e-4)
+    assert metadata["train_attn"] is False
+    assert metadata["train_mlp"] is True
+    assert metadata["train_unembed"] is False
+
+
+def test_issue_417_authority_record_keeps_live_actor_state_non_evictable(tmp_path: Path):
+    manager = MegatronSessionStateManager(base_path=str(tmp_path / "session_store"))
+    checkpoint_path = tmp_path / "loaded_checkpoint"
+    _write_adapter(checkpoint_path, size=128)
+    (checkpoint_path / "mp_rank_00_optimizer.pt").write_bytes(b"optimizer")
+
+    session_path = Path(
+        manager.prime_session(
+            "session_loaded",
+            str(checkpoint_path),
+            step=5,
+            lr=2e-4,
+            actual_rank=8,
+            optimizer_restored=True,
+        )
+    )
+    manager.mark_external_checkpoint(
+        "session_loaded",
+        checkpoint_path=str(checkpoint_path),
+        reason="load_checkpoint",
+        actor_name="actor-a",
+    )
+    manager.mark_actor_only_state(
+        "session_loaded",
+        reason="load_weights",
+        actor_name="actor-a",
+    )
+
+    authority = manager.get_authority_record("session_loaded")
+
+    assert session_path.exists()
+    assert authority.weights_source.kind == "checkpoint"
+    assert authority.weights_source.path == str(checkpoint_path)
+    assert authority.optimizer_source.kind == "live_actor"
+    assert authority.gradient_source.kind == "none"
+    assert authority.gradient_source.actor_name is None
+    assert authority.scheduler_source.kind == "none"
+    assert authority.scheduler_source.actor_name is None
+
+    usage = manager.get_cache_usage(actor_name="actor-a")
+    assert usage["evictable_session_count"] == 0
+    assert usage["actor_only_state_dirty_sessions"] == ["session_loaded"]
+
+
+def test_issue_417_actor_snapshot_manifest_records_exact_sources(tmp_path: Path):
+    manager = MegatronSessionStateManager(base_path=str(tmp_path / "session_store"))
+    session_path = Path(manager.get_session_path("session_snapshot"))
+    _write_adapter(session_path, size=128)
+    snapshot_dir = session_path / "actor_only_state"
+    snapshot_dir.mkdir()
+    rank_path = snapshot_dir / "rank_0.pt"
+    rank_path.write_bytes(b"snapshot")
+    manager.save_persisted_actor_only_state(
+        "session_snapshot",
+        actor_name="actor-a",
+        worker_entries=[
+            {
+                "rank": 0,
+                "path": str(rank_path),
+                "bytes": len(b"snapshot"),
+                "gradient_kind": "consumed",
+                "optimizer_state_present": True,
+                "scheduler_state_present": False,
+            }
+        ],
+    )
+
+    authority = manager.get_authority_record("session_snapshot")
+
+    assert authority.weights_source.kind == "session_cache"
+    assert authority.optimizer_source.kind == "actor_snapshot"
+    assert authority.gradient_source.kind == "none"
+    assert authority.gradient_source.manifest_path is None
+    assert authority.scheduler_source.kind == "none"
+    assert authority.scheduler_source.manifest_path is None
+
+
 def test_issue_414_load_checkpoint_without_optimizer_invalidates_existing_external_checkpoint(tmp_path: Path):
     load_path = tmp_path / "checkpoint"
     load_path.mkdir()
     (load_path / "mp_rank_00_adapter.pt").write_bytes(b"adapter")
-    (load_path / "adapter_config.json").write_text('{"r": 8}', encoding="utf-8")
+    (load_path / "adapter_config.json").write_text(
+        '{"r": 8, "target_modules": ["gate_proj", "up_proj", "down_proj"]}',
+        encoding="utf-8",
+    )
     (load_path / "training_meta.json").write_text('{"current_step": 5, "learning_rate": 0.0002}', encoding="utf-8")
 
     manager = MegatronSessionStateManager(base_path=str(tmp_path / "session_store"))
@@ -224,7 +625,10 @@ def test_issue_414_load_checkpoint_without_optimizer_stales_marker_before_reset(
     load_path = tmp_path / "checkpoint"
     load_path.mkdir()
     (load_path / "mp_rank_00_adapter.pt").write_bytes(b"adapter")
-    (load_path / "adapter_config.json").write_text('{"r": 8}', encoding="utf-8")
+    (load_path / "adapter_config.json").write_text(
+        '{"r": 8, "target_modules": ["gate_proj", "up_proj", "down_proj"]}',
+        encoding="utf-8",
+    )
     (load_path / "training_meta.json").write_text('{"current_step": 5, "learning_rate": 0.0002}', encoding="utf-8")
 
     manager = MegatronSessionStateManager(base_path=str(tmp_path / "session_store"))

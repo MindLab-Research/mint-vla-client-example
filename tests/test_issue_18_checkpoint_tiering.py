@@ -40,6 +40,59 @@ def test_issue_18_resolve_and_materialize_persistent_checkpoint(tmp_path, monkey
     assert (Path(local_path) / "adapter_model.safetensors").exists()
 
 
+def test_issue_18_resolve_prefers_cache_when_persistent_view_is_partial(tmp_path, monkeypatch) -> None:
+    from tinker_server import checkpoints
+
+    persistent_root = tmp_path / "tos"
+    runtime_root = tmp_path / "runtime"
+
+    persistent_dir = persistent_root / "owner-a" / "run-18" / "ckpt-race"
+    persistent_dir.mkdir(parents=True)
+    (persistent_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "checkpoint_id": "ckpt-race",
+                "owner_id": "owner-a",
+                "model_id": "run-18",
+                "checkpoint_type": "training",
+                "optimizer_present": True,
+                "type": "training",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cache_dir = runtime_root / "persistent_cache" / "owner-a" / "run-18" / "ckpt-race"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "adapter_model.safetensors").write_text("x", encoding="utf-8")
+    (cache_dir / "mp_rank_00_optimizer.pt").write_text("x", encoding="utf-8")
+    (cache_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "checkpoint_id": "ckpt-race",
+                "owner_id": "owner-a",
+                "model_id": "run-18",
+                "checkpoint_type": "training",
+                "optimizer_present": True,
+                "type": "training",
+                "storage_tier": "persistent_cache",
+                "mirror_status": "pending",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(checkpoints, "CHECKPOINTS_DIR", str(persistent_root))
+    monkeypatch.setattr(checkpoints, "PERSISTENT_CHECKPOINTS_DIR", str(persistent_root))
+    monkeypatch.setattr(checkpoints, "RUNTIME_CHECKPOINTS_DIR", str(runtime_root))
+
+    resolved = checkpoints.resolve_checkpoint_path(
+        "mint://run-18/weights/ckpt-race",
+        user_id="owner-a",
+    )
+    assert resolved == str(cache_dir)
+
+
 def test_issue_18_reap_runtime_checkpoints(tmp_path, monkeypatch) -> None:
     from tinker_server import checkpoints
 

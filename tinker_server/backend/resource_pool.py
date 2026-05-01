@@ -809,6 +809,8 @@ def actor_observability_metadata(actor_handle: ActorHandle | None, *, timeout_s:
         "gpu_memory_allocated_bytes",
         "gpu_memory_reserved_bytes",
         "gpu_memory_fragmentation_bytes",
+        "max_lora_rank",
+        "actual_rank",
     }
     float_fields = {
         "scheduler_kv_cache_usage_ratio",

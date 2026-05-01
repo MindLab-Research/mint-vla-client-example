@@ -253,20 +253,36 @@ def actor_runtime_env_vars(*, pythonpath: str, extra: dict[str, str] | None = No
         out.update(extra)
     return out
 
+def _runtime_env_value_is_uri(value: str) -> bool:
+    head = str(value or "").split("://", 1)
+    return len(head) == 2 and bool(head[0]) and all(ch.isalnum() or ch in "+-." for ch in head[0])
+
+
+def _actor_runtime_env_allows_local_paths() -> bool:
+    for name in ("MINT_RAY_CLIENT_ADDRESS", "RAY_CLIENT_ADDRESS", "RAY_ADDRESS"):
+        value = _env_nonempty(os.environ, name)
+        if value and value.startswith("ray://"):
+            return False
+    return True
+
+
 def actor_runtime_env(*, pythonpath: str, extra: dict[str, str] | None = None) -> dict[str, object]:
     runtime_env: dict[str, object] = {
         "env_vars": actor_runtime_env_vars(pythonpath=pythonpath, extra=extra)
     }
-    ray_address = _env_nonempty(os.environ, "RAY_ADDRESS") or ""
+    allow_local_paths = _actor_runtime_env_allows_local_paths()
     py_modules_csv = _env_nonempty(os.environ, "MINT_RAY_PY_MODULES_CSV")
     if py_modules_csv:
         py_modules = [x.strip() for x in py_modules_csv.split(",") if x.strip()]
-        if ray_address.startswith("ray://"):
-            py_modules = [x for x in py_modules if "://" in x]
-        if py_modules:
+        if allow_local_paths:
             runtime_env["py_modules"] = py_modules
+        else:
+            uri_modules = [x for x in py_modules if _runtime_env_value_is_uri(x)]
+            if uri_modules:
+                runtime_env["py_modules"] = uri_modules
     working_dir = _env_nonempty(os.environ, "MINT_RAY_WORKING_DIR")
-    if working_dir and not (ray_address.startswith("ray://") and "://" not in working_dir):
+    # Ray Client accepts local-path working_dir only at ray.init(job) level.
+    if working_dir and (allow_local_paths or _runtime_env_value_is_uri(working_dir)):
         runtime_env["working_dir"] = working_dir
     return runtime_env
 
@@ -388,9 +404,9 @@ class ServerConfig:
     internal_api_token: str = ""  # Shared token for trusting gateway-forwarded billing headers.
 
     # Usage billing
-    usage_log_dir: str = "/tmp/tinker_usage"  # active JSONL sink
-    usage_backend: str = "postgres"  # deprecated compatibility field; if set, it must remain 'postgres'
-    usage_pg_dsn: str = ""  # deprecated, ignored by the producer path
+    usage_log_dir: str = "/tmp/tinker_usage"  # deprecated; billing writes directly to PostgreSQL
+    usage_backend: str = "postgres"  # only postgres is supported
+    usage_pg_dsn: str = ""
     usage_pg_host: str = ""
     usage_pg_port: int = 5432
     usage_pg_database: str = "mint_billing"
@@ -399,7 +415,7 @@ class ServerConfig:
     usage_pg_pool_min: int = 10
     usage_pg_pool_max: int = 30
     usage_write_timeout_ms: int = 2000
-    usage_pg_table: str = "billing.usage_event"
+    usage_pg_table: str = "usage_event"
     checkpoint_index_pg_dsn: str = ""
     checkpoint_index_write_timeout_ms: int = 2000
     skip_actor_cleanup: bool = False  # MINT_SKIP_ACTOR_CLEANUP
@@ -642,7 +658,7 @@ class ServerConfig:
             usage_pg_table=_pick_str(
                 "TINKER_USAGE_PG_TABLE",
                 file_server.usage_pg_table if file_server is not None else None,
-                "billing.usage_event",
+                "usage_event",
             ),
             checkpoint_index_pg_dsn=_pick_str(
                 "TINKER_CHECKPOINT_INDEX_PG_DSN",

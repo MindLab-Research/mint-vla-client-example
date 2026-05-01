@@ -24,6 +24,7 @@ Entrypoint: |
   set -euo pipefail
   python3 - <<'PY'
   import os
+  import shutil
   import socket
   import time
 
@@ -86,9 +87,13 @@ Entrypoint: |
       if os.path.lexists(RAY_TMP_LINK):
           if os.path.islink(RAY_TMP_LINK) or os.path.isfile(RAY_TMP_LINK):
               os.unlink(RAY_TMP_LINK)
+          elif os.path.isdir(RAY_TMP_LINK):
+              shutil.rmtree(RAY_TMP_LINK)
           else:
-              raise RuntimeError(f"refusing to replace non-link temp path: {RAY_TMP_LINK}")
+              raise RuntimeError(f"refusing to replace temp path: {RAY_TMP_LINK}")
       os.symlink(ray_tmp_root_real, RAY_TMP_LINK)
+      if not os.path.islink(RAY_TMP_LINK) or os.path.realpath(RAY_TMP_LINK) != os.path.realpath(ray_tmp_root_real):
+          raise RuntimeError(f"ray temp symlink mismatch: {RAY_TMP_LINK} -> {os.path.realpath(RAY_TMP_LINK)} expected {os.path.realpath(ray_tmp_root_real)}")
       os.makedirs(ray_temp_dir, exist_ok=True)
       os.makedirs(ray_object_spilling_dir, exist_ok=True)
       os.makedirs(ray_os_tmpdir, exist_ok=True)

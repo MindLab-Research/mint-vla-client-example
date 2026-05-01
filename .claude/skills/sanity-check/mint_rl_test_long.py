@@ -26,6 +26,7 @@ except ModuleNotFoundError:
     pd = None
 from dotenv import load_dotenv
 from mint import types
+from tinker.lib.client_connection_pool_type import ClientConnectionPoolType
 from tinker.lib.retry_handler import RetryConfig
 
 DEFAULT_TIMEOUT_S = float(os.environ.get("MINT_TEST_TIMEOUT_S", "10800"))
@@ -562,6 +563,63 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+
+
+def _env_object_id(name: str) -> str | None:
+    value = str(os.environ.get(name, "") or "").strip()
+    if not value:
+        return None
+    if not re.fullmatch(r"[0-9a-fA-F]{24}", value):
+        raise ValueError(f"{name} must be a 24-character hex object id, got {value!r}")
+    return value
+
+
+def _checkpoint_owner_id() -> str | None:
+    return _env_object_id("MINT_TEST_CHECKPOINT_OWNER_ID")
+
+
+def _create_sampling_client_for_checkpoint(
+    service_client: Any,
+    *,
+    model_path: str,
+    base_model: str,
+    retry_config: RetryConfig,
+) -> Any:
+    owner_id = _checkpoint_owner_id()
+    if not owner_id:
+        return service_client.create_sampling_client(
+            model_path=model_path,
+            base_model=base_model,
+            retry_config=retry_config,
+        )
+
+    holder = service_client.holder
+    if not model_path.startswith("tinker://"):
+        raise ValueError("model_path must start with 'tinker://'")
+    assert holder._sampling_client_counter is not None
+    sampling_session_seq_id = holder._sampling_client_counter
+    holder._sampling_client_counter += 1
+
+    async def _create():
+        from tinker import types as tinker_types
+        from tinker.lib.public_interfaces.sampling_client import SamplingClient
+
+        with holder.aclient(ClientConnectionPoolType.SESSION) as client:
+            request = tinker_types.CreateSamplingSessionRequest(
+                session_id=holder.get_session_id(),
+                sampling_session_seq_id=sampling_session_seq_id,
+                model_path=model_path,
+                base_model=base_model,
+            )
+            result = await client.service.create_sampling_session(
+                request=request,
+                extra_body={"owner_id": owner_id},
+            )
+        return SamplingClient(holder, sampling_session_id=result.sampling_session_id, retry_config=retry_config)
+
+    return holder.run_coroutine_threadsafe(_create()).result()
+
+
 def _read_text_file(path: str) -> str:
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -907,7 +965,8 @@ def _save_weights_and_get_sampling_client_with_retry(
                 extra={"name": name},
             ).path
             sampling_client = _time_call(
-                lambda: service_client.create_sampling_client(
+                lambda: _create_sampling_client_for_checkpoint(
+                    service_client,
                     model_path=sampling_path,
                     base_model=base_model,
                     retry_config=SAMPLING_RETRY_CONFIG,
@@ -1372,7 +1431,8 @@ final_path = _result_with_heartbeat(
     extra={"name": "arithmetic-rl-final"},
 ).path
 final_client = _time_call(
-    lambda: service_client.create_sampling_client(
+    lambda: _create_sampling_client_for_checkpoint(
+        service_client,
         model_path=final_path,
         base_model=BASE_MODEL,
         retry_config=SAMPLING_RETRY_CONFIG,

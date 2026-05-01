@@ -58,7 +58,7 @@ http://<RAY_HEAD_IP>:8265
 
 | Flavor | GPUs | Memory | Use Case |
 |--------|------|--------|----------|
-| `ml.g2a.xlarge` | 0 (CPU only) | - | Ray head node |
+| `ml.r3i.4xlarge` | 0 (CPU only) | - | Ray head node |
 | `ml.hpcpni2l.28xlarge` | 8x A800 80GB | 1960 GiB | GPU workers (RDMA) |
 
 **Worker scaling:** Adjust `RoleReplicas` in worker YAML. N replicas = 8N GPUs = 640N GB GPU memory.
@@ -72,7 +72,7 @@ http://<RAY_HEAD_IP>:8265
 | `a800-mindverse-C1` | `q-20251126180002-26lwz` | GPU | Prod GPU workers (A800 instances, 128 GPUs total) |
 | `a800-mindverse-C2` | `q-20260203101340-www2h` | GPU | Prod C2 worker pool (K2 multinode vLLM) |
 
-**IMPORTANT:** CPU-only instances (ml.g2a.xlarge) MUST use the CPU queue. GPU instances MUST use a GPU queue.
+**IMPORTANT:** CPU-only instances (ml.r3i.4xlarge) MUST use the CPU queue. GPU instances MUST use a GPU queue.
 
 ## 1.2 Queue Availability (CLI)
 
@@ -93,7 +93,7 @@ flavor_gpus = {
     "ml.hpcpni2l.28xlarge": 8,
     "ml.hpcpni2l.14xlarge": 4,
     "ml.hpcpni2l.7xlarge": 2,
-    "ml.g2a.xlarge": 0,
+    "ml.r3i.4xlarge": 0,
 }
 
 def task_gpus(t):

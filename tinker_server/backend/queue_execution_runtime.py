@@ -16,7 +16,19 @@ from ..server_info import _git_sha
 
 logger = logging.getLogger(__name__)
 CURRENT_CODE_IDENTITY = os.environ.get("MINT_GIT_SHA") or _git_sha()
+RUNTIME_CONTRACT_DIGEST_ENV = "MINT_QUEUE_EXECUTION_RUNTIME_CONTRACT_DIGEST"
 _ACTOR_HANDLE = None
+
+
+_RUNTIME_CONTRACT_EXCLUDED_ENV = {"TMPDIR", "XDG_CACHE_HOME"}
+
+
+def _runtime_contract_overrides() -> dict[str, str]:
+    return {
+        key: value
+        for key, value in _runtime_env_overrides().items()
+        if key not in _RUNTIME_CONTRACT_EXCLUDED_ENV
+    }
 
 
 def _runtime_contract_payload() -> dict[str, Any]:
@@ -24,7 +36,7 @@ def _runtime_contract_payload() -> dict[str, Any]:
         "actor_name": _actor_name(),
         "namespace": _ray_namespace(),
         "code_identity": CURRENT_CODE_IDENTITY,
-        "runtime_env_overrides": _runtime_env_overrides(),
+        "runtime_env_overrides": _runtime_contract_overrides(),
     }
 
 
@@ -80,7 +92,6 @@ _register_ray_reconnect_invalidator(_reset_cached_actor_handle)
 
 def _runtime_env_overrides() -> dict[str, str]:
     out: dict[str, str] = {}
-
     direct_keys = (
         "MINT_QUEUE_EXECUTION_RUNTIME_ACTOR_NAME",
         "MINT_QUEUE_SUPERVISOR_ACTOR_NAME",
@@ -137,6 +148,8 @@ def _runtime_env_overrides() -> dict[str, str]:
     for key, value in os.environ.items():
         if key.startswith("MINT_OPENPI_") and value.strip():
             out[key] = value.strip()
+    if CURRENT_CODE_IDENTITY:
+        out["MINT_GIT_SHA"] = CURRENT_CODE_IDENTITY
 
     # Canonicalize legacy actor-name envs before detached runtime actors inherit them.
     compat_keys = {
@@ -371,7 +384,7 @@ def _get_or_create_actor():
                 self._last_error = None
                 self._last_started_at = None
                 self._code_identity = CURRENT_CODE_IDENTITY
-                self._runtime_contract_digest = _runtime_contract_digest()
+                self._runtime_contract_digest = os.environ.get(RUNTIME_CONTRACT_DIGEST_ENV) or _runtime_contract_digest()
                 self._observability_flush_task: asyncio.Task | None = None
                 self._observability_flush_interval_s = max(
                     5.0,
@@ -524,6 +537,7 @@ def _get_or_create_actor():
     apply_detached_actor_resources(options, ray)
     env = otel_env_vars()
     env.update(_runtime_env_overrides())
+    env[RUNTIME_CONTRACT_DIGEST_ENV] = _runtime_contract_digest()
     options["runtime_env"] = actor_runtime_env(pythonpath=PFS_PYTHONPATH, extra=env)
     _append_queue_runtime_debug(
         "driver_create_attempt",

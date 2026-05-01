@@ -214,7 +214,93 @@ Preflight gate before **any** isolated startup or retry:
 
 1. API-host import probe must pass from the intended issue PFS root.
 2. Ray `runtime_env` import probe must pass using the same `actor_runtime_env(PFS_PYTHONPATH)` path that detached actors will use.
-3. If either probe fails, do **not** start `run_server.py`. Fix the import path first.
+3. The exact intended API port must be free on the API host.
+4. If any probe fails, do **not** start `run_server.py`. Fix that resource first.
+
+Port/listener preflight is a hard gate:
+
+- Treat the API port as an explicit resource, independent of Ray actors, placement groups, and GPU state.
+- Before every isolated startup or retry, check the exact intended port on `mint-dev`.
+- If the port is occupied by your previous issue server, kill that exact listener and re-check the same port.
+- Do not switch to another port to work around a conflict unless the user explicitly changes the port.
+- Do not declare a retry valid unless the logs later show that `run_server.py` bound the intended port.
+
+Exact port check. Use Python and `/proc`; `ss`, `fuser`, and `lsof` are not guaranteed on the API host.
+
+```bash
+ssh mint-dev 'PORT=8010 /usr/bin/python3 - <<'"'"'PY'"'"'
+import os
+import socket
+
+port = int(os.environ["PORT"])
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
+    sock.bind(("0.0.0.0", port))
+except OSError as exc:
+    raise SystemExit(f"PORT_BLOCKED port={port} errno={exc.errno} message={exc.strerror}")
+finally:
+    sock.close()
+print(f"PORT_FREE port={port}")
+PY'
+```
+
+Exact listener cleanup for an owned issue server:
+
+```bash
+ssh mint-dev 'PORT=8010 ISSUE_ROOT=/vePFS-Mindverse/share/code/$USER/tinker-server-issue-<ISSUE> ISSUE_LOG=/tmp/tinker_server_issue.log /usr/bin/python3 - <<'"'"'PY'"'"'
+import os
+import signal
+import socket
+import time
+from pathlib import Path
+
+port = int(os.environ["PORT"])
+issue_root = os.environ["ISSUE_ROOT"]
+issue_log = os.environ["ISSUE_LOG"]
+
+def socket_inodes(path):
+    try:
+        rows = Path(path).read_text().splitlines()[1:]
+    except FileNotFoundError:
+        return set()
+    inodes = set()
+    for row in rows:
+        cols = row.split()
+        if cols[3] == "0A" and int(cols[1].rsplit(":", 1)[1], 16) == port:
+            inodes.add(cols[9])
+    return inodes
+
+inodes = socket_inodes("/proc/net/tcp") | socket_inodes("/proc/net/tcp6")
+killed = []
+for proc in Path("/proc").iterdir():
+    if not proc.name.isdigit():
+        continue
+    try:
+        owns_port = any(
+            os.readlink(fd).startswith("socket:[") and os.readlink(fd)[8:-1] in inodes
+            for fd in (proc / "fd").iterdir()
+        )
+    except Exception:
+        continue
+    if not owns_port:
+        continue
+    cwd = os.path.realpath(proc / "cwd")
+    out = os.path.realpath(proc / "fd" / "1")
+    if cwd == issue_root or out == issue_log:
+        os.kill(int(proc.name), signal.SIGTERM)
+        killed.append({"pid": int(proc.name), "cwd": cwd, "stdout": out})
+time.sleep(2)
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
+    sock.bind(("0.0.0.0", port))
+except OSError as exc:
+    print({"killed": killed, "port_free": False, "errno": exc.errno, "message": exc.strerror})
+    raise SystemExit(1)
+finally:
+    sock.close()
+print({"killed": killed, "port_free": True})
+PY'
+```
 
 API-host import probe:
 
@@ -275,6 +361,32 @@ def probe():
 
 print(json.dumps(ray.get(probe.remote()), indent=2))
 PY'
+```
+
+Ray client `working_dir` packaging:
+
+- In Ray client mode, detached actor creation may deserialize actor classes before
+  the `PYTHONPATH` runtime env is applied. If a detached actor fails with
+  `ModuleNotFoundError: No module named 'tinker_server'` even though the
+  `runtime_env` import probe passes, package the issue checkout into a PFS zip
+  and set `MINT_RAY_JOB_WORKING_DIR=file:///...zip` before starting the server.
+- Build the zip from the synced issue checkout, not from a stale shared tree.
+  Include the repo packages and runtime config needed for class import, for
+  example `tinker_server`, `scripts`, and `configs`.
+- Make the zip filename or URI versioned for every code change that affects
+  detached actors. Ray caches `working_dir` by URI; reusing the same URI can run
+  old actor code after a server restart.
+- This package is only for Ray client class distribution. It does not replace
+  unison; unison remains the source of truth for syncing the issue checkout to
+  PFS.
+
+Example:
+
+```bash
+ssh mint-dev 'cd /vePFS-Mindverse/share/code/$USER/tinker-server-issue-<ISSUE> && \
+  ZIP=/vePFS-Mindverse/share/code/$USER/tinker_server_issue<ISSUE>_working_dir_$(date +%s).zip && \
+  /usr/bin/python3 -m zipfile -c "$ZIP" tinker_server scripts configs && \
+  echo "export MINT_RAY_JOB_WORKING_DIR=file://$ZIP"'
 ```
 
 Hard bans for isolated startup:
