@@ -250,6 +250,11 @@ async def lifespan(app: FastAPI):
 
     owner_runtime_local_only = os.environ.get("MINT_OWNER_RUNTIME_SUPERVISOR_LOCAL_ONLY", "").strip().lower() in {"1", "true", "yes", "on"}
 
+    from .usage_store import get_usage_store
+
+    usage_store = await get_usage_store()
+    if not await usage_store.health_check():
+        raise RuntimeError("usage billing postgres health check failed")
     if startup_owner:
         await future_store.async_ensure_started()
         ensure_gateway_session_store_ready()

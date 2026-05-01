@@ -31,6 +31,9 @@ class _StubUsageStore:
         self.order = order if order is not None else []
 
     async def write_events(self, events) -> None:
+        self.schedule_events(events)
+
+    def schedule_events(self, events) -> None:
         self.order.append("write_events")
         self.events.extend(list(events))
 
@@ -85,10 +88,7 @@ def test_asample_logs_prefill_and_sample_dimensions(monkeypatch):
     monkeypatch.setattr(sampling_route, "session_manager", _StubSessionManager())
     monkeypatch.setattr(sampling_route, "future_store", future_store)
 
-    async def _get_usage_store():
-        return usage_store
-
-    monkeypatch.setattr(sampling_route, "get_usage_store", _get_usage_store)
+    monkeypatch.setattr(sampling_route, "schedule_usage_events", usage_store.schedule_events)
 
     request = SampleRequest(
         sampling_session_id="sess-1",
@@ -109,7 +109,7 @@ def test_asample_logs_prefill_and_sample_dimensions(monkeypatch):
     ]
 
 
-def test_asample_persists_usage_before_resolving_future(monkeypatch):
+def test_asample_resolves_future_before_persisting_usage(monkeypatch):
     order: list[str] = []
     future_store = _StubFutureStore(order=order)
     usage_store = _StubUsageStore(order=order)
@@ -117,10 +117,7 @@ def test_asample_persists_usage_before_resolving_future(monkeypatch):
     monkeypatch.setattr(sampling_route, "session_manager", _StubSessionManager())
     monkeypatch.setattr(sampling_route, "future_store", future_store)
 
-    async def _get_usage_store():
-        return usage_store
-
-    monkeypatch.setattr(sampling_route, "get_usage_store", _get_usage_store)
+    monkeypatch.setattr(sampling_route, "schedule_usage_events", usage_store.schedule_events)
 
     request = SampleRequest(
         sampling_session_id="sess-1",
@@ -131,7 +128,7 @@ def test_asample_persists_usage_before_resolving_future(monkeypatch):
 
     anyio.run(sampling_route._do_sample, "req-order", request, None, _gateway_auth())
 
-    assert order == ["write_events", "resolve"]
+    assert order == ["resolve", "write_events"]
 
 
 def test_compute_logprobs_logs_prefill_dimension(monkeypatch):
@@ -141,10 +138,7 @@ def test_compute_logprobs_logs_prefill_dimension(monkeypatch):
     monkeypatch.setattr(sampling_route, "session_manager", _StubSessionManager())
     monkeypatch.setattr(sampling_route, "future_store", future_store)
 
-    async def _get_usage_store():
-        return usage_store
-
-    monkeypatch.setattr(sampling_route, "get_usage_store", _get_usage_store)
+    monkeypatch.setattr(sampling_route, "schedule_usage_events", usage_store.schedule_events)
 
     request = ComputeLogprobsRequest(
         sampling_session_id="sess-1",

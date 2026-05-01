@@ -404,9 +404,9 @@ class ServerConfig:
     internal_api_token: str = ""  # Shared token for trusting gateway-forwarded billing headers.
 
     # Usage billing
-    usage_log_dir: str = "/tmp/tinker_usage"  # active JSONL sink
-    usage_backend: str = "postgres"  # deprecated compatibility field; if set, it must remain 'postgres'
-    usage_pg_dsn: str = ""  # deprecated, ignored by the producer path
+    usage_log_dir: str = "/tmp/tinker_usage"  # deprecated; billing writes directly to PostgreSQL
+    usage_backend: str = "postgres"  # only postgres is supported
+    usage_pg_dsn: str = ""
     usage_pg_host: str = ""
     usage_pg_port: int = 5432
     usage_pg_database: str = "mint_billing"
@@ -415,7 +415,7 @@ class ServerConfig:
     usage_pg_pool_min: int = 10
     usage_pg_pool_max: int = 30
     usage_write_timeout_ms: int = 2000
-    usage_pg_table: str = "billing.usage_event"
+    usage_pg_table: str = "usage_event"
     checkpoint_index_pg_dsn: str = ""
     checkpoint_index_write_timeout_ms: int = 2000
     skip_actor_cleanup: bool = False  # MINT_SKIP_ACTOR_CLEANUP
@@ -658,7 +658,7 @@ class ServerConfig:
             usage_pg_table=_pick_str(
                 "TINKER_USAGE_PG_TABLE",
                 file_server.usage_pg_table if file_server is not None else None,
-                "billing.usage_event",
+                "usage_event",
             ),
             checkpoint_index_pg_dsn=_pick_str(
                 "TINKER_CHECKPOINT_INDEX_PG_DSN",

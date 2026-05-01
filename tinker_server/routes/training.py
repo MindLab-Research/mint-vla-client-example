@@ -105,7 +105,7 @@ from ..models.types import (
     TrainStepRequest,
     UntypedAPIFuture,
 )
-from ..usage_store import UsageEvent, get_usage_store
+from ..usage_store import UsageEvent, schedule_usage_events
 from ..webhook import EventType, send_task_event
 
 if TYPE_CHECKING:
@@ -227,8 +227,7 @@ def _training_heartbeat_stale_timeout_s() -> float:
 
 
 async def _persist_usage_events(*, events: list[UsageEvent]) -> None:
-    usage_store = await get_usage_store()
-    await usage_store.write_events(events)
+    schedule_usage_events(events)
 
 
 async def _enqueue_training_request_with_trace(
@@ -2552,6 +2551,7 @@ async def _do_forward_backward(
         logger.info(
             f"[{session.model_id}] forward_backward done: elapsed_s={elapsed_s:.3f}"
         )
+        await future_store.async_resolve(request_id, result)
         if gateway_auth:
             auth_ctx = GatewayAuthContext(**gateway_auth)
             await _persist_usage_events(
@@ -2569,8 +2569,9 @@ async def _do_forward_backward(
                     )
                 ]
             )
-        await future_store.async_resolve(request_id, result)
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.exception(
             "[forward_backward] failed request_id=%s model_id=%s failure_reason=%s error_type=%s next_action=%s",
@@ -2788,6 +2789,7 @@ async def _do_train_step(
         elapsed_s = time.time() - t0
         msg = f"[{session.model_id}] train_step done request_id={request_id} elapsed_s={elapsed_s:.3f}"
         logger.info(msg)
+        await future_store.async_resolve(request_id, result)
         if gateway_auth:
             auth_ctx = GatewayAuthContext(**gateway_auth)
             await _persist_usage_events(
@@ -2805,8 +2807,9 @@ async def _do_train_step(
                     )
                 ]
             )
-        await future_store.async_resolve(request_id, result)
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.exception(
             "[train_step] failed request_id=%s model_id=%s failure_reason=%s error_type=%s next_action=%s",
@@ -3023,6 +3026,7 @@ async def _do_forward(
         )
         elapsed_s = time.time() - t0
         logger.info(f"[{session.model_id}] forward done: elapsed_s={elapsed_s:.3f}")
+        await future_store.async_resolve(request_id, result)
         if gateway_auth:
             auth_ctx = GatewayAuthContext(**gateway_auth)
             await _persist_usage_events(
@@ -3040,8 +3044,9 @@ async def _do_forward(
                     )
                 ]
             )
-        await future_store.async_resolve(request_id, result)
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.exception(
             "[forward] failed request_id=%s model_id=%s failure_reason=%s error_type=%s next_action=%s",

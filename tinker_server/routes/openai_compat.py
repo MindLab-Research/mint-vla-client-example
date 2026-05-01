@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from ..models.types import (
@@ -30,11 +30,16 @@ from ..models.types import (
     OAIToolCall,
     OAIUsage,
 )
-from .sampling import sample_once
+from ..usage_store import persist_usage_events
+from .sampling import build_sample_once_usage_events, sample_once
 from .service import ensure_sampling_session
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+async def _write_usage_events_after_response(events) -> None:
+    await persist_usage_events(events)
 
 
 @dataclass
@@ -660,7 +665,7 @@ async def retrieve_model(model_id: str):
 
 
 @router.post("/completions", response_model=OAICompletionResponse)
-async def completions(request: OAICompletionRequest, http_request: Request):
+async def completions(request: OAICompletionRequest, http_request: Request, background_tasks: BackgroundTasks):
     try:
         if request.stream:
             raise HTTPException(status_code=400, detail="stream=True is not supported")
@@ -676,6 +681,7 @@ async def completions(request: OAICompletionRequest, http_request: Request):
             tokenizer = await _get_tokenizer(base_model)
             prompt_token_ids = tokenizer.encode(request.prompt, add_special_tokens=False)
             try:
+                sampling_request_id = f"oai_cmpl_{uuid.uuid4().hex}"
                 sequence = await sample_once(
                     session_id=sampling_session_id,
                     token_ids=prompt_token_ids,
@@ -683,9 +689,10 @@ async def completions(request: OAICompletionRequest, http_request: Request):
                     temperature=request.temperature,
                     top_p=request.top_p,
                     stop=request.stop,
-                    request_id=f"oai_cmpl_{uuid.uuid4().hex}",
+                    request_id=sampling_request_id,
                     http_request=http_request,
                     user_id=user_id,
+                    bill_usage=False,
                 )
                 break
             except Exception as exc:
@@ -695,6 +702,15 @@ async def completions(request: OAICompletionRequest, http_request: Request):
                 if attempt == 1:
                     raise
         text = tokenizer.decode(sequence.tokens, skip_special_tokens=True)
+        usage_events = build_sample_once_usage_events(
+            session_id=sampling_session_id,
+            token_ids=prompt_token_ids,
+            sequence=sequence,
+            http_request=http_request,
+            request_id=sampling_request_id,
+        )
+        if usage_events:
+            background_tasks.add_task(_write_usage_events_after_response, usage_events)
         return OAICompletionResponse(
             id=f"cmpl-{uuid.uuid4().hex}",
             created=int(time.time()),
@@ -718,7 +734,7 @@ async def completions(request: OAICompletionRequest, http_request: Request):
 
 
 @router.post("/chat/completions", response_model=OAIChatCompletionResponse)
-async def chat_completions(request: OAIChatCompletionRequest, http_request: Request):
+async def chat_completions(request: OAIChatCompletionRequest, http_request: Request, background_tasks: BackgroundTasks):
     try:
         if request.stream:
             raise HTTPException(status_code=400, detail="stream=True is not supported")
@@ -746,6 +762,7 @@ async def chat_completions(request: OAIChatCompletionRequest, http_request: Requ
                         detail=f"Tokenizer.apply_chat_template returned unexpected type {type(prompt_token_ids).__name__}; expected list[int]",
                     )
                 try:
+                    sampling_request_id = f"oai_chat_{uuid.uuid4().hex}"
                     sequence = await sample_once(
                         session_id=sampling_session_id,
                         token_ids=prompt_token_ids,
@@ -753,9 +770,10 @@ async def chat_completions(request: OAIChatCompletionRequest, http_request: Requ
                         temperature=request.temperature,
                         top_p=request.top_p,
                         stop=request.stop,
-                        request_id=f"oai_chat_{uuid.uuid4().hex}",
+                        request_id=sampling_request_id,
                         http_request=http_request,
                         user_id=user_id,
+                        bill_usage=False,
                     )
                     break
                 except Exception as exc:
@@ -810,6 +828,15 @@ async def chat_completions(request: OAIChatCompletionRequest, http_request: Requ
 
             _validate_tool_calls(request, tool_calls=tool_calls)
             finish_reason = "tool_calls" if tool_calls else _finish_reason(sequence.stop_reason)
+            usage_events = build_sample_once_usage_events(
+                session_id=sampling_session_id,
+                token_ids=prompt_token_ids,
+                sequence=sequence,
+                http_request=http_request,
+                request_id=sampling_request_id,
+            )
+            if usage_events:
+                background_tasks.add_task(_write_usage_events_after_response, usage_events)
             return OAIChatCompletionResponse(
                 id=f"chatcmpl-{uuid.uuid4().hex}",
                 created=int(time.time()),
