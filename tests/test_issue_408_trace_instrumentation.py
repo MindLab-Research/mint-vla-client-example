@@ -255,6 +255,98 @@ def test_issue_408_megatron_create_path_emits_trace_spans(monkeypatch) -> None:
     assert span_by_name["training.create_model.megatron.reserve_gpus"]["attributes"]["world_size"] == 1
 
 
+def test_issue_572_megatron_existing_actor_rank_mismatch_recreates(monkeypatch) -> None:
+    from tinker_server.backend import megatron_distributed as md
+    from tinker_server.backend import model_registry as model_registry
+    from tinker_server.backend import resource_pool as resource_pool_mod
+    from tinker_server import config as config_mod
+
+    fake_new_actor = object()
+    killed: list[dict[str, object]] = []
+    created: list[dict[str, object]] = []
+
+    class _RemoteMethod:
+        def remote(self):
+            return "diagnostics-ref"
+
+    class _ActorHandle:
+        get_diagnostics = _RemoteMethod()
+
+    existing_actor = _ActorHandle()
+
+    class _FakePool:
+        def ensure_gpus_available(self, *_args, **_kwargs) -> bool:
+            return True
+
+        def reserve_gpus(self, *_args, **_kwargs) -> bool:
+            return True
+
+        def release_pending_gpus(self, *_args, **_kwargs) -> None:
+            return None
+
+        def register(self, **kwargs) -> None:
+            created.append(dict(kwargs))
+
+        def mark_ready(self, *_args, **_kwargs) -> bool:
+            return True
+
+    class _Options:
+        def remote(self, **_kwargs):
+            return fake_new_actor
+
+    class _FakeMegatronWorkerGroup:
+        @staticmethod
+        def options(**_kwargs):
+            return _Options()
+
+    get_actor_calls = {"count": 0}
+
+    def _fake_get_actor(*_args, **_kwargs):
+        get_actor_calls["count"] += 1
+        if get_actor_calls["count"] == 1:
+            return existing_actor
+        raise ValueError("missing")
+
+    def _fake_get(value, timeout=None):
+        if value == "diagnostics-ref":
+            return {"lora_rank": 16}
+        return value
+
+    def _fake_kill(actor, **kwargs):
+        assert actor is existing_actor
+        killed.append(dict(kwargs))
+
+    monkeypatch.setattr(resource_pool_mod, "get_resource_pool", lambda: _FakePool())
+    monkeypatch.setattr(config_mod, "actor_runtime_env_vars", lambda **_kwargs: {})
+    monkeypatch.setattr(config_mod, "otel_env_vars", lambda: {})
+    monkeypatch.setattr(resource_pool_mod, "actor_observability_metadata", lambda _actor: {})
+    monkeypatch.setattr(model_registry, "is_persistent_model", lambda _base_model: False)
+    monkeypatch.setattr(md, "MegatronWorkerGroup", _FakeMegatronWorkerGroup)
+    monkeypatch.setattr(md.ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(md.ray, "get_actor", _fake_get_actor)
+    monkeypatch.setattr(md.ray, "get", _fake_get)
+    monkeypatch.setattr(md.ray_kill, "kill", _fake_kill)
+    monkeypatch.setattr(md.ray.util, "get_placement_group", lambda _name: (_ for _ in ()).throw(ValueError("missing")))
+    monkeypatch.setattr(
+        md,
+        "start_as_current_span_from_traceparent",
+        lambda name, **kwargs: _span_recorder([], name, **kwargs),
+    )
+
+    actor = md.get_or_create_megatron_worker_group(
+        base_model="/tmp/qwen",
+        lora_rank=64,
+        learning_rate=1e-4,
+        session_id="sess-572-rank-mismatch",
+    )
+
+    assert actor is fake_new_actor
+    assert killed[0]["reason"] == "megatron_actor_lora_rank_mismatch"
+    assert killed[0]["observed_lora_rank"] == 16
+    assert killed[0]["expected_lora_rank"] == 64
+    assert created[-1]["metadata"]["max_lora_rank"] == 64
+
+
 @pytest.mark.anyio
 async def test_issue_408_async_get_or_create_megatron_worker_group_propagates_context(monkeypatch) -> None:
     from tinker_server.backend import megatron_distributed as md
@@ -290,6 +382,7 @@ async def test_issue_408_async_get_or_create_megatron_worker_group_propagates_co
         2e-4,
         None,
         "sess-async",
+        None,
         "Qwen/Qwen3-30B-A3B-Instruct-2507",
         "00-" + ("c" * 32) + "-" + ("3" * 16) + "-01",
         "req-408-async",

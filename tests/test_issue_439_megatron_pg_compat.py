@@ -69,7 +69,7 @@ def test_issue_439_megatron_diagnostics_report_requested_nodes() -> None:
     group.lora_rank = 8
     group._current_session = None
     group._session_manager = SimpleNamespace(list_persisted_actor_only_state=lambda actor_name=None: {})
-    group._get_session_cache_store_diagnostics = lambda: {"global": {}, "actor": {}}
+    group._get_session_cache_store_diagnostics = lambda: (_ for _ in ()).throw(AssertionError("expensive diagnostics"))
     group._placement_bundle_node_ips = ["192.168.38.175"] * 4
     group._placement_requested_node_ips = ["192.168.38.175"] * 4
 
@@ -77,3 +77,4 @@ def test_issue_439_megatron_diagnostics_report_requested_nodes() -> None:
 
     assert out["placement_bundle_node_ips"] == ["192.168.38.175"] * 4
     assert out["placement_requested_node_ips"] == ["192.168.38.175"]
+    assert out["session_cache_store"]["sampled"] is False
