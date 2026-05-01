@@ -12,6 +12,7 @@ Entrypoint: |
   # Note: prod keeps dashboard and Ray client disabled on purpose.
   python3 - <<'PY'
   import os
+  import shutil
   import socket
   import time
 
@@ -62,9 +63,13 @@ Entrypoint: |
       if os.path.lexists(RAY_TMP_LINK):
           if os.path.islink(RAY_TMP_LINK) or os.path.isfile(RAY_TMP_LINK):
               os.unlink(RAY_TMP_LINK)
+          elif os.path.isdir(RAY_TMP_LINK):
+              shutil.rmtree(RAY_TMP_LINK)
           else:
-              raise RuntimeError(f"refusing to replace non-link temp path: {RAY_TMP_LINK}")
+              raise RuntimeError(f"refusing to replace temp path: {RAY_TMP_LINK}")
       os.symlink(RAY_TMP_ROOT_REAL, RAY_TMP_LINK)
+      if not os.path.islink(RAY_TMP_LINK) or os.path.realpath(RAY_TMP_LINK) != os.path.realpath(RAY_TMP_ROOT_REAL):
+          raise RuntimeError(f"ray temp symlink mismatch: {RAY_TMP_LINK} -> {os.path.realpath(RAY_TMP_LINK)} expected {os.path.realpath(RAY_TMP_ROOT_REAL)}")
       os.makedirs(RAY_TEMP_DIR, exist_ok=True)
       os.makedirs(RAY_OBJECT_SPILLING_DIR, exist_ok=True)
       os.makedirs(RAY_OS_TMPDIR, exist_ok=True)
