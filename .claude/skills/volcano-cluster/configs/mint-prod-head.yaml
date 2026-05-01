@@ -132,7 +132,7 @@ Framework: "Custom"
 TaskRoleSpecs:
     - RoleName: "worker"
       RoleReplicas: 1
-      Flavor: "ml.g2a.xlarge"
+      Flavor: "ml.r3i.4xlarge"
 
 # No time limit - runs indefinitely
 ActiveDeadlineSeconds: 0

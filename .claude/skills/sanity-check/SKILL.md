@@ -67,6 +67,7 @@ set -a && source .secrets.env && set +a
 
 2) Confirm production targeting:
 - Set `TINKER_BASE_URL=https://mint.macaron.xin`.
+- Set `MINT_TEST_CHECKPOINT_OWNER_ID` to the production owner ObjectId used for owner-scoped checkpoint sampling.
 - Refuse to run if `TINKER_BASE_URL` is anything else (including `localhost:*` and `https://mint.macaron.im`).
 
 3) (Optional) Quick read-only probes (not sufficient alone):
@@ -87,6 +88,7 @@ Example per-model command:
 RUN_DIR="results/sanity-check/<timestamp>/<model_slug>"
 mkdir -p "$RUN_DIR"
 MINT_TEST_EXPERIMENT_ROOT="$RUN_DIR" \
+MINT_TEST_CHECKPOINT_OWNER_ID="$MINT_TEST_CHECKPOINT_OWNER_ID" \
 python .claude/skills/sanity-check/mint_rl_test_long.py \
   --model <MODEL_NAME> \
   --num-rl-steps=1 \
@@ -96,6 +98,7 @@ python .claude/skills/sanity-check/mint_rl_test_long.py \
 ```
 
 Do not add `--inference-only`.
+Do not omit `MINT_TEST_CHECKPOINT_OWNER_ID` when testing production owner-scoped checkpoints; without it, admin checkpoint references fail at sampling-client creation.
 After each run, preserve these timing outputs as evidence:
 - `timing_events.jsonl`: one record per timed stage call (sample, save_weights_for_sampler, forward_backward, optim_step, eval_sample, save_state, and client creation calls).
 - `timing_summary.json`: machine-readable per-stage aggregates.
