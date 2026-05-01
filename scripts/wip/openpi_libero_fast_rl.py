@@ -29,10 +29,30 @@ from openpi_libero_sft import (
 )
 
 
+def _request_headers() -> dict[str, str]:
+    headers = {"Connection": "close"}
+    api_key = (os.environ.get("TINKER_API_KEY") or os.environ.get("MINT_API_KEY") or "").strip()
+    if api_key:
+        headers["X-API-Key"] = api_key
+    return headers
+
+
+def _http_post(url: str, *, payload: dict[str, Any], timeout: float) -> requests.Response:
+    return requests.post(url, json=payload, timeout=timeout, headers=_request_headers())
+
+
+def _http_delete(url: str, *, timeout: float) -> requests.Response:
+    return requests.delete(url, timeout=timeout, headers=_request_headers())
+
+
 def _poll_future(base_url: str, request_id: str, *, timeout_s: float = 3600.0):
     deadline = time.time() + timeout_s
     while time.time() < deadline:
-        resp = requests.post(f"{base_url}/api/v1/retrieve_future", json={"request_id": request_id}, timeout=120)
+        try:
+            resp = _http_post(f"{base_url}/api/v1/retrieve_future", payload={"request_id": request_id}, timeout=120)
+        except requests.Timeout:
+            time.sleep(1.0)
+            continue
         if resp.status_code in {408, 503}:
             time.sleep(1.0)
             continue
@@ -49,7 +69,7 @@ def _create_model(base_url: str, base_model: str) -> str:
         "lora_config": {"rank": 16, "train_attn": True, "train_mlp": True, "train_unembed": True},
         "user_metadata": {"script": "scripts/wip/openpi_libero_fast_rl.py"},
     }
-    resp = requests.post(f"{base_url}/api/v1/create_model", json=payload, timeout=120)
+    resp = _http_post(f"{base_url}/api/v1/create_model", payload=payload, timeout=120)
     resp.raise_for_status()
     result = _poll_future(base_url, resp.json()["request_id"], timeout_s=3600)
     model_id = result.get("model_id")
@@ -77,7 +97,7 @@ def _create_model_from_state(
     owner_id = _checkpoint_owner_id_from_uri(state_path)
     if owner_id is not None:
         payload["owner_id"] = owner_id
-    resp = requests.post(f"{base_url}/api/v1/create_model_from_state", json=payload, timeout=120)
+    resp = _http_post(f"{base_url}/api/v1/create_model_from_state", payload=payload, timeout=120)
     resp.raise_for_status()
     result = _poll_future(base_url, resp.json()["request_id"], timeout_s=3600)
     model_id = result.get("model_id")
@@ -88,15 +108,15 @@ def _create_model_from_state(
 
 def _delete_model(base_url: str, model_id: str) -> None:
     try:
-        requests.delete(f"{base_url}/api/v1/models/{model_id}", timeout=300)
+        _http_delete(f"{base_url}/api/v1/models/{model_id}", timeout=300)
     except Exception:
         pass
 
 
 def _save_weights_for_sampler(base_url: str, model_id: str, checkpoint_name: str) -> str:
-    resp = requests.post(
+    resp = _http_post(
         f"{base_url}/api/v1/save_weights_for_sampler",
-        json={"model_id": model_id, "path": checkpoint_name},
+        payload={"model_id": model_id, "path": checkpoint_name},
         timeout=120,
     )
     resp.raise_for_status()
@@ -178,9 +198,9 @@ def _create_action_session(base_url: str, base_model: str, model_path: str, *, t
     if owner_id is not None:
         payload["owner_id"] = owner_id
     while True:
-        resp = requests.post(
+        resp = _http_post(
             f"{base_url}/api/v1/mint/action_sessions",
-            json=payload,
+            payload=payload,
             timeout=3600,
         )
         if resp.status_code in {429, 503} and time.time() < deadline:
@@ -199,7 +219,7 @@ def _create_action_session(base_url: str, base_model: str, model_path: str, *, t
 
 def _delete_action_session(base_url: str, action_session_id: str) -> None:
     try:
-        requests.delete(f"{base_url}/api/v1/mint/action_sessions/{action_session_id}", timeout=120)
+        _http_delete(f"{base_url}/api/v1/mint/action_sessions/{action_session_id}", timeout=120)
     except Exception:
         pass
 
@@ -263,9 +283,9 @@ def _make_action_observation(item: dict[str, Any]) -> dict[str, Any]:
 def _sample_actions(base_url: str, action_session_id: str, item: dict[str, Any], *, temperature: float = 0.0) -> np.ndarray:
     payload = _make_action_observation(item)
     payload["temperature"] = float(temperature)
-    resp = requests.post(
+    resp = _http_post(
         f"{base_url}/api/v1/mint/action_sessions/{action_session_id}/act",
-        json=payload,
+        payload=payload,
         timeout=120,
     )
     resp.raise_for_status()
@@ -313,9 +333,9 @@ def _forward_logprobs(base_url: str, model_id: str, datum: dict[str, Any]) -> li
     datum = json.loads(json.dumps(datum))
     datum["loss_fn_inputs"]["logprobs"]["data"] = [0.0] * zero_len
     datum["loss_fn_inputs"]["advantages"]["data"] = [0.0] * zero_len
-    resp = requests.post(
+    resp = _http_post(
         f"{base_url}/api/v1/forward_backward",
-        json={"model_id": model_id, "forward_backward_input": {"loss_fn": "importance_sampling", "data": [datum]}},
+        payload={"model_id": model_id, "forward_backward_input": {"loss_fn": "importance_sampling", "data": [datum]}},
         timeout=120,
     )
     resp.raise_for_status()
@@ -325,9 +345,9 @@ def _forward_logprobs(base_url: str, model_id: str, datum: dict[str, Any]) -> li
 
 
 def _ppo_train_step(base_url: str, model_id: str, datum: dict[str, Any]) -> dict[str, Any]:
-    resp = requests.post(
+    resp = _http_post(
         f"{base_url}/api/v1/train_step",
-        json={
+        payload={
             "model_id": model_id,
             "forward_backward_input": {"loss_fn": "ppo", "loss_fn_config": {"epsilon": 0.2}, "data": [datum]},
             "adam_params": {"learning_rate": 1e-4},

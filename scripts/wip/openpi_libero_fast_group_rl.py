@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -9,33 +10,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import requests
-
-
-def _request_headers() -> dict[str, str]:
-    api_key = (os.environ.get("TINKER_API_KEY") or os.environ.get("MINT_API_KEY") or "").strip()
-    if not api_key:
-        return {}
-    return {"X-API-Key": api_key}
-
-
-_orig_post = requests.post
-_orig_delete = requests.delete
-
-def _post(*args, **kwargs):
-    headers = dict(kwargs.pop("headers", {}) or {})
-    headers.update(_request_headers())
-    kwargs["headers"] = headers
-    return _orig_post(*args, **kwargs)
-
-def _delete(*args, **kwargs):
-    headers = dict(kwargs.pop("headers", {}) or {})
-    headers.update(_request_headers())
-    kwargs["headers"] = headers
-    return _orig_delete(*args, **kwargs)
-
-requests.post = _post
-requests.delete = _delete
 
 from openpi_libero_fast_rl import (
     _create_action_session,
@@ -44,6 +18,7 @@ from openpi_libero_fast_rl import (
     _delete_action_session,
     _delete_model,
     _forward_logprobs,
+    _http_post,
     _make_rl_datum,
     _poll_future,
     _resolve_fast_tokenizer_path,
@@ -55,9 +30,9 @@ from openpi_libero_sft import _build_transform, _collect_transformed_items, _loa
 
 
 def _save_training_state(base_url: str, model_id: str, checkpoint_name: str) -> str:
-    resp = requests.post(
+    resp = _http_post(
         f'{base_url}/api/v1/save_weights',
-        json={'model_id': model_id, 'path': checkpoint_name},
+        payload={'model_id': model_id, 'path': checkpoint_name},
         timeout=120,
     )
     resp.raise_for_status()
@@ -69,9 +44,9 @@ def _save_training_state(base_url: str, model_id: str, checkpoint_name: str) -> 
 
 
 def _ppo_train_step_batch(base_url: str, model_id: str, datums: list[dict], *, learning_rate: float) -> dict:
-    resp = requests.post(
+    resp = _http_post(
         f'{base_url}/api/v1/train_step',
-        json={
+        payload={
             'model_id': model_id,
             'forward_backward_input': {'loss_fn': 'ppo', 'loss_fn_config': {'epsilon': 0.2}, 'data': datums},
             'adam_params': {'learning_rate': float(learning_rate)},
@@ -91,9 +66,9 @@ def _forward_logprobs_batch(base_url: str, model_id: str, datums: list[dict]) ->
         zero_len = len(datum['loss_fn_inputs']['target_tokens']['data'])
         datum['loss_fn_inputs']['logprobs']['data'] = [0.0] * zero_len
         datum['loss_fn_inputs']['advantages']['data'] = [0.0] * zero_len
-    resp = requests.post(
+    resp = _http_post(
         f'{base_url}/api/v1/forward_backward',
-        json={
+        payload={
             'model_id': model_id,
             'forward_backward_input': {
                 'loss_fn': 'importance_sampling',
@@ -203,6 +178,15 @@ def _same_state_diversity_probe(
     return rows
 
 
+def _action_hash(actions: np.ndarray) -> str:
+    arr = np.asarray(actions, dtype=np.float32)
+    return hashlib.sha1(arr.tobytes()).hexdigest()[:12]
+
+
+def _token_hash(tokens: list[int]) -> str:
+    return hashlib.sha1(json.dumps(tokens, separators=(",", ":")).encode("utf-8")).hexdigest()[:12]
+
+
 def _evaluate_checkpoint_reward(
     base_url: str,
     *,
@@ -262,6 +246,26 @@ def main() -> int:
     parser.add_argument('--train-item-indices', default=os.environ.get('OPENPI_VLA_TRAIN_ITEM_INDICES', ''))
     parser.add_argument('--diversity-probe-count', type=int, default=3)
     parser.add_argument('--diversity-probe-repeats', type=int, default=4)
+    parser.add_argument(
+        '--min-group-reward-std',
+        type=float,
+        default=float(os.environ.get('OPENPI_VLA_MIN_GROUP_REWARD_STD', '1e-5')),
+    )
+    parser.add_argument(
+        '--max-group-resample-attempts',
+        type=int,
+        default=int(os.environ.get('OPENPI_VLA_MAX_GROUP_RESAMPLE_ATTEMPTS', '2')),
+    )
+    parser.add_argument(
+        '--resample-temperature-step',
+        type=float,
+        default=float(os.environ.get('OPENPI_VLA_RESAMPLE_TEMPERATURE_STEP', '0.025')),
+    )
+    parser.add_argument(
+        '--min-accepted-groups-per-step',
+        type=int,
+        default=int(os.environ.get('OPENPI_VLA_MIN_ACCEPTED_GROUPS_PER_STEP', '2')),
+    )
     args = parser.parse_args()
 
     base_model = 'openpi/pi0-fast-libero-low-mem-finetune'
@@ -469,94 +473,191 @@ def main() -> int:
             candidate_group_rows = []
             raw_rewards = []
             centered_rewards = []
+            skipped_group_rows = []
             order = list(train_indices)
             rng.shuffle(order)
-            selected_item_indices = [
-                order[group_idx % len(order)]
-                for group_idx in range(args.groups_per_step)
-            ]
-            for group_idx, item_index in enumerate(selected_item_indices):
+            candidate_item_attempt_count = max(args.groups_per_step, len(order))
+            selected_item_indices: list[int] = []
+            for item_attempt_idx in range(candidate_item_attempt_count):
+                if len(selected_item_indices) >= args.groups_per_step:
+                    break
+                group_idx = len(selected_item_indices)
+                item_index = order[item_attempt_idx % len(order)]
                 item = items[item_index]
-                group_datums = []
-                group_rewards = []
-                for sample_in_group in range(args.group_size):
+                accepted_group = False
+                for group_attempt_idx in range(args.max_group_resample_attempts + 1):
+                    sample_temperature = args.temperature + (
+                        float(group_attempt_idx) * args.resample_temperature_step
+                    )
+                    group_datums = []
+                    group_rewards = []
+                    group_action_hashes = []
+                    group_token_hashes = []
+                    group_samples = []
+                    for sample_in_group in range(args.group_size):
+                        with run_log.open('a', encoding='utf-8') as handle:
+                            handle.write(
+                                json.dumps(
+                                    {
+                                        'event': 'candidate_sample',
+                                        'step': step,
+                                        'group_idx': group_idx,
+                                        'item_attempt_idx': item_attempt_idx,
+                                        'group_attempt_idx': group_attempt_idx,
+                                        'sample_in_group': sample_in_group,
+                                        'item_index': item_index,
+                                        'temperature': sample_temperature,
+                                    }
+                                )
+                                + '\n'
+                            )
+                        sampled_actions = _sample_actions(
+                            base_url,
+                            action_session_id,
+                            item,
+                            temperature=sample_temperature,
+                        )
+                        expert_actions = np.asarray(item['actions'], dtype=np.float32)
+                        mse = float(np.mean((sampled_actions - expert_actions) ** 2))
+                        reward = -mse
+                        prefix_tokens, target_tokens, suffix_token_ar_mask = _tokenize_sampled_actions(
+                            tokenizer,
+                            task_text,
+                            item,
+                            sampled_actions,
+                        )
+                        if not target_tokens:
+                            raise RuntimeError(
+                                f'grouped RL sample produced empty target tokens at step {step}, '
+                                f'group_idx={group_idx}, item_index={item_index}'
+                            )
+                        datum = _make_rl_datum(
+                            item,
+                            prefix_tokens,
+                            target_tokens,
+                            suffix_token_ar_mask,
+                            logprobs=[0.0] * len(target_tokens),
+                            advantages=[0.0] * len(target_tokens),
+                        )
+                        group_datums.append(datum)
+                        group_rewards.append(reward)
+                        group_action_hashes.append(_action_hash(sampled_actions))
+                        group_token_hashes.append(_token_hash(target_tokens))
+                        group_samples.append(np.asarray(sampled_actions, dtype=np.float32))
+                    reward_arr = np.asarray(group_rewards, dtype=np.float32)
+                    reward_std = float(reward_arr.std())
+                    group_mean = float(reward_arr.mean())
+                    group_centered_rewards = (reward_arr - group_mean).astype(np.float32)
+                    unique_exact_actions = len(set(group_action_hashes))
+                    unique_target_tokenizations = len(set(group_token_hashes))
+                    stacked_samples = np.stack(group_samples, axis=0)
+                    max_pairwise_action_diff = float(
+                        max(
+                            np.max(np.abs(stacked_samples[i] - stacked_samples[j]))
+                            for i in range(len(group_samples))
+                            for j in range(i + 1, len(group_samples))
+                        )
+                    ) if len(group_samples) > 1 else 0.0
+                    group_event = {
+                        'event': 'candidate_group',
+                        'step': step,
+                        'group_idx': group_idx,
+                        'item_attempt_idx': item_attempt_idx,
+                        'group_attempt_idx': group_attempt_idx,
+                        'item_index': item_index,
+                        'temperature': sample_temperature,
+                        'rewards': group_rewards,
+                        'reward_mean': group_mean,
+                        'reward_std': reward_std,
+                        'centered_rewards': group_centered_rewards.tolist(),
+                        'unique_exact_actions': unique_exact_actions,
+                        'unique_target_tokenizations': unique_target_tokenizations,
+                        'action_hashes': group_action_hashes,
+                        'token_hashes': group_token_hashes,
+                        'max_pairwise_action_diff': max_pairwise_action_diff,
+                    }
                     with run_log.open('a', encoding='utf-8') as handle:
-                        handle.write(
-                            json.dumps(
+                        handle.write(json.dumps(group_event) + '\n')
+                    rejection_reasons = []
+                    if reward_std <= args.min_group_reward_std:
+                        rejection_reasons.append('reward_std_below_threshold')
+                    if unique_exact_actions <= 1:
+                        rejection_reasons.append('identical_actions')
+                    if rejection_reasons:
+                        with run_log.open('a', encoding='utf-8') as handle:
+                            handle.write(
+                                json.dumps(
+                                    {
+                                        'event': 'candidate_group_rejected',
+                                        **group_event,
+                                        'rejection_reasons': rejection_reasons,
+                                        'min_group_reward_std': args.min_group_reward_std,
+                                    }
+                                )
+                                + '\n'
+                            )
+                        if group_attempt_idx == args.max_group_resample_attempts:
+                            skipped_group_rows.append(
                                 {
-                                    'event': 'candidate_sample',
-                                    'step': step,
                                     'group_idx': group_idx,
-                                    'sample_in_group': sample_in_group,
+                                    'item_attempt_idx': item_attempt_idx,
                                     'item_index': item_index,
+                                    'temperature': sample_temperature,
+                                    'reward_std': reward_std,
+                                    'unique_exact_actions': unique_exact_actions,
+                                    'unique_target_tokenizations': unique_target_tokenizations,
+                                    'max_pairwise_action_diff': max_pairwise_action_diff,
+                                    'rejection_reasons': rejection_reasons,
                                 }
                             )
-                            + '\n'
-                        )
-                    sampled_actions = _sample_actions(
-                        base_url,
-                        action_session_id,
-                        item,
-                        temperature=args.temperature,
-                    )
-                    expert_actions = np.asarray(item['actions'], dtype=np.float32)
-                    mse = float(np.mean((sampled_actions - expert_actions) ** 2))
-                    reward = -mse
-                    prefix_tokens, target_tokens, suffix_token_ar_mask = _tokenize_sampled_actions(
-                        tokenizer,
-                        task_text,
-                        item,
-                        sampled_actions,
-                    )
-                    if not target_tokens:
-                        raise RuntimeError(
-                            f'grouped RL sample produced empty target tokens at step {step}, '
-                            f'group_idx={group_idx}, item_index={item_index}'
-                        )
-                    datum = _make_rl_datum(
-                        item,
-                        prefix_tokens,
-                        target_tokens,
-                        suffix_token_ar_mask,
-                        logprobs=[0.0] * len(target_tokens),
-                        advantages=[0.0] * len(target_tokens),
-                    )
-                    group_datums.append(datum)
-                    group_rewards.append(reward)
-                reward_arr = np.asarray(group_rewards, dtype=np.float32)
-                reward_std = float(reward_arr.std())
-                group_mean = float(reward_arr.mean())
-                group_centered_rewards = (reward_arr - group_mean).astype(np.float32)
-                with run_log.open('a', encoding='utf-8') as handle:
-                    handle.write(
-                        json.dumps(
+                        continue
+                    accepted_group = True
+                    selected_item_indices.append(item_index)
+                    for datum, centered_reward in zip(group_datums, group_centered_rewards.tolist(), strict=True):
+                        candidate_datums.append(datum)
+                        candidate_group_rows.append(
                             {
-                                'event': 'candidate_group',
                                 'step': step,
                                 'group_idx': group_idx,
                                 'item_index': item_index,
-                                'rewards': group_rewards,
+                                'temperature': sample_temperature,
+                                'centered_reward': float(centered_reward),
                                 'reward_mean': group_mean,
                                 'reward_std': reward_std,
-                                'centered_rewards': group_centered_rewards.tolist(),
+                                'unique_exact_actions': unique_exact_actions,
+                                'unique_target_tokenizations': unique_target_tokenizations,
+                                'max_pairwise_action_diff': max_pairwise_action_diff,
                             }
                         )
-                        + '\n'
-                    )
-                for datum, centered_reward in zip(group_datums, group_centered_rewards.tolist(), strict=True):
-                    candidate_datums.append(datum)
-                    candidate_group_rows.append(
+                        centered_rewards.append(float(centered_reward))
+                    raw_rewards.extend(group_rewards)
+                    break
+                if not accepted_group:
+                    continue
+
+            accepted_group_count = len(selected_item_indices)
+            with run_log.open('a', encoding='utf-8') as handle:
+                handle.write(
+                    json.dumps(
                         {
+                            'event': 'candidate_group_selection_summary',
                             'step': step,
-                            'group_idx': group_idx,
-                            'item_index': item_index,
-                            'centered_reward': float(centered_reward),
-                            'reward_mean': group_mean,
-                            'reward_std': reward_std,
+                            'requested_groups': args.groups_per_step,
+                            'accepted_groups': accepted_group_count,
+                            'min_accepted_groups_per_step': args.min_accepted_groups_per_step,
+                            'selected_item_indices': selected_item_indices,
+                            'skipped_groups': skipped_group_rows,
                         }
                     )
-                    centered_rewards.append(float(centered_reward))
-                raw_rewards.extend(group_rewards)
+                    + '\n'
+                )
+            if accepted_group_count < args.min_accepted_groups_per_step:
+                raise RuntimeError(
+                    f'grouped RL step {step} accepted too few same-state groups: '
+                    f'accepted={accepted_group_count} requested={args.groups_per_step} '
+                    f'min_required={args.min_accepted_groups_per_step} '
+                    f'skipped_groups={json.dumps(skipped_group_rows)}'
+                )
 
             if args.serialize_runtime_roles:
                 if action_session_id:
@@ -596,7 +697,8 @@ def main() -> int:
             if centered_reward_scale <= 1e-6:
                 raise RuntimeError(
                     f'grouped RL step {step} has zero centered-reward variance across same-state groups: '
-                    f'centered_rewards={centered_rewards}'
+                    f'accepted_groups={accepted_group_count} centered_rewards={centered_rewards} '
+                    f'skipped_groups={json.dumps(skipped_group_rows)}'
                 )
             for datum, row in zip(candidate_datums, candidate_group_rows, strict=True):
                 target_len = len(datum['loss_fn_inputs']['target_tokens']['data'])
@@ -679,7 +781,7 @@ def main() -> int:
             mean_reward = float(sum(raw_rewards) / len(raw_rewards))
             mean_loss = float(sum(epoch_losses) / len(epoch_losses))
             mean_loss_abs = float(sum(epoch_loss_abs) / len(epoch_loss_abs))
-            record = {'step': step, 'reward': mean_reward, 'reward_std': reward_std, 'loss': mean_loss, 'loss_last': epoch_losses[-1], 'loss_abs_mean': mean_loss_abs, 'loss_abs_last': epoch_loss_abs[-1], 'num_samples': len(raw_rewards), 'groups_per_step': args.groups_per_step, 'group_size': args.group_size, 'train_epochs': args.train_epochs, 'logprob_batch_size': args.logprob_batch_size, 'learning_rate': args.learning_rate, 'temperature': args.temperature, 'advantage_mode': 'same_state_group_centered_batchstd_per_token_normalized', 'centered_reward_scale': centered_reward_scale}
+            record = {'step': step, 'reward': mean_reward, 'reward_std': reward_std, 'loss': mean_loss, 'loss_last': epoch_losses[-1], 'loss_abs_mean': mean_loss_abs, 'loss_abs_last': epoch_loss_abs[-1], 'num_samples': len(raw_rewards), 'groups_per_step': args.groups_per_step, 'accepted_groups': accepted_group_count, 'skipped_group_count': len(skipped_group_rows), 'group_size': args.group_size, 'train_epochs': args.train_epochs, 'logprob_batch_size': args.logprob_batch_size, 'learning_rate': args.learning_rate, 'temperature': args.temperature, 'advantage_mode': 'same_state_group_centered_batchstd_per_token_normalized', 'centered_reward_scale': centered_reward_scale}
             if epoch_ratios:
                 record['ratio_mean'] = float(sum(epoch_ratios) / len(epoch_ratios))
             if epoch_clipfracs:

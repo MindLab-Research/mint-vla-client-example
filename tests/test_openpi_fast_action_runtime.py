@@ -1025,6 +1025,113 @@ def test_action_session_manager_create_session_starts_runtime_from_checkpoint(tm
             "action_session_id": "session-1:action:3",
             "base_model": OPENPI_FAST_MODEL,
             "checkpoint_path": str(checkpoint_dir.resolve()),
+            "config_name": "pi0_fast_libero_low_mem_finetune",
+            "action_dim": 7,
+            "action_horizon": 10,
+            "action_token_budget": 64,
+            "max_token_len": 180,
+            "camera_layout": ["base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"],
+        },
+    )
+
+
+def test_action_session_manager_create_session_retries_retryable_actor_death(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from tinker_server.backend import action_session_manager
+
+    checkpoint_dir = tmp_path / "model-1" / "export-1"
+    (checkpoint_dir / "params").mkdir(parents=True, exist_ok=True)
+    (checkpoint_dir / "assets").mkdir(parents=True, exist_ok=True)
+
+    class _RetryableActorDiedError(RuntimeError):
+        pass
+
+    monkeypatch.setattr(
+        action_session_manager.ray.exceptions,
+        "ActorDiedError",
+        _RetryableActorDiedError,
+        raising=False,
+    )
+
+    class _FlakyActionRuntimeClient:
+        def __init__(self, *, fail_on_create: bool) -> None:
+            self._fail_on_create = fail_on_create
+            self.calls: list[tuple[str, dict | None]] = []
+            self.closed = False
+
+        async def request(
+            self,
+            op: str,
+            payload: dict | None = None,
+            *,
+            timeout_s: float | None = None,
+        ) -> dict:
+            self.calls.append((op, payload))
+            _ = timeout_s
+            if op != "create_session":
+                raise AssertionError(f"unexpected action op {op}")
+            if self._fail_on_create:
+                raise action_session_manager.ray.exceptions.ActorDiedError("dead shared actor")
+            return {"ready": True}
+
+        async def close(self) -> None:
+            self.closed = True
+
+    class _FlakyActionRuntimeFactory:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+            self.clients: list[_FlakyActionRuntimeClient] = []
+
+        async def __call__(
+            self,
+            *,
+            action_session_id: str,
+            base_model: str,
+            checkpoint_path: str,
+            model_config,
+            config_name: str,
+        ):
+            self.calls.append(
+                {
+                    "action_session_id": action_session_id,
+                    "base_model": base_model,
+                    "checkpoint_path": checkpoint_path,
+                    "config_name": config_name,
+                    "camera_layout": model_config.camera_layout,
+                    "action_token_budget": model_config.action_token_budget,
+                }
+            )
+            client = _FlakyActionRuntimeClient(fail_on_create=len(self.clients) == 0)
+            self.clients.append(client)
+            return client
+
+    factory = _FlakyActionRuntimeFactory()
+    manager = action_session_manager.OpenPIFastActionSessionManager(runtime_factory=factory)
+
+    action_session_id = asyncio.run(
+        manager.create_session(
+            session_id="session-1",
+            action_session_seq_id=3,
+            base_model=OPENPI_FAST_MODEL,
+            model_path=f"file://{checkpoint_dir}",
+            user_id="admin",
+        )
+    )
+
+    assert action_session_id == "session-1:action:3"
+    assert len(factory.calls) == 2
+    assert len(factory.clients) == 2
+    assert factory.clients[0].closed is True
+    assert factory.clients[1].closed is False
+    assert factory.clients[0].calls == [
+        (
+            "create_session",
+            {
+                "action_session_id": "session-1:action:3",
+                "base_model": OPENPI_FAST_MODEL,
+                "checkpoint_path": str(checkpoint_dir.resolve()),
                 "config_name": "pi0_fast_libero_low_mem_finetune",
                 "action_dim": 7,
                 "action_horizon": 10,
@@ -1033,6 +1140,9 @@ def test_action_session_manager_create_session_starts_runtime_from_checkpoint(tm
                 "camera_layout": ["base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"],
             },
         )
+    ]
+    assert factory.clients[1].calls == factory.clients[0].calls
+    assert manager._runtime_clients[action_session_id] is factory.clients[1]
 
 
 def test_action_session_manager_act_returns_actions(tmp_path: Path) -> None:
