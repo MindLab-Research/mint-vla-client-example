@@ -97,11 +97,15 @@ def run_actor_reconciliation_once() -> dict[str, Any]:
 
 
 def run_training_cleanup_once() -> dict[str, Any]:
+    stale_after_s = float(os.environ.get("MINT_TRAINING_HEARTBEAT_STALE_S", "300"))
+    if stale_after_s <= 0:
+        return {"cleaned": []}
+
     from .training_cleanup_executor import training_cleanup_executor
 
     import asyncio
 
-    cleaned = asyncio.run(training_cleanup_executor.async_cleanup_stale_sessions_once())
+    cleaned = asyncio.run(training_cleanup_executor.async_cleanup_stale_sessions_once(stale_after_s=stale_after_s))
     return {"cleaned": list(cleaned)}
 
 

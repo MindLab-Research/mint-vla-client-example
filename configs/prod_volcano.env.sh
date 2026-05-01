@@ -10,6 +10,7 @@ export TINKER_HOST=0.0.0.0
 export TINKER_PORT=18000
 export TINKER_CHECKPOINT_DIR=/tos-mindverse/tinker_checkpoints
 export TINKER_USAGE_LOG_DIR=/vePFS-Mindverse/share/mint-prod-data/billing
+export TINKER_USAGE_PG_TABLE=mint_platform.usage_event
 
 export MINT_SUPPORTED_MODELS="Qwen/Qwen3-0.6B,Qwen/Qwen3-4B-Instruct-2507,Qwen/Qwen3-4B-Thinking-2507,Qwen/Qwen3-30B-A3B-Instruct-2507,Qwen/Qwen3-235B-A22B-Instruct-2507,zai-org/GLM-5.1"
 export MINT_PERSISTENT_MODELS="Qwen/Qwen3-0.6B,Qwen/Qwen3-4B-Instruct-2507,Qwen/Qwen3-4B-Thinking-2507,Qwen/Qwen3-30B-A3B-Instruct-2507,Qwen/Qwen3-235B-A22B-Instruct-2507"
@@ -62,6 +63,7 @@ export MINT_VLLM_REQUEST_TIMING=1
 export MINT_TIMING_DIAG=1
 export MINT_VERL_DIAGNOSTICS=1
 export MINT_LOG_KILL_STACK=1
+export MINT_TRAINING_HEARTBEAT_STALE_S=0
 
 export HF_HOME=/vePFS-Mindverse/share/huggingface
 export HF_HUB_OFFLINE=1
@@ -77,9 +79,12 @@ else
   return 1 2>/dev/null || exit 1
 fi
 
-export MINT_API_WORK_QUEUE_ACTOR_NAME=tinker_api_work_queue
-export MINT_QUEUE_EXECUTION_RUNTIME_ACTOR_NAME=tinker_queue_execution_runtime
-export MINT_QUEUE_SUPERVISOR_ACTOR_NAME=tinker_queue_supervisor
+# Bump detached control-plane actor names after production deploys that change
+# queue/runtime code or node-pin environment. Detached actors retain old imports
+# and environment until recreated.
+export MINT_API_WORK_QUEUE_ACTOR_NAME=tinker_api_work_queue_v20260425a
+export MINT_QUEUE_EXECUTION_RUNTIME_ACTOR_NAME=tinker_queue_execution_runtime_v20260425a
+export MINT_QUEUE_SUPERVISOR_ACTOR_NAME=tinker_queue_supervisor_v20260425a
 export MINT_API_WORK_QUEUE_ACTOR_MAX_CONCURRENCY=1024
 
 export PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/mint-runtime-py31213

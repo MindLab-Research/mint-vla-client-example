@@ -258,6 +258,7 @@ class PostgresUsageStore:
                 max_size=self._pool_max,
                 command_timeout=max(5.0, self._write_timeout_s),
                 server_settings={"application_name": "tinker_server_usage"},
+                statement_cache_size=0,
             )
             try:
                 await self._ensure_pg_schema(pool)
