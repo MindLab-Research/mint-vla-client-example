@@ -1208,12 +1208,70 @@ class TrainingWorker:
             },
         }
 
+    def _infer_adapter_checkpoint_rank(self, checkpoint_path: str) -> int:
+        """Infer adapter rank from checkpoint metadata and tensor shapes."""
+        from safetensors import safe_open
+
+        rank_sources: list[tuple[str, int]] = []
+
+        meta_path = os.path.join(checkpoint_path, "training_meta.json")
+        if os.path.exists(meta_path):
+            with open(meta_path, encoding="utf-8") as f:
+                meta = json.load(f)
+            if not isinstance(meta, dict):
+                raise ValueError(f"training_meta.json must contain a JSON object, got {type(meta).__name__}")
+            if "actual_rank" in meta:
+                rank = meta["actual_rank"]
+                if not isinstance(rank, int) or isinstance(rank, bool) or rank <= 0:
+                    raise ValueError(f"training_meta.actual_rank must be a positive int, got {rank!r}")
+                rank_sources.append(("training_meta.actual_rank", int(rank)))
+
+        config_path = os.path.join(checkpoint_path, "adapter_config.json")
+        if os.path.exists(config_path):
+            with open(config_path, encoding="utf-8") as f:
+                adapter_config = json.load(f)
+            if not isinstance(adapter_config, dict):
+                raise ValueError(f"adapter_config.json must contain a JSON object, got {type(adapter_config).__name__}")
+            rank = adapter_config.get("r")
+            if not isinstance(rank, int) or isinstance(rank, bool) or rank <= 0:
+                raise ValueError(f"adapter_config.r must be a positive int, got {rank!r}")
+            rank_sources.append(("adapter_config.r", int(rank)))
+
+        weights_path = os.path.join(checkpoint_path, "adapter_model.safetensors")
+        if not os.path.exists(weights_path):
+            raise FileNotFoundError(f"Adapter not found: {weights_path}")
+        tensor_ranks: list[tuple[str, int]] = []
+        with safe_open(weights_path, framework="pt", device="cpu") as handle:
+            for key in handle.keys():
+                lowered = str(key).lower()
+                is_lora_a = "lora_a" in lowered or ("adapter" in lowered and "linear_in" in lowered)
+                is_lora_b = "lora_b" in lowered or ("adapter" in lowered and "linear_out" in lowered)
+                if not (is_lora_a or is_lora_b):
+                    continue
+                shape = tuple(int(dim) for dim in handle.get_slice(key).get_shape())
+                if len(shape) < 2:
+                    raise ValueError(f"{key}: expected rank-2+ LoRA tensor, got shape={shape}")
+                tensor_ranks.append((str(key), int(shape[0] if is_lora_a else shape[-1])))
+        if tensor_ranks:
+            values = {rank for _, rank in tensor_ranks}
+            if len(values) != 1:
+                raise ValueError(f"LoRA tensor rank mismatch: {tensor_ranks}")
+            rank_sources.append(("adapter_model.safetensors", next(iter(values))))
+
+        if not rank_sources:
+            raise ValueError(f"No LoRA rank metadata or tensors found in checkpoint: {checkpoint_path}")
+        values = {rank for _, rank in rank_sources}
+        if len(values) != 1:
+            raise ValueError(f"Checkpoint LoRA rank metadata mismatch: {rank_sources}")
+        return self._resolve_actual_rank(next(iter(values)))
+
     def forward_backward_reverse_kl(
         self,
         data_items: list[dict],
         reference_checkpoint_path: str,
         temperature: float,
         session_id: str | None = None,
+        actual_rank: int | None = None,
         traceparent: str | None = None,
     ) -> dict:
         """Forward/backward for Mint reverse-KL distillation against a fixed reference checkpoint."""
@@ -1224,7 +1282,8 @@ class TrainingWorker:
         if temperature <= 0:
             raise ValueError(f"temperature must be positive, got {temperature!r}")
         if session_id:
-            self._ensure_session_loaded(session_id)
+            self._ensure_session_loaded(session_id, actual_rank=actual_rank)
+        current_actual_rank = self._resolve_actual_rank(actual_rank)
 
         from .mintx_ops import (
             build_scoring_sequence,
@@ -1242,10 +1301,19 @@ class TrainingWorker:
         prev_training = self.model.training
         try:
             with temporary_adapter_snapshot_dir("mintx_dense_ref_") as snapshot_dir:
-                self.save_adapter_state(snapshot_dir)
+                self.save_adapter_state(
+                    snapshot_dir,
+                    actual_rank=current_actual_rank,
+                    trainer_rank=self.max_lora_rank,
+                )
                 try:
                     self.model.eval()
-                    self.load_adapter_state(reference_checkpoint_path)
+                    reference_actual_rank = self._infer_adapter_checkpoint_rank(reference_checkpoint_path)
+                    self.load_adapter_state(
+                        reference_checkpoint_path,
+                        actual_rank=reference_actual_rank,
+                        trainer_rank=self.max_lora_rank,
+                    )
                     with torch.no_grad():
                         for batch in reference_batches:
                             scoring_input, completion_start = build_scoring_sequence(
@@ -1267,7 +1335,11 @@ class TrainingWorker:
                                 )
                             )
                 finally:
-                    self.load_adapter_state(snapshot_dir)
+                    self.load_adapter_state(
+                        snapshot_dir,
+                        actual_rank=current_actual_rank,
+                        trainer_rank=self.max_lora_rank,
+                    )
 
             self.model.train()
             outputs = []
@@ -3906,6 +3978,7 @@ class VerlTrainingEngine:
                 request.reference_model_path,
                 float(request.temperature),
                 session.model_id,
+                session.lora_config.rank if session.lora_config else None,
                 traceparent=traceparent,
             )
             result = await self._await_worker_call(

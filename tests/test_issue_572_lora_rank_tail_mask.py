@@ -224,6 +224,71 @@ def test_issue_572_dense_export_config_uses_actual_rank() -> None:
     assert config["lora_alpha"] == 16
 
 
+def test_issue_572_dense_reverse_kl_loads_reference_with_adapter_rank(tmp_path) -> None:
+    from safetensors.torch import save_file
+    from tinker_server.backend.verl_training import TrainingWorker
+
+    reference_dir = tmp_path / "reference"
+    reference_dir.mkdir()
+    save_file(
+        {
+            "base_model.model.layers.0.self_attn.q_proj.lora_A.default.weight": torch.ones(16, 3),
+            "base_model.model.layers.0.self_attn.q_proj.lora_B.default.weight": torch.ones(5, 16),
+        },
+        reference_dir / "adapter_model.safetensors",
+    )
+    (reference_dir / "adapter_config.json").write_text(json.dumps({"r": 16}))
+    (reference_dir / "training_meta.json").write_text(json.dumps({"actual_rank": 16}))
+
+    class _Model:
+        training = True
+
+        def train(self):
+            self.training = True
+
+        def eval(self):
+            self.training = False
+
+    worker_cls = TrainingWorker.__ray_metadata__.modified_class
+    worker = object.__new__(worker_cls)
+    worker.device = "cpu"
+    worker.model = _Model()
+    worker.max_lora_rank = 64
+    worker._current_actual_rank = None
+    worker._bind_traceparent = lambda traceparent: None
+    worker._touch = lambda: None
+
+    ensure_calls = []
+    save_calls = []
+    load_calls = []
+
+    def _ensure_session_loaded(session_id, actual_rank=None):
+        ensure_calls.append((session_id, actual_rank))
+        worker._current_actual_rank = actual_rank
+
+    worker._ensure_session_loaded = _ensure_session_loaded
+    worker.save_adapter_state = lambda path, actual_rank=None, trainer_rank=None: save_calls.append(
+        (actual_rank, trainer_rank)
+    )
+    worker.load_adapter_state = lambda path, actual_rank=None, trainer_rank=None: load_calls.append(
+        (str(path), actual_rank, trainer_rank)
+    )
+
+    result = worker.forward_backward_reverse_kl(
+        [],
+        str(reference_dir),
+        1.0,
+        session_id="session-r12",
+        actual_rank=12,
+    )
+
+    assert result["metrics"]["num_samples:sum"] == 0.0
+    assert ensure_calls == [("session-r12", 12)]
+    assert save_calls == [(12, 64)]
+    assert load_calls[0] == (str(reference_dir), 16, 64)
+    assert load_calls[1][1:] == (12, 64)
+
+
 def test_issue_572_dense_load_checkpoint_pads_actual_rank_adapter(tmp_path, monkeypatch) -> None:
     from safetensors.torch import save_file
     from tinker_server.backend.verl_training import TrainingWorker
@@ -437,13 +502,16 @@ def test_issue_572_megatron_group_reinit_passes_actual_rank_to_rank_workers() ->
     ]
 
 
-def test_issue_572_megatron_peft_export_truncates_to_actual_rank(tmp_path) -> None:
+def test_issue_572_megatron_peft_export_truncates_to_actual_rank(tmp_path, monkeypatch) -> None:
     ray = pytest.importorskip("ray")
     if not hasattr(ray, "remote"):
         pytest.skip("ray runtime without actor decorators is not usable for Megatron tests")
 
     from safetensors.torch import load_file
+    from tinker_server.backend import megatron_distributed
     from tinker_server.backend.megatron_distributed import MegatronRankWorker
+
+    monkeypatch.setattr(megatron_distributed, "get_model_config", lambda _model: SimpleNamespace(is_mla=False))
 
     worker_cls = MegatronRankWorker.__ray_metadata__.modified_class
     worker = object.__new__(worker_cls)

@@ -261,7 +261,6 @@ def test_issue_572_megatron_existing_actor_rank_mismatch_recreates(monkeypatch) 
     from tinker_server.backend import resource_pool as resource_pool_mod
     from tinker_server import config as config_mod
 
-    fake_existing_actor = object()
     fake_new_actor = object()
     killed: list[dict[str, object]] = []
     created: list[dict[str, object]] = []
