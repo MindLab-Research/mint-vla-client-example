@@ -147,8 +147,8 @@ async def _fake_admission_stats(*, include_actor_rss: bool = True) -> dict:
                 "metadata": {
                     "hostname": "host-b",
                     "gpu_bindings": [
-                        {"hostname": "host-b", "node_id": "node-b", "gpu_index": 0, "rank": 0},
-                        {"hostname": "host-b", "node_id": "node-b", "gpu_index": 1, "rank": 1},
+                        {"hostname": "host-b", "node_id": "node-b", "gpu_index": 0, "gpu_uuid": "GPU-host-b-0", "rank": 0},
+                        {"hostname": "host-b", "node_id": "node-b", "gpu_index": 1, "gpu_uuid": "GPU-host-b-1", "rank": 1},
                     ],
                     "active_sessions": 1,
                     "session_unknown": 0,
@@ -514,8 +514,8 @@ def test_issue_248_internal_metrics_omits_unknown_resource_pool_rss(monkeypatch)
         'mint_megatron_gpu_memory_allocated_bytes{actor_name="megatron-1",base_model="Qwen/Qwen3-30B-A3B-Instruct-2507"} 48000000000',
         'mint_megatron_gpu_memory_reserved_bytes{actor_name="megatron-1",base_model="Qwen/Qwen3-30B-A3B-Instruct-2507"} 52000000000',
         'mint_megatron_gpu_memory_fragmentation_bytes{actor_name="megatron-1",base_model="Qwen/Qwen3-30B-A3B-Instruct-2507"} 4000000000',
-        'mint_resource_pool_actor_gpu_binding{actor_name="megatron-1",gpu_index="0",hostname="host-b",workload="train"} 1',
-        'mint_resource_pool_actor_gpu_binding{actor_name="megatron-1",gpu_index="1",hostname="host-b",workload="train"} 1',
+        'mint_resource_pool_actor_gpu_binding{actor_name="megatron-1",gpu_index="0",gpu_uuid="GPU-host-b-0",hostname="host-b",workload="train"} 1',
+        'mint_resource_pool_actor_gpu_binding{actor_name="megatron-1",gpu_index="1",gpu_uuid="GPU-host-b-1",hostname="host-b",workload="train"} 1',
         'mint_resource_pool_observability_cache_hits_total{actor_type="megatron"} 9',
         'mint_resource_pool_observability_cache_stale_total{actor_type="megatron"} 3',
         'mint_resource_pool_observability_refresh_success_total{actor_type="megatron"} 2',

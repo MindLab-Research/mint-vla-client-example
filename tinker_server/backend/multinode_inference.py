@@ -36,6 +36,7 @@ from tinker_server.ray_utils import init_ray
 from tinker_server.runtime_env import join_pythonpath, sanitize_worker_pythonpath
 
 from . import ray_kill
+from .gpu_binding_helpers import gpu_bindings_from_ray_gpu_ids
 from .multinode_resources import compute_multinode_engine_resources
 from .ray_placement_groups import PlacementGroupMismatchError, get_named_placement_group
 from .ray_keepalive import ray_get_with_resource_pool_keepalive
@@ -672,24 +673,18 @@ def _create_multinode_vllm_actor(
         async def get_observability_binding(self) -> dict[str, object]:
             import socket
 
-            gpu_indices: list[int] = []
-            try:
-                for gpu_id in ray.get_gpu_ids():
-                    if isinstance(gpu_id, (int, float)):
-                        gpu_indices.append(int(gpu_id))
-                    else:
-                        gpu_indices.append(int(float(str(gpu_id))))
-            except Exception:
-                gpu_indices = []
+            hostname = socket.gethostname()
             node_id = None
             try:
                 node_id = str(ray.get_runtime_context().get_node_id())
             except Exception:
                 node_id = None
+            gpu_bindings = gpu_bindings_from_ray_gpu_ids(hostname=hostname, node_id=node_id)
             return {
-                "hostname": socket.gethostname(),
+                "hostname": hostname,
                 "node_id": node_id,
-                "gpu_indices": gpu_indices,
+                "gpu_indices": [binding["gpu_index"] for binding in gpu_bindings if "gpu_index" in binding],
+                "gpu_bindings": gpu_bindings,
                 **self._vllm_stats_observer.snapshot(),
             }
 

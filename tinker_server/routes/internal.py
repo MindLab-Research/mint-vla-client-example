@@ -534,16 +534,19 @@ def _resource_pool_gpu_bindings(rec: dict[str, object]) -> list[dict[str, str]]:
             if not isinstance(binding, dict):
                 continue
             gpu_index = binding.get("gpu_index")
-            if gpu_index is None:
+            gpu_uuid = binding.get("gpu_uuid")
+            if gpu_index is None and not (isinstance(gpu_uuid, str) and gpu_uuid.strip()):
                 continue
-            out.append(
-                {
-                    "actor_name": actor_name,
-                    "workload": workload,
-                    "hostname": str(binding.get("hostname") or metadata.get("hostname") or "unknown"),
-                    "gpu_index": str(gpu_index),
-                }
-            )
+            labels = {
+                "actor_name": actor_name,
+                "workload": workload,
+                "hostname": str(binding.get("hostname") or metadata.get("hostname") or "unknown"),
+            }
+            if gpu_index is not None:
+                labels["gpu_index"] = str(gpu_index)
+            if isinstance(gpu_uuid, str) and gpu_uuid.strip():
+                labels["gpu_uuid"] = gpu_uuid.strip()
+            out.append(labels)
         if out:
             return out
 
