@@ -243,6 +243,7 @@ class NvmlOtelProbe:
         self._last_error = ""
         self._last_emit_ts = 0.0
         self._samples = 0
+        self._last_process_classes: dict[str, int] = {}
         self._meter, self._provider = _configure_otel()
         self._gpu_present = self._meter.create_gauge(
             "mint_nvml_gpu_present",
@@ -330,6 +331,7 @@ class NvmlOtelProbe:
             "last_error": self._last_error,
             "last_emit_ts": self._last_emit_ts,
             "samples": self._samples,
+            "last_process_classes": self._last_process_classes,
             "interval_s": self._interval_s,
         }
 
@@ -367,6 +369,9 @@ class NvmlOtelProbe:
         try:
             rows = _run_nvidia_smi()
             process_agg = _run_compute_apps()
+            process_classes: dict[str, int] = {}
+            for _, process_class in process_agg:
+                process_classes[process_class] = process_classes.get(process_class, 0) + 1
             for row in rows:
                 attrs = {
                     "hostname": row.hostname,
@@ -385,6 +390,7 @@ class NvmlOtelProbe:
                     self._process_count.set(float(rec.get("count", 0.0)), attributes=proc_attrs)
                     self._process_memory.set(float(rec.get("memory_used_bytes", 0.0)), attributes=proc_attrs)
             self._probe_up.set(1, attributes=base_attrs)
+            self._last_process_classes = process_classes
             self._last_error = ""
             self._last_emit_ts = time.time()
             self._samples += 1
