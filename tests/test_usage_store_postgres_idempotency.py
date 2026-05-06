@@ -47,6 +47,8 @@ class _FakeConn:
     async def fetch(self, sql: str, *args):
         if sql.strip().startswith("INSERT INTO"):
             self._state["insert_fetch_calls"] += 1
+            if self._state.get("fail_with_pg_detail"):
+                raise self._state["fail_with_pg_detail"]
             if self._state.get("fail_always"):
                 raise RuntimeError("simulated persistent pg error")
             if self._state["fail_once"]:
@@ -754,3 +756,38 @@ def test_postgres_usage_store_health_check_returns_false_on_schema_failure(monke
         assert state["pool"].closed is True
 
     asyncio.run(_run())
+
+
+def test_postgres_usage_store_logs_pg_constraint_detail(monkeypatch, caplog):
+    class _PgDetailError(Exception):
+        sqlstate = "23503"
+        constraint_name = "usage_event_apikey_id_fkey"
+        table_name = "usage_event"
+        schema_name = "mint_platform"
+
+    state = _state(fail_with_pg_detail=_PgDetailError("missing apikey fk"))
+    _install_fake_asyncpg(monkeypatch, state)
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+
+    store = PostgresUsageStore(dsn="postgresql://fake")
+    event = UsageEvent(
+        account_id="aaaaaaaaaaaaaaaaaaaaaaaa",
+        apikey_id="bbbbbbbbbbbbbbbbbbbbbbbb",
+        charge_item="training",
+        quantity=7,
+        request_id="req-fk-detail",
+        label="model=z,route=training.forward_backward,dimension=train",
+    )
+
+    async def _run():
+        with pytest.raises(_PgDetailError):
+            await store.write_event(event)
+        await store.close()
+
+    caplog.set_level("WARNING", logger="tinker_server.usage_store")
+    asyncio.run(_run())
+
+    assert "error_type=_PgDetailError" in caplog.text
+    assert "sqlstate=23503" in caplog.text
+    assert "constraint_name=usage_event_apikey_id_fkey" in caplog.text
+    assert "table_name=usage_event" in caplog.text

@@ -40,6 +40,7 @@ from fastapi import APIRouter, HTTPException, Request
 from ..auth_identity import can_bypass_ownership_user_data
 from ..auth_identity import can_manage_system
 from ..auth_identity import can_write
+from ..auth_identity import get_apikey_id as _request_apikey_id
 from ..auth_identity import get_user_data as _request_user_data
 from ..auth_identity import get_user_id as _request_user_id
 from ..backend.async_ray_control import async_lookup_actor_handle
@@ -192,6 +193,16 @@ def _get_user_data(request: Request) -> dict | None:
 def _get_user_id(request: Request) -> str | None:
     """Extract user_id from request state (set by auth middleware)."""
     return _request_user_id(request)
+
+
+def _get_apikey_id(
+    request: Request,
+    *,
+    gateway_auth: GatewayAuthContext | None = None,
+) -> str | None:
+    if gateway_auth is not None and gateway_auth.apikey_id:
+        return str(gateway_auth.apikey_id)
+    return _request_apikey_id(request)
 
 
 def _build_training_usage_label(*, model: str, route: str) -> str:
@@ -2476,6 +2487,7 @@ async def forward_backward(
                 op="training.forward_backward",
                 request_json=request_json,
                 user_id=user_id,
+                apikey_id=_get_apikey_id(http_request, gateway_auth=gateway_auth),
                 webhook_url=None,
                 extra=scheduler_extra,
             ),
@@ -2724,6 +2736,7 @@ async def train_step(
                 op="training.train_step",
                 request_json=request_json,
                 user_id=user_id,
+                apikey_id=_get_apikey_id(http_request, gateway_auth=gateway_auth),
                 webhook_url=None,
                 extra=scheduler_extra,
             ),
@@ -2965,6 +2978,7 @@ async def forward(
                 op="training.forward",
                 request_json=request_json,
                 user_id=user_id,
+                apikey_id=_get_apikey_id(http_request, gateway_auth=gateway_auth),
                 webhook_url=None,
                 extra=scheduler_extra,
             ),

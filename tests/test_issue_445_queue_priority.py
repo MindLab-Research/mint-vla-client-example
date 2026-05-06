@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tinker_server.models.types import ForwardBackwardInput, ForwardBackwardRequest, ModelInput, SampleRequest, SamplingParams
+from tinker_server.models.types import ComputeLogprobsRequest, ForwardBackwardInput, ForwardBackwardRequest, ModelInput, SampleRequest, SamplingParams
 from tinker_server.queue_priority import (
     effective_queue_priority,
     extract_queue_priority_from_headers,
@@ -390,3 +390,41 @@ async def test_issue_445_forward_backward_enqueues_default_priority_on_invalid_h
     assert queue.calls
     assert queue.calls[0]["extra"]["queue_priority"] == 0
     assert queue.calls[0]["extra"]["scheduler_session_key"] == "run-445"
+    assert queue.calls[0]["apikey_id"] == "bbbbbbbbbbbbbbbbbbbbbbbb"
+
+
+@pytest.mark.anyio
+async def test_issue_445_compute_logprobs_enqueues_apikey_id(monkeypatch):
+    import tinker_server.backend.api_work_queue as awq
+    import tinker_server.backend.capacity_manager as cm
+    import tinker_server.backend.result_size_estimator as rse
+
+    queue = _CaptureQueue()
+    monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
+    monkeypatch.setattr(sampling_route, "future_store", _StubFutureStore())
+    monkeypatch.setattr(sampling_route, "record_sampling_admission_metric", lambda **_kwargs: None)
+
+    async def _no_snapshot(_sid):
+        return None
+
+    monkeypatch.setattr(sampling_route, "_async_get_detached_sampling_snapshot", _no_snapshot)
+    monkeypatch.setattr(awq, "api_work_queue", queue)
+    monkeypatch.setattr(cm, "capacity_manager", _StubCapacityManager())
+    monkeypatch.setattr(rse, "estimate_compute_logprobs_result_bytes", lambda _req: 0)
+
+    req = ComputeLogprobsRequest(
+        sampling_session_id="sess",
+        seq_id=3,
+        sequence=ModelInput.from_ints([1, 2, 3]),
+    )
+    http_request = _DummyRequest(
+        user_id="aaaaaaaaaaaaaaaaaaaaaaaa",
+        apikey_id="bbbbbbbbbbbbbbbbbbbbbbbb",
+        headers={"X-MinT-Priority": "9"},
+    )
+
+    await sampling_route.compute_logprobs(req, http_request)
+
+    assert queue.calls
+    assert queue.calls[0]["op"] == "sampling.compute_logprobs"
+    assert queue.calls[0]["apikey_id"] == "bbbbbbbbbbbbbbbbbbbbbbbb"

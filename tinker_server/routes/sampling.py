@@ -2112,6 +2112,7 @@ async def compute_logprobs(
                 op="sampling.compute_logprobs",
                 request_json=request_json,
                 user_id=user_id,
+                apikey_id=_get_apikey_id(http_request, billing_auth=billing_auth),
                 webhook_url=None,
                 extra=merge_queue_priority_extra(
                     {"gateway_auth": billing_auth.__dict__} if billing_auth is not None else None,

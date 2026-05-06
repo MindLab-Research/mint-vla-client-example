@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures
 import logging
 import os
+import traceback
 import time
 import uuid
 from typing import Any
@@ -230,6 +231,8 @@ def _get_or_create_actor():
                     "last_success_at": None,
                     "last_error_at": None,
                     "last_error": None,
+                    "last_error_type": None,
+                    "last_error_traceback": None,
                     "success_count": 0,
                     "error_count": 0,
                     "last_result": None,
@@ -246,13 +249,25 @@ def _get_or_create_actor():
                 state["success_count"] = int(state["success_count"]) + 1
                 state["last_result"] = result
                 state["last_error"] = None
+                state["last_error_type"] = None
+                state["last_error_traceback"] = None
                 return result if isinstance(result, dict) else {"result": result}
             except Exception as e:
                 state["last_error_at"] = time.time()
                 state["last_error"] = f"{type(e).__name__}: {e}"
+                state["last_error_type"] = type(e).__name__
+                state["last_error_traceback"] = "".join(traceback.format_exception(type(e), e, e.__traceback__))
                 state["error_count"] = int(state["error_count"]) + 1
-                logger.exception("owner_runtime_supervisor loop failed loop=%s", loop_name)
-                return {"error": state["last_error"]}
+                logger.exception(
+                    "owner_runtime_supervisor loop failed loop=%s error_type=%s error=%s",
+                    loop_name,
+                    type(e).__name__,
+                    str(e),
+                )
+                return {
+                    "error": state["last_error"],
+                    "error_type": state["last_error_type"],
+                }
             finally:
                 state["running"] = False
 
