@@ -101,23 +101,38 @@ python_version = "3.12.13"
 site_packages_dir = "site-packages"
 source_dir = "src"
 host_venv_dir = "host-venv"
+# Curated OpenPI host runtime dependencies. OpenPI is imported from the pinned
+# source tree declared below; its upstream pyproject is not installed directly.
+# Do not add OpenPI's torch pin here. Mint owns the torch ABI split via
+# host-runtime torch CPU and image-managed CUDA torch.
 host_requirements = [
     "augmax>=0.3.4",
     "beartype==0.19.0",
+    "dm-tree>=0.1.8",
+    "equinox>=0.11.8",
     "filelock>=3.16.1",
+    "flatbuffers>=24.3.25",
     "flax==0.10.2",
     "fsspec[gcs]>=2024.6.0",
+    "gym-aloha>=0.1.1",
+    "imageio>=2.36.1",
     "jax[cuda12]==0.5.3",
     "jaxtyping==0.2.36",
     "lerobot @ git+https://github.com/huggingface/lerobot.git@0cf864870cf29f4738d3ade893e6fd13fbd7cdb5",
     "ml_collections==1.0.0",
     "numpydantic>=1.6.6",
+    "opencv-python-headless>=4.10.0.84",
     "optax==0.2.4",
     "orbax-checkpoint==0.11.13",
+    "polars>=1.30.0",
     "pytest>=7.0.0",
+    "rich>=14.0.0",
     "torchvision==0.24.1+cpu",
     "tqdm-loggable>=0.2",
+    "treescope>=0.1.7",
+    "typing-extensions>=4.12.2",
     "tyro>=0.9.5",
+    "wandb>=0.19.1",
 ]
 
 [[tool.tinker.runtime_env.sources]]
