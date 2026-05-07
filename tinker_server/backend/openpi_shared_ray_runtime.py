@@ -182,7 +182,7 @@ async def _cleanup_failed_shared_actor_start(*, actor_name: str, actor: Any) -> 
         return errors
 
     try:
-        await asyncio.to_thread(ray.get, actor.shutdown.remote(), timeout=5.0)
+        await async_get_ray_ref(actor.shutdown.remote(), timeout_s=5.0)
     except Exception as exc:
         errors.append(
             f"OpenPI shared actor shutdown failed for {actor_name}: {type(exc).__name__}: {exc}"

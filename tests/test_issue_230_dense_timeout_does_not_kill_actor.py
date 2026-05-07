@@ -5,8 +5,6 @@ import pytest
 
 pytest.importorskip("ray")
 
-import ray
-
 from tinker_server.backend import resource_pool as resource_pool_module
 from tinker_server.backend.resource_pool import ActorType, get_resource_pool
 from tinker_server.backend.training_session_manager import TrainingSession
@@ -55,14 +53,10 @@ def test_issue_230_timeout_does_not_kill_actor(monkeypatch: pytest.MonkeyPatch) 
 
     monkeypatch.setattr(verl_training.ray_kill, "kill", _fake_kill)
 
-    def _always_timeout(*args, **kwargs):
-        raise ray.exceptions.GetTimeoutError("timeout")
-
-    monkeypatch.setattr(ray, "get", _always_timeout)
-
     async def _run() -> None:
+        fut = asyncio.get_running_loop().create_future()
         await engine._await_with_keepalive(
-            awaitable=object(),
+            awaitable=fut,
             session=session,
             interval_s=0.01,
             timeout_s=0.05,
@@ -105,17 +99,19 @@ def test_issue_230_keepalive_touches_dense_actor_without_inflight_mark(monkeypat
     observed_inflight: list[int] = []
     before_last_accessed = pool.get(actor_name).last_accessed
 
-    def _timeout_once_then_return(*args, **kwargs):
-        observed_inflight.append(pool.get(actor_name).inflight_count)
-        if len(observed_inflight) == 1:
-            raise ray.exceptions.GetTimeoutError("timeout")
-        return {"ok": True}
+    original_touch_actor = engine._touch_actor
 
-    monkeypatch.setattr(ray, "get", _timeout_once_then_return)
+    def _touch_actor(target_session):
+        observed_inflight.append(pool.get(actor_name).inflight_count)
+        return original_touch_actor(target_session)
+
+    monkeypatch.setattr(engine, "_touch_actor", _touch_actor)
 
     async def _run() -> None:
+        fut = asyncio.get_running_loop().create_future()
+        asyncio.get_running_loop().call_later(0.025, fut.set_result, {"ok": True})
         result = await engine._await_with_keepalive(
-            awaitable=object(),
+            awaitable=fut,
             session=session,
             interval_s=0.01,
             timeout_s=0.05,
@@ -172,7 +168,7 @@ def test_issue_230_unbind_session_keeps_shared_dense_actor_pinned(monkeypatch: p
 
     monkeypatch.setattr(verl_training.ray_kill, "kill", _fake_kill)
 
-    asyncio.run(engine.unbind_session(session))
+    asyncio.run(engine.shutdown_session(session))
 
     assert killed == []
     assert model_id not in engine._resource_pool_actor_names

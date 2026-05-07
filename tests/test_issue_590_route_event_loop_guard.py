@@ -32,12 +32,6 @@ EXISTING_ROUTE_BLOCKING_DEBT = Counter(
             "asyncio.to_thread",
             "worker = await asyncio.to_thread(ray.get_actor, actor_name, namespace=namespace)",
         ): 1,
-        (
-            "tinker_server/routes/training.py",
-            "asyncio.to_thread",
-            "await asyncio.to_thread(ray.get, delete_session.remote(model_id), timeout=30)",
-        ): 1,
-        ("tinker_server/routes/training.py", "asyncio.to_thread", "infos = await asyncio.to_thread(list_training_sessions)"): 1,
         ("tinker_server/routes/training.py", "asyncio.to_thread", "local_metadata = await asyncio.to_thread("): 1,
         ("tinker_server/routes/training.py", "asyncio.to_thread", "return await asyncio.to_thread("): 1,
         ("tinker_server/routes/training.py", "asyncio.to_thread", "tokenizer_metadata = await asyncio.to_thread("): 1,

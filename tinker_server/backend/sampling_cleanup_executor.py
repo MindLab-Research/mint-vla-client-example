@@ -9,6 +9,8 @@ import time
 from typing import Any
 
 from ..config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources, otel_env_vars
+from ..ray_utils import register_ray_reconnect_invalidator as _register_ray_reconnect_invalidator
+from .async_ray_control import async_get_ray_ref
 
 logger = logging.getLogger(__name__)
 _ACTOR_HANDLE = None
@@ -17,7 +19,7 @@ def _reset_cached_actor_handle() -> None:
     global _ACTOR_HANDLE
     _ACTOR_HANDLE = None
 
-from ..ray_utils import register_ray_reconnect_invalidator as _register_ray_reconnect_invalidator
+
 _register_ray_reconnect_invalidator(_reset_cached_actor_handle)
 
 
@@ -94,7 +96,7 @@ async def _remove_loaded_lora_if_last_reference(*, base_model: str, lora_int_id:
         actor = await asyncio.to_thread(ray.get_actor, actor_name, namespace=PERSISTENT_NAMESPACE)
     except Exception:
         return
-    await asyncio.to_thread(ray.get, actor.remove_lora.remote(int(lora_int_id)), timeout=30)
+    await async_get_ray_ref(actor.remove_lora.remote(int(lora_int_id)), timeout_s=30)
 
 
 async def cleanup_stale_sampling_sessions_once_impl(*, stale_after_s: float | None = None) -> list[str]:

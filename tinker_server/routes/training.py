@@ -43,7 +43,7 @@ from ..auth_identity import can_write
 from ..auth_identity import get_apikey_id as _request_apikey_id
 from ..auth_identity import get_user_data as _request_user_data
 from ..auth_identity import get_user_id as _request_user_id
-from ..backend.async_ray_control import async_lookup_actor_handle
+from ..backend.async_ray_control import async_get_ray_ref, async_lookup_actor_handle
 from ..gateway_auth import GatewayAuthContext, build_billing_auth_context
 from ..logging_context import (
     classify_failure_reason,
@@ -729,7 +729,7 @@ async def _best_effort_delete_training_session(
                 try:
                     import ray
 
-                    await asyncio.to_thread(ray.get, delete_session.remote(model_id), timeout=30)
+                    await async_get_ray_ref(delete_session.remote(model_id), timeout_s=30)
                     delete_ok = True
                 except Exception as e:
                     logger.warning(
@@ -793,11 +793,9 @@ async def cleanup_stale_training_sessions_once(*, stale_after_s: float | None = 
     from ..backend.session_heartbeat_store import session_heartbeat_store
 
     try:
-        from ..backend.training_session_store import list_training_sessions
+        from ..backend.training_session_store import async_list_training_sessions
 
-        # Detached store listing uses ray.get(). Keep that blocking call off the
-        # main event loop so stale-session cleanup cannot freeze the API server.
-        infos = await asyncio.to_thread(list_training_sessions)
+        infos = await async_list_training_sessions()
     except Exception as e:
         logger.warning(
             "stale training cleanup skipped: failed to list detached training sessions: %s: %s",

@@ -317,7 +317,10 @@ def _install_lifespan_stubs(
     monkeypatch.setattr(session_index_store_module, "ensure_ready", lambda: None)
     monkeypatch.setattr(training_session_manager_module, "TrainingSessionManager", _StubTrainingManager)
     monkeypatch.setattr(training_session_store_module, "ensure_ready", lambda: None)
-    monkeypatch.setattr(training_session_store_module, "list_training_sessions", lambda: [])
+    async def _async_list_training_sessions():
+        return []
+
+    monkeypatch.setattr(training_session_store_module, "async_list_training_sessions", _async_list_training_sessions)
     monkeypatch.setattr(future_replay_module, "ensure_future_replay_sweeper", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         dense_session_state_module,
@@ -1097,12 +1100,12 @@ async def test_get_engine_skips_capacity_check_when_named_actor_exists(monkeypat
 
     monkeypatch.setattr(mle.ray, "is_initialized", lambda: True, raising=False)
     monkeypatch.setattr(mle.ray, "get_actor", lambda *args, **kwargs: actor_handle, raising=False)
-    monkeypatch.setattr(
-        mle.ray,
-        "get",
-        lambda ref, *args, **kwargs: True if ref == "engine-ready-ref" else None,
-        raising=False,
-    )
+
+    async def _async_get_ray_ref(ref, *, timeout_s=None):
+        _ = timeout_s
+        return True if ref == "engine-ready-ref" else None
+
+    monkeypatch.setattr(mle, "async_get_ray_ref", _async_get_ray_ref, raising=False)
     monkeypatch.setattr(mle, "parse_model_single_node_ip", lambda **_kwargs: "192.168.38.4", raising=False)
     monkeypatch.setattr(mle, "parse_model_node_ip_list", lambda **_kwargs: ["192.168.38.4"], raising=False)
 
@@ -1139,10 +1142,11 @@ async def test_get_engine_checks_capacity_when_named_actor_probe_fails(monkeypat
     monkeypatch.setattr(mle.ray, "is_initialized", lambda: True, raising=False)
     monkeypatch.setattr(mle.ray, "get_actor", lambda *args, **kwargs: actor_handle, raising=False)
 
-    def _stale_actor_get(ref, *args, **kwargs):
+    async def _stale_async_get_ray_ref(ref, *, timeout_s=None):
+        _ = timeout_s
         raise mle.ray.exceptions.RayActorError(f"stale actor during probe: {ref}")
 
-    monkeypatch.setattr(mle.ray, "get", _stale_actor_get, raising=False)
+    monkeypatch.setattr(mle, "async_get_ray_ref", _stale_async_get_ray_ref, raising=False)
     monkeypatch.setattr(mle, "parse_model_single_node_ip", lambda **_kwargs: "192.168.38.4", raising=False)
     monkeypatch.setattr(mle, "parse_model_node_ip_list", lambda **_kwargs: ["192.168.38.4"], raising=False)
 

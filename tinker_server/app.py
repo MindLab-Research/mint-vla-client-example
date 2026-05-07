@@ -304,11 +304,11 @@ async def lifespan(app: FastAPI):
         mint.action_session_manager = action_manager
     try:
         from .backend.dense_session_state import cleanup_legacy_dense_session_state_once
-        from .backend.training_session_store import list_training_sessions
+        from .backend.training_session_store import async_list_training_sessions
 
         active_model_ids = {
             str(info.get("model_id"))
-            for info in await asyncio.to_thread(list_training_sessions)
+            for info in await async_list_training_sessions()
             if isinstance(info, dict) and str(info.get("model_id") or "").strip()
         }
         dense_cleanup = await asyncio.to_thread(

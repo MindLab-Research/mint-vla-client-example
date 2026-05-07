@@ -18,8 +18,9 @@ from typing import TYPE_CHECKING
 import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
+from tinker_server.backend.async_ray_control import async_get_ray_ref
 from tinker_server.backend.model_registry import get_model_config
-from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, otel_env_vars
+from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
 from tinker_server.config import config as server_config
 from tinker_server.logging_context import get_current_traceparent, run_async_with_otel_span
 from tinker_server.ray_utils import init_ray
@@ -225,10 +226,10 @@ class MultiLoRAInferenceEngine:
                 # This will raise RayActorError if actor is dead
                 try:
                     try:
-                        await asyncio.to_thread(ray.get, self.server.__ray_ready__.remote(), timeout=5)
+                        await async_get_ray_ref(self.server.__ray_ready__.remote(), timeout_s=5)
                         # Check if engine is actually initialized (not just actor alive)
                         # A broken actor can be "alive" but have failed engine init
-                        engine_ready = await asyncio.to_thread(ray.get, self.server.is_engine_ready.remote(), timeout=10)
+                        engine_ready = await async_get_ray_ref(self.server.is_engine_ready.remote(), timeout_s=10)
                     except SystemExit as e:
                         if getattr(e, "code", None) == 15:
                             raise
@@ -541,14 +542,12 @@ class MultiLoRAInferenceEngine:
                 **actor_options,
             ).remote(**remote_kwargs)
 
-            # Run blocking ray.get() in thread executor to avoid blocking the event loop.
-            # This allows the server to remain responsive during vLLM initialization.
+            # Await Ray's ObjectRef future bridge so the API event loop remains
+            # responsive during vLLM initialization.
             # Timeout scales with model size:
             # - Small models (1-2 GPUs): 300s (5 min)
             # - Medium models (4 GPUs): 600s (10 min)
             # - Large models (8+ GPUs, e.g., K2): 1800s (30 min)
-            loop = asyncio.get_event_loop()
-
             # Compute timeout based on model size (proxy: number of GPUs)
             if total_gpus >= 8:
                 init_timeout = 1800  # 30 min for K2 and similar large models
@@ -559,10 +558,7 @@ class MultiLoRAInferenceEngine:
 
             logger.info(f"Launching vLLM server (timeout={init_timeout}s for {total_gpus} GPUs)...")
             try:
-                await loop.run_in_executor(
-                    None,  # Use default thread pool
-                    lambda: ray.get(self.server.launch_server.remote(), timeout=init_timeout)
-                )
+                await async_get_ray_ref(self.server.launch_server.remote(), timeout_s=init_timeout)
             except SystemExit as e:
                 if getattr(e, "code", None) == 15:
                     raise
@@ -1461,7 +1457,7 @@ class MultiModelInferenceManager:
             return False
 
         try:
-            await asyncio.to_thread(ray.get, actor.__ray_ready__.remote(), timeout=5)
+            await async_get_ray_ref(actor.__ray_ready__.remote(), timeout_s=5)
             ready_method_name = None
             ready_probe = None
             for method_name in ("is_engine_ready", "is_ready"):
@@ -1477,7 +1473,7 @@ class MultiModelInferenceManager:
                     actor_name,
                 )
                 return True
-            engine_ready = await asyncio.to_thread(ray.get, ready_probe.remote(), timeout=10)
+            engine_ready = await async_get_ray_ref(ready_probe.remote(), timeout_s=10)
             logger.debug(
                 "named actor probe readiness actor=%s method=%s ready=%s",
                 actor_name,
@@ -1562,9 +1558,9 @@ class MultiModelInferenceManager:
                             return engine
                     try:
                         if hasattr(engine, 'server'):
-                            await asyncio.to_thread(ray.get, actor_handle.__ray_ready__.remote(), timeout=5)
+                            await async_get_ray_ref(actor_handle.__ray_ready__.remote(), timeout_s=5)
                         else:
-                            await asyncio.to_thread(ray.get, actor_handle.is_ready.remote(), timeout=5)
+                            await async_get_ray_ref(actor_handle.is_ready.remote(), timeout_s=5)
                         # Actor alive, return cached engine
                         logger.info("get_engine model=%s stage=return_cached_engine", model_name)
                         return engine

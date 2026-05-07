@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, cast
 import ray
 
 from . import ray_kill
+from .async_ray_control import _await_ray_ref, async_get_ray_ref
 from ..logging_context import (
     classify_failure_reason,
     get_current_traceparent,
@@ -3155,7 +3156,7 @@ class VerlTrainingEngine:
 
         # Dense trainer can be evicted by ResourcePool between RL stages.
         try:
-            await asyncio.to_thread(ray.get, worker.heartbeat.remote(), timeout=5)
+            await async_get_ray_ref(worker.heartbeat.remote(), timeout_s=5)
             return worker
         except ray.exceptions.GetTimeoutError:
             # Busy actor is still healthy; proceed with original handle.
@@ -3406,26 +3407,30 @@ class VerlTrainingEngine:
     ):
         """Await a Ray call while periodically touching ResourcePool.
 
-        Uses a poll loop with `ray.get(..., timeout=...)` executed in a thread to
-        avoid blocking the asyncio event loop. This ensures `timeout_s` can fire
-        during long Ray calls.
+        Uses one Ray ObjectRef await task so polling-slice timeouts do not
+        cancel or restart the underlying Ray wait.
         """
         start = time.time()
-        while True:
-            self._touch_actor(session)
+        ref_task = asyncio.create_task(_await_ray_ref(awaitable))
+        try:
+            while True:
+                self._touch_actor(session)
 
-            wait_s = interval_s
-            if timeout_s is not None and timeout_s > 0:
-                remaining = timeout_s - (time.time() - start)
-                if remaining <= 0:
-                    logger.warning(f"[{session.model_id}] Ray call timed out after {timeout_s}s")
-                    raise asyncio.TimeoutError(f"Ray call timed out after {timeout_s}s")
-                wait_s = min(wait_s, remaining)
+                wait_s = interval_s
+                if timeout_s is not None and timeout_s > 0:
+                    remaining = timeout_s - (time.time() - start)
+                    if remaining <= 0:
+                        logger.warning(f"[{session.model_id}] Ray call timed out after {timeout_s}s")
+                        raise asyncio.TimeoutError(f"Ray call timed out after {timeout_s}s")
+                    wait_s = min(wait_s, remaining)
 
-            try:
-                return await asyncio.to_thread(ray.get, awaitable, timeout=wait_s)
-            except ray.exceptions.GetTimeoutError:
-                continue
+                try:
+                    return await asyncio.wait_for(asyncio.shield(ref_task), timeout=wait_s)
+                except asyncio.TimeoutError:
+                    continue
+        finally:
+            if not ref_task.done():
+                ref_task.cancel()
 
     def _resolve_hf_model_path(self, hf_model_id: str) -> str | None:
         """Resolve HuggingFace model ID to local cache path.
@@ -4376,9 +4381,6 @@ class VerlTrainingEngine:
         Returns:
             dict with modules_reset count.
         """
-        import asyncio
-        import ray
-
         model_id = session.model_id
         try:
             worker = await self._get_live_worker(session, op="reset_expert_bias")
@@ -4396,11 +4398,10 @@ class VerlTrainingEngine:
 
         logger.info(f"[{model_id}] reset_expert_bias: calling worker...")
 
-        loop = asyncio.get_running_loop()
         try:
             traceparent = get_current_traceparent()
             result_ref = worker.reset_expert_bias.remote(traceparent=traceparent)
-            result = await loop.run_in_executor(None, ray.get, result_ref)
+            result = await async_get_ray_ref(result_ref)
             # MegatronWorkerGroup returns 'reset_count', normalize to 'modules_reset'
             modules_reset = result.get("reset_count", result.get("modules_reset", 0))
             logger.info(f"[{model_id}] reset_expert_bias: reset {modules_reset} modules")
@@ -4857,13 +4858,12 @@ class VerlTrainingEngine:
             delete_session = getattr(worker, "delete_session", None)
             if delete_session is not None:
                 try:
-                    await asyncio.to_thread(
-                        ray.get,
+                    await async_get_ray_ref(
                         delete_session.remote(model_id, traceparent=traceparent),
-                        timeout=30,
+                        timeout_s=30,
                     )
                 except TypeError:
-                    await asyncio.to_thread(ray.get, delete_session.remote(model_id), timeout=30)
+                    await async_get_ray_ref(delete_session.remote(model_id), timeout_s=30)
                 except Exception:
                     logger.warning(
                         "[%s] delete_session remote cleanup failed",
