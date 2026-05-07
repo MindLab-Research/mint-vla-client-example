@@ -596,7 +596,7 @@ def _create_multinode_vllm_actor(
             self._initialized = False
             self._rw_lock = _AsyncRWLock()
             self._lock_mode = os.environ.get("MINT_VLLM_ENGINE_LOCK_MODE", "rw").strip().lower()
-            self._timing = _env_flag("MINT_VLLM_REQUEST_TIMING", default=False)
+            self._timing = _env_flag("MINT_VLLM_REQUEST_TIMING", default=True)
             self._serialize_prompt_logprobs = _env_flag("MINT_VLLM_PROMPT_LOGPROBS_SERIALIZE", default=False)
             self._prompt_logprobs_lock = asyncio.Lock() if self._serialize_prompt_logprobs else None
             # vLLM supports concurrent requests for continuous batching, but some engine calls
@@ -637,10 +637,10 @@ def _create_multinode_vllm_actor(
             self._generate_timeout_s = float(os.environ.get("MINT_VLLM_GENERATE_TIMEOUT_S", "0"))
             self._post_generate_delay_s = float(os.environ.get("MINT_VLLM_POST_GENERATE_DELAY_S", "0"))
             self._gate_lock = asyncio.Lock()
-            # Default behavior preserves the current drain-until-idle gate.
-            # issue529 experiments can disable it for new-id add via env.
+            # Default to allowing add_lora to run without draining active generation first.
+            # Set MINT_VLLM_SERIALIZE_ADD_LORA_UNTIL_IDLE=1 to restore the conservative gate.
             self._serialize_add_lora_until_idle = _env_flag(
-                "MINT_VLLM_SERIALIZE_ADD_LORA_UNTIL_IDLE", default=True
+                "MINT_VLLM_SERIALIZE_ADD_LORA_UNTIL_IDLE", default=False
             )
             self._vllm_stats_observer = VllmStatsObserver()
             self._active_generates = 0

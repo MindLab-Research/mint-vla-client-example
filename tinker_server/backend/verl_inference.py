@@ -719,7 +719,7 @@ def _create_extended_server_class(
             # Track local paths for multi-LoRA (needed for GPU/CPU swap)
             self._lora_paths: dict[int, str] = {}
             self._owned_lora_paths: set[int] = set()
-            self._timing = os.environ.get("MINT_VLLM_REQUEST_TIMING", "").strip().lower() in (
+            self._timing = os.environ.get("MINT_VLLM_REQUEST_TIMING", "1").strip().lower() in (
                 "1",
                 "true",
                 "yes",
