@@ -10,7 +10,7 @@ import uuid
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
 from .config import config
 
@@ -58,6 +58,28 @@ def _import_asyncpg():
 
 def _usage_pg_dsn() -> str:
     return str(config.usage_pg_dsn or "").strip()
+
+
+def _exception_detail(exc: BaseException) -> dict[str, Any]:
+    diag = getattr(exc, "diag", None)
+    return {
+        "error_type": type(exc).__name__,
+        "sqlstate": getattr(exc, "sqlstate", None) or getattr(exc, "pgcode", None),
+        "constraint_name": getattr(exc, "constraint_name", None) or getattr(diag, "constraint_name", None),
+        "table_name": getattr(exc, "table_name", None) or getattr(diag, "table_name", None),
+        "schema_name": getattr(exc, "schema_name", None) or getattr(diag, "schema_name", None),
+    }
+
+
+def _event_detail(events: list["UsageEvent"]) -> dict[str, Any]:
+    return {
+        "event_count": len(events),
+        "event_ids": [event.event_id for event in events],
+        "request_ids": [event.request_id for event in events],
+        "charge_items": sorted({str(event.charge_item) for event in events}),
+        "account_ids": sorted({str(event.account_id) for event in events}),
+        "apikey_ids": sorted({str(event.apikey_id) for event in events}),
+    }
 
 
 @dataclass(frozen=True)
@@ -440,10 +462,18 @@ class PostgresUsageStore:
                 last_error = e
                 if attempt < 2:
                     backoff_s = float(2**attempt)
+                    event_detail = _event_detail(events)
+                    error_detail = _exception_detail(e)
                     logger.warning(
-                        "usage_event pg write failed, retrying: attempt=%s request_ids=%s err=%s",
+                        "usage_event pg write failed, retrying: attempt=%s event_ids=%s request_ids=%s charge_items=%s error_type=%s sqlstate=%s constraint_name=%s table_name=%s err=%s",
                         attempt + 1,
-                        [event.request_id for event in events],
+                        event_detail["event_ids"],
+                        event_detail["request_ids"],
+                        event_detail["charge_items"],
+                        error_detail["error_type"],
+                        error_detail["sqlstate"],
+                        error_detail["constraint_name"],
+                        error_detail["table_name"],
                         e,
                     )
                     await asyncio.sleep(backoff_s)
@@ -451,6 +481,20 @@ class PostgresUsageStore:
                 break
 
         if last_error is not None:
+            event_detail = _event_detail(events)
+            error_detail = _exception_detail(last_error)
+            logger.error(
+                "usage_event pg write exhausted: event_ids=%s request_ids=%s charge_items=%s event_count=%s error_type=%s sqlstate=%s constraint_name=%s table_name=%s err=%s",
+                event_detail["event_ids"],
+                event_detail["request_ids"],
+                event_detail["charge_items"],
+                event_detail["event_count"],
+                error_detail["error_type"],
+                error_detail["sqlstate"],
+                error_detail["constraint_name"],
+                error_detail["table_name"],
+                last_error,
+            )
             raise last_error
         raise RuntimeError("usage_event write failed with unknown error")
 
@@ -602,10 +646,19 @@ async def _write_usage_events_safely(events: list[UsageEvent]) -> None:
         await usage_store.write_events(events)
     except asyncio.CancelledError:
         raise
-    except Exception:
+    except Exception as e:
+        event_detail = _event_detail(events)
+        error_detail = _exception_detail(e)
         logger.exception(
-            "usage_event async persistence failed after user result completed: request_ids=%s",
-            [event.request_id for event in events],
+            "usage_event async persistence failed after user result completed: event_ids=%s request_ids=%s charge_items=%s event_count=%s error_type=%s sqlstate=%s constraint_name=%s table_name=%s",
+            event_detail["event_ids"],
+            event_detail["request_ids"],
+            event_detail["charge_items"],
+            event_detail["event_count"],
+            error_detail["error_type"],
+            error_detail["sqlstate"],
+            error_detail["constraint_name"],
+            error_detail["table_name"],
         )
 
 

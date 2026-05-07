@@ -17,9 +17,6 @@ def test_issue_364_future_reaper_once_releases_capacity(monkeypatch) -> None:
         async def async_ensure_started(self) -> dict:
             return {"ok": True}
 
-        async def async_ensure_started(self) -> dict:
-            return {"ok": True}
-
         async def async_reap(self) -> dict:
             return {"expired": ["req-expired"], "timed_out": ["req-timeout"]}
 
@@ -104,12 +101,27 @@ def test_issue_364_runtime_degraded_healthz() -> None:
     from tinker_server.health_state import clear_runtime_degraded_state, set_runtime_degraded_state
 
     clear_runtime_degraded_state()
-    set_runtime_degraded_state(reason="owner_runtime_supervisor_unavailable", error="boom", details={"x": 1})
+    set_runtime_degraded_state(
+        reason="owner_runtime_supervisor_unavailable",
+        error="boom",
+        details={
+            "x": 1,
+            "snapshot": {
+                "loops": {
+                    "checkpoint_reaper": {
+                        "last_error_traceback": "Traceback secret/path.py checkpoint boom",
+                    },
+                },
+            },
+        },
+    )
     try:
         out = public_healthz_response()
         assert isinstance(out, JSONResponse)
         assert out.status_code == 503
         assert b'owner_runtime_supervisor_unavailable' in out.body
+        assert b"last_error_traceback" not in out.body
+        assert b"Traceback secret/path.py" not in out.body
     finally:
         clear_runtime_degraded_state()
 
@@ -134,3 +146,51 @@ async def test_issue_364_internal_owner_runtime_supervisor_health(monkeypatch) -
     assert out["epoch_id"] == "epoch-1"
     assert out["timeout_s"] == 10.0
 
+
+
+def test_issue_364_owner_runtime_loop_snapshot_includes_error_details(monkeypatch):
+    from tinker_server.backend import owner_runtime_supervisor as ors
+
+    actor_cls_box = {}
+
+    class _FakeRemoteActorClass:
+        def __init__(self, cls):
+            actor_cls_box["cls"] = cls
+
+        def options(self, **_kwargs):
+            return self
+
+        def remote(self):
+            raise AssertionError("actor creation is not needed for this test")
+
+    class _FakeRay:
+        @staticmethod
+        def remote(**_kwargs):
+            def _wrap(cls):
+                return _FakeRemoteActorClass(cls)
+            return _wrap
+
+        @staticmethod
+        def get_actor(*_args, **_kwargs):
+            raise ValueError("missing")
+
+    monkeypatch.setitem(__import__("sys").modules, "ray", _FakeRay)
+    monkeypatch.setattr(ors, "run_checkpoint_reaper_once", lambda: (_ for _ in ()).throw(RuntimeError("checkpoint boom")))
+    monkeypatch.setattr(ors, "apply_detached_actor_resources", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ors, "otel_env_vars", lambda: {})
+    monkeypatch.setattr(ors, "actor_runtime_env", lambda **_kwargs: {})
+
+    try:
+        ors._get_or_create_actor()
+    except (AssertionError, ValueError):
+        pass
+
+    actor = actor_cls_box["cls"]()
+    out = __import__("asyncio").run(actor._run_loop_once("checkpoint_reaper"))
+    snapshot = actor.health_snapshot()
+    loop = snapshot["loops"]["checkpoint_reaper"]
+
+    assert out["error_type"] == "RuntimeError"
+    assert loop["last_error"] == "RuntimeError: checkpoint boom"
+    assert loop["last_error_type"] == "RuntimeError"
+    assert "last_error_traceback" not in loop

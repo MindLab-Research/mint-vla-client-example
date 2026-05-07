@@ -6,6 +6,31 @@ import os
 from fastapi.responses import JSONResponse
 
 
+_REDACTED_DETAIL_KEYS = {
+    "last_error_traceback",
+    "traceback",
+    "stack",
+    "stacktrace",
+    "exc_info",
+}
+
+
+def _public_details(value):
+    if isinstance(value, dict):
+        out = {}
+        for key, nested in value.items():
+            key_text = str(key)
+            if key_text.lower() in _REDACTED_DETAIL_KEYS:
+                continue
+            out[key_text] = _public_details(nested)
+        return out
+    if isinstance(value, list):
+        return [_public_details(item) for item in value]
+    if isinstance(value, tuple):
+        return [_public_details(item) for item in value]
+    return value
+
+
 def _degraded_response() -> JSONResponse | None:
     from .health_state import get_runtime_degraded_state, get_startup_degraded_state
 
@@ -18,7 +43,7 @@ def _degraded_response() -> JSONResponse | None:
             "status": "degraded",
             "reason": degraded.get("reason", "startup_degraded"),
             "error": degraded.get("error", ""),
-            "details": degraded.get("details", {}),
+            "details": _public_details(degraded.get("details", {})),
         },
     )
 

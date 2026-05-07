@@ -15,6 +15,7 @@ from ..checkpoints import (
     process_pending_checkpoint_mirrors,
     reap_runtime_checkpoints,
 )
+from ..ray_utils import register_ray_reconnect_invalidator as _register_ray_reconnect_invalidator
 from ..server_info import _git_sha
 
 CURRENT_CODE_IDENTITY = os.environ.get("MINT_GIT_SHA") or _git_sha()
@@ -26,7 +27,7 @@ def _reset_cached_actor_handle() -> None:
     global _ACTOR_HANDLE
     _ACTOR_HANDLE = None
 
-from ..ray_utils import register_ray_reconnect_invalidator as _register_ray_reconnect_invalidator
+
 _register_ray_reconnect_invalidator(_reset_cached_actor_handle)
 
 _LOOP_FUTURE_REAPER = "future_reaper"
@@ -230,6 +231,7 @@ def _get_or_create_actor():
                     "last_success_at": None,
                     "last_error_at": None,
                     "last_error": None,
+                    "last_error_type": None,
                     "success_count": 0,
                     "error_count": 0,
                     "last_result": None,
@@ -246,13 +248,23 @@ def _get_or_create_actor():
                 state["success_count"] = int(state["success_count"]) + 1
                 state["last_result"] = result
                 state["last_error"] = None
+                state["last_error_type"] = None
                 return result if isinstance(result, dict) else {"result": result}
             except Exception as e:
                 state["last_error_at"] = time.time()
                 state["last_error"] = f"{type(e).__name__}: {e}"
+                state["last_error_type"] = type(e).__name__
                 state["error_count"] = int(state["error_count"]) + 1
-                logger.exception("owner_runtime_supervisor loop failed loop=%s", loop_name)
-                return {"error": state["last_error"]}
+                logger.exception(
+                    "owner_runtime_supervisor loop failed loop=%s error_type=%s error=%s",
+                    loop_name,
+                    type(e).__name__,
+                    str(e),
+                )
+                return {
+                    "error": state["last_error"],
+                    "error_type": state["last_error_type"],
+                }
             finally:
                 state["running"] = False
 
