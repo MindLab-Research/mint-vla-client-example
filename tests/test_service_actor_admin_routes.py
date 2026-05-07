@@ -28,13 +28,27 @@ class _FakePool:
         self.unregister_calls: list[str] = []
         self.list_actor_refresh_metadata_calls: list[bool] = []
         self.list_actor_filter_calls: list[dict[str, object]] = []
+        self.total_gpus_used_calls = 0
 
     def list_actors(self, *, refresh_metadata: bool = False, actor_type=None, model_name: str | None = None) -> list[dict]:
+        raise AssertionError("/actors route must use ResourcePool.async_list_actors")
+
+    async def async_list_actors(
+        self,
+        *,
+        refresh_metadata: bool = False,
+        actor_type=None,
+        model_name: str | None = None,
+    ) -> list[dict]:
         self.list_actor_refresh_metadata_calls.append(bool(refresh_metadata))
         self.list_actor_filter_calls.append({"actor_type": actor_type, "model_name": model_name})
         return list(self._actors)
 
     def total_gpus_used(self) -> int:
+        raise AssertionError("/actors route must use ResourcePool.async_total_gpus_used")
+
+    async def async_total_gpus_used(self) -> int:
+        self.total_gpus_used_calls += 1
         return 0
 
     def iter_entries(self) -> list[object]:
@@ -146,8 +160,7 @@ def test_list_actors_passes_filters_to_resource_pool_before_refresh(monkeypatch)
     ]
 
 
-def test_list_actors_runs_resource_pool_inventory_in_threadpool(monkeypatch) -> None:
-    from tinker_server.routes import service as service_routes
+def test_list_actors_uses_async_resource_pool_inventory(monkeypatch) -> None:
     import tinker_server.ray_utils as ray_utils
 
     _install_ray_stub(monkeypatch)
@@ -156,20 +169,13 @@ def test_list_actors_runs_resource_pool_inventory_in_threadpool(monkeypatch) -> 
         actors=[{"actor_name": "vllm-a", "actor_type": "vllm", "base_model": "Qwen/Qwen3-4B-Instruct-2507"}],
         entries=[],
     )
-    threadpool_calls = []
-
-    async def _run_in_threadpool(fn, *args, **kwargs):
-        threadpool_calls.append((fn, args, kwargs))
-        return fn(*args, **kwargs)
-
-    monkeypatch.setattr(service_routes, "run_in_threadpool", _run_in_threadpool)
     client = _build_client(monkeypatch, pool)
 
     resp = client.get("/api/v1/actors")
 
     assert resp.status_code == 200, resp.text
-    assert len(threadpool_calls) == 1
     assert pool.list_actor_refresh_metadata_calls == [True]
+    assert pool.total_gpus_used_calls == 1
 
 
 def test_kill_dense_actors_returns_503_without_unregistering_when_ray_init_fails(monkeypatch) -> None:

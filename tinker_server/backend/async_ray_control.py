@@ -46,6 +46,29 @@ def _ensure_ray_initialized() -> None:
     raise RuntimeError("Ray is not initialized")
 
 
+async def async_ensure_ray_initialized(
+    *,
+    namespace: str,
+    timeout_s: float = 15.0,
+    ignore_reinit_error: bool = True,
+) -> None:
+    import ray
+
+    if ray.is_initialized():
+        return
+
+    from ..ray_utils import init_ray
+
+    await asyncio.wait_for(
+        asyncio.to_thread(
+            init_ray,
+            namespace=namespace,
+            ignore_reinit_error=ignore_reinit_error,
+        ),
+        timeout=float(timeout_s),
+    )
+
+
 @lru_cache(maxsize=1)
 def _pending_gpu_pg_observation_remote():
     import ray

@@ -755,17 +755,7 @@ async def _call_actor_async(method_name: str, *args, retry_on_actor_restart: boo
         return await _await_ray_ref(remote_method.remote(*args, **kwargs))
 
 
-def actor_observability_metadata(actor_handle: ActorHandle | None, *, timeout_s: float = 5.0) -> dict[str, Any] | None:
-    if actor_handle is None:
-        return None
-    getter = getattr(actor_handle, "get_observability_binding", None)
-    if not callable(getter):
-        return None
-    try:
-        payload = ray.get(getter.remote(), timeout=float(timeout_s))
-    except Exception as e:
-        logger.debug("[ResourcePool] get_observability_binding failed: %s", e)
-        return None
+def _normalize_actor_observability_payload(payload: Any) -> dict[str, Any] | None:
     if not isinstance(payload, dict):
         return None
     out: dict[str, Any] = {}
@@ -839,6 +829,38 @@ def actor_observability_metadata(actor_handle: ActorHandle | None, *, timeout_s:
     return out or None
 
 
+def actor_observability_metadata(actor_handle: ActorHandle | None, *, timeout_s: float = 5.0) -> dict[str, Any] | None:
+    if actor_handle is None:
+        return None
+    getter = getattr(actor_handle, "get_observability_binding", None)
+    if not callable(getter):
+        return None
+    try:
+        payload = ray.get(getter.remote(), timeout=float(timeout_s))
+    except Exception as e:
+        logger.debug("[ResourcePool] get_observability_binding failed: %s", e)
+        return None
+    return _normalize_actor_observability_payload(payload)
+
+
+async def async_actor_observability_metadata(
+    actor_handle: ActorHandle | None,
+    *,
+    timeout_s: float = 5.0,
+) -> dict[str, Any] | None:
+    if actor_handle is None:
+        return None
+    getter = getattr(actor_handle, "get_observability_binding", None)
+    if not callable(getter):
+        return None
+    try:
+        payload = await asyncio.wait_for(_await_ray_ref(getter.remote()), timeout=float(timeout_s))
+    except Exception as e:
+        logger.debug("[ResourcePool] async get_observability_binding failed: %s", e)
+        return None
+    return _normalize_actor_observability_payload(payload)
+
+
 class ResourcePool:
     """Unified pool managing all GPU-using actors with detached control plane."""
 
@@ -908,6 +930,15 @@ class ResourcePool:
             return None
         self._remember_handle(actor_name, actor)
         return actor
+
+    async def _lookup_handle_async(self, actor_name: str, namespace: str) -> ActorHandle | None:
+        with self._local_lock:
+            actor = self._handle_cache.get(actor_name)
+        if actor is not None:
+            return actor
+        if not self._use_detached():
+            return None
+        return await asyncio.to_thread(self._lookup_handle, actor_name, namespace)
 
     def _local(self, fn, *args, **kwargs):
         with self._local_lock:
@@ -1050,6 +1081,35 @@ class ResourcePool:
             )
         )
 
+    async def async_update_metadata(
+        self,
+        actor_name: str,
+        *,
+        metadata: dict[str, Any],
+        sample_time: float | None = None,
+        sample_source: str | None = None,
+    ) -> bool:
+        if not self._use_detached():
+            return bool(
+                self._local(
+                    self._local_state.update_metadata,
+                    actor_name,
+                    metadata=dict(metadata or {}),
+                    sample_time=sample_time,
+                    sample_source=sample_source,
+                )
+            )
+        return bool(
+            await _call_actor_async(
+                "update_metadata",
+                actor_name,
+                dict(metadata or {}),
+                sample_time,
+                sample_source,
+                retry_on_actor_restart=True,
+            )
+        )
+
     def reserve_gpus(self, num_gpus: int) -> bool:
         if not self._use_detached():
             return bool(self._local(self._local_state.reserve_gpus, num_gpus))
@@ -1110,25 +1170,43 @@ class ResourcePool:
         if refresh_metadata:
             for entry in entries:
                 self._refresh_entry_metadata(entry, now=now, sample_source="list_actors")
-        return [
-            {
-                "actor_name": entry.actor_name,
-                "actor_type": entry.actor_type.value,
-                "backend": _backend_for_entry(entry),
-                "role": _role_for_entry(entry),
-                "num_gpus": entry.num_gpus,
-                "base_model": entry.base_model,
-                "current_session": entry.current_session,
-                "node_id": entry.node_id,
-                "creating": entry.creating,
-                "protected": entry.protected,
-                **self._metadata_snapshot_fields(entry, now=now),
-                "idle": entry.is_idle(self.SESSION_IDLE_TIMEOUT),
-                "idle_time": entry.idle_time(),
-                "age": entry.age(),
-            }
-            for entry in entries
-        ]
+        return [self._actor_inventory_record(entry, now=now) for entry in entries]
+
+    async def async_list_actors(
+        self,
+        *,
+        refresh_metadata: bool = False,
+        actor_type: ActorType | None = None,
+        model_name: str | None = None,
+    ) -> list[dict]:
+        entries = await self.async_iter_entries(prune_stale=True)
+        if actor_type is not None:
+            entries = [entry for entry in entries if entry.actor_type == actor_type]
+        if model_name is not None:
+            entries = [entry for entry in entries if entry.base_model == model_name]
+        now = time.time()
+        if refresh_metadata:
+            for entry in entries:
+                await self._refresh_entry_metadata_async(entry, now=now, sample_source="list_actors")
+        return [self._actor_inventory_record(entry, now=now) for entry in entries]
+
+    def _actor_inventory_record(self, entry: ActorEntry, *, now: float) -> dict[str, Any]:
+        return {
+            "actor_name": entry.actor_name,
+            "actor_type": entry.actor_type.value,
+            "backend": _backend_for_entry(entry),
+            "role": _role_for_entry(entry),
+            "num_gpus": entry.num_gpus,
+            "base_model": entry.base_model,
+            "current_session": entry.current_session,
+            "node_id": entry.node_id,
+            "creating": entry.creating,
+            "protected": entry.protected,
+            **self._metadata_snapshot_fields(entry, now=now),
+            "idle": entry.is_idle(self.SESSION_IDLE_TIMEOUT),
+            "idle_time": entry.idle_time(),
+            "age": entry.age(),
+        }
 
     def _metadata_is_fresh(self, entry: ActorEntry, *, now: float) -> bool:
         if entry.metadata_sample_time is None:
@@ -1205,6 +1283,41 @@ class ResourcePool:
             return
         sample_time = float(now)
         if self.update_metadata(
+            entry.actor_name,
+            metadata=metadata,
+            sample_time=sample_time,
+            sample_source=sample_source,
+        ):
+            entry.metadata = dict(metadata)
+            entry.metadata_sample_time = sample_time
+            entry.metadata_sample_source = sample_source
+            self._record_metadata_metric(entry.actor_type, "refresh_success_total")
+            return
+        self._record_metadata_metric(entry.actor_type, "refresh_failures_total")
+
+    async def _refresh_entry_metadata_async(
+        self,
+        entry: ActorEntry,
+        *,
+        now: float,
+        sample_source: str = "cached_snapshot",
+    ) -> None:
+        if entry.actor_type not in {ActorType.VLLM, ActorType.MEGATRON}:
+            return
+        if self._metadata_is_fresh(entry, now=now):
+            self._record_metadata_metric(entry.actor_type, "cache_hits_total")
+            return
+        self._record_metadata_metric(entry.actor_type, "cache_stale_total")
+        handle = entry.actor_handle or await self._lookup_handle_async(entry.actor_name, entry.namespace)
+        if handle is None:
+            self._record_metadata_metric(entry.actor_type, "refresh_failures_total")
+            return
+        metadata = await async_actor_observability_metadata(handle, timeout_s=self.METADATA_TIMEOUT_S)
+        if metadata is None:
+            self._record_metadata_metric(entry.actor_type, "refresh_failures_total")
+            return
+        sample_time = float(now)
+        if await self.async_update_metadata(
             entry.actor_name,
             metadata=metadata,
             sample_time=sample_time,
@@ -1310,6 +1423,27 @@ class ResourcePool:
             )
         return out
 
+    async def async_iter_entries(self, *, prune_stale: bool = False) -> list[ActorEntry]:
+        if not self._use_detached():
+            if prune_stale and ray.is_initialized():
+                await asyncio.to_thread(self._local, self._local_state.prune_stale)
+            with self._local_lock:
+                return list(self._local_state.iter_entries())
+
+        records = await _call_actor_async("list_entries", bool(prune_stale), retry_on_actor_restart=True)
+        out: list[ActorEntry] = []
+        for record in records or []:
+            if not isinstance(record, dict):
+                continue
+            namespace = str(record.get("namespace") or "tinker")
+            out.append(
+                _record_to_entry(
+                    record,
+                    actor_handle=await self._lookup_handle_async(str(record.get("actor_name") or ""), namespace),
+                )
+            )
+        return out
+
     def clear_session(self, session_id: str, *, actor_type: ActorType | None = None) -> int:
         if not self._use_detached():
             return int(self._local(self._local_state.clear_session, session_id, actor_type=actor_type))
@@ -1320,6 +1454,11 @@ class ResourcePool:
         if not self._use_detached():
             return int(self._local(self._local_state.total_gpus_used))
         return int(_call_actor_sync("total_gpus_used", retry_on_actor_restart=True))
+
+    async def async_total_gpus_used(self) -> int:
+        if not self._use_detached():
+            return int(self._local(self._local_state.total_gpus_used))
+        return int(await _call_actor_async("total_gpus_used", retry_on_actor_restart=True))
 
     def gpus_used_by_node(self) -> dict[str, int]:
         usage: dict[str, int] = {}

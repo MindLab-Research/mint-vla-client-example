@@ -26,6 +26,13 @@ def _stub_sampling_last_activity(monkeypatch) -> None:
     )
 
 
+def _async_callable(fn):
+    async def _inner(*args, **kwargs):
+        return fn(*args, **kwargs)
+
+    return _inner
+
+
 @pytest.mark.anyio
 async def test_issue_437_root_heartbeat_touches_explicit_heartbeat_children(monkeypatch) -> None:
     from tinker_server.models.types import SessionHeartbeatRequest
@@ -38,24 +45,22 @@ async def test_issue_437_root_heartbeat_touches_explicit_heartbeat_children(monk
         def mark_session_inflight(self, session_id: str, delta: int) -> None:
             touched.append((session_id, delta))
 
-    async def _fake_run_in_threadpool(fn, *args, **kwargs):
-        return fn(*args, **kwargs)
-
     monkeypatch.setattr(service, "session_manager", _SessionManager())
     monkeypatch.setattr(service, "session_heartbeat_store", SimpleNamespace(update=updates.append))
-    monkeypatch.setattr(service, "run_in_threadpool", _fake_run_in_threadpool)
     _stub_sampling_last_activity(monkeypatch)
 
     import tinker_server.backend.session_index_store as sis
 
     monkeypatch.setattr(
         sis,
-        "get_session_index",
-        lambda session_id: {
-            "session_id": session_id,
-            "user_id": "owner-a",
-            "heartbeat_sampler_ids": ["sampler-a", "sampler-b", "sampler-a", "", None],
-        },
+        "async_get_session_index",
+        _async_callable(
+            lambda session_id: {
+                "session_id": session_id,
+                "user_id": "owner-a",
+                "heartbeat_sampler_ids": ["sampler-a", "sampler-b", "sampler-a", "", None],
+            }
+        ),
     )
 
     resp = await service.session_heartbeat(
@@ -84,34 +89,34 @@ async def test_issue_437_root_heartbeat_derives_training_checkpoint_children_onl
         def mark_session_inflight(self, session_id: str, delta: int) -> None:
             touched.append((session_id, delta))
 
-    async def _fake_run_in_threadpool(fn, *args, **kwargs):
-        return fn(*args, **kwargs)
-
     monkeypatch.setattr(service, "session_manager", _SessionManager())
     monkeypatch.setattr(service, "session_heartbeat_store", SimpleNamespace(update=updates.append))
-    monkeypatch.setattr(service, "run_in_threadpool", _fake_run_in_threadpool)
     _stub_sampling_last_activity(monkeypatch)
 
     import tinker_server.backend.session_index_store as sis
 
     monkeypatch.setattr(
         sis,
-        "get_session_index",
-        lambda session_id: {
-            "session_id": session_id,
-            "user_id": "owner-a",
-            "training_run_ids": ["train-a"],
-            "sampler_ids": ["child-sampler", "other-checkpoint", "base-model"],
-        },
+        "async_get_session_index",
+        _async_callable(
+            lambda session_id: {
+                "session_id": session_id,
+                "user_id": "owner-a",
+                "training_run_ids": ["train-a"],
+                "sampler_ids": ["child-sampler", "other-checkpoint", "base-model"],
+            }
+        ),
     )
     monkeypatch.setattr(
         sis,
-        "get_sampler_index",
-        lambda sampler_id: {
-            "child-sampler": {"source_type": "checkpoint", "model_id": "train-a"},
-            "other-checkpoint": {"source_type": "checkpoint", "model_id": "train-b"},
-            "base-model": {"source_type": "base_model"},
-        }.get(sampler_id),
+        "async_get_sampler_index",
+        _async_callable(
+            lambda sampler_id: {
+                "child-sampler": {"source_type": "checkpoint", "model_id": "train-a"},
+                "other-checkpoint": {"source_type": "checkpoint", "model_id": "train-b"},
+                "base-model": {"source_type": "base_model"},
+            }.get(sampler_id)
+        ),
     )
 
     resp = await service.session_heartbeat(
@@ -141,24 +146,22 @@ async def test_issue_437_root_heartbeat_ignores_missing_child_samplers(monkeypat
                 return
             touched.append((session_id, delta))
 
-    async def _fake_run_in_threadpool(fn, *args, **kwargs):
-        return fn(*args, **kwargs)
-
     monkeypatch.setattr(service, "session_manager", _SessionManager())
     monkeypatch.setattr(service, "session_heartbeat_store", SimpleNamespace(update=updates.append))
-    monkeypatch.setattr(service, "run_in_threadpool", _fake_run_in_threadpool)
     _stub_sampling_last_activity(monkeypatch)
 
     import tinker_server.backend.session_index_store as sis
 
     monkeypatch.setattr(
         sis,
-        "get_session_index",
-        lambda session_id: {
-            "session_id": session_id,
-            "user_id": "owner-a",
-            "heartbeat_sampler_ids": ["live-sampler", "stale-sampler"],
-        },
+        "async_get_session_index",
+        _async_callable(
+            lambda session_id: {
+                "session_id": session_id,
+                "user_id": "owner-a",
+                "heartbeat_sampler_ids": ["live-sampler", "stale-sampler"],
+            }
+        ),
     )
 
     resp = await service.session_heartbeat(
@@ -186,24 +189,22 @@ async def test_issue_437_root_heartbeat_skips_child_fanout_for_owner_mismatch(mo
         def mark_session_inflight(self, session_id: str, delta: int) -> None:
             touched.append((session_id, delta))
 
-    async def _fake_run_in_threadpool(fn, *args, **kwargs):
-        return fn(*args, **kwargs)
-
     monkeypatch.setattr(service, "session_manager", _SessionManager())
     monkeypatch.setattr(service, "session_heartbeat_store", SimpleNamespace(update=updates.append))
-    monkeypatch.setattr(service, "run_in_threadpool", _fake_run_in_threadpool)
     _stub_sampling_last_activity(monkeypatch)
 
     import tinker_server.backend.session_index_store as sis
 
     monkeypatch.setattr(
         sis,
-        "get_session_index",
-        lambda session_id: {
-            "session_id": session_id,
-            "user_id": "owner-a",
-            "heartbeat_sampler_ids": ["sampler-a"],
-        },
+        "async_get_session_index",
+        _async_callable(
+            lambda session_id: {
+                "session_id": session_id,
+                "user_id": "owner-a",
+                "heartbeat_sampler_ids": ["sampler-a"],
+            }
+        ),
     )
 
     with caplog.at_level("WARNING"):
@@ -230,20 +231,16 @@ async def test_issue_437_root_heartbeat_keeps_best_effort_on_index_failure(monke
         def mark_session_inflight(self, session_id: str, delta: int) -> None:
             touched.append((session_id, delta))
 
-    async def _fake_run_in_threadpool(fn, *args, **kwargs):
-        return fn(*args, **kwargs)
-
     monkeypatch.setattr(service, "session_manager", _SessionManager())
     monkeypatch.setattr(service, "session_heartbeat_store", SimpleNamespace(update=updates.append))
-    monkeypatch.setattr(service, "run_in_threadpool", _fake_run_in_threadpool)
     _stub_sampling_last_activity(monkeypatch)
 
     import tinker_server.backend.session_index_store as sis
 
-    def _boom(_session_id: str):
+    async def _boom(_session_id: str):
         raise RuntimeError("session index offline")
 
-    monkeypatch.setattr(sis, "get_session_index", _boom)
+    monkeypatch.setattr(sis, "async_get_session_index", _boom)
 
     with caplog.at_level("WARNING"):
         resp = await service.session_heartbeat(

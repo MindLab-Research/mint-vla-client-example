@@ -52,6 +52,48 @@ def test_actor_observability_metadata_preserves_recent_latency_and_gpu_fields(mo
     }
 
 
+def test_async_actor_observability_metadata_preserves_recent_latency_and_gpu_fields(monkeypatch) -> None:
+    class _Getter:
+        def __call__(self):
+            return None
+
+        def remote(self):
+            return "binding-ref"
+
+    class _Handle:
+        get_observability_binding = _Getter()
+
+    async def _await_ray_ref(ref):
+        assert ref == "binding-ref"
+        return {
+            "hostname": "host-a",
+            "node_id": "node-a",
+            "scheduler_waiting_requests": 4,
+            "seq_slot_wait_s_p95_recent": 1.2,
+            "generate_lock_wait_s_p50_recent": 0.1,
+            "time_per_output_token_s_total": 0.96,
+            "gpu_memory_allocated_bytes": 48000000000,
+            "gpu_memory_reserved_bytes": 52000000000,
+            "gpu_memory_fragmentation_bytes": 4000000000,
+        }
+
+    monkeypatch.setattr(resource_pool_mod, "_await_ray_ref", _await_ray_ref)
+
+    out = asyncio.run(resource_pool_mod.async_actor_observability_metadata(_Handle(), timeout_s=0.5))
+
+    assert out == {
+        "hostname": "host-a",
+        "node_id": "node-a",
+        "scheduler_waiting_requests": 4,
+        "seq_slot_wait_s_p95_recent": 1.2,
+        "generate_lock_wait_s_p50_recent": 0.1,
+        "time_per_output_token_s_total": 0.96,
+        "gpu_memory_allocated_bytes": 48000000000,
+        "gpu_memory_reserved_bytes": 52000000000,
+        "gpu_memory_fragmentation_bytes": 4000000000,
+    }
+
+
 def test_api_work_queue_metrics_snapshot_tracks_local_state() -> None:
     q = ApiWorkQueueClient()
     now = time.time()
@@ -642,6 +684,123 @@ def test_resource_pool_list_actors_can_refresh_vllm_observability(monkeypatch) -
     finally:
         pool.METADATA_TTL_S = old_ttl
         pool.clear(kill_actors=False)
+
+
+def test_resource_pool_async_list_actors_can_refresh_vllm_observability(monkeypatch) -> None:
+    monkeypatch.setattr(resource_pool_mod, "_detached_enabled", lambda: False)
+    pool = get_resource_pool()
+    pool.clear(kill_actors=False)
+    old_ttl = pool.METADATA_TTL_S
+    calls: list[object] = []
+
+    async def _stub_observability(handle, *, timeout_s=5.0):
+        calls.append(handle)
+        return {
+            "scheduler_waiting_requests": 7,
+            "scheduler_running_requests": 2,
+            "scheduler_kv_cache_usage_ratio": 0.5,
+        }
+
+    monkeypatch.setattr(resource_pool_mod, "async_actor_observability_metadata", _stub_observability)
+
+    try:
+        pool.METADATA_TTL_S = 30.0
+        handle = object()
+        pool.register("actor-vllm", ActorType.VLLM, 1, actor_handle=handle, base_model="m")
+        with pool._pool_lock:
+            entry = pool._entries["actor-vllm"]
+            entry.metadata = {"scheduler_waiting_requests": 0}
+            entry.metadata_sample_time = time.time() - 120.0
+            entry.metadata_sample_source = "stale"
+
+        rec = {item["actor_name"]: item for item in asyncio.run(pool.async_list_actors(refresh_metadata=True))}[
+            "actor-vllm"
+        ]
+
+        assert rec["metadata"]["scheduler_waiting_requests"] == 7
+        assert rec["metadata"]["scheduler_running_requests"] == 2
+        assert rec["metadata"]["scheduler_kv_cache_usage_ratio"] == 0.5
+        assert rec["metadata_sample_source"] == "list_actors"
+        assert rec["metadata_cache_state"] == "fresh"
+        assert len(calls) == 1
+        assert asyncio.run(pool.async_total_gpus_used()) == 1
+    finally:
+        pool.METADATA_TTL_S = old_ttl
+        pool.clear(kill_actors=False)
+
+
+def test_resource_pool_async_list_actors_refreshes_detached_inventory(monkeypatch) -> None:
+    monkeypatch.setattr(resource_pool_mod, "_detached_enabled", lambda: True)
+    monkeypatch.setattr(resource_pool_mod.ResourcePool, "_instance", None)
+    pool = get_resource_pool()
+    calls: list[tuple[str, tuple[object, ...]]] = []
+    handle = object()
+    stale_sample_time = time.time() - 120.0
+
+    async def _call_actor_async(method_name: str, *args, retry_on_actor_restart: bool = False, **kwargs):
+        calls.append((method_name, args))
+        if method_name == "list_entries":
+            assert args == (True,)
+            assert retry_on_actor_restart is True
+            return [
+                {
+                    "actor_name": "actor-vllm",
+                    "actor_type": ActorType.VLLM.value,
+                    "num_gpus": 1,
+                    "namespace": "ns",
+                    "base_model": "m",
+                    "metadata": {"scheduler_waiting_requests": 0},
+                    "metadata_sample_time": stale_sample_time,
+                    "metadata_sample_source": "stale",
+                }
+            ]
+        if method_name == "update_metadata":
+            assert args[0] == "actor-vllm"
+            assert args[1] == {
+                "scheduler_waiting_requests": 7,
+                "scheduler_running_requests": 2,
+            }
+            assert args[3] == "list_actors"
+            assert retry_on_actor_restart is True
+            return True
+        if method_name == "total_gpus_used":
+            assert args == ()
+            assert retry_on_actor_restart is True
+            return 3
+        raise AssertionError(f"unexpected ResourcePool actor method: {method_name}")
+
+    async def _lookup_handle_async(self, actor_name: str, namespace: str):
+        assert actor_name == "actor-vllm"
+        assert namespace == "ns"
+        return handle
+
+    async def _observability(actor_handle, *, timeout_s=5.0):
+        assert actor_handle is handle
+        return {
+            "scheduler_waiting_requests": 7,
+            "scheduler_running_requests": 2,
+        }
+
+    monkeypatch.setattr(resource_pool_mod, "_call_actor_async", _call_actor_async)
+    monkeypatch.setattr(resource_pool_mod.ResourcePool, "_lookup_handle_async", _lookup_handle_async)
+    monkeypatch.setattr(resource_pool_mod, "async_actor_observability_metadata", _observability)
+
+    rec = {item["actor_name"]: item for item in asyncio.run(pool.async_list_actors(refresh_metadata=True))}[
+        "actor-vllm"
+    ]
+
+    assert rec["metadata"] == {
+        "scheduler_waiting_requests": 7,
+        "scheduler_running_requests": 2,
+    }
+    assert rec["metadata_sample_source"] == "list_actors"
+    assert rec["metadata_cache_state"] == "fresh"
+    assert asyncio.run(pool.async_total_gpus_used()) == 3
+    assert [method_name for method_name, _args in calls] == [
+        "list_entries",
+        "update_metadata",
+        "total_gpus_used",
+    ]
 
 
 def test_resource_pool_list_actors_skips_refresh_when_requested(monkeypatch) -> None:

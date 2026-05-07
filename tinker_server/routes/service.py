@@ -24,7 +24,6 @@ from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
-from starlette.concurrency import run_in_threadpool
 
 from ..auth_identity import can_bypass_ownership_user_data
 from ..auth_identity import can_manage_system
@@ -33,6 +32,7 @@ from ..auth_identity import get_user_data as _request_user_data
 from ..auth_identity import get_user_id as _request_user_id
 from ..backend.async_ray_control import (
     _await_ray_ref,
+    async_ensure_ray_initialized,
     async_kill_named_actor,
     async_lookup_actor_handle,
     async_placement_group_table,
@@ -852,9 +852,9 @@ async def _child_sampler_ids_for_heartbeat(
     request_user_data: dict | None,
 ) -> list[str]:
     try:
-        from ..backend.session_index_store import get_sampler_index, get_session_index
+        from ..backend.session_index_store import async_get_sampler_index, async_get_session_index
 
-        info = await run_in_threadpool(get_session_index, root_session_id)
+        info = await async_get_session_index(root_session_id)
     except Exception as e:
         logger.warning("[session_heartbeat] session index lookup failed for %s: %s", root_session_id, e)
         return []
@@ -887,7 +887,7 @@ async def _child_sampler_ids_for_heartbeat(
             continue
         seen.add(sampler_id)
         try:
-            sampler_info = await run_in_threadpool(get_sampler_index, sampler_id)
+            sampler_info = await async_get_sampler_index(sampler_id)
         except Exception as e:
             logger.warning("[session_heartbeat] sampler index lookup failed for %s: %s", sampler_id, e)
             continue
@@ -968,13 +968,9 @@ def _require_admin(request: Request) -> None:
 
 async def _augment_with_placement_groups(actors: list[dict]) -> None:
     try:
-        import ray
         from ..config import RAY_NAMESPACE
-        from ..ray_utils import init_ray
 
-        if not ray.is_initialized():
-            init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
-
+        await async_ensure_ray_initialized(namespace=RAY_NAMESPACE)
         # Offload PG inspection into a Ray task so we never block the API event loop
         # with synchronous control-plane calls.
         timeout_s = float(os.environ.get("MINT_ACTORS_PG_TABLE_TIMEOUT_S", "2.0"))
@@ -1048,18 +1044,12 @@ async def list_actors(
         parsed_actor_type = ActorType(t)
 
     pool = get_resource_pool()
-
-    def _load_actors() -> tuple[list[dict], int]:
-        return (
-            pool.list_actors(
-                refresh_metadata=refresh_metadata,
-                actor_type=parsed_actor_type,
-                model_name=model_name,
-            ),
-            pool.total_gpus_used(),
-        )
-
-    actors, total_gpus_used = await run_in_threadpool(_load_actors)
+    actors = await pool.async_list_actors(
+        refresh_metadata=refresh_metadata,
+        actor_type=parsed_actor_type,
+        model_name=model_name,
+    )
+    total_gpus_used = await pool.async_total_gpus_used()
     await _augment_with_placement_groups(actors)
     return {"actors": actors, "total_gpus_used": total_gpus_used}
 
@@ -1316,8 +1306,6 @@ async def _kill_exact_dense_actor(*, actor_name: str) -> int:
 async def _kill_dense_actors(base_model: str | None) -> int:
     from ..backend.resource_pool import ActorType, get_resource_pool
     from ..config import RAY_NAMESPACE
-    from ..ray_utils import init_ray
-    import ray
 
     pool = get_resource_pool()
     targets = [
@@ -1328,14 +1316,12 @@ async def _kill_dense_actors(base_model: str | None) -> int:
 
     killed = 0
 
-    if not ray.is_initialized():
-        init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
-
+    await async_ensure_ray_initialized(namespace=RAY_NAMESPACE)
     for e in targets:
         await async_kill_named_actor(
             e.actor_name,
             e.namespace,
-            actor_handle=e.actor_handle if e.actor_handle is not None else None,
+            actor_handle=getattr(e, "actor_handle", None),
             base_model=e.base_model,
             reason="dense_kill_by_api",
         )
