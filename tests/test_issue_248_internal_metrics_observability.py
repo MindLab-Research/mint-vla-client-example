@@ -586,6 +586,81 @@ def test_issue_248_internal_metrics_marks_stale_cached_rss_without_emitting_valu
     assert 'mint_resource_pool_group_rss_bytes{actor_type="vllm",model="Qwen/Qwen3-4B-Instruct-2507"}' not in text
 
 
+def test_issue_588_admission_stats_rss_path_preserves_resource_pool_metadata(monkeypatch) -> None:
+    import importlib
+
+    api_work_queue_module = importlib.import_module("tinker_server.backend.api_work_queue")
+    capacity_manager_module = importlib.import_module("tinker_server.backend.capacity_manager")
+    future_store_module = importlib.import_module("tinker_server.backend.future_store")
+    resource_pool_module = importlib.import_module("tinker_server.backend.resource_pool")
+
+    @dataclass
+    class _CapSnapshot:
+        capacity: int
+        inflight: int
+
+    class _FakeCapacityManager:
+        async def async_snapshot(self, *, timeout_s: float = 10.0) -> _CapSnapshot:
+            return _CapSnapshot(capacity=16, inflight=1)
+
+        async def async_rss_bytes(self, *, timeout_s: float = 10.0) -> int:
+            return 1000
+
+    class _FakeApiWorkQueue:
+        async def stats(self, *, timeout_s: float = 10.0) -> dict:
+            return {"depth": 0, "enqueued": 0, "dequeued": 0}
+
+        async def rss_bytes(self, *, timeout_s: float = 10.0) -> int:
+            return 2000
+
+    class _FakeFutureStore:
+        async def async_ensure_ready(self, *, timeout_s: float = 10.0) -> dict:
+            return {"pending": 0, "results": 0, "errors": 0}
+
+        async def async_rss_bytes(self, *, timeout_s: float = 10.0) -> int:
+            return 3000
+
+    class _FakePool:
+        def rss_snapshot(self, *, timeout_s: float = 10.0) -> list[dict]:
+            return [
+                {
+                    "actor_name": "vllm-1",
+                    "actor_type": "vllm",
+                    "base_model": "Qwen/Qwen3-4B-Instruct-2507",
+                    "metadata": {
+                        "scheduler_waiting_requests": 4,
+                        "scheduler_running_requests": 2,
+                    },
+                    "metadata_sample_source": "cached_snapshot",
+                    "metadata_cache_state": "fresh",
+                    "rss_bytes": 4096,
+                }
+            ]
+
+        def cached_snapshot(self) -> list[dict]:
+            raise AssertionError("include_actor_rss=True must use rss_snapshot")
+
+        def metadata_cache_metrics_snapshot(self) -> list[dict]:
+            return []
+
+        def lifecycle_metrics_snapshot(self) -> list[dict]:
+            return []
+
+    monkeypatch.setattr(capacity_manager_module, "capacity_manager", _FakeCapacityManager())
+    monkeypatch.setattr(api_work_queue_module, "api_work_queue", _FakeApiWorkQueue())
+    monkeypatch.setattr(future_store_module, "future_store", _FakeFutureStore())
+    monkeypatch.setattr(resource_pool_module, "get_resource_pool", lambda: _FakePool())
+
+    stats = asyncio.run(internal_routes.admission_stats(include_actor_rss=True))
+    rec = stats["actors"]["resource_pool"][0]
+
+    assert rec["metadata"]["scheduler_waiting_requests"] == 4
+    assert rec["metadata"]["scheduler_running_requests"] == 2
+    assert rec["metadata_sample_source"] == "cached_snapshot"
+    assert rec["metadata_cache_state"] == "fresh"
+    assert rec["rss_bytes"] == 4096
+
+
 def test_issue_248_admission_stats_metrics_path_uses_cached_pool_snapshot(monkeypatch) -> None:
     import importlib
 

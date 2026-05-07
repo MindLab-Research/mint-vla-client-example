@@ -26,8 +26,12 @@ class _FakePool:
         self._actors = list(actors)
         self._entries = list(entries)
         self.unregister_calls: list[str] = []
+        self.list_actor_refresh_metadata_calls: list[bool] = []
+        self.list_actor_filter_calls: list[dict[str, object]] = []
 
-    def list_actors(self) -> list[dict]:
+    def list_actors(self, *, refresh_metadata: bool = False, actor_type=None, model_name: str | None = None) -> list[dict]:
+        self.list_actor_refresh_metadata_calls.append(bool(refresh_metadata))
+        self.list_actor_filter_calls.append({"actor_type": actor_type, "model_name": model_name})
         return list(self._actors)
 
     def total_gpus_used(self) -> int:
@@ -82,6 +86,90 @@ def test_list_actors_returns_503_when_ray_init_contract_fails(monkeypatch) -> No
 
     assert resp.status_code == 503, resp.text
     assert "RAY_ADDRESS must be set" in resp.text
+
+
+def test_list_actors_refreshes_metadata_by_default(monkeypatch) -> None:
+    import tinker_server.ray_utils as ray_utils
+
+    _install_ray_stub(monkeypatch)
+    monkeypatch.setattr(ray_utils, "init_ray", lambda *_args, **_kwargs: None)
+    pool = _FakePool(
+        actors=[{"actor_name": "vllm-a", "actor_type": "vllm", "base_model": "Qwen/Qwen3-4B-Instruct-2507"}],
+        entries=[],
+    )
+    client = _build_client(monkeypatch, pool)
+
+    resp = client.get("/api/v1/actors")
+
+    assert resp.status_code == 200, resp.text
+    assert pool.list_actor_refresh_metadata_calls == [True]
+
+
+def test_list_actors_can_skip_metadata_refresh(monkeypatch) -> None:
+    import tinker_server.ray_utils as ray_utils
+
+    _install_ray_stub(monkeypatch)
+    monkeypatch.setattr(ray_utils, "init_ray", lambda *_args, **_kwargs: None)
+    pool = _FakePool(
+        actors=[{"actor_name": "vllm-a", "actor_type": "vllm", "base_model": "Qwen/Qwen3-4B-Instruct-2507"}],
+        entries=[],
+    )
+    client = _build_client(monkeypatch, pool)
+
+    resp = client.get("/api/v1/actors?refresh_metadata=false")
+
+    assert resp.status_code == 200, resp.text
+    assert pool.list_actor_refresh_metadata_calls == [False]
+
+
+def test_list_actors_passes_filters_to_resource_pool_before_refresh(monkeypatch) -> None:
+    import tinker_server.ray_utils as ray_utils
+    from tinker_server.backend.resource_pool import ActorType
+
+    _install_ray_stub(monkeypatch)
+    monkeypatch.setattr(ray_utils, "init_ray", lambda *_args, **_kwargs: None)
+    pool = _FakePool(
+        actors=[{"actor_name": "vllm-a", "actor_type": "vllm", "base_model": "Qwen/Qwen3-4B-Instruct-2507"}],
+        entries=[],
+    )
+    client = _build_client(monkeypatch, pool)
+
+    resp = client.get("/api/v1/actors?type=vllm&model_name=Qwen/Qwen3-4B-Instruct-2507")
+
+    assert resp.status_code == 200, resp.text
+    assert pool.list_actor_refresh_metadata_calls == [True]
+    assert pool.list_actor_filter_calls == [
+        {
+            "actor_type": ActorType.VLLM,
+            "model_name": "Qwen/Qwen3-4B-Instruct-2507",
+        }
+    ]
+
+
+def test_list_actors_runs_resource_pool_inventory_in_threadpool(monkeypatch) -> None:
+    from tinker_server.routes import service as service_routes
+    import tinker_server.ray_utils as ray_utils
+
+    _install_ray_stub(monkeypatch)
+    monkeypatch.setattr(ray_utils, "init_ray", lambda *_args, **_kwargs: None)
+    pool = _FakePool(
+        actors=[{"actor_name": "vllm-a", "actor_type": "vllm", "base_model": "Qwen/Qwen3-4B-Instruct-2507"}],
+        entries=[],
+    )
+    threadpool_calls = []
+
+    async def _run_in_threadpool(fn, *args, **kwargs):
+        threadpool_calls.append((fn, args, kwargs))
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr(service_routes, "run_in_threadpool", _run_in_threadpool)
+    client = _build_client(monkeypatch, pool)
+
+    resp = client.get("/api/v1/actors")
+
+    assert resp.status_code == 200, resp.text
+    assert len(threadpool_calls) == 1
+    assert pool.list_actor_refresh_metadata_calls == [True]
 
 
 def test_kill_dense_actors_returns_503_without_unregistering_when_ray_init_fails(monkeypatch) -> None:
