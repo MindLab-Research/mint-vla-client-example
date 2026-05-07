@@ -7,14 +7,16 @@ def test_issue_193_training_worker_load_checkpoint_without_optimizer_resets_stat
     worker = object.__new__(impl_cls)
 
     worker.device = "cpu"
-    worker.model = object()
+    worker.model = SimpleNamespace(named_parameters=lambda: [])
+    worker.max_lora_rank = 8
+    worker._current_actual_rank = None
     worker._step_count = 0
     worker._touch = lambda: None
 
     ensure_calls: list[str] = []
     reset_calls: list[float | None] = []
 
-    worker._ensure_session_loaded = lambda session_id: ensure_calls.append(session_id)
+    worker._ensure_session_loaded = lambda session_id, **kwargs: ensure_calls.append(session_id)
     worker.reset_optimizer = lambda learning_rate=None: reset_calls.append(learning_rate) or {
         "status": "ok",
         "learning_rate": learning_rate,
@@ -31,10 +33,15 @@ def test_issue_193_training_worker_load_checkpoint_without_optimizer_resets_stat
     (ckpt_dir / "adapter_model.safetensors").write_bytes(b"stub")
     (ckpt_dir / "training_meta.json").write_text('{"current_step": 17, "learning_rate": 0.0005}')
 
+    torch = pytest.importorskip("torch")
     fake_safetensors_torch = types.ModuleType("safetensors.torch")
-    fake_safetensors_torch.load_file = lambda *args, **kwargs: {"fake": "state"}
+    fake_safetensors_torch.load_file = lambda *args, **kwargs: {
+        "fake.lora_A.weight": torch.ones(8, 1),
+        "fake.lora_B.weight": torch.ones(1, 8),
+    }
     fake_safetensors = types.ModuleType("safetensors")
     fake_safetensors.torch = fake_safetensors_torch
+    fake_safetensors.safe_open = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "safetensors", fake_safetensors)
     monkeypatch.setitem(sys.modules, "safetensors.torch", fake_safetensors_torch)
 
@@ -70,14 +77,16 @@ def test_issue_193_training_worker_load_checkpoint_invalid_meta_preserves_step_a
     worker = object.__new__(impl_cls)
 
     worker.device = "cpu"
-    worker.model = object()
+    worker.model = SimpleNamespace(named_parameters=lambda: [])
+    worker.max_lora_rank = 8
+    worker._current_actual_rank = None
     worker._step_count = 33
     worker._touch = lambda: None
 
     ensure_calls: list[str] = []
     reset_calls: list[float | None] = []
 
-    worker._ensure_session_loaded = lambda session_id: ensure_calls.append(session_id)
+    worker._ensure_session_loaded = lambda session_id, **kwargs: ensure_calls.append(session_id)
     worker.reset_optimizer = lambda learning_rate=None: reset_calls.append(learning_rate) or {
         "status": "ok",
         "learning_rate": learning_rate,
@@ -94,10 +103,15 @@ def test_issue_193_training_worker_load_checkpoint_invalid_meta_preserves_step_a
     (ckpt_dir / "adapter_model.safetensors").write_bytes(b"stub")
     (ckpt_dir / "training_meta.json").write_text('{"current_step": "bad", "learning_rate": "oops"}')
 
+    torch = pytest.importorskip("torch")
     fake_safetensors_torch = types.ModuleType("safetensors.torch")
-    fake_safetensors_torch.load_file = lambda *args, **kwargs: {"fake": "state"}
+    fake_safetensors_torch.load_file = lambda *args, **kwargs: {
+        "fake.lora_A.weight": torch.ones(8, 1),
+        "fake.lora_B.weight": torch.ones(1, 8),
+    }
     fake_safetensors = types.ModuleType("safetensors")
     fake_safetensors.torch = fake_safetensors_torch
+    fake_safetensors.safe_open = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "safetensors", fake_safetensors)
     monkeypatch.setitem(sys.modules, "safetensors.torch", fake_safetensors_torch)
 
@@ -347,7 +361,7 @@ def test_issue_193_megatron_save_weights_concurrent_shared_actor_is_isolated(mon
 
         def remote(self, *args, **kwargs):
             self.calls.append((args, kwargs))
-            return f"shared-ref-{kwargs['session_id']}"
+            return _labeled_ray_ref(f"shared-ref-{kwargs['session_id']}")
 
     shared_remote = _SharedCheckpointRemote()
     shared_worker = SimpleNamespace(save_checkpoint=shared_remote)
@@ -650,13 +664,15 @@ def test_issue_193_megatron_load_weights_passes_explicit_session_id_and_keepaliv
         )
 
     monkeypatch.setattr(engine, "_await_with_keepalive", fake_keepalive)
-    ray_get_calls: list[tuple[object, float | None]] = []
+    mark_loaded_ref = _completed_ray_ref({"status": "ok"})
+    worker.mark_session_loaded = _RecordingRemoteMethod(mark_loaded_ref)
+    async_get_ray_ref_calls: list[tuple[object, float | None]] = []
 
-    def fake_ray_get(ref, timeout=None):
-        ray_get_calls.append((ref, timeout))
+    async def fake_async_get_ray_ref(ref, *, timeout_s=None):
+        async_get_ray_ref_calls.append((ref, timeout_s))
         return {"status": "ok"}
 
-    monkeypatch.setattr(ray, "get", fake_ray_get)
+    monkeypatch.setattr("tinker_server.backend.verl_training.async_get_ray_ref", fake_async_get_ray_ref)
 
     async def _run():
         await engine.load_weights(
@@ -671,7 +687,7 @@ def test_issue_193_megatron_load_weights_passes_explicit_session_id_and_keepaliv
         ("fake-load-ready-ref", model_id, 30.0, 1800.0),
         ("megatron-load-ref", model_id, 30.0, 4321.0),
     ]
-    assert ray_get_calls == [("fake-mark-session-loaded-ref", 4321.0)]
+    assert async_get_ray_ref_calls == [(mark_loaded_ref, 4321.0)]
     args, kwargs = worker.load_checkpoint.calls[0]
     assert args == (str(load_path), False)
     assert kwargs["traceparent"] is None

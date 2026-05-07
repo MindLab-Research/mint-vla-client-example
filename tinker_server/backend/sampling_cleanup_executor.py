@@ -107,10 +107,10 @@ async def cleanup_stale_sampling_sessions_once_impl(*, stale_after_s: float | No
         return []
 
     from .future_store import future_store
-    from .sampling_session_store import delete_sampling_session, list_sampling_sessions
+    from .sampling_session_store import async_list_sampling_sessions, delete_sampling_session
 
     try:
-        infos = await asyncio.to_thread(list_sampling_sessions)
+        infos = await async_list_sampling_sessions()
     except Exception as e:
         logger.warning(
             "sampling cleanup executor skipped: failed to list detached sampling sessions: %s: %s",

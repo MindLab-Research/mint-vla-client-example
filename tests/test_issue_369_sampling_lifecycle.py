@@ -5,11 +5,12 @@ from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
 
-future_store_module = importlib.import_module("tinker_server.backend.future_store")
 from tinker_server.backend import sampling_cleanup_executor as cleanup_executor_module
 from tinker_server.backend import sampling_session_store as sampling_store_module
 from tinker_server.backend import session_manager as session_manager_module
 from tinker_server.routes import service as service_route
+
+future_store_module = importlib.import_module("tinker_server.backend.future_store")
 
 
 @pytest.fixture
@@ -40,10 +41,8 @@ async def test_issue_369_detached_sampling_cleanup_removes_stale_session(monkeyp
     failed_sampling = []
     unloaded = []
 
-    monkeypatch.setattr(
-        sampling_store_module,
-        "list_sampling_sessions",
-        lambda: [
+    async def _async_list_sampling_sessions():
+        return [
             {
                 "session_id": "sess-stale",
                 "base_model": "Qwen/Qwen3-4B-Instruct-2507",
@@ -64,8 +63,9 @@ async def test_issue_369_detached_sampling_cleanup_removes_stale_session(monkeyp
                 "last_activity": 1e12,
                 "inflight_requests": 0,
             },
-        ],
-    )
+        ]
+
+    monkeypatch.setattr(sampling_store_module, "async_list_sampling_sessions", _async_list_sampling_sessions)
     monkeypatch.setattr(sampling_store_module, "delete_sampling_session", lambda session_id: deleted.append(session_id))
     monkeypatch.setattr(
         future_store_module.future_store,
@@ -99,10 +99,8 @@ async def test_issue_369_detached_sampling_cleanup_keeps_shared_adapter_loaded(m
     deleted = []
     unloaded = []
 
-    monkeypatch.setattr(
-        sampling_store_module,
-        "list_sampling_sessions",
-        lambda: [
+    async def _async_list_sampling_sessions():
+        return [
             {
                 "session_id": "sess-a",
                 "base_model": "Qwen/Qwen3-4B-Instruct-2507",
@@ -123,8 +121,9 @@ async def test_issue_369_detached_sampling_cleanup_keeps_shared_adapter_loaded(m
                 "last_activity": 1e12,
                 "inflight_requests": 0,
             },
-        ],
-    )
+        ]
+
+    monkeypatch.setattr(sampling_store_module, "async_list_sampling_sessions", _async_list_sampling_sessions)
     monkeypatch.setattr(sampling_store_module, "delete_sampling_session", lambda session_id: deleted.append(session_id))
     monkeypatch.setattr(
         future_store_module.future_store,
