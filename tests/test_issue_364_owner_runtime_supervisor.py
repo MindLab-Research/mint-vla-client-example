@@ -17,9 +17,6 @@ def test_issue_364_future_reaper_once_releases_capacity(monkeypatch) -> None:
         async def async_ensure_started(self) -> dict:
             return {"ok": True}
 
-        async def async_ensure_started(self) -> dict:
-            return {"ok": True}
-
         async def async_reap(self) -> dict:
             return {"expired": ["req-expired"], "timed_out": ["req-timeout"]}
 
@@ -104,12 +101,27 @@ def test_issue_364_runtime_degraded_healthz() -> None:
     from tinker_server.health_state import clear_runtime_degraded_state, set_runtime_degraded_state
 
     clear_runtime_degraded_state()
-    set_runtime_degraded_state(reason="owner_runtime_supervisor_unavailable", error="boom", details={"x": 1})
+    set_runtime_degraded_state(
+        reason="owner_runtime_supervisor_unavailable",
+        error="boom",
+        details={
+            "x": 1,
+            "snapshot": {
+                "loops": {
+                    "checkpoint_reaper": {
+                        "last_error_traceback": "Traceback secret/path.py checkpoint boom",
+                    },
+                },
+            },
+        },
+    )
     try:
         out = public_healthz_response()
         assert isinstance(out, JSONResponse)
         assert out.status_code == 503
         assert b'owner_runtime_supervisor_unavailable' in out.body
+        assert b"last_error_traceback" not in out.body
+        assert b"Traceback secret/path.py" not in out.body
     finally:
         clear_runtime_degraded_state()
 
@@ -181,4 +193,4 @@ def test_issue_364_owner_runtime_loop_snapshot_includes_error_details(monkeypatc
     assert out["error_type"] == "RuntimeError"
     assert loop["last_error"] == "RuntimeError: checkpoint boom"
     assert loop["last_error_type"] == "RuntimeError"
-    assert "checkpoint boom" in loop["last_error_traceback"]
+    assert "last_error_traceback" not in loop

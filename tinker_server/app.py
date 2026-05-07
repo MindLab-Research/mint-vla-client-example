@@ -64,6 +64,33 @@ else:
     from .routes import mint
 
 
+def _owner_runtime_snapshot_details(
+    snapshot: dict[str, object],
+    *,
+    loop_name: object | None = None,
+    loop_state: dict[str, object] | None = None,
+) -> dict[str, object]:
+    details: dict[str, object] = {
+        "actor_name": snapshot.get("actor_name"),
+        "namespace": snapshot.get("namespace"),
+        "epoch_id": snapshot.get("epoch_id"),
+        "code_identity": snapshot.get("code_identity"),
+    }
+    if loop_name is not None:
+        details["loop"] = str(loop_name)
+    if loop_state is not None:
+        for key in (
+            "last_error_type",
+            "last_error_at",
+            "last_success_at",
+            "error_count",
+            "success_count",
+        ):
+            if key in loop_state:
+                details[key] = loop_state.get(key)
+    return {key: value for key, value in details.items() if value is not None}
+
+
 def _http_route_label(request: Request) -> str:
     route = request.scope.get("route")
     route_path = getattr(route, "path", None)
@@ -289,10 +316,13 @@ async def lifespan(app: FastAPI):
             cleanup_legacy_dense_session_state_once,
             active_session_ids=active_model_ids,
         )
-        migrated = len(dense_cleanup.get("migrated", []))
-        deleted = len(dense_cleanup.get("deleted", []))
-        skipped = len(dense_cleanup.get("skipped", []))
+        migrated_items = dense_cleanup.get("migrated", [])
+        deleted_items = dense_cleanup.get("deleted", [])
+        skipped_items = dense_cleanup.get("skipped", [])
         errors = dense_cleanup.get("errors", [])
+        migrated = len(migrated_items) if isinstance(migrated_items, list) else 0
+        deleted = len(deleted_items) if isinstance(deleted_items, list) else 0
+        skipped = len(skipped_items) if isinstance(skipped_items, list) else 0
         if migrated or deleted or skipped or errors:
             logger.info(
                 "dense session-state startup cleanup target_root=%s migrated=%s deleted=%s skipped=%s errors=%s",
@@ -320,7 +350,7 @@ async def lifespan(app: FastAPI):
             return (
                 "owner_runtime_supervisor_code_mismatch",
                 f"expected code_identity={app_module_git_sha!r} actual={code_identity!r}",
-                {"snapshot": snapshot},
+                _owner_runtime_snapshot_details(snapshot),
             )
         loops = snapshot.get("loops")
         if isinstance(loops, dict):
@@ -336,7 +366,7 @@ async def lifespan(app: FastAPI):
                     return (
                         "owner_runtime_supervisor_loop_error",
                         f"loop={loop_name} last_error={last_error}",
-                        {"snapshot": snapshot},
+                        _owner_runtime_snapshot_details(snapshot, loop_name=loop_name, loop_state=raw),
                     )
         return None
 

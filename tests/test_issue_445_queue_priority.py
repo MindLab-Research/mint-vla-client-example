@@ -7,8 +7,10 @@ import sys
 import time
 import types
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
+from fastapi import Request
 
 from tinker_server.models.types import ComputeLogprobsRequest, ForwardBackwardInput, ForwardBackwardRequest, ModelInput, SampleRequest, SamplingParams
 from tinker_server.queue_priority import (
@@ -118,10 +120,10 @@ def _install_ray_stub(monkeypatch) -> None:
         def _decorator(cls):
             class _RemoteWrapped(cls):
                 @classmethod
-                def options(cls_, **_opts):
+                def options(cls, **_opts):
                     class _OptionsHandle:
                         def remote(self, *args, **kwargs):
-                            return _ActorProxy(cls_(*args, **kwargs))
+                            return _ActorProxy(cls(*args, **kwargs))
 
                     return _OptionsHandle()
 
@@ -321,7 +323,7 @@ async def test_issue_445_asample_enqueues_normalized_priority(monkeypatch):
         headers={"X-MinT-Priority": "9"},
     )
 
-    await sampling_route.asample(req, http_request)
+    await sampling_route.asample(req, cast(Request, http_request))
 
     assert queue.calls
     assert queue.calls[0]["extra"]["queue_priority"] == 2
@@ -345,7 +347,7 @@ async def test_issue_445_internal_noop_enqueues_normalized_priority(monkeypatch)
 
     http_request = _DummyRequest(headers={"X-MinT-Priority": "9"})
 
-    await internal_route.work_queue_noop(http_request)
+    await internal_route.work_queue_noop(cast(Request, http_request))
 
     assert queue.calls
     assert queue.calls[0]["extra"]["queue_priority"] == 2
@@ -385,7 +387,7 @@ async def test_issue_445_forward_backward_enqueues_default_priority_on_invalid_h
         headers={"X-MinT-Priority": "bad-value"},
     )
 
-    await training_route.forward_backward(req, http_request)
+    await training_route.forward_backward(req, cast(Request, http_request))
 
     assert queue.calls
     assert queue.calls[0]["extra"]["queue_priority"] == 0
@@ -423,7 +425,7 @@ async def test_issue_445_compute_logprobs_enqueues_apikey_id(monkeypatch):
         headers={"X-MinT-Priority": "9"},
     )
 
-    await sampling_route.compute_logprobs(req, http_request)
+    await sampling_route.compute_logprobs(req, cast(Request, http_request))
 
     assert queue.calls
     assert queue.calls[0]["op"] == "sampling.compute_logprobs"
