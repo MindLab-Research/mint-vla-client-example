@@ -232,7 +232,10 @@ def test_api_work_queue_hydrate_metrics_snapshot_restores_restart_baseline(monke
             self._fn = fn
 
         def remote(self):
-            return lambda: self._fn()
+            async def _result():
+                return self._fn()
+
+            return _result()
 
     class _StubActor:
         def __init__(self):
@@ -598,6 +601,116 @@ def test_resource_pool_cached_snapshot_refreshes_vllm_observability_on_ttl(monke
     finally:
         pool.METADATA_TTL_S = old_ttl
         pool.METADATA_TIMEOUT_S = old_timeout
+        pool.clear(kill_actors=False)
+
+
+def test_resource_pool_list_actors_can_refresh_vllm_observability(monkeypatch) -> None:
+    monkeypatch.setattr(resource_pool_mod, "_detached_enabled", lambda: False)
+    pool = get_resource_pool()
+    pool.clear(kill_actors=False)
+    old_ttl = pool.METADATA_TTL_S
+    calls: list[object] = []
+
+    def _stub_observability(handle, *, timeout_s=5.0):
+        calls.append(handle)
+        return {
+            "scheduler_waiting_requests": 7,
+            "scheduler_running_requests": 2,
+            "scheduler_kv_cache_usage_ratio": 0.5,
+        }
+
+    monkeypatch.setattr(resource_pool_mod, "actor_observability_metadata", _stub_observability)
+
+    try:
+        pool.METADATA_TTL_S = 30.0
+        handle = object()
+        pool.register("actor-vllm", ActorType.VLLM, 1, actor_handle=handle, base_model="m")
+        with pool._pool_lock:
+            entry = pool._entries["actor-vllm"]
+            entry.metadata = {"scheduler_waiting_requests": 0}
+            entry.metadata_sample_time = time.time() - 120.0
+            entry.metadata_sample_source = "stale"
+
+        rec = {item["actor_name"]: item for item in pool.list_actors(refresh_metadata=True)}["actor-vllm"]
+
+        assert rec["metadata"]["scheduler_waiting_requests"] == 7
+        assert rec["metadata"]["scheduler_running_requests"] == 2
+        assert rec["metadata"]["scheduler_kv_cache_usage_ratio"] == 0.5
+        assert rec["metadata_sample_source"] == "list_actors"
+        assert rec["metadata_cache_state"] == "fresh"
+        assert len(calls) == 1
+    finally:
+        pool.METADATA_TTL_S = old_ttl
+        pool.clear(kill_actors=False)
+
+
+def test_resource_pool_list_actors_skips_refresh_when_requested(monkeypatch) -> None:
+    monkeypatch.setattr(resource_pool_mod, "_detached_enabled", lambda: False)
+    pool = get_resource_pool()
+    pool.clear(kill_actors=False)
+    old_ttl = pool.METADATA_TTL_S
+
+    def _fail_observability(_handle, *, timeout_s=5.0):
+        raise AssertionError("list_actors(refresh_metadata=False) must not refresh metadata")
+
+    monkeypatch.setattr(resource_pool_mod, "actor_observability_metadata", _fail_observability)
+
+    try:
+        pool.METADATA_TTL_S = 30.0
+        pool.register("actor-vllm", ActorType.VLLM, 1, actor_handle=object(), base_model="m")
+        with pool._pool_lock:
+            entry = pool._entries["actor-vllm"]
+            entry.metadata = {"scheduler_waiting_requests": 0}
+            entry.metadata_sample_time = time.time() - 120.0
+            entry.metadata_sample_source = "stale"
+
+        rec = {item["actor_name"]: item for item in pool.list_actors(refresh_metadata=False)}["actor-vllm"]
+
+        assert rec["metadata"]["scheduler_waiting_requests"] == 0
+        assert rec["metadata_sample_source"] == "stale"
+        assert rec["metadata_cache_state"] == "stale"
+    finally:
+        pool.METADATA_TTL_S = old_ttl
+        pool.clear(kill_actors=False)
+
+
+def test_resource_pool_rss_snapshot_preserves_cached_metadata_when_collecting_rss(monkeypatch) -> None:
+    monkeypatch.setattr(resource_pool_mod, "_detached_enabled", lambda: False)
+    pool = get_resource_pool()
+    pool.clear(kill_actors=False)
+    old_ttl = pool.METADATA_TTL_S
+
+    class _Method:
+        def remote(self):
+            return "rss-ref"
+
+    class _Handle:
+        get_rss_bytes = _Method()
+
+    monkeypatch.setattr(resource_pool_mod.ray, "get", lambda _ref, timeout=None: 4096)
+
+    try:
+        pool.METADATA_TTL_S = 30.0
+        pool.register("actor-vllm", ActorType.VLLM, 1, actor_handle=_Handle(), base_model="m")
+        with pool._pool_lock:
+            entry = pool._entries["actor-vllm"]
+            entry.metadata = {
+                "scheduler_waiting_requests": 4,
+                "scheduler_running_requests": 1,
+            }
+            entry.metadata_sample_time = time.time() - 5.0
+            entry.metadata_sample_source = "cached_snapshot"
+
+        rec = {item["actor_name"]: item for item in pool.rss_snapshot(timeout_s=0.1)}["actor-vllm"]
+
+        assert rec["rss_bytes"] == 4096
+        assert rec["metadata"]["scheduler_waiting_requests"] == 4
+        assert rec["metadata"]["scheduler_running_requests"] == 1
+        assert rec["metadata_sample_source"] == "cached_snapshot"
+        assert rec["metadata_cache_state"] == "fresh"
+        assert rec["metadata_sample_age_s"] >= 0.0
+    finally:
+        pool.METADATA_TTL_S = old_ttl
         pool.clear(kill_actors=False)
 
 

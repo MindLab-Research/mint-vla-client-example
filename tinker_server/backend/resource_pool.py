@@ -1088,8 +1088,22 @@ class ResourcePool:
             )
         )
 
-    def list_actors(self) -> list[dict]:
+    def list_actors(
+        self,
+        *,
+        refresh_metadata: bool = False,
+        actor_type: ActorType | None = None,
+        model_name: str | None = None,
+    ) -> list[dict]:
         entries = self.iter_entries(prune_stale=True)
+        if actor_type is not None:
+            entries = [entry for entry in entries if entry.actor_type == actor_type]
+        if model_name is not None:
+            entries = [entry for entry in entries if entry.base_model == model_name]
+        now = time.time()
+        if refresh_metadata:
+            for entry in entries:
+                self._refresh_entry_metadata(entry, now=now, sample_source="list_actors")
         return [
             {
                 "actor_name": entry.actor_name,
@@ -1102,7 +1116,7 @@ class ResourcePool:
                 "node_id": entry.node_id,
                 "creating": entry.creating,
                 "protected": entry.protected,
-                "metadata": dict(entry.metadata or {}),
+                **self._metadata_snapshot_fields(entry, now=now),
                 "idle": entry.is_idle(self.SESSION_IDLE_TIMEOUT),
                 "idle_time": entry.idle_time(),
                 "age": entry.age(),
@@ -1114,6 +1128,19 @@ class ResourcePool:
         if entry.metadata_sample_time is None:
             return False
         return max(0.0, float(now) - float(entry.metadata_sample_time)) <= float(self.METADATA_TTL_S)
+
+    def _metadata_snapshot_fields(self, entry: ActorEntry, *, now: float) -> dict[str, Any]:
+        fields: dict[str, Any] = {"metadata": dict(entry.metadata or {})}
+        if entry.metadata_sample_time is None:
+            fields["metadata_cache_state"] = "unknown"
+            return fields
+
+        sample_age = max(0.0, float(now) - float(entry.metadata_sample_time))
+        fields["metadata_sample_age_s"] = sample_age
+        if entry.metadata_sample_source is not None:
+            fields["metadata_sample_source"] = str(entry.metadata_sample_source)
+        fields["metadata_cache_state"] = "fresh" if sample_age <= float(self.METADATA_TTL_S) else "stale"
+        return fields
 
     def _record_metadata_metric(self, actor_type: ActorType, key: str) -> None:
         actor_key = actor_type.value
@@ -1149,7 +1176,13 @@ class ResourcePool:
         rows = _call_actor_sync("lifecycle_metrics_snapshot", retry_on_actor_restart=True)
         return rows if isinstance(rows, list) else []
 
-    def _refresh_entry_metadata(self, entry: ActorEntry, *, now: float) -> None:
+    def _refresh_entry_metadata(
+        self,
+        entry: ActorEntry,
+        *,
+        now: float,
+        sample_source: str = "cached_snapshot",
+    ) -> None:
         if entry.actor_type not in {ActorType.VLLM, ActorType.MEGATRON}:
             return
         if self._metadata_is_fresh(entry, now=now):
@@ -1169,11 +1202,11 @@ class ResourcePool:
             entry.actor_name,
             metadata=metadata,
             sample_time=sample_time,
-            sample_source="cached_snapshot",
+            sample_source=sample_source,
         ):
             entry.metadata = dict(metadata)
             entry.metadata_sample_time = sample_time
-            entry.metadata_sample_source = "cached_snapshot"
+            entry.metadata_sample_source = sample_source
             self._record_metadata_metric(entry.actor_type, "refresh_success_total")
             return
         self._record_metadata_metric(entry.actor_type, "refresh_failures_total")
@@ -1188,7 +1221,7 @@ class ResourcePool:
             "node_id": entry.node_id,
             "creating": entry.creating,
             "protected": entry.protected,
-            "metadata": dict(entry.metadata or {}),
+            **self._metadata_snapshot_fields(entry, now=now),
             "idle": entry.is_idle(self.SESSION_IDLE_TIMEOUT),
             "idle_time": entry.idle_time(),
             "age": entry.age(),
@@ -1221,6 +1254,7 @@ class ResourcePool:
 
     def rss_snapshot(self, *, timeout_s: float = 10.0) -> list[dict]:
         out: list[dict] = []
+        now = time.time()
         for entry in self.iter_entries():
             rec = {
                 "actor_name": entry.actor_name,
@@ -1229,6 +1263,7 @@ class ResourcePool:
                 "base_model": entry.base_model,
                 "current_session": entry.current_session,
                 "node_id": entry.node_id,
+                **self._metadata_snapshot_fields(entry, now=now),
                 "idle": entry.is_idle(self.SESSION_IDLE_TIMEOUT),
                 "idle_time": entry.idle_time(),
                 "age": entry.age(),

@@ -1024,31 +1024,44 @@ async def list_actors(
     request: Request,
     actor_type: str | None = Query(None, alias="type"),
     model_name: str | None = None,
+    refresh_metadata: bool = Query(
+        True,
+        description="Refresh VLLM/Megatron observability metadata before returning actors.",
+    ),
 ) -> dict:
     """List actors in the unified ResourcePool. Admin only when auth enabled.
 
     Query params:
         type: Optional filter ("vllm" | "megatron" | "dense")
         model_name: Optional filter on ActorEntry.base_model
+        refresh_metadata: Refresh VLLM/Megatron observability metadata before returning actors
     """
     _require_admin(request)
     from ..backend.resource_pool import ActorType, get_resource_pool
 
-    pool = get_resource_pool()
-    actors = pool.list_actors()
-
+    parsed_actor_type: ActorType | None = None
     if actor_type is not None:
         t = actor_type.strip().lower()
         allowed = {x.value for x in ActorType}
         if t not in allowed:
             raise HTTPException(status_code=422, detail=f"Invalid type {actor_type!r}; expected one of {sorted(allowed)}")
-        actors = [a for a in actors if a.get("actor_type") == t]
+        parsed_actor_type = ActorType(t)
 
-    if model_name is not None:
-        actors = [a for a in actors if a.get("base_model") == model_name]
+    pool = get_resource_pool()
 
+    def _load_actors() -> tuple[list[dict], int]:
+        return (
+            pool.list_actors(
+                refresh_metadata=refresh_metadata,
+                actor_type=parsed_actor_type,
+                model_name=model_name,
+            ),
+            pool.total_gpus_used(),
+        )
+
+    actors, total_gpus_used = await run_in_threadpool(_load_actors)
     await _augment_with_placement_groups(actors)
-    return {"actors": actors, "total_gpus_used": pool.total_gpus_used()}
+    return {"actors": actors, "total_gpus_used": total_gpus_used}
 
 
 class KillActorsRequest(BaseModel):
