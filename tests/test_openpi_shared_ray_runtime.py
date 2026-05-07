@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import os
 from types import SimpleNamespace
@@ -55,6 +56,18 @@ def _create_payload(session: TrainingSession, *, learning_rate: float = 1e-4) ->
         "max_token_len": 200,
         "camera_layout": ["base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"],
     }
+
+
+def _completed_ref(value: object) -> SimpleNamespace:
+    fut: concurrent.futures.Future[object] = concurrent.futures.Future()
+    fut.set_result(value)
+    return SimpleNamespace(future=lambda: fut)
+
+
+def _failed_ref(exc: BaseException) -> SimpleNamespace:
+    fut: concurrent.futures.Future[object] = concurrent.futures.Future()
+    fut.set_exception(exc)
+    return SimpleNamespace(future=lambda: fut)
 
 
 def _reset_shared_runtime_test_state(monkeypatch, openpi_shared_ray_runtime) -> None:
@@ -362,6 +375,29 @@ def test_openpi_shared_runtime_client_refreshes_named_actor_before_request(monke
     ]
 
 
+def test_openpi_shared_ray_runtime_client_ray_get_awaits_future_without_ray_get(monkeypatch) -> None:
+    pytest.importorskip("ray")
+    from tinker_server.backend.openpi_shared_ray_runtime import OpenPISharedRayRuntimeClient
+
+    client = OpenPISharedRayRuntimeClient(
+        actor=object(),
+        actor_name="openpi-shared-actor",
+        spec=_spec(),
+        session_id="model-a",
+        ready_timeout_s=30.0,
+    )
+    fut: concurrent.futures.Future[dict[str, object]] = concurrent.futures.Future()
+    fut.set_result({"ok": True})
+    ref = SimpleNamespace(future=lambda: fut)
+
+    monkeypatch.setattr(
+        "tinker_server.backend.openpi_shared_ray_runtime.ray.get",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("ray.get should not be called")),
+    )
+
+    assert asyncio.run(client._ray_get(ref, timeout_s=1.0)) == {"ok": True}
+
+
 def test_start_openpi_shared_ray_runtime_applies_single_node_pin(monkeypatch) -> None:
     from tinker_server.backend import openpi_shared_ray_runtime
 
@@ -461,12 +497,12 @@ def test_shared_client_close_cleans_up_new_actor_after_failed_initial_create_ses
         class ready_metadata:
             @staticmethod
             def remote():
-                return "ready-ref"
+                return _completed_ref({"actor_id": "actor-123", "current_session_id": None})
 
         class register_session:
             @staticmethod
             def remote(*_args, **_kwargs):
-                return "create-ref"
+                return _failed_ref(RuntimeError("create failed"))
 
         class shutdown:
             @staticmethod
@@ -507,10 +543,6 @@ def test_shared_client_close_cleans_up_new_actor_after_failed_initial_create_ses
         raise ValueError("actor not found")
 
     def _fake_ray_get(ref, timeout=None):
-        if ref == "ready-ref":
-            return {"actor_id": "actor-123", "current_session_id": None}
-        if ref == "create-ref":
-            raise RuntimeError("create failed")
         if ref == "shutdown-ref":
             state["shutdown_refs"].append((ref, timeout))
             return None
@@ -566,12 +598,14 @@ def test_shared_client_close_does_not_kill_actor_after_successful_create_session
         class ready_metadata:
             @staticmethod
             def remote():
-                return "ready-ref"
+                return _completed_ref({"actor_id": "actor-123", "current_session_id": None})
 
         class register_session:
             @staticmethod
             def remote(*_args, **_kwargs):
-                return "create-ref"
+                return _completed_ref(
+                    {"backend": "openpi_fast", "config_name": "pi0_fast_libero_low_mem_finetune"}
+                )
 
         class shutdown:
             @staticmethod
@@ -612,10 +646,6 @@ def test_shared_client_close_does_not_kill_actor_after_successful_create_session
         raise ValueError("actor not found")
 
     def _fake_ray_get(ref, timeout=None):
-        if ref == "ready-ref":
-            return {"actor_id": "actor-123", "current_session_id": None}
-        if ref == "create-ref":
-            return {"backend": "openpi_fast", "config_name": "pi0_fast_libero_low_mem_finetune"}
         if ref == "shutdown-ref":
             state["shutdown_refs"].append((ref, timeout))
             return None
@@ -669,17 +699,19 @@ def test_shared_client_shutdown_reclaims_actor_when_last_session_exits(monkeypat
         class ready_metadata:
             @staticmethod
             def remote():
-                return "ready-ref"
+                return _completed_ref({"actor_id": "actor-123", "current_session_id": None})
 
         class register_session:
             @staticmethod
             def remote(*_args, **_kwargs):
-                return "create-ref"
+                return _completed_ref(
+                    {"backend": "openpi_fast", "config_name": "pi0_fast_libero_low_mem_finetune"}
+                )
 
         class request_for_session:
             @staticmethod
             def remote(*_args, **_kwargs):
-                return "request-ref"
+                return _completed_ref({"stopped": True, "known_session_ids": []})
 
         class shutdown:
             @staticmethod
@@ -720,12 +752,6 @@ def test_shared_client_shutdown_reclaims_actor_when_last_session_exits(monkeypat
         raise ValueError("actor not found")
 
     def _fake_ray_get(ref, timeout=None):
-        if ref == "ready-ref":
-            return {"actor_id": "actor-123", "current_session_id": None}
-        if ref == "create-ref":
-            return {"backend": "openpi_fast", "config_name": "pi0_fast_libero_low_mem_finetune"}
-        if ref == "request-ref":
-            return {"stopped": True, "known_session_ids": []}
         if ref == "shutdown-ref":
             state["shutdown_refs"].append((ref, timeout))
             return None

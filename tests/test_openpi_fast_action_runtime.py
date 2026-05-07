@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -963,6 +964,30 @@ def test_start_openpi_action_ray_runtime_applies_single_node_pin(monkeypatch) ->
             f"{state['register']['actor_name']!r}",
         }
     ]
+
+
+def test_openpi_action_ray_runtime_client_ray_get_awaits_future_without_ray_get(monkeypatch) -> None:
+    pytest.importorskip("ray")
+    from tinker_server.backend.openpi_action_ray_runtime import OpenPIActionRayRuntimeClient
+    from tinker_server.backend.openpi_fast_action_runtime import OpenPIFastActionRuntimeSpec
+
+    client = OpenPIActionRayRuntimeClient(
+        actor=object(),
+        actor_name="openpi-action-actor",
+        spec=OpenPIFastActionRuntimeSpec(),
+        action_session_id="session-1:action:3",
+        ready_timeout_s=30.0,
+    )
+    fut: concurrent.futures.Future[dict[str, object]] = concurrent.futures.Future()
+    fut.set_result({"ok": True})
+    ref = SimpleNamespace(future=lambda: fut)
+
+    monkeypatch.setattr(
+        "tinker_server.backend.openpi_action_ray_runtime.ray.get",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("ray.get should not be called")),
+    )
+
+    assert asyncio.run(client._ray_get(ref, timeout_s=1.0)) == {"ok": True}
 
 
 def test_openpi_fast_save_weights_for_sampler_exports_policy_loadable_checkpoint(tmp_path: Path) -> None:

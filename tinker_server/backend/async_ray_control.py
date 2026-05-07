@@ -23,6 +23,17 @@ async def _await_ray_ref(ref: Any) -> Any:
     raise TypeError(f"Ray ref is not awaitable: {type(ref)}")
 
 
+async def async_get_ray_ref(ref: Any, *, timeout_s: float | None = None) -> Any:
+    if timeout_s is None:
+        return await _await_ray_ref(ref)
+    try:
+        return await asyncio.wait_for(_await_ray_ref(ref), timeout=float(timeout_s))
+    except asyncio.TimeoutError as exc:
+        import ray
+
+        raise ray.exceptions.GetTimeoutError(f"timed out after {float(timeout_s):.3f}s") from exc
+
+
 def is_actor_lookup_not_found(exc: Exception) -> bool:
     candidate: Exception | None = exc
     as_instanceof_cause = getattr(exc, "as_instanceof_cause", None)

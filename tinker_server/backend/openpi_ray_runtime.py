@@ -8,8 +8,9 @@ from typing import Any
 
 import ray
 
-from ..config import PFS_PYTHONPATH, RAY_NAMESPACE
+from ..config import PFS_PYTHONPATH, RAY_NAMESPACE, actor_runtime_env_vars
 from ..ray_utils import init_ray
+from .async_ray_control import async_get_ray_ref
 from .openpi_fast_runtime import (
     OpenPIFastRuntimeSpec,
     OpenPIFastWorkerClient,
@@ -20,8 +21,6 @@ from .openpi_fast_runtime import (
 
 logger = logging.getLogger(__name__)
 
-
-from ..config import actor_runtime_env_vars
 
 def _openpi_runtime_env_vars() -> dict[str, str]:
     extra = {"PYTHONDONTWRITEBYTECODE": "1"}
@@ -175,7 +174,7 @@ class OpenPIRayRuntimeClient:
 
     async def _ray_get(self, ref: Any, *, timeout_s: float | None) -> Any:
         try:
-            return await asyncio.to_thread(ray.get, ref, timeout=_ray_timeout(timeout_s))
+            return await async_get_ray_ref(ref, timeout_s=_ray_timeout(timeout_s))
         except ray.exceptions.GetTimeoutError as exc:
             raise OpenPIFastWorkerProtocolError(
                 f"Ray runtime timed out for session {self._session_id!r} after {timeout_s}s"
