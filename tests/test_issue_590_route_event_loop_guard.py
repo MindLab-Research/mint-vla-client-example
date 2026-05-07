@@ -5,7 +5,13 @@ from collections import Counter
 from pathlib import Path
 
 
-ROUTES_DIR = Path("tinker_server/routes")
+SCAN_PATHS = (
+    Path("tinker_server/routes"),
+    Path("tinker_server/health_checks.py"),
+    Path("tinker_server/ray_cluster_health.py"),
+    Path("tinker_server/ray_gcs_metrics.py"),
+    Path("tinker_server/backend/api_work_queue_dispatch.py"),
+)
 
 BLOCKING_PATTERNS = (
     "run_in_threadpool",
@@ -45,7 +51,14 @@ def test_routes_do_not_add_event_loop_blocking_primitives() -> None:
     violations: list[str] = []
     remaining_debt = EXISTING_ROUTE_BLOCKING_DEBT.copy()
 
-    for path in sorted(ROUTES_DIR.glob("*.py")):
+    paths: list[Path] = []
+    for scan_path in SCAN_PATHS:
+        if scan_path.is_dir():
+            paths.extend(sorted(scan_path.glob("*.py")))
+        else:
+            paths.append(scan_path)
+
+    for path in paths:
         rel_path = path.as_posix()
         with path.open("rb") as fh:
             comment_starts = {

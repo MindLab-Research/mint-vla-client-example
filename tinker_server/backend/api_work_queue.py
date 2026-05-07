@@ -2192,23 +2192,12 @@ class ApiWorkQueueClient:
             await self._await_ray_ref(ref, timeout_s=timeout_s)
 
         if not ray.is_initialized():
-            try:
-                from ..ray_utils import init_ray
-
-                init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
-                _append_api_work_queue_debug("get_ray_actor_async_after_init_ray", require_ready=bool(require_ready))
-            except Exception as e:
-                _append_api_work_queue_debug(
-                    "get_ray_actor_async_init_ray_error",
-                    require_ready=bool(require_ready),
-                    error=f"{type(e).__name__}: {e}",
-                    traceback=traceback.format_exc(),
-                )
-                raise ApiWorkQueueUnavailableError("Ray not initialized (init_ray failed)") from e
-        else:
-            _append_api_work_queue_debug("get_ray_actor_async_using_existing_ray", require_ready=bool(require_ready))
-        if not ray.is_initialized():
+            _append_api_work_queue_debug(
+                "get_ray_actor_async_ray_not_initialized",
+                require_ready=bool(require_ready),
+            )
             raise ApiWorkQueueUnavailableError("Ray not initialized")
+        _append_api_work_queue_debug("get_ray_actor_async_using_existing_ray", require_ready=bool(require_ready))
 
         if self._ray_actor is not None:
             if not require_ready:

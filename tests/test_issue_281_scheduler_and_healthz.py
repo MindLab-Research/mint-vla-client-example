@@ -678,8 +678,11 @@ async def test_issue_281_internal_serialized_op_marks_inflight_until_worker_fini
 
 @pytest.mark.anyio
 async def test_issue_281_public_healthz_ignores_timeout_observation(monkeypatch) -> None:
+    from tinker_server.health_state import clear_runtime_degraded_state, clear_startup_degraded_state
     from tinker_server.routes import service
 
+    clear_startup_degraded_state()
+    clear_runtime_degraded_state()
     _install_ray_stub(monkeypatch)
 
     async def _raise_timeout(awaitable, timeout):
@@ -695,8 +698,11 @@ async def test_issue_281_public_healthz_ignores_timeout_observation(monkeypatch)
 
 @pytest.mark.anyio
 async def test_issue_281_public_healthz_ignores_pending_pg_observation(monkeypatch) -> None:
+    from tinker_server.health_state import clear_runtime_degraded_state, clear_startup_degraded_state
     from tinker_server.routes import service
 
+    clear_startup_degraded_state()
+    clear_runtime_degraded_state()
     _install_ray_stub(monkeypatch, available={"GPU": 2}, total={"GPU": 8})
 
     async def _return_pending(awaitable, timeout):

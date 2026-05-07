@@ -8,12 +8,23 @@ from tinker_server import app as app_module
 from tinker_server.models.types import ModelInput, SampleRequest, SamplingParams
 
 
+def _mark_ray_initialized(monkeypatch) -> None:
+    import ray
+
+    monkeypatch.setattr(ray, "is_initialized", lambda: True)
+
+
 class _StubFutureStore:
     def ensure_ready(self, **_kwargs) -> None:
         return None
 
     async def async_ensure_started(self) -> None:
         return None
+
+
+class _StubUsageStore:
+    async def health_check(self) -> bool:
+        return True
 
 
 class _StubCapacityManager:
@@ -128,9 +139,13 @@ def test_sampling_queue_executor_forwards_gateway_auth(monkeypatch):
         captured["user_id"] = user_id
         captured["gateway_auth"] = gateway_auth
 
+    async def _get_usage_store():
+        return _StubUsageStore()
+
+    _mark_ray_initialized(monkeypatch)
     monkeypatch.setattr(app_module, "_cleanup_stale_actors", _noop_async)
-    monkeypatch.setattr(app_module, "_prewarm_persistent_models", _noop_async)
     monkeypatch.setattr(app_module, "_restore_sampling_sessions", _noop_async)
+    monkeypatch.setattr(app_module, "init_ray", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(app_module, "SessionManager", _StubSessionManager)
     monkeypatch.setattr(app_module.sampling, "_do_sample", _capture_do_sample)
     monkeypatch.setattr(app_module.config, "enable_multi_lora", False)
@@ -176,6 +191,7 @@ def test_sampling_queue_executor_forwards_gateway_auth(monkeypatch):
     monkeypatch.setattr(checkpoints_module, "get_checkpoint_reap_interval_s", lambda: 3600.0)
     monkeypatch.setattr(checkpoints_module, "reap_runtime_checkpoints", lambda: {})
     monkeypatch.setattr(gateway_module, "close_http_clients", _noop_async)
+    monkeypatch.setattr(usage_store_module, "get_usage_store", _get_usage_store)
     monkeypatch.setattr(usage_store_module, "close_usage_store", _noop_async)
 
     request = SampleRequest(

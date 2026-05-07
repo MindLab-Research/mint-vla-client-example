@@ -14,11 +14,16 @@ def _install_ray_stub(monkeypatch) -> None:
     ray.__spec__ = importlib.machinery.ModuleSpec("ray", loader=None)
     ray.is_initialized = lambda: False  # type: ignore[attr-defined]
     ray.actor = SimpleNamespace(ActorHandle=object)
+    ray.exceptions = SimpleNamespace(
+        GetTimeoutError=RuntimeError,
+        RayActorError=RuntimeError,
+    )
     ray.util = SimpleNamespace(
         get_placement_group=lambda *_args, **_kwargs: None,
         remove_placement_group=lambda *_args, **_kwargs: None,
     )
     monkeypatch.setitem(sys.modules, "ray", ray)
+    monkeypatch.setitem(sys.modules, "ray.exceptions", ray.exceptions)
 
 
 class _FakePool:
@@ -64,29 +69,29 @@ class _FakePool:
         self.unregister_calls.append(actor_name)
 
 
-def _build_client(monkeypatch, pool: _FakePool) -> TestClient:
+def _build_client(monkeypatch, pool: _FakePool, *, patch_placement_groups: bool = True) -> TestClient:
     from tinker_server.routes import service as service_routes
     import tinker_server.backend.resource_pool as resource_pool
 
     monkeypatch.setattr(service_routes, "_require_admin", lambda _request: None)
     monkeypatch.setattr(resource_pool, "get_resource_pool", lambda: pool)
+    if patch_placement_groups:
+        async def _empty_placement_group_table(*_args, **_kwargs):
+            return {}
+
+        monkeypatch.setattr(service_routes, "async_placement_group_table", _empty_placement_group_table)
 
     app = FastAPI()
     app.include_router(service_routes.router, prefix="/api/v1")
     return TestClient(app)
 
 
-def _raise_missing_ray_address(*_args, **_kwargs):
-    from tinker_server.ray_utils import MissingRayAddressError
-
-    raise MissingRayAddressError("RAY_ADDRESS must be set before initializing Ray")
-
-
-def test_list_actors_returns_503_when_ray_init_contract_fails(monkeypatch) -> None:
+def test_list_actors_uses_startup_ray_driver_without_request_path_init(monkeypatch) -> None:
     import tinker_server.ray_utils as ray_utils
 
     _install_ray_stub(monkeypatch)
-    monkeypatch.setattr(ray_utils, "init_ray", _raise_missing_ray_address)
+    init_ray_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    monkeypatch.setattr(ray_utils, "init_ray", lambda *args, **kwargs: init_ray_calls.append((args, kwargs)))
 
     client = _build_client(
         monkeypatch,
@@ -98,15 +103,12 @@ def test_list_actors_returns_503_when_ray_init_contract_fails(monkeypatch) -> No
 
     resp = client.get("/api/v1/actors")
 
-    assert resp.status_code == 503, resp.text
-    assert "RAY_ADDRESS must be set" in resp.text
+    assert resp.status_code == 200, resp.text
+    assert init_ray_calls == []
 
 
 def test_list_actors_refreshes_metadata_by_default(monkeypatch) -> None:
-    import tinker_server.ray_utils as ray_utils
-
     _install_ray_stub(monkeypatch)
-    monkeypatch.setattr(ray_utils, "init_ray", lambda *_args, **_kwargs: None)
     pool = _FakePool(
         actors=[{"actor_name": "vllm-a", "actor_type": "vllm", "base_model": "Qwen/Qwen3-4B-Instruct-2507"}],
         entries=[],
@@ -120,10 +122,7 @@ def test_list_actors_refreshes_metadata_by_default(monkeypatch) -> None:
 
 
 def test_list_actors_can_skip_metadata_refresh(monkeypatch) -> None:
-    import tinker_server.ray_utils as ray_utils
-
     _install_ray_stub(monkeypatch)
-    monkeypatch.setattr(ray_utils, "init_ray", lambda *_args, **_kwargs: None)
     pool = _FakePool(
         actors=[{"actor_name": "vllm-a", "actor_type": "vllm", "base_model": "Qwen/Qwen3-4B-Instruct-2507"}],
         entries=[],
@@ -137,11 +136,9 @@ def test_list_actors_can_skip_metadata_refresh(monkeypatch) -> None:
 
 
 def test_list_actors_passes_filters_to_resource_pool_before_refresh(monkeypatch) -> None:
-    import tinker_server.ray_utils as ray_utils
     from tinker_server.backend.resource_pool import ActorType
 
     _install_ray_stub(monkeypatch)
-    monkeypatch.setattr(ray_utils, "init_ray", lambda *_args, **_kwargs: None)
     pool = _FakePool(
         actors=[{"actor_name": "vllm-a", "actor_type": "vllm", "base_model": "Qwen/Qwen3-4B-Instruct-2507"}],
         entries=[],
@@ -161,10 +158,7 @@ def test_list_actors_passes_filters_to_resource_pool_before_refresh(monkeypatch)
 
 
 def test_list_actors_uses_async_resource_pool_inventory(monkeypatch) -> None:
-    import tinker_server.ray_utils as ray_utils
-
     _install_ray_stub(monkeypatch)
-    monkeypatch.setattr(ray_utils, "init_ray", lambda *_args, **_kwargs: None)
     pool = _FakePool(
         actors=[{"actor_name": "vllm-a", "actor_type": "vllm", "base_model": "Qwen/Qwen3-4B-Instruct-2507"}],
         entries=[],
@@ -178,12 +172,10 @@ def test_list_actors_uses_async_resource_pool_inventory(monkeypatch) -> None:
     assert pool.total_gpus_used_calls == 1
 
 
-def test_kill_dense_actors_returns_503_without_unregistering_when_ray_init_fails(monkeypatch) -> None:
-    import tinker_server.ray_utils as ray_utils
+def test_kill_dense_actors_returns_503_without_unregistering_when_ray_driver_is_unavailable(monkeypatch) -> None:
     from tinker_server.backend.resource_pool import ActorType
 
     _install_ray_stub(monkeypatch)
-    monkeypatch.setattr(ray_utils, "init_ray", _raise_missing_ray_address)
 
     pool = _FakePool(
         actors=[],
@@ -201,7 +193,7 @@ def test_kill_dense_actors_returns_503_without_unregistering_when_ray_init_fails
     resp = client.post("/api/v1/actors/kill", json={"actor_type": "dense"})
 
     assert resp.status_code == 503, resp.text
-    assert "RAY_ADDRESS must be set" in resp.text
+    assert "Ray is not initialized" in resp.text
     assert pool.unregister_calls == []
 
 
@@ -246,7 +238,6 @@ def test_kill_exact_dense_actor_returns_503_without_unregistering_when_kill_fail
 def test_kill_dense_actors_returns_503_without_unregistering_when_kill_fails(monkeypatch) -> None:
     from tinker_server.routes import service as service_routes
     from tinker_server.backend.resource_pool import ActorType
-    import tinker_server.ray_utils as ray_utils
 
     _install_ray_stub(monkeypatch)
     remove_pg_calls: list[str] = []
@@ -268,7 +259,6 @@ def test_kill_dense_actors_returns_503_without_unregistering_when_kill_fails(mon
     )
     monkeypatch.setattr(service_routes, "async_kill_named_actor", _raise_kill)
     monkeypatch.setattr(service_routes, "_remove_actor_pg", lambda actor_name: remove_pg_calls.append(actor_name))
-    monkeypatch.setattr(ray_utils, "init_ray", lambda *_args, **_kwargs: None)
     client = _build_client(monkeypatch, pool)
 
     resp = client.post("/api/v1/actors/kill", json={"actor_type": "dense"})
@@ -282,7 +272,6 @@ def test_kill_dense_actors_returns_503_without_unregistering_when_kill_fails(mon
 def test_kill_dense_actors_returns_503_when_pg_removal_fails(monkeypatch) -> None:
     from tinker_server.routes import service as service_routes
     from tinker_server.backend.resource_pool import ActorType
-    import tinker_server.ray_utils as ray_utils
 
     _install_ray_stub(monkeypatch)
 
@@ -305,7 +294,6 @@ def test_kill_dense_actors_returns_503_when_pg_removal_fails(monkeypatch) -> Non
         ],
     )
     monkeypatch.setattr(service_routes, "async_kill_named_actor", _kill_ok)
-    monkeypatch.setattr(ray_utils, "init_ray", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(service_routes, "_remove_actor_pg", _raise_remove_pg)
     client = _build_client(monkeypatch, pool)
 
@@ -367,7 +355,6 @@ def test_kill_dense_actors_returns_503_when_pg_lookup_mismatches_namespace(monke
     from tinker_server.routes import service as service_routes
     import tinker_server.backend.ray_placement_groups as ray_placement_groups
     from tinker_server.backend.resource_pool import ActorType
-    import tinker_server.ray_utils as ray_utils
 
     _install_ray_stub(monkeypatch)
 
@@ -390,7 +377,6 @@ def test_kill_dense_actors_returns_503_when_pg_lookup_mismatches_namespace(monke
         ],
     )
     monkeypatch.setattr(service_routes, "async_kill_named_actor", _kill_ok)
-    monkeypatch.setattr(ray_utils, "init_ray", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(ray_placement_groups, "get_named_placement_group", _raise_lookup_mismatch)
     client = _build_client(monkeypatch, pool)
 

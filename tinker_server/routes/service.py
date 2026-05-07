@@ -32,7 +32,6 @@ from ..auth_identity import get_user_data as _request_user_data
 from ..auth_identity import get_user_id as _request_user_id
 from ..backend.async_ray_control import (
     _await_ray_ref,
-    async_ensure_ray_initialized,
     async_kill_named_actor,
     async_lookup_actor_handle,
     async_placement_group_table,
@@ -968,9 +967,6 @@ def _require_admin(request: Request) -> None:
 
 async def _augment_with_placement_groups(actors: list[dict]) -> None:
     try:
-        from ..config import RAY_NAMESPACE
-
-        await async_ensure_ray_initialized(namespace=RAY_NAMESPACE)
         # Offload PG inspection into a Ray task so we never block the API event loop
         # with synchronous control-plane calls.
         timeout_s = float(os.environ.get("MINT_ACTORS_PG_TABLE_TIMEOUT_S", "2.0"))
@@ -1305,7 +1301,6 @@ async def _kill_exact_dense_actor(*, actor_name: str) -> int:
 
 async def _kill_dense_actors(base_model: str | None) -> int:
     from ..backend.resource_pool import ActorType, get_resource_pool
-    from ..config import RAY_NAMESPACE
 
     pool = get_resource_pool()
     targets = [
@@ -1316,7 +1311,6 @@ async def _kill_dense_actors(base_model: str | None) -> int:
 
     killed = 0
 
-    await async_ensure_ray_initialized(namespace=RAY_NAMESPACE)
     for e in targets:
         await async_kill_named_actor(
             e.actor_name,

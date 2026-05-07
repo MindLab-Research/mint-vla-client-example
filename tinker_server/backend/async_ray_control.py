@@ -40,33 +40,10 @@ def _ensure_ray_initialized() -> None:
     if ray.is_initialized():
         return
 
-    # Do not attempt to init/reconnect Ray on HTTP request paths. Startup is
-    # responsible for initializing the Ray client; request paths should fail
-    # fast when Ray is unavailable.
+    # Do not attempt to init/reconnect Ray on HTTP request paths. Startup owns
+    # the Ray driver connection; request paths only surface invariant breakage
+    # or runtime disconnection.
     raise RuntimeError("Ray is not initialized")
-
-
-async def async_ensure_ray_initialized(
-    *,
-    namespace: str,
-    timeout_s: float = 15.0,
-    ignore_reinit_error: bool = True,
-) -> None:
-    import ray
-
-    if ray.is_initialized():
-        return
-
-    from ..ray_utils import init_ray
-
-    await asyncio.wait_for(
-        asyncio.to_thread(
-            init_ray,
-            namespace=namespace,
-            ignore_reinit_error=ignore_reinit_error,
-        ),
-        timeout=float(timeout_s),
-    )
 
 
 @lru_cache(maxsize=1)
