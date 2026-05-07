@@ -50,7 +50,7 @@ def _make_actor_impl(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_issue_529_default_new_id_add_waits_for_active_generate(monkeypatch):
+async def test_issue_529_default_new_id_add_does_not_wait_for_active_generate(monkeypatch):
     _install_fake_vllm(monkeypatch)
     monkeypatch.delenv("MINT_VLLM_SERIALIZE_ADD_LORA_UNTIL_IDLE", raising=False)
     monkeypatch.setattr(lora_utils, "validate_peft_adapter_checkpoint_shapes", lambda *_a, **_k: None)
@@ -71,19 +71,18 @@ async def test_issue_529_default_new_id_add_waits_for_active_generate(monkeypatc
         )
     )
 
-    await asyncio.sleep(0.05)
-    assert not actor.engine.add_started.is_set()
+    await asyncio.wait_for(actor.engine.add_started.wait(), timeout=1.0)
+    assert actor._active_generates == 1
 
     await actor._register_generate_end()
-    await asyncio.wait_for(actor.engine.add_started.wait(), timeout=1.0)
     await asyncio.wait_for(add_task, timeout=1.0)
     assert actor.engine.calls == [(7, "tenant-b")]
 
 
 @pytest.mark.anyio
-async def test_issue_529_env_disables_idle_gate_for_new_id_add(monkeypatch):
+async def test_issue_529_env_enables_idle_gate_for_new_id_add(monkeypatch):
     _install_fake_vllm(monkeypatch)
-    monkeypatch.setenv("MINT_VLLM_SERIALIZE_ADD_LORA_UNTIL_IDLE", "0")
+    monkeypatch.setenv("MINT_VLLM_SERIALIZE_ADD_LORA_UNTIL_IDLE", "1")
     monkeypatch.setattr(lora_utils, "validate_peft_adapter_checkpoint_shapes", lambda *_a, **_k: None)
 
     impl_cls = _make_actor_impl(monkeypatch)
@@ -102,9 +101,32 @@ async def test_issue_529_env_disables_idle_gate_for_new_id_add(monkeypatch):
         )
     )
 
-    await asyncio.wait_for(actor.engine.add_started.wait(), timeout=1.0)
-    assert actor._active_generates == 1
+    await asyncio.sleep(0.05)
+    assert not actor.engine.add_started.is_set()
 
     await actor._register_generate_end()
+    await asyncio.wait_for(actor.engine.add_started.wait(), timeout=1.0)
     await asyncio.wait_for(add_task, timeout=1.0)
     assert actor.engine.calls == [(8, "tenant-b")]
+
+
+def test_issue_529_request_timing_defaults_enabled(monkeypatch):
+    _install_fake_vllm(monkeypatch)
+    monkeypatch.delenv("MINT_VLLM_REQUEST_TIMING", raising=False)
+
+    impl_cls = _make_actor_impl(monkeypatch)
+    actor = object.__new__(impl_cls)
+    impl_cls.__init__(actor, model_path="fake-model", tensor_parallel_size=1)
+
+    assert actor._timing is True
+
+
+def test_issue_529_request_timing_env_can_disable(monkeypatch):
+    _install_fake_vllm(monkeypatch)
+    monkeypatch.setenv("MINT_VLLM_REQUEST_TIMING", "0")
+
+    impl_cls = _make_actor_impl(monkeypatch)
+    actor = object.__new__(impl_cls)
+    impl_cls.__init__(actor, model_path="fake-model", tensor_parallel_size=1)
+
+    assert actor._timing is False
