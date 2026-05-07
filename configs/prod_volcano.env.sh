@@ -12,7 +12,7 @@ export TINKER_CHECKPOINT_DIR=/tos-mindverse/tinker_checkpoints
 export TINKER_USAGE_LOG_DIR=/vePFS-Mindverse/share/mint-prod-data/billing
 export TINKER_USAGE_PG_TABLE=mint_platform.usage_event
 
-export MINT_SUPPORTED_MODELS="Qwen/Qwen3-0.6B,Qwen/Qwen3-4B-Instruct-2507,Qwen/Qwen3-4B-Thinking-2507,Qwen/Qwen3-30B-A3B-Instruct-2507,Qwen/Qwen3-235B-A22B-Instruct-2507,zai-org/GLM-5.1"
+export MINT_SUPPORTED_MODELS="Qwen/Qwen3-0.6B,Qwen/Qwen3-4B-Instruct-2507,Qwen/Qwen3-4B-Thinking-2507,Qwen/Qwen3-30B-A3B-Instruct-2507,Qwen/Qwen3-235B-A22B-Instruct-2507,zai-org/GLM-5.1,openpi/pi0-fast-libero-low-mem-finetune,openpi/pi05-libero-low-mem-finetune"
 export MINT_PERSISTENT_MODELS="Qwen/Qwen3-0.6B,Qwen/Qwen3-4B-Instruct-2507,Qwen/Qwen3-4B-Thinking-2507,Qwen/Qwen3-30B-A3B-Instruct-2507,Qwen/Qwen3-235B-A22B-Instruct-2507"
 export MINT_PERSISTENT_PREWARM_INFERENCE=1
 export MINT_PERSISTENT_PREWARM_TRAINING=1
@@ -29,14 +29,14 @@ export MINT_SAVE_LORA_TIMEOUT_S=1800
 export MINT_SCHEDULER_ENABLE=1
 
 # Current worker topology after 2026-04-10 head/worker rebuild:
-# worker1 dense + small vLLM: 192.168.39.146
-# worker2 30B vLLM + megatron: 192.168.39.52
-# worker3-4 235B vLLM: 192.168.39.51,192.168.39.54
-# worker5-8 235B megatron: 192.168.39.50,192.168.39.56,192.168.39.55,192.168.39.57
-export MINT_VLLM_PINNED_NODE_IP_JSON='{"Qwen/Qwen3-0.6B":"192.168.39.146","Qwen/Qwen3-4B-Instruct-2507":"192.168.39.146","Qwen/Qwen3-4B-Thinking-2507":"192.168.39.146","Qwen/Qwen3-30B-A3B-Instruct-2507":"192.168.39.52"}'
-export MINT_DENSE_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.39.146"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.39.146"],"Qwen/Qwen3-4B-Thinking-2507":["192.168.39.146"]}'
-export MINT_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.39.146"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.39.146"],"Qwen/Qwen3-4B-Thinking-2507":["192.168.39.146"],"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.39.52"]}'
-export MINT_VLLM_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.39.146"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.39.146"],"Qwen/Qwen3-4B-Thinking-2507":["192.168.39.146"],"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.39.52"],"Qwen/Qwen3-235B-A22B-Instruct-2507":["192.168.39.51","192.168.39.54"],"Qwen/Qwen3-235B-A22B-Thinking-2507":["192.168.39.51","192.168.39.54"]}'
+# worker1 dense + small vLLM: 192.168.39.178
+# worker2 30B megatron: 192.168.39.52
+# worker3 30B vLLM + 235B vLLM: 192.168.39.178
+# worker4-7 235B megatron: 192.168.39.50,192.168.39.56,192.168.39.55,192.168.39.57
+export MINT_VLLM_PINNED_NODE_IP_JSON='{"Qwen/Qwen3-0.6B":"192.168.39.178","Qwen/Qwen3-4B-Instruct-2507":"192.168.39.178","Qwen/Qwen3-4B-Thinking-2507":"192.168.39.178","Qwen/Qwen3-30B-A3B-Instruct-2507":"192.168.39.178"}'
+export MINT_DENSE_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.39.178"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.39.178"],"Qwen/Qwen3-4B-Thinking-2507":["192.168.39.178"]}'
+export MINT_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.39.178"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.39.178"],"Qwen/Qwen3-4B-Thinking-2507":["192.168.39.178"],"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.39.178"]}'
+export MINT_VLLM_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.39.178"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.39.178"],"Qwen/Qwen3-4B-Thinking-2507":["192.168.39.178"],"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.39.178"],"Qwen/Qwen3-235B-A22B-Instruct-2507":["192.168.39.51","192.168.39.54"],"Qwen/Qwen3-235B-A22B-Thinking-2507":["192.168.39.51","192.168.39.54"]}'
 export MINT_MEGATRON_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.39.52"],"Qwen/Qwen3-235B-A22B-Instruct-2507":["192.168.39.50","192.168.39.56","192.168.39.55","192.168.39.57"],"Qwen/Qwen3-235B-A22B-Thinking-2507":["192.168.39.50","192.168.39.56","192.168.39.55","192.168.39.57"]}'
 
 export MINT_MODEL_CONFIG_OVERRIDES_JSON=''
@@ -79,9 +79,8 @@ else
   return 1 2>/dev/null || exit 1
 fi
 
-# Bump detached control-plane actor names after production deploys that change
-# queue/runtime code or node-pin environment. Detached actors retain old imports
-# and environment until recreated.
+# Bump detached queue actor names after node-pin changes so long-lived queue workers
+# reload the current MINT_*_NODE_IPS_JSON values instead of reusing stale env.
 export MINT_API_WORK_QUEUE_ACTOR_NAME=tinker_api_work_queue_v20260425a
 export MINT_QUEUE_EXECUTION_RUNTIME_ACTOR_NAME=tinker_queue_execution_runtime_v20260425a
 export MINT_QUEUE_SUPERVISOR_ACTOR_NAME=tinker_queue_supervisor_v20260425a
