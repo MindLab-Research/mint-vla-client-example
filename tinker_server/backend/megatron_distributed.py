@@ -29,6 +29,7 @@ import ray
 # (tensordict imports torch internally)
 
 from . import ray_kill
+from .gpu_binding_helpers import gpu_bindings_from_ray_gpu_ids
 from ..logging_context import (
     get_current_traceparent,
     get_request_id,
@@ -900,20 +901,14 @@ class MegatronRankWorker:
     def get_observability_binding(self) -> dict[str, object]:
         import socket
 
-        gpu_indices: list[int] = []
-        try:
-            for gpu_id in ray.get_gpu_ids():
-                if isinstance(gpu_id, (int, float)):
-                    gpu_indices.append(int(gpu_id))
-                else:
-                    gpu_indices.append(int(float(str(gpu_id))))
-        except Exception:
-            gpu_indices = []
+        hostname = socket.gethostname()
         node_id = None
         try:
             node_id = str(ray.get_runtime_context().get_node_id())
         except Exception:
             node_id = None
+        gpu_bindings = gpu_bindings_from_ray_gpu_ids(hostname=hostname, node_id=node_id, rank=int(self.rank))
+        gpu_indices = [binding["gpu_index"] for binding in gpu_bindings if "gpu_index" in binding]
         mem: dict[str, int] = {}
         try:
             torch = _get_torch()
@@ -928,9 +923,10 @@ class MegatronRankWorker:
         except Exception:
             mem = {}
         return {
-            "hostname": socket.gethostname(),
+            "hostname": hostname,
             "node_id": node_id,
             "gpu_indices": gpu_indices,
+            "gpu_bindings": gpu_bindings,
             "rank": int(self.rank),
             **mem,
         }
@@ -9344,17 +9340,34 @@ class MegatronWorkerGroup:
                 if not isinstance(binding, dict):
                     continue
                 responded_workers += 1
-                gpu_indices = binding.get("gpu_indices")
-                if isinstance(gpu_indices, list):
-                    for gpu_index in gpu_indices:
-                        bindings.append(
-                            {
-                                "hostname": binding.get("hostname"),
-                                "node_id": binding.get("node_id"),
-                                "gpu_index": int(gpu_index),
-                                "rank": binding.get("rank"),
-                            }
-                        )
+                gpu_bindings = binding.get("gpu_bindings")
+                if isinstance(gpu_bindings, list):
+                    for gpu_binding in gpu_bindings:
+                        if not isinstance(gpu_binding, dict):
+                            continue
+                        out_binding = {
+                            "hostname": gpu_binding.get("hostname") or binding.get("hostname"),
+                            "node_id": gpu_binding.get("node_id") or binding.get("node_id"),
+                            "rank": gpu_binding.get("rank", binding.get("rank")),
+                        }
+                        if gpu_binding.get("gpu_index") is not None:
+                            out_binding["gpu_index"] = int(gpu_binding["gpu_index"])
+                        if gpu_binding.get("gpu_uuid"):
+                            out_binding["gpu_uuid"] = str(gpu_binding["gpu_uuid"])
+                        if "gpu_index" in out_binding or "gpu_uuid" in out_binding:
+                            bindings.append(out_binding)
+                else:
+                    gpu_indices = binding.get("gpu_indices")
+                    if isinstance(gpu_indices, list):
+                        for gpu_index in gpu_indices:
+                            bindings.append(
+                                {
+                                    "hostname": binding.get("hostname"),
+                                    "node_id": binding.get("node_id"),
+                                    "gpu_index": int(gpu_index),
+                                    "rank": binding.get("rank"),
+                                }
+                            )
                 for field_name, total_name in (
                     ("gpu_memory_allocated_bytes", "allocated"),
                     ("gpu_memory_reserved_bytes", "reserved"),

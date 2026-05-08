@@ -785,16 +785,22 @@ def actor_observability_metadata(actor_handle: ActorHandle | None, *, timeout_s:
             if not isinstance(binding, dict):
                 continue
             gpu_index = binding.get("gpu_index")
-            if gpu_index is None:
+            gpu_uuid = binding.get("gpu_uuid")
+            if gpu_index is None and not (isinstance(gpu_uuid, str) and gpu_uuid.strip()):
                 continue
-            clean_bindings.append(
-                {
-                    "hostname": binding.get("hostname"),
-                    "node_id": binding.get("node_id"),
-                    "gpu_index": int(gpu_index),
-                    "rank": binding.get("rank"),
-                }
-            )
+            clean_binding = {
+                "hostname": binding.get("hostname"),
+                "node_id": binding.get("node_id"),
+                "rank": binding.get("rank"),
+            }
+            ray_gpu_id = binding.get("ray_gpu_id")
+            if isinstance(ray_gpu_id, str) and ray_gpu_id.strip():
+                clean_binding["ray_gpu_id"] = ray_gpu_id.strip()
+            if gpu_index is not None:
+                clean_binding["gpu_index"] = int(gpu_index)
+            if isinstance(gpu_uuid, str) and gpu_uuid.strip():
+                clean_binding["gpu_uuid"] = gpu_uuid.strip()
+            clean_bindings.append(clean_binding)
         if clean_bindings:
             out["gpu_bindings"] = clean_bindings
     int_fields = {
