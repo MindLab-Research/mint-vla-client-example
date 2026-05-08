@@ -31,7 +31,7 @@ from ..auth_identity import can_manage_system_user_data
 from ..auth_identity import get_user_data as _request_user_data
 from ..auth_identity import get_user_id as _request_user_id
 from ..backend.async_ray_control import (
-    _await_ray_ref,
+    async_get_ray_ref,
     async_kill_named_actor,
     async_lookup_actor_handle,
     async_placement_group_table,
@@ -1251,7 +1251,7 @@ async def _kill_exact_megatron_actor(*, actor_name: str) -> int:
 
     try:
         try:
-            await asyncio.wait_for(_await_ray_ref(actor.shutdown.remote()), timeout=10.0)
+            await async_get_ray_ref(actor.shutdown.remote(), timeout_s=10.0)
         except Exception:
             pass
         await async_kill_named_actor(

@@ -13,6 +13,7 @@ from typing import Any
 from ..config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources, config as server_config, otel_env_vars
 from ..ray_utils import register_ray_reconnect_invalidator as _register_ray_reconnect_invalidator
 from ..server_info import _git_sha
+from .async_ray_control import _await_with_ray_get_timeout, sync_get_ray_ref
 
 logger = logging.getLogger(__name__)
 CURRENT_CODE_IDENTITY = os.environ.get("MINT_GIT_SHA") or _git_sha()
@@ -224,21 +225,7 @@ def _kill_named_actor(actor: Any) -> None:
 
 
 def _await_ray_ref_sync(ref: Any, *, timeout_s: float | None = None) -> Any:
-    if hasattr(ref, "__await__"):
-        coro = ref
-        if timeout_s is None:
-            return asyncio.run(coro)
-        return asyncio.run(asyncio.wait_for(coro, timeout=float(timeout_s)))
-    to_future = getattr(ref, "future", None)
-    if callable(to_future):
-        fut = to_future()
-        if isinstance(fut, concurrent.futures.Future):
-            return fut.result(timeout=timeout_s)
-        if isinstance(fut, asyncio.Future) or hasattr(fut, "__await__"):
-            if timeout_s is None:
-                return asyncio.run(fut)
-            return asyncio.run(asyncio.wait_for(fut, timeout=float(timeout_s)))
-    return ref
+    return sync_get_ray_ref(ref, timeout_s=timeout_s)
 
 
 async def _restore_sampling_sessions_for_worker(inference_manager) -> int:
@@ -585,7 +572,7 @@ class QueueExecutionRuntime:
         self._reset_cached_actor()
         await asyncio.to_thread(_kill_named_actor, actor)
         actor = self._get_ray_actor()
-        refreshed = await asyncio.wait_for(_await_ray_ref(actor.health_snapshot.remote()), timeout=15.0)
+        refreshed = await _await_with_ray_get_timeout(_await_ray_ref(actor.health_snapshot.remote()), timeout_s=15.0)
         if not isinstance(refreshed, dict) or not self._runtime_contract_matches(refreshed):
             raise RuntimeError(
                 "queue execution runtime contract mismatch after recreate: "
@@ -609,14 +596,14 @@ class QueueExecutionRuntime:
 
     async def async_ensure_started(self, *, num_workers: int, timeout_s: float = 120.0) -> dict[str, Any]:
         actor = self._get_ray_actor()
-        snapshot = await asyncio.wait_for(_await_ray_ref(actor.health_snapshot.remote()), timeout=15.0)
+        snapshot = await _await_with_ray_get_timeout(_await_ray_ref(actor.health_snapshot.remote()), timeout_s=15.0)
         if not isinstance(snapshot, dict):
             raise TypeError(f"QueueExecutionRuntime.health_snapshot returned non-dict: {type(snapshot)}")
         await self._ensure_runtime_contract_async(snapshot)
         actor = self._get_ray_actor()
-        out = await asyncio.wait_for(
+        out = await _await_with_ray_get_timeout(
             _await_ray_ref(actor.ensure_started.remote(num_workers=int(num_workers))),
-            timeout=float(timeout_s),
+            timeout_s=float(timeout_s),
         )
         if not isinstance(out, dict):
             raise TypeError(f"QueueExecutionRuntime.ensure_started returned non-dict: {type(out)}")
@@ -624,14 +611,14 @@ class QueueExecutionRuntime:
 
     async def async_get_tokenizer_info(self, *, model_id: str, timeout_s: float = 60.0) -> dict[str, Any]:
         actor = self._get_ray_actor()
-        snapshot = await asyncio.wait_for(_await_ray_ref(actor.health_snapshot.remote()), timeout=15.0)
+        snapshot = await _await_with_ray_get_timeout(_await_ray_ref(actor.health_snapshot.remote()), timeout_s=15.0)
         if not isinstance(snapshot, dict):
             raise TypeError(f"QueueExecutionRuntime.health_snapshot returned non-dict: {type(snapshot)}")
         await self._ensure_runtime_contract_async(snapshot)
         actor = self._get_ray_actor()
-        out = await asyncio.wait_for(
+        out = await _await_with_ray_get_timeout(
             _await_ray_ref(actor.get_tokenizer_info.remote(model_id=str(model_id))),
-            timeout=float(timeout_s),
+            timeout_s=float(timeout_s),
         )
         if not isinstance(out, dict):
             raise TypeError(f"QueueExecutionRuntime.get_tokenizer_info returned non-dict: {type(out)}")
@@ -639,12 +626,18 @@ class QueueExecutionRuntime:
 
     async def async_health_snapshot(self, *, timeout_s: float = 30.0) -> dict[str, Any]:
         actor = self._get_ray_actor()
-        out = await asyncio.wait_for(_await_ray_ref(actor.health_snapshot.remote()), timeout=float(timeout_s))
+        out = await _await_with_ray_get_timeout(
+            _await_ray_ref(actor.health_snapshot.remote()),
+            timeout_s=float(timeout_s),
+        )
         if not isinstance(out, dict):
             raise TypeError(f"QueueExecutionRuntime.health_snapshot returned non-dict: {type(out)}")
         await self._ensure_runtime_contract_async(out)
         actor = self._get_ray_actor()
-        out = await asyncio.wait_for(_await_ray_ref(actor.health_snapshot.remote()), timeout=float(timeout_s))
+        out = await _await_with_ray_get_timeout(
+            _await_ray_ref(actor.health_snapshot.remote()),
+            timeout_s=float(timeout_s),
+        )
         if not isinstance(out, dict):
             raise TypeError(f"QueueExecutionRuntime.health_snapshot returned non-dict: {type(out)}")
         return out

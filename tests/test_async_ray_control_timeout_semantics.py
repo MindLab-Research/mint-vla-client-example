@@ -44,3 +44,29 @@ def test_async_get_ray_ref_prefers_future_bridge_over_direct_await() -> None:
 
     assert asyncio.run(async_get_ray_ref(_DualRayRef(fut), timeout_s=1.0)) == "ok"
 
+
+def test_sync_get_ray_ref_timeout_does_not_cancel_ray_future() -> None:
+    import ray
+
+    from tinker_server.backend.async_ray_control import sync_get_ray_ref
+
+    fut: concurrent.futures.Future = concurrent.futures.Future()
+
+    with pytest.raises(ray.exceptions.GetTimeoutError):
+        sync_get_ray_ref(_FutureRayRef(fut), timeout_s=0.01)
+    assert not fut.cancelled()
+    assert not fut.done()
+    fut.set_result("late-ok")
+
+
+def test_sync_get_ray_ref_prefers_future_bridge_over_direct_await() -> None:
+    from tinker_server.backend.async_ray_control import sync_get_ray_ref
+
+    fut: concurrent.futures.Future = concurrent.futures.Future()
+    fut.set_result("ok")
+
+    class _DualRayRef(_FutureRayRef):
+        def __await__(self):
+            raise AssertionError("direct __await__ path should not be used")
+
+    assert sync_get_ray_ref(_DualRayRef(fut), timeout_s=1.0) == "ok"
