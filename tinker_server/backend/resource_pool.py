@@ -892,6 +892,10 @@ class ResourcePool:
         self.RSS_TTL_S = float(os.environ.get("MINT_RESOURCE_POOL_RSS_TTL_S", "60.0"))
         self.METADATA_TTL_S = float(os.environ.get("MINT_RESOURCE_POOL_OBSERVABILITY_TTL_S", "30.0"))
         self.METADATA_TIMEOUT_S = float(os.environ.get("MINT_RESOURCE_POOL_OBSERVABILITY_TIMEOUT_S", "1.0"))
+        self.METADATA_REFRESH_CONCURRENCY = max(
+            1,
+            int(os.environ.get("MINT_RESOURCE_POOL_OBSERVABILITY_REFRESH_CONCURRENCY", "8")),
+        )
         self._metadata_metrics_lock = threading.Lock()
         self._metadata_metrics: dict[str, dict[str, int]] = {}
         # Backward-compatible aliases used by observability tests.
@@ -1187,8 +1191,7 @@ class ResourcePool:
             entries = [entry for entry in entries if entry.base_model == model_name]
         now = time.time()
         if refresh_metadata:
-            for entry in entries:
-                await self._refresh_entry_metadata_async(entry, now=now, sample_source="list_actors")
+            await self._refresh_entries_metadata_async(entries, now=now, sample_source="list_actors")
         return [self._actor_inventory_record(entry, now=now) for entry in entries]
 
     def _actor_inventory_record(self, entry: ActorEntry, *, now: float) -> dict[str, Any]:
@@ -1330,6 +1333,32 @@ class ResourcePool:
             self._record_metadata_metric(entry.actor_type, "refresh_success_total")
             return
         self._record_metadata_metric(entry.actor_type, "refresh_failures_total")
+
+    async def _refresh_entries_metadata_async(
+        self,
+        entries: list[ActorEntry],
+        *,
+        now: float,
+        sample_source: str,
+    ) -> None:
+        concurrency = max(1, int(self.METADATA_REFRESH_CONCURRENCY))
+        if concurrency == 1 or len(entries) <= 1:
+            for entry in entries:
+                await self._refresh_entry_metadata_async(entry, now=now, sample_source=sample_source)
+            return
+
+        for start in range(0, len(entries), concurrency):
+            batch = entries[start : start + concurrency]
+            results = await asyncio.gather(
+                *(
+                    self._refresh_entry_metadata_async(entry, now=now, sample_source=sample_source)
+                    for entry in batch
+                ),
+                return_exceptions=True,
+            )
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
 
     def _cached_snapshot_record(self, entry: ActorEntry, *, now: float) -> dict[str, Any]:
         rec: dict[str, Any] = {

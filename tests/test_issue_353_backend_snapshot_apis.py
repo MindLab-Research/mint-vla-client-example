@@ -730,6 +730,57 @@ def test_resource_pool_async_list_actors_can_refresh_vllm_observability(monkeypa
         pool.clear(kill_actors=False)
 
 
+def test_resource_pool_async_list_actors_refreshes_metadata_with_bounded_parallelism(monkeypatch) -> None:
+    monkeypatch.setattr(resource_pool_mod, "_detached_enabled", lambda: False)
+    pool = get_resource_pool()
+    pool.clear(kill_actors=False)
+    old_ttl = pool.METADATA_TTL_S
+    old_concurrency = pool.METADATA_REFRESH_CONCURRENCY
+    active = 0
+    max_active = 0
+
+    class _Handle:
+        def __init__(self, value: int) -> None:
+            self.value = value
+
+    async def _stub_observability(handle, *, timeout_s=5.0):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        try:
+            await asyncio.sleep(0.01)
+            return {"scheduler_waiting_requests": handle.value}
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(resource_pool_mod, "async_actor_observability_metadata", _stub_observability)
+
+    try:
+        pool.METADATA_TTL_S = 30.0
+        pool.METADATA_REFRESH_CONCURRENCY = 2
+        for idx in range(4):
+            name = f"actor-vllm-{idx}"
+            pool.register(name, ActorType.VLLM, 1, actor_handle=_Handle(idx), base_model="m")
+            with pool._pool_lock:
+                entry = pool._entries[name]
+                entry.metadata = {"scheduler_waiting_requests": -1}
+                entry.metadata_sample_time = time.time() - 120.0
+                entry.metadata_sample_source = "stale"
+
+        records = {item["actor_name"]: item for item in asyncio.run(pool.async_list_actors(refresh_metadata=True))}
+
+        assert max_active == 2
+        for idx in range(4):
+            rec = records[f"actor-vllm-{idx}"]
+            assert rec["metadata"]["scheduler_waiting_requests"] == idx
+            assert rec["metadata_sample_source"] == "list_actors"
+            assert rec["metadata_cache_state"] == "fresh"
+    finally:
+        pool.METADATA_TTL_S = old_ttl
+        pool.METADATA_REFRESH_CONCURRENCY = old_concurrency
+        pool.clear(kill_actors=False)
+
+
 def test_resource_pool_async_list_actors_refreshes_detached_inventory(monkeypatch) -> None:
     monkeypatch.setattr(resource_pool_mod, "_detached_enabled", lambda: True)
     monkeypatch.setattr(resource_pool_mod.ResourcePool, "_instance", None)
