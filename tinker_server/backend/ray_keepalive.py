@@ -8,7 +8,7 @@ from typing import Any
 import ray
 
 from ..config import config as server_config
-from .async_ray_control import _await_ray_ref
+from .async_ray_control import _ray_ref_to_future, _silence_late_result
 from .resource_pool import get_resource_pool
 
 logger = logging.getLogger(__name__)
@@ -45,7 +45,7 @@ async def ray_get_with_resource_pool_keepalive(
     tag = f"req={request_id} " if request_id else ""
 
     pool.mark_inflight(actor_name, +1)
-    ref_task = asyncio.create_task(_await_ray_ref(ref))
+    ref_future = _ray_ref_to_future(ref)
     try:
         iteration = 0
         while True:
@@ -59,7 +59,7 @@ async def ray_get_with_resource_pool_keepalive(
                 wait_s = min(wait_s, remaining)
 
             try:
-                result = await asyncio.wait_for(asyncio.shield(ref_task), timeout=wait_s)
+                result = await asyncio.wait_for(asyncio.shield(ref_future), timeout=wait_s)
                 elapsed = time.time() - start
                 if elapsed > 60.0:
                     logger.info(
@@ -78,6 +78,6 @@ async def ray_get_with_resource_pool_keepalive(
                     )
                 continue
     finally:
-        if not ref_task.done():
-            ref_task.cancel()
+        if not ref_future.done():
+            _silence_late_result(ref_future)
         pool.mark_inflight(actor_name, -1)

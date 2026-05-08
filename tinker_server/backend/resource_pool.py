@@ -27,6 +27,7 @@ import ray
 from ..config import config as server_config, otel_env_vars
 from ..ray_utils import register_ray_reconnect_invalidator as _register_ray_reconnect_invalidator
 from . import ray_kill
+from .async_ray_control import async_get_ray_ref
 
 logger = logging.getLogger(__name__)
 ActorHandle = Any
@@ -854,7 +855,7 @@ async def async_actor_observability_metadata(
     if not callable(getter):
         return None
     try:
-        payload = await asyncio.wait_for(_await_ray_ref(getter.remote()), timeout=float(timeout_s))
+        payload = await async_get_ray_ref(getter.remote(), timeout_s=float(timeout_s))
     except Exception as e:
         logger.debug("[ResourcePool] async get_observability_binding failed: %s", e)
         return None

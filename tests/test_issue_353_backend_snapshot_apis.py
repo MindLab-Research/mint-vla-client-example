@@ -63,8 +63,9 @@ def test_async_actor_observability_metadata_preserves_recent_latency_and_gpu_fie
     class _Handle:
         get_observability_binding = _Getter()
 
-    async def _await_ray_ref(ref):
+    async def _async_get_ray_ref(ref, *, timeout_s=None):
         assert ref == "binding-ref"
+        assert timeout_s == 0.5
         return {
             "hostname": "host-a",
             "node_id": "node-a",
@@ -77,7 +78,7 @@ def test_async_actor_observability_metadata_preserves_recent_latency_and_gpu_fie
             "gpu_memory_fragmentation_bytes": 4000000000,
         }
 
-    monkeypatch.setattr(resource_pool_mod, "_await_ray_ref", _await_ray_ref)
+    monkeypatch.setattr(resource_pool_mod, "async_get_ray_ref", _async_get_ray_ref)
 
     out = asyncio.run(resource_pool_mod.async_actor_observability_metadata(_Handle(), timeout_s=0.5))
 

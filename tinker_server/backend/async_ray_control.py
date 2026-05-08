@@ -6,28 +6,57 @@ from functools import lru_cache
 from typing import Any
 
 
-async def _await_ray_ref(ref: Any) -> Any:
-    if hasattr(ref, "__await__"):
-        return await ref
+def _discard_late_result(fut: asyncio.Future) -> None:
+    try:
+        fut.result()
+    except BaseException:
+        pass
 
+
+def _silence_late_result(fut: asyncio.Future) -> None:
+    if fut.done():
+        _discard_late_result(fut)
+        return
+    fut.add_done_callback(_discard_late_result)
+
+
+def _ray_ref_to_future(ref: Any) -> asyncio.Future:
     to_future = getattr(ref, "future", None)
     if callable(to_future):
         fut = to_future()
         if isinstance(fut, asyncio.Future):
-            return await fut
+            return fut
         if isinstance(fut, concurrent.futures.Future):
-            return await asyncio.wrap_future(fut)
+            return asyncio.wrap_future(fut)
         if hasattr(fut, "__await__"):
-            return await fut
+            return asyncio.ensure_future(fut)
+
+    if hasattr(ref, "__await__"):
+        return asyncio.ensure_future(ref)
 
     raise TypeError(f"Ray ref is not awaitable: {type(ref)}")
+
+
+async def _await_ray_ref(ref: Any) -> Any:
+    return await _ray_ref_to_future(ref)
+
+
+async def _await_ray_ref_with_timeout(ref: Any, *, timeout_s: float) -> Any:
+    fut = _ray_ref_to_future(ref)
+    try:
+        return await asyncio.wait_for(asyncio.shield(fut), timeout=float(timeout_s))
+    except asyncio.TimeoutError:
+        # Match ray.get(ref, timeout=...): timing out the wait must not cancel
+        # the local Ray future or imply cancellation of the remote work.
+        _silence_late_result(fut)
+        raise
 
 
 async def async_get_ray_ref(ref: Any, *, timeout_s: float | None = None) -> Any:
     if timeout_s is None:
         return await _await_ray_ref(ref)
     try:
-        return await asyncio.wait_for(_await_ray_ref(ref), timeout=float(timeout_s))
+        return await _await_ray_ref_with_timeout(ref, timeout_s=float(timeout_s))
     except asyncio.TimeoutError as exc:
         import ray
 
@@ -184,13 +213,13 @@ def _placement_group_table_remote():
 async def async_pending_gpu_pg_observation(*, timeout_s: float) -> dict[str, Any] | None:
     _ensure_ray_initialized()
     ref = _pending_gpu_pg_observation_remote().remote()
-    return await asyncio.wait_for(_await_ray_ref(ref), timeout=float(timeout_s))
+    return await _await_ray_ref_with_timeout(ref, timeout_s=float(timeout_s))
 
 
 async def async_placement_group_table(*, timeout_s: float = 5.0) -> dict[str, Any]:
     _ensure_ray_initialized()
     ref = _placement_group_table_remote().remote()
-    out = await asyncio.wait_for(_await_ray_ref(ref), timeout=float(timeout_s))
+    out = await _await_ray_ref_with_timeout(ref, timeout_s=float(timeout_s))
     if not isinstance(out, dict):
         raise TypeError(f"placement_group_table returned non-dict: {type(out)}")
     return out
@@ -199,7 +228,7 @@ async def async_placement_group_table(*, timeout_s: float = 5.0) -> dict[str, An
 async def async_lookup_actor_handle(actor_name: str, namespace: str, *, timeout_s: float = 15.0):
     _ensure_ray_initialized()
     ref = _lookup_actor_handle_remote().remote(str(actor_name), str(namespace))
-    return await asyncio.wait_for(_await_ray_ref(ref), timeout=float(timeout_s))
+    return await _await_ray_ref_with_timeout(ref, timeout_s=float(timeout_s))
 
 
 async def async_kill_named_actor(
@@ -221,4 +250,4 @@ async def async_kill_named_actor(
         str(reason),
         bool(verify_absent),
     )
-    return bool(await asyncio.wait_for(_await_ray_ref(ref), timeout=float(timeout_s)))
+    return bool(await _await_ray_ref_with_timeout(ref, timeout_s=float(timeout_s)))

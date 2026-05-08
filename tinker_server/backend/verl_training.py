@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any, cast
 import ray
 
 from . import ray_kill
-from .async_ray_control import _await_ray_ref, async_get_ray_ref
+from .async_ray_control import _ray_ref_to_future, _silence_late_result, async_get_ray_ref
 from ..logging_context import (
     classify_failure_reason,
     get_current_traceparent,
@@ -3399,11 +3399,11 @@ class VerlTrainingEngine:
     ):
         """Await a Ray call while periodically touching ResourcePool.
 
-        Uses one Ray ObjectRef await task so polling-slice timeouts do not
-        cancel or restart the underlying Ray wait.
+        Uses one Ray ObjectRef future so polling-slice timeouts do not cancel
+        or restart the underlying Ray wait.
         """
         start = time.time()
-        ref_task = asyncio.create_task(_await_ray_ref(awaitable))
+        ref_future = _ray_ref_to_future(awaitable)
         try:
             while True:
                 self._touch_actor(session)
@@ -3417,12 +3417,12 @@ class VerlTrainingEngine:
                     wait_s = min(wait_s, remaining)
 
                 try:
-                    return await asyncio.wait_for(asyncio.shield(ref_task), timeout=wait_s)
+                    return await asyncio.wait_for(asyncio.shield(ref_future), timeout=wait_s)
                 except asyncio.TimeoutError:
                     continue
         finally:
-            if not ref_task.done():
-                ref_task.cancel()
+            if not ref_future.done():
+                _silence_late_result(ref_future)
 
     def _resolve_hf_model_path(self, hf_model_id: str) -> str | None:
         """Resolve HuggingFace model ID to local cache path.
