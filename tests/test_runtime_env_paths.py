@@ -986,6 +986,37 @@ def test_actor_runtime_env_vars_forwards_control_plane_pin_envs(tmp_path):
     assert data["MINT_STARTUP_LEASE_PINNED_NODE_IP"] == "192.168.38.176"
 
 
+def test_actor_runtime_env_vars_forwards_vllm_envs(tmp_path):
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env(env_root)
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json; "
+                "from tinker_server.config import actor_runtime_env_vars; "
+                "print(json.dumps(actor_runtime_env_vars(pythonpath='X')))"
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            "PFS_RUNTIME_ENV_ROOT": str(env_root),
+            "PFS_TINKER_PATH": str(tmp_path / 'repo'),
+            "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
+            "RAY_ADDRESS": "ray://cfg-test",
+            "MINT_VLLM_SERIALIZE_ADD_LORA_UNTIL_IDLE": "1",
+            "MINT_VLLM_REQUEST_TIMING": "0",
+        },
+    )
+    data = json.loads(out.stdout)
+    assert data["MINT_VLLM_SERIALIZE_ADD_LORA_UNTIL_IDLE"] == "1"
+    assert data["MINT_VLLM_REQUEST_TIMING"] == "0"
+
+
 def test_actor_runtime_env_vars_forwards_config_path(tmp_path):
     env_root = tmp_path / "runtime"
     _materialize_runtime_env(env_root)

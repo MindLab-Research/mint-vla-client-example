@@ -21,13 +21,14 @@ import math
 import logging
 import shutil
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import ray
 
 from tinker_server.backend.model_registry import get_model_config
-from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, otel_env_vars
+from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
 from tinker_server.config import config as server_config
 from tinker_server.logging_context import (
     get_current_traceparent,
@@ -55,6 +56,13 @@ if TYPE_CHECKING:
     from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
 
 logger = logging.getLogger(__name__)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "y", "on")
 
 
 def _strip_empty_targets(value: object) -> object:
@@ -720,13 +728,15 @@ def _create_extended_server_class(
             # Track local paths for multi-LoRA (needed for GPU/CPU swap)
             self._lora_paths: dict[int, str] = {}
             self._owned_lora_paths: set[int] = set()
-            self._timing = os.environ.get("MINT_VLLM_REQUEST_TIMING", "1").strip().lower() in (
-                "1",
-                "true",
-                "yes",
-                "y",
-                "on",
+            self._timing = _env_flag("MINT_VLLM_REQUEST_TIMING", default=True)
+            # Keep single-node and multinode vLLM add_lora gating on the same env.
+            # The default allows new adapter loads without draining active generation first.
+            self._serialize_add_lora_until_idle = _env_flag(
+                "MINT_VLLM_SERIALIZE_ADD_LORA_UNTIL_IDLE", default=False
             )
+            self._gate_lock = asyncio.Lock()
+            self._active_generates = 0
+            self._active_generates_cond = asyncio.Condition()
             self._enable_rollout_routing_replay = bool(
                 getattr(self.config, "enable_rollout_routing_replay", False)
             )
@@ -742,6 +752,50 @@ def _create_extended_server_class(
         def _bind_traceparent(self, traceparent: str | None) -> None:
             if isinstance(traceparent, str) and traceparent:
                 restore_trace_id_from_traceparent(traceparent)
+
+        async def _register_generate_start(self) -> None:
+            async with self._gate_lock:
+                async with self._active_generates_cond:
+                    self._active_generates += 1
+
+        async def _register_generate_end(self) -> None:
+            async with self._active_generates_cond:
+                self._active_generates -= 1
+                if self._active_generates == 0:
+                    self._active_generates_cond.notify_all()
+
+        @asynccontextmanager
+        async def _exclusive_engine_op(self):
+            async with self._gate_lock:
+                async with self._active_generates_cond:
+                    while self._active_generates > 0:
+                        await self._active_generates_cond.wait()
+                yield
+
+        @asynccontextmanager
+        async def _maybe_add_lora_idle_gate(self):
+            if self._serialize_add_lora_until_idle:
+                async with self._exclusive_engine_op():
+                    yield
+                return
+            yield
+
+        async def _tracked_engine_generate(self, **kwargs):
+            await self._register_generate_start()
+            try:
+                generator = self.engine.generate(**kwargs)
+            except Exception:
+                await self._register_generate_end()
+                raise
+
+            async def _wrapped():
+                try:
+                    async for output in generator:
+                        yield output
+                finally:
+                    await self._register_generate_end()
+
+            return _wrapped()
 
         def _release_tracked_lora_path(self, lora_int_id: int) -> None:
             path = self._lora_paths.pop(lora_int_id, None)
@@ -924,20 +978,21 @@ def _create_extended_server_class(
             from .lora_utils import maybe_validate_peft_adapter_checkpoint_shapes
 
             # Remove existing LoRA first if present
-            try:
-                loaded = await self.engine.list_loras()
-                if VLLM_LORA_INT_ID in loaded:
-                    await self.engine.remove_lora(VLLM_LORA_INT_ID)
-            except Exception:
-                pass  # May not have any LoRA loaded
+            async with self._maybe_add_lora_idle_gate():
+                try:
+                    loaded = await self.engine.list_loras()
+                    if VLLM_LORA_INT_ID in loaded:
+                        await self.engine.remove_lora(VLLM_LORA_INT_ID)
+                except Exception:
+                    pass  # May not have any LoRA loaded
 
-            # Add new LoRA
-            maybe_validate_peft_adapter_checkpoint_shapes(
-                getattr(lora_request, "lora_path", None),
-                self.model_config.local_path,
-            )
-            await self._maybe_ensure_pack_moe_patched_for_adapter_dir(getattr(lora_request, "lora_path", None))
-            await self.engine.add_lora(lora_request)
+                # Add new LoRA
+                maybe_validate_peft_adapter_checkpoint_shapes(
+                    getattr(lora_request, "lora_path", None),
+                    self.model_config.local_path,
+                )
+                await self._maybe_ensure_pack_moe_patched_for_adapter_dir(getattr(lora_request, "lora_path", None))
+                await self.engine.add_lora(lora_request)
 
         async def add_lora_from_tensors(
             self,
@@ -987,21 +1042,21 @@ def _create_extended_server_class(
                 lora_path=adapter_path,
             )
 
-            # Remove existing and add new
             try:
-                loaded = await self.engine.list_loras()
-                if VLLM_LORA_INT_ID in loaded:
-                    await self.engine.remove_lora(VLLM_LORA_INT_ID)
-                    self._release_tracked_lora_path(VLLM_LORA_INT_ID)
-            except Exception:
-                pass
+                async with self._maybe_add_lora_idle_gate():
+                    try:
+                        loaded = await self.engine.list_loras()
+                        if VLLM_LORA_INT_ID in loaded:
+                            await self.engine.remove_lora(VLLM_LORA_INT_ID)
+                            self._release_tracked_lora_path(VLLM_LORA_INT_ID)
+                    except Exception:
+                        pass
 
-            try:
-                await self._maybe_ensure_pack_moe_patched_for_state_dict(
-                    state_dict,
-                    base_model_name_or_path=peft_config.get("base_model_name_or_path"),
-                )
-                await self.engine.add_lora(lora_request)
+                    await self._maybe_ensure_pack_moe_patched_for_state_dict(
+                        state_dict,
+                        base_model_name_or_path=peft_config.get("base_model_name_or_path"),
+                    )
+                    await self.engine.add_lora(lora_request)
             except Exception:
                 shutil.rmtree(adapter_path, ignore_errors=True)
                 raise
@@ -1094,15 +1149,16 @@ def _create_extended_server_class(
             try:
                 from .lora_utils import maybe_validate_peft_adapter_checkpoint_shapes
 
-                maybe_validate_peft_adapter_checkpoint_shapes(
-                    adapter_path,
-                    self.model_config.local_path,
-                )
-                await self._maybe_ensure_pack_moe_patched_for_state_dict(
-                    state_dict,
-                    base_model_name_or_path=peft_config.get("base_model_name_or_path"),
-                )
-                await self.engine.add_lora(lora_request)
+                async with self._maybe_add_lora_idle_gate():
+                    maybe_validate_peft_adapter_checkpoint_shapes(
+                        adapter_path,
+                        self.model_config.local_path,
+                    )
+                    await self._maybe_ensure_pack_moe_patched_for_state_dict(
+                        state_dict,
+                        base_model_name_or_path=peft_config.get("base_model_name_or_path"),
+                    )
+                    await self.engine.add_lora(lora_request)
             except Exception:
                 shutil.rmtree(adapter_path, ignore_errors=True)
                 raise
@@ -1156,22 +1212,23 @@ def _create_extended_server_class(
                 lora_path=lora_path,
             )
 
-            deadline = time.time() + float(os.environ.get("MINT_VLLM_ENGINE_READY_WAIT_S", "30"))
-            engine_ready = False
-            while time.time() < deadline:
-                if await self.is_engine_ready():
-                    engine_ready = True
-                    break
-                await asyncio.sleep(0.1)
-            if not engine_ready:
-                raise RuntimeError("vLLM engine not ready before add_lora_from_path")
+            async with self._maybe_add_lora_idle_gate():
+                deadline = time.time() + float(os.environ.get("MINT_VLLM_ENGINE_READY_WAIT_S", "30"))
+                engine_ready = False
+                while time.time() < deadline:
+                    if await self.is_engine_ready():
+                        engine_ready = True
+                        break
+                    await asyncio.sleep(0.1)
+                if not engine_ready:
+                    raise RuntimeError("vLLM engine not ready before add_lora_from_path")
 
-            maybe_validate_peft_adapter_checkpoint_shapes(
-                lora_path,
-                self.model_config.local_path,
-            )
-            await self._maybe_ensure_pack_moe_patched_for_adapter_dir(lora_path)
-            await self.engine.add_lora(lora_request)
+                maybe_validate_peft_adapter_checkpoint_shapes(
+                    lora_path,
+                    self.model_config.local_path,
+                )
+                await self._maybe_ensure_pack_moe_patched_for_adapter_dir(lora_path)
+                await self.engine.add_lora(lora_request)
 
             self._release_tracked_lora_path(lora_int_id)
             # Track path for generate_with_lora (needed for GPU/CPU swap)
@@ -1271,7 +1328,7 @@ def _create_extended_server_class(
                 "[vLLM actor] generate_with_lora ENTER req=%s prompt_len=%d max_tokens=%d effective_max=%d n=%d lora_id=%d",
                 request_id, len(prompt_ids), max_tokens, effective_max_tokens, effective_n, lora_int_id,
             )
-            generator = self.engine.generate(
+            generator = await self._tracked_engine_generate(
                 prompt=prompt,
                 sampling_params=sampling_params,
                 request_id=request_id,
@@ -1536,7 +1593,7 @@ def _create_extended_server_class(
                 "[vLLM actor] generate_base ENTER req=%s prompt_len=%d max_tokens=%d effective_max=%d n=%d",
                 request_id, len(prompt_ids), max_tokens, effective_max_tokens, effective_n,
             )
-            generator = self.engine.generate(
+            generator = await self._tracked_engine_generate(
                 prompt=prompt,
                 sampling_params=sampling_params,
                 request_id=request_id,
@@ -1787,7 +1844,7 @@ def _create_extended_server_class(
                         lora_path=VLLM_LORA_PATH,
                     )
 
-            generator = self.engine.generate(
+            generator = await self._tracked_engine_generate(
                 prompt=prompt,
                 sampling_params=sampling_params,
                 request_id=request_id,
@@ -1879,7 +1936,7 @@ def _create_extended_server_class(
                         lora_path=VLLM_LORA_PATH,
                     )
 
-            generator = self.engine.generate(
+            generator = await self._tracked_engine_generate(
                 prompt=prompt,
                 sampling_params=sampling_params,
                 request_id=request_id,
@@ -1967,7 +2024,7 @@ def _create_extended_server_class(
                     lora_path=lora_path,
                 )
 
-            generator = self.engine.generate(
+            generator = await self._tracked_engine_generate(
                 prompt=prompt,
                 sampling_params=sampling_params,
                 request_id=request_id,
@@ -2055,7 +2112,7 @@ def _create_extended_server_class(
                 lora_path=lora_path,
             )
 
-            generator = self.engine.generate(
+            generator = await self._tracked_engine_generate(
                 prompt=prompt,
                 sampling_params=sampling_params,
                 request_id=request_id,
@@ -2150,7 +2207,7 @@ def _create_extended_server_class(
                 lora_path=lora_path,
             )
 
-            generator = self.engine.generate(
+            generator = await self._tracked_engine_generate(
                 prompt=prompt,
                 sampling_params=sampling_params,
                 request_id=request_id,
@@ -2221,7 +2278,7 @@ def _create_extended_server_class(
             prompt = TokensPrompt(prompt_token_ids=prompt_ids)
 
             # Generate WITHOUT LoRA request (base model)
-            generator = self.engine.generate(
+            generator = await self._tracked_engine_generate(
                 prompt=prompt,
                 sampling_params=sampling_params,
                 request_id=request_id,
@@ -2299,7 +2356,7 @@ def _create_extended_server_class(
             prompt = TokensPrompt(prompt_token_ids=prompt_ids)
 
             # Generate WITHOUT LoRA request (base model)
-            generator = self.engine.generate(
+            generator = await self._tracked_engine_generate(
                 prompt=prompt,
                 sampling_params=sampling_params,
                 request_id=request_id,
@@ -2504,7 +2561,7 @@ with open(result_file, "w") as f:
             
             prompt = TokensPrompt(prompt_token_ids=prompt_ids)
             
-            generator = self.engine.generate(
+            generator = await self._tracked_engine_generate(
                 prompt=prompt,
                 sampling_params=sampling_params,
                 request_id=request_id,
@@ -2643,7 +2700,6 @@ class VerlInferenceEngine:
             otel_env_vars,
             preferred_vllm_python_executable,
         )
-        from dataclasses import asdict
 
         from verl.workers.config import CheckpointEngineConfig, HFModelConfig, RolloutConfig
         from verl.workers.rollout.replica import RolloutMode
