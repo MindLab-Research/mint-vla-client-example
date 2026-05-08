@@ -4,15 +4,18 @@ from types import SimpleNamespace
 
 import pytest
 
-future_store_module = importlib.import_module("tinker_server.backend.future_store")
 from tinker_server.backend import session_heartbeat_store as heartbeat_store_module
 from tinker_server.backend import training_session_store as training_store_module
 from tinker_server.routes import training as training_routes
+
+future_store_module = importlib.import_module("tinker_server.backend.future_store")
 
 
 @pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"
+
+
 class _StubTrainingStoreActor:
     def __init__(self):
         self.bump_calls = []
@@ -79,6 +82,9 @@ class _StubTrainingEngine:
         self._workers.pop(session.model_id, None)
         self._resource_pool_actor_names.pop(session.model_id, None)
         session.is_active = False
+
+    async def shutdown_session(self, session):
+        await self.delete_session(session)
 
 
 class _StubRemoteDelete:
@@ -266,7 +272,6 @@ async def test_issue_368_cleanup_skips_shared_actor_shutdown_after_restore(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     stale = _StubSession("model-stale", "sess-stale")
-    live = _StubSession("model-live", "sess-live")
     shared_worker = _StubSharedWorker()
     manager = _StubTrainingManager({})
     engine = _StubTrainingEngine()
@@ -298,8 +303,13 @@ async def test_issue_368_cleanup_skips_shared_actor_shutdown_after_restore(
     async def _restore_training_session(_model_id: str):
         return stale
 
+    async def _async_get_ray_ref(value, timeout_s=None):
+        _ = timeout_s
+        return value
+
     monkeypatch.setattr(training_routes, "_restore_training_session", _restore_training_session)
     monkeypatch.setitem(sys.modules, "ray", SimpleNamespace(get=lambda value, timeout=None: value))
+    monkeypatch.setattr(training_routes, "async_get_ray_ref", _async_get_ray_ref)
     monkeypatch.setattr(
         "tinker_server.backend.resource_pool.get_resource_pool",
         lambda: SimpleNamespace(clear_session=lambda model_id: None),

@@ -1391,7 +1391,7 @@ class FutureStore:
         except Exception:
             pass
     async def async_fail_training_requests_for_model(self, model_id: str, error: str) -> list[str]:
-        actor = await self._get_ray_actor_async()
+        actor = self._get_cached_ray_actor_for_async_request_path()
         import ray
 
         try:

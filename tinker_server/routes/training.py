@@ -645,9 +645,9 @@ async def _best_effort_delete_training_session(
         return False
 
     try:
-        fail_pending = getattr(future_store, "fail_training_requests_for_model", None)
+        fail_pending = getattr(future_store, "async_fail_training_requests_for_model", None)
         if callable(fail_pending):
-            failed_request_ids = fail_pending(
+            failed_request_ids = await fail_pending(
                 model_id,
                 f"Training session terminated due to {reason}",
             )
@@ -1427,6 +1427,8 @@ def _validate_lora_rank_or_400(lora_config: LoRAConfig | None) -> None:
             status_code=400,
             detail=f"Requested LoRA rank {requested_rank} exceeds server max_lora_rank={max_rank}",
         )
+
+
 def _build_training_scheduler_extra(
     *,
     session: Any,
@@ -1470,6 +1472,40 @@ def _build_training_scheduler_extra(
         except Exception:
             extra["seq_id"] = None
     return extra
+
+
+def _build_training_queued_meta(
+    *,
+    op: str,
+    model_id: str,
+    session: Any | None = None,
+    seq_id: int | None = None,
+) -> dict[str, Any]:
+    op_name = str(op)
+    if not op_name.startswith("training."):
+        op_name = f"training.{op_name}"
+    meta: dict[str, Any] = {
+        "op": op_name,
+        "model_id": str(model_id),
+        "queue_state": "queued",
+        "stage": "queued",
+        "queued_at": time.time(),
+    }
+    if session is not None:
+        meta["session_id"] = str(_field(session, "session_id", "") or model_id)
+        base_model = str(_field(session, "base_model", "") or "")
+        if base_model:
+            meta["base_model"] = base_model
+        backend = str(_field(session, "backend", "") or "")
+        if backend:
+            meta["backend"] = backend
+    if seq_id is not None:
+        try:
+            meta["seq_id"] = int(seq_id)
+        except Exception:
+            meta["seq_id"] = seq_id
+    return meta
+
 
 def _build_create_scheduler_extra(
     *,
@@ -1586,7 +1622,10 @@ async def _enqueue_internal_serialized_model_op(
             inflight_marked = True
         await future_store.async_create_with_id(request_id)
         created = True
-        await future_store.async_mark_queued(request_id, meta={"op": op, "model_id": model_id})
+        await future_store.async_mark_queued(
+            request_id,
+            meta=_build_training_queued_meta(op=op, model_id=model_id),
+        )
         await api_work_queue.enqueue(
             request_id=request_id,
             op=op,
@@ -1728,7 +1767,10 @@ async def create_model(
     try:
         await future_store.async_create_with_id(request_id)
         created = True
-        await future_store.async_mark_queued(request_id, meta={"op": "training.create_model", "model_id": model_id})
+        await future_store.async_mark_queued(
+            request_id,
+            meta=_build_training_queued_meta(op="create_model", model_id=model_id),
+        )
         await _enqueue_training_request_with_trace(
             route_start_s=route_start_s,
             request_id=request_id,
@@ -2148,7 +2190,7 @@ async def create_model_from_state(
         created = True
         await future_store.async_mark_queued(
             request_id,
-            meta={"op": "training.create_model_from_state", "model_id": model_id},
+            meta=_build_training_queued_meta(op="create_model_from_state", model_id=model_id),
         )
         await _enqueue_training_request_with_trace(
             route_start_s=route_start_s,
@@ -2471,7 +2513,12 @@ async def forward_backward(
         created = True
         await future_store.async_mark_queued(
             request_id,
-            meta={"op": "training.forward_backward", "model_id": request.model_id},
+            meta=_build_training_queued_meta(
+                op="forward_backward",
+                model_id=request.model_id,
+                session=route_session_info,
+                seq_id=request.seq_id,
+            ),
         )
         await _enqueue_training_request_with_trace(
             route_start_s=route_start_s,
@@ -2721,7 +2768,15 @@ async def train_step(
             scheduler_extra["gateway_auth"] = gateway_auth.__dict__
         await future_store.async_create_with_id(request_id)
         created = True
-        await future_store.async_mark_queued(request_id, meta={"op": "training.train_step", "model_id": request.model_id})
+        await future_store.async_mark_queued(
+            request_id,
+            meta=_build_training_queued_meta(
+                op="train_step",
+                model_id=request.model_id,
+                session=route_session_info,
+                seq_id=request.seq_id,
+            ),
+        )
         await _enqueue_training_request_with_trace(
             route_start_s=route_start_s,
             request_id=request_id,
@@ -2963,7 +3018,15 @@ async def forward(
             scheduler_extra["gateway_auth"] = gateway_auth.__dict__
         await future_store.async_create_with_id(request_id)
         created = True
-        await future_store.async_mark_queued(request_id, meta={"op": "training.forward", "model_id": request.model_id})
+        await future_store.async_mark_queued(
+            request_id,
+            meta=_build_training_queued_meta(
+                op="forward",
+                model_id=request.model_id,
+                session=route_session_info,
+                seq_id=request.seq_id,
+            ),
+        )
         await _enqueue_training_request_with_trace(
             route_start_s=route_start_s,
             request_id=request_id,
@@ -3199,7 +3262,15 @@ async def optim_step(
         )
         await future_store.async_create_with_id(request_id)
         created = True
-        await future_store.async_mark_queued(request_id, meta={"op": "training.optim_step", "model_id": request.model_id})
+        await future_store.async_mark_queued(
+            request_id,
+            meta=_build_training_queued_meta(
+                op="optim_step",
+                model_id=request.model_id,
+                session=route_session_info,
+                seq_id=request.seq_id,
+            ),
+        )
         await _enqueue_training_request_with_trace(
             route_start_s=route_start_s,
             request_id=request_id,
@@ -3533,7 +3604,12 @@ async def save_weights_for_sampler(
         created = True
         await future_store.async_mark_queued(
             request_id,
-            meta={"op": "training.save_weights_for_sampler", "model_id": request.model_id},
+            meta=_build_training_queued_meta(
+                op="save_weights_for_sampler",
+                model_id=request.model_id,
+                session=route_session_info,
+                seq_id=request.seq_id,
+            ),
         )
         await _enqueue_training_request_with_trace(
             route_start_s=route_start_s,

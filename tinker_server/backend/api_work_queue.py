@@ -2286,7 +2286,7 @@ class ApiWorkQueueClient:
         return await async_get_ray_ref(ref, timeout_s=None if timeout_s is None else float(timeout_s))
 
     async def async_ensure_started(self) -> None:
-        await self._get_ray_actor_async(require_ready=True)
+        await self._get_ray_actor_async(require_ready=False)
 
     async def async_ensure_ready(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
         actor = await self._get_ray_actor_async(require_ready=False)
