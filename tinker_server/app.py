@@ -37,7 +37,7 @@ from .logging_context import (
     record_http_server_metrics,
     set_trace_id,
 )
-from .ray_utils import init_ray, ray_address_source_configured, ray_connection_epoch, ray_reconnect_poll_s
+from .ray_utils import init_ray, ray_connection_epoch, ray_reconnect_poll_s
 from .routes import action_sampling, futures, internal, openai_compat, sampling, service, training, weights
 from .server_info import _git_sha
 from .token_encryptor import TokenEncryptor
@@ -245,7 +245,7 @@ async def lifespan(app: FastAPI):
     on startup, shuts down all sessions on application exit.
     """
     # ==========================================================================
-    # Ray: hard requirement (fail fast)
+    # Ray driver: startup invariant
     # ==========================================================================
     clear_startup_degraded_state()
     clear_runtime_degraded_state()
@@ -259,8 +259,7 @@ async def lifespan(app: FastAPI):
     from .backend.training_session_store import ensure_ready as ensure_training_session_store_ready
     from .config import RAY_NAMESPACE
 
-    if ray_address_source_configured():
-        init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
+    init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
 
     startup_lease = await acquire_startup_lease(_STARTUP_LEASE_ROLE)
     startup_owner = bool(startup_lease.is_owner)
@@ -305,11 +304,11 @@ async def lifespan(app: FastAPI):
         mint.action_session_manager = action_manager
     try:
         from .backend.dense_session_state import cleanup_legacy_dense_session_state_once
-        from .backend.training_session_store import list_training_sessions
+        from .backend.training_session_store import async_list_training_sessions
 
         active_model_ids = {
             str(info.get("model_id"))
-            for info in await asyncio.to_thread(list_training_sessions)
+            for info in await async_list_training_sessions()
             if isinstance(info, dict) and str(info.get("model_id") or "").strip()
         }
         dense_cleanup = await asyncio.to_thread(
@@ -551,8 +550,7 @@ async def lifespan(app: FastAPI):
                 except Exception:
                     logger.exception("Ray reconnect watch failed")
 
-        if ray_address_source_configured():
-            ray_reconnect_watch_task = asyncio.create_task(_ray_reconnect_watch_loop())
+        ray_reconnect_watch_task = asyncio.create_task(_ray_reconnect_watch_loop())
 
         stale_training_heartbeat_task = None
 

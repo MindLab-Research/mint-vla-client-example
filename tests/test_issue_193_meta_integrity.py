@@ -258,7 +258,7 @@ def test_issue_193_same_model_concurrent_save_weights_out_of_order_steps_do_not_
         def remote(self, *args, **kwargs):
             self._count += 1
             self.calls.append((args, kwargs))
-            return f"same-model-save-ref-{self._count}"
+            return _labeled_ray_ref(f"same-model-save-ref-{self._count}")
 
     remote = _SequenceCheckpointRemote()
     engine._workers[model_id] = SimpleNamespace(save_checkpoint=remote)
@@ -306,7 +306,7 @@ def test_issue_193_same_model_concurrent_save_lora_out_of_order_steps_do_not_reg
         def remote(self, *args, **kwargs):
             self._count += 1
             self.calls.append((args, kwargs))
-            return f"same-model-lora-ref-{self._count}"
+            return _labeled_ray_ref(f"same-model-lora-ref-{self._count}")
 
     remote = _SequenceLoraRemote()
     engine._workers[model_id] = SimpleNamespace(save_lora_weights=remote)

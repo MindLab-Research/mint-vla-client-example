@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import importlib
 import os
+import time
 from types import SimpleNamespace
+
+import pytest
 
 
 def _reload_openpi_ray_runtime(monkeypatch):
@@ -167,3 +171,177 @@ def test_openpi_ray_runtime_client_ready_uses_metadata_method(monkeypatch) -> No
 
     assert metadata == {"actor_id": "abc", "node_ip": "192.168.0.1"}
     assert client.metadata == metadata
+
+
+def test_openpi_ray_runtime_client_ray_get_awaits_future_without_ray_get(monkeypatch) -> None:
+    pytest.importorskip("ray")
+    from tinker_server.backend.openpi_ray_runtime import OpenPIRayRuntimeClient
+
+    client = OpenPIRayRuntimeClient(
+        actor=object(),
+        spec=_spec(),
+        session_id="session-1",
+        ready_timeout_s=30.0,
+    )
+    fut: concurrent.futures.Future[dict[str, object]] = concurrent.futures.Future()
+    fut.set_result({"ok": True})
+    ref = SimpleNamespace(future=lambda: fut)
+
+    monkeypatch.setattr(
+        "tinker_server.backend.openpi_ray_runtime.ray.get",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("ray.get should not be called")),
+    )
+
+    assert asyncio.run(client._ray_get(ref, timeout_s=1.0)) == {"ok": True}
+
+
+def test_openpi_ray_runtime_client_ray_get_preserves_timeout_surface(monkeypatch) -> None:
+    ray = pytest.importorskip("ray")
+    from tinker_server.backend.openpi_ray_runtime import OpenPIRayRuntimeClient
+    from tinker_server.backend.openpi_fast_runtime import OpenPIFastWorkerProtocolError
+
+    client = OpenPIRayRuntimeClient(
+        actor=object(),
+        spec=_spec(),
+        session_id="session-1",
+        ready_timeout_s=30.0,
+    )
+    fut: concurrent.futures.Future[dict[str, object]] = concurrent.futures.Future()
+    ref = SimpleNamespace(future=lambda: fut)
+
+    monkeypatch.setattr(
+        "tinker_server.backend.openpi_ray_runtime.ray.get",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("ray.get should not be called")),
+    )
+
+    with pytest.raises(OpenPIFastWorkerProtocolError) as exc_info:
+        asyncio.run(client._ray_get(ref, timeout_s=0.001))
+
+    assert isinstance(exc_info.value.__cause__, ray.exceptions.GetTimeoutError)
+
+
+def test_ray_keepalive_awaits_future_without_ray_get(monkeypatch) -> None:
+    pytest.importorskip("ray")
+    from tinker_server.backend import ray_keepalive
+
+    fut: concurrent.futures.Future[dict[str, object]] = concurrent.futures.Future()
+    fut.set_result({"ok": True})
+    ref = SimpleNamespace(future=lambda: fut)
+    calls: list[tuple[str, object]] = []
+
+    monkeypatch.setattr(
+        "tinker_server.backend.ray_keepalive.ray.get",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("ray.get should not be called")),
+    )
+    monkeypatch.setattr(
+        ray_keepalive,
+        "get_resource_pool",
+        lambda: SimpleNamespace(
+            mark_inflight=lambda actor_name, delta: calls.append(("mark_inflight", actor_name, delta)),
+            touch=lambda actor_name: calls.append(("touch", actor_name)),
+        ),
+    )
+
+    result = asyncio.run(
+        ray_keepalive.ray_get_with_resource_pool_keepalive(
+            ref,
+            actor_name="actor-1",
+            interval_s=1.0,
+            timeout_s=5.0,
+        )
+    )
+
+    assert result == {"ok": True}
+    assert calls == [
+        ("mark_inflight", "actor-1", 1),
+        ("touch", "actor-1"),
+        ("mark_inflight", "actor-1", -1),
+    ]
+
+
+def test_ray_keepalive_preserves_periodic_touch_while_waiting(monkeypatch) -> None:
+    pytest.importorskip("ray")
+    from tinker_server.backend import ray_keepalive
+
+    future: concurrent.futures.Future[dict[str, object]] = concurrent.futures.Future()
+    ref = SimpleNamespace(future=lambda: future)
+    touches: list[str] = []
+
+    monkeypatch.setattr(
+        "tinker_server.backend.ray_keepalive.ray.get",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("ray.get should not be called")),
+    )
+    def _touch(actor_name: str) -> None:
+        touches.append(actor_name)
+        if len(touches) >= 2 and not future.done():
+            future.set_result({"ok": True})
+
+    monkeypatch.setattr(
+        ray_keepalive,
+        "get_resource_pool",
+        lambda: SimpleNamespace(
+            mark_inflight=lambda *_args: None,
+            touch=_touch,
+        ),
+    )
+
+    start = time.time()
+    assert asyncio.run(
+        ray_keepalive.ray_get_with_resource_pool_keepalive(
+            ref,
+            actor_name="actor-1",
+            interval_s=0.01,
+            timeout_s=1.0,
+        )
+    ) == {"ok": True}
+    assert len(touches) >= 2
+    assert time.time() - start < 1.0
+
+
+def test_ray_keepalive_cancellation_silences_late_exception(monkeypatch) -> None:
+    pytest.importorskip("ray")
+    from tinker_server.backend import async_ray_control, ray_keepalive
+
+    discarded: list[str] = []
+
+    def _record_late_result(fut: asyncio.Future) -> None:
+        try:
+            fut.result()
+        except RuntimeError as exc:
+            discarded.append(str(exc))
+        except BaseException as exc:
+            discarded.append(type(exc).__name__)
+
+    monkeypatch.setattr(async_ray_control, "_discard_late_result", _record_late_result)
+    monkeypatch.setattr(
+        ray_keepalive,
+        "get_resource_pool",
+        lambda: SimpleNamespace(
+            mark_inflight=lambda *_args: None,
+            touch=lambda *_args: None,
+        ),
+    )
+
+    async def _run() -> None:
+        fut = asyncio.get_running_loop().create_future()
+        ref = SimpleNamespace(future=lambda: fut)
+        task = asyncio.create_task(
+            ray_keepalive.ray_get_with_resource_pool_keepalive(
+                ref,
+                actor_name="actor-1",
+                interval_s=1.0,
+                timeout_s=60.0,
+            )
+        )
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not fut.cancelled()
+
+        fut.set_exception(RuntimeError("late boom"))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert discarded == ["late boom"]
+
+    asyncio.run(_run())

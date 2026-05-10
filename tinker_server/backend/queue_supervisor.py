@@ -14,6 +14,7 @@ from typing import Any
 from ..config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources, otel_env_vars
 from ..ray_utils import register_ray_reconnect_invalidator as _register_ray_reconnect_invalidator
 from ..server_info import _git_sha
+from .async_ray_control import _await_with_ray_get_timeout, sync_get_ray_ref
 
 logger = logging.getLogger(__name__)
 CURRENT_CODE_IDENTITY = os.environ.get("MINT_GIT_SHA") or _git_sha()
@@ -98,21 +99,7 @@ def _kill_named_actor(actor: Any) -> None:
 
 
 def _await_ray_ref_sync(ref: Any, *, timeout_s: float | None = None) -> Any:
-    if hasattr(ref, "__await__"):
-        coro = ref
-        if timeout_s is None:
-            return asyncio.run(coro)
-        return asyncio.run(asyncio.wait_for(coro, timeout=float(timeout_s)))
-    to_future = getattr(ref, "future", None)
-    if callable(to_future):
-        fut = to_future()
-        if isinstance(fut, concurrent.futures.Future):
-            return fut.result(timeout=timeout_s)
-        if isinstance(fut, asyncio.Future) or hasattr(fut, "__await__"):
-            if timeout_s is None:
-                return asyncio.run(fut)
-            return asyncio.run(asyncio.wait_for(fut, timeout=float(timeout_s)))
-    return ref
+    return sync_get_ray_ref(ref, timeout_s=timeout_s)
 
 
 def _get_or_create_actor():
@@ -276,7 +263,7 @@ class QueueSupervisor:
         self._reset_cached_actor()
         await asyncio.to_thread(_kill_named_actor, actor)
         actor = self._get_ray_actor()
-        refreshed = await asyncio.wait_for(_await_ray_ref(actor.snapshot.remote()), timeout=15.0)
+        refreshed = await _await_with_ray_get_timeout(_await_ray_ref(actor.snapshot.remote()), timeout_s=15.0)
         if not isinstance(refreshed, dict) or not self._runtime_contract_matches(refreshed):
             raise RuntimeError(
                 "queue supervisor runtime contract mismatch after recreate: "
@@ -300,7 +287,7 @@ class QueueSupervisor:
 
     async def _get_verified_actor(self) -> Any:
         actor = self._get_ray_actor()
-        snapshot = await asyncio.wait_for(_await_ray_ref(actor.snapshot.remote()), timeout=15.0)
+        snapshot = await _await_with_ray_get_timeout(_await_ray_ref(actor.snapshot.remote()), timeout_s=15.0)
         if not isinstance(snapshot, dict):
             raise TypeError(f"QueueSupervisor.snapshot returned non-dict: {type(snapshot)}")
         await self._ensure_runtime_contract_async(snapshot)
@@ -308,35 +295,35 @@ class QueueSupervisor:
 
     async def async_claim_generation(self, *, timeout_s: float = 15.0) -> dict[str, Any]:
         actor = await self._get_verified_actor()
-        return await asyncio.wait_for(
+        return await _await_with_ray_get_timeout(
             _await_ray_ref(actor.claim_generation.remote(owner_id=self._owner_id, ttl_s=_lease_ttl_s())),
-            timeout=float(timeout_s),
+            timeout_s=float(timeout_s),
         )
 
     async def async_heartbeat(self, *, generation_id: int, timeout_s: float = 10.0) -> bool:
         actor = await self._get_verified_actor()
         return bool(
-            await asyncio.wait_for(
+            await _await_with_ray_get_timeout(
                 _await_ray_ref(
                     actor.heartbeat.remote(owner_id=self._owner_id, generation_id=int(generation_id), ttl_s=_lease_ttl_s())
                 ),
-                timeout=float(timeout_s),
+                timeout_s=float(timeout_s),
             )
         )
 
     async def async_begin_reconcile(self, *, generation_id: int, timeout_s: float = 10.0) -> bool:
         actor = await self._get_verified_actor()
         return bool(
-            await asyncio.wait_for(
+            await _await_with_ray_get_timeout(
                 _await_ray_ref(actor.begin_reconcile.remote(owner_id=self._owner_id, generation_id=int(generation_id))),
-                timeout=float(timeout_s),
+                timeout_s=float(timeout_s),
             )
         )
 
     async def async_finish_reconcile(self, *, generation_id: int, stale_reconciled: int, timeout_s: float = 10.0) -> bool:
         actor = await self._get_verified_actor()
         return bool(
-            await asyncio.wait_for(
+            await _await_with_ray_get_timeout(
                 _await_ray_ref(
                     actor.finish_reconcile.remote(
                         owner_id=self._owner_id,
@@ -344,29 +331,32 @@ class QueueSupervisor:
                         stale_reconciled=int(stale_reconciled),
                     )
                 ),
-                timeout=float(timeout_s),
+                timeout_s=float(timeout_s),
             )
         )
 
     async def async_is_generation_current(self, *, generation_id: int, timeout_s: float = 10.0) -> bool:
         actor = await self._get_verified_actor()
         return bool(
-            await asyncio.wait_for(
+            await _await_with_ray_get_timeout(
                 _await_ray_ref(actor.is_generation_current.remote(owner_id=self._owner_id, generation_id=int(generation_id))),
-                timeout=float(timeout_s),
+                timeout_s=float(timeout_s),
             )
         )
 
     async def async_record_fenced_worker(self, *, generation_id: int, timeout_s: float = 10.0) -> None:
         actor = await self._get_verified_actor()
-        await asyncio.wait_for(
+        await _await_with_ray_get_timeout(
             _await_ray_ref(actor.record_fenced_worker.remote(generation_id=int(generation_id))),
-            timeout=float(timeout_s),
+            timeout_s=float(timeout_s),
         )
 
     async def async_snapshot(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
         actor = await self._get_verified_actor()
-        out = await asyncio.wait_for(_await_ray_ref(actor.snapshot.remote()), timeout=float(timeout_s))
+        out = await _await_with_ray_get_timeout(
+            _await_ray_ref(actor.snapshot.remote()),
+            timeout_s=float(timeout_s),
+        )
         if not isinstance(out, dict):
             raise TypeError(f"QueueSupervisor.snapshot returned non-dict: {type(out)}")
         return out

@@ -7,6 +7,8 @@ import os
 from typing import Any
 
 from ..config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources, otel_env_vars
+from ..ray_utils import register_ray_reconnect_invalidator as _register_ray_reconnect_invalidator
+from .async_ray_control import async_get_ray_ref
 
 logger = logging.getLogger(__name__)
 _ACTOR_HANDLE = None
@@ -15,7 +17,7 @@ def _reset_cached_actor_handle() -> None:
     global _ACTOR_HANDLE
     _ACTOR_HANDLE = None
 
-from ..ray_utils import register_ray_reconnect_invalidator as _register_ray_reconnect_invalidator
+
 _register_ray_reconnect_invalidator(_reset_cached_actor_handle)
 
 
@@ -73,7 +75,7 @@ async def _delete_shared_worker_session(*, actor_name: str, namespace: str, mode
     if delete_session is None:
         return
 
-    await asyncio.to_thread(ray.get, delete_session.remote(model_id), timeout=30)
+    await async_get_ray_ref(delete_session.remote(model_id), timeout_s=30)
 
 
 async def _kill_training_actor(*, actor_name: str, namespace: str, model_id: str) -> None:
@@ -107,10 +109,10 @@ async def cleanup_stale_training_sessions_once_impl(*, stale_after_s: float | No
     from .future_store import future_store
     from .resource_pool import get_resource_pool
     from .session_heartbeat_store import session_heartbeat_store
-    from .training_session_store import delete_training_session, list_training_sessions
+    from .training_session_store import async_list_training_sessions, delete_training_session
 
     try:
-        infos = await asyncio.to_thread(list_training_sessions)
+        infos = await async_list_training_sessions()
     except Exception as e:
         logger.warning(
             "training cleanup executor skipped: failed to list detached training sessions: %s: %s",

@@ -1,12 +1,17 @@
 import asyncio
+import concurrent.futures
 from types import SimpleNamespace
 
 import pytest
 
-import ray
-
 from tinker_server.backend.training_session_manager import TrainingSession, TrainingSessionManager
 from tinker_server.backend.verl_training import VerlTrainingEngine
+
+
+def _completed_ref(value):
+    future = concurrent.futures.Future()
+    future.set_result(value)
+    return SimpleNamespace(future=lambda: future)
 
 
 class _StubRemoteMethod:
@@ -26,11 +31,11 @@ class _StubSharedWorker:
 
     def _delete_session(self, session_id: str, **kwargs):
         self.delete_calls.append((session_id, dict(kwargs)))
-        return {"status": "ok", "session_id": session_id, "deleted": True}
+        return _completed_ref({"status": "ok", "session_id": session_id, "deleted": True})
 
     def _shutdown(self):
         self.shutdown_calls += 1
-        return None
+        return _completed_ref(None)
 
 
 def _make_session(model_id: str, *, backend: str) -> TrainingSession:
@@ -60,7 +65,8 @@ def test_issue_381_delete_session_cleans_shared_megatron_state(monkeypatch: pyte
     engine._actor_loaded_sessions[actor_name] = model_id
     engine._actor_volatile_sessions[actor_name] = {model_id}
 
-    monkeypatch.setattr(ray, "get", lambda value, timeout=None: value)
+    import tinker_server.backend.verl_training as verl_training
+
     monkeypatch.setattr(
         "tinker_server.backend.resource_pool.get_resource_pool",
         lambda: SimpleNamespace(
@@ -68,7 +74,7 @@ def test_issue_381_delete_session_cleans_shared_megatron_state(monkeypatch: pyte
             set_session=lambda name, session_id: set_session_calls.append((name, session_id)),
         ),
     )
-    monkeypatch.setattr("tinker_server.backend.verl_training.ray_kill.kill", lambda *args, **kwargs: killed.append(dict(kwargs)))
+    monkeypatch.setattr(verl_training.ray_kill, "kill", lambda *args, **kwargs: killed.append(dict(kwargs)))
 
     asyncio.run(engine.delete_session(session))
 
@@ -101,7 +107,8 @@ def test_issue_381_delete_session_cleans_shared_dense_state(monkeypatch: pytest.
     engine._resource_pool_actor_names[model_id] = actor_name
     engine._resource_pool_actor_names[sibling_model_id] = actor_name
 
-    monkeypatch.setattr(ray, "get", lambda value, timeout=None: value)
+    import tinker_server.backend.verl_training as verl_training
+
     monkeypatch.setattr(
         "tinker_server.backend.resource_pool.get_resource_pool",
         lambda: SimpleNamespace(
@@ -113,7 +120,7 @@ def test_issue_381_delete_session_cleans_shared_dense_state(monkeypatch: pytest.
         "tinker_server.backend.dense_trainer.clear_dense_trainer_session",
         lambda target_model_id: cleared_dense_sessions.append(target_model_id),
     )
-    monkeypatch.setattr("tinker_server.backend.verl_training.ray_kill.kill", lambda *args, **kwargs: killed.append(dict(kwargs)))
+    monkeypatch.setattr(verl_training.ray_kill, "kill", lambda *args, **kwargs: killed.append(dict(kwargs)))
 
     asyncio.run(engine.delete_session(session))
 

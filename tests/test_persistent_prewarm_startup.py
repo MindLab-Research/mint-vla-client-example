@@ -100,6 +100,11 @@ class _StubInitRayCalls(list):
         return None
 
 
+class _StubUsageStore:
+    async def health_check(self) -> bool:
+        return True
+
+
 class _StubCapacityManager:
     def ensure_ready(self) -> None:
         return None
@@ -299,6 +304,8 @@ def _install_lifespan_stubs(
 
     if init_ray_calls is not None:
         monkeypatch.setattr(app_module, "init_ray", init_ray_calls)
+    else:
+        monkeypatch.setattr(app_module, "init_ray", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(api_work_queue_module, "api_work_queue", queue)
     monkeypatch.setattr(owner_runtime_module, "owner_runtime_supervisor", owner_runtime)
     monkeypatch.setattr(queue_execution_runtime_module, "queue_execution_runtime", queue_execution_runtime)
@@ -310,7 +317,10 @@ def _install_lifespan_stubs(
     monkeypatch.setattr(session_index_store_module, "ensure_ready", lambda: None)
     monkeypatch.setattr(training_session_manager_module, "TrainingSessionManager", _StubTrainingManager)
     monkeypatch.setattr(training_session_store_module, "ensure_ready", lambda: None)
-    monkeypatch.setattr(training_session_store_module, "list_training_sessions", lambda: [])
+    async def _async_list_training_sessions():
+        return []
+
+    monkeypatch.setattr(training_session_store_module, "async_list_training_sessions", _async_list_training_sessions)
     monkeypatch.setattr(future_replay_module, "ensure_future_replay_sweeper", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         dense_session_state_module,
@@ -325,7 +335,11 @@ def _install_lifespan_stubs(
         "process_pending_checkpoint_mirrors",
         lambda: {"mirrored": [], "failed": []},
     )
+    async def _get_usage_store():
+        return _StubUsageStore()
+
     monkeypatch.setattr(gateway_module, "close_http_clients", _noop_async)
+    monkeypatch.setattr(usage_store_module, "get_usage_store", _get_usage_store)
     monkeypatch.setattr(usage_store_module, "close_usage_store", _noop_async)
 
 
@@ -371,13 +385,9 @@ def test_lifespan_routes_persistent_prewarm_to_queue_runtime(monkeypatch) -> Non
     async def _acquire_startup_lease(*_args, **_kwargs):
         return lease
 
-    async def _fail_if_called(*_args, **_kwargs) -> None:
-        raise AssertionError("API-process prewarm path should be unused in detached runtime mode")
-
     monkeypatch.setattr(app_module.config, "prewarm_persistent_models_csv", "Qwen/Qwen3-30B-A3B-Instruct-2507")
     monkeypatch.setattr(app_module.config, "prewarm_enable_training", True)
     monkeypatch.setattr(app_module.config, "prewarm_enable_inference", False)
-    monkeypatch.setattr(app_module, "_prewarm_persistent_models", _fail_if_called)
     monkeypatch.setattr(
         "tinker_server.backend.startup_lease.acquire_startup_lease",
         _acquire_startup_lease,
@@ -444,14 +454,10 @@ def test_lifespan_follower_skips_leader_only_startup(monkeypatch) -> None:
     async def _count_cleanup(*_args, **_kwargs) -> None:
         calls.append("cleanup")
 
-    async def _count_prewarm(*_args, **_kwargs) -> None:
-        calls.append("prewarm")
-
     async def _acquire_startup_lease(*_args, **_kwargs):
         return lease
 
     monkeypatch.setattr(app_module, "_cleanup_stale_actors", _count_cleanup)
-    monkeypatch.setattr(app_module, "_prewarm_persistent_models", _count_prewarm)
     monkeypatch.setattr(
         "tinker_server.backend.startup_lease.acquire_startup_lease",
         _acquire_startup_lease,
@@ -472,7 +478,8 @@ def test_lifespan_follower_skips_leader_only_startup(monkeypatch) -> None:
     assert queue_execution_runtime.ensure_started_calls == [
         {"num_workers": 1, "timeout_s": 120.0}
     ]
-    assert len(init_ray_calls) == 0
+    assert len(init_ray_calls) == 1
+    assert init_ray_calls[0]["kwargs"]["namespace"] == "tinker"
 
 
 def test_lifespan_owner_runtime_local_only_uses_async_cleanup_helper(monkeypatch) -> None:
@@ -561,10 +568,6 @@ def test_lifespan_uses_started_probes_for_queue_and_future_store(monkeypatch) ->
     async def _acquire_startup_lease(*_args, **_kwargs):
         return lease
 
-    async def _noop_prewarm(*_args, **_kwargs) -> None:
-        return None
-
-    monkeypatch.setattr(app_module, "_prewarm_persistent_models", _noop_prewarm)
     monkeypatch.setattr(
         "tinker_server.backend.startup_lease.acquire_startup_lease",
         _acquire_startup_lease,
@@ -736,10 +739,6 @@ def test_lifespan_keeps_training_route_globals_unbound_in_stateless_api(monkeypa
     async def _acquire_startup_lease(*_args, **_kwargs):
         return lease
 
-    async def _noop_prewarm(*_args, **_kwargs) -> None:
-        return None
-
-    monkeypatch.setattr(app_module, "_prewarm_persistent_models", _noop_prewarm)
     monkeypatch.setattr(
         "tinker_server.backend.startup_lease.acquire_startup_lease",
         _acquire_startup_lease,
@@ -777,9 +776,6 @@ def test_lifespan_local_queue_runtime_cleans_up_bound_handles(monkeypatch) -> No
     async def _acquire_startup_lease(*_args, **_kwargs):
         return lease
 
-    async def _noop_prewarm(*_args, **_kwargs) -> None:
-        return None
-
     async def _record_inference_shutdown(manager) -> None:
         shutdown_calls.append(("inference", manager))
 
@@ -816,7 +812,6 @@ def test_lifespan_local_queue_runtime_cleans_up_bound_handles(monkeypatch) -> No
         }
 
     monkeypatch.setenv("MINT_QUEUE_EXECUTION_RUNTIME_LOCAL_ONLY", "1")
-    monkeypatch.setattr(app_module, "_prewarm_persistent_models", _noop_prewarm)
     monkeypatch.setattr(app_module, "_shutdown_local_inference_runtime", _record_inference_shutdown)
     monkeypatch.setattr(app_module, "_shutdown_local_training_runtime", _record_training_shutdown)
     monkeypatch.setattr(
@@ -882,9 +877,6 @@ def test_lifespan_local_queue_runtime_start_failure_still_cleans_up_bound_handle
     async def _acquire_startup_lease(*_args, **_kwargs):
         return lease
 
-    async def _noop_prewarm(*_args, **_kwargs) -> None:
-        return None
-
     async def _record_inference_shutdown(manager) -> None:
         shutdown_calls.append(("inference", manager))
 
@@ -910,7 +902,6 @@ def test_lifespan_local_queue_runtime_start_failure_still_cleans_up_bound_handle
         }
 
     monkeypatch.setenv("MINT_QUEUE_EXECUTION_RUNTIME_LOCAL_ONLY", "1")
-    monkeypatch.setattr(app_module, "_prewarm_persistent_models", _noop_prewarm)
     monkeypatch.setattr(app_module, "_shutdown_local_inference_runtime", _record_inference_shutdown)
     monkeypatch.setattr(app_module, "_shutdown_local_training_runtime", _record_training_shutdown)
     monkeypatch.setattr(
@@ -961,11 +952,7 @@ def test_lifespan_skips_tokenizer_preload_for_multi_worker_startup(monkeypatch) 
     async def _acquire_startup_lease(*_args, **_kwargs):
         return lease
 
-    async def _noop_prewarm(*_args, **_kwargs) -> None:
-        return None
-
     monkeypatch.setenv("MINT_UVICORN_WORKERS", "8")
-    monkeypatch.setattr(app_module, "_prewarm_persistent_models", _noop_prewarm)
     monkeypatch.setattr(app_module.openai_compat, "preload_supported_tokenizers", lambda: preload_calls.append(True) or {})
     monkeypatch.setattr(
         "tinker_server.backend.startup_lease.acquire_startup_lease",
@@ -994,7 +981,9 @@ async def test_prewarm_raises_when_training_prewarm_unavailable_in_stateless_api
         RuntimeError,
         match="persistent prewarm training configured but unavailable in the execution runtime",
     ):
-        await app_module._prewarm_persistent_models(None, SimpleNamespace())
+        from tinker_server.backend.persistent_prewarm import prewarm_persistent_models
+
+        await prewarm_persistent_models(None, SimpleNamespace())
 
 
 @pytest.mark.anyio
@@ -1022,7 +1011,9 @@ async def test_prewarm_raises_when_inference_prewarm_fails(monkeypatch) -> None:
             raise RuntimeError("pinned worker full")
 
     with pytest.raises(RuntimeError, match="pinned worker full"):
-        await app_module._prewarm_persistent_models(SimpleNamespace(), _FailingManager())
+        from tinker_server.backend.persistent_prewarm import prewarm_persistent_models
+
+        await prewarm_persistent_models(SimpleNamespace(), _FailingManager())
 
 
 @pytest.mark.anyio
@@ -1109,12 +1100,12 @@ async def test_get_engine_skips_capacity_check_when_named_actor_exists(monkeypat
 
     monkeypatch.setattr(mle.ray, "is_initialized", lambda: True, raising=False)
     monkeypatch.setattr(mle.ray, "get_actor", lambda *args, **kwargs: actor_handle, raising=False)
-    monkeypatch.setattr(
-        mle.ray,
-        "get",
-        lambda ref, *args, **kwargs: True if ref == "engine-ready-ref" else None,
-        raising=False,
-    )
+
+    async def _async_get_ray_ref(ref, *, timeout_s=None):
+        _ = timeout_s
+        return True if ref == "engine-ready-ref" else None
+
+    monkeypatch.setattr(mle, "async_get_ray_ref", _async_get_ray_ref, raising=False)
     monkeypatch.setattr(mle, "parse_model_single_node_ip", lambda **_kwargs: "192.168.38.4", raising=False)
     monkeypatch.setattr(mle, "parse_model_node_ip_list", lambda **_kwargs: ["192.168.38.4"], raising=False)
 
@@ -1151,10 +1142,11 @@ async def test_get_engine_checks_capacity_when_named_actor_probe_fails(monkeypat
     monkeypatch.setattr(mle.ray, "is_initialized", lambda: True, raising=False)
     monkeypatch.setattr(mle.ray, "get_actor", lambda *args, **kwargs: actor_handle, raising=False)
 
-    def _stale_actor_get(ref, *args, **kwargs):
+    async def _stale_async_get_ray_ref(ref, *, timeout_s=None):
+        _ = timeout_s
         raise mle.ray.exceptions.RayActorError(f"stale actor during probe: {ref}")
 
-    monkeypatch.setattr(mle.ray, "get", _stale_actor_get, raising=False)
+    monkeypatch.setattr(mle, "async_get_ray_ref", _stale_async_get_ray_ref, raising=False)
     monkeypatch.setattr(mle, "parse_model_single_node_ip", lambda **_kwargs: "192.168.38.4", raising=False)
     monkeypatch.setattr(mle, "parse_model_node_ip_list", lambda **_kwargs: ["192.168.38.4"], raising=False)
 

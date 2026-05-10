@@ -187,11 +187,10 @@ def _collect_ray_gcs_metrics() -> dict[str, Any]:
     import ray
 
     from .config import RAY_NAMESPACE
-    from .ray_utils import init_ray
 
     timeout_s = _float_env("MINT_RAY_GCS_METRICS_TIMEOUT_S", 2.0)
     if not ray.is_initialized():
-        init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
+        raise RuntimeError("Ray is not initialized")
 
     head_candidates, all_alive = _discover_candidate_addresses(ray)
     scrape_started = time.perf_counter()

@@ -8,7 +8,8 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from ..config import config as server_config, otel_env_vars, preferred_control_plane_resources
+from ..config import config as server_config, otel_env_vars
+from .async_ray_control import _await_with_ray_get_timeout
 
 
 class CapacityManagerUnavailableError(RuntimeError):
@@ -227,6 +228,7 @@ def _get_or_create_ray_actor():
         created = _RayCapacityManagerActor.options(  # type: ignore[attr-defined]
             **options
         ).remote(queue_bytes_budget=queue_bytes_budget)
+        ray.get(created.snapshot.remote(), timeout=1.0)
     except Exception:
         # Race: another request may have created the detached actor first.
         return ray.get_actor(actor_name, namespace=_ray_namespace())
@@ -333,9 +335,9 @@ class CapacityManager:
 
     async def async_ensure_ready(self, *, timeout_s: float = 10.0) -> CapacitySnapshot:
         actor = await self._get_ray_actor_async()
-        d = await asyncio.wait_for(
+        d = await _await_with_ray_get_timeout(
             _await_ray_ref(actor.snapshot.remote()),
-            timeout=float(timeout_s),
+            timeout_s=float(timeout_s),
         )
         if not isinstance(d, dict):
             raise TypeError(f"CapacityManager.snapshot returned non-dict: {type(d)}")
@@ -397,12 +399,12 @@ class CapacityManager:
             self._reset_ray_actor()
 
     async def async_snapshot(self, *, timeout_s: float = 10.0) -> CapacitySnapshot:
-        d = await asyncio.wait_for(
-            self._async_with_actor_retry(
-                lambda actor: _await_ray_ref(actor.snapshot.remote()),
-                err_msg="Detached Ray CapacityManager actor died",
+        d = await self._async_with_actor_retry(
+            lambda actor: _await_with_ray_get_timeout(
+                _await_ray_ref(actor.snapshot.remote()),
+                timeout_s=float(timeout_s),
             ),
-            timeout=float(timeout_s),
+            err_msg="Detached Ray CapacityManager actor died",
         )
         if not isinstance(d, dict):
             raise TypeError(f"CapacityManager.snapshot returned non-dict: {type(d)}")
@@ -416,12 +418,12 @@ class CapacityManager:
         )
 
     async def async_rss_bytes(self, *, timeout_s: float = 10.0) -> int:
-        v = await asyncio.wait_for(
-            self._async_with_actor_retry(
-                lambda actor: _await_ray_ref(actor.get_rss_bytes.remote()),
-                err_msg="Detached Ray CapacityManager actor died",
+        v = await self._async_with_actor_retry(
+            lambda actor: _await_with_ray_get_timeout(
+                _await_ray_ref(actor.get_rss_bytes.remote()),
+                timeout_s=float(timeout_s),
             ),
-            timeout=float(timeout_s),
+            err_msg="Detached Ray CapacityManager actor died",
         )
         return int(v)
 

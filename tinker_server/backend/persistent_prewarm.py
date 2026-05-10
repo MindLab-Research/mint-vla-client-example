@@ -8,6 +8,7 @@ import time
 from typing import TYPE_CHECKING
 
 from ..config import config
+from .async_ray_control import async_get_ray_ref
 
 if TYPE_CHECKING:
     from .multi_lora_engine import MultiModelInferenceManager
@@ -235,11 +236,7 @@ async def prewarm_persistent_models(
                             )
 
                     try:
-                        await asyncio.to_thread(
-                            ray.get,
-                            actor.__ray_ready__.remote(),
-                            timeout=megatron_ready_timeout_s,
-                        )
+                        await async_get_ray_ref(actor.__ray_ready__.remote(), timeout_s=megatron_ready_timeout_s)
                         resource_pool.mark_ready(actor_name)
                         logger.info(f"[prewarm] training ready+protected model={model_name} actor={actor_name}")
                     except SystemExit as ready_err:

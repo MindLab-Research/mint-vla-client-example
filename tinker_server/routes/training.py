@@ -43,7 +43,7 @@ from ..auth_identity import can_write
 from ..auth_identity import get_apikey_id as _request_apikey_id
 from ..auth_identity import get_user_data as _request_user_data
 from ..auth_identity import get_user_id as _request_user_id
-from ..backend.async_ray_control import async_lookup_actor_handle
+from ..backend.async_ray_control import async_get_ray_ref, async_lookup_actor_handle
 from ..gateway_auth import GatewayAuthContext, build_billing_auth_context
 from ..logging_context import (
     classify_failure_reason,
@@ -645,9 +645,9 @@ async def _best_effort_delete_training_session(
         return False
 
     try:
-        fail_pending = getattr(future_store, "fail_training_requests_for_model", None)
+        fail_pending = getattr(future_store, "async_fail_training_requests_for_model", None)
         if callable(fail_pending):
-            failed_request_ids = fail_pending(
+            failed_request_ids = await fail_pending(
                 model_id,
                 f"Training session terminated due to {reason}",
             )
@@ -727,9 +727,7 @@ async def _best_effort_delete_training_session(
             delete_ok = worker is None and not str(getattr(session, "actor_name", "") or "")
             if delete_session is not None:
                 try:
-                    import ray
-
-                    await asyncio.to_thread(ray.get, delete_session.remote(model_id), timeout=30)
+                    await async_get_ray_ref(delete_session.remote(model_id), timeout_s=30)
                     delete_ok = True
                 except Exception as e:
                     logger.warning(
@@ -793,11 +791,9 @@ async def cleanup_stale_training_sessions_once(*, stale_after_s: float | None = 
     from ..backend.session_heartbeat_store import session_heartbeat_store
 
     try:
-        from ..backend.training_session_store import list_training_sessions
+        from ..backend.training_session_store import async_list_training_sessions
 
-        # Detached store listing uses ray.get(). Keep that blocking call off the
-        # main event loop so stale-session cleanup cannot freeze the API server.
-        infos = await asyncio.to_thread(list_training_sessions)
+        infos = await async_list_training_sessions()
     except Exception as e:
         logger.warning(
             "stale training cleanup skipped: failed to list detached training sessions: %s: %s",
@@ -1429,6 +1425,8 @@ def _validate_lora_rank_or_400(lora_config: LoRAConfig | None) -> None:
             status_code=400,
             detail=f"Requested LoRA rank {requested_rank} exceeds server max_lora_rank={max_rank}",
         )
+
+
 def _build_training_scheduler_extra(
     *,
     session: Any,
@@ -1472,6 +1470,40 @@ def _build_training_scheduler_extra(
         except Exception:
             extra["seq_id"] = None
     return extra
+
+
+def _build_training_queued_meta(
+    *,
+    op: str,
+    model_id: str,
+    session: Any | None = None,
+    seq_id: int | None = None,
+) -> dict[str, Any]:
+    op_name = str(op)
+    if not op_name.startswith("training."):
+        op_name = f"training.{op_name}"
+    meta: dict[str, Any] = {
+        "op": op_name,
+        "model_id": str(model_id),
+        "queue_state": "queued",
+        "stage": "queued",
+        "queued_at": time.time(),
+    }
+    if session is not None:
+        meta["session_id"] = str(_field(session, "session_id", "") or model_id)
+        base_model = str(_field(session, "base_model", "") or "")
+        if base_model:
+            meta["base_model"] = base_model
+        backend = str(_field(session, "backend", "") or "")
+        if backend:
+            meta["backend"] = backend
+    if seq_id is not None:
+        try:
+            meta["seq_id"] = int(seq_id)
+        except Exception:
+            meta["seq_id"] = seq_id
+    return meta
+
 
 def _build_create_scheduler_extra(
     *,
@@ -1588,7 +1620,10 @@ async def _enqueue_internal_serialized_model_op(
             inflight_marked = True
         await future_store.async_create_with_id(request_id)
         created = True
-        await future_store.async_mark_queued(request_id, meta={"op": op, "model_id": model_id})
+        await future_store.async_mark_queued(
+            request_id,
+            meta=_build_training_queued_meta(op=op, model_id=model_id),
+        )
         await api_work_queue.enqueue(
             request_id=request_id,
             op=op,
@@ -1730,7 +1765,10 @@ async def create_model(
     try:
         await future_store.async_create_with_id(request_id)
         created = True
-        await future_store.async_mark_queued(request_id, meta={"op": "training.create_model", "model_id": model_id})
+        await future_store.async_mark_queued(
+            request_id,
+            meta=_build_training_queued_meta(op="create_model", model_id=model_id),
+        )
         await _enqueue_training_request_with_trace(
             route_start_s=route_start_s,
             request_id=request_id,
@@ -2150,7 +2188,7 @@ async def create_model_from_state(
         created = True
         await future_store.async_mark_queued(
             request_id,
-            meta={"op": "training.create_model_from_state", "model_id": model_id},
+            meta=_build_training_queued_meta(op="create_model_from_state", model_id=model_id),
         )
         await _enqueue_training_request_with_trace(
             route_start_s=route_start_s,
@@ -2473,7 +2511,12 @@ async def forward_backward(
         created = True
         await future_store.async_mark_queued(
             request_id,
-            meta={"op": "training.forward_backward", "model_id": request.model_id},
+            meta=_build_training_queued_meta(
+                op="forward_backward",
+                model_id=request.model_id,
+                session=route_session_info,
+                seq_id=request.seq_id,
+            ),
         )
         await _enqueue_training_request_with_trace(
             route_start_s=route_start_s,
@@ -2723,7 +2766,15 @@ async def train_step(
             scheduler_extra["gateway_auth"] = gateway_auth.__dict__
         await future_store.async_create_with_id(request_id)
         created = True
-        await future_store.async_mark_queued(request_id, meta={"op": "training.train_step", "model_id": request.model_id})
+        await future_store.async_mark_queued(
+            request_id,
+            meta=_build_training_queued_meta(
+                op="train_step",
+                model_id=request.model_id,
+                session=route_session_info,
+                seq_id=request.seq_id,
+            ),
+        )
         await _enqueue_training_request_with_trace(
             route_start_s=route_start_s,
             request_id=request_id,
@@ -2965,7 +3016,15 @@ async def forward(
             scheduler_extra["gateway_auth"] = gateway_auth.__dict__
         await future_store.async_create_with_id(request_id)
         created = True
-        await future_store.async_mark_queued(request_id, meta={"op": "training.forward", "model_id": request.model_id})
+        await future_store.async_mark_queued(
+            request_id,
+            meta=_build_training_queued_meta(
+                op="forward",
+                model_id=request.model_id,
+                session=route_session_info,
+                seq_id=request.seq_id,
+            ),
+        )
         await _enqueue_training_request_with_trace(
             route_start_s=route_start_s,
             request_id=request_id,
@@ -3201,7 +3260,15 @@ async def optim_step(
         )
         await future_store.async_create_with_id(request_id)
         created = True
-        await future_store.async_mark_queued(request_id, meta={"op": "training.optim_step", "model_id": request.model_id})
+        await future_store.async_mark_queued(
+            request_id,
+            meta=_build_training_queued_meta(
+                op="optim_step",
+                model_id=request.model_id,
+                session=route_session_info,
+                seq_id=request.seq_id,
+            ),
+        )
         await _enqueue_training_request_with_trace(
             route_start_s=route_start_s,
             request_id=request_id,
@@ -3535,7 +3602,12 @@ async def save_weights_for_sampler(
         created = True
         await future_store.async_mark_queued(
             request_id,
-            meta={"op": "training.save_weights_for_sampler", "model_id": request.model_id},
+            meta=_build_training_queued_meta(
+                op="save_weights_for_sampler",
+                model_id=request.model_id,
+                session=route_session_info,
+                seq_id=request.seq_id,
+            ),
         )
         await _enqueue_training_request_with_trace(
             route_start_s=route_start_s,

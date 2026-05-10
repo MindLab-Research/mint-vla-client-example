@@ -1,11 +1,13 @@
 # ruff: noqa: F401
 import asyncio
+import concurrent.futures
 import json
 import logging
 import os
 from pathlib import Path
 from types import SimpleNamespace
 import time
+import threading
 import sys
 import types
 
@@ -42,17 +44,86 @@ __all__ = [
     "_FakeLoadWorker",
     "_noop_log_worker_request_context",
     "_megatron_load_meta",
+    "_completed_ray_ref",
+    "_failed_ray_ref",
+    "_labeled_ray_ref",
 ]
 
 
 class _RecordingRemoteMethod:
-    def __init__(self, ref: str):
+    def __init__(self, ref: object):
         self._ref = ref
         self.calls: list[tuple[tuple, dict]] = []
 
     def remote(self, *args, **kwargs):
         self.calls.append((args, kwargs))
-        return self._ref
+        return _coerce_ray_ref(self._ref)
+
+
+_UNSET = object()
+
+
+class _FakeRayRef:
+    def __init__(
+        self,
+        label: object | None = None,
+        *,
+        result: object = _UNSET,
+        exc: BaseException | None = None,
+    ):
+        self._label = label
+        self._result = result
+        self._exc = exc
+        self._future: concurrent.futures.Future | None = None
+
+    def __eq__(self, other):
+        return self._label == other
+
+    def __hash__(self):
+        return hash(self._label)
+
+    def __repr__(self):
+        return repr(self._label)
+
+    def future(self):
+        if self._future is not None:
+            return self._future
+        future: concurrent.futures.Future = concurrent.futures.Future()
+        if self._exc is not None:
+            future.set_exception(self._exc)
+        elif self._result is not _UNSET:
+            future.set_result(self._result)
+        else:
+            def _resolve():
+                try:
+                    result = ray.get(self._label, timeout=1.0)
+                    if not future.cancelled():
+                        future.set_result(result)
+                except BaseException as exc:
+                    if not future.cancelled():
+                        future.set_exception(exc)
+
+            threading.Thread(target=_resolve, daemon=True).start()
+        self._future = future
+        return future
+
+
+def _coerce_ray_ref(ref: object) -> object:
+    if isinstance(ref, str):
+        return _FakeRayRef(ref)
+    return ref
+
+
+def _completed_ray_ref(result: object = None) -> _FakeRayRef:
+    return _FakeRayRef(result=result)
+
+
+def _failed_ray_ref(exc: BaseException) -> _FakeRayRef:
+    return _FakeRayRef(exc=exc)
+
+
+def _labeled_ray_ref(label: object) -> _FakeRayRef:
+    return _FakeRayRef(label)
 
 
 class _HeartbeatWorkerMixin:
@@ -77,7 +148,7 @@ class _FakeLoadWorker(_HeartbeatWorkerMixin):
         super().__init__()
         self.__ray_ready__ = _RecordingRemoteMethod("fake-load-ready-ref")
         self.load_checkpoint = _RecordingRemoteMethod(ref)
-        self.mark_session_loaded = _RecordingRemoteMethod("fake-mark-session-loaded-ref")
+        self.mark_session_loaded = _RecordingRemoteMethod(_completed_ray_ref({"status": "ok"}))
 
 
 async def _noop_log_worker_request_context(*args, **kwargs):

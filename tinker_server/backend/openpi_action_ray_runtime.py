@@ -11,6 +11,7 @@ import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from ..config import RAY_NAMESPACE
+from .async_ray_control import async_get_ray_ref
 from .openpi_fast_runtime import (
     OpenPIFastRuntimeSpec,
     OpenPIFastWorkerClient,
@@ -204,7 +205,7 @@ class OpenPIActionRayRuntimeClient:
 
     async def _ray_get(self, ref: Any, *, timeout_s: float | None) -> Any:
         try:
-            return await asyncio.to_thread(ray.get, ref, timeout=_ray_timeout(timeout_s))
+            return await async_get_ray_ref(ref, timeout_s=_ray_timeout(timeout_s))
         except ray.exceptions.GetTimeoutError as exc:
             raise OpenPIFastWorkerProtocolError(
                 "OpenPI action Ray runtime timed out for action_session_id "

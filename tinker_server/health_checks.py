@@ -63,57 +63,11 @@ async def deep_healthz_response() -> dict | JSONResponse:
         return degraded
 
     try:
-        import ray
-
-        from .config import RAY_NAMESPACE
-        from .ray_utils import init_ray
-
-        if not ray.is_initialized():
-            init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
-
-        def _pending_gpu_pg_names_in_namespace() -> list[str]:
-            tbl = ray.util.placement_group_table()
-            candidates: set[str] = set()
-            for info in tbl.values():
-                if not isinstance(info, dict):
-                    continue
-                name = info.get("name")
-                if not isinstance(name, str) or not name:
-                    continue
-                state = info.get("state")
-                if state in ("CREATED", "REMOVED"):
-                    continue
-                candidates.add(name)
-
-            pending: list[str] = []
-            for name in sorted(candidates):
-                try:
-                    pg = ray.util.get_placement_group(name)
-                except Exception:
-                    continue
-                try:
-                    info = ray.util.placement_group_table(pg)
-                except Exception:
-                    continue
-                state = info.get("state")
-                if state in ("CREATED", "REMOVED"):
-                    continue
-                bundles = info.get("bundles") or {}
-                total_gpu = 0.0
-                for bundle in bundles.values():
-                    if isinstance(bundle, dict):
-                        total_gpu += float(bundle.get("GPU", 0) or 0)
-                if total_gpu <= 0:
-                    continue
-                pending.append(name)
-            return pending
+        from .backend.async_ray_control import async_pending_gpu_pg_observation
 
         healthz_ray_timeout_s = float(os.environ.get("MINT_HEALTHZ_RAY_TIMEOUT_S", "10.0"))
         try:
-            pending_pg_names = await asyncio.wait_for(
-                asyncio.to_thread(_pending_gpu_pg_names_in_namespace),
-                timeout=healthz_ray_timeout_s,
-            )
+            ray_observation = await async_pending_gpu_pg_observation(timeout_s=healthz_ray_timeout_s)
         except asyncio.TimeoutError:
             return {
                 "status": "ready",
@@ -123,19 +77,8 @@ async def deep_healthz_response() -> dict | JSONResponse:
                 },
             }
 
-        if pending_pg_names:
-            available_resources = ray.available_resources()
-            cluster_resources = ray.cluster_resources()
-            return {
-                "status": "ready",
-                "ray_observation": {
-                    "reason": "pending_placement_groups",
-                    "pending_pg_count": len(pending_pg_names),
-                    "pending_pg_names": pending_pg_names[:20],
-                    "ray_gpu_available": float(available_resources.get("GPU", 0) or 0),
-                    "ray_gpu_total": float(cluster_resources.get("GPU", 0) or 0),
-                },
-            }
+        if ray_observation is not None:
+            return {"status": "ready", "ray_observation": ray_observation}
 
         return {"status": "ready"}
     except Exception as e:

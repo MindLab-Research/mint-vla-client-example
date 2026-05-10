@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, cast
 import ray
 
 from . import ray_kill
+from .async_ray_control import _ray_ref_to_future, _silence_late_result, async_get_ray_ref
 from ..logging_context import (
     classify_failure_reason,
     get_current_traceparent,
@@ -2541,17 +2542,9 @@ class VerlTrainingEngine:
         timeout_s = float(os.environ.get("MINT_WORKER_CUDA_SUMMARY_TIMEOUT_S", "2.0"))
         try:
             try:
-                return await asyncio.to_thread(
-                    ray.get,
-                    worker.get_cuda_memory_summary.remote(),
-                    timeout=timeout_s,
-                )
+                return await async_get_ray_ref(worker.get_cuda_memory_summary.remote(), timeout_s=timeout_s)
             except AttributeError:
-                return await asyncio.to_thread(
-                    ray.get,
-                    worker.get_cuda_memory_stats.remote(),
-                    timeout=timeout_s,
-                )
+                return await async_get_ray_ref(worker.get_cuda_memory_stats.remote(), timeout_s=timeout_s)
         except Exception as e:
             return {
                 "cuda_available": False,
@@ -3155,7 +3148,7 @@ class VerlTrainingEngine:
 
         # Dense trainer can be evicted by ResourcePool between RL stages.
         try:
-            await asyncio.to_thread(ray.get, worker.heartbeat.remote(), timeout=5)
+            await async_get_ray_ref(worker.heartbeat.remote(), timeout_s=5)
             return worker
         except ray.exceptions.GetTimeoutError:
             # Busy actor is still healthy; proceed with original handle.
@@ -3406,26 +3399,29 @@ class VerlTrainingEngine:
     ):
         """Await a Ray call while periodically touching ResourcePool.
 
-        Uses a poll loop with `ray.get(..., timeout=...)` executed in a thread to
-        avoid blocking the asyncio event loop. This ensures `timeout_s` can fire
-        during long Ray calls.
+        Uses one Ray ObjectRef future so polling-slice timeouts do not cancel
+        or restart the underlying Ray wait.
         """
         start = time.time()
-        while True:
-            self._touch_actor(session)
+        ref_future = _ray_ref_to_future(awaitable)
+        try:
+            while True:
+                self._touch_actor(session)
 
-            wait_s = interval_s
-            if timeout_s is not None and timeout_s > 0:
-                remaining = timeout_s - (time.time() - start)
-                if remaining <= 0:
-                    logger.warning(f"[{session.model_id}] Ray call timed out after {timeout_s}s")
-                    raise asyncio.TimeoutError(f"Ray call timed out after {timeout_s}s")
-                wait_s = min(wait_s, remaining)
+                wait_s = interval_s
+                if timeout_s is not None and timeout_s > 0:
+                    remaining = timeout_s - (time.time() - start)
+                    if remaining <= 0:
+                        logger.warning(f"[{session.model_id}] Ray call timed out after {timeout_s}s")
+                        raise asyncio.TimeoutError(f"Ray call timed out after {timeout_s}s")
+                    wait_s = min(wait_s, remaining)
 
-            try:
-                return await asyncio.to_thread(ray.get, awaitable, timeout=wait_s)
-            except ray.exceptions.GetTimeoutError:
-                continue
+                try:
+                    return await asyncio.wait_for(asyncio.shield(ref_future), timeout=wait_s)
+                except asyncio.TimeoutError:
+                    continue
+        finally:
+            _silence_late_result(ref_future)
 
     def _resolve_hf_model_path(self, hf_model_id: str) -> str | None:
         """Resolve HuggingFace model ID to local cache path.
@@ -3918,8 +3914,7 @@ class VerlTrainingEngine:
                     f"[{model_id}] reverse_kl prime reference session start: "
                     f"ref_session_id={ref_session_id} actual_rank={reference_actual_rank}"
                 )
-                await asyncio.to_thread(
-                    ray.get,
+                await async_get_ray_ref(
                     worker.prime_session_checkpoint.remote(
                         ref_session_id,
                         request.reference_model_path,
@@ -3930,8 +3925,7 @@ class VerlTrainingEngine:
                 )
                 logger.info(f"[{model_id}] reverse_kl prime reference session done: ref_session_id={ref_session_id}")
                 logger.info(f"[{model_id}] reverse_kl reference forward start: ref_session_id={ref_session_id}")
-                reference_chunks = await asyncio.to_thread(
-                    ray.get,
+                reference_chunks = await async_get_ray_ref(
                     worker.forward_reference_full_log_probs.remote(
                         data_items=reference_items,
                         temperature=float(request.temperature),
@@ -3969,10 +3963,7 @@ class VerlTrainingEngine:
                 )
             finally:
                 try:
-                    await asyncio.to_thread(
-                        ray.get,
-                        worker.delete_session.remote(ref_session_id, traceparent=traceparent),
-                    )
+                    await async_get_ray_ref(worker.delete_session.remote(ref_session_id, traceparent=traceparent))
                 except Exception:
                     logger.warning(
                         "[%s] reverse_kl reference session cleanup failed: ref_session_id=%s",
@@ -4376,9 +4367,6 @@ class VerlTrainingEngine:
         Returns:
             dict with modules_reset count.
         """
-        import asyncio
-        import ray
-
         model_id = session.model_id
         try:
             worker = await self._get_live_worker(session, op="reset_expert_bias")
@@ -4396,11 +4384,10 @@ class VerlTrainingEngine:
 
         logger.info(f"[{model_id}] reset_expert_bias: calling worker...")
 
-        loop = asyncio.get_running_loop()
         try:
             traceparent = get_current_traceparent()
             result_ref = worker.reset_expert_bias.remote(traceparent=traceparent)
-            result = await loop.run_in_executor(None, ray.get, result_ref)
+            result = await async_get_ray_ref(result_ref)
             # MegatronWorkerGroup returns 'reset_count', normalize to 'modules_reset'
             modules_reset = result.get("reset_count", result.get("modules_reset", 0))
             logger.info(f"[{model_id}] reset_expert_bias: reset {modules_reset} modules")
@@ -4791,8 +4778,7 @@ class VerlTrainingEngine:
                 self._actor_volatile_sessions.setdefault(actor_name, set()).add(session.model_id)
 
             worker = await self._get_live_worker(session, op="load_weights", allow_recover=False)
-            await asyncio.to_thread(
-                ray.get,
+            await async_get_ray_ref(
                 worker.mark_session_loaded.remote(
                     session.model_id,
                     step_count=session.current_step,
@@ -4805,7 +4791,7 @@ class VerlTrainingEngine:
                     train_mlp=meta["train_mlp"],
                     train_unembed=meta["train_unembed"],
                 ),
-                timeout=load_timeout_s,
+                timeout_s=load_timeout_s,
             )
             if not bool(meta["optimizer_restored"]):
                 actor_name = self._actor_name_for_session(session)
@@ -4857,13 +4843,12 @@ class VerlTrainingEngine:
             delete_session = getattr(worker, "delete_session", None)
             if delete_session is not None:
                 try:
-                    await asyncio.to_thread(
-                        ray.get,
+                    await async_get_ray_ref(
                         delete_session.remote(model_id, traceparent=traceparent),
-                        timeout=30,
+                        timeout_s=30,
                     )
                 except TypeError:
-                    await asyncio.to_thread(ray.get, delete_session.remote(model_id), timeout=30)
+                    await async_get_ray_ref(delete_session.remote(model_id), timeout_s=30)
                 except Exception:
                     logger.warning(
                         "[%s] delete_session remote cleanup failed",

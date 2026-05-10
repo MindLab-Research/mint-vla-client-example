@@ -14,6 +14,7 @@ import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from ..config import RAY_NAMESPACE
+from .async_ray_control import async_get_ray_ref
 from .openpi_fast_runtime import (
     OpenPIFastRuntimeSpec,
     OpenPIFastWorkerClient,
@@ -181,7 +182,7 @@ async def _cleanup_failed_shared_actor_start(*, actor_name: str, actor: Any) -> 
         return errors
 
     try:
-        await asyncio.to_thread(ray.get, actor.shutdown.remote(), timeout=5.0)
+        await async_get_ray_ref(actor.shutdown.remote(), timeout_s=5.0)
     except Exception as exc:
         errors.append(
             f"OpenPI shared actor shutdown failed for {actor_name}: {type(exc).__name__}: {exc}"
@@ -523,7 +524,7 @@ class OpenPISharedRayRuntimeClient:
 
     async def _ray_get(self, ref: Any, *, timeout_s: float | None) -> Any:
         try:
-            return await asyncio.to_thread(ray.get, ref, timeout=_ray_timeout(timeout_s))
+            return await async_get_ray_ref(ref, timeout_s=_ray_timeout(timeout_s))
         except ray.exceptions.GetTimeoutError as exc:
             raise OpenPIFastWorkerProtocolError(
                 f"OpenPI shared Ray runtime timed out for session {self._session_id!r} after {timeout_s}s"

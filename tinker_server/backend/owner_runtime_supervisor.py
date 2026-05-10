@@ -17,6 +17,7 @@ from ..checkpoints import (
 )
 from ..ray_utils import register_ray_reconnect_invalidator as _register_ray_reconnect_invalidator
 from ..server_info import _git_sha
+from .async_ray_control import _await_with_ray_get_timeout, sync_get_ray_ref
 
 CURRENT_CODE_IDENTITY = os.environ.get("MINT_GIT_SHA") or _git_sha()
 
@@ -150,21 +151,7 @@ def _kill_named_actor(actor: Any) -> None:
 
 
 def _await_ray_ref_sync(ref: Any, *, timeout_s: float | None = None) -> Any:
-    if hasattr(ref, "__await__"):
-        coro = ref
-        if timeout_s is None:
-            return asyncio.run(coro)
-        return asyncio.run(asyncio.wait_for(coro, timeout=float(timeout_s)))
-    to_future = getattr(ref, "future", None)
-    if callable(to_future):
-        fut = to_future()
-        if isinstance(fut, concurrent.futures.Future):
-            return fut.result(timeout=timeout_s)
-        if isinstance(fut, asyncio.Future) or hasattr(fut, "__await__"):
-            if timeout_s is None:
-                return asyncio.run(fut)
-            return asyncio.run(asyncio.wait_for(fut, timeout=float(timeout_s)))
-    return ref
+    return sync_get_ray_ref(ref, timeout_s=timeout_s)
 
 
 def _get_or_create_actor():
@@ -385,7 +372,10 @@ class OwnerRuntimeSupervisor:
         self._reset_cached_actor()
         await asyncio.to_thread(_kill_named_actor, actor)
         actor = self._get_ray_actor()
-        refreshed = await asyncio.wait_for(_await_ray_ref(actor.async_health_snapshot.remote()), timeout=15.0)
+        refreshed = await _await_with_ray_get_timeout(
+            _await_ray_ref(actor.async_health_snapshot.remote()),
+            timeout_s=15.0,
+        )
         if refreshed.get("code_identity") != CURRENT_CODE_IDENTITY:
             raise RuntimeError(
                 "owner runtime supervisor code identity mismatch after recreate: "
@@ -394,10 +384,16 @@ class OwnerRuntimeSupervisor:
 
     async def async_ensure_started(self, *, timeout_s: float = 15.0) -> dict[str, Any]:
         actor = self._get_ray_actor()
-        snapshot = await asyncio.wait_for(_await_ray_ref(actor.async_health_snapshot.remote()), timeout=float(timeout_s))
+        snapshot = await _await_with_ray_get_timeout(
+            _await_ray_ref(actor.async_health_snapshot.remote()),
+            timeout_s=float(timeout_s),
+        )
         await self._ensure_code_identity_async(snapshot)
         actor = self._get_ray_actor()
-        return await asyncio.wait_for(_await_ray_ref(actor.ensure_started.remote()), timeout=float(timeout_s))
+        return await _await_with_ray_get_timeout(
+            _await_ray_ref(actor.ensure_started.remote()),
+            timeout_s=float(timeout_s),
+        )
 
     def ensure_started(self, *, timeout_s: float = 15.0) -> dict[str, Any]:
         actor = self._get_ray_actor()
@@ -408,10 +404,16 @@ class OwnerRuntimeSupervisor:
 
     async def async_health_snapshot(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
         actor = self._get_ray_actor()
-        snapshot = await asyncio.wait_for(_await_ray_ref(actor.async_health_snapshot.remote()), timeout=float(timeout_s))
+        snapshot = await _await_with_ray_get_timeout(
+            _await_ray_ref(actor.async_health_snapshot.remote()),
+            timeout_s=float(timeout_s),
+        )
         await self._ensure_code_identity_async(snapshot)
         actor = self._get_ray_actor()
-        return await asyncio.wait_for(_await_ray_ref(actor.async_health_snapshot.remote()), timeout=float(timeout_s))
+        return await _await_with_ray_get_timeout(
+            _await_ray_ref(actor.async_health_snapshot.remote()),
+            timeout_s=float(timeout_s),
+        )
 
     def health_snapshot(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
         actor = self._get_ray_actor()
@@ -422,7 +424,10 @@ class OwnerRuntimeSupervisor:
 
     async def async_run_once(self, loop_name: str, *, timeout_s: float = 30.0) -> dict[str, Any]:
         actor = self._get_ray_actor()
-        return await asyncio.wait_for(_await_ray_ref(actor.run_once.remote(str(loop_name))), timeout=float(timeout_s))
+        return await _await_with_ray_get_timeout(
+            _await_ray_ref(actor.run_once.remote(str(loop_name))),
+            timeout_s=float(timeout_s),
+        )
 
 
 owner_runtime_supervisor = OwnerRuntimeSupervisor()

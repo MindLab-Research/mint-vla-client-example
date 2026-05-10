@@ -183,14 +183,13 @@ def _collect_ray_cluster_health() -> dict[str, Any]:
     import ray
 
     from .config import RAY_NAMESPACE
-    from .ray_utils import init_ray
 
     max_pending_pg_names = _int_env("MINT_RAY_CLUSTER_HEALTH_MAX_PENDING_PG_NAMES", 20)
     max_dead_node_sample = _int_env("MINT_RAY_CLUSTER_HEALTH_MAX_DEAD_NODE_SAMPLE", 10)
     slow_probe_ms = _float_env("MINT_RAY_CLUSTER_HEALTH_SLOW_PROBE_MS", 2000.0)
 
     if not ray.is_initialized():
-        init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
+        raise RuntimeError("Ray is not initialized")
 
     probes: dict[str, dict[str, Any]] = {}
     started = time.perf_counter()

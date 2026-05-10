@@ -5,8 +5,6 @@ import pytest
 
 pytest.importorskip("ray")
 
-import ray
-
 from tinker_server.backend import resource_pool as resource_pool_module
 from tinker_server.backend.resource_pool import ActorType, get_resource_pool
 from tinker_server.backend.training_session_manager import TrainingSession
@@ -55,14 +53,10 @@ def test_issue_230_timeout_does_not_kill_actor(monkeypatch: pytest.MonkeyPatch) 
 
     monkeypatch.setattr(verl_training.ray_kill, "kill", _fake_kill)
 
-    def _always_timeout(*args, **kwargs):
-        raise ray.exceptions.GetTimeoutError("timeout")
-
-    monkeypatch.setattr(ray, "get", _always_timeout)
-
     async def _run() -> None:
+        fut = asyncio.get_running_loop().create_future()
         await engine._await_with_keepalive(
-            awaitable=object(),
+            awaitable=fut,
             session=session,
             interval_s=0.01,
             timeout_s=0.05,
@@ -105,17 +99,19 @@ def test_issue_230_keepalive_touches_dense_actor_without_inflight_mark(monkeypat
     observed_inflight: list[int] = []
     before_last_accessed = pool.get(actor_name).last_accessed
 
-    def _timeout_once_then_return(*args, **kwargs):
-        observed_inflight.append(pool.get(actor_name).inflight_count)
-        if len(observed_inflight) == 1:
-            raise ray.exceptions.GetTimeoutError("timeout")
-        return {"ok": True}
+    original_touch_actor = engine._touch_actor
 
-    monkeypatch.setattr(ray, "get", _timeout_once_then_return)
+    def _touch_actor(target_session):
+        observed_inflight.append(pool.get(actor_name).inflight_count)
+        return original_touch_actor(target_session)
+
+    monkeypatch.setattr(engine, "_touch_actor", _touch_actor)
 
     async def _run() -> None:
+        fut = asyncio.get_running_loop().create_future()
+        asyncio.get_running_loop().call_later(0.025, fut.set_result, {"ok": True})
         result = await engine._await_with_keepalive(
-            awaitable=object(),
+            awaitable=fut,
             session=session,
             interval_s=0.01,
             timeout_s=0.05,
@@ -129,6 +125,69 @@ def test_issue_230_keepalive_touches_dense_actor_without_inflight_mark(monkeypat
     assert pool.get(actor_name).last_accessed >= before_last_accessed
     assert entry.current_session == model_id
 
+    pool.unregister(actor_name)
+
+
+def test_issue_230_keepalive_cancellation_silences_late_exception(monkeypatch: pytest.MonkeyPatch) -> None:
+    pool = _get_local_resource_pool(monkeypatch)
+    actor_name = f"peft_trainer_test_{uuid.uuid4().hex}_maxr64"
+    model_id = f"model_{uuid.uuid4().hex}"
+
+    pool.register(
+        actor_name=actor_name,
+        actor_type=ActorType.DENSE,
+        num_gpus=1,
+        base_model="/tmp/fake_model_path",
+        session_id=model_id,
+    )
+    pool.mark_ready(actor_name)
+
+    engine = VerlTrainingEngine()
+    engine._resource_pool_actor_names[model_id] = actor_name
+
+    session = TrainingSession(
+        model_id=model_id,
+        session_id="session_x",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-0.6B",
+        backend="peft",
+    )
+    discarded: list[str] = []
+
+    from tinker_server.backend import async_ray_control
+
+    def _record_late_result(fut: asyncio.Future) -> None:
+        try:
+            fut.result()
+        except RuntimeError as exc:
+            discarded.append(str(exc))
+        except BaseException as exc:
+            discarded.append(type(exc).__name__)
+
+    monkeypatch.setattr(async_ray_control, "_discard_late_result", _record_late_result)
+
+    async def _run() -> None:
+        fut = asyncio.get_running_loop().create_future()
+        task = asyncio.create_task(
+            engine._await_with_keepalive(
+                awaitable=fut,
+                session=session,
+                interval_s=1.0,
+                timeout_s=60.0,
+            )
+        )
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not fut.cancelled()
+
+        fut.set_exception(RuntimeError("late boom"))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert discarded == ["late boom"]
+
+    asyncio.run(_run())
     pool.unregister(actor_name)
 
 
@@ -172,7 +231,7 @@ def test_issue_230_unbind_session_keeps_shared_dense_actor_pinned(monkeypatch: p
 
     monkeypatch.setattr(verl_training.ray_kill, "kill", _fake_kill)
 
-    asyncio.run(engine.unbind_session(session))
+    asyncio.run(engine.shutdown_session(session))
 
     assert killed == []
     assert model_id not in engine._resource_pool_actor_names

@@ -1,10 +1,12 @@
 import asyncio
+import concurrent.futures
 import json
 import logging
 import os
 from pathlib import Path
 from types import SimpleNamespace
 import time
+import threading
 import sys
 import types
 
@@ -19,14 +21,80 @@ from tinker_server.backend.training_session_manager import TrainingSession
 from tinker_server.backend.verl_training import TrainingWorker, VerlTrainingEngine
 
 
+_UNSET = object()
+
+
+class _FakeRayRef:
+    def __init__(
+        self,
+        label: object | None = None,
+        *,
+        result: object = _UNSET,
+        exc: BaseException | None = None,
+    ):
+        self._label = label
+        self._result = result
+        self._exc = exc
+        self._future: concurrent.futures.Future | None = None
+
+    def __eq__(self, other):
+        return self._label == other
+
+    def __hash__(self):
+        return hash(self._label)
+
+    def __repr__(self):
+        return repr(self._label)
+
+    def future(self):
+        if self._future is not None:
+            return self._future
+        future: concurrent.futures.Future = concurrent.futures.Future()
+        if self._exc is not None:
+            future.set_exception(self._exc)
+        elif self._result is not _UNSET:
+            future.set_result(self._result)
+        else:
+            def _resolve():
+                try:
+                    result = ray.get(self._label, timeout=1.0)
+                    if not future.cancelled():
+                        future.set_result(result)
+                except BaseException as exc:
+                    if not future.cancelled():
+                        future.set_exception(exc)
+
+            threading.Thread(target=_resolve, daemon=True).start()
+        self._future = future
+        return future
+
+
+def _coerce_ray_ref(ref: object) -> object:
+    if isinstance(ref, str):
+        return _FakeRayRef(ref)
+    return ref
+
+
+def _completed_ray_ref(result: object = None) -> _FakeRayRef:
+    return _FakeRayRef(result=result)
+
+
+def _failed_ray_ref(exc: BaseException) -> _FakeRayRef:
+    return _FakeRayRef(exc=exc)
+
+
+def _labeled_ray_ref(label: object) -> _FakeRayRef:
+    return _FakeRayRef(label)
+
+
 class _RecordingRemoteMethod:
-    def __init__(self, ref: str):
+    def __init__(self, ref: object):
         self._ref = ref
         self.calls: list[tuple[tuple, dict]] = []
 
     def remote(self, *args, **kwargs):
         self.calls.append((args, kwargs))
-        return self._ref
+        return _coerce_ray_ref(self._ref)
 
 
 class _HeartbeatWorkerMixin:
@@ -51,7 +119,7 @@ class _FakeLoadWorker(_HeartbeatWorkerMixin):
         super().__init__()
         self.__ray_ready__ = _RecordingRemoteMethod("fake-load-ready-ref")
         self.load_checkpoint = _RecordingRemoteMethod(ref)
-        self.mark_session_loaded = _RecordingRemoteMethod("fake-mark-session-loaded-ref")
+        self.mark_session_loaded = _RecordingRemoteMethod(_completed_ray_ref({"status": "ok"}))
 
 
 async def _noop_log_worker_request_context(*args, **kwargs):
@@ -100,14 +168,16 @@ def test_issue_193_training_worker_load_checkpoint_without_optimizer_resets_stat
     worker = object.__new__(impl_cls)
 
     worker.device = "cpu"
-    worker.model = object()
+    worker.model = SimpleNamespace(named_parameters=lambda: [])
+    worker.max_lora_rank = 8
+    worker._current_actual_rank = None
     worker._step_count = 0
     worker._touch = lambda: None
 
     ensure_calls: list[str] = []
     reset_calls: list[float | None] = []
 
-    worker._ensure_session_loaded = lambda session_id: ensure_calls.append(session_id)
+    worker._ensure_session_loaded = lambda session_id, **kwargs: ensure_calls.append(session_id)
     worker.reset_optimizer = lambda learning_rate=None: reset_calls.append(learning_rate) or {
         "status": "ok",
         "learning_rate": learning_rate,
@@ -124,10 +194,15 @@ def test_issue_193_training_worker_load_checkpoint_without_optimizer_resets_stat
     (ckpt_dir / "adapter_model.safetensors").write_bytes(b"stub")
     (ckpt_dir / "training_meta.json").write_text('{"current_step": 17, "learning_rate": 0.0005}')
 
+    torch = pytest.importorskip("torch")
     fake_safetensors_torch = types.ModuleType("safetensors.torch")
-    fake_safetensors_torch.load_file = lambda *args, **kwargs: {"fake": "state"}
+    fake_safetensors_torch.load_file = lambda *args, **kwargs: {
+        "fake.lora_A.weight": torch.ones(8, 1),
+        "fake.lora_B.weight": torch.ones(1, 8),
+    }
     fake_safetensors = types.ModuleType("safetensors")
     fake_safetensors.torch = fake_safetensors_torch
+    fake_safetensors.safe_open = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "safetensors", fake_safetensors)
     monkeypatch.setitem(sys.modules, "safetensors.torch", fake_safetensors_torch)
 
@@ -163,14 +238,16 @@ def test_issue_193_training_worker_load_checkpoint_invalid_meta_preserves_step_a
     worker = object.__new__(impl_cls)
 
     worker.device = "cpu"
-    worker.model = object()
+    worker.model = SimpleNamespace(named_parameters=lambda: [])
+    worker.max_lora_rank = 8
+    worker._current_actual_rank = None
     worker._step_count = 33
     worker._touch = lambda: None
 
     ensure_calls: list[str] = []
     reset_calls: list[float | None] = []
 
-    worker._ensure_session_loaded = lambda session_id: ensure_calls.append(session_id)
+    worker._ensure_session_loaded = lambda session_id, **kwargs: ensure_calls.append(session_id)
     worker.reset_optimizer = lambda learning_rate=None: reset_calls.append(learning_rate) or {
         "status": "ok",
         "learning_rate": learning_rate,
@@ -187,10 +264,15 @@ def test_issue_193_training_worker_load_checkpoint_invalid_meta_preserves_step_a
     (ckpt_dir / "adapter_model.safetensors").write_bytes(b"stub")
     (ckpt_dir / "training_meta.json").write_text('{"current_step": "bad", "learning_rate": "oops"}')
 
+    torch = pytest.importorskip("torch")
     fake_safetensors_torch = types.ModuleType("safetensors.torch")
-    fake_safetensors_torch.load_file = lambda *args, **kwargs: {"fake": "state"}
+    fake_safetensors_torch.load_file = lambda *args, **kwargs: {
+        "fake.lora_A.weight": torch.ones(8, 1),
+        "fake.lora_B.weight": torch.ones(1, 8),
+    }
     fake_safetensors = types.ModuleType("safetensors")
     fake_safetensors.torch = fake_safetensors_torch
+    fake_safetensors.safe_open = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "safetensors", fake_safetensors)
     monkeypatch.setitem(sys.modules, "safetensors.torch", fake_safetensors_torch)
 
@@ -432,7 +514,7 @@ def test_issue_193_megatron_save_weights_concurrent_shared_actor_is_isolated(mon
 
         def remote(self, *args, **kwargs):
             self.calls.append((args, kwargs))
-            return f"shared-ref-{kwargs['session_id']}"
+            return _labeled_ray_ref(f"shared-ref-{kwargs['session_id']}")
 
     shared_remote = _SharedCheckpointRemote()
     shared_worker = SimpleNamespace(save_checkpoint=shared_remote)
@@ -1283,7 +1365,7 @@ def test_issue_193_megatron_load_weights_keeps_session_volatile_until_mark_loade
     engine = VerlTrainingEngine()
     model_id = "model_issue_193_megatron_load_mark_gap"
     worker = _FakeLoadWorker(ref="megatron-load-mark-gap-ref")
-    worker.mark_session_loaded = _RecordingRemoteMethod("mark-loaded-gap-ref")
+    worker.mark_session_loaded = _RecordingRemoteMethod(_failed_ray_ref(ray.exceptions.ActorDiedError()))
     engine._workers[model_id] = worker
     engine._resource_pool_actor_names[model_id] = "shared-megatron-actor"
 
@@ -1301,13 +1383,7 @@ def test_issue_193_megatron_load_weights_keeps_session_volatile_until_mark_loade
         assert awaitable == "megatron-load-mark-gap-ref"
         return {"current_step": 8, "learning_rate": 1e-4, "actual_rank": 5}
 
-    def fake_ray_get(ref, timeout=None):
-        if ref == "mark-loaded-gap-ref":
-            raise ray.exceptions.ActorDiedError()
-        return {"status": "ok"}
-
     monkeypatch.setattr(engine, "_await_with_keepalive", fake_keepalive)
-    monkeypatch.setattr(ray, "get", fake_ray_get)
 
     async def _run():
         await engine.load_weights(
@@ -2503,7 +2579,7 @@ def test_issue_193_same_model_concurrent_save_weights_out_of_order_steps_do_not_
         def remote(self, *args, **kwargs):
             self._count += 1
             self.calls.append((args, kwargs))
-            return f"same-model-save-ref-{self._count}"
+            return _labeled_ray_ref(f"same-model-save-ref-{self._count}")
 
     remote = _SequenceCheckpointRemote()
     engine._workers[model_id] = SimpleNamespace(save_checkpoint=remote)
@@ -2551,7 +2627,7 @@ def test_issue_193_same_model_concurrent_save_lora_out_of_order_steps_do_not_reg
         def remote(self, *args, **kwargs):
             self._count += 1
             self.calls.append((args, kwargs))
-            return f"same-model-lora-ref-{self._count}"
+            return _labeled_ray_ref(f"same-model-lora-ref-{self._count}")
 
     remote = _SequenceLoraRemote()
     engine._workers[model_id] = SimpleNamespace(save_lora_weights=remote)

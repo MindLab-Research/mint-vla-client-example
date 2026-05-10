@@ -19,6 +19,7 @@ import time
 from enum import Enum
 from typing import Any
 
+from .async_ray_control import _await_with_ray_get_timeout
 from .queue_execution_context import get_current_queue_generation_id
 from ..config import config as server_config, otel_env_vars
 
@@ -1074,7 +1075,10 @@ class FutureStore:
         import ray
 
         try:
-            out = await asyncio.wait_for(_await_ray_ref(actor.stats.remote()), timeout=float(timeout_s))
+            out = await _await_with_ray_get_timeout(
+                _await_ray_ref(actor.stats.remote()),
+                timeout_s=float(timeout_s),
+            )
         except ray.exceptions.ActorDiedError as e:
             self._ray_actor = None
             raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
@@ -1088,7 +1092,10 @@ class FutureStore:
         import ray
 
         try:
-            v = await asyncio.wait_for(_await_ray_ref(actor.get_rss_bytes.remote()), timeout=float(timeout_s))
+            v = await _await_with_ray_get_timeout(
+                _await_ray_ref(actor.get_rss_bytes.remote()),
+                timeout_s=float(timeout_s),
+            )
         except ray.exceptions.ActorDiedError as e:
             self._ray_actor = None
             raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
@@ -1107,7 +1114,7 @@ class FutureStore:
             if not require_ready:
                 return actor
             try:
-                await asyncio.wait_for(_await_ray_ref(actor.stats.remote()), timeout=1.0)
+                await _await_with_ray_get_timeout(_await_ray_ref(actor.stats.remote()), timeout_s=1.0)
                 return actor
             except Exception:
                 self._ray_actor = None
@@ -1266,9 +1273,9 @@ class FutureStore:
                 return out
 
             try:
-                out["ray_actor_stats"] = await asyncio.wait_for(
+                out["ray_actor_stats"] = await _await_with_ray_get_timeout(
                     _await_ray_ref(actor.stats.remote()),
-                    timeout=float(timeout_s),
+                    timeout_s=float(timeout_s),
                 )
             except Exception as e:
                 out["ray_actor_stats_error"] = f"{type(e).__name__}: {e}"
@@ -1384,7 +1391,7 @@ class FutureStore:
         except Exception:
             pass
     async def async_fail_training_requests_for_model(self, model_id: str, error: str) -> list[str]:
-        actor = await self._get_ray_actor_async()
+        actor = self._get_cached_ray_actor_for_async_request_path()
         import ray
 
         try:

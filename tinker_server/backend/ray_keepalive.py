@@ -8,6 +8,7 @@ from typing import Any
 import ray
 
 from ..config import config as server_config
+from .async_ray_control import _ray_ref_to_future, _silence_late_result
 from .resource_pool import get_resource_pool
 
 logger = logging.getLogger(__name__)
@@ -28,7 +29,7 @@ async def ray_get_with_resource_pool_keepalive(
     and evicted mid-request.
 
     Implementation notes:
-    - Uses ray.get(..., timeout=...) in a thread to avoid blocking the asyncio loop.
+    - Awaits Ray ObjectRef through Ray's asyncio future bridge.
     - Touches before each timed wait; stops touching once the ref resolves.
     """
     if interval_s <= 0:
@@ -44,6 +45,7 @@ async def ray_get_with_resource_pool_keepalive(
     tag = f"req={request_id} " if request_id else ""
 
     pool.mark_inflight(actor_name, +1)
+    ref_future = _ray_ref_to_future(ref)
     try:
         iteration = 0
         while True:
@@ -57,7 +59,7 @@ async def ray_get_with_resource_pool_keepalive(
                 wait_s = min(wait_s, remaining)
 
             try:
-                result = await asyncio.to_thread(ray.get, ref, timeout=wait_s)
+                result = await asyncio.wait_for(asyncio.shield(ref_future), timeout=wait_s)
                 elapsed = time.time() - start
                 if elapsed > 60.0:
                     logger.info(
@@ -65,7 +67,7 @@ async def ray_get_with_resource_pool_keepalive(
                         tag, actor_name, elapsed, iteration,
                     )
                 return result
-            except ray.exceptions.GetTimeoutError:
+            except (asyncio.TimeoutError, ray.exceptions.GetTimeoutError):
                 iteration += 1
                 elapsed = time.time() - start
                 # Log every 60s while waiting
@@ -76,4 +78,5 @@ async def ray_get_with_resource_pool_keepalive(
                     )
                 continue
     finally:
+        _silence_late_result(ref_future)
         pool.mark_inflight(actor_name, -1)

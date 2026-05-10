@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import hashlib
 import json
 import logging
@@ -29,6 +28,7 @@ from ..logging_context import (
 )
 from ..queue_priority import QUEUE_PRIORITY_AGING_S, effective_queue_priority, normalize_queue_priority
 from ..server_info import _git_sha
+from .async_ray_control import async_get_ray_ref, sync_get_ray_ref
 from .work_classification import infer_scheduler_capacity_owner
 
 logger = logging.getLogger(__name__)
@@ -218,21 +218,7 @@ def _kill_ray_actor(actor: Any, *, reason: str) -> None:
 
 
 def _await_ray_ref_sync(ref: Any, *, timeout_s: float | None = None) -> Any:
-    if hasattr(ref, "__await__"):
-        coro = ref
-        if timeout_s is None:
-            return asyncio.run(coro)
-        return asyncio.run(asyncio.wait_for(coro, timeout=float(timeout_s)))
-    to_future = getattr(ref, "future", None)
-    if callable(to_future):
-        fut = to_future()
-        if isinstance(fut, concurrent.futures.Future):
-            return fut.result(timeout=timeout_s)
-        if isinstance(fut, asyncio.Future) or hasattr(fut, "__await__"):
-            if timeout_s is None:
-                return asyncio.run(fut)
-            return asyncio.run(asyncio.wait_for(fut, timeout=float(timeout_s)))
-    return ref
+    return sync_get_ray_ref(ref, timeout_s=timeout_s)
 
 
 def _create_ray_actor(*, require_ready: bool = True):
@@ -2192,23 +2178,12 @@ class ApiWorkQueueClient:
             await self._await_ray_ref(ref, timeout_s=timeout_s)
 
         if not ray.is_initialized():
-            try:
-                from ..ray_utils import init_ray
-
-                init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
-                _append_api_work_queue_debug("get_ray_actor_async_after_init_ray", require_ready=bool(require_ready))
-            except Exception as e:
-                _append_api_work_queue_debug(
-                    "get_ray_actor_async_init_ray_error",
-                    require_ready=bool(require_ready),
-                    error=f"{type(e).__name__}: {e}",
-                    traceback=traceback.format_exc(),
-                )
-                raise ApiWorkQueueUnavailableError("Ray not initialized (init_ray failed)") from e
-        else:
-            _append_api_work_queue_debug("get_ray_actor_async_using_existing_ray", require_ready=bool(require_ready))
-        if not ray.is_initialized():
+            _append_api_work_queue_debug(
+                "get_ray_actor_async_ray_not_initialized",
+                require_ready=bool(require_ready),
+            )
             raise ApiWorkQueueUnavailableError("Ray not initialized")
+        _append_api_work_queue_debug("get_ray_actor_async_using_existing_ray", require_ready=bool(require_ready))
 
         if self._ray_actor is not None:
             if not require_ready:
@@ -2306,29 +2281,12 @@ class ApiWorkQueueClient:
     async def _await_ray_ref(self, ref: Any, *, timeout_s: float | None = None) -> Any:
         """Await a Ray ObjectRef without threadpool bridges.
 
-        Prefer Ray's asyncio-compatible future() bridge so we can apply asyncio
-        timeout semantics without run_in_executor/to_thread.
+        Timeout only stops the local wait; it must not cancel the Ray task.
         """
-        awaitable: Any = ref
-        ref_future = getattr(ref, "future", None)
-        if callable(ref_future):
-            try:
-                awaitable = asyncio.wrap_future(ref_future())
-            except Exception:
-                awaitable = ref
-        try:
-            if timeout_s is None:
-                return await awaitable
-            return await asyncio.wait_for(awaitable, timeout=float(timeout_s))
-        except asyncio.TimeoutError as e:
-            # Preserve the previous surface where a timed-out Ray ref probe raised
-            # Ray GetTimeoutError instead of asyncio.TimeoutError.
-            import ray
-
-            raise ray.exceptions.GetTimeoutError(f"timed out after {float(timeout_s):.3f}s") from e
+        return await async_get_ray_ref(ref, timeout_s=None if timeout_s is None else float(timeout_s))
 
     async def async_ensure_started(self) -> None:
-        await self._get_ray_actor_async(require_ready=True)
+        await self._get_ray_actor_async(require_ready=False)
 
     async def async_ensure_ready(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
         actor = await self._get_ray_actor_async(require_ready=False)

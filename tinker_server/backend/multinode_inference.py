@@ -36,6 +36,7 @@ from tinker_server.ray_utils import init_ray
 from tinker_server.runtime_env import join_pythonpath, sanitize_worker_pythonpath
 
 from . import ray_kill
+from .async_ray_control import async_get_ray_ref
 from .gpu_binding_helpers import gpu_bindings_from_ray_gpu_ids
 from .multinode_resources import compute_multinode_engine_resources
 from .ray_placement_groups import PlacementGroupMismatchError, get_named_placement_group
@@ -2317,7 +2318,7 @@ class MultiNodeInferenceEngine:
             try:
                 existing_actor = ray.get_actor(self.actor_name, namespace=PERSISTENT_NAMESPACE)
                 try:
-                    is_ready = await asyncio.to_thread(ray.get, existing_actor.is_ready.remote(), timeout=30)
+                    is_ready = await async_get_ray_ref(existing_actor.is_ready.remote(), timeout_s=30)
                 except ray.exceptions.GetTimeoutError:
                     # A timed-out readiness probe means the actor exists but its event loop is
                     # currently occupied. That happens both during long initialization and while
@@ -2353,7 +2354,7 @@ class MultiNodeInferenceEngine:
                         f"Actor {self.actor_name} exists but not ready; waiting for initialize (timeout={init_timeout}s)"
                     )
                     try:
-                        await asyncio.to_thread(ray.get, existing_actor.initialize.remote(), timeout=init_timeout)
+                        await async_get_ray_ref(existing_actor.initialize.remote(), timeout_s=init_timeout)
                     except ray.exceptions.GetTimeoutError:
                         logger.warning(
                             f"Actor {self.actor_name} initialize timed out after {init_timeout}s; will recreate"
@@ -2579,7 +2580,7 @@ class MultiNodeInferenceEngine:
                         lifetime="detached",
                     )
                 try:
-                    await asyncio.to_thread(ray.get, pg.ready())
+                    await async_get_ray_ref(pg.ready())
                 except SystemExit as e:
                     if getattr(e, "code", None) == 15:
                         raise
@@ -2782,12 +2783,8 @@ class MultiNodeInferenceEngine:
                 f"total_gpus={total_required_gpus}"
             )
 
-            loop = asyncio.get_event_loop()
             try:
-                await loop.run_in_executor(
-                    None,
-                    lambda: ray.get(self.engine.initialize.remote(), timeout=init_timeout)
-                )
+                await async_get_ray_ref(self.engine.initialize.remote(), timeout_s=init_timeout)
             except SystemExit as e:
                 if getattr(e, "code", None) == 15:
                     raise
@@ -3013,12 +3010,11 @@ class MultiNodeInferenceEngine:
         """Best-effort abort for an in-flight vLLM request."""
         if not self._initialized:
             return
-        import ray
         traceparent = get_current_traceparent()
 
         try:
             ref = self.engine.abort_request.remote(request_id, traceparent=traceparent)
-            await asyncio.to_thread(ray.get, ref, timeout=10)
+            await async_get_ray_ref(ref, timeout_s=10)
         except Exception as e:
             logger.warning(f"MultiNodeInferenceEngine.abort_request failed: {type(e).__name__}: {e}")
 
@@ -3076,7 +3072,7 @@ class MultiNodeInferenceEngine:
             # Try aborting just this request, then fail loud to the client.
             try:
                 abort_ref = self.engine.abort_request.remote(request_id, traceparent=traceparent)
-                await asyncio.to_thread(ray.get, abort_ref, timeout=10)
+                await async_get_ray_ref(abort_ref, timeout_s=10)
             except Exception:
                 pass
             raise RuntimeError(
@@ -3170,7 +3166,7 @@ class MultiNodeInferenceEngine:
         except asyncio.TimeoutError as e:
             try:
                 abort_ref = self.engine.abort_request.remote(request_id, traceparent=traceparent)
-                await asyncio.to_thread(ray.get, abort_ref, timeout=10)
+                await async_get_ray_ref(abort_ref, timeout_s=10)
             except Exception:
                 pass
             raise RuntimeError(

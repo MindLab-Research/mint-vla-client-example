@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import os
 from types import SimpleNamespace
@@ -55,6 +56,18 @@ def _create_payload(session: TrainingSession, *, learning_rate: float = 1e-4) ->
         "max_token_len": 200,
         "camera_layout": ["base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"],
     }
+
+
+def _completed_ref(value: object) -> SimpleNamespace:
+    fut: concurrent.futures.Future[object] = concurrent.futures.Future()
+    fut.set_result(value)
+    return SimpleNamespace(future=lambda: fut)
+
+
+def _failed_ref(exc: BaseException) -> SimpleNamespace:
+    fut: concurrent.futures.Future[object] = concurrent.futures.Future()
+    fut.set_exception(exc)
+    return SimpleNamespace(future=lambda: fut)
 
 
 def _reset_shared_runtime_test_state(monkeypatch, openpi_shared_ray_runtime) -> None:
@@ -362,6 +375,29 @@ def test_openpi_shared_runtime_client_refreshes_named_actor_before_request(monke
     ]
 
 
+def test_openpi_shared_ray_runtime_client_ray_get_awaits_future_without_ray_get(monkeypatch) -> None:
+    pytest.importorskip("ray")
+    from tinker_server.backend.openpi_shared_ray_runtime import OpenPISharedRayRuntimeClient
+
+    client = OpenPISharedRayRuntimeClient(
+        actor=object(),
+        actor_name="openpi-shared-actor",
+        spec=_spec(),
+        session_id="model-a",
+        ready_timeout_s=30.0,
+    )
+    fut: concurrent.futures.Future[dict[str, object]] = concurrent.futures.Future()
+    fut.set_result({"ok": True})
+    ref = SimpleNamespace(future=lambda: fut)
+
+    monkeypatch.setattr(
+        "tinker_server.backend.openpi_shared_ray_runtime.ray.get",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("ray.get should not be called")),
+    )
+
+    assert asyncio.run(client._ray_get(ref, timeout_s=1.0)) == {"ok": True}
+
+
 def test_start_openpi_shared_ray_runtime_applies_single_node_pin(monkeypatch) -> None:
     from tinker_server.backend import openpi_shared_ray_runtime
 
@@ -401,6 +437,7 @@ def test_start_openpi_shared_ray_runtime_applies_single_node_pin(monkeypatch) ->
 
     openpi_shared_ray_runtime.clear_openpi_shared_runtime_pool()
     monkeypatch.setattr(openpi_shared_ray_runtime, "ensure_openpi_ray_initialized", lambda: None)
+    monkeypatch.setattr(openpi_shared_ray_runtime.ray, "is_initialized", lambda: False)
     monkeypatch.setattr(openpi_shared_ray_runtime, "OpenPISharedRayRuntimeActor", _FakeActorBuilder())
     monkeypatch.setattr(openpi_shared_ray_runtime, "OpenPISharedRayRuntimeClient", _FakeClient)
     monkeypatch.setattr(openpi_shared_ray_runtime, "get_resource_pool", lambda: _FakePool())
@@ -448,6 +485,7 @@ def test_start_openpi_shared_ray_runtime_applies_single_node_pin(monkeypatch) ->
 def test_shared_client_close_cleans_up_new_actor_after_failed_initial_create_session(monkeypatch) -> None:
     from tinker_server.backend import openpi_shared_ray_runtime
 
+    shutdown_ref = _completed_ref("shutdown-ref")
     state: dict[str, object] = {
         "unregister": [],
         "kill_calls": [],
@@ -461,17 +499,17 @@ def test_shared_client_close_cleans_up_new_actor_after_failed_initial_create_ses
         class ready_metadata:
             @staticmethod
             def remote():
-                return "ready-ref"
+                return _completed_ref({"actor_id": "actor-123", "current_session_id": None})
 
         class register_session:
             @staticmethod
             def remote(*_args, **_kwargs):
-                return "create-ref"
+                return _failed_ref(RuntimeError("create failed"))
 
         class shutdown:
             @staticmethod
             def remote():
-                return "shutdown-ref"
+                return shutdown_ref
 
     class _FakeActorBuilder:
         def options(self, **kwargs):
@@ -507,14 +545,17 @@ def test_shared_client_close_cleans_up_new_actor_after_failed_initial_create_ses
         raise ValueError("actor not found")
 
     def _fake_ray_get(ref, timeout=None):
-        if ref == "ready-ref":
-            return {"actor_id": "actor-123", "current_session_id": None}
-        if ref == "create-ref":
-            raise RuntimeError("create failed")
         if ref == "shutdown-ref":
             state["shutdown_refs"].append((ref, timeout))
             return None
         raise AssertionError(f"unexpected ref {ref!r}")
+
+    async def _record_shutdown_ref(ref, *, timeout_s=None):
+        from tinker_server.backend.async_ray_control import async_get_ray_ref as _real_async_get_ray_ref
+
+        if ref is shutdown_ref:
+            state["shutdown_refs"].append(("shutdown-ref", timeout_s))
+        return await _real_async_get_ray_ref(ref, timeout_s=timeout_s)
 
     def _fake_ray_kill(actor, *, no_restart=True):
         state["kill_calls"].append((actor, no_restart))
@@ -541,6 +582,7 @@ def test_shared_client_close_cleans_up_new_actor_after_failed_initial_create_ses
     with pytest.raises(RuntimeError, match="create failed"):
         asyncio.run(client.request("create_session", _create_payload(session)))
 
+    monkeypatch.setattr(openpi_shared_ray_runtime, "async_get_ray_ref", _record_shutdown_ref)
     asyncio.run(client.close())
 
     actor_name = state["register"]["actor_name"]
@@ -566,17 +608,19 @@ def test_shared_client_close_does_not_kill_actor_after_successful_create_session
         class ready_metadata:
             @staticmethod
             def remote():
-                return "ready-ref"
+                return _completed_ref({"actor_id": "actor-123", "current_session_id": None})
 
         class register_session:
             @staticmethod
             def remote(*_args, **_kwargs):
-                return "create-ref"
+                return _completed_ref(
+                    {"backend": "openpi_fast", "config_name": "pi0_fast_libero_low_mem_finetune"}
+                )
 
         class shutdown:
             @staticmethod
             def remote():
-                return "shutdown-ref"
+                return _completed_ref("shutdown-ref")
 
     class _FakeActorBuilder:
         def options(self, **kwargs):
@@ -612,10 +656,6 @@ def test_shared_client_close_does_not_kill_actor_after_successful_create_session
         raise ValueError("actor not found")
 
     def _fake_ray_get(ref, timeout=None):
-        if ref == "ready-ref":
-            return {"actor_id": "actor-123", "current_session_id": None}
-        if ref == "create-ref":
-            return {"backend": "openpi_fast", "config_name": "pi0_fast_libero_low_mem_finetune"}
         if ref == "shutdown-ref":
             state["shutdown_refs"].append((ref, timeout))
             return None
@@ -656,6 +696,7 @@ def test_shared_client_close_does_not_kill_actor_after_successful_create_session
 def test_shared_client_shutdown_reclaims_actor_when_last_session_exits(monkeypatch) -> None:
     from tinker_server.backend import openpi_shared_ray_runtime
 
+    shutdown_ref = _completed_ref("shutdown-ref")
     state: dict[str, object] = {
         "unregister": [],
         "kill_calls": [],
@@ -669,22 +710,24 @@ def test_shared_client_shutdown_reclaims_actor_when_last_session_exits(monkeypat
         class ready_metadata:
             @staticmethod
             def remote():
-                return "ready-ref"
+                return _completed_ref({"actor_id": "actor-123", "current_session_id": None})
 
         class register_session:
             @staticmethod
             def remote(*_args, **_kwargs):
-                return "create-ref"
+                return _completed_ref(
+                    {"backend": "openpi_fast", "config_name": "pi0_fast_libero_low_mem_finetune"}
+                )
 
         class request_for_session:
             @staticmethod
             def remote(*_args, **_kwargs):
-                return "request-ref"
+                return _completed_ref({"stopped": True, "known_session_ids": []})
 
         class shutdown:
             @staticmethod
             def remote():
-                return "shutdown-ref"
+                return shutdown_ref
 
     class _FakeActorBuilder:
         def options(self, **kwargs):
@@ -720,16 +763,17 @@ def test_shared_client_shutdown_reclaims_actor_when_last_session_exits(monkeypat
         raise ValueError("actor not found")
 
     def _fake_ray_get(ref, timeout=None):
-        if ref == "ready-ref":
-            return {"actor_id": "actor-123", "current_session_id": None}
-        if ref == "create-ref":
-            return {"backend": "openpi_fast", "config_name": "pi0_fast_libero_low_mem_finetune"}
-        if ref == "request-ref":
-            return {"stopped": True, "known_session_ids": []}
         if ref == "shutdown-ref":
             state["shutdown_refs"].append((ref, timeout))
             return None
         raise AssertionError(f"unexpected ref {ref!r}")
+
+    async def _record_shutdown_ref(ref, *, timeout_s=None):
+        from tinker_server.backend.async_ray_control import async_get_ray_ref as _real_async_get_ray_ref
+
+        if ref is shutdown_ref:
+            state["shutdown_refs"].append(("shutdown-ref", timeout_s))
+        return await _real_async_get_ray_ref(ref, timeout_s=timeout_s)
 
     def _fake_ray_kill(actor, *, no_restart=True):
         state["kill_calls"].append((actor, no_restart))
@@ -742,6 +786,7 @@ def test_shared_client_shutdown_reclaims_actor_when_last_session_exits(monkeypat
     monkeypatch.setattr(openpi_shared_ray_runtime.ray, "get_actor", _raise_missing_actor)
     monkeypatch.setattr(openpi_shared_ray_runtime.ray, "get", _fake_ray_get)
     monkeypatch.setattr(openpi_shared_ray_runtime.ray, "kill", _fake_ray_kill)
+    monkeypatch.setattr(openpi_shared_ray_runtime, "async_get_ray_ref", _record_shutdown_ref)
 
     session = _make_session("model-a", "session-a")
     client = asyncio.run(
@@ -833,11 +878,12 @@ def test_start_openpi_shared_ray_runtime_uses_model_id_as_runtime_session_key(mo
 def test_start_openpi_shared_ray_runtime_cleans_up_detached_actor_when_ready_fails(monkeypatch) -> None:
     from tinker_server.backend import openpi_shared_ray_runtime
 
+    shutdown_ref = _completed_ref("shutdown-ref")
     state: dict[str, object] = {"shutdown_refs": [], "kill_calls": [], "unregister": []}
 
     class _FakeActorHandle:
         def __init__(self) -> None:
-            self.shutdown = SimpleNamespace(remote=lambda: "shutdown-ref")
+            self.shutdown = SimpleNamespace(remote=lambda: shutdown_ref)
 
     class _FakeActorBuilder:
         def options(self, **kwargs):
@@ -873,6 +919,13 @@ def test_start_openpi_shared_ray_runtime_cleans_up_detached_actor_when_ready_fai
         state["shutdown_refs"].append((ref, timeout))
         return None
 
+    async def _fake_async_get_ray_ref(ref, *, timeout_s=None):
+        from tinker_server.backend.async_ray_control import async_get_ray_ref as _real_async_get_ray_ref
+
+        if ref is shutdown_ref:
+            state["shutdown_refs"].append(("shutdown-ref", timeout_s))
+        return await _real_async_get_ray_ref(ref, timeout_s=timeout_s)
+
     def _fake_ray_kill(actor, *, no_restart=True):
         state["kill_calls"].append((actor, no_restart))
 
@@ -885,6 +938,7 @@ def test_start_openpi_shared_ray_runtime_cleans_up_detached_actor_when_ready_fai
     monkeypatch.setattr(openpi_shared_ray_runtime.ray, "get_actor", _raise_missing_actor)
     monkeypatch.setattr(openpi_shared_ray_runtime.ray, "get", _fake_ray_get)
     monkeypatch.setattr(openpi_shared_ray_runtime.ray, "kill", _fake_ray_kill)
+    monkeypatch.setattr(openpi_shared_ray_runtime, "async_get_ray_ref", _fake_async_get_ray_ref)
 
     session = _make_session("model-a", "session-a")
     with pytest.raises(RuntimeError, match="ready failed"):

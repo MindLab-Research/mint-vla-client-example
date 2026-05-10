@@ -203,7 +203,7 @@ async def test_issue_281_training_routes_mark_queued_stage_metadata(
     monkeypatch.setattr(cm, "capacity_manager", _AsyncCapacityManager())
 
     req = request_obj(model_types)
-    await getattr(tr, route_name)(req, _DummyRequest())
+    await getattr(tr, route_name)(req, _DummyRequest(user_id="owner-a"))
 
     assert queued_meta["op"] == f"training.{training_op}"
     assert queued_meta["model_id"] == "run-281"
@@ -535,7 +535,7 @@ async def test_issue_281_do_delete_model_deletes_then_resolves(monkeypatch) -> N
     monkeypatch.setattr(
         tr,
         "training_engine",
-        SimpleNamespace(delete_session=_fake_delete),
+        SimpleNamespace(shutdown_session=_fake_delete),
     )
     monkeypatch.setattr(
         tr,
@@ -639,8 +639,12 @@ async def test_issue_281_internal_serialized_op_marks_inflight_until_worker_fini
     async def _async_resolve(request_id, payload):
         resolved.update({"request_id": request_id, "payload": payload})
 
+    async def _restore_training_session(_model_id: str):
+        return manager.get_local_session(_model_id)
+
     monkeypatch.setattr(tr, "training_manager", manager)
     monkeypatch.setattr(tr, "training_engine", SimpleNamespace(reset_expert_bias=_fake_reset))
+    monkeypatch.setattr(tr, "_restore_training_session", _restore_training_session)
     monkeypatch.setattr(
         tr,
         "future_store",
@@ -667,19 +671,22 @@ async def test_issue_281_internal_serialized_op_marks_inflight_until_worker_fini
         request_json=b"{}",
         extra={},
     )
-    assert manager.get_session("run-281").inflight_ops == 1
+    assert manager.get_local_session("run-281").inflight_ops == 1
 
     await tr._do_reset_expert_bias(request_id, ResetExpertBiasRequest(model_id="run-281"))
 
-    assert manager.get_session("run-281").inflight_ops == 0
+    assert manager.get_local_session("run-281").inflight_ops == 0
     assert resolved["request_id"] == request_id
     assert resolved["payload"]["modules_reset"] == 1
 
 
 @pytest.mark.anyio
 async def test_issue_281_public_healthz_ignores_timeout_observation(monkeypatch) -> None:
+    from tinker_server.health_state import clear_runtime_degraded_state, clear_startup_degraded_state
     from tinker_server.routes import service
 
+    clear_startup_degraded_state()
+    clear_runtime_degraded_state()
     _install_ray_stub(monkeypatch)
 
     async def _raise_timeout(awaitable, timeout):
@@ -695,8 +702,11 @@ async def test_issue_281_public_healthz_ignores_timeout_observation(monkeypatch)
 
 @pytest.mark.anyio
 async def test_issue_281_public_healthz_ignores_pending_pg_observation(monkeypatch) -> None:
+    from tinker_server.health_state import clear_runtime_degraded_state, clear_startup_degraded_state
     from tinker_server.routes import service
 
+    clear_startup_degraded_state()
+    clear_runtime_degraded_state()
     _install_ray_stub(monkeypatch, available={"GPU": 2}, total={"GPU": 8})
 
     async def _return_pending(awaitable, timeout):

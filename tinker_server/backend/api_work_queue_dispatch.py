@@ -37,10 +37,8 @@ def _ensure_ray_context_for_dispatch() -> None:
 
     if ray.is_initialized():
         return
-    from ..config import RAY_NAMESPACE
-    from ..ray_utils import init_ray
 
-    init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
+    raise RuntimeError("Ray is not initialized")
 
 
 async def execute_work_item(item: Any) -> None:
@@ -400,5 +398,6 @@ async def execute_work_item(item: Any) -> None:
 
 
 def register_api_work_queue_executors(api_work_queue: Any) -> None:
+    _ensure_ray_context_for_dispatch()
     for op in KNOWN_QUEUE_OPS:
         api_work_queue.set_executor(op, execute_work_item)

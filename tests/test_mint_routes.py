@@ -502,6 +502,7 @@ def test_mint_vla_train_step_route_uses_detached_session_info(monkeypatch) -> No
 
 def test_api_work_queue_dispatch_executes_mint_vla_train_step(monkeypatch) -> None:
     from tinker_server.backend import api_work_queue_dispatch as dispatch
+    import ray
 
     captured: dict[str, object] = {}
 
@@ -512,6 +513,7 @@ def test_api_work_queue_dispatch_executes_mint_vla_train_step(monkeypatch) -> No
 
     from tinker_server.routes import mint as mint_routes
 
+    monkeypatch.setattr(ray, "is_initialized", lambda: True)
     monkeypatch.setattr(mint_routes, "_do_vla_train_step", _fake_do_vla_train_step)
 
     item = SimpleNamespace(
