@@ -5,12 +5,14 @@ from collections import Counter
 from pathlib import Path
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
 SCAN_PATHS = (
-    Path("tinker_server/routes"),
-    Path("tinker_server/health_checks.py"),
-    Path("tinker_server/ray_cluster_health.py"),
-    Path("tinker_server/ray_gcs_metrics.py"),
-    Path("tinker_server/backend/api_work_queue_dispatch.py"),
+    REPO_ROOT / "tinker_server/routes",
+    REPO_ROOT / "tinker_server/health_checks.py",
+    REPO_ROOT / "tinker_server/ray_cluster_health.py",
+    REPO_ROOT / "tinker_server/ray_gcs_metrics.py",
+    REPO_ROOT / "tinker_server/backend/api_work_queue_dispatch.py",
 )
 
 BLOCKING_PATTERNS = (
@@ -53,7 +55,7 @@ def test_routes_do_not_add_event_loop_blocking_primitives() -> None:
             paths.append(scan_path)
 
     for path in paths:
-        rel_path = path.as_posix()
+        rel_path = path.relative_to(REPO_ROOT).as_posix()
         with path.open("rb") as fh:
             comment_starts = {
                 tok.start[0]: tok.start[1] for tok in tokenize.tokenize(fh.readline) if tok.type == tokenize.COMMENT

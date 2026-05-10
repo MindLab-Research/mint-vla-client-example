@@ -172,6 +172,42 @@ def test_list_actors_uses_async_resource_pool_inventory(monkeypatch) -> None:
     assert pool.total_gpus_used_calls == 1
 
 
+def test_list_actors_returns_503_when_resource_pool_inventory_fails(monkeypatch) -> None:
+    class _FailingListPool(_FakePool):
+        async def async_list_actors(self, **_kwargs) -> list[dict]:
+            raise RuntimeError("ray disconnected")
+
+    _install_ray_stub(monkeypatch)
+    client = _build_client(monkeypatch, _FailingListPool(actors=[], entries=[]))
+
+    resp = client.get("/api/v1/actors")
+
+    assert resp.status_code == 503, resp.text
+    assert "Ray unavailable for actor inventory" in resp.text
+    assert "ray disconnected" in resp.text
+
+
+def test_list_actors_returns_503_when_resource_pool_gpu_total_fails(monkeypatch) -> None:
+    class _FailingGpuTotalPool(_FakePool):
+        async def async_total_gpus_used(self) -> int:
+            raise RuntimeError("resource pool unavailable")
+
+    _install_ray_stub(monkeypatch)
+    client = _build_client(
+        monkeypatch,
+        _FailingGpuTotalPool(
+            actors=[{"actor_name": "vllm-a", "actor_type": "vllm", "base_model": "Qwen/Qwen3-4B-Instruct-2507"}],
+            entries=[],
+        ),
+    )
+
+    resp = client.get("/api/v1/actors")
+
+    assert resp.status_code == 503, resp.text
+    assert "Ray unavailable for actor inventory" in resp.text
+    assert "resource pool unavailable" in resp.text
+
+
 def test_kill_dense_actors_returns_503_without_unregistering_when_ray_driver_is_unavailable(monkeypatch) -> None:
     from tinker_server.backend.resource_pool import ActorType
 

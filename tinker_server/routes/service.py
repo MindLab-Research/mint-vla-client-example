@@ -1039,14 +1039,19 @@ async def list_actors(
             raise HTTPException(status_code=422, detail=f"Invalid type {actor_type!r}; expected one of {sorted(allowed)}")
         parsed_actor_type = ActorType(t)
 
-    pool = get_resource_pool()
-    actors = await pool.async_list_actors(
-        refresh_metadata=refresh_metadata,
-        actor_type=parsed_actor_type,
-        model_name=model_name,
-    )
-    total_gpus_used = await pool.async_total_gpus_used()
-    await _augment_with_placement_groups(actors)
+    try:
+        pool = get_resource_pool()
+        actors = await pool.async_list_actors(
+            refresh_metadata=refresh_metadata,
+            actor_type=parsed_actor_type,
+            model_name=model_name,
+        )
+        total_gpus_used = await pool.async_total_gpus_used()
+        await _augment_with_placement_groups(actors)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Ray unavailable for actor inventory: {e}") from e
     return {"actors": actors, "total_gpus_used": total_gpus_used}
 
 
