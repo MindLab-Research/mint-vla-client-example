@@ -3421,8 +3421,7 @@ class VerlTrainingEngine:
                 except asyncio.TimeoutError:
                     continue
         finally:
-            if not ref_future.done():
-                _silence_late_result(ref_future)
+            _silence_late_result(ref_future)
 
     def _resolve_hf_model_path(self, hf_model_id: str) -> str | None:
         """Resolve HuggingFace model ID to local cache path.

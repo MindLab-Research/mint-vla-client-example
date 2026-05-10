@@ -78,6 +78,5 @@ async def ray_get_with_resource_pool_keepalive(
                     )
                 continue
     finally:
-        if not ref_future.done():
-            _silence_late_result(ref_future)
+        _silence_late_result(ref_future)
         pool.mark_inflight(actor_name, -1)

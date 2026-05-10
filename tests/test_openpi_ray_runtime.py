@@ -296,3 +296,52 @@ def test_ray_keepalive_preserves_periodic_touch_while_waiting(monkeypatch) -> No
     ) == {"ok": True}
     assert len(touches) >= 2
     assert time.time() - start < 1.0
+
+
+def test_ray_keepalive_cancellation_silences_late_exception(monkeypatch) -> None:
+    pytest.importorskip("ray")
+    from tinker_server.backend import async_ray_control, ray_keepalive
+
+    discarded: list[str] = []
+
+    def _record_late_result(fut: asyncio.Future) -> None:
+        try:
+            fut.result()
+        except RuntimeError as exc:
+            discarded.append(str(exc))
+        except BaseException as exc:
+            discarded.append(type(exc).__name__)
+
+    monkeypatch.setattr(async_ray_control, "_discard_late_result", _record_late_result)
+    monkeypatch.setattr(
+        ray_keepalive,
+        "get_resource_pool",
+        lambda: SimpleNamespace(
+            mark_inflight=lambda *_args: None,
+            touch=lambda *_args: None,
+        ),
+    )
+
+    async def _run() -> None:
+        fut = asyncio.get_running_loop().create_future()
+        ref = SimpleNamespace(future=lambda: fut)
+        task = asyncio.create_task(
+            ray_keepalive.ray_get_with_resource_pool_keepalive(
+                ref,
+                actor_name="actor-1",
+                interval_s=1.0,
+                timeout_s=60.0,
+            )
+        )
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not fut.cancelled()
+
+        fut.set_exception(RuntimeError("late boom"))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert discarded == ["late boom"]
+
+    asyncio.run(_run())

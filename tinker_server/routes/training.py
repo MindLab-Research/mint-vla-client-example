@@ -727,8 +727,6 @@ async def _best_effort_delete_training_session(
             delete_ok = worker is None and not str(getattr(session, "actor_name", "") or "")
             if delete_session is not None:
                 try:
-                    import ray
-
                     await async_get_ray_ref(delete_session.remote(model_id), timeout_s=30)
                     delete_ok = True
                 except Exception as e:

@@ -52,6 +52,9 @@ async def _await_shielded_with_timeout(awaitable: Awaitable[Any], *, timeout_s: 
     except asyncio.TimeoutError:
         _silence_late_result(task)
         raise
+    except asyncio.CancelledError:
+        _silence_late_result(task)
+        raise
 
 
 async def _await_with_ray_get_timeout(awaitable: Awaitable[Any], *, timeout_s: float) -> Any:
