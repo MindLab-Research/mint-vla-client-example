@@ -6807,6 +6807,7 @@ class MegatronWorkerGroup:
                         f"need {nodes_needed} nodes for world_size={world_size}, got {len(preferred_node_ips)}"
                     )
                 node_ips = preferred_node_ips[:nodes_needed]
+                pg_name = _make_megatron_pg_name(self.base_model)
                 required_by_node_ip: dict[str, int] = {}
                 for i in range(world_size):
                     node_ip = node_ips[i // int(gpus_per_node)]
@@ -6814,6 +6815,7 @@ class MegatronWorkerGroup:
                 assert_node_ip_capacity(
                     required_gpus_by_node_ip=required_by_node_ip,
                     context=f"[MegatronWorkerGroup] node pinning base_model={self.base_model}",
+                    ignore_placement_group_names={pg_name},
                 )
                 bundles = build_node_affinity_gpu_bundles(
                     node_ips=node_ips,
@@ -10113,6 +10115,7 @@ def get_or_create_megatron_worker_group(
             assert_node_ip_capacity(
                 required_gpus_by_node_ip=required_by_node_ip,
                 context=f"[MegatronWorkerGroup] precreate node pinning base_model={base_model}",
+                ignore_placement_group_names={pg_name},
             )
         else:
             # Check available GPUs and evict LRU actors if necessary.

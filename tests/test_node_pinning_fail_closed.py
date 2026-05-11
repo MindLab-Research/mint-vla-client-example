@@ -88,6 +88,44 @@ def test_assert_node_ip_capacity_reports_pg_blocker(monkeypatch: pytest.MonkeyPa
     assert "megatron_qwen_pg:CREATED" in msg
 
 
+def test_assert_node_ip_capacity_ignores_owned_pg_blocker(monkeypatch: pytest.MonkeyPatch) -> None:
+    vp = _import_volc_placement(monkeypatch)
+
+    monkeypatch.setattr(
+        vp,
+        "_list_alive_gpu_nodes",
+        lambda: [
+            vp.VolcGpuNode(
+                node_id="node-1",
+                node_ip="10.0.0.7",
+                hostname="worker-7",
+                total_gpus=8,
+                available_gpus=0,
+                volc_job_id=None,
+                volc_resource_queue_id=None,
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        vp,
+        "_gpu_placement_groups",
+        lambda: [
+            {
+                "name": "megatron_qwen_pg",
+                "state": "CREATED",
+                "pinned_ips": ["10.0.0.7"],
+                "node_ids": ["node-1"],
+            }
+        ],
+    )
+
+    vp.assert_node_ip_capacity(
+        required_gpus_by_node_ip={"10.0.0.7": 8},
+        context="megatron pin preflight",
+        ignore_placement_group_names={"megatron_qwen_pg"},
+    )
+
+
 def test_parse_model_single_node_ip_rejects_non_string_value(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
