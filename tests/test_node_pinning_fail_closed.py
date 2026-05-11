@@ -62,8 +62,10 @@ def test_assert_node_ip_capacity_reports_pg_blocker(monkeypatch: pytest.MonkeyPa
         lambda: [
             {
                 "name": "megatron_qwen_pg",
+                "namespace": "tinker",
                 "state": "CREATED",
                 "pinned_ips": ["10.0.0.7"],
+                "gpu_by_pinned_ip": {"10.0.0.7": 8.0},
                 "node_ids": ["node-1"],
             }
         ],
@@ -86,6 +88,176 @@ def test_assert_node_ip_capacity_reports_pg_blocker(monkeypatch: pytest.MonkeyPa
     assert "available_gpus" in msg
     assert "used_or_reserved_gpus" in msg
     assert "megatron_qwen_pg:CREATED" in msg
+
+
+def test_assert_node_ip_capacity_ignores_owned_pg_blocker(monkeypatch: pytest.MonkeyPatch) -> None:
+    vp = _import_volc_placement(monkeypatch)
+
+    monkeypatch.setattr(
+        vp,
+        "_list_alive_gpu_nodes",
+        lambda: [
+            vp.VolcGpuNode(
+                node_id="node-1",
+                node_ip="10.0.0.7",
+                hostname="worker-7",
+                total_gpus=8,
+                available_gpus=0,
+                volc_job_id=None,
+                volc_resource_queue_id=None,
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        vp,
+        "_gpu_placement_groups",
+        lambda: [
+            {
+                "name": "megatron_qwen_pg",
+                "namespace": "tinker",
+                "state": "CREATED",
+                "pinned_ips": ["10.0.0.7"],
+                "gpu_by_pinned_ip": {"10.0.0.7": 8.0},
+                "node_ids": ["node-1"],
+            }
+        ],
+    )
+
+    vp.assert_node_ip_capacity(
+        required_gpus_by_node_ip={"10.0.0.7": 8},
+        context="megatron pin preflight",
+        ignore_placement_group_names={"megatron_qwen_pg"},
+        ignore_placement_group_namespace="tinker",
+    )
+
+
+def test_assert_node_ip_capacity_does_not_ignore_same_name_pg_from_other_namespace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vp = _import_volc_placement(monkeypatch)
+
+    monkeypatch.setattr(
+        vp,
+        "_list_alive_gpu_nodes",
+        lambda: [
+            vp.VolcGpuNode(
+                node_id="node-1",
+                node_ip="10.0.0.7",
+                hostname="worker-7",
+                total_gpus=8,
+                available_gpus=0,
+                volc_job_id=None,
+                volc_resource_queue_id=None,
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        vp,
+        "_gpu_placement_groups",
+        lambda: [
+            {
+                "name": "megatron_qwen_pg",
+                "namespace": "other",
+                "state": "CREATED",
+                "pinned_ips": ["10.0.0.7"],
+                "gpu_by_pinned_ip": {"10.0.0.7": 8.0},
+                "node_ids": ["node-1"],
+            }
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="megatron_qwen_pg:CREATED"):
+        vp.assert_node_ip_capacity(
+            required_gpus_by_node_ip={"10.0.0.7": 8},
+            context="megatron pin preflight",
+            ignore_placement_group_names={"megatron_qwen_pg"},
+            ignore_placement_group_namespace="tinker",
+        )
+
+
+def test_assert_node_ip_capacity_ignores_namespace_suffixed_pg_when_ray_table_has_no_namespace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vp = _import_volc_placement(monkeypatch)
+
+    monkeypatch.setattr(
+        vp,
+        "_list_alive_gpu_nodes",
+        lambda: [
+            vp.VolcGpuNode(
+                node_id="node-1",
+                node_ip="10.0.0.7",
+                hostname="worker-7",
+                total_gpus=8,
+                available_gpus=0,
+                volc_job_id=None,
+                volc_resource_queue_id=None,
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        vp,
+        "_gpu_placement_groups",
+        lambda: [
+            {
+                "name": "megatron_qwen_tinker_pg",
+                "state": "CREATED",
+                "pinned_ips": ["10.0.0.7"],
+                "gpu_by_pinned_ip": {"10.0.0.7": 8.0},
+                "node_ids": ["node-1"],
+            }
+        ],
+    )
+
+    vp.assert_node_ip_capacity(
+        required_gpus_by_node_ip={"10.0.0.7": 8},
+        context="megatron pin preflight",
+        ignore_placement_group_names={"megatron_qwen_tinker_pg"},
+        ignore_placement_group_namespace="tinker",
+    )
+
+
+def test_assert_node_ip_capacity_does_not_ignore_unsuffixed_pg_when_ray_table_has_no_namespace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vp = _import_volc_placement(monkeypatch)
+
+    monkeypatch.setattr(
+        vp,
+        "_list_alive_gpu_nodes",
+        lambda: [
+            vp.VolcGpuNode(
+                node_id="node-1",
+                node_ip="10.0.0.7",
+                hostname="worker-7",
+                total_gpus=8,
+                available_gpus=0,
+                volc_job_id=None,
+                volc_resource_queue_id=None,
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        vp,
+        "_gpu_placement_groups",
+        lambda: [
+            {
+                "name": "megatron_qwen_pg",
+                "state": "CREATED",
+                "pinned_ips": ["10.0.0.7"],
+                "gpu_by_pinned_ip": {"10.0.0.7": 8.0},
+                "node_ids": ["node-1"],
+            }
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="megatron_qwen_pg:CREATED"):
+        vp.assert_node_ip_capacity(
+            required_gpus_by_node_ip={"10.0.0.7": 8},
+            context="megatron pin preflight",
+            ignore_placement_group_names={"megatron_qwen_pg"},
+            ignore_placement_group_namespace="tinker",
+        )
 
 
 def test_parse_model_single_node_ip_rejects_non_string_value(

@@ -8,11 +8,23 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass
+from hashlib import sha1
 from urllib.parse import urlsplit
 
 import ray
 
 logger = logging.getLogger(__name__)
+
+
+def _namespace_suffix(namespace: str) -> str:
+    raw = str(namespace).strip().lower()
+    if not raw:
+        return "default"
+    sanitized = "".join(ch if ch.isalnum() else "_" for ch in raw).strip("_")
+    if len(sanitized) <= 24:
+        return sanitized or "default"
+    digest = sha1(raw.encode("utf-8")).hexdigest()[:8]
+    return f"{sanitized[:15]}_{digest}"
 
 
 @dataclass(frozen=True)
@@ -427,6 +439,7 @@ def _gpu_placement_groups() -> list[dict[str, object]]:
 
         bundles = info.get("bundles") or {}
         total_gpu = 0.0
+        gpu_by_pinned_ip: dict[str, float] = {}
         pinned_ips: set[str] = set()
         if isinstance(bundles, dict):
             bundle_values = bundles.values()
@@ -438,11 +451,14 @@ def _gpu_placement_groups() -> list[dict[str, object]]:
             if not isinstance(bundle, dict):
                 continue
             total_gpu += float(bundle.get("GPU", 0) or 0)
+            bundle_gpu = float(bundle.get("GPU", 0) or 0)
             for key, value in bundle.items():
                 if not isinstance(key, str) or not key.startswith("node:"):
                     continue
                 if float(value or 0) > 0:
-                    pinned_ips.add(key.split("node:", 1)[1])
+                    ip = key.split("node:", 1)[1]
+                    pinned_ips.add(ip)
+                    gpu_by_pinned_ip[ip] = gpu_by_pinned_ip.get(ip, 0.0) + bundle_gpu
         if total_gpu <= 0:
             continue
 
@@ -461,8 +477,15 @@ def _gpu_placement_groups() -> list[dict[str, object]]:
         groups.append(
             {
                 "name": str(info.get("name") or "<unnamed>"),
+                "namespace": str(
+                    info.get("ray_namespace")
+                    or info.get("namespace")
+                    or info.get("rayNamespace")
+                    or ""
+                ),
                 "state": state or "<unknown>",
                 "pinned_ips": sorted(pinned_ips),
+                "gpu_by_pinned_ip": dict(sorted(gpu_by_pinned_ip.items())),
                 "node_ids": node_ids,
             }
         )
@@ -539,6 +562,8 @@ def assert_node_ip_capacity(
     *,
     required_gpus_by_node_ip: dict[str, int],
     context: str,
+    ignore_placement_group_names: set[str] | None = None,
+    ignore_placement_group_namespace: str | None = None,
 ) -> None:
     requested = {
         str(node_ip).strip(): int(gpus)
@@ -559,15 +584,38 @@ def assert_node_ip_capacity(
             f"missing_nodes={missing} alive_gpu_nodes={sorted(nodes_by_ip)}"
         )
 
+    ignored_pg_names = {str(name) for name in (ignore_placement_group_names or set()) if str(name)}
     placement_groups = _gpu_placement_groups()
+
+    def _is_ignored_pg(pg: dict[str, object]) -> bool:
+        name = str(pg.get("name") or "")
+        if name not in ignored_pg_names:
+            return False
+        if ignore_placement_group_namespace is None:
+            return True
+        namespace = str(pg.get("namespace") or "")
+        if namespace:
+            return namespace == str(ignore_placement_group_namespace)
+        return name.endswith(f"_{_namespace_suffix(ignore_placement_group_namespace)}_pg")
+
+    ignored_placement_groups = [pg for pg in placement_groups if _is_ignored_pg(pg)]
+    blocker_placement_groups = [pg for pg in placement_groups if not _is_ignored_pg(pg)]
     blockers: list[dict[str, object]] = []
     for node_ip, need_gpus in requested.items():
         node = nodes_by_ip[node_ip]
-        if node.available_gpus >= need_gpus:
+        ignored_reserved_gpus = 0.0
+        for pg in ignored_placement_groups:
+            by_ip = pg.get("gpu_by_pinned_ip")
+            if isinstance(by_ip, dict):
+                ignored_reserved_gpus += float(by_ip.get(node_ip, 0) or 0)
+            elif node_ip in pg["pinned_ips"] or node.node_id in pg["node_ids"]:
+                ignored_reserved_gpus += float(need_gpus)
+        effective_available_gpus = float(node.available_gpus) + ignored_reserved_gpus
+        if effective_available_gpus >= need_gpus:
             continue
         matching_pgs = [
             f"{pg['name']}:{pg['state']}"
-            for pg in placement_groups
+            for pg in blocker_placement_groups
             if node_ip in pg["pinned_ips"] or node.node_id in pg["node_ids"]
         ]
         blockers.append(
@@ -576,6 +624,7 @@ def assert_node_ip_capacity(
                 "hostname": node.hostname,
                 "need_gpus": need_gpus,
                 "available_gpus": node.available_gpus,
+                "effective_available_gpus": effective_available_gpus,
                 "total_gpus": node.total_gpus,
                 "used_or_reserved_gpus": node.total_gpus - node.available_gpus,
                 "placement_groups": matching_pgs[:8],

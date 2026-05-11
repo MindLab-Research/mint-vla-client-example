@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import threading
 from functools import lru_cache
 from typing import Any, Awaitable
 
@@ -43,6 +44,51 @@ async def _await_ray_ref(ref: Any) -> Any:
 
 async def _await_any(awaitable: Awaitable[Any]) -> Any:
     return await awaitable
+
+
+def _run_awaitable_sync(awaitable: Awaitable[Any], *, timeout_s: float | None = None) -> Any:
+    if isinstance(awaitable, asyncio.Future):
+        if awaitable.done():
+            return awaitable.result()
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError(
+                "sync_get_ray_ref cannot wait on a pending asyncio.Future attached "
+                "to the current event loop; use async_get_ray_ref instead"
+            )
+
+    async def _await() -> Any:
+        if timeout_s is None:
+            return await awaitable
+        return await _await_with_ray_get_timeout(awaitable, timeout_s=float(timeout_s))
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(_await())
+
+    result: dict[str, Any] = {}
+
+    def _target() -> None:
+        try:
+            result["value"] = asyncio.run(_await())
+        except BaseException as exc:
+            result["error"] = exc
+
+    thread = threading.Thread(target=_target, name="mint-sync-ray-ref-await", daemon=True)
+    thread.start()
+    join_timeout = None if timeout_s is None else max(float(timeout_s) + 1.0, 1.0)
+    thread.join(join_timeout)
+    if thread.is_alive():
+        import ray
+
+        raise ray.exceptions.GetTimeoutError(f"timed out after {float(timeout_s):.3f}s")
+    if "error" in result:
+        raise result["error"]
+    return result.get("value")
 
 
 async def _await_shielded_with_timeout(awaitable: Awaitable[Any], *, timeout_s: float) -> Any:
@@ -95,14 +141,10 @@ def sync_get_ray_ref(ref: Any, *, timeout_s: float | None = None) -> Any:
 
                 raise ray.exceptions.GetTimeoutError(f"timed out after {float(timeout_s):.3f}s") from exc
         if isinstance(fut, asyncio.Future) or hasattr(fut, "__await__"):
-            if timeout_s is None:
-                return asyncio.run(_await_any(fut))
-            return asyncio.run(_await_with_ray_get_timeout(fut, timeout_s=float(timeout_s)))
+            return _run_awaitable_sync(fut, timeout_s=timeout_s)
 
     if hasattr(ref, "__await__"):
-        if timeout_s is None:
-            return asyncio.run(_await_any(ref))
-        return asyncio.run(_await_with_ray_get_timeout(ref, timeout_s=float(timeout_s)))
+        return _run_awaitable_sync(ref, timeout_s=timeout_s)
 
     return ref
 

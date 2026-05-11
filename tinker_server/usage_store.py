@@ -71,6 +71,13 @@ def _exception_detail(exc: BaseException) -> dict[str, Any]:
     }
 
 
+def _is_permanent_pg_write_error(exc: BaseException) -> bool:
+    sqlstate = str(getattr(exc, "sqlstate", None) or getattr(exc, "pgcode", None) or "")
+    # SQLSTATE class 23 is integrity constraint violation. Retrying cannot fix
+    # permanent identity/schema issues such as missing apikey FK rows.
+    return sqlstate.startswith("23")
+
+
 def _event_detail(events: list["UsageEvent"]) -> dict[str, Any]:
     return {
         "event_count": len(events),
@@ -460,6 +467,9 @@ class PostgresUsageStore:
                 return [str(row["event_id"]) for row in rows]
             except Exception as e:
                 last_error = e
+                permanent_error = _is_permanent_pg_write_error(e)
+                if permanent_error:
+                    break
                 if attempt < 2:
                     backoff_s = float(2**attempt)
                     event_detail = _event_detail(events)
