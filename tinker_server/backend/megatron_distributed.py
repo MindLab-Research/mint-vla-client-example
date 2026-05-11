@@ -44,7 +44,11 @@ from tinker_server.config import PFS_PYTHONPATH, PFS_TINKER_PATH, RAY_NAMESPACE,
 from tinker_server.backend.model_registry import get_model_config
 from tinker_server.ray_utils import init_ray
 from tinker_server.model_input_utils import flatten_encoded_text_chunks
-from tinker_server.backend.volc_placement import assert_node_ip_capacity, parse_model_node_ip_list
+from tinker_server.backend.volc_placement import (
+    assert_node_ip_capacity,
+    ModelGpuPlacement,
+    parse_model_gpu_placement,
+)
 from tinker_server.backend.ray_placement_groups import PlacementGroupMismatchError, get_named_placement_group
 
 logger = logging.getLogger(__name__)
@@ -170,26 +174,37 @@ def _model_key_from_base_model(base_model: str) -> str:
     return base_model
 
 
-def _preferred_worker_node_ips_for_model(base_model: str) -> list[str]:
+def _model_gpu_placement_for_model(base_model: str) -> ModelGpuPlacement | None:
     model_key = _model_key_from_base_model(base_model)
     lookup_keys = [model_key, model_key.lower(), base_model, base_model.lower()]
-    node_ips = parse_model_node_ip_list(
-        raw_json=os.environ.get("MINT_MEGATRON_MODEL_NODE_IPS_JSON"),
+    placement = parse_model_gpu_placement(
+        raw_json=os.environ.get("MINT_MEGATRON_MODEL_PLACEMENT_JSON"),
         lookup_keys=lookup_keys,
-        env_var_name="MINT_MEGATRON_MODEL_NODE_IPS_JSON",
-        context=f"[MegatronWorkerGroup] node pinning model={model_key}",
+        env_var_name="MINT_MEGATRON_MODEL_PLACEMENT_JSON",
+        context=f"[MegatronWorkerGroup] placement model={model_key}",
     )
-    if not node_ips:
-        node_ips = parse_model_node_ip_list(
-        raw_json=os.environ.get("MINT_MODEL_NODE_IPS_JSON"),
-        lookup_keys=[model_key, model_key.lower(), base_model, base_model.lower()],
-        env_var_name="MINT_MODEL_NODE_IPS_JSON",
-        context=f"[MegatronWorkerGroup] node pinning model={model_key}",
+    if placement is None:
+        placement = parse_model_gpu_placement(
+            raw_json=os.environ.get("MINT_MODEL_PLACEMENT_JSON"),
+            lookup_keys=lookup_keys,
+            env_var_name="MINT_MODEL_PLACEMENT_JSON",
+            context=f"[MegatronWorkerGroup] placement model={model_key}",
         )
-    if not node_ips:
-        return []
-    logger.info(f"[MegatronWorkerGroup] node pinning for model={model_key}: {node_ips}")
-    return node_ips
+    if placement is not None:
+        logger.info(
+            "[MegatronWorkerGroup] placement for model=%s: %s",
+            model_key,
+            [
+                {
+                    "replica": slice_.replica,
+                    "worker_index": slice_.worker_index,
+                    "gpu_count": slice_.gpu_count,
+                    "node_ip": slice_.node_ip,
+                }
+                for slice_ in placement.slices
+            ],
+        )
+    return placement
 
 
 def _make_megatron_actor_name(base_model: str) -> str:
@@ -6795,36 +6810,33 @@ class MegatronWorkerGroup:
             )
             logger.info(f"[MegatronWorkerGroup] Volcano placement allowlist nodes={node_ips}")
         else:
-            preferred_node_ips = _preferred_worker_node_ips_for_model(self.base_model)
-            if preferred_node_ips:
-                from .volc_placement import build_node_affinity_gpu_bundles
-
-                gpus_per_node = 8
-                nodes_needed = (int(world_size) + int(gpus_per_node) - 1) // int(gpus_per_node)
-                if len(preferred_node_ips) < nodes_needed:
+            preferred_placement = _model_gpu_placement_for_model(self.base_model)
+            if preferred_placement is not None:
+                if preferred_placement.total_gpus != int(world_size):
                     raise ValueError(
-                        f"MINT_MODEL_NODE_IPS_JSON too short for base_model={self.base_model!r}: "
-                        f"need {nodes_needed} nodes for world_size={world_size}, got {len(preferred_node_ips)}"
+                        f"MINT_MODEL_PLACEMENT_JSON GPU count mismatch for base_model={self.base_model!r}: "
+                        f"need {world_size} GPUs, got {preferred_placement.total_gpus}"
                     )
-                node_ips = preferred_node_ips[:nodes_needed]
                 pg_name = _make_megatron_pg_name(self.base_model)
-                required_by_node_ip: dict[str, int] = {}
-                for i in range(world_size):
-                    node_ip = node_ips[i // int(gpus_per_node)]
-                    required_by_node_ip[node_ip] = required_by_node_ip.get(node_ip, 0) + 1
                 assert_node_ip_capacity(
-                    required_gpus_by_node_ip=required_by_node_ip,
+                    required_gpus_by_node_ip=preferred_placement.required_gpus_by_node_ip(),
                     context=f"[MegatronWorkerGroup] node pinning base_model={self.base_model}",
                     ignore_placement_group_names={pg_name},
                     ignore_placement_group_namespace=PERSISTENT_NAMESPACE,
                 )
-                bundles = build_node_affinity_gpu_bundles(
-                    node_ips=node_ips,
-                    gpus_per_node=gpus_per_node,
-                    required_gpus=world_size,
-                    cpu_per_gpu=1,
+                bundles = preferred_placement.pg_bundles(cpu_per_gpu=1)
+                logger.info(
+                    "[MegatronWorkerGroup] Model placement preferred slices=%s",
+                    [
+                        {
+                            "replica": slice_.replica,
+                            "worker_index": slice_.worker_index,
+                            "gpu_count": slice_.gpu_count,
+                            "node_ip": slice_.node_ip,
+                        }
+                        for slice_ in preferred_placement.slices
+                    ],
                 )
-                logger.info(f"[MegatronWorkerGroup] Model placement preferred nodes={node_ips}")
         with start_as_current_span_from_traceparent(
             "training.create_model.megatron.worker_group.select_bundles",
             traceparent=traceparent,
@@ -10098,23 +10110,17 @@ def get_or_create_megatron_worker_group(
             except Exception as e:
                 raise RuntimeError(f"Failed to remove orphan placement group {pg_name!r}: {e}") from e
 
-        preferred_node_ips = _preferred_worker_node_ips_for_model(base_model)
-        if preferred_node_ips:
-            gpus_per_node = 8
-            nodes_needed = (int(num_gpus) + int(gpus_per_node) - 1) // int(gpus_per_node)
-            if len(preferred_node_ips) < nodes_needed:
+        preferred_placement = _model_gpu_placement_for_model(base_model)
+        if preferred_placement is not None:
+            if preferred_placement.total_gpus != int(num_gpus):
                 raise ValueError(
-                    f"MINT_MODEL_NODE_IPS_JSON too short for base_model={base_model!r}: "
-                    f"need {nodes_needed} nodes for world_size={num_gpus}, got {len(preferred_node_ips)}"
+                    f"MINT_MODEL_PLACEMENT_JSON GPU count mismatch for base_model={base_model!r}: "
+                    f"need {num_gpus} GPUs, got {preferred_placement.total_gpus}"
                 )
-            required_by_node_ip: dict[str, int] = {}
-            for i in range(num_gpus):
-                node_ip = preferred_node_ips[i // int(gpus_per_node)]
-                required_by_node_ip[node_ip] = required_by_node_ip.get(node_ip, 0) + 1
             # For strict node-pinned launches, unrelated GPUs outside the requested slice
             # must not block bringup. Check the requested nodes directly and fail closed.
             assert_node_ip_capacity(
-                required_gpus_by_node_ip=required_by_node_ip,
+                required_gpus_by_node_ip=preferred_placement.required_gpus_by_node_ip(),
                 context=f"[MegatronWorkerGroup] precreate node pinning base_model={base_model}",
                 ignore_placement_group_names={pg_name},
                 ignore_placement_group_namespace=PERSISTENT_NAMESPACE,
@@ -10207,10 +10213,11 @@ def get_or_create_megatron_worker_group(
                 if v is not None:
                     runtime_env["env_vars"][k] = v
             explicit_node_ips_csv = os.environ.get("MINT_MEGATRON_NODE_IPS_CSV", "").strip()
-            megatron_node_pin_json = os.environ.get("MINT_MEGATRON_MODEL_NODE_IPS_JSON")
+            model_placement_json = os.environ.get("MINT_MODEL_PLACEMENT_JSON")
+            megatron_model_placement_json = os.environ.get("MINT_MEGATRON_MODEL_PLACEMENT_JSON")
             if explicit_node_ips_csv:
                 runtime_env["env_vars"]["MINT_MEGATRON_NODE_IPS_CSV"] = explicit_node_ips_csv
-            elif not megatron_node_pin_json:
+            elif not megatron_model_placement_json:
                 volc_rq = os.environ.get("MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID", "").strip()
                 if volc_rq:
                     from .volc_placement import list_node_ips_for_resource_queue
@@ -10225,11 +10232,10 @@ def get_or_create_megatron_worker_group(
             timing = os.environ.get("MINT_TIMING_DIAG")
             if timing is not None:
                 runtime_env["env_vars"]["MINT_TIMING_DIAG"] = timing
-            node_pin_json = os.environ.get("MINT_MODEL_NODE_IPS_JSON")
-            if node_pin_json:
-                runtime_env["env_vars"]["MINT_MODEL_NODE_IPS_JSON"] = node_pin_json
-            if megatron_node_pin_json:
-                runtime_env["env_vars"]["MINT_MEGATRON_MODEL_NODE_IPS_JSON"] = megatron_node_pin_json
+            if model_placement_json:
+                runtime_env["env_vars"]["MINT_MODEL_PLACEMENT_JSON"] = model_placement_json
+            if megatron_model_placement_json:
+                runtime_env["env_vars"]["MINT_MEGATRON_MODEL_PLACEMENT_JSON"] = megatron_model_placement_json
 
             # Create detached Ray actor with per-model name
             with start_as_current_span_from_traceparent(

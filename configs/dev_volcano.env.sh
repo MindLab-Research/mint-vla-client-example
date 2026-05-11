@@ -26,16 +26,9 @@ export TINKER_GATEWAY_CONFIG_JSON=""
 export MINT_SAVE_LORA_TIMEOUT_S=1800
 export MINT_SCHEDULER_ENABLE=1
 
-# export MINT_VLLM_PINNED_NODE_IP_JSON='{"Qwen/Qwen3-30B-A3B-Instruct-2507":"192.168.38.173"}'
-# export MINT_DENSE_MODEL_NODE_IPS_JSON='{}'
-# export MINT_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.38.173"]}'
-# export MINT_VLLM_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.38.173"]}'
-
-export MINT_VLLM_PINNED_NODE_IP_JSON='{"Qwen/Qwen3-0.6B":"192.168.38.177","Qwen/Qwen3-4B-Instruct-2507":"192.168.38.177","Qwen/Qwen3-4B-Thinking-2507":"192.168.38.177","Qwen/Qwen3-30B-A3B-Instruct-2507":"192.168.38.173"}'
-export MINT_DENSE_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.38.177"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.38.177"],"Qwen/Qwen3-4B-Thinking-2507":["192.168.38.177"]}'
-export MINT_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.38.177"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.38.177"],"Qwen/Qwen3-4B-Thinking-2507":["192.168.38.177"],"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.38.173"]}'
-export MINT_VLLM_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.38.177"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.38.177"],"Qwen/Qwen3-4B-Thinking-2507":["192.168.38.177"],"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.38.173"]}'
-export MINT_MEGATRON_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.38.173"]}'
+export MINT_VLLM_MODEL_PLACEMENT_JSON='{"Qwen/Qwen3-0.6B":{"replica":0,"worker_index":1,"gpu_count":1},"Qwen/Qwen3-4B-Instruct-2507":{"replica":0,"worker_index":1,"gpu_count":1},"Qwen/Qwen3-4B-Thinking-2507":{"replica":0,"worker_index":1,"gpu_count":1},"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"worker_index":2,"gpu_count":4}}'
+export MINT_DENSE_MODEL_PLACEMENT_JSON='{"Qwen/Qwen3-0.6B":{"replica":0,"worker_index":1,"gpu_count":1},"Qwen/Qwen3-4B-Instruct-2507":{"replica":0,"worker_index":1,"gpu_count":1},"Qwen/Qwen3-4B-Thinking-2507":{"replica":0,"worker_index":1,"gpu_count":1}}'
+export MINT_MEGATRON_MODEL_PLACEMENT_JSON='{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"worker_index":2,"gpu_count":4}}'
 
 export MINT_MODEL_CONFIG_OVERRIDES_JSON=''
 

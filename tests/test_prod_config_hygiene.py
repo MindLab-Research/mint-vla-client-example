@@ -40,6 +40,7 @@ def test_prod_runtime_env_contains_non_secret_authoritative_knobs() -> None:
     text = PROD_ENV.read_text(encoding="utf-8")
     assert "export MINT_MODEL_CONFIG_OVERRIDES_JSON=" in text
     assert "export MINT_MOE_LORA_SPARSE_EXPERT_EXPORT=1" in text
-    assert "export MINT_MODEL_NODE_IPS_JSON=" in text
+    assert "export MINT_VLLM_MODEL_PLACEMENT_JSON=" in text
+    assert "export MINT_MEGATRON_MODEL_PLACEMENT_JSON=" in text
     assert 'export MINT_TMP_ROOT="${MINT_TMP_ROOT:-/vePFS-Mindverse/share/mint-data/prod}"' in text
     assert "export TINKER_RUNTIME_CHECKPOINT_DIR=" in text

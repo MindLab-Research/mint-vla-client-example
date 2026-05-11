@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
-import time
 from typing import TYPE_CHECKING
 
 from ..config import config
@@ -73,62 +71,6 @@ async def prewarm_persistent_models(
     from tinker_server.backend.resource_pool import get_resource_pool
 
     resource_pool = get_resource_pool()
-    import ray
-
-    pinned_vllm_node_ip: dict[str, str] = {}
-    pinned_vllm_node_ip_json = os.environ.get("MINT_VLLM_PINNED_NODE_IP_JSON")
-    if pinned_vllm_node_ip_json:
-        try:
-            parsed = json.loads(pinned_vllm_node_ip_json)
-            if isinstance(parsed, dict):
-                pinned_vllm_node_ip = {str(k): str(v) for k, v in parsed.items()}
-        except Exception:
-            pinned_vllm_node_ip = {}
-
-    def _preferred_pg_node_id(pg_name: str, model_name: str) -> str | None:
-        preferred_ips: list[str] = []
-        for env_name in ("MINT_MEGATRON_MODEL_NODE_IPS_JSON", "MINT_MODEL_NODE_IPS_JSON"):
-            raw = os.environ.get(env_name, "").strip()
-            if not raw:
-                continue
-            try:
-                data = json.loads(raw)
-            except Exception:
-                continue
-            if not isinstance(data, dict):
-                continue
-            selected = None
-            for key in (model_name, model_name.lower()):
-                selected = data.get(key)
-                if selected is not None:
-                    break
-            if isinstance(selected, list):
-                preferred_ips.extend(str(ip).strip() for ip in selected if str(ip).strip())
-            if preferred_ips:
-                break
-
-        node_ip_by_id = {
-            str(n.get("NodeID") or ""): str(n.get("NodeManagerAddress") or "").strip()
-            for n in ray.nodes()
-            if n.get("Alive")
-        }
-        candidate_node_ids: list[str] = []
-        for info in ray.util.placement_group_table().values():
-            if info.get("state") != "CREATED" or info.get("name") != pg_name:
-                continue
-            bundles_to_node_id = info.get("bundles_to_node_id") or {}
-            for node_id in bundles_to_node_id.values():
-                node_id_str = str(node_id or "").strip()
-                if node_id_str:
-                    candidate_node_ids.append(node_id_str)
-        if not candidate_node_ids:
-            return None
-        if preferred_ips:
-            for node_id in candidate_node_ids:
-                if node_ip_by_id.get(node_id) in preferred_ips:
-                    return node_id
-            return None
-        return candidate_node_ids[0]
 
     logger.info(
         f"[prewarm] persistent models={models} train_lora_rank={lora_rank} train_lr={learning_rate} "
@@ -207,34 +149,6 @@ async def prewarm_persistent_models(
                     resource_pool.set_protected(actor_name, True)
                     logger.info(f"[prewarm] training __ray_ready__ scheduled model={model_name} actor={actor_name}")
 
-                    if (
-                        cfg.vllm_engine == "async"
-                        and cfg.vllm_distributed_executor_backend == "mp"
-                        and (cfg.train_gpus + cfg.total_gpus) <= 8
-                    ):
-                        try:
-                            pg_name = f"{actor_name}_pg"
-                            node_id = None
-                            deadline = time.monotonic() + 30.0
-                            while time.monotonic() < deadline and not node_id:
-                                node_id = _preferred_pg_node_id(pg_name, model_name)
-                                if not node_id:
-                                    await asyncio.sleep(0.5)
-                            if node_id:
-                                for n in ray.nodes():
-                                    if n.get("NodeID") == node_id:
-                                        ip = n.get("NodeManagerAddress")
-                                        if isinstance(ip, str) and ip.strip():
-                                            pinned_vllm_node_ip[model_name] = ip.strip()
-                                            logger.info(
-                                                f"[prewarm] pin_infer model={model_name} pg={pg_name} node_ip={ip.strip()}"
-                                            )
-                                        break
-                        except Exception as pin_err:
-                            logger.warning(
-                                f"[prewarm] training pin_infer_to_pg_node failed model={model_name}: {pin_err}"
-                            )
-
                     try:
                         await async_get_ray_ref(actor.__ray_ready__.remote(), timeout_s=megatron_ready_timeout_s)
                         resource_pool.mark_ready(actor_name)
@@ -304,31 +218,6 @@ async def prewarm_persistent_models(
     infer_dense = [m for m in infer_models if not _infer_is_moe(m) and _infer_gpus(m) <= 8]
     infer_moe_single.sort(key=lambda m: (-_infer_gpus(m), m))
     infer_dense.sort(key=lambda m: (-_infer_gpus(m), m))
-
-    # For 2-node clusters (e.g., 16 GPUs as 2x 8-GPU nodes), avoid fragmenting nodes by
-    # pinning dense models to a separate node from single-node MoE models.
-    try:
-        gpu_node_ips = sorted(
-            {
-                str(n.get("NodeManagerAddress") or "").strip()
-                for n in ray.nodes()
-                if n.get("Alive")
-                and float((n.get("Resources") or {}).get("GPU", 0) or 0) > 0
-                and str(n.get("NodeManagerAddress") or "").strip()
-            }
-        )
-        if len(gpu_node_ips) == 2:
-            moe_ip, dense_ip = gpu_node_ips[0], gpu_node_ips[1]
-            for m in infer_moe_single:
-                pinned_vllm_node_ip.setdefault(m, moe_ip)
-            for m in infer_dense:
-                pinned_vllm_node_ip.setdefault(m, dense_ip)
-    except Exception:
-        pass
-
-    if pinned_vllm_node_ip:
-        os.environ["MINT_VLLM_PINNED_NODE_IP_JSON"] = json.dumps(pinned_vllm_node_ip)
-        logger.info(f"[prewarm] MINT_VLLM_PINNED_NODE_IP_JSON={os.environ['MINT_VLLM_PINNED_NODE_IP_JSON']}")
 
     timeout_s = float(os.environ.get("MINT_PERSISTENT_INFER_TIMEOUT_S", "1800"))
 

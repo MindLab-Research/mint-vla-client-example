@@ -1106,8 +1106,15 @@ async def test_get_engine_skips_capacity_check_when_named_actor_exists(monkeypat
         return True if ref == "engine-ready-ref" else None
 
     monkeypatch.setattr(mle, "async_get_ray_ref", _async_get_ray_ref, raising=False)
-    monkeypatch.setattr(mle, "parse_model_single_node_ip", lambda **_kwargs: "192.168.38.4", raising=False)
-    monkeypatch.setattr(mle, "parse_model_node_ip_list", lambda **_kwargs: ["192.168.38.4"], raising=False)
+    monkeypatch.setattr(
+        mle,
+        "parse_model_gpu_placement",
+        lambda **_kwargs: SimpleNamespace(
+            total_gpus=1,
+            slices=(SimpleNamespace(replica=0, worker_index=1, gpu_count=1, node_ip="192.168.38.4"),),
+        ),
+        raising=False,
+    )
 
     def _fail_capacity_check(**_kwargs):
         raise AssertionError("capacity check should be skipped when a named actor already exists")
@@ -1147,8 +1154,15 @@ async def test_get_engine_checks_capacity_when_named_actor_probe_fails(monkeypat
         raise mle.ray.exceptions.RayActorError(f"stale actor during probe: {ref}")
 
     monkeypatch.setattr(mle, "async_get_ray_ref", _stale_async_get_ray_ref, raising=False)
-    monkeypatch.setattr(mle, "parse_model_single_node_ip", lambda **_kwargs: "192.168.38.4", raising=False)
-    monkeypatch.setattr(mle, "parse_model_node_ip_list", lambda **_kwargs: ["192.168.38.4"], raising=False)
+    monkeypatch.setattr(
+        mle,
+        "parse_model_gpu_placement",
+        lambda **_kwargs: SimpleNamespace(
+            total_gpus=1,
+            slices=(SimpleNamespace(replica=0, worker_index=1, gpu_count=1, node_ip="192.168.38.4"),),
+        ),
+        raising=False,
+    )
 
     def _capacity_check(**_kwargs):
         raise RuntimeError("capacity check ran")

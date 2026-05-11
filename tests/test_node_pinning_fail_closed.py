@@ -38,6 +38,171 @@ def test_parse_model_node_ip_list_rejects_bad_json(monkeypatch: pytest.MonkeyPat
         )
 
 
+def test_parse_model_worker_index_list_rejects_bad_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    vp = _import_volc_placement(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="MINT_MODEL_WORKER_INDICES_JSON is not valid JSON"):
+        vp.parse_model_worker_index_list(
+            raw_json="{bad json",
+            lookup_keys=["Qwen/Qwen3-30B-A3B-Instruct-2507"],
+            env_var_name="MINT_MODEL_WORKER_INDICES_JSON",
+            context="test worker pin parse",
+        )
+
+
+def test_parse_model_worker_index_list_rejects_negative_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vp = _import_volc_placement(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="non-negative worker indexes"):
+        vp.parse_model_worker_index_list(
+            raw_json='{"Qwen/Qwen3-30B-A3B-Instruct-2507":[-1]}',
+            lookup_keys=["Qwen/Qwen3-30B-A3B-Instruct-2507"],
+            env_var_name="MINT_MODEL_WORKER_INDICES_JSON",
+            context="test worker pin parse",
+        )
+
+
+def test_resolve_worker_indices_to_node_ips_uses_volcano_hostname(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vp = _import_volc_placement(monkeypatch)
+
+    monkeypatch.setattr(
+        vp,
+        "_list_alive_gpu_nodes",
+        lambda: [
+            vp.VolcGpuNode(
+                node_id="node-1",
+                node_ip="10.0.0.7",
+                hostname="t-abc-worker-1",
+                total_gpus=8,
+                available_gpus=8,
+                volc_job_id=None,
+                volc_resource_queue_id=None,
+            ),
+            vp.VolcGpuNode(
+                node_id="node-2",
+                node_ip="10.0.0.8",
+                hostname="t-abc-worker-2",
+                total_gpus=8,
+                available_gpus=8,
+                volc_job_id=None,
+                volc_resource_queue_id=None,
+            ),
+        ],
+    )
+
+    assert vp.resolve_worker_indices_to_node_ips(worker_indices=[2, 1], context="test") == [
+        "10.0.0.8",
+        "10.0.0.7",
+    ]
+
+
+def test_resolve_worker_indices_to_node_ips_reports_missing_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vp = _import_volc_placement(monkeypatch)
+
+    monkeypatch.setattr(
+        vp,
+        "_list_alive_gpu_nodes",
+        lambda: [
+            vp.VolcGpuNode(
+                node_id="node-1",
+                node_ip="10.0.0.7",
+                hostname="t-abc-worker-1",
+                total_gpus=8,
+                available_gpus=8,
+                volc_job_id=None,
+                volc_resource_queue_id=None,
+            )
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="missing_worker_indices=\\[2\\]"):
+        vp.resolve_worker_indices_to_node_ips(worker_indices=[2], context="test")
+
+
+def test_parse_model_gpu_placement_resolves_worker_gpu_slices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vp = _import_volc_placement(monkeypatch)
+
+    monkeypatch.setattr(
+        vp,
+        "_list_alive_gpu_nodes",
+        lambda: [
+            vp.VolcGpuNode(
+                node_id="node-1",
+                node_ip="10.0.0.7",
+                hostname="t-abc-worker-1",
+                total_gpus=8,
+                available_gpus=8,
+                volc_job_id=None,
+                volc_resource_queue_id=None,
+            ),
+            vp.VolcGpuNode(
+                node_id="node-2",
+                node_ip="10.0.0.8",
+                hostname="t-abc-worker-2",
+                total_gpus=8,
+                available_gpus=8,
+                volc_job_id=None,
+                volc_resource_queue_id=None,
+            ),
+        ],
+    )
+
+    placement = vp.parse_model_gpu_placement(
+        raw_json=(
+            '{"Qwen/Qwen3-235B-A22B-Instruct-2507":['
+            '{"replica":0,"worker_index":1,"gpu_count":2},'
+            '{"replica":0,"worker_index":2,"gpu_count":3}'
+            "]}"
+        ),
+        lookup_keys=["Qwen/Qwen3-235B-A22B-Instruct-2507"],
+        env_var_name="MINT_VLLM_MODEL_PLACEMENT_JSON",
+        context="test placement",
+    )
+
+    assert placement is not None
+    assert placement.node_ips == ["10.0.0.7", "10.0.0.8"]
+    assert placement.total_gpus == 5
+    assert placement.required_gpus_by_node_ip() == {"10.0.0.7": 2, "10.0.0.8": 3}
+
+
+def test_parse_model_gpu_placement_rejects_out_of_range_gpu_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vp = _import_volc_placement(monkeypatch)
+
+    monkeypatch.setattr(
+        vp,
+        "_list_alive_gpu_nodes",
+        lambda: [
+            vp.VolcGpuNode(
+                node_id="node-1",
+                node_ip="10.0.0.7",
+                hostname="t-abc-worker-1",
+                total_gpus=8,
+                available_gpus=8,
+                volc_job_id=None,
+                volc_resource_queue_id=None,
+            )
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="exceeds node GPU count"):
+        vp.parse_model_gpu_placement(
+            raw_json='{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"worker_index":1,"gpu_count":9}}',
+            lookup_keys=["Qwen/Qwen3-30B-A3B-Instruct-2507"],
+            env_var_name="MINT_VLLM_MODEL_PLACEMENT_JSON",
+            context="test placement",
+        )
+
+
 def test_assert_node_ip_capacity_reports_pg_blocker(monkeypatch: pytest.MonkeyPatch) -> None:
     vp = _import_volc_placement(monkeypatch)
 

@@ -12,9 +12,10 @@ def test_issue_440_queue_execution_runtime_propagates_mint_actor_and_routing_ove
         "MINT_CAPACITY_MANAGER_ACTOR_NAME": "cap-q",
         "MINT_FUTURE_STORE_ACTOR_NAME": "future-q",
         "MINT_RESOURCE_POOL_ACTOR_NAME": "pool-q",
-        "MINT_DENSE_MODEL_NODE_IPS_JSON": '{"Qwen/Qwen3-0.6B":["192.168.38.175"]}',
-        "MINT_MODEL_NODE_IPS_JSON": '{"Qwen/Qwen3-0.6B":["192.168.38.175"]}',
-        "MINT_VLLM_PINNED_NODE_IP_JSON": '{"Qwen/Qwen3-0.6B":"192.168.38.175"}',
+        "MINT_MODEL_PLACEMENT_JSON": '{"Qwen/Qwen3-0.6B":{"replica":0,"worker_index":2,"gpu_count":1}}',
+        "MINT_DENSE_MODEL_PLACEMENT_JSON": '{"Qwen/Qwen3-0.6B":{"replica":0,"worker_index":2,"gpu_count":1}}',
+        "MINT_VLLM_MODEL_PLACEMENT_JSON": '{"Qwen/Qwen3-0.6B":{"replica":0,"worker_index":2,"gpu_count":1}}',
+        "MINT_MEGATRON_MODEL_PLACEMENT_JSON": '{"Qwen/Qwen3-0.6B":{"replica":0,"worker_index":2,"gpu_count":1}}',
         "MINT_SUPPORTED_MODELS": "Qwen/Qwen3-0.6B",
         "MINT_QUEUE_EXECUTION_RUNTIME_DEBUG_LOG_PATH": "/tmp/queue-runtime-debug.jsonl",
     }

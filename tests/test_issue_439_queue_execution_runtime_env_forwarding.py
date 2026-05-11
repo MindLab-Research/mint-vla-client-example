@@ -11,10 +11,10 @@ def test_issue_439_queue_execution_runtime_forwards_actor_name_and_placement_ove
     monkeypatch.setenv("TINKER_RAY_NAMESPACE", "ns-issue-439")
     monkeypatch.setenv("MINT_K2_INFER_VOLC_RESOURCE_QUEUE_ID", "rq-k2")
     monkeypatch.setenv("MINT_VLLM_VOLC_RESOURCE_QUEUE_ID", "rq-vllm")
-    monkeypatch.setenv("MINT_MODEL_NODE_IPS_JSON", '{"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.38.175"]}')
+    monkeypatch.setenv("MINT_MODEL_PLACEMENT_JSON", '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"worker_index":1,"gpu_count":4}}')
     monkeypatch.setenv(
-        "MINT_MEGATRON_MODEL_NODE_IPS_JSON",
-        '{"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.38.175"]}',
+        "MINT_MEGATRON_MODEL_PLACEMENT_JSON",
+        '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"worker_index":1,"gpu_count":4}}',
     )
     monkeypatch.setenv("MINT_MBRIDGE_EXPORT_GLOO_TIMEOUT_S", "123")
     monkeypatch.setenv("MINT_MBRIDGE_EXPORT_GATHER_DEBUG", "1")
@@ -29,8 +29,8 @@ def test_issue_439_queue_execution_runtime_forwards_actor_name_and_placement_ove
     assert out["TINKER_RAY_NAMESPACE"] == "ns-issue-439"
     assert out["MINT_K2_INFER_VOLC_RESOURCE_QUEUE_ID"] == "rq-k2"
     assert out["MINT_VLLM_VOLC_RESOURCE_QUEUE_ID"] == "rq-vllm"
-    assert out["MINT_MODEL_NODE_IPS_JSON"] == '{"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.38.175"]}'
-    assert out["MINT_MEGATRON_MODEL_NODE_IPS_JSON"] == '{"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.38.175"]}'
+    assert out["MINT_MODEL_PLACEMENT_JSON"] == '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"worker_index":1,"gpu_count":4}}'
+    assert out["MINT_MEGATRON_MODEL_PLACEMENT_JSON"] == '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"worker_index":1,"gpu_count":4}}'
     assert out["MINT_MBRIDGE_EXPORT_GLOO_TIMEOUT_S"] == "123"
     assert out["MINT_MBRIDGE_EXPORT_GATHER_DEBUG"] == "1"
     assert out["MINT_MBRIDGE_EXPORT_GLOO_BARRIER_DEBUG"] == "1"

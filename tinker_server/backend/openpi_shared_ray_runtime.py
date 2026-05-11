@@ -29,7 +29,10 @@ from .openpi_ray_runtime import (
     ensure_openpi_ray_initialized,
 )
 from .resource_pool import ActorType, get_resource_pool
-from .volc_placement import assert_node_ip_capacity, parse_model_node_ip_list
+from .volc_placement import (
+    assert_node_ip_capacity,
+    parse_model_gpu_placement,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -85,24 +88,25 @@ def _preferred_openpi_node_ip(base_model: str, actor_name: str) -> str | None:
         str(actor_name).strip(),
         str(actor_name).strip().lower(),
     ]
-    node_ips = parse_model_node_ip_list(
-        raw_json=os.environ.get("MINT_MODEL_NODE_IPS_JSON"),
+    context = f"[OpenPISharedRuntime] node pinning model={base_model!r} actor={actor_name!r}"
+    placement = parse_model_gpu_placement(
+        raw_json=os.environ.get("MINT_MODEL_PLACEMENT_JSON"),
         lookup_keys=lookup_keys,
-        env_var_name="MINT_MODEL_NODE_IPS_JSON",
-        context=f"[OpenPISharedRuntime] node pinning model={base_model!r} actor={actor_name!r}",
+        env_var_name="MINT_MODEL_PLACEMENT_JSON",
+        context=context,
     )
-    if not node_ips:
+    if placement is None:
         return None
-    if len(node_ips) != 1:
+    if len(placement.slices) != 1:
         raise RuntimeError(
             f"[OpenPISharedRuntime] node pinning model={base_model!r} actor={actor_name!r}: "
-            f"expected exactly 1 node for single-GPU actor, got {node_ips}"
+            f"expected exactly 1 placement slice for single-GPU actor, got {len(placement.slices)}"
         )
     assert_node_ip_capacity(
-        required_gpus_by_node_ip={node_ips[0]: 1},
+        required_gpus_by_node_ip={placement.slices[0].node_ip: 1},
         context=f"[OpenPISharedRuntime] node pinning model={base_model!r} actor={actor_name!r}",
     )
-    return node_ips[0]
+    return placement.slices[0].node_ip
 
 
 def _single_node_actor_options(*, base_model: str, actor_name: str) -> dict[str, Any]:
