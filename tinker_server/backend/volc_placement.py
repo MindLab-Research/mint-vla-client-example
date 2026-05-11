@@ -465,6 +465,12 @@ def _gpu_placement_groups() -> list[dict[str, object]]:
         groups.append(
             {
                 "name": str(info.get("name") or "<unnamed>"),
+                "namespace": str(
+                    info.get("ray_namespace")
+                    or info.get("namespace")
+                    or info.get("rayNamespace")
+                    or ""
+                ),
                 "state": state or "<unknown>",
                 "pinned_ips": sorted(pinned_ips),
                 "gpu_by_pinned_ip": dict(sorted(gpu_by_pinned_ip.items())),
@@ -545,6 +551,7 @@ def assert_node_ip_capacity(
     required_gpus_by_node_ip: dict[str, int],
     context: str,
     ignore_placement_group_names: set[str] | None = None,
+    ignore_placement_group_namespace: str | None = None,
 ) -> None:
     requested = {
         str(node_ip).strip(): int(gpus)
@@ -570,7 +577,12 @@ def assert_node_ip_capacity(
 
     def _is_ignored_pg(pg: dict[str, object]) -> bool:
         name = str(pg.get("name") or "")
-        return name in ignored_pg_names
+        if name not in ignored_pg_names:
+            return False
+        if ignore_placement_group_namespace is None:
+            return True
+        namespace = str(pg.get("namespace") or "")
+        return namespace == str(ignore_placement_group_namespace)
 
     ignored_placement_groups = [pg for pg in placement_groups if _is_ignored_pg(pg)]
     blocker_placement_groups = [pg for pg in placement_groups if not _is_ignored_pg(pg)]

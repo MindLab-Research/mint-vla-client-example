@@ -47,6 +47,19 @@ async def _await_any(awaitable: Awaitable[Any]) -> Any:
 
 
 def _run_awaitable_sync(awaitable: Awaitable[Any], *, timeout_s: float | None = None) -> Any:
+    if isinstance(awaitable, asyncio.Future):
+        if awaitable.done():
+            return awaitable.result()
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError(
+                "sync_get_ray_ref cannot wait on a pending asyncio.Future attached "
+                "to the current event loop; use async_get_ray_ref instead"
+            )
+
     async def _await() -> Any:
         if timeout_s is None:
             return await awaitable
