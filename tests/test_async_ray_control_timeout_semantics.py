@@ -109,3 +109,16 @@ def test_sync_get_ray_ref_prefers_future_bridge_over_direct_await() -> None:
             raise AssertionError("direct __await__ path should not be used")
 
     assert sync_get_ray_ref(_DualRayRef(fut), timeout_s=1.0) == "ok"
+
+
+def test_sync_get_ray_ref_awaitable_inside_running_loop() -> None:
+    from tinker_server.backend.async_ray_control import sync_get_ray_ref
+
+    async def _value() -> str:
+        await asyncio.sleep(0)
+        return "ok"
+
+    async def _run() -> str:
+        return sync_get_ray_ref(_value(), timeout_s=1.0)
+
+    assert asyncio.run(_run()) == "ok"
