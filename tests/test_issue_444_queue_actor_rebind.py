@@ -103,6 +103,10 @@ async def test_issue_444_api_work_queue_enqueue_reacquires_actor(monkeypatch) ->
         _ = timeout_s
         return ref
 
+    fake_ray = types.SimpleNamespace(
+        get_runtime_context=lambda: types.SimpleNamespace(get_job_id=lambda: "producer-123")
+    )
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
     monkeypatch.setattr(client, "_get_ray_actor_async", _get_ray_actor_async)
     monkeypatch.setattr(client, "_await_ray_ref", _await_ref)
     monkeypatch.setattr(api_work_queue_module, "get_otel_tracer", lambda: None)
@@ -198,13 +202,16 @@ def test_issue_444_queue_execution_runtime_forwards_runtime_contract_env(monkeyp
     monkeypatch.setattr(queue_execution_runtime_module, "CURRENT_CODE_IDENTITY", "sha-test")
     monkeypatch.delenv("TINKER_API_WORK_QUEUE_ACTOR_NAME", raising=False)
     monkeypatch.delenv("MINT_API_WORK_QUEUE_ACTOR_NAME", raising=False)
-    monkeypatch.delenv("MINT_MODEL_NODE_IPS_JSON", raising=False)
+    monkeypatch.delenv("MINT_MODEL_PLACEMENT_JSON", raising=False)
     monkeypatch.delenv("MINT_API_WORK_QUEUE_PINNED_NODE_IP", raising=False)
     monkeypatch.delenv("OPENPI_DATA_HOME", raising=False)
     monkeypatch.delenv("MINT_OPENPI_FAST_WEIGHTS_PATH", raising=False)
     monkeypatch.setenv("TINKER_RAY_NAMESPACE", "ns-test")
     monkeypatch.setenv("TINKER_API_WORK_QUEUE_ACTOR_NAME", "queue-custom")
-    monkeypatch.setenv("MINT_MODEL_NODE_IPS_JSON", '{"openpi/pi0-fast-libero-low-mem-finetune":["192.168.38.176"]}')
+    monkeypatch.setenv(
+        "MINT_MODEL_PLACEMENT_JSON",
+        '{"openpi/pi0-fast-libero-low-mem-finetune":{"replica":0,"worker_index":2,"gpu_count":1}}',
+    )
     monkeypatch.setenv("MINT_API_WORK_QUEUE_PINNED_NODE_IP", "192.168.38.176")
     monkeypatch.setenv("OPENPI_DATA_HOME", "/tmp/openpi-data")
     monkeypatch.setenv("MINT_OPENPI_FAST_WEIGHTS_PATH", "/tmp/pi0-fast-weights")
@@ -214,7 +221,10 @@ def test_issue_444_queue_execution_runtime_forwards_runtime_contract_env(monkeyp
     assert overrides["MINT_GIT_SHA"] == "sha-test"
     assert overrides["TINKER_RAY_NAMESPACE"] == "ns-test"
     assert overrides["TINKER_API_WORK_QUEUE_ACTOR_NAME"] == "queue-custom"
-    assert overrides["MINT_MODEL_NODE_IPS_JSON"] == '{"openpi/pi0-fast-libero-low-mem-finetune":["192.168.38.176"]}'
+    assert (
+        overrides["MINT_MODEL_PLACEMENT_JSON"]
+        == '{"openpi/pi0-fast-libero-low-mem-finetune":{"replica":0,"worker_index":2,"gpu_count":1}}'
+    )
     assert overrides["MINT_API_WORK_QUEUE_PINNED_NODE_IP"] == "192.168.38.176"
     assert overrides["OPENPI_DATA_HOME"] == "/tmp/openpi-data"
     assert overrides["MINT_OPENPI_FAST_WEIGHTS_PATH"] == "/tmp/pi0-fast-weights"

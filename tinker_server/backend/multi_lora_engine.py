@@ -1633,56 +1633,67 @@ class MultiModelInferenceManager:
                 str(actor_name).strip().lower(),
             ]
             context = f"single_node_vllm_pin model={model_name!r} actor={actor_name!r}"
-            placement = parse_model_gpu_placement(
-                raw_json=raw_vllm_placement,
-                lookup_keys=lookup_keys,
-                env_var_name="MINT_VLLM_MODEL_PLACEMENT_JSON",
-                context=context,
-            )
-            if placement is None:
-                placement = parse_model_gpu_placement(
-                    raw_json=raw_model_placement,
-                    lookup_keys=lookup_keys,
-                    env_var_name="MINT_MODEL_PLACEMENT_JSON",
-                    context=context,
-                )
-            if placement is not None:
-                if len(placement.slices) != 1:
-                    raise RuntimeError(
-                        f"{context}: single-node vLLM requires exactly 1 placement slice, got {len(placement.slices)}"
-                    )
-                if placement.total_gpus < int(total_gpus):
-                    raise RuntimeError(
-                        f"{context}: placement too small, need {total_gpus} GPUs, got {placement.total_gpus}"
-                    )
-                pinned_node_ip = placement.slices[0].node_ip
+            if config.vllm_engine == "async":
                 logger.info(
-                    "single_node_vllm_pin_lookup model=%r actor=%r pinned_node_ip=%s lookup_keys=%s placement_slices=%s raw_vllm_placement_present=%s raw_model_placement_present=%s",
+                    "single_node_vllm_pin_lookup model=%r actor=%r skipped_for_async_engine=True raw_vllm_placement_present=%s raw_model_placement_present=%s",
                     model_name,
                     actor_name,
-                    pinned_node_ip,
-                    lookup_keys,
-                    [
-                        {
-                            "replica": slice_.replica,
-                            "worker_index": slice_.worker_index,
-                            "gpu_count": slice_.gpu_count,
-                            "node_ip": slice_.node_ip,
-                        }
-                        for slice_ in placement.slices
-                    ],
                     bool(raw_vllm_placement),
                     bool(raw_model_placement),
                 )
             else:
-                logger.info(
-                    "single_node_vllm_pin_lookup model=%r actor=%r pinned_node_ip=None lookup_keys=%s raw_vllm_placement_present=%s raw_model_placement_present=%s",
-                    model_name,
-                    actor_name,
-                    lookup_keys,
-                    bool(raw_vllm_placement),
-                    bool(raw_model_placement),
+                placement = parse_model_gpu_placement(
+                    raw_json=raw_vllm_placement,
+                    lookup_keys=lookup_keys,
+                    env_var_name="MINT_VLLM_MODEL_PLACEMENT_JSON",
+                    context=context,
+                    replica=0,
                 )
+                if placement is None:
+                    placement = parse_model_gpu_placement(
+                        raw_json=raw_model_placement,
+                        lookup_keys=lookup_keys,
+                        env_var_name="MINT_MODEL_PLACEMENT_JSON",
+                        context=context,
+                        replica=0,
+                    )
+                if placement is not None:
+                    if len(placement.slices) != 1:
+                        raise RuntimeError(
+                            f"{context}: single-node vLLM requires exactly 1 placement slice, got {len(placement.slices)}"
+                        )
+                    if placement.total_gpus != int(total_gpus):
+                        raise RuntimeError(
+                            f"{context}: placement GPU count mismatch, need {total_gpus} GPUs, got {placement.total_gpus}"
+                        )
+                    pinned_node_ip = placement.slices[0].node_ip
+                    logger.info(
+                        "single_node_vllm_pin_lookup model=%r actor=%r pinned_node_ip=%s lookup_keys=%s placement_slices=%s raw_vllm_placement_present=%s raw_model_placement_present=%s",
+                        model_name,
+                        actor_name,
+                        pinned_node_ip,
+                        lookup_keys,
+                        [
+                            {
+                                "replica": slice_.replica,
+                                "worker_index": slice_.worker_index,
+                                "gpu_count": slice_.gpu_count,
+                                "node_ip": slice_.node_ip,
+                            }
+                            for slice_ in placement.slices
+                        ],
+                        bool(raw_vllm_placement),
+                        bool(raw_model_placement),
+                    )
+                else:
+                    logger.info(
+                        "single_node_vllm_pin_lookup model=%r actor=%r pinned_node_ip=None lookup_keys=%s raw_vllm_placement_present=%s raw_model_placement_present=%s",
+                        model_name,
+                        actor_name,
+                        lookup_keys,
+                        bool(raw_vllm_placement),
+                        bool(raw_model_placement),
+                    )
 
             # Determine quantization from model config (None = vLLM auto-detect from config.json)
             quantization = config.quantization

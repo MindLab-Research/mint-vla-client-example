@@ -157,11 +157,20 @@ def _preferred_worker_node_ip_for_model(model_key: str | None, base_model: str) 
             lookup_keys=lookup_keys,
             env_var_name=env_name,
             context=f"DenseTrainer placement model={model_key or base_model}",
+            replica=0,
         )
         if placement is None:
             continue
-        if placement.total_gpus < 1:
-            raise RuntimeError(f"DenseTrainer placement model={model_key or base_model} has no GPUs")
+        if len(placement.slices) != 1:
+            raise RuntimeError(
+                f"DenseTrainer placement model={model_key or base_model} expected exactly 1 placement slice, "
+                f"got {len(placement.slices)}"
+            )
+        if placement.total_gpus != 1:
+            raise RuntimeError(
+                f"DenseTrainer placement model={model_key or base_model} expected exactly 1 GPU, "
+                f"got {placement.total_gpus}"
+            )
         return placement.slices[0].node_ip
     return None
 

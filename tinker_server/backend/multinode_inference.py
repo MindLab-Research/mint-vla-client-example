@@ -216,9 +216,9 @@ def _node_affinity_scheduling_opts_for_model(
             f"for model={model_name!r}"
         )
     pinned_ip = placement.slices[0].node_ip
-    if placement.total_gpus < int(required_gpus):
+    if placement.total_gpus != int(required_gpus):
         raise RuntimeError(
-            f"mp vLLM placement too small for model={model_name!r}: "
+            f"mp vLLM placement GPU count mismatch for model={model_name!r}: "
             f"need {required_gpus} GPUs, got {placement.total_gpus}"
         )
     assert_node_ip_capacity(
@@ -241,6 +241,7 @@ def _model_gpu_placement_for_model(model_name: str | None) -> ModelGpuPlacement 
         lookup_keys=lookup_keys,
         env_var_name="MINT_VLLM_MODEL_PLACEMENT_JSON",
         context=context,
+        replica=0,
     )
     if placement is None:
         placement = parse_model_gpu_placement(
@@ -248,6 +249,7 @@ def _model_gpu_placement_for_model(model_name: str | None) -> ModelGpuPlacement 
             lookup_keys=lookup_keys,
             env_var_name="MINT_MODEL_PLACEMENT_JSON",
             context=context,
+            replica=0,
         )
     if placement is not None:
         logger.info(
@@ -2445,9 +2447,9 @@ class MultiNodeInferenceEngine:
             # Preferred node pinning takes precedence over queue-based selection.
             preferred_placement = _model_gpu_placement_for_model(self.model_name)
             if preferred_placement is not None:
-                if preferred_placement.total_gpus < int(worker_gpus):
+                if preferred_placement.total_gpus != int(worker_gpus):
                     raise RuntimeError(
-                        f"MINT_MODEL_PLACEMENT_JSON too small for model={self.model_name!r}: "
+                        f"MINT_MODEL_PLACEMENT_JSON GPU count mismatch for model={self.model_name!r}: "
                         f"need {worker_gpus} GPUs, got {preferred_placement.total_gpus}"
                     )
                 node_ips = preferred_placement.node_ips
@@ -2481,8 +2483,6 @@ class MultiNodeInferenceEngine:
                         context=f"multinode_vllm_node_pin model={self.model_name}",
                     )
                     pg_bundles = preferred_placement.pg_bundles()
-                    if len(pg_bundles) > int(worker_gpus):
-                        pg_bundles = pg_bundles[: int(worker_gpus)]
                     if resources is None:
                         raise RuntimeError("internal error: Ray vLLM placement resources are not initialized")
                     resources = MultiNodeEngineResources(

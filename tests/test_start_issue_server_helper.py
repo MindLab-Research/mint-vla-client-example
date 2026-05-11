@@ -33,8 +33,8 @@ def test_start_issue_server_helper_scopes_control_plane_actor_names() -> None:
             "ISSUE_LOG_FILE": "/tmp/tinker_server_issue_416_r9.log",
             "ISSUE_USAGE_LOG_DIR": "/tmp/tinker_usage_issue_416_r9",
             "ISSUE_SUPPORTED_MODELS": "Qwen/Qwen3-30B-A3B-Instruct-2507",
-            "ISSUE_MODEL_NODE_IPS_JSON": '{"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.39.94"]}',
-            "ISSUE_MEGATRON_MODEL_NODE_IPS_JSON": '{"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.39.94"]}',
+            "ISSUE_MODEL_PLACEMENT_JSON": '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"worker_index":2,"gpu_count":4}}',
+            "ISSUE_MEGATRON_MODEL_PLACEMENT_JSON": '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"worker_index":2,"gpu_count":4}}',
         }
     )
 
@@ -65,6 +65,16 @@ def test_start_issue_server_helper_scopes_control_plane_actor_names() -> None:
     assert data["MINT_QUEUE_EXECUTION_RUNTIME_LOCAL_ONLY"] == "1"
     assert data["MINT_DISABLE_MINT_ROUTE"] == "1"
     assert data["TINKER_API_KEY"] == "dummy"
+    assert (
+        data["MINT_MODEL_PLACEMENT_JSON"]
+        == '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"worker_index":2,"gpu_count":4}}'
+    )
+    assert (
+        data["MINT_MEGATRON_MODEL_PLACEMENT_JSON"]
+        == '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"worker_index":2,"gpu_count":4}}'
+    )
+    assert data["MINT_DENSE_MODEL_PLACEMENT_JSON"] == "{}"
+    assert data["MINT_VLLM_MODEL_PLACEMENT_JSON"] == "{}"
 
     assert token in data["MINT_API_WORK_QUEUE_ACTOR_NAME"]
     assert token in data["MINT_CAPACITY_MANAGER_ACTOR_NAME"]

@@ -182,6 +182,7 @@ def _model_gpu_placement_for_model(base_model: str) -> ModelGpuPlacement | None:
         lookup_keys=lookup_keys,
         env_var_name="MINT_MEGATRON_MODEL_PLACEMENT_JSON",
         context=f"[MegatronWorkerGroup] placement model={model_key}",
+        replica=0,
     )
     if placement is None:
         placement = parse_model_gpu_placement(
@@ -189,6 +190,7 @@ def _model_gpu_placement_for_model(base_model: str) -> ModelGpuPlacement | None:
             lookup_keys=lookup_keys,
             env_var_name="MINT_MODEL_PLACEMENT_JSON",
             context=f"[MegatronWorkerGroup] placement model={model_key}",
+            replica=0,
         )
     if placement is not None:
         logger.info(

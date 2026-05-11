@@ -66,6 +66,7 @@ def _preferred_openpi_action_node_ip(base_model: str, actor_name: str) -> str | 
         lookup_keys=lookup_keys,
         env_var_name="MINT_MODEL_PLACEMENT_JSON",
         context=context,
+        replica=0,
     )
     if placement is None:
         return None
@@ -73,6 +74,11 @@ def _preferred_openpi_action_node_ip(base_model: str, actor_name: str) -> str | 
         raise RuntimeError(
             f"[OpenPIActionRuntime] node pinning model={base_model!r} actor={actor_name!r}: "
             f"expected exactly 1 placement slice for single-GPU actor, got {len(placement.slices)}"
+        )
+    if placement.total_gpus != 1:
+        raise RuntimeError(
+            f"[OpenPIActionRuntime] node pinning model={base_model!r} actor={actor_name!r}: "
+            f"expected exactly 1 GPU, got {placement.total_gpus}"
         )
     assert_node_ip_capacity(
         required_gpus_by_node_ip={placement.slices[0].node_ip: 1},

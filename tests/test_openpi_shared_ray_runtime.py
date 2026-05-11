@@ -446,6 +446,7 @@ def test_start_openpi_shared_ray_runtime_applies_single_node_pin(monkeypatch) ->
         openpi_shared_ray_runtime,
         "parse_model_gpu_placement",
         lambda **_kwargs: SimpleNamespace(
+            total_gpus=1,
             slices=(SimpleNamespace(replica=0, worker_index=1, gpu_count=1, node_ip="192.168.38.176"),)
         ),
     )

@@ -72,6 +72,26 @@ class ModelGpuPlacement:
                 bundles.append({"GPU": 1, "CPU": int(cpu_per_gpu), f"node:{slice_.node_ip}": 0.001})
         return bundles
 
+    def for_replica(self, replica: int) -> "ModelGpuPlacement":
+        replica = int(replica)
+        slices = tuple(slice_ for slice_ in self.slices if slice_.replica == replica)
+        if not slices:
+            available = sorted({slice_.replica for slice_ in self.slices})
+            raise RuntimeError(f"placement replica={replica} not found; available_replicas={available}")
+        return ModelGpuPlacement(slices=slices)
+
+    def only_replica(self, replica: int, *, context: str) -> "ModelGpuPlacement":
+        selected = self.for_replica(replica)
+        unexpected = sorted({slice_.replica for slice_ in self.slices if slice_.replica != int(replica)})
+        if unexpected:
+            logger.info(
+                "%s: selected placement replica=%s and ignored configured replicas=%s",
+                context,
+                int(replica),
+                unexpected,
+            )
+        return selected
+
 
 def parse_csv(value: str | None) -> list[str]:
     if value is None:
@@ -767,7 +787,9 @@ def _parse_model_gpu_placement_value(
     selected_key: str,
     env_var_name: str,
     context: str,
+    replica: int | None = None,
 ) -> list[tuple[int, int, int]]:
+    selected_replica = None if replica is None else int(replica)
     # Canonical shape:
     #   [{"replica":0,"worker_index":1,"gpu_count":4}]
     # Shorthands accepted for single-replica configs:
@@ -779,12 +801,20 @@ def _parse_model_gpu_placement_value(
         flattened: list[dict[str, object]] = []
         if not value["replicas"]:
             raise RuntimeError(f"{context}: {env_var_name}[{selected_key!r}].replicas is empty")
+        saw_selected_replica = selected_replica is None
         for replica_idx, replica_value in enumerate(value["replicas"]):
             if not isinstance(replica_value, dict):
                 raise RuntimeError(
                     f"{context}: {env_var_name}[{selected_key!r}].replicas[{replica_idx}] must be an object"
                 )
-            replica = replica_value.get("replica", replica_idx)
+            replica_value_id = _parse_non_negative_int(
+                replica_value.get("replica", replica_idx),
+                path=f"{env_var_name}[{selected_key!r}].replicas[{replica_idx}].replica",
+                context=context,
+            )
+            if selected_replica is not None and replica_value_id != selected_replica:
+                continue
+            saw_selected_replica = True
             slices_value = replica_value.get("slices")
             if not isinstance(slices_value, list) or not slices_value:
                 raise RuntimeError(
@@ -796,8 +826,22 @@ def _parse_model_gpu_placement_value(
                         f"{context}: {env_var_name}[{selected_key!r}].replicas[{replica_idx}].slices entries must be objects"
                     )
                 merged = dict(slice_value)
-                merged.setdefault("replica", replica)
+                merged.setdefault("replica", replica_value_id)
                 flattened.append(merged)
+        if not saw_selected_replica:
+            available = [
+                _parse_non_negative_int(
+                    item.get("replica", idx),
+                    path=f"{env_var_name}[{selected_key!r}].replicas[{idx}].replica",
+                    context=context,
+                )
+                for idx, item in enumerate(value["replicas"])
+                if isinstance(item, dict)
+            ]
+            raise RuntimeError(
+                f"{context}: {env_var_name}[{selected_key!r}] replica={selected_replica} "
+                f"not found; available_replicas={sorted(set(available))}"
+            )
         value = flattened
 
     if isinstance(value, dict) and "slices" in value:
@@ -817,11 +861,13 @@ def _parse_model_gpu_placement_value(
             raise RuntimeError(
                 f"{context}: {env_var_name}[{selected_key!r}][{idx}] must be a placement slice object"
             )
-        replica = _parse_non_negative_int(
-            item.get("replica", idx),
+        item_replica = _parse_non_negative_int(
+            item.get("replica", 0),
             path=f"{env_var_name}[{selected_key!r}][{idx}].replica",
             context=context,
         )
+        if selected_replica is not None and item_replica != selected_replica:
+            continue
         worker_index = _parse_non_negative_int(
             item.get("worker_index", item.get("worker", item.get("worker_idx"))),
             path=f"{env_var_name}[{selected_key!r}][{idx}].worker_index",
@@ -837,16 +883,20 @@ def _parse_model_gpu_placement_value(
             raise RuntimeError(
                 f"{context}: {env_var_name}[{selected_key!r}][{idx}].gpu_count must be a positive integer"
             )
-        replica_worker = (replica, worker_index)
+        replica_worker = (item_replica, worker_index)
         if replica_worker in seen_replica_workers:
             raise RuntimeError(
                 f"{context}: {env_var_name}[{selected_key!r}] contains duplicate "
-                f"replica={replica} worker_index={worker_index}"
+                f"replica={item_replica} worker_index={worker_index}"
             )
         seen_replica_workers.add(replica_worker)
-        slices.append((replica, worker_index, gpu_count))
+        slices.append((item_replica, worker_index, gpu_count))
 
     if not slices:
+        if selected_replica is not None:
+            raise RuntimeError(
+                f"{context}: {env_var_name}[{selected_key!r}] replica={selected_replica} not found"
+            )
         raise RuntimeError(f"{context}: {env_var_name}[{selected_key!r}] resolved to an empty placement")
     return slices
 
@@ -932,6 +982,7 @@ def parse_model_gpu_placement(
     lookup_keys: list[str],
     env_var_name: str,
     context: str,
+    replica: int | None = None,
 ) -> ModelGpuPlacement | None:
     selected_key, value = _selected_model_pin_value(
         raw_json=raw_json,
@@ -946,6 +997,7 @@ def parse_model_gpu_placement(
         selected_key=selected_key,
         env_var_name=env_var_name,
         context=context,
+        replica=replica,
     )
     return resolve_worker_gpu_slices_to_placement(worker_gpu_slices=worker_gpu_slices, context=context)
 
