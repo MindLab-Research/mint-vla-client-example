@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import uuid
-from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -95,6 +94,7 @@ async def _connect():
     return await asyncpg.connect(
         dsn=dsn,
         command_timeout=max(5.0, _checkpoint_index_timeout_s()),
+        statement_cache_size=0,
         server_settings={"application_name": "tinker_server_checkpoint_index"},
     )
 
