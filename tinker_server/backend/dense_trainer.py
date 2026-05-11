@@ -11,7 +11,6 @@ from __future__ import annotations
 import os
 import threading
 import logging
-import json
 import re
 import time
 from dataclasses import dataclass
@@ -24,6 +23,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from . import ray_kill
 from .ray_placement_groups import PlacementGroupMismatchError, get_named_placement_group
 from .resource_pool import ActorType, actor_observability_metadata, get_resource_pool
+from .volc_placement import parse_model_gpu_placement
 from ..config import PFS_PYTHONPATH, RAY_NAMESPACE
 
 logger = logging.getLogger(__name__)
@@ -145,38 +145,34 @@ def dense_trainer_reuse_block_reason(actor_name: str) -> str | None:
 
 
 def _preferred_worker_node_ip_for_model(model_key: str | None, base_model: str) -> str | None:
-    raw = os.environ.get("MINT_DENSE_MODEL_NODE_IPS_JSON", "").strip()
-    source = "MINT_DENSE_MODEL_NODE_IPS_JSON"
-    if not raw:
-        raw = os.environ.get("MINT_MODEL_NODE_IPS_JSON", "").strip()
-        source = "MINT_MODEL_NODE_IPS_JSON"
-    if not raw:
-        return None
-    try:
-        data = json.loads(raw)
-    except Exception:
-        logger.warning("%s is not valid JSON; ignoring", source)
-        return None
-    if not isinstance(data, dict):
-        logger.warning("%s must be a JSON object; ignoring", source)
-        return None
-
-    candidates = None
     lookup_keys: list[str] = []
     for key in (model_key, base_model):
         if not key:
             continue
         lookup_keys.extend((key, str(key).lower()))
-    for key in lookup_keys:
-        value = data.get(key)
-        if value is not None:
-            candidates = value
-            break
-    if not isinstance(candidates, list) or not candidates:
-        return None
 
-    ip = str(candidates[0]).strip()
-    return ip or None
+    for env_name in ("MINT_DENSE_MODEL_PLACEMENT_JSON", "MINT_MODEL_PLACEMENT_JSON"):
+        placement = parse_model_gpu_placement(
+            raw_json=os.environ.get(env_name),
+            lookup_keys=lookup_keys,
+            env_var_name=env_name,
+            context=f"DenseTrainer placement model={model_key or base_model}",
+            replica=0,
+        )
+        if placement is None:
+            continue
+        if len(placement.slices) != 1:
+            raise RuntimeError(
+                f"DenseTrainer placement model={model_key or base_model} expected exactly 1 placement slice, "
+                f"got {len(placement.slices)}"
+            )
+        if placement.total_gpus != 1:
+            raise RuntimeError(
+                f"DenseTrainer placement model={model_key or base_model} expected exactly 1 GPU, "
+                f"got {placement.total_gpus}"
+            )
+        return placement.slices[0].node_ip
+    return None
 
 
 def _get_or_create_pg(actor_name: str, *, model_key: str | None, base_model: str) -> Any:

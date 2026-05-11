@@ -1010,11 +1010,15 @@ def test_actor_runtime_env_vars_forwards_vllm_envs(tmp_path):
             "RAY_ADDRESS": "ray://cfg-test",
             "MINT_VLLM_SERIALIZE_ADD_LORA_UNTIL_IDLE": "1",
             "MINT_VLLM_REQUEST_TIMING": "0",
+            "MINT_MODEL_PLACEMENT_JSON": '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"worker_index":1,"gpu_count":4}}',
+            "MINT_MEGATRON_MODEL_PLACEMENT_JSON": '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"worker_index":1,"gpu_count":4}}',
         },
     )
     data = json.loads(out.stdout)
     assert data["MINT_VLLM_SERIALIZE_ADD_LORA_UNTIL_IDLE"] == "1"
     assert data["MINT_VLLM_REQUEST_TIMING"] == "0"
+    assert data["MINT_MODEL_PLACEMENT_JSON"] == '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"worker_index":1,"gpu_count":4}}'
+    assert data["MINT_MEGATRON_MODEL_PLACEMENT_JSON"] == '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"worker_index":1,"gpu_count":4}}'
 
 
 def test_actor_runtime_env_vars_forwards_config_path(tmp_path):

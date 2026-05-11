@@ -28,16 +28,12 @@ export TINKER_GATEWAY_GLM51_AUTH_MODE="static_api_key"
 export MINT_SAVE_LORA_TIMEOUT_S=1800
 export MINT_SCHEDULER_ENABLE=1
 
-# Current worker topology after 2026-04-10 head/worker rebuild:
-# worker1 dense + small vLLM: 192.168.39.178
-# worker2 30B megatron: 192.168.39.52
-# worker3 30B vLLM + 235B vLLM: 192.168.39.178
-# worker4-7 235B megatron: 192.168.39.50,192.168.39.56,192.168.39.55,192.168.39.57
-export MINT_VLLM_PINNED_NODE_IP_JSON='{"Qwen/Qwen3-0.6B":"192.168.39.178","Qwen/Qwen3-4B-Instruct-2507":"192.168.39.178","Qwen/Qwen3-4B-Thinking-2507":"192.168.39.178","Qwen/Qwen3-30B-A3B-Instruct-2507":"192.168.39.178"}'
-export MINT_DENSE_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.39.178"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.39.178"],"Qwen/Qwen3-4B-Thinking-2507":["192.168.39.178"]}'
-export MINT_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.39.178"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.39.178"],"Qwen/Qwen3-4B-Thinking-2507":["192.168.39.178"],"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.39.178"]}'
-export MINT_VLLM_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.39.178"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.39.178"],"Qwen/Qwen3-4B-Thinking-2507":["192.168.39.178"],"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.39.178"],"Qwen/Qwen3-235B-A22B-Instruct-2507":["192.168.39.51","192.168.39.54"],"Qwen/Qwen3-235B-A22B-Thinking-2507":["192.168.39.51","192.168.39.54"]}'
-export MINT_MEGATRON_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.39.52"],"Qwen/Qwen3-235B-A22B-Instruct-2507":["192.168.39.50","192.168.39.56","192.168.39.55","192.168.39.57"],"Qwen/Qwen3-235B-A22B-Thinking-2507":["192.168.39.50","192.168.39.56","192.168.39.55","192.168.39.57"]}'
+# Authoritative prod Volcano placement. worker_index is resolved from Volcano hostnames
+# like t-<job>-worker-<idx>; gpu_count lets Ray/veRL choose concrete GPUs on the pinned worker.
+export MINT_VLLM_MODEL_PLACEMENT_JSON='{"Qwen/Qwen3-0.6B":{"replica":0,"worker_index":2,"gpu_count":1},"Qwen/Qwen3-4B-Instruct-2507":{"replica":0,"worker_index":2,"gpu_count":1},"Qwen/Qwen3-4B-Thinking-2507":{"replica":0,"worker_index":2,"gpu_count":1},"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"worker_index":1,"gpu_count":4},"Qwen/Qwen3-235B-A22B-Instruct-2507":[{"replica":0,"worker_index":3,"gpu_count":8},{"replica":0,"worker_index":4,"gpu_count":8}],"Qwen/Qwen3-235B-A22B-Thinking-2507":[{"replica":0,"worker_index":3,"gpu_count":8},{"replica":0,"worker_index":4,"gpu_count":8}]}'
+export MINT_MODEL_PLACEMENT_JSON='{"openpi/pi0-fast-libero-low-mem-finetune":{"replica":0,"worker_index":2,"gpu_count":1},"openpi/pi05-libero-low-mem-finetune":{"replica":0,"worker_index":2,"gpu_count":1}}'
+export MINT_DENSE_MODEL_PLACEMENT_JSON='{"Qwen/Qwen3-0.6B":{"replica":0,"worker_index":2,"gpu_count":1},"Qwen/Qwen3-4B-Instruct-2507":{"replica":0,"worker_index":2,"gpu_count":1},"Qwen/Qwen3-4B-Thinking-2507":{"replica":0,"worker_index":2,"gpu_count":1}}'
+export MINT_MEGATRON_MODEL_PLACEMENT_JSON='{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"worker_index":1,"gpu_count":4},"Qwen/Qwen3-235B-A22B-Instruct-2507":[{"replica":0,"worker_index":5,"gpu_count":8},{"replica":0,"worker_index":6,"gpu_count":8},{"replica":0,"worker_index":7,"gpu_count":8},{"replica":0,"worker_index":8,"gpu_count":8}],"Qwen/Qwen3-235B-A22B-Thinking-2507":[{"replica":0,"worker_index":5,"gpu_count":8},{"replica":0,"worker_index":6,"gpu_count":8},{"replica":0,"worker_index":7,"gpu_count":8},{"replica":0,"worker_index":8,"gpu_count":8}]}'
 
 export MINT_MODEL_CONFIG_OVERRIDES_JSON=''
 
@@ -80,7 +76,7 @@ else
 fi
 
 # Bump detached queue actor names after node-pin changes so long-lived queue workers
-# reload the current MINT_*_NODE_IPS_JSON values instead of reusing stale env.
+# reload the current node-pin env values instead of reusing stale env.
 export MINT_API_WORK_QUEUE_ACTOR_NAME=tinker_api_work_queue_v20260425a
 export MINT_QUEUE_EXECUTION_RUNTIME_ACTOR_NAME=tinker_queue_execution_runtime_v20260425a
 export MINT_QUEUE_SUPERVISOR_ACTOR_NAME=tinker_queue_supervisor_v20260425a

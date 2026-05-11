@@ -38,6 +38,61 @@ class VolcGpuNode:
     volc_resource_queue_id: str | None
 
 
+@dataclass(frozen=True)
+class ModelGpuSlice:
+    replica: int
+    worker_index: int
+    gpu_count: int
+    node_ip: str
+    hostname: str
+
+
+@dataclass(frozen=True)
+class ModelGpuPlacement:
+    slices: tuple[ModelGpuSlice, ...]
+
+    @property
+    def node_ips(self) -> list[str]:
+        return [slice_.node_ip for slice_ in self.slices]
+
+    @property
+    def total_gpus(self) -> int:
+        return sum(slice_.gpu_count for slice_ in self.slices)
+
+    def required_gpus_by_node_ip(self) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for slice_ in self.slices:
+            out[slice_.node_ip] = out.get(slice_.node_ip, 0) + slice_.gpu_count
+        return out
+
+    def pg_bundles(self, *, cpu_per_gpu: int = 1) -> list[dict[str, int | float]]:
+        bundles: list[dict[str, int | float]] = []
+        for slice_ in self.slices:
+            for _ in range(slice_.gpu_count):
+                bundles.append({"GPU": 1, "CPU": int(cpu_per_gpu), f"node:{slice_.node_ip}": 0.001})
+        return bundles
+
+    def for_replica(self, replica: int) -> "ModelGpuPlacement":
+        replica = int(replica)
+        slices = tuple(slice_ for slice_ in self.slices if slice_.replica == replica)
+        if not slices:
+            available = sorted({slice_.replica for slice_ in self.slices})
+            raise RuntimeError(f"placement replica={replica} not found; available_replicas={available}")
+        return ModelGpuPlacement(slices=slices)
+
+    def only_replica(self, replica: int, *, context: str) -> "ModelGpuPlacement":
+        selected = self.for_replica(replica)
+        unexpected = sorted({slice_.replica for slice_ in self.slices if slice_.replica != int(replica)})
+        if unexpected:
+            logger.info(
+                "%s: selected placement replica=%s and ignored configured replicas=%s",
+                context,
+                int(replica),
+                unexpected,
+            )
+        return selected
+
+
 def parse_csv(value: str | None) -> list[str]:
     if value is None:
         return []
@@ -51,6 +106,16 @@ def _parse_volc_job_id_from_hostname(hostname: str | None) -> str | None:
     if "-worker-" not in hostname:
         return None
     return hostname.split("-worker-", 1)[0] or None
+
+
+def _parse_volc_worker_index_from_hostname(hostname: str | None) -> int | None:
+    # Volcano replicas show up as: t-<job_id>-worker-<idx>
+    if not hostname:
+        return None
+    match = re.search(r"-worker-(\d+)(?:$|[-.])", hostname)
+    if not match:
+        return None
+    return int(match.group(1))
 
 
 def _parse_volc_json(payload: str) -> list[dict]:
@@ -525,6 +590,434 @@ def parse_model_node_ip_list(
     if not cleaned:
         raise RuntimeError(f"{context}: {env_var_name}[{key!r}] resolved to an empty node list")
     return list(dict.fromkeys(cleaned))
+
+
+def parse_model_worker_index_list(
+    *,
+    raw_json: str | None,
+    lookup_keys: list[str],
+    env_var_name: str,
+    context: str,
+) -> list[int]:
+    raw = str(raw_json or "").strip()
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        raise RuntimeError(f"{context}: {env_var_name} is not valid JSON: {e}") from e
+    if not isinstance(data, dict):
+        raise RuntimeError(f"{context}: {env_var_name} must be a JSON object")
+
+    selected_key: str | None = None
+    value = None
+    for key in lookup_keys:
+        value = data.get(key)
+        if value is not None:
+            selected_key = key
+            break
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise RuntimeError(
+            f"{context}: {env_var_name}[{selected_key!r}] must be a JSON list of worker indexes, got {type(value).__name__}"
+        )
+
+    cleaned: list[int] = []
+    for item in value:
+        try:
+            idx = int(item)
+        except Exception as e:
+            raise RuntimeError(
+                f"{context}: {env_var_name}[{selected_key!r}] must contain integer worker indexes, got {item!r}"
+            ) from e
+        if idx < 0:
+            raise RuntimeError(
+                f"{context}: {env_var_name}[{selected_key!r}] must contain non-negative worker indexes, got {idx}"
+            )
+        cleaned.append(idx)
+    if not cleaned:
+        raise RuntimeError(f"{context}: {env_var_name}[{selected_key!r}] resolved to an empty worker list")
+    return list(dict.fromkeys(cleaned))
+
+
+def parse_model_single_worker_index(
+    *,
+    raw_json: str | None,
+    lookup_keys: list[str],
+    env_var_name: str,
+    context: str,
+) -> int | None:
+    raw = str(raw_json or "").strip()
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        raise RuntimeError(f"{context}: {env_var_name} is not valid JSON: {e}") from e
+    if not isinstance(data, dict):
+        raise RuntimeError(f"{context}: {env_var_name} must be a JSON object")
+
+    selected_key: str | None = None
+    value = None
+    for key in lookup_keys:
+        value = data.get(key)
+        if value is not None:
+            selected_key = key
+            break
+    if value is None:
+        return None
+    try:
+        idx = int(value)
+    except Exception as e:
+        raise RuntimeError(
+            f"{context}: {env_var_name}[{selected_key!r}] must be a non-negative worker index"
+        ) from e
+    if idx < 0:
+        raise RuntimeError(
+            f"{context}: {env_var_name}[{selected_key!r}] must be a non-negative worker index"
+        )
+    return idx
+
+
+def resolve_worker_indices_to_node_ips(
+    *,
+    worker_indices: list[int],
+    context: str,
+) -> list[str]:
+    requested = list(dict.fromkeys(int(idx) for idx in worker_indices))
+    if not requested:
+        return []
+    if not ray.is_initialized():
+        raise RuntimeError("ray is not initialized (expected to be connected already)")
+
+    nodes_by_worker_idx: dict[int, VolcGpuNode] = {}
+    for node in _list_alive_gpu_nodes():
+        worker_idx = _parse_volc_worker_index_from_hostname(node.hostname)
+        if worker_idx is None:
+            continue
+        if worker_idx in nodes_by_worker_idx:
+            other = nodes_by_worker_idx[worker_idx]
+            raise RuntimeError(
+                f"{context}: duplicate live GPU nodes for worker_idx={worker_idx}: "
+                f"{other.node_ip}/{other.hostname} and {node.node_ip}/{node.hostname}"
+            )
+        nodes_by_worker_idx[worker_idx] = node
+
+    missing = [idx for idx in requested if idx not in nodes_by_worker_idx]
+    if missing:
+        alive = {
+            idx: {
+                "node_ip": node.node_ip,
+                "hostname": node.hostname,
+                "available_gpus": node.available_gpus,
+                "total_gpus": node.total_gpus,
+            }
+            for idx, node in sorted(nodes_by_worker_idx.items())
+        }
+        raise RuntimeError(
+            f"{context}: requested worker indexes are not alive Ray GPU nodes: "
+            f"missing_worker_indices={missing} alive_worker_nodes={alive}"
+        )
+
+    node_ips = [nodes_by_worker_idx[idx].node_ip for idx in requested]
+    logger.info(
+        "[volc_placement] resolved worker_indices=%s to node_ips=%s context=%s",
+        requested,
+        node_ips,
+        context,
+    )
+    return node_ips
+
+
+def parse_model_worker_index_node_ip_list(
+    *,
+    raw_json: str | None,
+    lookup_keys: list[str],
+    env_var_name: str,
+    context: str,
+) -> list[str]:
+    worker_indices = parse_model_worker_index_list(
+        raw_json=raw_json,
+        lookup_keys=lookup_keys,
+        env_var_name=env_var_name,
+        context=context,
+    )
+    if not worker_indices:
+        return []
+    return resolve_worker_indices_to_node_ips(worker_indices=worker_indices, context=context)
+
+
+def _selected_model_pin_value(
+    *,
+    raw_json: str | None,
+    lookup_keys: list[str],
+    env_var_name: str,
+    context: str,
+) -> tuple[str | None, object | None]:
+    raw = str(raw_json or "").strip()
+    if not raw:
+        return None, None
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        raise RuntimeError(f"{context}: {env_var_name} is not valid JSON: {e}") from e
+    if not isinstance(data, dict):
+        raise RuntimeError(f"{context}: {env_var_name} must be a JSON object")
+    for key in lookup_keys:
+        value = data.get(key)
+        if value is not None:
+            return key, value
+    return None, None
+
+
+def _parse_non_negative_int(value: object, *, path: str, context: str) -> int:
+    try:
+        parsed = int(value)
+    except Exception as e:
+        raise RuntimeError(f"{context}: {path} must be an integer") from e
+    if parsed < 0:
+        raise RuntimeError(f"{context}: {path} must be non-negative, got {parsed}")
+    return parsed
+
+
+def _parse_model_gpu_placement_value(
+    *,
+    value: object,
+    selected_key: str,
+    env_var_name: str,
+    context: str,
+    replica: int | None = None,
+) -> list[tuple[int, int, int]]:
+    selected_replica = None if replica is None else int(replica)
+    # Canonical shape:
+    #   [{"replica":0,"worker_index":1,"gpu_count":4}]
+    # Shorthands accepted for single-replica configs:
+    #   [{"worker_index":1,"gpu_count":4}]
+    #   {"worker_index":1,"gpu_count":4}
+    # Compatibility with a nested shape is kept:
+    #   {"replicas":[{"replica":0,"slices":[{"worker_index":1,"gpu_count":4}]}]}
+    if isinstance(value, dict) and isinstance(value.get("replicas"), list):
+        flattened: list[dict[str, object]] = []
+        if not value["replicas"]:
+            raise RuntimeError(f"{context}: {env_var_name}[{selected_key!r}].replicas is empty")
+        saw_selected_replica = selected_replica is None
+        for replica_idx, replica_value in enumerate(value["replicas"]):
+            if not isinstance(replica_value, dict):
+                raise RuntimeError(
+                    f"{context}: {env_var_name}[{selected_key!r}].replicas[{replica_idx}] must be an object"
+                )
+            replica_value_id = _parse_non_negative_int(
+                replica_value.get("replica", replica_idx),
+                path=f"{env_var_name}[{selected_key!r}].replicas[{replica_idx}].replica",
+                context=context,
+            )
+            if selected_replica is not None and replica_value_id != selected_replica:
+                continue
+            saw_selected_replica = True
+            slices_value = replica_value.get("slices")
+            if not isinstance(slices_value, list) or not slices_value:
+                raise RuntimeError(
+                    f"{context}: {env_var_name}[{selected_key!r}].replicas[{replica_idx}].slices must be a non-empty list"
+                )
+            for slice_value in slices_value:
+                if not isinstance(slice_value, dict):
+                    raise RuntimeError(
+                        f"{context}: {env_var_name}[{selected_key!r}].replicas[{replica_idx}].slices entries must be objects"
+                    )
+                merged = dict(slice_value)
+                merged.setdefault("replica", replica_value_id)
+                flattened.append(merged)
+        if not saw_selected_replica:
+            available = [
+                _parse_non_negative_int(
+                    item.get("replica", idx),
+                    path=f"{env_var_name}[{selected_key!r}].replicas[{idx}].replica",
+                    context=context,
+                )
+                for idx, item in enumerate(value["replicas"])
+                if isinstance(item, dict)
+            ]
+            raise RuntimeError(
+                f"{context}: {env_var_name}[{selected_key!r}] replica={selected_replica} "
+                f"not found; available_replicas={sorted(set(available))}"
+            )
+        value = flattened
+
+    if isinstance(value, dict) and "slices" in value:
+        value = value.get("slices")
+    elif isinstance(value, dict) and "worker_index" in value and "gpu_count" in value:
+        value = [value]
+
+    if not isinstance(value, list):
+        raise RuntimeError(
+            f"{context}: {env_var_name}[{selected_key!r}] must be a placement object or list of placement slices"
+        )
+
+    slices: list[tuple[int, int, int]] = []
+    seen_replica_workers: set[tuple[int, int]] = set()
+    for idx, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise RuntimeError(
+                f"{context}: {env_var_name}[{selected_key!r}][{idx}] must be a placement slice object"
+            )
+        item_replica = _parse_non_negative_int(
+            item.get("replica", 0),
+            path=f"{env_var_name}[{selected_key!r}][{idx}].replica",
+            context=context,
+        )
+        if selected_replica is not None and item_replica != selected_replica:
+            continue
+        worker_index = _parse_non_negative_int(
+            item.get("worker_index", item.get("worker", item.get("worker_idx"))),
+            path=f"{env_var_name}[{selected_key!r}][{idx}].worker_index",
+            context=context,
+        )
+        try:
+            gpu_count = int(item.get("gpu_count"))
+        except Exception as e:
+            raise RuntimeError(
+                f"{context}: {env_var_name}[{selected_key!r}][{idx}].gpu_count must be a positive integer"
+            ) from e
+        if gpu_count <= 0:
+            raise RuntimeError(
+                f"{context}: {env_var_name}[{selected_key!r}][{idx}].gpu_count must be a positive integer"
+            )
+        replica_worker = (item_replica, worker_index)
+        if replica_worker in seen_replica_workers:
+            raise RuntimeError(
+                f"{context}: {env_var_name}[{selected_key!r}] contains duplicate "
+                f"replica={item_replica} worker_index={worker_index}"
+            )
+        seen_replica_workers.add(replica_worker)
+        slices.append((item_replica, worker_index, gpu_count))
+
+    if not slices:
+        if selected_replica is not None:
+            raise RuntimeError(
+                f"{context}: {env_var_name}[{selected_key!r}] replica={selected_replica} not found"
+            )
+        raise RuntimeError(f"{context}: {env_var_name}[{selected_key!r}] resolved to an empty placement")
+    return slices
+
+
+def resolve_worker_gpu_slices_to_placement(
+    *,
+    worker_gpu_slices: list[tuple[int, int, int]],
+    context: str,
+) -> ModelGpuPlacement:
+    worker_indices = [worker_index for _replica, worker_index, _gpu_count in worker_gpu_slices]
+    requested = list(dict.fromkeys(worker_indices))
+    if not ray.is_initialized():
+        raise RuntimeError("ray is not initialized (expected to be connected already)")
+
+    nodes_by_worker_idx: dict[int, VolcGpuNode] = {}
+    for node in _list_alive_gpu_nodes():
+        worker_idx = _parse_volc_worker_index_from_hostname(node.hostname)
+        if worker_idx is None:
+            continue
+        if worker_idx in nodes_by_worker_idx:
+            other = nodes_by_worker_idx[worker_idx]
+            raise RuntimeError(
+                f"{context}: duplicate live GPU nodes for worker_idx={worker_idx}: "
+                f"{other.node_ip}/{other.hostname} and {node.node_ip}/{node.hostname}"
+            )
+        nodes_by_worker_idx[worker_idx] = node
+
+    missing = [idx for idx in requested if idx not in nodes_by_worker_idx]
+    if missing:
+        alive = {
+            idx: {
+                "node_ip": node.node_ip,
+                "hostname": node.hostname,
+                "available_gpus": node.available_gpus,
+                "total_gpus": node.total_gpus,
+            }
+            for idx, node in sorted(nodes_by_worker_idx.items())
+        }
+        raise RuntimeError(
+            f"{context}: requested worker indexes are not alive Ray GPU nodes: "
+            f"missing_worker_indices={missing} alive_worker_nodes={alive}"
+        )
+
+    slices: list[ModelGpuSlice] = []
+    for replica, worker_idx, gpu_count in worker_gpu_slices:
+        node = nodes_by_worker_idx[worker_idx]
+        if gpu_count > node.total_gpus:
+            raise RuntimeError(
+                f"{context}: replica={replica} worker_index={worker_idx} gpu_count={gpu_count} "
+                f"exceeds node GPU count total_gpus={node.total_gpus}"
+            )
+        slices.append(
+            ModelGpuSlice(
+                replica=replica,
+                worker_index=worker_idx,
+                gpu_count=int(gpu_count),
+                node_ip=node.node_ip,
+                hostname=node.hostname,
+            )
+        )
+
+    placement = ModelGpuPlacement(slices=tuple(slices))
+    logger.info(
+        "[volc_placement] resolved placement=%s context=%s",
+        [
+            {
+                "replica": slice_.replica,
+                "worker_index": slice_.worker_index,
+                "gpu_count": slice_.gpu_count,
+                "node_ip": slice_.node_ip,
+                "hostname": slice_.hostname,
+            }
+            for slice_ in placement.slices
+        ],
+        context,
+    )
+    return placement
+
+
+def parse_model_gpu_placement(
+    *,
+    raw_json: str | None,
+    lookup_keys: list[str],
+    env_var_name: str,
+    context: str,
+    replica: int | None = None,
+) -> ModelGpuPlacement | None:
+    selected_key, value = _selected_model_pin_value(
+        raw_json=raw_json,
+        lookup_keys=lookup_keys,
+        env_var_name=env_var_name,
+        context=context,
+    )
+    if selected_key is None:
+        return None
+    worker_gpu_slices = _parse_model_gpu_placement_value(
+        value=value,
+        selected_key=selected_key,
+        env_var_name=env_var_name,
+        context=context,
+        replica=replica,
+    )
+    return resolve_worker_gpu_slices_to_placement(worker_gpu_slices=worker_gpu_slices, context=context)
+
+
+def parse_model_single_worker_index_node_ip(
+    *,
+    raw_json: str | None,
+    lookup_keys: list[str],
+    env_var_name: str,
+    context: str,
+) -> str | None:
+    worker_idx = parse_model_single_worker_index(
+        raw_json=raw_json,
+        lookup_keys=lookup_keys,
+        env_var_name=env_var_name,
+        context=context,
+    )
+    if worker_idx is None:
+        return None
+    return resolve_worker_indices_to_node_ips(worker_indices=[worker_idx], context=context)[0]
 
 
 def parse_model_single_node_ip(

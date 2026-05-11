@@ -38,7 +38,7 @@ from tinker_server.runtime_env import join_pythonpath, sanitize_worker_pythonpat
 from . import ray_kill
 from .async_ray_control import async_get_ray_ref
 from .gpu_binding_helpers import gpu_bindings_from_ray_gpu_ids
-from .multinode_resources import compute_multinode_engine_resources
+from .multinode_resources import MultiNodeEngineResources, compute_multinode_engine_resources
 from .ray_placement_groups import PlacementGroupMismatchError, get_named_placement_group
 from .ray_keepalive import ray_get_with_resource_pool_keepalive
 from .vllm_scheduler_observability import (
@@ -48,8 +48,8 @@ from .vllm_scheduler_observability import (
 )
 from .volc_placement import (
     assert_node_ip_capacity,
-    parse_model_node_ip_list,
-    parse_model_single_node_ip,
+    ModelGpuPlacement,
+    parse_model_gpu_placement,
 )
 
 if TYPE_CHECKING:
@@ -203,19 +203,24 @@ def _node_affinity_scheduling_opts_for_model(
     """Optional single-node pinning for vLLM actors (mp backend).
 
     Use-case: pack MoE inference+training on the same 8-GPU node during prewarm.
-    Controlled by env var:
-      - MINT_VLLM_PINNED_NODE_IP_JSON='{"<model_name>":"<node_ip>"}'
+    Controlled by MINT_VLLM_MODEL_PLACEMENT_JSON or MINT_MODEL_PLACEMENT_JSON.
     """
     if not model_name:
         return {}
-    pinned_ip = parse_model_single_node_ip(
-        raw_json=os.environ.get("MINT_VLLM_PINNED_NODE_IP_JSON"),
-        lookup_keys=[model_name, model_name.lower()],
-        env_var_name="MINT_VLLM_PINNED_NODE_IP_JSON",
-        context=f"multinode_vllm_pin model={model_name}",
-    )
-    if pinned_ip is None:
+    placement = _model_gpu_placement_for_model(model_name)
+    if placement is None:
         return {}
+    if len(placement.slices) != 1:
+        raise RuntimeError(
+            f"mp vLLM requires exactly 1 placement slice, got {len(placement.slices)} "
+            f"for model={model_name!r}"
+        )
+    pinned_ip = placement.slices[0].node_ip
+    if placement.total_gpus != int(required_gpus):
+        raise RuntimeError(
+            f"mp vLLM placement GPU count mismatch for model={model_name!r}: "
+            f"need {required_gpus} GPUs, got {placement.total_gpus}"
+        )
     assert_node_ip_capacity(
         required_gpus_by_node_ip={pinned_ip: int(required_gpus)},
         context=f"multinode_vllm_pin model={model_name}",
@@ -226,26 +231,42 @@ def _node_affinity_scheduling_opts_for_model(
     return {"resources": {node_res: 0.001}}
 
 
-def _preferred_worker_node_ips_for_model(model_name: str | None) -> list[str]:
+def _model_gpu_placement_for_model(model_name: str | None) -> ModelGpuPlacement | None:
     if not model_name:
-        return []
-    node_ips = parse_model_node_ip_list(
-        raw_json=os.environ.get("MINT_VLLM_MODEL_NODE_IPS_JSON"),
-        lookup_keys=[model_name, model_name.lower()],
-        env_var_name="MINT_VLLM_MODEL_NODE_IPS_JSON",
-        context=f"multinode_vllm_node_pin model={model_name}",
+        return None
+    lookup_keys = [model_name, model_name.lower()]
+    context = f"multinode_vllm_placement model={model_name}"
+    placement = parse_model_gpu_placement(
+        raw_json=os.environ.get("MINT_VLLM_MODEL_PLACEMENT_JSON"),
+        lookup_keys=lookup_keys,
+        env_var_name="MINT_VLLM_MODEL_PLACEMENT_JSON",
+        context=context,
+        replica=0,
     )
-    if not node_ips:
-        node_ips = parse_model_node_ip_list(
-            raw_json=os.environ.get("MINT_MODEL_NODE_IPS_JSON"),
-            lookup_keys=[model_name, model_name.lower()],
-            env_var_name="MINT_MODEL_NODE_IPS_JSON",
-            context=f"multinode_vllm_node_pin model={model_name}",
+    if placement is None:
+        placement = parse_model_gpu_placement(
+            raw_json=os.environ.get("MINT_MODEL_PLACEMENT_JSON"),
+            lookup_keys=lookup_keys,
+            env_var_name="MINT_MODEL_PLACEMENT_JSON",
+            context=context,
+            replica=0,
         )
-    if not node_ips:
-        return []
-    logger.info(f"multinode_vllm_node_pin model={model_name} node_ips={node_ips}")
-    return node_ips
+    if placement is not None:
+        logger.info(
+            "multinode_vllm_placement model=%s total_gpus=%s slices=%s",
+            model_name,
+            placement.total_gpus,
+            [
+                {
+                    "replica": slice_.replica,
+                    "worker_index": slice_.worker_index,
+                    "gpu_count": slice_.gpu_count,
+                    "node_ip": slice_.node_ip,
+                }
+                for slice_ in placement.slices
+            ],
+        )
+    return placement
 
 
 def _raise_serializable_vllm_error(*, where: str, request_id: str, extra: dict[str, Any]) -> None:
@@ -2260,10 +2281,9 @@ class MultiNodeInferenceEngine:
                 total_required_gpus = int(worker_gpus)
                 resources = None
             else:
-                preferred_node_ips = _preferred_worker_node_ips_for_model(self.model_name)
                 resources = compute_multinode_engine_resources(
                     worker_gpus,
-                    preferred_node_ips=preferred_node_ips,
+                    preferred_node_ips=[],
                 )
                 controller_gpus = resources.controller_gpus
                 controller_cpus = resources.controller_cpus
@@ -2425,23 +2445,32 @@ class MultiNodeInferenceEngine:
             gpus_per_node = 8
 
             # Preferred node pinning takes precedence over queue-based selection.
-            preferred_node_ips = _preferred_worker_node_ips_for_model(self.model_name)
-            if preferred_node_ips:
-                nodes_needed = (int(worker_gpus) + int(gpus_per_node) - 1) // int(gpus_per_node)
-                if len(preferred_node_ips) < nodes_needed:
+            preferred_placement = _model_gpu_placement_for_model(self.model_name)
+            if preferred_placement is not None:
+                if preferred_placement.total_gpus != int(worker_gpus):
                     raise RuntimeError(
-                        f"MINT_MODEL_NODE_IPS_JSON too short for model={self.model_name!r}: "
-                        f"need {nodes_needed} nodes for worker_gpus={worker_gpus}, got {len(preferred_node_ips)}"
+                        f"MINT_MODEL_PLACEMENT_JSON GPU count mismatch for model={self.model_name!r}: "
+                        f"need {worker_gpus} GPUs, got {preferred_placement.total_gpus}"
                     )
-                node_ips = preferred_node_ips[:nodes_needed]
+                node_ips = preferred_placement.node_ips
                 volc_rq = ""
                 logger.info(
-                    f"[MultiNodeInferenceEngine] Using pinned node IPs for model={self.model_name} nodes={node_ips}"
+                    "[MultiNodeInferenceEngine] Using pinned placement for model=%s slices=%s",
+                    self.model_name,
+                    [
+                        {
+                            "replica": slice_.replica,
+                            "worker_index": slice_.worker_index,
+                            "gpu_count": slice_.gpu_count,
+                            "node_ip": slice_.node_ip,
+                        }
+                        for slice_ in preferred_placement.slices
+                    ],
                 )
                 if distributed_executor_backend == "mp":
-                    if len(node_ips) != 1:
+                    if len(preferred_placement.slices) != 1:
                         raise RuntimeError(
-                            f"mp vLLM requires exactly 1 pinned node, got nodes={node_ips} "
+                            f"mp vLLM requires exactly 1 pinned worker slice, got slices={len(preferred_placement.slices)} "
                             f"for model={self.model_name!r}"
                         )
                     mp_pinned_node_ip = node_ips[0]
@@ -2449,22 +2478,21 @@ class MultiNodeInferenceEngine:
                         f"[MultiNodeInferenceEngine] mp pin model={self.model_name} node={mp_pinned_node_ip}"
                     )
                 else:
-                    required_by_node_ip: dict[str, int] = {}
-                    for bundle in resources.pg_bundles:
-                        if float(bundle.get("GPU", 0) or 0) <= 0:
-                            continue
-                        for key, value in bundle.items():
-                            if not isinstance(key, str) or not key.startswith("node:"):
-                                continue
-                            if float(value or 0) <= 0:
-                                continue
-                            node_ip = key.split("node:", 1)[1]
-                            required_by_node_ip[node_ip] = required_by_node_ip.get(node_ip, 0) + 1
-                    if required_by_node_ip:
-                        assert_node_ip_capacity(
-                            required_gpus_by_node_ip=required_by_node_ip,
-                            context=f"multinode_vllm_node_pin model={self.model_name}",
-                        )
+                    assert_node_ip_capacity(
+                        required_gpus_by_node_ip=preferred_placement.required_gpus_by_node_ip(),
+                        context=f"multinode_vllm_node_pin model={self.model_name}",
+                    )
+                    pg_bundles = preferred_placement.pg_bundles()
+                    if resources is None:
+                        raise RuntimeError("internal error: Ray vLLM placement resources are not initialized")
+                    resources = MultiNodeEngineResources(
+                        worker_gpus=resources.worker_gpus,
+                        controller_gpus=resources.controller_gpus,
+                        controller_cpus=resources.controller_cpus,
+                        total_required_gpus=resources.total_required_gpus,
+                        pg_bundles=pg_bundles + [resources.pg_bundles[-1]],
+                        controller_bundle_index=int(worker_gpus),
+                    )
             else:
                 k2_models = ("moonshotai/Kimi-K2-Instruct", "unsloth/Kimi-K2-Instruct-0905-BF16")
                 if self.model_name in k2_models:

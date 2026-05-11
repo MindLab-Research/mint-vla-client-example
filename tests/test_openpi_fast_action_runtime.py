@@ -927,8 +927,11 @@ def test_start_openpi_action_ray_runtime_applies_single_node_pin(monkeypatch) ->
     monkeypatch.setenv("PFS_TINKER_PATH", "/repo")
     monkeypatch.setattr(
         openpi_action_ray_runtime,
-        "parse_model_node_ip_list",
-        lambda **_kwargs: ["192.168.38.176"],
+        "parse_model_gpu_placement",
+        lambda **_kwargs: SimpleNamespace(
+            total_gpus=1,
+            slices=(SimpleNamespace(replica=0, worker_index=1, gpu_count=1, node_ip="192.168.38.176"),)
+        ),
     )
     capacity_calls: list[dict[str, object]] = []
     monkeypatch.setattr(
