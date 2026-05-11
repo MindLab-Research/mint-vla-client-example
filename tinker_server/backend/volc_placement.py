@@ -8,11 +8,23 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass
+from hashlib import sha1
 from urllib.parse import urlsplit
 
 import ray
 
 logger = logging.getLogger(__name__)
+
+
+def _namespace_suffix(namespace: str) -> str:
+    raw = str(namespace).strip().lower()
+    if not raw:
+        return "default"
+    sanitized = "".join(ch if ch.isalnum() else "_" for ch in raw).strip("_")
+    if len(sanitized) <= 24:
+        return sanitized or "default"
+    digest = sha1(raw.encode("utf-8")).hexdigest()[:8]
+    return f"{sanitized[:15]}_{digest}"
 
 
 @dataclass(frozen=True)
@@ -582,7 +594,9 @@ def assert_node_ip_capacity(
         if ignore_placement_group_namespace is None:
             return True
         namespace = str(pg.get("namespace") or "")
-        return namespace == str(ignore_placement_group_namespace)
+        if namespace:
+            return namespace == str(ignore_placement_group_namespace)
+        return name.endswith(f"_{_namespace_suffix(ignore_placement_group_namespace)}_pg")
 
     ignored_placement_groups = [pg for pg in placement_groups if _is_ignored_pg(pg)]
     blocker_placement_groups = [pg for pg in placement_groups if not _is_ignored_pg(pg)]
