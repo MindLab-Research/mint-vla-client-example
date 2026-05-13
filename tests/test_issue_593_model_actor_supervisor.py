@@ -530,7 +530,7 @@ def test_issue_593_placement_reconciler_does_not_preempt_on_non_capacity_failure
     assert out["evicted_placement_group_names"] == []
 
 
-def test_issue_593_placement_reconciler_does_not_remove_unknown_namespace_pg() -> None:
+def test_issue_593_placement_reconciler_removes_unknown_namespace_pg_as_current_namespace() -> None:
     capacity_checks = 0
     removed_pgs: list[tuple[str, str]] = []
     killed: list[tuple[str, str, str]] = []
@@ -575,9 +575,9 @@ def test_issue_593_placement_reconciler_does_not_remove_unknown_namespace_pg() -
     assert out["ok"] is True
     assert capacity_checks == 2
     assert killed == []
-    assert ("unknown_ns_pg", "tinker") not in removed_pgs
+    assert ("unknown_ns_pg", "tinker") in removed_pgs
     assert out["evicted_actor_names"] == []
-    assert out["evicted_placement_group_names"] == []
+    assert out["evicted_placement_group_names"] == ["unknown_ns_pg"]
 
 
 def test_issue_593_placement_reconciler_does_not_evict_foreign_blockers_when_target_started() -> None:

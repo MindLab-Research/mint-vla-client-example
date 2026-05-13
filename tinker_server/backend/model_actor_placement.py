@@ -465,13 +465,7 @@ class ModelActorPlacementReconciler:
             pg_name = str(pg_info.get("name") or "").strip()
             if not pg_name:
                 continue
-            pg_namespace = str(pg_info.get("namespace") or "").strip()
-            if not pg_namespace:
-                logger.warning(
-                    "[model_actor_placement] skip preempting placement_group=%s with unresolved namespace",
-                    pg_name,
-                )
-                continue
+            pg_namespace = str(pg_info.get("namespace") or "").strip() or self._namespace
             if (
                 pg_namespace == ignore_placement_group_namespace
                 and pg_name in ignore_placement_group_names
