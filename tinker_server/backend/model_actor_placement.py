@@ -589,6 +589,8 @@ class ModelActorPlacementReconciler:
                 removed_pgs.extend(self._cleanup_orphan_owned_pgs(owned_actor_names))
                 required = self._required_gpus_by_node_ip(spec, node_pins)
                 if required:
+                    if self._target_actor_started(owned_actor_names):
+                        continue
                     ignore_pg_names = {f"{name}_pg" for name in owned_actor_names}
                     try:
                         self._capacity_checker(
@@ -599,8 +601,6 @@ class ModelActorPlacementReconciler:
                         )
                     except Exception as capacity_error:
                         if not _is_capacity_block_error(capacity_error):
-                            raise
-                        if self._target_actor_started(owned_actor_names):
                             raise
                         preempted = self._preempt_exclusive_blockers(
                             required_gpus_by_node_ip=required,

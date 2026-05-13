@@ -637,9 +637,8 @@ def test_issue_593_placement_reconciler_does_not_evict_foreign_blockers_when_tar
         }
     )
 
-    assert out["ok"] is False
-    assert len(capacity_checks) == 1
-    assert "foreign_vllm_pg" in out["blocked"]["vllm:Qwen/Test::replica-1"]
+    assert out["ok"] is True
+    assert capacity_checks == []
     assert killed == []
     assert ("foreign_vllm_pg", "foreign") not in removed_pgs
     assert out["evicted_actor_names"] == []
