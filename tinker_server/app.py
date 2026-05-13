@@ -393,6 +393,7 @@ async def lifespan(app: FastAPI):
     else:
         owner_runtime_health_task = asyncio.create_task(_owner_runtime_health_loop())
     ray_reconnect_watch_task: asyncio.Task | None = None
+    model_actor_supervisor_task: asyncio.Task | None = None
     last_ray_connection_epoch = ray_connection_epoch()
 
     inference_manager = None
@@ -475,6 +476,7 @@ async def lifespan(app: FastAPI):
         # ==========================================================================
         from .backend.api_work_queue import api_work_queue
         from .backend.capacity_manager import capacity_manager
+        from .backend.model_actor_supervisor import model_actor_supervisor
         from .backend.queue_execution_runtime import queue_execution_runtime
 
         logger.info("startup stage=before_capacity_manager_ready")
@@ -522,6 +524,26 @@ async def lifespan(app: FastAPI):
             )
             logger.info("startup stage=after_remote_queue_execution_runtime_started")
 
+        if startup_owner and model_actor_supervisor.snapshot().get("desired_total", 0):
+            logger.info("startup stage=before_model_actor_supervisor_reconcile")
+            await model_actor_supervisor.reconcile_once()
+            logger.info("startup stage=after_model_actor_supervisor_reconcile")
+
+        async def _model_actor_supervisor_loop() -> None:
+            interval_s = float(os.environ.get("MINT_MODEL_ACTOR_SUPERVISOR_RECONCILE_INTERVAL_S", "5.0"))
+            while True:
+                await asyncio.sleep(max(1.0, interval_s))
+                try:
+                    if model_actor_supervisor.snapshot().get("desired_total", 0):
+                        await model_actor_supervisor.reconcile_once()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("model actor supervisor reconcile failed")
+
+        if startup_owner and model_actor_supervisor.snapshot().get("desired_total", 0):
+            model_actor_supervisor_task = asyncio.create_task(_model_actor_supervisor_loop())
+
         async def _ray_reconnect_watch_loop() -> None:
             nonlocal last_ray_connection_epoch
             poll_s = ray_reconnect_poll_s()
@@ -545,6 +567,8 @@ async def lifespan(app: FastAPI):
                     ensure_training_session_store_ready()
                     await capacity_manager.async_ensure_ready()
                     await api_work_queue.async_ensure_started()
+                    if model_actor_supervisor.snapshot().get("desired_total", 0):
+                        await model_actor_supervisor.reconcile_once()
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -555,6 +579,7 @@ async def lifespan(app: FastAPI):
         stale_training_heartbeat_task = None
 
     except Exception:
+        await _cancel_task(model_actor_supervisor_task)
         await _cancel_task(ray_reconnect_watch_task)
         await _cancel_task(startup_lease_task)
         await startup_lease.release()
@@ -573,6 +598,7 @@ async def lifespan(app: FastAPI):
     # Shutdown
     # ==========================================================================
     await _cancel_task(ray_reconnect_watch_task)
+    await _cancel_task(model_actor_supervisor_task)
     await _cancel_task(owner_runtime_health_task)
     await _cancel_task(stale_training_heartbeat_task)
     await _cancel_task(startup_lease_task)

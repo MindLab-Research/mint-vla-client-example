@@ -135,6 +135,84 @@ def test_parse_model_gpu_placement_resolves_worker_gpu_slices(
     assert placement.required_gpus_by_node_ip() == {"10.0.0.7": 2, "10.0.0.8": 3}
 
 
+def test_parse_model_gpu_placement_accepts_node_ip_slice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vp = _import_volc_placement(monkeypatch)
+
+    monkeypatch.setattr(
+        vp,
+        "_list_alive_gpu_nodes",
+        lambda: [
+            vp.VolcGpuNode(
+                node_id="node-1",
+                node_ip="10.0.0.17",
+                hostname="t-abc-worker-1",
+                total_gpus=8,
+                available_gpus=8,
+                volc_job_id=None,
+                volc_resource_queue_id=None,
+            )
+        ],
+    )
+
+    placement = vp.parse_model_gpu_placement(
+        raw_json='{"Qwen/Test":{"replica":0,"node_ip":"10.0.0.17","gpu_count":4}}',
+        lookup_keys=["Qwen/Test"],
+        env_var_name="MINT_VLLM_MODEL_PLACEMENT_JSON",
+        context="test placement",
+        replica=0,
+    )
+
+    assert placement is not None
+    assert placement.total_gpus == 4
+    assert placement.node_ips == ["10.0.0.17"]
+    assert placement.required_gpus_by_node_ip() == {"10.0.0.17": 4}
+
+
+def test_parse_model_gpu_placement_node_ip_slice_ignores_duplicate_worker_indexes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vp = _import_volc_placement(monkeypatch)
+
+    monkeypatch.setattr(
+        vp,
+        "_list_alive_gpu_nodes",
+        lambda: [
+            vp.VolcGpuNode(
+                node_id="node-1",
+                node_ip="10.0.0.17",
+                hostname="t-old-worker-0",
+                total_gpus=8,
+                available_gpus=8,
+                volc_job_id=None,
+                volc_resource_queue_id=None,
+            ),
+            vp.VolcGpuNode(
+                node_id="node-2",
+                node_ip="10.0.0.18",
+                hostname="t-new-worker-0",
+                total_gpus=8,
+                available_gpus=8,
+                volc_job_id=None,
+                volc_resource_queue_id=None,
+            ),
+        ],
+    )
+
+    placement = vp.parse_model_gpu_placement(
+        raw_json='{"Qwen/Test":{"replica":0,"node_ip":"10.0.0.18","gpu_count":1}}',
+        lookup_keys=["Qwen/Test"],
+        env_var_name="MINT_VLLM_MODEL_PLACEMENT_JSON",
+        context="test placement",
+        replica=0,
+    )
+
+    assert placement is not None
+    assert placement.node_ips == ["10.0.0.18"]
+    assert placement.required_gpus_by_node_ip() == {"10.0.0.18": 1}
+
+
 def test_parse_model_gpu_placement_selects_single_runtime_replica(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -174,6 +174,49 @@ def test_issue_432_vllm_iteration_patch_resets_stale_step_timings(monkeypatch) -
     assert not hasattr(stats, "mint_worker_execute_model_s")
 
 
+def test_issue_432_vllm_iteration_patch_tolerates_missing_engine_timing_hook(monkeypatch) -> None:
+    monkeypatch.setattr(vllm_obs_mod, "_VLLM_PATCHES_INSTALLED", False)
+
+    fake_sched_mod = types.ModuleType("vllm.v1.core.sched.scheduler")
+    fake_core_mod = types.ModuleType("vllm.v1.engine.core")
+    fake_output_mod = types.ModuleType("vllm.v1.engine.output_processor")
+
+    class FakeScheduler:
+        def schedule(self):
+            return SimpleNamespace(
+                total_num_scheduled_tokens=8,
+                scheduled_new_reqs=[object()],
+                scheduled_cached_reqs=SimpleNamespace(num_reqs=0),
+            )
+
+        def make_stats(self):
+            return SimpleNamespace()
+
+    class FakeEngineCore:
+        pass
+
+    class FakeOutputProcessor:
+        def _update_stats_from_output(self, *_args, **_kwargs):
+            return None
+
+    fake_sched_mod.Scheduler = FakeScheduler
+    fake_core_mod.EngineCore = FakeEngineCore
+    fake_output_mod.OutputProcessor = FakeOutputProcessor
+
+    monkeypatch.setitem(sys.modules, "vllm.v1.core.sched.scheduler", fake_sched_mod)
+    monkeypatch.setitem(sys.modules, "vllm.v1.engine.core", fake_core_mod)
+    monkeypatch.setitem(sys.modules, "vllm.v1.engine.output_processor", fake_output_mod)
+    monkeypatch.delitem(sys.modules, "vllm.v1.worker.gpu_worker", raising=False)
+
+    vllm_obs_mod.install_vllm_iteration_observability_patches()
+
+    scheduler = FakeScheduler()
+    scheduler.schedule()
+    stats = scheduler.make_stats()
+    assert stats.mint_total_scheduled_tokens == 8
+    assert not hasattr(stats, "mint_executor_execute_model_s")
+
+
 def test_issue_432_vllm_iteration_timings_do_not_replay_stale_values() -> None:
     obs = VllmStatsObserver()
     scheduler_stats = SimpleNamespace(

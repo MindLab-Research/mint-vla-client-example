@@ -425,12 +425,11 @@ async def _enqueue_sampling_request_with_trace(
     enqueue_coro,
     session_id: str | None = None,
     base_model: str | None = None,
-) -> None:
+) -> object:
     tracer = get_otel_tracer()
     future_ready_elapsed_ms = (time.perf_counter() - route_start_s) * 1000.0
     if tracer is None:
-        await enqueue_coro
-        return
+        return await enqueue_coro
 
     with tracer.start_as_current_span(f"{op}.enqueue") as span:
         span.set_attribute("component", "routes.sampling")
@@ -448,7 +447,7 @@ async def _enqueue_sampling_request_with_trace(
             },
         )
         enqueue_start_s = time.perf_counter()
-        await enqueue_coro
+        out = await enqueue_coro
         span.add_event(
             "enqueue_done",
             {
@@ -456,6 +455,7 @@ async def _enqueue_sampling_request_with_trace(
                 "route_elapsed_ms": round((time.perf_counter() - route_start_s) * 1000.0, 3),
             },
         )
+        return out
 
 
 async def _ensure_session_lora_loaded(
@@ -622,6 +622,26 @@ def _prompt_fingerprint(token_ids: list[int]) -> bytes:
 
 def _payload_hash(payload: bytes) -> str:
     return hashlib.blake2b(payload, digest_size=16).hexdigest()
+
+
+def _model_work_scheduler_asample_enabled() -> bool:
+    return str(os.environ.get("MINT_MODEL_WORK_SCHEDULER_ASAMPLE", "")).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    )
+
+
+def _model_work_domain_key(base_model: str) -> str:
+    return f"vllm:{str(base_model).strip()}"
+
+
+def _model_work_affinity_group(snapshot: SamplingSessionSnapshot) -> str:
+    if snapshot.uses_base_model:
+        return f"base:{snapshot.base_model}"
+    return f"lora:{snapshot.session_id}:generation:{int(snapshot.metadata_version)}"
 
 
 def _deterministic_request_id(session_id: str, seq_id: int) -> str:
@@ -1083,6 +1103,7 @@ async def asample(
         billing_auth=billing_auth,
     )
     created_pending = False
+    model_work_attempt_id = uuid.uuid4().hex
 
     # Set request_id in context for logging
     set_request_id(request_id)
@@ -1093,7 +1114,10 @@ async def asample(
             try:
                 ensure = await future_store.async_ensure_pending(
                     request_id=request_id,
-                    meta={"payload_hash": payload_hash},
+                    meta={
+                        "payload_hash": payload_hash,
+                        "model_work_attempt_id": model_work_attempt_id,
+                    },
                 )
             except FutureStoreUnavailableError:
                 raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
@@ -1147,43 +1171,123 @@ async def asample(
         )
 
     created = False
+    model_work_scheduler_append_confirmed = False
     try:
         if not created_pending:
             await future_store.async_create_with_id(request_id)
             created = True
+        base_model = snapshot.base_model if snapshot is not None else None
+        use_model_work_scheduler = (
+            _model_work_scheduler_asample_enabled()
+            and snapshot is not None
+            and bool(snapshot.uses_multi_lora)
+            and bool(base_model)
+        )
+        domain_key = _model_work_domain_key(str(base_model)) if use_model_work_scheduler else None
+        affinity_group = _model_work_affinity_group(snapshot) if use_model_work_scheduler else None
+        ordering_key = f"session:{session_id}" if use_model_work_scheduler else None
+        queued_meta = {
+            "op": "sampling.asample",
+            "sampling_session_id": str(session_id),
+            "queue_state": "queued",
+            "queued_at": time.time(),
+            "stage": "queued",
+        }
+        if use_model_work_scheduler:
+            queued_meta.update(
+                {
+                    "queue_kind": "model_work_scheduler",
+                    "domain_key": domain_key,
+                    "affinity_group": affinity_group,
+                    "ordering_key": ordering_key,
+                    "model_work_attempt_id": model_work_attempt_id,
+                }
+            )
         await future_store.async_mark_queued(
             request_id,
-            meta={
-                "op": "sampling.asample",
-                "sampling_session_id": str(session_id),
-                "queue_state": "queued",
-                "queued_at": time.time(),
-                "stage": "queued",
-            },
+            meta=queued_meta,
         )
-        base_model = snapshot.base_model if snapshot is not None else None
-        await _enqueue_sampling_request_with_trace(
-            route_start_s=route_start_s,
-            request_id=request_id,
-            op="sampling.asample",
-            session_id=session_id,
-            base_model=base_model,
-            enqueue_coro=api_work_queue.enqueue(
+        enqueue_extra = merge_queue_priority_extra(
+            {"gateway_auth": billing_auth.__dict__} if billing_auth is not None else None,
+            request=http_request,
+        )
+        if use_model_work_scheduler:
+            from ..backend.model_work_scheduler import model_work_scheduler
+
+            enqueue_out = await _enqueue_sampling_request_with_trace(
+                route_start_s=route_start_s,
                 request_id=request_id,
                 op="sampling.asample",
-                request_json=request_json,
-                user_id=user_id,
-                apikey_id=apikey_id,
-                throttle_principal=throttle_principal,
-                webhook_url=None,
-                extra=merge_queue_priority_extra(
-                    {"gateway_auth": billing_auth.__dict__} if billing_auth is not None else None,
-                    request=http_request,
+                session_id=session_id,
+                base_model=base_model,
+                enqueue_coro=model_work_scheduler.append(
+                    request_id=request_id,
+                    op="sampling.asample",
+                    request_json=request_json,
+                    user_id=user_id,
+                    apikey_id=apikey_id,
+                    throttle_principal=throttle_principal,
+                    webhook_url=None,
+                    domain_key=domain_key,
+                    affinity_group=affinity_group,
+                    ordering_key=ordering_key,
+                    token_cost=max(
+                        1,
+                        int(request.sampling_params.max_tokens) * int(request.num_samples),
+                    ),
+                    assign=True,
+                    assign_max_items=1,
+                    extra={
+                        **enqueue_extra,
+                        "model_work_scheduler": True,
+                        "domain_key": domain_key,
+                        "affinity_group": affinity_group,
+                        "model_work_attempt_id": model_work_attempt_id,
+                    },
                 ),
-            ),
-        )
+            )
+            if isinstance(enqueue_out, dict) and bool(enqueue_out.get("ok")):
+                model_work_scheduler_append_confirmed = True
+            if isinstance(enqueue_out, dict) and enqueue_out.get("scheduler_instance_id"):
+                await future_store.async_update_meta(
+                    request_id,
+                    {
+                        "model_work_scheduler_instance_id": str(
+                            enqueue_out["scheduler_instance_id"]
+                        ),
+                        "model_work_attempt_id": model_work_attempt_id,
+                    },
+                )
+        else:
+            await _enqueue_sampling_request_with_trace(
+                route_start_s=route_start_s,
+                request_id=request_id,
+                op="sampling.asample",
+                session_id=session_id,
+                base_model=base_model,
+                enqueue_coro=api_work_queue.enqueue(
+                    request_id=request_id,
+                    op="sampling.asample",
+                    request_json=request_json,
+                    user_id=user_id,
+                    apikey_id=apikey_id,
+                    throttle_principal=throttle_principal,
+                    webhook_url=None,
+                    extra=enqueue_extra,
+                ),
+            )
     except ApiWorkQueueThrottleError as e:
         await capacity_manager.async_release_all(request_id)
+        if model_work_scheduler_append_confirmed:
+            try:
+                from ..backend.model_work_scheduler import model_work_scheduler
+
+                await model_work_scheduler.cancel_request(
+                    request_id=request_id,
+                    reason="asample_enqueue_failed",
+                )
+            except Exception:
+                pass
         if created_pending:
             try:
                 await future_store.async_forget(request_id)
@@ -1203,6 +1307,16 @@ async def asample(
         throttle_error = _unwrap_queue_throttle_error(e)
         if throttle_error is not None:
             await capacity_manager.async_release_all(request_id)
+            if model_work_scheduler_append_confirmed:
+                try:
+                    from ..backend.model_work_scheduler import model_work_scheduler
+
+                    await model_work_scheduler.cancel_request(
+                        request_id=request_id,
+                        reason="asample_enqueue_failed",
+                    )
+                except Exception:
+                    pass
             if created_pending:
                 try:
                     await future_store.async_forget(request_id)
@@ -1219,6 +1333,16 @@ async def asample(
             )
             raise HTTPException(status_code=429, detail=throttle_error.detail) from e
         await capacity_manager.async_release_all(request_id)
+        if model_work_scheduler_append_confirmed:
+            try:
+                from ..backend.model_work_scheduler import model_work_scheduler
+
+                await model_work_scheduler.cancel_request(
+                    request_id=request_id,
+                    reason="asample_enqueue_failed",
+                )
+            except Exception:
+                pass
         if created_pending:
             try:
                 await future_store.async_forget(request_id)

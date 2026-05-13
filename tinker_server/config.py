@@ -217,6 +217,14 @@ def actor_runtime_env_vars(*, pythonpath: str, extra: dict[str, str] | None = No
         "MINT_VLLM_SERIALIZE_ADD_LORA_UNTIL_IDLE",
         "MINT_VLLM_REQUEST_TIMING",
         "MINT_VLLM_SKIP_PEFT_SHAPE_VALIDATION",
+        "MINT_VLLM_ENABLE_SLEEP_MODE",
+        "MINT_MODEL_CONFIG_OVERRIDES_JSON",
+        "TINKER_MODEL_CONFIG_OVERRIDES_JSON",
+        "MINT_VLLM_MAX_NUM_SEQS",
+        "MINT_VLLM_MAX_NUM_BATCHED_TOKENS",
+        "MINT_VLLM_MAX_LORAS",
+        "MINT_VLLM_MAX_CPU_LORAS",
+        "MINT_VLLM_MAX_LORA_RANK",
         "MINT_MODEL_PLACEMENT_JSON",
         "MINT_VLLM_MODEL_PLACEMENT_JSON",
         "MINT_DENSE_MODEL_PLACEMENT_JSON",
@@ -244,10 +252,22 @@ def actor_runtime_env_vars(*, pythonpath: str, extra: dict[str, str] | None = No
         "TINKER_CHECKPOINT_INDEX_WRITE_TIMEOUT_MS",
         "TINKER_CHECKPOINT_INDEX_UPLOADING_STALE_S",
         "MINT_CHECKPOINT_INDEX_PUBLISH_RETRY_S",
+        "MINT_FUTURE_STORE_ACTOR_NAME",
+        "MINT_FUTURE_REPLAY_ROOT_DIR",
+        "MINT_FUTURE_REPLAY_SWEEPER_ACTOR_NAME",
+        "MINT_MODEL_WORK_SCHEDULER_ACTOR_NAME",
+        "MINT_MODEL_WORK_SCHEDULER_PINNED_NODE_IP",
+        "MINT_QUEUE_EXECUTION_RUNTIME_ACTOR_NAME",
+        "MINT_QUEUE_SUPERVISOR_ACTOR_NAME",
+        "MINT_STARTUP_LEASE_ACTOR_NAME",
+        "MINT_OWNER_RUNTIME_SUPERVISOR_ACTOR_NAME",
     ):
         value = _env_nonempty(os.environ, key)
         if value is not None:
             out[key] = value
+    mint_ray_namespace = _env_nonempty(os.environ, "MINT_RAY_NAMESPACE")
+    if mint_ray_namespace is not None:
+        out["MINT_RAY_NAMESPACE"] = mint_ray_namespace
     for primary, aliases in (
         ("MINT_API_WORK_QUEUE_ACTOR_NAME", ("TINKER_API_WORK_QUEUE_ACTOR_NAME",)),
         ("MINT_CAPACITY_MANAGER_ACTOR_NAME", ("TINKER_CAPACITY_MANAGER_ACTOR_NAME",)),

@@ -97,8 +97,6 @@ async def test_issue_364_queue_supervisor_claim_and_heartbeat(monkeypatch) -> No
 
 
 def test_issue_364_queue_supervisor_same_owner_claim_keeps_active_state(monkeypatch) -> None:
-    import tinker_server.backend.queue_supervisor as qs
-
     class _ActorState:
         def __init__(self) -> None:
             self.generation_id = 0
@@ -205,6 +203,49 @@ def test_issue_364_future_store_rejects_stale_generation(monkeypatch) -> None:
     future_store_module.future_store.resolve("rid-1", {"ok": True})
 
     assert calls == [("rid-1", "stale generation finalize rejected (generation_id=7)")]
+
+
+@pytest.mark.anyio
+async def test_issue_593_future_store_async_rejects_stale_generation(monkeypatch) -> None:
+    future_store_module = importlib.import_module("tinker_server.backend.future_store")
+
+    calls: list[tuple[str, str]] = []
+
+    class _FakeActor:
+        class _FailRemote:
+            def remote(self, *, request_id: str, error: str):
+                calls.append((request_id, error))
+
+        @property
+        def fail(self):
+            return self._FailRemote()
+
+    class _FakeQueueSupervisor:
+        async def async_is_generation_current(self, *, generation_id: int, timeout_s: float = 10.0) -> bool:
+            assert generation_id == 7
+            return False
+
+    async def _await(value, *, timeout_s=None):
+        _ = timeout_s
+        return value
+
+    async def _get_actor_async():
+        return _FakeActor()
+
+    monkeypatch.setattr(future_store_module.future_store, "_get_ray_actor_async", _get_actor_async)
+    monkeypatch.setattr(future_store_module, "_await_ray_ref", _await)
+    queue_supervisor_module = importlib.import_module("tinker_server.backend.queue_supervisor")
+    monkeypatch.setattr(queue_supervisor_module, "queue_supervisor", _FakeQueueSupervisor())
+    monkeypatch.setattr(future_store_module, "get_current_queue_generation_id", lambda: 7)
+    monkeypatch.setitem(
+        sys.modules,
+        "ray",
+        SimpleNamespace(put=lambda value: value, exceptions=SimpleNamespace(ActorDiedError=RuntimeError)),
+    )
+
+    await future_store_module.future_store.async_resolve("rid-async", {"ok": True})
+
+    assert calls == [("rid-async", "stale generation finalize rejected (generation_id=7)")]
 
 
 @pytest.mark.anyio

@@ -236,6 +236,19 @@ class _StubQueueExecutionRuntime:
         }
 
 
+class _StubModelActorSupervisor:
+    def __init__(self, *, desired_total: int = 0):
+        self.desired_total = int(desired_total)
+        self.reconcile_calls = 0
+
+    def snapshot(self):
+        return {"desired_total": self.desired_total}
+
+    async def reconcile_once(self):
+        self.reconcile_calls += 1
+        return {"ok": True}
+
+
 class _TrackedMultiModelManager:
     def __init__(self) -> None:
         self.shutdown_calls = 0
@@ -274,6 +287,7 @@ def _install_lifespan_stubs(
     queue_execution_runtime: _StubQueueExecutionRuntime,
     init_ray_calls: _StubInitRayCalls | None = None,
     future_store: _StubFutureStore | None = None,
+    model_actor_supervisor: _StubModelActorSupervisor | None = None,
 ) -> None:
     monkeypatch.setattr(app_module, "_cleanup_stale_actors", _noop_async)
     monkeypatch.setattr(app_module, "_restore_sampling_sessions", _noop_async)
@@ -297,6 +311,7 @@ def _install_lifespan_stubs(
     usage_store_module = importlib.import_module("tinker_server.usage_store")
     owner_runtime_module = importlib.import_module("tinker_server.backend.owner_runtime_supervisor")
     queue_execution_runtime_module = importlib.import_module("tinker_server.backend.queue_execution_runtime")
+    model_actor_supervisor_module = importlib.import_module("tinker_server.backend.model_actor_supervisor")
 
     verl_training_module = types.ModuleType("tinker_server.backend.verl_training")
     verl_training_module.VerlTrainingEngine = _StubTrainingEngine
@@ -309,6 +324,11 @@ def _install_lifespan_stubs(
     monkeypatch.setattr(api_work_queue_module, "api_work_queue", queue)
     monkeypatch.setattr(owner_runtime_module, "owner_runtime_supervisor", owner_runtime)
     monkeypatch.setattr(queue_execution_runtime_module, "queue_execution_runtime", queue_execution_runtime)
+    monkeypatch.setattr(
+        model_actor_supervisor_module,
+        "model_actor_supervisor",
+        model_actor_supervisor or _StubModelActorSupervisor(),
+    )
     monkeypatch.setattr(capacity_manager_module, "capacity_manager", _StubCapacityManager())
     monkeypatch.setattr(future_store_module, "future_store", future_store or _StubFutureStore())
     monkeypatch.setattr(gateway_session_store_module, "ensure_ready", lambda: None)
@@ -408,6 +428,36 @@ def test_lifespan_routes_persistent_prewarm_to_queue_runtime(monkeypatch) -> Non
             "timeout_s": app_module._queue_execution_runtime_start_timeout_s(),
         }
     ]
+
+
+def test_lifespan_reconciles_model_actor_supervisor_when_desired(monkeypatch) -> None:
+    queue = _StubApiWorkQueue()
+    owner_runtime = _StubOwnerRuntimeSupervisor()
+    queue_execution_runtime = _StubQueueExecutionRuntime()
+    model_actor_supervisor = _StubModelActorSupervisor(desired_total=1)
+    _install_lifespan_stubs(
+        monkeypatch,
+        queue,
+        owner_runtime,
+        queue_execution_runtime,
+        model_actor_supervisor=model_actor_supervisor,
+    )
+    lease = _StubStartupLease(is_owner=True)
+
+    async def _acquire_startup_lease(*_args, **_kwargs):
+        return lease
+
+    monkeypatch.setattr(
+        "tinker_server.backend.startup_lease.acquire_startup_lease",
+        _acquire_startup_lease,
+    )
+
+    async def _run() -> None:
+        async with app_module.lifespan(app_module.app):
+            return None
+
+    asyncio.run(_run())
+    assert model_actor_supervisor.reconcile_calls == 1
 
 
 @pytest.mark.anyio

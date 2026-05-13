@@ -492,11 +492,15 @@ async def retrieve_future(
         queue_depth_session = None
         queue_position_session = None
         queue_active_sessions = None
+        domain_key = meta.get("domain_key") if isinstance(meta, dict) else None
+        affinity_group = meta.get("affinity_group") if isinstance(meta, dict) else None
+        ordering_key = meta.get("ordering_key") if isinstance(meta, dict) else None
         from ..backend.api_work_queue import ApiWorkQueueUnavailableError, api_work_queue
 
         pos = None
         queue_probe = None
-        if status_field == "queued":
+        should_probe_api_queue = status_field == "queued" and queue_kind != "model_work_scheduler"
+        if should_probe_api_queue:
             try:
                 queue_probe = await api_work_queue.describe_pending_request(
                     body.request_id,
@@ -504,10 +508,10 @@ async def retrieve_future(
                 )
                 pos = queue_probe
             except ApiWorkQueueUnavailableError as e:
-                if queue_kind != "scheduled":
+                if queue_kind not in {"scheduled", "model_work_scheduler"}:
                     raise HTTPException(status_code=503, detail=f"ApiWorkQueue unavailable: {e}") from e
             except Exception as e:
-                if queue_kind != "scheduled":
+                if queue_kind not in {"scheduled", "model_work_scheduler"}:
                     raise HTTPException(status_code=503, detail=f"ApiWorkQueue position lookup failed: {type(e).__name__}: {e}") from e
 
         if isinstance(pos, dict):
@@ -570,6 +574,38 @@ async def retrieve_future(
             scheduler_domain = None
         if not isinstance(scheduler_session_id, str) or not scheduler_session_id:
             scheduler_session_id = None
+        if not isinstance(domain_key, str) or not domain_key:
+            domain_key = None
+        if not isinstance(affinity_group, str) or not affinity_group:
+            affinity_group = None
+        if not isinstance(ordering_key, str) or not ordering_key:
+            ordering_key = None
+
+        if status_field == "queued" and queue_kind == "model_work_scheduler":
+            try:
+                from ..backend.capacity_manager import capacity_manager
+                from ..backend.model_work_scheduler import model_work_scheduler
+
+                contains = await model_work_scheduler.contains_request(request_id=body.request_id)
+                if not bool(contains.get("present")):
+                    await future_store.async_fail(
+                        body.request_id,
+                        "model work scheduler recovered without this request; request must be retried",
+                    )
+                    await capacity_manager.async_release_all(body.request_id)
+                    error = await future_store.async_get_error(body.request_id)
+                    payload = _failed_payload(error, http_request)
+                    _recent_put(body.request_id, payload, ttl_s=_local_hot_ttl_s())
+                    logger.warning(
+                        "[retrieve_future] request_id=%s status=model_work_orphan_failed",
+                        body.request_id,
+                    )
+                    return payload
+            except Exception:
+                logger.exception(
+                    "[retrieve_future] model_work_scheduler orphan probe failed request_id=%s",
+                    body.request_id,
+                )
 
         if queue_kind == "legacy" and isinstance(queue_depth_scheduled, int) and queue_depth_scheduled > 0:
             queue_position = None
@@ -582,7 +618,9 @@ async def retrieve_future(
                 estimated_wait_s = (float(queue_position) + 1.0) * float(ema_exec_s) / float(worker_count)
 
         if queue_state_reason is None and status_field == "queued":
-            if queue_kind == "scheduled":
+            if queue_kind == "model_work_scheduler":
+                queue_state_reason = "model_work_scheduler"
+            elif queue_kind == "scheduled":
                 queue_state_reason = "scheduled_queue"
             elif queue_kind == "legacy" and isinstance(queue_depth_scheduled, int) and queue_depth_scheduled > 0:
                 queue_state_reason = "mixed_queue_arbitration"
@@ -642,6 +680,9 @@ async def retrieve_future(
                 "scheduler_session_id": scheduler_session_id,
                 "scheduler_domain_key_source": scheduler_domain_key_source,
                 "scheduler_capacity_owner": scheduler_capacity_owner,
+                "domain_key": domain_key,
+                "affinity_group": affinity_group,
+                "ordering_key": ordering_key,
                 "model_id": model_id,
                 "session_id": session_id,
                 "sampling_session_id": sampling_session_id,

@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import ray
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from tinker_server.backend.model_registry import get_model_config
 from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
@@ -45,6 +46,7 @@ from tinker_server.runtime_env import (
 
 from . import ray_kill
 from .gpu_binding_helpers import gpu_bindings_from_ray_gpu_ids
+from .volc_placement import assert_node_ip_capacity, parse_model_gpu_placement
 from .vllm_scheduler_observability import (
     VllmStatsObserver,
     attach_vllm_stats_logger,
@@ -63,6 +65,79 @@ def _env_flag(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _replica_index_from_env(default: int = 0) -> int:
+    raw = os.environ.get("MINT_MODEL_ACTOR_REPLICA_ID") or os.environ.get("MINT_MODEL_ACTOR_REPLICA")
+    if raw is None:
+        return int(default)
+    value = str(raw).strip()
+    if value.startswith("replica-"):
+        value = value.removeprefix("replica-")
+    try:
+        return int(value)
+    except Exception:
+        logger.warning("Invalid model actor replica env value %r; falling back to %s", raw, default)
+        return int(default)
+
+
+def _vllm_actor_pin_options_for_model(
+    model_path: str,
+    *,
+    required_gpus: int,
+    replica: int | None = None,
+) -> dict[str, Any]:
+    lookup_keys = [str(model_path).strip(), str(model_path).strip().lower()]
+    replica_index = _replica_index_from_env() if replica is None else int(replica)
+    context = f"verl_vllm_pin model={model_path!r} replica={replica_index}"
+    placement = parse_model_gpu_placement(
+        raw_json=os.environ.get("MINT_VLLM_MODEL_PLACEMENT_JSON"),
+        lookup_keys=lookup_keys,
+        env_var_name="MINT_VLLM_MODEL_PLACEMENT_JSON",
+        context=context,
+        replica=replica_index,
+    )
+    if placement is None:
+        placement = parse_model_gpu_placement(
+            raw_json=os.environ.get("MINT_MODEL_PLACEMENT_JSON"),
+            lookup_keys=lookup_keys,
+            env_var_name="MINT_MODEL_PLACEMENT_JSON",
+            context=context,
+            replica=replica_index,
+        )
+    if placement is None:
+        return {}
+    if len(placement.slices) != 1:
+        raise RuntimeError(
+            f"{context}: VerlInferenceEngine requires exactly 1 placement slice, got {len(placement.slices)}"
+        )
+    if int(placement.total_gpus) != int(required_gpus):
+        raise RuntimeError(
+            f"{context}: placement GPU count mismatch, need {required_gpus}, got {placement.total_gpus}"
+        )
+    pinned_node_ip = placement.slices[0].node_ip
+    assert_node_ip_capacity(
+        required_gpus_by_node_ip={pinned_node_ip: int(required_gpus)},
+        context=context,
+    )
+    node_map = {n.get("NodeManagerAddress"): n.get("NodeID") for n in ray.nodes() if n.get("Alive")}
+    node_id = node_map.get(pinned_node_ip)
+    if not node_id:
+        raise RuntimeError(
+            f"{context}: pinned_node_ip={pinned_node_ip} is not an alive Ray node; "
+            f"alive_node_ips={sorted(ip for ip in node_map if ip)}"
+        )
+    logger.info(
+        "Pinning VerlInferenceEngine vLLM actor model=%s node_ip=%s node_id=%s required_gpus=%s",
+        model_path,
+        pinned_node_ip,
+        node_id,
+        required_gpus,
+    )
+    return {
+        "resources": {f"node:{pinned_node_ip}": 0.001},
+        "scheduling_strategy": NodeAffinitySchedulingStrategy(node_id, soft=False),
+    }
 
 
 def _strip_empty_targets(value: object) -> object:
@@ -695,8 +770,16 @@ def _create_extended_server_class(
                 # instance for the base server.
                 if hasattr(rollout_cfg, "disable_log_stats"):
                     object.__setattr__(rollout_cfg, "disable_log_stats", False)
+                if hasattr(rollout_cfg, "enable_sleep_mode"):
+                    object.__setattr__(
+                        rollout_cfg,
+                        "enable_sleep_mode",
+                        _env_flag("MINT_VLLM_ENABLE_SLEEP_MODE", default=False),
+                    )
                 print(
-                    f"[ExtendedVLLMHttpServer] rollout config normalized type={type(rollout_cfg).__name__} _target_={getattr(rollout_cfg, '_target_', None)!r}",
+                    f"[ExtendedVLLMHttpServer] rollout config normalized type={type(rollout_cfg).__name__} "
+                    f"_target_={getattr(rollout_cfg, '_target_', None)!r} "
+                    f"enable_sleep_mode={getattr(rollout_cfg, 'enable_sleep_mode', None)!r}",
                     flush=True,
                 )
                 call_kwargs["config"] = rollout_cfg
@@ -2730,6 +2813,7 @@ class VerlInferenceEngine:
             engine_kwargs=engine_kwargs,
             checkpoint_engine=CheckpointEngineConfig(backend="naive"),
             enable_rollout_routing_replay=enable_rollout_routing_replay,
+            enable_sleep_mode=_env_flag("MINT_VLLM_ENABLE_SLEEP_MODE", default=False),
         )
         model_config = HFModelConfig(
             path=self.model_path,
@@ -2760,9 +2844,14 @@ class VerlInferenceEngine:
                 extra={
                     "LD_LIBRARY_PATH": actor_ld_library_path(),
                     "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+                    "USE_TORCH": "1",
+                    "USE_TF": "0",
+                    "USE_FLAX": "0",
                     "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                     "HF_HUB_OFFLINE": "1",
                     "VLLM_ATTENTION_BACKEND": server_config.vllm_attention_backend,
+                    "MINT_MODEL_PLACEMENT_JSON": os.environ.get("MINT_MODEL_PLACEMENT_JSON", "").strip(),
+                    "MINT_VLLM_MODEL_PLACEMENT_JSON": os.environ.get("MINT_VLLM_MODEL_PLACEMENT_JSON", "").strip(),
                     **otel_env_vars(),
                 },
             )
@@ -2771,10 +2860,15 @@ class VerlInferenceEngine:
         if preferred_python:
             runtime_env["py_executable"] = preferred_python
 
+        actor_options: dict[str, Any] = {
+            **_vllm_actor_pin_options_for_model(self.model_path, required_gpus=int(total_gpus)),
+        }
+
         self.server = ExtendedVLLMHttpServer.options(
             num_gpus=total_gpus,
             max_concurrency=int(os.environ.get("MINT_VLLM_ACTOR_MAX_CONCURRENCY", "64")),
             runtime_env=runtime_env,
+            **actor_options,
         ).remote(**remote_kwargs)
 
         # Launch the server

@@ -33,6 +33,15 @@ class _StubFutureStore:
     async def async_debug_snapshot(self) -> dict:
         return {"meta": dict(self._meta)}
 
+    async def async_fail(self, request_id: str, error: str) -> None:
+        self._meta["failed_request_id"] = request_id
+        self._meta["failed_error"] = error
+
+    async def async_get_error(self, request_id: str) -> str | None:
+        _ = request_id
+        error = self._meta.get("failed_error")
+        return str(error) if error is not None else None
+
 
 class _StubApiWorkQueue:
     def __init__(
@@ -91,6 +100,24 @@ class _StubApiWorkQueueProbeUnavailable(_StubApiWorkQueue):
     async def describe_pending_request(self, request_id: str, op: str | None) -> dict:
         _ = request_id, op
         raise ApiWorkQueueUnavailableError("probe unavailable")
+
+
+class _StubModelWorkScheduler:
+    def __init__(self, *, present: bool) -> None:
+        self.present = bool(present)
+        self.contains_calls: list[str] = []
+
+    async def contains_request(self, *, request_id: str) -> dict:
+        self.contains_calls.append(request_id)
+        return {"ok": True, "request_id": request_id, "present": self.present}
+
+
+class _StubCapacityManager:
+    def __init__(self) -> None:
+        self.released: list[str] = []
+
+    async def async_release_all(self, request_id: str) -> None:
+        self.released.append(request_id)
 
 
 def _request_stub():
@@ -486,6 +513,76 @@ def test_issue_182_queued_scheduled_payload_survives_queue_actor_unavailable(mon
     assert payload.get("scheduler_domain") == "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507"
     assert payload.get("scheduler_session_id") == "sess-182"
     assert payload.get("estimated_wait_s") is None
+
+
+def test_issue_593_model_work_scheduler_payload_skips_legacy_queue_probe(monkeypatch):
+    meta = {
+        "queue_state": "queued",
+        "stage": "queued",
+        "op": "sampling.asample",
+        "queue_kind": "model_work_scheduler",
+        "domain_key": "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
+        "affinity_group": "lora:session-a:generation:7",
+        "ordering_key": "session:session-a",
+    }
+    monkeypatch.setattr(futures_route, "future_store", _StubFutureStore(meta))
+    import tinker_server.backend.api_work_queue as wq
+
+    queue = _StubApiWorkQueueUnavailable()
+    monkeypatch.setattr(wq, "api_work_queue", queue)
+    import tinker_server.backend.model_work_scheduler as mws
+
+    scheduler = _StubModelWorkScheduler(present=True)
+    monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
+    import tinker_server.config as config_module
+
+    monkeypatch.setattr(config_module.config, "api_work_queue_num_workers", 2, raising=False)
+
+    body = FutureRetrieveRequest(request_id="rid_model_work_scheduler_queued")
+    response = _response_stub()
+    payload = asyncio.run(futures_route.retrieve_future(body, _request_stub(), response))
+
+    assert response.status_code == 408
+    assert payload.get("status") == "queued"
+    assert payload.get("queue_kind") == "model_work_scheduler"
+    assert payload.get("queue_state_reason") == "model_work_scheduler"
+    assert payload.get("domain_key") == "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507"
+    assert payload.get("affinity_group") == "lora:session-a:generation:7"
+    assert payload.get("ordering_key") == "session:session-a"
+    assert payload.get("estimated_wait_s") is None
+    assert scheduler.contains_calls == ["rid_model_work_scheduler_queued"]
+
+
+def test_issue_593_model_work_scheduler_orphan_fails_on_retrieve(monkeypatch):
+    meta = {
+        "queue_state": "queued",
+        "stage": "queued",
+        "op": "sampling.asample",
+        "queue_kind": "model_work_scheduler",
+        "domain_key": "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
+    }
+    store = _StubFutureStore(meta)
+    monkeypatch.setattr(futures_route, "future_store", store)
+    import tinker_server.backend.api_work_queue as wq
+
+    monkeypatch.setattr(wq, "api_work_queue", _StubApiWorkQueueUnavailable())
+    import tinker_server.backend.capacity_manager as cm
+
+    capacity = _StubCapacityManager()
+    monkeypatch.setattr(cm, "capacity_manager", capacity)
+    import tinker_server.backend.model_work_scheduler as mws
+
+    scheduler = _StubModelWorkScheduler(present=False)
+    monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
+
+    body = FutureRetrieveRequest(request_id="rid_orphaned_model_work")
+    response = _response_stub()
+    payload = asyncio.run(futures_route.retrieve_future(body, _request_stub(), response))
+
+    assert response.status_code == 200
+    assert payload.get("error") == "model work scheduler recovered without this request; request must be retried"
+    assert capacity.released == ["rid_orphaned_model_work"]
+    assert scheduler.contains_calls == ["rid_orphaned_model_work"]
 
 
 def test_issue_182_running_payload_survives_queue_actor_unavailable(monkeypatch):

@@ -20,7 +20,14 @@ from enum import Enum
 from typing import Any
 
 from .async_ray_control import _await_with_ray_get_timeout
-from .queue_execution_context import get_current_queue_generation_id
+from .queue_execution_context import (
+    ModelWorkFinalize,
+    get_current_model_work_consumer_generation,
+    get_current_model_work_consumer_id,
+    get_current_model_work_finalize_buffer,
+    get_current_model_work_lease_id,
+    get_current_queue_generation_id,
+)
 from ..config import config as server_config, otel_env_vars
 
 
@@ -551,6 +558,25 @@ def _get_or_create_ray_actor():
             meta["done_at"] = done_at
             self._meta[request_id] = meta
 
+        def fail_if_pending_meta_matches(
+            self,
+            request_id: str,
+            error: str,
+            expected_meta: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            self._prune()
+            if request_id not in self._pending:
+                return {"failed": False, "reason": "not_pending"}
+            meta = self._meta.get(request_id)
+            if expected_meta:
+                if not isinstance(meta, dict):
+                    return {"failed": False, "reason": "missing_meta"}
+                for key, value in expected_meta.items():
+                    if meta.get(str(key)) != value:
+                        return {"failed": False, "reason": "meta_mismatch"}
+            self.fail(request_id, error)
+            return {"failed": True, "reason": "failed"}
+
         def get_status(self, request_id: str) -> str:
             self._prune()
             if request_id in self._retrieved_at:
@@ -612,6 +638,38 @@ def _get_or_create_ray_actor():
             self._prune()
             meta = _meta_with_request_op(self._meta.get(request_id), self._request_op(request_id))
             return meta or None
+
+        def list_pending_by_meta(
+            self,
+            filters: dict[str, Any] | None = None,
+            limit: int = 1000,
+        ) -> list[dict[str, Any]]:
+            self._prune()
+            expected = {str(k): v for k, v in (filters or {}).items()}
+            out: list[dict[str, Any]] = []
+            for request_id in sorted(self._pending):
+                meta = self._meta.get(request_id)
+                if not isinstance(meta, dict):
+                    continue
+                matched = True
+                for key, value in expected.items():
+                    if meta.get(key) != value:
+                        matched = False
+                        break
+                if not matched:
+                    continue
+                out.append(
+                    {
+                        "request_id": request_id,
+                        "meta": dict(meta),
+                        "created_at": self._created_at.get(request_id),
+                        "queued_at": self._queued_at.get(request_id),
+                        "running_at": self._running_at.get(request_id),
+                    }
+                )
+                if len(out) >= max(1, int(limit)):
+                    break
+            return out
 
         def cleanup(self, request_id: str) -> None:
             terminal = (
@@ -1198,6 +1256,22 @@ class FutureStore:
         except Exception:
             pass
 
+    def _buffer_model_work_finalize(self, *, kind: str, request_id: str, payload: Any) -> bool:
+        buffer = get_current_model_work_finalize_buffer()
+        if buffer is None:
+            return False
+        if buffer.finalization is not None:
+            raise RuntimeError(
+                f"model work request {request_id!r} already has buffered finalize "
+                f"{buffer.finalization.kind!r}"
+            )
+        buffer.finalization = ModelWorkFinalize(
+            kind=str(kind),
+            request_id=str(request_id),
+            payload=payload,
+        )
+        return True
+
     def resolve(self, request_id: str, result: Any) -> None:
         actor = self._get_ray_actor()
         import ray
@@ -1356,14 +1430,43 @@ class FutureStore:
         except Exception as e:
             return True, f"stale generation finalize check failed: {type(e).__name__}: {e}"
 
+    async def _async_stale_model_work_lease_finalize_guard(self) -> tuple[bool, str | None]:
+        lease_id = get_current_model_work_lease_id()
+        if lease_id is None:
+            return False, None
+        consumer_id = get_current_model_work_consumer_id()
+        consumer_generation = get_current_model_work_consumer_generation()
+        if consumer_id is None or consumer_generation is None:
+            return True, "model work lease finalize rejected: missing consumer context"
+        try:
+            from .model_work_scheduler import model_work_scheduler
+
+            out = await model_work_scheduler.validate_lease(
+                lease_id=str(lease_id),
+                consumer_id=str(consumer_id),
+                consumer_generation=int(consumer_generation),
+            )
+            if isinstance(out, dict) and bool(out.get("ok")):
+                return False, None
+            reason = out.get("reason") if isinstance(out, dict) else type(out).__name__
+            return True, f"stale model work lease finalize rejected (lease_id={lease_id}, reason={reason})"
+        except Exception as e:
+            return True, f"stale model work lease finalize check failed: {type(e).__name__}: {e}"
+
     async def async_resolve(self, request_id: str, result: Any) -> None:
+        if self._buffer_model_work_finalize(kind="resolve", request_id=request_id, payload=result):
+            return
         actor = await self._get_ray_actor_async()
         import ray
 
         stale, message = await self._async_stale_generation_finalize_guard()
+        if not stale:
+            stale, message = await self._async_stale_model_work_lease_finalize_guard()
         try:
             if stale:
-                await _await_ray_ref(actor.fail.remote(request_id=request_id, error=str(message)))
+                if get_current_queue_generation_id() is not None:
+                    await _await_ray_ref(actor.fail.remote(request_id=request_id, error=str(message)))
+                    self._snapshot_mark_terminal(str(request_id), status=FutureStatus.FAILED.value)
                 return
             meta = await _await_ray_ref(actor.get_meta.remote(request_id=request_id))
             result = _sync_training_session_step(meta, result)
@@ -1373,13 +1476,23 @@ class FutureStore:
         except ray.exceptions.ActorDiedError as e:
             self._ray_actor = None
             raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
+
     async def async_fail(self, request_id: str, error: str) -> None:
+        if self._buffer_model_work_finalize(kind="fail", request_id=request_id, payload=str(error)):
+            return
         actor = await self._get_ray_actor_async()
         import ray
 
         stale, message = await self._async_stale_generation_finalize_guard()
+        if not stale:
+            stale, message = await self._async_stale_model_work_lease_finalize_guard()
         try:
-            await _await_ray_ref(actor.fail.remote(request_id=request_id, error=str(message if stale and message else error)))
+            if stale:
+                if get_current_queue_generation_id() is not None:
+                    await _await_ray_ref(actor.fail.remote(request_id=request_id, error=str(message if message else error)))
+                    self._snapshot_mark_terminal(str(request_id), status=FutureStatus.FAILED.value)
+                return
+            await _await_ray_ref(actor.fail.remote(request_id=request_id, error=str(error)))
             self._snapshot_mark_terminal(str(request_id), status=FutureStatus.FAILED.value)
         except ray.exceptions.ActorDiedError as e:
             self._ray_actor = None
@@ -1390,6 +1503,41 @@ class FutureStore:
             await capacity_manager.async_release_object_store(request_id)
         except Exception:
             pass
+
+    async def async_fail_if_pending_meta_matches(
+        self,
+        request_id: str,
+        error: str,
+        *,
+        expected_meta: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        actor = await self._get_ray_actor_async()
+        import ray
+
+        payload = None if expected_meta is None else dict(expected_meta)
+        try:
+            out = await _await_ray_ref(
+                actor.fail_if_pending_meta_matches.remote(
+                    request_id=str(request_id),
+                    error=str(error),
+                    expected_meta=payload,
+                )
+            )
+        except ray.exceptions.ActorDiedError as e:
+            self._ray_actor = None
+            raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
+        if not isinstance(out, dict):
+            raise TypeError(f"FutureStore.fail_if_pending_meta_matches returned non-dict: {type(out)}")
+        if bool(out.get("failed")):
+            self._snapshot_mark_terminal(str(request_id), status=FutureStatus.FAILED.value)
+            try:
+                from .capacity_manager import capacity_manager
+
+                await capacity_manager.async_release_object_store(request_id)
+            except Exception:
+                pass
+        return out
+
     async def async_fail_training_requests_for_model(self, model_id: str, error: str) -> list[str]:
         actor = self._get_cached_ray_actor_for_async_request_path()
         import ray
@@ -1549,6 +1697,31 @@ class FutureStore:
         if not isinstance(out, dict):
             raise TypeError(f"FutureStore.get_meta returned non-dict: {type(out)}")
         return out
+
+    async def async_list_pending_by_meta(
+        self,
+        filters: dict[str, Any] | None = None,
+        *,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        actor = await self._get_ray_actor_async()
+        import ray
+
+        payload = None if filters is None else dict(filters)
+        try:
+            out = await _await_ray_ref(
+                actor.list_pending_by_meta.remote(filters=payload, limit=int(limit))
+            )
+        except ray.exceptions.ActorDiedError:
+            self._ray_actor = None
+            raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from None
+        if not isinstance(out, list):
+            raise TypeError(f"FutureStore.list_pending_by_meta returned non-list: {type(out)}")
+        normalized: list[dict[str, Any]] = []
+        for item in out:
+            if isinstance(item, dict):
+                normalized.append(dict(item))
+        return normalized
 
     async def async_forget(self, request_id: str) -> None:
         actor = await self._get_ray_actor_async()

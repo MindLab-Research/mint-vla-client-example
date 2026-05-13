@@ -788,13 +788,14 @@ def _parse_model_gpu_placement_value(
     env_var_name: str,
     context: str,
     replica: int | None = None,
-) -> list[tuple[int, int, int]]:
+) -> list[tuple[int, int | None, int, str | None]]:
     selected_replica = None if replica is None else int(replica)
     # Canonical shape:
     #   [{"replica":0,"worker_index":1,"gpu_count":4}]
     # Shorthands accepted for single-replica configs:
     #   [{"worker_index":1,"gpu_count":4}]
     #   {"worker_index":1,"gpu_count":4}
+    #   {"node_ip":"10.0.0.17","gpu_count":4}
     # Compatibility with a nested shape is kept:
     #   {"replicas":[{"replica":0,"slices":[{"worker_index":1,"gpu_count":4}]}]}
     if isinstance(value, dict) and isinstance(value.get("replicas"), list):
@@ -846,7 +847,11 @@ def _parse_model_gpu_placement_value(
 
     if isinstance(value, dict) and "slices" in value:
         value = value.get("slices")
-    elif isinstance(value, dict) and "worker_index" in value and "gpu_count" in value:
+    elif (
+        isinstance(value, dict)
+        and ("worker_index" in value or "worker" in value or "worker_idx" in value or "node_ip" in value)
+        and "gpu_count" in value
+    ):
         value = [value]
 
     if not isinstance(value, list):
@@ -854,8 +859,9 @@ def _parse_model_gpu_placement_value(
             f"{context}: {env_var_name}[{selected_key!r}] must be a placement object or list of placement slices"
         )
 
-    slices: list[tuple[int, int, int]] = []
+    slices: list[tuple[int, int | None, int, str | None]] = []
     seen_replica_workers: set[tuple[int, int]] = set()
+    seen_replica_nodes: set[tuple[int, str]] = set()
     for idx, item in enumerate(value):
         if not isinstance(item, dict):
             raise RuntimeError(
@@ -868,10 +874,21 @@ def _parse_model_gpu_placement_value(
         )
         if selected_replica is not None and item_replica != selected_replica:
             continue
-        worker_index = _parse_non_negative_int(
-            item.get("worker_index", item.get("worker", item.get("worker_idx"))),
-            path=f"{env_var_name}[{selected_key!r}][{idx}].worker_index",
-            context=context,
+        raw_worker_index = item.get("worker_index", item.get("worker", item.get("worker_idx")))
+        raw_node_ip = item.get("node_ip", item.get("node", item.get("ip")))
+        node_ip = str(raw_node_ip).strip() if raw_node_ip is not None else None
+        if raw_worker_index is None and not node_ip:
+            raise RuntimeError(
+                f"{context}: {env_var_name}[{selected_key!r}][{idx}] requires worker_index or node_ip"
+            )
+        worker_index = (
+            None
+            if raw_worker_index is None
+            else _parse_non_negative_int(
+                raw_worker_index,
+                path=f"{env_var_name}[{selected_key!r}][{idx}].worker_index",
+                context=context,
+            )
         )
         try:
             gpu_count = int(item.get("gpu_count"))
@@ -883,14 +900,23 @@ def _parse_model_gpu_placement_value(
             raise RuntimeError(
                 f"{context}: {env_var_name}[{selected_key!r}][{idx}].gpu_count must be a positive integer"
             )
-        replica_worker = (item_replica, worker_index)
-        if replica_worker in seen_replica_workers:
-            raise RuntimeError(
-                f"{context}: {env_var_name}[{selected_key!r}] contains duplicate "
-                f"replica={item_replica} worker_index={worker_index}"
-            )
-        seen_replica_workers.add(replica_worker)
-        slices.append((item_replica, worker_index, gpu_count))
+        if worker_index is not None:
+            replica_worker = (item_replica, worker_index)
+            if replica_worker in seen_replica_workers:
+                raise RuntimeError(
+                    f"{context}: {env_var_name}[{selected_key!r}] contains duplicate "
+                    f"replica={item_replica} worker_index={worker_index}"
+                )
+            seen_replica_workers.add(replica_worker)
+        elif node_ip is not None:
+            replica_node = (item_replica, node_ip)
+            if replica_node in seen_replica_nodes:
+                raise RuntimeError(
+                    f"{context}: {env_var_name}[{selected_key!r}] contains duplicate "
+                    f"replica={item_replica} node_ip={node_ip}"
+                )
+            seen_replica_nodes.add(replica_node)
+        slices.append((item_replica, worker_index, gpu_count, node_ip))
 
     if not slices:
         if selected_replica is not None:
@@ -903,26 +929,44 @@ def _parse_model_gpu_placement_value(
 
 def resolve_worker_gpu_slices_to_placement(
     *,
-    worker_gpu_slices: list[tuple[int, int, int]],
+    worker_gpu_slices: list[tuple[int, int, int] | tuple[int, int | None, int, str | None]],
     context: str,
 ) -> ModelGpuPlacement:
-    worker_indices = [worker_index for _replica, worker_index, _gpu_count in worker_gpu_slices]
+    normalized_slices: list[tuple[int, int | None, int, str | None]] = []
+    for raw in worker_gpu_slices:
+        if len(raw) == 3:
+            replica, worker_index, gpu_count = raw
+            normalized_slices.append((replica, worker_index, gpu_count, None))
+        else:
+            replica, worker_index, gpu_count, node_ip = raw
+            normalized_slices.append((replica, worker_index, gpu_count, node_ip))
+    worker_indices = [
+        worker_index
+        for _replica, worker_index, _gpu_count, _node_ip in normalized_slices
+        if worker_index is not None
+    ]
     requested = list(dict.fromkeys(worker_indices))
     if not ray.is_initialized():
         raise RuntimeError("ray is not initialized (expected to be connected already)")
 
+    alive_nodes = _list_alive_gpu_nodes()
     nodes_by_worker_idx: dict[int, VolcGpuNode] = {}
-    for node in _list_alive_gpu_nodes():
-        worker_idx = _parse_volc_worker_index_from_hostname(node.hostname)
-        if worker_idx is None:
-            continue
-        if worker_idx in nodes_by_worker_idx:
-            other = nodes_by_worker_idx[worker_idx]
-            raise RuntimeError(
-                f"{context}: duplicate live GPU nodes for worker_idx={worker_idx}: "
-                f"{other.node_ip}/{other.hostname} and {node.node_ip}/{node.hostname}"
-            )
-        nodes_by_worker_idx[worker_idx] = node
+    nodes_by_ip: dict[str, VolcGpuNode] = {}
+    for node in alive_nodes:
+        nodes_by_ip[node.node_ip] = node
+
+    if requested:
+        for node in alive_nodes:
+            worker_idx = _parse_volc_worker_index_from_hostname(node.hostname)
+            if worker_idx is None:
+                continue
+            if worker_idx in nodes_by_worker_idx:
+                other = nodes_by_worker_idx[worker_idx]
+                raise RuntimeError(
+                    f"{context}: duplicate live GPU nodes for worker_idx={worker_idx}: "
+                    f"{other.node_ip}/{other.hostname} and {node.node_ip}/{node.hostname}"
+                )
+            nodes_by_worker_idx[worker_idx] = node
 
     missing = [idx for idx in requested if idx not in nodes_by_worker_idx]
     if missing:
@@ -941,8 +985,20 @@ def resolve_worker_gpu_slices_to_placement(
         )
 
     slices: list[ModelGpuSlice] = []
-    for replica, worker_idx, gpu_count in worker_gpu_slices:
-        node = nodes_by_worker_idx[worker_idx]
+    for replica, worker_idx, gpu_count, node_ip in normalized_slices:
+        if worker_idx is not None:
+            node = nodes_by_worker_idx[worker_idx]
+        else:
+            assert node_ip is not None
+            node = nodes_by_ip.get(node_ip)
+            if node is None:
+                raise RuntimeError(
+                    f"{context}: pinned node_ip={node_ip} is not an alive Ray GPU node; "
+                    f"alive_node_ips={sorted(nodes_by_ip)}"
+                )
+            worker_idx = _parse_volc_worker_index_from_hostname(node.hostname)
+            if worker_idx is None:
+                worker_idx = -1
         if gpu_count > node.total_gpus:
             raise RuntimeError(
                 f"{context}: replica={replica} worker_index={worker_idx} gpu_count={gpu_count} "

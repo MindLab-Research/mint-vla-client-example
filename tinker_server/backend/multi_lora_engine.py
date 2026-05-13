@@ -479,6 +479,9 @@ class MultiLoRAInferenceEngine:
                 extra={
                 "LD_LIBRARY_PATH": actor_ld_library_path(),
                 "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+                "USE_TORCH": "1",
+                "USE_TF": "0",
+                "USE_FLAX": "0",
                 "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                 "HF_HUB_OFFLINE": "1",
                 **otel_env_vars(),

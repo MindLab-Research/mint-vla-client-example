@@ -1010,6 +1010,13 @@ def test_actor_runtime_env_vars_forwards_vllm_envs(tmp_path):
             "RAY_ADDRESS": "ray://cfg-test",
             "MINT_VLLM_SERIALIZE_ADD_LORA_UNTIL_IDLE": "1",
             "MINT_VLLM_REQUEST_TIMING": "0",
+            "MINT_VLLM_ENABLE_SLEEP_MODE": "1",
+            "MINT_MODEL_CONFIG_OVERRIDES_JSON": '{"Qwen/Qwen3-0.6B":{"gpu_memory_utilization":0.75}}',
+            "MINT_VLLM_MAX_NUM_SEQS": "32",
+            "MINT_VLLM_MAX_NUM_BATCHED_TOKENS": "2048",
+            "MINT_VLLM_MAX_LORAS": "4",
+            "MINT_VLLM_MAX_CPU_LORAS": "8",
+            "MINT_VLLM_MAX_LORA_RANK": "16",
             "MINT_MODEL_PLACEMENT_JSON": '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"worker_index":1,"gpu_count":4}}',
             "MINT_MEGATRON_MODEL_PLACEMENT_JSON": '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"worker_index":1,"gpu_count":4}}',
         },
@@ -1017,6 +1024,13 @@ def test_actor_runtime_env_vars_forwards_vllm_envs(tmp_path):
     data = json.loads(out.stdout)
     assert data["MINT_VLLM_SERIALIZE_ADD_LORA_UNTIL_IDLE"] == "1"
     assert data["MINT_VLLM_REQUEST_TIMING"] == "0"
+    assert data["MINT_VLLM_ENABLE_SLEEP_MODE"] == "1"
+    assert data["MINT_MODEL_CONFIG_OVERRIDES_JSON"] == '{"Qwen/Qwen3-0.6B":{"gpu_memory_utilization":0.75}}'
+    assert data["MINT_VLLM_MAX_NUM_SEQS"] == "32"
+    assert data["MINT_VLLM_MAX_NUM_BATCHED_TOKENS"] == "2048"
+    assert data["MINT_VLLM_MAX_LORAS"] == "4"
+    assert data["MINT_VLLM_MAX_CPU_LORAS"] == "8"
+    assert data["MINT_VLLM_MAX_LORA_RANK"] == "16"
     assert data["MINT_MODEL_PLACEMENT_JSON"] == '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"worker_index":1,"gpu_count":4}}'
     assert data["MINT_MEGATRON_MODEL_PLACEMENT_JSON"] == '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"worker_index":1,"gpu_count":4}}'
 
@@ -1160,6 +1174,55 @@ def test_actor_runtime_env_vars_canonicalize_legacy_tinker_actor_aliases(tmp_pat
     assert data["MINT_CAPACITY_MANAGER_ACTOR_NAME"] == "legacy-capacity-manager"
     assert "TINKER_API_WORK_QUEUE_ACTOR_NAME" not in data
     assert "TINKER_CAPACITY_MANAGER_ACTOR_NAME" not in data
+
+
+def test_actor_runtime_env_vars_forwards_control_plane_actor_names(tmp_path):
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env(env_root)
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json; "
+                "from tinker_server.config import actor_runtime_env_vars; "
+                "print(json.dumps(actor_runtime_env_vars(pythonpath='X')))"
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            "PFS_RUNTIME_ENV_ROOT": str(env_root),
+            "PFS_TINKER_PATH": str(tmp_path / 'repo'),
+            "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
+            "RAY_ADDRESS": "ray://cfg-test",
+            "TINKER_RAY_NAMESPACE": "mint-test-ns",
+            "MINT_RAY_NAMESPACE": "mint-test-ns",
+            "MINT_FUTURE_STORE_ACTOR_NAME": "mint-future-store-test",
+            "MINT_FUTURE_REPLAY_ROOT_DIR": "/tmp/future-replay-test",
+            "MINT_FUTURE_REPLAY_SWEEPER_ACTOR_NAME": "mint-future-replay-sweeper-test",
+            "MINT_MODEL_WORK_SCHEDULER_ACTOR_NAME": "mint-model-work-scheduler-test",
+            "MINT_MODEL_WORK_SCHEDULER_PINNED_NODE_IP": "192.168.39.110",
+            "MINT_QUEUE_EXECUTION_RUNTIME_ACTOR_NAME": "mint-queue-runtime-test",
+            "MINT_QUEUE_SUPERVISOR_ACTOR_NAME": "mint-queue-supervisor-test",
+            "MINT_STARTUP_LEASE_ACTOR_NAME": "mint-startup-lease-test",
+            "MINT_OWNER_RUNTIME_SUPERVISOR_ACTOR_NAME": "mint-owner-runtime-test",
+        },
+    )
+    data = json.loads(out.stdout)
+    assert data["TINKER_RAY_NAMESPACE"] == "mint-test-ns"
+    assert data["MINT_RAY_NAMESPACE"] == "mint-test-ns"
+    assert data["MINT_FUTURE_STORE_ACTOR_NAME"] == "mint-future-store-test"
+    assert data["MINT_FUTURE_REPLAY_ROOT_DIR"] == "/tmp/future-replay-test"
+    assert data["MINT_FUTURE_REPLAY_SWEEPER_ACTOR_NAME"] == "mint-future-replay-sweeper-test"
+    assert data["MINT_MODEL_WORK_SCHEDULER_ACTOR_NAME"] == "mint-model-work-scheduler-test"
+    assert data["MINT_MODEL_WORK_SCHEDULER_PINNED_NODE_IP"] == "192.168.39.110"
+    assert data["MINT_QUEUE_EXECUTION_RUNTIME_ACTOR_NAME"] == "mint-queue-runtime-test"
+    assert data["MINT_QUEUE_SUPERVISOR_ACTOR_NAME"] == "mint-queue-supervisor-test"
+    assert data["MINT_STARTUP_LEASE_ACTOR_NAME"] == "mint-startup-lease-test"
+    assert data["MINT_OWNER_RUNTIME_SUPERVISOR_ACTOR_NAME"] == "mint-owner-runtime-test"
 
 
 def test_actor_runtime_env_vars_forwards_usage_envs(tmp_path):

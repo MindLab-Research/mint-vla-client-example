@@ -120,9 +120,11 @@ def install_vllm_iteration_observability_patches() -> None:
                 Scheduler.make_stats = make_stats  # type: ignore[assignment]
 
             original_execute_model_with_error_logging = getattr(EngineCore, "execute_model_with_error_logging", None)
-            if original_execute_model_with_error_logging is None:
-                raise RuntimeError("vLLM EngineCore missing execute_model_with_error_logging")
-            if not getattr(original_execute_model_with_error_logging, "_mint_iteration_observability", False):
+            if original_execute_model_with_error_logging is not None and not getattr(
+                original_execute_model_with_error_logging,
+                "_mint_iteration_observability",
+                False,
+            ):
                 def execute_model_with_error_logging(self, *args: Any, **kwargs: Any):
                     t0 = time.perf_counter()
                     out = original_execute_model_with_error_logging(self, *args, **kwargs)

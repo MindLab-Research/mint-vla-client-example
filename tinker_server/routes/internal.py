@@ -236,6 +236,8 @@ async def admission_stats(*, include_actor_rss: bool = True) -> dict:
     from ..backend.api_work_queue import api_work_queue
     from ..backend.capacity_manager import capacity_manager
     from ..backend.future_store import future_store
+    from ..backend.model_actor_supervisor import model_actor_supervisor
+    from ..backend.model_work_scheduler import model_work_scheduler
     from ..backend.owner_runtime_supervisor import owner_runtime_supervisor
     from ..backend.queue_execution_runtime import queue_execution_runtime
     from ..backend.queue_supervisor import queue_supervisor
@@ -261,6 +263,22 @@ async def admission_stats(*, include_actor_rss: bool = True) -> dict:
             q = {"error": f"api_work_queue snapshot returned non-dict: {type(q)}"}
     except Exception as e:
         q = {"error": f"{type(e).__name__}: {e}"}
+
+    model_scheduler = None
+    try:
+        model_scheduler = await model_work_scheduler.stats(timeout_s=timeout_s)
+        if not isinstance(model_scheduler, dict):
+            model_scheduler = {"error": f"model_work_scheduler snapshot returned non-dict: {type(model_scheduler)}"}
+    except Exception as e:
+        model_scheduler = {"error": f"{type(e).__name__}: {e}"}
+
+    model_supervisor = None
+    try:
+        model_supervisor = await model_actor_supervisor.async_snapshot(timeout_s=timeout_s)
+        if not isinstance(model_supervisor, dict):
+            model_supervisor = {"error": f"model_actor_supervisor snapshot returned non-dict: {type(model_supervisor)}"}
+    except Exception as e:
+        model_supervisor = {"error": f"{type(e).__name__}: {e}"}
 
     fs = None
     try:
@@ -380,6 +398,8 @@ async def admission_stats(*, include_actor_rss: bool = True) -> dict:
     return {
         "capacity": cap,
         "work_queue": q,
+        "model_work_scheduler": model_scheduler,
+        "model_actor_supervisor": model_supervisor,
         "future_store": fs,
         "actors": actors,
         "process": proc,
@@ -411,6 +431,20 @@ async def queue_execution_runtime_health() -> dict:
     from ..backend.queue_execution_runtime import queue_execution_runtime
 
     return await queue_execution_runtime.async_health_snapshot(timeout_s=10.0)
+
+
+@router.get("/model_work_scheduler")
+async def model_work_scheduler_health() -> dict:
+    from ..backend.model_work_scheduler import model_work_scheduler
+
+    return await model_work_scheduler.stats(timeout_s=10.0)
+
+
+@router.get("/model_actor_supervisor")
+async def model_actor_supervisor_health() -> dict:
+    from ..backend.model_actor_supervisor import model_actor_supervisor
+
+    return await model_actor_supervisor.async_snapshot(timeout_s=10.0)
 
 
 @router.get("/ray_cluster_health")
@@ -727,6 +761,76 @@ async def metrics() -> Response:
                 _append_metric(lines, "mint_model_pending_requests", agg.get("pending_requests"), labels=labels)
                 _append_metric(lines, "mint_model_inflight_workers", agg.get("inflight_workers"), labels=labels)
                 _append_metric(lines, "mint_model_capacity_workers", agg.get("capacity_workers"), labels=labels)
+
+    model_scheduler = stats.get("model_work_scheduler")
+    if isinstance(model_scheduler, dict):
+        _append_metric(lines, "mint_model_work_scheduler_depth", model_scheduler.get("depth"))
+        _append_metric(lines, "mint_model_work_scheduler_backlog_depth", model_scheduler.get("backlog_depth"))
+        counters = model_scheduler.get("counters")
+        if isinstance(counters, dict):
+            for key in ("appended", "assigned", "claimed", "completed", "failed", "requeued"):
+                _append_metric(lines, f"mint_model_work_scheduler_{key}_total", counters.get(key))
+        backlog_by_domain = model_scheduler.get("backlog_depth_by_domain")
+        if isinstance(backlog_by_domain, dict):
+            for domain_key, depth in backlog_by_domain.items():
+                _append_metric(
+                    lines,
+                    "mint_model_work_scheduler_domain_backlog_depth",
+                    depth,
+                    labels={"domain_key": domain_key},
+                )
+        replica_queues = model_scheduler.get("replica_queues")
+        if isinstance(replica_queues, dict):
+            for queue_id, rec in replica_queues.items():
+                if not isinstance(rec, dict):
+                    continue
+                labels = {
+                    "domain_key": rec.get("domain_key") or "unknown",
+                    "replica_id": rec.get("replica_id") or "unknown",
+                    "queue_id": queue_id,
+                    "status": rec.get("status") or "unknown",
+                }
+                _append_metric(lines, "mint_model_work_scheduler_replica_queue_depth", rec.get("depth"), labels=labels)
+        leases = model_scheduler.get("leases")
+        if isinstance(leases, list):
+            _append_metric(lines, "mint_model_work_scheduler_leases", len(leases))
+
+    model_supervisor = stats.get("model_actor_supervisor")
+    if isinstance(model_supervisor, dict):
+        for key in (
+            "desired_total",
+            "managed_total",
+            "domain_total",
+            "reconcile_total",
+            "created_total",
+            "restarted_total",
+            "blocked_total",
+            "busy_recycle_skipped_total",
+            "scheduler_sync_failures_total",
+        ):
+            _append_metric(lines, f"mint_model_actor_supervisor_{key}", model_supervisor.get(key))
+        domains = model_supervisor.get("domains")
+        if isinstance(domains, dict):
+            for domain_key, rec in domains.items():
+                if not isinstance(rec, dict):
+                    continue
+                labels = {"domain_key": domain_key}
+                _append_metric(lines, "mint_model_actor_supervisor_domain_replicas", rec.get("replicas"), labels=labels)
+                _append_metric(lines, "mint_model_actor_supervisor_domain_healthy", rec.get("healthy"), labels=labels)
+                _append_metric(lines, "mint_model_actor_supervisor_domain_unhealthy", rec.get("unhealthy"), labels=labels)
+        replicas = model_supervisor.get("replicas")
+        if isinstance(replicas, dict):
+            for replica_key, rec in replicas.items():
+                if not isinstance(rec, dict):
+                    continue
+                labels = {
+                    "domain_key": rec.get("domain_key") or "unknown",
+                    "replica_id": rec.get("replica_id") or "unknown",
+                    "actor_name": rec.get("actor_name") or "unknown",
+                    "state": rec.get("state") or "unknown",
+                }
+                _append_metric(lines, "mint_model_actor_supervisor_replica_state", 1, labels=labels)
+                _append_metric(lines, "mint_model_actor_supervisor_replica_generation", rec.get("generation"), labels=labels)
 
     fs = stats.get("future_store")
     if isinstance(fs, dict):
