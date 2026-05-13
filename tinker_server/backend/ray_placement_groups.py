@@ -81,6 +81,8 @@ def _lookup_named_pg_info(name: str, namespace: str) -> dict[str, object] | None
     for info in table.values():
         if not isinstance(info, dict) or info.get("name") != name:
             continue
+        if str(info.get("state") or "").upper() == "REMOVED":
+            continue
         info_ns = _namespace_from_pg_info(info)
         if info_ns == namespace:
             exact_matches.append(info)

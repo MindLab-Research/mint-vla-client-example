@@ -3,7 +3,6 @@ from __future__ import annotations
 import importlib
 import sys
 import types
-from types import SimpleNamespace
 
 import pytest
 
@@ -120,3 +119,39 @@ def test_remove_named_placement_group_falls_back_to_table_id_for_unknown_namespa
     assert module.remove_named_placement_group("megatron_qwen_pg", namespace="ns-a") is True
     assert len(removed) == 1
     assert removed[0].pg_id == "pgid:abcd0000"
+
+
+def test_remove_named_placement_group_ignores_removed_table_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ray_module = types.ModuleType("ray")
+    ray_util_module = types.ModuleType("ray.util")
+    removed: list[object] = []
+
+    def _get_placement_group(_name: str):
+        raise ValueError("pg not found in namespace")
+
+    def _placement_group_table(arg=None):
+        if arg is not None:
+            raise AssertionError("unexpected placement_group_table arg")
+        return {
+            "pg-id": {
+                "name": "megatron_qwen_pg",
+                "placement_group_id": "abcd0000",
+                "state": "REMOVED",
+                "bundles": [{"GPU": 1, "node:192.168.38.38": 0.001}],
+            }
+        }
+
+    ray_util_module.get_placement_group = _get_placement_group
+    ray_util_module.remove_placement_group = lambda pg: removed.append(pg)
+    ray_util_module.placement_group_table = _placement_group_table
+    ray_module.util = ray_util_module
+
+    monkeypatch.setitem(sys.modules, "ray", ray_module)
+    monkeypatch.setitem(sys.modules, "ray.util", ray_util_module)
+    sys.modules.pop("tinker_server.backend.ray_placement_groups", None)
+    module = importlib.import_module("tinker_server.backend.ray_placement_groups")
+
+    assert module.remove_named_placement_group("megatron_qwen_pg", namespace="ns-a") is False
+    assert removed == []
