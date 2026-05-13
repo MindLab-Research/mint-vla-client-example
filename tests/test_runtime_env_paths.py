@@ -1201,6 +1201,14 @@ def test_actor_runtime_env_vars_forwards_control_plane_actor_names(tmp_path):
             "TINKER_RAY_NAMESPACE": "mint-test-ns",
             "MINT_RAY_NAMESPACE": "mint-test-ns",
             "MINT_FUTURE_STORE_ACTOR_NAME": "mint-future-store-test",
+            "MINT_GATEWAY_SESSION_STORE_ACTOR_NAME": "mint-gateway-session-store-test",
+            "MINT_SAMPLING_SESSION_STORE_ACTOR_NAME": "mint-sampling-session-store-test",
+            "MINT_TRAINING_SESSION_STORE_ACTOR_NAME": "mint-training-session-store-test",
+            "MINT_SESSION_HEARTBEAT_ACTOR_NAME": "mint-session-heartbeat-test",
+            "MINT_SESSION_INDEX_ACTOR_NAME": "mint-session-index-test",
+            "MINT_RESOURCE_POOL_ACTOR_NAME": "mint-resource-pool-test",
+            "MINT_TRAINING_CLEANUP_EXECUTOR_ACTOR_NAME": "mint-training-cleanup-test",
+            "MINT_SAMPLING_CLEANUP_EXECUTOR_ACTOR_NAME": "mint-sampling-cleanup-test",
             "MINT_FUTURE_REPLAY_ROOT_DIR": "/tmp/future-replay-test",
             "MINT_FUTURE_REPLAY_SWEEPER_ACTOR_NAME": "mint-future-replay-sweeper-test",
             "MINT_MODEL_WORK_SCHEDULER_ACTOR_NAME": "mint-model-work-scheduler-test",
@@ -1215,6 +1223,14 @@ def test_actor_runtime_env_vars_forwards_control_plane_actor_names(tmp_path):
     assert data["TINKER_RAY_NAMESPACE"] == "mint-test-ns"
     assert data["MINT_RAY_NAMESPACE"] == "mint-test-ns"
     assert data["MINT_FUTURE_STORE_ACTOR_NAME"] == "mint-future-store-test"
+    assert data["MINT_GATEWAY_SESSION_STORE_ACTOR_NAME"] == "mint-gateway-session-store-test"
+    assert data["MINT_SAMPLING_SESSION_STORE_ACTOR_NAME"] == "mint-sampling-session-store-test"
+    assert data["MINT_TRAINING_SESSION_STORE_ACTOR_NAME"] == "mint-training-session-store-test"
+    assert data["MINT_SESSION_HEARTBEAT_ACTOR_NAME"] == "mint-session-heartbeat-test"
+    assert data["MINT_SESSION_INDEX_ACTOR_NAME"] == "mint-session-index-test"
+    assert data["MINT_RESOURCE_POOL_ACTOR_NAME"] == "mint-resource-pool-test"
+    assert data["MINT_TRAINING_CLEANUP_EXECUTOR_ACTOR_NAME"] == "mint-training-cleanup-test"
+    assert data["MINT_SAMPLING_CLEANUP_EXECUTOR_ACTOR_NAME"] == "mint-sampling-cleanup-test"
     assert data["MINT_FUTURE_REPLAY_ROOT_DIR"] == "/tmp/future-replay-test"
     assert data["MINT_FUTURE_REPLAY_SWEEPER_ACTOR_NAME"] == "mint-future-replay-sweeper-test"
     assert data["MINT_MODEL_WORK_SCHEDULER_ACTOR_NAME"] == "mint-model-work-scheduler-test"
