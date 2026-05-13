@@ -77,6 +77,18 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "y", "on")
 
 
+def _import_vllm_async_engine_components() -> tuple[type[Any], type[Any]]:
+    try:
+        from vllm import AsyncEngineArgs, AsyncLLMEngine
+    except ImportError as top_level_error:
+        try:
+            from vllm.engine.arg_utils import AsyncEngineArgs
+            from vllm.engine.async_llm_engine import AsyncLLMEngine
+        except ImportError:
+            raise top_level_error
+    return AsyncEngineArgs, AsyncLLMEngine
+
+
 def _enforce_vllm_no_compiled_dag(
     env_vars: dict[str, str],
     *,
@@ -889,8 +901,8 @@ def _create_multinode_vllm_actor(
                 os.environ.get("LD_LIBRARY_PATH", ""),
             )
 
-            # Import vLLM components AFTER setting env var
-            from vllm import AsyncEngineArgs, AsyncLLMEngine
+            # Import vLLM components AFTER setting env var.
+            AsyncEngineArgs, AsyncLLMEngine = _import_vllm_async_engine_components()
 
             # Build engine args for multi-node TP
             # prompt_logprobs uses float32 log_softmax over [tokens, vocab], which can spike memory.

@@ -43,6 +43,42 @@ def _install_fake_vllm(monkeypatch):
     monkeypatch.setitem(sys.modules, "vllm.lora.request", request_mod)
 
 
+def test_multinode_vllm_async_engine_imports_top_level_exports(monkeypatch):
+    class TopLevelArgs:
+        pass
+
+    class TopLevelEngine:
+        pass
+
+    vllm_mod = types.ModuleType("vllm")
+    vllm_mod.AsyncEngineArgs = TopLevelArgs
+    vllm_mod.AsyncLLMEngine = TopLevelEngine
+    monkeypatch.setitem(sys.modules, "vllm", vllm_mod)
+
+    assert mni._import_vllm_async_engine_components() == (TopLevelArgs, TopLevelEngine)
+
+
+def test_multinode_vllm_async_engine_imports_legacy_submodules(monkeypatch):
+    class LegacyArgs:
+        pass
+
+    class LegacyEngine:
+        pass
+
+    vllm_mod = types.ModuleType("vllm")
+    engine_pkg = types.ModuleType("vllm.engine")
+    arg_utils_mod = types.ModuleType("vllm.engine.arg_utils")
+    async_engine_mod = types.ModuleType("vllm.engine.async_llm_engine")
+    arg_utils_mod.AsyncEngineArgs = LegacyArgs
+    async_engine_mod.AsyncLLMEngine = LegacyEngine
+    monkeypatch.setitem(sys.modules, "vllm", vllm_mod)
+    monkeypatch.setitem(sys.modules, "vllm.engine", engine_pkg)
+    monkeypatch.setitem(sys.modules, "vllm.engine.arg_utils", arg_utils_mod)
+    monkeypatch.setitem(sys.modules, "vllm.engine.async_llm_engine", async_engine_mod)
+
+    assert mni._import_vllm_async_engine_components() == (LegacyArgs, LegacyEngine)
+
+
 def _make_actor_impl(monkeypatch):
     monkeypatch.setattr(mni, "init_actor_observability", lambda: None)
     remote_cls = mni._create_multinode_vllm_actor()
