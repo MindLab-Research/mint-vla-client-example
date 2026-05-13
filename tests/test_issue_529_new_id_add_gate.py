@@ -91,6 +91,15 @@ def test_multinode_vllm_child_env_disables_tensorflow_and_flax(monkeypatch):
     assert mni.os.environ["USE_FLAX"] == "0"
 
 
+def test_multinode_vllm_runtime_env_disables_tensorflow_and_flax_by_default():
+    env_vars: dict[str, str] = {}
+
+    mni._set_default_vllm_runtime_env(env_vars)
+
+    assert env_vars["USE_TF"] == "0"
+    assert env_vars["USE_FLAX"] == "0"
+
+
 def _make_actor_impl(monkeypatch):
     monkeypatch.setattr(mni, "init_actor_observability", lambda: None)
     remote_cls = mni._create_multinode_vllm_actor()

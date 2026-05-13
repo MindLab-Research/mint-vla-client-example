@@ -101,6 +101,13 @@ def _enforce_vllm_no_compiled_dag(
         env_vars[VLLM_NO_COMPILED_DAG_ENV] = "1"
 
 
+def _set_default_vllm_runtime_env(env_vars: dict[str, str]) -> None:
+    env_vars.setdefault("MINT_ENABLE_VLLM_IMPORT_PATCHES", "1")
+    env_vars.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    env_vars.setdefault("USE_TF", "0")
+    env_vars.setdefault("USE_FLAX", "0")
+
+
 def _prepend_env_path_entries(raw: str | None, entries: list[str], *, blocked: set[str] | None = None) -> str:
     blocked = blocked or set()
     out: list[str] = []
@@ -2706,8 +2713,7 @@ class MultiNodeInferenceEngine:
             )
             if "CUDA_LAUNCH_BLOCKING" in os.environ:
                 env_vars["CUDA_LAUNCH_BLOCKING"] = os.environ["CUDA_LAUNCH_BLOCKING"]
-            env_vars.setdefault("MINT_ENABLE_VLLM_IMPORT_PATCHES", "1")
-            env_vars.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+            _set_default_vllm_runtime_env(env_vars)
             if "MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE" in os.environ:
                 env_vars["MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE"] = os.environ[
                     "MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE"
