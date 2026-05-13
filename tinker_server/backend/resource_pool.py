@@ -1439,7 +1439,7 @@ class ResourcePool:
             with self._local_lock:
                 return list(self._local_state.iter_entries())
 
-        records = _call_actor_sync("list_entries", bool(prune_stale), retry_on_actor_restart=True)
+        records = _call_actor_sync("list_entries", prune_stale=bool(prune_stale), retry_on_actor_restart=True)
         out: list[ActorEntry] = []
         for record in records or []:
             if not isinstance(record, dict):
@@ -1460,7 +1460,7 @@ class ResourcePool:
             with self._local_lock:
                 return list(self._local_state.iter_entries())
 
-        records = await _call_actor_async("list_entries", bool(prune_stale), retry_on_actor_restart=True)
+        records = await _call_actor_async("list_entries", prune_stale=bool(prune_stale), retry_on_actor_restart=True)
         out: list[ActorEntry] = []
         for record in records or []:
             if not isinstance(record, dict):

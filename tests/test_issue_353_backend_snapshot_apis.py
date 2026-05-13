@@ -785,14 +785,15 @@ def test_resource_pool_async_list_actors_refreshes_detached_inventory(monkeypatc
     monkeypatch.setattr(resource_pool_mod, "_detached_enabled", lambda: True)
     monkeypatch.setattr(resource_pool_mod.ResourcePool, "_instance", None)
     pool = get_resource_pool()
-    calls: list[tuple[str, tuple[object, ...]]] = []
+    calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
     handle = object()
     stale_sample_time = time.time() - 120.0
 
     async def _call_actor_async(method_name: str, *args, retry_on_actor_restart: bool = False, **kwargs):
-        calls.append((method_name, args))
+        calls.append((method_name, args, dict(kwargs)))
         if method_name == "list_entries":
-            assert args == (True,)
+            assert args == ()
+            assert kwargs == {"prune_stale": True}
             assert retry_on_actor_restart is True
             return [
                 {
@@ -848,11 +849,41 @@ def test_resource_pool_async_list_actors_refreshes_detached_inventory(monkeypatc
     assert rec["metadata_sample_source"] == "list_actors"
     assert rec["metadata_cache_state"] == "fresh"
     assert asyncio.run(pool.async_total_gpus_used()) == 3
-    assert [method_name for method_name, _args in calls] == [
+    assert [method_name for method_name, _args, _kwargs in calls] == [
         "list_entries",
         "update_metadata",
         "total_gpus_used",
     ]
+
+
+def test_resource_pool_detached_gpu_usage_lists_entries_with_keyword_prune(monkeypatch) -> None:
+    monkeypatch.setattr(resource_pool_mod, "_detached_enabled", lambda: True)
+    monkeypatch.setattr(resource_pool_mod.ResourcePool, "_instance", None)
+    pool = get_resource_pool()
+    calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+
+    def _call_actor_sync(method_name: str, *args, retry_on_actor_restart: bool = False, **kwargs):
+        calls.append((method_name, args, dict(kwargs)))
+        if method_name == "list_entries":
+            assert args == ()
+            assert kwargs == {"prune_stale": False}
+            assert retry_on_actor_restart is True
+            return [
+                {
+                    "actor_name": "actor-vllm",
+                    "actor_type": ActorType.VLLM.value,
+                    "num_gpus": 4,
+                    "namespace": "ns",
+                    "base_model": "m",
+                    "node_id": "node-1",
+                }
+            ]
+        raise AssertionError(f"unexpected ResourcePool actor method: {method_name}")
+
+    monkeypatch.setattr(resource_pool_mod, "_call_actor_sync", _call_actor_sync)
+
+    assert pool.gpus_used_by_node() == {"node-1": 4}
+    assert calls == [("list_entries", (), {"prune_stale": False})]
 
 
 def test_resource_pool_list_actors_skips_refresh_when_requested(monkeypatch) -> None:
