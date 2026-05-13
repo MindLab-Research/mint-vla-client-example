@@ -79,6 +79,18 @@ def test_multinode_vllm_async_engine_imports_legacy_submodules(monkeypatch):
     assert mni._import_vllm_async_engine_components() == (LegacyArgs, LegacyEngine)
 
 
+def test_multinode_vllm_child_env_disables_tensorflow_and_flax(monkeypatch):
+    monkeypatch.delenv("USE_TF", raising=False)
+    monkeypatch.delenv("USE_FLAX", raising=False)
+    monkeypatch.setattr(mni.os.path, "isdir", lambda _path: False)
+    monkeypatch.setattr(mni, "preferred_torch_lib_dirs", lambda: [])
+
+    mni._stabilize_vllm_child_environment()
+
+    assert mni.os.environ["USE_TF"] == "0"
+    assert mni.os.environ["USE_FLAX"] == "0"
+
+
 def _make_actor_impl(monkeypatch):
     monkeypatch.setattr(mni, "init_actor_observability", lambda: None)
     remote_cls = mni._create_multinode_vllm_actor()

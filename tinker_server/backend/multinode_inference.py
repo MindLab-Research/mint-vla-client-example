@@ -117,6 +117,9 @@ def _prepend_env_path_entries(raw: str | None, entries: list[str], *, blocked: s
 
 
 def _stabilize_vllm_child_environment() -> None:
+    os.environ.setdefault("USE_TF", "0")
+    os.environ.setdefault("USE_FLAX", "0")
+
     pyver = f"python{sys.version_info.major}.{sys.version_info.minor}"
     python_entries = [
         path
