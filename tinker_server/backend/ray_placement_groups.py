@@ -94,6 +94,19 @@ def _lookup_named_pg_info(name: str, namespace: str) -> dict[str, object] | None
     return None
 
 
+def _placement_group_from_info(info: dict[str, object]) -> Any | None:
+    raw_id = info.get("placement_group_id") or info.get("id")
+    if raw_id is None:
+        return None
+    try:
+        from ray._raylet import PlacementGroupID
+        from ray.util.placement_group import PlacementGroup
+
+        return PlacementGroup(PlacementGroupID.from_hex(str(raw_id)))
+    except Exception:
+        return None
+
+
 def get_named_placement_group(
     name: str,
     *,
@@ -131,9 +144,15 @@ def get_named_placement_group(
 
 
 def remove_named_placement_group(name: str, *, namespace: str | None = None) -> bool:
+    target_namespace = namespace or _ray_namespace()
     try:
-        pg = get_named_placement_group(name, namespace=namespace)
+        pg = get_named_placement_group(name, namespace=target_namespace)
     except Exception:
-        return False
+        info = _lookup_named_pg_info(name, target_namespace)
+        if info is None:
+            return False
+        pg = _placement_group_from_info(info)
+        if pg is None:
+            return False
     ray.util.remove_placement_group(pg)
     return True

@@ -69,3 +69,54 @@ def test_get_named_placement_group_rejects_incompatible_pinned_nodes(
             namespace="ns-a",
             expected_bundles=[{"GPU": 1, "CPU": 1, "node:192.168.37.240": 0.001}] * 8,
         )
+
+
+def test_remove_named_placement_group_falls_back_to_table_id_for_unknown_namespace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ray_module = types.ModuleType("ray")
+    ray_util_module = types.ModuleType("ray.util")
+    placement_group_module = types.ModuleType("ray.util.placement_group")
+    raylet_module = types.ModuleType("ray._raylet")
+    removed: list[object] = []
+
+    class _FakePlacementGroupID:
+        @classmethod
+        def from_hex(cls, value: str) -> str:
+            return f"pgid:{value}"
+
+    class _FakePlacementGroup:
+        def __init__(self, pg_id: object) -> None:
+            self.pg_id = pg_id
+
+    def _get_placement_group(_name: str):
+        raise ValueError("pg not found in namespace")
+
+    def _placement_group_table(arg=None):
+        if arg is not None:
+            raise AssertionError("unexpected placement_group_table arg")
+        return {
+            "pg-id": {
+                "name": "megatron_qwen_pg",
+                "placement_group_id": "abcd0000",
+                "bundles": [{"GPU": 1, "node:192.168.38.38": 0.001}],
+            }
+        }
+
+    ray_util_module.get_placement_group = _get_placement_group
+    ray_util_module.remove_placement_group = lambda pg: removed.append(pg)
+    ray_util_module.placement_group_table = _placement_group_table
+    placement_group_module.PlacementGroup = _FakePlacementGroup
+    raylet_module.PlacementGroupID = _FakePlacementGroupID
+    ray_module.util = ray_util_module
+
+    monkeypatch.setitem(sys.modules, "ray", ray_module)
+    monkeypatch.setitem(sys.modules, "ray.util", ray_util_module)
+    monkeypatch.setitem(sys.modules, "ray.util.placement_group", placement_group_module)
+    monkeypatch.setitem(sys.modules, "ray._raylet", raylet_module)
+    sys.modules.pop("tinker_server.backend.ray_placement_groups", None)
+    module = importlib.import_module("tinker_server.backend.ray_placement_groups")
+
+    assert module.remove_named_placement_group("megatron_qwen_pg", namespace="ns-a") is True
+    assert len(removed) == 1
+    assert removed[0].pg_id == "pgid:abcd0000"
