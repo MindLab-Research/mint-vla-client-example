@@ -400,3 +400,90 @@ def test_scheduler_persists_append_assign_claim_and_begin_finalize_to_task_state
         asyncio.run(_run())
     finally:
         store.close()
+
+
+def test_scheduler_hydrates_active_task_state_after_restart() -> None:
+    store = TaskStateStore.in_memory()
+    actor_a = _ModelWorkSchedulerActor(
+        use_task_state_store=True,
+        task_state_store=store,
+        owner_id="scheduler-test",
+    )
+    actor_b = _ModelWorkSchedulerActor(
+        use_task_state_store=True,
+        task_state_store=store,
+        owner_id="scheduler-test",
+    )
+
+    async def _run() -> None:
+        await actor_a.sync_replicas([_replica("replica-0")])
+        assert (await actor_a.append(_work("req-restart"), assign=True))["ok"] is True
+        assert store.get_task("req-restart")["status"] == "assigned"
+
+        await actor_b.sync_replicas([_replica("replica-0")])
+        contains = await actor_b.contains_request(request_id="req-restart")
+        assert contains["present"] is True
+        assert contains["location"] == "assigned"
+        claimed = await actor_b.claim_from_replica_queue(
+            domain_key="vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
+            replica_id="replica-0",
+            consumer_id="consumer-replica-0",
+            consumer_generation=10,
+            max_items=1,
+            lease_ttl_s=30.0,
+        )
+        assert [lease["item"]["request_id"] for lease in claimed["leases"]] == ["req-restart"]
+        assert store.get_task("req-restart")["status"] == "leased"
+
+    try:
+        asyncio.run(_run())
+    finally:
+        store.close()
+
+
+def test_scheduler_persists_requeue_before_reclaim() -> None:
+    store = TaskStateStore.in_memory()
+    actor = _ModelWorkSchedulerActor(
+        use_task_state_store=True,
+        task_state_store=store,
+        owner_id="scheduler-test",
+    )
+
+    async def _run() -> None:
+        await actor.sync_replicas([_replica("replica-0")])
+        assert (await actor.append(_work("req-requeue"), assign=True))["ok"] is True
+        claimed = await actor.claim_from_replica_queue(
+            domain_key="vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
+            replica_id="replica-0",
+            consumer_id="consumer-replica-0",
+            consumer_generation=10,
+            max_items=1,
+            lease_ttl_s=30.0,
+        )
+        lease = claimed["leases"][0]
+        failed = await actor.fail_lease(
+            lease_id=lease["lease_id"],
+            consumer_id="consumer-replica-0",
+            consumer_generation=10,
+            reason="executor_failed",
+            requeue=True,
+        )
+        assert failed["requeued"] is True
+        assert store.get_task("req-requeue")["status"] == "pending"
+
+        await actor.assign_pending(max_items=1)
+        reclaimed = await actor.claim_from_replica_queue(
+            domain_key="vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
+            replica_id="replica-0",
+            consumer_id="consumer-replica-0",
+            consumer_generation=10,
+            max_items=1,
+            lease_ttl_s=30.0,
+        )
+        assert [item["item"]["request_id"] for item in reclaimed["leases"]] == ["req-requeue"]
+        assert store.get_task("req-requeue")["status"] == "leased"
+
+    try:
+        asyncio.run(_run())
+    finally:
+        store.close()

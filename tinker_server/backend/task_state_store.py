@@ -548,6 +548,51 @@ class TaskStateStore:
             now=now,
         )
 
+    def requeue_task(
+        self,
+        *,
+        request_id: str,
+        scheduler_epoch: int,
+        reason: str,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        ts = _now(now)
+        with self._transaction() as conn:
+            self.assert_scheduler_owner(conn, scheduler_epoch=scheduler_epoch, now=ts)
+            row = self._get_row(conn, request_id)
+            if str(row["status"]) in TERMINAL_TASK_STATUSES:
+                return {"ok": False, "reason": "terminal", "record": self._row_to_record(row)}
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                SET status = 'pending',
+                    subqueue_id = NULL,
+                    lease_id = NULL,
+                    attempt_id = NULL,
+                    scheduler_epoch = NULL,
+                    runtime_generation = NULL,
+                    consumer_id = NULL,
+                    assigned_at = NULL,
+                    leased_at = NULL,
+                    lease_expires_at = NULL,
+                    finalizing_until = NULL,
+                    updated_at = ?
+                WHERE request_id = ?
+                  AND status IN ('pending', 'assigned', 'leased', 'finalizing')
+                """,
+                (ts, str(request_id)),
+            )
+            if cur.rowcount != 1:
+                self._raise_task_transition_error(conn, request_id, "requeue active task")
+            self._record_event(
+                conn,
+                request_id=str(request_id),
+                event_type="task_requeued",
+                payload={"reason": str(reason), "scheduler_epoch": int(scheduler_epoch)},
+                now=ts,
+            )
+            return {"ok": True, "record": self._row_to_record(self._get_row(conn, request_id))}
+
     def _commit_finalize(
         self,
         *,
@@ -578,7 +623,6 @@ class TaskStateStore:
                 ):
                     return {"ok": True, "idempotent": True, "record": self._row_to_record(row)}
                 raise TaskStateConflictError("terminal task commit payload mismatch")
-            self.assert_scheduler_owner(conn, scheduler_epoch=scheduler_epoch, now=ts)
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -789,6 +833,9 @@ class _TaskStateStoreActor:
     def commit_finalize_failure(self, **kwargs: Any) -> dict[str, Any]:
         return self._store.commit_finalize_failure(**kwargs)
 
+    def requeue_task(self, **kwargs: Any) -> dict[str, Any]:
+        return self._store.requeue_task(**kwargs)
+
     def list_active_tasks(self, **kwargs: Any) -> list[dict[str, Any]]:
         return self._store.list_active_tasks(**kwargs)
 
@@ -911,6 +958,9 @@ class TaskStateStoreClient:
 
     async def async_commit_finalize_failure(self, **kwargs: Any) -> dict[str, Any]:
         return await self._dict_call("commit_finalize_failure", **kwargs)
+
+    async def async_requeue_task(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("requeue_task", **kwargs)
 
     async def async_get_task(self, request_id: str) -> dict[str, Any]:
         return await self._dict_call("get_task", request_id=str(request_id))

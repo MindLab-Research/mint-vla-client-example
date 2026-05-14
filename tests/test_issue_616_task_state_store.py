@@ -189,6 +189,77 @@ def test_finalize_success_is_cas_fenced_and_idempotent() -> None:
         store.close()
 
 
+def test_runtime_commit_does_not_require_live_scheduler_owner() -> None:
+    store = TaskStateStore.in_memory()
+    try:
+        epoch, lease_id, attempt_id = _leased_task(store)
+        store.begin_finalize(
+            request_id="req-1",
+            lease_id=lease_id,
+            attempt_id=attempt_id,
+            scheduler_epoch=epoch,
+            runtime_generation=7,
+            finalize_ttl_s=30.0,
+            now=104.0,
+        )
+        owner_b = store.acquire_scheduler_owner(owner_id="scheduler-b", ttl_s=30.0, now=132.0)
+        assert owner_b["ok"] is True
+        assert owner_b["epoch"] == 2
+
+        committed = store.commit_finalize_success(
+            request_id="req-1",
+            lease_id=lease_id,
+            attempt_id=attempt_id,
+            scheduler_epoch=epoch,
+            runtime_generation=7,
+            result_path="/vePFS-Mindverse/share/mint-results/req-1.json",
+            result_checksum="sha256:abc",
+            result_size_bytes=123,
+            now=133.0,
+        )
+
+        assert committed["record"]["status"] == "done"
+    finally:
+        store.close()
+
+
+def test_requeue_task_resets_active_record_for_reclaim() -> None:
+    store = TaskStateStore.in_memory()
+    try:
+        epoch, lease_id, attempt_id = _leased_task(store)
+        requeued = store.requeue_task(
+            request_id="req-1",
+            scheduler_epoch=epoch,
+            reason="lease_expired",
+            now=104.0,
+        )
+        assert requeued["record"]["status"] == "pending"
+        assert requeued["record"]["lease_id"] is None
+        assert requeued["record"]["attempt_id"] is None
+
+        store.assign_task(
+            request_id="req-1",
+            subqueue_id="vllm:Qwen/Qwen3-4B-Instruct-2507::replica-0",
+            scheduler_epoch=epoch,
+            now=105.0,
+        )
+        claimed = store.claim_task(
+            request_id="req-1",
+            subqueue_id="vllm:Qwen/Qwen3-4B-Instruct-2507::replica-0",
+            lease_id=f"{lease_id}-retry",
+            attempt_id=f"{attempt_id}-retry",
+            consumer_id="runtime-0",
+            scheduler_epoch=epoch,
+            runtime_generation=7,
+            lease_ttl_s=30.0,
+            now=106.0,
+        )
+        assert claimed["record"]["status"] == "leased"
+        assert claimed["record"]["lease_id"] == "lease-1-retry"
+    finally:
+        store.close()
+
+
 def test_finalize_failure_records_terminal_error() -> None:
     store = TaskStateStore.in_memory()
     try:

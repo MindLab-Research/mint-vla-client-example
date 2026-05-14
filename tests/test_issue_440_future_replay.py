@@ -149,6 +149,122 @@ def test_issue_616_task_state_store_terminal_success_fallback(monkeypatch, tmp_p
     assert payload == {"ok": True}
 
 
+def test_issue_616_future_store_done_takes_precedence_over_task_state_fallback(
+    monkeypatch,
+    tmp_path,
+):
+    import tinker_server.backend.task_state_store as task_state_store_module
+    from tinker_server.backend.task_payload_store import TaskPayloadStore
+
+    payload_root = tmp_path / "payloads"
+    monkeypatch.setenv("MINT_RETRIEVE_FUTURE_TASK_STATE_STORE", "1")
+    monkeypatch.setenv("MINT_TASK_PAYLOAD_ROOT_DIR", str(payload_root))
+    stub = _StubFutureStore(
+        FutureStatus.DONE,
+        result={"source": "future_store"},
+        meta={"op": "sampling.asample"},
+    )
+    monkeypatch.setattr(futures_route, "future_store", stub)
+    payload_meta = TaskPayloadStore(payload_root).write_json_payload(
+        request_id="rid-task-state-done",
+        attempt_id="attempt-1",
+        payload={"source": "task_state_store"},
+    )
+    monkeypatch.setattr(
+        task_state_store_module,
+        "task_state_store",
+        _StubTaskStateStore(
+            {
+                "request_id": "rid-task-state-done",
+                "status": "done",
+                "result_path": payload_meta["path"],
+                "result_checksum": payload_meta["checksum"],
+                "metadata": {"op": "sampling.asample"},
+            }
+        ),
+    )
+
+    body = FutureRetrieveRequest(request_id="rid-task-state-done")
+    payload = anyio.run(futures_route.retrieve_future, body, _request_stub(), _response_stub())
+
+    assert payload == {"source": "future_store"}
+    assert stub.cleanup_calls == ["rid-task-state-done"]
+
+
+def test_issue_616_pending_future_uses_task_state_terminal_and_cleans_future_store(
+    monkeypatch,
+    tmp_path,
+):
+    import tinker_server.backend.task_state_store as task_state_store_module
+    from tinker_server.backend.task_payload_store import TaskPayloadStore
+
+    payload_root = tmp_path / "payloads"
+    monkeypatch.setenv("MINT_RETRIEVE_FUTURE_TASK_STATE_STORE", "1")
+    monkeypatch.setenv("MINT_TASK_PAYLOAD_ROOT_DIR", str(payload_root))
+    stub = _StubFutureStore(
+        FutureStatus.PENDING,
+        meta={"op": "sampling.asample", "queue_state": "running", "stage": "prefill"},
+    )
+    monkeypatch.setattr(futures_route, "future_store", stub)
+    payload_meta = TaskPayloadStore(payload_root).write_json_payload(
+        request_id="rid-task-state-pending-done",
+        attempt_id="attempt-1",
+        payload={"ok": True},
+    )
+    monkeypatch.setattr(
+        task_state_store_module,
+        "task_state_store",
+        _StubTaskStateStore(
+            {
+                "request_id": "rid-task-state-pending-done",
+                "status": "done",
+                "result_path": payload_meta["path"],
+                "result_checksum": payload_meta["checksum"],
+                "metadata": {"op": "sampling.asample"},
+            }
+        ),
+    )
+
+    body = FutureRetrieveRequest(request_id="rid-task-state-pending-done")
+    payload = anyio.run(futures_route.retrieve_future, body, _request_stub(), _response_stub())
+
+    assert payload == {"ok": True}
+    assert stub.cleanup_calls == ["rid-task-state-pending-done"]
+
+
+def test_issue_616_task_state_payload_read_failure_falls_back_to_future_store_pending(
+    monkeypatch,
+):
+    import tinker_server.backend.task_state_store as task_state_store_module
+
+    monkeypatch.setenv("MINT_RETRIEVE_FUTURE_TASK_STATE_STORE", "1")
+    stub = _StubFutureStore(
+        FutureStatus.PENDING,
+        meta={"op": "sampling.asample", "queue_state": "running", "stage": "prefill"},
+    )
+    monkeypatch.setattr(futures_route, "future_store", stub)
+    monkeypatch.setattr(
+        task_state_store_module,
+        "task_state_store",
+        _StubTaskStateStore(
+            {
+                "request_id": "rid-task-state-corrupt",
+                "status": "done",
+                "result_path": "/tmp/does-not-exist-task-payload.json",
+                "result_checksum": "sha256:missing",
+                "metadata": {"op": "sampling.asample"},
+            }
+        ),
+    )
+
+    response = _response_stub()
+    body = FutureRetrieveRequest(request_id="rid-task-state-corrupt")
+    payload = anyio.run(futures_route.retrieve_future, body, _request_stub(), response)
+
+    assert response.status_code == 408
+    assert payload["type"] == "try_again"
+
+
 def test_issue_616_task_state_store_terminal_failure_fallback_keeps_public_masking(
     monkeypatch,
 ):

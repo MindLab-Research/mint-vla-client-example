@@ -169,11 +169,15 @@ async def _lookup_task_state_terminal(request_id: str, http_request: Request) ->
         result_path = record.get("result_path")
         if not isinstance(result_path, str) or not result_path:
             return None
-        result = await asyncio.to_thread(
-            TaskPayloadStore().read_json_payload,
-            path=result_path,
-            expected_checksum=record.get("result_checksum"),
-        )
+        try:
+            result = await asyncio.to_thread(
+                TaskPayloadStore().read_json_payload,
+                path=result_path,
+                expected_checksum=record.get("result_checksum"),
+            )
+        except Exception:
+            logger.exception("[retrieve_future] task_state_store payload read failed request_id=%s", request_id)
+            return None
         _maybe_persist_terminal_replay(
             request_id,
             final_status=FutureStatus.DONE.value,
@@ -433,17 +437,16 @@ async def retrieve_future(
             logger.info("[retrieve_future] request_id=%s replay_cache_hit=true", body.request_id)
         return replay_payload
 
-    task_state_payload = await _lookup_task_state_terminal(body.request_id, http_request)
-    if task_state_payload is not None:
-        _pending_hint_clear(body.request_id)
-        logger.info("[retrieve_future] request_id=%s task_state_store_terminal_hit=true", body.request_id)
-        return task_state_payload
-
     try:
         status = await future_store.async_get_status(body.request_id)
     except FutureStoreUnavailableError:
         raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
     except KeyError:
+        task_state_payload = await _lookup_task_state_terminal(body.request_id, http_request)
+        if task_state_payload is not None:
+            _pending_hint_clear(body.request_id)
+            logger.info("[retrieve_future] request_id=%s task_state_store_terminal_hit=true", body.request_id)
+            return task_state_payload
         _pending_hint_clear(body.request_id)
         logger.info("[retrieve_future] request_id=%s status=unknown", body.request_id)
         detail: object = f"Unknown request_id: {body.request_id}"
@@ -456,6 +459,24 @@ async def retrieve_future(
         raise HTTPException(status_code=404, detail=detail)
 
     if status == FutureStatus.PENDING:
+        task_state_payload = await _lookup_task_state_terminal(body.request_id, http_request)
+        if task_state_payload is not None:
+            _pending_hint_clear(body.request_id)
+            try:
+                from ..backend.capacity_manager import capacity_manager
+
+                import ray
+
+                if ray.is_initialized():
+                    await capacity_manager.async_release_all(body.request_id)
+            except Exception:
+                pass
+            try:
+                await future_store.async_cleanup(body.request_id)
+            except Exception:
+                pass
+            logger.info("[retrieve_future] request_id=%s task_state_store_terminal_hit=true", body.request_id)
+            return task_state_payload
         meta = None
         try:
             meta = await future_store.async_get_meta(body.request_id)
