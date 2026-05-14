@@ -722,44 +722,70 @@ class ModelRuntimeActor:
                     await self._release_all_capacity(request_id)
                 self._requeued_total += 1
                 return
+            task_state_committed = False
             try:
                 if finalization.kind == "resolve":
                     await self._commit_task_state_success(lease, payload=finalization.payload)
+                    task_state_committed = self._task_state_finalize_enabled(lease)
                     await self._future_store.async_resolve(request_id, finalization.payload)
                 else:
                     await self._commit_task_state_failure(lease, error=str(finalization.payload))
+                    task_state_committed = self._task_state_finalize_enabled(lease)
                     await self._future_store.async_fail(request_id, str(finalization.payload))
+            except Exception as e:
+                if task_state_committed:
+                    logger.error(
+                        "[model_runtime] future_store finalize failed after task_state commit actor=%s request_id=%s error_type=%s error=%s",
+                        self._config.actor_name,
+                        request_id,
+                        type(e).__name__,
+                        e,
+                    )
+                else:
+                    try:
+                        await self._scheduler.fail_lease(
+                            lease_id=lease_id,
+                            consumer_id=self._config.consumer_id,
+                            consumer_generation=self._config.actor_generation,
+                            reason="future_store_finalize_failed",
+                            requeue=True,
+                        )
+                        self._requeued_total += 1
+                    except Exception:
+                        pass
+                    return
+            try:
+                if finalization.kind == "resolve":
+                    completed = await self._scheduler.complete_lease(
+                        lease_id=lease_id,
+                        consumer_id=self._config.consumer_id,
+                        consumer_generation=self._config.actor_generation,
+                    )
+                    if not isinstance(completed, dict) or not bool(completed.get("ok")):
+                        logger.warning(
+                            "[model_runtime] lease complete rejected after future resolve actor=%s request_id=%s result=%s",
+                            self._config.actor_name,
+                            request_id,
+                            completed,
+                        )
+                    self._processed_total += 1
+                    self._completed_total += 1
+                    self._last_completed_at = time.time()
+                    self._last_error = None
+                    self._last_error_traceback = None
+                    return
             except Exception:
                 try:
                     await self._scheduler.fail_lease(
                         lease_id=lease_id,
                         consumer_id=self._config.consumer_id,
                         consumer_generation=self._config.actor_generation,
-                        reason="future_store_finalize_failed",
+                        reason="scheduler_complete_failed",
                         requeue=True,
                     )
                     self._requeued_total += 1
                 except Exception:
                     pass
-                return
-            if finalization.kind == "resolve":
-                completed = await self._scheduler.complete_lease(
-                    lease_id=lease_id,
-                    consumer_id=self._config.consumer_id,
-                    consumer_generation=self._config.actor_generation,
-                )
-                if not isinstance(completed, dict) or not bool(completed.get("ok")):
-                    logger.warning(
-                        "[model_runtime] lease complete rejected after future resolve actor=%s request_id=%s result=%s",
-                        self._config.actor_name,
-                        request_id,
-                        completed,
-                    )
-                self._processed_total += 1
-                self._completed_total += 1
-                self._last_completed_at = time.time()
-                self._last_error = None
-                self._last_error_traceback = None
                 return
 
             failed = await self._scheduler.fail_lease(
@@ -841,8 +867,10 @@ class ModelRuntimeActor:
                     await self._release_all_capacity(request_id)
                 self._requeued_total += 1
                 return
+            task_state_committed = False
             try:
                 await self._commit_task_state_failure(lease, error=f"executor failed: {e}")
+                task_state_committed = self._task_state_finalize_enabled(lease)
                 await self._future_store.async_fail(request_id, f"executor failed: {e}")
             except Exception as e2:
                 logger.error(
@@ -852,18 +880,19 @@ class ModelRuntimeActor:
                     type(e2).__name__,
                     e2,
                 )
-                try:
-                    await self._scheduler.fail_lease(
-                        lease_id=lease_id,
-                        consumer_id=self._config.consumer_id,
-                        consumer_generation=self._config.actor_generation,
-                        reason="future_store_fail_failed",
-                        requeue=True,
-                    )
-                    self._requeued_total += 1
-                except Exception:
-                    pass
-                return
+                if not task_state_committed:
+                    try:
+                        await self._scheduler.fail_lease(
+                            lease_id=lease_id,
+                            consumer_id=self._config.consumer_id,
+                            consumer_generation=self._config.actor_generation,
+                            reason="future_store_fail_failed",
+                            requeue=True,
+                        )
+                        self._requeued_total += 1
+                    except Exception:
+                        pass
+                    return
             await self._scheduler.fail_lease(
                 lease_id=lease_id,
                 consumer_id=self._config.consumer_id,

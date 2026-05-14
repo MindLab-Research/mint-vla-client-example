@@ -344,6 +344,55 @@ async def test_issue_616_model_runtime_commits_success_to_task_state_store(tmp_p
 
 
 @pytest.mark.anyio
+async def test_issue_616_model_runtime_does_not_requeue_after_task_state_success_commit(
+    tmp_path,
+) -> None:
+    lease = _lease("runtime-req-task-state-success-future-fails")
+    lease["attempt_id"] = "attempt-success-future-fails"
+    lease["scheduler_epoch"] = 9
+    lease["item"]["extra"] = {
+        **dict(lease["item"].get("extra") or {}),
+        "model_work_attempt_id": "attempt-success-future-fails",
+    }
+    scheduler = _FakeScheduler(claims=[[lease]])
+    future_store = _FakeFutureStore(
+        statuses={lease["item"]["request_id"]: FutureStatus.PENDING},
+        fail_terminal_write=True,
+    )
+    task_state_store = _FakeTaskStateStore()
+    capacity = _FakeCapacityManager()
+
+    async def _executor(_lease: dict) -> None:
+        await future_store.async_resolve(_lease["item"]["request_id"], {"ok": True})
+
+    actor = ModelRuntimeActor(
+        domain_key="vllm:model-a",
+        replica_id="replica-0",
+        actor_name="runtime-a",
+        actor_generation=3,
+        scheduler_client=scheduler,
+        future_store_client=future_store,
+        task_state_store_client=task_state_store,
+        payload_store=TaskPayloadStore(tmp_path),
+        capacity_manager_client=capacity,
+        executor=_executor,
+    )
+
+    assert await actor.run_once() == {"claimed": 1, "executed": 1}
+    assert future_store.resolved == []
+    assert len(task_state_store.successes) == 1
+    assert scheduler.completed == [
+        {
+            "lease_id": lease["lease_id"],
+            "consumer_id": "vllm:model-a::replica-0::generation::3",
+            "consumer_generation": 3,
+        }
+    ]
+    assert scheduler.failed == []
+    assert actor.health_snapshot()["completed_total"] == 1
+
+
+@pytest.mark.anyio
 async def test_issue_616_model_runtime_commits_executor_failure_to_task_state_store(tmp_path) -> None:
     lease = _lease("runtime-req-task-state-failure")
     lease["attempt_id"] = "attempt-failure"
@@ -386,6 +435,57 @@ async def test_issue_616_model_runtime_commits_executor_failure_to_task_state_st
             "error": "executor failed: boom",
         }
     ]
+
+
+@pytest.mark.anyio
+async def test_issue_616_model_runtime_does_not_requeue_after_task_state_failure_commit(
+    tmp_path,
+) -> None:
+    lease = _lease("runtime-req-task-state-failure-future-fails")
+    lease["attempt_id"] = "attempt-failure-future-fails"
+    lease["scheduler_epoch"] = 10
+    lease["item"]["extra"] = {
+        **dict(lease["item"].get("extra") or {}),
+        "model_work_attempt_id": "attempt-failure-future-fails",
+    }
+    scheduler = _FakeScheduler(claims=[[lease]])
+    future_store = _FakeFutureStore(
+        statuses={lease["item"]["request_id"]: FutureStatus.PENDING},
+        fail_terminal_write=True,
+    )
+    task_state_store = _FakeTaskStateStore()
+    capacity = _FakeCapacityManager()
+
+    async def _executor(_lease: dict) -> None:
+        raise RuntimeError("boom")
+
+    actor = ModelRuntimeActor(
+        domain_key="vllm:model-a",
+        replica_id="replica-0",
+        actor_name="runtime-a",
+        actor_generation=3,
+        scheduler_client=scheduler,
+        future_store_client=future_store,
+        task_state_store_client=task_state_store,
+        payload_store=TaskPayloadStore(tmp_path),
+        capacity_manager_client=capacity,
+        executor=_executor,
+    )
+
+    assert await actor.run_once() == {"claimed": 1, "executed": 1}
+    assert future_store.failed == []
+    assert len(task_state_store.failures) == 1
+    assert scheduler.completed == []
+    assert scheduler.failed == [
+        {
+            "lease_id": lease["lease_id"],
+            "consumer_id": "vllm:model-a::replica-0::generation::3",
+            "consumer_generation": 3,
+            "reason": "executor_failed",
+            "requeue": False,
+        }
+    ]
+    assert actor.health_snapshot()["failed_total"] == 1
 
 
 @pytest.mark.anyio
