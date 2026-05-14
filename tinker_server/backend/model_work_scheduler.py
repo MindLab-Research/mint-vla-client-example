@@ -205,6 +205,7 @@ class ModelWorkLease:
     replica_id: str
     queue_id: str
     attempt_id: str
+    scheduler_epoch: int | None
     consumer_id: str
     consumer_generation: int
     leased_at: float
@@ -221,6 +222,7 @@ class ModelWorkLease:
             "replica_id": self.replica_id,
             "queue_id": self.queue_id,
             "attempt_id": self.attempt_id,
+            "scheduler_epoch": self.scheduler_epoch,
             "consumer_id": self.consumer_id,
             "consumer_generation": self.consumer_generation,
             "leased_at": self.leased_at,
@@ -703,6 +705,7 @@ class _ModelWorkSchedulerActor:
                     replica_id=replica_id,
                     queue_id=assigned.queue_id,
                     attempt_id=attempt_id,
+                    scheduler_epoch=self._scheduler_epoch,
                     consumer_id=consumer_id,
                     consumer_generation=int(consumer_generation),
                     leased_at=now,

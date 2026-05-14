@@ -22,6 +22,8 @@ from .future_store import FutureStatus, future_store
 from .model_actor_supervisor import consumer_id_for_replica, queue_id_for_replica
 from .model_work_scheduler import ModelWorkSchedulerClient, model_work_scheduler
 from .queue_execution_context import ModelWorkFinalizeBuffer, model_work_execution_context
+from .task_payload_store import TaskPayloadStore
+from .task_state_store import task_state_store
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +211,8 @@ class ModelRuntimeActor:
         token_budget: int | None = None,
         scheduler_client: ModelWorkSchedulerClient | None = None,
         future_store_client: Any | None = None,
+        task_state_store_client: Any | None = None,
+        payload_store: TaskPayloadStore | None = None,
         capacity_manager_client: Any | None = None,
         executor: ModelWorkExecutor | None = None,
     ) -> None:
@@ -245,6 +249,10 @@ class ModelRuntimeActor:
         )
         self._scheduler = scheduler_client if scheduler_client is not None else model_work_scheduler
         self._future_store = future_store_client if future_store_client is not None else future_store
+        self._task_state_store = (
+            task_state_store_client if task_state_store_client is not None else task_state_store
+        )
+        self._payload_store = payload_store if payload_store is not None else TaskPayloadStore()
         if capacity_manager_client is None:
             from .capacity_manager import capacity_manager
 
@@ -493,6 +501,63 @@ class ModelRuntimeActor:
         )
         return bool(out.get("failed")) if isinstance(out, dict) else False
 
+    def _task_state_finalize_enabled(self, lease: dict[str, Any]) -> bool:
+        return lease.get("scheduler_epoch") is not None and bool(lease.get("attempt_id"))
+
+    def _lease_attempt_id(self, lease: dict[str, Any]) -> str | None:
+        attempt_id = str(lease.get("attempt_id") or "") or None
+        if attempt_id:
+            return attempt_id
+        item = lease.get("item") if isinstance(lease, dict) else {}
+        extra = item.get("extra") if isinstance(item, dict) and isinstance(item.get("extra"), dict) else {}
+        return str(extra.get("model_work_attempt_id") or "") or None
+
+    async def _commit_task_state_success(
+        self,
+        lease: dict[str, Any],
+        *,
+        payload: Any,
+    ) -> None:
+        if not self._task_state_finalize_enabled(lease):
+            return
+        item = lease["item"]
+        request_id = str(item["request_id"])
+        attempt_id = str(lease["attempt_id"])
+        payload_meta = await asyncio.to_thread(
+            self._payload_store.write_json_payload,
+            request_id=request_id,
+            attempt_id=attempt_id,
+            payload=payload,
+        )
+        await self._task_state_store.async_commit_finalize_success(
+            request_id=request_id,
+            lease_id=str(lease["lease_id"]),
+            attempt_id=attempt_id,
+            scheduler_epoch=int(lease["scheduler_epoch"]),
+            runtime_generation=int(self._config.actor_generation),
+            result_path=str(payload_meta["path"]),
+            result_checksum=str(payload_meta["checksum"]),
+            result_size_bytes=int(payload_meta["size_bytes"]),
+        )
+
+    async def _commit_task_state_failure(
+        self,
+        lease: dict[str, Any],
+        *,
+        error: str,
+    ) -> None:
+        if not self._task_state_finalize_enabled(lease):
+            return
+        item = lease["item"]
+        await self._task_state_store.async_commit_finalize_failure(
+            request_id=str(item["request_id"]),
+            lease_id=str(lease["lease_id"]),
+            attempt_id=str(lease["attempt_id"]),
+            scheduler_epoch=int(lease["scheduler_epoch"]),
+            runtime_generation=int(self._config.actor_generation),
+            error=str(error),
+        )
+
     async def _mark_running(self, lease: dict[str, Any]) -> None:
         item = lease["item"]
         await self._future_store.async_mark_running(
@@ -574,8 +639,7 @@ class ModelRuntimeActor:
         item = lease["item"]
         request_id = str(item["request_id"])
         lease_id = str(lease["lease_id"])
-        extra = item.get("extra") if isinstance(item.get("extra"), dict) else {}
-        attempt_id = str(extra.get("model_work_attempt_id") or "") or None
+        attempt_id = self._lease_attempt_id(lease)
         self._active_request_id = request_id
         self._active_lease_id = lease_id
         self._restore_item_context(lease)
@@ -660,8 +724,10 @@ class ModelRuntimeActor:
                 return
             try:
                 if finalization.kind == "resolve":
+                    await self._commit_task_state_success(lease, payload=finalization.payload)
                     await self._future_store.async_resolve(request_id, finalization.payload)
                 else:
+                    await self._commit_task_state_failure(lease, error=str(finalization.payload))
                     await self._future_store.async_fail(request_id, str(finalization.payload))
             except Exception:
                 try:
@@ -776,6 +842,7 @@ class ModelRuntimeActor:
                 self._requeued_total += 1
                 return
             try:
+                await self._commit_task_state_failure(lease, error=f"executor failed: {e}")
                 await self._future_store.async_fail(request_id, f"executor failed: {e}")
             except Exception as e2:
                 logger.error(
