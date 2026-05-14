@@ -17,6 +17,8 @@ def _reset_retrieve_future_state(monkeypatch, tmp_path):
     monkeypatch.setattr(config_module.config, "future_replay_root_dir", str(tmp_path / "future-replay"), raising=False)
     monkeypatch.setattr(config_module.config, "future_replay_disk_ttl_s", 60.0, raising=False)
     monkeypatch.setattr(config_module.config, "future_replay_hot_ttl_s", 60.0, raising=False)
+    monkeypatch.delenv("MINT_RETRIEVE_FUTURE_TASK_STATE_STORE", raising=False)
+    monkeypatch.delenv("MINT_MODEL_WORK_SCHEDULER_TASK_STATE_STORE", raising=False)
 
 
 class _StubFutureStore:
@@ -51,6 +53,16 @@ class _UnknownFutureStore:
 
     async def async_debug_snapshot(self):
         return {"stub": True}
+
+
+class _StubTaskStateStore:
+    def __init__(self, record: dict):
+        self.record = dict(record)
+
+    async def async_get_task(self, request_id: str) -> dict:
+        if self.record.get("request_id") != request_id:
+            raise KeyError(request_id)
+        return dict(self.record)
 
 
 def _request_stub(*, admin: bool = True):
@@ -101,6 +113,72 @@ def test_issue_440_random_unknown_without_replay_stays_404(monkeypatch):
     with pytest.raises(futures_route.HTTPException) as exc:
         anyio.run(futures_route.retrieve_future, body, _request_stub(), _response_stub())
     assert exc.value.status_code == 404
+
+
+def test_issue_616_task_state_store_terminal_success_fallback(monkeypatch, tmp_path):
+    import tinker_server.backend.task_state_store as task_state_store_module
+    from tinker_server.backend.task_payload_store import TaskPayloadStore
+
+    payload_root = tmp_path / "payloads"
+    monkeypatch.setenv("MINT_RETRIEVE_FUTURE_TASK_STATE_STORE", "1")
+    monkeypatch.setenv("MINT_TASK_PAYLOAD_ROOT_DIR", str(payload_root))
+    monkeypatch.setattr(futures_route, "future_store", _UnknownFutureStore())
+    store = TaskPayloadStore(payload_root)
+    payload_meta = store.write_json_payload(
+        request_id="rid-task-state-done",
+        attempt_id="attempt-1",
+        payload={"ok": True},
+    )
+    monkeypatch.setattr(
+        task_state_store_module,
+        "task_state_store",
+        _StubTaskStateStore(
+            {
+                "request_id": "rid-task-state-done",
+                "status": "done",
+                "result_path": payload_meta["path"],
+                "result_checksum": payload_meta["checksum"],
+                "metadata": {"op": "sampling.asample"},
+            }
+        ),
+    )
+
+    body = FutureRetrieveRequest(request_id="rid-task-state-done")
+    payload = anyio.run(futures_route.retrieve_future, body, _request_stub(), _response_stub())
+
+    assert payload == {"ok": True}
+
+
+def test_issue_616_task_state_store_terminal_failure_fallback_keeps_public_masking(
+    monkeypatch,
+):
+    import tinker_server.backend.task_state_store as task_state_store_module
+
+    monkeypatch.setattr(config_module.config, "api_key", "secret", raising=False)
+    monkeypatch.setenv("MINT_RETRIEVE_FUTURE_TASK_STATE_STORE", "1")
+    monkeypatch.setattr(futures_route, "future_store", _UnknownFutureStore())
+    monkeypatch.setattr(
+        task_state_store_module,
+        "task_state_store",
+        _StubTaskStateStore(
+            {
+                "request_id": "rid-task-state-failed",
+                "status": "failed",
+                "error": "secret backend trace",
+                "metadata": {"op": "sampling.asample"},
+            }
+        ),
+    )
+
+    body = FutureRetrieveRequest(request_id="rid-task-state-failed")
+    payload = anyio.run(
+        futures_route.retrieve_future,
+        body,
+        _request_stub(admin=False),
+        _response_stub(),
+    )
+
+    assert payload == {"error": futures_route.GENERIC_ERROR_MESSAGE, "category": "system"}
 
 
 def test_issue_440_known_terminal_future_evicted_not_unknown(monkeypatch):
