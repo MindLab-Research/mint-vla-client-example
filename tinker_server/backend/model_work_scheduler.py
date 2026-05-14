@@ -204,6 +204,7 @@ class ModelWorkLease:
     domain_key: str
     replica_id: str
     queue_id: str
+    attempt_id: str
     consumer_id: str
     consumer_generation: int
     leased_at: float
@@ -219,6 +220,7 @@ class ModelWorkLease:
             "domain_key": self.domain_key,
             "replica_id": self.replica_id,
             "queue_id": self.queue_id,
+            "attempt_id": self.attempt_id,
             "consumer_id": self.consumer_id,
             "consumer_generation": self.consumer_generation,
             "leased_at": self.leased_at,
@@ -234,9 +236,19 @@ def _queue_key(domain_key: str, replica_id: str) -> tuple[str, str]:
 
 
 class _ModelWorkSchedulerActor:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        use_task_state_store: bool = False,
+        task_state_store: Any | None = None,
+        owner_id: str | None = None,
+    ) -> None:
         self._cv = asyncio.Condition()
         self._instance_id = uuid.uuid4().hex
+        self._owner_id = owner_id or f"{_ray_model_work_scheduler_actor_name()}:{self._instance_id}"
+        self._use_task_state_store = bool(use_task_state_store)
+        self._task_state_store = task_state_store
+        self._scheduler_epoch: int | None = None
         self._domain_backlog: dict[str, deque[ModelWorkItem]] = {}
         self._replicas: dict[tuple[str, str], ModelReplicaRegistration] = {}
         self._replica_queues: dict[tuple[str, str], deque[_AssignedWork]] = {}
@@ -253,6 +265,40 @@ class _ModelWorkSchedulerActor:
 
     def _all_request_ids(self) -> set[str]:
         return set(self._request_locations)
+
+    async def _task_state_call(self, method: str, **kwargs: Any) -> Any:
+        if self._task_state_store is None:
+            from .task_state_store import task_state_store
+
+            self._task_state_store = task_state_store
+        async_method = getattr(self._task_state_store, f"async_{method}", None)
+        if callable(async_method):
+            return await async_method(**kwargs)
+        sync_method = getattr(self._task_state_store, method)
+        return sync_method(**kwargs)
+
+    async def _ensure_task_state_owner(self) -> int | None:
+        if not self._use_task_state_store:
+            return None
+        if self._scheduler_epoch is not None:
+            renewed = await self._task_state_call(
+                "renew_scheduler_owner",
+                owner_id=self._owner_id,
+                epoch=int(self._scheduler_epoch),
+                ttl_s=float(getattr(server_config, "task_state_store_owner_ttl_s", 30.0)),
+            )
+            if isinstance(renewed, dict) and bool(renewed.get("ok")):
+                return int(self._scheduler_epoch)
+            self._scheduler_epoch = None
+        acquired = await self._task_state_call(
+            "acquire_scheduler_owner",
+            owner_id=self._owner_id,
+            ttl_s=float(getattr(server_config, "task_state_store_owner_ttl_s", 30.0)),
+        )
+        if not isinstance(acquired, dict) or not bool(acquired.get("ok")):
+            raise ModelWorkSchedulerConflictError(f"failed to acquire scheduler owner: {acquired}")
+        self._scheduler_epoch = int(acquired["epoch"])
+        return int(self._scheduler_epoch)
 
     def _backlog(self, domain_key: str) -> deque[ModelWorkItem]:
         return self._domain_backlog.setdefault(str(domain_key), deque())
@@ -345,7 +391,7 @@ class _ModelWorkSchedulerActor:
             expired += 1
         return expired
 
-    def _assign_pending_locked(self, *, max_items: int | None = None) -> dict[str, Any]:
+    async def _assign_pending_locked(self, *, max_items: int | None = None) -> dict[str, Any]:
         assigned = 0
         skipped_domains: list[str] = []
         limit = None if max_items is None else max(0, int(max_items))
@@ -359,6 +405,13 @@ class _ModelWorkSchedulerActor:
                 if replica is None:
                     skipped_domains.append(domain_key)
                     break
+                if self._use_task_state_store:
+                    await self._task_state_call(
+                        "assign_task",
+                        request_id=item.request_id,
+                        subqueue_id=replica.effective_queue_id,
+                        scheduler_epoch=int(self._scheduler_epoch or 0),
+                    )
                 backlog.popleft()
                 queue = self._queue(replica.domain_key, replica.replica_id)
                 queue.append(
@@ -385,6 +438,8 @@ class _ModelWorkSchedulerActor:
         assign_max_items: int | None = None,
     ) -> dict[str, Any]:
         work = ModelWorkItem.from_dict(item)
+        if self._use_task_state_store:
+            await self._ensure_task_state_owner()
         async with self._cv:
             if work.request_id in self._all_request_ids():
                 return {
@@ -392,11 +447,36 @@ class _ModelWorkSchedulerActor:
                     "reason": "duplicate_request_id",
                     "request_id": work.request_id,
                 }
+            if self._use_task_state_store:
+                created = await self._task_state_call(
+                    "create_task",
+                    request_id=work.request_id,
+                    op=work.op,
+                    domain_key=work.domain_key,
+                    request_json=work.request_json,
+                    payload_hash=work.extra.get("payload_hash"),
+                    metadata={
+                        **dict(work.extra),
+                        "user_id": work.user_id,
+                        "apikey_id": work.apikey_id,
+                        "throttle_principal": work.throttle_principal,
+                        "webhook_url": work.webhook_url,
+                        "affinity_group": work.affinity_group,
+                        "ordering_key": work.ordering_key,
+                        "token_cost": work.token_cost,
+                    },
+                )
+                if isinstance(created, dict) and not bool(created.get("created", True)):
+                    return {
+                        "ok": False,
+                        "reason": "duplicate_request_id",
+                        "request_id": work.request_id,
+                    }
             self._backlog(work.domain_key).append(work)
             self._request_locations[work.request_id] = "backlog"
             self._appended += 1
             assigned = (
-                self._assign_pending_locked(max_items=assign_max_items)
+                await self._assign_pending_locked(max_items=assign_max_items)
                 if bool(assign)
                 else {"ok": True, "assigned": 0, "skipped_domains": []}
             )
@@ -458,6 +538,8 @@ class _ModelWorkSchedulerActor:
 
     async def sync_replicas(self, replicas: list[dict[str, Any]]) -> dict[str, Any]:
         now = time.time()
+        if self._use_task_state_store:
+            await self._ensure_task_state_owner()
         incoming = {
             _queue_key(reg.domain_key, reg.replica_id): reg
             for reg in (ModelReplicaRegistration.from_dict(replica) for replica in replicas)
@@ -506,7 +588,7 @@ class _ModelWorkSchedulerActor:
             for key in incoming:
                 self._replica_queues.setdefault(key, deque())
             expired = self._expire_leases_locked(now=now)
-            assigned_pending = self._assign_pending_locked()
+            assigned_pending = await self._assign_pending_locked()
             self._cv.notify_all()
             return {
                 "ok": True,
@@ -518,9 +600,11 @@ class _ModelWorkSchedulerActor:
             }
 
     async def assign_pending(self, *, max_items: int | None = None) -> dict[str, Any]:
+        if self._use_task_state_store:
+            await self._ensure_task_state_owner()
         async with self._cv:
             expired = self._expire_leases_locked(now=time.time())
-            out = self._assign_pending_locked(max_items=max_items)
+            out = await self._assign_pending_locked(max_items=max_items)
             out["expired"] = expired
             self._cv.notify_all()
             return out
@@ -567,6 +651,8 @@ class _ModelWorkSchedulerActor:
         lease_ttl_s: float = 30.0,
     ) -> dict[str, Any]:
         now = time.time()
+        if self._use_task_state_store:
+            await self._ensure_task_state_owner()
         async with self._cv:
             self._validate_claimer(
                 domain_key=domain_key,
@@ -584,15 +670,39 @@ class _ModelWorkSchedulerActor:
                     break
                 if token_budget is not None and not claimed and cost > int(token_budget):
                     break
-                queue.popleft()
                 lease_id = uuid.uuid4().hex
                 claim_attempt = int(assigned.item.extra.get("claim_attempt") or 0) + 1
+                attempt_id = str(assigned.item.extra.get("model_work_attempt_id") or uuid.uuid4().hex)
+                item = assigned.item
+                if item.extra.get("model_work_attempt_id") != attempt_id:
+                    item = ModelWorkItem(
+                        **{
+                            **asdict(item),
+                            "request_json": item.request_json,
+                            "extra": {**dict(item.extra), "model_work_attempt_id": attempt_id},
+                        }
+                    )
+                    assigned.item = item
+                if self._use_task_state_store:
+                    await self._task_state_call(
+                        "claim_task",
+                        request_id=item.request_id,
+                        subqueue_id=assigned.queue_id,
+                        lease_id=lease_id,
+                        attempt_id=attempt_id,
+                        consumer_id=consumer_id,
+                        scheduler_epoch=int(self._scheduler_epoch or 0),
+                        runtime_generation=int(consumer_generation),
+                        lease_ttl_s=max(1.0, float(lease_ttl_s)),
+                    )
+                queue.popleft()
                 lease = ModelWorkLease(
                     lease_id=lease_id,
-                    item=assigned.item,
+                    item=item,
                     domain_key=domain_key,
                     replica_id=replica_id,
                     queue_id=assigned.queue_id,
+                    attempt_id=attempt_id,
                     consumer_id=consumer_id,
                     consumer_generation=int(consumer_generation),
                     leased_at=now,
@@ -616,6 +726,8 @@ class _ModelWorkSchedulerActor:
         consumer_generation: int,
         finalize_ttl_s: float = 30.0,
     ) -> dict[str, Any]:
+        if self._use_task_state_store:
+            await self._ensure_task_state_owner()
         async with self._cv:
             lease = self._leases_by_id.get(str(lease_id))
             if lease is None:
@@ -625,6 +737,16 @@ class _ModelWorkSchedulerActor:
             ):
                 return {"ok": False, "reason": "stale_consumer"}
             now = time.time()
+            if self._use_task_state_store:
+                await self._task_state_call(
+                    "begin_finalize",
+                    request_id=lease.item.request_id,
+                    lease_id=lease.lease_id,
+                    attempt_id=lease.attempt_id,
+                    scheduler_epoch=int(self._scheduler_epoch or 0),
+                    runtime_generation=int(consumer_generation),
+                    finalize_ttl_s=max(1.0, float(finalize_ttl_s)),
+                )
             lease.finalizing_until = now + max(1.0, float(finalize_ttl_s))
             lease.lease_expires_at = max(float(lease.lease_expires_at), lease.finalizing_until)
             return {"ok": True, "lease": lease.to_dict()}
@@ -750,6 +872,8 @@ class _ModelWorkSchedulerActor:
             "actor_name": _ray_model_work_scheduler_actor_name(),
             "namespace": _ray_namespace(),
             "scheduler_instance_id": self._instance_id,
+            "scheduler_epoch": self._scheduler_epoch,
+            "task_state_store_enabled": self._use_task_state_store,
             "now": now,
             "depth": sum(backlog_depth_by_domain.values())
             + sum(len(queue) for queue in self._replica_queues.values())
@@ -794,7 +918,12 @@ def _create_ray_actor(*, require_ready: bool = True):
     class _RayModelWorkSchedulerActor(_ModelWorkSchedulerActor):
         pass
 
-    actor = _RayModelWorkSchedulerActor.options(**options).remote()
+    actor = _RayModelWorkSchedulerActor.options(**options).remote(
+        use_task_state_store=str(
+            os.environ.get("MINT_MODEL_WORK_SCHEDULER_TASK_STATE_STORE", "")
+        ).strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
     if require_ready:
         stats = _await_ray_ref_sync(actor.stats.remote(), timeout_s=5.0)
         if not isinstance(stats, dict):
