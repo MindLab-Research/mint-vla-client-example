@@ -164,6 +164,47 @@ def test_server_config_retrieve_future_settings_read_from_file(tmp_path):
     assert cfg.retrieve_future_min_poll_s == 2.5
 
 
+def test_config_file_task_state_store_settings_load(tmp_path):
+    p = tmp_path / "ok.toml"
+    p.write_text(
+        "\n".join(
+            [
+                "[task_state_store]",
+                "actor_name = 'mint_task_state_store_test'",
+                "db_path = '/tmp/task-state.sqlite3'",
+                "owner_ttl_s = 45",
+                "owner_renew_s = 15",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    file_cfg = load_tinker_config_file(p)
+
+    cfg = ServerConfig.from_sources(
+        environ={},
+        config_path=str(p),
+        config_file=file_cfg,
+    )
+
+    assert cfg.task_state_store_actor_name == "mint_task_state_store_test"
+    assert cfg.task_state_store_db_path == "/tmp/task-state.sqlite3"
+    assert cfg.task_state_store_owner_ttl_s == 45.0
+    assert cfg.task_state_store_owner_renew_s == 15.0
+
+
+def test_server_config_task_state_store_defaults_follow_auth_mode():
+    dev = ServerConfig.from_sources(environ={}, config_path=None, config_file=None)
+    assert dev.task_state_store_db_path == "/vePFS-Mindverse/share/mint-prod-dev/task-state/task_state.sqlite3"
+
+    prod = ServerConfig.from_sources(
+        environ={"TINKER_API_KEY": "secret"},
+        config_path=None,
+        config_file=None,
+    )
+    assert prod.task_state_store_db_path == "/vePFS-Mindverse/share/mint-prod-data/task-state/task_state.sqlite3"
+
+
 def test_server_config_future_replay_env_overrides_file_independently(tmp_path):
     p = tmp_path / "ok.toml"
     p.write_text(

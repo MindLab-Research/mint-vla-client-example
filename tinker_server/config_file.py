@@ -103,6 +103,15 @@ class _FutureStoreSection(BaseModel):
     retrieve_future_min_poll_s: float | None = None
 
 
+class _TaskStateStoreSection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    actor_name: str | None = None
+    db_path: str | None = None
+    owner_ttl_s: float | None = None
+    owner_renew_s: float | None = None
+
+
 class _TrainingSection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -149,6 +158,7 @@ class TinkerConfigFile(BaseModel):
     megatron_bridge: _MegatronBridgeSection = Field(default_factory=_MegatronBridgeSection)
     resource_pool: _ResourcePoolSection = Field(default_factory=_ResourcePoolSection)
     future_store: _FutureStoreSection = Field(default_factory=_FutureStoreSection)
+    task_state_store: _TaskStateStoreSection = Field(default_factory=_TaskStateStoreSection)
     training: _TrainingSection = Field(default_factory=_TrainingSection)
     prewarm: _PrewarmSection = Field(default_factory=_PrewarmSection)
     docs: _DocsSection = Field(default_factory=_DocsSection)

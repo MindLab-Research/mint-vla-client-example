@@ -41,6 +41,12 @@ def _default_future_replay_root_dir(*, auth_enabled: bool) -> str:
     return "/vePFS-Mindverse/share/mint-prod-dev/future-replay"
 
 
+def _default_task_state_store_db_path(*, auth_enabled: bool) -> str:
+    if auth_enabled:
+        return "/vePFS-Mindverse/share/mint-prod-data/task-state/task_state.sqlite3"
+    return "/vePFS-Mindverse/share/mint-prod-dev/task-state/task_state.sqlite3"
+
+
 def _load_config_file_for_process(environ: dict[str, str]) -> tuple[str | None, object | None]:
     path = _env_nonempty(environ, "TINKER_CONFIG_PATH")
     if not path:
@@ -498,6 +504,12 @@ class ServerConfig:
     retrieve_future_grace_s: float = 120.0
     retrieve_future_min_poll_s: float = 1.0
 
+    # TaskStateStore settings (backend/task_state_store.py)
+    task_state_store_actor_name: str = "mint_task_state_store"
+    task_state_store_db_path: str = "/vePFS-Mindverse/share/mint-prod-dev/task-state/task_state.sqlite3"
+    task_state_store_owner_ttl_s: float = 30.0
+    task_state_store_owner_renew_s: float = 10.0
+
     # Admission control + API work queue (issue #84)
     capacity_manager_actor_name: str = "tinker_capacity_manager"
     api_work_queue_actor_name: str = "tinker_api_work_queue"
@@ -556,6 +568,7 @@ class ServerConfig:
         file_sampling = config_file.sampling if config_file is not None else None
         file_resource_pool = config_file.resource_pool if config_file is not None else None
         file_future_store = config_file.future_store if config_file is not None else None
+        file_task_state_store = config_file.task_state_store if config_file is not None else None
         file_training = config_file.training if config_file is not None else None
         file_prewarm = config_file.prewarm if config_file is not None else None
         file_docs = config_file.docs if config_file is not None else None
@@ -839,6 +852,27 @@ class ServerConfig:
                 "MINT_FUTURE_REPLAY_SWEEP_INTERVAL_S",
                 file_future_store.replay_sweep_interval_s if file_future_store is not None else None,
                 21600.0,
+            ),
+            # TaskStateStore settings
+            task_state_store_actor_name=_pick_str(
+                "MINT_TASK_STATE_STORE_ACTOR_NAME",
+                file_task_state_store.actor_name if file_task_state_store is not None else None,
+                "mint_task_state_store",
+            ),
+            task_state_store_db_path=_pick_str(
+                "MINT_TASK_STATE_STORE_DB_PATH",
+                file_task_state_store.db_path if file_task_state_store is not None else None,
+                _default_task_state_store_db_path(auth_enabled=auth_enabled),
+            ),
+            task_state_store_owner_ttl_s=_pick_float(
+                "MINT_TASK_STATE_STORE_OWNER_TTL_S",
+                file_task_state_store.owner_ttl_s if file_task_state_store is not None else None,
+                30.0,
+            ),
+            task_state_store_owner_renew_s=_pick_float(
+                "MINT_TASK_STATE_STORE_OWNER_RENEW_S",
+                file_task_state_store.owner_renew_s if file_task_state_store is not None else None,
+                10.0,
             ),
             # Admission control + API work queue (issue #84)
             capacity_manager_actor_name=_pick_str_alias(

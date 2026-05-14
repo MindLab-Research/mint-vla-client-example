@@ -5,6 +5,7 @@ import pytest
 from tinker_server.backend.task_state_store import (
     TaskStateConflictError,
     TaskStateStore,
+    _TaskStateStoreActor,
 )
 
 
@@ -241,3 +242,34 @@ def test_expired_leases_include_finalizing_deadline() -> None:
         assert expired[0]["status"] == "finalizing"
     finally:
         store.close()
+
+
+def test_task_state_store_actor_uses_single_db_path(tmp_path) -> None:
+    db_path = tmp_path / "task_state.sqlite3"
+    actor = _TaskStateStoreActor(str(db_path))
+    try:
+        owner = actor.acquire_scheduler_owner(owner_id="scheduler-a", ttl_s=30.0, now=100.0)
+        assert owner["ok"] is True
+        created = actor.create_task(
+            request_id="req-actor",
+            op="sampling.asample",
+            domain_key="vllm:test",
+            request_json=b"{}",
+            payload_hash="hash",
+            metadata={"queue_kind": "model_work_scheduler"},
+            now=101.0,
+        )
+        assert created["created"] is True
+        stats = actor.stats()
+        assert stats["db_path"] == str(db_path)
+        assert stats["active_tasks"] == 1
+        assert stats["active_by_status"] == {"pending": 1}
+        assert actor.integrity_check() == "ok"
+    finally:
+        actor.close()
+
+    reopened = _TaskStateStoreActor(str(db_path))
+    try:
+        assert [record["request_id"] for record in reopened.list_active_tasks()] == ["req-actor"]
+    finally:
+        reopened.close()

@@ -3,11 +3,15 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import asyncio
 import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
+
+from ..config import PFS_PYTHONPATH, actor_runtime_env, config as server_config
+from .async_ray_control import async_get_ray_ref, sync_get_ray_ref
 
 
 ACTIVE_TASK_STATUSES = frozenset({"pending", "assigned", "leased", "finalizing"})
@@ -23,6 +27,10 @@ class TaskStateConflictError(TaskStateStoreError):
 
 
 class TaskStateNotFoundError(TaskStateStoreError, KeyError):
+    pass
+
+
+class TaskStateStoreUnavailableError(TaskStateStoreError):
     pass
 
 
@@ -699,3 +707,236 @@ class TaskStateStore:
             "lease_expires_at": row["lease_expires_at"],
             "finalizing_until": row["finalizing_until"],
         }
+
+
+def _ray_namespace() -> str:
+    v = os.environ.get("TINKER_RAY_NAMESPACE") or os.environ.get("MINT_RAY_NAMESPACE")
+    if v:
+        return v
+    try:
+        from ..config import RAY_NAMESPACE
+
+        return RAY_NAMESPACE
+    except Exception:
+        return "tinker"
+
+
+def _ray_task_state_store_actor_name() -> str:
+    return str(
+        os.environ.get("MINT_TASK_STATE_STORE_ACTOR_NAME")
+        or getattr(server_config, "task_state_store_actor_name", "mint_task_state_store")
+    )
+
+
+def _task_state_store_db_path() -> str:
+    return str(
+        os.environ.get("MINT_TASK_STATE_STORE_DB_PATH")
+        or getattr(
+            server_config,
+            "task_state_store_db_path",
+            "/vePFS-Mindverse/share/mint-prod-dev/task-state/task_state.sqlite3",
+        )
+    )
+
+
+class _TaskStateStoreActor:
+    def __init__(self, db_path: str | None = None) -> None:
+        self._started_at = time.time()
+        self._store = TaskStateStore(db_path or _task_state_store_db_path())
+
+    def close(self) -> None:
+        self._store.close()
+
+    def stats(self) -> dict[str, Any]:
+        active = self._store.list_active_tasks()
+        by_status: dict[str, int] = {}
+        for record in active:
+            status = str(record.get("status") or "unknown")
+            by_status[status] = by_status.get(status, 0) + 1
+        return {
+            "actor_name": _ray_task_state_store_actor_name(),
+            "namespace": _ray_namespace(),
+            "db_path": self._store.db_path,
+            "started_at": self._started_at,
+            "active_tasks": len(active),
+            "active_by_status": by_status,
+        }
+
+    def integrity_check(self) -> str:
+        return self._store.integrity_check()
+
+    def acquire_scheduler_owner(self, **kwargs: Any) -> dict[str, Any]:
+        return self._store.acquire_scheduler_owner(**kwargs)
+
+    def renew_scheduler_owner(self, **kwargs: Any) -> dict[str, Any]:
+        return self._store.renew_scheduler_owner(**kwargs)
+
+    def create_task(self, **kwargs: Any) -> dict[str, Any]:
+        return self._store.create_task(**kwargs)
+
+    def assign_task(self, **kwargs: Any) -> dict[str, Any]:
+        return self._store.assign_task(**kwargs)
+
+    def claim_task(self, **kwargs: Any) -> dict[str, Any]:
+        return self._store.claim_task(**kwargs)
+
+    def begin_finalize(self, **kwargs: Any) -> dict[str, Any]:
+        return self._store.begin_finalize(**kwargs)
+
+    def commit_finalize_success(self, **kwargs: Any) -> dict[str, Any]:
+        return self._store.commit_finalize_success(**kwargs)
+
+    def commit_finalize_failure(self, **kwargs: Any) -> dict[str, Any]:
+        return self._store.commit_finalize_failure(**kwargs)
+
+    def list_active_tasks(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return self._store.list_active_tasks(**kwargs)
+
+    def list_expired_leases(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return self._store.list_expired_leases(**kwargs)
+
+    def get_task(self, request_id: str) -> dict[str, Any]:
+        return self._store.get_task(request_id)
+
+
+def _create_ray_actor(*, require_ready: bool = True):
+    try:
+        import ray
+    except Exception as e:
+        raise TaskStateStoreUnavailableError("Ray import failed") from e
+
+    actor_name = _ray_task_state_store_actor_name()
+    namespace = _ray_namespace()
+    db_path = _task_state_store_db_path()
+    max_concurrency = int(os.environ.get("MINT_TASK_STATE_STORE_ACTOR_MAX_CONCURRENCY", "128"))
+
+    @ray.remote(num_cpus=0, max_concurrency=max_concurrency, max_restarts=0)
+    class _RayTaskStateStoreActor(_TaskStateStoreActor):
+        pass
+
+    options: dict[str, Any] = {
+        "name": actor_name,
+        "namespace": namespace,
+        "lifetime": "detached",
+        "get_if_exists": True,
+        "runtime_env": actor_runtime_env(pythonpath=PFS_PYTHONPATH),
+    }
+    actor = _RayTaskStateStoreActor.options(**options).remote(db_path)
+    if require_ready:
+        out = sync_get_ray_ref(actor.stats.remote(), timeout_s=5.0)
+        if not isinstance(out, dict):
+            raise TypeError(f"TaskStateStore.stats returned non-dict: {type(out)}")
+    return actor
+
+
+class TaskStateStoreClient:
+    def __init__(self) -> None:
+        self._ray_actor = None
+
+    def _reset_ray_actor(self) -> None:
+        self._ray_actor = None
+
+    async def _get_ray_actor_async(self, *, require_ready: bool = True):
+        try:
+            import ray
+        except Exception as e:
+            raise TaskStateStoreUnavailableError("Ray import failed") from e
+        if not ray.is_initialized():
+            raise TaskStateStoreUnavailableError("Ray not initialized")
+        if self._ray_actor is not None:
+            if not require_ready:
+                return self._ray_actor
+            try:
+                out = await async_get_ray_ref(self._ray_actor.stats.remote(), timeout_s=1.0)
+                if not isinstance(out, dict):
+                    raise TypeError(f"TaskStateStore.stats returned non-dict: {type(out)}")
+                return self._ray_actor
+            except Exception:
+                self._reset_ray_actor()
+        import ray
+
+        actor_name = _ray_task_state_store_actor_name()
+        try:
+            self._ray_actor = await asyncio.to_thread(
+                ray.get_actor,
+                actor_name,
+                namespace=_ray_namespace(),
+            )
+        except Exception:
+            try:
+                self._ray_actor = _create_ray_actor(require_ready=require_ready)
+            except Exception as e:
+                raise TaskStateStoreUnavailableError(
+                    "Failed to get/create detached Ray TaskStateStore actor"
+                ) from e
+        return self._ray_actor
+
+    async def _call(self, method: str, **kwargs: Any) -> Any:
+        actor = await self._get_ray_actor_async()
+        remote = getattr(actor, method).remote
+        return await async_get_ray_ref(remote(**kwargs))
+
+    async def async_ensure_started(self) -> None:
+        await self._get_ray_actor_async(require_ready=False)
+
+    async def async_stats(self) -> dict[str, Any]:
+        out = await self._call("stats")
+        if not isinstance(out, dict):
+            raise TypeError(f"TaskStateStore.stats returned non-dict: {type(out)}")
+        return out
+
+    async def async_integrity_check(self) -> str:
+        return str(await self._call("integrity_check"))
+
+    async def async_acquire_scheduler_owner(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("acquire_scheduler_owner", **kwargs)
+
+    async def async_renew_scheduler_owner(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("renew_scheduler_owner", **kwargs)
+
+    async def async_create_task(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("create_task", **kwargs)
+
+    async def async_assign_task(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("assign_task", **kwargs)
+
+    async def async_claim_task(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("claim_task", **kwargs)
+
+    async def async_begin_finalize(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("begin_finalize", **kwargs)
+
+    async def async_commit_finalize_success(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("commit_finalize_success", **kwargs)
+
+    async def async_commit_finalize_failure(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("commit_finalize_failure", **kwargs)
+
+    async def async_get_task(self, request_id: str) -> dict[str, Any]:
+        return await self._dict_call("get_task", request_id=str(request_id))
+
+    async def async_list_active_tasks(self, *, limit: int | None = None) -> list[dict[str, Any]]:
+        out = await self._call("list_active_tasks", limit=limit)
+        if not isinstance(out, list):
+            raise TypeError(f"TaskStateStore.list_active_tasks returned non-list: {type(out)}")
+        return out
+
+    async def async_list_expired_leases(
+        self,
+        *,
+        now: float | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        out = await self._call("list_expired_leases", now=now, limit=limit)
+        if not isinstance(out, list):
+            raise TypeError(f"TaskStateStore.list_expired_leases returned non-list: {type(out)}")
+        return out
+
+    async def _dict_call(self, method: str, **kwargs: Any) -> dict[str, Any]:
+        out = await self._call(method, **kwargs)
+        if not isinstance(out, dict):
+            raise TypeError(f"TaskStateStore.{method} returned non-dict: {type(out)}")
+        return out
+
+
+task_state_store = TaskStateStoreClient()
