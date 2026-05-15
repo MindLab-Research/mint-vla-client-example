@@ -86,6 +86,27 @@ class TaskStateFutureStore:
         await self._task_state.async_ensure_task(request_id=str(request_id), status="pending")
         return str(request_id)
 
+    async def async_create_model_work_with_id(
+        self,
+        request_id: str,
+        *,
+        op: str,
+        domain_key: str,
+        request_json: bytes,
+        meta: dict[str, Any] | None = None,
+        payload_hash: str | None = None,
+    ) -> str:
+        await self._task_state.async_ensure_task(
+            request_id=str(request_id),
+            op=str(op),
+            domain_key=str(domain_key),
+            request_json=bytes(request_json),
+            payload_hash=payload_hash,
+            metadata=dict(meta or {}),
+            status="pending",
+        )
+        return str(request_id)
+
     async def async_ensure_pending(self, request_id: str, meta: dict[str, Any] | None = None) -> dict[str, Any]:
         out = await self._task_state.async_ensure_task(
             request_id=str(request_id),

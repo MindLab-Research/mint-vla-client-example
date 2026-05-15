@@ -306,13 +306,34 @@ class TaskStateStore:
         ts = _now(now)
         with self._transaction() as conn:
             existing = conn.execute(
-                "SELECT payload_hash FROM tasks WHERE request_id = ?",
+                "SELECT * FROM tasks WHERE request_id = ?",
                 (str(request_id),),
             ).fetchone()
             if existing is not None:
                 existing_hash = existing["payload_hash"]
                 if payload_hash is not None and existing_hash not in (None, payload_hash):
                     raise TaskStateConflictError("duplicate request_id with different payload hash")
+                if str(existing["op"]) != str(op) or str(existing["domain_key"]) != str(domain_key):
+                    raise TaskStateConflictError("duplicate request_id with different task identity")
+                merged = {**_json_loads(existing["metadata_json"]), **dict(metadata or {})}
+                if existing_hash is None and payload_hash is not None:
+                    conn.execute(
+                        """
+                        UPDATE tasks
+                        SET request_json = ?, payload_hash = ?, metadata_json = ?, updated_at = ?
+                        WHERE request_id = ?
+                        """,
+                        (bytes(request_json), payload_hash, _json_dumps(merged), ts, str(request_id)),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE tasks
+                        SET request_json = ?, metadata_json = ?, updated_at = ?
+                        WHERE request_id = ?
+                        """,
+                        (bytes(request_json), _json_dumps(merged), ts, str(request_id)),
+                    )
                 return {"ok": True, "created": False, "record": self._row_to_record(self._get_row(conn, request_id))}
             conn.execute(
                 """

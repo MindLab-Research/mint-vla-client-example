@@ -306,6 +306,49 @@ def test_future_style_task_lifecycle_and_metadata_lookup() -> None:
         store.close()
 
 
+def test_create_task_is_idempotent_for_precreated_scheduler_task() -> None:
+    store = TaskStateStore.in_memory()
+    try:
+        precreated = store.ensure_task(
+            request_id="req-precreated",
+            op="sampling.asample",
+            domain_key="vllm:Qwen/Test",
+            request_json=b'{"prompt":"a"}',
+            metadata={"stage": "queued"},
+            status="queued",
+            now=100.0,
+        )
+        assert precreated["created"] is True
+
+        created = store.create_task(
+            request_id="req-precreated",
+            op="sampling.asample",
+            domain_key="vllm:Qwen/Test",
+            request_json=b'{"prompt":"b"}',
+            payload_hash="hash-1",
+            metadata={"model_work_scheduler": True},
+            now=101.0,
+        )
+
+        assert created["ok"] is True
+        assert created["created"] is False
+        assert created["record"]["status"] == "queued"
+        assert created["record"]["payload_hash"] == "hash-1"
+        assert created["record"]["request_json"] == b'{"prompt":"b"}'
+        assert created["record"]["metadata"]["stage"] == "queued"
+        assert created["record"]["metadata"]["model_work_scheduler"] is True
+
+        with pytest.raises(TaskStateConflictError):
+            store.create_task(
+                request_id="req-precreated",
+                op="sampling.compute_logprobs",
+                domain_key="vllm:Qwen/Test",
+                request_json=b"{}",
+            )
+    finally:
+        store.close()
+
+
 def test_finalize_failure_records_terminal_error() -> None:
     store = TaskStateStore.in_memory()
     try:

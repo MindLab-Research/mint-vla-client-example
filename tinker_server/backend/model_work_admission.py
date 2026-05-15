@@ -31,6 +31,7 @@ async def enqueue_model_work(
     assign: bool = True,
     assign_max_items: int | None = 1,
     create_future: bool = True,
+    payload_hash: str | None = None,
     future_store_client: Any | None = None,
     scheduler_client: Any | None = None,
     trace_enqueue: TraceEnqueue | None = None,
@@ -58,7 +59,18 @@ async def enqueue_model_work(
         scheduler = scheduler_client
     try:
         if create_future:
-            await store.async_create_with_id(request_id)
+            create_model_work = getattr(store, "async_create_model_work_with_id", None)
+            if callable(create_model_work):
+                await create_model_work(
+                    request_id,
+                    op=op,
+                    domain_key=str(domain_key),
+                    request_json=request_json,
+                    meta=enqueue_extra,
+                    payload_hash=payload_hash,
+                )
+            else:
+                await store.async_create_with_id(request_id)
             created = True
             await store.async_mark_queued(
                 request_id,
@@ -69,6 +81,7 @@ async def enqueue_model_work(
                     **dict(queued_meta),
                     "model_work_scheduler": True,
                     "domain_key": str(domain_key),
+                    "request_json_bytes": len(request_json),
                 },
             )
         append_coro = scheduler.append(
