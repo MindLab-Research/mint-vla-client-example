@@ -379,7 +379,9 @@ def _worker_visible_py_executable(path: str | None) -> str | None:
 def preferred_vllm_python_executable() -> str | None:
     explicit = _env_nonempty(os.environ, "MINT_VLLM_CHILD_PYTHON_EXECUTABLE")
     if explicit:
-        return explicit
+        if not Path(explicit).exists():
+            raise RuntimeError(f"MINT_VLLM_CHILD_PYTHON_EXECUTABLE does not exist: {explicit}")
+        return _worker_visible_py_executable(explicit)
     if PFS_TINKER_PATH:
         candidate = Path(PFS_TINKER_PATH) / "scripts" / "vllm_worker_python.py"
         if candidate.exists():
