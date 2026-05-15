@@ -6,8 +6,8 @@ Runtime configuration is split by when the value must be available:
 
 1. **Bootstrap runtime_env**: required before a Ray actor can import code or connect to Ray.
 2. **Actor creation inputs**: required by Ray at `.options(...).remote(...)` time.
-3. **ConfigActor snapshot**: low-frequency deployment/runtime config that actors can fetch after startup.
-4. **Observability config**: OTEL/APM/logging values. These can be recorded in the snapshot, but libraries that initialize from env still require explicit env forwarding until their initialization path is migrated.
+3. **ConfigActor actor_env**: namespace-local deployment/runtime config that actor processes hydrate from ConfigActor during import.
+4. **Observability config**: OTEL/APM/logging values. These are distributed through ConfigActor actor_env for actor hydration.
 5. **Task state**: task/lease/result state is not configuration. It belongs in TaskStateStore, Scheduler, or FutureStore.
 
 `ConfigActor` is a namespace-local detached actor. Namespace is the deployment isolation boundary, so the production actor name is stable inside the namespace and does not contain a run id.
@@ -19,7 +19,8 @@ Runtime configuration is split by when the value must be available:
 - Mutation: none. V1 has no `put`, no `set_many`, and no watch mechanism.
 - Startup behavior: the startup owner creates or attaches to the actor. If an existing actor has a different snapshot fingerprint, startup fails fast instead of silently using stale configuration.
 - Persistence: none inside ConfigActor. The API process rebuilds the read-only snapshot from env/config file on startup.
-- Secret handling: the V1 snapshot is for configuration discovery and future non-secret migration. Secret-like keys are redacted; do not use ConfigActor as a secret distribution service.
+- Actor hydration: normal Ray actors receive only bootstrap runtime_env plus `MINT_CONFIG_ACTOR_HYDRATE=1`. `tinker_server.config` fetches ConfigActor once on import and overlays `actor_env` into `os.environ` before module-level config constants are computed.
+- Secret handling: `env` and `server_config` remain redacted for introspection, but `actor_env` contains real values because it is the actor configuration distribution payload. Namespace access to ConfigActor is therefore a trust boundary.
 
 ## Bootstrap runtime_env
 
@@ -48,20 +49,16 @@ These cannot be fetched after actor startup because Ray needs them when creating
 
 The snapshot can include these for audit/debugging, but not as the source of truth for already-created actors.
 
-## Snapshot candidates
+## Actor Env
 
-Good ConfigActor candidates are low-frequency runtime settings currently passed through env only because there was no namespace-local config service:
+ConfigActor owns actor-readable deployment/runtime configuration. The API process builds `actor_env` from:
 
-- vLLM tuning knobs such as max sequences, batched tokens, LoRA slot counts, and request timing toggles;
-- model registry override JSON;
-- future replay paths and retrieve throttling policy;
-- scheduler fairness/coalesce/debug settings;
-- checkpoint index and usage backend settings;
-- Megatron runtime feature flags and diagnostics;
-- local payload/checkpoint roots.
+- known actor creation, snapshot, observability, and task-state configuration keys;
+- unclassified `MINT_`, `TINKER_`, and `OTEL_` keys, so newly added deployment knobs do not silently fall back to direct runtime_env forwarding;
+- canonical `MINT_*` actor name aliases when only legacy `TINKER_*` names are set.
 
-V1 only publishes them. Consumers should migrate incrementally in small PRs.
+`actor_env` deliberately excludes bootstrap runtime_env keys and ConfigActor hydration control flags. Per-actor identity or execution contract values may still be passed through `extra` at actor creation, because they are not deployment configuration.
 
 ## Observability
 
-OTEL and APM keys are included in the classification and may appear in the snapshot for introspection. They still need explicit env forwarding where OpenTelemetry or logging libraries read env during import or provider initialization.
+OTEL and APM keys are included in `actor_env`. Actor processes hydrate them before `tinker_server.config` module globals are evaluated, then actor initialization calls the normal observability setup path.

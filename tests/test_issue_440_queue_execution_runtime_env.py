@@ -7,9 +7,11 @@ from tinker_server import ray_utils as ray_utils_module
 
 
 def test_issue_440_queue_execution_runtime_propagates_mint_actor_and_routing_overrides(monkeypatch):
-    expected = {
+    actor_creation = {
         "MINT_API_WORK_QUEUE_ACTOR_NAME": "api-q",
         "MINT_CAPACITY_MANAGER_ACTOR_NAME": "cap-q",
+    }
+    snapshot_config = {
         "MINT_FUTURE_STORE_ACTOR_NAME": "future-q",
         "MINT_RESOURCE_POOL_ACTOR_NAME": "pool-q",
         "MINT_MODEL_PLACEMENT_JSON": '{"Qwen/Qwen3-0.6B":{"replica":0,"worker_index":2,"gpu_count":1}}',
@@ -19,13 +21,20 @@ def test_issue_440_queue_execution_runtime_propagates_mint_actor_and_routing_ove
         "MINT_SUPPORTED_MODELS": "Qwen/Qwen3-0.6B",
         "MINT_QUEUE_EXECUTION_RUNTIME_DEBUG_LOG_PATH": "/tmp/queue-runtime-debug.jsonl",
     }
+    expected = {**actor_creation, **snapshot_config}
     for key, value in expected.items():
         monkeypatch.setenv(key, value)
 
     out = runtime_module._runtime_env_overrides()
+    from tinker_server.runtime_config import actor_env_from_environ
 
-    for key, value in expected.items():
+    for key, value in actor_creation.items():
         assert out[key] == value
+    for key in snapshot_config:
+        assert key not in out
+    actor_env = actor_env_from_environ(__import__("os").environ)
+    for key, value in snapshot_config.items():
+        assert actor_env[key] == value
     assert "TINKER_RAY_NAMESPACE" not in out
     assert "MINT_RAY_NAMESPACE" not in out
 

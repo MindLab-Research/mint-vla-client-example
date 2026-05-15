@@ -17,6 +17,9 @@ from .runtime_env import (
     env_nonempty as _runtime_env_nonempty,
 )
 from .checkpoints import DEFAULT_RUNTIME_CHECKPOINTS_DIR
+from .config_hydration import hydrate_from_config_actor
+
+hydrate_from_config_actor()
 
 
 def _env_nonempty(environ: dict[str, str], name: str) -> str | None:
@@ -190,7 +193,12 @@ def _env_nonempty_any(environ: dict[str, str], *names: str) -> tuple[str | None,
     return None, None
 
 
-def actor_runtime_env_vars(*, pythonpath: str, extra: dict[str, str] | None = None) -> dict[str, str]:
+def actor_runtime_env_vars(
+    *,
+    pythonpath: str,
+    extra: dict[str, str] | None = None,
+    include_config_snapshot: bool = True,
+) -> dict[str, str]:
     if not PFS_RUNTIME_ENV_ROOT:
         raise RuntimeError("PFS_RUNTIME_ENV_ROOT is required")
     if not PFS_TINKER_PATH:
@@ -209,66 +217,22 @@ def actor_runtime_env_vars(*, pythonpath: str, extra: dict[str, str] | None = No
         "PFS_HF_MODULES_PATH": PFS_HF_MODULES_PATH,
         "RAY_ADDRESS": ray_address,
     }
+    config_actor_name = _env_nonempty(os.environ, "MINT_CONFIG_ACTOR_NAME")
+    if config_actor_name is not None:
+        out["MINT_CONFIG_ACTOR_NAME"] = config_actor_name
     config_path = _env_nonempty(os.environ, "TINKER_CONFIG_PATH")
     if config_path is not None:
         out["TINKER_CONFIG_PATH"] = config_path
     for key in (
-        "MINT_VLLM_CHILD_PYTHON_EXECUTABLE",
-        "MINT_VLLM_SERIALIZE_ADD_LORA_UNTIL_IDLE",
-        "MINT_VLLM_REQUEST_TIMING",
-        "MINT_VLLM_SKIP_PEFT_SHAPE_VALIDATION",
-        "MINT_VLLM_ENABLE_SLEEP_MODE",
-        "MINT_MODEL_CONFIG_OVERRIDES_JSON",
-        "TINKER_MODEL_CONFIG_OVERRIDES_JSON",
-        "MINT_VLLM_MAX_NUM_SEQS",
-        "MINT_VLLM_MAX_NUM_BATCHED_TOKENS",
-        "MINT_VLLM_MAX_LORAS",
-        "MINT_VLLM_MAX_CPU_LORAS",
-        "MINT_VLLM_MAX_LORA_RANK",
-        "MINT_MODEL_PLACEMENT_JSON",
-        "MINT_VLLM_MODEL_PLACEMENT_JSON",
-        "MINT_DENSE_MODEL_PLACEMENT_JSON",
-        "MINT_MEGATRON_MODEL_PLACEMENT_JSON",
-        "MINT_MEGATRON_NODE_IPS_CSV",
-        "MINT_CONTROL_PLANE_PINNED_NODE_IP",
-        "MINT_API_WORK_QUEUE_PINNED_NODE_IP",
-        "MINT_STARTUP_LEASE_PINNED_NODE_IP",
         "TINKER_ACTOR_LD_LIBRARY_PATH",
-        "MINT_SFT_DIAG_FAIL",
-        "MINT_REVERSE_KL_DIAG_FAIL",
-        "TINKER_DENSE_SESSION_STATE_ROOT",
-        "TINKER_RUNTIME_CHECKPOINT_DIR",
-        "TINKER_LEGACY_DENSE_SESSION_STATE_ROOTS",
-        "MINT_DETACHED_ACTOR_NODE_IP",
         "MINT_RAY_HEAD_ADDRESS_PATH",
         "MINT_RAY_CLIENT_ADDRESS",
         "RAY_CLIENT_ADDRESS",
         "MINT_RAY_NODE_IP_ADDRESS",
         "MINT_RAY_TEMP_DIR",
-        "TINKER_USAGE_LOG_DIR",
-        "TINKER_USAGE_BACKEND",
-        "TINKER_USAGE_PG_DSN",
-        "TINKER_CHECKPOINT_INDEX_PG_DSN",
-        "TINKER_CHECKPOINT_INDEX_WRITE_TIMEOUT_MS",
-        "TINKER_CHECKPOINT_INDEX_UPLOADING_STALE_S",
-        "MINT_CHECKPOINT_INDEX_PUBLISH_RETRY_S",
-        "MINT_FUTURE_STORE_ACTOR_NAME",
-        "MINT_GATEWAY_SESSION_STORE_ACTOR_NAME",
-        "MINT_SAMPLING_SESSION_STORE_ACTOR_NAME",
-        "MINT_TRAINING_SESSION_STORE_ACTOR_NAME",
-        "MINT_SESSION_HEARTBEAT_ACTOR_NAME",
-        "MINT_SESSION_INDEX_ACTOR_NAME",
-        "MINT_RESOURCE_POOL_ACTOR_NAME",
-        "MINT_TRAINING_CLEANUP_EXECUTOR_ACTOR_NAME",
-        "MINT_SAMPLING_CLEANUP_EXECUTOR_ACTOR_NAME",
-        "MINT_FUTURE_REPLAY_ROOT_DIR",
-        "MINT_FUTURE_REPLAY_SWEEPER_ACTOR_NAME",
-        "MINT_MODEL_WORK_SCHEDULER_ACTOR_NAME",
-        "MINT_MODEL_WORK_SCHEDULER_PINNED_NODE_IP",
-        "MINT_QUEUE_EXECUTION_RUNTIME_ACTOR_NAME",
-        "MINT_QUEUE_SUPERVISOR_ACTOR_NAME",
-        "MINT_STARTUP_LEASE_ACTOR_NAME",
-        "MINT_OWNER_RUNTIME_SUPERVISOR_ACTOR_NAME",
+        "MINT_RAY_JOB_WORKING_DIR",
+        "MINT_RAY_WORKING_DIR",
+        "MINT_RAY_PY_MODULES_CSV",
     ):
         value = _env_nonempty(os.environ, key)
         if value is not None:
@@ -276,15 +240,10 @@ def actor_runtime_env_vars(*, pythonpath: str, extra: dict[str, str] | None = No
     mint_ray_namespace = _env_nonempty(os.environ, "MINT_RAY_NAMESPACE")
     if mint_ray_namespace is not None:
         out["MINT_RAY_NAMESPACE"] = mint_ray_namespace
-    for primary, aliases in (
-        ("MINT_API_WORK_QUEUE_ACTOR_NAME", ("TINKER_API_WORK_QUEUE_ACTOR_NAME",)),
-        ("MINT_CAPACITY_MANAGER_ACTOR_NAME", ("TINKER_CAPACITY_MANAGER_ACTOR_NAME",)),
-    ):
-        value, _source = _env_nonempty_any(os.environ, primary, *aliases)
-        if value is not None:
-            out[primary] = value
     if extra:
         out.update(extra)
+    if include_config_snapshot:
+        out["MINT_CONFIG_ACTOR_HYDRATE"] = "1"
     return out
 
 def _runtime_env_value_is_uri(value: str) -> bool:
@@ -300,9 +259,18 @@ def _actor_runtime_env_allows_local_paths() -> bool:
     return True
 
 
-def actor_runtime_env(*, pythonpath: str, extra: dict[str, str] | None = None) -> dict[str, object]:
+def actor_runtime_env(
+    *,
+    pythonpath: str,
+    extra: dict[str, str] | None = None,
+    include_config_snapshot: bool = True,
+) -> dict[str, object]:
     runtime_env: dict[str, object] = {
-        "env_vars": actor_runtime_env_vars(pythonpath=pythonpath, extra=extra)
+        "env_vars": actor_runtime_env_vars(
+            pythonpath=pythonpath,
+            extra=extra,
+            include_config_snapshot=include_config_snapshot,
+        )
     }
     allow_local_paths = _actor_runtime_env_allows_local_paths()
     py_modules_csv = _env_nonempty(os.environ, "MINT_RAY_PY_MODULES_CSV")

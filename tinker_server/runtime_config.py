@@ -84,6 +84,8 @@ ACTOR_CREATION_INPUT_KEYS = frozenset(
         "TINKER_API_WORK_QUEUE_ACTOR_NAME",
         "MINT_CAPACITY_MANAGER_ACTOR_NAME",
         "TINKER_CAPACITY_MANAGER_ACTOR_NAME",
+        "MINT_MODEL_RUNTIME_POLL_INTERVAL_S",
+        "MINT_MODEL_RUNTIME_LEASE_TTL_S",
     }
 )
 
@@ -142,6 +144,157 @@ SNAPSHOT_CONFIG_ENV_KEYS = frozenset(
         "MINT_MEGATRON_MOE_DEEPEP_NUM_SMS",
         "MINT_NCCL_IB_DISABLE",
         "MINT_TIMING_DIAG",
+        "MINT_SUPPORTED_MODELS",
+        "TINKER_SUPPORTED_MODELS",
+        "TINKER_GATEWAY_CONFIG_JSON",
+        "MINT_MODEL_ACTOR_DESIRED_JSON",
+        "MINT_MODEL_RUNTIME_DESIRED_JSON",
+        "MINT_PERSISTENT_MODELS",
+        "MINT_API_WORK_QUEUE_ACTOR_MAX_CONCURRENCY",
+        "MINT_API_WORK_QUEUE_MAX_RESTARTS",
+        "MINT_API_WORK_QUEUE_DEBUG_MAX",
+        "MINT_API_WORK_QUEUE_SCHED_DEBUG_MAX",
+        "MINT_API_WORK_QUEUE_ETA_ALPHA",
+        "MINT_API_WORK_QUEUE_DEQUEUE_POLL_S",
+        "MINT_API_WORK_QUEUE_PROBE_TIMEOUT_S",
+        "MINT_API_WORK_QUEUE_FAIL_FAST_ON_PROBE_TIMEOUT",
+        "MINT_API_WORK_QUEUE_SNAPSHOT_HYDRATE_MIN_INTERVAL_S",
+        "MINT_API_WORK_QUEUE_ENQUEUE_TIMEOUT_S",
+        "MINT_API_WORK_QUEUE_START_TIMEOUT_S",
+        "MINT_API_WORK_QUEUE_METRICS_HYDRATE_STARTUP_RETRIES",
+        "MINT_API_WORK_QUEUE_METRICS_HYDRATE_RETRY_DELAY_S",
+        "MINT_QUEUE_EXECUTION_RUNTIME_START_TIMEOUT_S",
+        "MINT_QUEUE_EXECUTION_RUNTIME_LOCAL_ONLY",
+        "MINT_QUEUE_EXECUTION_RUNTIME_ACTOR_MAX_CONCURRENCY",
+        "MINT_QUEUE_EXECUTION_RUNTIME_WORKER_READY_TIMEOUT_S",
+        "MINT_QUEUE_SUPERVISOR_TTL_S",
+        "MINT_ACTOR_RECONCILE_INTERVAL_S",
+        "MINT_TRAINING_HEARTBEAT_STALE_S",
+        "MINT_RESOURCE_POOL_RSS_TTL_S",
+        "MINT_RESOURCE_POOL_OBSERVABILITY_TTL_S",
+        "MINT_RESOURCE_POOL_OBSERVABILITY_TIMEOUT_S",
+        "MINT_RESOURCE_POOL_OBSERVABILITY_REFRESH_CONCURRENCY",
+        "MINT_SESSION_HEARTBEAT_MAX_AGE_S",
+        "MINT_SESSION_HEARTBEAT_PRUNE_EVERY",
+        "MINT_FUTURE_STORE_SNAPSHOT_HYDRATE_MIN_INTERVAL_S",
+        "MINT_FUTURE_STORE_METRICS_HYDRATE_STARTUP_RETRIES",
+        "MINT_FUTURE_STORE_METRICS_HYDRATE_RETRY_DELAY_S",
+        "MINT_FUTURE_TTL_S",
+        "MINT_FUTURE_QUEUE_TTL_S",
+        "MINT_FUTURE_DONE_TTL_S",
+        "MINT_FUTURE_TOMBSTONE_TTL_S",
+        "MINT_FUTURE_REPLAY_HOT_TTL_S",
+        "MINT_FUTURE_REPLAY_DISK_TTL_S",
+        "MINT_FUTURE_REPLAY_SWEEP_INTERVAL_S",
+        "MINT_RETRIEVE_FUTURE_GRACE_S",
+        "TINKER_RETRIEVE_FUTURE_GRACE_S",
+        "MINT_RETRIEVE_FUTURE_MIN_POLL_S",
+        "TINKER_RETRIEVE_FUTURE_MIN_POLL_S",
+        "MINT_VLLM_ACTOR_MAX_CONCURRENCY",
+        "MINT_VLLM_OMP_NUM_THREADS",
+        "MINT_VLLM_MKL_NUM_THREADS",
+        "MINT_VLLM_OPENBLAS_NUM_THREADS",
+        "MINT_VLLM_NUMEXPR_NUM_THREADS",
+        "MINT_VLLM_VECLIB_MAXIMUM_THREADS",
+        "MINT_VLLM_BLIS_NUM_THREADS",
+        "MINT_VLLM_ENGINE_LOCK_MODE",
+        "MINT_VLLM_MULTISAMPLE_MODE",
+        "MINT_VLLM_GENERATE_TIMEOUT_S",
+        "MINT_VLLM_POST_GENERATE_DELAY_S",
+        "MINT_VLLM_IS_READY_TIMEOUT_S",
+        "MINT_VLLM_DISTRIBUTED_EXECUTOR_BACKEND",
+        "MINT_VLLM_LORA_DTYPE",
+        "MINT_VLLM_ALL2ALL_BACKEND",
+        "MINT_VLLM_SLOW_REQUEST_LOG_THRESHOLD_S",
+        "MINT_VLLM_RAY_GET_TIMEOUT_S",
+        "MINT_VLLM_ALLOW_INSECURE_SERIALIZATION",
+        "MINT_VLLM_LORA_DEBUG",
+        "MINT_VLLM_ENGINE_READY_WAIT_S",
+        "MINT_DENSE_INFLIGHT_WAIT_S",
+        "MINT_DENSE_ACTOR_INIT_TIMEOUT_S",
+        "MINT_OPENPI_XLA_FLAGS",
+        "MINT_OPENPI_RAY_ACTOR_READY_TIMEOUT_S",
+        "MINT_OPENPI_FAST_TOKENIZER_PATH",
+        "MINT_OPENPI_FAST_ACTION_SESSION_STATE_ROOT",
+        "MINT_OPENPI_FAST_DEBUG_TOKENS",
+        "MINT_OPENPI_FAST_ACTION_REQUEST_TIMEOUT_S",
+        "MINT_OPENPI_FAST_ACTION_PYTHON",
+        "MINT_OPENPI_FAST_ACTION_STARTUP_TIMEOUT_S",
+        "MINT_OPENPI_FAST_ACTION_CWD",
+        "MINT_OPENPI_FAST_WEIGHTS_PATH",
+        "MINT_OPENPI_FAST_RANDOM_INIT",
+        "MINT_OPENPI_PI05_WEIGHTS_PATH",
+        "MINT_OPENPI_PI05_RANDOM_INIT",
+        "MINT_OPENPI_FAST_PYTHONPATH",
+        "MINT_OPENPI_FAST_REQUEST_TIMEOUT_S",
+        "MINT_OPENPI_FAST_PYTHON",
+        "MINT_OPENPI_FAST_STARTUP_TIMEOUT_S",
+        "MINT_OPENPI_FAST_CREATE_SESSION_TIMEOUT_S",
+        "MINT_OPENPI_FAST_SAVE_TIMEOUT_S",
+        "MINT_OPENPI_FAST_LOAD_TIMEOUT_S",
+        "MINT_OPENPI_FAST_CWD",
+        "MINT_PERSISTENT_INFER_TIMEOUT_S",
+        "MINT_REVERSE_KL_VOCAB_BLOCK",
+        "MINT_MEGATRON_GUARD_PREFLIGHT",
+        "MINT_MEGATRON_GUARD_QUERY_TIMEOUT_S",
+        "MINT_WORKER_CUDA_SUMMARY_TIMEOUT_S",
+        "MINT_MEGATRON_STRICT_SAVE_META",
+        "MINT_MEGATRON_SKIP_CREATE_READY_WAIT",
+        "MINT_SAVE_LORA_TIMEOUT_S",
+        "MINT_SAVE_CHECKPOINT_TIMEOUT_S",
+        "MINT_LOAD_CHECKPOINT_TIMEOUT_S",
+        "MINT_DISABLE_EXTERNAL_LABEL",
+        "MINT_PPO_LOSS_DEBUG",
+        "MINT_VERL_DIAGNOSTICS",
+        "TINKER_LORA_EVICT_MIN_IDLE_S",
+        "MINT_STARTUP_RECONCILE_READY_TIMEOUT_S",
+        "MINT_MEGATRON_SESSIONS_BASE_PATH",
+        "MINT_TORCH_DIST_TIMEOUT_S",
+        "MINT_MEGATRON_ENFORCE_TRUSTED_PAIR",
+        "MINT_MEGATRON_SAVE_CHECKPOINT_TIMEOUT_S",
+        "MINT_MEGATRON_SAVE_LORA_TIMEOUT_S",
+        "MINT_MEGATRON_EVICT_PROTECTED",
+        "MINT_VOLC_BIN",
+        "TINKER_TP_SIZE",
+        "TINKER_DP_SIZE",
+        "TINKER_GPU_MEM_UTIL",
+        "TINKER_MAX_MODEL_LEN",
+        "TINKER_SESSION_INACTIVITY_TIMEOUT_S",
+        "TINKER_INACTIVITY_TIMEOUT_S",
+        "TINKER_ENABLE_MULTI_LORA",
+        "TINKER_MAX_LORAS",
+        "TINKER_MAX_CPU_LORAS",
+        "TINKER_MAX_LORA_RANK",
+        "TINKER_VLLM_ATTENTION_BACKEND",
+        "TINKER_MAX_INFLIGHT_SAMPLE_TASKS",
+        "TINKER_MAX_PENDING_ASAMPLE_PER_APIKEY",
+        "TINKER_MAX_CONCURRENT_SAMPLES_PER_REQUEST",
+        "TINKER_SAMPLE_COALESCE",
+        "TINKER_SAMPLE_COALESCE_WINDOW_MS",
+        "TINKER_SAMPLE_COALESCE_MAX_BATCH",
+        "TINKER_SAMPLE_COALESCE_MAX_SAMPLES",
+        "TINKER_SAMPLE_REQUIRE_SEQ_ID",
+        "MINT_MIN_ACTOR_AGE",
+        "MINT_SESSION_IDLE_TIMEOUT",
+        "TINKER_CAPACITY_QUEUE_BYTES_BUDGET",
+        "TINKER_API_WORK_QUEUE_NUM_WORKERS",
+        "TINKER_API_WORK_QUEUE_REAP_INTERVAL_S",
+        "MINT_TRAINING_INACTIVITY_TIMEOUT",
+        "TINKER_FORCE_GRAD_CHECKPOINTING",
+        "TINKER_ENABLE_SDP",
+        "MINT_MEGATRON_CREATE_TIMEOUT_S",
+        "MINT_DENSE_GET_OR_CREATE_TIMEOUT_S",
+        "MINT_REINIT_LORA_TIMEOUT_S",
+        "MINT_ACTOR_READY_TIMEOUT_S",
+        "MINT_TRAINING_REMOTE_CALL_TIMEOUT_S",
+        "MINT_ROUTER_REPLAY_MODE",
+        "MINT_PERSISTENT_TRAIN_LORA_RANK",
+        "MINT_PERSISTENT_TRAIN_LR",
+        "MINT_PERSISTENT_MEGATRON_READY_TIMEOUT_S",
+        "MINT_PERSISTENT_PREWARM_TRAINING",
+        "MINT_PERSISTENT_PREWARM_INFERENCE",
+        "MINT_DOC_PATH",
+        "TINKER_CHECKPOINT_DIR",
     }
 )
 
@@ -184,6 +337,17 @@ SECRET_MARKERS = (
 )
 SECRET_PARTS = frozenset({"TOKEN"})
 REDACTED_VALUE = "<redacted>"
+CONFIG_ACTOR_HYDRATION_CONTROL_KEYS = frozenset(
+    {
+        "MINT_CONFIG_ACTOR_HYDRATE",
+        "MINT_CONFIG_ACTOR_SELF",
+    }
+)
+CONFIG_ACTOR_HYDRATION_PREFIXES = ("MINT_", "TINKER_", "OTEL_")
+LEGACY_ACTOR_NAME_ALIASES = {
+    "MINT_API_WORK_QUEUE_ACTOR_NAME": "TINKER_API_WORK_QUEUE_ACTOR_NAME",
+    "MINT_CAPACITY_MANAGER_ACTOR_NAME": "TINKER_CAPACITY_MANAGER_ACTOR_NAME",
+}
 
 
 def config_actor_name(environ: Mapping[str, str] | None = None) -> str:
@@ -230,6 +394,29 @@ def _redact_server_config(raw: dict[str, object]) -> dict[str, object]:
     return {key: _redact_config_value(key, value) for key, value in raw.items()}
 
 
+def actor_env_from_environ(environ: Mapping[str, str]) -> dict[str, str]:
+    """Return non-bootstrap config that actors hydrate from ConfigActor."""
+    out: dict[str, str] = {}
+    for key, value in sorted(environ.items()):
+        if not value:
+            continue
+        if key in CONFIG_ACTOR_HYDRATION_CONTROL_KEYS:
+            continue
+        config_class = classify_env_key(key)
+        if config_class in {
+            CONFIG_CLASS_ACTOR_CREATION_INPUT,
+            CONFIG_CLASS_SNAPSHOT_CONFIG,
+            CONFIG_CLASS_OBSERVABILITY,
+            CONFIG_CLASS_TASK_STATE,
+        } or (config_class == CONFIG_CLASS_UNCLASSIFIED and key.startswith(CONFIG_ACTOR_HYDRATION_PREFIXES)):
+            out[key] = str(value)
+    for canonical, legacy in LEGACY_ACTOR_NAME_ALIASES.items():
+        if canonical not in out and legacy in out:
+            out[canonical] = out[legacy]
+        out.pop(legacy, None)
+    return out
+
+
 @dataclass(frozen=True)
 class ConfigSnapshot:
     schema_version: int
@@ -238,6 +425,7 @@ class ConfigSnapshot:
     actor_name: str
     config_path: str | None
     env: dict[str, dict[str, str]]
+    actor_env: dict[str, str]
     server_config: dict[str, object]
     fingerprint: str
 
@@ -276,6 +464,7 @@ def build_config_snapshot(
         "actor_name": str(actor),
         "config_path": cfg.config_path,
         "env": classify_env(environ),
+        "actor_env": actor_env_from_environ(environ),
         "server_config": _redact_server_config(asdict(cfg)),
         "fingerprint": "",
     }
@@ -287,6 +476,7 @@ def build_config_snapshot(
         actor_name=str(actor),
         config_path=cfg.config_path,
         env=snapshot_without_fingerprint["env"],  # type: ignore[arg-type]
+        actor_env=snapshot_without_fingerprint["actor_env"],  # type: ignore[arg-type]
         server_config=snapshot_without_fingerprint["server_config"],  # type: ignore[arg-type]
         fingerprint=fingerprint,
     )

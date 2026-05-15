@@ -225,15 +225,12 @@ def _get_or_create_ray_actor():
     }
 
     try:
-        created = _RayCapacityManagerActor.options(  # type: ignore[attr-defined]
+        return _RayCapacityManagerActor.options(  # type: ignore[attr-defined]
             **options
         ).remote(queue_bytes_budget=queue_bytes_budget)
-        ray.get(created.snapshot.remote(), timeout=1.0)
     except Exception:
         # Race: another request may have created the detached actor first.
         return ray.get_actor(actor_name, namespace=_ray_namespace())
-
-    return created
 
 
 class CapacityManager:
