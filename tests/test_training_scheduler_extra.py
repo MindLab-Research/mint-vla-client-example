@@ -20,7 +20,7 @@ def test_openpi_train_step_scheduler_extra_forces_session_rotation(monkeypatch):
     )
 
     assert extra["scheduler_enabled"] is True
-    assert extra["scheduler_domain"] == "openpi_fast:openpi/pi0-fast-libero-low-mem-finetune"
+    assert extra["scheduler_domain"] == "training:openpi/pi0-fast-libero-low-mem-finetune"
     assert extra["scheduler_session_key"] == "model-1"
     assert extra["scheduler_fairness"] == "rr"
     assert extra["scheduler_max_consecutive"] == 1
