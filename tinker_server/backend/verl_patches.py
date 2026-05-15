@@ -227,7 +227,14 @@ def _apply_external_label_patch():
 
     original_forward_step = MegatronEngineWithLMHead.forward_step
 
-    def patched_forward_step(self, batch_iter, model, postprocess_micro_batch_func):
+    def patched_forward_step(
+        self,
+        batch_iter,
+        model,
+        logits_processor_func=None,
+        postprocess_micro_batch_func=None,
+        **_kwargs,
+    ):
         """Patched forward_step that uses external labels when provided."""
         from functools import partial
         from tensordict import TensorDict
@@ -236,6 +243,9 @@ def _apply_external_label_patch():
         import verl.utils.torch_functional as verl_F
         from verl.utils.megatron.tensor_parallel import vocab_parallel_entropy
         from verl.utils.megatron.tensor_parallel import vocab_parallel_log_probs_from_logits
+
+        if postprocess_micro_batch_func is None:
+            raise TypeError("postprocess_micro_batch_func is required")
 
         batch: TensorDict = next(batch_iter)
         batch = batch.to(get_device_id())
