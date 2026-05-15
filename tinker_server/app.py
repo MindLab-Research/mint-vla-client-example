@@ -250,6 +250,7 @@ async def lifespan(app: FastAPI):
     clear_startup_degraded_state()
     clear_runtime_degraded_state()
     from .backend.future_store import future_store
+    from .backend.config_actor import async_ensure_started as async_ensure_config_actor_started
     from .backend.gateway_session_store import ensure_ready as ensure_gateway_session_store_ready
     from .backend.owner_runtime_supervisor import owner_runtime_supervisor
     from .backend.sampling_session_store import ensure_ready as ensure_sampling_session_store_ready
@@ -282,6 +283,7 @@ async def lifespan(app: FastAPI):
     if not await usage_store.health_check():
         raise RuntimeError("usage billing postgres health check failed")
     if startup_owner:
+        await async_ensure_config_actor_started()
         await future_store.async_ensure_started()
         ensure_gateway_session_store_ready()
         ensure_sampling_session_store_ready()
@@ -559,6 +561,7 @@ async def lifespan(app: FastAPI):
                         "Ray connection epoch advanced to %s; refreshing detached control-plane handles",
                         current_epoch,
                     )
+                    await async_ensure_config_actor_started()
                     await future_store.async_ensure_started()
                     ensure_gateway_session_store_ready()
                     ensure_sampling_session_store_ready()
