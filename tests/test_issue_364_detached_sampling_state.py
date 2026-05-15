@@ -529,6 +529,10 @@ async def test_issue_364_save_weights_for_sampler_persists_lora_int_id(
     async def _fake_save_weights_for_sampler(**_kwargs):
         return str(ckpt_dir)
 
+    async def _identity_materialize(session_arg):
+        return session_arg
+
+    monkeypatch.setattr(training_route, "_materialize_training_session_for_stateful_use", _identity_materialize)
     monkeypatch.setattr(
         training_route,
         "training_manager",
@@ -571,6 +575,10 @@ async def test_issue_364_save_weights_for_sampler_persists_lora_int_id(
         lambda **_kwargs: None,
     )
     monkeypatch.setattr(
+        "tinker_server.backend.session_index_store.add_heartbeat_sampler_to_session",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
         "tinker_server.backend.session_index_store.upsert_sampler_index",
         lambda _payload: None,
     )
@@ -583,8 +591,8 @@ async def test_issue_364_save_weights_for_sampler_persists_lora_int_id(
         prefer_tinker=True,
     )
 
-    assert registered["lora_loaded"] is True
-    assert registered["lora_int_id"] == 41
+    assert registered["lora_loaded"] is False
+    assert "lora_int_id" not in registered
     assert registered["adapter_path"] == str(ckpt_dir)
     assert resolved["request_id"] == "req-364-save-sampler"
     assert resolved["response"]["sampling_session_id"] is not None

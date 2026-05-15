@@ -15,6 +15,10 @@ def _import_training_route():
     return importlib.import_module("tinker_server.routes.training")
 
 
+async def _identity_materialize(session):
+    return session
+
+
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
@@ -28,6 +32,7 @@ async def test_issue_408_save_weights_for_sampler_registers_lazy_multilora_sessi
     from tinker_server.models.types import SaveWeightsForSamplerRequest
 
     tr = _import_training_route()
+    monkeypatch.setattr(tr, "_materialize_training_session_for_stateful_use", _identity_materialize)
 
     ckpt_dir = tmp_path / "sampler_ephemeral"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -63,6 +68,9 @@ async def test_issue_408_save_weights_for_sampler_registers_lazy_multilora_sessi
         resolved["request_id"] = request_id
         resolved["response"] = response
 
+    async def _async_resolve(request_id: str, response: dict) -> None:
+        _resolve(request_id, response)
+
     monkeypatch.setattr(
         tr,
         "training_manager",
@@ -88,13 +96,14 @@ async def test_issue_408_save_weights_for_sampler_registers_lazy_multilora_sessi
     monkeypatch.setattr(
         tr,
         "future_store",
-        SimpleNamespace(resolve=_resolve, async_fail=_async_fail),
+        SimpleNamespace(async_resolve=_async_resolve, async_fail=_async_fail),
     )
     monkeypatch.setattr(tr, "checkpoint_has_optimizer_state", lambda _path: False)
     monkeypatch.setattr(tr, "validate_sampler_checkpoint_for_sampling", lambda _path: None)
     monkeypatch.setattr(tr, "write_checkpoint_metadata", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(tr, "build_ephemeral_checkpoint_dir", lambda **_kwargs: str(ckpt_dir))
     monkeypatch.setattr(sis, "add_sampler_to_session", lambda **_kwargs: None)
+    monkeypatch.setattr(sis, "add_heartbeat_sampler_to_session", lambda **_kwargs: None)
     monkeypatch.setattr(sis, "upsert_sampler_index", lambda _payload: None)
 
     orig_create_task = tr.asyncio.create_task
@@ -148,6 +157,7 @@ async def test_issue_408_save_weights_for_sampler_reuses_pending_warm_task(
     from tinker_server.models.types import SaveWeightsForSamplerRequest
 
     tr = _import_training_route()
+    monkeypatch.setattr(tr, "_materialize_training_session_for_stateful_use", _identity_materialize)
 
     ckpt_dir = tmp_path / "sampler_ephemeral"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -178,6 +188,9 @@ async def test_issue_408_save_weights_for_sampler_reuses_pending_warm_task(
     def _resolve(request_id: str, response: dict) -> None:
         resolved.append((request_id, response))
 
+    async def _async_resolve(request_id: str, response: dict) -> None:
+        _resolve(request_id, response)
+
     inference_manager = _InferenceManagerStub()
     monkeypatch.setattr(
         tr,
@@ -204,13 +217,14 @@ async def test_issue_408_save_weights_for_sampler_reuses_pending_warm_task(
     monkeypatch.setattr(
         tr,
         "future_store",
-        SimpleNamespace(resolve=_resolve, async_fail=lambda *_args, **_kwargs: None),
+        SimpleNamespace(async_resolve=_async_resolve, async_fail=lambda *_args, **_kwargs: None),
     )
     monkeypatch.setattr(tr, "checkpoint_has_optimizer_state", lambda _path: False)
     monkeypatch.setattr(tr, "validate_sampler_checkpoint_for_sampling", lambda _path: None)
     monkeypatch.setattr(tr, "write_checkpoint_metadata", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(tr, "build_ephemeral_checkpoint_dir", lambda **_kwargs: str(ckpt_dir))
     monkeypatch.setattr(sis, "add_sampler_to_session", lambda **_kwargs: None)
+    monkeypatch.setattr(sis, "add_heartbeat_sampler_to_session", lambda **_kwargs: None)
     monkeypatch.setattr(sis, "upsert_sampler_index", lambda _payload: None)
 
     orig_create_task = tr.asyncio.create_task
@@ -255,6 +269,7 @@ async def test_issue_408_save_weights_for_sampler_fails_fast_on_immediate_engine
     from tinker_server.models.types import SaveWeightsForSamplerRequest
 
     tr = _import_training_route()
+    monkeypatch.setattr(tr, "_materialize_training_session_for_stateful_use", _identity_materialize)
 
     ckpt_dir = tmp_path / "sampler_ephemeral"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -269,6 +284,9 @@ async def test_issue_408_save_weights_for_sampler_fails_fast_on_immediate_engine
 
     async def _async_fail(request_id: str, error: str) -> None:
         failures.append((request_id, error))
+
+    async def _async_resolve(request_id: str, response: dict) -> None:
+        resolved.update(request_id=request_id, response=response)
 
     class _InferenceManagerStub:
         tensor_parallel_size = 1
@@ -309,10 +327,7 @@ async def test_issue_408_save_weights_for_sampler_fails_fast_on_immediate_engine
         tr,
         "future_store",
         SimpleNamespace(
-            resolve=lambda request_id, response: resolved.update(
-                request_id=request_id,
-                response=response,
-            ),
+            async_resolve=_async_resolve,
             async_fail=_async_fail,
         ),
     )
@@ -321,6 +336,7 @@ async def test_issue_408_save_weights_for_sampler_fails_fast_on_immediate_engine
     monkeypatch.setattr(tr, "write_checkpoint_metadata", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(tr, "build_ephemeral_checkpoint_dir", lambda **_kwargs: str(ckpt_dir))
     monkeypatch.setattr(sis, "add_sampler_to_session", lambda **_kwargs: None)
+    monkeypatch.setattr(sis, "add_heartbeat_sampler_to_session", lambda **_kwargs: None)
     monkeypatch.setattr(sis, "upsert_sampler_index", lambda _payload: None)
 
     request = SaveWeightsForSamplerRequest(model_id="run-408", seq_id=0)
@@ -345,6 +361,7 @@ async def test_issue_408_save_weights_for_sampler_fails_fast_on_async_warm_error
     from tinker_server.models.types import SaveWeightsForSamplerRequest
 
     tr = _import_training_route()
+    monkeypatch.setattr(tr, "_materialize_training_session_for_stateful_use", _identity_materialize)
 
     ckpt_dir = tmp_path / "sampler_ephemeral"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -359,6 +376,9 @@ async def test_issue_408_save_weights_for_sampler_fails_fast_on_async_warm_error
 
     async def _async_fail(request_id: str, error: str) -> None:
         failures.append((request_id, error))
+
+    async def _async_resolve(request_id: str, response: dict) -> None:
+        resolved.update(request_id=request_id, response=response)
 
     class _InferenceManagerStub:
         tensor_parallel_size = 1
@@ -400,10 +420,7 @@ async def test_issue_408_save_weights_for_sampler_fails_fast_on_async_warm_error
         tr,
         "future_store",
         SimpleNamespace(
-            resolve=lambda request_id, response: resolved.update(
-                request_id=request_id,
-                response=response,
-            ),
+            async_resolve=_async_resolve,
             async_fail=_async_fail,
         ),
     )
@@ -412,6 +429,7 @@ async def test_issue_408_save_weights_for_sampler_fails_fast_on_async_warm_error
     monkeypatch.setattr(tr, "write_checkpoint_metadata", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(tr, "build_ephemeral_checkpoint_dir", lambda **_kwargs: str(ckpt_dir))
     monkeypatch.setattr(sis, "add_sampler_to_session", lambda **_kwargs: None)
+    monkeypatch.setattr(sis, "add_heartbeat_sampler_to_session", lambda **_kwargs: None)
     monkeypatch.setattr(sis, "upsert_sampler_index", lambda _payload: None)
 
     request = SaveWeightsForSamplerRequest(model_id="run-408", seq_id=0)

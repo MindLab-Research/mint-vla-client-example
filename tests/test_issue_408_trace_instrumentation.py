@@ -76,6 +76,12 @@ async def test_issue_408_save_weights_for_sampler_emits_trace_spans(
         resolved["request_id"] = request_id
         resolved["response"] = response
 
+    async def _async_resolve(request_id: str, response: dict) -> None:
+        _resolve(request_id, response)
+
+    async def _async_fail(*_args, **_kwargs) -> None:
+        return None
+
     monkeypatch.setattr(
         tr,
         "training_manager",
@@ -101,13 +107,14 @@ async def test_issue_408_save_weights_for_sampler_emits_trace_spans(
     monkeypatch.setattr(
         tr,
         "future_store",
-        SimpleNamespace(resolve=_resolve, async_fail=lambda *_args, **_kwargs: None),
+        SimpleNamespace(async_resolve=_async_resolve, async_fail=_async_fail),
     )
     monkeypatch.setattr(tr, "checkpoint_has_optimizer_state", lambda _path: False)
     monkeypatch.setattr(tr, "validate_sampler_checkpoint_for_sampling", lambda _path: None)
     monkeypatch.setattr(tr, "write_checkpoint_metadata", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(tr, "build_ephemeral_checkpoint_dir", lambda **_kwargs: str(ckpt_dir))
     monkeypatch.setattr(sis, "add_sampler_to_session", lambda **_kwargs: None)
+    monkeypatch.setattr(sis, "add_heartbeat_sampler_to_session", lambda **_kwargs: None)
     monkeypatch.setattr(sis, "upsert_sampler_index", lambda _payload: None)
     monkeypatch.setattr(
         tr,
