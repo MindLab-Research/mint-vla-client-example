@@ -630,6 +630,82 @@ def test_build_runtime_env_inspect_cli_returns_nonzero_on_probe_failure(tmp_path
     assert snapshot["probe_results"]["does_not_exist_for_runtime_env_probe"]["ok"] is False
 
 
+def test_mint_runtime_build_root_uses_env_runtime_builds(tmp_path):
+    from scripts import build_runtime_env as build_runtime_env
+
+    out = build_runtime_env._mint_runtime_build_root(tmp_path / "mint", "prod", "build-1")
+
+    assert out == tmp_path / "mint" / "prod" / "runtime-builds" / "build-1"
+    assert build_runtime_env._mint_runtime_link(tmp_path / "mint", "dev") == tmp_path / "mint" / "dev" / "runtime"
+
+
+def test_promote_runtime_symlink_updates_link_atomically(tmp_path):
+    from scripts import build_runtime_env as build_runtime_env
+
+    runtime_root = tmp_path / "mint" / "prod" / "runtime-builds" / "build-1"
+    runtime_root.mkdir(parents=True)
+    (runtime_root / "manifest.json").write_text("{}", encoding="utf-8")
+    link = tmp_path / "mint" / "prod" / "runtime"
+
+    build_runtime_env._promote_runtime_symlink(runtime_root, link)
+
+    assert link.is_symlink()
+    assert link.resolve() == runtime_root.resolve()
+
+
+def test_copy_runtime_env_requires_fresh_destination(tmp_path):
+    from scripts import build_runtime_env as build_runtime_env
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "manifest.json").write_text("{}", encoding="utf-8")
+    (src / "payload.txt").write_text("ok", encoding="utf-8")
+    dst = tmp_path / "dst"
+
+    build_runtime_env.copy_runtime_env(src, dst)
+
+    assert (dst / "manifest.json").is_file()
+    assert (dst / "payload.txt").read_text(encoding="utf-8") == "ok"
+    with pytest.raises(RuntimeError, match="already exists"):
+        build_runtime_env.copy_runtime_env(src, dst)
+
+
+def test_mint_runtime_cli_copies_and_promotes(tmp_path, monkeypatch, capsys):
+    from scripts import build_runtime_env as build_runtime_env
+
+    src = tmp_path / "prod-source"
+    src.mkdir()
+    (src / "manifest.json").write_text("{}", encoding="utf-8")
+
+    rc = build_runtime_env.main(
+        [
+            "--mint-root",
+            str(tmp_path / "mint"),
+            "--mint-env",
+            "dev",
+            "--build-id",
+            "copy-1",
+            "--copy-from",
+            str(src),
+            "--promote",
+        ]
+    )
+
+    assert rc == 0
+    promoted = tmp_path / "mint" / "dev" / "runtime"
+    copied = tmp_path / "mint" / "dev" / "runtime-builds" / "copy-1"
+    assert promoted.resolve() == copied.resolve()
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"env_root": str(copied.resolve()), "promoted": True}
+
+
+def test_mint_runtime_cli_rejects_copy_without_mint_env():
+    from scripts import build_runtime_env as build_runtime_env
+
+    with pytest.raises(SystemExit):
+        build_runtime_env._parse_args(["--env-root", "/tmp/runtime", "--copy-from", "/tmp/src"])
+
+
 def test_runtime_env_layout_prefers_manifest_sources(tmp_path):
     env_root = tmp_path / "runtime"
     manifest = {
