@@ -2153,6 +2153,8 @@ class MegatronRankWorker:
 
             from tinker_server.backend.verl_patches import _enable_megatron_determinism
             _enable_megatron_determinism(seed=42)
+            if attention_backend != "flash":
+                _disable_te_flash_attention_backend()
 
             # Apply MLA patches for DeepseekV3/K2/Moonlight models BEFORE importing Megatron
             # These patches enable Flash Attention 2 with MLA by padding value tensors
