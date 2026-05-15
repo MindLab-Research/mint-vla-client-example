@@ -1,4 +1,3 @@
-import json
 from types import SimpleNamespace
 
 import anyio
@@ -13,10 +12,25 @@ from tinker_server.routes import service as service_route
 
 class _StubSamplingSessionManager:
     def is_multi_lora_session(self, _session_id: str) -> bool:
-        return False
+        return True
 
     def get_engine(self, _session_id: str):
         return object()
+
+    def get_session_base_model(self, _session_id: str):
+        return "Qwen/Qwen3-0.6B"
+
+    def get_session_lora_rank(self, _session_id: str):
+        return 0
+
+    def get_session_adapter_path(self, _session_id: str):
+        return None
+
+    def is_base_model_session(self, _session_id: str):
+        return True
+
+    def get_session_metadata_version(self, _session_id: str):
+        return 1
 
 
 class _StubFutureStore:
@@ -31,6 +45,12 @@ class _StubFutureStore:
 
     async def async_mark_queued(self, request_id: str, meta: dict | None = None) -> None:
         self.marked.append(request_id)
+        cur = self.pending.get(request_id) or {}
+        if meta is not None:
+            cur.update(dict(meta))
+        self.pending[request_id] = cur
+
+    async def async_update_meta(self, request_id: str, meta: dict | None = None) -> None:
         cur = self.pending.get(request_id) or {}
         if meta is not None:
             cur.update(dict(meta))
@@ -59,6 +79,18 @@ class _StubApiWorkQueue:
 
     async def enqueue(self, **kwargs):
         self.calls.append(dict(kwargs))
+
+
+class _StubModelWorkScheduler:
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    async def append(self, **kwargs):
+        self.calls.append(dict(kwargs))
+        return {"ok": True, "scheduler_instance_id": "scheduler-test"}
+
+    async def cancel_request(self, **_kwargs):
+        return {"ok": True}
 
 
 def _dummy_request(user_id: str | None = None):
@@ -121,20 +153,17 @@ def test_sample_request_rejects_seq_id_without_session_selector():
 )
 def test_asample_normalizes_direct_selector_before_enqueue(monkeypatch, selector_field: str, selector_value: str):
     stub_fs = _StubFutureStore()
-    stub_cap = _StubCapacityManager()
-    stub_q = _StubApiWorkQueue()
+    stub_scheduler = _StubModelWorkScheduler()
     created_sessions: list[tuple[str, str]] = []
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
     monkeypatch.setattr(sampling_route, "future_store", stub_fs)
 
-    import tinker_server.backend.capacity_manager as cm
-    import tinker_server.backend.api_work_queue as awq
-    import tinker_server.backend.result_size_estimator as rse
+    import tinker_server.backend.model_registry as model_registry
+    import tinker_server.backend.model_work_scheduler as mws
 
-    monkeypatch.setattr(cm, "capacity_manager", stub_cap)
-    monkeypatch.setattr(awq, "api_work_queue", stub_q)
-    monkeypatch.setattr(rse, "estimate_sampling_result_bytes", lambda _req: 0)
+    monkeypatch.setattr(model_registry, "get_model_config", lambda _model: SimpleNamespace(max_model_len=4096))
+    monkeypatch.setattr(mws, "model_work_scheduler", stub_scheduler)
 
     async def _ensure_sampling_session(*, model_path: str, http_request, parent_session_id: str | None = None):
         created_sessions.append((model_path, parent_session_id or ""))
@@ -153,12 +182,12 @@ def test_asample_normalizes_direct_selector_before_enqueue(monkeypatch, selector
 
     assert isinstance(out.request_id, str) and out.request_id
     assert created_sessions == [(selector_value, "")]
-    assert len(stub_q.calls) == 1
-    payload = json.loads(stub_q.calls[0]["request_json"].decode("utf-8"))
-    assert payload["sampling_session_id"] == "sess-created"
-    assert payload["model_id"] is None
-    assert payload["base_model"] is None
-    assert payload["model_path"] is None
+    assert len(stub_scheduler.calls) == 1
+    payload = SampleRequest.model_validate_json(stub_scheduler.calls[0]["request_json"])
+    assert payload.sampling_session_id == "sess-created"
+    assert payload.model_id is None
+    assert payload.base_model is None
+    assert payload.model_path is None
 
 
 def test_asample_keeps_seq_id_gate_for_existing_session_selector(monkeypatch):

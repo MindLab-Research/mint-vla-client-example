@@ -46,10 +46,25 @@ class _StubSessionManager:
 
 class _StubSamplingSessionManager:
     def is_multi_lora_session(self, _session_id: str) -> bool:
-        return False
+        return True
 
     def get_engine(self, _session_id: str):
         return object()
+
+    def get_session_base_model(self, _session_id: str):
+        return "Qwen/Qwen3-0.6B"
+
+    def get_session_lora_rank(self, _session_id: str):
+        return 8
+
+    def get_session_adapter_path(self, _session_id: str):
+        return None
+
+    def is_base_model_session(self, _session_id: str):
+        return False
+
+    def get_session_metadata_version(self, _session_id: str):
+        return 1
 
 
 class _StubFutureStore:
@@ -71,6 +86,12 @@ class _StubFutureStore:
 
     async def async_mark_queued(self, request_id: str, meta: dict | None = None) -> None:
         self.marked.append(request_id)
+        cur = self.pending.get(request_id) or {}
+        if meta is not None:
+            cur.update(dict(meta))
+        self.pending[request_id] = cur
+
+    async def async_update_meta(self, request_id: str, meta: dict | None = None) -> None:
         cur = self.pending.get(request_id) or {}
         if meta is not None:
             cur.update(dict(meta))
@@ -118,6 +139,18 @@ class _StubApiWorkQueue:
 
     async def enqueue(self, **kwargs):
         self.calls.append(dict(kwargs))
+
+
+class _StubModelWorkScheduler:
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    async def append(self, **kwargs):
+        self.calls.append(dict(kwargs))
+        return {"ok": True, "scheduler_instance_id": "scheduler-test"}
+
+    async def cancel_request(self, **_kwargs):
+        return {"ok": True}
 
 
 def _dummy_request(user_id: str | None = None):
@@ -280,19 +313,16 @@ def test_create_sampling_session_keeps_generic_samplers_out_of_heartbeat_fanout(
 
 def test_asample_deterministic_request_id_dedup(monkeypatch):
     stub_fs = _StubFutureStore()
-    stub_cap = _StubCapacityManager()
-    stub_q = _StubApiWorkQueue()
+    stub_scheduler = _StubModelWorkScheduler()
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
     monkeypatch.setattr(sampling_route, "future_store", stub_fs)
 
-    import tinker_server.backend.capacity_manager as cm
-    import tinker_server.backend.api_work_queue as awq
-    import tinker_server.backend.result_size_estimator as rse
+    import tinker_server.backend.model_registry as model_registry
+    import tinker_server.backend.model_work_scheduler as mws
 
-    monkeypatch.setattr(cm, "capacity_manager", stub_cap)
-    monkeypatch.setattr(awq, "api_work_queue", stub_q)
-    monkeypatch.setattr(rse, "estimate_sampling_result_bytes", lambda _req: 0)
+    monkeypatch.setattr(model_registry, "get_model_config", lambda _model: SimpleNamespace(max_model_len=4096))
+    monkeypatch.setattr(mws, "model_work_scheduler", stub_scheduler)
 
     req = SampleRequest(
         sampling_session_id="sess",
@@ -308,27 +338,26 @@ def test_asample_deterministic_request_id_dedup(monkeypatch):
     expected = sampling_route._deterministic_request_id("sess", 9)
     assert out1.request_id == expected
     assert out2.request_id == expected
-    assert stub_cap.reserved == [expected]
-    assert len(stub_q.calls) == 1
+    assert len(stub_scheduler.calls) == 1
+    assert stub_scheduler.calls[0]["request_id"] == expected
+    assert stub_scheduler.calls[0]["op"] == "sampling.asample"
+    assert stub_scheduler.calls[0]["domain_key"] == "vllm:Qwen/Qwen3-0.6B"
 
 
 def test_asample_sets_deterministic_request_id_in_logging_context_first(monkeypatch):
     stub_fs = _StubFutureStore()
-    stub_cap = _StubCapacityManager()
-    stub_q = _StubApiWorkQueue()
+    stub_scheduler = _StubModelWorkScheduler()
     request_id_bindings: list[str] = []
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
     monkeypatch.setattr(sampling_route, "future_store", stub_fs)
     monkeypatch.setattr(sampling_route, "set_request_id", lambda rid: request_id_bindings.append(rid))
 
-    import tinker_server.backend.capacity_manager as cm
-    import tinker_server.backend.api_work_queue as awq
-    import tinker_server.backend.result_size_estimator as rse
+    import tinker_server.backend.model_registry as model_registry
+    import tinker_server.backend.model_work_scheduler as mws
 
-    monkeypatch.setattr(cm, "capacity_manager", stub_cap)
-    monkeypatch.setattr(awq, "api_work_queue", stub_q)
-    monkeypatch.setattr(rse, "estimate_sampling_result_bytes", lambda _req: 0)
+    monkeypatch.setattr(model_registry, "get_model_config", lambda _model: SimpleNamespace(max_model_len=4096))
+    monkeypatch.setattr(mws, "model_work_scheduler", stub_scheduler)
 
     req = SampleRequest(
         sampling_session_id="sess",
@@ -346,19 +375,16 @@ def test_asample_sets_deterministic_request_id_in_logging_context_first(monkeypa
 
 def test_asample_duplicate_payload_conflict(monkeypatch):
     stub_fs = _StubFutureStore()
-    stub_cap = _StubCapacityManager()
-    stub_q = _StubApiWorkQueue()
+    stub_scheduler = _StubModelWorkScheduler()
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
     monkeypatch.setattr(sampling_route, "future_store", stub_fs)
 
-    import tinker_server.backend.capacity_manager as cm
-    import tinker_server.backend.api_work_queue as awq
-    import tinker_server.backend.result_size_estimator as rse
+    import tinker_server.backend.model_registry as model_registry
+    import tinker_server.backend.model_work_scheduler as mws
 
-    monkeypatch.setattr(cm, "capacity_manager", stub_cap)
-    monkeypatch.setattr(awq, "api_work_queue", stub_q)
-    monkeypatch.setattr(rse, "estimate_sampling_result_bytes", lambda _req: 0)
+    monkeypatch.setattr(model_registry, "get_model_config", lambda _model: SimpleNamespace(max_model_len=4096))
+    monkeypatch.setattr(mws, "model_work_scheduler", stub_scheduler)
 
     req1 = SampleRequest(
         sampling_session_id="sess",
@@ -386,19 +412,9 @@ def test_asample_duplicate_payload_conflict(monkeypatch):
 
 def test_asample_requires_seq_id_when_enabled(monkeypatch):
     stub_fs = _StubFutureStore()
-    stub_cap = _StubCapacityManager()
-    stub_q = _StubApiWorkQueue()
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
     monkeypatch.setattr(sampling_route, "future_store", stub_fs)
-
-    import tinker_server.backend.capacity_manager as cm
-    import tinker_server.backend.api_work_queue as awq
-    import tinker_server.backend.result_size_estimator as rse
-
-    monkeypatch.setattr(cm, "capacity_manager", stub_cap)
-    monkeypatch.setattr(awq, "api_work_queue", stub_q)
-    monkeypatch.setattr(rse, "estimate_sampling_result_bytes", lambda _req: 0)
     monkeypatch.setattr(sampling_route.server_config, "sampling_require_seq_id", True)
 
     req = SampleRequest(
