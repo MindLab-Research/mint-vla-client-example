@@ -15,8 +15,10 @@ import math
 import hashlib
 import socket
 import logging
+import sys
 import threading
 import time
+import types
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -69,6 +71,60 @@ def _get_torch():
     import torch
 
     return torch
+
+
+def _install_noop_tensorboard() -> None:
+    """Avoid importing TensorFlow through torch.utils.tensorboard in Megatron actors."""
+    if os.environ.get("MINT_MEGATRON_DISABLE_TENSORBOARD", "1").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    ):
+        return
+
+    if "torch.utils.tensorboard" in sys.modules:
+        return
+
+    class _NoOpSummaryWriter:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            self.close()
+            return False
+
+        def __getattr__(self, name):
+            def _noop(*args, **kwargs):
+                return None
+
+            return _noop
+
+        def flush(self):
+            return None
+
+        def close(self):
+            return None
+
+    tensorboard_mod = types.ModuleType("torch.utils.tensorboard")
+    writer_mod = types.ModuleType("torch.utils.tensorboard.writer")
+    tensorboard_mod.SummaryWriter = _NoOpSummaryWriter
+    tensorboard_mod.FileWriter = _NoOpSummaryWriter
+    writer_mod.SummaryWriter = _NoOpSummaryWriter
+    writer_mod.FileWriter = _NoOpSummaryWriter
+    sys.modules["torch.utils.tensorboard"] = tensorboard_mod
+    sys.modules["torch.utils.tensorboard.writer"] = writer_mod
+
+    try:
+        import torch.utils
+
+        torch.utils.tensorboard = tensorboard_mod
+    except Exception:
+        pass
 
 
 def _get_megatron_create_lock(actor_name: str) -> threading.Lock:
@@ -579,6 +635,7 @@ class MegatronRankWorker:
         simultaneously so they can reach init_process_group barrier together.
         """
         init_actor_observability()
+        _install_noop_tensorboard()
         self._startup_traceparent = traceparent
         self._startup_request_id = str(request_id or get_request_id() or "") or None
         self._bind_traceparent(traceparent)
@@ -6901,6 +6958,9 @@ class MegatronWorkerGroup:
             "env_vars": actor_runtime_env_vars(
                 pythonpath=PFS_PYTHONPATH,
                 extra={
+                "USE_TORCH": "1",
+                "USE_TF": "0",
+                "USE_FLAX": "0",
                 "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                 "HF_HUB_OFFLINE": "1",
                 "TRANSFORMERS_OFFLINE": "1",
@@ -10205,6 +10265,9 @@ def get_or_create_megatron_worker_group(
                 "env_vars": actor_runtime_env_vars(
                     pythonpath=PFS_PYTHONPATH,
                     extra={
+                    "USE_TORCH": "1",
+                    "USE_TF": "0",
+                    "USE_FLAX": "0",
                     "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                     "HF_HUB_OFFLINE": "1",
                     "TRANSFORMERS_OFFLINE": "1",
