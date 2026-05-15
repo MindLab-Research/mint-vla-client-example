@@ -7721,6 +7721,33 @@ class MegatronWorkerGroup:
                 f"session {session_id} blocked for {op}: strict trusted-pair enforcement requires both markers"
             )
 
+    def _has_stale_trusted_pair_marker(self, session_id: str) -> bool:
+        session_manager = getattr(self, "_session_manager", None)
+        if session_manager is None:
+            return False
+        get_external_checkpoint = getattr(session_manager, "get_external_checkpoint", None)
+        get_recovery_baseline = getattr(session_manager, "get_trusted_recovery_baseline", None)
+        external = get_external_checkpoint(session_id) if callable(get_external_checkpoint) else None
+        baseline = get_recovery_baseline(session_id) if callable(get_recovery_baseline) else None
+        return (
+            isinstance(external, dict)
+            and not bool(external.get("is_fresh", False))
+        ) or (
+            isinstance(baseline, dict)
+            and not bool(baseline.get("is_fresh", False))
+        )
+
+    def _can_restore_session_before_stale_pair_check(self, session_id: str) -> bool:
+        if getattr(self, "_session_unknown_due_to_partial_swap", False):
+            return False
+        if getattr(self, "_current_session", None) == session_id:
+            return bool(self._session_state_cached_on_workers(session_id))
+        session_manager = getattr(self, "_session_manager", None)
+        if session_manager is None:
+            return False
+        session_exists = getattr(session_manager, "session_exists", None)
+        return bool(callable(session_exists) and session_exists(session_id))
+
     def _invalidate_session_durability(
         self,
         session_id: str | None,
@@ -7780,7 +7807,12 @@ class MegatronWorkerGroup:
         """Resolve and restore session state for forward/backward/step style requests."""
         effective_session_id = self._resolve_required_session_id(session_id, op=op)
         self._assert_session_request_allowed(effective_session_id, op=op)
-        self._validate_trusted_pair_for_request(effective_session_id, op=op)
+        validate_after_restore = (
+            self._has_stale_trusted_pair_marker(effective_session_id)
+            and self._can_restore_session_before_stale_pair_check(effective_session_id)
+        )
+        if not validate_after_restore:
+            self._validate_trusted_pair_for_request(effective_session_id, op=op)
         try:
             switch_stats = self._ensure_session_loaded(
                 effective_session_id,
@@ -7796,6 +7828,8 @@ class MegatronWorkerGroup:
                 reason=f"{op}:ensure_session_loaded:{type(e).__name__}",
             )
             raise
+        if validate_after_restore:
+            self._validate_trusted_pair_for_request(effective_session_id, op=op)
         if not isinstance(switch_stats, dict):
             switch_stats = dict(getattr(self, "_last_session_switch_stats", None) or {})
         return effective_session_id, switch_stats
