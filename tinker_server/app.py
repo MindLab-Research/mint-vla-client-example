@@ -896,24 +896,29 @@ async def api_key_auth_middleware(request: Request, call_next):
 
         # Legacy auth disabled => dev mode pass-through with explicit write caps.
         if not config.auth_enabled:
-            request.state.user_data = {
-                "user_id": "000000000000000000000001",
-                "user_role": "admin",
-                "is_admin": True,
-                "account_id": "000000000000000000000001",
-                "apikey_id": "000000000000000000000002",
-                "cap_write": True,
-                "cap_view_internal_errors": True,
-                "cap_bypass_ownership": True,
-                "cap_manage_system": True,
-                "caps_from_headers": True,
-            }
+            existing_user_data = getattr(request.state, "user_data", None)
+            if not isinstance(existing_user_data, dict):
+                request.state.user_data = {
+                    "user_id": "000000000000000000000001",
+                    "user_role": "admin",
+                    "is_admin": True,
+                    "account_id": "000000000000000000000001",
+                    "apikey_id": "000000000000000000000002",
+                    "cap_write": True,
+                    "cap_view_internal_errors": True,
+                    "cap_bypass_ownership": True,
+                    "cap_manage_system": True,
+                    "caps_from_headers": True,
+                }
+            obs = get_request_observability_context(request)
             with bind_request_trace_context(
                 trace_id=trace_id,
-                user_id="000000000000000000000001",
-                user_role="admin",
-                account_id="000000000000000000000001",
-                apikey_id="000000000000000000000002",
+                user_id=obs.get("user_id"),
+                user_role=obs.get("user_role"),
+                account_id=obs.get("account_id"),
+                apikey_id=obs.get("apikey_id"),
+                gateway_request_id=obs.get("gateway_request_id"),
+                gateway_session_id=obs.get("gateway_session_id"),
             ):
                 return await _next_with_trace()
 
