@@ -52,6 +52,30 @@ def _materialize_runtime_env_with_real_host_python(root: Path) -> None:
     host_python.symlink_to(Path(sys.executable))
 
 
+def _load_actor_runtime_env_payload(env: dict[str, str]) -> dict[str, dict[str, str]]:
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json, os; "
+                "from tinker_server.config import actor_runtime_env_vars; "
+                "from tinker_server.runtime_config import actor_env_from_environ; "
+                "print(json.dumps({"
+                "'runtime_env': actor_runtime_env_vars(pythonpath='X'), "
+                "'actor_env': actor_env_from_environ(os.environ)"
+                "}))"
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    return json.loads(out.stdout)
+
+
 def test_build_runtime_pythonpath_uses_canonical_root(tmp_path):
     env_root = tmp_path / "runtime"
     _materialize_runtime_env(env_root)
@@ -956,21 +980,8 @@ def test_set_exact_pythonpath_removes_local_checkout_masking(monkeypatch):
 def test_actor_runtime_env_vars_forwards_control_plane_pin_envs(tmp_path):
     env_root = tmp_path / "runtime"
     _materialize_runtime_env(env_root)
-    out = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import json; "
-                "from tinker_server.config import actor_runtime_env_vars; "
-                "print(json.dumps(actor_runtime_env_vars(pythonpath='X')))"
-            ),
-        ],
-        cwd=Path(__file__).resolve().parents[1],
-        check=True,
-        capture_output=True,
-        text=True,
-        env={
+    payload = _load_actor_runtime_env_payload(
+        {
             "PFS_RUNTIME_ENV_ROOT": str(env_root),
             "PFS_TINKER_PATH": str(tmp_path / 'repo'),
             "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
@@ -980,30 +991,20 @@ def test_actor_runtime_env_vars_forwards_control_plane_pin_envs(tmp_path):
             "MINT_STARTUP_LEASE_PINNED_NODE_IP": "192.168.38.176",
         },
     )
-    data = json.loads(out.stdout)
-    assert data["MINT_CONTROL_PLANE_PINNED_NODE_IP"] == "192.168.38.176"
-    assert data["MINT_API_WORK_QUEUE_PINNED_NODE_IP"] == "192.168.38.176"
-    assert data["MINT_STARTUP_LEASE_PINNED_NODE_IP"] == "192.168.38.176"
+    data = payload["runtime_env"]
+    actor_env = payload["actor_env"]
+    assert data["MINT_CONFIG_ACTOR_HYDRATE"] == "1"
+    assert "MINT_CONTROL_PLANE_PINNED_NODE_IP" not in data
+    assert actor_env["MINT_CONTROL_PLANE_PINNED_NODE_IP"] == "192.168.38.176"
+    assert actor_env["MINT_API_WORK_QUEUE_PINNED_NODE_IP"] == "192.168.38.176"
+    assert actor_env["MINT_STARTUP_LEASE_PINNED_NODE_IP"] == "192.168.38.176"
 
 
 def test_actor_runtime_env_vars_forwards_vllm_envs(tmp_path):
     env_root = tmp_path / "runtime"
     _materialize_runtime_env(env_root)
-    out = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import json; "
-                "from tinker_server.config import actor_runtime_env_vars; "
-                "print(json.dumps(actor_runtime_env_vars(pythonpath='X')))"
-            ),
-        ],
-        cwd=Path(__file__).resolve().parents[1],
-        check=True,
-        capture_output=True,
-        text=True,
-        env={
+    payload = _load_actor_runtime_env_payload(
+        {
             "PFS_RUNTIME_ENV_ROOT": str(env_root),
             "PFS_TINKER_PATH": str(tmp_path / 'repo'),
             "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
@@ -1021,18 +1022,21 @@ def test_actor_runtime_env_vars_forwards_vllm_envs(tmp_path):
             "MINT_MEGATRON_MODEL_PLACEMENT_JSON": '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"worker_index":1,"gpu_count":4}}',
         },
     )
-    data = json.loads(out.stdout)
-    assert data["MINT_VLLM_SERIALIZE_ADD_LORA_UNTIL_IDLE"] == "1"
-    assert data["MINT_VLLM_REQUEST_TIMING"] == "0"
-    assert data["MINT_VLLM_ENABLE_SLEEP_MODE"] == "1"
-    assert data["MINT_MODEL_CONFIG_OVERRIDES_JSON"] == '{"Qwen/Qwen3-0.6B":{"gpu_memory_utilization":0.75}}'
-    assert data["MINT_VLLM_MAX_NUM_SEQS"] == "32"
-    assert data["MINT_VLLM_MAX_NUM_BATCHED_TOKENS"] == "2048"
-    assert data["MINT_VLLM_MAX_LORAS"] == "4"
-    assert data["MINT_VLLM_MAX_CPU_LORAS"] == "8"
-    assert data["MINT_VLLM_MAX_LORA_RANK"] == "16"
-    assert data["MINT_MODEL_PLACEMENT_JSON"] == '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"worker_index":1,"gpu_count":4}}'
-    assert data["MINT_MEGATRON_MODEL_PLACEMENT_JSON"] == '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"worker_index":1,"gpu_count":4}}'
+    data = payload["runtime_env"]
+    actor_env = payload["actor_env"]
+    assert data["MINT_CONFIG_ACTOR_HYDRATE"] == "1"
+    assert "MINT_VLLM_MAX_NUM_SEQS" not in data
+    assert actor_env["MINT_VLLM_SERIALIZE_ADD_LORA_UNTIL_IDLE"] == "1"
+    assert actor_env["MINT_VLLM_REQUEST_TIMING"] == "0"
+    assert actor_env["MINT_VLLM_ENABLE_SLEEP_MODE"] == "1"
+    assert actor_env["MINT_MODEL_CONFIG_OVERRIDES_JSON"] == '{"Qwen/Qwen3-0.6B":{"gpu_memory_utilization":0.75}}'
+    assert actor_env["MINT_VLLM_MAX_NUM_SEQS"] == "32"
+    assert actor_env["MINT_VLLM_MAX_NUM_BATCHED_TOKENS"] == "2048"
+    assert actor_env["MINT_VLLM_MAX_LORAS"] == "4"
+    assert actor_env["MINT_VLLM_MAX_CPU_LORAS"] == "8"
+    assert actor_env["MINT_VLLM_MAX_LORA_RANK"] == "16"
+    assert actor_env["MINT_MODEL_PLACEMENT_JSON"] == '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"worker_index":1,"gpu_count":4}}'
+    assert actor_env["MINT_MEGATRON_MODEL_PLACEMENT_JSON"] == '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"worker_index":1,"gpu_count":4}}'
 
 
 def test_actor_runtime_env_vars_forwards_config_path(tmp_path):
@@ -1054,21 +1058,8 @@ def test_actor_runtime_env_vars_forwards_config_path(tmp_path):
         + "\n",
         encoding="utf-8",
     )
-    out = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import json; "
-                "from tinker_server.config import actor_runtime_env_vars; "
-                "print(json.dumps(actor_runtime_env_vars(pythonpath='X')))"
-            ),
-        ],
-        cwd=Path(__file__).resolve().parents[1],
-        check=True,
-        capture_output=True,
-        text=True,
-        env={
+    payload = _load_actor_runtime_env_payload(
+        {
             "PFS_RUNTIME_ENV_ROOT": str(env_root),
             "PFS_TINKER_PATH": str(tmp_path / 'repo'),
             "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
@@ -1079,13 +1070,14 @@ def test_actor_runtime_env_vars_forwards_config_path(tmp_path):
             "MINT_CAPACITY_MANAGER_ACTOR_NAME": "issue440-capacity-manager",
         },
     )
-    data = json.loads(out.stdout)
+    data = payload["runtime_env"]
+    actor_env = payload["actor_env"]
     assert data["RAY_ADDRESS"] == "ray://cfg-test"
     assert data["TINKER_CONFIG_PATH"] == str(cfg)
     assert data["TINKER_RAY_NAMESPACE"] == "cfg_ns"
-    assert data["MINT_DETACHED_ACTOR_NODE_IP"] == "192.168.38.175"
-    assert data["MINT_API_WORK_QUEUE_ACTOR_NAME"] == "issue440-api-work-queue"
-    assert data["MINT_CAPACITY_MANAGER_ACTOR_NAME"] == "issue440-capacity-manager"
+    assert actor_env["MINT_DETACHED_ACTOR_NODE_IP"] == "192.168.38.175"
+    assert actor_env["MINT_API_WORK_QUEUE_ACTOR_NAME"] == "issue440-api-work-queue"
+    assert actor_env["MINT_CAPACITY_MANAGER_ACTOR_NAME"] == "issue440-capacity-manager"
 
 
 def test_server_config_prefers_mint_actor_names_and_accepts_legacy_tinker_aliases():
@@ -1146,21 +1138,8 @@ def test_actor_runtime_env_vars_requires_ray_address(tmp_path):
 def test_actor_runtime_env_vars_canonicalize_legacy_tinker_actor_aliases(tmp_path):
     env_root = tmp_path / "runtime"
     _materialize_runtime_env(env_root)
-    out = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import json; "
-                "from tinker_server.config import actor_runtime_env_vars; "
-                "print(json.dumps(actor_runtime_env_vars(pythonpath='X')))"
-            ),
-        ],
-        cwd=Path(__file__).resolve().parents[1],
-        check=True,
-        capture_output=True,
-        text=True,
-        env={
+    payload = _load_actor_runtime_env_payload(
+        {
             "PFS_RUNTIME_ENV_ROOT": str(env_root),
             "PFS_TINKER_PATH": str(tmp_path / 'repo'),
             "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
@@ -1169,31 +1148,20 @@ def test_actor_runtime_env_vars_canonicalize_legacy_tinker_actor_aliases(tmp_pat
             "TINKER_CAPACITY_MANAGER_ACTOR_NAME": "legacy-capacity-manager",
         },
     )
-    data = json.loads(out.stdout)
-    assert data["MINT_API_WORK_QUEUE_ACTOR_NAME"] == "legacy-api-work-queue"
-    assert data["MINT_CAPACITY_MANAGER_ACTOR_NAME"] == "legacy-capacity-manager"
+    data = payload["runtime_env"]
+    actor_env = payload["actor_env"]
     assert "TINKER_API_WORK_QUEUE_ACTOR_NAME" not in data
-    assert "TINKER_CAPACITY_MANAGER_ACTOR_NAME" not in data
+    assert actor_env["MINT_API_WORK_QUEUE_ACTOR_NAME"] == "legacy-api-work-queue"
+    assert actor_env["MINT_CAPACITY_MANAGER_ACTOR_NAME"] == "legacy-capacity-manager"
+    assert "TINKER_API_WORK_QUEUE_ACTOR_NAME" not in actor_env
+    assert "TINKER_CAPACITY_MANAGER_ACTOR_NAME" not in actor_env
 
 
 def test_actor_runtime_env_vars_forwards_control_plane_actor_names(tmp_path):
     env_root = tmp_path / "runtime"
     _materialize_runtime_env(env_root)
-    out = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import json; "
-                "from tinker_server.config import actor_runtime_env_vars; "
-                "print(json.dumps(actor_runtime_env_vars(pythonpath='X')))"
-            ),
-        ],
-        cwd=Path(__file__).resolve().parents[1],
-        check=True,
-        capture_output=True,
-        text=True,
-        env={
+    payload = _load_actor_runtime_env_payload(
+        {
             "PFS_RUNTIME_ENV_ROOT": str(env_root),
             "PFS_TINKER_PATH": str(tmp_path / 'repo'),
             "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
@@ -1219,46 +1187,34 @@ def test_actor_runtime_env_vars_forwards_control_plane_actor_names(tmp_path):
             "MINT_OWNER_RUNTIME_SUPERVISOR_ACTOR_NAME": "mint-owner-runtime-test",
         },
     )
-    data = json.loads(out.stdout)
+    data = payload["runtime_env"]
+    actor_env = payload["actor_env"]
     assert data["TINKER_RAY_NAMESPACE"] == "mint-test-ns"
     assert data["MINT_RAY_NAMESPACE"] == "mint-test-ns"
-    assert data["MINT_FUTURE_STORE_ACTOR_NAME"] == "mint-future-store-test"
-    assert data["MINT_GATEWAY_SESSION_STORE_ACTOR_NAME"] == "mint-gateway-session-store-test"
-    assert data["MINT_SAMPLING_SESSION_STORE_ACTOR_NAME"] == "mint-sampling-session-store-test"
-    assert data["MINT_TRAINING_SESSION_STORE_ACTOR_NAME"] == "mint-training-session-store-test"
-    assert data["MINT_SESSION_HEARTBEAT_ACTOR_NAME"] == "mint-session-heartbeat-test"
-    assert data["MINT_SESSION_INDEX_ACTOR_NAME"] == "mint-session-index-test"
-    assert data["MINT_RESOURCE_POOL_ACTOR_NAME"] == "mint-resource-pool-test"
-    assert data["MINT_TRAINING_CLEANUP_EXECUTOR_ACTOR_NAME"] == "mint-training-cleanup-test"
-    assert data["MINT_SAMPLING_CLEANUP_EXECUTOR_ACTOR_NAME"] == "mint-sampling-cleanup-test"
-    assert data["MINT_FUTURE_REPLAY_ROOT_DIR"] == "/tmp/future-replay-test"
-    assert data["MINT_FUTURE_REPLAY_SWEEPER_ACTOR_NAME"] == "mint-future-replay-sweeper-test"
-    assert data["MINT_MODEL_WORK_SCHEDULER_ACTOR_NAME"] == "mint-model-work-scheduler-test"
-    assert data["MINT_MODEL_WORK_SCHEDULER_PINNED_NODE_IP"] == "192.168.39.110"
-    assert data["MINT_QUEUE_EXECUTION_RUNTIME_ACTOR_NAME"] == "mint-queue-runtime-test"
-    assert data["MINT_QUEUE_SUPERVISOR_ACTOR_NAME"] == "mint-queue-supervisor-test"
-    assert data["MINT_STARTUP_LEASE_ACTOR_NAME"] == "mint-startup-lease-test"
-    assert data["MINT_OWNER_RUNTIME_SUPERVISOR_ACTOR_NAME"] == "mint-owner-runtime-test"
+    assert actor_env["MINT_FUTURE_STORE_ACTOR_NAME"] == "mint-future-store-test"
+    assert actor_env["MINT_GATEWAY_SESSION_STORE_ACTOR_NAME"] == "mint-gateway-session-store-test"
+    assert actor_env["MINT_SAMPLING_SESSION_STORE_ACTOR_NAME"] == "mint-sampling-session-store-test"
+    assert actor_env["MINT_TRAINING_SESSION_STORE_ACTOR_NAME"] == "mint-training-session-store-test"
+    assert actor_env["MINT_SESSION_HEARTBEAT_ACTOR_NAME"] == "mint-session-heartbeat-test"
+    assert actor_env["MINT_SESSION_INDEX_ACTOR_NAME"] == "mint-session-index-test"
+    assert actor_env["MINT_RESOURCE_POOL_ACTOR_NAME"] == "mint-resource-pool-test"
+    assert actor_env["MINT_TRAINING_CLEANUP_EXECUTOR_ACTOR_NAME"] == "mint-training-cleanup-test"
+    assert actor_env["MINT_SAMPLING_CLEANUP_EXECUTOR_ACTOR_NAME"] == "mint-sampling-cleanup-test"
+    assert actor_env["MINT_FUTURE_REPLAY_ROOT_DIR"] == "/tmp/future-replay-test"
+    assert actor_env["MINT_FUTURE_REPLAY_SWEEPER_ACTOR_NAME"] == "mint-future-replay-sweeper-test"
+    assert actor_env["MINT_MODEL_WORK_SCHEDULER_ACTOR_NAME"] == "mint-model-work-scheduler-test"
+    assert actor_env["MINT_MODEL_WORK_SCHEDULER_PINNED_NODE_IP"] == "192.168.39.110"
+    assert actor_env["MINT_QUEUE_EXECUTION_RUNTIME_ACTOR_NAME"] == "mint-queue-runtime-test"
+    assert actor_env["MINT_QUEUE_SUPERVISOR_ACTOR_NAME"] == "mint-queue-supervisor-test"
+    assert actor_env["MINT_STARTUP_LEASE_ACTOR_NAME"] == "mint-startup-lease-test"
+    assert actor_env["MINT_OWNER_RUNTIME_SUPERVISOR_ACTOR_NAME"] == "mint-owner-runtime-test"
 
 
 def test_actor_runtime_env_vars_forwards_usage_envs(tmp_path):
     env_root = tmp_path / "runtime"
     _materialize_runtime_env(env_root)
-    out = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import json; "
-                "from tinker_server.config import actor_runtime_env_vars; "
-                "print(json.dumps(actor_runtime_env_vars(pythonpath='X')))"
-            ),
-        ],
-        cwd=Path(__file__).resolve().parents[1],
-        check=True,
-        capture_output=True,
-        text=True,
-        env={
+    payload = _load_actor_runtime_env_payload(
+        {
             "PFS_RUNTIME_ENV_ROOT": str(env_root),
             "PFS_TINKER_PATH": str(tmp_path / 'repo'),
             "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
@@ -1268,10 +1224,12 @@ def test_actor_runtime_env_vars_forwards_usage_envs(tmp_path):
             "TINKER_USAGE_PG_DSN": "postgresql://mint:test@db/usage",
         },
     )
-    data = json.loads(out.stdout)
-    assert data["TINKER_USAGE_LOG_DIR"] == "/vePFS/shared/usage"
-    assert data["TINKER_USAGE_BACKEND"] == "postgres"
-    assert data["TINKER_USAGE_PG_DSN"] == "postgresql://mint:test@db/usage"
+    data = payload["runtime_env"]
+    actor_env = payload["actor_env"]
+    assert "TINKER_USAGE_LOG_DIR" not in data
+    assert actor_env["TINKER_USAGE_LOG_DIR"] == "/vePFS/shared/usage"
+    assert actor_env["TINKER_USAGE_BACKEND"] == "postgres"
+    assert actor_env["TINKER_USAGE_PG_DSN"] == "postgresql://mint:test@db/usage"
 
 
 def test_actor_runtime_env_vars_forwards_ray_attach_hints(tmp_path):

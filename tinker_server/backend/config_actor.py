@@ -9,6 +9,7 @@ from typing import Any
 import ray
 
 from ..config import PFS_PYTHONPATH, RAY_NAMESPACE, actor_runtime_env, apply_detached_actor_resources
+from ..config_hydration import CONFIG_ACTOR_SELF_ENV
 from ..runtime_config import ConfigSnapshot, build_config_snapshot, config_actor_name
 
 logger = logging.getLogger(__name__)
@@ -34,7 +35,11 @@ def _actor_options(*, actor_name: str) -> dict[str, object]:
         "namespace": _ray_namespace(),
         "lifetime": "detached",
         "get_if_exists": True,
-        "runtime_env": actor_runtime_env(pythonpath=PFS_PYTHONPATH),
+        "runtime_env": actor_runtime_env(
+            pythonpath=PFS_PYTHONPATH,
+            extra={CONFIG_ACTOR_SELF_ENV: "1"},
+            include_config_snapshot=False,
+        ),
     }
     apply_detached_actor_resources(options, ray)
     return options
