@@ -93,8 +93,14 @@ class _AsyncFakeFutureStore:
     async def async_create_with_id(self, request_id: str) -> None:
         self.created.append(request_id)
 
+    async def async_create_model_work_with_id(self, request_id: str, **_kwargs) -> None:
+        self.created.append(request_id)
+
     async def async_mark_queued(self, request_id: str, meta: dict | None = None) -> None:
         self.queued.append((request_id, meta))
+
+    async def async_update_meta(self, _request_id: str, _meta: dict) -> None:
+        return None
 
     async def async_cleanup(self, request_id: str) -> None:
         self.cleaned.append(request_id)
@@ -258,6 +264,7 @@ def test_create_action_session_route_infers_base_model_with_admin_scope(monkeypa
         json={
             "session_id": "session-1",
             "model_path": "mint://model-1/sampler_weights/export-1",
+            "owner_id": "owner-a",
         },
     )
 
@@ -265,7 +272,7 @@ def test_create_action_session_route_infers_base_model_with_admin_scope(monkeypa
     assert infer_calls == [
         {
             "model_path": "mint://model-1/sampler_weights/export-1",
-            "user_id": "admin",
+            "user_id": "owner-a",
             "is_admin": True,
         }
     ]
@@ -274,7 +281,7 @@ def test_create_action_session_route_infers_base_model_with_admin_scope(monkeypa
             "path": "mint://model-1/sampler_weights/export-1",
             "user_id": "admin",
             "is_admin": True,
-            "owner_id": None,
+            "owner_id": "owner-a",
         }
     ]
     assert manager.create_calls == [
@@ -532,7 +539,7 @@ def test_mint_action_route_enqueues_expected_request(monkeypatch) -> None:
 
     assert resp.status_code == 200, resp.text
     request_id = resp.json()["request_id"]
-    assert future_store.created == [request_id]
+    assert future_store.created == []
     queued_request_id, queued_meta = future_store.queued[0]
     assert queued_request_id == request_id
     assert queued_meta["op"] == "mint.action.act"
