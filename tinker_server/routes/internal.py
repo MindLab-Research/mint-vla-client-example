@@ -231,38 +231,16 @@ def _resource_pool_local_snapshot() -> list[dict]:
 
 @router.get("/admission_stats")
 async def admission_stats(*, include_actor_rss: bool = True) -> dict:
-    from dataclasses import asdict
-
-    from ..backend.api_work_queue import api_work_queue
-    from ..backend.capacity_manager import capacity_manager
     from ..backend.future_store import future_store
     from ..backend.model_actor_supervisor import model_actor_supervisor
     from ..backend.model_work_scheduler import model_work_scheduler
     from ..backend.owner_runtime_supervisor import owner_runtime_supervisor
-    from ..backend.queue_execution_runtime import queue_execution_runtime
     from ..backend.queue_supervisor import queue_supervisor
     from ..backend.session_heartbeat_store import session_heartbeat_store
     from ..routes import sampling as sampling_route
     from ..routes import service as service_route
 
     timeout_s = 10.0
-
-    cap = None
-    try:
-        cap = asdict(await capacity_manager.async_snapshot(timeout_s=timeout_s))
-    except Exception as e:
-        cap = {"error": f"{type(e).__name__}: {e}"}
-
-    q = None
-    try:
-        if not include_actor_rss and hasattr(api_work_queue, "metrics_snapshot"):
-            q = api_work_queue.metrics_snapshot()
-        else:
-            q = await api_work_queue.stats(timeout_s=timeout_s)
-        if not isinstance(q, dict):
-            q = {"error": f"api_work_queue snapshot returned non-dict: {type(q)}"}
-    except Exception as e:
-        q = {"error": f"{type(e).__name__}: {e}"}
 
     model_scheduler = None
     try:
@@ -293,16 +271,6 @@ async def admission_stats(*, include_actor_rss: bool = True) -> dict:
 
     actors: dict = {}
     if include_actor_rss:
-        try:
-            actors["capacity_manager"] = {"rss_bytes": int(await capacity_manager.async_rss_bytes(timeout_s=timeout_s))}
-        except Exception as e:
-            actors["capacity_manager"] = {"error": f"{type(e).__name__}: {e}"}
-
-        try:
-            actors["api_work_queue"] = {"rss_bytes": int(await api_work_queue.rss_bytes(timeout_s=timeout_s))}
-        except Exception as e:
-            actors["api_work_queue"] = {"error": f"{type(e).__name__}: {e}"}
-
         try:
             actors["future_store"] = {"rss_bytes": int(await future_store.async_rss_bytes(timeout_s=timeout_s))}
         except Exception as e:
@@ -389,15 +357,7 @@ async def admission_stats(*, include_actor_rss: bool = True) -> dict:
     except Exception as e:
         queue_runtime = {"error": f"{type(e).__name__}: {e}"}
 
-    queue_execution = None
-    try:
-        queue_execution = await queue_execution_runtime.async_health_snapshot(timeout_s=timeout_s)
-    except Exception as e:
-        queue_execution = {"error": f"{type(e).__name__}: {e}"}
-
     return {
-        "capacity": cap,
-        "work_queue": q,
         "model_work_scheduler": model_scheduler,
         "model_actor_supervisor": model_supervisor,
         "future_store": fs,
@@ -408,7 +368,6 @@ async def admission_stats(*, include_actor_rss: bool = True) -> dict:
         "ray_gcs_metrics": ray_gcs_metrics,
         "owner_runtime_supervisor": owner_runtime,
         "queue_supervisor": queue_runtime,
-        "queue_execution_runtime": queue_execution,
     }
 
 
@@ -424,13 +383,6 @@ async def queue_supervisor_health() -> dict:
     from ..backend.queue_supervisor import queue_supervisor
 
     return await queue_supervisor.async_snapshot(timeout_s=10.0)
-
-
-@router.get("/queue_execution_runtime")
-async def queue_execution_runtime_health() -> dict:
-    from ..backend.queue_execution_runtime import queue_execution_runtime
-
-    return await queue_execution_runtime.async_health_snapshot(timeout_s=10.0)
 
 
 @router.get("/model_work_scheduler")
@@ -607,165 +559,11 @@ async def metrics() -> Response:
     lines: list[str] = []
     megatron_actor_lifecycle_counts: dict[tuple[str, str], float] = {}
 
-    cap = stats.get("capacity")
-    if isinstance(cap, dict):
-        for key, value in cap.items():
-            _append_metric(lines, f"mint_capacity_{key}", value)
-
-    wq = stats.get("work_queue")
-    if isinstance(wq, dict):
-        # Existing queue counters.
-        _append_metric(lines, "mint_work_queue_depth", wq.get("depth"))
-        _append_metric(lines, "mint_work_queue_depth_legacy", wq.get("depth_legacy"))
-        _append_metric(lines, "mint_work_queue_depth_scheduled", wq.get("depth_scheduled"))
-        _append_metric(lines, "mint_work_queue_enqueued", wq.get("enqueued"))
-        _append_metric(lines, "mint_work_queue_dequeued", wq.get("dequeued"))
-        _append_metric(lines, "mint_work_queue_scheduler_enabled", wq.get("scheduler_enabled"))
-        _append_metric(lines, "mint_work_queue_scheduler_picks_total", wq.get("scheduler_picks_total"))
-        _append_metric(lines, "mint_work_queue_scheduler_switches_total", wq.get("scheduler_switches_total"))
-        _append_metric(
-            lines,
-            "mint_work_queue_scheduler_starvation_picks_total",
-            wq.get("scheduler_starvation_picks_total"),
-        )
-        _append_metric(lines, "mint_work_queue_scheduler_wait_s_sum", wq.get("scheduler_wait_s_sum"))
-        _append_metric(lines, "mint_work_queue_scheduler_domains_total", wq.get("scheduler_domains_total"))
-
-        # Phase 2: grouped depth by executor/op.
-        by_executor = wq.get("by_executor")
-        if isinstance(by_executor, dict):
-            for executor, depth in by_executor.items():
-                _append_metric(
-                    lines,
-                    "mint_work_queue_depth",
-                    depth,
-                    labels={"executor": executor},
-                )
-
-        # Phase 2: queued age stats.
-        age_stats = wq.get("age_stats")
-        if isinstance(age_stats, dict):
-            _append_metric(lines, "mint_work_queue_oldest_queued_s", age_stats.get("oldest_queued_s"))
-            _append_metric(lines, "mint_work_queue_avg_queued_s", age_stats.get("avg_queued_s"))
-
-        execution_time_s_by_op = wq.get("execution_time_s_by_op")
-        if isinstance(execution_time_s_by_op, dict):
-            for op, rec in execution_time_s_by_op.items():
-                if not isinstance(rec, dict):
-                    continue
-                labels = {"op": op}
-                _append_metric(lines, "mint_work_queue_execution_last_s", rec.get("last"), labels=labels)
-                _append_metric(lines, "mint_work_queue_execution_ema_s", rec.get("ema"), labels=labels)
-                _append_metric(lines, "mint_work_queue_execution_sum_s", rec.get("sum"), labels=labels)
-                _append_metric(lines, "mint_work_queue_execution_count", rec.get("count"), labels=labels)
-                _append_metric(lines, "mint_work_queue_execution_max_s", rec.get("max"), labels=labels)
-
-        _append_metric(lines, "mint_work_queue_scheduler_arbitration_total", wq.get("scheduler_arbitration_total"))
-        arbitration_by_winner = wq.get("scheduler_arbitration_by_winner")
-        if isinstance(arbitration_by_winner, dict):
-            for winner_bucket, total in arbitration_by_winner.items():
-                _append_metric(
-                    lines,
-                    "mint_work_queue_scheduler_arbitration_total",
-                    total,
-                    labels={"winner_bucket": winner_bucket},
-                )
-        arbitration_by_reason = wq.get("scheduler_arbitration_by_reason")
-        if isinstance(arbitration_by_reason, dict):
-            for decision_reason, total in arbitration_by_reason.items():
-                _append_metric(
-                    lines,
-                    "mint_work_queue_scheduler_arbitration_total",
-                    total,
-                    labels={"decision_reason": decision_reason},
-                )
-
-        scheduled_dequeue_stats = wq.get("scheduled_dequeue_stats")
-        if isinstance(scheduled_dequeue_stats, list):
-            for rec in scheduled_dequeue_stats:
-                if not isinstance(rec, dict):
-                    continue
-                scheduler_domain = rec.get("scheduler_domain")
-                labels = {
-                    "scheduler_domain": scheduler_domain,
-                    "backend": str(scheduler_domain).split(":", 1)[0] if scheduler_domain else "unknown",
-                    "reason": rec.get("reason") or "unknown",
-                    "op": rec.get("op") or "unknown",
-                    "execution_scope": "local",
-                }
-                _append_metric(lines, "mint_work_queue_scheduler_domain_dequeue_total", rec.get("total"), labels=labels)
-
-        legacy_dequeue_stats = wq.get("legacy_dequeue_stats")
-        if isinstance(legacy_dequeue_stats, list):
-            for rec in legacy_dequeue_stats:
-                if not isinstance(rec, dict):
-                    continue
-                _append_metric(
-                    lines,
-                    "mint_work_queue_legacy_dequeue_total",
-                    rec.get("total"),
-                    labels={
-                        "reason": rec.get("reason") or "unknown",
-                        "op": rec.get("op") or "unknown",
-                        "execution_scope": "local",
-                    },
-                )
-
-        scheduler_domains = wq.get("scheduler_domains")
-        if isinstance(scheduler_domains, dict):
-            sample_model_load: dict[str, dict[str, float]] = {}
-            for scheduler_domain, rec in scheduler_domains.items():
-                if not isinstance(rec, dict):
-                    continue
-                labels = {
-                    "scheduler_domain": scheduler_domain,
-                    "backend": rec.get("backend") or str(scheduler_domain).split(":", 1)[0],
-                    "execution_scope": "local",
-                }
-                _append_metric(lines, "mint_work_queue_scheduler_domain_pending_requests", rec.get("pending_requests"), labels=labels)
-                _append_metric(lines, "mint_work_queue_scheduler_domain_oldest_queued_s", rec.get("oldest_queued_s"), labels=labels)
-                _append_metric(lines, "mint_work_queue_scheduler_domain_active_sessions", rec.get("active_sessions"), labels=labels)
-                _append_metric(lines, "mint_work_queue_scheduler_domain_inflight_workers", rec.get("inflight_workers"), labels=labels)
-                _append_metric(lines, "mint_work_queue_scheduler_domain_capacity_workers", rec.get("capacity_workers"), labels=labels)
-                _append_metric(lines, "mint_work_queue_scheduler_domain_admissible", rec.get("admissible"), labels=labels)
-                _append_metric(lines, "mint_work_queue_scheduler_domain_service_gap_s", rec.get("service_gap_s"), labels=labels)
-                domain_stats = rec.get("stats")
-                if isinstance(domain_stats, dict):
-                    _append_metric(
-                        lines,
-                        "mint_work_queue_scheduler_domain_dequeue_picks_total",
-                        domain_stats.get("picks"),
-                        labels=labels,
-                    )
-                    _append_metric(lines, "mint_work_queue_scheduler_domain_starvation_picks_total", domain_stats.get("starvation_picks"), labels=labels)
-
-                backend = str(rec.get("backend") or str(scheduler_domain).split(":", 1)[0]).strip().lower()
-                if backend != "vllm":
-                    continue
-                base_model = _scheduler_domain_base_model(scheduler_domain)
-                if not base_model:
-                    continue
-                bucket = sample_model_load.setdefault(
-                    base_model,
-                    {"pending_requests": 0.0, "inflight_workers": 0.0, "capacity_workers": 0.0},
-                )
-                bucket["pending_requests"] += float(_prom_number(rec.get("pending_requests")) or 0.0)
-                bucket["inflight_workers"] += float(_prom_number(rec.get("inflight_workers")) or 0.0)
-                bucket["capacity_workers"] += float(_prom_number(rec.get("capacity_workers")) or 0.0)
-
-            for base_model, agg in sorted(sample_model_load.items()):
-                labels = {"base_model": base_model, "workload": "sample"}
-                capacity_workers = float(agg.get("capacity_workers", 0.0))
-                load_pct = 0.0 if capacity_workers <= 0 else (100.0 * float(agg.get("inflight_workers", 0.0)) / capacity_workers)
-                _append_metric(lines, "mint_model_load_pct", load_pct, labels=labels)
-                _append_metric(lines, "mint_model_pending_requests", agg.get("pending_requests"), labels=labels)
-                _append_metric(lines, "mint_model_inflight_workers", agg.get("inflight_workers"), labels=labels)
-                _append_metric(lines, "mint_model_capacity_workers", agg.get("capacity_workers"), labels=labels)
-
     model_scheduler = stats.get("model_work_scheduler")
     if isinstance(model_scheduler, dict):
         _append_metric(lines, "mint_model_work_scheduler_depth", model_scheduler.get("depth"))
         _append_metric(lines, "mint_model_work_scheduler_backlog_depth", model_scheduler.get("backlog_depth"))
+        sample_model_load: dict[str, dict[str, float]] = {}
         counters = model_scheduler.get("counters")
         if isinstance(counters, dict):
             for key in ("appended", "assigned", "claimed", "completed", "failed", "requeued"):
@@ -791,9 +589,45 @@ async def metrics() -> Response:
                     "status": rec.get("status") or "unknown",
                 }
                 _append_metric(lines, "mint_model_work_scheduler_replica_queue_depth", rec.get("depth"), labels=labels)
+                domain_key = str(rec.get("domain_key") or "")
+                if domain_key.startswith("vllm:"):
+                    base_model = _scheduler_domain_base_model(domain_key)
+                    if base_model:
+                        bucket = sample_model_load.setdefault(
+                            base_model,
+                            {"pending_requests": 0.0, "inflight_workers": 0.0, "capacity_workers": 0.0},
+                        )
+                        bucket["pending_requests"] += float(_prom_number(rec.get("depth")) or 0.0)
+                        if str(rec.get("status") or "").lower() in {"healthy", "ready"}:
+                            bucket["capacity_workers"] += 1.0
         leases = model_scheduler.get("leases")
         if isinstance(leases, list):
             _append_metric(lines, "mint_model_work_scheduler_leases", len(leases))
+            for lease in leases:
+                if not isinstance(lease, dict):
+                    continue
+                item = lease.get("item") if isinstance(lease.get("item"), dict) else {}
+                domain_key = str(item.get("domain_key") or lease.get("domain_key") or "")
+                if not domain_key.startswith("vllm:"):
+                    continue
+                base_model = _scheduler_domain_base_model(domain_key)
+                if not base_model:
+                    continue
+                bucket = sample_model_load.setdefault(
+                    base_model,
+                    {"pending_requests": 0.0, "inflight_workers": 0.0, "capacity_workers": 0.0},
+                )
+                bucket["inflight_workers"] += 1.0
+        for base_model, agg in sorted(sample_model_load.items()):
+            labels = {"base_model": base_model, "workload": "sample"}
+            capacity_workers = float(agg.get("capacity_workers", 0.0))
+            load_pct = 0.0 if capacity_workers <= 0 else (
+                100.0 * float(agg.get("inflight_workers", 0.0)) / capacity_workers
+            )
+            _append_metric(lines, "mint_model_load_pct", load_pct, labels=labels)
+            _append_metric(lines, "mint_model_pending_requests", agg.get("pending_requests"), labels=labels)
+            _append_metric(lines, "mint_model_inflight_workers", agg.get("inflight_workers"), labels=labels)
+            _append_metric(lines, "mint_model_capacity_workers", agg.get("capacity_workers"), labels=labels)
 
     model_supervisor = stats.get("model_actor_supervisor")
     if isinstance(model_supervisor, dict):
@@ -897,7 +731,7 @@ async def metrics() -> Response:
 
     actors = stats.get("actors")
     if isinstance(actors, dict):
-        for actor_key in ("capacity_manager", "api_work_queue", "future_store"):
+        for actor_key in ("future_store",):
             rec = actors.get(actor_key)
             if isinstance(rec, dict):
                 _append_metric(
@@ -1185,170 +1019,6 @@ async def metrics() -> Response:
             driver_state.get("sampling_sessions_inflight"),
         )
 
-    queue_execution = stats.get("queue_execution_runtime")
-    if isinstance(queue_execution, dict):
-        sampling_sessions = queue_execution.get("sampling_sessions")
-        if isinstance(sampling_sessions, dict):
-            _append_metric(lines, "mint_sampling_sessions_total", sampling_sessions.get("sampling_sessions_total"))
-            _append_metric(lines, "mint_sampling_sessions_inflight", sampling_sessions.get("sampling_sessions_inflight"))
-            _append_metric(lines, "mint_sampling_sessions_lora_loaded_total", sampling_sessions.get("sampling_sessions_lora_loaded"))
-            by_model = sampling_sessions.get("sampling_sessions_by_model")
-            if isinstance(by_model, list):
-                for row in by_model:
-                    if not isinstance(row, dict):
-                        continue
-                    labels = {"base_model": row.get("base_model") or "unknown"}
-                    _append_metric(lines, "mint_sampling_sessions_by_model", row.get("total"), labels=labels)
-                    _append_metric(lines, "mint_sampling_sessions_inflight_by_model", row.get("inflight"), labels=labels)
-                    _append_metric(lines, "mint_sampling_sessions_lora_loaded_by_model", row.get("lora_loaded"), labels=labels)
-
-        training_sessions = queue_execution.get("training_sessions")
-        if isinstance(training_sessions, dict):
-            _append_metric(lines, "mint_training_sessions_total", training_sessions.get("training_sessions_total"))
-            _append_metric(lines, "mint_training_sessions_active", training_sessions.get("training_sessions_active"))
-            _append_metric(lines, "mint_training_sessions_inflight", training_sessions.get("training_sessions_inflight"))
-            by_model = training_sessions.get("training_sessions_by_model")
-            if isinstance(by_model, list):
-                for row in by_model:
-                    if not isinstance(row, dict):
-                        continue
-                    labels = {
-                        "base_model": row.get("base_model") or "unknown",
-                        "backend": row.get("backend") or "unknown",
-                    }
-                    _append_metric(lines, "mint_training_sessions_by_model", row.get("total"), labels=labels)
-                    _append_metric(lines, "mint_training_sessions_active_by_model", row.get("active"), labels=labels)
-                    _append_metric(lines, "mint_training_sessions_inflight_by_model", row.get("inflight"), labels=labels)
-
-        runtime_observability = queue_execution.get("runtime_observability")
-        if isinstance(runtime_observability, dict):
-            megatron_switch = runtime_observability.get("megatron_session_switch")
-            if isinstance(megatron_switch, list):
-                for row in megatron_switch:
-                    if not isinstance(row, dict):
-                        continue
-                    labels = {
-                        "base_model": row.get("base_model") or "unknown",
-                        "session_state": row.get("session_state") or "unknown",
-                    }
-                    for phase, field_name in (
-                        ("save", "save_s_total"),
-                        ("swap", "swap_s_total"),
-                        ("load", "load_s_total"),
-                        ("reset_bias", "reset_bias_s_total"),
-                        ("total", "total_s_total"),
-                    ):
-                        _append_metric(
-                            lines,
-                            "mint_megatron_session_switch_duration_s_total",
-                            row.get(field_name),
-                            labels={**labels, "phase": phase},
-                        )
-
-            megatron_switch_failures = runtime_observability.get("megatron_session_switch_failures")
-            if isinstance(megatron_switch_failures, list):
-                for row in megatron_switch_failures:
-                    if not isinstance(row, dict):
-                        continue
-                    labels = {
-                        "base_model": row.get("base_model") or "unknown",
-                        "reason": row.get("reason") or "unknown",
-                    }
-                    _append_metric(lines, "mint_megatron_session_switch_failures_total", row.get("count"), labels=labels)
-
-            megatron_actor_lifecycle = runtime_observability.get("megatron_actor_lifecycle")
-            if isinstance(megatron_actor_lifecycle, list):
-                for row in megatron_actor_lifecycle:
-                    if not isinstance(row, dict):
-                        continue
-                    key = (str(row.get("base_model") or "unknown"), str(row.get("event") or "unknown"))
-                    megatron_actor_lifecycle_counts[key] = float(megatron_actor_lifecycle_counts.get(key, 0.0)) + float(
-                        row.get("count") or 0.0
-                    )
-
-            vllm_workload = runtime_observability.get("vllm_workload")
-            if isinstance(vllm_workload, list):
-                for row in vllm_workload:
-                    if not isinstance(row, dict):
-                        continue
-                    labels = {
-                        "actor_name": row.get("actor_name") or "unknown",
-                        "base_model": row.get("base_model") or "unknown",
-                        "op": row.get("op") or "unknown",
-                        "status": row.get("status") or "unknown",
-                    }
-                    _append_metric(lines, "mint_vllm_workload_requests_total", row.get("requests_total"), labels=labels)
-                    _append_metric(lines, "mint_vllm_workload_prompt_tokens_total", row.get("prompt_tokens_total"), labels=labels)
-                    _append_metric(lines, "mint_vllm_workload_generated_tokens_total", row.get("generated_tokens_total"), labels=labels)
-                    _append_metric(lines, "mint_vllm_workload_ttft_s_sum", row.get("ttft_s_total"), labels=labels)
-                    _append_metric(lines, "mint_vllm_workload_ttft_s_count", row.get("ttft_s_count"), labels=labels)
-                    _append_metric(lines, "mint_vllm_workload_ttft_s_max", row.get("ttft_s_max"), labels=labels)
-                    _append_metric(lines, "mint_vllm_workload_tpot_s_sum", row.get("tpot_s_total"), labels=labels)
-                    _append_metric(lines, "mint_vllm_workload_tpot_s_count", row.get("tpot_s_count"), labels=labels)
-                    _append_metric(lines, "mint_vllm_workload_tpot_s_max", row.get("tpot_s_max"), labels=labels)
-
-            vllm_active = runtime_observability.get("vllm_active_requests")
-            if isinstance(vllm_active, list):
-                for row in vllm_active:
-                    if not isinstance(row, dict):
-                        continue
-                    labels = {
-                        "actor_name": row.get("actor_name") or "unknown",
-                        "base_model": row.get("base_model") or "unknown",
-                        "op": row.get("op") or "unknown",
-                    }
-                    _append_metric(lines, "mint_vllm_workload_active_requests", row.get("active_requests"), labels=labels)
-
-            training_operation_latency = runtime_observability.get("training_operation_latency")
-            if isinstance(training_operation_latency, list):
-                for row in training_operation_latency:
-                    if not isinstance(row, dict):
-                        continue
-                    labels = {
-                        "base_model": row.get("base_model") or "unknown",
-                        "backend": row.get("backend") or "unknown",
-                        "op": row.get("op") or "unknown",
-                        "status": row.get("status") or "unknown",
-                        "failure_class": row.get("failure_class") or "none",
-                    }
-                    _append_metric(lines, "mint_training_operation_total", row.get("count"), labels=labels)
-                    _append_metric(lines, "mint_training_operation_duration_s_sum", row.get("duration_s_total"), labels=labels)
-                    _append_metric(lines, "mint_training_operation_duration_s_max", row.get("duration_s_max"), labels=labels)
-
-            dense_actor_bind_decision = runtime_observability.get("dense_actor_bind_decision")
-            if isinstance(dense_actor_bind_decision, list):
-                for row in dense_actor_bind_decision:
-                    if not isinstance(row, dict):
-                        continue
-                    labels = {
-                        "base_model": row.get("base_model") or "unknown",
-                        "decision": row.get("decision") or "unknown",
-                    }
-                    _append_metric(lines, "mint_dense_actor_bind_decision_total", row.get("count"), labels=labels)
-
-            dense_actor_fatal = runtime_observability.get("dense_actor_fatal")
-            if isinstance(dense_actor_fatal, list):
-                for row in dense_actor_fatal:
-                    if not isinstance(row, dict):
-                        continue
-                    labels = {
-                        "base_model": row.get("base_model") or "unknown",
-                        "op": row.get("op") or "unknown",
-                        "failure_class": row.get("failure_class") or "unknown",
-                    }
-                    _append_metric(lines, "mint_dense_actor_fatal_total", row.get("count"), labels=labels)
-
-            dense_actor_retire = runtime_observability.get("dense_actor_retire")
-            if isinstance(dense_actor_retire, list):
-                for row in dense_actor_retire:
-                    if not isinstance(row, dict):
-                        continue
-                    labels = {
-                        "base_model": row.get("base_model") or "unknown",
-                        "outcome": row.get("outcome") or "unknown",
-                    }
-                    _append_metric(lines, "mint_dense_actor_retire_total", row.get("count"), labels=labels)
-
     for (base_model, event), count in sorted(megatron_actor_lifecycle_counts.items()):
         _append_metric(
             lines,
@@ -1516,9 +1186,9 @@ async def work_queue_noop(http_request: Request) -> dict:
 
 @router.get("/work_queue/debug_state")
 async def work_queue_debug_state() -> dict:
-    from ..backend.api_work_queue import api_work_queue
+    from ..backend.model_work_scheduler import model_work_scheduler
 
-    return await api_work_queue.debug_state(timeout_s=10.0)
+    return await model_work_scheduler.stats(timeout_s=10.0)
 
 
 @router.get("/debug/scheduler_decisions")
@@ -1528,15 +1198,38 @@ async def scheduler_decisions_debug(
     reason: str | None = None,
     since_seq: int | None = Query(default=None, ge=0),
 ) -> dict:
-    from ..backend.api_work_queue import api_work_queue
+    from ..backend.model_work_scheduler import model_work_scheduler
 
-    return await api_work_queue.scheduler_decisions(
-        limit=int(limit),
-        scheduler_domain=scheduler_domain,
-        reason=reason,
-        since_seq=since_seq,
-        timeout_s=10.0,
-    )
+    stats = await model_work_scheduler.stats(timeout_s=10.0)
+    domain_filter = scheduler_domain.strip() if isinstance(scheduler_domain, str) else None
+    if not domain_filter and reason is None and since_seq is None:
+        return stats
+    out = dict(stats)
+    if domain_filter:
+        out["replica_queues"] = {
+            queue_id: rec
+            for queue_id, rec in (stats.get("replica_queues") or {}).items()
+            if isinstance(rec, dict) and rec.get("domain_key") == domain_filter
+        }
+        out["backlog_depth_by_domain"] = {
+            key: value
+            for key, value in (stats.get("backlog_depth_by_domain") or {}).items()
+            if key == domain_filter
+        }
+        out["leases"] = [
+            lease
+            for lease in (stats.get("leases") or [])
+            if isinstance(lease, dict)
+            and (
+                lease.get("domain_key") == domain_filter
+                or (
+                    isinstance(lease.get("item"), dict)
+                    and lease["item"].get("domain_key") == domain_filter
+                )
+            )
+        ]
+    out["decision_log_removed"] = True
+    return out
 
 
 # =============================================================================

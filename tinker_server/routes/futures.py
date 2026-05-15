@@ -463,15 +463,6 @@ async def retrieve_future(
         if task_state_payload is not None:
             _pending_hint_clear(body.request_id)
             try:
-                from ..backend.capacity_manager import capacity_manager
-
-                import ray
-
-                if ray.is_initialized():
-                    await capacity_manager.async_release_all(body.request_id)
-            except Exception:
-                pass
-            try:
                 await future_store.async_cleanup(body.request_id)
             except Exception:
                 pass
@@ -583,46 +574,12 @@ async def retrieve_future(
         domain_key = meta.get("domain_key") if isinstance(meta, dict) else None
         affinity_group = meta.get("affinity_group") if isinstance(meta, dict) else None
         ordering_key = meta.get("ordering_key") if isinstance(meta, dict) else None
-        from ..backend.api_work_queue import ApiWorkQueueUnavailableError, api_work_queue
 
-        pos = None
-        queue_probe = None
-        should_probe_api_queue = status_field == "queued" and queue_kind != "model_work_scheduler"
-        if should_probe_api_queue:
-            try:
-                queue_probe = await api_work_queue.describe_pending_request(
-                    body.request_id,
-                    op if isinstance(op, str) else None,
-                )
-                pos = queue_probe
-            except ApiWorkQueueUnavailableError as e:
-                if queue_kind not in {"scheduled", "model_work_scheduler"}:
-                    raise HTTPException(status_code=503, detail=f"ApiWorkQueue unavailable: {e}") from e
-            except Exception as e:
-                if queue_kind not in {"scheduled", "model_work_scheduler"}:
-                    raise HTTPException(status_code=503, detail=f"ApiWorkQueue position lookup failed: {type(e).__name__}: {e}") from e
+        if status_field == "queued" and queue_kind is None:
+            queue_kind = "model_work_scheduler"
 
-        if isinstance(pos, dict):
-            pos_queue_kind = pos.get("queue_kind")
-            if isinstance(pos_queue_kind, str) and pos_queue_kind:
-                queue_kind = pos_queue_kind
-            queue_depth = pos.get("depth")
-            queue_depth_legacy = pos.get("depth_legacy")
-            queue_depth_scheduled = pos.get("depth_scheduled")
-            if queue_kind == "scheduled":
-                pos_scheduler_domain = pos.get("scheduler_domain")
-                pos_scheduler_session_id = pos.get("scheduler_session_id")
-                if isinstance(pos_scheduler_domain, str) and pos_scheduler_domain:
-                    scheduler_domain = pos_scheduler_domain
-                if isinstance(pos_scheduler_session_id, str) and pos_scheduler_session_id:
-                    scheduler_session_id = pos_scheduler_session_id
-                if status_field == "queued":
-                    queue_depth_domain = pos.get("domain_depth")
-                    queue_depth_session = pos.get("session_depth")
-                    queue_position_session = pos.get("session_position")
-                    queue_active_sessions = pos.get("active_sessions")
-            elif status_field == "queued" and queue_kind == "legacy":
-                queue_position = pos.get("position")
+        if queue_kind == "scheduled":
+            queue_kind = "model_work_scheduler"
 
         if isinstance(queue_depth, (int, float)):
             queue_depth = int(queue_depth)
@@ -671,7 +628,6 @@ async def retrieve_future(
 
         if status_field == "queued" and queue_kind == "model_work_scheduler":
             try:
-                from ..backend.capacity_manager import capacity_manager
                 from ..backend.model_work_scheduler import model_work_scheduler
 
                 contains = await model_work_scheduler.contains_request(request_id=body.request_id)
@@ -680,7 +636,6 @@ async def retrieve_future(
                         body.request_id,
                         "model work scheduler recovered without this request; request must be retried",
                     )
-                    await capacity_manager.async_release_all(body.request_id)
                     error = await future_store.async_get_error(body.request_id)
                     payload = _failed_payload(error, http_request)
                     _recent_put(body.request_id, payload, ttl_s=_local_hot_ttl_s())
@@ -695,23 +650,9 @@ async def retrieve_future(
                     body.request_id,
                 )
 
-        if queue_kind == "legacy" and isinstance(queue_depth_scheduled, int) and queue_depth_scheduled > 0:
-            queue_position = None
-        if status_field == "queued" and queue_position is not None:
-            from ..config import config as server_config
-
-            ema_exec_s = queue_probe.get("ema_exec_s") if isinstance(queue_probe, dict) else None
-            worker_count = int(server_config.api_work_queue_num_workers)
-            if worker_count > 0 and isinstance(ema_exec_s, (int, float)):
-                estimated_wait_s = (float(queue_position) + 1.0) * float(ema_exec_s) / float(worker_count)
-
         if queue_state_reason is None and status_field == "queued":
             if queue_kind == "model_work_scheduler":
                 queue_state_reason = "model_work_scheduler"
-            elif queue_kind == "scheduled":
-                queue_state_reason = "scheduled_queue"
-            elif queue_kind == "legacy" and isinstance(queue_depth_scheduled, int) and queue_depth_scheduled > 0:
-                queue_state_reason = "mixed_queue_arbitration"
             elif isinstance(queue_depth, int) and queue_depth > 0:
                 queue_state_reason = "queue_backlog"
             elif queue_position is None:
@@ -880,15 +821,6 @@ async def retrieve_future(
         _recent_put(body.request_id, payload, ttl_s=_local_hot_ttl_s())
         logger.info("[retrieve_future] request_id=%s status=failed", body.request_id)
         try:
-            from ..backend.capacity_manager import capacity_manager
-
-            import ray
-
-            if ray.is_initialized():
-                await capacity_manager.async_release_all(body.request_id)
-        except Exception:
-            pass
-        try:
             await future_store.async_cleanup(body.request_id)
         except Exception:
             pass
@@ -905,15 +837,6 @@ async def retrieve_future(
         )
         _recent_put(body.request_id, result, ttl_s=_local_hot_ttl_s())
         logger.info("[retrieve_future] request_id=%s status=done", body.request_id)
-        try:
-            from ..backend.capacity_manager import capacity_manager
-
-            import ray
-
-            if ray.is_initialized():
-                await capacity_manager.async_release_all(body.request_id)
-        except Exception:
-            pass
         try:
             await future_store.async_cleanup(body.request_id)
         except Exception:

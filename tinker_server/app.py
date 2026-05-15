@@ -14,8 +14,6 @@ from fastapi.responses import JSONResponse
 
 from .auth_identity import get_apikey_id as get_request_apikey_id
 from .auth_identity import get_request_observability_context
-from .backend.api_work_queue import ApiWorkQueueUnavailableError
-from .backend.capacity_manager import CapacityManagerUnavailableError
 from .backend.future_store import FutureStoreUnavailableError
 from .backend.session_manager import SessionManager
 from .config import config
@@ -110,30 +108,6 @@ def _should_preload_openai_tokenizers() -> bool:
     except Exception:
         workers = 1
     return workers <= 1
-
-
-def _queue_execution_runtime_start_timeout_s() -> float:
-    raw = os.environ.get("MINT_QUEUE_EXECUTION_RUNTIME_START_TIMEOUT_S", "").strip()
-    if raw:
-        try:
-            return max(1.0, float(raw))
-        except ValueError:
-            logger.warning(
-                "Invalid MINT_QUEUE_EXECUTION_RUNTIME_START_TIMEOUT_S=%r, using default",
-                raw,
-            )
-    models_csv = (config.prewarm_persistent_models_csv or "").strip()
-    prewarm_requested = bool(models_csv) and (
-        bool(config.prewarm_enable_training) or bool(config.prewarm_enable_inference)
-    )
-    if prewarm_requested:
-        return max(1800.0, float(config.prewarm_megatron_ready_timeout_s) + 300.0)
-    return 120.0
-
-
-def _skip_api_work_queue_execution_ready_wait() -> bool:
-    raw = os.environ.get("MINT_API_WORK_QUEUE_SKIP_READY_WAIT", "").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
 
 
 async def _cleanup_stale_actors() -> None:
@@ -474,57 +448,14 @@ async def lifespan(app: FastAPI):
             logger.info("Skipping OpenAI-compatible tokenizer preload for multi-worker startup")
 
         # ==========================================================================
-        # Issue #84: Admission control + API work queue workers + future reaper
+        # Model scheduler + runtime supervisors
         # ==========================================================================
-        from .backend.api_work_queue import api_work_queue
-        from .backend.capacity_manager import capacity_manager
         from .backend.model_actor_supervisor import model_actor_supervisor
-        from .backend.queue_execution_runtime import queue_execution_runtime
+        from .backend.model_work_scheduler import model_work_scheduler
 
-        logger.info("startup stage=before_capacity_manager_ready")
-        await capacity_manager.async_ensure_ready(timeout_s=180.0)
-        logger.info("startup stage=after_capacity_manager_ready")
-        logger.info("startup stage=before_api_work_queue_started")
-        await api_work_queue.async_ensure_started()
-        logger.info("startup stage=after_api_work_queue_started")
-        if os.environ.get("MINT_QUEUE_EXECUTION_RUNTIME_LOCAL_ONLY", "").strip().lower() in {"1", "true", "yes", "on"}:
-            from .backend.api_work_queue_dispatch import register_api_work_queue_executors
-            from .backend.queue_execution_runtime import _initialize_execution_runtime
-
-            logger.warning(
-                "Using local queue execution runtime fallback in API process "
-                "(MINT_QUEUE_EXECUTION_RUNTIME_LOCAL_ONLY=1)"
-            )
-            logger.info("startup stage=before_local_initialize_execution_runtime")
-            bindings = await _initialize_execution_runtime(prewarm=startup_owner)
-            logger.info("startup stage=after_local_initialize_execution_runtime")
-            inference_manager = bindings.get("inference_manager")
-            train_manager = bindings.get("train_manager")
-            multi_model_manager = bindings.get("multi_model_manager")
-            logger.info("startup stage=before_register_api_work_queue_executors")
-            register_api_work_queue_executors(api_work_queue)
-            logger.info("startup stage=after_register_api_work_queue_executors")
-            logger.info("startup stage=before_api_work_queue_start_workers")
-            await api_work_queue.start_workers(num_workers=int(config.api_work_queue_num_workers))
-            logger.info("startup stage=after_api_work_queue_start_workers")
-            if _skip_api_work_queue_execution_ready_wait():
-                logger.warning(
-                    "Skipping api_work_queue execution-ready startup wait "
-                    "(MINT_API_WORK_QUEUE_SKIP_READY_WAIT=1)"
-                )
-            else:
-                logger.info("startup stage=before_api_work_queue_execution_ready_wait")
-                await api_work_queue.wait_until_execution_ready(
-                    timeout_s=_queue_execution_runtime_start_timeout_s()
-                )
-                logger.info("startup stage=after_api_work_queue_execution_ready_wait")
-        else:
-            logger.info("startup stage=before_remote_queue_execution_runtime_started")
-            await queue_execution_runtime.async_ensure_started(
-                num_workers=int(config.api_work_queue_num_workers),
-                timeout_s=_queue_execution_runtime_start_timeout_s(),
-            )
-            logger.info("startup stage=after_remote_queue_execution_runtime_started")
+        logger.info("startup stage=before_model_work_scheduler_started")
+        await model_work_scheduler.stats(timeout_s=10.0)
+        logger.info("startup stage=after_model_work_scheduler_started")
 
         if startup_owner and model_actor_supervisor.snapshot().get("desired_total", 0):
             logger.info("startup stage=before_model_actor_supervisor_reconcile")
@@ -568,8 +499,7 @@ async def lifespan(app: FastAPI):
                     session_heartbeat_store.ensure_ready()
                     ensure_session_index_store_ready()
                     ensure_training_session_store_ready()
-                    await capacity_manager.async_ensure_ready()
-                    await api_work_queue.async_ensure_started()
+                    await model_work_scheduler.stats(timeout_s=10.0)
                     if model_actor_supervisor.snapshot().get("desired_total", 0):
                         await model_actor_supervisor.reconcile_once()
                 except asyncio.CancelledError:
@@ -605,7 +535,6 @@ async def lifespan(app: FastAPI):
     await _cancel_task(owner_runtime_health_task)
     await _cancel_task(stale_training_heartbeat_task)
     await _cancel_task(startup_lease_task)
-    await api_work_queue.shutdown()
     await startup_lease.release()
     logger.info("Shutting down local runtime state")
 
@@ -644,22 +573,6 @@ async def future_store_unavailable_handler(_: Request, __: FutureStoreUnavailabl
     return JSONResponse(
         status_code=503,
         content={"detail": "Ray unavailable: FutureStore requires Ray"},
-    )
-
-
-@app.exception_handler(ApiWorkQueueUnavailableError)
-async def api_work_queue_unavailable_handler(_: Request, __: ApiWorkQueueUnavailableError) -> JSONResponse:
-    return JSONResponse(
-        status_code=503,
-        content={"detail": "Ray unavailable: ApiWorkQueue requires Ray"},
-    )
-
-
-@app.exception_handler(CapacityManagerUnavailableError)
-async def capacity_manager_unavailable_handler(_: Request, __: CapacityManagerUnavailableError) -> JSONResponse:
-    return JSONResponse(
-        status_code=503,
-        content={"detail": "Ray unavailable: CapacityManager requires Ray"},
     )
 
 

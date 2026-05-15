@@ -211,7 +211,6 @@ class ModelRuntimeActor:
         future_store_client: Any | None = None,
         task_state_store_client: Any | None = None,
         payload_store: TaskPayloadStore | None = None,
-        capacity_manager_client: Any | None = None,
         executor: ModelWorkExecutor | None = None,
     ) -> None:
         domain = str(domain_key).strip()
@@ -251,11 +250,6 @@ class ModelRuntimeActor:
             task_state_store_client if task_state_store_client is not None else task_state_store
         )
         self._payload_store = payload_store if payload_store is not None else TaskPayloadStore()
-        if capacity_manager_client is None:
-            from .capacity_manager import capacity_manager
-
-            capacity_manager_client = capacity_manager
-        self._capacity_manager = capacity_manager_client
         self._executor = executor if executor is not None else _default_executor
 
         self._running = False
@@ -424,42 +418,6 @@ class ModelRuntimeActor:
         self._last_error = f"{type(e).__name__}: {e}"
         self._last_error_traceback = traceback.format_exc()
 
-    async def _release_queue_capacity(self, request_id: str) -> None:
-        try:
-            await self._capacity_manager.async_release_queue(request_id)
-        except Exception as e:
-            logger.error(
-                "[model_runtime] release_queue failed actor=%s request_id=%s error_type=%s error=%s",
-                self._config.actor_name,
-                request_id,
-                type(e).__name__,
-                e,
-            )
-
-    async def _release_object_capacity(self, request_id: str) -> None:
-        try:
-            await self._capacity_manager.async_release_object_store(request_id)
-        except Exception as e:
-            logger.error(
-                "[model_runtime] release_object_store failed actor=%s request_id=%s error_type=%s error=%s",
-                self._config.actor_name,
-                request_id,
-                type(e).__name__,
-                e,
-            )
-
-    async def _release_all_capacity(self, request_id: str) -> None:
-        try:
-            await self._capacity_manager.async_release_all(request_id)
-        except Exception as e:
-            logger.error(
-                "[model_runtime] release_all failed actor=%s request_id=%s error_type=%s error=%s",
-                self._config.actor_name,
-                request_id,
-                type(e).__name__,
-                e,
-            )
-
     async def _status_is_pending(self, lease: dict[str, Any]) -> bool:
         item = lease["item"]
         request_id = str(item["request_id"])
@@ -467,7 +425,6 @@ class ModelRuntimeActor:
         try:
             status = await self._future_store.async_get_status(request_id)
         except KeyError:
-            await self._release_all_capacity(request_id)
             await self._scheduler.complete_lease(
                 lease_id=lease_id,
                 consumer_id=self._config.consumer_id,
@@ -475,7 +432,6 @@ class ModelRuntimeActor:
             )
             return False
         if status is not None and status != FutureStatus.PENDING:
-            await self._release_all_capacity(request_id)
             await self._scheduler.complete_lease(
                 lease_id=lease_id,
                 consumer_id=self._config.consumer_id,
@@ -641,7 +597,6 @@ class ModelRuntimeActor:
         self._active_request_id = request_id
         self._active_lease_id = lease_id
         self._restore_item_context(lease)
-        await self._release_queue_capacity(request_id)
         if not await self._status_is_pending(lease):
             self._active_request_id = None
             self._active_lease_id = None
@@ -716,8 +671,6 @@ class ModelRuntimeActor:
                         type(e).__name__,
                         e,
                     )
-                finally:
-                    await self._release_all_capacity(request_id)
                 self._requeued_total += 1
                 return
             task_state_committed = False
@@ -800,7 +753,6 @@ class ModelRuntimeActor:
                     request_id,
                     failed,
                 )
-            await self._release_object_capacity(request_id)
             self._processed_total += 1
             self._failed_total += 1
             self._last_error = f"future failed: {finalization.payload}"
@@ -861,8 +813,6 @@ class ModelRuntimeActor:
                         type(e2).__name__,
                         e2,
                     )
-                finally:
-                    await self._release_all_capacity(request_id)
                 self._requeued_total += 1
                 return
             task_state_committed = False
@@ -898,7 +848,6 @@ class ModelRuntimeActor:
                 reason="executor_failed",
                 requeue=False,
             )
-            await self._release_object_capacity(request_id)
             self._processed_total += 1
             self._failed_total += 1
         finally:

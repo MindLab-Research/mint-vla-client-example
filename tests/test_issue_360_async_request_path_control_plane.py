@@ -540,28 +540,77 @@ def test_issue_360_asample_admission_uses_async_capacity_and_future(monkeypatch)
 def test_issue_360_internal_admission_stats_uses_async_store_calls(monkeypatch):
     import importlib
 
-    wq = importlib.import_module("tinker_server.backend.api_work_queue")
-    cm = importlib.import_module("tinker_server.backend.capacity_manager")
     fs = importlib.import_module("tinker_server.backend.future_store")
+    model_actor_supervisor = importlib.import_module("tinker_server.backend.model_actor_supervisor")
+    model_work_scheduler = importlib.import_module("tinker_server.backend.model_work_scheduler")
+    owner_runtime_supervisor = importlib.import_module("tinker_server.backend.owner_runtime_supervisor")
+    queue_supervisor = importlib.import_module("tinker_server.backend.queue_supervisor")
+    session_heartbeat_store = importlib.import_module("tinker_server.backend.session_heartbeat_store")
+    sampling = importlib.import_module("tinker_server.routes.sampling")
+    service = importlib.import_module("tinker_server.routes.service")
+    dense_session_state = importlib.import_module("tinker_server.backend.dense_session_state")
+    ray_cluster_health = importlib.import_module("tinker_server.ray_cluster_health")
+    ray_gcs_metrics = importlib.import_module("tinker_server.ray_gcs_metrics")
     _install_minimal_ray_module(monkeypatch)
     rp = importlib.import_module("tinker_server.backend.resource_pool")
 
-    monkeypatch.setattr(cm, "capacity_manager", _AsyncOnlyAdmissionCapacityManager())
+    async def _scheduler_stats(timeout_s: float = 10.0):
+        _ = timeout_s
+        return {
+            "depth": 1,
+            "backlog_depth": 0,
+            "backlog_depth_by_domain": {},
+            "replica_queues": {},
+            "leases": [],
+            "counters": {},
+        }
+
+    async def _empty_snapshot(timeout_s: float = 10.0):
+        _ = timeout_s
+        return {}
+
+    async def _zero() -> int:
+        return 0
+
     monkeypatch.setattr(fs, "future_store", _AsyncOnlyAdmissionFutureStore())
-    monkeypatch.setattr(wq, "api_work_queue", _StubApiWorkQueue())
+    monkeypatch.setattr(
+        model_work_scheduler,
+        "model_work_scheduler",
+        SimpleNamespace(stats=_scheduler_stats),
+    )
+    monkeypatch.setattr(
+        model_actor_supervisor,
+        "model_actor_supervisor",
+        SimpleNamespace(async_snapshot=_empty_snapshot),
+    )
+    monkeypatch.setattr(
+        owner_runtime_supervisor,
+        "owner_runtime_supervisor",
+        SimpleNamespace(async_health_snapshot=_empty_snapshot),
+    )
+    monkeypatch.setattr(queue_supervisor, "queue_supervisor", SimpleNamespace(async_snapshot=_empty_snapshot))
+    monkeypatch.setattr(session_heartbeat_store, "session_heartbeat_store", SimpleNamespace(async_size=_zero))
+    monkeypatch.setattr(sampling, "_lora_load_lock_count", _zero)
+    monkeypatch.setattr(service, "session_manager", None)
+    monkeypatch.setattr(dense_session_state, "collect_dense_session_state_stats", lambda: {})
+    monkeypatch.setattr(ray_cluster_health, "get_ray_cluster_health_snapshot", lambda: {})
+    monkeypatch.setattr(ray_gcs_metrics, "get_ray_gcs_metrics_snapshot", lambda: {})
     monkeypatch.setattr(
         rp,
         "get_resource_pool",
-        lambda: SimpleNamespace(rss_snapshot=lambda timeout_s=10.0: {"rss_bytes": 333}),
+        lambda: SimpleNamespace(
+            rss_snapshot=lambda timeout_s=10.0: [{"actor_name": "actor-a", "rss_bytes": 333}],
+            metadata_cache_metrics_snapshot=lambda: [],
+            lifecycle_metrics_snapshot=lambda: [],
+        ),
     )
 
     payload = anyio.run(internal_route.admission_stats)
 
-    assert payload["capacity"]["queue_bytes_budget"] == 1
+    assert payload["model_work_scheduler"]["depth"] == 1
     assert payload["future_store"]["pending"] == 0
-    assert payload["actors"]["capacity_manager"]["rss_bytes"] == 111
-    assert payload["actors"]["api_work_queue"]["rss_bytes"] == 123
     assert payload["actors"]["future_store"]["rss_bytes"] == 222
+    assert payload["actors"]["resource_pool"][0]["rss_bytes"] == 333
 
 
 @pytest.mark.anyio

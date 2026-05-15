@@ -3,8 +3,6 @@ from __future__ import annotations
 import asyncio
 import importlib
 import time
-from dataclasses import dataclass
-
 import tinker_server.routes.internal as internal_routes
 
 
@@ -195,51 +193,39 @@ async def _fake_admission_stats(*, include_actor_rss: bool = True) -> dict:
         ],
     }
     if include_actor_rss:
-        actors.update(
-            {
-                "capacity_manager": {"rss_bytes": 1000},
-                "api_work_queue": {"rss_bytes": 2000},
-                "future_store": {"rss_bytes": 3000},
-            }
-        )
+        actors.update({"future_store": {"rss_bytes": 3000}})
     else:
         actors["resource_pool"][0].pop("rss_bytes", None)
         actors["resource_pool"][0]["rss_cache_state"] = "unknown"
     return {
-        "capacity": {"capacity": 16, "inflight": 3},
-        "work_queue": {
-            "depth": 2,
-            "enqueued": 10,
-            "dequeued": 8,
-            "by_executor": {"sampling.asample": 1, "weights.save_weights": 1},
-            "age_stats": {"oldest_queued_s": 12.5, "avg_queued_s": 6.25},
-            "scheduler_arbitration_total": 9,
-            "scheduler_arbitration_by_winner": {"legacy": 4, "scheduled": 5},
-            "scheduler_arbitration_by_reason": {"legacy_head_older": 4, "scheduled_starvation": 2},
-            "scheduled_dequeue_stats": [
-                {
-                    "scheduler_domain": "vllm:Qwen/Qwen3-4B-Instruct-2507::replica::0",
-                    "reason": "starvation",
-                    "op": "sampling.asample",
-                    "total": 6,
-                }
+        "model_work_scheduler": {
+            "depth": 4,
+            "backlog_depth": 2,
+            "backlog_depth_by_domain": {"vllm:Qwen/Qwen3-4B-Instruct-2507": 2},
+            "replica_queues": {
+                "vllm:Qwen/Qwen3-4B-Instruct-2507::replica-0": {
+                    "domain_key": "vllm:Qwen/Qwen3-4B-Instruct-2507",
+                    "replica_id": "replica-0",
+                    "depth": 3,
+                    "status": "healthy",
+                },
+                "megatron:Qwen/Qwen3-30B-A3B-Instruct-2507::replica-0": {
+                    "domain_key": "megatron:Qwen/Qwen3-30B-A3B-Instruct-2507",
+                    "replica_id": "replica-0",
+                    "depth": 1,
+                    "status": "healthy",
+                },
+            },
+            "leases": [
+                {"item": {"domain_key": "vllm:Qwen/Qwen3-4B-Instruct-2507"}},
             ],
-            "legacy_dequeue_stats": [
-                {"reason": "fifo", "op": "sampling.asample", "total": 4},
-            ],
-            "scheduler_domains": {
-                "vllm:Qwen/Qwen3-4B-Instruct-2507::replica::0": {
-                    "backend": "vllm",
-                    "pending_requests": 3,
-                    "active_sessions": 2,
-                    "oldest_queued_s": 11.0,
-                    "inflight_workers": 1,
-                    "capacity_owner": "vllm_replica_single_worker",
-                    "capacity_workers": 2,
-                    "admissible": True,
-                    "service_gap_s": 5.5,
-                    "stats": {"picks": 6, "starvation_picks": 1},
-                }
+            "counters": {
+                "appended": 10,
+                "assigned": 8,
+                "claimed": 6,
+                "completed": 5,
+                "failed": 1,
+                "requeued": 2,
             },
         },
         "future_store": {
@@ -265,145 +251,6 @@ async def _fake_admission_stats(*, include_actor_rss: bool = True) -> dict:
         },
         "actors": actors,
         "process": {"rss_bytes": 12345, "pid": 999},
-        "queue_execution_runtime": {
-            "sampling_sessions": {
-                "sampling_sessions_total": 3,
-                "sampling_sessions_inflight": 2,
-                "sampling_sessions_lora_loaded": 1,
-                "sampling_sessions_by_model": [
-                    {
-                        "base_model": "Qwen/Qwen3-4B-Instruct-2507",
-                        "total": 2,
-                        "inflight": 1,
-                        "lora_loaded": 1,
-                    }
-                ],
-            },
-            "training_sessions": {
-                "training_sessions_total": 2,
-                "training_sessions_active": 1,
-                "training_sessions_inflight": 1,
-                "training_sessions_by_model": [
-                    {
-                        "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
-                        "backend": "megatron",
-                        "total": 2,
-                        "active": 1,
-                        "inflight": 1,
-                    }
-                ],
-            },
-            "runtime_observability": {
-                "megatron_session_switch": [
-                    {
-                        "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
-                        "session_state": "existing",
-                        "count": 4,
-                        "save_s_total": 8.0,
-                        "save_s_max": 3.0,
-                        "swap_s_total": 2.0,
-                        "swap_s_max": 0.9,
-                        "load_s_total": 6.0,
-                        "load_s_max": 2.4,
-                        "reset_bias_s_total": 1.0,
-                        "reset_bias_s_max": 0.4,
-                        "total_s_total": 17.0,
-                        "total_s_max": 6.5,
-                    }
-                ],
-                "megatron_session_switch_failures": [
-                    {
-                        "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
-                        "reason": "partial_swap",
-                        "count": 2,
-                    }
-                ],
-                "megatron_actor_lifecycle": [
-                    {
-                        "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
-                        "event": "evicted",
-                        "count": 1,
-                    },
-                    {
-                        "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
-                        "event": "startup_timeout",
-                        "count": 1,
-                    }
-                ],
-                "vllm_workload": [
-                    {
-                        "actor_name": "vllm-1",
-                        "base_model": "Qwen/Qwen3-4B-Instruct-2507",
-                        "op": "asample",
-                        "status": "ok",
-                        "requests_total": 8,
-                        "prompt_tokens_total": 4096,
-                        "generated_tokens_total": 512,
-                        "duration_s_total": 24.0,
-                        "duration_s_max": 5.5,
-                        "ttft_s_total": 8.0,
-                        "ttft_s_max": 1.5,
-                        "ttft_s_count": 8,
-                        "tpot_s_total": 0.96,
-                        "tpot_s_max": 0.2,
-                        "tpot_s_count": 8,
-                    }
-                ],
-                "vllm_active_requests": [
-                    {
-                        "actor_name": "vllm-1",
-                        "base_model": "Qwen/Qwen3-4B-Instruct-2507",
-                        "op": "asample",
-                        "active_requests": 2,
-                    }
-                ],
-                "vllm_actor_latency": [
-                    {
-                        "actor_name": "vllm-1",
-                        "base_model": "Qwen/Qwen3-4B-Instruct-2507",
-                        "op": "asample",
-                        "status": "ok",
-                        "count": 8,
-                        "duration_s_total": 24.0,
-                        "duration_s_max": 5.5,
-                    }
-                ],
-                "training_operation_latency": [
-                    {
-                        "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
-                        "backend": "megatron",
-                        "op": "forward_backward",
-                        "status": "ok",
-                        "failure_class": "none",
-                        "count": 4,
-                        "duration_s_total": 18.0,
-                        "duration_s_max": 6.0,
-                    }
-                ],
-                "dense_actor_bind_decision": [
-                    {
-                        "base_model": "Qwen/Qwen3-0.6B",
-                        "decision": "rebind_refused_poisoned",
-                        "count": 1,
-                    }
-                ],
-                "dense_actor_fatal": [
-                    {
-                        "base_model": "Qwen/Qwen3-0.6B",
-                        "op": "forward_backward",
-                        "failure_class": "cuda_fatal",
-                        "count": 1,
-                    }
-                ],
-                "dense_actor_retire": [
-                    {
-                        "base_model": "Qwen/Qwen3-0.6B",
-                        "outcome": "ok",
-                        "count": 1,
-                    }
-                ],
-            },
-        },
     }
 
 
@@ -433,20 +280,13 @@ def test_issue_248_internal_metrics_omits_unknown_resource_pool_rss(monkeypatch)
     text = resp.body.decode("utf-8")
 
     expected_lines = (
-        "mint_capacity_capacity 16",
-        "mint_capacity_inflight 3",
-        "mint_work_queue_depth 2",
-        'mint_work_queue_depth{executor="sampling.asample"} 1',
-        "mint_work_queue_oldest_queued_s 12.5",
-        "mint_work_queue_scheduler_arbitration_total 9",
-        'mint_work_queue_scheduler_arbitration_total{winner_bucket="scheduled"} 5',
-        'mint_work_queue_scheduler_domain_dequeue_total{backend="vllm",execution_scope="local",op="sampling.asample",reason="starvation",scheduler_domain="vllm:Qwen/Qwen3-4B-Instruct-2507::replica::0"} 6',
-        'mint_work_queue_legacy_dequeue_total{execution_scope="local",op="sampling.asample",reason="fifo"} 4',
-        'mint_work_queue_scheduler_domain_pending_requests{backend="vllm",execution_scope="local",scheduler_domain="vllm:Qwen/Qwen3-4B-Instruct-2507::replica::0"} 3',
-        'mint_work_queue_scheduler_domain_inflight_workers{backend="vllm",execution_scope="local",scheduler_domain="vllm:Qwen/Qwen3-4B-Instruct-2507::replica::0"} 1',
-        'mint_work_queue_scheduler_domain_capacity_workers{backend="vllm",execution_scope="local",scheduler_domain="vllm:Qwen/Qwen3-4B-Instruct-2507::replica::0"} 2',
-        'mint_work_queue_scheduler_domain_admissible{backend="vllm",execution_scope="local",scheduler_domain="vllm:Qwen/Qwen3-4B-Instruct-2507::replica::0"} 1',
-        'mint_work_queue_scheduler_domain_dequeue_picks_total{backend="vllm",execution_scope="local",scheduler_domain="vllm:Qwen/Qwen3-4B-Instruct-2507::replica::0"} 6',
+        "mint_model_work_scheduler_depth 4",
+        "mint_model_work_scheduler_backlog_depth 2",
+        "mint_model_work_scheduler_appended_total 10",
+        "mint_model_work_scheduler_assigned_total 8",
+        'mint_model_work_scheduler_domain_backlog_depth{domain_key="vllm:Qwen/Qwen3-4B-Instruct-2507"} 2',
+        'mint_model_work_scheduler_replica_queue_depth{domain_key="vllm:Qwen/Qwen3-4B-Instruct-2507",queue_id="vllm:Qwen/Qwen3-4B-Instruct-2507::replica-0",replica_id="replica-0",status="healthy"} 3',
+        "mint_model_work_scheduler_leases 1",
         "mint_future_store_pending 1",
         'mint_future_store_pending{op="asample"} 1',
         "mint_future_store_oldest_pending_s 8",
@@ -463,16 +303,10 @@ def test_issue_248_internal_metrics_omits_unknown_resource_pool_rss(monkeypatch)
         assert line in text, f"missing metric line: {line}"
 
     extra_lines = (
-        'mint_model_load_pct{base_model="Qwen/Qwen3-4B-Instruct-2507",workload="sample"} 50',
+        'mint_model_load_pct{base_model="Qwen/Qwen3-4B-Instruct-2507",workload="sample"} 100',
         'mint_model_pending_requests{base_model="Qwen/Qwen3-4B-Instruct-2507",workload="sample"} 3',
-        'mint_sampling_sessions_total 3',
-        'mint_sampling_sessions_by_model{base_model="Qwen/Qwen3-4B-Instruct-2507"} 2',
-        'mint_training_sessions_total 2',
-        'mint_training_sessions_by_model{backend="megatron",base_model="Qwen/Qwen3-30B-A3B-Instruct-2507"} 2',
-        'mint_vllm_workload_requests_total{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507",op="asample",status="ok"} 8',
-        'mint_vllm_workload_ttft_s_sum{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507",op="asample",status="ok"} 8',
-        'mint_vllm_workload_tpot_s_sum{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507",op="asample",status="ok"} 0.96',
-        'mint_vllm_workload_active_requests{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507",op="asample"} 2',
+        'mint_model_inflight_workers{base_model="Qwen/Qwen3-4B-Instruct-2507",workload="sample"} 1',
+        'mint_model_capacity_workers{base_model="Qwen/Qwen3-4B-Instruct-2507",workload="sample"} 1',
         'mint_resource_pool_actor_gpu_binding{actor_name="vllm-1",gpu_index="0",hostname="host-a",workload="sample"} 1',
         'mint_vllm_scheduler_waiting_requests{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 4',
         'mint_vllm_scheduler_running_requests{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 2',
@@ -510,7 +344,6 @@ def test_issue_248_internal_metrics_omits_unknown_resource_pool_rss(monkeypatch)
         'mint_megatron_session_unknown{actor_name="megatron-1",base_model="Qwen/Qwen3-30B-A3B-Instruct-2507"} 0',
         'mint_megatron_session_step{actor_name="megatron-1",base_model="Qwen/Qwen3-30B-A3B-Instruct-2507"} 17',
         'mint_megatron_learning_rate{actor_name="megatron-1",base_model="Qwen/Qwen3-30B-A3B-Instruct-2507"} 5e-05',
-        'mint_megatron_session_switch_duration_s_total{base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",phase="total",session_state="existing"} 17',
         'mint_megatron_gpu_memory_allocated_bytes{actor_name="megatron-1",base_model="Qwen/Qwen3-30B-A3B-Instruct-2507"} 48000000000',
         'mint_megatron_gpu_memory_reserved_bytes{actor_name="megatron-1",base_model="Qwen/Qwen3-30B-A3B-Instruct-2507"} 52000000000',
         'mint_megatron_gpu_memory_fragmentation_bytes{actor_name="megatron-1",base_model="Qwen/Qwen3-30B-A3B-Instruct-2507"} 4000000000',
@@ -522,14 +355,6 @@ def test_issue_248_internal_metrics_omits_unknown_resource_pool_rss(monkeypatch)
         'mint_resource_pool_observability_refresh_failures_total{actor_type="megatron"} 1',
         'mint_resource_pool_observability_cache_hits_total{actor_type="vllm"} 12',
         'mint_resource_pool_observability_refresh_success_total{actor_type="vllm"} 3',
-        'mint_megatron_session_switch_failures_total{base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",reason="partial_swap"} 2',
-        'mint_megatron_actor_lifecycle_events_total{base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",event="evicted"} 1',
-        'mint_megatron_actor_lifecycle_events_total{base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",event="startup_timeout"} 1',
-        'mint_training_operation_total{backend="megatron",base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",failure_class="none",op="forward_backward",status="ok"} 4',
-        'mint_training_operation_duration_s_sum{backend="megatron",base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",failure_class="none",op="forward_backward",status="ok"} 18',
-        'mint_dense_actor_bind_decision_total{base_model="Qwen/Qwen3-0.6B",decision="rebind_refused_poisoned"} 1',
-        'mint_dense_actor_fatal_total{base_model="Qwen/Qwen3-0.6B",failure_class="cuda_fatal",op="forward_backward"} 1',
-        'mint_dense_actor_retire_total{base_model="Qwen/Qwen3-0.6B",outcome="ok"} 1',
         'mint_dense_actor_poisoned{actor_name="peft_trainer_qwen__qwen3_4b_instruct_2507_maxr64",base_model="Qwen/Qwen3-4B-Instruct-2507",last_fatal_op="reinit_lora_weights"} 1',
         'mint_dense_poisoned_actors{base_model="Qwen/Qwen3-4B-Instruct-2507",last_fatal_op="reinit_lora_weights"} 1',
     )
@@ -587,31 +412,37 @@ def test_issue_248_internal_metrics_marks_stale_cached_rss_without_emitting_valu
 
 
 def test_issue_588_admission_stats_rss_path_preserves_resource_pool_metadata(monkeypatch) -> None:
-    import importlib
-
-    api_work_queue_module = importlib.import_module("tinker_server.backend.api_work_queue")
-    capacity_manager_module = importlib.import_module("tinker_server.backend.capacity_manager")
     future_store_module = importlib.import_module("tinker_server.backend.future_store")
+    model_actor_supervisor_module = importlib.import_module("tinker_server.backend.model_actor_supervisor")
+    model_work_scheduler_module = importlib.import_module("tinker_server.backend.model_work_scheduler")
+    owner_runtime_supervisor_module = importlib.import_module("tinker_server.backend.owner_runtime_supervisor")
+    queue_supervisor_module = importlib.import_module("tinker_server.backend.queue_supervisor")
     resource_pool_module = importlib.import_module("tinker_server.backend.resource_pool")
+    session_heartbeat_store_module = importlib.import_module("tinker_server.backend.session_heartbeat_store")
+    sampling_route = importlib.import_module("tinker_server.routes.sampling")
+    service_route = importlib.import_module("tinker_server.routes.service")
+    dense_session_state_module = importlib.import_module("tinker_server.backend.dense_session_state")
+    ray_cluster_health_module = importlib.import_module("tinker_server.ray_cluster_health")
+    ray_gcs_metrics_module = importlib.import_module("tinker_server.ray_gcs_metrics")
 
-    @dataclass
-    class _CapSnapshot:
-        capacity: int
-        inflight: int
-
-    class _FakeCapacityManager:
-        async def async_snapshot(self, *, timeout_s: float = 10.0) -> _CapSnapshot:
-            return _CapSnapshot(capacity=16, inflight=1)
-
-        async def async_rss_bytes(self, *, timeout_s: float = 10.0) -> int:
-            return 1000
-
-    class _FakeApiWorkQueue:
+    class _FakeModelWorkScheduler:
         async def stats(self, *, timeout_s: float = 10.0) -> dict:
-            return {"depth": 0, "enqueued": 0, "dequeued": 0}
+            return {"depth": 0, "backlog_depth": 0, "replica_queues": {}, "leases": [], "counters": {}}
 
-        async def rss_bytes(self, *, timeout_s: float = 10.0) -> int:
-            return 2000
+    class _FakeModelActorSupervisor:
+        async def async_snapshot(self, *, timeout_s: float = 10.0) -> dict:
+            return {}
+
+    class _FakeSupervisor:
+        async def async_health_snapshot(self, *, timeout_s: float = 10.0) -> dict:
+            return {}
+
+        async def async_snapshot(self, *, timeout_s: float = 10.0) -> dict:
+            return {}
+
+    class _FakeSessionHeartbeatStore:
+        async def async_size(self) -> int:
+            return 0
 
     class _FakeFutureStore:
         async def async_ensure_ready(self, *, timeout_s: float = 10.0) -> dict:
@@ -646,10 +477,18 @@ def test_issue_588_admission_stats_rss_path_preserves_resource_pool_metadata(mon
         def lifecycle_metrics_snapshot(self) -> list[dict]:
             return []
 
-    monkeypatch.setattr(capacity_manager_module, "capacity_manager", _FakeCapacityManager())
-    monkeypatch.setattr(api_work_queue_module, "api_work_queue", _FakeApiWorkQueue())
     monkeypatch.setattr(future_store_module, "future_store", _FakeFutureStore())
+    monkeypatch.setattr(model_work_scheduler_module, "model_work_scheduler", _FakeModelWorkScheduler())
+    monkeypatch.setattr(model_actor_supervisor_module, "model_actor_supervisor", _FakeModelActorSupervisor())
+    monkeypatch.setattr(owner_runtime_supervisor_module, "owner_runtime_supervisor", _FakeSupervisor())
+    monkeypatch.setattr(queue_supervisor_module, "queue_supervisor", _FakeSupervisor())
     monkeypatch.setattr(resource_pool_module, "get_resource_pool", lambda: _FakePool())
+    monkeypatch.setattr(session_heartbeat_store_module, "session_heartbeat_store", _FakeSessionHeartbeatStore())
+    monkeypatch.setattr(sampling_route, "_lora_load_lock_count", lambda: 0)
+    monkeypatch.setattr(service_route, "session_manager", None)
+    monkeypatch.setattr(dense_session_state_module, "collect_dense_session_state_stats", lambda: {})
+    monkeypatch.setattr(ray_cluster_health_module, "get_ray_cluster_health_snapshot", lambda: {})
+    monkeypatch.setattr(ray_gcs_metrics_module, "get_ray_gcs_metrics_snapshot", lambda: {})
 
     stats = asyncio.run(internal_routes.admission_stats(include_actor_rss=True))
     rec = stats["actors"]["resource_pool"][0]
@@ -662,28 +501,37 @@ def test_issue_588_admission_stats_rss_path_preserves_resource_pool_metadata(mon
 
 
 def test_issue_248_admission_stats_metrics_path_uses_cached_pool_snapshot(monkeypatch) -> None:
-    import importlib
-
-    api_work_queue_module = importlib.import_module("tinker_server.backend.api_work_queue")
-    capacity_manager_module = importlib.import_module("tinker_server.backend.capacity_manager")
     future_store_module = importlib.import_module("tinker_server.backend.future_store")
+    model_actor_supervisor_module = importlib.import_module("tinker_server.backend.model_actor_supervisor")
+    model_work_scheduler_module = importlib.import_module("tinker_server.backend.model_work_scheduler")
+    owner_runtime_supervisor_module = importlib.import_module("tinker_server.backend.owner_runtime_supervisor")
+    queue_supervisor_module = importlib.import_module("tinker_server.backend.queue_supervisor")
     resource_pool_module = importlib.import_module("tinker_server.backend.resource_pool")
+    session_heartbeat_store_module = importlib.import_module("tinker_server.backend.session_heartbeat_store")
+    sampling_route = importlib.import_module("tinker_server.routes.sampling")
+    service_route = importlib.import_module("tinker_server.routes.service")
+    dense_session_state_module = importlib.import_module("tinker_server.backend.dense_session_state")
+    ray_cluster_health_module = importlib.import_module("tinker_server.ray_cluster_health")
+    ray_gcs_metrics_module = importlib.import_module("tinker_server.ray_gcs_metrics")
 
-    @dataclass
-    class _CapSnapshot:
-        capacity: int
-        inflight: int
-
-    class _FakeCapacityManager:
-        async def async_snapshot(self, *, timeout_s: float = 10.0) -> _CapSnapshot:
-            return _CapSnapshot(capacity=16, inflight=1)
-
-    class _FakeApiWorkQueue:
-        def metrics_snapshot(self) -> dict:
-            return {"depth": 0, "enqueued": 0, "dequeued": 0}
-
+    class _FakeModelWorkScheduler:
         async def stats(self, *, timeout_s: float = 10.0) -> dict:
-            raise AssertionError("metrics scrape must not call api_work_queue.stats")
+            return {"depth": 0, "backlog_depth": 0, "replica_queues": {}, "leases": [], "counters": {}}
+
+    class _FakeModelActorSupervisor:
+        async def async_snapshot(self, *, timeout_s: float = 10.0) -> dict:
+            return {}
+
+    class _FakeSupervisor:
+        async def async_health_snapshot(self, *, timeout_s: float = 10.0) -> dict:
+            return {}
+
+        async def async_snapshot(self, *, timeout_s: float = 10.0) -> dict:
+            return {}
+
+    class _FakeSessionHeartbeatStore:
+        async def async_size(self) -> int:
+            return 0
 
     class _FakeFutureStore:
         def metrics_snapshot(self) -> dict:
@@ -708,10 +556,18 @@ def test_issue_248_admission_stats_metrics_path_uses_cached_pool_snapshot(monkey
         def rss_snapshot(self, *, timeout_s: float = 10.0) -> list[dict]:
             raise AssertionError("metrics scrape must not call resource_pool.rss_snapshot")
 
-    monkeypatch.setattr(capacity_manager_module, "capacity_manager", _FakeCapacityManager())
-    monkeypatch.setattr(api_work_queue_module, "api_work_queue", _FakeApiWorkQueue())
     monkeypatch.setattr(future_store_module, "future_store", _FakeFutureStore())
+    monkeypatch.setattr(model_work_scheduler_module, "model_work_scheduler", _FakeModelWorkScheduler())
+    monkeypatch.setattr(model_actor_supervisor_module, "model_actor_supervisor", _FakeModelActorSupervisor())
+    monkeypatch.setattr(owner_runtime_supervisor_module, "owner_runtime_supervisor", _FakeSupervisor())
+    monkeypatch.setattr(queue_supervisor_module, "queue_supervisor", _FakeSupervisor())
     monkeypatch.setattr(resource_pool_module, "get_resource_pool", lambda: _FakePool())
+    monkeypatch.setattr(session_heartbeat_store_module, "session_heartbeat_store", _FakeSessionHeartbeatStore())
+    monkeypatch.setattr(sampling_route, "_lora_load_lock_count", lambda: 0)
+    monkeypatch.setattr(service_route, "session_manager", None)
+    monkeypatch.setattr(dense_session_state_module, "collect_dense_session_state_stats", lambda: {})
+    monkeypatch.setattr(ray_cluster_health_module, "get_ray_cluster_health_snapshot", lambda: {})
+    monkeypatch.setattr(ray_gcs_metrics_module, "get_ray_gcs_metrics_snapshot", lambda: {})
 
     stats = asyncio.run(internal_routes.admission_stats(include_actor_rss=False))
 
@@ -720,84 +576,43 @@ def test_issue_248_admission_stats_metrics_path_uses_cached_pool_snapshot(monkey
 
 
 def test_issue_248_metrics_path_exports_cached_scheduler_model_load(monkeypatch) -> None:
-    api_work_queue_module = importlib.import_module("tinker_server.backend.api_work_queue")
-    capacity_manager_module = importlib.import_module("tinker_server.backend.capacity_manager")
-    future_store_module = importlib.import_module("tinker_server.backend.future_store")
-    resource_pool_module = importlib.import_module("tinker_server.backend.resource_pool")
-
-    @dataclass
-    class _CapSnapshot:
-        capacity: int
-        inflight: int
-
-    class _FakeCapacityManager:
-        async def async_snapshot(self, *, timeout_s: float = 10.0) -> _CapSnapshot:
-            return _CapSnapshot(capacity=16, inflight=1)
-
-    class _FakeApiWorkQueue:
-        def metrics_snapshot(self) -> dict:
-            return {
+    async def _stats(*, include_actor_rss: bool = True) -> dict:
+        return {
+            "model_work_scheduler": {
                 "depth": 5,
-                "depth_legacy": 3,
-                "depth_scheduled": 2,
-                "enqueued": 9,
-                "dequeued": 4,
-                "scheduler_metrics_ready": True,
-                "scheduler_enabled": True,
-                "scheduler_domains_total": 1,
-                "scheduler_domains": {
-                    "vllm:Qwen/Qwen3-4B-Instruct-2507::replica::0": {
-                        "backend": "vllm",
-                        "pending_requests": 3,
-                        "active_sessions": 2,
-                        "oldest_queued_s": 11.0,
-                        "inflight_workers": 1,
-                        "capacity_workers": 2,
-                        "admissible": True,
-                        "service_gap_s": 5.5,
-                        "stats": {"picks": 6, "starvation_picks": 1},
-                    }
+                "backlog_depth": 2,
+                "backlog_depth_by_domain": {"vllm:Qwen/Qwen3-4B-Instruct-2507": 2},
+                "replica_queues": {
+                    "vllm:Qwen/Qwen3-4B-Instruct-2507::replica-0": {
+                        "domain_key": "vllm:Qwen/Qwen3-4B-Instruct-2507",
+                        "replica_id": "replica-0",
+                        "depth": 3,
+                        "status": "healthy",
+                    },
+                    "vllm:Qwen/Qwen3-4B-Instruct-2507::replica-1": {
+                        "domain_key": "vllm:Qwen/Qwen3-4B-Instruct-2507",
+                        "replica_id": "replica-1",
+                        "depth": 0,
+                        "status": "healthy",
+                    },
                 },
-            }
+                "leases": [
+                    {"item": {"domain_key": "vllm:Qwen/Qwen3-4B-Instruct-2507"}},
+                ],
+                "counters": {},
+            },
+            "future_store": {},
+            "actors": {"resource_pool": []},
+            "process": {},
+        }
 
-        async def stats(self, *, timeout_s: float = 10.0) -> dict:
-            raise AssertionError("metrics scrape must not call api_work_queue.stats")
-
-    class _FakeFutureStore:
-        def metrics_snapshot(self) -> dict:
-            return {"pending": 0, "results": 0, "errors": 0}
-
-        def ensure_ready(self, *, timeout_s: float = 10.0) -> dict:
-            raise AssertionError("metrics scrape must not call future_store.ensure_ready")
-
-    class _FakePool:
-        def cached_snapshot(self) -> list[dict]:
-            return []
-
-        def metadata_cache_metrics_snapshot(self) -> list[dict]:
-            return []
-
-        def lifecycle_metrics_snapshot(self) -> list[dict]:
-            return []
-
-        def rss_snapshot(self, *, timeout_s: float = 10.0) -> list[dict]:
-            raise AssertionError("metrics scrape must not call resource_pool.rss_snapshot")
-
-    monkeypatch.setattr(capacity_manager_module, "capacity_manager", _FakeCapacityManager())
-    monkeypatch.setattr(api_work_queue_module, "api_work_queue", _FakeApiWorkQueue())
-    monkeypatch.setattr(future_store_module, "future_store", _FakeFutureStore())
-    monkeypatch.setattr(resource_pool_module, "get_resource_pool", lambda: _FakePool())
+    monkeypatch.setattr(internal_routes, "admission_stats", _stats)
 
     resp = asyncio.run(internal_routes.metrics())
     text = resp.body.decode("utf-8")
 
-    assert "mint_work_queue_depth_scheduled 2" in text
-    assert "mint_work_queue_scheduler_enabled 1" in text
-    assert "mint_work_queue_scheduler_domains_total 1" in text
-    assert (
-        'mint_work_queue_scheduler_domain_pending_requests{backend="vllm",execution_scope="local",scheduler_domain="vllm:Qwen/Qwen3-4B-Instruct-2507::replica::0"} 3'
-        in text
-    )
+    assert "mint_model_work_scheduler_depth 5" in text
+    assert "mint_model_work_scheduler_backlog_depth 2" in text
     assert (
         'mint_model_load_pct{base_model="Qwen/Qwen3-4B-Instruct-2507",workload="sample"} 50'
         in text
@@ -809,38 +624,47 @@ def test_issue_248_metrics_path_exports_cached_scheduler_model_load(monkeypatch)
 
 
 def test_issue_248_scheduler_decisions_debug_route_proxies_filters(monkeypatch) -> None:
-    api_work_queue_module = importlib.import_module("tinker_server.backend.api_work_queue")
-    captured: dict[str, object] = {}
+    model_work_scheduler_module = importlib.import_module("tinker_server.backend.model_work_scheduler")
 
-    class _FakeApiWorkQueue:
-        async def scheduler_decisions(self, **kwargs) -> dict:
-            captured.update(kwargs)
+    class _FakeModelWorkScheduler:
+        async def stats(self, *, timeout_s: float = 10.0) -> dict:
             return {
-                "actor_name": "tinker_api_work_queue",
-                "last_seq": 12,
-                "items": [],
-                "scheduler": {"enabled": True},
+                "depth": 2,
+                "backlog_depth_by_domain": {
+                    "vllm:Qwen/Qwen3-4B-Instruct-2507": 2,
+                    "megatron:Qwen/Qwen3-30B-A3B-Instruct-2507": 1,
+                },
+                "replica_queues": {
+                    "vllm:Qwen/Qwen3-4B-Instruct-2507::replica-0": {
+                        "domain_key": "vllm:Qwen/Qwen3-4B-Instruct-2507",
+                        "depth": 2,
+                    },
+                    "megatron:Qwen/Qwen3-30B-A3B-Instruct-2507::replica-0": {
+                        "domain_key": "megatron:Qwen/Qwen3-30B-A3B-Instruct-2507",
+                        "depth": 1,
+                    },
+                },
+                "leases": [
+                    {"item": {"domain_key": "vllm:Qwen/Qwen3-4B-Instruct-2507"}},
+                    {"item": {"domain_key": "megatron:Qwen/Qwen3-30B-A3B-Instruct-2507"}},
+                ],
             }
 
-    monkeypatch.setattr(api_work_queue_module, "api_work_queue", _FakeApiWorkQueue())
+    monkeypatch.setattr(model_work_scheduler_module, "model_work_scheduler", _FakeModelWorkScheduler())
 
     payload = asyncio.run(
         internal_routes.scheduler_decisions_debug(
             limit=25,
-            scheduler_domain="vllm:Qwen/Qwen3-4B-Instruct-2507::replica::0",
+            scheduler_domain="vllm:Qwen/Qwen3-4B-Instruct-2507",
             reason="sticky",
             since_seq=7,
         )
     )
 
-    assert captured == {
-        "limit": 25,
-        "scheduler_domain": "vllm:Qwen/Qwen3-4B-Instruct-2507::replica::0",
-        "reason": "sticky",
-        "since_seq": 7,
-        "timeout_s": 10.0,
-    }
-    assert payload["last_seq"] == 12
+    assert payload["decision_log_removed"] is True
+    assert list(payload["backlog_depth_by_domain"]) == ["vllm:Qwen/Qwen3-4B-Instruct-2507"]
+    assert list(payload["replica_queues"]) == ["vllm:Qwen/Qwen3-4B-Instruct-2507::replica-0"]
+    assert payload["leases"] == [{"item": {"domain_key": "vllm:Qwen/Qwen3-4B-Instruct-2507"}}]
 
 
 def test_issue_248_internal_metrics_exports_ray_control_plane_cache_timestamps(monkeypatch) -> None:

@@ -94,6 +94,25 @@ class _StubFutureStore:
         return None
 
 
+class _StubModelWorkScheduler:
+    def __init__(self, *, fail_stats: str | None = None):
+        self.fail_stats = fail_stats
+        self.stats_calls: list[dict[str, float]] = []
+
+    async def stats(self, *, timeout_s: float = 10.0) -> dict:
+        self.stats_calls.append({"timeout_s": float(timeout_s)})
+        if self.fail_stats is not None:
+            raise RuntimeError(self.fail_stats)
+        return {
+            "depth": 0,
+            "backlog_depth": 0,
+            "backlog_depth_by_domain": {},
+            "replica_queues": {},
+            "leases": [],
+            "counters": {},
+        }
+
+
 class _StubInitRayCalls(list):
     def __call__(self, *args, **kwargs):
         self.append({"args": args, "kwargs": kwargs})
@@ -288,6 +307,7 @@ def _install_lifespan_stubs(
     init_ray_calls: _StubInitRayCalls | None = None,
     future_store: _StubFutureStore | None = None,
     model_actor_supervisor: _StubModelActorSupervisor | None = None,
+    model_work_scheduler: _StubModelWorkScheduler | None = None,
 ) -> None:
     monkeypatch.setattr(app_module, "_cleanup_stale_actors", _noop_async)
     monkeypatch.setattr(app_module, "_restore_sampling_sessions", _noop_async)
@@ -296,6 +316,7 @@ def _install_lifespan_stubs(
     monkeypatch.setattr(app_module.config, "api_work_queue_num_workers", 1)
 
     api_work_queue_module = importlib.import_module("tinker_server.backend.api_work_queue")
+    config_actor_module = importlib.import_module("tinker_server.backend.config_actor")
     future_store_module = importlib.import_module("tinker_server.backend.future_store")
     capacity_manager_module = importlib.import_module("tinker_server.backend.capacity_manager")
     gateway_session_store_module = importlib.import_module("tinker_server.backend.gateway_session_store")
@@ -312,6 +333,7 @@ def _install_lifespan_stubs(
     owner_runtime_module = importlib.import_module("tinker_server.backend.owner_runtime_supervisor")
     queue_execution_runtime_module = importlib.import_module("tinker_server.backend.queue_execution_runtime")
     model_actor_supervisor_module = importlib.import_module("tinker_server.backend.model_actor_supervisor")
+    model_work_scheduler_module = importlib.import_module("tinker_server.backend.model_work_scheduler")
 
     verl_training_module = types.ModuleType("tinker_server.backend.verl_training")
     verl_training_module.VerlTrainingEngine = _StubTrainingEngine
@@ -322,12 +344,18 @@ def _install_lifespan_stubs(
     else:
         monkeypatch.setattr(app_module, "init_ray", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(api_work_queue_module, "api_work_queue", queue)
+    monkeypatch.setattr(config_actor_module, "async_ensure_started", _noop_async)
     monkeypatch.setattr(owner_runtime_module, "owner_runtime_supervisor", owner_runtime)
     monkeypatch.setattr(queue_execution_runtime_module, "queue_execution_runtime", queue_execution_runtime)
     monkeypatch.setattr(
         model_actor_supervisor_module,
         "model_actor_supervisor",
         model_actor_supervisor or _StubModelActorSupervisor(),
+    )
+    monkeypatch.setattr(
+        model_work_scheduler_module,
+        "model_work_scheduler",
+        model_work_scheduler or _StubModelWorkScheduler(),
     )
     monkeypatch.setattr(capacity_manager_module, "capacity_manager", _StubCapacityManager())
     monkeypatch.setattr(future_store_module, "future_store", future_store or _StubFutureStore())
@@ -363,13 +391,18 @@ def _install_lifespan_stubs(
     monkeypatch.setattr(usage_store_module, "close_usage_store", _noop_async)
 
 
-def test_lifespan_surfaces_queue_runtime_prewarm_failure(monkeypatch) -> None:
+def test_lifespan_surfaces_model_work_scheduler_start_failure(monkeypatch) -> None:
     queue = _StubApiWorkQueue()
     owner_runtime = _StubOwnerRuntimeSupervisor()
-    queue_execution_runtime = _StubQueueExecutionRuntime(
-        fail_async_ensure_started="prewarm failed: pinned worker full"
+    queue_execution_runtime = _StubQueueExecutionRuntime()
+    model_work_scheduler = _StubModelWorkScheduler(fail_stats="scheduler unavailable")
+    _install_lifespan_stubs(
+        monkeypatch,
+        queue,
+        owner_runtime,
+        queue_execution_runtime,
+        model_work_scheduler=model_work_scheduler,
     )
-    _install_lifespan_stubs(monkeypatch, queue, owner_runtime, queue_execution_runtime)
     lease = _StubStartupLease(is_owner=True)
 
     async def _acquire_startup_lease(*_args, **_kwargs):
@@ -381,33 +414,36 @@ def test_lifespan_surfaces_queue_runtime_prewarm_failure(monkeypatch) -> None:
     )
 
     async def _run() -> None:
-        with pytest.raises(RuntimeError, match="prewarm failed: pinned worker full"):
+        with pytest.raises(RuntimeError, match="scheduler unavailable"):
             async with app_module.lifespan(app_module.app):
-                raise AssertionError("lifespan should not yield on queue runtime prewarm failure")
+                raise AssertionError("lifespan should not yield on scheduler startup failure")
 
     asyncio.run(_run())
     assert queue.started_workers == 0
     assert owner_runtime.started == 1
     assert lease.released is True
     assert app_module.service.session_manager is None
-    assert queue_execution_runtime.ensure_started_calls == [
-        {"num_workers": 1, "timeout_s": 120.0}
-    ]
+    assert queue_execution_runtime.ensure_started_calls == []
+    assert model_work_scheduler.stats_calls == [{"timeout_s": 10.0}]
 
 
-def test_lifespan_routes_persistent_prewarm_to_queue_runtime(monkeypatch) -> None:
+def test_lifespan_starts_model_work_scheduler_without_queue_runtime(monkeypatch) -> None:
     queue = _StubApiWorkQueue()
     owner_runtime = _StubOwnerRuntimeSupervisor()
     queue_execution_runtime = _StubQueueExecutionRuntime()
-    _install_lifespan_stubs(monkeypatch, queue, owner_runtime, queue_execution_runtime)
+    model_work_scheduler = _StubModelWorkScheduler()
+    _install_lifespan_stubs(
+        monkeypatch,
+        queue,
+        owner_runtime,
+        queue_execution_runtime,
+        model_work_scheduler=model_work_scheduler,
+    )
     lease = _StubStartupLease(is_owner=True)
 
     async def _acquire_startup_lease(*_args, **_kwargs):
         return lease
 
-    monkeypatch.setattr(app_module.config, "prewarm_persistent_models_csv", "Qwen/Qwen3-30B-A3B-Instruct-2507")
-    monkeypatch.setattr(app_module.config, "prewarm_enable_training", True)
-    monkeypatch.setattr(app_module.config, "prewarm_enable_inference", False)
     monkeypatch.setattr(
         "tinker_server.backend.startup_lease.acquire_startup_lease",
         _acquire_startup_lease,
@@ -422,12 +458,9 @@ def test_lifespan_routes_persistent_prewarm_to_queue_runtime(monkeypatch) -> Non
     assert owner_runtime.started == 1
     assert lease.released is True
     assert app_module.service.session_manager is None
-    assert queue_execution_runtime.ensure_started_calls == [
-        {
-            "num_workers": 1,
-            "timeout_s": app_module._queue_execution_runtime_start_timeout_s(),
-        }
-    ]
+    assert queue_execution_runtime.ensure_started_calls == []
+    assert queue.started_workers == 0
+    assert model_work_scheduler.stats_calls == [{"timeout_s": 10.0}]
 
 
 def test_lifespan_reconciles_model_actor_supervisor_when_desired(monkeypatch) -> None:
@@ -525,9 +558,7 @@ def test_lifespan_follower_skips_leader_only_startup(monkeypatch) -> None:
     assert lease.heartbeat_started is False
     assert lease.released is True
     assert app_module.service.session_manager is None
-    assert queue_execution_runtime.ensure_started_calls == [
-        {"num_workers": 1, "timeout_s": 120.0}
-    ]
+    assert queue_execution_runtime.ensure_started_calls == []
     assert len(init_ray_calls) == 1
     assert init_ray_calls[0]["kwargs"]["namespace"] == "tinker"
 
@@ -563,9 +594,7 @@ def test_lifespan_owner_runtime_local_only_uses_async_cleanup_helper(monkeypatch
     assert owner_runtime.started == 0
     assert lease.heartbeat_started is True
     assert lease.released is True
-    assert queue_execution_runtime.ensure_started_calls == [
-        {"num_workers": 1, "timeout_s": 120.0}
-    ]
+    assert queue_execution_runtime.ensure_started_calls == []
 
 
 def test_lifespan_init_ray_when_head_address_path_configured(monkeypatch, tmp_path: Path) -> None:
@@ -601,7 +630,7 @@ def test_lifespan_init_ray_when_head_address_path_configured(monkeypatch, tmp_pa
     assert init_ray_calls[0]["kwargs"]["namespace"] == "tinker"
 
 
-def test_lifespan_uses_started_probes_for_queue_and_future_store(monkeypatch) -> None:
+def test_lifespan_uses_started_probe_for_future_store(monkeypatch) -> None:
     queue = _StubApiWorkQueue(fail_async_ensure_ready=True)
     future_store = _StubFutureStore(fail_async_ensure_ready=True)
     owner_runtime = _StubOwnerRuntimeSupervisor()
@@ -631,11 +660,9 @@ def test_lifespan_uses_started_probes_for_queue_and_future_store(monkeypatch) ->
 
     assert future_store.async_ensure_started_calls == 1
     assert future_store.async_ensure_ready_calls == 0
-    assert queue.async_ensure_started_calls == 1
+    assert queue.async_ensure_started_calls == 0
     assert queue.async_ensure_ready_calls == 0
-    assert queue_execution_runtime.ensure_started_calls == [
-        {"num_workers": 1, "timeout_s": 120.0}
-    ]
+    assert queue_execution_runtime.ensure_started_calls == []
     assert lease.released is True
 
 
@@ -809,186 +836,7 @@ def test_lifespan_keeps_training_route_globals_unbound_in_stateless_api(monkeypa
     assert queue.started_workers == 0
     assert owner_runtime.started == 1
     assert lease.released is True
-    assert queue_execution_runtime.ensure_started_calls == [
-        {"num_workers": 1, "timeout_s": 120.0}
-    ]
-
-
-def test_lifespan_local_queue_runtime_cleans_up_bound_handles(monkeypatch) -> None:
-    queue = _StubApiWorkQueue()
-    owner_runtime = _StubOwnerRuntimeSupervisor()
-    queue_execution_runtime = _StubQueueExecutionRuntime()
-    _install_lifespan_stubs(monkeypatch, queue, owner_runtime, queue_execution_runtime)
-    lease = _StubStartupLease(is_owner=True)
-    shutdown_calls: list[tuple[str, object]] = []
-    register_calls: list[int] = []
-
-    async def _acquire_startup_lease(*_args, **_kwargs):
-        return lease
-
-    async def _record_inference_shutdown(manager) -> None:
-        shutdown_calls.append(("inference", manager))
-
-    async def _record_training_shutdown(manager) -> None:
-        shutdown_calls.append(("training", manager))
-
-    inference_manager = SimpleNamespace(_cleanup_task=None, _sessions={})
-    train_manager = SimpleNamespace(_cleanup_task=None, _sessions={})
-    multi_model_manager = _TrackedMultiModelManager()
-
-    async def _fake_initialize_execution_bindings():
-        from tinker_server.routes import mint as mint_routes
-        from tinker_server.routes import sampling as sampling_routes
-        from tinker_server.routes import service as service_routes
-        from tinker_server.routes import training as training_routes
-        from tinker_server.routes import weights as weights_routes
-
-        service_routes.session_manager = inference_manager
-        sampling_routes.session_manager = inference_manager
-        training_routes.training_manager = train_manager
-        training_routes.training_engine = object()
-        training_routes.inference_manager = inference_manager
-        mint_routes.training_manager = train_manager
-        mint_routes.training_engine = object()
-        weights_routes.training_manager = train_manager
-        weights_routes.training_engine = object()
-        weights_routes.inference_manager = inference_manager
-        return {
-            "inference_manager": inference_manager,
-            "train_manager": train_manager,
-            "multi_model_manager": multi_model_manager,
-            "restored_sampling_sessions": 0,
-            "multi_model_enabled": False,
-        }
-
-    monkeypatch.setenv("MINT_QUEUE_EXECUTION_RUNTIME_LOCAL_ONLY", "1")
-    monkeypatch.setattr(app_module, "_shutdown_local_inference_runtime", _record_inference_shutdown)
-    monkeypatch.setattr(app_module, "_shutdown_local_training_runtime", _record_training_shutdown)
-    monkeypatch.setattr(
-        "tinker_server.backend.startup_lease.acquire_startup_lease",
-        _acquire_startup_lease,
-    )
-    monkeypatch.setattr(
-        "tinker_server.backend.queue_execution_runtime._initialize_execution_bindings",
-        _fake_initialize_execution_bindings,
-    )
-    monkeypatch.setattr(
-        "tinker_server.backend.api_work_queue_dispatch.register_api_work_queue_executors",
-        lambda _queue: register_calls.append(1),
-    )
-
-    from tinker_server.routes import mint as mint_routes
-    from tinker_server.routes import sampling as sampling_routes
-    from tinker_server.routes import service as service_routes
-    from tinker_server.routes import training as training_routes
-    from tinker_server.routes import weights as weights_routes
-
-    async def _run() -> None:
-        async with app_module.lifespan(app_module.app):
-            assert service_routes.session_manager is inference_manager
-            assert sampling_routes.session_manager is inference_manager
-            assert training_routes.training_manager is train_manager
-            assert mint_routes.training_manager is train_manager
-            assert weights_routes.inference_manager is inference_manager
-
-    asyncio.run(_run())
-
-    assert shutdown_calls == [
-        ("training", train_manager),
-        ("inference", inference_manager),
-    ]
-    assert multi_model_manager.shutdown_calls == 1
-    assert register_calls == [1]
-    assert queue.started_workers == 1
-    assert queue.wait_until_execution_ready_calls == [120.0]
     assert queue_execution_runtime.ensure_started_calls == []
-    assert owner_runtime.started == 1
-    assert lease.released is True
-    assert service_routes.session_manager is None
-    assert sampling_routes.session_manager is None
-    assert training_routes.training_manager is None
-    assert training_routes.training_engine is None
-    assert training_routes.inference_manager is None
-    assert mint_routes.training_manager is None
-    assert mint_routes.training_engine is None
-    assert weights_routes.training_manager is None
-    assert weights_routes.training_engine is None
-    assert weights_routes.inference_manager is None
-
-
-def test_lifespan_local_queue_runtime_start_failure_still_cleans_up_bound_handles(monkeypatch) -> None:
-    queue = _StubApiWorkQueue(fail_wait_until_execution_ready=True)
-    owner_runtime = _StubOwnerRuntimeSupervisor()
-    queue_execution_runtime = _StubQueueExecutionRuntime()
-    _install_lifespan_stubs(monkeypatch, queue, owner_runtime, queue_execution_runtime)
-    lease = _StubStartupLease(is_owner=True)
-    shutdown_calls: list[tuple[str, object]] = []
-
-    async def _acquire_startup_lease(*_args, **_kwargs):
-        return lease
-
-    async def _record_inference_shutdown(manager) -> None:
-        shutdown_calls.append(("inference", manager))
-
-    async def _record_training_shutdown(manager) -> None:
-        shutdown_calls.append(("training", manager))
-
-    inference_manager = SimpleNamespace(_cleanup_task=None, _sessions={})
-    train_manager = SimpleNamespace(_cleanup_task=None, _sessions={})
-
-    async def _fake_initialize_execution_bindings():
-        from tinker_server.routes import service as service_routes
-        from tinker_server.routes import training as training_routes
-
-        service_routes.session_manager = inference_manager
-        training_routes.training_manager = train_manager
-        training_routes.inference_manager = inference_manager
-        return {
-            "inference_manager": inference_manager,
-            "train_manager": train_manager,
-            "multi_model_manager": None,
-            "restored_sampling_sessions": 0,
-            "multi_model_enabled": False,
-        }
-
-    monkeypatch.setenv("MINT_QUEUE_EXECUTION_RUNTIME_LOCAL_ONLY", "1")
-    monkeypatch.setattr(app_module, "_shutdown_local_inference_runtime", _record_inference_shutdown)
-    monkeypatch.setattr(app_module, "_shutdown_local_training_runtime", _record_training_shutdown)
-    monkeypatch.setattr(
-        "tinker_server.backend.startup_lease.acquire_startup_lease",
-        _acquire_startup_lease,
-    )
-    monkeypatch.setattr(
-        "tinker_server.backend.queue_execution_runtime._initialize_execution_bindings",
-        _fake_initialize_execution_bindings,
-    )
-    monkeypatch.setattr(
-        "tinker_server.backend.api_work_queue_dispatch.register_api_work_queue_executors",
-        lambda _queue: None,
-    )
-
-    from tinker_server.routes import service as service_routes
-    from tinker_server.routes import training as training_routes
-
-    async def _run() -> None:
-        with pytest.raises(RuntimeError, match="local queue runtime not ready"):
-            async with app_module.lifespan(app_module.app):
-                raise AssertionError("lifespan should not yield on local queue runtime failure")
-
-    asyncio.run(_run())
-
-    assert shutdown_calls == [
-        ("training", train_manager),
-        ("inference", inference_manager),
-    ]
-    assert queue.started_workers == 1
-    assert queue.wait_until_execution_ready_calls == [120.0]
-    assert queue_execution_runtime.ensure_started_calls == []
-    assert owner_runtime.started == 1
-    assert lease.released is True
-    assert service_routes.session_manager is None
-    assert training_routes.training_manager is None
-    assert training_routes.inference_manager is None
 
 
 def test_lifespan_skips_tokenizer_preload_for_multi_worker_startup(monkeypatch) -> None:
@@ -1016,9 +864,7 @@ def test_lifespan_skips_tokenizer_preload_for_multi_worker_startup(monkeypatch) 
     asyncio.run(_run())
 
     assert preload_calls == []
-    assert queue_execution_runtime.ensure_started_calls == [
-        {"num_workers": 1, "timeout_s": 120.0}
-    ]
+    assert queue_execution_runtime.ensure_started_calls == []
 
 
 @pytest.mark.anyio

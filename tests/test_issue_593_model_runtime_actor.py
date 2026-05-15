@@ -178,22 +178,6 @@ class _FakeFutureStore:
         return {"failed": True, "reason": "failed"}
 
 
-class _FakeCapacityManager:
-    def __init__(self) -> None:
-        self.queue_released: list[str] = []
-        self.object_released: list[str] = []
-        self.all_released: list[str] = []
-
-    async def async_release_queue(self, request_id: str):
-        self.queue_released.append(str(request_id))
-
-    async def async_release_object_store(self, request_id: str):
-        self.object_released.append(str(request_id))
-
-    async def async_release_all(self, request_id: str):
-        self.all_released.append(str(request_id))
-
-
 class _FakeTaskStateStore:
     def __init__(self) -> None:
         self.successes: list[dict] = []
@@ -213,7 +197,6 @@ async def test_issue_593_model_runtime_claims_executes_renews_and_completes() ->
     lease = _lease()
     scheduler = _FakeScheduler(claims=[[lease]])
     future_store = _FakeFutureStore(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
-    capacity = _FakeCapacityManager()
     seen_context: list[tuple[str | None, int | None, str | None, str | None, int | None]] = []
 
     async def _executor(_lease: dict) -> None:
@@ -237,7 +220,6 @@ async def test_issue_593_model_runtime_claims_executes_renews_and_completes() ->
         lease_ttl_s=0.3,
         scheduler_client=scheduler,
         future_store_client=future_store,
-        capacity_manager_client=capacity,
         executor=_executor,
     )
 
@@ -265,7 +247,6 @@ async def test_issue_593_model_runtime_claims_executes_renews_and_completes() ->
             3,
         )
     ]
-    assert capacity.queue_released == [lease["item"]["request_id"]]
     assert future_store.running[0][0] == lease["item"]["request_id"]
     assert future_store.running[0][1]["domain_key"] == "vllm:model-a"
     assert future_store.running[0][1]["replica_id"] == "replica-0"
@@ -307,7 +288,6 @@ async def test_issue_616_model_runtime_commits_success_to_task_state_store(tmp_p
     future_store = _FakeFutureStore(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
     task_state_store = _FakeTaskStateStore()
     payload_store = TaskPayloadStore(tmp_path)
-    capacity = _FakeCapacityManager()
 
     async def _executor(_lease: dict) -> None:
         await future_store.async_resolve(_lease["item"]["request_id"], {"ok": True})
@@ -321,7 +301,6 @@ async def test_issue_616_model_runtime_commits_success_to_task_state_store(tmp_p
         future_store_client=future_store,
         task_state_store_client=task_state_store,
         payload_store=payload_store,
-        capacity_manager_client=capacity,
         executor=_executor,
     )
 
@@ -360,7 +339,6 @@ async def test_issue_616_model_runtime_does_not_requeue_after_task_state_success
         fail_terminal_write=True,
     )
     task_state_store = _FakeTaskStateStore()
-    capacity = _FakeCapacityManager()
 
     async def _executor(_lease: dict) -> None:
         await future_store.async_resolve(_lease["item"]["request_id"], {"ok": True})
@@ -374,7 +352,6 @@ async def test_issue_616_model_runtime_does_not_requeue_after_task_state_success
         future_store_client=future_store,
         task_state_store_client=task_state_store,
         payload_store=TaskPayloadStore(tmp_path),
-        capacity_manager_client=capacity,
         executor=_executor,
     )
 
@@ -404,7 +381,6 @@ async def test_issue_616_model_runtime_commits_executor_failure_to_task_state_st
     scheduler = _FakeScheduler(claims=[[lease]])
     future_store = _FakeFutureStore(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
     task_state_store = _FakeTaskStateStore()
-    capacity = _FakeCapacityManager()
 
     async def _executor(_lease: dict) -> None:
         raise RuntimeError("boom")
@@ -418,7 +394,6 @@ async def test_issue_616_model_runtime_commits_executor_failure_to_task_state_st
         future_store_client=future_store,
         task_state_store_client=task_state_store,
         payload_store=TaskPayloadStore(tmp_path),
-        capacity_manager_client=capacity,
         executor=_executor,
     )
 
@@ -454,7 +429,6 @@ async def test_issue_616_model_runtime_does_not_requeue_after_task_state_failure
         fail_terminal_write=True,
     )
     task_state_store = _FakeTaskStateStore()
-    capacity = _FakeCapacityManager()
 
     async def _executor(_lease: dict) -> None:
         raise RuntimeError("boom")
@@ -468,7 +442,6 @@ async def test_issue_616_model_runtime_does_not_requeue_after_task_state_failure
         future_store_client=future_store,
         task_state_store_client=task_state_store,
         payload_store=TaskPayloadStore(tmp_path),
-        capacity_manager_client=capacity,
         executor=_executor,
     )
 
@@ -493,7 +466,6 @@ async def test_issue_593_model_runtime_executor_failure_fails_future_and_lease()
     lease = _lease("runtime-req-fail")
     scheduler = _FakeScheduler(claims=[[lease]])
     future_store = _FakeFutureStore(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
-    capacity = _FakeCapacityManager()
 
     async def _executor(_lease: dict) -> None:
         raise RuntimeError("boom")
@@ -505,7 +477,6 @@ async def test_issue_593_model_runtime_executor_failure_fails_future_and_lease()
         actor_generation=3,
         scheduler_client=scheduler,
         future_store_client=future_store,
-        capacity_manager_client=capacity,
         executor=_executor,
     )
 
@@ -513,7 +484,6 @@ async def test_issue_593_model_runtime_executor_failure_fails_future_and_lease()
 
     assert result == {"claimed": 1, "executed": 1}
     assert future_store.failed == [(lease["item"]["request_id"], "executor failed: boom")]
-    assert capacity.object_released == [lease["item"]["request_id"]]
     assert scheduler.begin_finalized == [
         {
             "lease_id": lease["lease_id"],
@@ -543,7 +513,6 @@ async def test_issue_593_model_runtime_future_fail_finalization_fails_lease() ->
     lease = _lease("runtime-req-finalized-fail")
     scheduler = _FakeScheduler(claims=[[lease]])
     future_store = _FakeFutureStore(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
-    capacity = _FakeCapacityManager()
 
     async def _executor(_lease: dict) -> None:
         await future_store.async_fail(_lease["item"]["request_id"], "engine startup failed")
@@ -555,7 +524,6 @@ async def test_issue_593_model_runtime_future_fail_finalization_fails_lease() ->
         actor_generation=3,
         scheduler_client=scheduler,
         future_store_client=future_store,
-        capacity_manager_client=capacity,
         executor=_executor,
     )
 
@@ -573,7 +541,6 @@ async def test_issue_593_model_runtime_future_fail_finalization_fails_lease() ->
             "requeue": False,
         }
     ]
-    assert capacity.object_released == [lease["item"]["request_id"]]
     snapshot = actor.health_snapshot()
     assert snapshot["completed_total"] == 0
     assert snapshot["failed_total"] == 1
@@ -588,7 +555,6 @@ async def test_issue_593_model_runtime_requeues_if_future_store_finalize_fails()
         statuses={lease["item"]["request_id"]: FutureStatus.PENDING},
         fail_terminal_write=True,
     )
-    capacity = _FakeCapacityManager()
 
     async def _executor(_lease: dict) -> None:
         await future_store.async_resolve(_lease["item"]["request_id"], {"ok": True})
@@ -599,7 +565,6 @@ async def test_issue_593_model_runtime_requeues_if_future_store_finalize_fails()
         actor_generation=3,
         scheduler_client=scheduler,
         future_store_client=future_store,
-        capacity_manager_client=capacity,
         executor=_executor,
     )
 
@@ -625,7 +590,6 @@ async def test_issue_593_model_runtime_fails_future_if_lease_missing_before_fina
     lease = _lease("runtime-req-missing-finalize-lease")
     scheduler = _FakeScheduler(claims=[[lease]], begin_finalize_ok=False)
     future_store = _FakeFutureStore(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
-    capacity = _FakeCapacityManager()
 
     async def _executor(_lease: dict) -> None:
         await future_store.async_resolve(_lease["item"]["request_id"], {"ok": True})
@@ -636,7 +600,6 @@ async def test_issue_593_model_runtime_fails_future_if_lease_missing_before_fina
         actor_generation=3,
         scheduler_client=scheduler,
         future_store_client=future_store,
-        capacity_manager_client=capacity,
         executor=_executor,
     )
 
@@ -650,7 +613,6 @@ async def test_issue_593_model_runtime_fails_future_if_lease_missing_before_fina
             "model work scheduler lost active lease; request must be retried",
         )
     ]
-    assert capacity.all_released == [lease["item"]["request_id"]]
     assert scheduler.failed == []
     snapshot = actor.health_snapshot()
     assert snapshot["failed_total"] == 1
@@ -665,7 +627,6 @@ async def test_issue_593_model_runtime_releases_capacity_if_lost_lease_fail_writ
         statuses={lease["item"]["request_id"]: FutureStatus.PENDING},
         fail_terminal_write=True,
     )
-    capacity = _FakeCapacityManager()
 
     async def _executor(_lease: dict) -> None:
         await future_store.async_resolve(_lease["item"]["request_id"], {"ok": True})
@@ -676,7 +637,6 @@ async def test_issue_593_model_runtime_releases_capacity_if_lost_lease_fail_writ
         actor_generation=3,
         scheduler_client=scheduler,
         future_store_client=future_store,
-        capacity_manager_client=capacity,
         executor=_executor,
     )
 
@@ -684,7 +644,6 @@ async def test_issue_593_model_runtime_releases_capacity_if_lost_lease_fail_writ
 
     assert result == {"claimed": 1, "executed": 1}
     assert future_store.failed == []
-    assert capacity.all_released == [lease["item"]["request_id"]]
     assert actor.health_snapshot()["failed_total"] == 0
 
 
@@ -693,7 +652,6 @@ async def test_issue_593_model_runtime_does_not_recreate_forgotten_future_on_los
     lease = _lease("runtime-req-forgotten-lost-lease")
     scheduler = _FakeScheduler(claims=[[lease]], begin_finalize_ok=False)
     future_store = _FakeFutureStore(statuses={})
-    capacity = _FakeCapacityManager()
 
     async def _executor(_lease: dict) -> None:
         await future_store.async_resolve(_lease["item"]["request_id"], {"ok": True})
@@ -704,7 +662,6 @@ async def test_issue_593_model_runtime_does_not_recreate_forgotten_future_on_los
         actor_generation=3,
         scheduler_client=scheduler,
         future_store_client=future_store,
-        capacity_manager_client=capacity,
         executor=_executor,
     )
 
@@ -712,7 +669,6 @@ async def test_issue_593_model_runtime_does_not_recreate_forgotten_future_on_los
 
     assert result == {"claimed": 1, "executed": 1}
     assert future_store.failed == []
-    assert capacity.all_released == [lease["item"]["request_id"]]
     assert actor.health_snapshot()["failed_total"] == 0
 
 
@@ -721,7 +677,6 @@ async def test_issue_593_model_runtime_does_not_fail_new_retry_on_lost_old_lease
     lease = _lease_with_attempt("runtime-req-retried-lost-lease", "old-attempt")
     scheduler = _FakeScheduler(claims=[[lease]], begin_finalize_ok=False)
     future_store = _FakeFutureStore(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
-    capacity = _FakeCapacityManager()
 
     async def _executor(_lease: dict) -> None:
         await future_store.async_resolve(_lease["item"]["request_id"], {"ok": True})
@@ -732,7 +687,6 @@ async def test_issue_593_model_runtime_does_not_fail_new_retry_on_lost_old_lease
         actor_generation=3,
         scheduler_client=scheduler,
         future_store_client=future_store,
-        capacity_manager_client=capacity,
         executor=_executor,
     )
 
@@ -740,7 +694,6 @@ async def test_issue_593_model_runtime_does_not_fail_new_retry_on_lost_old_lease
 
     assert result == {"claimed": 1, "executed": 1}
     assert future_store.failed == []
-    assert capacity.all_released == [lease["item"]["request_id"]]
     assert actor.health_snapshot()["failed_total"] == 0
 
 
@@ -749,7 +702,6 @@ async def test_issue_593_model_runtime_fails_future_if_lease_missing_after_execu
     lease = _lease("runtime-req-missing-failure-lease")
     scheduler = _FakeScheduler(claims=[[lease]], begin_finalize_ok=False)
     future_store = _FakeFutureStore(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
-    capacity = _FakeCapacityManager()
 
     async def _executor(_lease: dict) -> None:
         raise RuntimeError("boom")
@@ -760,7 +712,6 @@ async def test_issue_593_model_runtime_fails_future_if_lease_missing_after_execu
         actor_generation=3,
         scheduler_client=scheduler,
         future_store_client=future_store,
-        capacity_manager_client=capacity,
         executor=_executor,
     )
 
@@ -773,7 +724,6 @@ async def test_issue_593_model_runtime_fails_future_if_lease_missing_after_execu
             "model work scheduler lost active lease after executor failure; request must be retried",
         )
     ]
-    assert capacity.all_released == [lease["item"]["request_id"]]
     assert scheduler.failed == []
     snapshot = actor.health_snapshot()
     assert snapshot["failed_total"] == 1
@@ -788,7 +738,6 @@ async def test_issue_593_model_runtime_releases_capacity_if_lost_failure_lease_f
         statuses={lease["item"]["request_id"]: FutureStatus.PENDING},
         fail_terminal_write=True,
     )
-    capacity = _FakeCapacityManager()
 
     async def _executor(_lease: dict) -> None:
         raise RuntimeError("boom")
@@ -799,7 +748,6 @@ async def test_issue_593_model_runtime_releases_capacity_if_lost_failure_lease_f
         actor_generation=3,
         scheduler_client=scheduler,
         future_store_client=future_store,
-        capacity_manager_client=capacity,
         executor=_executor,
     )
 
@@ -807,7 +755,6 @@ async def test_issue_593_model_runtime_releases_capacity_if_lost_failure_lease_f
 
     assert result == {"claimed": 1, "executed": 1}
     assert future_store.failed == []
-    assert capacity.all_released == [lease["item"]["request_id"]]
     assert actor.health_snapshot()["failed_total"] == 0
 
 
@@ -819,7 +766,6 @@ async def test_issue_593_model_runtime_requeues_if_future_store_fail_write_fails
         statuses={lease["item"]["request_id"]: FutureStatus.PENDING},
         fail_terminal_write=True,
     )
-    capacity = _FakeCapacityManager()
 
     async def _executor(_lease: dict) -> None:
         raise RuntimeError("boom")
@@ -830,7 +776,6 @@ async def test_issue_593_model_runtime_requeues_if_future_store_fail_write_fails
         actor_generation=3,
         scheduler_client=scheduler,
         future_store_client=future_store,
-        capacity_manager_client=capacity,
         executor=_executor,
     )
 
@@ -856,7 +801,6 @@ async def test_issue_593_model_runtime_requeues_if_mark_running_fails() -> None:
     lease = _lease("runtime-req-mark-running-fail")
     scheduler = _FakeScheduler(claims=[[lease]])
     future_store = _FakeFutureStore(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
-    capacity = _FakeCapacityManager()
 
     async def _executor(_lease: dict) -> None:
         await future_store.async_resolve(_lease["item"]["request_id"], {"ok": True})
@@ -867,7 +811,6 @@ async def test_issue_593_model_runtime_requeues_if_mark_running_fails() -> None:
         actor_generation=3,
         scheduler_client=scheduler,
         future_store_client=future_store,
-        capacity_manager_client=capacity,
         executor=_executor,
     )
 
@@ -896,7 +839,6 @@ async def test_issue_593_model_runtime_skips_non_pending_future_without_executio
     lease = _lease("runtime-req-done")
     scheduler = _FakeScheduler(claims=[[lease]])
     future_store = _FakeFutureStore(statuses={lease["item"]["request_id"]: FutureStatus.DONE})
-    capacity = _FakeCapacityManager()
     executed = False
 
     async def _executor(_lease: dict) -> None:
@@ -909,7 +851,6 @@ async def test_issue_593_model_runtime_skips_non_pending_future_without_executio
         actor_generation=3,
         scheduler_client=scheduler,
         future_store_client=future_store,
-        capacity_manager_client=capacity,
         executor=_executor,
     )
 
@@ -917,8 +858,6 @@ async def test_issue_593_model_runtime_skips_non_pending_future_without_executio
 
     assert result == {"claimed": 1, "executed": 1}
     assert executed is False
-    assert capacity.queue_released == [lease["item"]["request_id"]]
-    assert capacity.all_released == [lease["item"]["request_id"]]
     assert scheduler.completed == [
         {
             "lease_id": lease["lease_id"],
@@ -937,7 +876,6 @@ async def test_issue_593_model_runtime_empty_poll_and_drain() -> None:
         replica_id="replica-0",
         scheduler_client=scheduler,
         future_store_client=_FakeFutureStore(),
-        capacity_manager_client=_FakeCapacityManager(),
         executor=lambda _lease: asyncio.sleep(0),
     )
 
@@ -956,7 +894,6 @@ async def test_issue_593_model_runtime_empty_poll_preserves_last_error() -> None
     lease = _lease("runtime-req-failed-then-idle")
     scheduler = _FakeScheduler(claims=[[lease]])
     future_store = _FakeFutureStore(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
-    capacity = _FakeCapacityManager()
 
     async def _executor(_lease: dict) -> None:
         await future_store.async_fail(_lease["item"]["request_id"], "engine startup failed")
@@ -966,7 +903,6 @@ async def test_issue_593_model_runtime_empty_poll_preserves_last_error() -> None
         replica_id="replica-0",
         scheduler_client=scheduler,
         future_store_client=future_store,
-        capacity_manager_client=capacity,
         executor=_executor,
     )
 
@@ -990,7 +926,6 @@ async def test_issue_593_model_runtime_success_clears_previous_error() -> None:
             ok_lease["item"]["request_id"]: FutureStatus.PENDING,
         }
     )
-    capacity = _FakeCapacityManager()
 
     async def _executor(lease: dict) -> None:
         request_id = lease["item"]["request_id"]
@@ -1004,7 +939,6 @@ async def test_issue_593_model_runtime_success_clears_previous_error() -> None:
         replica_id="replica-0",
         scheduler_client=scheduler,
         future_store_client=future_store,
-        capacity_manager_client=capacity,
         executor=_executor,
     )
 
