@@ -34,13 +34,13 @@ def test_issue_593_verl_inference_builds_node_affinity_options(monkeypatch):
     monkeypatch.setattr(
         verl_inference.ray,
         "nodes",
-        lambda: [{"Alive": True, "NodeManagerAddress": "10.0.0.17", "NodeID": "node-17"}],
+        lambda: [{"Alive": True, "NodeManagerAddress": "10.0.0.17", "NodeID": "a" * 56}],
     )
 
     out = verl_inference._vllm_actor_pin_options_for_model("Qwen/Qwen3-0.6B", required_gpus=1)
 
     assert out["resources"] == {"node:10.0.0.17": 0.001}
-    assert out["scheduling_strategy"].node_id == "node-17"
+    assert out["scheduling_strategy"].node_id == "a" * 56
     assert seen_parse[0]["replica"] == 0
     assert seen_capacity[0]["required_gpus_by_node_ip"] == {"10.0.0.17": 1}
 
@@ -67,7 +67,7 @@ def test_issue_593_verl_inference_uses_replica_env_for_node_affinity(monkeypatch
     monkeypatch.setattr(
         verl_inference.ray,
         "nodes",
-        lambda: [{"Alive": True, "NodeManagerAddress": "10.0.0.17", "NodeID": "node-17"}],
+        lambda: [{"Alive": True, "NodeManagerAddress": "10.0.0.17", "NodeID": "a" * 56}],
     )
 
     out = verl_inference._vllm_actor_pin_options_for_model("Qwen/Qwen3-0.6B", required_gpus=1)
