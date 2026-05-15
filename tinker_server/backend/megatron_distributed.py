@@ -144,7 +144,7 @@ def _megatron_attention_backend() -> str:
     except Exception:
         pass
 
-    return "local"
+    return "unfused"
 
 
 def _get_megatron_create_lock(actor_name: str) -> threading.Lock:
@@ -2124,10 +2124,10 @@ class MegatronRankWorker:
             # This must happen before FlashAttention code is loaded to take effect
             # Without this, consecutive forward passes differ by ~0.46 nats
             attention_backend = _megatron_attention_backend()
-            if attention_backend == "local":
-                os.environ["NVTE_FLASH_ATTN"] = "0"
-                os.environ["NVTE_FUSED_ATTN"] = "0"
-                os.environ["NVTE_UNFUSED_ATTN"] = "0"
+            if attention_backend in {"flash", "fused", "unfused", "local"}:
+                os.environ["NVTE_FLASH_ATTN"] = "1" if attention_backend == "flash" else "0"
+                os.environ["NVTE_FUSED_ATTN"] = "1" if attention_backend == "fused" else "0"
+                os.environ["NVTE_UNFUSED_ATTN"] = "1" if attention_backend == "unfused" else "0"
             logger.info(f"[Rank {self.rank}] Megatron attention_backend={attention_backend}")
 
             from tinker_server.backend.verl_patches import _enable_megatron_determinism
