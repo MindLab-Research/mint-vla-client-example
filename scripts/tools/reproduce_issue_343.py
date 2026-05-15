@@ -117,6 +117,14 @@ def _require_metric(metrics: dict[str, Any], key: str) -> float:
     return value
 
 
+def _weighted_sum_from_mean(metrics: dict[str, Any], *, label: str) -> tuple[float, float]:
+    loss_mean = _require_metric(metrics, "loss:mean")
+    num_tokens = _require_metric(metrics, "num_tokens:sum")
+    if num_tokens <= 0:
+        raise RuntimeError(f"{label} returned invalid num_tokens:sum={num_tokens}")
+    return loss_mean * num_tokens, loss_mean
+
+
 def _extract_logprobs(result: dict[str, Any]) -> list[float]:
     outputs = result.get("loss_fn_outputs")
     if not isinstance(outputs, list) or not outputs or not isinstance(outputs[0], dict):
@@ -259,28 +267,18 @@ def _verify_cross_entropy(model_id: str) -> None:
     result = _forward_backward(model_id, datum, loss_fn="cross_entropy")
     metrics = _require_metrics(result)
 
-    loss_sum = _require_metric(metrics, "loss:sum")
-    loss_mean = _require_metric(metrics, "loss:mean")
-    num_tokens = _require_metric(metrics, "num_tokens:sum")
+    loss_sum, loss_mean = _weighted_sum_from_mean(metrics, label="cross_entropy")
     logprobs = _extract_logprobs(result)
 
     expected_sum = -sum(lp * wt for lp, wt in zip(logprobs, weights))
-    _assert_close("cross_entropy loss:sum", loss_sum, expected_sum)
-
-    if num_tokens <= 0:
-        raise RuntimeError(f"cross_entropy returned invalid num_tokens:sum={num_tokens}")
+    _assert_close("cross_entropy loss:mean*num_tokens", loss_sum, expected_sum)
     if loss_mean == 0.0:
         raise RuntimeError(f"cross_entropy returned suspicious loss:mean=0.0 metrics={metrics!r}")
 
-    # Current project-standard Megatron runs use dp=1, so loss:mean should match
-    # loss:sum / num_tokens:sum here. If dp>1 is introduced later, validate
-    # loss:sum directly instead of assuming this identity.
-    expected_mean = loss_sum / num_tokens
-    _assert_close("cross_entropy loss:sum/num_tokens vs loss:mean", loss_mean, expected_mean)
-
     print(
         "cross_entropy ok "
-        f"loss_sum={loss_sum:.6f} expected_sum={expected_sum:.6f} loss_mean={loss_mean:.6f} num_tokens={num_tokens:.0f}",
+        f"loss_sum={loss_sum:.6f} expected_sum={expected_sum:.6f} "
+        f"loss_mean={loss_mean:.6f} num_tokens={_require_metric(metrics, 'num_tokens:sum'):.0f}",
         flush=True,
     )
 
@@ -290,8 +288,7 @@ def _verify_importance_sampling(model_id: str) -> None:
     result = _forward_backward(model_id, datum, loss_fn="importance_sampling")
     metrics = _require_metrics(result)
 
-    loss_sum = _require_metric(metrics, "loss:sum")
-    loss_mean = _require_metric(metrics, "loss:mean")
+    loss_sum, loss_mean = _weighted_sum_from_mean(metrics, label="importance_sampling")
     new_logprobs = _extract_logprobs(result)
 
     expected_sum = 0.0
@@ -299,7 +296,7 @@ def _verify_importance_sampling(model_id: str) -> None:
         log_ratio = max(-20.0, min(20.0, lp_new - lp_old))
         ratio = math.exp(log_ratio)
         expected_sum += -(ratio * adv * wt)
-    _assert_close("importance_sampling loss:sum", loss_sum, expected_sum, atol=1e-2, rtol=1e-2)
+    _assert_close("importance_sampling loss:mean*num_tokens", loss_sum, expected_sum, atol=1e-2, rtol=1e-2)
 
     if not math.isfinite(loss_mean):
         raise RuntimeError(f"importance_sampling returned non-finite loss:mean={loss_mean!r}")
@@ -327,24 +324,16 @@ def _verify_forward(model_id: str) -> None:
     result = _forward(model_id, datum)
     metrics = _require_metrics(result)
 
-    loss_sum = _require_metric(metrics, "loss:sum")
-    loss_mean = _require_metric(metrics, "loss:mean")
-    num_tokens = _require_metric(metrics, "num_tokens:sum")
+    loss_sum, loss_mean = _weighted_sum_from_mean(metrics, label="forward")
     logprobs = _extract_logprobs(result)
 
     expected_sum = -sum(lp * wt for lp, wt in zip(logprobs, weights))
-    _assert_close("forward loss:sum", loss_sum, expected_sum)
-
-    if num_tokens <= 0:
-        raise RuntimeError(f"forward returned invalid num_tokens:sum={num_tokens}")
-    # Same dp=1 scope note as _verify_cross_entropy above.
-    expected_mean = loss_sum / num_tokens
-    _assert_close("forward loss:sum/num_tokens vs loss:mean", loss_mean, expected_mean)
+    _assert_close("forward loss:mean*num_tokens", loss_sum, expected_sum)
 
     print(
         "forward ok "
         f"loss_sum={loss_sum:.6f} expected_sum={expected_sum:.6f} "
-        f"loss_mean={loss_mean:.6f} num_tokens={num_tokens:.0f}",
+        f"loss_mean={loss_mean:.6f} num_tokens={_require_metric(metrics, 'num_tokens:sum'):.0f}",
         flush=True,
     )
 
