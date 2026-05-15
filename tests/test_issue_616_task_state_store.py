@@ -223,6 +223,34 @@ def test_runtime_commit_does_not_require_live_scheduler_owner() -> None:
         store.close()
 
 
+def test_scheduler_leased_task_can_finalize_after_runtime_marks_running() -> None:
+    store = TaskStateStore.in_memory()
+    try:
+        epoch, lease_id, attempt_id = _leased_task(store)
+        store.update_task_metadata(
+            request_id="req-1",
+            metadata={"stage": "prefill"},
+            status="running",
+            now=104.0,
+        )
+
+        finalizing = store.begin_finalize(
+            request_id="req-1",
+            lease_id=lease_id,
+            attempt_id=attempt_id,
+            scheduler_epoch=epoch,
+            runtime_generation=7,
+            finalize_ttl_s=30.0,
+            now=105.0,
+        )
+
+        assert finalizing["record"]["status"] == "finalizing"
+        assert finalizing["record"]["lease_id"] == lease_id
+        assert finalizing["record"]["metadata"]["stage"] == "prefill"
+    finally:
+        store.close()
+
+
 def test_requeue_task_resets_active_record_for_reclaim() -> None:
     store = TaskStateStore.in_memory()
     try:

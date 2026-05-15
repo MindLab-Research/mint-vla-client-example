@@ -744,7 +744,7 @@ class TaskStateStore:
                     lease_expires_at = MAX(COALESCE(lease_expires_at, 0), ?),
                     updated_at = ?
                 WHERE request_id = ?
-                  AND status = 'leased'
+                  AND status IN ('leased', 'running')
                   AND lease_id = ?
                   AND attempt_id = ?
                   AND scheduler_epoch = ?
@@ -857,7 +857,7 @@ class TaskStateStore:
                     finalizing_until = NULL,
                     updated_at = ?
                 WHERE request_id = ?
-                  AND status IN ('pending', 'assigned', 'leased', 'finalizing')
+                  AND status IN ('pending', 'assigned', 'leased', 'running', 'finalizing')
                 """,
                 (ts, str(request_id)),
             )
