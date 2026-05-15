@@ -235,8 +235,9 @@ def test_issue_193_megatron_explicit_load_prepare_converges_outgoing_actor_only_
     group._session_manager = SimpleNamespace(
         get_session_path=lambda session_id: f"/tmp/{session_id}",
         has_actor_only_state=lambda session_id: session_id == "session_outgoing",
+        has_persisted_actor_only_state=lambda session_id: session_id == "session_target",
         session_exists=lambda session_id: session_id == "session_target",
-        save_metadata=lambda *args: save_metadata_calls.append(args),
+        save_metadata=lambda *args, **kwargs: save_metadata_calls.append((args, kwargs)),
         clear_persisted_actor_only_state=lambda session_id: clear_persisted_calls.append(session_id),
         clear_actor_only_state=lambda session_id: clear_calls.append(session_id),
         save_persisted_actor_only_state=lambda session_id, actor_name, worker_entries: persisted_manifest_calls.append(
@@ -259,8 +260,13 @@ def test_issue_193_megatron_explicit_load_prepare_converges_outgoing_actor_only_
 
     assert swap_calls == ["session_target"]
     assert mark_calls == []
-    assert save_metadata_calls and save_metadata_calls[0][0] == "session_outgoing"
-    assert clear_persisted_calls == ["session_target"]
+    assert save_metadata_calls and save_metadata_calls[0][0][0] == "session_outgoing"
+    assert save_metadata_calls[0][1] == {
+        "train_attn": True,
+        "train_mlp": True,
+        "train_unembed": True,
+    }
+    assert clear_persisted_calls == []
     assert persisted_manifest_calls == [
         {
             "session_id": "session_outgoing",
@@ -268,10 +274,10 @@ def test_issue_193_megatron_explicit_load_prepare_converges_outgoing_actor_only_
             "worker_entries": [{"rank": 0, "path": "/tmp/r0.pt", "bytes": 123}],
         }
     ]
-    # clear_session_state(target) + clear_actor_only_state(target) + clear_actor_only_state(outgoing)
-    assert clear_calls.count("session_target") == 2
+    # clear_session_state(target) + clear_actor_only_state(outgoing)
+    assert clear_calls.count("session_target") == 1
     assert clear_calls.count("session_outgoing") == 1
-    assert group._current_session == "session_target"
+    assert group._current_session == "session_outgoing"
 
 
 def test_issue_193_megatron_explicit_load_prepare_allows_dirty_target_on_fresh_actor(monkeypatch):
@@ -299,6 +305,7 @@ def test_issue_193_megatron_explicit_load_prepare_allows_dirty_target_on_fresh_a
         has_actor_only_state=lambda session_id: (_ for _ in ()).throw(
             AssertionError("explicit checkpoint prepare must not consult target dirty marker")
         ),
+        has_persisted_actor_only_state=lambda session_id: True,
     )
     group._bind_traceparent = lambda traceparent: None
     group._swap_session_on_workers = lambda session_id: swap_calls.append(session_id)
@@ -307,8 +314,8 @@ def test_issue_193_megatron_explicit_load_prepare_allows_dirty_target_on_fresh_a
     group._prepare_session_for_explicit_load("session_target")
 
     assert clear_calls == ["session_target"]
-    assert swap_calls == ["session_target"]
-    assert group._current_session == "session_target"
+    assert swap_calls == []
+    assert group._current_session is None
 
 
 def test_issue_527_megatron_explicit_load_prepare_same_session_discards_target_actor_only_state(monkeypatch):
@@ -350,8 +357,8 @@ def test_issue_527_megatron_explicit_load_prepare_same_session_discards_target_a
     group._prepare_session_for_explicit_load("session_target")
 
     assert worker_clear_calls == [("session_target", None)]
-    assert clear_persisted_calls == ["session_target"]
-    assert clear_actor_calls == ["session_target"]
+    assert clear_persisted_calls == []
+    assert clear_actor_calls == []
     assert group._current_session == "session_target"
     assert group._session_unknown_due_to_partial_swap is False
 
@@ -396,6 +403,7 @@ def test_issue_193_megatron_forward_backward_uses_ensure_session_loaded(monkeypa
                 loss_fn_config,
                 rollout_correction_config,
                 session_id,
+                actual_rank,
                 reset_bias,
                 traceparent=None,
             ):
@@ -409,6 +417,7 @@ def test_issue_193_megatron_forward_backward_uses_ensure_session_loaded(monkeypa
 
     group.workers = [_FakeWorker()]
     group.base_model = "Qwen/Qwen3-0.6B"
+    group._actual_rank = 8
     group._bind_traceparent = lambda traceparent: None
     group._resolve_required_session_id = lambda session_id, op: session_id
     group._ensure_session_loaded = lambda session_id, **kwargs: ensure_calls.append(session_id)
@@ -434,12 +443,13 @@ def test_issue_193_megatron_optim_step_uses_ensure_session_loaded(monkeypatch):
     class _FakeWorker:
         class optim_step:
             @staticmethod
-            def remote(learning_rate, session_id, **kwargs):
+            def remote(learning_rate, session_id, actual_rank=None, **kwargs):
                 return {"grad_norm": 1.25, "lr": learning_rate}
 
     group.workers = [_FakeWorker()]
     group.base_model = "Qwen/Qwen3-0.6B"
     group._step_count = 0
+    group._actual_rank = 8
     group._bind_traceparent = lambda traceparent: None
     group._resolve_required_session_id = lambda session_id, op: session_id
     group._ensure_session_loaded = lambda session_id, **kwargs: ensure_calls.append(session_id)
@@ -474,6 +484,7 @@ def test_issue_193_megatron_ab_interleave_reloads_session_before_optim_step(monk
                 loss_fn_config,
                 rollout_correction_config,
                 session_id,
+                actual_rank,
                 reset_bias,
                 traceparent=None,
             ):
@@ -501,7 +512,7 @@ def test_issue_193_megatron_ab_interleave_reloads_session_before_optim_step(monk
 
         class optim_step:
             @staticmethod
-            def remote(learning_rate, session_id, **kwargs):
+            def remote(learning_rate, session_id, actual_rank=None, **kwargs):
                 call_log.append(("optim_step", session_id, group._current_session))
                 return {"grad_norm": 0.5, "lr": learning_rate}
 
@@ -509,6 +520,7 @@ def test_issue_193_megatron_ab_interleave_reloads_session_before_optim_step(monk
     group.base_model = "Qwen/Qwen3-0.6B"
     group._step_count = 0
     group._current_session = None
+    group._actual_rank = 8
     group._bind_traceparent = lambda traceparent: None
     group._resolve_required_session_id = lambda session_id, op: session_id
     group._ensure_session_loaded = _ensure_session_loaded
@@ -539,7 +551,10 @@ def test_issue_193_megatron_load_checkpoint_uses_explicit_load_prepare(tmp_path:
     ckpt_dir = tmp_path / "ckpt"
     ckpt_dir.mkdir()
     (ckpt_dir / "mp_rank_00_000_000_adapter.pt").write_bytes(b"adapter")
-    (ckpt_dir / "adapter_config.json").write_text(json.dumps({"r": 8}), encoding="utf-8")
+    (ckpt_dir / "adapter_config.json").write_text(
+        json.dumps({"r": 8, "target_modules": ["linear_qkv", "linear_proj"]}),
+        encoding="utf-8",
+    )
     (ckpt_dir / "training_meta.json").write_text(
         json.dumps({"current_step": 3, "learning_rate": 2e-4}),
         encoding="utf-8",
@@ -581,9 +596,9 @@ def test_issue_193_megatron_load_checkpoint_uses_explicit_load_prepare(tmp_path:
     assert call_path == str(ckpt_dir)
     assert call_kwargs["actual_rank"] == 8
     assert call_kwargs["traceparent"] is None
-    assert call_kwargs["train_attn"] is None
-    assert call_kwargs["train_mlp"] is None
-    assert call_kwargs["train_unembed"] is None
+    assert call_kwargs["train_attn"] is True
+    assert call_kwargs["train_mlp"] is False
+    assert call_kwargs["train_unembed"] is False
     assert reset_optimizer_calls == [
         (
             (2e-4,),
@@ -904,5 +919,3 @@ def test_issue_527_get_session_guard_state_reports_markers_and_latches():
     assert state["blocked"] is True
     assert state["external_checkpoint"]["checkpoint_identity"] == "identity-a"
     assert state["trusted_recovery_baseline"]["checkpoint_identity"] == "identity-a"
-
-

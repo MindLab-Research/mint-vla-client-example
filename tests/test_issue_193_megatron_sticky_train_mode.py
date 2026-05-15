@@ -884,6 +884,8 @@ def test_issue_193_load_adapter_state_restores_expert_bias(tmp_path, monkeypatch
 
     fake_lora_utils = types.ModuleType("tinker_server.backend.lora_utils")
     fake_lora_utils.pad_lora_state_dict = lambda state, *_args, **_kwargs: state  # type: ignore[attr-defined]
+    fake_lora_utils.fit_lora_state_dict_to_reference = lambda state, *_args, **_kwargs: state  # type: ignore[attr-defined]
+    fake_lora_utils.zero_lora_rank_tail_named_parameters = lambda *_args, **_kwargs: {"params": 0, "grads": 0}  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "tinker_server.backend.lora_utils", fake_lora_utils)
 
     worker.load_adapter_state(str(tmp_path))
@@ -923,6 +925,8 @@ def test_issue_193_load_adapter_state_rejects_key_mismatch(tmp_path, monkeypatch
 
     fake_lora_utils = types.ModuleType("tinker_server.backend.lora_utils")
     fake_lora_utils.pad_lora_state_dict = lambda state, *_args, **_kwargs: state  # type: ignore[attr-defined]
+    fake_lora_utils.fit_lora_state_dict_to_reference = lambda state, *_args, **_kwargs: state  # type: ignore[attr-defined]
+    fake_lora_utils.zero_lora_rank_tail_named_parameters = lambda *_args, **_kwargs: {"params": 0, "grads": 0}  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "tinker_server.backend.lora_utils", fake_lora_utils)
 
     with pytest.raises(RuntimeError, match="Adapter checkpoint key mismatch"):
@@ -1860,7 +1864,7 @@ def test_issue_417_optimizerless_load_warns_for_legacy_rank_shard_without_adapte
     group._session_unknown_due_to_partial_swap = False
     group._step_count = 99
     group.learning_rate = 1e-4
-    group._actual_rank = 12
+    group._actual_rank = 8
     group.lora_rank = 8
     group._train_attn = False
     group._train_mlp = True
@@ -1898,7 +1902,7 @@ def test_issue_417_optimizerless_load_warns_for_legacy_rank_shard_without_adapte
         (
             str(ckpt_dir),
             {
-                "actual_rank": 12,
+                "actual_rank": 8,
                 "traceparent": None,
                 "train_attn": False,
                 "train_mlp": True,
@@ -1914,7 +1918,7 @@ def test_issue_417_optimizerless_load_warns_for_legacy_rank_shard_without_adapte
     assert result["train_attn"] is False
     assert result["train_mlp"] is True
     assert result["train_unembed"] is False
-    assert group._actual_rank == 12
+    assert group._actual_rank == 8
     assert group._step_count == 0
     assert group.learning_rate == pytest.approx(1e-4)
     assert any("Legacy Megatron rank-shard checkpoint is missing adapter_config.json" in rec.getMessage() for rec in caplog.records)
@@ -1927,7 +1931,7 @@ def test_issue_417_optimizer_resume_accepts_legacy_rank_shard_without_adapter_co
     group = object.__new__(group_cls)
     group._current_session = "current_session"
     group._session_unknown_due_to_partial_swap = False
-    group._actual_rank = 12
+    group._actual_rank = 8
     group.lora_rank = 8
     group._train_attn = False
     group._train_mlp = True
@@ -1954,7 +1958,7 @@ def test_issue_417_optimizer_resume_accepts_legacy_rank_shard_without_adapter_co
             return {"rank": 0, "status": "ok"}
 
     class _FakeMarkSessionLoadedRemoteMethod:
-        def remote(self, session_id):
+        def remote(self, session_id, actual_rank=None):
             return {"session_id": session_id, "status": "ok"}
 
     class _FakeWorker:
@@ -1981,7 +1985,7 @@ def test_issue_417_optimizer_resume_accepts_legacy_rank_shard_without_adapter_co
         (
             str(ckpt_dir),
             {
-                "actual_rank": 12,
+                "actual_rank": 8,
                 "traceparent": None,
                 "train_attn": False,
                 "train_mlp": True,
@@ -1997,7 +2001,7 @@ def test_issue_417_optimizer_resume_accepts_legacy_rank_shard_without_adapter_co
     assert result["train_attn"] is False
     assert result["train_mlp"] is True
     assert result["train_unembed"] is False
-    assert group._actual_rank == 12
+    assert group._actual_rank == 8
     assert group._step_count == 7
     assert group.learning_rate == pytest.approx(3e-4)
 
@@ -2637,6 +2641,7 @@ def test_issue_193_partial_swap_explicit_session_recovers_optim_step(monkeypatch
     group._current_session = None
     group._step_count = 5
     group.base_model = "Qwen/Qwen3-0.6B"
+    group._actual_rank = 8
 
     ensure_calls: list[tuple[str, dict]] = []
 
@@ -2655,8 +2660,8 @@ def test_issue_193_partial_swap_explicit_session_recovers_optim_step(monkeypatch
         def __init__(self):
             self.calls = []
 
-        def remote(self, learning_rate, session_id, **kwargs):
-            self.calls.append((learning_rate, session_id, kwargs))
+        def remote(self, learning_rate, session_id, actual_rank=None, **kwargs):
+            self.calls.append((learning_rate, session_id, actual_rank, kwargs))
             return "future-optim"
 
     class _FakeWorker:
@@ -2696,6 +2701,7 @@ def test_issue_193_partial_swap_explicit_session_recovers_optim_step(monkeypatch
         (
             2e-4,
             "recovered_session",
+            8,
             {
                 "train_attn": False,
                 "train_mlp": True,

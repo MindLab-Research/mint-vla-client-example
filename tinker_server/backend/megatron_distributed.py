@@ -73,6 +73,14 @@ def _get_torch():
     return torch
 
 
+def _unwrap_megatron_model(model):
+    try:
+        from verl.utils.megatron_utils import unwrap_model
+    except ModuleNotFoundError:
+        return model
+    return unwrap_model(model)
+
+
 def _install_noop_tensorboard() -> None:
     """Avoid importing TensorFlow through torch.utils.tensorboard in Megatron actors."""
     if os.environ.get("MINT_MEGATRON_DISABLE_TENSORBOARD", "1").strip().lower() not in (
@@ -2033,11 +2041,13 @@ class MegatronRankWorker:
 
     def _zero_lora_rank_tail(self, model=None, actual_rank: int | None = None, *, zero_grads: bool = True) -> dict[str, int]:
         from tinker_server.backend.lora_utils import zero_lora_rank_tail_named_parameters
-        from verl.utils.megatron_utils import unwrap_model
 
         effective_rank = self._resolve_actual_rank(actual_rank)
+        if effective_rank == self.lora_rank:
+            self._current_actual_rank = effective_rank
+            return {"params": 0, "grads": 0}
         if model is None:
-            model = unwrap_model(self.engine.module)
+            model = _unwrap_megatron_model(self.engine.module)
             while isinstance(model, list):
                 model = model[0]
         rank_shard_index = 0
@@ -3820,9 +3830,7 @@ class MegatronRankWorker:
                 current_lr = self.engine.lr_scheduler_step()
 
                 try:
-                    from verl.utils.megatron_utils import unwrap_model
-
-                    model = unwrap_model(self.engine.module)
+                    model = _unwrap_megatron_model(self.engine.module)
                     while isinstance(model, list):
                         model = model[0]
                     self._zero_disabled_lora_params(
@@ -4458,8 +4466,7 @@ class MegatronRankWorker:
     def get_lora_weight_norm(self) -> float:
         """Compute L2 norm of all LoRA weights for debugging."""
         with self.engine.train_mode():
-            from verl.utils.megatron_utils import unwrap_model
-            model = unwrap_model(self.engine.module)
+            model = _unwrap_megatron_model(self.engine.module)
             while isinstance(model, list):
                 model = model[0]
             total_norm_sq = 0.0
@@ -4479,8 +4486,7 @@ class MegatronRankWorker:
     def get_lora_weight_checksum(self) -> dict:
         """Compute checksum stats for LoRA weights (rank 0 only)."""
         with self.engine.train_mode():
-            from verl.utils.megatron_utils import unwrap_model
-            model = unwrap_model(self.engine.module)
+            model = _unwrap_megatron_model(self.engine.module)
             while isinstance(model, list):
                 model = model[0]
             total_sum = 0.0
@@ -4504,9 +4510,7 @@ class MegatronRankWorker:
     def debug_named_parameter(self, needle: str) -> dict:
         """Inspect matching parameters for metadata and basic readback health."""
         with self.engine.train_mode():
-            from verl.utils.megatron_utils import unwrap_model
-
-            model = unwrap_model(self.engine.module)
+            model = _unwrap_megatron_model(self.engine.module)
             while isinstance(model, list):
                 model = model[0]
 
@@ -4537,8 +4541,7 @@ class MegatronRankWorker:
     def get_base_weight_checksum(self, max_params: int = 5) -> dict:
         """Compute checksum stats for a small sample of non-LoRA params (rank 0 only)."""
         with self.engine.train_mode():
-            from verl.utils.megatron_utils import unwrap_model
-            model = unwrap_model(self.engine.module)
+            model = _unwrap_megatron_model(self.engine.module)
             while isinstance(model, list):
                 model = model[0]
             entries = []
@@ -4568,8 +4571,7 @@ class MegatronRankWorker:
     def get_buffer_checksum(self, max_buffers: int = 5) -> dict:
         """Compute checksum stats for a small sample of non-LoRA buffers."""
         with self.engine.train_mode():
-            from verl.utils.megatron_utils import unwrap_model
-            model = unwrap_model(self.engine.module)
+            model = _unwrap_megatron_model(self.engine.module)
             while isinstance(model, list):
                 model = model[0]
             entries = []
@@ -4605,7 +4607,6 @@ class MegatronRankWorker:
             return {"has_optimizer": False}
 
         # Build id -> name map for current model params (raw + unwrapped)
-        from verl.utils.megatron_utils import unwrap_model
         id_to_name: dict[int, str] = {}
 
         modules = self.engine.module if isinstance(self.engine.module, list) else [self.engine.module]
@@ -4613,7 +4614,7 @@ class MegatronRankWorker:
             for n, p in mod.named_parameters():
                 id_to_name[id(p)] = n
 
-        unwrapped = unwrap_model(self.engine.module)
+        unwrapped = _unwrap_megatron_model(self.engine.module)
         while isinstance(unwrapped, list):
             unwrapped = unwrapped[0]
         for n, p in unwrapped.named_parameters():
@@ -4699,8 +4700,7 @@ class MegatronRankWorker:
 
         with self.engine.train_mode():
             # Access model parameters (unwrap from list/DDP like verl does)
-            from verl.utils.megatron_utils import unwrap_model
-            model = unwrap_model(self.engine.module)
+            model = _unwrap_megatron_model(self.engine.module)
             # Unwrap nested lists until we get a module
             while isinstance(model, list):
                 model = model[0]
@@ -5342,7 +5342,6 @@ class MegatronRankWorker:
 
         from tinker_server.backend.lora_utils import fit_lora_state_dict_to_reference, pad_lora_state_dict
         peft_utils = importlib.import_module("verl.utils.megatron_peft_utils")
-        from verl.utils.megatron_utils import unwrap_model
 
         self._release_sticky_for_aux_mode_transition(
             reason="load_adapter_state",
@@ -5376,7 +5375,7 @@ class MegatronRankWorker:
             model = self.engine.module
             if isinstance(model, list):
                 model = model[0]
-            unwrapped = unwrap_model(model)
+            unwrapped = _unwrap_megatron_model(model)
             if isinstance(unwrapped, list):
                 unwrapped = unwrapped[0]
 
@@ -7064,16 +7063,13 @@ class MegatronWorkerGroup:
         logger.info(f"[MegatronWorkerGroup] Placement group ready with {world_size} GPUs")
 
         # Runtime env for workers
-        is_mla = False
         disable_nccl_ib = False
         try:
             from .model_registry import get_model_config
 
             cfg = get_model_config(self.base_model)
-            is_mla = bool(cfg.is_mla)
             disable_nccl_ib = bool(getattr(cfg, "train_nccl_ib_disable", False))
         except Exception:
-            is_mla = False
             disable_nccl_ib = False
 
         from ..config import actor_runtime_env_vars, otel_env_vars
