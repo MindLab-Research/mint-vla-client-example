@@ -653,18 +653,29 @@ def test_promote_runtime_symlink_updates_link_atomically(tmp_path):
     assert link.resolve() == runtime_root.resolve()
 
 
-def test_copy_runtime_env_requires_fresh_destination(tmp_path):
+def test_copy_runtime_env_rewrites_embedded_runtime_metadata(tmp_path, monkeypatch):
     from scripts import build_runtime_env as build_runtime_env
 
     src = tmp_path / "src"
-    src.mkdir()
-    (src / "manifest.json").write_text("{}", encoding="utf-8")
+    _materialize_runtime_env_with_real_host_python(src)
+    (src / "host-venv" / "lib" / "python3.12" / "site-packages").mkdir(parents=True)
     (src / "payload.txt").write_text("ok", encoding="utf-8")
     dst = tmp_path / "dst"
+    monkeypatch.setattr(
+        build_runtime_env.subprocess,
+        "check_output",
+        lambda *args, **kwargs: str(dst / "host-venv" / "lib" / "python3.12" / "site-packages"),
+    )
 
     build_runtime_env.copy_runtime_env(src, dst)
 
-    assert (dst / "manifest.json").is_file()
+    manifest = json.loads((dst / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["env_root"] == str(dst)
+    assert manifest["host_python"] == str(dst / "host-venv" / "bin" / "python")
+    pth = dst / "host-venv" / "lib" / "python3.12" / "site-packages" / "tinker_runtime_env.pth"
+    assert str(dst / "site-packages") in pth.read_text(encoding="utf-8")
+    assert str(src / "site-packages") not in pth.read_text(encoding="utf-8")
+    assert f"export PFS_RUNTIME_ENV_ROOT={dst}" in (dst / "activate_runtime_env.sh").read_text(encoding="utf-8")
     assert (dst / "payload.txt").read_text(encoding="utf-8") == "ok"
     with pytest.raises(RuntimeError, match="already exists"):
         build_runtime_env.copy_runtime_env(src, dst)
@@ -674,8 +685,15 @@ def test_mint_runtime_cli_copies_and_promotes(tmp_path, monkeypatch, capsys):
     from scripts import build_runtime_env as build_runtime_env
 
     src = tmp_path / "prod-source"
-    src.mkdir()
-    (src / "manifest.json").write_text("{}", encoding="utf-8")
+    _materialize_runtime_env_with_real_host_python(src)
+    (src / "host-venv" / "lib" / "python3.12" / "site-packages").mkdir(parents=True)
+    monkeypatch.setattr(
+        build_runtime_env.subprocess,
+        "check_output",
+        lambda *args, **kwargs: str(
+            tmp_path / "mint" / "dev" / "runtime-builds" / "copy-1" / "host-venv" / "lib" / "python3.12" / "site-packages"
+        ),
+    )
 
     rc = build_runtime_env.main(
         [

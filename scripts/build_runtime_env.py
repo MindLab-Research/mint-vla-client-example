@@ -200,7 +200,7 @@ def copy_runtime_env(src_root: Path, dst_root: Path) -> None:
         raise RuntimeError(f"destination runtime root already exists: {dst_root}")
     dst_root.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(src_root, dst_root, symlinks=True)
-    _load_manifest(dst_root)
+    _rewrite_copied_runtime_metadata(dst_root)
 
 
 def _required_runtime_paths(layout) -> list[str]:
@@ -389,27 +389,44 @@ def _create_host_venv(
     return python
 
 
-def _write_manifest(env_root: Path, pyproject: dict[str, Any], host_python: Path, shared_deps: list[str]) -> None:
+def _runtime_env_metadata(pyproject: dict[str, Any]) -> dict[str, str]:
     runtime = _runtime_table(pyproject)
     runtime_env = _runtime_env_symbols()
+    return {
+        "site_packages_dir": runtime.get(
+            "site_packages_dir", runtime_env["DEFAULT_SITE_PACKAGES_DIRNAME"]
+        ),
+        "source_dir": runtime.get("source_dir", runtime_env["DEFAULT_SOURCE_DIRNAME"]),
+        "base_python_dir": runtime.get("base_python_dir", runtime_env["DEFAULT_BASE_PYTHON_DIRNAME"]),
+        "host_venv_dir": runtime.get("host_venv_dir", runtime_env["DEFAULT_HOST_VENV_DIRNAME"]),
+    }
+
+
+def _write_manifest(env_root: Path, pyproject: dict[str, Any], host_python: Path, shared_deps: list[str]) -> None:
+    runtime = _runtime_table(pyproject)
     manifest = {
         "python_version": runtime["python_version"],
         "env_root": str(env_root),
         "host_python": str(host_python),
         "shared_dependencies": shared_deps,
         "host_dependencies": _host_deps(pyproject),
-        "runtime_env": {
-            "site_packages_dir": runtime.get(
-                "site_packages_dir", runtime_env["DEFAULT_SITE_PACKAGES_DIRNAME"]
-            ),
-            "source_dir": runtime.get("source_dir", runtime_env["DEFAULT_SOURCE_DIRNAME"]),
-            "base_python_dir": runtime.get("base_python_dir", runtime_env["DEFAULT_BASE_PYTHON_DIRNAME"]),
-            "host_venv_dir": runtime.get("host_venv_dir", runtime_env["DEFAULT_HOST_VENV_DIRNAME"]),
-        },
+        "runtime_env": _runtime_env_metadata(pyproject),
         "sources": runtime["sources"],
         "image_managed": runtime["image_managed"],
     }
     (env_root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+
+def _rewrite_copied_runtime_metadata(env_root: Path) -> None:
+    manifest = _load_manifest(env_root)
+    layout = _runtime_env_symbols()["runtime_env_layout"](str(env_root))
+    manifest["env_root"] = str(env_root)
+    manifest["host_python"] = layout.host_python
+    if "runtime_env" not in manifest:
+        manifest["runtime_env"] = _runtime_env_metadata(_load_pyproject())
+    (env_root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    _write_host_pth(env_root, Path(layout.host_python))
+    _write_activation(env_root)
 
 
 def _write_activation(env_root: Path) -> None:
