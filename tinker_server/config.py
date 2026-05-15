@@ -251,6 +251,8 @@ def actor_runtime_env_vars(*, pythonpath: str, extra: dict[str, str] | None = No
         "RAY_CLIENT_ADDRESS",
         "MINT_RAY_NODE_IP_ADDRESS",
         "MINT_RAY_TEMP_DIR",
+        "MINT_RAY_JOB_WORKING_DIR",
+        "MINT_RAY_WORKING_DIR",
         "TINKER_USAGE_LOG_DIR",
         "TINKER_USAGE_BACKEND",
         "TINKER_USAGE_PG_DSN",
