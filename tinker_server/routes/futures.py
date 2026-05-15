@@ -6,6 +6,7 @@ Endpoints:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -133,6 +134,70 @@ def _pending_hint_note_pending(request_id: str) -> None:
 
 def _pending_hint_clear(request_id: str) -> None:
     _PENDING_HINTS.pop(request_id, None)
+
+
+def _task_state_retrieve_enabled() -> bool:
+    for key in (
+        "MINT_RETRIEVE_FUTURE_TASK_STATE_STORE",
+        "MINT_MODEL_WORK_SCHEDULER_TASK_STATE_STORE",
+    ):
+        if str(os.environ.get(key, "")).strip().lower() in {"1", "true", "yes", "on"}:
+            return True
+    return False
+
+
+async def _lookup_task_state_terminal(request_id: str, http_request: Request) -> Any | None:
+    if not _task_state_retrieve_enabled():
+        return None
+    try:
+        from ..backend.task_payload_store import TaskPayloadStore
+        from ..backend.task_state_store import TaskStateNotFoundError, task_state_store
+    except Exception:
+        logger.exception("[retrieve_future] task_state_store terminal lookup unavailable request_id=%s", request_id)
+        return None
+    try:
+        record = await task_state_store.async_get_task(request_id)
+    except (KeyError, TaskStateNotFoundError):
+        return None
+    except Exception:
+        logger.exception("[retrieve_future] task_state_store terminal lookup failed request_id=%s", request_id)
+        return None
+
+    status = str(record.get("status") or "")
+    meta = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    if status == "done":
+        result_path = record.get("result_path")
+        if not isinstance(result_path, str) or not result_path:
+            return None
+        try:
+            result = await asyncio.to_thread(
+                TaskPayloadStore().read_json_payload,
+                path=result_path,
+                expected_checksum=record.get("result_checksum"),
+            )
+        except Exception:
+            logger.exception("[retrieve_future] task_state_store payload read failed request_id=%s", request_id)
+            return None
+        _maybe_persist_terminal_replay(
+            request_id,
+            final_status=FutureStatus.DONE.value,
+            payload=result,
+            meta=meta,
+        )
+        _recent_put(request_id, result, ttl_s=_local_hot_ttl_s())
+        return result
+    if status == "failed":
+        error = str(record.get("error") or "Task failed")
+        payload = _failed_payload(error, http_request)
+        _maybe_persist_terminal_replay(
+            request_id,
+            final_status=FutureStatus.FAILED.value,
+            payload=error,
+            meta=meta,
+        )
+        _recent_put(request_id, payload, ttl_s=_local_hot_ttl_s())
+        return payload
+    return None
 
 
 GENERIC_ERROR_MESSAGE = "Operation failed. Contact administrator if issue persists."
@@ -377,6 +442,11 @@ async def retrieve_future(
     except FutureStoreUnavailableError:
         raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
     except KeyError:
+        task_state_payload = await _lookup_task_state_terminal(body.request_id, http_request)
+        if task_state_payload is not None:
+            _pending_hint_clear(body.request_id)
+            logger.info("[retrieve_future] request_id=%s task_state_store_terminal_hit=true", body.request_id)
+            return task_state_payload
         _pending_hint_clear(body.request_id)
         logger.info("[retrieve_future] request_id=%s status=unknown", body.request_id)
         detail: object = f"Unknown request_id: {body.request_id}"
@@ -389,6 +459,24 @@ async def retrieve_future(
         raise HTTPException(status_code=404, detail=detail)
 
     if status == FutureStatus.PENDING:
+        task_state_payload = await _lookup_task_state_terminal(body.request_id, http_request)
+        if task_state_payload is not None:
+            _pending_hint_clear(body.request_id)
+            try:
+                from ..backend.capacity_manager import capacity_manager
+
+                import ray
+
+                if ray.is_initialized():
+                    await capacity_manager.async_release_all(body.request_id)
+            except Exception:
+                pass
+            try:
+                await future_store.async_cleanup(body.request_id)
+            except Exception:
+                pass
+            logger.info("[retrieve_future] request_id=%s task_state_store_terminal_hit=true", body.request_id)
+            return task_state_payload
         meta = None
         try:
             meta = await future_store.async_get_meta(body.request_id)

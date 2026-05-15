@@ -39,6 +39,7 @@ def test_runtime_config_classifies_bootstrap_actor_creation_snapshot_and_observa
     assert classify_env_key("MINT_MEGATRON_STICKY_IDLE_TIMEOUT_S") == CONFIG_CLASS_SNAPSHOT_CONFIG
     assert classify_env_key("OTEL_EXPORTER_OTLP_ENDPOINT") == CONFIG_CLASS_OBSERVABILITY
     assert classify_env_key("MINT_TASK_STATE_STORE_DB_PATH") == CONFIG_CLASS_TASK_STATE
+    assert classify_env_key("MINT_TASK_STATE_STORE_OWNER_TTL_S") == CONFIG_CLASS_TASK_STATE
 
     grouped = classify_env(
         {
@@ -49,6 +50,7 @@ def test_runtime_config_classifies_bootstrap_actor_creation_snapshot_and_observa
             "OTEL_SERVICE_NAME": "mint",
             "OTEL_EXPORTER_OTLP_HEADERS": "Authorization=secret",
             "MINT_TASK_STATE_STORE_DB_PATH": "/tmp/task.sqlite3",
+            "MINT_TASK_STATE_STORE_OWNER_RENEW_S": "10",
             "UNRELATED_ENV": "ignored",
         }
     )
@@ -60,6 +62,7 @@ def test_runtime_config_classifies_bootstrap_actor_creation_snapshot_and_observa
     assert grouped[CONFIG_CLASS_OBSERVABILITY]["OTEL_SERVICE_NAME"] == "mint"
     assert grouped[CONFIG_CLASS_OBSERVABILITY]["OTEL_EXPORTER_OTLP_HEADERS"] == REDACTED_VALUE
     assert grouped[CONFIG_CLASS_TASK_STATE]["MINT_TASK_STATE_STORE_DB_PATH"] == "/tmp/task.sqlite3"
+    assert grouped[CONFIG_CLASS_TASK_STATE]["MINT_TASK_STATE_STORE_OWNER_RENEW_S"] == "10"
     assert "UNRELATED_ENV" not in grouped["unclassified"]
 
 
@@ -112,6 +115,7 @@ def test_actor_env_from_environ_keeps_real_values_for_actor_hydration() -> None:
             "MINT_VLLM_MAX_NUM_SEQS": "32",
             "OTEL_EXPORTER_OTLP_HEADERS": "Authorization=secret",
             "MINT_TASK_STATE_STORE_DB_PATH": "/tmp/task.sqlite3",
+            "MINT_TASK_STATE_STORE_OWNER_TTL_S": "30",
             "MINT_NEW_FEATURE_FLAG": "1",
             "MINT_CONFIG_ACTOR_HYDRATE": "1",
             "UNRELATED": "ignored",
@@ -123,6 +127,7 @@ def test_actor_env_from_environ_keeps_real_values_for_actor_hydration() -> None:
     assert actor_env["MINT_VLLM_MAX_NUM_SEQS"] == "32"
     assert actor_env["OTEL_EXPORTER_OTLP_HEADERS"] == "Authorization=secret"
     assert actor_env["MINT_TASK_STATE_STORE_DB_PATH"] == "/tmp/task.sqlite3"
+    assert actor_env["MINT_TASK_STATE_STORE_OWNER_TTL_S"] == "30"
     assert actor_env["MINT_NEW_FEATURE_FLAG"] == "1"
     assert "MINT_CONFIG_ACTOR_HYDRATE" not in actor_env
     assert "UNRELATED" not in actor_env
