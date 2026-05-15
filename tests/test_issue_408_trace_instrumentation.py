@@ -211,8 +211,8 @@ def test_issue_408_megatron_create_path_emits_trace_spans(monkeypatch) -> None:
     monkeypatch.setattr(md, "MegatronWorkerGroup", _FakeMegatronWorkerGroup)
     monkeypatch.setattr(md.ray, "is_initialized", lambda: True)
     monkeypatch.setattr(md.ray, "get_actor", lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("missing")))
-    monkeypatch.setattr(md.ray.util, "get_placement_group", lambda _name: fake_pg)
-    monkeypatch.setattr(md.ray.util, "remove_placement_group", lambda pg: removed.append(pg))
+    monkeypatch.setattr(md.ray.util, "get_placement_group", lambda _name: fake_pg, raising=False)
+    monkeypatch.setattr(md.ray.util, "remove_placement_group", lambda pg: removed.append(pg), raising=False)
     monkeypatch.setattr(time, "sleep", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         md,
@@ -333,7 +333,12 @@ def test_issue_572_megatron_existing_actor_rank_mismatch_recreates(monkeypatch) 
     monkeypatch.setattr(md.ray, "get_actor", _fake_get_actor)
     monkeypatch.setattr(md.ray, "get", _fake_get)
     monkeypatch.setattr(md.ray_kill, "kill", _fake_kill)
-    monkeypatch.setattr(md.ray.util, "get_placement_group", lambda _name: (_ for _ in ()).throw(ValueError("missing")))
+    monkeypatch.setattr(
+        md.ray.util,
+        "get_placement_group",
+        lambda _name: (_ for _ in ()).throw(ValueError("missing")),
+        raising=False,
+    )
     monkeypatch.setattr(
         md,
         "start_as_current_span_from_traceparent",

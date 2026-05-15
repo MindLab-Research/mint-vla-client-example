@@ -18,7 +18,10 @@ def test_resource_pool_list_actors_includes_metadata(monkeypatch: pytest.MonkeyP
     pool.unregister(actor_name)
 
 
-def test_resource_pool_list_actors_labels_openpi_backend() -> None:
+def test_resource_pool_list_actors_labels_openpi_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(resource_pool_module, "_detached_enabled", lambda: False)
+    monkeypatch.setattr(resource_pool_module.ray, "is_initialized", lambda: False)
+    monkeypatch.setattr(ResourcePool, "_instance", None)
     pool = get_resource_pool()
     actor_name = f"test_issue_40_openpi_{uuid.uuid4().hex}"
 

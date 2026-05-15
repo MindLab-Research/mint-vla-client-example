@@ -869,23 +869,28 @@ def test_lifespan_skips_tokenizer_preload_for_multi_worker_startup(monkeypatch) 
 
 @pytest.mark.anyio
 async def test_prewarm_raises_when_training_prewarm_unavailable_in_stateless_api(monkeypatch) -> None:
-    monkeypatch.setattr(app_module.config, "prewarm_persistent_models_csv", "Qwen/Qwen3-30B-A3B-Instruct-2507")
-    monkeypatch.setattr(app_module.config, "prewarm_enable_training", True)
-    monkeypatch.setattr(app_module.config, "prewarm_enable_inference", False)
+    from tinker_server.backend import persistent_prewarm
+
+    monkeypatch.setattr(
+        persistent_prewarm.config,
+        "prewarm_persistent_models_csv",
+        "Qwen/Qwen3-30B-A3B-Instruct-2507",
+    )
+    monkeypatch.setattr(persistent_prewarm.config, "prewarm_enable_training", True)
+    monkeypatch.setattr(persistent_prewarm.config, "prewarm_enable_inference", False)
 
     with pytest.raises(
         RuntimeError,
         match="persistent prewarm training configured but unavailable in the execution runtime",
     ):
-        from tinker_server.backend.persistent_prewarm import prewarm_persistent_models
-
-        await prewarm_persistent_models(None, SimpleNamespace())
+        await persistent_prewarm.prewarm_persistent_models(None, SimpleNamespace())
 
 
 @pytest.mark.anyio
 async def test_prewarm_raises_when_inference_prewarm_fails(monkeypatch) -> None:
     _install_fake_ray(monkeypatch)
     resource_pool_module = importlib.import_module("tinker_server.backend.resource_pool")
+    from tinker_server.backend import persistent_prewarm
 
     monkeypatch.setattr(
         resource_pool_module,
@@ -895,21 +900,23 @@ async def test_prewarm_raises_when_inference_prewarm_fails(monkeypatch) -> None:
             mark_ready=lambda *_args, **_kwargs: None,
         ),
     )
-    monkeypatch.setattr(app_module.config, "prewarm_persistent_models_csv", "Qwen/Qwen3-30B-A3B-Instruct-2507")
-    monkeypatch.setattr(app_module.config, "prewarm_train_lora_rank", 16)
-    monkeypatch.setattr(app_module.config, "prewarm_train_lr", 5e-5)
-    monkeypatch.setattr(app_module.config, "prewarm_megatron_ready_timeout_s", 1.0)
-    monkeypatch.setattr(app_module.config, "prewarm_enable_training", False)
-    monkeypatch.setattr(app_module.config, "prewarm_enable_inference", True)
+    monkeypatch.setattr(
+        persistent_prewarm.config,
+        "prewarm_persistent_models_csv",
+        "Qwen/Qwen3-30B-A3B-Instruct-2507",
+    )
+    monkeypatch.setattr(persistent_prewarm.config, "prewarm_train_lora_rank", 16)
+    monkeypatch.setattr(persistent_prewarm.config, "prewarm_train_lr", 5e-5)
+    monkeypatch.setattr(persistent_prewarm.config, "prewarm_megatron_ready_timeout_s", 1.0)
+    monkeypatch.setattr(persistent_prewarm.config, "prewarm_enable_training", False)
+    monkeypatch.setattr(persistent_prewarm.config, "prewarm_enable_inference", True)
 
     class _FailingManager:
         async def get_engine(self, _model_name: str):
             raise RuntimeError("pinned worker full")
 
     with pytest.raises(RuntimeError, match="pinned worker full"):
-        from tinker_server.backend.persistent_prewarm import prewarm_persistent_models
-
-        await prewarm_persistent_models(SimpleNamespace(), _FailingManager())
+        await persistent_prewarm.prewarm_persistent_models(SimpleNamespace(), _FailingManager())
 
 
 @pytest.mark.anyio
