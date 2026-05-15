@@ -76,6 +76,7 @@ def test_issue_353_megatron_group_optim_step_times_out(monkeypatch):
     group.workers = [_FakeWorker(), _FakeWorker()]
     group._step_count = 0
     group.learning_rate = 1e-4
+    group._actual_rank = 8
     group._bind_traceparent = lambda traceparent: None
     group._resolve_required_session_id = lambda session_id, op: session_id or "s1"
     group._ensure_session_loaded = lambda *args, **kwargs: None

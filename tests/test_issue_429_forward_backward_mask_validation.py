@@ -24,12 +24,22 @@ def _datum_with_mask_key(mask_key: str) -> dict:
     return datum
 
 
+def _client_with_auth(router) -> TestClient:
+    app = FastAPI()
+
+    @app.middleware("http")
+    async def _inject_user_data(request, call_next):
+        request.state.user_data = {"user_id": "anonymous", "user_role": "user"}
+        return await call_next(request)
+
+    app.include_router(router, prefix="/api/v1")
+    return TestClient(app)
+
+
 def test_issue_429_forward_backward_rejects_missing_explicit_loss_mask_before_backend() -> None:
     from tinker_server.routes import training as training_routes
 
-    app = FastAPI()
-    app.include_router(training_routes.router, prefix="/api/v1")
-    client = TestClient(app)
+    client = _client_with_auth(training_routes.router)
 
     resp = client.post(
         "/api/v1/forward_backward",
@@ -49,9 +59,7 @@ def test_issue_429_forward_backward_rejects_missing_explicit_loss_mask_before_ba
 def test_issue_429_train_step_rejects_missing_explicit_loss_mask_before_backend() -> None:
     from tinker_server.routes import training as training_routes
 
-    app = FastAPI()
-    app.include_router(training_routes.router, prefix="/api/v1")
-    client = TestClient(app)
+    client = _client_with_auth(training_routes.router)
 
     resp = client.post(
         "/api/v1/train_step",

@@ -2878,12 +2878,18 @@ class VerlTrainingEngine:
         from .runtime_observability import runtime_observability
 
         started = time.monotonic()
+        effective_timeout_s = timeout_s
+        if effective_timeout_s is None:
+            configured_timeout_s = server_config.training_remote_call_timeout_s
+            if configured_timeout_s is not None:
+                configured_timeout_s = float(configured_timeout_s)
+                effective_timeout_s = configured_timeout_s if configured_timeout_s > 0 else None
         try:
             result = await self._await_with_keepalive(
                 awaitable,
                 session,
                 interval_s=interval_s,
-                timeout_s=timeout_s,
+                timeout_s=effective_timeout_s,
             )
             runtime_observability.record_training_operation(
                 base_model=session.base_model,
