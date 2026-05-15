@@ -2183,67 +2183,58 @@ async def compute_logprobs(
             )
 
     user_id = _get_user_id(http_request)
-    from ..backend.api_work_queue import api_work_queue
-    from ..backend.capacity_manager import capacity_manager
-    from ..backend.result_size_estimator import estimate_compute_logprobs_result_bytes
+    from ..backend.model_work_admission import enqueue_model_work
+    from ..backend.model_work_scheduler import model_work_scheduler
 
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
     billing_auth = build_billing_auth_context(http_request, fallback_request_id=request_id)
-    reserve = await capacity_manager.async_try_reserve(
-        request_id,
-        queue_bytes=len(request_json),
-        object_store_bytes=estimate_compute_logprobs_result_bytes(request),
+    base_model = snapshot.base_model if snapshot is not None else None
+    if not base_model:
+        raise HTTPException(status_code=500, detail=f"Session {request.sampling_session_id!r} missing base_model")
+    domain_key = _model_work_domain_key(str(base_model))
+    affinity_group = (
+        _model_work_affinity_group(snapshot)
+        if snapshot is not None
+        else f"session:{request.sampling_session_id}"
     )
-    if not bool(reserve.get("ok")):
-        record_sampling_admission_metric(
-            route=_COMPUTE_LOGPROBS_ROUTE,
-            decision="rejected",
-            reason="capacity_rejected",
-        )
-        raise HTTPException(
-            status_code=429,
-            detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
-        )
 
-    created = False
     try:
-        await future_store.async_create_with_id(request_id)
-        created = True
-        await future_store.async_mark_queued(
-            request_id,
-            meta={
+        await enqueue_model_work(
+            request_id=request_id,
+            op="sampling.compute_logprobs",
+            request_json=request_json,
+            user_id=user_id,
+            apikey_id=_get_apikey_id(http_request, billing_auth=billing_auth),
+            webhook_url=None,
+            domain_key=domain_key,
+            affinity_group=affinity_group,
+            ordering_key=f"session:{request.sampling_session_id}",
+            token_cost=max(1, len(request.sequence.to_token_ids())),
+            extra=merge_queue_priority_extra(
+                {"gateway_auth": billing_auth.__dict__} if billing_auth is not None else None,
+                request=http_request,
+            ),
+            queued_meta={
                 "op": "sampling.compute_logprobs",
                 "sampling_session_id": str(request.sampling_session_id),
                 "queue_state": "queued",
                 "queued_at": time.time(),
                 "stage": "queued",
+                "queue_kind": "model_work_scheduler",
+                "domain_key": domain_key,
+                "affinity_group": affinity_group,
+            },
+            future_store_client=future_store,
+            scheduler_client=model_work_scheduler,
+            trace_enqueue=_enqueue_sampling_request_with_trace,
+            trace_kwargs={
+                "route_start_s": route_start_s,
+                "session_id": request.sampling_session_id,
+                "base_model": base_model,
             },
         )
-        base_model = snapshot.base_model if snapshot is not None else None
-        await _enqueue_sampling_request_with_trace(
-            route_start_s=route_start_s,
-            request_id=request_id,
-            op="sampling.compute_logprobs",
-            session_id=request.sampling_session_id,
-            base_model=base_model,
-            enqueue_coro=api_work_queue.enqueue(
-                request_id=request_id,
-                op="sampling.compute_logprobs",
-                request_json=request_json,
-                user_id=user_id,
-                apikey_id=_get_apikey_id(http_request, billing_auth=billing_auth),
-                webhook_url=None,
-                extra=merge_queue_priority_extra(
-                    {"gateway_auth": billing_auth.__dict__} if billing_auth is not None else None,
-                    request=http_request,
-                ),
-            ),
-        )
     except Exception as e:
-        await capacity_manager.async_release_all(request_id)
-        if created:
-            await future_store.async_cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue compute_logprobs request: {e}")
 
     record_sampling_admission_metric(

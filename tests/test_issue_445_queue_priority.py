@@ -74,6 +74,18 @@ class _CaptureQueue:
         self.calls.append(dict(kwargs))
 
 
+class _CaptureModelWorkScheduler:
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    async def append(self, **kwargs) -> dict:
+        self.calls.append(dict(kwargs))
+        return {"ok": True, "scheduler_instance_id": "scheduler-445"}
+
+    async def cancel_request(self, **kwargs) -> dict:
+        return {"ok": True, **dict(kwargs)}
+
+
 class _StubSamplingSessionManager:
     def is_multi_lora_session(self, _session_id: str) -> bool:
         return False
@@ -355,11 +367,9 @@ async def test_issue_445_internal_noop_enqueues_normalized_priority(monkeypatch)
 
 @pytest.mark.anyio
 async def test_issue_445_forward_backward_enqueues_default_priority_on_invalid_header(monkeypatch):
-    import tinker_server.backend.api_work_queue as awq
-    import tinker_server.backend.capacity_manager as cm
-    import tinker_server.backend.result_size_estimator as rse
+    import tinker_server.backend.model_work_scheduler as mws
 
-    queue = _CaptureQueue()
+    scheduler = _CaptureModelWorkScheduler()
     monkeypatch.setattr(training_route, "training_engine", object())
     async def _route_info(_model_id):
         return {"base_model": "Qwen/Qwen3-0.6B", "backend": "peft"}
@@ -371,9 +381,7 @@ async def test_issue_445_forward_backward_enqueues_default_priority_on_invalid_h
     monkeypatch.setattr(training_route, "_protect_training_session_enqueue_window", _protect)
     monkeypatch.setattr(training_route, "_get_max_model_len", lambda _base_model: 4096)
     monkeypatch.setattr(training_route, "future_store", _StubFutureStore())
-    monkeypatch.setattr(awq, "api_work_queue", queue)
-    monkeypatch.setattr(cm, "capacity_manager", _StubCapacityManager())
-    monkeypatch.setattr(rse, "estimate_forward_backward_result_bytes", lambda _req: 0)
+    monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
     monkeypatch.setattr(training_route, "_mark_training_inflight", lambda *_args, **_kwargs: None)
 
     req = ForwardBackwardRequest(
@@ -389,30 +397,23 @@ async def test_issue_445_forward_backward_enqueues_default_priority_on_invalid_h
 
     await training_route.forward_backward(req, cast(Request, http_request))
 
-    assert queue.calls
-    assert queue.calls[0]["extra"]["queue_priority"] == 0
-    assert queue.calls[0]["extra"]["scheduler_session_key"] == "run-445"
-    assert queue.calls[0]["apikey_id"] == "bbbbbbbbbbbbbbbbbbbbbbbb"
+    assert scheduler.calls
+    assert scheduler.calls[0]["extra"]["queue_priority"] == 0
+    assert scheduler.calls[0]["extra"]["scheduler_session_key"] == "run-445"
+    assert scheduler.calls[0]["apikey_id"] == "bbbbbbbbbbbbbbbbbbbbbbbb"
 
 
 @pytest.mark.anyio
 async def test_issue_445_compute_logprobs_enqueues_apikey_id(monkeypatch):
-    import tinker_server.backend.api_work_queue as awq
-    import tinker_server.backend.capacity_manager as cm
-    import tinker_server.backend.result_size_estimator as rse
+    import tinker_server.backend.model_registry as model_registry
+    import tinker_server.backend.model_work_scheduler as mws
 
-    queue = _CaptureQueue()
+    scheduler = _CaptureModelWorkScheduler()
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
     monkeypatch.setattr(sampling_route, "future_store", _StubFutureStore())
     monkeypatch.setattr(sampling_route, "record_sampling_admission_metric", lambda **_kwargs: None)
-
-    async def _no_snapshot(_sid):
-        return None
-
-    monkeypatch.setattr(sampling_route, "_async_get_detached_sampling_snapshot", _no_snapshot)
-    monkeypatch.setattr(awq, "api_work_queue", queue)
-    monkeypatch.setattr(cm, "capacity_manager", _StubCapacityManager())
-    monkeypatch.setattr(rse, "estimate_compute_logprobs_result_bytes", lambda _req: 0)
+    monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
+    monkeypatch.setattr(model_registry, "get_model_config", lambda _model: SimpleNamespace(max_model_len=4096))
 
     req = ComputeLogprobsRequest(
         sampling_session_id="sess",
@@ -427,6 +428,7 @@ async def test_issue_445_compute_logprobs_enqueues_apikey_id(monkeypatch):
 
     await sampling_route.compute_logprobs(req, cast(Request, http_request))
 
-    assert queue.calls
-    assert queue.calls[0]["op"] == "sampling.compute_logprobs"
-    assert queue.calls[0]["apikey_id"] == "bbbbbbbbbbbbbbbbbbbbbbbb"
+    assert scheduler.calls
+    assert scheduler.calls[0]["op"] == "sampling.compute_logprobs"
+    assert scheduler.calls[0]["apikey_id"] == "bbbbbbbbbbbbbbbbbbbbbbbb"
+    assert scheduler.calls[0]["extra"]["queue_priority"] == 2

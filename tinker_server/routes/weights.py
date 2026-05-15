@@ -286,6 +286,62 @@ def _build_execution_serial_extra(*, model_id: str, extra: dict | None = None) -
     return payload
 
 
+def _training_domain_key_from_store_info(store_info: dict, *, model_id: str) -> str:
+    from ..backend.model_actor_supervisor import domain_key_for_training_base_model
+
+    base_model = str(store_info.get("base_model") or "").strip()
+    if base_model:
+        return domain_key_for_training_base_model(base_model)
+    return f"training_session:{model_id}"
+
+
+def _weights_queued_meta(*, op: str, model_id: str) -> dict[str, object]:
+    return {
+        "op": str(op),
+        "model_id": str(model_id),
+        "queue_state": "queued",
+        "stage": "queued",
+        "queued_at": time.time(),
+    }
+
+
+async def _enqueue_weights_model_work(
+    *,
+    route_start_s: float,
+    request_id: str,
+    op: str,
+    request_json: bytes,
+    user_id: str | None,
+    webhook_url: str | None,
+    model_id: str,
+    domain_key: str,
+    extra: dict | None = None,
+) -> None:
+    from ..backend.model_work_admission import enqueue_model_work
+    from ..backend.model_work_scheduler import model_work_scheduler
+
+    affinity_group = f"training_session:{model_id}"
+    await enqueue_model_work(
+        request_id=request_id,
+        op=op,
+        request_json=request_json,
+        user_id=user_id,
+        webhook_url=webhook_url,
+        domain_key=domain_key,
+        affinity_group=affinity_group,
+        ordering_key=affinity_group,
+        extra=_build_execution_serial_extra(model_id=model_id, extra=dict(extra or {})),
+        queued_meta=_weights_queued_meta(op=op, model_id=model_id),
+        future_store_client=future_store,
+        scheduler_client=model_work_scheduler,
+        trace_enqueue=_enqueue_weights_request_with_trace,
+        trace_kwargs={
+            "route_start_s": route_start_s,
+            "model_id": model_id,
+        },
+    )
+
+
 async def _get_route_training_store_info(model_id: str) -> dict | None:
     from ..routes.training import _get_training_route_session_info
 
@@ -992,59 +1048,32 @@ async def save_weights(
     from ..client_compat import prefer_tinker_uri
 
     prefer_tinker = prefer_tinker_uri(http_request)
-    from ..backend.api_work_queue import api_work_queue
-    from ..backend.capacity_manager import capacity_manager
-    from ..backend.result_size_estimator import estimate_small_result_bytes
 
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
 
-    reserve = await capacity_manager.async_try_reserve(
-        request_id,
-        queue_bytes=len(request_json),
-        object_store_bytes=estimate_small_result_bytes(),
-    )
-    if not bool(reserve.get("ok")):
-        raise HTTPException(
-            status_code=429,
-            detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
-        )
-
-    created = False
     inflight_marked = False
     try:
         if training_manager is not None:
             _mark_training_inflight(request.model_id, +1)
             inflight_marked = True
-        await future_store.async_create_with_id(request_id)
-        created = True
-        await future_store.async_mark_queued(request_id, meta={"op": "weights.save_weights", "model_id": request.model_id})
-        await _enqueue_weights_request_with_trace(
+        await _enqueue_weights_model_work(
             route_start_s=route_start_s,
             request_id=request_id,
             op="weights.save_weights",
+            request_json=request_json,
+            user_id=user_id,
+            webhook_url=webhook_url,
             model_id=request.model_id,
-            enqueue_coro=api_work_queue.enqueue(
-                request_id=request_id,
-                op="weights.save_weights",
-                request_json=request_json,
-                user_id=user_id,
-                webhook_url=webhook_url,
-                extra=merge_queue_priority_extra(
-                    _build_execution_serial_extra(
-                        model_id=request.model_id,
-                        extra={"prefer_tinker": bool(prefer_tinker)},
-                    ),
-                    request=http_request,
-                ),
+            domain_key=_training_domain_key_from_store_info(store_info, model_id=request.model_id),
+            extra=merge_queue_priority_extra(
+                {"prefer_tinker": bool(prefer_tinker)},
+                request=http_request,
             ),
         )
     except Exception as e:
         if inflight_marked and training_manager is not None:
             _mark_training_inflight(request.model_id, -1)
-        await capacity_manager.async_release_all(request_id)
-        if created:
-            await future_store.async_cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue save_weights request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)
@@ -1120,58 +1149,32 @@ async def save_state(
     from ..client_compat import prefer_tinker_uri
 
     prefer_tinker = prefer_tinker_uri(http_request)
-    from ..backend.api_work_queue import api_work_queue
-    from ..backend.capacity_manager import capacity_manager
-    from ..backend.result_size_estimator import estimate_small_result_bytes
 
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
-    reserve = await capacity_manager.async_try_reserve(
-        request_id,
-        queue_bytes=len(request_json),
-        object_store_bytes=estimate_small_result_bytes(),
-    )
-    if not bool(reserve.get("ok")):
-        raise HTTPException(
-            status_code=429,
-            detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
-        )
 
-    created = False
     inflight_marked = False
     try:
         if training_manager is not None:
             _mark_training_inflight(request.model_id, +1)
             inflight_marked = True
-        await future_store.async_create_with_id(request_id)
-        created = True
-        await future_store.async_mark_queued(request_id, meta={"op": "weights.save_state", "model_id": request.model_id})
-        await _enqueue_weights_request_with_trace(
+        await _enqueue_weights_model_work(
             route_start_s=route_start_s,
             request_id=request_id,
             op="weights.save_state",
+            request_json=request_json,
+            user_id=user_id,
+            webhook_url=webhook_url,
             model_id=request.model_id,
-            enqueue_coro=api_work_queue.enqueue(
-                request_id=request_id,
-                op="weights.save_state",
-                request_json=request_json,
-                user_id=user_id,
-                webhook_url=webhook_url,
-                extra=merge_queue_priority_extra(
-                    _build_execution_serial_extra(
-                        model_id=request.model_id,
-                        extra={"prefer_tinker": bool(prefer_tinker)},
-                    ),
-                    request=http_request,
-                ),
+            domain_key=_training_domain_key_from_store_info(store_info, model_id=request.model_id),
+            extra=merge_queue_priority_extra(
+                {"prefer_tinker": bool(prefer_tinker)},
+                request=http_request,
             ),
         )
     except Exception as e:
         if inflight_marked and training_manager is not None:
             _mark_training_inflight(request.model_id, -1)
-        await capacity_manager.async_release_all(request_id)
-        if created:
-            await future_store.async_cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue save_state request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)
@@ -1725,55 +1728,31 @@ async def load_state(
                 },
             ) from e
 
-    from ..backend.api_work_queue import api_work_queue
-    from ..backend.capacity_manager import capacity_manager
-    from ..backend.result_size_estimator import estimate_small_result_bytes
-
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
-    reserve = await capacity_manager.async_try_reserve(
-        request_id,
-        queue_bytes=len(request_json),
-        object_store_bytes=estimate_small_result_bytes(),
-    )
-    if not bool(reserve.get("ok")):
-        raise HTTPException(
-            status_code=429,
-            detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
-        )
 
-    created = False
     inflight_marked = False
     try:
         if training_manager is not None:
             _mark_training_inflight(request.model_id, +1)
             inflight_marked = True
-        await future_store.async_create_with_id(request_id)
-        created = True
-        await future_store.async_mark_queued(request_id, meta={"op": "weights.load_state", "model_id": request.model_id})
-        await _enqueue_weights_request_with_trace(
+        await _enqueue_weights_model_work(
             route_start_s=route_start_s,
             request_id=request_id,
             op="weights.load_state",
+            request_json=request_json,
+            user_id=user_id,
+            webhook_url=None,
             model_id=request.model_id,
-            enqueue_coro=api_work_queue.enqueue(
-                request_id=request_id,
-                op="weights.load_state",
-                request_json=request_json,
-                user_id=user_id,
-                webhook_url=None,
-                extra=merge_queue_priority_extra(
-                    _build_execution_serial_extra(model_id=request.model_id),
-                    request=http_request,
-                ),
+            domain_key=_training_domain_key_from_store_info(store_info, model_id=request.model_id),
+            extra=merge_queue_priority_extra(
+                {},
+                request=http_request,
             ),
         )
     except Exception as e:
         if inflight_marked and training_manager is not None:
             _mark_training_inflight(request.model_id, -1)
-        await capacity_manager.async_release_all(request_id)
-        if created:
-            await future_store.async_cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue load_state request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)

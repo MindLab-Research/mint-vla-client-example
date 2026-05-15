@@ -323,10 +323,8 @@ async def test_issue_281_asample_enqueues_scheduler_metadata(monkeypatch) -> Non
 
 @pytest.mark.anyio
 async def test_issue_281_compute_logprobs_enqueues_scheduler_metadata(monkeypatch) -> None:
-    import tinker_server.backend.api_work_queue as awq
-    import tinker_server.backend.capacity_manager as cm
+    import tinker_server.backend.model_work_scheduler as mws
     import tinker_server.backend.model_registry as model_registry
-    import tinker_server.backend.result_size_estimator as rse
     from tinker_server.models.types import ComputeLogprobsRequest, ModelInput
     from tinker_server.routes import sampling as sr
 
@@ -334,9 +332,6 @@ async def test_issue_281_compute_logprobs_enqueues_scheduler_metadata(monkeypatc
 
     captured: dict = {}
     queued_meta: dict = {}
-
-    async def _fake_enqueue(**kwargs):
-        captured.update(kwargs)
 
     class _QueuedFutureStore(_AsyncFutureStore):
         async def async_mark_queued(self, _request_id: str, meta=None) -> None:
@@ -353,9 +348,7 @@ async def test_issue_281_compute_logprobs_enqueues_scheduler_metadata(monkeypatc
         ),
     )
     monkeypatch.setattr(sr, "future_store", _QueuedFutureStore())
-    monkeypatch.setattr(awq, "api_work_queue", SimpleNamespace(enqueue=_fake_enqueue))
-    monkeypatch.setattr(cm, "capacity_manager", _AsyncCapacityManager())
-    monkeypatch.setattr(rse, "estimate_compute_logprobs_result_bytes", lambda _req: 0)
+    monkeypatch.setattr(mws, "model_work_scheduler", _AsyncModelWorkScheduler(captured))
     monkeypatch.setattr(model_registry, "get_model_config", lambda _model: SimpleNamespace(max_model_len=4096))
 
     req = ComputeLogprobsRequest(
@@ -370,7 +363,11 @@ async def test_issue_281_compute_logprobs_enqueues_scheduler_metadata(monkeypatc
     assert queued_meta["queue_state"] == "queued"
     assert queued_meta["stage"] == "queued"
     assert isinstance(queued_meta["queued_at"], float)
-    assert captured["extra"] == {"queue_priority": 0}
+    assert captured["domain_key"] == "vllm:Qwen/Qwen3-0.6B"
+    assert captured["affinity_group"] == "lora:sess-281:generation:1"
+    assert captured["ordering_key"] == "session:sess-281"
+    assert captured["extra"]["queue_priority"] == 0
+    assert captured["extra"]["model_work_scheduler"] is True
 
 
 @pytest.mark.anyio

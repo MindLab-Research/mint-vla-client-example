@@ -18,13 +18,31 @@ def _make_write_app() -> FastAPI:
     return app
 
 
+class StubModelWorkScheduler:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    async def append(self, **kwargs) -> dict:
+        self.calls.append(dict(kwargs))
+        return {"ok": True, "scheduler_instance_id": "scheduler-283"}
+
+    async def cancel_request(self, **kwargs) -> dict:
+        return {"ok": True, **dict(kwargs)}
+
+
+def _queued_payload(call: dict) -> dict:
+    raw = call["request_json"]
+    if isinstance(raw, bytes):
+        return json.loads(raw.decode("utf-8"))
+    return dict(raw)
+
+
 def test_issue_283_create_model_from_state_uses_small_result_reservation(
     tmp_path: Path, monkeypatch
 ) -> None:
     from tinker_server.routes import training as training_routes
     from tinker_server import checkpoints as checkpoints_module
-    import tinker_server.backend.capacity_manager as capacity_module
-    import tinker_server.backend.api_work_queue as work_queue_module
+    import tinker_server.backend.model_work_scheduler as scheduler_module
     import tinker_server.gateway as gateway_module
 
     training_routes.CHECKPOINTS_DIR = str(tmp_path)
@@ -71,7 +89,7 @@ def test_issue_283_create_model_from_state_uses_small_result_reservation(
         async def async_release_all(self, request_id: str) -> None:
             return None
 
-    class StubWorkQueue:
+    class LocalStubWorkQueue:
         def __init__(self) -> None:
             self.calls: list[dict] = []
 
@@ -107,10 +125,9 @@ def test_issue_283_create_model_from_state_uses_small_result_reservation(
             return None
 
     stub_capacity = StubCapacityManager()
-    stub_queue = StubWorkQueue()
+    stub_queue = StubModelWorkScheduler()
 
-    monkeypatch.setattr(capacity_module, "capacity_manager", stub_capacity)
-    monkeypatch.setattr(work_queue_module, "api_work_queue", stub_queue)
+    monkeypatch.setattr(scheduler_module, "model_work_scheduler", stub_queue)
     monkeypatch.setattr(gateway_module, "get_gateway_config", lambda: None)
     monkeypatch.setattr(gateway_module, "remote_training_model", lambda model_id: None)
     monkeypatch.setattr(gateway_module, "upstream_for_model", lambda base_model: None)
@@ -136,14 +153,13 @@ def test_issue_283_create_model_from_state_uses_small_result_reservation(
     )
 
     assert resp.status_code == 200, resp.text
-    assert len(stub_capacity.calls) == 1
-    assert stub_capacity.calls[0]["object_store_bytes"] == 256 * 1024
+    assert stub_capacity.calls == []
     assert len(stub_queue.calls) == 1
     assert stub_queue.calls[0]["op"] == "training.create_model_from_state"
     assert stub_queue.calls[0]["extra"]["execution_serial_key"] == "training_session:s283_0"
     assert stub_queue.calls[0]["extra"]["scheduler_session_key"] == "s283_0"
     assert stub_queue.calls[0]["extra"]["training_op"] == "create_model_from_state"
-    queued_payload = json.loads(stub_queue.calls[0]["request_json"].decode("utf-8"))
+    queued_payload = _queued_payload(stub_queue.calls[0])
     assert queued_payload["state_path"] != f"tinker://{run_id}/weights/{ckpt_name}"
     assert queued_payload["state_path"].startswith(str(tmp_path))
 
@@ -533,8 +549,7 @@ def test_issue_283_load_state_route_queues_resolved_path(tmp_path: Path, monkeyp
     from tinker_server.routes import training as training_routes
     from tinker_server.routes import weights as weights_routes
     from tinker_server import checkpoints as checkpoints_module
-    import tinker_server.backend.capacity_manager as capacity_module
-    import tinker_server.backend.api_work_queue as work_queue_module
+    import tinker_server.backend.model_work_scheduler as scheduler_module
 
     weights_routes.CHECKPOINTS_DIR = str(tmp_path)
     checkpoints_module.CHECKPOINTS_DIR = str(tmp_path)
@@ -571,7 +586,7 @@ def test_issue_283_load_state_route_queues_resolved_path(tmp_path: Path, monkeyp
         async def async_release_all(self, request_id: str) -> None:
             _ = request_id
 
-    class StubWorkQueue:
+    class LocalStubWorkQueue:
         def __init__(self) -> None:
             self.calls: list[dict] = []
 
@@ -629,10 +644,9 @@ def test_issue_283_load_state_route_queues_resolved_path(tmp_path: Path, monkeyp
             }
         return None
 
-    stub_queue = StubWorkQueue()
+    stub_queue = StubModelWorkScheduler()
 
-    monkeypatch.setattr(capacity_module, "capacity_manager", StubCapacityManager())
-    monkeypatch.setattr(work_queue_module, "api_work_queue", stub_queue)
+    monkeypatch.setattr(scheduler_module, "model_work_scheduler", stub_queue)
     monkeypatch.setattr(weights_routes, "future_store", StubFutureStore())
     monkeypatch.setattr(weights_routes, "training_engine", object())
     monkeypatch.setattr(weights_routes, "training_manager", StubTrainingManager())
@@ -652,7 +666,7 @@ def test_issue_283_load_state_route_queues_resolved_path(tmp_path: Path, monkeyp
     )
 
     assert resp.status_code == 200, resp.text
-    queued_payload = json.loads(stub_queue.calls[0]["request_json"].decode("utf-8"))
+    queued_payload = _queued_payload(stub_queue.calls[0])
     expected_path = weights_routes._resolve_mint_path(
         f"tinker://{run_id}/weights/{ckpt_name}",
         user_id=None,
@@ -997,8 +1011,7 @@ def test_issue_417_load_state_reports_success_when_metadata_persist_fails_after_
 def test_issue_283_save_routes_use_detached_training_info_without_route_runtime(monkeypatch) -> None:
     from tinker_server.routes import training as training_routes
     from tinker_server.routes import weights as weights_routes
-    import tinker_server.backend.capacity_manager as capacity_module
-    import tinker_server.backend.api_work_queue as work_queue_module
+    import tinker_server.backend.model_work_scheduler as scheduler_module
 
     class StubCapacityManager:
         async def async_try_reserve(self, request_id: str, *, queue_bytes: int, object_store_bytes: int) -> dict:
@@ -1008,7 +1021,7 @@ def test_issue_283_save_routes_use_detached_training_info_without_route_runtime(
         async def async_release_all(self, request_id: str) -> None:
             _ = request_id
 
-    class StubWorkQueue:
+    class LocalStubWorkQueue:
         def __init__(self) -> None:
             self.calls: list[dict] = []
 
@@ -1053,10 +1066,9 @@ def test_issue_283_save_routes_use_detached_training_info_without_route_runtime(
             }
         return None
 
-    stub_queue = StubWorkQueue()
+    stub_queue = StubModelWorkScheduler()
 
-    monkeypatch.setattr(capacity_module, "capacity_manager", StubCapacityManager())
-    monkeypatch.setattr(work_queue_module, "api_work_queue", stub_queue)
+    monkeypatch.setattr(scheduler_module, "model_work_scheduler", stub_queue)
     monkeypatch.setattr(weights_routes, "future_store", StubFutureStore())
     monkeypatch.setattr(weights_routes, "training_engine", None)
     monkeypatch.setattr(weights_routes, "training_manager", None)
@@ -1074,7 +1086,7 @@ def test_issue_283_save_routes_use_detached_training_info_without_route_runtime(
         assert resp.status_code == 200, resp.text
 
     assert [call["op"] for call in stub_queue.calls] == ["weights.save_weights", "weights.save_state"]
-    assert [call["request_json"]["model_id"] for call in stub_queue.calls] == ["model-283", "model-283"]
+    assert [_queued_payload(call)["model_id"] for call in stub_queue.calls] == ["model-283", "model-283"]
     assert all(call["extra"]["execution_serial_key"] == "training_session:model-283" for call in stub_queue.calls)
 
 
@@ -1082,8 +1094,7 @@ def test_issue_283_load_state_route_uses_detached_training_info_without_route_ru
     from tinker_server.routes import training as training_routes
     from tinker_server.routes import weights as weights_routes
     from tinker_server import checkpoints as checkpoints_module
-    import tinker_server.backend.capacity_manager as capacity_module
-    import tinker_server.backend.api_work_queue as work_queue_module
+    import tinker_server.backend.model_work_scheduler as scheduler_module
 
     weights_routes.CHECKPOINTS_DIR = str(tmp_path)
     checkpoints_module.CHECKPOINTS_DIR = str(tmp_path)
@@ -1120,7 +1131,7 @@ def test_issue_283_load_state_route_uses_detached_training_info_without_route_ru
         async def async_release_all(self, request_id: str) -> None:
             _ = request_id
 
-    class StubWorkQueue:
+    class LocalStubWorkQueue:
         def __init__(self) -> None:
             self.calls: list[dict] = []
 
@@ -1165,10 +1176,9 @@ def test_issue_283_load_state_route_uses_detached_training_info_without_route_ru
             }
         return None
 
-    stub_queue = StubWorkQueue()
+    stub_queue = StubModelWorkScheduler()
 
-    monkeypatch.setattr(capacity_module, "capacity_manager", StubCapacityManager())
-    monkeypatch.setattr(work_queue_module, "api_work_queue", stub_queue)
+    monkeypatch.setattr(scheduler_module, "model_work_scheduler", stub_queue)
     monkeypatch.setattr(weights_routes, "future_store", StubFutureStore())
     monkeypatch.setattr(weights_routes, "training_engine", None)
     monkeypatch.setattr(weights_routes, "training_manager", None)
@@ -1188,7 +1198,7 @@ def test_issue_283_load_state_route_uses_detached_training_info_without_route_ru
     )
 
     assert resp.status_code == 200, resp.text
-    queued_payload = json.loads(stub_queue.calls[0]["request_json"].decode("utf-8"))
+    queued_payload = _queued_payload(stub_queue.calls[0])
     expected_path = weights_routes._resolve_mint_path(
         f"tinker://{run_id}/weights/{ckpt_name}",
         user_id=None,
@@ -1200,8 +1210,7 @@ def test_issue_283_load_state_route_uses_detached_training_info_without_route_ru
 def test_issue_283_save_routes_restore_inflight_protection(monkeypatch) -> None:
     from tinker_server.routes import training as training_routes
     from tinker_server.routes import weights as weights_routes
-    import tinker_server.backend.capacity_manager as capacity_module
-    import tinker_server.backend.api_work_queue as work_queue_module
+    import tinker_server.backend.model_work_scheduler as scheduler_module
 
     class StubCapacityManager:
         async def async_try_reserve(self, request_id: str, *, queue_bytes: int, object_store_bytes: int) -> dict:
@@ -1211,7 +1220,7 @@ def test_issue_283_save_routes_restore_inflight_protection(monkeypatch) -> None:
         async def async_release_all(self, request_id: str) -> None:
             _ = request_id
 
-    class StubWorkQueue:
+    class LocalStubWorkQueue:
         def __init__(self) -> None:
             self.calls: list[dict] = []
 
@@ -1246,10 +1255,9 @@ def test_issue_283_save_routes_restore_inflight_protection(monkeypatch) -> None:
         return None
 
     manager = StubTrainingManager()
-    stub_queue = StubWorkQueue()
+    stub_queue = StubModelWorkScheduler()
 
-    monkeypatch.setattr(capacity_module, "capacity_manager", StubCapacityManager())
-    monkeypatch.setattr(work_queue_module, "api_work_queue", stub_queue)
+    monkeypatch.setattr(scheduler_module, "model_work_scheduler", stub_queue)
     monkeypatch.setattr(weights_routes, "future_store", StubFutureStore())
     monkeypatch.setattr(weights_routes, "training_engine", None)
     monkeypatch.setattr(weights_routes, "training_manager", manager)
@@ -1274,8 +1282,7 @@ def test_issue_283_load_state_route_restores_inflight_protection(tmp_path: Path,
     from tinker_server.routes import training as training_routes
     from tinker_server.routes import weights as weights_routes
     from tinker_server import checkpoints as checkpoints_module
-    import tinker_server.backend.capacity_manager as capacity_module
-    import tinker_server.backend.api_work_queue as work_queue_module
+    import tinker_server.backend.model_work_scheduler as scheduler_module
 
     weights_routes.CHECKPOINTS_DIR = str(tmp_path)
     checkpoints_module.CHECKPOINTS_DIR = str(tmp_path)
@@ -1312,7 +1319,7 @@ def test_issue_283_load_state_route_restores_inflight_protection(tmp_path: Path,
         async def async_release_all(self, request_id: str) -> None:
             _ = request_id
 
-    class StubWorkQueue:
+    class LocalStubWorkQueue:
         def __init__(self) -> None:
             self.calls: list[dict] = []
 
@@ -1347,10 +1354,9 @@ def test_issue_283_load_state_route_restores_inflight_protection(tmp_path: Path,
         return None
 
     manager = StubTrainingManager()
-    stub_queue = StubWorkQueue()
+    stub_queue = StubModelWorkScheduler()
 
-    monkeypatch.setattr(capacity_module, "capacity_manager", StubCapacityManager())
-    monkeypatch.setattr(work_queue_module, "api_work_queue", stub_queue)
+    monkeypatch.setattr(scheduler_module, "model_work_scheduler", stub_queue)
     monkeypatch.setattr(weights_routes, "future_store", StubFutureStore())
     monkeypatch.setattr(weights_routes, "training_engine", None)
     monkeypatch.setattr(weights_routes, "training_manager", manager)
@@ -1412,8 +1418,7 @@ def test_issue_283_weights_routes_propagate_detached_store_503(monkeypatch, rout
 def test_issue_283_save_routes_refresh_detached_enqueue_protection(monkeypatch) -> None:
     from tinker_server.routes import training as training_routes
     from tinker_server.routes import weights as weights_routes
-    import tinker_server.backend.capacity_manager as capacity_module
-    import tinker_server.backend.api_work_queue as work_queue_module
+    import tinker_server.backend.model_work_scheduler as scheduler_module
 
     class StubCapacityManager:
         async def async_try_reserve(self, request_id: str, *, queue_bytes: int, object_store_bytes: int) -> dict:
@@ -1423,7 +1428,7 @@ def test_issue_283_save_routes_refresh_detached_enqueue_protection(monkeypatch) 
         async def async_release_all(self, request_id: str) -> None:
             _ = request_id
 
-    class StubWorkQueue:
+    class LocalStubWorkQueue:
         def __init__(self) -> None:
             self.calls: list[dict] = []
 
@@ -1456,10 +1461,9 @@ def test_issue_283_save_routes_refresh_detached_enqueue_protection(monkeypatch) 
     async def _protect_training_session_enqueue_window(session_info: dict) -> None:
         protected.append(dict(session_info))
 
-    stub_queue = StubWorkQueue()
+    stub_queue = StubModelWorkScheduler()
 
-    monkeypatch.setattr(capacity_module, "capacity_manager", StubCapacityManager())
-    monkeypatch.setattr(work_queue_module, "api_work_queue", stub_queue)
+    monkeypatch.setattr(scheduler_module, "model_work_scheduler", stub_queue)
     monkeypatch.setattr(weights_routes, "future_store", StubFutureStore())
     monkeypatch.setattr(weights_routes, "training_engine", None)
     monkeypatch.setattr(weights_routes, "training_manager", None)
@@ -1484,8 +1488,7 @@ def test_issue_283_load_state_route_refreshes_detached_enqueue_protection(tmp_pa
     from tinker_server.routes import training as training_routes
     from tinker_server.routes import weights as weights_routes
     from tinker_server import checkpoints as checkpoints_module
-    import tinker_server.backend.capacity_manager as capacity_module
-    import tinker_server.backend.api_work_queue as work_queue_module
+    import tinker_server.backend.model_work_scheduler as scheduler_module
 
     weights_routes.CHECKPOINTS_DIR = str(tmp_path)
     checkpoints_module.CHECKPOINTS_DIR = str(tmp_path)
@@ -1522,7 +1525,7 @@ def test_issue_283_load_state_route_refreshes_detached_enqueue_protection(tmp_pa
         async def async_release_all(self, request_id: str) -> None:
             _ = request_id
 
-    class StubWorkQueue:
+    class LocalStubWorkQueue:
         def __init__(self) -> None:
             self.calls: list[dict] = []
 
@@ -1555,10 +1558,9 @@ def test_issue_283_load_state_route_refreshes_detached_enqueue_protection(tmp_pa
     async def _protect_training_session_enqueue_window(session_info: dict) -> None:
         protected.append(dict(session_info))
 
-    stub_queue = StubWorkQueue()
+    stub_queue = StubModelWorkScheduler()
 
-    monkeypatch.setattr(capacity_module, "capacity_manager", StubCapacityManager())
-    monkeypatch.setattr(work_queue_module, "api_work_queue", stub_queue)
+    monkeypatch.setattr(scheduler_module, "model_work_scheduler", stub_queue)
     monkeypatch.setattr(weights_routes, "future_store", StubFutureStore())
     monkeypatch.setattr(weights_routes, "training_engine", None)
     monkeypatch.setattr(weights_routes, "training_manager", None)
