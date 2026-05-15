@@ -231,7 +231,6 @@ def test_load_weights_accepts_sampler_checkpoint_when_optimizer_restore_is_disab
 
     monkeypatch.setattr(worker_module, "checkpoint_has_openpi_training_state", lambda path: False)
     monkeypatch.setattr(worker_module, "find_openpi_policy_checkpoint_dir", lambda path: Path(path))
-    monkeypatch.setattr(worker_module, "checkpoint_has_openpi_policy_weights", lambda path: True)
 
     result = worker_module.OpenPIFastWorkerSession.load_weights(
         fake_session,
