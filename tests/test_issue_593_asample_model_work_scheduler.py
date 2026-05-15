@@ -133,6 +133,7 @@ def test_issue_593_asample_routes_multi_lora_to_model_work_scheduler(monkeypatch
     assert isinstance(out.request_id, str) and out.request_id
     assert api_queue.calls == []
     assert stub_cap.reserved == []
+    assert stub_fs.created == []
     assert len(scheduler.calls) == 1
     call = scheduler.calls[0]
     assert call["request_id"] == out.request_id
@@ -196,13 +197,13 @@ def test_issue_593_asample_cancels_scheduler_item_if_post_append_meta_update_fai
     assert len(scheduler.calls) == 1
     assert scheduler.cancelled == [
         {
-            "request_id": stub_fs.created[0],
+            "request_id": scheduler.calls[0]["request_id"],
             "reason": "asample_enqueue_failed",
         }
     ]
     assert stub_cap.reserved == []
     assert stub_cap.released == []
-    assert stub_fs.cleaned == [stub_fs.created[0]]
+    assert stub_fs.cleaned == [scheduler.calls[0]["request_id"]]
 
 
 def test_issue_593_asample_does_not_cancel_scheduler_item_when_append_rejects(monkeypatch):
@@ -240,7 +241,9 @@ def test_issue_593_asample_does_not_cancel_scheduler_item_when_append_rejects(mo
     assert scheduler.cancelled == []
     assert stub_cap.reserved == []
     assert stub_cap.released == []
-    assert stub_fs.cleaned == [stub_fs.created[0]]
+    assert stub_fs.created == []
+    assert stub_fs.queued == []
+    assert stub_fs.cleaned == []
 
 
 def test_issue_593_asample_ignores_legacy_flag_and_uses_model_work_scheduler(monkeypatch):

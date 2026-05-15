@@ -854,7 +854,8 @@ def test_issue_360_training_optim_step_admission_uses_async_capacity_and_future(
 
     assert isinstance(out.request_id, str) and out.request_id
     assert cap.calls == []
-    assert any(name == "async_create_with_id" for name, _rid in fs.calls)
+    assert not any(name == "async_create_with_id" for name, _rid in fs.calls)
+    assert any(name == "async_mark_queued" for name, _rid in fs.calls)
     assert q.calls == []
     assert len(mws.calls) == 1
 
@@ -979,7 +980,8 @@ def test_issue_360_training_enqueue_routes_use_detached_metadata_with_api_global
     out = anyio.run(route, request_factory(), _request_stub("user-a"))
 
     assert isinstance(out.request_id, str) and out.request_id
-    assert any(name == "async_create_with_id" for name, _rid in fs.calls)
+    assert not any(name == "async_create_with_id" for name, _rid in fs.calls)
+    assert any(name == "async_mark_queued" for name, _rid in fs.calls)
     assert cap.calls == []
     assert q.calls == []
     assert len(mws.calls) == 1
@@ -1097,7 +1099,8 @@ def test_issue_360_training_enqueue_refreshes_detached_heartbeat_before_queue(mo
     assert calls[0][0] == "sess-detached"
     assert calls[0][1] is not None
     assert cap.calls == []
-    assert any(name == "async_create_with_id" for name, _rid in fs.calls)
+    assert not any(name == "async_create_with_id" for name, _rid in fs.calls)
+    assert any(name == "async_mark_queued" for name, _rid in fs.calls)
     assert q.calls == []
     assert len(_mws.calls) == 1
 

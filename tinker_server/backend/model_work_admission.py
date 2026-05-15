@@ -47,7 +47,6 @@ async def enqueue_model_work(
     if ordering_key is not None:
         enqueue_extra["ordering_key"] = str(ordering_key)
 
-    created = False
     scheduler_confirmed = False
     if future_store_client is None:
         from .future_store import future_store as store
@@ -58,32 +57,6 @@ async def enqueue_model_work(
     else:
         scheduler = scheduler_client
     try:
-        if create_future:
-            create_model_work = getattr(store, "async_create_model_work_with_id", None)
-            if callable(create_model_work):
-                await create_model_work(
-                    request_id,
-                    op=op,
-                    domain_key=str(domain_key),
-                    request_json=request_json,
-                    meta=enqueue_extra,
-                    payload_hash=payload_hash,
-                )
-            else:
-                await store.async_create_with_id(request_id)
-            created = True
-            await store.async_mark_queued(
-                request_id,
-                meta={
-                    "queue_state": "queued",
-                    "stage": "queued",
-                    "queued_at": time.time(),
-                    **dict(queued_meta),
-                    "model_work_scheduler": True,
-                    "domain_key": str(domain_key),
-                    "request_json_bytes": len(request_json),
-                },
-            )
         append_coro = scheduler.append(
             request_id=request_id,
             op=op,
@@ -110,6 +83,19 @@ async def enqueue_model_work(
                 enqueue_coro=append_coro,
             )
         scheduler_confirmed = isinstance(out, dict) and bool(out.get("ok"))
+        if create_future:
+            await store.async_mark_queued(
+                request_id,
+                meta={
+                    "queue_state": "queued",
+                    "stage": "queued",
+                    "queued_at": time.time(),
+                    **dict(queued_meta),
+                    "model_work_scheduler": True,
+                    "domain_key": str(domain_key),
+                    "request_json_bytes": len(request_json),
+                },
+            )
         return ModelWorkAdmissionResult(
             request_id=request_id,
             scheduler_result=out if isinstance(out, dict) else {},
@@ -121,11 +107,6 @@ async def enqueue_model_work(
                     request_id=request_id,
                     reason="admission_failed",
                 )
-            except Exception:
-                pass
-        if created:
-            try:
-                await store.async_cleanup(request_id)
             except Exception:
                 pass
         raise
