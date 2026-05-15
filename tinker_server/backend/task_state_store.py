@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-from ..config import PFS_PYTHONPATH, actor_runtime_env, config as server_config
+from ..config import PFS_PYTHONPATH, actor_runtime_env, config as server_config, otel_env_vars
 from .async_ray_control import async_get_ray_ref, sync_get_ray_ref
 
 
@@ -1166,7 +1166,7 @@ def _create_ray_actor(*, require_ready: bool = True):
         "namespace": namespace,
         "lifetime": "detached",
         "get_if_exists": True,
-        "runtime_env": actor_runtime_env(pythonpath=PFS_PYTHONPATH),
+        "runtime_env": actor_runtime_env(pythonpath=PFS_PYTHONPATH, extra=otel_env_vars()),
     }
     actor = _RayTaskStateStoreActor.options(**options).remote(db_path)
     if require_ready:

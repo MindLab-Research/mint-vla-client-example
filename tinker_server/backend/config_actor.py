@@ -8,7 +8,7 @@ from typing import Any
 
 import ray
 
-from ..config import PFS_PYTHONPATH, RAY_NAMESPACE, actor_runtime_env, apply_detached_actor_resources
+from ..config import PFS_PYTHONPATH, RAY_NAMESPACE, actor_runtime_env, apply_detached_actor_resources, otel_env_vars
 from ..config_hydration import CONFIG_ACTOR_SELF_ENV
 from ..runtime_config import ConfigSnapshot, build_config_snapshot, config_actor_name
 
@@ -37,7 +37,7 @@ def _actor_options(*, actor_name: str) -> dict[str, object]:
         "get_if_exists": True,
         "runtime_env": actor_runtime_env(
             pythonpath=PFS_PYTHONPATH,
-            extra={CONFIG_ACTOR_SELF_ENV: "1"},
+            extra={**otel_env_vars(), CONFIG_ACTOR_SELF_ENV: "1"},
             include_config_snapshot=False,
         ),
     }
