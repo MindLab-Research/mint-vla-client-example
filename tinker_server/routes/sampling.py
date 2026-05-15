@@ -625,13 +625,8 @@ def _payload_hash(payload: bytes) -> str:
 
 
 def _model_work_scheduler_asample_enabled() -> bool:
-    return str(os.environ.get("MINT_MODEL_WORK_SCHEDULER_ASAMPLE", "")).strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "y",
-        "on",
-    )
+    value = str(os.environ.get("MINT_MODEL_WORK_SCHEDULER_ASAMPLE", "1")).strip().lower()
+    return value not in ("0", "false", "no", "n", "off")
 
 
 def _model_work_domain_key(base_model: str) -> str:
@@ -961,6 +956,20 @@ async def _persist_usage_events(*, auth_ctx: GatewayAuthContext, events: list[Us
     schedule_usage_events(events)
 
 
+async def _cancel_scheduler_request_if_confirmed(request_id: str, *, confirmed: bool) -> None:
+    if not confirmed:
+        return
+    try:
+        from ..backend.model_work_scheduler import model_work_scheduler
+
+        await model_work_scheduler.cancel_request(
+            request_id=request_id,
+            reason="asample_enqueue_failed",
+        )
+    except Exception:
+        pass
+
+
 @router.post("/asample")
 async def asample(
     request: SampleRequest,
@@ -1088,8 +1097,6 @@ async def asample(
         raise HTTPException(status_code=429, detail="Sampling backpressure: server overloaded")
     user_id = _get_user_id(http_request)
     from ..backend.api_work_queue import ApiWorkQueueThrottleError, _unwrap_queue_throttle_error, api_work_queue
-    from ..backend.capacity_manager import capacity_manager
-    from ..backend.result_size_estimator import estimate_sampling_result_bytes
 
     request_json = request.model_dump_json().encode("utf-8")
     payload_hash = _payload_hash(request_json)
@@ -1104,6 +1111,13 @@ async def asample(
     )
     created_pending = False
     model_work_attempt_id = uuid.uuid4().hex
+    base_model = snapshot.base_model if snapshot is not None else None
+    use_model_work_scheduler = (
+        _model_work_scheduler_asample_enabled()
+        and snapshot is not None
+        and bool(snapshot.uses_multi_lora)
+        and bool(base_model)
+    )
 
     # Set request_id in context for logging
     set_request_id(request_id)
@@ -1149,26 +1163,30 @@ async def asample(
                 )
             return UntypedAPIFuture(request_id=request_id)
 
-    reserve = await capacity_manager.async_try_reserve(
-        request_id,
-        queue_bytes=len(request_json),
-        object_store_bytes=estimate_sampling_result_bytes(request),
-    )
-    if not bool(reserve.get("ok")):
-        if created_pending:
-            try:
-                await future_store.async_forget(request_id)
-            except FutureStoreUnavailableError:
-                raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
-        record_sampling_admission_metric(
-            route=_ASAMPLE_ROUTE,
-            decision="rejected",
-            reason="capacity_rejected",
+    if not use_model_work_scheduler:
+        from ..backend.capacity_manager import capacity_manager
+        from ..backend.result_size_estimator import estimate_sampling_result_bytes
+
+        reserve = await capacity_manager.async_try_reserve(
+            request_id,
+            queue_bytes=len(request_json),
+            object_store_bytes=estimate_sampling_result_bytes(request),
         )
-        raise HTTPException(
-            status_code=429,
-            detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
-        )
+        if not bool(reserve.get("ok")):
+            if created_pending:
+                try:
+                    await future_store.async_forget(request_id)
+                except FutureStoreUnavailableError:
+                    raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
+            record_sampling_admission_metric(
+                route=_ASAMPLE_ROUTE,
+                decision="rejected",
+                reason="capacity_rejected",
+            )
+            raise HTTPException(
+                status_code=429,
+                detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
+            )
 
     created = False
     model_work_scheduler_append_confirmed = False
@@ -1176,13 +1194,6 @@ async def asample(
         if not created_pending:
             await future_store.async_create_with_id(request_id)
             created = True
-        base_model = snapshot.base_model if snapshot is not None else None
-        use_model_work_scheduler = (
-            _model_work_scheduler_asample_enabled()
-            and snapshot is not None
-            and bool(snapshot.uses_multi_lora)
-            and bool(base_model)
-        )
         domain_key = _model_work_domain_key(str(base_model)) if use_model_work_scheduler else None
         affinity_group = _model_work_affinity_group(snapshot) if use_model_work_scheduler else None
         ordering_key = f"session:{session_id}" if use_model_work_scheduler else None
@@ -1277,17 +1288,12 @@ async def asample(
                 ),
             )
     except ApiWorkQueueThrottleError as e:
-        await capacity_manager.async_release_all(request_id)
-        if model_work_scheduler_append_confirmed:
-            try:
-                from ..backend.model_work_scheduler import model_work_scheduler
+        if use_model_work_scheduler:
+            await _cancel_scheduler_request_if_confirmed(request_id, confirmed=model_work_scheduler_append_confirmed)
+        else:
+            from ..backend.capacity_manager import capacity_manager
 
-                await model_work_scheduler.cancel_request(
-                    request_id=request_id,
-                    reason="asample_enqueue_failed",
-                )
-            except Exception:
-                pass
+            await capacity_manager.async_release_all(request_id)
         if created_pending:
             try:
                 await future_store.async_forget(request_id)
@@ -1306,17 +1312,12 @@ async def asample(
     except Exception as e:
         throttle_error = _unwrap_queue_throttle_error(e)
         if throttle_error is not None:
-            await capacity_manager.async_release_all(request_id)
-            if model_work_scheduler_append_confirmed:
-                try:
-                    from ..backend.model_work_scheduler import model_work_scheduler
+            if use_model_work_scheduler:
+                await _cancel_scheduler_request_if_confirmed(request_id, confirmed=model_work_scheduler_append_confirmed)
+            else:
+                from ..backend.capacity_manager import capacity_manager
 
-                    await model_work_scheduler.cancel_request(
-                        request_id=request_id,
-                        reason="asample_enqueue_failed",
-                    )
-                except Exception:
-                    pass
+                await capacity_manager.async_release_all(request_id)
             if created_pending:
                 try:
                     await future_store.async_forget(request_id)
@@ -1332,17 +1333,12 @@ async def asample(
                 scope=detail.get("scope") if isinstance(detail, dict) else None,
             )
             raise HTTPException(status_code=429, detail=throttle_error.detail) from e
-        await capacity_manager.async_release_all(request_id)
-        if model_work_scheduler_append_confirmed:
-            try:
-                from ..backend.model_work_scheduler import model_work_scheduler
+        if use_model_work_scheduler:
+            await _cancel_scheduler_request_if_confirmed(request_id, confirmed=model_work_scheduler_append_confirmed)
+        else:
+            from ..backend.capacity_manager import capacity_manager
 
-                await model_work_scheduler.cancel_request(
-                    request_id=request_id,
-                    reason="asample_enqueue_failed",
-                )
-            except Exception:
-                pass
+            await capacity_manager.async_release_all(request_id)
         if created_pending:
             try:
                 await future_store.async_forget(request_id)

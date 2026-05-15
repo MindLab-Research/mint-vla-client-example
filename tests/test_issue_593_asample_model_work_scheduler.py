@@ -103,7 +103,6 @@ def _dummy_request(user_id: str | None = None):
 
 
 def test_issue_593_asample_routes_multi_lora_to_model_work_scheduler(monkeypatch):
-    monkeypatch.setenv("MINT_MODEL_WORK_SCHEDULER_ASAMPLE", "1")
     stub_fs = _StubFutureStore()
     stub_cap = _StubCapacityManager()
     api_queue = _CaptureQueue()
@@ -133,6 +132,7 @@ def test_issue_593_asample_routes_multi_lora_to_model_work_scheduler(monkeypatch
 
     assert isinstance(out.request_id, str) and out.request_id
     assert api_queue.calls == []
+    assert stub_cap.reserved == []
     assert len(scheduler.calls) == 1
     call = scheduler.calls[0]
     assert call["request_id"] == out.request_id
@@ -163,7 +163,6 @@ def test_issue_593_asample_routes_multi_lora_to_model_work_scheduler(monkeypatch
 
 
 def test_issue_593_asample_cancels_scheduler_item_if_post_append_meta_update_fails(monkeypatch):
-    monkeypatch.setenv("MINT_MODEL_WORK_SCHEDULER_ASAMPLE", "1")
     stub_fs = _StubFutureStore(fail_update_meta=True)
     stub_cap = _StubCapacityManager()
     api_queue = _CaptureQueue()
@@ -201,12 +200,12 @@ def test_issue_593_asample_cancels_scheduler_item_if_post_append_meta_update_fai
             "reason": "asample_enqueue_failed",
         }
     ]
-    assert stub_cap.released == [stub_fs.created[0]]
+    assert stub_cap.reserved == []
+    assert stub_cap.released == []
     assert stub_fs.cleaned == [stub_fs.created[0]]
 
 
 def test_issue_593_asample_does_not_cancel_scheduler_item_when_append_rejects(monkeypatch):
-    monkeypatch.setenv("MINT_MODEL_WORK_SCHEDULER_ASAMPLE", "1")
     stub_fs = _StubFutureStore()
     stub_cap = _StubCapacityManager()
     api_queue = _CaptureQueue()
@@ -239,12 +238,13 @@ def test_issue_593_asample_does_not_cancel_scheduler_item_when_append_rejects(mo
 
     assert len(scheduler.calls) == 1
     assert scheduler.cancelled == []
-    assert stub_cap.released == [stub_fs.created[0]]
+    assert stub_cap.reserved == []
+    assert stub_cap.released == []
     assert stub_fs.cleaned == [stub_fs.created[0]]
 
 
-def test_issue_593_asample_flag_off_keeps_api_work_queue(monkeypatch):
-    monkeypatch.delenv("MINT_MODEL_WORK_SCHEDULER_ASAMPLE", raising=False)
+def test_issue_593_asample_explicit_flag_off_keeps_api_work_queue(monkeypatch):
+    monkeypatch.setenv("MINT_MODEL_WORK_SCHEDULER_ASAMPLE", "0")
     stub_fs = _StubFutureStore()
     stub_cap = _StubCapacityManager()
     api_queue = _CaptureQueue()

@@ -1031,9 +1031,9 @@ def _create_ray_actor(*, require_ready: bool = True):
 
     actor = _RayModelWorkSchedulerActor.options(**options).remote(
         use_task_state_store=str(
-            os.environ.get("MINT_MODEL_WORK_SCHEDULER_TASK_STATE_STORE", "")
+            os.environ.get("MINT_MODEL_WORK_SCHEDULER_TASK_STATE_STORE", "1")
         ).strip().lower()
-        in {"1", "true", "yes", "on"}
+        not in {"0", "false", "no", "off"}
     )
     if require_ready:
         stats = _await_ray_ref_sync(actor.stats.remote(), timeout_s=5.0)

@@ -49,6 +49,9 @@ class _AsyncFutureStore:
     async def async_mark_queued(self, _request_id: str, meta=None) -> None:
         return None
 
+    async def async_update_meta(self, _request_id: str, meta=None) -> None:
+        return None
+
     async def async_cleanup(self, _request_id: str) -> None:
         return None
 
@@ -68,6 +71,15 @@ class _AsyncCapacityManager:
 
     async def async_release_all(self, *_args, **_kwargs) -> None:
         return None
+
+
+class _AsyncModelWorkScheduler:
+    def __init__(self, captured: dict) -> None:
+        self._captured = captured
+
+    async def append(self, **kwargs) -> dict:
+        self._captured.update(kwargs)
+        return {"ok": True, "scheduler_instance_id": "scheduler-281"}
 
 
 async def _route_session_info(model_id: str, *, backend: str, base_model: str) -> dict[str, str]:
@@ -272,19 +284,14 @@ async def test_issue_281_save_weights_for_sampler_enqueues_scheduler_metadata(mo
 
 @pytest.mark.anyio
 async def test_issue_281_asample_enqueues_scheduler_metadata(monkeypatch) -> None:
-    import tinker_server.backend.api_work_queue as awq
-    import tinker_server.backend.capacity_manager as cm
+    import tinker_server.backend.model_work_scheduler as mws
     import tinker_server.backend.model_registry as model_registry
-    import tinker_server.backend.result_size_estimator as rse
     from tinker_server.models.types import ModelInput, SampleRequest, SamplingParams
     from tinker_server.routes import sampling as sr
 
     monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "1")
 
     captured: dict = {}
-
-    async def _fake_enqueue(**kwargs):
-        captured.update(kwargs)
 
     monkeypatch.setattr(
         sr,
@@ -297,9 +304,7 @@ async def test_issue_281_asample_enqueues_scheduler_metadata(monkeypatch) -> Non
         ),
     )
     monkeypatch.setattr(sr, "future_store", _AsyncFutureStore())
-    monkeypatch.setattr(awq, "api_work_queue", SimpleNamespace(enqueue=_fake_enqueue))
-    monkeypatch.setattr(cm, "capacity_manager", _AsyncCapacityManager())
-    monkeypatch.setattr(rse, "estimate_sampling_result_bytes", lambda _req: 0)
+    monkeypatch.setattr(mws, "model_work_scheduler", _AsyncModelWorkScheduler(captured))
     monkeypatch.setattr(model_registry, "get_model_config", lambda _model: SimpleNamespace(max_model_len=4096))
 
     req = SampleRequest(
@@ -310,7 +315,13 @@ async def test_issue_281_asample_enqueues_scheduler_metadata(monkeypatch) -> Non
     )
     await sr.asample(req, _DummyRequest(user_id="owner-a"))
 
-    assert captured["extra"] == {"queue_priority": 0}
+    assert captured["domain_key"] == "vllm:Qwen/Qwen3-0.6B"
+    assert captured["affinity_group"] == "lora:sess-281:generation:1"
+    assert captured["ordering_key"] == "session:sess-281"
+    assert captured["extra"]["queue_priority"] == 0
+    assert captured["extra"]["model_work_scheduler"] is True
+    assert captured["extra"]["domain_key"] == "vllm:Qwen/Qwen3-0.6B"
+    assert captured["extra"]["affinity_group"] == "lora:sess-281:generation:1"
 
 
 @pytest.mark.anyio
@@ -570,19 +581,14 @@ async def test_issue_281_do_delete_model_deletes_then_resolves(monkeypatch) -> N
 
 @pytest.mark.anyio
 async def test_issue_281_asample_falls_back_to_base_model_scheduler_domain(monkeypatch) -> None:
-    import tinker_server.backend.api_work_queue as awq
-    import tinker_server.backend.capacity_manager as cm
+    import tinker_server.backend.model_work_scheduler as mws
     import tinker_server.backend.model_registry as model_registry
-    import tinker_server.backend.result_size_estimator as rse
     from tinker_server.models.types import ModelInput, SampleRequest, SamplingParams
     from tinker_server.routes import sampling as sr
 
     monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "1")
 
     captured: dict = {}
-
-    async def _fake_enqueue(**kwargs):
-        captured.update(kwargs)
 
     monkeypatch.setattr(
         sr,
@@ -595,9 +601,7 @@ async def test_issue_281_asample_falls_back_to_base_model_scheduler_domain(monke
         ),
     )
     monkeypatch.setattr(sr, "future_store", _AsyncFutureStore())
-    monkeypatch.setattr(awq, "api_work_queue", SimpleNamespace(enqueue=_fake_enqueue))
-    monkeypatch.setattr(cm, "capacity_manager", _AsyncCapacityManager())
-    monkeypatch.setattr(rse, "estimate_sampling_result_bytes", lambda _req: 0)
+    monkeypatch.setattr(mws, "model_work_scheduler", _AsyncModelWorkScheduler(captured))
     monkeypatch.setattr(model_registry, "get_model_config", lambda _model: SimpleNamespace(max_model_len=4096))
 
     req = SampleRequest(
@@ -608,7 +612,11 @@ async def test_issue_281_asample_falls_back_to_base_model_scheduler_domain(monke
     )
     await sr.asample(req, _DummyRequest(user_id="owner-a"))
 
-    assert captured["extra"] == {"queue_priority": 0}
+    assert captured["domain_key"] == "vllm:Qwen/Qwen3-0.6B"
+    assert captured["affinity_group"] == "lora:sess-281:generation:1"
+    assert captured["ordering_key"] == "session:sess-281"
+    assert captured["extra"]["queue_priority"] == 0
+    assert captured["extra"]["model_work_scheduler"] is True
 
 
 @pytest.mark.anyio
