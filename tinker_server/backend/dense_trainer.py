@@ -507,6 +507,9 @@ def get_or_create_dense_trainer(
                     "env_vars": actor_runtime_env_vars(
                         pythonpath=PFS_PYTHONPATH_DENSE,
                         extra={
+                        "USE_TORCH": "1",
+                        "USE_TF": "0",
+                        "USE_FLAX": "0",
                         "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                         "HF_HUB_OFFLINE": "1",
                         "TRANSFORMERS_OFFLINE": "1",

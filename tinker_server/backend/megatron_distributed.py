@@ -15,8 +15,10 @@ import math
 import hashlib
 import socket
 import logging
+import sys
 import threading
 import time
+import types
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -69,6 +71,172 @@ def _get_torch():
     import torch
 
     return torch
+
+
+def _install_noop_tensorboard() -> None:
+    """Avoid importing TensorFlow through torch.utils.tensorboard in Megatron actors."""
+    if os.environ.get("MINT_MEGATRON_DISABLE_TENSORBOARD", "1").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    ):
+        return
+
+    if "torch.utils.tensorboard" in sys.modules:
+        return
+
+    class _NoOpSummaryWriter:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            self.close()
+            return False
+
+        def __getattr__(self, name):
+            def _noop(*args, **kwargs):
+                return None
+
+            return _noop
+
+        def flush(self):
+            return None
+
+        def close(self):
+            return None
+
+    tensorboard_mod = types.ModuleType("torch.utils.tensorboard")
+    writer_mod = types.ModuleType("torch.utils.tensorboard.writer")
+    tensorboard_mod.SummaryWriter = _NoOpSummaryWriter
+    tensorboard_mod.FileWriter = _NoOpSummaryWriter
+    writer_mod.SummaryWriter = _NoOpSummaryWriter
+    writer_mod.FileWriter = _NoOpSummaryWriter
+    sys.modules["torch.utils.tensorboard"] = tensorboard_mod
+    sys.modules["torch.utils.tensorboard.writer"] = writer_mod
+
+    try:
+        import torch.utils
+
+        torch.utils.tensorboard = tensorboard_mod
+    except Exception:
+        pass
+
+
+def _patch_flash_attn_metadata_version() -> None:
+    """Normalize flash-attn metadata before TransformerEngine probes it."""
+    try:
+        import importlib.metadata as _imd
+
+        _orig_version = getattr(_imd, "version", None)
+        if not callable(_orig_version) or getattr(_orig_version, "_tinker_flash_attn_version_patch", False):
+            return
+
+        def _patched_version(dist_name: str) -> str:
+            version_text = _orig_version(dist_name)
+            if dist_name == "flash-attn" and isinstance(version_text, str):
+                if version_text == "0.2.8":
+                    return "2.8.1"
+                if "+" in version_text:
+                    return version_text.split("+", 1)[0]
+            if dist_name == "flash-attn-3" and isinstance(version_text, str) and "+" in version_text:
+                return version_text.split("+", 1)[0]
+            return version_text
+
+        _patched_version._tinker_flash_attn_version_patch = True  # type: ignore[attr-defined]
+        _imd.version = _patched_version  # type: ignore[assignment]
+    except Exception as exc:
+        logger.warning("Failed to patch flash-attn metadata version: %s", exc)
+
+
+def _patch_flash_attn_interface_compat() -> None:
+    """Expose flash-attn v2 names when the image ships older unpadded aliases."""
+    try:
+        from flash_attn import flash_attn_interface
+
+        if (
+            not hasattr(flash_attn_interface, "flash_attn_varlen_func")
+            and hasattr(flash_attn_interface, "flash_attn_unpadded_func")
+        ):
+            flash_attn_interface.flash_attn_varlen_func = flash_attn_interface.flash_attn_unpadded_func
+        if (
+            not hasattr(flash_attn_interface, "_flash_attn_varlen_forward")
+            and hasattr(flash_attn_interface, "_flash_attn_forward")
+        ):
+            flash_attn_interface._flash_attn_varlen_forward = flash_attn_interface._flash_attn_forward
+        if (
+            not hasattr(flash_attn_interface, "_flash_attn_varlen_backward")
+            and hasattr(flash_attn_interface, "_flash_attn_backward")
+        ):
+            flash_attn_interface._flash_attn_varlen_backward = flash_attn_interface._flash_attn_backward
+    except Exception as exc:
+        logger.warning("Failed to patch flash-attn interface compatibility: %s", exc)
+
+
+def _patch_flash_attn_compat() -> None:
+    _patch_flash_attn_metadata_version()
+    _patch_flash_attn_interface_compat()
+
+
+def _megatron_attention_backend() -> str:
+    _patch_flash_attn_compat()
+
+    override = os.environ.get("MINT_MEGATRON_ATTENTION_BACKEND", "").strip().lower()
+    if override:
+        if override not in {"flash", "fused", "unfused", "local", "auto"}:
+            raise ValueError(f"Invalid MINT_MEGATRON_ATTENTION_BACKEND={override!r}")
+        return override
+
+    try:
+        from importlib.metadata import version
+        from packaging.version import Version
+
+        flash_attn_version = Version(version("flash-attn"))
+        if Version("2.1.1") <= flash_attn_version <= Version("2.8.1"):
+            return "flash"
+    except Exception:
+        pass
+
+    try:
+        import flash_attn_2_cuda  # noqa: F401
+        from flash_attn import flash_attn_interface
+
+        has_dense = hasattr(flash_attn_interface, "flash_attn_func")
+        has_varlen = hasattr(flash_attn_interface, "flash_attn_varlen_func") or hasattr(
+            flash_attn_interface,
+            "flash_attn_unpadded_func",
+        )
+        if not (has_dense and has_varlen):
+            raise ImportError("flash-attn interface is missing dense or variable-length kernels")
+
+        return "flash"
+    except Exception:
+        pass
+
+    return "unfused"
+
+
+def _disable_te_flash_attention_backend() -> None:
+    """Prevent Transformer Engine from instantiating incompatible flash-attn."""
+    try:
+        from packaging.version import Version
+        from transformer_engine.pytorch.attention.dot_product_attention import (
+            backends as dpa_backends,
+            utils as dpa_utils,
+        )
+
+        dpa_utils._NVTE_FLASH_ATTN = 0
+        for flash_utils in (dpa_utils.FlashAttentionUtils, dpa_backends.fa_utils):
+            flash_utils.is_installed = False
+            flash_utils.v3_is_installed = False
+            flash_utils.version = Version("0")
+            flash_utils.fa3_version = Version("0")
+    except Exception as exc:
+        logger.warning("Failed to disable TE flash attention backend: %s", exc)
 
 
 def _get_megatron_create_lock(actor_name: str) -> threading.Lock:
@@ -579,6 +747,7 @@ class MegatronRankWorker:
         simultaneously so they can reach init_process_group barrier together.
         """
         init_actor_observability()
+        _install_noop_tensorboard()
         self._startup_traceparent = traceparent
         self._startup_request_id = str(request_id or get_request_id() or "") or None
         self._bind_traceparent(traceparent)
@@ -2046,8 +2215,20 @@ class MegatronRankWorker:
             # CRITICAL: Enable determinism FIRST, before ANY Megatron/TE imports
             # This must happen before FlashAttention code is loaded to take effect
             # Without this, consecutive forward passes differ by ~0.46 nats
+            attention_backend = _megatron_attention_backend()
+            if attention_backend in {"flash", "fused", "unfused", "local"}:
+                os.environ["NVTE_FLASH_ATTN"] = "1" if attention_backend == "flash" else "0"
+                os.environ["NVTE_FUSED_ATTN"] = "1" if attention_backend == "fused" else "0"
+                os.environ["NVTE_UNFUSED_ATTN"] = "1" if attention_backend == "unfused" else "0"
+            if attention_backend != "flash":
+                _disable_te_flash_attention_backend()
+            logger.info(f"[Rank {self.rank}] Megatron attention_backend={attention_backend}")
+
             from tinker_server.backend.verl_patches import _enable_megatron_determinism
+            _patch_flash_attn_compat()
             _enable_megatron_determinism(seed=42)
+            if attention_backend != "flash":
+                _disable_te_flash_attention_backend()
 
             # Apply MLA patches for DeepseekV3/K2/Moonlight models BEFORE importing Megatron
             # These patches enable Flash Attention 2 with MLA by padding value tensors
@@ -2280,17 +2461,16 @@ class MegatronRankWorker:
         # Flash Attention 2 requires head_dim_qk == head_dim_v
         # The MLA patch in verl/models/mcore/patch_v012.py pads value tensor to 192
         # to match query dimension, enabling FA2 with THD format on sm80 (A100/A800)
-        #
-        # IMPORTANT: Do NOT force unfused backend here - it conflicts with THD format
-        # (TE disables unfused for THD). Let FA2 work with the value padding instead.
         qk_nope = getattr(hf_config, "qk_nope_head_dim", 0)
         qk_rope = getattr(hf_config, "qk_rope_head_dim", 0)
         head_dim_qk = qk_nope + qk_rope
         has_mla_attention = head_dim_qk > 0
+        attention_backend = _megatron_attention_backend()
+        override_tf_config["attention_backend"] = attention_backend
         if has_mla_attention:
             logger.info(
                 f"[Rank {self.rank}] MLA attention detected: head_dim_qk={head_dim_qk} "
-                f"(qk_nope={qk_nope} + qk_rope={qk_rope}). Using FA2 with value padding."
+                f"(qk_nope={qk_nope} + qk_rope={qk_rope}), attention_backend={attention_backend}."
             )
 
         # Activation checkpointing for memory-efficient training
@@ -6901,6 +7081,9 @@ class MegatronWorkerGroup:
             "env_vars": actor_runtime_env_vars(
                 pythonpath=PFS_PYTHONPATH,
                 extra={
+                "USE_TORCH": "1",
+                "USE_TF": "0",
+                "USE_FLAX": "0",
                 "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                 "HF_HUB_OFFLINE": "1",
                 "TRANSFORMERS_OFFLINE": "1",
@@ -6910,9 +7093,6 @@ class MegatronWorkerGroup:
                 # TransformerEngine debug - see why attention backends are disabled
                 "NVTE_DEBUG": "1",
                 "NVTE_DEBUG_LEVEL": "2",
-                # Allow TE DotProductAttention backends; Megatron flash attention asserts these are 0.
-                "NVTE_FUSED_ATTN": "0" if is_mla else "1",
-                "NVTE_UNFUSED_ATTN": "0" if is_mla else "1",
                 **otel_env_vars(),
                 },
             ),
@@ -7721,6 +7901,33 @@ class MegatronWorkerGroup:
                 f"session {session_id} blocked for {op}: strict trusted-pair enforcement requires both markers"
             )
 
+    def _has_stale_trusted_pair_marker(self, session_id: str) -> bool:
+        session_manager = getattr(self, "_session_manager", None)
+        if session_manager is None:
+            return False
+        get_external_checkpoint = getattr(session_manager, "get_external_checkpoint", None)
+        get_recovery_baseline = getattr(session_manager, "get_trusted_recovery_baseline", None)
+        external = get_external_checkpoint(session_id) if callable(get_external_checkpoint) else None
+        baseline = get_recovery_baseline(session_id) if callable(get_recovery_baseline) else None
+        return (
+            isinstance(external, dict)
+            and not bool(external.get("is_fresh", False))
+        ) or (
+            isinstance(baseline, dict)
+            and not bool(baseline.get("is_fresh", False))
+        )
+
+    def _can_restore_session_before_stale_pair_check(self, session_id: str) -> bool:
+        if getattr(self, "_session_unknown_due_to_partial_swap", False):
+            return False
+        if getattr(self, "_current_session", None) == session_id:
+            return bool(self._session_state_cached_on_workers(session_id))
+        session_manager = getattr(self, "_session_manager", None)
+        if session_manager is None:
+            return False
+        session_exists = getattr(session_manager, "session_exists", None)
+        return bool(callable(session_exists) and session_exists(session_id))
+
     def _invalidate_session_durability(
         self,
         session_id: str | None,
@@ -7780,7 +7987,12 @@ class MegatronWorkerGroup:
         """Resolve and restore session state for forward/backward/step style requests."""
         effective_session_id = self._resolve_required_session_id(session_id, op=op)
         self._assert_session_request_allowed(effective_session_id, op=op)
-        self._validate_trusted_pair_for_request(effective_session_id, op=op)
+        validate_after_restore = (
+            self._has_stale_trusted_pair_marker(effective_session_id)
+            and self._can_restore_session_before_stale_pair_check(effective_session_id)
+        )
+        if not validate_after_restore:
+            self._validate_trusted_pair_for_request(effective_session_id, op=op)
         try:
             switch_stats = self._ensure_session_loaded(
                 effective_session_id,
@@ -7796,6 +8008,8 @@ class MegatronWorkerGroup:
                 reason=f"{op}:ensure_session_loaded:{type(e).__name__}",
             )
             raise
+        if validate_after_restore:
+            self._validate_trusted_pair_for_request(effective_session_id, op=op)
         if not isinstance(switch_stats, dict):
             switch_stats = dict(getattr(self, "_last_session_switch_stats", None) or {})
         return effective_session_id, switch_stats
@@ -10171,6 +10385,9 @@ def get_or_create_megatron_worker_group(
                 "env_vars": actor_runtime_env_vars(
                     pythonpath=PFS_PYTHONPATH,
                     extra={
+                    "USE_TORCH": "1",
+                    "USE_TF": "0",
+                    "USE_FLAX": "0",
                     "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                     "HF_HUB_OFFLINE": "1",
                     "TRANSFORMERS_OFFLINE": "1",

@@ -227,7 +227,14 @@ def _apply_external_label_patch():
 
     original_forward_step = MegatronEngineWithLMHead.forward_step
 
-    def patched_forward_step(self, batch_iter, model, postprocess_micro_batch_func):
+    def patched_forward_step(
+        self,
+        batch_iter,
+        model,
+        logits_processor_func=None,
+        postprocess_micro_batch_func=None,
+        **_kwargs,
+    ):
         """Patched forward_step that uses external labels when provided."""
         from functools import partial
         from tensordict import TensorDict
@@ -236,6 +243,9 @@ def _apply_external_label_patch():
         import verl.utils.torch_functional as verl_F
         from verl.utils.megatron.tensor_parallel import vocab_parallel_entropy
         from verl.utils.megatron.tensor_parallel import vocab_parallel_log_probs_from_logits
+
+        if postprocess_micro_batch_func is None:
+            raise TypeError("postprocess_micro_batch_func is required")
 
         batch: TensorDict = next(batch_iter)
         batch = batch.to(get_device_id())
@@ -1195,7 +1205,12 @@ def _enable_megatron_determinism(seed: int = 42):
         if callable(_orig_version) and not getattr(_orig_version, "_tinker_flash_attn_version_patch", False):
             def _patched_version(dist_name: str) -> str:
                 v = _orig_version(dist_name)
-                if dist_name in ("flash-attn", "flash-attn-3") and isinstance(v, str) and "+" in v:
+                if dist_name == "flash-attn" and isinstance(v, str):
+                    if v == "0.2.8":
+                        return "2.8.1"
+                    if "+" in v:
+                        return v.split("+", 1)[0]
+                if dist_name == "flash-attn-3" and isinstance(v, str) and "+" in v:
                     return v.split("+", 1)[0]
                 return v
 
@@ -1204,23 +1219,24 @@ def _enable_megatron_determinism(seed: int = 42):
     except Exception as e:
         logger.warning(f"Failed to patch importlib.metadata.version for flash-attn: {e}")
 
-    # TransformerEngine disables FlashAttention when the installed flash-attn distribution
-    # version contains a local suffix (e.g. "2.8.3+cu129torch2.9") and is compared strictly
-    # against max_version="2.8.3". That forces a fallback to O(seq^2) attention and OOMs at
-    # long context.
-    #
-    # Force-enable FlashAttention by normalizing TE's cached version object before Megatron
-    # imports initialize TE attention modules.
-    try:
-        from transformer_engine.pytorch.attention.dot_product_attention.utils import FlashAttentionUtils, PkgVersion
-        te_ver = str(getattr(FlashAttentionUtils, "version", ""))
-        if "+" in te_ver:
-            base = te_ver.split("+", 1)[0]
-            FlashAttentionUtils.version = PkgVersion(base)
-            print(f"[VERL_PATCH] Normalized TransformerEngine FlashAttentionUtils.version {te_ver} -> {base}")
-        FlashAttentionUtils.set_flash_attention_version()
-    except Exception as e:
-        logger.warning(f"Failed to force-enable TransformerEngine FlashAttention: {e}")
+    if os.environ.get("NVTE_FLASH_ATTN", "1") != "0":
+        # TransformerEngine disables FlashAttention when the installed flash-attn distribution
+        # version contains a local suffix (e.g. "2.8.3+cu129torch2.9") and is compared strictly
+        # against max_version="2.8.3". That forces a fallback to O(seq^2) attention and OOMs at
+        # long context.
+        #
+        # Force-enable FlashAttention by normalizing TE's cached version object before Megatron
+        # imports initialize TE attention modules.
+        try:
+            from transformer_engine.pytorch.attention.dot_product_attention.utils import FlashAttentionUtils, PkgVersion
+            te_ver = str(getattr(FlashAttentionUtils, "version", ""))
+            if "+" in te_ver:
+                base = te_ver.split("+", 1)[0]
+                FlashAttentionUtils.version = PkgVersion(base)
+                print(f"[VERL_PATCH] Normalized TransformerEngine FlashAttentionUtils.version {te_ver} -> {base}")
+            FlashAttentionUtils.set_flash_attention_version()
+        except Exception as e:
+            logger.warning(f"Failed to force-enable TransformerEngine FlashAttention: {e}")
 
     # Set random seeds
     random.seed(seed)

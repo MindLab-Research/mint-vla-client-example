@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import os
 import shutil
@@ -27,6 +28,8 @@ DEFAULT_INSPECT_PROBE_MODULES = (
     "orbax.checkpoint",
 )
 DEFAULT_UV_HTTP_TIMEOUT = "300"
+DEFAULT_MINT_ROOT = Path("/vePFS-Mindverse/share/mint")
+MINT_ENVS = ("prod", "dev")
 
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -145,6 +148,59 @@ def _load_manifest(env_root: Path) -> dict[str, Any]:
     if not manifest_path.exists():
         raise RuntimeError(f"missing manifest.json under {env_root}")
     return json.loads(manifest_path.read_text(encoding="utf-8"))
+
+
+def _git_short_sha() -> str:
+    try:
+        return _capture(["git", "rev-parse", "--short=12", "HEAD"], cwd=REPO_ROOT).strip()
+    except Exception:
+        return "nogit"
+
+
+def _default_build_id() -> str:
+    timestamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
+    return f"py31213-{timestamp}-{_git_short_sha()}"
+
+
+def _mint_env_root(mint_root: Path, mint_env: str) -> Path:
+    if mint_env not in MINT_ENVS:
+        raise ValueError(f"unsupported Mint runtime env {mint_env!r}; expected one of {MINT_ENVS!r}")
+    return mint_root / mint_env
+
+
+def _mint_runtime_build_root(mint_root: Path, mint_env: str, build_id: str) -> Path:
+    return _mint_env_root(mint_root, mint_env) / "runtime-builds" / build_id
+
+
+def _mint_runtime_link(mint_root: Path, mint_env: str) -> Path:
+    return _mint_env_root(mint_root, mint_env) / "runtime"
+
+
+def _promote_runtime_symlink(runtime_root: Path, link_path: Path) -> None:
+    runtime_root = runtime_root.resolve()
+    if not runtime_root.is_dir():
+        raise RuntimeError(f"runtime root does not exist: {runtime_root}")
+    if not (runtime_root / "manifest.json").is_file():
+        raise RuntimeError(f"runtime root is missing manifest.json: {runtime_root}")
+    link_path.parent.mkdir(parents=True, exist_ok=True)
+    next_link = link_path.with_name(f".{link_path.name}.next-{os.getpid()}")
+    if next_link.exists() or next_link.is_symlink():
+        next_link.unlink()
+    next_link.symlink_to(runtime_root)
+    os.replace(next_link, link_path)
+
+
+def copy_runtime_env(src_root: Path, dst_root: Path) -> None:
+    src_root = src_root.resolve()
+    if not src_root.is_dir():
+        raise RuntimeError(f"source runtime root does not exist: {src_root}")
+    if not (src_root / "manifest.json").is_file():
+        raise RuntimeError(f"source runtime root is missing manifest.json: {src_root}")
+    if dst_root.exists() or dst_root.is_symlink():
+        raise RuntimeError(f"destination runtime root already exists: {dst_root}")
+    dst_root.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(src_root, dst_root, symlinks=True)
+    _rewrite_copied_runtime_metadata(dst_root)
 
 
 def _required_runtime_paths(layout) -> list[str]:
@@ -333,27 +389,44 @@ def _create_host_venv(
     return python
 
 
-def _write_manifest(env_root: Path, pyproject: dict[str, Any], host_python: Path, shared_deps: list[str]) -> None:
+def _runtime_env_metadata(pyproject: dict[str, Any]) -> dict[str, str]:
     runtime = _runtime_table(pyproject)
     runtime_env = _runtime_env_symbols()
+    return {
+        "site_packages_dir": runtime.get(
+            "site_packages_dir", runtime_env["DEFAULT_SITE_PACKAGES_DIRNAME"]
+        ),
+        "source_dir": runtime.get("source_dir", runtime_env["DEFAULT_SOURCE_DIRNAME"]),
+        "base_python_dir": runtime.get("base_python_dir", runtime_env["DEFAULT_BASE_PYTHON_DIRNAME"]),
+        "host_venv_dir": runtime.get("host_venv_dir", runtime_env["DEFAULT_HOST_VENV_DIRNAME"]),
+    }
+
+
+def _write_manifest(env_root: Path, pyproject: dict[str, Any], host_python: Path, shared_deps: list[str]) -> None:
+    runtime = _runtime_table(pyproject)
     manifest = {
         "python_version": runtime["python_version"],
         "env_root": str(env_root),
         "host_python": str(host_python),
         "shared_dependencies": shared_deps,
         "host_dependencies": _host_deps(pyproject),
-        "runtime_env": {
-            "site_packages_dir": runtime.get(
-                "site_packages_dir", runtime_env["DEFAULT_SITE_PACKAGES_DIRNAME"]
-            ),
-            "source_dir": runtime.get("source_dir", runtime_env["DEFAULT_SOURCE_DIRNAME"]),
-            "base_python_dir": runtime.get("base_python_dir", runtime_env["DEFAULT_BASE_PYTHON_DIRNAME"]),
-            "host_venv_dir": runtime.get("host_venv_dir", runtime_env["DEFAULT_HOST_VENV_DIRNAME"]),
-        },
+        "runtime_env": _runtime_env_metadata(pyproject),
         "sources": runtime["sources"],
         "image_managed": runtime["image_managed"],
     }
     (env_root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+
+def _rewrite_copied_runtime_metadata(env_root: Path) -> None:
+    manifest = _load_manifest(env_root)
+    layout = _runtime_env_symbols()["runtime_env_layout"](str(env_root))
+    manifest["env_root"] = str(env_root)
+    manifest["host_python"] = layout.host_python
+    if "runtime_env" not in manifest:
+        manifest["runtime_env"] = _runtime_env_metadata(_load_pyproject())
+    (env_root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    _write_host_pth(env_root, Path(layout.host_python))
+    _write_activation(env_root)
 
 
 def _write_activation(env_root: Path) -> None:
@@ -585,7 +658,30 @@ def build_runtime_env(env_root: Path) -> None:
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument("--env-root", required=True, help="Destination PFS runtime env root")
+    p.add_argument("--env-root", help="Destination PFS runtime env root")
+    p.add_argument(
+        "--mint-env",
+        choices=MINT_ENVS,
+        help="Build or copy into <mint-root>/<env>/runtime-builds/<build-id>",
+    )
+    p.add_argument(
+        "--mint-root",
+        default=str(DEFAULT_MINT_ROOT),
+        help=f"Mint runtime root that contains prod/ and dev/ (default: {DEFAULT_MINT_ROOT})",
+    )
+    p.add_argument(
+        "--build-id",
+        help="Build directory name under runtime-builds. Defaults to py31213-<UTC timestamp>-<git sha>.",
+    )
+    p.add_argument(
+        "--copy-from",
+        help="Copy an existing runtime root instead of building from pyproject.",
+    )
+    p.add_argument(
+        "--promote",
+        action="store_true",
+        help="Atomically update <mint-root>/<env>/runtime to the built or copied runtime root.",
+    )
     p.add_argument("--inspect", action="store_true", help="Inspect an existing runtime env root")
     p.add_argument(
         "--probe-module",
@@ -593,17 +689,49 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default=None,
         help="Module name to import with the runtime env host python during --inspect",
     )
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if args.inspect:
+        if not args.env_root:
+            p.error("--inspect requires --env-root")
+        if args.mint_env or args.copy_from or args.promote:
+            p.error("--inspect only supports --env-root and --probe-module")
+        return args
+    if args.mint_env:
+        if args.env_root:
+            p.error("--mint-env and --env-root are mutually exclusive for build/copy")
+        return args
+    if args.copy_from:
+        p.error("--copy-from requires --mint-env")
+    if args.promote:
+        p.error("--promote requires --mint-env")
+    if not args.env_root:
+        p.error("one of --env-root or --mint-env is required")
+    return args
 
 
 def main(argv: list[str]) -> int:
     args = _parse_args(argv)
-    env_root = Path(args.env_root).resolve()
     if args.inspect:
+        env_root = Path(args.env_root).resolve()
         snapshot = inspect_runtime_env(env_root, probe_modules=args.probe_module)
         print(json.dumps(snapshot, indent=2))
         probe_failed = any(not result["ok"] for result in snapshot["probe_results"].values())
         return 0 if snapshot["valid_layout"] and not probe_failed else 1
+
+    if args.mint_env:
+        mint_root = Path(args.mint_root).resolve()
+        build_id = args.build_id or _default_build_id()
+        env_root = _mint_runtime_build_root(mint_root, args.mint_env, build_id).resolve()
+        if args.copy_from:
+            copy_runtime_env(Path(args.copy_from), env_root)
+        else:
+            build_runtime_env(env_root)
+        if args.promote:
+            _promote_runtime_symlink(env_root, _mint_runtime_link(mint_root, args.mint_env))
+        print(json.dumps({"env_root": str(env_root), "promoted": bool(args.promote)}, indent=2))
+        return 0
+
+    env_root = Path(args.env_root).resolve()
     build_runtime_env(env_root)
     return 0
 
