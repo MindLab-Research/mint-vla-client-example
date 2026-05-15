@@ -127,6 +127,26 @@ def _install_noop_tensorboard() -> None:
         pass
 
 
+def _megatron_attention_backend() -> str:
+    override = os.environ.get("MINT_MEGATRON_ATTENTION_BACKEND", "").strip().lower()
+    if override:
+        if override not in {"flash", "fused", "unfused", "local", "auto"}:
+            raise ValueError(f"Invalid MINT_MEGATRON_ATTENTION_BACKEND={override!r}")
+        return override
+
+    try:
+        from importlib.metadata import version
+        from packaging.version import Version
+
+        flash_attn_version = Version(version("flash-attn"))
+        if Version("2.1.1") <= flash_attn_version <= Version("2.8.1"):
+            return "flash"
+    except Exception:
+        pass
+
+    return "local"
+
+
 def _get_megatron_create_lock(actor_name: str) -> threading.Lock:
     with _megatron_create_locks_guard:
         lock = _megatron_create_locks.get(actor_name)
@@ -2103,6 +2123,13 @@ class MegatronRankWorker:
             # CRITICAL: Enable determinism FIRST, before ANY Megatron/TE imports
             # This must happen before FlashAttention code is loaded to take effect
             # Without this, consecutive forward passes differ by ~0.46 nats
+            attention_backend = _megatron_attention_backend()
+            if attention_backend == "local":
+                os.environ["NVTE_FLASH_ATTN"] = "0"
+                os.environ["NVTE_FUSED_ATTN"] = "0"
+                os.environ["NVTE_UNFUSED_ATTN"] = "0"
+            logger.info(f"[Rank {self.rank}] Megatron attention_backend={attention_backend}")
+
             from tinker_server.backend.verl_patches import _enable_megatron_determinism
             _enable_megatron_determinism(seed=42)
 
@@ -2337,17 +2364,16 @@ class MegatronRankWorker:
         # Flash Attention 2 requires head_dim_qk == head_dim_v
         # The MLA patch in verl/models/mcore/patch_v012.py pads value tensor to 192
         # to match query dimension, enabling FA2 with THD format on sm80 (A100/A800)
-        #
-        # IMPORTANT: Do NOT force unfused backend here - it conflicts with THD format
-        # (TE disables unfused for THD). Let FA2 work with the value padding instead.
         qk_nope = getattr(hf_config, "qk_nope_head_dim", 0)
         qk_rope = getattr(hf_config, "qk_rope_head_dim", 0)
         head_dim_qk = qk_nope + qk_rope
         has_mla_attention = head_dim_qk > 0
+        attention_backend = _megatron_attention_backend()
+        override_tf_config["attention_backend"] = attention_backend
         if has_mla_attention:
             logger.info(
                 f"[Rank {self.rank}] MLA attention detected: head_dim_qk={head_dim_qk} "
-                f"(qk_nope={qk_nope} + qk_rope={qk_rope}). Using FA2 with value padding."
+                f"(qk_nope={qk_nope} + qk_rope={qk_rope}), attention_backend={attention_backend}."
             )
 
         # Activation checkpointing for memory-efficient training
@@ -6970,9 +6996,6 @@ class MegatronWorkerGroup:
                 # TransformerEngine debug - see why attention backends are disabled
                 "NVTE_DEBUG": "1",
                 "NVTE_DEBUG_LEVEL": "2",
-                # Allow TE DotProductAttention backends; Megatron flash attention asserts these are 0.
-                "NVTE_FUSED_ATTN": "0" if is_mla else "1",
-                "NVTE_UNFUSED_ATTN": "0" if is_mla else "1",
                 **otel_env_vars(),
                 },
             ),
