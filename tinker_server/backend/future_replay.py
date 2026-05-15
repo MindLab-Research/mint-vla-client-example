@@ -339,7 +339,11 @@ def ensure_future_replay_sweeper(*, timeout_s: float = 10.0) -> dict[str, Any]:
     actor = _get_or_create_sweeper_actor()
     import ray
 
-    return ray.get(actor.poke.remote(), timeout=float(timeout_s))
+    try:
+        return ray.get(actor.poke.remote(), timeout=float(timeout_s))
+    except Exception as exc:
+        logger.warning("future replay sweeper startup poke failed; continuing: %r", exc)
+        return {"ready": False, "error": type(exc).__name__}
 
 
 def _future_replay_sweeper_actor_name() -> str:
@@ -371,23 +375,27 @@ def _get_or_create_sweeper_actor():
             self._interval_s = max(1.0, float(interval_s))
             self._last_sweep_ts = 0.0
             self._last_deleted = 0
+            self._sweep_lock = threading.Lock()
             self._thread = threading.Thread(target=self._loop, daemon=True)
             self._thread.start()
+
+        def _sweep_once(self) -> int:
+            with self._sweep_lock:
+                deleted = future_replay_store().sweep_expired_payloads()["deleted"]
+                self._last_deleted = int(deleted)
+                self._last_sweep_ts = time.time()
+                return int(deleted)
 
         def _loop(self) -> None:
             while True:
                 try:
-                    deleted = future_replay_store().sweep_expired_payloads()["deleted"]
-                    self._last_deleted = int(deleted)
-                    self._last_sweep_ts = time.time()
+                    self._sweep_once()
                 except Exception:
                     logger.exception("future replay sweeper loop failed")
                 time.sleep(self._interval_s)
 
         def poke(self) -> dict[str, Any]:
-            deleted = future_replay_store().sweep_expired_payloads()["deleted"]
-            self._last_deleted = int(deleted)
-            self._last_sweep_ts = time.time()
+            self._sweep_once()
             return self.stats()
 
         def stats(self) -> dict[str, Any]:

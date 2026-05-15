@@ -490,6 +490,28 @@ def test_issue_440_future_replay_sweeper_actor_name_is_overrideable(monkeypatch)
     assert _future_replay_sweeper_actor_name() == "mint_future_replay_sweeper_issue440_ns4"
 
 
+def test_issue_440_future_replay_sweeper_startup_poke_is_nonfatal(monkeypatch):
+    class FakeActor:
+        class Poke:
+            @staticmethod
+            def remote():
+                return "ref"
+
+        poke = Poke()
+
+    class FakeRay:
+        @staticmethod
+        def get(ref, timeout=None):
+            raise RuntimeError("sqlite busy")
+
+    monkeypatch.setattr(future_replay_module, "_get_or_create_sweeper_actor", lambda: FakeActor())
+    monkeypatch.setitem(__import__("sys").modules, "ray", FakeRay)
+
+    out = future_replay_module.ensure_future_replay_sweeper(timeout_s=0.1)
+
+    assert out == {"ready": False, "error": "RuntimeError"}
+
+
 def test_issue_440_meta_with_request_op_restores_missing_op():
     meta = {"model_id": "m4", "done_at": 1.0, "final_status": FutureStatus.FAILED.value}
 
