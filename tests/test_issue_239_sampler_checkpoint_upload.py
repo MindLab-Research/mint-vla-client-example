@@ -34,6 +34,12 @@ def test_issue_239_sampler_only_upload_is_supported(tmp_path: Path) -> None:
     )
 
     app = FastAPI()
+
+    @app.middleware("http")
+    async def _inject_user(request, call_next):
+        request.state.user_data = {"user_id": "anonymous"}
+        return await call_next(request)
+
     app.include_router(weights_routes.router, prefix="/api/v1")
     client = TestClient(app)
 
@@ -63,6 +69,12 @@ def test_issue_239_openpi_sampler_upload_is_supported(tmp_path: Path) -> None:
     )
 
     app = FastAPI()
+
+    @app.middleware("http")
+    async def _inject_user(request, call_next):
+        request.state.user_data = {"user_id": "anonymous"}
+        return await call_next(request)
+
     app.include_router(weights_routes.router, prefix="/api/v1")
     client = TestClient(app)
 
@@ -92,6 +104,12 @@ def test_issue_239_training_declared_without_optimizer_is_rejected(tmp_path: Pat
     )
 
     app = FastAPI()
+
+    @app.middleware("http")
+    async def _inject_user(request, call_next):
+        request.state.user_data = {"user_id": "anonymous"}
+        return await call_next(request)
+
     app.include_router(weights_routes.router, prefix="/api/v1")
     client = TestClient(app)
 
