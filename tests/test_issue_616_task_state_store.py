@@ -260,6 +260,52 @@ def test_requeue_task_resets_active_record_for_reclaim() -> None:
         store.close()
 
 
+def test_future_style_task_lifecycle_and_metadata_lookup() -> None:
+    store = TaskStateStore.in_memory()
+    try:
+        created = store.ensure_task(
+            request_id="future-1",
+            op="training.train_step",
+            domain_key="future:default",
+            metadata={"model_id": "model-a"},
+            status="queued",
+            now=100.0,
+        )
+        assert created["created"] is True
+        assert created["record"]["status"] == "queued"
+
+        running = store.update_task_metadata(
+            request_id="future-1",
+            metadata={"stage": "running"},
+            status="running",
+            now=101.0,
+        )
+        assert running["record"]["metadata"]["model_id"] == "model-a"
+        assert running["record"]["metadata"]["stage"] == "running"
+
+        completed = store.complete_task_success(
+            request_id="future-1",
+            result_path="/tmp/result.json",
+            result_checksum="sha256:abc",
+            result_size_bytes=17,
+            metadata={"done_at": 102.0},
+            now=102.0,
+        )
+        assert completed["record"]["status"] == "done"
+
+        by_meta = store.list_tasks_by_metadata(
+            filters={"model_id": "model-a"},
+            statuses=["done"],
+        )
+        assert [record["request_id"] for record in by_meta] == ["future-1"]
+
+        retrieved = store.mark_task_retrieved(request_id="future-1", now=103.0)
+        assert retrieved["record"]["status"] == "retrieved"
+        assert retrieved["record"]["metadata"]["terminal_status"] == "done"
+    finally:
+        store.close()
+
+
 def test_finalize_failure_records_terminal_error() -> None:
     store = TaskStateStore.in_memory()
     try:

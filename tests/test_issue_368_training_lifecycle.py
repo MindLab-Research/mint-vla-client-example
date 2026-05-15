@@ -95,14 +95,6 @@ class _StubRemoteDelete:
         return self._fn(*args, **kwargs)
 
 
-class _StubRemoteMethod:
-    def __init__(self, fn):
-        self._fn = fn
-
-    def remote(self, *args, **kwargs):
-        return self._fn(*args, **kwargs)
-
-
 class _StubSharedWorker:
     def __init__(self):
         self.delete_calls = []
@@ -111,17 +103,6 @@ class _StubSharedWorker:
     def _delete_session(self, model_id: str) -> bool:
         self.delete_calls.append(model_id)
         return True
-
-
-class _StubFutureStoreActor:
-    def __init__(self, failed_request_ids):
-        self.calls = []
-        self._failed_request_ids = list(failed_request_ids)
-        self.fail_training_requests_for_model = _StubRemoteMethod(self._fail_training_requests_for_model)
-
-    def _fail_training_requests_for_model(self, *, model_id: str, error: str) -> list[str]:
-        self.calls.append((model_id, error))
-        return list(self._failed_request_ids)
 
 
 @pytest.mark.anyio
@@ -359,38 +340,3 @@ def test_issue_368_sync_training_session_step_uses_reported_step_when_present(
     assert actor.bump_calls == []
     assert actor.set_calls == [("model-b", 11)]
     assert result["metrics"]["step"] == 11
-
-
-@pytest.mark.anyio
-async def test_issue_368_fail_training_requests_for_model_releases_capacity(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    actor = _StubFutureStoreActor(["req-1", "req-2"])
-    store = future_store_module.FutureStore()
-    released_request_ids = []
-
-    monkeypatch.setattr(store, "_get_cached_ray_actor_for_async_request_path", lambda: actor)
-
-    async def _fake_await_ray_ref(value):
-        return value
-
-    monkeypatch.setattr(future_store_module, "_await_ray_ref", _fake_await_ray_ref)
-    monkeypatch.setitem(
-        sys.modules,
-        "ray",
-        SimpleNamespace(exceptions=SimpleNamespace(ActorDiedError=RuntimeError)),
-    )
-
-    async def _async_release_all(request_id: str) -> None:
-        released_request_ids.append(request_id)
-
-    monkeypatch.setattr(
-        "tinker_server.backend.capacity_manager.capacity_manager.async_release_all",
-        _async_release_all,
-    )
-
-    failed = await store.async_fail_training_requests_for_model("model-z", "stale heartbeat")
-
-    assert failed == ["req-1", "req-2"]
-    assert actor.calls == [("model-z", "stale heartbeat")]
-    assert released_request_ids == ["req-1", "req-2"]

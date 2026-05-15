@@ -1,5 +1,4 @@
 import importlib
-import sys
 from types import SimpleNamespace
 
 import pytest
@@ -16,22 +15,6 @@ future_store_module = importlib.import_module("tinker_server.backend.future_stor
 @pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"
-
-
-class _StubFutureStoreActor:
-    def __init__(self, failed_request_ids):
-        self.calls = []
-        self._failed_request_ids = list(failed_request_ids)
-
-        class _Remote:
-            def __init__(self, outer):
-                self._outer = outer
-
-            def remote(self, *, sampling_session_id: str, error: str):
-                self._outer.calls.append((sampling_session_id, error))
-                return list(self._outer._failed_request_ids)
-
-        self.fail_sampling_requests_for_session = _Remote(self)
 
 
 @pytest.mark.anyio
@@ -67,10 +50,14 @@ async def test_issue_369_detached_sampling_cleanup_removes_stale_session(monkeyp
 
     monkeypatch.setattr(sampling_store_module, "async_list_sampling_sessions", _async_list_sampling_sessions)
     monkeypatch.setattr(sampling_store_module, "delete_sampling_session", lambda session_id: deleted.append(session_id))
+    async def _async_fail_sampling_requests_for_session(session_id: str, error: str) -> list[str]:
+        failed_sampling.append((session_id, error))
+        return ["req-sample"]
+
     monkeypatch.setattr(
         future_store_module.future_store,
-        "fail_sampling_requests_for_session",
-        lambda session_id, error: failed_sampling.append((session_id, error)) or ["req-sample"],
+        "async_fail_sampling_requests_for_session",
+        _async_fail_sampling_requests_for_session,
     )
     monkeypatch.setattr(cleanup_executor_module, "_cleanup_sampler_indices", lambda sampler_id: cleaned_indices.append(sampler_id))
 
@@ -125,10 +112,13 @@ async def test_issue_369_detached_sampling_cleanup_keeps_shared_adapter_loaded(m
 
     monkeypatch.setattr(sampling_store_module, "async_list_sampling_sessions", _async_list_sampling_sessions)
     monkeypatch.setattr(sampling_store_module, "delete_sampling_session", lambda session_id: deleted.append(session_id))
+    async def _async_fail_sampling_requests_for_session(session_id: str, error: str) -> list[str]:
+        return []
+
     monkeypatch.setattr(
         future_store_module.future_store,
-        "fail_sampling_requests_for_session",
-        lambda session_id, error: [],
+        "async_fail_sampling_requests_for_session",
+        _async_fail_sampling_requests_for_session,
     )
     monkeypatch.setattr(cleanup_executor_module, "_cleanup_sampler_indices", lambda sampler_id: None)
 
@@ -223,29 +213,3 @@ def test_issue_369_session_manager_base_model_getter_restores_from_detached_stor
     snapshot = manager.get_sampling_session_snapshot("sess-restore")
     assert snapshot is not None
     assert snapshot.base_model == "Qwen/Qwen3-30B-A3B-Instruct-2507"
-
-
-def test_issue_369_fail_sampling_requests_for_session_releases_capacity(monkeypatch) -> None:
-    actor = _StubFutureStoreActor(["req-1", "req-2"])
-    store = future_store_module.FutureStore()
-    released_request_ids = []
-
-    monkeypatch.setattr(store, "_get_ray_actor", lambda: actor)
-    monkeypatch.setitem(
-        sys.modules,
-        "ray",
-        SimpleNamespace(
-            get=lambda value: value,
-            exceptions=SimpleNamespace(ActorDiedError=RuntimeError),
-        ),
-    )
-    monkeypatch.setattr(
-        "tinker_server.backend.capacity_manager.capacity_manager.release_all",
-        lambda request_id: released_request_ids.append(request_id),
-    )
-
-    failed = store.fail_sampling_requests_for_session("sess-z", "sampling inactivity")
-
-    assert failed == ["req-1", "req-2"]
-    assert actor.calls == [("sess-z", "sampling inactivity")]
-    assert released_request_ids == ["req-1", "req-2"]

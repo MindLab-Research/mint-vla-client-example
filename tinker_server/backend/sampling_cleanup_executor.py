@@ -153,7 +153,7 @@ async def cleanup_stale_sampling_sessions_once_impl(*, stale_after_s: float | No
 
         reason = f"sampling inactivity (> {stale_after_s:.1f}s)"
         try:
-            failed_request_ids = future_store.fail_sampling_requests_for_session(
+            failed_request_ids = await future_store.async_fail_sampling_requests_for_session(
                 session_id,
                 f"Sampling session terminated due to {reason}",
             )

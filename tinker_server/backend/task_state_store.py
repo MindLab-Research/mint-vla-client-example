@@ -14,8 +14,8 @@ from ..config import PFS_PYTHONPATH, actor_runtime_env, config as server_config
 from .async_ray_control import async_get_ray_ref, sync_get_ray_ref
 
 
-ACTIVE_TASK_STATUSES = frozenset({"pending", "assigned", "leased", "finalizing"})
-TERMINAL_TASK_STATUSES = frozenset({"done", "failed", "cancelled", "expired"})
+ACTIVE_TASK_STATUSES = frozenset({"pending", "queued", "running", "assigned", "leased", "finalizing"})
+TERMINAL_TASK_STATUSES = frozenset({"done", "failed", "cancelled", "expired", "retrieved"})
 
 
 class TaskStateStoreError(RuntimeError):
@@ -341,6 +341,264 @@ class TaskStateStore:
                 now=ts,
             )
             return {"ok": True, "created": True, "record": self._row_to_record(self._get_row(conn, request_id))}
+
+    def ensure_task(
+        self,
+        *,
+        request_id: str,
+        op: str = "unknown",
+        domain_key: str = "future:default",
+        request_json: bytes = b"{}",
+        payload_hash: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        status: str = "pending",
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        ts = _now(now)
+        with self._transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM tasks WHERE request_id = ?",
+                (str(request_id),),
+            ).fetchone()
+            if row is not None:
+                merged = {**_json_loads(row["metadata_json"]), **dict(metadata or {})}
+                conn.execute(
+                    """
+                    UPDATE tasks
+                    SET metadata_json = ?, updated_at = ?
+                    WHERE request_id = ?
+                    """,
+                    (_json_dumps(merged), ts, str(request_id)),
+                )
+                return {"ok": True, "created": False, "record": self._row_to_record(self._get_row(conn, request_id))}
+            conn.execute(
+                """
+                INSERT INTO tasks(
+                    request_id, op, status, domain_key, request_json, payload_hash,
+                    metadata_json, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(request_id),
+                    str(op),
+                    str(status),
+                    str(domain_key),
+                    bytes(request_json),
+                    payload_hash,
+                    _json_dumps(metadata),
+                    ts,
+                    ts,
+                ),
+            )
+            self._record_event(
+                conn,
+                request_id=str(request_id),
+                event_type="task_created",
+                payload={"status": str(status)},
+                now=ts,
+            )
+            return {"ok": True, "created": True, "record": self._row_to_record(self._get_row(conn, request_id))}
+
+    def update_task_metadata(
+        self,
+        *,
+        request_id: str,
+        metadata: dict[str, Any] | None = None,
+        status: str | None = None,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        ts = _now(now)
+        with self._transaction() as conn:
+            row = self._get_row(conn, request_id)
+            merged = {**_json_loads(row["metadata_json"]), **dict(metadata or {})}
+            if status is None:
+                conn.execute(
+                    """
+                    UPDATE tasks
+                    SET metadata_json = ?, updated_at = ?
+                    WHERE request_id = ?
+                    """,
+                    (_json_dumps(merged), ts, str(request_id)),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE tasks
+                    SET metadata_json = ?, status = ?, updated_at = ?
+                    WHERE request_id = ?
+                    """,
+                    (_json_dumps(merged), str(status), ts, str(request_id)),
+                )
+            self._record_event(
+                conn,
+                request_id=str(request_id),
+                event_type="task_metadata_updated",
+                payload={"status": status, "metadata": dict(metadata or {})},
+                now=ts,
+            )
+            return {"ok": True, "record": self._row_to_record(self._get_row(conn, request_id))}
+
+    def complete_task_success(
+        self,
+        *,
+        request_id: str,
+        result_path: str,
+        result_checksum: str,
+        result_size_bytes: int,
+        metadata: dict[str, Any] | None = None,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        return self._complete_task_direct(
+            request_id=request_id,
+            status="done",
+            result_path=result_path,
+            result_checksum=result_checksum,
+            result_size_bytes=result_size_bytes,
+            error=None,
+            metadata=metadata,
+            now=now,
+        )
+
+    def complete_task_failure(
+        self,
+        *,
+        request_id: str,
+        error: str,
+        result_path: str | None = None,
+        result_checksum: str | None = None,
+        result_size_bytes: int | None = None,
+        metadata: dict[str, Any] | None = None,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        return self._complete_task_direct(
+            request_id=request_id,
+            status="failed",
+            result_path=result_path,
+            result_checksum=result_checksum,
+            result_size_bytes=result_size_bytes,
+            error=str(error),
+            metadata=metadata,
+            now=now,
+        )
+
+    def mark_task_retrieved(self, *, request_id: str, now: float | None = None) -> dict[str, Any]:
+        ts = _now(now)
+        with self._transaction() as conn:
+            row = self._get_row(conn, request_id)
+            if str(row["status"]) == "retrieved":
+                return {"ok": True, "record": self._row_to_record(row)}
+            if str(row["status"]) not in {"done", "failed", "expired", "cancelled"}:
+                raise TaskStateConflictError(f"cannot mark retrieved; current status={row['status']!r}")
+            metadata = _json_loads(row["metadata_json"])
+            metadata.setdefault("terminal_status", str(row["status"]))
+            conn.execute(
+                """
+                UPDATE tasks
+                SET status = 'retrieved', metadata_json = ?, updated_at = ?
+                WHERE request_id = ?
+                """,
+                (_json_dumps(metadata), ts, str(request_id)),
+            )
+            self._record_event(conn, request_id=str(request_id), event_type="task_retrieved", payload={}, now=ts)
+            return {"ok": True, "record": self._row_to_record(self._get_row(conn, request_id))}
+
+    def forget_task(self, *, request_id: str) -> dict[str, Any]:
+        with self._transaction() as conn:
+            conn.execute("DELETE FROM task_events WHERE request_id = ?", (str(request_id),))
+            cur = conn.execute("DELETE FROM tasks WHERE request_id = ?", (str(request_id),))
+            return {"ok": True, "deleted": cur.rowcount > 0}
+
+    def list_tasks_by_metadata(
+        self,
+        *,
+        filters: dict[str, Any] | None = None,
+        statuses: list[str] | None = None,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        status_values = list(statuses or [])
+        params: list[Any] = []
+        sql = "SELECT * FROM tasks"
+        if status_values:
+            placeholders = ", ".join("?" for _ in status_values)
+            sql += f" WHERE status IN ({placeholders})"
+            params.extend(status_values)
+        sql += " ORDER BY created_at, request_id"
+        with self._lock:
+            rows = self._conn.execute(sql, tuple(params)).fetchall()
+        normalized_filters = dict(filters or {})
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            record = self._row_to_record(row)
+            metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+            if all(metadata.get(key) == value for key, value in normalized_filters.items()):
+                out.append(record)
+                if len(out) >= int(limit):
+                    break
+        return out
+
+    def _complete_task_direct(
+        self,
+        *,
+        request_id: str,
+        status: str,
+        result_path: str | None,
+        result_checksum: str | None,
+        result_size_bytes: int | None,
+        error: str | None,
+        metadata: dict[str, Any] | None,
+        now: float | None,
+    ) -> dict[str, Any]:
+        ts = _now(now)
+        with self._transaction() as conn:
+            row = self._get_row(conn, request_id)
+            if str(row["status"]) in TERMINAL_TASK_STATUSES:
+                if (
+                    str(row["status"]) == status
+                    and row["result_path"] == result_path
+                    and row["result_checksum"] == result_checksum
+                    and row["result_size_bytes"] == result_size_bytes
+                    and row["error"] == error
+                ):
+                    return {"ok": True, "idempotent": True, "record": self._row_to_record(row)}
+                raise TaskStateConflictError("terminal task commit payload mismatch")
+            merged = {**_json_loads(row["metadata_json"]), **dict(metadata or {})}
+            conn.execute(
+                """
+                UPDATE tasks
+                SET status = ?,
+                    result_path = ?,
+                    result_checksum = ?,
+                    result_size_bytes = ?,
+                    error = ?,
+                    metadata_json = ?,
+                    updated_at = ?
+                WHERE request_id = ?
+                """,
+                (
+                    str(status),
+                    result_path,
+                    result_checksum,
+                    result_size_bytes,
+                    error,
+                    _json_dumps(merged),
+                    ts,
+                    str(request_id),
+                ),
+            )
+            self._record_event(
+                conn,
+                request_id=str(request_id),
+                event_type=f"task_{status}",
+                payload={
+                    "result_path": result_path,
+                    "result_checksum": result_checksum,
+                    "result_size_bytes": result_size_bytes,
+                    "error": error,
+                },
+                now=ts,
+            )
+            return {"ok": True, "idempotent": False, "record": self._row_to_record(self._get_row(conn, request_id))}
 
     def assign_task(
         self,
@@ -818,6 +1076,27 @@ class _TaskStateStoreActor:
     def create_task(self, **kwargs: Any) -> dict[str, Any]:
         return self._store.create_task(**kwargs)
 
+    def ensure_task(self, **kwargs: Any) -> dict[str, Any]:
+        return self._store.ensure_task(**kwargs)
+
+    def update_task_metadata(self, **kwargs: Any) -> dict[str, Any]:
+        return self._store.update_task_metadata(**kwargs)
+
+    def complete_task_success(self, **kwargs: Any) -> dict[str, Any]:
+        return self._store.complete_task_success(**kwargs)
+
+    def complete_task_failure(self, **kwargs: Any) -> dict[str, Any]:
+        return self._store.complete_task_failure(**kwargs)
+
+    def mark_task_retrieved(self, **kwargs: Any) -> dict[str, Any]:
+        return self._store.mark_task_retrieved(**kwargs)
+
+    def forget_task(self, **kwargs: Any) -> dict[str, Any]:
+        return self._store.forget_task(**kwargs)
+
+    def list_tasks_by_metadata(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return self._store.list_tasks_by_metadata(**kwargs)
+
     def assign_task(self, **kwargs: Any) -> dict[str, Any]:
         return self._store.assign_task(**kwargs)
 
@@ -944,6 +1223,24 @@ class TaskStateStoreClient:
     async def async_create_task(self, **kwargs: Any) -> dict[str, Any]:
         return await self._dict_call("create_task", **kwargs)
 
+    async def async_ensure_task(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("ensure_task", **kwargs)
+
+    async def async_update_task_metadata(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("update_task_metadata", **kwargs)
+
+    async def async_complete_task_success(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("complete_task_success", **kwargs)
+
+    async def async_complete_task_failure(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("complete_task_failure", **kwargs)
+
+    async def async_mark_task_retrieved(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("mark_task_retrieved", **kwargs)
+
+    async def async_forget_task(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("forget_task", **kwargs)
+
     async def async_assign_task(self, **kwargs: Any) -> dict[str, Any]:
         return await self._dict_call("assign_task", **kwargs)
 
@@ -980,6 +1277,18 @@ class TaskStateStoreClient:
         out = await self._call("list_expired_leases", now=now, limit=limit)
         if not isinstance(out, list):
             raise TypeError(f"TaskStateStore.list_expired_leases returned non-list: {type(out)}")
+        return out
+
+    async def async_list_tasks_by_metadata(
+        self,
+        *,
+        filters: dict[str, Any] | None = None,
+        statuses: list[str] | None = None,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        out = await self._call("list_tasks_by_metadata", filters=filters, statuses=statuses, limit=limit)
+        if not isinstance(out, list):
+            raise TypeError(f"TaskStateStore.list_tasks_by_metadata returned non-list: {type(out)}")
         return out
 
     async def _dict_call(self, method: str, **kwargs: Any) -> dict[str, Any]:

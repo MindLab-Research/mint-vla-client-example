@@ -144,7 +144,7 @@ async def cleanup_stale_training_sessions_once_impl(*, stale_after_s: float | No
 
         reason = f"stale heartbeat (> {stale_after_s:.1f}s)"
         try:
-            failed_request_ids = future_store.fail_training_requests_for_model(
+            failed_request_ids = await future_store.async_fail_training_requests_for_model(
                 model_id,
                 f"Training session terminated due to {reason}",
             )

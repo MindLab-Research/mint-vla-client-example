@@ -77,7 +77,7 @@ def _resolve_checkpoint_for_user(
     is_admin: bool,
     owner_id: str | None = None,
 ) -> str:
-    owner_scope = owner_id if is_admin else user_id
+    owner_scope = owner_id if is_admin and owner_id is not None else user_id
     try:
         resolved = resolve_checkpoint_path(path, user_id=owner_scope, is_admin=is_admin)
     except ValueError as e:
@@ -128,7 +128,7 @@ def _infer_base_model_from_checkpoint_for_request(
     try:
         return _infer_base_model_from_checkpoint(
             model_path,
-            user_id=(owner_id if _can_bypass_checkpoint_ownership(request) else _get_user_id(request)),
+            user_id=(owner_id if owner_id is not None and _can_bypass_checkpoint_ownership(request) else _get_user_id(request)),
             is_admin=_can_bypass_checkpoint_ownership(request),
         )
     except ValueError as e:

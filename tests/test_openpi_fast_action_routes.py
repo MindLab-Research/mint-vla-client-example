@@ -170,8 +170,8 @@ def test_create_action_session_route_resolves_checkpoint_path_before_manager(mon
     monkeypatch.setattr(
         mint_routes,
         "_resolve_checkpoint_for_user",
-        lambda path, *, user_id, is_admin: (
-            resolve_calls.append({"path": path, "user_id": user_id, "is_admin": is_admin}),
+        lambda path, *, user_id, is_admin, owner_id=None: (
+            resolve_calls.append({"path": path, "user_id": user_id, "is_admin": is_admin, "owner_id": owner_id}),
             "/runtime/persistent_cache/user-1/model-1/export-1",
         )[1],
     )
@@ -196,6 +196,7 @@ def test_create_action_session_route_resolves_checkpoint_path_before_manager(mon
             "path": "tinker://model-1/sampler_weights/export-1",
             "user_id": "user-1",
             "is_admin": False,
+            "owner_id": None,
         }
     ]
     assert manager.create_calls == [
@@ -230,8 +231,8 @@ def test_create_action_session_route_infers_base_model_with_admin_scope(monkeypa
     monkeypatch.setattr(
         mint_routes,
         "_resolve_checkpoint_for_user",
-        lambda path, *, user_id, is_admin: (
-            resolve_calls.append({"path": path, "user_id": user_id, "is_admin": is_admin}),
+        lambda path, *, user_id, is_admin, owner_id=None: (
+            resolve_calls.append({"path": path, "user_id": user_id, "is_admin": is_admin, "owner_id": owner_id}),
             "/runtime/persistent_cache/anonymous/model-1/export-1",
         )[1],
     )
@@ -261,6 +262,7 @@ def test_create_action_session_route_infers_base_model_with_admin_scope(monkeypa
             "path": "mint://model-1/sampler_weights/export-1",
             "user_id": "admin",
             "is_admin": True,
+            "owner_id": None,
         }
     ]
     assert manager.create_calls == [
