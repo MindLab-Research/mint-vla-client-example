@@ -147,6 +147,22 @@ def _megatron_attention_backend() -> str:
     return "unfused"
 
 
+def _disable_te_flash_attention_backend() -> None:
+    """Prevent Transformer Engine from instantiating incompatible flash-attn."""
+    try:
+        from packaging.version import Version
+        from transformer_engine.pytorch.attention.dot_product_attention.utils import (
+            FlashAttentionUtils,
+        )
+
+        FlashAttentionUtils.is_installed = False
+        FlashAttentionUtils.v3_is_installed = False
+        FlashAttentionUtils.version = Version("0")
+        FlashAttentionUtils.fa3_version = Version("0")
+    except Exception as exc:
+        logger.warning("Failed to disable TE flash attention backend: %s", exc)
+
+
 def _get_megatron_create_lock(actor_name: str) -> threading.Lock:
     with _megatron_create_locks_guard:
         lock = _megatron_create_locks.get(actor_name)
@@ -2128,6 +2144,8 @@ class MegatronRankWorker:
                 os.environ["NVTE_FLASH_ATTN"] = "1" if attention_backend == "flash" else "0"
                 os.environ["NVTE_FUSED_ATTN"] = "1" if attention_backend == "fused" else "0"
                 os.environ["NVTE_UNFUSED_ATTN"] = "1" if attention_backend == "unfused" else "0"
+            if attention_backend != "flash":
+                _disable_te_flash_attention_backend()
             logger.info(f"[Rank {self.rank}] Megatron attention_backend={attention_backend}")
 
             from tinker_server.backend.verl_patches import _enable_megatron_determinism
