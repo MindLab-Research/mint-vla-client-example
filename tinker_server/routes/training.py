@@ -285,11 +285,6 @@ async def _enqueue_training_request_with_trace(
         return out
 
 
-def _training_model_work_scheduler_enabled() -> bool:
-    raw = str(os.environ.get("MINT_MODEL_WORK_SCHEDULER_TRAINING", "1")).strip().lower()
-    return raw not in {"0", "false", "no", "n", "off"}
-
-
 def _training_model_work_domain_key(*, backend: str, base_model: str, model_id: str) -> str:
     backend_value = str(backend or "").strip()
     base = str(base_model or "").strip()
@@ -300,7 +295,7 @@ def _training_model_work_domain_key(*, backend: str, base_model: str, model_id: 
     return f"training_session:{model_id}"
 
 
-async def _enqueue_training_via_model_work_scheduler(
+async def _enqueue_training_model_work_route(
     *,
     route_start_s: float,
     request_id: str,
@@ -309,57 +304,50 @@ async def _enqueue_training_via_model_work_scheduler(
     user_id: str | None,
     apikey_id: str | None = None,
     webhook_url: str | None = None,
-    extra: dict[str, Any] | None = None,
+    extra: dict[str, Any],
     model_id: str,
     base_model: str,
     backend: str,
+    queued_meta: dict[str, Any],
 ) -> dict[str, Any]:
+    from ..backend.model_work_admission import enqueue_model_work
     from ..backend.model_work_scheduler import model_work_scheduler
 
     domain_key = _training_model_work_domain_key(backend=backend, base_model=base_model, model_id=model_id)
     affinity_group = f"training_session:{model_id}"
-    enqueue_extra = {
-        **dict(extra or {}),
-        "model_work_scheduler": True,
-        "domain_key": domain_key,
-        "affinity_group": affinity_group,
-    }
-    out = await _enqueue_training_request_with_trace(
-        route_start_s=route_start_s,
+    result = await enqueue_model_work(
         request_id=request_id,
         op=op,
-        model_id=model_id,
-        base_model=base_model,
-        backend=backend,
-        enqueue_coro=model_work_scheduler.append(
-            request_id=request_id,
-            op=op,
-            request_json=request_json,
-            user_id=user_id,
-            apikey_id=apikey_id,
-            throttle_principal=None,
-            webhook_url=webhook_url,
-            domain_key=domain_key,
-            affinity_group=affinity_group,
-            ordering_key=affinity_group,
-            token_cost=1,
-            assign=True,
-            assign_max_items=1,
-            extra=enqueue_extra,
-        ),
+        request_json=request_json,
+        user_id=user_id,
+        apikey_id=apikey_id,
+        throttle_principal=None,
+        webhook_url=webhook_url,
+        domain_key=domain_key,
+        affinity_group=affinity_group,
+        ordering_key=affinity_group,
+        token_cost=1,
+        assign=True,
+        assign_max_items=1,
+        extra={
+            **dict(extra),
+            "model_work_scheduler": True,
+            "domain_key": domain_key,
+            "affinity_group": affinity_group,
+            "model_work_attempt_id": str(extra.get("model_work_attempt_id") or uuid.uuid4().hex),
+        },
+        queued_meta=queued_meta,
+        future_store_client=future_store,
+        scheduler_client=model_work_scheduler,
+        trace_enqueue=_enqueue_training_request_with_trace,
+        trace_kwargs={
+            "route_start_s": route_start_s,
+            "model_id": model_id,
+            "base_model": base_model,
+            "backend": backend,
+        },
     )
-    return out if isinstance(out, dict) else {}
-
-
-async def _cancel_training_model_work_request_if_confirmed(request_id: str, *, confirmed: bool) -> None:
-    if not confirmed:
-        return
-    try:
-        from ..backend.model_work_scheduler import model_work_scheduler
-
-        await model_work_scheduler.cancel_request(request_id=request_id, reason="training_enqueue_failed")
-    except Exception:
-        pass
+    return result.scheduler_result
 
 
 def _get_webhook_url(request: Request) -> str | None:
@@ -1511,6 +1499,8 @@ def _build_training_scheduler_extra(
     training_op: str,
     seq_id: int | None = None,
 ) -> dict[str, Any]:
+    from ..backend.model_actor_supervisor import domain_key_for_training_base_model
+
     enabled = str(os.environ.get("MINT_SCHEDULER_ENABLE", "1")).strip().lower() in (
         "1",
         "true",
@@ -1523,13 +1513,10 @@ def _build_training_scheduler_extra(
     openpi_train_step = training_op == "train_step" and backend in {"openpi_fast", "openpi_pi05"}
     if openpi_train_step:
         enabled = True
-    if backend == "megatron" and base_model:
-        domain_key = _normalize_megatron_scheduler_domain_key(base_model)
-    else:
-        domain_key = base_model if base_model else str(model_id)
+    domain_key = domain_key_for_training_base_model(base_model) if base_model else f"training_session:{model_id}"
     extra: dict[str, Any] = {
         "scheduler_enabled": bool(enabled),
-        "scheduler_domain": f"{backend}:{domain_key}",
+        "scheduler_domain": domain_key,
         # Scheduler session key is model_id (server-side training session identity),
         # not the user-provided create_model session_id string.
         "scheduler_session_key": str(model_id),
@@ -1588,17 +1575,9 @@ def _build_create_scheduler_extra(
     model_id: str,
     training_op: str,
 ) -> dict[str, Any]:
-    from ..backend.model_registry import get_model_config
+    from ..backend.model_actor_supervisor import domain_key_for_training_base_model
 
-    if bool(get_model_config(base_model).is_moe):
-        backend = "megatron"
-        domain_key = _normalize_megatron_scheduler_domain_key(base_model)
-    else:
-        backend = "peft"
-        domain_key = base_model
-    scheduler_domain = f"{backend}:{domain_key}"
-    if training_op == "create_model":
-        scheduler_domain = f"{backend}:create:{domain_key}"
+    scheduler_domain = domain_key_for_training_base_model(base_model)
     return {
         "scheduler_enabled": str(os.environ.get("MINT_SCHEDULER_ENABLE", "1")).strip().lower()
         in ("1", "true", "yes", "y", "on"),
@@ -1635,28 +1614,10 @@ async def _wait_internal_future_result(request_id: str) -> Any:
                 await asyncio.sleep(poll_interval_s)
                 continue
             if status == FutureStatus.DONE:
-                try:
-                    from ..backend.capacity_manager import capacity_manager
-
-                    await capacity_manager.async_release_all(request_id)
-                except Exception:
-                    pass
                 return await future_store.async_get_result(request_id)
             if status == FutureStatus.FAILED:
                 err = await future_store.async_get_error(request_id)
-                try:
-                    from ..backend.capacity_manager import capacity_manager
-
-                    await capacity_manager.async_release_all(request_id)
-                except Exception:
-                    pass
                 raise RuntimeError(str(err or f"internal queued op failed request_id={request_id}"))
-            try:
-                from ..backend.capacity_manager import capacity_manager
-
-                await capacity_manager.async_release_all(request_id)
-            except Exception:
-                pass
             raise RuntimeError(f"internal future reached unexpected terminal state={status.value} request_id={request_id}")
     finally:
         try:
@@ -1673,46 +1634,34 @@ async def _enqueue_internal_serialized_model_op(
     extra: dict[str, Any],
     user_id: str | None = None,
 ) -> str:
-    from ..backend.api_work_queue import api_work_queue
-    from ..backend.capacity_manager import capacity_manager
-    from ..backend.result_size_estimator import estimate_small_result_bytes
+    from ..backend.model_work_admission import enqueue_model_work
+    from ..backend.model_work_scheduler import model_work_scheduler
 
     request_id = uuid.uuid4().hex
-    reserve = await capacity_manager.async_try_reserve(
-        request_id,
-        queue_bytes=len(request_json),
-        object_store_bytes=estimate_small_result_bytes(),
-    )
-    if not bool(reserve.get("ok")):
-        raise HTTPException(
-            status_code=429,
-            detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
-        )
-
     created = False
     inflight_marked = False
     try:
         if training_manager is not None:
             training_manager.mark_inflight(model_id, +1)
             inflight_marked = True
-        await future_store.async_create_with_id(request_id)
-        created = True
-        await future_store.async_mark_queued(
-            request_id,
-            meta=_build_training_queued_meta(op=op, model_id=model_id),
-        )
-        await api_work_queue.enqueue(
+        await enqueue_model_work(
             request_id=request_id,
             op=op,
             request_json=request_json,
             user_id=user_id,
             webhook_url=None,
+            domain_key=str(extra.get("scheduler_domain") or f"training_session:{model_id}"),
+            affinity_group=f"training_session:{model_id}",
+            ordering_key=f"training_session:{model_id}",
             extra=dict(extra),
+            queued_meta=_build_training_queued_meta(op=op, model_id=model_id),
+            future_store_client=future_store,
+            scheduler_client=model_work_scheduler,
         )
+        created = True
     except Exception as e:
         if inflight_marked and training_manager is not None:
             training_manager.mark_inflight(model_id, -1)
-        await capacity_manager.async_release_all(request_id)
         if created:
             await future_store.async_cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue {op} request: {e}") from e
@@ -1821,45 +1770,32 @@ async def create_model(
         training_op="create_model",
     )
 
-    from ..backend.api_work_queue import api_work_queue
-    from ..backend.capacity_manager import capacity_manager
-    from ..backend.result_size_estimator import estimate_small_result_bytes
+    from ..backend.model_work_admission import enqueue_model_work
+    from ..backend.model_work_scheduler import model_work_scheduler
 
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
-    reserve = await capacity_manager.async_try_reserve(
-        request_id,
-        queue_bytes=len(request_json),
-        object_store_bytes=estimate_small_result_bytes(),
-    )
-    if not bool(reserve.get("ok")):
-        raise HTTPException(
-            status_code=429,
-            detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
-        )
 
-    created = False
     try:
-        await future_store.async_create_with_id(request_id)
-        created = True
-        await future_store.async_mark_queued(
-            request_id,
-            meta=_build_training_queued_meta(op="create_model", model_id=model_id),
-        )
-        await _enqueue_training_request_with_trace(
-            route_start_s=route_start_s,
+        await enqueue_model_work(
             request_id=request_id,
             op="training.create_model",
-            model_id=model_id,
-            base_model=request.base_model,
-            enqueue_coro=api_work_queue.enqueue(
-                request_id=request_id,
-                op="training.create_model",
-                request_json=request_json,
-                user_id=user_id,
-                webhook_url=webhook_url,
-                extra=scheduler_extra,
-            ),
+            request_json=request_json,
+            user_id=user_id,
+            webhook_url=webhook_url,
+            domain_key=str(scheduler_extra["scheduler_domain"]),
+            affinity_group=f"training_session:{model_id}",
+            ordering_key=f"training_session:{model_id}",
+            extra=scheduler_extra,
+            queued_meta=_build_training_queued_meta(op="create_model", model_id=model_id),
+            future_store_client=future_store,
+            scheduler_client=model_work_scheduler,
+            trace_enqueue=_enqueue_training_request_with_trace,
+            trace_kwargs={
+                "route_start_s": route_start_s,
+                "model_id": model_id,
+                "base_model": request.base_model,
+            },
         )
         if webhook_url and user_id:
             send_task_event(
@@ -1881,9 +1817,6 @@ async def create_model(
             int(len(request_json)),
         )
     except Exception as e:
-        await capacity_manager.async_release_all(request_id)
-        if created:
-            await future_store.async_cleanup(request_id)
         if webhook_url and user_id:
             send_task_event(
                 webhook_url=webhook_url,
@@ -2227,9 +2160,8 @@ async def create_model_from_state(
                 detail=f"Model_id conflict: {model_id!r} is registered as remote via upstream {upstream_alias!r}",
             )
 
-    from ..backend.api_work_queue import api_work_queue
-    from ..backend.capacity_manager import capacity_manager
-    from ..backend.result_size_estimator import estimate_small_result_bytes
+    from ..backend.model_work_admission import enqueue_model_work
+    from ..backend.model_work_scheduler import model_work_scheduler
 
     resolved_state_path = _resolve_state_path(
         request.state_path,
@@ -2248,44 +2180,29 @@ async def create_model_from_state(
         model_id=model_id,
         training_op="create_model_from_state",
     )
-    reserve = await capacity_manager.async_try_reserve(
-        request_id,
-        queue_bytes=len(request_json),
-        object_store_bytes=estimate_small_result_bytes(),
-    )
-    if not bool(reserve.get("ok")):
-        raise HTTPException(
-            status_code=429,
-            detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
-        )
 
-    created = False
     try:
-        await future_store.async_create_with_id(request_id)
-        created = True
-        await future_store.async_mark_queued(
-            request_id,
-            meta=_build_training_queued_meta(op="create_model_from_state", model_id=model_id),
-        )
-        await _enqueue_training_request_with_trace(
-            route_start_s=route_start_s,
+        await enqueue_model_work(
             request_id=request_id,
             op="training.create_model_from_state",
-            model_id=model_id,
-            base_model=request.base_model,
-            enqueue_coro=api_work_queue.enqueue(
-                request_id=request_id,
-                op="training.create_model_from_state",
-                request_json=request_json,
-                user_id=user_id,
-                webhook_url=None,
-                extra=scheduler_extra,
-            ),
+            request_json=request_json,
+            user_id=user_id,
+            webhook_url=None,
+            domain_key=str(scheduler_extra["scheduler_domain"]),
+            affinity_group=f"training_session:{model_id}",
+            ordering_key=f"training_session:{model_id}",
+            extra=scheduler_extra,
+            queued_meta=_build_training_queued_meta(op="create_model_from_state", model_id=model_id),
+            future_store_client=future_store,
+            scheduler_client=model_work_scheduler,
+            trace_enqueue=_enqueue_training_request_with_trace,
+            trace_kwargs={
+                "route_start_s": route_start_s,
+                "model_id": model_id,
+                "base_model": request.base_model,
+            },
         )
     except Exception as e:
-        await capacity_manager.async_release_all(request_id)
-        if created:
-            await future_store.async_cleanup(request_id)
         raise HTTPException(
             status_code=503, detail=f"Failed to enqueue create_model_from_state request: {e}"
         )
@@ -2548,29 +2465,11 @@ async def forward_backward(
     request_id = uuid.uuid4().hex
     user_id = _get_user_id(http_request)
     gateway_auth = build_billing_auth_context(http_request, fallback_request_id=request_id)
-    use_model_work_scheduler = _training_model_work_scheduler_enabled()
 
     set_request_id(request_id)
     logger.info(f"forward_backward request received: model_id={request.model_id}")
 
-    if not use_model_work_scheduler:
-        from ..backend.capacity_manager import capacity_manager
-        from ..backend.result_size_estimator import estimate_forward_backward_result_bytes
-
-        reserve = await capacity_manager.async_try_reserve(
-            request_id,
-            queue_bytes=len(request_json),
-            object_store_bytes=estimate_forward_backward_result_bytes(request),
-        )
-        if not bool(reserve.get("ok")):
-            raise HTTPException(
-                status_code=429,
-                detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
-            )
-
-    created = False
     inflight_marked = False
-    model_work_scheduler_append_confirmed = False
     try:
         await _protect_training_session_enqueue_window(route_session_info)
         _mark_training_inflight(request.model_id, +1)
@@ -2584,70 +2483,29 @@ async def forward_backward(
             ),
             request=http_request,
         )
-        if use_model_work_scheduler:
-            scheduler_extra["model_work_attempt_id"] = uuid.uuid4().hex
         if gateway_auth is not None:
             scheduler_extra["gateway_auth"] = gateway_auth.__dict__
-        await future_store.async_create_with_id(request_id)
-        created = True
-        await future_store.async_mark_queued(
-            request_id,
-            meta=_build_training_queued_meta(
+        await _enqueue_training_model_work_route(
+            route_start_s=route_start_s,
+            request_id=request_id,
+            op="training.forward_backward",
+            request_json=request_json,
+            user_id=user_id,
+            apikey_id=_get_apikey_id(http_request, gateway_auth=gateway_auth),
+            extra=scheduler_extra,
+            model_id=request.model_id,
+            base_model=base_model,
+            backend=backend,
+            queued_meta=_build_training_queued_meta(
                 op="forward_backward",
                 model_id=request.model_id,
                 session=route_session_info,
                 seq_id=request.seq_id,
             ),
         )
-        if use_model_work_scheduler:
-            out = await _enqueue_training_via_model_work_scheduler(
-                route_start_s=route_start_s,
-                request_id=request_id,
-                op="training.forward_backward",
-                request_json=request_json,
-                user_id=user_id,
-                apikey_id=_get_apikey_id(http_request, gateway_auth=gateway_auth),
-                webhook_url=None,
-                extra=scheduler_extra,
-                model_id=request.model_id,
-                base_model=base_model,
-                backend=backend,
-            )
-            model_work_scheduler_append_confirmed = bool(out.get("ok"))
-        else:
-            from ..backend.api_work_queue import api_work_queue
-
-            await _enqueue_training_request_with_trace(
-                route_start_s=route_start_s,
-                request_id=request_id,
-                op="training.forward_backward",
-                model_id=request.model_id,
-                base_model=base_model,
-                backend=backend,
-                enqueue_coro=api_work_queue.enqueue(
-                    request_id=request_id,
-                    op="training.forward_backward",
-                    request_json=request_json,
-                    user_id=user_id,
-                    apikey_id=_get_apikey_id(http_request, gateway_auth=gateway_auth),
-                    webhook_url=None,
-                    extra=scheduler_extra,
-                ),
-            )
     except Exception as e:
         if inflight_marked and training_manager is not None:
             _mark_training_inflight(request.model_id, -1)
-        if use_model_work_scheduler:
-            await _cancel_training_model_work_request_if_confirmed(
-                request_id,
-                confirmed=model_work_scheduler_append_confirmed,
-            )
-        else:
-            from ..backend.capacity_manager import capacity_manager
-
-            await capacity_manager.async_release_all(request_id)
-        if created:
-            await future_store.async_cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue forward_backward request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)
@@ -2839,25 +2697,8 @@ async def train_step(
     request_id = uuid.uuid4().hex
     user_id = _get_user_id(http_request)
     gateway_auth = build_billing_auth_context(http_request, fallback_request_id=request_id)
-    use_model_work_scheduler = _training_model_work_scheduler_enabled()
-    if not use_model_work_scheduler:
-        from ..backend.capacity_manager import capacity_manager
-        from ..backend.result_size_estimator import estimate_small_result_bytes
 
-        reserve = await capacity_manager.async_try_reserve(
-            request_id,
-            queue_bytes=len(request_json),
-            object_store_bytes=estimate_small_result_bytes(),
-        )
-        if not bool(reserve.get("ok")):
-            raise HTTPException(
-                status_code=429,
-                detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
-            )
-
-    created = False
     inflight_marked = False
-    model_work_scheduler_append_confirmed = False
     try:
         await _protect_training_session_enqueue_window(route_session_info)
         _mark_training_inflight(request.model_id, +1)
@@ -2871,70 +2712,29 @@ async def train_step(
             ),
             request=http_request,
         )
-        if use_model_work_scheduler:
-            scheduler_extra["model_work_attempt_id"] = uuid.uuid4().hex
         if gateway_auth is not None:
             scheduler_extra["gateway_auth"] = gateway_auth.__dict__
-        await future_store.async_create_with_id(request_id)
-        created = True
-        await future_store.async_mark_queued(
-            request_id,
-            meta=_build_training_queued_meta(
+        await _enqueue_training_model_work_route(
+            route_start_s=route_start_s,
+            request_id=request_id,
+            op="training.train_step",
+            request_json=request_json,
+            user_id=user_id,
+            apikey_id=_get_apikey_id(http_request, gateway_auth=gateway_auth),
+            extra=scheduler_extra,
+            model_id=request.model_id,
+            base_model=base_model,
+            backend=backend,
+            queued_meta=_build_training_queued_meta(
                 op="train_step",
                 model_id=request.model_id,
                 session=route_session_info,
                 seq_id=request.seq_id,
             ),
         )
-        if use_model_work_scheduler:
-            out = await _enqueue_training_via_model_work_scheduler(
-                route_start_s=route_start_s,
-                request_id=request_id,
-                op="training.train_step",
-                request_json=request_json,
-                user_id=user_id,
-                apikey_id=_get_apikey_id(http_request, gateway_auth=gateway_auth),
-                webhook_url=None,
-                extra=scheduler_extra,
-                model_id=request.model_id,
-                base_model=base_model,
-                backend=backend,
-            )
-            model_work_scheduler_append_confirmed = bool(out.get("ok"))
-        else:
-            from ..backend.api_work_queue import api_work_queue
-
-            await _enqueue_training_request_with_trace(
-                route_start_s=route_start_s,
-                request_id=request_id,
-                op="training.train_step",
-                model_id=request.model_id,
-                base_model=base_model,
-                backend=backend,
-                enqueue_coro=api_work_queue.enqueue(
-                    request_id=request_id,
-                    op="training.train_step",
-                    request_json=request_json,
-                    user_id=user_id,
-                    apikey_id=_get_apikey_id(http_request, gateway_auth=gateway_auth),
-                    webhook_url=None,
-                    extra=scheduler_extra,
-                ),
-            )
     except Exception as e:
         if inflight_marked and training_manager is not None:
             _mark_training_inflight(request.model_id, -1)
-        if use_model_work_scheduler:
-            await _cancel_training_model_work_request_if_confirmed(
-                request_id,
-                confirmed=model_work_scheduler_append_confirmed,
-            )
-        else:
-            from ..backend.capacity_manager import capacity_manager
-
-            await capacity_manager.async_release_all(request_id)
-        if created:
-            await future_store.async_cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue train_step request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)
@@ -3115,26 +2915,11 @@ async def forward(
             ),
         )
 
-    from ..backend.api_work_queue import api_work_queue
-    from ..backend.capacity_manager import capacity_manager
-    from ..backend.result_size_estimator import estimate_small_result_bytes
-
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
     gateway_auth = build_billing_auth_context(http_request, fallback_request_id=request_id)
     user_id = _get_user_id(http_request)
-    reserve = await capacity_manager.async_try_reserve(
-        request_id,
-        queue_bytes=len(request_json),
-        object_store_bytes=estimate_small_result_bytes(),
-    )
-    if not bool(reserve.get("ok")):
-        raise HTTPException(
-            status_code=429,
-            detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
-        )
 
-    created = False
     inflight_marked = False
     try:
         await _protect_training_session_enqueue_window(route_session_info)
@@ -3151,40 +2936,27 @@ async def forward(
         )
         if gateway_auth is not None:
             scheduler_extra["gateway_auth"] = gateway_auth.__dict__
-        await future_store.async_create_with_id(request_id)
-        created = True
-        await future_store.async_mark_queued(
-            request_id,
-            meta=_build_training_queued_meta(
+        await _enqueue_training_model_work_route(
+            route_start_s=route_start_s,
+            request_id=request_id,
+            op="training.forward",
+            request_json=request_json,
+            user_id=user_id,
+            apikey_id=_get_apikey_id(http_request, gateway_auth=gateway_auth),
+            extra=scheduler_extra,
+            model_id=request.model_id,
+            base_model=base_model,
+            backend=backend,
+            queued_meta=_build_training_queued_meta(
                 op="forward",
                 model_id=request.model_id,
                 session=route_session_info,
                 seq_id=request.seq_id,
             ),
         )
-        await _enqueue_training_request_with_trace(
-            route_start_s=route_start_s,
-            request_id=request_id,
-            op="training.forward",
-            model_id=request.model_id,
-            base_model=base_model,
-            backend=backend,
-            enqueue_coro=api_work_queue.enqueue(
-                request_id=request_id,
-                op="training.forward",
-                request_json=request_json,
-                user_id=user_id,
-                apikey_id=_get_apikey_id(http_request, gateway_auth=gateway_auth),
-                webhook_url=None,
-                extra=scheduler_extra,
-            ),
-        )
     except Exception as e:
         if inflight_marked and training_manager is not None:
             _mark_training_inflight(request.model_id, -1)
-        await capacity_manager.async_release_all(request_id)
-        if created:
-            await future_store.async_cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue forward request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)
@@ -3355,32 +3127,10 @@ async def optim_step(
     backend = str(route_session_info.get("backend") or "unknown")
 
     user_id = _get_user_id(http_request)
-    from ..backend.api_work_queue import api_work_queue
-    from ..backend.capacity_manager import capacity_manager
-    from ..backend.result_size_estimator import estimate_small_result_bytes
 
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
-    reserve_start_s = time.perf_counter()
-    reserve = await capacity_manager.async_try_reserve(
-        request_id,
-        queue_bytes=len(request_json),
-        object_store_bytes=estimate_small_result_bytes(),
-    )
-    logger.info(
-        "[optim_step route] request_id=%s model_id=%s stage=capacity_reserve elapsed_ms=%.3f ok=%s",
-        str(request_id),
-        str(request.model_id),
-        (time.perf_counter() - reserve_start_s) * 1000.0,
-        bool(reserve.get("ok")),
-    )
-    if not bool(reserve.get("ok")):
-        raise HTTPException(
-            status_code=429,
-            detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
-        )
 
-    created = False
     inflight_marked = False
     try:
         await _protect_training_session_enqueue_window(route_session_info)
@@ -3395,39 +3145,26 @@ async def optim_step(
             ),
             request=http_request,
         )
-        await future_store.async_create_with_id(request_id)
-        created = True
-        await future_store.async_mark_queued(
-            request_id,
-            meta=_build_training_queued_meta(
+        await _enqueue_training_model_work_route(
+            route_start_s=route_start_s,
+            request_id=request_id,
+            op="training.optim_step",
+            request_json=request_json,
+            user_id=user_id,
+            extra=scheduler_extra,
+            model_id=request.model_id,
+            base_model=base_model,
+            backend=backend,
+            queued_meta=_build_training_queued_meta(
                 op="optim_step",
                 model_id=request.model_id,
                 session=route_session_info,
                 seq_id=request.seq_id,
             ),
         )
-        await _enqueue_training_request_with_trace(
-            route_start_s=route_start_s,
-            request_id=request_id,
-            op="training.optim_step",
-            model_id=request.model_id,
-            base_model=base_model,
-            backend=backend,
-            enqueue_coro=api_work_queue.enqueue(
-                request_id=request_id,
-                op="training.optim_step",
-                request_json=request_json,
-                user_id=user_id,
-                webhook_url=None,
-                extra=scheduler_extra,
-            ),
-        )
     except Exception as e:
         if inflight_marked and training_manager is not None:
             _mark_training_inflight(request.model_id, -1)
-        await capacity_manager.async_release_all(request_id)
-        if created:
-            await future_store.async_cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue optim_step request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)
@@ -3701,24 +3438,10 @@ async def save_weights_for_sampler(
     from ..client_compat import prefer_tinker_uri
 
     prefer_tinker = prefer_tinker_uri(http_request)
-    from ..backend.api_work_queue import api_work_queue
-    from ..backend.capacity_manager import capacity_manager
-    from ..backend.result_size_estimator import estimate_small_result_bytes
 
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
-    reserve = await capacity_manager.async_try_reserve(
-        request_id,
-        queue_bytes=len(request_json),
-        object_store_bytes=estimate_small_result_bytes(),
-    )
-    if not bool(reserve.get("ok")):
-        raise HTTPException(
-            status_code=429,
-            detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
-        )
 
-    created = False
     inflight_marked = False
     try:
         await _protect_training_session_enqueue_window(route_session_info)
@@ -3735,39 +3458,26 @@ async def save_weights_for_sampler(
         )
         scheduler_extra["prefer_tinker"] = bool(prefer_tinker)
         scheduler_extra["is_admin"] = can_manage_system(http_request)
-        await future_store.async_create_with_id(request_id)
-        created = True
-        await future_store.async_mark_queued(
-            request_id,
-            meta=_build_training_queued_meta(
+        await _enqueue_training_model_work_route(
+            route_start_s=route_start_s,
+            request_id=request_id,
+            op="training.save_weights_for_sampler",
+            request_json=request_json,
+            user_id=user_id,
+            extra=scheduler_extra,
+            model_id=request.model_id,
+            base_model=base_model,
+            backend=backend,
+            queued_meta=_build_training_queued_meta(
                 op="save_weights_for_sampler",
                 model_id=request.model_id,
                 session=route_session_info,
                 seq_id=request.seq_id,
             ),
         )
-        await _enqueue_training_request_with_trace(
-            route_start_s=route_start_s,
-            request_id=request_id,
-            op="training.save_weights_for_sampler",
-            model_id=request.model_id,
-            base_model=base_model,
-            backend=backend,
-            enqueue_coro=api_work_queue.enqueue(
-                request_id=request_id,
-                op="training.save_weights_for_sampler",
-                request_json=request_json,
-                user_id=user_id,
-                webhook_url=None,
-                extra=scheduler_extra,
-            ),
-        )
     except Exception as e:
         if inflight_marked and training_manager is not None:
             _mark_training_inflight(request.model_id, -1)
-        await capacity_manager.async_release_all(request_id)
-        if created:
-            await future_store.async_cleanup(request_id)
         raise HTTPException(
             status_code=503, detail=f"Failed to enqueue save_weights_for_sampler request: {e}"
         )

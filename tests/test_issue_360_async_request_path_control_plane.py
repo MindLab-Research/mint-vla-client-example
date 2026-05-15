@@ -756,6 +756,7 @@ def test_issue_360_training_optim_step_admission_uses_async_capacity_and_future(
     fs = _AsyncOnlyTrainingFutureStore()
     cap = _AsyncOnlyCapacityManager()
     q = _RecordingQueue()
+    mws = _RecordingModelWorkScheduler()
 
     session = SimpleNamespace(backend="peft", base_model="Qwen/Qwen3-0.6B")
     async def _restore_training_session(_mid):
@@ -787,10 +788,12 @@ def test_issue_360_training_optim_step_admission_uses_async_capacity_and_future(
 
     import tinker_server.backend.capacity_manager as cm
     import tinker_server.backend.api_work_queue as awq
+    import tinker_server.backend.model_work_scheduler as mws_module
     import tinker_server.backend.result_size_estimator as rse
 
     monkeypatch.setattr(cm, "capacity_manager", cap)
     monkeypatch.setattr(awq, "api_work_queue", q)
+    monkeypatch.setattr(mws_module, "model_work_scheduler", mws)
     monkeypatch.setattr(rse, "estimate_small_result_bytes", lambda: 0)
 
     req = OptimStepRequest(
@@ -800,9 +803,10 @@ def test_issue_360_training_optim_step_admission_uses_async_capacity_and_future(
     out = anyio.run(training_route.optim_step, req, _request_stub("user-a"))
 
     assert isinstance(out.request_id, str) and out.request_id
-    assert len(cap.calls) == 1
+    assert cap.calls == []
     assert any(name == "async_create_with_id" for name, _rid in fs.calls)
-    assert len(q.calls) == 1
+    assert q.calls == []
+    assert len(mws.calls) == 1
 
 
 def _install_stateless_training_enqueue_stubs(monkeypatch, *, route_session_info: dict | None):
@@ -926,21 +930,14 @@ def test_issue_360_training_enqueue_routes_use_detached_metadata_with_api_global
 
     assert isinstance(out.request_id, str) and out.request_id
     assert any(name == "async_create_with_id" for name, _rid in fs.calls)
-    uses_model_work_scheduler = route_name in {"forward_backward", "train_step"}
-    if uses_model_work_scheduler:
-        assert cap.calls == []
-        assert q.calls == []
-        assert len(mws.calls) == 1
-        queued = mws.calls[0]
-        assert queued["domain_key"] == "training:Qwen/Qwen3-0.6B"
-        assert queued["affinity_group"] == "training_session:run-detached"
-        assert queued["ordering_key"] == "training_session:run-detached"
-        assert queued["extra"]["model_work_scheduler"] is True
-    else:
-        assert len(cap.calls) == 1
-        assert mws.calls == []
-        assert len(q.calls) == 1
-        queued = q.calls[0]
+    assert cap.calls == []
+    assert q.calls == []
+    assert len(mws.calls) == 1
+    queued = mws.calls[0]
+    assert queued["domain_key"] == "training:Qwen/Qwen3-0.6B"
+    assert queued["affinity_group"] == "training_session:run-detached"
+    assert queued["ordering_key"] == "training_session:run-detached"
+    assert queued["extra"]["model_work_scheduler"] is True
     assert queued["op"] == expected_op
     assert queued["user_id"] == "user-a"
     assert queued["extra"]["training_op"] == expected_training_op
@@ -1049,9 +1046,10 @@ def test_issue_360_training_enqueue_refreshes_detached_heartbeat_before_queue(mo
     assert len(calls) == 1
     assert calls[0][0] == "sess-detached"
     assert calls[0][1] is not None
-    assert len(cap.calls) == 1
+    assert cap.calls == []
     assert any(name == "async_create_with_id" for name, _rid in fs.calls)
-    assert len(q.calls) == 1
+    assert q.calls == []
+    assert len(_mws.calls) == 1
 
 
 def test_issue_360_training_enqueue_returns_503_when_heartbeat_protection_fails(monkeypatch):

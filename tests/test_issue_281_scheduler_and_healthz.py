@@ -98,8 +98,7 @@ async def _noop_async(*_args, **_kwargs) -> None:
 
 @pytest.mark.anyio
 async def test_issue_281_forward_enqueues_scheduler_metadata(monkeypatch) -> None:
-    import tinker_server.backend.api_work_queue as awq
-    import tinker_server.backend.capacity_manager as cm
+    import tinker_server.backend.model_work_scheduler as mws
     from tinker_server.models.types import ForwardBackwardInput, ForwardRequest
     from tinker_server.routes import training as tr
 
@@ -107,9 +106,6 @@ async def test_issue_281_forward_enqueues_scheduler_metadata(monkeypatch) -> Non
 
     session = SimpleNamespace(backend="peft", base_model="Qwen/Qwen3-0.6B")
     captured: dict = {}
-
-    async def _fake_enqueue(**kwargs):
-        captured.update(kwargs)
 
     monkeypatch.setattr(tr, "training_manager", SimpleNamespace(get_session=lambda _model_id: session))
     monkeypatch.setattr(tr, "training_engine", object())
@@ -122,8 +118,7 @@ async def test_issue_281_forward_enqueues_scheduler_metadata(monkeypatch) -> Non
     )
     monkeypatch.setattr(tr, "_protect_training_session_enqueue_window", _noop_async)
     monkeypatch.setattr(tr, "future_store", _AsyncFutureStore())
-    monkeypatch.setattr(awq, "api_work_queue", SimpleNamespace(enqueue=_fake_enqueue))
-    monkeypatch.setattr(cm, "capacity_manager", _AsyncCapacityManager())
+    monkeypatch.setattr(mws, "model_work_scheduler", _AsyncModelWorkScheduler(captured))
 
     req = ForwardRequest(
         model_id="run-281",
@@ -133,12 +128,16 @@ async def test_issue_281_forward_enqueues_scheduler_metadata(monkeypatch) -> Non
     await tr.forward(req, _DummyRequest())
 
     assert captured["extra"]["scheduler_enabled"] is True
-    assert captured["extra"]["scheduler_domain"] == "peft:Qwen/Qwen3-0.6B"
+    assert captured["extra"]["scheduler_domain"] == "training:Qwen/Qwen3-0.6B"
     assert captured["extra"]["scheduler_session_key"] == "run-281"
     assert captured["extra"]["execution_serial_key"] == "training_session:run-281"
     assert captured["extra"]["training_op"] == "forward"
     assert captured["extra"]["seq_id"] == 7
     assert captured["extra"]["queue_priority"] == 0
+    assert captured["domain_key"] == "training:Qwen/Qwen3-0.6B"
+    assert captured["affinity_group"] == "training_session:run-281"
+    assert captured["ordering_key"] == "training_session:run-281"
+    assert captured["extra"]["model_work_scheduler"] is True
 
 
 @pytest.mark.anyio
@@ -178,8 +177,6 @@ async def test_issue_281_forward_enqueues_scheduler_metadata(monkeypatch) -> Non
 async def test_issue_281_training_routes_mark_queued_stage_metadata(
     monkeypatch, route_name: str, request_obj, training_op: str
 ) -> None:
-    import tinker_server.backend.api_work_queue as awq
-    import tinker_server.backend.capacity_manager as cm
     import tinker_server.backend.model_work_scheduler as mws
     from tinker_server.models import types as model_types
     from tinker_server.routes import training as tr
@@ -189,9 +186,6 @@ async def test_issue_281_training_routes_mark_queued_stage_metadata(
     session = SimpleNamespace(backend="megatron", base_model="Qwen/Qwen3-30B-A3B-Instruct-2507")
     captured: dict = {}
     queued_meta: dict = {}
-
-    async def _fake_enqueue(**kwargs):
-        captured.update(kwargs)
 
     class _QueuedFutureStore(_AsyncFutureStore):
         async def async_mark_queued(self, _request_id: str, meta=None) -> None:
@@ -212,8 +206,6 @@ async def test_issue_281_training_routes_mark_queued_stage_metadata(
     )
     monkeypatch.setattr(tr, "_protect_training_session_enqueue_window", _noop_async)
     monkeypatch.setattr(tr, "future_store", _QueuedFutureStore())
-    monkeypatch.setattr(awq, "api_work_queue", SimpleNamespace(enqueue=_fake_enqueue))
-    monkeypatch.setattr(cm, "capacity_manager", _AsyncCapacityManager())
     monkeypatch.setattr(mws, "model_work_scheduler", _AsyncModelWorkScheduler(captured))
 
     req = request_obj(model_types)
@@ -234,17 +226,15 @@ async def test_issue_281_training_routes_mark_queued_stage_metadata(
     assert captured["extra"]["execution_serial_key"] == "training_session:run-281"
     assert captured["extra"]["training_op"] == training_op
     assert captured["extra"]["queue_priority"] == 0
-    if route_name in {"forward_backward", "train_step"}:
-        assert captured["domain_key"] == "megatron:megatron_qwen3_30b_a3b_instruct_2507"
-        assert captured["affinity_group"] == "training_session:run-281"
-        assert captured["ordering_key"] == "training_session:run-281"
-        assert captured["extra"]["model_work_scheduler"] is True
+    assert captured["domain_key"] == "megatron:megatron_qwen3_30b_a3b_instruct_2507"
+    assert captured["affinity_group"] == "training_session:run-281"
+    assert captured["ordering_key"] == "training_session:run-281"
+    assert captured["extra"]["model_work_scheduler"] is True
 
 
 @pytest.mark.anyio
 async def test_issue_281_save_weights_for_sampler_enqueues_scheduler_metadata(monkeypatch) -> None:
-    import tinker_server.backend.api_work_queue as awq
-    import tinker_server.backend.capacity_manager as cm
+    import tinker_server.backend.model_work_scheduler as mws
     import tinker_server.client_compat as client_compat
     from tinker_server.models.types import SaveWeightsForSamplerRequest
     from tinker_server.routes import training as tr
@@ -253,9 +243,6 @@ async def test_issue_281_save_weights_for_sampler_enqueues_scheduler_metadata(mo
 
     session = SimpleNamespace(backend="megatron", base_model="Qwen/Qwen3-30B-A3B-Instruct-2507")
     captured: dict = {}
-
-    async def _fake_enqueue(**kwargs):
-        captured.update(kwargs)
 
     monkeypatch.setattr(tr, "training_manager", SimpleNamespace(get_session=lambda _model_id: session))
     monkeypatch.setattr(tr, "training_engine", object())
@@ -271,8 +258,7 @@ async def test_issue_281_save_weights_for_sampler_enqueues_scheduler_metadata(mo
     )
     monkeypatch.setattr(tr, "_protect_training_session_enqueue_window", _noop_async)
     monkeypatch.setattr(tr, "future_store", _AsyncFutureStore())
-    monkeypatch.setattr(awq, "api_work_queue", SimpleNamespace(enqueue=_fake_enqueue))
-    monkeypatch.setattr(cm, "capacity_manager", _AsyncCapacityManager())
+    monkeypatch.setattr(mws, "model_work_scheduler", _AsyncModelWorkScheduler(captured))
     monkeypatch.setattr(client_compat, "prefer_tinker_uri", lambda _request: True)
 
     req = SaveWeightsForSamplerRequest(model_id="run-281", seq_id=9, path=None)
@@ -287,6 +273,10 @@ async def test_issue_281_save_weights_for_sampler_enqueues_scheduler_metadata(mo
     assert captured["extra"]["queue_priority"] == 0
     assert captured["extra"]["prefer_tinker"] is True
     assert captured["extra"]["is_admin"] is False
+    assert captured["domain_key"] == "megatron:megatron_qwen3_30b_a3b_instruct_2507"
+    assert captured["affinity_group"] == "training_session:run-281"
+    assert captured["ordering_key"] == "training_session:run-281"
+    assert captured["extra"]["model_work_scheduler"] is True
 
 
 @pytest.mark.anyio
@@ -628,28 +618,21 @@ async def test_issue_281_asample_falls_back_to_base_model_scheduler_domain(monke
 
 @pytest.mark.anyio
 async def test_issue_281_internal_serialized_op_marks_inflight_until_worker_finishes(monkeypatch) -> None:
-    import tinker_server.backend.api_work_queue as awq
-    import tinker_server.backend.capacity_manager as cm
+    import tinker_server.backend.model_work_scheduler as mws
     from tinker_server.backend.training_session_manager import TrainingSessionManager
     from tinker_server.models.types import ResetExpertBiasRequest
     from tinker_server.routes import training as tr
 
     manager = TrainingSessionManager()
     manager.create_session("run-281", "sess-281", 0, "Qwen/Qwen3-30B-A3B-Instruct-2507")
+    captured: dict = {}
     resolved: dict = {}
-
-    async def _fake_enqueue(**_kwargs):
-        return None
 
     async def _fake_reset(_session):
         return {"modules_reset": 1}
 
     async def _async_fail(request_id, error):
         resolved.update({"failed_request_id": request_id, "error": error})
-
-    async def _async_try_reserve(*args, **kwargs):
-        _ = (args, kwargs)
-        return {"ok": True}
 
     async def _async_resolve(request_id, payload):
         resolved.update({"request_id": request_id, "payload": payload})
@@ -670,15 +653,7 @@ async def test_issue_281_internal_serialized_op_marks_inflight_until_worker_fini
             async_fail=_async_fail,
         ),
     )
-    monkeypatch.setattr(awq, "api_work_queue", SimpleNamespace(enqueue=_fake_enqueue))
-    monkeypatch.setattr(
-        cm,
-        "capacity_manager",
-        SimpleNamespace(
-            async_try_reserve=_async_try_reserve,
-            async_release_all=_async_none,
-        ),
-    )
+    monkeypatch.setattr(mws, "model_work_scheduler", _AsyncModelWorkScheduler(captured))
 
     request_id = await tr._enqueue_internal_serialized_model_op(
         model_id="run-281",
@@ -687,6 +662,9 @@ async def test_issue_281_internal_serialized_op_marks_inflight_until_worker_fini
         extra={},
     )
     assert manager.get_local_session("run-281").inflight_ops == 1
+    assert captured["op"] == "training.reset_expert_bias"
+    assert captured["affinity_group"] == "training_session:run-281"
+    assert captured["ordering_key"] == "training_session:run-281"
 
     await tr._do_reset_expert_bias(request_id, ResetExpertBiasRequest(model_id="run-281"))
 

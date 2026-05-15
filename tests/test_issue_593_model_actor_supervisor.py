@@ -339,7 +339,12 @@ def test_issue_593_supervisor_falls_back_to_persistent_models(monkeypatch: pytes
 
     specs = desired_specs_from_env()
 
-    assert [spec.domain_key for spec in specs] == ["vllm:Qwen/A", "vllm:Qwen/B"]
+    assert [spec.domain_key for spec in specs] == [
+        "vllm:Qwen/A",
+        "training:Qwen/A",
+        "vllm:Qwen/B",
+        "training:Qwen/B",
+    ]
     assert domain_key_for_vllm_base_model("Qwen/A") == "vllm:Qwen/A"
     assert queue_id_for_replica("vllm:Qwen/A", "replica-2") == "vllm:Qwen/A::replica-2"
 

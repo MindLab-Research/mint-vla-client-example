@@ -59,6 +59,26 @@ def domain_key_for_vllm_base_model(base_model: str) -> str:
     return f"vllm:{model}"
 
 
+def _normalize_megatron_domain_key(base_model: str) -> str:
+    model_name = str(base_model or "").split("/")[-1]
+    model_name = re.sub(r"[^A-Za-z0-9]+", "_", model_name).strip("_").lower()
+    return f"megatron_{model_name}" if model_name else "megatron_model"
+
+
+def domain_key_for_training_base_model(base_model: str) -> str:
+    model = str(base_model).strip()
+    if not model:
+        raise ValueError("base_model is required")
+    try:
+        from .model_registry import get_model_config
+
+        if bool(getattr(get_model_config(model), "is_moe", False)):
+            return f"megatron:{_normalize_megatron_domain_key(model)}"
+    except Exception:
+        logger.debug("training domain model config lookup failed for %s", model, exc_info=True)
+    return f"training:{model}"
+
+
 def default_model_actor_name(domain_key: str, replica_id: str) -> str:
     raw = f"mint_model_actor_{domain_key}_{replica_id}"
     return re.sub(r"[^A-Za-z0-9_.-]+", "-", raw).strip("-")
@@ -192,7 +212,19 @@ def desired_specs_from_env() -> list[ModelActorSpec]:
     persistent = os.environ.get("MINT_PERSISTENT_MODELS", "").strip()
     if not persistent:
         return []
-    return [_spec_from_obj(model.strip()) for model in persistent.split(",") if model.strip()]
+    specs: list[ModelActorSpec] = []
+    for model in (item.strip() for item in persistent.split(",")):
+        if not model:
+            continue
+        specs.append(_spec_from_obj(model))
+        specs.append(
+            ModelActorSpec(
+                domain_key=domain_key_for_training_base_model(model),
+                base_model=model,
+                launcher_key="training",
+            )
+        )
+    return specs
 
 
 async def _maybe_await(value: Any) -> Any:
