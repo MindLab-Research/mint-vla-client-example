@@ -127,7 +127,35 @@ def _install_noop_tensorboard() -> None:
         pass
 
 
+def _patch_flash_attn_metadata_version() -> None:
+    """Normalize flash-attn metadata before TransformerEngine probes it."""
+    try:
+        import importlib.metadata as _imd
+
+        _orig_version = getattr(_imd, "version", None)
+        if not callable(_orig_version) or getattr(_orig_version, "_tinker_flash_attn_version_patch", False):
+            return
+
+        def _patched_version(dist_name: str) -> str:
+            version_text = _orig_version(dist_name)
+            if dist_name == "flash-attn" and isinstance(version_text, str):
+                if version_text == "0.2.8":
+                    return "2.8.1"
+                if "+" in version_text:
+                    return version_text.split("+", 1)[0]
+            if dist_name == "flash-attn-3" and isinstance(version_text, str) and "+" in version_text:
+                return version_text.split("+", 1)[0]
+            return version_text
+
+        _patched_version._tinker_flash_attn_version_patch = True  # type: ignore[attr-defined]
+        _imd.version = _patched_version  # type: ignore[assignment]
+    except Exception as exc:
+        logger.warning("Failed to patch flash-attn metadata version: %s", exc)
+
+
 def _megatron_attention_backend() -> str:
+    _patch_flash_attn_metadata_version()
+
     override = os.environ.get("MINT_MEGATRON_ATTENTION_BACKEND", "").strip().lower()
     if override:
         if override not in {"flash", "fused", "unfused", "local", "auto"}:
@@ -146,10 +174,15 @@ def _megatron_attention_backend() -> str:
 
     try:
         import flash_attn_2_cuda  # noqa: F401
-        from flash_attn.flash_attn_interface import (  # noqa: F401
-            flash_attn_func,
-            flash_attn_varlen_func,
+        from flash_attn import flash_attn_interface
+
+        has_dense = hasattr(flash_attn_interface, "flash_attn_func")
+        has_varlen = hasattr(flash_attn_interface, "flash_attn_varlen_func") or hasattr(
+            flash_attn_interface,
+            "flash_attn_unpadded_func",
         )
+        if not (has_dense and has_varlen):
+            raise ImportError("flash-attn interface is missing dense or variable-length kernels")
 
         return "flash"
     except Exception:
