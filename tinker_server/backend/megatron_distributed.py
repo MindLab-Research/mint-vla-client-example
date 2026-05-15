@@ -163,6 +163,16 @@ def _patch_flash_attn_interface_compat() -> None:
             and hasattr(flash_attn_interface, "flash_attn_unpadded_func")
         ):
             flash_attn_interface.flash_attn_varlen_func = flash_attn_interface.flash_attn_unpadded_func
+        if (
+            not hasattr(flash_attn_interface, "_flash_attn_varlen_forward")
+            and hasattr(flash_attn_interface, "_flash_attn_forward")
+        ):
+            flash_attn_interface._flash_attn_varlen_forward = flash_attn_interface._flash_attn_forward
+        if (
+            not hasattr(flash_attn_interface, "_flash_attn_varlen_backward")
+            and hasattr(flash_attn_interface, "_flash_attn_backward")
+        ):
+            flash_attn_interface._flash_attn_varlen_backward = flash_attn_interface._flash_attn_backward
     except Exception as exc:
         logger.warning("Failed to patch flash-attn interface compatibility: %s", exc)
 
