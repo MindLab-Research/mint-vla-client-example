@@ -16,7 +16,7 @@ from typing import Any
 
 import numpy as np
 
-from ..checkpoints import checkpoint_has_openpi_policy_weights, checkpoint_has_openpi_training_state
+from ..checkpoints import checkpoint_has_openpi_training_state
 from .openpi_fast_action_runtime import find_openpi_policy_checkpoint_dir
 from .openpi_fast_runtime import OPENPI_FAST_WORKER_PROTOCOL_VERSION
 from .openpi_session_state import OpenPISessionStateManager
@@ -784,7 +784,10 @@ class OpenPIFastWorkerSession:
                 checkpoint_step,
             )
             manager.wait_until_finished()
-            self._save_checkpoint_assets(Path(checkpoint_path) / str(checkpoint_step) / "assets")
+            _save_assets = getattr(self, "_save_checkpoint_assets", None)
+            if not callable(_save_assets):
+                _save_assets = OpenPIFastWorkerSession._save_checkpoint_assets
+            _save_assets(self, Path(checkpoint_path) / str(checkpoint_step) / "assets")
         finally:
             close = getattr(manager, "close", None)
             if callable(close):
@@ -822,7 +825,11 @@ class OpenPIFastWorkerSession:
             manager.save(
                 checkpoint_step,
                 items={
-                    "assets": self._save_checkpoint_assets,
+                    "assets": (
+                        self._save_checkpoint_assets
+                        if callable(getattr(self, "_save_checkpoint_assets", None))
+                        else lambda directory: OpenPIFastWorkerSession._save_checkpoint_assets(self, directory)
+                    ),
                     "params": {"params": params},
                 },
             )

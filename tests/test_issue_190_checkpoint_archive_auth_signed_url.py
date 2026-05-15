@@ -65,7 +65,7 @@ def test_issue_190_redirect_location_is_fetchable_without_headers_under_auth(
     client = TestClient(app)
 
     resp = client.get(
-        f"/api/v1/training_runs/{run_id}/checkpoints/weights/0001/archive",
+        f"/api/v1/training_runs/{run_id}/checkpoints/weights/0001/archive?owner_id=anonymous",
         headers={"User-Agent": "AsyncTinker/Python 0.13.1", "X-API-Key": "sekret"},
         follow_redirects=False,
     )
@@ -80,4 +80,3 @@ def test_issue_190_redirect_location_is_fetchable_without_headers_under_auth(
     assert direct.status_code == 200
     assert direct.headers.get("content-type") == "application/gzip"
     assert direct.content[:2] == b"\x1f\x8b"
-

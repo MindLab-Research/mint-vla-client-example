@@ -218,9 +218,19 @@ def test_openpi_fast_worker_checkpoint_save_normalizes_step_zero() -> None:
                 "step": step,
             }
 
+        class _normalize:
+            @staticmethod
+            def save(path, norm_stats):
+                calls["asset_save"] = {"path": path, "norm_stats": norm_stats}
+
+    class _FakeDataLoader:
+        @staticmethod
+        def data_config():
+            return SimpleNamespace(norm_stats={"mean": [0.0]}, asset_id="asset")
+
     fake_session = SimpleNamespace(
         _checkpoints=_FakeCheckpoints(),
-        _data_loader="loader",
+        _data_loader=_FakeDataLoader(),
     )
     state = SimpleNamespace(step=0)
 

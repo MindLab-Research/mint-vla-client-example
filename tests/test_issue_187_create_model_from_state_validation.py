@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
 
@@ -41,6 +41,12 @@ def test_issue_187_create_model_from_state_rejects_sampler_checkpoint_with_optim
     )
 
     app = FastAPI()
+
+    @app.middleware("http")
+    async def inject_user(request: Request, call_next):
+        request.state.user_data = {"user_id": "anonymous"}
+        return await call_next(request)
+
     app.include_router(training_routes.router, prefix="/api/v1")
     client = TestClient(app)
 
