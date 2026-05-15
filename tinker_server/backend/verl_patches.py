@@ -1195,7 +1195,12 @@ def _enable_megatron_determinism(seed: int = 42):
         if callable(_orig_version) and not getattr(_orig_version, "_tinker_flash_attn_version_patch", False):
             def _patched_version(dist_name: str) -> str:
                 v = _orig_version(dist_name)
-                if dist_name in ("flash-attn", "flash-attn-3") and isinstance(v, str) and "+" in v:
+                if dist_name == "flash-attn" and isinstance(v, str):
+                    if v == "0.2.8":
+                        return "2.8.1"
+                    if "+" in v:
+                        return v.split("+", 1)[0]
+                if dist_name == "flash-attn-3" and isinstance(v, str) and "+" in v:
                     return v.split("+", 1)[0]
                 return v
 

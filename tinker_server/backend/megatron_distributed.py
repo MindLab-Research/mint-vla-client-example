@@ -144,6 +144,17 @@ def _megatron_attention_backend() -> str:
     except Exception:
         pass
 
+    try:
+        import flash_attn_2_cuda  # noqa: F401
+        from flash_attn.flash_attn_interface import (  # noqa: F401
+            flash_attn_func,
+            flash_attn_varlen_func,
+        )
+
+        return "flash"
+    except Exception:
+        pass
+
     return "unfused"
 
 
