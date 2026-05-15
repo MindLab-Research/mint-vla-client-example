@@ -280,6 +280,9 @@ class _AsyncOnlySamplingFutureStore:
         self.calls.append(("async_mark_queued", request_id))
         self.marked.append(request_id)
 
+    async def async_update_meta(self, request_id: str, meta: dict | None = None) -> None:
+        self.calls.append(("async_update_meta", request_id))
+
     def mark_queued(self, request_id: str, meta: dict | None = None) -> None:
         self.marked.append(request_id)
 
@@ -402,6 +405,9 @@ class _SamplingSessionManager:
     def get_engine(self, _session_id: str):
         return object()
 
+    def get_session_base_model(self, _session_id: str) -> str:
+        return "Qwen/Qwen3-0.6B"
+
 
 class _AsyncOnlyAdmissionCapacityManager:
     async def async_snapshot(self, timeout_s: float = 10.0):
@@ -507,19 +513,14 @@ def test_issue_360_retrieve_future_unknown_admin_uses_async_debug_snapshot(monke
 
 def test_issue_360_asample_admission_uses_async_capacity_and_future(monkeypatch):
     fs = _AsyncOnlySamplingFutureStore()
-    cap = _AsyncOnlyCapacityManager()
-    q = _RecordingQueue()
+    scheduler = _RecordingModelWorkScheduler()
 
     monkeypatch.setattr(sampling_route, "session_manager", _SamplingSessionManager())
     monkeypatch.setattr(sampling_route, "future_store", fs)
 
-    import tinker_server.backend.capacity_manager as cm
-    import tinker_server.backend.api_work_queue as awq
-    import tinker_server.backend.result_size_estimator as rse
+    import tinker_server.backend.model_work_scheduler as mws
 
-    monkeypatch.setattr(cm, "capacity_manager", cap)
-    monkeypatch.setattr(awq, "api_work_queue", q)
-    monkeypatch.setattr(rse, "estimate_sampling_result_bytes", lambda _req: 0)
+    monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
 
     req = SampleRequest(
         sampling_session_id="sess_async",
@@ -531,9 +532,9 @@ def test_issue_360_asample_admission_uses_async_capacity_and_future(monkeypatch)
     out = anyio.run(sampling_route.asample, req, _request_stub("user-a"))
 
     assert isinstance(out.request_id, str) and out.request_id
-    assert len(cap.calls) == 1
     assert any(name == "async_ensure_pending" for name, _rid in fs.calls)
-    assert len(q.calls) == 1
+    assert len(scheduler.calls) == 1
+    assert scheduler.calls[0]["domain_key"] == "vllm:Qwen/Qwen3-0.6B"
 
 
 def test_issue_360_internal_admission_stats_uses_async_store_calls(monkeypatch):

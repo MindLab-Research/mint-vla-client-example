@@ -243,7 +243,7 @@ def test_issue_593_asample_does_not_cancel_scheduler_item_when_append_rejects(mo
     assert stub_fs.cleaned == [stub_fs.created[0]]
 
 
-def test_issue_593_asample_explicit_flag_off_keeps_api_work_queue(monkeypatch):
+def test_issue_593_asample_ignores_legacy_flag_and_uses_model_work_scheduler(monkeypatch):
     monkeypatch.setenv("MINT_MODEL_WORK_SCHEDULER_ASAMPLE", "0")
     stub_fs = _StubFutureStore()
     stub_cap = _StubCapacityManager()
@@ -273,8 +273,8 @@ def test_issue_593_asample_explicit_flag_off_keeps_api_work_queue(monkeypatch):
     out = anyio.run(sampling_route.asample, req, _dummy_request("user-a"))
 
     assert isinstance(out.request_id, str) and out.request_id
-    assert scheduler.calls == []
-    assert len(api_queue.calls) == 1
-    assert json.loads(api_queue.calls[0]["request_json"].decode("utf-8"))[
+    assert api_queue.calls == []
+    assert len(scheduler.calls) == 1
+    assert json.loads(scheduler.calls[0]["request_json"].decode("utf-8"))[
         "sampling_session_id"
     ] == "session-a"

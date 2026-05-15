@@ -1476,47 +1476,39 @@ async def metrics() -> Response:
 
 @router.post("/work_queue/noop")
 async def work_queue_noop(http_request: Request) -> dict:
-    from ..backend.api_work_queue import api_work_queue
-    from ..backend.capacity_manager import capacity_manager
     from ..backend.future_store import future_store
-    from ..backend.result_size_estimator import estimate_small_result_bytes
+    from ..backend.model_actor_supervisor import domain_key_for_internal_control
+    from ..backend.model_work_admission import enqueue_model_work
 
     route_start_s = time.perf_counter()
     request_id = uuid.uuid4().hex
     request_json = b"{}"
-    reserve = await capacity_manager.async_try_reserve(
-        request_id,
-        queue_bytes=len(request_json),
-        object_store_bytes=estimate_small_result_bytes(),
-    )
-    if not bool(reserve.get("ok")):
-        raise HTTPException(
-            status_code=429,
-            detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
-        )
-
-    created = False
     try:
-        await future_store.async_create_with_id(request_id)
-        created = True
-        await future_store.async_mark_queued(request_id, meta={"op": "internal.noop"})
         await _enqueue_internal_request_with_trace(
             route_start_s=route_start_s,
             request_id=request_id,
             op="internal.noop",
-            enqueue_coro=api_work_queue.enqueue(
+            enqueue_coro=enqueue_model_work(
                 request_id=request_id,
                 op="internal.noop",
                 request_json=request_json,
                 user_id=None,
                 webhook_url=None,
+                domain_key=domain_key_for_internal_control(),
+                affinity_group="internal:no-op",
+                ordering_key=None,
+                token_cost=1,
                 extra=merge_queue_priority_extra({"ts": float(time.time())}, request=http_request),
+                queued_meta={
+                    "op": "internal.noop",
+                    "queue_state": "queued",
+                    "stage": "queued",
+                    "queued_at": time.time(),
+                },
+                future_store_client=future_store,
             ),
         )
     except Exception as e:
-        await capacity_manager.async_release_all(request_id)
-        if created:
-            await future_store.async_cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue internal.noop: {e}")
 
     return {"request_id": request_id}

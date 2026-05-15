@@ -32,6 +32,23 @@ class _StubFutureStore:
         self.failed.append((request_id, message))
 
 
+class _StubModelWorkScheduler:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.calls: list[dict] = []
+        self.cancelled: list[dict] = []
+        self.fail = bool(fail)
+
+    async def append(self, **kwargs) -> dict:
+        self.calls.append(dict(kwargs))
+        if self.fail:
+            raise RuntimeError("scheduler unavailable")
+        return {"ok": True, "scheduler_instance_id": "scheduler-mint"}
+
+    async def cancel_request(self, **kwargs) -> dict:
+        self.cancelled.append(dict(kwargs))
+        return {"ok": True}
+
+
 class _StubCapacityManager:
     def __init__(self) -> None:
         self.calls: list[dict] = []
@@ -81,30 +98,14 @@ def test_mint_action_route_cleans_up_future_when_enqueue_fails(monkeypatch) -> N
     from tinker_server.routes import mint as mint_routes
 
     future_store = _StubFutureStore()
-    capacity = _StubCapacityManager()
-
-    class _ExplodingQueue:
-        async def enqueue(
-            self,
-            *,
-            request_id: str,
-            op: str,
-            request_json: bytes,
-            user_id: str | None,
-            webhook_url: str | None,
-            extra: dict | None = None,
-        ) -> None:
-            _ = request_id, op, request_json, user_id, webhook_url, extra
-            raise RuntimeError("queue unavailable")
+    scheduler = _StubModelWorkScheduler(fail=True)
 
     monkeypatch.setattr(mint_routes, "future_store", future_store, raising=False)
     monkeypatch.setattr(mint_routes, "action_session_manager", object(), raising=False)
 
-    import tinker_server.backend.capacity_manager as capacity_module
-    import tinker_server.backend.api_work_queue as queue_module
+    import tinker_server.backend.model_work_scheduler as mws
 
-    monkeypatch.setattr(capacity_module, "capacity_manager", capacity)
-    monkeypatch.setattr(queue_module, "api_work_queue", _ExplodingQueue())
+    monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
 
     app = FastAPI()
     app.include_router(mint_routes.router, prefix="/api/v1/mint")
@@ -135,8 +136,8 @@ def test_mint_action_route_cleans_up_future_when_enqueue_fails(monkeypatch) -> N
 
     assert resp.status_code == 503, resp.text
     assert len(future_store.created) == 1
-    assert future_store.cleaned == future_store.created
-    assert capacity.released == future_store.created
+    assert set(future_store.cleaned) == set(future_store.created)
+    assert len(scheduler.calls) == 1
 
 
 def test_mint_create_action_session_maps_capacity_runtime_error_to_503(monkeypatch) -> None:
@@ -255,8 +256,7 @@ def test_mint_vla_train_step_route_enqueues_expected_request(monkeypatch) -> Non
     from tinker_server.routes import mint as mint_routes
 
     future_store = _StubFutureStore()
-    capacity = _StubCapacityManager()
-    queue = _StubQueue()
+    scheduler = _StubModelWorkScheduler()
 
     session = SimpleNamespace(
         model_id="model-123",
@@ -279,17 +279,16 @@ def test_mint_vla_train_step_route_enqueues_expected_request(monkeypatch) -> Non
     monkeypatch.setattr(mint_routes, "training_manager", _StubTrainingManager())
     monkeypatch.setattr(mint_routes, "_get_user_id", lambda _request: "user-a")
 
-    import tinker_server.backend.capacity_manager as capacity_module
-    import tinker_server.backend.api_work_queue as queue_module
+    import tinker_server.backend.model_work_scheduler as mws
     from tinker_server.routes import training as training_routes
 
-    monkeypatch.setattr(capacity_module, "capacity_manager", capacity)
-    monkeypatch.setattr(queue_module, "api_work_queue", queue)
+    monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
     monkeypatch.setattr(training_routes, "_get_max_model_len", lambda _base_model: 2048)
     monkeypatch.setattr(
         training_routes,
         "_build_training_scheduler_extra",
         lambda *, session, model_id, training_op, seq_id=None: {
+            "scheduler_domain": f"training:{session.base_model}",
             "scheduler_session_key": model_id,
             "training_op": training_op,
             "seq_id": seq_id,
@@ -355,14 +354,19 @@ def test_mint_vla_train_step_route_enqueues_expected_request(monkeypatch) -> Non
     assert resp.status_code == 200, resp.text
     request_id = resp.json()["request_id"]
     assert future_store.created == [request_id]
-    assert future_store.queued == [
-        (request_id, {"op": "mint.vla.train_step", "model_id": "model-123"})
-    ]
-    assert len(queue.calls) == 1
-    queued = queue.calls[0]
+    queued_request_id, queued_meta = future_store.queued[0]
+    assert queued_request_id == request_id
+    assert queued_meta["op"] == "mint.vla.train_step"
+    assert queued_meta["model_id"] == "model-123"
+    assert queued_meta["queue_state"] == "queued"
+    assert len(scheduler.calls) == 1
+    queued = scheduler.calls[0]
     assert queued["op"] == "mint.vla.train_step"
-    assert queued["request_json"]["data"][0]["observation"]["state"]["shape"] == [8]
-    assert queued["request_json"]["data"][0]["supervision"]["target_tokens"]["shape"] == [2]
+    assert queued["domain_key"] == "training:openpi/pi0-fast-libero-low-mem-finetune"
+    assert queued["affinity_group"] == "training_session:model-123"
+    request_json = json.loads(queued["request_json"].decode("utf-8"))
+    assert request_json["data"][0]["observation"]["state"]["shape"] == [8]
+    assert request_json["data"][0]["supervision"]["target_tokens"]["shape"] == [2]
 
 
 def test_mint_vla_train_step_background_lowers_observation_and_supervision(monkeypatch) -> None:
@@ -431,8 +435,7 @@ def test_mint_vla_train_step_route_uses_detached_session_info(monkeypatch) -> No
     from tinker_server.routes import training as training_routes
 
     future_store = _StubFutureStore()
-    capacity = _StubCapacityManager()
-    queue = _StubQueue()
+    scheduler = _StubModelWorkScheduler()
 
     async def _fake_route_session_info(model_id: str):
         assert model_id == "model-123"
@@ -450,16 +453,15 @@ def test_mint_vla_train_step_route_uses_detached_session_info(monkeypatch) -> No
     monkeypatch.setattr(mint_routes, "_get_user_id", lambda _request: "user-a")
     monkeypatch.setattr(mint_routes, "_get_route_training_store_info", _fake_route_session_info)
 
-    import tinker_server.backend.capacity_manager as capacity_module
-    import tinker_server.backend.api_work_queue as queue_module
+    import tinker_server.backend.model_work_scheduler as mws
 
-    monkeypatch.setattr(capacity_module, "capacity_manager", capacity)
-    monkeypatch.setattr(queue_module, "api_work_queue", queue)
+    monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
     monkeypatch.setattr(training_routes, "_get_max_model_len", lambda _base_model: 2048)
     monkeypatch.setattr(
         training_routes,
         "_build_training_scheduler_extra",
         lambda *, session, model_id, training_op, seq_id=None: {
+            "scheduler_domain": f"training:{session['base_model']}",
             "scheduler_session_key": model_id,
             "training_op": training_op,
             "seq_id": seq_id,
@@ -496,8 +498,9 @@ def test_mint_vla_train_step_route_uses_detached_session_info(monkeypatch) -> No
     )
 
     assert resp.status_code == 200, resp.text
-    assert len(queue.calls) == 1
-    assert queue.calls[0]["op"] == "mint.vla.train_step"
+    assert len(scheduler.calls) == 1
+    assert scheduler.calls[0]["op"] == "mint.vla.train_step"
+    assert scheduler.calls[0]["domain_key"] == "training:openpi/pi0-fast-libero-low-mem-finetune"
 
 
 def test_api_work_queue_dispatch_executes_mint_vla_train_step(monkeypatch) -> None:
@@ -551,19 +554,16 @@ def test_mint_interpolate_route_enqueues_expected_request(monkeypatch) -> None:
     from tinker_server.routes import mint as mint_routes
 
     future_store = _StubFutureStore()
-    capacity = _StubCapacityManager()
-    queue = _StubQueue()
+    scheduler = _StubModelWorkScheduler()
 
     monkeypatch.setattr(mint_routes, "future_store", future_store)
     monkeypatch.setattr(mint_routes, "training_engine", object())
     monkeypatch.setattr(mint_routes, "training_manager", object())
     monkeypatch.setattr(mint_routes, "_get_user_id", lambda _request: "user-a")
 
-    import tinker_server.backend.capacity_manager as capacity_module
-    import tinker_server.backend.api_work_queue as queue_module
+    import tinker_server.backend.model_work_scheduler as mws
 
-    monkeypatch.setattr(capacity_module, "capacity_manager", capacity)
-    monkeypatch.setattr(queue_module, "api_work_queue", queue)
+    monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
 
     resolved_flags: list[bool] = []
 
@@ -573,6 +573,7 @@ def test_mint_interpolate_route_enqueues_expected_request(monkeypatch) -> None:
 
     monkeypatch.setattr(mint_routes, "can_bypass_ownership", lambda _request: True)
     monkeypatch.setattr(mint_routes, "_resolve_checkpoint_for_user", _resolve)
+    monkeypatch.setattr(mint_routes, "_require_peft_adapter_checkpoint", lambda _path: None)
 
     app = FastAPI()
     app.include_router(mint_routes.router, prefix="/api/v1/mint")
@@ -602,11 +603,13 @@ def test_mint_interpolate_route_enqueues_expected_request(monkeypatch) -> None:
     assert isinstance(queued_meta["queued_at"], float)
     assert queued_meta["checkpoint_count"] == 2
     assert queued_meta["output_path"] == "ema-0010"
-    assert len(queue.calls) == 1
-    queued = queue.calls[0]
+    assert len(scheduler.calls) == 1
+    queued = scheduler.calls[0]
     assert queued["op"] == "mint.interpolate_checkpoints"
     assert queued["user_id"] == "user-a"
-    assert queued["request_json"]["source_paths"] == [
+    assert queued["domain_key"] == "internal:control"
+    request_json = json.loads(queued["request_json"].decode("utf-8"))
+    assert request_json["source_paths"] == [
         "/resolved/user-a/ckpt-a",
         "/resolved/user-a/ckpt-b",
     ]
@@ -802,8 +805,7 @@ def test_mint_reverse_kl_route_and_background_path(monkeypatch) -> None:
     from tinker_server.models.mint_types import ForwardBackwardReverseKLRequest
 
     future_store = _StubFutureStore()
-    capacity = _StubCapacityManager()
-    queue = _StubQueue()
+    scheduler = _StubModelWorkScheduler()
 
     class _StubSession:
         base_model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
@@ -862,14 +864,13 @@ def test_mint_reverse_kl_route_and_background_path(monkeypatch) -> None:
     monkeypatch.setattr(mint_routes, "_get_user_id", lambda _request: "user-a")
     monkeypatch.setattr(mint_routes, "can_bypass_ownership", lambda _request: True)
     monkeypatch.setattr(mint_routes, "_resolve_checkpoint_for_user", _resolve)
+    monkeypatch.setattr(mint_routes, "_require_peft_adapter_checkpoint", lambda _path: None)
     monkeypatch.setattr(mint_routes, "_protect_training_session_enqueue_window", _noop_protect)
     monkeypatch.setattr(mint_routes, "_get_max_model_len", lambda _base_model: 2048, raising=False)
 
-    import tinker_server.backend.capacity_manager as capacity_module
-    import tinker_server.backend.api_work_queue as queue_module
+    import tinker_server.backend.model_work_scheduler as mws
 
-    monkeypatch.setattr(capacity_module, "capacity_manager", capacity)
-    monkeypatch.setattr(queue_module, "api_work_queue", queue)
+    monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
     monkeypatch.setattr(training_routes, "_get_max_model_len", lambda _base_model: 2048)
     monkeypatch.setattr(mint_routes, "_get_route_training_store_info", _get_training_route_session_info)
 
@@ -905,14 +906,14 @@ def test_mint_reverse_kl_route_and_background_path(monkeypatch) -> None:
     assert queued_meta["queue_state"] == "queued"
     assert queued_meta["stage"] == "queued"
     assert isinstance(queued_meta["queued_at"], float)
-    assert len(queue.calls) == 1
-    queued = queue.calls[0]
+    assert len(scheduler.calls) == 1
+    queued = scheduler.calls[0]
     assert queued["op"] == "mint.forward_backward_reverse_kl"
-    assert queued["request_json"]["reference_model_path"] == "/resolved/ref-step-0010"
+    queued_request_json = json.loads(queued["request_json"].decode("utf-8"))
+    assert queued_request_json["reference_model_path"] == "/resolved/ref-step-0010"
     assert resolved_flags == [True]
-    assert capacity.calls[0]["object_store_bytes"] == 256 * 1024
 
-    request = ForwardBackwardReverseKLRequest.model_validate(queued["request_json"])
+    request = ForwardBackwardReverseKLRequest.model_validate(queued_request_json)
     import asyncio
 
     asyncio.run(mint_routes._do_forward_backward_reverse_kl(request_id, request, "user-a"))
@@ -947,8 +948,7 @@ def test_mint_reverse_kl_route_uses_detached_training_info_without_route_runtime
     from tinker_server.routes import training as training_routes
 
     future_store = _StubFutureStore()
-    capacity = _StubCapacityManager()
-    queue = _StubQueue()
+    scheduler = _StubModelWorkScheduler()
 
     async def _get_training_route_session_info(model_id: str):
         if model_id == "model-123":
@@ -969,14 +969,13 @@ def test_mint_reverse_kl_route_uses_detached_training_info_without_route_runtime
     monkeypatch.setattr(mint_routes, "_get_user_id", lambda _request: "user-a")
     monkeypatch.setattr(mint_routes, "can_bypass_ownership", lambda _request: False)
     monkeypatch.setattr(mint_routes, "_resolve_checkpoint_for_user", lambda path, **_: "/resolved/ref-step-0010")
+    monkeypatch.setattr(mint_routes, "_require_peft_adapter_checkpoint", lambda _path: None)
     monkeypatch.setattr(mint_routes, "_protect_training_session_enqueue_window", _noop_protect)
     monkeypatch.setattr(mint_routes, "_get_route_training_store_info", _get_training_route_session_info)
 
-    import tinker_server.backend.capacity_manager as capacity_module
-    import tinker_server.backend.api_work_queue as queue_module
+    import tinker_server.backend.model_work_scheduler as mws
 
-    monkeypatch.setattr(capacity_module, "capacity_manager", capacity)
-    monkeypatch.setattr(queue_module, "api_work_queue", queue)
+    monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
     monkeypatch.setattr(training_routes, "_get_max_model_len", lambda _base_model: 2048)
 
     app = FastAPI()
@@ -1011,10 +1010,11 @@ def test_mint_reverse_kl_route_uses_detached_training_info_without_route_runtime
     assert queued_meta["queue_state"] == "queued"
     assert queued_meta["stage"] == "queued"
     assert isinstance(queued_meta["queued_at"], float)
-    assert len(queue.calls) == 1
-    queued = queue.calls[0]
+    assert len(scheduler.calls) == 1
+    queued = scheduler.calls[0]
     assert queued["op"] == "mint.forward_backward_reverse_kl"
-    assert queued["request_json"]["reference_model_path"] == "/resolved/ref-step-0010"
+    queued_request_json = json.loads(queued["request_json"].decode("utf-8"))
+    assert queued_request_json["reference_model_path"] == "/resolved/ref-step-0010"
 
 
 def test_mint_reverse_kl_route_propagates_detached_store_503(monkeypatch) -> None:
@@ -1055,8 +1055,7 @@ def test_mint_reverse_kl_route_refreshes_detached_enqueue_protection(monkeypatch
     from tinker_server.routes import training as training_routes
 
     future_store = _StubFutureStore()
-    capacity = _StubCapacityManager()
-    queue = _StubQueue()
+    scheduler = _StubModelWorkScheduler()
     protected: list[dict] = []
 
     async def _get_training_route_session_info(model_id: str):
@@ -1078,14 +1077,13 @@ def test_mint_reverse_kl_route_refreshes_detached_enqueue_protection(monkeypatch
     monkeypatch.setattr(mint_routes, "_get_user_id", lambda _request: "user-a")
     monkeypatch.setattr(mint_routes, "can_bypass_ownership", lambda _request: False)
     monkeypatch.setattr(mint_routes, "_resolve_checkpoint_for_user", lambda path, **_: "/resolved/ref-step-0010")
+    monkeypatch.setattr(mint_routes, "_require_peft_adapter_checkpoint", lambda _path: None)
     monkeypatch.setattr(mint_routes, "_protect_training_session_enqueue_window", _protect_training_session_enqueue_window)
     monkeypatch.setattr(mint_routes, "_get_route_training_store_info", _get_training_route_session_info)
 
-    import tinker_server.backend.capacity_manager as capacity_module
-    import tinker_server.backend.api_work_queue as queue_module
+    import tinker_server.backend.model_work_scheduler as mws
 
-    monkeypatch.setattr(capacity_module, "capacity_manager", capacity)
-    monkeypatch.setattr(queue_module, "api_work_queue", queue)
+    monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
     monkeypatch.setattr(training_routes, "_get_max_model_len", lambda _base_model: 2048)
 
     app = FastAPI()

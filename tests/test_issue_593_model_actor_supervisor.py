@@ -288,7 +288,12 @@ def test_issue_593_supervisor_parses_desired_specs_from_env(monkeypatch: pytest.
             base_model="Qwen/Test",
             node_pins=("10.0.0.1",),
             gpu_count=4,
-        )
+        ),
+        ModelActorSpec(
+            domain_key="internal:control",
+            launcher_key="internal_control",
+            gpu_count=0,
+        ),
     ]
 
 
@@ -344,6 +349,7 @@ def test_issue_593_supervisor_falls_back_to_persistent_models(monkeypatch: pytes
         "training:Qwen/A",
         "vllm:Qwen/B",
         "training:Qwen/B",
+        "internal:control",
     ]
     assert domain_key_for_vllm_base_model("Qwen/A") == "vllm:Qwen/A"
     assert queue_id_for_replica("vllm:Qwen/A", "replica-2") == "vllm:Qwen/A::replica-2"
@@ -354,7 +360,13 @@ def test_issue_593_supervisor_empty_env_has_no_desired_specs(monkeypatch: pytest
     monkeypatch.delenv("MINT_MODEL_RUNTIME_DESIRED_JSON", raising=False)
     monkeypatch.delenv("MINT_PERSISTENT_MODELS", raising=False)
 
-    assert desired_specs_from_env() == []
+    assert desired_specs_from_env() == [
+        ModelActorSpec(
+            domain_key="internal:control",
+            launcher_key="internal_control",
+            gpu_count=0,
+        )
+    ]
 
 
 def test_issue_593_placement_reconciler_resolves_worker_and_removes_owned_orphan_pg() -> None:

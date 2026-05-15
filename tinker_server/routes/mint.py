@@ -70,6 +70,62 @@ def _get_user_id(request: Request) -> str | None:
     return _request_user_id(request)
 
 
+async def _enqueue_mint_model_work(
+    *,
+    request_id: str,
+    op: str,
+    request_json: bytes,
+    domain_key: str,
+    queued_meta: dict,
+    http_request: Request,
+    user_id: str | None,
+    affinity_group: str | None = None,
+    ordering_key: str | None = None,
+    token_cost: int = 1,
+    extra: dict | None = None,
+) -> None:
+    from ..backend.model_work_admission import enqueue_model_work
+
+    try:
+        await enqueue_model_work(
+            request_id=request_id,
+            op=op,
+            request_json=request_json,
+            user_id=user_id,
+            webhook_url=None,
+            domain_key=domain_key,
+            affinity_group=affinity_group,
+            ordering_key=ordering_key,
+            token_cost=token_cost,
+            assign=True,
+            assign_max_items=1,
+            extra=merge_queue_priority_extra(extra, request=http_request),
+            queued_meta=queued_meta,
+            future_store_client=future_store,
+        )
+    except Exception:
+        try:
+            await future_store.async_cleanup(request_id)
+        except Exception:
+            pass
+        raise
+
+
+def _validate_peft_adapter_checkpoint(path: str) -> None:
+    adapter_path = os.path.join(path, "adapter_model.safetensors")
+    if not os.path.exists(adapter_path):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Checkpoint is not a readable PEFT adapter checkpoint: missing {adapter_path}",
+        )
+    config_path = os.path.join(path, "adapter_config.json")
+    if not os.path.exists(config_path):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Checkpoint is not a readable PEFT adapter checkpoint: missing {config_path}",
+        )
+
+
 def _resolve_checkpoint_for_user(
     path: str,
     *,
@@ -104,19 +160,7 @@ def _resolve_checkpoint_for_request(path: str, request: Request, *, owner_id: st
     )
 
 
-def _require_peft_adapter_checkpoint(path: str) -> None:
-    adapter_path = os.path.join(path, "adapter_model.safetensors")
-    if not os.path.exists(adapter_path):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Checkpoint is not a readable PEFT adapter checkpoint: missing {adapter_path}",
-        )
-    config_path = os.path.join(path, "adapter_config.json")
-    if not os.path.exists(config_path):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Checkpoint is not a readable PEFT adapter checkpoint: missing {config_path}",
-        )
+_require_peft_adapter_checkpoint = _validate_peft_adapter_checkpoint
 
 
 def _infer_base_model_from_checkpoint_for_request(
@@ -303,10 +347,6 @@ async def act(
     if action_session_manager is None:
         raise HTTPException(status_code=503, detail="Action session manager not initialized")
 
-    from ..backend.api_work_queue import api_work_queue
-    from ..backend.capacity_manager import capacity_manager
-    from ..backend.result_size_estimator import estimate_small_result_bytes
-
     queued_request = ActRequest(
         action_session_id=action_session_id,
         seq_id=request.seq_id,
@@ -316,36 +356,24 @@ async def act(
     )
     request_json = queued_request.model_dump_json().encode("utf-8")
     request_id = f"act_{uuid.uuid4().hex}"
-    reserve = await capacity_manager.async_try_reserve(
-        request_id,
-        queue_bytes=len(request_json),
-        object_store_bytes=estimate_small_result_bytes(),
-    )
-    if not bool(reserve.get("ok")):
-        raise HTTPException(
-            status_code=429,
-            detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
-        )
-
-    created = False
     try:
-        await future_store.async_create_with_id(request_id)
-        created = True
-        await future_store.async_mark_queued(
-            request_id,
-            meta={"op": "mint.action.act", "action_session_id": action_session_id},
-        )
-        await api_work_queue.enqueue(
+        from ..backend.model_actor_supervisor import domain_key_for_internal_control
+
+        await _enqueue_mint_model_work(
             request_id=request_id,
             op="mint.action.act",
             request_json=request_json,
+            domain_key=domain_key_for_internal_control(),
+            affinity_group=f"action_session:{action_session_id}",
+            ordering_key=f"action_session:{action_session_id}",
+            queued_meta=_build_mint_future_meta(
+                op="mint.action.act",
+                extra={"action_session_id": action_session_id},
+            ),
+            http_request=http_request,
             user_id=_get_user_id(http_request),
-            webhook_url=None,
         )
     except Exception as e:
-        await capacity_manager.async_release_all(request_id)
-        if created:
-            await future_store.async_cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue action act request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)
@@ -387,24 +415,9 @@ async def vla_train_step(
         )
 
     user_id = _get_user_id(http_request)
-    from ..backend.api_work_queue import api_work_queue
-    from ..backend.capacity_manager import capacity_manager
-    from ..backend.result_size_estimator import estimate_small_result_bytes
-
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
-    reserve = await capacity_manager.async_try_reserve(
-        request_id,
-        queue_bytes=len(request_json),
-        object_store_bytes=estimate_small_result_bytes(),
-    )
-    if not bool(reserve.get("ok")):
-        raise HTTPException(
-            status_code=429,
-            detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
-        )
 
-    created = False
     inflight_marked = False
     try:
         if training_manager is not None:
@@ -416,12 +429,11 @@ async def vla_train_step(
             training_op="train_step",
             seq_id=request.seq_id,
         )
-        await future_store.async_create_with_id(request_id)
-        created = True
-        await future_store.async_mark_queued(
-            request_id,
-            meta={"op": "mint.vla.train_step", "model_id": request.model_id},
-        )
+        domain_key = str(scheduler_extra.get("scheduler_domain") or "")
+        if not domain_key:
+            from ..backend.model_actor_supervisor import domain_key_for_training_base_model
+
+            domain_key = domain_key_for_training_base_model(base_model)
         await training_routes._enqueue_training_request_with_trace(
             route_start_s=route_start_s,
             request_id=request_id,
@@ -429,21 +441,26 @@ async def vla_train_step(
             model_id=request.model_id,
             base_model=base_model,
             backend=backend,
-            enqueue_coro=api_work_queue.enqueue(
+            enqueue_coro=_enqueue_mint_model_work(
                 request_id=request_id,
                 op="mint.vla.train_step",
                 request_json=request_json,
+                domain_key=domain_key,
+                affinity_group=f"training_session:{request.model_id}",
+                ordering_key=f"training_session:{request.model_id}",
+                queued_meta=_build_mint_future_meta(
+                    op="mint.vla.train_step",
+                    model_id=request.model_id,
+                    session_info=session if isinstance(session, dict) else None,
+                ),
+                http_request=http_request,
                 user_id=user_id,
-                webhook_url=None,
                 extra=scheduler_extra,
             ),
         )
     except Exception as e:
         if inflight_marked and training_manager is not None:
             training_manager.mark_inflight(request.model_id, -1)
-        await capacity_manager.async_release_all(request_id)
-        if created:
-            await future_store.async_cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue VLA train_step request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)
@@ -524,49 +541,29 @@ async def interpolate_checkpoints(
     for source_path in resolved_sources:
         _require_peft_adapter_checkpoint(source_path)
     request = request.model_copy(update={"source_paths": resolved_sources})
-    from ..backend.api_work_queue import api_work_queue
-    from ..backend.capacity_manager import capacity_manager
-    from ..backend.result_size_estimator import estimate_small_result_bytes
-
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
-    reserve = await capacity_manager.async_try_reserve(
-        request_id,
-        queue_bytes=len(request_json),
-        object_store_bytes=estimate_small_result_bytes(),
-    )
-    if not bool(reserve.get("ok")):
-        raise HTTPException(
-            status_code=429,
-            detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
-        )
-
-    created = False
     try:
-        await future_store.async_create_with_id(request_id)
-        created = True
-        await future_store.async_mark_queued(
-            request_id,
-            meta=_build_mint_future_meta(
+        from ..backend.model_actor_supervisor import domain_key_for_internal_control
+
+        await _enqueue_mint_model_work(
+            request_id=request_id,
+            op="mint.interpolate_checkpoints",
+            request_json=request_json,
+            domain_key=domain_key_for_internal_control(),
+            affinity_group="mint:checkpoint",
+            ordering_key=None,
+            queued_meta=_build_mint_future_meta(
                 op="mint.interpolate_checkpoints",
                 extra={
                     "checkpoint_count": len(request.source_paths),
                     "output_path": request.output_path,
                 },
             ),
-        )
-        await api_work_queue.enqueue(
-            request_id=request_id,
-            op="mint.interpolate_checkpoints",
-            request_json=request_json,
+            http_request=http_request,
             user_id=user_id,
-            webhook_url=None,
-            extra=merge_queue_priority_extra(request=http_request),
         )
     except Exception as e:
-        await capacity_manager.async_release_all(request_id)
-        if created:
-            await future_store.async_cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue interpolate_checkpoints request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)
@@ -706,47 +703,27 @@ async def forward_backward_reverse_kl(
     _require_peft_adapter_checkpoint(resolved_reference_path)
     request = request.model_copy(update={"reference_model_path": resolved_reference_path})
 
-    from ..backend.api_work_queue import api_work_queue
-    from ..backend.capacity_manager import capacity_manager
-    from ..backend.result_size_estimator import estimate_small_result_bytes
-
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
-    reserve = await capacity_manager.async_try_reserve(
-        request_id,
-        queue_bytes=len(request_json),
-        object_store_bytes=estimate_small_result_bytes(),
-    )
-    if not bool(reserve.get("ok")):
-        raise HTTPException(
-            status_code=429,
-            detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
-        )
-
-    created = False
     try:
-        await future_store.async_create_with_id(request_id)
-        created = True
-        await future_store.async_mark_queued(
-            request_id,
-            meta=_build_mint_future_meta(
+        from ..backend.model_actor_supervisor import domain_key_for_training_base_model
+
+        await _enqueue_mint_model_work(
+            request_id=request_id,
+            op="mint.forward_backward_reverse_kl",
+            request_json=request_json,
+            domain_key=domain_key_for_training_base_model(base_model),
+            affinity_group=f"training_session:{request.model_id}",
+            ordering_key=f"training_session:{request.model_id}",
+            queued_meta=_build_mint_future_meta(
                 op="mint.forward_backward_reverse_kl",
                 model_id=request.model_id,
                 session_info=info,
             ),
-        )
-        await api_work_queue.enqueue(
-            request_id=request_id,
-            op="mint.forward_backward_reverse_kl",
-            request_json=request_json,
+            http_request=http_request,
             user_id=user_id,
-            webhook_url=None,
-            extra=merge_queue_priority_extra(request=http_request),
         )
     except Exception as e:
-        await capacity_manager.async_release_all(request_id)
-        if created:
-            await future_store.async_cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue forward_backward_reverse_kl request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)

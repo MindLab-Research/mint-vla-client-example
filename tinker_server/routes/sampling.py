@@ -22,6 +22,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 
 from ..config import config as server_config
 from ..backend.future_store import FutureStatus, FutureStoreUnavailableError, future_store
+from ..backend.model_work_admission import enqueue_model_work
 from ..gateway_auth import GatewayAuthContext, build_billing_auth_context
 from ..logging_context import (
     classify_failure_reason,
@@ -624,11 +625,6 @@ def _payload_hash(payload: bytes) -> str:
     return hashlib.blake2b(payload, digest_size=16).hexdigest()
 
 
-def _model_work_scheduler_asample_enabled() -> bool:
-    value = str(os.environ.get("MINT_MODEL_WORK_SCHEDULER_ASAMPLE", "1")).strip().lower()
-    return value not in ("0", "false", "no", "n", "off")
-
-
 def _model_work_domain_key(base_model: str) -> str:
     return f"vllm:{str(base_model).strip()}"
 
@@ -956,20 +952,6 @@ async def _persist_usage_events(*, auth_ctx: GatewayAuthContext, events: list[Us
     schedule_usage_events(events)
 
 
-async def _cancel_scheduler_request_if_confirmed(request_id: str, *, confirmed: bool) -> None:
-    if not confirmed:
-        return
-    try:
-        from ..backend.model_work_scheduler import model_work_scheduler
-
-        await model_work_scheduler.cancel_request(
-            request_id=request_id,
-            reason="asample_enqueue_failed",
-        )
-    except Exception:
-        pass
-
-
 @router.post("/asample")
 async def asample(
     request: SampleRequest,
@@ -1096,8 +1078,6 @@ async def asample(
         )
         raise HTTPException(status_code=429, detail="Sampling backpressure: server overloaded")
     user_id = _get_user_id(http_request)
-    from ..backend.api_work_queue import ApiWorkQueueThrottleError, _unwrap_queue_throttle_error, api_work_queue
-
     request_json = request.model_dump_json().encode("utf-8")
     payload_hash = _payload_hash(request_json)
     if request.seq_id is not None:
@@ -1112,12 +1092,11 @@ async def asample(
     created_pending = False
     model_work_attempt_id = uuid.uuid4().hex
     base_model = snapshot.base_model if snapshot is not None else None
-    use_model_work_scheduler = (
-        _model_work_scheduler_asample_enabled()
-        and snapshot is not None
-        and bool(snapshot.uses_multi_lora)
-        and bool(base_model)
-    )
+    if snapshot is None or not base_model:
+        snapshot = _get_sampling_snapshot(session_id)
+        base_model = snapshot.base_model if snapshot is not None else None
+    if snapshot is None or not base_model:
+        raise HTTPException(status_code=404, detail=f"Sampling session {session_id!r} not found")
 
     # Set request_id in context for logging
     set_request_id(request_id)
@@ -1163,188 +1142,90 @@ async def asample(
                 )
             return UntypedAPIFuture(request_id=request_id)
 
-    if not use_model_work_scheduler:
-        from ..backend.capacity_manager import capacity_manager
-        from ..backend.result_size_estimator import estimate_sampling_result_bytes
-
-        reserve = await capacity_manager.async_try_reserve(
-            request_id,
-            queue_bytes=len(request_json),
-            object_store_bytes=estimate_sampling_result_bytes(request),
-        )
-        if not bool(reserve.get("ok")):
-            if created_pending:
-                try:
-                    await future_store.async_forget(request_id)
-                except FutureStoreUnavailableError:
-                    raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
-            record_sampling_admission_metric(
-                route=_ASAMPLE_ROUTE,
-                decision="rejected",
-                reason="capacity_rejected",
-            )
-            raise HTTPException(
-                status_code=429,
-                detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
-            )
-
-    created = False
-    model_work_scheduler_append_confirmed = False
+    created_by_admission = False
+    scheduler_append_confirmed = False
     try:
-        if not created_pending:
-            await future_store.async_create_with_id(request_id)
-            created = True
-        domain_key = _model_work_domain_key(str(base_model)) if use_model_work_scheduler else None
-        affinity_group = _model_work_affinity_group(snapshot) if use_model_work_scheduler else None
-        ordering_key = f"session:{session_id}" if use_model_work_scheduler else None
+        domain_key = _model_work_domain_key(str(base_model))
+        affinity_group = _model_work_affinity_group(snapshot)
+        ordering_key = f"session:{session_id}"
         queued_meta = {
             "op": "sampling.asample",
             "sampling_session_id": str(session_id),
             "queue_state": "queued",
             "queued_at": time.time(),
             "stage": "queued",
+            "queue_kind": "model_work_scheduler",
+            "domain_key": domain_key,
+            "affinity_group": affinity_group,
+            "ordering_key": ordering_key,
+            "model_work_attempt_id": model_work_attempt_id,
         }
-        if use_model_work_scheduler:
-            queued_meta.update(
-                {
-                    "queue_kind": "model_work_scheduler",
-                    "domain_key": domain_key,
-                    "affinity_group": affinity_group,
-                    "ordering_key": ordering_key,
-                    "model_work_attempt_id": model_work_attempt_id,
-                }
-            )
-        await future_store.async_mark_queued(
-            request_id,
-            meta=queued_meta,
-        )
         enqueue_extra = merge_queue_priority_extra(
             {"gateway_auth": billing_auth.__dict__} if billing_auth is not None else None,
             request=http_request,
         )
-        if use_model_work_scheduler:
-            from ..backend.model_work_scheduler import model_work_scheduler
-
-            enqueue_out = await _enqueue_sampling_request_with_trace(
-                route_start_s=route_start_s,
-                request_id=request_id,
-                op="sampling.asample",
-                session_id=session_id,
-                base_model=base_model,
-                enqueue_coro=model_work_scheduler.append(
-                    request_id=request_id,
-                    op="sampling.asample",
-                    request_json=request_json,
-                    user_id=user_id,
-                    apikey_id=apikey_id,
-                    throttle_principal=throttle_principal,
-                    webhook_url=None,
-                    domain_key=domain_key,
-                    affinity_group=affinity_group,
-                    ordering_key=ordering_key,
-                    token_cost=max(
-                        1,
-                        int(request.sampling_params.max_tokens) * int(request.num_samples),
-                    ),
-                    assign=True,
-                    assign_max_items=1,
-                    extra={
-                        **enqueue_extra,
-                        "model_work_scheduler": True,
-                        "domain_key": domain_key,
-                        "affinity_group": affinity_group,
-                        "model_work_attempt_id": model_work_attempt_id,
-                    },
-                ),
-            )
-            if isinstance(enqueue_out, dict) and bool(enqueue_out.get("ok")):
-                model_work_scheduler_append_confirmed = True
-            if isinstance(enqueue_out, dict) and enqueue_out.get("scheduler_instance_id"):
-                await future_store.async_update_meta(
-                    request_id,
-                    {
-                        "model_work_scheduler_instance_id": str(
-                            enqueue_out["scheduler_instance_id"]
-                        ),
-                        "model_work_attempt_id": model_work_attempt_id,
-                    },
-                )
-        else:
-            await _enqueue_sampling_request_with_trace(
-                route_start_s=route_start_s,
-                request_id=request_id,
-                op="sampling.asample",
-                session_id=session_id,
-                base_model=base_model,
-                enqueue_coro=api_work_queue.enqueue(
-                    request_id=request_id,
-                    op="sampling.asample",
-                    request_json=request_json,
-                    user_id=user_id,
-                    apikey_id=apikey_id,
-                    throttle_principal=throttle_principal,
-                    webhook_url=None,
-                    extra=enqueue_extra,
-                ),
-            )
-    except ApiWorkQueueThrottleError as e:
-        if use_model_work_scheduler:
-            await _cancel_scheduler_request_if_confirmed(request_id, confirmed=model_work_scheduler_append_confirmed)
-        else:
-            from ..backend.capacity_manager import capacity_manager
-
-            await capacity_manager.async_release_all(request_id)
-        if created_pending:
-            try:
-                await future_store.async_forget(request_id)
-            except FutureStoreUnavailableError:
-                raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
-        elif created:
-            await future_store.async_cleanup(request_id)
-        detail = e.detail if isinstance(e.detail, dict) else {}
-        record_sampling_admission_metric(
-            route=_ASAMPLE_ROUTE,
-            decision="rejected",
-            reason="queue_throttled",
-            scope=detail.get("scope") if isinstance(detail, dict) else None,
+        admission = await enqueue_model_work(
+            request_id=request_id,
+            op="sampling.asample",
+            request_json=request_json,
+            user_id=user_id,
+            apikey_id=apikey_id,
+            throttle_principal=throttle_principal,
+            webhook_url=None,
+            domain_key=domain_key,
+            affinity_group=affinity_group,
+            ordering_key=ordering_key,
+            token_cost=max(
+                1,
+                int(request.sampling_params.max_tokens) * int(request.num_samples),
+            ),
+            assign=True,
+            assign_max_items=1,
+            extra={
+                **enqueue_extra,
+                "model_work_attempt_id": model_work_attempt_id,
+            },
+            queued_meta=queued_meta,
+            create_future=not created_pending,
+            payload_hash=payload_hash,
+            future_store_client=future_store,
+            trace_enqueue=_enqueue_sampling_request_with_trace,
+            trace_kwargs={
+                "route_start_s": route_start_s,
+                "session_id": session_id,
+                "base_model": base_model,
+            },
         )
-        raise HTTPException(status_code=429, detail=e.detail) from e
-    except Exception as e:
-        throttle_error = _unwrap_queue_throttle_error(e)
-        if throttle_error is not None:
-            if use_model_work_scheduler:
-                await _cancel_scheduler_request_if_confirmed(request_id, confirmed=model_work_scheduler_append_confirmed)
-            else:
-                from ..backend.capacity_manager import capacity_manager
-
-                await capacity_manager.async_release_all(request_id)
-            if created_pending:
-                try:
-                    await future_store.async_forget(request_id)
-                except FutureStoreUnavailableError:
-                    raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
-            elif created:
-                await future_store.async_cleanup(request_id)
-            detail = throttle_error.detail if isinstance(throttle_error.detail, dict) else {}
-            record_sampling_admission_metric(
-                route=_ASAMPLE_ROUTE,
-                decision="rejected",
-                reason="queue_throttled",
-                scope=detail.get("scope") if isinstance(detail, dict) else None,
+        scheduler_result = admission.scheduler_result
+        scheduler_append_confirmed = bool(scheduler_result.get("ok"))
+        created_by_admission = not created_pending
+        if scheduler_result.get("scheduler_instance_id"):
+            await future_store.async_update_meta(
+                request_id,
+                {
+                    "model_work_scheduler_instance_id": str(
+                        scheduler_result["scheduler_instance_id"]
+                    ),
+                    "model_work_attempt_id": model_work_attempt_id,
+                },
             )
-            raise HTTPException(status_code=429, detail=throttle_error.detail) from e
-        if use_model_work_scheduler:
-            await _cancel_scheduler_request_if_confirmed(request_id, confirmed=model_work_scheduler_append_confirmed)
-        else:
-            from ..backend.capacity_manager import capacity_manager
+    except Exception as e:
+        if scheduler_append_confirmed:
+            try:
+                from ..backend.model_work_scheduler import model_work_scheduler
 
-            await capacity_manager.async_release_all(request_id)
+                await model_work_scheduler.cancel_request(
+                    request_id=request_id,
+                    reason="asample_enqueue_failed",
+                )
+            except Exception:
+                pass
         if created_pending:
             try:
                 await future_store.async_forget(request_id)
             except FutureStoreUnavailableError:
                 raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
-        elif created:
+        elif created_by_admission:
             await future_store.async_cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue sampling request: {e}")
 

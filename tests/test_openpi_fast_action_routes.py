@@ -158,6 +158,18 @@ class _StubQueue:
         )
 
 
+class _StubModelWorkScheduler:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def append(self, **kwargs) -> dict[str, object]:
+        self.calls.append(dict(kwargs))
+        return {"ok": True, "scheduler_instance_id": "scheduler-action"}
+
+    async def cancel_request(self, **kwargs) -> dict[str, object]:
+        return {"ok": True, **dict(kwargs)}
+
+
 def test_create_action_session_route_resolves_checkpoint_path_before_manager(monkeypatch) -> None:
     from tinker_server.routes import mint as mint_routes
 
@@ -478,17 +490,14 @@ def test_mint_action_route_enqueues_expected_request(monkeypatch) -> None:
     from tinker_server.routes import mint as mint_routes
 
     future_store = _AsyncFakeFutureStore()
-    capacity = _StubCapacityManager()
-    queue = _StubQueue()
+    scheduler = _StubModelWorkScheduler()
 
     monkeypatch.setattr(mint_routes, "future_store", future_store, raising=False)
     monkeypatch.setattr(mint_routes, "action_session_manager", object(), raising=False)
 
-    import tinker_server.backend.capacity_manager as capacity_module
-    import tinker_server.backend.api_work_queue as queue_module
+    import tinker_server.backend.model_work_scheduler as mws
 
-    monkeypatch.setattr(capacity_module, "capacity_manager", capacity)
-    monkeypatch.setattr(queue_module, "api_work_queue", queue)
+    monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
 
     app = FastAPI()
     app.include_router(mint_routes.router, prefix="/api/v1/mint")
@@ -524,18 +533,18 @@ def test_mint_action_route_enqueues_expected_request(monkeypatch) -> None:
     assert resp.status_code == 200, resp.text
     request_id = resp.json()["request_id"]
     assert future_store.created == [request_id]
-    assert future_store.queued == [
-        (
-            request_id,
-            {"op": "mint.action.act", "action_session_id": "action-session-1"},
-        )
-    ]
-    assert len(capacity.calls) == 1
-    assert len(queue.calls) == 1
-    queued = queue.calls[0]
+    queued_request_id, queued_meta = future_store.queued[0]
+    assert queued_request_id == request_id
+    assert queued_meta["op"] == "mint.action.act"
+    assert queued_meta["action_session_id"] == "action-session-1"
+    assert queued_meta["queue_state"] == "queued"
+    assert len(scheduler.calls) == 1
+    queued = scheduler.calls[0]
     assert queued["op"] == "mint.action.act"
-    assert queued["request_json"]["action_session_id"] == "action-session-1"
-    assert queued["request_json"]["extra_inputs"]["state"]["shape"] == [8]
+    assert queued["domain_key"] == "internal:control"
+    request_json = json.loads(queued["request_json"].decode("utf-8"))
+    assert request_json["action_session_id"] == "action-session-1"
+    assert request_json["extra_inputs"]["state"]["shape"] == [8]
 
 
 def test_legacy_action_public_routes_are_not_exposed(monkeypatch) -> None:

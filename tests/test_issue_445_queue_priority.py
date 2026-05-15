@@ -46,6 +46,9 @@ class _StubFutureStore:
     async def async_mark_queued(self, _request_id: str, meta: dict | None = None) -> None:
         _ = meta
 
+    async def async_update_meta(self, _request_id: str, meta: dict | None = None) -> None:
+        _ = meta
+
     async def async_ensure_pending(self, request_id: str, meta: dict | None = None) -> dict:
         _ = (request_id, meta)
         return {"created": True, "meta": None}
@@ -307,11 +310,9 @@ def test_issue_445_actor_keeps_training_scheduler_behavior_within_priority_tier(
 
 @pytest.mark.anyio
 async def test_issue_445_asample_enqueues_normalized_priority(monkeypatch):
-    import tinker_server.backend.api_work_queue as awq
-    import tinker_server.backend.capacity_manager as cm
-    import tinker_server.backend.result_size_estimator as rse
+    import tinker_server.backend.model_work_scheduler as mws
 
-    queue = _CaptureQueue()
+    scheduler = _CaptureModelWorkScheduler()
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
     monkeypatch.setattr(sampling_route, "future_store", _StubFutureStore())
     monkeypatch.setattr(sampling_route, "record_sampling_admission_metric", lambda **_kwargs: None)
@@ -319,9 +320,7 @@ async def test_issue_445_asample_enqueues_normalized_priority(monkeypatch):
         return None
 
     monkeypatch.setattr(sampling_route, "_async_get_detached_sampling_snapshot", _no_snapshot)
-    monkeypatch.setattr(awq, "api_work_queue", queue)
-    monkeypatch.setattr(cm, "capacity_manager", _StubCapacityManager())
-    monkeypatch.setattr(rse, "estimate_sampling_result_bytes", lambda _req: 0)
+    monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
 
     req = SampleRequest(
         sampling_session_id="sess",
@@ -337,32 +336,28 @@ async def test_issue_445_asample_enqueues_normalized_priority(monkeypatch):
 
     await sampling_route.asample(req, cast(Request, http_request))
 
-    assert queue.calls
-    assert queue.calls[0]["extra"]["queue_priority"] == 2
+    assert scheduler.calls
+    assert scheduler.calls[0]["extra"]["queue_priority"] == 2
 
 
 @pytest.mark.anyio
 async def test_issue_445_internal_noop_enqueues_normalized_priority(monkeypatch):
     import importlib
 
-    import tinker_server.backend.api_work_queue as awq
-    import tinker_server.backend.capacity_manager as cm
-    import tinker_server.backend.result_size_estimator as rse
+    import tinker_server.backend.model_work_scheduler as mws
 
     future_store_module = importlib.import_module("tinker_server.backend.future_store")
 
-    queue = _CaptureQueue()
-    monkeypatch.setattr(awq, "api_work_queue", queue)
-    monkeypatch.setattr(cm, "capacity_manager", _StubCapacityManager())
+    scheduler = _CaptureModelWorkScheduler()
+    monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
     monkeypatch.setattr(future_store_module, "future_store", _StubFutureStore())
-    monkeypatch.setattr(rse, "estimate_small_result_bytes", lambda: 0)
 
     http_request = _DummyRequest(headers={"X-MinT-Priority": "9"})
 
     await internal_route.work_queue_noop(cast(Request, http_request))
 
-    assert queue.calls
-    assert queue.calls[0]["extra"]["queue_priority"] == 2
+    assert scheduler.calls
+    assert scheduler.calls[0]["extra"]["queue_priority"] == 2
 
 
 @pytest.mark.anyio

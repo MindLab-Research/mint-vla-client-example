@@ -79,6 +79,10 @@ def domain_key_for_training_base_model(base_model: str) -> str:
     return f"training:{model}"
 
 
+def domain_key_for_internal_control() -> str:
+    return "internal:control"
+
+
 def default_model_actor_name(domain_key: str, replica_id: str) -> str:
     raw = f"mint_model_actor_{domain_key}_{replica_id}"
     return re.sub(r"[^A-Za-z0-9_.-]+", "-", raw).strip("-")
@@ -187,6 +191,22 @@ def _spec_from_obj(obj: Any) -> ModelActorSpec:
 
 
 def desired_specs_from_env() -> list[ModelActorSpec]:
+    def _with_internal_control(specs: list[ModelActorSpec]) -> list[ModelActorSpec]:
+        enabled = str(os.environ.get("MINT_MODEL_ACTOR_INTERNAL_CONTROL", "1")).strip().lower()
+        if enabled in ("0", "false", "no", "n", "off"):
+            return specs
+        domain_key = domain_key_for_internal_control()
+        if any(spec.domain_key == domain_key for spec in specs):
+            return specs
+        return [
+            *specs,
+            ModelActorSpec(
+                domain_key=domain_key,
+                launcher_key="internal_control",
+                gpu_count=0,
+            ),
+        ]
+
     raw = os.environ.get("MINT_MODEL_ACTOR_DESIRED_JSON", "").strip()
     if raw:
         payload = json.loads(raw)
@@ -196,7 +216,7 @@ def desired_specs_from_env() -> list[ModelActorSpec]:
             items = payload
         if not isinstance(items, list):
             raise ValueError("MINT_MODEL_ACTOR_DESIRED_JSON must be a list or contain models/actors/items")
-        return [_spec_from_obj(item) for item in items]
+        return _with_internal_control([_spec_from_obj(item) for item in items])
 
     legacy_raw = os.environ.get("MINT_MODEL_RUNTIME_DESIRED_JSON", "").strip()
     if legacy_raw:
@@ -207,11 +227,11 @@ def desired_specs_from_env() -> list[ModelActorSpec]:
             items = payload
         if not isinstance(items, list):
             raise ValueError("MINT_MODEL_RUNTIME_DESIRED_JSON must be a list or contain models/runtimes/items")
-        return [_spec_from_obj(item) for item in items]
+        return _with_internal_control([_spec_from_obj(item) for item in items])
 
     persistent = os.environ.get("MINT_PERSISTENT_MODELS", "").strip()
     if not persistent:
-        return []
+        return _with_internal_control([])
     specs: list[ModelActorSpec] = []
     for model in (item.strip() for item in persistent.split(",")):
         if not model:
@@ -224,7 +244,7 @@ def desired_specs_from_env() -> list[ModelActorSpec]:
                 launcher_key="training",
             )
         )
-    return specs
+    return _with_internal_control(specs)
 
 
 async def _maybe_await(value: Any) -> Any:
