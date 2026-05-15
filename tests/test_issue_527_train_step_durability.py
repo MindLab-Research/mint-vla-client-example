@@ -159,3 +159,89 @@ def test_trusted_pair_stale_blocks_when_not_live_continuation() -> None:
         group._validate_trusted_pair_for_request("session-a", op="forward_backward")
 
     assert group._blocked_sessions["session-a"] == "external_checkpoint_stale:optim_step"
+
+
+def test_training_op_restores_cached_session_before_stale_pair_check() -> None:
+    group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
+    group = object.__new__(group_cls)
+
+    group._current_session = "session-b"
+    group._session_unknown_due_to_partial_swap = False
+    group._blocked_sessions = {}
+    group._contaminated_sessions = {}
+    group._bind_traceparent = MethodType(lambda self, traceparent: None, group)
+    group._resolve_required_session_id = MethodType(lambda self, session_id, op: session_id, group)
+    group._session_state_cached_on_workers = MethodType(
+        lambda self, session_id: self._current_session == session_id,
+        group,
+    )
+
+    ensure_calls: list[str] = []
+
+    def _ensure_session_loaded(
+        self,
+        session_id,
+        traceparent=None,
+        actual_rank=None,
+        train_attn=None,
+        train_mlp=None,
+        train_unembed=None,
+    ):
+        ensure_calls.append(session_id)
+        self._current_session = session_id
+        return {"switched": True}
+
+    group._ensure_session_loaded = MethodType(_ensure_session_loaded, group)
+    group._session_manager = SimpleNamespace(
+        session_exists=lambda session_id: session_id == "session-a",
+        get_external_checkpoint=lambda session_id: {
+            "is_fresh": False,
+            "invalidated_reason": "forward_backward",
+            "checkpoint_identity": "id-a",
+        },
+        get_trusted_recovery_baseline=lambda session_id: {
+            "is_fresh": False,
+            "invalidated_reason": "forward_backward",
+            "checkpoint_identity": "id-a",
+        },
+    )
+
+    effective_session_id, switch_stats = group._ensure_session_for_request(
+        op="optim_step",
+        session_id="session-a",
+    )
+
+    assert effective_session_id == "session-a"
+    assert switch_stats == {"switched": True}
+    assert ensure_calls == ["session-a"]
+    assert group._blocked_sessions == {}
+
+
+def test_training_op_does_not_reinit_missing_session_with_stale_pair() -> None:
+    group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
+    group = object.__new__(group_cls)
+
+    group._current_session = "session-b"
+    group._session_unknown_due_to_partial_swap = False
+    group._blocked_sessions = {}
+    group._contaminated_sessions = {}
+    group._resolve_required_session_id = MethodType(lambda self, session_id, op: session_id, group)
+    group._session_state_cached_on_workers = MethodType(lambda self, session_id: False, group)
+    group._ensure_session_loaded = MethodType(
+        lambda self, *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not reinitialize")),
+        group,
+    )
+    group._session_manager = SimpleNamespace(
+        session_exists=lambda session_id: False,
+        get_external_checkpoint=lambda session_id: {
+            "is_fresh": False,
+            "invalidated_reason": "forward_backward",
+            "checkpoint_identity": "id-a",
+        },
+        get_trusted_recovery_baseline=lambda session_id: None,
+    )
+
+    with pytest.raises(RuntimeError, match="external checkpoint stale"):
+        group._ensure_session_for_request(op="optim_step", session_id="session-a")
+
+    assert group._blocked_sessions["session-a"] == "external_checkpoint_stale:forward_backward"
