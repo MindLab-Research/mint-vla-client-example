@@ -220,8 +220,6 @@ def actor_runtime_env_vars(
     config_actor_name = _env_nonempty(os.environ, "MINT_CONFIG_ACTOR_NAME")
     if config_actor_name is not None:
         out["MINT_CONFIG_ACTOR_NAME"] = config_actor_name
-    if include_config_snapshot:
-        out["MINT_CONFIG_ACTOR_HYDRATE"] = "1"
     config_path = _env_nonempty(os.environ, "TINKER_CONFIG_PATH")
     if config_path is not None:
         out["TINKER_CONFIG_PATH"] = config_path
@@ -244,6 +242,8 @@ def actor_runtime_env_vars(
         out["MINT_RAY_NAMESPACE"] = mint_ray_namespace
     if extra:
         out.update(extra)
+    if include_config_snapshot:
+        out["MINT_CONFIG_ACTOR_HYDRATE"] = "1"
     return out
 
 def _runtime_env_value_is_uri(value: str) -> bool:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -213,6 +214,40 @@ def test_config_actor_options_are_detached_namespace_local(monkeypatch) -> None:
             "MINT_CONFIG_ACTOR_SELF": "1",
         }
     }
+
+
+def test_actor_runtime_env_hydration_flag_is_default_and_not_extra_overridable(monkeypatch) -> None:
+    from tinker_server import config as server_config
+
+    monkeypatch.setattr(server_config, "PFS_RUNTIME_ENV_ROOT", "/runtime")
+    monkeypatch.setattr(server_config, "PFS_TINKER_PATH", "/repo")
+    monkeypatch.setattr(server_config, "PFS_HF_MODULES_PATH", "/hf")
+    monkeypatch.setattr(server_config, "RAY_NAMESPACE", "mint-test")
+    monkeypatch.setenv("RAY_ADDRESS", "ray://127.0.0.1:10001")
+
+    env_vars = server_config.actor_runtime_env_vars(
+        pythonpath="/runtime/pythonpath",
+        extra={"MINT_CONFIG_ACTOR_HYDRATE": "0"},
+    )
+
+    assert env_vars["MINT_CONFIG_ACTOR_HYDRATE"] == "1"
+
+
+def test_only_config_actor_disables_config_actor_hydration() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    matches: list[tuple[str, str]] = []
+    for path in sorted((repo_root / "tinker_server").rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            if "include_config_snapshot=False" in line:
+                matches.append((str(path.relative_to(repo_root)), line.strip()))
+
+    assert matches == [
+        (
+            "tinker_server/backend/config_actor.py",
+            "include_config_snapshot=False,",
+        )
+    ]
 
 
 def test_config_hydration_applies_actor_env_once(monkeypatch) -> None:
