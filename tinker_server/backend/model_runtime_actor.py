@@ -160,8 +160,6 @@ async def _default_executor(lease: dict[str, Any]) -> None:
     if not isinstance(item, dict):
         raise RuntimeError(f"model work lease missing item: {lease!r}")
     op = str(item.get("op") or "")
-    if op != "sampling.asample":
-        raise RuntimeError(f"unsupported model work op: {op!r}")
     from .api_work_queue_dispatch import execute_work_item
     from .api_work_queue import WorkItem
 
