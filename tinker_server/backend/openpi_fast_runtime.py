@@ -266,11 +266,8 @@ class OpenPIFastWorkerClient:
                     ) from exc
                 if message.get("id") == request_id:
                     break
-                logger.warning(
-                    "Discarding stale OpenPI worker reply for op=%s expected_id=%s got_id=%s",
-                    op,
-                    request_id,
-                    message.get("id"),
+                raise OpenPIFastWorkerProtocolError(
+                    f"worker reply id mismatch for op {op!r}: expected {request_id!r}, got {message.get('id')!r}"
                 )
             if message.get("ok") is not True:
                 error = message.get("error") or {}

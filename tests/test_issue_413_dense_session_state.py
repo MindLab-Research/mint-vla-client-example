@@ -27,7 +27,15 @@ class _RemoteMethod:
         self._fn = fn
 
     def remote(self, *args, **kwargs):
-        return self._fn(*args, **kwargs)
+        result = self._fn(*args, **kwargs)
+
+        class _DoneRef:
+            def future(self):
+                fut = asyncio.get_running_loop().create_future()
+                fut.set_result(result)
+                return fut
+
+        return _DoneRef()
 
 
 class _DeletingWorker:
@@ -37,7 +45,7 @@ class _DeletingWorker:
         self.delete_session = _RemoteMethod(self._delete_session)
         self.shutdown = _RemoteMethod(lambda: None)
 
-    def _delete_session(self, session_id: str):
+    def _delete_session(self, session_id: str, **_kwargs):
         self.delete_calls.append(session_id)
         return self._delete_fn(session_id)
 
