@@ -153,8 +153,27 @@ def _patch_flash_attn_metadata_version() -> None:
         logger.warning("Failed to patch flash-attn metadata version: %s", exc)
 
 
-def _megatron_attention_backend() -> str:
+def _patch_flash_attn_interface_compat() -> None:
+    """Expose flash-attn v2 names when the image ships older unpadded aliases."""
+    try:
+        from flash_attn import flash_attn_interface
+
+        if (
+            not hasattr(flash_attn_interface, "flash_attn_varlen_func")
+            and hasattr(flash_attn_interface, "flash_attn_unpadded_func")
+        ):
+            flash_attn_interface.flash_attn_varlen_func = flash_attn_interface.flash_attn_unpadded_func
+    except Exception as exc:
+        logger.warning("Failed to patch flash-attn interface compatibility: %s", exc)
+
+
+def _patch_flash_attn_compat() -> None:
     _patch_flash_attn_metadata_version()
+    _patch_flash_attn_interface_compat()
+
+
+def _megatron_attention_backend() -> str:
+    _patch_flash_attn_compat()
 
     override = os.environ.get("MINT_MEGATRON_ATTENTION_BACKEND", "").strip().lower()
     if override:
@@ -2196,6 +2215,7 @@ class MegatronRankWorker:
             logger.info(f"[Rank {self.rank}] Megatron attention_backend={attention_backend}")
 
             from tinker_server.backend.verl_patches import _enable_megatron_determinism
+            _patch_flash_attn_compat()
             _enable_megatron_determinism(seed=42)
             if attention_backend != "flash":
                 _disable_te_flash_attention_backend()
