@@ -726,7 +726,6 @@ def _prefer_cached_checkpoint_view(
             os.path.join(cache_root, path_part),
             os.path.join(cache_root, owner_dir, path_part),
             os.path.join(cache_root, anonymous_dir, path_part),
-            *glob.glob(os.path.join(cache_root, "*", path_part)),
         ]
     else:
         candidates = [os.path.join(cache_root, owner_dir, path_part)]

@@ -133,6 +133,8 @@ def _resolve_checkpoint_for_user(
     is_admin: bool,
     owner_id: str | None = None,
 ) -> str:
+    if is_admin and not str(owner_id or "").strip():
+        raise HTTPException(status_code=400, detail="owner_id is required for admin checkpoint references")
     owner_scope = owner_id if is_admin and owner_id is not None else user_id
     try:
         resolved = resolve_checkpoint_path(path, user_id=owner_scope, is_admin=is_admin)
@@ -169,6 +171,8 @@ def _infer_base_model_from_checkpoint_for_request(
     *,
     owner_id: str | None = None,
 ) -> str:
+    if _can_bypass_checkpoint_ownership(request) and not str(owner_id or "").strip():
+        raise HTTPException(status_code=400, detail="owner_id is required for admin checkpoint references")
     try:
         return _infer_base_model_from_checkpoint(
             model_path,
