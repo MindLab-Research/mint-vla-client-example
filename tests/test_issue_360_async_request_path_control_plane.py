@@ -347,6 +347,20 @@ class _RecordingQueue:
         self.calls.append(dict(kwargs))
 
 
+class _RecordingModelWorkScheduler:
+    def __init__(self):
+        self.calls: list[dict] = []
+        self.cancelled: list[dict] = []
+
+    async def append(self, **kwargs):
+        self.calls.append(dict(kwargs))
+        return {"ok": True, "scheduler_instance_id": "scheduler-360"}
+
+    async def cancel_request(self, **kwargs):
+        self.cancelled.append(dict(kwargs))
+        return {"ok": True}
+
+
 class _RecordingTrainingManager:
     def __init__(self):
         self.sessions: dict[str, object] = {}
@@ -795,12 +809,14 @@ def _install_stateless_training_enqueue_stubs(monkeypatch, *, route_session_info
     fs = _AsyncOnlyTrainingFutureStore()
     cap = _AsyncOnlyCapacityManager()
     q = _RecordingQueue()
+    mws = _RecordingModelWorkScheduler()
 
     async def _get_training_route_session_info(_model_id: str):
         return route_session_info
 
     import tinker_server.backend.capacity_manager as cm
     import tinker_server.backend.api_work_queue as awq
+    import tinker_server.backend.model_work_scheduler as mws_module
     import tinker_server.backend.result_size_estimator as rse
     import tinker_server.client_compat as client_compat
 
@@ -812,11 +828,12 @@ def _install_stateless_training_enqueue_stubs(monkeypatch, *, route_session_info
     monkeypatch.setattr(training_route, "can_access_model", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(cm, "capacity_manager", cap)
     monkeypatch.setattr(awq, "api_work_queue", q)
+    monkeypatch.setattr(mws_module, "model_work_scheduler", mws)
     monkeypatch.setattr(rse, "estimate_small_result_bytes", lambda: 0)
     monkeypatch.setattr(rse, "estimate_forward_backward_result_bytes", lambda _request: 0)
     monkeypatch.setattr(client_compat, "prefer_tinker_uri", lambda _request: True)
 
-    return fs, cap, q
+    return fs, cap, q, mws
 
 
 @pytest.mark.parametrize(
@@ -894,7 +911,7 @@ def test_issue_360_training_enqueue_routes_use_detached_metadata_with_api_global
     expected_seq_id: int,
     expect_prefer_tinker: bool,
 ):
-    fs, cap, q = _install_stateless_training_enqueue_stubs(
+    fs, cap, q, mws = _install_stateless_training_enqueue_stubs(
         monkeypatch,
         route_session_info={
             "model_id": "run-detached",
@@ -908,10 +925,22 @@ def test_issue_360_training_enqueue_routes_use_detached_metadata_with_api_global
     out = anyio.run(route, request_factory(), _request_stub("user-a"))
 
     assert isinstance(out.request_id, str) and out.request_id
-    assert len(cap.calls) == 1
     assert any(name == "async_create_with_id" for name, _rid in fs.calls)
-    assert len(q.calls) == 1
-    queued = q.calls[0]
+    uses_model_work_scheduler = route_name in {"forward_backward", "train_step"}
+    if uses_model_work_scheduler:
+        assert cap.calls == []
+        assert q.calls == []
+        assert len(mws.calls) == 1
+        queued = mws.calls[0]
+        assert queued["domain_key"] == "training:Qwen/Qwen3-0.6B"
+        assert queued["affinity_group"] == "training_session:run-detached"
+        assert queued["ordering_key"] == "training_session:run-detached"
+        assert queued["extra"]["model_work_scheduler"] is True
+    else:
+        assert len(cap.calls) == 1
+        assert mws.calls == []
+        assert len(q.calls) == 1
+        queued = q.calls[0]
     assert queued["op"] == expected_op
     assert queued["user_id"] == "user-a"
     assert queued["extra"]["training_op"] == expected_training_op
@@ -987,7 +1016,7 @@ def test_issue_360_training_route_session_helper_does_not_fallback_to_local_stat
 
 
 def test_issue_360_training_enqueue_refreshes_detached_heartbeat_before_queue(monkeypatch):
-    fs, cap, q = _install_stateless_training_enqueue_stubs(
+    fs, cap, q, _mws = _install_stateless_training_enqueue_stubs(
         monkeypatch,
         route_session_info={
             "model_id": "run-detached",
@@ -1026,7 +1055,7 @@ def test_issue_360_training_enqueue_refreshes_detached_heartbeat_before_queue(mo
 
 
 def test_issue_360_training_enqueue_returns_503_when_heartbeat_protection_fails(monkeypatch):
-    _fs, _cap, q = _install_stateless_training_enqueue_stubs(
+    _fs, _cap, q, _mws = _install_stateless_training_enqueue_stubs(
         monkeypatch,
         route_session_info={
             "model_id": "run-detached",

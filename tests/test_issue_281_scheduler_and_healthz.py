@@ -180,6 +180,7 @@ async def test_issue_281_training_routes_mark_queued_stage_metadata(
 ) -> None:
     import tinker_server.backend.api_work_queue as awq
     import tinker_server.backend.capacity_manager as cm
+    import tinker_server.backend.model_work_scheduler as mws
     from tinker_server.models import types as model_types
     from tinker_server.routes import training as tr
 
@@ -213,6 +214,7 @@ async def test_issue_281_training_routes_mark_queued_stage_metadata(
     monkeypatch.setattr(tr, "future_store", _QueuedFutureStore())
     monkeypatch.setattr(awq, "api_work_queue", SimpleNamespace(enqueue=_fake_enqueue))
     monkeypatch.setattr(cm, "capacity_manager", _AsyncCapacityManager())
+    monkeypatch.setattr(mws, "model_work_scheduler", _AsyncModelWorkScheduler(captured))
 
     req = request_obj(model_types)
     await getattr(tr, route_name)(req, _DummyRequest(user_id="owner-a"))
@@ -232,6 +234,11 @@ async def test_issue_281_training_routes_mark_queued_stage_metadata(
     assert captured["extra"]["execution_serial_key"] == "training_session:run-281"
     assert captured["extra"]["training_op"] == training_op
     assert captured["extra"]["queue_priority"] == 0
+    if route_name in {"forward_backward", "train_step"}:
+        assert captured["domain_key"] == "megatron:megatron_qwen3_30b_a3b_instruct_2507"
+        assert captured["affinity_group"] == "training_session:run-281"
+        assert captured["ordering_key"] == "training_session:run-281"
+        assert captured["extra"]["model_work_scheduler"] is True
 
 
 @pytest.mark.anyio
