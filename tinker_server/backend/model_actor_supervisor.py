@@ -190,6 +190,61 @@ def _spec_from_obj(obj: Any) -> ModelActorSpec:
     )
 
 
+def _placement_spec_overlay(raw_json: str | None, model: str) -> dict[str, Any]:
+    raw = str(raw_json or "").strip()
+    if not raw:
+        return {}
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        raise ValueError("model placement JSON must be an object keyed by base model")
+    raw_entry = payload.get(model)
+    if raw_entry is None:
+        return {}
+    entry = raw_entry[0] if isinstance(raw_entry, list) else raw_entry
+    if not isinstance(entry, dict):
+        raise ValueError(f"model placement entry for {model!r} must be an object")
+    out: dict[str, Any] = {}
+    if "replica_id" in entry:
+        out["replica_id"] = entry["replica_id"]
+    elif "replica" in entry:
+        out["replica_id"] = _replica_id(entry["replica"])
+    if "worker_index" in entry:
+        out["worker_index"] = int(entry["worker_index"])
+    if "node_ip" in entry:
+        out["node_pin"] = str(entry["node_ip"])
+    elif "node_pin" in entry:
+        out["node_pin"] = str(entry["node_pin"])
+    if "node_pins" in entry:
+        raw_pins = entry["node_pins"]
+        if isinstance(raw_pins, str):
+            out["node_pins"] = tuple(pin.strip() for pin in raw_pins.split(",") if pin.strip())
+        else:
+            out["node_pins"] = tuple(str(pin) for pin in raw_pins if str(pin).strip())
+    if "gpu_count" in entry:
+        out["gpu_count"] = int(entry["gpu_count"])
+    return out
+
+
+def _persistent_model_spec(
+    *,
+    model: str,
+    domain_key: str,
+    launcher_key: str,
+    placement_raw: str | None,
+) -> ModelActorSpec:
+    overlay = _placement_spec_overlay(placement_raw, model)
+    return ModelActorSpec(
+        domain_key=domain_key,
+        replica_id=str(overlay.get("replica_id") or "replica-0"),
+        base_model=model,
+        launcher_key=launcher_key,
+        worker_index=overlay.get("worker_index"),
+        node_pin=overlay.get("node_pin"),
+        node_pins=tuple(overlay.get("node_pins") or ()),
+        gpu_count=overlay.get("gpu_count"),
+    )
+
+
 def desired_specs_from_env() -> list[ModelActorSpec]:
     def _with_internal_control(specs: list[ModelActorSpec]) -> list[ModelActorSpec]:
         enabled = str(os.environ.get("MINT_MODEL_ACTOR_INTERNAL_CONTROL", "1")).strip().lower()
@@ -233,15 +288,28 @@ def desired_specs_from_env() -> list[ModelActorSpec]:
     if not persistent:
         return _with_internal_control([])
     specs: list[ModelActorSpec] = []
+    shared_placement_raw = os.environ.get("MINT_MODEL_PLACEMENT_JSON", "").strip()
+    vllm_placement_raw = os.environ.get("MINT_VLLM_MODEL_PLACEMENT_JSON", "").strip() or shared_placement_raw
+    training_placement_raw = os.environ.get("MINT_DENSE_MODEL_PLACEMENT_JSON", "").strip() or shared_placement_raw
+    megatron_placement_raw = os.environ.get("MINT_MEGATRON_MODEL_PLACEMENT_JSON", "").strip() or shared_placement_raw
     for model in (item.strip() for item in persistent.split(",")):
         if not model:
             continue
-        specs.append(_spec_from_obj(model))
+        training_domain = domain_key_for_training_base_model(model)
         specs.append(
-            ModelActorSpec(
-                domain_key=domain_key_for_training_base_model(model),
-                base_model=model,
+            _persistent_model_spec(
+                model=model,
+                domain_key=domain_key_for_vllm_base_model(model),
+                launcher_key="legacy_vllm",
+                placement_raw=vllm_placement_raw,
+            )
+        )
+        specs.append(
+            _persistent_model_spec(
+                model=model,
+                domain_key=training_domain,
                 launcher_key="training",
+                placement_raw=megatron_placement_raw if training_domain.startswith("megatron:") else training_placement_raw,
             )
         )
     return _with_internal_control(specs)

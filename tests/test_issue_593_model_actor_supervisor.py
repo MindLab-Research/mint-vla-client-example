@@ -340,6 +340,10 @@ def test_issue_593_supervisor_builds_runtime_placement_env_from_node_pin() -> No
 def test_issue_593_supervisor_falls_back_to_persistent_models(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MINT_MODEL_ACTOR_DESIRED_JSON", raising=False)
     monkeypatch.delenv("MINT_MODEL_RUNTIME_DESIRED_JSON", raising=False)
+    monkeypatch.delenv("MINT_MODEL_PLACEMENT_JSON", raising=False)
+    monkeypatch.delenv("MINT_VLLM_MODEL_PLACEMENT_JSON", raising=False)
+    monkeypatch.delenv("MINT_DENSE_MODEL_PLACEMENT_JSON", raising=False)
+    monkeypatch.delenv("MINT_MEGATRON_MODEL_PLACEMENT_JSON", raising=False)
     monkeypatch.setenv("MINT_PERSISTENT_MODELS", "Qwen/A, Qwen/B")
 
     specs = desired_specs_from_env()
@@ -353,6 +357,40 @@ def test_issue_593_supervisor_falls_back_to_persistent_models(monkeypatch: pytes
     ]
     assert domain_key_for_vllm_base_model("Qwen/A") == "vllm:Qwen/A"
     assert queue_id_for_replica("vllm:Qwen/A", "replica-2") == "vllm:Qwen/A::replica-2"
+
+
+def test_issue_593_persistent_specs_inherit_runtime_placement(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MINT_MODEL_ACTOR_DESIRED_JSON", raising=False)
+    monkeypatch.delenv("MINT_MODEL_RUNTIME_DESIRED_JSON", raising=False)
+    monkeypatch.setenv("MINT_PERSISTENT_MODELS", "Qwen/A")
+    monkeypatch.setenv(
+        "MINT_VLLM_MODEL_PLACEMENT_JSON",
+        '{"Qwen/A":{"replica":1,"node_ip":"10.0.0.7","gpu_count":2}}',
+    )
+    monkeypatch.setenv(
+        "MINT_DENSE_MODEL_PLACEMENT_JSON",
+        '{"Qwen/A":{"replica":0,"worker_index":3,"gpu_count":1}}',
+    )
+
+    specs = desired_specs_from_env()
+
+    assert specs[:2] == [
+        ModelActorSpec(
+            domain_key="vllm:Qwen/A",
+            replica_id="replica-1",
+            base_model="Qwen/A",
+            launcher_key="legacy_vllm",
+            node_pin="10.0.0.7",
+            gpu_count=2,
+        ),
+        ModelActorSpec(
+            domain_key="training:Qwen/A",
+            base_model="Qwen/A",
+            launcher_key="training",
+            worker_index=3,
+            gpu_count=1,
+        ),
+    ]
 
 
 def test_issue_593_supervisor_empty_env_has_no_desired_specs(monkeypatch: pytest.MonkeyPatch) -> None:
