@@ -3,7 +3,7 @@ import logging
 import pytest
 
 from tinker_server import usage_store as usage_store_module
-from tinker_server.usage_store import PostgresUsageStore, UsageEvent
+from tinker_server.usage_store import DisabledUsageStore, PostgresUsageStore, UsageEvent
 
 
 def test_usage_event_defaults_include_empty_event_id():
@@ -69,6 +69,14 @@ def test_build_usage_store_rejects_non_postgres_backend(monkeypatch):
 
     with pytest.raises(ValueError, match="Unsupported usage backend 'jsonl'"):
         usage_store_module._build_usage_store()
+
+
+def test_build_usage_store_returns_disabled_store(monkeypatch):
+    monkeypatch.setattr(usage_store_module.config, "usage_backend", "disabled")
+
+    store = usage_store_module._build_usage_store()
+
+    assert isinstance(store, DisabledUsageStore)
 
 
 def test_build_usage_store_returns_postgres_store(monkeypatch):

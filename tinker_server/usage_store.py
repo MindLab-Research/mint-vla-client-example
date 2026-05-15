@@ -620,14 +620,56 @@ class PostgresUsageStore:
             self._pool = None
 
 
+class DisabledUsageStore:
+    async def write_event(self, event: UsageEvent) -> list[str]:
+        return await self.write_events([event])
+
+    async def write_events(self, events: list[UsageEvent]) -> list[str]:
+        return [
+            str(event.event_id or "").strip() or PostgresUsageStore.build_event_id(event)
+            for event in events
+        ]
+
+    async def flush_outbox(self, limit: int = 0) -> int:
+        return 0
+
+    async def delete_events(self, events: list[UsageEvent]) -> None:
+        return None
+
+    async def delete_event_ids(self, event_ids: list[str]) -> None:
+        return None
+
+    async def query_logs(
+        self,
+        since: datetime | None = None,
+        account_id: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> tuple[list[dict], int, bool]:
+        return [], 0, False
+
+    async def get_account_summary(self, account_id: str) -> dict:
+        return {"total_quantity": 0, "charge_item_totals": {}}
+
+    async def health_check(self) -> bool:
+        return True
+
+    async def close(self) -> None:
+        return None
+
+
 _usage_store: UsageStore | None = None
 _usage_store_guard = asyncio.Lock()
 
 
 def _build_usage_store() -> UsageStore:
     backend = str(config.usage_backend or "postgres").strip().lower()
+    if backend in {"disabled", "noop"}:
+        return DisabledUsageStore()
     if backend != "postgres":
-        raise ValueError(f"Unsupported usage backend {backend!r}; only 'postgres' is accepted")
+        raise ValueError(
+            f"Unsupported usage backend {backend!r}; expected one of 'postgres', 'disabled', or 'noop'"
+        )
     dsn = _usage_pg_dsn()
     if not dsn:
         raise ValueError("TINKER_USAGE_PG_DSN or TINKER_USAGE_PG_HOST is required for postgres usage backend")

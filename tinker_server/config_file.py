@@ -19,7 +19,7 @@ class _ServerSection(BaseModel):
 
     internal_api_token: str | None = None
     usage_log_dir: str | None = None  # deprecated; billing writes directly to PostgreSQL
-    usage_backend: str | None = None  # only postgres is supported
+    usage_backend: str | None = None  # postgres, disabled, or noop
     usage_pg_dsn: str | None = None
     usage_pg_host: str | None = None
     usage_pg_port: int | None = None

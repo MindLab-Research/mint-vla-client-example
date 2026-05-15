@@ -314,3 +314,13 @@ def test_server_config_fails_fast_for_non_postgres_usage_backend_from_file(tmp_p
             config_path=str(p),
             config_file=file_cfg,
         )
+
+
+def test_server_config_accepts_disabled_usage_backend():
+    cfg = ServerConfig.from_sources(
+        environ={"TINKER_USAGE_BACKEND": "disabled"},
+        config_path=None,
+        config_file=None,
+    )
+
+    assert cfg.usage_backend == "disabled"

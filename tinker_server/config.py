@@ -977,8 +977,10 @@ class ServerConfig:
 
     def validate_deprecated_usage_config(self) -> None:
         backend = str(self.usage_backend or "").strip().lower()
-        if backend and backend != "postgres":
-            raise ValueError(f"Unsupported usage backend {self.usage_backend!r}; only 'postgres' is accepted")
+        if backend and backend not in {"postgres", "disabled", "noop"}:
+            raise ValueError(
+                f"Unsupported usage backend {self.usage_backend!r}; expected one of 'postgres', 'disabled', or 'noop'"
+            )
 
 # Global config instance
 config = ServerConfig.from_sources(environ=os.environ, config_path=_CONFIG_PATH, config_file=_CONFIG_FILE)
