@@ -151,14 +151,17 @@ def _disable_te_flash_attention_backend() -> None:
     """Prevent Transformer Engine from instantiating incompatible flash-attn."""
     try:
         from packaging.version import Version
-        from transformer_engine.pytorch.attention.dot_product_attention.utils import (
-            FlashAttentionUtils,
+        from transformer_engine.pytorch.attention.dot_product_attention import (
+            backends as dpa_backends,
+            utils as dpa_utils,
         )
 
-        FlashAttentionUtils.is_installed = False
-        FlashAttentionUtils.v3_is_installed = False
-        FlashAttentionUtils.version = Version("0")
-        FlashAttentionUtils.fa3_version = Version("0")
+        dpa_utils._NVTE_FLASH_ATTN = 0
+        for flash_utils in (dpa_utils.FlashAttentionUtils, dpa_backends.fa_utils):
+            flash_utils.is_installed = False
+            flash_utils.v3_is_installed = False
+            flash_utils.version = Version("0")
+            flash_utils.fa3_version = Version("0")
     except Exception as exc:
         logger.warning("Failed to disable TE flash attention backend: %s", exc)
 
