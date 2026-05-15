@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import types
 from pathlib import Path
 
 
@@ -10,6 +11,20 @@ def _load_fast_rl_module():
     scripts_dir = repo_root / "scripts" / "wip"
     if str(scripts_dir) not in sys.path:
         sys.path.insert(0, str(scripts_dir))
+    sys.modules.setdefault(
+        "openpi_libero_sft",
+        types.SimpleNamespace(
+            _build_transform=lambda *_args, **_kwargs: None,
+            _collect_transformed_items=lambda *_args, **_kwargs: None,
+            _decode_image=lambda *_args, **_kwargs: None,
+            _encode_png_base64=lambda *_args, **_kwargs: None,
+            _episode_path=lambda *_args, **_kwargs: None,
+            _iter_windows_for_task=lambda *_args, **_kwargs: (),
+            _load_tasks=lambda *_args, **_kwargs: [],
+            _plot_curve=lambda *_args, **_kwargs: None,
+            CONFIG_NAME_BY_BASE_MODEL={},
+        ),
+    )
 
     module_name = "_test_issue_567_openpi_libero_fast_rl"
     path = scripts_dir / "openpi_libero_fast_rl.py"

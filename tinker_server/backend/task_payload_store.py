@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import json
 import os
 import uuid
@@ -133,3 +134,15 @@ class TaskPayloadStore:
                 f"payload checksum mismatch: expected={expected_checksum!r} actual={checksum!r}"
             )
         return json.loads(data.decode("utf-8"))
+
+    async def async_read_json_payload(
+        self,
+        *,
+        path: str | os.PathLike[str],
+        expected_checksum: str | None = None,
+    ) -> Any:
+        return await asyncio.to_thread(
+            self.read_json_payload,
+            path=path,
+            expected_checksum=expected_checksum,
+        )

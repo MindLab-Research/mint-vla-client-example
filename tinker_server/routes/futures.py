@@ -6,7 +6,6 @@ Endpoints:
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import time
@@ -170,8 +169,7 @@ async def _lookup_task_state_terminal(request_id: str, http_request: Request) ->
         if not isinstance(result_path, str) or not result_path:
             return None
         try:
-            result = await asyncio.to_thread(
-                TaskPayloadStore().read_json_payload,
+            result = await TaskPayloadStore().async_read_json_payload(
                 path=result_path,
                 expected_checksum=record.get("result_checksum"),
             )
