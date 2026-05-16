@@ -30,7 +30,7 @@ async def prewarm_persistent_models(
       - Training actors (pooled PEFT trainers and MegatronWorkerGroup)
       - vLLM inference actors (MultiModelInferenceManager)
 
-    and marks them as ModelActorSupervisorInventory protected to prevent LRU eviction.
+    and marks them as ModelActorSupervisorInventory protected for admin/lifecycle visibility.
     """
     failures: list[str] = []
 

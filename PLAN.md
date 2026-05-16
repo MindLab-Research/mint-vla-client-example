@@ -7,7 +7,7 @@
 - Separated inference and training on different GPU pools
 - LoRA-based training with sub-second adapter transfer
 - Dense models via PEFT, MoE models via verl Megatron backend
-- Multi-session actor sharing with LRU eviction
+- Multi-session actor sharing through supervisor inventory and explicit lifecycle controls
 
 ---
 
@@ -315,7 +315,7 @@ Key requirements:
 ├─────────────────────────────────────────────────────────────────────────┤
 │  ModelActorSupervisor / ModelWorkScheduler / ModelActorSupervisorInventory          │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │ Global GPU tracking, cross-pool LRU eviction                    │    │
+│  │ Actor inventory, inflight/session metadata, admin list/kill     │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
 ├──────────────────────────────┬──────────────────────────────────────────┤
 │      Inference Pool          │           Training Pool                  │

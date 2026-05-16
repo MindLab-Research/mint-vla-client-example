@@ -39,9 +39,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Default idle timeout for TrainingWorker (seconds)
-# Set to 0 to disable self-termination (ModelActorSupervisorInventory LRU eviction handles lifecycle)
-DEFAULT_IDLE_TIMEOUT = 0  # Disabled - LRU eviction manages actor lifecycle
+# Default idle timeout for TrainingWorker (seconds). Lifecycle is controlled by
+# session shutdown, explicit admin actions, and supervisor reconciliation.
+DEFAULT_IDLE_TIMEOUT = 0
 
 
 # =====================================================================
@@ -3784,7 +3784,7 @@ class VerlTrainingEngine:
         model_id = session.model_id
         worker = await self._get_live_worker(session, op="forward_backward")
 
-        # Mark actor as recently used to prevent LRU eviction during training
+        # Mark actor as recently used for supervisor inventory and admin visibility.
         self._touch_actor(session)
         await self._ensure_megatron_session_guard_clean(
             session,
@@ -4014,7 +4014,7 @@ class VerlTrainingEngine:
         model_id = session.model_id
         worker = await self._get_live_worker(session, op="forward")
 
-        # Mark actor as recently used to prevent LRU eviction during training
+        # Mark actor as recently used for supervisor inventory and admin visibility.
         self._touch_actor(session)
         await self._ensure_megatron_session_guard_clean(
             session,
@@ -4131,7 +4131,7 @@ class VerlTrainingEngine:
         model_id = session.model_id
         worker = await self._get_live_worker(session, op="optim_step")
 
-        # Mark actor as recently used to prevent LRU eviction during training
+        # Mark actor as recently used for supervisor inventory and admin visibility.
         self._touch_actor(session)
         await self._ensure_megatron_session_guard_clean(
             session,
@@ -4210,7 +4210,7 @@ class VerlTrainingEngine:
         model_id = session.model_id
         worker = await self._get_live_worker(session, op="train_step")
 
-        # Mark actor as recently used to prevent LRU eviction during training
+        # Mark actor as recently used for supervisor inventory and admin visibility.
         self._touch_actor(session)
         await self._ensure_megatron_session_guard_clean(
             session,
