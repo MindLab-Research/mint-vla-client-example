@@ -314,7 +314,7 @@ async def test_issue_445_asample_enqueues_normalized_priority(monkeypatch):
 
     scheduler = _CaptureModelWorkScheduler()
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
-    monkeypatch.setattr(sampling_route, "future_store", _StubFutureStore())
+    monkeypatch.setattr(sampling_route, "task_state_futures", _StubFutureStore())
     monkeypatch.setattr(sampling_route, "record_sampling_admission_metric", lambda **_kwargs: None)
     async def _no_snapshot(_sid):
         return None
@@ -375,7 +375,7 @@ async def test_issue_445_forward_backward_enqueues_default_priority_on_invalid_h
     monkeypatch.setattr(training_route, "_get_training_route_session_info", _route_info)
     monkeypatch.setattr(training_route, "_protect_training_session_enqueue_window", _protect)
     monkeypatch.setattr(training_route, "_get_max_model_len", lambda _base_model: 4096)
-    monkeypatch.setattr(training_route, "future_store", _StubFutureStore())
+    monkeypatch.setattr(training_route, "task_state_futures", _StubFutureStore())
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
     monkeypatch.setattr(training_route, "_mark_training_inflight", lambda *_args, **_kwargs: None)
 
@@ -405,7 +405,7 @@ async def test_issue_445_compute_logprobs_enqueues_apikey_id(monkeypatch):
 
     scheduler = _CaptureModelWorkScheduler()
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
-    monkeypatch.setattr(sampling_route, "future_store", _StubFutureStore())
+    monkeypatch.setattr(sampling_route, "task_state_futures", _StubFutureStore())
     monkeypatch.setattr(sampling_route, "record_sampling_admission_metric", lambda **_kwargs: None)
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
     monkeypatch.setattr(model_registry, "get_model_config", lambda _model: SimpleNamespace(max_model_len=4096))

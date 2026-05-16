@@ -106,7 +106,7 @@ async def test_issue_408_save_weights_for_sampler_emits_trace_spans(
     monkeypatch.setattr(tr, "inference_manager", _InferenceManagerStub())
     monkeypatch.setattr(
         tr,
-        "future_store",
+        "task_state_futures",
         SimpleNamespace(async_resolve=_async_resolve, async_fail=_async_fail),
     )
     monkeypatch.setattr(tr, "checkpoint_has_optimizer_state", lambda _path: False)

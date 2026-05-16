@@ -678,9 +678,9 @@ def _configure_opentelemetry(root_logger: logging.Logger) -> None:
             description="Sampling admission decisions observed by mint",
         )
         _FUTURE_STORE_TIMEOUT_COUNTER = meter.create_counter(
-            "mint_future_store_timeout_events_total",
+            "mint_task_state_futures_timeout_events_total",
             unit="{timeout}",
-            description="FutureStore queue and execution timeout events observed by mint",
+            description="task state future queue and execution timeout events observed by mint",
         )
         _VLLM_ACTOR_REQUEST_COUNTER = meter.create_counter(
             "mint_vllm_actor_requests_total",
@@ -816,7 +816,7 @@ def record_sampling_admission_metric(
         pass
 
 
-def record_future_store_timeout_metric(*, kind: str, op: str | None = None) -> None:
+def record_task_state_futures_timeout_metric(*, kind: str, op: str | None = None) -> None:
     if not _OTEL_ENABLED:
         return
     attrs: dict[str, str] = {"kind": str(kind)}

@@ -288,7 +288,7 @@ def _get_or_create_actor():
             from .api_work_queue import api_work_queue
             from .api_work_queue_dispatch import register_api_work_queue_executors
             from .capacity_manager import capacity_manager
-            from .task_state_store import task_state_futures as future_store
+            from .task_state_store import task_state_futures
 
             _append_queue_runtime_debug(
                 "ensure_started_begin",
@@ -306,8 +306,8 @@ def _get_or_create_actor():
                     _append_queue_runtime_debug("ensure_started_after_observability_task")
                     await capacity_manager.async_ensure_ready()
                     _append_queue_runtime_debug("ensure_started_after_capacity_manager")
-                    await future_store.async_ensure_started()
-                    _append_queue_runtime_debug("ensure_started_after_future_store")
+                    await task_state_futures.async_ensure_started()
+                    _append_queue_runtime_debug("ensure_started_after_task_state_futures")
                     await api_work_queue.async_ensure_started()
                     _append_queue_runtime_debug("ensure_started_after_api_work_queue_started")
                     register_api_work_queue_executors(api_work_queue)

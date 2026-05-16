@@ -555,7 +555,7 @@ async def test_issue_364_save_weights_for_sampler_persists_lora_int_id(
 
     monkeypatch.setattr(
         training_route,
-        "future_store",
+        "task_state_futures",
         SimpleNamespace(
             async_resolve=_async_resolve,
             async_fail=_async_fail,
@@ -706,7 +706,7 @@ async def test_issue_364_compute_logprobs_marks_resource_pool_inflight(
 
     monkeypatch.setattr(
         sampling_route,
-        "future_store",
+        "task_state_futures",
         SimpleNamespace(
             async_resolve=_async_resolve,
             async_fail=_async_fail,

@@ -316,7 +316,7 @@ def test_asample_deterministic_request_id_dedup(monkeypatch):
     stub_scheduler = _StubModelWorkScheduler()
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
-    monkeypatch.setattr(sampling_route, "future_store", stub_fs)
+    monkeypatch.setattr(sampling_route, "task_state_futures", stub_fs)
 
     import tinker_server.backend.model_registry as model_registry
     import tinker_server.backend.model_work_scheduler as mws
@@ -350,7 +350,7 @@ def test_asample_sets_deterministic_request_id_in_logging_context_first(monkeypa
     request_id_bindings: list[str] = []
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
-    monkeypatch.setattr(sampling_route, "future_store", stub_fs)
+    monkeypatch.setattr(sampling_route, "task_state_futures", stub_fs)
     monkeypatch.setattr(sampling_route, "set_request_id", lambda rid: request_id_bindings.append(rid))
 
     import tinker_server.backend.model_registry as model_registry
@@ -378,7 +378,7 @@ def test_asample_duplicate_payload_conflict(monkeypatch):
     stub_scheduler = _StubModelWorkScheduler()
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
-    monkeypatch.setattr(sampling_route, "future_store", stub_fs)
+    monkeypatch.setattr(sampling_route, "task_state_futures", stub_fs)
 
     import tinker_server.backend.model_registry as model_registry
     import tinker_server.backend.model_work_scheduler as mws
@@ -414,7 +414,7 @@ def test_asample_requires_seq_id_when_enabled(monkeypatch):
     stub_fs = _StubFutureStore()
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
-    monkeypatch.setattr(sampling_route, "future_store", stub_fs)
+    monkeypatch.setattr(sampling_route, "task_state_futures", stub_fs)
     monkeypatch.setattr(sampling_route.server_config, "sampling_require_seq_id", True)
 
     req = SampleRequest(

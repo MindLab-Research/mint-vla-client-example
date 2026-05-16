@@ -157,7 +157,7 @@ def test_asample_normalizes_direct_selector_before_enqueue(monkeypatch, selector
     created_sessions: list[tuple[str, str]] = []
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
-    monkeypatch.setattr(sampling_route, "future_store", stub_fs)
+    monkeypatch.setattr(sampling_route, "task_state_futures", stub_fs)
 
     import tinker_server.backend.model_registry as model_registry
     import tinker_server.backend.model_work_scheduler as mws
@@ -196,7 +196,7 @@ def test_asample_keeps_seq_id_gate_for_existing_session_selector(monkeypatch):
     stub_q = _StubApiWorkQueue()
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
-    monkeypatch.setattr(sampling_route, "future_store", stub_fs)
+    monkeypatch.setattr(sampling_route, "task_state_futures", stub_fs)
 
     import tinker_server.backend.capacity_manager as cm
     import tinker_server.backend.api_work_queue as awq

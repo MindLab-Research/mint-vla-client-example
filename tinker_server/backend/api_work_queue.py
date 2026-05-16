@@ -2568,7 +2568,7 @@ class ApiWorkQueueClient:
 
     async def _reconcile_stale_running_requests(self, consumer_job_id: str) -> int:
         from .capacity_manager import capacity_manager
-        from .task_state_store import TaskStateStoreUnavailableError as FutureStoreUnavailableError, task_state_futures as future_store
+        from .task_state_store import TaskStateStoreUnavailableError, task_state_futures
 
         stale_leased_request_ids: list[str] = []
         try:
@@ -2586,11 +2586,11 @@ class ApiWorkQueueClient:
             )
 
         try:
-            stale_request_ids = await future_store.async_fail_stale_running_requests(
+            stale_request_ids = await task_state_futures.async_fail_stale_running_requests(
                 str(consumer_job_id),
                 "api server restarted while request was running",
             )
-        except FutureStoreUnavailableError as e:
+        except TaskStateStoreUnavailableError as e:
             logger.warning(
                 "[api_work_queue] stale-running reconciliation unavailable consumer_job_id=%s: %s: %s",
                 str(consumer_job_id),
@@ -2615,13 +2615,13 @@ class ApiWorkQueueClient:
         ]
         for request_id in pending_leased_request_ids:
             try:
-                await future_store.async_fail(
+                await task_state_futures.async_fail(
                     request_id,
                     "api server restarted while request was dequeued before execution began",
                 )
             except Exception as e:
                 logger.warning(
-                    "[api_work_queue] future_store.async_fail failed for stale leased request_id=%s consumer_job_id=%s: %s: %s",
+                    "[api_work_queue] task_state_futures.async_fail failed for stale leased request_id=%s consumer_job_id=%s: %s: %s",
                     str(request_id),
                     str(consumer_job_id),
                     type(e).__name__,
@@ -2837,7 +2837,7 @@ class ApiWorkQueueClient:
     async def _worker_loop(self, worker_idx: int) -> None:
 
         from .capacity_manager import capacity_manager
-        from .task_state_store import FutureStatus, task_state_futures as future_store
+        from .task_state_store import FutureStatus, task_state_futures
         from .queue_execution_context import queue_execution_context
         from .queue_supervisor import queue_supervisor
 
@@ -2911,7 +2911,7 @@ class ApiWorkQueueClient:
                     is_current = False
             if current_generation_id is None or not is_current:
                 try:
-                    await future_store.async_fail(
+                    await task_state_futures.async_fail(
                         item.request_id,
                         "queue generation fenced before execution",
                     )
@@ -2964,7 +2964,7 @@ class ApiWorkQueueClient:
                 # queue-timeout), do not run the executor. This prevents a timed-out future from
                 # later being overwritten by a "successful" resolve.
                 try:
-                    status = await future_store.async_get_status(item.request_id)
+                    status = await task_state_futures.async_get_status(item.request_id)
                 except KeyError:
                     await _finalize_request_slot(item.request_id)
                     try:
@@ -2989,13 +2989,13 @@ class ApiWorkQueueClient:
                         e,
                     )
                     try:
-                        await future_store.async_fail(
+                        await task_state_futures.async_fail(
                             item.request_id,
-                            f"internal error: future_store.get_status failed: {type(e).__name__}: {e}",
+                            f"internal error: task_state_futures.get_status failed: {type(e).__name__}: {e}",
                         )
                     except Exception as e2:
                         logger.error(
-                            "[api_work_queue] future_store.fail failed after get_status error (worker_idx=%s, request_id=%s, op=%s): %s: %s",
+                            "[api_work_queue] task_state_futures.fail failed after get_status error (worker_idx=%s, request_id=%s, op=%s): %s: %s",
                             int(worker_idx),
                             str(item.request_id),
                             str(item.op),
@@ -3042,7 +3042,7 @@ class ApiWorkQueueClient:
 
                 try:
                     running_stage = "prefill" if str(item.op).startswith("sampling.") else "running"
-                    await future_store.async_mark_running(
+                    await task_state_futures.async_mark_running(
                         item.request_id,
                         meta={
                             "worker_idx": int(worker_idx),
@@ -3070,13 +3070,13 @@ class ApiWorkQueueClient:
                         e,
                     )
                     try:
-                        await future_store.async_fail(
+                        await task_state_futures.async_fail(
                             item.request_id,
-                            f"internal error: future_store.mark_running failed: {type(e).__name__}: {e}",
+                            f"internal error: task_state_futures.mark_running failed: {type(e).__name__}: {e}",
                         )
                     except Exception as e2:
                         logger.error(
-                            "[api_work_queue] future_store.fail failed after mark_running error (worker_idx=%s, request_id=%s, op=%s): %s: %s",
+                            "[api_work_queue] task_state_futures.fail failed after mark_running error (worker_idx=%s, request_id=%s, op=%s): %s: %s",
                             int(worker_idx),
                             str(item.request_id),
                             str(item.op),
@@ -3114,10 +3114,10 @@ class ApiWorkQueueClient:
                         int(worker_idx),
                     )
                     try:
-                        await future_store.async_fail(item.request_id, f"unknown op: {item.op!r}")
+                        await task_state_futures.async_fail(item.request_id, f"unknown op: {item.op!r}")
                     except Exception as e:
                         logger.error(
-                            "[api_work_queue] future_store.fail failed for unknown op (worker_idx=%s, request_id=%s, op=%s): %s: %s",
+                            "[api_work_queue] task_state_futures.fail failed for unknown op (worker_idx=%s, request_id=%s, op=%s): %s: %s",
                             int(worker_idx),
                             str(item.request_id),
                             str(item.op),
@@ -3221,14 +3221,14 @@ class ApiWorkQueueClient:
                         type(e).__name__,
                         e,
                         classify_failure_reason(e),
-                        "check_executor_and_future_store",
+                        "check_executor_and_task_state_futures",
                     )
                     # Ensure the future does not remain pending forever.
                     try:
-                        await future_store.async_fail(item.request_id, f"executor failed: {e}")
+                        await task_state_futures.async_fail(item.request_id, f"executor failed: {e}")
                     except Exception as e2:
                         logger.error(
-                            "[api_work_queue] future_store.fail failed after executor exception (worker_idx=%s, request_id=%s, op=%s): %s: %s",
+                            "[api_work_queue] task_state_futures.fail failed after executor exception (worker_idx=%s, request_id=%s, op=%s): %s: %s",
                             int(worker_idx),
                             str(item.request_id),
                             str(item.op),

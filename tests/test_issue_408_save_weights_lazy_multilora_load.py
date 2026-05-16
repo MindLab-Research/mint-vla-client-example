@@ -95,7 +95,7 @@ async def test_issue_408_save_weights_for_sampler_registers_lazy_multilora_sessi
     monkeypatch.setattr(tr, "inference_manager", _InferenceManagerStub())
     monkeypatch.setattr(
         tr,
-        "future_store",
+        "task_state_futures",
         SimpleNamespace(async_resolve=_async_resolve, async_fail=_async_fail),
     )
     monkeypatch.setattr(tr, "checkpoint_has_optimizer_state", lambda _path: False)
@@ -216,7 +216,7 @@ async def test_issue_408_save_weights_for_sampler_reuses_pending_warm_task(
     monkeypatch.setattr(tr, "inference_manager", inference_manager)
     monkeypatch.setattr(
         tr,
-        "future_store",
+        "task_state_futures",
         SimpleNamespace(async_resolve=_async_resolve, async_fail=lambda *_args, **_kwargs: None),
     )
     monkeypatch.setattr(tr, "checkpoint_has_optimizer_state", lambda _path: False)
@@ -325,7 +325,7 @@ async def test_issue_408_save_weights_for_sampler_fails_fast_on_immediate_engine
     monkeypatch.setattr(tr, "inference_manager", _InferenceManagerStub())
     monkeypatch.setattr(
         tr,
-        "future_store",
+        "task_state_futures",
         SimpleNamespace(
             async_resolve=_async_resolve,
             async_fail=_async_fail,
@@ -418,7 +418,7 @@ async def test_issue_408_save_weights_for_sampler_fails_fast_on_async_warm_error
     monkeypatch.setattr(tr, "inference_manager", _InferenceManagerStub())
     monkeypatch.setattr(
         tr,
-        "future_store",
+        "task_state_futures",
         SimpleNamespace(
             async_resolve=_async_resolve,
             async_fail=_async_fail,

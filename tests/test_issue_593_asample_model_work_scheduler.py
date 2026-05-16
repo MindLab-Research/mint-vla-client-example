@@ -109,7 +109,7 @@ def test_issue_593_asample_routes_multi_lora_to_model_work_scheduler(monkeypatch
     scheduler = _CaptureModelWorkScheduler()
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
-    monkeypatch.setattr(sampling_route, "future_store", stub_fs)
+    monkeypatch.setattr(sampling_route, "task_state_futures", stub_fs)
 
     import tinker_server.backend.api_work_queue as awq
     import tinker_server.backend.capacity_manager as cm
@@ -170,7 +170,7 @@ def test_issue_593_asample_cancels_scheduler_item_if_post_append_meta_update_fai
     scheduler = _CaptureModelWorkScheduler()
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
-    monkeypatch.setattr(sampling_route, "future_store", stub_fs)
+    monkeypatch.setattr(sampling_route, "task_state_futures", stub_fs)
 
     import tinker_server.backend.api_work_queue as awq
     import tinker_server.backend.capacity_manager as cm
@@ -213,7 +213,7 @@ def test_issue_593_asample_does_not_cancel_scheduler_item_when_append_rejects(mo
     scheduler = _CaptureModelWorkScheduler(append_error=RuntimeError("duplicate request_id"))
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
-    monkeypatch.setattr(sampling_route, "future_store", stub_fs)
+    monkeypatch.setattr(sampling_route, "task_state_futures", stub_fs)
 
     import tinker_server.backend.api_work_queue as awq
     import tinker_server.backend.capacity_manager as cm
@@ -254,7 +254,7 @@ def test_issue_593_asample_ignores_legacy_flag_and_uses_model_work_scheduler(mon
     scheduler = _CaptureModelWorkScheduler()
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
-    monkeypatch.setattr(sampling_route, "future_store", stub_fs)
+    monkeypatch.setattr(sampling_route, "task_state_futures", stub_fs)
 
     import tinker_server.backend.api_work_queue as awq
     import tinker_server.backend.capacity_manager as cm

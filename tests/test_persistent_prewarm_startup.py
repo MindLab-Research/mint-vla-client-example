@@ -305,7 +305,7 @@ def _install_lifespan_stubs(
     owner_runtime: _StubOwnerRuntimeSupervisor,
     queue_execution_runtime: _StubQueueExecutionRuntime,
     init_ray_calls: _StubInitRayCalls | None = None,
-    future_store: _StubFutureStore | None = None,
+    task_state_futures: _StubFutureStore | None = None,
     model_actor_supervisor: _StubModelActorSupervisor | None = None,
     model_work_scheduler: _StubModelWorkScheduler | None = None,
 ) -> None:
@@ -358,7 +358,7 @@ def _install_lifespan_stubs(
         model_work_scheduler or _StubModelWorkScheduler(),
     )
     monkeypatch.setattr(capacity_manager_module, "capacity_manager", _StubCapacityManager())
-    monkeypatch.setattr(task_state_store_module, "task_state_futures", future_store or _StubFutureStore())
+    monkeypatch.setattr(task_state_store_module, "task_state_futures", task_state_futures or _StubFutureStore())
     monkeypatch.setattr(gateway_session_store_module, "ensure_ready", lambda: None)
     monkeypatch.setattr(sampling_session_store_module, "ensure_ready", lambda: None)
     monkeypatch.setattr(session_heartbeat_store_module, "session_heartbeat_store", SimpleNamespace(ensure_ready=lambda: None, async_size=lambda: 0))
@@ -630,9 +630,9 @@ def test_lifespan_init_ray_when_head_address_path_configured(monkeypatch, tmp_pa
     assert init_ray_calls[0]["kwargs"]["namespace"] == "tinker"
 
 
-def test_lifespan_uses_started_probe_for_future_store(monkeypatch) -> None:
+def test_lifespan_uses_started_probe_for_task_state_futures(monkeypatch) -> None:
     queue = _StubApiWorkQueue(fail_async_ensure_ready=True)
-    future_store = _StubFutureStore(fail_async_ensure_ready=True)
+    task_state_futures = _StubFutureStore(fail_async_ensure_ready=True)
     owner_runtime = _StubOwnerRuntimeSupervisor()
     queue_execution_runtime = _StubQueueExecutionRuntime()
     _install_lifespan_stubs(
@@ -640,7 +640,7 @@ def test_lifespan_uses_started_probe_for_future_store(monkeypatch) -> None:
         queue,
         owner_runtime,
         queue_execution_runtime,
-        future_store=future_store,
+        task_state_futures=task_state_futures,
     )
     lease = _StubStartupLease(is_owner=True)
 
@@ -658,8 +658,8 @@ def test_lifespan_uses_started_probe_for_future_store(monkeypatch) -> None:
 
     asyncio.run(_run())
 
-    assert future_store.async_ensure_started_calls == 1
-    assert future_store.async_ensure_ready_calls == 0
+    assert task_state_futures.async_ensure_started_calls == 1
+    assert task_state_futures.async_ensure_ready_calls == 0
     assert queue.async_ensure_started_calls == 0
     assert queue.async_ensure_ready_calls == 0
     assert queue_execution_runtime.ensure_started_calls == []

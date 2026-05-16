@@ -332,7 +332,7 @@ async def _enqueue_weights_model_work(
         ordering_key=affinity_group,
         extra=_build_execution_serial_extra(model_id=model_id, extra=dict(extra or {})),
         queued_meta=_weights_queued_meta(op=op, model_id=model_id),
-        future_store_client=task_state_futures,
+        task_state_futures_client=task_state_futures,
         scheduler_client=model_work_scheduler,
         trace_enqueue=_enqueue_weights_request_with_trace,
         trace_kwargs={
@@ -387,7 +387,7 @@ async def _enqueue_weights_request_with_trace(
         if model_id:
             span.set_attribute("model_id", str(model_id))
         span.add_event(
-            "future_store_ready",
+            "task_state_futures_ready",
             {
                 "elapsed_ms": round(future_ready_elapsed_ms, 3),
                 "route_elapsed_ms": round(future_ready_elapsed_ms, 3),

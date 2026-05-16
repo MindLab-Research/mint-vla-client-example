@@ -54,7 +54,7 @@ async def test_issue_517_do_create_model_persists_unmaterialized_session_without
 ) -> None:
     manager = TrainingSessionManager()
     persisted: dict[str, object] = {}
-    future_store = _AsyncFutureStore()
+    task_state_futures = _AsyncFutureStore()
     create_calls: list[str] = []
 
     async def _unexpected_create_training_session(_session) -> None:
@@ -88,8 +88,8 @@ async def test_issue_517_do_create_model_persists_unmaterialized_session_without
     )
     monkeypatch.setattr(
         training_route,
-        "future_store",
-        future_store,
+        "task_state_futures",
+        task_state_futures,
     )
 
     req = CreateModelRequest(
@@ -105,9 +105,9 @@ async def test_issue_517_do_create_model_persists_unmaterialized_session_without
     assert persisted["actor_name"] is None
     assert persisted["backend"] == "megatron"
     assert persisted["tokenizer_info"] == {"vocab_size": 151936}
-    assert future_store.resolved["request_id"] == "rid-517-create"
-    assert future_store.resolved["payload"]["model_id"] == "s517_0"
-    assert future_store.resolved["payload"]["backend"] == "megatron"
+    assert task_state_futures.resolved["request_id"] == "rid-517-create"
+    assert task_state_futures.resolved["payload"]["model_id"] == "s517_0"
+    assert task_state_futures.resolved["payload"]["backend"] == "megatron"
     session = manager.get_local_session("s517_0")
     assert session is not None
     assert session.materialization_state == MATERIALIZATION_STATE_UNMATERIALIZED
@@ -131,7 +131,7 @@ async def test_issue_517_forward_backward_materializes_unmaterialized_session_on
         }
     )
     persisted: list[dict[str, object]] = []
-    future_store = _AsyncFutureStore()
+    task_state_futures = _AsyncFutureStore()
     order: list[str] = []
 
     async def _create_training_session(session) -> None:
@@ -174,8 +174,8 @@ async def test_issue_517_forward_backward_materializes_unmaterialized_session_on
     monkeypatch.setattr(training_route, "_get_max_model_len", lambda _base_model: 4096)
     monkeypatch.setattr(
         training_route,
-        "future_store",
-        future_store,
+        "task_state_futures",
+        task_state_futures,
     )
 
     req = ForwardBackwardRequest(
@@ -187,9 +187,9 @@ async def test_issue_517_forward_backward_materializes_unmaterialized_session_on
     assert order == ["create", "forward_backward"]
     assert [item["materialization_state"] for item in persisted] == ["materializing", "ready"]
     assert persisted[-1]["actor_name"] == "actor-517"
-    assert future_store.resolved["request_id"] == "rid-517-fb"
-    assert future_store.resolved["payload"]["type"] == "mint_forward_backward"
-    assert future_store.failed == []
+    assert task_state_futures.resolved["request_id"] == "rid-517-fb"
+    assert task_state_futures.resolved["payload"]["type"] == "mint_forward_backward"
+    assert task_state_futures.failed == []
     session = manager.get_local_session("run-517")
     assert session is not None
     assert session.materialization_state == MATERIALIZATION_STATE_READY
@@ -228,15 +228,15 @@ async def test_issue_517_create_model_route_enqueues_without_local_training_runt
         enqueued.update(kwargs)
         return SimpleNamespace(scheduler_result={"ok": True})
 
-    future_store = _AsyncFutureStore()
+    task_state_futures = _AsyncFutureStore()
 
     monkeypatch.setattr(training_route, "training_manager", None)
     monkeypatch.setattr(training_route, "training_engine", None)
     monkeypatch.setattr(training_route, "can_access_model", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(
         training_route,
-        "future_store",
-        future_store,
+        "task_state_futures",
+        task_state_futures,
     )
     monkeypatch.setattr(supported_models_gate_module, "enforce_base_model_allowed", _allow_model)
     monkeypatch.setattr(gateway_module, "upstream_for_model", lambda *_args, **_kwargs: None)
@@ -343,7 +343,7 @@ async def test_issue_528_do_create_model_dense_is_metadata_only_until_first_stat
     )
     monkeypatch.setattr(
         training_route,
-        "future_store",
+        "task_state_futures",
         _AsyncFutureStore(),
     )
 
@@ -420,7 +420,7 @@ async def test_issue_528_dense_materialization_happens_once_on_first_stateful_us
     monkeypatch.setattr(training_route, "_get_max_model_len", lambda _base_model: 4096)
     monkeypatch.setattr(
         training_route,
-        "future_store",
+        "task_state_futures",
         _AsyncFutureStore(),
     )
 

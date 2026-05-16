@@ -441,7 +441,7 @@ async def _enqueue_sampling_request_with_trace(
         if base_model:
             span.set_attribute("base_model", str(base_model))
         span.add_event(
-            "future_store_ready",
+            "task_state_futures_ready",
             {
                 "elapsed_ms": round(future_ready_elapsed_ms, 3),
                 "route_elapsed_ms": round(future_ready_elapsed_ms, 3),
@@ -1188,7 +1188,7 @@ async def asample(
             queued_meta=queued_meta,
             create_future=not created_pending,
             payload_hash=payload_hash,
-            future_store_client=task_state_futures,
+            task_state_futures_client=task_state_futures,
             trace_enqueue=_enqueue_sampling_request_with_trace,
             trace_kwargs={
                 "route_start_s": route_start_s,
@@ -2106,7 +2106,7 @@ async def compute_logprobs(
                 "domain_key": domain_key,
                 "affinity_group": affinity_group,
             },
-            future_store_client=task_state_futures,
+            task_state_futures_client=task_state_futures,
             scheduler_client=model_work_scheduler,
             trace_enqueue=_enqueue_sampling_request_with_trace,
             trace_kwargs={

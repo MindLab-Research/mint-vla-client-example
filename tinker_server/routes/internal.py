@@ -55,7 +55,7 @@ async def _enqueue_internal_request_with_trace(
         span.set_attribute("op", str(op))
         span.set_attribute("request_id", str(request_id))
         span.add_event(
-            "future_store_ready",
+            "task_state_futures_ready",
             {
                 "elapsed_ms": round(future_ready_elapsed_ms, 3),
                 "route_elapsed_ms": round(future_ready_elapsed_ms, 3),
@@ -1148,7 +1148,7 @@ async def metrics() -> Response:
 
 @router.post("/work_queue/noop")
 async def work_queue_noop(http_request: Request) -> dict:
-    from ..backend.task_state_store import task_state_futures as future_store
+    from ..backend.task_state_store import task_state_futures
     from ..backend.model_actor_supervisor import domain_key_for_internal_control
     from ..backend.model_work_admission import enqueue_model_work
 
@@ -1177,7 +1177,7 @@ async def work_queue_noop(http_request: Request) -> dict:
                     "stage": "queued",
                     "queued_at": time.time(),
                 },
-                future_store_client=future_store,
+                task_state_futures_client=task_state_futures,
             ),
         )
     except Exception as e:

@@ -103,10 +103,10 @@ class _StubQueue:
 def test_mint_action_route_cleans_up_future_when_enqueue_fails(monkeypatch) -> None:
     from tinker_server.routes import mint as mint_routes
 
-    future_store = _StubFutureStore()
+    task_state_futures = _StubFutureStore()
     scheduler = _StubModelWorkScheduler(fail=True)
 
-    monkeypatch.setattr(mint_routes, "future_store", future_store, raising=False)
+    monkeypatch.setattr(mint_routes, "task_state_futures", task_state_futures, raising=False)
     monkeypatch.setattr(mint_routes, "action_session_manager", object(), raising=False)
 
     import tinker_server.backend.model_work_scheduler as mws
@@ -141,8 +141,8 @@ def test_mint_action_route_cleans_up_future_when_enqueue_fails(monkeypatch) -> N
     )
 
     assert resp.status_code == 503, resp.text
-    assert future_store.created == []
-    assert len(future_store.cleaned) == 1
+    assert task_state_futures.created == []
+    assert len(task_state_futures.cleaned) == 1
     assert len(scheduler.calls) == 1
 
 
@@ -261,7 +261,7 @@ def test_mint_create_action_session_uses_bypass_cap_for_checkpoint_paths(monkeyp
 def test_mint_vla_train_step_route_enqueues_expected_request(monkeypatch) -> None:
     from tinker_server.routes import mint as mint_routes
 
-    future_store = _StubFutureStore()
+    task_state_futures = _StubFutureStore()
     scheduler = _StubModelWorkScheduler()
 
     session = SimpleNamespace(
@@ -280,7 +280,7 @@ def test_mint_vla_train_step_route_enqueues_expected_request(monkeypatch) -> Non
         def mark_inflight(self, model_id: str, delta: int) -> None:
             self.inflight.append((model_id, delta))
 
-    monkeypatch.setattr(mint_routes, "future_store", future_store)
+    monkeypatch.setattr(mint_routes, "task_state_futures", task_state_futures)
     monkeypatch.setattr(mint_routes, "training_engine", object())
     monkeypatch.setattr(mint_routes, "training_manager", _StubTrainingManager())
     monkeypatch.setattr(mint_routes, "_get_user_id", lambda _request: "user-a")
@@ -359,8 +359,8 @@ def test_mint_vla_train_step_route_enqueues_expected_request(monkeypatch) -> Non
 
     assert resp.status_code == 200, resp.text
     request_id = resp.json()["request_id"]
-    assert future_store.created == []
-    queued_request_id, queued_meta = future_store.queued[0]
+    assert task_state_futures.created == []
+    queued_request_id, queued_meta = task_state_futures.queued[0]
     assert queued_request_id == request_id
     assert queued_meta["op"] == "mint.vla.train_step"
     assert queued_meta["model_id"] == "model-123"
@@ -380,7 +380,7 @@ def test_mint_vla_train_step_background_lowers_observation_and_supervision(monke
     from tinker_server.routes import mint as mint_routes
     from tinker_server.routes import training as training_routes
 
-    future_store = _StubFutureStore()
+    task_state_futures = _StubFutureStore()
     mark_calls: list[tuple[str, int]] = []
     captured: dict[str, object] = {}
 
@@ -392,7 +392,7 @@ def test_mint_vla_train_step_background_lowers_observation_and_supervision(monke
         _ = request_id, user_id, gateway_auth
         captured["request"] = request
 
-    monkeypatch.setattr(mint_routes, "future_store", future_store)
+    monkeypatch.setattr(mint_routes, "task_state_futures", task_state_futures)
     monkeypatch.setattr(mint_routes, "training_manager", _StubTrainingManager())
     monkeypatch.setattr(training_routes, "_do_train_step", _fake_do_train_step)
 
@@ -440,7 +440,7 @@ def test_mint_vla_train_step_route_uses_detached_session_info(monkeypatch) -> No
     from tinker_server.routes import mint as mint_routes
     from tinker_server.routes import training as training_routes
 
-    future_store = _StubFutureStore()
+    task_state_futures = _StubFutureStore()
     scheduler = _StubModelWorkScheduler()
 
     async def _fake_route_session_info(model_id: str):
@@ -454,7 +454,7 @@ def test_mint_vla_train_step_route_uses_detached_session_info(monkeypatch) -> No
     async def _fake_enqueue_training_request_with_trace(**kwargs):
         await kwargs["enqueue_coro"]
 
-    monkeypatch.setattr(mint_routes, "future_store", future_store)
+    monkeypatch.setattr(mint_routes, "task_state_futures", task_state_futures)
     monkeypatch.setattr(mint_routes, "training_manager", None)
     monkeypatch.setattr(mint_routes, "_get_user_id", lambda _request: "user-a")
     monkeypatch.setattr(mint_routes, "_get_route_training_store_info", _fake_route_session_info)
@@ -559,10 +559,10 @@ def test_api_work_queue_dispatch_executes_mint_vla_train_step(monkeypatch) -> No
 def test_mint_interpolate_route_enqueues_expected_request(monkeypatch) -> None:
     from tinker_server.routes import mint as mint_routes
 
-    future_store = _StubFutureStore()
+    task_state_futures = _StubFutureStore()
     scheduler = _StubModelWorkScheduler()
 
-    monkeypatch.setattr(mint_routes, "future_store", future_store)
+    monkeypatch.setattr(mint_routes, "task_state_futures", task_state_futures)
     monkeypatch.setattr(mint_routes, "training_engine", object())
     monkeypatch.setattr(mint_routes, "training_manager", object())
     monkeypatch.setattr(mint_routes, "_get_user_id", lambda _request: "user-a")
@@ -600,8 +600,8 @@ def test_mint_interpolate_route_enqueues_expected_request(monkeypatch) -> None:
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert "request_id" in body
-    assert future_store.created == []
-    queued_request_id, queued_meta = future_store.queued[0]
+    assert task_state_futures.created == []
+    queued_request_id, queued_meta = task_state_futures.queued[0]
     assert queued_request_id == body["request_id"]
     assert queued_meta["op"] == "mint.interpolate_checkpoints"
     assert queued_meta["queue_state"] == "queued"
@@ -627,7 +627,7 @@ def test_mint_interpolate_do_path_claims_checkpoint_and_writes_ckpt_id(monkeypat
     from tinker_server.routes import mint as mint_routes
     import tinker_server.backend.mintx_ops as mintx_ops
 
-    future_store = _StubFutureStore()
+    task_state_futures = _StubFutureStore()
     written: dict[str, object] = {}
     claimed: dict[str, object] = {}
 
@@ -635,7 +635,7 @@ def test_mint_interpolate_do_path_claims_checkpoint_and_writes_ckpt_id(monkeypat
         claimed.update(kwargs)
         return "ckpt-rec-1"
 
-    monkeypatch.setattr(mint_routes, "future_store", future_store)
+    monkeypatch.setattr(mint_routes, "task_state_futures", task_state_futures)
     monkeypatch.setattr(mint_routes, "_claim_sampler_checkpoint_or_raise", _claim)
     monkeypatch.setattr(
         mintx_ops,
@@ -691,8 +691,8 @@ def test_mint_interpolate_do_path_claims_checkpoint_and_writes_ckpt_id(monkeypat
     assert written["path"].endswith("ema-0010")
     assert written["metadata"]["ckpt_id"] == "ckpt-rec-1"
     assert "created_at" in written["metadata"]
-    assert future_store.failed == []
-    assert future_store.resolved == [
+    assert task_state_futures.failed == []
+    assert task_state_futures.resolved == [
         (
             "req-interp-1",
             {
@@ -717,7 +717,7 @@ def test_mint_interpolate_do_path_marks_failed_checkpoint(monkeypatch, tmp_path)
     from tinker_server.routes import mint as mint_routes
     import tinker_server.backend.mintx_ops as mintx_ops
 
-    future_store = _StubFutureStore()
+    task_state_futures = _StubFutureStore()
     failed_marks: list[tuple[str | None, str]] = []
 
     async def _claim(**_kwargs):
@@ -726,7 +726,7 @@ def test_mint_interpolate_do_path_marks_failed_checkpoint(monkeypatch, tmp_path)
     async def _mark_failed(ckpt_id: str | None, *, fail_reason: str) -> None:
         failed_marks.append((ckpt_id, fail_reason))
 
-    monkeypatch.setattr(mint_routes, "future_store", future_store)
+    monkeypatch.setattr(mint_routes, "task_state_futures", task_state_futures)
     monkeypatch.setattr(mint_routes, "_claim_sampler_checkpoint_or_raise", _claim)
     monkeypatch.setattr(mint_routes, "mark_checkpoint_failed", _mark_failed)
     monkeypatch.setattr(
@@ -755,8 +755,8 @@ def test_mint_interpolate_do_path_marks_failed_checkpoint(monkeypatch, tmp_path)
     asyncio.run(mint_routes._do_interpolate_checkpoints("req-interp-err", request, "owner-a"))
 
     assert failed_marks == [("ckpt-rec-failed", "upload_error")]
-    assert future_store.resolved == []
-    assert future_store.failed == [("req-interp-err", "interpolate_failed")]
+    assert task_state_futures.resolved == []
+    assert task_state_futures.failed == [("req-interp-err", "interpolate_failed")]
 
 
 def test_mint_interpolate_do_path_mark_failed_error_does_not_mask_root_failure(monkeypatch, tmp_path) -> None:
@@ -764,7 +764,7 @@ def test_mint_interpolate_do_path_mark_failed_error_does_not_mask_root_failure(m
     from tinker_server.routes import mint as mint_routes
     import tinker_server.backend.mintx_ops as mintx_ops
 
-    future_store = _StubFutureStore()
+    task_state_futures = _StubFutureStore()
 
     async def _claim(**_kwargs):
         return "ckpt-rec-failed"
@@ -773,7 +773,7 @@ def test_mint_interpolate_do_path_mark_failed_error_does_not_mask_root_failure(m
         assert fail_reason == "upload_error"
         raise RuntimeError("mark_failed_broken")
 
-    monkeypatch.setattr(mint_routes, "future_store", future_store)
+    monkeypatch.setattr(mint_routes, "task_state_futures", task_state_futures)
     monkeypatch.setattr(mint_routes, "_claim_sampler_checkpoint_or_raise", _claim)
     monkeypatch.setattr(mint_routes, "mark_checkpoint_failed", _mark_failed)
     monkeypatch.setattr(
@@ -801,8 +801,8 @@ def test_mint_interpolate_do_path_mark_failed_error_does_not_mask_root_failure(m
 
     asyncio.run(mint_routes._do_interpolate_checkpoints("req-interp-err-2", request, "owner-a"))
 
-    assert future_store.resolved == []
-    assert future_store.failed == [("req-interp-err-2", "interpolate_failed")]
+    assert task_state_futures.resolved == []
+    assert task_state_futures.failed == [("req-interp-err-2", "interpolate_failed")]
 
 
 def test_mint_reverse_kl_route_and_background_path(monkeypatch) -> None:
@@ -810,7 +810,7 @@ def test_mint_reverse_kl_route_and_background_path(monkeypatch) -> None:
     from tinker_server.routes import training as training_routes
     from tinker_server.models.mint_types import ForwardBackwardReverseKLRequest
 
-    future_store = _StubFutureStore()
+    task_state_futures = _StubFutureStore()
     scheduler = _StubModelWorkScheduler()
 
     class _StubSession:
@@ -864,7 +864,7 @@ def test_mint_reverse_kl_route_and_background_path(monkeypatch) -> None:
         resolved_flags.append(bool(kwargs.get("is_admin")))
         return "/resolved/ref-step-0010"
 
-    monkeypatch.setattr(mint_routes, "future_store", future_store)
+    monkeypatch.setattr(mint_routes, "task_state_futures", task_state_futures)
     monkeypatch.setattr(mint_routes, "training_engine", _StubTrainingEngine())
     monkeypatch.setattr(mint_routes, "training_manager", _StubTrainingManager())
     monkeypatch.setattr(mint_routes, "_get_user_id", lambda _request: "user-a")
@@ -901,8 +901,8 @@ def test_mint_reverse_kl_route_and_background_path(monkeypatch) -> None:
 
     assert resp.status_code == 200, resp.text
     request_id = resp.json()["request_id"]
-    assert future_store.created == []
-    queued_request_id, queued_meta = future_store.queued[0]
+    assert task_state_futures.created == []
+    queued_request_id, queued_meta = task_state_futures.queued[0]
     assert queued_request_id == request_id
     assert queued_meta["op"] == "mint.forward_backward_reverse_kl"
     assert queued_meta["model_id"] == "model-123"
@@ -924,7 +924,7 @@ def test_mint_reverse_kl_route_and_background_path(monkeypatch) -> None:
 
     asyncio.run(mint_routes._do_forward_backward_reverse_kl(request_id, request, "user-a"))
 
-    assert future_store.resolved == [
+    assert task_state_futures.resolved == [
         (
             request_id,
             {
@@ -953,7 +953,7 @@ def test_mint_reverse_kl_route_uses_detached_training_info_without_route_runtime
     from tinker_server.routes import mint as mint_routes
     from tinker_server.routes import training as training_routes
 
-    future_store = _StubFutureStore()
+    task_state_futures = _StubFutureStore()
     scheduler = _StubModelWorkScheduler()
 
     async def _get_training_route_session_info(model_id: str):
@@ -969,7 +969,7 @@ def test_mint_reverse_kl_route_uses_detached_training_info_without_route_runtime
     async def _noop_protect(_info: dict) -> None:
         return None
 
-    monkeypatch.setattr(mint_routes, "future_store", future_store)
+    monkeypatch.setattr(mint_routes, "task_state_futures", task_state_futures)
     monkeypatch.setattr(mint_routes, "training_engine", None)
     monkeypatch.setattr(mint_routes, "training_manager", None)
     monkeypatch.setattr(mint_routes, "_get_user_id", lambda _request: "user-a")
@@ -1005,8 +1005,8 @@ def test_mint_reverse_kl_route_uses_detached_training_info_without_route_runtime
 
     assert resp.status_code == 200, resp.text
     request_id = resp.json()["request_id"]
-    assert future_store.created == []
-    queued_request_id, queued_meta = future_store.queued[0]
+    assert task_state_futures.created == []
+    queued_request_id, queued_meta = task_state_futures.queued[0]
     assert queued_request_id == request_id
     assert queued_meta["op"] == "mint.forward_backward_reverse_kl"
     assert queued_meta["model_id"] == "model-123"
@@ -1060,7 +1060,7 @@ def test_mint_reverse_kl_route_refreshes_detached_enqueue_protection(monkeypatch
     from tinker_server.routes import mint as mint_routes
     from tinker_server.routes import training as training_routes
 
-    future_store = _StubFutureStore()
+    task_state_futures = _StubFutureStore()
     scheduler = _StubModelWorkScheduler()
     protected: list[dict] = []
 
@@ -1077,7 +1077,7 @@ def test_mint_reverse_kl_route_refreshes_detached_enqueue_protection(monkeypatch
     async def _protect_training_session_enqueue_window(session_info: dict) -> None:
         protected.append(dict(session_info))
 
-    monkeypatch.setattr(mint_routes, "future_store", future_store)
+    monkeypatch.setattr(mint_routes, "task_state_futures", task_state_futures)
     monkeypatch.setattr(mint_routes, "training_engine", None)
     monkeypatch.setattr(mint_routes, "training_manager", None)
     monkeypatch.setattr(mint_routes, "_get_user_id", lambda _request: "user-a")

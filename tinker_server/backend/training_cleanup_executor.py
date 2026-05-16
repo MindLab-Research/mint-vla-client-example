@@ -106,7 +106,7 @@ async def cleanup_stale_training_sessions_once_impl(*, stale_after_s: float | No
     if stale_after_s <= 0:
         return []
 
-    from .task_state_store import task_state_futures as future_store
+    from .task_state_store import task_state_futures
     from .resource_pool import get_resource_pool
     from .session_heartbeat_store import session_heartbeat_store
     from .training_session_store import async_list_training_sessions, delete_training_session
@@ -144,7 +144,7 @@ async def cleanup_stale_training_sessions_once_impl(*, stale_after_s: float | No
 
         reason = f"stale heartbeat (> {stale_after_s:.1f}s)"
         try:
-            failed_request_ids = await future_store.async_fail_training_requests_for_model(
+            failed_request_ids = await task_state_futures.async_fail_training_requests_for_model(
                 model_id,
                 f"Training session terminated due to {reason}",
             )

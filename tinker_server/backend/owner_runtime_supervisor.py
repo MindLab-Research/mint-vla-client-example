@@ -63,10 +63,10 @@ def _future_reap_interval_s() -> float:
 
 def run_future_reaper_once() -> dict[str, Any]:
     from .capacity_manager import capacity_manager
-    from .task_state_store import task_state_futures as future_store
+    from .task_state_store import task_state_futures
 
-    asyncio.run(future_store.async_ensure_started())
-    reaped = asyncio.run(future_store.async_reap())
+    asyncio.run(task_state_futures.async_ensure_started())
+    reaped = asyncio.run(task_state_futures.async_reap())
     released: list[str] = []
     for rid in list(reaped.get("expired", [])) + list(reaped.get("timed_out", [])):
         asyncio.run(capacity_manager.async_release_all(str(rid)))

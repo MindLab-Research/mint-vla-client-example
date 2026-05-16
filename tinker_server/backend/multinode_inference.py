@@ -849,9 +849,9 @@ def _create_multinode_vllm_actor(
                 else:
                     min_tokens = int(tokens_generated)
             try:
-                from .task_state_store import task_state_futures as future_store
+                from .task_state_store import task_state_futures
 
-                await future_store.async_update_meta(
+                await task_state_futures.async_update_meta(
                     outer_request_id,
                     meta={
                         "stage": "decode",
@@ -1498,9 +1498,9 @@ def _create_multinode_vllm_actor(
             add_request_wait_s = 0.0
             add_request_exec_s = 0.0
             try:
-                from .task_state_store import task_state_futures as future_store
+                from .task_state_store import task_state_futures
 
-                await future_store.async_update_meta(
+                await task_state_futures.async_update_meta(
                     outer_request_id,
                     meta={
                         "stage": "prefill",

@@ -906,9 +906,9 @@ def _create_extended_server_class(
                 return
             self._progress_last[request_id] = now
             try:
-                from tinker_server.backend.task_state_store import task_state_futures as future_store
+                from tinker_server.backend.task_state_store import task_state_futures
 
-                await future_store.async_update_meta(
+                await task_state_futures.async_update_meta(
                     request_id,
                     meta={
                         "stage": stage,
@@ -1418,9 +1418,9 @@ def _create_extended_server_class(
                 lora_request=lora_request,
             )
             try:
-                from tinker_server.backend.task_state_store import task_state_futures as future_store
+                from tinker_server.backend.task_state_store import task_state_futures
 
-                await future_store.async_update_meta(
+                await task_state_futures.async_update_meta(
                     request_id,
                     meta={
                         "stage": "prefill",
@@ -1683,9 +1683,9 @@ def _create_extended_server_class(
                 lora_request=None,  # No LoRA = base model
             )
             try:
-                from tinker_server.backend.task_state_store import task_state_futures as future_store
+                from tinker_server.backend.task_state_store import task_state_futures
 
-                await future_store.async_update_meta(
+                await task_state_futures.async_update_meta(
                     request_id,
                     meta={
                         "stage": "prefill",

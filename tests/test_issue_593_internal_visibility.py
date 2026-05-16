@@ -42,7 +42,7 @@ def test_issue_593_internal_metrics_exports_scheduler_and_supervisor(monkeypatch
         return {
             "capacity": {},
             "work_queue": {},
-            "future_store": {},
+            "task_state_futures": {},
             "actors": {},
             "model_work_scheduler": {
                 "depth": 5,

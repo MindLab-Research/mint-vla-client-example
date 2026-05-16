@@ -267,7 +267,7 @@ async def _enqueue_training_request_with_trace(
         if backend:
             span.set_attribute("backend", str(backend))
         span.add_event(
-            "future_store_ready",
+            "task_state_futures_ready",
             {
                 "elapsed_ms": round(future_ready_elapsed_ms, 3),
                 "route_elapsed_ms": round(future_ready_elapsed_ms, 3),
@@ -337,7 +337,7 @@ async def _enqueue_training_model_work_route(
             "model_work_attempt_id": str(extra.get("model_work_attempt_id") or uuid.uuid4().hex),
         },
         queued_meta=queued_meta,
-        future_store_client=task_state_futures,
+        task_state_futures_client=task_state_futures,
         scheduler_client=model_work_scheduler,
         trace_enqueue=_enqueue_training_request_with_trace,
         trace_kwargs={
@@ -1655,7 +1655,7 @@ async def _enqueue_internal_serialized_model_op(
             ordering_key=f"training_session:{model_id}",
             extra=dict(extra),
             queued_meta=_build_training_queued_meta(op=op, model_id=model_id),
-            future_store_client=task_state_futures,
+            task_state_futures_client=task_state_futures,
             scheduler_client=model_work_scheduler,
         )
         created = True
@@ -1788,7 +1788,7 @@ async def create_model(
             ordering_key=f"training_session:{model_id}",
             extra=scheduler_extra,
             queued_meta=_build_training_queued_meta(op="create_model", model_id=model_id),
-            future_store_client=task_state_futures,
+            task_state_futures_client=task_state_futures,
             scheduler_client=model_work_scheduler,
             trace_enqueue=_enqueue_training_request_with_trace,
             trace_kwargs={
@@ -2193,7 +2193,7 @@ async def create_model_from_state(
             ordering_key=f"training_session:{model_id}",
             extra=scheduler_extra,
             queued_meta=_build_training_queued_meta(op="create_model_from_state", model_id=model_id),
-            future_store_client=task_state_futures,
+            task_state_futures_client=task_state_futures,
             scheduler_client=model_work_scheduler,
             trace_enqueue=_enqueue_training_request_with_trace,
             trace_kwargs={

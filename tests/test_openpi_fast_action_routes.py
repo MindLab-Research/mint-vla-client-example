@@ -355,9 +355,9 @@ def test_do_act_resolves_future_with_actions(monkeypatch) -> None:
     from tinker_server.models.types import ActRequest, EncodedTextChunk, ImageChunk, ModelInput, TensorData
 
     manager = _FakeActionSessionManager()
-    future_store = _FakeFutureStore()
+    task_state_futures = _FakeFutureStore()
     monkeypatch.setattr(action_routes, "action_session_manager", manager, raising=False)
-    monkeypatch.setattr(action_routes, "future_store", future_store, raising=False)
+    monkeypatch.setattr(action_routes, "task_state_futures", task_state_futures, raising=False)
 
     request = ActRequest(
         action_session_id="action-session-1",
@@ -381,7 +381,7 @@ def test_do_act_resolves_future_with_actions(monkeypatch) -> None:
             "temperature": 3.0,
         }
     ]
-    assert future_store.resolved == [
+    assert task_state_futures.resolved == [
         (
             "req-1",
             {
@@ -395,17 +395,17 @@ def test_do_act_resolves_future_with_actions(monkeypatch) -> None:
             },
         )
     ]
-    assert future_store.failed == []
+    assert task_state_futures.failed == []
 
 
-def test_do_act_prefers_async_future_store_api(monkeypatch) -> None:
+def test_do_act_prefers_async_task_state_futures_api(monkeypatch) -> None:
     from tinker_server.routes import action_sampling as action_routes
     from tinker_server.models.types import ActRequest, EncodedTextChunk, ImageChunk, ModelInput, TensorData
 
     manager = _FakeActionSessionManager()
-    future_store = _AsyncResolvingFutureStore()
+    task_state_futures = _AsyncResolvingFutureStore()
     monkeypatch.setattr(action_routes, "action_session_manager", manager, raising=False)
-    monkeypatch.setattr(action_routes, "future_store", future_store, raising=False)
+    monkeypatch.setattr(action_routes, "task_state_futures", task_state_futures, raising=False)
 
     request = ActRequest(
         action_session_id="action-session-1",
@@ -429,7 +429,7 @@ def test_do_act_prefers_async_future_store_api(monkeypatch) -> None:
             "temperature": 1.5,
         }
     ]
-    assert future_store.resolved == [
+    assert task_state_futures.resolved == [
         (
             "req-2",
             {
@@ -443,7 +443,7 @@ def test_do_act_prefers_async_future_store_api(monkeypatch) -> None:
             },
         )
     ]
-    assert future_store.failed == []
+    assert task_state_futures.failed == []
 
 
 def test_do_act_logs_when_future_fail_marking_fails(monkeypatch) -> None:
@@ -471,7 +471,7 @@ def test_do_act_logs_when_future_fail_marking_fails(monkeypatch) -> None:
         _ExplodingActionSessionManager(),
         raising=False,
     )
-    monkeypatch.setattr(action_routes, "future_store", _ExplodingFutureStore(), raising=False)
+    monkeypatch.setattr(action_routes, "task_state_futures", _ExplodingFutureStore(), raising=False)
     monkeypatch.setattr(action_routes.logger, "exception", _record_log)
 
     request = ActRequest(
@@ -496,10 +496,10 @@ def test_do_act_logs_when_future_fail_marking_fails(monkeypatch) -> None:
 def test_mint_action_route_enqueues_expected_request(monkeypatch) -> None:
     from tinker_server.routes import mint as mint_routes
 
-    future_store = _AsyncFakeFutureStore()
+    task_state_futures = _AsyncFakeFutureStore()
     scheduler = _StubModelWorkScheduler()
 
-    monkeypatch.setattr(mint_routes, "future_store", future_store, raising=False)
+    monkeypatch.setattr(mint_routes, "task_state_futures", task_state_futures, raising=False)
     monkeypatch.setattr(mint_routes, "action_session_manager", object(), raising=False)
 
     import tinker_server.backend.model_work_scheduler as mws
@@ -539,8 +539,8 @@ def test_mint_action_route_enqueues_expected_request(monkeypatch) -> None:
 
     assert resp.status_code == 200, resp.text
     request_id = resp.json()["request_id"]
-    assert future_store.created == []
-    queued_request_id, queued_meta = future_store.queued[0]
+    assert task_state_futures.created == []
+    queued_request_id, queued_meta = task_state_futures.queued[0]
     assert queued_request_id == request_id
     assert queued_meta["op"] == "mint.action.act"
     assert queued_meta["action_session_id"] == "action-session-1"
@@ -563,7 +563,7 @@ def test_legacy_action_public_routes_are_not_exposed(monkeypatch) -> None:
     monkeypatch.setattr(service_routes, "action_session_manager", manager, raising=False)
     monkeypatch.setattr(service_routes, "_get_user_id", lambda _request: "user-1")
     monkeypatch.setattr(action_routes, "action_session_manager", manager, raising=False)
-    monkeypatch.setattr(action_routes, "future_store", _FakeFutureStore(), raising=False)
+    monkeypatch.setattr(action_routes, "task_state_futures", _FakeFutureStore(), raising=False)
     monkeypatch.setattr(mint_routes, "action_session_manager", manager, raising=False)
 
     app = FastAPI()

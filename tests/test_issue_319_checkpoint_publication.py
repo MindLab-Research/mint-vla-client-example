@@ -74,7 +74,7 @@ async def test_issue_319_save_weights_for_sampler_rejects_invalid_checkpoint_nam
     )
     monkeypatch.setattr(
         tr,
-        "future_store",
+        "task_state_futures",
         _StubFutureStore(resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail),
     )
 
@@ -135,7 +135,7 @@ async def test_issue_319_save_weights_for_sampler_fails_before_metadata(monkeypa
     )
     monkeypatch.setattr(
         tr,
-        "future_store",
+        "task_state_futures",
         _StubFutureStore(resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail),
     )
     monkeypatch.setattr(tr, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
@@ -207,7 +207,7 @@ async def test_issue_319_save_weights_for_sampler_mark_failed_error_does_not_mas
     monkeypatch.setattr(tr, "mark_checkpoint_failed", _mark_failed)
     monkeypatch.setattr(
         tr,
-        "future_store",
+        "task_state_futures",
         _StubFutureStore(resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail),
     )
     monkeypatch.setattr(tr, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
@@ -271,7 +271,7 @@ async def test_issue_319_save_weights_for_sampler_rejects_corrupt_safetensors(
     )
     monkeypatch.setattr(
         tr,
-        "future_store",
+        "task_state_futures",
         _StubFutureStore(resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail),
     )
     monkeypatch.setattr(tr, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
@@ -326,7 +326,7 @@ async def test_issue_319_save_state_fails_before_metadata(monkeypatch, tmp_path:
     monkeypatch.setattr(wt, "training_engine", SimpleNamespace(save_weights=_fake_save_weights))
     monkeypatch.setattr(
         wt,
-        "future_store",
+        "task_state_futures",
         _StubFutureStore(resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail),
     )
     monkeypatch.setattr(wt, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
@@ -386,7 +386,7 @@ async def test_issue_319_save_state_mark_failed_error_does_not_mask_root_failure
     monkeypatch.setattr(wt, "mark_checkpoint_failed", _mark_failed)
     monkeypatch.setattr(
         wt,
-        "future_store",
+        "task_state_futures",
         _StubFutureStore(resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail),
     )
     monkeypatch.setattr(wt, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
@@ -443,7 +443,7 @@ async def test_issue_319_save_state_accepts_openpi_training_checkpoint_before_me
     monkeypatch.setattr(wt, "training_engine", SimpleNamespace(save_weights=_fake_save_weights))
     monkeypatch.setattr(
         wt,
-        "future_store",
+        "task_state_futures",
         _StubFutureStore(resolve=_resolve, async_fail=_async_fail),
     )
     monkeypatch.setattr(wt, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
