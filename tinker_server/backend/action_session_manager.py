@@ -14,7 +14,6 @@ from .model_registry import get_model_config
 from .openpi_action_ray_runtime import (
     OpenPIActionRayRuntimeClient,
     _actor_ready_timeout_s,
-    start_openpi_action_ray_runtime,
 )
 from .openpi_fast_action_runtime import OpenPIFastActionRuntimeSpec
 from .openpi_fast_training import (
@@ -27,7 +26,7 @@ from .openpi_pi05_training import (
     OPENPI_PI05_TRAINING_BACKEND,
     get_openpi_pi05_config_name,
 )
-from .resource_pool import ActorType, get_resource_pool
+from .model_actor_registry import ActorType, get_model_actor_registry
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +98,7 @@ def _recover_detached_action_runtime_client(
     supports_base_model: Callable[[str], bool],
     supports_worker_module: Callable[[str], bool],
 ) -> OpenPIActionRayRuntimeClient | OpenPISharedRayRuntimeClient | None:
-    pool = get_resource_pool()
+    pool = get_model_actor_registry()
     shared_candidates: list[tuple[Any, OpenPIFastActionRuntimeSpec]] = []
     for entry in pool.iter_entries(prune_stale=True):
         metadata = dict(entry.metadata or {})
@@ -541,7 +540,7 @@ class ActionSessionRouter:
         raise ValueError(f"Action inference does not support {base_model!r}")
 
     def _recover_manager_for_session(self, action_session_id: str) -> object | None:
-        pool = get_resource_pool()
+        pool = get_model_actor_registry()
         candidate_managers: dict[int, object] = {}
         for entry in pool.iter_entries(prune_stale=True):
             metadata = dict(entry.metadata or {})

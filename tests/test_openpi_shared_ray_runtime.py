@@ -74,7 +74,7 @@ def _reset_shared_runtime_test_state(monkeypatch, openpi_shared_ray_runtime) -> 
     monkeypatch.setenv("PFS_TINKER_PATH", "/repo")
     monkeypatch.setattr(
         openpi_shared_ray_runtime,
-        "get_resource_pool",
+        "get_model_actor_registry",
         lambda: SimpleNamespace(
             unregister=lambda *_args, **_kwargs: None,
             register=lambda **_kwargs: None,
@@ -183,7 +183,7 @@ def test_start_openpi_shared_ray_runtime_reuses_actor_for_same_pool_key(monkeypa
     ]
 
 
-def test_start_openpi_shared_ray_runtime_registers_actor_metadata_in_resource_pool(monkeypatch) -> None:
+def test_start_openpi_shared_ray_runtime_registers_actor_metadata_in_model_actor_registry(monkeypatch) -> None:
     from tinker_server.backend import openpi_shared_ray_runtime
 
     state: dict[str, object] = {}
@@ -229,7 +229,7 @@ def test_start_openpi_shared_ray_runtime_registers_actor_metadata_in_resource_po
     monkeypatch.setattr(openpi_shared_ray_runtime, "ensure_openpi_ray_initialized", lambda: None)
     monkeypatch.setattr(openpi_shared_ray_runtime, "OpenPISharedRayRuntimeActor", _FakeActorBuilder())
     monkeypatch.setattr(openpi_shared_ray_runtime, "OpenPISharedRayRuntimeClient", _FakeClient)
-    monkeypatch.setattr(openpi_shared_ray_runtime, "get_resource_pool", lambda: _FakePool())
+    monkeypatch.setattr(openpi_shared_ray_runtime, "get_model_actor_registry", lambda: _FakePool())
     monkeypatch.setattr(
         openpi_shared_ray_runtime,
         "_openpi_runtime_env_vars",
@@ -440,7 +440,7 @@ def test_start_openpi_shared_ray_runtime_applies_single_node_pin(monkeypatch) ->
     monkeypatch.setattr(openpi_shared_ray_runtime.ray, "is_initialized", lambda: False)
     monkeypatch.setattr(openpi_shared_ray_runtime, "OpenPISharedRayRuntimeActor", _FakeActorBuilder())
     monkeypatch.setattr(openpi_shared_ray_runtime, "OpenPISharedRayRuntimeClient", _FakeClient)
-    monkeypatch.setattr(openpi_shared_ray_runtime, "get_resource_pool", lambda: _FakePool())
+    monkeypatch.setattr(openpi_shared_ray_runtime, "get_model_actor_registry", lambda: _FakePool())
     monkeypatch.setattr(openpi_shared_ray_runtime, "_openpi_runtime_env_vars", lambda: {"PYTHONPATH": "/runtime/site-packages:/repo:/hf"})
     monkeypatch.setattr(
         openpi_shared_ray_runtime,
@@ -566,7 +566,7 @@ def test_shared_client_close_cleans_up_new_actor_after_failed_initial_create_ses
     _reset_shared_runtime_test_state(monkeypatch, openpi_shared_ray_runtime)
     monkeypatch.setattr(openpi_shared_ray_runtime, "ensure_openpi_ray_initialized", lambda: None)
     monkeypatch.setattr(openpi_shared_ray_runtime, "OpenPISharedRayRuntimeActor", _FakeActorBuilder())
-    monkeypatch.setattr(openpi_shared_ray_runtime, "get_resource_pool", lambda: _FakePool())
+    monkeypatch.setattr(openpi_shared_ray_runtime, "get_model_actor_registry", lambda: _FakePool())
     monkeypatch.setattr(openpi_shared_ray_runtime.ray, "is_initialized", lambda: True)
     monkeypatch.setattr(openpi_shared_ray_runtime.ray, "get_actor", _raise_missing_actor)
     monkeypatch.setattr(openpi_shared_ray_runtime.ray, "get", _fake_ray_get)
@@ -670,7 +670,7 @@ def test_shared_client_close_does_not_kill_actor_after_successful_create_session
     _reset_shared_runtime_test_state(monkeypatch, openpi_shared_ray_runtime)
     monkeypatch.setattr(openpi_shared_ray_runtime, "ensure_openpi_ray_initialized", lambda: None)
     monkeypatch.setattr(openpi_shared_ray_runtime, "OpenPISharedRayRuntimeActor", _FakeActorBuilder())
-    monkeypatch.setattr(openpi_shared_ray_runtime, "get_resource_pool", lambda: _FakePool())
+    monkeypatch.setattr(openpi_shared_ray_runtime, "get_model_actor_registry", lambda: _FakePool())
     monkeypatch.setattr(openpi_shared_ray_runtime.ray, "is_initialized", lambda: True)
     monkeypatch.setattr(openpi_shared_ray_runtime.ray, "get_actor", _raise_missing_actor)
     monkeypatch.setattr(openpi_shared_ray_runtime.ray, "get", _fake_ray_get)
@@ -784,7 +784,7 @@ def test_shared_client_shutdown_reclaims_actor_when_last_session_exits(monkeypat
     _reset_shared_runtime_test_state(monkeypatch, openpi_shared_ray_runtime)
     monkeypatch.setattr(openpi_shared_ray_runtime, "ensure_openpi_ray_initialized", lambda: None)
     monkeypatch.setattr(openpi_shared_ray_runtime, "OpenPISharedRayRuntimeActor", _FakeActorBuilder())
-    monkeypatch.setattr(openpi_shared_ray_runtime, "get_resource_pool", lambda: _FakePool())
+    monkeypatch.setattr(openpi_shared_ray_runtime, "get_model_actor_registry", lambda: _FakePool())
     monkeypatch.setattr(openpi_shared_ray_runtime.ray, "is_initialized", lambda: True)
     monkeypatch.setattr(openpi_shared_ray_runtime.ray, "get_actor", _raise_missing_actor)
     monkeypatch.setattr(openpi_shared_ray_runtime.ray, "get", _fake_ray_get)
@@ -853,7 +853,7 @@ def test_start_openpi_shared_ray_runtime_uses_model_id_as_runtime_session_key(mo
     monkeypatch.setattr(openpi_shared_ray_runtime, "ensure_openpi_ray_initialized", lambda: None)
     monkeypatch.setattr(openpi_shared_ray_runtime, "OpenPISharedRayRuntimeActor", _FakeActorBuilder())
     monkeypatch.setattr(openpi_shared_ray_runtime, "OpenPISharedRayRuntimeClient", _FakeClient)
-    monkeypatch.setattr(openpi_shared_ray_runtime, "get_resource_pool", lambda: _FakePool())
+    monkeypatch.setattr(openpi_shared_ray_runtime, "get_model_actor_registry", lambda: _FakePool())
 
     session_a = _make_session("model-a", "shared-http-session")
     session_b = _make_session("model-b", "shared-http-session")
@@ -936,7 +936,7 @@ def test_start_openpi_shared_ray_runtime_cleans_up_detached_actor_when_ready_fai
     monkeypatch.setattr(openpi_shared_ray_runtime, "ensure_openpi_ray_initialized", lambda: None)
     monkeypatch.setattr(openpi_shared_ray_runtime, "OpenPISharedRayRuntimeActor", _FakeActorBuilder())
     monkeypatch.setattr(openpi_shared_ray_runtime, "OpenPISharedRayRuntimeClient", _FailingClient)
-    monkeypatch.setattr(openpi_shared_ray_runtime, "get_resource_pool", lambda: _FakePool())
+    monkeypatch.setattr(openpi_shared_ray_runtime, "get_model_actor_registry", lambda: _FakePool())
     monkeypatch.setattr(openpi_shared_ray_runtime.ray, "is_initialized", lambda: True)
     monkeypatch.setattr(openpi_shared_ray_runtime.ray, "get_actor", _raise_missing_actor)
     monkeypatch.setattr(openpi_shared_ray_runtime.ray, "get", _fake_ray_get)

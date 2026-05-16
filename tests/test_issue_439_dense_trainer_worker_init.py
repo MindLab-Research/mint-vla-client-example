@@ -50,7 +50,7 @@ def test_issue_439_dense_trainer_does_not_pass_removed_session_state_root(monkey
         def mark_ready(self, _actor_name: str) -> None:
             return None
 
-    monkeypatch.setattr(dt, "get_resource_pool", lambda: _FakePool())
+    monkeypatch.setattr(dt, "get_model_actor_registry", lambda: _FakePool())
     monkeypatch.setattr(dt, "_get_or_create_pg", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(dt.ray, "get_actor", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("missing")))
     monkeypatch.setattr(dt.ray, "get", lambda value, timeout=None: value)
@@ -137,7 +137,7 @@ def test_issue_561_poisoned_dense_trainer_is_not_reused(monkeypatch, base_model:
         retire_calls.append(dict(kwargs))
         return "ok"
 
-    monkeypatch.setattr(dt, "get_resource_pool", lambda: _FakePool())
+    monkeypatch.setattr(dt, "get_model_actor_registry", lambda: _FakePool())
     monkeypatch.setattr(dt, "retire_dense_trainer", _fake_retire_dense_trainer)
     monkeypatch.setattr(dt, "_get_or_create_pg", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(dt.ray, "get_actor", lambda *args, **kwargs: _ExistingActor())
@@ -186,7 +186,7 @@ def test_issue_561_poisoned_dense_trainer_recreate_aborts_when_retire_fails(monk
         def ensure_gpus_available(self, _num_gpus: int) -> None:
             raise AssertionError("creation must not start after failed retire")
 
-    monkeypatch.setattr(dt, "get_resource_pool", lambda: _FakePool())
+    monkeypatch.setattr(dt, "get_model_actor_registry", lambda: _FakePool())
     monkeypatch.setattr(dt.ray, "get_actor", lambda *args, **kwargs: object())
     monkeypatch.setattr(dt, "retire_dense_trainer", lambda **kwargs: "kill_failed")
 
@@ -258,7 +258,7 @@ def test_issue_561_dead_dense_actor_absent_name_recreates(monkeypatch) -> None:
         return out
 
     monkeypatch.setattr(dt, "RayActorError", _DeadActorError)
-    monkeypatch.setattr(dt, "get_resource_pool", lambda: _FakePool())
+    monkeypatch.setattr(dt, "get_model_actor_registry", lambda: _FakePool())
     monkeypatch.setattr(dt.ray, "get_actor", _fake_get_actor)
     monkeypatch.setattr(dt.ray, "get", lambda value, timeout=None: value)
     monkeypatch.setattr(dt, "_get_or_create_pg", lambda *_args, **_kwargs: object())
@@ -284,7 +284,7 @@ def test_issue_561_inflight_guard_uses_actor_identity(monkeypatch) -> None:
     monkeypatch.setattr(dt, "_inflight_errors", {})
     monkeypatch.setattr(
         dt,
-        "get_resource_pool",
+        "get_model_actor_registry",
         lambda: (_ for _ in ()).throw(AssertionError("creation path should be guarded by actor identity")),
     )
 
@@ -353,7 +353,7 @@ def test_issue_561_retire_dense_trainer_persists_fatal_metadata(monkeypatch) -> 
         def unregister(self, actor_name: str):
             unregisters.append(actor_name)
 
-    monkeypatch.setattr(dt, "get_resource_pool", lambda: _FakePool())
+    monkeypatch.setattr(dt, "get_model_actor_registry", lambda: _FakePool())
     monkeypatch.setattr(runtime_obs_module, "runtime_observability", obs)
     monkeypatch.setattr(dt.ray_kill, "kill", lambda *args, **kwargs: killed.append(dict(kwargs)))
     monkeypatch.setattr(dt, "_remove_pg", lambda actor_name: None)
@@ -416,7 +416,7 @@ def test_issue_561_retire_metadata_failure_does_not_block_recreate(monkeypatch) 
         def unregister(self, actor_name: str):
             unregisters.append(actor_name)
 
-    monkeypatch.setattr(dt, "get_resource_pool", lambda: _FakePool())
+    monkeypatch.setattr(dt, "get_model_actor_registry", lambda: _FakePool())
     monkeypatch.setattr(runtime_obs_module, "runtime_observability", obs)
     monkeypatch.setattr(dt.ray_kill, "kill", lambda *args, **kwargs: None)
     monkeypatch.setattr(dt, "_remove_pg", lambda actor_name: None)

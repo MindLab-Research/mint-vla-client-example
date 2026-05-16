@@ -5,21 +5,21 @@ import pytest
 
 pytest.importorskip("ray")
 
-from tinker_server.backend import resource_pool as resource_pool_module
-from tinker_server.backend.resource_pool import ActorType, get_resource_pool
+from tinker_server.backend import model_actor_registry as model_actor_registry_module
+from tinker_server.backend.model_actor_registry import ActorType, get_model_actor_registry
 from tinker_server.backend.training_session_manager import TrainingSession
 from tinker_server.backend.verl_training import VerlTrainingEngine
 
 
-def _get_local_resource_pool(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(resource_pool_module, "_detached_enabled", lambda: False)
-    pool = get_resource_pool()
+def _get_local_model_actor_registry(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(model_actor_registry_module, "_detached_enabled", lambda: False)
+    pool = get_model_actor_registry()
     pool.clear(kill_actors=False)
     return pool
 
 
 def test_issue_230_timeout_does_not_kill_actor(monkeypatch: pytest.MonkeyPatch) -> None:
-    pool = _get_local_resource_pool(monkeypatch)
+    pool = _get_local_model_actor_registry(monkeypatch)
     actor_name = f"peft_trainer_test_{uuid.uuid4().hex}_maxr64"
     model_id = f"model_{uuid.uuid4().hex}"
 
@@ -34,7 +34,7 @@ def test_issue_230_timeout_does_not_kill_actor(monkeypatch: pytest.MonkeyPatch) 
     pool.mark_ready(actor_name)
 
     engine = VerlTrainingEngine()
-    engine._resource_pool_actor_names[model_id] = actor_name
+    engine._model_actor_registry_actor_names[model_id] = actor_name
 
     session = TrainingSession(
         model_id=model_id,
@@ -71,7 +71,7 @@ def test_issue_230_timeout_does_not_kill_actor(monkeypatch: pytest.MonkeyPatch) 
 
 
 def test_issue_230_keepalive_touches_dense_actor_without_inflight_mark(monkeypatch: pytest.MonkeyPatch) -> None:
-    pool = _get_local_resource_pool(monkeypatch)
+    pool = _get_local_model_actor_registry(monkeypatch)
     actor_name = f"peft_trainer_test_{uuid.uuid4().hex}_maxr64"
     model_id = f"model_{uuid.uuid4().hex}"
 
@@ -86,7 +86,7 @@ def test_issue_230_keepalive_touches_dense_actor_without_inflight_mark(monkeypat
     pool.mark_ready(actor_name)
 
     engine = VerlTrainingEngine()
-    engine._resource_pool_actor_names[model_id] = actor_name
+    engine._model_actor_registry_actor_names[model_id] = actor_name
 
     session = TrainingSession(
         model_id=model_id,
@@ -129,7 +129,7 @@ def test_issue_230_keepalive_touches_dense_actor_without_inflight_mark(monkeypat
 
 
 def test_issue_230_keepalive_cancellation_silences_late_exception(monkeypatch: pytest.MonkeyPatch) -> None:
-    pool = _get_local_resource_pool(monkeypatch)
+    pool = _get_local_model_actor_registry(monkeypatch)
     actor_name = f"peft_trainer_test_{uuid.uuid4().hex}_maxr64"
     model_id = f"model_{uuid.uuid4().hex}"
 
@@ -143,7 +143,7 @@ def test_issue_230_keepalive_cancellation_silences_late_exception(monkeypatch: p
     pool.mark_ready(actor_name)
 
     engine = VerlTrainingEngine()
-    engine._resource_pool_actor_names[model_id] = actor_name
+    engine._model_actor_registry_actor_names[model_id] = actor_name
 
     session = TrainingSession(
         model_id=model_id,
@@ -192,7 +192,7 @@ def test_issue_230_keepalive_cancellation_silences_late_exception(monkeypatch: p
 
 
 def test_issue_230_unbind_session_keeps_shared_dense_actor_pinned(monkeypatch: pytest.MonkeyPatch) -> None:
-    pool = _get_local_resource_pool(monkeypatch)
+    pool = _get_local_model_actor_registry(monkeypatch)
     actor_name = f"peft_trainer_test_{uuid.uuid4().hex}_maxr64"
     model_id = f"model_{uuid.uuid4().hex}"
     other_model_id = f"model_{uuid.uuid4().hex}"
@@ -209,8 +209,8 @@ def test_issue_230_unbind_session_keeps_shared_dense_actor_pinned(monkeypatch: p
 
     engine = VerlTrainingEngine()
     shared_worker = object()
-    engine._resource_pool_actor_names[model_id] = actor_name
-    engine._resource_pool_actor_names[other_model_id] = actor_name
+    engine._model_actor_registry_actor_names[model_id] = actor_name
+    engine._model_actor_registry_actor_names[other_model_id] = actor_name
     engine._workers[model_id] = shared_worker
     engine._workers[other_model_id] = shared_worker
 
@@ -234,8 +234,8 @@ def test_issue_230_unbind_session_keeps_shared_dense_actor_pinned(monkeypatch: p
     asyncio.run(engine.shutdown_session(session))
 
     assert killed == []
-    assert model_id not in engine._resource_pool_actor_names
-    assert other_model_id in engine._resource_pool_actor_names
+    assert model_id not in engine._model_actor_registry_actor_names
+    assert other_model_id in engine._model_actor_registry_actor_names
     assert model_id not in engine._workers
     assert entry.current_session == other_model_id
     assert pool.get(actor_name).current_session == other_model_id
@@ -244,7 +244,7 @@ def test_issue_230_unbind_session_keeps_shared_dense_actor_pinned(monkeypatch: p
 
 
 def test_issue_230_shutdown_session_keeps_protected_dense_actor_alive(monkeypatch: pytest.MonkeyPatch) -> None:
-    pool = _get_local_resource_pool(monkeypatch)
+    pool = _get_local_model_actor_registry(monkeypatch)
     actor_name = f"peft_trainer_test_{uuid.uuid4().hex}_maxr64"
     model_id = f"model_{uuid.uuid4().hex}"
 
@@ -271,7 +271,7 @@ def test_issue_230_shutdown_session_keeps_protected_dense_actor_alive(monkeypatc
             return True
 
     worker = _ShutdownRecorder()
-    engine._resource_pool_actor_names[model_id] = actor_name
+    engine._model_actor_registry_actor_names[model_id] = actor_name
     engine._workers[model_id] = worker
 
     session = TrainingSession(
@@ -295,7 +295,7 @@ def test_issue_230_shutdown_session_keeps_protected_dense_actor_alive(monkeypatc
 
     assert worker.calls == 0
     assert killed == []
-    assert model_id not in engine._resource_pool_actor_names
+    assert model_id not in engine._model_actor_registry_actor_names
     assert model_id not in engine._workers
     assert entry.current_session is None
     assert pool.is_protected(actor_name) is True

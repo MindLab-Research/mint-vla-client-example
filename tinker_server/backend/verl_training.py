@@ -40,7 +40,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Default idle timeout for TrainingWorker (seconds)
-# Set to 0 to disable self-termination (ResourcePool LRU eviction handles lifecycle)
+# Set to 0 to disable self-termination (ModelActorRegistry LRU eviction handles lifecycle)
 DEFAULT_IDLE_TIMEOUT = 0  # Disabled - LRU eviction manages actor lifecycle
 
 
@@ -2066,9 +2066,9 @@ class VerlTrainingEngine:
         self.default_base_model = default_base_model
         self.default_lora_rank = default_lora_rank
         self._workers: dict[str, ray.actor.ActorHandle] = {}
-        # Map model_id -> Ray actor name registered in ResourcePool, used to keep
+        # Map model_id -> Ray actor name registered in ModelActorRegistry, used to keep
         # actors marked as active during long-running calls (32k forward/backward).
-        self._resource_pool_actor_names: dict[str, str] = {}
+        self._model_actor_registry_actor_names: dict[str, str] = {}
         self._actor_loaded_sessions: dict[str, str] = {}
         self._actor_volatile_sessions: dict[str, set[str]] = {}
         # Session-level poisoned marker for mid-call actor failures.
@@ -2146,24 +2146,24 @@ class VerlTrainingEngine:
     def _touch_actor(self, session: "TrainingSession") -> None:
         """Update last_accessed timestamp and session for the session's actor.
 
-        ResourcePool idleness is time-based; a 32k forward/backward can easily run
+        ModelActorRegistry idleness is time-based; a 32k forward/backward can easily run
         longer than the idle timeout. We keep actors marked as active while a
         request is in-flight to prevent eviction of busy actors.
         """
-        actor_name = self._resource_pool_actor_names.get(session.model_id)
+        actor_name = self._model_actor_registry_actor_names.get(session.model_id)
         if not actor_name:
             return
         try:
-            from .resource_pool import get_resource_pool
+            from .model_actor_registry import get_model_actor_registry
 
-            resource_pool = get_resource_pool()
-            resource_pool.touch(actor_name)
-            resource_pool.set_session(actor_name, session.model_id)
+            model_actor_registry = get_model_actor_registry()
+            model_actor_registry.touch(actor_name)
+            model_actor_registry.set_session(actor_name, session.model_id)
         except Exception:
             logger.debug("[%s] skip touch_actor for %s", session.model_id, actor_name, exc_info=True)
 
     def _actor_name_for_session(self, session: "TrainingSession") -> str | None:
-        return self._resource_pool_actor_names.get(session.model_id)
+        return self._model_actor_registry_actor_names.get(session.model_id)
 
     def _raise_if_session_poisoned(self, session: "TrainingSession", *, op: str) -> None:
         hard_error = self._hard_poisoned_sessions.get(session.model_id)
@@ -2209,7 +2209,7 @@ class VerlTrainingEngine:
         from .megatron_distributed import MegatronSessionStateManager, _make_megatron_actor_name
 
         session_manager = MegatronSessionStateManager()
-        actor_name = self._resource_pool_actor_names.get(session.model_id)
+        actor_name = self._model_actor_registry_actor_names.get(session.model_id)
         if not actor_name:
             actor_name = _make_megatron_actor_name(session.base_model or "")
 
@@ -2379,7 +2379,7 @@ class VerlTrainingEngine:
             async_get_or_create_megatron_worker_group,
         )
         from .model_registry import is_persistent_model
-        from .resource_pool import ActorType, get_resource_pool
+        from .model_actor_registry import ActorType, get_model_actor_registry
 
         base_model, requested_model = self._resolve_megatron_base_model(session)
         actor_name = _make_megatron_actor_name(base_model or requested_model or session.base_model or "")
@@ -2425,7 +2425,7 @@ class VerlTrainingEngine:
             except ValueError as e:
                 raise RuntimeError(f"[{session.model_id}] missing worker for backend=megatron") from e
 
-        get_resource_pool().register(
+        get_model_actor_registry().register(
             actor_name=actor_name,
             actor_type=ActorType.MEGATRON,
             num_gpus=distributed_config.world_size,
@@ -2435,8 +2435,8 @@ class VerlTrainingEngine:
             session_id=session.model_id,
             protected=is_persistent_model(base_model or requested_model or ""),
         )
-        get_resource_pool().mark_ready(actor_name)
-        self._resource_pool_actor_names[session.model_id] = actor_name
+        get_model_actor_registry().mark_ready(actor_name)
+        self._model_actor_registry_actor_names[session.model_id] = actor_name
         self._workers[session.model_id] = worker
         self._touch_actor(session)
         session.backend = "megatron"
@@ -2744,9 +2744,9 @@ class VerlTrainingEngine:
         if not actor_name:
             return None
         try:
-            from .resource_pool import get_resource_pool
+            from .model_actor_registry import get_model_actor_registry
 
-            entry = get_resource_pool().get(str(actor_name))
+            entry = get_model_actor_registry().get(str(actor_name))
         except Exception:
             return None
         node_id = getattr(entry, "node_id", None) if entry is not None else None
@@ -2773,7 +2773,7 @@ class VerlTrainingEngine:
         if fatal_reason is None:
             return
 
-        actor_name = str(self._resource_pool_actor_names.get(session.model_id) or getattr(session, "actor_name", "") or "")
+        actor_name = str(self._model_actor_registry_actor_names.get(session.model_id) or getattr(session, "actor_name", "") or "")
         if not actor_name:
             return
 
@@ -2860,7 +2860,7 @@ class VerlTrainingEngine:
             logger.error(retire_failure)
 
         self._workers.pop(session.model_id, None)
-        self._resource_pool_actor_names.pop(session.model_id, None)
+        self._model_actor_registry_actor_names.pop(session.model_id, None)
         if str(getattr(session, "actor_name", "") or "") == actor_name:
             session.actor_name = None
             session.namespace = None
@@ -2903,7 +2903,7 @@ class VerlTrainingEngine:
         except Exception as e:
             status, failure_class = self._classify_training_failure(e)
             actor_name = str(
-                self._resource_pool_actor_names.get(session.model_id)
+                self._model_actor_registry_actor_names.get(session.model_id)
                 or getattr(session, "actor_name", "")
                 or ""
             )
@@ -2993,7 +2993,7 @@ class VerlTrainingEngine:
             session_id=session.model_id,
         )
         self._workers[model_id] = dense.actor
-        self._resource_pool_actor_names[model_id] = dense.actor_name
+        self._model_actor_registry_actor_names[model_id] = dense.actor_name
         session.actor_name = dense.actor_name
         session.namespace = RAY_NAMESPACE
         self._touch_actor(session)
@@ -3091,7 +3091,7 @@ class VerlTrainingEngine:
             )
             return None
         self._workers[session.model_id] = worker
-        self._resource_pool_actor_names[session.model_id] = actor_name
+        self._model_actor_registry_actor_names[session.model_id] = actor_name
         self._touch_actor(session)
         if session.backend == "peft":
             runtime_observability.record_dense_actor_bind_decision(
@@ -3130,10 +3130,10 @@ class VerlTrainingEngine:
         model_id = session.model_id
         worker = self._workers.get(model_id)
         authoritative_actor_name = str(getattr(session, "actor_name", "") or "")
-        bound_actor_name = str(self._resource_pool_actor_names.get(model_id) or "")
+        bound_actor_name = str(self._model_actor_registry_actor_names.get(model_id) or "")
         if authoritative_actor_name and bound_actor_name and bound_actor_name != authoritative_actor_name:
             self._workers.pop(model_id, None)
-            self._resource_pool_actor_names[model_id] = authoritative_actor_name
+            self._model_actor_registry_actor_names[model_id] = authoritative_actor_name
             worker = None
         if worker is None:
             worker = await self._rebind_worker_from_session_metadata(session, reason=f"{op}:metadata_rebind")
@@ -3152,7 +3152,7 @@ class VerlTrainingEngine:
         if session.backend != "peft":
             return worker
 
-        # Dense trainer can be evicted by ResourcePool between RL stages.
+        # Dense trainer can be evicted by ModelActorRegistry between RL stages.
         try:
             await async_get_ray_ref(worker.heartbeat.remote(), timeout_s=5)
             return worker
@@ -3403,7 +3403,7 @@ class VerlTrainingEngine:
         interval_s: float = 30.0,
         timeout_s: float | None = None,
     ):
-        """Await a Ray call while periodically touching ResourcePool.
+        """Await a Ray call while periodically touching ModelActorRegistry.
 
         Uses one Ray ObjectRef future so polling-slice timeouts do not cancel
         or restart the underlying Ray wait.
@@ -3616,7 +3616,7 @@ class VerlTrainingEngine:
             session.backend = "megatron"
             from .megatron_distributed import _make_megatron_actor_name
 
-            self._resource_pool_actor_names[model_id] = _make_megatron_actor_name(base_model or "")
+            self._model_actor_registry_actor_names[model_id] = _make_megatron_actor_name(base_model or "")
             self._touch_actor(session)
             # Note: reinit_lora_weights is now called inside get_or_create_megatron_worker_group
             # with session_id for proper session state management (Issue #44)
@@ -3650,7 +3650,7 @@ class VerlTrainingEngine:
                 flush=True,
             )
             worker = dense.actor
-            self._resource_pool_actor_names[model_id] = dense.actor_name
+            self._model_actor_registry_actor_names[model_id] = dense.actor_name
             self._touch_actor(session)
 
             # Reinitialize LoRA weights for fresh session (statelessness)
@@ -3678,12 +3678,12 @@ class VerlTrainingEngine:
                     timeout_s=effective_reinit_timeout_s,
                 )
             except Exception:
-                self._resource_pool_actor_names.pop(model_id, None)
+                self._model_actor_registry_actor_names.pop(model_id, None)
                 self._workers.pop(model_id, None)
                 try:
-                    from .resource_pool import get_resource_pool
+                    from .model_actor_registry import get_model_actor_registry
 
-                    get_resource_pool().clear_session(model_id)
+                    get_model_actor_registry().clear_session(model_id)
                 except Exception:
                     pass
                 raise
@@ -3707,11 +3707,11 @@ class VerlTrainingEngine:
                 "on",
             )
             if skip_ready_wait:
-                actor_name = self._resource_pool_actor_names.get(model_id)
+                actor_name = self._model_actor_registry_actor_names.get(model_id)
                 if actor_name:
-                    from .resource_pool import get_resource_pool
+                    from .model_actor_registry import get_model_actor_registry
 
-                    get_resource_pool().mark_ready(actor_name)
+                    get_model_actor_registry().mark_ready(actor_name)
 
                 self._workers[model_id] = worker
                 session.is_active = True
@@ -3744,12 +3744,12 @@ class VerlTrainingEngine:
                 timeout_s=ready_timeout_s,
             )
         except Exception:
-            self._resource_pool_actor_names.pop(model_id, None)
+            self._model_actor_registry_actor_names.pop(model_id, None)
             self._workers.pop(model_id, None)
             try:
-                from .resource_pool import get_resource_pool
+                from .model_actor_registry import get_model_actor_registry
 
-                get_resource_pool().clear_session(model_id)
+                get_model_actor_registry().clear_session(model_id)
             except Exception:
                 pass
             raise
@@ -3757,11 +3757,11 @@ class VerlTrainingEngine:
             f"[DEBUG {model_id}] __ray_ready__ done",
             flush=True,
         )
-        actor_name = self._resource_pool_actor_names.get(model_id)
+        actor_name = self._model_actor_registry_actor_names.get(model_id)
         if actor_name:
-            from .resource_pool import get_resource_pool
+            from .model_actor_registry import get_model_actor_registry
 
-            get_resource_pool().mark_ready(actor_name)
+            get_model_actor_registry().mark_ready(actor_name)
 
         self._workers[model_id] = worker
         session.is_active = True
@@ -4832,17 +4832,17 @@ class VerlTrainingEngine:
         """Delete actor-local session state, then release or unbind the worker."""
         model_id = session.model_id
 
-        actor_name = self._resource_pool_actor_names.get(model_id)
+        actor_name = self._model_actor_registry_actor_names.get(model_id)
         worker = self._workers.get(model_id)
         authoritative_actor_name = str(getattr(session, "actor_name", "") or "")
         if authoritative_actor_name and actor_name and actor_name != authoritative_actor_name:
             self._workers.pop(model_id, None)
-            self._resource_pool_actor_names[model_id] = authoritative_actor_name
+            self._model_actor_registry_actor_names[model_id] = authoritative_actor_name
             worker = None
             actor_name = authoritative_actor_name
         if worker is None:
             worker = await self._rebind_worker_from_session_metadata(session, reason="shutdown_session")
-            actor_name = self._resource_pool_actor_names.get(model_id) or str(getattr(session, "actor_name", "") or "") or None
+            actor_name = self._model_actor_registry_actor_names.get(model_id) or str(getattr(session, "actor_name", "") or "") or None
         traceparent = get_current_traceparent()
 
         if worker is not None:
@@ -4865,7 +4865,7 @@ class VerlTrainingEngine:
         actor_protected = False
         other_users: list[str] = []
         if actor_name:
-            other_users = [mid for mid, an in self._resource_pool_actor_names.items() if an == actor_name and mid != model_id]
+            other_users = [mid for mid, an in self._model_actor_registry_actor_names.items() if an == actor_name and mid != model_id]
             try:
                 from .training_session_store import list_training_sessions
 
@@ -4885,15 +4885,15 @@ class VerlTrainingEngine:
         should_kill_actor = not other_users
         if actor_name:
             try:
-                from .resource_pool import get_resource_pool
+                from .model_actor_registry import get_model_actor_registry
 
-                actor_protected = get_resource_pool().is_protected(actor_name)
+                actor_protected = get_model_actor_registry().is_protected(actor_name)
                 if actor_protected:
                     should_kill_actor = False
             except Exception:
                 pass
 
-        self._resource_pool_actor_names.pop(model_id, None)
+        self._model_actor_registry_actor_names.pop(model_id, None)
         self._workers.pop(model_id, None)
 
         actor_loaded_sessions = getattr(self, "_actor_loaded_sessions", None)
@@ -4919,9 +4919,9 @@ class VerlTrainingEngine:
 
         try:
             if actor_name:
-                from .resource_pool import get_resource_pool
+                from .model_actor_registry import get_model_actor_registry
 
-                get_resource_pool().set_session(actor_name, replacement_session)
+                get_model_actor_registry().set_session(actor_name, replacement_session)
         except Exception:
             pass
 

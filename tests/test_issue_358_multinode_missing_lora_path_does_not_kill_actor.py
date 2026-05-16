@@ -75,7 +75,7 @@ def test_issue_358_remote_adapter_file_missing_does_not_kill_actor(
     async def _raise_missing_adapter_asset(*_args, **_kwargs):
         raise remote_error
 
-    monkeypatch.setattr(mi, "ray_get_with_resource_pool_keepalive", _raise_missing_adapter_asset)
+    monkeypatch.setattr(mi, "ray_get_with_model_actor_registry_keepalive", _raise_missing_adapter_asset)
     monkeypatch.setattr(mi, "get_current_traceparent", lambda: None)
     monkeypatch.setattr(
         mi.ray_kill,
@@ -120,7 +120,7 @@ def test_issue_358_unrelated_file_not_found_still_kills_actor(
     async def _raise_unrelated_missing_file(*_args, **_kwargs):
         raise unrelated_error
 
-    monkeypatch.setattr(mi, "ray_get_with_resource_pool_keepalive", _raise_unrelated_missing_file)
+    monkeypatch.setattr(mi, "ray_get_with_model_actor_registry_keepalive", _raise_unrelated_missing_file)
     monkeypatch.setattr(mi, "get_current_traceparent", lambda: None)
     monkeypatch.setattr(
         mi.ray_kill,

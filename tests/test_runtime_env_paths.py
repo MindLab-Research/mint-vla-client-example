@@ -1215,7 +1215,7 @@ def test_actor_runtime_env_vars_forwards_control_plane_actor_names(tmp_path):
             "MINT_TRAINING_SESSION_STORE_ACTOR_NAME": "mint-training-session-store-test",
             "MINT_SESSION_HEARTBEAT_ACTOR_NAME": "mint-session-heartbeat-test",
             "MINT_SESSION_INDEX_ACTOR_NAME": "mint-session-index-test",
-            "MINT_RESOURCE_POOL_ACTOR_NAME": "mint-resource-pool-test",
+            "MINT_MODEL_ACTOR_REGISTRY_ACTOR_NAME": "mint-model-actor-registry-test",
             "MINT_TRAINING_CLEANUP_EXECUTOR_ACTOR_NAME": "mint-training-cleanup-test",
             "MINT_SAMPLING_CLEANUP_EXECUTOR_ACTOR_NAME": "mint-sampling-cleanup-test",
             "MINT_FUTURE_REPLAY_ROOT_DIR": "/tmp/future-replay-test",
@@ -1236,7 +1236,7 @@ def test_actor_runtime_env_vars_forwards_control_plane_actor_names(tmp_path):
     assert actor_env["MINT_TRAINING_SESSION_STORE_ACTOR_NAME"] == "mint-training-session-store-test"
     assert actor_env["MINT_SESSION_HEARTBEAT_ACTOR_NAME"] == "mint-session-heartbeat-test"
     assert actor_env["MINT_SESSION_INDEX_ACTOR_NAME"] == "mint-session-index-test"
-    assert actor_env["MINT_RESOURCE_POOL_ACTOR_NAME"] == "mint-resource-pool-test"
+    assert actor_env["MINT_MODEL_ACTOR_REGISTRY_ACTOR_NAME"] == "mint-model-actor-registry-test"
     assert actor_env["MINT_TRAINING_CLEANUP_EXECUTOR_ACTOR_NAME"] == "mint-training-cleanup-test"
     assert actor_env["MINT_SAMPLING_CLEANUP_EXECUTOR_ACTOR_NAME"] == "mint-sampling-cleanup-test"
     assert actor_env["MINT_FUTURE_REPLAY_ROOT_DIR"] == "/tmp/future-replay-test"

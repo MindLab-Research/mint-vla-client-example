@@ -156,7 +156,7 @@ async def test_issue_561_dense_fatal_error_retires_actor(monkeypatch: pytest.Mon
     )
     session.actor_name = "peft_trainer_qwen__qwen3_0_6b_maxr64"
     session.namespace = "tinker"
-    engine._resource_pool_actor_names[session.model_id] = session.actor_name
+    engine._model_actor_registry_actor_names[session.model_id] = session.actor_name
 
     worker = SimpleNamespace(forward_backward=_RemoteCall())
 
@@ -208,7 +208,7 @@ async def test_issue_561_dense_fatal_error_retires_actor(monkeypatch: pytest.Mon
     assert retire_calls[0]["fatal_op"] == "forward_backward"
     assert "forward_backward" in str(retire_calls[0]["reason"])
     assert "device-side assert" in str(retire_calls[0]["reason"])
-    assert session.model_id not in engine._resource_pool_actor_names
+    assert session.model_id not in engine._model_actor_registry_actor_names
     assert session.actor_name is None
     assert session.namespace is None
     snap = obs.snapshot()
@@ -246,7 +246,7 @@ async def test_issue_561_dense_retire_failure_hard_poisons_session(monkeypatch: 
     )
     session.actor_name = "peft_trainer_qwen__qwen3_0_6b_maxr64"
     session.namespace = "tinker"
-    engine._resource_pool_actor_names[session.model_id] = session.actor_name
+    engine._model_actor_registry_actor_names[session.model_id] = session.actor_name
 
     worker = SimpleNamespace(forward_backward=_RemoteCall())
 
@@ -289,7 +289,7 @@ async def test_issue_561_dense_retire_failure_hard_poisons_session(monkeypatch: 
     assert "outcome=kill_failed" in hard_error
     with pytest.raises(RuntimeError, match="dense actor retirement failed"):
         engine._raise_if_session_poisoned(session, op="load_weights")
-    assert session.model_id not in engine._resource_pool_actor_names
+    assert session.model_id not in engine._model_actor_registry_actor_names
     assert session.actor_name is None
     assert session.namespace is None
     assert any(

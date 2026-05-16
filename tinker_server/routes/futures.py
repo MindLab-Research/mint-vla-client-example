@@ -476,9 +476,9 @@ async def retrieve_future(
             tracked_session_id = meta.get("model_id")
             if actor_name:
                 try:
-                    from ..backend.resource_pool import get_resource_pool
+                    from ..backend.model_actor_registry import get_model_actor_registry
 
-                    rp = get_resource_pool()
+                    rp = get_model_actor_registry()
                     await rp.async_touch(actor_name)
                     if tracked_session_id:
                         await rp.async_set_session(actor_name, tracked_session_id)

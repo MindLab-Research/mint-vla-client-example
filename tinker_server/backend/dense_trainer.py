@@ -1,9 +1,9 @@
-"""PEFT (dense) trainer actor helpers (ResourcePool is the source of truth).
+"""PEFT (dense) trainer actor helpers (ModelActorRegistry is the source of truth).
 
 This module replaces the previous DenseTrainerPool tracking dictionary with:
 - deterministic actor naming
 - a small inflight-creation guard keyed by Ray actor identity
-- ResourcePool registration for lifecycle and eviction
+- ModelActorRegistry registration for lifecycle and eviction
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from . import ray_kill
 from .ray_placement_groups import PlacementGroupMismatchError, get_named_placement_group
-from .resource_pool import ActorType, actor_observability_metadata, get_resource_pool
+from .model_actor_registry import ActorType, actor_observability_metadata, get_model_actor_registry
 from .volc_placement import parse_model_gpu_placement
 from ..config import PFS_PYTHONPATH, RAY_NAMESPACE
 
@@ -138,7 +138,7 @@ def _dense_reuse_block_reason_from_metadata(metadata: dict | None) -> str | None
 
 
 def dense_trainer_reuse_block_reason(actor_name: str) -> str | None:
-    entry = get_resource_pool().get(actor_name)
+    entry = get_model_actor_registry().get(actor_name)
     if entry is None:
         return None
     return _dense_reuse_block_reason_from_metadata(entry.metadata)
@@ -227,8 +227,8 @@ def _remove_pg(actor_name: str) -> None:
 
 
 def clear_dense_trainer_session(session_id: str) -> int:
-    """Clear ResourcePool current_session pointers for dense trainers."""
-    return get_resource_pool().clear_session(session_id, actor_type=ActorType.DENSE)
+    """Clear ModelActorRegistry current_session pointers for dense trainers."""
+    return get_model_actor_registry().clear_session(session_id, actor_type=ActorType.DENSE)
 
 
 def retire_dense_trainer(
@@ -245,7 +245,7 @@ def retire_dense_trainer(
     """Poison a dense trainer so it cannot be reused after fatal GPU failures."""
     from .runtime_observability import runtime_observability
 
-    pool = get_resource_pool()
+    pool = get_model_actor_registry()
     entry = pool.get(actor_name)
     retire_error: str | None = None
     auxiliary_failures: list[str] = []
@@ -400,7 +400,7 @@ def get_or_create_dense_trainer(
 ) -> DenseTrainerHandle:
     """Get an existing dense trainer actor or create a new one.
 
-    The returned actor is registered in ResourcePool with metadata:
+    The returned actor is registered in ModelActorRegistry with metadata:
       - max_lora_rank
       - actual_rank (current session rank)
     """
@@ -436,7 +436,7 @@ def get_or_create_dense_trainer(
         try:
             bind_decision = "create"
 
-            pool = get_resource_pool()
+            pool = get_model_actor_registry()
             from .model_registry import is_persistent_model
             from .runtime_observability import runtime_observability
 
@@ -607,8 +607,8 @@ def get_or_create_dense_trainer(
 
 
 def remove_dense_trainers(*, base_model: str, kill_actor: bool = True) -> int:
-    """Remove dense trainer actors for base_model from ResourcePool (and optionally Ray)."""
-    pool = get_resource_pool()
+    """Remove dense trainer actors for base_model from ModelActorRegistry (and optionally Ray)."""
+    pool = get_model_actor_registry()
     targets = [e for e in pool.iter_entries() if e.actor_type == ActorType.DENSE and e.base_model == base_model]
     if not targets:
         return 0

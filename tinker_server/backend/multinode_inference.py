@@ -40,7 +40,7 @@ from .async_ray_control import async_get_ray_ref
 from .gpu_binding_helpers import gpu_bindings_from_ray_gpu_ids
 from .multinode_resources import MultiNodeEngineResources, compute_multinode_engine_resources
 from .ray_placement_groups import PlacementGroupMismatchError, get_named_placement_group
-from .ray_keepalive import ray_get_with_resource_pool_keepalive
+from .ray_keepalive import ray_get_with_model_actor_registry_keepalive
 from .vllm_scheduler_observability import (
     VllmStatsObserver,
     install_vllm_iteration_observability_patches,
@@ -2336,14 +2336,14 @@ class MultiNodeInferenceEngine:
             def _attach_existing_actor(existing_actor_handle) -> None:
                 self.engine = existing_actor_handle
                 self._initialized = True
-                from tinker_server.backend.resource_pool import (
+                from tinker_server.backend.model_actor_registry import (
                     ActorType,
                     actor_observability_metadata,
-                    get_resource_pool,
+                    get_model_actor_registry,
                 )
 
-                resource_pool = get_resource_pool()
-                resource_pool.register(
+                model_actor_registry = get_model_actor_registry()
+                model_actor_registry.register(
                     actor_name=self.actor_name,
                     actor_type=ActorType.VLLM,
                     num_gpus=total_required_gpus,
@@ -2353,7 +2353,7 @@ class MultiNodeInferenceEngine:
                     protected=is_persistent,
                     metadata=dict(actor_observability_metadata(self.engine) or {}),
                 )
-                resource_pool.mark_ready(self.actor_name)
+                model_actor_registry.mark_ready(self.actor_name)
 
             # Try to connect to existing actor
             existing_actor = None
@@ -2567,12 +2567,12 @@ class MultiNodeInferenceEngine:
             os.makedirs(self.shared_adapter_dir, exist_ok=True)
 
             # Step 1: Ensure enough GPUs are available (evict idle actors if needed)
-            from tinker_server.backend.resource_pool import (
+            from tinker_server.backend.model_actor_registry import (
                 ActorType,
                 actor_observability_metadata,
-                get_resource_pool,
+                get_model_actor_registry,
             )
-            resource_pool = get_resource_pool()
+            model_actor_registry = get_model_actor_registry()
             logger.info(
                 f"Ensuring {total_required_gpus} GPUs available for multi-node vLLM "
                 f"(TP={self.tensor_parallel_size}, PP={self.pipeline_parallel_size}, "
@@ -2580,7 +2580,7 @@ class MultiNodeInferenceEngine:
                 f"controller_gpus={controller_gpus}, worker_gpus={worker_gpus})"
             )
             await asyncio.to_thread(
-                resource_pool.ensure_gpus_available,
+                model_actor_registry.ensure_gpus_available,
                 total_required_gpus,
                 300,
                 exclude_actor_types=(ActorType.MEGATRON,),
@@ -2895,9 +2895,9 @@ class MultiNodeInferenceEngine:
             self._initialized = True
             logger.info(f"MultiNodeInferenceEngine initialized: {self.actor_name}")
 
-            # Register with unified resource pool for LRU tracking
+            # Register with unified model actor registry for LRU tracking
             # Multi-node vLLM internally manages GPU workers, but we track total GPUs for eviction
-            resource_pool.register(
+            model_actor_registry.register(
                 actor_name=self.actor_name,
                 actor_type=ActorType.VLLM,
                 num_gpus=total_required_gpus,
@@ -2908,9 +2908,9 @@ class MultiNodeInferenceEngine:
                 metadata=dict(actor_observability_metadata(self.engine) or {}),
             )
             # Mark as ready since initialization completed
-            resource_pool.mark_ready(self.actor_name)
+            model_actor_registry.mark_ready(self.actor_name)
             logger.info(
-                f"Registered {self.actor_name} with ResourcePool ({total_required_gpus} GPUs)"
+                f"Registered {self.actor_name} with ModelActorRegistry ({total_required_gpus} GPUs)"
             )
 
     async def add_lora_for_session(
@@ -2961,7 +2961,7 @@ class MultiNodeInferenceEngine:
                 lora_name=sampling_session_id,
                 traceparent=traceparent,
             )
-            await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
+            await ray_get_with_model_actor_registry_keepalive(ref, actor_name=self.actor_name)
         except Exception:
             # Roll back registry on load failure so retries don't trip
             # "already has lora_int_id" for the same session.
@@ -3023,7 +3023,7 @@ class MultiNodeInferenceEngine:
                 lora_path,
                 lora_id,
             )
-            await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
+            await ray_get_with_model_actor_registry_keepalive(ref, actor_name=self.actor_name)
             logger.info(
                 "add_lora_for_session_from_path start sampling_session_id=%s path=%s lora_int_id=%s stage=after_add_lora_wait",
                 sampling_session_id,
@@ -3115,7 +3115,7 @@ class MultiNodeInferenceEngine:
         )
         try:
             timeout_s = ray_get_timeout_s if ray_get_timeout_s > 0 else None
-            result = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name, timeout_s=timeout_s)
+            result = await ray_get_with_model_actor_registry_keepalive(ref, actor_name=self.actor_name, timeout_s=timeout_s)
         except asyncio.TimeoutError as e:
             # Avoid killing the actor: killing forces a 60-90s re-init and pollutes latency measurements.
             # Try aborting just this request, then fail loud to the client.
@@ -3211,7 +3211,7 @@ class MultiNodeInferenceEngine:
         )
         try:
             timeout_s = ray_get_timeout_s if ray_get_timeout_s > 0 else None
-            raw = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name, timeout_s=timeout_s)
+            raw = await ray_get_with_model_actor_registry_keepalive(ref, actor_name=self.actor_name, timeout_s=timeout_s)
         except asyncio.TimeoutError as e:
             try:
                 abort_ref = self.engine.abort_request.remote(request_id, traceparent=traceparent)
@@ -3296,7 +3296,7 @@ class MultiNodeInferenceEngine:
         )
         try:
             timeout_s = ray_get_timeout_s if ray_get_timeout_s > 0 else None
-            result = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name, timeout_s=timeout_s)
+            result = await ray_get_with_model_actor_registry_keepalive(ref, actor_name=self.actor_name, timeout_s=timeout_s)
         except asyncio.TimeoutError as e:
             raise RuntimeError(
                 f"multinode_vllm_ray_get_timeout_s={ray_get_timeout_s} request_id={request_id}"
@@ -3377,7 +3377,7 @@ class MultiNodeInferenceEngine:
         )
         try:
             timeout_s = ray_get_timeout_s if ray_get_timeout_s > 0 else None
-            result = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name, timeout_s=timeout_s)
+            result = await ray_get_with_model_actor_registry_keepalive(ref, actor_name=self.actor_name, timeout_s=timeout_s)
         except asyncio.TimeoutError as e:
             raise RuntimeError(
                 f"multinode_vllm_ray_get_timeout_s={ray_get_timeout_s} request_id={request_id}"
@@ -3421,7 +3421,7 @@ class MultiNodeInferenceEngine:
             traceparent = get_current_traceparent()
             try:
                 ref = self.engine.remove_lora.remote(removed_lora_id, traceparent=traceparent)
-                await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
+                await ray_get_with_model_actor_registry_keepalive(ref, actor_name=self.actor_name)
             except Exception as e:
                 logger.warning(f"Failed to remove LoRA {removed_lora_id} from engine: {e}")
 

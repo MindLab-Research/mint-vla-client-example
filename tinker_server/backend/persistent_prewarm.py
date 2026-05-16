@@ -30,7 +30,7 @@ async def prewarm_persistent_models(
       - Training actors (pooled PEFT trainers and MegatronWorkerGroup)
       - vLLM inference actors (MultiModelInferenceManager)
 
-    and marks them as ResourcePool protected to prevent LRU eviction.
+    and marks them as ModelActorRegistry protected to prevent LRU eviction.
     """
     failures: list[str] = []
 
@@ -68,9 +68,9 @@ async def prewarm_persistent_models(
         normalize_model_name,
         requires_fp8,
     )
-    from tinker_server.backend.resource_pool import get_resource_pool
+    from tinker_server.backend.model_actor_registry import get_model_actor_registry
 
-    resource_pool = get_resource_pool()
+    model_actor_registry = get_model_actor_registry()
 
     logger.info(
         f"[prewarm] persistent models={models} train_lora_rank={lora_rank} train_lr={learning_rate} "
@@ -146,12 +146,12 @@ async def prewarm_persistent_models(
                     )
                     actor_name = _make_megatron_actor_name(base_model or model_name)
                     # Protect as soon as the actor is registered, so readiness timeouts don't leave it evictable.
-                    resource_pool.set_protected(actor_name, True)
+                    model_actor_registry.set_protected(actor_name, True)
                     logger.info(f"[prewarm] training __ray_ready__ scheduled model={model_name} actor={actor_name}")
 
                     try:
                         await async_get_ray_ref(actor.__ray_ready__.remote(), timeout_s=megatron_ready_timeout_s)
-                        resource_pool.mark_ready(actor_name)
+                        model_actor_registry.mark_ready(actor_name)
                         logger.info(f"[prewarm] training ready+protected model={model_name} actor={actor_name}")
                     except SystemExit as ready_err:
                         if getattr(ready_err, "code", None) == 15:
@@ -228,17 +228,17 @@ async def prewarm_persistent_models(
             actor_name = getattr(engine, "actor_name", None)
             if not actor_name:
                 raise RuntimeError("engine has no actor_name")
-            ok = resource_pool.set_protected(actor_name, True)
+            ok = model_actor_registry.set_protected(actor_name, True)
             if not ok:
                 for _ in range(50):
                     await asyncio.sleep(0.1)
-                    ok = resource_pool.set_protected(actor_name, True)
+                    ok = model_actor_registry.set_protected(actor_name, True)
                     if ok:
                         break
             if ok:
                 logger.info(f"[prewarm] inference ready+protected model={model_name} actor={actor_name}")
             else:
-                logger.warning(f"[prewarm] inference ready (but not in ResourcePool) model={model_name} actor={actor_name}")
+                logger.warning(f"[prewarm] inference ready (but not in ModelActorRegistry) model={model_name} actor={actor_name}")
         except SystemExit as e:
             if getattr(e, "code", None) == 15:
                 raise
@@ -268,7 +268,7 @@ async def prewarm_persistent_models(
                     session_id=None,
                 )
                 actor_name = dense.actor_name
-                resource_pool.set_protected(actor_name, True)
+                model_actor_registry.set_protected(actor_name, True)
                 logger.info(f"[prewarm] training ready+protected model={model_name} actor={actor_name}")
             except Exception as e:
                 _record_failure("training", model_name, e)

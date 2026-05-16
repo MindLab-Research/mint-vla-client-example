@@ -631,7 +631,7 @@ def test_issue_193_megatron_midcall_mutating_op_fails_closed_even_when_actor_was
     recovered_worker = object()
     actor_name = "shared-megatron-actor"
     engine._workers[model_id] = dead_worker
-    engine._resource_pool_actor_names[model_id] = actor_name
+    engine._model_actor_registry_actor_names[model_id] = actor_name
 
     session = TrainingSession(
         model_id=model_id,
@@ -679,7 +679,7 @@ def test_issue_193_dense_recycle_fails_loud_after_dead_worker_during_forward(mon
     dead_worker = object()
     recovered_worker = object()
     engine._workers[model_id] = dead_worker
-    engine._resource_pool_actor_names[model_id] = "dense-actor"
+    engine._model_actor_registry_actor_names[model_id] = "dense-actor"
 
     session = TrainingSession(
         model_id=model_id,

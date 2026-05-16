@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 
 async def cleanup_stale_actors_once() -> dict[str, int]:
-    """Cleanup stale Ray actors and register alive ones with ResourcePool.
+    """Cleanup stale Ray actors and register alive ones with ModelActorRegistry.
 
     Returns a summary dict so callers can surface observability and health.
     """
@@ -22,7 +22,7 @@ async def cleanup_stale_actors_once() -> dict[str, int]:
 
     from . import ray_kill
     from .multi_lora_engine import PERSISTENT_NAMESPACE
-    from .resource_pool import ActorType, get_resource_pool
+    from .model_actor_registry import ActorType, get_model_actor_registry
 
     if not ray.is_initialized():
         init_ray(namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
@@ -76,7 +76,7 @@ async def cleanup_stale_actors_once() -> dict[str, int]:
         return {"cleaned": 0, "registered": 0}
 
     logger.info("Found %s actors in namespace %s, checking status...", len(tinker_actors), PERSISTENT_NAMESPACE)
-    resource_pool = get_resource_pool()
+    model_actor_registry = get_model_actor_registry()
     cleaned = 0
     registered = 0
     ready_timeout_s = float(os.environ.get("MINT_STARTUP_RECONCILE_READY_TIMEOUT_S", "5"))
@@ -108,7 +108,7 @@ async def cleanup_stale_actors_once() -> dict[str, int]:
                 except Exception as kill_err:
                     logger.warning("Failed to kill legacy dense trainer actor %s: %s", name, kill_err)
                 try:
-                    resource_pool.unregister(name)
+                    model_actor_registry.unregister(name)
                 except Exception:
                     pass
                 continue
@@ -164,7 +164,7 @@ async def cleanup_stale_actors_once() -> dict[str, int]:
 
                 from tinker_server.backend.model_registry import is_persistent_model
 
-                resource_pool.register(
+                model_actor_registry.register(
                     actor_name=name,
                     actor_type=actor_type,
                     num_gpus=num_gpus,
@@ -176,7 +176,7 @@ async def cleanup_stale_actors_once() -> dict[str, int]:
                     protected=bool(actor_type != ActorType.OPENPI and base_model and is_persistent_model(base_model)),
                     metadata=metadata,
                 )
-                resource_pool.mark_ready(name)
+                model_actor_registry.mark_ready(name)
                 registered += 1
                 logger.info("Registered existing actor: %s (%s, %s GPUs)", name, actor_type.value, num_gpus)
             except ray.exceptions.RayActorError:
@@ -236,7 +236,7 @@ async def cleanup_stale_actors_once() -> dict[str, int]:
 
                     from tinker_server.backend.model_registry import is_persistent_model
 
-                    resource_pool.register(
+                    model_actor_registry.register(
                         actor_name=name,
                         actor_type=actor_type,
                         num_gpus=num_gpus,
@@ -255,7 +255,7 @@ async def cleanup_stale_actors_once() -> dict[str, int]:
         except ValueError:
             logger.debug("Actor %s not found (name registered but no actor)", name)
             try:
-                resource_pool.unregister(name)
+                model_actor_registry.unregister(name)
             except Exception:
                 pass
             try:

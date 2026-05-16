@@ -77,7 +77,7 @@ def _request_stub(user_id: str | None = None):
     return SimpleNamespace(state=SimpleNamespace(user_data=user_data), headers={})
 
 
-class _FakeResourcePool:
+class _FakeModelActorRegistry:
     def __init__(self) -> None:
         self.calls: list[tuple[str, int]] = []
 
@@ -85,10 +85,10 @@ class _FakeResourcePool:
         self.calls.append((actor_name, int(delta)))
 
 
-def _install_fake_resource_pool(monkeypatch: pytest.MonkeyPatch, pool: _FakeResourcePool) -> None:
-    module = types.ModuleType("tinker_server.backend.resource_pool")
-    module.get_resource_pool = lambda: pool
-    monkeypatch.setitem(sys.modules, "tinker_server.backend.resource_pool", module)
+def _install_fake_model_actor_registry(monkeypatch: pytest.MonkeyPatch, pool: _FakeModelActorRegistry) -> None:
+    module = types.ModuleType("tinker_server.backend.model_actor_registry")
+    module.get_model_actor_registry = lambda: pool
+    monkeypatch.setitem(sys.modules, "tinker_server.backend.model_actor_registry", module)
 
 
 def test_issue_364_register_multi_lora_session_persists_detached_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -328,7 +328,7 @@ async def test_issue_364_sample_once_restores_local_sampler_from_detached_store(
     manager = SessionManager()
     engine = _FakeEngine()
     manager.set_multi_model_manager(_FakeMultiModelManager(engine))
-    resource_pool = _FakeResourcePool()
+    model_actor_registry = _FakeModelActorRegistry()
 
     async def _async_get_sampling_session_info(session_id: str):
         assert session_id == "sess-364-live"
@@ -356,7 +356,7 @@ async def test_issue_364_sample_once_restores_local_sampler_from_detached_store(
         "tinker_server.backend.model_registry.get_model_config",
         lambda _model_name: SimpleNamespace(max_model_len=8192),
     )
-    _install_fake_resource_pool(monkeypatch, resource_pool)
+    _install_fake_model_actor_registry(monkeypatch, model_actor_registry)
 
     sequence = await sampling_route.sample_once(
         session_id="sess-364-live",
@@ -372,7 +372,7 @@ async def test_issue_364_sample_once_restores_local_sampler_from_detached_store(
 
     assert manager.is_base_model_session("sess-364-live") is True
     assert engine.generate_calls[0]["sampling_session_id"] == "sess-364-live"
-    assert resource_pool.calls == [("actor-364", 1), ("actor-364", -1)]
+    assert model_actor_registry.calls == [("actor-364", 1), ("actor-364", -1)]
     assert sequence.tokens == [101, 102]
     snapshot = manager.get_sampling_session_snapshot("sess-364-live")
     assert snapshot is not None
@@ -449,14 +449,14 @@ def test_issue_364_restore_sampling_session_merges_last_activity_without_version
     assert snapshot.metadata_version == 3
 
 
-def test_issue_364_resource_pool_wrapper_preserves_metadata_without_ray(monkeypatch: pytest.MonkeyPatch) -> None:
-    import tinker_server.backend.resource_pool as resource_pool_module
-    from tinker_server.backend.resource_pool import ActorType, ResourcePool, get_resource_pool
+def test_issue_364_model_actor_registry_wrapper_preserves_metadata_without_ray(monkeypatch: pytest.MonkeyPatch) -> None:
+    import tinker_server.backend.model_actor_registry as model_actor_registry_module
+    from tinker_server.backend.model_actor_registry import ActorType, ModelActorRegistry, get_model_actor_registry
 
-    monkeypatch.setattr(resource_pool_module, "_detached_enabled", lambda: False)
-    monkeypatch.setattr(resource_pool_module.ray, "is_initialized", lambda: False)
-    monkeypatch.setattr(ResourcePool, "_instance", None)
-    pool = get_resource_pool()
+    monkeypatch.setattr(model_actor_registry_module, "_detached_enabled", lambda: False)
+    monkeypatch.setattr(model_actor_registry_module.ray, "is_initialized", lambda: False)
+    monkeypatch.setattr(ModelActorRegistry, "_instance", None)
+    pool = get_model_actor_registry()
     actor_name = "actor-364-wrapper-local"
     pool.unregister(actor_name)
     pool.register(
@@ -680,7 +680,7 @@ async def test_issue_364_sampling_restore_drops_stale_local_snapshot_when_store_
 
 
 @pytest.mark.anyio
-async def test_issue_364_compute_logprobs_marks_resource_pool_inflight(
+async def test_issue_364_compute_logprobs_marks_model_actor_registry_inflight(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from tinker_server.models.types import ComputeLogprobsRequest, ModelInput
@@ -693,7 +693,7 @@ async def test_issue_364_compute_logprobs_marks_resource_pool_inflight(
         base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         metadata_version=3,
     )
-    resource_pool = _FakeResourcePool()
+    model_actor_registry = _FakeModelActorRegistry()
     resolved: dict = {}
     failed: list[str] = []
 
@@ -712,7 +712,7 @@ async def test_issue_364_compute_logprobs_marks_resource_pool_inflight(
             async_fail=_async_fail,
         ),
     )
-    _install_fake_resource_pool(monkeypatch, resource_pool)
+    _install_fake_model_actor_registry(monkeypatch, model_actor_registry)
 
     request = ComputeLogprobsRequest(
         sampling_session_id="sess-364-logprobs",
@@ -727,4 +727,4 @@ async def test_issue_364_compute_logprobs_marks_resource_pool_inflight(
 
     assert failed == []
     assert resolved["request_id"] == "req-364-logprobs"
-    assert resource_pool.calls == [("actor-364", 1), ("actor-364", -1)]
+    assert model_actor_registry.calls == [("actor-364", 1), ("actor-364", -1)]

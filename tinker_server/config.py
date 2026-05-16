@@ -458,9 +458,9 @@ class ServerConfig:
     sampling_sample_coalesce_max_samples: int = 16
     sampling_require_seq_id: bool = False
 
-    # ResourcePool settings (backend/resource_pool.py)
-    resource_pool_min_actor_age_s: int = 300
-    resource_pool_session_idle_timeout_s: int = 300
+    # ModelActorRegistry settings (backend/model_actor_registry.py)
+    model_actor_registry_min_actor_age_s: int = 300
+    model_actor_registry_session_idle_timeout_s: int = 300
 
     # Future replay and retrieve polling settings.
     future_replay_root_dir: str = "/vePFS-Mindverse/share/mint-prod-dev/future-replay"
@@ -525,7 +525,7 @@ class ServerConfig:
         inactivity_s = environ.get("TINKER_SESSION_INACTIVITY_TIMEOUT_S") or environ.get("TINKER_INACTIVITY_TIMEOUT_S")
         file_server = config_file.server if config_file is not None else None
         file_sampling = config_file.sampling if config_file is not None else None
-        file_resource_pool = config_file.resource_pool if config_file is not None else None
+        file_model_actor_registry = config_file.model_actor_registry if config_file is not None else None
         file_future = config_file.future if config_file is not None else None
         file_task_state_store = config_file.task_state_store if config_file is not None else None
         file_training = config_file.training if config_file is not None else None
@@ -743,15 +743,15 @@ class ServerConfig:
                 file_sampling.require_seq_id if file_sampling is not None else None,
                 False,
             ),
-            # ResourcePool settings
-            resource_pool_min_actor_age_s=_pick_int(
-                "MINT_MIN_ACTOR_AGE",
-                file_resource_pool.min_actor_age_s if file_resource_pool is not None else None,
+            # ModelActorRegistry settings
+            model_actor_registry_min_actor_age_s=_pick_int(
+                "MINT_MODEL_ACTOR_REGISTRY_MIN_ACTOR_AGE_S",
+                file_model_actor_registry.min_actor_age_s if file_model_actor_registry is not None else None,
                 300,
             ),
-            resource_pool_session_idle_timeout_s=_pick_int(
-                "MINT_SESSION_IDLE_TIMEOUT",
-                file_resource_pool.session_idle_timeout_s if file_resource_pool is not None else None,
+            model_actor_registry_session_idle_timeout_s=_pick_int(
+                "MINT_MODEL_ACTOR_REGISTRY_SESSION_IDLE_TIMEOUT_S",
+                file_model_actor_registry.session_idle_timeout_s if file_model_actor_registry is not None else None,
                 300,
             ),
             # Future replay/retrieve settings

@@ -107,7 +107,7 @@ async def cleanup_stale_training_sessions_once_impl(*, stale_after_s: float | No
         return []
 
     from .task_state_store import task_state_futures
-    from .resource_pool import get_resource_pool
+    from .model_actor_registry import get_model_actor_registry
     from .session_heartbeat_store import session_heartbeat_store
     from .training_session_store import async_list_training_sessions, delete_training_session
 
@@ -200,7 +200,7 @@ async def cleanup_stale_training_sessions_once_impl(*, stale_after_s: float | No
             pass
 
         try:
-            get_resource_pool().clear_session(model_id)
+            get_model_actor_registry().clear_session(model_id)
         except Exception:
             pass
 

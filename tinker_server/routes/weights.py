@@ -162,7 +162,7 @@ async def _persist_loaded_training_session(session: Any, *, request_user_id: str
 
     actor_name = None
     if training_engine is not None:
-        actor_name = getattr(training_engine, "_resource_pool_actor_names", {}).get(model_id)
+        actor_name = getattr(training_engine, "_model_actor_registry_actor_names", {}).get(model_id)
     if actor_name is not None:
         session.actor_name = str(actor_name or "") or None
     if not getattr(session, "namespace", None):

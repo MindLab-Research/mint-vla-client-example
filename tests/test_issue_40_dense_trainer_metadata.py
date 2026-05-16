@@ -4,25 +4,25 @@ import pytest
 
 pytest.importorskip("ray")
 
-import tinker_server.backend.resource_pool as resource_pool_module
-from tinker_server.backend.resource_pool import ActorType, ResourcePool, get_resource_pool
+import tinker_server.backend.model_actor_registry as model_actor_registry_module
+from tinker_server.backend.model_actor_registry import ActorType, ModelActorRegistry, get_model_actor_registry
 
 
-def test_resource_pool_list_actors_includes_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(resource_pool_module, "_detached_enabled", lambda: False)
-    monkeypatch.setattr(resource_pool_module.ray, "is_initialized", lambda: False)
-    monkeypatch.setattr(ResourcePool, "_instance", None)
-    pool = get_resource_pool()
+def test_model_actor_registry_list_actors_includes_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(model_actor_registry_module, "_detached_enabled", lambda: False)
+    monkeypatch.setattr(model_actor_registry_module.ray, "is_initialized", lambda: False)
+    monkeypatch.setattr(ModelActorRegistry, "_instance", None)
+    pool = get_model_actor_registry()
     actor_name = f"test_issue_40_dense_{uuid.uuid4().hex}"
 
     pool.unregister(actor_name)
 
 
-def test_resource_pool_list_actors_labels_openpi_backend(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(resource_pool_module, "_detached_enabled", lambda: False)
-    monkeypatch.setattr(resource_pool_module.ray, "is_initialized", lambda: False)
-    monkeypatch.setattr(ResourcePool, "_instance", None)
-    pool = get_resource_pool()
+def test_model_actor_registry_list_actors_labels_openpi_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(model_actor_registry_module, "_detached_enabled", lambda: False)
+    monkeypatch.setattr(model_actor_registry_module.ray, "is_initialized", lambda: False)
+    monkeypatch.setattr(ModelActorRegistry, "_instance", None)
+    pool = get_model_actor_registry()
     actor_name = f"test_issue_40_openpi_{uuid.uuid4().hex}"
 
     pool.unregister(actor_name)

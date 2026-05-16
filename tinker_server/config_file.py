@@ -80,7 +80,7 @@ class _MegatronBridgeSection(BaseModel):
     use_mbridge_lora_export: bool | None = None
 
 
-class _ResourcePoolSection(BaseModel):
+class _ModelActorRegistrySection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     min_actor_age_s: int | None = None
@@ -151,7 +151,7 @@ class TinkerConfigFile(BaseModel):
     ray: _RaySection = Field(default_factory=_RaySection)
     paths: _PathsSection = Field(default_factory=_PathsSection)
     megatron_bridge: _MegatronBridgeSection = Field(default_factory=_MegatronBridgeSection)
-    resource_pool: _ResourcePoolSection = Field(default_factory=_ResourcePoolSection)
+    model_actor_registry: _ModelActorRegistrySection = Field(default_factory=_ModelActorRegistrySection)
     future: _FutureSection = Field(default_factory=_FutureSection)
     task_state_store: _TaskStateStoreSection = Field(default_factory=_TaskStateStoreSection)
     training: _TrainingSection = Field(default_factory=_TrainingSection)

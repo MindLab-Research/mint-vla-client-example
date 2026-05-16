@@ -163,7 +163,7 @@ async def test_issue_408_save_weights_for_sampler_emits_trace_spans(
 def test_issue_408_megatron_create_path_emits_trace_spans(monkeypatch) -> None:
     from tinker_server.backend import megatron_distributed as md
     from tinker_server.backend import model_registry as model_registry
-    from tinker_server.backend import resource_pool as resource_pool_mod
+    from tinker_server.backend import model_actor_registry as model_actor_registry_mod
     from tinker_server import config as config_mod
 
     span_calls: list[tuple[str, dict[str, object]]] = []
@@ -203,10 +203,10 @@ def test_issue_408_megatron_create_path_emits_trace_spans(monkeypatch) -> None:
             created.append({"options": dict(kwargs)})
             return _Options(kwargs)
 
-    monkeypatch.setattr(resource_pool_mod, "get_resource_pool", lambda: _FakePool())
+    monkeypatch.setattr(model_actor_registry_mod, "get_model_actor_registry", lambda: _FakePool())
     monkeypatch.setattr(config_mod, "actor_runtime_env_vars", lambda **_kwargs: {})
     monkeypatch.setattr(config_mod, "otel_env_vars", lambda: {})
-    monkeypatch.setattr(resource_pool_mod, "actor_observability_metadata", lambda _actor: {})
+    monkeypatch.setattr(model_actor_registry_mod, "actor_observability_metadata", lambda _actor: {})
     monkeypatch.setattr(model_registry, "is_persistent_model", lambda _base_model: False)
     monkeypatch.setattr(md, "MegatronWorkerGroup", _FakeMegatronWorkerGroup)
     monkeypatch.setattr(md.ray, "is_initialized", lambda: True)
@@ -265,7 +265,7 @@ def test_issue_408_megatron_create_path_emits_trace_spans(monkeypatch) -> None:
 def test_issue_572_megatron_existing_actor_rank_mismatch_recreates(monkeypatch) -> None:
     from tinker_server.backend import megatron_distributed as md
     from tinker_server.backend import model_registry as model_registry
-    from tinker_server.backend import resource_pool as resource_pool_mod
+    from tinker_server.backend import model_actor_registry as model_actor_registry_mod
     from tinker_server import config as config_mod
 
     fake_new_actor = object()
@@ -323,10 +323,10 @@ def test_issue_572_megatron_existing_actor_rank_mismatch_recreates(monkeypatch) 
         assert actor is existing_actor
         killed.append(dict(kwargs))
 
-    monkeypatch.setattr(resource_pool_mod, "get_resource_pool", lambda: _FakePool())
+    monkeypatch.setattr(model_actor_registry_mod, "get_model_actor_registry", lambda: _FakePool())
     monkeypatch.setattr(config_mod, "actor_runtime_env_vars", lambda **_kwargs: {})
     monkeypatch.setattr(config_mod, "otel_env_vars", lambda: {})
-    monkeypatch.setattr(resource_pool_mod, "actor_observability_metadata", lambda _actor: {})
+    monkeypatch.setattr(model_actor_registry_mod, "actor_observability_metadata", lambda _actor: {})
     monkeypatch.setattr(model_registry, "is_persistent_model", lambda _base_model: False)
     monkeypatch.setattr(md, "MegatronWorkerGroup", _FakeMegatronWorkerGroup)
     monkeypatch.setattr(md.ray, "is_initialized", lambda: True)

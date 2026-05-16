@@ -31,7 +31,7 @@ def test_issue_396_compute_topk_validation_error_does_not_kill_actor(
     async def _raise_validation_error(*_args, **_kwargs):
         raise validation_error
 
-    monkeypatch.setattr(mi, "ray_get_with_resource_pool_keepalive", _raise_validation_error)
+    monkeypatch.setattr(mi, "ray_get_with_model_actor_registry_keepalive", _raise_validation_error)
     monkeypatch.setattr(
         mi.ray_kill,
         "kill",

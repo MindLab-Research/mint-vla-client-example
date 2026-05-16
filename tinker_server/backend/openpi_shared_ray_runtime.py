@@ -28,7 +28,7 @@ from .openpi_ray_runtime import (
     _ray_timeout,
     ensure_openpi_ray_initialized,
 )
-from .resource_pool import ActorType, get_resource_pool
+from .model_actor_registry import ActorType, get_model_actor_registry
 from .volc_placement import (
     assert_node_ip_capacity,
     parse_model_gpu_placement,
@@ -160,7 +160,7 @@ def clear_openpi_shared_runtime_pool() -> None:
         entries = list(_SHARED_ACTORS.values())
         _SHARED_ACTORS.clear()
 
-    pool = get_resource_pool()
+    pool = get_model_actor_registry()
     for entry in entries:
         pool.unregister(entry.actor_name)
         if not ray.is_initialized():
@@ -207,7 +207,7 @@ async def _cleanup_failed_shared_actor_start(*, actor_name: str, actor: Any) -> 
 
 
 async def _pool_call(method_name: str, *args: Any, **kwargs: Any) -> Any:
-    pool = get_resource_pool()
+    pool = get_model_actor_registry()
     method = getattr(pool, method_name)
     return await asyncio.to_thread(method, *args, **kwargs)
 

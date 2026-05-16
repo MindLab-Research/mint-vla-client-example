@@ -2,15 +2,15 @@ from __future__ import annotations
 
 import pytest
 
-from tinker_server.backend.resource_pool import ActorType, _ResourcePoolState
+from tinker_server.backend.model_actor_registry import ActorType, _ModelActorRegistryState
 
 
 @pytest.fixture
-def pool_state() -> _ResourcePoolState:
-    return _ResourcePoolState(min_actor_age=0, session_idle_timeout=0)
+def pool_state() -> _ModelActorRegistryState:
+    return _ModelActorRegistryState(min_actor_age=0, session_idle_timeout=0)
 
 
-def test_issue_364_pending_gpu_reservations_reduce_effective_capacity(pool_state: _ResourcePoolState) -> None:
+def test_issue_364_pending_gpu_reservations_reduce_effective_capacity(pool_state: _ModelActorRegistryState) -> None:
     assert pool_state.get_effective_available_gpus(ray_available=4) == 4
 
     pool_state.reserve_gpus(3)
@@ -25,7 +25,7 @@ def test_issue_364_pending_gpu_reservations_reduce_effective_capacity(pool_state
 
 def test_issue_364_evictable_selection_respects_protection_busy_and_exclusions(
     monkeypatch: pytest.MonkeyPatch,
-    pool_state: _ResourcePoolState,
+    pool_state: _ModelActorRegistryState,
 ) -> None:
     idle_dense = pool_state.register(
         actor_name="dense-idle",
@@ -77,10 +77,10 @@ def test_issue_364_evictable_selection_respects_protection_busy_and_exclusions(
 
 def test_issue_364_ensure_gpus_available_counts_pending_reservations(
     monkeypatch: pytest.MonkeyPatch,
-    pool_state: _ResourcePoolState,
+    pool_state: _ModelActorRegistryState,
 ) -> None:
     pool_state.reserve_gpus(3)
-    monkeypatch.setattr("tinker_server.backend.resource_pool.ray.available_resources", lambda: {"GPU": 4})
+    monkeypatch.setattr("tinker_server.backend.model_actor_registry.ray.available_resources", lambda: {"GPU": 4})
 
     with pytest.raises(ValueError, match="Insufficient GPUs"):
         pool_state.ensure_gpus_available(2, timeout=0.0)

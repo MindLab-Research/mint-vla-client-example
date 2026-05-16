@@ -67,7 +67,7 @@ class _StubTrainingEngine:
         self.unbind_calls = []
         self.delete_calls = []
         self._workers = {}
-        self._resource_pool_actor_names = {}
+        self._model_actor_registry_actor_names = {}
 
     async def unbind_session(self, session):
         self.unbind_calls.append(session.model_id)
@@ -80,7 +80,7 @@ class _StubTrainingEngine:
         if delete_session is not None:
             delete_session.remote(session.model_id)
         self._workers.pop(session.model_id, None)
-        self._resource_pool_actor_names.pop(session.model_id, None)
+        self._model_actor_registry_actor_names.pop(session.model_id, None)
         session.is_active = False
 
     async def shutdown_session(self, session):
@@ -138,7 +138,7 @@ async def test_issue_368_cleanup_stale_training_sessions(monkeypatch: pytest.Mon
     )
     monkeypatch.setattr(heartbeat_store_module, "session_heartbeat_store", heartbeat_store)
     monkeypatch.setattr(
-        "tinker_server.backend.resource_pool.get_resource_pool",
+        "tinker_server.backend.model_actor_registry.get_model_actor_registry",
         lambda: SimpleNamespace(clear_session=lambda model_id: cleared_model_ids.append(model_id)),
     )
 
@@ -190,7 +190,7 @@ async def test_issue_368_cleanup_can_restore_session_before_shutdown(monkeypatch
 
     monkeypatch.setattr(training_routes, "_restore_training_session", _restore_training_session)
     monkeypatch.setattr(
-        "tinker_server.backend.resource_pool.get_resource_pool",
+        "tinker_server.backend.model_actor_registry.get_model_actor_registry",
         lambda: SimpleNamespace(clear_session=lambda model_id: None),
     )
 
@@ -232,7 +232,7 @@ async def test_issue_368_cleanup_aborts_if_future_fail_path_errors(monkeypatch: 
     )
     monkeypatch.setattr(heartbeat_store_module, "session_heartbeat_store", heartbeat_store)
     monkeypatch.setattr(
-        "tinker_server.backend.resource_pool.get_resource_pool",
+        "tinker_server.backend.model_actor_registry.get_model_actor_registry",
         lambda: SimpleNamespace(clear_session=lambda model_id: None),
     )
 
@@ -260,7 +260,7 @@ async def test_issue_368_cleanup_skips_shared_actor_shutdown_after_restore(
     deleted_model_ids = []
 
     engine._workers[stale.model_id] = shared_worker
-    engine._resource_pool_actor_names[stale.model_id] = "shared-actor"
+    engine._model_actor_registry_actor_names[stale.model_id] = "shared-actor"
 
     monkeypatch.setattr(training_routes, "training_manager", manager)
     monkeypatch.setattr(training_routes, "training_engine", engine)
@@ -292,7 +292,7 @@ async def test_issue_368_cleanup_skips_shared_actor_shutdown_after_restore(
     monkeypatch.setitem(sys.modules, "ray", SimpleNamespace(get=lambda value, timeout=None: value))
     monkeypatch.setattr(training_routes, "async_get_ray_ref", _async_get_ray_ref)
     monkeypatch.setattr(
-        "tinker_server.backend.resource_pool.get_resource_pool",
+        "tinker_server.backend.model_actor_registry.get_model_actor_registry",
         lambda: SimpleNamespace(clear_session=lambda model_id: None),
     )
 
@@ -307,7 +307,7 @@ async def test_issue_368_cleanup_skips_shared_actor_shutdown_after_restore(
     assert shared_worker.delete_calls == ["model-stale"]
     assert deleted_model_ids == ["model-stale"]
     assert stale.model_id not in engine._workers
-    assert stale.model_id not in engine._resource_pool_actor_names
+    assert stale.model_id not in engine._model_actor_registry_actor_names
 
 
 def test_issue_368_sync_training_session_step_bumps_when_result_has_no_step(monkeypatch: pytest.MonkeyPatch) -> None:

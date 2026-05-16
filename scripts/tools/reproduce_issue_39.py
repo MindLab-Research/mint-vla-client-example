@@ -152,7 +152,7 @@ def main() -> int:
         if "error" in out:
             return _fail(f"retrieve_future error: {out.get('error')!r}")
 
-        # New unified actor endpoints must exist and use ResourcePool schema.
+        # New unified actor endpoints must exist and use ModelActorRegistry schema.
         vllm = _get_json("/api/v1/actors?type=vllm", timeout_s=30.0)
         actors = vllm.get("actors")
         if not isinstance(actors, list):
@@ -180,8 +180,8 @@ def main() -> int:
         _expect_404_post("/api/v1/kill_vllm")
         _expect_404_get("/api/v1/megatron_status")
         _expect_404_post("/api/v1/kill_megatron")
-        _expect_404_get("/api/v1/resource_pool")
-        _expect_404_post("/api/v1/clear_resource_pool")
+        _expect_404_get("/api/v1/model_actor_registry")
+        _expect_404_post("/api/v1/clear_model_actor_registry")
         _expect_404_post("/api/v1/kill_all_actors")
 
         print("PASS")

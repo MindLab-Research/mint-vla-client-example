@@ -219,7 +219,7 @@ def main() -> int:
             )
 
         if actor_gpus != expected_gpus:
-            return _fail(f"resource pool tracks {actor_gpus} GPUs for {actor_name} (expected {expected_gpus})")
+            return _fail(f"model actor registry tracks {actor_gpus} GPUs for {actor_name} (expected {expected_gpus})")
 
         print("PASS")
         return 0

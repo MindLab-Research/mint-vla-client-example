@@ -36,7 +36,7 @@ class _FakePool:
         self.total_gpus_used_calls = 0
 
     def list_actors(self, *, refresh_metadata: bool = False, actor_type=None, model_name: str | None = None) -> list[dict]:
-        raise AssertionError("/actors route must use ResourcePool.async_list_actors")
+        raise AssertionError("/actors route must use ModelActorRegistry.async_list_actors")
 
     async def async_list_actors(
         self,
@@ -50,7 +50,7 @@ class _FakePool:
         return list(self._actors)
 
     def total_gpus_used(self) -> int:
-        raise AssertionError("/actors route must use ResourcePool.async_total_gpus_used")
+        raise AssertionError("/actors route must use ModelActorRegistry.async_total_gpus_used")
 
     async def async_total_gpus_used(self) -> int:
         self.total_gpus_used_calls += 1
@@ -71,10 +71,10 @@ class _FakePool:
 
 def _build_client(monkeypatch, pool: _FakePool, *, patch_placement_groups: bool = True) -> TestClient:
     from tinker_server.routes import service as service_routes
-    import tinker_server.backend.resource_pool as resource_pool
+    import tinker_server.backend.model_actor_registry as model_actor_registry
 
     monkeypatch.setattr(service_routes, "_require_admin", lambda _request: None)
-    monkeypatch.setattr(resource_pool, "get_resource_pool", lambda: pool)
+    monkeypatch.setattr(model_actor_registry, "get_model_actor_registry", lambda: pool)
     if patch_placement_groups:
         async def _empty_placement_group_table(*_args, **_kwargs):
             return {}
@@ -135,8 +135,8 @@ def test_list_actors_can_skip_metadata_refresh(monkeypatch) -> None:
     assert pool.list_actor_refresh_metadata_calls == [False]
 
 
-def test_list_actors_passes_filters_to_resource_pool_before_refresh(monkeypatch) -> None:
-    from tinker_server.backend.resource_pool import ActorType
+def test_list_actors_passes_filters_to_model_actor_registry_before_refresh(monkeypatch) -> None:
+    from tinker_server.backend.model_actor_registry import ActorType
 
     _install_ray_stub(monkeypatch)
     pool = _FakePool(
@@ -157,7 +157,7 @@ def test_list_actors_passes_filters_to_resource_pool_before_refresh(monkeypatch)
     ]
 
 
-def test_list_actors_uses_async_resource_pool_inventory(monkeypatch) -> None:
+def test_list_actors_uses_async_model_actor_registry_inventory(monkeypatch) -> None:
     _install_ray_stub(monkeypatch)
     pool = _FakePool(
         actors=[{"actor_name": "vllm-a", "actor_type": "vllm", "base_model": "Qwen/Qwen3-4B-Instruct-2507"}],
@@ -172,7 +172,7 @@ def test_list_actors_uses_async_resource_pool_inventory(monkeypatch) -> None:
     assert pool.total_gpus_used_calls == 1
 
 
-def test_list_actors_returns_503_when_resource_pool_inventory_fails(monkeypatch) -> None:
+def test_list_actors_returns_503_when_model_actor_registry_inventory_fails(monkeypatch) -> None:
     class _FailingListPool(_FakePool):
         async def async_list_actors(self, **_kwargs) -> list[dict]:
             raise RuntimeError("ray disconnected")
@@ -187,10 +187,10 @@ def test_list_actors_returns_503_when_resource_pool_inventory_fails(monkeypatch)
     assert "ray disconnected" in resp.text
 
 
-def test_list_actors_returns_503_when_resource_pool_gpu_total_fails(monkeypatch) -> None:
+def test_list_actors_returns_503_when_model_actor_registry_gpu_total_fails(monkeypatch) -> None:
     class _FailingGpuTotalPool(_FakePool):
         async def async_total_gpus_used(self) -> int:
-            raise RuntimeError("resource pool unavailable")
+            raise RuntimeError("model actor registry unavailable")
 
     _install_ray_stub(monkeypatch)
     client = _build_client(
@@ -205,11 +205,11 @@ def test_list_actors_returns_503_when_resource_pool_gpu_total_fails(monkeypatch)
 
     assert resp.status_code == 503, resp.text
     assert "Ray unavailable for actor inventory" in resp.text
-    assert "resource pool unavailable" in resp.text
+    assert "model actor registry unavailable" in resp.text
 
 
 def test_kill_dense_actors_returns_503_without_unregistering_when_ray_driver_is_unavailable(monkeypatch) -> None:
-    from tinker_server.backend.resource_pool import ActorType
+    from tinker_server.backend.model_actor_registry import ActorType
 
     _install_ray_stub(monkeypatch)
 
@@ -235,7 +235,7 @@ def test_kill_dense_actors_returns_503_without_unregistering_when_ray_driver_is_
 
 def test_kill_exact_dense_actor_returns_503_without_unregistering_when_kill_fails(monkeypatch) -> None:
     from tinker_server.routes import service as service_routes
-    from tinker_server.backend.resource_pool import ActorType
+    from tinker_server.backend.model_actor_registry import ActorType
 
     _install_ray_stub(monkeypatch)
     remove_pg_calls: list[str] = []
@@ -273,7 +273,7 @@ def test_kill_exact_dense_actor_returns_503_without_unregistering_when_kill_fail
 
 def test_kill_dense_actors_returns_503_without_unregistering_when_kill_fails(monkeypatch) -> None:
     from tinker_server.routes import service as service_routes
-    from tinker_server.backend.resource_pool import ActorType
+    from tinker_server.backend.model_actor_registry import ActorType
 
     _install_ray_stub(monkeypatch)
     remove_pg_calls: list[str] = []
@@ -307,7 +307,7 @@ def test_kill_dense_actors_returns_503_without_unregistering_when_kill_fails(mon
 
 def test_kill_dense_actors_returns_503_when_pg_removal_fails(monkeypatch) -> None:
     from tinker_server.routes import service as service_routes
-    from tinker_server.backend.resource_pool import ActorType
+    from tinker_server.backend.model_actor_registry import ActorType
 
     _install_ray_stub(monkeypatch)
 
@@ -390,7 +390,7 @@ def test_infer_base_model_from_checkpoint_passes_admin_scope(monkeypatch, tmp_pa
 def test_kill_dense_actors_returns_503_when_pg_lookup_mismatches_namespace(monkeypatch) -> None:
     from tinker_server.routes import service as service_routes
     import tinker_server.backend.ray_placement_groups as ray_placement_groups
-    from tinker_server.backend.resource_pool import ActorType
+    from tinker_server.backend.model_actor_registry import ActorType
 
     _install_ray_stub(monkeypatch)
 

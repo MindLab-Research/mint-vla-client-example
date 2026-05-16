@@ -137,7 +137,7 @@ async def test_issue_517_forward_backward_materializes_unmaterialized_session_on
     async def _create_training_session(session) -> None:
         order.append("create")
         session.is_active = True
-        engine._resource_pool_actor_names[session.model_id] = "actor-517"
+        engine._model_actor_registry_actor_names[session.model_id] = "actor-517"
 
     async def _forward_backward(session, request):
         order.append("forward_backward")
@@ -158,7 +158,7 @@ async def test_issue_517_forward_backward_materializes_unmaterialized_session_on
 
     engine = SimpleNamespace(
         _workers={},
-        _resource_pool_actor_names={},
+        _model_actor_registry_actor_names={},
         create_training_session=_create_training_session,
         forward_backward=_forward_backward,
     )
@@ -385,7 +385,7 @@ async def test_issue_528_dense_materialization_happens_once_on_first_stateful_us
     async def _create_training_session(session) -> None:
         create_calls.append(session.model_id)
         session.is_active = True
-        engine._resource_pool_actor_names[session.model_id] = "dense-actor-528"
+        engine._model_actor_registry_actor_names[session.model_id] = "dense-actor-528"
 
     async def _forward_backward(session, request):
         forward_calls.append(request.model_id)
@@ -404,7 +404,7 @@ async def test_issue_528_dense_materialization_happens_once_on_first_stateful_us
 
     engine = SimpleNamespace(
         _workers={},
-        _resource_pool_actor_names={},
+        _model_actor_registry_actor_names={},
         create_training_session=_create_training_session,
         forward_backward=_forward_backward,
     )

@@ -10078,10 +10078,10 @@ def get_or_create_megatron_worker_group(
     Returns:
         Ray actor handle to MegatronWorkerGroup.
     """
-    from tinker_server.backend.resource_pool import (
+    from tinker_server.backend.model_actor_registry import (
         ActorType,
         actor_observability_metadata,
-        get_resource_pool,
+        get_model_actor_registry,
     )
     from .model_registry import is_persistent_model
 
@@ -10160,7 +10160,7 @@ def get_or_create_megatron_worker_group(
             ignore_reinit_error=True,
         )
 
-    resource_pool = get_resource_pool()
+    model_actor_registry = get_model_actor_registry()
     actor_name = _make_megatron_actor_name(base_model)
 
     create_lock = _get_megatron_create_lock(actor_name)
@@ -10211,8 +10211,8 @@ def get_or_create_megatron_worker_group(
                     "is_persistent": bool(is_persistent),
                 },
             ):
-                # Register with resource pool (reconnection case)
-                resource_pool.register(
+                # Register with model actor registry (reconnection case)
+                model_actor_registry.register(
                     actor_name=actor_name,
                     actor_type=ActorType.MEGATRON,
                     num_gpus=num_gpus,
@@ -10223,7 +10223,7 @@ def get_or_create_megatron_worker_group(
                     metadata={**dict(actor_observability_metadata(actor) or {}), **rank_metadata},
                 )
                 # Existing actor is already ready
-                resource_pool.mark_ready(actor_name)
+                model_actor_registry.mark_ready(actor_name)
             # NOTE: Do NOT reinit weights here for existing actors.
             # Session swapping + reinit happens inside MegatronWorkerGroup._ensure_session_loaded()
             # to avoid clobbering active sessions during create_model.
@@ -10355,7 +10355,7 @@ def get_or_create_megatron_worker_group(
                     "allow_evict_protected": bool(allow_evict_protected),
                 },
             ):
-                resource_pool.ensure_gpus_available(num_gpus, allow_evict_protected=allow_evict_protected)
+                model_actor_registry.ensure_gpus_available(num_gpus, allow_evict_protected=allow_evict_protected)
 
         # Reserve GPUs to prevent race conditions with concurrent requests
         # This must be done AFTER ensure_gpus_available and BEFORE actor creation
@@ -10371,7 +10371,7 @@ def get_or_create_megatron_worker_group(
                 "world_size": int(num_gpus),
             },
         ):
-            resource_pool.reserve_gpus(num_gpus)
+            model_actor_registry.reserve_gpus(num_gpus)
 
         try:
             from ..config import actor_runtime_env_vars, apply_detached_actor_resources, otel_env_vars
@@ -10516,7 +10516,7 @@ def get_or_create_megatron_worker_group(
                 # Register immediately (creating=True) to account for GPU usage and prevent eviction.
                 # Actor readiness is awaited in VerlTrainingEngine.create_training_session, which also
                 # marks the entry ready (creating=False) after __ray_ready__ completes.
-                resource_pool.register(
+                model_actor_registry.register(
                     actor_name=actor_name,
                     actor_type=ActorType.MEGATRON,
                     num_gpus=num_gpus,
@@ -10530,7 +10530,7 @@ def get_or_create_megatron_worker_group(
             return actor
         finally:
             # Release pending GPU reservation (GPUs now tracked by registered actor or freed on failure)
-            resource_pool.release_pending_gpus(num_gpus)
+            model_actor_registry.release_pending_gpus(num_gpus)
 
 
 async def async_get_or_create_megatron_worker_group(
@@ -10588,7 +10588,7 @@ def kill_megatron_actor(base_model: str | None = None) -> bool:
     Returns:
         True if any actor was killed, False if none found.
     """
-    from tinker_server.backend.resource_pool import get_resource_pool, ActorType
+    from tinker_server.backend.model_actor_registry import get_model_actor_registry, ActorType
 
     if not ray.is_initialized():
         init_ray(
@@ -10596,7 +10596,7 @@ def kill_megatron_actor(base_model: str | None = None) -> bool:
             ignore_reinit_error=True,
         )
 
-    resource_pool = get_resource_pool()
+    model_actor_registry = get_model_actor_registry()
     killed_any = False
 
     def _remove_detached_pg(actor_name: str) -> None:
@@ -10633,21 +10633,21 @@ def kill_megatron_actor(base_model: str | None = None) -> bool:
                 base_model=base_model,
             )
             logger.info(f"Killed Megatron actor: {actor_name}")
-            resource_pool.unregister(actor_name)
+            model_actor_registry.unregister(actor_name)
             _remove_detached_pg(actor_name)
             killed_any = True
         except ValueError:
             logger.info(f"No Megatron actor to kill for {base_model}")
-            resource_pool.unregister(actor_name)
+            model_actor_registry.unregister(actor_name)
             _remove_detached_pg(actor_name)
     else:
-        # Kill ALL Megatron actors from resource pool
-        for entry in resource_pool.iter_entries():
+        # Kill ALL Megatron actors from model actor registry
+        for entry in model_actor_registry.iter_entries():
             if entry.actor_type == ActorType.MEGATRON:
                 try:
                     actor = ray.get_actor(entry.actor_name, namespace=PERSISTENT_NAMESPACE)
                 except ValueError:
-                    resource_pool.unregister(entry.actor_name)
+                    model_actor_registry.unregister(entry.actor_name)
                     _remove_detached_pg(entry.actor_name)
                     continue
 
@@ -10666,7 +10666,7 @@ def kill_megatron_actor(base_model: str | None = None) -> bool:
                     base_model=entry.base_model,
                 )
                 logger.info(f"Killed Megatron actor: {entry.actor_name}")
-                resource_pool.unregister(entry.actor_name)
+                model_actor_registry.unregister(entry.actor_name)
                 _remove_detached_pg(entry.actor_name)
                 killed_any = True
 
@@ -10700,10 +10700,10 @@ def is_megatron_actor_running(base_model: str | None = None) -> bool:
         except (ValueError, ray.exceptions.RayActorError, Exception):
             return False
     else:
-        # Check for any Megatron actor from resource pool
-        from tinker_server.backend.resource_pool import get_resource_pool, ActorType
-        resource_pool = get_resource_pool()
-        for entry in resource_pool.iter_entries():
+        # Check for any Megatron actor from model actor registry
+        from tinker_server.backend.model_actor_registry import get_model_actor_registry, ActorType
+        model_actor_registry = get_model_actor_registry()
+        for entry in model_actor_registry.iter_entries():
             if entry.actor_type == ActorType.MEGATRON:
                 try:
                     ray.get(entry.actor_handle.get_diagnostics.remote(), timeout=5)

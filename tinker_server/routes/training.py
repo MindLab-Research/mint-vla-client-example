@@ -360,9 +360,9 @@ def _get_webhook_url(request: Request) -> str | None:
 
 
 def _find_actor_handle(actor_name: str, namespace: str):
-    from ..backend.resource_pool import get_resource_pool
+    from ..backend.model_actor_registry import get_model_actor_registry
 
-    pool = get_resource_pool()
+    pool = get_model_actor_registry()
     for entry in pool.iter_entries():
         if entry.actor_name == actor_name and entry.namespace == namespace and entry.actor_handle:
             return entry.actor_handle
@@ -422,7 +422,7 @@ def _drop_local_training_session(model_id: str) -> None:
                 logger.warning("Failed to delete stale local training session %s: %s", model_id, e)
     if training_engine is not None:
         getattr(training_engine, "_workers", {}).pop(model_id, None)
-        getattr(training_engine, "_resource_pool_actor_names", {}).pop(model_id, None)
+        getattr(training_engine, "_model_actor_registry_actor_names", {}).pop(model_id, None)
 
 
 def _refresh_training_session_from_info_if_needed(model_id: str, info: dict, snapshot=None):
@@ -453,9 +453,9 @@ def _refresh_training_session_from_info_if_needed(model_id: str, info: dict, sna
     if actor_binding_changed and training_engine is not None:
         getattr(training_engine, "_workers", {}).pop(model_id, None)
         if incoming_actor_name is not None:
-            getattr(training_engine, "_resource_pool_actor_names", {})[model_id] = incoming_actor_name
+            getattr(training_engine, "_model_actor_registry_actor_names", {})[model_id] = incoming_actor_name
         else:
-            getattr(training_engine, "_resource_pool_actor_names", {}).pop(model_id, None)
+            getattr(training_engine, "_model_actor_registry_actor_names", {}).pop(model_id, None)
     if incoming_version <= current_version and incoming_step <= current_step and not actor_binding_changed:
         return snap
     _restore_training_session_info_compat(info)
@@ -651,7 +651,7 @@ async def _restore_training_session(model_id: str):
                         session.namespace = original_session_state["namespace"]
                 return None
             getattr(training_engine, "_workers", {})[model_id] = worker
-            getattr(training_engine, "_resource_pool_actor_names", {})[model_id] = actor_name
+            getattr(training_engine, "_model_actor_registry_actor_names", {})[model_id] = actor_name
 
         return session
     except Exception as e:
@@ -767,7 +767,7 @@ async def _best_effort_delete_training_session(
             actor_name = str(getattr(session, "actor_name", "") or "")
             other_users = [
                 mid
-                for mid, bound_actor in getattr(training_engine, "_resource_pool_actor_names", {}).items()
+                for mid, bound_actor in getattr(training_engine, "_model_actor_registry_actor_names", {}).items()
                 if bound_actor == actor_name and mid != model_id
             ]
             replacement_session = other_users[0] if other_users else None
@@ -803,14 +803,14 @@ async def _best_effort_delete_training_session(
                         e,
                     )
             cleanup_ok = cleanup_ok and delete_ok
-            getattr(training_engine, "_resource_pool_actor_names", {}).pop(model_id, None)
+            getattr(training_engine, "_model_actor_registry_actor_names", {}).pop(model_id, None)
             getattr(training_engine, "_workers", {}).pop(model_id, None)
             session.is_active = False
             if actor_name:
                 try:
-                    from ..backend.resource_pool import get_resource_pool
+                    from ..backend.model_actor_registry import get_model_actor_registry
 
-                    get_resource_pool().set_session(actor_name, replacement_session)
+                    get_model_actor_registry().set_session(actor_name, replacement_session)
                 except Exception:
                     pass
 
@@ -836,9 +836,9 @@ async def _best_effort_delete_training_session(
         )
 
     try:
-        from ..backend.resource_pool import get_resource_pool
+        from ..backend.model_actor_registry import get_model_actor_registry
 
-        get_resource_pool().clear_session(model_id)
+        get_model_actor_registry().clear_session(model_id)
     except Exception:
         pass
 
@@ -1011,7 +1011,7 @@ def _has_training_worker_binding(model_id: str) -> bool:
         return False
     if model_id in getattr(training_engine, "_workers", {}):
         return True
-    return model_id in getattr(training_engine, "_resource_pool_actor_names", {})
+    return model_id in getattr(training_engine, "_model_actor_registry_actor_names", {})
 
 
 async def _get_training_session_for_request(model_id: str):
@@ -1361,7 +1361,7 @@ async def _materialize_training_session_for_stateful_use(session: Any) -> Any:
             session.tokenizer_info = dict(tokenizer_metadata.get("tokenizer_info") or {})
             session.tokenizer_identity = str(tokenizer_metadata.get("tokenizer_identity") or "") or None
             session.tokenizer_source_path = str(tokenizer_metadata.get("tokenizer_source_path") or "") or None
-        actor_name = getattr(training_engine, "_resource_pool_actor_names", {}).get(session.model_id)
+        actor_name = getattr(training_engine, "_model_actor_registry_actor_names", {}).get(session.model_id)
         session.actor_name = str(actor_name or "") or None
         session.namespace = RAY_NAMESPACE
         session.materialization_state = MATERIALIZATION_STATE_READY
@@ -1963,9 +1963,9 @@ async def _do_create_model(
         except Exception:
             pass
         try:
-            from ..backend.resource_pool import get_resource_pool
+            from ..backend.model_actor_registry import get_model_actor_registry
 
-            get_resource_pool().clear_session(model_id)
+            get_model_actor_registry().clear_session(model_id)
         except Exception:
             pass
         await task_state_futures.async_fail(request_id, str(e))
@@ -2299,7 +2299,7 @@ async def _do_create_model_from_state(
 
         from ..backend.training_session_store import async_upsert_training_session
 
-        actor_name = getattr(engine, "_resource_pool_actor_names", {}).get(model_id)
+        actor_name = getattr(engine, "_model_actor_registry_actor_names", {}).get(model_id)
         session.actor_name = str(actor_name or "") or None
         session.namespace = RAY_NAMESPACE
         await async_upsert_training_session(
@@ -4193,9 +4193,9 @@ async def _do_delete_model(request_id: str, model_id: str) -> None:
         except Exception:
             pass
         try:
-            from ..backend.resource_pool import get_resource_pool
+            from ..backend.model_actor_registry import get_model_actor_registry
 
-            get_resource_pool().clear_session(model_id)
+            get_model_actor_registry().clear_session(model_id)
         except Exception:
             pass
 

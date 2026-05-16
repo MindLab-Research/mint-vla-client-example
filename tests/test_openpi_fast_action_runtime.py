@@ -670,7 +670,7 @@ def test_openpi_pi05_default_runtime_factory_uses_shared_runtime(
 
 def test_recover_detached_action_runtime_client_uses_shared_client_for_shared_actor(monkeypatch) -> None:
     from tinker_server.backend import action_session_manager
-    from tinker_server.backend.resource_pool import ActorType
+    from tinker_server.backend.model_actor_registry import ActorType
 
     class _FakeActorHandle:
         class _Describe:
@@ -720,7 +720,7 @@ def test_recover_detached_action_runtime_client_uses_shared_client_for_shared_ac
         def __init__(self, **kwargs):
             raise AssertionError(f"legacy action client recovery must not run: {kwargs}")
 
-    monkeypatch.setattr(action_session_manager, "get_resource_pool", lambda: _FakePool())
+    monkeypatch.setattr(action_session_manager, "get_model_actor_registry", lambda: _FakePool())
     monkeypatch.setattr(action_session_manager, "OpenPISharedRayRuntimeClient", _FakeSharedClient)
     monkeypatch.setattr(action_session_manager, "OpenPIActionRayRuntimeClient", _UnexpectedActionClient)
     monkeypatch.setattr(action_session_manager, "_actor_ready_timeout_s", lambda spec: 123.0)
@@ -753,7 +753,7 @@ def test_recover_detached_action_runtime_client_uses_shared_client_for_shared_ac
 
 def test_action_session_router_recovers_shared_session_from_known_session_ids(monkeypatch) -> None:
     from tinker_server.backend import action_session_manager
-    from tinker_server.backend.resource_pool import ActorType
+    from tinker_server.backend.model_actor_registry import ActorType
 
     class _FakeActorHandle:
         class _Describe:
@@ -781,7 +781,7 @@ def test_action_session_router_recovers_shared_session_from_known_session_ids(mo
 
     fake_fast_manager = object()
 
-    monkeypatch.setattr(action_session_manager, "get_resource_pool", lambda: _FakePool())
+    monkeypatch.setattr(action_session_manager, "get_model_actor_registry", lambda: _FakePool())
     monkeypatch.setattr(
         action_session_manager.ray,
         "get",
@@ -799,7 +799,7 @@ def test_action_session_router_recovers_shared_session_from_known_session_ids(mo
     assert router._manager_for_session["session-1:action:3"] is fake_fast_manager
 
 
-def test_start_openpi_action_ray_runtime_registers_actor_metadata_in_resource_pool(monkeypatch) -> None:
+def test_start_openpi_action_ray_runtime_registers_actor_metadata_in_model_actor_registry(monkeypatch) -> None:
     from tinker_server.backend import openpi_action_ray_runtime
     from tinker_server.backend.openpi_fast_action_runtime import OpenPIFastActionRuntimeSpec
 
@@ -850,7 +850,7 @@ def test_start_openpi_action_ray_runtime_registers_actor_metadata_in_resource_po
     monkeypatch.setattr(openpi_action_ray_runtime, "ensure_openpi_ray_initialized", lambda: None)
     monkeypatch.setattr(openpi_action_ray_runtime, "OpenPIActionRayRuntimeActor", _FakeActorBuilder())
     monkeypatch.setattr(openpi_action_ray_runtime, "OpenPIActionRayRuntimeClient", _FakeClient)
-    monkeypatch.setattr(openpi_action_ray_runtime, "get_resource_pool", lambda: _FakePool())
+    monkeypatch.setattr(openpi_action_ray_runtime, "get_model_actor_registry", lambda: _FakePool())
     monkeypatch.setattr(openpi_action_ray_runtime, "_openpi_runtime_env_vars", _fake_openpi_actor_env)
     monkeypatch.setenv("PFS_TINKER_PATH", "/repo")
 
@@ -922,7 +922,7 @@ def test_start_openpi_action_ray_runtime_applies_single_node_pin(monkeypatch) ->
     monkeypatch.setattr(openpi_action_ray_runtime, "ensure_openpi_ray_initialized", lambda: None)
     monkeypatch.setattr(openpi_action_ray_runtime, "OpenPIActionRayRuntimeActor", _FakeActorBuilder())
     monkeypatch.setattr(openpi_action_ray_runtime, "OpenPIActionRayRuntimeClient", _FakeClient)
-    monkeypatch.setattr(openpi_action_ray_runtime, "get_resource_pool", lambda: _FakePool())
+    monkeypatch.setattr(openpi_action_ray_runtime, "get_model_actor_registry", lambda: _FakePool())
     monkeypatch.setattr(openpi_action_ray_runtime, "_openpi_runtime_env_vars", _fake_openpi_actor_env)
     monkeypatch.setenv("PFS_TINKER_PATH", "/repo")
     monkeypatch.setattr(
