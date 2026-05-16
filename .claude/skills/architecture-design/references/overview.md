@@ -75,9 +75,9 @@ Two transfer mechanisms exist because of size and serialization limits:
 
 MoE training uses Megatron and must export PEFT adapters by reconstructing full tensors across TP and EP sharding. The preferred path is a newer Megatron-Bridge adapter export API that returns adapter weights without merging.
 
-## ModelActorSupervisor, ModelWorkScheduler, and registry
+## ModelActorSupervisor, ModelWorkScheduler, and inventory
 
-`ModelActorSupervisor` owns desired model-runtime actor reconciliation. `ModelWorkScheduler` owns hot task scheduling, replica subqueues, and leases. `ModelActorInventory` is a process-local inventory used for observability, inflight marking, and actor observability and inflight tracking.
+`ModelActorSupervisor` owns desired model-runtime actor reconciliation. `ModelWorkScheduler` owns hot task scheduling, replica subqueues, and leases. `ModelActorInventory` is a process-local helper owned by the supervisor for actor observability, inflight marking, session/protection metadata, and admin list/kill surfaces.
 
 Clients do not explicitly end all sessions, so idle timeouts still affect training and inference:
 - Detached inference actors can remain alive across server restarts and keep CUDA memory until evicted.
