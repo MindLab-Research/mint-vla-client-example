@@ -9,7 +9,7 @@ def anyio_backend() -> str:
 
 
 def test_issue_364_future_reaper_once_reaps_task_state(monkeypatch) -> None:
-    from tinker_server.backend import owner_runtime_supervisor as ors
+    from tinker_server.backend import maintenance_cron_actor as ors
 
     class _FakeFutureStore:
         async def async_ensure_started(self) -> dict:
@@ -33,7 +33,7 @@ def test_issue_364_future_reaper_once_reaps_task_state(monkeypatch) -> None:
 
 
 def test_issue_364_checkpoint_helpers_proxy_results(monkeypatch) -> None:
-    from tinker_server.backend import owner_runtime_supervisor as ors
+    from tinker_server.backend import maintenance_cron_actor as ors
 
     monkeypatch.setattr(ors, "reap_runtime_checkpoints", lambda: {"ephemeral": ["a"], "persistent_cache": [], "persistent": []})
     monkeypatch.setattr(ors, "process_pending_checkpoint_mirrors", lambda: {"mirrored": ["m1"], "failed": ["f1"]})
@@ -47,7 +47,7 @@ def test_issue_364_checkpoint_helpers_proxy_results(monkeypatch) -> None:
 
 
 def test_issue_364_training_cleanup_runner_proxies_results(monkeypatch) -> None:
-    from tinker_server.backend import owner_runtime_supervisor as ors
+    from tinker_server.backend import maintenance_cron_actor as ors
 
     class _FakeTrainingCleanupExecutor:
         async def async_cleanup_stale_sessions_once(self, *, stale_after_s=None):
@@ -62,7 +62,7 @@ def test_issue_364_training_cleanup_runner_proxies_results(monkeypatch) -> None:
 
 
 def test_issue_364_training_cleanup_runner_respects_disable_env(monkeypatch) -> None:
-    from tinker_server.backend import owner_runtime_supervisor as ors
+    from tinker_server.backend import maintenance_cron_actor as ors
 
     monkeypatch.setenv("MINT_TRAINING_HEARTBEAT_STALE_S", "0")
 
@@ -70,7 +70,7 @@ def test_issue_364_training_cleanup_runner_respects_disable_env(monkeypatch) -> 
 
 
 def test_issue_364_sampling_cleanup_runner_proxies_results(monkeypatch) -> None:
-    from tinker_server.backend import owner_runtime_supervisor as ors
+    from tinker_server.backend import maintenance_cron_actor as ors
 
     class _FakeSamplingCleanupExecutor:
         async def async_cleanup_stale_sessions_once(self):
@@ -92,7 +92,7 @@ def test_issue_364_runtime_degraded_healthz() -> None:
 
     clear_runtime_degraded_state()
     set_runtime_degraded_state(
-        reason="owner_runtime_supervisor_unavailable",
+        reason="maintenance_cron_actor_unavailable",
         error="boom",
         details={
             "x": 1,
@@ -109,7 +109,7 @@ def test_issue_364_runtime_degraded_healthz() -> None:
         out = public_healthz_response()
         assert isinstance(out, JSONResponse)
         assert out.status_code == 503
-        assert b'owner_runtime_supervisor_unavailable' in out.body
+        assert b'maintenance_cron_actor_unavailable' in out.body
         assert b"last_error_traceback" not in out.body
         assert b"Traceback secret/path.py" not in out.body
     finally:
@@ -117,29 +117,29 @@ def test_issue_364_runtime_degraded_healthz() -> None:
 
 
 @pytest.mark.anyio
-async def test_issue_364_internal_owner_runtime_supervisor_health(monkeypatch) -> None:
+async def test_issue_364_internal_maintenance_cron_actor_health(monkeypatch) -> None:
     from tinker_server.routes import internal
 
-    class _FakeOwnerRuntimeSupervisor:
+    class _FakeMaintenanceCronActor:
         async def async_health_snapshot(self, *, timeout_s: float = 10.0):
             return {
-                "actor_name": "tinker_owner_runtime_supervisor",
+                "actor_name": "mint_maintenance_cron",
                 "epoch_id": "epoch-1",
                 "timeout_s": float(timeout_s),
             }
 
-    monkeypatch.setattr("tinker_server.backend.owner_runtime_supervisor.owner_runtime_supervisor", _FakeOwnerRuntimeSupervisor())
+    monkeypatch.setattr("tinker_server.backend.maintenance_cron_actor.maintenance_cron_actor", _FakeMaintenanceCronActor())
 
-    out = await internal.owner_runtime_supervisor_health()
+    out = await internal.maintenance_cron_actor_health()
 
-    assert out["actor_name"] == "tinker_owner_runtime_supervisor"
+    assert out["actor_name"] == "mint_maintenance_cron"
     assert out["epoch_id"] == "epoch-1"
     assert out["timeout_s"] == 10.0
 
 
 
-def test_issue_364_owner_runtime_loop_snapshot_includes_error_details(monkeypatch):
-    from tinker_server.backend import owner_runtime_supervisor as ors
+def test_issue_364_maintenance_cron_loop_snapshot_includes_error_details(monkeypatch):
+    from tinker_server.backend import maintenance_cron_actor as ors
 
     actor_cls_box = {}
 

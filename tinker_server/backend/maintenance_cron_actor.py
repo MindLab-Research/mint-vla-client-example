@@ -40,7 +40,7 @@ _LOOP_SAMPLING_CLEANUP = "sampling_cleanup"
 
 
 def _actor_name() -> str:
-    return os.environ.get("MINT_OWNER_RUNTIME_SUPERVISOR_ACTOR_NAME", "tinker_owner_runtime_supervisor")
+    return os.environ.get("MINT_MAINTENANCE_CRON_ACTOR_NAME", "mint_maintenance_cron")
 
 
 def _ray_namespace() -> str:
@@ -134,7 +134,7 @@ def _kill_named_actor(actor: Any) -> None:
 
     ray_kill.kill(
         actor,
-        reason="owner_runtime_supervisor_code_mismatch",
+        reason="maintenance_cron_actor_code_mismatch",
         actor_name=_actor_name(),
         namespace=_ray_namespace(),
         no_restart=True,
@@ -159,7 +159,7 @@ def _get_or_create_actor():
         pass
 
     @ray.remote(num_cpus=0, max_concurrency=64)
-    class _OwnerRuntimeSupervisorActor:
+    class _MaintenanceCronActor:
         def __init__(self) -> None:
             from ..logging_context import init_actor_observability
 
@@ -235,7 +235,7 @@ def _get_or_create_actor():
                 state["last_error_type"] = type(e).__name__
                 state["error_count"] = int(state["error_count"]) + 1
                 logger.exception(
-                    "owner_runtime_supervisor loop failed loop=%s error_type=%s error=%s",
+                    "maintenance_cron_actor loop failed loop=%s error_type=%s error=%s",
                     loop_name,
                     type(e).__name__,
                     str(e),
@@ -305,7 +305,7 @@ def _get_or_create_actor():
     )
 
     try:
-        created = _OwnerRuntimeSupervisorActor.options(**options).remote()
+        created = _MaintenanceCronActor.options(**options).remote()
         try:
             _await_ray_ref_sync(created.health_snapshot.remote(), timeout_s=15.0)
             _ACTOR_HANDLE = created
@@ -317,7 +317,7 @@ def _get_or_create_actor():
         return _ACTOR_HANDLE
 
 
-class OwnerRuntimeSupervisor:
+class MaintenanceCronActor:
     def __init__(self) -> None:
         self._ray_actor = None
 
@@ -352,7 +352,7 @@ class OwnerRuntimeSupervisor:
         refreshed = _await_ray_ref_sync(actor.health_snapshot.remote(), timeout_s=15.0)
         if refreshed.get("code_identity") != CURRENT_CODE_IDENTITY:
             raise RuntimeError(
-                "owner runtime supervisor code identity mismatch after recreate: "
+                "maintenance cron actor code identity mismatch after recreate: "
                 f"expected={CURRENT_CODE_IDENTITY!r} actual={refreshed.get('code_identity')!r}"
             )
 
@@ -370,7 +370,7 @@ class OwnerRuntimeSupervisor:
         )
         if refreshed.get("code_identity") != CURRENT_CODE_IDENTITY:
             raise RuntimeError(
-                "owner runtime supervisor code identity mismatch after recreate: "
+                "maintenance cron actor code identity mismatch after recreate: "
                 f"expected={CURRENT_CODE_IDENTITY!r} actual={refreshed.get('code_identity')!r}"
             )
 
@@ -422,4 +422,4 @@ class OwnerRuntimeSupervisor:
         )
 
 
-owner_runtime_supervisor = OwnerRuntimeSupervisor()
+maintenance_cron_actor = MaintenanceCronActor()

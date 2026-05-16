@@ -234,7 +234,7 @@ async def admission_stats(*, include_actor_rss: bool = True) -> dict:
     from ..backend.task_state_store import task_state_futures
     from ..backend.model_actor_supervisor import model_actor_supervisor
     from ..backend.model_work_scheduler import model_work_scheduler
-    from ..backend.owner_runtime_supervisor import owner_runtime_supervisor
+    from ..backend.maintenance_cron_actor import maintenance_cron_actor
     from ..backend.session_heartbeat_store import session_heartbeat_store
     from ..routes import sampling as sampling_route
     from ..routes import service as service_route
@@ -346,11 +346,11 @@ async def admission_stats(*, include_actor_rss: bool = True) -> dict:
     except Exception as e:
         ray_gcs_metrics = {"error": f"{type(e).__name__}: {e}"}
 
-    owner_runtime = None
+    maintenance_cron = None
     try:
-        owner_runtime = await owner_runtime_supervisor.async_health_snapshot(timeout_s=timeout_s)
+        maintenance_cron = await maintenance_cron_actor.async_health_snapshot(timeout_s=timeout_s)
     except Exception as e:
-        owner_runtime = {"error": f"{type(e).__name__}: {e}"}
+        maintenance_cron = {"error": f"{type(e).__name__}: {e}"}
 
     return {
         "model_work_scheduler": model_scheduler,
@@ -361,15 +361,15 @@ async def admission_stats(*, include_actor_rss: bool = True) -> dict:
         "driver_state": driver_state,
         "ray_cluster": ray_cluster,
         "ray_gcs_metrics": ray_gcs_metrics,
-        "owner_runtime_supervisor": owner_runtime,
+        "maintenance_cron_actor": maintenance_cron,
     }
 
 
-@router.get("/owner_runtime_supervisor")
-async def owner_runtime_supervisor_health() -> dict:
-    from ..backend.owner_runtime_supervisor import owner_runtime_supervisor
+@router.get("/maintenance_cron_actor")
+async def maintenance_cron_actor_health() -> dict:
+    from ..backend.maintenance_cron_actor import maintenance_cron_actor
 
-    return await owner_runtime_supervisor.async_health_snapshot(timeout_s=10.0)
+    return await maintenance_cron_actor.async_health_snapshot(timeout_s=10.0)
 
 
 @router.get("/model_work_scheduler")

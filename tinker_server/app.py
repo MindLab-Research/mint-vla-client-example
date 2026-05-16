@@ -62,7 +62,7 @@ else:
     from .routes import mint
 
 
-def _owner_runtime_snapshot_details(
+def _maintenance_cron_snapshot_details(
     snapshot: dict[str, object],
     *,
     loop_name: object | None = None,
@@ -226,7 +226,7 @@ async def lifespan(app: FastAPI):
     from .backend.task_state_store import task_state_futures
     from .backend.config_actor import async_ensure_started as async_ensure_config_actor_started
     from .backend.gateway_session_store import ensure_ready as ensure_gateway_session_store_ready
-    from .backend.owner_runtime_supervisor import owner_runtime_supervisor
+    from .backend.maintenance_cron_actor import maintenance_cron_actor
     from .backend.sampling_session_store import ensure_ready as ensure_sampling_session_store_ready
     from .backend.session_heartbeat_store import session_heartbeat_store
     from .backend.session_index_store import ensure_ready as ensure_session_index_store_ready
@@ -249,7 +249,7 @@ async def lifespan(app: FastAPI):
         startup_lease.owner_id,
     )
 
-    owner_runtime_local_only = os.environ.get("MINT_OWNER_RUNTIME_SUPERVISOR_LOCAL_ONLY", "").strip().lower() in {"1", "true", "yes", "on"}
+    maintenance_cron_local_only = os.environ.get("MINT_MAINTENANCE_CRON_LOCAL_ONLY", "").strip().lower() in {"1", "true", "yes", "on"}
 
     from .usage_store import get_usage_store
 
@@ -267,10 +267,10 @@ async def lifespan(app: FastAPI):
         from .backend.future_replay import ensure_future_replay_sweeper
 
         ensure_future_replay_sweeper()
-    if owner_runtime_local_only:
-        owner_runtime = {"actor_name": "local_owner_runtime_supervisor", "epoch_id": "local"}
+    if maintenance_cron_local_only:
+        maintenance_cron = {"actor_name": "local_maintenance_cron_actor", "epoch_id": "local"}
     else:
-        owner_runtime = await owner_runtime_supervisor.async_ensure_started()
+        maintenance_cron = await maintenance_cron_actor.async_ensure_started()
 
     from .backend.action_session_manager import ActionSessionRouter
 
@@ -314,18 +314,18 @@ async def lifespan(app: FastAPI):
 
     app_module_git_sha = _git_sha()
     logger.info(
-        "owner runtime supervisor ready actor=%s epoch=%s",
-        owner_runtime.get("actor_name"),
-        owner_runtime.get("epoch_id"),
+        "maintenance cron actor ready actor=%s epoch=%s",
+        maintenance_cron.get("actor_name"),
+        maintenance_cron.get("epoch_id"),
     )
 
-    def _owner_runtime_health_error(snapshot: dict[str, object]) -> tuple[str, str, dict[str, object]] | None:
+    def _maintenance_cron_health_error(snapshot: dict[str, object]) -> tuple[str, str, dict[str, object]] | None:
         code_identity = snapshot.get("code_identity")
         if code_identity != app_module_git_sha:
             return (
-                "owner_runtime_supervisor_code_mismatch",
+                "maintenance_cron_actor_code_mismatch",
                 f"expected code_identity={app_module_git_sha!r} actual={code_identity!r}",
-                _owner_runtime_snapshot_details(snapshot),
+                _maintenance_cron_snapshot_details(snapshot),
             )
         loops = snapshot.get("loops")
         if isinstance(loops, dict):
@@ -339,17 +339,17 @@ async def lifespan(app: FastAPI):
                     last_success_at is None or float(last_error_at) >= float(last_success_at)
                 ):
                     return (
-                        "owner_runtime_supervisor_loop_error",
+                        "maintenance_cron_actor_loop_error",
                         f"loop={loop_name} last_error={last_error}",
-                        _owner_runtime_snapshot_details(snapshot, loop_name=loop_name, loop_state=raw),
+                        _maintenance_cron_snapshot_details(snapshot, loop_name=loop_name, loop_state=raw),
                     )
         return None
 
-    async def _owner_runtime_health_loop() -> None:
+    async def _maintenance_cron_health_loop() -> None:
         while True:
             try:
-                snapshot = await owner_runtime_supervisor.async_health_snapshot(timeout_s=10.0)
-                err = _owner_runtime_health_error(snapshot)
+                snapshot = await maintenance_cron_actor.async_health_snapshot(timeout_s=10.0)
+                err = _maintenance_cron_health_error(snapshot)
                 if err is None:
                     clear_runtime_degraded_state()
                 else:
@@ -357,17 +357,17 @@ async def lifespan(app: FastAPI):
                     set_runtime_degraded_state(reason=reason, error=error, details=details)
             except Exception as e:
                 set_runtime_degraded_state(
-                    reason="owner_runtime_supervisor_unavailable",
+                    reason="maintenance_cron_actor_unavailable",
                     error=f"{type(e).__name__}: {e}",
                     details={},
                 )
             await asyncio.sleep(5.0)
 
-    if owner_runtime_local_only:
+    if maintenance_cron_local_only:
         clear_runtime_degraded_state()
-        owner_runtime_health_task = None
+        maintenance_cron_health_task = None
     else:
-        owner_runtime_health_task = asyncio.create_task(_owner_runtime_health_loop())
+        maintenance_cron_health_task = asyncio.create_task(_maintenance_cron_health_loop())
     ray_reconnect_watch_task: asyncio.Task | None = None
     model_actor_supervisor_task: asyncio.Task | None = None
     last_ray_connection_epoch = ray_connection_epoch()
@@ -382,10 +382,10 @@ async def lifespan(app: FastAPI):
         # Cleanup: Kill stale actors from previous server runs
         # ==========================================================================
         if startup_owner:
-            if owner_runtime_local_only:
+            if maintenance_cron_local_only:
                 await _cleanup_stale_actors()
             else:
-                await owner_runtime_supervisor.async_run_once("actor_reconciliation", timeout_s=60.0)
+                await maintenance_cron_actor.async_run_once("actor_reconciliation", timeout_s=60.0)
         else:
             logger.info("Skipping stale-actor cleanup on follower worker")
 
@@ -532,7 +532,7 @@ async def lifespan(app: FastAPI):
     # ==========================================================================
     await _cancel_task(ray_reconnect_watch_task)
     await _cancel_task(model_actor_supervisor_task)
-    await _cancel_task(owner_runtime_health_task)
+    await _cancel_task(maintenance_cron_health_task)
     await _cancel_task(stale_training_heartbeat_task)
     await _cancel_task(startup_lease_task)
     await startup_lease.release()

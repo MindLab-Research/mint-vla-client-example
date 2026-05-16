@@ -83,7 +83,7 @@ def test_start_issue_server_helper_scopes_control_plane_actor_names() -> None:
     assert token in data["MINT_SESSION_HEARTBEAT_ACTOR_NAME"]
     assert token in data["MINT_SESSION_INDEX_ACTOR_NAME"]
     assert token in data["MINT_RESOURCE_POOL_ACTOR_NAME"]
-    assert token in data["MINT_OWNER_RUNTIME_SUPERVISOR_ACTOR_NAME"]
+    assert token in data["MINT_MAINTENANCE_CRON_ACTOR_NAME"]
     assert token in data["MINT_TRAINING_CLEANUP_EXECUTOR_ACTOR_NAME"]
     assert token in data["MINT_SAMPLING_CLEANUP_EXECUTOR_ACTOR_NAME"]
     assert token in data["MINT_FUTURE_REPLAY_SWEEPER_ACTOR_NAME"]
@@ -96,7 +96,7 @@ def test_start_issue_server_helper_scopes_control_plane_actor_names() -> None:
         "tinker_session_heartbeat_store",
         "tinker_session_index_store",
         "tinker_resource_pool",
-        "tinker_owner_runtime_supervisor",
+        "mint_maintenance_cron",
         "tinker_training_cleanup_executor",
         "tinker_sampling_cleanup_executor",
         "mint_future_replay_sweeper",

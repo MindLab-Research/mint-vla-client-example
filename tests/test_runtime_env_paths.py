@@ -1224,7 +1224,7 @@ def test_actor_runtime_env_vars_forwards_control_plane_actor_names(tmp_path):
             "MINT_MODEL_WORK_SCHEDULER_PINNED_NODE_IP": "192.168.39.110",
             "MINT_TASK_STATE_STORE_ACTOR_NAME": "mint-task-state-store-test",
             "MINT_STARTUP_LEASE_ACTOR_NAME": "mint-startup-lease-test",
-            "MINT_OWNER_RUNTIME_SUPERVISOR_ACTOR_NAME": "mint-owner-runtime-test",
+            "MINT_MAINTENANCE_CRON_ACTOR_NAME": "mint-maintenance-cron-test",
         },
     )
     data = payload["runtime_env"]
@@ -1245,7 +1245,7 @@ def test_actor_runtime_env_vars_forwards_control_plane_actor_names(tmp_path):
     assert actor_env["MINT_MODEL_WORK_SCHEDULER_PINNED_NODE_IP"] == "192.168.39.110"
     assert actor_env["MINT_TASK_STATE_STORE_ACTOR_NAME"] == "mint-task-state-store-test"
     assert actor_env["MINT_STARTUP_LEASE_ACTOR_NAME"] == "mint-startup-lease-test"
-    assert actor_env["MINT_OWNER_RUNTIME_SUPERVISOR_ACTOR_NAME"] == "mint-owner-runtime-test"
+    assert actor_env["MINT_MAINTENANCE_CRON_ACTOR_NAME"] == "mint-maintenance-cron-test"
 
 
 def test_actor_runtime_env_vars_forwards_usage_envs(tmp_path):
