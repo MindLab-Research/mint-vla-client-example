@@ -60,15 +60,15 @@ def test_issue_381_delete_session_cleans_shared_megatron_state(monkeypatch: pyte
 
     engine._workers[model_id] = worker
     engine._workers[sibling_model_id] = worker
-    engine._model_actor_registry_actor_names[model_id] = actor_name
-    engine._model_actor_registry_actor_names[sibling_model_id] = actor_name
+    engine._model_actor_supervisor_actor_names[model_id] = actor_name
+    engine._model_actor_supervisor_actor_names[sibling_model_id] = actor_name
     engine._actor_loaded_sessions[actor_name] = model_id
     engine._actor_volatile_sessions[actor_name] = {model_id}
 
     import tinker_server.backend.verl_training as verl_training
 
     monkeypatch.setattr(
-        "tinker_server.backend.model_actor_registry.get_model_actor_registry",
+        "tinker_server.backend.model_actor_supervisor.get_model_actor_supervisor",
         lambda: SimpleNamespace(
             is_protected=lambda name: False,
             set_session=lambda name, session_id: set_session_calls.append((name, session_id)),
@@ -83,9 +83,9 @@ def test_issue_381_delete_session_cleans_shared_megatron_state(monkeypatch: pyte
     assert killed == []
     assert set_session_calls == [(actor_name, sibling_model_id)]
     assert model_id not in engine._workers
-    assert model_id not in engine._model_actor_registry_actor_names
+    assert model_id not in engine._model_actor_supervisor_actor_names
     assert sibling_model_id in engine._workers
-    assert sibling_model_id in engine._model_actor_registry_actor_names
+    assert sibling_model_id in engine._model_actor_supervisor_actor_names
     assert engine._actor_loaded_sessions == {}
     assert engine._actor_volatile_sessions == {}
     assert session.is_active is False
@@ -104,13 +104,13 @@ def test_issue_381_delete_session_cleans_shared_dense_state(monkeypatch: pytest.
 
     engine._workers[model_id] = worker
     engine._workers[sibling_model_id] = worker
-    engine._model_actor_registry_actor_names[model_id] = actor_name
-    engine._model_actor_registry_actor_names[sibling_model_id] = actor_name
+    engine._model_actor_supervisor_actor_names[model_id] = actor_name
+    engine._model_actor_supervisor_actor_names[sibling_model_id] = actor_name
 
     import tinker_server.backend.verl_training as verl_training
 
     monkeypatch.setattr(
-        "tinker_server.backend.model_actor_registry.get_model_actor_registry",
+        "tinker_server.backend.model_actor_supervisor.get_model_actor_supervisor",
         lambda: SimpleNamespace(
             is_protected=lambda name: False,
             set_session=lambda name, session_id: set_session_calls.append((name, session_id)),
@@ -161,7 +161,7 @@ async def test_issue_381_idle_cleanup_uses_engine_delete_session(monkeypatch: py
         lambda model_id: deleted_store_sessions.append(model_id),
     )
     monkeypatch.setattr(
-        "tinker_server.backend.model_actor_registry.get_model_actor_registry",
+        "tinker_server.backend.model_actor_supervisor.get_model_actor_supervisor",
         lambda: SimpleNamespace(clear_session=lambda model_id: cleared_sessions.append(model_id)),
     )
 

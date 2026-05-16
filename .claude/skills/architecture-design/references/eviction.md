@@ -1,126 +1,80 @@
-# GPU actor inventory and eviction
+# GPU actor inventory
 
-Mint now separates desired actor reconciliation from local actor inventory:
+Mint separates desired actor reconciliation from local actor inventory:
 
 - `ModelActorSupervisor` is the desired-state reconciler. It owns node-pin based model-runtime actor planning and talks to `ModelWorkScheduler` about replica availability.
-- `ModelActorRegistry` (`tinker_server/backend/model_actor_registry.py`) is a process-local projection of currently known GPU actors. It tracks metadata, inflight counts, session bindings, LRU timestamps, and best-effort eviction helpers. It is not a detached store and is not durable scheduling state.
+- `ModelActorInventory` (`tinker_server/backend/model_actor_inventory.py`) is an internal helper owned by `ModelActorSupervisor`. It tracks local metadata, inflight counts, session bindings, protection flags, RSS samples, and actor handles for admin list/kill and observability.
 - Durable task/lease/result state lives in `TaskStateStore`; hot scheduling state lives in `ModelWorkScheduler`.
 
-## What gets evicted
+## No LRU capacity manager
 
-`ModelActorRegistry` tracks GPU-using Ray actors observed by the API process:
-- `ActorType.VLLM`: vLLM inference actors (including multi-LoRA vLLM actors)
-- `ActorType.DENSE`: dense training actors (TrainingWorker) managed by DenseTrainerPool
-- `ActorType.MEGATRON`: MegatronWorkerGroup actors (MoE training)
+The old demand-driven GPU capacity path is removed. Direct actor creation no longer calls local `ensure_gpus_available`, pending GPU reservations, or opportunistic LRU eviction.
 
-The registry does not create actors and does not decide desired placement. It only:
-- records actor metadata (type, GPU count, session association, node_id)
-- updates LRU timestamps on use
-- kills idle actors when a legacy direct actor creation path explicitly asks for capacity
+GPU placement is now expected to be deterministic:
 
-## When eviction happens in V1
+- scheduler-owned work should flow through `ModelWorkScheduler` and runtime subqueues;
+- model runtime actors should be reconciled from `ModelActorSupervisor` desired state and node pins;
+- direct creation paths should rely on explicit placement or Ray placement failure, not a process-local best-effort eviction loop.
 
-Eviction is still demand-driven on direct actor creation paths. Callers must explicitly request capacity:
-- `ModelActorRegistry.ensure_gpus_available(needed_gpus)` checks Ray GPU availability and triggers eviction if needed.
-- Call sites include:
-  - vLLM actor creation (`tinker_server/backend/multi_lora_engine.py`)
-  - Dense trainer actor creation (`tinker_server/backend/verl_training.py` DenseTrainerPool)
-  - Megatron actor creation (`tinker_server/backend/megatron_distributed.py`)
+## Inventory responsibilities
 
-If no code calls `ensure_gpus_available`, the registry does not evict anything. Scheduler-driven runtime placement should prefer deterministic node pins and supervisor reconciliation instead of opportunistic "find any GPU" logic.
+`ModelActorSupervisor` inventory tracks GPU-using Ray actors observed by the API process:
 
-## DenseTrainerPool interaction
+- `ActorType.VLLM`: vLLM inference actors, including multi-LoRA vLLM actors
+- `ActorType.DENSE`: dense training actors
+- `ActorType.OPENPI`: OpenPI action/training actors
+- `ActorType.MEGATRON`: MegatronWorkerGroup actors
 
-Dense training has two layers of caching/lifecycle:
-- `DenseTrainerPool` reuses a detached `TrainingWorker` per `base_model` and can also kill idle pool entries.
-- `ModelActorRegistry` is the local cross-subsystem inventory and best-effort eviction helper.
+The inventory:
 
-In practice, `DenseTrainerPool.get_or_create(...)` calls `ModelActorRegistry.ensure_gpus_available(1)` before creating a new actor and registers the actor into `ModelActorRegistry` for LRU accounting.
+- records actor metadata such as type, GPU count, session association, node id, and backend observability fields;
+- updates access timestamps on use;
+- tracks inflight counts so admin/metrics can distinguish busy actors;
+- keeps optional protection/session fields used by lifecycle code;
+- powers `/api/v1/actors`, `/api/v1/actors/kill`, `/internal/admission_stats`, and `/internal/metrics`.
 
-## Idle and evictable definitions
+It does not own desired placement and is not durable scheduling state.
+
+## Idle state
 
 Each actor has:
-- `creating`: True while the actor is initializing. Creating actors are never evicted.
-- `protected`: True means the actor is never evicted by `ModelActorRegistry` LRU (used for "persistent" actors).
-- `last_accessed`: updated via `touch()`/`get()` to implement LRU.
-- `current_session`: optional marker for training actors.
 
-`ActorEntry.is_idle(session_idle_timeout)`:
+- `creating`: true while the actor is initializing.
+- `protected`: true for actors that admin tooling should not casually remove.
+- `last_accessed`: updated via `touch()`/`get()`.
+- `current_session`: optional marker for training-like actors.
+
+`ActorEntry.is_idle(session_idle_timeout)` is observability-only:
+
 - vLLM: idle if `idle_time() > session_idle_timeout`
-- training actors: idle if `current_session is None` OR `idle_time() > session_idle_timeout`
+- training actors: idle if `current_session is None` or `idle_time() > session_idle_timeout`
 
-Evictability is stricter than idleness:
-- An actor is evictable if it is idle AND `idle_time() > MIN_ACTOR_AGE`.
-- Env vars:
-  - `MINT_SESSION_IDLE_TIMEOUT` (default 300s)
-  - `MINT_MIN_ACTOR_AGE` (default 300s)
+The only config knob left for this surface is `[model_actor_supervisor_inventory].session_idle_timeout_s`, mirrored by `MINT_MODEL_ACTOR_SUPERVISOR_INVENTORY_SESSION_IDLE_TIMEOUT_S`.
 
-LRU ordering:
-- `ModelActorRegistry._get_evictable_actors_lru()` sorts evictable actors by `last_accessed` ascending (oldest first).
+## Admin kill
 
-## Pending reservations (concurrency safety)
+Admin kill remains explicit. `ModelActorInventory.clear(kill_actors=True)` and actor-family kill routes:
 
-To avoid races where multiple concurrent requests all observe the same "available GPUs" and over-allocate:
-- `ModelActorRegistry.reserve_gpus(n)` increments `_pending_gpus`.
-- `ModelActorRegistry.get_effective_available_gpus()` returns `ray.available_resources()["GPU"] - _pending_gpus`.
-- `ModelActorRegistry.release_pending_gpus(n)` decrements `_pending_gpus` after the actor is created (or the create failed).
+- look up actor handles by name and namespace;
+- try `shutdown.remote()` when present;
+- call `ray_kill.kill(...)`;
+- unregister local inventory state.
 
-If a caller ignores pending reservations and uses raw Ray availability, the pool cannot prevent oversubscription.
-
-## Killing an actor
-
-`ModelActorRegistry._kill_actor(entry)`:
-- gets actor handle (cached handle or `ray.get_actor(name, namespace)`)
-- tries `actor.shutdown.remote()` if present (best-effort)
-- then `ray_kill.kill(...)` and removes it from `_entries`
-
-This frees GPUs at Ray scheduling level. It does not guarantee CUDA memory defragmentation on the node.
-
-`ray_kill.kill(...)`:
-- logs structured context (reason, actor_name, namespace, GPU footprint, etc.)
-- optionally logs a call stack when `MINT_LOG_KILL_STACK=1`
-- best-effort removes a detached placement group named `{actor_name}_pg` (a common leak source)
-
-## Clearing stale session pins
-
-Session deletion can race with in-flight actor creation. Two helpers exist to avoid permanently pinning an actor as "non-idle" due to stale `current_session` values:
-- `ModelActorRegistry.clear_session(session_id)` clears `current_session` fields that still point at a deleted session.
-- Dense training has a parallel mechanism: `DenseTrainerPool.clear_session(session_id)` (see `tinker_server/backend/verl_training.py`).
+This is an operator action, not automatic admission control.
 
 ## Startup reconciliation
 
-Many actors are created as detached so they can survive an API server restart.
+Many actors are detached and can survive API server restart. Startup reconciliation:
 
-Problem: after restart, server memory is empty, but actors still exist.
+- lists named actors in `tinker_server.config.RAY_NAMESPACE`;
+- health-checks them via `__ray_ready__`;
+- registers alive actors into `ModelActorSupervisor` inventory and marks them ready;
+- unregisters or kills dead/unresponsive actors.
 
-Startup hook `tinker_server/app.py:_cleanup_stale_actors()`:
-- lists named actors in `tinker_server.config.RAY_NAMESPACE` (from `TINKER_RAY_NAMESPACE`)
-- health-checks them (`__ray_ready__`)
-- registers alive actors into `ModelActorRegistry` and marks them ready
-- kills dead/unresponsive ones
+This rebuilds the process-local inventory projection from live Ray named actors.
 
-This rebuilds the process-local `ModelActorRegistry` projection from live Ray named actors.
+## Architecture guidance
 
-## Persistent actors (prewarm + eviction protection)
-
-At API server startup, Mint can optionally pre-create long-lived training/inference actors and mark them as `protected` in `ModelActorRegistry` so direct LRU eviction paths do not kill them.
-
-Implementation: `tinker_server/app.py:_prewarm_persistent_models(...)`.
-
-Controls:
-- `MINT_PERSISTENT_MODELS`: comma-separated HF model names (enables prewarm)
-- `MINT_PERSISTENT_TRAIN_LORA_RANK` (default 16)
-- `MINT_PERSISTENT_TRAIN_LR` (default 5e-5)
-- `MINT_PERSISTENT_MEGATRON_READY_TIMEOUT_S` (default 3600)
-- `MINT_PERSISTENT_INFER_TIMEOUT_S` (default 1800)
-
-## Implications for architecture changes
-
-- If you introduce a new GPU-using actor type, first decide whether it should be reconciled by `ModelActorSupervisor` and claimed through `ModelWorkScheduler`.
-- Register live actors in `ModelActorRegistry` so local observability and eviction safeguards stay correct. Decide how it should set:
-  - `creating` (protect during init)
-  - `protected` (if you need a never-evict policy)
-  - `current_session` (if training-like)
-  - `node_id` (if placement decisions need it)
-- For direct, non-scheduler actor creation paths, ensure the code path calls `ensure_gpus_available` before `ray.remote(...).remote(...)`.
-- If the actor is detached, add it to startup reconciliation in `tinker_server/app.py`.
+- New scheduler-owned GPU runtime actors should be modeled as `ModelActorSupervisor` desired state plus `ModelWorkScheduler` replica registrations.
+- New direct actor paths should register live actors in `ModelActorSupervisor` inventory for admin and metrics, but must not add local capacity reservation or LRU eviction.
+- Detached GPU actors should participate in startup reconciliation.

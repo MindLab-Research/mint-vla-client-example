@@ -10,10 +10,36 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from .async_ray_control import async_get_ray_ref
+from .model_actor_inventory import (
+    ActorEntry,
+    ActorType,
+    ModelActorInventory,
+    ModelActorSupervisorStaleError,
+    _ModelActorInventoryState,
+    actor_observability_metadata,
+    async_actor_observability_metadata,
+)
 from .model_actor_placement import model_actor_placement_reconciler
 from .model_work_scheduler import ModelReplicaRegistration, ModelWorkSchedulerClient, model_work_scheduler
 
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    "ActorEntry",
+    "ActorType",
+    "ModelActorSpec",
+    "ModelActorSupervisor",
+    "ModelActorSupervisorStaleError",
+    "_ModelActorInventoryState",
+    "actor_observability_metadata",
+    "async_actor_observability_metadata",
+    "default_model_actor_name",
+    "domain_key_for_internal_control",
+    "domain_key_for_training_base_model",
+    "domain_key_for_vllm_base_model",
+    "get_model_actor_supervisor",
+    "model_actor_supervisor",
+]
 
 
 @dataclass(frozen=True)
@@ -435,8 +461,15 @@ class ModelActorSupervisor:
         self._last_reconcile_at: float | None = None
         self._last_scheduler_sync_at: float | None = None
         self._last_placement_reconcile: dict[str, Any] | None = None
+        self._inventory = ModelActorInventory()
         for spec in specs or []:
             self.set_desired(spec)
+
+    def __getattr__(self, name: str) -> Any:
+        inventory = self.__dict__.get("_inventory")
+        if inventory is not None and hasattr(inventory, name):
+            return getattr(inventory, name)
+        raise AttributeError(f"{type(self).__name__!s} object has no attribute {name!r}")
 
     def set_desired(self, spec: ModelActorSpec) -> None:
         if not spec.domain_key:
@@ -858,3 +891,7 @@ def consumer_id_for_replica(domain_key: str, replica_id: str, generation: int) -
 
 
 model_actor_supervisor = ModelActorSupervisor(specs=desired_specs_from_env())
+
+
+def get_model_actor_supervisor() -> ModelActorSupervisor:
+    return model_actor_supervisor

@@ -999,7 +999,7 @@ curl -s http://localhost:8000/api/v1/healthz
 
 Use this after shared actor code changes (for example `tinker_server/backend/model_registry.py`) or when GPUs are exhausted.
 
-Note: `/api/v1/actors/kill` with `{"actor_type":"all"}` kills ModelActorRegistry-tracked GPU actors (vLLM, Megatron, dense trainer pool). It does not kill detached store actors.
+Note: `/api/v1/actors/kill` with `{"actor_type":"all"}` kills ModelActorSupervisorInventory-tracked GPU actors (vLLM, Megatron, dense trainer pool). It does not kill detached store actors.
 
 ```bash
 curl -X POST -H "Content-Type: application/json" \

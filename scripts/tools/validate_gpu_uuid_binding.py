@@ -87,7 +87,7 @@ def inspect_allocated_gpu() -> dict[str, Any]:
     }
 
 
-def _read_model_actor_registry_bindings() -> list[dict[str, str]]:
+def _read_model_actor_supervisor_inventory_bindings() -> list[dict[str, str]]:
     try:
         from tinker_server.routes import internal as internal_routes
 
@@ -95,10 +95,10 @@ def _read_model_actor_registry_bindings() -> list[dict[str, str]]:
     except Exception:
         return []
     out: list[dict[str, str]] = []
-    for rec in stats.get("model_actor_registry", []):
+    for rec in stats.get("model_actor_supervisor_inventory", []):
         if not isinstance(rec, dict):
             continue
-        for binding in internal_routes._model_actor_registry_gpu_bindings(rec):
+        for binding in internal_routes._model_actor_supervisor_inventory_gpu_bindings(rec):
             out.append({str(k): str(v) for k, v in binding.items()})
     return out
 
@@ -120,7 +120,7 @@ def main() -> int:
     parser.add_argument(
         "--validate-existing-bindings",
         action="store_true",
-        help="Fetch current ModelActorRegistry bindings and verify any gpu_uuid labels against NVML UUIDs on the same hostname.",
+        help="Fetch current ModelActorSupervisorInventory bindings and verify any gpu_uuid labels against NVML UUIDs on the same hostname.",
     )
     args = parser.parse_args()
 
@@ -143,13 +143,13 @@ def main() -> int:
         row.get("hostname"): {gpu.get("gpu_uuid") for gpu in row.get("nvml_gpus", []) if gpu.get("gpu_uuid")}
         for row in rows
     }
-    model_actor_registry_bindings = _read_model_actor_registry_bindings() if args.validate_existing_bindings else []
-    model_actor_registry_binding_uuid_errors = []
-    for binding in model_actor_registry_bindings:
+    model_actor_supervisor_inventory_bindings = _read_model_actor_supervisor_inventory_bindings() if args.validate_existing_bindings else []
+    model_actor_supervisor_inventory_binding_uuid_errors = []
+    for binding in model_actor_supervisor_inventory_bindings:
         gpu_uuid = binding.get("gpu_uuid")
         hostname = binding.get("hostname")
         if gpu_uuid and hostname and gpu_uuid not in nvml_by_hostname.get(hostname, set()):
-            model_actor_registry_binding_uuid_errors.append(binding)
+            model_actor_supervisor_inventory_binding_uuid_errors.append(binding)
     summary = []
     for row in rows:
         nvml_uuids = nvml_by_node.get(row.get("node_ip"), set())
@@ -176,10 +176,10 @@ def main() -> int:
                 "summary": summary,
                 "rows": rows,
                 "allocated_rows": allocated_rows,
-                "model_actor_registry_binding_uuid_count": sum(
-                    1 for binding in model_actor_registry_bindings if binding.get("gpu_uuid")
+                "model_actor_supervisor_inventory_binding_uuid_count": sum(
+                    1 for binding in model_actor_supervisor_inventory_bindings if binding.get("gpu_uuid")
                 ),
-                "model_actor_registry_binding_uuid_missing_from_nvml": model_actor_registry_binding_uuid_errors,
+                "model_actor_supervisor_inventory_binding_uuid_missing_from_nvml": model_actor_supervisor_inventory_binding_uuid_errors,
             },
             indent=2,
             sort_keys=True,

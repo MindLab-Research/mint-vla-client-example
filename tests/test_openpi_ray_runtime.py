@@ -235,7 +235,7 @@ def test_ray_keepalive_awaits_future_without_ray_get(monkeypatch) -> None:
     )
     monkeypatch.setattr(
         ray_keepalive,
-        "get_model_actor_registry",
+        "get_model_actor_supervisor",
         lambda: SimpleNamespace(
             mark_inflight=lambda actor_name, delta: calls.append(("mark_inflight", actor_name, delta)),
             touch=lambda actor_name: calls.append(("touch", actor_name)),
@@ -243,7 +243,7 @@ def test_ray_keepalive_awaits_future_without_ray_get(monkeypatch) -> None:
     )
 
     result = asyncio.run(
-        ray_keepalive.ray_get_with_model_actor_registry_keepalive(
+        ray_keepalive.ray_get_with_model_actor_supervisor_keepalive(
             ref,
             actor_name="actor-1",
             interval_s=1.0,
@@ -278,7 +278,7 @@ def test_ray_keepalive_preserves_periodic_touch_while_waiting(monkeypatch) -> No
 
     monkeypatch.setattr(
         ray_keepalive,
-        "get_model_actor_registry",
+        "get_model_actor_supervisor",
         lambda: SimpleNamespace(
             mark_inflight=lambda *_args: None,
             touch=_touch,
@@ -287,7 +287,7 @@ def test_ray_keepalive_preserves_periodic_touch_while_waiting(monkeypatch) -> No
 
     start = time.time()
     assert asyncio.run(
-        ray_keepalive.ray_get_with_model_actor_registry_keepalive(
+        ray_keepalive.ray_get_with_model_actor_supervisor_keepalive(
             ref,
             actor_name="actor-1",
             interval_s=0.01,
@@ -315,7 +315,7 @@ def test_ray_keepalive_cancellation_silences_late_exception(monkeypatch) -> None
     monkeypatch.setattr(async_ray_control, "_discard_late_result", _record_late_result)
     monkeypatch.setattr(
         ray_keepalive,
-        "get_model_actor_registry",
+        "get_model_actor_supervisor",
         lambda: SimpleNamespace(
             mark_inflight=lambda *_args: None,
             touch=lambda *_args: None,
@@ -326,7 +326,7 @@ def test_ray_keepalive_cancellation_silences_late_exception(monkeypatch) -> None
         fut = asyncio.get_running_loop().create_future()
         ref = SimpleNamespace(future=lambda: fut)
         task = asyncio.create_task(
-            ray_keepalive.ray_get_with_model_actor_registry_keepalive(
+            ray_keepalive.ray_get_with_model_actor_supervisor_keepalive(
                 ref,
                 actor_name="actor-1",
                 interval_s=1.0,

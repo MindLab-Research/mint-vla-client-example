@@ -200,7 +200,7 @@ def _assert_busy_vllm_actor_not_idle_while_future_pending(sampling_session_id: s
             # request remains pending.
             if idle is True and elapsed > (EXPECTED_IDLE_TIMEOUT_S + 1.0):
                 raise RuntimeError(
-                    "ModelActorRegistry marks vLLM actor idle while inference is in-flight "
+                    "ModelActorSupervisorInventory marks vLLM actor idle while inference is in-flight "
                     f"(dt_s={elapsed:.1f}, idle_time={idle_time}, infer_request_id={infer_rid})"
                 )
             time.sleep(0.5)

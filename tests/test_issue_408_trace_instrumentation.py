@@ -163,7 +163,7 @@ async def test_issue_408_save_weights_for_sampler_emits_trace_spans(
 def test_issue_408_megatron_create_path_emits_trace_spans(monkeypatch) -> None:
     from tinker_server.backend import megatron_distributed as md
     from tinker_server.backend import model_registry as model_registry
-    from tinker_server.backend import model_actor_registry as model_actor_registry_mod
+    from tinker_server.backend import model_actor_supervisor as model_actor_supervisor_mod
     from tinker_server import config as config_mod
 
     span_calls: list[tuple[str, dict[str, object]]] = []
@@ -174,15 +174,6 @@ def test_issue_408_megatron_create_path_emits_trace_spans(monkeypatch) -> None:
     fake_actor = object()
 
     class _FakePool:
-        def ensure_gpus_available(self, *_args, **_kwargs) -> bool:
-            return True
-
-        def reserve_gpus(self, *_args, **_kwargs) -> bool:
-            return True
-
-        def release_pending_gpus(self, *_args, **_kwargs) -> None:
-            return None
-
         def register(self, **kwargs) -> None:
             created.append(dict(kwargs))
 
@@ -203,10 +194,10 @@ def test_issue_408_megatron_create_path_emits_trace_spans(monkeypatch) -> None:
             created.append({"options": dict(kwargs)})
             return _Options(kwargs)
 
-    monkeypatch.setattr(model_actor_registry_mod, "get_model_actor_registry", lambda: _FakePool())
+    monkeypatch.setattr(model_actor_supervisor_mod, "get_model_actor_supervisor", lambda: _FakePool())
     monkeypatch.setattr(config_mod, "actor_runtime_env_vars", lambda **_kwargs: {})
     monkeypatch.setattr(config_mod, "otel_env_vars", lambda: {})
-    monkeypatch.setattr(model_actor_registry_mod, "actor_observability_metadata", lambda _actor: {})
+    monkeypatch.setattr(model_actor_supervisor_mod, "actor_observability_metadata", lambda _actor: {})
     monkeypatch.setattr(model_registry, "is_persistent_model", lambda _base_model: False)
     monkeypatch.setattr(md, "MegatronWorkerGroup", _FakeMegatronWorkerGroup)
     monkeypatch.setattr(md.ray, "is_initialized", lambda: True)
@@ -250,8 +241,6 @@ def test_issue_408_megatron_create_path_emits_trace_spans(monkeypatch) -> None:
     assert "training.create_model.megatron.orphan_pg_probe" in span_by_name
     assert "training.create_model.megatron.orphan_pg_race_guard" in span_by_name
     assert "training.create_model.megatron.orphan_pg_remove" in span_by_name
-    assert "training.create_model.megatron.ensure_gpus_available" in span_by_name
-    assert "training.create_model.megatron.reserve_gpus" in span_by_name
     assert "training.create_model.megatron.actor_create" in span_by_name
     assert "training.create_model.megatron.register_new_actor" in span_by_name
     assert span_by_name["training.create_model.megatron.actor_lookup"]["traceparent"] == (
@@ -259,13 +248,12 @@ def test_issue_408_megatron_create_path_emits_trace_spans(monkeypatch) -> None:
     )
     assert span_by_name["training.create_model.megatron.actor_lookup"]["request_id"] == "req-408-create"
     assert span_by_name["training.create_model.megatron.actor_create"]["attributes"]["base_model"] == "/tmp/qwen"
-    assert span_by_name["training.create_model.megatron.reserve_gpus"]["attributes"]["world_size"] == 1
 
 
 def test_issue_572_megatron_existing_actor_rank_mismatch_recreates(monkeypatch) -> None:
     from tinker_server.backend import megatron_distributed as md
     from tinker_server.backend import model_registry as model_registry
-    from tinker_server.backend import model_actor_registry as model_actor_registry_mod
+    from tinker_server.backend import model_actor_supervisor as model_actor_supervisor_mod
     from tinker_server import config as config_mod
 
     fake_new_actor = object()
@@ -282,15 +270,6 @@ def test_issue_572_megatron_existing_actor_rank_mismatch_recreates(monkeypatch) 
     existing_actor = _ActorHandle()
 
     class _FakePool:
-        def ensure_gpus_available(self, *_args, **_kwargs) -> bool:
-            return True
-
-        def reserve_gpus(self, *_args, **_kwargs) -> bool:
-            return True
-
-        def release_pending_gpus(self, *_args, **_kwargs) -> None:
-            return None
-
         def register(self, **kwargs) -> None:
             created.append(dict(kwargs))
 
@@ -323,10 +302,10 @@ def test_issue_572_megatron_existing_actor_rank_mismatch_recreates(monkeypatch) 
         assert actor is existing_actor
         killed.append(dict(kwargs))
 
-    monkeypatch.setattr(model_actor_registry_mod, "get_model_actor_registry", lambda: _FakePool())
+    monkeypatch.setattr(model_actor_supervisor_mod, "get_model_actor_supervisor", lambda: _FakePool())
     monkeypatch.setattr(config_mod, "actor_runtime_env_vars", lambda **_kwargs: {})
     monkeypatch.setattr(config_mod, "otel_env_vars", lambda: {})
-    monkeypatch.setattr(model_actor_registry_mod, "actor_observability_metadata", lambda _actor: {})
+    monkeypatch.setattr(model_actor_supervisor_mod, "actor_observability_metadata", lambda _actor: {})
     monkeypatch.setattr(model_registry, "is_persistent_model", lambda _base_model: False)
     monkeypatch.setattr(md, "MegatronWorkerGroup", _FakeMegatronWorkerGroup)
     monkeypatch.setattr(md.ray, "is_initialized", lambda: True)

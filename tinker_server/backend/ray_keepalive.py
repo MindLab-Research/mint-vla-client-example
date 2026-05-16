@@ -9,12 +9,12 @@ import ray
 
 from ..config import config as server_config
 from .async_ray_control import _ray_ref_to_future, _silence_late_result
-from .model_actor_registry import get_model_actor_registry
+from .model_actor_supervisor import get_model_actor_supervisor
 
 logger = logging.getLogger(__name__)
 
 
-async def ray_get_with_model_actor_registry_keepalive(
+async def ray_get_with_model_actor_supervisor_keepalive(
     ref: Any,
     *,
     actor_name: str,
@@ -22,9 +22,9 @@ async def ray_get_with_model_actor_registry_keepalive(
     timeout_s: float | None = None,
     request_id: str | None = None,
 ) -> Any:
-    """ray.get(ref) while periodically touching ModelActorRegistry for actor_name.
+    """ray.get(ref) while periodically touching ModelActorSupervisorInventory for actor_name.
 
-    vLLM inference requests can run longer than ModelActorRegistry's session idle
+    vLLM inference requests can run longer than ModelActorSupervisorInventory's session idle
     timeout; without periodic touches, a busy vLLM actor can be considered idle
     and evicted mid-request.
 
@@ -35,12 +35,12 @@ async def ray_get_with_model_actor_registry_keepalive(
     if interval_s <= 0:
         interval_s = 30.0
 
-    # Keepalive must be more frequent than ModelActorRegistry's idle cutoff, otherwise
+    # Keepalive must be more frequent than ModelActorSupervisorInventory's idle cutoff, otherwise
     # a busy actor can still appear idle and be evicted mid-request.
-    idle_timeout_s = float(getattr(server_config, "model_actor_registry_session_idle_timeout_s", 300) or 300)
+    idle_timeout_s = float(getattr(server_config, "model_actor_supervisor_inventory_session_idle_timeout_s", 300) or 300)
     interval_s = min(interval_s, max(0.5, idle_timeout_s / 4.0))
 
-    pool = get_model_actor_registry()
+    pool = get_model_actor_supervisor()
     start = time.time()
     tag = f"req={request_id} " if request_id else ""
 

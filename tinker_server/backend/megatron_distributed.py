@@ -10078,10 +10078,10 @@ def get_or_create_megatron_worker_group(
     Returns:
         Ray actor handle to MegatronWorkerGroup.
     """
-    from tinker_server.backend.model_actor_registry import (
+    from tinker_server.backend.model_actor_supervisor import (
         ActorType,
         actor_observability_metadata,
-        get_model_actor_registry,
+        get_model_actor_supervisor,
     )
     from .model_registry import is_persistent_model
 
@@ -10160,7 +10160,7 @@ def get_or_create_megatron_worker_group(
             ignore_reinit_error=True,
         )
 
-    model_actor_registry = get_model_actor_registry()
+    model_actor_supervisor_inventory = get_model_actor_supervisor()
     actor_name = _make_megatron_actor_name(base_model)
 
     create_lock = _get_megatron_create_lock(actor_name)
@@ -10212,7 +10212,7 @@ def get_or_create_megatron_worker_group(
                 },
             ):
                 # Register with model actor registry (reconnection case)
-                model_actor_registry.register(
+                model_actor_supervisor_inventory.register(
                     actor_name=actor_name,
                     actor_type=ActorType.MEGATRON,
                     num_gpus=num_gpus,
@@ -10223,7 +10223,7 @@ def get_or_create_megatron_worker_group(
                     metadata={**dict(actor_observability_metadata(actor) or {}), **rank_metadata},
                 )
                 # Existing actor is already ready
-                model_actor_registry.mark_ready(actor_name)
+                model_actor_supervisor_inventory.mark_ready(actor_name)
             # NOTE: Do NOT reinit weights here for existing actors.
             # Session swapping + reinit happens inside MegatronWorkerGroup._ensure_session_loaded()
             # to avoid clobbering active sessions during create_model.
@@ -10233,8 +10233,8 @@ def get_or_create_megatron_worker_group(
             logger.info(f"Creating new detached Megatron actor: {actor_name} for {base_model}")
 
         # Heal a common invariant violation: a detached Megatron placement group can outlive the
-        # named actor (e.g., crash during initialization). The orphan PG reserves GPUs, which can
-        # make ensure_gpus_available() block forever even though nothing is actually running.
+        # named actor (e.g., crash during initialization). The orphan PG reserves GPUs and can
+        # block node-pinned placement even though nothing is actually running.
         pg_name = _make_megatron_pg_name(base_model)
         try:
             with start_as_current_span_from_traceparent(
@@ -10337,50 +10337,14 @@ def get_or_create_megatron_worker_group(
                 ignore_placement_group_names={pg_name},
                 ignore_placement_group_namespace=PERSISTENT_NAMESPACE,
             )
-        else:
-            # Check available GPUs and evict LRU actors if necessary.
-            # For large, full-cluster Megatron jobs, allow preempting idle protected actors
-            # (e.g., inference "always-on" actors) to avoid deadlocking on a fixed-size cluster.
-            allow_evict_protected = os.environ.get("MINT_MEGATRON_EVICT_PROTECTED", "0") == "1"
-            with start_as_current_span_from_traceparent(
-                "training.create_model.megatron.ensure_gpus_available",
-                traceparent=traceparent,
-                component="backend.megatron_distributed",
-                op="training.create_model.megatron.ensure_gpus_available",
-                request_id=request_id,
-                attributes={
-                    "actor_name": str(actor_name),
-                    "base_model": str(base_model),
-                    "world_size": int(num_gpus),
-                    "allow_evict_protected": bool(allow_evict_protected),
-                },
-            ):
-                model_actor_registry.ensure_gpus_available(num_gpus, allow_evict_protected=allow_evict_protected)
 
-        # Reserve GPUs to prevent race conditions with concurrent requests
-        # This must be done AFTER ensure_gpus_available and BEFORE actor creation
-        with start_as_current_span_from_traceparent(
-            "training.create_model.megatron.reserve_gpus",
-            traceparent=traceparent,
-            component="backend.megatron_distributed",
-            op="training.create_model.megatron.reserve_gpus",
-            request_id=request_id,
-            attributes={
-                "actor_name": str(actor_name),
-                "base_model": str(base_model),
-                "world_size": int(num_gpus),
-            },
-        ):
-            model_actor_registry.reserve_gpus(num_gpus)
+        from ..config import actor_runtime_env_vars, apply_detached_actor_resources, otel_env_vars
 
-        try:
-            from ..config import actor_runtime_env_vars, apply_detached_actor_resources, otel_env_vars
-
-            # Runtime env for PFS code access
-            runtime_env = {
-                "env_vars": actor_runtime_env_vars(
-                    pythonpath=PFS_PYTHONPATH,
-                    extra={
+        # Runtime env for PFS code access
+        runtime_env = {
+            "env_vars": actor_runtime_env_vars(
+                pythonpath=PFS_PYTHONPATH,
+                extra={
                     "USE_TORCH": "1",
                     "USE_TF": "0",
                     "USE_FLAX": "0",
@@ -10390,147 +10354,144 @@ def get_or_create_megatron_worker_group(
                     "PYTHONDONTWRITEBYTECODE": "1",
                     "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",  # Reduce memory fragmentation
                     **otel_env_vars(),
-                    },
-                )
-            }
-
-            # Forward MoE LoRA export knobs into the detached Megatron actor so the
-            # on-GPU export path can be switched without code deploys.
-            for k in (
-                "MINT_MOE_LORA_SPARSE_EXPERT_EXPORT",
-                "MINT_MOE_LORA_SHARED_EXPERT_EXPORT",
-            ):
-                v = os.environ.get(k)
-                if v is not None:
-                    runtime_env["env_vars"][k] = v
-            for k in (
-                "CUDA_LAUNCH_BLOCKING",
-                "TORCH_DISTRIBUTED_DEBUG",
-                "NCCL_DEBUG",
-                "NCCL_DEBUG_SUBSYS",
-            ):
-                v = os.environ.get(k)
-                if v is not None:
-                    runtime_env["env_vars"][k] = v
-            # Forward sticky/diagnostic knobs into the detached Megatron actor
-            # so group-level watchdog and sticky behavior match server settings.
-            for k in (
-                "MINT_MEGATRON_STICKY_TRAIN_MODE",
-                "MINT_MEGATRON_STICKY_IDLE_TIMEOUT_S",
-                "MINT_MEGATRON_STICKY_CLOSE_ON_OPTIM",
-                "MINT_MEGATRON_STICKY_TIMING_DIAG",
-                "MINT_MEGATRON_STACK_DUMP_TIMEOUT_S",
-                "MINT_MEGATRON_STACK_DUMP_LIMIT",
-                "MINT_MBRIDGE_EXPORT_GLOO_TIMEOUT_S",
-                "MINT_MBRIDGE_EXPORT_GATHER_DEBUG",
-            ):
-                v = os.environ.get(k)
-                if v is not None:
-                    runtime_env["env_vars"][k] = v
-            explicit_node_ips_csv = os.environ.get("MINT_MEGATRON_NODE_IPS_CSV", "").strip()
-            model_placement_json = os.environ.get("MINT_MODEL_PLACEMENT_JSON")
-            megatron_model_placement_json = os.environ.get("MINT_MEGATRON_MODEL_PLACEMENT_JSON")
-            if explicit_node_ips_csv:
-                runtime_env["env_vars"]["MINT_MEGATRON_NODE_IPS_CSV"] = explicit_node_ips_csv
-            elif not megatron_model_placement_json:
-                volc_rq = os.environ.get("MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID", "").strip()
-                if volc_rq:
-                    from .volc_placement import list_node_ips_for_resource_queue
-
-                    node_ips = list_node_ips_for_resource_queue(resource_queue_id=volc_rq)
-                    if not node_ips:
-                        raise RuntimeError(
-                            f"no Ray GPU nodes found for MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID={volc_rq}"
-                        )
-                    runtime_env["env_vars"]["MINT_MEGATRON_NODE_IPS_CSV"] = ",".join(node_ips)
-
-            timing = os.environ.get("MINT_TIMING_DIAG")
-            if timing is not None:
-                runtime_env["env_vars"]["MINT_TIMING_DIAG"] = timing
-            if model_placement_json:
-                runtime_env["env_vars"]["MINT_MODEL_PLACEMENT_JSON"] = model_placement_json
-            if megatron_model_placement_json:
-                runtime_env["env_vars"]["MINT_MEGATRON_MODEL_PLACEMENT_JSON"] = megatron_model_placement_json
-
-            # Create detached Ray actor with per-model name
-            with start_as_current_span_from_traceparent(
-                "training.create_model.megatron.actor_create",
-                traceparent=traceparent,
-                component="backend.megatron_distributed",
-                op="training.create_model.megatron.actor_create",
-                request_id=request_id,
-                attributes={
-                    "actor_name": str(actor_name),
-                    "base_model": str(base_model),
-                    "world_size": int(num_gpus),
-                    "session_id": str(session_id) if session_id is not None else None,
-                    "is_persistent": bool(is_persistent),
                 },
-            ) as create_span:
-                try:
-                    actor_options = {
-                        "name": actor_name,
-                        "namespace": PERSISTENT_NAMESPACE,
-                        "lifetime": "detached",
-                        "runtime_env": runtime_env,
-                    }
-                    apply_detached_actor_resources(actor_options, ray)
-                    actor = MegatronWorkerGroup.options(**actor_options).remote(
-                        base_model=base_model,
-                        lora_rank=lora_rank,
-                        learning_rate=learning_rate,
-                        distributed_config=config,
-                        observability_base_model=observability_model,
-                        traceparent=traceparent,
-                        request_id=request_id,
+            )
+        }
+
+        # Forward MoE LoRA export knobs into the detached Megatron actor so the
+        # on-GPU export path can be switched without code deploys.
+        for k in (
+            "MINT_MOE_LORA_SPARSE_EXPERT_EXPORT",
+            "MINT_MOE_LORA_SHARED_EXPERT_EXPORT",
+        ):
+            v = os.environ.get(k)
+            if v is not None:
+                runtime_env["env_vars"][k] = v
+        for k in (
+            "CUDA_LAUNCH_BLOCKING",
+            "TORCH_DISTRIBUTED_DEBUG",
+            "NCCL_DEBUG",
+            "NCCL_DEBUG_SUBSYS",
+        ):
+            v = os.environ.get(k)
+            if v is not None:
+                runtime_env["env_vars"][k] = v
+        # Forward sticky/diagnostic knobs into the detached Megatron actor
+        # so group-level watchdog and sticky behavior match server settings.
+        for k in (
+            "MINT_MEGATRON_STICKY_TRAIN_MODE",
+            "MINT_MEGATRON_STICKY_IDLE_TIMEOUT_S",
+            "MINT_MEGATRON_STICKY_CLOSE_ON_OPTIM",
+            "MINT_MEGATRON_STICKY_TIMING_DIAG",
+            "MINT_MEGATRON_STACK_DUMP_TIMEOUT_S",
+            "MINT_MEGATRON_STACK_DUMP_LIMIT",
+            "MINT_MBRIDGE_EXPORT_GLOO_TIMEOUT_S",
+            "MINT_MBRIDGE_EXPORT_GATHER_DEBUG",
+        ):
+            v = os.environ.get(k)
+            if v is not None:
+                runtime_env["env_vars"][k] = v
+        explicit_node_ips_csv = os.environ.get("MINT_MEGATRON_NODE_IPS_CSV", "").strip()
+        model_placement_json = os.environ.get("MINT_MODEL_PLACEMENT_JSON")
+        megatron_model_placement_json = os.environ.get("MINT_MEGATRON_MODEL_PLACEMENT_JSON")
+        if explicit_node_ips_csv:
+            runtime_env["env_vars"]["MINT_MEGATRON_NODE_IPS_CSV"] = explicit_node_ips_csv
+        elif not megatron_model_placement_json:
+            volc_rq = os.environ.get("MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID", "").strip()
+            if volc_rq:
+                from .volc_placement import list_node_ips_for_resource_queue
+
+                node_ips = list_node_ips_for_resource_queue(resource_queue_id=volc_rq)
+                if not node_ips:
+                    raise RuntimeError(
+                        f"no Ray GPU nodes found for MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID={volc_rq}"
                     )
-                    if create_span is not None:
-                        create_span.set_attribute("create_raced_existing_actor", False)
-                except Exception as e:
-                    msg = str(e)
-                    if actor_name in msg and "already exists" in msg:
-                        logger.warning(
-                            f"Megatron actor create raced (already exists): {actor_name}; reusing existing actor"
-                        )
-                        actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
-                        _verify_actor_lora_rank_or_recreate(actor)
-                        if create_span is not None:
-                            create_span.set_attribute("create_raced_existing_actor", True)
-                    else:
-                        raise
+                runtime_env["env_vars"]["MINT_MEGATRON_NODE_IPS_CSV"] = ",".join(node_ips)
 
-            with start_as_current_span_from_traceparent(
-                "training.create_model.megatron.register_new_actor",
-                traceparent=traceparent,
-                component="backend.megatron_distributed",
-                op="training.create_model.megatron.register_new_actor",
-                request_id=request_id,
-                attributes={
-                    "actor_name": str(actor_name),
-                    "base_model": str(base_model),
-                    "world_size": int(num_gpus),
-                    "session_id": str(session_id) if session_id is not None else None,
-                    "is_persistent": bool(is_persistent),
-                },
-            ):
-                # Register immediately (creating=True) to account for GPU usage and prevent eviction.
-                # Actor readiness is awaited in VerlTrainingEngine.create_training_session, which also
-                # marks the entry ready (creating=False) after __ray_ready__ completes.
-                model_actor_registry.register(
-                    actor_name=actor_name,
-                    actor_type=ActorType.MEGATRON,
-                    num_gpus=num_gpus,
-                    actor_handle=actor,
-                    namespace=PERSISTENT_NAMESPACE,
-                    base_model=observability_model,
-                    session_id=session_id,
-                    protected=is_persistent,
-                    metadata={**dict(actor_observability_metadata(actor) or {}), **rank_metadata},
+        timing = os.environ.get("MINT_TIMING_DIAG")
+        if timing is not None:
+            runtime_env["env_vars"]["MINT_TIMING_DIAG"] = timing
+        if model_placement_json:
+            runtime_env["env_vars"]["MINT_MODEL_PLACEMENT_JSON"] = model_placement_json
+        if megatron_model_placement_json:
+            runtime_env["env_vars"]["MINT_MEGATRON_MODEL_PLACEMENT_JSON"] = megatron_model_placement_json
+
+        # Create detached Ray actor with per-model name
+        with start_as_current_span_from_traceparent(
+            "training.create_model.megatron.actor_create",
+            traceparent=traceparent,
+            component="backend.megatron_distributed",
+            op="training.create_model.megatron.actor_create",
+            request_id=request_id,
+            attributes={
+                "actor_name": str(actor_name),
+                "base_model": str(base_model),
+                "world_size": int(num_gpus),
+                "session_id": str(session_id) if session_id is not None else None,
+                "is_persistent": bool(is_persistent),
+            },
+        ) as create_span:
+            try:
+                actor_options = {
+                    "name": actor_name,
+                    "namespace": PERSISTENT_NAMESPACE,
+                    "lifetime": "detached",
+                    "runtime_env": runtime_env,
+                }
+                apply_detached_actor_resources(actor_options, ray)
+                actor = MegatronWorkerGroup.options(**actor_options).remote(
+                    base_model=base_model,
+                    lora_rank=lora_rank,
+                    learning_rate=learning_rate,
+                    distributed_config=config,
+                    observability_base_model=observability_model,
+                    traceparent=traceparent,
+                    request_id=request_id,
                 )
-            return actor
-        finally:
-            # Release pending GPU reservation (GPUs now tracked by registered actor or freed on failure)
-            model_actor_registry.release_pending_gpus(num_gpus)
+                if create_span is not None:
+                    create_span.set_attribute("create_raced_existing_actor", False)
+            except Exception as e:
+                msg = str(e)
+                if actor_name in msg and "already exists" in msg:
+                    logger.warning(
+                        f"Megatron actor create raced (already exists): {actor_name}; reusing existing actor"
+                    )
+                    actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
+                    _verify_actor_lora_rank_or_recreate(actor)
+                    if create_span is not None:
+                        create_span.set_attribute("create_raced_existing_actor", True)
+                else:
+                    raise
+
+        with start_as_current_span_from_traceparent(
+            "training.create_model.megatron.register_new_actor",
+            traceparent=traceparent,
+            component="backend.megatron_distributed",
+            op="training.create_model.megatron.register_new_actor",
+            request_id=request_id,
+            attributes={
+                "actor_name": str(actor_name),
+                "base_model": str(base_model),
+                "world_size": int(num_gpus),
+                "session_id": str(session_id) if session_id is not None else None,
+                "is_persistent": bool(is_persistent),
+            },
+        ):
+            # Register immediately (creating=True) to account for GPU usage and prevent eviction.
+            # Actor readiness is awaited in VerlTrainingEngine.create_training_session, which also
+            # marks the entry ready (creating=False) after __ray_ready__ completes.
+            model_actor_supervisor_inventory.register(
+                actor_name=actor_name,
+                actor_type=ActorType.MEGATRON,
+                num_gpus=num_gpus,
+                actor_handle=actor,
+                namespace=PERSISTENT_NAMESPACE,
+                base_model=observability_model,
+                session_id=session_id,
+                protected=is_persistent,
+                metadata={**dict(actor_observability_metadata(actor) or {}), **rank_metadata},
+            )
+        return actor
 
 
 async def async_get_or_create_megatron_worker_group(
@@ -10588,7 +10549,7 @@ def kill_megatron_actor(base_model: str | None = None) -> bool:
     Returns:
         True if any actor was killed, False if none found.
     """
-    from tinker_server.backend.model_actor_registry import get_model_actor_registry, ActorType
+    from tinker_server.backend.model_actor_supervisor import get_model_actor_supervisor, ActorType
 
     if not ray.is_initialized():
         init_ray(
@@ -10596,7 +10557,7 @@ def kill_megatron_actor(base_model: str | None = None) -> bool:
             ignore_reinit_error=True,
         )
 
-    model_actor_registry = get_model_actor_registry()
+    model_actor_supervisor_inventory = get_model_actor_supervisor()
     killed_any = False
 
     def _remove_detached_pg(actor_name: str) -> None:
@@ -10633,21 +10594,21 @@ def kill_megatron_actor(base_model: str | None = None) -> bool:
                 base_model=base_model,
             )
             logger.info(f"Killed Megatron actor: {actor_name}")
-            model_actor_registry.unregister(actor_name)
+            model_actor_supervisor_inventory.unregister(actor_name)
             _remove_detached_pg(actor_name)
             killed_any = True
         except ValueError:
             logger.info(f"No Megatron actor to kill for {base_model}")
-            model_actor_registry.unregister(actor_name)
+            model_actor_supervisor_inventory.unregister(actor_name)
             _remove_detached_pg(actor_name)
     else:
         # Kill ALL Megatron actors from model actor registry
-        for entry in model_actor_registry.iter_entries():
+        for entry in model_actor_supervisor_inventory.iter_entries():
             if entry.actor_type == ActorType.MEGATRON:
                 try:
                     actor = ray.get_actor(entry.actor_name, namespace=PERSISTENT_NAMESPACE)
                 except ValueError:
-                    model_actor_registry.unregister(entry.actor_name)
+                    model_actor_supervisor_inventory.unregister(entry.actor_name)
                     _remove_detached_pg(entry.actor_name)
                     continue
 
@@ -10666,7 +10627,7 @@ def kill_megatron_actor(base_model: str | None = None) -> bool:
                     base_model=entry.base_model,
                 )
                 logger.info(f"Killed Megatron actor: {entry.actor_name}")
-                model_actor_registry.unregister(entry.actor_name)
+                model_actor_supervisor_inventory.unregister(entry.actor_name)
                 _remove_detached_pg(entry.actor_name)
                 killed_any = True
 
@@ -10701,9 +10662,9 @@ def is_megatron_actor_running(base_model: str | None = None) -> bool:
             return False
     else:
         # Check for any Megatron actor from model actor registry
-        from tinker_server.backend.model_actor_registry import get_model_actor_registry, ActorType
-        model_actor_registry = get_model_actor_registry()
-        for entry in model_actor_registry.iter_entries():
+        from tinker_server.backend.model_actor_supervisor import get_model_actor_supervisor, ActorType
+        model_actor_supervisor_inventory = get_model_actor_supervisor()
+        for entry in model_actor_supervisor_inventory.iter_entries():
             if entry.actor_type == ActorType.MEGATRON:
                 try:
                     ray.get(entry.actor_handle.get_diagnostics.remote(), timeout=5)

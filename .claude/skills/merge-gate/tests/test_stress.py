@@ -9,13 +9,12 @@ Tests system behavior under concurrent load with:
 This test validates:
 1. Session isolation (no cross-contamination)
 2. Request serialization (no deadlocks)
-3. LRU eviction (when resources insufficient for all models)
+3. Explicit skip for removed local LRU eviction manifests
 
 Pass criteria: All clients complete without deadlock or error.
 """
 
 import concurrent.futures
-import os
 import threading
 import time
 
@@ -28,17 +27,8 @@ from .conftest import (
     create_session,
     forward_backward,
     optim_step,
-    save_weights,
-    list_actors,
-    get_admission_stats,
 )
-from .framework import (
-    LRUEvictionData,
-    PlotGenerator,
-    TestReport,
-    create_test_report,
-    print_report_summary,
-)
+from .framework import TestReport
 
 # Pre-load tokenizers to avoid concurrent import race conditions
 _dense_tokenizer = None
@@ -404,97 +394,8 @@ class TestStress:
         )
 
     def test_mixed_model_lru_eviction(self):
-        """Eviction sentry: require an observed eviction event under 8 GPUs.
-
-        This test snapshots ModelActorRegistry actor inventory before/after phases and
-        fails unless at least one eviction event is observed (actor disappearance).
-
-        Requires server started with:
-        - MINT_MIN_ACTOR_AGE=0
-        - small MINT_SESSION_IDLE_TIMEOUT (so a prior actor becomes idle during the test)
-        """
-        start_time = time.time()
-        idle_wait_s = float(os.environ.get("TINKER_EVICTION_IDLE_WAIT_S", "6"))
-
-        try:
-            stats = get_admission_stats()
-            gpu_total = float(
-                (((stats.get("ray_cluster") or {}).get("resources") or {}).get("gpu_total") or 0.0)
-            )
-        except Exception:
-            gpu_total = 0.0
-        if gpu_total > 8.0:
-            pytest.skip(f"eviction sentry requires constrained cluster (gpu_total={gpu_total})")
-
-        data = LRUEvictionData()
-
-        def snapshot(phase: str, action: str = "") -> set[str]:
-            resp = list_actors()
-            actors = [a.get("actor_name") for a in resp.get("actors", []) if isinstance(a, dict)]
-            actors = [a for a in actors if isinstance(a, str) and a]
-            gpu_usage = int(resp.get("total_gpus_used", 0) or 0)
-            data.add_snapshot(phase=phase, actors=actors, gpu_usage=gpu_usage, action=action)
-            print(f"snapshot phase={phase} gpus={gpu_usage} actors={len(actors)} action={action!r}")
-            return set(actors)
-
-        prev = snapshot("start")
-
-        # Phase 1: create a Dense training actor, then let it become idle.
-        r1 = run_dense_sft_client(1, rank=32, num_iterations=1)
-        assert r1.get("status") == "completed", f"dense phase failed: {r1}"
-        dense_after = snapshot("dense_created", action="dense_sft_client")
-
-        time.sleep(idle_wait_s)
-        dense_idle = snapshot("dense_idle_wait", action=f"sleep {idle_wait_s}s")
-
-        # Phase 2: create MoE trainer, then create MoE vLLM engine (save_weights) to push total GPU demand > 8.
-        r2 = run_moe_sft_client(2, rank=32, num_iterations=1)
-        assert r2.get("status") == "completed", f"moe trainer phase failed: {r2}"
-        moe_trainer = snapshot("moe_trainer", action="moe_sft_client")
-
-        moe_model_id = r2.get("model_id")
-        assert isinstance(moe_model_id, str) and moe_model_id, f"missing model_id from moe client: {r2}"
-        save_res = save_weights(moe_model_id, name="merge_gate_eviction_moe")
-        assert "error" not in save_res, f"save_weights failed: {save_res.get('error')}"
-        moe_vllm = snapshot("moe_vllm_created", action="save_weights(moe)")
-
-        # Phase 3: touch Dense again (may evict MoE actors depending on LRU/idle).
-        r3 = run_dense_sft_client(3, rank=32, num_iterations=1)
-        assert r3.get("status") == "completed", f"dense reentry phase failed: {r3}"
-        dense_again = snapshot("dense_again", action="dense_sft_client")
-
-        # Infer eviction events from consecutive snapshots.
-        for i in range(1, len(data.snapshots)):
-            a0 = set(data.snapshots[i - 1].actors)
-            a1 = set(data.snapshots[i].actors)
-            removed = sorted(a0 - a1)
-            added = sorted(a1 - a0)
-            if removed:
-                data.eviction_events.append({
-                    "from_phase": data.snapshots[i - 1].phase,
-                    "to_phase": data.snapshots[i].phase,
-                    "removed": removed,
-                    "added": added,
-                })
-
-        plot = PlotGenerator().lru_eviction_timeline(data)
-        report = create_test_report(
-            test_name="stress_lru_eviction",
-            test_type="eviction",
-            data=data,
-            start_time=start_time,
-            plots=[plot] if plot else [],
-            metadata={
-                "idle_wait_s": idle_wait_s,
-                "dense_model": DENSE_MODEL,
-                "moe_model": MOE_MODEL,
-            },
-        )
-        report_path = report.save()
-        print_report_summary(report)
-        print(f"report_json={report_path}")
-
-        assert data.eviction_events, "no eviction events observed (check MINT_MIN_ACTOR_AGE and MINT_SESSION_IDLE_TIMEOUT)"
+        """Obsolete sentry kept as an explicit skip for old merge-gate manifests."""
+        pytest.skip("local LRU eviction was removed; use scheduler/node-pin placement validation instead")
 
     def test_rapid_session_creation(self):
         """Test rapid session creation and teardown.
@@ -615,8 +516,8 @@ class TestStress:
         print(f"\n{'='*60}")
         print("INTERLEAVED SESSIONS TEST RESULTS")
         print(f"{'='*60}")
-        print(f"Session A losses: {[f'{l:.4f}' for l in losses_a]}")
-        print(f"Session B losses: {[f'{l:.4f}' for l in losses_b]}")
+        print(f"Session A losses: {[f'{loss:.4f}' for loss in losses_a]}")
+        print(f"Session B losses: {[f'{loss:.4f}' for loss in losses_b]}")
 
         # Verify A's loss continues decreasing after switch
         # losses_a[1] is before switch, losses_a[2] is after switch

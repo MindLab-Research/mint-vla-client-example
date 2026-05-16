@@ -25,7 +25,7 @@ from .openpi_ray_runtime import (
     _ray_timeout,
     ensure_openpi_ray_initialized,
 )
-from .model_actor_registry import ActorType, get_model_actor_registry
+from .model_actor_supervisor import ActorType, get_model_actor_supervisor
 from .volc_placement import (
     assert_node_ip_capacity,
     parse_model_gpu_placement,
@@ -119,7 +119,7 @@ def _single_node_actor_options(*, base_model: str, actor_name: str) -> dict[str,
 
 
 async def _pool_call(method_name: str, *args: Any, **kwargs: Any) -> Any:
-    pool = get_model_actor_registry()
+    pool = get_model_actor_supervisor()
     method = getattr(pool, method_name)
     return await asyncio.to_thread(method, *args, **kwargs)
 

@@ -8,7 +8,7 @@ def test_issue_193_megatron_load_weights_marks_recycled_worker_loaded(monkeypatc
     dead_worker = _FakeLoadWorker(ref="dead-load-ref")
     recovered_worker = _FakeLoadWorker(ref="recovered-load-ref")
     engine._workers[model_id] = dead_worker
-    engine._model_actor_registry_actor_names[model_id] = "megatron-actor"
+    engine._model_actor_supervisor_actor_names[model_id] = "megatron-actor"
 
     session = TrainingSession(
         model_id=model_id,
@@ -80,7 +80,7 @@ def test_issue_193_megatron_load_weights_recovers_when_ready_probe_actor_dies(mo
     recovered_worker = _FakeLoadWorker(ref="recovered-load-ref")
     recovered_worker.__ray_ready__ = _RecordingRemoteMethod("recovered-ready-ref")
     engine._workers[model_id] = dead_worker
-    engine._model_actor_registry_actor_names[model_id] = "megatron-actor"
+    engine._model_actor_supervisor_actor_names[model_id] = "megatron-actor"
 
     session = TrainingSession(
         model_id=model_id,
@@ -278,7 +278,7 @@ def test_issue_193_megatron_recycle_fails_loud_when_live_state_was_only_in_memor
     dead_worker = object()
     recovered_worker = object()
     engine._workers[model_id] = dead_worker
-    engine._model_actor_registry_actor_names[model_id] = "shared-megatron-actor"
+    engine._model_actor_supervisor_actor_names[model_id] = "shared-megatron-actor"
     engine._actor_loaded_sessions["shared-megatron-actor"] = model_id
     engine._actor_volatile_sessions["shared-megatron-actor"] = {model_id}
 
@@ -331,7 +331,7 @@ def test_issue_193_megatron_recycle_retries_when_no_live_state_was_lost(monkeypa
     dead_worker = object()
     recovered_worker = object()
     engine._workers[model_id] = dead_worker
-    engine._model_actor_registry_actor_names[model_id] = "shared-megatron-actor"
+    engine._model_actor_supervisor_actor_names[model_id] = "shared-megatron-actor"
     engine._actor_loaded_sessions["shared-megatron-actor"] = model_id
 
     session = TrainingSession(
@@ -397,8 +397,8 @@ def test_issue_193_megatron_switched_out_dirty_session_still_poisoned_on_actor_d
         base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         backend="megatron",
     )
-    engine._model_actor_registry_actor_names[session_a.model_id] = actor_name
-    engine._model_actor_registry_actor_names[session_b.model_id] = actor_name
+    engine._model_actor_supervisor_actor_names[session_a.model_id] = actor_name
+    engine._model_actor_supervisor_actor_names[session_b.model_id] = actor_name
 
     engine._note_successful_worker_call(session_a, op="forward_backward")
     engine._note_successful_worker_call(session_b, op="forward")
@@ -432,7 +432,7 @@ def test_issue_193_megatron_adapter_only_load_restore_stays_recoverable_until_ne
     dead_worker = object()
     recovered_worker = object()
     engine._workers[model_id] = dead_worker
-    engine._model_actor_registry_actor_names[model_id] = "shared-megatron-actor"
+    engine._model_actor_supervisor_actor_names[model_id] = "shared-megatron-actor"
 
     session = TrainingSession(
         model_id=model_id,
@@ -489,7 +489,7 @@ def test_issue_193_megatron_load_weights_with_optimizer_keeps_session_volatile(m
     model_id = "model_issue_193_megatron_load_with_optimizer"
     worker = _FakeLoadWorker(ref="megatron-load-with-optimizer-ref")
     engine._workers[model_id] = worker
-    engine._model_actor_registry_actor_names[model_id] = "shared-megatron-actor"
+    engine._model_actor_supervisor_actor_names[model_id] = "shared-megatron-actor"
 
     session = TrainingSession(
         model_id=model_id,
@@ -531,7 +531,7 @@ def test_issue_193_megatron_load_weights_keeps_session_volatile_until_mark_loade
     worker = _FakeLoadWorker(ref="megatron-load-mark-gap-ref")
     worker.mark_session_loaded = _RecordingRemoteMethod(_failed_ray_ref(ray.exceptions.ActorDiedError()))
     engine._workers[model_id] = worker
-    engine._model_actor_registry_actor_names[model_id] = "shared-megatron-actor"
+    engine._model_actor_supervisor_actor_names[model_id] = "shared-megatron-actor"
 
     session = TrainingSession(
         model_id=model_id,
@@ -573,7 +573,7 @@ def test_issue_193_megatron_train_step_marks_session_volatile(monkeypatch):
     dead_worker = object()
     recovered_worker = object()
     engine._workers[model_id] = dead_worker
-    engine._model_actor_registry_actor_names[model_id] = "shared-megatron-actor"
+    engine._model_actor_supervisor_actor_names[model_id] = "shared-megatron-actor"
 
     session = TrainingSession(
         model_id=model_id,
@@ -625,7 +625,7 @@ def test_issue_193_megatron_sampler_save_does_not_clear_volatile_train_state(mon
         base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         backend="megatron",
     )
-    engine._model_actor_registry_actor_names[model_id] = actor_name
+    engine._model_actor_supervisor_actor_names[model_id] = actor_name
 
     engine._note_successful_worker_call(session, op="forward_backward")
     engine._note_successful_worker_call(session, op="save_lora_weights_for_sampler")
@@ -644,7 +644,7 @@ def test_issue_193_megatron_save_weights_does_not_clear_volatile_train_state():
         base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         backend="megatron",
     )
-    engine._model_actor_registry_actor_names[model_id] = actor_name
+    engine._model_actor_supervisor_actor_names[model_id] = actor_name
 
     engine._note_successful_worker_call(session, op="forward_backward")
     engine._note_successful_worker_call(session, op="save_weights")
@@ -727,7 +727,7 @@ def test_issue_193_megatron_rebind_reuses_existing_actor_without_ready_probe(mon
         lambda actor_name, namespace=None: worker,
     )
     monkeypatch.setattr(
-        "tinker_server.backend.model_actor_registry.get_model_actor_registry",
+        "tinker_server.backend.model_actor_supervisor.get_model_actor_supervisor",
         lambda: SimpleNamespace(
             register=lambda *args, **kwargs: register_calls.append((args, kwargs)),
             mark_ready=lambda actor_name: mark_ready_calls.append(actor_name),
@@ -790,7 +790,7 @@ def test_issue_193_megatron_rebind_created_actor_ready_death_maps_to_missing_wor
         lambda **_kwargs: asyncio.sleep(0, result=worker),
     )
     monkeypatch.setattr(
-        "tinker_server.backend.model_actor_registry.get_model_actor_registry",
+        "tinker_server.backend.model_actor_supervisor.get_model_actor_supervisor",
         lambda: SimpleNamespace(
             register=lambda *args, **kwargs: None,
             mark_ready=lambda *_args, **_kwargs: None,
@@ -825,7 +825,7 @@ def test_issue_193_megatron_missing_worker_with_live_state_still_fails_closed(mo
         base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         backend="megatron",
     )
-    engine._model_actor_registry_actor_names[model_id] = actor_name
+    engine._model_actor_supervisor_actor_names[model_id] = actor_name
     engine._actor_volatile_sessions[actor_name] = {model_id}
 
     async def fake_rebind(*_args, **_kwargs):

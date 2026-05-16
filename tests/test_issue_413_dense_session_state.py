@@ -9,8 +9,8 @@ import pytest
 pytest.importorskip("ray")
 
 from tinker_server.backend import dense_session_state as dense_state_module
-import tinker_server.backend.model_actor_registry as model_actor_registry_module
-from tinker_server.backend.model_actor_registry import ActorType, ModelActorRegistry, get_model_actor_registry
+import tinker_server.backend.model_actor_inventory as model_actor_inventory_module
+from tinker_server.backend.model_actor_supervisor import ActorType, get_model_actor_supervisor
 from tinker_server.backend.training_session_manager import TrainingSession
 from tinker_server.backend.verl_training import SessionStateManager, TrainingWorker, VerlTrainingEngine
 from tinker_server.config import config as server_config
@@ -131,9 +131,9 @@ def test_issue_413_shutdown_session_reclaims_dense_state_for_shared_actor(
     runtime_env_root.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(config_module, "PFS_RUNTIME_ENV_ROOT", str(runtime_env_root))
     monkeypatch.setattr(config_module, "PFS_PYTHONPATH", str((tmp_path / "runtime_py").resolve()))
-    monkeypatch.setattr(model_actor_registry_module.ray, "is_initialized", lambda: False)
-    monkeypatch.setattr(ModelActorRegistry, "_instance", None)
-    pool = get_model_actor_registry()
+    monkeypatch.setattr(model_actor_inventory_module.ray, "is_initialized", lambda: False)
+    pool = get_model_actor_supervisor()
+    pool.clear(kill_actors=False)
     actor_name = f"peft_trainer_test_{uuid.uuid4().hex}_maxr64"
     model_id = f"model_{uuid.uuid4().hex}"
     other_model_id = f"model_{uuid.uuid4().hex}"
@@ -151,8 +151,8 @@ def test_issue_413_shutdown_session_reclaims_dense_state_for_shared_actor(
     session_dir = _write_dense_session_dir(dense_root, model_id)
     worker = _DeletingWorker(lambda session_id: dense_state_module.delete_dense_session_state(session_id))
     engine = VerlTrainingEngine()
-    engine._model_actor_registry_actor_names[model_id] = actor_name
-    engine._model_actor_registry_actor_names[other_model_id] = actor_name
+    engine._model_actor_supervisor_actor_names[model_id] = actor_name
+    engine._model_actor_supervisor_actor_names[other_model_id] = actor_name
     engine._workers[model_id] = worker
     engine._workers[other_model_id] = worker
 
@@ -172,8 +172,8 @@ def test_issue_413_shutdown_session_reclaims_dense_state_for_shared_actor(
 
     assert worker.delete_calls == [model_id]
     assert not session_dir.exists()
-    assert model_id not in engine._model_actor_registry_actor_names
-    assert other_model_id in engine._model_actor_registry_actor_names
+    assert model_id not in engine._model_actor_supervisor_actor_names
+    assert other_model_id in engine._model_actor_supervisor_actor_names
     assert entry.current_session == other_model_id
 
     pool.unregister(actor_name)

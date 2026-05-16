@@ -142,13 +142,13 @@ def _require_rss_payload(stats: dict) -> dict:
             f"admission_stats missing actors dict: {actors!r}. Hint: restart server to load new code."
         )
 
-    rp = actors.get("model_actor_registry")
+    rp = actors.get("model_actor_supervisor_inventory")
     if not isinstance(rp, list):
-        raise AssertionError(f"admission_stats actors.model_actor_registry missing list: {rp!r}")
+        raise AssertionError(f"admission_stats actors.model_actor_supervisor missing list: {rp!r}")
 
     missing = [a for a in rp if not (isinstance(a, dict) and isinstance(a.get('rss_bytes'), int))]
     if missing:
-        raise AssertionError(f"model_actor_registry rss_bytes missing for some actors: {missing[:3]!r}")
+        raise AssertionError(f"model_actor_supervisor_inventory rss_bytes missing for some actors: {missing[:3]!r}")
 
     v = actors.get("task_state_futures")
     if not isinstance(v, dict):
@@ -164,7 +164,7 @@ def _require_rss_payload(stats: dict) -> dict:
 
 
 def _rss_snapshot(actors_payload: dict) -> dict[str, int]:
-    rp = actors_payload["model_actor_registry"]
+    rp = actors_payload["model_actor_supervisor_inventory"]
     out: dict[str, int] = {}
     for a in rp:
         if not isinstance(a, dict):

@@ -472,7 +472,7 @@ curl -s -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/actors | j
 curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/json"   -d '{"actor_type":"all"}' http://localhost:18000/api/v1/actors/kill
 ```
 
-`{"actor_type":"all"}` kills only ModelActorRegistry-tracked GPU actors. It does not clear detached scheduler/runtime/store actors.
+`{"actor_type":"all"}` kills only ModelActorSupervisorInventory-tracked GPU actors. It does not clear detached scheduler/runtime/store actors.
 
 ---
 
@@ -514,7 +514,7 @@ If `TINKER_CHECKPOINT_INDEX_PG_DSN` or checkpoint publication code changes and o
 ### Kill Actors
 
 The current admin route is `POST /api/v1/actors/kill`.
-Use it for ModelActorRegistry-tracked GPU actor families only:
+Use it for ModelActorSupervisorInventory-tracked GPU actor families only:
 
 ```bash
 # Kill one GPU actor family (admin only when auth is enabled)

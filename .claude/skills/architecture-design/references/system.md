@@ -38,7 +38,7 @@ Implications:
 
 - `tinker_server/app.py`
   - FastAPI startup/shutdown (lifespan), auth middleware, route registration.
-  - Startup actor reconciliation: `_cleanup_stale_actors()` kills dead actors and registers alive detached actors with `ModelActorRegistry`.
+  - Startup actor reconciliation: `_cleanup_stale_actors()` kills dead actors and registers alive detached actors with `ModelActorSupervisorInventory`.
   - Warms detached control-plane actors used on request paths (`TaskStateStore`, metadata stores, scheduler actors).
 
 - `tinker_server/routes/*`
@@ -55,7 +55,7 @@ Implications:
 - `tinker_server/models/types.py`
   - Pydantic request/response models intended to match the Tinker API.
 
-- `tinker_server/backend/model_actor_registry.py`
+- `tinker_server/backend/model_actor_supervisor_inventory.py`
   - Process-local GPU actor inventory, inflight counts, metadata cache, and best-effort LRU eviction helpers.
   - Durable scheduling state does not live here; use `TaskStateStore`, `ModelWorkScheduler`, and `ModelActorSupervisor`.
 

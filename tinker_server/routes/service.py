@@ -1021,7 +1021,7 @@ async def list_actors(
         description="Refresh VLLM/Megatron observability metadata before returning actors.",
     ),
 ) -> dict:
-    """List actors in the unified ModelActorRegistry. Admin only when auth enabled.
+    """List actors in the unified ModelActorSupervisorInventory. Admin only when auth enabled.
 
     Query params:
         type: Optional filter ("vllm" | "megatron" | "dense")
@@ -1029,7 +1029,7 @@ async def list_actors(
         refresh_metadata: Refresh VLLM/Megatron observability metadata before returning actors
     """
     _require_admin(request)
-    from ..backend.model_actor_registry import ActorType, get_model_actor_registry
+    from ..backend.model_actor_supervisor import ActorType, get_model_actor_supervisor
 
     parsed_actor_type: ActorType | None = None
     if actor_type is not None:
@@ -1040,7 +1040,7 @@ async def list_actors(
         parsed_actor_type = ActorType(t)
 
     try:
-        pool = get_model_actor_registry()
+        pool = get_model_actor_supervisor()
         actors = await pool.async_list_actors(
             refresh_metadata=refresh_metadata,
             actor_type=parsed_actor_type,
@@ -1098,9 +1098,9 @@ def _collect_kill_target_entries(
     model_name: str | None,
     actor_name: str | None,
 ) -> list[object]:
-    from ..backend.model_actor_registry import get_model_actor_registry
+    from ..backend.model_actor_supervisor import get_model_actor_supervisor
 
-    pool = get_model_actor_registry()
+    pool = get_model_actor_supervisor()
     return [
         entry
         for entry in pool.iter_entries()
@@ -1203,9 +1203,9 @@ def _remove_actor_pg(actor_name: str, *, namespace: str | None = None) -> None:
 
 async def _kill_exact_vllm_actor(*, actor_name: str) -> int:
     from ..backend.multi_lora_engine import PERSISTENT_NAMESPACE
-    from ..backend.model_actor_registry import ActorType, ModelActorRegistryStaleError, get_model_actor_registry
+    from ..backend.model_actor_supervisor import ActorType, ModelActorSupervisorStaleError, get_model_actor_supervisor
 
-    pool = get_model_actor_registry()
+    pool = get_model_actor_supervisor()
     entry = pool.get(actor_name)
     if entry is not None and entry.actor_type != ActorType.VLLM:
         return 0
@@ -1228,7 +1228,7 @@ async def _kill_exact_vllm_actor(*, actor_name: str) -> int:
             base_model=entry.base_model if entry is not None else None,
             reason="vllm_kill_by_actor_name",
         )
-    except ModelActorRegistryStaleError:
+    except ModelActorSupervisorStaleError:
         raise
     pool.unregister(actor_name)
     _remove_actor_pg(actor_name)
@@ -1237,9 +1237,9 @@ async def _kill_exact_vllm_actor(*, actor_name: str) -> int:
 
 async def _kill_exact_megatron_actor(*, actor_name: str) -> int:
     from ..backend.megatron_distributed import PERSISTENT_NAMESPACE
-    from ..backend.model_actor_registry import ActorType, get_model_actor_registry
+    from ..backend.model_actor_supervisor import ActorType, get_model_actor_supervisor
 
-    pool = get_model_actor_registry()
+    pool = get_model_actor_supervisor()
     entry = pool.get(actor_name)
     if entry is not None and entry.actor_type != ActorType.MEGATRON:
         return 0
@@ -1274,9 +1274,9 @@ async def _kill_exact_megatron_actor(*, actor_name: str) -> int:
 
 
 async def _kill_exact_dense_actor(*, actor_name: str) -> int:
-    from ..backend.model_actor_registry import ActorType, get_model_actor_registry
+    from ..backend.model_actor_supervisor import ActorType, get_model_actor_supervisor
 
-    pool = get_model_actor_registry()
+    pool = get_model_actor_supervisor()
     entry = pool.get(actor_name)
     if entry is not None and entry.actor_type != ActorType.DENSE:
         return 0
@@ -1305,9 +1305,9 @@ async def _kill_exact_dense_actor(*, actor_name: str) -> int:
 
 
 async def _kill_dense_actors(base_model: str | None) -> int:
-    from ..backend.model_actor_registry import ActorType, get_model_actor_registry
+    from ..backend.model_actor_supervisor import ActorType, get_model_actor_supervisor
 
-    pool = get_model_actor_registry()
+    pool = get_model_actor_supervisor()
     targets = [
         e
         for e in pool.iter_entries()
@@ -1355,11 +1355,11 @@ async def kill_actors(request: Request, body: KillActorsRequest) -> dict:
         if t == "all":
             raise HTTPException(status_code=422, detail="actor_name cannot be combined with actor_type=all")
         if t == "vllm":
-            from ..backend.model_actor_registry import ModelActorRegistryStaleError
+            from ..backend.model_actor_supervisor import ModelActorSupervisorStaleError
 
             try:
                 killed_by_type["vllm"] = await _kill_exact_vllm_actor(actor_name=actor_name)
-            except ModelActorRegistryStaleError as e:
+            except ModelActorSupervisorStaleError as e:
                 raise HTTPException(status_code=409, detail=str(e)) from e
         elif t == "megatron":
             killed_by_type["megatron"] = await _kill_exact_megatron_actor(actor_name=actor_name)
@@ -1379,14 +1379,14 @@ async def kill_actors(request: Request, body: KillActorsRequest) -> dict:
 
     if t in ("vllm", "all"):
         from ..backend.multi_lora_engine import kill_persistent_vllm_actor
-        from ..backend.model_actor_registry import ModelActorRegistryStaleError
+        from ..backend.model_actor_supervisor import ModelActorSupervisorStaleError
 
         try:
             if t == "vllm":
                 killed_by_type["vllm"] = 1 if kill_persistent_vllm_actor(model_name) else 0
             else:
                 killed_by_type["vllm"] = 1 if kill_persistent_vllm_actor(None) else 0
-        except ModelActorRegistryStaleError as e:
+        except ModelActorSupervisorStaleError as e:
             raise HTTPException(status_code=409, detail=str(e)) from e
 
     if t in ("megatron", "all"):

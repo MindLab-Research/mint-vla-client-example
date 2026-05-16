@@ -61,10 +61,9 @@ actor/runtime dependency assembly.
 
 - `use_mbridge_lora_export` (bool) [env: `USE_MBRIDGE_LORA_EXPORT`]
 
-### `[model_actor_registry]`
+### `[model_actor_supervisor_inventory]`
 
-- `min_actor_age_s` (int) [env: `MINT_MIN_ACTOR_AGE`]
-- `session_idle_timeout_s` (int) [env: `MINT_SESSION_IDLE_TIMEOUT`]
+- `session_idle_timeout_s` (int) [env: `MINT_MODEL_ACTOR_SUPERVISOR_INVENTORY_SESSION_IDLE_TIMEOUT_S`]
 
 ### `[future]`
 

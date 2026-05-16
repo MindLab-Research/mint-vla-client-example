@@ -345,15 +345,15 @@ def _available_resources_per_node_with_pg_fallback(
             )
 
     try:
-        from .model_actor_registry import get_model_actor_registry
+        from .model_actor_supervisor import get_model_actor_supervisor
 
-        for node_id, used_gpus in get_model_actor_registry().gpus_used_by_node().items():
+        for node_id, used_gpus in get_model_actor_supervisor().gpus_used_by_node().items():
             used_gpus_by_node[node_id] = max(
                 used_gpus_by_node.get(node_id, 0.0),
                 float(used_gpus),
             )
     except Exception as e:
-        logger.debug("%s: model_actor_registry fallback failed: %s", context, e)
+        logger.debug("%s: model_actor_supervisor_inventory fallback failed: %s", context, e)
 
     # Ray Client mode cannot always access per-node availability via ray._private.state.
     # If actor-state fallback succeeds we can still trust the derived reservations. Otherwise,

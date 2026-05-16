@@ -77,7 +77,7 @@ def _request_stub(user_id: str | None = None):
     return SimpleNamespace(state=SimpleNamespace(user_data=user_data), headers={})
 
 
-class _FakeModelActorRegistry:
+class _FakeModelActorSupervisorInventory:
     def __init__(self) -> None:
         self.calls: list[tuple[str, int]] = []
 
@@ -85,10 +85,10 @@ class _FakeModelActorRegistry:
         self.calls.append((actor_name, int(delta)))
 
 
-def _install_fake_model_actor_registry(monkeypatch: pytest.MonkeyPatch, pool: _FakeModelActorRegistry) -> None:
-    module = types.ModuleType("tinker_server.backend.model_actor_registry")
-    module.get_model_actor_registry = lambda: pool
-    monkeypatch.setitem(sys.modules, "tinker_server.backend.model_actor_registry", module)
+def _install_fake_model_actor_supervisor_inventory(monkeypatch: pytest.MonkeyPatch, pool: _FakeModelActorSupervisorInventory) -> None:
+    module = types.ModuleType("tinker_server.backend.model_actor_supervisor")
+    module.get_model_actor_supervisor = lambda: pool
+    monkeypatch.setitem(sys.modules, "tinker_server.backend.model_actor_supervisor", module)
 
 
 def test_issue_364_register_multi_lora_session_persists_detached_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -328,7 +328,7 @@ async def test_issue_364_sample_once_restores_local_sampler_from_detached_store(
     manager = SessionManager()
     engine = _FakeEngine()
     manager.set_multi_model_manager(_FakeMultiModelManager(engine))
-    model_actor_registry = _FakeModelActorRegistry()
+    model_actor_supervisor_inventory = _FakeModelActorSupervisorInventory()
 
     async def _async_get_sampling_session_info(session_id: str):
         assert session_id == "sess-364-live"
@@ -356,7 +356,7 @@ async def test_issue_364_sample_once_restores_local_sampler_from_detached_store(
         "tinker_server.backend.model_registry.get_model_config",
         lambda _model_name: SimpleNamespace(max_model_len=8192),
     )
-    _install_fake_model_actor_registry(monkeypatch, model_actor_registry)
+    _install_fake_model_actor_supervisor_inventory(monkeypatch, model_actor_supervisor_inventory)
 
     sequence = await sampling_route.sample_once(
         session_id="sess-364-live",
@@ -372,7 +372,7 @@ async def test_issue_364_sample_once_restores_local_sampler_from_detached_store(
 
     assert manager.is_base_model_session("sess-364-live") is True
     assert engine.generate_calls[0]["sampling_session_id"] == "sess-364-live"
-    assert model_actor_registry.calls == [("actor-364", 1), ("actor-364", -1)]
+    assert model_actor_supervisor_inventory.calls == [("actor-364", 1), ("actor-364", -1)]
     assert sequence.tokens == [101, 102]
     snapshot = manager.get_sampling_session_snapshot("sess-364-live")
     assert snapshot is not None
@@ -449,12 +449,12 @@ def test_issue_364_restore_sampling_session_merges_last_activity_without_version
     assert snapshot.metadata_version == 3
 
 
-def test_issue_364_model_actor_registry_wrapper_preserves_metadata_without_ray(monkeypatch: pytest.MonkeyPatch) -> None:
-    import tinker_server.backend.model_actor_registry as model_actor_registry_module
-    from tinker_server.backend.model_actor_registry import ActorType, ModelActorRegistry, get_model_actor_registry
-    monkeypatch.setattr(model_actor_registry_module.ray, "is_initialized", lambda: False)
-    monkeypatch.setattr(ModelActorRegistry, "_instance", None)
-    pool = get_model_actor_registry()
+def test_issue_364_model_actor_supervisor_inventory_wrapper_preserves_metadata_without_ray(monkeypatch: pytest.MonkeyPatch) -> None:
+    import tinker_server.backend.model_actor_inventory as model_actor_inventory_module
+    from tinker_server.backend.model_actor_supervisor import ActorType, get_model_actor_supervisor
+    monkeypatch.setattr(model_actor_inventory_module.ray, "is_initialized", lambda: False)
+    pool = get_model_actor_supervisor()
+    pool.clear(kill_actors=False)
     actor_name = "actor-364-wrapper-local"
     pool.unregister(actor_name)
     pool.register(
@@ -678,7 +678,7 @@ async def test_issue_364_sampling_restore_drops_stale_local_snapshot_when_store_
 
 
 @pytest.mark.anyio
-async def test_issue_364_compute_logprobs_marks_model_actor_registry_inflight(
+async def test_issue_364_compute_logprobs_marks_model_actor_supervisor_inventory_inflight(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from tinker_server.models.types import ComputeLogprobsRequest, ModelInput
@@ -691,7 +691,7 @@ async def test_issue_364_compute_logprobs_marks_model_actor_registry_inflight(
         base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         metadata_version=3,
     )
-    model_actor_registry = _FakeModelActorRegistry()
+    model_actor_supervisor_inventory = _FakeModelActorSupervisorInventory()
     resolved: dict = {}
     failed: list[str] = []
 
@@ -710,7 +710,7 @@ async def test_issue_364_compute_logprobs_marks_model_actor_registry_inflight(
             async_fail=_async_fail,
         ),
     )
-    _install_fake_model_actor_registry(monkeypatch, model_actor_registry)
+    _install_fake_model_actor_supervisor_inventory(monkeypatch, model_actor_supervisor_inventory)
 
     request = ComputeLogprobsRequest(
         sampling_session_id="sess-364-logprobs",
@@ -725,4 +725,4 @@ async def test_issue_364_compute_logprobs_marks_model_actor_registry_inflight(
 
     assert failed == []
     assert resolved["request_id"] == "req-364-logprobs"
-    assert model_actor_registry.calls == [("actor-364", 1), ("actor-364", -1)]
+    assert model_actor_supervisor_inventory.calls == [("actor-364", 1), ("actor-364", -1)]

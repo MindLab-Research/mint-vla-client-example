@@ -391,7 +391,7 @@ async def lifespan(app: FastAPI):
 
         # ==========================================================================
         # Action route layer: process-local router can recover detached runtimes
-        # from ModelActorRegistry metadata after API or worker restarts.
+        # from ModelActorSupervisorInventory metadata after API or worker restarts.
         # ==========================================================================
         action_sampling.action_session_manager = action_manager
         if mint is not None:

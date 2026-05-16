@@ -635,7 +635,7 @@ class TrainingSessionManager:
         1. engine.delete_session (delete actor-local state, then unbind/kill actor if applicable)
         2. delete_session (remove from in-memory manager)
         3. delete_training_session (remove from detached Ray store)
-        4. model_actor_registry.clear_session (clear stale session pins)
+        4. model_actor_supervisor_inventory.clear_session (clear stale session pins)
         """
         session = self._sessions.get(model_id)
         if session is None:
@@ -685,11 +685,11 @@ class TrainingSessionManager:
                 f"Failed to delete training session {model_id} from store: {e}"
             )
 
-        # 5. Clear ModelActorRegistry session tracking (best-effort)
+        # 5. Clear ModelActorSupervisorInventory session tracking (best-effort)
         try:
-            from .model_actor_registry import get_model_actor_registry
+            from .model_actor_supervisor import get_model_actor_supervisor
 
-            get_model_actor_registry().clear_session(model_id)
+            get_model_actor_supervisor().clear_session(model_id)
         except Exception:
             pass
 

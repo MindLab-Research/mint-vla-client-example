@@ -135,7 +135,7 @@ Detached Ray actor surviving server restarts. First start ~80s, subsequent ~2s.
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
 | `/api/v1/healthz` | GET | Health check |
-| `/api/v1/actors` | GET | List actors (ModelActorRegistry inventory) |
+| `/api/v1/actors` | GET | List actors (ModelActorSupervisorInventory inventory) |
 | `/api/v1/actors/kill` | POST | Kill actors by type |
 | `/api/v1/create_session` | POST | Create session |
 | `/api/v1/create_sampling_session` | POST | Create sampling session |

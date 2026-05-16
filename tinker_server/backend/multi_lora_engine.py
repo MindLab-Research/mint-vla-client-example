@@ -29,7 +29,7 @@ from tinker_server.runtime_env import join_pythonpath, sanitize_worker_pythonpat
 from . import ray_kill
 from .lora_registry import LoRARegistry
 from .ray_placement_groups import remove_named_placement_group
-from .ray_keepalive import ray_get_with_model_actor_registry_keepalive
+from .ray_keepalive import ray_get_with_model_actor_supervisor_keepalive
 from .volc_placement import (
     assert_node_ip_capacity,
     parse_model_gpu_placement,
@@ -259,16 +259,16 @@ class MultiLoRAInferenceEngine:
 
                         # Register existing actor with model actor registry for LRU tracking
                         # Include node_id for proper per-node GPU scheduling
-                        from tinker_server.backend.model_actor_registry import (
+                        from tinker_server.backend.model_actor_supervisor import (
                             ActorType,
                             actor_observability_metadata,
-                            get_model_actor_registry,
+                            get_model_actor_supervisor,
                         )
                         total_gpus = self.tensor_parallel_size * self.data_parallel_size
-                        model_actor_registry = get_model_actor_registry()
+                        model_actor_supervisor_inventory = get_model_actor_supervisor()
                         actor_node_id = _get_actor_node_id(self.server)
-                        logger.info(f"Registering existing actor {self.actor_name} with ModelActorRegistry (node={actor_node_id[:8] if actor_node_id else 'unknown'})")
-                        model_actor_registry.register(
+                        logger.info(f"Registering existing actor {self.actor_name} with ModelActorSupervisorInventory (node={actor_node_id[:8] if actor_node_id else 'unknown'})")
+                        model_actor_supervisor_inventory.register(
                             actor_name=self.actor_name,
                             actor_type=ActorType.VLLM,
                             num_gpus=total_gpus,
@@ -279,7 +279,7 @@ class MultiLoRAInferenceEngine:
                             metadata=dict(actor_observability_metadata(self.server) or {}),
                         )
                         # Mark as ready since it's an existing actor that responded to health check
-                        model_actor_registry.mark_ready(self.actor_name)
+                        model_actor_supervisor_inventory.mark_ready(self.actor_name)
                         return
                 except ray.exceptions.RayActorError:
                     # Actor is dead, need to create new one
@@ -313,18 +313,18 @@ class MultiLoRAInferenceEngine:
                     )
                     self._initialized = True
 
-                    from tinker_server.backend.model_actor_registry import (
+                    from tinker_server.backend.model_actor_supervisor import (
                         ActorType,
                         actor_observability_metadata,
-                        get_model_actor_registry,
+                        get_model_actor_supervisor,
                     )
                     total_gpus = self.tensor_parallel_size * self.data_parallel_size
-                    model_actor_registry = get_model_actor_registry()
+                    model_actor_supervisor_inventory = get_model_actor_supervisor()
                     actor_node_id = _get_actor_node_id(self.server)
                     logger.info(
-                        f"Registering existing actor {self.actor_name} with ModelActorRegistry (node={actor_node_id[:8] if actor_node_id else 'unknown'})"
+                        f"Registering existing actor {self.actor_name} with ModelActorSupervisorInventory (node={actor_node_id[:8] if actor_node_id else 'unknown'})"
                     )
-                    model_actor_registry.register(
+                    model_actor_supervisor_inventory.register(
                         actor_name=self.actor_name,
                         actor_type=ActorType.VLLM,
                         num_gpus=total_gpus,
@@ -334,7 +334,7 @@ class MultiLoRAInferenceEngine:
                         node_id=actor_node_id,
                         metadata=dict(actor_observability_metadata(self.server) or {}),
                     )
-                    model_actor_registry.mark_ready(self.actor_name)
+                    model_actor_supervisor_inventory.mark_ready(self.actor_name)
                     return
             except ValueError:
                 # Actor doesn't exist, create new one
@@ -357,22 +357,6 @@ class MultiLoRAInferenceEngine:
             # Compute total GPUs needed for MoE models
             # For EP (expert parallelism), total_gpus = TP * DP
             total_gpus = self.tensor_parallel_size * self.data_parallel_size
-
-            # Ensure GPUs available, evicting idle actors if needed (LRU)
-            # This is critical to prevent server hangs when no GPUs are free.
-            from tinker_server.backend.model_actor_registry import get_model_actor_registry, ActorType
-            model_actor_registry = get_model_actor_registry()
-            try:
-                await asyncio.to_thread(
-                    model_actor_registry.ensure_gpus_available,
-                    total_gpus,
-                    600,
-                    exclude_actor_types=(ActorType.MEGATRON,),
-                )
-            except ValueError as e:
-                # Unable to free enough GPUs even after eviction
-                logger.error(f"Cannot create vLLM actor: {e}")
-                raise
 
             # Build engine_kwargs for expert parallelism
             # Pass enable_expert_parallel directly to vLLM, bypassing verl's worker-based EP
@@ -613,14 +597,14 @@ class MultiLoRAInferenceEngine:
 
             # Register with unified model actor registry for LRU tracking
             # Include node_id for proper per-node GPU scheduling
-            from tinker_server.backend.model_actor_registry import (
+            from tinker_server.backend.model_actor_supervisor import (
                 ActorType,
                 actor_observability_metadata,
-                get_model_actor_registry,
+                get_model_actor_supervisor,
             )
-            model_actor_registry = get_model_actor_registry()
+            model_actor_supervisor_inventory = get_model_actor_supervisor()
             actor_node_id = _get_actor_node_id(self.server)
-            model_actor_registry.register(
+            model_actor_supervisor_inventory.register(
                 actor_name=self.actor_name,
                 actor_type=ActorType.VLLM,
                 num_gpus=total_gpus,
@@ -631,7 +615,7 @@ class MultiLoRAInferenceEngine:
                 metadata=dict(actor_observability_metadata(self.server) or {}),
             )
             # Mark as ready now that launch completed successfully
-            model_actor_registry.mark_ready(self.actor_name)
+            model_actor_supervisor_inventory.mark_ready(self.actor_name)
             if actor_node_id:
                 logger.info(f"vLLM actor {self.actor_name} running on node {actor_node_id[:8]}")
 
@@ -691,7 +675,7 @@ class MultiLoRAInferenceEngine:
                 peft_config=peft_config,
                 traceparent=traceparent,
             )
-            await ray_get_with_model_actor_registry_keepalive(ref, actor_name=self.actor_name)
+            await ray_get_with_model_actor_supervisor_keepalive(ref, actor_name=self.actor_name)
             print("[DEBUG add_lora_for_session] add_lora_with_id.remote returned", flush=True)
         except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError) as e:
             logger.warning(f"vLLM actor dead/unresponsive, reinitializing: {e}")
@@ -706,7 +690,7 @@ class MultiLoRAInferenceEngine:
                 peft_config=peft_config,
                 traceparent=traceparent,
             )
-            await ray_get_with_model_actor_registry_keepalive(ref, actor_name=self.actor_name)
+            await ray_get_with_model_actor_supervisor_keepalive(ref, actor_name=self.actor_name)
         except Exception as e:
             print(f"[DEBUG add_lora_for_session] UNEXPECTED EXCEPTION: {type(e).__name__}: {e}", flush=True)
             import traceback
@@ -803,7 +787,7 @@ class MultiLoRAInferenceEngine:
                     lora_name=sampling_session_id,
                     traceparent=traceparent,
                 )
-                await ray_get_with_model_actor_registry_keepalive(ref, actor_name=self.actor_name)
+                await ray_get_with_model_actor_supervisor_keepalive(ref, actor_name=self.actor_name)
                 print("[DEBUG add_lora_for_session_from_path] add_lora_from_path.remote returned", flush=True)
             except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError) as e:
                 logger.warning(f"vLLM actor dead/unresponsive, reinitializing: {e}")
@@ -817,7 +801,7 @@ class MultiLoRAInferenceEngine:
                     lora_name=sampling_session_id,
                     traceparent=traceparent,
                 )
-                await ray_get_with_model_actor_registry_keepalive(ref, actor_name=self.actor_name)
+                await ray_get_with_model_actor_supervisor_keepalive(ref, actor_name=self.actor_name)
 
         try:
             await run_async_with_otel_span(
@@ -942,7 +926,7 @@ class MultiLoRAInferenceEngine:
                 )
 
             t0_ray = time.time()
-            result = await ray_get_with_model_actor_registry_keepalive(ref, actor_name=self.actor_name, request_id=request_id)
+            result = await ray_get_with_model_actor_supervisor_keepalive(ref, actor_name=self.actor_name, request_id=request_id)
             ray_elapsed = time.time() - t0_ray
             if ray_elapsed > 30.0:
                 logger.warning(
@@ -1050,7 +1034,7 @@ class MultiLoRAInferenceEngine:
                     n=num_samples,
                     traceparent=traceparent,
                 )
-            return await ray_get_with_model_actor_registry_keepalive(ref, actor_name=self.actor_name)
+            return await ray_get_with_model_actor_supervisor_keepalive(ref, actor_name=self.actor_name)
 
         raw = await run_async_with_otel_span(
             "sampling.multi_lora.generate_many",
@@ -1159,13 +1143,13 @@ class MultiLoRAInferenceEngine:
                         lora_int_id=lora_id,
                         traceparent=traceparent,
                     )
-                    return await ray_get_with_model_actor_registry_keepalive(ref, actor_name=self.actor_name)
+                    return await ray_get_with_model_actor_supervisor_keepalive(ref, actor_name=self.actor_name)
                 except Exception as e:
                     msg = f"{type(e).__name__}: {e}"
                     if any(s in msg for s in ("OutOfMemoryError", "CUDA out of memory", "EngineDeadError")):
                         logger.error(f"vLLM compute_logprobs failed; killing actor {self.actor_name}: {msg}")
                         try:
-                            from tinker_server.backend.model_actor_registry import get_model_actor_registry
+                            from tinker_server.backend.model_actor_supervisor import get_model_actor_supervisor
 
                             ray_kill.kill(
                                 self.server,
@@ -1174,7 +1158,7 @@ class MultiLoRAInferenceEngine:
                                 namespace=PERSISTENT_NAMESPACE,
                                 no_restart=True,
                             )
-                            get_model_actor_registry().unregister(self.actor_name)
+                            get_model_actor_supervisor().unregister(self.actor_name)
                         except Exception:
                             pass
                         self.server = None
@@ -1186,13 +1170,13 @@ class MultiLoRAInferenceEngine:
                     request_id=request_id,
                     traceparent=traceparent,
                 )
-                return await ray_get_with_model_actor_registry_keepalive(ref, actor_name=self.actor_name)
+                return await ray_get_with_model_actor_supervisor_keepalive(ref, actor_name=self.actor_name)
             except Exception as e:
                 msg = f"{type(e).__name__}: {e}"
                 if any(s in msg for s in ("OutOfMemoryError", "CUDA out of memory", "EngineDeadError")):
                     logger.error(f"vLLM compute_logprobs failed; killing actor {self.actor_name}: {msg}")
                     try:
-                        from tinker_server.backend.model_actor_registry import get_model_actor_registry
+                        from tinker_server.backend.model_actor_supervisor import get_model_actor_supervisor
 
                         ray_kill.kill(
                             self.server,
@@ -1201,7 +1185,7 @@ class MultiLoRAInferenceEngine:
                             namespace=PERSISTENT_NAMESPACE,
                             no_restart=True,
                         )
-                        get_model_actor_registry().unregister(self.actor_name)
+                        get_model_actor_supervisor().unregister(self.actor_name)
                     except Exception:
                         pass
                     self.server = None
@@ -1281,7 +1265,7 @@ class MultiLoRAInferenceEngine:
                 traceparent=traceparent,
             )
 
-        result = await ray_get_with_model_actor_registry_keepalive(ref, actor_name=self.actor_name)
+        result = await ray_get_with_model_actor_supervisor_keepalive(ref, actor_name=self.actor_name)
 
         return list(result)
 
@@ -1305,7 +1289,7 @@ class MultiLoRAInferenceEngine:
         if should_unload:
             try:
                 ref = self.server.remove_lora.remote(lora_id)
-                await ray_get_with_model_actor_registry_keepalive(ref, actor_name=self.actor_name)
+                await ray_get_with_model_actor_supervisor_keepalive(ref, actor_name=self.actor_name)
             except Exception as e:
                 logger.warning(f"Failed to remove LoRA {lora_id} from engine: {e}")
 
@@ -1828,10 +1812,10 @@ class MultiModelInferenceManager:
             if persistent_csv:
                 persistent_models = {m.strip() for m in persistent_csv.split(",") if m.strip()}
                 if model_name in persistent_models:
-                    from tinker_server.backend.model_actor_registry import get_model_actor_registry
+                    from tinker_server.backend.model_actor_supervisor import get_model_actor_supervisor
 
-                    model_actor_registry = get_model_actor_registry()
-                    if not model_actor_registry.set_protected(actor_name, True):
+                    model_actor_supervisor_inventory = get_model_actor_supervisor()
+                    if not model_actor_supervisor_inventory.set_protected(actor_name, True):
                         logger.warning(
                             f"Failed to protect vLLM actor for persistent model {model_name}: actor={actor_name}"
                         )
@@ -1861,7 +1845,7 @@ class MultiModelInferenceManager:
 def _list_named_vllm_actor_names(*, namespace: str) -> list[str]:
     """List vLLM actor names by Ray named actor registry.
 
-    This is useful for detecting inventory mismatches (ModelActorRegistry staleness).
+    This is useful for detecting inventory mismatches (ModelActorSupervisorInventory staleness).
     Callers must not silently treat this registry as authoritative.
     """
     names: list[str] = []
@@ -1887,11 +1871,11 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
         True if any actor was killed, False if none found.
 
     Raises:
-        ModelActorRegistryStaleError: When ModelActorRegistry reports no vLLM actors but Ray named
+        ModelActorSupervisorStaleError: When ModelActorSupervisorInventory reports no vLLM actors but Ray named
             actors exist in the namespace. This is an accounting invariant violation
             and must be surfaced rather than falling back silently.
     """
-    from tinker_server.backend.model_actor_registry import ActorType, get_model_actor_registry
+    from tinker_server.backend.model_actor_supervisor import ActorType, get_model_actor_supervisor
 
     if not ray.is_initialized():
         init_ray(
@@ -1899,7 +1883,7 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
             ignore_reinit_error=True,
         )
 
-    model_actor_registry = get_model_actor_registry()
+    model_actor_supervisor_inventory = get_model_actor_supervisor()
 
     if model_name:
         # Kill specific model's actor
@@ -1913,7 +1897,7 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
                 namespace=PERSISTENT_NAMESPACE,
             )
             logger.info(f"Killed vLLM actor: {actor_name}")
-            model_actor_registry.unregister(actor_name)
+            model_actor_supervisor_inventory.unregister(actor_name)
             try:
                 remove_named_placement_group(f"{actor_name}_pg", namespace=PERSISTENT_NAMESPACE)
             except Exception:
@@ -1929,7 +1913,7 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
     else:
         # Kill ALL vLLM actors via model actor registry
         killed_any = False
-        for entry in model_actor_registry.iter_entries():
+        for entry in model_actor_supervisor_inventory.iter_entries():
             if entry.actor_type == ActorType.VLLM:
                 try:
                     actor = ray.get_actor(entry.actor_name, namespace=entry.namespace)
@@ -1940,7 +1924,7 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
                         namespace=entry.namespace,
                     )
                     logger.info(f"Killed vLLM actor: {entry.actor_name}")
-                    model_actor_registry.unregister(entry.actor_name)
+                    model_actor_supervisor_inventory.unregister(entry.actor_name)
                     try:
                         remove_named_placement_group(
                             f"{entry.actor_name}_pg",
@@ -1951,7 +1935,7 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
                     killed_any = True
                 except ValueError:
                     logger.warning(f"vLLM actor not found in Ray: {entry.actor_name}")
-                    model_actor_registry.unregister(entry.actor_name)
+                    model_actor_supervisor_inventory.unregister(entry.actor_name)
                     try:
                         remove_named_placement_group(
                             f"{entry.actor_name}_pg",
@@ -1962,15 +1946,15 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
                 except Exception as e:
                     logger.error(f"Error killing vLLM actor {entry.actor_name}: {e}")
         if not killed_any:
-            from tinker_server.backend.model_actor_registry import ModelActorRegistryStaleError
+            from tinker_server.backend.model_actor_supervisor import ModelActorSupervisorStaleError
 
             named = _list_named_vllm_actor_names(namespace=PERSISTENT_NAMESPACE)
             if named:
-                raise ModelActorRegistryStaleError(
-                    "ModelActorRegistry lists 0 vLLM actors but Ray named-actor registry has "
+                raise ModelActorSupervisorStaleError(
+                    "ModelActorSupervisorInventory lists 0 vLLM actors but Ray named-actor registry has "
                     f"{len(named)} vLLM actor(s) in namespace={PERSISTENT_NAMESPACE!r}: {named!r}"
                 )
-            logger.info("No vLLM actors found in ModelActorRegistry")
+            logger.info("No vLLM actors found in ModelActorSupervisorInventory")
         return killed_any
 
 
@@ -1984,7 +1968,7 @@ def check_persistent_vllm_actor(model_name: str | None = None) -> bool:
     Returns:
         True if matching actor exists and is alive.
     """
-    from tinker_server.backend.model_actor_registry import ActorType, get_model_actor_registry
+    from tinker_server.backend.model_actor_supervisor import ActorType, get_model_actor_supervisor
 
     if not ray.is_initialized():
         init_ray(
@@ -2027,8 +2011,8 @@ def check_persistent_vllm_actor(model_name: str | None = None) -> bool:
             return False
     else:
         # Check for ANY vLLM actor via model actor registry
-        model_actor_registry = get_model_actor_registry()
-        for entry in model_actor_registry.iter_entries():
+        model_actor_supervisor_inventory = get_model_actor_supervisor()
+        for entry in model_actor_supervisor_inventory.iter_entries():
             if entry.actor_type == ActorType.VLLM:
                 try:
                     actor = ray.get_actor(entry.actor_name, namespace=entry.namespace)
@@ -2045,12 +2029,12 @@ def list_vllm_actors() -> list[dict]:
     Returns:
         List of actor info dicts with name, gpus, base_model.
     """
-    from tinker_server.backend.model_actor_registry import ActorType, get_model_actor_registry
+    from tinker_server.backend.model_actor_supervisor import ActorType, get_model_actor_supervisor
 
-    model_actor_registry = get_model_actor_registry()
+    model_actor_supervisor_inventory = get_model_actor_supervisor()
     out = [
         {"name": e.actor_name, "gpus": e.num_gpus, "base_model": e.base_model}
-        for e in model_actor_registry.iter_entries()
+        for e in model_actor_supervisor_inventory.iter_entries()
         if e.actor_type == ActorType.VLLM
     ]
     seen = {a["name"] for a in out}

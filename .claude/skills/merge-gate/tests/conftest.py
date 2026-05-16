@@ -200,7 +200,7 @@ def sample(model_id: str, prompt_tokens: list, max_tokens: int = 20,
 
 
 def list_actors(actor_type: str | None = None, model_name: str | None = None) -> dict:
-    """List ModelActorRegistry actors via server endpoint.
+    """List ModelActorSupervisorInventory actors via server endpoint.
 
     Used by merge-gate eviction sentries to observe real eviction events.
     """

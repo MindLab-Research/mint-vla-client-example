@@ -40,7 +40,7 @@ from .async_ray_control import async_get_ray_ref
 from .gpu_binding_helpers import gpu_bindings_from_ray_gpu_ids
 from .multinode_resources import MultiNodeEngineResources, compute_multinode_engine_resources
 from .ray_placement_groups import PlacementGroupMismatchError, get_named_placement_group
-from .ray_keepalive import ray_get_with_model_actor_registry_keepalive
+from .ray_keepalive import ray_get_with_model_actor_supervisor_keepalive
 from .vllm_scheduler_observability import (
     VllmStatsObserver,
     install_vllm_iteration_observability_patches,
@@ -2336,14 +2336,14 @@ class MultiNodeInferenceEngine:
             def _attach_existing_actor(existing_actor_handle) -> None:
                 self.engine = existing_actor_handle
                 self._initialized = True
-                from tinker_server.backend.model_actor_registry import (
+                from tinker_server.backend.model_actor_supervisor import (
                     ActorType,
                     actor_observability_metadata,
-                    get_model_actor_registry,
+                    get_model_actor_supervisor,
                 )
 
-                model_actor_registry = get_model_actor_registry()
-                model_actor_registry.register(
+                model_actor_supervisor_inventory = get_model_actor_supervisor()
+                model_actor_supervisor_inventory.register(
                     actor_name=self.actor_name,
                     actor_type=ActorType.VLLM,
                     num_gpus=total_required_gpus,
@@ -2353,7 +2353,7 @@ class MultiNodeInferenceEngine:
                     protected=is_persistent,
                     metadata=dict(actor_observability_metadata(self.engine) or {}),
                 )
-                model_actor_registry.mark_ready(self.actor_name)
+                model_actor_supervisor_inventory.mark_ready(self.actor_name)
 
             # Try to connect to existing actor
             existing_actor = None
@@ -2566,27 +2566,20 @@ class MultiNodeInferenceEngine:
             # Ensure shared adapter directory exists
             os.makedirs(self.shared_adapter_dir, exist_ok=True)
 
-            # Step 1: Ensure enough GPUs are available (evict idle actors if needed)
-            from tinker_server.backend.model_actor_registry import (
+            from tinker_server.backend.model_actor_supervisor import (
                 ActorType,
                 actor_observability_metadata,
-                get_model_actor_registry,
+                get_model_actor_supervisor,
             )
-            model_actor_registry = get_model_actor_registry()
+            model_actor_supervisor_inventory = get_model_actor_supervisor()
             logger.info(
-                f"Ensuring {total_required_gpus} GPUs available for multi-node vLLM "
+                f"Creating multi-node vLLM requiring {total_required_gpus} GPUs "
                 f"(TP={self.tensor_parallel_size}, PP={self.pipeline_parallel_size}, "
                 f"DP={self.data_parallel_size}, expert_parallel={self.enable_expert_parallel}, "
                 f"controller_gpus={controller_gpus}, worker_gpus={worker_gpus})"
             )
-            await asyncio.to_thread(
-                model_actor_registry.ensure_gpus_available,
-                total_required_gpus,
-                300,
-                exclude_actor_types=(ActorType.MEGATRON,),
-            )
 
-            # Step 2: Create a detached placement group and capture child tasks.
+            # Step 1: Create a detached placement group and capture child tasks.
             #
             # vLLM's Ray backend spawns 1-GPU RayWorkerWrapper actors. Without a placement group,
             # those workers can collide with Megatron placement groups, leading to vLLM init failures
@@ -2897,7 +2890,7 @@ class MultiNodeInferenceEngine:
 
             # Register with unified model actor registry for LRU tracking
             # Multi-node vLLM internally manages GPU workers, but we track total GPUs for eviction
-            model_actor_registry.register(
+            model_actor_supervisor_inventory.register(
                 actor_name=self.actor_name,
                 actor_type=ActorType.VLLM,
                 num_gpus=total_required_gpus,
@@ -2908,9 +2901,9 @@ class MultiNodeInferenceEngine:
                 metadata=dict(actor_observability_metadata(self.engine) or {}),
             )
             # Mark as ready since initialization completed
-            model_actor_registry.mark_ready(self.actor_name)
+            model_actor_supervisor_inventory.mark_ready(self.actor_name)
             logger.info(
-                f"Registered {self.actor_name} with ModelActorRegistry ({total_required_gpus} GPUs)"
+                f"Registered {self.actor_name} with ModelActorSupervisorInventory ({total_required_gpus} GPUs)"
             )
 
     async def add_lora_for_session(
@@ -2961,7 +2954,7 @@ class MultiNodeInferenceEngine:
                 lora_name=sampling_session_id,
                 traceparent=traceparent,
             )
-            await ray_get_with_model_actor_registry_keepalive(ref, actor_name=self.actor_name)
+            await ray_get_with_model_actor_supervisor_keepalive(ref, actor_name=self.actor_name)
         except Exception:
             # Roll back registry on load failure so retries don't trip
             # "already has lora_int_id" for the same session.
@@ -3023,7 +3016,7 @@ class MultiNodeInferenceEngine:
                 lora_path,
                 lora_id,
             )
-            await ray_get_with_model_actor_registry_keepalive(ref, actor_name=self.actor_name)
+            await ray_get_with_model_actor_supervisor_keepalive(ref, actor_name=self.actor_name)
             logger.info(
                 "add_lora_for_session_from_path start sampling_session_id=%s path=%s lora_int_id=%s stage=after_add_lora_wait",
                 sampling_session_id,
@@ -3115,7 +3108,7 @@ class MultiNodeInferenceEngine:
         )
         try:
             timeout_s = ray_get_timeout_s if ray_get_timeout_s > 0 else None
-            result = await ray_get_with_model_actor_registry_keepalive(ref, actor_name=self.actor_name, timeout_s=timeout_s)
+            result = await ray_get_with_model_actor_supervisor_keepalive(ref, actor_name=self.actor_name, timeout_s=timeout_s)
         except asyncio.TimeoutError as e:
             # Avoid killing the actor: killing forces a 60-90s re-init and pollutes latency measurements.
             # Try aborting just this request, then fail loud to the client.
@@ -3211,7 +3204,7 @@ class MultiNodeInferenceEngine:
         )
         try:
             timeout_s = ray_get_timeout_s if ray_get_timeout_s > 0 else None
-            raw = await ray_get_with_model_actor_registry_keepalive(ref, actor_name=self.actor_name, timeout_s=timeout_s)
+            raw = await ray_get_with_model_actor_supervisor_keepalive(ref, actor_name=self.actor_name, timeout_s=timeout_s)
         except asyncio.TimeoutError as e:
             try:
                 abort_ref = self.engine.abort_request.remote(request_id, traceparent=traceparent)
@@ -3296,7 +3289,7 @@ class MultiNodeInferenceEngine:
         )
         try:
             timeout_s = ray_get_timeout_s if ray_get_timeout_s > 0 else None
-            result = await ray_get_with_model_actor_registry_keepalive(ref, actor_name=self.actor_name, timeout_s=timeout_s)
+            result = await ray_get_with_model_actor_supervisor_keepalive(ref, actor_name=self.actor_name, timeout_s=timeout_s)
         except asyncio.TimeoutError as e:
             raise RuntimeError(
                 f"multinode_vllm_ray_get_timeout_s={ray_get_timeout_s} request_id={request_id}"
@@ -3377,7 +3370,7 @@ class MultiNodeInferenceEngine:
         )
         try:
             timeout_s = ray_get_timeout_s if ray_get_timeout_s > 0 else None
-            result = await ray_get_with_model_actor_registry_keepalive(ref, actor_name=self.actor_name, timeout_s=timeout_s)
+            result = await ray_get_with_model_actor_supervisor_keepalive(ref, actor_name=self.actor_name, timeout_s=timeout_s)
         except asyncio.TimeoutError as e:
             raise RuntimeError(
                 f"multinode_vllm_ray_get_timeout_s={ray_get_timeout_s} request_id={request_id}"
@@ -3421,7 +3414,7 @@ class MultiNodeInferenceEngine:
             traceparent = get_current_traceparent()
             try:
                 ref = self.engine.remove_lora.remote(removed_lora_id, traceparent=traceparent)
-                await ray_get_with_model_actor_registry_keepalive(ref, actor_name=self.actor_name)
+                await ray_get_with_model_actor_supervisor_keepalive(ref, actor_name=self.actor_name)
             except Exception as e:
                 logger.warning(f"Failed to remove LoRA {removed_lora_id} from engine: {e}")
 

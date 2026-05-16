@@ -4,23 +4,23 @@ import pytest
 
 pytest.importorskip("ray")
 
-import tinker_server.backend.model_actor_registry as model_actor_registry_module
-from tinker_server.backend.model_actor_registry import ActorType, ModelActorRegistry, get_model_actor_registry
+import tinker_server.backend.model_actor_inventory as model_actor_inventory_module
+from tinker_server.backend.model_actor_supervisor import ActorType, get_model_actor_supervisor
 
 
-def test_model_actor_registry_list_actors_includes_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(model_actor_registry_module.ray, "is_initialized", lambda: False)
-    monkeypatch.setattr(ModelActorRegistry, "_instance", None)
-    pool = get_model_actor_registry()
+def test_model_actor_supervisor_inventory_list_actors_includes_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(model_actor_inventory_module.ray, "is_initialized", lambda: False)
+    pool = get_model_actor_supervisor()
+    pool.clear(kill_actors=False)
     actor_name = f"test_issue_40_dense_{uuid.uuid4().hex}"
 
     pool.unregister(actor_name)
 
 
-def test_model_actor_registry_list_actors_labels_openpi_backend(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(model_actor_registry_module.ray, "is_initialized", lambda: False)
-    monkeypatch.setattr(ModelActorRegistry, "_instance", None)
-    pool = get_model_actor_registry()
+def test_model_actor_supervisor_inventory_list_actors_labels_openpi_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(model_actor_inventory_module.ray, "is_initialized", lambda: False)
+    pool = get_model_actor_supervisor()
+    pool.clear(kill_actors=False)
     actor_name = f"test_issue_40_openpi_{uuid.uuid4().hex}"
 
     pool.unregister(actor_name)

@@ -77,7 +77,7 @@ MoE training uses Megatron and must export PEFT adapters by reconstructing full 
 
 ## ModelActorSupervisor, ModelWorkScheduler, and registry
 
-`ModelActorSupervisor` owns desired model-runtime actor reconciliation. `ModelWorkScheduler` owns hot task scheduling, replica subqueues, and leases. `ModelActorRegistry` is a process-local inventory used for observability, inflight marking, and best-effort LRU eviction on direct actor creation paths.
+`ModelActorSupervisor` owns desired model-runtime actor reconciliation. `ModelWorkScheduler` owns hot task scheduling, replica subqueues, and leases. `ModelActorSupervisorInventory` is a process-local inventory used for observability, inflight marking, and best-effort LRU eviction on direct actor creation paths.
 
 Clients do not explicitly end all sessions, so idle timeouts still affect training and inference:
 - Detached inference actors can remain alive across server restarts and keep CUDA memory until evicted.

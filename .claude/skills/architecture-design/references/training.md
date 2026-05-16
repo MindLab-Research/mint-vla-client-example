@@ -14,7 +14,7 @@ See `training-multitenancy.md` for the dense vs Megatron swap mechanisms.
 
 - `TrainingSessionManager` stores per-`model_id` metadata and lifecycle in server memory.
 - The actual training state (weights, optimizer, step counters) lives inside Ray actors.
-- `ModelActorSupervisor` and `ModelWorkScheduler` own runtime reconciliation and scheduling. `ModelActorRegistry` is the local inventory and best-effort eviction helper for GPU actors.
+- `ModelActorSupervisor` and `ModelWorkScheduler` own runtime reconciliation and scheduling. `ModelActorSupervisorInventory` is the local inventory and best-effort eviction helper for GPU actors.
 
 ## Backends
 
@@ -42,6 +42,6 @@ When cleanup fires, it skips sessions with `inflight_ops > 0`, then performs the
 1. `engine.shutdown_session` (release GPU actor reference)
 2. `delete_session` (remove from in-memory manager)
 3. `delete_training_session` (remove from detached Ray store)
-4. `model_actor_registry.clear_session` (clear stale session pins)
+4. `model_actor_supervisor_inventory.clear_session` (clear stale session pins)
 
 This prevents unbounded session accumulation when clients disconnect without calling DELETE.

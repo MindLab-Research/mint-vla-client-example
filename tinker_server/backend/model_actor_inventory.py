@@ -1,7 +1,7 @@
-"""Process-local model actor registry.
+"""Process-local model actor inventory owned by ModelActorSupervisor.
 
 All GPU-using runtime actors publish inventory, inflight counts, protection
-flags, and session bindings here. The registry is intentionally process-local:
+flags, and session bindings here. The inventory is intentionally process-local:
 the durable scheduling state lives in TaskStateStore/ModelWorkScheduler, while
 actor desired-state reconciliation belongs to ModelActorSupervisor.
 """
@@ -27,8 +27,8 @@ logger = logging.getLogger(__name__)
 ActorHandle = Any
 
 
-class ModelActorRegistryStaleError(RuntimeError):
-    """ModelActorRegistry inventory/state disagrees with Ray named-actor registry."""
+class ModelActorSupervisorStaleError(RuntimeError):
+    """ModelActorInventory inventory/state disagrees with Ray named-actor registry."""
 
 
 class ActorType(Enum):
@@ -85,17 +85,15 @@ class ActorEntry:
         return time.time() - self.last_accessed
 
 
-class _ModelActorRegistryState:
-    """Authoritative ModelActorRegistry state machine.
+class _ModelActorInventoryState:
+    """Authoritative ModelActorInventory state machine.
 
     This object stores only serializable control-plane metadata. Actor handles
     intentionally stay worker-local.
     """
 
-    def __init__(self, *, min_actor_age: int, session_idle_timeout: int) -> None:
+    def __init__(self, *, session_idle_timeout: int) -> None:
         self.entries: dict[str, ActorEntry] = {}
-        self.pending_gpus: int = 0
-        self.min_actor_age = int(min_actor_age)
         self.session_idle_timeout = int(session_idle_timeout)
         self.lifecycle_metrics: dict[tuple[str, str], int] = {}
 
@@ -130,7 +128,7 @@ class _ModelActorRegistryState:
             )
             self.entries[actor_name] = entry
             logger.info(
-                "[ModelActorRegistry] Registered %s actor=%s num_gpus=%s base_model=%s node_id=%s",
+                "[ModelActorInventory] Registered %s actor=%s num_gpus=%s base_model=%s node_id=%s",
                 actor_type.value,
                 actor_name,
                 num_gpus,
@@ -159,7 +157,7 @@ class _ModelActorRegistryState:
     def unregister(self, actor_name: str) -> bool:
         removed = self.entries.pop(actor_name, None) is not None
         if removed:
-            logger.info("[ModelActorRegistry] Unregistered actor=%s", actor_name)
+            logger.info("[ModelActorInventory] Unregistered actor=%s", actor_name)
         return removed
 
     def get(self, actor_name: str, *, touch: bool) -> ActorEntry | None:
@@ -243,42 +241,14 @@ class _ModelActorRegistryState:
             for (base_model, event), count in sorted(self.lifecycle_metrics.items())
         ]
 
-    def reserve_gpus(self, num_gpus: int) -> bool:
-        self.pending_gpus += max(0, int(num_gpus))
-        return True
-
-    def release_pending_gpus(self, num_gpus: int) -> int:
-        self.pending_gpus = max(0, self.pending_gpus - max(0, int(num_gpus)))
-        return self.pending_gpus
-
-    def get_effective_available_gpus(self, *, ray_available: int | None = None) -> int:
-        available = int(ray_available) if ray_available is not None else int(ray.available_resources().get("GPU", 0))
-        return max(0, available - int(self.pending_gpus))
-
-    def _get_evictable_actors_lru(
-        self,
-        *,
-        allow_evict_protected: bool,
-        exclude_actor_types: tuple[ActorType, ...] = (),
-    ) -> list[ActorEntry]:
-        evictable = [
-            entry
-            for entry in self.entries.values()
-            if entry.actor_type not in exclude_actor_types
-            if allow_evict_protected or not entry.protected
-            if entry.is_idle(self.session_idle_timeout)
-            if entry.idle_time() > self.min_actor_age
-        ]
-        return sorted(evictable, key=lambda entry: (entry.protected, entry.last_accessed))
-
     def _kill_actor(self, entry: ActorEntry) -> bool:
         try:
             actor = ray.get_actor(entry.actor_name, namespace=entry.namespace)
         except ValueError:
-            logger.warning("[ModelActorRegistry] Actor not found during eviction: %s", entry.actor_name)
+            logger.warning("[ModelActorInventory] Actor not found during eviction: %s", entry.actor_name)
             return False
         except Exception as e:
-            logger.warning("[ModelActorRegistry] Actor lookup failed during eviction actor=%s err=%s", entry.actor_name, e)
+            logger.warning("[ModelActorInventory] Actor lookup failed during eviction actor=%s err=%s", entry.actor_name, e)
             return False
 
         try:
@@ -290,7 +260,7 @@ class _ModelActorRegistryState:
 
             ray_kill.kill(
                 actor,
-                reason="model_actor_registry_evict",
+                reason="model_actor_inventory_evict",
                 actor_name=entry.actor_name,
                 namespace=entry.namespace,
                 actor_type=entry.actor_type.value,
@@ -300,93 +270,13 @@ class _ModelActorRegistryState:
                 creating=entry.creating,
                 idle_time=f"{entry.idle_time():.1f}",
                 age=f"{entry.age():.1f}",
-                min_actor_age=self.min_actor_age,
                 session_idle_timeout=self.session_idle_timeout,
             )
-            if entry.actor_type == ActorType.MEGATRON:
-                self.record_lifecycle_event(base_model=entry.base_model, event="evicted")
-            logger.info("[ModelActorRegistry] Evicted actor=%s", entry.actor_name)
+            logger.info("[ModelActorInventory] Killed actor=%s", entry.actor_name)
             return True
         except Exception as e:
-            logger.warning("[ModelActorRegistry] Error killing actor %s: %s", entry.actor_name, e)
+            logger.warning("[ModelActorInventory] Error killing actor %s: %s", entry.actor_name, e)
             return False
-
-    def evict_for_gpus(
-        self,
-        needed_gpus: int,
-        *,
-        allow_evict_protected: bool,
-        exclude_actor_types: tuple[ActorType, ...] = (),
-    ) -> int:
-        freed_gpus = 0
-        victims = self._get_evictable_actors_lru(
-            allow_evict_protected=allow_evict_protected,
-            exclude_actor_types=exclude_actor_types,
-        )
-        for entry in victims:
-            if freed_gpus >= int(needed_gpus):
-                break
-            if self._kill_actor(entry):
-                freed_gpus += int(entry.num_gpus)
-                self.entries.pop(entry.actor_name, None)
-        return freed_gpus
-
-    def ensure_gpus_available(
-        self,
-        needed_gpus: int,
-        timeout: float = 600.0,
-        *,
-        allow_evict_protected: bool = False,
-        exclude_actor_types: tuple[ActorType, ...] = (),
-    ) -> bool:
-        import time as time_module
-
-        start_time = time_module.time()
-        poll_interval = 5.0
-        iteration = 0
-
-        while True:
-            iteration += 1
-            available = self.get_effective_available_gpus()
-            if available >= int(needed_gpus):
-                return True
-
-            need_to_free = int(needed_gpus) - int(available)
-            evictable = self._get_evictable_actors_lru(
-                allow_evict_protected=allow_evict_protected,
-                exclude_actor_types=exclude_actor_types,
-            )
-            logger.info(
-                "[ModelActorRegistry] ensure_gpus_available iter=%s need=%s available=%s pending=%s "
-                "need_to_free=%s evictable=%s allow_evict_protected=%s exclude_actor_types=%s",
-                iteration,
-                needed_gpus,
-                available,
-                self.pending_gpus,
-                need_to_free,
-                len(evictable),
-                allow_evict_protected,
-                [actor_type.value for actor_type in exclude_actor_types],
-            )
-
-            freed = self.evict_for_gpus(
-                need_to_free,
-                allow_evict_protected=allow_evict_protected,
-                exclude_actor_types=exclude_actor_types,
-            )
-            if freed > 0:
-                time_module.sleep(2.0)
-                if self.get_effective_available_gpus() >= int(needed_gpus):
-                    return True
-
-            elapsed = time_module.time() - start_time
-            if elapsed >= float(timeout):
-                raise ValueError(
-                    f"Insufficient GPUs: need {needed_gpus}, available {self.get_effective_available_gpus()} "
-                    f"after eviction. Freed {freed} GPUs but resources did not become available within "
-                    f"{timeout}s timeout. Other actors may be in use. Check cluster status with 'ray status'."
-                )
-            time_module.sleep(min(poll_interval, float(timeout) - elapsed))
 
     def iter_entries(self) -> list[ActorEntry]:
         return list(self.entries.values())
@@ -399,7 +289,7 @@ class _ModelActorRegistryState:
             except ValueError:
                 stale.append(name)
             except Exception as e:
-                logger.warning("[ModelActorRegistry] Error checking actor %s: %s", name, e)
+                logger.warning("[ModelActorInventory] Error checking actor %s: %s", name, e)
         for name in stale:
             self.entries.pop(name, None)
         return len(stale)
@@ -416,7 +306,7 @@ class _ModelActorRegistryState:
             cleared += 1
         if cleared:
             logger.info(
-                "[ModelActorRegistry] Cleared current_session=%s actor_type=%s count=%s",
+                "[ModelActorInventory] Cleared current_session=%s actor_type=%s count=%s",
                 session_id,
                 actor_type.value if actor_type is not None else "any",
                 cleared,
@@ -432,7 +322,6 @@ class _ModelActorRegistryState:
             for entry in list(self.entries.values()):
                 self._kill_actor(entry)
         self.entries.clear()
-        self.pending_gpus = 0
         return count
 
 
@@ -600,7 +489,7 @@ def actor_observability_metadata(actor_handle: ActorHandle | None, *, timeout_s:
     try:
         payload = ray.get(getter.remote(), timeout=float(timeout_s))
     except Exception as e:
-        logger.debug("[ModelActorRegistry] get_observability_binding failed: %s", e)
+        logger.debug("[ModelActorInventory] get_observability_binding failed: %s", e)
         return None
     return _normalize_actor_observability_payload(payload)
 
@@ -618,15 +507,15 @@ async def async_actor_observability_metadata(
     try:
         payload = await async_get_ray_ref(getter.remote(), timeout_s=float(timeout_s))
     except Exception as e:
-        logger.debug("[ModelActorRegistry] async get_observability_binding failed: %s", e)
+        logger.debug("[ModelActorInventory] async get_observability_binding failed: %s", e)
         return None
     return _normalize_actor_observability_payload(payload)
 
 
-class ModelActorRegistry:
+class ModelActorInventory:
     """Process-local registry for GPU-using actors."""
 
-    _instance: "ModelActorRegistry | None" = None
+    _instance: "ModelActorInventory | None" = None
     _lock = threading.Lock()
 
     def __new__(cls):
@@ -640,22 +529,19 @@ class ModelActorRegistry:
     def __init__(self) -> None:
         if self._initialized:
             return
-        min_actor_age = int(server_config.model_actor_registry_min_actor_age_s)
-        session_idle_timeout = int(server_config.model_actor_registry_session_idle_timeout_s)
-        self.MIN_ACTOR_AGE = min_actor_age
+        session_idle_timeout = int(server_config.model_actor_supervisor_inventory_session_idle_timeout_s)
         self.SESSION_IDLE_TIMEOUT = session_idle_timeout
-        self._local_state = _ModelActorRegistryState(
-            min_actor_age=min_actor_age,
+        self._local_state = _ModelActorInventoryState(
             session_idle_timeout=session_idle_timeout,
         )
         self._local_lock = threading.Lock()
         self._handle_cache: dict[str, ActorHandle] = {}
-        self.RSS_TTL_S = float(os.environ.get("MINT_MODEL_ACTOR_REGISTRY_RSS_TTL_S", "60.0"))
-        self.METADATA_TTL_S = float(os.environ.get("MINT_MODEL_ACTOR_REGISTRY_OBSERVABILITY_TTL_S", "30.0"))
-        self.METADATA_TIMEOUT_S = float(os.environ.get("MINT_MODEL_ACTOR_REGISTRY_OBSERVABILITY_TIMEOUT_S", "1.0"))
+        self.RSS_TTL_S = float(os.environ.get("MINT_MODEL_ACTOR_SUPERVISOR_INVENTORY_RSS_TTL_S", "60.0"))
+        self.METADATA_TTL_S = float(os.environ.get("MINT_MODEL_ACTOR_SUPERVISOR_INVENTORY_OBSERVABILITY_TTL_S", "30.0"))
+        self.METADATA_TIMEOUT_S = float(os.environ.get("MINT_MODEL_ACTOR_SUPERVISOR_INVENTORY_OBSERVABILITY_TIMEOUT_S", "1.0"))
         self.METADATA_REFRESH_CONCURRENCY = max(
             1,
-            int(os.environ.get("MINT_MODEL_ACTOR_REGISTRY_OBSERVABILITY_REFRESH_CONCURRENCY", "8")),
+            int(os.environ.get("MINT_MODEL_ACTOR_SUPERVISOR_INVENTORY_OBSERVABILITY_REFRESH_CONCURRENCY", "8")),
         )
         self._metadata_metrics_lock = threading.Lock()
         self._metadata_metrics: dict[str, dict[str, int]] = {}
@@ -664,8 +550,7 @@ class ModelActorRegistry:
         self._entries = self._local_state.entries
         self._initialized = True
         logger.info(
-            "[ModelActorRegistry] Initialized MIN_ACTOR_AGE=%s SESSION_IDLE_TIMEOUT=%s",
-            self.MIN_ACTOR_AGE,
+            "[ModelActorInventory] Initialized SESSION_IDLE_TIMEOUT=%s",
             self.SESSION_IDLE_TIMEOUT,
         )
 
@@ -803,33 +688,6 @@ class ModelActorRegistry:
                 metadata=dict(metadata or {}),
                 sample_time=sample_time,
                 sample_source=sample_source,
-            )
-        )
-
-    def reserve_gpus(self, num_gpus: int) -> bool:
-        return bool(self._local(self._local_state.reserve_gpus, num_gpus))
-
-    def release_pending_gpus(self, num_gpus: int) -> None:
-        self._local(self._local_state.release_pending_gpus, num_gpus)
-
-    def get_effective_available_gpus(self) -> int:
-        return int(self._local(self._local_state.get_effective_available_gpus))
-
-    def ensure_gpus_available(
-        self,
-        needed_gpus: int,
-        timeout: float = 600,
-        *,
-        allow_evict_protected: bool = False,
-        exclude_actor_types: tuple[ActorType, ...] = (),
-    ) -> bool:
-        return bool(
-            self._local(
-                self._local_state.ensure_gpus_available,
-                int(needed_gpus),
-                timeout=float(timeout),
-                allow_evict_protected=allow_evict_protected,
-                exclude_actor_types=exclude_actor_types,
             )
         )
 
@@ -1143,7 +1001,7 @@ class ModelActorRegistry:
                 address = actor_info.get("Address", {})
                 return address.get("NodeID")
         except Exception as e:
-            logger.debug("[ModelActorRegistry] Could not get node_id: %s", e)
+            logger.debug("[ModelActorInventory] Could not get node_id: %s", e)
         return None
 
     def clear(self, kill_actors: bool = True) -> int:
@@ -1154,5 +1012,5 @@ class ModelActorRegistry:
 
 # Global singleton accessor
 
-def get_model_actor_registry() -> ModelActorRegistry:
-    return ModelActorRegistry()
+def get_model_actor_inventory() -> ModelActorInventory:
+    return ModelActorInventory()

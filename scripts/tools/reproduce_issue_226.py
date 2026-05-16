@@ -110,7 +110,7 @@ class _NamedActor:
 
 
 def _ssh_create_named_actor(actor: _NamedActor, *, block_s: int | None = None) -> None:
-    # Create a detached named actor in the server namespace, without registering it in ModelActorRegistry.
+    # Create a detached named actor in the server namespace, without registering it in ModelActorSupervisorInventory.
     # Optionally start a long-running task to force __ray_ready__ probes to time out.
     block_s_expr = "None" if block_s is None else str(int(block_s))
     code = f"""
@@ -203,7 +203,7 @@ def main() -> int:
 
     # -------------------------------------------------------------------------
     # Repro 1: /actors/kill should not fall back to Ray named-actor registry when
-    # ModelActorRegistry has no VLLM entries. Before the fix, the endpoint kills the
+    # ModelActorSupervisorInventory has no VLLM entries. Before the fix, the endpoint kills the
     # actor anyway (silent fallback). After the fix, it should surface the
     # mismatch as an error (409) rather than silently switching registries.
     # -------------------------------------------------------------------------
@@ -212,7 +212,7 @@ def main() -> int:
         _ssh_create_named_actor(named_only)
         _require(
             not _actors_by_name(named_only.name),
-            f"precondition_failed: {named_only.name} unexpectedly appears in ModelActorRegistry",
+            f"precondition_failed: {named_only.name} unexpectedly appears in ModelActorSupervisorInventory",
         )
 
         r = _post(

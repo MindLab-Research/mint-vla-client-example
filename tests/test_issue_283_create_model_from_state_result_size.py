@@ -199,7 +199,7 @@ def test_issue_283_create_model_from_state_background_uses_resolved_path(tmp_pat
     class StubTrainingEngine:
         def __init__(self) -> None:
             self.load_calls: list[dict] = []
-            self._model_actor_registry_actor_names = {}
+            self._model_actor_supervisor_actor_names = {}
 
         async def unbind_session(self, session) -> None:
             return None
@@ -290,7 +290,7 @@ def test_issue_417_create_model_from_state_persists_loaded_lora_config(
 
     class StubTrainingEngine:
         def __init__(self) -> None:
-            self._model_actor_registry_actor_names = {model_id: "megatron-actor-417"}
+            self._model_actor_supervisor_actor_names = {model_id: "megatron-actor-417"}
 
         async def create_training_session(self, session) -> None:
             return None
@@ -748,7 +748,7 @@ def test_issue_417_load_state_persists_loaded_lora_config(tmp_path: Path, monkey
 
     class StubTrainingEngine:
         def __init__(self) -> None:
-            self._model_actor_registry_actor_names = {"model-417": "megatron-actor-417"}
+            self._model_actor_supervisor_actor_names = {"model-417": "megatron-actor-417"}
 
         async def load_weights(self, session, load_path: str, load_optimizer: bool) -> None:
             assert load_path == str(checkpoint_dir)
@@ -880,7 +880,7 @@ def test_issue_417_load_state_reports_success_when_metadata_persist_fails_after_
             raise AssertionError(f"mark_persisted must not run after failed upsert: {model_id}")
 
     class StubTrainingEngine:
-        _model_actor_registry_actor_names = {"model-417-persist-fail": "megatron-actor-417"}
+        _model_actor_supervisor_actor_names = {"model-417-persist-fail": "megatron-actor-417"}
 
         async def load_weights(self, session, load_path: str, load_optimizer: bool) -> None:
             assert load_path == str(checkpoint_dir)

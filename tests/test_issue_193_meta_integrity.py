@@ -16,7 +16,7 @@ def test_issue_193_load_weights_invalid_meta_warns_without_pollution(monkeypatch
     model_id = "model_issue_193_invalid_meta_load"
     worker = _FakeLoadWorker(ref="invalid-meta-load-ref")
     engine._workers[model_id] = worker
-    engine._model_actor_registry_actor_names[model_id] = "shared-actor"
+    engine._model_actor_supervisor_actor_names[model_id] = "shared-actor"
     monkeypatch.setattr(engine, "_get_live_worker", lambda *args, **kwargs: asyncio.sleep(0, result=worker))
 
     session = TrainingSession(
@@ -56,7 +56,7 @@ def test_issue_193_megatron_load_weights_invalid_meta_fails_loud(monkeypatch):
     model_id = "model_issue_193_invalid_meta_megatron_load"
     worker = _FakeLoadWorker(ref="invalid-meta-megatron-load-ref")
     engine._workers[model_id] = worker
-    engine._model_actor_registry_actor_names[model_id] = "shared-megatron-actor"
+    engine._model_actor_supervisor_actor_names[model_id] = "shared-megatron-actor"
     monkeypatch.setattr(engine, "_get_live_worker", lambda *args, **kwargs: asyncio.sleep(0, result=worker))
 
     session = TrainingSession(
@@ -120,7 +120,7 @@ def test_issue_193_megatron_create_training_session_waits_for_ready_probe(monkey
         lambda **kwargs: asyncio.sleep(0, result=worker),
     )
     monkeypatch.setattr(
-        "tinker_server.backend.model_actor_registry.get_model_actor_registry",
+        "tinker_server.backend.model_actor_supervisor.get_model_actor_supervisor",
         lambda: SimpleNamespace(
             touch=lambda *_args, **_kwargs: None,
             set_session=lambda *_args, **_kwargs: None,

@@ -92,7 +92,7 @@ model_max_loras = 1 if config.is_moe else self.max_loras
 #### Implemented
 
 - ModelActorSupervisor and ModelWorkScheduler coordination for runtime placement
-- Process-local ModelActorRegistry inventory for actor tracking
+- Process-local ModelActorSupervisorInventory inventory for actor tracking
 - Per-model TP/EP/DP configuration via `model_registry.py`
 - Actor registration and cleanup on server startup
 
@@ -134,7 +134,7 @@ Architectural design documents for internal reference:
 |----------|---------|
 | Training backend architecture | Megatron vs PEFT selection, param/grad offloading, session state management |
 | Inference backend architecture | vLLM actor lifecycle, multi-LoRA hot-swap, TP/EP constraints |
-| Resource orchestration | ModelActorSupervisor, ModelWorkScheduler, and ModelActorRegistry coordination |
+| Resource orchestration | ModelActorSupervisor, ModelWorkScheduler, and ModelActorSupervisorInventory coordination |
 | LoRA weight transfer | Megatron → PEFT → vLLM conversion pipeline, naming conventions |
 | API compatibility layer | Tinker API mapping, `train_step` vs separate calls, data format translation |
 
@@ -313,7 +313,7 @@ Key requirements:
 │                           MinT API Server                               │
 │                     (Tinker-Compatible REST API)                        │
 ├─────────────────────────────────────────────────────────────────────────┤
-│  ModelActorSupervisor / ModelWorkScheduler / ModelActorRegistry          │
+│  ModelActorSupervisor / ModelWorkScheduler / ModelActorSupervisorInventory          │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
 │  │ Global GPU tracking, cross-pool LRU eviction                    │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
