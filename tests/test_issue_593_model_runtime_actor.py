@@ -963,7 +963,7 @@ def test_issue_593_model_runtime_default_actor_name_is_stable() -> None:
 @pytest.mark.anyio
 async def test_issue_593_default_executor_initializes_execution_bindings(monkeypatch) -> None:
     import tinker_server.backend.model_runtime_actor as runtime_module
-    import tinker_server.backend.api_work_queue_dispatch as dispatch_module
+    import tinker_server.backend.model_work_dispatch as dispatch_module
 
     calls: list[str] = []
 
@@ -971,15 +971,15 @@ async def test_issue_593_default_executor_initializes_execution_bindings(monkeyp
         calls.append("init")
         return {"inference_manager": object()}
 
-    async def _execute_work_item(item):
+    async def _execute_work_item(item, **_kwargs):
         calls.append(f"execute:{item.op}")
 
     monkeypatch.setattr(runtime_module, "_EXECUTION_BINDINGS", None)
     monkeypatch.setattr(
-        "tinker_server.backend.queue_execution_runtime._initialize_execution_bindings",
+        "tinker_server.backend.execution_bindings.initialize_execution_bindings",
         _initialize_execution_bindings,
     )
-    monkeypatch.setattr(dispatch_module, "execute_work_item", _execute_work_item)
+    monkeypatch.setattr(dispatch_module, "execute_model_work_item", _execute_work_item)
 
     await _default_executor(_lease())
     await _default_executor(_lease("runtime-req-2"))
@@ -990,7 +990,7 @@ async def test_issue_593_default_executor_initializes_execution_bindings(monkeyp
 @pytest.mark.anyio
 async def test_issue_616_default_executor_accepts_non_sampling_ops(monkeypatch) -> None:
     import tinker_server.backend.model_runtime_actor as runtime_module
-    import tinker_server.backend.api_work_queue_dispatch as dispatch_module
+    import tinker_server.backend.model_work_dispatch as dispatch_module
 
     calls: list[str] = []
     lease = _lease("runtime-training-req")
@@ -1000,15 +1000,15 @@ async def test_issue_616_default_executor_accepts_non_sampling_ops(monkeypatch) 
         calls.append("init")
         return {"train_manager": object()}
 
-    async def _execute_work_item(item):
+    async def _execute_work_item(item, **_kwargs):
         calls.append(f"execute:{item.op}")
 
     monkeypatch.setattr(runtime_module, "_EXECUTION_BINDINGS", None)
     monkeypatch.setattr(
-        "tinker_server.backend.queue_execution_runtime._initialize_execution_bindings",
+        "tinker_server.backend.execution_bindings.initialize_execution_bindings",
         _initialize_execution_bindings,
     )
-    monkeypatch.setattr(dispatch_module, "execute_work_item", _execute_work_item)
+    monkeypatch.setattr(dispatch_module, "execute_model_work_item", _execute_work_item)
 
     await _default_executor(lease)
 

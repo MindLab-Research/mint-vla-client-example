@@ -7,6 +7,7 @@ import re
 import time
 import traceback
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
 
 from ..config import PFS_PYTHONPATH, actor_runtime_env_vars, apply_detached_actor_resources, otel_env_vars
@@ -160,11 +161,10 @@ async def _default_executor(lease: dict[str, Any]) -> None:
     if not isinstance(item, dict):
         raise RuntimeError(f"model work lease missing item: {lease!r}")
     op = str(item.get("op") or "")
-    from .api_work_queue_dispatch import execute_work_item
-    from .api_work_queue import WorkItem
+    from .model_work_dispatch import execute_model_work_item
 
-    await execute_work_item(
-        WorkItem(
+    await execute_model_work_item(
+        SimpleNamespace(
             request_id=str(item["request_id"]),
             op=op,
             request_json=bytes(item.get("request_json") or b""),
@@ -178,7 +178,8 @@ async def _default_executor(lease: dict[str, Any]) -> None:
             webhook_url=None if item.get("webhook_url") is None else str(item.get("webhook_url")),
             extra=dict(item.get("extra") or {}),
             created_at=float(item.get("created_at") or time.time()),
-        )
+        ),
+        component="model_runtime_actor",
     )
 
 
@@ -186,9 +187,9 @@ async def _ensure_execution_bindings() -> dict[str, Any]:
     global _EXECUTION_BINDINGS
     if _EXECUTION_BINDINGS is not None:
         return _EXECUTION_BINDINGS
-    from .queue_execution_runtime import _initialize_execution_bindings
+    from .execution_bindings import initialize_execution_bindings
 
-    _EXECUTION_BINDINGS = await _initialize_execution_bindings()
+    _EXECUTION_BINDINGS = await initialize_execution_bindings()
     return _EXECUTION_BINDINGS
 
 
