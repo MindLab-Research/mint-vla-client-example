@@ -4,20 +4,19 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_dev_volcano_env_pins_runtime_paths_for_dev_host() -> None:
+def test_dev_volcano_env_sources_external_config() -> None:
     text = (REPO_ROOT / "configs" / "dev_volcano.env.sh").read_text()
 
-    assert "export PFS_RUNTIME_ENV_ROOT=" in text
-    assert "export PFS_TINKER_PATH=" in text
-    assert "export MINT_VLLM_CHILD_PYTHON_EXECUTABLE=" in text
-    assert 'export MINT_TMP_ROOT="${MINT_TMP_ROOT:-/vePFS-Mindverse/share/mint-data/dev}"' in text
-    assert "export TINKER_RUNTIME_CHECKPOINT_DIR=" in text
+    assert 'mint_dev_config_env="${MINT_DEV_CONFIG_ENV:-/share/mint/dev/config/common.env}"' in text
+    assert '. "${mint_dev_config_env}"' in text
 
 
 def test_start_dev_server_script_sources_env_and_uses_runtime_python() -> None:
     text = (REPO_ROOT / "scripts" / "start_dev_server.sh").read_text()
 
-    assert ". ./configs/dev_volcano.env.sh" in text
+    assert 'dev_config_env="${MINT_DEV_CONFIG_ENV:-/share/mint/dev/config/common.env}"' in text
+    assert '. "${dev_config_env}"' in text
+    assert 'dev_secrets_env="${MINT_DEV_SECRETS_ENV:-/share/mint/dev/config/secrets.env}"' in text
     assert 'api_tmp_root="${MINT_TMP_ROOT}/api/${USER:-unknown}"' in text
     assert 'api_tmp_link="/tmp/mda"' in text
     assert 'export TMPDIR="${api_tmp_link}/t"' in text
@@ -29,19 +28,20 @@ def test_start_dev_server_script_sources_env_and_uses_runtime_python() -> None:
     assert 'exec "${PFS_RUNTIME_ENV_ROOT}/host-venv/bin/python" scripts/run_server.py' in text
 
 
-def test_prod_volcano_env_pins_runtime_paths_for_prod_host() -> None:
+def test_prod_volcano_env_sources_external_config() -> None:
     text = (REPO_ROOT / "configs" / "prod_volcano.env.sh").read_text()
 
-    assert 'zai-org/GLM-5.1' in text
-    assert 'export TINKER_GATEWAY_GLM51_BASE_URL="http://123.57.26.97:18000"' in text
-    assert 'export MINT_TMP_ROOT="${MINT_TMP_ROOT:-/vePFS-Mindverse/share/mint-data/prod}"' in text
-    assert "export TINKER_RUNTIME_CHECKPOINT_DIR=" in text
+    assert 'mint_prod_config_env="${MINT_PROD_CONFIG_ENV:-/share/mint/prod/config/prod.env}"' in text
+    assert '. "${mint_prod_config_env}"' in text
 
 
 def test_start_prod_server_script_uses_tmp_root_shortlink() -> None:
     text = (REPO_ROOT / "scripts" / "start_prod_server.sh").read_text()
 
-    assert '. ./configs/prod_volcano.env.sh' in text
+    assert 'prod_config_env="${MINT_PROD_CONFIG_ENV:-/share/mint/prod/config/prod.env}"' in text
+    assert '. "${prod_config_env}"' in text
+    assert 'prod_secrets_env="${MINT_PROD_SECRETS_ENV:-/share/mint/prod/config/secrets.env}"' in text
+    assert '. "${prod_secrets_env}"' in text
     assert 'if [ -n "${TINKER_GATEWAY_GLM51_BASE_URL:-}" ]; then' in text
     assert 'missing TINKER_API_KEY for GLM5.1 static gateway auth' in text
     assert 'model_to_upstream[model] = alias' in text

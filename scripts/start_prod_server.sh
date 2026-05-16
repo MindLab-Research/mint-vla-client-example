@@ -5,8 +5,18 @@ repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo_root"
 
 set -a
-. ./configs/prod_volcano.env.sh
-. ./.secrets.env
+prod_config_env="${MINT_PROD_CONFIG_ENV:-/share/mint/prod/config/prod.env}"
+if [ ! -r "${prod_config_env}" ]; then
+  echo "missing prod config: ${prod_config_env}" >&2
+  exit 1
+fi
+. "${prod_config_env}"
+prod_secrets_env="${MINT_PROD_SECRETS_ENV:-/share/mint/prod/config/secrets.env}"
+if [ ! -r "${prod_secrets_env}" ]; then
+  echo "missing prod secrets: ${prod_secrets_env}" >&2
+  exit 1
+fi
+. "${prod_secrets_env}"
 set +a
 
 if [ -n "${TINKER_GATEWAY_GLM51_BASE_URL:-}" ]; then

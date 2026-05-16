@@ -5,7 +5,16 @@ repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo_root"
 
 set -a
-. ./configs/dev_volcano.env.sh
+dev_config_env="${MINT_DEV_CONFIG_ENV:-/share/mint/dev/config/common.env}"
+if [ ! -r "${dev_config_env}" ]; then
+  echo "missing dev config: ${dev_config_env}" >&2
+  exit 1
+fi
+. "${dev_config_env}"
+dev_secrets_env="${MINT_DEV_SECRETS_ENV:-/share/mint/dev/config/secrets.env}"
+if [ -r "${dev_secrets_env}" ]; then
+  . "${dev_secrets_env}"
+fi
 set +a
 
 api_tmp_root="${MINT_TMP_ROOT}/api/${USER:-unknown}"

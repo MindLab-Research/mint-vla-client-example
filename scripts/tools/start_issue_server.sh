@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# Start one isolated mint-dev issue server from the checked-in dev template.
+# Start one isolated mint-dev issue server from the shared dev config template.
 # This script is meant to run on the mint-dev host after the issue worktree has
 # been synced to PFS. It uses the existing local queue-runtime mode so training
 # route globals are bound in the API process while the actual model work still
@@ -16,7 +16,12 @@ _INPUT_MINT_RAY_PY_MODULES_CSV="${MINT_RAY_PY_MODULES_CSV:-}"
 _INPUT_MINT_VLLM_CHILD_PYTHON_EXECUTABLE="${MINT_VLLM_CHILD_PYTHON_EXECUTABLE:-}"
 
 cd "${ISSUE_SERVER_ROOT}"
-. ./configs/dev_volcano.env.sh
+dev_config_env="${MINT_DEV_CONFIG_ENV:-/share/mint/dev/config/common.env}"
+if [[ ! -r "${dev_config_env}" ]]; then
+  echo "missing dev config: ${dev_config_env}" >&2
+  exit 1
+fi
+. "${dev_config_env}"
 
 export RAY_ADDRESS="${_INPUT_RAY_ADDRESS:-${RAY_ADDRESS:-}}"
 export MINT_RAY_CLIENT_ADDRESS="${_INPUT_MINT_RAY_CLIENT_ADDRESS:-${MINT_RAY_CLIENT_ADDRESS:-${RAY_ADDRESS}}}"
@@ -103,4 +108,4 @@ if [[ "${ISSUE_STARTUP_PRINT_ENV:-0}" == "1" ]]; then
   exit 0
 fi
 
-exec /vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python scripts/run_server.py
+exec "${PFS_RUNTIME_ENV_ROOT}/host-venv/bin/python" scripts/run_server.py

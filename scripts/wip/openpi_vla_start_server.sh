@@ -26,10 +26,11 @@ CONTROL_PLANE_IP="${MINT_VLA_CONTROL_PLANE_IP:-192.168.39.87}"
 OPENPI_CHECKPOINT_BASE_DIR="${MINT_VLA_OPENPI_CHECKPOINT_BASE_DIR:-$CODE_ROOT/checkpoints}"
 OPENPI_XLA_CACHE_DIR="${MINT_VLA_OPENPI_XLA_CACHE_DIR:-$CODE_ROOT/results/xla_autotune_cache}"
 OPENPI_XLA_FLAGS_DEFAULT="--xla_gpu_per_fusion_autotune_cache_dir=${OPENPI_XLA_CACHE_DIR} --xla_gpu_exclude_nondeterministic_ops"
+BASE_CONFIG_ENV="${MINT_VLA_BASE_CONFIG_ENV:-/share/mint/prod/config/prod.env}"
 
 for required_path in \
   "$CODE_ROOT" \
-  "$CODE_ROOT/configs/prod_volcano.env.sh" \
+  "$BASE_CONFIG_ENV" \
   "$CODE_ROOT/scripts/run_server.py" \
   "$RUNTIME_ROOT/host-venv/bin/python" \
   "$CODE_ROOT/scripts/vllm_worker_python.py"
@@ -41,7 +42,7 @@ do
 done
 
 cd "$CODE_ROOT"
-. ./configs/prod_volcano.env.sh
+. "$BASE_CONFIG_ENV"
 
 for required_path in \
   "$FAST_WEIGHTS_PATH" \
