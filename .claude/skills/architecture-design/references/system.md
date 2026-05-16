@@ -29,6 +29,7 @@ Control-plane detached actors:
 
 Implications:
 - A server restart loses in-process mappings (live session registries, engine bindings, LoRA id mappings), but detached actors may still exist and hold GPU memory.
+- `TaskStateStore` owns durable task state and active indexes. `ModelWorkScheduler` and `ModelActorSupervisor` derive in-memory projections from that state and from current config; they do not own a second durable queue/index.
 - Some REST-visible metadata survives restart in detached control-plane stores even though the live engine/session objects do not.
 - Startup reconciliation is required to rediscover or kill these actors (`tinker_server/app.py:_cleanup_stale_actors`).
 - Changes to actor code require recreating the actor. Detached actors do not hot-reload.

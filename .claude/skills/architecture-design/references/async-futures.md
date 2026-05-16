@@ -11,7 +11,7 @@ Implementation: `tinker_server/routes/futures.py` backed by `TaskStateFutures` i
 - HTTP 200 with result payload: `DONE`
 - HTTP 404: unknown `request_id` (server has forgotten it)
 
-Important detail: `TaskStateStore` is the single durable index for terminal futures. After returning `DONE` or `FAILED`, the server marks the `request_id` as `RETRIEVED` while retaining terminal metadata and payload pointers. A second `retrieve_future` is served idempotently from `TaskStateStore` when the payload or error is still retained; if the payload has been removed but the terminal task record remains, the route returns `{"error": "Known terminal future evicted", ...}` rather than treating the request as unknown.
+Important detail: `TaskStateStore` is the single durable source of truth for task state, result metadata, and terminal future indexes. After returning `DONE` or `FAILED`, the server marks the `request_id` as `RETRIEVED` while retaining terminal metadata and payload pointers. A second `retrieve_future` is served idempotently from `TaskStateStore` when the payload or error is still retained; if the payload has been removed but the terminal task record remains, the route returns `{"error": "Known terminal future evicted", ...}` rather than treating the request as unknown.
 
 ## Why futures exist in Mint
 
@@ -25,7 +25,7 @@ The facade preserves the old Tinker future methods (`async_resolve`, `async_fail
 
 There is no separate future replay index. Retrieve hot-cache entries are process-local accelerators only; restart recovery, terminal replay, and payload-evicted detection all use `TaskStateStore`.
 
-`TaskStateStore` uses active-task indexes (`pending`, `queued`, `assigned`, `leased`, `running`, `finalizing`) for scheduler hydration and metadata-based failure/cleanup. Full table scans are not part of the hot path.
+`TaskStateStore` uses its SQLite-backed active-task indexes (`pending`, `queued`, `assigned`, `leased`, `running`, `finalizing`) for scheduler hydration, retrieve projection, and metadata-based failure/cleanup. `ModelWorkScheduler` must rebuild its in-memory projection from those indexes on startup; it is not a second durable indexer. Full table scans are not part of the hot path.
 
 ## Admission and scheduling
 
@@ -33,6 +33,7 @@ Async endpoints that require model-runtime scheduling go through `ModelWorkSched
 - API routes first create or ensure the task in `TaskStateStore` via `TaskStateFutures`.
 - The route appends a `ModelWorkItem` to the detached `ModelWorkScheduler` actor (`mint_model_work_scheduler` by default).
 - `ModelWorkScheduler` keeps the hot domain backlog, per-replica subqueues, leases, and fairness state in memory.
+- `ModelActorSupervisor` observes active scheduler domains and reconciles the matching desired runtime actors from config and placement JSON. A queued training domain can therefore create the runtime needed to claim it.
 - Runtime actors claim from their scheduler-owned subqueue. Claiming is independent of `retrieve_future`; result polling reads `TaskStateStore`.
 - For scheduler leases with `attempt_id` and `scheduler_epoch`, `ModelRuntimeActor` owns terminal commit to `TaskStateStore` and lease completion/failure. Route-level `_do_*` functions may still use `TaskStateFutures.async_resolve/async_fail` as an executor-local completion signal, but those calls are buffered while running under a model-work execution context and do not write terminal state directly.
 

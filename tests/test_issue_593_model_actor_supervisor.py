@@ -137,10 +137,11 @@ async def test_issue_593_supervisor_creates_replica_and_syncs_scheduler() -> Non
 async def test_issue_593_supervisor_projects_scheduler_backlog_to_desired_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("MINT_SUPPORTED_MODELS", "Qwen/A")
+    base_model = "Qwen/Qwen3-0.6B"
+    monkeypatch.setenv("MINT_SUPPORTED_MODELS", base_model)
     monkeypatch.setenv(
         "MINT_DENSE_MODEL_PLACEMENT_JSON",
-        '{"Qwen/A":{"replica":0,"node_ip":"10.0.0.8","gpu_count":1}}',
+        f'{{"{base_model}":{{"replica":0,"node_ip":"10.0.0.8","gpu_count":1}}}}',
     )
     created: list[_FakeRuntimeActor] = []
     synced: list[list[dict]] = []
@@ -157,14 +158,18 @@ async def test_issue_593_supervisor_projects_scheduler_backlog_to_desired_runtim
 
     async def _scheduler_stats():
         return {
-            "backlog_depth_by_domain": {domain_key_for_training_base_model("Qwen/A"): 1},
+            "backlog_depth_by_domain": {domain_key_for_training_base_model(base_model): 1},
             "replica_queues": {},
             "leases": [],
         }
 
+    async def _placement_reconciler(_desired):
+        return {"ok": True, "blocked": {}}
+
     supervisor = ModelActorSupervisor(
         runtime_factory=_factory,
         scheduler_stats=_scheduler_stats,
+        placement_reconciler=_placement_reconciler,
         scheduler_sync=lambda registrations: synced.append(
             [registration.to_dict() for registration in registrations]
         ),
@@ -172,11 +177,11 @@ async def test_issue_593_supervisor_projects_scheduler_backlog_to_desired_runtim
 
     out = await supervisor.reconcile_once()
 
-    domain_key = domain_key_for_training_base_model("Qwen/A")
+    domain_key = domain_key_for_training_base_model(base_model)
     label = f"{domain_key}::replica-0"
     assert len(created) == 1
     assert created[0].domain_key == domain_key
-    assert out["snapshot"]["replicas"][label]["base_model"] == "Qwen/A"
+    assert out["snapshot"]["replicas"][label]["base_model"] == base_model
     assert out["snapshot"]["replicas"][label]["node_pins"] == ["10.0.0.8"]
     assert synced[-1][0]["domain_key"] == domain_key
     assert synced[-1][0]["status"] == "healthy"
