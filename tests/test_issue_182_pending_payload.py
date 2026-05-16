@@ -347,7 +347,7 @@ def test_issue_182_non_sampling_status_is_generic(monkeypatch):
     assert payload.get("status") == "running"
 
 
-def test_issue_182_done_result_cleans_future_without_capacity_release(monkeypatch):
+def test_issue_182_done_result_cleans_future_without_scheduler_release(monkeypatch):
     store = _StubTaskStateFutures({}, status=FutureStatus.DONE, result={"ok": True})
     monkeypatch.setattr(futures_route, "task_state_futures", store)
 

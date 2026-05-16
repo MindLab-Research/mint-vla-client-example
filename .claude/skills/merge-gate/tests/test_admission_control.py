@@ -198,13 +198,12 @@ class TestAdmissionControl:
         rss_actors_before = _require_rss_payload(stats_before)
         rss_pool_before = _rss_snapshot(rss_actors_before)
         report_data["rss_pool_before"] = rss_pool_before
-        cap_before = stats_before.get("capacity") or {}
-        if not isinstance(cap_before, dict) or "error" in cap_before:
-            raise AssertionError(f"capacity snapshot unavailable: {cap_before!r}")
-        queue_before = int(cap_before.get("queue_bytes_reserved", -1))
-        obj_before = int(cap_before.get("object_store_bytes_reserved", -1))
-        if queue_before < 0 or obj_before < 0:
-            raise AssertionError(f"invalid capacity snapshot: {cap_before!r}")
+        scheduler_before = stats_before.get("model_work_scheduler") or {}
+        if not isinstance(scheduler_before, dict) or "error" in scheduler_before:
+            raise AssertionError(f"model_work_scheduler snapshot unavailable: {scheduler_before!r}")
+        scheduler_depth_before = int(scheduler_before.get("depth", -1))
+        if scheduler_depth_before < 0:
+            raise AssertionError(f"invalid model_work_scheduler snapshot: {scheduler_before!r}")
 
         proc_before = stats_before.get("process") or {}
         if not isinstance(proc_before, dict):
@@ -276,7 +275,7 @@ class TestAdmissionControl:
                 f"status counts={counts}"
             )
 
-        # 3) Drain outstanding requests so we can assert no reservation leaks.
+        # 3) Drain outstanding requests so we can assert no scheduler backlog leaks.
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
             list(ex.map(lambda rid: poll_future(rid, timeout=600), ok_request_ids))
 
@@ -294,13 +293,16 @@ class TestAdmissionControl:
             max_delta = max(max_delta, after - int(before))
         assert max_delta < 512 * 1024 * 1024, f"Ray actor RSS grew too much under flood: max_delta={max_delta}"
 
-        cap_after = stats_after.get("capacity") or {}
-        if not isinstance(cap_after, dict) or "error" in cap_after:
-            raise AssertionError(f"capacity snapshot unavailable after drain: {cap_after!r}")
-        queue_after = int(cap_after.get("queue_bytes_reserved", -1))
-        obj_after = int(cap_after.get("object_store_bytes_reserved", -1))
-        assert queue_after == queue_before, f"queue_bytes_reserved leaked: {queue_before} -> {queue_after}"
-        assert obj_after == obj_before, f"object_store_bytes_reserved leaked: {obj_before} -> {obj_after}"
+        scheduler_after = stats_after.get("model_work_scheduler") or {}
+        if not isinstance(scheduler_after, dict) or "error" in scheduler_after:
+            raise AssertionError(f"model_work_scheduler snapshot unavailable after drain: {scheduler_after!r}")
+        scheduler_depth_after = int(scheduler_after.get("depth", -1))
+        if scheduler_depth_after < 0:
+            raise AssertionError(f"invalid model_work_scheduler snapshot after drain: {scheduler_after!r}")
+        assert scheduler_depth_after <= scheduler_depth_before, (
+            "model_work_scheduler depth leaked after drain: "
+            f"{scheduler_depth_before} -> {scheduler_depth_after}"
+        )
 
         proc_after = stats_after.get("process") or {}
         if not isinstance(proc_after, dict):
