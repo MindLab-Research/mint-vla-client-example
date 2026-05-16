@@ -397,8 +397,10 @@ curl -X POST http://localhost:8000/api/v1/kill_vllm
 # Kill vLLM (prod - admin only when auth is enabled)
 curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_vllm
 
-# Kill all actors (dev; admin only when auth is enabled)
-curl -X POST http://localhost:8000/api/v1/kill_all_actors
+# Kill all tracked GPU actors (dev; admin only when auth is enabled)
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"actor_type":"all"}' \
+  http://localhost:8000/api/v1/actors/kill
 
 # Check status
 curl -s http://localhost:8000/api/v1/megatron_status | jq

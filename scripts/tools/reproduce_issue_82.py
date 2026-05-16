@@ -144,7 +144,7 @@ def _expected_gpus() -> int:
     )
 
 
-def _try_kill_all_actors() -> None:
+def _try_kill_all_tracked_gpu_actors() -> None:
     try:
         _post_json("/api/v1/actors/kill", {"actor_type": "all"}, timeout_s=30.0)
     except Exception:
@@ -160,7 +160,7 @@ def main() -> int:
         if expected_gpus <= 0:
             return _fail(f"unexpected expected_gpus={expected_gpus} for model={MODEL!r}")
 
-        _try_kill_all_actors()
+        _try_kill_all_tracked_gpu_actors()
 
         session = _post_json(
             "/api/v1/create_session",

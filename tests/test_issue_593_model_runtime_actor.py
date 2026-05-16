@@ -11,14 +11,12 @@ from tinker_server.backend.model_runtime_actor import (
     default_model_runtime_actor_name,
     get_or_create_model_runtime_actor,
 )
-from tinker_server.backend.queue_execution_context import (
+from tinker_server.backend.model_work_execution_context import (
     ModelWorkFinalize,
     get_current_model_work_consumer_generation,
     get_current_model_work_consumer_id,
     get_current_model_work_finalize_buffer,
     get_current_model_work_lease_id,
-    get_current_queue_consumer_id,
-    get_current_queue_generation_id,
 )
 from tinker_server.backend.task_payload_store import TaskPayloadStore
 
@@ -197,13 +195,11 @@ async def test_issue_593_model_runtime_claims_executes_renews_and_completes() ->
     lease = _lease()
     scheduler = _FakeScheduler(claims=[[lease]])
     task_state_futures = _FakeTaskStateFutures(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
-    seen_context: list[tuple[str | None, int | None, str | None, str | None, int | None]] = []
+    seen_context: list[tuple[str | None, str | None, int | None]] = []
 
     async def _executor(_lease: dict) -> None:
         seen_context.append(
             (
-                get_current_queue_consumer_id(),
-                get_current_queue_generation_id(),
                 get_current_model_work_lease_id(),
                 get_current_model_work_consumer_id(),
                 get_current_model_work_consumer_generation(),
@@ -238,15 +234,7 @@ async def test_issue_593_model_runtime_claims_executes_renews_and_completes() ->
         }
     ]
     assert scheduler.assigned == [{"max_items": 1}]
-    assert seen_context == [
-        (
-            None,
-            None,
-            lease["lease_id"],
-            "vllm:model-a::replica-0::generation::3",
-            3,
-        )
-    ]
+    assert seen_context == [(lease["lease_id"], "vllm:model-a::replica-0::generation::3", 3)]
     assert task_state_futures.running[0][0] == lease["item"]["request_id"]
     assert task_state_futures.running[0][1]["domain_key"] == "vllm:model-a"
     assert task_state_futures.running[0][1]["replica_id"] == "replica-0"

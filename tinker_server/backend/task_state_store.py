@@ -13,7 +13,7 @@ from typing import Any, Iterator
 
 from ..config import PFS_PYTHONPATH, actor_runtime_env, config as server_config, otel_env_vars
 from .async_ray_control import async_get_ray_ref, sync_get_ray_ref
-from .queue_execution_context import ModelWorkFinalize, get_current_model_work_finalize_buffer
+from .model_work_execution_context import ModelWorkFinalize, get_current_model_work_finalize_buffer
 
 
 ACTIVE_TASK_STATUSES = frozenset({"pending", "queued", "running", "assigned", "leased", "finalizing"})

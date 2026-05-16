@@ -260,7 +260,7 @@ def _delete_model(*, base_url: str, headers: dict[str, str], model_id: str, time
 
 def _safe_queue_debug(base_url: str, headers: dict[str, str]) -> dict[str, Any]:
     try:
-        r = requests.get(f"{base_url}/internal/work_queue/debug_state", headers=headers, timeout=20)
+        r = requests.get(f"{base_url}/internal/model_work_scheduler/debug_state", headers=headers, timeout=20)
         if r.ok:
             d = r.json()
             if isinstance(d, dict):
@@ -896,7 +896,6 @@ def _draw_compare_svg(
         if not data:
             return []
         xs = [p[0] for p in data]
-        ys = [p[1] for p in data]
         xmin, xmax = min(xs), max(xs)
         if abs(xmax - xmin) < 1e-9:
             xmax = xmin + 1.0

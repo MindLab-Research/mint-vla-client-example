@@ -21,7 +21,7 @@ from ..logging_context import (
 from .async_ray_control import sync_get_ray_ref
 from .model_actor_supervisor import consumer_id_for_replica, queue_id_for_replica
 from .model_work_scheduler import ModelWorkSchedulerClient, model_work_scheduler
-from .queue_execution_context import ModelWorkFinalizeBuffer, model_work_execution_context
+from .model_work_execution_context import ModelWorkFinalizeBuffer, model_work_execution_context
 from .task_payload_store import TaskPayloadStore
 from .task_state_store import FutureStatus, task_state_futures, task_state_store
 

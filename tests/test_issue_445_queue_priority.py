@@ -140,7 +140,7 @@ async def test_issue_445_internal_noop_enqueues_normalized_priority(monkeypatch)
 
     http_request = _DummyRequest(headers={"X-MinT-Priority": "9"})
 
-    await internal_route.work_queue_noop(cast(Request, http_request))
+    await internal_route.model_work_scheduler_noop(cast(Request, http_request))
 
     assert scheduler.calls
     assert scheduler.calls[0]["extra"]["queue_priority"] == 2

@@ -2,13 +2,13 @@
 """Issue 432 local mixed-load harness.
 
 Purpose:
-- generate sustained local legacy FIFO pressure with `/internal/work_queue/noop`
+- generate sustained local scheduler noop pressure with `/internal/model_work_scheduler/noop`
 - generate scheduled local training pressure with `training.forward_backward`
 - capture the Gate 5 artifacts needed to explain global arbitration decisions
 
 This script keeps scope tight to issue432. It does not try to reproduce the
-production incident byte-for-byte. It isolates the local legacy-vs-scheduled
-arbiter with deterministic inputs and captures the required debug evidence.
+production incident byte-for-byte. It isolates local scheduler arbitration with
+deterministic inputs and captures the required debug evidence.
 """
 
 from __future__ import annotations
@@ -82,17 +82,17 @@ class LegacyController:
 
     def _submit_noop(self, session: requests.Session) -> str:
         r = session.post(
-            f"{self.cfg.base_url}/internal/work_queue/noop",
+            f"{self.cfg.base_url}/internal/model_work_scheduler/noop",
             headers=self.cfg.headers,
             timeout=min(self.cfg.timeout_s, 30.0),
         )
         r.raise_for_status()
         data = r.json()
         if not isinstance(data, dict):
-            raise TypeError(f"/internal/work_queue/noop returned non-dict: {type(data)}")
+            raise TypeError(f"/internal/model_work_scheduler/noop returned non-dict: {type(data)}")
         request_id = data.get("request_id")
         if not isinstance(request_id, str) or not request_id:
-            raise RuntimeError(f"/internal/work_queue/noop missing request_id: {data}")
+            raise RuntimeError(f"/internal/model_work_scheduler/noop missing request_id: {data}")
         return request_id
 
     def _poll_once(self, session: requests.Session, request_id: str) -> tuple[str, dict[str, Any] | None]:
@@ -233,7 +233,7 @@ class SnapshotSampler:
         try:
             debug = _get_json(
                 session,
-                f"{self.cfg.base_url}/internal/work_queue/debug_state",
+                f"{self.cfg.base_url}/internal/model_work_scheduler/debug_state",
                 headers=self.cfg.headers,
                 timeout_s=self.cfg.timeout_s,
             )
@@ -291,17 +291,17 @@ class SnapshotSampler:
                 self.seen_enqueues.add(key)
                 _append_jsonl(self.out_path, {"kind": "recent_enqueue", "captured_at": _now_iso(), "record": rec})
 
-        work_queue = admission.get("work_queue") if isinstance(admission, dict) else {}
+        scheduler_stats = admission.get("model_work_scheduler") if isinstance(admission, dict) else {}
         _append_jsonl(
             self.out_path,
             {
                 "kind": "snapshot",
                 "ts": _now_iso(),
                 "sample_ts": sample_ts,
-                "depth": work_queue.get("depth") if isinstance(work_queue, dict) else None,
-                "scheduler_arbitration_total": work_queue.get("scheduler_arbitration_total") if isinstance(work_queue, dict) else None,
-                "scheduler_arbitration_by_winner": work_queue.get("scheduler_arbitration_by_winner") if isinstance(work_queue, dict) else None,
-                "scheduler_arbitration_by_reason": work_queue.get("scheduler_arbitration_by_reason") if isinstance(work_queue, dict) else None,
+                "depth": scheduler_stats.get("depth") if isinstance(scheduler_stats, dict) else None,
+                "scheduler_arbitration_total": scheduler_stats.get("scheduler_arbitration_total") if isinstance(scheduler_stats, dict) else None,
+                "scheduler_arbitration_by_winner": scheduler_stats.get("scheduler_arbitration_by_winner") if isinstance(scheduler_stats, dict) else None,
+                "scheduler_arbitration_by_reason": scheduler_stats.get("scheduler_arbitration_by_reason") if isinstance(scheduler_stats, dict) else None,
                 "scheduler_legacy_streak": scheduler.get("legacy_streak") if isinstance(scheduler, dict) else None,
                 "scheduler_domains": domains,
                 "debug_stats": stats,
@@ -738,8 +738,8 @@ def _build_summary(
         except statistics.StatisticsError:
             target_domain = scheduled_domains[0]
 
-    before_wq = before_admission.get("work_queue") if isinstance(before_admission, dict) else {}
-    after_wq = after_admission.get("work_queue") if isinstance(after_admission, dict) else {}
+    before_scheduler_stats = before_admission.get("model_work_scheduler") if isinstance(before_admission, dict) else {}
+    after_scheduler_stats = after_admission.get("model_work_scheduler") if isinstance(after_admission, dict) else {}
     max_depth = None
     max_legacy_streak = None
     for row in sample_rows:
@@ -783,14 +783,14 @@ def _build_summary(
                 [float(rec["elapsed_s"]) for rec in legacy.records if isinstance(rec.get("elapsed_s"), (int, float))]
             ),
         },
-        "arbitration_delta_total": int((after_wq or {}).get("scheduler_arbitration_total", 0)) - int((before_wq or {}).get("scheduler_arbitration_total", 0)),
+        "arbitration_delta_total": int((after_scheduler_stats or {}).get("scheduler_arbitration_total", 0)) - int((before_scheduler_stats or {}).get("scheduler_arbitration_total", 0)),
         "arbitration_delta_by_winner": _dict_delta(
-            (after_wq or {}).get("scheduler_arbitration_by_winner", {}) if isinstance(after_wq, dict) else {},
-            (before_wq or {}).get("scheduler_arbitration_by_winner", {}) if isinstance(before_wq, dict) else {},
+            (after_scheduler_stats or {}).get("scheduler_arbitration_by_winner", {}) if isinstance(after_scheduler_stats, dict) else {},
+            (before_scheduler_stats or {}).get("scheduler_arbitration_by_winner", {}) if isinstance(before_scheduler_stats, dict) else {},
         ),
         "arbitration_delta_by_reason": _dict_delta(
-            (after_wq or {}).get("scheduler_arbitration_by_reason", {}) if isinstance(after_wq, dict) else {},
-            (before_wq or {}).get("scheduler_arbitration_by_reason", {}) if isinstance(before_wq, dict) else {},
+            (after_scheduler_stats or {}).get("scheduler_arbitration_by_reason", {}) if isinstance(after_scheduler_stats, dict) else {},
+            (before_scheduler_stats or {}).get("scheduler_arbitration_by_reason", {}) if isinstance(before_scheduler_stats, dict) else {},
         ),
         "max_sampled_depth": max_depth,
         "max_sampled_legacy_streak": max_legacy_streak,
@@ -903,7 +903,7 @@ def main() -> None:
                 session_infos.append({"session_id": session_id, "model_id": model_id})
 
             before_admission = _get_json(session, f"{cfg.base_url}/internal/admission_stats", headers=cfg.headers, timeout_s=cfg.timeout_s)
-            before_debug = _get_json(session, f"{cfg.base_url}/internal/work_queue/debug_state", headers=cfg.headers, timeout_s=cfg.timeout_s)
+            before_debug = _get_json(session, f"{cfg.base_url}/internal/model_work_scheduler/debug_state", headers=cfg.headers, timeout_s=cfg.timeout_s)
             before_metrics = _get_text(session, f"{cfg.base_url}/internal/metrics", headers=cfg.headers, timeout_s=cfg.timeout_s)
             _write_json(cfg.raw_dir / "before.admission.json", before_admission)
             _write_json(cfg.raw_dir / "before.debug.json", before_debug)
@@ -927,7 +927,7 @@ def main() -> None:
             sampler_thread.join(timeout=cfg.timeout_s)
 
             after_admission = _get_json(session, f"{cfg.base_url}/internal/admission_stats", headers=cfg.headers, timeout_s=cfg.timeout_s)
-            after_debug = _get_json(session, f"{cfg.base_url}/internal/work_queue/debug_state", headers=cfg.headers, timeout_s=cfg.timeout_s)
+            after_debug = _get_json(session, f"{cfg.base_url}/internal/model_work_scheduler/debug_state", headers=cfg.headers, timeout_s=cfg.timeout_s)
             after_metrics = _get_text(session, f"{cfg.base_url}/internal/metrics", headers=cfg.headers, timeout_s=cfg.timeout_s)
             _write_json(cfg.raw_dir / "after.admission.json", after_admission)
             _write_json(cfg.raw_dir / "after.debug.json", after_debug)

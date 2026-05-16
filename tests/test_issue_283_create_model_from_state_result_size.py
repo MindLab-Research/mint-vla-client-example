@@ -72,48 +72,6 @@ def test_issue_283_create_model_from_state_queues_resolved_checkpoint_path_witho
         encoding="utf-8",
     )
 
-    class StubUnusedAdmission:
-        def __init__(self) -> None:
-            self.calls: list[dict] = []
-
-        async def async_unused_reserve(self, request_id: str, *, payload_bytes: int, result_bytes: int) -> dict:
-            self.calls.append(
-                {
-                    "request_id": request_id,
-                    "payload_bytes": payload_bytes,
-                    "result_bytes": result_bytes,
-                }
-            )
-            return {"ok": True}
-
-        async def async_unused_release(self, request_id: str) -> None:
-            return None
-
-    class LocalStubWorkQueue:
-        def __init__(self) -> None:
-            self.calls: list[dict] = []
-
-        async def enqueue(
-            self,
-            *,
-            request_id: str,
-            op: str,
-            request_json: bytes,
-            user_id: str | None,
-            webhook_url: str | None,
-            extra: dict | None = None,
-        ) -> None:
-            self.calls.append(
-                {
-                    "request_id": request_id,
-                    "op": op,
-                    "request_json": request_json,
-                    "user_id": user_id,
-                    "webhook_url": webhook_url,
-                    "extra": extra,
-                }
-            )
-
     class StubTaskStateFutures:
         async def async_create_with_id(self, request_id: str) -> None:
             return None
@@ -124,7 +82,6 @@ def test_issue_283_create_model_from_state_queues_resolved_checkpoint_path_witho
         async def async_cleanup(self, request_id: str) -> None:
             return None
 
-    unused_admission = StubUnusedAdmission()
     stub_queue = StubModelWorkScheduler()
 
     monkeypatch.setattr(scheduler_module, "model_work_scheduler", stub_queue)
@@ -153,7 +110,6 @@ def test_issue_283_create_model_from_state_queues_resolved_checkpoint_path_witho
     )
 
     assert resp.status_code == 200, resp.text
-    assert unused_admission.calls == []
     assert len(stub_queue.calls) == 1
     assert stub_queue.calls[0]["op"] == "training.create_model_from_state"
     assert stub_queue.calls[0]["extra"]["execution_serial_key"] == "training_session:s283_0"
@@ -578,39 +534,6 @@ def test_issue_283_load_state_route_queues_resolved_path(tmp_path: Path, monkeyp
         encoding="utf-8",
     )
 
-    class StubUnusedAdmission:
-        async def async_unused_reserve(self, request_id: str, *, payload_bytes: int, result_bytes: int) -> dict:
-            _ = (request_id, payload_bytes, result_bytes)
-            return {"ok": True}
-
-        async def async_unused_release(self, request_id: str) -> None:
-            _ = request_id
-
-    class LocalStubWorkQueue:
-        def __init__(self) -> None:
-            self.calls: list[dict] = []
-
-        async def enqueue(
-            self,
-            *,
-            request_id: str,
-            op: str,
-            request_json: bytes,
-            user_id: str | None,
-            webhook_url: str | None,
-            extra: dict | None = None,
-        ) -> None:
-            self.calls.append(
-                {
-                    "request_id": request_id,
-                    "op": op,
-                    "request_json": request_json,
-                    "user_id": user_id,
-                    "webhook_url": webhook_url,
-                    "extra": extra,
-                }
-            )
-
     class StubTaskStateFutures:
         async def async_create_with_id(self, request_id: str) -> None:
             _ = request_id
@@ -1013,39 +936,6 @@ def test_issue_283_save_routes_use_detached_training_info_without_route_runtime(
     from tinker_server.routes import weights as weights_routes
     import tinker_server.backend.model_work_scheduler as scheduler_module
 
-    class StubUnusedAdmission:
-        async def async_unused_reserve(self, request_id: str, *, payload_bytes: int, result_bytes: int) -> dict:
-            _ = (request_id, payload_bytes, result_bytes)
-            return {"ok": True}
-
-        async def async_unused_release(self, request_id: str) -> None:
-            _ = request_id
-
-    class LocalStubWorkQueue:
-        def __init__(self) -> None:
-            self.calls: list[dict] = []
-
-        async def enqueue(
-            self,
-            *,
-            request_id: str,
-            op: str,
-            request_json: bytes,
-            user_id: str | None,
-            webhook_url: str | None,
-            extra: dict | None = None,
-        ) -> None:
-            self.calls.append(
-                {
-                    "request_id": request_id,
-                    "op": op,
-                    "request_json": json.loads(request_json.decode("utf-8")),
-                    "user_id": user_id,
-                    "webhook_url": webhook_url,
-                    "extra": extra,
-                }
-            )
-
     class StubTaskStateFutures:
         async def async_create_with_id(self, request_id: str) -> None:
             _ = request_id
@@ -1123,39 +1013,6 @@ def test_issue_283_load_state_route_uses_detached_training_info_without_route_ru
         encoding="utf-8",
     )
 
-    class StubUnusedAdmission:
-        async def async_unused_reserve(self, request_id: str, *, payload_bytes: int, result_bytes: int) -> dict:
-            _ = (request_id, payload_bytes, result_bytes)
-            return {"ok": True}
-
-        async def async_unused_release(self, request_id: str) -> None:
-            _ = request_id
-
-    class LocalStubWorkQueue:
-        def __init__(self) -> None:
-            self.calls: list[dict] = []
-
-        async def enqueue(
-            self,
-            *,
-            request_id: str,
-            op: str,
-            request_json: bytes,
-            user_id: str | None,
-            webhook_url: str | None,
-            extra: dict | None = None,
-        ) -> None:
-            self.calls.append(
-                {
-                    "request_id": request_id,
-                    "op": op,
-                    "request_json": request_json,
-                    "user_id": user_id,
-                    "webhook_url": webhook_url,
-                    "extra": extra,
-                }
-            )
-
     class StubTaskStateFutures:
         async def async_create_with_id(self, request_id: str) -> None:
             _ = request_id
@@ -1211,21 +1068,6 @@ def test_issue_283_save_routes_restore_inflight_protection(monkeypatch) -> None:
     from tinker_server.routes import training as training_routes
     from tinker_server.routes import weights as weights_routes
     import tinker_server.backend.model_work_scheduler as scheduler_module
-
-    class StubUnusedAdmission:
-        async def async_unused_reserve(self, request_id: str, *, payload_bytes: int, result_bytes: int) -> dict:
-            _ = (request_id, payload_bytes, result_bytes)
-            return {"ok": True}
-
-        async def async_unused_release(self, request_id: str) -> None:
-            _ = request_id
-
-    class LocalStubWorkQueue:
-        def __init__(self) -> None:
-            self.calls: list[dict] = []
-
-        async def enqueue(self, **kwargs) -> None:
-            self.calls.append(dict(kwargs))
 
     class StubTaskStateFutures:
         async def async_create_with_id(self, request_id: str) -> None:
@@ -1310,21 +1152,6 @@ def test_issue_283_load_state_route_restores_inflight_protection(tmp_path: Path,
         ),
         encoding="utf-8",
     )
-
-    class StubUnusedAdmission:
-        async def async_unused_reserve(self, request_id: str, *, payload_bytes: int, result_bytes: int) -> dict:
-            _ = (request_id, payload_bytes, result_bytes)
-            return {"ok": True}
-
-        async def async_unused_release(self, request_id: str) -> None:
-            _ = request_id
-
-    class LocalStubWorkQueue:
-        def __init__(self) -> None:
-            self.calls: list[dict] = []
-
-        async def enqueue(self, **kwargs) -> None:
-            self.calls.append(dict(kwargs))
 
     class StubTaskStateFutures:
         async def async_create_with_id(self, request_id: str) -> None:
@@ -1420,21 +1247,6 @@ def test_issue_283_save_routes_refresh_detached_enqueue_protection(monkeypatch) 
     from tinker_server.routes import weights as weights_routes
     import tinker_server.backend.model_work_scheduler as scheduler_module
 
-    class StubUnusedAdmission:
-        async def async_unused_reserve(self, request_id: str, *, payload_bytes: int, result_bytes: int) -> dict:
-            _ = (request_id, payload_bytes, result_bytes)
-            return {"ok": True}
-
-        async def async_unused_release(self, request_id: str) -> None:
-            _ = request_id
-
-    class LocalStubWorkQueue:
-        def __init__(self) -> None:
-            self.calls: list[dict] = []
-
-        async def enqueue(self, **kwargs) -> None:
-            self.calls.append(dict(kwargs))
-
     class StubTaskStateFutures:
         async def async_create_with_id(self, request_id: str) -> None:
             _ = request_id
@@ -1516,21 +1328,6 @@ def test_issue_283_load_state_route_refreshes_detached_enqueue_protection(tmp_pa
         ),
         encoding="utf-8",
     )
-
-    class StubUnusedAdmission:
-        async def async_unused_reserve(self, request_id: str, *, payload_bytes: int, result_bytes: int) -> dict:
-            _ = (request_id, payload_bytes, result_bytes)
-            return {"ok": True}
-
-        async def async_unused_release(self, request_id: str) -> None:
-            _ = request_id
-
-    class LocalStubWorkQueue:
-        def __init__(self) -> None:
-            self.calls: list[dict] = []
-
-        async def enqueue(self, **kwargs) -> None:
-            self.calls.append(dict(kwargs))
 
     class StubTaskStateFutures:
         async def async_create_with_id(self, request_id: str) -> None:

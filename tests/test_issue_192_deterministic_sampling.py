@@ -117,22 +117,6 @@ class _StubTaskStateFutures:
         self.pending.pop(request_id, None)
 
 
-class _StubUnusedAdmission:
-    def __init__(self):
-        self.reserved: list[str] = []
-        self.released: list[str] = []
-
-    async def async_unused_reserve(self, request_id: str, payload_bytes: int, result_bytes: int):
-        self.reserved.append(request_id)
-        return {"ok": True}
-
-    async def async_unused_release(self, request_id: str) -> None:
-        self.released.append(request_id)
-
-    def unused_release(self, request_id: str) -> None:
-        self.released.append(request_id)
-
-
 class _StubAdmissionQueue:
     def __init__(self):
         self.calls: list[dict] = []

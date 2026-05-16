@@ -796,8 +796,10 @@ curl -s http://localhost:8000/api/v1/vllm_status | jq
 # Megatron status
 curl -s http://localhost:8000/api/v1/megatron_status | jq
 
-# Kill all actors (nuclear option; admin only when auth is enabled)
-curl -X POST http://localhost:8000/api/v1/kill_all_actors
+# Kill all tracked GPU actors (admin only when auth is enabled)
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"actor_type":"all"}' \
+  http://localhost:8000/api/v1/actors/kill
 ```
 
 ---
@@ -987,10 +989,12 @@ curl -s http://localhost:8000/api/v1/healthz
 
 Use this after shared actor code changes (for example `tinker_server/backend/model_registry.py`) or when GPUs are exhausted.
 
-Note: `/api/v1/kill_all_actors` kills ModelActorRegistry-tracked GPU actors (vLLM, Megatron, dense trainer pool). It does not kill detached store actors.
+Note: `/api/v1/actors/kill` with `{"actor_type":"all"}` kills ModelActorRegistry-tracked GPU actors (vLLM, Megatron, dense trainer pool). It does not kill detached store actors.
 
 ```bash
-curl -X POST http://localhost:8000/api/v1/kill_all_actors
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"actor_type":"all"}' \
+  http://localhost:8000/api/v1/actors/kill
 ssh mint-dev 'pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true'
 ssh mint-dev "cd /root/tinker_project/tinker-server && nohup bash -c \
   \"PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/mint-runtime-py31213 \

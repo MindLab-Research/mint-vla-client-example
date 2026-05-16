@@ -82,7 +82,7 @@ def _post_asample(env: Env, *, user_id: str, apikey_id: str) -> tuple[int, Any]:
 
 
 def _debug_state(env: Env) -> dict[str, Any]:
-    r = requests.get(env.base_url + "/internal/work_queue/debug_state", timeout=env.timeout_s)
+    r = requests.get(env.base_url + "/internal/model_work_scheduler/debug_state", timeout=env.timeout_s)
     r.raise_for_status()
     data = r.json()
     if not isinstance(data, dict):

@@ -188,7 +188,7 @@ def _get_server_job_id(env: Env, pid: int) -> str:
 
 
 def _post_noop(env: Env) -> str:
-    r = requests.post(env.base_url + "/internal/work_queue/noop", timeout=10.0)
+    r = requests.post(env.base_url + "/internal/model_work_scheduler/noop", timeout=10.0)
     r.raise_for_status()
     payload = r.json()
     rid = payload.get("request_id")
@@ -213,7 +213,7 @@ def _poll_future(env: Env, request_id: str, *, timeout_s: float) -> tuple[bool, 
 
 
 def _debug_state(env: Env) -> dict[str, Any]:
-    r = requests.get(env.base_url + "/internal/work_queue/debug_state", timeout=10.0)
+    r = requests.get(env.base_url + "/internal/model_work_scheduler/debug_state", timeout=10.0)
     r.raise_for_status()
     d = r.json()
     if not isinstance(d, dict):

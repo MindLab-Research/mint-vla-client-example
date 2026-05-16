@@ -1131,8 +1131,8 @@ async def metrics() -> Response:
     return Response(content=payload, media_type="text/plain; version=0.0.4")
 
 
-@router.post("/work_queue/noop")
-async def work_queue_noop(http_request: Request) -> dict:
+@router.post("/model_work_scheduler/noop")
+async def model_work_scheduler_noop(http_request: Request) -> dict:
     from ..backend.task_state_store import task_state_futures
     from ..backend.model_actor_supervisor import domain_key_for_internal_control
     from ..backend.model_work_admission import enqueue_model_work
@@ -1171,8 +1171,8 @@ async def work_queue_noop(http_request: Request) -> dict:
     return {"request_id": request_id}
 
 
-@router.get("/work_queue/debug_state")
-async def work_queue_debug_state() -> dict:
+@router.get("/model_work_scheduler/debug_state")
+async def model_work_scheduler_debug_state() -> dict:
     from ..backend.model_work_scheduler import model_work_scheduler
 
     return await model_work_scheduler.stats(timeout_s=10.0)
