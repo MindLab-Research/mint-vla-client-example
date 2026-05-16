@@ -9,6 +9,7 @@ from tinker_server.backend.model_actor_supervisor import (
     ModelActorSpec,
     ModelActorSupervisor,
     desired_specs_from_env,
+    domain_key_for_training_base_model,
     domain_key_for_vllm_base_model,
     _placement_env_for_spec,
     queue_id_for_replica,
@@ -130,6 +131,55 @@ async def test_issue_593_supervisor_creates_replica_and_syncs_scheduler() -> Non
     assert synced[-1][0]["status"] == "healthy"
     assert synced[-1][0]["capacity"] == 4
     assert await supervisor.async_snapshot() == supervisor.snapshot()
+
+
+@pytest.mark.anyio
+async def test_issue_593_supervisor_projects_scheduler_backlog_to_desired_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MINT_SUPPORTED_MODELS", "Qwen/A")
+    monkeypatch.setenv(
+        "MINT_DENSE_MODEL_PLACEMENT_JSON",
+        '{"Qwen/A":{"replica":0,"node_ip":"10.0.0.8","gpu_count":1}}',
+    )
+    created: list[_FakeRuntimeActor] = []
+    synced: list[list[dict]] = []
+
+    async def _factory(spec: ModelActorSpec, generation: int):
+        actor = _FakeRuntimeActor(
+            actor_name=spec.normalized_actor_name(),
+            domain_key=spec.domain_key,
+            replica_id=spec.replica_id,
+            generation=generation,
+        )
+        created.append(actor)
+        return actor
+
+    async def _scheduler_stats():
+        return {
+            "backlog_depth_by_domain": {domain_key_for_training_base_model("Qwen/A"): 1},
+            "replica_queues": {},
+            "leases": [],
+        }
+
+    supervisor = ModelActorSupervisor(
+        runtime_factory=_factory,
+        scheduler_stats=_scheduler_stats,
+        scheduler_sync=lambda registrations: synced.append(
+            [registration.to_dict() for registration in registrations]
+        ),
+    )
+
+    out = await supervisor.reconcile_once()
+
+    domain_key = domain_key_for_training_base_model("Qwen/A")
+    label = f"{domain_key}::replica-0"
+    assert len(created) == 1
+    assert created[0].domain_key == domain_key
+    assert out["snapshot"]["replicas"][label]["base_model"] == "Qwen/A"
+    assert out["snapshot"]["replicas"][label]["node_pins"] == ["10.0.0.8"]
+    assert synced[-1][0]["domain_key"] == domain_key
+    assert synced[-1][0]["status"] == "healthy"
 
 
 @pytest.mark.anyio

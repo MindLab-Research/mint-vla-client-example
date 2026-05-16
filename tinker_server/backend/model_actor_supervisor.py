@@ -75,6 +75,7 @@ class ModelActorSpec:
 RuntimeFactory = Callable[[ModelActorSpec, int], Any | Awaitable[Any]]
 NodeInventory = Callable[[], set[str] | None | Awaitable[set[str] | None]]
 SchedulerSync = Callable[[list[ModelReplicaRegistration]], Any | Awaitable[Any]]
+SchedulerStats = Callable[[], dict[str, Any] | Awaitable[dict[str, Any]]]
 OrphanPlacementGroupCleaner = Callable[[dict[tuple[str, str], ModelActorSpec]], Any | Awaitable[Any]]
 PlacementReconciler = Callable[[dict[tuple[str, str], ModelActorSpec]], Any | Awaitable[dict[str, Any]]]
 
@@ -323,6 +324,104 @@ def _persistent_model_spec(
     )
 
 
+def _supported_model_specs_from_env() -> dict[str, ModelActorSpec]:
+    supported = os.environ.get("MINT_SUPPORTED_MODELS", "").strip()
+    if not supported:
+        return {}
+
+    specs: dict[str, ModelActorSpec] = {}
+    shared_placement_raw = os.environ.get("MINT_MODEL_PLACEMENT_JSON", "").strip()
+    vllm_placement_raw = os.environ.get("MINT_VLLM_MODEL_PLACEMENT_JSON", "").strip() or shared_placement_raw
+    training_placement_raw = os.environ.get("MINT_DENSE_MODEL_PLACEMENT_JSON", "").strip() or shared_placement_raw
+    megatron_placement_raw = os.environ.get("MINT_MEGATRON_MODEL_PLACEMENT_JSON", "").strip() or shared_placement_raw
+    for model in (item.strip() for item in supported.split(",")):
+        if not model:
+            continue
+        vllm_spec = _persistent_model_spec(
+            model=model,
+            domain_key=domain_key_for_vllm_base_model(model),
+            launcher_key="legacy_vllm",
+            placement_raw=vllm_placement_raw,
+        )
+        training_domain = domain_key_for_training_base_model(model)
+        training_spec = _persistent_model_spec(
+            model=model,
+            domain_key=training_domain,
+            launcher_key="training",
+            placement_raw=megatron_placement_raw if training_domain.startswith("megatron:") else training_placement_raw,
+        )
+        specs[vllm_spec.domain_key] = vllm_spec
+        specs[training_spec.domain_key] = training_spec
+    return specs
+
+
+def _spec_for_scheduler_domain_from_env(domain_key: str) -> ModelActorSpec | None:
+    domain = str(domain_key).strip()
+    if not domain or domain == domain_key_for_internal_control():
+        return None
+
+    supported = _supported_model_specs_from_env()
+    if domain in supported:
+        return supported[domain]
+
+    shared_placement_raw = os.environ.get("MINT_MODEL_PLACEMENT_JSON", "").strip()
+    if domain.startswith("vllm:"):
+        base_model = domain.removeprefix("vllm:").strip()
+        if not base_model:
+            return None
+        return _persistent_model_spec(
+            model=base_model,
+            domain_key=domain,
+            launcher_key="legacy_vllm",
+            placement_raw=os.environ.get("MINT_VLLM_MODEL_PLACEMENT_JSON", "").strip() or shared_placement_raw,
+        )
+    if domain.startswith("training:"):
+        base_model = domain.removeprefix("training:").strip()
+        if not base_model:
+            return None
+        return _persistent_model_spec(
+            model=base_model,
+            domain_key=domain,
+            launcher_key="training",
+            placement_raw=os.environ.get("MINT_DENSE_MODEL_PLACEMENT_JSON", "").strip() or shared_placement_raw,
+        )
+    if domain.startswith("megatron:"):
+        for spec in supported.values():
+            if spec.domain_key == domain:
+                return spec
+    return None
+
+
+def _active_scheduler_domains(stats: dict[str, Any]) -> set[str]:
+    domains: set[str] = set()
+    backlog = stats.get("backlog_depth_by_domain")
+    if isinstance(backlog, dict):
+        for domain, depth in backlog.items():
+            try:
+                if int(depth) > 0:
+                    domains.add(str(domain))
+            except Exception:
+                continue
+
+    replica_queues = stats.get("replica_queues")
+    if isinstance(replica_queues, dict):
+        for queue in replica_queues.values():
+            if not isinstance(queue, dict):
+                continue
+            try:
+                if int(queue.get("depth") or 0) > 0 and queue.get("domain_key"):
+                    domains.add(str(queue["domain_key"]))
+            except Exception:
+                continue
+
+    leases = stats.get("leases")
+    if isinstance(leases, list):
+        for lease in leases:
+            if isinstance(lease, dict) and lease.get("domain_key"):
+                domains.add(str(lease["domain_key"]))
+    return domains
+
+
 def desired_specs_from_env() -> list[ModelActorSpec]:
     def _with_internal_control(specs: list[ModelActorSpec]) -> list[ModelActorSpec]:
         enabled = str(os.environ.get("MINT_MODEL_ACTOR_INTERNAL_CONTROL", "1")).strip().lower()
@@ -437,6 +536,7 @@ class ModelActorSupervisor:
         node_inventory: NodeInventory | None = None,
         scheduler: ModelWorkSchedulerClient | None = None,
         scheduler_sync: SchedulerSync | None = None,
+        scheduler_stats: SchedulerStats | None = None,
         orphan_pg_cleaner: OrphanPlacementGroupCleaner | None = None,
         placement_reconciler: PlacementReconciler | None = None,
     ) -> None:
@@ -445,6 +545,7 @@ class ModelActorSupervisor:
         self._node_inventory = node_inventory
         self._scheduler = scheduler or model_work_scheduler
         self._scheduler_sync = scheduler_sync
+        self._scheduler_stats = scheduler_stats
         self._orphan_pg_cleaner = orphan_pg_cleaner
         self._placement_reconciler = placement_reconciler or model_actor_placement_reconciler
         self._actors: dict[tuple[str, str], Any] = {}
@@ -464,6 +565,41 @@ class ModelActorSupervisor:
         self._inventory = ModelActorInventory()
         for spec in specs or []:
             self.set_desired(spec)
+
+    async def _sync_active_scheduler_domains(self) -> None:
+        stats: dict[str, Any] | None = None
+        try:
+            if self._scheduler_stats is not None:
+                candidate = await _maybe_await(self._scheduler_stats())
+            elif self._scheduler_sync is None:
+                candidate = await self._scheduler.stats(timeout_s=2.0)
+            else:
+                candidate = None
+            if isinstance(candidate, dict):
+                stats = candidate
+        except Exception as e:
+            logger.debug(
+                "[model_actor_supervisor] active scheduler domain sync skipped: %s: %s",
+                type(e).__name__,
+                e,
+            )
+        if not stats:
+            return
+        for domain_key in sorted(_active_scheduler_domains(stats)):
+            spec = _spec_for_scheduler_domain_from_env(domain_key)
+            if spec is None:
+                logger.warning(
+                    "[model_actor_supervisor] scheduler has active domain without launch spec: %s",
+                    domain_key,
+                )
+                continue
+            if spec.key not in self._desired:
+                logger.info(
+                    "[model_actor_supervisor] adding active scheduler domain to desired runtimes domain=%s replica=%s",
+                    spec.domain_key,
+                    spec.replica_id,
+                )
+                self.set_desired(spec)
 
     # Explicit inventory/launcher contract for legacy GPU actor launch paths.
     # Direct vLLM/Megatron/dense launchers still create backend-specific Ray
@@ -758,6 +894,7 @@ class ModelActorSupervisor:
     async def reconcile_once(self) -> dict[str, Any]:
         self._reconcile_total += 1
         self._last_reconcile_at = time.time()
+        await self._sync_active_scheduler_domains()
         if self._orphan_pg_cleaner is not None:
             await _maybe_await(self._orphan_pg_cleaner(dict(self._desired)))
         placement_out: dict[str, Any] = {}
