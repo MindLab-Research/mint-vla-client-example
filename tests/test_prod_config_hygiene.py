@@ -68,7 +68,7 @@ def test_prod_openpi_models_have_model_placement() -> None:
     assert openpi_models <= set(placement)
     for model in openpi_models:
         assert placement[model]["replica"] == 0
-        assert placement[model]["worker_index"] >= 0
+        assert placement[model]["node_ip"]
         assert placement[model]["gpu_count"] == 1
 
 

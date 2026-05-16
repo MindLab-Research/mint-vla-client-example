@@ -26,68 +26,8 @@ def _import_volc_placement(monkeypatch: pytest.MonkeyPatch):
     return importlib.import_module("tinker_server.backend.volc_placement")
 
 
-def test_resolve_worker_indices_to_node_ips_uses_volcano_hostname(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    vp = _import_volc_placement(monkeypatch)
 
-    monkeypatch.setattr(
-        vp,
-        "_list_alive_gpu_nodes",
-        lambda: [
-            vp.VolcGpuNode(
-                node_id="node-1",
-                node_ip="10.0.0.7",
-                hostname="t-abc-worker-1",
-                total_gpus=8,
-                available_gpus=8,
-                volc_job_id=None,
-                volc_resource_queue_id=None,
-            ),
-            vp.VolcGpuNode(
-                node_id="node-2",
-                node_ip="10.0.0.8",
-                hostname="t-abc-worker-2",
-                total_gpus=8,
-                available_gpus=8,
-                volc_job_id=None,
-                volc_resource_queue_id=None,
-            ),
-        ],
-    )
-
-    assert vp.resolve_worker_indices_to_node_ips(worker_indices=[2, 1], context="test") == [
-        "10.0.0.8",
-        "10.0.0.7",
-    ]
-
-
-def test_resolve_worker_indices_to_node_ips_reports_missing_worker(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    vp = _import_volc_placement(monkeypatch)
-
-    monkeypatch.setattr(
-        vp,
-        "_list_alive_gpu_nodes",
-        lambda: [
-            vp.VolcGpuNode(
-                node_id="node-1",
-                node_ip="10.0.0.7",
-                hostname="t-abc-worker-1",
-                total_gpus=8,
-                available_gpus=8,
-                volc_job_id=None,
-                volc_resource_queue_id=None,
-            )
-        ],
-    )
-
-    with pytest.raises(RuntimeError, match="missing_worker_indices=\\[2\\]"):
-        vp.resolve_worker_indices_to_node_ips(worker_indices=[2], context="test")
-
-
-def test_parse_model_gpu_placement_resolves_worker_gpu_slices(
+def test_parse_model_gpu_placement_resolves_node_ip_gpu_slices(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     vp = _import_volc_placement(monkeypatch)
@@ -120,8 +60,8 @@ def test_parse_model_gpu_placement_resolves_worker_gpu_slices(
     placement = vp.parse_model_gpu_placement(
         raw_json=(
             '{"Qwen/Qwen3-235B-A22B-Instruct-2507":['
-            '{"replica":0,"worker_index":1,"gpu_count":2},'
-            '{"replica":0,"worker_index":2,"gpu_count":3}'
+            '{"replica":0,"node_ip":"10.0.0.7","gpu_count":2},'
+            '{"replica":0,"node_ip":"10.0.0.8","gpu_count":3}'
             "]}"
         ),
         lookup_keys=["Qwen/Qwen3-235B-A22B-Instruct-2507"],
@@ -134,6 +74,23 @@ def test_parse_model_gpu_placement_resolves_worker_gpu_slices(
     assert placement.total_gpus == 5
     assert placement.required_gpus_by_node_ip() == {"10.0.0.7": 2, "10.0.0.8": 3}
 
+
+def test_parse_model_gpu_placement_rejects_worker_index_slice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vp = _import_volc_placement(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="uses worker_index; use node_ip"):
+        vp.parse_model_gpu_placement(
+            raw_json=(
+                '{"Qwen/Qwen3-235B-A22B-Instruct-2507":['
+                '{"replica":0,"worker_index":1,"gpu_count":2}'
+                "]}"
+            ),
+            lookup_keys=["Qwen/Qwen3-235B-A22B-Instruct-2507"],
+            env_var_name="MINT_VLLM_MODEL_PLACEMENT_JSON",
+            context="test placement",
+        )
 
 def test_parse_model_gpu_placement_accepts_node_ip_slice(
     monkeypatch: pytest.MonkeyPatch,
@@ -170,7 +127,7 @@ def test_parse_model_gpu_placement_accepts_node_ip_slice(
     assert placement.required_gpus_by_node_ip() == {"10.0.0.17": 4}
 
 
-def test_parse_model_gpu_placement_node_ip_slice_ignores_duplicate_worker_indexes(
+def test_parse_model_gpu_placement_node_ip_slice_ignores_duplicate_hostname_worker_indexes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     vp = _import_volc_placement(monkeypatch)
@@ -237,8 +194,8 @@ def test_parse_model_gpu_placement_selects_single_runtime_replica(
     placement = vp.parse_model_gpu_placement(
         raw_json=(
             '{"Qwen/Qwen3-30B-A3B-Instruct-2507":['
-            '{"replica":0,"worker_index":1,"gpu_count":4},'
-            '{"replica":1,"worker_index":1,"gpu_count":4}'
+            '{"replica":0,"node_ip":"10.0.0.7","gpu_count":4},'
+            '{"replica":1,"node_ip":"10.0.0.7","gpu_count":4}'
             "]}"
         ),
         lookup_keys=["Qwen/Qwen3-30B-A3B-Instruct-2507"],
@@ -277,8 +234,8 @@ def test_parse_model_gpu_placement_filters_unused_replica_before_resolution(
     placement = vp.parse_model_gpu_placement(
         raw_json=(
             '{"Qwen/Qwen3-30B-A3B-Instruct-2507":['
-            '{"replica":0,"worker_index":1,"gpu_count":4},'
-            '{"replica":1,"worker_index":99,"gpu_count":999}'
+            '{"replica":0,"node_ip":"10.0.0.7","gpu_count":4},'
+            '{"replica":1,"node_ip":"10.0.0.99","gpu_count":999}'
             "]}"
         ),
         lookup_keys=["Qwen/Qwen3-30B-A3B-Instruct-2507"],
@@ -314,7 +271,7 @@ def test_parse_model_gpu_placement_rejects_out_of_range_gpu_id(
 
     with pytest.raises(RuntimeError, match="exceeds node GPU count"):
         vp.parse_model_gpu_placement(
-            raw_json='{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"worker_index":1,"gpu_count":9}}',
+            raw_json='{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"node_ip":"10.0.0.7","gpu_count":9}}',
             lookup_keys=["Qwen/Qwen3-30B-A3B-Instruct-2507"],
             env_var_name="MINT_VLLM_MODEL_PLACEMENT_JSON",
             context="test placement",

@@ -23,7 +23,6 @@ class ModelActorSpec:
     base_model: str | None = None
     actor_name: str | None = None
     launcher_key: str = "legacy_vllm"
-    worker_index: int | None = None
     node_pin: str | None = None
     node_pins: tuple[str, ...] = ()
     gpu_count: int | None = None
@@ -117,20 +116,6 @@ def _placement_env_for_spec(spec: ModelActorSpec) -> dict[str, str]:
     base_model = _base_model_from_spec(spec)
     if not base_model or spec.gpu_count is None:
         return {}
-    if spec.worker_index is not None:
-        payload = {
-            base_model: {
-                "replica": _replica_int(spec.replica_id),
-                "worker_index": int(spec.worker_index),
-                "gpu_count": int(spec.gpu_count),
-            }
-        }
-        raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-        return {
-            "MINT_MODEL_PLACEMENT_JSON": raw,
-            "MINT_VLLM_MODEL_PLACEMENT_JSON": raw,
-            "MINT_MODEL_ACTOR_REPLICA_ID": spec.replica_id,
-        }
     node_pins = spec.normalized_node_pins()
     if len(node_pins) != 1:
         return {}
@@ -175,14 +160,14 @@ def _spec_from_obj(obj: Any) -> ModelActorSpec:
         node_pins = tuple(pin.strip() for pin in raw_node_pins.split(",") if pin.strip())
     else:
         node_pins = tuple(str(pin) for pin in (raw_node_pins or []) if str(pin).strip())
-    worker_index = obj.get("worker_index")
+    if obj.get("worker_index") is not None or obj.get("worker") is not None or obj.get("worker_idx") is not None:
+        raise ValueError("model actor spec worker_index is no longer supported; use node_pin/node_pins")
     return ModelActorSpec(
         domain_key=str(domain_key),
         replica_id=_replica_id(obj.get("replica_id", obj.get("replica", 0))),
         base_model=None if base_model is None else str(base_model),
         actor_name=None if obj.get("actor_name") is None else str(obj["actor_name"]),
         launcher_key=str(obj.get("launcher_key") or "legacy_vllm"),
-        worker_index=None if worker_index is None else int(worker_index),
         node_pin=None if obj.get("node_pin") is None else str(obj["node_pin"]),
         node_pins=node_pins,
         gpu_count=None if obj.get("gpu_count") is None else int(obj["gpu_count"]),
@@ -209,7 +194,7 @@ def _placement_spec_overlay(raw_json: str | None, model: str) -> dict[str, Any]:
     elif "replica" in entry:
         out["replica_id"] = _replica_id(entry["replica"])
     if "worker_index" in entry:
-        out["worker_index"] = int(entry["worker_index"])
+        raise ValueError(f"model placement entry for {model!r} uses worker_index; use node_ip")
     if "node_ip" in entry:
         out["node_pin"] = str(entry["node_ip"])
     elif "node_pin" in entry:
@@ -238,7 +223,6 @@ def _persistent_model_spec(
         replica_id=str(overlay.get("replica_id") or "replica-0"),
         base_model=model,
         launcher_key=launcher_key,
-        worker_index=overlay.get("worker_index"),
         node_pin=overlay.get("node_pin"),
         node_pins=tuple(overlay.get("node_pins") or ()),
         gpu_count=overlay.get("gpu_count"),
@@ -470,7 +454,6 @@ class ModelActorSupervisor:
             "last_action": f"create:{reason}",
             "last_action_at": time.time(),
             "node_pins": spec.normalized_node_pins(),
-            "worker_index": spec.worker_index,
             "gpu_count": spec.gpu_count,
         }
         return actor
@@ -582,7 +565,6 @@ class ModelActorSupervisor:
                     "state": "blocked",
                     "actor_name": spec.normalized_actor_name(),
                     "node_pins": resolved_node_pins,
-                    "worker_index": spec.worker_index,
                     "gpu_count": spec.gpu_count,
                     "last_error": f"placement blocked: {placement_error}",
                     "last_action": "blocked:placement",
@@ -600,7 +582,6 @@ class ModelActorSupervisor:
                     "state": "blocked",
                     "actor_name": spec.normalized_actor_name(),
                     "node_pins": resolved_node_pins,
-                    "worker_index": spec.worker_index,
                     "gpu_count": spec.gpu_count,
                     "last_error": f"node pin unavailable: {','.join(resolved_node_pins)}",
                     "last_action": "blocked:node_pin_unavailable",
@@ -641,7 +622,6 @@ class ModelActorSupervisor:
                         "last_action": "health_unhealthy",
                         "last_action_at": time.time(),
                         "node_pins": resolved_node_pins,
-                        "worker_index": spec.worker_index,
                         "gpu_count": spec.gpu_count,
                     }
                     self._actors.pop(key, None)
@@ -668,7 +648,6 @@ class ModelActorSupervisor:
                     "last_action": "health_check",
                     "last_action_at": time.time(),
                     "node_pins": resolved_node_pins,
-                    "worker_index": spec.worker_index,
                     "gpu_count": spec.gpu_count,
                 }
                 results[label] = self._states[key]
@@ -686,7 +665,6 @@ class ModelActorSupervisor:
                     "last_action": "health_failed",
                     "last_action_at": time.time(),
                     "node_pins": resolved_node_pins,
-                    "worker_index": spec.worker_index,
                     "gpu_count": spec.gpu_count,
                 }
                 self._actors.pop(key, None)
@@ -761,7 +739,6 @@ class ModelActorSupervisor:
                         "desired_actor_name": spec.normalized_actor_name(),
                         "desired_enabled": bool(spec.enabled),
                         "launcher_key": spec.launcher_key,
-                        "worker_index": spec.worker_index,
                         "gpu_count": spec.gpu_count,
                     }
                 )

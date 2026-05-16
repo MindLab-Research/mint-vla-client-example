@@ -13,7 +13,6 @@ ActorLister = Callable[[], Iterable[dict[str, Any]]]
 CapacityChecker = Callable[[dict[str, int], str, set[str], str], None]
 PlacementGroupRemover = Callable[[str, str], bool]
 PlacementGroupLister = Callable[[], Iterable[dict[str, Any]]]
-WorkerResolver = Callable[[list[int], str], list[str]]
 
 
 def _ray_namespace() -> str:
@@ -333,12 +332,6 @@ def _default_capacity_checker(
     )
 
 
-def _default_worker_resolver(worker_indices: list[int], context: str) -> list[str]:
-    from .volc_placement import resolve_worker_indices_to_node_ips
-
-    return resolve_worker_indices_to_node_ips(worker_indices=worker_indices, context=context)
-
-
 def _is_capacity_block_error(exc: BaseException) -> bool:
     msg = str(exc).lower()
     return (
@@ -367,7 +360,6 @@ class ModelActorPlacementReconciler:
         gpu_actor_lister: ActorLister | None = None,
         placement_group_lister: PlacementGroupLister | None = None,
         placement_group_remover: PlacementGroupRemover | None = None,
-        worker_resolver: WorkerResolver | None = None,
     ) -> None:
         self._namespace = namespace or _ray_namespace()
         self._actor_exists = actor_exists or _default_actor_exists
@@ -377,16 +369,13 @@ class ModelActorPlacementReconciler:
         self._gpu_actor_lister = gpu_actor_lister or _default_gpu_actor_lister
         self._placement_group_lister = placement_group_lister or _default_placement_group_lister
         self._placement_group_remover = placement_group_remover or _default_pg_remover
-        self._worker_resolver = worker_resolver or _default_worker_resolver
 
     def _resolved_node_pins(self, spec: Any, *, context: str) -> list[str]:
+        _ = context
         pins = [str(pin) for pin in spec.normalized_node_pins() if str(pin).strip()]
         if pins:
             return list(dict.fromkeys(pins))
-        worker_index = getattr(spec, "worker_index", None)
-        if worker_index is None:
-            return []
-        return list(dict.fromkeys(self._worker_resolver([int(worker_index)], context)))
+        return []
 
     def _required_gpus_by_node_ip(self, spec: Any, node_pins: list[str]) -> dict[str, int]:
         gpu_count = getattr(spec, "gpu_count", None)

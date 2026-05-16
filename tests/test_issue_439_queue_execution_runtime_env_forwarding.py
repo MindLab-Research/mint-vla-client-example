@@ -12,10 +12,10 @@ def test_issue_439_queue_execution_runtime_records_actor_name_and_placement_over
     monkeypatch.setenv("TINKER_RAY_NAMESPACE", "ns-issue-439")
     monkeypatch.setenv("MINT_K2_INFER_VOLC_RESOURCE_QUEUE_ID", "rq-k2")
     monkeypatch.setenv("MINT_VLLM_VOLC_RESOURCE_QUEUE_ID", "rq-vllm")
-    monkeypatch.setenv("MINT_MODEL_PLACEMENT_JSON", '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"worker_index":1,"gpu_count":4}}')
+    monkeypatch.setenv("MINT_MODEL_PLACEMENT_JSON", '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"node_ip":"10.0.0.17","gpu_count":4}}')
     monkeypatch.setenv(
         "MINT_MEGATRON_MODEL_PLACEMENT_JSON",
-        '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"worker_index":1,"gpu_count":4}}',
+        '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"node_ip":"10.0.0.17","gpu_count":4}}',
     )
     monkeypatch.setenv("MINT_MBRIDGE_EXPORT_GLOO_TIMEOUT_S", "123")
     monkeypatch.setenv("MINT_MBRIDGE_EXPORT_GATHER_DEBUG", "1")
@@ -33,8 +33,8 @@ def test_issue_439_queue_execution_runtime_records_actor_name_and_placement_over
     assert actor_env["MINT_FUTURE_STORE_ACTOR_NAME"] == "future-v2"
     assert actor_env["MINT_K2_INFER_VOLC_RESOURCE_QUEUE_ID"] == "rq-k2"
     assert actor_env["MINT_VLLM_VOLC_RESOURCE_QUEUE_ID"] == "rq-vllm"
-    assert actor_env["MINT_MODEL_PLACEMENT_JSON"] == '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"worker_index":1,"gpu_count":4}}'
-    assert actor_env["MINT_MEGATRON_MODEL_PLACEMENT_JSON"] == '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"worker_index":1,"gpu_count":4}}'
+    assert actor_env["MINT_MODEL_PLACEMENT_JSON"] == '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"node_ip":"10.0.0.17","gpu_count":4}}'
+    assert actor_env["MINT_MEGATRON_MODEL_PLACEMENT_JSON"] == '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"node_ip":"10.0.0.17","gpu_count":4}}'
     assert actor_env["MINT_MBRIDGE_EXPORT_GLOO_TIMEOUT_S"] == "123"
     assert actor_env["MINT_MBRIDGE_EXPORT_GATHER_DEBUG"] == "1"
     assert actor_env["MINT_MBRIDGE_EXPORT_GLOO_BARRIER_DEBUG"] == "1"

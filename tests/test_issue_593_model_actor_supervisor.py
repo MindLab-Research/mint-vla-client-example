@@ -297,25 +297,6 @@ def test_issue_593_supervisor_parses_desired_specs_from_env(monkeypatch: pytest.
     ]
 
 
-def test_issue_593_supervisor_builds_runtime_placement_env_from_worker_spec() -> None:
-    env = _placement_env_for_spec(
-        ModelActorSpec(
-            domain_key="vllm:Qwen/Test",
-            replica_id="replica-2",
-            base_model="Qwen/Test",
-            worker_index=3,
-            gpu_count=4,
-        )
-    )
-
-    expected = '{"Qwen/Test":{"gpu_count":4,"replica":2,"worker_index":3}}'
-    assert env == {
-        "MINT_MODEL_PLACEMENT_JSON": expected,
-        "MINT_VLLM_MODEL_PLACEMENT_JSON": expected,
-        "MINT_MODEL_ACTOR_REPLICA_ID": "replica-2",
-    }
-
-
 def test_issue_593_supervisor_builds_runtime_placement_env_from_node_pin() -> None:
     env = _placement_env_for_spec(
         ModelActorSpec(
@@ -369,7 +350,7 @@ def test_issue_593_persistent_specs_inherit_runtime_placement(monkeypatch: pytes
     )
     monkeypatch.setenv(
         "MINT_DENSE_MODEL_PLACEMENT_JSON",
-        '{"Qwen/A":{"replica":0,"worker_index":3,"gpu_count":1}}',
+        '{"Qwen/A":{"replica":0,"node_ip":"10.0.0.8","gpu_count":1}}',
     )
 
     specs = desired_specs_from_env()
@@ -387,7 +368,7 @@ def test_issue_593_persistent_specs_inherit_runtime_placement(monkeypatch: pytes
             domain_key="training:Qwen/A",
             base_model="Qwen/A",
             launcher_key="training",
-            worker_index=3,
+            node_pin="10.0.0.8",
             gpu_count=1,
         ),
     ]
@@ -407,7 +388,7 @@ def test_issue_593_supervisor_empty_env_has_no_desired_specs(monkeypatch: pytest
     ]
 
 
-def test_issue_593_placement_reconciler_resolves_worker_and_removes_owned_orphan_pg() -> None:
+def test_issue_593_placement_reconciler_uses_node_pin_and_removes_owned_orphan_pg() -> None:
     capacity_checks: list[dict[str, object]] = []
     removed_pgs: list[tuple[str, str]] = []
     killed: list[tuple[str, str, str]] = []
@@ -432,7 +413,6 @@ def test_issue_593_placement_reconciler_resolves_worker_and_removes_owned_orphan
         ],
         capacity_checker=_capacity,
         placement_group_remover=lambda name, namespace: removed_pgs.append((name, namespace)) or True,
-        worker_resolver=lambda worker_indices, _context: [f"10.0.0.{worker_indices[0] + 10}"],
     )
 
     out = reconciler(
@@ -441,7 +421,7 @@ def test_issue_593_placement_reconciler_resolves_worker_and_removes_owned_orphan
                 domain_key="vllm:Qwen/Test",
                 replica_id="replica-1",
                 base_model="Qwen/Test",
-                worker_index=7,
+                node_pin="10.0.0.17",
                 gpu_count=4,
             )
         }
@@ -507,7 +487,6 @@ def test_issue_593_placement_reconciler_evicts_foreign_blockers_when_target_abse
             }
         ],
         placement_group_remover=lambda name, namespace: removed_pgs.append((name, namespace)) or True,
-        worker_resolver=lambda worker_indices, _context: [f"10.0.0.{worker_indices[0] + 10}"],
     )
 
     out = reconciler(
@@ -516,7 +495,7 @@ def test_issue_593_placement_reconciler_evicts_foreign_blockers_when_target_abse
                 domain_key="vllm:Qwen/Test",
                 replica_id="replica-1",
                 base_model="Qwen/Test",
-                worker_index=7,
+                node_pin="10.0.0.17",
                 gpu_count=4,
             )
         }
@@ -562,7 +541,6 @@ def test_issue_593_placement_reconciler_does_not_preempt_on_non_capacity_failure
             }
         ],
         placement_group_remover=lambda name, namespace: removed_pgs.append((name, namespace)) or True,
-        worker_resolver=lambda worker_indices, _context: [f"10.0.0.{worker_indices[0] + 10}"],
     )
 
     out = reconciler(
@@ -571,7 +549,7 @@ def test_issue_593_placement_reconciler_does_not_preempt_on_non_capacity_failure
                 domain_key="vllm:Qwen/Test",
                 replica_id="replica-1",
                 base_model="Qwen/Test",
-                worker_index=7,
+                node_pin="10.0.0.17",
                 gpu_count=4,
             )
         }
@@ -612,7 +590,6 @@ def test_issue_593_placement_reconciler_removes_unknown_namespace_pg_as_current_
             }
         ],
         placement_group_remover=lambda name, namespace: removed_pgs.append((name, namespace)) or True,
-        worker_resolver=lambda worker_indices, _context: [f"10.0.0.{worker_indices[0] + 10}"],
     )
 
     out = reconciler(
@@ -621,7 +598,7 @@ def test_issue_593_placement_reconciler_removes_unknown_namespace_pg_as_current_
                 domain_key="vllm:Qwen/Test",
                 replica_id="replica-1",
                 base_model="Qwen/Test",
-                worker_index=7,
+                node_pin="10.0.0.17",
                 gpu_count=4,
             )
         }
@@ -677,7 +654,6 @@ def test_issue_593_placement_reconciler_does_not_evict_foreign_blockers_when_tar
             }
         ],
         placement_group_remover=lambda name, namespace: removed_pgs.append((name, namespace)) or True,
-        worker_resolver=lambda worker_indices, _context: [f"10.0.0.{worker_indices[0] + 10}"],
     )
 
     out = reconciler(
@@ -686,7 +662,7 @@ def test_issue_593_placement_reconciler_does_not_evict_foreign_blockers_when_tar
                 domain_key="vllm:Qwen/Test",
                 replica_id="replica-1",
                 base_model="Qwen/Test",
-                worker_index=7,
+                node_pin="10.0.0.17",
                 gpu_count=4,
             )
         }
@@ -729,7 +705,7 @@ async def test_issue_593_supervisor_blocks_placement_capacity_failure_without_cr
                 domain_key="vllm:Qwen/Test",
                 replica_id="replica-0",
                 base_model="Qwen/Test",
-                worker_index=1,
+                node_pin="10.0.0.7",
                 gpu_count=4,
             )
         ],

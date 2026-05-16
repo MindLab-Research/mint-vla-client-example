@@ -1112,8 +1112,8 @@ def test_actor_runtime_env_vars_forwards_vllm_envs(tmp_path):
             "MINT_VLLM_MAX_LORAS": "4",
             "MINT_VLLM_MAX_CPU_LORAS": "8",
             "MINT_VLLM_MAX_LORA_RANK": "16",
-            "MINT_MODEL_PLACEMENT_JSON": '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"worker_index":1,"gpu_count":4}}',
-            "MINT_MEGATRON_MODEL_PLACEMENT_JSON": '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"worker_index":1,"gpu_count":4}}',
+            "MINT_MODEL_PLACEMENT_JSON": '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"node_ip":"10.0.0.17","gpu_count":4}}',
+            "MINT_MEGATRON_MODEL_PLACEMENT_JSON": '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"node_ip":"10.0.0.17","gpu_count":4}}',
         },
     )
     data = payload["runtime_env"]
@@ -1129,8 +1129,8 @@ def test_actor_runtime_env_vars_forwards_vllm_envs(tmp_path):
     assert actor_env["MINT_VLLM_MAX_LORAS"] == "4"
     assert actor_env["MINT_VLLM_MAX_CPU_LORAS"] == "8"
     assert actor_env["MINT_VLLM_MAX_LORA_RANK"] == "16"
-    assert actor_env["MINT_MODEL_PLACEMENT_JSON"] == '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"worker_index":1,"gpu_count":4}}'
-    assert actor_env["MINT_MEGATRON_MODEL_PLACEMENT_JSON"] == '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"worker_index":1,"gpu_count":4}}'
+    assert actor_env["MINT_MODEL_PLACEMENT_JSON"] == '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"node_ip":"10.0.0.17","gpu_count":4}}'
+    assert actor_env["MINT_MEGATRON_MODEL_PLACEMENT_JSON"] == '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"node_ip":"10.0.0.17","gpu_count":4}}'
 
 
 def test_actor_runtime_env_vars_forwards_config_path(tmp_path):

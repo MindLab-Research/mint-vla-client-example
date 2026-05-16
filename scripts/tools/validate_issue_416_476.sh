@@ -71,8 +71,8 @@ nohup env \
   RAY_ADDRESS="\$RAY_ADDR" \
   MINT_RAY_CLIENT_ADDRESS="\$RAY_ADDR" \
   PFS_TINKER_PATH="\$PFS_ROOT" \
-  ISSUE_MODEL_PLACEMENT_JSON='{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"worker_index":2,"gpu_count":4}}' \
-  ISSUE_MEGATRON_MODEL_PLACEMENT_JSON='{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"worker_index":2,"gpu_count":4}}' \
+  ISSUE_MODEL_PLACEMENT_JSON='{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"node_ip":"192.168.39.159","gpu_count":4}}' \
+  ISSUE_MEGATRON_MODEL_PLACEMENT_JSON='{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"node_ip":"192.168.39.159","gpu_count":4}}' \
   bash scripts/tools/start_issue_server.sh >> "\$LOG" 2>&1 &
 
 for _ in \$(seq 1 180); do
