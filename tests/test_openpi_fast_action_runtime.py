@@ -799,7 +799,7 @@ def test_action_session_router_recovers_shared_session_from_known_session_ids(mo
     assert router._manager_for_session["session-1:action:3"] is fake_fast_manager
 
 
-def test_start_openpi_action_ray_runtime_registers_actor_metadata_in_model_actor_supervisor_inventory(monkeypatch) -> None:
+def test_start_openpi_action_ray_runtime_registers_actor_metadata_in_model_actor_inventory(monkeypatch) -> None:
     from tinker_server.backend import openpi_action_ray_runtime
     from tinker_server.backend.openpi_fast_action_runtime import OpenPIFastActionRuntimeSpec
 

@@ -63,7 +63,7 @@ Default action requests now:
 - create a future
 - go through `ModelWorkScheduler` when async model-runtime scheduling is needed
 - execute on Mint-managed Ray actors
-- surface placement and lifecycle through `ModelActorSupervisor`, `ModelWorkScheduler`, and `ModelActorSupervisorInventory`
+- surface placement and lifecycle through `ModelActorSupervisor`, `ModelWorkScheduler`, and `ModelActorInventory`
 
 ### 4. Runtime declaration is now repo-owned
 

@@ -1021,7 +1021,7 @@ async def list_actors(
         description="Refresh VLLM/Megatron observability metadata before returning actors.",
     ),
 ) -> dict:
-    """List actors in the unified ModelActorSupervisorInventory. Admin only when auth enabled.
+    """List actors in the unified ModelActorInventory. Admin only when auth enabled.
 
     Query params:
         type: Optional filter ("vllm" | "megatron" | "dense")

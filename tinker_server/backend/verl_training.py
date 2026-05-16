@@ -2066,7 +2066,7 @@ class VerlTrainingEngine:
         self.default_base_model = default_base_model
         self.default_lora_rank = default_lora_rank
         self._workers: dict[str, ray.actor.ActorHandle] = {}
-        # Map model_id -> Ray actor name registered in ModelActorSupervisorInventory, used to keep
+        # Map model_id -> Ray actor name registered in ModelActorInventory, used to keep
         # actors marked as active during long-running calls (32k forward/backward).
         self._model_actor_supervisor_actor_names: dict[str, str] = {}
         self._actor_loaded_sessions: dict[str, str] = {}
@@ -2146,7 +2146,7 @@ class VerlTrainingEngine:
     def _touch_actor(self, session: "TrainingSession") -> None:
         """Update last_accessed timestamp and session for the session's actor.
 
-        ModelActorSupervisorInventory idleness is time-based; a 32k forward/backward can easily run
+        ModelActorInventory idleness is time-based; a 32k forward/backward can easily run
         longer than the idle timeout. We keep actors marked as active while a
         request is in-flight to prevent eviction of busy actors.
         """
@@ -2156,9 +2156,9 @@ class VerlTrainingEngine:
         try:
             from .model_actor_supervisor import get_model_actor_supervisor
 
-            model_actor_supervisor_inventory = get_model_actor_supervisor()
-            model_actor_supervisor_inventory.touch(actor_name)
-            model_actor_supervisor_inventory.set_session(actor_name, session.model_id)
+            model_actor_inventory = get_model_actor_supervisor()
+            model_actor_inventory.touch(actor_name)
+            model_actor_inventory.set_session(actor_name, session.model_id)
         except Exception:
             logger.debug("[%s] skip touch_actor for %s", session.model_id, actor_name, exc_info=True)
 
@@ -3152,7 +3152,7 @@ class VerlTrainingEngine:
         if session.backend != "peft":
             return worker
 
-        # Dense trainer can be evicted by ModelActorSupervisorInventory between RL stages.
+        # Dense trainer can be evicted by ModelActorInventory between RL stages.
         try:
             await async_get_ray_ref(worker.heartbeat.remote(), timeout_s=5)
             return worker
@@ -3403,7 +3403,7 @@ class VerlTrainingEngine:
         interval_s: float = 30.0,
         timeout_s: float | None = None,
     ):
-        """Await a Ray call while periodically touching ModelActorSupervisorInventory.
+        """Await a Ray call while periodically touching ModelActorInventory.
 
         Uses one Ray ObjectRef future so polling-slice timeouts do not cancel
         or restart the underlying Ray wait.

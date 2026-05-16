@@ -222,7 +222,7 @@ def _self_rss_bytes() -> int:
     return rss_pages * page_size
 
 
-def _model_actor_supervisor_inventory_local_snapshot() -> list[dict]:
+def _model_actor_inventory_local_snapshot() -> list[dict]:
     from ..backend.model_actor_supervisor import get_model_actor_supervisor
 
     pool = get_model_actor_supervisor()
@@ -281,11 +281,11 @@ async def admission_stats(*, include_actor_rss: bool = True) -> dict:
             from ..backend.model_actor_supervisor import get_model_actor_supervisor
 
             pool = get_model_actor_supervisor()
-            actors["model_actor_supervisor_inventory"] = pool.rss_snapshot(timeout_s=timeout_s)
-            actors["model_actor_supervisor_inventory_metadata_cache"] = pool.metadata_cache_metrics_snapshot()
-            actors["model_actor_supervisor_inventory_lifecycle"] = pool.lifecycle_metrics_snapshot()
+            actors["model_actor_inventory"] = pool.rss_snapshot(timeout_s=timeout_s)
+            actors["model_actor_inventory_metadata_cache"] = pool.metadata_cache_metrics_snapshot()
+            actors["model_actor_inventory_lifecycle"] = pool.lifecycle_metrics_snapshot()
         except Exception as e:
-            actors["model_actor_supervisor_inventory"] = {"error": f"{type(e).__name__}: {e}"}
+            actors["model_actor_inventory"] = {"error": f"{type(e).__name__}: {e}"}
     else:
         # Metrics scrapes must stay cheap. A single hung actor in rss_snapshot()
         # can otherwise block the API thread and stall unrelated routes.
@@ -293,11 +293,11 @@ async def admission_stats(*, include_actor_rss: bool = True) -> dict:
             from ..backend.model_actor_supervisor import get_model_actor_supervisor
 
             pool = get_model_actor_supervisor()
-            actors["model_actor_supervisor_inventory"] = pool.cached_snapshot()
-            actors["model_actor_supervisor_inventory_metadata_cache"] = pool.metadata_cache_metrics_snapshot()
-            actors["model_actor_supervisor_inventory_lifecycle"] = pool.lifecycle_metrics_snapshot()
+            actors["model_actor_inventory"] = pool.cached_snapshot()
+            actors["model_actor_inventory_metadata_cache"] = pool.metadata_cache_metrics_snapshot()
+            actors["model_actor_inventory_lifecycle"] = pool.lifecycle_metrics_snapshot()
         except Exception as e:
-            actors["model_actor_supervisor_inventory"] = {"error": f"{type(e).__name__}: {e}"}
+            actors["model_actor_inventory"] = {"error": f"{type(e).__name__}: {e}"}
 
     proc = {"pid": int(os.getpid())}
     try:
@@ -494,7 +494,7 @@ def _actor_workload(actor_type: object) -> str:
     return "sample" if str(actor_type or "").strip().lower() == "vllm" else "train"
 
 
-def _model_actor_supervisor_inventory_gpu_bindings(rec: dict[str, object]) -> list[dict[str, str]]:
+def _model_actor_inventory_gpu_bindings(rec: dict[str, object]) -> list[dict[str, str]]:
     metadata = rec.get("metadata") if isinstance(rec.get("metadata"), dict) else {}
     actor_name = str(rec.get("actor_name") or "unknown")
     actor_type = str(rec.get("actor_type") or "unknown")
@@ -728,11 +728,11 @@ async def metrics() -> Response:
                     labels={"actor": actor_key},
                 )
 
-        model_actor_supervisor_inventory = actors.get("model_actor_supervisor_inventory")
-        if isinstance(model_actor_supervisor_inventory, list):
+        model_actor_inventory = actors.get("model_actor_inventory")
+        if isinstance(model_actor_inventory, list):
             grouped: dict[tuple[str, str], dict[str, float]] = {}
             dense_poisoned_grouped: dict[tuple[str, str], float] = {}
-            for rec in model_actor_supervisor_inventory:
+            for rec in model_actor_inventory:
                 if not isinstance(rec, dict):
                     continue
                 actor_type = str(rec.get("actor_type") or "unknown")
@@ -740,10 +740,10 @@ async def metrics() -> Response:
                 actor_name = str(rec.get("actor_name") or "unknown")
                 labels = {"actor_type": actor_type, "model": model, "actor_name": actor_name}
                 metadata = rec.get("metadata") if isinstance(rec.get("metadata"), dict) else {}
-                _append_metric(lines, "mint_model_actor_supervisor_inventory_actor_idle_time_s", rec.get("idle_time"), labels=labels)
-                _append_metric(lines, "mint_model_actor_supervisor_inventory_actor_age_s", rec.get("age"), labels=labels)
-                _append_metric(lines, "mint_model_actor_supervisor_inventory_actor_rss_bytes", rec.get("rss_bytes"), labels=labels)
-                _append_metric(lines, "mint_model_actor_supervisor_inventory_actor_rss_sample_age_s", rec.get("rss_sample_age_s"), labels=labels)
+                _append_metric(lines, "mint_model_actor_inventory_actor_idle_time_s", rec.get("idle_time"), labels=labels)
+                _append_metric(lines, "mint_model_actor_inventory_actor_age_s", rec.get("age"), labels=labels)
+                _append_metric(lines, "mint_model_actor_inventory_actor_rss_bytes", rec.get("rss_bytes"), labels=labels)
+                _append_metric(lines, "mint_model_actor_inventory_actor_rss_sample_age_s", rec.get("rss_sample_age_s"), labels=labels)
                 if actor_type.strip().lower() == "vllm":
                     vllm_labels = {"actor_name": actor_name, "base_model": model}
                     _append_metric(
@@ -856,8 +856,8 @@ async def metrics() -> Response:
                         )
                     key = (model, last_fatal_op)
                     dense_poisoned_grouped[key] = float(dense_poisoned_grouped.get(key, 0.0)) + 1.0
-                for binding in _model_actor_supervisor_inventory_gpu_bindings(rec):
-                    _append_metric(lines, "mint_model_actor_supervisor_inventory_actor_gpu_binding", 1, labels=binding)
+                for binding in _model_actor_inventory_gpu_bindings(rec):
+                    _append_metric(lines, "mint_model_actor_inventory_actor_gpu_binding", 1, labels=binding)
 
                 rss_state = str(rec.get("rss_cache_state") or "").strip().lower()
                 if rss_state not in {"fresh", "stale", "unknown"}:
@@ -869,7 +869,7 @@ async def metrics() -> Response:
                         rss_state = "unknown"
                 _append_metric(
                     lines,
-                    "mint_model_actor_supervisor_inventory_actor_rss_cache_state",
+                    "mint_model_actor_inventory_actor_rss_cache_state",
                     1,
                     labels={**labels, "state": rss_state},
                 )
@@ -902,17 +902,17 @@ async def metrics() -> Response:
 
             for (actor_type, model), agg in grouped.items():
                 labels = {"actor_type": actor_type, "model": model}
-                _append_metric(lines, "mint_model_actor_supervisor_inventory_actors", agg["count"], labels=labels)
-                _append_metric(lines, "mint_model_actor_supervisor_inventory_group_oldest_idle_time_s", agg["max_idle"], labels=labels)
-                _append_metric(lines, "mint_model_actor_supervisor_inventory_group_oldest_age_s", agg["max_age"], labels=labels)
+                _append_metric(lines, "mint_model_actor_inventory_actors", agg["count"], labels=labels)
+                _append_metric(lines, "mint_model_actor_inventory_group_oldest_idle_time_s", agg["max_idle"], labels=labels)
+                _append_metric(lines, "mint_model_actor_inventory_group_oldest_age_s", agg["max_age"], labels=labels)
                 if agg.get("rss_count", 0.0) > 0.0:
-                    _append_metric(lines, "mint_model_actor_supervisor_inventory_group_rss_bytes", agg["rss_sum"], labels=labels)
+                    _append_metric(lines, "mint_model_actor_inventory_group_rss_bytes", agg["rss_sum"], labels=labels)
                 for state in ("fresh", "stale", "unknown"):
                     key = f"rss_{state}"
                     if agg.get(key, 0.0) > 0.0:
                         _append_metric(
                             lines,
-                            "mint_model_actor_supervisor_inventory_group_rss_cache_samples",
+                            "mint_model_actor_inventory_group_rss_cache_samples",
                             agg[key],
                             labels={**labels, "state": state},
                         )
@@ -925,40 +925,40 @@ async def metrics() -> Response:
                     labels={"base_model": base_model, "last_fatal_op": last_fatal_op},
                 )
 
-        model_actor_supervisor_inventory_metadata_cache = actors.get("model_actor_supervisor_inventory_metadata_cache")
-        if isinstance(model_actor_supervisor_inventory_metadata_cache, list):
-            for row in model_actor_supervisor_inventory_metadata_cache:
+        model_actor_inventory_metadata_cache = actors.get("model_actor_inventory_metadata_cache")
+        if isinstance(model_actor_inventory_metadata_cache, list):
+            for row in model_actor_inventory_metadata_cache:
                 if not isinstance(row, dict):
                     continue
                 labels = {"actor_type": row.get("actor_type") or "unknown"}
                 _append_metric(
                     lines,
-                    "mint_model_actor_supervisor_inventory_observability_cache_hits_total",
+                    "mint_model_actor_inventory_observability_cache_hits_total",
                     row.get("cache_hits_total"),
                     labels=labels,
                 )
                 _append_metric(
                     lines,
-                    "mint_model_actor_supervisor_inventory_observability_cache_stale_total",
+                    "mint_model_actor_inventory_observability_cache_stale_total",
                     row.get("cache_stale_total"),
                     labels=labels,
                 )
                 _append_metric(
                     lines,
-                    "mint_model_actor_supervisor_inventory_observability_refresh_success_total",
+                    "mint_model_actor_inventory_observability_refresh_success_total",
                     row.get("refresh_success_total"),
                     labels=labels,
                 )
                 _append_metric(
                     lines,
-                    "mint_model_actor_supervisor_inventory_observability_refresh_failures_total",
+                    "mint_model_actor_inventory_observability_refresh_failures_total",
                     row.get("refresh_failures_total"),
                     labels=labels,
                 )
 
-        model_actor_supervisor_inventory_lifecycle = actors.get("model_actor_supervisor_inventory_lifecycle")
-        if isinstance(model_actor_supervisor_inventory_lifecycle, list):
-            for row in model_actor_supervisor_inventory_lifecycle:
+        model_actor_inventory_lifecycle = actors.get("model_actor_inventory_lifecycle")
+        if isinstance(model_actor_inventory_lifecycle, list):
+            for row in model_actor_inventory_lifecycle:
                 if not isinstance(row, dict):
                     continue
                 key = (str(row.get("base_model") or "unknown"), str(row.get("event") or "unknown"))

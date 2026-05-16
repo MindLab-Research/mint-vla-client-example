@@ -183,7 +183,7 @@ def test_start_openpi_shared_ray_runtime_reuses_actor_for_same_pool_key(monkeypa
     ]
 
 
-def test_start_openpi_shared_ray_runtime_registers_actor_metadata_in_model_actor_supervisor_inventory(monkeypatch) -> None:
+def test_start_openpi_shared_ray_runtime_registers_actor_metadata_in_model_actor_inventory(monkeypatch) -> None:
     from tinker_server.backend import openpi_shared_ray_runtime
 
     state: dict[str, object] = {}

@@ -401,7 +401,7 @@ def test_issue_572_dense_load_checkpoint_rejects_non_int_adapter_config_rank(tmp
 def test_issue_572_dense_create_passes_configured_max_rank(monkeypatch) -> None:
     import tinker_server.backend.dense_trainer as dense_trainer
     import tinker_server.backend.model_registry as model_registry
-    import tinker_server.backend.model_actor_supervisor as model_actor_supervisor_inventory
+    import tinker_server.backend.model_actor_supervisor as model_actor_inventory
     import tinker_server.backend.verl_training as verl_training
     from tinker_server.backend.verl_training import VerlTrainingEngine
 
@@ -437,7 +437,7 @@ def test_issue_572_dense_create_passes_configured_max_rank(monkeypatch) -> None:
         return ref
 
     monkeypatch.setattr(dense_trainer, "get_or_create_dense_trainer", _fake_get_or_create_dense_trainer)
-    monkeypatch.setattr(model_actor_supervisor_inventory, "get_model_actor_supervisor", lambda: _Pool())
+    monkeypatch.setattr(model_actor_inventory, "get_model_actor_supervisor", lambda: _Pool())
 
     engine = VerlTrainingEngine(default_base_model="/models/qwen", default_lora_rank=8)
     engine._await_worker_call = _fake_await_worker_call

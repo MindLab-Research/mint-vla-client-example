@@ -175,7 +175,7 @@ def main() -> int:
         lora_sid = _create_sampling_session(base_model=BASE_MODEL, model_path=ADAPTER_PATH)
         lora_rid = _asample(lora_sid, max_tokens=1)
 
-        # Let LoRA load start, then start high-GPU training creates to trigger ModelActorSupervisorInventory eviction.
+        # Let LoRA load start, then start high-GPU training creates to trigger ModelActorInventory eviction.
         time.sleep(max(0.0, EVICT_DELAY_S))
         _create_model_pressure()
 

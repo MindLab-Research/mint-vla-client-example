@@ -507,7 +507,7 @@ async def test_issue_281_do_reset_expert_bias_resolves_future(monkeypatch) -> No
 @pytest.mark.anyio
 async def test_issue_281_do_delete_model_deletes_then_resolves(monkeypatch) -> None:
     _install_ray_stub(monkeypatch)
-    import tinker_server.backend.model_actor_supervisor as model_actor_supervisor_inventory
+    import tinker_server.backend.model_actor_supervisor as model_actor_inventory
     import tinker_server.backend.training_session_store as training_session_store
     from tinker_server.routes import training as tr
 
@@ -541,7 +541,7 @@ async def test_issue_281_do_delete_model_deletes_then_resolves(monkeypatch) -> N
     )
     monkeypatch.setattr(training_session_store, "delete_training_session", lambda model_id: calls["delete_store"].append(model_id))
     monkeypatch.setattr(
-        model_actor_supervisor_inventory,
+        model_actor_inventory,
         "get_model_actor_supervisor",
         lambda: SimpleNamespace(clear_session=lambda model_id: calls["clear_session"].append(model_id)),
     )

@@ -8,7 +8,7 @@ import tinker_server.backend.model_actor_inventory as model_actor_inventory_modu
 from tinker_server.backend.model_actor_supervisor import ActorType, get_model_actor_supervisor
 
 
-def test_model_actor_supervisor_inventory_list_actors_includes_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_model_actor_inventory_list_actors_includes_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(model_actor_inventory_module.ray, "is_initialized", lambda: False)
     pool = get_model_actor_supervisor()
     pool.clear(kill_actors=False)
@@ -17,7 +17,7 @@ def test_model_actor_supervisor_inventory_list_actors_includes_metadata(monkeypa
     pool.unregister(actor_name)
 
 
-def test_model_actor_supervisor_inventory_list_actors_labels_openpi_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_model_actor_inventory_list_actors_labels_openpi_backend(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(model_actor_inventory_module.ray, "is_initialized", lambda: False)
     pool = get_model_actor_supervisor()
     pool.clear(kill_actors=False)

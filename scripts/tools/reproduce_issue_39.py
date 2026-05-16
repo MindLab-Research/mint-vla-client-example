@@ -144,7 +144,7 @@ def main() -> int:
         if "error" in out:
             return _fail(f"retrieve_future error: {out.get('error')!r}")
 
-        # New unified actor endpoints must exist and use ModelActorSupervisorInventory schema.
+        # New unified actor endpoints must exist and use ModelActorInventory schema.
         vllm = _get_json("/api/v1/actors?type=vllm", timeout_s=30.0)
         actors = vllm.get("actors")
         if not isinstance(actors, list):

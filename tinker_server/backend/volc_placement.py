@@ -353,7 +353,7 @@ def _available_resources_per_node_with_pg_fallback(
                 float(used_gpus),
             )
     except Exception as e:
-        logger.debug("%s: model_actor_supervisor_inventory fallback failed: %s", context, e)
+        logger.debug("%s: model_actor_inventory fallback failed: %s", context, e)
 
     # Ray Client mode cannot always access per-node availability via ray._private.state.
     # If actor-state fallback succeeds we can still trust the derived reservations. Otherwise,

@@ -10,14 +10,14 @@ from tinker_server.backend.training_session_manager import TrainingSession
 from tinker_server.backend.verl_training import VerlTrainingEngine
 
 
-def _get_local_model_actor_supervisor_inventory(monkeypatch: pytest.MonkeyPatch):
+def _get_local_model_actor_inventory(monkeypatch: pytest.MonkeyPatch):
     pool = get_model_actor_supervisor()
     pool.clear(kill_actors=False)
     return pool
 
 
 def test_issue_230_timeout_does_not_kill_actor(monkeypatch: pytest.MonkeyPatch) -> None:
-    pool = _get_local_model_actor_supervisor_inventory(monkeypatch)
+    pool = _get_local_model_actor_inventory(monkeypatch)
     actor_name = f"peft_trainer_test_{uuid.uuid4().hex}_maxr64"
     model_id = f"model_{uuid.uuid4().hex}"
 
@@ -69,7 +69,7 @@ def test_issue_230_timeout_does_not_kill_actor(monkeypatch: pytest.MonkeyPatch) 
 
 
 def test_issue_230_keepalive_touches_dense_actor_without_inflight_mark(monkeypatch: pytest.MonkeyPatch) -> None:
-    pool = _get_local_model_actor_supervisor_inventory(monkeypatch)
+    pool = _get_local_model_actor_inventory(monkeypatch)
     actor_name = f"peft_trainer_test_{uuid.uuid4().hex}_maxr64"
     model_id = f"model_{uuid.uuid4().hex}"
 
@@ -127,7 +127,7 @@ def test_issue_230_keepalive_touches_dense_actor_without_inflight_mark(monkeypat
 
 
 def test_issue_230_keepalive_cancellation_silences_late_exception(monkeypatch: pytest.MonkeyPatch) -> None:
-    pool = _get_local_model_actor_supervisor_inventory(monkeypatch)
+    pool = _get_local_model_actor_inventory(monkeypatch)
     actor_name = f"peft_trainer_test_{uuid.uuid4().hex}_maxr64"
     model_id = f"model_{uuid.uuid4().hex}"
 
@@ -190,7 +190,7 @@ def test_issue_230_keepalive_cancellation_silences_late_exception(monkeypatch: p
 
 
 def test_issue_230_unbind_session_keeps_shared_dense_actor_pinned(monkeypatch: pytest.MonkeyPatch) -> None:
-    pool = _get_local_model_actor_supervisor_inventory(monkeypatch)
+    pool = _get_local_model_actor_inventory(monkeypatch)
     actor_name = f"peft_trainer_test_{uuid.uuid4().hex}_maxr64"
     model_id = f"model_{uuid.uuid4().hex}"
     other_model_id = f"model_{uuid.uuid4().hex}"
@@ -242,7 +242,7 @@ def test_issue_230_unbind_session_keeps_shared_dense_actor_pinned(monkeypatch: p
 
 
 def test_issue_230_shutdown_session_keeps_protected_dense_actor_alive(monkeypatch: pytest.MonkeyPatch) -> None:
-    pool = _get_local_model_actor_supervisor_inventory(monkeypatch)
+    pool = _get_local_model_actor_inventory(monkeypatch)
     actor_name = f"peft_trainer_test_{uuid.uuid4().hex}_maxr64"
     model_id = f"model_{uuid.uuid4().hex}"
 

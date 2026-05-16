@@ -49,7 +49,7 @@ Each actor has:
 - vLLM: idle if `idle_time() > session_idle_timeout`
 - training actors: idle if `current_session is None` or `idle_time() > session_idle_timeout`
 
-The only config knob left for this surface is `[model_actor_supervisor_inventory].session_idle_timeout_s`, mirrored by `MINT_MODEL_ACTOR_SUPERVISOR_INVENTORY_SESSION_IDLE_TIMEOUT_S`.
+The only config knob left for this surface is `[model_actor_inventory].session_idle_timeout_s`, mirrored by `MINT_MODEL_ACTOR_INVENTORY_SESSION_IDLE_TIMEOUT_S`.
 
 ## Admin kill
 

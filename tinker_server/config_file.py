@@ -80,7 +80,7 @@ class _MegatronBridgeSection(BaseModel):
     use_mbridge_lora_export: bool | None = None
 
 
-class _ModelActorSupervisorInventorySection(BaseModel):
+class _ModelActorInventorySection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     session_idle_timeout_s: int | None = None
@@ -150,7 +150,7 @@ class TinkerConfigFile(BaseModel):
     ray: _RaySection = Field(default_factory=_RaySection)
     paths: _PathsSection = Field(default_factory=_PathsSection)
     megatron_bridge: _MegatronBridgeSection = Field(default_factory=_MegatronBridgeSection)
-    model_actor_supervisor_inventory: _ModelActorSupervisorInventorySection = Field(default_factory=_ModelActorSupervisorInventorySection)
+    model_actor_inventory: _ModelActorInventorySection = Field(default_factory=_ModelActorInventorySection)
     future: _FutureSection = Field(default_factory=_FutureSection)
     task_state_store: _TaskStateStoreSection = Field(default_factory=_TaskStateStoreSection)
     training: _TrainingSection = Field(default_factory=_TrainingSection)

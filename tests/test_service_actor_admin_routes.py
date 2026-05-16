@@ -36,7 +36,7 @@ class _FakePool:
         self.total_gpus_used_calls = 0
 
     def list_actors(self, *, refresh_metadata: bool = False, actor_type=None, model_name: str | None = None) -> list[dict]:
-        raise AssertionError("/actors route must use ModelActorSupervisorInventory.async_list_actors")
+        raise AssertionError("/actors route must use ModelActorInventory.async_list_actors")
 
     async def async_list_actors(
         self,
@@ -50,7 +50,7 @@ class _FakePool:
         return list(self._actors)
 
     def total_gpus_used(self) -> int:
-        raise AssertionError("/actors route must use ModelActorSupervisorInventory.async_total_gpus_used")
+        raise AssertionError("/actors route must use ModelActorInventory.async_total_gpus_used")
 
     async def async_total_gpus_used(self) -> int:
         self.total_gpus_used_calls += 1
@@ -71,10 +71,10 @@ class _FakePool:
 
 def _build_client(monkeypatch, pool: _FakePool, *, patch_placement_groups: bool = True) -> TestClient:
     from tinker_server.routes import service as service_routes
-    import tinker_server.backend.model_actor_supervisor as model_actor_supervisor_inventory
+    import tinker_server.backend.model_actor_supervisor as model_actor_inventory
 
     monkeypatch.setattr(service_routes, "_require_admin", lambda _request: None)
-    monkeypatch.setattr(model_actor_supervisor_inventory, "get_model_actor_supervisor", lambda: pool)
+    monkeypatch.setattr(model_actor_inventory, "get_model_actor_supervisor", lambda: pool)
     if patch_placement_groups:
         async def _empty_placement_group_table(*_args, **_kwargs):
             return {}
@@ -135,7 +135,7 @@ def test_list_actors_can_skip_metadata_refresh(monkeypatch) -> None:
     assert pool.list_actor_refresh_metadata_calls == [False]
 
 
-def test_list_actors_passes_filters_to_model_actor_supervisor_inventory_before_refresh(monkeypatch) -> None:
+def test_list_actors_passes_filters_to_model_actor_inventory_before_refresh(monkeypatch) -> None:
     from tinker_server.backend.model_actor_supervisor import ActorType
 
     _install_ray_stub(monkeypatch)
@@ -157,7 +157,7 @@ def test_list_actors_passes_filters_to_model_actor_supervisor_inventory_before_r
     ]
 
 
-def test_list_actors_uses_async_model_actor_supervisor_inventory_inventory(monkeypatch) -> None:
+def test_list_actors_uses_async_model_actor_inventory_inventory(monkeypatch) -> None:
     _install_ray_stub(monkeypatch)
     pool = _FakePool(
         actors=[{"actor_name": "vllm-a", "actor_type": "vllm", "base_model": "Qwen/Qwen3-4B-Instruct-2507"}],
@@ -172,7 +172,7 @@ def test_list_actors_uses_async_model_actor_supervisor_inventory_inventory(monke
     assert pool.total_gpus_used_calls == 1
 
 
-def test_list_actors_returns_503_when_model_actor_supervisor_inventory_inventory_fails(monkeypatch) -> None:
+def test_list_actors_returns_503_when_model_actor_inventory_inventory_fails(monkeypatch) -> None:
     class _FailingListPool(_FakePool):
         async def async_list_actors(self, **_kwargs) -> list[dict]:
             raise RuntimeError("ray disconnected")
@@ -187,7 +187,7 @@ def test_list_actors_returns_503_when_model_actor_supervisor_inventory_inventory
     assert "ray disconnected" in resp.text
 
 
-def test_list_actors_returns_503_when_model_actor_supervisor_inventory_gpu_total_fails(monkeypatch) -> None:
+def test_list_actors_returns_503_when_model_actor_inventory_gpu_total_fails(monkeypatch) -> None:
     class _FailingGpuTotalPool(_FakePool):
         async def async_total_gpus_used(self) -> int:
             raise RuntimeError("model actor registry unavailable")

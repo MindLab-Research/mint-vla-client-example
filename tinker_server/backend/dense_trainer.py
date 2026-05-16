@@ -1,9 +1,9 @@
-"""PEFT (dense) trainer actor helpers (ModelActorSupervisorInventory is the source of truth).
+"""PEFT (dense) trainer actor helpers (ModelActorInventory is the source of truth).
 
 This module replaces the previous DenseTrainerPool tracking dictionary with:
 - deterministic actor naming
 - a small inflight-creation guard keyed by Ray actor identity
-- ModelActorSupervisorInventory registration for lifecycle and eviction
+- ModelActorInventory registration for lifecycle and eviction
 """
 
 from __future__ import annotations
@@ -227,7 +227,7 @@ def _remove_pg(actor_name: str) -> None:
 
 
 def clear_dense_trainer_session(session_id: str) -> int:
-    """Clear ModelActorSupervisorInventory current_session pointers for dense trainers."""
+    """Clear ModelActorInventory current_session pointers for dense trainers."""
     return get_model_actor_supervisor().clear_session(session_id, actor_type=ActorType.DENSE)
 
 
@@ -400,7 +400,7 @@ def get_or_create_dense_trainer(
 ) -> DenseTrainerHandle:
     """Get an existing dense trainer actor or create a new one.
 
-    The returned actor is registered in ModelActorSupervisorInventory with metadata:
+    The returned actor is registered in ModelActorInventory with metadata:
       - max_lora_rank
       - actual_rank (current session rank)
     """
@@ -606,7 +606,7 @@ def get_or_create_dense_trainer(
 
 
 def remove_dense_trainers(*, base_model: str, kill_actor: bool = True) -> int:
-    """Remove dense trainer actors for base_model from ModelActorSupervisorInventory (and optionally Ray)."""
+    """Remove dense trainer actors for base_model from ModelActorInventory (and optionally Ray)."""
     pool = get_model_actor_supervisor()
     targets = [e for e in pool.iter_entries() if e.actor_type == ActorType.DENSE and e.base_model == base_model]
     if not targets:

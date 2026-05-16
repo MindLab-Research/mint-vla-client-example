@@ -140,7 +140,7 @@ _LEGACY_REMOVED_GUARD_TESTS = {
     "test_issue_193_megatron_sampler_save_does_not_clear_volatile_train_state",
     "test_issue_193_megatron_save_weights_does_not_clear_volatile_train_state",
     "test_issue_193_megatron_missing_worker_rebinds_before_recycle",
-    "test_issue_193_megatron_rebind_re_registers_model_actor_supervisor_inventory",
+    "test_issue_193_megatron_rebind_re_registers_model_actor_inventory",
     "test_issue_193_megatron_rebind_ready_death_maps_to_missing_worker",
     "test_issue_193_megatron_missing_worker_with_live_state_still_fails_closed",
     "test_issue_193_megatron_missing_actor_without_cache_fails_closed",
@@ -1524,7 +1524,7 @@ def test_issue_193_megatron_missing_worker_rebinds_before_recycle(monkeypatch):
     assert rebind_calls == ["forward:missing_worker"]
 
 
-def test_issue_193_megatron_rebind_re_registers_model_actor_supervisor_inventory(monkeypatch):
+def test_issue_193_megatron_rebind_re_registers_model_actor_inventory(monkeypatch):
     engine = VerlTrainingEngine()
     model_id = "model_issue_193_megatron_rebind_registers_pool"
     worker = _FakeLoadWorker(ref="unused-load-ref")

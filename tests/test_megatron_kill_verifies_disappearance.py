@@ -95,8 +95,8 @@ def _import_megatron_modules():
     _ensure_peft_stubbed()
     dist = importlib.import_module("tinker_server.backend.megatron_distributed")
     ray_kill = importlib.import_module("tinker_server.backend.ray_kill")
-    model_actor_supervisor_inventory = importlib.import_module("tinker_server.backend.model_actor_supervisor")
-    return dist, ray_kill, model_actor_supervisor_inventory
+    model_actor_inventory = importlib.import_module("tinker_server.backend.model_actor_supervisor")
+    return dist, ray_kill, model_actor_inventory
 
 
 class _ShutdownHandle:
@@ -156,14 +156,14 @@ def test_ray_kill_verify_absent_polls_until_lookup_fails(monkeypatch):
 
 
 def test_kill_megatron_actor_unregisters_only_after_verified_disappearance(monkeypatch):
-    dist, _, model_actor_supervisor_inventory = _import_megatron_modules()
+    dist, _, model_actor_inventory = _import_megatron_modules()
     pool = _Pool()
     kill_kwargs: dict[str, object] = {}
 
     monkeypatch.setattr(dist.ray, "is_initialized", lambda: True)
     monkeypatch.setattr(dist.ray, "get_actor", lambda actor_name, namespace: _ActorHandle())
     monkeypatch.setattr(dist.ray, "get", lambda _ref, timeout=None: None)
-    monkeypatch.setattr(model_actor_supervisor_inventory, "get_model_actor_supervisor", lambda: pool)
+    monkeypatch.setattr(model_actor_inventory, "get_model_actor_supervisor", lambda: pool)
     monkeypatch.setattr(
         dist.ray_kill,
         "kill",
@@ -178,13 +178,13 @@ def test_kill_megatron_actor_unregisters_only_after_verified_disappearance(monke
 
 
 def test_kill_megatron_actor_does_not_unregister_when_actor_stays_resolvable(monkeypatch):
-    dist, ray_kill, model_actor_supervisor_inventory = _import_megatron_modules()
+    dist, ray_kill, model_actor_inventory = _import_megatron_modules()
     pool = _Pool()
 
     monkeypatch.setattr(dist.ray, "is_initialized", lambda: True)
     monkeypatch.setattr(dist.ray, "get_actor", lambda actor_name, namespace: _ActorHandle())
     monkeypatch.setattr(dist.ray, "get", lambda _ref, timeout=None: None)
-    monkeypatch.setattr(model_actor_supervisor_inventory, "get_model_actor_supervisor", lambda: pool)
+    monkeypatch.setattr(model_actor_inventory, "get_model_actor_supervisor", lambda: pool)
     monkeypatch.setattr(
         dist.ray_kill,
         "kill",
