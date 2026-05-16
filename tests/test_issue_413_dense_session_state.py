@@ -131,8 +131,6 @@ def test_issue_413_shutdown_session_reclaims_dense_state_for_shared_actor(
     runtime_env_root.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(config_module, "PFS_RUNTIME_ENV_ROOT", str(runtime_env_root))
     monkeypatch.setattr(config_module, "PFS_PYTHONPATH", str((tmp_path / "runtime_py").resolve()))
-
-    monkeypatch.setattr(model_actor_registry_module, "_detached_enabled", lambda: False)
     monkeypatch.setattr(model_actor_registry_module.ray, "is_initialized", lambda: False)
     monkeypatch.setattr(ModelActorRegistry, "_instance", None)
     pool = get_model_actor_registry()

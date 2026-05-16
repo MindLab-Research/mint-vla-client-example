@@ -9,7 +9,6 @@ from tinker_server.backend.model_actor_registry import ActorType, ModelActorRegi
 
 
 def test_model_actor_registry_list_actors_includes_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(model_actor_registry_module, "_detached_enabled", lambda: False)
     monkeypatch.setattr(model_actor_registry_module.ray, "is_initialized", lambda: False)
     monkeypatch.setattr(ModelActorRegistry, "_instance", None)
     pool = get_model_actor_registry()
@@ -19,7 +18,6 @@ def test_model_actor_registry_list_actors_includes_metadata(monkeypatch: pytest.
 
 
 def test_model_actor_registry_list_actors_labels_openpi_backend(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(model_actor_registry_module, "_detached_enabled", lambda: False)
     monkeypatch.setattr(model_actor_registry_module.ray, "is_initialized", lambda: False)
     monkeypatch.setattr(ModelActorRegistry, "_instance", None)
     pool = get_model_actor_registry()

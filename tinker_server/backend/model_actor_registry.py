@@ -1,19 +1,14 @@
-"""Unified ModelActorRegistry with detached control-plane state.
+"""Process-local model actor registry.
 
-All GPU-using actors share one admission and eviction control plane. In
-multi-worker API deployments the authoritative state lives in a detached Ray
-actor so inventory, pending GPU reservations, LRU, inflight counts, protection
-flags, and session bindings stay consistent across workers.
-
-Process-local state is limited to actor-handle caching. When Ray is not
-initialized, the module falls back to an in-process state object so unit tests
-can still use the same API.
+All GPU-using runtime actors publish inventory, inflight counts, protection
+flags, and session bindings here. The registry is intentionally process-local:
+the durable scheduling state lives in TaskStateStore/ModelWorkScheduler, while
+actor desired-state reconciliation belongs to ModelActorSupervisor.
 """
 
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import logging
 import os
 import threading
@@ -24,8 +19,7 @@ from typing import Any, cast
 
 import ray
 
-from ..config import config as server_config, otel_env_vars
-from ..ray_utils import register_ray_reconnect_invalidator as _register_ray_reconnect_invalidator
+from ..config import config as server_config
 from . import ray_kill
 from .async_ray_control import async_get_ray_ref
 
@@ -523,239 +517,6 @@ def _restore_actor_types(values: list[str] | tuple[str, ...] | None) -> tuple[Ac
     return tuple(ActorType(str(value)) for value in values)
 
 
-def _ray_namespace() -> str:
-    env_ns = os.environ.get("TINKER_RAY_NAMESPACE") or os.environ.get("MINT_RAY_NAMESPACE")
-    if env_ns:
-        return env_ns
-    try:
-        from ..config import RAY_NAMESPACE
-
-        return RAY_NAMESPACE
-    except Exception:
-        return "tinker"
-
-
-def _actor_name() -> str:
-    return os.environ.get("MINT_MODEL_ACTOR_REGISTRY_ACTOR_NAME", "mint_model_actor_registry")
-
-
-def _detached_enabled() -> bool:
-    if os.environ.get("MINT_MODEL_ACTOR_REGISTRY_LOCAL_ONLY", "0") == "1":
-        return False
-    try:
-        return bool(ray.is_initialized())
-    except Exception:
-        return False
-
-
-async def _await_ray_ref(ref: Any) -> Any:
-    if hasattr(ref, "__await__"):
-        return await cast(Any, ref)
-
-    to_future = getattr(ref, "future", None)
-    if callable(to_future):
-        fut = to_future()
-        if isinstance(fut, asyncio.Future):
-            return await fut
-        if isinstance(fut, concurrent.futures.Future):
-            return await asyncio.wrap_future(fut)
-        if hasattr(fut, "__await__"):
-            return await cast(Any, fut)
-
-    raise TypeError(f"Ray ref is not awaitable: {type(ref)}")
-
-
-_MODEL_ACTOR_REGISTRY_ACTOR_HANDLE = None
-
-def _reset_cached_actor_handle() -> None:
-    global _MODEL_ACTOR_REGISTRY_ACTOR_HANDLE
-    _MODEL_ACTOR_REGISTRY_ACTOR_HANDLE = None
-
-_register_ray_reconnect_invalidator(_reset_cached_actor_handle)
-
-
-def _get_or_create_actor_sync() -> Any:
-    global _MODEL_ACTOR_REGISTRY_ACTOR_HANDLE
-
-    if not _detached_enabled():
-        raise RuntimeError("Ray not initialized")
-
-    name = _actor_name()
-    namespace = _ray_namespace()
-    try:
-        _MODEL_ACTOR_REGISTRY_ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)
-        return _MODEL_ACTOR_REGISTRY_ACTOR_HANDLE
-    except ValueError:
-        pass
-
-    min_actor_age = int(server_config.model_actor_registry_min_actor_age_s)
-    session_idle_timeout = int(server_config.model_actor_registry_session_idle_timeout_s)
-
-    @ray.remote(num_cpus=0)
-    class _ModelActorRegistryActor:
-        def __init__(self, *, min_actor_age: int, session_idle_timeout: int) -> None:
-            from ..logging_context import init_actor_observability
-
-            init_actor_observability()
-            self._state = _ModelActorRegistryState(
-                min_actor_age=min_actor_age,
-                session_idle_timeout=session_idle_timeout,
-            )
-
-        def register(self, info: dict[str, Any]) -> dict[str, Any]:
-            entry = self._state.register(
-                actor_name=str(info.get("actor_name") or ""),
-                actor_type=ActorType(str(info.get("actor_type") or ActorType.DENSE.value)),
-                num_gpus=int(info.get("num_gpus") or 0),
-                namespace=str(info.get("namespace") or "tinker"),
-                base_model=str(info.get("base_model") or ""),
-                session_id=info.get("session_id"),
-                node_id=info.get("node_id"),
-                protected=bool(info.get("protected", False)),
-                metadata=dict(info.get("metadata") or {}),
-            )
-            return _entry_to_record(entry)
-
-        def unregister(self, actor_name: str) -> bool:
-            return self._state.unregister(actor_name)
-
-        def get(self, actor_name: str, touch: bool = True) -> dict[str, Any] | None:
-            entry = self._state.get(actor_name, touch=bool(touch))
-            return None if entry is None else _entry_to_record(entry)
-
-        def set_session(self, actor_name: str, session_id: str | None) -> bool:
-            return self._state.set_session(actor_name, session_id)
-
-        def set_protected(self, actor_name: str, protected: bool = True) -> bool:
-            return self._state.set_protected(actor_name, protected)
-
-        def is_protected(self, actor_name: str) -> bool:
-            return self._state.is_protected(actor_name)
-
-        def touch(self, actor_name: str) -> bool:
-            return self._state.touch(actor_name)
-
-        def mark_inflight(self, actor_name: str, delta: int) -> bool:
-            return self._state.mark_inflight(actor_name, delta)
-
-        def mark_ready(self, actor_name: str) -> bool:
-            return self._state.mark_ready(actor_name)
-
-        def update_metadata(
-            self,
-            actor_name: str,
-            metadata: dict[str, Any],
-            sample_time: float | None = None,
-            sample_source: str | None = None,
-        ) -> bool:
-            return self._state.update_metadata(
-                actor_name,
-                metadata=dict(metadata or {}),
-                sample_time=sample_time,
-                sample_source=sample_source,
-            )
-
-        def lifecycle_metrics_snapshot(self) -> list[dict[str, int | str]]:
-            return self._state.lifecycle_metrics_snapshot()
-
-        def reserve_gpus(self, num_gpus: int) -> bool:
-            return self._state.reserve_gpus(num_gpus)
-
-        def release_pending_gpus(self, num_gpus: int) -> int:
-            return self._state.release_pending_gpus(num_gpus)
-
-        def get_effective_available_gpus(self) -> int:
-            return self._state.get_effective_available_gpus()
-
-        def ensure_gpus_available(
-            self,
-            needed_gpus: int,
-            timeout: float = 600.0,
-            allow_evict_protected: bool = False,
-            exclude_actor_types: list[str] | None = None,
-        ) -> bool:
-            return self._state.ensure_gpus_available(
-                needed_gpus,
-                timeout=timeout,
-                allow_evict_protected=allow_evict_protected,
-                exclude_actor_types=_restore_actor_types(exclude_actor_types),
-            )
-
-        def list_entries(self, prune_stale: bool = False) -> list[dict[str, Any]]:
-            if prune_stale:
-                try:
-                    self._state.prune_stale()
-                except Exception as e:
-                    logger.warning("[ModelActorRegistry] prune_stale failed: %s", e)
-            return [_entry_to_record(entry) for entry in self._state.iter_entries()]
-
-        def clear_session(self, session_id: str, actor_type: str | None = None) -> int:
-            parsed_actor_type = None if actor_type is None else ActorType(str(actor_type))
-            return self._state.clear_session(session_id, actor_type=parsed_actor_type)
-
-        def total_gpus_used(self) -> int:
-            return self._state.total_gpus_used()
-
-        def clear(self, kill_actors: bool = True) -> int:
-            return self._state.clear(kill_actors=kill_actors)
-
-    options: dict[str, Any] = {
-        "name": name,
-        "namespace": namespace,
-        "lifetime": "detached",
-    }
-
-    from ..config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources
-
-    apply_detached_actor_resources(options, ray)
-    options["runtime_env"] = actor_runtime_env(
-        pythonpath=PFS_PYTHONPATH,
-        extra=otel_env_vars(),
-    )
-
-    try:
-        _MODEL_ACTOR_REGISTRY_ACTOR_HANDLE = _ModelActorRegistryActor.options(**options).remote(
-            min_actor_age=min_actor_age,
-            session_idle_timeout=session_idle_timeout,
-        )
-        return _MODEL_ACTOR_REGISTRY_ACTOR_HANDLE
-    except Exception:
-        _MODEL_ACTOR_REGISTRY_ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)
-        return _MODEL_ACTOR_REGISTRY_ACTOR_HANDLE
-
-
-def _call_actor_sync(method_name: str, *args, retry_on_actor_restart: bool = False, **kwargs) -> Any:
-    global _MODEL_ACTOR_REGISTRY_ACTOR_HANDLE
-
-    actor = _get_or_create_actor_sync()
-    remote_method = getattr(actor, method_name)
-    try:
-        return ray.get(remote_method.remote(*args, **kwargs))
-    except Exception:
-        if not retry_on_actor_restart:
-            raise
-        _MODEL_ACTOR_REGISTRY_ACTOR_HANDLE = None
-        actor = _get_or_create_actor_sync()
-        remote_method = getattr(actor, method_name)
-        return ray.get(remote_method.remote(*args, **kwargs))
-
-
-async def _call_actor_async(method_name: str, *args, retry_on_actor_restart: bool = False, **kwargs) -> Any:
-    global _MODEL_ACTOR_REGISTRY_ACTOR_HANDLE
-
-    actor = await asyncio.to_thread(_get_or_create_actor_sync)
-    remote_method = getattr(actor, method_name)
-    try:
-        return await _await_ray_ref(remote_method.remote(*args, **kwargs))
-    except Exception:
-        if not retry_on_actor_restart:
-            raise
-        _MODEL_ACTOR_REGISTRY_ACTOR_HANDLE = None
-        actor = await asyncio.to_thread(_get_or_create_actor_sync)
-        remote_method = getattr(actor, method_name)
-        return await _await_ray_ref(remote_method.remote(*args, **kwargs))
-
-
 def _normalize_actor_observability_payload(payload: Any) -> dict[str, Any] | None:
     if not isinstance(payload, dict):
         return None
@@ -863,7 +624,7 @@ async def async_actor_observability_metadata(
 
 
 class ModelActorRegistry:
-    """Unified pool managing all GPU-using actors with detached control plane."""
+    """Process-local registry for GPU-using actors."""
 
     _instance: "ModelActorRegistry | None" = None
     _lock = threading.Lock()
@@ -903,14 +664,10 @@ class ModelActorRegistry:
         self._entries = self._local_state.entries
         self._initialized = True
         logger.info(
-            "[ModelActorRegistry] Initialized MIN_ACTOR_AGE=%s SESSION_IDLE_TIMEOUT=%s detached=%s",
+            "[ModelActorRegistry] Initialized MIN_ACTOR_AGE=%s SESSION_IDLE_TIMEOUT=%s",
             self.MIN_ACTOR_AGE,
             self.SESSION_IDLE_TIMEOUT,
-            _detached_enabled(),
         )
-
-    def _use_detached(self) -> bool:
-        return _detached_enabled()
 
     def _clear_cached_handle(self, actor_name: str) -> None:
         with self._local_lock:
@@ -927,7 +684,10 @@ class ModelActorRegistry:
             actor = self._handle_cache.get(actor_name)
         if actor is not None:
             return actor
-        if not self._use_detached():
+        try:
+            if not ray.is_initialized():
+                return None
+        except Exception:
             return None
         try:
             actor = ray.get_actor(actor_name, namespace=namespace)
@@ -941,7 +701,10 @@ class ModelActorRegistry:
             actor = self._handle_cache.get(actor_name)
         if actor is not None:
             return actor
-        if not self._use_detached():
+        try:
+            if not ray.is_initialized():
+                return None
+        except Exception:
             return None
         return await asyncio.to_thread(self._lookup_handle, actor_name, namespace)
 
@@ -963,99 +726,49 @@ class ModelActorRegistry:
         metadata: dict[str, Any] | None = None,
     ) -> ActorEntry:
         self._remember_handle(actor_name, actor_handle)
-        if not self._use_detached():
-            return self._local(
-                self._local_state.register,
-                actor_name=actor_name,
-                actor_type=actor_type,
-                num_gpus=num_gpus,
-                namespace=namespace,
-                base_model=base_model,
-                session_id=session_id,
-                node_id=node_id,
-                protected=protected,
-                metadata=metadata,
-            )
-        record = _call_actor_sync(
-            "register",
-            {
-                "actor_name": actor_name,
-                "actor_type": actor_type.value,
-                "num_gpus": int(num_gpus),
-                "namespace": namespace,
-                "base_model": base_model,
-                "session_id": session_id,
-                "node_id": node_id,
-                "protected": bool(protected),
-                "metadata": dict(metadata or {}),
-            },
+        return self._local(
+            self._local_state.register,
+            actor_name=actor_name,
+            actor_type=actor_type,
+            num_gpus=num_gpus,
+            namespace=namespace,
+            base_model=base_model,
+            session_id=session_id,
+            node_id=node_id,
+            protected=protected,
+            metadata=metadata,
         )
-        return _record_to_entry(record, actor_handle=self._lookup_handle(actor_name, namespace))
 
     def unregister(self, actor_name: str) -> bool:
         self._clear_cached_handle(actor_name)
-        if not self._use_detached():
-            return bool(self._local(self._local_state.unregister, actor_name))
-        try:
-            return bool(_call_actor_sync("unregister", actor_name))
-        except ray.exceptions.GetTimeoutError:
-            logger.warning("[ModelActorRegistry] unregister timed out for actor=%s", actor_name)
-            return False
+        return bool(self._local(self._local_state.unregister, actor_name))
 
     def get(self, actor_name: str) -> ActorEntry | None:
-        if not self._use_detached():
-            return self._local(self._local_state.get, actor_name, touch=True)
-        record = _call_actor_sync("get", actor_name, True, retry_on_actor_restart=True)
-        if not isinstance(record, dict):
-            return None
-        return _record_to_entry(
-            record,
-            actor_handle=self._lookup_handle(actor_name, str(record.get("namespace") or "tinker")),
-        )
+        return self._local(self._local_state.get, actor_name, touch=True)
 
     def set_session(self, actor_name: str, session_id: str | None) -> None:
-        if not self._use_detached():
-            self._local(self._local_state.set_session, actor_name, session_id)
-            return
-        _call_actor_sync("set_session", actor_name, session_id)
+        self._local(self._local_state.set_session, actor_name, session_id)
 
     async def async_set_session(self, actor_name: str, session_id: str | None) -> None:
-        if not self._use_detached():
-            await asyncio.to_thread(self._local, self._local_state.set_session, actor_name, session_id)
-            return
-        await _call_actor_async("set_session", actor_name, session_id)
+        await asyncio.to_thread(self._local, self._local_state.set_session, actor_name, session_id)
 
     def set_protected(self, actor_name: str, protected: bool = True) -> bool:
-        if not self._use_detached():
-            return bool(self._local(self._local_state.set_protected, actor_name, protected))
-        return bool(_call_actor_sync("set_protected", actor_name, protected))
+        return bool(self._local(self._local_state.set_protected, actor_name, protected))
 
     def is_protected(self, actor_name: str) -> bool:
-        if not self._use_detached():
-            return bool(self._local(self._local_state.is_protected, actor_name))
-        return bool(_call_actor_sync("is_protected", actor_name, retry_on_actor_restart=True))
+        return bool(self._local(self._local_state.is_protected, actor_name))
 
     def touch(self, actor_name: str) -> bool:
-        if not self._use_detached():
-            return bool(self._local(self._local_state.touch, actor_name))
-        return bool(_call_actor_sync("touch", actor_name))
+        return bool(self._local(self._local_state.touch, actor_name))
 
     async def async_touch(self, actor_name: str) -> bool:
-        if not self._use_detached():
-            return bool(await asyncio.to_thread(self._local, self._local_state.touch, actor_name))
-        return bool(await _call_actor_async("touch", actor_name))
+        return bool(await asyncio.to_thread(self._local, self._local_state.touch, actor_name))
 
     def mark_inflight(self, actor_name: str, delta: int) -> None:
-        if not self._use_detached():
-            self._local(self._local_state.mark_inflight, actor_name, delta)
-            return
-        _call_actor_sync("mark_inflight", actor_name, int(delta))
+        self._local(self._local_state.mark_inflight, actor_name, delta)
 
     def mark_ready(self, actor_name: str) -> None:
-        if not self._use_detached():
-            self._local(self._local_state.mark_ready, actor_name)
-            return
-        _call_actor_sync("mark_ready", actor_name)
+        self._local(self._local_state.mark_ready, actor_name)
 
     def update_metadata(
         self,
@@ -1065,24 +778,13 @@ class ModelActorRegistry:
         sample_time: float | None = None,
         sample_source: str | None = None,
     ) -> bool:
-        if not self._use_detached():
-            return bool(
-                self._local(
-                    self._local_state.update_metadata,
-                    actor_name,
-                    metadata=dict(metadata or {}),
-                    sample_time=sample_time,
-                    sample_source=sample_source,
-                )
-            )
         return bool(
-            _call_actor_sync(
-                "update_metadata",
+            self._local(
+                self._local_state.update_metadata,
                 actor_name,
-                dict(metadata or {}),
-                sample_time,
-                sample_source,
-                retry_on_actor_restart=True,
+                metadata=dict(metadata or {}),
+                sample_time=sample_time,
+                sample_source=sample_source,
             )
         )
 
@@ -1094,42 +796,24 @@ class ModelActorRegistry:
         sample_time: float | None = None,
         sample_source: str | None = None,
     ) -> bool:
-        if not self._use_detached():
-            return bool(
-                self._local(
-                    self._local_state.update_metadata,
-                    actor_name,
-                    metadata=dict(metadata or {}),
-                    sample_time=sample_time,
-                    sample_source=sample_source,
-                )
-            )
         return bool(
-            await _call_actor_async(
-                "update_metadata",
+            self._local(
+                self._local_state.update_metadata,
                 actor_name,
-                dict(metadata or {}),
-                sample_time,
-                sample_source,
-                retry_on_actor_restart=True,
+                metadata=dict(metadata or {}),
+                sample_time=sample_time,
+                sample_source=sample_source,
             )
         )
 
     def reserve_gpus(self, num_gpus: int) -> bool:
-        if not self._use_detached():
-            return bool(self._local(self._local_state.reserve_gpus, num_gpus))
-        return bool(_call_actor_sync("reserve_gpus", int(num_gpus)))
+        return bool(self._local(self._local_state.reserve_gpus, num_gpus))
 
     def release_pending_gpus(self, num_gpus: int) -> None:
-        if not self._use_detached():
-            self._local(self._local_state.release_pending_gpus, num_gpus)
-            return
-        _call_actor_sync("release_pending_gpus", int(num_gpus))
+        self._local(self._local_state.release_pending_gpus, num_gpus)
 
     def get_effective_available_gpus(self) -> int:
-        if not self._use_detached():
-            return int(self._local(self._local_state.get_effective_available_gpus))
-        return int(_call_actor_sync("get_effective_available_gpus", retry_on_actor_restart=True))
+        return int(self._local(self._local_state.get_effective_available_gpus))
 
     def ensure_gpus_available(
         self,
@@ -1139,23 +823,13 @@ class ModelActorRegistry:
         allow_evict_protected: bool = False,
         exclude_actor_types: tuple[ActorType, ...] = (),
     ) -> bool:
-        if not self._use_detached():
-            return bool(
-                self._local(
-                    self._local_state.ensure_gpus_available,
-                    int(needed_gpus),
-                    timeout=float(timeout),
-                    allow_evict_protected=allow_evict_protected,
-                    exclude_actor_types=exclude_actor_types,
-                )
-            )
         return bool(
-            _call_actor_sync(
-                "ensure_gpus_available",
+            self._local(
+                self._local_state.ensure_gpus_available,
                 int(needed_gpus),
-                float(timeout),
-                bool(allow_evict_protected),
-                _exclude_actor_types(exclude_actor_types),
+                timeout=float(timeout),
+                allow_evict_protected=allow_evict_protected,
+                exclude_actor_types=exclude_actor_types,
             )
         )
 
@@ -1259,10 +933,7 @@ class ModelActorRegistry:
         ]
 
     def lifecycle_metrics_snapshot(self) -> list[dict[str, int | str]]:
-        if not self._use_detached():
-            return self._local(self._local_state.lifecycle_metrics_snapshot)
-        rows = _call_actor_sync("lifecycle_metrics_snapshot", retry_on_actor_restart=True)
-        return rows if isinstance(rows, list) else []
+        return self._local(self._local_state.lifecycle_metrics_snapshot)
 
     def _refresh_entry_metadata(
         self,
@@ -1392,11 +1063,8 @@ class ModelActorRegistry:
 
     def cached_snapshot(self) -> list[dict[str, Any]]:
         now = time.time()
-        if not self._use_detached():
-            with self._pool_lock:
-                entries = list(self._entries.values())
-        else:
-            entries = self.iter_entries(prune_stale=True)
+        with self._pool_lock:
+            entries = list(self._entries.values())
         for entry in entries:
             self._refresh_entry_metadata(entry, now=now)
         return [self._cached_snapshot_record(entry, now=now) for entry in entries]
@@ -1433,62 +1101,25 @@ class ModelActorRegistry:
         return out
 
     def iter_entries(self, *, prune_stale: bool = False) -> list[ActorEntry]:
-        if not self._use_detached():
-            if prune_stale and ray.is_initialized():
-                self._local(self._local_state.prune_stale)
-            with self._local_lock:
-                return list(self._local_state.iter_entries())
-
-        records = _call_actor_sync("list_entries", prune_stale=bool(prune_stale), retry_on_actor_restart=True)
-        out: list[ActorEntry] = []
-        for record in records or []:
-            if not isinstance(record, dict):
-                continue
-            namespace = str(record.get("namespace") or "tinker")
-            out.append(
-                _record_to_entry(
-                    record,
-                    actor_handle=self._lookup_handle(str(record.get("actor_name") or ""), namespace),
-                )
-            )
-        return out
+        if prune_stale and ray.is_initialized():
+            self._local(self._local_state.prune_stale)
+        with self._local_lock:
+            return list(self._local_state.iter_entries())
 
     async def async_iter_entries(self, *, prune_stale: bool = False) -> list[ActorEntry]:
-        if not self._use_detached():
-            if prune_stale and ray.is_initialized():
-                await asyncio.to_thread(self._local, self._local_state.prune_stale)
-            with self._local_lock:
-                return list(self._local_state.iter_entries())
-
-        records = await _call_actor_async("list_entries", prune_stale=bool(prune_stale), retry_on_actor_restart=True)
-        out: list[ActorEntry] = []
-        for record in records or []:
-            if not isinstance(record, dict):
-                continue
-            namespace = str(record.get("namespace") or "tinker")
-            out.append(
-                _record_to_entry(
-                    record,
-                    actor_handle=await self._lookup_handle_async(str(record.get("actor_name") or ""), namespace),
-                )
-            )
-        return out
+        if prune_stale and ray.is_initialized():
+            await asyncio.to_thread(self._local, self._local_state.prune_stale)
+        with self._local_lock:
+            return list(self._local_state.iter_entries())
 
     def clear_session(self, session_id: str, *, actor_type: ActorType | None = None) -> int:
-        if not self._use_detached():
-            return int(self._local(self._local_state.clear_session, session_id, actor_type=actor_type))
-        arg = None if actor_type is None else actor_type.value
-        return int(_call_actor_sync("clear_session", session_id, arg))
+        return int(self._local(self._local_state.clear_session, session_id, actor_type=actor_type))
 
     def total_gpus_used(self) -> int:
-        if not self._use_detached():
-            return int(self._local(self._local_state.total_gpus_used))
-        return int(_call_actor_sync("total_gpus_used", retry_on_actor_restart=True))
+        return int(self._local(self._local_state.total_gpus_used))
 
     async def async_total_gpus_used(self) -> int:
-        if not self._use_detached():
-            return int(self._local(self._local_state.total_gpus_used))
-        return int(await _call_actor_async("total_gpus_used", retry_on_actor_restart=True))
+        return int(self._local(self._local_state.total_gpus_used))
 
     def gpus_used_by_node(self) -> dict[str, int]:
         usage: dict[str, int] = {}
@@ -1518,9 +1149,7 @@ class ModelActorRegistry:
     def clear(self, kill_actors: bool = True) -> int:
         with self._local_lock:
             self._handle_cache.clear()
-        if not self._use_detached():
-            return int(self._local(self._local_state.clear, kill_actors=kill_actors))
-        return int(_call_actor_sync("clear", bool(kill_actors)))
+        return int(self._local(self._local_state.clear, kill_actors=kill_actors))
 
 
 # Global singleton accessor

@@ -452,8 +452,6 @@ def test_issue_364_restore_sampling_session_merges_last_activity_without_version
 def test_issue_364_model_actor_registry_wrapper_preserves_metadata_without_ray(monkeypatch: pytest.MonkeyPatch) -> None:
     import tinker_server.backend.model_actor_registry as model_actor_registry_module
     from tinker_server.backend.model_actor_registry import ActorType, ModelActorRegistry, get_model_actor_registry
-
-    monkeypatch.setattr(model_actor_registry_module, "_detached_enabled", lambda: False)
     monkeypatch.setattr(model_actor_registry_module.ray, "is_initialized", lambda: False)
     monkeypatch.setattr(ModelActorRegistry, "_instance", None)
     pool = get_model_actor_registry()

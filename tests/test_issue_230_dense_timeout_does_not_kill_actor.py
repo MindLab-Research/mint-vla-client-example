@@ -5,14 +5,12 @@ import pytest
 
 pytest.importorskip("ray")
 
-from tinker_server.backend import model_actor_registry as model_actor_registry_module
 from tinker_server.backend.model_actor_registry import ActorType, get_model_actor_registry
 from tinker_server.backend.training_session_manager import TrainingSession
 from tinker_server.backend.verl_training import VerlTrainingEngine
 
 
 def _get_local_model_actor_registry(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(model_actor_registry_module, "_detached_enabled", lambda: False)
     pool = get_model_actor_registry()
     pool.clear(kill_actors=False)
     return pool
