@@ -104,7 +104,7 @@ def test_config_file_future_replay_settings_load(tmp_path):
     p.write_text(
         "\n".join(
             [
-                "[future_store]",
+                "[future]",
                 "replay_root_dir = '/tmp/future-replay'",
                 "replay_hot_ttl_s = 30",
                 "replay_disk_ttl_s = 300",
@@ -117,12 +117,12 @@ def test_config_file_future_replay_settings_load(tmp_path):
         encoding="utf-8",
     )
     cfg = load_tinker_config_file(p)
-    assert cfg.future_store.replay_root_dir == "/tmp/future-replay"
-    assert cfg.future_store.replay_hot_ttl_s == 30
-    assert cfg.future_store.replay_disk_ttl_s == 300
-    assert cfg.future_store.replay_sweep_interval_s == 600
-    assert cfg.future_store.retrieve_future_grace_s == 45
-    assert cfg.future_store.retrieve_future_min_poll_s == 2.5
+    assert cfg.future.replay_root_dir == "/tmp/future-replay"
+    assert cfg.future.replay_hot_ttl_s == 30
+    assert cfg.future.replay_disk_ttl_s == 300
+    assert cfg.future.replay_sweep_interval_s == 600
+    assert cfg.future.retrieve_future_grace_s == 45
+    assert cfg.future.retrieve_future_min_poll_s == 2.5
 
 
 def test_server_config_future_replay_root_defaults_to_dev_without_auth():
@@ -144,7 +144,7 @@ def test_server_config_retrieve_future_settings_read_from_file(tmp_path):
     p.write_text(
         "\n".join(
             [
-                "[future_store]",
+                "[future]",
                 "retrieve_future_grace_s = 45",
                 "retrieve_future_min_poll_s = 2.5",
             ]
@@ -210,7 +210,7 @@ def test_server_config_future_replay_env_overrides_file_independently(tmp_path):
     p.write_text(
         "\n".join(
             [
-                "[future_store]",
+                "[future]",
                 "replay_root_dir = '/tmp/from-file'",
                 "replay_hot_ttl_s = 30",
                 "replay_disk_ttl_s = 300",
@@ -244,7 +244,7 @@ def test_server_config_future_replay_partial_env_override_preserves_untouched_fi
     p.write_text(
         "\n".join(
             [
-                "[future_store]",
+                "[future]",
                 "replay_root_dir = '/tmp/from-file'",
                 "replay_hot_ttl_s = 30",
                 "replay_disk_ttl_s = 300",

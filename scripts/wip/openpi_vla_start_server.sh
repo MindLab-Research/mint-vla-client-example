@@ -58,7 +58,6 @@ done
 
 unset \
   MINT_STARTUP_LEASE_ACTOR_NAME \
-  MINT_FUTURE_STORE_ACTOR_NAME \
   MINT_OWNER_RUNTIME_SUPERVISOR_ACTOR_NAME \
   MINT_API_WORK_QUEUE_ACTOR_NAME \
   MINT_CAPACITY_MANAGER_ACTOR_NAME \
@@ -97,7 +96,6 @@ export MINT_API_WORK_QUEUE_ACTOR_NAME="tinker_api_work_queue_${NAME_SUFFIX}"
 export MINT_CAPACITY_MANAGER_ACTOR_NAME="tinker_capacity_manager_${NAME_SUFFIX}"
 export MINT_QUEUE_EXECUTION_RUNTIME_ACTOR_NAME="tinker_queue_execution_runtime_${NAME_SUFFIX}"
 export MINT_QUEUE_SUPERVISOR_ACTOR_NAME="tinker_queue_supervisor_${NAME_SUFFIX}"
-export MINT_FUTURE_STORE_ACTOR_NAME="tinker_future_store_${NAME_SUFFIX}"
 export MINT_GATEWAY_SESSION_STORE_ACTOR_NAME="tinker_gateway_session_store_${NAME_SUFFIX}"
 export MINT_SAMPLING_SESSION_STORE_ACTOR_NAME="tinker_sampling_session_store_${NAME_SUFFIX}"
 export MINT_TRAINING_SESSION_STORE_ACTOR_NAME="tinker_training_session_store_${NAME_SUFFIX}"

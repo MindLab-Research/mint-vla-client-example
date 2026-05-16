@@ -462,14 +462,7 @@ class ServerConfig:
     resource_pool_min_actor_age_s: int = 300
     resource_pool_session_idle_timeout_s: int = 300
 
-    # Future store settings (backend/future_store.py)
-    future_store_actor_name: str = "tinker_future_store"
-    future_store_ttl_s: float = 86400.0
-    # Maximum time a request may stay QUEUED (not RUNNING) before being marked FAILED.
-    # This is a safety net for worker/queue failures; it is not the execution timeout.
-    future_store_queue_ttl_s: float = 7 * 86400.0
-    future_store_done_ttl_s: float = 7200.0
-    future_store_tombstone_ttl_s: float = 300.0
+    # Future replay and retrieve polling settings.
     future_replay_root_dir: str = "/vePFS-Mindverse/share/mint-prod-dev/future-replay"
     future_replay_hot_ttl_s: float = 60.0
     future_replay_disk_ttl_s: float = 86400.0
@@ -540,7 +533,7 @@ class ServerConfig:
         file_server = config_file.server if config_file is not None else None
         file_sampling = config_file.sampling if config_file is not None else None
         file_resource_pool = config_file.resource_pool if config_file is not None else None
-        file_future_store = config_file.future_store if config_file is not None else None
+        file_future = config_file.future if config_file is not None else None
         file_task_state_store = config_file.task_state_store if config_file is not None else None
         file_training = config_file.training if config_file is not None else None
         file_prewarm = config_file.prewarm if config_file is not None else None
@@ -768,62 +761,37 @@ class ServerConfig:
                 file_resource_pool.session_idle_timeout_s if file_resource_pool is not None else None,
                 300,
             ),
-            # Future store settings
-            future_store_actor_name=_pick_str(
-                "MINT_FUTURE_STORE_ACTOR_NAME",
-                file_future_store.actor_name if file_future_store is not None else None,
-                "tinker_future_store",
-            ),
-            future_store_ttl_s=_pick_float(
-                "MINT_FUTURE_TTL_S",
-                file_future_store.ttl_s if file_future_store is not None else None,
-                86400.0,
-            ),
-            future_store_queue_ttl_s=_pick_float(
-                "MINT_FUTURE_QUEUE_TTL_S",
-                file_future_store.queue_ttl_s if file_future_store is not None else None,
-                7 * 86400.0,
-            ),
-            future_store_done_ttl_s=_pick_float(
-                "MINT_FUTURE_DONE_TTL_S",
-                file_future_store.done_ttl_s if file_future_store is not None else None,
-                7200.0,
-            ),
-            future_store_tombstone_ttl_s=_pick_float(
-                "MINT_FUTURE_TOMBSTONE_TTL_S",
-                file_future_store.tombstone_ttl_s if file_future_store is not None else None,
-                300.0,
-            ),
+            # Future replay/retrieve settings
             future_replay_root_dir=_pick_str(
                 "MINT_FUTURE_REPLAY_ROOT_DIR",
-                file_future_store.replay_root_dir if file_future_store is not None else None,
+                file_future.replay_root_dir if file_future is not None else None,
                 _default_future_replay_root_dir(auth_enabled=auth_enabled),
             ),
             future_replay_hot_ttl_s=_pick_float(
                 "MINT_FUTURE_REPLAY_HOT_TTL_S",
-                file_future_store.replay_hot_ttl_s if file_future_store is not None else None,
+                file_future.replay_hot_ttl_s if file_future is not None else None,
                 60.0,
             ),
             retrieve_future_grace_s=_pick_float_alias(
                 "MINT_RETRIEVE_FUTURE_GRACE_S",
                 ("TINKER_RETRIEVE_FUTURE_GRACE_S",),
-                file_future_store.retrieve_future_grace_s if file_future_store is not None else None,
+                file_future.retrieve_future_grace_s if file_future is not None else None,
                 120.0,
             ),
             retrieve_future_min_poll_s=_pick_float_alias(
                 "MINT_RETRIEVE_FUTURE_MIN_POLL_S",
                 ("TINKER_RETRIEVE_FUTURE_MIN_POLL_S",),
-                file_future_store.retrieve_future_min_poll_s if file_future_store is not None else None,
+                file_future.retrieve_future_min_poll_s if file_future is not None else None,
                 1.0,
             ),
             future_replay_disk_ttl_s=_pick_float(
                 "MINT_FUTURE_REPLAY_DISK_TTL_S",
-                file_future_store.replay_disk_ttl_s if file_future_store is not None else None,
+                file_future.replay_disk_ttl_s if file_future is not None else None,
                 86400.0,
             ),
             future_replay_sweep_interval_s=_pick_float(
                 "MINT_FUTURE_REPLAY_SWEEP_INTERVAL_S",
-                file_future_store.replay_sweep_interval_s if file_future_store is not None else None,
+                file_future.replay_sweep_interval_s if file_future is not None else None,
                 21600.0,
             ),
             # TaskStateStore settings

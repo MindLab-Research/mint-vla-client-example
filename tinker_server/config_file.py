@@ -87,14 +87,9 @@ class _ResourcePoolSection(BaseModel):
     session_idle_timeout_s: int | None = None
 
 
-class _FutureStoreSection(BaseModel):
+class _FutureSection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    actor_name: str | None = None
-    ttl_s: float | None = None
-    queue_ttl_s: float | None = None
-    done_ttl_s: float | None = None
-    tombstone_ttl_s: float | None = None
     replay_root_dir: str | None = None
     replay_hot_ttl_s: float | None = None
     replay_disk_ttl_s: float | None = None
@@ -157,7 +152,7 @@ class TinkerConfigFile(BaseModel):
     paths: _PathsSection = Field(default_factory=_PathsSection)
     megatron_bridge: _MegatronBridgeSection = Field(default_factory=_MegatronBridgeSection)
     resource_pool: _ResourcePoolSection = Field(default_factory=_ResourcePoolSection)
-    future_store: _FutureStoreSection = Field(default_factory=_FutureStoreSection)
+    future: _FutureSection = Field(default_factory=_FutureSection)
     task_state_store: _TaskStateStoreSection = Field(default_factory=_TaskStateStoreSection)
     training: _TrainingSection = Field(default_factory=_TrainingSection)
     prewarm: _PrewarmSection = Field(default_factory=_PrewarmSection)

@@ -80,7 +80,6 @@ def test_start_issue_server_helper_scopes_control_plane_actor_names() -> None:
     assert token in data["MINT_CAPACITY_MANAGER_ACTOR_NAME"]
     assert token in data["MINT_QUEUE_EXECUTION_RUNTIME_ACTOR_NAME"]
     assert token in data["MINT_QUEUE_SUPERVISOR_ACTOR_NAME"]
-    assert token in data["MINT_FUTURE_STORE_ACTOR_NAME"]
     assert token in data["MINT_GATEWAY_SESSION_STORE_ACTOR_NAME"]
     assert token in data["MINT_SAMPLING_SESSION_STORE_ACTOR_NAME"]
     assert token in data["MINT_TRAINING_SESSION_STORE_ACTOR_NAME"]
@@ -97,7 +96,6 @@ def test_start_issue_server_helper_scopes_control_plane_actor_names() -> None:
         "tinker_capacity_manager",
         "tinker_queue_execution_runtime",
         "tinker_queue_supervisor",
-        "tinker_future_store",
         "tinker_training_session_store",
         "tinker_sampling_session_store",
         "tinker_session_heartbeat_store",

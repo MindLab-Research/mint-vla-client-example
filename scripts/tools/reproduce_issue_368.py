@@ -101,9 +101,9 @@ def _ensure_ray_initialized(*, ray_address: str, ray_namespace: str) -> None:
         ray.shutdown()
     ray.init(address=str(ray_address), namespace=str(ray_namespace), ignore_reinit_error=True)
     try:
-        from tinker_server.backend.future_store import future_store
+        from tinker_server.backend.task_state_store import task_state_futures
 
-        future_store._ray_actor = None
+        task_state_futures._task_state._reset_ray_actor()
     except Exception:
         pass
 
@@ -216,12 +216,12 @@ def _get_detached_training_session_info(model_id: str, *, ray_address: str, ray_
 
 def _create_synthetic_pending_training_future(model_id: str, *, ray_address: str, ray_namespace: str) -> str:
     _ensure_ray_initialized(ray_address=ray_address, ray_namespace=ray_namespace)
-    from tinker_server.backend.future_store import future_store
+    from tinker_server.backend.task_state_store import task_state_futures
 
     request_id = f"issue368-synthetic-{uuid.uuid4().hex}"
-    asyncio.run(future_store.async_create_with_id(request_id))
+    asyncio.run(task_state_futures.async_create_with_id(request_id))
     asyncio.run(
-        future_store.async_mark_running(
+        task_state_futures.async_mark_running(
             request_id,
             meta={
                 "op": "training.optim_step",
@@ -242,13 +242,13 @@ def _wait_for_synthetic_future_failure(
     timeout_s: float,
 ) -> tuple[str, str | None]:
     _ensure_ray_initialized(ray_address=ray_address, ray_namespace=ray_namespace)
-    from tinker_server.backend.future_store import FutureStatus, future_store
+    from tinker_server.backend.task_state_store import FutureStatus, task_state_futures
 
     deadline = time.monotonic() + timeout_s
     while True:
-        status = asyncio.run(future_store.async_get_status(request_id))
+        status = asyncio.run(task_state_futures.async_get_status(request_id))
         if status == FutureStatus.FAILED:
-            return status.value, asyncio.run(future_store.async_get_error(request_id))
+            return status.value, asyncio.run(task_state_futures.async_get_error(request_id))
         if time.monotonic() > deadline:
             raise TimeoutError(f"synthetic future {request_id} did not fail within {timeout_s}s (status={status.value})")
         time.sleep(1.0)

@@ -7,7 +7,6 @@ def test_issue_439_queue_execution_runtime_records_actor_name_and_placement_over
 
     monkeypatch.setenv("TINKER_API_WORK_QUEUE_ACTOR_NAME", "queue-v20260309")
     monkeypatch.setenv("MINT_API_WORK_QUEUE_ACTOR_MAX_CONCURRENCY", "1024")
-    monkeypatch.setenv("MINT_FUTURE_STORE_ACTOR_NAME", "future-v2")
     monkeypatch.setenv("TINKER_CAPACITY_MANAGER_ACTOR_NAME", "capacity-v3")
     monkeypatch.setenv("TINKER_RAY_NAMESPACE", "ns-issue-439")
     monkeypatch.setenv("MINT_K2_INFER_VOLC_RESOURCE_QUEUE_ID", "rq-k2")
@@ -27,10 +26,8 @@ def test_issue_439_queue_execution_runtime_records_actor_name_and_placement_over
     assert out["MINT_API_WORK_QUEUE_ACTOR_NAME"] == "queue-v20260309"
     assert out["MINT_CAPACITY_MANAGER_ACTOR_NAME"] == "capacity-v3"
     assert "MINT_API_WORK_QUEUE_ACTOR_MAX_CONCURRENCY" not in out
-    assert "MINT_FUTURE_STORE_ACTOR_NAME" not in out
     assert "TINKER_RAY_NAMESPACE" not in out
     assert actor_env["MINT_API_WORK_QUEUE_ACTOR_MAX_CONCURRENCY"] == "1024"
-    assert actor_env["MINT_FUTURE_STORE_ACTOR_NAME"] == "future-v2"
     assert actor_env["MINT_K2_INFER_VOLC_RESOURCE_QUEUE_ID"] == "rq-k2"
     assert actor_env["MINT_VLLM_VOLC_RESOURCE_QUEUE_ID"] == "rq-vllm"
     assert actor_env["MINT_MODEL_PLACEMENT_JSON"] == '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"node_ip":"10.0.0.17","gpu_count":4}}'

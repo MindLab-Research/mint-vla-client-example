@@ -1262,7 +1262,6 @@ def test_actor_runtime_env_vars_forwards_control_plane_actor_names(tmp_path):
             "RAY_ADDRESS": "ray://cfg-test",
             "TINKER_RAY_NAMESPACE": "mint-test-ns",
             "MINT_RAY_NAMESPACE": "mint-test-ns",
-            "MINT_FUTURE_STORE_ACTOR_NAME": "mint-future-store-test",
             "MINT_GATEWAY_SESSION_STORE_ACTOR_NAME": "mint-gateway-session-store-test",
             "MINT_SAMPLING_SESSION_STORE_ACTOR_NAME": "mint-sampling-session-store-test",
             "MINT_TRAINING_SESSION_STORE_ACTOR_NAME": "mint-training-session-store-test",
@@ -1285,7 +1284,6 @@ def test_actor_runtime_env_vars_forwards_control_plane_actor_names(tmp_path):
     actor_env = payload["actor_env"]
     assert data["TINKER_RAY_NAMESPACE"] == "mint-test-ns"
     assert data["MINT_RAY_NAMESPACE"] == "mint-test-ns"
-    assert actor_env["MINT_FUTURE_STORE_ACTOR_NAME"] == "mint-future-store-test"
     assert actor_env["MINT_GATEWAY_SESSION_STORE_ACTOR_NAME"] == "mint-gateway-session-store-test"
     assert actor_env["MINT_SAMPLING_SESSION_STORE_ACTOR_NAME"] == "mint-sampling-session-store-test"
     assert actor_env["MINT_TRAINING_SESSION_STORE_ACTOR_NAME"] == "mint-training-session-store-test"

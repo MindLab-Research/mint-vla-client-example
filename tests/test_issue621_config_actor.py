@@ -34,7 +34,6 @@ def test_runtime_config_classifies_bootstrap_actor_creation_snapshot_and_observa
     assert classify_env_key("PFS_RUNTIME_ENV_ROOT") == CONFIG_CLASS_BOOTSTRAP_RUNTIME_ENV
     assert classify_env_key("MINT_RAY_JOB_WORKING_DIR") == CONFIG_CLASS_BOOTSTRAP_RUNTIME_ENV
     assert classify_env_key("MINT_MODEL_PLACEMENT_JSON") == CONFIG_CLASS_ACTOR_CREATION_INPUT
-    assert classify_env_key("MINT_FUTURE_STORE_ACTOR_NAME") == CONFIG_CLASS_ACTOR_CREATION_INPUT
     assert classify_env_key("MINT_VLLM_MAX_NUM_SEQS") == CONFIG_CLASS_SNAPSHOT_CONFIG
     assert classify_env_key("MINT_MEGATRON_STICKY_IDLE_TIMEOUT_S") == CONFIG_CLASS_SNAPSHOT_CONFIG
     assert classify_env_key("OTEL_EXPORTER_OTLP_ENDPOINT") == CONFIG_CLASS_OBSERVABILITY
@@ -44,7 +43,6 @@ def test_runtime_config_classifies_bootstrap_actor_creation_snapshot_and_observa
     grouped = classify_env(
         {
             "PFS_RUNTIME_ENV_ROOT": "/runtime",
-            "MINT_FUTURE_STORE_ACTOR_NAME": "future",
             "MINT_VLLM_MAX_NUM_SEQS": "64",
             "MINT_VLLM_MAX_NUM_BATCHED_TOKENS": "4096",
             "OTEL_SERVICE_NAME": "mint",
@@ -56,7 +54,6 @@ def test_runtime_config_classifies_bootstrap_actor_creation_snapshot_and_observa
     )
 
     assert grouped[CONFIG_CLASS_BOOTSTRAP_RUNTIME_ENV]["PFS_RUNTIME_ENV_ROOT"] == "/runtime"
-    assert grouped[CONFIG_CLASS_ACTOR_CREATION_INPUT]["MINT_FUTURE_STORE_ACTOR_NAME"] == "future"
     assert grouped[CONFIG_CLASS_SNAPSHOT_CONFIG]["MINT_VLLM_MAX_NUM_SEQS"] == "64"
     assert grouped[CONFIG_CLASS_SNAPSHOT_CONFIG]["MINT_VLLM_MAX_NUM_BATCHED_TOKENS"] == "4096"
     assert grouped[CONFIG_CLASS_OBSERVABILITY]["OTEL_SERVICE_NAME"] == "mint"
@@ -68,7 +65,6 @@ def test_runtime_config_classifies_bootstrap_actor_creation_snapshot_and_observa
 
 def test_config_snapshot_is_read_only_shape_and_fingerprint_ignores_created_at() -> None:
     cfg = ServerConfig(
-        future_store_actor_name="future-test",
         api_work_queue_actor_name="queue-test",
         config_path="/etc/mint/config.toml",
         api_key="secret-key",
@@ -97,7 +93,6 @@ def test_config_snapshot_is_read_only_shape_and_fingerprint_ignores_created_at()
     assert first.actor_name == "mint_config"
     assert first.ray_namespace == "mint-test"
     assert first.config_path == "/etc/mint/config.toml"
-    assert first.server_config["future_store_actor_name"] == "future-test"
     assert first.server_config["api_key"] == REDACTED_VALUE
     assert first.server_config["usage_pg_dsn"] == REDACTED_VALUE
     assert first.env[CONFIG_CLASS_SNAPSHOT_CONFIG]["MINT_VLLM_MAX_NUM_BATCHED_TOKENS"] == "4096"
