@@ -33,27 +33,6 @@ class _StubFutureStore:
         self.cleaned.append(request_id)
 
 
-class _StubCapacityManager:
-    def __init__(self):
-        self.reserved: list[str] = []
-        self.released: list[str] = []
-
-    async def async_try_reserve(self, request_id: str, queue_bytes: int, object_store_bytes: int):
-        self.reserved.append(request_id)
-        return {"ok": True}
-
-    async def async_release_all(self, request_id: str) -> None:
-        self.released.append(request_id)
-
-
-class _CaptureQueue:
-    def __init__(self):
-        self.calls: list[dict] = []
-
-    async def enqueue(self, **kwargs):
-        self.calls.append(dict(kwargs))
-
-
 class _CaptureModelWorkScheduler:
     def __init__(self, *, append_error: Exception | None = None):
         self.calls: list[dict] = []
@@ -104,20 +83,14 @@ def _dummy_request(user_id: str | None = None):
 
 def test_issue_593_asample_routes_multi_lora_to_model_work_scheduler(monkeypatch):
     stub_fs = _StubFutureStore()
-    stub_cap = _StubCapacityManager()
-    api_queue = _CaptureQueue()
     scheduler = _CaptureModelWorkScheduler()
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
     monkeypatch.setattr(sampling_route, "task_state_futures", stub_fs)
 
-    import tinker_server.backend.api_work_queue as awq
-    import tinker_server.backend.capacity_manager as cm
     import tinker_server.backend.model_work_scheduler as mws
     import tinker_server.backend.result_size_estimator as rse
 
-    monkeypatch.setattr(awq, "api_work_queue", api_queue)
-    monkeypatch.setattr(cm, "capacity_manager", stub_cap)
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
     monkeypatch.setattr(rse, "estimate_sampling_result_bytes", lambda _req: 0)
 
@@ -131,8 +104,6 @@ def test_issue_593_asample_routes_multi_lora_to_model_work_scheduler(monkeypatch
     out = anyio.run(sampling_route.asample, req, _dummy_request("user-a"))
 
     assert isinstance(out.request_id, str) and out.request_id
-    assert api_queue.calls == []
-    assert stub_cap.reserved == []
     assert stub_fs.created == []
     assert len(scheduler.calls) == 1
     call = scheduler.calls[0]
@@ -165,20 +136,14 @@ def test_issue_593_asample_routes_multi_lora_to_model_work_scheduler(monkeypatch
 
 def test_issue_593_asample_cancels_scheduler_item_if_post_append_meta_update_fails(monkeypatch):
     stub_fs = _StubFutureStore(fail_update_meta=True)
-    stub_cap = _StubCapacityManager()
-    api_queue = _CaptureQueue()
     scheduler = _CaptureModelWorkScheduler()
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
     monkeypatch.setattr(sampling_route, "task_state_futures", stub_fs)
 
-    import tinker_server.backend.api_work_queue as awq
-    import tinker_server.backend.capacity_manager as cm
     import tinker_server.backend.model_work_scheduler as mws
     import tinker_server.backend.result_size_estimator as rse
 
-    monkeypatch.setattr(awq, "api_work_queue", api_queue)
-    monkeypatch.setattr(cm, "capacity_manager", stub_cap)
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
     monkeypatch.setattr(rse, "estimate_sampling_result_bytes", lambda _req: 0)
 
@@ -201,27 +166,19 @@ def test_issue_593_asample_cancels_scheduler_item_if_post_append_meta_update_fai
             "reason": "asample_enqueue_failed",
         }
     ]
-    assert stub_cap.reserved == []
-    assert stub_cap.released == []
     assert stub_fs.cleaned == [scheduler.calls[0]["request_id"]]
 
 
 def test_issue_593_asample_does_not_cancel_scheduler_item_when_append_rejects(monkeypatch):
     stub_fs = _StubFutureStore()
-    stub_cap = _StubCapacityManager()
-    api_queue = _CaptureQueue()
     scheduler = _CaptureModelWorkScheduler(append_error=RuntimeError("duplicate request_id"))
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
     monkeypatch.setattr(sampling_route, "task_state_futures", stub_fs)
 
-    import tinker_server.backend.api_work_queue as awq
-    import tinker_server.backend.capacity_manager as cm
     import tinker_server.backend.model_work_scheduler as mws
     import tinker_server.backend.result_size_estimator as rse
 
-    monkeypatch.setattr(awq, "api_work_queue", api_queue)
-    monkeypatch.setattr(cm, "capacity_manager", stub_cap)
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
     monkeypatch.setattr(rse, "estimate_sampling_result_bytes", lambda _req: 0)
 
@@ -239,8 +196,6 @@ def test_issue_593_asample_does_not_cancel_scheduler_item_when_append_rejects(mo
 
     assert len(scheduler.calls) == 1
     assert scheduler.cancelled == []
-    assert stub_cap.reserved == []
-    assert stub_cap.released == []
     assert stub_fs.created == []
     assert stub_fs.queued == []
     assert stub_fs.cleaned == []
@@ -249,20 +204,14 @@ def test_issue_593_asample_does_not_cancel_scheduler_item_when_append_rejects(mo
 def test_issue_593_asample_ignores_legacy_flag_and_uses_model_work_scheduler(monkeypatch):
     monkeypatch.setenv("MINT_MODEL_WORK_SCHEDULER_ASAMPLE", "0")
     stub_fs = _StubFutureStore()
-    stub_cap = _StubCapacityManager()
-    api_queue = _CaptureQueue()
     scheduler = _CaptureModelWorkScheduler()
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
     monkeypatch.setattr(sampling_route, "task_state_futures", stub_fs)
 
-    import tinker_server.backend.api_work_queue as awq
-    import tinker_server.backend.capacity_manager as cm
     import tinker_server.backend.model_work_scheduler as mws
     import tinker_server.backend.result_size_estimator as rse
 
-    monkeypatch.setattr(awq, "api_work_queue", api_queue)
-    monkeypatch.setattr(cm, "capacity_manager", stub_cap)
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
     monkeypatch.setattr(rse, "estimate_sampling_result_bytes", lambda _req: 0)
 
@@ -276,7 +225,6 @@ def test_issue_593_asample_ignores_legacy_flag_and_uses_model_work_scheduler(mon
     out = anyio.run(sampling_route.asample, req, _dummy_request("user-a"))
 
     assert isinstance(out.request_id, str) and out.request_id
-    assert api_queue.calls == []
     assert len(scheduler.calls) == 1
     assert json.loads(scheduler.calls[0]["request_json"].decode("utf-8"))[
         "sampling_session_id"

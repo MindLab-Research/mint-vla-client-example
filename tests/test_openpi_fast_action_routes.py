@@ -119,51 +119,6 @@ class _AsyncResolvingFutureStore(_AsyncFakeFutureStore):
         self.failed.append((request_id, error))
 
 
-class _StubCapacityManager:
-    def __init__(self) -> None:
-        self.calls: list[dict[str, object]] = []
-        self.released: list[str] = []
-
-    async def async_try_reserve(self, request_id: str, *, queue_bytes: int, object_store_bytes: int) -> dict:
-        self.calls.append(
-            {
-                "request_id": request_id,
-                "queue_bytes": queue_bytes,
-                "object_store_bytes": object_store_bytes,
-            }
-        )
-        return {"ok": True}
-
-    async def async_release_all(self, request_id: str) -> None:
-        self.released.append(request_id)
-
-
-class _StubQueue:
-    def __init__(self) -> None:
-        self.calls: list[dict[str, object]] = []
-
-    async def enqueue(
-        self,
-        *,
-        request_id: str,
-        op: str,
-        request_json: bytes,
-        user_id: str | None,
-        webhook_url: str | None,
-        extra: dict | None = None,
-    ) -> None:
-        self.calls.append(
-            {
-                "request_id": request_id,
-                "op": op,
-                "request_json": json.loads(request_json.decode("utf-8")),
-                "user_id": user_id,
-                "webhook_url": webhook_url,
-                "extra": extra,
-            }
-        )
-
-
 class _StubModelWorkScheduler:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []

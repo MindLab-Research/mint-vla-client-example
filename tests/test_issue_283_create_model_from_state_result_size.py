@@ -72,7 +72,7 @@ def test_issue_283_create_model_from_state_uses_small_result_reservation(
         encoding="utf-8",
     )
 
-    class StubCapacityManager:
+    class StubAdmissionControl:
         def __init__(self) -> None:
             self.calls: list[dict] = []
 
@@ -124,7 +124,7 @@ def test_issue_283_create_model_from_state_uses_small_result_reservation(
         async def async_cleanup(self, request_id: str) -> None:
             return None
 
-    stub_capacity = StubCapacityManager()
+    stub_admission = StubAdmissionControl()
     stub_queue = StubModelWorkScheduler()
 
     monkeypatch.setattr(scheduler_module, "model_work_scheduler", stub_queue)
@@ -153,7 +153,7 @@ def test_issue_283_create_model_from_state_uses_small_result_reservation(
     )
 
     assert resp.status_code == 200, resp.text
-    assert stub_capacity.calls == []
+    assert stub_admission.calls == []
     assert len(stub_queue.calls) == 1
     assert stub_queue.calls[0]["op"] == "training.create_model_from_state"
     assert stub_queue.calls[0]["extra"]["execution_serial_key"] == "training_session:s283_0"
@@ -578,7 +578,7 @@ def test_issue_283_load_state_route_queues_resolved_path(tmp_path: Path, monkeyp
         encoding="utf-8",
     )
 
-    class StubCapacityManager:
+    class StubAdmissionControl:
         async def async_try_reserve(self, request_id: str, *, queue_bytes: int, object_store_bytes: int) -> dict:
             _ = (request_id, queue_bytes, object_store_bytes)
             return {"ok": True}
@@ -1013,7 +1013,7 @@ def test_issue_283_save_routes_use_detached_training_info_without_route_runtime(
     from tinker_server.routes import weights as weights_routes
     import tinker_server.backend.model_work_scheduler as scheduler_module
 
-    class StubCapacityManager:
+    class StubAdmissionControl:
         async def async_try_reserve(self, request_id: str, *, queue_bytes: int, object_store_bytes: int) -> dict:
             _ = (request_id, queue_bytes, object_store_bytes)
             return {"ok": True}
@@ -1123,7 +1123,7 @@ def test_issue_283_load_state_route_uses_detached_training_info_without_route_ru
         encoding="utf-8",
     )
 
-    class StubCapacityManager:
+    class StubAdmissionControl:
         async def async_try_reserve(self, request_id: str, *, queue_bytes: int, object_store_bytes: int) -> dict:
             _ = (request_id, queue_bytes, object_store_bytes)
             return {"ok": True}
@@ -1212,7 +1212,7 @@ def test_issue_283_save_routes_restore_inflight_protection(monkeypatch) -> None:
     from tinker_server.routes import weights as weights_routes
     import tinker_server.backend.model_work_scheduler as scheduler_module
 
-    class StubCapacityManager:
+    class StubAdmissionControl:
         async def async_try_reserve(self, request_id: str, *, queue_bytes: int, object_store_bytes: int) -> dict:
             _ = (request_id, queue_bytes, object_store_bytes)
             return {"ok": True}
@@ -1311,7 +1311,7 @@ def test_issue_283_load_state_route_restores_inflight_protection(tmp_path: Path,
         encoding="utf-8",
     )
 
-    class StubCapacityManager:
+    class StubAdmissionControl:
         async def async_try_reserve(self, request_id: str, *, queue_bytes: int, object_store_bytes: int) -> dict:
             _ = (request_id, queue_bytes, object_store_bytes)
             return {"ok": True}
@@ -1420,7 +1420,7 @@ def test_issue_283_save_routes_refresh_detached_enqueue_protection(monkeypatch) 
     from tinker_server.routes import weights as weights_routes
     import tinker_server.backend.model_work_scheduler as scheduler_module
 
-    class StubCapacityManager:
+    class StubAdmissionControl:
         async def async_try_reserve(self, request_id: str, *, queue_bytes: int, object_store_bytes: int) -> dict:
             _ = (request_id, queue_bytes, object_store_bytes)
             return {"ok": True}
@@ -1517,7 +1517,7 @@ def test_issue_283_load_state_route_refreshes_detached_enqueue_protection(tmp_pa
         encoding="utf-8",
     )
 
-    class StubCapacityManager:
+    class StubAdmissionControl:
         async def async_try_reserve(self, request_id: str, *, queue_bytes: int, object_store_bytes: int) -> dict:
             _ = (request_id, queue_bytes, object_store_bytes)
             return {"ok": True}

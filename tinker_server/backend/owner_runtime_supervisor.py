@@ -56,25 +56,17 @@ def _ray_namespace() -> str:
 
 
 def _future_reap_interval_s() -> float:
-    from ..config import config as server_config
-
-    return float(server_config.api_work_queue_reap_interval_s)
+    return float(os.environ.get("MINT_MAINTENANCE_REAP_INTERVAL_S", "5.0"))
 
 
 def run_future_reaper_once() -> dict[str, Any]:
-    from .capacity_manager import capacity_manager
     from .task_state_store import task_state_futures
 
     asyncio.run(task_state_futures.async_ensure_started())
     reaped = asyncio.run(task_state_futures.async_reap())
-    released: list[str] = []
-    for rid in list(reaped.get("expired", [])) + list(reaped.get("timed_out", [])):
-        asyncio.run(capacity_manager.async_release_all(str(rid)))
-        released.append(str(rid))
     return {
         "expired": list(reaped.get("expired", [])),
         "timed_out": list(reaped.get("timed_out", [])),
-        "released": released,
     }
 
 

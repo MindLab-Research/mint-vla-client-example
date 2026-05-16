@@ -55,51 +55,6 @@ class _StubModelWorkScheduler:
         return {"ok": True}
 
 
-class _StubCapacityManager:
-    def __init__(self) -> None:
-        self.calls: list[dict] = []
-        self.released: list[str] = []
-
-    async def async_try_reserve(self, request_id: str, *, queue_bytes: int, object_store_bytes: int) -> dict:
-        self.calls.append(
-            {
-                "request_id": request_id,
-                "queue_bytes": queue_bytes,
-                "object_store_bytes": object_store_bytes,
-            }
-        )
-        return {"ok": True}
-
-    async def async_release_all(self, request_id: str) -> None:
-        self.released.append(request_id)
-
-
-class _StubQueue:
-    def __init__(self) -> None:
-        self.calls: list[dict] = []
-
-    async def enqueue(
-        self,
-        *,
-        request_id: str,
-        op: str,
-        request_json: bytes,
-        user_id: str | None,
-        webhook_url: str | None,
-        extra: dict | None = None,
-    ) -> None:
-        self.calls.append(
-            {
-                "request_id": request_id,
-                "op": op,
-                "request_json": json.loads(request_json.decode("utf-8")),
-                "user_id": user_id,
-                "webhook_url": webhook_url,
-                "extra": extra,
-            }
-        )
-
-
 def test_mint_action_route_cleans_up_future_when_enqueue_fails(monkeypatch) -> None:
     from tinker_server.routes import mint as mint_routes
 
@@ -509,8 +464,8 @@ def test_mint_vla_train_step_route_uses_detached_session_info(monkeypatch) -> No
     assert scheduler.calls[0]["domain_key"] == "training:openpi/pi0-fast-libero-low-mem-finetune"
 
 
-def test_api_work_queue_dispatch_executes_mint_vla_train_step(monkeypatch) -> None:
-    from tinker_server.backend import api_work_queue_dispatch as dispatch
+def test_model_work_dispatch_executes_mint_vla_train_step(monkeypatch) -> None:
+    from tinker_server.backend import model_work_dispatch as dispatch
     import ray
 
     captured: dict[str, object] = {}
@@ -549,7 +504,7 @@ def test_api_work_queue_dispatch_executes_mint_vla_train_step(monkeypatch) -> No
         extra=None,
     )
 
-    asyncio.run(dispatch.execute_work_item(item))
+    asyncio.run(dispatch.execute_model_work_item(item))
 
     assert captured["request_id"] == "req-1"
     assert captured["user_id"] == "user-a"

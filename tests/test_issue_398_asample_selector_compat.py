@@ -60,27 +60,6 @@ class _StubFutureStore:
         return None
 
 
-class _StubCapacityManager:
-    def __init__(self):
-        self.reserved: list[str] = []
-        self.released: list[str] = []
-
-    async def async_try_reserve(self, request_id: str, queue_bytes: int, object_store_bytes: int):
-        self.reserved.append(request_id)
-        return {"ok": True}
-
-    async def async_release_all(self, request_id: str) -> None:
-        self.released.append(request_id)
-
-
-class _StubApiWorkQueue:
-    def __init__(self):
-        self.calls: list[dict] = []
-
-    async def enqueue(self, **kwargs):
-        self.calls.append(dict(kwargs))
-
-
 class _StubModelWorkScheduler:
     def __init__(self):
         self.calls: list[dict] = []
@@ -192,19 +171,9 @@ def test_asample_normalizes_direct_selector_before_enqueue(monkeypatch, selector
 
 def test_asample_keeps_seq_id_gate_for_existing_session_selector(monkeypatch):
     stub_fs = _StubFutureStore()
-    stub_cap = _StubCapacityManager()
-    stub_q = _StubApiWorkQueue()
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
     monkeypatch.setattr(sampling_route, "task_state_futures", stub_fs)
-
-    import tinker_server.backend.capacity_manager as cm
-    import tinker_server.backend.api_work_queue as awq
-    import tinker_server.backend.result_size_estimator as rse
-
-    monkeypatch.setattr(cm, "capacity_manager", stub_cap)
-    monkeypatch.setattr(awq, "api_work_queue", stub_q)
-    monkeypatch.setattr(rse, "estimate_sampling_result_bytes", lambda _req: 0)
     monkeypatch.setattr(sampling_route.server_config, "sampling_require_seq_id", True)
 
     req = SampleRequest(

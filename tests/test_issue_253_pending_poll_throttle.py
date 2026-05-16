@@ -20,16 +20,6 @@ class _StubFutureStore:
         return {}
 
 
-class _StubApiWorkQueue:
-    async def find_position(self, request_id: str, *, timeout_s: float = 5.0) -> dict:
-        _ = timeout_s
-        return {"found": True, "position": None, "depth": 0}
-
-    async def get_eta_state(self, op: str | None, *, timeout_s: float = 5.0) -> dict:
-        _ = timeout_s
-        return {"ema_exec_s": None}
-
-
 def _request_with_admin_user():
     return SimpleNamespace(state=SimpleNamespace(user_data={"user_id": "admin"}), headers={})
 
@@ -45,12 +35,6 @@ def test_pending_retrieve_short_circuits_repeat_polls(monkeypatch):
     monkeypatch.setattr(futures_route, "task_state_futures", stub)
     monkeypatch.setattr(futures_route.time, "time", lambda: clock["now"])
     monkeypatch.setattr(futures_route, "_PENDING_HINTS", futures_route.OrderedDict())
-    import tinker_server.backend.api_work_queue as wq
-
-    monkeypatch.setattr(wq, "api_work_queue", _StubApiWorkQueue())
-    import tinker_server.config as config_module
-
-    monkeypatch.setattr(config_module.config, "api_work_queue_num_workers", 1, raising=False)
 
     body = FutureRetrieveRequest(request_id="rid_pending")
 

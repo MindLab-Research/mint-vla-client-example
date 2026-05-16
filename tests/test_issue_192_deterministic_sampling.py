@@ -117,7 +117,7 @@ class _StubFutureStore:
         self.pending.pop(request_id, None)
 
 
-class _StubCapacityManager:
+class _StubAdmissionControl:
     def __init__(self):
         self.reserved: list[str] = []
         self.released: list[str] = []
@@ -133,7 +133,7 @@ class _StubCapacityManager:
         self.released.append(request_id)
 
 
-class _StubApiWorkQueue:
+class _StubAdmissionQueue:
     def __init__(self):
         self.calls: list[dict] = []
 

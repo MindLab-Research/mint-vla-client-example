@@ -8,10 +8,8 @@ def anyio_backend() -> str:
     return "asyncio"
 
 
-def test_issue_364_future_reaper_once_releases_capacity(monkeypatch) -> None:
+def test_issue_364_future_reaper_once_reaps_task_state(monkeypatch) -> None:
     from tinker_server.backend import owner_runtime_supervisor as ors
-
-    released: list[str] = []
 
     class _FakeFutureStore:
         async def async_ensure_started(self) -> dict:
@@ -20,26 +18,18 @@ def test_issue_364_future_reaper_once_releases_capacity(monkeypatch) -> None:
         async def async_reap(self) -> dict:
             return {"expired": ["req-expired"], "timed_out": ["req-timeout"]}
 
-    class _FakeCapacityManager:
-        async def async_release_all(self, request_id: str) -> None:
-            released.append(str(request_id))
-
     import importlib
 
     task_state_store_module = importlib.import_module("tinker_server.backend.task_state_store")
-    capacity_manager_module = importlib.import_module("tinker_server.backend.capacity_manager")
 
     monkeypatch.setattr(task_state_store_module, "task_state_futures", _FakeFutureStore())
-    monkeypatch.setattr(capacity_manager_module, "capacity_manager", _FakeCapacityManager())
 
     out = ors.run_future_reaper_once()
 
     assert out == {
         "expired": ["req-expired"],
         "timed_out": ["req-timeout"],
-        "released": ["req-expired", "req-timeout"],
     }
-    assert released == ["req-expired", "req-timeout"]
 
 
 def test_issue_364_checkpoint_helpers_proxy_results(monkeypatch) -> None:

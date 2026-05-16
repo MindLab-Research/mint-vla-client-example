@@ -13,7 +13,7 @@ def anyio_backend() -> str:
 
 @pytest.mark.anyio
 async def test_issue_439_internal_noop_dispatch_uses_async_future_store(monkeypatch) -> None:
-    from tinker_server.backend import api_work_queue_dispatch as dispatch
+    from tinker_server.backend import model_work_dispatch as dispatch
     import ray
 
     task_state_store_module = importlib.import_module("tinker_server.backend.task_state_store")
@@ -42,14 +42,14 @@ async def test_issue_439_internal_noop_dispatch_uses_async_future_store(monkeypa
         extra=None,
     )
 
-    await dispatch.execute_work_item(item)
+    await dispatch.execute_model_work_item(item)
 
     assert calls == [("rid-noop", "internal.noop")]
 
 
 @pytest.mark.anyio
-async def test_api_work_queue_dispatch_does_not_lazy_init_ray(monkeypatch) -> None:
-    from tinker_server.backend import api_work_queue_dispatch as dispatch
+async def test_model_work_dispatch_does_not_lazy_init_ray(monkeypatch) -> None:
+    from tinker_server.backend import model_work_dispatch as dispatch
     from tinker_server import ray_utils
     import ray
 
@@ -68,6 +68,6 @@ async def test_api_work_queue_dispatch_does_not_lazy_init_ray(monkeypatch) -> No
     )
 
     with pytest.raises(RuntimeError, match="Ray is not initialized"):
-        await dispatch.execute_work_item(item)
+        await dispatch.execute_model_work_item(item)
 
     assert init_ray_calls == []

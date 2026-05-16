@@ -65,7 +65,6 @@ def test_runtime_config_classifies_bootstrap_actor_creation_snapshot_and_observa
 
 def test_config_snapshot_is_read_only_shape_and_fingerprint_ignores_created_at() -> None:
     cfg = ServerConfig(
-        api_work_queue_actor_name="queue-test",
         config_path="/etc/mint/config.toml",
         api_key="secret-key",
         usage_pg_dsn="postgres://mint:secret@db/mint",
@@ -126,20 +125,6 @@ def test_actor_env_from_environ_keeps_real_values_for_actor_hydration() -> None:
     assert actor_env["MINT_NEW_FEATURE_FLAG"] == "1"
     assert "MINT_CONFIG_ACTOR_HYDRATE" not in actor_env
     assert "UNRELATED" not in actor_env
-
-
-def test_actor_env_from_environ_canonicalizes_legacy_actor_name_aliases() -> None:
-    actor_env = actor_env_from_environ(
-        {
-            "TINKER_API_WORK_QUEUE_ACTOR_NAME": "legacy-api",
-            "TINKER_CAPACITY_MANAGER_ACTOR_NAME": "legacy-capacity",
-        }
-    )
-
-    assert actor_env["MINT_API_WORK_QUEUE_ACTOR_NAME"] == "legacy-api"
-    assert actor_env["MINT_CAPACITY_MANAGER_ACTOR_NAME"] == "legacy-capacity"
-    assert "TINKER_API_WORK_QUEUE_ACTOR_NAME" not in actor_env
-    assert "TINKER_CAPACITY_MANAGER_ACTOR_NAME" not in actor_env
 
 
 def test_config_actor_exposes_no_mutating_api() -> None:

@@ -416,7 +416,6 @@ def test_issue_588_admission_stats_rss_path_preserves_resource_pool_metadata(mon
     model_actor_supervisor_module = importlib.import_module("tinker_server.backend.model_actor_supervisor")
     model_work_scheduler_module = importlib.import_module("tinker_server.backend.model_work_scheduler")
     owner_runtime_supervisor_module = importlib.import_module("tinker_server.backend.owner_runtime_supervisor")
-    queue_supervisor_module = importlib.import_module("tinker_server.backend.queue_supervisor")
     resource_pool_module = importlib.import_module("tinker_server.backend.resource_pool")
     session_heartbeat_store_module = importlib.import_module("tinker_server.backend.session_heartbeat_store")
     sampling_route = importlib.import_module("tinker_server.routes.sampling")
@@ -435,9 +434,6 @@ def test_issue_588_admission_stats_rss_path_preserves_resource_pool_metadata(mon
 
     class _FakeSupervisor:
         async def async_health_snapshot(self, *, timeout_s: float = 10.0) -> dict:
-            return {}
-
-        async def async_snapshot(self, *, timeout_s: float = 10.0) -> dict:
             return {}
 
     class _FakeSessionHeartbeatStore:
@@ -481,7 +477,6 @@ def test_issue_588_admission_stats_rss_path_preserves_resource_pool_metadata(mon
     monkeypatch.setattr(model_work_scheduler_module, "model_work_scheduler", _FakeModelWorkScheduler())
     monkeypatch.setattr(model_actor_supervisor_module, "model_actor_supervisor", _FakeModelActorSupervisor())
     monkeypatch.setattr(owner_runtime_supervisor_module, "owner_runtime_supervisor", _FakeSupervisor())
-    monkeypatch.setattr(queue_supervisor_module, "queue_supervisor", _FakeSupervisor())
     monkeypatch.setattr(resource_pool_module, "get_resource_pool", lambda: _FakePool())
     monkeypatch.setattr(session_heartbeat_store_module, "session_heartbeat_store", _FakeSessionHeartbeatStore())
     monkeypatch.setattr(sampling_route, "_lora_load_lock_count", lambda: 0)
@@ -505,7 +500,6 @@ def test_issue_248_admission_stats_metrics_path_uses_cached_pool_snapshot(monkey
     model_actor_supervisor_module = importlib.import_module("tinker_server.backend.model_actor_supervisor")
     model_work_scheduler_module = importlib.import_module("tinker_server.backend.model_work_scheduler")
     owner_runtime_supervisor_module = importlib.import_module("tinker_server.backend.owner_runtime_supervisor")
-    queue_supervisor_module = importlib.import_module("tinker_server.backend.queue_supervisor")
     resource_pool_module = importlib.import_module("tinker_server.backend.resource_pool")
     session_heartbeat_store_module = importlib.import_module("tinker_server.backend.session_heartbeat_store")
     sampling_route = importlib.import_module("tinker_server.routes.sampling")
@@ -524,9 +518,6 @@ def test_issue_248_admission_stats_metrics_path_uses_cached_pool_snapshot(monkey
 
     class _FakeSupervisor:
         async def async_health_snapshot(self, *, timeout_s: float = 10.0) -> dict:
-            return {}
-
-        async def async_snapshot(self, *, timeout_s: float = 10.0) -> dict:
             return {}
 
     class _FakeSessionHeartbeatStore:
@@ -560,7 +551,6 @@ def test_issue_248_admission_stats_metrics_path_uses_cached_pool_snapshot(monkey
     monkeypatch.setattr(model_work_scheduler_module, "model_work_scheduler", _FakeModelWorkScheduler())
     monkeypatch.setattr(model_actor_supervisor_module, "model_actor_supervisor", _FakeModelActorSupervisor())
     monkeypatch.setattr(owner_runtime_supervisor_module, "owner_runtime_supervisor", _FakeSupervisor())
-    monkeypatch.setattr(queue_supervisor_module, "queue_supervisor", _FakeSupervisor())
     monkeypatch.setattr(resource_pool_module, "get_resource_pool", lambda: _FakePool())
     monkeypatch.setattr(session_heartbeat_store_module, "session_heartbeat_store", _FakeSessionHeartbeatStore())
     monkeypatch.setattr(sampling_route, "_lora_load_lock_count", lambda: 0)

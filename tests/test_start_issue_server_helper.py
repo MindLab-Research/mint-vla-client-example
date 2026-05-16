@@ -62,7 +62,6 @@ def test_start_issue_server_helper_scopes_control_plane_actor_names() -> None:
     assert data["TINKER_RAY_NAMESPACE"] == "tinker_yiwen_issue_416_r9"
     assert data["MINT_RAY_NAMESPACE"] == "tinker_yiwen_issue_416_r9"
     assert data["MINT_STARTUP_LEASE_ACTOR_NAME"] == "tinker_startup_lease_issue_416_r9"
-    assert data["MINT_QUEUE_EXECUTION_RUNTIME_LOCAL_ONLY"] == "1"
     assert data["MINT_DISABLE_MINT_ROUTE"] == "1"
     assert data["TINKER_API_KEY"] == "dummy"
     assert (
@@ -76,10 +75,8 @@ def test_start_issue_server_helper_scopes_control_plane_actor_names() -> None:
     assert data["MINT_DENSE_MODEL_PLACEMENT_JSON"] == "{}"
     assert data["MINT_VLLM_MODEL_PLACEMENT_JSON"] == "{}"
 
-    assert token in data["MINT_API_WORK_QUEUE_ACTOR_NAME"]
-    assert token in data["MINT_CAPACITY_MANAGER_ACTOR_NAME"]
-    assert token in data["MINT_QUEUE_EXECUTION_RUNTIME_ACTOR_NAME"]
-    assert token in data["MINT_QUEUE_SUPERVISOR_ACTOR_NAME"]
+    assert token in data["MINT_MODEL_WORK_SCHEDULER_ACTOR_NAME"]
+    assert token in data["MINT_TASK_STATE_STORE_ACTOR_NAME"]
     assert token in data["MINT_GATEWAY_SESSION_STORE_ACTOR_NAME"]
     assert token in data["MINT_SAMPLING_SESSION_STORE_ACTOR_NAME"]
     assert token in data["MINT_TRAINING_SESSION_STORE_ACTOR_NAME"]
@@ -92,10 +89,8 @@ def test_start_issue_server_helper_scopes_control_plane_actor_names() -> None:
     assert token in data["MINT_FUTURE_REPLAY_SWEEPER_ACTOR_NAME"]
 
     forbidden = {
-        "tinker_api_work_queue_leixiang",
-        "tinker_capacity_manager",
-        "tinker_queue_execution_runtime",
-        "tinker_queue_supervisor",
+        "mint_model_work_scheduler",
+        "mint_task_state_store",
         "tinker_training_session_store",
         "tinker_sampling_session_store",
         "tinker_session_heartbeat_store",

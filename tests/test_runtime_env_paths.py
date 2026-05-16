@@ -1081,7 +1081,7 @@ def test_actor_runtime_env_vars_forwards_control_plane_pin_envs(tmp_path):
             "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
             "RAY_ADDRESS": "ray://cfg-test",
             "MINT_CONTROL_PLANE_PINNED_NODE_IP": "192.168.38.176",
-            "MINT_API_WORK_QUEUE_PINNED_NODE_IP": "192.168.38.176",
+            "MINT_MODEL_WORK_SCHEDULER_PINNED_NODE_IP": "192.168.38.176",
             "MINT_STARTUP_LEASE_PINNED_NODE_IP": "192.168.38.176",
         },
     )
@@ -1090,7 +1090,7 @@ def test_actor_runtime_env_vars_forwards_control_plane_pin_envs(tmp_path):
     assert data["MINT_CONFIG_ACTOR_HYDRATE"] == "1"
     assert "MINT_CONTROL_PLANE_PINNED_NODE_IP" not in data
     assert actor_env["MINT_CONTROL_PLANE_PINNED_NODE_IP"] == "192.168.38.176"
-    assert actor_env["MINT_API_WORK_QUEUE_PINNED_NODE_IP"] == "192.168.38.176"
+    assert actor_env["MINT_MODEL_WORK_SCHEDULER_PINNED_NODE_IP"] == "192.168.38.176"
     assert actor_env["MINT_STARTUP_LEASE_PINNED_NODE_IP"] == "192.168.38.176"
 
 
@@ -1160,8 +1160,8 @@ def test_actor_runtime_env_vars_forwards_config_path(tmp_path):
             "RAY_ADDRESS": "ray://cfg-test",
             "TINKER_CONFIG_PATH": str(cfg),
             "MINT_DETACHED_ACTOR_NODE_IP": "192.168.38.175",
-            "MINT_API_WORK_QUEUE_ACTOR_NAME": "issue440-api-work-queue",
-            "MINT_CAPACITY_MANAGER_ACTOR_NAME": "issue440-capacity-manager",
+            "MINT_MODEL_WORK_SCHEDULER_ACTOR_NAME": "issue440-model-work-scheduler",
+            "MINT_TASK_STATE_STORE_ACTOR_NAME": "issue440-task-state-store",
         },
     )
     data = payload["runtime_env"]
@@ -1170,38 +1170,8 @@ def test_actor_runtime_env_vars_forwards_config_path(tmp_path):
     assert data["TINKER_CONFIG_PATH"] == str(cfg)
     assert data["TINKER_RAY_NAMESPACE"] == "cfg_ns"
     assert actor_env["MINT_DETACHED_ACTOR_NODE_IP"] == "192.168.38.175"
-    assert actor_env["MINT_API_WORK_QUEUE_ACTOR_NAME"] == "issue440-api-work-queue"
-    assert actor_env["MINT_CAPACITY_MANAGER_ACTOR_NAME"] == "issue440-capacity-manager"
-
-
-def test_server_config_prefers_mint_actor_names_and_accepts_legacy_tinker_aliases():
-    cfg = server_config.ServerConfig.from_sources(
-        environ={
-            "TINKER_API_KEY": "dev-key",
-            "MINT_API_WORK_QUEUE_ACTOR_NAME": "mint-api",
-            "TINKER_API_WORK_QUEUE_ACTOR_NAME": "legacy-api",
-            "MINT_CAPACITY_MANAGER_ACTOR_NAME": "mint-cap",
-            "TINKER_CAPACITY_MANAGER_ACTOR_NAME": "legacy-cap",
-        },
-        config_path=None,
-        config_file=None,
-    )
-
-    assert cfg.api_work_queue_actor_name == "mint-api"
-    assert cfg.capacity_manager_actor_name == "mint-cap"
-
-    legacy_only = server_config.ServerConfig.from_sources(
-        environ={
-            "TINKER_API_KEY": "dev-key",
-            "TINKER_API_WORK_QUEUE_ACTOR_NAME": "legacy-api",
-            "TINKER_CAPACITY_MANAGER_ACTOR_NAME": "legacy-cap",
-        },
-        config_path=None,
-        config_file=None,
-    )
-
-    assert legacy_only.api_work_queue_actor_name == "legacy-api"
-    assert legacy_only.capacity_manager_actor_name == "legacy-cap"
+    assert actor_env["MINT_MODEL_WORK_SCHEDULER_ACTOR_NAME"] == "issue440-model-work-scheduler"
+    assert actor_env["MINT_TASK_STATE_STORE_ACTOR_NAME"] == "issue440-task-state-store"
 
 
 def test_actor_runtime_env_vars_requires_ray_address(tmp_path):
@@ -1229,28 +1199,6 @@ def test_actor_runtime_env_vars_requires_ray_address(tmp_path):
     assert "RAY_ADDRESS is required" in (out.stdout + out.stderr)
 
 
-def test_actor_runtime_env_vars_canonicalize_legacy_tinker_actor_aliases(tmp_path):
-    env_root = tmp_path / "runtime"
-    _materialize_runtime_env(env_root)
-    payload = _load_actor_runtime_env_payload(
-        {
-            "PFS_RUNTIME_ENV_ROOT": str(env_root),
-            "PFS_TINKER_PATH": str(tmp_path / 'repo'),
-            "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
-            "RAY_ADDRESS": "ray://cfg-test",
-            "TINKER_API_WORK_QUEUE_ACTOR_NAME": "legacy-api-work-queue",
-            "TINKER_CAPACITY_MANAGER_ACTOR_NAME": "legacy-capacity-manager",
-        },
-    )
-    data = payload["runtime_env"]
-    actor_env = payload["actor_env"]
-    assert "TINKER_API_WORK_QUEUE_ACTOR_NAME" not in data
-    assert actor_env["MINT_API_WORK_QUEUE_ACTOR_NAME"] == "legacy-api-work-queue"
-    assert actor_env["MINT_CAPACITY_MANAGER_ACTOR_NAME"] == "legacy-capacity-manager"
-    assert "TINKER_API_WORK_QUEUE_ACTOR_NAME" not in actor_env
-    assert "TINKER_CAPACITY_MANAGER_ACTOR_NAME" not in actor_env
-
-
 def test_actor_runtime_env_vars_forwards_control_plane_actor_names(tmp_path):
     env_root = tmp_path / "runtime"
     _materialize_runtime_env(env_root)
@@ -1274,8 +1222,7 @@ def test_actor_runtime_env_vars_forwards_control_plane_actor_names(tmp_path):
             "MINT_FUTURE_REPLAY_SWEEPER_ACTOR_NAME": "mint-future-replay-sweeper-test",
             "MINT_MODEL_WORK_SCHEDULER_ACTOR_NAME": "mint-model-work-scheduler-test",
             "MINT_MODEL_WORK_SCHEDULER_PINNED_NODE_IP": "192.168.39.110",
-            "MINT_QUEUE_EXECUTION_RUNTIME_ACTOR_NAME": "mint-queue-runtime-test",
-            "MINT_QUEUE_SUPERVISOR_ACTOR_NAME": "mint-queue-supervisor-test",
+            "MINT_TASK_STATE_STORE_ACTOR_NAME": "mint-task-state-store-test",
             "MINT_STARTUP_LEASE_ACTOR_NAME": "mint-startup-lease-test",
             "MINT_OWNER_RUNTIME_SUPERVISOR_ACTOR_NAME": "mint-owner-runtime-test",
         },
@@ -1296,8 +1243,7 @@ def test_actor_runtime_env_vars_forwards_control_plane_actor_names(tmp_path):
     assert actor_env["MINT_FUTURE_REPLAY_SWEEPER_ACTOR_NAME"] == "mint-future-replay-sweeper-test"
     assert actor_env["MINT_MODEL_WORK_SCHEDULER_ACTOR_NAME"] == "mint-model-work-scheduler-test"
     assert actor_env["MINT_MODEL_WORK_SCHEDULER_PINNED_NODE_IP"] == "192.168.39.110"
-    assert actor_env["MINT_QUEUE_EXECUTION_RUNTIME_ACTOR_NAME"] == "mint-queue-runtime-test"
-    assert actor_env["MINT_QUEUE_SUPERVISOR_ACTOR_NAME"] == "mint-queue-supervisor-test"
+    assert actor_env["MINT_TASK_STATE_STORE_ACTOR_NAME"] == "mint-task-state-store-test"
     assert actor_env["MINT_STARTUP_LEASE_ACTOR_NAME"] == "mint-startup-lease-test"
     assert actor_env["MINT_OWNER_RUNTIME_SUPERVISOR_ACTOR_NAME"] == "mint-owner-runtime-test"
 

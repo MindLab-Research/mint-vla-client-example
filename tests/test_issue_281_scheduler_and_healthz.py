@@ -65,14 +65,6 @@ class _AsyncFutureStore:
         return "pending"
 
 
-class _AsyncCapacityManager:
-    async def async_try_reserve(self, *args, **kwargs) -> dict:
-        return {"ok": True}
-
-    async def async_release_all(self, *_args, **_kwargs) -> None:
-        return None
-
-
 class _AsyncModelWorkScheduler:
     def __init__(self, captured: dict) -> None:
         self._captured = captured

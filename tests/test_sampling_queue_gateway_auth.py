@@ -5,7 +5,7 @@ import sys
 import types
 from types import SimpleNamespace
 
-from tinker_server.backend import api_work_queue_dispatch
+from tinker_server.backend import model_work_dispatch
 from tinker_server.models.types import ModelInput, SampleRequest, SamplingParams
 
 
@@ -49,7 +49,7 @@ def test_sampling_work_executor_forwards_gateway_auth(monkeypatch):
     monkeypatch.setitem(sys.modules, "ray", ray_module)
     monkeypatch.setattr("tinker_server.routes.sampling._do_sample", _capture_do_sample)
 
-    asyncio.run(api_work_queue_dispatch.execute_work_item(item))
+    asyncio.run(model_work_dispatch.execute_model_work_item(item))
 
     assert captured == {
         "request_id": "req-test",

@@ -64,7 +64,7 @@ def _poll_future(request_id: str, timeout_s: float = 1800.0) -> dict[str, Any]:
         if resp.status_code == 408:
             time.sleep(2)
             continue
-        if resp.status_code == 503 and "ApiWorkQueue position lookup failed" in resp.text:
+        if resp.status_code == 503 and "ModelWorkScheduler position lookup failed" in resp.text:
             time.sleep(2)
             continue
         if resp.status_code != 200:

@@ -235,7 +235,6 @@ async def admission_stats(*, include_actor_rss: bool = True) -> dict:
     from ..backend.model_actor_supervisor import model_actor_supervisor
     from ..backend.model_work_scheduler import model_work_scheduler
     from ..backend.owner_runtime_supervisor import owner_runtime_supervisor
-    from ..backend.queue_supervisor import queue_supervisor
     from ..backend.session_heartbeat_store import session_heartbeat_store
     from ..routes import sampling as sampling_route
     from ..routes import service as service_route
@@ -353,12 +352,6 @@ async def admission_stats(*, include_actor_rss: bool = True) -> dict:
     except Exception as e:
         owner_runtime = {"error": f"{type(e).__name__}: {e}"}
 
-    queue_runtime = None
-    try:
-        queue_runtime = await queue_supervisor.async_snapshot(timeout_s=timeout_s)
-    except Exception as e:
-        queue_runtime = {"error": f"{type(e).__name__}: {e}"}
-
     return {
         "model_work_scheduler": model_scheduler,
         "model_actor_supervisor": model_supervisor,
@@ -369,7 +362,6 @@ async def admission_stats(*, include_actor_rss: bool = True) -> dict:
         "ray_cluster": ray_cluster,
         "ray_gcs_metrics": ray_gcs_metrics,
         "owner_runtime_supervisor": owner_runtime,
-        "queue_supervisor": queue_runtime,
     }
 
 
@@ -378,13 +370,6 @@ async def owner_runtime_supervisor_health() -> dict:
     from ..backend.owner_runtime_supervisor import owner_runtime_supervisor
 
     return await owner_runtime_supervisor.async_health_snapshot(timeout_s=10.0)
-
-
-@router.get("/queue_supervisor")
-async def queue_supervisor_health() -> dict:
-    from ..backend.queue_supervisor import queue_supervisor
-
-    return await queue_supervisor.async_snapshot(timeout_s=10.0)
 
 
 @router.get("/model_work_scheduler")
