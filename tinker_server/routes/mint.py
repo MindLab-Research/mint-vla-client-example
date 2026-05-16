@@ -11,7 +11,7 @@ from fastapi import APIRouter, HTTPException, Request
 from ..auth_identity import can_bypass_ownership
 from ..auth_identity import get_user_data as _request_user_data
 from ..auth_identity import get_user_id as _request_user_id
-from ..backend.task_state_store import task_state_futures as future_store
+from ..backend.task_state_store import task_state_futures
 from ..backend.mintx_ops import interpolate_checkpoints_to_dir
 from ..checkpoints import (
     MIRROR_STATUS_PENDING,
@@ -101,11 +101,11 @@ async def _enqueue_mint_model_work(
             assign_max_items=1,
             extra=merge_queue_priority_extra(extra, request=http_request),
             queued_meta=queued_meta,
-            future_store_client=future_store,
+            future_store_client=task_state_futures,
         )
     except Exception:
         try:
-            await future_store.async_cleanup(request_id)
+            await task_state_futures.async_cleanup(request_id)
         except Exception:
             pass
         raise
@@ -641,7 +641,7 @@ async def _do_interpolate_checkpoints(
             prefer_tinker=False,
             checkpoint_type=output_checkpoint_type,
         )
-        await future_store.async_resolve(
+        await task_state_futures.async_resolve(
             request_id,
             {
                 "checkpoint_id": checkpoint_name,
@@ -667,7 +667,7 @@ async def _do_interpolate_checkpoints(
             type(e).__name__,
             "check_source_checkpoints_and_coefficients",
         )
-        await future_store.async_fail(request_id, str(e))
+        await task_state_futures.async_fail(request_id, str(e))
 
 
 @router.post("/forward_backward_reverse_kl", response_model=UntypedAPIFuture)
@@ -771,7 +771,7 @@ async def _do_forward_backward_reverse_kl(
             session.model_id,
             time.time() - t0,
         )
-        await future_store.async_resolve(request_id, result)
+        await task_state_futures.async_resolve(request_id, result)
     except Exception as e:
         logger.exception(
             "[mint.forward_backward_reverse_kl] failed request_id=%s model_id=%s failure_reason=%s error_type=%s next_action=%s",
@@ -781,7 +781,7 @@ async def _do_forward_backward_reverse_kl(
             type(e).__name__,
             "check_reference_checkpoint_and_reverse_kl_batch_shape",
         )
-        await future_store.async_fail(request_id, str(e))
+        await task_state_futures.async_fail(request_id, str(e))
 
 
 async def _do_vla_train_step(
@@ -802,7 +802,7 @@ async def _do_vla_train_step(
             type(e).__name__,
             "check_vla_observation_and_supervision_shapes",
         )
-        await future_store.async_fail(request_id, str(e))
+        await task_state_futures.async_fail(request_id, str(e))
         if training_manager is not None:
             training_manager.mark_inflight(request.model_id, -1)
         return

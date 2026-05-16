@@ -44,13 +44,13 @@ async def test_issue364_request_path_helpers_fail_fast_without_init_ray(monkeypa
 
     api_work_queue_module = importlib.import_module("tinker_server.backend.api_work_queue")
     capacity_manager_module = importlib.import_module("tinker_server.backend.capacity_manager")
-    future_store_module = importlib.import_module("tinker_server.backend.future_store")
+    task_state_store_module = importlib.import_module("tinker_server.backend.task_state_store")
     gateway_session_store_module = importlib.import_module("tinker_server.backend.gateway_session_store")
 
     with pytest.raises(capacity_manager_module.CapacityManagerUnavailableError, match="Ray not initialized"):
         capacity_manager_module.CapacityManager()._get_cached_ray_actor_for_async_request_path()
-    with pytest.raises(future_store_module.FutureStoreUnavailableError, match="Ray not initialized"):
-        future_store_module.FutureStore()._get_cached_ray_actor_for_async_request_path()
+    with pytest.raises(task_state_store_module.TaskStateStoreUnavailableError, match="Ray not initialized"):
+        await task_state_store_module.TaskStateStoreClient()._get_ray_actor_async(require_ready=False)
     with pytest.raises(api_work_queue_module.ApiWorkQueueUnavailableError, match="Ray not initialized"):
         await api_work_queue_module.ApiWorkQueueClient()._get_ray_actor_async(require_ready=False)
     with pytest.raises(RuntimeError, match="Ray not initialized"):

@@ -9,7 +9,7 @@ from tinker_server.backend import sampling_session_store as sampling_store_modul
 from tinker_server.backend import session_manager as session_manager_module
 from tinker_server.routes import service as service_route
 
-future_store_module = importlib.import_module("tinker_server.backend.future_store")
+task_state_store_module = importlib.import_module("tinker_server.backend.task_state_store")
 
 
 @pytest.fixture
@@ -55,7 +55,7 @@ async def test_issue_369_detached_sampling_cleanup_removes_stale_session(monkeyp
         return ["req-sample"]
 
     monkeypatch.setattr(
-        future_store_module.future_store,
+        task_state_store_module.task_state_futures,
         "async_fail_sampling_requests_for_session",
         _async_fail_sampling_requests_for_session,
     )
@@ -116,7 +116,7 @@ async def test_issue_369_detached_sampling_cleanup_keeps_shared_adapter_loaded(m
         return []
 
     monkeypatch.setattr(
-        future_store_module.future_store,
+        task_state_store_module.task_state_futures,
         "async_fail_sampling_requests_for_session",
         _async_fail_sampling_requests_for_session,
     )

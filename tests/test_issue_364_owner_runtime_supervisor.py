@@ -26,10 +26,10 @@ def test_issue_364_future_reaper_once_releases_capacity(monkeypatch) -> None:
 
     import importlib
 
-    future_store_module = importlib.import_module("tinker_server.backend.future_store")
+    task_state_store_module = importlib.import_module("tinker_server.backend.task_state_store")
     capacity_manager_module = importlib.import_module("tinker_server.backend.capacity_manager")
 
-    monkeypatch.setattr(future_store_module, "future_store", _FakeFutureStore())
+    monkeypatch.setattr(task_state_store_module, "task_state_futures", _FakeFutureStore())
     monkeypatch.setattr(capacity_manager_module, "capacity_manager", _FakeCapacityManager())
 
     out = ors.run_future_reaper_once()

@@ -130,9 +130,9 @@ def _stub_future_store(monkeypatch):
     async def _noop_async_update_meta(*args, **kwargs):
         return None
 
-    future_store_module = importlib.import_module("tinker_server.backend.future_store")
+    task_state_store_module = importlib.import_module("tinker_server.backend.task_state_store")
     monkeypatch.setattr(
-        future_store_module.future_store,
+        task_state_store_module.task_state_futures,
         "async_update_meta",
         _noop_async_update_meta,
     )

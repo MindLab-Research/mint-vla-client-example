@@ -231,7 +231,7 @@ def _resource_pool_local_snapshot() -> list[dict]:
 
 @router.get("/admission_stats")
 async def admission_stats(*, include_actor_rss: bool = True) -> dict:
-    from ..backend.task_state_store import task_state_futures as future_store
+    from ..backend.task_state_store import task_state_futures
     from ..backend.model_actor_supervisor import model_actor_supervisor
     from ..backend.model_work_scheduler import model_work_scheduler
     from ..backend.owner_runtime_supervisor import owner_runtime_supervisor
@@ -260,21 +260,23 @@ async def admission_stats(*, include_actor_rss: bool = True) -> dict:
 
     fs = None
     try:
-        if not include_actor_rss and hasattr(future_store, "metrics_snapshot"):
-            fs = future_store.metrics_snapshot()
-        elif hasattr(future_store, "async_ensure_ready"):
-            fs = await future_store.async_ensure_ready(timeout_s=timeout_s)
+        if not include_actor_rss and hasattr(task_state_futures, "metrics_snapshot"):
+            fs = task_state_futures.metrics_snapshot()
+        elif hasattr(task_state_futures, "async_ensure_ready"):
+            fs = await task_state_futures.async_ensure_ready(timeout_s=timeout_s)
         else:
-            fs = future_store.ensure_ready(timeout_s=timeout_s)
+            fs = task_state_futures.ensure_ready(timeout_s=timeout_s)
     except Exception as e:
         fs = {"error": f"{type(e).__name__}: {e}"}
 
     actors: dict = {}
     if include_actor_rss:
         try:
-            actors["future_store"] = {"rss_bytes": int(await future_store.async_rss_bytes(timeout_s=timeout_s))}
+            actors["task_state_futures"] = {
+                "rss_bytes": int(await task_state_futures.async_rss_bytes(timeout_s=timeout_s))
+            }
         except Exception as e:
-            actors["future_store"] = {"error": f"{type(e).__name__}: {e}"}
+            actors["task_state_futures"] = {"error": f"{type(e).__name__}: {e}"}
 
         try:
             from ..backend.resource_pool import get_resource_pool
@@ -360,7 +362,7 @@ async def admission_stats(*, include_actor_rss: bool = True) -> dict:
     return {
         "model_work_scheduler": model_scheduler,
         "model_actor_supervisor": model_supervisor,
-        "future_store": fs,
+        "task_state_futures": fs,
         "actors": actors,
         "process": proc,
         "driver_state": driver_state,
@@ -666,9 +668,8 @@ async def metrics() -> Response:
                 _append_metric(lines, "mint_model_actor_supervisor_replica_state", 1, labels=labels)
                 _append_metric(lines, "mint_model_actor_supervisor_replica_generation", rec.get("generation"), labels=labels)
 
-    fs = stats.get("future_store")
+    fs = stats.get("task_state_futures")
     if isinstance(fs, dict):
-        # Existing FutureStore counters/settings from /internal/admission_stats.
         for key in (
             "pending",
             "results",
@@ -682,37 +683,38 @@ async def metrics() -> Response:
             "result_ttl_s",
             "tombstone_ttl_s",
         ):
-            _append_metric(lines, f"mint_future_store_{key}", fs.get(key))
+            _append_metric(lines, f"mint_task_state_futures_{key}", fs.get(key))
 
-        # Phase 2: grouped counters by operation.
         by_op = fs.get("by_op")
         if isinstance(by_op, dict):
             for op, counters in by_op.items():
                 if not isinstance(counters, dict):
                     continue
-                _append_metric(lines, "mint_future_store_pending", counters.get("pending"), labels={"op": op})
-                _append_metric(lines, "mint_future_store_results", counters.get("results"), labels={"op": op})
-                _append_metric(lines, "mint_future_store_errors", counters.get("errors"), labels={"op": op})
+                _append_metric(lines, "mint_task_state_futures_pending", counters.get("pending"), labels={"op": op})
+                _append_metric(lines, "mint_task_state_futures_results", counters.get("results"), labels={"op": op})
+                _append_metric(lines, "mint_task_state_futures_errors", counters.get("errors"), labels={"op": op})
 
         age_stats = fs.get("age_stats")
         if isinstance(age_stats, dict):
-            _append_metric(lines, "mint_future_store_oldest_pending_s", age_stats.get("oldest_pending_s"))
-            _append_metric(lines, "mint_future_store_oldest_done_s", age_stats.get("oldest_done_s"))
-            _append_metric(lines, "mint_future_store_avg_pending_s", age_stats.get("avg_pending_s"))
-            _append_metric(lines, "mint_future_store_avg_done_s", age_stats.get("avg_done_s"))
+            _append_metric(lines, "mint_task_state_futures_oldest_pending_s", age_stats.get("oldest_pending_s"))
+            _append_metric(lines, "mint_task_state_futures_oldest_done_s", age_stats.get("oldest_done_s"))
+            _append_metric(lines, "mint_task_state_futures_avg_pending_s", age_stats.get("avg_pending_s"))
+            _append_metric(lines, "mint_task_state_futures_avg_done_s", age_stats.get("avg_done_s"))
 
         payload_stats = fs.get("payload_stats")
         if isinstance(payload_stats, dict):
-            _append_metric(lines, "mint_future_store_result_refs_count", payload_stats.get("result_refs_count"))
-            _append_metric(lines, "mint_future_store_errors_count", payload_stats.get("errors_count"))
-            _append_metric(lines, "mint_future_store_refs_count", payload_stats.get("refs_count"))
+            _append_metric(
+                lines, "mint_task_state_futures_result_refs_count", payload_stats.get("result_refs_count")
+            )
+            _append_metric(lines, "mint_task_state_futures_errors_count", payload_stats.get("errors_count"))
+            _append_metric(lines, "mint_task_state_futures_refs_count", payload_stats.get("refs_count"))
 
         timeout_counts = fs.get("timeout_counts")
         if isinstance(timeout_counts, dict):
             for kind in ("queue", "execution", "total"):
                 _append_metric(
                     lines,
-                    "mint_future_store_timeouts_total",
+                    "mint_task_state_futures_timeouts_total",
                     timeout_counts.get(kind),
                     labels={"kind": kind},
                 )
@@ -724,14 +726,14 @@ async def metrics() -> Response:
                     for kind in ("queue", "execution", "total"):
                         _append_metric(
                             lines,
-                            "mint_future_store_timeouts_total",
+                            "mint_task_state_futures_timeouts_total",
                             rec.get(kind),
                             labels={"op": op, "kind": kind},
                         )
 
     actors = stats.get("actors")
     if isinstance(actors, dict):
-        for actor_key in ("future_store",):
+        for actor_key in ("task_state_futures",):
             rec = actors.get(actor_key)
             if isinstance(rec, dict):
                 _append_metric(

@@ -351,7 +351,7 @@ def _future_replay_sweeper_actor_name() -> str:
 
 
 def _get_or_create_sweeper_actor():
-    from .future_store import _ray_namespace
+    from .task_state_store import _ray_namespace
 
     import ray
 

@@ -29,7 +29,7 @@ from ..auth_identity import can_manage_system
 from ..auth_identity import can_write
 from ..auth_identity import get_user_data as _request_user_data
 from ..auth_identity import get_user_id as _request_user_id
-from ..backend.task_state_store import task_state_futures as future_store
+from ..backend.task_state_store import task_state_futures
 from ..checkpoint_index import (
     CheckpointAlreadyExistsError,
     CheckpointAlreadyFailedError,
@@ -252,15 +252,15 @@ def _mark_training_inflight(model_id: str, delta: int) -> None:
 
 
 async def _fail_future(request_id: str, error: str) -> None:
-    async_fail = getattr(future_store, "async_fail", None)
+    async_fail = getattr(task_state_futures, "async_fail", None)
     if callable(async_fail):
         await async_fail(request_id, error)
         return
-    fail = getattr(future_store, "fail", None)
+    fail = getattr(task_state_futures, "fail", None)
     if callable(fail):
         fail(request_id, error)
         return
-    raise AttributeError("future_store has neither async_fail nor fail")
+    raise AttributeError("task_state_futures has neither async_fail nor fail")
 
 
 def _get_user_data(request: Request) -> dict | None:
@@ -332,7 +332,7 @@ async def _enqueue_weights_model_work(
         ordering_key=affinity_group,
         extra=_build_execution_serial_extra(model_id=model_id, extra=dict(extra or {})),
         queued_meta=_weights_queued_meta(op=op, model_id=model_id),
-        future_store_client=future_store,
+        future_store_client=task_state_futures,
         scheduler_client=model_work_scheduler,
         trace_enqueue=_enqueue_weights_request_with_trace,
         trace_kwargs={
@@ -1332,7 +1332,7 @@ async def _do_save_state(
             checkpoint_type="training",
         )
 
-        await future_store.async_resolve(request_id, {
+        await task_state_futures.async_resolve(request_id, {
             "checkpoint_id": checkpoint_name,
             "checkpoint_record_id": claimed_ckpt_id,
             "path": selected_path,
@@ -1539,7 +1539,7 @@ async def _do_save_weights(
             checkpoint_type="sampler",
         )
 
-        await future_store.async_resolve(
+        await task_state_futures.async_resolve(
             request_id,
             {
                 "checkpoint_id": checkpoint_name,
@@ -1837,7 +1837,7 @@ async def _do_load_state(
         if not metadata_persisted:
             payload["metadata_persisted"] = False
             payload["metadata_persist_error"] = metadata_persist_error
-        await future_store.async_resolve(request_id, payload)
+        await task_state_futures.async_resolve(request_id, payload)
 
     except Exception as e:
         logger.exception(

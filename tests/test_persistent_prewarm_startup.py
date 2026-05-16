@@ -317,7 +317,7 @@ def _install_lifespan_stubs(
 
     api_work_queue_module = importlib.import_module("tinker_server.backend.api_work_queue")
     config_actor_module = importlib.import_module("tinker_server.backend.config_actor")
-    future_store_module = importlib.import_module("tinker_server.backend.future_store")
+    task_state_store_module = importlib.import_module("tinker_server.backend.task_state_store")
     capacity_manager_module = importlib.import_module("tinker_server.backend.capacity_manager")
     gateway_session_store_module = importlib.import_module("tinker_server.backend.gateway_session_store")
     sampling_session_store_module = importlib.import_module("tinker_server.backend.sampling_session_store")
@@ -358,7 +358,7 @@ def _install_lifespan_stubs(
         model_work_scheduler or _StubModelWorkScheduler(),
     )
     monkeypatch.setattr(capacity_manager_module, "capacity_manager", _StubCapacityManager())
-    monkeypatch.setattr(future_store_module, "future_store", future_store or _StubFutureStore())
+    monkeypatch.setattr(task_state_store_module, "task_state_futures", future_store or _StubFutureStore())
     monkeypatch.setattr(gateway_session_store_module, "ensure_ready", lambda: None)
     monkeypatch.setattr(sampling_session_store_module, "ensure_ready", lambda: None)
     monkeypatch.setattr(session_heartbeat_store_module, "session_heartbeat_store", SimpleNamespace(ensure_ready=lambda: None, async_size=lambda: 0))

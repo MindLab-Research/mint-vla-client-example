@@ -516,7 +516,7 @@ def test_issue_360_asample_admission_uses_async_capacity_and_future(monkeypatch)
     scheduler = _RecordingModelWorkScheduler()
 
     monkeypatch.setattr(sampling_route, "session_manager", _SamplingSessionManager())
-    monkeypatch.setattr(sampling_route, "future_store", fs)
+    monkeypatch.setattr(sampling_route, "task_state_futures", fs)
 
     import tinker_server.backend.model_work_scheduler as mws
 
@@ -540,7 +540,7 @@ def test_issue_360_asample_admission_uses_async_capacity_and_future(monkeypatch)
 def test_issue_360_internal_admission_stats_uses_async_store_calls(monkeypatch):
     import importlib
 
-    fs = importlib.import_module("tinker_server.backend.future_store")
+    fs = importlib.import_module("tinker_server.backend.task_state_store")
     model_actor_supervisor = importlib.import_module("tinker_server.backend.model_actor_supervisor")
     model_work_scheduler = importlib.import_module("tinker_server.backend.model_work_scheduler")
     owner_runtime_supervisor = importlib.import_module("tinker_server.backend.owner_runtime_supervisor")
@@ -572,7 +572,7 @@ def test_issue_360_internal_admission_stats_uses_async_store_calls(monkeypatch):
     async def _zero() -> int:
         return 0
 
-    monkeypatch.setattr(fs, "future_store", _AsyncOnlyAdmissionFutureStore())
+    monkeypatch.setattr(fs, "task_state_futures", _AsyncOnlyAdmissionFutureStore())
     monkeypatch.setattr(
         model_work_scheduler,
         "model_work_scheduler",
@@ -608,8 +608,8 @@ def test_issue_360_internal_admission_stats_uses_async_store_calls(monkeypatch):
     payload = anyio.run(internal_route.admission_stats)
 
     assert payload["model_work_scheduler"]["depth"] == 1
-    assert payload["future_store"]["pending"] == 0
-    assert payload["actors"]["future_store"]["rss_bytes"] == 222
+    assert payload["task_state_futures"]["pending"] == 0
+    assert payload["actors"]["task_state_futures"]["rss_bytes"] == 222
     assert payload["actors"]["resource_pool"][0]["rss_bytes"] == 333
 
 
@@ -775,29 +775,28 @@ async def test_issue_360_api_work_queue_stats_omits_unready_scheduler_metrics(mo
 async def test_issue_360_async_started_probes_skip_ready_snapshot(monkeypatch):
     import importlib
 
-    fs_module = importlib.import_module("tinker_server.backend.future_store")
+    fs_module = importlib.import_module("tinker_server.backend.task_state_store")
     wq_module = importlib.import_module("tinker_server.backend.api_work_queue")
 
-    future_store = fs_module.FutureStore()
     api_work_queue = wq_module.ApiWorkQueueClient()
     calls: list[tuple[str, bool]] = []
 
-    async def _fake_future_get(*, require_ready: bool = True):
-        calls.append(("future_store", bool(require_ready)))
-        return object()
+    class _TaskStateClient:
+        async def async_ensure_started(self):
+            calls.append(("task_state_store", False))
 
     async def _fake_queue_get(*, require_ready: bool = True):
         calls.append(("api_work_queue", bool(require_ready)))
         return object()
 
-    monkeypatch.setattr(future_store, "_get_ray_actor_async", _fake_future_get)
+    future_store = fs_module.TaskStateFutureStore(task_state_client=_TaskStateClient())
     monkeypatch.setattr(api_work_queue, "_get_ray_actor_async", _fake_queue_get)
 
     await future_store.async_ensure_started()
     await api_work_queue.async_ensure_started()
 
     assert calls == [
-        ("future_store", False),
+        ("task_state_store", False),
         ("api_work_queue", False),
     ]
 
@@ -812,7 +811,7 @@ def test_issue_360_training_optim_step_admission_uses_async_capacity_and_future(
     async def _restore_training_session(_mid):
         return None
 
-    monkeypatch.setattr(training_route, "future_store", fs)
+    monkeypatch.setattr(training_route, "task_state_futures", fs)
     monkeypatch.setattr(
         training_route,
         "training_manager",
@@ -875,7 +874,7 @@ def _install_stateless_training_enqueue_stubs(monkeypatch, *, route_session_info
     import tinker_server.backend.result_size_estimator as rse
     import tinker_server.client_compat as client_compat
 
-    monkeypatch.setattr(training_route, "future_store", fs)
+    monkeypatch.setattr(training_route, "task_state_futures", fs)
     monkeypatch.setattr(training_route, "training_manager", None)
     monkeypatch.setattr(training_route, "training_engine", None)
     monkeypatch.setattr(training_route, "_get_training_route_session_info", _get_training_route_session_info)
@@ -2024,33 +2023,15 @@ class _RemoteCall:
 def test_issue_360_future_store_async_get_status_backend_api(monkeypatch):
     import importlib
 
-    fs_module = importlib.import_module("tinker_server.backend.future_store")
+    fs_module = importlib.import_module("tinker_server.backend.task_state_store")
 
-    store = fs_module.FutureStore()
-    assert hasattr(store, "async_get_status"), "FutureStore must expose async_get_status for request paths"
+    class _TaskStateClient:
+        async def async_get_task(self, request_id: str):
+            assert request_id == "rid_backend_async"
+            return {"request_id": request_id, "status": "done", "metadata": {}}
 
-    actor = SimpleNamespace(
-        get_status=_RemoteCall(result="done"),
-        stats=_RemoteCall(result={"depth": 0}),
-    )
-    store._ray_actor = actor
-
-    ray_mod = types.ModuleType("ray")
-    ray_mod.is_initialized = lambda: True  # type: ignore[attr-defined]
-
-    class _ActorDiedError(Exception):
-        pass
-
-    class _RayTaskError(Exception):
-        def __init__(self, message: str, *, cause: Exception | None = None):
-            super().__init__(message)
-            self.cause = cause
-
-    ray_mod.exceptions = SimpleNamespace(
-        ActorDiedError=_ActorDiedError,
-        RayTaskError=_RayTaskError,
-    )
-    monkeypatch.setitem(sys.modules, "ray", ray_mod)
+    store = fs_module.TaskStateFutureStore(task_state_client=_TaskStateClient())
+    assert hasattr(store, "async_get_status"), "TaskStateFutureStore must expose async_get_status for request paths"
 
     out = anyio.run(store.async_get_status, "rid_backend_async")
     assert out == FutureStatus.DONE

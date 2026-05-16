@@ -8,7 +8,7 @@ from tinker_server.backend import session_heartbeat_store as heartbeat_store_mod
 from tinker_server.backend import training_session_store as training_store_module
 from tinker_server.routes import training as training_routes
 
-future_store_module = importlib.import_module("tinker_server.backend.future_store")
+task_state_store_module = importlib.import_module("tinker_server.backend.task_state_store")
 
 
 @pytest.fixture
@@ -127,7 +127,7 @@ async def test_issue_368_cleanup_stale_training_sessions(monkeypatch: pytest.Mon
         return ["req-stale"]
 
     monkeypatch.setattr(
-        training_routes.future_store,
+        training_routes.task_state_futures,
         "async_fail_training_requests_for_model",
         _async_fail_training_requests_for_model,
     )
@@ -174,7 +174,7 @@ async def test_issue_368_cleanup_can_restore_session_before_shutdown(monkeypatch
         return []
 
     monkeypatch.setattr(
-        training_routes.future_store,
+        training_routes.task_state_futures,
         "async_fail_training_requests_for_model",
         _async_fail_training_requests_for_model,
     )
@@ -221,7 +221,7 @@ async def test_issue_368_cleanup_aborts_if_future_fail_path_errors(monkeypatch: 
         raise RuntimeError("future-store-down")
 
     monkeypatch.setattr(
-        training_routes.future_store,
+        training_routes.task_state_futures,
         "async_fail_training_requests_for_model",
         _async_fail_training_requests_for_model,
     )
@@ -270,7 +270,7 @@ async def test_issue_368_cleanup_skips_shared_actor_shutdown_after_restore(
         return []
 
     monkeypatch.setattr(
-        training_routes.future_store,
+        training_routes.task_state_futures,
         "async_fail_training_requests_for_model",
         _async_fail_training_requests_for_model,
     )
@@ -315,7 +315,7 @@ def test_issue_368_sync_training_session_step_bumps_when_result_has_no_step(monk
     monkeypatch.setattr(training_store_module, "bump_training_session_step_best_effort", actor._bump_step)
     monkeypatch.setattr(training_store_module, "set_training_session_step_best_effort", actor._set_step)
 
-    result = future_store_module._sync_training_session_step(
+    result = task_state_store_module._sync_training_session_step(
         {"op": "training.optim_step", "model_id": "model-a"},
         {"metrics": {"loss": 1.0}},
     )
@@ -332,7 +332,7 @@ def test_issue_368_sync_training_session_step_uses_reported_step_when_present(
     monkeypatch.setattr(training_store_module, "bump_training_session_step_best_effort", actor._bump_step)
     monkeypatch.setattr(training_store_module, "set_training_session_step_best_effort", actor._set_step)
 
-    result = future_store_module._sync_training_session_step(
+    result = task_state_store_module._sync_training_session_step(
         {"op": "training.train_step", "model_id": "model-b"},
         {"metrics": {"step": 11, "loss": 0.5}},
     )

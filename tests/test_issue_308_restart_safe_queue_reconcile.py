@@ -4,7 +4,7 @@ import importlib
 from tinker_server.backend import api_work_queue as queue_mod
 from tinker_server.backend import capacity_manager as capacity_manager_mod
 
-future_store_mod = importlib.import_module("tinker_server.backend.future_store")
+task_state_store_mod = importlib.import_module("tinker_server.backend.task_state_store")
 
 
 class _AwaitableRef:
@@ -122,7 +122,7 @@ def test_reconcile_stale_running_requests(monkeypatch):
 
     monkeypatch.setattr(client, "_get_ray_actor_async", _get_ray_actor_async)
     monkeypatch.setattr(client, "_await_ray_ref", _await_ray_ref)
-    monkeypatch.setattr(future_store_mod, "future_store", future_store)
+    monkeypatch.setattr(task_state_store_mod, "task_state_futures", future_store)
     monkeypatch.setattr(capacity_manager_mod, "capacity_manager", capacity_manager)
 
     reconciled = anyio.run(client._reconcile_stale_running_requests, "job-new")
@@ -141,7 +141,7 @@ def test_start_workers_continues_when_snapshot_hydration_baseline_missing(monkey
 
     monkeypatch.setattr(client, "_get_ray_actor", lambda: actor)
     monkeypatch.setattr(queue_mod.ApiWorkQueueClient, "_worker_loop", _noop_worker_loop, raising=False)
-    monkeypatch.setattr(future_store_mod, "future_store", future_store)
+    monkeypatch.setattr(task_state_store_mod, "task_state_futures", future_store)
     monkeypatch.setattr(capacity_manager_mod, "capacity_manager", capacity_manager)
     monkeypatch.setitem(__import__("sys").modules, "ray", _StubRay)
     monkeypatch.setenv("MINT_API_WORK_QUEUE_METRICS_HYDRATE_STARTUP_RETRIES", "3")

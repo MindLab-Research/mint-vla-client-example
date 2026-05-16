@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 from fastapi import APIRouter, HTTPException, Request, Response
 
 from ..config import config as server_config
-from ..backend.task_state_store import FutureStatus, TaskStateStoreUnavailableError as FutureStoreUnavailableError, task_state_futures as future_store
+from ..backend.task_state_store import FutureStatus, TaskStateStoreUnavailableError, task_state_futures
 from ..backend.model_work_admission import enqueue_model_work
 from ..gateway_auth import GatewayAuthContext, build_billing_auth_context
 from ..logging_context import (
@@ -578,7 +578,7 @@ async def _await_with_external_fail_abort(*, engine, request_id: str, awaitable)
                 logger.info(f"[sample await done] request_id={request_id} elapsed_s={elapsed:.1f}")
                 return await task
             try:
-                status = await future_store.async_get_status(request_id)
+                status = await task_state_futures.async_get_status(request_id)
             except KeyError:
                 status = FutureStatus.PENDING
             now = time.monotonic()
@@ -1105,15 +1105,15 @@ async def asample(
     if request.seq_id is not None:
         for attempt in range(2):
             try:
-                ensure = await future_store.async_ensure_pending(
+                ensure = await task_state_futures.async_ensure_pending(
                     request_id=request_id,
                     meta={
                         "payload_hash": payload_hash,
                         "model_work_attempt_id": model_work_attempt_id,
                     },
                 )
-            except FutureStoreUnavailableError:
-                raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
+            except TaskStateStoreUnavailableError:
+                raise HTTPException(status_code=503, detail="Ray unavailable: TaskStateStore requires Ray")
             if bool(ensure.get("created")):
                 created_pending = True
                 break
@@ -1130,9 +1130,9 @@ async def asample(
                     detail="Duplicate seq_id with different request payload",
                 )
             try:
-                await future_store.async_get_status(request_id)
-            except FutureStoreUnavailableError:
-                raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
+                await task_state_futures.async_get_status(request_id)
+            except TaskStateStoreUnavailableError:
+                raise HTTPException(status_code=503, detail="Ray unavailable: TaskStateStore requires Ray")
             except KeyError:
                 if attempt == 0:
                     continue
@@ -1188,7 +1188,7 @@ async def asample(
             queued_meta=queued_meta,
             create_future=not created_pending,
             payload_hash=payload_hash,
-            future_store_client=future_store,
+            future_store_client=task_state_futures,
             trace_enqueue=_enqueue_sampling_request_with_trace,
             trace_kwargs={
                 "route_start_s": route_start_s,
@@ -1200,7 +1200,7 @@ async def asample(
         scheduler_append_confirmed = bool(scheduler_result.get("ok"))
         created_by_admission = not created_pending
         if scheduler_result.get("scheduler_instance_id"):
-            await future_store.async_update_meta(
+            await task_state_futures.async_update_meta(
                 request_id,
                 {
                     "model_work_scheduler_instance_id": str(
@@ -1222,11 +1222,11 @@ async def asample(
                 pass
         if created_pending:
             try:
-                await future_store.async_forget(request_id)
-            except FutureStoreUnavailableError:
-                raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
+                await task_state_futures.async_forget(request_id)
+            except TaskStateStoreUnavailableError:
+                raise HTTPException(status_code=503, detail="Ray unavailable: TaskStateStore requires Ray")
         elif created_by_admission:
-            await future_store.async_cleanup(request_id)
+            await task_state_futures.async_cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue sampling request: {e}")
 
     record_sampling_admission_metric(
@@ -1921,7 +1921,7 @@ async def _do_sample(
                     ]
                 )
             # Compatibility: older tinker clients don't accept a top-level `type` field on SampleResponse.
-            await future_store.async_resolve(request_id, response.model_dump(exclude={"type"}))
+            await task_state_futures.async_resolve(request_id, response.model_dump(exclude={"type"}))
             if usage_events:
                 await _persist_usage_events(auth_ctx=auth_ctx, events=usage_events)
             workload_status = "ok"
@@ -1932,7 +1932,7 @@ async def _do_sample(
         except asyncio.CancelledError:
             workload_status = "canceled"
             await _abort_engine_request(engine, request_id)
-            await future_store.async_fail(request_id, "sampling task cancelled")
+            await task_state_futures.async_fail(request_id, "sampling task cancelled")
             logger.warning(
                 "[sampling.asample] canceled request_id=%s session_id=%s next_action=%s",
                 str(request_id),
@@ -1951,7 +1951,7 @@ async def _do_sample(
                 type(e).__name__,
                 "check_sampling_session_and_vllm_actor",
             )
-            await future_store.async_fail(request_id, str(e))
+            await task_state_futures.async_fail(request_id, str(e))
     finally:
         if workload_started:
             _record_vllm_workload_finish(
@@ -2106,7 +2106,7 @@ async def compute_logprobs(
                 "domain_key": domain_key,
                 "affinity_group": affinity_group,
             },
-            future_store_client=future_store,
+            future_store_client=task_state_futures,
             scheduler_client=model_work_scheduler,
             trace_enqueue=_enqueue_sampling_request_with_trace,
             trace_kwargs={
@@ -2253,7 +2253,7 @@ async def _do_compute_logprobs(
         logprobs = normalize_prompt_logprobs_for_tinker(logprobs, prompt_len=len(token_ids))
         response = ComputeLogprobsResponse(logprobs=logprobs)
         # Compatibility: older tinker clients don't accept a top-level `type` field on ComputeLogprobsResponse.
-        await future_store.async_resolve(request_id, response.model_dump(exclude={"type"}))
+        await task_state_futures.async_resolve(request_id, response.model_dump(exclude={"type"}))
         if gateway_auth:
             auth_ctx = GatewayAuthContext(**gateway_auth)
             await _persist_usage_events(
@@ -2278,7 +2278,7 @@ async def _do_compute_logprobs(
 
     except asyncio.CancelledError:
         workload_status = "canceled"
-        await future_store.async_fail(request_id, "compute_logprobs task cancelled")
+        await task_state_futures.async_fail(request_id, "compute_logprobs task cancelled")
         logger.warning(
             "[sampling.compute_logprobs] canceled request_id=%s session_id=%s next_action=%s",
             str(request_id),
@@ -2296,7 +2296,7 @@ async def _do_compute_logprobs(
             type(e).__name__,
             "check_sampling_session_and_token_length",
         )
-        await future_store.async_fail(request_id, str(e))
+        await task_state_futures.async_fail(request_id, str(e))
     finally:
         if workload_started:
             _record_vllm_workload_finish(

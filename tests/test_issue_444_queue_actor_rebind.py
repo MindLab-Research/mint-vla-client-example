@@ -128,41 +128,24 @@ async def test_issue_444_api_work_queue_enqueue_reacquires_actor(monkeypatch) ->
 
 
 @pytest.mark.anyio
-async def test_issue_444_future_store_async_create_reacquires_actor(monkeypatch) -> None:
-    future_store_module = importlib.import_module("tinker_server.backend.future_store")
+async def test_issue_444_task_state_future_create_uses_task_state_client() -> None:
+    task_state_store_module = importlib.import_module("tinker_server.backend.task_state_store")
 
-    store = future_store_module.FutureStore()
-    store._ray_actor = object()
-    add_pending_calls: list[str] = []
+    class _TaskStateClient:
+        def __init__(self):
+            self.calls: list[dict] = []
 
-    class _FreshActor:
-        class _AddPendingRemote:
-            def remote(self, request_id: str):
-                add_pending_calls.append(request_id)
-                return None
+        async def async_ensure_task(self, **kwargs):
+            self.calls.append(dict(kwargs))
+            return {"created": True, "record": {"request_id": kwargs["request_id"]}}
 
-        @property
-        def add_pending(self):
-            return self._AddPendingRemote()
-
-    fresh_actor = _FreshActor()
-    reacquire_calls: list[str] = []
-
-    async def _get_ray_actor_async():
-        reacquire_calls.append("reacquired")
-        return fresh_actor
-
-    async def _await_ref(ref):
-        return ref
-
-    monkeypatch.setattr(store, "_get_ray_actor_async", _get_ray_actor_async)
-    monkeypatch.setattr(future_store_module, "_await_ray_ref", _await_ref)
+    task_state = _TaskStateClient()
+    store = task_state_store_module.TaskStateFutureStore(task_state_client=task_state)
 
     request_id = await store.async_create_with_id("rid-fs-1")
 
     assert request_id == "rid-fs-1"
-    assert reacquire_calls == ["reacquired"]
-    assert add_pending_calls == ["rid-fs-1"]
+    assert task_state.calls == [{"request_id": "rid-fs-1", "status": "pending"}]
 
 
 def test_issue_444_queue_actor_name_prefers_env_overrides(monkeypatch) -> None:

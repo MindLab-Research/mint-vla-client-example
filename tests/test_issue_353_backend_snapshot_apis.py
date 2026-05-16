@@ -6,7 +6,7 @@ import time
 
 import tinker_server.backend.resource_pool as resource_pool_mod
 from tinker_server.backend.api_work_queue import ApiWorkQueueClient
-from tinker_server.backend.future_store import FutureStatus, FutureStore, FutureStoreUnavailableError
+from tinker_server.backend.task_state_store import FutureStatus, TaskStateFutureStore
 from tinker_server.backend.resource_pool import ActorType, get_resource_pool
 
 
@@ -145,130 +145,114 @@ def test_api_work_queue_metrics_snapshot_tracks_local_state() -> None:
     assert snap2["by_apikey_id"] == {}
 
 
-def test_future_store_metrics_snapshot_tracks_local_state() -> None:
-    fs = FutureStore()
+class _InlineTaskStateClient:
+    def __init__(self, *, stats: dict | None = None) -> None:
+        self.records: dict[str, dict] = {}
+        self.stats_payload = stats or {"backend": "task_state_store", "records": 0}
+        self.started = 0
 
-    fs._snapshot_ensure_pending("req-pending", meta={"op": "sampling.asample"}, has_ref=True)
-    fs._snapshot_ensure_pending("req-done", meta={"op": "sampling.asample"}, has_ref=True)
-    fs._snapshot_ensure_pending("req-failed", meta={"op": "weights.save_weights"}, has_ref=False)
-    fs._snapshot_mark_terminal("req-done", status=FutureStatus.DONE.value)
-    fs._snapshot_mark_terminal("req-failed", status=FutureStatus.FAILED.value)
-    fs._snapshot_mark_terminal("req-expired", status=FutureStatus.EXPIRED.value)
-    fs._snapshot_mark_terminal("req-retrieved", status=FutureStatus.RETRIEVED.value)
-
-    snap = fs.metrics_snapshot()
-
-    assert snap["pending"] == 1
-    assert snap["results"] == 1
-    assert snap["errors"] == 1
-    assert snap["expired"] == 1
-    assert snap["retrieved"] == 1
-    assert snap["refs"] == 1
-    assert snap["meta"] == 3
-
-    assert snap["by_op"]["sampling.asample"]["pending"] == 1
-    assert snap["by_op"]["sampling.asample"]["results"] == 1
-    assert snap["by_op"]["weights.save_weights"]["errors"] == 1
-
-    assert snap["age_stats"]["oldest_pending_s"] >= 0.0
-    assert snap["age_stats"]["oldest_done_s"] >= 0.0
-    assert snap["payload_stats"]["result_refs_count"] == 1
-    assert snap["payload_stats"]["errors_count"] == 1
-    assert snap["payload_stats"]["refs_count"] == 1
-
-
-def test_future_store_payload_stats_use_backing_store_semantics() -> None:
-    fs = FutureStore()
-    now = time.time()
-    with fs._snapshot_lock:
-        fs._snapshot_requests = {
-            "req-done-with-payload": {
-                "status": FutureStatus.DONE.value,
-                "created_at": now,
-                "done_at": now,
-                "op": "op.a",
-                "has_meta": False,
-                "has_ref": False,
-                "has_result_ref": True,
-                "has_error": False,
+    async def async_ensure_task(self, **kwargs):
+        request_id = str(kwargs["request_id"])
+        created = request_id not in self.records
+        record = self.records.setdefault(
+            request_id,
+            {
+                "request_id": request_id,
+                "status": kwargs.get("status") or "pending",
+                "op": kwargs.get("op") or "unknown",
+                "domain_key": kwargs.get("domain_key") or "future:default",
+                "metadata": dict(kwargs.get("metadata") or {}),
             },
-            "req-done-no-payload": {
-                "status": FutureStatus.DONE.value,
-                "created_at": now,
-                "done_at": now,
-                "op": "op.a",
-                "has_meta": False,
-                "has_ref": False,
-                "has_result_ref": False,
-                "has_error": False,
-            },
-            "req-failed-with-error": {
-                "status": FutureStatus.FAILED.value,
-                "created_at": now,
-                "done_at": now,
-                "op": "op.b",
-                "has_meta": False,
-                "has_ref": False,
-                "has_result_ref": False,
-                "has_error": True,
-            },
-            "req-failed-no-error": {
-                "status": FutureStatus.FAILED.value,
-                "created_at": now,
-                "done_at": now,
-                "op": "op.b",
-                "has_meta": False,
-                "has_ref": True,
-                "has_result_ref": False,
-                "has_error": False,
-            },
+        )
+        if kwargs.get("metadata") is not None:
+            record["metadata"] = dict(kwargs["metadata"])
+        if kwargs.get("op") is not None:
+            record["op"] = kwargs["op"]
+        if kwargs.get("domain_key") is not None:
+            record["domain_key"] = kwargs["domain_key"]
+        if kwargs.get("status") is not None:
+            record["status"] = kwargs["status"]
+        return {"created": created, "record": dict(record)}
+
+    async def async_get_task(self, request_id: str):
+        return dict(self.records[str(request_id)])
+
+    async def async_complete_task_success(self, **kwargs):
+        record = self.records[str(kwargs["request_id"])]
+        record.update(
+            {
+                "status": "done",
+                "result_path": kwargs["result_path"],
+                "result_checksum": kwargs["result_checksum"],
+                "result_size_bytes": kwargs["result_size_bytes"],
+                "metadata": {**record.get("metadata", {}), **dict(kwargs.get("metadata") or {})},
+            }
+        )
+        return dict(record)
+
+    async def async_mark_task_retrieved(self, **kwargs):
+        record = self.records[str(kwargs["request_id"])]
+        record["status"] = "retrieved"
+        return dict(record)
+
+    async def async_stats(self):
+        return dict(self.stats_payload)
+
+    async def async_ensure_started(self):
+        self.started += 1
+
+
+class _InlinePayloadStore:
+    def __init__(self) -> None:
+        self.payloads: dict[str, object] = {}
+
+    def write_json_payload(self, *, request_id: str, attempt_id: str, payload):
+        _ = attempt_id
+        path = f"inline://{request_id}"
+        self.payloads[path] = payload
+        return {"path": path, "checksum": f"sha256:{request_id}", "size_bytes": 1}
+
+    def read_json_payload(self, *, path: str, expected_checksum: str | None = None):
+        _ = expected_checksum
+        return self.payloads[path]
+
+
+def test_task_state_future_store_metrics_snapshot_identifies_backend() -> None:
+    assert TaskStateFutureStore().metrics_snapshot() == {"backend": "task_state_store"}
+
+
+def test_task_state_future_store_round_trips_result_payload() -> None:
+    task_state = _InlineTaskStateClient()
+    payload_store = _InlinePayloadStore()
+    fs = TaskStateFutureStore(task_state_client=task_state, payload_store=payload_store)
+
+    async def _run():
+        assert await fs.async_ensure_pending("req-done", meta={"op": "sampling.asample"}) == {
+            "created": True,
+            "meta": {"op": "sampling.asample"},
         }
+        await fs.async_resolve("req-done", {"ok": True})
+        assert await fs.async_get_status("req-done") is FutureStatus.DONE
+        assert await fs.async_get_result("req-done") == {"ok": True}
 
-    snap = fs.metrics_snapshot()
-
-    assert snap["results"] == 2
-    assert snap["errors"] == 2
-    assert snap["refs"] == 1
-    assert snap["payload_stats"]["result_refs_count"] == 1
-    assert snap["payload_stats"]["errors_count"] == 1
-    assert snap["payload_stats"]["refs_count"] == 1
+    asyncio.run(_run())
+    assert task_state.records["req-done"]["status"] == "retrieved"
 
 
-def test_future_store_ensure_pending_syncs_existing_pending_without_meta(monkeypatch) -> None:
-    class _StubRayExceptions:
-        class ActorDiedError(Exception):
-            pass
+def test_task_state_future_store_ensure_pending_syncs_existing_pending_without_meta() -> None:
+    task_state = _InlineTaskStateClient()
+    task_state.records["req-existing"] = {
+        "request_id": "req-existing",
+        "status": "pending",
+        "op": "unknown",
+        "domain_key": "future:default",
+        "metadata": {},
+    }
+    fs = TaskStateFutureStore(task_state_client=task_state, payload_store=_InlinePayloadStore())
 
-    class _StubRay:
-        exceptions = _StubRayExceptions
+    out = asyncio.run(fs.async_ensure_pending("req-existing", meta=None))
 
-        @staticmethod
-        def get(ref):
-            return ref() if callable(ref) else ref
-
-    class _StubMethod:
-        def __init__(self, fn):
-            self._fn = fn
-
-        def remote(self, **kwargs):
-            return lambda: self._fn(**kwargs)
-
-    class _StubActor:
-        def __init__(self):
-            self.ensure_pending = _StubMethod(lambda request_id, meta: {"created": False, "meta": None})
-            self.get_status = _StubMethod(lambda request_id: FutureStatus.PENDING.value)
-
-    monkeypatch.setitem(sys.modules, "ray", _StubRay)
-
-    fs = FutureStore()
-    monkeypatch.setattr(fs, "_get_ray_actor", lambda: _StubActor())
-
-    out = fs.ensure_pending("req-existing", meta=None)
-
-    assert out == {"created": False, "meta": None}
-    snap = fs.metrics_snapshot()
-    assert snap["pending"] == 1
-    assert snap["by_op"]["unknown"]["pending"] == 1
+    assert out == {"created": False, "meta": {}}
 
 
 def test_api_work_queue_hydrate_metrics_snapshot_restores_restart_baseline(monkeypatch) -> None:
@@ -376,134 +360,20 @@ def test_api_work_queue_scheduler_decisions_client_proxies_filters() -> None:
     assert payload["last_seq"] == 9
 
 
-def test_future_store_hydrate_metrics_snapshot_restores_restart_baseline(monkeypatch) -> None:
-    class _StubRay:
-        @staticmethod
-        def get(ref, timeout=None):
-            return ref() if callable(ref) else ref
+def test_task_state_future_store_ensure_ready_returns_task_state_stats() -> None:
+    task_state = _InlineTaskStateClient(stats={"backend": "task_state_store", "active": 3})
+    fs = TaskStateFutureStore(task_state_client=task_state, payload_store=_InlinePayloadStore())
 
-    class _StubMethod:
-        def __init__(self, fn):
-            self._fn = fn
-
-        def remote(self):
-            return lambda: self._fn()
-
-    class _StubActor:
-        def __init__(self):
-            self.metrics_seed_snapshot = _StubMethod(
-                lambda: {
-                    "requests": [
-                        {
-                            "request_id": "rid-fs-1",
-                            "status": FutureStatus.PENDING.value,
-                            "created_at": time.time() - 5.0,
-                            "done_at": None,
-                            "op": "sampling.asample",
-                            "has_meta": True,
-                            "has_ref": True,
-                            "has_result_ref": False,
-                            "has_error": False,
-                        },
-                        {
-                            "request_id": "rid-fs-2",
-                            "status": FutureStatus.DONE.value,
-                            "created_at": time.time() - 12.0,
-                            "done_at": time.time() - 2.0,
-                            "op": "sampling.asample",
-                            "has_meta": True,
-                            "has_ref": False,
-                            "has_result_ref": True,
-                            "has_error": False,
-                        },
-                        {
-                            "request_id": "rid-fs-3",
-                            "status": FutureStatus.FAILED.value,
-                            "created_at": time.time() - 10.0,
-                            "done_at": time.time() - 1.0,
-                            "op": "weights.save_weights",
-                            "has_meta": False,
-                            "has_ref": False,
-                            "has_result_ref": False,
-                            "has_error": True,
-                        },
-                    ]
-                }
-            )
-
-    monkeypatch.setitem(sys.modules, "ray", _StubRay)
-
-    fs = FutureStore()
-    monkeypatch.setattr(fs, "_get_ray_actor", lambda: _StubActor())
-
-    assert fs.hydrate_metrics_snapshot(force=True)
-    snap = fs.metrics_snapshot()
-    assert snap["pending"] == 1
-    assert snap["results"] == 1
-    assert snap["errors"] == 1
-    assert snap["refs"] == 1
-    assert snap["meta"] == 2
-    assert snap["payload_stats"]["result_refs_count"] == 1
-    assert snap["payload_stats"]["errors_count"] == 1
-    assert snap["by_op"]["sampling.asample"]["pending"] == 1
-    assert snap["by_op"]["sampling.asample"]["results"] == 1
-    assert snap["by_op"]["weights.save_weights"]["errors"] == 1
+    assert asyncio.run(fs.async_ensure_ready()) == {"backend": "task_state_store", "active": 3}
 
 
-def test_future_store_ensure_ready_fails_when_hydration_baseline_required(monkeypatch) -> None:
-    class _StubRay:
-        @staticmethod
-        def get(ref, timeout=None):
-            return ref() if callable(ref) else ref
+def test_task_state_future_store_ensure_started_delegates_to_task_state_client() -> None:
+    task_state = _InlineTaskStateClient()
+    fs = TaskStateFutureStore(task_state_client=task_state, payload_store=_InlinePayloadStore())
 
-    class _StubMethod:
-        def __init__(self, fn):
-            self._fn = fn
+    asyncio.run(fs.async_ensure_started())
 
-        def remote(self):
-            return lambda: self._fn()
-
-    class _StubActor:
-        def __init__(self):
-            self.stats = _StubMethod(lambda: {"pending": 3})
-
-    monkeypatch.setitem(sys.modules, "ray", _StubRay)
-
-    fs = FutureStore()
-    monkeypatch.setattr(fs, "_get_ray_actor", lambda: _StubActor())
-    monkeypatch.setenv("MINT_FUTURE_STORE_METRICS_HYDRATE_STARTUP_RETRIES", "3")
-    monkeypatch.setenv("MINT_FUTURE_STORE_METRICS_HYDRATE_RETRY_DELAY_S", "0")
-
-    attempts = {"count": 0}
-
-    def _always_fail_hydrate(**kwargs) -> bool:
-        attempts["count"] += 1
-        return False
-
-    monkeypatch.setattr(fs, "hydrate_metrics_snapshot", _always_fail_hydrate)
-
-    try:
-        fs.ensure_ready(require_hydrated_baseline=True)
-        assert False, "expected ensure_ready to fail when hydration baseline is required"
-    except FutureStoreUnavailableError as e:
-        assert "metrics baseline hydration failed" in str(e)
-
-    assert attempts["count"] == 3
-
-
-def test_future_store_ensure_started_skips_ready_probe(monkeypatch) -> None:
-    fs = FutureStore()
-    calls: list[bool] = []
-
-    def _fake_get_ray_actor(*, require_ready: bool = True):
-        calls.append(bool(require_ready))
-        return object()
-
-    monkeypatch.setattr(fs, "_get_ray_actor", _fake_get_ray_actor)
-
-    fs.ensure_started()
-
-    assert calls == [False]
+    assert task_state.started == 1
 
 
 def test_api_work_queue_start_workers_continues_when_hydration_baseline_missing(monkeypatch) -> None:
