@@ -465,11 +465,159 @@ class ModelActorSupervisor:
         for spec in specs or []:
             self.set_desired(spec)
 
-    def __getattr__(self, name: str) -> Any:
-        inventory = self.__dict__.get("_inventory")
-        if inventory is not None and hasattr(inventory, name):
-            return getattr(inventory, name)
-        raise AttributeError(f"{type(self).__name__!s} object has no attribute {name!r}")
+    # Explicit inventory/launcher contract for legacy GPU actor launch paths.
+    # Direct vLLM/Megatron/dense launchers still create backend-specific Ray
+    # actors themselves, but lifecycle publication now goes through
+    # ModelActorSupervisor instead of relying on implicit inventory forwarding.
+    def register(
+        self,
+        *,
+        actor_name: str,
+        actor_type: ActorType,
+        num_gpus: int,
+        actor_handle: Any | None = None,
+        namespace: str = "tinker",
+        base_model: str = "",
+        session_id: str | None = None,
+        node_id: str | None = None,
+        protected: bool = False,
+        metadata: dict[str, Any] | None = None,
+    ) -> ActorEntry:
+        metadata = {
+            "launcher_contract": "model_actor_supervisor",
+            **dict(metadata or {}),
+        }
+        return self._inventory.register(
+            actor_name=actor_name,
+            actor_type=actor_type,
+            num_gpus=num_gpus,
+            actor_handle=actor_handle,
+            namespace=namespace,
+            base_model=base_model,
+            session_id=session_id,
+            node_id=node_id,
+            protected=protected,
+            metadata=metadata,
+        )
+
+    def unregister(self, actor_name: str) -> bool:
+        return self._inventory.unregister(actor_name)
+
+    def get(self, actor_name: str) -> ActorEntry | None:
+        return self._inventory.get(actor_name)
+
+    def set_session(self, actor_name: str, session_id: str | None) -> None:
+        self._inventory.set_session(actor_name, session_id)
+
+    async def async_set_session(self, actor_name: str, session_id: str | None) -> None:
+        await self._inventory.async_set_session(actor_name, session_id)
+
+    def set_protected(self, actor_name: str, protected: bool = True) -> bool:
+        return self._inventory.set_protected(actor_name, protected)
+
+    def is_protected(self, actor_name: str) -> bool:
+        return self._inventory.is_protected(actor_name)
+
+    def touch(self, actor_name: str) -> bool:
+        return self._inventory.touch(actor_name)
+
+    async def async_touch(self, actor_name: str) -> bool:
+        return await self._inventory.async_touch(actor_name)
+
+    def mark_inflight(self, actor_name: str, delta: int) -> None:
+        self._inventory.mark_inflight(actor_name, delta)
+
+    def mark_ready(self, actor_name: str) -> None:
+        self._inventory.mark_ready(actor_name)
+
+    def update_metadata(
+        self,
+        actor_name: str,
+        metadata: dict[str, Any],
+        *,
+        sample_time: float | None = None,
+        source: str | None = None,
+    ) -> bool:
+        return self._inventory.update_metadata(
+            actor_name,
+            metadata,
+            sample_time=sample_time,
+            source=source,
+        )
+
+    async def async_update_metadata(
+        self,
+        actor_name: str,
+        metadata: dict[str, Any],
+        *,
+        sample_time: float | None = None,
+        source: str | None = None,
+    ) -> bool:
+        return await self._inventory.async_update_metadata(
+            actor_name,
+            metadata,
+            sample_time=sample_time,
+            source=source,
+        )
+
+    def list_actors(
+        self,
+        *,
+        refresh_metadata: bool = False,
+        actor_type: ActorType | None = None,
+        model_name: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return self._inventory.list_actors(
+            refresh_metadata=refresh_metadata,
+            actor_type=actor_type,
+            model_name=model_name,
+        )
+
+    async def async_list_actors(
+        self,
+        *,
+        refresh_metadata: bool = False,
+        actor_type: ActorType | None = None,
+        model_name: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return await self._inventory.async_list_actors(
+            refresh_metadata=refresh_metadata,
+            actor_type=actor_type,
+            model_name=model_name,
+        )
+
+    def metadata_cache_metrics_snapshot(self) -> list[dict[str, int | str]]:
+        return self._inventory.metadata_cache_metrics_snapshot()
+
+    def lifecycle_metrics_snapshot(self) -> list[dict[str, int | str]]:
+        return self._inventory.lifecycle_metrics_snapshot()
+
+    def cached_snapshot(self) -> list[dict[str, Any]]:
+        return self._inventory.cached_snapshot()
+
+    def rss_snapshot(self, *, timeout_s: float = 10.0) -> list[dict]:
+        return self._inventory.rss_snapshot(timeout_s=timeout_s)
+
+    def iter_entries(self, *, prune_stale: bool = False) -> list[ActorEntry]:
+        return self._inventory.iter_entries(prune_stale=prune_stale)
+
+    async def async_iter_entries(self, *, prune_stale: bool = False) -> list[ActorEntry]:
+        return await self._inventory.async_iter_entries(prune_stale=prune_stale)
+
+    def clear_session(self, session_id: str, *, actor_type: ActorType | None = None) -> int:
+        return self._inventory.clear_session(session_id, actor_type=actor_type)
+
+    def total_gpus_used(self) -> int:
+        return self._inventory.total_gpus_used()
+
+    async def async_total_gpus_used(self) -> int:
+        return await self._inventory.async_total_gpus_used()
+
+    def gpus_used_by_node(self) -> dict[str, int]:
+        return self._inventory.gpus_used_by_node()
+
+    def clear(self, kill_actors: bool = True) -> int:
+        return self._inventory.clear(kill_actors=kill_actors)
 
     def set_desired(self, spec: ModelActorSpec) -> None:
         if not spec.domain_key:

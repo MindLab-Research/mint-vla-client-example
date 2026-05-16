@@ -10160,7 +10160,7 @@ def get_or_create_megatron_worker_group(
             ignore_reinit_error=True,
         )
 
-    model_actor_inventory = get_model_actor_supervisor()
+    model_actor_supervisor = get_model_actor_supervisor()
     actor_name = _make_megatron_actor_name(base_model)
 
     create_lock = _get_megatron_create_lock(actor_name)
@@ -10212,7 +10212,7 @@ def get_or_create_megatron_worker_group(
                 },
             ):
                 # Register with model actor registry (reconnection case)
-                model_actor_inventory.register(
+                model_actor_supervisor.register(
                     actor_name=actor_name,
                     actor_type=ActorType.MEGATRON,
                     num_gpus=num_gpus,
@@ -10223,7 +10223,7 @@ def get_or_create_megatron_worker_group(
                     metadata={**dict(actor_observability_metadata(actor) or {}), **rank_metadata},
                 )
                 # Existing actor is already ready
-                model_actor_inventory.mark_ready(actor_name)
+                model_actor_supervisor.mark_ready(actor_name)
             # NOTE: Do NOT reinit weights here for existing actors.
             # Session swapping + reinit happens inside MegatronWorkerGroup._ensure_session_loaded()
             # to avoid clobbering active sessions during create_model.
@@ -10480,7 +10480,7 @@ def get_or_create_megatron_worker_group(
             # Register immediately (creating=True) to account for GPU usage and prevent eviction.
             # Actor readiness is awaited in VerlTrainingEngine.create_training_session, which also
             # marks the entry ready (creating=False) after __ray_ready__ completes.
-            model_actor_inventory.register(
+            model_actor_supervisor.register(
                 actor_name=actor_name,
                 actor_type=ActorType.MEGATRON,
                 num_gpus=num_gpus,
@@ -10557,7 +10557,7 @@ def kill_megatron_actor(base_model: str | None = None) -> bool:
             ignore_reinit_error=True,
         )
 
-    model_actor_inventory = get_model_actor_supervisor()
+    model_actor_supervisor = get_model_actor_supervisor()
     killed_any = False
 
     def _remove_detached_pg(actor_name: str) -> None:
@@ -10594,21 +10594,21 @@ def kill_megatron_actor(base_model: str | None = None) -> bool:
                 base_model=base_model,
             )
             logger.info(f"Killed Megatron actor: {actor_name}")
-            model_actor_inventory.unregister(actor_name)
+            model_actor_supervisor.unregister(actor_name)
             _remove_detached_pg(actor_name)
             killed_any = True
         except ValueError:
             logger.info(f"No Megatron actor to kill for {base_model}")
-            model_actor_inventory.unregister(actor_name)
+            model_actor_supervisor.unregister(actor_name)
             _remove_detached_pg(actor_name)
     else:
         # Kill ALL Megatron actors from model actor registry
-        for entry in model_actor_inventory.iter_entries():
+        for entry in model_actor_supervisor.iter_entries():
             if entry.actor_type == ActorType.MEGATRON:
                 try:
                     actor = ray.get_actor(entry.actor_name, namespace=PERSISTENT_NAMESPACE)
                 except ValueError:
-                    model_actor_inventory.unregister(entry.actor_name)
+                    model_actor_supervisor.unregister(entry.actor_name)
                     _remove_detached_pg(entry.actor_name)
                     continue
 
@@ -10627,7 +10627,7 @@ def kill_megatron_actor(base_model: str | None = None) -> bool:
                     base_model=entry.base_model,
                 )
                 logger.info(f"Killed Megatron actor: {entry.actor_name}")
-                model_actor_inventory.unregister(entry.actor_name)
+                model_actor_supervisor.unregister(entry.actor_name)
                 _remove_detached_pg(entry.actor_name)
                 killed_any = True
 
@@ -10663,8 +10663,8 @@ def is_megatron_actor_running(base_model: str | None = None) -> bool:
     else:
         # Check for any Megatron actor from model actor registry
         from tinker_server.backend.model_actor_supervisor import get_model_actor_supervisor, ActorType
-        model_actor_inventory = get_model_actor_supervisor()
-        for entry in model_actor_inventory.iter_entries():
+        model_actor_supervisor = get_model_actor_supervisor()
+        for entry in model_actor_supervisor.iter_entries():
             if entry.actor_type == ActorType.MEGATRON:
                 try:
                     ray.get(entry.actor_handle.get_diagnostics.remote(), timeout=5)

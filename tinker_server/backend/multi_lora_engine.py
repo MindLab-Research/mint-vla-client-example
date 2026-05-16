@@ -265,10 +265,10 @@ class MultiLoRAInferenceEngine:
                             get_model_actor_supervisor,
                         )
                         total_gpus = self.tensor_parallel_size * self.data_parallel_size
-                        model_actor_inventory = get_model_actor_supervisor()
+                        model_actor_supervisor = get_model_actor_supervisor()
                         actor_node_id = _get_actor_node_id(self.server)
                         logger.info(f"Registering existing actor {self.actor_name} with ModelActorInventory (node={actor_node_id[:8] if actor_node_id else 'unknown'})")
-                        model_actor_inventory.register(
+                        model_actor_supervisor.register(
                             actor_name=self.actor_name,
                             actor_type=ActorType.VLLM,
                             num_gpus=total_gpus,
@@ -279,7 +279,7 @@ class MultiLoRAInferenceEngine:
                             metadata=dict(actor_observability_metadata(self.server) or {}),
                         )
                         # Mark as ready since it's an existing actor that responded to health check
-                        model_actor_inventory.mark_ready(self.actor_name)
+                        model_actor_supervisor.mark_ready(self.actor_name)
                         return
                 except ray.exceptions.RayActorError:
                     # Actor is dead, need to create new one
@@ -319,12 +319,12 @@ class MultiLoRAInferenceEngine:
                         get_model_actor_supervisor,
                     )
                     total_gpus = self.tensor_parallel_size * self.data_parallel_size
-                    model_actor_inventory = get_model_actor_supervisor()
+                    model_actor_supervisor = get_model_actor_supervisor()
                     actor_node_id = _get_actor_node_id(self.server)
                     logger.info(
                         f"Registering existing actor {self.actor_name} with ModelActorInventory (node={actor_node_id[:8] if actor_node_id else 'unknown'})"
                     )
-                    model_actor_inventory.register(
+                    model_actor_supervisor.register(
                         actor_name=self.actor_name,
                         actor_type=ActorType.VLLM,
                         num_gpus=total_gpus,
@@ -334,7 +334,7 @@ class MultiLoRAInferenceEngine:
                         node_id=actor_node_id,
                         metadata=dict(actor_observability_metadata(self.server) or {}),
                     )
-                    model_actor_inventory.mark_ready(self.actor_name)
+                    model_actor_supervisor.mark_ready(self.actor_name)
                     return
             except ValueError:
                 # Actor doesn't exist, create new one
@@ -602,9 +602,9 @@ class MultiLoRAInferenceEngine:
                 actor_observability_metadata,
                 get_model_actor_supervisor,
             )
-            model_actor_inventory = get_model_actor_supervisor()
+            model_actor_supervisor = get_model_actor_supervisor()
             actor_node_id = _get_actor_node_id(self.server)
-            model_actor_inventory.register(
+            model_actor_supervisor.register(
                 actor_name=self.actor_name,
                 actor_type=ActorType.VLLM,
                 num_gpus=total_gpus,
@@ -615,7 +615,7 @@ class MultiLoRAInferenceEngine:
                 metadata=dict(actor_observability_metadata(self.server) or {}),
             )
             # Mark as ready now that launch completed successfully
-            model_actor_inventory.mark_ready(self.actor_name)
+            model_actor_supervisor.mark_ready(self.actor_name)
             if actor_node_id:
                 logger.info(f"vLLM actor {self.actor_name} running on node {actor_node_id[:8]}")
 
@@ -1814,8 +1814,8 @@ class MultiModelInferenceManager:
                 if model_name in persistent_models:
                     from tinker_server.backend.model_actor_supervisor import get_model_actor_supervisor
 
-                    model_actor_inventory = get_model_actor_supervisor()
-                    if not model_actor_inventory.set_protected(actor_name, True):
+                    model_actor_supervisor = get_model_actor_supervisor()
+                    if not model_actor_supervisor.set_protected(actor_name, True):
                         logger.warning(
                             f"Failed to protect vLLM actor for persistent model {model_name}: actor={actor_name}"
                         )
@@ -1883,7 +1883,7 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
             ignore_reinit_error=True,
         )
 
-    model_actor_inventory = get_model_actor_supervisor()
+    model_actor_supervisor = get_model_actor_supervisor()
 
     if model_name:
         # Kill specific model's actor
@@ -1897,7 +1897,7 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
                 namespace=PERSISTENT_NAMESPACE,
             )
             logger.info(f"Killed vLLM actor: {actor_name}")
-            model_actor_inventory.unregister(actor_name)
+            model_actor_supervisor.unregister(actor_name)
             try:
                 remove_named_placement_group(f"{actor_name}_pg", namespace=PERSISTENT_NAMESPACE)
             except Exception:
@@ -1913,7 +1913,7 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
     else:
         # Kill ALL vLLM actors via model actor registry
         killed_any = False
-        for entry in model_actor_inventory.iter_entries():
+        for entry in model_actor_supervisor.iter_entries():
             if entry.actor_type == ActorType.VLLM:
                 try:
                     actor = ray.get_actor(entry.actor_name, namespace=entry.namespace)
@@ -1924,7 +1924,7 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
                         namespace=entry.namespace,
                     )
                     logger.info(f"Killed vLLM actor: {entry.actor_name}")
-                    model_actor_inventory.unregister(entry.actor_name)
+                    model_actor_supervisor.unregister(entry.actor_name)
                     try:
                         remove_named_placement_group(
                             f"{entry.actor_name}_pg",
@@ -1935,7 +1935,7 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
                     killed_any = True
                 except ValueError:
                     logger.warning(f"vLLM actor not found in Ray: {entry.actor_name}")
-                    model_actor_inventory.unregister(entry.actor_name)
+                    model_actor_supervisor.unregister(entry.actor_name)
                     try:
                         remove_named_placement_group(
                             f"{entry.actor_name}_pg",
@@ -2011,8 +2011,8 @@ def check_persistent_vllm_actor(model_name: str | None = None) -> bool:
             return False
     else:
         # Check for ANY vLLM actor via model actor registry
-        model_actor_inventory = get_model_actor_supervisor()
-        for entry in model_actor_inventory.iter_entries():
+        model_actor_supervisor = get_model_actor_supervisor()
+        for entry in model_actor_supervisor.iter_entries():
             if entry.actor_type == ActorType.VLLM:
                 try:
                     actor = ray.get_actor(entry.actor_name, namespace=entry.namespace)
@@ -2031,10 +2031,10 @@ def list_vllm_actors() -> list[dict]:
     """
     from tinker_server.backend.model_actor_supervisor import ActorType, get_model_actor_supervisor
 
-    model_actor_inventory = get_model_actor_supervisor()
+    model_actor_supervisor = get_model_actor_supervisor()
     out = [
         {"name": e.actor_name, "gpus": e.num_gpus, "base_model": e.base_model}
-        for e in model_actor_inventory.iter_entries()
+        for e in model_actor_supervisor.iter_entries()
         if e.actor_type == ActorType.VLLM
     ]
     seen = {a["name"] for a in out}

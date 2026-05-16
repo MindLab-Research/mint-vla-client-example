@@ -1486,13 +1486,13 @@ async def sample_once(
 
             from ..backend.model_actor_supervisor import get_model_actor_supervisor
 
-            model_actor_inventory = get_model_actor_supervisor()
+            model_actor_supervisor = get_model_actor_supervisor()
             model_actor_inventory_actor_name = getattr(engine, "actor_name", None)
             if not isinstance(model_actor_inventory_actor_name, str) or not model_actor_inventory_actor_name:
                 raise RuntimeError(
                     f"Engine for session {session_id} missing actor_name; cannot protect from eviction"
                 )
-            model_actor_inventory.mark_inflight(model_actor_inventory_actor_name, +1)
+            model_actor_supervisor.mark_inflight(model_actor_inventory_actor_name, +1)
             await run_async_with_otel_span(
                 "sampling.ensure_lora_loaded",
                 lambda: _ensure_session_lora_loaded(engine, session_id, snapshot=snapshot),
@@ -1561,7 +1561,7 @@ async def sample_once(
         raise
     finally:
         if model_actor_inventory is not None and model_actor_inventory_actor_name is not None:
-            model_actor_inventory.mark_inflight(model_actor_inventory_actor_name, -1)
+            model_actor_supervisor.mark_inflight(model_actor_inventory_actor_name, -1)
         manager.mark_session_inflight(session_id, -1)
 
 
@@ -1651,13 +1651,13 @@ async def _do_sample(
                     raise RuntimeError(f"No engine found for session {session_id}")
                 from ..backend.model_actor_supervisor import get_model_actor_supervisor
 
-                model_actor_inventory = get_model_actor_supervisor()
+                model_actor_supervisor = get_model_actor_supervisor()
                 model_actor_inventory_actor_name = getattr(engine, "actor_name", None)
                 if not isinstance(model_actor_inventory_actor_name, str) or not model_actor_inventory_actor_name:
                     raise RuntimeError(
                         f"Engine for session {session_id} missing actor_name; cannot protect from eviction"
                     )
-                model_actor_inventory.mark_inflight(model_actor_inventory_actor_name, +1)
+                model_actor_supervisor.mark_inflight(model_actor_inventory_actor_name, +1)
                 _record_vllm_workload_start(
                     actor_name=model_actor_inventory_actor_name,
                     base_model=workload_base_model,
@@ -1966,7 +1966,7 @@ async def _do_sample(
                 tpot_s=workload_obs["tpot_s"],
             )
         if model_actor_inventory is not None and model_actor_inventory_actor_name is not None:
-            model_actor_inventory.mark_inflight(model_actor_inventory_actor_name, -1)
+            model_actor_supervisor.mark_inflight(model_actor_inventory_actor_name, -1)
         if session_manager is not None and session_id is not None:
             session_manager.mark_session_inflight(session_id, -1)
         _inflight_sample_tasks -= 1
@@ -2189,13 +2189,13 @@ async def _do_compute_logprobs(
                     raise RuntimeError(f"No engine found for session {session_id}")
                 from ..backend.model_actor_supervisor import get_model_actor_supervisor
 
-                model_actor_inventory = get_model_actor_supervisor()
+                model_actor_supervisor = get_model_actor_supervisor()
                 model_actor_inventory_actor_name = getattr(multi_lora_engine, "actor_name", None)
                 if not isinstance(model_actor_inventory_actor_name, str) or not model_actor_inventory_actor_name:
                     raise RuntimeError(
                         f"Engine for session {session_id} missing actor_name; cannot protect from eviction"
                     )
-                model_actor_inventory.mark_inflight(model_actor_inventory_actor_name, +1)
+                model_actor_supervisor.mark_inflight(model_actor_inventory_actor_name, +1)
                 _record_vllm_workload_start(
                     actor_name=model_actor_inventory_actor_name,
                     base_model=workload_base_model,
@@ -2309,6 +2309,6 @@ async def _do_compute_logprobs(
                 started_at=workload_started_at,
             )
         if model_actor_inventory is not None and model_actor_inventory_actor_name is not None:
-            model_actor_inventory.mark_inflight(model_actor_inventory_actor_name, -1)
+            model_actor_supervisor.mark_inflight(model_actor_inventory_actor_name, -1)
         if session_manager is not None and session_id is not None:
             session_manager.mark_session_inflight(session_id, -1)

@@ -70,7 +70,7 @@ async def prewarm_persistent_models(
     )
     from tinker_server.backend.model_actor_supervisor import get_model_actor_supervisor
 
-    model_actor_inventory = get_model_actor_supervisor()
+    model_actor_supervisor = get_model_actor_supervisor()
 
     logger.info(
         f"[prewarm] persistent models={models} train_lora_rank={lora_rank} train_lr={learning_rate} "
@@ -146,12 +146,12 @@ async def prewarm_persistent_models(
                     )
                     actor_name = _make_megatron_actor_name(base_model or model_name)
                     # Protect as soon as the actor is registered, so readiness timeouts don't leave it evictable.
-                    model_actor_inventory.set_protected(actor_name, True)
+                    model_actor_supervisor.set_protected(actor_name, True)
                     logger.info(f"[prewarm] training __ray_ready__ scheduled model={model_name} actor={actor_name}")
 
                     try:
                         await async_get_ray_ref(actor.__ray_ready__.remote(), timeout_s=megatron_ready_timeout_s)
-                        model_actor_inventory.mark_ready(actor_name)
+                        model_actor_supervisor.mark_ready(actor_name)
                         logger.info(f"[prewarm] training ready+protected model={model_name} actor={actor_name}")
                     except SystemExit as ready_err:
                         if getattr(ready_err, "code", None) == 15:
@@ -228,11 +228,11 @@ async def prewarm_persistent_models(
             actor_name = getattr(engine, "actor_name", None)
             if not actor_name:
                 raise RuntimeError("engine has no actor_name")
-            ok = model_actor_inventory.set_protected(actor_name, True)
+            ok = model_actor_supervisor.set_protected(actor_name, True)
             if not ok:
                 for _ in range(50):
                     await asyncio.sleep(0.1)
-                    ok = model_actor_inventory.set_protected(actor_name, True)
+                    ok = model_actor_supervisor.set_protected(actor_name, True)
                     if ok:
                         break
             if ok:
@@ -268,7 +268,7 @@ async def prewarm_persistent_models(
                     session_id=None,
                 )
                 actor_name = dense.actor_name
-                model_actor_inventory.set_protected(actor_name, True)
+                model_actor_supervisor.set_protected(actor_name, True)
                 logger.info(f"[prewarm] training ready+protected model={model_name} actor={actor_name}")
             except Exception as e:
                 _record_failure("training", model_name, e)

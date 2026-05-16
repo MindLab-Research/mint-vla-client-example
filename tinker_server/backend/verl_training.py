@@ -2156,9 +2156,9 @@ class VerlTrainingEngine:
         try:
             from .model_actor_supervisor import get_model_actor_supervisor
 
-            model_actor_inventory = get_model_actor_supervisor()
-            model_actor_inventory.touch(actor_name)
-            model_actor_inventory.set_session(actor_name, session.model_id)
+            model_actor_supervisor = get_model_actor_supervisor()
+            model_actor_supervisor.touch(actor_name)
+            model_actor_supervisor.set_session(actor_name, session.model_id)
         except Exception:
             logger.debug("[%s] skip touch_actor for %s", session.model_id, actor_name, exc_info=True)
 

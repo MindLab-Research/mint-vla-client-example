@@ -2342,8 +2342,8 @@ class MultiNodeInferenceEngine:
                     get_model_actor_supervisor,
                 )
 
-                model_actor_inventory = get_model_actor_supervisor()
-                model_actor_inventory.register(
+                model_actor_supervisor = get_model_actor_supervisor()
+                model_actor_supervisor.register(
                     actor_name=self.actor_name,
                     actor_type=ActorType.VLLM,
                     num_gpus=total_required_gpus,
@@ -2353,7 +2353,7 @@ class MultiNodeInferenceEngine:
                     protected=is_persistent,
                     metadata=dict(actor_observability_metadata(self.engine) or {}),
                 )
-                model_actor_inventory.mark_ready(self.actor_name)
+                model_actor_supervisor.mark_ready(self.actor_name)
 
             # Try to connect to existing actor
             existing_actor = None
@@ -2571,7 +2571,7 @@ class MultiNodeInferenceEngine:
                 actor_observability_metadata,
                 get_model_actor_supervisor,
             )
-            model_actor_inventory = get_model_actor_supervisor()
+            model_actor_supervisor = get_model_actor_supervisor()
             logger.info(
                 f"Creating multi-node vLLM requiring {total_required_gpus} GPUs "
                 f"(TP={self.tensor_parallel_size}, PP={self.pipeline_parallel_size}, "
@@ -2890,7 +2890,7 @@ class MultiNodeInferenceEngine:
 
             # Register with unified model actor registry for LRU tracking
             # Multi-node vLLM internally manages GPU workers, but we track total GPUs for eviction
-            model_actor_inventory.register(
+            model_actor_supervisor.register(
                 actor_name=self.actor_name,
                 actor_type=ActorType.VLLM,
                 num_gpus=total_required_gpus,
@@ -2901,7 +2901,7 @@ class MultiNodeInferenceEngine:
                 metadata=dict(actor_observability_metadata(self.engine) or {}),
             )
             # Mark as ready since initialization completed
-            model_actor_inventory.mark_ready(self.actor_name)
+            model_actor_supervisor.mark_ready(self.actor_name)
             logger.info(
                 f"Registered {self.actor_name} with ModelActorInventory ({total_required_gpus} GPUs)"
             )

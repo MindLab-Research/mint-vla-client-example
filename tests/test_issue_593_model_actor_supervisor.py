@@ -4,6 +4,7 @@ import os
 
 import pytest
 
+from tinker_server.backend.model_actor_inventory import ActorType
 from tinker_server.backend.model_actor_supervisor import (
     ModelActorSpec,
     ModelActorSupervisor,
@@ -48,6 +49,33 @@ class _FakeRuntimeActor:
         self.start_calls += 1
         self.running = True
         return self.health_snapshot()
+
+
+def test_issue_593_supervisor_exposes_explicit_inventory_contract() -> None:
+    supervisor = ModelActorSupervisor()
+
+    entry = supervisor.register(
+        actor_name="vllm-contract-actor",
+        actor_type=ActorType.VLLM,
+        num_gpus=1,
+        base_model="model-a",
+        metadata={"launcher_key": "legacy_vllm"},
+    )
+    supervisor.mark_ready("vllm-contract-actor")
+    supervisor.mark_inflight("vllm-contract-actor", +1)
+    supervisor.set_session("vllm-contract-actor", "session-a")
+
+    assert entry.metadata["launcher_contract"] == "model_actor_supervisor"
+    current = supervisor.get("vllm-contract-actor")
+    assert current is not None
+    assert current.current_session == "session-a"
+    assert current.inflight_count == 1
+    listed = supervisor.list_actors(actor_type=ActorType.VLLM)
+    assert any(row["actor_name"] == "vllm-contract-actor" for row in listed)
+    assert supervisor.total_gpus_used() >= 1
+
+    assert supervisor.clear_session("session-a", actor_type=ActorType.VLLM) == 1
+    assert supervisor.unregister("vllm-contract-actor") is True
 
 
 @pytest.mark.anyio

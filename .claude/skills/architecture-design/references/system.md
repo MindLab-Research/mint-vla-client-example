@@ -62,6 +62,7 @@ Implications:
 - `tinker_server/backend/model_actor_supervisor.py`
   - Process-local desired-state reconciler for model runtime actors.
   - Desired specs come from local config/env; the supervisor itself is not a durable store.
+  - Exposes the explicit inventory/launcher publication contract used by legacy vLLM, Megatron, dense, and OpenPI actor launch paths while those backends are being moved behind backend-specific launcher implementations.
 
 - `tinker_server/backend/session_manager.py`
   - Sampling session bookkeeping and cleanup.
