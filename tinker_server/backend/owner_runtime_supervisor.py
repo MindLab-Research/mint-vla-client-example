@@ -63,7 +63,7 @@ def _future_reap_interval_s() -> float:
 
 def run_future_reaper_once() -> dict[str, Any]:
     from .capacity_manager import capacity_manager
-    from .future_store import future_store
+    from .task_state_store import task_state_futures as future_store
 
     asyncio.run(future_store.async_ensure_started())
     reaped = asyncio.run(future_store.async_reap())

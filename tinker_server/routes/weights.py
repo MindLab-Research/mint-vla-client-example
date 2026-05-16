@@ -29,7 +29,7 @@ from ..auth_identity import can_manage_system
 from ..auth_identity import can_write
 from ..auth_identity import get_user_data as _request_user_data
 from ..auth_identity import get_user_id as _request_user_id
-from ..backend.future_store import future_store
+from ..backend.task_state_store import task_state_futures as future_store
 from ..checkpoint_index import (
     CheckpointAlreadyExistsError,
     CheckpointAlreadyFailedError,

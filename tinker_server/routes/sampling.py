@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 from fastapi import APIRouter, HTTPException, Request, Response
 
 from ..config import config as server_config
-from ..backend.future_store import FutureStatus, FutureStoreUnavailableError, future_store
+from ..backend.task_state_store import FutureStatus, TaskStateStoreUnavailableError as FutureStoreUnavailableError, task_state_futures as future_store
 from ..backend.model_work_admission import enqueue_model_work
 from ..gateway_auth import GatewayAuthContext, build_billing_auth_context
 from ..logging_context import (

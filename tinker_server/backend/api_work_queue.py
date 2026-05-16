@@ -2568,7 +2568,7 @@ class ApiWorkQueueClient:
 
     async def _reconcile_stale_running_requests(self, consumer_job_id: str) -> int:
         from .capacity_manager import capacity_manager
-        from .future_store import FutureStoreUnavailableError, future_store
+        from .task_state_store import TaskStateStoreUnavailableError as FutureStoreUnavailableError, task_state_futures as future_store
 
         stale_leased_request_ids: list[str] = []
         try:
@@ -2837,7 +2837,7 @@ class ApiWorkQueueClient:
     async def _worker_loop(self, worker_idx: int) -> None:
 
         from .capacity_manager import capacity_manager
-        from .future_store import FutureStatus, future_store
+        from .task_state_store import FutureStatus, task_state_futures as future_store
         from .queue_execution_context import queue_execution_context
         from .queue_supervisor import queue_supervisor
 

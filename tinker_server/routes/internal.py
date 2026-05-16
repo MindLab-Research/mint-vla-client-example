@@ -231,7 +231,7 @@ def _resource_pool_local_snapshot() -> list[dict]:
 
 @router.get("/admission_stats")
 async def admission_stats(*, include_actor_rss: bool = True) -> dict:
-    from ..backend.future_store import future_store
+    from ..backend.task_state_store import task_state_futures as future_store
     from ..backend.model_actor_supervisor import model_actor_supervisor
     from ..backend.model_work_scheduler import model_work_scheduler
     from ..backend.owner_runtime_supervisor import owner_runtime_supervisor
@@ -1146,7 +1146,7 @@ async def metrics() -> Response:
 
 @router.post("/work_queue/noop")
 async def work_queue_noop(http_request: Request) -> dict:
-    from ..backend.future_store import future_store
+    from ..backend.task_state_store import task_state_futures as future_store
     from ..backend.model_actor_supervisor import domain_key_for_internal_control
     from ..backend.model_work_admission import enqueue_model_work
 

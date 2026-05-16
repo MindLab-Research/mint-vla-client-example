@@ -106,7 +106,7 @@ async def cleanup_stale_training_sessions_once_impl(*, stale_after_s: float | No
     if stale_after_s <= 0:
         return []
 
-    from .future_store import future_store
+    from .task_state_store import task_state_futures as future_store
     from .resource_pool import get_resource_pool
     from .session_heartbeat_store import session_heartbeat_store
     from .training_session_store import async_list_training_sessions, delete_training_session

@@ -55,7 +55,7 @@ from ..logging_context import (
     start_as_current_span_from_traceparent,
 )
 
-from ..backend.future_store import FutureStatus, future_store
+from ..backend.task_state_store import FutureStatus, task_state_futures as future_store
 from ..checkpoint_index import (
     CheckpointAlreadyExistsError,
     CheckpointAlreadyFailedError,

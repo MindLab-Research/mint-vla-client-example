@@ -346,11 +346,11 @@ async def test_issue_445_internal_noop_enqueues_normalized_priority(monkeypatch)
 
     import tinker_server.backend.model_work_scheduler as mws
 
-    future_store_module = importlib.import_module("tinker_server.backend.future_store")
+    task_state_store_module = importlib.import_module("tinker_server.backend.task_state_store")
 
     scheduler = _CaptureModelWorkScheduler()
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
-    monkeypatch.setattr(future_store_module, "future_store", _StubFutureStore())
+    monkeypatch.setattr(task_state_store_module, "task_state_futures", _StubFutureStore())
 
     http_request = _DummyRequest(headers={"X-MinT-Priority": "9"})
 

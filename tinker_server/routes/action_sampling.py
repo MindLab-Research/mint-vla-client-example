@@ -6,7 +6,7 @@ import logging
 
 from fastapi import APIRouter
 
-from ..backend.future_store import future_store
+from ..backend.task_state_store import task_state_futures as future_store
 from ..models.types import ActRequest
 
 logger = logging.getLogger(__name__)

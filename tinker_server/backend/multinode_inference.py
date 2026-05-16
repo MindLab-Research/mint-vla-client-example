@@ -849,7 +849,7 @@ def _create_multinode_vllm_actor(
                 else:
                     min_tokens = int(tokens_generated)
             try:
-                from .future_store import future_store
+                from .task_state_store import task_state_futures as future_store
 
                 await future_store.async_update_meta(
                     outer_request_id,
@@ -1498,7 +1498,7 @@ def _create_multinode_vllm_actor(
             add_request_wait_s = 0.0
             add_request_exec_s = 0.0
             try:
-                from .future_store import future_store
+                from .task_state_store import task_state_futures as future_store
 
                 await future_store.async_update_meta(
                     outer_request_id,

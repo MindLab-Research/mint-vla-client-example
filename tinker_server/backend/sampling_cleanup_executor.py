@@ -106,7 +106,7 @@ async def cleanup_stale_sampling_sessions_once_impl(*, stale_after_s: float | No
     if stale_after_s <= 0:
         return []
 
-    from .future_store import future_store
+    from .task_state_store import task_state_futures as future_store
     from .sampling_session_store import async_list_sampling_sessions, delete_sampling_session
 
     try:

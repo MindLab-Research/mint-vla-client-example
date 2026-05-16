@@ -288,7 +288,7 @@ def _get_or_create_actor():
             from .api_work_queue import api_work_queue
             from .api_work_queue_dispatch import register_api_work_queue_executors
             from .capacity_manager import capacity_manager
-            from .future_store import future_store
+            from .task_state_store import task_state_futures as future_store
 
             _append_queue_runtime_debug(
                 "ensure_started_begin",
