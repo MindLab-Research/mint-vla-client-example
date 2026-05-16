@@ -312,9 +312,61 @@ def test_issue_593_supervisor_builds_runtime_placement_env_from_node_pin() -> No
     assert env == {
         "MINT_MODEL_PLACEMENT_JSON": placement,
         "MINT_VLLM_MODEL_PLACEMENT_JSON": placement,
+        "MINT_DENSE_MODEL_PLACEMENT_JSON": placement,
+        "MINT_MEGATRON_MODEL_PLACEMENT_JSON": placement,
         "MINT_MODEL_ACTOR_REPLICA_ID": "replica-2",
         "MINT_VLLM_PINNED_NODE_IP_JSON": '{"Qwen/Test":"10.0.0.17"}',
         "MINT_VLLM_MODEL_NODE_IPS_JSON": '{"Qwen/Test":["10.0.0.17"]}',
+    }
+
+
+def test_issue_593_supervisor_builds_runtime_placement_env_from_multi_node_slices() -> None:
+    env = _placement_env_for_spec(
+        ModelActorSpec(
+            domain_key="vllm:Qwen/Test",
+            replica_id="replica-0",
+            base_model="Qwen/Test",
+            placement_slices=(("replica-0", "10.0.0.17", 4), ("replica-0", "10.0.0.18", 4)),
+            gpu_count=4,
+        )
+    )
+
+    placement = (
+        '{"Qwen/Test":[{"gpu_count":4,"node_ip":"10.0.0.17","replica":0},'
+        '{"gpu_count":4,"node_ip":"10.0.0.18","replica":0}]}'
+    )
+    assert env == {
+        "MINT_MODEL_PLACEMENT_JSON": placement,
+        "MINT_VLLM_MODEL_PLACEMENT_JSON": placement,
+        "MINT_DENSE_MODEL_PLACEMENT_JSON": placement,
+        "MINT_MEGATRON_MODEL_PLACEMENT_JSON": placement,
+        "MINT_MODEL_ACTOR_REPLICA_ID": "replica-0",
+        "MINT_VLLM_MODEL_NODE_IPS_JSON": '{"Qwen/Test":["10.0.0.17","10.0.0.18"]}',
+    }
+
+
+def test_issue_593_supervisor_builds_runtime_placement_env_from_multi_node_pins() -> None:
+    env = _placement_env_for_spec(
+        ModelActorSpec(
+            domain_key="vllm:Qwen/Test",
+            replica_id="replica-0",
+            base_model="Qwen/Test",
+            node_pins=("10.0.0.17", "10.0.0.18"),
+            gpu_count=4,
+        )
+    )
+
+    placement = (
+        '{"Qwen/Test":[{"gpu_count":4,"node_ip":"10.0.0.17","replica":0},'
+        '{"gpu_count":4,"node_ip":"10.0.0.18","replica":0}]}'
+    )
+    assert env == {
+        "MINT_MODEL_PLACEMENT_JSON": placement,
+        "MINT_VLLM_MODEL_PLACEMENT_JSON": placement,
+        "MINT_DENSE_MODEL_PLACEMENT_JSON": placement,
+        "MINT_MEGATRON_MODEL_PLACEMENT_JSON": placement,
+        "MINT_MODEL_ACTOR_REPLICA_ID": "replica-0",
+        "MINT_VLLM_MODEL_NODE_IPS_JSON": '{"Qwen/Test":["10.0.0.17","10.0.0.18"]}',
     }
 
 
@@ -361,17 +413,62 @@ def test_issue_593_persistent_specs_inherit_runtime_placement(monkeypatch: pytes
             replica_id="replica-1",
             base_model="Qwen/A",
             launcher_key="legacy_vllm",
-            node_pin="10.0.0.7",
+            node_pins=("10.0.0.7",),
+            placement_slices=(("replica-1", "10.0.0.7", 2),),
             gpu_count=2,
         ),
         ModelActorSpec(
             domain_key="training:Qwen/A",
             base_model="Qwen/A",
             launcher_key="training",
-            node_pin="10.0.0.8",
+            node_pins=("10.0.0.8",),
+            placement_slices=(("replica-0", "10.0.0.8", 1),),
             gpu_count=1,
         ),
     ]
+
+
+def test_issue_593_persistent_specs_preserve_multi_node_placement(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MINT_MODEL_ACTOR_DESIRED_JSON", raising=False)
+    monkeypatch.delenv("MINT_MODEL_RUNTIME_DESIRED_JSON", raising=False)
+    monkeypatch.setenv("MINT_PERSISTENT_MODELS", "Qwen/A")
+    monkeypatch.setenv(
+        "MINT_VLLM_MODEL_PLACEMENT_JSON",
+        (
+            '{"Qwen/A":['
+            '{"replica":0,"node_ip":"10.0.0.7","gpu_count":4},'
+            '{"replica":0,"node_ip":"10.0.0.8","gpu_count":4}'
+            "]}"
+        ),
+    )
+    monkeypatch.setenv(
+        "MINT_DENSE_MODEL_PLACEMENT_JSON",
+        '{"Qwen/A":{"replica":0,"node_ip":"10.0.0.9","gpu_count":1}}',
+    )
+
+    specs = desired_specs_from_env()
+
+    assert specs[0] == ModelActorSpec(
+        domain_key="vllm:Qwen/A",
+        base_model="Qwen/A",
+        launcher_key="legacy_vllm",
+        node_pins=("10.0.0.7", "10.0.0.8"),
+        placement_slices=(("replica-0", "10.0.0.7", 4), ("replica-0", "10.0.0.8", 4)),
+        gpu_count=4,
+    )
+
+
+def test_issue_593_persistent_specs_reject_worker_aliases(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MINT_MODEL_ACTOR_DESIRED_JSON", raising=False)
+    monkeypatch.delenv("MINT_MODEL_RUNTIME_DESIRED_JSON", raising=False)
+    monkeypatch.setenv("MINT_PERSISTENT_MODELS", "Qwen/A")
+    monkeypatch.setenv(
+        "MINT_VLLM_MODEL_PLACEMENT_JSON",
+        '{"Qwen/A":{"replica":0,"worker_idx":1,"gpu_count":1}}',
+    )
+
+    with pytest.raises(ValueError, match="uses worker_index; use node_ip"):
+        desired_specs_from_env()
 
 
 def test_issue_593_supervisor_empty_env_has_no_desired_specs(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -378,6 +378,15 @@ class ModelActorPlacementReconciler:
         return []
 
     def _required_gpus_by_node_ip(self, spec: Any, node_pins: list[str]) -> dict[str, int]:
+        placement_slices = getattr(spec, "placement_slices", ())
+        if placement_slices:
+            required: dict[str, int] = {}
+            for _replica_id, node_ip, gpu_count in placement_slices:
+                node = str(node_ip).strip()
+                if not node:
+                    continue
+                required[node] = required.get(node, 0) + int(gpu_count)
+            return required
         gpu_count = getattr(spec, "gpu_count", None)
         if gpu_count is None:
             return {}

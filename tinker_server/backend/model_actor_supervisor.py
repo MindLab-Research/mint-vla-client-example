@@ -25,6 +25,7 @@ class ModelActorSpec:
     launcher_key: str = "legacy_vllm"
     node_pin: str | None = None
     node_pins: tuple[str, ...] = ()
+    placement_slices: tuple[tuple[str, str, int], ...] = ()
     gpu_count: int | None = None
     enabled: bool = True
 
@@ -38,10 +39,11 @@ class ModelActorSpec:
         return default_model_actor_name(self.domain_key, self.replica_id)
 
     def normalized_node_pins(self) -> list[str]:
-        pins = [str(pin) for pin in self.node_pins if str(pin).strip()]
+        pins = [str(node_ip) for _replica_id, node_ip, _gpu_count in self.placement_slices if str(node_ip).strip()]
+        pins.extend(str(pin) for pin in self.node_pins if str(pin).strip())
         if self.node_pin and str(self.node_pin).strip() and str(self.node_pin) not in pins:
             pins.append(str(self.node_pin))
-        return pins
+        return list(dict.fromkeys(pins))
 
 
 RuntimeFactory = Callable[[ModelActorSpec, int], Any | Awaitable[Any]]
@@ -116,7 +118,51 @@ def _placement_env_for_spec(spec: ModelActorSpec) -> dict[str, str]:
     base_model = _base_model_from_spec(spec)
     if not base_model or spec.gpu_count is None:
         return {}
+    if spec.placement_slices:
+        placement_value = [
+            {
+                "replica": _replica_int(replica_id),
+                "node_ip": node_ip,
+                "gpu_count": int(gpu_count),
+            }
+            for replica_id, node_ip, gpu_count in spec.placement_slices
+        ]
+        placement_raw = json.dumps({base_model: placement_value}, sort_keys=True, separators=(",", ":"))
+        node_pins = spec.normalized_node_pins()
+        nodes_raw = json.dumps({base_model: node_pins}, sort_keys=True, separators=(",", ":"))
+        return {
+            "MINT_MODEL_PLACEMENT_JSON": placement_raw,
+            "MINT_VLLM_MODEL_PLACEMENT_JSON": placement_raw,
+            "MINT_DENSE_MODEL_PLACEMENT_JSON": placement_raw,
+            "MINT_MEGATRON_MODEL_PLACEMENT_JSON": placement_raw,
+            "MINT_MODEL_ACTOR_REPLICA_ID": spec.replica_id,
+            "MINT_VLLM_MODEL_NODE_IPS_JSON": nodes_raw,
+        }
     node_pins = spec.normalized_node_pins()
+    if len(node_pins) > 1:
+        placement_raw = json.dumps(
+            {
+                base_model: [
+                    {
+                        "replica": _replica_int(spec.replica_id),
+                        "node_ip": node_ip,
+                        "gpu_count": int(spec.gpu_count),
+                    }
+                    for node_ip in node_pins
+                ]
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        nodes_raw = json.dumps({base_model: node_pins}, sort_keys=True, separators=(",", ":"))
+        return {
+            "MINT_MODEL_PLACEMENT_JSON": placement_raw,
+            "MINT_VLLM_MODEL_PLACEMENT_JSON": placement_raw,
+            "MINT_DENSE_MODEL_PLACEMENT_JSON": placement_raw,
+            "MINT_MEGATRON_MODEL_PLACEMENT_JSON": placement_raw,
+            "MINT_MODEL_ACTOR_REPLICA_ID": spec.replica_id,
+            "MINT_VLLM_MODEL_NODE_IPS_JSON": nodes_raw,
+        }
     if len(node_pins) != 1:
         return {}
     placement_raw = json.dumps(
@@ -135,6 +181,8 @@ def _placement_env_for_spec(spec: ModelActorSpec) -> dict[str, str]:
     return {
         "MINT_MODEL_PLACEMENT_JSON": placement_raw,
         "MINT_VLLM_MODEL_PLACEMENT_JSON": placement_raw,
+        "MINT_DENSE_MODEL_PLACEMENT_JSON": placement_raw,
+        "MINT_MEGATRON_MODEL_PLACEMENT_JSON": placement_raw,
         "MINT_MODEL_ACTOR_REPLICA_ID": spec.replica_id,
         "MINT_VLLM_PINNED_NODE_IP_JSON": pinned_raw,
         "MINT_VLLM_MODEL_NODE_IPS_JSON": nodes_raw,
@@ -185,28 +233,47 @@ def _placement_spec_overlay(raw_json: str | None, model: str) -> dict[str, Any]:
     raw_entry = payload.get(model)
     if raw_entry is None:
         return {}
-    entry = raw_entry[0] if isinstance(raw_entry, list) else raw_entry
-    if not isinstance(entry, dict):
-        raise ValueError(f"model placement entry for {model!r} must be an object")
+    entries = raw_entry if isinstance(raw_entry, list) else [raw_entry]
+    if not entries:
+        raise ValueError(f"model placement entry for {model!r} must not be empty")
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError(f"model placement entry for {model!r} must be an object")
+        if "worker_index" in entry or "worker" in entry or "worker_idx" in entry:
+            raise ValueError(f"model placement entry for {model!r} uses worker_index; use node_ip")
+    first = entries[0]
     out: dict[str, Any] = {}
-    if "replica_id" in entry:
-        out["replica_id"] = entry["replica_id"]
-    elif "replica" in entry:
-        out["replica_id"] = _replica_id(entry["replica"])
-    if "worker_index" in entry:
-        raise ValueError(f"model placement entry for {model!r} uses worker_index; use node_ip")
-    if "node_ip" in entry:
-        out["node_pin"] = str(entry["node_ip"])
-    elif "node_pin" in entry:
-        out["node_pin"] = str(entry["node_pin"])
-    if "node_pins" in entry:
-        raw_pins = entry["node_pins"]
+    if "replica_id" in first:
+        out["replica_id"] = first["replica_id"]
+    elif "replica" in first:
+        out["replica_id"] = _replica_id(first["replica"])
+    target_replica_id = str(out.get("replica_id") or "replica-0")
+    placement_slices: list[tuple[str, str, int]] = []
+    for entry in entries:
+        entry_replica_id = _replica_id(entry.get("replica_id", entry.get("replica", 0)))
+        if entry_replica_id != target_replica_id:
+            continue
+        raw_node_ip = entry.get("node_ip", entry.get("node_pin"))
+        node_ip = str(raw_node_ip).strip() if raw_node_ip is not None else ""
+        raw_gpu_count = entry.get("gpu_count")
+        if node_ip and raw_gpu_count is not None:
+            placement_slices.append((entry_replica_id, node_ip, int(raw_gpu_count)))
+    if placement_slices:
+        out["placement_slices"] = tuple(placement_slices)
+        out["node_pins"] = tuple(node_ip for _replica_id, node_ip, _gpu_count in placement_slices)
+        out["gpu_count"] = int(placement_slices[0][2])
+    elif "node_ip" in first:
+        out["node_pin"] = str(first["node_ip"])
+    elif "node_pin" in first:
+        out["node_pin"] = str(first["node_pin"])
+    if "node_pins" in first:
+        raw_pins = first["node_pins"]
         if isinstance(raw_pins, str):
             out["node_pins"] = tuple(pin.strip() for pin in raw_pins.split(",") if pin.strip())
         else:
             out["node_pins"] = tuple(str(pin) for pin in raw_pins if str(pin).strip())
-    if "gpu_count" in entry:
-        out["gpu_count"] = int(entry["gpu_count"])
+    if "gpu_count" in first and "gpu_count" not in out:
+        out["gpu_count"] = int(first["gpu_count"])
     return out
 
 
@@ -225,6 +292,7 @@ def _persistent_model_spec(
         launcher_key=launcher_key,
         node_pin=overlay.get("node_pin"),
         node_pins=tuple(overlay.get("node_pins") or ()),
+        placement_slices=tuple(overlay.get("placement_slices") or ()),
         gpu_count=overlay.get("gpu_count"),
     )
 
