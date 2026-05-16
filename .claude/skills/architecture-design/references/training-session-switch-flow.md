@@ -11,10 +11,10 @@ The training path has several different concepts that are easy to conflate:
 - client `session_id`
 - server `model_id`
 - async `request_id`
-- queue scheduling metadata
+- scheduler metadata
 - the "currently loaded session" inside a Ray training actor
 
-The bug behind issue 193/194 came from exactly this gap: dequeue order was being preserved better, but same-session operations could still reach the backend actor out of order under load.
+The bug behind issue 193/194 came from exactly this gap: queue selection order was being preserved better, but same-session operations could still reach the backend actor out of order under load.
 
 ## The four identifiers
 
@@ -32,7 +32,7 @@ The bug behind issue 193/194 came from exactly this gap: dequeue order was being
 
 - `request_id`
   - Created per async API request
-  - Keys `FutureStore`
+  - Keys `TaskStateStore` through the `TaskStateFutures` facade
   - Used for polling via `retrieve_future`
 
 - backend current session
@@ -52,22 +52,21 @@ See also `state.md`.
 For asynchronous training operations such as `forward_backward`, `optim_step`, and `save_weights_for_sampler`, the control flow is:
 
 1. Route validates request and looks up the `TrainingSession` by `model_id`.
-2. Route creates `request_id` and a pending future in `FutureStore`.
-3. Route enqueues work into `ApiWorkQueue` with extra metadata.
-4. Queue actor chooses a dequeue candidate.
-5. Queue actor assigns a per-session execution sequence number if the item carries `execution_serial_key`.
-6. A local queue worker receives the item.
-7. The worker waits in `_execution_serialized(...)` until this item is the next allowed sequence for that session.
-8. The app-level executor deserializes the JSON and calls the `_do_*` route helper.
-9. The route helper calls `training_engine.*(...)`.
-10. The backend actor ensures the correct session is loaded before doing any forward/backward/save/load work.
-11. The result resolves or fails the `request_id` in `FutureStore`.
+2. Route creates `request_id` and a pending task through `TaskStateFutures`.
+3. Route enqueues work into `ModelWorkScheduler` with extra metadata.
+4. `ModelWorkScheduler` assigns pending work into a runtime-owned subqueue for a registered model replica.
+5. `ModelRuntimeActor` polls its subqueue and claims a lease.
+6. The runtime actor validates task status, deserializes the JSON, and calls the registered route executor.
+7. The route helper calls `training_engine.*(...)`.
+8. The backend actor ensures the correct session is loaded before doing any forward/backward/save/load work.
+9. The result resolves or fails the `request_id` through `TaskStateFutures`, which persists state and payload metadata in `TaskStateStore`.
 
 Relevant code:
 
 - route enqueue metadata: `tinker_server/routes/training.py`
-- executor registration: `tinker_server/app.py`
-- dequeue and execution gate: `tinker_server/backend/api_work_queue.py`
+- executor registration: `tinker_server/backend/model_runtime_executor.py`
+- scheduler and lease state: `tinker_server/backend/model_work_scheduler.py`
+- runtime claim/execute loop: `tinker_server/backend/model_runtime_actor.py`
 
 ## Route metadata: scheduler vs execution serialization
 
@@ -82,8 +81,8 @@ Training routes attach extra metadata using `_build_training_scheduler_extra(...
 
 The distinction matters:
 
-- `scheduler_*` influences how the queue chooses which item to dequeue next
-- `execution_serial_key` forces same-session execution order after dequeue
+- `scheduler_*` influences how `ModelWorkScheduler` assigns work to runtime subqueues
+- `execution_serial_key` is retained as metadata for compatible callers and diagnostics; V1 ordering is enforced by scheduler domain/session ordering and single-flight runtime leases
 
 For training routes, `execution_serial_key` is:
 
@@ -97,12 +96,12 @@ This same key is also attached to checkpoint/state routes in `tinker_server/rout
 - `/save_state`
 - `/load_state`
 
-And the remaining same-session mutating sync routes now enqueue internal work onto that same serialized lane before returning:
+And the remaining same-session mutating sync routes now enqueue internal work onto that same scheduler session lane before returning:
 
 - `/reset_expert_bias`
 - `DELETE /models/{model_id}`
 
-That means the following operations now share one per-session serialized lane:
+That means the following operations now share one per-session scheduler lane:
 
 - `training.create_model`
 - `training.create_model_from_state`
@@ -115,34 +114,14 @@ That means the following operations now share one per-session serialized lane:
 - `weights.save_state`
 - `weights.load_state`
 
-## Why scheduler alone was not enough
+## Why the runtime subqueue matters
 
-Issue 194 improved dequeue ordering, but dequeue order is not the same thing as backend submission order.
+The legacy API queue had multiple local workers, so dequeue order and backend submission order could diverge under load. The refactor removes that queue-worker race: a model runtime claims from its scheduler-owned subqueue, and the lease is tied to the registered replica and consumer generation.
 
-Under load, multiple queue workers may process items for the same `model_id` concurrently. If one operation does more local preprocessing before it calls `.remote()`, then a later-dequeued operation can still reach the backend actor first.
+The key split is:
 
-That is exactly what could happen here:
-
-- `forward_backward` does more request shaping and data serialization before its remote call
-- `optim_step` is lighter
-- with multiple queue workers, a later `optim_step` could overtake an earlier `forward_backward`
-
-So the fix added a second mechanism:
-
-1. On dequeue, the queue actor assigns a monotonic `execution_serial_seq` per `execution_serial_key`.
-2. Before running the executor, the local worker waits until that sequence is next.
-
-This is implemented in:
-
-- dequeue sequence assignment: `ApiWorkQueueActor.dequeue()`
-- execution gate: `ApiWorkQueueClient._execution_serialized(...)`
-
-This is the key difference:
-
-- scheduler controls selection
-- execution serialization controls actual submission order
-
-Both are needed.
+- scheduler controls assignment, fairness, leases, and cancellation
+- runtime actor controls claim/execute/finalize for one model replica
 
 The same `execution_serial_key` also now covers lifecycle creation for a concrete `model_id`:
 
@@ -153,9 +132,9 @@ That prevents a follow-up op from running against a half-initialized session aft
 `TrainingSessionManager` metadata has been published but before actor creation or
 checkpoint load has finished.
 
-## App executor layer
+## Runtime executor layer
 
-`tinker_server/app.py` registers one executor per queue op. Examples:
+`tinker_server/backend/model_runtime_executor.py` registers one executor per model work op. Examples:
 
 - `training.forward_backward` -> `training._do_forward_backward(...)`
 - `training.optim_step` -> `training._do_optim_step(...)`
@@ -163,7 +142,7 @@ checkpoint load has finished.
 - `weights.save_state` -> `weights._do_save_state(...)`
 - `weights.load_state` -> `weights._do_load_state(...)`
 
-The execution gate happens before these executors run, so by the time an executor begins, same-session FIFO order is already enforced.
+The runtime actor validates the lease and task status before these executors run.
 
 ## Server-side training session metadata
 
@@ -331,7 +310,7 @@ Purpose:
 
 - load a training checkpoint back into a `model_id`
 
-This also uses the same serialized lane, so it cannot interleave with forward/backward or optimizer step for the same session.
+This also uses the same scheduler session lane, so it cannot interleave with forward/backward or optimizer step for the same session.
 
 ## Example timeline
 
@@ -345,10 +324,10 @@ And another session `B` is also active.
 
 What now happens is:
 
-1. The queue may interleave dequeue across `A` and `B` depending on scheduling policy.
-2. But every `A` item gets the same `execution_serial_key=training_session:A`.
-3. The queue actor stamps those `A` items with monotonically increasing `execution_serial_seq`.
-4. Local workers must execute `A` in that sequence order, even if different workers picked the items.
+1. The scheduler may interleave assignments across `A` and `B` depending on fairness policy.
+2. But every `A` item carries the same scheduler session key.
+3. Scheduler assignment preserves same-session order for the runtime subqueue.
+4. The model runtime claims leases from that subqueue and executes them one at a time.
 5. Inside the backend actor:
    - first `A` loads or reuses session `A`
    - second `A` sees `A` already loaded, so no session switch
@@ -359,8 +338,8 @@ What now happens is:
 
 This is the intended layering:
 
-- queue-level fairness/scheduling between sessions
-- queue-worker serialization within one session
+- scheduler-level fairness between sessions
+- runtime subqueue ordering within one session
 - backend actor session swap only when the active session changes
 
 ## Persistence and restart boundaries
@@ -382,10 +361,10 @@ Megatron backend:
 API server:
 
 - `TrainingSessionManager`
-- `FutureStore`
+- `TaskStateFutures`
 - in-process sampling mappings
 
-Only the first and third items above are process-memory state and lost on API restart. `FutureStore` itself is a detached Ray actor.
+Only the first, second facade object, and third items above are process-memory state and lost on API restart. The durable records behind `TaskStateFutures` live in detached `TaskStateStore`.
 
 More precisely:
 
@@ -394,7 +373,7 @@ More precisely:
   - in-process sampling mappings
   - other API-host registries and live actor bindings
 - Preserved in detached control-plane actors:
-  - `FutureStore`
+  - `TaskStateStore`
   - training-session recovery metadata used by `_restore_training_session(...)`
 
 That preserved metadata is enough for request polling and some routing recovery, but it is not a durable training-state checkpoint. Backend actor memory and in-process session bindings can still be lost independently.
@@ -406,7 +385,7 @@ So "session isolation" and "durable resume" are related but separate concerns.
 When reading the training code, use this model:
 
 - `model_id` chooses the mutable training session
-- queue scheduling decides which request to consider next
+- scheduler assignment decides which request to consider next
 - execution serialization decides the per-session execution order
 - backend `_ensure_session_loaded(...)` decides whether a real session swap is needed
 - sticky train mode is only a performance optimization inside the Megatron backend

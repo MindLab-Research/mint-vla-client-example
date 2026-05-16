@@ -406,7 +406,7 @@ class TestStress:
     def test_mixed_model_lru_eviction(self):
         """Eviction sentry: require an observed eviction event under 8 GPUs.
 
-        This test snapshots ResourcePool actor inventory before/after phases and
+        This test snapshots ModelActorRegistry actor inventory before/after phases and
         fails unless at least one eviction event is observed (actor disappearance).
 
         Requires server started with:

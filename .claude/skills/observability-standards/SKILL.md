@@ -79,7 +79,7 @@ For HTTP SERVER span:
 For worker/executor spans (as relevant):
 
 - `op` / operation name
-- `component` (api, queue, future_store, trainer, sampler, gateway)
+- `component` (api, queue, task_state_futures, trainer, sampler, gateway)
 - `model_name` (if relevant)
 - `queue_wait_ms` / `attempt` / `retry_count` (if relevant)
 

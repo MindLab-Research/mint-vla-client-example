@@ -413,7 +413,7 @@ curl -s http://localhost:8000/api/v1/vllm_status | jq
 | vLLM (single-node) | `tinker_vllm_{model_part}` (example: `tinker_vllm_kimi-k2-thinking`) | `TINKER_RAY_NAMESPACE` |
 | vLLM (multi-node) | `multinode_vllm_{model_part}` | `TINKER_RAY_NAMESPACE` |
 | Dense trainer pool | `dense_trainer_pool_{model_part}_maxr{rank}` | `TINKER_RAY_NAMESPACE` |
-| Stores | `tinker_future_store`, `tinker_training_session_store`, `tinker_gateway_session_store` | `MINT_RAY_NAMESPACE` (defaults to `TINKER_RAY_NAMESPACE` if set) |
+| Stores/schedulers | `mint_task_state_store`, `mint_model_work_scheduler`, `mint_model_runtime_*`, `mint_maintenance_cron`, `tinker_training_session_store`, `tinker_gateway_session_store` | `MINT_RAY_NAMESPACE` (defaults to `TINKER_RAY_NAMESPACE` if set) |
 
 Model name normalization differs by subsystem:
 - Megatron: last component, lowercase, replace `-` and `.` with `_`.

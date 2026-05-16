@@ -200,7 +200,7 @@ def sample(model_id: str, prompt_tokens: list, max_tokens: int = 20,
 
 
 def list_actors(actor_type: str | None = None, model_name: str | None = None) -> dict:
-    """List ResourcePool actors via server endpoint.
+    """List ModelActorRegistry actors via server endpoint.
 
     Used by merge-gate eviction sentries to observe real eviction events.
     """
@@ -216,7 +216,7 @@ def list_actors(actor_type: str | None = None, model_name: str | None = None) ->
 
 
 def get_admission_stats() -> dict:
-    """Fetch admission control stats (capacity manager, work queue, future store)."""
+    """Fetch scheduler, task-state, and actor-inventory stats."""
     url = f"{BASE_URL}/internal/admission_stats"
     resp = requests.get(url, headers=get_headers(), timeout=30)
     resp.raise_for_status()

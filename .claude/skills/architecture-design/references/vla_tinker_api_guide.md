@@ -277,7 +277,7 @@ Use the Mint surface when your goal is:
 
 - one service boundary for training and action inference
 - async future semantics
-- Mint-managed queue and capacity behavior
+- Mint-managed scheduling and task-state behavior
 - Mint-managed actor lifecycle
 - a stable client pattern across `pi0-fast` and `pi0.5`
 

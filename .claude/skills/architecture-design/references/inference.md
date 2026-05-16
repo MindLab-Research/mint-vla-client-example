@@ -7,7 +7,7 @@
 3. `MultiLoRAInferenceEngine.initialize()` connects to an existing detached vLLM actor or creates a new one:
   - `namespace=tinker_server.config.RAY_NAMESPACE` (from `TINKER_RAY_NAMESPACE`) so actors can be rediscovered across server restarts.
   - detached lifetime so actors survive API server restarts.
-  - registers the actor in `ResourcePool` for LRU eviction and GPU accounting.
+  - registers the actor in `ModelActorRegistry` for LRU eviction and GPU accounting.
 4. If a LoRA adapter is provided, the server loads weights and registers them for the session:
    - Small/medium adapters: tensors transferred via Ray object store (`add_lora_with_id`).
    - Very large adapters (MoE with many tensors): path-based load (`add_lora_from_path`) to avoid Ray serialization overhead.
@@ -29,7 +29,7 @@ Mechanics (MultiNodeInferenceEngine):
   - a detached placement group with `total_required_gpus = worker_gpus` GPU bundles plus one CPU-only controller bundle (strategy `PACK`)
   - a detached controller actor with `num_gpus=0`, pinned to the controller bundle index
   - child vLLM workers captured into the same placement group (`placement_group_capture_child_tasks=True`)
-- `ResourcePool` accounts for the full `total_required_gpus` so eviction decisions reflect the real cluster footprint.
+- `ModelActorRegistry` accounts for the full `total_required_gpus` so eviction decisions reflect the real cluster footprint.
 
 ## Why multi-LoRA is central
 

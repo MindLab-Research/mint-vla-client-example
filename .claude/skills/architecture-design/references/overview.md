@@ -34,7 +34,7 @@ Boundaries and tradeoffs:
 
 Hot HTTP paths must not block the API event loop on synchronous Ray control-plane calls.
 
-- Request routes use async APIs on detached control-plane actors (`FutureStore`, `CapacityManager`, `ApiWorkQueue`, and the metadata stores) and await Ray refs directly.
+- Request routes use async APIs on detached control-plane actors (`TaskStateStore`, `ModelWorkScheduler`, metadata stores, and cleanup actors) and await Ray refs directly. `TaskStateFutures` is the in-process compatibility facade over `TaskStateStore`.
 - Startup is responsible for initializing Ray and warming detached actor handles.
 - Request paths fail fast when Ray is unavailable; they must not call `init_ray()` or silently reconnect from inside a route.
 - Detached metadata-store handles can be reacquired by name if the cached handle dies, but request paths still do not create new Ray clients or hide hard Ray outages.
@@ -75,9 +75,11 @@ Two transfer mechanisms exist because of size and serialization limits:
 
 MoE training uses Megatron and must export PEFT adapters by reconstructing full tensors across TP and EP sharding. The preferred path is a newer Megatron-Bridge adapter export API that returns adapter weights without merging.
 
-## ResourcePool and eviction
+## ModelActorSupervisor, ModelWorkScheduler, and registry
 
-ResourcePool owns global GPU accounting and eviction. Clients do not explicitly end sessions, so idle timeouts control eviction. This affects both training and inference:
+`ModelActorSupervisor` owns desired model-runtime actor reconciliation. `ModelWorkScheduler` owns hot task scheduling, replica subqueues, and leases. `ModelActorRegistry` is a process-local inventory used for observability, inflight marking, and best-effort LRU eviction on direct actor creation paths.
+
+Clients do not explicitly end all sessions, so idle timeouts still affect training and inference:
 - Detached inference actors can remain alive across server restarts and keep CUDA memory until evicted.
 - Training actors can be evicted if idle, which can discard in-memory session state.
 

@@ -142,26 +142,29 @@ def _require_rss_payload(stats: dict) -> dict:
             f"admission_stats missing actors dict: {actors!r}. Hint: restart server to load new code."
         )
 
-    rp = actors.get("resource_pool")
+    rp = actors.get("model_actor_registry")
     if not isinstance(rp, list):
-        raise AssertionError(f"admission_stats actors.resource_pool missing list: {rp!r}")
+        raise AssertionError(f"admission_stats actors.model_actor_registry missing list: {rp!r}")
 
     missing = [a for a in rp if not (isinstance(a, dict) and isinstance(a.get('rss_bytes'), int))]
     if missing:
-        raise AssertionError(f"resource_pool rss_bytes missing for some actors: {missing[:3]!r}")
+        raise AssertionError(f"model_actor_registry rss_bytes missing for some actors: {missing[:3]!r}")
 
-    for k in ("capacity_manager", "api_work_queue", "future_store"):
-        v = actors.get(k)
-        if not isinstance(v, dict):
-            raise AssertionError(f"admission_stats actors.{k} missing dict: {v!r}")
-        if "rss_bytes" not in v:
-            raise AssertionError(f"admission_stats actors.{k} missing rss_bytes: {v!r}")
+    v = actors.get("task_state_futures")
+    if not isinstance(v, dict):
+        raise AssertionError(f"admission_stats actors.task_state_futures missing dict: {v!r}")
+    if "rss_bytes" not in v:
+        raise AssertionError(f"admission_stats actors.task_state_futures missing rss_bytes: {v!r}")
+
+    scheduler = stats.get("model_work_scheduler")
+    if not isinstance(scheduler, dict):
+        raise AssertionError(f"admission_stats model_work_scheduler missing dict: {scheduler!r}")
 
     return actors
 
 
 def _rss_snapshot(actors_payload: dict) -> dict[str, int]:
-    rp = actors_payload["resource_pool"]
+    rp = actors_payload["model_actor_registry"]
     out: dict[str, int] = {}
     for a in rp:
         if not isinstance(a, dict):

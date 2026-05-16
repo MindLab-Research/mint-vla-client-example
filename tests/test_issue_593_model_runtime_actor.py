@@ -144,7 +144,7 @@ class _FakeTaskStateFutures:
             )
             return
         if self.fail_terminal_write:
-            raise RuntimeError("future store terminal write failed")
+            raise RuntimeError("task state terminal write failed")
         self.resolved.append((request_id, result))
 
     async def async_fail(self, request_id: str, error: str):
@@ -157,7 +157,7 @@ class _FakeTaskStateFutures:
             )
             return
         if self.fail_terminal_write:
-            raise RuntimeError("future store terminal write failed")
+            raise RuntimeError("task state terminal write failed")
         self.failed.append((request_id, str(error)))
 
     async def async_fail_if_pending_meta_matches(

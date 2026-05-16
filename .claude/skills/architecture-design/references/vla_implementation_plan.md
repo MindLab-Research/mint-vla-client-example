@@ -61,9 +61,9 @@ The current repo no longer treats action inference as a side path outside Mint s
 Default action requests now:
 
 - create a future
-- go through queue and capacity control
+- go through `ModelWorkScheduler` when async model-runtime scheduling is needed
 - execute on Mint-managed Ray actors
-- surface placement and lifecycle through `ResourcePool`
+- surface placement and lifecycle through `ModelActorSupervisor`, `ModelWorkScheduler`, and `ModelActorRegistry`
 
 ### 4. Runtime declaration is now repo-owned
 

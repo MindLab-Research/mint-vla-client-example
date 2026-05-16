@@ -20,9 +20,9 @@ client -> HTTP -> tinker-server (FastAPI) -> Ray -> GPU actors
 Some control-plane and GPU actors are created as detached Ray actors in a fixed namespace so they can be reused across API server restarts.
 
 Control-plane detached actors:
-- `tinker_future_store`: async future state and result refs (results stored in Ray object store).
-- `tinker_capacity_manager`: admission control for async backlog (queue bytes and object store bytes).
-- `tinker_api_work_queue`: stores request JSON for async operations; API workers dequeue and execute.
+- `mint_task_state_store`: durable task state and future polling metadata backed by SQLite.
+- `mint_model_work_scheduler`: hot scheduling actor for model work backlog, per-replica subqueues, and leases.
+- `mint_maintenance_cron`: periodic maintenance actor for cleanup and reconciliation.
 - `tinker_session_index_store`: minimal session and sampler metadata for REST enumeration after API restart.
 - `tinker_training_session_store`: minimal training-session metadata used to recover routing to detached trainer actors.
 - `tinker_gateway_session_store`: routing metadata for upstream-created sampling sessions and training models when this server acts as a gateway.
@@ -38,8 +38,8 @@ Implications:
 
 - `tinker_server/app.py`
   - FastAPI startup/shutdown (lifespan), auth middleware, route registration.
-  - Startup actor reconciliation: `_cleanup_stale_actors()` kills dead actors and registers alive detached actors with `ResourcePool`.
-  - Warms detached control-plane actors used on request paths (`FutureStore`, metadata stores, admission queue actors).
+  - Startup actor reconciliation: `_cleanup_stale_actors()` kills dead actors and registers alive detached actors with `ModelActorRegistry`.
+  - Warms detached control-plane actors used on request paths (`TaskStateStore`, metadata stores, scheduler actors).
 
 - `tinker_server/routes/*`
   - HTTP endpoints. Most heavy work is delegated to backend modules.
@@ -55,9 +55,13 @@ Implications:
 - `tinker_server/models/types.py`
   - Pydantic request/response models intended to match the Tinker API.
 
-- `tinker_server/backend/resource_pool.py`
-  - Global GPU accounting and LRU eviction across actor types (training + inference).
-  - Core design assumption: clients do not explicitly end sessions; the pool uses idle timeouts to evict actors.
+- `tinker_server/backend/model_actor_registry.py`
+  - Process-local GPU actor inventory, inflight counts, metadata cache, and best-effort LRU eviction helpers.
+  - Durable scheduling state does not live here; use `TaskStateStore`, `ModelWorkScheduler`, and `ModelActorSupervisor`.
+
+- `tinker_server/backend/model_actor_supervisor.py`
+  - Process-local desired-state reconciler for model runtime actors.
+  - Desired specs come from local config/env; the supervisor itself is not a durable store.
 
 - `tinker_server/backend/session_manager.py`
   - Sampling session bookkeeping and cleanup.

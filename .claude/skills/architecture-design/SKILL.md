@@ -4,10 +4,10 @@ description: |
   Architectural design reference for tinker-server (MinT).
 
   Use for: understanding or changing system boundaries (FastAPI routes, Ray actor lifecycles,
-  training vs inference backends, weight transfer, and GPU scheduling via ResourcePool).
+  training vs inference backends, weight transfer, and GPU scheduling via ModelActorSupervisor/ModelWorkScheduler).
 
   Triggers: "architecture", "system design", "refactor", "add endpoint", "Ray actor",
-  "training/inference", "weights transfer", "session lifecycle", "resource pool"
+  "training/inference", "weights transfer", "session lifecycle", "model actor registry"
 ---
 
 # Architecture design (tinker-server)

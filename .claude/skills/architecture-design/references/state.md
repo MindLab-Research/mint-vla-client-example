@@ -24,15 +24,15 @@ This project has multiple identifiers that look similar but have different owner
   - In gateway mode, upstream routing metadata for remote sampling sessions is mirrored into the detached gateway-session store.
 
 - `request_id`
-  - Created by `FutureStore.create()` and returned by endpoints that run async work in the background.
+  - Created through the `TaskStateFutures` facade and returned by endpoints that run async work in the background.
   - Polled via `POST /api/v1/retrieve_future` (Tinker polling protocol).
-  - Stored in detached `FutureStore`, not in API-process memory.
+  - Stored in detached `TaskStateStore`, not in API-process memory.
 
 ## Persistence and restart behavior
 
 State that survives an API restart in detached control-plane actors:
 
-- `FutureStore` entries (`request_id` status/result metadata)
+- `TaskStateStore` entries (`request_id` status/result metadata)
 - session and sampler index metadata
 - training-session recovery metadata
 - gateway routing metadata for remote sampling sessions and training models

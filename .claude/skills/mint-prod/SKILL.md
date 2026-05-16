@@ -472,7 +472,7 @@ curl -s -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/actors | j
 curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/json"   -d '{"actor_type":"all"}' http://localhost:18000/api/v1/actors/kill
 ```
 
-`{"actor_type":"all"}` kills only ResourcePool-tracked GPU actors. It does not clear detached queue/runtime/store actors.
+`{"actor_type":"all"}` kills only ModelActorRegistry-tracked GPU actors. It does not clear detached scheduler/runtime/store actors.
 
 ---
 
@@ -495,26 +495,26 @@ Kill GPU actors only if the change can be imported/executed inside that actor pr
 - Megatron: `tinker_server/backend/megatron_distributed.py`, `tinker_server/backend/megatron_training.py`, `tinker_server/backend/verl_patches.py`
 - Dense training pool: `tinker_server/backend/verl_training.py`
 
-Kill detached control-plane actors in the current namespace if the diff can be imported/executed inside the queued request path, detached stores, or detached cleanup loops:
-- control plane core: `tinker_server/backend/api_work_queue.py`, `tinker_server/backend/api_work_queue_dispatch.py`, `tinker_server/backend/queue_execution_runtime.py`, `tinker_server/backend/queue_supervisor.py`, `tinker_server/backend/owner_runtime_supervisor.py`
-- detached state: `tinker_server/backend/capacity_manager.py`, `tinker_server/backend/resource_pool.py`, `tinker_server/backend/startup_lease.py`, `tinker_server/backend/future_store.py`, `tinker_server/backend/future_replay.py`
+Kill detached control-plane actors in the current namespace if the diff can be imported/executed inside the scheduled request path, detached stores, or detached cleanup loops:
+- control plane core: `tinker_server/backend/model_work_scheduler.py`, `tinker_server/backend/model_runtime_actor.py`, `tinker_server/backend/model_runtime_executor.py`, `tinker_server/backend/maintenance_cron_actor.py`
+- detached state: `tinker_server/backend/task_state_store.py`, `tinker_server/backend/task_payload_store.py`, `tinker_server/backend/startup_lease.py`, `tinker_server/backend/future_replay.py`
 - detached stores: `tinker_server/backend/sampling_session_store.py`, `tinker_server/backend/training_session_store.py`, `tinker_server/backend/gateway_session_store.py`, `tinker_server/backend/session_heartbeat_store.py`, `tinker_server/backend/session_index_store.py`
 - detached cleanup executors: `tinker_server/backend/sampling_cleanup_executor.py`, `tinker_server/backend/training_cleanup_executor.py`
-- queued auth/handler path: `tinker_server/gateway_auth.py`, `tinker_server/routes/sampling.py`, `tinker_server/routes/training.py`, `tinker_server/routes/weights.py`, `tinker_server/routes/mint.py`
+- scheduled auth/handler path: `tinker_server/gateway_auth.py`, `tinker_server/routes/sampling.py`, `tinker_server/routes/training.py`, `tinker_server/routes/weights.py`, `tinker_server/routes/mint.py`
 - shared imports used by both API and detached actors: `tinker_server/config.py`, `tinker_server/ray_utils.py`, `tinker_server/backend/ray_kill.py`, `tinker_server/backend/model_registry.py`
 
 If none of the above changed: restart server only.
 
 Checkpoint index rollout spans two detached actor families:
-- `tinker_queue_execution_runtime` and `tinker_api_work_queue*` handle queued checkpoint claim/write, so they must be recreated before fresh named checkpoint writes will emit non-null `checkpoint_record_id` and `metadata.json.ckpt_id`
-- `tinker_owner_runtime_supervisor` runs the periodic checkpoint mirror/publish loop, so it must also be recreated before fresh rows will drain from `checkpoint_staging` into `checkpoint_catalog`
+- `mint_model_runtime_*` and `mint_model_work_scheduler` handle scheduled checkpoint claim/write, so they must be recreated before fresh named checkpoint writes will emit non-null `checkpoint_record_id` and `metadata.json.ckpt_id`
+- `mint_maintenance_cron` runs the periodic checkpoint mirror/publish loop, so it must also be recreated before fresh rows will drain from `checkpoint_staging` into `checkpoint_catalog`
 
 If `TINKER_CHECKPOINT_INDEX_PG_DSN` or checkpoint publication code changes and only the first actor family is recycled, checkpoints can mirror to disk while remaining stranded in `checkpoint_staging`.
 
 ### Kill Actors
 
 The current admin route is `POST /api/v1/actors/kill`.
-Use it for ResourcePool-tracked GPU actor families only:
+Use it for ModelActorRegistry-tracked GPU actor families only:
 
 ```bash
 # Kill one GPU actor family (admin only when auth is enabled)
@@ -527,7 +527,7 @@ curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H 'Content-Type: application/json'
 ```
 
 `{"actor_type":"all"}` kills only `vllm`, `megatron`, and `dense` actors.
-It does not kill detached queue/runtime/store actors.
+It does not kill detached scheduler/runtime/store actors.
 It does not remove residual placement groups left behind by dead actors.
 Do not treat it as a full control-plane reset.
 
@@ -547,13 +547,10 @@ from ray.util.placement_group import placement_group_table
 ray.init(address='auto', ignore_reinit_error=True)
 ns = os.environ.get('TINKER_RAY_NAMESPACE', 'tinker')
 exact_names = {
-    'tinker_queue_execution_runtime',
-    'tinker_queue_supervisor',
-    'tinker_owner_runtime_supervisor',
-    'tinker_capacity_manager',
-    'tinker_resource_pool',
+    'mint_model_work_scheduler',
+    'mint_maintenance_cron',
+    'mint_task_state_store',
     'tinker_startup_lease_store',
-    'tinker_future_store',
     'mint_future_replay_sweeper',
     'tinker_sampling_session_store',
     'tinker_training_session_store',
@@ -563,7 +560,7 @@ exact_names = {
     'tinker_sampling_cleanup_executor',
     'tinker_training_cleanup_executor',
 }
-prefixes = ('tinker_api_work_queue',)
+prefixes = ('mint_model_runtime_',)
 victims = []
 for row in ray.util.list_named_actors(all_namespaces=True):
     if row.get('namespace') != ns:

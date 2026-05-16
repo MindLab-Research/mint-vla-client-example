@@ -24,8 +24,8 @@ nohup bash scripts/wip/openpi_vla_start_server.sh tinker_root_vla_pr422_20260404
 - Source `configs/prod_volcano.env.sh`, then override only the dedicated VLA values.
 - Keep `MINT_UVICORN_WORKERS=1`.
 - Use a fresh Ray namespace for each cold-start validation.
-- Use a namespace-specific queue actor name via `TINKER_API_WORK_QUEUE_ACTOR_NAME` and `MINT_API_WORK_QUEUE_ACTOR_NAME`.
-- Pin the queue actor with `MINT_API_WORK_QUEUE_PINNED_NODE_IP=192.168.38.176`.
+- Use a namespace-specific scheduler actor name via `MINT_MODEL_WORK_SCHEDULER_ACTOR_NAME`.
+- Pin the scheduler actor with `MINT_MODEL_WORK_SCHEDULER_PINNED_NODE_IP=192.168.38.176`.
 - Pin the detached control-plane actors with `MINT_CONTROL_PLANE_PINNED_NODE_IP=192.168.38.176`.
 - Set `MINT_OPENPI_FAST_WEIGHTS_PATH` to the shared params directory: `/vePFS-Mindverse/share/models/openpi/pi0_fast_base/params`.
 - Set `MINT_OPENPI_PI05_WEIGHTS_PATH` to the shared params directory: `/vePFS-Mindverse/share/models/openpi/pi05_base/params`.
@@ -50,7 +50,7 @@ The deterministic fix is:
 - `preferred_control_plane_resources()` selects the explicit worker pin when `MINT_CONTROL_PLANE_PINNED_NODE_IP` is set.
 - `actor_runtime_env_vars()` now forwards:
   - `MINT_CONTROL_PLANE_PINNED_NODE_IP`
-  - `MINT_API_WORK_QUEUE_PINNED_NODE_IP`
+  - `MINT_MODEL_WORK_SCHEDULER_PINNED_NODE_IP`
   - `MINT_STARTUP_LEASE_PINNED_NODE_IP`
 
 That makes both top-level and nested detached actors inherit the same cold-start placement policy.
@@ -77,10 +77,10 @@ Observed successful cold-start reference:
 If cold-start regresses, inspect in this order:
 
 1. `startup_lease`
-2. `future_store`
+2. `task_state_store`
 3. `sampling_session_store`, `session_heartbeat_store`, `session_index_store`, `training_session_store`
-4. `owner_runtime_supervisor`
-5. `api_work_queue`
-6. `queue_execution_runtime`
+4. `maintenance_cron_actor`
+5. `model_work_scheduler`
+6. `mint_model_runtime_*`
 
 If a detached actor is stuck in `PENDING_CREATION`, inspect its `required_resources` and its serialized `runtime_env.env_vars` before changing any code.

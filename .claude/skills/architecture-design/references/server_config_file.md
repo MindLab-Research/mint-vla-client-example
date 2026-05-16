@@ -61,18 +61,26 @@ actor/runtime dependency assembly.
 
 - `use_mbridge_lora_export` (bool) [env: `USE_MBRIDGE_LORA_EXPORT`]
 
-### `[resource_pool]`
+### `[model_actor_registry]`
 
 - `min_actor_age_s` (int) [env: `MINT_MIN_ACTOR_AGE`]
 - `session_idle_timeout_s` (int) [env: `MINT_SESSION_IDLE_TIMEOUT`]
 
-### `[future_store]`
+### `[future]`
 
-- `actor_name` (str) [env: `MINT_FUTURE_STORE_ACTOR_NAME`]
-- `ttl_s` (float) [env: `MINT_FUTURE_TTL_S`]
-- `queue_ttl_s` (float) [env: `MINT_FUTURE_QUEUE_TTL_S`]
-- `done_ttl_s` (float) [env: `MINT_FUTURE_DONE_TTL_S`]
-- `tombstone_ttl_s` (float) [env: `MINT_FUTURE_TOMBSTONE_TTL_S`]
+- `replay_root_dir` (str) [env: `MINT_FUTURE_REPLAY_ROOT_DIR`]
+- `replay_hot_ttl_s` (float) [env: `MINT_FUTURE_REPLAY_HOT_TTL_S`]
+- `replay_disk_ttl_s` (float) [env: `MINT_FUTURE_REPLAY_DISK_TTL_S`]
+- `replay_sweep_interval_s` (float) [env: `MINT_FUTURE_REPLAY_SWEEP_INTERVAL_S`]
+- `retrieve_future_grace_s` (float) [env: `MINT_RETRIEVE_FUTURE_GRACE_S`]
+- `retrieve_future_min_poll_s` (float) [env: `MINT_RETRIEVE_FUTURE_MIN_POLL_S`]
+
+### `[task_state_store]`
+
+- `actor_name` (str) [env: `MINT_TASK_STATE_STORE_ACTOR_NAME`]
+- `db_path` (str) [env: `MINT_TASK_STATE_STORE_DB_PATH`]
+- `owner_ttl_s` (float) [env: `MINT_TASK_STATE_STORE_OWNER_TTL_S`]
+- `owner_renew_s` (float) [env: `MINT_TASK_STATE_STORE_OWNER_RENEW_S`]
 
 ### `[training]`
 

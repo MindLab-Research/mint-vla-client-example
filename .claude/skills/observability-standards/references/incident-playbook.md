@@ -14,7 +14,7 @@ Trace:
 - Parent span: HTTP SERVER span.
 - Child span: `queue.enqueue`.
 - Attributes:
-  - `component=api_work_queue`
+  - `component=model_work_scheduler`
   - `op=enqueue`
   - `timeout_ms`
   - `queue_actor`

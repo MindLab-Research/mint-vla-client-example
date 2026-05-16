@@ -353,7 +353,7 @@ After code changes:
    - vLLM: `tinker_server/backend/verl_inference.py`, `tinker_server/backend/multi_lora_engine.py`, `tinker_server/backend/multinode_inference.py`, `tinker_server/backend/vllm_*.py`
    - Megatron: `tinker_server/backend/megatron_distributed.py`, `tinker_server/backend/megatron_training.py`, `tinker_server/backend/verl_patches.py`
    - Dense training pool: `tinker_server/backend/verl_training.py`
-   - Detached stores: `tinker_server/backend/future_store.py`, `tinker_server/backend/training_session_store.py`, `tinker_server/backend/gateway_session_store.py`
+   - Detached stores/schedulers: `tinker_server/backend/task_state_store.py`, `tinker_server/backend/model_work_scheduler.py`, `tinker_server/backend/model_runtime_actor.py`, `tinker_server/backend/training_session_store.py`, `tinker_server/backend/gateway_session_store.py`
    - Shared (kills required for all GPU actor types): `tinker_server/config.py`, `tinker_server/ray_utils.py`, `tinker_server/backend/ray_kill.py`, `tinker_server/backend/model_registry.py`
    - If uncertain: run namespace cleanup (issue namespace makes this safe).
 3) restart the issue-scoped dev server (stop/start using the issue-scoped commands in 3b)

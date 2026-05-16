@@ -818,7 +818,7 @@ Kill detached actors only if the change can be imported/executed inside that act
 - vLLM: `tinker_server/backend/verl_inference.py`, `tinker_server/backend/multi_lora_engine.py`, `tinker_server/backend/multinode_inference.py`, `tinker_server/backend/vllm_*.py`
 - Megatron: `tinker_server/backend/megatron_distributed.py`, `tinker_server/backend/megatron_training.py`, `tinker_server/backend/verl_patches.py`
 - Dense training pool: `tinker_server/backend/verl_training.py`
-- Detached stores: `tinker_server/backend/future_store.py`, `tinker_server/backend/training_session_store.py`, `tinker_server/backend/gateway_session_store.py`
+- Detached stores/schedulers: `tinker_server/backend/task_state_store.py`, `tinker_server/backend/model_work_scheduler.py`, `tinker_server/backend/model_runtime_actor.py`, `tinker_server/backend/maintenance_cron_actor.py`, `tinker_server/backend/training_session_store.py`, `tinker_server/backend/gateway_session_store.py`
 - Shared (kills required for all GPU actor types): `tinker_server/config.py`, `tinker_server/ray_utils.py`, `tinker_server/backend/ray_kill.py`, `tinker_server/backend/model_registry.py`
 
 If none of the above changed: restart server only.
@@ -829,7 +829,7 @@ If none of the above changed: restart server only.
 > - vLLM: `tinker_vllm_{model_name}` (e.g., `tinker_vllm_kimi-k2-thinking`)
 > - Megatron: `megatron_{model_name}` (e.g., `megatron_kimi_k2_thinking`; model name is lowercased and `-`/`.` become `_`)
 > - Dense training pool: `dense_trainer_pool_{model_name}_maxr{rank}` (e.g., `dense_trainer_pool_qwen3_4b_instruct_2507_maxr64`)
-> - Stores: `tinker_future_store`, `tinker_training_session_store`, `tinker_gateway_session_store`
+> - Stores/schedulers: `mint_task_state_store`, `mint_model_work_scheduler`, `mint_model_runtime_*`, `mint_maintenance_cron`, `tinker_training_session_store`, `tinker_gateway_session_store`
 > - Namespace: `TINKER_RAY_NAMESPACE` (default `tinker`)
 >
 > Hard rule: never create/get/kill actors outside `TINKER_RAY_NAMESPACE` unless the user explicitly requests it.
@@ -902,15 +902,21 @@ for a in actors:
 print(f\"killed={killed} prefix='dense_trainer_pool_' namespace={ns}\")
 \""
 
-# Kill detached store actors in current namespace (name match)
+# Kill detached store/scheduler actors in current namespace (name/prefix match)
 ssh mint-dev "RAY_ADDRESS='${RAY_ADDRESS:?set explicit validated head:port first}' TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' MINT_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' /vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python -c \"
 import os
 import ray
 ray.init(address=os.environ['RAY_ADDRESS'], ignore_reinit_error=True)
 ns = os.environ['TINKER_RAY_NAMESPACE']
-names = ['tinker_future_store', 'tinker_training_session_store', 'tinker_gateway_session_store']
+names = ['mint_task_state_store', 'mint_model_work_scheduler', 'mint_maintenance_cron', 'tinker_training_session_store', 'tinker_gateway_session_store']
+prefixes = ('mint_model_runtime_',)
 killed = 0
-for name in names:
+for row in ray.util.list_named_actors(all_namespaces=True):
+    if row.get('namespace') != ns:
+        continue
+    name = str(row.get('name') or '')
+    if name not in names and not any(name.startswith(prefix) for prefix in prefixes):
+        continue
     try:
         ray.kill(ray.get_actor(name, namespace=ns))
         killed += 1
@@ -981,7 +987,7 @@ curl -s http://localhost:8000/api/v1/healthz
 
 Use this after shared actor code changes (for example `tinker_server/backend/model_registry.py`) or when GPUs are exhausted.
 
-Note: `/api/v1/kill_all_actors` kills ResourcePool-tracked GPU actors (vLLM, Megatron, dense trainer pool). It does not kill detached store actors.
+Note: `/api/v1/kill_all_actors` kills ModelActorRegistry-tracked GPU actors (vLLM, Megatron, dense trainer pool). It does not kill detached store actors.
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/kill_all_actors
