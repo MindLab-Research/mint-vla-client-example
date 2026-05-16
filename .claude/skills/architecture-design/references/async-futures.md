@@ -34,6 +34,7 @@ Async endpoints that require model-runtime scheduling go through `ModelWorkSched
 - The route appends a `ModelWorkItem` to the detached `ModelWorkScheduler` actor (`mint_model_work_scheduler` by default).
 - `ModelWorkScheduler` keeps the hot domain backlog, per-replica subqueues, leases, and fairness state in memory.
 - Runtime actors claim from their scheduler-owned subqueue. Claiming is independent of `retrieve_future`; result polling reads `TaskStateStore`.
+- For scheduler leases with `attempt_id` and `scheduler_epoch`, `ModelRuntimeActor` owns terminal commit to `TaskStateStore` and lease completion/failure. Route-level `_do_*` functions may still use `TaskStateFutures.async_resolve/async_fail` as an executor-local completion signal, but those calls are buffered while running under a model-work execution context and do not write terminal state directly.
 
 On admission failure, the API must return HTTP 429 with a structured overload reason. V1 does not enforce a hard active-task cap; add one only if the active-task index becomes a measured bottleneck.
 

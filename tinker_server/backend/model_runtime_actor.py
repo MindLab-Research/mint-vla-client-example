@@ -675,18 +675,23 @@ class ModelRuntimeActor:
                 return
             task_state_committed = False
             try:
+                task_state_native_finalize = self._task_state_finalize_enabled(lease)
                 if finalization.kind == "resolve":
-                    await self._commit_task_state_success(lease, payload=finalization.payload)
-                    task_state_committed = self._task_state_finalize_enabled(lease)
-                    await self._task_state_futures.async_resolve(request_id, finalization.payload)
+                    if task_state_native_finalize:
+                        await self._commit_task_state_success(lease, payload=finalization.payload)
+                        task_state_committed = True
+                    else:
+                        await self._task_state_futures.async_resolve(request_id, finalization.payload)
                 else:
-                    await self._commit_task_state_failure(lease, error=str(finalization.payload))
-                    task_state_committed = self._task_state_finalize_enabled(lease)
-                    await self._task_state_futures.async_fail(request_id, str(finalization.payload))
+                    if task_state_native_finalize:
+                        await self._commit_task_state_failure(lease, error=str(finalization.payload))
+                        task_state_committed = True
+                    else:
+                        await self._task_state_futures.async_fail(request_id, str(finalization.payload))
             except Exception as e:
                 if task_state_committed:
                     logger.error(
-                        "[model_runtime] task_state_futures finalize failed after task_state commit actor=%s request_id=%s error_type=%s error=%s",
+                        "[model_runtime] task_state finalize failed after commit actor=%s request_id=%s error_type=%s error=%s",
                         self._config.actor_name,
                         request_id,
                         type(e).__name__,
@@ -817,12 +822,14 @@ class ModelRuntimeActor:
                 return
             task_state_committed = False
             try:
-                await self._commit_task_state_failure(lease, error=f"executor failed: {e}")
-                task_state_committed = self._task_state_finalize_enabled(lease)
-                await self._task_state_futures.async_fail(request_id, f"executor failed: {e}")
+                if self._task_state_finalize_enabled(lease):
+                    await self._commit_task_state_failure(lease, error=f"executor failed: {e}")
+                    task_state_committed = True
+                else:
+                    await self._task_state_futures.async_fail(request_id, f"executor failed: {e}")
             except Exception as e2:
                 logger.error(
-                    "[model_runtime] task_state_futures.fail failed actor=%s request_id=%s error_type=%s error=%s",
+                    "[model_runtime] task_state failure finalize failed actor=%s request_id=%s error_type=%s error=%s",
                     self._config.actor_name,
                     request_id,
                     type(e2).__name__,

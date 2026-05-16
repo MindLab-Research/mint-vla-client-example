@@ -293,7 +293,7 @@ async def test_issue_616_model_runtime_commits_success_to_task_state_store(tmp_p
     )
 
     assert await actor.run_once() == {"claimed": 1, "executed": 1}
-    assert task_state_futures.resolved == [(lease["item"]["request_id"], {"ok": True})]
+    assert task_state_futures.resolved == []
     assert task_state_store.failures == []
     assert len(task_state_store.successes) == 1
     success = task_state_store.successes[0]
@@ -386,7 +386,7 @@ async def test_issue_616_model_runtime_commits_executor_failure_to_task_state_st
     )
 
     assert await actor.run_once() == {"claimed": 1, "executed": 1}
-    assert task_state_futures.failed == [(lease["item"]["request_id"], "executor failed: boom")]
+    assert task_state_futures.failed == []
     assert task_state_store.successes == []
     assert task_state_store.failures == [
         {
