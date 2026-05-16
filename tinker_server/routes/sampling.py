@@ -1431,7 +1431,7 @@ async def sample_once(
             return sample_response.sequences[0]
 
     engine = None
-    model_actor_inventory = None
+    model_actor_supervisor = None
     model_actor_inventory_actor_name: str | None = None
     manager.mark_session_inflight(session_id, +1)
     try:
@@ -1560,7 +1560,7 @@ async def sample_once(
         await _abort_engine_request(engine, request_id)
         raise
     finally:
-        if model_actor_inventory is not None and model_actor_inventory_actor_name is not None:
+        if model_actor_supervisor is not None and model_actor_inventory_actor_name is not None:
             model_actor_supervisor.mark_inflight(model_actor_inventory_actor_name, -1)
         manager.mark_session_inflight(session_id, -1)
 
@@ -1579,7 +1579,7 @@ async def _do_sample(
     _inflight_sample_tasks += 1
     session_id: str | None = None
     engine = None
-    model_actor_inventory = None
+    model_actor_supervisor = None
     model_actor_inventory_actor_name: str | None = None
     workload_base_model = "unknown"
     workload_started_at = time.perf_counter()
@@ -1965,7 +1965,7 @@ async def _do_sample(
                 ttft_s=workload_obs["ttft_s"],
                 tpot_s=workload_obs["tpot_s"],
             )
-        if model_actor_inventory is not None and model_actor_inventory_actor_name is not None:
+        if model_actor_supervisor is not None and model_actor_inventory_actor_name is not None:
             model_actor_supervisor.mark_inflight(model_actor_inventory_actor_name, -1)
         if session_manager is not None and session_id is not None:
             session_manager.mark_session_inflight(session_id, -1)
@@ -2134,7 +2134,7 @@ async def _do_compute_logprobs(
 ) -> None:
     """Background task to compute logprobs."""
     session_id: str | None = None
-    model_actor_inventory = None
+    model_actor_supervisor = None
     model_actor_inventory_actor_name: str | None = None
     workload_base_model = "unknown"
     workload_started_at = time.perf_counter()
@@ -2154,7 +2154,7 @@ async def _do_compute_logprobs(
         base_model = snapshot.base_model if snapshot is not None else session_manager.get_session_base_model(session_id)
 
         async def _compute_logprobs_action():
-            nonlocal model_actor_inventory, model_actor_inventory_actor_name, workload_started
+            nonlocal model_actor_supervisor, model_actor_inventory_actor_name, workload_started
 
             # Check if session uses multi-LoRA mode (includes base model sessions)
             is_multi_lora = bool(snapshot.uses_multi_lora) if snapshot is not None else session_manager.is_multi_lora_session(session_id)
@@ -2308,7 +2308,7 @@ async def _do_compute_logprobs(
                 generated_tokens=0,
                 started_at=workload_started_at,
             )
-        if model_actor_inventory is not None and model_actor_inventory_actor_name is not None:
+        if model_actor_supervisor is not None and model_actor_inventory_actor_name is not None:
             model_actor_supervisor.mark_inflight(model_actor_inventory_actor_name, -1)
         if session_manager is not None and session_id is not None:
             session_manager.mark_session_inflight(session_id, -1)

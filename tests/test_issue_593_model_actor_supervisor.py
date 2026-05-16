@@ -70,7 +70,7 @@ def test_issue_593_supervisor_exposes_explicit_inventory_contract() -> None:
     assert current is not None
     assert current.current_session == "session-a"
     assert current.inflight_count == 1
-    listed = supervisor.list_actors(actor_type=ActorType.VLLM)
+    listed = supervisor.cached_snapshot()
     assert any(row["actor_name"] == "vllm-contract-actor" for row in listed)
     assert supervisor.total_gpus_used() >= 1
 
