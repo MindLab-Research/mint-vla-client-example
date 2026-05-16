@@ -24,7 +24,7 @@ class _StubTrainingManager:
         return None
 
 
-class _StubFutureStore:
+class _StubTaskStateFutures:
     def __init__(self, *, resolve=None, async_fail=None) -> None:
         self.resolve = resolve or (lambda *_args, **_kwargs: None)
         self.async_fail = async_fail or (lambda *_args, **_kwargs: None)
@@ -75,7 +75,7 @@ async def test_issue_319_save_weights_for_sampler_rejects_invalid_checkpoint_nam
     monkeypatch.setattr(
         tr,
         "task_state_futures",
-        _StubFutureStore(resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail),
+        _StubTaskStateFutures(resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail),
     )
 
     request = SaveWeightsForSamplerRequest(model_id="run-319", seq_id=0, path="../bad")
@@ -136,7 +136,7 @@ async def test_issue_319_save_weights_for_sampler_fails_before_metadata(monkeypa
     monkeypatch.setattr(
         tr,
         "task_state_futures",
-        _StubFutureStore(resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail),
+        _StubTaskStateFutures(resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail),
     )
     monkeypatch.setattr(tr, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
     monkeypatch.setattr(tr, "get_persistent_cache_dir", lambda: str(tmp_path))
@@ -208,7 +208,7 @@ async def test_issue_319_save_weights_for_sampler_mark_failed_error_does_not_mas
     monkeypatch.setattr(
         tr,
         "task_state_futures",
-        _StubFutureStore(resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail),
+        _StubTaskStateFutures(resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail),
     )
     monkeypatch.setattr(tr, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
 
@@ -272,7 +272,7 @@ async def test_issue_319_save_weights_for_sampler_rejects_corrupt_safetensors(
     monkeypatch.setattr(
         tr,
         "task_state_futures",
-        _StubFutureStore(resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail),
+        _StubTaskStateFutures(resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail),
     )
     monkeypatch.setattr(tr, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
     monkeypatch.setattr(tr, "get_persistent_cache_dir", lambda: str(tmp_path))
@@ -327,7 +327,7 @@ async def test_issue_319_save_state_fails_before_metadata(monkeypatch, tmp_path:
     monkeypatch.setattr(
         wt,
         "task_state_futures",
-        _StubFutureStore(resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail),
+        _StubTaskStateFutures(resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail),
     )
     monkeypatch.setattr(wt, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
     request = SaveStateRequest(model_id="run-319", path="training-bad")
@@ -387,7 +387,7 @@ async def test_issue_319_save_state_mark_failed_error_does_not_mask_root_failure
     monkeypatch.setattr(
         wt,
         "task_state_futures",
-        _StubFutureStore(resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail),
+        _StubTaskStateFutures(resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail),
     )
     monkeypatch.setattr(wt, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
 
@@ -444,7 +444,7 @@ async def test_issue_319_save_state_accepts_openpi_training_checkpoint_before_me
     monkeypatch.setattr(
         wt,
         "task_state_futures",
-        _StubFutureStore(resolve=_resolve, async_fail=_async_fail),
+        _StubTaskStateFutures(resolve=_resolve, async_fail=_async_fail),
     )
     monkeypatch.setattr(wt, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
     monkeypatch.setattr(wt, "begin_async_checkpoint_mirror", lambda *_args, **_kwargs: None)

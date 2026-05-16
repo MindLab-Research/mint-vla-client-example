@@ -21,7 +21,7 @@ def _reset_retrieve_future_state(monkeypatch, tmp_path):
     monkeypatch.delenv("MINT_MODEL_WORK_SCHEDULER_TASK_STATE_STORE", raising=False)
 
 
-class _StubFutureStore:
+class _StubTaskStateFutures:
     _UNSET = object()
 
     def __init__(self, status: FutureStatus, *, result=_UNSET, error=_UNSET, meta=None):
@@ -47,7 +47,7 @@ class _StubFutureStore:
         self.cleanup_calls.append(request_id)
 
 
-class _UnknownFutureStore:
+class _UnknownTaskStateFutures:
     async def async_get_status(self, request_id: str) -> FutureStatus:
         raise KeyError(f"Unknown request_id: {request_id}")
 
@@ -81,7 +81,7 @@ def test_issue_440_train_step_result_persists_and_replays(monkeypatch):
     monkeypatch.setattr(futures_route.time, "time", lambda: clock["now"])
     monkeypatch.setattr(future_replay_module.time, "time", lambda: clock["now"])
 
-    stub = _StubFutureStore(
+    stub = _StubTaskStateFutures(
         FutureStatus.DONE,
         result={"ok": "rid-train-step"},
         meta={"op": "training.train_step", "model_id": "m1", "done_at": 990.0},
@@ -99,7 +99,7 @@ def test_issue_440_train_step_result_persists_and_replays(monkeypatch):
     assert entry.op == "training.train_step"
     assert entry.model_id == "m1"
 
-    monkeypatch.setattr(futures_route, "task_state_futures", _UnknownFutureStore())
+    monkeypatch.setattr(futures_route, "task_state_futures", _UnknownTaskStateFutures())
     monkeypatch.setattr(futures_route, "_RECENT", futures_route.OrderedDict())
 
     replayed = anyio.run(futures_route.retrieve_future, body, _request_stub(), _response_stub())
@@ -107,7 +107,7 @@ def test_issue_440_train_step_result_persists_and_replays(monkeypatch):
 
 
 def test_issue_440_random_unknown_without_replay_stays_404(monkeypatch):
-    monkeypatch.setattr(futures_route, "task_state_futures", _UnknownFutureStore())
+    monkeypatch.setattr(futures_route, "task_state_futures", _UnknownTaskStateFutures())
 
     body = FutureRetrieveRequest(request_id="rid-unknown")
     with pytest.raises(futures_route.HTTPException) as exc:
@@ -122,7 +122,7 @@ def test_issue_616_task_state_store_terminal_success_fallback(monkeypatch, tmp_p
     payload_root = tmp_path / "payloads"
     monkeypatch.setenv("MINT_RETRIEVE_FUTURE_TASK_STATE_STORE", "1")
     monkeypatch.setenv("MINT_TASK_PAYLOAD_ROOT_DIR", str(payload_root))
-    monkeypatch.setattr(futures_route, "task_state_futures", _UnknownFutureStore())
+    monkeypatch.setattr(futures_route, "task_state_futures", _UnknownTaskStateFutures())
     store = TaskPayloadStore(payload_root)
     payload_meta = store.write_json_payload(
         request_id="rid-task-state-done",
@@ -149,7 +149,7 @@ def test_issue_616_task_state_store_terminal_success_fallback(monkeypatch, tmp_p
     assert payload == {"ok": True}
 
 
-def test_issue_616_future_store_done_takes_precedence_over_task_state_fallback(
+def test_issue_616_task_state_futures_done_takes_precedence_over_task_state_fallback(
     monkeypatch,
     tmp_path,
 ):
@@ -159,9 +159,9 @@ def test_issue_616_future_store_done_takes_precedence_over_task_state_fallback(
     payload_root = tmp_path / "payloads"
     monkeypatch.setenv("MINT_RETRIEVE_FUTURE_TASK_STATE_STORE", "1")
     monkeypatch.setenv("MINT_TASK_PAYLOAD_ROOT_DIR", str(payload_root))
-    stub = _StubFutureStore(
+    stub = _StubTaskStateFutures(
         FutureStatus.DONE,
-        result={"source": "future_store"},
+        result={"source": "task_state_futures"},
         meta={"op": "sampling.asample"},
     )
     monkeypatch.setattr(futures_route, "task_state_futures", stub)
@@ -187,11 +187,11 @@ def test_issue_616_future_store_done_takes_precedence_over_task_state_fallback(
     body = FutureRetrieveRequest(request_id="rid-task-state-done")
     payload = anyio.run(futures_route.retrieve_future, body, _request_stub(), _response_stub())
 
-    assert payload == {"source": "future_store"}
+    assert payload == {"source": "task_state_futures"}
     assert stub.cleanup_calls == ["rid-task-state-done"]
 
 
-def test_issue_616_pending_future_uses_task_state_terminal_and_cleans_future_store(
+def test_issue_616_pending_future_uses_task_state_terminal_and_cleans_task_state_futures(
     monkeypatch,
     tmp_path,
 ):
@@ -201,7 +201,7 @@ def test_issue_616_pending_future_uses_task_state_terminal_and_cleans_future_sto
     payload_root = tmp_path / "payloads"
     monkeypatch.setenv("MINT_RETRIEVE_FUTURE_TASK_STATE_STORE", "1")
     monkeypatch.setenv("MINT_TASK_PAYLOAD_ROOT_DIR", str(payload_root))
-    stub = _StubFutureStore(
+    stub = _StubTaskStateFutures(
         FutureStatus.PENDING,
         meta={"op": "sampling.asample", "queue_state": "running", "stage": "prefill"},
     )
@@ -232,13 +232,13 @@ def test_issue_616_pending_future_uses_task_state_terminal_and_cleans_future_sto
     assert stub.cleanup_calls == ["rid-task-state-pending-done"]
 
 
-def test_issue_616_task_state_payload_read_failure_falls_back_to_future_store_pending(
+def test_issue_616_task_state_payload_read_failure_falls_back_to_task_state_futures_pending(
     monkeypatch,
 ):
     import tinker_server.backend.task_state_store as task_state_store_module
 
     monkeypatch.setenv("MINT_RETRIEVE_FUTURE_TASK_STATE_STORE", "1")
-    stub = _StubFutureStore(
+    stub = _StubTaskStateFutures(
         FutureStatus.PENDING,
         meta={"op": "sampling.asample", "queue_state": "running", "stage": "prefill"},
     )
@@ -272,7 +272,7 @@ def test_issue_616_task_state_store_terminal_failure_fallback_keeps_public_maski
 
     monkeypatch.setattr(config_module.config, "api_key", "secret", raising=False)
     monkeypatch.setenv("MINT_RETRIEVE_FUTURE_TASK_STATE_STORE", "1")
-    monkeypatch.setattr(futures_route, "task_state_futures", _UnknownFutureStore())
+    monkeypatch.setattr(futures_route, "task_state_futures", _UnknownTaskStateFutures())
     monkeypatch.setattr(
         task_state_store_module,
         "task_state_store",
@@ -305,7 +305,7 @@ def test_issue_440_known_terminal_future_evicted_not_unknown(monkeypatch):
     monkeypatch.setattr(future_replay_module.time, "time", lambda: clock["now"])
     monkeypatch.setattr(config_module.config, "future_replay_disk_ttl_s", 1.0, raising=False)
 
-    stub = _StubFutureStore(
+    stub = _StubTaskStateFutures(
         FutureStatus.DONE,
         result={"ok": "rid-evicted"},
         meta={"op": "training.forward_backward", "model_id": "m2", "done_at": 995.0},
@@ -316,7 +316,7 @@ def test_issue_440_known_terminal_future_evicted_not_unknown(monkeypatch):
     first = anyio.run(futures_route.retrieve_future, body, _request_stub(), _response_stub())
     assert first == {"ok": "rid-evicted"}
 
-    monkeypatch.setattr(futures_route, "task_state_futures", _UnknownFutureStore())
+    monkeypatch.setattr(futures_route, "task_state_futures", _UnknownTaskStateFutures())
     monkeypatch.setattr(futures_route, "_RECENT", futures_route.OrderedDict())
     clock["now"] = 1010.0
 
@@ -333,7 +333,7 @@ def test_issue_440_failure_replay_keeps_public_masking(monkeypatch):
     monkeypatch.setattr(futures_route.time, "time", lambda: clock["now"])
     monkeypatch.setattr(future_replay_module.time, "time", lambda: clock["now"])
 
-    stub = _StubFutureStore(
+    stub = _StubTaskStateFutures(
         FutureStatus.FAILED,
         error="secret backend trace",
         meta={"op": "training.optim_step", "model_id": "m3", "done_at": 1990.0},
@@ -344,7 +344,7 @@ def test_issue_440_failure_replay_keeps_public_masking(monkeypatch):
     first = anyio.run(futures_route.retrieve_future, body, _request_stub(admin=False), _response_stub())
     assert first == {"error": futures_route.GENERIC_ERROR_MESSAGE, "category": "system"}
 
-    monkeypatch.setattr(futures_route, "task_state_futures", _UnknownFutureStore())
+    monkeypatch.setattr(futures_route, "task_state_futures", _UnknownTaskStateFutures())
     monkeypatch.setattr(futures_route, "_RECENT", futures_route.OrderedDict())
 
     replayed = anyio.run(futures_route.retrieve_future, body, _request_stub(admin=False), _response_stub())
@@ -356,7 +356,7 @@ def test_issue_440_concurrent_first_retrieve_returns_equivalent_payloads(monkeyp
     monkeypatch.setattr(futures_route.time, "time", lambda: clock["now"])
     monkeypatch.setattr(future_replay_module.time, "time", lambda: clock["now"])
 
-    stub = _StubFutureStore(
+    stub = _StubTaskStateFutures(
         FutureStatus.DONE,
         result={"ok": "rid-race"},
         meta={"op": "training.train_step", "model_id": "m-race", "done_at": 2990.0},
@@ -390,7 +390,7 @@ def test_issue_440_restart_like_replay_survives_process_local_state_reset(monkey
     monkeypatch.setattr(futures_route.time, "time", lambda: clock["now"])
     monkeypatch.setattr(future_replay_module.time, "time", lambda: clock["now"])
 
-    stub = _StubFutureStore(
+    stub = _StubTaskStateFutures(
         FutureStatus.DONE,
         result={"ok": "rid-restart"},
         meta={"op": "training.train_step", "model_id": "m-restart", "done_at": 3990.0},
@@ -401,7 +401,7 @@ def test_issue_440_restart_like_replay_survives_process_local_state_reset(monkey
     first = anyio.run(futures_route.retrieve_future, body, _request_stub(), _response_stub())
     assert first == {"ok": "rid-restart"}
 
-    monkeypatch.setattr(futures_route, "task_state_futures", _UnknownFutureStore())
+    monkeypatch.setattr(futures_route, "task_state_futures", _UnknownTaskStateFutures())
     monkeypatch.setattr(futures_route, "_RECENT", futures_route.OrderedDict())
 
     replayed = anyio.run(futures_route.retrieve_future, body, _request_stub(), _response_stub())

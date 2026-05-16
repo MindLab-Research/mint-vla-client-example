@@ -109,7 +109,7 @@ class _FakeScheduler:
         return {"ok": True, "assigned": 0, "expired": 0}
 
 
-class _FakeFutureStore:
+class _FakeTaskStateFutures:
     def __init__(
         self,
         statuses: dict[str, FutureStatus] | None = None,
@@ -196,7 +196,7 @@ class _FakeTaskStateStore:
 async def test_issue_593_model_runtime_claims_executes_renews_and_completes() -> None:
     lease = _lease()
     scheduler = _FakeScheduler(claims=[[lease]])
-    task_state_futures = _FakeFutureStore(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
+    task_state_futures = _FakeTaskStateFutures(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
     seen_context: list[tuple[str | None, int | None, str | None, str | None, int | None]] = []
 
     async def _executor(_lease: dict) -> None:
@@ -285,7 +285,7 @@ async def test_issue_616_model_runtime_commits_success_to_task_state_store(tmp_p
         "model_work_attempt_id": "attempt-success",
     }
     scheduler = _FakeScheduler(claims=[[lease]])
-    task_state_futures = _FakeFutureStore(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
+    task_state_futures = _FakeTaskStateFutures(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
     task_state_store = _FakeTaskStateStore()
     payload_store = TaskPayloadStore(tmp_path)
 
@@ -334,7 +334,7 @@ async def test_issue_616_model_runtime_does_not_requeue_after_task_state_success
         "model_work_attempt_id": "attempt-success-future-fails",
     }
     scheduler = _FakeScheduler(claims=[[lease]])
-    task_state_futures = _FakeFutureStore(
+    task_state_futures = _FakeTaskStateFutures(
         statuses={lease["item"]["request_id"]: FutureStatus.PENDING},
         fail_terminal_write=True,
     )
@@ -379,7 +379,7 @@ async def test_issue_616_model_runtime_commits_executor_failure_to_task_state_st
         "model_work_attempt_id": "attempt-failure",
     }
     scheduler = _FakeScheduler(claims=[[lease]])
-    task_state_futures = _FakeFutureStore(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
+    task_state_futures = _FakeTaskStateFutures(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
     task_state_store = _FakeTaskStateStore()
 
     async def _executor(_lease: dict) -> None:
@@ -424,7 +424,7 @@ async def test_issue_616_model_runtime_does_not_requeue_after_task_state_failure
         "model_work_attempt_id": "attempt-failure-future-fails",
     }
     scheduler = _FakeScheduler(claims=[[lease]])
-    task_state_futures = _FakeFutureStore(
+    task_state_futures = _FakeTaskStateFutures(
         statuses={lease["item"]["request_id"]: FutureStatus.PENDING},
         fail_terminal_write=True,
     )
@@ -465,7 +465,7 @@ async def test_issue_616_model_runtime_does_not_requeue_after_task_state_failure
 async def test_issue_593_model_runtime_executor_failure_fails_future_and_lease() -> None:
     lease = _lease("runtime-req-fail")
     scheduler = _FakeScheduler(claims=[[lease]])
-    task_state_futures = _FakeFutureStore(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
+    task_state_futures = _FakeTaskStateFutures(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
 
     async def _executor(_lease: dict) -> None:
         raise RuntimeError("boom")
@@ -512,7 +512,7 @@ async def test_issue_593_model_runtime_executor_failure_fails_future_and_lease()
 async def test_issue_593_model_runtime_future_fail_finalization_fails_lease() -> None:
     lease = _lease("runtime-req-finalized-fail")
     scheduler = _FakeScheduler(claims=[[lease]])
-    task_state_futures = _FakeFutureStore(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
+    task_state_futures = _FakeTaskStateFutures(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
 
     async def _executor(_lease: dict) -> None:
         await task_state_futures.async_fail(_lease["item"]["request_id"], "engine startup failed")
@@ -551,7 +551,7 @@ async def test_issue_593_model_runtime_future_fail_finalization_fails_lease() ->
 async def test_issue_593_model_runtime_requeues_if_task_state_futures_finalize_fails() -> None:
     lease = _lease("runtime-req-finalize-fail")
     scheduler = _FakeScheduler(claims=[[lease]])
-    task_state_futures = _FakeFutureStore(
+    task_state_futures = _FakeTaskStateFutures(
         statuses={lease["item"]["request_id"]: FutureStatus.PENDING},
         fail_terminal_write=True,
     )
@@ -589,7 +589,7 @@ async def test_issue_593_model_runtime_requeues_if_task_state_futures_finalize_f
 async def test_issue_593_model_runtime_fails_future_if_lease_missing_before_finalize() -> None:
     lease = _lease("runtime-req-missing-finalize-lease")
     scheduler = _FakeScheduler(claims=[[lease]], begin_finalize_ok=False)
-    task_state_futures = _FakeFutureStore(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
+    task_state_futures = _FakeTaskStateFutures(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
 
     async def _executor(_lease: dict) -> None:
         await task_state_futures.async_resolve(_lease["item"]["request_id"], {"ok": True})
@@ -623,7 +623,7 @@ async def test_issue_593_model_runtime_fails_future_if_lease_missing_before_fina
 async def test_issue_593_model_runtime_releases_capacity_if_lost_lease_fail_write_fails() -> None:
     lease = _lease("runtime-req-lost-lease-fail-write")
     scheduler = _FakeScheduler(claims=[[lease]], begin_finalize_ok=False)
-    task_state_futures = _FakeFutureStore(
+    task_state_futures = _FakeTaskStateFutures(
         statuses={lease["item"]["request_id"]: FutureStatus.PENDING},
         fail_terminal_write=True,
     )
@@ -651,7 +651,7 @@ async def test_issue_593_model_runtime_releases_capacity_if_lost_lease_fail_writ
 async def test_issue_593_model_runtime_does_not_recreate_forgotten_future_on_lost_lease() -> None:
     lease = _lease("runtime-req-forgotten-lost-lease")
     scheduler = _FakeScheduler(claims=[[lease]], begin_finalize_ok=False)
-    task_state_futures = _FakeFutureStore(statuses={})
+    task_state_futures = _FakeTaskStateFutures(statuses={})
 
     async def _executor(_lease: dict) -> None:
         await task_state_futures.async_resolve(_lease["item"]["request_id"], {"ok": True})
@@ -676,7 +676,7 @@ async def test_issue_593_model_runtime_does_not_recreate_forgotten_future_on_los
 async def test_issue_593_model_runtime_does_not_fail_new_retry_on_lost_old_lease() -> None:
     lease = _lease_with_attempt("runtime-req-retried-lost-lease", "old-attempt")
     scheduler = _FakeScheduler(claims=[[lease]], begin_finalize_ok=False)
-    task_state_futures = _FakeFutureStore(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
+    task_state_futures = _FakeTaskStateFutures(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
 
     async def _executor(_lease: dict) -> None:
         await task_state_futures.async_resolve(_lease["item"]["request_id"], {"ok": True})
@@ -701,7 +701,7 @@ async def test_issue_593_model_runtime_does_not_fail_new_retry_on_lost_old_lease
 async def test_issue_593_model_runtime_fails_future_if_lease_missing_after_executor_failure() -> None:
     lease = _lease("runtime-req-missing-failure-lease")
     scheduler = _FakeScheduler(claims=[[lease]], begin_finalize_ok=False)
-    task_state_futures = _FakeFutureStore(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
+    task_state_futures = _FakeTaskStateFutures(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
 
     async def _executor(_lease: dict) -> None:
         raise RuntimeError("boom")
@@ -734,7 +734,7 @@ async def test_issue_593_model_runtime_fails_future_if_lease_missing_after_execu
 async def test_issue_593_model_runtime_releases_capacity_if_lost_failure_lease_fail_write_fails() -> None:
     lease = _lease("runtime-req-lost-failure-lease-fail-write")
     scheduler = _FakeScheduler(claims=[[lease]], begin_finalize_ok=False)
-    task_state_futures = _FakeFutureStore(
+    task_state_futures = _FakeTaskStateFutures(
         statuses={lease["item"]["request_id"]: FutureStatus.PENDING},
         fail_terminal_write=True,
     )
@@ -762,7 +762,7 @@ async def test_issue_593_model_runtime_releases_capacity_if_lost_failure_lease_f
 async def test_issue_593_model_runtime_requeues_if_task_state_futures_fail_write_fails() -> None:
     lease = _lease("runtime-req-fail-write-fail")
     scheduler = _FakeScheduler(claims=[[lease]])
-    task_state_futures = _FakeFutureStore(
+    task_state_futures = _FakeTaskStateFutures(
         statuses={lease["item"]["request_id"]: FutureStatus.PENDING},
         fail_terminal_write=True,
     )
@@ -800,7 +800,7 @@ async def test_issue_593_model_runtime_requeues_if_task_state_futures_fail_write
 async def test_issue_593_model_runtime_requeues_if_mark_running_fails() -> None:
     lease = _lease("runtime-req-mark-running-fail")
     scheduler = _FakeScheduler(claims=[[lease]])
-    task_state_futures = _FakeFutureStore(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
+    task_state_futures = _FakeTaskStateFutures(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
 
     async def _executor(_lease: dict) -> None:
         await task_state_futures.async_resolve(_lease["item"]["request_id"], {"ok": True})
@@ -838,7 +838,7 @@ async def test_issue_593_model_runtime_requeues_if_mark_running_fails() -> None:
 async def test_issue_593_model_runtime_skips_non_pending_future_without_execution() -> None:
     lease = _lease("runtime-req-done")
     scheduler = _FakeScheduler(claims=[[lease]])
-    task_state_futures = _FakeFutureStore(statuses={lease["item"]["request_id"]: FutureStatus.DONE})
+    task_state_futures = _FakeTaskStateFutures(statuses={lease["item"]["request_id"]: FutureStatus.DONE})
     executed = False
 
     async def _executor(_lease: dict) -> None:
@@ -875,7 +875,7 @@ async def test_issue_593_model_runtime_empty_poll_and_drain() -> None:
         domain_key="vllm:model-a",
         replica_id="replica-0",
         scheduler_client=scheduler,
-        task_state_futures_client=_FakeFutureStore(),
+        task_state_futures_client=_FakeTaskStateFutures(),
         executor=lambda _lease: asyncio.sleep(0),
     )
 
@@ -893,7 +893,7 @@ async def test_issue_593_model_runtime_empty_poll_and_drain() -> None:
 async def test_issue_593_model_runtime_empty_poll_preserves_last_error() -> None:
     lease = _lease("runtime-req-failed-then-idle")
     scheduler = _FakeScheduler(claims=[[lease]])
-    task_state_futures = _FakeFutureStore(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
+    task_state_futures = _FakeTaskStateFutures(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
 
     async def _executor(_lease: dict) -> None:
         await task_state_futures.async_fail(_lease["item"]["request_id"], "engine startup failed")
@@ -920,7 +920,7 @@ async def test_issue_593_model_runtime_success_clears_previous_error() -> None:
     failed_lease = _lease("runtime-req-failed-then-success")
     ok_lease = _lease("runtime-req-success-after-error")
     scheduler = _FakeScheduler(claims=[[failed_lease], [ok_lease]])
-    task_state_futures = _FakeFutureStore(
+    task_state_futures = _FakeTaskStateFutures(
         statuses={
             failed_lease["item"]["request_id"]: FutureStatus.PENDING,
             ok_lease["item"]["request_id"]: FutureStatus.PENDING,

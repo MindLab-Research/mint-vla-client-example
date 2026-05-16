@@ -65,7 +65,7 @@ class _FakeActionSessionManager:
         self.shutdown_calls.append(action_session_id)
 
 
-class _FakeFutureStore:
+class _FakeTaskStateFutures:
     def __init__(self) -> None:
         self.created: list[str] = []
         self.resolved: list[tuple[str, dict[str, object]]] = []
@@ -84,7 +84,7 @@ class _FakeFutureStore:
         self.failed.append((request_id, error))
 
 
-class _AsyncFakeFutureStore:
+class _AsyncFakeTaskStateFutures:
     def __init__(self) -> None:
         self.created: list[str] = []
         self.queued: list[tuple[str, dict | None]] = []
@@ -106,7 +106,7 @@ class _AsyncFakeFutureStore:
         self.cleaned.append(request_id)
 
 
-class _AsyncResolvingFutureStore(_AsyncFakeFutureStore):
+class _AsyncResolvingTaskStateFutures(_AsyncFakeTaskStateFutures):
     def __init__(self) -> None:
         super().__init__()
         self.resolved: list[tuple[str, dict[str, object]]] = []
@@ -310,7 +310,7 @@ def test_do_act_resolves_future_with_actions(monkeypatch) -> None:
     from tinker_server.models.types import ActRequest, EncodedTextChunk, ImageChunk, ModelInput, TensorData
 
     manager = _FakeActionSessionManager()
-    task_state_futures = _FakeFutureStore()
+    task_state_futures = _FakeTaskStateFutures()
     monkeypatch.setattr(action_routes, "action_session_manager", manager, raising=False)
     monkeypatch.setattr(action_routes, "task_state_futures", task_state_futures, raising=False)
 
@@ -358,7 +358,7 @@ def test_do_act_prefers_async_task_state_futures_api(monkeypatch) -> None:
     from tinker_server.models.types import ActRequest, EncodedTextChunk, ImageChunk, ModelInput, TensorData
 
     manager = _FakeActionSessionManager()
-    task_state_futures = _AsyncResolvingFutureStore()
+    task_state_futures = _AsyncResolvingTaskStateFutures()
     monkeypatch.setattr(action_routes, "action_session_manager", manager, raising=False)
     monkeypatch.setattr(action_routes, "task_state_futures", task_state_futures, raising=False)
 
@@ -410,7 +410,7 @@ def test_do_act_logs_when_future_fail_marking_fails(monkeypatch) -> None:
             _ = action_session_id, observation, extra_inputs
             raise RuntimeError("boom")
 
-    class _ExplodingFutureStore(_FakeFutureStore):
+    class _ExplodingTaskStateFutures(_FakeTaskStateFutures):
         def fail(self, request_id: str, error: str) -> None:
             _ = request_id, error
             raise RuntimeError("fail-store-boom")
@@ -426,7 +426,7 @@ def test_do_act_logs_when_future_fail_marking_fails(monkeypatch) -> None:
         _ExplodingActionSessionManager(),
         raising=False,
     )
-    monkeypatch.setattr(action_routes, "task_state_futures", _ExplodingFutureStore(), raising=False)
+    monkeypatch.setattr(action_routes, "task_state_futures", _ExplodingTaskStateFutures(), raising=False)
     monkeypatch.setattr(action_routes.logger, "exception", _record_log)
 
     request = ActRequest(
@@ -451,7 +451,7 @@ def test_do_act_logs_when_future_fail_marking_fails(monkeypatch) -> None:
 def test_mint_action_route_enqueues_expected_request(monkeypatch) -> None:
     from tinker_server.routes import mint as mint_routes
 
-    task_state_futures = _AsyncFakeFutureStore()
+    task_state_futures = _AsyncFakeTaskStateFutures()
     scheduler = _StubModelWorkScheduler()
 
     monkeypatch.setattr(mint_routes, "task_state_futures", task_state_futures, raising=False)
@@ -518,7 +518,7 @@ def test_legacy_action_public_routes_are_not_exposed(monkeypatch) -> None:
     monkeypatch.setattr(service_routes, "action_session_manager", manager, raising=False)
     monkeypatch.setattr(service_routes, "_get_user_id", lambda _request: "user-1")
     monkeypatch.setattr(action_routes, "action_session_manager", manager, raising=False)
-    monkeypatch.setattr(action_routes, "task_state_futures", _FakeFutureStore(), raising=False)
+    monkeypatch.setattr(action_routes, "task_state_futures", _FakeTaskStateFutures(), raising=False)
     monkeypatch.setattr(mint_routes, "action_session_manager", manager, raising=False)
 
     app = FastAPI()

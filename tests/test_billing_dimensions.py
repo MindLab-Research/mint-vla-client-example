@@ -5,7 +5,7 @@ from tinker_server.models.types import ComputeLogprobsRequest, ModelInput, Sampl
 from tinker_server.routes import sampling as sampling_route
 
 
-class _StubFutureStore:
+class _StubTaskStateFutures:
     def __init__(self, order: list[str] | None = None):
         self.resolved: dict[str, dict] = {}
         self.failed: dict[str, str] = {}
@@ -82,7 +82,7 @@ def _gateway_auth() -> dict[str, str]:
 
 
 def test_asample_logs_prefill_and_sample_dimensions(monkeypatch):
-    task_state_futures = _StubFutureStore()
+    task_state_futures = _StubTaskStateFutures()
     usage_store = _StubUsageStore()
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSessionManager())
@@ -111,7 +111,7 @@ def test_asample_logs_prefill_and_sample_dimensions(monkeypatch):
 
 def test_asample_resolves_future_before_persisting_usage(monkeypatch):
     order: list[str] = []
-    task_state_futures = _StubFutureStore(order=order)
+    task_state_futures = _StubTaskStateFutures(order=order)
     usage_store = _StubUsageStore(order=order)
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSessionManager())
@@ -132,7 +132,7 @@ def test_asample_resolves_future_before_persisting_usage(monkeypatch):
 
 
 def test_compute_logprobs_logs_prefill_dimension(monkeypatch):
-    task_state_futures = _StubFutureStore()
+    task_state_futures = _StubTaskStateFutures()
     usage_store = _StubUsageStore()
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSessionManager())

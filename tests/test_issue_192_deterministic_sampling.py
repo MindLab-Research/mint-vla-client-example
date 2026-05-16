@@ -67,7 +67,7 @@ class _StubSamplingSessionManager:
         return 1
 
 
-class _StubFutureStore:
+class _StubTaskStateFutures:
     def __init__(self):
         self.pending: dict[str, dict | None] = {}
         self.marked: list[str] = []
@@ -312,7 +312,7 @@ def test_create_sampling_session_keeps_generic_samplers_out_of_heartbeat_fanout(
 
 
 def test_asample_deterministic_request_id_dedup(monkeypatch):
-    stub_fs = _StubFutureStore()
+    stub_fs = _StubTaskStateFutures()
     stub_scheduler = _StubModelWorkScheduler()
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
@@ -345,7 +345,7 @@ def test_asample_deterministic_request_id_dedup(monkeypatch):
 
 
 def test_asample_sets_deterministic_request_id_in_logging_context_first(monkeypatch):
-    stub_fs = _StubFutureStore()
+    stub_fs = _StubTaskStateFutures()
     stub_scheduler = _StubModelWorkScheduler()
     request_id_bindings: list[str] = []
 
@@ -374,7 +374,7 @@ def test_asample_sets_deterministic_request_id_in_logging_context_first(monkeypa
 
 
 def test_asample_duplicate_payload_conflict(monkeypatch):
-    stub_fs = _StubFutureStore()
+    stub_fs = _StubTaskStateFutures()
     stub_scheduler = _StubModelWorkScheduler()
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
@@ -411,7 +411,7 @@ def test_asample_duplicate_payload_conflict(monkeypatch):
 
 
 def test_asample_requires_seq_id_when_enabled(monkeypatch):
-    stub_fs = _StubFutureStore()
+    stub_fs = _StubTaskStateFutures()
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
     monkeypatch.setattr(sampling_route, "task_state_futures", stub_fs)

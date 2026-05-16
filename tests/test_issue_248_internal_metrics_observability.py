@@ -440,7 +440,7 @@ def test_issue_588_admission_stats_rss_path_preserves_model_actor_registry_metad
         async def async_size(self) -> int:
             return 0
 
-    class _FakeFutureStore:
+    class _FakeTaskStateFutures:
         async def async_ensure_ready(self, *, timeout_s: float = 10.0) -> dict:
             return {"pending": 0, "results": 0, "errors": 0}
 
@@ -473,7 +473,7 @@ def test_issue_588_admission_stats_rss_path_preserves_model_actor_registry_metad
         def lifecycle_metrics_snapshot(self) -> list[dict]:
             return []
 
-    monkeypatch.setattr(task_state_store_module, "task_state_futures", _FakeFutureStore())
+    monkeypatch.setattr(task_state_store_module, "task_state_futures", _FakeTaskStateFutures())
     monkeypatch.setattr(model_work_scheduler_module, "model_work_scheduler", _FakeModelWorkScheduler())
     monkeypatch.setattr(model_actor_supervisor_module, "model_actor_supervisor", _FakeModelActorSupervisor())
     monkeypatch.setattr(maintenance_cron_actor_module, "maintenance_cron_actor", _FakeSupervisor())
@@ -524,7 +524,7 @@ def test_issue_248_admission_stats_metrics_path_uses_cached_pool_snapshot(monkey
         async def async_size(self) -> int:
             return 0
 
-    class _FakeFutureStore:
+    class _FakeTaskStateFutures:
         def metrics_snapshot(self) -> dict:
             return {"pending": 0, "results": 0, "errors": 0}
 
@@ -547,7 +547,7 @@ def test_issue_248_admission_stats_metrics_path_uses_cached_pool_snapshot(monkey
         def rss_snapshot(self, *, timeout_s: float = 10.0) -> list[dict]:
             raise AssertionError("metrics scrape must not call model_actor_registry.rss_snapshot")
 
-    monkeypatch.setattr(task_state_store_module, "task_state_futures", _FakeFutureStore())
+    monkeypatch.setattr(task_state_store_module, "task_state_futures", _FakeTaskStateFutures())
     monkeypatch.setattr(model_work_scheduler_module, "model_work_scheduler", _FakeModelWorkScheduler())
     monkeypatch.setattr(model_actor_supervisor_module, "model_actor_supervisor", _FakeModelActorSupervisor())
     monkeypatch.setattr(maintenance_cron_actor_module, "maintenance_cron_actor", _FakeSupervisor())

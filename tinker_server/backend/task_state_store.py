@@ -1403,7 +1403,7 @@ class TaskStateStoreClient:
         return out
 
 
-class TaskStateFutureStore:
+class TaskStateFutures:
     """Future polling facade backed by TaskStateStore and TaskPayloadStore.
 
     This owns the external Tinker future lifecycle while the durable state lives
@@ -1688,4 +1688,4 @@ class TaskStateFutureStore:
 
 
 task_state_store = TaskStateStoreClient()
-task_state_futures = TaskStateFutureStore()
+task_state_futures = TaskStateFutures()

@@ -33,7 +33,7 @@ class _StubSamplingSessionManager:
         return 1
 
 
-class _StubFutureStore:
+class _StubTaskStateFutures:
     def __init__(self):
         self.pending: dict[str, dict | None] = {}
         self.marked: list[str] = []
@@ -131,7 +131,7 @@ def test_sample_request_rejects_seq_id_without_session_selector():
     ],
 )
 def test_asample_normalizes_direct_selector_before_enqueue(monkeypatch, selector_field: str, selector_value: str):
-    stub_fs = _StubFutureStore()
+    stub_fs = _StubTaskStateFutures()
     stub_scheduler = _StubModelWorkScheduler()
     created_sessions: list[tuple[str, str]] = []
 
@@ -170,7 +170,7 @@ def test_asample_normalizes_direct_selector_before_enqueue(monkeypatch, selector
 
 
 def test_asample_keeps_seq_id_gate_for_existing_session_selector(monkeypatch):
-    stub_fs = _StubFutureStore()
+    stub_fs = _StubTaskStateFutures()
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
     monkeypatch.setattr(sampling_route, "task_state_futures", stub_fs)

@@ -126,7 +126,7 @@ def _make_actor_impl(monkeypatch, **actor_kwargs):
     return impl_cls
 
 
-def _stub_future_store(monkeypatch):
+def _stub_task_state_futures(monkeypatch):
     async def _noop_async_update_meta(*args, **kwargs):
         return None
 
@@ -157,7 +157,7 @@ async def test_issue_428_default_multisample_mode_preserves_cross_request_concur
 @pytest.mark.anyio
 async def test_issue_428_multisample_request_does_not_block_ordinary_request_entry(monkeypatch):
     _install_fake_vllm(monkeypatch)
-    _stub_future_store(monkeypatch)
+    _stub_task_state_futures(monkeypatch)
     monkeypatch.setattr(mni, "init_actor_observability", lambda: None)
     monkeypatch.setattr(mni.server_config, "router_replay_mode", "disabled", raising=False)
     monkeypatch.setattr(vllm_stop, "vllm_stop_kwargs", lambda stop, default_stop_token_ids=None: {})
@@ -220,7 +220,7 @@ async def test_issue_428_multisample_request_does_not_block_ordinary_request_ent
 @pytest.mark.anyio
 async def test_issue_428_vllm_n_requests_remain_isolated_from_each_other(monkeypatch):
     _install_fake_vllm(monkeypatch)
-    _stub_future_store(monkeypatch)
+    _stub_task_state_futures(monkeypatch)
     monkeypatch.setattr(mni, "init_actor_observability", lambda: None)
     monkeypatch.setattr(mni.server_config, "router_replay_mode", "disabled", raising=False)
     monkeypatch.setattr(vllm_stop, "vllm_stop_kwargs", lambda stop, default_stop_token_ids=None: {})
@@ -284,7 +284,7 @@ async def test_issue_428_vllm_n_requests_remain_isolated_from_each_other(monkeyp
 @pytest.mark.anyio
 async def test_issue_428_concurrent_n1_failure_aborts_remaining_subrequests(monkeypatch):
     _install_fake_vllm(monkeypatch)
-    _stub_future_store(monkeypatch)
+    _stub_task_state_futures(monkeypatch)
     monkeypatch.setattr(mni, "init_actor_observability", lambda: None)
     monkeypatch.setattr(mni.server_config, "router_replay_mode", "disabled", raising=False)
     monkeypatch.setattr(vllm_stop, "vllm_stop_kwargs", lambda stop, default_stop_token_ids=None: {})
@@ -360,7 +360,7 @@ async def test_issue_428_concurrent_n1_failure_aborts_remaining_subrequests(monk
 @pytest.mark.anyio
 async def test_issue_428_register_generate_start_failure_releases_seq_slot(monkeypatch):
     _install_fake_vllm(monkeypatch)
-    _stub_future_store(monkeypatch)
+    _stub_task_state_futures(monkeypatch)
     monkeypatch.setattr(mni, "init_actor_observability", lambda: None)
     monkeypatch.setattr(mni.server_config, "router_replay_mode", "disabled", raising=False)
     monkeypatch.setattr(vllm_stop, "vllm_stop_kwargs", lambda stop, default_stop_token_ids=None: {})
@@ -426,7 +426,7 @@ async def test_issue_428_register_generate_start_failure_releases_seq_slot(monke
 @pytest.mark.anyio
 async def test_issue_428_generate_emits_request_stage_spans(monkeypatch):
     _install_fake_vllm(monkeypatch)
-    _stub_future_store(monkeypatch)
+    _stub_task_state_futures(monkeypatch)
     monkeypatch.setattr(mni, "init_actor_observability", lambda: None)
     monkeypatch.setattr(mni.server_config, "router_replay_mode", "disabled", raising=False)
     monkeypatch.setattr(vllm_stop, "vllm_stop_kwargs", lambda stop, default_stop_token_ids=None: {})

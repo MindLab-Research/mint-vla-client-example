@@ -18,7 +18,7 @@ def anyio_backend() -> str:
     return "asyncio"
 
 
-class _AsyncFutureStore:
+class _AsyncTaskStateFutures:
     def __init__(self) -> None:
         self.resolved: dict[str, object] = {}
         self.failed: list[tuple[str, str]] = []
@@ -54,7 +54,7 @@ async def test_issue_517_do_create_model_persists_unmaterialized_session_without
 ) -> None:
     manager = TrainingSessionManager()
     persisted: dict[str, object] = {}
-    task_state_futures = _AsyncFutureStore()
+    task_state_futures = _AsyncTaskStateFutures()
     create_calls: list[str] = []
 
     async def _unexpected_create_training_session(_session) -> None:
@@ -131,7 +131,7 @@ async def test_issue_517_forward_backward_materializes_unmaterialized_session_on
         }
     )
     persisted: list[dict[str, object]] = []
-    task_state_futures = _AsyncFutureStore()
+    task_state_futures = _AsyncTaskStateFutures()
     order: list[str] = []
 
     async def _create_training_session(session) -> None:
@@ -228,7 +228,7 @@ async def test_issue_517_create_model_route_enqueues_without_local_training_runt
         enqueued.update(kwargs)
         return SimpleNamespace(scheduler_result={"ok": True})
 
-    task_state_futures = _AsyncFutureStore()
+    task_state_futures = _AsyncTaskStateFutures()
 
     monkeypatch.setattr(training_route, "training_manager", None)
     monkeypatch.setattr(training_route, "training_engine", None)
@@ -344,7 +344,7 @@ async def test_issue_528_do_create_model_dense_is_metadata_only_until_first_stat
     monkeypatch.setattr(
         training_route,
         "task_state_futures",
-        _AsyncFutureStore(),
+        _AsyncTaskStateFutures(),
     )
 
     req = CreateModelRequest(
@@ -421,7 +421,7 @@ async def test_issue_528_dense_materialization_happens_once_on_first_stateful_us
     monkeypatch.setattr(
         training_route,
         "task_state_futures",
-        _AsyncFutureStore(),
+        _AsyncTaskStateFutures(),
     )
 
     req = ForwardBackwardRequest(

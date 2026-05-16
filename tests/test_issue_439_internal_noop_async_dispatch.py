@@ -12,14 +12,14 @@ def anyio_backend() -> str:
 
 
 @pytest.mark.anyio
-async def test_issue_439_internal_noop_dispatch_uses_async_future_store(monkeypatch) -> None:
+async def test_issue_439_internal_noop_dispatch_uses_async_task_state_futures(monkeypatch) -> None:
     from tinker_server.backend import model_work_dispatch as dispatch
     import ray
 
     task_state_store_module = importlib.import_module("tinker_server.backend.task_state_store")
     calls: list[tuple[str, str]] = []
 
-    class _AsyncOnlyFutureStore:
+    class _AsyncOnlyTaskStateFutures:
         async def async_resolve(self, request_id: str, result) -> None:
             calls.append((str(request_id), str(result.get("op"))))
 
@@ -31,7 +31,7 @@ async def test_issue_439_internal_noop_dispatch_uses_async_future_store(monkeypa
 
     monkeypatch.setattr(dispatch, "run_async_with_otel_span", _passthrough)
     monkeypatch.setattr(ray, "is_initialized", lambda: True)
-    monkeypatch.setattr(task_state_store_module, "task_state_futures", _AsyncOnlyFutureStore())
+    monkeypatch.setattr(task_state_store_module, "task_state_futures", _AsyncOnlyTaskStateFutures())
 
     item = SimpleNamespace(
         op="internal.noop",

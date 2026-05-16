@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 
-class _StubFutureStore:
+class _StubTaskStateFutures:
     def __init__(self) -> None:
         self.created: list[str] = []
         self.queued: list[tuple[str, dict | None]] = []
@@ -58,7 +58,7 @@ class _StubModelWorkScheduler:
 def test_mint_action_route_cleans_up_future_when_enqueue_fails(monkeypatch) -> None:
     from tinker_server.routes import mint as mint_routes
 
-    task_state_futures = _StubFutureStore()
+    task_state_futures = _StubTaskStateFutures()
     scheduler = _StubModelWorkScheduler(fail=True)
 
     monkeypatch.setattr(mint_routes, "task_state_futures", task_state_futures, raising=False)
@@ -216,7 +216,7 @@ def test_mint_create_action_session_uses_bypass_cap_for_checkpoint_paths(monkeyp
 def test_mint_vla_train_step_route_enqueues_expected_request(monkeypatch) -> None:
     from tinker_server.routes import mint as mint_routes
 
-    task_state_futures = _StubFutureStore()
+    task_state_futures = _StubTaskStateFutures()
     scheduler = _StubModelWorkScheduler()
 
     session = SimpleNamespace(
@@ -335,7 +335,7 @@ def test_mint_vla_train_step_background_lowers_observation_and_supervision(monke
     from tinker_server.routes import mint as mint_routes
     from tinker_server.routes import training as training_routes
 
-    task_state_futures = _StubFutureStore()
+    task_state_futures = _StubTaskStateFutures()
     mark_calls: list[tuple[str, int]] = []
     captured: dict[str, object] = {}
 
@@ -395,7 +395,7 @@ def test_mint_vla_train_step_route_uses_detached_session_info(monkeypatch) -> No
     from tinker_server.routes import mint as mint_routes
     from tinker_server.routes import training as training_routes
 
-    task_state_futures = _StubFutureStore()
+    task_state_futures = _StubTaskStateFutures()
     scheduler = _StubModelWorkScheduler()
 
     async def _fake_route_session_info(model_id: str):
@@ -514,7 +514,7 @@ def test_model_work_dispatch_executes_mint_vla_train_step(monkeypatch) -> None:
 def test_mint_interpolate_route_enqueues_expected_request(monkeypatch) -> None:
     from tinker_server.routes import mint as mint_routes
 
-    task_state_futures = _StubFutureStore()
+    task_state_futures = _StubTaskStateFutures()
     scheduler = _StubModelWorkScheduler()
 
     monkeypatch.setattr(mint_routes, "task_state_futures", task_state_futures)
@@ -582,7 +582,7 @@ def test_mint_interpolate_do_path_claims_checkpoint_and_writes_ckpt_id(monkeypat
     from tinker_server.routes import mint as mint_routes
     import tinker_server.backend.mintx_ops as mintx_ops
 
-    task_state_futures = _StubFutureStore()
+    task_state_futures = _StubTaskStateFutures()
     written: dict[str, object] = {}
     claimed: dict[str, object] = {}
 
@@ -672,7 +672,7 @@ def test_mint_interpolate_do_path_marks_failed_checkpoint(monkeypatch, tmp_path)
     from tinker_server.routes import mint as mint_routes
     import tinker_server.backend.mintx_ops as mintx_ops
 
-    task_state_futures = _StubFutureStore()
+    task_state_futures = _StubTaskStateFutures()
     failed_marks: list[tuple[str | None, str]] = []
 
     async def _claim(**_kwargs):
@@ -719,7 +719,7 @@ def test_mint_interpolate_do_path_mark_failed_error_does_not_mask_root_failure(m
     from tinker_server.routes import mint as mint_routes
     import tinker_server.backend.mintx_ops as mintx_ops
 
-    task_state_futures = _StubFutureStore()
+    task_state_futures = _StubTaskStateFutures()
 
     async def _claim(**_kwargs):
         return "ckpt-rec-failed"
@@ -765,7 +765,7 @@ def test_mint_reverse_kl_route_and_background_path(monkeypatch) -> None:
     from tinker_server.routes import training as training_routes
     from tinker_server.models.mint_types import ForwardBackwardReverseKLRequest
 
-    task_state_futures = _StubFutureStore()
+    task_state_futures = _StubTaskStateFutures()
     scheduler = _StubModelWorkScheduler()
 
     class _StubSession:
@@ -908,7 +908,7 @@ def test_mint_reverse_kl_route_uses_detached_training_info_without_route_runtime
     from tinker_server.routes import mint as mint_routes
     from tinker_server.routes import training as training_routes
 
-    task_state_futures = _StubFutureStore()
+    task_state_futures = _StubTaskStateFutures()
     scheduler = _StubModelWorkScheduler()
 
     async def _get_training_route_session_info(model_id: str):
@@ -1015,7 +1015,7 @@ def test_mint_reverse_kl_route_refreshes_detached_enqueue_protection(monkeypatch
     from tinker_server.routes import mint as mint_routes
     from tinker_server.routes import training as training_routes
 
-    task_state_futures = _StubFutureStore()
+    task_state_futures = _StubTaskStateFutures()
     scheduler = _StubModelWorkScheduler()
     protected: list[dict] = []
 

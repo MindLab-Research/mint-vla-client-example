@@ -14,7 +14,7 @@ from tinker_server.models.types import ComputeLogprobsRequest, ModelInput, Sampl
 from tinker_server.routes import sampling as sampling_route
 
 
-class _StubFutureStore:
+class _StubTaskStateFutures:
     def __init__(self):
         self.failed: dict[str, str] = {}
 
@@ -69,7 +69,7 @@ def test_issue_439_reverse_kl_entrypoints_exist() -> None:
 
 
 def test_issue_439_asample_cancellation_decrements_active_requests(monkeypatch: pytest.MonkeyPatch) -> None:
-    task_state_futures = _StubFutureStore()
+    task_state_futures = _StubTaskStateFutures()
     session_manager = _StubSessionManager()
     obs = RuntimeObservability()
 
@@ -119,7 +119,7 @@ def test_issue_439_asample_cancellation_decrements_active_requests(monkeypatch: 
 
 
 def test_issue_439_compute_logprobs_cancellation_decrements_active_requests(monkeypatch: pytest.MonkeyPatch) -> None:
-    task_state_futures = _StubFutureStore()
+    task_state_futures = _StubTaskStateFutures()
     session_manager = _StubSessionManager()
     obs = RuntimeObservability()
 

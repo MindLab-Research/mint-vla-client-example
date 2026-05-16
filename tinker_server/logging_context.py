@@ -64,7 +64,7 @@ _HTTP_REQUEST_COUNTER: Any | None = None
 _HTTP_DURATION_HISTOGRAM: Any | None = None
 _HTTP_ERROR_COUNTER: Any | None = None
 _SAMPLING_ADMISSION_COUNTER: Any | None = None
-_FUTURE_STORE_TIMEOUT_COUNTER: Any | None = None
+_TASK_STATE_FUTURES_TIMEOUT_COUNTER: Any | None = None
 _VLLM_ACTOR_REQUEST_COUNTER: Any | None = None
 _VLLM_ACTOR_REQUEST_DURATION_HISTOGRAM: Any | None = None
 _TRAINING_OPERATION_COUNTER: Any | None = None
@@ -595,7 +595,7 @@ def _configure_opentelemetry(root_logger: logging.Logger) -> None:
     """Configure OTLP trace/metric/log export (APMPlus or collector)."""
     global _OTEL_ENABLED, _OTEL_INITIALIZED, _OTEL_LOG_HANDLER_ATTACHED
     global _HTTP_REQUEST_COUNTER, _HTTP_DURATION_HISTOGRAM, _HTTP_ERROR_COUNTER
-    global _SAMPLING_ADMISSION_COUNTER, _FUTURE_STORE_TIMEOUT_COUNTER
+    global _SAMPLING_ADMISSION_COUNTER, _TASK_STATE_FUTURES_TIMEOUT_COUNTER
     global _VLLM_ACTOR_REQUEST_COUNTER, _VLLM_ACTOR_REQUEST_DURATION_HISTOGRAM
     global _TRAINING_OPERATION_COUNTER, _TRAINING_OPERATION_DURATION_HISTOGRAM
     global _MEGATRON_SESSION_SWITCH_COUNTER, _MEGATRON_SESSION_SWITCH_DURATION_COUNTER
@@ -677,7 +677,7 @@ def _configure_opentelemetry(root_logger: logging.Logger) -> None:
             unit="{decision}",
             description="Sampling admission decisions observed by mint",
         )
-        _FUTURE_STORE_TIMEOUT_COUNTER = meter.create_counter(
+        _TASK_STATE_FUTURES_TIMEOUT_COUNTER = meter.create_counter(
             "mint_task_state_futures_timeout_events_total",
             unit="{timeout}",
             description="task state future queue and execution timeout events observed by mint",
@@ -823,8 +823,8 @@ def record_task_state_futures_timeout_metric(*, kind: str, op: str | None = None
     if isinstance(op, str) and op.strip():
         attrs["op"] = op.strip()
     try:
-        if _FUTURE_STORE_TIMEOUT_COUNTER is not None:
-            _FUTURE_STORE_TIMEOUT_COUNTER.add(1, attributes=attrs)
+        if _TASK_STATE_FUTURES_TIMEOUT_COUNTER is not None:
+            _TASK_STATE_FUTURES_TIMEOUT_COUNTER.add(1, attributes=attrs)
     except Exception:
         pass
 
