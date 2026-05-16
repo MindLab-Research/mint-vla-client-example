@@ -324,9 +324,9 @@ async def execute_model_work_item(item: Any, *, component: str = "model_work_dis
 
     if op == "internal.noop":
         async def _run():
-            from .future_store import future_store
+            from .task_state_store import task_state_futures
 
-            await future_store.async_resolve(
+            await task_state_futures.async_resolve(
                 str(item.request_id),
                 {"ok": True, "op": "internal.noop", "ts": time.time()},
             )

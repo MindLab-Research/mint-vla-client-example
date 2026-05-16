@@ -8,7 +8,7 @@ from concurrent.futures import Future
 import anyio
 import pytest
 
-from tinker_server.backend.future_store import FutureStatus
+from tinker_server.backend.task_state_store import FutureStatus
 from tinker_server.models.types import (
     AdamParams,
     ForwardBackwardInput,
@@ -455,7 +455,7 @@ def test_issue_360_retrieve_future_pending_uses_async_store_calls(monkeypatch):
         {"queue_state": "queued", "stage": "queued", "op": "sampling.asample", "actor_name": "actor-a", "model_id": "model-a"}
     )
     pool = _AsyncOnlyResourcePool()
-    monkeypatch.setattr(futures_route, "future_store", store)
+    monkeypatch.setattr(futures_route, "task_state_futures", store)
     import tinker_server.backend.api_work_queue as wq
     import tinker_server.config as config_module
     import tinker_server.backend.resource_pool as rp
@@ -477,7 +477,7 @@ def test_issue_360_retrieve_future_pending_uses_async_store_calls(monkeypatch):
 
 def test_issue_360_retrieve_future_terminal_uses_async_result(monkeypatch):
     store = _AsyncOnlyTerminalFutureStore()
-    monkeypatch.setattr(futures_route, "future_store", store)
+    monkeypatch.setattr(futures_route, "task_state_futures", store)
 
     ray_mod = types.ModuleType("ray")
     ray_mod.is_initialized = lambda: False  # type: ignore[attr-defined]
@@ -497,7 +497,7 @@ def test_issue_360_retrieve_future_unknown_admin_uses_async_debug_snapshot(monke
     from fastapi import HTTPException
 
     store = _AsyncOnlyUnknownFutureStore()
-    monkeypatch.setattr(futures_route, "future_store", store)
+    monkeypatch.setattr(futures_route, "task_state_futures", store)
 
     body = FutureRetrieveRequest(request_id="rid_unknown_async")
     response = _response_stub()
@@ -506,7 +506,7 @@ def test_issue_360_retrieve_future_unknown_admin_uses_async_debug_snapshot(monke
         anyio.run(futures_route.retrieve_future, body, _request_stub(), response)
 
     assert exc.value.status_code == 404
-    assert exc.value.detail["future_store"] == {"status": "debug"}
+    assert exc.value.detail["task_state_store"] == {"status": "debug"}
     assert ("async_get_status", "rid_unknown_async") in store.calls
     assert any(name == "async_debug_snapshot" for name, _value in store.calls)
 

@@ -49,7 +49,7 @@ async def enqueue_model_work(
 
     scheduler_confirmed = False
     if future_store_client is None:
-        from .future_store import future_store as store
+        from .task_state_store import task_state_futures as store
     else:
         store = future_store_client
     if scheduler_client is None:

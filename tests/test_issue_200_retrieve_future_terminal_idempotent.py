@@ -1,7 +1,7 @@
 import anyio
 from types import SimpleNamespace
 
-from tinker_server.backend.future_store import FutureStatus
+from tinker_server.backend.task_state_store import FutureStatus
 from tinker_server.models.types import FutureRetrieveRequest
 from tinker_server.routes import futures as futures_route
 
@@ -42,7 +42,7 @@ def _response_stub():
 
 def test_done_retrieve_does_not_evict_terminal_future(monkeypatch):
     stub = _StubFutureStore(FutureStatus.DONE, result={"ok": "rid_done"})
-    monkeypatch.setattr(futures_route, "future_store", stub)
+    monkeypatch.setattr(futures_route, "task_state_futures", stub)
 
     body = FutureRetrieveRequest(request_id="rid_done")
     response = _response_stub()
@@ -54,7 +54,7 @@ def test_done_retrieve_does_not_evict_terminal_future(monkeypatch):
 
 def test_failed_retrieve_does_not_evict_terminal_future(monkeypatch):
     stub = _StubFutureStore(FutureStatus.FAILED, error="error:rid_failed")
-    monkeypatch.setattr(futures_route, "future_store", stub)
+    monkeypatch.setattr(futures_route, "task_state_futures", stub)
 
     body = FutureRetrieveRequest(request_id="rid_failed")
     response = _response_stub()
@@ -66,7 +66,7 @@ def test_failed_retrieve_does_not_evict_terminal_future(monkeypatch):
 
 def test_retrieved_result_is_served_idempotently(monkeypatch):
     stub = _StubFutureStore(FutureStatus.RETRIEVED, result={"ok": "rid_retrieved"})
-    monkeypatch.setattr(futures_route, "future_store", stub)
+    monkeypatch.setattr(futures_route, "task_state_futures", stub)
 
     body = FutureRetrieveRequest(request_id="rid_retrieved")
     response = _response_stub()
@@ -78,7 +78,7 @@ def test_retrieved_result_is_served_idempotently(monkeypatch):
 
 def test_retrieved_error_is_served_idempotently(monkeypatch):
     stub = _StubFutureStore(FutureStatus.RETRIEVED, result=None, error="error:rid_retrieved_failed")
-    monkeypatch.setattr(futures_route, "future_store", stub)
+    monkeypatch.setattr(futures_route, "task_state_futures", stub)
 
     body = FutureRetrieveRequest(request_id="rid_retrieved_failed")
     response = _response_stub()

@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from .future_store import FutureStatus, FutureStore, future_store
+from .future_store import FutureStore
+from .task_state_store import FutureStatus, task_state_futures
 
 if TYPE_CHECKING:
     from .verl_inference import VerlInferenceEngine
 
-__all__ = ["FutureStatus", "FutureStore", "future_store", "VerlInferenceEngine"]
+__all__ = ["FutureStatus", "FutureStore", "task_state_futures", "VerlInferenceEngine"]
 
 
 def __getattr__(name: str):

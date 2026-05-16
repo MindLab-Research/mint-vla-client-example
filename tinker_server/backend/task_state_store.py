@@ -7,11 +7,13 @@ import asyncio
 import threading
 import time
 from contextlib import contextmanager
+from enum import Enum
 from pathlib import Path
 from typing import Any, Iterator
 
 from ..config import PFS_PYTHONPATH, actor_runtime_env, config as server_config, otel_env_vars
 from .async_ray_control import async_get_ray_ref, sync_get_ray_ref
+from .queue_execution_context import ModelWorkFinalize, get_current_model_work_finalize_buffer
 
 
 ACTIVE_TASK_STATUSES = frozenset({"pending", "queued", "running", "assigned", "leased", "finalizing"})
@@ -34,6 +36,14 @@ class TaskStateStoreUnavailableError(TaskStateStoreError):
     pass
 
 
+class FutureStatus(Enum):
+    PENDING = "pending"
+    DONE = "done"
+    FAILED = "failed"
+    EXPIRED = "expired"
+    RETRIEVED = "retrieved"
+
+
 def _now(now: float | None = None) -> float:
     return time.time() if now is None else float(now)
 
@@ -52,6 +62,80 @@ def _json_loads(value: str | bytes | None) -> dict[str, Any]:
     out = json.loads(value)
     if not isinstance(out, dict):
         raise TaskStateStoreError(f"expected JSON object, got {type(out).__name__}")
+    return out
+
+
+def _status_from_task_record(record: dict[str, Any]) -> FutureStatus:
+    status = str(record.get("status") or "")
+    if status in {"pending", "queued", "assigned", "leased", "running", "finalizing"}:
+        return FutureStatus.PENDING
+    if status == "done":
+        return FutureStatus.DONE
+    if status in {"failed", "cancelled"}:
+        return FutureStatus.FAILED
+    if status == "expired":
+        return FutureStatus.EXPIRED
+    if status == "retrieved":
+        return FutureStatus.RETRIEVED
+    raise KeyError(f"Unknown task status for request_id={record.get('request_id')!r}: {status!r}")
+
+
+def _is_training_step_op(op: Any) -> bool:
+    return str(op or "") in {"training.optim_step", "training.train_step"}
+
+
+def _extract_training_step(result: Any) -> int | None:
+    if not isinstance(result, dict):
+        return None
+    metrics = result.get("metrics")
+    if not isinstance(metrics, dict):
+        return None
+    step = metrics.get("step")
+    if isinstance(step, bool):
+        return None
+    if isinstance(step, int):
+        return int(step)
+    if isinstance(step, float) and step.is_integer():
+        return int(step)
+    return None
+
+
+def _sync_training_session_step(meta: dict[str, Any] | None, result: Any) -> Any:
+    if not isinstance(meta, dict) or not _is_training_step_op(meta.get("op")):
+        return result
+    model_id = meta.get("model_id")
+    if not model_id:
+        return result
+
+    try:
+        from .training_session_store import (
+            bump_training_session_step_best_effort,
+            set_training_session_step_best_effort,
+        )
+
+        step = _extract_training_step(result)
+        if step is None:
+            bump_training_session_step_best_effort(str(model_id))
+            return result
+
+        set_training_session_step_best_effort(str(model_id), int(step))
+        if isinstance(result, dict):
+            metrics = result.get("metrics")
+            if isinstance(metrics, dict):
+                metrics["step"] = int(step)
+        return result
+    except Exception:
+        return result
+
+
+def _meta_with_request_op(meta: dict[str, Any] | None, request_op: Any) -> dict[str, Any]:
+    out = dict(meta or {})
+    op = out.get("op")
+    if isinstance(op, str) and op.strip():
+        return out
+    op = str(request_op or "").strip()
+    if op:
+        out["op"] = op
     return out
 
 
@@ -1319,4 +1403,289 @@ class TaskStateStoreClient:
         return out
 
 
+class TaskStateFutureStore:
+    """Future polling facade backed by TaskStateStore and TaskPayloadStore.
+
+    This owns the external Tinker future lifecycle while the durable state lives
+    in TaskStateStore. It intentionally mirrors the old async future methods so
+    routes can migrate without changing public polling semantics.
+    """
+
+    def __init__(
+        self,
+        *,
+        task_state_client: TaskStateStoreClient | None = None,
+        payload_store: Any | None = None,
+    ) -> None:
+        self._task_state = task_state_client if task_state_client is not None else task_state_store
+        self._payload_store = payload_store
+
+    @property
+    def _payloads(self) -> Any:
+        if self._payload_store is None:
+            from .task_payload_store import TaskPayloadStore
+
+            self._payload_store = TaskPayloadStore()
+        return self._payload_store
+
+    async def async_create_with_id(self, request_id: str) -> str:
+        await self._task_state.async_ensure_task(request_id=str(request_id), status="pending")
+        return str(request_id)
+
+    async def async_create_model_work_with_id(
+        self,
+        request_id: str,
+        *,
+        op: str,
+        domain_key: str,
+        request_json: bytes,
+        meta: dict[str, Any] | None = None,
+        payload_hash: str | None = None,
+    ) -> str:
+        await self._task_state.async_ensure_task(
+            request_id=str(request_id),
+            op=str(op),
+            domain_key=str(domain_key),
+            request_json=bytes(request_json),
+            payload_hash=payload_hash,
+            metadata=dict(meta or {}),
+            status="pending",
+        )
+        return str(request_id)
+
+    async def async_ensure_pending(self, request_id: str, meta: dict[str, Any] | None = None) -> dict[str, Any]:
+        out = await self._task_state.async_ensure_task(
+            request_id=str(request_id),
+            op=str((meta or {}).get("op") or "unknown"),
+            domain_key=str((meta or {}).get("domain_key") or "future:default"),
+            metadata=dict(meta or {}),
+            status="pending",
+        )
+        return {"created": bool(out.get("created")), "meta": out.get("record", {}).get("metadata") or {}}
+
+    async def async_mark_queued(self, request_id: str, meta: dict[str, Any] | None = None) -> None:
+        await self._task_state.async_ensure_task(
+            request_id=str(request_id),
+            op=str((meta or {}).get("op") or "unknown"),
+            domain_key=str((meta or {}).get("domain_key") or "future:default"),
+            metadata={**dict(meta or {}), "queue_state": "queued"},
+            status="queued",
+        )
+
+    async def async_mark_running(self, request_id: str, meta: dict[str, Any] | None = None) -> None:
+        await self._task_state.async_update_task_metadata(
+            request_id=str(request_id),
+            metadata={**dict(meta or {}), "queue_state": "running"},
+            status="running",
+        )
+
+    async def async_update_meta(self, request_id: str, meta: dict[str, Any] | None = None) -> None:
+        await self._task_state.async_update_task_metadata(
+            request_id=str(request_id),
+            metadata=dict(meta or {}),
+        )
+
+    async def async_resolve(self, request_id: str, result: Any) -> None:
+        if self._buffer_model_work_finalize(kind="resolve", request_id=request_id, payload=result):
+            return
+        meta = await self.async_get_meta(request_id)
+        result = _sync_training_session_step(meta, result)
+        payload = await asyncio.to_thread(
+            self._payloads.write_json_payload,
+            request_id=str(request_id),
+            attempt_id=str((meta or {}).get("model_work_attempt_id") or "future"),
+            payload=result,
+        )
+        await self._task_state.async_complete_task_success(
+            request_id=str(request_id),
+            result_path=str(payload["path"]),
+            result_checksum=str(payload["checksum"]),
+            result_size_bytes=int(payload["size_bytes"]),
+            metadata={"done_at": time.time(), "final_status": FutureStatus.DONE.value},
+        )
+
+    async def async_fail(self, request_id: str, error: str) -> None:
+        if self._buffer_model_work_finalize(kind="fail", request_id=request_id, payload=str(error)):
+            return
+        try:
+            await self._task_state.async_complete_task_failure(
+                request_id=str(request_id),
+                error=str(error),
+                metadata={"failed_at": time.time(), "done_at": time.time(), "final_status": FutureStatus.FAILED.value},
+            )
+        except (KeyError, TaskStateNotFoundError):
+            await self._task_state.async_ensure_task(
+                request_id=str(request_id),
+                status="pending",
+                metadata={"failed_at": time.time()},
+            )
+            await self._task_state.async_complete_task_failure(
+                request_id=str(request_id),
+                error=str(error),
+                metadata={"failed_at": time.time(), "done_at": time.time(), "final_status": FutureStatus.FAILED.value},
+            )
+
+    async def async_fail_if_pending_meta_matches(
+        self,
+        request_id: str,
+        error: str,
+        *,
+        expected_meta: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        try:
+            record = await self._task_state.async_get_task(str(request_id))
+        except (KeyError, TaskStateNotFoundError):
+            return {"failed": False, "reason": "unknown"}
+        if _status_from_task_record(record) != FutureStatus.PENDING:
+            return {"failed": False, "reason": "not_pending"}
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        for key, value in dict(expected_meta or {}).items():
+            if metadata.get(key) != value:
+                return {"failed": False, "reason": "meta_mismatch"}
+        await self.async_fail(str(request_id), str(error))
+        return {"failed": True}
+
+    async def async_get_status(self, request_id: str) -> FutureStatus:
+        try:
+            record = await self._task_state.async_get_task(str(request_id))
+        except (KeyError, TaskStateNotFoundError):
+            raise KeyError(f"Unknown request_id: {request_id}") from None
+        return _status_from_task_record(record)
+
+    async def async_get_result(self, request_id: str) -> Any:
+        record = await self._task_state.async_get_task(str(request_id))
+        if str(record.get("status")) == "retrieved":
+            raise KeyError(f"Future already retrieved: {request_id}")
+        if str(record.get("status")) != "done":
+            raise KeyError(f"Future is not done: {request_id}")
+        result_path = record.get("result_path")
+        if not isinstance(result_path, str) or not result_path:
+            raise KeyError(f"Future result payload missing: {request_id}")
+        payload = await asyncio.to_thread(
+            self._payloads.read_json_payload,
+            path=result_path,
+            expected_checksum=record.get("result_checksum"),
+        )
+        await self._task_state.async_mark_task_retrieved(request_id=str(request_id))
+        return payload
+
+    async def async_get_error(self, request_id: str) -> str | None:
+        record = await self._task_state.async_get_task(str(request_id))
+        return None if record.get("error") is None else str(record.get("error"))
+
+    async def async_get_meta(self, request_id: str) -> dict[str, Any] | None:
+        record = await self._task_state.async_get_task(str(request_id))
+        metadata = record.get("metadata")
+        return dict(metadata) if isinstance(metadata, dict) else None
+
+    async def async_list_pending_by_meta(
+        self,
+        filters: dict[str, Any] | None = None,
+        *,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        records = await self._task_state.async_list_tasks_by_metadata(
+            filters=dict(filters or {}),
+            statuses=["pending", "queued", "assigned", "leased", "running", "finalizing"],
+            limit=int(limit),
+        )
+        return [
+            {
+                "request_id": record["request_id"],
+                "status": record["status"],
+                "meta": record.get("metadata") or {},
+            }
+            for record in records
+        ]
+
+    async def async_fail_training_requests_for_model(self, model_id: str, error: str) -> list[str]:
+        return await self._fail_requests_by_metadata(
+            filters={"model_id": str(model_id)},
+            op_prefix="training.",
+            error=error,
+        )
+
+    async def async_fail_sampling_requests_for_session(self, sampling_session_id: str, error: str) -> list[str]:
+        return await self._fail_requests_by_metadata(
+            filters={"sampling_session_id": str(sampling_session_id)},
+            op_prefix="sampling.",
+            error=error,
+        )
+
+    async def _fail_requests_by_metadata(
+        self,
+        *,
+        filters: dict[str, Any],
+        op_prefix: str,
+        error: str,
+    ) -> list[str]:
+        records = await self._task_state.async_list_tasks_by_metadata(
+            filters=dict(filters),
+            statuses=["pending", "queued", "assigned", "leased", "running", "finalizing"],
+            limit=10000,
+        )
+        failed: list[str] = []
+        for record in records:
+            metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+            op = metadata.get("op") or record.get("op")
+            if not str(op or "").startswith(op_prefix):
+                continue
+            await self.async_fail(str(record["request_id"]), str(error))
+            failed.append(str(record["request_id"]))
+        return failed
+
+    async def async_forget(self, request_id: str) -> None:
+        await self._task_state.async_forget_task(request_id=str(request_id))
+
+    async def async_cleanup(self, request_id: str) -> None:
+        try:
+            await self._task_state.async_mark_task_retrieved(request_id=str(request_id))
+        except Exception:
+            await self._task_state.async_forget_task(request_id=str(request_id))
+
+    async def async_reap(self) -> dict[str, list[str]]:
+        return {"expired": [], "timed_out": []}
+
+    async def async_fail_stale_running_requests(self, active_consumer_job_id: str, error: str) -> list[str]:
+        records = await self._task_state.async_list_tasks_by_metadata(
+            filters={"consumer_job_id": str(active_consumer_job_id)},
+            statuses=["running"],
+            limit=10000,
+        )
+        failed: list[str] = []
+        for record in records:
+            await self.async_fail(str(record["request_id"]), str(error))
+            failed.append(str(record["request_id"]))
+        return failed
+
+    async def async_ensure_started(self) -> None:
+        await self._task_state.async_ensure_started()
+
+    async def async_ensure_ready(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
+        _ = timeout_s
+        return await self._task_state.async_stats()
+
+    def metrics_snapshot(self) -> dict[str, Any]:
+        return {"backend": "task_state_store"}
+
+    async def async_rss_bytes(self, *, timeout_s: float = 10.0) -> int:
+        _ = timeout_s
+        return 0
+
+    async def async_debug_snapshot(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
+        _ = timeout_s
+        try:
+            return {"backend": "task_state_store", "task_state_store": await self._task_state.async_stats()}
+        except Exception as e:
+            return {"backend": "task_state_store", "error": f"{type(e).__name__}: {e}"}
+
+    def _buffer_model_work_finalize(self, *, kind: str, request_id: str, payload: Any) -> bool:
+        buffer = get_current_model_work_finalize_buffer()
+        if buffer is None:
+            return False
+        buffer.finalization = ModelWorkFinalize(kind=kind, request_id=str(request_id), payload=payload)
+        return True
+
+
 task_state_store = TaskStateStoreClient()
+task_state_futures = TaskStateFutureStore()

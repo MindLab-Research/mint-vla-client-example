@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse
 
 from .auth_identity import get_apikey_id as get_request_apikey_id
 from .auth_identity import get_request_observability_context
-from .backend.future_store import FutureStoreUnavailableError
+from .backend.task_state_store import TaskStateStoreUnavailableError
 from .backend.session_manager import SessionManager
 from .config import config
 from .gateway import close_http_clients
@@ -223,7 +223,7 @@ async def lifespan(app: FastAPI):
     # ==========================================================================
     clear_startup_degraded_state()
     clear_runtime_degraded_state()
-    from .backend.future_store import future_store
+    from .backend.task_state_store import task_state_futures
     from .backend.config_actor import async_ensure_started as async_ensure_config_actor_started
     from .backend.gateway_session_store import ensure_ready as ensure_gateway_session_store_ready
     from .backend.owner_runtime_supervisor import owner_runtime_supervisor
@@ -258,7 +258,7 @@ async def lifespan(app: FastAPI):
         raise RuntimeError("usage billing postgres health check failed")
     if startup_owner:
         await async_ensure_config_actor_started()
-        await future_store.async_ensure_started()
+        await task_state_futures.async_ensure_started()
         ensure_gateway_session_store_ready()
         ensure_sampling_session_store_ready()
         session_heartbeat_store.ensure_ready()
@@ -493,7 +493,7 @@ async def lifespan(app: FastAPI):
                         current_epoch,
                     )
                     await async_ensure_config_actor_started()
-                    await future_store.async_ensure_started()
+                    await task_state_futures.async_ensure_started()
                     ensure_gateway_session_store_ready()
                     ensure_sampling_session_store_ready()
                     session_heartbeat_store.ensure_ready()
@@ -568,11 +568,11 @@ app = FastAPI(
     docs_url=None,  # Disable built-in Swagger UI
 )
 
-@app.exception_handler(FutureStoreUnavailableError)
-async def future_store_unavailable_handler(_: Request, __: FutureStoreUnavailableError) -> JSONResponse:
+@app.exception_handler(TaskStateStoreUnavailableError)
+async def task_state_store_unavailable_handler(_: Request, __: TaskStateStoreUnavailableError) -> JSONResponse:
     return JSONResponse(
         status_code=503,
-        content={"detail": "Ray unavailable: FutureStore requires Ray"},
+        content={"detail": "TaskStateStore unavailable"},
     )
 
 

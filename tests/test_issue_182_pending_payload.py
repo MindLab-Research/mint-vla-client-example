@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tinker_server.backend.future_store import FutureStatus
+from tinker_server.backend.task_state_store import FutureStatus
 from tinker_server.models.types import FutureRetrieveRequest
 from tinker_server.routes import futures as futures_route
 
@@ -93,7 +93,7 @@ def test_issue_182_pending_payload_model_work_scheduler_queued(monkeypatch):
         "affinity_group": "lora:session-a:generation:7",
         "ordering_key": "session:session-a",
     }
-    monkeypatch.setattr(futures_route, "future_store", _StubFutureStore(meta))
+    monkeypatch.setattr(futures_route, "task_state_futures", _StubFutureStore(meta))
     scheduler = _install_scheduler(monkeypatch)
 
     body = FutureRetrieveRequest(request_id="rid_model_work_scheduler_queued")
@@ -116,7 +116,7 @@ def test_issue_182_pending_payload_model_work_scheduler_queued(monkeypatch):
 
 def test_issue_182_pending_payload_defaults_queued_to_model_work_scheduler(monkeypatch):
     meta = {"queue_state": "queued", "stage": "queued", "op": "sampling.asample"}
-    monkeypatch.setattr(futures_route, "future_store", _StubFutureStore(meta))
+    monkeypatch.setattr(futures_route, "task_state_futures", _StubFutureStore(meta))
     scheduler = _install_scheduler(monkeypatch)
 
     body = FutureRetrieveRequest(request_id="rid_queue_default")
@@ -135,7 +135,7 @@ def test_issue_182_pending_payload_defaults_queued_to_model_work_scheduler(monke
 
 def test_issue_182_pending_payload_reason_null_when_not_queued(monkeypatch):
     meta = {"queue_state": "running", "stage": "prefill", "op": "sampling.asample"}
-    monkeypatch.setattr(futures_route, "future_store", _StubFutureStore(meta))
+    monkeypatch.setattr(futures_route, "task_state_futures", _StubFutureStore(meta))
 
     body = FutureRetrieveRequest(request_id="rid_running")
     response = _response_stub()
@@ -156,7 +156,7 @@ def test_issue_182_pending_payload_progress_headers(monkeypatch):
         "progress": {"tokens_generated": 5, "max_tokens": 12},
         "last_progress_at": 0.0,
     }
-    monkeypatch.setattr(futures_route, "future_store", _StubFutureStore(meta))
+    monkeypatch.setattr(futures_route, "task_state_futures", _StubFutureStore(meta))
 
     body = FutureRetrieveRequest(request_id="rid_decode")
     response = _response_stub()
@@ -180,7 +180,7 @@ def test_issue_182_pending_payload_training_correlation_fields(monkeypatch):
         "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
         "backend": "megatron",
     }
-    monkeypatch.setattr(futures_route, "future_store", _StubFutureStore(meta))
+    monkeypatch.setattr(futures_route, "task_state_futures", _StubFutureStore(meta))
     _install_scheduler(monkeypatch)
 
     body = FutureRetrieveRequest(request_id="rid_training_meta")
@@ -268,7 +268,7 @@ def test_issue_182_pending_payload_exposes_stage_timing(monkeypatch):
         "lora_load_s": 3.0,
         "generate_s": 8.0,
     }
-    monkeypatch.setattr(futures_route, "future_store", _StubFutureStore(meta))
+    monkeypatch.setattr(futures_route, "task_state_futures", _StubFutureStore(meta))
 
     body = FutureRetrieveRequest(request_id="rid_stage_timing")
     response = _response_stub()
@@ -298,7 +298,7 @@ def test_issue_182_scheduled_alias_is_normalized_to_model_work_scheduler(monkeyp
         "scheduler_session_id": "sess-182",
         "scheduler_domain_key_source": "replica_key",
     }
-    monkeypatch.setattr(futures_route, "future_store", _StubFutureStore(meta))
+    monkeypatch.setattr(futures_route, "task_state_futures", _StubFutureStore(meta))
     _install_scheduler(monkeypatch)
 
     body = FutureRetrieveRequest(request_id="rid_sched_alias")
@@ -323,7 +323,7 @@ def test_issue_593_model_work_scheduler_orphan_fails_on_retrieve(monkeypatch):
         "domain_key": "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
     }
     store = _StubFutureStore(meta)
-    monkeypatch.setattr(futures_route, "future_store", store)
+    monkeypatch.setattr(futures_route, "task_state_futures", store)
     scheduler = _install_scheduler(monkeypatch, present=False)
 
     body = FutureRetrieveRequest(request_id="rid_orphaned_model_work")
@@ -337,7 +337,7 @@ def test_issue_593_model_work_scheduler_orphan_fails_on_retrieve(monkeypatch):
 
 def test_issue_182_non_sampling_status_is_generic(monkeypatch):
     meta = {"queue_state": "running", "stage": "prefill", "op": "training.train_step"}
-    monkeypatch.setattr(futures_route, "future_store", _StubFutureStore(meta))
+    monkeypatch.setattr(futures_route, "task_state_futures", _StubFutureStore(meta))
 
     body = FutureRetrieveRequest(request_id="rid_train_running")
     response = _response_stub()
@@ -349,7 +349,7 @@ def test_issue_182_non_sampling_status_is_generic(monkeypatch):
 
 def test_issue_182_done_result_cleans_future_without_capacity_release(monkeypatch):
     store = _StubFutureStore({}, status=FutureStatus.DONE, result={"ok": True})
-    monkeypatch.setattr(futures_route, "future_store", store)
+    monkeypatch.setattr(futures_route, "task_state_futures", store)
 
     body = FutureRetrieveRequest(request_id="rid_done")
     response = _response_stub()

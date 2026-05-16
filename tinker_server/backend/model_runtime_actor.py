@@ -19,12 +19,11 @@ from ..logging_context import (
     set_trace_id,
 )
 from .async_ray_control import sync_get_ray_ref
-from .future_store import FutureStatus, future_store
 from .model_actor_supervisor import consumer_id_for_replica, queue_id_for_replica
 from .model_work_scheduler import ModelWorkSchedulerClient, model_work_scheduler
 from .queue_execution_context import ModelWorkFinalizeBuffer, model_work_execution_context
 from .task_payload_store import TaskPayloadStore
-from .task_state_store import task_state_store
+from .task_state_store import FutureStatus, task_state_futures, task_state_store
 
 logger = logging.getLogger(__name__)
 
@@ -246,7 +245,7 @@ class ModelRuntimeActor:
             token_budget=None if token_budget is None else int(token_budget),
         )
         self._scheduler = scheduler_client if scheduler_client is not None else model_work_scheduler
-        self._future_store = future_store_client if future_store_client is not None else future_store
+        self._future_store = future_store_client if future_store_client is not None else task_state_futures
         self._task_state_store = (
             task_state_store_client if task_state_store_client is not None else task_state_store
         )

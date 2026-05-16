@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from tinker_server.backend.future_store import FutureStatus
+from tinker_server.backend.task_state_store import FutureStatus
 from tinker_server.backend.model_runtime_actor import (
     ModelRuntimeActor,
     _default_executor,

@@ -16,7 +16,7 @@ async def test_issue_439_internal_noop_dispatch_uses_async_future_store(monkeypa
     from tinker_server.backend import api_work_queue_dispatch as dispatch
     import ray
 
-    future_store_module = importlib.import_module("tinker_server.backend.future_store")
+    task_state_store_module = importlib.import_module("tinker_server.backend.task_state_store")
     calls: list[tuple[str, str]] = []
 
     class _AsyncOnlyFutureStore:
@@ -31,7 +31,7 @@ async def test_issue_439_internal_noop_dispatch_uses_async_future_store(monkeypa
 
     monkeypatch.setattr(dispatch, "run_async_with_otel_span", _passthrough)
     monkeypatch.setattr(ray, "is_initialized", lambda: True)
-    monkeypatch.setattr(future_store_module, "future_store", _AsyncOnlyFutureStore())
+    monkeypatch.setattr(task_state_store_module, "task_state_futures", _AsyncOnlyFutureStore())
 
     item = SimpleNamespace(
         op="internal.noop",

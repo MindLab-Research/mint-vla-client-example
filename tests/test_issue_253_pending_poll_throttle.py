@@ -1,7 +1,7 @@
 import anyio
 from types import SimpleNamespace
 
-from tinker_server.backend.future_store import FutureStatus
+from tinker_server.backend.task_state_store import FutureStatus
 from tinker_server.models.types import FutureRetrieveRequest
 from tinker_server.routes import futures as futures_route
 
@@ -42,7 +42,7 @@ def test_pending_retrieve_short_circuits_repeat_polls(monkeypatch):
     stub = _StubFutureStore()
     clock = {"now": 1000.0}
 
-    monkeypatch.setattr(futures_route, "future_store", stub)
+    monkeypatch.setattr(futures_route, "task_state_futures", stub)
     monkeypatch.setattr(futures_route.time, "time", lambda: clock["now"])
     monkeypatch.setattr(futures_route, "_PENDING_HINTS", futures_route.OrderedDict())
     import tinker_server.backend.api_work_queue as wq
