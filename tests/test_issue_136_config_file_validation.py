@@ -99,16 +99,13 @@ def test_config_file_sampling_window_loads(tmp_path):
     assert cfg.sampling.sample_coalesce_window_ms == 12.5
 
 
-def test_config_file_future_replay_settings_load(tmp_path):
+def test_config_file_retrieve_future_settings_load(tmp_path):
     p = tmp_path / "ok.toml"
     p.write_text(
         "\n".join(
             [
                 "[future]",
-                "replay_root_dir = '/tmp/future-replay'",
-                "replay_hot_ttl_s = 30",
-                "replay_disk_ttl_s = 300",
-                "replay_sweep_interval_s = 600",
+                "retrieve_future_hot_ttl_s = 30",
                 "retrieve_future_grace_s = 45",
                 "retrieve_future_min_poll_s = 2.5",
             ]
@@ -117,26 +114,9 @@ def test_config_file_future_replay_settings_load(tmp_path):
         encoding="utf-8",
     )
     cfg = load_tinker_config_file(p)
-    assert cfg.future.replay_root_dir == "/tmp/future-replay"
-    assert cfg.future.replay_hot_ttl_s == 30
-    assert cfg.future.replay_disk_ttl_s == 300
-    assert cfg.future.replay_sweep_interval_s == 600
+    assert cfg.future.retrieve_future_hot_ttl_s == 30
     assert cfg.future.retrieve_future_grace_s == 45
     assert cfg.future.retrieve_future_min_poll_s == 2.5
-
-
-def test_server_config_future_replay_root_defaults_to_dev_without_auth():
-    cfg = ServerConfig.from_sources(environ={}, config_path=None, config_file=None)
-    assert cfg.future_replay_root_dir == "/vePFS-Mindverse/share/mint-prod-dev/future-replay"
-
-
-def test_server_config_future_replay_root_defaults_to_prod_with_auth():
-    cfg = ServerConfig.from_sources(
-        environ={"TINKER_API_KEY": "secret"},
-        config_path=None,
-        config_file=None,
-    )
-    assert cfg.future_replay_root_dir == "/vePFS-Mindverse/share/mint-prod-data/future-replay"
 
 
 def test_server_config_retrieve_future_settings_read_from_file(tmp_path):
@@ -145,6 +125,7 @@ def test_server_config_retrieve_future_settings_read_from_file(tmp_path):
         "\n".join(
             [
                 "[future]",
+                "retrieve_future_hot_ttl_s = 30",
                 "retrieve_future_grace_s = 45",
                 "retrieve_future_min_poll_s = 2.5",
             ]
@@ -160,6 +141,7 @@ def test_server_config_retrieve_future_settings_read_from_file(tmp_path):
         config_file=file_cfg,
     )
 
+    assert cfg.retrieve_future_hot_ttl_s == 30.0
     assert cfg.retrieve_future_grace_s == 45.0
     assert cfg.retrieve_future_min_poll_s == 2.5
 
@@ -205,16 +187,13 @@ def test_server_config_task_state_store_defaults_follow_auth_mode():
     assert prod.task_state_store_db_path == "/vePFS-Mindverse/share/mint-prod-data/task-state/task_state.sqlite3"
 
 
-def test_server_config_future_replay_env_overrides_file_independently(tmp_path):
+def test_server_config_retrieve_future_env_overrides_file_independently(tmp_path):
     p = tmp_path / "ok.toml"
     p.write_text(
         "\n".join(
             [
                 "[future]",
-                "replay_root_dir = '/tmp/from-file'",
-                "replay_hot_ttl_s = 30",
-                "replay_disk_ttl_s = 300",
-                "replay_sweep_interval_s = 600",
+                "retrieve_future_hot_ttl_s = 30",
             ]
         )
         + "\n",
@@ -224,50 +203,13 @@ def test_server_config_future_replay_env_overrides_file_independently(tmp_path):
 
     cfg = ServerConfig.from_sources(
         environ={
-            "MINT_FUTURE_REPLAY_ROOT_DIR": "/tmp/from-env",
-            "MINT_FUTURE_REPLAY_HOT_TTL_S": "31",
-            "MINT_FUTURE_REPLAY_DISK_TTL_S": "301",
-            "MINT_FUTURE_REPLAY_SWEEP_INTERVAL_S": "601",
+            "MINT_RETRIEVE_FUTURE_HOT_TTL_S": "31",
         },
         config_path=None,
         config_file=file_cfg,
     )
 
-    assert cfg.future_replay_root_dir == "/tmp/from-env"
-    assert cfg.future_replay_hot_ttl_s == 31.0
-    assert cfg.future_replay_disk_ttl_s == 301.0
-    assert cfg.future_replay_sweep_interval_s == 601.0
-
-
-def test_server_config_future_replay_partial_env_override_preserves_untouched_file_values(tmp_path):
-    p = tmp_path / "ok.toml"
-    p.write_text(
-        "\n".join(
-            [
-                "[future]",
-                "replay_root_dir = '/tmp/from-file'",
-                "replay_hot_ttl_s = 30",
-                "replay_disk_ttl_s = 300",
-                "replay_sweep_interval_s = 600",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    file_cfg = load_tinker_config_file(p)
-
-    cfg = ServerConfig.from_sources(
-        environ={
-            "MINT_FUTURE_REPLAY_DISK_TTL_S": "301",
-        },
-        config_path=None,
-        config_file=file_cfg,
-    )
-
-    assert cfg.future_replay_root_dir == "/tmp/from-file"
-    assert cfg.future_replay_hot_ttl_s == 30.0
-    assert cfg.future_replay_disk_ttl_s == 301.0
-    assert cfg.future_replay_sweep_interval_s == 600.0
+    assert cfg.retrieve_future_hot_ttl_s == 31.0
 
 
 def test_server_config_reads_usage_log_dir_from_env():

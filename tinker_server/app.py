@@ -264,9 +264,6 @@ async def lifespan(app: FastAPI):
         session_heartbeat_store.ensure_ready()
         ensure_session_index_store_ready()
         ensure_training_session_store_ready()
-        from .backend.future_replay import ensure_future_replay_sweeper
-
-        ensure_future_replay_sweeper()
     if maintenance_cron_local_only:
         maintenance_cron = {"actor_name": "local_maintenance_cron_actor", "epoch_id": "local"}
     else:

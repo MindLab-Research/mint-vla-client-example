@@ -67,10 +67,7 @@ actor/runtime dependency assembly.
 
 ### `[future]`
 
-- `replay_root_dir` (str) [env: `MINT_FUTURE_REPLAY_ROOT_DIR`]
-- `replay_hot_ttl_s` (float) [env: `MINT_FUTURE_REPLAY_HOT_TTL_S`]
-- `replay_disk_ttl_s` (float) [env: `MINT_FUTURE_REPLAY_DISK_TTL_S`]
-- `replay_sweep_interval_s` (float) [env: `MINT_FUTURE_REPLAY_SWEEP_INTERVAL_S`]
+- `retrieve_future_hot_ttl_s` (float) [env: `MINT_RETRIEVE_FUTURE_HOT_TTL_S`]
 - `retrieve_future_grace_s` (float) [env: `MINT_RETRIEVE_FUTURE_GRACE_S`]
 - `retrieve_future_min_poll_s` (float) [env: `MINT_RETRIEVE_FUTURE_MIN_POLL_S`]
 

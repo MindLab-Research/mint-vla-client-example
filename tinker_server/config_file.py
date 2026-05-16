@@ -89,10 +89,7 @@ class _ModelActorInventorySection(BaseModel):
 class _FutureSection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    replay_root_dir: str | None = None
-    replay_hot_ttl_s: float | None = None
-    replay_disk_ttl_s: float | None = None
-    replay_sweep_interval_s: float | None = None
+    retrieve_future_hot_ttl_s: float | None = None
     retrieve_future_grace_s: float | None = None
     retrieve_future_min_poll_s: float | None = None
 

@@ -38,12 +38,6 @@ def _parse_bool(s: str) -> bool:
     return str(s).strip().lower() in ("true", "1", "yes", "y", "on")
 
 
-def _default_future_replay_root_dir(*, auth_enabled: bool) -> str:
-    if auth_enabled:
-        return "/vePFS-Mindverse/share/mint-prod-data/future-replay"
-    return "/vePFS-Mindverse/share/mint-prod-dev/future-replay"
-
-
 def _default_task_state_store_db_path(*, auth_enabled: bool) -> str:
     if auth_enabled:
         return "/vePFS-Mindverse/share/mint-prod-data/task-state/task_state.sqlite3"
@@ -461,11 +455,8 @@ class ServerConfig:
     # ModelActorSupervisor inventory settings
     model_actor_inventory_session_idle_timeout_s: int = 300
 
-    # Future replay and retrieve polling settings.
-    future_replay_root_dir: str = "/vePFS-Mindverse/share/mint-prod-dev/future-replay"
-    future_replay_hot_ttl_s: float = 60.0
-    future_replay_disk_ttl_s: float = 86400.0
-    future_replay_sweep_interval_s: float = 21600.0
+    # Retrieve polling/cache settings. Durable terminal state lives in TaskStateStore.
+    retrieve_future_hot_ttl_s: float = 60.0
     retrieve_future_grace_s: float = 120.0
     retrieve_future_min_poll_s: float = 1.0
 
@@ -748,15 +739,10 @@ class ServerConfig:
                 file_model_actor_inventory.session_idle_timeout_s if file_model_actor_inventory is not None else None,
                 300,
             ),
-            # Future replay/retrieve settings
-            future_replay_root_dir=_pick_str(
-                "MINT_FUTURE_REPLAY_ROOT_DIR",
-                file_future.replay_root_dir if file_future is not None else None,
-                _default_future_replay_root_dir(auth_enabled=auth_enabled),
-            ),
-            future_replay_hot_ttl_s=_pick_float(
-                "MINT_FUTURE_REPLAY_HOT_TTL_S",
-                file_future.replay_hot_ttl_s if file_future is not None else None,
+            # Retrieve settings
+            retrieve_future_hot_ttl_s=_pick_float(
+                "MINT_RETRIEVE_FUTURE_HOT_TTL_S",
+                file_future.retrieve_future_hot_ttl_s if file_future is not None else None,
                 60.0,
             ),
             retrieve_future_grace_s=_pick_float_alias(
@@ -770,16 +756,6 @@ class ServerConfig:
                 ("TINKER_RETRIEVE_FUTURE_MIN_POLL_S",),
                 file_future.retrieve_future_min_poll_s if file_future is not None else None,
                 1.0,
-            ),
-            future_replay_disk_ttl_s=_pick_float(
-                "MINT_FUTURE_REPLAY_DISK_TTL_S",
-                file_future.replay_disk_ttl_s if file_future is not None else None,
-                86400.0,
-            ),
-            future_replay_sweep_interval_s=_pick_float(
-                "MINT_FUTURE_REPLAY_SWEEP_INTERVAL_S",
-                file_future.replay_sweep_interval_s if file_future is not None else None,
-                21600.0,
             ),
             # TaskStateStore settings
             task_state_store_actor_name=_pick_str(

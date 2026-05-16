@@ -11,7 +11,7 @@ Implementation: `tinker_server/routes/futures.py` backed by `TaskStateFutures` i
 - HTTP 200 with result payload: `DONE`
 - HTTP 404: unknown `request_id` (server has forgotten it)
 
-Important detail: `request_id` is single-use for results. After returning `DONE` or `FAILED`, the server marks the `request_id` as `RETRIEVED` and releases associated reservations. A second `retrieve_future` returns HTTP 200 with `{"error": "Future already retrieved", ...}` (not 404).
+Important detail: `TaskStateStore` is the single durable index for terminal futures. After returning `DONE` or `FAILED`, the server marks the `request_id` as `RETRIEVED` while retaining terminal metadata and payload pointers. A second `retrieve_future` is served idempotently from `TaskStateStore` when the payload or error is still retained; if the payload has been removed but the terminal task record remains, the route returns `{"error": "Known terminal future evicted", ...}` rather than treating the request as unknown.
 
 ## Why futures exist in Mint
 
@@ -22,6 +22,8 @@ Most work runs on Ray GPU actors and can exceed typical HTTP request lifetimes. 
 `TaskStateFutures` is an in-process facade. Durable task state lives in the detached `TaskStateStore` actor (`mint_task_state_store` by default), and result payloads are written through `TaskPayloadStore`.
 
 The facade preserves the old Tinker future methods (`async_resolve`, `async_fail`, `async_get_status`, etc.) while routing all persistent state through `TaskStateStore`. Completed result payloads are written to the payload store, and the task record stores the payload path, checksum, size, status, error, and metadata.
+
+There is no separate future replay index. Retrieve hot-cache entries are process-local accelerators only; restart recovery, terminal replay, and payload-evicted detection all use `TaskStateStore`.
 
 `TaskStateStore` uses active-task indexes (`pending`, `queued`, `assigned`, `leased`, `running`, `finalizing`) for scheduler hydration and metadata-based failure/cleanup. Full table scans are not part of the hot path.
 

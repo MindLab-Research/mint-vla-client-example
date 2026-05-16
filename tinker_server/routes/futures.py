@@ -15,7 +15,6 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request, Response
 
 from ..auth_identity import can_view_internal_errors
-from ..backend.future_replay import ReplayEntry, future_replay_store, should_persist_training_future
 from ..backend.task_state_store import FutureStatus, TaskStateStoreUnavailableError, task_state_futures
 from ..futures_utils import pending_future_http_response
 from ..models.types import FutureRetrieveRequest
@@ -70,7 +69,7 @@ def _local_hot_ttl_s() -> float:
     from ..config import config as server_config
 
     try:
-        return max(0.0, float(server_config.future_replay_hot_ttl_s))
+        return max(0.0, float(server_config.retrieve_future_hot_ttl_s))
     except Exception:
         return 0.0
 
@@ -135,19 +134,7 @@ def _pending_hint_clear(request_id: str) -> None:
     _PENDING_HINTS.pop(request_id, None)
 
 
-def _task_state_retrieve_enabled() -> bool:
-    for key in (
-        "MINT_RETRIEVE_FUTURE_TASK_STATE_STORE",
-        "MINT_MODEL_WORK_SCHEDULER_TASK_STATE_STORE",
-    ):
-        if str(os.environ.get(key, "")).strip().lower() in {"1", "true", "yes", "on"}:
-            return True
-    return False
-
-
 async def _lookup_task_state_terminal(request_id: str, http_request: Request) -> Any | None:
-    if not _task_state_retrieve_enabled():
-        return None
     try:
         from ..backend.task_payload_store import TaskPayloadStore
         from ..backend.task_state_store import TaskStateNotFoundError, task_state_store
@@ -164,35 +151,29 @@ async def _lookup_task_state_terminal(request_id: str, http_request: Request) ->
 
     status = str(record.get("status") or "")
     meta = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-    if status == "done":
+    if status in {"done", "retrieved"}:
         result_path = record.get("result_path")
-        if not isinstance(result_path, str) or not result_path:
-            return None
-        try:
-            result = await TaskPayloadStore().async_read_json_payload(
-                path=result_path,
-                expected_checksum=record.get("result_checksum"),
-            )
-        except Exception:
-            logger.exception("[retrieve_future] task_state_store payload read failed request_id=%s", request_id)
-            return None
-        _maybe_persist_terminal_replay(
-            request_id,
-            final_status=FutureStatus.DONE.value,
-            payload=result,
-            meta=meta,
-        )
-        _recent_put(request_id, result, ttl_s=_local_hot_ttl_s())
-        return result
+        terminal_status = str(meta.get("terminal_status") or status)
+        if terminal_status == "failed" or record.get("error") is not None:
+            error = str(record.get("error") or "Task failed")
+            payload = _failed_payload(error, http_request)
+            _recent_put(request_id, payload, ttl_s=_local_hot_ttl_s())
+            return payload
+        if isinstance(result_path, str) and result_path:
+            try:
+                result = await TaskPayloadStore().async_read_json_payload(
+                    path=result_path,
+                    expected_checksum=record.get("result_checksum"),
+                )
+            except Exception:
+                logger.exception("[retrieve_future] task_state_store payload read failed request_id=%s", request_id)
+                return _terminal_evicted_payload(record)
+            _recent_put(request_id, result, ttl_s=_local_hot_ttl_s())
+            return result
+        return _terminal_evicted_payload(record)
     if status == "failed":
         error = str(record.get("error") or "Task failed")
         payload = _failed_payload(error, http_request)
-        _maybe_persist_terminal_replay(
-            request_id,
-            final_status=FutureStatus.FAILED.value,
-            payload=error,
-            meta=meta,
-        )
         _recent_put(request_id, payload, ttl_s=_local_hot_ttl_s())
         return payload
     return None
@@ -231,65 +212,26 @@ def _failed_payload(error: str | None, request: Request) -> dict[str, str]:
     return {"error": _public_error(error), "category": "system"}
 
 
-def _terminal_evicted_payload(entry: ReplayEntry) -> dict[str, Any]:
+def _terminal_evicted_payload(record: dict[str, Any]) -> dict[str, Any]:
+    meta = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    done_at = meta.get("done_at") or meta.get("failed_at") or record.get("updated_at")
+    retrieved_at = record.get("updated_at") if str(record.get("status") or "") == "retrieved" else None
+    try:
+        done_at_s = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(done_at)))
+    except Exception:
+        done_at_s = None
+    try:
+        retrieved_at_s = None if retrieved_at is None else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(retrieved_at)))
+    except Exception:
+        retrieved_at_s = None
     return {
         "error": "Known terminal future evicted",
         "category": "system",
-        "request_id": entry.request_id,
-        "op": entry.op,
-        "done_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(entry.done_at_ts)),
-        "retrieved_at": (
-            None
-            if entry.retrieved_at_ts is None
-            else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(entry.retrieved_at_ts))
-        ),
+        "request_id": str(record.get("request_id") or ""),
+        "op": str(meta.get("op") or record.get("op") or ""),
+        "done_at": done_at_s,
+        "retrieved_at": retrieved_at_s,
     }
-
-
-def _maybe_persist_terminal_replay(
-    request_id: str,
-    *,
-    final_status: str,
-    payload: Any,
-    meta: dict[str, Any] | None,
-) -> None:
-    if not isinstance(meta, dict):
-        return
-    op = meta.get("op")
-    if not should_persist_training_future(op):
-        return
-    done_at = meta.get("done_at")
-    if not isinstance(done_at, (int, float)):
-        done_at = time.time()
-    try:
-        future_replay_store().persist_terminal_payload(
-            request_id=request_id,
-            op=str(op),
-            model_id=None if meta.get("model_id") is None else str(meta.get("model_id")),
-            final_status=final_status,
-            payload=payload,
-            done_at_ts=float(done_at),
-            retrieved_at_ts=time.time(),
-        )
-    except Exception:
-        logger.exception("terminal replay persist failed: request_id=%s op=%s", request_id, op)
-
-
-def _lookup_local_terminal_replay(request_id: str, http_request: Request) -> Any | None:
-    lookup = future_replay_store().lookup(request_id)
-    if lookup.state == "miss":
-        return None
-    if lookup.state == "evicted":
-        return _terminal_evicted_payload(lookup.entry)
-    envelope = lookup.envelope or {}
-    entry = lookup.entry
-    if entry is None:
-        return None
-    payload = envelope.get("payload")
-    if entry.final_status == FutureStatus.FAILED.value:
-        error = payload if isinstance(payload, str) else str(payload)
-        return _failed_payload(error, http_request)
-    return payload
 
 
 @router.post("/retrieve_future")
@@ -424,16 +366,6 @@ async def retrieve_future(
     if cached is not None:
         logger.info("[retrieve_future] request_id=%s local_cache_hit=true", body.request_id)
         return _apply_cached_response(cached, response)
-
-    replay_payload = _lookup_local_terminal_replay(body.request_id, http_request)
-    if replay_payload is not None:
-        _pending_hint_clear(body.request_id)
-        _recent_put(body.request_id, replay_payload, ttl_s=_local_hot_ttl_s())
-        if isinstance(replay_payload, dict) and replay_payload.get("error") == "Known terminal future evicted":
-            logger.info("[retrieve_future] request_id=%s status=terminal_evicted", body.request_id)
-        else:
-            logger.info("[retrieve_future] request_id=%s replay_cache_hit=true", body.request_id)
-        return replay_payload
 
     try:
         status = await task_state_futures.async_get_status(body.request_id)
@@ -779,29 +711,24 @@ async def retrieve_future(
         if cached is not None:
             logger.info("[retrieve_future] request_id=%s status=retrieved served=cached", body.request_id)
             return _apply_cached_response(cached, response)
-        meta = await task_state_futures.async_get_meta(body.request_id)
-        result = await task_state_futures.async_get_result(body.request_id)
+        task_state_payload = await _lookup_task_state_terminal(body.request_id, http_request)
+        if task_state_payload is not None:
+            _pending_hint_clear(body.request_id)
+            logger.info("[retrieve_future] request_id=%s status=retrieved served=task_state_store", body.request_id)
+            return task_state_payload
+        try:
+            result = await task_state_futures.async_get_result(body.request_id)
+        except Exception:
+            result = None
         if result is not None:
-            _maybe_persist_terminal_replay(
-                body.request_id,
-                final_status=FutureStatus.DONE.value,
-                payload=result,
-                meta=meta,
-            )
             _recent_put(body.request_id, result, ttl_s=_local_hot_ttl_s())
-            logger.info("[retrieve_future] request_id=%s status=retrieved served=result", body.request_id)
+            logger.info("[retrieve_future] request_id=%s status=retrieved served=facade_result", body.request_id)
             return result
         error = await task_state_futures.async_get_error(body.request_id)
         if error is not None:
-            _maybe_persist_terminal_replay(
-                body.request_id,
-                final_status=FutureStatus.FAILED.value,
-                payload=str(error),
-                meta=meta,
-            )
             payload = _failed_payload(error, http_request)
             _recent_put(body.request_id, payload, ttl_s=_local_hot_ttl_s())
-            logger.info("[retrieve_future] request_id=%s status=retrieved served=error_payload", body.request_id)
+            logger.info("[retrieve_future] request_id=%s status=retrieved served=facade_error", body.request_id)
             return payload
         logger.info("[retrieve_future] request_id=%s status=retrieved served=error", body.request_id)
         return {"error": "Future already retrieved", "category": "system"}
@@ -809,13 +736,6 @@ async def retrieve_future(
         _pending_hint_clear(body.request_id)
         error = await task_state_futures.async_get_error(body.request_id)
         payload = _failed_payload(error, http_request)
-        meta = await task_state_futures.async_get_meta(body.request_id)
-        _maybe_persist_terminal_replay(
-            body.request_id,
-            final_status=FutureStatus.FAILED.value,
-            payload=str(error),
-            meta=meta,
-        )
         _recent_put(body.request_id, payload, ttl_s=_local_hot_ttl_s())
         logger.info("[retrieve_future] request_id=%s status=failed", body.request_id)
         try:
@@ -826,13 +746,6 @@ async def retrieve_future(
     else:
         _pending_hint_clear(body.request_id)
         result = await task_state_futures.async_get_result(body.request_id)
-        meta = await task_state_futures.async_get_meta(body.request_id)
-        _maybe_persist_terminal_replay(
-            body.request_id,
-            final_status=FutureStatus.DONE.value,
-            payload=result,
-            meta=meta,
-        )
         _recent_put(body.request_id, result, ttl_s=_local_hot_ttl_s())
         logger.info("[retrieve_future] request_id=%s status=done", body.request_id)
         try:

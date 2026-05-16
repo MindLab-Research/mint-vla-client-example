@@ -1217,8 +1217,7 @@ def test_actor_runtime_env_vars_forwards_control_plane_actor_names(tmp_path):
             "MINT_SESSION_INDEX_ACTOR_NAME": "mint-session-index-test",
             "MINT_TRAINING_CLEANUP_EXECUTOR_ACTOR_NAME": "mint-training-cleanup-test",
             "MINT_SAMPLING_CLEANUP_EXECUTOR_ACTOR_NAME": "mint-sampling-cleanup-test",
-            "MINT_FUTURE_REPLAY_ROOT_DIR": "/tmp/future-replay-test",
-            "MINT_FUTURE_REPLAY_SWEEPER_ACTOR_NAME": "mint-future-replay-sweeper-test",
+            "MINT_RETRIEVE_FUTURE_HOT_TTL_S": "45",
             "MINT_MODEL_WORK_SCHEDULER_ACTOR_NAME": "mint-model-work-scheduler-test",
             "MINT_MODEL_WORK_SCHEDULER_PINNED_NODE_IP": "192.168.39.110",
             "MINT_TASK_STATE_STORE_ACTOR_NAME": "mint-task-state-store-test",
@@ -1237,8 +1236,7 @@ def test_actor_runtime_env_vars_forwards_control_plane_actor_names(tmp_path):
     assert actor_env["MINT_SESSION_INDEX_ACTOR_NAME"] == "mint-session-index-test"
     assert actor_env["MINT_TRAINING_CLEANUP_EXECUTOR_ACTOR_NAME"] == "mint-training-cleanup-test"
     assert actor_env["MINT_SAMPLING_CLEANUP_EXECUTOR_ACTOR_NAME"] == "mint-sampling-cleanup-test"
-    assert actor_env["MINT_FUTURE_REPLAY_ROOT_DIR"] == "/tmp/future-replay-test"
-    assert actor_env["MINT_FUTURE_REPLAY_SWEEPER_ACTOR_NAME"] == "mint-future-replay-sweeper-test"
+    assert actor_env["MINT_RETRIEVE_FUTURE_HOT_TTL_S"] == "45"
     assert actor_env["MINT_MODEL_WORK_SCHEDULER_ACTOR_NAME"] == "mint-model-work-scheduler-test"
     assert actor_env["MINT_MODEL_WORK_SCHEDULER_PINNED_NODE_IP"] == "192.168.39.110"
     assert actor_env["MINT_TASK_STATE_STORE_ACTOR_NAME"] == "mint-task-state-store-test"

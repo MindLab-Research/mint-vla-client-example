@@ -85,8 +85,6 @@ def test_start_issue_server_helper_scopes_control_plane_actor_names() -> None:
     assert token in data["MINT_MAINTENANCE_CRON_ACTOR_NAME"]
     assert token in data["MINT_TRAINING_CLEANUP_EXECUTOR_ACTOR_NAME"]
     assert token in data["MINT_SAMPLING_CLEANUP_EXECUTOR_ACTOR_NAME"]
-    assert token in data["MINT_FUTURE_REPLAY_SWEEPER_ACTOR_NAME"]
-
     forbidden = {
         "mint_model_work_scheduler",
         "mint_task_state_store",
@@ -97,7 +95,6 @@ def test_start_issue_server_helper_scopes_control_plane_actor_names() -> None:
         "mint_maintenance_cron",
         "tinker_training_cleanup_executor",
         "tinker_sampling_cleanup_executor",
-        "mint_future_replay_sweeper",
     }
     for key, value in data.items():
         if key.endswith("_ACTOR_NAME"):

@@ -1554,9 +1554,11 @@ class TaskStateFutures:
 
     async def async_get_result(self, request_id: str) -> Any:
         record = await self._task_state.async_get_task(str(request_id))
-        if str(record.get("status")) == "retrieved":
-            raise KeyError(f"Future already retrieved: {request_id}")
-        if str(record.get("status")) != "done":
+        status = str(record.get("status"))
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        if status == "retrieved" and str(metadata.get("terminal_status") or "done") != "done":
+            raise KeyError(f"Future already retrieved without result: {request_id}")
+        if status not in {"done", "retrieved"}:
             raise KeyError(f"Future is not done: {request_id}")
         result_path = record.get("result_path")
         if not isinstance(result_path, str) or not result_path:
@@ -1566,7 +1568,8 @@ class TaskStateFutures:
             path=result_path,
             expected_checksum=record.get("result_checksum"),
         )
-        await self._task_state.async_mark_task_retrieved(request_id=str(request_id))
+        if status != "retrieved":
+            await self._task_state.async_mark_task_retrieved(request_id=str(request_id))
         return payload
 
     async def async_get_error(self, request_id: str) -> str | None:

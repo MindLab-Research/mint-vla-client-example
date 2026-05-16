@@ -26,13 +26,13 @@ This project has multiple identifiers that look similar but have different owner
 - `request_id`
   - Created through the `TaskStateFutures` facade and returned by endpoints that run async work in the background.
   - Polled via `POST /api/v1/retrieve_future` (Tinker polling protocol).
-  - Stored in detached `TaskStateStore`, not in API-process memory.
+  - Stored in detached `TaskStateStore`, not in API-process memory. Terminal replay also uses this same task record plus `TaskPayloadStore`; there is no second future index.
 
 ## Persistence and restart behavior
 
 State that survives an API restart in detached control-plane actors:
 
-- `TaskStateStore` entries (`request_id` status/result metadata)
+- `TaskStateStore` entries (`request_id` status/result metadata and terminal payload pointers)
 - session and sampler index metadata
 - training-session recovery metadata
 - gateway routing metadata for remote sampling sessions and training models
