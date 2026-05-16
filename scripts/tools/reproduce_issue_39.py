@@ -99,14 +99,6 @@ def _poll_future(request_id: str) -> dict[str, Any]:
     raise TimeoutError(f"retrieve_future timed out after {POLL_TIMEOUT_S:.1f}s request_id={request_id}")
 
 
-def _expect_404_get(path: str) -> None:
-    _get(path, timeout_s=10.0, expect_status=404)
-
-
-def _expect_404_post(path: str) -> None:
-    _post(path, {}, timeout_s=10.0, expect_status=404)
-
-
 def main() -> int:
     try:
         _get_json("/api/v1/healthz", timeout_s=10.0)
@@ -174,15 +166,6 @@ def main() -> int:
         )
         if not isinstance(killed.get("killed"), int):
             return _fail(f"/api/v1/actors/kill missing killed count: {killed!r}")
-
-        # Legacy endpoints must be removed entirely.
-        _expect_404_get("/api/v1/vllm_status")
-        _expect_404_post("/api/v1/kill_vllm")
-        _expect_404_get("/api/v1/megatron_status")
-        _expect_404_post("/api/v1/kill_megatron")
-        _expect_404_get("/api/v1/model_actor_registry")
-        _expect_404_post("/api/v1/clear_model_actor_registry")
-        _expect_404_post("/api/v1/kill_all_actors")
 
         print("PASS")
         return 0

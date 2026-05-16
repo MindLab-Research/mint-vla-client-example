@@ -201,16 +201,16 @@ def main() -> int:
         help="Do not exit immediately on the first issue signature; run until --total-seconds.",
     )
     p.add_argument(
-        "--auto-kill-vllm-on-repro",
+        "--auto-kill-actors-on-repro",
         action="store_true",
-        default=(os.environ.get("TINKER_AUTO_KILL_VLLM_ON_REPRO", "").strip() == "1"),
-        help="POST /api/v1/kill_vllm when an issue signature or stall is detected.",
+        default=(os.environ.get("TINKER_AUTO_KILL_ACTORS_ON_REPRO", "").strip() == "1"),
+        help="POST /api/v1/actors/kill for the vLLM actor when an issue signature or stall is detected.",
     )
     p.add_argument(
         "--auto-kill-min-interval-s",
         type=float,
         default=float(os.environ.get("TINKER_AUTO_KILL_MIN_INTERVAL_S", "120")),
-        help="Minimum seconds between /kill_vllm calls (rate limit).",
+        help="Minimum seconds between actor kill calls (rate limit).",
     )
     p.add_argument(
         "--prompt-mode",
@@ -332,7 +332,7 @@ def main() -> int:
                     "warmup_timeout_s": float(args.warmup_timeout_s),
                     "session_mode": session_mode,
                     "continue_after_repro": bool(args.continue_after_repro),
-                    "auto_kill_vllm_on_repro": bool(args.auto_kill_vllm_on_repro),
+                    "auto_kill_actors_on_repro": bool(args.auto_kill_actors_on_repro),
                     "auto_kill_min_interval_s": float(args.auto_kill_min_interval_s),
                     "prompt_mode": str(args.prompt_mode),
                     "prompt_random_max_token_id": int(args.prompt_random_max_token_id),
@@ -351,9 +351,9 @@ def main() -> int:
         def record_event(event_type: str, extra: dict[str, Any]) -> None:
             record_obj({"ts": _now_iso(), "kind": "event", "type": event_type, **extra})
 
-        def maybe_kill_vllm(reason: str) -> None:
+        def maybe_kill_actors(reason: str) -> None:
             nonlocal last_kill_at
-            if not args.auto_kill_vllm_on_repro:
+            if not args.auto_kill_actors_on_repro:
                 return
             now = time.monotonic()
             with kill_lock:
@@ -364,13 +364,13 @@ def main() -> int:
                 st, out = _post_json(
                     base_url,
                     api_key,
-                    "/api/v1/kill_vllm",
-                    {"model_name": str(args.model)},
+                    "/api/v1/actors/kill",
+                    {"actor_type": "vllm", "model_name": str(args.model)},
                     timeout_s=min(max(args.http_timeout_s, 1.0), 30.0),
                 )
-                record_event("kill_vllm", {"reason": reason, "status": int(st), "resp": str(out)[:800]})
+                record_event("kill_actors", {"reason": reason, "status": int(st), "resp": str(out)[:800]})
             except Exception as e:
-                record_event("kill_vllm", {"reason": reason, "status": 0, "resp": f"{type(e).__name__}: {e}"})
+                record_event("kill_actors", {"reason": reason, "status": 0, "resp": f"{type(e).__name__}: {e}"})
 
         def record(r: OneRequest) -> None:
             nonlocal last_complete, total_completed, total_failed, stress_completed
@@ -543,7 +543,7 @@ def main() -> int:
                                 "error": r.error,
                             },
                         )
-                        maybe_kill_vllm("issue_signature")
+                        maybe_kill_actors("issue_signature")
                         if not args.continue_after_repro:
                             stop.set()
                             return
@@ -574,7 +574,7 @@ def main() -> int:
                 if dt > args.stall_timeout_s:
                     reproduced.set()
                     record_event("stall_timeout", {"no_complete_for_s": float(dt), "stall_timeout_s": float(args.stall_timeout_s)})
-                    maybe_kill_vllm("stall_timeout")
+                    maybe_kill_actors("stall_timeout")
                     stop.set()
                     return
                 time.sleep(1.0)

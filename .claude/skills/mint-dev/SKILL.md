@@ -31,7 +31,7 @@ Procedure contract:
 > | Server logs | `ssh mint-dev "tail -50 /tmp/tinker_server.log"` |
 > | Health check | `curl http://localhost:8000/api/v1/healthz` |
 > | Restart server | See "Start Server" section below |
-> | Kill vLLM | `curl -X POST http://localhost:8000/api/v1/kill_vllm` |
+> | Kill vLLM | `curl -X POST -H "Content-Type: application/json" -d '{"actor_type":"vllm"}' http://localhost:8000/api/v1/actors/kill` |
 >
 > If you find yourself guessing or trial-and-error debugging basic infrastructure, **STOP and re-read this skill**.
 >
@@ -647,10 +647,12 @@ curl http://localhost:8000/api/v1/healthz
 ssh mint-dev "tail -50 /tmp/tinker_server.log"
 
 # vLLM status
-curl http://localhost:8000/api/v1/vllm_status
+curl "http://localhost:8000/api/v1/actors?type=vllm"
 
 # Kill vLLM
-curl -X POST http://localhost:8000/api/v1/kill_vllm
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"actor_type":"vllm"}' \
+  http://localhost:8000/api/v1/actors/kill
 ```
 
 ---
@@ -768,33 +770,37 @@ ssh mint-dev "ps aux | grep run_server | grep -v grep"
 
 ```bash
 # Via API (admin only when auth is enabled; do not kill random processes)
-curl -X POST http://localhost:8000/api/v1/kill_vllm
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"actor_type":"vllm"}' \
+  http://localhost:8000/api/v1/actors/kill
 
 # Kill specific model's vLLM actor
 curl -X POST -H "Content-Type: application/json" \
-  -d '{"model_name": "Qwen/Qwen3-30B-A3B-Instruct-2507"}' \
-  http://localhost:8000/api/v1/kill_vllm
+  -d '{"actor_type":"vllm","model_name":"Qwen/Qwen3-30B-A3B-Instruct-2507"}' \
+  http://localhost:8000/api/v1/actors/kill
 ```
 
 ### Kill Megatron Actor
 
 ```bash
-curl -X POST http://localhost:8000/api/v1/kill_megatron
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"actor_type":"megatron"}' \
+  http://localhost:8000/api/v1/actors/kill
 
 # Kill specific model's Megatron actor
 curl -X POST -H "Content-Type: application/json" \
-  -d '{"base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507"}' \
-  http://localhost:8000/api/v1/kill_megatron
+  -d '{"actor_type":"megatron","model_name":"Qwen/Qwen3-30B-A3B-Instruct-2507"}' \
+  http://localhost:8000/api/v1/actors/kill
 ```
 
 ### Check Actor Status
 
 ```bash
 # vLLM status
-curl -s http://localhost:8000/api/v1/vllm_status | jq
+curl -s "http://localhost:8000/api/v1/actors?type=vllm" | jq
 
 # Megatron status
-curl -s http://localhost:8000/api/v1/megatron_status | jq
+curl -s "http://localhost:8000/api/v1/actors?type=megatron" | jq
 
 # Kill all tracked GPU actors (admin only when auth is enabled)
 curl -X POST -H "Content-Type: application/json" \
@@ -952,7 +958,9 @@ ssh mint-dev "cd /root/tinker_project/tinker-server && nohup bash -c \
 Use this after vLLM actor code changes, OOM, or switching base model.
 
 ```bash
-curl -X POST http://localhost:8000/api/v1/kill_vllm
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"actor_type":"vllm"}' \
+  http://localhost:8000/api/v1/actors/kill
 ssh mint-dev 'pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true'
 ssh mint-dev "cd /root/tinker_project/tinker-server && nohup bash -c \
   \". ./configs/dev_volcano.env.sh && \
@@ -971,7 +979,9 @@ sleep 80 && curl -s http://localhost:8000/api/v1/healthz
 Use this after Megatron actor code changes, OOM, or switching base model.
 
 ```bash
-curl -X POST http://localhost:8000/api/v1/kill_megatron
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"actor_type":"megatron"}' \
+  http://localhost:8000/api/v1/actors/kill
 ssh mint-dev 'pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true'
 ssh mint-dev "cd /root/tinker_project/tinker-server && nohup bash -c \
   \". ./configs/dev_volcano.env.sh && \

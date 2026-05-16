@@ -205,7 +205,7 @@ curl http://localhost:18000/api/v1/healthz
 ssh mint-prod-volcano "tail -50 /tmp/tinker_server_auth.log"
 
 # vLLM status (auth required)
-curl -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/vllm_status
+curl -H "X-API-Key: $TINKER_API_KEY" "http://localhost:18000/api/v1/actors?type=vllm"
 
 # Kill vLLM (auth required)
 curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/json" -d '{"actor_type":"vllm"}' http://localhost:18000/api/v1/actors/kill
@@ -457,10 +457,10 @@ curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/json"
 
 ```bash
 # vLLM status
-curl -s -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/vllm_status | jq
+curl -s -H "X-API-Key: $TINKER_API_KEY" "http://localhost:18000/api/v1/actors?type=vllm" | jq
 
 # Megatron status
-curl -s -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/megatron_status | jq
+curl -s -H "X-API-Key: $TINKER_API_KEY" "http://localhost:18000/api/v1/actors?type=megatron" | jq
 
 # Full tracked actor inventory
 curl -s -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/actors | jq '.actors[] | {actor_name,actor_type,base_model,idle,current_session,num_gpus}'

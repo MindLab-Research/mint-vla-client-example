@@ -386,16 +386,24 @@ PYEOF'
 
 ```bash
 # Kill Megatron (dev)
-curl -X POST http://localhost:8000/api/v1/kill_megatron
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"actor_type":"megatron"}' \
+  http://localhost:8000/api/v1/actors/kill
 
 # Kill Megatron (prod - admin only when auth is enabled)
-curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_megatron
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/json" \
+  -d '{"actor_type":"megatron"}' \
+  http://localhost:18000/api/v1/actors/kill
 
 # Kill vLLM (dev)
-curl -X POST http://localhost:8000/api/v1/kill_vllm
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"actor_type":"vllm"}' \
+  http://localhost:8000/api/v1/actors/kill
 
 # Kill vLLM (prod - admin only when auth is enabled)
-curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_vllm
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/json" \
+  -d '{"actor_type":"vllm"}' \
+  http://localhost:18000/api/v1/actors/kill
 
 # Kill all tracked GPU actors (dev; admin only when auth is enabled)
 curl -X POST -H "Content-Type: application/json" \
@@ -403,8 +411,8 @@ curl -X POST -H "Content-Type: application/json" \
   http://localhost:8000/api/v1/actors/kill
 
 # Check status
-curl -s http://localhost:8000/api/v1/megatron_status | jq
-curl -s http://localhost:8000/api/v1/vllm_status | jq
+curl -s "http://localhost:8000/api/v1/actors?type=megatron" | jq
+curl -s "http://localhost:8000/api/v1/actors?type=vllm" | jq
 ```
 
 ### Actor Names Reference
