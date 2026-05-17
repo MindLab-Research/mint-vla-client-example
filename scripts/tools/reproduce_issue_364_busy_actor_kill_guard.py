@@ -136,7 +136,7 @@ def main() -> int:
         _wait_until_pending(request_id)
 
         kill_response = requests.post(
-            f"{BASE_URL}/api/v1/actors/kill",
+            f"{BASE_URL}/internal/actors/kill",
             headers=_headers(),
             json={"actor_type": "vllm", "model_name": MODEL},
             timeout=30.0,

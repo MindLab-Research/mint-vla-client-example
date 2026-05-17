@@ -119,7 +119,7 @@ def _poll_done(request_id: str, *, timeout_s: float) -> dict[str, Any]:
 
 
 def _list_vllm_actor_names() -> list[str]:
-    out = _get_json("/api/v1/actors?type=vllm", timeout_s=10.0)
+    out = _get_json("/internal/actors?type=vllm", timeout_s=10.0)
     actors = out.get("actors")
     if not isinstance(actors, list):
         raise TypeError(f"/actors unexpected payload: {out!r}")

@@ -87,7 +87,7 @@ def _matches_model(entry_base_model: str, model: str) -> bool:
 
 
 def _list_actors() -> list[dict[str, Any]]:
-    out = _get_json("/api/v1/actors", timeout_s=30.0)
+    out = _get_json("/internal/actors", timeout_s=30.0)
     actors = out.get("actors", [])
     if not isinstance(actors, list):
         raise RuntimeError(f"actors field missing/invalid: {actors!r}")
@@ -109,7 +109,7 @@ def _find_training_actors() -> list[dict[str, Any]]:
 
 
 def _kill_training_actors(actor_type: str) -> None:
-    _post_json("/api/v1/actors/kill", {"actor_type": actor_type}, timeout_s=30.0)
+    _post_json("/internal/actors/kill", {"actor_type": actor_type}, timeout_s=30.0)
 
 
 def _create_training_model() -> str:

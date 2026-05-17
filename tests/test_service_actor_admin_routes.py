@@ -70,19 +70,20 @@ class _FakePool:
 
 
 def _build_client(monkeypatch, pool: _FakePool, *, patch_placement_groups: bool = True) -> TestClient:
-    from tinker_server.routes import service as service_routes
+    from tinker_server.routes import internal as internal_routes
+    import tinker_server.backend.actor_admin as actor_admin
     import tinker_server.backend.model_actor_supervisor as model_actor_inventory
 
-    monkeypatch.setattr(service_routes, "_require_admin", lambda _request: None)
+    monkeypatch.setattr(actor_admin, "require_admin", lambda _request: None)
     monkeypatch.setattr(model_actor_inventory, "get_model_actor_supervisor", lambda: pool)
     if patch_placement_groups:
         async def _empty_placement_group_table(*_args, **_kwargs):
             return {}
 
-        monkeypatch.setattr(service_routes, "async_placement_group_table", _empty_placement_group_table)
+        monkeypatch.setattr(actor_admin, "async_placement_group_table", _empty_placement_group_table)
 
     app = FastAPI()
-    app.include_router(service_routes.router, prefix="/api/v1")
+    app.include_router(internal_routes.router, prefix="/internal")
     return TestClient(app)
 
 
@@ -101,7 +102,7 @@ def test_list_actors_uses_startup_ray_driver_without_request_path_init(monkeypat
         ),
     )
 
-    resp = client.get("/api/v1/actors")
+    resp = client.get("/internal/actors")
 
     assert resp.status_code == 200, resp.text
     assert init_ray_calls == []
@@ -115,7 +116,7 @@ def test_list_actors_refreshes_metadata_by_default(monkeypatch) -> None:
     )
     client = _build_client(monkeypatch, pool)
 
-    resp = client.get("/api/v1/actors")
+    resp = client.get("/internal/actors")
 
     assert resp.status_code == 200, resp.text
     assert pool.list_actor_refresh_metadata_calls == [True]
@@ -129,7 +130,7 @@ def test_list_actors_can_skip_metadata_refresh(monkeypatch) -> None:
     )
     client = _build_client(monkeypatch, pool)
 
-    resp = client.get("/api/v1/actors?refresh_metadata=false")
+    resp = client.get("/internal/actors?refresh_metadata=false")
 
     assert resp.status_code == 200, resp.text
     assert pool.list_actor_refresh_metadata_calls == [False]
@@ -145,7 +146,7 @@ def test_list_actors_passes_filters_to_model_actor_inventory_before_refresh(monk
     )
     client = _build_client(monkeypatch, pool)
 
-    resp = client.get("/api/v1/actors?type=vllm&model_name=Qwen/Qwen3-4B-Instruct-2507")
+    resp = client.get("/internal/actors?type=vllm&model_name=Qwen/Qwen3-4B-Instruct-2507")
 
     assert resp.status_code == 200, resp.text
     assert pool.list_actor_refresh_metadata_calls == [True]
@@ -165,7 +166,7 @@ def test_list_actors_uses_async_model_actor_inventory_inventory(monkeypatch) -> 
     )
     client = _build_client(monkeypatch, pool)
 
-    resp = client.get("/api/v1/actors")
+    resp = client.get("/internal/actors")
 
     assert resp.status_code == 200, resp.text
     assert pool.list_actor_refresh_metadata_calls == [True]
@@ -180,7 +181,7 @@ def test_list_actors_returns_503_when_model_actor_inventory_inventory_fails(monk
     _install_ray_stub(monkeypatch)
     client = _build_client(monkeypatch, _FailingListPool(actors=[], entries=[]))
 
-    resp = client.get("/api/v1/actors")
+    resp = client.get("/internal/actors")
 
     assert resp.status_code == 503, resp.text
     assert "Ray unavailable for actor inventory" in resp.text
@@ -201,7 +202,7 @@ def test_list_actors_returns_503_when_model_actor_inventory_gpu_total_fails(monk
         ),
     )
 
-    resp = client.get("/api/v1/actors")
+    resp = client.get("/internal/actors")
 
     assert resp.status_code == 503, resp.text
     assert "Ray unavailable for actor inventory" in resp.text
@@ -226,7 +227,7 @@ def test_kill_dense_actors_returns_503_without_unregistering_when_ray_driver_is_
     )
     client = _build_client(monkeypatch, pool)
 
-    resp = client.post("/api/v1/actors/kill", json={"actor_type": "dense"})
+    resp = client.post("/internal/actors/kill", json={"actor_type": "dense"})
 
     assert resp.status_code == 503, resp.text
     assert "Ray is not initialized" in resp.text
@@ -234,7 +235,7 @@ def test_kill_dense_actors_returns_503_without_unregistering_when_ray_driver_is_
 
 
 def test_kill_exact_dense_actor_returns_503_without_unregistering_when_kill_fails(monkeypatch) -> None:
-    from tinker_server.routes import service as service_routes
+    import tinker_server.backend.actor_admin as actor_admin
     from tinker_server.backend.model_actor_supervisor import ActorType
 
     _install_ray_stub(monkeypatch)
@@ -258,12 +259,12 @@ def test_kill_exact_dense_actor_returns_503_without_unregistering_when_kill_fail
             )
         ],
     )
-    monkeypatch.setattr(service_routes, "async_lookup_actor_handle", _lookup)
-    monkeypatch.setattr(service_routes, "async_kill_named_actor", _raise_kill)
-    monkeypatch.setattr(service_routes, "_remove_actor_pg", lambda actor_name: remove_pg_calls.append(actor_name))
+    monkeypatch.setattr(actor_admin, "async_lookup_actor_handle", _lookup)
+    monkeypatch.setattr(actor_admin, "async_kill_named_actor", _raise_kill)
+    monkeypatch.setattr(actor_admin, "_remove_actor_pg", lambda actor_name, **_kwargs: remove_pg_calls.append(actor_name))
     client = _build_client(monkeypatch, pool)
 
-    resp = client.post("/api/v1/actors/kill", json={"actor_type": "dense", "actor_name": "dense-a"})
+    resp = client.post("/internal/actors/kill", json={"actor_type": "dense", "actor_name": "dense-a"})
 
     assert resp.status_code == 503, resp.text
     assert "kill failed" in resp.text
@@ -272,7 +273,7 @@ def test_kill_exact_dense_actor_returns_503_without_unregistering_when_kill_fail
 
 
 def test_kill_dense_actors_returns_503_without_unregistering_when_kill_fails(monkeypatch) -> None:
-    from tinker_server.routes import service as service_routes
+    import tinker_server.backend.actor_admin as actor_admin
     from tinker_server.backend.model_actor_supervisor import ActorType
 
     _install_ray_stub(monkeypatch)
@@ -293,11 +294,11 @@ def test_kill_dense_actors_returns_503_without_unregistering_when_kill_fails(mon
             )
         ],
     )
-    monkeypatch.setattr(service_routes, "async_kill_named_actor", _raise_kill)
-    monkeypatch.setattr(service_routes, "_remove_actor_pg", lambda actor_name: remove_pg_calls.append(actor_name))
+    monkeypatch.setattr(actor_admin, "async_kill_named_actor", _raise_kill)
+    monkeypatch.setattr(actor_admin, "_remove_actor_pg", lambda actor_name, **_kwargs: remove_pg_calls.append(actor_name))
     client = _build_client(monkeypatch, pool)
 
-    resp = client.post("/api/v1/actors/kill", json={"actor_type": "dense"})
+    resp = client.post("/internal/actors/kill", json={"actor_type": "dense"})
 
     assert resp.status_code == 503, resp.text
     assert "kill failed" in resp.text
@@ -306,7 +307,7 @@ def test_kill_dense_actors_returns_503_without_unregistering_when_kill_fails(mon
 
 
 def test_kill_dense_actors_returns_503_when_pg_removal_fails(monkeypatch) -> None:
-    from tinker_server.routes import service as service_routes
+    import tinker_server.backend.actor_admin as actor_admin
     from tinker_server.backend.model_actor_supervisor import ActorType
 
     _install_ray_stub(monkeypatch)
@@ -329,11 +330,11 @@ def test_kill_dense_actors_returns_503_when_pg_removal_fails(monkeypatch) -> Non
             )
         ],
     )
-    monkeypatch.setattr(service_routes, "async_kill_named_actor", _kill_ok)
-    monkeypatch.setattr(service_routes, "_remove_actor_pg", _raise_remove_pg)
+    monkeypatch.setattr(actor_admin, "async_kill_named_actor", _kill_ok)
+    monkeypatch.setattr(actor_admin, "_remove_actor_pg", _raise_remove_pg)
     client = _build_client(monkeypatch, pool)
 
-    resp = client.post("/api/v1/actors/kill", json={"actor_type": "dense"})
+    resp = client.post("/internal/actors/kill", json={"actor_type": "dense"})
 
     assert resp.status_code == 503, resp.text
     assert "pg failed" in resp.text
@@ -388,7 +389,7 @@ def test_infer_base_model_from_checkpoint_passes_admin_scope(monkeypatch, tmp_pa
 
 
 def test_kill_dense_actors_returns_503_when_pg_lookup_mismatches_namespace(monkeypatch) -> None:
-    from tinker_server.routes import service as service_routes
+    import tinker_server.backend.actor_admin as actor_admin
     import tinker_server.backend.ray_placement_groups as ray_placement_groups
     from tinker_server.backend.model_actor_supervisor import ActorType
 
@@ -412,11 +413,11 @@ def test_kill_dense_actors_returns_503_when_pg_lookup_mismatches_namespace(monke
             )
         ],
     )
-    monkeypatch.setattr(service_routes, "async_kill_named_actor", _kill_ok)
+    monkeypatch.setattr(actor_admin, "async_kill_named_actor", _kill_ok)
     monkeypatch.setattr(ray_placement_groups, "get_named_placement_group", _raise_lookup_mismatch)
     client = _build_client(monkeypatch, pool)
 
-    resp = client.post("/api/v1/actors/kill", json={"actor_type": "dense"})
+    resp = client.post("/internal/actors/kill", json={"actor_type": "dense"})
 
     assert resp.status_code == 503, resp.text
     assert "target_namespace='ns-a'" in resp.text

@@ -154,9 +154,9 @@ def _poll_future(request_id: str) -> dict[str, Any]:
 
 
 def _list_vllm_actors() -> list[dict[str, Any]]:
-    status, body = _get_json("/api/v1/actors?type=vllm")
+    status, body = _get_json("/internal/actors?type=vllm")
     if status != 200:
-        raise RuntimeError(f"GET /api/v1/actors?type=vllm returned {status}: {body!r}")
+        raise RuntimeError(f"GET /internal/actors?type=vllm returned {status}: {body!r}")
     actors = body.get("actors")
     if not isinstance(actors, list):
         raise RuntimeError(f"actors payload missing list: {body!r}")
@@ -226,7 +226,7 @@ def main() -> int:
         actor_after_invalid = _actor_entry(actor_name)
         if actor_after_invalid is None:
             raise RuntimeError(
-                f"validation error killed actor {actor_name!r}; expected actor to remain present in /api/v1/actors"
+                f"validation error killed actor {actor_name!r}; expected actor to remain present in /internal/actors"
             )
 
         followup_request_id = _submit_request(

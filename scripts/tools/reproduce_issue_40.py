@@ -111,10 +111,10 @@ def main() -> int:
         if backend != "peft":
             return _fail(f"expected dense training backend 'peft', got {backend!r} (base_model={MODEL!r})")
 
-        dense = _get_json("/api/v1/actors?type=dense", timeout_s=30.0)
+        dense = _get_json("/internal/actors?type=dense", timeout_s=30.0)
         actors = dense.get("actors")
         if not isinstance(actors, list):
-            return _fail(f"/api/v1/actors?type=dense returned invalid actors: {dense!r}")
+            return _fail(f"/internal/actors?type=dense returned invalid actors: {dense!r}")
 
         match = None
         for a in actors:
@@ -122,7 +122,7 @@ def main() -> int:
                 match = a
                 break
         if match is None:
-            return _fail(f"expected dense trainer with current_session={model_id!r} not found in /api/v1/actors")
+            return _fail(f"expected dense trainer with current_session={model_id!r} not found in /internal/actors")
 
         metadata = match.get("metadata")
         if not isinstance(metadata, dict):

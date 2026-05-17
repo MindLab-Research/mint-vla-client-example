@@ -181,7 +181,7 @@ else:
 
 
 def _actors_by_name(actor_name: str) -> list[dict[str, Any]]:
-    payload = _get_json(f"{BASE_URL}/api/v1/actors?type=vllm", timeout_s=30.0)
+    payload = _get_json(f"{BASE_URL}/internal/actors?type=vllm", timeout_s=30.0)
     actors = payload.get("actors")
     if not isinstance(actors, list):
         raise RuntimeError(f"invalid /actors payload keys={sorted(payload.keys())}")
@@ -216,7 +216,7 @@ def main() -> int:
         )
 
         r = _post(
-            f"{BASE_URL}/api/v1/actors/kill",
+            f"{BASE_URL}/internal/actors/kill",
             {"actor_type": "vllm", "model_name": None},
             timeout_s=30.0,
         )

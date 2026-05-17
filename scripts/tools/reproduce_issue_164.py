@@ -71,7 +71,7 @@ def _poll_future(request_id: str, *, timeout_s: float) -> tuple[int, dict[str, A
 
 
 def _list_vllm_actors() -> list[dict[str, Any]]:
-    status, data = _get_json("/api/v1/actors?type=vllm")
+    status, data = _get_json("/internal/actors?type=vllm")
     if status != 200:
         raise RuntimeError(f"GET /actors returned {status}: {data!r}")
     actors = data.get("actors")

@@ -298,7 +298,7 @@ def main() -> int:
         for fut in as_completed(futs):
             outcomes.append(fut.result())
 
-    st, actors = _get_json(base_url, api_key, "/api/v1/actors", 10.0)
+    st, actors = _get_json(base_url, api_key, "/internal/actors", 10.0)
     result["actors_after"] = {"status": st, "body": actors}
     result["finished_at"] = time.time()
     result["outcomes"] = [asdict(x) for x in sorted(outcomes, key=lambda r: r.idx)]

@@ -154,7 +154,7 @@ def _start_probe_threads(
         threading.Thread(
             target=_probe_loop,
             kwargs={
-                "path": "/api/v1/actors",
+                "path": "/internal/actors",
                 "stop_event": stop_event,
                 "interval_s": interval_s,
                 "timeout_s": timeout_s,
@@ -431,7 +431,7 @@ def main() -> int:
 
         for path, budget_s, allowed_statuses in [
             ("/api/v1/healthz", float(args.healthz_p95_budget_s), {200, 503}),
-            ("/api/v1/actors", float(args.actors_p95_budget_s), {200}),
+            ("/internal/actors", float(args.actors_p95_budget_s), {200}),
         ]:
             stats = summary["probes"].get(path)
             if not isinstance(stats, dict):

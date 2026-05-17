@@ -125,7 +125,7 @@ def main() -> int:
 
     base_url = args.base_url.rstrip("/")
     headers = _headers(args.api_key)
-    actors_before = _get_json(base_url, "/api/v1/actors", headers)
+    actors_before = _get_json(base_url, "/internal/actors", headers)
     model_id = ""
     action_session_id = ""
     try:
@@ -142,7 +142,7 @@ def main() -> int:
             action_created = _post_json(base_url, "/api/v1/mint/action_sessions", headers, {"session_id": f"smoke-action-{uuid.uuid4().hex[:12]}", "base_model": args.model, "model_path": model_path})
             action_session_id = action_created["action_session_id"]
             action_result = _await_result(base_url, headers, _post_json(base_url, f"/api/v1/mint/action_sessions/{action_session_id}/act", headers, {"observation": datum["observation"]}))
-        actors_after = _get_json(base_url, "/api/v1/actors", headers)
+        actors_after = _get_json(base_url, "/internal/actors", headers)
         payload = {
             "model": args.model,
             "model_id": model_id,

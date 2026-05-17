@@ -32,6 +32,7 @@ from ..queue_priority import merge_queue_priority_extra
 from ..ray_cluster_health import get_ray_cluster_health_snapshot
 from ..ray_gcs_metrics import get_ray_gcs_metrics_snapshot
 from ..usage_store import get_usage_store
+from ..backend.actor_admin import KillActorsRequest
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -210,6 +211,39 @@ async def health_check():
 async def deep_health_check():
     """Costly internal health endpoint with active Ray diagnostics."""
     return await deep_healthz_response()
+
+
+@router.get("/actors")
+async def list_actors(
+    request: Request,
+    actor_type: str | None = Query(None, alias="type"),
+    model_name: str | None = None,
+    refresh_metadata: bool = Query(
+        True,
+        description="Refresh VLLM/Megatron observability metadata before returning actors.",
+    ),
+) -> dict:
+    """List model actor inventory. Internal/admin endpoint."""
+    from ..backend.actor_admin import ActorListRequest, list_actor_inventory, require_admin
+
+    require_admin(request)
+    return await list_actor_inventory(
+        ActorListRequest(
+            actor_type=actor_type,
+            model_name=model_name,
+            refresh_metadata=refresh_metadata,
+        )
+    )
+
+
+@router.post("/actors/kill")
+async def kill_actors(request: Request, body: "KillActorsRequest") -> dict:
+    """Kill model actors by type or exact name. Internal/admin endpoint."""
+    from ..backend.actor_admin import kill_actors as kill_actor_inventory
+    from ..backend.actor_admin import require_admin
+
+    require_admin(request)
+    return await kill_actor_inventory(request, body)
 
 
 def _self_rss_bytes() -> int:

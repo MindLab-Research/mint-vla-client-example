@@ -145,27 +145,27 @@ def main() -> int:
             return _fail(f"retrieve_future error: {out.get('error')!r}")
 
         # New unified actor endpoints must exist and use ModelActorInventory schema.
-        vllm = _get_json("/api/v1/actors?type=vllm", timeout_s=30.0)
+        vllm = _get_json("/internal/actors?type=vllm", timeout_s=30.0)
         actors = vllm.get("actors")
         if not isinstance(actors, list):
-            return _fail(f"/api/v1/actors returned invalid actors: {actors!r}")
+            return _fail(f"/internal/actors returned invalid actors: {actors!r}")
 
         expected_actor_name = _model_to_vllm_actor_name(MODEL)
         if not any(isinstance(a, dict) and a.get("actor_name") == expected_actor_name for a in actors):
-            return _fail(f"expected vLLM actor not present in /api/v1/actors: {expected_actor_name!r}")
+            return _fail(f"expected vLLM actor not present in /internal/actors: {expected_actor_name!r}")
 
         for t in ["megatron", "dense"]:
-            d = _get_json(f"/api/v1/actors?type={t}", timeout_s=30.0)
+            d = _get_json(f"/internal/actors?type={t}", timeout_s=30.0)
             if not isinstance(d.get("actors"), list):
-                return _fail(f"/api/v1/actors?type={t} returned invalid actors: {d!r}")
+                return _fail(f"/internal/actors?type={t} returned invalid actors: {d!r}")
 
         killed = _post_json(
-            "/api/v1/actors/kill",
+            "/internal/actors/kill",
             {"actor_type": "vllm", "model_name": MODEL},
             timeout_s=30.0,
         )
         if not isinstance(killed.get("killed"), int):
-            return _fail(f"/api/v1/actors/kill missing killed count: {killed!r}")
+            return _fail(f"/internal/actors/kill missing killed count: {killed!r}")
 
         print("PASS")
         return 0

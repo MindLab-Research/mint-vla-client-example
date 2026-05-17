@@ -96,7 +96,7 @@ def _require_model_in_caps(model_name: str) -> None:
 
 
 def _get_actor_gpus(actor_name: str) -> int | None:
-    status = _get_json("/api/v1/actors?type=vllm", timeout_s=30.0)
+    status = _get_json("/internal/actors?type=vllm", timeout_s=30.0)
     actors = status.get("actors")
     if not isinstance(actors, list):
         raise RuntimeError(f"actors missing/invalid: {actors!r}")
@@ -114,7 +114,7 @@ def _get_actor_gpus(actor_name: str) -> int | None:
 
 
 def _get_actor_pg_total_gpus(actor_name: str) -> int | None:
-    status = _get_json("/api/v1/actors?type=vllm", timeout_s=30.0)
+    status = _get_json("/internal/actors?type=vllm", timeout_s=30.0)
     actors = status.get("actors")
     if not isinstance(actors, list):
         raise RuntimeError(f"actors missing/invalid: {actors!r}")
@@ -146,7 +146,7 @@ def _expected_gpus() -> int:
 
 def _try_kill_all_tracked_gpu_actors() -> None:
     try:
-        _post_json("/api/v1/actors/kill", {"actor_type": "all"}, timeout_s=30.0)
+        _post_json("/internal/actors/kill", {"actor_type": "all"}, timeout_s=30.0)
     except Exception:
         return
 

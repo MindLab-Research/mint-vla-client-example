@@ -204,7 +204,7 @@ def main() -> int:
         "--auto-kill-actors-on-repro",
         action="store_true",
         default=(os.environ.get("TINKER_AUTO_KILL_ACTORS_ON_REPRO", "").strip() == "1"),
-        help="POST /api/v1/actors/kill for the vLLM actor when an issue signature or stall is detected.",
+        help="POST /internal/actors/kill for the vLLM actor when an issue signature or stall is detected.",
     )
     p.add_argument(
         "--auto-kill-min-interval-s",
@@ -364,7 +364,7 @@ def main() -> int:
                 st, out = _post_json(
                     base_url,
                     api_key,
-                    "/api/v1/actors/kill",
+                    "/internal/actors/kill",
                     {"actor_type": "vllm", "model_name": str(args.model)},
                     timeout_s=min(max(args.http_timeout_s, 1.0), 30.0),
                 )

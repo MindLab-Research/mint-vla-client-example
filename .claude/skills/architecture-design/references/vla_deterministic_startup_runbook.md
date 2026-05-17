@@ -62,7 +62,7 @@ Expected success signals:
 ```bash
 grep -n 'Application startup complete' /tmp/tinker_server_vla_pr422_startdet3.log
 curl -s http://localhost:18125/api/v1/healthz
-curl -s http://localhost:18125/api/v1/actors
+curl -s http://localhost:18125/internal/actors
 ```
 
 Observed successful cold-start reference:
