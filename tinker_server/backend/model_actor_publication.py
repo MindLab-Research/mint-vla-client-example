@@ -2,8 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .model_actor_inventory import ActorEntry, ActorType, actor_observability_metadata
-from .model_actor_supervisor import get_model_actor_supervisor
+from .model_actor_inventory import ActorEntry, ActorType
 
 
 def publish_model_actor(
@@ -23,15 +22,17 @@ def publish_model_actor(
     ready: bool = True,
 ) -> ActorEntry:
     """Publish a backend-created Ray actor into ModelActorSupervisor inventory."""
+    from . import model_actor_supervisor as supervisor_mod
+
     merged_metadata = dict(metadata or {})
     if refresh_observability and actor_handle is not None:
-        observability = dict(actor_observability_metadata(actor_handle) or {})
+        observability = dict(supervisor_mod.actor_observability_metadata(actor_handle) or {})
         if observability_wins:
             merged_metadata = {**merged_metadata, **observability}
         else:
             merged_metadata = {**observability, **merged_metadata}
 
-    supervisor = get_model_actor_supervisor()
+    supervisor = supervisor_mod.get_model_actor_supervisor()
     entry = supervisor.register(
         actor_name=actor_name,
         actor_type=actor_type,
@@ -50,4 +51,6 @@ def publish_model_actor(
 
 
 def unpublish_model_actor(actor_name: str) -> bool:
-    return get_model_actor_supervisor().unregister(actor_name)
+    from . import model_actor_supervisor as supervisor_mod
+
+    return supervisor_mod.get_model_actor_supervisor().unregister(actor_name)

@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from tinker_server.backend import model_actor_publication as publication
+from tinker_server.backend import model_actor_supervisor as supervisor_mod
 from tinker_server.backend.model_actor_inventory import ActorType
 
 
@@ -22,9 +23,9 @@ class _Supervisor:
 
 def test_publish_model_actor_merges_metadata_with_extra_winning_by_default(monkeypatch) -> None:
     supervisor = _Supervisor()
-    monkeypatch.setattr(publication, "get_model_actor_supervisor", lambda: supervisor)
+    monkeypatch.setattr(supervisor_mod, "get_model_actor_supervisor", lambda: supervisor)
     monkeypatch.setattr(
-        publication,
+        supervisor_mod,
         "actor_observability_metadata",
         lambda _actor: {"shared": "observability", "observability": "yes"},
     )
@@ -44,9 +45,9 @@ def test_publish_model_actor_merges_metadata_with_extra_winning_by_default(monke
 
 def test_publish_model_actor_can_preserve_observability_wins_order(monkeypatch) -> None:
     supervisor = _Supervisor()
-    monkeypatch.setattr(publication, "get_model_actor_supervisor", lambda: supervisor)
+    monkeypatch.setattr(supervisor_mod, "get_model_actor_supervisor", lambda: supervisor)
     monkeypatch.setattr(
-        publication,
+        supervisor_mod,
         "actor_observability_metadata",
         lambda _actor: {"shared": "observability", "observability": "yes"},
     )

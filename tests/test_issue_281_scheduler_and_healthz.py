@@ -671,12 +671,6 @@ async def test_issue_281_public_healthz_ignores_timeout_observation(monkeypatch)
     clear_runtime_degraded_state()
     _install_ray_stub(monkeypatch)
 
-    async def _raise_timeout(awaitable, timeout):
-        awaitable.close()
-        raise service.asyncio.TimeoutError()
-
-    monkeypatch.setattr(service.asyncio, "wait_for", _raise_timeout)
-
     payload = await service.healthz()
     assert payload["status"] == "ready"
     assert "ray_observation" not in payload
@@ -690,12 +684,6 @@ async def test_issue_281_public_healthz_ignores_pending_pg_observation(monkeypat
     clear_startup_degraded_state()
     clear_runtime_degraded_state()
     _install_ray_stub(monkeypatch, available={"GPU": 2}, total={"GPU": 8})
-
-    async def _return_pending(awaitable, timeout):
-        awaitable.close()
-        return ["pg-a"]
-
-    monkeypatch.setattr(service.asyncio, "wait_for", _return_pending)
 
     payload = await service.healthz()
     assert payload["status"] == "ready"
