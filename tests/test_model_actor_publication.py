@@ -65,3 +65,12 @@ def test_publish_model_actor_can_preserve_observability_wins_order(monkeypatch) 
     metadata = supervisor.register_calls[0]["metadata"]
     assert metadata == {"shared": "observability", "extra": "yes", "observability": "yes"}
     assert supervisor.ready == []
+
+
+def test_mark_model_actor_ready_delegates_to_supervisor(monkeypatch) -> None:
+    supervisor = _Supervisor()
+    monkeypatch.setattr(supervisor_mod, "get_model_actor_supervisor", lambda: supervisor)
+
+    publication.mark_model_actor_ready("actor-a")
+
+    assert supervisor.ready == ["actor-a"]

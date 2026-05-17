@@ -68,6 +68,7 @@ async def prewarm_persistent_models(
         normalize_model_name,
         requires_fp8,
     )
+    from tinker_server.backend.model_actor_publication import mark_model_actor_ready
     from tinker_server.backend.model_actor_supervisor import get_model_actor_supervisor
 
     model_actor_supervisor = get_model_actor_supervisor()
@@ -151,7 +152,7 @@ async def prewarm_persistent_models(
 
                     try:
                         await async_get_ray_ref(actor.__ray_ready__.remote(), timeout_s=megatron_ready_timeout_s)
-                        model_actor_supervisor.mark_ready(actor_name)
+                        mark_model_actor_ready(actor_name)
                         logger.info(f"[prewarm] training ready+protected model={model_name} actor={actor_name}")
                     except SystemExit as ready_err:
                         if getattr(ready_err, "code", None) == 15:

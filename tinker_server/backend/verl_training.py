@@ -3709,9 +3709,9 @@ class VerlTrainingEngine:
             if skip_ready_wait:
                 actor_name = self._model_actor_supervisor_actor_names.get(model_id)
                 if actor_name:
-                    from .model_actor_supervisor import get_model_actor_supervisor
+                    from .model_actor_publication import mark_model_actor_ready
 
-                    get_model_actor_supervisor().mark_ready(actor_name)
+                    mark_model_actor_ready(actor_name)
 
                 self._workers[model_id] = worker
                 session.is_active = True
@@ -3759,9 +3759,9 @@ class VerlTrainingEngine:
         )
         actor_name = self._model_actor_supervisor_actor_names.get(model_id)
         if actor_name:
-            from .model_actor_supervisor import get_model_actor_supervisor
+            from .model_actor_publication import mark_model_actor_ready
 
-            get_model_actor_supervisor().mark_ready(actor_name)
+            mark_model_actor_ready(actor_name)
 
         self._workers[model_id] = worker
         session.is_active = True
