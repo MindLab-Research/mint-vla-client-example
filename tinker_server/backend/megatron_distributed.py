@@ -10080,7 +10080,7 @@ def get_or_create_megatron_worker_group(
     """
     from tinker_server.backend.model_actor_publication import (
         ActorType,
-        publish_model_actor,
+        publish_backend_model_actor,
     )
     from .model_registry import is_persistent_model
 
@@ -10210,7 +10210,7 @@ def get_or_create_megatron_worker_group(
                 },
             ):
                 # Register with model actor registry (reconnection case)
-                publish_model_actor(
+                publish_backend_model_actor(
                     actor_name=actor_name,
                     actor_type=ActorType.MEGATRON,
                     num_gpus=num_gpus,
@@ -10476,7 +10476,7 @@ def get_or_create_megatron_worker_group(
             # Register immediately (creating=True) to account for GPU usage and prevent eviction.
             # Actor readiness is awaited in VerlTrainingEngine.create_training_session, which also
             # marks the entry ready (creating=False) after __ray_ready__ completes.
-            publish_model_actor(
+            publish_backend_model_actor(
                 actor_name=actor_name,
                 actor_type=ActorType.MEGATRON,
                 num_gpus=num_gpus,

@@ -2338,10 +2338,10 @@ class MultiNodeInferenceEngine:
                 self._initialized = True
                 from tinker_server.backend.model_actor_publication import (
                     ActorType,
-                    publish_model_actor,
+                    publish_backend_model_actor,
                 )
 
-                publish_model_actor(
+                publish_backend_model_actor(
                     actor_name=self.actor_name,
                     actor_type=ActorType.VLLM,
                     num_gpus=total_required_gpus,
@@ -2564,7 +2564,7 @@ class MultiNodeInferenceEngine:
 
             from tinker_server.backend.model_actor_publication import (
                 ActorType,
-                publish_model_actor,
+                publish_backend_model_actor,
             )
             logger.info(
                 f"Creating multi-node vLLM requiring {total_required_gpus} GPUs "
@@ -2884,7 +2884,7 @@ class MultiNodeInferenceEngine:
 
             # Register with unified model actor registry for LRU tracking
             # Multi-node vLLM internally manages GPU workers, but we track total GPUs for eviction
-            publish_model_actor(
+            publish_backend_model_actor(
                 actor_name=self.actor_name,
                 actor_type=ActorType.VLLM,
                 num_gpus=total_required_gpus,

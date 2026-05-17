@@ -484,10 +484,9 @@ class ModelActorSupervisor:
                 )
                 self.set_desired(spec)
 
-    # Explicit inventory/launcher contract for legacy GPU actor launch paths.
-    # Direct vLLM/Megatron/dense launchers still create backend-specific Ray
-    # actors themselves, but lifecycle publication now goes through
-    # ModelActorSupervisor instead of relying on implicit inventory forwarding.
+    # Explicit inventory/launcher contract for backend-created GPU actors.
+    # Backend-specific vLLM/Megatron/dense launchers own their Ray actor
+    # creation, then publish lifecycle through ModelActorSupervisor.
     def register(
         self,
         *,

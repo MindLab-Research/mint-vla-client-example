@@ -261,12 +261,12 @@ class MultiLoRAInferenceEngine:
                         # Include node_id for proper per-node GPU scheduling
                         from tinker_server.backend.model_actor_publication import (
                             ActorType,
-                            publish_model_actor,
+                            publish_backend_model_actor,
                         )
                         total_gpus = self.tensor_parallel_size * self.data_parallel_size
                         actor_node_id = _get_actor_node_id(self.server)
                         logger.info(f"Registering existing actor {self.actor_name} with ModelActorInventory (node={actor_node_id[:8] if actor_node_id else 'unknown'})")
-                        publish_model_actor(
+                        publish_backend_model_actor(
                             actor_name=self.actor_name,
                             actor_type=ActorType.VLLM,
                             num_gpus=total_gpus,
@@ -310,14 +310,14 @@ class MultiLoRAInferenceEngine:
 
                     from tinker_server.backend.model_actor_publication import (
                         ActorType,
-                        publish_model_actor,
+                        publish_backend_model_actor,
                     )
                     total_gpus = self.tensor_parallel_size * self.data_parallel_size
                     actor_node_id = _get_actor_node_id(self.server)
                     logger.info(
                         f"Registering existing actor {self.actor_name} with ModelActorInventory (node={actor_node_id[:8] if actor_node_id else 'unknown'})"
                     )
-                    publish_model_actor(
+                    publish_backend_model_actor(
                         actor_name=self.actor_name,
                         actor_type=ActorType.VLLM,
                         num_gpus=total_gpus,
@@ -590,10 +590,10 @@ class MultiLoRAInferenceEngine:
             # Include node_id for proper per-node GPU scheduling
             from tinker_server.backend.model_actor_publication import (
                 ActorType,
-                publish_model_actor,
+                publish_backend_model_actor,
             )
             actor_node_id = _get_actor_node_id(self.server)
-            publish_model_actor(
+            publish_backend_model_actor(
                 actor_name=self.actor_name,
                 actor_type=ActorType.VLLM,
                 num_gpus=total_gpus,

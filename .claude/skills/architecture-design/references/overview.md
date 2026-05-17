@@ -77,7 +77,7 @@ MoE training uses Megatron and must export PEFT adapters by reconstructing full 
 
 ## ModelActorSupervisor, ModelWorkScheduler, and inventory
 
-`ModelActorSupervisor` owns desired model-runtime actor reconciliation. `ModelWorkScheduler` owns hot task scheduling, replica subqueues, and leases. `TaskStateStore` is the durable task/result/index source; Scheduler and Supervisor keep rebuildable in-memory projections. `ModelActorInventory` is a process-local helper owned by the supervisor for actor observability, inflight marking, session/protection metadata, and admin list/kill surfaces.
+`ModelActorSupervisor` owns desired model-runtime actor reconciliation. Backend-specific vLLM, Megatron, dense, and OpenPI launchers still create their backend Ray actors, but they publish those actors through the supervisor launch-publication contract. `ModelWorkScheduler` owns hot task scheduling, replica subqueues, and leases. `TaskStateStore` is the durable task/result/index source; Scheduler and Supervisor keep rebuildable in-memory projections. `ModelActorInventory` is a process-local helper owned by the supervisor for actor observability, inflight marking, session/protection metadata, and admin list/kill surfaces.
 
 Clients do not explicitly end all sessions, so idle timeouts still affect training and inference:
 - Detached inference actors can remain alive across server restarts and keep CUDA memory until evicted.

@@ -59,7 +59,7 @@ For asynchronous training operations such as `forward_backward`, `optim_step`, a
 6. The runtime actor validates task status, deserializes the JSON, and calls the registered route executor.
 7. The route helper calls `training_engine.*(...)`.
 8. The backend actor ensures the correct session is loaded before doing any forward/backward/save/load work.
-9. For scheduler leases with native finalize metadata, `ModelRuntimeActor` commits the terminal result or failure to `TaskStateStore` and then completes or fails the scheduler lease. Executor-local `TaskStateFutures.async_resolve` / `async_fail` calls are buffered while running under model-work execution context and serve as completion signals, not as independent durable terminal writes.
+9. Scheduler leases must carry native finalize metadata. `ModelRuntimeActor` commits the terminal result or failure to `TaskStateStore` and then completes or fails the scheduler lease. Executor-local `TaskStateFutures.async_resolve` / `async_fail` calls are buffered while running under model-work execution context and serve as completion signals, not as independent durable terminal writes.
 
 Relevant code:
 

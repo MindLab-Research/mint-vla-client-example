@@ -70,8 +70,8 @@ Implications:
   - Owns runtime actor launch-time placement environment construction.
 
 - `tinker_server/backend/model_actor_publication.py`
-  - Shared publication helper for backend-created GPU actors.
-  - Backend-specific launchers still create Ray actors and placement groups, but lifecycle registration, ready marking, and observability metadata merge go through this helper.
+  - Shared launch-publication helper for backend-created GPU actors.
+  - Backend-specific launchers still own backend Ray actor and placement-group creation, but they publish a `BackendModelActorLaunch` through this helper. Lifecycle registration, ready marking, and observability metadata merge all go through `ModelActorSupervisor`.
 
 - `tinker_server/backend/session_manager.py`
   - Sampling session bookkeeping and cleanup.

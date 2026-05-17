@@ -21,7 +21,7 @@ class _Supervisor:
         self.ready.append(actor_name)
 
 
-def test_publish_model_actor_merges_metadata_with_extra_winning_by_default(monkeypatch) -> None:
+def test_publish_backend_model_actor_merges_metadata_with_extra_winning_by_default(monkeypatch) -> None:
     supervisor = _Supervisor()
     monkeypatch.setattr(supervisor_mod, "get_model_actor_supervisor", lambda: supervisor)
     monkeypatch.setattr(
@@ -30,7 +30,7 @@ def test_publish_model_actor_merges_metadata_with_extra_winning_by_default(monke
         lambda _actor: {"shared": "observability", "observability": "yes"},
     )
 
-    publication.publish_model_actor(
+    publication.publish_backend_model_actor(
         actor_name="actor-a",
         actor_type=ActorType.VLLM,
         num_gpus=1,
@@ -39,11 +39,16 @@ def test_publish_model_actor_merges_metadata_with_extra_winning_by_default(monke
     )
 
     metadata = supervisor.register_calls[0]["metadata"]
-    assert metadata == {"shared": "extra", "observability": "yes", "extra": "yes"}
+    assert metadata == {
+        "launcher_contract": "backend_model_actor_launch",
+        "shared": "extra",
+        "observability": "yes",
+        "extra": "yes",
+    }
     assert supervisor.ready == ["actor-a"]
 
 
-def test_publish_model_actor_can_preserve_observability_wins_order(monkeypatch) -> None:
+def test_publish_backend_model_actor_can_preserve_observability_wins_order(monkeypatch) -> None:
     supervisor = _Supervisor()
     monkeypatch.setattr(supervisor_mod, "get_model_actor_supervisor", lambda: supervisor)
     monkeypatch.setattr(
@@ -52,7 +57,7 @@ def test_publish_model_actor_can_preserve_observability_wins_order(monkeypatch) 
         lambda _actor: {"shared": "observability", "observability": "yes"},
     )
 
-    publication.publish_model_actor(
+    publication.publish_backend_model_actor(
         actor_name="actor-a",
         actor_type=ActorType.DENSE,
         num_gpus=1,
@@ -63,14 +68,19 @@ def test_publish_model_actor_can_preserve_observability_wins_order(monkeypatch) 
     )
 
     metadata = supervisor.register_calls[0]["metadata"]
-    assert metadata == {"shared": "observability", "extra": "yes", "observability": "yes"}
+    assert metadata == {
+        "launcher_contract": "backend_model_actor_launch",
+        "shared": "observability",
+        "extra": "yes",
+        "observability": "yes",
+    }
     assert supervisor.ready == []
 
 
-def test_mark_model_actor_ready_delegates_to_supervisor(monkeypatch) -> None:
+def test_mark_backend_model_actor_ready_delegates_to_supervisor(monkeypatch) -> None:
     supervisor = _Supervisor()
     monkeypatch.setattr(supervisor_mod, "get_model_actor_supervisor", lambda: supervisor)
 
-    publication.mark_model_actor_ready("actor-a")
+    publication.mark_backend_model_actor_ready("actor-a")
 
     assert supervisor.ready == ["actor-a"]

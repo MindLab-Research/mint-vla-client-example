@@ -22,7 +22,7 @@ async def cleanup_stale_actors_once() -> dict[str, int]:
 
     from . import ray_kill
     from .multi_lora_engine import PERSISTENT_NAMESPACE
-    from .model_actor_publication import publish_model_actor
+    from .model_actor_publication import publish_backend_model_actor
     from .model_actor_supervisor import ActorType, get_model_actor_supervisor
 
     if not ray.is_initialized():
@@ -147,7 +147,7 @@ async def cleanup_stale_actors_once() -> dict[str, int]:
 
                 from tinker_server.backend.model_registry import is_persistent_model
 
-                publish_model_actor(
+                publish_backend_model_actor(
                     actor_name=name,
                     actor_type=actor_type,
                     num_gpus=num_gpus,
@@ -219,7 +219,7 @@ async def cleanup_stale_actors_once() -> dict[str, int]:
 
                     from tinker_server.backend.model_registry import is_persistent_model
 
-                    publish_model_actor(
+                    publish_backend_model_actor(
                         actor_name=name,
                         actor_type=actor_type,
                         num_gpus=num_gpus,

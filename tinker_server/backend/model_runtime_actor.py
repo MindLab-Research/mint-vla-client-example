@@ -459,6 +459,14 @@ class ModelRuntimeActor:
     def _task_state_finalize_enabled(self, lease: dict[str, Any]) -> bool:
         return lease.get("scheduler_epoch") is not None and bool(lease.get("attempt_id"))
 
+    def _require_task_state_finalize(self, lease: dict[str, Any]) -> None:
+        if self._task_state_finalize_enabled(lease):
+            return
+        raise RuntimeError(
+            "model work lease missing TaskStateStore finalize metadata "
+            "(attempt_id and scheduler_epoch are required)"
+        )
+
     def _lease_attempt_id(self, lease: dict[str, Any]) -> str | None:
         attempt_id = str(lease.get("attempt_id") or "") or None
         if attempt_id:
@@ -473,8 +481,7 @@ class ModelRuntimeActor:
         *,
         payload: Any,
     ) -> None:
-        if not self._task_state_finalize_enabled(lease):
-            return
+        self._require_task_state_finalize(lease)
         item = lease["item"]
         request_id = str(item["request_id"])
         attempt_id = str(lease["attempt_id"])
@@ -501,8 +508,7 @@ class ModelRuntimeActor:
         *,
         error: str,
     ) -> None:
-        if not self._task_state_finalize_enabled(lease):
-            return
+        self._require_task_state_finalize(lease)
         item = lease["item"]
         await self._task_state_store.async_commit_finalize_failure(
             request_id=str(item["request_id"]),
@@ -676,19 +682,12 @@ class ModelRuntimeActor:
                 return
             task_state_committed = False
             try:
-                task_state_native_finalize = self._task_state_finalize_enabled(lease)
                 if finalization.kind == "resolve":
-                    if task_state_native_finalize:
-                        await self._commit_task_state_success(lease, payload=finalization.payload)
-                        task_state_committed = True
-                    else:
-                        await self._task_state_futures.async_resolve(request_id, finalization.payload)
+                    await self._commit_task_state_success(lease, payload=finalization.payload)
+                    task_state_committed = True
                 else:
-                    if task_state_native_finalize:
-                        await self._commit_task_state_failure(lease, error=str(finalization.payload))
-                        task_state_committed = True
-                    else:
-                        await self._task_state_futures.async_fail(request_id, str(finalization.payload))
+                    await self._commit_task_state_failure(lease, error=str(finalization.payload))
+                    task_state_committed = True
             except Exception as e:
                 if task_state_committed:
                     logger.error(
@@ -704,7 +703,7 @@ class ModelRuntimeActor:
                             lease_id=lease_id,
                             consumer_id=self._config.consumer_id,
                             consumer_generation=self._config.actor_generation,
-                            reason="task_state_futures_finalize_failed",
+                            reason="task_state_finalize_failed",
                             requeue=True,
                         )
                         self._requeued_total += 1
@@ -823,11 +822,8 @@ class ModelRuntimeActor:
                 return
             task_state_committed = False
             try:
-                if self._task_state_finalize_enabled(lease):
-                    await self._commit_task_state_failure(lease, error=f"executor failed: {e}")
-                    task_state_committed = True
-                else:
-                    await self._task_state_futures.async_fail(request_id, f"executor failed: {e}")
+                await self._commit_task_state_failure(lease, error=f"executor failed: {e}")
+                task_state_committed = True
             except Exception as e2:
                 logger.error(
                     "[model_runtime] task_state failure finalize failed actor=%s request_id=%s error_type=%s error=%s",
@@ -842,7 +838,7 @@ class ModelRuntimeActor:
                             lease_id=lease_id,
                             consumer_id=self._config.consumer_id,
                             consumer_generation=self._config.actor_generation,
-                            reason="task_state_futures_fail_failed",
+                            reason="task_state_finalize_failed",
                             requeue=True,
                         )
                         self._requeued_total += 1

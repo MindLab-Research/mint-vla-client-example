@@ -35,7 +35,7 @@ Async endpoints that require model-runtime scheduling go through `ModelWorkSched
 - `ModelWorkScheduler` keeps the hot domain backlog, per-replica subqueues, leases, and fairness state in memory.
 - `ModelActorSupervisor` observes active scheduler domains and reconciles the matching desired runtime actors from config and placement JSON. A queued training domain can therefore create the runtime needed to claim it.
 - Runtime actors claim from their scheduler-owned subqueue. Claiming is independent of `retrieve_future`; result polling reads `TaskStateStore`.
-- For scheduler leases with `attempt_id` and `scheduler_epoch`, `ModelRuntimeActor` owns terminal commit to `TaskStateStore` and lease completion/failure. Route-level `_do_*` functions may still use `TaskStateFutures.async_resolve/async_fail` as an executor-local completion signal, but those calls are buffered while running under a model-work execution context and do not write terminal state directly.
+- Scheduler leases must include `attempt_id` and `scheduler_epoch`. `ModelRuntimeActor` owns terminal commit to `TaskStateStore` and lease completion/failure. Route-level `_do_*` functions may still use `TaskStateFutures.async_resolve/async_fail` as an executor-local completion signal, but those calls are buffered while running under a model-work execution context and do not write terminal state directly. There is no scheduler-work fallback that writes terminal state through the facade.
 
 On admission failure, the API must return HTTP 429 with a structured overload reason. V1 does not enforce a hard active-task cap; add one only if the active-task index becomes a measured bottleneck.
 
