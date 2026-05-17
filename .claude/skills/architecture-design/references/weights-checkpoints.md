@@ -18,7 +18,8 @@ Patterns used:
 - Path-based loading on shared filesystem: used to avoid serializing 10k+ tensors through Ray.
 
 Key knobs and locations:
-- `TINKER_CHECKPOINT_DIR` controls where server-side code expects checkpoints/adapters for `file://` and `tinker://` URIs (see `tinker_server/routes/service.py` and `tinker_server/backend/session_manager.py`).
+- `TINKER_CHECKPOINT_DIR` controls where server-side code expects checkpoints/adapters for `file://` and `mint://` URIs (see `tinker_server/routes/service.py` and `tinker_server/backend/session_manager.py`).
+- External `tinker://` request payloads are accepted only at the API compatibility boundary and rewritten to `mint://` before route handlers run.
 
 ## Resume metadata lookup
 
@@ -72,7 +73,7 @@ After `optim_step`, weights as well as optimizer state are actor-local until a l
 
 ## Filesystem visibility contract
 
-`file://` and `tinker://` URIs are resolved to filesystem paths in the API server process.
+`file://` and `mint://` URIs are resolved to filesystem paths in the API server process.
 
 For path-based loading (vLLM `add_lora_from_path`, Megatron adapter load), the resolved directory must be visible to the Ray worker process on its node. If the path is only present on the API server node, the only viable transfer path is to materialize tensors into memory and send them via Ray object store.
 

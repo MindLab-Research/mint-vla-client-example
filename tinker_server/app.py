@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -17,6 +18,7 @@ from .auth_identity import get_request_observability_context
 from .backend.task_state_store import TaskStateStoreUnavailableError
 from .backend.session_manager import SessionManager
 from .config import config
+from .compatibility import rewrite_legacy_tinker_uris
 from .gateway import close_http_clients
 from .health_state import (
     clear_runtime_degraded_state,
@@ -876,6 +878,34 @@ async def api_key_auth_middleware(request: Request, call_next):
         return _with_trace(JSONResponse(status_code=401, content={"error": "Missing platform auth headers"}))
     with bind_request_trace_context(trace_id=trace_id):
         return await _next_with_trace()
+
+
+@app.middleware("http")
+async def external_compatibility_middleware(request: Request, call_next):
+    content_type = request.headers.get("content-type", "")
+    if request.method not in {"POST", "PUT", "PATCH"} or "json" not in content_type.lower():
+        return await call_next(request)
+
+    body = await request.body()
+    if not body:
+        return await call_next(request)
+    try:
+        payload = json.loads(body)
+    except Exception:
+        return await call_next(request)
+
+    rewritten, changed = rewrite_legacy_tinker_uris(payload)
+    if not changed:
+        return await call_next(request)
+
+    new_body = json.dumps(rewritten, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+    async def _receive():
+        return {"type": "http.request", "body": new_body, "more_body": False}
+
+    request._body = new_body  # noqa: SLF001 - Starlette request body cache.
+    request._receive = _receive  # noqa: SLF001 - make downstream body reads see the rewritten payload.
+    return await call_next(request)
 
 
 # Register routes with API prefix

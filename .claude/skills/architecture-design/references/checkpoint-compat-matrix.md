@@ -11,10 +11,13 @@ This document describes deterministic behavior for the `download -> upload -> re
   - Intended for inference/sampling only.
   - Must not include optimizer artifacts.
 
-Canonical checkpoint paths:
+Canonical internal checkpoint paths:
 
-- `tinker://{training_run_id}/weights/{checkpoint_name}`
-- `tinker://{training_run_id}/sampler_weights/{checkpoint_name}`
+- `mint://{training_run_id}/weights/{checkpoint_name}`
+- `mint://{training_run_id}/sampler_weights/{checkpoint_name}`
+
+External `tinker://...` payloads remain accepted for Tinker SDK compatibility and
+are rewritten to `mint://...` by the API compatibility middleware.
 
 Canonical checkpoint IDs (used by RestClient APIs):
 
@@ -36,4 +39,3 @@ Notes:
 - Upload contract:
   - If an extracted `metadata.json` declares `checkpoint_type`, it must match the artifacts (optimizer present vs absent), otherwise upload fails with `400`.
   - If `metadata.json` does not declare a type, MinT infers `training` if optimizer artifacts exist, otherwise `sampler`.
-
