@@ -86,6 +86,12 @@ markers = [
     "moe: tests requiring MoE resources",
     "slow: long-running tests",
 ]
+filterwarnings = [
+    "ignore:The following imports from `dynamic_context.py` will be removed.*:DeprecationWarning",
+    "ignore:builtin type SwigPyPacked has no __module__ attribute:DeprecationWarning",
+    "ignore:builtin type SwigPyObject has no __module__ attribute:DeprecationWarning",
+    "ignore:This process .* is multi-threaded, use of fork\\(\\) may lead to deadlocks in the child\\.:DeprecationWarning",
+]
 
 [dependency-groups]
 host-runtime = [
