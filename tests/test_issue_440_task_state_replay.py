@@ -153,7 +153,8 @@ def test_issue_440_known_terminal_future_evicted_not_unknown(monkeypatch):
 def test_issue_440_failure_replay_keeps_public_masking(monkeypatch):
     import tinker_server.backend.task_state_store as task_state_store_module
 
-    monkeypatch.setattr(config_module.config, "api_key", "secret", raising=False)
+    monkeypatch.setattr(config_module.config, "api_key", "", raising=False)
+    monkeypatch.setattr(config_module.config, "internal_api_token", "secret", raising=False)
     monkeypatch.setattr(futures_route, "task_state_futures", _UnknownTaskStateFutures())
     monkeypatch.setattr(
         task_state_store_module,

@@ -11,7 +11,7 @@ PROD_WORKER = REPO_ROOT / ".claude" / "skills" / "volcano-cluster" / "configs" /
 def test_dev_head_keeps_dashboard_and_ray_client_enabled() -> None:
     text = DEV_HEAD.read_text(encoding="utf-8")
 
-    assert 'HEAD_IP_PATH = "/vePFS-Mindverse/share/code/tinker-server/ray_head_ip.txt"' in text
+    assert 'HEAD_IP_PATH = "/vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt"' in text
     assert 'TMP_ROOT = os.environ.get("MINT_TMP_ROOT", "/vePFS-Mindverse/share/mint-data/dev")' in text
     assert 'RAY_TMP_ROOT_REAL = f"{TMP_ROOT}/head"' in text
     assert 'RAY_TMP_LINK = "/tmp/mdh"' in text
@@ -43,7 +43,7 @@ def test_dev_head_keeps_dashboard_and_ray_client_enabled() -> None:
 def test_dev_worker_uses_short_temp_paths() -> None:
     text = DEV_WORKER.read_text(encoding="utf-8")
 
-    assert 'HEAD_IP_PATH = "/vePFS-Mindverse/share/code/tinker-server/ray_head_ip.txt"' in text
+    assert 'HEAD_IP_PATH = "/vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt"' in text
     assert 'TMP_ROOT = os.environ.get("MINT_TMP_ROOT", "/vePFS-Mindverse/share/mint-data/dev")' in text
     assert 'RAY_TMP_ROOT_BASE = f"{TMP_ROOT}/worker"' in text
     assert 'RAY_TMP_LINK = "/tmp/mdw"' in text
@@ -70,7 +70,7 @@ def test_dev_worker_uses_short_temp_paths() -> None:
 def test_prod_head_self_heals_without_dashboard_or_ray_client() -> None:
     text = PROD_HEAD.read_text(encoding="utf-8")
 
-    assert 'HEAD_IP_PATH = "/vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt"' in text
+    assert 'HEAD_IP_PATH = "/vePFS-Mindverse/share/mint/prod/ray/head-address/ray_head_ip.txt"' in text
     assert 'TMP_ROOT = os.environ.get("MINT_TMP_ROOT", "/vePFS-Mindverse/share/mint-data/prod")' in text
     assert 'RAY_TMP_ROOT_REAL = f"{TMP_ROOT}/head"' in text
     assert 'RAY_TMP_LINK = "/tmp/mph"' in text
@@ -100,7 +100,7 @@ def test_prod_head_self_heals_without_dashboard_or_ray_client() -> None:
 def test_prod_worker_self_heals_with_backoff() -> None:
     text = PROD_WORKER.read_text(encoding="utf-8")
 
-    assert 'HEAD_IP_PATH = Path("/vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt")' in text
+    assert 'HEAD_IP_PATH = Path("/vePFS-Mindverse/share/mint/prod/ray/head-address/ray_head_ip.txt")' in text
     assert 'TMP_ROOT = os.environ.get("MINT_TMP_ROOT", "/vePFS-Mindverse/share/mint-data/prod")' in text
     assert 'RAY_TMP_ROOT_BASE = f"{TMP_ROOT}/worker"' in text
     assert 'RAY_TMP_LINK = "/tmp/mpw"' in text
