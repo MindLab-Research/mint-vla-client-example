@@ -96,24 +96,6 @@ async def cleanup_stale_actors_once() -> dict[str, int]:
         name = actor_info["name"]
         try:
             actor = ray.get_actor(name, namespace=PERSISTENT_NAMESPACE)
-            if name.startswith("dense_trainer_pool_"):
-                try:
-                    ray_kill.kill(
-                        actor,
-                        reason="legacy_dense_trainer_prefix",
-                        actor_name=name,
-                        namespace=PERSISTENT_NAMESPACE,
-                        no_restart=True,
-                    )
-                    cleaned += 1
-                except Exception as kill_err:
-                    logger.warning("Failed to kill legacy dense trainer actor %s: %s", name, kill_err)
-                try:
-                    model_actor_supervisor.unregister(name)
-                except Exception:
-                    pass
-                continue
-
             try:
                 ray.get(actor.__ray_ready__.remote(), timeout=ready_timeout_s)
                 session_id: str | None = None

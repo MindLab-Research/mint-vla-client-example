@@ -81,14 +81,12 @@ def placement_env_for_spec(spec: ModelActorSpecLike) -> dict[str, str]:
         ]
         placement_raw = json.dumps({base_model: placement_value}, sort_keys=True, separators=(",", ":"))
         node_pins = spec.normalized_node_pins()
-        nodes_raw = json.dumps({base_model: node_pins}, sort_keys=True, separators=(",", ":"))
         return {
             "MINT_MODEL_PLACEMENT_JSON": placement_raw,
             "MINT_VLLM_MODEL_PLACEMENT_JSON": placement_raw,
             "MINT_DENSE_MODEL_PLACEMENT_JSON": placement_raw,
             "MINT_MEGATRON_MODEL_PLACEMENT_JSON": placement_raw,
             "MINT_MODEL_ACTOR_REPLICA_ID": spec.replica_id,
-            "MINT_VLLM_MODEL_NODE_IPS_JSON": nodes_raw,
         }
     node_pins = spec.normalized_node_pins()
     if len(node_pins) > 1:
@@ -106,14 +104,12 @@ def placement_env_for_spec(spec: ModelActorSpecLike) -> dict[str, str]:
             sort_keys=True,
             separators=(",", ":"),
         )
-        nodes_raw = json.dumps({base_model: node_pins}, sort_keys=True, separators=(",", ":"))
         return {
             "MINT_MODEL_PLACEMENT_JSON": placement_raw,
             "MINT_VLLM_MODEL_PLACEMENT_JSON": placement_raw,
             "MINT_DENSE_MODEL_PLACEMENT_JSON": placement_raw,
             "MINT_MEGATRON_MODEL_PLACEMENT_JSON": placement_raw,
             "MINT_MODEL_ACTOR_REPLICA_ID": spec.replica_id,
-            "MINT_VLLM_MODEL_NODE_IPS_JSON": nodes_raw,
         }
     if len(node_pins) != 1:
         return {}
@@ -128,16 +124,12 @@ def placement_env_for_spec(spec: ModelActorSpecLike) -> dict[str, str]:
         sort_keys=True,
         separators=(",", ":"),
     )
-    pinned_raw = json.dumps({base_model: node_pins[0]}, sort_keys=True, separators=(",", ":"))
-    nodes_raw = json.dumps({base_model: node_pins}, sort_keys=True, separators=(",", ":"))
     return {
         "MINT_MODEL_PLACEMENT_JSON": placement_raw,
         "MINT_VLLM_MODEL_PLACEMENT_JSON": placement_raw,
         "MINT_DENSE_MODEL_PLACEMENT_JSON": placement_raw,
         "MINT_MEGATRON_MODEL_PLACEMENT_JSON": placement_raw,
         "MINT_MODEL_ACTOR_REPLICA_ID": spec.replica_id,
-        "MINT_VLLM_PINNED_NODE_IP_JSON": pinned_raw,
-        "MINT_VLLM_MODEL_NODE_IPS_JSON": nodes_raw,
     }
 
 
@@ -159,7 +151,7 @@ def default_model_actor_launcher_registry() -> ModelActorLauncherRegistry:
     launchers = {
         "internal_control": launch_model_runtime_actor,
         "training": launch_model_runtime_actor,
-        "legacy_vllm": launch_model_runtime_actor,
+        "vllm": launch_model_runtime_actor,
         "model_runtime": launch_model_runtime_actor,
     }
     return ModelActorLauncherRegistry(launchers)

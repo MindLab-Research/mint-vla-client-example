@@ -70,7 +70,7 @@ class WorkClassification:
         if capacity_owner is None:
             capacity_owner = infer_scheduler_capacity_owner(domain)
         enabled = bool(scheduler_enabled)
-        queue_kind = "scheduled" if enabled and domain and session_key and capacity_owner else "legacy"
+        queue_kind = "scheduled" if enabled and domain and session_key and capacity_owner else "direct"
         return cls(
             queue_kind=queue_kind,
             scheduler_enabled=enabled,

@@ -99,7 +99,6 @@ SNAPSHOT_CONFIG_ENV_KEYS = frozenset(
         "MINT_REVERSE_KL_DIAG_FAIL",
         "TINKER_DENSE_SESSION_STATE_ROOT",
         "TINKER_RUNTIME_CHECKPOINT_DIR",
-        "TINKER_LEGACY_DENSE_SESSION_STATE_ROOTS",
         "TINKER_USAGE_LOG_DIR",
         "TINKER_USAGE_BACKEND",
         "TINKER_USAGE_PG_DSN",
@@ -135,7 +134,6 @@ SNAPSHOT_CONFIG_ENV_KEYS = frozenset(
         "TINKER_SUPPORTED_MODELS",
         "TINKER_GATEWAY_CONFIG_JSON",
         "MINT_MODEL_ACTOR_DESIRED_JSON",
-        "MINT_MODEL_RUNTIME_DESIRED_JSON",
         "MINT_PERSISTENT_MODELS",
         "MINT_MAINTENANCE_REAP_INTERVAL_S",
         "MINT_ACTOR_RECONCILE_INTERVAL_S",
@@ -302,7 +300,6 @@ CONFIG_ACTOR_HYDRATION_CONTROL_KEYS = frozenset(
     }
 )
 CONFIG_ACTOR_HYDRATION_PREFIXES = ("MINT_", "TINKER_", "OTEL_")
-LEGACY_ACTOR_NAME_ALIASES: dict[str, str] = {}
 
 
 def config_actor_name(environ: Mapping[str, str] | None = None) -> str:
@@ -365,10 +362,6 @@ def actor_env_from_environ(environ: Mapping[str, str]) -> dict[str, str]:
             CONFIG_CLASS_TASK_STATE,
         } or (config_class == CONFIG_CLASS_UNCLASSIFIED and key.startswith(CONFIG_ACTOR_HYDRATION_PREFIXES)):
             out[key] = str(value)
-    for canonical, legacy in LEGACY_ACTOR_NAME_ALIASES.items():
-        if canonical not in out and legacy in out:
-            out[canonical] = out[legacy]
-        out.pop(legacy, None)
     return out
 
 

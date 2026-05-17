@@ -275,39 +275,6 @@ async def lifespan(app: FastAPI):
     action_sampling.action_session_manager = action_manager
     if mint is not None:
         mint.action_session_manager = action_manager
-    try:
-        from .backend.dense_session_state import cleanup_legacy_dense_session_state_once
-        from .backend.training_session_store import async_list_training_sessions
-
-        active_model_ids = {
-            str(info.get("model_id"))
-            for info in await async_list_training_sessions()
-            if isinstance(info, dict) and str(info.get("model_id") or "").strip()
-        }
-        dense_cleanup = await asyncio.to_thread(
-            cleanup_legacy_dense_session_state_once,
-            active_session_ids=active_model_ids,
-        )
-        migrated_items = dense_cleanup.get("migrated", [])
-        deleted_items = dense_cleanup.get("deleted", [])
-        skipped_items = dense_cleanup.get("skipped", [])
-        errors = dense_cleanup.get("errors", [])
-        migrated = len(migrated_items) if isinstance(migrated_items, list) else 0
-        deleted = len(deleted_items) if isinstance(deleted_items, list) else 0
-        skipped = len(skipped_items) if isinstance(skipped_items, list) else 0
-        if migrated or deleted or skipped or errors:
-            logger.info(
-                "dense session-state startup cleanup target_root=%s migrated=%s deleted=%s skipped=%s errors=%s",
-                dense_cleanup.get("target_root"),
-                migrated,
-                deleted,
-                skipped,
-                len(errors) if isinstance(errors, list) else 0,
-            )
-            if errors:
-                logger.warning("dense session-state startup cleanup errors: %s", errors)
-    except Exception:
-        logger.exception("dense session-state startup cleanup failed")
 
     app_module_git_sha = _git_sha()
     logger.info(

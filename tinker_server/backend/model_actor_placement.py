@@ -42,28 +42,9 @@ def _base_model_from_spec(spec: Any) -> str | None:
     return None
 
 
-def _legacy_vllm_actor_name(base_model: str) -> str:
-    try:
-        from .multi_lora_engine import _model_to_actor_name
-
-        return _model_to_actor_name(base_model)
-    except Exception:
-        model_part = base_model.split("/")[-1] if "/" in base_model else base_model
-        return f"tinker_vllm_{model_part.lower().replace(' ', '_')}"
-
-
-def _legacy_multinode_actor_name(base_model: str) -> str:
-    model_part = base_model.split("/")[-1] if "/" in base_model else base_model
-    return f"multinode_vllm_{model_part.lower()}"
-
-
 def _owned_actor_names_for_spec(spec: Any) -> set[str]:
-    names = {str(spec.normalized_actor_name())}
-    base_model = _base_model_from_spec(spec)
-    if base_model:
-        names.add(_legacy_vllm_actor_name(base_model))
-        names.add(_legacy_multinode_actor_name(base_model))
-    return {name for name in names if name}
+    name = str(spec.normalized_actor_name())
+    return {name} if name else set()
 
 
 def _is_supervisor_wrapper_actor_name(name: str) -> bool:

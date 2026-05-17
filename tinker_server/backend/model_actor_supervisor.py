@@ -52,7 +52,7 @@ class ModelActorSpec:
     replica_id: str = "replica-0"
     base_model: str | None = None
     actor_name: str | None = None
-    launcher_key: str = "legacy_vllm"
+    launcher_key: str = "vllm"
     node_pin: str | None = None
     node_pins: tuple[str, ...] = ()
     placement_slices: tuple[tuple[str, str, int], ...] = ()
@@ -152,7 +152,7 @@ def _spec_from_obj(obj: Any) -> ModelActorSpec:
         replica_id=_replica_id(obj.get("replica_id", obj.get("replica", 0))),
         base_model=None if base_model is None else str(base_model),
         actor_name=None if obj.get("actor_name") is None else str(obj["actor_name"]),
-        launcher_key=str(obj.get("launcher_key") or "legacy_vllm"),
+        launcher_key=str(obj.get("launcher_key") or "vllm"),
         node_pin=None if obj.get("node_pin") is None else str(obj["node_pin"]),
         node_pins=node_pins,
         gpu_count=None if obj.get("gpu_count") is None else int(obj["gpu_count"]),
@@ -250,7 +250,7 @@ def _supported_model_specs_from_env() -> dict[str, ModelActorSpec]:
         vllm_spec = _persistent_model_spec(
             model=model,
             domain_key=domain_key_for_vllm_base_model(model),
-            launcher_key="legacy_vllm",
+            launcher_key="vllm",
             placement_raw=vllm_placement_raw,
         )
         training_domain = domain_key_for_training_base_model(model)
@@ -282,7 +282,7 @@ def _spec_for_scheduler_domain_from_env(domain_key: str) -> ModelActorSpec | Non
         return _persistent_model_spec(
             model=base_model,
             domain_key=domain,
-            launcher_key="legacy_vllm",
+            launcher_key="vllm",
             placement_raw=os.environ.get("MINT_VLLM_MODEL_PLACEMENT_JSON", "").strip() or shared_placement_raw,
         )
     if domain.startswith("training:"):
@@ -360,17 +360,6 @@ def desired_specs_from_env() -> list[ModelActorSpec]:
             raise ValueError("MINT_MODEL_ACTOR_DESIRED_JSON must be a list or contain models/actors/items")
         return _with_internal_control([_spec_from_obj(item) for item in items])
 
-    legacy_raw = os.environ.get("MINT_MODEL_RUNTIME_DESIRED_JSON", "").strip()
-    if legacy_raw:
-        payload = json.loads(legacy_raw)
-        if isinstance(payload, dict):
-            items = payload.get("models") or payload.get("runtimes") or payload.get("items")
-        else:
-            items = payload
-        if not isinstance(items, list):
-            raise ValueError("MINT_MODEL_RUNTIME_DESIRED_JSON must be a list or contain models/runtimes/items")
-        return _with_internal_control([_spec_from_obj(item) for item in items])
-
     persistent = os.environ.get("MINT_PERSISTENT_MODELS", "").strip()
     if not persistent:
         return _with_internal_control([])
@@ -387,7 +376,7 @@ def desired_specs_from_env() -> list[ModelActorSpec]:
             _persistent_model_spec(
                 model=model,
                 domain_key=domain_key_for_vllm_base_model(model),
-                launcher_key="legacy_vllm",
+                launcher_key="vllm",
                 placement_raw=vllm_placement_raw,
             )
         )

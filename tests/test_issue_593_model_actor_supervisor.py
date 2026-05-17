@@ -63,7 +63,7 @@ def test_issue_593_supervisor_exposes_explicit_inventory_contract() -> None:
         actor_type=ActorType.VLLM,
         num_gpus=1,
         base_model="model-a",
-        metadata={"launcher_key": "legacy_vllm"},
+        metadata={"launcher_key": "vllm"},
     )
     supervisor.mark_ready("vllm-contract-actor")
     supervisor.mark_inflight("vllm-contract-actor", +1)
@@ -440,8 +440,6 @@ def test_issue_593_supervisor_builds_runtime_placement_env_from_node_pin() -> No
         "MINT_DENSE_MODEL_PLACEMENT_JSON": placement,
         "MINT_MEGATRON_MODEL_PLACEMENT_JSON": placement,
         "MINT_MODEL_ACTOR_REPLICA_ID": "replica-2",
-        "MINT_VLLM_PINNED_NODE_IP_JSON": '{"Qwen/Test":"10.0.0.17"}',
-        "MINT_VLLM_MODEL_NODE_IPS_JSON": '{"Qwen/Test":["10.0.0.17"]}',
     }
 
 
@@ -466,7 +464,6 @@ def test_issue_593_supervisor_builds_runtime_placement_env_from_multi_node_slice
         "MINT_DENSE_MODEL_PLACEMENT_JSON": placement,
         "MINT_MEGATRON_MODEL_PLACEMENT_JSON": placement,
         "MINT_MODEL_ACTOR_REPLICA_ID": "replica-0",
-        "MINT_VLLM_MODEL_NODE_IPS_JSON": '{"Qwen/Test":["10.0.0.17","10.0.0.18"]}',
     }
 
 
@@ -491,13 +488,11 @@ def test_issue_593_supervisor_builds_runtime_placement_env_from_multi_node_pins(
         "MINT_DENSE_MODEL_PLACEMENT_JSON": placement,
         "MINT_MEGATRON_MODEL_PLACEMENT_JSON": placement,
         "MINT_MODEL_ACTOR_REPLICA_ID": "replica-0",
-        "MINT_VLLM_MODEL_NODE_IPS_JSON": '{"Qwen/Test":["10.0.0.17","10.0.0.18"]}',
     }
 
 
 def test_issue_593_supervisor_falls_back_to_persistent_models(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MINT_MODEL_ACTOR_DESIRED_JSON", raising=False)
-    monkeypatch.delenv("MINT_MODEL_RUNTIME_DESIRED_JSON", raising=False)
     monkeypatch.delenv("MINT_MODEL_PLACEMENT_JSON", raising=False)
     monkeypatch.delenv("MINT_VLLM_MODEL_PLACEMENT_JSON", raising=False)
     monkeypatch.delenv("MINT_DENSE_MODEL_PLACEMENT_JSON", raising=False)
@@ -519,7 +514,6 @@ def test_issue_593_supervisor_falls_back_to_persistent_models(monkeypatch: pytes
 
 def test_issue_593_persistent_specs_inherit_runtime_placement(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MINT_MODEL_ACTOR_DESIRED_JSON", raising=False)
-    monkeypatch.delenv("MINT_MODEL_RUNTIME_DESIRED_JSON", raising=False)
     monkeypatch.setenv("MINT_PERSISTENT_MODELS", "Qwen/A")
     monkeypatch.setenv(
         "MINT_VLLM_MODEL_PLACEMENT_JSON",
@@ -537,7 +531,7 @@ def test_issue_593_persistent_specs_inherit_runtime_placement(monkeypatch: pytes
             domain_key="vllm:Qwen/A",
             replica_id="replica-1",
             base_model="Qwen/A",
-            launcher_key="legacy_vllm",
+            launcher_key="vllm",
             node_pins=("10.0.0.7",),
             placement_slices=(("replica-1", "10.0.0.7", 2),),
             gpu_count=2,
@@ -555,7 +549,6 @@ def test_issue_593_persistent_specs_inherit_runtime_placement(monkeypatch: pytes
 
 def test_issue_593_persistent_specs_preserve_multi_node_placement(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MINT_MODEL_ACTOR_DESIRED_JSON", raising=False)
-    monkeypatch.delenv("MINT_MODEL_RUNTIME_DESIRED_JSON", raising=False)
     monkeypatch.setenv("MINT_PERSISTENT_MODELS", "Qwen/A")
     monkeypatch.setenv(
         "MINT_VLLM_MODEL_PLACEMENT_JSON",
@@ -576,7 +569,7 @@ def test_issue_593_persistent_specs_preserve_multi_node_placement(monkeypatch: p
     assert specs[0] == ModelActorSpec(
         domain_key="vllm:Qwen/A",
         base_model="Qwen/A",
-        launcher_key="legacy_vllm",
+        launcher_key="vllm",
         node_pins=("10.0.0.7", "10.0.0.8"),
         placement_slices=(("replica-0", "10.0.0.7", 4), ("replica-0", "10.0.0.8", 4)),
         gpu_count=4,
@@ -585,7 +578,6 @@ def test_issue_593_persistent_specs_preserve_multi_node_placement(monkeypatch: p
 
 def test_issue_593_persistent_specs_reject_worker_aliases(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MINT_MODEL_ACTOR_DESIRED_JSON", raising=False)
-    monkeypatch.delenv("MINT_MODEL_RUNTIME_DESIRED_JSON", raising=False)
     monkeypatch.setenv("MINT_PERSISTENT_MODELS", "Qwen/A")
     monkeypatch.setenv(
         "MINT_VLLM_MODEL_PLACEMENT_JSON",
@@ -598,7 +590,6 @@ def test_issue_593_persistent_specs_reject_worker_aliases(monkeypatch: pytest.Mo
 
 def test_issue_593_supervisor_empty_env_has_no_desired_specs(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MINT_MODEL_ACTOR_DESIRED_JSON", raising=False)
-    monkeypatch.delenv("MINT_MODEL_RUNTIME_DESIRED_JSON", raising=False)
     monkeypatch.delenv("MINT_PERSISTENT_MODELS", raising=False)
 
     assert desired_specs_from_env() == [
@@ -653,16 +644,12 @@ def test_issue_593_placement_reconciler_uses_node_pin_and_removes_owned_orphan_p
     assert out["node_pins"]["vllm:Qwen/Test::replica-1"] == ["10.0.0.17"]
     assert out["cleaned_actor_names"] == ["mint_model_runtime_old"]
     assert ("mint_model_runtime_old", "tinker", "model_actor_supervisor_undesired_wrapper") in killed
-    assert ("tinker_vllm_test_pg", "tinker") in removed_pgs
-    assert ("multinode_vllm_test_pg", "tinker") in removed_pgs
     assert capacity_checks == [
         {
             "required": {"10.0.0.17": 4},
             "context": "model_actor_supervisor placement domain='vllm:Qwen/Test' replica='replica-1'",
             "ignore_pg_names": {
                 "mint_model_actor_vllm-Qwen-Test_replica-1_pg",
-                "tinker_vllm_test_pg",
-                "multinode_vllm_test_pg",
             },
             "namespace": "tinker",
         }

@@ -58,7 +58,7 @@ def test_issue_432_sampling_work_classification_uses_replica_key_then_base_model
     assert fallback.scheduler_capacity_owner == "model_registry_inference_dp"
 
 
-def test_issue_432_unschedulable_classification_stays_legacy() -> None:
+def test_issue_432_unschedulable_classification_stays_direct() -> None:
     classification = WorkClassification.build(
         scheduler_enabled=True,
         scheduler_domain="megatron:Qwen/Qwen3-30B-A3B-Instruct-2507",
@@ -66,7 +66,7 @@ def test_issue_432_unschedulable_classification_stays_legacy() -> None:
         scheduler_domain_key_source="backend_base_model",
     )
 
-    assert classification.queue_kind == "legacy"
+    assert classification.queue_kind == "direct"
     assert classification.scheduler_domain == "megatron:Qwen/Qwen3-30B-A3B-Instruct-2507"
     assert classification.scheduler_session_key is None
 
@@ -77,10 +77,10 @@ def test_issue_432_unschedulable_classification_stays_legacy() -> None:
         },
         scheduler_enabled_default=False,
     )
-    assert round_trip.queue_kind == "legacy"
+    assert round_trip.queue_kind == "direct"
 
 
-def test_issue_432_unknown_capacity_owner_stays_legacy() -> None:
+def test_issue_432_unknown_capacity_owner_stays_direct() -> None:
     classification = WorkClassification.build(
         scheduler_enabled=True,
         scheduler_domain="custom_backend:tenant-1",
@@ -88,7 +88,7 @@ def test_issue_432_unknown_capacity_owner_stays_legacy() -> None:
         scheduler_domain_key_source="custom",
     )
 
-    assert classification.queue_kind == "legacy"
+    assert classification.queue_kind == "direct"
     assert classification.scheduler_capacity_owner is None
 
 

@@ -71,53 +71,6 @@ def test_issue_413_training_worker_signature_accepts_session_state_root() -> Non
     assert "session_state_root" in sig.parameters
 
 
-def test_issue_413_session_state_manager_migrates_legacy_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    dense_root = tmp_path / "runtime" / "dense_session_state"
-    legacy_root = tmp_path / "legacy_dense_state"
-    monkeypatch.setattr(server_config, "training_dense_session_state_root", str(dense_root))
-    monkeypatch.setattr(dense_state_module, "DEFAULT_LEGACY_DENSE_SESSION_STATE_ROOT", str(legacy_root))
-
-    legacy_dir = _write_dense_session_dir(legacy_root, "model-413")
-    manager = SessionStateManager(base_path=str(dense_root))
-
-    migrated = dense_state_module.maybe_migrate_legacy_dense_session_state("model-413", root=str(dense_root))
-    assert migrated == str((dense_root / "model-413_checkpoint").resolve())
-    assert manager.session_exists("model-413") is True
-    assert not legacy_dir.exists()
-    assert (dense_root / "model-413_checkpoint" / "adapter_model.safetensors").exists()
-
-    assert manager.delete_session("model-413") is True
-    assert not (dense_root / "model-413_checkpoint").exists()
-
-
-def test_issue_413_startup_cleanup_migrates_active_and_reaps_stale_legacy(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    dense_root = tmp_path / "runtime" / "dense_session_state"
-    legacy_root = tmp_path / "legacy_dense_state"
-    monkeypatch.setattr(server_config, "training_dense_session_state_root", str(dense_root))
-    monkeypatch.setattr(dense_state_module, "DEFAULT_LEGACY_DENSE_SESSION_STATE_ROOT", str(legacy_root))
-
-    active_dir = _write_dense_session_dir(legacy_root, "model-active", age_s=600)
-    stale_dir = _write_dense_session_dir(legacy_root, "model-stale", age_s=600)
-    fresh_dir = _write_dense_session_dir(legacy_root, "model-fresh", age_s=10)
-
-    result = dense_state_module.cleanup_legacy_dense_session_state_once(
-        active_session_ids={"model-active"},
-        stale_after_s=60.0,
-        root=str(dense_root),
-    )
-
-    assert result["migrated"] == ["model-active"]
-    assert result["deleted"] == ["model-stale"]
-    assert result["skipped"] == ["model-fresh"]
-    assert not active_dir.exists()
-    assert not stale_dir.exists()
-    assert fresh_dir.exists()
-    assert (dense_root / "model-active_checkpoint" / "adapter_model.safetensors").exists()
-
-
 def test_issue_413_shutdown_session_reclaims_dense_state_for_shared_actor(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
