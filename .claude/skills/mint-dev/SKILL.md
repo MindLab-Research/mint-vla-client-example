@@ -31,11 +31,11 @@ Procedure contract:
 > | Server logs | `ssh mint-dev "tail -50 /tmp/tinker_server.log"` |
 > | Health check | `curl http://localhost:8000/api/v1/healthz` |
 > | Restart server | See "Start Server" section below |
-> | Kill vLLM | `curl -X POST -H "Content-Type: application/json" -d '{"actor_type":"vllm"}' http://localhost:8000/api/v1/actors/kill` |
+> | Kill vLLM | `curl -X POST -H "Content-Type: application/json" -d '{"actor_type":"vllm"}' http://localhost:8000/internal/actors/kill` |
 >
 > If you find yourself guessing or trial-and-error debugging basic infrastructure, **STOP and re-read this skill**.
 >
-> Note: `GET /api/v1/healthz` is the cheap public API-worker health endpoint. For costly Ray / placement-group diagnostics, use the internal deep health surface instead of expecting `healthz` to reflect cluster capacity.
+> Note: `GET /api/v1/healthz` is the cheap public API-worker health endpoint. For costly Ray / placement-group diagnostics, use the internal deep health surface instead of expecting `healthz` to reflect cluster capacity. For `/internal/*` actor, scheduler, admission, and deep-health operations, use the `mint-ops` skill after this environment skill.
 
 > **CRITICAL: RESTART SERVER AFTER CODE CHANGES**
 >
@@ -647,12 +647,12 @@ curl http://localhost:8000/api/v1/healthz
 ssh mint-dev "tail -50 /tmp/tinker_server.log"
 
 # vLLM status
-curl "http://localhost:8000/api/v1/actors?type=vllm"
+curl "http://localhost:8000/internal/actors?type=vllm"
 
 # Kill vLLM
 curl -X POST -H "Content-Type: application/json" \
   -d '{"actor_type":"vllm"}' \
-  http://localhost:8000/api/v1/actors/kill
+  http://localhost:8000/internal/actors/kill
 ```
 
 ---
@@ -759,53 +759,26 @@ ssh mint-dev "ps aux | grep run_server | grep -v grep"
 
 ---
 
-## 3. vLLM Actor
+## 3. GPU Actor Admin
 
 | Operation | Time | When to use |
 |-----------|------|-------------|
 | Reconnect (existing) | ~2s | Server restart, vLLM actor still alive |
 | Kill + restart | ~80s | Base model changed, OOM, vLLM code changed |
 
-### Kill vLLM Actor
+Use the `mint-ops` skill for the full `/internal/*` control-plane semantics. Dev defaults:
 
 ```bash
-# Via API (admin only when auth is enabled; do not kill random processes)
+BASE=http://localhost:8000
+
+# Actor inventory
+curl -s "$BASE/internal/actors?type=vllm" | jq
+curl -s "$BASE/internal/actors?type=megatron" | jq
+
+# Kill an actor family
 curl -X POST -H "Content-Type: application/json" \
-  -d '{"actor_type":"vllm"}' \
-  http://localhost:8000/api/v1/actors/kill
-
-# Kill specific model's vLLM actor
-curl -X POST -H "Content-Type: application/json" \
-  -d '{"actor_type":"vllm","model_name":"Qwen/Qwen3-30B-A3B-Instruct-2507"}' \
-  http://localhost:8000/api/v1/actors/kill
-```
-
-### Kill Megatron Actor
-
-```bash
-curl -X POST -H "Content-Type: application/json" \
-  -d '{"actor_type":"megatron"}' \
-  http://localhost:8000/api/v1/actors/kill
-
-# Kill specific model's Megatron actor
-curl -X POST -H "Content-Type: application/json" \
-  -d '{"actor_type":"megatron","model_name":"Qwen/Qwen3-30B-A3B-Instruct-2507"}' \
-  http://localhost:8000/api/v1/actors/kill
-```
-
-### Check Actor Status
-
-```bash
-# vLLM status
-curl -s "http://localhost:8000/api/v1/actors?type=vllm" | jq
-
-# Megatron status
-curl -s "http://localhost:8000/api/v1/actors?type=megatron" | jq
-
-# Kill all tracked GPU actors (admin only when auth is enabled)
-curl -X POST -H "Content-Type: application/json" \
-  -d '{"actor_type":"all"}' \
-  http://localhost:8000/api/v1/actors/kill
+  -d '{"actor_type":"vllm","reason":"dev_reload"}' \
+  "$BASE/internal/actors/kill" | jq
 ```
 
 ---
@@ -960,7 +933,7 @@ Use this after vLLM actor code changes, OOM, or switching base model.
 ```bash
 curl -X POST -H "Content-Type: application/json" \
   -d '{"actor_type":"vllm"}' \
-  http://localhost:8000/api/v1/actors/kill
+  http://localhost:8000/internal/actors/kill
 ssh mint-dev 'pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true'
 ssh mint-dev "cd /root/tinker_project/tinker-server && nohup bash -c \
   \". ./configs/dev_volcano.env.sh && \
@@ -981,7 +954,7 @@ Use this after Megatron actor code changes, OOM, or switching base model.
 ```bash
 curl -X POST -H "Content-Type: application/json" \
   -d '{"actor_type":"megatron"}' \
-  http://localhost:8000/api/v1/actors/kill
+  http://localhost:8000/internal/actors/kill
 ssh mint-dev 'pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true'
 ssh mint-dev "cd /root/tinker_project/tinker-server && nohup bash -c \
   \". ./configs/dev_volcano.env.sh && \
@@ -999,12 +972,12 @@ curl -s http://localhost:8000/api/v1/healthz
 
 Use this after shared actor code changes (for example `tinker_server/backend/model_registry.py`) or when GPUs are exhausted.
 
-Note: `/api/v1/actors/kill` with `{"actor_type":"all"}` kills ModelActorSupervisorInventory-tracked GPU actors (vLLM, Megatron, dense trainer pool). It does not kill detached store actors.
+Note: `/internal/actors/kill` with `{"actor_type":"all"}` kills ModelActorSupervisor-tracked GPU actors (vLLM, Megatron, dense trainer pool). It does not kill detached store actors.
 
 ```bash
 curl -X POST -H "Content-Type: application/json" \
   -d '{"actor_type":"all"}' \
-  http://localhost:8000/api/v1/actors/kill
+  http://localhost:8000/internal/actors/kill
 ssh mint-dev 'pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true'
 ssh mint-dev "cd /root/tinker_project/tinker-server && nohup bash -c \
   \"PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/mint-runtime-py31213 \

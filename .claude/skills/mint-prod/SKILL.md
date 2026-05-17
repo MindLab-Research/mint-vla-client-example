@@ -32,11 +32,11 @@ Procedure contract:
 > | Health check | `curl http://localhost:18000/api/v1/healthz` |
 > | Restart server | `ssh mint-prod-volcano 'supervisorctl restart tinker-server-auth'` |
 > | Stop server (fallback) | `ssh mint-prod-volcano 'fuser -k 18000/tcp'` (NOT pkill) |
-> | Kill vLLM | `curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/json" -d '{"actor_type":"vllm"}' http://localhost:18000/api/v1/actors/kill` |
+> | Kill vLLM | `curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/json" -d '{"actor_type":"vllm"}' http://localhost:18000/internal/actors/kill` |
 >
 > If you find yourself guessing or trial-and-error debugging basic infrastructure, **STOP and re-read this skill**.
 >
-> Note: `GET /api/v1/healthz` is the cheap public API-worker health endpoint. For costly Ray / placement-group diagnostics, use the internal deep health surface instead of expecting `healthz` to reflect cluster capacity.
+> Note: `GET /api/v1/healthz` is the cheap public API-worker health endpoint. For costly Ray / placement-group diagnostics, use the internal deep health surface instead of expecting `healthz` to reflect cluster capacity. For `/internal/*` actor, scheduler, admission, and deep-health operations, use the `mint-ops` skill after this environment skill.
 
 ---
 
@@ -117,7 +117,7 @@ K2 is not in production service yet. Skip this section unless the task is explic
 1) Query actor inventory:
 ```bash
 source .secrets.env
-curl -s -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/actors | jq '.actors[] | {actor_name,actor_type,base_model,idle,current_session,num_gpus}'
+curl -s -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/internal/actors | jq '.actors[] | {actor_name,actor_type,base_model,idle,current_session,num_gpus}'
 ```
 
 2) Query queue-to-node IP mapping:
@@ -158,10 +158,10 @@ source .secrets.env
 ssh mint-prod-volcano 'supervisorctl restart tinker-server-auth'
 curl -s -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/json" \
   -d '{"actor_type":"megatron","model_name":"moonshotai/Kimi-K2-Instruct"}' \
-  http://localhost:18000/api/v1/actors/kill
+  http://localhost:18000/internal/actors/kill
 curl -s -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/json" \
   -d '{"actor_type":"vllm","model_name":"moonshotai/Kimi-K2-Instruct"}' \
-  http://localhost:18000/api/v1/actors/kill
+  http://localhost:18000/internal/actors/kill
 ```
 
 Then recreate actors as needed and re-run placement checks above.
@@ -205,10 +205,10 @@ curl http://localhost:18000/api/v1/healthz
 ssh mint-prod-volcano "tail -50 /tmp/tinker_server_auth.log"
 
 # vLLM status (auth required)
-curl -H "X-API-Key: $TINKER_API_KEY" "http://localhost:18000/api/v1/actors?type=vllm"
+curl -H "X-API-Key: $TINKER_API_KEY" "http://localhost:18000/internal/actors?type=vllm"
 
 # Kill vLLM (auth required)
-curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/json" -d '{"actor_type":"vllm"}' http://localhost:18000/api/v1/actors/kill
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/json" -d '{"actor_type":"vllm"}' http://localhost:18000/internal/actors/kill
 ```
 
 ---
@@ -428,51 +428,23 @@ ssh mint-prod-volcano "ps aux | grep run_server | grep -v grep"
 | Reconnect (existing) | ~2s | Server restart, GPU actor still alive |
 | Kill + restart | ~80s | Base model changed, OOM, GPU actor code changed |
 
-Current admin route:
-- `POST /api/v1/actors/kill`
-- `actor_type`: `vllm`, `megatron`, `dense`, or `all`
-- optional filters: `model_name`, `actor_name`, `force`, `reason`
-
-### Kill vLLM Actor
+Use the `mint-ops` skill for the full `/internal/*` control-plane semantics. Prod defaults:
 
 ```bash
-# Kill all tracked vLLM actors
-curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/json"   -d '{"actor_type":"vllm"}' http://localhost:18000/api/v1/actors/kill
+source .secrets.env
+BASE=http://localhost:18000
 
-# Kill one model's vLLM actor
-curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/json"   -d '{"actor_type":"vllm","model_name":"Qwen/Qwen3-30B-A3B-Instruct-2507"}'   http://localhost:18000/api/v1/actors/kill
+# Actor inventory
+curl -s -H "X-API-Key: $TINKER_API_KEY" "$BASE/internal/actors?type=vllm" | jq
+curl -s -H "X-API-Key: $TINKER_API_KEY" "$BASE/internal/actors?type=megatron" | jq
+
+# Kill an actor family
+curl -s -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/json" \
+  -d '{"actor_type":"vllm","reason":"prod_reload"}' \
+  "$BASE/internal/actors/kill" | jq
 ```
 
-### Kill Megatron Actor
-
-```bash
-# Kill all tracked Megatron actors
-curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/json"   -d '{"actor_type":"megatron"}' http://localhost:18000/api/v1/actors/kill
-
-# Kill one model's Megatron actor
-curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/json"   -d '{"actor_type":"megatron","model_name":"Qwen/Qwen3-30B-A3B-Instruct-2507"}'   http://localhost:18000/api/v1/actors/kill
-```
-
-### Check Actor Status
-
-```bash
-# vLLM status
-curl -s -H "X-API-Key: $TINKER_API_KEY" "http://localhost:18000/api/v1/actors?type=vllm" | jq
-
-# Megatron status
-curl -s -H "X-API-Key: $TINKER_API_KEY" "http://localhost:18000/api/v1/actors?type=megatron" | jq
-
-# Full tracked actor inventory
-curl -s -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/actors | jq '.actors[] | {actor_name,actor_type,base_model,idle,current_session,num_gpus}'
-```
-
-### Kill all tracked GPU actors
-
-```bash
-curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/json"   -d '{"actor_type":"all"}' http://localhost:18000/api/v1/actors/kill
-```
-
-`{"actor_type":"all"}` kills only ModelActorSupervisorInventory-tracked GPU actors. It does not clear detached scheduler/runtime/store actors.
+`{"actor_type":"all"}` kills only ModelActorSupervisor-tracked GPU actors. It does not clear detached scheduler/runtime/store actors.
 
 ---
 
@@ -513,17 +485,16 @@ If `TINKER_CHECKPOINT_INDEX_PG_DSN` or checkpoint publication code changes and o
 
 ### Kill Actors
 
-The current admin route is `POST /api/v1/actors/kill`.
-Use it for ModelActorSupervisorInventory-tracked GPU actor families only:
+Use `mint-ops` for the full actor-admin semantics. The current admin route is `POST /internal/actors/kill`; it only manages ModelActorSupervisor-tracked GPU actor families.
 
 ```bash
 # Kill one GPU actor family (admin only when auth is enabled)
-curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H 'Content-Type: application/json'   -d '{"actor_type":"vllm"}' http://localhost:18000/api/v1/actors/kill
-curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H 'Content-Type: application/json'   -d '{"actor_type":"megatron"}' http://localhost:18000/api/v1/actors/kill
-curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H 'Content-Type: application/json'   -d '{"actor_type":"dense"}' http://localhost:18000/api/v1/actors/kill
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H 'Content-Type: application/json'   -d '{"actor_type":"vllm"}' http://localhost:18000/internal/actors/kill
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H 'Content-Type: application/json'   -d '{"actor_type":"megatron"}' http://localhost:18000/internal/actors/kill
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H 'Content-Type: application/json'   -d '{"actor_type":"dense"}' http://localhost:18000/internal/actors/kill
 
 # Kill all tracked GPU actors
-curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H 'Content-Type: application/json'   -d '{"actor_type":"all"}' http://localhost:18000/api/v1/actors/kill
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H 'Content-Type: application/json'   -d '{"actor_type":"all"}' http://localhost:18000/internal/actors/kill
 ```
 
 `{"actor_type":"all"}` kills only `vllm`, `megatron`, and `dense` actors.
@@ -603,7 +574,7 @@ ssh mint-prod-volcano 'supervisorctl restart tinker-server-auth'
 ### Restart after killing vLLM
 
 ```bash
-curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H 'Content-Type: application/json'   -d '{"actor_type":"vllm"}' http://localhost:18000/api/v1/actors/kill
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H 'Content-Type: application/json'   -d '{"actor_type":"vllm"}' http://localhost:18000/internal/actors/kill
 ssh mint-prod-volcano 'supervisorctl restart tinker-server-auth'
 sleep 80 && curl -s http://localhost:18000/api/v1/healthz
 ```
@@ -611,7 +582,7 @@ sleep 80 && curl -s http://localhost:18000/api/v1/healthz
 ### Restart after killing Megatron
 
 ```bash
-curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H 'Content-Type: application/json'   -d '{"actor_type":"megatron"}' http://localhost:18000/api/v1/actors/kill
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H 'Content-Type: application/json'   -d '{"actor_type":"megatron"}' http://localhost:18000/internal/actors/kill
 ssh mint-prod-volcano 'supervisorctl restart tinker-server-auth'
 curl -s http://localhost:18000/api/v1/healthz
 ```
@@ -622,7 +593,7 @@ Use this after shared GPU actor code changes or when GPUs are exhausted.
 Use the full detached control-plane reset above when queued-path or control-plane code changed.
 
 ```bash
-curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H 'Content-Type: application/json'   -d '{"actor_type":"all"}' http://localhost:18000/api/v1/actors/kill
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H 'Content-Type: application/json'   -d '{"actor_type":"all"}' http://localhost:18000/internal/actors/kill
 ssh mint-prod-volcano 'supervisorctl restart tinker-server-auth'
 sleep 80 && curl -s http://localhost:18000/api/v1/healthz
 ```
