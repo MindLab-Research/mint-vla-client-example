@@ -795,7 +795,7 @@ def _build_sdk_archive_redirect_response(
     from ..download_tokens import make_archive_download_token
     from starlette.datastructures import URL
 
-    secret = (config.token_secret_key or config.api_key or "").strip()
+    secret = config.download_token_secret
 
     def _first_forwarded(value: str | None) -> str | None:
         if not value:
@@ -2268,7 +2268,7 @@ async def download_checkpoint_archive(
     user_id = _get_user_id(request)
     if user_id is None:
         download_token = request.query_params.get("download_token")
-        secret = (config.token_secret_key or config.api_key or "").strip()
+        secret = config.download_token_secret
         payload = verify_download_token(download_token or "", secret=secret)
         if (
             isinstance(payload, dict)

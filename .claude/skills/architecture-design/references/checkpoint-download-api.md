@@ -98,7 +98,7 @@ Application Gateway (reverse proxy)
     ▼
 Mint Server (/internal/v1/*)
     │
-    ├── Auth: extract user_id from sk- token
+    ├── Auth: read platform-forwarded identity headers
     ├── List: query checkpoints where owner_id = user_id
     └── Download: stream tar.gz if owner_id matches
     │

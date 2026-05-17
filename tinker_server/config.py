@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import secrets
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -406,9 +405,8 @@ class ServerConfig:
     port: int = 8000
 
     # Authentication
-    api_key: str = ""  # Hardcoded API key (legacy). If set, accepts this key directly.
-    token_secret_key: str = ""  # Secret for sk- token decryption. If set, accepts encrypted tokens.
-    internal_api_token: str = ""  # Shared token for trusting gateway-forwarded billing headers.
+    api_key: str = ""  # Deprecated; retained for signed-download token compatibility.
+    internal_api_token: str = ""  # Shared token for trusting platform-forwarded identity headers.
 
     # Usage billing
     usage_log_dir: str = "/tmp/tinker_usage"  # deprecated; billing writes directly to PostgreSQL
@@ -509,11 +507,13 @@ class ServerConfig:
     ) -> "ServerConfig":
         """Load configuration from env vars + optional config file (env wins)."""
         api_key = environ.get("TINKER_API_KEY", "")
-        token_secret_key = environ.get("TINKER_TOKEN_SECRET_KEY", "")
-        # Auth disabled (dev mode) if neither api_key nor token_secret_key is set
-        auth_enabled = bool(api_key or token_secret_key)
         inactivity_s = environ.get("TINKER_SESSION_INACTIVITY_TIMEOUT_S") or environ.get("TINKER_INACTIVITY_TIMEOUT_S")
         file_server = config_file.server if config_file is not None else None
+        internal_api_token = _env_nonempty(environ, "INTERNAL_API_TOKEN") or (
+            file_server.internal_api_token if file_server is not None else None
+        )
+        # Auth is disabled in dev unless a platform internal token is configured.
+        auth_enabled = bool(internal_api_token)
         file_sampling = config_file.sampling if config_file is not None else None
         file_model_actor_inventory = config_file.model_actor_inventory if config_file is not None else None
         file_future = config_file.future if config_file is not None else None
@@ -576,7 +576,6 @@ class ServerConfig:
             host=_pick_str("TINKER_HOST", file_server.host if file_server is not None else None, "0.0.0.0"),
             port=_pick_int("TINKER_PORT", file_server.port if file_server is not None else None, 8000),
             api_key=api_key,
-            token_secret_key=token_secret_key,
             internal_api_token=_pick_str(
                 "INTERNAL_API_TOKEN",
                 file_server.internal_api_token if file_server is not None else None,
@@ -870,13 +869,12 @@ class ServerConfig:
     @property
     def auth_enabled(self) -> bool:
         """Check if any authentication is configured."""
-        return bool(self.api_key or self.token_secret_key)
+        return bool(self.internal_api_token)
 
-    def validate_api_key(self, provided_key: str) -> bool:
-        """Validate hardcoded API key using constant-time comparison."""
-        if not self.api_key:
-            return False
-        return secrets.compare_digest(self.api_key, provided_key)
+    @property
+    def download_token_secret(self) -> str:
+        """Secret used for short-lived SDK archive download URLs."""
+        return (self.internal_api_token or self.api_key or "").strip()
 
     def validate_deprecated_usage_config(self) -> None:
         backend = str(self.usage_backend or "").strip().lower()

@@ -38,7 +38,6 @@ from .logging_context import (
 from .ray_utils import init_ray, ray_connection_epoch, ray_reconnect_poll_s
 from .routes import action_sampling, futures, internal, openai_compat, sampling, service, training, weights
 from .server_info import _git_sha
-from .token_encryptor import TokenEncryptor
 
 if TYPE_CHECKING:
     from .backend.multi_lora_engine import MultiModelInferenceManager
@@ -557,18 +556,6 @@ _OTEL_EXCLUDED_PATHS: set[str] = set() if _OTEL_EXCLUDE_NONE else {
     "/internal/metrics",
 }
 
-# Token encryptor for sk- token validation (initialized lazily)
-_token_encryptor: TokenEncryptor | None = None
-
-
-def get_token_encryptor() -> TokenEncryptor | None:
-    """Get or create token encryptor if secret key is configured."""
-    global _token_encryptor
-    if _token_encryptor is None and config.token_secret_key:
-        _token_encryptor = TokenEncryptor(config.token_secret_key)
-    return _token_encryptor
-
-
 @app.middleware("http")
 async def otel_trace_metrics_middleware(request: Request, call_next):
     """Manual OTel instrumentation for HTTP server traces and metrics."""
@@ -766,7 +753,7 @@ async def otel_trace_metrics_middleware(request: Request, call_next):
 
 @app.middleware("http")
 async def api_key_auth_middleware(request: Request, call_next):
-    """Validate gateway-forwarded auth headers (preferred) with legacy fallback."""
+    """Validate platform-forwarded identity headers, or use dev pass-through."""
     path = request.url.path
     traceparent_trace_id = extract_trace_id_from_traceparent(request.headers.get("traceparent"))
     incoming_trace_id = traceparent_trace_id
@@ -803,8 +790,7 @@ async def api_key_auth_middleware(request: Request, call_next):
             try:
                 from .download_tokens import verify_download_token
 
-                # Prefer token_secret_key (if configured), otherwise api_key.
-                secret = config.token_secret_key or config.api_key or ""
+                secret = config.download_token_secret
                 payload = verify_download_token(str(download_token), secret=secret)
                 if payload is None:
                     raise ValueError("invalid token")
@@ -858,8 +844,9 @@ async def api_key_auth_middleware(request: Request, call_next):
             ):
                 return await _next_with_trace()
 
-        # Legacy auth disabled => dev mode pass-through with explicit write caps.
-        if not config.auth_enabled:
+        # No internal token means local/dev mode. Prod should configure
+        # INTERNAL_API_TOKEN and send platform identity headers on every API call.
+        if not config.internal_api_token:
             existing_user_data = getattr(request.state, "user_data", None)
             if not isinstance(existing_user_data, dict):
                 request.state.user_data = {
@@ -886,49 +873,7 @@ async def api_key_auth_middleware(request: Request, call_next):
             ):
                 return await _next_with_trace()
 
-        api_key = request.headers.get("X-API-Key", "")
-        if not api_key:
-            auth_header = request.headers.get("Authorization", "")
-            if auth_header.startswith("Bearer "):
-                api_key = auth_header[7:]
-            elif auth_header.startswith("sk-"):
-                api_key = auth_header
-
-        if not api_key:
-            return _with_trace(JSONResponse(status_code=401, content={"error": "Missing API key"}))
-
-        if config.validate_api_key(api_key):
-            request.state.user_data = {"user_id": "admin", "user_role": "admin", "is_admin": True}
-            with bind_request_trace_context(
-                trace_id=trace_id,
-                user_id="admin",
-                user_role="admin",
-            ):
-                return await _next_with_trace()
-
-        if api_key.startswith("sk-") and config.token_secret_key:
-            encryptor = get_token_encryptor()
-            if encryptor:
-                user_data = encryptor.decrypt_token(api_key)
-                if user_data is not None:
-                    if "user_role" not in user_data:
-                        user_data["user_role"] = "admin" if user_data.get("user_id") == "admin" else "user"
-                    if "is_admin" not in user_data:
-                        user_data["is_admin"] = user_data.get("user_role") == "admin"
-                    request.state.user_data = user_data
-                    obs = get_request_observability_context(request)
-                    with bind_request_trace_context(
-                        request_id=obs.get("gateway_request_id"),
-                        trace_id=trace_id,
-                        user_id=obs.get("user_id"),
-                        user_role=obs.get("user_role"),
-                        account_id=obs.get("account_id"),
-                        apikey_id=obs.get("apikey_id"),
-                        gateway_request_id=obs.get("gateway_request_id"),
-                        gateway_session_id=obs.get("gateway_session_id"),
-                    ):
-                        return await _next_with_trace()
-        return _with_trace(JSONResponse(status_code=401, content={"error": "Invalid API key or token"}))
+        return _with_trace(JSONResponse(status_code=401, content={"error": "Missing platform auth headers"}))
     with bind_request_trace_context(trace_id=trace_id):
         return await _next_with_trace()
 

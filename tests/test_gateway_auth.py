@@ -136,7 +136,7 @@ def test_can_access_model_allows_privileged_restricted_model_access():
     )
 
 
-def test_build_billing_auth_context_from_legacy_user_data():
+def test_build_billing_auth_context_from_dev_user_data():
     request = SimpleNamespace(
         state=SimpleNamespace(
             user_data={
@@ -147,14 +147,14 @@ def test_build_billing_auth_context_from_legacy_user_data():
         headers={},
     )
 
-    ctx = build_billing_auth_context(request, fallback_request_id="req-legacy")
+    ctx = build_billing_auth_context(request, fallback_request_id="req-dev")
 
     assert ctx is not None
     assert ctx.user_id == "aaaaaaaaaaaaaaaaaaaaaaaa"
     assert ctx.user_role == "user"
     assert ctx.account_id == "aaaaaaaaaaaaaaaaaaaaaaaa"
     assert ctx.apikey_id == "bbbbbbbbbbbbbbbbbbbbbbbb"
-    assert ctx.request_id == "req-legacy"
+    assert ctx.request_id == "req-dev"
 
 
 def test_build_billing_auth_context_from_gateway_state_preserves_role():
@@ -180,8 +180,7 @@ def test_build_billing_auth_context_from_gateway_state_preserves_role():
 
 @pytest.mark.anyio
 async def test_internal_route_requires_auth(monkeypatch, anyio_backend):
-    monkeypatch.setattr(app_module.config, "api_key", "admin-key")
-    monkeypatch.setattr(app_module.config, "token_secret_key", "")
+    monkeypatch.setattr(app_module.config, "api_key", "")
     monkeypatch.setattr(app_module.config, "internal_api_token", "internal-secret")
 
     scope = {
@@ -207,7 +206,6 @@ async def test_internal_route_requires_auth(monkeypatch, anyio_backend):
 @pytest.mark.anyio
 async def test_gateway_auth_sets_response_apikey_header(monkeypatch, anyio_backend):
     monkeypatch.setattr(app_module.config, "api_key", "")
-    monkeypatch.setattr(app_module.config, "token_secret_key", "")
     monkeypatch.setattr(app_module.config, "internal_api_token", "internal-secret")
 
     scope = {
@@ -285,7 +283,6 @@ class _DummyTracer:
 @pytest.mark.anyio
 async def test_http_observability_includes_gateway_identity(monkeypatch, caplog, anyio_backend):
     monkeypatch.setattr(app_module.config, "api_key", "")
-    monkeypatch.setattr(app_module.config, "token_secret_key", "")
     monkeypatch.setattr(app_module.config, "internal_api_token", "internal-secret")
 
     propagate_mod = types.ModuleType("opentelemetry.propagate")
@@ -350,9 +347,9 @@ async def test_http_observability_includes_gateway_identity(monkeypatch, caplog,
 
 
 @pytest.mark.anyio
-async def test_legacy_user_data_sets_response_apikey_header(monkeypatch, anyio_backend):
+async def test_dev_user_data_sets_response_apikey_header(monkeypatch, anyio_backend):
     monkeypatch.setattr(app_module.config, "api_key", "")
-    monkeypatch.setattr(app_module.config, "token_secret_key", "")
+    monkeypatch.setattr(app_module.config, "internal_api_token", "")
 
     scope = {
         "type": "http",

@@ -1,4 +1,4 @@
-"""Helpers for request identity, legacy role fallback, and capability checks."""
+"""Helpers for platform-forwarded request identity and capability checks."""
 
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ def _caps_from_headers(user_data: dict | None) -> bool:
     return _coerce_bool(user_data.get("caps_from_headers"))
 
 
-def _legacy_caps_for_role(role: str | None) -> tuple[bool, bool, bool, bool]:
+def _trusted_caps_for_role(role: str | None) -> tuple[bool, bool, bool, bool]:
     normalized = str(role or "").strip().lower()
     if normalized == "admin":
         return True, True, True, True
@@ -68,7 +68,7 @@ def _cap_from_user_data(user_data: dict | None, key: str, index: int) -> bool:
         )
     if _caps_from_headers(user_data):
         return _coerce_bool(user_data.get(key))
-    return _legacy_caps_for_role(get_user_role_from_user_data(user_data))[index]
+    return _trusted_caps_for_role(get_user_role_from_user_data(user_data))[index]
 
 
 def can_write_user_data(user_data: dict | None) -> bool:
@@ -173,4 +173,3 @@ def get_request_observability_context(request: Request) -> dict[str, str]:
 def can_access_restricted_models_user_data(user_data: dict | None) -> bool:
     role = get_user_role_from_user_data(user_data)
     return role == "admin"
-

@@ -180,7 +180,7 @@ def test_server_config_task_state_store_defaults_follow_auth_mode():
     assert dev.task_state_store_db_path == "/vePFS-Mindverse/share/mint/dev/data/task-state/task_state.sqlite3"
 
     prod = ServerConfig.from_sources(
-        environ={"TINKER_API_KEY": "secret"},
+        environ={"INTERNAL_API_TOKEN": "secret"},
         config_path=None,
         config_file=None,
     )

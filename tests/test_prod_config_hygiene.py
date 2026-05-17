@@ -29,7 +29,6 @@ def test_secrets_env_contains_only_secret_exports() -> None:
     names = _exported_names(SECRETS_ENV)
     assert names == [
         "TINKER_API_KEY",
-        "TINKER_TOKEN_SECRET_KEY",
         "MINT_API_KEY",
         "CRS_OAI_KEY",
         "MINT_APMPLUS_APP_KEY",

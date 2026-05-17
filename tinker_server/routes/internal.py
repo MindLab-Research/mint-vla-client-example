@@ -136,7 +136,8 @@ async def get_usage_logs(
 ):
     """Query usage logs for the authenticated user.
 
-    Logs are automatically filtered by the user_id extracted from the sk- token.
+    Logs are automatically filtered by the account id from platform-forwarded
+    identity headers.
 
     Args:
         since: Only return logs after this timestamp (ISO 8601)

@@ -8,7 +8,7 @@ def test_issue_261_response_uses_final_trace_id(monkeypatch):
     from tinker_server.app import api_key_auth_middleware
 
     monkeypatch.setattr(config_module.config, "api_key", None, raising=False)
-    monkeypatch.setattr(config_module.config, "token_secret_key", None, raising=False)
+    monkeypatch.setattr(config_module.config, "internal_api_token", "", raising=False)
 
     app = FastAPI()
     app.middleware("http")(api_key_auth_middleware)

@@ -16,7 +16,8 @@ Unknown keys and type mismatches fail fast at startup with a validation error.
 
 ## Supported keys
 
-Secrets stay in environment variables (`TINKER_API_KEY`, `TINKER_TOKEN_SECRET_KEY`); the config file schema forbids them.
+Secrets stay in environment variables. `INTERNAL_API_TOKEN` is the production
+trust boundary between the platform and Mint API process.
 
 ### `[server]`
 

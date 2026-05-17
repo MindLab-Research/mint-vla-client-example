@@ -46,9 +46,9 @@ def test_issue_190_redirect_location_is_fetchable_without_headers_under_auth(
 
     weights_routes.CHECKPOINTS_DIR = str(tmp_path)
 
-    # Enable auth via hardcoded API key.
-    monkeypatch.setattr(config_module.config, "api_key", "sekret", raising=False)
-    monkeypatch.setattr(config_module.config, "token_secret_key", None, raising=False)
+    # Enable platform auth; the direct archive URL uses a short-lived signed token.
+    monkeypatch.setattr(config_module.config, "api_key", "", raising=False)
+    monkeypatch.setattr(config_module.config, "internal_api_token", "sekret", raising=False)
 
     run_id = "run-190-auth"
     _mk_checkpoint(
@@ -66,7 +66,14 @@ def test_issue_190_redirect_location_is_fetchable_without_headers_under_auth(
 
     resp = client.get(
         f"/api/v1/training_runs/{run_id}/checkpoints/weights/0001/archive?owner_id=anonymous",
-        headers={"User-Agent": "AsyncTinker/Python 0.13.1", "X-API-Key": "sekret"},
+        headers={
+            "User-Agent": "AsyncTinker/Python 0.13.1",
+            "X-MinT-User-Id": "aaaaaaaaaaaaaaaaaaaaaaaa",
+            "X-MinT-Apikey-Id": "bbbbbbbbbbbbbbbbbbbbbbbb",
+            "X-MinT-Request-Id": "req-190",
+            "X-MinT-Cap-Bypass-Ownership": "true",
+            "X-Internal-Token": "sekret",
+        },
         follow_redirects=False,
     )
     assert resp.status_code == 302

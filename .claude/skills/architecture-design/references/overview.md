@@ -89,9 +89,9 @@ Mint can optionally pre-create and protect ("never evict") a set of persistent a
 
 ## Auth and access boundaries
 
-Auth is enforced by middleware when keys are configured:
-- Admin key (`TINKER_API_KEY`) for privileged access.
-- Encrypted user tokens (`TINKER_TOKEN_SECRET_KEY`) for per-user identity.
+Auth is enforced by middleware when `INTERNAL_API_TOKEN` is configured. In
+production the platform authenticates callers and forwards trusted `X-MinT-*`
+identity headers plus `X-Internal-Token`.
 
 Model access control is centralized and applied on session creation. The server hides detailed exception text unless the request is privileged.
 
