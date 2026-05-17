@@ -44,10 +44,10 @@ Optional:
 
 1. HTTP health
 - `GET /api/v1/healthz` (latency + payload)
-- `GET /api/v1/actors` (read-only visibility; do not use kill endpoints)
+- `GET /internal/actors` (read-only visibility; do not use kill endpoints)
 
 2. Server logs (Volcano)
-- `ssh mint-prod "tail -${MINT_LOG_MONITOR_TAIL_LINES:-200} /tmp/tinker_server_auth.log"`
+- `ssh mint-prod-volcano "tail -${MINT_LOG_MONITOR_TAIL_LINES:-200} /share/mint/prod/logs/tinker_server_auth.log"`
 
 3. Error signatures (grep over last tail window)
 - `Traceback`

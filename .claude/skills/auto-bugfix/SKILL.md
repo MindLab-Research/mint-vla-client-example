@@ -181,7 +181,7 @@ else
 fi
 ```
 
-### 3b) Set up dev env using issue-specific namespace and PFS path
+### 3b) Set up dev env using issue-specific namespace and server checkout
 
 Use `mint-dev` for shared dev constraints and definitions. Do not reuse its start/stop/log commands because this skill must not stop or replace the default dev server.
 
@@ -192,12 +192,11 @@ Hard rules:
 - Use issue-specific `TINKER_RAY_NAMESPACE` (do not reuse across issues).
 - Kill all actors in the issue namespace at the end of the issue (and before starting the issue-scoped server if rerunning) so detached actors do not accumulate.
 
-Example issue-specific namespace + issue-specific PFS path:
+Example issue-specific namespace + issue-specific server checkout:
 ```bash
 export ISSUE=123
 export TINKER_RAY_NAMESPACE="tinker_${USER}_issue_${ISSUE}"
-export PFS_TINKER_PATH="/vePFS-Mindverse/share/code/$USER/tinker-server-issue-$ISSUE"
-export UNISON_PROFILE="volcano-tinker-$USER-issue-$ISSUE"
+export PFS_TINKER_PATH="/vePFS-Mindverse/share/mint/dev/tmp/issue-$ISSUE/mint-server"
 export TINKER_PORT="$((10000 + ISSUE % 5000))"
 ```
 
@@ -223,77 +222,42 @@ print(f\"killed={killed} namespace={ns}\")
 \""
 ```
 
-Issue-specific code sync (do not manually sync; use unison daemon mode):
+Issue-specific code update uses git. Push the branch, then clone or update the
+server checkout on `mint-dev`:
 ```bash
-export LOCAL_ROOT="$(git rev-parse --show-toplevel)"
-
-mkdir -p ~/.unison
-python - <<'PY'
-import os
-from pathlib import Path
-
-issue = os.environ["ISSUE"]
-user = os.environ["USER"]
-local_root = os.environ["LOCAL_ROOT"]
-unison_profile = os.environ["UNISON_PROFILE"]
-
-template = Path(".claude/skills/mint-dev/configs/volcano-tinker.prf").read_text()
-lines = template.splitlines(True)
-roots = [i for i, ln in enumerate(lines) if ln.startswith("root = ")]
-if len(roots) != 2:
-    raise SystemExit(f"expected 2 root lines, got {len(roots)}")
-
-lines[roots[0]] = f"root = {local_root}\n"
-lines[roots[1]] = f"root = ssh://mint-dev//vePFS-Mindverse/share/code/{user}/tinker-server-issue-{issue}\n"
-out = "".join(lines).replace("__PFS_USER__", user)
-
-dst = Path.home() / ".unison" / f"{unison_profile}.prf"
-dst.write_text(out)
-print(dst)
-PY
-
-test -n "$UNISON_PROFILE" || { echo "error: UNISON_PROFILE is empty"; exit 1; }
-mkdir -p ~/.config/systemd/user
-cat > ~/.config/systemd/user/unison@.service <<'EOF'
-[Unit]
-Description=Unison (%i) watch
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/unison %i -repeat watch -ui text
-Restart=always
-RestartSec=2
-StandardOutput=append:/tmp/unison-%i.log
-StandardError=append:/tmp/unison-%i.log
-
-[Install]
-WantedBy=default.target
-EOF
-
-systemctl --user daemon-reload
-loginctl enable-linger "$USER" || true
-systemctl --user enable --now "unison@$UNISON_PROFILE.service"
-systemctl --user status "unison@$UNISON_PROFILE.service" --no-pager
-tail -n 200 "/tmp/unison-$UNISON_PROFILE.log"
+git push -u origin HEAD
+PFS_TINKER_PARENT="${PFS_TINKER_PATH%/*}"
+ssh mint-dev "mkdir -p '$PFS_TINKER_PARENT'"
+ssh mint-dev "if [ ! -d '$PFS_TINKER_PATH/.git' ]; then git clone https://github.com/MindLab-Research/mint.git '$PFS_TINKER_PATH'; fi"
+ssh mint-dev "cd '$PFS_TINKER_PATH' && git fetch origin && git checkout '$BRANCH' && git pull --ff-only origin '$BRANCH' && git rev-parse HEAD"
 ```
 
 Issue-specific server root on mint-dev:
 ```bash
-ssh mint-dev "mkdir -p $PFS_TINKER_PATH && ln -sfn $PFS_TINKER_PATH /root/tinker_project/tinker-server-issue-$ISSUE"
+ssh mint-dev "ln -sfn $PFS_TINKER_PATH /root/tinker_project/tinker-server-issue-$ISSUE"
 ```
 
 Start an issue-scoped dev server (does not touch the default dev server on port 8000):
 ```bash
-ssh mint-dev "cd /root/tinker_project/tinker-server-issue-$ISSUE && nohup bash -c \
-  \"PYTHONPATH=/root/tinker_project/tinker-server-issue-$ISSUE:\\$PYTHONPATH \
-   HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
-   PYTHONDONTWRITEBYTECODE=1 \
-   PFS_TINKER_PATH=$PFS_TINKER_PATH \
-   TINKER_RAY_NAMESPACE=$TINKER_RAY_NAMESPACE \
-   MINT_RAY_NAMESPACE=$TINKER_RAY_NAMESPACE \
-   TINKER_PORT=$TINKER_PORT \
-   TINKER_USAGE_LOG_DIR=/tmp/tinker_usage_issue_$ISSUE \
-   python scripts/run_server.py\" >> /tmp/tinker_server_issue_$ISSUE.log 2>&1 & echo \$! > /tmp/tinker_server_issue_$ISSUE.pid"
+ssh mint-dev "cat > /share/mint/dev/tmp/start_issue_$ISSUE.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+cd '$PFS_TINKER_PATH'
+set -a
+. /share/mint/dev/config/common.env
+if [ -f /share/mint/dev/config/secrets.env ]; then
+  . /share/mint/dev/config/secrets.env
+fi
+set +a
+export PFS_TINKER_PATH='$PFS_TINKER_PATH'
+export TINKER_RAY_NAMESPACE='$TINKER_RAY_NAMESPACE'
+export MINT_RAY_NAMESPACE='$TINKER_RAY_NAMESPACE'
+export TINKER_PORT='$TINKER_PORT'
+export TINKER_USAGE_LOG_DIR='/tmp/tinker_usage_issue_$ISSUE'
+exec /share/mint/dev/runtime/host-venv/bin/python scripts/run_server.py
+SH
+chmod +x /share/mint/dev/tmp/start_issue_$ISSUE.sh
+nohup /share/mint/dev/tmp/start_issue_$ISSUE.sh >> /tmp/tinker_server_issue_$ISSUE.log 2>&1 & echo \$! > /tmp/tinker_server_issue_$ISSUE.pid"
 ```
 
 Issue-scoped health check (via local SSH tunnel):
@@ -348,7 +312,7 @@ Use the `bugfix` workflow:
 Implement the minimal root-cause fix.
 
 After code changes:
-1) verify code synced to mint-dev (unison)
+1) push the branch and update the issue checkout on `mint-dev` with git
 2) if the change touches code that can be imported/executed inside detached actors, run the 3b "Namespace cleanup" snippet to kill the issue namespace actors so the next run loads new code:
    - vLLM: `tinker_server/backend/verl_inference.py`, `tinker_server/backend/multi_lora_engine.py`, `tinker_server/backend/multinode_inference.py`, `tinker_server/backend/vllm_*.py`
    - Megatron: `tinker_server/backend/megatron_distributed.py`, `tinker_server/backend/megatron_training.py`, `tinker_server/backend/verl_patches.py`

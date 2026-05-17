@@ -73,7 +73,7 @@ set -a && source .secrets.env && set +a
 3) (Optional) Quick read-only probes (not sufficient alone):
 ```bash
 curl -sS "$TINKER_BASE_URL/api/v1/healthz"
-curl -sS -H "X-API-Key: $TINKER_API_KEY" "$TINKER_BASE_URL/api/v1/actors"
+curl -sS -H "X-API-Key: $TINKER_API_KEY" "$TINKER_BASE_URL/internal/actors"
 ```
 
 ### 1) Run the 4 RL tests (must)
@@ -111,9 +111,9 @@ After each run, preserve these timing outputs as evidence:
   - `ssh mint-prod-volcano "tail -400 /tmp/tinker_server_auth.log"`
 - Do not assume `235B -> Aliyun`.
 - Before checking any remote upstream, verify the current routing target from current prod evidence:
-  - checked-in prod config such as `configs/prod_volcano.env.sh`
+  - shared prod config under `/share/mint/prod/config`
   - live routing env such as `TINKER_GATEWAY_CONFIG_JSON`
-  - current actor inventory from `/api/v1/actors`
+  - current actor inventory from `/internal/actors`
 - Only if that evidence shows the model is remotely routed should you inspect the remote target logs, for example:
   - `ssh mint-prod-aliyun "tail -400 /tmp/tinker_server_auth.log"`
 
@@ -138,7 +138,7 @@ Prefer the smallest blast radius:
 curl -sS -X POST \
   -H "X-API-Key: $TINKER_API_KEY" \
   -H "Content-Type: application/json" \
-  "$TINKER_BASE_URL/api/v1/actors/kill" \
+  "$TINKER_BASE_URL/internal/actors/kill" \
   -d '{"actor_type":"vllm","model_name":"Qwen/Qwen3-4B-Instruct-2507"}'
 ```
 
@@ -151,7 +151,7 @@ Notes:
 
 2) Restart API server only if the server process itself is unhealthy:
 - Volcano:
-  - `ssh mint-prod-volcano 'supervisorctl restart tinker-server-auth'`
+  - follow the `mint-prod` restart procedure
 - Remote upstream:
   - Only if current routing/config proves the failing model is hosted there, follow that deployment's start SOP.
   - For Aliyun specifically, follow `.claude/skills/aliyun-cluster/SKILL.md` "Start tinker-server on mint-prod-aliyun".

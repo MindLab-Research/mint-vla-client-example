@@ -278,7 +278,7 @@ Before any selected item runs:
 
 1. Confirm dev targeting.
 2. Confirm server health.
-3. Confirm Unison is healthy.
+3. Confirm the dev server checkout is on the intended git commit.
 4. Inspect current actor inventory.
 5. Inspect current free and total GPUs.
 6. Build a session manifest:
@@ -290,7 +290,7 @@ Suggested preflight evidence:
 
 ```bash
 curl -s http://localhost:8000/api/v1/healthz
-curl -s http://localhost:8000/api/v1/actors
+curl -s http://localhost:8000/internal/actors
 ```
 
 If deeper GPU accounting is needed, use the `mint-dev` workflow and the cluster Python that matches the dev Ray runtime.

@@ -81,14 +81,12 @@ Before proceeding, clearly document:
 ### 2.1 Ensure Dev Environment is Ready
 
 ```bash
-# Verify unison is syncing
-pgrep -af "unison.*volcano-tinker"
-
 # Check dev server is running
 curl http://localhost:8000/api/v1/healthz
 ```
 
-If dev server is not running, use the `mint-dev` skill to start it.
+If dev server is not running, use the `mint-dev` skill to start it. Dev code is
+updated through the git checkout at `/share/mint/dev/mint-server`, not file sync.
 
 ### 2.1.1 Path-Based Checkpoint Repros On Dev
 
@@ -125,8 +123,7 @@ python scripts/tools/reproduce_issue_<NUMBER>.py
 2. Make code changes
 3. **Restart dev server** (code changes require server restart):
    ```bash
-   ssh mint-dev 'pkill -f "tinker-server.*run_server"'
-   # Then start server using mint-dev skill
+   # Use mint-dev start/restart commands so shared config and runtime are used.
    ```
 
 ### 2.4 Verify Fix
