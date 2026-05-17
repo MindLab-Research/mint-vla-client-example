@@ -26,7 +26,7 @@ Use this skill for MinT internal control-plane operations and for the standalone
 
 ## Internal Control Plane
 
-Use `/internal/*` for operator-only control-plane state. Do not use removed legacy public paths such as `/api/v1/actors`, `/api/v1/actors/kill`, `/api/v1/kill_vllm`, `/api/v1/kill_megatron`, `/api/v1/vllm_status`, or `/api/v1/megatron_status`.
+Use `/internal/*` for operator-only control-plane state.
 
 Environment-specific skills provide host, port, auth, and restart rules:
 - For development, read `mint-dev` first; default local base URL is `http://localhost:8000` and auth is usually disabled.
@@ -36,7 +36,7 @@ Environment-specific skills provide host, port, auth, and restart rules:
 
 - Default to read-only endpoints.
 - Mutating calls, especially `/internal/actors/kill`, require an explicit actor family, model, actor name, or reason.
-- Do not dump secrets. In prod, source `.secrets.env` without printing it.
+- Do not dump secrets. Source shared private config without printing it.
 - Public `/api/v1/healthz` is cheap API-worker health. Use `/internal/healthz/deep` only when Ray / placement-group diagnostics are needed.
 - `/internal/actors` is an inventory/admin view, not the scheduling source of truth. Scheduler state is under `/internal/model_work_scheduler`; desired runtime state is under `/internal/model_actor_supervisor`.
 - Do not run local `ray` or `volc` commands through this skill. Use the environment skill or `volcano-cluster`.
@@ -53,7 +53,7 @@ curl -s "$BASE/internal/actors?type=vllm" | jq
 Production:
 
 ```bash
-source /vePFS-Mindverse/share/code/tinker-server-auth/.secrets.env
+source /share/mint/prod/config/secrets.env
 BASE=http://localhost:18000
 curl -s -H "X-API-Key: $TINKER_API_KEY" "$BASE/internal/actors?type=vllm" | jq
 ```
@@ -130,7 +130,7 @@ Use this section when the task is specifically about deploying or operating the 
 
 - Target host: `mint-prod-volcano`
 - Remote app root: `/vePFS-Mindverse/share/mint-ops`
-- Python env: `/vePFS-Mindverse/share/code/tinker-server-auth/.venv31213/bin/python`
+- Python env: `/share/mint/prod/runtime/host-venv/bin/python`
 - Mint API: `http://127.0.0.1:18000`
 - Ray: deploy on the driver node, so default to `auto`
 - Supervisor config: `/mlplatform/supervisord/supervisord.conf`
@@ -139,34 +139,26 @@ Use this section when the task is specifically about deploying or operating the 
 ### Hard rules
 
 - Use `ssh mint-prod-volcano`, not a guessed host or raw IP, for server-side changes.
-- Do not use `rsync --delete`.
-- Do not print secrets from `.secrets.env`.
+- Manage the ops console as a git checkout under the remote app root.
+- Do not print secrets from `/share/mint/prod/config/secrets.env`.
 - Production should use one service only: build the frontend with relative `/api` paths and let `ops.backend` serve `ops/frontend/dist/`.
-- Keep backend pointed at local Mint (`http://127.0.0.1:18000`) and source the API key from remote `.secrets.env`.
+- Keep backend pointed at local Mint (`http://127.0.0.1:18000`) and source the API key from shared private config.
 
 ### Deploy SOP
 
-#### 1. Build frontend locally
+#### 1. Update the remote checkout
+
+```bash
+ssh mint-prod-volcano 'if [ ! -d /vePFS-Mindverse/share/mint-ops/.git ]; then git clone https://github.com/MindLab-Research/mint.git /vePFS-Mindverse/share/mint-ops; fi'
+ssh mint-prod-volcano 'cd /vePFS-Mindverse/share/mint-ops && git fetch origin && git checkout refactor && git pull --ff-only origin refactor'
+```
+
+#### 2. Build frontend on the remote host
 
 Build with the default relative API path:
 
 ```bash
-cd /vePFS-Mindverse/user/intern/nolanho/code/mint-feat-mint-ops/ops/frontend
-pnpm build
-```
-
-#### 2. Sync only the `ops` app
-
-Sync the directory itself so the remote layout becomes `/vePFS-Mindverse/share/mint-ops/ops/...`:
-
-```bash
-cd /vePFS-Mindverse/user/intern/nolanho/code/mint-feat-mint-ops
-rsync -avz ops \
-  --exclude='__pycache__/' \
-  --exclude='*.pyc' \
-  --exclude='node_modules/' \
-  --exclude='*.tsbuildinfo' \
-  mint-prod-volcano:/vePFS-Mindverse/share/mint-ops/
+ssh mint-prod-volcano 'cd /vePFS-Mindverse/share/mint-ops/ops/frontend && pnpm install --frozen-lockfile && pnpm build'
 ```
 
 #### 3. Add the supervisor program
@@ -175,7 +167,7 @@ Append one program to `/mlplatform/supervisord/supervisord.conf`:
 
 ```ini
 [program:mint-ops-backend]
-command=/usr/bin/bash -lc 'cd /vePFS-Mindverse/share/mint-ops && set -a && source /vePFS-Mindverse/share/code/tinker-server-auth/.secrets.env && set +a && export PYTHONPATH=/vePFS-Mindverse/share/mint-ops:/vePFS-Mindverse/share/code/tinker-server-auth && export MINT_OPS_MINT_BASE_URL=http://127.0.0.1:18000 && exec /vePFS-Mindverse/share/code/tinker-server-auth/.venv31213/bin/python -m ops.backend --bind 0.0.0.0 --backend-port 8787'
+command=/usr/bin/bash -lc 'cd /vePFS-Mindverse/share/mint-ops && set -a && source /share/mint/prod/config/prod.env && source /share/mint/prod/config/secrets.env && set +a && export PYTHONPATH=/vePFS-Mindverse/share/mint-ops:/share/mint/prod/mint-server && export MINT_OPS_MINT_BASE_URL=http://127.0.0.1:18000 && exec /share/mint/prod/runtime/host-venv/bin/python -m ops.backend --bind 0.0.0.0 --backend-port 8787'
 directory=/vePFS-Mindverse/share/mint-ops
 autostart=true
 autorestart=true
