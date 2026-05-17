@@ -19,6 +19,10 @@ from .model_actor_inventory import (
     actor_observability_metadata,
     async_actor_observability_metadata,
 )
+from .model_actor_launchers import (
+    ModelActorLauncherRegistry,
+    default_model_actor_launcher_registry,
+)
 from .model_actor_placement import model_actor_placement_reconciler
 from .model_work_scheduler import ModelReplicaRegistration, ModelWorkSchedulerClient, model_work_scheduler
 
@@ -120,100 +124,6 @@ def _replica_id(value: Any) -> str:
     if isinstance(value, str) and value.strip():
         return value.strip()
     return f"replica-{int(value or 0)}"
-
-
-def _base_model_from_spec(spec: ModelActorSpec) -> str | None:
-    if spec.base_model:
-        return str(spec.base_model)
-    if spec.domain_key.startswith("vllm:"):
-        model = spec.domain_key.removeprefix("vllm:").strip()
-        return model or None
-    return None
-
-
-def _replica_int(replica_id: str) -> int:
-    raw = str(replica_id).strip()
-    if raw.startswith("replica-"):
-        raw = raw.removeprefix("replica-")
-    try:
-        return int(raw)
-    except Exception:
-        return 0
-
-
-def _placement_env_for_spec(spec: ModelActorSpec) -> dict[str, str]:
-    base_model = _base_model_from_spec(spec)
-    if not base_model or spec.gpu_count is None:
-        return {}
-    if spec.placement_slices:
-        placement_value = [
-            {
-                "replica": _replica_int(replica_id),
-                "node_ip": node_ip,
-                "gpu_count": int(gpu_count),
-            }
-            for replica_id, node_ip, gpu_count in spec.placement_slices
-        ]
-        placement_raw = json.dumps({base_model: placement_value}, sort_keys=True, separators=(",", ":"))
-        node_pins = spec.normalized_node_pins()
-        nodes_raw = json.dumps({base_model: node_pins}, sort_keys=True, separators=(",", ":"))
-        return {
-            "MINT_MODEL_PLACEMENT_JSON": placement_raw,
-            "MINT_VLLM_MODEL_PLACEMENT_JSON": placement_raw,
-            "MINT_DENSE_MODEL_PLACEMENT_JSON": placement_raw,
-            "MINT_MEGATRON_MODEL_PLACEMENT_JSON": placement_raw,
-            "MINT_MODEL_ACTOR_REPLICA_ID": spec.replica_id,
-            "MINT_VLLM_MODEL_NODE_IPS_JSON": nodes_raw,
-        }
-    node_pins = spec.normalized_node_pins()
-    if len(node_pins) > 1:
-        placement_raw = json.dumps(
-            {
-                base_model: [
-                    {
-                        "replica": _replica_int(spec.replica_id),
-                        "node_ip": node_ip,
-                        "gpu_count": int(spec.gpu_count),
-                    }
-                    for node_ip in node_pins
-                ]
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        nodes_raw = json.dumps({base_model: node_pins}, sort_keys=True, separators=(",", ":"))
-        return {
-            "MINT_MODEL_PLACEMENT_JSON": placement_raw,
-            "MINT_VLLM_MODEL_PLACEMENT_JSON": placement_raw,
-            "MINT_DENSE_MODEL_PLACEMENT_JSON": placement_raw,
-            "MINT_MEGATRON_MODEL_PLACEMENT_JSON": placement_raw,
-            "MINT_MODEL_ACTOR_REPLICA_ID": spec.replica_id,
-            "MINT_VLLM_MODEL_NODE_IPS_JSON": nodes_raw,
-        }
-    if len(node_pins) != 1:
-        return {}
-    placement_raw = json.dumps(
-        {
-            base_model: {
-                "replica": _replica_int(spec.replica_id),
-                "node_ip": node_pins[0],
-                "gpu_count": int(spec.gpu_count),
-            }
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    pinned_raw = json.dumps({base_model: node_pins[0]}, sort_keys=True, separators=(",", ":"))
-    nodes_raw = json.dumps({base_model: node_pins}, sort_keys=True, separators=(",", ":"))
-    return {
-        "MINT_MODEL_PLACEMENT_JSON": placement_raw,
-        "MINT_VLLM_MODEL_PLACEMENT_JSON": placement_raw,
-        "MINT_DENSE_MODEL_PLACEMENT_JSON": placement_raw,
-        "MINT_MEGATRON_MODEL_PLACEMENT_JSON": placement_raw,
-        "MINT_MODEL_ACTOR_REPLICA_ID": spec.replica_id,
-        "MINT_VLLM_PINNED_NODE_IP_JSON": pinned_raw,
-        "MINT_VLLM_MODEL_NODE_IPS_JSON": nodes_raw,
-    }
 
 
 def _spec_from_obj(obj: Any) -> ModelActorSpec:
@@ -509,24 +419,6 @@ async def _invoke_actor(actor: Any, method_name: str, *args: Any, **kwargs: Any)
     return await _maybe_await(method(*args, **kwargs))
 
 
-async def _default_runtime_factory(spec: ModelActorSpec, generation: int) -> Any:
-    from .model_runtime_actor import get_or_create_model_runtime_actor
-
-    base_model = _base_model_from_spec(spec)
-    return get_or_create_model_runtime_actor(
-        domain_key=spec.domain_key,
-        replica_id=spec.replica_id,
-        actor_name=spec.normalized_actor_name(),
-        actor_generation=int(generation),
-        base_model=base_model,
-        # RuntimeActor executes claimed work sequentially and only renews the
-        # active lease. Keep claims single-item until multi-lease renewal and
-        # concurrent execution are implemented.
-        max_claim=1,
-        runtime_env_extra=_placement_env_for_spec(spec),
-    )
-
-
 class ModelActorSupervisor:
     def __init__(
         self,
@@ -539,9 +431,11 @@ class ModelActorSupervisor:
         scheduler_stats: SchedulerStats | None = None,
         orphan_pg_cleaner: OrphanPlacementGroupCleaner | None = None,
         placement_reconciler: PlacementReconciler | None = None,
+        launcher_registry: ModelActorLauncherRegistry | None = None,
     ) -> None:
         self._desired: dict[tuple[str, str], ModelActorSpec] = {}
-        self._runtime_factory = runtime_factory or _default_runtime_factory
+        self._launcher_registry = launcher_registry or default_model_actor_launcher_registry()
+        self._runtime_factory = runtime_factory
         self._node_inventory = node_inventory
         self._scheduler = scheduler or model_work_scheduler
         self._scheduler_sync = scheduler_sync
@@ -816,7 +710,10 @@ class ModelActorSupervisor:
     async def _create_runtime(self, spec: ModelActorSpec, *, reason: str) -> Any:
         key = spec.key
         generation = self._next_generation(key)
-        actor = await _maybe_await(self._runtime_factory(spec, generation))
+        if self._runtime_factory is not None:
+            actor = await _maybe_await(self._runtime_factory(spec, generation))
+        else:
+            actor = await self._launcher_registry.launch(spec, generation, launcher_key=spec.launcher_key)
         start_result = await _invoke_actor(actor, "start")
         if isinstance(start_result, dict) and start_result.get("running") is False:
             raise RuntimeError(f"runtime actor did not start: {start_result!r}")

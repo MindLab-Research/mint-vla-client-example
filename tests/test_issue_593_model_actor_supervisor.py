@@ -5,13 +5,16 @@ import os
 import pytest
 
 from tinker_server.backend.model_actor_inventory import ActorType
+from tinker_server.backend.model_actor_launchers import (
+    ModelActorLauncherRegistry,
+    placement_env_for_spec,
+)
 from tinker_server.backend.model_actor_supervisor import (
     ModelActorSpec,
     ModelActorSupervisor,
     desired_specs_from_env,
     domain_key_for_training_base_model,
     domain_key_for_vllm_base_model,
-    _placement_env_for_spec,
     queue_id_for_replica,
 )
 from tinker_server.backend.model_actor_placement import ModelActorPlacementReconciler
@@ -77,6 +80,45 @@ def test_issue_593_supervisor_exposes_explicit_inventory_contract() -> None:
 
     assert supervisor.clear_session("session-a", actor_type=ActorType.VLLM) == 1
     assert supervisor.unregister("vllm-contract-actor") is True
+
+
+@pytest.mark.anyio
+async def test_issue_593_supervisor_uses_launcher_registry_when_no_factory() -> None:
+    launched: list[tuple[ModelActorSpec, int]] = []
+
+    async def _launch(spec: ModelActorSpec, generation: int):
+        launched.append((spec, generation))
+        return _FakeRuntimeActor(
+            actor_name=spec.normalized_actor_name(),
+            domain_key=spec.domain_key,
+            replica_id=spec.replica_id,
+            generation=generation,
+        )
+
+    async def _sync(_registrations):
+        return None
+
+    supervisor = ModelActorSupervisor(
+        specs=[
+            ModelActorSpec(
+                domain_key="vllm:model-a",
+                replica_id="replica-0",
+                base_model="model-a",
+                launcher_key="test_launcher",
+                gpu_count=1,
+            )
+        ],
+        scheduler_sync=_sync,
+        placement_reconciler=lambda _desired: {"reclaimed": 0},
+        launcher_registry=ModelActorLauncherRegistry({"test_launcher": _launch}),
+    )
+
+    await supervisor.reconcile_once()
+
+    assert len(launched) == 1
+    assert launched[0][0].domain_key == "vllm:model-a"
+    snapshot = supervisor.snapshot()["replicas"]
+    assert snapshot["vllm:model-a::replica-0"]["launcher_key"] == "test_launcher"
 
 
 @pytest.mark.anyio
@@ -381,7 +423,7 @@ def test_issue_593_supervisor_parses_desired_specs_from_env(monkeypatch: pytest.
 
 
 def test_issue_593_supervisor_builds_runtime_placement_env_from_node_pin() -> None:
-    env = _placement_env_for_spec(
+    env = placement_env_for_spec(
         ModelActorSpec(
             domain_key="vllm:Qwen/Test",
             replica_id="replica-2",
@@ -404,7 +446,7 @@ def test_issue_593_supervisor_builds_runtime_placement_env_from_node_pin() -> No
 
 
 def test_issue_593_supervisor_builds_runtime_placement_env_from_multi_node_slices() -> None:
-    env = _placement_env_for_spec(
+    env = placement_env_for_spec(
         ModelActorSpec(
             domain_key="vllm:Qwen/Test",
             replica_id="replica-0",
@@ -429,7 +471,7 @@ def test_issue_593_supervisor_builds_runtime_placement_env_from_multi_node_slice
 
 
 def test_issue_593_supervisor_builds_runtime_placement_env_from_multi_node_pins() -> None:
-    env = _placement_env_for_spec(
+    env = placement_env_for_spec(
         ModelActorSpec(
             domain_key="vllm:Qwen/Test",
             replica_id="replica-0",

@@ -6,6 +6,7 @@ This reference is split by topic for faster lookup. Start here, then open the re
 
 - Overview (design decisions): `overview.md`
 - System boundary and code map: `system.md`
+- HTTP API boundary and internal routes: `internal-api.md`
 - Identifiers and state ownership: `state.md`
 - Async futures (Tinker polling protocol): `async-futures.md`
 - Inference architecture (vLLM, multi-LoRA): `inference.md`
