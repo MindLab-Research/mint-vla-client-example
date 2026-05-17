@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 
+from .runtime_env import env_nonempty
+
 
 STARTED_AT = datetime.now(timezone.utc)
 
@@ -47,8 +49,8 @@ def _find_git_root() -> Path | None:
 
 @lru_cache(maxsize=1)
 def _git_sha() -> str | None:
-    for k in ("TINKER_GIT_SHA", "MINT_GIT_SHA", "GIT_SHA"):
-        v = os.environ.get(k)
+    for k in ("MINT_GIT_SHA", "GIT_SHA"):
+        v = env_nonempty(os.environ, k)
         if v:
             return v
 

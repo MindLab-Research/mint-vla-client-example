@@ -13,6 +13,7 @@ import os
 from typing import Any
 
 from ..config import otel_env_vars
+from ..runtime_env import env_nonempty
 
 _ACTOR_HANDLE = None
 
@@ -42,7 +43,7 @@ async def _await_ray_ref(ref: Any) -> Any:
 
 
 def _ray_namespace() -> str:
-    env_ns = os.environ.get("TINKER_RAY_NAMESPACE") or os.environ.get("MINT_RAY_NAMESPACE")
+    env_ns = env_nonempty(os.environ, "MINT_RAY_NAMESPACE")
     if env_ns:
         return env_ns
     try:

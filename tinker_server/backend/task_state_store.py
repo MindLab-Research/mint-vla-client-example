@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from ..config import PFS_PYTHONPATH, actor_runtime_env, config as server_config, otel_env_vars
+from ..runtime_env import env_nonempty
 from .async_ray_control import async_get_ray_ref, sync_get_ray_ref
 from .model_work_execution_context import ModelWorkFinalize, get_current_model_work_finalize_buffer
 
@@ -1117,7 +1118,7 @@ class TaskStateStore:
 
 
 def _ray_namespace() -> str:
-    v = os.environ.get("TINKER_RAY_NAMESPACE") or os.environ.get("MINT_RAY_NAMESPACE")
+    v = env_nonempty(os.environ, "MINT_RAY_NAMESPACE")
     if v:
         return v
     try:

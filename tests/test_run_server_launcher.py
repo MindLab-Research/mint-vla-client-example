@@ -75,9 +75,9 @@ def test_launcher_observability_reports_normalization_flags() -> None:
             "MINT_STARTUP_LEASE_ACTOR_NAME": "lease-test",
             "RAY_ADDRESS": "192.168.38.184:6379",
             "RAY_CLIENT_ADDRESS": "ray://192.168.38.184:10001",
-            "TINKER_SERVER_ENV_NORMALIZED": "1",
-            "TINKER_SERVER_PYTHONPATH_CHANGED": "1",
-            "TINKER_SERVER_LD_LIBRARY_PATH_CHANGED": "0",
+            "MINT_SERVER_ENV_NORMALIZED": "1",
+            "MINT_SERVER_PYTHONPATH_CHANGED": "1",
+            "MINT_SERVER_LD_LIBRARY_PATH_CHANGED": "0",
             "PYTHONPATH": "/a:/b:/c",
         },
     )

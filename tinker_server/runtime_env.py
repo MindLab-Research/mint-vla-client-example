@@ -19,8 +19,30 @@ DEFAULT_BASE_PYTHON_DIRNAME = "base-python"
 DEFAULT_HOST_VENV_DIRNAME = "host-venv"
 
 
+def canonical_mint_env_name(name: str) -> str:
+    if name.startswith("TINKER_"):
+        return f"MINT_{name[len('TINKER_'):]}"
+    return name
+
+
+def env_alias_names(name: str) -> tuple[str, ...]:
+    if name.startswith("TINKER_"):
+        return (canonical_mint_env_name(name), name)
+    if name.startswith("MINT_"):
+        return (name, f"TINKER_{name[len('MINT_'):]}")
+    return (name,)
+
+
+def env_get(environ: Mapping[str, str], name: str, default: str | None = None) -> str | None:
+    for alias in env_alias_names(name):
+        value = environ.get(alias)
+        if value is not None:
+            return str(value)
+    return default
+
+
 def env_nonempty(environ: Mapping[str, str], name: str) -> str | None:
-    value = environ.get(name)
+    value = env_get(environ, name)
     if value is None:
         return None
     value = str(value).strip()

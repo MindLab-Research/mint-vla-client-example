@@ -19,33 +19,33 @@ fi
 . "${prod_secrets_env}"
 set +a
 
-if [ -n "${TINKER_GATEWAY_GLM51_BASE_URL:-}" ]; then
-  if [ "${TINKER_GATEWAY_GLM51_AUTH_MODE:-static_api_key}" != "static_api_key" ]; then
-    echo "unsupported GLM5.1 gateway auth mode: ${TINKER_GATEWAY_GLM51_AUTH_MODE}" >&2
+if [ -n "${MINT_GATEWAY_GLM51_BASE_URL:-}" ]; then
+  if [ "${MINT_GATEWAY_GLM51_AUTH_MODE:-static_api_key}" != "static_api_key" ]; then
+    echo "unsupported GLM5.1 gateway auth mode: ${MINT_GATEWAY_GLM51_AUTH_MODE}" >&2
     exit 1
   fi
-  if [ -z "${TINKER_API_KEY:-}" ]; then
-    echo "missing TINKER_API_KEY for GLM5.1 static gateway auth" >&2
+  if [ -z "${MINT_API_KEY:-}" ]; then
+    echo "missing MINT_API_KEY for GLM5.1 static gateway auth" >&2
     exit 1
   fi
-  export TINKER_GATEWAY_CONFIG_JSON="$(python - <<'PY'
+  export MINT_GATEWAY_CONFIG_JSON="$(python - <<'PY'
 import json
 import os
 
-raw = os.environ.get("TINKER_GATEWAY_CONFIG_JSON", "").strip()
+raw = os.environ.get("MINT_GATEWAY_CONFIG_JSON", "").strip()
 cfg = json.loads(raw) if raw else {}
 model_to_upstream = dict(cfg.get("model_to_upstream") or {})
 upstreams = dict(cfg.get("upstreams") or {})
-alias = os.environ["TINKER_GATEWAY_GLM51_ALIAS"].strip()
-model = os.environ["TINKER_GATEWAY_GLM51_MODEL"].strip()
-base_url = os.environ["TINKER_GATEWAY_GLM51_BASE_URL"].strip().rstrip("/")
+alias = os.environ["MINT_GATEWAY_GLM51_ALIAS"].strip()
+model = os.environ["MINT_GATEWAY_GLM51_MODEL"].strip()
+base_url = os.environ["MINT_GATEWAY_GLM51_BASE_URL"].strip().rstrip("/")
 if not alias or not model or not base_url:
     raise SystemExit("GLM5.1 gateway config is incomplete")
 model_to_upstream[model] = alias
 upstreams[alias] = {
     "base_url": base_url,
     "auth_mode": "static_api_key",
-    "api_key": os.environ["TINKER_API_KEY"].strip(),
+    "api_key": os.environ["MINT_API_KEY"].strip(),
 }
 cfg["model_to_upstream"] = model_to_upstream
 cfg["upstreams"] = upstreams
@@ -67,7 +67,7 @@ ln -s "$api_tmp_root" "$api_tmp_link"
 
 export TMPDIR="${api_tmp_link}/t"
 export XDG_CACHE_HOME="${api_tmp_link}/c"
-mkdir -p "${TMPDIR}" "${XDG_CACHE_HOME}" "${TINKER_RUNTIME_CHECKPOINT_DIR}"
+mkdir -p "${TMPDIR}" "${XDG_CACHE_HOME}" "${MINT_RUNTIME_CHECKPOINT_DIR}"
 
 ray_node_ip="$(python - <<'PY'
 import socket

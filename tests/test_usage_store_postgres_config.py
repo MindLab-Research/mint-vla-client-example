@@ -60,7 +60,7 @@ def test_build_usage_store_requires_pg_dsn(monkeypatch):
     monkeypatch.setattr(usage_store_module.config, "usage_pg_dsn", "")
     monkeypatch.setattr(usage_store_module.config, "usage_pg_host", "")
 
-    with pytest.raises(ValueError, match="TINKER_USAGE_PG_DSN or TINKER_USAGE_PG_HOST is required"):
+    with pytest.raises(ValueError, match="MINT_USAGE_PG_DSN or MINT_USAGE_PG_HOST is required"):
         usage_store_module._build_usage_store()
 
 

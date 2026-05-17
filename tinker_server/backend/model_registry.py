@@ -7,6 +7,8 @@ import types
 from dataclasses import dataclass, replace
 from typing import Any, Literal, get_args, get_origin
 
+from ..runtime_env import env_get
+
 logger = logging.getLogger(__name__)
 
 
@@ -536,9 +538,7 @@ def get_model_config(model_name: str) -> ModelConfig:
     if overrides:
         cfg = replace(cfg, **overrides)
 
-    raw_overrides = (
-        os.environ.get("MINT_MODEL_CONFIG_OVERRIDES_JSON") or os.environ.get("TINKER_MODEL_CONFIG_OVERRIDES_JSON") or ""
-    ).strip()
+    raw_overrides = (env_get(os.environ, "MINT_MODEL_CONFIG_OVERRIDES_JSON", "") or "").strip()
     if raw_overrides:
         import json
 
@@ -617,7 +617,7 @@ def requires_fp8(model_name: str) -> bool:
 
 
 def _gateway_supported_models() -> set[str]:
-    raw = os.environ.get("TINKER_GATEWAY_CONFIG_JSON", "").strip()
+    raw = (env_get(os.environ, "MINT_GATEWAY_CONFIG_JSON", "") or "").strip()
     if not raw:
         return set()
 
@@ -629,13 +629,13 @@ def _gateway_supported_models() -> set[str]:
         or {}
     )
     if not isinstance(model_map, dict):
-        raise ValueError("TINKER_GATEWAY_CONFIG_JSON model routing must be a JSON object")
+        raise ValueError("MINT_GATEWAY_CONFIG_JSON model routing must be a JSON object")
     return {str(name).strip() for name in model_map if str(name).strip()}
 
 
 def list_supported_models() -> list[str]:
     """Return list of supported model names."""
-    raw = (os.environ.get("MINT_SUPPORTED_MODELS") or os.environ.get("TINKER_SUPPORTED_MODELS") or "").strip()
+    raw = (env_get(os.environ, "MINT_SUPPORTED_MODELS", "") or "").strip()
     if raw:
         items = [s.strip() for s in raw.split(",") if s.strip()]
         seen: set[str] = set()

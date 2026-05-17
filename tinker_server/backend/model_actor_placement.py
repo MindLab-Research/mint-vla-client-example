@@ -5,6 +5,8 @@ import os
 from collections.abc import Callable, Iterable
 from typing import Any
 
+from ..runtime_env import env_nonempty
+
 logger = logging.getLogger(__name__)
 
 ActorExists = Callable[[str, str], bool]
@@ -16,7 +18,7 @@ PlacementGroupLister = Callable[[], Iterable[dict[str, Any]]]
 
 
 def _ray_namespace() -> str:
-    v = os.environ.get("TINKER_RAY_NAMESPACE") or os.environ.get("MINT_RAY_NAMESPACE")
+    v = env_nonempty(os.environ, "MINT_RAY_NAMESPACE")
     if v:
         return v
     try:

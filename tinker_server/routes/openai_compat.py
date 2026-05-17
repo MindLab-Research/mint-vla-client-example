@@ -30,6 +30,7 @@ from ..models.types import (
     OAIToolCall,
     OAIUsage,
 )
+from ..runtime_env import env_get
 from ..usage_store import persist_usage_events
 from .sampling import build_sample_once_usage_events, sample_once
 from .service import ensure_sampling_session
@@ -50,16 +51,8 @@ class _SessionCacheEntry:
     last_used: float
 
 
-_MAX_SESSION_CACHE_SIZE = int(
-    os.environ.get("TINKER_OAI_SESSION_CACHE_MAX_SIZE")
-    or os.environ.get("MINT_OAI_SESSION_CACHE_MAX_SIZE")
-    or 1024
-)
-_SESSION_CACHE_TTL_S = int(
-    os.environ.get("TINKER_OAI_SESSION_CACHE_TTL_S")
-    or os.environ.get("MINT_OAI_SESSION_CACHE_TTL_S")
-    or 3600
-)
+_MAX_SESSION_CACHE_SIZE = int(env_get(os.environ, "MINT_OAI_SESSION_CACHE_MAX_SIZE", "1024") or 1024)
+_SESSION_CACHE_TTL_S = int(env_get(os.environ, "MINT_OAI_SESSION_CACHE_TTL_S", "3600") or 3600)
 _session_cache: OrderedDict[tuple[str | None, str], _SessionCacheEntry] = OrderedDict()
 _session_lock = asyncio.Lock()
 _tokenizer_cache: dict[str, Any] = {}
@@ -116,11 +109,7 @@ def _load_tokenizer_cpu(base_model: str):
 
 
 def _tokenizer_max_workers() -> int:
-    raw = (
-        os.environ.get("TINKER_OAI_TOKENIZER_MAX_WORKERS")
-        or os.environ.get("MINT_OAI_TOKENIZER_MAX_WORKERS")
-        or "8"
-    )
+    raw = env_get(os.environ, "MINT_OAI_TOKENIZER_MAX_WORKERS", "8")
     try:
         return max(1, int(raw))
     except (TypeError, ValueError):

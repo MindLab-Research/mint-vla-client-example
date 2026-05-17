@@ -34,6 +34,7 @@ from ..logging_context import (
 )
 from ..model_access_control import can_access_model, get_access_denied_error
 from ..queue_priority import merge_queue_priority_extra
+from ..runtime_env import env_get
 from ..models.types import (
     ComputeLogprobsRequest,
     ComputeLogprobsResponse,
@@ -703,7 +704,7 @@ async def _coalesced_generate(
         need = int(num_samples)
         if need > _SAMPLE_COALESCE_MAX_SAMPLES:
             raise ValueError(
-                f"coalesce: num_samples={need} exceeds TINKER_SAMPLE_COALESCE_MAX_SAMPLES={_SAMPLE_COALESCE_MAX_SAMPLES}"
+                f"coalesce: num_samples={need} exceeds MINT_SAMPLE_COALESCE_MAX_SAMPLES={_SAMPLE_COALESCE_MAX_SAMPLES}"
             )
         if g is None:
             g = {
@@ -1315,8 +1316,8 @@ async def sample_once(
         if not isinstance(upstream_request_id, str) or not upstream_request_id:
             raise HTTPException(status_code=502, detail="Upstream asample returned invalid request_id")
 
-        poll_timeout_s = float(os.environ.get("TINKER_POLL_TIMEOUT_S", "1800"))
-        poll_sleep_s = float(os.environ.get("TINKER_POLL_SLEEP_S", "0.2"))
+        poll_timeout_s = float(env_get(os.environ, "MINT_POLL_TIMEOUT_S", "1800") or "1800")
+        poll_sleep_s = float(env_get(os.environ, "MINT_POLL_SLEEP_S", "0.2") or "0.2")
         deadline = time.time() + poll_timeout_s
         while True:
             poll_resp = await forward_json(
@@ -1384,8 +1385,8 @@ async def sample_once(
             ),
             http_request,
         )
-        poll_timeout_s = float(os.environ.get("TINKER_POLL_TIMEOUT_S", "1800"))
-        poll_sleep_s = float(os.environ.get("TINKER_POLL_SLEEP_S", "0.2"))
+        poll_timeout_s = float(env_get(os.environ, "MINT_POLL_TIMEOUT_S", "1800") or "1800")
+        poll_sleep_s = float(env_get(os.environ, "MINT_POLL_SLEEP_S", "0.2") or "0.2")
         deadline = time.time() + poll_timeout_s
         while True:
             poll_response = Response()

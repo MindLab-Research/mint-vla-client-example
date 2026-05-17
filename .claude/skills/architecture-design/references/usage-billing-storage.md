@@ -54,6 +54,6 @@ Result:
 
 ## Operational modes
 
-Configured by `TINKER_USAGE_BACKEND`:
+Configured by `MINT_USAGE_BACKEND`:
 
 - `postgres`: direct PG mode with durable local outbox fallback

@@ -5,6 +5,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from .runtime_env import env_get
+
 _CHECKPOINT_STAGING_TABLE = "checkpoint_staging"
 _CHECKPOINT_CATALOG_TABLE = "checkpoint_catalog"
 _SCHEMA_READY_DSN: str | None = None
@@ -44,13 +46,13 @@ def _checkpoint_index_pg_dsn() -> str:
     cfg = _runtime_config()
     if cfg is not None:
         return str(getattr(cfg, "checkpoint_index_pg_dsn", "") or "").strip()
-    return str(os.environ.get("TINKER_CHECKPOINT_INDEX_PG_DSN", "") or "").strip()
+    return str(env_get(os.environ, "MINT_CHECKPOINT_INDEX_PG_DSN", "") or "").strip()
 
 
 def _checkpoint_index_timeout_s() -> float:
     cfg = _runtime_config()
-    raw = getattr(cfg, "checkpoint_index_write_timeout_ms", 2000) if cfg is not None else os.environ.get(
-        "TINKER_CHECKPOINT_INDEX_WRITE_TIMEOUT_MS", 2000
+    raw = getattr(cfg, "checkpoint_index_write_timeout_ms", 2000) if cfg is not None else env_get(
+        os.environ, "MINT_CHECKPOINT_INDEX_WRITE_TIMEOUT_MS", "2000"
     )
     try:
         return max(0.1, float(raw) / 1000.0)
@@ -65,7 +67,7 @@ def _import_asyncpg():
 
 
 def _uploading_stale_timeout_s() -> float:
-    raw = os.environ.get("TINKER_CHECKPOINT_INDEX_UPLOADING_STALE_S", "1800")
+    raw = env_get(os.environ, "MINT_CHECKPOINT_INDEX_UPLOADING_STALE_S", "1800")
     try:
         return max(0.0, float(raw))
     except Exception:

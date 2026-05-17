@@ -672,7 +672,7 @@ def _build_usage_store() -> UsageStore:
         )
     dsn = _usage_pg_dsn()
     if not dsn:
-        raise ValueError("TINKER_USAGE_PG_DSN or TINKER_USAGE_PG_HOST is required for postgres usage backend")
+        raise ValueError("MINT_USAGE_PG_DSN or MINT_USAGE_PG_HOST is required for postgres usage backend")
     return PostgresUsageStore(
         dsn=dsn,
         pool_min=config.usage_pg_pool_min,

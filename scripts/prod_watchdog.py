@@ -45,17 +45,17 @@ def _restart(program: str) -> int:
 
 
 def main() -> int:
-    url = os.environ.get("TINKER_WATCHDOG_URL", "http://localhost:18000/api/v1/healthz")
-    timeout_s = float(os.environ.get("TINKER_WATCHDOG_TIMEOUT_S", "30"))
-    interval_s = float(os.environ.get("TINKER_WATCHDOG_INTERVAL_S", "60"))
-    fails_to_restart = int(os.environ.get("TINKER_WATCHDOG_FAILS_TO_RESTART", "6"))
-    restart_cooldown_s = float(os.environ.get("TINKER_WATCHDOG_RESTART_COOLDOWN_S", "60"))
-    program = os.environ.get("TINKER_WATCHDOG_PROGRAM", "tinker-server-auth")
+    url = os.environ.get("MINT_WATCHDOG_URL", "http://localhost:18000/api/v1/healthz")
+    timeout_s = float(os.environ.get("MINT_WATCHDOG_TIMEOUT_S", "30"))
+    interval_s = float(os.environ.get("MINT_WATCHDOG_INTERVAL_S", "60"))
+    fails_to_restart = int(os.environ.get("MINT_WATCHDOG_FAILS_TO_RESTART", "6"))
+    restart_cooldown_s = float(os.environ.get("MINT_WATCHDOG_RESTART_COOLDOWN_S", "60"))
+    program = os.environ.get("MINT_WATCHDOG_PROGRAM", "tinker-server-auth")
 
     fails = 0
 
     # Give server time to boot after container start / deploy.
-    boot_grace_s = float(os.environ.get("TINKER_WATCHDOG_BOOT_GRACE_S", "30"))
+    boot_grace_s = float(os.environ.get("MINT_WATCHDOG_BOOT_GRACE_S", "30"))
     print(
         f"{_ts()} watchdog: starting url={url} "
         f"timeout_s={timeout_s} interval_s={interval_s} "

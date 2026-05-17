@@ -10,6 +10,7 @@ from pathlib import Path
 
 from ..checkpoints import DEFAULT_RUNTIME_CHECKPOINTS_DIR
 from ..config import config as server_config
+from ..runtime_env import env_get
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +36,7 @@ def get_dense_session_state_root() -> str:
     configured = str(server_config.training_dense_session_state_root or "").strip()
     if configured:
         return os.path.abspath(configured)
-    runtime_root = os.environ.get("TINKER_RUNTIME_CHECKPOINT_DIR", DEFAULT_RUNTIME_CHECKPOINTS_DIR)
+    runtime_root = env_get(os.environ, "MINT_RUNTIME_CHECKPOINT_DIR", DEFAULT_RUNTIME_CHECKPOINTS_DIR)
     return os.path.abspath(os.path.join(runtime_root, DENSE_SESSION_STATE_DIRNAME))
 
 

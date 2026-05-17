@@ -8,12 +8,12 @@ Optional:
     python scripts/run_server.py --config /path/to/config.toml
 
 Environment variables:
-    TINKER_HOST: Server host (default: 0.0.0.0)
-    TINKER_PORT: Server port (default: 8000)
-    TINKER_TP_SIZE: Tensor parallel size (default: auto-detected per model)
-    TINKER_DP_SIZE: Data parallel size for MoE (default: auto-detected per model)
-    TINKER_GPU_MEM_UTIL: GPU memory utilization (default: 0.9)
-    TINKER_MAX_MODEL_LEN: Maximum model context length (default: auto)
+    MINT_HOST: Server host (default: 0.0.0.0)
+    MINT_PORT: Server port (default: 8000)
+    MINT_TP_SIZE: Tensor parallel size (default: auto-detected per model)
+    MINT_DP_SIZE: Data parallel size for MoE (default: auto-detected per model)
+    MINT_GPU_MEM_UTIL: GPU memory utilization (default: 0.9)
+    MINT_MAX_MODEL_LEN: Maximum model context length (default: auto)
 
 Note: No default model is configured. Clients specify models per-request.
 Parallelism is auto-detected from the model registry when engines are created.
@@ -47,6 +47,27 @@ def _load_local_runtime_env_module() -> ModuleType:
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _env_get(environ: dict[str, str], name: str, default: str = "") -> str:
+    runtime_env = _load_local_runtime_env_module()
+    if not hasattr(runtime_env, "env_get"):
+        if name.startswith("MINT_"):
+            return environ.get(name) or environ.get(f"TINKER_{name[len('MINT_'):]}") or default
+        if name.startswith("TINKER_"):
+            return environ.get(f"MINT_{name[len('TINKER_'):]}") or environ.get(name) or default
+        return environ.get(name, default)
+    value = runtime_env.env_get(environ, name, default)
+    return default if value is None else str(value)
+
+
+def _env_nonempty(environ: dict[str, str], name: str) -> str | None:
+    runtime_env = _load_local_runtime_env_module()
+    if not hasattr(runtime_env, "env_nonempty"):
+        value = _env_get(environ, name, "")
+        value = str(value).strip()
+        return value or None
+    return runtime_env.env_nonempty(environ, name)
 
 
 def _is_local_checkout_path(path: str) -> bool:
@@ -137,25 +158,25 @@ def _reexec_if_env_mismatch(*, pythonpath: str, ld_library_path: str) -> None:
     desired = {
         "PYTHONPATH": pythonpath,
         "LD_LIBRARY_PATH": ld_library_path,
-        "TINKER_SERVER_EXACT_ENV": "1",
+        "MINT_SERVER_EXACT_ENV": "1",
     }
     current_pythonpath = _normalize_pythonpath(os.environ.get("PYTHONPATH", ""))
     current_ld_library_path = os.environ.get("LD_LIBRARY_PATH", "")
     current_matches = all(
-        os.environ.get(k) == v for k, v in desired.items() if k != "TINKER_SERVER_EXACT_ENV"
+        _env_get(os.environ, k) == v for k, v in desired.items() if k != "MINT_SERVER_EXACT_ENV"
     )
     if current_matches:
         return
-    if os.environ.get("TINKER_SERVER_EXACT_ENV") == "1":
+    if _env_get(os.environ, "MINT_SERVER_EXACT_ENV") == "1":
         raise RuntimeError(
-            "TINKER_SERVER_EXACT_ENV=1 but runtime environment is still incorrect: "
+            "MINT_SERVER_EXACT_ENV=1 but runtime environment is still incorrect: "
             f"PYTHONPATH={os.environ.get('PYTHONPATH')!r} LD_LIBRARY_PATH={os.environ.get('LD_LIBRARY_PATH')!r}"
         )
     new_env = dict(os.environ)
     new_env.update(desired)
-    new_env["TINKER_SERVER_ENV_NORMALIZED"] = "1"
-    new_env["TINKER_SERVER_PYTHONPATH_CHANGED"] = "1" if current_pythonpath != pythonpath else "0"
-    new_env["TINKER_SERVER_LD_LIBRARY_PATH_CHANGED"] = "1" if current_ld_library_path != ld_library_path else "0"
+    new_env["MINT_SERVER_ENV_NORMALIZED"] = "1"
+    new_env["MINT_SERVER_PYTHONPATH_CHANGED"] = "1" if current_pythonpath != pythonpath else "0"
+    new_env["MINT_SERVER_LD_LIBRARY_PATH_CHANGED"] = "1" if current_ld_library_path != ld_library_path else "0"
     os.execvpe(sys.executable, [sys.executable, *sys.argv], new_env)
 
 
@@ -169,12 +190,12 @@ def _reexec_to_runtime_host_python_if_needed() -> None:
     current_python = pathlib.Path(sys.executable).resolve()
     if current_python == target_python:
         return
-    if os.environ.get("TINKER_SERVER_HOST_PYTHON") == "1":
+    if _env_get(os.environ, "MINT_SERVER_HOST_PYTHON") == "1":
         raise RuntimeError(
-            f"TINKER_SERVER_HOST_PYTHON=1 but sys.executable={current_python} != {target_python}"
+            f"MINT_SERVER_HOST_PYTHON=1 but sys.executable={current_python} != {target_python}"
         )
     new_env = dict(os.environ)
-    new_env["TINKER_SERVER_HOST_PYTHON"] = "1"
+    new_env["MINT_SERVER_HOST_PYTHON"] = "1"
     os.execvpe(str(target_python), [str(target_python), *sys.argv], new_env)
 
 def crash_handler(exc_type, exc_value, exc_tb):
@@ -209,7 +230,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--config",
         dest="config_path",
         default=None,
-        help="Path to tinker-server TOML config file (sets TINKER_CONFIG_PATH before import).",
+        help="Path to tinker-server TOML config file (sets MINT_CONFIG_PATH before import).",
     )
     return p.parse_args(argv)
 
@@ -295,13 +316,13 @@ def _launcher_observability(*, target: object, kwargs: dict[str, object], enviro
         "port": kwargs["port"],
         "target": target if isinstance(target, str) else "inproc:app",
         "timeout_worker_healthcheck": kwargs.get("timeout_worker_healthcheck"),
-        "namespace": env.get("MINT_RAY_NAMESPACE") or env.get("TINKER_RAY_NAMESPACE") or "",
+        "namespace": _env_get(env, "MINT_RAY_NAMESPACE"),
         "startup_lease_actor": env.get("MINT_STARTUP_LEASE_ACTOR_NAME", ""),
         "ray_address": env.get("RAY_ADDRESS", ""),
         "ray_client_address": env.get("MINT_RAY_CLIENT_ADDRESS") or env.get("RAY_CLIENT_ADDRESS") or "",
-        "env_normalized": env.get("TINKER_SERVER_ENV_NORMALIZED") == "1",
-        "pythonpath_changed": env.get("TINKER_SERVER_PYTHONPATH_CHANGED") == "1",
-        "ld_library_path_changed": env.get("TINKER_SERVER_LD_LIBRARY_PATH_CHANGED") == "1",
+        "env_normalized": _env_get(env, "MINT_SERVER_ENV_NORMALIZED") == "1",
+        "pythonpath_changed": _env_get(env, "MINT_SERVER_PYTHONPATH_CHANGED") == "1",
+        "ld_library_path_changed": _env_get(env, "MINT_SERVER_LD_LIBRARY_PATH_CHANGED") == "1",
         "pythonpath_entries": entry_count,
     }
 
@@ -330,9 +351,9 @@ def _log_launcher_observability(*, target: object, kwargs: dict[str, object], en
 def main(argv: list[str] | None = None) -> None:
     argv = sys.argv[1:] if argv is None else argv
     args = _parse_args(argv)
-    config_path = str(args.config_path) if args.config_path else os.environ.get("TINKER_CONFIG_PATH", "").strip()
+    config_path = str(args.config_path) if args.config_path else (_env_nonempty(os.environ, "MINT_CONFIG_PATH") or "")
     if config_path:
-        os.environ["TINKER_CONFIG_PATH"] = config_path
+        os.environ["MINT_CONFIG_PATH"] = config_path
         _seed_runtime_env_from_config(config_path)
 
     _reexec_to_runtime_host_python_if_needed()

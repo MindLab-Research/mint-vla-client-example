@@ -63,7 +63,7 @@ Implications:
 - `tinker_server/backend/model_actor_supervisor.py`
   - Process-local desired-state reconciler for model runtime actors.
   - Desired specs come from local config/env; the supervisor itself is not a durable store.
-  - Exposes the explicit inventory/launcher publication contract used by legacy vLLM, Megatron, dense, and OpenPI actor launch paths while those backends are being moved behind backend-specific launcher implementations.
+  - Owns the inventory/launcher publication contract used by backend-specific vLLM, Megatron, dense, and OpenPI launchers.
 
 - `tinker_server/backend/model_actor_launchers.py`
   - Launcher registry used by `ModelActorSupervisor` when reconciling desired model runtime actors.
@@ -75,7 +75,7 @@ Implications:
 
 - `tinker_server/backend/session_manager.py`
   - Sampling session bookkeeping and cleanup.
-  - Supports legacy per-session engines and a shared-engine mode for faster ephemeral weight sync.
+  - Routes named sessions and ephemeral weight sync through the current shared-engine sampling path.
 
 - `tinker_server/backend/multi_lora_engine.py`
   - Multi-tenant inference: one detached vLLM actor per base model, with many LoRA adapters loaded and selected by `lora_int_id`.
@@ -96,7 +96,7 @@ Implications:
 - `tinker_server/config.py`
   - Server config + Ray runtime `PYTHONPATH` for actors.
   - Canonical mode assembles `PFS_PYTHONPATH` from `PFS_RUNTIME_ENV_ROOT`.
-  - Legacy mode assembles it from per-package overlay paths.
+  - Reads server-owned deployment knobs through the runtime-env helper; `MINT_*` is canonical and `TINKER_*` is only an input alias.
 
 - `tinker_server/runtime_env.py`
   - Pure-stdlib runtime-env layout and bootstrap helpers shared by config and startup code.

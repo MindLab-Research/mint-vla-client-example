@@ -495,7 +495,6 @@ async def retrieve_future(
         queue_kind = meta.get("queue_kind") if isinstance(meta, dict) else None
         scheduler_domain = meta.get("scheduler_domain") if isinstance(meta, dict) else None
         scheduler_session_id = meta.get("scheduler_session_id") if isinstance(meta, dict) else None
-        queue_depth_legacy = None
         queue_depth_scheduled = None
         queue_depth_domain = None
         queue_depth_session = None
@@ -519,10 +518,6 @@ async def retrieve_future(
             queue_position = int(queue_position)
         else:
             queue_position = None
-        if isinstance(queue_depth_legacy, (int, float)):
-            queue_depth_legacy = int(queue_depth_legacy)
-        else:
-            queue_depth_legacy = None
         if isinstance(queue_depth_scheduled, (int, float)):
             queue_depth_scheduled = int(queue_depth_scheduled)
         else:
@@ -648,7 +643,6 @@ async def retrieve_future(
                 "seq_id": seq_id,
                 "base_model": base_model,
                 "backend": backend,
-                "queue_depth_legacy": queue_depth_legacy,
                 "queue_depth_scheduled": queue_depth_scheduled,
                 "queue_depth_domain": queue_depth_domain,
                 "queue_depth_session": queue_depth_session,

@@ -12,6 +12,8 @@ Runtime configuration is split by when the value must be available:
 
 `ConfigActor` is a namespace-local detached actor. Namespace is the deployment isolation boundary, so the production actor name is stable inside the namespace and does not contain a run id.
 
+`MINT_*` is the canonical environment/config namespace for server-owned deployment settings. `TINKER_*` names are accepted only as compatibility aliases by `tinker_server.runtime_env.env_get()` / `env_nonempty()`: reading either `MINT_FOO` or `TINKER_FOO` checks `MINT_FOO` first and then `TINKER_FOO`. Code outside that helper should use canonical `MINT_*` names, and ConfigActor snapshots should publish canonical `MINT_*` keys.
+
 ## V1 semantics
 
 - Actor name: `mint_config`, overridable by `MINT_CONFIG_ACTOR_NAME` for tests or controlled migrations.
@@ -31,10 +33,10 @@ These values remain explicit actor bootstrap inputs because the actor cannot que
 - `PFS_TINKER_PATH`
 - `PFS_HF_MODULES_PATH`
 - `RAY_ADDRESS`
-- `TINKER_RAY_NAMESPACE` / `MINT_RAY_NAMESPACE`
-- `TINKER_CONFIG_PATH`
+- `MINT_RAY_NAMESPACE`
+- `MINT_CONFIG_PATH`
 - Ray Client packaging inputs such as `MINT_RAY_JOB_WORKING_DIR`, `MINT_RAY_WORKING_DIR`, and `MINT_RAY_PY_MODULES_CSV`
-- library loader bootstrap such as `TINKER_ACTOR_LD_LIBRARY_PATH`
+- library loader bootstrap such as `MINT_ACTOR_LD_LIBRARY_PATH`
 
 These should be small and relatively stable. If a frequently changed business setting needs bootstrap propagation, treat that as a design smell and migrate the consumer to the ConfigActor snapshot when possible.
 
@@ -55,7 +57,7 @@ ConfigActor owns actor-readable deployment/runtime configuration. The API proces
 
 - known actor creation, snapshot, observability, and task-state configuration keys;
 - unclassified `MINT_`, `TINKER_`, and `OTEL_` keys, so newly added deployment knobs do not silently fall back to direct runtime_env forwarding;
-- canonical `MINT_*` actor name aliases when only legacy `TINKER_*` names are set.
+- canonicalized `MINT_*` names when only a `TINKER_*` alias is set.
 
 `actor_env` deliberately excludes bootstrap runtime_env keys and ConfigActor hydration control flags. Per-actor identity or execution contract values may still be passed through `extra` at actor creation, because they are not deployment configuration.
 

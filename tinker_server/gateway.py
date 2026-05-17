@@ -11,6 +11,7 @@ from typing import Any
 import httpx
 
 from .logging_context import get_current_traceparent, get_trace_id
+from .runtime_env import env_get
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +43,7 @@ def get_gateway_config() -> GatewayConfig | None:
     if _gateway_config is not None:
         return _gateway_config
 
-    raw = os.environ.get("TINKER_GATEWAY_CONFIG_JSON", "").strip()
+    raw = (env_get(os.environ, "MINT_GATEWAY_CONFIG_JSON", "") or "").strip()
     if not raw:
         return None
 
@@ -59,12 +60,12 @@ def get_gateway_config() -> GatewayConfig | None:
     for alias, u in upstreams_raw.items():
         base_url = str(u.get("base_url") or "").rstrip("/")
         if not base_url:
-            raise ValueError(f"TINKER_GATEWAY_CONFIG_JSON: upstream {alias!r} missing base_url")
+            raise ValueError(f"MINT_GATEWAY_CONFIG_JSON: upstream {alias!r} missing base_url")
         auth_mode = str(u.get("auth_mode") or "pass_through").strip().lower()
         api_key = u.get("api_key")
         if auth_mode == "static_api_key" and not api_key:
             raise ValueError(
-                f"TINKER_GATEWAY_CONFIG_JSON: upstream {alias!r} auth_mode=static_api_key requires api_key"
+                f"MINT_GATEWAY_CONFIG_JSON: upstream {alias!r} auth_mode=static_api_key requires api_key"
             )
         upstreams[str(alias)] = Upstream(
             alias=str(alias),
@@ -86,7 +87,7 @@ def upstream_for_model(model_name: str) -> Upstream | None:
         return None
     up = cfg.upstreams.get(alias)
     if up is None:
-        raise ValueError(f"TINKER_GATEWAY_CONFIG_JSON: model {model_name!r} maps to unknown upstream {alias!r}")
+        raise ValueError(f"MINT_GATEWAY_CONFIG_JSON: model {model_name!r} maps to unknown upstream {alias!r}")
     return up
 
 
@@ -132,7 +133,7 @@ def _pick_auth_headers(*, incoming_headers: dict[str, str], upstream: Upstream) 
             return {**forwarded, "Authorization": auth}
         return forwarded
     raise ValueError(
-        f"TINKER_GATEWAY_CONFIG_JSON: unsupported auth_mode={upstream.auth_mode!r} for {upstream.alias!r}"
+        f"MINT_GATEWAY_CONFIG_JSON: unsupported auth_mode={upstream.auth_mode!r} for {upstream.alias!r}"
     )
 
 

@@ -809,8 +809,8 @@ def test_gateway_session_store_namespace_respects_config_file(tmp_path):
     cfg.write_text("[ray]\nnamespace = 'cfg_ns'\n", encoding="utf-8")
 
     env = os.environ.copy()
-    env["TINKER_CONFIG_PATH"] = str(cfg)
-    env.pop("TINKER_RAY_NAMESPACE", None)
+    env["MINT_CONFIG_PATH"] = str(cfg)
+    env.pop("MINT_RAY_NAMESPACE", None)
     env.pop("MINT_RAY_NAMESPACE", None)
 
     out = subprocess.run(
@@ -838,8 +838,8 @@ def test_detached_store_namespaces_respect_config_file(tmp_path):
     cfg.write_text("[ray]\nnamespace = 'cfg_ns'\n", encoding="utf-8")
 
     env = os.environ.copy()
-    env["TINKER_CONFIG_PATH"] = str(cfg)
-    env.pop("TINKER_RAY_NAMESPACE", None)
+    env["MINT_CONFIG_PATH"] = str(cfg)
+    env.pop("MINT_RAY_NAMESPACE", None)
     env.pop("MINT_RAY_NAMESPACE", None)
 
     out = subprocess.run(
@@ -873,8 +873,8 @@ def test_config_import_fails_on_namespace_mismatch(tmp_path):
     cfg.write_text("[ray]\nnamespace = 'cfg_ns'\n", encoding="utf-8")
 
     env = os.environ.copy()
-    env["TINKER_CONFIG_PATH"] = str(cfg)
-    env["TINKER_RAY_NAMESPACE"] = "env_ns"
+    env["MINT_CONFIG_PATH"] = str(cfg)
+    env["MINT_RAY_NAMESPACE"] = "env_ns"
 
     out = subprocess.run(
         [sys.executable, "-c", "import tinker_server.config"],
@@ -903,7 +903,7 @@ def test_config_import_fails_on_runtime_path_mismatch(tmp_path):
     )
 
     env = os.environ.copy()
-    env["TINKER_CONFIG_PATH"] = str(cfg)
+    env["MINT_CONFIG_PATH"] = str(cfg)
     env["PFS_RUNTIME_ENV_ROOT"] = "/env/runtime"
     env["PFS_TINKER_PATH"] = "/env/repo"
     env["PFS_HF_MODULES_PATH"] = "/env/hf"
@@ -979,7 +979,7 @@ def test_run_server_honors_env_config_before_runtime_bootstrap(tmp_path):
         text=True,
         env={
             "TINKER_HOST": "127.0.0.1",
-            "TINKER_CONFIG_PATH": str(cfg),
+            "MINT_CONFIG_PATH": str(cfg),
         },
     )
     assert "PFS_RUNTIME_ENV_ROOT is required" not in (out.stdout + out.stderr)
@@ -1158,7 +1158,7 @@ def test_actor_runtime_env_vars_forwards_config_path(tmp_path):
             "PFS_TINKER_PATH": str(tmp_path / 'repo'),
             "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
             "RAY_ADDRESS": "ray://cfg-test",
-            "TINKER_CONFIG_PATH": str(cfg),
+            "MINT_CONFIG_PATH": str(cfg),
             "MINT_DETACHED_ACTOR_NODE_IP": "192.168.38.175",
             "MINT_MODEL_WORK_SCHEDULER_ACTOR_NAME": "issue440-model-work-scheduler",
             "MINT_TASK_STATE_STORE_ACTOR_NAME": "issue440-task-state-store",
@@ -1167,8 +1167,8 @@ def test_actor_runtime_env_vars_forwards_config_path(tmp_path):
     data = payload["runtime_env"]
     actor_env = payload["actor_env"]
     assert data["RAY_ADDRESS"] == "ray://cfg-test"
-    assert data["TINKER_CONFIG_PATH"] == str(cfg)
-    assert data["TINKER_RAY_NAMESPACE"] == "cfg_ns"
+    assert data["MINT_CONFIG_PATH"] == str(cfg)
+    assert data["MINT_RAY_NAMESPACE"] == "cfg_ns"
     assert actor_env["MINT_DETACHED_ACTOR_NODE_IP"] == "192.168.38.175"
     assert actor_env["MINT_MODEL_WORK_SCHEDULER_ACTOR_NAME"] == "issue440-model-work-scheduler"
     assert actor_env["MINT_TASK_STATE_STORE_ACTOR_NAME"] == "issue440-task-state-store"
@@ -1208,7 +1208,7 @@ def test_actor_runtime_env_vars_forwards_control_plane_actor_names(tmp_path):
             "PFS_TINKER_PATH": str(tmp_path / 'repo'),
             "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
             "RAY_ADDRESS": "ray://cfg-test",
-            "TINKER_RAY_NAMESPACE": "mint-test-ns",
+            "MINT_RAY_NAMESPACE": "mint-test-ns",
             "MINT_RAY_NAMESPACE": "mint-test-ns",
             "MINT_GATEWAY_SESSION_STORE_ACTOR_NAME": "mint-gateway-session-store-test",
             "MINT_SAMPLING_SESSION_STORE_ACTOR_NAME": "mint-sampling-session-store-test",
@@ -1227,7 +1227,7 @@ def test_actor_runtime_env_vars_forwards_control_plane_actor_names(tmp_path):
     )
     data = payload["runtime_env"]
     actor_env = payload["actor_env"]
-    assert data["TINKER_RAY_NAMESPACE"] == "mint-test-ns"
+    assert data["MINT_RAY_NAMESPACE"] == "mint-test-ns"
     assert data["MINT_RAY_NAMESPACE"] == "mint-test-ns"
     assert actor_env["MINT_GATEWAY_SESSION_STORE_ACTOR_NAME"] == "mint-gateway-session-store-test"
     assert actor_env["MINT_SAMPLING_SESSION_STORE_ACTOR_NAME"] == "mint-sampling-session-store-test"
@@ -1253,17 +1253,17 @@ def test_actor_runtime_env_vars_forwards_usage_envs(tmp_path):
             "PFS_TINKER_PATH": str(tmp_path / 'repo'),
             "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
             "RAY_ADDRESS": "ray://cfg-test",
-            "TINKER_USAGE_LOG_DIR": "/vePFS/shared/usage",
-            "TINKER_USAGE_BACKEND": "postgres",
-            "TINKER_USAGE_PG_DSN": "postgresql://mint:test@db/usage",
+            "MINT_USAGE_LOG_DIR": "/vePFS/shared/usage",
+            "MINT_USAGE_BACKEND": "postgres",
+            "MINT_USAGE_PG_DSN": "postgresql://mint:test@db/usage",
         },
     )
     data = payload["runtime_env"]
     actor_env = payload["actor_env"]
-    assert "TINKER_USAGE_LOG_DIR" not in data
-    assert actor_env["TINKER_USAGE_LOG_DIR"] == "/vePFS/shared/usage"
-    assert actor_env["TINKER_USAGE_BACKEND"] == "postgres"
-    assert actor_env["TINKER_USAGE_PG_DSN"] == "postgresql://mint:test@db/usage"
+    assert "MINT_USAGE_LOG_DIR" not in data
+    assert actor_env["MINT_USAGE_LOG_DIR"] == "/vePFS/shared/usage"
+    assert actor_env["MINT_USAGE_BACKEND"] == "postgres"
+    assert actor_env["MINT_USAGE_PG_DSN"] == "postgresql://mint:test@db/usage"
 
 
 def test_actor_runtime_env_vars_forwards_ray_attach_hints(tmp_path):

@@ -18,7 +18,7 @@ Patterns used:
 - Path-based loading on shared filesystem: used to avoid serializing 10k+ tensors through Ray.
 
 Key knobs and locations:
-- `TINKER_CHECKPOINT_DIR` controls where server-side code expects checkpoints/adapters for `file://` and `mint://` URIs (see `tinker_server/routes/service.py` and `tinker_server/backend/session_manager.py`).
+- `MINT_CHECKPOINT_DIR` controls where server-side code expects checkpoints/adapters for `file://` and `mint://` URIs (see `tinker_server/routes/service.py` and `tinker_server/backend/session_manager.py`).
 - External `tinker://` request payloads are accepted only at the API compatibility boundary and rewritten to `mint://` before route handlers run.
 
 ## Resume metadata lookup

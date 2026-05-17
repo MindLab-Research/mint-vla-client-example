@@ -6,6 +6,8 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+from .runtime_env import env_nonempty
+
 _CACHE_LOCK = threading.Lock()
 _CACHE_AT_MONO = 0.0
 _CACHE_VALUE: dict[str, Any] | None = None
@@ -273,7 +275,7 @@ def get_ray_cluster_health_snapshot(*, force_refresh: bool = False) -> dict[str,
         snapshot = {
             "status": "unavailable",
             "up": False,
-            "namespace": os.environ.get("TINKER_RAY_NAMESPACE") or os.environ.get("MINT_RAY_NAMESPACE") or "tinker",
+            "namespace": env_nonempty(os.environ, "MINT_RAY_NAMESPACE") or "tinker",
             "collected_at": _utc_now_iso(),
             "probes": {},
             "warnings": ["collector_error"],

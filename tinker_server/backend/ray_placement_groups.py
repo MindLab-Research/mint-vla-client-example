@@ -5,6 +5,8 @@ from typing import Any
 
 import ray
 
+from ..runtime_env import env_nonempty
+
 
 class PlacementGroupMismatchError(RuntimeError):
     def __init__(self, pg: Any, message: str) -> None:
@@ -13,7 +15,7 @@ class PlacementGroupMismatchError(RuntimeError):
 
 
 def _ray_namespace() -> str:
-    env_ns = os.environ.get("TINKER_RAY_NAMESPACE") or os.environ.get("MINT_RAY_NAMESPACE")
+    env_ns = env_nonempty(os.environ, "MINT_RAY_NAMESPACE")
     if env_ns:
         return env_ns
     try:

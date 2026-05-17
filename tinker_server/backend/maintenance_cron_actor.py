@@ -9,6 +9,7 @@ import uuid
 from typing import Any
 
 from ..config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources, otel_env_vars
+from ..runtime_env import env_nonempty
 from ..checkpoints import (
     get_checkpoint_mirror_poll_s,
     get_checkpoint_reap_interval_s,
@@ -44,7 +45,7 @@ def _actor_name() -> str:
 
 
 def _ray_namespace() -> str:
-    env_ns = os.environ.get("TINKER_RAY_NAMESPACE") or os.environ.get("MINT_RAY_NAMESPACE")
+    env_ns = env_nonempty(os.environ, "MINT_RAY_NAMESPACE")
     if env_ns:
         return env_ns
     try:

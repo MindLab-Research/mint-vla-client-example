@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from ..config import PFS_PYTHONPATH, actor_runtime_env, config as server_config, otel_env_vars, preferred_control_plane_resources
+from ..runtime_env import env_nonempty
 from .async_ray_control import async_get_ray_ref, sync_get_ray_ref
 
 logger = logging.getLogger(__name__)
@@ -27,7 +28,7 @@ class ModelWorkSchedulerConflictError(RuntimeError):
 
 
 def _ray_namespace() -> str:
-    v = os.environ.get("TINKER_RAY_NAMESPACE") or os.environ.get("MINT_RAY_NAMESPACE")
+    v = env_nonempty(os.environ, "MINT_RAY_NAMESPACE")
     if v:
         return v
     try:

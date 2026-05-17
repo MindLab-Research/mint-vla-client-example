@@ -8,6 +8,8 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import Any
 
+from .runtime_env import env_nonempty
+
 _CACHE_LOCK = threading.Lock()
 _CACHE_AT_MONO = 0.0
 _CACHE_VALUE: dict[str, Any] | None = None
@@ -253,7 +255,7 @@ def get_ray_gcs_metrics_snapshot(*, force_refresh: bool = False) -> dict[str, An
         snapshot = {
             "status": "unavailable",
             "up": False,
-            "namespace": os.environ.get("TINKER_RAY_NAMESPACE") or os.environ.get("MINT_RAY_NAMESPACE") or "tinker",
+            "namespace": env_nonempty(os.environ, "MINT_RAY_NAMESPACE") or "tinker",
             "collected_at": _utc_now_iso(),
             "timeout_s": _float_env("MINT_RAY_GCS_METRICS_TIMEOUT_S", 2.0),
             "candidate_addresses": [],

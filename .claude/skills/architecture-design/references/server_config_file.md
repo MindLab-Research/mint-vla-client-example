@@ -4,12 +4,12 @@
 
 ## Location and precedence
 
-- `scripts/run_server.py --config /path/to/config.toml` sets `TINKER_CONFIG_PATH` before importing the app.
-- `TINKER_CONFIG_PATH=/path/to/config.toml` loads the file at process startup.
+- `scripts/run_server.py --config /path/to/config.toml` sets `MINT_CONFIG_PATH` before importing the app.
+- `MINT_CONFIG_PATH=/path/to/config.toml` loads the file at process startup.
 
 Precedence:
 1. Environment variables
-2. Config file (`TINKER_CONFIG_PATH`)
+2. Config file (`MINT_CONFIG_PATH`)
 3. Built-in defaults
 
 Unknown keys and type mismatches fail fast at startup with a validation error.
@@ -25,29 +25,29 @@ trust boundary between the platform and Mint API process.
 - `port` (int)
 - `usage_log_dir` (str)
 - `skip_actor_cleanup` (bool) [env: `MINT_SKIP_ACTOR_CLEANUP`]
-- `tensor_parallel_size` (int) [env: `TINKER_TP_SIZE`]
-- `data_parallel_size` (int) [env: `TINKER_DP_SIZE`]
-- `gpu_memory_utilization` (float) [env: `TINKER_GPU_MEM_UTIL`]
-- `max_model_len` (int) [env: `TINKER_MAX_MODEL_LEN`]
-- `session_inactivity_timeout_s` (float) [env: `TINKER_SESSION_INACTIVITY_TIMEOUT_S`]
-- `enable_multi_lora` (bool) [env: `TINKER_ENABLE_MULTI_LORA`]
-- `max_loras` (int) [env: `TINKER_MAX_LORAS`]
-- `max_cpu_loras` (int) [env: `TINKER_MAX_CPU_LORAS`]
-- `max_lora_rank` (int) [env: `TINKER_MAX_LORA_RANK`]
+- `tensor_parallel_size` (int) [env: `MINT_TP_SIZE`]
+- `data_parallel_size` (int) [env: `MINT_DP_SIZE`]
+- `gpu_memory_utilization` (float) [env: `MINT_GPU_MEM_UTIL`]
+- `max_model_len` (int) [env: `MINT_MAX_MODEL_LEN`]
+- `session_inactivity_timeout_s` (float) [env: `MINT_SESSION_INACTIVITY_TIMEOUT_S`]
+- `enable_multi_lora` (bool) [env: `MINT_ENABLE_MULTI_LORA`]
+- `max_loras` (int) [env: `MINT_MAX_LORAS`]
+- `max_cpu_loras` (int) [env: `MINT_MAX_CPU_LORAS`]
+- `max_lora_rank` (int) [env: `MINT_MAX_LORA_RANK`]
 
 ### `[sampling]`
 
-- `max_inflight_sample_tasks` (int) [env: `TINKER_MAX_INFLIGHT_SAMPLE_TASKS`]
-- `max_concurrent_samples_per_request` (int) [env: `TINKER_MAX_CONCURRENT_SAMPLES_PER_REQUEST`]
-- `sample_coalesce` (bool) [env: `TINKER_SAMPLE_COALESCE`]
-- `sample_coalesce_window_ms` (float) [env: `TINKER_SAMPLE_COALESCE_WINDOW_MS`]
-- `sample_coalesce_max_batch` (int) [env: `TINKER_SAMPLE_COALESCE_MAX_BATCH`]
-- `sample_coalesce_max_samples` (int) [env: `TINKER_SAMPLE_COALESCE_MAX_SAMPLES`]
-- `require_seq_id` (bool) [env: `TINKER_SAMPLE_REQUIRE_SEQ_ID`]
+- `max_inflight_sample_tasks` (int) [env: `MINT_MAX_INFLIGHT_SAMPLE_TASKS`]
+- `max_concurrent_samples_per_request` (int) [env: `MINT_MAX_CONCURRENT_SAMPLES_PER_REQUEST`]
+- `sample_coalesce` (bool) [env: `MINT_SAMPLE_COALESCE`]
+- `sample_coalesce_window_ms` (float) [env: `MINT_SAMPLE_COALESCE_WINDOW_MS`]
+- `sample_coalesce_max_batch` (int) [env: `MINT_SAMPLE_COALESCE_MAX_BATCH`]
+- `sample_coalesce_max_samples` (int) [env: `MINT_SAMPLE_COALESCE_MAX_SAMPLES`]
+- `require_seq_id` (bool) [env: `MINT_SAMPLE_REQUIRE_SEQ_ID`]
 
 ### `[ray]`
 
-- `namespace` (str) [env: `TINKER_RAY_NAMESPACE` / `MINT_RAY_NAMESPACE`]
+- `namespace` (str) [env: `MINT_RAY_NAMESPACE`]
 
 ### `[paths]`
 
@@ -81,8 +81,8 @@ actor/runtime dependency assembly.
 
 ### `[training]`
 
-- `force_grad_checkpointing` (bool) [env: `TINKER_FORCE_GRAD_CHECKPOINTING`]
-- `enable_sdp` (bool) [env: `TINKER_ENABLE_SDP`]
+- `force_grad_checkpointing` (bool) [env: `MINT_FORCE_GRAD_CHECKPOINTING`]
+- `enable_sdp` (bool) [env: `MINT_ENABLE_SDP`]
 - `megatron_create_timeout_s` (float) [env: `MINT_MEGATRON_CREATE_TIMEOUT_S`]
 - `dense_get_or_create_timeout_s` (float) [env: `MINT_DENSE_GET_OR_CREATE_TIMEOUT_S`]
 - `reinit_lora_timeout_s` (float) [env: `MINT_REINIT_LORA_TIMEOUT_S`]
@@ -101,7 +101,7 @@ actor/runtime dependency assembly.
 
 ### `[internal]`
 
-- `checkpoint_dir` (str) [env: `TINKER_CHECKPOINT_DIR`]
+- `checkpoint_dir` (str) [env: `MINT_CHECKPOINT_DIR`]
 
 ## Example
 

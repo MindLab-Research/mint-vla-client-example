@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Literal
 import fcntl
 
+from .runtime_env import env_get
 from .checkpoint_index import (
     CheckpointNotFoundError,
     checkpoint_index_enabled,
@@ -33,9 +34,9 @@ DEFAULT_MIRROR_POLL_S = 5
 DEFAULT_PUBLISH_RETRY_BACKOFF_S = 60
 
 # Backward-compatible module globals. Existing tests patch CHECKPOINTS_DIR directly.
-CHECKPOINTS_DIR = os.environ.get("TINKER_CHECKPOINT_DIR", DEFAULT_PERSISTENT_CHECKPOINTS_DIR)
-PERSISTENT_CHECKPOINTS_DIR = os.environ.get("TINKER_PERSISTENT_CHECKPOINT_DIR", CHECKPOINTS_DIR)
-RUNTIME_CHECKPOINTS_DIR = os.environ.get("TINKER_RUNTIME_CHECKPOINT_DIR", DEFAULT_RUNTIME_CHECKPOINTS_DIR)
+CHECKPOINTS_DIR = env_get(os.environ, "MINT_CHECKPOINT_DIR", DEFAULT_PERSISTENT_CHECKPOINTS_DIR)
+PERSISTENT_CHECKPOINTS_DIR = env_get(os.environ, "MINT_PERSISTENT_CHECKPOINT_DIR", CHECKPOINTS_DIR)
+RUNTIME_CHECKPOINTS_DIR = env_get(os.environ, "MINT_RUNTIME_CHECKPOINT_DIR", DEFAULT_RUNTIME_CHECKPOINTS_DIR)
 
 CheckpointType = Literal["training", "sampler"]
 _CHECKPOINT_TYPES: tuple[CheckpointType, ...] = ("training", "sampler")

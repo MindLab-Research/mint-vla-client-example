@@ -6,6 +6,8 @@ import logging
 import os
 from collections.abc import MutableMapping
 
+from .runtime_env import env_nonempty
+
 logger = logging.getLogger(__name__)
 
 CONFIG_ACTOR_DEFAULT_NAME = "mint_config"
@@ -20,16 +22,12 @@ def _truthy(value: str | None) -> bool:
 
 
 def _config_actor_name(environ: MutableMapping[str, str]) -> str:
-    value = str(environ.get("MINT_CONFIG_ACTOR_NAME") or "").strip()
+    value = env_nonempty(environ, "MINT_CONFIG_ACTOR_NAME")
     return value or CONFIG_ACTOR_DEFAULT_NAME
 
 
 def _ray_namespace(environ: MutableMapping[str, str]) -> str:
-    value = str(
-        environ.get("TINKER_RAY_NAMESPACE")
-        or environ.get("MINT_RAY_NAMESPACE")
-        or ""
-    ).strip()
+    value = env_nonempty(environ, "MINT_RAY_NAMESPACE")
     return value or "tinker"
 
 

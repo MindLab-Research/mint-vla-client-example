@@ -10,6 +10,7 @@ import ray
 
 from ..config import PFS_PYTHONPATH, RAY_NAMESPACE, actor_runtime_env_vars
 from ..ray_utils import init_ray
+from ..runtime_env import env_nonempty
 from .async_ray_control import async_get_ray_ref
 from .openpi_fast_runtime import (
     OpenPIFastRuntimeSpec,
@@ -42,8 +43,7 @@ def _action_session_state_root(actor_name: str) -> str:
     if not pfs_tinker_path:
         raise RuntimeError("OpenPI action session state root requires PFS_TINKER_PATH")
     namespace = str(
-        os.environ.get("MINT_RAY_NAMESPACE")
-        or os.environ.get("TINKER_RAY_NAMESPACE")
+        env_nonempty(os.environ, "MINT_RAY_NAMESPACE")
         or RAY_NAMESPACE
         or ""
     ).strip()

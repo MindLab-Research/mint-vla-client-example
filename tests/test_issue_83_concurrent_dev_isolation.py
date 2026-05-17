@@ -5,16 +5,16 @@ from pathlib import Path
 def test_ray_namespace_env_roundtrip(monkeypatch):
     import tinker_server.config as cfg
 
-    old = cfg.os.environ.get("TINKER_RAY_NAMESPACE")
+    old = cfg.os.environ.get("MINT_RAY_NAMESPACE")
 
-    monkeypatch.setenv("TINKER_RAY_NAMESPACE", "ns_test_83")
+    monkeypatch.setenv("MINT_RAY_NAMESPACE", "ns_test_83")
     cfg2 = importlib.reload(cfg)
     assert cfg2.RAY_NAMESPACE == "ns_test_83"
 
     if old is None:
-        monkeypatch.delenv("TINKER_RAY_NAMESPACE", raising=False)
+        monkeypatch.delenv("MINT_RAY_NAMESPACE", raising=False)
     else:
-        monkeypatch.setenv("TINKER_RAY_NAMESPACE", old)
+        monkeypatch.setenv("MINT_RAY_NAMESPACE", old)
     cfg3 = importlib.reload(cfg)
     assert cfg3.RAY_NAMESPACE == (old or "tinker")
 
@@ -42,7 +42,7 @@ def test_no_hardcoded_tinker_namespace_in_backends():
         assert "namespace='tinker'" not in txt
 
 
-def test_detached_store_actors_use_tinker_ray_namespace(monkeypatch):
+def test_detached_store_actors_use_mint_ray_namespace(monkeypatch):
     monkeypatch.setenv("TINKER_RAY_NAMESPACE", "ns_tinker")
     monkeypatch.setenv("MINT_RAY_NAMESPACE", "ns_mint")
 
@@ -53,10 +53,10 @@ def test_detached_store_actors_use_tinker_ray_namespace(monkeypatch):
     sampling_session_store_mod = importlib.import_module("tinker_server.backend.sampling_session_store")
     training_session_store_mod = importlib.import_module("tinker_server.backend.training_session_store")
 
-    assert task_state_store_mod._ray_namespace() == "ns_tinker"
-    assert sampling_session_store_mod._ray_namespace() == "ns_tinker"
-    assert training_session_store_mod._ray_namespace() == "ns_tinker"
-    assert gateway_session_store_mod._ray_namespace() == "ns_tinker"
+    assert task_state_store_mod._ray_namespace() == "ns_mint"
+    assert sampling_session_store_mod._ray_namespace() == "ns_mint"
+    assert training_session_store_mod._ray_namespace() == "ns_mint"
+    assert gateway_session_store_mod._ray_namespace() == "ns_mint"
 
 
 def test_training_session_metadata_namespace_is_ray_namespace():

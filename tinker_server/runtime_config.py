@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass
 from typing import Mapping
 
 from .config import ServerConfig, config as server_config
+from .runtime_env import canonical_mint_env_name
 
 CONFIG_SNAPSHOT_SCHEMA_VERSION = 1
 CONFIG_ACTOR_DEFAULT_NAME = "mint_config"
@@ -32,10 +33,9 @@ BOOTSTRAP_RUNTIME_ENV_KEYS = frozenset(
         "PFS_TINKER_PATH",
         "PFS_HF_MODULES_PATH",
         "RAY_ADDRESS",
-        "TINKER_RAY_NAMESPACE",
         "MINT_RAY_NAMESPACE",
-        "TINKER_CONFIG_PATH",
-        "TINKER_ACTOR_LD_LIBRARY_PATH",
+        "MINT_CONFIG_PATH",
+        "MINT_ACTOR_LD_LIBRARY_PATH",
         "MINT_RAY_CLIENT_ADDRESS",
         "RAY_CLIENT_ADDRESS",
         "MINT_RAY_HEAD_ADDRESS_PATH",
@@ -89,7 +89,6 @@ SNAPSHOT_CONFIG_ENV_KEYS = frozenset(
         "MINT_VLLM_SKIP_PEFT_SHAPE_VALIDATION",
         "MINT_VLLM_ENABLE_SLEEP_MODE",
         "MINT_MODEL_CONFIG_OVERRIDES_JSON",
-        "TINKER_MODEL_CONFIG_OVERRIDES_JSON",
         "MINT_VLLM_MAX_NUM_SEQS",
         "MINT_VLLM_MAX_NUM_BATCHED_TOKENS",
         "MINT_VLLM_MAX_LORAS",
@@ -97,14 +96,14 @@ SNAPSHOT_CONFIG_ENV_KEYS = frozenset(
         "MINT_VLLM_MAX_LORA_RANK",
         "MINT_SFT_DIAG_FAIL",
         "MINT_REVERSE_KL_DIAG_FAIL",
-        "TINKER_DENSE_SESSION_STATE_ROOT",
-        "TINKER_RUNTIME_CHECKPOINT_DIR",
-        "TINKER_USAGE_LOG_DIR",
-        "TINKER_USAGE_BACKEND",
-        "TINKER_USAGE_PG_DSN",
-        "TINKER_CHECKPOINT_INDEX_PG_DSN",
-        "TINKER_CHECKPOINT_INDEX_WRITE_TIMEOUT_MS",
-        "TINKER_CHECKPOINT_INDEX_UPLOADING_STALE_S",
+        "MINT_DENSE_SESSION_STATE_ROOT",
+        "MINT_RUNTIME_CHECKPOINT_DIR",
+        "MINT_USAGE_LOG_DIR",
+        "MINT_USAGE_BACKEND",
+        "MINT_USAGE_PG_DSN",
+        "MINT_CHECKPOINT_INDEX_PG_DSN",
+        "MINT_CHECKPOINT_INDEX_WRITE_TIMEOUT_MS",
+        "MINT_CHECKPOINT_INDEX_UPLOADING_STALE_S",
         "MINT_CHECKPOINT_INDEX_PUBLISH_RETRY_S",
         "MINT_MODEL_WORK_SCHEDULER_DEBUG_LOG_PATH",
         "MINT_RETRIEVE_FUTURE_TASK_STATE_STORE",
@@ -131,8 +130,7 @@ SNAPSHOT_CONFIG_ENV_KEYS = frozenset(
         "MINT_NCCL_IB_DISABLE",
         "MINT_TIMING_DIAG",
         "MINT_SUPPORTED_MODELS",
-        "TINKER_SUPPORTED_MODELS",
-        "TINKER_GATEWAY_CONFIG_JSON",
+        "MINT_GATEWAY_CONFIG_JSON",
         "MINT_MODEL_ACTOR_DESIRED_JSON",
         "MINT_PERSISTENT_MODELS",
         "MINT_MAINTENANCE_REAP_INTERVAL_S",
@@ -146,9 +144,7 @@ SNAPSHOT_CONFIG_ENV_KEYS = frozenset(
         "MINT_SESSION_HEARTBEAT_PRUNE_EVERY",
         "MINT_RETRIEVE_FUTURE_HOT_TTL_S",
         "MINT_RETRIEVE_FUTURE_GRACE_S",
-        "TINKER_RETRIEVE_FUTURE_GRACE_S",
         "MINT_RETRIEVE_FUTURE_MIN_POLL_S",
-        "TINKER_RETRIEVE_FUTURE_MIN_POLL_S",
         "MINT_VLLM_ACTOR_MAX_CONCURRENCY",
         "MINT_VLLM_OMP_NUM_THREADS",
         "MINT_VLLM_MKL_NUM_THREADS",
@@ -205,7 +201,7 @@ SNAPSHOT_CONFIG_ENV_KEYS = frozenset(
         "MINT_DISABLE_EXTERNAL_LABEL",
         "MINT_PPO_LOSS_DEBUG",
         "MINT_VERL_DIAGNOSTICS",
-        "TINKER_LORA_EVICT_MIN_IDLE_S",
+        "MINT_LORA_EVICT_MIN_IDLE_S",
         "MINT_STARTUP_RECONCILE_READY_TIMEOUT_S",
         "MINT_MEGATRON_SESSIONS_BASE_PATH",
         "MINT_TORCH_DIST_TIMEOUT_S",
@@ -213,29 +209,29 @@ SNAPSHOT_CONFIG_ENV_KEYS = frozenset(
         "MINT_MEGATRON_SAVE_CHECKPOINT_TIMEOUT_S",
         "MINT_MEGATRON_SAVE_LORA_TIMEOUT_S",
         "MINT_VOLC_BIN",
-        "TINKER_TP_SIZE",
-        "TINKER_DP_SIZE",
-        "TINKER_GPU_MEM_UTIL",
-        "TINKER_MAX_MODEL_LEN",
-        "TINKER_SESSION_INACTIVITY_TIMEOUT_S",
-        "TINKER_INACTIVITY_TIMEOUT_S",
-        "TINKER_ENABLE_MULTI_LORA",
-        "TINKER_MAX_LORAS",
-        "TINKER_MAX_CPU_LORAS",
-        "TINKER_MAX_LORA_RANK",
-        "TINKER_VLLM_ATTENTION_BACKEND",
-        "TINKER_MAX_INFLIGHT_SAMPLE_TASKS",
-        "TINKER_MAX_PENDING_ASAMPLE_PER_APIKEY",
-        "TINKER_MAX_CONCURRENT_SAMPLES_PER_REQUEST",
-        "TINKER_SAMPLE_COALESCE",
-        "TINKER_SAMPLE_COALESCE_WINDOW_MS",
-        "TINKER_SAMPLE_COALESCE_MAX_BATCH",
-        "TINKER_SAMPLE_COALESCE_MAX_SAMPLES",
-        "TINKER_SAMPLE_REQUIRE_SEQ_ID",
+        "MINT_TP_SIZE",
+        "MINT_DP_SIZE",
+        "MINT_GPU_MEM_UTIL",
+        "MINT_MAX_MODEL_LEN",
+        "MINT_SESSION_INACTIVITY_TIMEOUT_S",
+        "MINT_INACTIVITY_TIMEOUT_S",
+        "MINT_ENABLE_MULTI_LORA",
+        "MINT_MAX_LORAS",
+        "MINT_MAX_CPU_LORAS",
+        "MINT_MAX_LORA_RANK",
+        "MINT_VLLM_ATTENTION_BACKEND",
+        "MINT_MAX_INFLIGHT_SAMPLE_TASKS",
+        "MINT_MAX_PENDING_ASAMPLE_PER_APIKEY",
+        "MINT_MAX_CONCURRENT_SAMPLES_PER_REQUEST",
+        "MINT_SAMPLE_COALESCE",
+        "MINT_SAMPLE_COALESCE_WINDOW_MS",
+        "MINT_SAMPLE_COALESCE_MAX_BATCH",
+        "MINT_SAMPLE_COALESCE_MAX_SAMPLES",
+        "MINT_SAMPLE_REQUIRE_SEQ_ID",
         "MINT_MODEL_ACTOR_INVENTORY_SESSION_IDLE_TIMEOUT_S",
         "MINT_TRAINING_INACTIVITY_TIMEOUT",
-        "TINKER_FORCE_GRAD_CHECKPOINTING",
-        "TINKER_ENABLE_SDP",
+        "MINT_FORCE_GRAD_CHECKPOINTING",
+        "MINT_ENABLE_SDP",
         "MINT_MEGATRON_CREATE_TIMEOUT_S",
         "MINT_DENSE_GET_OR_CREATE_TIMEOUT_S",
         "MINT_REINIT_LORA_TIMEOUT_S",
@@ -248,7 +244,7 @@ SNAPSHOT_CONFIG_ENV_KEYS = frozenset(
         "MINT_PERSISTENT_PREWARM_TRAINING",
         "MINT_PERSISTENT_PREWARM_INFERENCE",
         "MINT_DOC_PATH",
-        "TINKER_CHECKPOINT_DIR",
+        "MINT_CHECKPOINT_DIR",
     }
 )
 
@@ -309,6 +305,7 @@ def config_actor_name(environ: Mapping[str, str] | None = None) -> str:
 
 
 def classify_env_key(key: str) -> str:
+    key = canonical_mint_env_name(key)
     if key in BOOTSTRAP_RUNTIME_ENV_KEYS:
         return CONFIG_CLASS_BOOTSTRAP_RUNTIME_ENV
     if key in ACTOR_CREATION_INPUT_KEYS:
@@ -327,10 +324,13 @@ def classify_env(environ: Mapping[str, str]) -> dict[str, dict[str, str]]:
     for key, value in sorted(environ.items()):
         if not value:
             continue
-        config_class = classify_env_key(key)
+        canonical_key = canonical_mint_env_name(key)
+        if canonical_key != key and canonical_key in environ:
+            continue
+        config_class = classify_env_key(canonical_key)
         if config_class == CONFIG_CLASS_UNCLASSIFIED:
             continue
-        grouped[config_class][key] = _redact_config_value(key, str(value))
+        grouped[config_class][canonical_key] = _redact_config_value(canonical_key, str(value))
     return grouped
 
 
@@ -354,14 +354,17 @@ def actor_env_from_environ(environ: Mapping[str, str]) -> dict[str, str]:
             continue
         if key in CONFIG_ACTOR_HYDRATION_CONTROL_KEYS:
             continue
-        config_class = classify_env_key(key)
+        canonical_key = canonical_mint_env_name(key)
+        if canonical_key != key and canonical_key in environ:
+            continue
+        config_class = classify_env_key(canonical_key)
         if config_class in {
             CONFIG_CLASS_ACTOR_CREATION_INPUT,
             CONFIG_CLASS_SNAPSHOT_CONFIG,
             CONFIG_CLASS_OBSERVABILITY,
             CONFIG_CLASS_TASK_STATE,
         } or (config_class == CONFIG_CLASS_UNCLASSIFIED and key.startswith(CONFIG_ACTOR_HYDRATION_PREFIXES)):
-            out[key] = str(value)
+            out[canonical_key] = str(value)
     return out
 
 

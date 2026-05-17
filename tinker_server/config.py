@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 from .runtime_env import (
     build_runtime_pythonpath,
+    env_get as _runtime_env_get,
     env_nonempty as _runtime_env_nonempty,
 )
 from .checkpoints import DEFAULT_PERSISTENT_CHECKPOINTS_DIR, DEFAULT_RUNTIME_CHECKPOINTS_DIR
@@ -23,6 +24,11 @@ hydrate_from_config_actor()
 
 def _env_nonempty(environ: dict[str, str], name: str) -> str | None:
     return _runtime_env_nonempty(environ, name)
+
+
+def _env_get(environ: dict[str, str], name: str, default: str = "") -> str:
+    value = _runtime_env_get(environ, name)
+    return default if value is None else value
 
 
 def _resolve_env_or_config(name: str, env_value: str | None, file_value: str | None) -> str:
@@ -44,15 +50,15 @@ def _default_task_state_store_db_path(*, auth_enabled: bool) -> str:
 
 
 def _load_config_file_for_process(environ: dict[str, str]) -> tuple[str | None, object | None]:
-    path = _env_nonempty(environ, "TINKER_CONFIG_PATH")
+    path = _env_nonempty(environ, "MINT_CONFIG_PATH")
     if not path:
         return None, None
     try:
         from .config_file import load_tinker_config_file
     except ModuleNotFoundError as e:
         raise RuntimeError(
-            "TINKER_CONFIG_PATH is set but config parsing dependencies are missing "
-            f"(missing module: {e.name!r}). Install pydantic on this runtime or unset TINKER_CONFIG_PATH."
+            "MINT_CONFIG_PATH is set but config parsing dependencies are missing "
+            f"(missing module: {e.name!r}). Install pydantic on this runtime or unset MINT_CONFIG_PATH."
         ) from e
     return path, load_tinker_config_file(path)
 
@@ -62,9 +68,8 @@ _CONFIG_PATH, _CONFIG_FILE = _load_config_file_for_process(os.environ)
 # Ray namespace for all server-owned actors (vLLM, Megatron, trainer pools).
 # Override for concurrent dev runs on a shared Ray cluster.
 #
-# `MINT_RAY_NAMESPACE` is a legacy alias still used in some scripts; prefer
-# `TINKER_RAY_NAMESPACE` but accept the alias as a fallback.
-_env_ray_ns = _env_nonempty(os.environ, "TINKER_RAY_NAMESPACE") or _env_nonempty(os.environ, "MINT_RAY_NAMESPACE")
+# Old `TINKER_*` names are accepted by the env helper, but `MINT_*` is canonical.
+_env_ray_ns = _env_nonempty(os.environ, "MINT_RAY_NAMESPACE")
 _file_ray_ns = _CONFIG_FILE.ray.namespace if _CONFIG_FILE is not None else None
 if _env_ray_ns and _file_ray_ns and _env_ray_ns != _file_ray_ns:
     raise RuntimeError(
@@ -209,7 +214,7 @@ def actor_runtime_env_vars(
         raise RuntimeError("RAY_ADDRESS is required")
 
     out = {
-        "TINKER_RAY_NAMESPACE": RAY_NAMESPACE,
+        "MINT_RAY_NAMESPACE": RAY_NAMESPACE,
         "PYTHONPATH": pythonpath,
         "PFS_RUNTIME_ENV_ROOT": PFS_RUNTIME_ENV_ROOT,
         "PFS_TINKER_PATH": PFS_TINKER_PATH,
@@ -219,11 +224,11 @@ def actor_runtime_env_vars(
     config_actor_name = _env_nonempty(os.environ, "MINT_CONFIG_ACTOR_NAME")
     if config_actor_name is not None:
         out["MINT_CONFIG_ACTOR_NAME"] = config_actor_name
-    config_path = _env_nonempty(os.environ, "TINKER_CONFIG_PATH")
+    config_path = _env_nonempty(os.environ, "MINT_CONFIG_PATH")
     if config_path is not None:
-        out["TINKER_CONFIG_PATH"] = config_path
+        out["MINT_CONFIG_PATH"] = config_path
     for key in (
-        "TINKER_ACTOR_LD_LIBRARY_PATH",
+        "MINT_ACTOR_LD_LIBRARY_PATH",
         "MINT_RAY_HEAD_ADDRESS_PATH",
         "MINT_RAY_CLIENT_ADDRESS",
         "RAY_CLIENT_ADDRESS",
@@ -236,9 +241,6 @@ def actor_runtime_env_vars(
         value = _env_nonempty(os.environ, key)
         if value is not None:
             out[key] = value
-    mint_ray_namespace = _env_nonempty(os.environ, "MINT_RAY_NAMESPACE")
-    if mint_ray_namespace is not None:
-        out["MINT_RAY_NAMESPACE"] = mint_ray_namespace
     if extra:
         out.update(extra)
     if include_config_snapshot:
@@ -379,7 +381,7 @@ def actor_ld_library_path() -> str:
     Do not inherit the API host's LD_LIBRARY_PATH by default. The host may be a
     CPU-only bootstrap environment with incompatible torch libs.
     """
-    override = _env_nonempty(os.environ, "TINKER_ACTOR_LD_LIBRARY_PATH")
+    override = _env_nonempty(os.environ, "MINT_ACTOR_LD_LIBRARY_PATH")
     if override is not None:
         return override
     return ":".join(
@@ -488,9 +490,9 @@ class ServerConfig:
 
     # Docs / internal paths
     doc_path: str | None = None  # MINT_DOC_PATH
-    checkpoint_dir: str = "/tos-mindverse/tinker_checkpoints"  # TINKER_CHECKPOINT_DIR
+    checkpoint_dir: str = "/tos-mindverse/tinker_checkpoints"  # MINT_CHECKPOINT_DIR
 
-    # Config file (TINKER_CONFIG_PATH)
+    # Config file (MINT_CONFIG_PATH)
     config_path: str | None = None
 
     @classmethod
@@ -506,8 +508,10 @@ class ServerConfig:
         config_file: TinkerConfigFile | None,
     ) -> "ServerConfig":
         """Load configuration from env vars + optional config file (env wins)."""
-        api_key = environ.get("TINKER_API_KEY", "")
-        inactivity_s = environ.get("TINKER_SESSION_INACTIVITY_TIMEOUT_S") or environ.get("TINKER_INACTIVITY_TIMEOUT_S")
+        api_key = _env_get(environ, "MINT_API_KEY", "")
+        inactivity_s = _env_nonempty(environ, "MINT_SESSION_INACTIVITY_TIMEOUT_S") or _env_nonempty(
+            environ, "MINT_INACTIVITY_TIMEOUT_S"
+        )
         file_server = config_file.server if config_file is not None else None
         internal_api_token = _env_nonempty(environ, "INTERNAL_API_TOKEN") or (
             file_server.internal_api_token if file_server is not None else None
@@ -523,7 +527,7 @@ class ServerConfig:
         file_docs = config_file.docs if config_file is not None else None
         file_internal = config_file.internal if config_file is not None else None
         dense_session_state_default_root = os.path.join(
-            _env_nonempty(environ, "TINKER_RUNTIME_CHECKPOINT_DIR") or DEFAULT_RUNTIME_CHECKPOINTS_DIR,
+            _env_nonempty(environ, "MINT_RUNTIME_CHECKPOINT_DIR") or DEFAULT_RUNTIME_CHECKPOINTS_DIR,
             "dense_session_state",
         )
 
@@ -551,7 +555,7 @@ class ServerConfig:
             v = _env_nonempty(environ, name)
             return _parse_bool(v) if v is not None else (bool(file_value) if file_value is not None else bool(default))
 
-        max_model_len_env = _env_nonempty(environ, "TINKER_MAX_MODEL_LEN")
+        max_model_len_env = _env_nonempty(environ, "MINT_MAX_MODEL_LEN")
         max_model_len = int(max_model_len_env) if max_model_len_env is not None else (file_server.max_model_len if file_server is not None else None)
 
         inactivity_from_file = file_server.session_inactivity_timeout_s if file_server is not None else None
@@ -573,8 +577,8 @@ class ServerConfig:
         )
 
         cfg = cls(
-            host=_pick_str("TINKER_HOST", file_server.host if file_server is not None else None, "0.0.0.0"),
-            port=_pick_int("TINKER_PORT", file_server.port if file_server is not None else None, 8000),
+            host=_pick_str("MINT_HOST", file_server.host if file_server is not None else None, "0.0.0.0"),
+            port=_pick_int("MINT_PORT", file_server.port if file_server is not None else None, 8000),
             api_key=api_key,
             internal_api_token=_pick_str(
                 "INTERNAL_API_TOKEN",
@@ -582,96 +586,96 @@ class ServerConfig:
                 "",
             ),
             usage_backend=_pick_str(
-                "TINKER_USAGE_BACKEND",
+                "MINT_USAGE_BACKEND",
                 file_server.usage_backend if file_server is not None else None,
                 "postgres",
             ).lower(),
             usage_log_dir=_pick_str(
-                "TINKER_USAGE_LOG_DIR",
+                "MINT_USAGE_LOG_DIR",
                 file_server.usage_log_dir if file_server is not None else None,
                 "/tmp/tinker_usage",
             ),
             usage_pg_dsn=(
                 _pick_str(
-                    "TINKER_USAGE_PG_DSN",
+                    "MINT_USAGE_PG_DSN",
                     file_server.usage_pg_dsn if file_server is not None else None,
                     "",
                 )
                 or (
                     (
                         "postgresql://"
-                        f"{_pick_str('TINKER_USAGE_PG_USER', file_server.usage_pg_user if file_server is not None else None, 'mint_user')}:"
-                        f"{_pick_str('TINKER_USAGE_PG_PASSWORD', file_server.usage_pg_password if file_server is not None else None, '')}@"
-                        f"{_pick_str('TINKER_USAGE_PG_HOST', file_server.usage_pg_host if file_server is not None else None, '')}:"
-                        f"{_pick_int('TINKER_USAGE_PG_PORT', file_server.usage_pg_port if file_server is not None else None, 5432)}/"
-                        f"{_pick_str('TINKER_USAGE_PG_DATABASE', file_server.usage_pg_database if file_server is not None else None, 'mint_billing')}"
+                        f"{_pick_str('MINT_USAGE_PG_USER', file_server.usage_pg_user if file_server is not None else None, 'mint_user')}:"
+                        f"{_pick_str('MINT_USAGE_PG_PASSWORD', file_server.usage_pg_password if file_server is not None else None, '')}@"
+                        f"{_pick_str('MINT_USAGE_PG_HOST', file_server.usage_pg_host if file_server is not None else None, '')}:"
+                        f"{_pick_int('MINT_USAGE_PG_PORT', file_server.usage_pg_port if file_server is not None else None, 5432)}/"
+                        f"{_pick_str('MINT_USAGE_PG_DATABASE', file_server.usage_pg_database if file_server is not None else None, 'mint_billing')}"
                     )
-                    if _pick_str("TINKER_USAGE_PG_HOST", file_server.usage_pg_host if file_server is not None else None, "")
+                    if _pick_str("MINT_USAGE_PG_HOST", file_server.usage_pg_host if file_server is not None else None, "")
                     else ""
                 )
             ),
             usage_pg_host=_pick_str(
-                "TINKER_USAGE_PG_HOST",
+                "MINT_USAGE_PG_HOST",
                 file_server.usage_pg_host if file_server is not None else None,
                 "",
             ),
             usage_pg_port=_pick_int(
-                "TINKER_USAGE_PG_PORT",
+                "MINT_USAGE_PG_PORT",
                 file_server.usage_pg_port if file_server is not None else None,
                 5432,
             ),
             usage_pg_database=_pick_str(
-                "TINKER_USAGE_PG_DATABASE",
+                "MINT_USAGE_PG_DATABASE",
                 file_server.usage_pg_database if file_server is not None else None,
                 "mint_billing",
             ),
             usage_pg_user=_pick_str(
-                "TINKER_USAGE_PG_USER",
+                "MINT_USAGE_PG_USER",
                 file_server.usage_pg_user if file_server is not None else None,
                 "mint_user",
             ),
             usage_pg_password=_pick_str(
-                "TINKER_USAGE_PG_PASSWORD",
+                "MINT_USAGE_PG_PASSWORD",
                 file_server.usage_pg_password if file_server is not None else None,
                 "",
             ),
             usage_pg_pool_min=_pick_int(
-                "TINKER_USAGE_PG_POOL_MIN",
+                "MINT_USAGE_PG_POOL_MIN",
                 file_server.usage_pg_pool_min if file_server is not None else None,
                 10,
             ),
             usage_pg_pool_max=_pick_int(
-                "TINKER_USAGE_PG_POOL_MAX",
+                "MINT_USAGE_PG_POOL_MAX",
                 file_server.usage_pg_pool_max if file_server is not None else None,
                 30,
             ),
             usage_write_timeout_ms=_pick_int(
-                "TINKER_USAGE_WRITE_TIMEOUT_MS",
+                "MINT_USAGE_WRITE_TIMEOUT_MS",
                 file_server.usage_write_timeout_ms if file_server is not None else None,
                 2000,
             ),
             usage_pg_table=_pick_str(
-                "TINKER_USAGE_PG_TABLE",
+                "MINT_USAGE_PG_TABLE",
                 file_server.usage_pg_table if file_server is not None else None,
                 "usage_event",
             ),
             checkpoint_index_pg_dsn=_pick_str(
-                "TINKER_CHECKPOINT_INDEX_PG_DSN",
+                "MINT_CHECKPOINT_INDEX_PG_DSN",
                 file_server.checkpoint_index_pg_dsn if file_server is not None else None,
                 "",
             ),
             checkpoint_index_write_timeout_ms=_pick_int(
-                "TINKER_CHECKPOINT_INDEX_WRITE_TIMEOUT_MS",
+                "MINT_CHECKPOINT_INDEX_WRITE_TIMEOUT_MS",
                 file_server.checkpoint_index_write_timeout_ms if file_server is not None else None,
                 2000,
             ),
             skip_actor_cleanup=_pick_bool(
                 "MINT_SKIP_ACTOR_CLEANUP", file_server.skip_actor_cleanup if file_server is not None else None, False
             ),
-            tensor_parallel_size=_pick_int("TINKER_TP_SIZE", file_server.tensor_parallel_size if file_server is not None else None, 1),
-            data_parallel_size=_pick_int("TINKER_DP_SIZE", file_server.data_parallel_size if file_server is not None else None, 1),
+            tensor_parallel_size=_pick_int("MINT_TP_SIZE", file_server.tensor_parallel_size if file_server is not None else None, 1),
+            data_parallel_size=_pick_int("MINT_DP_SIZE", file_server.data_parallel_size if file_server is not None else None, 1),
             gpu_memory_utilization=_pick_float(
-                "TINKER_GPU_MEM_UTIL", file_server.gpu_memory_utilization if file_server is not None else None, 0.85
+                "MINT_GPU_MEM_UTIL", file_server.gpu_memory_utilization if file_server is not None else None, 0.85
             ),
             max_model_len=max_model_len,
             session_inactivity_timeout_s=float(inactivity_s)
@@ -679,56 +683,56 @@ class ServerConfig:
             else (float(inactivity_from_file) if inactivity_from_file is not None else None),
             # Multi-LoRA settings
             enable_multi_lora=_pick_bool(
-                "TINKER_ENABLE_MULTI_LORA", file_server.enable_multi_lora if file_server is not None else None, True
+                "MINT_ENABLE_MULTI_LORA", file_server.enable_multi_lora if file_server is not None else None, True
             ),
-            max_loras=_pick_int("TINKER_MAX_LORAS", file_server.max_loras if file_server is not None else None, 64),
+            max_loras=_pick_int("MINT_MAX_LORAS", file_server.max_loras if file_server is not None else None, 64),
             max_cpu_loras=_pick_int(
-                "TINKER_MAX_CPU_LORAS", file_server.max_cpu_loras if file_server is not None else None, 1024
+                "MINT_MAX_CPU_LORAS", file_server.max_cpu_loras if file_server is not None else None, 1024
             ),
-            max_lora_rank=_pick_int("TINKER_MAX_LORA_RANK", file_server.max_lora_rank if file_server is not None else None, 64),
+            max_lora_rank=_pick_int("MINT_MAX_LORA_RANK", file_server.max_lora_rank if file_server is not None else None, 64),
             vllm_attention_backend=_pick_str(
-                "TINKER_VLLM_ATTENTION_BACKEND",
+                "MINT_VLLM_ATTENTION_BACKEND",
                 file_server.vllm_attention_backend if file_server is not None else None,
                 "DUAL_CHUNK_FLASH_ATTN",
             ),
             # Sampling settings
             sampling_max_inflight_sample_tasks=_pick_int(
-                "TINKER_MAX_INFLIGHT_SAMPLE_TASKS",
+                "MINT_MAX_INFLIGHT_SAMPLE_TASKS",
                 file_sampling.max_inflight_sample_tasks if file_sampling is not None else None,
                 64,
             ),
             sampling_max_pending_asample_per_apikey=_pick_int(
-                "TINKER_MAX_PENDING_ASAMPLE_PER_APIKEY",
+                "MINT_MAX_PENDING_ASAMPLE_PER_APIKEY",
                 getattr(file_sampling, "max_pending_asample_per_apikey", None) if file_sampling is not None else None,
                 64,
             ),
             sampling_max_concurrent_samples_per_request=_pick_int(
-                "TINKER_MAX_CONCURRENT_SAMPLES_PER_REQUEST",
+                "MINT_MAX_CONCURRENT_SAMPLES_PER_REQUEST",
                 file_sampling.max_concurrent_samples_per_request if file_sampling is not None else None,
                 8,
             ),
             sampling_sample_coalesce=_pick_bool(
-                "TINKER_SAMPLE_COALESCE",
+                "MINT_SAMPLE_COALESCE",
                 file_sampling.sample_coalesce if file_sampling is not None else None,
                 True,
             ),
             sampling_sample_coalesce_window_ms=_pick_float(
-                "TINKER_SAMPLE_COALESCE_WINDOW_MS",
+                "MINT_SAMPLE_COALESCE_WINDOW_MS",
                 file_sampling.sample_coalesce_window_ms if file_sampling is not None else None,
                 50.0,
             ),
             sampling_sample_coalesce_max_batch=_pick_int(
-                "TINKER_SAMPLE_COALESCE_MAX_BATCH",
+                "MINT_SAMPLE_COALESCE_MAX_BATCH",
                 file_sampling.sample_coalesce_max_batch if file_sampling is not None else None,
                 32,
             ),
             sampling_sample_coalesce_max_samples=_pick_int(
-                "TINKER_SAMPLE_COALESCE_MAX_SAMPLES",
+                "MINT_SAMPLE_COALESCE_MAX_SAMPLES",
                 file_sampling.sample_coalesce_max_samples if file_sampling is not None else None,
                 16,
             ),
             sampling_require_seq_id=_pick_bool(
-                "TINKER_SAMPLE_REQUIRE_SEQ_ID",
+                "MINT_SAMPLE_REQUIRE_SEQ_ID",
                 file_sampling.require_seq_id if file_sampling is not None else None,
                 False,
             ),
@@ -746,13 +750,13 @@ class ServerConfig:
             ),
             retrieve_future_grace_s=_pick_float_alias(
                 "MINT_RETRIEVE_FUTURE_GRACE_S",
-                ("TINKER_RETRIEVE_FUTURE_GRACE_S",),
+                ("MINT_RETRIEVE_FUTURE_GRACE_S",),
                 file_future.retrieve_future_grace_s if file_future is not None else None,
                 120.0,
             ),
             retrieve_future_min_poll_s=_pick_float_alias(
                 "MINT_RETRIEVE_FUTURE_MIN_POLL_S",
-                ("TINKER_RETRIEVE_FUTURE_MIN_POLL_S",),
+                ("MINT_RETRIEVE_FUTURE_MIN_POLL_S",),
                 file_future.retrieve_future_min_poll_s if file_future is not None else None,
                 1.0,
             ),
@@ -784,12 +788,12 @@ class ServerConfig:
                 3600,
             ),
             training_force_grad_checkpointing=_pick_bool(
-                "TINKER_FORCE_GRAD_CHECKPOINTING",
+                "MINT_FORCE_GRAD_CHECKPOINTING",
                 file_training.force_grad_checkpointing if file_training is not None else None,
                 True,
             ),
             training_enable_sdp=_pick_bool(
-                "TINKER_ENABLE_SDP",
+                "MINT_ENABLE_SDP",
                 file_training.enable_sdp if file_training is not None else None,
                 True,
             ),
@@ -804,7 +808,7 @@ class ServerConfig:
                 1800.0,
             ),
             training_dense_session_state_root=_pick_str(
-                "TINKER_DENSE_SESSION_STATE_ROOT",
+                "MINT_DENSE_SESSION_STATE_ROOT",
                 file_training.dense_session_state_root if file_training is not None else None,
                 dense_session_state_default_root,
             ),
@@ -857,7 +861,7 @@ class ServerConfig:
                 "",
             ) or None,
             checkpoint_dir=_pick_str(
-                "TINKER_CHECKPOINT_DIR",
+                "MINT_CHECKPOINT_DIR",
                 file_internal.checkpoint_dir if file_internal is not None else None,
                 DEFAULT_PERSISTENT_CHECKPOINTS_DIR,
             ),

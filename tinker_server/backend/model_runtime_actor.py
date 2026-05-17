@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
 
 from ..config import PFS_PYTHONPATH, actor_runtime_env_vars, apply_detached_actor_resources, otel_env_vars
+from ..runtime_env import env_nonempty
 from ..logging_context import (
     classify_failure_reason,
     extract_trace_id_from_traceparent,
@@ -62,7 +63,7 @@ def default_model_runtime_actor_name(domain_key: str, replica_id: str) -> str:
 
 
 def _ray_namespace() -> str:
-    v = os.environ.get("TINKER_RAY_NAMESPACE") or os.environ.get("MINT_RAY_NAMESPACE")
+    v = env_nonempty(os.environ, "MINT_RAY_NAMESPACE")
     if v:
         return v
     try:

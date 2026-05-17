@@ -12,6 +12,8 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 
+from ..runtime_env import env_get
+
 logger = logging.getLogger(__name__)
 
 
@@ -185,7 +187,7 @@ class LoRARegistry:
         """Get the least recently used lora_int_ids for eviction."""
         async with self._lock:
             try:
-                min_idle_s = float(os.environ.get("TINKER_LORA_EVICT_MIN_IDLE_S", "5.0"))
+                min_idle_s = float(env_get(os.environ, "MINT_LORA_EVICT_MIN_IDLE_S", "5.0") or "5.0")
             except ValueError:
                 min_idle_s = 5.0
 
