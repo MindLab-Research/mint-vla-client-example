@@ -204,7 +204,7 @@ def list_actors(actor_type: str | None = None, model_name: str | None = None) ->
 
     Used by merge-gate eviction sentries to observe real eviction events.
     """
-    url = f"{BASE_URL}/api/v1/actors"
+    url = f"{BASE_URL}/internal/actors"
     params: dict[str, str] = {}
     if actor_type is not None:
         params["type"] = actor_type
