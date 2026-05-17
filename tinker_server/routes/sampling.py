@@ -229,7 +229,7 @@ def _record_vllm_workload_finish(
     )
 
 
-def _snapshot_from_legacy_getters(session_id: str) -> SamplingSessionSnapshot | None:
+def _snapshot_from_manager_getters(session_id: str) -> SamplingSessionSnapshot | None:
     manager = _active_session_manager()
     if manager is None:
         return None
@@ -297,7 +297,7 @@ def _get_sampling_snapshot(session_id: str) -> SamplingSessionSnapshot | None:
         snapshot = _coerce_sampling_snapshot(get_snapshot(session_id), session_id)
         if snapshot is not None:
             return snapshot
-    return _snapshot_from_legacy_getters(session_id)
+    return _snapshot_from_manager_getters(session_id)
 
 
 async def _async_get_detached_sampling_snapshot(session_id: str) -> SamplingSessionSnapshot | None:

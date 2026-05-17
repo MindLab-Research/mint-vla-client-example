@@ -1,7 +1,7 @@
 """Weight and state routes for saving/loading model weights and checkpoints.
 
 Endpoints:
-- POST /save_weights: Save model weights (currently LoRA-only; legacy)
+- POST /save_weights: Save model weights (currently LoRA-only)
 - POST /save_state: Save checkpoint for training resume (LoRA-only, includes optimizer state)
 - POST /load_state: Load checkpoint to resume training
 - GET /training_runs/{model_id}/checkpoints: List checkpoints for model
@@ -427,7 +427,7 @@ def _resolve_mint_path(
 
 
 def _to_mint_path(model_id: str, checkpoint_name: str) -> str:
-    """Convert to mint://{model_id}/ URI (legacy format)."""
+    """Convert to mint://{model_id}/ URI."""
     return f"mint://{model_id}/{checkpoint_name}"
 
 
@@ -978,7 +978,7 @@ async def _forward_remote_checkpoint_archive(*, model_id: str, checkpoint_id: st
 
 
 # =============================================================================
-# POST /save_weights - async (legacy)
+# POST /save_weights - async
 # =============================================================================
 
 
@@ -1400,7 +1400,7 @@ async def _do_save_weights(
     webhook_url: str | None = None,
     prefer_tinker: bool = False,
 ) -> None:
-    """Background task to save sampler-only LoRA weights (legacy /save_weights).
+    """Background task to save sampler-only LoRA weights from /save_weights.
 
     Storage schema: /checkpoints/{owner_id}/{model_id}/{checkpoint_name}/
     Also registers the model for sampling via multi-LoRA engine.

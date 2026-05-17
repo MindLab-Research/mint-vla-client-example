@@ -26,7 +26,6 @@ from .checkpoint_index import (
 
 DEFAULT_PERSISTENT_CHECKPOINTS_DIR = "/tos-mindverse/tinker_checkpoints"
 DEFAULT_RUNTIME_CHECKPOINTS_DIR = "/vePFS-Mindverse/share/mint/prod/data/runtime-checkpoints"
-DEFAULT_LEGACY_PFS_CHECKPOINTS_DIR = "/vePFS-Mindverse/share/tinker_checkpoints"
 DEFAULT_EPHEMERAL_TTL_S = 24 * 60 * 60
 DEFAULT_PERSISTENT_CACHE_TTL_S = 24 * 60 * 60
 DEFAULT_REAP_INTERVAL_S = 10 * 60
@@ -127,15 +126,6 @@ def get_checkpoint_publish_retry_backoff_s() -> float:
         return max(0.0, float(raw))
     except Exception:
         return float(DEFAULT_PUBLISH_RETRY_BACKOFF_S)
-
-
-def get_legacy_checkpoint_dirs() -> list[str]:
-    extra = os.environ.get("MINT_LEGACY_CHECKPOINT_DIRS", "")
-    paths = [DEFAULT_LEGACY_PFS_CHECKPOINTS_DIR]
-    if os.path.realpath(CHECKPOINTS_DIR) != os.path.realpath(PERSISTENT_CHECKPOINTS_DIR):
-        paths.insert(0, CHECKPOINTS_DIR)
-    paths.extend([p for p in extra.split(":") if p])
-    return _dedupe_paths(paths)
 
 
 def get_persistent_search_roots(primary_root: str | None = None) -> list[str]:

@@ -166,8 +166,6 @@ def test_issue_18_no_legacy_fallback_resolution(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(checkpoints, "CHECKPOINTS_DIR", str(persistent_root))
     monkeypatch.setattr(checkpoints, "PERSISTENT_CHECKPOINTS_DIR", str(persistent_root))
     monkeypatch.setattr(checkpoints, "RUNTIME_CHECKPOINTS_DIR", str(runtime_root))
-    monkeypatch.setenv("MINT_LEGACY_CHECKPOINT_DIRS", str(legacy_root))
-
     unresolved = checkpoints.resolve_checkpoint_path(
         "mint://run-18/sampler_weights/ckpt-final",
         user_id="owner-a",

@@ -184,7 +184,7 @@ class SessionManager:
         self._apply_sampling_obs_delta(self._sampling_obs_state(after), 1)
 
     async def start_cleanup_task(self) -> None:
-        """Deprecated local cleanup loop retained only for legacy tests."""
+        """Start the local cleanup loop."""
         if self._cleanup_task is None:
             self._cleanup_task = asyncio.create_task(self._cleanup_loop())
             logger.info(
