@@ -2379,7 +2379,7 @@ class VerlTrainingEngine:
             async_get_or_create_megatron_worker_group,
         )
         from .model_registry import is_persistent_model
-        from .model_actor_publication import ActorType, publish_backend_model_actor
+        from .model_actor_publication import ActorType, BackendModelActorLaunch, publish_backend_model_actor
 
         base_model, requested_model = self._resolve_megatron_base_model(session)
         actor_name = _make_megatron_actor_name(base_model or requested_model or session.base_model or "")
@@ -2425,7 +2425,7 @@ class VerlTrainingEngine:
             except ValueError as e:
                 raise RuntimeError(f"[{session.model_id}] missing worker for backend=megatron") from e
 
-        publish_backend_model_actor(
+        publish_backend_model_actor(BackendModelActorLaunch(
             actor_name=actor_name,
             actor_type=ActorType.MEGATRON,
             num_gpus=distributed_config.world_size,
@@ -2434,6 +2434,7 @@ class VerlTrainingEngine:
             base_model=base_model or requested_model or "",
             session_id=session.model_id,
             protected=is_persistent_model(base_model or requested_model or ""),
+        ),
             refresh_observability=False,
         )
         self._model_actor_supervisor_actor_names[session.model_id] = actor_name

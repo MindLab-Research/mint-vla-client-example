@@ -31,11 +31,13 @@ def test_publish_backend_model_actor_merges_metadata_with_extra_winning_by_defau
     )
 
     publication.publish_backend_model_actor(
-        actor_name="actor-a",
-        actor_type=ActorType.VLLM,
-        num_gpus=1,
-        actor_handle=object(),
-        metadata={"shared": "extra", "extra": "yes"},
+        publication.BackendModelActorLaunch(
+            actor_name="actor-a",
+            actor_type=ActorType.VLLM,
+            num_gpus=1,
+            actor_handle=object(),
+            metadata={"shared": "extra", "extra": "yes"},
+        ),
     )
 
     metadata = supervisor.register_calls[0]["metadata"]
@@ -58,11 +60,13 @@ def test_publish_backend_model_actor_can_preserve_observability_wins_order(monke
     )
 
     publication.publish_backend_model_actor(
-        actor_name="actor-a",
-        actor_type=ActorType.DENSE,
-        num_gpus=1,
-        actor_handle=object(),
-        metadata={"shared": "extra", "extra": "yes"},
+        publication.BackendModelActorLaunch(
+            actor_name="actor-a",
+            actor_type=ActorType.DENSE,
+            num_gpus=1,
+            actor_handle=object(),
+            metadata={"shared": "extra", "extra": "yes"},
+        ),
         observability_wins=True,
         ready=False,
     )

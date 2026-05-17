@@ -261,12 +261,13 @@ class MultiLoRAInferenceEngine:
                         # Include node_id for proper per-node GPU scheduling
                         from tinker_server.backend.model_actor_publication import (
                             ActorType,
+                            BackendModelActorLaunch,
                             publish_backend_model_actor,
                         )
                         total_gpus = self.tensor_parallel_size * self.data_parallel_size
                         actor_node_id = _get_actor_node_id(self.server)
                         logger.info(f"Registering existing actor {self.actor_name} with ModelActorInventory (node={actor_node_id[:8] if actor_node_id else 'unknown'})")
-                        publish_backend_model_actor(
+                        publish_backend_model_actor(BackendModelActorLaunch(
                             actor_name=self.actor_name,
                             actor_type=ActorType.VLLM,
                             num_gpus=total_gpus,
@@ -274,7 +275,7 @@ class MultiLoRAInferenceEngine:
                             namespace=PERSISTENT_NAMESPACE,
                             base_model=self.model_path,
                             node_id=actor_node_id,
-                        )
+                        ))
                         return
                 except ray.exceptions.RayActorError:
                     # Actor is dead, need to create new one
@@ -310,6 +311,7 @@ class MultiLoRAInferenceEngine:
 
                     from tinker_server.backend.model_actor_publication import (
                         ActorType,
+                        BackendModelActorLaunch,
                         publish_backend_model_actor,
                     )
                     total_gpus = self.tensor_parallel_size * self.data_parallel_size
@@ -317,7 +319,7 @@ class MultiLoRAInferenceEngine:
                     logger.info(
                         f"Registering existing actor {self.actor_name} with ModelActorInventory (node={actor_node_id[:8] if actor_node_id else 'unknown'})"
                     )
-                    publish_backend_model_actor(
+                    publish_backend_model_actor(BackendModelActorLaunch(
                         actor_name=self.actor_name,
                         actor_type=ActorType.VLLM,
                         num_gpus=total_gpus,
@@ -325,7 +327,7 @@ class MultiLoRAInferenceEngine:
                         namespace=PERSISTENT_NAMESPACE,
                         base_model=self.model_path,
                         node_id=actor_node_id,
-                    )
+                    ))
                     return
             except ValueError:
                 # Actor doesn't exist, create new one
@@ -590,10 +592,11 @@ class MultiLoRAInferenceEngine:
             # Include node_id for proper per-node GPU scheduling
             from tinker_server.backend.model_actor_publication import (
                 ActorType,
+                BackendModelActorLaunch,
                 publish_backend_model_actor,
             )
             actor_node_id = _get_actor_node_id(self.server)
-            publish_backend_model_actor(
+            publish_backend_model_actor(BackendModelActorLaunch(
                 actor_name=self.actor_name,
                 actor_type=ActorType.VLLM,
                 num_gpus=total_gpus,
@@ -601,7 +604,7 @@ class MultiLoRAInferenceEngine:
                 namespace=PERSISTENT_NAMESPACE,
                 base_model=self.model_path,
                 node_id=actor_node_id,
-            )
+            ))
             if actor_node_id:
                 logger.info(f"vLLM actor {self.actor_name} running on node {actor_node_id[:8]}")
 

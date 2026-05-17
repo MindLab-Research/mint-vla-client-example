@@ -23,40 +23,14 @@ class BackendModelActorLaunch:
 
 
 def publish_backend_model_actor(
-    launch: BackendModelActorLaunch | None = None,
+    launch: BackendModelActorLaunch,
     *,
-    actor_name: str | None = None,
-    actor_type: ActorType | None = None,
-    num_gpus: int | None = None,
-    actor_handle: Any | None = None,
-    namespace: str = "tinker",
-    base_model: str = "",
-    session_id: str | None = None,
-    node_id: str | None = None,
-    protected: bool = False,
-    metadata: dict[str, Any] | None = None,
     refresh_observability: bool = True,
     observability_wins: bool = False,
     ready: bool = True,
 ) -> ActorEntry:
     """Publish a backend-created Ray actor through the supervisor launch contract."""
     from . import model_actor_supervisor as supervisor_mod
-
-    if launch is None:
-        if actor_name is None or actor_type is None or num_gpus is None:
-            raise ValueError("actor_name, actor_type, and num_gpus are required")
-        launch = BackendModelActorLaunch(
-            actor_name=str(actor_name),
-            actor_type=actor_type,
-            num_gpus=int(num_gpus),
-            actor_handle=actor_handle,
-            namespace=str(namespace),
-            base_model=str(base_model),
-            session_id=session_id,
-            node_id=node_id,
-            protected=bool(protected),
-            metadata=dict(metadata or {}),
-        )
 
     merged_metadata = {
         "launcher_contract": "backend_model_actor_launch",
