@@ -2336,8 +2336,8 @@ class MultiNodeInferenceEngine:
             def _attach_existing_actor(existing_actor_handle) -> None:
                 self.engine = existing_actor_handle
                 self._initialized = True
+                from tinker_server.backend.model_actor_inventory import ActorType
                 from tinker_server.backend.model_actor_publication import (
-                    ActorType,
                     BackendModelActorLaunch,
                     publish_backend_model_actor,
                 )
@@ -2563,8 +2563,8 @@ class MultiNodeInferenceEngine:
             # Ensure shared adapter directory exists
             os.makedirs(self.shared_adapter_dir, exist_ok=True)
 
+            from tinker_server.backend.model_actor_inventory import ActorType
             from tinker_server.backend.model_actor_publication import (
-                ActorType,
                 BackendModelActorLaunch,
                 publish_backend_model_actor,
             )

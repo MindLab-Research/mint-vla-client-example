@@ -2379,7 +2379,8 @@ class VerlTrainingEngine:
             async_get_or_create_megatron_worker_group,
         )
         from .model_registry import is_persistent_model
-        from .model_actor_publication import ActorType, BackendModelActorLaunch, publish_backend_model_actor
+        from .model_actor_inventory import ActorType
+        from .model_actor_publication import BackendModelActorLaunch, publish_backend_model_actor
 
         base_model, requested_model = self._resolve_megatron_base_model(session)
         actor_name = _make_megatron_actor_name(base_model or requested_model or session.base_model or "")

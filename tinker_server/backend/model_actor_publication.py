@@ -61,12 +61,6 @@ def publish_backend_model_actor(
     return entry
 
 
-def unpublish_backend_model_actor(actor_name: str) -> bool:
-    from . import model_actor_supervisor as supervisor_mod
-
-    return supervisor_mod.get_model_actor_supervisor().unregister(actor_name)
-
-
 def mark_backend_model_actor_ready(actor_name: str) -> None:
     from . import model_actor_supervisor as supervisor_mod
 

@@ -259,8 +259,8 @@ class MultiLoRAInferenceEngine:
 
                         # Register existing actor with model actor registry for LRU tracking
                         # Include node_id for proper per-node GPU scheduling
+                        from tinker_server.backend.model_actor_inventory import ActorType
                         from tinker_server.backend.model_actor_publication import (
-                            ActorType,
                             BackendModelActorLaunch,
                             publish_backend_model_actor,
                         )
@@ -309,8 +309,8 @@ class MultiLoRAInferenceEngine:
                     )
                     self._initialized = True
 
+                    from tinker_server.backend.model_actor_inventory import ActorType
                     from tinker_server.backend.model_actor_publication import (
-                        ActorType,
                         BackendModelActorLaunch,
                         publish_backend_model_actor,
                     )
@@ -590,8 +590,8 @@ class MultiLoRAInferenceEngine:
 
             # Register with unified model actor registry for LRU tracking
             # Include node_id for proper per-node GPU scheduling
+            from tinker_server.backend.model_actor_inventory import ActorType
             from tinker_server.backend.model_actor_publication import (
-                ActorType,
                 BackendModelActorLaunch,
                 publish_backend_model_actor,
             )

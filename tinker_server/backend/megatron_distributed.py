@@ -10078,8 +10078,8 @@ def get_or_create_megatron_worker_group(
     Returns:
         Ray actor handle to MegatronWorkerGroup.
     """
+    from tinker_server.backend.model_actor_inventory import ActorType
     from tinker_server.backend.model_actor_publication import (
-        ActorType,
         BackendModelActorLaunch,
         publish_backend_model_actor,
     )
