@@ -177,14 +177,14 @@ def test_config_file_task_state_store_settings_load(tmp_path):
 
 def test_server_config_task_state_store_defaults_follow_auth_mode():
     dev = ServerConfig.from_sources(environ={}, config_path=None, config_file=None)
-    assert dev.task_state_store_db_path == "/vePFS-Mindverse/share/mint-prod-dev/task-state/task_state.sqlite3"
+    assert dev.task_state_store_db_path == "/vePFS-Mindverse/share/mint/dev/data/task-state/task_state.sqlite3"
 
     prod = ServerConfig.from_sources(
         environ={"TINKER_API_KEY": "secret"},
         config_path=None,
         config_file=None,
     )
-    assert prod.task_state_store_db_path == "/vePFS-Mindverse/share/mint-prod-data/task-state/task_state.sqlite3"
+    assert prod.task_state_store_db_path == "/vePFS-Mindverse/share/mint/prod/data/task-state/task_state.sqlite3"
 
 
 def test_server_config_retrieve_future_env_overrides_file_independently(tmp_path):

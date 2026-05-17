@@ -24,7 +24,7 @@ def _task_payload_root_dir() -> str:
             getattr(
                 server_config,
                 "task_state_store_db_path",
-                "/vePFS-Mindverse/share/mint-prod-dev/task-state/task_state.sqlite3",
+                "/vePFS-Mindverse/share/mint/dev/data/task-state/task_state.sqlite3",
             )
         )
     )

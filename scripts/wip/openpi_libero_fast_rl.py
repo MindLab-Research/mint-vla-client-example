@@ -140,11 +140,12 @@ def _checkpoint_owner_id_from_uri(checkpoint_uri: str) -> str | None:
         return env_override
 
     search_roots = [
-        Path("/vePFS-Mindverse/share/tinker_runtime_checkpoints/persistent_cache"),
-        Path("/vePFS-Mindverse/share/tinker_runtime_checkpoints/ephemeral"),
+        Path("/vePFS-Mindverse/share/mint/prod/data/runtime-checkpoints/persistent_cache"),
+        Path("/vePFS-Mindverse/share/mint/prod/data/runtime-checkpoints/ephemeral"),
+        Path("/vePFS-Mindverse/share/mint/dev/data/runtime-checkpoints/persistent_cache"),
+        Path("/vePFS-Mindverse/share/mint/dev/data/runtime-checkpoints/ephemeral"),
         Path("/tos-mindverse/tinker_checkpoints"),
         Path("/vePFS-Mindverse/share/tinker_checkpoints"),
-        Path("/vePFS-Mindverse/share/code/tinker-server/checkpoints"),
     ]
     owner_ids: set[str] = set()
 

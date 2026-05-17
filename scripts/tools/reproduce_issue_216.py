@@ -12,7 +12,7 @@ API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
 
 BASE_MODEL = os.environ.get("TINKER_BASE_MODEL") or "Qwen/Qwen3-30B-A3B-Instruct-2507"
 ADAPTER_PATH = os.environ.get("TINKER_ADAPTER_PATH") or (
-    "/vePFS-Mindverse/share/code/tinker-server/checkpoints/"
+    "/tos-mindverse/tinker_checkpoints/"
     "eb69ea65-3302-4c97-a74e-f6838f79909d_0/rl-step-0"
 )
 
@@ -206,4 +206,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

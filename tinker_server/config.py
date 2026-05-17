@@ -16,7 +16,7 @@ from .runtime_env import (
     build_runtime_pythonpath,
     env_nonempty as _runtime_env_nonempty,
 )
-from .checkpoints import DEFAULT_RUNTIME_CHECKPOINTS_DIR
+from .checkpoints import DEFAULT_PERSISTENT_CHECKPOINTS_DIR, DEFAULT_RUNTIME_CHECKPOINTS_DIR
 from .config_hydration import hydrate_from_config_actor
 
 hydrate_from_config_actor()
@@ -40,8 +40,8 @@ def _parse_bool(s: str) -> bool:
 
 def _default_task_state_store_db_path(*, auth_enabled: bool) -> str:
     if auth_enabled:
-        return "/vePFS-Mindverse/share/mint-prod-data/task-state/task_state.sqlite3"
-    return "/vePFS-Mindverse/share/mint-prod-dev/task-state/task_state.sqlite3"
+        return "/vePFS-Mindverse/share/mint/prod/data/task-state/task_state.sqlite3"
+    return "/vePFS-Mindverse/share/mint/dev/data/task-state/task_state.sqlite3"
 
 
 def _load_config_file_for_process(environ: dict[str, str]) -> tuple[str | None, object | None]:
@@ -462,7 +462,7 @@ class ServerConfig:
 
     # TaskStateStore settings (backend/task_state_store.py)
     task_state_store_actor_name: str = "mint_task_state_store"
-    task_state_store_db_path: str = "/vePFS-Mindverse/share/mint-prod-dev/task-state/task_state.sqlite3"
+    task_state_store_db_path: str = "/vePFS-Mindverse/share/mint/dev/data/task-state/task_state.sqlite3"
     task_state_store_owner_ttl_s: float = 30.0
     task_state_store_owner_renew_s: float = 10.0
 
@@ -860,7 +860,7 @@ class ServerConfig:
             checkpoint_dir=_pick_str(
                 "TINKER_CHECKPOINT_DIR",
                 file_internal.checkpoint_dir if file_internal is not None else None,
-                "/vePFS-Mindverse/share/code/tinker-server/checkpoints",
+                DEFAULT_PERSISTENT_CHECKPOINTS_DIR,
             ),
             config_path=config_path,
         )
