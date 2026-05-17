@@ -22,6 +22,7 @@ async def cleanup_stale_actors_once() -> dict[str, int]:
 
     from . import ray_kill
     from .multi_lora_engine import PERSISTENT_NAMESPACE
+    from .model_actor_publication import publish_model_actor
     from .model_actor_supervisor import ActorType, get_model_actor_supervisor
 
     if not ray.is_initialized():
@@ -164,7 +165,7 @@ async def cleanup_stale_actors_once() -> dict[str, int]:
 
                 from tinker_server.backend.model_registry import is_persistent_model
 
-                model_actor_supervisor.register(
+                publish_model_actor(
                     actor_name=name,
                     actor_type=actor_type,
                     num_gpus=num_gpus,
@@ -175,8 +176,8 @@ async def cleanup_stale_actors_once() -> dict[str, int]:
                     node_id=node_id,
                     protected=bool(actor_type != ActorType.OPENPI and base_model and is_persistent_model(base_model)),
                     metadata=metadata,
+                    refresh_observability=False,
                 )
-                model_actor_supervisor.mark_ready(name)
                 registered += 1
                 logger.info("Registered existing actor: %s (%s, %s GPUs)", name, actor_type.value, num_gpus)
             except ray.exceptions.RayActorError:
@@ -236,7 +237,7 @@ async def cleanup_stale_actors_once() -> dict[str, int]:
 
                     from tinker_server.backend.model_registry import is_persistent_model
 
-                    model_actor_supervisor.register(
+                    publish_model_actor(
                         actor_name=name,
                         actor_type=actor_type,
                         num_gpus=num_gpus,
@@ -247,6 +248,8 @@ async def cleanup_stale_actors_once() -> dict[str, int]:
                         node_id=node_id,
                         protected=bool(actor_type != ActorType.OPENPI and base_model and is_persistent_model(base_model)),
                         metadata=metadata,
+                        refresh_observability=False,
+                        ready=False,
                     )
                     registered += 1
                     logger.info("Registered busy actor (not ready): %s (%s, %s GPUs)", name, actor_type.value, num_gpus)

@@ -65,6 +65,14 @@ Implications:
   - Desired specs come from local config/env; the supervisor itself is not a durable store.
   - Exposes the explicit inventory/launcher publication contract used by legacy vLLM, Megatron, dense, and OpenPI actor launch paths while those backends are being moved behind backend-specific launcher implementations.
 
+- `tinker_server/backend/model_actor_launchers.py`
+  - Launcher registry used by `ModelActorSupervisor` when reconciling desired model runtime actors.
+  - Owns runtime actor launch-time placement environment construction.
+
+- `tinker_server/backend/model_actor_publication.py`
+  - Shared publication helper for backend-created GPU actors.
+  - Backend-specific launchers still create Ray actors and placement groups, but lifecycle registration, ready marking, and observability metadata merge go through this helper.
+
 - `tinker_server/backend/session_manager.py`
   - Sampling session bookkeeping and cleanup.
   - Supports legacy per-session engines and a shared-engine mode for faster ephemeral weight sync.

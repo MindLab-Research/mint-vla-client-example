@@ -10078,10 +10078,9 @@ def get_or_create_megatron_worker_group(
     Returns:
         Ray actor handle to MegatronWorkerGroup.
     """
-    from tinker_server.backend.model_actor_supervisor import (
+    from tinker_server.backend.model_actor_publication import (
         ActorType,
-        actor_observability_metadata,
-        get_model_actor_supervisor,
+        publish_model_actor,
     )
     from .model_registry import is_persistent_model
 
@@ -10160,7 +10159,6 @@ def get_or_create_megatron_worker_group(
             ignore_reinit_error=True,
         )
 
-    model_actor_supervisor = get_model_actor_supervisor()
     actor_name = _make_megatron_actor_name(base_model)
 
     create_lock = _get_megatron_create_lock(actor_name)
@@ -10212,7 +10210,7 @@ def get_or_create_megatron_worker_group(
                 },
             ):
                 # Register with model actor registry (reconnection case)
-                model_actor_supervisor.register(
+                publish_model_actor(
                     actor_name=actor_name,
                     actor_type=ActorType.MEGATRON,
                     num_gpus=num_gpus,
@@ -10220,10 +10218,8 @@ def get_or_create_megatron_worker_group(
                     namespace=PERSISTENT_NAMESPACE,
                     base_model=observability_model,
                     protected=is_persistent,
-                    metadata={**dict(actor_observability_metadata(actor) or {}), **rank_metadata},
+                    metadata=rank_metadata,
                 )
-                # Existing actor is already ready
-                model_actor_supervisor.mark_ready(actor_name)
             # NOTE: Do NOT reinit weights here for existing actors.
             # Session swapping + reinit happens inside MegatronWorkerGroup._ensure_session_loaded()
             # to avoid clobbering active sessions during create_model.
@@ -10480,7 +10476,7 @@ def get_or_create_megatron_worker_group(
             # Register immediately (creating=True) to account for GPU usage and prevent eviction.
             # Actor readiness is awaited in VerlTrainingEngine.create_training_session, which also
             # marks the entry ready (creating=False) after __ray_ready__ completes.
-            model_actor_supervisor.register(
+            publish_model_actor(
                 actor_name=actor_name,
                 actor_type=ActorType.MEGATRON,
                 num_gpus=num_gpus,
@@ -10489,7 +10485,8 @@ def get_or_create_megatron_worker_group(
                 base_model=observability_model,
                 session_id=session_id,
                 protected=is_persistent,
-                metadata={**dict(actor_observability_metadata(actor) or {}), **rank_metadata},
+                metadata=rank_metadata,
+                ready=False,
             )
         return actor
 

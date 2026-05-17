@@ -259,16 +259,14 @@ class MultiLoRAInferenceEngine:
 
                         # Register existing actor with model actor registry for LRU tracking
                         # Include node_id for proper per-node GPU scheduling
-                        from tinker_server.backend.model_actor_supervisor import (
+                        from tinker_server.backend.model_actor_publication import (
                             ActorType,
-                            actor_observability_metadata,
-                            get_model_actor_supervisor,
+                            publish_model_actor,
                         )
                         total_gpus = self.tensor_parallel_size * self.data_parallel_size
-                        model_actor_supervisor = get_model_actor_supervisor()
                         actor_node_id = _get_actor_node_id(self.server)
                         logger.info(f"Registering existing actor {self.actor_name} with ModelActorInventory (node={actor_node_id[:8] if actor_node_id else 'unknown'})")
-                        model_actor_supervisor.register(
+                        publish_model_actor(
                             actor_name=self.actor_name,
                             actor_type=ActorType.VLLM,
                             num_gpus=total_gpus,
@@ -276,10 +274,7 @@ class MultiLoRAInferenceEngine:
                             namespace=PERSISTENT_NAMESPACE,
                             base_model=self.model_path,
                             node_id=actor_node_id,
-                            metadata=dict(actor_observability_metadata(self.server) or {}),
                         )
-                        # Mark as ready since it's an existing actor that responded to health check
-                        model_actor_supervisor.mark_ready(self.actor_name)
                         return
                 except ray.exceptions.RayActorError:
                     # Actor is dead, need to create new one
@@ -313,18 +308,16 @@ class MultiLoRAInferenceEngine:
                     )
                     self._initialized = True
 
-                    from tinker_server.backend.model_actor_supervisor import (
+                    from tinker_server.backend.model_actor_publication import (
                         ActorType,
-                        actor_observability_metadata,
-                        get_model_actor_supervisor,
+                        publish_model_actor,
                     )
                     total_gpus = self.tensor_parallel_size * self.data_parallel_size
-                    model_actor_supervisor = get_model_actor_supervisor()
                     actor_node_id = _get_actor_node_id(self.server)
                     logger.info(
                         f"Registering existing actor {self.actor_name} with ModelActorInventory (node={actor_node_id[:8] if actor_node_id else 'unknown'})"
                     )
-                    model_actor_supervisor.register(
+                    publish_model_actor(
                         actor_name=self.actor_name,
                         actor_type=ActorType.VLLM,
                         num_gpus=total_gpus,
@@ -332,9 +325,7 @@ class MultiLoRAInferenceEngine:
                         namespace=PERSISTENT_NAMESPACE,
                         base_model=self.model_path,
                         node_id=actor_node_id,
-                        metadata=dict(actor_observability_metadata(self.server) or {}),
                     )
-                    model_actor_supervisor.mark_ready(self.actor_name)
                     return
             except ValueError:
                 # Actor doesn't exist, create new one
@@ -597,14 +588,12 @@ class MultiLoRAInferenceEngine:
 
             # Register with unified model actor registry for LRU tracking
             # Include node_id for proper per-node GPU scheduling
-            from tinker_server.backend.model_actor_supervisor import (
+            from tinker_server.backend.model_actor_publication import (
                 ActorType,
-                actor_observability_metadata,
-                get_model_actor_supervisor,
+                publish_model_actor,
             )
-            model_actor_supervisor = get_model_actor_supervisor()
             actor_node_id = _get_actor_node_id(self.server)
-            model_actor_supervisor.register(
+            publish_model_actor(
                 actor_name=self.actor_name,
                 actor_type=ActorType.VLLM,
                 num_gpus=total_gpus,
@@ -612,10 +601,7 @@ class MultiLoRAInferenceEngine:
                 namespace=PERSISTENT_NAMESPACE,
                 base_model=self.model_path,
                 node_id=actor_node_id,
-                metadata=dict(actor_observability_metadata(self.server) or {}),
             )
-            # Mark as ready now that launch completed successfully
-            model_actor_supervisor.mark_ready(self.actor_name)
             if actor_node_id:
                 logger.info(f"vLLM actor {self.actor_name} running on node {actor_node_id[:8]}")
 

@@ -22,7 +22,8 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from . import ray_kill
 from .ray_placement_groups import PlacementGroupMismatchError, get_named_placement_group
-from .model_actor_supervisor import ActorType, actor_observability_metadata, get_model_actor_supervisor
+from .model_actor_publication import publish_model_actor
+from .model_actor_supervisor import ActorType, get_model_actor_supervisor
 from .volc_placement import parse_model_gpu_placement
 from ..config import PFS_PYTHONPATH, RAY_NAMESPACE
 
@@ -436,7 +437,6 @@ def get_or_create_dense_trainer(
         try:
             bind_decision = "create"
 
-            pool = get_model_actor_supervisor()
             from .model_registry import is_persistent_model
             from .runtime_observability import runtime_observability
 
@@ -554,7 +554,7 @@ def get_or_create_dense_trainer(
                     _remove_pg(actor_name)
                     raise
 
-            entry = pool.register(
+            entry = publish_model_actor(
                 actor_name=actor_name,
                 actor_type=ActorType.DENSE,
                 num_gpus=DEFAULT_NUM_GPUS,
@@ -569,10 +569,9 @@ def get_or_create_dense_trainer(
                         max_lora_rank=effective_max_rank,
                         model_key=name_key,
                     ),
-                    **dict(actor_observability_metadata(actor) or {}),
                 },
+                observability_wins=True,
             )
-            pool.mark_ready(actor_name)
             entry.current_session = session_id
             runtime_observability.record_dense_actor_bind_decision(base_model=base_model, decision=bind_decision)
             runtime_observability.record_training_incident(
