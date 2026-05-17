@@ -18,7 +18,7 @@ Entrypoint: |
   # Symlink to PFS code (tinker-server for development)
   rm -rf /root/tinker_project/tinker-server
   mkdir -p /root/tinker_project
-  ln -s /vePFS-Mindverse/share/code/tinker-server /root/tinker_project/tinker-server
+  ln -s /vePFS-Mindverse/share/mint/dev/mint-server /root/tinker_project/tinker-server
 
   # Connect to Ray head published by mint-dev-head.
   set -euo pipefail
@@ -32,7 +32,7 @@ Entrypoint: |
   from ray._private.node import Node
   from ray._private.parameter import RayParams
 
-  HEAD_IP_PATH = "/vePFS-Mindverse/share/code/tinker-server/ray_head_ip.txt"
+  HEAD_IP_PATH = "/vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt"
   TMP_ROOT = os.environ.get("MINT_TMP_ROOT", "/vePFS-Mindverse/share/mint-data/dev")
   RAY_TMP_ROOT_BASE = f"{TMP_ROOT}/worker"
   RAY_TMP_LINK = "/tmp/mdw"

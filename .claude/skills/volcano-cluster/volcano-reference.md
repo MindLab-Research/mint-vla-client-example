@@ -33,8 +33,12 @@ Storages:
 
 | Path | Purpose |
 |------|---------|
-| `/vePFS-Mindverse/share/code/tinker-server/` | Application code (synced via Unison) |
-| `/vePFS-Mindverse/share/code/vllm-0.13.0-pkg/` | vLLM package (for PYTHONPATH override) |
+| `/vePFS-Mindverse/share/mint/dev/mint-server/` | Dev server git checkout |
+| `/vePFS-Mindverse/share/mint/prod/mint-server/` | Prod server git checkout |
+| `/vePFS-Mindverse/share/mint/dev/runtime/` | Dev runtime symlink |
+| `/vePFS-Mindverse/share/mint/prod/runtime/` | Prod runtime symlink |
+| `/vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt` | Dev Ray head pointer |
+| `/vePFS-Mindverse/share/mint/prod/ray/head-address/ray_head_ip.txt` | Prod Ray head pointer |
 | `/vePFS-Mindverse/share/huggingface/` | HuggingFace cache (models, tokenizers) |
 | `/vePFS-Mindverse/share/models/` | Model checkpoints |
 | `/vePFS-Mindverse/share/dataset/` | Training datasets |

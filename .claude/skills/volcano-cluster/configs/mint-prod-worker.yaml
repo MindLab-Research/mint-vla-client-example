@@ -16,18 +16,15 @@ Entrypoint: |
   export HF_HOME=/vePFS-Mindverse/share/huggingface
   export PYTHONDONTWRITEBYTECODE=1  # Disable .pyc cache
 
-  # Use PFS verl (has abort_all_requests method, needed for multi-lora)
-  export PYTHONPATH=/vePFS-Mindverse/share/code/verl:$PYTHONPATH
-
-  # Symlink to PFS code (tinker-server-auth for production)
-  rm -rf /root/tinker_project/tinker-server-auth
+  # Symlink to the production server checkout for debugging and explicit local probes.
+  rm -rf /root/tinker_project/mint-server
   mkdir -p /root/tinker_project
-  ln -s /vePFS-Mindverse/share/code/tinker-server-auth /root/tinker_project/tinker-server-auth
+  ln -s /vePFS-Mindverse/share/mint/prod/mint-server /root/tinker_project/mint-server
 
   echo "=== MINT PRODUCTION WORKER ==="
   echo "Started at $(date)"
   echo "Using PFS code via symlink:"
-  ls -la /root/tinker_project/tinker-server-auth/
+  ls -la /root/tinker_project/mint-server/
 
   # Note: Ray CLI crashes on startup; start Ray via Python internals.
   set -euo pipefail
@@ -42,7 +39,7 @@ Entrypoint: |
   from ray._private.node import Node
   from ray._private.parameter import RayParams
 
-  HEAD_IP_PATH = Path("/vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt")
+  HEAD_IP_PATH = Path("/vePFS-Mindverse/share/mint/prod/ray/head-address/ray_head_ip.txt")
   TMP_ROOT = os.environ.get("MINT_TMP_ROOT", "/vePFS-Mindverse/share/mint-data/prod")
   RAY_TMP_ROOT_BASE = f"{TMP_ROOT}/worker"
   RAY_TMP_LINK = "/tmp/mpw"

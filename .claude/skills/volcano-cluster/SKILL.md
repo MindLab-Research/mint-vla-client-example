@@ -134,7 +134,7 @@ When operating on prod (`mint-prod-volcano`), enforce:
 
 Use the placement verification SOP in `.claude/skills/mint-prod/SKILL.md`:
 
-- actor inventory query (`/api/v1/actors`)
+- actor inventory query (`/internal/actors`)
 - queue-to-node-IP query (`list_node_ips_for_resource_queue`)
 - per-run `MegatronRankWorker ip=...` window check against C1/C2 IP sets
 
@@ -155,9 +155,12 @@ Workers must use packages pre-installed in image or via PFS PYTHONPATH.
 
 | Path | Purpose |
 |------|---------|
-| `/vePFS-Mindverse/share/code/tinker-server/` | Dev code (synced via Unison) |
-| `/vePFS-Mindverse/share/code/tinker-server-auth/` | Prod code (synced via Unison) |
-| `/vePFS-Mindverse/share/code/vllm-0.13.0-pkg/` | vLLM package (PYTHONPATH override) |
+| `/vePFS-Mindverse/share/mint/dev/mint-server/` | Dev server git checkout |
+| `/vePFS-Mindverse/share/mint/prod/mint-server/` | Prod server git checkout |
+| `/vePFS-Mindverse/share/mint/dev/runtime/` | Dev runtime symlink |
+| `/vePFS-Mindverse/share/mint/prod/runtime/` | Prod runtime symlink |
+| `/vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt` | Dev Ray head pointer |
+| `/vePFS-Mindverse/share/mint/prod/ray/head-address/ray_head_ip.txt` | Prod Ray head pointer |
 | `/vePFS-Mindverse/share/huggingface/` | HuggingFace cache (models, tokenizers) |
 | `/vePFS-Mindverse/share/models/` | Model checkpoints |
 | `/vePFS-Mindverse/share/dataset/` | Training datasets |
@@ -236,7 +239,7 @@ PY
 2. **Get head IP from logs and confirm PFS publication:**
    ```bash
    ssh mint-dev '/root/.volc/bin/volc ml_task logs -t <head_task_id> -i worker_0 | grep \"Local node IP\"'
-   ssh mint-dev 'cat /vePFS-Mindverse/share/code/tinker-server/ray_head_ip.txt'
+   ssh mint-dev 'cat /vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt'
    ```
 
 3. **Copy worker template and set only the GPU queue:**
@@ -244,7 +247,7 @@ PY
    cp .claude/skills/volcano-cluster/configs/mint-dev-worker.yaml /tmp/mint-dev-worker.yaml
    sed -i "s/<GPU_QUEUE_ID>/<queue_id>/g" /tmp/mint-dev-worker.yaml
    ```
-   `mint-dev-worker.yaml` reads the head IP from `/vePFS-Mindverse/share/code/tinker-server/ray_head_ip.txt`, so do not patch the head IP into the worker template.
+   `mint-dev-worker.yaml` reads the head IP from `/vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt`, so do not patch the head IP into the worker template.
    Choose a GPU queue that is currently available in the Volcano console. If only prod GPU queues are available, get user approval before submitting dev workers.
 
 4. **Submit one worker task per node:**
@@ -260,8 +263,8 @@ PY
    - Use `ray.init(address=...)` in Python or Ray CLI commands that connect to the head directly.
 
    ```bash
-   ssh mint-dev "/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/ray status --address='<RAY_HEAD_IP>:6379'"
-   ssh mint-dev "/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python - <<'PY'\nimport ray\nray.init(address='<RAY_HEAD_IP>:6379')\nprint(ray.cluster_resources())\nray.shutdown()\nPY"
+   ssh mint-dev "/vePFS-Mindverse/share/mint/dev/runtime/host-venv/bin/ray status --address='<RAY_HEAD_IP>:6379'"
+   ssh mint-dev "/vePFS-Mindverse/share/mint/dev/runtime/host-venv/bin/python - <<'PY'\nimport ray\nray.init(address='<RAY_HEAD_IP>:6379')\nprint(ray.cluster_resources())\nray.shutdown()\nPY"
    ```
 
 ### Production Cluster
@@ -270,13 +273,16 @@ Prod head self-heals the Ray control plane, writes IP to PFS automatically, and 
 
 1. **Submit head:**
    ```bash
-ssh mint-prod-volcano '/root/.volc/bin/volc ml_task submit -c /vePFS-Mindverse/share/code/tinker-server-auth/.claude/skills/volcano-cluster/configs/mint-prod-head.yaml --output json'
+   tmp=/tmp/mint-prod-head.yaml
+   cp .claude/skills/volcano-cluster/configs/mint-prod-head.yaml "$tmp"
+   ssh mint-prod-volcano 'cat > /tmp/mint-prod-head.yaml' < "$tmp"
+   ssh mint-prod-volcano '/root/.volc/bin/volc ml_task submit -c /tmp/mint-prod-head.yaml --output json'
    ```
 
 2. **Wait for head to write IP to PFS:**
    ```bash
    # Check PFS file (head MUST write on startup)
-   ssh mint-prod-volcano 'ls -la /vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt && cat /vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt'
+   ssh mint-prod-volcano 'ls -la /vePFS-Mindverse/share/mint/prod/ray/head-address/ray_head_ip.txt && cat /vePFS-Mindverse/share/mint/prod/ray/head-address/ray_head_ip.txt'
    ```
 
    If the file is missing but the Ray cluster is running, recover it from Ray and write it:
@@ -289,16 +295,16 @@ nodes=[n for n in ray.nodes() if n.get(\"Alive\")]
 head=[n for n in nodes if (n.get(\"Resources\") or {}).get(\"node:__internal_head__\")]
 print(head[0][\"NodeManagerAddress\"] if head else \"\")
 PY
-); test -n \"$ip\" && echo \"$ip\" > /vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt && cat /vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt'
+); test -n \"$ip\" && echo \"$ip\" > /vePFS-Mindverse/share/mint/prod/ray/head-address/ray_head_ip.txt && cat /vePFS-Mindverse/share/mint/prod/ray/head-address/ray_head_ip.txt'
    ```
 
 3. **Copy template, choose GPU queue, submit worker (reads head IP from PFS):**
    ```bash
    # Prefer a800-mindverse-C1 or a800-mindverse-C2 for prod workers.
-   ssh mint-prod-volcano 'tmp=/tmp/mint-prod-worker.yaml && \
-     cp /vePFS-Mindverse/share/code/tinker-server-auth/.claude/skills/volcano-cluster/configs/mint-prod-worker.yaml "$tmp" && \
-     sed -i "s/<GPU_QUEUE_ID>/q-20251126180002-26lwz/g" "$tmp" && \
-     /root/.volc/bin/volc ml_task submit -c "$tmp" --output json'
+   cp .claude/skills/volcano-cluster/configs/mint-prod-worker.yaml /tmp/mint-prod-worker.yaml
+   sed -i "s/<GPU_QUEUE_ID>/q-20251126180002-26lwz/g" /tmp/mint-prod-worker.yaml
+   ssh mint-prod-volcano 'cat > /tmp/mint-prod-worker.yaml' < /tmp/mint-prod-worker.yaml
+   ssh mint-prod-volcano '/root/.volc/bin/volc ml_task submit -c /tmp/mint-prod-worker.yaml --output json'
    ```
 
 4. **Production join is a bootstrap step, not a test step:**
@@ -388,31 +394,31 @@ PYEOF'
 # Kill Megatron (dev)
 curl -X POST -H "Content-Type: application/json" \
   -d '{"actor_type":"megatron"}' \
-  http://localhost:8000/api/v1/actors/kill
+  http://localhost:8000/internal/actors/kill
 
 # Kill Megatron (prod - admin only when auth is enabled)
 curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/json" \
   -d '{"actor_type":"megatron"}' \
-  http://localhost:18000/api/v1/actors/kill
+  http://localhost:18000/internal/actors/kill
 
 # Kill vLLM (dev)
 curl -X POST -H "Content-Type: application/json" \
   -d '{"actor_type":"vllm"}' \
-  http://localhost:8000/api/v1/actors/kill
+  http://localhost:8000/internal/actors/kill
 
 # Kill vLLM (prod - admin only when auth is enabled)
 curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/json" \
   -d '{"actor_type":"vllm"}' \
-  http://localhost:18000/api/v1/actors/kill
+  http://localhost:18000/internal/actors/kill
 
 # Kill all tracked GPU actors (dev; admin only when auth is enabled)
 curl -X POST -H "Content-Type: application/json" \
   -d '{"actor_type":"all"}' \
-  http://localhost:8000/api/v1/actors/kill
+  http://localhost:8000/internal/actors/kill
 
 # Check status
-curl -s "http://localhost:8000/api/v1/actors?type=megatron" | jq
-curl -s "http://localhost:8000/api/v1/actors?type=vllm" | jq
+curl -s "http://localhost:8000/internal/actors?type=megatron" | jq
+curl -s "http://localhost:8000/internal/actors?type=vllm" | jq
 ```
 
 ### Actor Names Reference
@@ -468,37 +474,17 @@ volc ml_task logs -t <head_task_id> -i worker_0 | grep "Local node IP"
 volc ml_task logs -t <head_task_id> -i worker_0 | grep "MINT Production Ray head IP"
 
 # From PFS (MUST if present)
-cat /vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt
+cat /vePFS-Mindverse/share/mint/prod/ray/head-address/ray_head_ip.txt
 ```
 
 ---
 
-## 8. Package Upgrades via PFS
+## 8. Runtime Upgrades
 
-Workers cannot install packages (no internet). To upgrade without rebuilding images:
-
-1. **Download on SSH server** (has proxy):
-   ```bash
-   ssh mint-dev 'export http_proxy=http://localhost:1081 https_proxy=http://localhost:1081 && \
-     pip download <package>==<version> --no-deps -d /tmp/wheels'
-   ```
-
-2. **Install to PFS:**
-   ```bash
-   ssh mint-dev 'pip install --target=/vePFS-Mindverse/share/code/<package>-<version> \
-     /tmp/wheels/<package>-*.whl --no-deps'
-   ```
-
-3. **Set PYTHONPATH in Ray runtime_env**
-
-### Current PFS Packages
-
-| Package | Version | Path |
-|---------|---------|------|
-| PyTorch | 2.9.0 | `/vePFS-Mindverse/share/code/torch-2.9.0/` |
-| vLLM | 0.13.0 | `/vePFS-Mindverse/share/code/vllm-0.13.0-pkg/` |
-
-**PYTHONPATH order matters:** torch must come before vllm.
+Workers use the image plus the runtime roots under `/vePFS-Mindverse/share/mint`.
+Do not install ad hoc packages into live worker paths. Rebuild or copy a runtime
+root with `scripts/build_runtime_env.py`, promote the environment symlink, and
+restart the affected Ray workers or actors.
 
 ---
 
@@ -524,7 +510,7 @@ This reduces scheduler coupling: each task is an independent allocation request,
 **Prod example (split 10 replicas into 4+4+2):**
 ```bash
 ssh mint-prod-volcano 'set -euo pipefail
-base=/vePFS-Mindverse/share/code/tinker-server-auth/.claude/skills/volcano-cluster/configs/mint-prod-worker.yaml
+base=/vePFS-Mindverse/share/mint/prod/mint-server/.claude/skills/volcano-cluster/configs/mint-prod-worker.yaml
 queue_id=q-20251126180002-26lwz  # a800-mindverse-C1 (set explicitly)
 
 tmp4a=/tmp/mint-prod-worker-scale4a-$(date +%Y%m%d%H%M%S).yaml
