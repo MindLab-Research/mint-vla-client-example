@@ -16,12 +16,12 @@ def test_action_session_types_roundtrip_minimal_payload() -> None:
     request = CreateActionSessionRequest(
         session_id="session-1",
         base_model="openpi/pi0-fast-libero-low-mem-finetune",
-        model_path="tinker://model-1/weights/export-1",
+        model_path="mint://model-1/weights/export-1",
     )
 
     assert request.session_id == "session-1"
     assert request.base_model == "openpi/pi0-fast-libero-low-mem-finetune"
-    assert request.model_path == "tinker://model-1/weights/export-1"
+    assert request.model_path == "mint://model-1/weights/export-1"
 
     response = CreateActionSessionResponse(action_session_id="action-session-1")
     assert response.action_session_id == "action-session-1"

@@ -71,11 +71,11 @@ def test_checkpoint_namespace_resolution_prefers_typed_view(tmp_path, monkeypatc
     monkeypatch.setattr(checkpoints, "RUNTIME_CHECKPOINTS_DIR", str(runtime_root))
 
     assert checkpoints.resolve_checkpoint_path(
-        "tinker://run-hotfix/weights/0001",
+        "mint://run-hotfix/weights/0001",
         user_id="owner-a",
     ) == str(training_dir)
     assert checkpoints.resolve_checkpoint_path(
-        "tinker://run-hotfix/sampler_weights/0001",
+        "mint://run-hotfix/sampler_weights/0001",
         user_id="owner-a",
     ) == str(sampler_dir)
 
@@ -99,7 +99,7 @@ def test_checkpoint_namespace_resolution_falls_back_to_legacy_flat_dir(tmp_path,
     monkeypatch.setattr(checkpoints, "RUNTIME_CHECKPOINTS_DIR", str(runtime_root))
 
     assert checkpoints.resolve_checkpoint_path(
-        "tinker://run-hotfix/sampler_weights/0002",
+        "mint://run-hotfix/sampler_weights/0002",
         user_id="owner-a",
     ) == str(legacy_dir)
 
@@ -123,7 +123,7 @@ def test_checkpoint_namespace_resolution_allows_legacy_anonymous_cache(tmp_path,
     monkeypatch.setattr(checkpoints, "RUNTIME_CHECKPOINTS_DIR", str(runtime_root))
 
     assert checkpoints.resolve_checkpoint_path(
-        "tinker://run-hotfix/sampler_weights/0003",
+        "mint://run-hotfix/sampler_weights/0003",
         user_id="owner-a",
     ) == str(anonymous_dir)
 

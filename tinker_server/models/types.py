@@ -254,7 +254,7 @@ class CreateSamplingSessionRequest(BaseModel):
     session_id: str
     sampling_session_seq_id: int | None = None  # Sequence within session
     base_model: str | None = None
-    model_path: str | None = None  # tinker://, mint://, or file:// path to weights
+    model_path: str | None = None  # mint:// or file:// path to weights
     owner_id: str | None = None  # admin-only owner scope for checkpoint references
     lora_rank: int = 32  # LoRA rank for per-session adapter
 
@@ -782,7 +782,7 @@ class SaveWeightsForSamplerRequest(BaseModel):
 class SaveWeightsForSamplerResponse(BaseModel):
     """Response from save weights for sampler."""
 
-    path: str | None = None  # tinker://, mint://, or file:// URI (None for ephemeral)
+    path: str | None = None  # mint:// or file:// URI (None for ephemeral)
     sampling_session_id: str | None = None  # For ephemeral flow
     type: Literal["save_weights_for_sampler"] = "save_weights_for_sampler"
 
@@ -808,7 +808,7 @@ class SaveStateRequest(BaseModel):
 class SaveStateResponse(BaseModel):
     """Response from saving state."""
 
-    path: str  # tinker:// or mint:// URI
+    path: str  # mint:// URI
     type: Literal["save_weights"] = "save_weights"
 
 
@@ -818,7 +818,7 @@ class LoadStateRequest(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
     model_id: str
-    path: str  # tinker://, mint://, or file:// path
+    path: str  # mint:// or file:// path
     owner_id: str | None = None  # admin-only owner scope for checkpoint references
     optimizer: bool = True  # whether to restore optimizer state
     seq_id: int | None = None

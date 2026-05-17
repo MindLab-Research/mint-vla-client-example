@@ -594,8 +594,8 @@ def _create_sampling_client_for_checkpoint(
         )
 
     holder = service_client.holder
-    if not model_path.startswith("tinker://"):
-        raise ValueError("model_path must start with 'tinker://'")
+    if not model_path.startswith("mint://"):
+        raise ValueError("model_path must start with 'mint://'")
     assert holder._sampling_client_counter is not None
     sampling_session_seq_id = holder._sampling_client_counter
     holder._sampling_client_counter += 1

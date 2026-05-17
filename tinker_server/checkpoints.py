@@ -666,7 +666,7 @@ def _checkpoint_type_from_uri_path(path_part: str) -> CheckpointType | None:
     return None
 
 
-def _strip_tinker_checkpoint_kind(path_part: str) -> str:
+def _strip_checkpoint_kind(path_part: str) -> str:
     parts = path_part.split("/")
     if len(parts) >= 3 and parts[1] in ("weights", "sampler_weights"):
         return "/".join([parts[0], *parts[2:]])
@@ -760,9 +760,7 @@ def resolve_checkpoint_uri(
         resolved = resolve_checkpoint_id(uri, checkpoints_dir, user_id=user_id, is_admin=is_admin)
         return resolved or uri
 
-    if uri.startswith("tinker://"):
-        raw_path_part = uri[len("tinker://") :]
-    elif uri.startswith("mint://"):
+    if uri.startswith("mint://"):
         raw_path_part = uri[len("mint://") :]
     else:
         return uri
@@ -774,7 +772,7 @@ def resolve_checkpoint_uri(
             "('/weights/' or '/sampler_weights/')."
         )
     owner_dir = _scoped_checkpoint_owner_dir(user_id, is_admin=is_admin)
-    path_part = _strip_tinker_checkpoint_kind(raw_path_part)
+    path_part = _strip_checkpoint_kind(raw_path_part)
 
     cached = _prefer_cached_checkpoint_view(
         path_part,

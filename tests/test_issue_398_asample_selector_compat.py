@@ -91,13 +91,13 @@ def test_sample_request_preserves_base_model_selector():
 
 def test_sample_request_preserves_model_path_selector():
     req = SampleRequest(
-        model_path="tinker://run-123/weights/checkpoint-001",
+        model_path="mint://run-123/weights/checkpoint-001",
         num_samples=1,
         prompt=ModelInput.from_ints([1, 2, 3]),
         sampling_params=SamplingParams(max_tokens=4),
     )
-    assert req.model_path == "tinker://run-123/weights/checkpoint-001"
-    assert req.model_dump()["model_path"] == "tinker://run-123/weights/checkpoint-001"
+    assert req.model_path == "mint://run-123/weights/checkpoint-001"
+    assert req.model_dump()["model_path"] == "mint://run-123/weights/checkpoint-001"
     assert req.needs_session_creation() is True
 
 
@@ -127,7 +127,7 @@ def test_sample_request_rejects_seq_id_without_session_selector():
     ("selector_field", "selector_value"),
     [
         ("base_model", "Qwen/Qwen3-0.6B"),
-        ("model_path", "tinker://run-123/weights/checkpoint-001"),
+        ("model_path", "mint://run-123/weights/checkpoint-001"),
     ],
 )
 def test_asample_normalizes_direct_selector_before_enqueue(monkeypatch, selector_field: str, selector_value: str):

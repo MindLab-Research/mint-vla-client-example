@@ -30,7 +30,7 @@ def test_issue_18_resolve_and_materialize_persistent_checkpoint(tmp_path, monkey
     monkeypatch.setattr(checkpoints, "RUNTIME_CHECKPOINTS_DIR", str(runtime_root))
 
     resolved = checkpoints.resolve_checkpoint_path(
-        "tinker://run-18/sampler_weights/ckpt-final",
+        "mint://run-18/sampler_weights/ckpt-final",
         user_id="owner-a",
     )
     assert resolved == str(checkpoint_dir)
@@ -169,7 +169,7 @@ def test_issue_18_no_legacy_fallback_resolution(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("MINT_LEGACY_CHECKPOINT_DIRS", str(legacy_root))
 
     unresolved = checkpoints.resolve_checkpoint_path(
-        "tinker://run-18/sampler_weights/ckpt-final",
+        "mint://run-18/sampler_weights/ckpt-final",
         user_id="owner-a",
     )
     assert unresolved == str(persistent_root / "owner-a" / "run-18" / "ckpt-final" / "sampler")
@@ -180,7 +180,7 @@ def test_issue_18_session_manager_rejects_checkpoint_uri() -> None:
 
     manager = SessionManager()
     try:
-        manager._resolve_model_path("tinker://run-18/sampler_weights/ckpt-final")
+        manager._resolve_model_path("mint://run-18/sampler_weights/ckpt-final")
     except ValueError as e:
         assert "must be resolved" in str(e)
     else:

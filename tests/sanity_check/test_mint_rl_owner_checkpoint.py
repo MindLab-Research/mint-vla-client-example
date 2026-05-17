@@ -75,7 +75,7 @@ def test_owner_checkpoint_sampling_client_sends_owner_extra_body(monkeypatch):
 
     out = helper(
         SimpleNamespace(holder=_Holder()),
-        model_path="tinker://checkpoint/path",
+        model_path="mint://checkpoint/path",
         base_model="Qwen/Qwen3-0.6B",
         retry_config="retry",
     )
@@ -85,7 +85,7 @@ def test_owner_checkpoint_sampling_client_sends_owner_extra_body(monkeypatch):
     request, extra_body = calls[0]
     assert request.session_id == "session-1"
     assert request.sampling_session_seq_id == 7
-    assert request.model_path == "tinker://checkpoint/path"
+    assert request.model_path == "mint://checkpoint/path"
     assert extra_body == {"owner_id": "0123456789abcdef01234567"}
 
 
@@ -99,13 +99,13 @@ def test_owner_checkpoint_sampling_client_falls_back_without_owner(monkeypatch):
 
     out = helper(
         _ServiceClient(),
-        model_path="tinker://checkpoint/path",
+        model_path="mint://checkpoint/path",
         base_model="Qwen/Qwen3-0.6B",
         retry_config="retry",
     )
 
     assert out == {
-        "model_path": "tinker://checkpoint/path",
+        "model_path": "mint://checkpoint/path",
         "base_model": "Qwen/Qwen3-0.6B",
         "retry_config": "retry",
     }

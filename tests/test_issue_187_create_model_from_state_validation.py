@@ -56,7 +56,7 @@ def test_issue_187_create_model_from_state_rejects_sampler_checkpoint_with_optim
             "session_id": "s",
             "model_seq_id": 0,
             "base_model": "Qwen/Qwen3-0.6B",
-            "state_path": f"tinker://{run_id}/sampler_weights/{ckpt_name}",
+            "state_path": f"mint://{run_id}/sampler_weights/{ckpt_name}",
             "lora_config": {"rank": 8},
             "load_optimizer": True,
         },

@@ -407,7 +407,7 @@ class SessionManager:
         Returns:
             Absolute filesystem path to adapter directory.
         """
-        if model_path.startswith(("tinker://", "mint://", "ckpt_")):
+        if model_path.startswith(("mint://", "ckpt_")):
             raise ValueError("Checkpoint URIs must be resolved before SessionManager.create_session")
         if model_path.startswith("file://"):
             return model_path[7:]

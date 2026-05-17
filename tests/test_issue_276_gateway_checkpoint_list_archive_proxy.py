@@ -65,7 +65,7 @@ def test_issue_276_gateway_list_checkpoints_proxies_remote(monkeypatch) -> None:
                     {
                         "checkpoint_id": "weights/ckpt_123",
                         "checkpoint_type": "training",
-                        "tinker_path": "tinker://run-276/weights/ckpt_123",
+                        "tinker_path": "mint://run-276/weights/ckpt_123",
                         "path": "mint://run-276/weights/ckpt_123",
                         "step": 0,
                         "created_at": "2026-03-08T00:00:00Z",

@@ -103,7 +103,7 @@ def test_issue_283_create_model_from_state_queues_resolved_checkpoint_path_witho
             "session_id": "s283",
             "model_seq_id": 0,
             "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
-            "state_path": f"tinker://{run_id}/weights/{ckpt_name}",
+            "state_path": f"mint://{run_id}/weights/{ckpt_name}",
             "lora_config": {"rank": 8},
             "load_optimizer": True,
         },
@@ -116,7 +116,7 @@ def test_issue_283_create_model_from_state_queues_resolved_checkpoint_path_witho
     assert stub_queue.calls[0]["extra"]["scheduler_session_key"] == "s283_0"
     assert stub_queue.calls[0]["extra"]["training_op"] == "create_model_from_state"
     queued_payload = _queued_payload(stub_queue.calls[0])
-    assert queued_payload["state_path"] != f"tinker://{run_id}/weights/{ckpt_name}"
+    assert queued_payload["state_path"] != f"mint://{run_id}/weights/{ckpt_name}"
     assert queued_payload["state_path"].startswith(str(tmp_path))
 
 
@@ -149,14 +149,14 @@ def test_issue_283_create_model_from_state_missing_checkpoint_returns_404(
             "session_id": "s283-missing",
             "model_seq_id": 0,
             "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
-            "state_path": "tinker://missing-run/weights/missing-ckpt",
+            "state_path": "mint://missing-run/weights/missing-ckpt",
             "lora_config": {"rank": 8},
             "load_optimizer": False,
         },
     )
 
     assert resp.status_code == 404, resp.text
-    assert resp.json()["detail"] == "Checkpoint not found: tinker://missing-run/weights/missing-ckpt"
+    assert resp.json()["detail"] == "Checkpoint not found: mint://missing-run/weights/missing-ckpt"
 
 
 def test_issue_283_create_model_from_state_background_uses_resolved_path(tmp_path: Path, monkeypatch) -> None:
@@ -583,7 +583,7 @@ def test_issue_283_load_state_route_queues_resolved_path(tmp_path: Path, monkeyp
         "/api/v1/load_state",
         json={
             "model_id": "model-283",
-            "path": f"tinker://{run_id}/weights/{ckpt_name}",
+            "path": f"mint://{run_id}/weights/{ckpt_name}",
             "optimizer": True,
         },
     )
@@ -591,7 +591,7 @@ def test_issue_283_load_state_route_queues_resolved_path(tmp_path: Path, monkeyp
     assert resp.status_code == 200, resp.text
     queued_payload = _queued_payload(stub_queue.calls[0])
     expected_path = weights_routes._resolve_mint_path(
-        f"tinker://{run_id}/weights/{ckpt_name}",
+        f"mint://{run_id}/weights/{ckpt_name}",
         user_id=None,
         is_admin=False,
     )
@@ -1049,7 +1049,7 @@ def test_issue_283_load_state_route_uses_detached_training_info_without_route_ru
         "/api/v1/load_state",
         json={
             "model_id": "model-283",
-            "path": f"tinker://{run_id}/weights/{ckpt_name}",
+            "path": f"mint://{run_id}/weights/{ckpt_name}",
             "optimizer": True,
         },
     )
@@ -1057,7 +1057,7 @@ def test_issue_283_load_state_route_uses_detached_training_info_without_route_ru
     assert resp.status_code == 200, resp.text
     queued_payload = _queued_payload(stub_queue.calls[0])
     expected_path = weights_routes._resolve_mint_path(
-        f"tinker://{run_id}/weights/{ckpt_name}",
+        f"mint://{run_id}/weights/{ckpt_name}",
         user_id=None,
         is_admin=False,
     )
@@ -1197,7 +1197,7 @@ def test_issue_283_load_state_route_restores_inflight_protection(tmp_path: Path,
         "/api/v1/load_state",
         json={
             "model_id": "model-283",
-            "path": f"tinker://{run_id}/weights/{ckpt_name}",
+            "path": f"mint://{run_id}/weights/{ckpt_name}",
             "optimizer": True,
         },
     )
@@ -1372,7 +1372,7 @@ def test_issue_283_load_state_route_refreshes_detached_enqueue_protection(tmp_pa
         "/api/v1/load_state",
         json={
             "model_id": "model-283",
-            "path": f"tinker://{run_id}/weights/{ckpt_name}",
+            "path": f"mint://{run_id}/weights/{ckpt_name}",
             "optimizer": True,
         },
     )

@@ -87,9 +87,7 @@ def _local_sampling_config(session_id: str) -> tuple[str | None, str | None, int
 
 
 def _parse_checkpoint_path(model_path: str) -> tuple[str, str] | None:
-    if model_path.startswith("tinker://"):
-        path_part = model_path[len("tinker://") :]
-    elif model_path.startswith("mint://"):
+    if model_path.startswith("mint://"):
         path_part = model_path[len("mint://") :]
     else:
         return None
@@ -533,7 +531,7 @@ async def ensure_sampling_session(
     request_kwargs: dict[str, str] = {
         "session_id": parent_session_id or str(uuid.uuid4()),
     }
-    if model_path.startswith(("tinker://", "mint://", "ckpt_", "file://", "/")):
+    if model_path.startswith(("mint://", "ckpt_", "file://", "/")):
         request_kwargs["model_path"] = model_path
     else:
         request_kwargs["base_model"] = model_path
@@ -727,7 +725,7 @@ def _resolve_model_path(
     )
 
     can_system = can_manage_system(http_request)
-    if not can_system and not model_path.startswith(("tinker://", "mint://", "ckpt_")):
+    if not can_system and not model_path.startswith(("mint://", "ckpt_")):
         raise HTTPException(status_code=403, detail="Access denied")
 
     owner_scope = owner_id if can_system else user_id

@@ -94,14 +94,14 @@ def test_cookbook_openai_completions_example_shape(monkeypatch):
                 http_client=http_client,
             )
             response = await client.completions.create(
-                model="tinker://exp/sampler_weights/000080",
+                model="mint://exp/sampler_weights/000080",
                 prompt="The capital of France is",
                 max_tokens=50,
                 temperature=0.2,
                 top_p=0.9,
             )
             assert response.object == "text_completion"
-            assert response.model == "tinker://exp/sampler_weights/000080"
+            assert response.model == "mint://exp/sampler_weights/000080"
             assert response.choices[0].text == "11|12"
             assert response.choices[0].finish_reason == "stop"
             assert response.usage.prompt_tokens == 2
@@ -109,7 +109,7 @@ def test_cookbook_openai_completions_example_shape(monkeypatch):
 
     anyio.run(_run)
 
-    assert seen["model_path"] == "tinker://exp/sampler_weights/000080"
+    assert seen["model_path"] == "mint://exp/sampler_weights/000080"
     assert seen["sample_kwargs"]["max_tokens"] == 50
     assert seen["sample_kwargs"]["temperature"] == 0.2
     assert seen["sample_kwargs"]["top_p"] == 0.9
@@ -241,7 +241,7 @@ def test_cookbook_openai_chat_completions_example_shape(monkeypatch):
                 http_client=http_client,
             )
             response = await client.chat.completions.create(
-                model="tinker://exp/sampler_weights/000081",
+                model="mint://exp/sampler_weights/000081",
                 messages=[{"role": "user", "content": "What is 2+2?"}],
                 max_tokens=20,
             )
@@ -253,7 +253,7 @@ def test_cookbook_openai_chat_completions_example_shape(monkeypatch):
 
     anyio.run(_run)
 
-    assert seen["model_path"] == "tinker://exp/sampler_weights/000081"
+    assert seen["model_path"] == "mint://exp/sampler_weights/000081"
     assert tokenizer.chat_calls == [[{"role": "user", "content": "What is 2+2?"}]]
     assert tokenizer.chat_tools == [None]
 
@@ -548,7 +548,7 @@ def test_openai_chat_completions_accepts_tools_and_parses_tool_calls(monkeypatch
     response = client.post(
         "/oai/api/v1/chat/completions",
         json={
-            "model": "tinker://exp/sampler_weights/000084",
+            "model": "mint://exp/sampler_weights/000084",
             "messages": [{"role": "user", "content": "北京天气如何"}],
             "tools": [
                 {
@@ -576,7 +576,7 @@ def test_openai_chat_completions_accepts_tools_and_parses_tool_calls(monkeypatch
     assert body["choices"][0]["message"]["tool_calls"][0]["type"] == "function"
     assert body["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "get_weather"
     assert body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] == '{"location": "北京"}'
-    assert seen["model_path"] == "tinker://exp/sampler_weights/000084"
+    assert seen["model_path"] == "mint://exp/sampler_weights/000084"
     assert tokenizer.chat_calls == [[{"role": "user", "content": "北京天气如何"}]]
     assert tokenizer.chat_tools[0][0]["function"]["name"] == "get_weather"
 
@@ -675,7 +675,7 @@ def test_openai_chat_completions_passes_assistant_tool_call_and_tool_result(monk
     response = client.post(
         "/oai/api/v1/chat/completions",
         json={
-            "model": "tinker://exp/sampler_weights/000085",
+            "model": "mint://exp/sampler_weights/000085",
             "messages": [
                 {"role": "user", "content": "北京天气如何"},
                 {
@@ -763,7 +763,7 @@ def test_openai_chat_completions_tool_choice_none_does_not_pass_tools(monkeypatc
     response = client.post(
         "/oai/api/v1/chat/completions",
         json={
-            "model": "tinker://exp/sampler_weights/000086",
+            "model": "mint://exp/sampler_weights/000086",
             "messages": [{"role": "user", "content": "只用文字回答"}],
             "tools": [
                 {
@@ -804,7 +804,7 @@ def test_openai_chat_completions_required_tool_choice_rejects_plain_text(monkeyp
     response = client.post(
         "/oai/api/v1/chat/completions",
         json={
-            "model": "tinker://exp/sampler_weights/000087",
+            "model": "mint://exp/sampler_weights/000087",
             "messages": [{"role": "user", "content": "北京天气如何"}],
             "tools": [
                 {
@@ -849,7 +849,7 @@ def test_openai_chat_completions_specific_tool_choice_rejects_wrong_tool(monkeyp
     response = client.post(
         "/oai/api/v1/chat/completions",
         json={
-            "model": "tinker://exp/sampler_weights/000088",
+            "model": "mint://exp/sampler_weights/000088",
             "messages": [{"role": "user", "content": "北京天气如何"}],
             "tools": [
                 {
@@ -904,7 +904,7 @@ def test_openai_chat_completions_parallel_tool_calls_false_rejects_multiple(monk
     response = client.post(
         "/oai/api/v1/chat/completions",
         json={
-            "model": "tinker://exp/sampler_weights/000089",
+            "model": "mint://exp/sampler_weights/000089",
             "messages": [{"role": "user", "content": "比较北京和上海天气"}],
             "tools": [
                 {
@@ -928,7 +928,7 @@ def test_openai_chat_completions_rejects_invalid_tool_message_shape():
     response = client.post(
         "/oai/api/v1/chat/completions",
         json={
-            "model": "tinker://exp/sampler_weights/000090",
+            "model": "mint://exp/sampler_weights/000090",
             "messages": [
                 {"role": "user", "content": "北京天气如何"},
                 {"role": "tool", "content": "{\"temp\":10}"},
@@ -945,7 +945,7 @@ def test_openai_chat_completions_rejects_unknown_tool_choice_function():
     response = client.post(
         "/oai/api/v1/chat/completions",
         json={
-            "model": "tinker://exp/sampler_weights/000091",
+            "model": "mint://exp/sampler_weights/000091",
             "messages": [{"role": "user", "content": "北京天气如何"}],
             "tools": [
                 {
@@ -992,7 +992,7 @@ def test_openai_chat_completions_returns_501_when_tokenizer_lacks_tool_support(m
     response = client.post(
         "/oai/api/v1/chat/completions",
         json={
-            "model": "tinker://exp/sampler_weights/000092",
+            "model": "mint://exp/sampler_weights/000092",
             "messages": [{"role": "user", "content": "北京天气如何"}],
             "tools": [
                 {
@@ -1033,7 +1033,7 @@ def test_openai_route_cache_is_scoped_by_user(monkeypatch):
 
     client = TestClient(_build_app())
     payload = {
-        "model": "tinker://exp/sampler_weights/000082",
+        "model": "mint://exp/sampler_weights/000082",
         "prompt": "hello",
         "max_tokens": 5,
     }
@@ -1046,8 +1046,8 @@ def test_openai_route_cache_is_scoped_by_user(monkeypatch):
     assert second.status_code == 200
     assert third.status_code == 200
     assert ensure_calls == [
-        ("alice", "tinker://exp/sampler_weights/000082"),
-        ("bob", "tinker://exp/sampler_weights/000082"),
+        ("alice", "mint://exp/sampler_weights/000082"),
+        ("bob", "mint://exp/sampler_weights/000082"),
     ]
 
 
@@ -1061,11 +1061,11 @@ def test_openai_route_returns_oai_error_for_stream_and_n(monkeypatch):
 
     stream_resp = client.post(
         "/oai/api/v1/completions",
-        json={"model": "tinker://exp/sampler_weights/000083", "prompt": "hello", "stream": True},
+        json={"model": "mint://exp/sampler_weights/000083", "prompt": "hello", "stream": True},
     )
     n_resp = client.post(
         "/oai/api/v1/completions",
-        json={"model": "tinker://exp/sampler_weights/000083", "prompt": "hello", "n": 2},
+        json={"model": "mint://exp/sampler_weights/000083", "prompt": "hello", "n": 2},
     )
 
     assert stream_resp.status_code == 400
@@ -1096,14 +1096,14 @@ def test_different_models_same_user_have_separate_cache(monkeypatch):
 
     client = TestClient(_build_app())
     headers = {"x-user-id": "alice"}
-    client.post("/oai/api/v1/completions", json={"model": "tinker://x/sampler_weights/1", "prompt": "hi"}, headers=headers)
-    client.post("/oai/api/v1/completions", json={"model": "tinker://y/sampler_weights/2", "prompt": "hi"}, headers=headers)
+    client.post("/oai/api/v1/completions", json={"model": "mint://x/sampler_weights/1", "prompt": "hi"}, headers=headers)
+    client.post("/oai/api/v1/completions", json={"model": "mint://y/sampler_weights/2", "prompt": "hi"}, headers=headers)
     # 第三次命中第一个 model 的 cache，不产生新 ensure 调用
-    client.post("/oai/api/v1/completions", json={"model": "tinker://x/sampler_weights/1", "prompt": "hi"}, headers=headers)
+    client.post("/oai/api/v1/completions", json={"model": "mint://x/sampler_weights/1", "prompt": "hi"}, headers=headers)
 
     assert len(ensure_calls) == 2
-    assert "tinker://x/sampler_weights/1" in ensure_calls
-    assert "tinker://y/sampler_weights/2" in ensure_calls
+    assert "mint://x/sampler_weights/1" in ensure_calls
+    assert "mint://y/sampler_weights/2" in ensure_calls
 
 
 def test_chat_multi_turn_all_messages_passed_to_template(monkeypatch):
@@ -1133,7 +1133,7 @@ def test_chat_multi_turn_all_messages_passed_to_template(monkeypatch):
     ]
     resp = client.post(
         "/oai/api/v1/chat/completions",
-        json={"model": "tinker://x/sampler_weights/1", "messages": messages},
+        json={"model": "mint://x/sampler_weights/1", "messages": messages},
     )
     assert resp.status_code == 200
     assert tokenizer.chat_calls == [messages]
@@ -1160,7 +1160,7 @@ def test_sampling_exception_returns_oai_error_json(monkeypatch):
     client = TestClient(_build_app())
     resp = client.post(
         "/oai/api/v1/completions",
-        json={"model": "tinker://x/sampler_weights/1", "prompt": "hi"},
+        json={"model": "mint://x/sampler_weights/1", "prompt": "hi"},
     )
     assert resp.status_code == 500
     error = resp.json()["error"]
@@ -1228,7 +1228,7 @@ def test_session_creation_http_exception_returns_oai_error_json(monkeypatch):
     client = TestClient(_build_app())
     resp = client.post(
         "/oai/api/v1/completions",
-        json={"model": "tinker://bad/sampler_weights/1", "prompt": "hi"},
+        json={"model": "mint://bad/sampler_weights/1", "prompt": "hi"},
     )
     assert resp.status_code == 422
     error = resp.json()["error"]
@@ -1246,7 +1246,7 @@ def test_prompt_as_list_is_rejected_with_422(monkeypatch):
     client = TestClient(_build_app())
     resp = client.post(
         "/oai/api/v1/completions",
-        json={"model": "tinker://x/sampler_weights/1", "prompt": ["a", "b"]},
+        json={"model": "mint://x/sampler_weights/1", "prompt": ["a", "b"]},
     )
     assert resp.status_code == 422
 
@@ -1296,7 +1296,7 @@ def test_extract_tool_calls_skips_bad_json_keeps_valid(monkeypatch):
     resp = client.post(
         "/oai/api/v1/chat/completions",
         json={
-            "model": "tinker://x/sampler_weights/1",
+            "model": "mint://x/sampler_weights/1",
             "messages": [{"role": "user", "content": "test"}],
             "tools": [
                 {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}},
@@ -1473,7 +1473,7 @@ def test_required_tool_choice_retries_before_rejecting(monkeypatch):
     resp = client.post(
         "/oai/api/v1/chat/completions",
         json={
-            "model": "tinker://x/1",
+            "model": "mint://x/1",
             "messages": [{"role": "user", "content": "call a tool"}],
             "tools": [{"type": "function", "function": {"name": "fn", "parameters": {"type": "object"}}}],
             "tool_choice": "required",
@@ -1497,7 +1497,7 @@ def test_function_choice_wrong_tool_retries_then_rejects(monkeypatch):
     resp = client.post(
         "/oai/api/v1/chat/completions",
         json={
-            "model": "tinker://x/1",
+            "model": "mint://x/1",
             "messages": [{"role": "user", "content": "use get_weather"}],
             "tools": [
                 {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}},
@@ -1523,7 +1523,7 @@ def test_function_definition_accepts_strict_field(monkeypatch):
     resp = client.post(
         "/oai/api/v1/chat/completions",
         json={
-            "model": "tinker://x/1",
+            "model": "mint://x/1",
             "messages": [{"role": "user", "content": "go"}],
             "tools": [{
                 "type": "function",
@@ -1548,7 +1548,7 @@ def test_response_choice_has_logprobs_field(monkeypatch):
     chat_resp = client.post(
         "/oai/api/v1/chat/completions",
         json={
-            "model": "tinker://x/1",
+            "model": "mint://x/1",
             "messages": [{"role": "user", "content": "hi"}],
             "max_tokens": 4,
         },
@@ -1559,7 +1559,7 @@ def test_response_choice_has_logprobs_field(monkeypatch):
 
     compl_resp = client.post(
         "/oai/api/v1/completions",
-        json={"model": "tinker://x/1", "prompt": "hi", "max_tokens": 4},
+        json={"model": "mint://x/1", "prompt": "hi", "max_tokens": 4},
     )
     assert compl_resp.status_code == 200
     assert "logprobs" in compl_resp.json()["choices"][0]
@@ -1574,7 +1574,7 @@ def test_assistant_tool_call_without_id_is_rejected(monkeypatch):
     resp = client.post(
         "/oai/api/v1/chat/completions",
         json={
-            "model": "tinker://x/1",
+            "model": "mint://x/1",
             "messages": [
                 {"role": "user", "content": "hi"},
                 {
@@ -1621,7 +1621,7 @@ def test_session_cache_evicts_oldest_when_full(monkeypatch):
     for i in range(3):
         client.post(
             "/oai/api/v1/completions",
-            json={"model": f"tinker://m{i}/sampler_weights/1", "prompt": "hi", "max_tokens": 1},
+            json={"model": f"mint://m{i}/sampler_weights/1", "prompt": "hi", "max_tokens": 1},
             headers={"x-user-id": "alice"},
         )
 

@@ -1638,7 +1638,7 @@ async def load_state(
         incoming_headers = dict(http_request.headers)
         json_body = request.model_dump()
         can_system = can_manage_system(http_request)
-        if request.path.startswith(("tinker://", "mint://", "ckpt_")):
+        if request.path.startswith(("mint://", "ckpt_")):
             owner_scope = request.owner_id if can_system else user_id
             try:
                 local_path = resolve_checkpoint_path(request.path, user_id=owner_scope, is_admin=can_system)

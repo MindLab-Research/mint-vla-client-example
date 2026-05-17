@@ -32,7 +32,7 @@ def test_issue_557_resolve_checkpoint_path_admin_requires_owner_id(tmp_path, mon
 
     with pytest.raises(ValueError, match="owner_id is required"):
         checkpoints.resolve_checkpoint_path(
-            "tinker://run-557/weights/ckpt-a",
+            "mint://run-557/weights/ckpt-a",
             user_id=None,
             is_admin=True,
         )
@@ -63,7 +63,7 @@ def test_issue_557_resolve_checkpoint_path_admin_uses_owner_scope_without_glob(t
     monkeypatch.setattr(checkpoints.glob, "glob", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("glob scan not expected")))
 
     resolved = checkpoints.resolve_checkpoint_path(
-        "tinker://run-557/weights/ckpt-a",
+        "mint://run-557/weights/ckpt-a",
         user_id="owner-a",
         is_admin=True,
     )
@@ -234,7 +234,7 @@ def test_issue_557_training_helper_requires_owner_id_for_admin() -> None:
 
     with pytest.raises(HTTPException, match="owner_id is required"):
         tr._resolve_state_path(
-            "tinker://run-557/weights/ckpt-a",
+            "mint://run-557/weights/ckpt-a",
             user_id="admin",
             is_admin=True,
             owner_id=None,
@@ -247,7 +247,7 @@ def test_issue_557_weights_helper_requires_owner_id_for_admin() -> None:
 
     with pytest.raises(HTTPException, match="owner_id is required"):
         wt._resolve_mint_path(
-            "tinker://run-557/weights/ckpt-a",
+            "mint://run-557/weights/ckpt-a",
             user_id="admin",
             is_admin=True,
             owner_id=None,
@@ -260,7 +260,7 @@ def test_issue_557_mint_helper_requires_owner_id_for_admin() -> None:
 
     with pytest.raises(HTTPException, match="owner_id is required"):
         mint_routes._resolve_checkpoint_for_user(
-            "tinker://run-557/weights/ckpt-a",
+            "mint://run-557/weights/ckpt-a",
             user_id="admin",
             is_admin=True,
             owner_id=None,
@@ -309,7 +309,7 @@ def test_issue_557_mint_action_session_admin_missing_owner_id_returns_400(tmp_pa
         "/api/v1/action_sessions",
         json={
             "session_id": "sess-557",
-            "model_path": "tinker://run-557/weights/ckpt-a",
+            "model_path": "mint://run-557/weights/ckpt-a",
         },
     )
     assert resp.status_code == 400, resp.text
@@ -360,7 +360,7 @@ def test_issue_557_mint_action_session_admin_accepts_owner_id(tmp_path, monkeypa
         json={
             "session_id": "sess-557",
             "base_model": "Qwen/Qwen3-0.6B",
-            "model_path": "tinker://run-557/weights/ckpt-a",
+            "model_path": "mint://run-557/weights/ckpt-a",
             "owner_id": "owner-a",
         },
     )
@@ -443,7 +443,7 @@ def test_issue_557_service_resolve_model_path_admin_uses_owner_scope(tmp_path, m
     monkeypatch.setattr(checkpoints, "RUNTIME_CHECKPOINTS_DIR", str(tmp_path / "runtime"))
 
     resolved = service_routes._resolve_model_path(
-        "tinker://run-557/weights/ckpt-a",
+        "mint://run-557/weights/ckpt-a",
         user_id="admin",
         owner_id="owner-a",
         http_request=_ServiceRequest({"user_id": "admin", "user_role": "admin", "is_admin": True}),
@@ -464,7 +464,7 @@ def test_issue_557_mint_helper_maps_permission_error_to_403(monkeypatch) -> None
 
     with pytest.raises(HTTPException) as exc:
         mint_routes._resolve_checkpoint_for_user(
-            "tinker://run-557/weights/ckpt-a",
+            "mint://run-557/weights/ckpt-a",
             user_id="owner-a",
             is_admin=False,
         )
@@ -485,7 +485,7 @@ def test_issue_557_weights_helper_maps_permission_error_to_403(monkeypatch) -> N
 
     with pytest.raises(HTTPException) as exc:
         wt._resolve_mint_path(
-            "tinker://run-557/weights/ckpt-a",
+            "mint://run-557/weights/ckpt-a",
             user_id="owner-a",
             is_admin=False,
         )
@@ -592,7 +592,7 @@ def test_issue_557_resolve_checkpoint_path_admin_rejects_invalid_owner_id(tmp_pa
 
     with pytest.raises(ValueError, match="Invalid owner_id"):
         checkpoints.resolve_checkpoint_path(
-            "tinker://run-557/weights/ckpt-a",
+            "mint://run-557/weights/ckpt-a",
             user_id="../owner-a",
             is_admin=True,
         )

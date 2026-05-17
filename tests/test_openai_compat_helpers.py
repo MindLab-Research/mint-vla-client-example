@@ -134,7 +134,7 @@ def test_get_tokenizer_lazy_loads_via_dedicated_executor_and_caches(monkeypatch)
 
     monkeypatch.setattr(openai_compat, "_load_tokenizer_cpu", _fake_load)
     monkeypatch.setattr(openai_compat, "_get_tokenizer_executor", lambda: sentinel_executor)
-    monkeypatch.setattr(openai_compat.asyncio, "get_running_loop", lambda: _FakeLoop())
+    monkeypatch.setattr(openai_compat, "_get_running_loop", lambda: _FakeLoop())
 
     first = anyio.run(openai_compat._get_tokenizer, "Qwen/Qwen3-0.6B")
     second = anyio.run(openai_compat._get_tokenizer, "Qwen/Qwen3-0.6B")
@@ -271,13 +271,13 @@ def test_ensure_sampling_session_generates_parent_session_id(monkeypatch):
 
     result = anyio.run(
         lambda: service_route.ensure_sampling_session(
-            model_path="tinker://exp/sampler_weights/000001",
+            model_path="mint://exp/sampler_weights/000001",
             http_request=_dummy_request("u1"),
         )
     )
 
     assert result == ("sample-1", "Qwen/Qwen3-4B-Instruct-2507")
-    assert seen["model_path"] == "tinker://exp/sampler_weights/000001"
+    assert seen["model_path"] == "mint://exp/sampler_weights/000001"
     assert str(uuid.UUID(seen["parent_session_id"])) == seen["parent_session_id"]
 
 
@@ -329,7 +329,7 @@ def test_ensure_sampling_session_returns_gateway_session_base_model(monkeypatch)
 
     result = anyio.run(
         lambda: service_route.ensure_sampling_session(
-            model_path="tinker://exp/sampler_weights/000002",
+            model_path="mint://exp/sampler_weights/000002",
             http_request=_dummy_request("u1"),
         )
     )

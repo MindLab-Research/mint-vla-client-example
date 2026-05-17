@@ -1997,7 +1997,7 @@ def _resolve_state_path(
     is_admin: bool = False,
     owner_id: str | None = None,
 ) -> str:
-    if not is_admin and not state_uri.startswith(("tinker://", "mint://", "ckpt_")):
+    if not is_admin and not state_uri.startswith(("mint://", "ckpt_")):
         raise HTTPException(status_code=403, detail="Access denied")
 
     owner_scope = owner_id if is_admin else user_id
@@ -2086,7 +2086,7 @@ async def create_model_from_state(
     if upstream is not None:
         await _raise_if_local_model_id_exists(model_id)
         incoming_headers = dict(http_request.headers)
-        if request.state_path.startswith(("tinker://", "mint://", "ckpt_")):
+        if request.state_path.startswith(("mint://", "ckpt_")):
             local_path = _resolve_state_path(
                 request.state_path,
                 user_id=user_id,
@@ -2169,7 +2169,7 @@ async def create_model_from_state(
         is_admin=can_manage_system(http_request),
         owner_id=request.owner_id,
     )
-    if request.state_path.startswith(("tinker://", "mint://", "ckpt_")) and not os.path.isdir(resolved_state_path):
+    if request.state_path.startswith(("mint://", "ckpt_")) and not os.path.isdir(resolved_state_path):
         raise HTTPException(status_code=404, detail=f"Checkpoint not found: {request.state_path}")
     request = request.model_copy(update={"state_path": resolved_state_path})
 

@@ -158,7 +158,7 @@ def test_create_action_session_route_resolves_checkpoint_path_before_manager(mon
         json={
             "session_id": "session-1",
             "base_model": OPENPI_FAST_MODEL,
-            "model_path": "tinker://model-1/sampler_weights/export-1",
+            "model_path": "mint://model-1/sampler_weights/export-1",
         },
     )
 
@@ -166,7 +166,7 @@ def test_create_action_session_route_resolves_checkpoint_path_before_manager(mon
     assert resp.json() == {"action_session_id": "action-session-1"}
     assert resolve_calls == [
         {
-            "path": "tinker://model-1/sampler_weights/export-1",
+            "path": "mint://model-1/sampler_weights/export-1",
             "user_id": "user-1",
             "is_admin": False,
             "owner_id": None,
@@ -532,7 +532,7 @@ def test_legacy_action_public_routes_are_not_exposed(monkeypatch) -> None:
         json={
             "session_id": "session-1",
             "base_model": OPENPI_FAST_MODEL,
-            "model_path": "tinker://model-1/sampler_weights/export-1",
+            "model_path": "mint://model-1/sampler_weights/export-1",
         },
     )
     act_resp = client.post(

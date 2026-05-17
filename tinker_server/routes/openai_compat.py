@@ -167,6 +167,10 @@ def preload_supported_tokenizers() -> dict[str, str]:
     return failures
 
 
+def _get_running_loop():
+    return asyncio.get_running_loop()
+
+
 async def _get_tokenizer(base_model: str):
     tokenizer = _tokenizer_cache.get(base_model)
     if tokenizer is not None:
@@ -175,7 +179,7 @@ async def _get_tokenizer(base_model: str):
     async with model_lock:
         tokenizer = _tokenizer_cache.get(base_model)
         if tokenizer is None:
-            loop = asyncio.get_running_loop()
+            loop = _get_running_loop()
             tokenizer = await loop.run_in_executor(
                 _get_tokenizer_executor(),
                 _load_tokenizer_cpu,

@@ -53,7 +53,7 @@ def test_issue_417_weights_info_reads_training_checkpoint_metadata(tmp_path: Pat
     app.include_router(weights_routes.router, prefix="/api/v1")
     client = TestClient(app)
 
-    response = client.post("/api/v1/weights_info", json={"tinker_path": "tinker://run/weights/ckpt_417"})
+    response = client.post("/api/v1/weights_info", json={"tinker_path": "mint://run/weights/ckpt_417"})
 
     assert response.status_code == 200, response.text
     assert response.json() == {
@@ -96,7 +96,7 @@ def test_issue_417_weights_info_rejects_sampler_checkpoint_for_training_resume(
     app.include_router(weights_routes.router, prefix="/api/v1")
     client = TestClient(app)
 
-    response = client.post("/api/v1/weights_info", json={"tinker_path": "tinker://run/sampler_weights/ckpt"})
+    response = client.post("/api/v1/weights_info", json={"tinker_path": "mint://run/sampler_weights/ckpt"})
 
     assert response.status_code == 400, response.text
     assert "Sampler checkpoint cannot recreate a training client" in response.text
@@ -179,7 +179,7 @@ def test_issue_417_weights_info_rejects_megatron_peft_shape_without_rank_shards(
     app.include_router(weights_routes.router, prefix="/api/v1")
     client = TestClient(app)
 
-    response = client.post("/api/v1/weights_info", json={"tinker_path": "tinker://run/weights/megatron-peft"})
+    response = client.post("/api/v1/weights_info", json={"tinker_path": "mint://run/weights/megatron-peft"})
 
     assert response.status_code == 400, response.text
     assert "Checkpoint artifacts cannot recreate a megatron training client" in response.text
@@ -226,7 +226,7 @@ def test_issue_417_weights_info_accepts_peft_training_adapter_checkpoint(
     app.include_router(weights_routes.router, prefix="/api/v1")
     client = TestClient(app)
 
-    response = client.post("/api/v1/weights_info", json={"tinker_path": "tinker://run/weights/peft"})
+    response = client.post("/api/v1/weights_info", json={"tinker_path": "mint://run/weights/peft"})
 
     assert response.status_code == 200, response.text
     assert response.json() == {
@@ -279,7 +279,7 @@ def test_issue_417_weights_info_accepts_peft_optimizerless_training_adapter_chec
     app.include_router(weights_routes.router, prefix="/api/v1")
     client = TestClient(app)
 
-    response = client.post("/api/v1/weights_info", json={"tinker_path": "tinker://run/weights/peft-no-opt"})
+    response = client.post("/api/v1/weights_info", json={"tinker_path": "mint://run/weights/peft-no-opt"})
 
     assert response.status_code == 200, response.text
     assert response.json() == {
@@ -331,7 +331,7 @@ def test_issue_417_weights_info_rejects_peft_rank_shard_without_peft_artifacts(
     app.include_router(weights_routes.router, prefix="/api/v1")
     client = TestClient(app)
 
-    response = client.post("/api/v1/weights_info", json={"tinker_path": "tinker://run/weights/peft-rank"})
+    response = client.post("/api/v1/weights_info", json={"tinker_path": "mint://run/weights/peft-rank"})
 
     assert response.status_code == 400, response.text
     assert "Checkpoint artifacts cannot recreate a peft training client" in response.text
@@ -384,7 +384,7 @@ def test_issue_417_weights_info_accepts_optimizerless_training_adapter_checkpoin
     app.include_router(weights_routes.router, prefix="/api/v1")
     client = TestClient(app)
 
-    response = client.post("/api/v1/weights_info", json={"tinker_path": "tinker://run/weights/ckpt"})
+    response = client.post("/api/v1/weights_info", json={"tinker_path": "mint://run/weights/ckpt"})
 
     assert response.status_code == 200, response.text
     assert response.json() == {
@@ -438,7 +438,7 @@ def test_issue_417_weights_info_rejects_lora_checkpoint_without_rank(
     app.include_router(weights_routes.router, prefix="/api/v1")
     client = TestClient(app)
 
-    response = client.post("/api/v1/weights_info", json={"tinker_path": "tinker://run/weights/bad"})
+    response = client.post("/api/v1/weights_info", json={"tinker_path": "mint://run/weights/bad"})
 
     assert response.status_code == 400, response.text
     assert "Invalid or missing LoRA rank" in response.text
@@ -476,7 +476,7 @@ def test_issue_417_weights_info_rejects_malformed_adapter_config_as_400(
     app.include_router(weights_routes.router, prefix="/api/v1")
     client = TestClient(app)
 
-    response = client.post("/api/v1/weights_info", json={"tinker_path": "tinker://run/weights/bad-json"})
+    response = client.post("/api/v1/weights_info", json={"tinker_path": "mint://run/weights/bad-json"})
 
     assert response.status_code == 400, response.text
     assert "Malformed adapter_config.json" in response.text
@@ -514,7 +514,7 @@ def test_issue_417_weights_info_rejects_non_object_metadata_as_400(
     app.include_router(weights_routes.router, prefix="/api/v1")
     client = TestClient(app)
 
-    response = client.post("/api/v1/weights_info", json={"tinker_path": "tinker://run/weights/non-object"})
+    response = client.post("/api/v1/weights_info", json={"tinker_path": "mint://run/weights/non-object"})
 
     assert response.status_code == 400, response.text
     assert "Invalid metadata.json" in response.text
@@ -554,7 +554,7 @@ def test_issue_417_weights_info_accepts_non_lora_training_checkpoint(
     app.include_router(weights_routes.router, prefix="/api/v1")
     client = TestClient(app)
 
-    response = client.post("/api/v1/weights_info", json={"tinker_path": "tinker://run/weights/openpi"})
+    response = client.post("/api/v1/weights_info", json={"tinker_path": "mint://run/weights/openpi"})
 
     assert response.status_code == 200, response.text
     assert response.json() == {
