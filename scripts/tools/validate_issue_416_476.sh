@@ -4,7 +4,7 @@ set -euo pipefail
 NS="${TINKER_RAY_NAMESPACE:?set TINKER_RAY_NAMESPACE}"
 PORT="${TINKER_PORT:-10427}"
 ROOT="${ISSUE_SERVER_ROOT:-/root/tinker_project/tinker-server-issue-416}"
-PFS_ROOT="${PFS_TINKER_PATH:?set PFS_TINKER_PATH}"
+MINT_ROOT="${MINT_CODE_ROOT:?set MINT_CODE_ROOT}"
 LOG="${ISSUE_LOG_FILE:-/tmp/tinker_server_issue_416_r17.log}"
 RAY_ADDR="${RAY_ADDRESS:?set RAY_ADDRESS=ray://<head>:10001}"
 PY="${TINKER_HOST_PYTHON:-/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python}"
@@ -15,7 +15,7 @@ set -euo pipefail
 NS="$NS"
 PORT="$PORT"
 ROOT="$ROOT"
-PFS_ROOT="$PFS_ROOT"
+MINT_ROOT="$MINT_ROOT"
 LOG="$LOG"
 RAY_ADDR="$RAY_ADDR"
 PY="$PY"
@@ -70,7 +70,7 @@ nohup env \
   ISSUE_SUPPORTED_MODELS=Qwen/Qwen3-30B-A3B-Instruct-2507 \
   RAY_ADDRESS="\$RAY_ADDR" \
   MINT_RAY_CLIENT_ADDRESS="\$RAY_ADDR" \
-  PFS_TINKER_PATH="\$PFS_ROOT" \
+  MINT_CODE_ROOT="\$MINT_ROOT" \
   ISSUE_MODEL_PLACEMENT_JSON='{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"node_ip":"192.168.39.159","gpu_count":4}}' \
   ISSUE_MEGATRON_MODEL_PLACEMENT_JSON='{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"node_ip":"192.168.39.159","gpu_count":4}}' \
   bash scripts/tools/start_issue_server.sh >> "\$LOG" 2>&1 &

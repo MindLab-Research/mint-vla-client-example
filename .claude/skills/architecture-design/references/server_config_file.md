@@ -52,7 +52,7 @@ trust boundary between the platform and Mint API process.
 ### `[paths]`
 
 - `pfs_runtime_env_root` (str) [env: `PFS_RUNTIME_ENV_ROOT`]
-- `pfs_tinker_path` (str) [env: `PFS_TINKER_PATH`]
+- `mint_code_root` (str) [env: `MINT_CODE_ROOT`]
 - `pfs_hf_modules_path` (str) [env: `PFS_HF_MODULES_PATH`]
 
 `pfs_runtime_env_root` is the canonical dependency root and is required for

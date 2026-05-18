@@ -19,7 +19,7 @@ class Env:
     ray_namespace: str
     ssh_host: str
     server_root: str
-    pfs_tinker_path: str
+    mint_code_root: str
     port: int
     pidfile: str
     logfile: str
@@ -50,7 +50,7 @@ def _env() -> Env:
 
     ssh_host = os.environ.get("TINKER_ISSUE_SSH_HOST", "mint-dev")
     server_root = os.environ.get("TINKER_ISSUE_SERVER_ROOT", "/root/tinker_project/tinker-server-issue-238")
-    pfs_tinker_path = _require_env("PFS_TINKER_PATH")
+    mint_code_root = _require_env("MINT_CODE_ROOT")
     pidfile = os.environ.get("TINKER_ISSUE_PIDFILE", "/tmp/tinker_server_issue_238.pid")
     logfile = os.environ.get("TINKER_ISSUE_LOGFILE", "/tmp/tinker_server_issue_238.log")
     return Env(
@@ -60,7 +60,7 @@ def _env() -> Env:
         ray_namespace=str(ray_namespace),
         ssh_host=str(ssh_host),
         server_root=str(server_root),
-        pfs_tinker_path=str(pfs_tinker_path),
+        mint_code_root=str(mint_code_root),
         port=int(port),
         pidfile=str(pidfile),
         logfile=str(logfile),
@@ -94,12 +94,12 @@ def _start_server(env: Env) -> int:
             "export TINKER_PORT={port}; "
             "export TINKER_RAY_NAMESPACE={ns}; "
             "export MINT_RAY_NAMESPACE={ns}; "
-            "export PFS_TINKER_PATH={pfs}; "
+            "export MINT_CODE_ROOT={mint_root}; "
             "export TINKER_TELEMETRY=0; "
             "PYTHONPATH={py_path} python scripts/run_server.py".format(
                 port=int(env.port),
                 ns=env.ray_namespace,
-                pfs=env.pfs_tinker_path,
+                mint_root=env.mint_code_root,
                 py_path=py_path,
             )
         )

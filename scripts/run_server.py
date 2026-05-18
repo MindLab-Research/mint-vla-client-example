@@ -240,16 +240,20 @@ def _seed_runtime_env_from_config(config_path: str) -> None:
     paths = data.get("paths", {})
     required = (
         "pfs_runtime_env_root",
-        "pfs_tinker_path",
+        "mint_code_root",
         "pfs_hf_modules_path",
     )
     missing = [key for key in required if key not in paths]
+    if missing == ["mint_code_root"] and "pfs_tinker_path" in paths:
+        missing = []
     if missing:
         raise RuntimeError(
             f"{config_path} must define [paths] {required}; missing={missing}"
         )
     os.environ["PFS_RUNTIME_ENV_ROOT"] = str(paths["pfs_runtime_env_root"])
-    os.environ["PFS_TINKER_PATH"] = str(paths["pfs_tinker_path"])
+    mint_code_root = str(paths.get("mint_code_root") or paths["pfs_tinker_path"])
+    os.environ["MINT_CODE_ROOT"] = mint_code_root
+    os.environ["PFS_TINKER_PATH"] = mint_code_root
     os.environ["PFS_HF_MODULES_PATH"] = str(paths["pfs_hf_modules_path"])
 
 

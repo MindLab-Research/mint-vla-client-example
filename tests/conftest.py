@@ -133,7 +133,7 @@ def configure_runtime_env(monkeypatch, tmp_path):
             path.mkdir(parents=True, exist_ok=True)
 
         monkeypatch.setenv("PFS_RUNTIME_ENV_ROOT", str(env_root))
-        monkeypatch.setenv("PFS_TINKER_PATH", str(tinker_root))
+        monkeypatch.setenv("MINT_CODE_ROOT", str(tinker_root))
         monkeypatch.setenv("PFS_HF_MODULES_PATH", str(hf_modules))
         monkeypatch.setenv("HF_HOME", str(hf_home))
         monkeypatch.setenv("HF_HUB_OFFLINE", "1")

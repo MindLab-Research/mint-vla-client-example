@@ -19,7 +19,7 @@ def _fake_openpi_actor_env() -> dict[str, str]:
     return {
         "PYTHONPATH": "/runtime/site-packages:/repo:/hf",
         "PFS_RUNTIME_ENV_ROOT": "/runtime",
-        "PFS_TINKER_PATH": "/repo",
+        "MINT_CODE_ROOT": "/repo",
         "PFS_HF_MODULES_PATH": "/hf",
     }
 
@@ -852,7 +852,7 @@ def test_start_openpi_action_ray_runtime_registers_actor_metadata_in_model_actor
     monkeypatch.setattr(openpi_action_ray_runtime, "OpenPIActionRayRuntimeClient", _FakeClient)
     monkeypatch.setattr(openpi_action_ray_runtime, "get_model_actor_supervisor", lambda: _FakePool())
     monkeypatch.setattr(openpi_action_ray_runtime, "_openpi_runtime_env_vars", _fake_openpi_actor_env)
-    monkeypatch.setenv("PFS_TINKER_PATH", "/repo")
+    monkeypatch.setenv("MINT_CODE_ROOT", "/repo")
 
     client = asyncio.run(
         openpi_action_ray_runtime.start_openpi_action_ray_runtime(
@@ -924,7 +924,7 @@ def test_start_openpi_action_ray_runtime_applies_single_node_pin(monkeypatch) ->
     monkeypatch.setattr(openpi_action_ray_runtime, "OpenPIActionRayRuntimeClient", _FakeClient)
     monkeypatch.setattr(openpi_action_ray_runtime, "get_model_actor_supervisor", lambda: _FakePool())
     monkeypatch.setattr(openpi_action_ray_runtime, "_openpi_runtime_env_vars", _fake_openpi_actor_env)
-    monkeypatch.setenv("PFS_TINKER_PATH", "/repo")
+    monkeypatch.setenv("MINT_CODE_ROOT", "/repo")
     monkeypatch.setattr(
         openpi_action_ray_runtime,
         "parse_model_gpu_placement",

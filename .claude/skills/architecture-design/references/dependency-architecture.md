@@ -45,7 +45,7 @@ Canonical layout under `PFS_RUNTIME_ENV_ROOT`:
 Runtime import precedence:
 1. `PFS_RUNTIME_ENV_ROOT/site-packages`
 2. pinned source trees under `PFS_RUNTIME_ENV_ROOT/src`
-3. `PFS_TINKER_PATH`
+3. `MINT_CODE_ROOT`
 4. `PFS_HF_MODULES_PATH`
 
 This precedence is surfaced as `tinker_server.config.PFS_PYTHONPATH`.
@@ -62,7 +62,7 @@ The API host should launch with the runtime-env host interpreter:
 Ray actors keep using `runtime_env={"env_vars": {...}}`, but the canonical env
 now includes:
 - `PFS_RUNTIME_ENV_ROOT`
-- `PFS_TINKER_PATH`
+- `MINT_CODE_ROOT`
 - `PFS_HF_MODULES_PATH`
 - `PYTHONPATH=PFS_PYTHONPATH`
 

@@ -26,7 +26,7 @@ def test_start_issue_server_helper_scopes_control_plane_actor_names() -> None:
             "ISSUE_STARTUP_PRINT_ENV": "1",
             "RAY_ADDRESS": "ray://192.168.39.87:10001",
             "MINT_RAY_CLIENT_ADDRESS": "ray://192.168.39.87:10001",
-            "PFS_TINKER_PATH": "/vePFS-Mindverse/share/code/yiwen/tinker-server-issue-416",
+            "MINT_CODE_ROOT": "/vePFS-Mindverse/share/code/yiwen/tinker-server-issue-416",
             "ISSUE_NAMESPACE": "tinker_yiwen_issue_416_r9",
             "ISSUE_STARTUP_LEASE": "tinker_startup_lease_issue_416_r9",
             "ISSUE_PORT": "10419",

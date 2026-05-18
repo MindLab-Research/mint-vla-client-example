@@ -71,7 +71,7 @@ def _failed_ref(exc: BaseException) -> SimpleNamespace:
 
 
 def _reset_shared_runtime_test_state(monkeypatch, openpi_shared_ray_runtime) -> None:
-    monkeypatch.setenv("PFS_TINKER_PATH", "/repo")
+    monkeypatch.setenv("MINT_CODE_ROOT", "/repo")
     monkeypatch.setattr(
         openpi_shared_ray_runtime,
         "get_model_actor_supervisor",
@@ -90,7 +90,7 @@ def _reset_shared_runtime_test_state(monkeypatch, openpi_shared_ray_runtime) -> 
         lambda: {
             "PYTHONPATH": "/runtime/site-packages:/repo:/hf",
             "PFS_RUNTIME_ENV_ROOT": "/runtime",
-            "PFS_TINKER_PATH": "/repo",
+            "MINT_CODE_ROOT": "/repo",
             "PFS_HF_MODULES_PATH": "/hf",
         },
     )
@@ -233,7 +233,7 @@ def test_start_openpi_shared_ray_runtime_registers_actor_metadata_in_model_actor
     monkeypatch.setattr(
         openpi_shared_ray_runtime,
         "_openpi_runtime_env_vars",
-        lambda: {"PYTHONPATH": "/runtime/site-packages:/repo:/hf", "PFS_TINKER_PATH": "/repo"},
+        lambda: {"PYTHONPATH": "/runtime/site-packages:/repo:/hf", "MINT_CODE_ROOT": "/repo"},
     )
 
     session = _make_session("model-a", "session-a")
@@ -404,7 +404,7 @@ def test_start_openpi_shared_ray_runtime_applies_single_node_pin(monkeypatch) ->
     state: dict[str, object] = {}
     node_id = "a" * 56
 
-    monkeypatch.setenv("PFS_TINKER_PATH", "/repo")
+    monkeypatch.setenv("MINT_CODE_ROOT", "/repo")
 
     class _FakeActorBuilder:
         def options(self, **kwargs):

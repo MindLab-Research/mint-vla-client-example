@@ -70,6 +70,7 @@ class _PathsSection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     pfs_runtime_env_root: str | None = None
+    mint_code_root: str | None = None
     pfs_tinker_path: str | None = None
     pfs_hf_modules_path: str | None = None
 

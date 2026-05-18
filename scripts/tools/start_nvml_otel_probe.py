@@ -436,7 +436,7 @@ def _probe_runtime_env() -> dict[str, object] | None:
         "OTEL_APMPLUS_APP_KEY",
         "RAY_ADDRESS",
         "PFS_RUNTIME_ENV_ROOT",
-        "PFS_TINKER_PATH",
+        "MINT_CODE_ROOT",
         "PFS_HF_MODULES_PATH",
     ):
         value = os.getenv(key)

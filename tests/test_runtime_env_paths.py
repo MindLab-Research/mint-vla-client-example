@@ -82,7 +82,7 @@ def test_build_runtime_pythonpath_uses_canonical_root(tmp_path):
 
     out = build_runtime_pythonpath(
         env_root=str(env_root),
-        pfs_tinker_path="/vePFS/code/yiwen/tinker-server",
+        mint_code_root="/vePFS/code/yiwen/tinker-server",
         pfs_hf_modules_path="/vePFS/hf/modules",
     )
 
@@ -103,7 +103,7 @@ def test_build_runtime_pythonpath_fails_on_incomplete_root(tmp_path):
     with pytest.raises(RuntimeError):
         build_runtime_pythonpath(
             env_root=str(env_root),
-            pfs_tinker_path="/repo",
+            mint_code_root="/repo",
             pfs_hf_modules_path="/hf",
         )
 
@@ -128,7 +128,7 @@ def test_build_runtime_pythonpath_does_not_require_host_python(tmp_path):
 
     out = build_runtime_pythonpath(
         env_root=str(env_root),
-        pfs_tinker_path="/repo",
+        mint_code_root="/repo",
         pfs_hf_modules_path="/hf",
     )
 
@@ -140,7 +140,7 @@ def test_bootstrap_runtime_pythonpath_prefers_runtime_root(tmp_path):
     _materialize_runtime_env(env_root)
     environ = {
         "PFS_RUNTIME_ENV_ROOT": str(env_root),
-        "PFS_TINKER_PATH": "/pfs/code/tinker-server",
+        "MINT_CODE_ROOT": "/pfs/code/tinker-server",
         "PFS_HF_MODULES_PATH": "/pfs/hf/modules",
     }
 
@@ -160,7 +160,7 @@ def test_bootstrap_runtime_pythonpath_requires_runtime_root():
 def test_bootstrap_runtime_pythonpath_requires_tinker_path(tmp_path):
     env_root = tmp_path / "runtime"
     _materialize_runtime_env(env_root)
-    with pytest.raises(RuntimeError, match="PFS_TINKER_PATH is required"):
+    with pytest.raises(RuntimeError, match="MINT_CODE_ROOT is required"):
         bootstrap_runtime_pythonpath(
             {
                 "PFS_RUNTIME_ENV_ROOT": str(env_root),
@@ -177,7 +177,7 @@ def test_bootstrap_runtime_pythonpath_requires_hf_modules_path(tmp_path):
         bootstrap_runtime_pythonpath(
             {
                 "PFS_RUNTIME_ENV_ROOT": str(env_root),
-                "PFS_TINKER_PATH": "/repo",
+                "MINT_CODE_ROOT": "/repo",
             },
             repo_root="/repo",
         )
@@ -769,7 +769,7 @@ def test_preferred_vllm_python_executable_prefers_explicit_env(monkeypatch, tmp_
     explicit.parent.mkdir(parents=True, exist_ok=True)
     explicit.write_text("#!/bin/sh\n", encoding="utf-8")
 
-    monkeypatch.setattr(server_config, "PFS_TINKER_PATH", str(repo_root))
+    monkeypatch.setattr(server_config, "MINT_CODE_ROOT", str(repo_root))
     monkeypatch.setenv("MINT_VLLM_CHILD_PYTHON_EXECUTABLE", str(explicit))
 
     assert server_config.preferred_vllm_python_executable() == str(explicit)
@@ -894,7 +894,7 @@ def test_config_import_fails_on_runtime_path_mismatch(tmp_path):
             [
                 "[paths]",
                 'pfs_runtime_env_root = "/cfg/runtime"',
-                'pfs_tinker_path = "/cfg/repo"',
+                'mint_code_root = "/cfg/repo"',
                 'pfs_hf_modules_path = "/cfg/hf"',
             ]
         )
@@ -905,7 +905,7 @@ def test_config_import_fails_on_runtime_path_mismatch(tmp_path):
     env = os.environ.copy()
     env["MINT_CONFIG_PATH"] = str(cfg)
     env["PFS_RUNTIME_ENV_ROOT"] = "/env/runtime"
-    env["PFS_TINKER_PATH"] = "/env/repo"
+    env["MINT_CODE_ROOT"] = "/env/repo"
     env["PFS_HF_MODULES_PATH"] = "/env/hf"
 
     out = subprocess.run(
@@ -926,7 +926,7 @@ def test_run_server_parses_config_before_runtime_bootstrap(tmp_path):
             [
                 "[paths]",
                 f'pfs_runtime_env_root = "{tmp_path / "runtime"}"',
-                f'pfs_tinker_path = "{tmp_path / "repo"}"',
+                f'mint_code_root = "{tmp_path / "repo"}"',
                 f'pfs_hf_modules_path = "{tmp_path / "hf"}"',
                 "",
                 "[server]",
@@ -960,7 +960,7 @@ def test_run_server_honors_env_config_before_runtime_bootstrap(tmp_path):
             [
                 "[paths]",
                 f'pfs_runtime_env_root = "{tmp_path / "runtime"}"',
-                f'pfs_tinker_path = "{tmp_path / "repo"}"',
+                f'mint_code_root = "{tmp_path / "repo"}"',
                 f'pfs_hf_modules_path = "{tmp_path / "hf"}"',
                 "",
                 "[server]",
@@ -994,7 +994,7 @@ def test_seed_runtime_env_from_config_overrides_stale_env(tmp_path, monkeypatch)
             [
                 "[paths]",
                 f'pfs_runtime_env_root = "{tmp_path / "runtime"}"',
-                f'pfs_tinker_path = "{tmp_path / "repo"}"',
+                f'mint_code_root = "{tmp_path / "repo"}"',
                 f'pfs_hf_modules_path = "{tmp_path / "hf"}"',
             ]
         )
@@ -1002,13 +1002,13 @@ def test_seed_runtime_env_from_config_overrides_stale_env(tmp_path, monkeypatch)
         encoding="utf-8",
     )
     monkeypatch.setenv("PFS_RUNTIME_ENV_ROOT", "/stale/runtime")
-    monkeypatch.setenv("PFS_TINKER_PATH", "/stale/repo")
+    monkeypatch.setenv("MINT_CODE_ROOT", "/stale/repo")
     monkeypatch.setenv("PFS_HF_MODULES_PATH", "/stale/hf")
 
     _seed_runtime_env_from_config(str(cfg))
 
     assert os.environ["PFS_RUNTIME_ENV_ROOT"] == str(tmp_path / "runtime")
-    assert os.environ["PFS_TINKER_PATH"] == str(tmp_path / "repo")
+    assert os.environ["MINT_CODE_ROOT"] == str(tmp_path / "repo")
     assert os.environ["PFS_HF_MODULES_PATH"] == str(tmp_path / "hf")
 
 
@@ -1021,14 +1021,14 @@ def test_seed_runtime_env_from_config_requires_all_paths(tmp_path, monkeypatch):
             [
                 "[paths]",
                 f'pfs_runtime_env_root = "{tmp_path / "runtime"}"',
-                f'pfs_tinker_path = "{tmp_path / "repo"}"',
+                f'mint_code_root = "{tmp_path / "repo"}"',
             ]
         )
         + "\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("PFS_RUNTIME_ENV_ROOT", "/stale/runtime")
-    monkeypatch.setenv("PFS_TINKER_PATH", "/stale/repo")
+    monkeypatch.setenv("MINT_CODE_ROOT", "/stale/repo")
     monkeypatch.setenv("PFS_HF_MODULES_PATH", "/stale/hf")
 
     with pytest.raises(RuntimeError, match="missing=.*pfs_hf_modules_path"):
@@ -1077,7 +1077,7 @@ def test_actor_runtime_env_vars_forwards_control_plane_pin_envs(tmp_path):
     payload = _load_actor_runtime_env_payload(
         {
             "PFS_RUNTIME_ENV_ROOT": str(env_root),
-            "PFS_TINKER_PATH": str(tmp_path / 'repo'),
+            "MINT_CODE_ROOT": str(tmp_path / 'repo'),
             "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
             "RAY_ADDRESS": "ray://cfg-test",
             "MINT_CONTROL_PLANE_PINNED_NODE_IP": "192.168.38.176",
@@ -1100,7 +1100,7 @@ def test_actor_runtime_env_vars_forwards_vllm_envs(tmp_path):
     payload = _load_actor_runtime_env_payload(
         {
             "PFS_RUNTIME_ENV_ROOT": str(env_root),
-            "PFS_TINKER_PATH": str(tmp_path / 'repo'),
+            "MINT_CODE_ROOT": str(tmp_path / 'repo'),
             "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
             "RAY_ADDRESS": "ray://cfg-test",
             "MINT_VLLM_SERIALIZE_ADD_LORA_UNTIL_IDLE": "1",
@@ -1142,7 +1142,7 @@ def test_actor_runtime_env_vars_forwards_config_path(tmp_path):
             [
                 "[paths]",
                 f'pfs_runtime_env_root = "{env_root}"',
-                f'pfs_tinker_path = "{tmp_path / "repo"}"',
+                f'mint_code_root = "{tmp_path / "repo"}"',
                 f'pfs_hf_modules_path = "{tmp_path / "hf"}"',
                 "",
                 "[ray]",
@@ -1155,7 +1155,7 @@ def test_actor_runtime_env_vars_forwards_config_path(tmp_path):
     payload = _load_actor_runtime_env_payload(
         {
             "PFS_RUNTIME_ENV_ROOT": str(env_root),
-            "PFS_TINKER_PATH": str(tmp_path / 'repo'),
+            "MINT_CODE_ROOT": str(tmp_path / 'repo'),
             "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
             "RAY_ADDRESS": "ray://cfg-test",
             "MINT_CONFIG_PATH": str(cfg),
@@ -1191,7 +1191,7 @@ def test_actor_runtime_env_vars_requires_ray_address(tmp_path):
         text=True,
         env={
             "PFS_RUNTIME_ENV_ROOT": str(env_root),
-            "PFS_TINKER_PATH": str(tmp_path / 'repo'),
+            "MINT_CODE_ROOT": str(tmp_path / 'repo'),
             "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
         },
     )
@@ -1205,7 +1205,7 @@ def test_actor_runtime_env_vars_forwards_control_plane_actor_names(tmp_path):
     payload = _load_actor_runtime_env_payload(
         {
             "PFS_RUNTIME_ENV_ROOT": str(env_root),
-            "PFS_TINKER_PATH": str(tmp_path / 'repo'),
+            "MINT_CODE_ROOT": str(tmp_path / 'repo'),
             "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
             "RAY_ADDRESS": "ray://cfg-test",
             "MINT_RAY_NAMESPACE": "mint-test-ns",
@@ -1250,7 +1250,7 @@ def test_actor_runtime_env_vars_forwards_usage_envs(tmp_path):
     payload = _load_actor_runtime_env_payload(
         {
             "PFS_RUNTIME_ENV_ROOT": str(env_root),
-            "PFS_TINKER_PATH": str(tmp_path / 'repo'),
+            "MINT_CODE_ROOT": str(tmp_path / 'repo'),
             "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
             "RAY_ADDRESS": "ray://cfg-test",
             "MINT_USAGE_LOG_DIR": "/vePFS/shared/usage",
@@ -1285,7 +1285,7 @@ def test_actor_runtime_env_vars_forwards_ray_attach_hints(tmp_path):
         text=True,
         env={
             "PFS_RUNTIME_ENV_ROOT": str(env_root),
-            "PFS_TINKER_PATH": str(tmp_path / 'repo'),
+            "MINT_CODE_ROOT": str(tmp_path / 'repo'),
             "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
             "RAY_ADDRESS": "192.168.39.87:6379",
             "MINT_RAY_CLIENT_ADDRESS": "ray://192.168.39.87:10001",
@@ -1323,7 +1323,7 @@ def test_actor_runtime_env_skips_local_working_dir_in_ray_client_mode(tmp_path):
         text=True,
         env={
             "PFS_RUNTIME_ENV_ROOT": str(env_root),
-            "PFS_TINKER_PATH": str(local_repo),
+            "MINT_CODE_ROOT": str(local_repo),
             "PFS_HF_MODULES_PATH": str(tmp_path / "hf"),
             "RAY_ADDRESS": "ray://192.168.39.87:10001",
             "MINT_RAY_CLIENT_ADDRESS": "ray://192.168.39.87:10001",
@@ -1355,7 +1355,7 @@ def test_actor_runtime_env_skips_local_py_modules_in_ray_client_mode(tmp_path):
         text=True,
         env={
             "PFS_RUNTIME_ENV_ROOT": str(env_root),
-            "PFS_TINKER_PATH": str(tmp_path / "repo"),
+            "MINT_CODE_ROOT": str(tmp_path / "repo"),
             "PFS_HF_MODULES_PATH": str(tmp_path / "hf"),
             "RAY_ADDRESS": "ray://192.168.39.87:10001",
             "MINT_RAY_PY_MODULES_CSV": str(repo_pkg),
@@ -1386,7 +1386,7 @@ def test_actor_runtime_env_keeps_local_working_dir_for_direct_ray(tmp_path):
         text=True,
         env={
             "PFS_RUNTIME_ENV_ROOT": str(env_root),
-            "PFS_TINKER_PATH": str(local_repo),
+            "MINT_CODE_ROOT": str(local_repo),
             "PFS_HF_MODULES_PATH": str(tmp_path / "hf"),
             "RAY_ADDRESS": "192.168.39.87:6379",
             "MINT_RAY_WORKING_DIR": str(local_repo),

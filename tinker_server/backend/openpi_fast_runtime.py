@@ -40,9 +40,9 @@ def _default_pythonpath() -> tuple[str, ...]:
 
 
 def _default_mint_root() -> Path:
-    pfs_tinker_path = (os.environ.get("PFS_TINKER_PATH") or "").strip()
-    if pfs_tinker_path:
-        return Path(pfs_tinker_path).expanduser().resolve()
+    mint_code_root = (os.environ.get("MINT_CODE_ROOT") or os.environ.get("PFS_TINKER_PATH") or "").strip()
+    if mint_code_root:
+        return Path(mint_code_root).expanduser().resolve()
     return Path(__file__).resolve().parents[2]
 
 

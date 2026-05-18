@@ -30,7 +30,7 @@ These values remain explicit actor bootstrap inputs because the actor cannot que
 
 - `PYTHONPATH`
 - `PFS_RUNTIME_ENV_ROOT`
-- `PFS_TINKER_PATH`
+- `MINT_CODE_ROOT`
 - `PFS_HF_MODULES_PATH`
 - `RAY_ADDRESS`
 - `MINT_RAY_NAMESPACE`

@@ -42,12 +42,12 @@ def main() -> int:
         if needle not in txt:
             return _fail(f"{rel} missing {needle!r}")
 
-    # Per-run code root support: PFS_TINKER_PATH should flow into PFS_PYTHONPATH.
-    pfs_tinker = os.environ.get("PFS_TINKER_PATH")
+    # Per-run code root support: MINT_CODE_ROOT should flow into PFS_PYTHONPATH.
+    pfs_tinker = os.environ.get("MINT_CODE_ROOT")
     if pfs_tinker:
         pfs_pythonpath = getattr(cfg, "PFS_PYTHONPATH", "")
         if pfs_tinker not in pfs_pythonpath.split(":"):
-            return _fail(f"PFS_TINKER_PATH not present in PFS_PYTHONPATH: {pfs_tinker!r}")
+            return _fail(f"MINT_CODE_ROOT not present in PFS_PYTHONPATH: {pfs_tinker!r}")
 
     # Regression guard: no hard-coded shared dev root in worker PYTHONPATH.
     for rel in (

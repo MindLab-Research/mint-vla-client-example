@@ -30,6 +30,7 @@ BOOTSTRAP_RUNTIME_ENV_KEYS = frozenset(
     {
         "PYTHONPATH",
         "PFS_RUNTIME_ENV_ROOT",
+        "MINT_CODE_ROOT",
         "PFS_TINKER_PATH",
         "PFS_HF_MODULES_PATH",
         "RAY_ADDRESS",

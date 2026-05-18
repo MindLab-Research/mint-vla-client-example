@@ -205,7 +205,7 @@ def test_actor_runtime_env_hydration_flag_is_default_and_not_extra_overridable(m
     from tinker_server import config as server_config
 
     monkeypatch.setattr(server_config, "PFS_RUNTIME_ENV_ROOT", "/runtime")
-    monkeypatch.setattr(server_config, "PFS_TINKER_PATH", "/repo")
+    monkeypatch.setattr(server_config, "MINT_CODE_ROOT", "/repo")
     monkeypatch.setattr(server_config, "PFS_HF_MODULES_PATH", "/hf")
     monkeypatch.setattr(server_config, "RAY_NAMESPACE", "mint-test")
     monkeypatch.setenv("RAY_ADDRESS", "ray://127.0.0.1:10001")

@@ -20,7 +20,7 @@ def test_preferred_vllm_python_executable_uses_existing_override(
     worker.write_text("#!/bin/sh\n")
     worker.chmod(0o755)
     monkeypatch.setenv("MINT_VLLM_CHILD_PYTHON_EXECUTABLE", str(worker))
-    monkeypatch.delenv("PFS_TINKER_PATH", raising=False)
+    monkeypatch.delenv("MINT_CODE_ROOT", raising=False)
 
     cfg = _import_config(monkeypatch)
 
@@ -37,7 +37,7 @@ def test_preferred_vllm_python_executable_rejects_missing_override(
     script.chmod(0o755)
 
     monkeypatch.setenv("MINT_VLLM_CHILD_PYTHON_EXECUTABLE", str(tmp_path / "missing-python"))
-    monkeypatch.setenv("PFS_TINKER_PATH", str(repo_root))
+    monkeypatch.setenv("MINT_CODE_ROOT", str(repo_root))
 
     cfg = _import_config(monkeypatch)
 

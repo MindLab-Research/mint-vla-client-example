@@ -230,13 +230,13 @@ def sanitize_worker_pythonpath(raw: str | None, *, env_root: str | None) -> str:
 def build_runtime_pythonpath(
     *,
     env_root: str,
-    pfs_tinker_path: str,
+    mint_code_root: str,
     pfs_hf_modules_path: str,
 ) -> str:
     layout = validate_runtime_env_layout(env_root, require_host_python=False)
     return join_pythonpath(
         layout.pythonpath_entries,
-        pfs_tinker_path,
+        mint_code_root,
         pfs_hf_modules_path,
     )
 
@@ -250,9 +250,9 @@ def bootstrap_runtime_pythonpath(
     env_root = env_nonempty(environ, "PFS_RUNTIME_ENV_ROOT")
     if not env_root:
         raise RuntimeError("PFS_RUNTIME_ENV_ROOT is required")
-    pfs_tinker_path = env_nonempty(environ, "PFS_TINKER_PATH")
-    if not pfs_tinker_path:
-        raise RuntimeError("PFS_TINKER_PATH is required")
+    mint_code_root = env_nonempty(environ, "MINT_CODE_ROOT") or env_nonempty(environ, "PFS_TINKER_PATH")
+    if not mint_code_root:
+        raise RuntimeError("MINT_CODE_ROOT is required")
     pfs_hf_modules_path = env_nonempty(environ, "PFS_HF_MODULES_PATH")
     if not pfs_hf_modules_path:
         raise RuntimeError("PFS_HF_MODULES_PATH is required")
@@ -260,6 +260,6 @@ def bootstrap_runtime_pythonpath(
     return join_pythonpath(
         layout.pythonpath_entries,
         layout.host_pythonpath_entries,
-        pfs_tinker_path,
+        mint_code_root,
         pfs_hf_modules_path,
     )

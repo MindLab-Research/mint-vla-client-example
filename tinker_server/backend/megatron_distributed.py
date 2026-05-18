@@ -42,7 +42,7 @@ from ..logging_context import (
 )
 
 # Import centralized PFS paths from config
-from tinker_server.config import PFS_PYTHONPATH, PFS_TINKER_PATH, RAY_NAMESPACE, config as server_config
+from tinker_server.config import MINT_CODE_ROOT, PFS_PYTHONPATH, RAY_NAMESPACE, config as server_config
 from tinker_server.backend.model_registry import get_model_config
 from tinker_server.ray_utils import init_ray
 from tinker_server.model_input_utils import flatten_encoded_text_chunks
@@ -285,7 +285,7 @@ def _env_int(name: str, default: int) -> int:
 
 def _default_megatron_sessions_base_path() -> str:
     return os.environ.get("MINT_MEGATRON_SESSIONS_BASE_PATH") or os.path.join(
-        PFS_TINKER_PATH,
+        MINT_CODE_ROOT,
         "checkpoints",
         "megatron_sessions",
     )

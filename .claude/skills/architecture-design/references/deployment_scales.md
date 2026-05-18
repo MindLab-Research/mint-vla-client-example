@@ -47,7 +47,7 @@ The API host should run:
 <PFS_RUNTIME_ENV_ROOT>/host-venv/bin/python scripts/run_server.py
 ```
 
-`scripts/run_server.py` bootstraps the rest of the Python path from `PFS_RUNTIME_ENV_ROOT`, `PFS_TINKER_PATH`, and `PFS_HF_MODULES_PATH`.
+`scripts/run_server.py` bootstraps the rest of the Python path from `PFS_RUNTIME_ENV_ROOT`, `MINT_CODE_ROOT`, and `PFS_HF_MODULES_PATH`.
 
 There is no alternate per-package overlay mode anymore. Deployments must set
 `PFS_RUNTIME_ENV_ROOT`.

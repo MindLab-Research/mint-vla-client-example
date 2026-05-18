@@ -13,7 +13,7 @@ def test_issue_439_dense_trainer_does_not_pass_removed_session_state_root(monkey
     from tinker_server import config as cfg
 
     monkeypatch.setattr(cfg, "PFS_RUNTIME_ENV_ROOT", "/tmp/runtime-root")
-    monkeypatch.setattr(cfg, "PFS_TINKER_PATH", "/tmp/tinker-root")
+    monkeypatch.setattr(cfg, "MINT_CODE_ROOT", "/tmp/tinker-root")
     monkeypatch.setattr(cfg, "PFS_HF_MODULES_PATH", "/tmp/hf-modules")
     monkeypatch.setenv("RAY_ADDRESS", "192.168.38.184:6379")
 
@@ -83,7 +83,7 @@ def test_issue_561_poisoned_dense_trainer_is_not_reused(monkeypatch, base_model:
     monkeypatch.setattr(runtime_obs_module, "runtime_observability", obs)
 
     monkeypatch.setattr(cfg, "PFS_RUNTIME_ENV_ROOT", "/tmp/runtime-root")
-    monkeypatch.setattr(cfg, "PFS_TINKER_PATH", "/tmp/tinker-root")
+    monkeypatch.setattr(cfg, "MINT_CODE_ROOT", "/tmp/tinker-root")
     monkeypatch.setattr(cfg, "PFS_HF_MODULES_PATH", "/tmp/hf-modules")
     monkeypatch.setenv("RAY_ADDRESS", "192.168.38.184:6379")
 
@@ -196,7 +196,7 @@ def test_issue_561_dead_dense_actor_absent_name_recreates(monkeypatch) -> None:
     from tinker_server import config as cfg
 
     monkeypatch.setattr(cfg, "PFS_RUNTIME_ENV_ROOT", "/tmp/runtime-root")
-    monkeypatch.setattr(cfg, "PFS_TINKER_PATH", "/tmp/tinker-root")
+    monkeypatch.setattr(cfg, "MINT_CODE_ROOT", "/tmp/tinker-root")
     monkeypatch.setattr(cfg, "PFS_HF_MODULES_PATH", "/tmp/hf-modules")
     monkeypatch.setenv("RAY_ADDRESS", "192.168.38.184:6379")
 

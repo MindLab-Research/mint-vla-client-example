@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -123,19 +124,26 @@ async def test_issue_593_verl_inference_disables_sleep_mode_by_default(monkeypat
     monkeypatch.delenv("MINT_VLLM_ENABLE_SLEEP_MODE", raising=False)
     monkeypatch.setenv("RAY_ADDRESS", "ray://test")
     monkeypatch.setenv("PFS_RUNTIME_ENV_ROOT", "/tmp/runtime")
-    monkeypatch.setenv("PFS_TINKER_PATH", "/tmp/repo")
+    monkeypatch.setenv("MINT_CODE_ROOT", "/tmp/repo")
     monkeypatch.setenv("PFS_HF_MODULES_PATH", "/tmp/hf")
+    config_module = sys.modules["tinker_server.config"]
+    monkeypatch.setattr(config_module, "PFS_RUNTIME_ENV_ROOT", "/tmp/runtime")
+    monkeypatch.setattr(config_module, "MINT_CODE_ROOT", "/tmp/repo")
+    monkeypatch.setattr(config_module, "PFS_HF_MODULES_PATH", "/tmp/hf")
+    config_module.actor_runtime_env_vars.__globals__["PFS_RUNTIME_ENV_ROOT"] = "/tmp/runtime"
+    config_module.actor_runtime_env_vars.__globals__["MINT_CODE_ROOT"] = "/tmp/repo"
+    config_module.actor_runtime_env_vars.__globals__["PFS_HF_MODULES_PATH"] = "/tmp/hf"
     monkeypatch.setattr(verl_inference, "get_model_config", lambda _model: _FakeCfg())
     monkeypatch.setattr(verl_inference, "_create_extended_server_class", lambda **_kwargs: _FakeServer)
     monkeypatch.setattr(verl_inference, "_vllm_actor_pin_options_for_model", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(verl_inference, "init_ray", lambda **_kwargs: None)
     monkeypatch.setattr(
-        server_config_module,
-        "actor_runtime_env_vars",
-        lambda *, pythonpath, extra=None: {"PYTHONPATH": pythonpath, **(extra or {})},
-    )
-    monkeypatch.setattr(server_config_module, "actor_ld_library_path", lambda: "")
-    monkeypatch.setattr(server_config_module, "preferred_vllm_python_executable", lambda: "")
+            config_module,
+            "actor_runtime_env_vars",
+            lambda *, pythonpath, extra=None: {"PYTHONPATH": pythonpath, **(extra or {})},
+        )
+    monkeypatch.setattr(config_module, "actor_ld_library_path", lambda: "")
+    monkeypatch.setattr(config_module, "preferred_vllm_python_executable", lambda: "")
     monkeypatch.setitem(
         __import__("sys").modules,
         "verl.workers.config",

@@ -39,9 +39,9 @@ def _openpi_runtime_env_vars() -> dict[str, str]:
 
 
 def _action_session_state_root(actor_name: str) -> str:
-    pfs_tinker_path = str(os.environ.get("PFS_TINKER_PATH") or "").strip()
-    if not pfs_tinker_path:
-        raise RuntimeError("OpenPI action session state root requires PFS_TINKER_PATH")
+    mint_code_root = str(os.environ.get("MINT_CODE_ROOT") or os.environ.get("PFS_TINKER_PATH") or "").strip()
+    if not mint_code_root:
+        raise RuntimeError("OpenPI action session state root requires MINT_CODE_ROOT")
     namespace = str(
         env_nonempty(os.environ, "MINT_RAY_NAMESPACE")
         or RAY_NAMESPACE
@@ -52,7 +52,7 @@ def _action_session_state_root(actor_name: str) -> str:
     namespace_dir = namespace.replace("/", "_")
     return str(
         (
-            Path(pfs_tinker_path).resolve()
+            Path(mint_code_root).resolve()
             / "checkpoints"
             / "openpi_action_session_state"
             / namespace_dir

@@ -15,13 +15,13 @@ def _reload_openpi_ray_runtime(monkeypatch):
 
     monkeypatch.setattr(config, "PFS_PYTHONPATH", "/runtime/site-packages:/repo:/hf")
     monkeypatch.setattr(config, "PFS_RUNTIME_ENV_ROOT", "/runtime")
-    monkeypatch.setattr(config, "PFS_TINKER_PATH", "/repo")
+    monkeypatch.setattr(config, "MINT_CODE_ROOT", "/repo")
     monkeypatch.setattr(config, "PFS_HF_MODULES_PATH", "/hf")
 
     def _fake_actor_runtime_env_vars(*, pythonpath: str, extra: dict[str, str] | None = None) -> dict[str, str]:
         out = {
             "PFS_RUNTIME_ENV_ROOT": "/runtime",
-            "PFS_TINKER_PATH": "/repo",
+            "MINT_CODE_ROOT": "/repo",
             "PFS_HF_MODULES_PATH": "/hf",
             "RAY_ADDRESS": "auto",
             "TINKER_RAY_NAMESPACE": "tinker",
@@ -69,7 +69,7 @@ def test_openpi_ray_runtime_env_vars_forward_mint_openpi_overrides(monkeypatch) 
     assert env_vars["OPENPI_DATA_HOME"] == "/tmp/openpi-data"
     assert env_vars["PYTHONPATH"] == "/runtime/site-packages:/repo:/hf"
     assert env_vars["PFS_RUNTIME_ENV_ROOT"] == "/runtime"
-    assert env_vars["PFS_TINKER_PATH"] == "/repo"
+    assert env_vars["MINT_CODE_ROOT"] == "/repo"
     assert env_vars["PFS_HF_MODULES_PATH"] == "/hf"
     assert "UNRELATED_ENV" not in env_vars
 

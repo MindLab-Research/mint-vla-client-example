@@ -75,7 +75,7 @@ Session switching call path:
 
 2. LoRA weight swap (disk-backed adapter checkpoints)
    - `MegatronSessionStateManager` maps `session_id` to a checkpoint directory on a shared filesystem:
-     - default: `${PFS_TINKER_PATH}/checkpoints/megatron_sessions/{session_id}_checkpoint/` (override: `MINT_MEGATRON_SESSIONS_BASE_PATH`)
+     - default: `${MINT_CODE_ROOT}/checkpoints/megatron_sessions/{session_id}_checkpoint/` (override: `MINT_MEGATRON_SESSIONS_BASE_PATH`)
    - On session switch:
      - saves outgoing adapter state via `save_adapter_state(...)` into that directory
      - loads incoming adapter state via `load_adapter_state(...)` if it exists

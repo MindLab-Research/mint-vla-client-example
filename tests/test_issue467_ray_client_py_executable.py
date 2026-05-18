@@ -47,7 +47,7 @@ def test_preferred_vllm_python_executable_uses_relative_wrapper_in_ray_client_mo
     script.parent.mkdir(parents=True)
     script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
 
-    monkeypatch.setattr(cfg, "PFS_TINKER_PATH", str(repo))
+    monkeypatch.setattr(cfg, "MINT_CODE_ROOT", str(repo))
     monkeypatch.setenv("MINT_RAY_JOB_WORKING_DIR", str(repo))
     monkeypatch.delenv("MINT_VLLM_CHILD_PYTHON_EXECUTABLE", raising=False)
 

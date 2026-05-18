@@ -165,7 +165,7 @@ def _driver_runtime_env() -> dict[str, Any]:
     runtime_env: dict[str, Any] = {}
 
     # Only package a Ray Client working_dir when the operator asks for it.
-    # `PFS_TINKER_PATH` is already a shared cluster path in Mint deployments,
+    # `MINT_CODE_ROOT` is already a shared cluster path in Mint deployments,
     # so auto-uploading it through runtime_env just creates redundant node-side
     # working_dir caches.
     working_dir = (
@@ -270,7 +270,7 @@ def _job_level_runtime_env(address: str, existing: Any) -> dict[str, Any] | Any:
 
     # Ray Client actor creation serializes code on the job side before actor-level
     # runtime_env takes effect. Only package a job-level working_dir when the
-    # operator explicitly requests it. Auto-packaging `PFS_TINKER_PATH` causes
+    # operator explicitly requests it. Auto-packaging `MINT_CODE_ROOT` causes
     # remote API-host startup to hash/upload the whole shared checkout on every
     # restart even though that path is already directly visible on the host.
     job_working_dir = os.environ.get("MINT_RAY_JOB_WORKING_DIR", "").strip()

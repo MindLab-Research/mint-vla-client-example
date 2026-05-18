@@ -87,14 +87,21 @@ RAY_NAMESPACE = _env_ray_ns or _file_ray_ns or "tinker"
 # running API server deployment (dev/prod/aliyun).
 #
 # Historical default hard-coded `/vePFS-Mindverse/share/code/tinker-server-auth`, which breaks
-# non-volcano deployments (e.g. `tinker-server-aliyun`) by setting worker runtime_env PYTHONPATH
-# to a non-existent code directory.
-_file_pfs_tinker_path = _CONFIG_FILE.paths.pfs_tinker_path if _CONFIG_FILE is not None else None
-PFS_TINKER_PATH = _resolve_env_or_config(
-    "PFS_TINKER_PATH",
-    _env_nonempty(os.environ, "PFS_TINKER_PATH"),
-    _file_pfs_tinker_path,
+# non-volcano deployments by setting worker runtime_env PYTHONPATH to a
+# non-existent code directory. `PFS_TINKER_PATH` remains an input alias only.
+_file_mint_code_root = _CONFIG_FILE.paths.mint_code_root if _CONFIG_FILE is not None else None
+_file_legacy_pfs_tinker_path = _CONFIG_FILE.paths.pfs_tinker_path if _CONFIG_FILE is not None else None
+if _file_mint_code_root and _file_legacy_pfs_tinker_path and _file_mint_code_root != _file_legacy_pfs_tinker_path:
+    raise RuntimeError(
+        "mint_code_root mismatch between config aliases: "
+        f"mint_code_root={_file_mint_code_root!r} pfs_tinker_path={_file_legacy_pfs_tinker_path!r}"
+    )
+MINT_CODE_ROOT = _resolve_env_or_config(
+    "MINT_CODE_ROOT",
+    _env_nonempty(os.environ, "MINT_CODE_ROOT") or _env_nonempty(os.environ, "PFS_TINKER_PATH"),
+    _file_mint_code_root or _file_legacy_pfs_tinker_path,
 )
+PFS_TINKER_PATH = MINT_CODE_ROOT
 
 # Canonical runtime env root. This contains:
 # - `site-packages/` for shared pure-Python runtime deps
@@ -128,8 +135,8 @@ PFS_HF_MODULES_PATH = _resolve_env_or_config(
 def ensure_runtime_env_configured() -> str:
     if not PFS_RUNTIME_ENV_ROOT:
         raise RuntimeError("PFS_RUNTIME_ENV_ROOT must be set")
-    if not PFS_TINKER_PATH:
-        raise RuntimeError("PFS_TINKER_PATH must be set")
+    if not MINT_CODE_ROOT:
+        raise RuntimeError("MINT_CODE_ROOT must be set")
     if not PFS_HF_MODULES_PATH:
         raise RuntimeError("PFS_HF_MODULES_PATH must be set")
     return PFS_RUNTIME_ENV_ROOT
@@ -138,10 +145,10 @@ def ensure_runtime_env_configured() -> str:
 PFS_PYTHONPATH = (
     build_runtime_pythonpath(
         env_root=PFS_RUNTIME_ENV_ROOT,
-        pfs_tinker_path=PFS_TINKER_PATH,
+        mint_code_root=MINT_CODE_ROOT,
         pfs_hf_modules_path=PFS_HF_MODULES_PATH,
     )
-    if PFS_RUNTIME_ENV_ROOT and PFS_TINKER_PATH and PFS_HF_MODULES_PATH
+    if PFS_RUNTIME_ENV_ROOT and MINT_CODE_ROOT and PFS_HF_MODULES_PATH
     else ""
 )
 
@@ -205,8 +212,8 @@ def actor_runtime_env_vars(
 ) -> dict[str, str]:
     if not PFS_RUNTIME_ENV_ROOT:
         raise RuntimeError("PFS_RUNTIME_ENV_ROOT is required")
-    if not PFS_TINKER_PATH:
-        raise RuntimeError("PFS_TINKER_PATH is required")
+    if not MINT_CODE_ROOT:
+        raise RuntimeError("MINT_CODE_ROOT is required")
     if not PFS_HF_MODULES_PATH:
         raise RuntimeError("PFS_HF_MODULES_PATH is required")
     ray_address = _env_nonempty(os.environ, "RAY_ADDRESS")
@@ -217,7 +224,8 @@ def actor_runtime_env_vars(
         "MINT_RAY_NAMESPACE": RAY_NAMESPACE,
         "PYTHONPATH": pythonpath,
         "PFS_RUNTIME_ENV_ROOT": PFS_RUNTIME_ENV_ROOT,
-        "PFS_TINKER_PATH": PFS_TINKER_PATH,
+        "MINT_CODE_ROOT": MINT_CODE_ROOT,
+        "PFS_TINKER_PATH": MINT_CODE_ROOT,
         "PFS_HF_MODULES_PATH": PFS_HF_MODULES_PATH,
         "RAY_ADDRESS": ray_address,
     }
@@ -342,8 +350,8 @@ def preferred_vllm_python_executable() -> str | None:
         if not Path(explicit).exists():
             raise RuntimeError(f"MINT_VLLM_CHILD_PYTHON_EXECUTABLE does not exist: {explicit}")
         return worker_visible
-    if PFS_TINKER_PATH:
-        candidate = Path(PFS_TINKER_PATH) / "scripts" / "vllm_worker_python.py"
+    if MINT_CODE_ROOT:
+        candidate = Path(MINT_CODE_ROOT) / "scripts" / "vllm_worker_python.py"
         if candidate.exists():
             return _worker_visible_py_executable(str(candidate))
     return _worker_visible_py_executable(_env_nonempty(os.environ, "MINT_VLLM_CHILD_PYTHON_EXECUTABLE"))
