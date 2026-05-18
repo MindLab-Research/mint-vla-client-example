@@ -18,6 +18,7 @@ This reference is split by topic for faster lookup. Start here, then open the re
 - Authentication and model access: `auth-access.md`
 - Dependency architecture (runtime env root, image boundary, host bootstrap): `dependency-architecture.md`
 - Runtime configuration and ConfigActor: `runtime-config.md`
+- Topology-aware supervision and node metrics DaemonSet: `topology-daemon-metrics.md`
 - Usage billing storage (JSONL -> async PostgreSQL): `usage-billing-storage.md`
 - Design constraints and change checklist: `constraints-checklist.md`
 - VLA user-facing API guide: `vla_tinker_api_guide.md`

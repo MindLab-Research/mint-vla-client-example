@@ -38,7 +38,8 @@ Contract:
 - Internal routes may expose implementation details such as Ray actor names, replica queues, placement state, and task indexes.
 
 Current categories:
-- Health and observability: `/internal/health`, `/internal/healthz/deep`, `/internal/metrics`, `/internal/admission_stats`.
+- Health and observability: `/internal/health`, `/internal/healthz/deep`, `/internal/admission_stats`.
+- Optional debug metrics: `/internal/metrics` when explicitly enabled; the default metrics path is OTel push from node collectors, not Prometheus scraping.
 - Scheduler state: `/internal/model_work_scheduler`, `/internal/model_work_scheduler/debug_state`, `/internal/debug/scheduler_decisions`, `/internal/model_work_scheduler/noop`.
 - Runtime desired state: `/internal/model_actor_supervisor`.
 - Ray cluster diagnostics: `/internal/ray_cluster_health`, `/internal/ray_gcs_metrics`.

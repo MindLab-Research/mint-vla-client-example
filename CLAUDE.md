@@ -152,7 +152,7 @@ Internal operational endpoints are under `/internal`, not `/api/v1`:
 |----------|--------|---------|
 | `/internal/actors` | GET | List ModelActorSupervisor inventory |
 | `/internal/actors/kill` | POST | Admin actor cleanup |
-| `/internal/metrics` | GET | Internal metrics text |
+| `/internal/metrics` | GET | Optional authenticated debug metrics text; disabled by default |
 | `/internal/admission_stats` | GET | Control-plane stats snapshot |
 
 ## Cookbook Tests (Development)
