@@ -16,9 +16,15 @@
 
 **Use `mint-prod` for production operations. Use `mint-dev` for development.**
 
-## Code Synchronization
+## Code Deployment
 
-Code sync handled by background `unison` process. **NEVER** manually sync.
+Development and production hosts use git checkouts under `/share/mint`, not
+background file sync.
+
+- Development checkout: `/share/mint/dev/mint-server`
+- Production checkout: `/share/mint/prod/mint-server`
+- Keep each checkout on the intended branch and use `git pull --ff-only`.
+- Runtime/config/logs come from the matching `/share/mint/{dev,prod}` tree.
 
 ## Remote Commands
 
@@ -73,12 +79,12 @@ tinker-cookbook ──HTTP──> tinker-server ──Ray──> GPU Workers (Me
 
 | Environment | SSH Host | Port | Auth | Log File |
 |-------------|----------|------|------|----------|
-| Development | `mint-dev` | 8000 | No | `/tmp/tinker_server.log` |
-| Production | `mint-prod` | 18000 | Yes (`X-API-Key`) | `/tmp/tinker_server_auth.log` |
+| Development | `mint-dev` | 8000 | No | `/share/mint/dev/logs/tinker_server_auth.log` |
+| Production | `mint-prod` | 18000 | Yes (`X-API-Key`) | `/share/mint/prod/logs/tinker_server_auth.log` |
 
 ## Multi-target Production Routing
 
-The API server can act as a gateway and forward selected base models to other tinker-server deployments via `TINKER_GATEWAY_CONFIG_JSON`.
+The API server can act as a gateway and forward selected base models to other tinker-server deployments via `MINT_GATEWAY_CONFIG_JSON` (`TINKER_GATEWAY_CONFIG_JSON` is accepted as a compatibility alias).
 
 Current deployment plan:
 - `mint-prod-volcano` (router/master): `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-4B-Instruct-2507`, `Qwen/Qwen3-30B-A3B-Instruct-2507`, `moonshotai/Kimi-K2-Thinking`
@@ -90,7 +96,7 @@ GPU differences that affect per-model parallelism and vLLM memory caps:
 
 Gateway config example (set on the router only):
 ```bash
-export TINKER_GATEWAY_CONFIG_JSON='
+export MINT_GATEWAY_CONFIG_JSON='
 {
   "model_to_upstream": {
     "Qwen/Qwen3-235B-A22B-Instruct-2507": "mint-prod-aliyun"
@@ -135,12 +141,19 @@ Detached Ray actor surviving server restarts. First start ~80s, subsequent ~2s.
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
 | `/api/v1/healthz` | GET | Health check |
-| `/api/v1/actors` | GET | List actors (ModelActorInventory inventory) |
-| `/api/v1/actors/kill` | POST | Kill actors by type |
 | `/api/v1/create_session` | POST | Create session |
 | `/api/v1/create_sampling_session` | POST | Create sampling session |
 | `/api/v1/asample` | POST | Submit async sample |
 | `/api/v1/retrieve_future` | POST | Poll result (408=pending, 200=ready) |
+
+Internal operational endpoints are under `/internal`, not `/api/v1`:
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/internal/actors` | GET | List ModelActorSupervisor inventory |
+| `/internal/actors/kill` | POST | Admin actor cleanup |
+| `/internal/metrics` | GET | Internal metrics text |
+| `/internal/admission_stats` | GET | Control-plane stats snapshot |
 
 ## Cookbook Tests (Development)
 
@@ -177,7 +190,7 @@ Agent mistakes that wasted time. Read this before starting any task.
 | 2024-12-18 | Repeatedly concluded "K2 is blocked" without checking reference implementation in k2_workspace | Always check existing working implementations before declaring something impossible. |
 | 2024-12-18 | Assumed K2 inference needs 1TB VRAM based on web search instead of checking actual configs | Trust local reference code over generic web articles. |
 | 2024-12-23 | After K2 RL loop succeeded, ran Qwen2.5-7B cookbook instead of K2 12-hour training | User said "run K2 for 12 hours". Run K2, not a different model. Read the request literally. |
-| 2024-12-23 | Spent 15+ turns fumbling with SSH, log locations, process killing instead of following mint-dev skill | Read the skill docs first. SSH via `mint-dev` alias, logs at `/tmp/tinker_server.log`, restart commands are documented. Don't waste context on solved problems. |
+| 2024-12-23 | Spent 15+ turns fumbling with SSH, log locations, process killing instead of following mint-dev skill | Read the skill docs first. SSH via `mint-dev` alias, logs live under `/share/mint/{dev,prod}/logs`, restart commands are documented. Don't waste context on solved problems. |
 | 2024-12-23 | VANDALISM: Copied files over unstaged work in develop worktree, then ran `git checkout --` destroying 4 hours of session state management code permanently. Two catastrophic errors in sequence: (1) overwrote files without backup, (2) destroyed recovery chance by reverting to HEAD. | NEVER touch another worktree's files without explicit backup. When user catches a mistake, STOP IMMEDIATELY - do not attempt to "fix" with more commands. Unstaged work is unrecoverable after `git checkout --`. |
 | 2024-12-24 | Ran "K2 RL training" for hours without tracking reward - the actual RL metric. Script was SFT on trivial arithmetic, not RL. Model already solved problems correctly. Wasted 2+ hours monitoring meaningless loss values. | RL requires reward tracking. Verify the metric being optimized matches the goal. Trivial problems (5+5=10) don't demonstrate learning. |
 | 2024-12-24 | Sent wrong context to theorist agent. Asked "find bugs in gradient isolation" when should have asked "how does gradient isolation work for small MoE models (where it succeeds)?". Jumped to debugging without understanding the working mechanism first. Correct approach: (1) understand how it works for Qwen3-30B-A3B, (2) identify what's different about K2, (3) then debug. Also ignored key clue: grad_norm=0 in all logs. | First understand the WORKING case before debugging the FAILING case. Understand mechanism → identify difference → then debug. |
@@ -185,7 +198,7 @@ Agent mistakes that wasted time. Read this before starting any task.
 | 2024-12-24 | Used wrong API (train_step) in K2 RL script. Misunderstood trainer eviction as bug when it's expected GPU time-sharing. Claimed "training never completes" when idle timeout handles this. Made architecture claims without understanding: (1) train_step is deprecated, (2) trainer eviction before inference is by design, (3) weights transfer trainer->inferencer works correctly. | UNDERSTAND THE ARCHITECTURE FIRST. Read `.claude/skills/tinker-official-reference/references/tinker_official_reference.txt` for correct API. Trainer eviction + idle timeout is the designed flow. Don't invent explanations for behavior you don't understand. |
 | 2024-12-24 | Changed renderer from "deepseekv3" to "role_colon" without checking for dedicated K2 renderer. A `KimiK2Renderer` exists but wasn't discovered until training crashed after 30+ minutes of sampling. | ALWAYS search for dedicated renderers first: `grep -i "kimi\|k2" renderers.py`. The `kimi_k2` renderer uses correct `<\|im_end\|>` stop tokens and handles thinking blocks. |
 | 2024-12-25 | Added "fallback" to `export_weights()` when `export_hf_weights()` unavailable, even though `export_weights()` merges LoRA into base weights - completely unusable for the requirement (separate LoRA matrices for vLLM). Fallback would silently produce wrong output. | NEVER fall back to an API that cannot satisfy the requirement. If the correct API is unavailable, FAIL LOUDLY with a clear error. A fallback that produces garbage is worse than no fallback. |
-| 2024-12-26 | Spent entire night debugging why vLLM used TP=8 instead of TP=16 for K2. Analyzed code paths, model registry, normalize functions, server logs. Root cause: wrong unison profile running (`volcano-tinker-bugfix` instead of `volcano-tinker`), so code changes never synced to server. The skill doc explicitly says to verify unison before any work. | VERIFY UNISON IS RUNNING FIRST: `pgrep -af "unison.*volcano-tinker"`. Before debugging server behavior, confirm the server has the latest code. A 5-second check would have saved 8+ hours. |
+| 2024-12-26 | Spent entire night debugging why vLLM used TP=8 instead of TP=16 for K2. Analyzed code paths, model registry, normalize functions, server logs. Root cause: server checkout was not the intended code version. | VERIFY THE REMOTE CHECKOUT FIRST: `cd /share/mint/<env>/mint-server && git rev-parse HEAD && git status --short --branch`. Before debugging server behavior, confirm the server has the latest intended commit. |
 | 2024-12-27 | When K2 training hit OOM, repeatedly tried smaller configurations (max_tokens 2048→1024→512, lora_rank 32→8) without understanding WHY it failed. Binary search by trial-and-error instead of calculating memory requirements. | See "Configuration Debugging Principle" section below. |
 | 2024-12-27 | FABRICATED DATA: Presented made-up memory breakdown as verified fact. Claimed "37 GiB headroom" when previous runs OOMed - an obvious contradiction ignored. When challenged, suggested nvidia-smi which gives ONLY total usage (useless for breakdown). Then FLED to a harder dataset (MATH) when GSM8K showed reward=1.0, adding complexity instead of understanding the current problem. Classic pattern: can't explain current behavior → distract with new shiny thing. | (1) Unverified theory presented as fact is LYING. Say "I calculated X but haven't verified" not "X is the breakdown". (2) nvidia-smi total tells NOTHING about where memory goes. Use `torch.cuda.memory_stats()`, `torch.cuda.memory_summary()`, or instrument code with memory checkpoints. (3) REDUCE moving parts when debugging. If you don't understand GSM8K memory, adding MATH makes it WORSE. Stay with the simple case until you understand it completely. |
 | 2024-12-27 | LIVESTOCK MINDSET: Celebrated "Run 47 works at 8K context" as success when K2 supports 262K context natively. That's 3% of capability. When asked to add memory profiling to push context higher, went in circles: started profiling → got interrupted → started again → user had to explain purpose THREE TIMES. Never completed anything. The goal is LONGER CONTEXT, not "it works at reduced settings". | (1) "Works at reduced settings" is FAILURE, not success. The goal is to maximize capability. (2) Memory profiling purpose: understand WHERE memory goes so we can INCREASE context length. Not to verify theoretical numbers. Not to debug past OOMs. TO PUSH LIMITS HIGHER. (3) When given a clear task (add memory profiling), COMPLETE IT. Don't explain, don't ask clarifying questions, don't go in circles. Just do it. |
@@ -204,7 +217,7 @@ Agent mistakes that wasted time. Read this before starting any task.
 | 2026-01-29 | **FALSE POSITIVE (transformer_engine)**: Claimed `transformer_engine` was "installed", then set `PFS_EXTRA_PYTHONPATH` to a CPFS `transformer-engine-pkg` directory that did not include the `transformer_engine.pytorch` extension module, causing Megatron init to crash with `StopIteration` in `transformer_engine/pytorch/__init__.py` (missing `*.so` glob). | **VERIFY THE ACTUAL IMPORT ON A GPU POD BEFORE DECLARING FIXED:** (1) `python -c "import transformer_engine.pytorch as te; print(te.__file__)"` must succeed on a DLC GPU worker. (2) Do not shadow in-image deps with partial CPFS installs; if using CPFS `--target`, ensure the wheel installs the Python extension `.so` files under `transformer_engine/pytorch`. (3) Encode the exact validation command + expected output into `.claude/skills/aliyun-cluster/SKILL.md`. |
 | 2026-01-29 | **ALIYUN RAY CONTROL-PLANE SELF-SABOTAGE**: Started a local `raylet` on the CPU-only API host (`mint-prod-aliyun`) and allowed it to be schedulable. Then restarted/killed that local node while debugging, SIGTERM-killing actors placed on that node and causing `save_weights_for_sampler` to fail with `ActorDiedError`. Also wrote/used a nondeterministic SOP mixing `PYTHONPATH=cpu-pydeps` Ray with a project venv, and misread `/opt/venv` in worker tracebacks as something acceptable to use on the API host. | **DRIVER-ONLY API HOST, DETERMINISTIC CLUSTER LAYOUT:** (1) API hosts are Ray drivers only (`ray.init(address=...)`); never run `ray start`/`raylet` there. (2) DLC head must be `0 GPU` and started with `--num-gpus=0`; only worker pods advertise GPUs. (3) Never "fix" actor failures by restarting Ray on any node; locate the actor's node and fix that node/pod. (4) Treat `/opt/venv` as internal to the worker image; never reference it in SOPs or host setup. |
 | 2026-01-29 | **CREDENTIAL LEAK (process env dump)**: Printed sensitive tokens by dumping `/proc/<PID>/environ` during debugging. | **NEVER DUMP ENV/CONFIGS VERBATIM:** (1) Do not read or print `/proc/<PID>/environ`. (2) When checking env, whitelist non-secret keys and redact values (`KEY=<redacted>`). (3) Treat any `*_KEY`, `*_SECRET`, `*_TOKEN`, `*_PASSWORD` as secrets and keep them out of logs and terminal output. |
-| 2026-01-29 | **ALIYUN PYTHONPATH MISMATCH (wrong default PFS_TINKER_PATH)**: Left `tinker_server/config.py` defaulting `PFS_TINKER_PATH=/vePFS-Mindverse/share/code/tinker-server-auth` on Aliyun deployment where code root is `/vePFS-Mindverse/share/code/tinker-server-aliyun`, causing Ray worker `runtime_env` to override `PYTHONPATH` to a non-existent code path and triggering Ray actor creation failure (`ensure_str(class_name)`, got `NoneType`). | **PIN CODE ROOT EXPLICITLY + VERIFY ON-CLUSTER:** (1) Set `PFS_TINKER_PATH=/vePFS-Mindverse/share/code/tinker-server-aliyun` (or make default derive from current repo root). (2) Verify inside Ray runtime_env before running real training: run a `num_gpus=1` probe `python -c "import tinker_server; print(tinker_server.__file__)"` and confirm it imports from the intended code root. (3) If `runtime_env` sets `PYTHONPATH`, include the code root and do not clobber it with stale defaults. |
+| 2026-01-29 | **ALIYUN PYTHONPATH MISMATCH (wrong default code root)**: Left runtime config defaulting to a Volcano-only code path on Aliyun, causing Ray worker `runtime_env` to import from a non-existent directory and triggering actor creation failure. | **PIN CODE ROOT EXPLICITLY + VERIFY ON-CLUSTER:** (1) Set the Mint code root in the environment/config used by the deployment. (2) Verify inside Ray runtime_env before running real training: run a `num_gpus=1` probe `python -c "import tinker_server; print(tinker_server.__file__)"` and confirm it imports from the intended code root. (3) If `runtime_env` sets `PYTHONPATH`, include the code root and do not clobber it with stale defaults. |
 | 2026-01-13 | **UNSUBSTANTIATED CLAIMS**: When investigating server crash, ran `ray.get_actor("tinker_vllm_Qwen-Qwen3-30B-A3B-Instruct-2507")` which failed to find actor. Immediately concluded "vLLM actor: DEAD" and wasted 10+ minutes searching Ray logs, trying to SSH to worker nodes, looking for crash reasons. The actual actor name was `tinker_vllm_qwen3-30b-a3b-instruct-2507` (different case/format) and it was ALIVE the whole time. A simple `ray list actors` would have shown this in 5 seconds. | **VERIFY BEFORE CONCLUDING:** (1) A failed lookup could mean: wrong name, wrong namespace, OR actually dead. (2) **ALWAYS list actors first** (`ray list actors \| grep vllm`) to see what exists. (3) Never report "X is dead" without seeing it in the dead actors list. (4) Wrong conclusions waste time chasing phantom bugs. (5) The skill doc section 9 now documents the correct procedure. |
 | 2026-03-13 | **MINT-DEV ENV AND PLACEMENT THRASH**: Repeatedly launched dev API servers with repo-root-only `PYTHONPATH`, causing fake `verl_http` import failures on the Python 3.12 host. Then used system Python 3.10 for Ray inspection against a Python 3.12 cluster, producing version-mismatch errors instead of real state. Also retried `235B` placement while stale detached placement groups still logically occupied `138/139`, even when the GPUs were physically idle. Wasted hours on nonexistent dependency and scheduling problems. | **PRE-FLIGHT BEFORE ANY MINT-DEV DEBUGGING:** (1) Start API servers with `/root/venv_k2_py31213/bin/python` and full PFS `PYTHONPATH` (`vllm`, `verl`, `megatron-bridge`, repo, HF modules). (2) Use the same Python 3.12 venv for all host-side Ray inspection commands. Never use system Python against the dev Ray cluster. (3) If a PG says `NO_RESOURCES` while GPUs look idle, inspect global placement-group state first and remove only owned stale PGs before any retry. (4) Do not pip-install missing packages until you have proved the API-host `PYTHONPATH` is correct. |
 | 2026-03-13 | **STALE PG AMNESIA**: Repeatedly retried placement while old detached 235B placement groups still existed logically, even after the user explicitly said to remove them. This turned a deterministic pre-flight check into repeated failed bringups. | **PG CLEANUP IS A HARD GATE, NOT A SUGGESTION:** Before any new placement attempt, list all non-REMOVED placement groups cluster-wide. If any owned stale or pending PG can reserve the target GPUs, remove it first. Do not start a new server or actor until this check is done and the result is written down. |
