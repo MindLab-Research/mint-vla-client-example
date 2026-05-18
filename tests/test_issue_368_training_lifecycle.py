@@ -127,7 +127,7 @@ async def test_issue_368_cleanup_stale_training_sessions(monkeypatch: pytest.Mon
         return ["req-stale"]
 
     monkeypatch.setattr(
-        training_routes.task_state_futures,
+        training_routes.task_futures,
         "async_fail_training_requests_for_model",
         _async_fail_training_requests_for_model,
     )
@@ -174,7 +174,7 @@ async def test_issue_368_cleanup_can_restore_session_before_shutdown(monkeypatch
         return []
 
     monkeypatch.setattr(
-        training_routes.task_state_futures,
+        training_routes.task_futures,
         "async_fail_training_requests_for_model",
         _async_fail_training_requests_for_model,
     )
@@ -221,7 +221,7 @@ async def test_issue_368_cleanup_aborts_if_future_fail_path_errors(monkeypatch: 
         raise RuntimeError("future-store-down")
 
     monkeypatch.setattr(
-        training_routes.task_state_futures,
+        training_routes.task_futures,
         "async_fail_training_requests_for_model",
         _async_fail_training_requests_for_model,
     )
@@ -270,7 +270,7 @@ async def test_issue_368_cleanup_skips_shared_actor_shutdown_after_restore(
         return []
 
     monkeypatch.setattr(
-        training_routes.task_state_futures,
+        training_routes.task_futures,
         "async_fail_training_requests_for_model",
         _async_fail_training_requests_for_model,
     )

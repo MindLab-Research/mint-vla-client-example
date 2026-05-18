@@ -8,7 +8,7 @@ Runtime configuration is split by when the value must be available:
 2. **Actor creation inputs**: required by Ray at `.options(...).remote(...)` time.
 3. **ConfigActor actor_env**: namespace-local deployment/runtime config that actor processes hydrate from ConfigActor during import.
 4. **Observability config**: OTEL/APM/logging values. These are distributed through ConfigActor actor_env for actor hydration.
-5. **Task state**: task/lease/result state is not configuration. Durable task/result state belongs in TaskStateStore; hot scheduling state belongs in ModelWorkScheduler. TaskStateFutures is only the route-facing facade.
+5. **Task state**: task/lease/result state is not configuration. Durable task/result state belongs in TaskStateStore; hot scheduling state belongs in ModelWorkScheduler. TaskFutureService is only the route-facing facade.
 
 `ConfigActor` is a namespace-local detached actor. Namespace is the deployment isolation boundary, so the production actor name is stable inside the namespace and does not contain a run id.
 

@@ -15,7 +15,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request, Response
 
 from ..auth_identity import can_view_internal_errors
-from ..backend.task_state_store import FutureStatus, TaskStateStoreUnavailableError, task_state_futures
+from ..backend.task_state_store import FutureStatus, TaskStateStoreUnavailableError, task_futures
 from ..futures_utils import pending_future_http_response
 from ..models.types import FutureRetrieveRequest
 
@@ -368,7 +368,7 @@ async def retrieve_future(
         return _apply_cached_response(cached, response)
 
     try:
-        status = await task_state_futures.async_get_status(body.request_id)
+        status = await task_futures.async_get_status(body.request_id)
     except TaskStateStoreUnavailableError:
         raise HTTPException(status_code=503, detail="TaskStateStore unavailable")
     except KeyError:
@@ -384,7 +384,7 @@ async def retrieve_future(
             detail = {
                 "error": detail,
                 "request_id": body.request_id,
-                "task_state_store": await task_state_futures.async_debug_snapshot(),
+                "task_state_store": await task_futures.async_debug_snapshot(),
             }
         raise HTTPException(status_code=404, detail=detail)
 
@@ -393,14 +393,14 @@ async def retrieve_future(
         if task_state_payload is not None:
             _pending_hint_clear(body.request_id)
             try:
-                await task_state_futures.async_cleanup(body.request_id)
+                await task_futures.async_cleanup(body.request_id)
             except Exception:
                 pass
             logger.info("[retrieve_future] request_id=%s task_state_store_terminal_hit=true", body.request_id)
             return task_state_payload
         meta = None
         try:
-            meta = await task_state_futures.async_get_meta(body.request_id)
+            meta = await task_futures.async_get_meta(body.request_id)
         except Exception:
             meta = None
         if isinstance(meta, dict):
@@ -557,11 +557,11 @@ async def retrieve_future(
 
                 contains = await model_work_scheduler.contains_request(request_id=body.request_id)
                 if not bool(contains.get("present")):
-                    await task_state_futures.async_fail(
+                    await task_futures.async_fail(
                         body.request_id,
                         "model work scheduler recovered without this request; request must be retried",
                     )
-                    error = await task_state_futures.async_get_error(body.request_id)
+                    error = await task_futures.async_get_error(body.request_id)
                     payload = _failed_payload(error, http_request)
                     _recent_put(body.request_id, payload, ttl_s=_local_hot_ttl_s())
                     logger.warning(
@@ -711,14 +711,14 @@ async def retrieve_future(
             logger.info("[retrieve_future] request_id=%s status=retrieved served=task_state_store", body.request_id)
             return task_state_payload
         try:
-            result = await task_state_futures.async_get_result(body.request_id)
+            result = await task_futures.async_get_result(body.request_id)
         except Exception:
             result = None
         if result is not None:
             _recent_put(body.request_id, result, ttl_s=_local_hot_ttl_s())
             logger.info("[retrieve_future] request_id=%s status=retrieved served=facade_result", body.request_id)
             return result
-        error = await task_state_futures.async_get_error(body.request_id)
+        error = await task_futures.async_get_error(body.request_id)
         if error is not None:
             payload = _failed_payload(error, http_request)
             _recent_put(body.request_id, payload, ttl_s=_local_hot_ttl_s())
@@ -728,22 +728,22 @@ async def retrieve_future(
         return {"error": "Future already retrieved", "category": "system"}
     elif status == FutureStatus.FAILED:
         _pending_hint_clear(body.request_id)
-        error = await task_state_futures.async_get_error(body.request_id)
+        error = await task_futures.async_get_error(body.request_id)
         payload = _failed_payload(error, http_request)
         _recent_put(body.request_id, payload, ttl_s=_local_hot_ttl_s())
         logger.info("[retrieve_future] request_id=%s status=failed", body.request_id)
         try:
-            await task_state_futures.async_cleanup(body.request_id)
+            await task_futures.async_cleanup(body.request_id)
         except Exception:
             pass
         return payload
     else:
         _pending_hint_clear(body.request_id)
-        result = await task_state_futures.async_get_result(body.request_id)
+        result = await task_futures.async_get_result(body.request_id)
         _recent_put(body.request_id, result, ttl_s=_local_hot_ttl_s())
         logger.info("[retrieve_future] request_id=%s status=done", body.request_id)
         try:
-            await task_state_futures.async_cleanup(body.request_id)
+            await task_futures.async_cleanup(body.request_id)
         except Exception:
             pass
         return result

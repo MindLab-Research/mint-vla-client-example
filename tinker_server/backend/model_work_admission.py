@@ -32,7 +32,7 @@ async def enqueue_model_work(
     assign_max_items: int | None = 1,
     create_future: bool = True,
     payload_hash: str | None = None,
-    task_state_futures_client: Any | None = None,
+    task_futures_client: Any | None = None,
     scheduler_client: Any | None = None,
     trace_enqueue: TraceEnqueue | None = None,
     trace_kwargs: dict[str, Any] | None = None,
@@ -48,10 +48,10 @@ async def enqueue_model_work(
         enqueue_extra["ordering_key"] = str(ordering_key)
 
     scheduler_confirmed = False
-    if task_state_futures_client is None:
-        from .task_state_store import task_state_futures as store
+    if task_futures_client is None:
+        from .task_state_store import task_futures as store
     else:
-        store = task_state_futures_client
+        store = task_futures_client
     if scheduler_client is None:
         from .model_work_scheduler import model_work_scheduler as scheduler
     else:

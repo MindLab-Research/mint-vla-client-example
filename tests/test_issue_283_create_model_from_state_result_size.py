@@ -72,7 +72,7 @@ def test_issue_283_create_model_from_state_queues_resolved_checkpoint_path_witho
         encoding="utf-8",
     )
 
-    class StubTaskStateFutures:
+    class StubTaskFutureService:
         async def async_create_with_id(self, request_id: str) -> None:
             return None
 
@@ -88,7 +88,7 @@ def test_issue_283_create_model_from_state_queues_resolved_checkpoint_path_witho
     monkeypatch.setattr(gateway_module, "get_gateway_config", lambda: None)
     monkeypatch.setattr(gateway_module, "remote_training_model", lambda model_id: None)
     monkeypatch.setattr(gateway_module, "upstream_for_model", lambda base_model: None)
-    monkeypatch.setattr(training_routes, "task_state_futures", StubTaskStateFutures())
+    monkeypatch.setattr(training_routes, "task_futures", StubTaskFutureService())
     monkeypatch.setattr(training_routes, "training_engine", object())
     monkeypatch.setattr(training_routes, "training_manager", object())
     monkeypatch.setattr(training_routes, "can_access_model", lambda base_model, user_data: True)
@@ -214,7 +214,7 @@ def test_issue_283_create_model_from_state_background_uses_resolved_path(tmp_pat
             _ = session
             return {}
 
-    class StubTaskStateFutures:
+    class StubTaskFutureService:
         def __init__(self) -> None:
             self.resolved: list[tuple[str, dict]] = []
 
@@ -228,7 +228,7 @@ def test_issue_283_create_model_from_state_background_uses_resolved_path(tmp_pat
             raise AssertionError(f"unexpected fail({request_id}): {error}")
 
     stub_engine = StubTrainingEngine()
-    stub_task_state_futures = StubTaskStateFutures()
+    stub_task_futures = StubTaskFutureService()
 
     import tinker_server.backend.session_index_store as session_index_store_module
     import tinker_server.backend.training_session_store as training_store_module
@@ -241,7 +241,7 @@ def test_issue_283_create_model_from_state_background_uses_resolved_path(tmp_pat
 
     monkeypatch.setattr(training_routes, "training_engine", stub_engine)
     monkeypatch.setattr(training_routes, "training_manager", StubTrainingManager())
-    monkeypatch.setattr(training_routes, "task_state_futures", stub_task_state_futures)
+    monkeypatch.setattr(training_routes, "task_futures", stub_task_futures)
     monkeypatch.setattr(training_store_module, "async_upsert_training_session", _async_upsert_training_session)
     monkeypatch.setattr(
         session_index_store_module,
@@ -265,7 +265,7 @@ def test_issue_283_create_model_from_state_background_uses_resolved_path(tmp_pat
     assert stub_engine.load_calls == [
         {"load_path": str(checkpoint_dir), "load_optimizer": True}
     ]
-    assert stub_task_state_futures.resolved == [
+    assert stub_task_futures.resolved == [
         ("req-283-bg", {"request_id": "req-283-bg", "model_id": "s283-bg_0", "type": "create_model_from_state"})
     ]
     assert training_store_updates[0]["model_id"] == "s283-bg_0"
@@ -314,7 +314,7 @@ def test_issue_417_create_model_from_state_persists_loaded_lora_config(
         async def shutdown_session(self, session) -> None:
             _ = session
 
-    class StubTaskStateFutures:
+    class StubTaskFutureService:
         def __init__(self) -> None:
             self.resolved: list[tuple[str, dict]] = []
 
@@ -334,7 +334,7 @@ def test_issue_417_create_model_from_state_persists_loaded_lora_config(
 
     monkeypatch.setattr(training_routes, "training_engine", StubTrainingEngine())
     monkeypatch.setattr(training_routes, "training_manager", manager)
-    monkeypatch.setattr(training_routes, "task_state_futures", StubTaskStateFutures())
+    monkeypatch.setattr(training_routes, "task_futures", StubTaskFutureService())
     monkeypatch.setattr(training_store_module, "async_upsert_training_session", _async_upsert_training_session)
     monkeypatch.setattr(
         session_index_store_module,
@@ -434,7 +434,7 @@ def test_issue_283_create_model_from_state_background_restores_openpi_training_c
                 )
             )
 
-    class StubTaskStateFutures:
+    class StubTaskFutureService:
         def __init__(self) -> None:
             self.resolved: list[tuple[str, dict]] = []
 
@@ -450,7 +450,7 @@ def test_issue_283_create_model_from_state_background_restores_openpi_training_c
     text_engine = _RecordingEngine("text")
     openpi_fast_engine = _RecordingEngine("openpi-fast")
     router = TrainingEngineRouter(text_engine=text_engine, openpi_fast_engine=openpi_fast_engine)
-    stub_task_state_futures = StubTaskStateFutures()
+    stub_task_futures = StubTaskFutureService()
     training_store_updates: list[dict] = []
 
     async def _async_upsert_training_session(info: dict) -> None:
@@ -458,7 +458,7 @@ def test_issue_283_create_model_from_state_background_restores_openpi_training_c
 
     monkeypatch.setattr(training_routes, "training_engine", router)
     monkeypatch.setattr(training_routes, "training_manager", StubTrainingManager())
-    monkeypatch.setattr(training_routes, "task_state_futures", stub_task_state_futures)
+    monkeypatch.setattr(training_routes, "task_futures", stub_task_futures)
     monkeypatch.setattr(training_store_module, "async_upsert_training_session", _async_upsert_training_session)
     monkeypatch.setattr(
         session_index_store_module,
@@ -489,7 +489,7 @@ def test_issue_283_create_model_from_state_background_restores_openpi_training_c
     ]
     assert text_engine.calls == []
     assert training_store_updates[0]["lora_config"] is None
-    assert stub_task_state_futures.resolved == [
+    assert stub_task_futures.resolved == [
         (
             "req-283-openpi",
             {
@@ -534,7 +534,7 @@ def test_issue_283_load_state_route_queues_resolved_path(tmp_path: Path, monkeyp
         encoding="utf-8",
     )
 
-    class StubTaskStateFutures:
+    class StubTaskFutureService:
         async def async_create_with_id(self, request_id: str) -> None:
             _ = request_id
 
@@ -570,7 +570,7 @@ def test_issue_283_load_state_route_queues_resolved_path(tmp_path: Path, monkeyp
     stub_queue = StubModelWorkScheduler()
 
     monkeypatch.setattr(scheduler_module, "model_work_scheduler", stub_queue)
-    monkeypatch.setattr(weights_routes, "task_state_futures", StubTaskStateFutures())
+    monkeypatch.setattr(weights_routes, "task_futures", StubTaskFutureService())
     monkeypatch.setattr(weights_routes, "training_engine", object())
     monkeypatch.setattr(weights_routes, "training_manager", StubTrainingManager())
     monkeypatch.setattr(training_routes, "_get_training_route_session_info", _get_training_route_session_info)
@@ -659,7 +659,7 @@ def test_issue_283_load_state_background_uses_resolved_path(tmp_path: Path, monk
         async def load_weights(self, session, load_path: str, load_optimizer: bool) -> None:
             self.load_calls.append({"load_path": load_path, "load_optimizer": load_optimizer})
 
-    class StubTaskStateFutures:
+    class StubTaskFutureService:
         def __init__(self) -> None:
             self.resolved: list[tuple[str, dict]] = []
 
@@ -670,7 +670,7 @@ def test_issue_283_load_state_background_uses_resolved_path(tmp_path: Path, monk
             raise AssertionError(f"unexpected fail({request_id}): {error}")
 
     stub_engine = StubTrainingEngine()
-    stub_task_state_futures = StubTaskStateFutures()
+    stub_task_futures = StubTaskFutureService()
     training_store_updates: list[dict] = []
 
     async def _async_upsert_training_session(info: dict) -> None:
@@ -678,7 +678,7 @@ def test_issue_283_load_state_background_uses_resolved_path(tmp_path: Path, monk
 
     monkeypatch.setattr(weights_routes, "training_engine", stub_engine)
     monkeypatch.setattr(weights_routes, "training_manager", StubTrainingManager())
-    monkeypatch.setattr(weights_routes, "task_state_futures", stub_task_state_futures)
+    monkeypatch.setattr(weights_routes, "task_futures", stub_task_futures)
     monkeypatch.setattr(
         training_store_module,
         "async_upsert_training_session",
@@ -692,7 +692,7 @@ def test_issue_283_load_state_background_uses_resolved_path(tmp_path: Path, monk
     assert stub_engine.load_calls == [
         {"load_path": str(checkpoint_dir), "load_optimizer": True}
     ]
-    assert stub_task_state_futures.resolved == [
+    assert stub_task_futures.resolved == [
         ("req-283-load", {"path": str(checkpoint_dir), "type": "load_weights"})
     ]
     assert training_store_updates[0]["model_id"] == "model-283"
@@ -762,7 +762,7 @@ def test_issue_417_load_state_persists_loaded_lora_config(tmp_path: Path, monkey
                 train_unembed=False,
             )
 
-    class StubTaskStateFutures:
+    class StubTaskFutureService:
         def __init__(self) -> None:
             self.resolved: list[tuple[str, dict]] = []
 
@@ -773,7 +773,7 @@ def test_issue_417_load_state_persists_loaded_lora_config(tmp_path: Path, monkey
             raise AssertionError(f"unexpected fail({request_id}): {error}")
 
     training_manager = StubTrainingManager()
-    task_state_futures = StubTaskStateFutures()
+    task_futures = StubTaskFutureService()
     training_store_updates: list[dict] = []
 
     async def _async_upsert_training_session(info: dict) -> None:
@@ -781,13 +781,13 @@ def test_issue_417_load_state_persists_loaded_lora_config(tmp_path: Path, monkey
 
     monkeypatch.setattr(weights_routes, "training_engine", StubTrainingEngine())
     monkeypatch.setattr(weights_routes, "training_manager", training_manager)
-    monkeypatch.setattr(weights_routes, "task_state_futures", task_state_futures)
+    monkeypatch.setattr(weights_routes, "task_futures", task_futures)
     monkeypatch.setattr(training_store_module, "async_upsert_training_session", _async_upsert_training_session)
 
     req = LoadStateRequest(model_id="model-417", path=str(checkpoint_dir), optimizer=False)
     asyncio.run(weights_routes._do_load_state("req-417-load", req, user_id="admin-user"))
 
-    assert task_state_futures.resolved == [
+    assert task_futures.resolved == [
         ("req-417-load", {"path": str(checkpoint_dir), "type": "load_weights"})
     ]
     assert training_manager.persisted == ["model-417"]
@@ -889,7 +889,7 @@ def test_issue_417_load_state_reports_success_when_metadata_persist_fails_after_
             session.learning_rate = 9e-5
             session.lora_config = LoRAConfig(rank=16, train_attn=False, train_mlp=True, train_unembed=False)
 
-    class StubTaskStateFutures:
+    class StubTaskFutureService:
         def __init__(self) -> None:
             self.resolved: list[tuple[str, dict]] = []
             self.failed: list[tuple[str, str]] = []
@@ -904,17 +904,17 @@ def test_issue_417_load_state_reports_success_when_metadata_persist_fails_after_
         _ = info
         raise RuntimeError("detached store unavailable")
 
-    task_state_futures = StubTaskStateFutures()
+    task_futures = StubTaskFutureService()
     monkeypatch.setattr(weights_routes, "training_engine", StubTrainingEngine())
     monkeypatch.setattr(weights_routes, "training_manager", StubTrainingManager())
-    monkeypatch.setattr(weights_routes, "task_state_futures", task_state_futures)
+    monkeypatch.setattr(weights_routes, "task_futures", task_futures)
     monkeypatch.setattr(training_store_module, "async_upsert_training_session", _async_upsert_training_session)
 
     req = LoadStateRequest(model_id="model-417-persist-fail", path=str(checkpoint_dir), optimizer=True)
     asyncio.run(weights_routes._do_load_state("req-417-persist-fail", req, user_id="user-417"))
 
-    assert task_state_futures.failed == []
-    assert task_state_futures.resolved == [
+    assert task_futures.failed == []
+    assert task_futures.resolved == [
         (
             "req-417-persist-fail",
             {
@@ -936,7 +936,7 @@ def test_issue_283_save_routes_use_detached_training_info_without_route_runtime(
     from tinker_server.routes import weights as weights_routes
     import tinker_server.backend.model_work_scheduler as scheduler_module
 
-    class StubTaskStateFutures:
+    class StubTaskFutureService:
         async def async_create_with_id(self, request_id: str) -> None:
             _ = request_id
 
@@ -959,7 +959,7 @@ def test_issue_283_save_routes_use_detached_training_info_without_route_runtime(
     stub_queue = StubModelWorkScheduler()
 
     monkeypatch.setattr(scheduler_module, "model_work_scheduler", stub_queue)
-    monkeypatch.setattr(weights_routes, "task_state_futures", StubTaskStateFutures())
+    monkeypatch.setattr(weights_routes, "task_futures", StubTaskFutureService())
     monkeypatch.setattr(weights_routes, "training_engine", None)
     monkeypatch.setattr(weights_routes, "training_manager", None)
     monkeypatch.setattr(training_routes, "_get_training_route_session_info", _get_training_route_session_info)
@@ -1013,7 +1013,7 @@ def test_issue_283_load_state_route_uses_detached_training_info_without_route_ru
         encoding="utf-8",
     )
 
-    class StubTaskStateFutures:
+    class StubTaskFutureService:
         async def async_create_with_id(self, request_id: str) -> None:
             _ = request_id
 
@@ -1036,7 +1036,7 @@ def test_issue_283_load_state_route_uses_detached_training_info_without_route_ru
     stub_queue = StubModelWorkScheduler()
 
     monkeypatch.setattr(scheduler_module, "model_work_scheduler", stub_queue)
-    monkeypatch.setattr(weights_routes, "task_state_futures", StubTaskStateFutures())
+    monkeypatch.setattr(weights_routes, "task_futures", StubTaskFutureService())
     monkeypatch.setattr(weights_routes, "training_engine", None)
     monkeypatch.setattr(weights_routes, "training_manager", None)
     monkeypatch.setattr(training_routes, "_get_training_route_session_info", _get_training_route_session_info)
@@ -1069,7 +1069,7 @@ def test_issue_283_save_routes_restore_inflight_protection(monkeypatch) -> None:
     from tinker_server.routes import weights as weights_routes
     import tinker_server.backend.model_work_scheduler as scheduler_module
 
-    class StubTaskStateFutures:
+    class StubTaskFutureService:
         async def async_create_with_id(self, request_id: str) -> None:
             _ = request_id
 
@@ -1100,7 +1100,7 @@ def test_issue_283_save_routes_restore_inflight_protection(monkeypatch) -> None:
     stub_queue = StubModelWorkScheduler()
 
     monkeypatch.setattr(scheduler_module, "model_work_scheduler", stub_queue)
-    monkeypatch.setattr(weights_routes, "task_state_futures", StubTaskStateFutures())
+    monkeypatch.setattr(weights_routes, "task_futures", StubTaskFutureService())
     monkeypatch.setattr(weights_routes, "training_engine", None)
     monkeypatch.setattr(weights_routes, "training_manager", manager)
     monkeypatch.setattr(training_routes, "_get_training_route_session_info", _get_training_route_session_info)
@@ -1153,7 +1153,7 @@ def test_issue_283_load_state_route_restores_inflight_protection(tmp_path: Path,
         encoding="utf-8",
     )
 
-    class StubTaskStateFutures:
+    class StubTaskFutureService:
         async def async_create_with_id(self, request_id: str) -> None:
             _ = request_id
 
@@ -1184,7 +1184,7 @@ def test_issue_283_load_state_route_restores_inflight_protection(tmp_path: Path,
     stub_queue = StubModelWorkScheduler()
 
     monkeypatch.setattr(scheduler_module, "model_work_scheduler", stub_queue)
-    monkeypatch.setattr(weights_routes, "task_state_futures", StubTaskStateFutures())
+    monkeypatch.setattr(weights_routes, "task_futures", StubTaskFutureService())
     monkeypatch.setattr(weights_routes, "training_engine", None)
     monkeypatch.setattr(weights_routes, "training_manager", manager)
     monkeypatch.setattr(training_routes, "_get_training_route_session_info", _get_training_route_session_info)
@@ -1247,7 +1247,7 @@ def test_issue_283_save_routes_refresh_detached_enqueue_protection(monkeypatch) 
     from tinker_server.routes import weights as weights_routes
     import tinker_server.backend.model_work_scheduler as scheduler_module
 
-    class StubTaskStateFutures:
+    class StubTaskFutureService:
         async def async_create_with_id(self, request_id: str) -> None:
             _ = request_id
 
@@ -1276,7 +1276,7 @@ def test_issue_283_save_routes_refresh_detached_enqueue_protection(monkeypatch) 
     stub_queue = StubModelWorkScheduler()
 
     monkeypatch.setattr(scheduler_module, "model_work_scheduler", stub_queue)
-    monkeypatch.setattr(weights_routes, "task_state_futures", StubTaskStateFutures())
+    monkeypatch.setattr(weights_routes, "task_futures", StubTaskFutureService())
     monkeypatch.setattr(weights_routes, "training_engine", None)
     monkeypatch.setattr(weights_routes, "training_manager", None)
     monkeypatch.setattr(weights_routes, "_protect_training_session_enqueue_window", _protect_training_session_enqueue_window)
@@ -1329,7 +1329,7 @@ def test_issue_283_load_state_route_refreshes_detached_enqueue_protection(tmp_pa
         encoding="utf-8",
     )
 
-    class StubTaskStateFutures:
+    class StubTaskFutureService:
         async def async_create_with_id(self, request_id: str) -> None:
             _ = request_id
 
@@ -1358,7 +1358,7 @@ def test_issue_283_load_state_route_refreshes_detached_enqueue_protection(tmp_pa
     stub_queue = StubModelWorkScheduler()
 
     monkeypatch.setattr(scheduler_module, "model_work_scheduler", stub_queue)
-    monkeypatch.setattr(weights_routes, "task_state_futures", StubTaskStateFutures())
+    monkeypatch.setattr(weights_routes, "task_futures", StubTaskFutureService())
     monkeypatch.setattr(weights_routes, "training_engine", None)
     monkeypatch.setattr(weights_routes, "training_manager", None)
     monkeypatch.setattr(weights_routes, "_protect_training_session_enqueue_window", _protect_training_session_enqueue_window)

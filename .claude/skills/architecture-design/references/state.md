@@ -24,7 +24,7 @@ This project has multiple identifiers that look similar but have different owner
   - In gateway mode, upstream routing metadata for remote sampling sessions is mirrored into the detached gateway-session store.
 
 - `request_id`
-  - Created through the `TaskStateFutures` facade and returned by endpoints that run async work in the background.
+  - Created through the `TaskFutureService` facade and returned by endpoints that run async work in the background.
   - Polled via `POST /api/v1/retrieve_future` (Tinker polling protocol).
   - Stored in detached `TaskStateStore`, not in API-process memory. Terminal replay also uses this same task record plus `TaskPayloadStore`; there is no second future index.
 

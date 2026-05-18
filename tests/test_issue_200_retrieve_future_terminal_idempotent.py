@@ -6,7 +6,7 @@ from tinker_server.models.types import FutureRetrieveRequest
 from tinker_server.routes import futures as futures_route
 
 
-class _StubTaskStateFutures:
+class _StubTaskFutureService:
     _UNSET = object()
 
     def __init__(self, status: FutureStatus, *, result=_UNSET, error=_UNSET, meta=None):
@@ -41,8 +41,8 @@ def _response_stub():
 
 
 def test_done_retrieve_does_not_evict_terminal_future(monkeypatch):
-    stub = _StubTaskStateFutures(FutureStatus.DONE, result={"ok": "rid_done"})
-    monkeypatch.setattr(futures_route, "task_state_futures", stub)
+    stub = _StubTaskFutureService(FutureStatus.DONE, result={"ok": "rid_done"})
+    monkeypatch.setattr(futures_route, "task_futures", stub)
 
     body = FutureRetrieveRequest(request_id="rid_done")
     response = _response_stub()
@@ -53,8 +53,8 @@ def test_done_retrieve_does_not_evict_terminal_future(monkeypatch):
 
 
 def test_failed_retrieve_does_not_evict_terminal_future(monkeypatch):
-    stub = _StubTaskStateFutures(FutureStatus.FAILED, error="error:rid_failed")
-    monkeypatch.setattr(futures_route, "task_state_futures", stub)
+    stub = _StubTaskFutureService(FutureStatus.FAILED, error="error:rid_failed")
+    monkeypatch.setattr(futures_route, "task_futures", stub)
 
     body = FutureRetrieveRequest(request_id="rid_failed")
     response = _response_stub()
@@ -65,8 +65,8 @@ def test_failed_retrieve_does_not_evict_terminal_future(monkeypatch):
 
 
 def test_retrieved_result_is_served_idempotently(monkeypatch):
-    stub = _StubTaskStateFutures(FutureStatus.RETRIEVED, result={"ok": "rid_retrieved"})
-    monkeypatch.setattr(futures_route, "task_state_futures", stub)
+    stub = _StubTaskFutureService(FutureStatus.RETRIEVED, result={"ok": "rid_retrieved"})
+    monkeypatch.setattr(futures_route, "task_futures", stub)
 
     body = FutureRetrieveRequest(request_id="rid_retrieved")
     response = _response_stub()
@@ -77,8 +77,8 @@ def test_retrieved_result_is_served_idempotently(monkeypatch):
 
 
 def test_retrieved_error_is_served_idempotently(monkeypatch):
-    stub = _StubTaskStateFutures(FutureStatus.RETRIEVED, result=None, error="error:rid_retrieved_failed")
-    monkeypatch.setattr(futures_route, "task_state_futures", stub)
+    stub = _StubTaskFutureService(FutureStatus.RETRIEVED, result=None, error="error:rid_retrieved_failed")
+    monkeypatch.setattr(futures_route, "task_futures", stub)
 
     body = FutureRetrieveRequest(request_id="rid_retrieved_failed")
     response = _response_stub()

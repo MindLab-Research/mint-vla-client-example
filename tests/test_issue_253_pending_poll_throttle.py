@@ -6,7 +6,7 @@ from tinker_server.models.types import FutureRetrieveRequest
 from tinker_server.routes import futures as futures_route
 
 
-class _StubTaskStateFutures:
+class _StubTaskFutureService:
     def __init__(self):
         self.status_calls = 0
         self.meta_calls = 0
@@ -29,10 +29,10 @@ def _response_stub():
 
 
 def test_pending_retrieve_short_circuits_repeat_polls(monkeypatch):
-    stub = _StubTaskStateFutures()
+    stub = _StubTaskFutureService()
     clock = {"now": 1000.0}
 
-    monkeypatch.setattr(futures_route, "task_state_futures", stub)
+    monkeypatch.setattr(futures_route, "task_futures", stub)
     monkeypatch.setattr(futures_route.time, "time", lambda: clock["now"])
     monkeypatch.setattr(futures_route, "_PENDING_HINTS", futures_route.OrderedDict())
 

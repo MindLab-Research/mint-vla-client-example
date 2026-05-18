@@ -16,7 +16,7 @@ def _reset_retrieve_future_state(monkeypatch):
     monkeypatch.setattr(config_module.config, "retrieve_future_hot_ttl_s", 60.0, raising=False)
 
 
-class _StubTaskStateFutures:
+class _StubTaskFutureService:
     _UNSET = object()
 
     def __init__(self, status: FutureStatus, *, result=_UNSET, error=_UNSET, meta=None):
@@ -42,7 +42,7 @@ class _StubTaskStateFutures:
         self.cleanup_calls.append(request_id)
 
 
-class _UnknownTaskStateFutures:
+class _UnknownTaskFutureService:
     async def async_get_status(self, request_id: str) -> FutureStatus:
         raise KeyError(f"Unknown request_id: {request_id}")
 
@@ -75,7 +75,7 @@ def test_issue_440_train_step_result_uses_task_state_store_as_replay_index(monke
 
     payload_root = tmp_path / "payloads"
     monkeypatch.setenv("MINT_TASK_PAYLOAD_ROOT_DIR", str(payload_root))
-    monkeypatch.setattr(futures_route, "task_state_futures", _UnknownTaskStateFutures())
+    monkeypatch.setattr(futures_route, "task_futures", _UnknownTaskFutureService())
     payload_meta = TaskPayloadStore(payload_root).write_json_payload(
         request_id="rid-train-step",
         attempt_id="attempt-1",
@@ -109,7 +109,7 @@ def test_issue_440_train_step_result_uses_task_state_store_as_replay_index(monke
 
 
 def test_issue_440_random_unknown_without_task_state_record_stays_404(monkeypatch):
-    monkeypatch.setattr(futures_route, "task_state_futures", _UnknownTaskStateFutures())
+    monkeypatch.setattr(futures_route, "task_futures", _UnknownTaskFutureService())
 
     body = FutureRetrieveRequest(request_id="rid-unknown")
     with pytest.raises(futures_route.HTTPException) as exc:
@@ -120,7 +120,7 @@ def test_issue_440_random_unknown_without_task_state_record_stays_404(monkeypatc
 def test_issue_440_known_terminal_future_evicted_not_unknown(monkeypatch):
     import tinker_server.backend.task_state_store as task_state_store_module
 
-    monkeypatch.setattr(futures_route, "task_state_futures", _UnknownTaskStateFutures())
+    monkeypatch.setattr(futures_route, "task_futures", _UnknownTaskFutureService())
     monkeypatch.setattr(
         task_state_store_module,
         "task_state_store",
@@ -155,7 +155,7 @@ def test_issue_440_failure_replay_keeps_public_masking(monkeypatch):
 
     monkeypatch.setattr(config_module.config, "api_key", "", raising=False)
     monkeypatch.setattr(config_module.config, "internal_api_token", "secret", raising=False)
-    monkeypatch.setattr(futures_route, "task_state_futures", _UnknownTaskStateFutures())
+    monkeypatch.setattr(futures_route, "task_futures", _UnknownTaskFutureService())
     monkeypatch.setattr(
         task_state_store_module,
         "task_state_store",
@@ -188,7 +188,7 @@ def test_issue_440_concurrent_task_state_replay_returns_equivalent_payloads(monk
 
     payload_root = tmp_path / "payloads"
     monkeypatch.setenv("MINT_TASK_PAYLOAD_ROOT_DIR", str(payload_root))
-    monkeypatch.setattr(futures_route, "task_state_futures", _UnknownTaskStateFutures())
+    monkeypatch.setattr(futures_route, "task_futures", _UnknownTaskFutureService())
     payload_meta = TaskPayloadStore(payload_root).write_json_payload(
         request_id="rid-race",
         attempt_id="attempt-1",

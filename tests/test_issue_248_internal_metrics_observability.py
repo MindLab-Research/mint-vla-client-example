@@ -193,7 +193,7 @@ async def _fake_admission_stats(*, include_actor_rss: bool = True) -> dict:
         ],
     }
     if include_actor_rss:
-        actors.update({"task_state_futures": {"rss_bytes": 3000}})
+        actors.update({"task_futures": {"rss_bytes": 3000}})
     else:
         actors["model_actor_inventory"][0].pop("rss_bytes", None)
         actors["model_actor_inventory"][0]["rss_cache_state"] = "unknown"
@@ -228,7 +228,7 @@ async def _fake_admission_stats(*, include_actor_rss: bool = True) -> dict:
                 "requeued": 2,
             },
         },
-        "task_state_futures": {
+        "task_futures": {
             "pending": 1,
             "results": 4,
             "errors": 0,
@@ -287,10 +287,10 @@ def test_issue_248_internal_metrics_omits_unknown_model_actor_inventory_rss(monk
         'mint_model_work_scheduler_domain_backlog_depth{domain_key="vllm:Qwen/Qwen3-4B-Instruct-2507"} 2',
         'mint_model_work_scheduler_replica_queue_depth{domain_key="vllm:Qwen/Qwen3-4B-Instruct-2507",queue_id="vllm:Qwen/Qwen3-4B-Instruct-2507::replica-0",replica_id="replica-0",status="healthy"} 3',
         "mint_model_work_scheduler_leases 1",
-        "mint_task_state_futures_pending 1",
-        'mint_task_state_futures_pending{op="asample"} 1',
-        "mint_task_state_futures_oldest_pending_s 8",
-        "mint_task_state_futures_result_refs_count 4",
+        "mint_task_futures_pending 1",
+        'mint_task_futures_pending{op="asample"} 1',
+        "mint_task_futures_oldest_pending_s 8",
+        "mint_task_futures_result_refs_count 4",
         'mint_model_actor_inventory_actor_idle_time_s{actor_name="vllm-1",actor_type="vllm",model="Qwen/Qwen3-4B-Instruct-2507"} 2',
         'mint_model_actor_inventory_actor_age_s{actor_name="vllm-1",actor_type="vllm",model="Qwen/Qwen3-4B-Instruct-2507"} 50',
         'mint_model_actor_inventory_actors{actor_type="vllm",model="Qwen/Qwen3-4B-Instruct-2507"} 1',
@@ -362,7 +362,7 @@ def test_issue_248_internal_metrics_omits_unknown_model_actor_inventory_rss(monk
         assert line in text, f"missing metric line: {line}"
     assert 'mint_dense_actor_poisoned_age_s{actor_name="peft_trainer_qwen__qwen3_4b_instruct_2507_maxr64",base_model="Qwen/Qwen3-4B-Instruct-2507",last_fatal_op="reinit_lora_weights"}' in text
 
-    assert 'mint_actor_rss_bytes{actor="task_state_futures"}' not in text
+    assert 'mint_actor_rss_bytes{actor="task_futures"}' not in text
     assert 'mint_model_actor_inventory_actor_rss_bytes{actor_name="vllm-1"' not in text
     assert 'mint_model_actor_inventory_group_rss_bytes{actor_type="vllm",model="Qwen/Qwen3-4B-Instruct-2507"}' not in text
 
@@ -440,7 +440,7 @@ def test_issue_588_admission_stats_rss_path_preserves_model_actor_inventory_meta
         async def async_size(self) -> int:
             return 0
 
-    class _FakeTaskStateFutures:
+    class _FakeTaskFutureService:
         async def async_ensure_ready(self, *, timeout_s: float = 10.0) -> dict:
             return {"pending": 0, "results": 0, "errors": 0}
 
@@ -473,7 +473,7 @@ def test_issue_588_admission_stats_rss_path_preserves_model_actor_inventory_meta
         def lifecycle_metrics_snapshot(self) -> list[dict]:
             return []
 
-    monkeypatch.setattr(task_state_store_module, "task_state_futures", _FakeTaskStateFutures())
+    monkeypatch.setattr(task_state_store_module, "task_futures", _FakeTaskFutureService())
     monkeypatch.setattr(model_work_scheduler_module, "model_work_scheduler", _FakeModelWorkScheduler())
     monkeypatch.setattr(model_actor_supervisor_module, "model_actor_supervisor", _FakeModelActorSupervisor())
     monkeypatch.setattr(maintenance_cron_actor_module, "maintenance_cron_actor", _FakeSupervisor())
@@ -524,12 +524,12 @@ def test_issue_248_admission_stats_metrics_path_uses_cached_pool_snapshot(monkey
         async def async_size(self) -> int:
             return 0
 
-    class _FakeTaskStateFutures:
+    class _FakeTaskFutureService:
         def metrics_snapshot(self) -> dict:
             return {"pending": 0, "results": 0, "errors": 0}
 
         def ensure_ready(self, *, timeout_s: float = 10.0) -> dict:
-            raise AssertionError("metrics scrape must not call task_state_futures.ensure_ready")
+            raise AssertionError("metrics scrape must not call task_futures.ensure_ready")
 
     calls = {"cached_snapshot": 0}
 
@@ -547,7 +547,7 @@ def test_issue_248_admission_stats_metrics_path_uses_cached_pool_snapshot(monkey
         def rss_snapshot(self, *, timeout_s: float = 10.0) -> list[dict]:
             raise AssertionError("metrics scrape must not call model_actor_inventory.rss_snapshot")
 
-    monkeypatch.setattr(task_state_store_module, "task_state_futures", _FakeTaskStateFutures())
+    monkeypatch.setattr(task_state_store_module, "task_futures", _FakeTaskFutureService())
     monkeypatch.setattr(model_work_scheduler_module, "model_work_scheduler", _FakeModelWorkScheduler())
     monkeypatch.setattr(model_actor_supervisor_module, "model_actor_supervisor", _FakeModelActorSupervisor())
     monkeypatch.setattr(maintenance_cron_actor_module, "maintenance_cron_actor", _FakeSupervisor())
@@ -591,7 +591,7 @@ def test_issue_248_metrics_path_exports_cached_scheduler_model_load(monkeypatch)
                 ],
                 "counters": {},
             },
-            "task_state_futures": {},
+            "task_futures": {},
             "actors": {"model_actor_inventory": []},
             "process": {},
         }

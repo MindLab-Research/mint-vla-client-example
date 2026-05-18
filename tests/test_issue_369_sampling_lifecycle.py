@@ -55,7 +55,7 @@ async def test_issue_369_detached_sampling_cleanup_removes_stale_session(monkeyp
         return ["req-sample"]
 
     monkeypatch.setattr(
-        task_state_store_module.task_state_futures,
+        task_state_store_module.task_futures,
         "async_fail_sampling_requests_for_session",
         _async_fail_sampling_requests_for_session,
     )
@@ -116,7 +116,7 @@ async def test_issue_369_detached_sampling_cleanup_keeps_shared_adapter_loaded(m
         return []
 
     monkeypatch.setattr(
-        task_state_store_module.task_state_futures,
+        task_state_store_module.task_futures,
         "async_fail_sampling_requests_for_session",
         _async_fail_sampling_requests_for_session,
     )

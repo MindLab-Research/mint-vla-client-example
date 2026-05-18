@@ -32,7 +32,7 @@ The bug behind issue 193/194 came from exactly this gap: queue selection order w
 
 - `request_id`
   - Created per async API request
-  - Keys `TaskStateStore` through the `TaskStateFutures` facade
+  - Keys `TaskStateStore` through the `TaskFutureService` facade
   - Used for polling via `retrieve_future`
 
 - backend current session
@@ -52,14 +52,14 @@ See also `state.md`.
 For asynchronous training operations such as `forward_backward`, `optim_step`, and `save_weights_for_sampler`, the control flow is:
 
 1. Route validates request and looks up the `TrainingSession` by `model_id`.
-2. Route creates `request_id` and a pending task through `TaskStateFutures`.
+2. Route creates `request_id` and a pending task through `TaskFutureService`.
 3. Route enqueues work into `ModelWorkScheduler` with extra metadata.
 4. `ModelWorkScheduler` assigns pending work into a runtime-owned subqueue for a registered model replica.
 5. `ModelRuntimeActor` polls its subqueue and claims a lease.
 6. The runtime actor validates task status, deserializes the JSON, and calls the registered route executor.
 7. The route helper calls `training_engine.*(...)`.
 8. The backend actor ensures the correct session is loaded before doing any forward/backward/save/load work.
-9. Scheduler leases must carry native finalize metadata. `ModelRuntimeActor` commits the terminal result or failure to `TaskStateStore` and then completes or fails the scheduler lease. Executor-local `TaskStateFutures.async_resolve` / `async_fail` calls are buffered while running under model-work execution context and serve as completion signals, not as independent durable terminal writes.
+9. Scheduler leases must carry native finalize metadata. `ModelRuntimeActor` commits the terminal result or failure to `TaskStateStore` and then completes or fails the scheduler lease. Executor-local `TaskFutureService.async_resolve` / `async_fail` calls are buffered while running under model-work execution context and serve as completion signals, not as independent durable terminal writes.
 
 Relevant code:
 
@@ -361,10 +361,10 @@ Megatron backend:
 API server:
 
 - `TrainingSessionManager`
-- `TaskStateFutures`
+- `TaskFutureService`
 - in-process sampling mappings
 
-Only the first, second facade object, and third items above are process-memory state and lost on API restart. The durable records behind `TaskStateFutures` live in detached `TaskStateStore`.
+Only the first, second facade object, and third items above are process-memory state and lost on API restart. The durable records behind `TaskFutureService` live in detached `TaskStateStore`.
 
 More precisely:
 

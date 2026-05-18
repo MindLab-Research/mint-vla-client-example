@@ -65,7 +65,7 @@ class _FakeActionSessionManager:
         self.shutdown_calls.append(action_session_id)
 
 
-class _FakeTaskStateFutures:
+class _FakeTaskFutureService:
     def __init__(self) -> None:
         self.created: list[str] = []
         self.resolved: list[tuple[str, dict[str, object]]] = []
@@ -84,7 +84,7 @@ class _FakeTaskStateFutures:
         self.failed.append((request_id, error))
 
 
-class _AsyncFakeTaskStateFutures:
+class _AsyncFakeTaskFutureService:
     def __init__(self) -> None:
         self.created: list[str] = []
         self.queued: list[tuple[str, dict | None]] = []
@@ -106,7 +106,7 @@ class _AsyncFakeTaskStateFutures:
         self.cleaned.append(request_id)
 
 
-class _AsyncResolvingTaskStateFutures(_AsyncFakeTaskStateFutures):
+class _AsyncResolvingTaskFutureService(_AsyncFakeTaskFutureService):
     def __init__(self) -> None:
         super().__init__()
         self.resolved: list[tuple[str, dict[str, object]]] = []
@@ -310,9 +310,9 @@ def test_do_act_resolves_future_with_actions(monkeypatch) -> None:
     from tinker_server.models.types import ActRequest, EncodedTextChunk, ImageChunk, ModelInput, TensorData
 
     manager = _FakeActionSessionManager()
-    task_state_futures = _FakeTaskStateFutures()
+    task_futures = _FakeTaskFutureService()
     monkeypatch.setattr(action_routes, "action_session_manager", manager, raising=False)
-    monkeypatch.setattr(action_routes, "task_state_futures", task_state_futures, raising=False)
+    monkeypatch.setattr(action_routes, "task_futures", task_futures, raising=False)
 
     request = ActRequest(
         action_session_id="action-session-1",
@@ -336,7 +336,7 @@ def test_do_act_resolves_future_with_actions(monkeypatch) -> None:
             "temperature": 3.0,
         }
     ]
-    assert task_state_futures.resolved == [
+    assert task_futures.resolved == [
         (
             "req-1",
             {
@@ -350,17 +350,17 @@ def test_do_act_resolves_future_with_actions(monkeypatch) -> None:
             },
         )
     ]
-    assert task_state_futures.failed == []
+    assert task_futures.failed == []
 
 
-def test_do_act_prefers_async_task_state_futures_api(monkeypatch) -> None:
+def test_do_act_prefers_async_task_futures_api(monkeypatch) -> None:
     from tinker_server.routes import action_sampling as action_routes
     from tinker_server.models.types import ActRequest, EncodedTextChunk, ImageChunk, ModelInput, TensorData
 
     manager = _FakeActionSessionManager()
-    task_state_futures = _AsyncResolvingTaskStateFutures()
+    task_futures = _AsyncResolvingTaskFutureService()
     monkeypatch.setattr(action_routes, "action_session_manager", manager, raising=False)
-    monkeypatch.setattr(action_routes, "task_state_futures", task_state_futures, raising=False)
+    monkeypatch.setattr(action_routes, "task_futures", task_futures, raising=False)
 
     request = ActRequest(
         action_session_id="action-session-1",
@@ -384,7 +384,7 @@ def test_do_act_prefers_async_task_state_futures_api(monkeypatch) -> None:
             "temperature": 1.5,
         }
     ]
-    assert task_state_futures.resolved == [
+    assert task_futures.resolved == [
         (
             "req-2",
             {
@@ -398,7 +398,7 @@ def test_do_act_prefers_async_task_state_futures_api(monkeypatch) -> None:
             },
         )
     ]
-    assert task_state_futures.failed == []
+    assert task_futures.failed == []
 
 
 def test_do_act_logs_when_future_fail_marking_fails(monkeypatch) -> None:
@@ -410,7 +410,7 @@ def test_do_act_logs_when_future_fail_marking_fails(monkeypatch) -> None:
             _ = action_session_id, observation, extra_inputs
             raise RuntimeError("boom")
 
-    class _ExplodingTaskStateFutures(_FakeTaskStateFutures):
+    class _ExplodingTaskFutureService(_FakeTaskFutureService):
         def fail(self, request_id: str, error: str) -> None:
             _ = request_id, error
             raise RuntimeError("fail-store-boom")
@@ -426,7 +426,7 @@ def test_do_act_logs_when_future_fail_marking_fails(monkeypatch) -> None:
         _ExplodingActionSessionManager(),
         raising=False,
     )
-    monkeypatch.setattr(action_routes, "task_state_futures", _ExplodingTaskStateFutures(), raising=False)
+    monkeypatch.setattr(action_routes, "task_futures", _ExplodingTaskFutureService(), raising=False)
     monkeypatch.setattr(action_routes.logger, "exception", _record_log)
 
     request = ActRequest(
@@ -451,10 +451,10 @@ def test_do_act_logs_when_future_fail_marking_fails(monkeypatch) -> None:
 def test_mint_action_route_enqueues_expected_request(monkeypatch) -> None:
     from tinker_server.routes import mint as mint_routes
 
-    task_state_futures = _AsyncFakeTaskStateFutures()
+    task_futures = _AsyncFakeTaskFutureService()
     scheduler = _StubModelWorkScheduler()
 
-    monkeypatch.setattr(mint_routes, "task_state_futures", task_state_futures, raising=False)
+    monkeypatch.setattr(mint_routes, "task_futures", task_futures, raising=False)
     monkeypatch.setattr(mint_routes, "action_session_manager", object(), raising=False)
 
     import tinker_server.backend.model_work_scheduler as mws
@@ -494,8 +494,8 @@ def test_mint_action_route_enqueues_expected_request(monkeypatch) -> None:
 
     assert resp.status_code == 200, resp.text
     request_id = resp.json()["request_id"]
-    assert task_state_futures.created == []
-    queued_request_id, queued_meta = task_state_futures.queued[0]
+    assert task_futures.created == []
+    queued_request_id, queued_meta = task_futures.queued[0]
     assert queued_request_id == request_id
     assert queued_meta["op"] == "mint.action.act"
     assert queued_meta["action_session_id"] == "action-session-1"
@@ -518,7 +518,7 @@ def test_legacy_action_public_routes_are_not_exposed(monkeypatch) -> None:
     monkeypatch.setattr(service_routes, "action_session_manager", manager, raising=False)
     monkeypatch.setattr(service_routes, "_get_user_id", lambda _request: "user-1")
     monkeypatch.setattr(action_routes, "action_session_manager", manager, raising=False)
-    monkeypatch.setattr(action_routes, "task_state_futures", _FakeTaskStateFutures(), raising=False)
+    monkeypatch.setattr(action_routes, "task_futures", _FakeTaskFutureService(), raising=False)
     monkeypatch.setattr(mint_routes, "action_session_manager", manager, raising=False)
 
     app = FastAPI()

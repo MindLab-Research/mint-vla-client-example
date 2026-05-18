@@ -42,7 +42,7 @@ async def _async_none(*_args, **_kwargs):
     return None
 
 
-class _AsyncTaskStateFutures:
+class _AsyncTaskFutureService:
     async def async_create_with_id(self, _request_id: str) -> None:
         return None
 
@@ -109,7 +109,7 @@ async def test_issue_281_forward_enqueues_scheduler_metadata(monkeypatch) -> Non
         lambda model_id: _route_session_info(model_id, backend="peft", base_model="Qwen/Qwen3-0.6B"),
     )
     monkeypatch.setattr(tr, "_protect_training_session_enqueue_window", _noop_async)
-    monkeypatch.setattr(tr, "task_state_futures", _AsyncTaskStateFutures())
+    monkeypatch.setattr(tr, "task_futures", _AsyncTaskFutureService())
     monkeypatch.setattr(mws, "model_work_scheduler", _AsyncModelWorkScheduler(captured))
 
     req = ForwardRequest(
@@ -179,7 +179,7 @@ async def test_issue_281_training_routes_mark_queued_stage_metadata(
     captured: dict = {}
     queued_meta: dict = {}
 
-    class _QueuedTaskStateFutures(_AsyncTaskStateFutures):
+    class _QueuedTaskFutureService(_AsyncTaskFutureService):
         async def async_mark_queued(self, _request_id: str, meta=None) -> None:
             queued_meta.update(meta or {})
 
@@ -197,7 +197,7 @@ async def test_issue_281_training_routes_mark_queued_stage_metadata(
         ),
     )
     monkeypatch.setattr(tr, "_protect_training_session_enqueue_window", _noop_async)
-    monkeypatch.setattr(tr, "task_state_futures", _QueuedTaskStateFutures())
+    monkeypatch.setattr(tr, "task_futures", _QueuedTaskFutureService())
     monkeypatch.setattr(mws, "model_work_scheduler", _AsyncModelWorkScheduler(captured))
 
     req = request_obj(model_types)
@@ -249,7 +249,7 @@ async def test_issue_281_save_weights_for_sampler_enqueues_scheduler_metadata(mo
         ),
     )
     monkeypatch.setattr(tr, "_protect_training_session_enqueue_window", _noop_async)
-    monkeypatch.setattr(tr, "task_state_futures", _AsyncTaskStateFutures())
+    monkeypatch.setattr(tr, "task_futures", _AsyncTaskFutureService())
     monkeypatch.setattr(mws, "model_work_scheduler", _AsyncModelWorkScheduler(captured))
     monkeypatch.setattr(client_compat, "prefer_tinker_uri", lambda _request: True)
 
@@ -292,7 +292,7 @@ async def test_issue_281_asample_enqueues_scheduler_metadata(monkeypatch) -> Non
             get_session_replica_key=lambda _session_id: "Qwen/Qwen3-0.6B::replica::1",
         ),
     )
-    monkeypatch.setattr(sr, "task_state_futures", _AsyncTaskStateFutures())
+    monkeypatch.setattr(sr, "task_futures", _AsyncTaskFutureService())
     monkeypatch.setattr(mws, "model_work_scheduler", _AsyncModelWorkScheduler(captured))
     monkeypatch.setattr(model_registry, "get_model_config", lambda _model: SimpleNamespace(max_model_len=4096))
 
@@ -325,7 +325,7 @@ async def test_issue_281_compute_logprobs_enqueues_scheduler_metadata(monkeypatc
     captured: dict = {}
     queued_meta: dict = {}
 
-    class _QueuedTaskStateFutures(_AsyncTaskStateFutures):
+    class _QueuedTaskFutureService(_AsyncTaskFutureService):
         async def async_mark_queued(self, _request_id: str, meta=None) -> None:
             queued_meta.update(meta or {})
 
@@ -339,7 +339,7 @@ async def test_issue_281_compute_logprobs_enqueues_scheduler_metadata(monkeypatc
             get_session_replica_key=lambda _session_id: "Qwen/Qwen3-0.6B::replica::1",
         ),
     )
-    monkeypatch.setattr(sr, "task_state_futures", _QueuedTaskStateFutures())
+    monkeypatch.setattr(sr, "task_futures", _QueuedTaskFutureService())
     monkeypatch.setattr(mws, "model_work_scheduler", _AsyncModelWorkScheduler(captured))
     monkeypatch.setattr(model_registry, "get_model_config", lambda _model: SimpleNamespace(max_model_len=4096))
 
@@ -386,7 +386,7 @@ async def test_issue_281_do_create_model_active_duplicate_fails_without_deleting
     monkeypatch.setattr(tr, "training_engine", SimpleNamespace(shutdown_session=lambda _session: None))
     monkeypatch.setattr(
         tr,
-        "task_state_futures",
+        "task_futures",
         SimpleNamespace(
             async_fail=_async_fail,
         ),
@@ -433,7 +433,7 @@ async def test_issue_281_do_create_model_from_state_active_duplicate_fails_witho
     monkeypatch.setattr(tr, "training_engine", SimpleNamespace(shutdown_session=lambda _session: None))
     monkeypatch.setattr(
         tr,
-        "task_state_futures",
+        "task_futures",
         SimpleNamespace(
             async_fail=_async_fail,
         ),
@@ -486,7 +486,7 @@ async def test_issue_281_do_reset_expert_bias_resolves_future(monkeypatch) -> No
     monkeypatch.setattr(tr, "_restore_training_session", _async_none)
     monkeypatch.setattr(
         tr,
-        "task_state_futures",
+        "task_futures",
         SimpleNamespace(
             async_resolve=_async_resolve,
             async_fail=_async_fail,
@@ -547,7 +547,7 @@ async def test_issue_281_do_delete_model_deletes_then_resolves(monkeypatch) -> N
     )
     monkeypatch.setattr(
         tr,
-        "task_state_futures",
+        "task_futures",
         SimpleNamespace(
             async_resolve=_async_resolve,
             async_fail=_async_fail,
@@ -586,7 +586,7 @@ async def test_issue_281_asample_falls_back_to_base_model_scheduler_domain(monke
             get_session_replica_key=lambda _session_id: None,
         ),
     )
-    monkeypatch.setattr(sr, "task_state_futures", _AsyncTaskStateFutures())
+    monkeypatch.setattr(sr, "task_futures", _AsyncTaskFutureService())
     monkeypatch.setattr(mws, "model_work_scheduler", _AsyncModelWorkScheduler(captured))
     monkeypatch.setattr(model_registry, "get_model_config", lambda _model: SimpleNamespace(max_model_len=4096))
 
@@ -634,7 +634,7 @@ async def test_issue_281_internal_serialized_op_marks_inflight_until_worker_fini
     monkeypatch.setattr(tr, "_restore_training_session", _restore_training_session)
     monkeypatch.setattr(
         tr,
-        "task_state_futures",
+        "task_futures",
         SimpleNamespace(
             async_create_with_id=_async_none,
             async_mark_queued=_async_none,

@@ -224,7 +224,7 @@ async def lifespan(app: FastAPI):
     # ==========================================================================
     clear_startup_degraded_state()
     clear_runtime_degraded_state()
-    from .backend.task_state_store import task_state_futures
+    from .backend.task_state_store import task_futures
     from .backend.config_actor import async_ensure_started as async_ensure_config_actor_started
     from .backend.gateway_session_store import ensure_ready as ensure_gateway_session_store_ready
     from .backend.maintenance_cron_actor import maintenance_cron_actor
@@ -259,7 +259,7 @@ async def lifespan(app: FastAPI):
         raise RuntimeError("usage billing postgres health check failed")
     if startup_owner:
         await async_ensure_config_actor_started()
-        await task_state_futures.async_ensure_started()
+        await task_futures.async_ensure_started()
         ensure_gateway_session_store_ready()
         ensure_sampling_session_store_ready()
         session_heartbeat_store.ensure_ready()
@@ -458,7 +458,7 @@ async def lifespan(app: FastAPI):
                         current_epoch,
                     )
                     await async_ensure_config_actor_started()
-                    await task_state_futures.async_ensure_started()
+                    await task_futures.async_ensure_started()
                     ensure_gateway_session_store_ready()
                     ensure_sampling_session_store_ready()
                     session_heartbeat_store.ensure_ready()

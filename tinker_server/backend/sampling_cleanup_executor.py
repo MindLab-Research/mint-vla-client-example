@@ -107,7 +107,7 @@ async def cleanup_stale_sampling_sessions_once_impl(*, stale_after_s: float | No
     if stale_after_s <= 0:
         return []
 
-    from .task_state_store import task_state_futures
+    from .task_state_store import task_futures
     from .sampling_session_store import async_list_sampling_sessions, delete_sampling_session
 
     try:
@@ -154,7 +154,7 @@ async def cleanup_stale_sampling_sessions_once_impl(*, stale_after_s: float | No
 
         reason = f"sampling inactivity (> {stale_after_s:.1f}s)"
         try:
-            failed_request_ids = await task_state_futures.async_fail_sampling_requests_for_session(
+            failed_request_ids = await task_futures.async_fail_sampling_requests_for_session(
                 session_id,
                 f"Sampling session terminated due to {reason}",
             )

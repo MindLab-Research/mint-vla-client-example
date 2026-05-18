@@ -9,7 +9,7 @@ from tinker_server.models.types import ModelInput, SampleRequest, SamplingParams
 from tinker_server.routes import sampling as sampling_route
 
 
-class _StubTaskStateFutures:
+class _StubTaskFutureService:
     def __init__(self, *, fail_update_meta: bool = False):
         self.created: list[str] = []
         self.queued: list[tuple[str, dict | None]] = []
@@ -82,11 +82,11 @@ def _dummy_request(user_id: str | None = None):
 
 
 def test_issue_593_asample_routes_multi_lora_to_model_work_scheduler(monkeypatch):
-    stub_fs = _StubTaskStateFutures()
+    stub_fs = _StubTaskFutureService()
     scheduler = _CaptureModelWorkScheduler()
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
-    monkeypatch.setattr(sampling_route, "task_state_futures", stub_fs)
+    monkeypatch.setattr(sampling_route, "task_futures", stub_fs)
 
     import tinker_server.backend.model_work_scheduler as mws
     import tinker_server.backend.result_size_estimator as rse
@@ -135,11 +135,11 @@ def test_issue_593_asample_routes_multi_lora_to_model_work_scheduler(monkeypatch
 
 
 def test_issue_593_asample_cancels_scheduler_item_if_post_append_meta_update_fails(monkeypatch):
-    stub_fs = _StubTaskStateFutures(fail_update_meta=True)
+    stub_fs = _StubTaskFutureService(fail_update_meta=True)
     scheduler = _CaptureModelWorkScheduler()
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
-    monkeypatch.setattr(sampling_route, "task_state_futures", stub_fs)
+    monkeypatch.setattr(sampling_route, "task_futures", stub_fs)
 
     import tinker_server.backend.model_work_scheduler as mws
     import tinker_server.backend.result_size_estimator as rse
@@ -170,11 +170,11 @@ def test_issue_593_asample_cancels_scheduler_item_if_post_append_meta_update_fai
 
 
 def test_issue_593_asample_does_not_cancel_scheduler_item_when_append_rejects(monkeypatch):
-    stub_fs = _StubTaskStateFutures()
+    stub_fs = _StubTaskFutureService()
     scheduler = _CaptureModelWorkScheduler(append_error=RuntimeError("duplicate request_id"))
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
-    monkeypatch.setattr(sampling_route, "task_state_futures", stub_fs)
+    monkeypatch.setattr(sampling_route, "task_futures", stub_fs)
 
     import tinker_server.backend.model_work_scheduler as mws
     import tinker_server.backend.result_size_estimator as rse
@@ -203,11 +203,11 @@ def test_issue_593_asample_does_not_cancel_scheduler_item_when_append_rejects(mo
 
 def test_issue_593_asample_ignores_legacy_flag_and_uses_model_work_scheduler(monkeypatch):
     monkeypatch.setenv("MINT_MODEL_WORK_SCHEDULER_ASAMPLE", "0")
-    stub_fs = _StubTaskStateFutures()
+    stub_fs = _StubTaskFutureService()
     scheduler = _CaptureModelWorkScheduler()
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
-    monkeypatch.setattr(sampling_route, "task_state_futures", stub_fs)
+    monkeypatch.setattr(sampling_route, "task_futures", stub_fs)
 
     import tinker_server.backend.model_work_scheduler as mws
     import tinker_server.backend.result_size_estimator as rse

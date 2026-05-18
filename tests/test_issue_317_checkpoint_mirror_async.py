@@ -463,7 +463,7 @@ async def test_issue_317_save_state_does_not_wait_for_sampling_registration(
     monkeypatch.setattr(wt, "training_engine", SimpleNamespace(save_weights=_fake_save_weights))
     monkeypatch.setattr(
         wt,
-        "task_state_futures",
+        "task_futures",
         SimpleNamespace(async_resolve=_async_resolve, async_fail=_async_fail),
     )
     monkeypatch.setattr(wt, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
@@ -546,7 +546,7 @@ async def test_issue_317_named_save_weights_for_sampler_preserves_type(
     )
     monkeypatch.setattr(
         tr,
-        "task_state_futures",
+        "task_futures",
         SimpleNamespace(async_resolve=_async_resolve, async_fail=_async_fail),
     )
     monkeypatch.setattr(tr, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
@@ -626,7 +626,7 @@ async def test_issue_317_named_save_weights_for_sampler_admin_owner_is_anonymous
     )
     monkeypatch.setattr(
         tr,
-        "task_state_futures",
+        "task_futures",
         SimpleNamespace(async_resolve=_async_resolve, async_fail=_async_fail),
     )
     monkeypatch.setattr(tr, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))

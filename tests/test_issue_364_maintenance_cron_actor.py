@@ -11,7 +11,7 @@ def anyio_backend() -> str:
 def test_issue_364_future_reaper_once_reaps_task_state(monkeypatch) -> None:
     from tinker_server.backend import maintenance_cron_actor as ors
 
-    class _FakeTaskStateFutures:
+    class _FakeTaskFutureService:
         async def async_ensure_started(self) -> dict:
             return {"ok": True}
 
@@ -22,7 +22,7 @@ def test_issue_364_future_reaper_once_reaps_task_state(monkeypatch) -> None:
 
     task_state_store_module = importlib.import_module("tinker_server.backend.task_state_store")
 
-    monkeypatch.setattr(task_state_store_module, "task_state_futures", _FakeTaskStateFutures())
+    monkeypatch.setattr(task_state_store_module, "task_futures", _FakeTaskFutureService())
 
     out = ors.run_future_reaper_once()
 

@@ -4,7 +4,7 @@ Many endpoints return `{"request_id": "<uuid>"}` immediately and complete the wo
 
 ## Retrieve semantics (`POST /api/v1/retrieve_future`)
 
-Implementation: `tinker_server/routes/futures.py` backed by `TaskStateFutures` in `tinker_server/backend/task_state_store.py`.
+Implementation: `tinker_server/routes/futures.py` backed by `TaskFutureService` in `tinker_server/backend/task_state_store.py`.
 
 - HTTP 408: `PENDING` (client should retry)
 - HTTP 200 with `{"error": ...}`: terminal non-success (for example `FAILED`, `EXPIRED`, `RETRIEVED`)
@@ -19,7 +19,7 @@ Most work runs on Ray GPU actors and can exceed typical HTTP request lifetimes. 
 
 ## Where futures live
 
-`TaskStateFutures` is an in-process facade. Durable task state lives in the detached `TaskStateStore` actor (`mint_task_state_store` by default), and result payloads are written through `TaskPayloadStore`.
+`TaskFutureService` is an in-process facade. Durable task state lives in the detached `TaskStateStore` actor (`mint_task_state_store` by default), and result payloads are written through `TaskPayloadStore`.
 
 The facade preserves the old Tinker future methods (`async_resolve`, `async_fail`, `async_get_status`, etc.) while routing all persistent state through `TaskStateStore`. Completed result payloads are written to the payload store, and the task record stores the payload path, checksum, size, status, error, and metadata.
 
@@ -30,12 +30,12 @@ There is no separate future replay index. Retrieve hot-cache entries are process
 ## Admission and scheduling
 
 Async endpoints that require model-runtime scheduling go through `ModelWorkScheduler`:
-- API routes first create or ensure the task in `TaskStateStore` via `TaskStateFutures`.
+- API routes first create or ensure the task in `TaskStateStore` via `TaskFutureService`.
 - The route appends a `ModelWorkItem` to the detached `ModelWorkScheduler` actor (`mint_model_work_scheduler` by default).
 - `ModelWorkScheduler` keeps the hot domain backlog, per-replica subqueues, leases, and fairness state in memory.
 - `ModelActorSupervisor` observes active scheduler domains and reconciles the matching desired runtime actors from config and placement JSON. A queued training domain can therefore create the runtime needed to claim it.
 - Runtime actors claim from their scheduler-owned subqueue. Claiming is independent of `retrieve_future`; result polling reads `TaskStateStore`.
-- Scheduler leases must include `attempt_id` and `scheduler_epoch`. `ModelRuntimeActor` owns terminal commit to `TaskStateStore` and lease completion/failure. Route-level `_do_*` functions may still use `TaskStateFutures.async_resolve/async_fail` as an executor-local completion signal, but those calls are buffered while running under a model-work execution context and do not write terminal state directly. There is no scheduler-work fallback that writes terminal state through the facade.
+- Scheduler leases must include `attempt_id` and `scheduler_epoch`. `ModelRuntimeActor` owns terminal commit to `TaskStateStore` and lease completion/failure. Route-level `_do_*` functions may still use `TaskFutureService.async_resolve/async_fail` as an executor-local completion signal, but those calls are buffered while running under a model-work execution context and do not write terminal state directly. There is no scheduler-work fallback that writes terminal state through the facade.
 
 On admission failure, the API must return HTTP 429 with a structured overload reason. V1 does not enforce a hard active-task cap; add one only if the active-task index becomes a measured bottleneck.
 
@@ -81,7 +81,7 @@ This is a deliberate tradeoff: global strict FIFO across sessions is relaxed for
 
 ## Reaping and cleanup
 
-`MaintenanceCronActor` owns periodic cleanup. `TaskStateFutures.async_reap()` is currently a compatibility facade over `TaskStateStore`; task/result retention policy belongs in `TaskStateStore` and payload-store cleanup.
+`MaintenanceCronActor` owns periodic cleanup. `TaskFutureService.async_reap()` is currently a compatibility facade over `TaskStateStore`; task/result retention policy belongs in `TaskStateStore` and payload-store cleanup.
 
 ## Detached actor hygiene
 

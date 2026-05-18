@@ -5,7 +5,7 @@ from tinker_server.models.types import ComputeLogprobsRequest, ModelInput, Sampl
 from tinker_server.routes import sampling as sampling_route
 
 
-class _StubTaskStateFutures:
+class _StubTaskFutureService:
     def __init__(self, order: list[str] | None = None):
         self.resolved: dict[str, dict] = {}
         self.failed: dict[str, str] = {}
@@ -82,11 +82,11 @@ def _gateway_auth() -> dict[str, str]:
 
 
 def test_asample_logs_prefill_and_sample_dimensions(monkeypatch):
-    task_state_futures = _StubTaskStateFutures()
+    task_futures = _StubTaskFutureService()
     usage_store = _StubUsageStore()
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSessionManager())
-    monkeypatch.setattr(sampling_route, "task_state_futures", task_state_futures)
+    monkeypatch.setattr(sampling_route, "task_futures", task_futures)
 
     monkeypatch.setattr(sampling_route, "schedule_usage_events", usage_store.schedule_events)
 
@@ -99,8 +99,8 @@ def test_asample_logs_prefill_and_sample_dimensions(monkeypatch):
 
     anyio.run(sampling_route._do_sample, "req-sample", request, None, _gateway_auth())
 
-    assert "req-sample" in task_state_futures.resolved
-    assert task_state_futures.failed == {}
+    assert "req-sample" in task_futures.resolved
+    assert task_futures.failed == {}
     assert [event.charge_item for event in usage_store.events] == ["sampling", "sampling"]
     assert [event.quantity for event in usage_store.events] == [3, 2]
     assert [event.label for event in usage_store.events] == [
@@ -111,11 +111,11 @@ def test_asample_logs_prefill_and_sample_dimensions(monkeypatch):
 
 def test_asample_resolves_future_before_persisting_usage(monkeypatch):
     order: list[str] = []
-    task_state_futures = _StubTaskStateFutures(order=order)
+    task_futures = _StubTaskFutureService(order=order)
     usage_store = _StubUsageStore(order=order)
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSessionManager())
-    monkeypatch.setattr(sampling_route, "task_state_futures", task_state_futures)
+    monkeypatch.setattr(sampling_route, "task_futures", task_futures)
 
     monkeypatch.setattr(sampling_route, "schedule_usage_events", usage_store.schedule_events)
 
@@ -132,11 +132,11 @@ def test_asample_resolves_future_before_persisting_usage(monkeypatch):
 
 
 def test_compute_logprobs_logs_prefill_dimension(monkeypatch):
-    task_state_futures = _StubTaskStateFutures()
+    task_futures = _StubTaskFutureService()
     usage_store = _StubUsageStore()
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSessionManager())
-    monkeypatch.setattr(sampling_route, "task_state_futures", task_state_futures)
+    monkeypatch.setattr(sampling_route, "task_futures", task_futures)
 
     monkeypatch.setattr(sampling_route, "schedule_usage_events", usage_store.schedule_events)
 
@@ -148,8 +148,8 @@ def test_compute_logprobs_logs_prefill_dimension(monkeypatch):
 
     anyio.run(sampling_route._do_compute_logprobs, "req-logprobs", request, None, _gateway_auth())
 
-    assert "req-logprobs" in task_state_futures.resolved
-    assert task_state_futures.failed == {}
+    assert "req-logprobs" in task_futures.resolved
+    assert task_futures.failed == {}
     assert len(usage_store.events) == 1
     assert usage_store.events[0].charge_item == "sampling"
     assert usage_store.events[0].quantity == 4

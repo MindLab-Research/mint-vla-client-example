@@ -24,7 +24,7 @@ from .model_actor_supervisor import consumer_id_for_replica, queue_id_for_replic
 from .model_work_scheduler import ModelWorkSchedulerClient, model_work_scheduler
 from .model_work_execution_context import ModelWorkFinalizeBuffer, model_work_execution_context
 from .task_payload_store import TaskPayloadStore
-from .task_state_store import FutureStatus, task_state_futures, task_state_store
+from .task_state_store import FutureStatus, task_futures, task_state_store
 
 logger = logging.getLogger(__name__)
 
@@ -209,7 +209,7 @@ class ModelRuntimeActor:
         max_claim: int = 1,
         token_budget: int | None = None,
         scheduler_client: ModelWorkSchedulerClient | None = None,
-        task_state_futures_client: Any | None = None,
+        task_futures_client: Any | None = None,
         task_state_store_client: Any | None = None,
         payload_store: TaskPayloadStore | None = None,
         executor: ModelWorkExecutor | None = None,
@@ -246,7 +246,7 @@ class ModelRuntimeActor:
             token_budget=None if token_budget is None else int(token_budget),
         )
         self._scheduler = scheduler_client if scheduler_client is not None else model_work_scheduler
-        self._task_state_futures = task_state_futures_client if task_state_futures_client is not None else task_state_futures
+        self._task_futures = task_futures_client if task_futures_client is not None else task_futures
         self._task_state_store = (
             task_state_store_client if task_state_store_client is not None else task_state_store
         )
@@ -424,7 +424,7 @@ class ModelRuntimeActor:
         request_id = str(item["request_id"])
         lease_id = str(lease["lease_id"])
         try:
-            status = await self._task_state_futures.async_get_status(request_id)
+            status = await self._task_futures.async_get_status(request_id)
         except KeyError:
             await self._scheduler.complete_lease(
                 lease_id=lease_id,
@@ -449,7 +449,7 @@ class ModelRuntimeActor:
         attempt_id: str | None = None,
     ) -> bool:
         expected_meta = {"model_work_attempt_id": attempt_id} if attempt_id else None
-        out = await self._task_state_futures.async_fail_if_pending_meta_matches(
+        out = await self._task_futures.async_fail_if_pending_meta_matches(
             request_id,
             error,
             expected_meta=expected_meta,
@@ -521,7 +521,7 @@ class ModelRuntimeActor:
 
     async def _mark_running(self, lease: dict[str, Any]) -> None:
         item = lease["item"]
-        await self._task_state_futures.async_mark_running(
+        await self._task_futures.async_mark_running(
             str(item["request_id"]),
             meta={
                 "consumer_id": self._config.consumer_id,
@@ -672,7 +672,7 @@ class ModelRuntimeActor:
                         self._failed_total += 1
                 except Exception as e:
                     logger.error(
-                        "[model_runtime] lost-lease task_state_futures.fail failed actor=%s request_id=%s error_type=%s error=%s",
+                        "[model_runtime] lost-lease task_futures.fail failed actor=%s request_id=%s error_type=%s error=%s",
                         self._config.actor_name,
                         request_id,
                         type(e).__name__,
@@ -812,7 +812,7 @@ class ModelRuntimeActor:
                         self._failed_total += 1
                 except Exception as e2:
                     logger.error(
-                        "[model_runtime] lost-failure-lease task_state_futures.fail failed actor=%s request_id=%s error_type=%s error=%s",
+                        "[model_runtime] lost-failure-lease task_futures.fail failed actor=%s request_id=%s error_type=%s error=%s",
                         self._config.actor_name,
                         request_id,
                         type(e2).__name__,

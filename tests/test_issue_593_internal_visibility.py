@@ -41,7 +41,7 @@ def test_issue_593_internal_metrics_exports_scheduler_and_supervisor(monkeypatch
         assert include_actor_rss is False
         return {
             "capacity": {},
-            "task_state_futures": {},
+            "task_futures": {},
             "actors": {},
             "model_work_scheduler": {
                 "depth": 5,

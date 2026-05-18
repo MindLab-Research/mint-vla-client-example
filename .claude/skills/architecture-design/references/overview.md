@@ -34,7 +34,7 @@ Boundaries and tradeoffs:
 
 Hot HTTP paths must not block the API event loop on synchronous Ray control-plane calls.
 
-- Request routes use async APIs on detached control-plane actors (`TaskStateStore`, `ModelWorkScheduler`, metadata stores, and cleanup actors) and await Ray refs directly. `TaskStateFutures` is the in-process compatibility facade over `TaskStateStore`.
+- Request routes use async APIs on detached control-plane actors (`TaskStateStore`, `ModelWorkScheduler`, metadata stores, and cleanup actors) and await Ray refs directly. `TaskFutureService` is the in-process compatibility facade over `TaskStateStore`.
 - Startup is responsible for initializing Ray and warming detached actor handles.
 - Request paths fail fast when Ray is unavailable; they must not call `init_ray()` or silently reconnect from inside a route.
 - Detached metadata-store handles can be reacquired by name if the cached handle dies, but request paths still do not create new Ray clients or hide hard Ray outages.

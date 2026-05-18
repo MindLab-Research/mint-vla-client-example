@@ -11,7 +11,7 @@
 - Adding a new endpoint
   - Add/extend request/response types in `tinker_server/models/types.py`.
   - Implement route in `tinker_server/routes/*`.
-  - If work is async, return `request_id` and use `TaskStateFutures` + `/retrieve_future` semantics.
+  - If work is async, return `request_id` and use `TaskFutureService` + `/retrieve_future` semantics.
 
 - Adding or changing a Ray actor type
   - Decide: is it detached? If yes, add startup reconciliation logic in `tinker_server/app.py:_cleanup_stale_actors()`.

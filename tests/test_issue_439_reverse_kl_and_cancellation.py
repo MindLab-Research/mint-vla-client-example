@@ -14,7 +14,7 @@ from tinker_server.models.types import ComputeLogprobsRequest, ModelInput, Sampl
 from tinker_server.routes import sampling as sampling_route
 
 
-class _StubTaskStateFutures:
+class _StubTaskFutureService:
     def __init__(self):
         self.failed: dict[str, str] = {}
 
@@ -69,11 +69,11 @@ def test_issue_439_reverse_kl_entrypoints_exist() -> None:
 
 
 def test_issue_439_asample_cancellation_decrements_active_requests(monkeypatch: pytest.MonkeyPatch) -> None:
-    task_state_futures = _StubTaskStateFutures()
+    task_futures = _StubTaskFutureService()
     session_manager = _StubSessionManager()
     obs = RuntimeObservability()
 
-    monkeypatch.setattr(sampling_route, "task_state_futures", task_state_futures)
+    monkeypatch.setattr(sampling_route, "task_futures", task_futures)
     monkeypatch.setattr(sampling_route, "session_manager", session_manager)
     monkeypatch.setattr(
         sampling_route,
@@ -96,7 +96,7 @@ def test_issue_439_asample_cancellation_decrements_active_requests(monkeypatch: 
         anyio.run(sampling_route._do_sample, "req-sample-cancel", request, None, None)
 
     snap = obs.snapshot()
-    assert task_state_futures.failed == {"req-sample-cancel": "sampling task cancelled"}
+    assert task_futures.failed == {"req-sample-cancel": "sampling task cancelled"}
     assert session_manager.inflight == [("sess-1", 1), ("sess-1", -1)]
     assert snap["vllm_active_requests"] == [
         {
@@ -119,11 +119,11 @@ def test_issue_439_asample_cancellation_decrements_active_requests(monkeypatch: 
 
 
 def test_issue_439_compute_logprobs_cancellation_decrements_active_requests(monkeypatch: pytest.MonkeyPatch) -> None:
-    task_state_futures = _StubTaskStateFutures()
+    task_futures = _StubTaskFutureService()
     session_manager = _StubSessionManager()
     obs = RuntimeObservability()
 
-    monkeypatch.setattr(sampling_route, "task_state_futures", task_state_futures)
+    monkeypatch.setattr(sampling_route, "task_futures", task_futures)
     monkeypatch.setattr(sampling_route, "session_manager", session_manager)
     monkeypatch.setattr(
         "tinker_server.backend.runtime_observability.runtime_observability",
@@ -140,7 +140,7 @@ def test_issue_439_compute_logprobs_cancellation_decrements_active_requests(monk
         anyio.run(sampling_route._do_compute_logprobs, "req-logprobs-cancel", request, None, None)
 
     snap = obs.snapshot()
-    assert task_state_futures.failed == {"req-logprobs-cancel": "compute_logprobs task cancelled"}
+    assert task_futures.failed == {"req-logprobs-cancel": "compute_logprobs task cancelled"}
     assert session_manager.inflight == [("sess-1", 1), ("sess-1", -1)]
     assert snap["vllm_active_requests"] == [
         {

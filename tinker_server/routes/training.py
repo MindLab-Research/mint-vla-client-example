@@ -55,7 +55,7 @@ from ..logging_context import (
     start_as_current_span_from_traceparent,
 )
 
-from ..backend.task_state_store import FutureStatus, task_state_futures
+from ..backend.task_state_store import FutureStatus, task_futures
 from ..checkpoint_index import (
     CheckpointAlreadyExistsError,
     CheckpointAlreadyFailedError,
@@ -172,17 +172,17 @@ def _mark_training_inflight(model_id: str, delta: int) -> None:
 
 
 async def _fail_future(request_id: str, error: str) -> None:
-    async_fail = getattr(task_state_futures, "async_fail", None)
+    async_fail = getattr(task_futures, "async_fail", None)
     if callable(async_fail):
         result = async_fail(request_id, error)
         if inspect.isawaitable(result):
             await result
         return
-    fail = getattr(task_state_futures, "fail", None)
+    fail = getattr(task_futures, "fail", None)
     if callable(fail):
         fail(request_id, error)
         return
-    raise AttributeError("task_state_futures has neither async_fail nor fail")
+    raise AttributeError("task_futures has neither async_fail nor fail")
 
 
 def _get_user_data(request: Request) -> dict | None:
@@ -267,7 +267,7 @@ async def _enqueue_training_request_with_trace(
         if backend:
             span.set_attribute("backend", str(backend))
         span.add_event(
-            "task_state_futures_ready",
+            "task_futures_ready",
             {
                 "elapsed_ms": round(future_ready_elapsed_ms, 3),
                 "route_elapsed_ms": round(future_ready_elapsed_ms, 3),
@@ -337,7 +337,7 @@ async def _enqueue_training_model_work_route(
             "model_work_attempt_id": str(extra.get("model_work_attempt_id") or uuid.uuid4().hex),
         },
         queued_meta=queued_meta,
-        task_state_futures_client=task_state_futures,
+        task_futures_client=task_futures,
         scheduler_client=model_work_scheduler,
         trace_enqueue=_enqueue_training_request_with_trace,
         trace_kwargs={
@@ -710,7 +710,7 @@ async def _best_effort_delete_training_session(
         return False
 
     try:
-        fail_pending = getattr(task_state_futures, "async_fail_training_requests_for_model", None)
+        fail_pending = getattr(task_futures, "async_fail_training_requests_for_model", None)
         if callable(fail_pending):
             failed_request_ids = await fail_pending(
                 model_id,
@@ -1607,21 +1607,21 @@ async def _wait_internal_future_result(request_id: str) -> Any:
     poll_interval_s = _sync_route_wait_poll_interval_s()
     try:
         while True:
-            status = await task_state_futures.async_get_status(request_id)
+            status = await task_futures.async_get_status(request_id)
             if status == FutureStatus.PENDING:
                 if time.perf_counter() >= deadline:
                     raise TimeoutError(f"Timed out waiting for internal future request_id={request_id}")
                 await asyncio.sleep(poll_interval_s)
                 continue
             if status == FutureStatus.DONE:
-                return await task_state_futures.async_get_result(request_id)
+                return await task_futures.async_get_result(request_id)
             if status == FutureStatus.FAILED:
-                err = await task_state_futures.async_get_error(request_id)
+                err = await task_futures.async_get_error(request_id)
                 raise RuntimeError(str(err or f"internal queued op failed request_id={request_id}"))
             raise RuntimeError(f"internal future reached unexpected terminal state={status.value} request_id={request_id}")
     finally:
         try:
-            await task_state_futures.async_cleanup(request_id)
+            await task_futures.async_cleanup(request_id)
         except Exception:
             pass
 
@@ -1655,7 +1655,7 @@ async def _enqueue_internal_serialized_model_op(
             ordering_key=f"training_session:{model_id}",
             extra=dict(extra),
             queued_meta=_build_training_queued_meta(op=op, model_id=model_id),
-            task_state_futures_client=task_state_futures,
+            task_futures_client=task_futures,
             scheduler_client=model_work_scheduler,
         )
         created = True
@@ -1663,7 +1663,7 @@ async def _enqueue_internal_serialized_model_op(
         if inflight_marked and training_manager is not None:
             training_manager.mark_inflight(model_id, -1)
         if created:
-            await task_state_futures.async_cleanup(request_id)
+            await task_futures.async_cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue {op} request: {e}") from e
     return request_id
 # =============================================================================
@@ -1788,7 +1788,7 @@ async def create_model(
             ordering_key=f"training_session:{model_id}",
             extra=scheduler_extra,
             queued_meta=_build_training_queued_meta(op="create_model", model_id=model_id),
-            task_state_futures_client=task_state_futures,
+            task_futures_client=task_futures,
             scheduler_client=model_work_scheduler,
             trace_enqueue=_enqueue_training_request_with_trace,
             trace_kwargs={
@@ -1928,7 +1928,7 @@ async def _do_create_model(
             type="create_model",
             backend=planned_backend,
         )
-        await task_state_futures.async_resolve(request_id, response.model_dump())
+        await task_futures.async_resolve(request_id, response.model_dump())
 
         if webhook_url and user_id:
             send_task_event(
@@ -1968,7 +1968,7 @@ async def _do_create_model(
             get_model_actor_supervisor().clear_session(model_id)
         except Exception:
             pass
-        await task_state_futures.async_fail(request_id, str(e))
+        await task_futures.async_fail(request_id, str(e))
 
         if webhook_url and user_id:
             send_task_event(
@@ -2193,7 +2193,7 @@ async def create_model_from_state(
             ordering_key=f"training_session:{model_id}",
             extra=scheduler_extra,
             queued_meta=_build_training_queued_meta(op="create_model_from_state", model_id=model_id),
-            task_state_futures_client=task_state_futures,
+            task_futures_client=task_futures,
             scheduler_client=model_work_scheduler,
             trace_enqueue=_enqueue_training_request_with_trace,
             trace_kwargs={
@@ -2338,7 +2338,7 @@ async def _do_create_model_from_state(
             model_id=model_id,
             type="create_model_from_state",
         )
-        await task_state_futures.async_resolve(request_id, response.model_dump())
+        await task_futures.async_resolve(request_id, response.model_dump())
 
     except Exception as e:
         logger.exception(
@@ -2371,7 +2371,7 @@ async def _do_create_model_from_state(
             delete_training_session(model_id)
         except Exception:
             pass
-        await task_state_futures.async_fail(request_id, str(e))
+        await task_futures.async_fail(request_id, str(e))
     finally:
         if inflight_marked and training_manager is not None:
             training_manager.mark_inflight(model_id, -1)
@@ -2571,7 +2571,7 @@ async def _do_forward_backward(
         logger.info(
             f"[{session.model_id}] forward_backward done: elapsed_s={elapsed_s:.3f}"
         )
-        await task_state_futures.async_resolve(request_id, result)
+        await task_futures.async_resolve(request_id, result)
         if gateway_auth:
             auth_ctx = GatewayAuthContext(**gateway_auth)
             await _persist_usage_events(
@@ -2601,7 +2601,7 @@ async def _do_forward_backward(
             type(e).__name__,
             "check_training_session_and_batch_shape",
         )
-        await task_state_futures.async_fail(request_id, str(e))
+        await task_futures.async_fail(request_id, str(e))
     finally:
         if inflight_marked and training_manager is not None:
             training_manager.mark_inflight(request.model_id, -1)
@@ -2790,7 +2790,7 @@ async def _do_train_step(
         elapsed_s = time.time() - t0
         msg = f"[{session.model_id}] train_step done request_id={request_id} elapsed_s={elapsed_s:.3f}"
         logger.info(msg)
-        await task_state_futures.async_resolve(request_id, result)
+        await task_futures.async_resolve(request_id, result)
         if gateway_auth:
             auth_ctx = GatewayAuthContext(**gateway_auth)
             await _persist_usage_events(
@@ -2820,7 +2820,7 @@ async def _do_train_step(
             type(e).__name__,
             "check_training_session_and_actor",
         )
-        await task_state_futures.async_fail(request_id, str(e))
+        await task_futures.async_fail(request_id, str(e))
     finally:
         if inflight_marked and training_manager is not None:
             training_manager.mark_inflight(request.model_id, -1)
@@ -3008,7 +3008,7 @@ async def _do_forward(
         )
         elapsed_s = time.time() - t0
         logger.info(f"[{session.model_id}] forward done: elapsed_s={elapsed_s:.3f}")
-        await task_state_futures.async_resolve(request_id, result)
+        await task_futures.async_resolve(request_id, result)
         if gateway_auth:
             auth_ctx = GatewayAuthContext(**gateway_auth)
             await _persist_usage_events(
@@ -3038,7 +3038,7 @@ async def _do_forward(
             type(e).__name__,
             "check_training_session_and_input_tokens",
         )
-        await task_state_futures.async_fail(request_id, str(e))
+        await task_futures.async_fail(request_id, str(e))
     finally:
         if inflight_marked and training_manager is not None:
             training_manager.mark_inflight(request.model_id, -1)
@@ -3208,7 +3208,7 @@ async def _do_optim_step(request_id: str, request: OptimStepRequest, user_id: st
         elapsed_s = time.time() - t0
         msg = f"[{session.model_id}] optim_step done request_id={request_id} elapsed_s={elapsed_s:.3f}"
         logger.info(msg)
-        await task_state_futures.async_resolve(request_id, result)
+        await task_futures.async_resolve(request_id, result)
 
     except Exception as e:
         logger.exception(
@@ -3219,7 +3219,7 @@ async def _do_optim_step(request_id: str, request: OptimStepRequest, user_id: st
             type(e).__name__,
             "check_training_session_and_optimizer_state",
         )
-        await task_state_futures.async_fail(request_id, str(e))
+        await task_futures.async_fail(request_id, str(e))
     finally:
         if inflight_marked and training_manager is not None:
             training_manager.mark_inflight(request.model_id, -1)
@@ -3331,7 +3331,7 @@ async def _do_reset_expert_bias(
 
         result = await training_engine.reset_expert_bias(session)
         modules_reset = int(result.get("modules_reset", 0) or 0)
-        await task_state_futures.async_resolve(
+        await task_futures.async_resolve(
             request_id,
             ResetExpertBiasResponse(
                 model_id=request.model_id,
@@ -3347,7 +3347,7 @@ async def _do_reset_expert_bias(
             type(e).__name__,
             e,
         )
-        await task_state_futures.async_fail(request_id, str(e))
+        await task_futures.async_fail(request_id, str(e))
     finally:
         if inflight_marked and training_manager is not None:
             training_manager.mark_inflight(request.model_id, -1)
@@ -3845,7 +3845,7 @@ async def _do_save_weights_for_sampler(
                 sampling_session_id=sampling_session_id,
             ).model_dump()
 
-        await task_state_futures.async_resolve(request_id, response)
+        await task_futures.async_resolve(request_id, response)
 
     except Exception as e:
         if not mirror_started:
@@ -3879,7 +3879,7 @@ async def _do_save_weights_for_sampler(
             type(e).__name__,
             "check_checkpoint_export_and_inference_registration",
         )
-        await task_state_futures.async_fail(request_id, str(e))
+        await task_futures.async_fail(request_id, str(e))
     finally:
         if inflight_marked and training_manager is not None:
             training_manager.mark_inflight(request.model_id, -1)
@@ -4199,7 +4199,7 @@ async def _do_delete_model(request_id: str, model_id: str) -> None:
         except Exception:
             pass
 
-        await task_state_futures.async_resolve(request_id, {"model_id": model_id, "status": "deleted"})
+        await task_futures.async_resolve(request_id, {"model_id": model_id, "status": "deleted"})
     except Exception as e:
         logger.exception(
             "[training.delete_model] failed request_id=%s model_id=%s error_type=%s error=%s",
@@ -4208,7 +4208,7 @@ async def _do_delete_model(request_id: str, model_id: str) -> None:
             type(e).__name__,
             e,
         )
-        await task_state_futures.async_fail(request_id, str(e))
+        await task_futures.async_fail(request_id, str(e))
     finally:
         if inflight_marked and training_manager is not None:
             training_manager.mark_inflight(model_id, -1)
