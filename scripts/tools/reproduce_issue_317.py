@@ -9,14 +9,14 @@ from typing import Any
 import requests
 
 
-BASE_URL = (os.environ.get("TINKER_BASE_URL") or f"http://localhost:{os.environ.get('TINKER_PORT', '10317')}").rstrip("/")
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
-BASE_MODEL = os.environ.get("TINKER_BASE_MODEL", "Qwen/Qwen3-0.6B")
-LORA_RANK = int(os.environ.get("TINKER_LORA_RANK", "8"))
-SAVE_TIMEOUT_S = float(os.environ.get("TINKER_SAVE_TIMEOUT_S", "20"))
-FUTURE_TIMEOUT_S = float(os.environ.get("TINKER_FUTURE_TIMEOUT_S", "900"))
-LIST_COMPLETE_TIMEOUT_S = float(os.environ.get("TINKER_LIST_COMPLETE_TIMEOUT_S", "120"))
-POLL_SLEEP_S = float(os.environ.get("TINKER_POLL_SLEEP_S", "1.0"))
+BASE_URL = (os.environ.get("MINT_BASE_URL") or f"http://localhost:{os.environ.get('MINT_PORT', '10317')}").rstrip("/")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
+BASE_MODEL = os.environ.get("MINT_BASE_MODEL", "Qwen/Qwen3-0.6B")
+LORA_RANK = int(os.environ.get("MINT_LORA_RANK", "8"))
+SAVE_TIMEOUT_S = float(os.environ.get("MINT_SAVE_TIMEOUT_S", "20"))
+FUTURE_TIMEOUT_S = float(os.environ.get("MINT_FUTURE_TIMEOUT_S", "900"))
+LIST_COMPLETE_TIMEOUT_S = float(os.environ.get("MINT_LIST_COMPLETE_TIMEOUT_S", "120"))
+POLL_SLEEP_S = float(os.environ.get("MINT_POLL_SLEEP_S", "1.0"))
 PENDING_CACHE_STATUSES = {"pending", "in_progress"}
 
 

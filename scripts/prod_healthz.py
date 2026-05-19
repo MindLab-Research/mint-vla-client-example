@@ -41,11 +41,11 @@ def main() -> int:
     ap.add_argument(
         "--base-url",
         default=None,
-        help="Defaults to $MINT_BASE_URL, then $TINKER_BASE_URL, then https://mint.macaron.im",
+        help="Defaults to $MINT_BASE_URL, then $MINT_BASE_URL, then https://mint.macaron.im",
     )
     args = ap.parse_args()
 
-    base_url = args.base_url or os.environ.get("MINT_BASE_URL") or os.environ.get("TINKER_BASE_URL")
+    base_url = args.base_url or os.environ.get("MINT_BASE_URL") or os.environ.get("MINT_BASE_URL")
     if not base_url:
         base_url = "https://mint.macaron.im"
 

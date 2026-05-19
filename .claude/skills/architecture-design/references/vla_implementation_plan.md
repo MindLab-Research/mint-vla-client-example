@@ -71,7 +71,7 @@ This historical plan was written before the runtime contract was pulled into Min
 
 The current rule is:
 
-- `src/mint/pyproject.toml` owns `tool.tinker.runtime_env`
+- `src/mint/pyproject.toml` owns `tool.mint.runtime_env`
 - the OpenPI source contract includes both `src/openpi/src` and `src/openpi/packages/openpi-client/src`
 - host requirements explicitly include the OpenPI worker stack
 - `src/mint/scripts/build_runtime_env.py --inspect --env-root ...` is the canonical probe for manifest, layout, and host-python import checks

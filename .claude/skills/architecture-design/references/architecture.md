@@ -1,6 +1,6 @@
-# tinker-server architecture reference (index)
+# mint-server architecture reference (index)
 
-tinker-server ("MinT") is a FastAPI service that implements a Tinker-compatible REST API and brokers training/inference to Ray GPU actors.
+mint-server is the MinT FastAPI service that implements a Tinker-compatible REST API and brokers training/inference to Ray GPU actors.
 
 This reference is split by topic for faster lookup. Start here, then open the relevant topic file.
 

@@ -8,13 +8,13 @@ import pytest
 
 pytest.importorskip("ray")
 
-from tinker_server.backend import dense_session_state as dense_state_module
-import tinker_server.backend.model_actor_inventory as model_actor_inventory_module
-from tinker_server.backend.model_actor_supervisor import ActorType, get_model_actor_supervisor
-from tinker_server.backend.training_session_manager import TrainingSession
-from tinker_server.backend.verl_training import SessionStateManager, TrainingWorker, VerlTrainingEngine
-from tinker_server.config import config as server_config
-from tinker_server.routes import internal as internal_routes
+from mint_server.backend import dense_session_state as dense_state_module
+import mint_server.backend.model_actor_inventory as model_actor_inventory_module
+from mint_server.backend.model_actor_supervisor import ActorType, get_model_actor_supervisor
+from mint_server.backend.training_session_manager import TrainingSession
+from mint_server.backend.verl_training import SessionStateManager, TrainingWorker, VerlTrainingEngine
+from mint_server.config import config as server_config
+from mint_server.routes import internal as internal_routes
 
 
 @pytest.fixture
@@ -78,7 +78,7 @@ def test_issue_413_shutdown_session_reclaims_dense_state_for_shared_actor(
     dense_root = tmp_path / "runtime" / "dense_session_state"
     monkeypatch.setattr(server_config, "training_dense_session_state_root", str(dense_root))
 
-    import tinker_server.config as config_module
+    import mint_server.config as config_module
 
     runtime_env_root = (tmp_path / "runtime_env").resolve()
     runtime_env_root.mkdir(parents=True, exist_ok=True)
@@ -87,7 +87,7 @@ def test_issue_413_shutdown_session_reclaims_dense_state_for_shared_actor(
     monkeypatch.setattr(model_actor_inventory_module.ray, "is_initialized", lambda: False)
     pool = get_model_actor_supervisor()
     pool.clear(kill_actors=False)
-    actor_name = f"peft_trainer_test_{uuid.uuid4().hex}_maxr64"
+    actor_name = f"mint_dense_test_{uuid.uuid4().hex}"
     model_id = f"model_{uuid.uuid4().hex}"
     other_model_id = f"model_{uuid.uuid4().hex}"
 
@@ -117,7 +117,7 @@ def test_issue_413_shutdown_session_reclaims_dense_state_for_shared_actor(
         backend="peft",
     )
 
-    import tinker_server.backend.verl_training as verl_training
+    import mint_server.backend.verl_training as verl_training
 
     monkeypatch.setattr(verl_training.ray, "get", lambda value, timeout=None: value)
 

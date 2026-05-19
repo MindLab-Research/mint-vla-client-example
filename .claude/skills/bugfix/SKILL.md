@@ -38,8 +38,8 @@ Write a script that can run against either production or development:
 # scripts/tools/reproduce_issue_<NUMBER>.py
 import os
 
-BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000")
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
+BASE_URL = os.environ.get("MINT_BASE_URL", "http://localhost:8000")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
 
 # ... reproduction logic using BASE_URL and API_KEY
 ```
@@ -59,8 +59,8 @@ Do not run any production-side kill/restart commands during reproduction. Use HT
 
 ```bash
 # SSH to prod server to READ logs only
-ssh mint-prod-volcano "tail -100 /tmp/tinker_server_auth.log"
-ssh mint-prod-volcano "grep -i 'error\|exception' /tmp/tinker_server_auth.log | tail -30"
+ssh mint-prod-volcano "tail -100 /tmp/mint_server_auth.log"
+ssh mint-prod-volcano "grep -i 'error\|exception' /tmp/mint_server_auth.log | tail -30"
 ```
 
 > **WARNING: DO NOT run any commands that modify state on mint-prod.**
@@ -95,7 +95,7 @@ If reproduction requires `model_path` or `state_path` pointing at an absolute ch
 - Use an admin API key on the dev server. Absolute paths are rejected for non-admin requests.
 - If you need a private dev server, follow the `mint-dev` skill's isolated debug server rules:
   - Python attach uses `ray://<head_ip>:10001`, not raw `:6379`
-  - fresh `TINKER_RAY_NAMESPACE` and `MINT_RAY_NAMESPACE`
+  - fresh `MINT_RAY_NAMESPACE`
   - fresh `MINT_STARTUP_LEASE_ACTOR_NAME`
   - `MINT_UVICORN_WORKERS=1`
 - Do not spend time on model-level debugging until that private server can pass:
@@ -112,8 +112,8 @@ python scripts/tools/reproduce_issue_<NUMBER>.py
 
 Or explicitly:
 ```bash
-TINKER_BASE_URL=http://localhost:8000 \
-TINKER_API_KEY=dummy \
+MINT_BASE_URL=http://localhost:8000 \
+MINT_API_KEY=dummy \
 python scripts/tools/reproduce_issue_<NUMBER>.py
 ```
 
@@ -180,11 +180,11 @@ Examples that usually require doc updates:
 
 | Task | Command |
 |------|---------|
-| Reproduce on prod (China) | `TINKER_BASE_URL=https://mint.macaron.xin TINKER_API_KEY=<admin_key> python scripts/tools/reproduce_issue_X.py` |
-| Reproduce on prod (international) | `TINKER_BASE_URL=https://mint.macaron.im TINKER_API_KEY=<admin_key> python scripts/tools/reproduce_issue_X.py` |
+| Reproduce on prod (China) | `MINT_BASE_URL=https://mint.macaron.xin MINT_API_KEY=<admin_key> python scripts/tools/reproduce_issue_X.py` |
+| Reproduce on prod (international) | `MINT_BASE_URL=https://mint.macaron.im MINT_API_KEY=<admin_key> python scripts/tools/reproduce_issue_X.py` |
 | Reproduce on dev | `python scripts/tools/reproduce_issue_X.py` |
-| Prod logs (READ-ONLY) | `ssh mint-prod-volcano "tail -100 /tmp/tinker_server_auth.log"` |
-| Dev logs | `ssh mint-dev "tail -100 /tmp/tinker_server.log"` |
+| Prod logs (READ-ONLY) | `ssh mint-prod-volcano "tail -100 /tmp/mint_server_auth.log"` |
+| Dev logs | `ssh mint-dev "tail -100 /tmp/mint_server.log"` |
 | Health check | `curl http://localhost:8000/api/v1/healthz` |
 
 ---

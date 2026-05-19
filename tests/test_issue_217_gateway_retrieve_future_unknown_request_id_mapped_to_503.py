@@ -3,8 +3,8 @@ import httpx
 import pytest
 from types import SimpleNamespace
 
-from tinker_server.models.types import FutureRetrieveRequest
-from tinker_server.routes import futures as futures_route
+from mint_server.models.types import FutureRetrieveRequest
+from mint_server.routes import futures as futures_route
 
 
 def _request_non_privileged():
@@ -20,7 +20,7 @@ def _response_stub():
 
 
 def test_issue_217_gateway_unknown_request_id_maps_404_to_503_non_privileged(monkeypatch):
-    import tinker_server.gateway as gw
+    import mint_server.gateway as gw
     monkeypatch.setattr(futures_route, "_is_privileged", lambda _req: False)
 
     async def _forward_json(*, upstream, method, path, incoming_headers, json_body, timeout_s=30.0):
@@ -44,7 +44,7 @@ def test_issue_217_gateway_unknown_request_id_maps_404_to_503_non_privileged(mon
 
 
 def test_issue_217_gateway_unknown_request_id_maps_404_to_503_privileged(monkeypatch):
-    import tinker_server.gateway as gw
+    import mint_server.gateway as gw
     monkeypatch.setattr(futures_route, "_is_privileged", lambda _req: True)
 
     async def _forward_json(*, upstream, method, path, incoming_headers, json_body, timeout_s=30.0):

@@ -12,8 +12,8 @@ import requests
 # Configuration
 # =============================================================================
 
-BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000")
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
+BASE_URL = os.environ.get("MINT_BASE_URL", "http://localhost:8000")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
 
 DEFAULT_POLL_TIMEOUT_S = int(os.environ.get("MINT_MERGE_GATE_POLL_TIMEOUT_S", "900"))
 

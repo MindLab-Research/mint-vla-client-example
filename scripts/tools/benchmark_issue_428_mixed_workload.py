@@ -17,28 +17,28 @@ def _env(name: str, default: str) -> str:
     return value if value is not None and value != "" else default
 
 
-BASE_URL = _env("TINKER_BASE_URL", "http://localhost:8000").rstrip("/")
-API_KEY = _env("TINKER_API_KEY", "")
-MODEL = _env("TINKER_BASE_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
-REQUEST_TIMEOUT_S = float(_env("TINKER_REQUEST_TIMEOUT_S", "30"))
-POLL_TIMEOUT_S = float(_env("TINKER_POLL_TIMEOUT_S", "1800"))
-POLL_SLEEP_S = float(_env("TINKER_POLL_SLEEP_S", "0.2"))
-TRIALS = int(_env("TINKER_TRIALS", "1"))
-PROMPT_LEN = int(_env("TINKER_PROMPT_LEN", "4096"))
-MULTI_NUM_SAMPLES = int(_env("TINKER_MULTI_NUM_SAMPLES", "8"))
-MULTI_MAX_TOKENS = int(_env("TINKER_MULTI_MAX_TOKENS", "256"))
-ORDINARY_CONCURRENCY = int(_env("TINKER_ORDINARY_CONCURRENCY", "8"))
-ORDINARY_MAX_TOKENS = int(_env("TINKER_ORDINARY_MAX_TOKENS", "256"))
-MULTI_SUBMIT_GAP_S = float(_env("TINKER_MULTI_SUBMIT_GAP_S", "0.3"))
-ORDINARY_SUBMIT_GAP_S = float(_env("TINKER_ORDINARY_SUBMIT_GAP_S", "0.0"))
-SECOND_MULTISAMPLE = _env("TINKER_SECOND_MULTISAMPLE", "0") in {"1", "true", "yes", "on"}
-SECOND_MULTI_GAP_S = float(_env("TINKER_SECOND_MULTI_GAP_S", "0.3"))
-TEMPERATURE = float(_env("TINKER_TEMPERATURE", "0.7"))
-TOP_P = float(_env("TINKER_TOP_P", "1.0"))
-SEED = int(_env("TINKER_SEED", "123"))
-RUN_LABEL = _env("TINKER_RUN_LABEL", "issue428-mixed")
-WARMUP = _env("TINKER_WARMUP", "1") in {"1", "true", "yes", "on"}
-WARMUP_MAX_TOKENS = int(_env("TINKER_WARMUP_MAX_TOKENS", "16"))
+BASE_URL = _env("MINT_BASE_URL", "http://localhost:8000").rstrip("/")
+API_KEY = _env("MINT_API_KEY", "")
+MODEL = _env("MINT_BASE_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
+REQUEST_TIMEOUT_S = float(_env("MINT_REQUEST_TIMEOUT_S", "30"))
+POLL_TIMEOUT_S = float(_env("MINT_POLL_TIMEOUT_S", "1800"))
+POLL_SLEEP_S = float(_env("MINT_POLL_SLEEP_S", "0.2"))
+TRIALS = int(_env("MINT_TRIALS", "1"))
+PROMPT_LEN = int(_env("MINT_PROMPT_LEN", "4096"))
+MULTI_NUM_SAMPLES = int(_env("MINT_MULTI_NUM_SAMPLES", "8"))
+MULTI_MAX_TOKENS = int(_env("MINT_MULTI_MAX_TOKENS", "256"))
+ORDINARY_CONCURRENCY = int(_env("MINT_ORDINARY_CONCURRENCY", "8"))
+ORDINARY_MAX_TOKENS = int(_env("MINT_ORDINARY_MAX_TOKENS", "256"))
+MULTI_SUBMIT_GAP_S = float(_env("MINT_MULTI_SUBMIT_GAP_S", "0.3"))
+ORDINARY_SUBMIT_GAP_S = float(_env("MINT_ORDINARY_SUBMIT_GAP_S", "0.0"))
+SECOND_MULTISAMPLE = _env("MINT_SECOND_MULTISAMPLE", "0") in {"1", "true", "yes", "on"}
+SECOND_MULTI_GAP_S = float(_env("MINT_SECOND_MULTI_GAP_S", "0.3"))
+TEMPERATURE = float(_env("MINT_TEMPERATURE", "0.7"))
+TOP_P = float(_env("MINT_TOP_P", "1.0"))
+SEED = int(_env("MINT_SEED", "123"))
+RUN_LABEL = _env("MINT_RUN_LABEL", "issue428-mixed")
+WARMUP = _env("MINT_WARMUP", "1") in {"1", "true", "yes", "on"}
+WARMUP_MAX_TOKENS = int(_env("MINT_WARMUP_MAX_TOKENS", "16"))
 
 
 @dataclass

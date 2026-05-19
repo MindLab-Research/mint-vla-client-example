@@ -4,7 +4,7 @@
 Inputs:
 - One or more JSONL files produced by scripts/tools/bench_issue129_vllm_lora_asample.py
 - A text file containing server logs with `[vLLM timing] ... req=... total_s=... first_tok_s=...`
-  plus optional `[coalesce flush] ... rid_ns=...` lines (added in tinker_server/routes/sampling.py).
+  plus optional `[coalesce flush] ... rid_ns=...` lines (added in mint_server/routes/sampling.py).
 
 Outputs (written to --out-dir):
 - summary.csv

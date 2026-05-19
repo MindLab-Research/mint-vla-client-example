@@ -7,7 +7,7 @@ import pytest
 
 
 def test_issue_88_safe_extract_strips_single_root(tmp_path: Path) -> None:
-    from tinker_server import checkpoints
+    from mint_server import checkpoints
 
     archive_path = tmp_path / "ckpt.tar.gz"
     root = "ckpt_original"
@@ -34,7 +34,7 @@ def test_issue_88_safe_extract_strips_single_root(tmp_path: Path) -> None:
 
 
 def test_issue_88_safe_extract_rejects_path_traversal(tmp_path: Path) -> None:
-    from tinker_server import checkpoints
+    from mint_server import checkpoints
 
     archive_path = tmp_path / "evil.tar.gz"
     with tarfile.open(archive_path, "w:gz") as tf:
@@ -49,7 +49,7 @@ def test_issue_88_safe_extract_rejects_path_traversal(tmp_path: Path) -> None:
 
 
 def test_issue_88_resolve_ckpt_id(tmp_path: Path) -> None:
-    from tinker_server import checkpoints
+    from mint_server import checkpoints
 
     ckpt_id = "ckpt_123456789abc"
     ckpt_dir = tmp_path / "anonymous" / ckpt_id
@@ -60,7 +60,7 @@ def test_issue_88_resolve_ckpt_id(tmp_path: Path) -> None:
 
 
 def test_issue_88_validate_checkpoint_dir_accepts_megatron_shards(tmp_path: Path) -> None:
-    from tinker_server import checkpoints
+    from mint_server import checkpoints
 
     ckpt_dir = tmp_path / "ckpt_x"
     ckpt_dir.mkdir()

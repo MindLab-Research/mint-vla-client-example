@@ -10,7 +10,7 @@ import torch
 
 
 def test_rollout_correction_request_accepts_icepop_threshold_string() -> None:
-    from tinker_server.models.types import CreateModelRequest
+    from mint_server.models.types import CreateModelRequest
 
     request = CreateModelRequest.model_validate(
         {
@@ -156,7 +156,7 @@ def test_create_ppo_loss_fn_bypass_mode_uses_current_rollout_helper_signature(mo
     monkeypatch.setitem(sys.modules, "verl.workers.config", workers_config_mod)
 
     module_name = "test_megatron_training_icepop_support"
-    module_path = Path(__file__).resolve().parents[1] / "tinker_server" / "backend" / "megatron_training.py"
+    module_path = Path(__file__).resolve().parents[1] / "mint_server" / "backend" / "megatron_training.py"
     spec = importlib.util.spec_from_file_location(module_name, module_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)

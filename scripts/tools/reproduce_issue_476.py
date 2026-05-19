@@ -10,15 +10,15 @@ from typing import Any
 import requests
 
 
-BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000").rstrip("/")
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
+BASE_URL = os.environ.get("MINT_BASE_URL", "http://localhost:8000").rstrip("/")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
 RAY_ADDRESS = os.environ.get("RAY_ADDRESS", "").strip()
 RAY_NAMESPACE = (
-    os.environ.get("TINKER_RAY_NAMESPACE")
+    os.environ.get("MINT_RAY_NAMESPACE")
     or os.environ.get("MINT_RAY_NAMESPACE")
     or ""
 ).strip()
-SSH_HOST = os.environ.get("TINKER_DEV_SSH_HOST", "mint-dev").strip()
+SSH_HOST = os.environ.get("MINT_DEV_SSH_HOST", "mint-dev").strip()
 
 BASE_MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 HIGH_RANK = 64
@@ -166,14 +166,14 @@ def _run_python(code: str, timeout_s: float = 120.0) -> str:
         if RAY_ADDRESS:
             env["RAY_ADDRESS"] = RAY_ADDRESS
         if RAY_NAMESPACE:
-            env["TINKER_RAY_NAMESPACE"] = RAY_NAMESPACE
+            env["MINT_RAY_NAMESPACE"] = RAY_NAMESPACE
             env["MINT_RAY_NAMESPACE"] = RAY_NAMESPACE
     else:
         cmd = ["ssh", SSH_HOST]
         if RAY_ADDRESS:
             cmd.append(f"RAY_ADDRESS={RAY_ADDRESS}")
         if RAY_NAMESPACE:
-            cmd.append(f"TINKER_RAY_NAMESPACE={RAY_NAMESPACE}")
+            cmd.append(f"MINT_RAY_NAMESPACE={RAY_NAMESPACE}")
             cmd.append(f"MINT_RAY_NAMESPACE={RAY_NAMESPACE}")
         cmd.extend(["/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python", "-"])
         env = None
@@ -197,14 +197,14 @@ def _actor_infos() -> list[dict[str, Any]]:
     if not RAY_ADDRESS:
         raise RuntimeError("RAY_ADDRESS is required")
     if not RAY_NAMESPACE:
-        raise RuntimeError("TINKER_RAY_NAMESPACE or MINT_RAY_NAMESPACE is required")
+        raise RuntimeError("MINT_RAY_NAMESPACE or MINT_RAY_NAMESPACE is required")
     code = f"""
 import json
 import os
 import ray
 
 ray.init(address=os.environ["RAY_ADDRESS"], ignore_reinit_error=True)
-ns = os.environ["TINKER_RAY_NAMESPACE"]
+ns = os.environ["MINT_RAY_NAMESPACE"]
 rows = []
 for entry in ray.util.list_named_actors(all_namespaces=True):
     if entry.get("namespace") != ns:

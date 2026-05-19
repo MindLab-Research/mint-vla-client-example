@@ -87,15 +87,15 @@ def _load_env() -> None:
 
 def _base_url(args: argparse.Namespace) -> str:
     """Get base URL from args or environment."""
-    base_url = args.base_url or os.environ.get("TINKER_BASE_URL") or os.environ.get("MINT_BASE_URL")
+    base_url = args.base_url or os.environ.get("MINT_BASE_URL") or os.environ.get("MINT_BASE_URL")
     if not base_url:
-        raise ValueError("Base URL not provided. Set --base-url or TINKER_BASE_URL/MINT_BASE_URL")
+        raise ValueError("Base URL not provided. Set --base-url or MINT_BASE_URL/MINT_BASE_URL")
     return base_url.rstrip("/")
 
 
 def _headers(args: argparse.Namespace) -> dict[str, str]:
     """Get API headers."""
-    api_key = args.api_key or os.environ.get("TINKER_API_KEY") or os.environ.get("MINT_API_KEY")
+    api_key = args.api_key or os.environ.get("MINT_API_KEY") or os.environ.get("MINT_API_KEY")
     if api_key:
         return {"X-API-Key": api_key}
     return {}

@@ -6,19 +6,19 @@ from typing import Any
 import requests
 
 
-BASE_URL = os.environ.get("TINKER_BASE_URL")
+BASE_URL = os.environ.get("MINT_BASE_URL")
 if not BASE_URL:
-    port = os.environ.get("TINKER_PORT", "8000")
+    port = os.environ.get("MINT_PORT", "8000")
     BASE_URL = f"http://localhost:{port}"
 BASE_URL = BASE_URL.rstrip("/")
 
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
 
-MODEL = os.environ.get("TINKER_MODEL", "Qwen/Qwen3-0.6B")
-LORA_RANK = int(os.environ.get("TINKER_LORA_RANK", "32"))
+MODEL = os.environ.get("MINT_MODEL", "Qwen/Qwen3-0.6B")
+LORA_RANK = int(os.environ.get("MINT_LORA_RANK", "32"))
 
-POLL_TIMEOUT_S = float(os.environ.get("TINKER_POLL_TIMEOUT_S", "1800"))
-POLL_SLEEP_S = float(os.environ.get("TINKER_POLL_SLEEP_S", "2.0"))
+POLL_TIMEOUT_S = float(os.environ.get("MINT_POLL_TIMEOUT_S", "1800"))
+POLL_SLEEP_S = float(os.environ.get("MINT_POLL_SLEEP_S", "2.0"))
 
 
 def _headers() -> dict[str, str]:
@@ -142,7 +142,7 @@ def main() -> int:
         tinker_path = out.get("tinker_path")
         if not isinstance(tinker_path, str) or not tinker_path:
             return _fail(f"save_state response missing tinker_path payload_keys={sorted(out.keys())!r}")
-        if not tinker_path.startswith("tinker://"):
+        if not tinker_path.startswith("mint://"):
             return _fail(f"save_state returned invalid tinker_path={tinker_path!r}")
 
         print("PASS")

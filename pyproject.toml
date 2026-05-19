@@ -1,7 +1,7 @@
 [project]
-name = "tinker-server"
+name = "mint-server"
 version = "0.1.0"
-description = "Tinker-compatible inference server wrapping verl"
+description = "Mint server implementing a Tinker-compatible inference and training API"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "fastapi[standard]==0.121.2",
@@ -79,7 +79,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["tinker_server*"]
+include = ["mint_server*"]
 
 [tool.pytest.ini_options]
 markers = [
@@ -102,7 +102,7 @@ dev = [
     "trio>=0.33.0",
 ]
 
-[tool.tinker.runtime_env]
+[tool.mint.runtime_env]
 python_version = "3.12.13"
 site_packages_dir = "site-packages"
 source_dir = "src"
@@ -141,31 +141,31 @@ host_requirements = [
     "wandb>=0.19.1",
 ]
 
-[[tool.tinker.runtime_env.sources]]
+[[tool.mint.runtime_env.sources]]
 name = "Megatron-LM"
 repo = "https://github.com/NVIDIA/Megatron-LM.git"
 commit = "2d398b42fd4237fffb553109563d73ac099751c3"
 pythonpath = ["."]
 
-[[tool.tinker.runtime_env.sources]]
+[[tool.mint.runtime_env.sources]]
 name = "Megatron-Bridge"
 repo = "https://github.com/HollowMan6/Megatron-Bridge.git"
 commit = "762fc5d3b717d24327c00ae37ce2be573e3f343b"
 pythonpath = ["src", "."]
 
-[[tool.tinker.runtime_env.sources]]
+[[tool.mint.runtime_env.sources]]
 name = "verl"
 repo = "https://github.com/verl-project/verl.git"
 commit = "d2916f5a0ed346464d8999e040e0ebb05bb8fadf"
 pythonpath = ["."]
 
-[[tool.tinker.runtime_env.sources]]
+[[tool.mint.runtime_env.sources]]
 name = "openpi"
 repo = "https://github.com/Physical-Intelligence/openpi.git"
 commit = "e6b044115c075dc64a2e4e23d33ea3a3c293f123"
 pythonpath = ["src", "packages/openpi-client/src"]
 
-[[tool.tinker.runtime_env.sources]]
+[[tool.mint.runtime_env.sources]]
 name = "vllm"
 repo = "https://github.com/vllm-project/vllm.git"
 commit = "89a77b10846fd96273cce78d86d2556ea582d26e"
@@ -174,7 +174,7 @@ host_only = true
 package_name = "vllm"
 version = "0.16.0"
 
-[tool.tinker.runtime_env.image_managed]
+[tool.mint.runtime_env.image_managed]
 torch = "2.9.1+cu129 from mint:16 base image"
 vllm = "0.16.x from mint:16 base image"
 deep_ep = "base image managed"

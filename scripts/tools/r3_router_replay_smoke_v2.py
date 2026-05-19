@@ -44,7 +44,7 @@ def _coalesce(*values: str | None) -> str | None:
 def _base_url(args: argparse.Namespace) -> str:
     base = _coalesce(
         getattr(args, "base_url", None),
-        os.environ.get("TINKER_BASE_URL"),
+        os.environ.get("MINT_BASE_URL"),
         os.environ.get("MINT_BASE_URL"),
         DEFAULT_BASE_URL,
     ) or DEFAULT_BASE_URL
@@ -52,7 +52,7 @@ def _base_url(args: argparse.Namespace) -> str:
 
 
 def _headers(args: argparse.Namespace) -> dict[str, str]:
-    api_key = _coalesce(args.api_key, os.environ.get("TINKER_API_KEY"), os.environ.get("MINT_API_KEY"))
+    api_key = _coalesce(args.api_key, os.environ.get("MINT_API_KEY"), os.environ.get("MINT_API_KEY"))
     return {"X-API-Key": api_key} if api_key else {}
 
 
@@ -320,7 +320,7 @@ def _plot_csv(paths: list[Path], labels: list[str], out_png: Path) -> None:
 
 def _pick_model(*, supported_models: list[str]) -> str:
     """Prefer DEFAULT_MODEL_CANDIDATES; fall back to smallest supported MoE model."""
-    from tinker_server.backend.model_registry import MODEL_CONFIGS, maybe_normalize_model_name
+    from mint_server.backend.model_registry import MODEL_CONFIGS, maybe_normalize_model_name
 
     normalized_supported: set[str] = set()
     for item in supported_models:

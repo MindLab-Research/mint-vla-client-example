@@ -1,4 +1,4 @@
-from tinker_server.backend.model_registry import MODEL_CONFIGS, list_supported_models
+from mint_server.backend.model_registry import MODEL_CONFIGS, list_supported_models
 
 
 OPENPI_PI05_MODEL = "openpi/pi05-libero-low-mem-finetune"
@@ -18,6 +18,6 @@ def test_openpi_pi05_profile_is_registered_with_vla_metadata() -> None:
 
 def test_openpi_pi05_profile_is_not_in_default_supported_models_without_opt_in(monkeypatch) -> None:
     monkeypatch.delenv("MINT_SUPPORTED_MODELS", raising=False)
-    monkeypatch.delenv("TINKER_SUPPORTED_MODELS", raising=False)
+    monkeypatch.delenv("MINT_SUPPORTED_MODELS", raising=False)
 
     assert OPENPI_PI05_MODEL not in list_supported_models()

@@ -4,7 +4,7 @@ import anyio
 import pytest
 from fastapi import HTTPException
 
-from tinker_server.routes import internal as internal_route
+from mint_server.routes import internal as internal_route
 
 
 class _StubUsageStore:

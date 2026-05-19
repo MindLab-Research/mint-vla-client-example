@@ -32,7 +32,7 @@ class _DummyRequest:
 
 
 def test_issue_218_async_checkpoint_archive_delegates_to_ray_helper(tmp_path, monkeypatch):
-    import tinker_server.checkpoints as checkpoints
+    import mint_server.checkpoints as checkpoints
 
     ckpt_dir = tmp_path / "ckpt"
     ckpt_dir.mkdir()
@@ -45,14 +45,14 @@ def test_issue_218_async_checkpoint_archive_delegates_to_ray_helper(tmp_path, mo
             return "fake-ref"
 
     monkeypatch.setattr(checkpoints, "_create_checkpoint_archive_remote", lambda: _FakeRemote())
-    monkeypatch.setattr("tinker_server.backend.async_ray_control._ensure_ray_initialized", lambda: seen.setdefault("init", True))
+    monkeypatch.setattr("mint_server.backend.async_ray_control._ensure_ray_initialized", lambda: seen.setdefault("init", True))
 
     async def _fake_await_ray_ref(ref):
         seen["ref"] = ref
         Path(archive_path).write_bytes(b"archive")
         return str(archive_path)
 
-    monkeypatch.setattr("tinker_server.backend.async_ray_control._await_ray_ref", _fake_await_ray_ref)
+    monkeypatch.setattr("mint_server.backend.async_ray_control._await_ray_ref", _fake_await_ray_ref)
 
     asyncio.run(checkpoints.async_create_checkpoint_archive(str(ckpt_dir), str(archive_path), timeout_s=12.5))
 
@@ -64,7 +64,7 @@ def test_issue_218_async_checkpoint_archive_delegates_to_ray_helper(tmp_path, mo
 def test_issue_218_async_checkpoint_archive_cancels_ray_task_on_timeout(tmp_path, monkeypatch):
     import pytest
 
-    import tinker_server.checkpoints as checkpoints
+    import mint_server.checkpoints as checkpoints
 
     ckpt_dir = tmp_path / "ckpt"
     ckpt_dir.mkdir()
@@ -77,12 +77,12 @@ def test_issue_218_async_checkpoint_archive_cancels_ray_task_on_timeout(tmp_path
             return "timeout-ref"
 
     monkeypatch.setattr(checkpoints, "_create_checkpoint_archive_remote", lambda: _FakeRemote())
-    monkeypatch.setattr("tinker_server.backend.async_ray_control._ensure_ray_initialized", lambda: None)
+    monkeypatch.setattr("mint_server.backend.async_ray_control._ensure_ray_initialized", lambda: None)
 
     async def _fake_await_ray_ref(_ref):
         await asyncio.sleep(3600)
 
-    monkeypatch.setattr("tinker_server.backend.async_ray_control._await_ray_ref", _fake_await_ray_ref)
+    monkeypatch.setattr("mint_server.backend.async_ray_control._await_ray_ref", _fake_await_ray_ref)
     monkeypatch.setattr("ray.cancel", lambda ref, force=False: cancelled.append((ref, force)))
 
     with pytest.raises(asyncio.TimeoutError):
@@ -92,10 +92,10 @@ def test_issue_218_async_checkpoint_archive_cancels_ray_task_on_timeout(tmp_path
 
 
 def test_issue_218_gateway_create_model_from_state_proxies_local_checkpoint_dir(tmp_path, monkeypatch):
-    import tinker_server.gateway as gw
-    from tinker_server.gateway import Upstream
-    from tinker_server.models.types import CreateModelFromStateRequest, LoRAConfig
-    from tinker_server.routes import training as tr
+    import mint_server.gateway as gw
+    from mint_server.gateway import Upstream
+    from mint_server.models.types import CreateModelFromStateRequest, LoRAConfig
+    from mint_server.routes import training as tr
 
     ckpt_dir = tmp_path / "ckpt_local"
     ckpt_dir.mkdir()
@@ -163,10 +163,10 @@ def test_issue_218_gateway_create_model_from_state_proxies_local_checkpoint_dir(
 
 
 def test_issue_218_gateway_load_state_proxies_local_checkpoint_dir(tmp_path, monkeypatch):
-    import tinker_server.gateway as gw
-    from tinker_server.gateway import Upstream
-    from tinker_server.models.types import LoadStateRequest
-    from tinker_server.routes import weights as wt
+    import mint_server.gateway as gw
+    from mint_server.gateway import Upstream
+    from mint_server.models.types import LoadStateRequest
+    from mint_server.routes import weights as wt
 
     ckpt_dir = tmp_path / "ckpt_local"
     ckpt_dir.mkdir()
@@ -229,10 +229,10 @@ def test_issue_218_gateway_load_state_proxies_local_checkpoint_dir(tmp_path, mon
 
 
 def test_issue_218_gateway_create_model_from_state_forwards_owner_scope(tmp_path, monkeypatch):
-    import tinker_server.gateway as gw
-    from tinker_server.gateway import Upstream
-    from tinker_server.models.types import CreateModelFromStateRequest, LoRAConfig
-    from tinker_server.routes import training as tr
+    import mint_server.gateway as gw
+    from mint_server.gateway import Upstream
+    from mint_server.models.types import CreateModelFromStateRequest, LoRAConfig
+    from mint_server.routes import training as tr
 
     ckpt_dir = tmp_path / "ckpt_local"
     ckpt_dir.mkdir()
@@ -290,10 +290,10 @@ def test_issue_218_gateway_create_model_from_state_forwards_owner_scope(tmp_path
 
 
 def test_issue_218_gateway_load_state_forwards_owner_scope(tmp_path, monkeypatch):
-    import tinker_server.gateway as gw
-    from tinker_server.gateway import Upstream
-    from tinker_server.models.types import LoadStateRequest
-    from tinker_server.routes import weights as wt
+    import mint_server.gateway as gw
+    from mint_server.gateway import Upstream
+    from mint_server.models.types import LoadStateRequest
+    from mint_server.routes import weights as wt
 
     ckpt_dir = tmp_path / "ckpt_local"
     ckpt_dir.mkdir()

@@ -18,10 +18,10 @@ from typing import Any
 import requests
 
 
-DEFAULT_BASE_URL = (os.environ.get("TINKER_BASE_URL") or os.environ.get("MINT_BASE_URL") or "http://localhost:8000").rstrip("/")
-DEFAULT_API_KEY = os.environ.get("TINKER_API_KEY") or os.environ.get("MINT_API_KEY") or "dummy"
+DEFAULT_BASE_URL = (os.environ.get("MINT_BASE_URL") or os.environ.get("MINT_BASE_URL") or "http://localhost:8000").rstrip("/")
+DEFAULT_API_KEY = os.environ.get("MINT_API_KEY") or os.environ.get("MINT_API_KEY") or "dummy"
 
-MODEL = os.environ.get("TINKER_INFER_MODEL", "Qwen/Qwen3-235B-A22B-Instruct-2507")
+MODEL = os.environ.get("MINT_INFER_MODEL", "Qwen/Qwen3-235B-A22B-Instruct-2507")
 
 
 def _now_iso() -> str:
@@ -162,76 +162,76 @@ def main() -> int:
     p.add_argument("--base-url", default=DEFAULT_BASE_URL)
     p.add_argument("--api-key", default=DEFAULT_API_KEY)
     p.add_argument("--model", default=MODEL)
-    p.add_argument("--concurrency", type=int, default=int(os.environ.get("TINKER_CONCURRENCY", "16")))
-    p.add_argument("--prompt-len", type=int, default=int(os.environ.get("TINKER_PROMPT_LEN", "512")))
+    p.add_argument("--concurrency", type=int, default=int(os.environ.get("MINT_CONCURRENCY", "16")))
+    p.add_argument("--prompt-len", type=int, default=int(os.environ.get("MINT_PROMPT_LEN", "512")))
     p.add_argument(
         "--prompt-lens",
-        default=os.environ.get("TINKER_PROMPT_LENS") or "",
+        default=os.environ.get("MINT_PROMPT_LENS") or "",
         help="Optional comma-separated prompt lengths. If set, overrides --prompt-len per request.",
     )
-    p.add_argument("--num-samples", type=int, default=int(os.environ.get("TINKER_NUM_SAMPLES", "1")))
-    p.add_argument("--max-tokens", type=int, default=int(os.environ.get("TINKER_MAX_TOKENS", "64")))
-    p.add_argument("--warmup-prompt-len", type=int, default=int(os.environ.get("TINKER_WARMUP_PROMPT_LEN", "512")))
-    p.add_argument("--warmup-max-tokens", type=int, default=int(os.environ.get("TINKER_WARMUP_MAX_TOKENS", "8")))
+    p.add_argument("--num-samples", type=int, default=int(os.environ.get("MINT_NUM_SAMPLES", "1")))
+    p.add_argument("--max-tokens", type=int, default=int(os.environ.get("MINT_MAX_TOKENS", "64")))
+    p.add_argument("--warmup-prompt-len", type=int, default=int(os.environ.get("MINT_WARMUP_PROMPT_LEN", "512")))
+    p.add_argument("--warmup-max-tokens", type=int, default=int(os.environ.get("MINT_WARMUP_MAX_TOKENS", "8")))
     p.add_argument(
         "--warmup-num-samples",
         type=int,
-        default=int(os.environ.get("TINKER_WARMUP_NUM_SAMPLES", "0")),
+        default=int(os.environ.get("MINT_WARMUP_NUM_SAMPLES", "0")),
         help="If >0, overrides --num-samples for the warmup request only.",
     )
-    p.add_argument("--temperature", type=float, default=float(os.environ.get("TINKER_TEMPERATURE", "0.7")))
-    p.add_argument("--top-p", type=float, default=float(os.environ.get("TINKER_TOP_P", "1.0")))
-    p.add_argument("--poll-s", type=float, default=float(os.environ.get("TINKER_POLL_S", "0.2")))
-    p.add_argument("--http-timeout-s", type=float, default=float(os.environ.get("TINKER_HTTP_TIMEOUT_S", "30")))
-    p.add_argument("--req-timeout-s", type=float, default=float(os.environ.get("TINKER_REQ_TIMEOUT_S", "900")))
-    p.add_argument("--stall-timeout-s", type=float, default=float(os.environ.get("TINKER_STALL_TIMEOUT_S", "180")))
-    p.add_argument("--total-seconds", type=float, default=float(os.environ.get("TINKER_TOTAL_SECONDS", "1200")))
-    p.add_argument("--warmup-timeout-s", type=float, default=float(os.environ.get("TINKER_WARMUP_TIMEOUT_S", "900")))
+    p.add_argument("--temperature", type=float, default=float(os.environ.get("MINT_TEMPERATURE", "0.7")))
+    p.add_argument("--top-p", type=float, default=float(os.environ.get("MINT_TOP_P", "1.0")))
+    p.add_argument("--poll-s", type=float, default=float(os.environ.get("MINT_POLL_S", "0.2")))
+    p.add_argument("--http-timeout-s", type=float, default=float(os.environ.get("MINT_HTTP_TIMEOUT_S", "30")))
+    p.add_argument("--req-timeout-s", type=float, default=float(os.environ.get("MINT_REQ_TIMEOUT_S", "900")))
+    p.add_argument("--stall-timeout-s", type=float, default=float(os.environ.get("MINT_STALL_TIMEOUT_S", "180")))
+    p.add_argument("--total-seconds", type=float, default=float(os.environ.get("MINT_TOTAL_SECONDS", "1200")))
+    p.add_argument("--warmup-timeout-s", type=float, default=float(os.environ.get("MINT_WARMUP_TIMEOUT_S", "900")))
     p.add_argument("--reuse-sampling-session", action="store_true")
     p.add_argument(
         "--session-mode",
         choices=["shared", "per_worker", "per_request"],
-        default=os.environ.get("TINKER_SESSION_MODE") or "",
+        default=os.environ.get("MINT_SESSION_MODE") or "",
         help="Sampling session strategy. Default matches legacy: shared if --reuse-sampling-session, else per_request.",
     )
     p.add_argument(
         "--continue-after-repro",
         action="store_true",
-        default=(os.environ.get("TINKER_CONTINUE_AFTER_REPRO", "").strip() == "1"),
+        default=(os.environ.get("MINT_CONTINUE_AFTER_REPRO", "").strip() == "1"),
         help="Do not exit immediately on the first issue signature; run until --total-seconds.",
     )
     p.add_argument(
         "--auto-kill-actors-on-repro",
         action="store_true",
-        default=(os.environ.get("TINKER_AUTO_KILL_ACTORS_ON_REPRO", "").strip() == "1"),
+        default=(os.environ.get("MINT_AUTO_KILL_ACTORS_ON_REPRO", "").strip() == "1"),
         help="POST /internal/actors/kill for the vLLM actor when an issue signature or stall is detected.",
     )
     p.add_argument(
         "--auto-kill-min-interval-s",
         type=float,
-        default=float(os.environ.get("TINKER_AUTO_KILL_MIN_INTERVAL_S", "120")),
+        default=float(os.environ.get("MINT_AUTO_KILL_MIN_INTERVAL_S", "120")),
         help="Minimum seconds between actor kill calls (rate limit).",
     )
     p.add_argument(
         "--prompt-mode",
         choices=["pattern", "random"],
-        default=os.environ.get("TINKER_PROMPT_MODE", "pattern"),
+        default=os.environ.get("MINT_PROMPT_MODE", "pattern"),
         help="Prompt token generation strategy.",
     )
     p.add_argument(
         "--prompt-random-max-token-id",
         type=int,
-        default=int(os.environ.get("TINKER_PROMPT_RANDOM_MAX_TOKEN_ID", "2000")),
+        default=int(os.environ.get("MINT_PROMPT_RANDOM_MAX_TOKEN_ID", "2000")),
         help="Upper bound for random token ids when --prompt-mode=random.",
     )
-    p.add_argument("--progress-s", type=float, default=float(os.environ.get("TINKER_PROGRESS_S", "10")))
-    p.add_argument("--run-dir", default=os.environ.get("TINKER_RUN_DIR") or None)
+    p.add_argument("--progress-s", type=float, default=float(os.environ.get("MINT_PROGRESS_S", "10")))
+    p.add_argument("--run-dir", default=os.environ.get("MINT_RUN_DIR") or None)
     args = p.parse_args()
 
     base_url = str(args.base_url).rstrip("/")
     api_key = str(args.api_key)
     if "--api-key" in sys.argv:
-        print("WARNING: --api-key puts the key in argv/ps; prefer TINKER_API_KEY/MINT_API_KEY env var.", file=sys.stderr, flush=True)
+        print("WARNING: --api-key puts the key in argv/ps; prefer MINT_API_KEY/MINT_API_KEY env var.", file=sys.stderr, flush=True)
 
     if args.concurrency < 1:
         return _fail("--concurrency must be >= 1")
@@ -270,7 +270,7 @@ def main() -> int:
     # Auth check: required on prod for stress endpoints; fail early if missing.
     st, _ = _get_json(base_url, api_key, "/api/v1/server_info", timeout_s=10.0)
     if st == 401:
-        return _fail("unauthorized: set TINKER_API_KEY/MINT_API_KEY (or --api-key) for this base-url")
+        return _fail("unauthorized: set MINT_API_KEY/MINT_API_KEY (or --api-key) for this base-url")
     if st != 200:
         return _fail(f"unexpected /api/v1/server_info status={st}")
 

@@ -32,13 +32,13 @@ def _coalesce(*values: str | None) -> str | None:
 
 def _base_url(args: argparse.Namespace) -> str:
     return (
-        _coalesce(args.base_url, os.environ.get("TINKER_BASE_URL"), os.environ.get("MINT_BASE_URL"), DEFAULT_BASE_URL)
+        _coalesce(args.base_url, os.environ.get("MINT_BASE_URL"), os.environ.get("MINT_BASE_URL"), DEFAULT_BASE_URL)
         .rstrip("/")
     )
 
 
 def _headers(args: argparse.Namespace) -> dict[str, str]:
-    api_key = _coalesce(args.api_key, os.environ.get("TINKER_API_KEY"), os.environ.get("MINT_API_KEY"))
+    api_key = _coalesce(args.api_key, os.environ.get("MINT_API_KEY"), os.environ.get("MINT_API_KEY"))
     return {"X-API-Key": api_key} if api_key else {}
 
 

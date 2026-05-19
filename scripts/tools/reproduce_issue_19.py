@@ -4,8 +4,8 @@ from pathlib import Path
 
 import requests
 
-BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000")
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
+BASE_URL = os.environ.get("MINT_BASE_URL", "http://localhost:8000")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
 
 _repo_root = Path(__file__).resolve().parents[2]
 if str(_repo_root) not in sys.path:
@@ -26,16 +26,16 @@ def main() -> int:
     _ = BASE_URL, API_KEY
 
     mint_dev = _read_text(".claude/skills/mint-dev/SKILL.md")
-    if 'python scripts/run_server.py\\" > /tmp/tinker_server.log' in mint_dev:
-        return _fail("mint-dev/SKILL.md still uses '>' redirection for /tmp/tinker_server.log (truncates logs)")
-    if 'python scripts/run_server.py\\" >> /tmp/tinker_server.log' not in mint_dev:
-        return _fail("mint-dev/SKILL.md missing '>> /tmp/tinker_server.log' redirection")
+    if 'python scripts/run_server.py\\" > /tmp/mint_server.log' in mint_dev:
+        return _fail("mint-dev/SKILL.md still uses '>' redirection for /tmp/mint_server.log (truncates logs)")
+    if 'python scripts/run_server.py\\" >> /tmp/mint_server.log' not in mint_dev:
+        return _fail("mint-dev/SKILL.md missing '>> /tmp/mint_server.log' redirection")
 
     auto_bugfix = _read_text(".claude/skills/auto-bugfix/SKILL.md")
-    if 'python scripts/run_server.py\\" > /tmp/tinker_server_issue_$ISSUE.log' in auto_bugfix:
-        return _fail("auto-bugfix/SKILL.md still uses '>' redirection for /tmp/tinker_server_issue_$ISSUE.log")
-    if 'python scripts/run_server.py\\" >> /tmp/tinker_server_issue_$ISSUE.log' not in auto_bugfix:
-        return _fail("auto-bugfix/SKILL.md missing '>> /tmp/tinker_server_issue_$ISSUE.log' redirection")
+    if 'python scripts/run_server.py\\" > /tmp/mint_server_issue_$ISSUE.log' in auto_bugfix:
+        return _fail("auto-bugfix/SKILL.md still uses '>' redirection for /tmp/mint_server_issue_$ISSUE.log")
+    if 'python scripts/run_server.py\\" >> /tmp/mint_server_issue_$ISSUE.log' not in auto_bugfix:
+        return _fail("auto-bugfix/SKILL.md missing '>> /tmp/mint_server_issue_$ISSUE.log' redirection")
 
     # Regression guard: pid capture must not expand $! locally.
     if "echo \\\\$!" in auto_bugfix:
@@ -43,11 +43,11 @@ def main() -> int:
     if "echo \\$!" not in auto_bugfix:
         return _fail("auto-bugfix/SKILL.md missing 'echo \\$!' in pid capture")
 
-    # zsh: $TINKER_PORT:localhost triggers :l modifier; braces required.
-    if "ssh -f -N -L $TINKER_PORT:localhost:$TINKER_PORT volcano" in auto_bugfix:
-        return _fail("auto-bugfix/SKILL.md uses unbraced $TINKER_PORT in -L (breaks in zsh)")
-    if "ssh -f -N -L ${TINKER_PORT}:localhost:${TINKER_PORT} volcano" not in auto_bugfix:
-        return _fail("auto-bugfix/SKILL.md missing braced ssh -L tunnel example for $TINKER_PORT")
+    # zsh: $MINT_PORT:localhost triggers :l modifier; braces required.
+    if "ssh -f -N -L $MINT_PORT:localhost:$MINT_PORT volcano" in auto_bugfix:
+        return _fail("auto-bugfix/SKILL.md uses unbraced $MINT_PORT in -L (breaks in zsh)")
+    if "ssh -f -N -L ${MINT_PORT}:localhost:${MINT_PORT} volcano" not in auto_bugfix:
+        return _fail("auto-bugfix/SKILL.md missing braced ssh -L tunnel example for $MINT_PORT")
 
     # Runtime check: server should expose server_info and report append-mode stdout/stderr.
     try:

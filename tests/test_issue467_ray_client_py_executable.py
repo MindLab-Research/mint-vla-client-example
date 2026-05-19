@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from tinker_server import config as cfg
+from mint_server import config as cfg
 
 
 def test_worker_visible_py_executable_keeps_absolute_without_job_working_dir(monkeypatch):

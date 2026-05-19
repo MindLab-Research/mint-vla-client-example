@@ -50,7 +50,7 @@ Review checklist:
 4) Do unit tests pass (`pytest -q`)?
 5) Does an integrated smoke check pass (`python scripts/tools/smoke.py service` against the same issue-scoped dev server)?
 6) Does the fix introduce unhandled edge cases or obvious regressions?
-7) Are server restart, `TINKER_RAY_NAMESPACE`, and `PFS_TINKER_PATH` implications handled correctly (per `mint-dev`)?
+7) Are server restart, `MINT_RAY_NAMESPACE`, and `MINT_CODE_ROOT` implications handled correctly (per `mint-dev`)?
 8) If behavior/operator workflow changed, were architecture docs updated (`architecture-design`)?
 
 Deliverable:

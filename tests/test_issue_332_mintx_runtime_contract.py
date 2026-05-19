@@ -60,10 +60,10 @@ def _install_fake_ray(monkeypatch) -> None:
 
 def _import_megatron_modules(monkeypatch):
     _install_fake_ray(monkeypatch)
-    sys.modules.pop("tinker_server.backend.megatron_training", None)
-    sys.modules.pop("tinker_server.backend.megatron_distributed", None)
-    training = importlib.import_module("tinker_server.backend.megatron_training")
-    distributed = importlib.import_module("tinker_server.backend.megatron_distributed")
+    sys.modules.pop("mint_server.backend.megatron_training", None)
+    sys.modules.pop("mint_server.backend.megatron_distributed", None)
+    training = importlib.import_module("mint_server.backend.megatron_training")
+    distributed = importlib.import_module("mint_server.backend.megatron_distributed")
     return training, distributed
 
 

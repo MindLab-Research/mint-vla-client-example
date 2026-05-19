@@ -13,8 +13,8 @@ import pytest
 
 
 def _import_training_route():
-    sys.modules.setdefault("tinker_server.routes.service", types.ModuleType("tinker_server.routes.service"))
-    return importlib.import_module("tinker_server.routes.training")
+    sys.modules.setdefault("mint_server.routes.service", types.ModuleType("mint_server.routes.service"))
+    return importlib.import_module("mint_server.routes.training")
 
 
 @pytest.fixture
@@ -41,8 +41,8 @@ def _span_recorder(store: list[tuple[str, dict[str, object]]], name: str, **kwar
 async def test_issue_408_save_weights_for_sampler_emits_trace_spans(
     monkeypatch, tmp_path: Path
 ) -> None:
-    from tinker_server.backend import session_index_store as sis
-    from tinker_server.models.types import SaveWeightsForSamplerRequest
+    from mint_server.backend import session_index_store as sis
+    from mint_server.models.types import SaveWeightsForSamplerRequest
 
     tr = _import_training_route()
 
@@ -161,10 +161,10 @@ async def test_issue_408_save_weights_for_sampler_emits_trace_spans(
 
 
 def test_issue_408_megatron_create_path_emits_trace_spans(monkeypatch) -> None:
-    from tinker_server.backend import megatron_distributed as md
-    from tinker_server.backend import model_registry as model_registry
-    from tinker_server.backend import model_actor_supervisor as model_actor_supervisor_mod
-    from tinker_server import config as config_mod
+    from mint_server.backend import megatron_distributed as md
+    from mint_server.backend import model_registry as model_registry
+    from mint_server.backend import model_actor_supervisor as model_actor_supervisor_mod
+    from mint_server import config as config_mod
 
     span_calls: list[tuple[str, dict[str, object]]] = []
     removed: list[object] = []
@@ -251,10 +251,10 @@ def test_issue_408_megatron_create_path_emits_trace_spans(monkeypatch) -> None:
 
 
 def test_issue_572_megatron_existing_actor_rank_mismatch_recreates(monkeypatch) -> None:
-    from tinker_server.backend import megatron_distributed as md
-    from tinker_server.backend import model_registry as model_registry
-    from tinker_server.backend import model_actor_supervisor as model_actor_supervisor_mod
-    from tinker_server import config as config_mod
+    from mint_server.backend import megatron_distributed as md
+    from mint_server.backend import model_registry as model_registry
+    from mint_server.backend import model_actor_supervisor as model_actor_supervisor_mod
+    from mint_server import config as config_mod
 
     fake_new_actor = object()
     killed: list[dict[str, object]] = []
@@ -340,7 +340,7 @@ def test_issue_572_megatron_existing_actor_rank_mismatch_recreates(monkeypatch) 
 
 @pytest.mark.anyio
 async def test_issue_408_async_get_or_create_megatron_worker_group_propagates_context(monkeypatch) -> None:
-    from tinker_server.backend import megatron_distributed as md
+    from mint_server.backend import megatron_distributed as md
 
     captured: dict[str, object] = {}
 

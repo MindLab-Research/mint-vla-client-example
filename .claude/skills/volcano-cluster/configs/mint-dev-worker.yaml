@@ -15,10 +15,10 @@ Entrypoint: |
   export HF_HOME=/vePFS-Mindverse/share/huggingface
   export PYTHONDONTWRITEBYTECODE=1
 
-  # Symlink to PFS code (tinker-server for development)
-  rm -rf /root/tinker_project/tinker-server
-  mkdir -p /root/tinker_project
-  ln -s /vePFS-Mindverse/share/mint/dev/mint-server /root/tinker_project/tinker-server
+  # Symlink to PFS code (mint-server for development)
+  rm -rf /root/mint_project/mint-server
+  mkdir -p /root/mint_project
+  ln -s /vePFS-Mindverse/share/mint/dev/mint-server /root/mint_project/mint-server
 
   # Connect to Ray head published by mint-dev-head.
   set -euo pipefail

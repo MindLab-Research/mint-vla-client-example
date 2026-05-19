@@ -3,8 +3,8 @@ import sys
 
 import requests
 
-BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000")
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
+BASE_URL = os.environ.get("MINT_BASE_URL", "http://localhost:8000")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
 
 
 def _fail(msg: str) -> int:

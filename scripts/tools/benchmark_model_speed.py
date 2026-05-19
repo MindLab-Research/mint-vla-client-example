@@ -49,7 +49,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--base-url",
         default=_coalesce(
-            os.environ.get("TINKER_BASE_URL"),
+            os.environ.get("MINT_BASE_URL"),
             os.environ.get("MINT_BASE_URL"),
             "http://localhost:8000",
         ),
@@ -57,7 +57,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--api-key",
         default=_coalesce(
-            os.environ.get("TINKER_API_KEY"),
+            os.environ.get("MINT_API_KEY"),
             os.environ.get("MINT_API_KEY"),
             "dummy",
         ),

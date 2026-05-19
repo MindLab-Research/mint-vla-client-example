@@ -14,7 +14,7 @@ import shutil
 import time
 from pathlib import Path
 
-from tinker_server import checkpoints
+from mint_server import checkpoints
 
 
 def _iter_checkpoint_dirs(root: str) -> list[Path]:

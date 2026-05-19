@@ -9,17 +9,17 @@
 ## Architecture change checklist (project-specific)
 
 - Adding a new endpoint
-  - Add/extend request/response types in `tinker_server/models/types.py`.
-  - Implement route in `tinker_server/routes/*`.
+  - Add/extend request/response types in `mint_server/models/types.py`.
+  - Implement route in `mint_server/routes/*`.
   - If work is async, return `request_id` and use `TaskFutureService` + `/retrieve_future` semantics.
 
 - Adding or changing a Ray actor type
-  - Decide: is it detached? If yes, add startup reconciliation logic in `tinker_server/app.py:_cleanup_stale_actors()`.
-  - If it is GPU-using, register live actors in `tinker_server/backend/model_actor_inventory.py` so local inventory, inflight marking, and observability stay correct.
+  - Decide: is it detached? If yes, add startup reconciliation logic in `mint_server/app.py:_cleanup_stale_actors()`.
+  - If it is GPU-using, register live actors in `mint_server/backend/model_actor_inventory.py` so local inventory, inflight marking, and observability stay correct.
   - Audit filesystem assumptions: can the API server see the same paths as the actor?
 
 - Adding a new model or changing parallelism
-  - Update `tinker_server/backend/model_registry.py` (inference and training parallelism are specified separately).
+  - Update `mint_server/backend/model_registry.py` (inference and training parallelism are specified separately).
   - Check inference-vs-training constraints independently (vLLM LoRA limitations differ from Megatron LoRA limitations).
 
 - Changing weight transfer

@@ -9,7 +9,7 @@ import pytest
 
 pytest.importorskip("ray")
 
-from tinker_server.backend.megatron_distributed import (
+from mint_server.backend.megatron_distributed import (
     DistributedConfig,
     MegatronRankWorker,
     MegatronWorkerGroup,
@@ -261,18 +261,18 @@ def _prepare_worker_for_forward_backward(worker, monkeypatch):
     class _FakeModelConfig:
         max_model_len = 2048
 
-    fake_training = types.ModuleType("tinker_server.backend.megatron_training")
+    fake_training = types.ModuleType("mint_server.backend.megatron_training")
     fake_training.create_sft_loss_fn = lambda **kw: (lambda *a, **k: None)  # type: ignore
     fake_training.create_ppo_loss_fn = lambda *a, **kw: (lambda *a2, **k2: None)  # type: ignore
     fake_training.tinker_to_tensordict = lambda *a, **kw: "fake_tensordict"  # type: ignore
-    monkeypatch.setitem(sys.modules, "tinker_server.backend.megatron_training", fake_training)
+    monkeypatch.setitem(sys.modules, "mint_server.backend.megatron_training", fake_training)
 
     monkeypatch.setattr(
-        "tinker_server.backend.megatron_distributed.get_model_config",
+        "mint_server.backend.megatron_distributed.get_model_config",
         lambda model: _FakeModelConfig(),
     )
     monkeypatch.setattr(
-        "tinker_server.backend.megatron_distributed.flatten_encoded_text_chunks",
+        "mint_server.backend.megatron_distributed.flatten_encoded_text_chunks",
         lambda model_input: model_input.get("input_ids", [1, 2, 3]),
     )
 
@@ -882,11 +882,11 @@ def test_issue_193_load_adapter_state_restores_expert_bias(tmp_path, monkeypatch
     fake_utils.unwrap_model = lambda model: model  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "verl.utils.megatron_utils", fake_utils)
 
-    fake_lora_utils = types.ModuleType("tinker_server.backend.lora_utils")
+    fake_lora_utils = types.ModuleType("mint_server.backend.lora_utils")
     fake_lora_utils.pad_lora_state_dict = lambda state, *_args, **_kwargs: state  # type: ignore[attr-defined]
     fake_lora_utils.fit_lora_state_dict_to_reference = lambda state, *_args, **_kwargs: state  # type: ignore[attr-defined]
     fake_lora_utils.zero_lora_rank_tail_named_parameters = lambda *_args, **_kwargs: {"params": 0, "grads": 0}  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "tinker_server.backend.lora_utils", fake_lora_utils)
+    monkeypatch.setitem(sys.modules, "mint_server.backend.lora_utils", fake_lora_utils)
 
     worker.load_adapter_state(str(tmp_path))
 
@@ -923,11 +923,11 @@ def test_issue_193_load_adapter_state_rejects_key_mismatch(tmp_path, monkeypatch
     fake_utils.unwrap_model = lambda model: model  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "verl.utils.megatron_utils", fake_utils)
 
-    fake_lora_utils = types.ModuleType("tinker_server.backend.lora_utils")
+    fake_lora_utils = types.ModuleType("mint_server.backend.lora_utils")
     fake_lora_utils.pad_lora_state_dict = lambda state, *_args, **_kwargs: state  # type: ignore[attr-defined]
     fake_lora_utils.fit_lora_state_dict_to_reference = lambda state, *_args, **_kwargs: state  # type: ignore[attr-defined]
     fake_lora_utils.zero_lora_rank_tail_named_parameters = lambda *_args, **_kwargs: {"params": 0, "grads": 0}  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "tinker_server.backend.lora_utils", fake_lora_utils)
+    monkeypatch.setitem(sys.modules, "mint_server.backend.lora_utils", fake_lora_utils)
 
     with pytest.raises(RuntimeError, match="Adapter checkpoint key mismatch"):
         worker.load_adapter_state(str(tmp_path))
@@ -2209,7 +2209,7 @@ def test_issue_417_failed_explicit_load_leaves_session_unknown(tmp_path, monkeyp
 
 
 def test_issue_417_failed_explicit_load_preserves_target_actor_authority(tmp_path, monkeypatch):
-    from tinker_server.backend.megatron_distributed import MegatronSessionStateManager
+    from mint_server.backend.megatron_distributed import MegatronSessionStateManager
 
     manager = MegatronSessionStateManager(base_path=str(tmp_path / "session_store"))
     target_path = tmp_path / "target_checkpoint"
@@ -3155,7 +3155,7 @@ def test_issue_467_get_lora_state_dict_allows_moe_mlp_export_without_layout_flag
 
     worker.engine.bridge = _Bridge()
     monkeypatch.setattr(
-        "tinker_server.backend.megatron_distributed.get_model_config",
+        "mint_server.backend.megatron_distributed.get_model_config",
         lambda _: type("Cfg", (), {"is_moe": True})(),
     )
 
@@ -3178,7 +3178,7 @@ def test_issue_482_save_lora_weights_writes_unembed_target_modules(monkeypatch, 
         "base_model.model.output_layer.lora_B.weight": torch.ones(1, 1),
     }
     monkeypatch.setattr(
-        "tinker_server.backend.megatron_distributed.get_model_config",
+        "mint_server.backend.megatron_distributed.get_model_config",
         lambda _: type("Cfg", (), {"is_mla": False, "is_moe": False})(),
     )
 
@@ -3225,7 +3225,7 @@ def test_issue_489_get_lora_state_dict_patches_cpu_ep_gather(monkeypatch):
     worker.engine.module = object()
 
     monkeypatch.setattr(
-        "tinker_server.backend.megatron_distributed.get_model_config",
+        "mint_server.backend.megatron_distributed.get_model_config",
         lambda _model: SimpleNamespace(is_moe=True),
     )
 
@@ -3313,7 +3313,7 @@ def test_issue_495_get_lora_state_dict_single_pp_path_restores_bridge_patch(monk
     worker.engine.module = object()
 
     monkeypatch.setattr(
-        "tinker_server.backend.megatron_distributed.get_model_config",
+        "mint_server.backend.megatron_distributed.get_model_config",
         lambda _model: SimpleNamespace(is_moe=True),
     )
 

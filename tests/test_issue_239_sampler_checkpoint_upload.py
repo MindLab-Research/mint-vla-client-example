@@ -19,7 +19,7 @@ def _make_tar_gz_bytes(root: str, files: dict[str, bytes]) -> bytes:
 
 
 def test_issue_239_sampler_only_upload_is_supported(tmp_path: Path) -> None:
-    from tinker_server.routes import weights as weights_routes
+    from mint_server.routes import weights as weights_routes
 
     weights_routes.CHECKPOINTS_DIR = str(tmp_path)
 
@@ -56,7 +56,7 @@ def test_issue_239_sampler_only_upload_is_supported(tmp_path: Path) -> None:
 
 
 def test_issue_239_openpi_sampler_upload_is_supported(tmp_path: Path) -> None:
-    from tinker_server.routes import weights as weights_routes
+    from mint_server.routes import weights as weights_routes
 
     weights_routes.CHECKPOINTS_DIR = str(tmp_path)
 
@@ -91,7 +91,7 @@ def test_issue_239_openpi_sampler_upload_is_supported(tmp_path: Path) -> None:
 
 
 def test_issue_239_training_declared_without_optimizer_is_rejected(tmp_path: Path) -> None:
-    from tinker_server.routes import weights as weights_routes
+    from mint_server.routes import weights as weights_routes
 
     weights_routes.CHECKPOINTS_DIR = str(tmp_path)
 

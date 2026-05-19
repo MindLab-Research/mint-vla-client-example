@@ -7,19 +7,19 @@ from typing import Any
 
 import requests
 
-BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000").rstrip("/")
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
-SSH_HOST = os.environ.get("TINKER_SSH_HOST", "mint-dev")
+BASE_URL = os.environ.get("MINT_BASE_URL", "http://localhost:8000").rstrip("/")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
+SSH_HOST = os.environ.get("MINT_SSH_HOST", "mint-dev")
 
 DEFAULT_MODEL = "Qwen/Qwen3-0.6B"
-BASE_MODEL = os.environ.get("TINKER_MODEL", DEFAULT_MODEL)
-LORA_RANK = int(os.environ.get("TINKER_LORA_RANK", "8"))
+BASE_MODEL = os.environ.get("MINT_MODEL", DEFAULT_MODEL)
+LORA_RANK = int(os.environ.get("MINT_LORA_RANK", "8"))
 
-LR1 = float(os.environ.get("TINKER_LR1", "1e-4"))
-LR2 = float(os.environ.get("TINKER_LR2", "5e-5"))
+LR1 = float(os.environ.get("MINT_LR1", "1e-4"))
+LR2 = float(os.environ.get("MINT_LR2", "5e-5"))
 
 CHECKPOINTS_ROOT = os.environ.get(
-    "TINKER_CHECKPOINTS_ROOT", "/vePFS-Mindverse/share/tinker_checkpoints"
+    "MINT_CHECKPOINTS_ROOT", "/vePFS-Mindverse/share/mint_checkpoints"
 )
 
 

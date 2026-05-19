@@ -4,21 +4,21 @@ import asyncio
 
 import pytest
 
-from tinker_server.backend.task_state_store import FutureStatus
-from tinker_server.backend.model_runtime_actor import (
+from mint_server.backend.task_state_store import FutureStatus
+from mint_server.backend.model_runtime_actor import (
     ModelRuntimeActor,
     _default_executor,
     default_model_runtime_actor_name,
     get_or_create_model_runtime_actor,
 )
-from tinker_server.backend.model_work_execution_context import (
+from mint_server.backend.model_work_execution_context import (
     ModelWorkFinalize,
     get_current_model_work_consumer_generation,
     get_current_model_work_consumer_id,
     get_current_model_work_finalize_buffer,
     get_current_model_work_lease_id,
 )
-from tinker_server.backend.task_payload_store import TaskPayloadStore
+from mint_server.backend.task_payload_store import TaskPayloadStore
 
 
 def _lease(request_id: str = "runtime-req-1", *, finalize: bool = True) -> dict:
@@ -980,8 +980,8 @@ def test_issue_593_model_runtime_default_actor_name_is_stable() -> None:
 
 @pytest.mark.anyio
 async def test_issue_593_default_executor_initializes_execution_bindings(monkeypatch) -> None:
-    import tinker_server.backend.model_runtime_actor as runtime_module
-    import tinker_server.backend.model_work_dispatch as dispatch_module
+    import mint_server.backend.model_runtime_actor as runtime_module
+    import mint_server.backend.model_work_dispatch as dispatch_module
 
     calls: list[str] = []
 
@@ -994,7 +994,7 @@ async def test_issue_593_default_executor_initializes_execution_bindings(monkeyp
 
     monkeypatch.setattr(runtime_module, "_EXECUTION_BINDINGS", None)
     monkeypatch.setattr(
-        "tinker_server.backend.execution_bindings.initialize_execution_bindings",
+        "mint_server.backend.execution_bindings.initialize_execution_bindings",
         _initialize_execution_bindings,
     )
     monkeypatch.setattr(dispatch_module, "execute_model_work_item", _execute_work_item)
@@ -1007,8 +1007,8 @@ async def test_issue_593_default_executor_initializes_execution_bindings(monkeyp
 
 @pytest.mark.anyio
 async def test_issue_616_default_executor_accepts_non_sampling_ops(monkeypatch) -> None:
-    import tinker_server.backend.model_runtime_actor as runtime_module
-    import tinker_server.backend.model_work_dispatch as dispatch_module
+    import mint_server.backend.model_runtime_actor as runtime_module
+    import mint_server.backend.model_work_dispatch as dispatch_module
 
     calls: list[str] = []
     lease = _lease("runtime-training-req")
@@ -1023,7 +1023,7 @@ async def test_issue_616_default_executor_accepts_non_sampling_ops(monkeypatch) 
 
     monkeypatch.setattr(runtime_module, "_EXECUTION_BINDINGS", None)
     monkeypatch.setattr(
-        "tinker_server.backend.execution_bindings.initialize_execution_bindings",
+        "mint_server.backend.execution_bindings.initialize_execution_bindings",
         _initialize_execution_bindings,
     )
     monkeypatch.setattr(dispatch_module, "execute_model_work_item", _execute_work_item)
@@ -1080,15 +1080,15 @@ def test_issue_593_get_or_create_recreates_stale_generation(monkeypatch) -> None
 
     monkeypatch.setitem(__import__("sys").modules, "ray", _Ray)
     monkeypatch.setattr(
-        "tinker_server.backend.model_runtime_actor.sync_get_ray_ref",
+        "mint_server.backend.model_runtime_actor.sync_get_ray_ref",
         lambda ref, timeout_s=None: ref.value,
     )
     monkeypatch.setattr(
-        "tinker_server.backend.model_runtime_actor.apply_detached_actor_resources",
+        "mint_server.backend.model_runtime_actor.apply_detached_actor_resources",
         lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(
-        "tinker_server.backend.model_runtime_actor.actor_runtime_env_vars",
+        "mint_server.backend.model_runtime_actor.actor_runtime_env_vars",
         lambda **_kwargs: {},
     )
 

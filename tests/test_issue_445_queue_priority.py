@@ -6,16 +6,16 @@ from typing import cast
 import pytest
 from fastapi import Request
 
-from tinker_server.models.types import ComputeLogprobsRequest, ForwardBackwardInput, ForwardBackwardRequest, ModelInput, SampleRequest, SamplingParams
-from tinker_server.queue_priority import (
+from mint_server.models.types import ComputeLogprobsRequest, ForwardBackwardInput, ForwardBackwardRequest, ModelInput, SampleRequest, SamplingParams
+from mint_server.queue_priority import (
     effective_queue_priority,
     extract_queue_priority_from_headers,
     merge_queue_priority_extra,
     normalize_queue_priority,
 )
-from tinker_server.routes import internal as internal_route
-from tinker_server.routes import sampling as sampling_route
-from tinker_server.routes import training as training_route
+from mint_server.routes import internal as internal_route
+from mint_server.routes import sampling as sampling_route
+from mint_server.routes import training as training_route
 
 
 class _DummyRequest:
@@ -96,7 +96,7 @@ def test_issue_445_queue_priority_normalization_and_aging():
 
 @pytest.mark.anyio
 async def test_issue_445_asample_enqueues_normalized_priority(monkeypatch):
-    import tinker_server.backend.model_work_scheduler as mws
+    import mint_server.backend.model_work_scheduler as mws
 
     scheduler = _CaptureModelWorkScheduler()
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
@@ -130,9 +130,9 @@ async def test_issue_445_asample_enqueues_normalized_priority(monkeypatch):
 async def test_issue_445_internal_noop_enqueues_normalized_priority(monkeypatch):
     import importlib
 
-    import tinker_server.backend.model_work_scheduler as mws
+    import mint_server.backend.model_work_scheduler as mws
 
-    task_state_store_module = importlib.import_module("tinker_server.backend.task_state_store")
+    task_state_store_module = importlib.import_module("mint_server.backend.task_state_store")
 
     scheduler = _CaptureModelWorkScheduler()
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
@@ -148,7 +148,7 @@ async def test_issue_445_internal_noop_enqueues_normalized_priority(monkeypatch)
 
 @pytest.mark.anyio
 async def test_issue_445_forward_backward_enqueues_default_priority_on_invalid_header(monkeypatch):
-    import tinker_server.backend.model_work_scheduler as mws
+    import mint_server.backend.model_work_scheduler as mws
 
     scheduler = _CaptureModelWorkScheduler()
     monkeypatch.setattr(training_route, "training_engine", object())
@@ -186,8 +186,8 @@ async def test_issue_445_forward_backward_enqueues_default_priority_on_invalid_h
 
 @pytest.mark.anyio
 async def test_issue_445_compute_logprobs_enqueues_apikey_id(monkeypatch):
-    import tinker_server.backend.model_registry as model_registry
-    import tinker_server.backend.model_work_scheduler as mws
+    import mint_server.backend.model_registry as model_registry
+    import mint_server.backend.model_work_scheduler as mws
 
     scheduler = _CaptureModelWorkScheduler()
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())

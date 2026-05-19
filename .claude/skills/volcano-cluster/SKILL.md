@@ -370,17 +370,17 @@ t = ray.cluster_resources()
 gpu_avail = r.get("GPU", 0)
 gpu_total = t.get("GPU", 0)
 print(f"GPUs: {gpu_avail:.0f} / {gpu_total:.0f}")
-ns = os.environ.get("TINKER_RAY_NAMESPACE") or os.environ.get("MINT_RAY_NAMESPACE") or "tinker"
+ns = os.environ.get("MINT_RAY_NAMESPACE") or "mint"
 actors = ray.util.list_named_actors(all_namespaces=True)
 for a in actors:
     if a.get("namespace") != ns:
         continue
     name = a.get("name", "")
     if (
-        name.startswith("tinker_vllm_")
-        or name.startswith("multinode_vllm_")
-        or name.startswith("megatron_")
-        or name.startswith("dense_trainer_pool_")
+        name.startswith("mint_vllm_")
+        or name == "vllm_server"
+        or name.startswith("mint_megatron_")
+        or name.startswith("mint_dense_")
     ):
         print(f"{name}: ALIVE")
 PYEOF'
@@ -397,7 +397,7 @@ curl -X POST -H "Content-Type: application/json" \
   http://localhost:8000/internal/actors/kill
 
 # Kill Megatron (prod - admin only when auth is enabled)
-curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/json" \
+curl -X POST -H "X-API-Key: $MINT_API_KEY" -H "Content-Type: application/json" \
   -d '{"actor_type":"megatron"}' \
   http://localhost:18000/internal/actors/kill
 
@@ -407,7 +407,7 @@ curl -X POST -H "Content-Type: application/json" \
   http://localhost:8000/internal/actors/kill
 
 # Kill vLLM (prod - admin only when auth is enabled)
-curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/json" \
+curl -X POST -H "X-API-Key: $MINT_API_KEY" -H "Content-Type: application/json" \
   -d '{"actor_type":"vllm"}' \
   http://localhost:18000/internal/actors/kill
 
@@ -425,11 +425,11 @@ curl -s "http://localhost:8000/internal/actors?type=vllm" | jq
 
 | Actor | Name Pattern | Namespace |
 |-------|--------------|-----------|
-| Megatron | `megatron_{model_name}` (example: `megatron_kimi_k2_thinking`) | `TINKER_RAY_NAMESPACE` |
-| vLLM (single-node) | `tinker_vllm_{model_part}` (example: `tinker_vllm_kimi-k2-thinking`) | `TINKER_RAY_NAMESPACE` |
-| vLLM (multi-node) | `multinode_vllm_{model_part}` | `TINKER_RAY_NAMESPACE` |
-| Dense trainer pool | `dense_trainer_pool_{model_part}_maxr{rank}` | `TINKER_RAY_NAMESPACE` |
-| Stores/schedulers | `mint_task_state_store`, `mint_model_work_scheduler`, `mint_model_runtime_*`, `mint_maintenance_cron`, `tinker_training_session_store`, `tinker_gateway_session_store` | `MINT_RAY_NAMESPACE` (defaults to `TINKER_RAY_NAMESPACE` if set) |
+| Megatron | `mint_megatron_{model_slug}` (example: `mint_megatron_kimi_k2_thinking`) | `MINT_RAY_NAMESPACE` |
+| vLLM per-model | `mint_vllm_{model_slug}` (example: `mint_vllm_kimi-k2-thinking`) | `MINT_RAY_NAMESPACE` |
+| vLLM persistent singleton | `vllm_server` | `MINT_RAY_NAMESPACE` |
+| Dense trainer pool | `mint_dense_{model_slug}` | `MINT_RAY_NAMESPACE` |
+| Stores/schedulers | `mint_task_state_store`, `mint_model_work_scheduler`, `mint_model_runtime_*`, `mint_maintenance_cron`, `mint_training_session_store`, `mint_gateway_session_store` | `MINT_RAY_NAMESPACE` |
 
 Model name normalization differs by subsystem:
 - Megatron: last component, lowercase, replace `-` and `.` with `_`.

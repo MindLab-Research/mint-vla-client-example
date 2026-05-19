@@ -1,6 +1,6 @@
 # Run:
-#   cd /vePFS-Mindverse/share/code/leixiang/tinker-server
-#   /root/tinker_project/tinker-server/.venv31213/bin/pytest tests/test_openai_compat_helpers.py -v
+#   cd /vePFS-Mindverse/share/code/leixiang/mint-server
+#   /root/mint_project/mint-server/.venv31213/bin/pytest tests/test_openai_compat_helpers.py -v
 
 import asyncio
 import uuid
@@ -13,9 +13,9 @@ from types import SimpleNamespace
 
 import anyio
 
-from tinker_server.models.types import CreateSamplingSessionResponse
-from tinker_server.routes import openai_compat
-from tinker_server.routes import service as service_route
+from mint_server.models.types import CreateSamplingSessionResponse
+from mint_server.routes import openai_compat
+from mint_server.routes import service as service_route
 
 
 def _dummy_request(user_id: str | None = None):
@@ -76,15 +76,14 @@ def test_preload_supported_tokenizers_populates_cache_and_reports_failures(monke
 
 
 def test_tokenizer_max_workers_env(monkeypatch):
-    monkeypatch.setenv("TINKER_OAI_TOKENIZER_MAX_WORKERS", "12")
-    monkeypatch.delenv("MINT_OAI_TOKENIZER_MAX_WORKERS", raising=False)
+    monkeypatch.setenv("MINT_OAI_TOKENIZER_MAX_WORKERS", "12")
 
     assert openai_compat._tokenizer_max_workers() == 12
 
 
 def test_tokenizer_max_workers_env_alias_and_invalid_fallback(monkeypatch):
-    monkeypatch.delenv("TINKER_OAI_TOKENIZER_MAX_WORKERS", raising=False)
-    monkeypatch.setenv("MINT_OAI_TOKENIZER_MAX_WORKERS", "7")
+    monkeypatch.delenv("MINT_OAI_TOKENIZER_MAX_WORKERS", raising=False)
+    monkeypatch.setenv("TINKER_OAI_TOKENIZER_MAX_WORKERS", "7")
     assert openai_compat._tokenizer_max_workers() == 7
 
     monkeypatch.setenv("MINT_OAI_TOKENIZER_MAX_WORKERS", "bad")
@@ -262,7 +261,7 @@ def test_ensure_sampling_session_generates_parent_session_id(monkeypatch):
     monkeypatch.setattr(service_route, "create_sampling_session", _fake_create_sampling_session)
     monkeypatch.setattr(service_route, "session_manager", _StubSessionManager("Qwen/Qwen3-4B-Instruct-2507"))
 
-    import tinker_server.gateway as gw
+    import mint_server.gateway as gw
 
     async def _remote_sampling_session(_sid):
         return None
@@ -293,7 +292,7 @@ def test_ensure_sampling_session_uses_base_model_for_plain_model_names(monkeypat
     monkeypatch.setattr(service_route, "create_sampling_session", _fake_create_sampling_session)
     monkeypatch.setattr(service_route, "session_manager", _StubSessionManager("Qwen/Qwen3-30B-A3B-Instruct-2507"))
 
-    import tinker_server.gateway as gw
+    import mint_server.gateway as gw
 
     async def _remote_sampling_session(_sid):
         return None
@@ -320,7 +319,7 @@ def test_ensure_sampling_session_returns_gateway_session_base_model(monkeypatch)
     monkeypatch.setattr(service_route, "create_sampling_session", _fake_create_sampling_session)
     monkeypatch.setattr(service_route, "session_manager", _StubSessionManager(None))
 
-    import tinker_server.gateway as gw
+    import mint_server.gateway as gw
 
     async def _remote_sampling_session(_sid):
         return ("aliyun", "Qwen/Qwen3-235B-A22B-Instruct-2507")
@@ -348,7 +347,7 @@ def test_ensure_sampling_session_allows_routed_base_model_creation(monkeypatch):
     monkeypatch.setattr(service_route, "create_sampling_session", _fake_create_sampling_session)
     monkeypatch.setattr(service_route, "session_manager", _StubSessionManager(None))
 
-    import tinker_server.gateway as gw
+    import mint_server.gateway as gw
 
     async def _remote_sampling_session(_sid):
         return ("mint-prod-aliyun", "Qwen/Qwen3-235B-A22B-Instruct-2507")

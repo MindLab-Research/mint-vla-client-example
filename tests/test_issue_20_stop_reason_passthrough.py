@@ -1,4 +1,4 @@
-from tinker_server.sampling_utils import resolve_stop_reason, sampled_sequence_from_result
+from mint_server.sampling_utils import resolve_stop_reason, sampled_sequence_from_result
 
 
 def test_issue_20_prefers_explicit_stop_reason() -> None:

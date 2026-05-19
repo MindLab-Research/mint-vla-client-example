@@ -4,7 +4,7 @@ Many endpoints return `{"request_id": "<uuid>"}` immediately and complete the wo
 
 ## Retrieve semantics (`POST /api/v1/retrieve_future`)
 
-Implementation: `tinker_server/routes/futures.py` backed by `TaskFutureService` in `tinker_server/backend/task_state_store.py`.
+Implementation: `mint_server/routes/futures.py` backed by `TaskFutureService` in `mint_server/backend/task_state_store.py`.
 
 - HTTP 408: `PENDING` (client should retry)
 - HTTP 200 with `{"error": ...}`: terminal non-success (for example `FAILED`, `EXPIRED`, `RETRIEVED`)

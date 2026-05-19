@@ -8,7 +8,7 @@ import pytest
 
 pytest.importorskip("ray")
 
-import tinker_server.backend.multinode_inference as mi
+import mint_server.backend.multinode_inference as mi
 
 
 class _RegistryStub:
@@ -43,7 +43,7 @@ def test_issue_358_generate_missing_lora_path_fails_without_killing_actor(
     fake_self = SimpleNamespace(
         _initialized=True,
         registry=_RegistryStub(lora_id=7, adapter_path="/tmp/definitely-missing-issue358-adapter"),
-        actor_name="tinker_vllm_qwen3-30b-a3b-instruct-2507",
+        actor_name="mint_vllm_qwen3-30b-a3b-instruct-2507",
         engine=_fake_generate_engine(),
     )
 
@@ -88,7 +88,7 @@ def test_issue_358_remote_adapter_file_missing_does_not_kill_actor(
     fake_self = SimpleNamespace(
         _initialized=True,
         registry=_RegistryStub(lora_id=8, adapter_path=str(adapter_dir)),
-        actor_name="tinker_vllm_qwen3-30b-a3b-instruct-2507",
+        actor_name="mint_vllm_qwen3-30b-a3b-instruct-2507",
         engine=_fake_generate_engine(),
     )
 
@@ -133,7 +133,7 @@ def test_issue_358_unrelated_file_not_found_still_kills_actor(
     fake_self = SimpleNamespace(
         _initialized=True,
         registry=_RegistryStub(lora_id=9, adapter_path=str(adapter_dir)),
-        actor_name="tinker_vllm_qwen3-30b-a3b-instruct-2507",
+        actor_name="mint_vllm_qwen3-30b-a3b-instruct-2507",
         engine=_fake_generate_engine(),
     )
 

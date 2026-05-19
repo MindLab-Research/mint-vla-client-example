@@ -1,7 +1,7 @@
 ---
 name: vllm-knob-calculation
 description: |
-  Back-of-envelope sizing workflow for vLLM serving knobs in tinker-server.
+  Back-of-envelope sizing workflow for vLLM serving knobs in mint-server.
 
   Use for: choosing or reviewing `gpu_memory_utilization`, `max_loras`,
   `max_cpu_loras`, `max_lora_rank`, `max_num_batched_tokens`, and the

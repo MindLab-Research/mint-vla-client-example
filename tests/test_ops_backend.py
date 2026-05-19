@@ -31,7 +31,7 @@ class StubDeployService(DeployService):
             "rebuild_model_options": ["Qwen/Qwen3-30B-A3B-Instruct-2507"],
             "actors": [
                 {
-                    "actor_name": "tinker_vllm_qwen3",
+                    "actor_name": "mint_vllm_qwen3",
                     "actor_type": actor_type or "vllm",
                     "base_model": model_query or "Qwen/Qwen3-30B-A3B-Instruct-2507",
                     "num_gpus": 8,
@@ -108,12 +108,12 @@ def test_recycle_route_proxies_payload() -> None:
         json={
             "actor_type": "vllm",
             "model_name": "Qwen/Qwen3-30B-A3B-Instruct-2507",
-            "actor_name": "tinker_vllm_qwen3",
+            "actor_name": "mint_vllm_qwen3",
         },
     )
     assert response.status_code == 200
     assert response.json()["ok"] is True
-    assert service.recycle_calls == [("vllm", "Qwen/Qwen3-30B-A3B-Instruct-2507", "tinker_vllm_qwen3")]
+    assert service.recycle_calls == [("vllm", "Qwen/Qwen3-30B-A3B-Instruct-2507", "mint_vllm_qwen3")]
 
 
 def test_rebuild_route_proxies_models() -> None:

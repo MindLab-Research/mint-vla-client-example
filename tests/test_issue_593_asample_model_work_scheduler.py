@@ -5,8 +5,8 @@ from types import SimpleNamespace
 
 import anyio
 
-from tinker_server.models.types import ModelInput, SampleRequest, SamplingParams
-from tinker_server.routes import sampling as sampling_route
+from mint_server.models.types import ModelInput, SampleRequest, SamplingParams
+from mint_server.routes import sampling as sampling_route
 
 
 class _StubTaskFutureService:
@@ -88,8 +88,8 @@ def test_issue_593_asample_routes_multi_lora_to_model_work_scheduler(monkeypatch
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
     monkeypatch.setattr(sampling_route, "task_futures", stub_fs)
 
-    import tinker_server.backend.model_work_scheduler as mws
-    import tinker_server.backend.result_size_estimator as rse
+    import mint_server.backend.model_work_scheduler as mws
+    import mint_server.backend.result_size_estimator as rse
 
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
     monkeypatch.setattr(rse, "estimate_sampling_result_bytes", lambda _req: 0)
@@ -141,8 +141,8 @@ def test_issue_593_asample_cancels_scheduler_item_if_post_append_meta_update_fai
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
     monkeypatch.setattr(sampling_route, "task_futures", stub_fs)
 
-    import tinker_server.backend.model_work_scheduler as mws
-    import tinker_server.backend.result_size_estimator as rse
+    import mint_server.backend.model_work_scheduler as mws
+    import mint_server.backend.result_size_estimator as rse
 
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
     monkeypatch.setattr(rse, "estimate_sampling_result_bytes", lambda _req: 0)
@@ -176,8 +176,8 @@ def test_issue_593_asample_does_not_cancel_scheduler_item_when_append_rejects(mo
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
     monkeypatch.setattr(sampling_route, "task_futures", stub_fs)
 
-    import tinker_server.backend.model_work_scheduler as mws
-    import tinker_server.backend.result_size_estimator as rse
+    import mint_server.backend.model_work_scheduler as mws
+    import mint_server.backend.result_size_estimator as rse
 
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
     monkeypatch.setattr(rse, "estimate_sampling_result_bytes", lambda _req: 0)
@@ -209,8 +209,8 @@ def test_issue_593_asample_ignores_legacy_flag_and_uses_model_work_scheduler(mon
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
     monkeypatch.setattr(sampling_route, "task_futures", stub_fs)
 
-    import tinker_server.backend.model_work_scheduler as mws
-    import tinker_server.backend.result_size_estimator as rse
+    import mint_server.backend.model_work_scheduler as mws
+    import mint_server.backend.result_size_estimator as rse
 
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
     monkeypatch.setattr(rse, "estimate_sampling_result_bytes", lambda _req: 0)

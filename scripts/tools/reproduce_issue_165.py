@@ -6,22 +6,22 @@ from typing import Any
 import requests
 
 
-BASE_URL = os.environ.get("TINKER_BASE_URL")
+BASE_URL = os.environ.get("MINT_BASE_URL")
 if not BASE_URL:
-    port = os.environ.get("TINKER_PORT", "8000")
+    port = os.environ.get("MINT_PORT", "8000")
     BASE_URL = f"http://localhost:{port}"
 BASE_URL = BASE_URL.rstrip("/")
 
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
 
-MODEL = os.environ.get("TINKER_MODEL", "Qwen/Qwen3-0.6B")
-LORA_RANK = int(os.environ.get("TINKER_LORA_RANK", "16"))
-LR = float(os.environ.get("TINKER_LR", "5e-5"))
+MODEL = os.environ.get("MINT_MODEL", "Qwen/Qwen3-0.6B")
+LORA_RANK = int(os.environ.get("MINT_LORA_RANK", "16"))
+LR = float(os.environ.get("MINT_LR", "5e-5"))
 
-POLL_TIMEOUT_S = float(os.environ.get("TINKER_POLL_TIMEOUT_S", "900"))
-POLL_SLEEP_S = float(os.environ.get("TINKER_POLL_SLEEP_S", "1.0"))
+POLL_TIMEOUT_S = float(os.environ.get("MINT_POLL_TIMEOUT_S", "900"))
+POLL_SLEEP_S = float(os.environ.get("MINT_POLL_SLEEP_S", "1.0"))
 
-PREWARM_WAIT_S = float(os.environ.get("TINKER_PREWARM_WAIT_S", "600"))
+PREWARM_WAIT_S = float(os.environ.get("MINT_PREWARM_WAIT_S", "600"))
 
 
 def _headers() -> dict[str, str]:

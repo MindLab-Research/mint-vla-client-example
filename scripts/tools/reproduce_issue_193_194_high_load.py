@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """High-load repro harness for issue 193/194 style same-session crossing.
 
-This script is intended to run from a workstation against a live tinker-server.
+This script is intended to run from a workstation against a live mint-server.
 
 What it does:
 - creates one target training model
@@ -73,13 +73,13 @@ def _coalesce(*values: str | None) -> str | None:
 
 def _base_url(args: argparse.Namespace) -> str:
     return (
-        _coalesce(args.base_url, os.environ.get("TINKER_BASE_URL"), os.environ.get("MINT_BASE_URL"), DEFAULT_BASE_URL)
+        _coalesce(args.base_url, os.environ.get("MINT_BASE_URL"), os.environ.get("MINT_BASE_URL"), DEFAULT_BASE_URL)
         .rstrip("/")
     )
 
 
 def _headers(args: argparse.Namespace) -> dict[str, str]:
-    key = _coalesce(args.api_key, os.environ.get("TINKER_API_KEY"), os.environ.get("MINT_API_KEY"))
+    key = _coalesce(args.api_key, os.environ.get("MINT_API_KEY"), os.environ.get("MINT_API_KEY"))
     return {"X-API-Key": key} if key else {}
 
 
@@ -434,27 +434,27 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default=None)
     parser.add_argument("--api-key", default=None)
-    parser.add_argument("--model", default=os.environ.get("TINKER_MODEL", DEFAULT_MODEL))
-    parser.add_argument("--lora-rank", type=int, default=int(os.environ.get("TINKER_LORA_RANK", "8")))
-    parser.add_argument("--learning-rate", type=float, default=float(os.environ.get("TINKER_LR", "1e-4")))
-    parser.add_argument("--steps", type=int, default=int(os.environ.get("TINKER_STEPS", "8")))
-    parser.add_argument("--batch-size", type=int, default=int(os.environ.get("TINKER_BATCH_SIZE", "8")))
-    parser.add_argument("--prompt-repeats", type=int, default=int(os.environ.get("TINKER_PROMPT_REPEATS", "256")))
-    parser.add_argument("--target-repeats", type=int, default=int(os.environ.get("TINKER_TARGET_REPEATS", "48")))
-    parser.add_argument("--background-models", type=int, default=int(os.environ.get("TINKER_BG_MODELS", "2")))
-    parser.add_argument("--save-every", type=int, default=int(os.environ.get("TINKER_SAVE_EVERY", "0")))
-    parser.add_argument("--dispatch-gap-s", type=float, default=float(os.environ.get("TINKER_DISPATCH_GAP_S", "0.0")))
-    parser.add_argument("--timeout-s", type=float, default=float(os.environ.get("TINKER_TIMEOUT_S", "3600")))
-    parser.add_argument("--poll-interval-s", type=float, default=float(os.environ.get("TINKER_POLL_INTERVAL_S", "2.0")))
+    parser.add_argument("--model", default=os.environ.get("MINT_MODEL", DEFAULT_MODEL))
+    parser.add_argument("--lora-rank", type=int, default=int(os.environ.get("MINT_LORA_RANK", "8")))
+    parser.add_argument("--learning-rate", type=float, default=float(os.environ.get("MINT_LR", "1e-4")))
+    parser.add_argument("--steps", type=int, default=int(os.environ.get("MINT_STEPS", "8")))
+    parser.add_argument("--batch-size", type=int, default=int(os.environ.get("MINT_BATCH_SIZE", "8")))
+    parser.add_argument("--prompt-repeats", type=int, default=int(os.environ.get("MINT_PROMPT_REPEATS", "256")))
+    parser.add_argument("--target-repeats", type=int, default=int(os.environ.get("MINT_TARGET_REPEATS", "48")))
+    parser.add_argument("--background-models", type=int, default=int(os.environ.get("MINT_BG_MODELS", "2")))
+    parser.add_argument("--save-every", type=int, default=int(os.environ.get("MINT_SAVE_EVERY", "0")))
+    parser.add_argument("--dispatch-gap-s", type=float, default=float(os.environ.get("MINT_DISPATCH_GAP_S", "0.0")))
+    parser.add_argument("--timeout-s", type=float, default=float(os.environ.get("MINT_TIMEOUT_S", "3600")))
+    parser.add_argument("--poll-interval-s", type=float, default=float(os.environ.get("MINT_POLL_INTERVAL_S", "2.0")))
     parser.add_argument(
         "--ordering-tolerance-s",
         type=float,
-        default=float(os.environ.get("TINKER_ORDERING_TOLERANCE_S", "2.0")),
+        default=float(os.environ.get("MINT_ORDERING_TOLERANCE_S", "2.0")),
     )
-    parser.add_argument("--baseline-window", type=int, default=int(os.environ.get("TINKER_BASELINE_WINDOW", "3")))
-    parser.add_argument("--loss-spike-factor", type=float, default=float(os.environ.get("TINKER_LOSS_SPIKE_FACTOR", "3.0")))
-    parser.add_argument("--loss-spike-abs", type=float, default=float(os.environ.get("TINKER_LOSS_SPIKE_ABS", "0.5")))
-    parser.add_argument("--output-dir", default=os.environ.get("TINKER_REPRO_OUTPUT_DIR", "/tmp/issue193-194-high-load"))
+    parser.add_argument("--baseline-window", type=int, default=int(os.environ.get("MINT_BASELINE_WINDOW", "3")))
+    parser.add_argument("--loss-spike-factor", type=float, default=float(os.environ.get("MINT_LOSS_SPIKE_FACTOR", "3.0")))
+    parser.add_argument("--loss-spike-abs", type=float, default=float(os.environ.get("MINT_LOSS_SPIKE_ABS", "0.5")))
+    parser.add_argument("--output-dir", default=os.environ.get("MINT_REPRO_OUTPUT_DIR", "/tmp/issue193-194-high-load"))
     return parser.parse_args()
 
 

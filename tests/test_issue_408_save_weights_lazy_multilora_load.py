@@ -11,8 +11,8 @@ import pytest
 
 
 def _import_training_route():
-    sys.modules.setdefault("tinker_server.routes.service", types.ModuleType("tinker_server.routes.service"))
-    return importlib.import_module("tinker_server.routes.training")
+    sys.modules.setdefault("mint_server.routes.service", types.ModuleType("mint_server.routes.service"))
+    return importlib.import_module("mint_server.routes.training")
 
 
 async def _identity_materialize(session):
@@ -28,8 +28,8 @@ def anyio_backend():
 async def test_issue_408_save_weights_for_sampler_registers_lazy_multilora_session(
     monkeypatch, tmp_path: Path
 ) -> None:
-    from tinker_server.backend import session_index_store as sis
-    from tinker_server.models.types import SaveWeightsForSamplerRequest
+    from mint_server.backend import session_index_store as sis
+    from mint_server.models.types import SaveWeightsForSamplerRequest
 
     tr = _import_training_route()
     monkeypatch.setattr(tr, "_materialize_training_session_for_stateful_use", _identity_materialize)
@@ -153,8 +153,8 @@ async def test_issue_408_save_weights_for_sampler_registers_lazy_multilora_sessi
 async def test_issue_408_save_weights_for_sampler_reuses_pending_warm_task(
     monkeypatch, tmp_path: Path
 ) -> None:
-    from tinker_server.backend import session_index_store as sis
-    from tinker_server.models.types import SaveWeightsForSamplerRequest
+    from mint_server.backend import session_index_store as sis
+    from mint_server.models.types import SaveWeightsForSamplerRequest
 
     tr = _import_training_route()
     monkeypatch.setattr(tr, "_materialize_training_session_for_stateful_use", _identity_materialize)
@@ -265,8 +265,8 @@ async def test_issue_408_save_weights_for_sampler_reuses_pending_warm_task(
 async def test_issue_408_save_weights_for_sampler_fails_fast_on_immediate_engine_error(
     monkeypatch, tmp_path: Path
 ) -> None:
-    from tinker_server.backend import session_index_store as sis
-    from tinker_server.models.types import SaveWeightsForSamplerRequest
+    from mint_server.backend import session_index_store as sis
+    from mint_server.models.types import SaveWeightsForSamplerRequest
 
     tr = _import_training_route()
     monkeypatch.setattr(tr, "_materialize_training_session_for_stateful_use", _identity_materialize)
@@ -357,8 +357,8 @@ async def test_issue_408_save_weights_for_sampler_fails_fast_on_immediate_engine
 async def test_issue_408_save_weights_for_sampler_fails_fast_on_async_warm_error(
     monkeypatch, tmp_path: Path
 ) -> None:
-    from tinker_server.backend import session_index_store as sis
-    from tinker_server.models.types import SaveWeightsForSamplerRequest
+    from mint_server.backend import session_index_store as sis
+    from mint_server.models.types import SaveWeightsForSamplerRequest
 
     tr = _import_training_route()
     monkeypatch.setattr(tr, "_materialize_training_session_for_stateful_use", _identity_materialize)

@@ -6,7 +6,7 @@ This script runs a minimal real training request:
 2) forward_backward with loss_fn=importance_sampling (no per-step rollout config)
 
 Run locally against dev server (via SSH tunnel):
-  TINKER_BASE_URL=http://localhost:8000 TINKER_API_KEY=dummy \
+  MINT_BASE_URL=http://localhost:8000 MINT_API_KEY=dummy \
   python scripts/tools/validate_mis_rollout_correction.py \
     --base-model Qwen/Qwen3-0.6B
 """
@@ -27,8 +27,8 @@ def _env(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
-BASE_URL = _env("TINKER_BASE_URL", "http://localhost:8000").rstrip("/")
-API_KEY = _env("TINKER_API_KEY", "dummy")
+BASE_URL = _env("MINT_BASE_URL", "http://localhost:8000").rstrip("/")
+API_KEY = _env("MINT_API_KEY", "dummy")
 
 
 def _headers(api_key: str) -> dict[str, str]:
@@ -100,10 +100,10 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Validate MIS rollout_correction_config path")
     p.add_argument("--base-url", default=BASE_URL)
     p.add_argument("--api-key", default=API_KEY)
-    p.add_argument("--base-model", default=_env("TINKER_MODEL", "Qwen/Qwen3-0.6B"))
-    p.add_argument("--lora-rank", type=int, default=int(_env("TINKER_LORA_RANK", "8")))
-    p.add_argument("--create-timeout-s", type=float, default=float(_env("TINKER_CREATE_MODEL_TIMEOUT_S", "3600")))
-    p.add_argument("--forward-backward-timeout-s", type=float, default=float(_env("TINKER_FORWARD_BACKWARD_TIMEOUT_S", "1800")))
+    p.add_argument("--base-model", default=_env("MINT_MODEL", "Qwen/Qwen3-0.6B"))
+    p.add_argument("--lora-rank", type=int, default=int(_env("MINT_LORA_RANK", "8")))
+    p.add_argument("--create-timeout-s", type=float, default=float(_env("MINT_CREATE_MODEL_TIMEOUT_S", "3600")))
+    p.add_argument("--forward-backward-timeout-s", type=float, default=float(_env("MINT_FORWARD_BACKWARD_TIMEOUT_S", "1800")))
     p.add_argument("--poll-interval-s", type=float, default=2.0)
     p.add_argument(
         "--mis-threshold", type=float, default=1.1, help="rollout_correction_config.rollout_is_threshold"

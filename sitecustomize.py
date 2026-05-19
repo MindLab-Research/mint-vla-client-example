@@ -57,7 +57,7 @@ def _sanitize_vllm_worker_pythonpath(raw: str | None) -> str:
     if raw is None:
         return ""
     try:
-        from tinker_server.runtime_env import sanitize_worker_pythonpath
+        from mint_server.runtime_env import sanitize_worker_pythonpath
 
         return sanitize_worker_pythonpath(
             raw,
@@ -72,7 +72,7 @@ def _strip_host_only_sys_path_entries(paths: list[str]) -> list[str]:
     if not env_root:
         return paths
     try:
-        from tinker_server.runtime_env import host_only_pythonpath_entries
+        from mint_server.runtime_env import host_only_pythonpath_entries
 
         excluded = {
             os.path.normcase(os.path.abspath(path))
@@ -420,7 +420,7 @@ def _patch_vllm_ray_executor_use_explicit_cluster_address() -> None:
         # attach hints and temp-dir/node-ip overrides instead of falling back to a
         # fresh local-driver attach inside the worker process.
         import ray
-        from tinker_server.ray_utils import init_ray as mint_init_ray
+        from mint_server.ray_utils import init_ray as mint_init_ray
 
         if not ray.is_initialized():
             mint_init_ray(

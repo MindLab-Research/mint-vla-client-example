@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import anyio
 
-from tinker_server.routes import sampling as sampling_route
+from mint_server.routes import sampling as sampling_route
 
 
 class _StubCoalesceEngine:

@@ -10,17 +10,17 @@ from typing import Any
 import requests
 
 
-BASE_URL = (os.environ.get("TINKER_BASE_URL") or "http://localhost:10164").rstrip("/")
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
+BASE_URL = (os.environ.get("MINT_BASE_URL") or "http://localhost:10164").rstrip("/")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
 
-INFER_MODEL = os.environ.get("TINKER_INFER_MODEL", "Qwen/Qwen3-0.6B")
+INFER_MODEL = os.environ.get("MINT_INFER_MODEL", "Qwen/Qwen3-0.6B")
 
-POLL_TIMEOUT_S = float(os.environ.get("TINKER_POLL_TIMEOUT_S", "120"))
-HTTP_TIMEOUT_S = float(os.environ.get("TINKER_HTTP_TIMEOUT_S", "30"))
-IDLE_WAIT_S = float(os.environ.get("TINKER_IDLE_WAIT_S", "2.0"))
-EXPECTED_IDLE_TIMEOUT_S = float(os.environ.get("TINKER_EXPECT_IDLE_TIMEOUT_S", "300"))
+POLL_TIMEOUT_S = float(os.environ.get("MINT_POLL_TIMEOUT_S", "120"))
+HTTP_TIMEOUT_S = float(os.environ.get("MINT_HTTP_TIMEOUT_S", "30"))
+IDLE_WAIT_S = float(os.environ.get("MINT_IDLE_WAIT_S", "2.0"))
+EXPECTED_IDLE_TIMEOUT_S = float(os.environ.get("MINT_EXPECT_IDLE_TIMEOUT_S", "300"))
 
-MAX_TOKENS = int(os.environ.get("TINKER_MAX_TOKENS", "2048"))
+MAX_TOKENS = int(os.environ.get("MINT_MAX_TOKENS", "2048"))
 
 
 def _headers() -> dict[str, str]:
@@ -92,10 +92,10 @@ def _get_vllm_actor_entry(*, actor_name: str) -> dict[str, Any] | None:
 
 
 def _expected_vllm_actor_name(model_name: str) -> str:
-    # Must match tinker_server.backend.multi_lora_engine._model_to_actor_name().
+    # Must match mint_server.backend.multi_lora_engine._model_to_actor_name().
     model_part = model_name.split("/")[-1] if "/" in model_name else model_name
     safe_name = model_part.lower().replace(" ", "_")
-    return f"tinker_vllm_{safe_name}"
+    return f"mint_vllm_{safe_name}"
 
 
 def _create_sampling_session() -> str:
@@ -210,7 +210,7 @@ def _assert_busy_vllm_actor_not_idle_while_future_pending(sampling_session_id: s
             if not saw_pending:
                 raise RuntimeError(
                     "Inference finished too quickly; cannot validate keepalive. "
-                    f"Try increasing TINKER_MAX_TOKENS (currently {MAX_TOKENS})."
+                    f"Try increasing MINT_MAX_TOKENS (currently {MAX_TOKENS})."
                 )
             if "error" in fut:
                 raise RuntimeError(f"infer future returned error: {fut!r}")

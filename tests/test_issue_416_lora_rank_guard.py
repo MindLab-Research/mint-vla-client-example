@@ -3,8 +3,8 @@ from __future__ import annotations
 import pytest
 from fastapi import HTTPException
 
-from tinker_server.models.types import LoRAConfig
-from tinker_server.routes import training as training_routes
+from mint_server.models.types import LoRAConfig
+from mint_server.routes import training as training_routes
 
 
 def test_issue_416_lora_rank_guard_rejects_rank_above_server_max(monkeypatch: pytest.MonkeyPatch) -> None:

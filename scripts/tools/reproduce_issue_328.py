@@ -13,28 +13,28 @@ from typing import Any
 import requests
 
 
-BASE_URL = (os.environ.get("TINKER_BASE_URL") or "http://localhost:8000").rstrip("/")
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
-BASE_MODEL = os.environ.get("TINKER_BASE_MODEL", "Qwen/Qwen3-235B-A22B-Instruct-2507")
+BASE_URL = (os.environ.get("MINT_BASE_URL") or "http://localhost:8000").rstrip("/")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
+BASE_MODEL = os.environ.get("MINT_BASE_MODEL", "Qwen/Qwen3-235B-A22B-Instruct-2507")
 MODEL_PATH = os.environ.get(
-    "TINKER_MODEL_PATH",
-    "tinker://ebccebe2-2ccf-584c-822b-11a8ec92c602:train:0/sampler_weights/hotload-base-vllmfix3",
+    "MINT_MODEL_PATH",
+    "mint://ebccebe2-2ccf-584c-822b-11a8ec92c602:train:0/sampler_weights/hotload-base-vllmfix3",
 )
-LORA_RANK = int(os.environ.get("TINKER_LORA_RANK", "64"))
-LONG_PROMPT_LEN = int(os.environ.get("TINKER_LONG_PROMPT_LEN", "24000"))
-LONG_MAX_TOKENS = int(os.environ.get("TINKER_LONG_MAX_TOKENS", "1"))
-CHURN_COUNT = int(os.environ.get("TINKER_CHURN_COUNT", "8"))
-CHURN_PROMPT_LEN = int(os.environ.get("TINKER_CHURN_PROMPT_LEN", "128"))
-CHURN_MAX_TOKENS = int(os.environ.get("TINKER_CHURN_MAX_TOKENS", "8"))
-WAIT_BEFORE_CHURN_S = float(os.environ.get("TINKER_WAIT_BEFORE_CHURN_S", "5"))
-POLL_SLEEP_S = float(os.environ.get("TINKER_POLL_SLEEP_S", "1.0"))
-POLL_TIMEOUT_S = float(os.environ.get("TINKER_POLL_TIMEOUT_S", "2400"))
-MONITOR_INTERVAL_S = float(os.environ.get("TINKER_MONITOR_INTERVAL_S", "0.5"))
+LORA_RANK = int(os.environ.get("MINT_LORA_RANK", "64"))
+LONG_PROMPT_LEN = int(os.environ.get("MINT_LONG_PROMPT_LEN", "24000"))
+LONG_MAX_TOKENS = int(os.environ.get("MINT_LONG_MAX_TOKENS", "1"))
+CHURN_COUNT = int(os.environ.get("MINT_CHURN_COUNT", "8"))
+CHURN_PROMPT_LEN = int(os.environ.get("MINT_CHURN_PROMPT_LEN", "128"))
+CHURN_MAX_TOKENS = int(os.environ.get("MINT_CHURN_MAX_TOKENS", "8"))
+WAIT_BEFORE_CHURN_S = float(os.environ.get("MINT_WAIT_BEFORE_CHURN_S", "5"))
+POLL_SLEEP_S = float(os.environ.get("MINT_POLL_SLEEP_S", "1.0"))
+POLL_TIMEOUT_S = float(os.environ.get("MINT_POLL_TIMEOUT_S", "2400"))
+MONITOR_INTERVAL_S = float(os.environ.get("MINT_MONITOR_INTERVAL_S", "0.5"))
 MONITOR_NODE_IPS = [
-    x.strip() for x in os.environ.get("TINKER_MONITOR_NODE_IPS", "192.168.37.187,192.168.37.188").split(",") if x.strip()
+    x.strip() for x in os.environ.get("MINT_MONITOR_NODE_IPS", "192.168.37.187,192.168.37.188").split(",") if x.strip()
 ]
-RAY_NAMESPACE = os.environ.get("TINKER_RAY_NAMESPACE", "tinker_issue328")
-OUTPUT_JSON = os.environ.get("TINKER_OUTPUT_JSON", f"/tmp/issue328_repro_{int(time.time())}.json")
+RAY_NAMESPACE = os.environ.get("MINT_RAY_NAMESPACE", "mint_issue328")
+OUTPUT_JSON = os.environ.get("MINT_OUTPUT_JSON", f"/tmp/issue328_repro_{int(time.time())}.json")
 
 
 def _headers() -> dict[str, str]:
@@ -310,7 +310,7 @@ def main() -> int:
         return any(
             needle in text
             for needle in (
-                "multinode_vllm_ray_get_failed",
+                "mint_vllm_multinode_ray_get_failed",
                 "ActorDiedError",
                 "EngineDeadError",
                 "RayActorError",

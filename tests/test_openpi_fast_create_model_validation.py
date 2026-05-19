@@ -1,8 +1,8 @@
 import pytest
 
-from tinker_server.models.types import CreateModelRequest, LoRAConfig
+from mint_server.models.types import CreateModelRequest, LoRAConfig
 
-from tinker_server.backend.openpi_fast_training import (
+from mint_server.backend.openpi_fast_training import (
     OPENPI_FAST_LORA_RANK,
     validate_openpi_fast_create_request,
 )

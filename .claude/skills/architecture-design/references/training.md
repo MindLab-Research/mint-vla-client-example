@@ -1,6 +1,6 @@
 # Training architecture
 
-Training is controlled via `/api/v1/*` routes in `tinker_server/routes/training.py`. The API surface follows the Tinker SDK expectations (create model, forward/backward, optimizer step, checkpointing).
+Training is controlled via `/api/v1/*` routes in `mint_server/routes/training.py`. The API surface follows the Tinker SDK expectations (create model, forward/backward, optimizer step, checkpointing).
 
 For a request-by-request walkthrough of queueing, execution serialization, backend session switching, and checkpoint/export interactions, see `training-session-switch-flow.md`.
 

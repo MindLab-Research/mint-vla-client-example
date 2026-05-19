@@ -13,13 +13,13 @@ import requests
 
 
 def _load_api_key() -> str:
-    api_key = os.environ.get("TINKER_API_KEY")
+    api_key = os.environ.get("MINT_API_KEY")
     if api_key:
         return api_key
 
     try:
         result = subprocess.run(
-            ["zsh", "-lc", "printf %s \"${TINKER_API_KEY-}\""],
+            ["zsh", "-lc", "printf %s \"${MINT_API_KEY-}\""],
             check=True,
             capture_output=True,
             text=True,
@@ -30,18 +30,18 @@ def _load_api_key() -> str:
     return result.stdout.strip()
 
 
-BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000").rstrip("/")
+BASE_URL = os.environ.get("MINT_BASE_URL", "http://localhost:8000").rstrip("/")
 API_KEY = _load_api_key()
-BASE_MODEL = os.environ.get("TINKER_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
-LORA_RANK = int(os.environ.get("TINKER_LORA_RANK", "8"))
-LEARNING_RATE = float(os.environ.get("TINKER_LEARNING_RATE", "1e-4"))
+BASE_MODEL = os.environ.get("MINT_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
+LORA_RANK = int(os.environ.get("MINT_LORA_RANK", "8"))
+LEARNING_RATE = float(os.environ.get("MINT_LEARNING_RATE", "1e-4"))
 
-CREATE_TIMEOUT_S = float(os.environ.get("TINKER_CREATE_MODEL_TIMEOUT_S", "3600"))
-FWDBWD_TIMEOUT_S = float(os.environ.get("TINKER_FORWARD_BACKWARD_TIMEOUT_S", "3600"))
-OPTIM_TIMEOUT_S = float(os.environ.get("TINKER_OPTIM_STEP_TIMEOUT_S", "3600"))
-REQUEST_TIMEOUT_S = float(os.environ.get("TINKER_REQUEST_TIMEOUT_S", "60"))
-POLL_REQUEST_TIMEOUT_S = float(os.environ.get("TINKER_POLL_REQUEST_TIMEOUT_S", "30"))
-POLL_INTERVAL_S = float(os.environ.get("TINKER_POLL_INTERVAL_S", "2"))
+CREATE_TIMEOUT_S = float(os.environ.get("MINT_CREATE_MODEL_TIMEOUT_S", "3600"))
+FWDBWD_TIMEOUT_S = float(os.environ.get("MINT_FORWARD_BACKWARD_TIMEOUT_S", "3600"))
+OPTIM_TIMEOUT_S = float(os.environ.get("MINT_OPTIM_STEP_TIMEOUT_S", "3600"))
+REQUEST_TIMEOUT_S = float(os.environ.get("MINT_REQUEST_TIMEOUT_S", "60"))
+POLL_REQUEST_TIMEOUT_S = float(os.environ.get("MINT_POLL_REQUEST_TIMEOUT_S", "30"))
+POLL_INTERVAL_S = float(os.environ.get("MINT_POLL_INTERVAL_S", "2"))
 
 
 def _headers() -> dict[str, str]:

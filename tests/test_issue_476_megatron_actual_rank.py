@@ -6,10 +6,10 @@ ray = pytest.importorskip("ray")
 if not hasattr(ray, "remote"):
     pytest.skip("ray runtime without actor decorators is not usable for Megatron tests", allow_module_level=True)
 
-from tinker_server.backend.training_session_manager import TrainingSession
-from tinker_server.backend.verl_training import VerlTrainingEngine
-from tinker_server.backend.megatron_distributed import MegatronWorkerGroup
-from tinker_server.models.types import LoRAConfig
+from mint_server.backend.training_session_manager import TrainingSession
+from mint_server.backend.verl_training import VerlTrainingEngine
+from mint_server.backend.megatron_distributed import MegatronWorkerGroup
+from mint_server.models.types import LoRAConfig
 
 
 def test_issue_476_reused_shared_actor_preserves_new_session_actual_rank():
@@ -121,7 +121,7 @@ def test_issue_476_megatron_train_step_passes_actual_rank(monkeypatch):
     monkeypatch.setattr(engine, "_touch_actor", lambda _session: None)
     monkeypatch.setattr(engine, "_record_megatron_result_metrics", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
-        "tinker_server.backend.model_registry.get_model_config",
+        "mint_server.backend.model_registry.get_model_config",
         lambda _model: SimpleNamespace(is_moe=True),
     )
 

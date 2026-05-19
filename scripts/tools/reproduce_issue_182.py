@@ -4,8 +4,8 @@ import time
 import requests
 
 
-BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000").rstrip("/")
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
+BASE_URL = os.environ.get("MINT_BASE_URL", "http://localhost:8000").rstrip("/")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
 BASE_MODEL = os.environ.get("ISSUE182_BASE_MODEL", "Qwen/Qwen3-0.6B")
 SCHEDULER_ENABLED = os.environ.get("MINT_SCHEDULER_ENABLE", "0").strip().lower() in ("1", "true", "yes", "y")
 

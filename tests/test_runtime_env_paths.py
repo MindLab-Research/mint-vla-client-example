@@ -10,8 +10,8 @@ import tomllib
 import subprocess
 import sys
 
-import tinker_server.config as server_config
-from tinker_server.runtime_env import (
+import mint_server.config as server_config
+from mint_server.runtime_env import (
     bootstrap_runtime_pythonpath,
     build_runtime_pythonpath,
     checkout_runtime_env_layout,
@@ -29,7 +29,7 @@ def _materialize_runtime_env(root: Path) -> None:
             "base_python_dir": "base-python",
             "host_venv_dir": "host-venv",
         },
-        "sources": tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["tool"]["tinker"]["runtime_env"]["sources"],
+        "sources": tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["tool"]["mint"]["runtime_env"]["sources"],
     }
     root.mkdir(parents=True, exist_ok=True)
     (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
@@ -59,8 +59,8 @@ def _load_actor_runtime_env_payload(env: dict[str, str]) -> dict[str, dict[str, 
             "-c",
             (
                 "import json, os; "
-                "from tinker_server.config import actor_runtime_env_vars; "
-                "from tinker_server.runtime_config import actor_env_from_environ; "
+                "from mint_server.config import actor_runtime_env_vars; "
+                "from mint_server.runtime_config import actor_env_from_environ; "
                 "print(json.dumps({"
                 "'runtime_env': actor_runtime_env_vars(pythonpath='X'), "
                 "'actor_env': actor_env_from_environ(os.environ)"
@@ -82,7 +82,7 @@ def test_build_runtime_pythonpath_uses_canonical_root(tmp_path):
 
     out = build_runtime_pythonpath(
         env_root=str(env_root),
-        mint_code_root="/vePFS/code/yiwen/tinker-server",
+        mint_code_root="/vePFS/code/yiwen/mint-server",
         pfs_hf_modules_path="/vePFS/hf/modules",
     )
 
@@ -93,7 +93,7 @@ def test_build_runtime_pythonpath_uses_canonical_root(tmp_path):
     assert str(env_root / "src" / "verl") in parts
     assert str(env_root / "src" / "openpi" / "src") in parts
     assert str(env_root / "src" / "Megatron-LM") in parts
-    assert parts[-2] == "/vePFS/code/yiwen/tinker-server"
+    assert parts[-2] == "/vePFS/code/yiwen/mint-server"
     assert parts[-1] == "/vePFS/hf/modules"
 
 
@@ -118,7 +118,7 @@ def test_build_runtime_pythonpath_does_not_require_host_python(tmp_path):
             "base_python_dir": "base-python",
             "host_venv_dir": "host-venv",
         },
-        "sources": tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["tool"]["tinker"]["runtime_env"]["sources"],
+        "sources": tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["tool"]["mint"]["runtime_env"]["sources"],
     }
     env_root.mkdir(parents=True, exist_ok=True)
     (env_root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
@@ -140,7 +140,7 @@ def test_bootstrap_runtime_pythonpath_prefers_runtime_root(tmp_path):
     _materialize_runtime_env(env_root)
     environ = {
         "PFS_RUNTIME_ENV_ROOT": str(env_root),
-        "MINT_CODE_ROOT": "/pfs/code/tinker-server",
+        "MINT_CODE_ROOT": "/pfs/code/mint-server",
         "PFS_HF_MODULES_PATH": "/pfs/hf/modules",
     }
 
@@ -148,7 +148,7 @@ def test_bootstrap_runtime_pythonpath_prefers_runtime_root(tmp_path):
 
     assert str(env_root / "site-packages") in out.split(":")
     assert str(env_root / "src" / "vllm") in out.split(":")
-    assert "/pfs/code/tinker-server" in out.split(":")
+    assert "/pfs/code/mint-server" in out.split(":")
     assert "/pfs/hf/modules" in out.split(":")
 
 
@@ -186,7 +186,7 @@ def test_bootstrap_runtime_pythonpath_requires_hf_modules_path(tmp_path):
 def test_runtime_env_layout_tracks_pyproject_source_pythonpaths():
     data = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
     expected = []
-    for source in data["tool"]["tinker"]["runtime_env"]["sources"]:
+    for source in data["tool"]["mint"]["runtime_env"]["sources"]:
         if source.get("host_only", False):
             continue
         for rel in source.get("pythonpath", ["."]):
@@ -200,7 +200,7 @@ def test_runtime_env_layout_tracks_pyproject_source_pythonpaths():
 def test_runtime_env_layout_tracks_host_only_pythonpaths():
     data = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
     expected = []
-    for source in data["tool"]["tinker"]["runtime_env"]["sources"]:
+    for source in data["tool"]["mint"]["runtime_env"]["sources"]:
         if not source.get("host_only", False):
             continue
         for rel in source.get("pythonpath", ["."]):
@@ -456,7 +456,7 @@ def test_write_host_pth_prepends_runtime_paths(tmp_path, monkeypatch):
 
     build_runtime_env._write_host_pth(env_root, env_root / "host-venv" / "bin" / "python")
 
-    line = (purelib / "tinker_runtime_env.pth").read_text(encoding="utf-8").strip()
+    line = (purelib / "mint_runtime_env.pth").read_text(encoding="utf-8").strip()
     original_sys_path = sys.path[:]
     sys.path[:] = [
         "/host/site-packages",
@@ -501,7 +501,7 @@ def test_build_runtime_env_normalizes_host_only_vllm_source_metadata(tmp_path):
     )
     pyproject = {
         "tool": {
-            "tinker": {
+            "mint": {
                 "runtime_env": {
                     "source_dir": "src",
                     "sources": [
@@ -672,7 +672,7 @@ def test_copy_runtime_env_rewrites_embedded_runtime_metadata(tmp_path, monkeypat
     manifest = json.loads((dst / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["env_root"] == str(dst)
     assert manifest["host_python"] == str(dst / "host-venv" / "bin" / "python")
-    pth = dst / "host-venv" / "lib" / "python3.12" / "site-packages" / "tinker_runtime_env.pth"
+    pth = dst / "host-venv" / "lib" / "python3.12" / "site-packages" / "mint_runtime_env.pth"
     assert str(dst / "site-packages") in pth.read_text(encoding="utf-8")
     assert str(src / "site-packages") not in pth.read_text(encoding="utf-8")
     assert f"export PFS_RUNTIME_ENV_ROOT={dst}" in (dst / "activate_runtime_env.sh").read_text(encoding="utf-8")
@@ -760,7 +760,7 @@ def test_runtime_env_layout_prefers_manifest_sources(tmp_path):
 
 
 def test_preferred_vllm_python_executable_prefers_explicit_env(monkeypatch, tmp_path):
-    repo_root = tmp_path / "local-tinker"
+    repo_root = tmp_path / "local-mint"
     worker_wrapper = repo_root / "scripts" / "vllm_worker_python.py"
     worker_wrapper.parent.mkdir(parents=True, exist_ok=True)
     worker_wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
@@ -793,7 +793,7 @@ def test_config_import_does_not_require_runtime_root():
         [
             sys.executable,
             "-c",
-            "import tinker_server.config as c; print(c.PFS_RUNTIME_ENV_ROOT == '')",
+            "import mint_server.config as c; print(c.PFS_RUNTIME_ENV_ROOT == '')",
         ],
         cwd=Path(__file__).resolve().parents[1],
         check=True,
@@ -818,8 +818,8 @@ def test_gateway_session_store_namespace_respects_config_file(tmp_path):
             sys.executable,
             "-c",
             (
-                "import tinker_server.config as c; "
-                "import tinker_server.backend.gateway_session_store as g; "
+                "import mint_server.config as c; "
+                "import mint_server.backend.gateway_session_store as g; "
                 "print(c.RAY_NAMESPACE); "
                 "print(g._ray_namespace())"
             ),
@@ -847,11 +847,11 @@ def test_detached_store_namespaces_respect_config_file(tmp_path):
             sys.executable,
             "-c",
             (
-                "import tinker_server.config as c; "
-                "import tinker_server.backend.gateway_session_store as g; "
-                "import tinker_server.backend.sampling_session_store as p; "
-                "import tinker_server.backend.session_index_store as s; "
-                "import tinker_server.backend.training_session_store as t; "
+                "import mint_server.config as c; "
+                "import mint_server.backend.gateway_session_store as g; "
+                "import mint_server.backend.sampling_session_store as p; "
+                "import mint_server.backend.session_index_store as s; "
+                "import mint_server.backend.training_session_store as t; "
                 "print(c.RAY_NAMESPACE); "
                 "print(g._ray_namespace()); "
                 "print(p._ray_namespace()); "
@@ -877,7 +877,7 @@ def test_config_import_fails_on_namespace_mismatch(tmp_path):
     env["MINT_RAY_NAMESPACE"] = "env_ns"
 
     out = subprocess.run(
-        [sys.executable, "-c", "import tinker_server.config"],
+        [sys.executable, "-c", "import mint_server.config"],
         cwd=Path(__file__).resolve().parents[1],
         capture_output=True,
         text=True,
@@ -909,7 +909,7 @@ def test_config_import_fails_on_runtime_path_mismatch(tmp_path):
     env["PFS_HF_MODULES_PATH"] = "/env/hf"
 
     out = subprocess.run(
-        [sys.executable, "-c", "import tinker_server.config"],
+        [sys.executable, "-c", "import mint_server.config"],
         cwd=Path(__file__).resolve().parents[1],
         capture_output=True,
         text=True,
@@ -920,7 +920,7 @@ def test_config_import_fails_on_runtime_path_mismatch(tmp_path):
 
 
 def test_run_server_parses_config_before_runtime_bootstrap(tmp_path):
-    cfg = tmp_path / "tinker.toml"
+    cfg = tmp_path / "mint.toml"
     cfg.write_text(
         "\n".join(
             [
@@ -948,13 +948,13 @@ def test_run_server_parses_config_before_runtime_bootstrap(tmp_path):
         cwd=Path(__file__).resolve().parents[1],
         capture_output=True,
         text=True,
-        env={**dict(), "TINKER_HOST": "127.0.0.1"},
+        env={**dict(), "MINT_HOST": "127.0.0.1"},
     )
     assert "PFS_RUNTIME_ENV_ROOT is required" not in (out.stdout + out.stderr)
 
 
 def test_run_server_honors_env_config_before_runtime_bootstrap(tmp_path):
-    cfg = tmp_path / "tinker.toml"
+    cfg = tmp_path / "mint.toml"
     cfg.write_text(
         "\n".join(
             [
@@ -978,7 +978,7 @@ def test_run_server_honors_env_config_before_runtime_bootstrap(tmp_path):
         capture_output=True,
         text=True,
         env={
-            "TINKER_HOST": "127.0.0.1",
+            "MINT_HOST": "127.0.0.1",
             "MINT_CONFIG_PATH": str(cfg),
         },
     )
@@ -988,7 +988,7 @@ def test_run_server_honors_env_config_before_runtime_bootstrap(tmp_path):
 def test_seed_runtime_env_from_config_overrides_stale_env(tmp_path, monkeypatch):
     from scripts.run_server import _seed_runtime_env_from_config
 
-    cfg = tmp_path / "tinker.toml"
+    cfg = tmp_path / "mint.toml"
     cfg.write_text(
         "\n".join(
             [
@@ -1049,7 +1049,7 @@ def test_set_exact_pythonpath_removes_local_checkout_masking(monkeypatch):
                     str(Path.cwd()),
                     str(Path.cwd() / "scripts"),
                     "/home/yiwen/.local/lib/python3.14/site-packages",
-                    "/home/yiwen/tinker_project/mindlab-toolkit/src",
+                    "/home/yiwen/mint_project/mindlab-toolkit/src",
                     "/opt/host-venv/lib/python3.12",
                     "/usr/lib/python3.12",
                 ],
@@ -1066,7 +1066,7 @@ def test_set_exact_pythonpath_removes_local_checkout_masking(monkeypatch):
     assert str(Path.cwd()) not in run_server.sys.path
     assert str(Path.cwd() / "scripts") not in run_server.sys.path
     assert "/home/yiwen/.local/lib/python3.14/site-packages" not in run_server.sys.path
-    assert "/home/yiwen/tinker_project/mindlab-toolkit/src" not in run_server.sys.path
+    assert "/home/yiwen/mint_project/mindlab-toolkit/src" not in run_server.sys.path
     assert "/opt/host-venv/lib/python3.12" in run_server.sys.path
     assert "/usr/lib/python3.12" in run_server.sys.path
 
@@ -1136,7 +1136,7 @@ def test_actor_runtime_env_vars_forwards_vllm_envs(tmp_path):
 def test_actor_runtime_env_vars_forwards_config_path(tmp_path):
     env_root = tmp_path / "runtime"
     _materialize_runtime_env(env_root)
-    cfg = tmp_path / "tinker.toml"
+    cfg = tmp_path / "mint.toml"
     cfg.write_text(
         "\n".join(
             [
@@ -1182,7 +1182,7 @@ def test_actor_runtime_env_vars_requires_ray_address(tmp_path):
             sys.executable,
             "-c",
             (
-                "from tinker_server.config import actor_runtime_env_vars; "
+                "from mint_server.config import actor_runtime_env_vars; "
                 "actor_runtime_env_vars(pythonpath='X')"
             ),
         ],
@@ -1275,7 +1275,7 @@ def test_actor_runtime_env_vars_forwards_ray_attach_hints(tmp_path):
             "-c",
             (
                 "import json; "
-                "from tinker_server.config import actor_runtime_env_vars; "
+                "from mint_server.config import actor_runtime_env_vars; "
                 "print(json.dumps(actor_runtime_env_vars(pythonpath='X')))"
             ),
         ],
@@ -1313,7 +1313,7 @@ def test_actor_runtime_env_skips_local_working_dir_in_ray_client_mode(tmp_path):
             "-c",
             (
                 "import json; "
-                "from tinker_server.config import actor_runtime_env; "
+                "from mint_server.config import actor_runtime_env; "
                 "print(json.dumps(actor_runtime_env(pythonpath='X')))"
             ),
         ],
@@ -1337,7 +1337,7 @@ def test_actor_runtime_env_skips_local_working_dir_in_ray_client_mode(tmp_path):
 def test_actor_runtime_env_skips_local_py_modules_in_ray_client_mode(tmp_path):
     env_root = tmp_path / "runtime"
     _materialize_runtime_env(env_root)
-    repo_pkg = tmp_path / "repo" / "tinker_server"
+    repo_pkg = tmp_path / "repo" / "mint_server"
     repo_pkg.mkdir(parents=True)
     out = subprocess.run(
         [
@@ -1345,7 +1345,7 @@ def test_actor_runtime_env_skips_local_py_modules_in_ray_client_mode(tmp_path):
             "-c",
             (
                 "import json; "
-                "from tinker_server.config import actor_runtime_env; "
+                "from mint_server.config import actor_runtime_env; "
                 "print(json.dumps(actor_runtime_env(pythonpath='X')))"
             ),
         ],
@@ -1376,7 +1376,7 @@ def test_actor_runtime_env_keeps_local_working_dir_for_direct_ray(tmp_path):
             "-c",
             (
                 "import json; "
-                "from tinker_server.config import actor_runtime_env; "
+                "from mint_server.config import actor_runtime_env; "
                 "print(json.dumps(actor_runtime_env(pythonpath='X')))"
             ),
         ],

@@ -19,10 +19,10 @@ def main() -> None:
         (ckpt_dir / "metadata.json").write_text(f'{{"checkpoint_id": "{ckpt_id}"}}', encoding="utf-8")
 
         # Ensure module constant picks this up.
-        os.environ["TINKER_CHECKPOINT_DIR"] = str(root)
+        os.environ["MINT_CHECKPOINT_DIR"] = str(root)
 
         from importlib import reload
-        import tinker_server.checkpoints as checkpoints
+        import mint_server.checkpoints as checkpoints
 
         reload(checkpoints)
 

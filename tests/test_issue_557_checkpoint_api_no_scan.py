@@ -24,7 +24,7 @@ def _app_with_user(router, user_data: dict) -> TestClient:
 
 
 def test_issue_557_resolve_checkpoint_path_admin_requires_owner_id(tmp_path, monkeypatch) -> None:
-    from tinker_server import checkpoints
+    from mint_server import checkpoints
 
     monkeypatch.setattr(checkpoints, "CHECKPOINTS_DIR", str(tmp_path))
     monkeypatch.setattr(checkpoints, "PERSISTENT_CHECKPOINTS_DIR", str(tmp_path))
@@ -39,7 +39,7 @@ def test_issue_557_resolve_checkpoint_path_admin_requires_owner_id(tmp_path, mon
 
 
 def test_issue_557_resolve_checkpoint_path_admin_uses_owner_scope_without_glob(tmp_path, monkeypatch) -> None:
-    from tinker_server import checkpoints
+    from mint_server import checkpoints
 
     ckpt_dir = tmp_path / "owner-a" / "run-557" / "ckpt-a" / "training"
     _touch(ckpt_dir / "adapter_model.safetensors")
@@ -71,7 +71,7 @@ def test_issue_557_resolve_checkpoint_path_admin_uses_owner_scope_without_glob(t
 
 
 def test_issue_557_weights_list_requires_catalog(monkeypatch) -> None:
-    from tinker_server.routes import weights as wt
+    from mint_server.routes import weights as wt
 
     async def _no_remote(**_kwargs):
         return None
@@ -86,8 +86,8 @@ def test_issue_557_weights_list_requires_catalog(monkeypatch) -> None:
 
 
 def test_issue_557_weights_archive_admin_requires_owner_id(tmp_path, monkeypatch) -> None:
-    from tinker_server import checkpoints
-    from tinker_server.routes import weights as wt
+    from mint_server import checkpoints
+    from mint_server.routes import weights as wt
 
     ckpt_dir = tmp_path / "owner-a" / "run-557" / "ckpt-a" / "training"
     _touch(ckpt_dir / "adapter_model.safetensors")
@@ -121,8 +121,8 @@ def test_issue_557_weights_archive_admin_requires_owner_id(tmp_path, monkeypatch
 
 
 def test_issue_557_weights_delete_admin_requires_owner_id(tmp_path, monkeypatch) -> None:
-    from tinker_server import checkpoints
-    from tinker_server.routes import weights as wt
+    from mint_server import checkpoints
+    from mint_server.routes import weights as wt
 
     ckpt_dir = tmp_path / "owner-a" / "run-557" / "ckpt-a" / "training"
     _touch(ckpt_dir / "adapter_model.safetensors")
@@ -152,8 +152,8 @@ def test_issue_557_weights_delete_admin_requires_owner_id(tmp_path, monkeypatch)
 
 
 def test_issue_557_weights_archive_admin_owner_scope_blocks_wrong_owner(tmp_path, monkeypatch) -> None:
-    from tinker_server import checkpoints
-    from tinker_server.routes import weights as wt
+    from mint_server import checkpoints
+    from mint_server.routes import weights as wt
 
     wrong_owner_dir = tmp_path / "run-557" / "ckpt-a" / "training"
     _touch(wrong_owner_dir / "adapter_model.safetensors")
@@ -189,8 +189,8 @@ def test_issue_557_weights_archive_admin_owner_scope_blocks_wrong_owner(tmp_path
 
 
 def test_issue_557_weights_archive_sdk_redirect_preserves_owner_id(tmp_path, monkeypatch) -> None:
-    from tinker_server import checkpoints
-    from tinker_server.routes import weights as wt
+    from mint_server import checkpoints
+    from mint_server.routes import weights as wt
 
     ckpt_dir = tmp_path / "owner-a" / "run-557" / "ckpt-a" / "training"
     _touch(ckpt_dir / "adapter_model.safetensors")
@@ -230,7 +230,7 @@ def test_issue_557_weights_archive_sdk_redirect_preserves_owner_id(tmp_path, mon
 
 def test_issue_557_training_helper_requires_owner_id_for_admin() -> None:
     from fastapi import HTTPException
-    from tinker_server.routes import training as tr
+    from mint_server.routes import training as tr
 
     with pytest.raises(HTTPException, match="owner_id is required"):
         tr._resolve_state_path(
@@ -243,7 +243,7 @@ def test_issue_557_training_helper_requires_owner_id_for_admin() -> None:
 
 def test_issue_557_weights_helper_requires_owner_id_for_admin() -> None:
     from fastapi import HTTPException
-    from tinker_server.routes import weights as wt
+    from mint_server.routes import weights as wt
 
     with pytest.raises(HTTPException, match="owner_id is required"):
         wt._resolve_mint_path(
@@ -256,7 +256,7 @@ def test_issue_557_weights_helper_requires_owner_id_for_admin() -> None:
 
 def test_issue_557_mint_helper_requires_owner_id_for_admin() -> None:
     from fastapi import HTTPException
-    from tinker_server.routes import mint as mint_routes
+    from mint_server.routes import mint as mint_routes
 
     with pytest.raises(HTTPException, match="owner_id is required"):
         mint_routes._resolve_checkpoint_for_user(
@@ -268,9 +268,9 @@ def test_issue_557_mint_helper_requires_owner_id_for_admin() -> None:
 
 
 def test_issue_557_mint_action_session_admin_missing_owner_id_returns_400(tmp_path, monkeypatch) -> None:
-    from tinker_server import checkpoints
-    from tinker_server.routes import mint as mint_routes
-    import tinker_server.supported_models_gate as model_gate
+    from mint_server import checkpoints
+    from mint_server.routes import mint as mint_routes
+    import mint_server.supported_models_gate as model_gate
 
     ckpt_dir = tmp_path / "owner-a" / "run-557" / "ckpt-a" / "training"
     _touch(ckpt_dir / "adapter_model.safetensors")
@@ -317,9 +317,9 @@ def test_issue_557_mint_action_session_admin_missing_owner_id_returns_400(tmp_pa
 
 
 def test_issue_557_mint_action_session_admin_accepts_owner_id(tmp_path, monkeypatch) -> None:
-    from tinker_server import checkpoints
-    from tinker_server.routes import mint as mint_routes
-    import tinker_server.supported_models_gate as model_gate
+    from mint_server import checkpoints
+    from mint_server.routes import mint as mint_routes
+    import mint_server.supported_models_gate as model_gate
 
     ckpt_dir = tmp_path / "owner-a" / "run-557" / "ckpt-a" / "training"
     _touch(ckpt_dir / "adapter_model.safetensors")
@@ -369,9 +369,9 @@ def test_issue_557_mint_action_session_admin_accepts_owner_id(tmp_path, monkeypa
 
 
 def test_issue_557_weights_archive_sdk_redirect_token_uses_owner_scope(tmp_path, monkeypatch) -> None:
-    from tinker_server import checkpoints
-    import tinker_server.config as config_module
-    from tinker_server.routes import weights as wt
+    from mint_server import checkpoints
+    import mint_server.config as config_module
+    from mint_server.routes import weights as wt
 
     ckpt_dir = tmp_path / "owner-a" / "run-557" / "ckpt-a" / "training"
     _touch(ckpt_dir / "adapter_model.safetensors")
@@ -419,8 +419,8 @@ class _ServiceRequest:
 
 
 def test_issue_557_service_resolve_model_path_admin_uses_owner_scope(tmp_path, monkeypatch) -> None:
-    from tinker_server import checkpoints
-    from tinker_server.routes import service as service_routes
+    from mint_server import checkpoints
+    from mint_server.routes import service as service_routes
 
     ckpt_dir = tmp_path / "owner-a" / "run-557" / "ckpt-a" / "training"
     _touch(ckpt_dir / "adapter_model.safetensors")
@@ -453,7 +453,7 @@ def test_issue_557_service_resolve_model_path_admin_uses_owner_scope(tmp_path, m
 
 def test_issue_557_mint_helper_maps_permission_error_to_403(monkeypatch) -> None:
     from fastapi import HTTPException
-    from tinker_server.routes import mint as mint_routes
+    from mint_server.routes import mint as mint_routes
 
     monkeypatch.setattr(mint_routes, "resolve_checkpoint_path", lambda *_args, **_kwargs: "/tmp/blocked")
     monkeypatch.setattr(
@@ -474,7 +474,7 @@ def test_issue_557_mint_helper_maps_permission_error_to_403(monkeypatch) -> None
 
 def test_issue_557_weights_helper_maps_permission_error_to_403(monkeypatch) -> None:
     from fastapi import HTTPException
-    from tinker_server.routes import weights as wt
+    from mint_server.routes import weights as wt
 
     monkeypatch.setattr(wt, "resolve_checkpoint_path", lambda *_args, **_kwargs: "/tmp/blocked")
     monkeypatch.setattr(
@@ -494,7 +494,7 @@ def test_issue_557_weights_helper_maps_permission_error_to_403(monkeypatch) -> N
 
 
 def test_issue_557_weights_archive_rejects_catalog_row_when_metadata_owner_mismatches(tmp_path, monkeypatch) -> None:
-    from tinker_server.routes import weights as wt
+    from mint_server.routes import weights as wt
 
     wrong_owner_dir = tmp_path / "owner-a" / "run-557" / "ckpt-a" / "training"
     _touch(wrong_owner_dir / "adapter_model.safetensors")
@@ -540,7 +540,7 @@ def test_issue_557_weights_archive_rejects_catalog_row_when_metadata_owner_misma
 
 
 def test_issue_557_parse_checkpoint_time_normalizes_naive_timestamps(tmp_path) -> None:
-    from tinker_server.routes import weights as wt
+    from mint_server.routes import weights as wt
 
     fallback = tmp_path / "fallback"
     fallback.mkdir()
@@ -550,8 +550,8 @@ def test_issue_557_parse_checkpoint_time_normalizes_naive_timestamps(tmp_path) -
 
 
 def test_issue_557_weights_archive_admin_rejects_invalid_owner_id(tmp_path, monkeypatch) -> None:
-    from tinker_server import checkpoints
-    from tinker_server.routes import weights as wt
+    from mint_server import checkpoints
+    from mint_server.routes import weights as wt
 
     async def _no_remote(**_kwargs):
         return None
@@ -571,7 +571,7 @@ def test_issue_557_weights_archive_admin_rejects_invalid_owner_id(tmp_path, monk
 
 
 def test_issue_557_weights_catalog_checkpoint_path_rejects_escape_segments() -> None:
-    from tinker_server.routes import weights as wt
+    from mint_server.routes import weights as wt
 
     row = {
         "storage_root": "/tmp/checkpoints",
@@ -584,7 +584,7 @@ def test_issue_557_weights_catalog_checkpoint_path_rejects_escape_segments() -> 
 
 
 def test_issue_557_resolve_checkpoint_path_admin_rejects_invalid_owner_id(tmp_path, monkeypatch) -> None:
-    from tinker_server import checkpoints
+    from mint_server import checkpoints
 
     monkeypatch.setattr(checkpoints, "CHECKPOINTS_DIR", str(tmp_path))
     monkeypatch.setattr(checkpoints, "PERSISTENT_CHECKPOINTS_DIR", str(tmp_path))
@@ -599,8 +599,8 @@ def test_issue_557_resolve_checkpoint_path_admin_rejects_invalid_owner_id(tmp_pa
 
 
 def test_issue_557_weights_delete_succeeds_when_catalog_tombstone_fails(tmp_path, monkeypatch) -> None:
-    from tinker_server import checkpoints
-    from tinker_server.routes import weights as wt
+    from mint_server import checkpoints
+    from mint_server.routes import weights as wt
 
     ckpt_dir = tmp_path / "owner-a" / "run-557" / "ckpt-a" / "training"
     _touch(ckpt_dir / "adapter_model.safetensors")
@@ -647,8 +647,8 @@ def test_issue_557_weights_delete_succeeds_when_catalog_tombstone_fails(tmp_path
 
 
 def test_issue_557_weights_archive_type_mismatch_returns_404(tmp_path, monkeypatch) -> None:
-    from tinker_server import checkpoints
-    from tinker_server.routes import weights as wt
+    from mint_server import checkpoints
+    from mint_server.routes import weights as wt
 
     sampler_dir = tmp_path / "owner-a" / "run-557" / "ckpt-a" / "sampler"
     _touch(sampler_dir / "adapter_model.safetensors")
@@ -682,8 +682,8 @@ def test_issue_557_weights_archive_type_mismatch_returns_404(tmp_path, monkeypat
 
 
 def test_issue_557_weights_archive_untyped_checkpoint_id_uses_only_typed_view(tmp_path, monkeypatch) -> None:
-    from tinker_server import checkpoints
-    from tinker_server.routes import weights as wt
+    from mint_server import checkpoints
+    from mint_server.routes import weights as wt
 
     sampler_dir = tmp_path / "owner-a" / "run-557" / "ckpt-a" / "sampler"
     _touch(sampler_dir / "adapter_model.safetensors")

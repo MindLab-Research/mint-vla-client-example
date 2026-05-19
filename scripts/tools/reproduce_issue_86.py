@@ -6,15 +6,15 @@ from typing import Any
 
 import requests
 
-BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000").rstrip("/")
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
+BASE_URL = os.environ.get("MINT_BASE_URL", "http://localhost:8000").rstrip("/")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
 
-BASE_MODEL = os.environ.get("TINKER_MODEL", "Qwen/Qwen3-0.6B")
-LORA_RANK = int(os.environ.get("TINKER_LORA_RANK", "8"))
+BASE_MODEL = os.environ.get("MINT_MODEL", "Qwen/Qwen3-0.6B")
+LORA_RANK = int(os.environ.get("MINT_LORA_RANK", "8"))
 
-CREATE_TIMEOUT_S = float(os.environ.get("TINKER_CREATE_MODEL_TIMEOUT_S", "3600"))
-SAVE_TIMEOUT_S = float(os.environ.get("TINKER_SAVE_STATE_TIMEOUT_S", "3600"))
-RESUME_TIMEOUT_S = float(os.environ.get("TINKER_CREATE_MODEL_FROM_STATE_TIMEOUT_S", "3600"))
+CREATE_TIMEOUT_S = float(os.environ.get("MINT_CREATE_MODEL_TIMEOUT_S", "3600"))
+SAVE_TIMEOUT_S = float(os.environ.get("MINT_SAVE_STATE_TIMEOUT_S", "3600"))
+RESUME_TIMEOUT_S = float(os.environ.get("MINT_CREATE_MODEL_FROM_STATE_TIMEOUT_S", "3600"))
 
 
 def _headers() -> dict[str, str]:
@@ -94,7 +94,7 @@ def main() -> int:
             return _fail(f"create_model missing model_id: {created!r}")
 
         # Official contract: save_state(name=...) returns a resolvable URI like
-        # tinker://<model_id>/<name>. Repro uses a named checkpoint.
+        # mint://<model_id>/<name>. Repro uses a named checkpoint.
         checkpoint_name = f"issue86_{uuid.uuid4().hex[:8]}"
         saved = _post_json(
             f"{BASE_URL}/api/v1/save_state",
@@ -106,7 +106,7 @@ def main() -> int:
         if "error" in saved:
             return _fail(f"save_state failed: {saved.get('error')!r}")
 
-        resume_path = f"tinker://{created_model_id}/{checkpoint_name}"
+        resume_path = f"mint://{created_model_id}/{checkpoint_name}"
 
         listed = _get_json(
             f"{BASE_URL}/api/v1/training_runs/{created_model_id}/checkpoints",

@@ -4,11 +4,11 @@ import types
 
 import pytest
 
-import tinker_server.backend.session_heartbeat_store as session_heartbeat_store_module
-import tinker_server.ray_utils as ray_utils
-from tinker_server.backend.session_heartbeat_store import SessionHeartbeatStore
-from tinker_server.backend.session_manager import SessionManager
-from tinker_server.backend.training_session_manager import TrainingSessionManager
+import mint_server.backend.session_heartbeat_store as session_heartbeat_store_module
+import mint_server.ray_utils as ray_utils
+from mint_server.backend.session_heartbeat_store import SessionHeartbeatStore
+from mint_server.backend.session_manager import SessionManager
+from mint_server.backend.training_session_manager import TrainingSessionManager
 
 
 class _RemoteMethod:

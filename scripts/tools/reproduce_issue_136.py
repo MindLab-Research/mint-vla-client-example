@@ -6,13 +6,13 @@ from typing import Any
 import requests
 
 
-BASE_URL = os.environ.get("TINKER_BASE_URL")
+BASE_URL = os.environ.get("MINT_BASE_URL")
 if not BASE_URL:
-    port = os.environ.get("TINKER_PORT", "8000")
+    port = os.environ.get("MINT_PORT", "8000")
     BASE_URL = f"http://localhost:{port}"
 BASE_URL = BASE_URL.rstrip("/")
 
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
 
 def _headers() -> dict[str, str]:
     if not API_KEY:

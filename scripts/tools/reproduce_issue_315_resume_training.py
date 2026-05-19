@@ -13,21 +13,21 @@ from typing import Any
 import requests
 
 
-BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000").rstrip("/")
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
-OWNER_ID = os.environ.get("TINKER_OWNER_ID") or os.environ.get("TINKER_USER_ID", "issue_315_user")
-BASE_MODEL = os.environ.get("TINKER_MODEL", "Qwen/Qwen3-0.6B")
-LORA_RANK = int(os.environ.get("TINKER_LORA_RANK", "8"))
-LEARNING_RATE = float(os.environ.get("TINKER_LEARNING_RATE", "1e-4"))
-WARMUP_STEPS = int(os.environ.get("TINKER_WARMUP_STEPS", "5"))
-COMPARE_STEPS = int(os.environ.get("TINKER_COMPARE_STEPS", "3"))
-DIFFERENT_CHECKPOINT_STEPS = int(os.environ.get("TINKER_DIFFERENT_CHECKPOINT_STEPS", "2"))
-SEQ_LEN = int(os.environ.get("TINKER_SEQ_LEN", "64"))
-CREATE_TIMEOUT_S = float(os.environ.get("TINKER_CREATE_TIMEOUT_S", "3600"))
-SAVE_TIMEOUT_S = float(os.environ.get("TINKER_SAVE_TIMEOUT_S", "3600"))
-RESUME_TIMEOUT_S = float(os.environ.get("TINKER_RESUME_TIMEOUT_S", "3600"))
-POLL_TIMEOUT_S = float(os.environ.get("TINKER_POLL_TIMEOUT_S", "3600"))
-POLL_REQUEST_TIMEOUT_S = float(os.environ.get("TINKER_POLL_REQUEST_TIMEOUT_S", "180"))
+BASE_URL = os.environ.get("MINT_BASE_URL", "http://localhost:8000").rstrip("/")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
+OWNER_ID = os.environ.get("MINT_OWNER_ID") or os.environ.get("MINT_USER_ID", "issue_315_user")
+BASE_MODEL = os.environ.get("MINT_MODEL", "Qwen/Qwen3-0.6B")
+LORA_RANK = int(os.environ.get("MINT_LORA_RANK", "8"))
+LEARNING_RATE = float(os.environ.get("MINT_LEARNING_RATE", "1e-4"))
+WARMUP_STEPS = int(os.environ.get("MINT_WARMUP_STEPS", "5"))
+COMPARE_STEPS = int(os.environ.get("MINT_COMPARE_STEPS", "3"))
+DIFFERENT_CHECKPOINT_STEPS = int(os.environ.get("MINT_DIFFERENT_CHECKPOINT_STEPS", "2"))
+SEQ_LEN = int(os.environ.get("MINT_SEQ_LEN", "64"))
+CREATE_TIMEOUT_S = float(os.environ.get("MINT_CREATE_TIMEOUT_S", "3600"))
+SAVE_TIMEOUT_S = float(os.environ.get("MINT_SAVE_TIMEOUT_S", "3600"))
+RESUME_TIMEOUT_S = float(os.environ.get("MINT_RESUME_TIMEOUT_S", "3600"))
+POLL_TIMEOUT_S = float(os.environ.get("MINT_POLL_TIMEOUT_S", "3600"))
+POLL_REQUEST_TIMEOUT_S = float(os.environ.get("MINT_POLL_REQUEST_TIMEOUT_S", "180"))
 
 
 def _headers() -> dict[str, str]:

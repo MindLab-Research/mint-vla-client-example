@@ -5,9 +5,9 @@ import pytest
 
 pytest.importorskip("ray")
 
-from tinker_server.backend.model_actor_supervisor import ActorType, get_model_actor_supervisor
-from tinker_server.backend.training_session_manager import TrainingSession
-from tinker_server.backend.verl_training import VerlTrainingEngine
+from mint_server.backend.model_actor_supervisor import ActorType, get_model_actor_supervisor
+from mint_server.backend.training_session_manager import TrainingSession
+from mint_server.backend.verl_training import VerlTrainingEngine
 
 
 def _get_local_model_actor_inventory(monkeypatch: pytest.MonkeyPatch):
@@ -18,7 +18,7 @@ def _get_local_model_actor_inventory(monkeypatch: pytest.MonkeyPatch):
 
 def test_issue_230_timeout_does_not_kill_actor(monkeypatch: pytest.MonkeyPatch) -> None:
     pool = _get_local_model_actor_inventory(monkeypatch)
-    actor_name = f"peft_trainer_test_{uuid.uuid4().hex}_maxr64"
+    actor_name = f"mint_dense_test_{uuid.uuid4().hex}"
     model_id = f"model_{uuid.uuid4().hex}"
 
     pool.unregister(actor_name)
@@ -44,7 +44,7 @@ def test_issue_230_timeout_does_not_kill_actor(monkeypatch: pytest.MonkeyPatch) 
 
     killed: list[dict] = []
 
-    import tinker_server.backend.verl_training as verl_training
+    import mint_server.backend.verl_training as verl_training
 
     def _fake_kill(*args, **kwargs):
         killed.append(dict(kwargs))
@@ -70,7 +70,7 @@ def test_issue_230_timeout_does_not_kill_actor(monkeypatch: pytest.MonkeyPatch) 
 
 def test_issue_230_keepalive_touches_dense_actor_without_inflight_mark(monkeypatch: pytest.MonkeyPatch) -> None:
     pool = _get_local_model_actor_inventory(monkeypatch)
-    actor_name = f"peft_trainer_test_{uuid.uuid4().hex}_maxr64"
+    actor_name = f"mint_dense_test_{uuid.uuid4().hex}"
     model_id = f"model_{uuid.uuid4().hex}"
 
     pool.unregister(actor_name)
@@ -128,7 +128,7 @@ def test_issue_230_keepalive_touches_dense_actor_without_inflight_mark(monkeypat
 
 def test_issue_230_keepalive_cancellation_silences_late_exception(monkeypatch: pytest.MonkeyPatch) -> None:
     pool = _get_local_model_actor_inventory(monkeypatch)
-    actor_name = f"peft_trainer_test_{uuid.uuid4().hex}_maxr64"
+    actor_name = f"mint_dense_test_{uuid.uuid4().hex}"
     model_id = f"model_{uuid.uuid4().hex}"
 
     pool.register(
@@ -152,7 +152,7 @@ def test_issue_230_keepalive_cancellation_silences_late_exception(monkeypatch: p
     )
     discarded: list[str] = []
 
-    from tinker_server.backend import async_ray_control
+    from mint_server.backend import async_ray_control
 
     def _record_late_result(fut: asyncio.Future) -> None:
         try:
@@ -191,7 +191,7 @@ def test_issue_230_keepalive_cancellation_silences_late_exception(monkeypatch: p
 
 def test_issue_230_unbind_session_keeps_shared_dense_actor_pinned(monkeypatch: pytest.MonkeyPatch) -> None:
     pool = _get_local_model_actor_inventory(monkeypatch)
-    actor_name = f"peft_trainer_test_{uuid.uuid4().hex}_maxr64"
+    actor_name = f"mint_dense_test_{uuid.uuid4().hex}"
     model_id = f"model_{uuid.uuid4().hex}"
     other_model_id = f"model_{uuid.uuid4().hex}"
 
@@ -220,7 +220,7 @@ def test_issue_230_unbind_session_keeps_shared_dense_actor_pinned(monkeypatch: p
         backend="peft",
     )
 
-    import tinker_server.backend.verl_training as verl_training
+    import mint_server.backend.verl_training as verl_training
 
     killed: list[dict] = []
 
@@ -243,7 +243,7 @@ def test_issue_230_unbind_session_keeps_shared_dense_actor_pinned(monkeypatch: p
 
 def test_issue_230_shutdown_session_keeps_protected_dense_actor_alive(monkeypatch: pytest.MonkeyPatch) -> None:
     pool = _get_local_model_actor_inventory(monkeypatch)
-    actor_name = f"peft_trainer_test_{uuid.uuid4().hex}_maxr64"
+    actor_name = f"mint_dense_test_{uuid.uuid4().hex}"
     model_id = f"model_{uuid.uuid4().hex}"
 
     pool.unregister(actor_name)
@@ -280,7 +280,7 @@ def test_issue_230_shutdown_session_keeps_protected_dense_actor_alive(monkeypatc
         backend="peft",
     )
 
-    import tinker_server.backend.verl_training as verl_training
+    import mint_server.backend.verl_training as verl_training
 
     killed: list[dict] = []
 

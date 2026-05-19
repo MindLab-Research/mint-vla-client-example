@@ -6,7 +6,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
-from tinker_server.routes import internal as internal_routes
+from mint_server.routes import internal as internal_routes
 
 
 def _touch(path: Path, data: bytes = b"x") -> None:

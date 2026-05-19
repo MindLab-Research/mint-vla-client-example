@@ -7,8 +7,8 @@ import types
 
 import pytest
 
-import tinker_server.backend.multinode_inference as mni
-import tinker_server.backend.vllm_stop as vllm_stop
+import mint_server.backend.multinode_inference as mni
+import mint_server.backend.vllm_stop as vllm_stop
 
 
 @pytest.fixture
@@ -121,7 +121,7 @@ def _install_fake_vllm(monkeypatch):
 
 def _make_actor_impl(monkeypatch, **actor_kwargs):
     monkeypatch.setattr(mni, "init_actor_observability", lambda: None)
-    remote_cls = mni._create_multinode_vllm_actor(**actor_kwargs)
+    remote_cls = mni._create_mint_vllm_multinode_actor(**actor_kwargs)
     impl_cls = remote_cls.__ray_metadata__.modified_class
     return impl_cls
 
@@ -130,7 +130,7 @@ def _stub_task_futures(monkeypatch):
     async def _noop_async_update_meta(*args, **kwargs):
         return None
 
-    task_state_store_module = importlib.import_module("tinker_server.backend.task_state_store")
+    task_state_store_module = importlib.import_module("mint_server.backend.task_state_store")
     monkeypatch.setattr(
         task_state_store_module.task_futures,
         "async_update_meta",
@@ -498,13 +498,13 @@ async def test_issue_428_generate_emits_request_stage_spans(monkeypatch):
 
     assert result["token_ids"] == [11, 21]
     names = [str(s["span_name"]) for s in spans]
-    assert "sampling.multinode_vllm_actor.seq_slot_wait" in names
-    assert "sampling.multinode_vllm_actor.add_request" in names
+    assert "sampling.mint_vllm_multinode_actor.seq_slot_wait" in names
+    assert "sampling.mint_vllm_multinode_actor.add_request" in names
 
-    seq_span = next(s for s in spans if s["span_name"] == "sampling.multinode_vllm_actor.seq_slot_wait")
-    add_span = next(s for s in spans if s["span_name"] == "sampling.multinode_vllm_actor.add_request")
+    seq_span = next(s for s in spans if s["span_name"] == "sampling.mint_vllm_multinode_actor.seq_slot_wait")
+    add_span = next(s for s in spans if s["span_name"] == "sampling.mint_vllm_multinode_actor.add_request")
 
-    assert seq_span["component"] == "multinode_vllm_actor"
+    assert seq_span["component"] == "mint_vllm_multinode_actor"
     assert seq_span["op"] == "sampling.seq_slot_wait"
     assert seq_span["request_id"] == "ordinary"
     assert seq_span["attrs"]["prompt_tokens"] == 3
@@ -512,7 +512,7 @@ async def test_issue_428_generate_emits_request_stage_spans(monkeypatch):
     assert seq_span["attrs"]["max_tokens"] == 8
     assert float(seq_span["attrs"]["wait_s"]) >= 0.0
 
-    assert add_span["component"] == "multinode_vllm_actor"
+    assert add_span["component"] == "mint_vllm_multinode_actor"
     assert add_span["op"] == "sampling.vllm_add_request"
     assert add_span["request_id"] == "ordinary"
     assert add_span["attrs"]["prompt_tokens"] == 3

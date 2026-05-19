@@ -6,10 +6,10 @@ This repo now treats dependency management as two coordinated layers with one ca
 2. A PFS runtime-env root is authoritative for shared Python packages and pinned source overlays.
 
 The metadata source of truth is:
-- [pyproject.toml](/home/yiwen/tinker_project/tinker-server-dep-cleanup/pyproject.toml)
+- [pyproject.toml](/home/yiwen/mint_project/mint-server-dep-cleanup/pyproject.toml)
 - `project.dependencies`: shared runtime Python packages
 - `dependency-groups.host-runtime`: thin host-only additions
-- `tool.tinker.runtime_env`: pinned source checkouts and runtime-env layout
+- `tool.mint.runtime_env`: pinned source checkouts and runtime-env layout
 
 ## Why this split remains necessary
 
@@ -48,7 +48,7 @@ Runtime import precedence:
 3. `MINT_CODE_ROOT`
 4. `PFS_HF_MODULES_PATH`
 
-This precedence is surfaced as `tinker_server.config.PFS_PYTHONPATH`.
+This precedence is surfaced as `mint_server.config.PFS_PYTHONPATH`.
 
 ## Host startup model
 

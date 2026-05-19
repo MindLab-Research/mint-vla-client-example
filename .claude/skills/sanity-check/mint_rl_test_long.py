@@ -640,13 +640,11 @@ _patch_trust_remote_code_for_tokenizers(
     enable=(args.base_model == "moonshotai/Moonlight-16B-A3B-Instruct"),
 )
 
-print(f"TINKER_BASE_URL={os.environ.get('TINKER_BASE_URL')!r}")
-if os.environ.get("TINKER_API_KEY"):
-    print("TINKER_API_KEY present (value redacted).")
-elif os.environ.get("MINT_API_KEY"):
+print(f"MINT_BASE_URL={os.environ.get('MINT_BASE_URL')!r}")
+if os.environ.get("MINT_API_KEY"):
     print("MINT_API_KEY present (value redacted).")
 else:
-    print("WARNING: neither TINKER_API_KEY nor MINT_API_KEY is set; client init will fail.")
+    print("WARNING: MINT_API_KEY is not set; client init will fail.")
 
 # Create timestamped experiment directory
 EXPERIMENT_TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")

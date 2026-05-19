@@ -9,26 +9,26 @@ from typing import Any
 import requests
 
 
-BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000").rstrip("/")
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
+BASE_URL = os.environ.get("MINT_BASE_URL", "http://localhost:8000").rstrip("/")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
 
 # The fix for this issue is about actor accounting and reconciliation, which is
 # fundamentally Ray-backed. The repro creates named Ray actors in the server's
 # namespace, then exercises server endpoints over HTTP.
 RAY_NAMESPACE = (
-    os.environ.get("TINKER_RAY_NAMESPACE")
+    os.environ.get("MINT_RAY_NAMESPACE")
     or os.environ.get("MINT_RAY_NAMESPACE")
     or ""
 ).strip()
 
-SSH_HOST = os.environ.get("TINKER_DEV_SSH_HOST", "mint-dev").strip() or "mint-dev"
+SSH_HOST = os.environ.get("MINT_DEV_SSH_HOST", "mint-dev").strip() or "mint-dev"
 
 ISSUE_NUMBER = 226
 REMOTE_SERVER_ROOT = os.environ.get(
-    "TINKER_ISSUE_REMOTE_ROOT", f"/root/tinker_project/tinker-server-issue-{ISSUE_NUMBER}"
+    "MINT_ISSUE_REMOTE_ROOT", f"/root/mint_project/mint-server-issue-{ISSUE_NUMBER}"
 ).rstrip("/")
 
-POLL_DELAY_S = float(os.environ.get("TINKER_POLL_DELAY_S", "0.5"))
+POLL_DELAY_S = float(os.environ.get("MINT_POLL_DELAY_S", "0.5"))
 
 
 def _headers() -> dict[str, str]:
@@ -74,11 +74,11 @@ def _ssh_run(argv: list[str], *, input_text: str | None = None, timeout_s: float
 
 
 def _ssh_python(code: str, *, timeout_s: float = 60.0) -> str:
-    _require(RAY_NAMESPACE, "TINKER_RAY_NAMESPACE (or MINT_RAY_NAMESPACE) must be set for this repro")
+    _require(RAY_NAMESPACE, "MINT_RAY_NAMESPACE (or MINT_RAY_NAMESPACE) must be set for this repro")
     return _ssh_run(
         [
             "env",
-            f"TINKER_RAY_NAMESPACE={RAY_NAMESPACE}",
+            f"MINT_RAY_NAMESPACE={RAY_NAMESPACE}",
             f"MINT_RAY_NAMESPACE={RAY_NAMESPACE}",
             "python3",
             "-",
@@ -118,7 +118,7 @@ import os
 import time
 import ray
 
-ns = os.environ["TINKER_RAY_NAMESPACE"]
+ns = os.environ["MINT_RAY_NAMESPACE"]
 addr = os.environ.get("RAY_ADDRESS", "").strip()
 if not addr:
     raise RuntimeError("RAY_ADDRESS is required")
@@ -162,7 +162,7 @@ def _ssh_kill_named_actor(name: str) -> None:
 import os
 import ray
 
-ns = os.environ["TINKER_RAY_NAMESPACE"]
+ns = os.environ["MINT_RAY_NAMESPACE"]
 addr = os.environ.get("RAY_ADDRESS", "").strip()
 if not addr:
     raise RuntimeError("RAY_ADDRESS is required")
@@ -207,7 +207,7 @@ def main() -> int:
     # actor anyway (silent fallback). After the fix, it should surface the
     # mismatch as an error (409) rather than silently switching registries.
     # -------------------------------------------------------------------------
-    named_only = _NamedActor(name="tinker_vllm_repro_226_named_only", kind="named_only")
+    named_only = _NamedActor(name="mint_vllm_repro_226_named_only", kind="named_only")
     try:
         _ssh_create_named_actor(named_only)
         _require(

@@ -69,7 +69,7 @@ def inspect_node() -> dict[str, Any]:
 
 @ray.remote(num_cpus=0.01, num_gpus=1)
 def inspect_allocated_gpu() -> dict[str, Any]:
-    from tinker_server.backend.gpu_binding_helpers import gpu_bindings_from_ray_gpu_ids
+    from mint_server.backend.gpu_binding_helpers import gpu_bindings_from_ray_gpu_ids
 
     try:
         import ray.util  # type: ignore[attr-defined]
@@ -89,7 +89,7 @@ def inspect_allocated_gpu() -> dict[str, Any]:
 
 def _read_model_actor_inventory_bindings() -> list[dict[str, str]]:
     try:
-        from tinker_server.routes import internal as internal_routes
+        from mint_server.routes import internal as internal_routes
 
         stats = ray.get(internal_routes.admission_stats(include_actor_rss=False))
     except Exception:
@@ -109,7 +109,7 @@ def main() -> int:
     parser.add_argument("--ray-address", default="auto")
     parser.add_argument(
         "--namespace",
-        default=os.getenv("MINT_RAY_NAMESPACE") or os.getenv("TINKER_RAY_NAMESPACE") or "tinker",
+        default=os.getenv("MINT_RAY_NAMESPACE") or os.getenv("MINT_RAY_NAMESPACE") or "mint",
     )
     parser.add_argument("--timeout-s", type=float, default=120.0)
     parser.add_argument(

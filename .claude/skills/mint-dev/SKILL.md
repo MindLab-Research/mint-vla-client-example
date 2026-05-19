@@ -30,7 +30,7 @@ update the skill instead of reviving old deployment paths.
 | Runtime root | `/share/mint/dev/runtime` |
 | Public config | `/share/mint/dev/config/common.env` |
 | Private config | `/share/mint/dev/config/secrets.env` |
-| Log file | `/share/mint/dev/logs/tinker_server_auth.log` |
+| Log file | `/share/mint/dev/logs/mint_server_auth.log` |
 
 Dev config is split deliberately:
 - `common.env`: non-secret deployment config such as port, Ray address, runtime
@@ -74,7 +74,7 @@ set +a
 exec /share/mint/dev/runtime/host-venv/bin/python scripts/run_server.py
 SH
 chmod +x /share/mint/dev/tmp/start_mint_dev.sh
-nohup /share/mint/dev/tmp/start_mint_dev.sh >> /share/mint/dev/logs/tinker_server_auth.log 2>&1 &'
+nohup /share/mint/dev/tmp/start_mint_dev.sh >> /share/mint/dev/logs/mint_server_auth.log 2>&1 &'
 ```
 
 After any code change, restart the server before validating behavior. Python
@@ -84,7 +84,7 @@ servers do not hot-reload.
 
 ```bash
 curl http://localhost:8000/api/v1/healthz
-ssh mint-dev 'tail -n 200 /share/mint/dev/logs/tinker_server_auth.log'
+ssh mint-dev 'tail -n 200 /share/mint/dev/logs/mint_server_auth.log'
 ssh mint-dev 'ps aux | grep "[s]cripts/run_server.py"'
 ```
 
@@ -92,7 +92,7 @@ If using a local tunnel:
 
 ```bash
 ssh -f -N -L 8000:localhost:8000 mint-dev
-TINKER_BASE_URL=http://localhost:8000 TINKER_API_KEY=dummy python scripts/tools/smoke.py service
+MINT_BASE_URL=http://localhost:8000 MINT_API_KEY=dummy python scripts/tools/smoke.py service
 ```
 
 ## Internal Ops

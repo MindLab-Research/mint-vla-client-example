@@ -47,7 +47,7 @@ Optional:
 - `GET /internal/actors` (read-only visibility; do not use kill endpoints)
 
 2. Server logs (Volcano)
-- `ssh mint-prod-volcano "tail -${MINT_LOG_MONITOR_TAIL_LINES:-200} /share/mint/prod/logs/tinker_server_auth.log"`
+- `ssh mint-prod-volcano "tail -${MINT_LOG_MONITOR_TAIL_LINES:-200} /share/mint/prod/logs/mint_server_auth.log"`
 
 3. Error signatures (grep over last tail window)
 - `Traceback`
@@ -70,7 +70,7 @@ Optional:
 - If `actors` endpoint exists and is unauthenticated, call it read-only.
 
 3. Tail logs (read-only)
-- Tail `/tmp/tinker_server_auth.log` from `mint-prod`.
+- Tail `/tmp/mint_server_auth.log` from `mint-prod`.
 - If the deployment uses gateway routing to an Aliyun upstream, use `aliyun-cluster` to fetch worker logs (read-only).
 
 4. Triage any anomaly

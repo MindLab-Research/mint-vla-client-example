@@ -25,9 +25,13 @@ must keep model-runtime actors and daemon actors as separate scheduling classes.
 
 ### 1. Node Topology
 
-Node topology describes the cluster workers that Mint may target:
+Node topology describes the cluster workers that Mint may target. V1 topology
+is an independent YAML file owned by deployment configuration, not a subsection
+of model config. The file path is provided by `MINT_TOPOLOGY_CONFIG_PATH`.
 
-- `alias`: stable name such as `worker2` or `train-a`.
+- `alias`: stable name in the form `mint-worker-{idx}`, for example
+  `mint-worker-0`. The index is deployment-local and must not be reused for two
+  live nodes in the same topology generation.
 - `node_ip`: Ray node IP.
 - `ray_node_id`: optional Ray node ID observed at runtime.
 - `provider`: explicit provider discriminator. V1 implementation may only
@@ -43,6 +47,26 @@ Node topology describes the cluster workers that Mint may target:
 - `mount_ok`: whether required shared paths are expected to exist.
 - `runtime_env_ok`: whether the Mint runtime env is expected to import.
 
+Example:
+
+```yaml
+version: 1
+deployment_env: prod
+cluster_id: volcano
+nodes:
+  - alias: mint-worker-0
+    provider: volc
+    role: gpu
+    enabled: true
+    gpu_count: 8
+    node_ip: 192.168.39.110
+    provider_identity:
+      worker_index: 0
+      resource_queue_id: q-example
+    labels:
+      pool: qwen
+```
+
 V1 reads this from a static config file and verifies it against `ray.nodes()`.
 The topology reader may mark nodes stale or unavailable, but it should not
 provision or tear down cloud nodes.
@@ -57,11 +81,25 @@ perspective.
 Model runtime placement should become topology-aware. The target configuration
 references node aliases, not raw IPs:
 
-```toml
-[[models."Qwen/Qwen3-30B-A3B-Instruct-2507".megatron.placement]]
-worker = "worker2"
-gpu_count = 4
-replica = 0
+```yaml
+models:
+  Qwen/Qwen3-30B-A3B-Instruct-2507:
+    megatron:
+      placement:
+        - worker: mint-worker-0
+          gpu_count: 4
+          replica: 0
+        - worker: mint-worker-1
+          gpu_count: 4
+          replica: 0
+```
+
+Equivalent normalized placement item:
+
+```yaml
+worker: mint-worker-0
+gpu_count: 4
+replica: 0
 ```
 
 Accepted topology-aware placement keys:
@@ -82,7 +120,7 @@ The normalized internal form is:
 
 ```python
 ResolvedPlacement(
-    worker="worker2",
+    worker="mint-worker-0",
     node_ip="192.168.39.110",
     gpu_count=4,
 )
@@ -161,16 +199,90 @@ The supervisor snapshot should expose daemon state separately:
   "replicas": {"vllm:...::replica-0": {"state": "healthy"}},
   "daemons": {
     "node_metrics": {
-      "worker2": {
+      "mint-worker-0": {
         "node_ip": "192.168.39.110",
         "state": "healthy",
-        "actor_name": "mint_node_metrics_collector_worker2",
+        "actor_name": "mint_daemon_node_metrics_mint-worker-0",
         "last_error": null
       }
     }
   }
 }
 ```
+
+## Deployment Labels and OTel Resource Attributes
+
+All API processes, model runtime actors, and daemon actors must receive these
+deployment labels:
+
+- `MINT_DEPLOYMENT_ENV`: `dev` or `prod`.
+- `MINT_CLUSTER_ID`: `volcano` or `aliyun`. This is the stable Mint cluster
+  family label; provider-specific values such as `volc`, `pai`, or DLC job
+  names stay in topology metadata and must not replace this label.
+
+They must be forwarded into Ray actor runtime environments and attached to OTel
+resource attributes/metric attributes:
+
+- `deployment.env` from `MINT_DEPLOYMENT_ENV`
+- `mint.cluster_id` from `MINT_CLUSTER_ID`
+- `service.name`
+
+The API server service name is `mint-server`. The node metrics daemon service
+name is `mint-node-metrics`. New service names must use the `mint-*` namespace.
+
+`MINT_DEPLOYMENT_ENV` and `MINT_CLUSTER_ID` are part of metric identity. They
+must be present on node metrics, actor binding facts, and supervisor lifecycle
+metrics so dev/prod and Volcano/Aliyun data never join accidentally.
+
+## Actor Naming
+
+Detached actors owned by Mint should have short, stable names. Shape, placement,
+generation, and session details belong in supervisor metadata or
+`health_snapshot()`, not in the actor name.
+
+Canonical GPU actor names:
+
+- vLLM: `mint_vllm_{model_slug}`
+- Megatron: `mint_megatron_{model_slug}`
+- Dense trainer: `mint_dense_{model_slug}`
+- OpenPI shared runtime: `mint_openpi_shared_{pool_slug_or_hash}`
+- OpenPI action/session runtime: `mint_openpi_action_{hash}`; this is
+  session-scoped and must not be treated as a low-cardinality metrics label.
+
+Canonical daemon actor names:
+
+- Node metrics: `mint_daemon_node_metrics_{worker_alias}`
+
+Canonical supervisor wrapper names, if the wrapper actor remains necessary:
+
+- Model runtime wrapper: `mint_runtime_{backend}_{model_slug}_{replica_id}`
+
+Do not include these in detached actor names:
+
+- request IDs
+- session IDs
+- generation
+- PID
+- node IP
+- hostname
+- TP/PP/DP/world size
+- max LoRA rank
+
+Actor metadata should carry:
+
+- `backend`: `vllm`, `megatron`, `dense`, or `openpi`
+- `runtime_mode`: for example `single_node` or `multinode`
+- `base_model`
+- `replica_id`
+- `generation`
+- `tp`, `pp`, `dp`, `world_size` when relevant
+- `max_lora_rank` when relevant
+- `worker_aliases`
+- `gpu_uuids`
+
+The actor name is not the place for shape or lifecycle metadata. Keep those
+fields in supervisor metadata and expose them through health snapshots and
+metrics.
 
 ## NodeMetricsCollectorActor
 
@@ -201,8 +313,11 @@ GPU identity is based on `gpu_uuid`. GPU name is optional diagnostic metadata an
 must not be required for actor correlation because some MLP environments do not
 expose stable GPU names.
 
-Emit per `gpu_uuid`, `node_ip`, `hostname`, `worker_alias`, and optional
-`gpu_index`:
+Emit per `deployment.env`, `mint.cluster_id`, `worker_alias`, and `gpu_uuid`.
+`node_ip`, `hostname`, `ray_node_id`, `ray_gpu_id`, and `gpu_index` are debug
+metadata, not primary metric labels. If `gpu_uuid` is unavailable, GPU-level
+actor correlation is unavailable; degrade to node/worker-level observability
+instead of guessing from GPU index or PID.
 
 - `mint_node_gpu_present`
 - `mint_node_gpu_utilization_ratio`
@@ -240,7 +355,9 @@ Actor ownership remains a separate binding fact.
 
 ### Node Metrics
 
-Emit per `node_ip`, `hostname`, and worker alias when known:
+Emit per `deployment.env`, `mint.cluster_id`, and `worker_alias`. `node_ip` and
+`hostname` may be attached as debug metadata but should not be the primary
+dashboard grouping because they can churn across cluster recreates.
 
 - `mint_node_cpu_utilization_ratio`
 - `mint_node_load1`
@@ -271,24 +388,17 @@ The node collector should not infer Mint actor ownership from PIDs. It only
 publishes node-local GPU and process facts. Actor ownership is joined in the
 observability backend or debug tooling via `gpu_uuid`.
 
-Actor bindings and node metrics should share this composite identity when
-available:
+Actor bindings and node metrics should share this composite identity:
 
-- `worker_alias`
-- `ray_node_id`
-- `node_ip`
-- `hostname`
-- `gpu_uuid`
-- `gpu_index`
-- `ray_gpu_id`
+1. `deployment.env`
+2. `mint.cluster_id`
+3. `worker_alias`
+4. `gpu_uuid`
 
-Join order:
-
-1. `worker_alias + gpu_uuid`
-2. `ray_node_id + gpu_uuid`
-3. `node_ip + gpu_uuid`
-4. `hostname + gpu_uuid`
-5. `node identity + gpu_index`
+`ray_gpu_id` is Ray's logical allocation token and is useful only for debugging
+Ray/CUDA remapping. It is not part of the correlation key. `ray_node_id` is also
+debug metadata because it can change when Ray restarts. `gpu_index` is not a
+reliable fallback in the target environments and should not be required.
 
 If the join is ambiguous or missing, attribution must be reported as `unknown`;
 do not guess from process names.
@@ -299,11 +409,10 @@ Keep labels bounded even for internal OTel metrics.
 
 Per-sample node/GPU/process metrics may use:
 
+- `deployment.env`
+- `mint.cluster_id`
 - `worker_alias`
-- `node_ip`
-- `hostname`
 - `gpu_uuid`
-- `gpu_index`
 - `process_class`
 
 They must not use:
@@ -318,6 +427,7 @@ Actor binding metrics may additionally use:
 
 - `actor_name`
 - `actor_type`
+- `backend`
 - `base_model`
 - `replica_id`
 - `workload`

@@ -5,13 +5,13 @@ from typing import Any
 
 import requests
 
-BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000").rstrip("/")
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
+BASE_URL = os.environ.get("MINT_BASE_URL", "http://localhost:8000").rstrip("/")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
 
-SUPPORTED_MODEL = os.environ.get("TINKER_SUPPORTED_MODEL", "Qwen/Qwen3-0.6B")
-UNSUPPORTED_MODEL = os.environ.get("TINKER_UNSUPPORTED_MODEL", "Qwen/Qwen3-4B-Instruct-2507")
+SUPPORTED_MODEL = os.environ.get("MINT_SUPPORTED_MODEL", "Qwen/Qwen3-0.6B")
+UNSUPPORTED_MODEL = os.environ.get("MINT_UNSUPPORTED_MODEL", "Qwen/Qwen3-4B-Instruct-2507")
 
-EXPECT_ALLOW_UNSUPPORTED = os.environ.get("TINKER_EXPECT_ALLOW_UNSUPPORTED_MODELS", "0").strip() in ("1", "true", "yes", "on")
+EXPECT_ALLOW_UNSUPPORTED = os.environ.get("MINT_EXPECT_ALLOW_UNSUPPORTED_MODELS", "0").strip() in ("1", "true", "yes", "on")
 
 
 def _headers() -> dict[str, str]:

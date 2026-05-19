@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from tinker_server.routes.training import _build_training_scheduler_extra
+from mint_server.routes.training import _build_training_scheduler_extra
 
 
 def test_openpi_train_step_scheduler_extra_forces_session_rotation(monkeypatch):

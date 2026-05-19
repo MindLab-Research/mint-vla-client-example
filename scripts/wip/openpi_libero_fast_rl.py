@@ -31,7 +31,7 @@ from openpi_libero_sft import (
 
 def _request_headers() -> dict[str, str]:
     headers = {"Connection": "close"}
-    api_key = (os.environ.get("TINKER_API_KEY") or os.environ.get("MINT_API_KEY") or "").strip()
+    api_key = (os.environ.get("MINT_API_KEY") or os.environ.get("MINT_API_KEY") or "").strip()
     if api_key:
         headers["X-API-Key"] = api_key
     return headers
@@ -128,12 +128,12 @@ def _save_weights_for_sampler(base_url: str, model_id: str, checkpoint_name: str
 
 
 def _checkpoint_owner_id_from_uri(checkpoint_uri: str) -> str | None:
-    if not checkpoint_uri.startswith(("mint://", "tinker://", "ckpt_")):
+    if not checkpoint_uri.startswith(("mint://", "mint://", "ckpt_")):
         return None
 
     env_override = (
         os.environ.get("OPENPI_VLA_CHECKPOINT_OWNER_ID")
-        or os.environ.get("TINKER_CHECKPOINT_OWNER_ID")
+        or os.environ.get("MINT_CHECKPOINT_OWNER_ID")
         or ""
     ).strip()
     if env_override:
@@ -144,8 +144,8 @@ def _checkpoint_owner_id_from_uri(checkpoint_uri: str) -> str | None:
         Path("/vePFS-Mindverse/share/mint/prod/data/runtime-checkpoints/ephemeral"),
         Path("/vePFS-Mindverse/share/mint/dev/data/runtime-checkpoints/persistent_cache"),
         Path("/vePFS-Mindverse/share/mint/dev/data/runtime-checkpoints/ephemeral"),
-        Path("/tos-mindverse/tinker_checkpoints"),
-        Path("/vePFS-Mindverse/share/tinker_checkpoints"),
+        Path("/tos-mindverse/mint_checkpoints"),
+        Path("/vePFS-Mindverse/share/mint_checkpoints"),
     ]
     owner_ids: set[str] = set()
 

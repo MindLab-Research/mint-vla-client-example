@@ -253,7 +253,7 @@ class DirectMintOpsService(DeployService):
         models: list[str] = []
         seen: set[str] = set()
         try:
-            from tinker_server.backend.model_registry import MODEL_CONFIGS
+            from mint_server.backend.model_registry import MODEL_CONFIGS
 
             for model in sorted(MODEL_CONFIGS.keys()):
                 if model in seen:

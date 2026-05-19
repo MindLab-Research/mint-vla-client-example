@@ -12,7 +12,7 @@ Runtime configuration is split by when the value must be available:
 
 `ConfigActor` is a namespace-local detached actor. Namespace is the deployment isolation boundary, so the production actor name is stable inside the namespace and does not contain a run id.
 
-`MINT_*` is the canonical environment/config namespace for server-owned deployment settings. `TINKER_*` names are accepted only as compatibility aliases by `tinker_server.runtime_env.env_get()` / `env_nonempty()`: reading either `MINT_FOO` or `TINKER_FOO` checks `MINT_FOO` first and then `TINKER_FOO`. Code outside that helper should use canonical `MINT_*` names, and ConfigActor snapshots should publish canonical `MINT_*` keys.
+`MINT_*` is the canonical environment/config namespace for server-owned deployment settings. The runtime-env compatibility helper accepts the SDK-facing environment aliases and canonicalizes them to `MINT_*`: reading a canonical key checks the canonical value first, then its compatibility alias. Code outside that helper should use canonical `MINT_*` names, and ConfigActor snapshots should publish canonical `MINT_*` keys.
 
 ## V1 semantics
 
@@ -21,7 +21,7 @@ Runtime configuration is split by when the value must be available:
 - Mutation: none. V1 has no `put`, no `set_many`, and no watch mechanism.
 - Startup behavior: the startup owner creates or attaches to the actor. If an existing actor has a different snapshot fingerprint, startup fails fast instead of silently using stale configuration.
 - Persistence: none inside ConfigActor. The API process rebuilds the read-only snapshot from env/config file on startup.
-- Actor hydration: normal Ray actors receive only bootstrap runtime_env plus `MINT_CONFIG_ACTOR_HYDRATE=1`. `tinker_server.config` fetches ConfigActor once on import and overlays `actor_env` into `os.environ` before module-level config constants are computed.
+- Actor hydration: normal Ray actors receive only bootstrap runtime_env plus `MINT_CONFIG_ACTOR_HYDRATE=1`. `mint_server.config` fetches ConfigActor once on import and overlays `actor_env` into `os.environ` before module-level config constants are computed.
 - Secret handling: `env` and `server_config` remain redacted for introspection, but `actor_env` contains real values because it is the actor configuration distribution payload. Namespace access to ConfigActor is therefore a trust boundary.
 
 ## Bootstrap runtime_env
@@ -56,11 +56,11 @@ The snapshot can include these for audit/debugging, but not as the source of tru
 ConfigActor owns actor-readable deployment/runtime configuration. The API process builds `actor_env` from:
 
 - known actor creation, snapshot, observability, and task-state configuration keys;
-- unclassified `MINT_`, `TINKER_`, and `OTEL_` keys, so newly added deployment knobs do not silently fall back to direct runtime_env forwarding;
-- canonicalized `MINT_*` names when only a `TINKER_*` alias is set.
+- unclassified `MINT_`, compatibility alias, and `OTEL_` keys, so newly added deployment knobs do not silently fall back to direct runtime_env forwarding;
+- canonicalized `MINT_*` names when only a compatibility alias is set.
 
 `actor_env` deliberately excludes bootstrap runtime_env keys and ConfigActor hydration control flags. Per-actor identity or execution contract values may still be passed through `extra` at actor creation, because they are not deployment configuration.
 
 ## Observability
 
-OTEL and APM keys are included in `actor_env`. Actor processes hydrate them before `tinker_server.config` module globals are evaluated, then actor initialization calls the normal observability setup path.
+OTEL and APM keys are included in `actor_env`. Actor processes hydrate them before `mint_server.config` module globals are evaluated, then actor initialization calls the normal observability setup path.

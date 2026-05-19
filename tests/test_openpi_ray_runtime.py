@@ -11,7 +11,7 @@ import pytest
 
 
 def _reload_openpi_ray_runtime(monkeypatch):
-    import tinker_server.config as config
+    import mint_server.config as config
 
     monkeypatch.setattr(config, "PFS_PYTHONPATH", "/runtime/site-packages:/repo:/hf")
     monkeypatch.setattr(config, "PFS_RUNTIME_ENV_ROOT", "/runtime")
@@ -24,7 +24,7 @@ def _reload_openpi_ray_runtime(monkeypatch):
             "MINT_CODE_ROOT": "/repo",
             "PFS_HF_MODULES_PATH": "/hf",
             "RAY_ADDRESS": "auto",
-            "TINKER_RAY_NAMESPACE": "tinker",
+            "MINT_RAY_NAMESPACE": "mint",
             "PYTHONPATH": pythonpath,
         }
         if extra:
@@ -32,13 +32,13 @@ def _reload_openpi_ray_runtime(monkeypatch):
         return out
 
     monkeypatch.setattr(config, "actor_runtime_env_vars", _fake_actor_runtime_env_vars)
-    import tinker_server.backend.openpi_ray_runtime as openpi_ray_runtime
+    import mint_server.backend.openpi_ray_runtime as openpi_ray_runtime
 
     return importlib.reload(openpi_ray_runtime)
 
 
 def _spec():
-    from tinker_server.backend.openpi_fast_runtime import OpenPIFastRuntimeSpec
+    from mint_server.backend.openpi_fast_runtime import OpenPIFastRuntimeSpec
 
     return OpenPIFastRuntimeSpec(
         python_executable=os.sys.executable,
@@ -75,7 +75,7 @@ def test_openpi_ray_runtime_env_vars_forward_mint_openpi_overrides(monkeypatch) 
 
 
 def test_openpi_ray_actor_ready_timeout_defaults_to_extended_budget(monkeypatch) -> None:
-    from tinker_server.backend.openpi_ray_runtime import _actor_ready_timeout_s
+    from mint_server.backend.openpi_ray_runtime import _actor_ready_timeout_s
 
     monkeypatch.delenv("MINT_OPENPI_RAY_ACTOR_READY_TIMEOUT_S", raising=False)
 
@@ -83,7 +83,7 @@ def test_openpi_ray_actor_ready_timeout_defaults_to_extended_budget(monkeypatch)
 
 
 def test_openpi_ray_actor_ready_timeout_respects_override(monkeypatch) -> None:
-    from tinker_server.backend.openpi_ray_runtime import _actor_ready_timeout_s
+    from mint_server.backend.openpi_ray_runtime import _actor_ready_timeout_s
 
     monkeypatch.setenv("MINT_OPENPI_RAY_ACTOR_READY_TIMEOUT_S", "123")
 
@@ -91,7 +91,7 @@ def test_openpi_ray_actor_ready_timeout_respects_override(monkeypatch) -> None:
 
 
 def test_start_openpi_ray_runtime_passes_model_and_training_session_ids(monkeypatch) -> None:
-    from tinker_server.backend import openpi_ray_runtime
+    from mint_server.backend import openpi_ray_runtime
 
     actor_state: dict[str, object] = {}
 
@@ -142,7 +142,7 @@ def test_start_openpi_ray_runtime_passes_model_and_training_session_ids(monkeypa
 
 
 def test_openpi_ray_runtime_client_ready_uses_metadata_method(monkeypatch) -> None:
-    from tinker_server.backend.openpi_ray_runtime import OpenPIRayRuntimeClient
+    from mint_server.backend.openpi_ray_runtime import OpenPIRayRuntimeClient
 
     class _Method:
         def __init__(self, value):
@@ -175,7 +175,7 @@ def test_openpi_ray_runtime_client_ready_uses_metadata_method(monkeypatch) -> No
 
 def test_openpi_ray_runtime_client_ray_get_awaits_future_without_ray_get(monkeypatch) -> None:
     pytest.importorskip("ray")
-    from tinker_server.backend.openpi_ray_runtime import OpenPIRayRuntimeClient
+    from mint_server.backend.openpi_ray_runtime import OpenPIRayRuntimeClient
 
     client = OpenPIRayRuntimeClient(
         actor=object(),
@@ -188,7 +188,7 @@ def test_openpi_ray_runtime_client_ray_get_awaits_future_without_ray_get(monkeyp
     ref = SimpleNamespace(future=lambda: fut)
 
     monkeypatch.setattr(
-        "tinker_server.backend.openpi_ray_runtime.ray.get",
+        "mint_server.backend.openpi_ray_runtime.ray.get",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("ray.get should not be called")),
     )
 
@@ -197,8 +197,8 @@ def test_openpi_ray_runtime_client_ray_get_awaits_future_without_ray_get(monkeyp
 
 def test_openpi_ray_runtime_client_ray_get_preserves_timeout_surface(monkeypatch) -> None:
     ray = pytest.importorskip("ray")
-    from tinker_server.backend.openpi_ray_runtime import OpenPIRayRuntimeClient
-    from tinker_server.backend.openpi_fast_runtime import OpenPIFastWorkerProtocolError
+    from mint_server.backend.openpi_ray_runtime import OpenPIRayRuntimeClient
+    from mint_server.backend.openpi_fast_runtime import OpenPIFastWorkerProtocolError
 
     client = OpenPIRayRuntimeClient(
         actor=object(),
@@ -210,7 +210,7 @@ def test_openpi_ray_runtime_client_ray_get_preserves_timeout_surface(monkeypatch
     ref = SimpleNamespace(future=lambda: fut)
 
     monkeypatch.setattr(
-        "tinker_server.backend.openpi_ray_runtime.ray.get",
+        "mint_server.backend.openpi_ray_runtime.ray.get",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("ray.get should not be called")),
     )
 
@@ -222,7 +222,7 @@ def test_openpi_ray_runtime_client_ray_get_preserves_timeout_surface(monkeypatch
 
 def test_ray_keepalive_awaits_future_without_ray_get(monkeypatch) -> None:
     pytest.importorskip("ray")
-    from tinker_server.backend import ray_keepalive
+    from mint_server.backend import ray_keepalive
 
     fut: concurrent.futures.Future[dict[str, object]] = concurrent.futures.Future()
     fut.set_result({"ok": True})
@@ -230,7 +230,7 @@ def test_ray_keepalive_awaits_future_without_ray_get(monkeypatch) -> None:
     calls: list[tuple[str, object]] = []
 
     monkeypatch.setattr(
-        "tinker_server.backend.ray_keepalive.ray.get",
+        "mint_server.backend.ray_keepalive.ray.get",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("ray.get should not be called")),
     )
     monkeypatch.setattr(
@@ -261,14 +261,14 @@ def test_ray_keepalive_awaits_future_without_ray_get(monkeypatch) -> None:
 
 def test_ray_keepalive_preserves_periodic_touch_while_waiting(monkeypatch) -> None:
     pytest.importorskip("ray")
-    from tinker_server.backend import ray_keepalive
+    from mint_server.backend import ray_keepalive
 
     future: concurrent.futures.Future[dict[str, object]] = concurrent.futures.Future()
     ref = SimpleNamespace(future=lambda: future)
     touches: list[str] = []
 
     monkeypatch.setattr(
-        "tinker_server.backend.ray_keepalive.ray.get",
+        "mint_server.backend.ray_keepalive.ray.get",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("ray.get should not be called")),
     )
     def _touch(actor_name: str) -> None:
@@ -300,7 +300,7 @@ def test_ray_keepalive_preserves_periodic_touch_while_waiting(monkeypatch) -> No
 
 def test_ray_keepalive_cancellation_silences_late_exception(monkeypatch) -> None:
     pytest.importorskip("ray")
-    from tinker_server.backend import async_ray_control, ray_keepalive
+    from mint_server.backend import async_ray_control, ray_keepalive
 
     discarded: list[str] = []
 

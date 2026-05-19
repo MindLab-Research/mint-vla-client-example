@@ -1,8 +1,8 @@
 import pytest
 
-import tinker_server.backend.openpi_fast_training as openpi_fast_training
-from tinker_server.backend.model_registry import MODEL_CONFIGS
-from tinker_server.models.types import Datum, EncodedTextChunk, ImageChunk, ModelInput
+import mint_server.backend.openpi_fast_training as openpi_fast_training
+from mint_server.backend.model_registry import MODEL_CONFIGS
+from mint_server.models.types import Datum, EncodedTextChunk, ImageChunk, ModelInput
 
 
 OPENPI_FAST_MODEL = "openpi/pi0-fast-libero-low-mem-finetune"

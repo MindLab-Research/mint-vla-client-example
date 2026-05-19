@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from tinker_server.backend.verl_inference import _extract_sampled_token_logprobs
+from mint_server.backend.verl_inference import _extract_sampled_token_logprobs
 
 
 class _LogProb:
@@ -88,7 +88,7 @@ def test_issue_355_extract_sampled_token_logprobs_raises_when_payload_missing_en
 
 
 def test_issue_355_extract_sampled_token_logprobs_logs_structure_for_missing_payload(caplog: pytest.LogCaptureFixture) -> None:
-    with caplog.at_level(logging.WARNING, logger="tinker_server.backend.verl_inference"):
+    with caplog.at_level(logging.WARNING, logger="mint_server.backend.verl_inference"):
         with pytest.raises(
             RuntimeError, match=r"returned no sampled-token logprob payload: request_id=req-355 token_count=2"
         ):
@@ -117,7 +117,7 @@ def test_issue_355_extract_sampled_token_logprobs_raises_when_payload_length_mis
 
 
 def test_issue_355_extract_sampled_token_logprobs_logs_structure_for_missing_entry(caplog: pytest.LogCaptureFixture) -> None:
-    with caplog.at_level(logging.WARNING, logger="tinker_server.backend.verl_inference"):
+    with caplog.at_level(logging.WARNING, logger="mint_server.backend.verl_inference"):
         with pytest.raises(RuntimeError, match=r"missing sampled-token logprob: request_id=req-355 idx=1 token_id=0"):
             _extract_sampled_token_logprobs(
                 request_id="req-355",
@@ -139,7 +139,7 @@ def test_issue_355_extract_sampled_token_logprobs_logs_structure_for_missing_ent
 
 def test_issue_355_verl_requests_positive_sampled_token_logprob_budget() -> None:
     repo_root = Path(__file__).resolve().parents[1]
-    text = (repo_root / "tinker_server/backend/verl_inference.py").read_text(encoding="utf-8")
+    text = (repo_root / "mint_server/backend/verl_inference.py").read_text(encoding="utf-8")
 
     assert "logprobs=0 if logprobs else None" not in text
     assert 'sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None' not in text

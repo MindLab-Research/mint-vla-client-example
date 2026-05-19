@@ -22,8 +22,8 @@ def _import_volc_placement(monkeypatch: pytest.MonkeyPatch):
     ray_private.state = SimpleNamespace(available_resources_per_node=lambda: {})
     monkeypatch.setitem(sys.modules, "ray._private", ray_private)
 
-    sys.modules.pop("tinker_server.backend.volc_placement", None)
-    return importlib.import_module("tinker_server.backend.volc_placement")
+    sys.modules.pop("mint_server.backend.volc_placement", None)
+    return importlib.import_module("mint_server.backend.volc_placement")
 
 
 
@@ -302,7 +302,7 @@ def test_assert_node_ip_capacity_reports_pg_blocker(monkeypatch: pytest.MonkeyPa
         lambda: [
             {
                 "name": "megatron_qwen_pg",
-                "namespace": "tinker",
+                "namespace": "mint",
                 "state": "CREATED",
                 "pinned_ips": ["10.0.0.7"],
                 "gpu_by_pinned_ip": {"10.0.0.7": 8.0},
@@ -354,7 +354,7 @@ def test_assert_node_ip_capacity_ignores_owned_pg_blocker(monkeypatch: pytest.Mo
         lambda: [
             {
                 "name": "megatron_qwen_pg",
-                "namespace": "tinker",
+                "namespace": "mint",
                 "state": "CREATED",
                 "pinned_ips": ["10.0.0.7"],
                 "gpu_by_pinned_ip": {"10.0.0.7": 8.0},
@@ -367,7 +367,7 @@ def test_assert_node_ip_capacity_ignores_owned_pg_blocker(monkeypatch: pytest.Mo
         required_gpus_by_node_ip={"10.0.0.7": 8},
         context="megatron pin preflight",
         ignore_placement_group_names={"megatron_qwen_pg"},
-        ignore_placement_group_namespace="tinker",
+        ignore_placement_group_namespace="mint",
     )
 
 
@@ -411,7 +411,7 @@ def test_assert_node_ip_capacity_does_not_ignore_same_name_pg_from_other_namespa
             required_gpus_by_node_ip={"10.0.0.7": 8},
             context="megatron pin preflight",
             ignore_placement_group_names={"megatron_qwen_pg"},
-            ignore_placement_group_namespace="tinker",
+            ignore_placement_group_namespace="mint",
         )
 
 
@@ -440,7 +440,7 @@ def test_assert_node_ip_capacity_ignores_namespace_suffixed_pg_when_ray_table_ha
         "_gpu_placement_groups",
         lambda: [
             {
-                "name": "megatron_qwen_tinker_pg",
+                "name": "megatron_qwen_mint_pg",
                 "state": "CREATED",
                 "pinned_ips": ["10.0.0.7"],
                 "gpu_by_pinned_ip": {"10.0.0.7": 8.0},
@@ -452,8 +452,8 @@ def test_assert_node_ip_capacity_ignores_namespace_suffixed_pg_when_ray_table_ha
     vp.assert_node_ip_capacity(
         required_gpus_by_node_ip={"10.0.0.7": 8},
         context="megatron pin preflight",
-        ignore_placement_group_names={"megatron_qwen_tinker_pg"},
-        ignore_placement_group_namespace="tinker",
+        ignore_placement_group_names={"megatron_qwen_mint_pg"},
+        ignore_placement_group_namespace="mint",
     )
 
 
@@ -496,7 +496,7 @@ def test_assert_node_ip_capacity_does_not_ignore_unsuffixed_pg_when_ray_table_ha
             required_gpus_by_node_ip={"10.0.0.7": 8},
             context="megatron pin preflight",
             ignore_placement_group_names={"megatron_qwen_pg"},
-            ignore_placement_group_namespace="tinker",
+            ignore_placement_group_namespace="mint",
         )
 
 

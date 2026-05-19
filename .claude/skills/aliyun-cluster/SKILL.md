@@ -54,7 +54,7 @@ rsync -avz --dry-run \
   --exclude='LOG.md' \
   --exclude='PROMPT.md' \
   --exclude='.claude' \
-  ./ mint-prod-aliyun:/vePFS-Mindverse/share/code/tinker-server-aliyun/
+  ./ mint-prod-aliyun:/vePFS-Mindverse/share/code/mint-server-aliyun/
 ```
 
 ## Quick Reference
@@ -105,7 +105,7 @@ For this project, credentials are stored in the repo-root `.env`:
 
 Workflow:
 ```bash
-cd /path/to/tinker-server-prod
+cd /path/to/mint-server-prod
 set -a
 source .env
 set +a
@@ -166,7 +166,7 @@ export DLC_DATA_SOURCE_URIS='bmcpfs://bmcpfs-03001407yug37qgafv7j5.cn-beijing/::
 export DLC_IMAGE='acr-qhxx-registry.cn-beijing.cr.aliyuncs.com/mindverse/mint:11'
 
 # Code root on CPFS (workers run entrypoint from here)
-export ALIYUN_CODE_ROOT=/vePFS-Mindverse/share/code/tinker-server-aliyun
+export ALIYUN_CODE_ROOT=/vePFS-Mindverse/share/code/mint-server-aliyun
 export ALIYUN_RAY_ENTRYPOINT="${ALIYUN_CODE_ROOT}/.claude/skills/aliyun-cluster/scripts/ray_entrypoint.sh"
 ```
 
@@ -182,7 +182,7 @@ This avoids writing the head IP into CPFS (DLC BMCPFS mounts are read-only by de
 
 Run on `mint-prod-aliyun`:
 ```bash
-ssh mint-prod-aliyun 'cd /vePFS-Mindverse/share/code/tinker-server-aliyun && \
+ssh mint-prod-aliyun 'cd /vePFS-Mindverse/share/code/mint-server-aliyun && \
   nohup bash -c "PYTHONPATH=$PWD:$PYTHONPATH RAY_START_HEAD=1 RAY_HEAD_PORT=6379 RAY_HEAD_NUM_CPUS=4 \
     .venv_cpu/bin/python .claude/skills/aliyun-cluster/scripts/start_local_ray_head.py" \
   >> /tmp/ray_head_aliyun.log 2>&1 &'
@@ -221,7 +221,7 @@ ssh mint-prod-aliyun 'dlc logs <WORKER_JOB_ID> <POD_ID> --max_events_num 200'
 
 Run from `mint-prod-aliyun`:
 ```bash
-ssh mint-prod-aliyun "cd /vePFS-Mindverse/share/code/tinker-server-aliyun && \
+ssh mint-prod-aliyun "cd /vePFS-Mindverse/share/code/mint-server-aliyun && \
   RAY_ADDRESS=<MINT_PROD_ALIYUN_RAY_HEAD_IP>:6379 PYTHONPATH=$PWD .venv_cpu/bin/python - <<'PY'
 import os
 import ray
@@ -237,9 +237,9 @@ Hardware differences matter for vLLM TP/PP/DP and overall GPU count:
 - Volcano: A800 80GB
 - Aliyun: H (SM90)
 
-For tinker-server deployments on Aliyun, tune `tinker_server/backend/model_registry.py` or set `MINT_MODEL_CONFIG_OVERRIDES_JSON` on the Aliyun server.
+For mint-server deployments on Aliyun, tune `mint_server/backend/model_registry.py` or set `MINT_MODEL_CONFIG_OVERRIDES_JSON` on the Aliyun server.
 
-Current 235B defaults in `tinker_server/backend/model_registry.py` are tuned for 24xSM90-class Aliyun GPUs with concurrent prewarm:
+Current 235B defaults in `mint_server/backend/model_registry.py` are tuned for 24xSM90-class Aliyun GPUs with concurrent prewarm:
 - Inference: `inference_tp=8`, `inference_dp=1` (8 GPUs)
 - Training: `train_tp=4`, `train_pp=2`, `train_ep=2` (16 GPUs)
 
@@ -247,34 +247,34 @@ Current 235B defaults in `tinker_server/backend/model_registry.py` are tuned for
 
 `mint-prod-aliyun` is a CPU-only API host.
 
-In this environment, run the Ray head locally on `mint-prod-aliyun` (section 2.1) and run `tinker-server` as a Ray driver against that local head.
+In this environment, run the Ray head locally on `mint-prod-aliyun` (section 2.1) and run `mint-server` as a Ray driver against that local head.
 
 Invariants:
 - Do not use `nvidia-smi` here.
 - Do not use `/opt/venv` on the API host. `/opt/venv` exists inside DLC worker images.
 - Do not restart the local Ray head while actors exist; that SIGTERMs workers and breaks `save_weights_for_sampler`.
 
-### Start tinker-server on mint-prod-aliyun
+### Start mint-server on mint-prod-aliyun
 
 Key env vars:
 - `RAY_ADDRESS=<MINT_PROD_ALIYUN_RAY_HEAD_IP>:6379`
 - `MINT_SUPPORTED_MODELS=Qwen/Qwen3-235B-A22B-Instruct-2507`
 - `MINT_PERSISTENT_MODELS=Qwen/Qwen3-235B-A22B-Instruct-2507`
-- `TINKER_CHECKPOINT_DIR=/vePFS-Mindverse/share/tinker_checkpoints`
-- `PFS_TINKER_PATH=/vePFS-Mindverse/share/code/tinker-server-aliyun` (so Ray worker `runtime_env` points at the correct code root)
+- `MINT_CHECKPOINT_DIR=/vePFS-Mindverse/share/mint_checkpoints`
+- `MINT_CODE_ROOT=/vePFS-Mindverse/share/code/mint-server-aliyun` (so Ray worker `runtime_env` points at the correct code root)
 - Do not shadow in-image vLLM with an incomplete CPFS checkout (missing `vllm._C`).
 
-Start (uses project-owned `.venv_cpu`; logs to `/tmp/tinker_server_auth.log`):
+Start (uses project-owned `.venv_cpu`; logs to `/tmp/mint_server_auth.log`):
 ```bash
-ssh mint-prod-aliyun 'cd /vePFS-Mindverse/share/code/tinker-server-aliyun && \
+ssh mint-prod-aliyun 'cd /vePFS-Mindverse/share/code/mint-server-aliyun && \
   set -a && source .secrets.env && set +a && \
   pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true; \
   nohup bash -c "PYTHONPATH=$PWD:$PYTHONPATH HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
-    PYTHONDONTWRITEBYTECODE=1 RAY_ADDRESS=<MINT_PROD_ALIYUN_RAY_HEAD_IP>:6379 TINKER_PORT=18000 \
+    PYTHONDONTWRITEBYTECODE=1 RAY_ADDRESS=<MINT_PROD_ALIYUN_RAY_HEAD_IP>:6379 MINT_PORT=18000 \
     MINT_SUPPORTED_MODELS=Qwen/Qwen3-235B-A22B-Instruct-2507 \
     MINT_PERSISTENT_MODELS=Qwen/Qwen3-235B-A22B-Instruct-2507 \
     MINT_PERSISTENT_TRAIN_LORA_RANK=16 MINT_PERSISTENT_TRAIN_LR=5e-5 \
-    .venv_cpu/bin/python scripts/run_server.py" >> /tmp/tinker_server_auth.log 2>&1 &'
+    .venv_cpu/bin/python scripts/run_server.py" >> /tmp/mint_server_auth.log 2>&1 &'
 ```
 
 Sanity:
@@ -309,7 +309,7 @@ Install on `mint-prod-aliyun`:
 ssh mint-prod-aliyun 'set -euo pipefail
 target=/vePFS-Mindverse/share/code/modelopt-pkg
 rm -rf "$target" && mkdir -p "$target"
-py=/vePFS-Mindverse/share/code/tinker-server-aliyun/.venv/bin/python
+py=/vePFS-Mindverse/share/code/mint-server-aliyun/.venv/bin/python
 
 # WARNING: do NOT install nvidia-modelopt with dependencies; it will pull a full torch+CUDA wheel set.
 $py -m pip install -q --target "$target" --no-deps nvidia-modelopt==0.41.0
@@ -319,7 +319,7 @@ $py -m pip install -q --target "$target" ninja packaging nvidia-ml-py rich tqdm 
 
 Sanity check on a GPU worker (forces execution on a GPU pod):
 ```bash
-ssh mint-prod-aliyun 'RAY_ADDRESS=<HEAD_IP>:6379 /vePFS-Mindverse/share/code/tinker-server-aliyun/.venv/bin/python - <<'"'"'PY'"'"'
+ssh mint-prod-aliyun 'RAY_ADDRESS=<HEAD_IP>:6379 /vePFS-Mindverse/share/code/mint-server-aliyun/.venv/bin/python - <<'"'"'PY'"'"'
 import os, ray
 ray.init(address=os.environ["RAY_ADDRESS"], ignore_reinit_error=True)
 

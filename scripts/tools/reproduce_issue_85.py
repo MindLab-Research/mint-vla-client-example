@@ -6,11 +6,11 @@ from typing import Any
 
 import requests
 
-BASE_URL_A = os.environ.get("TINKER_BASE_URL_A") or os.environ.get("TINKER_BASE_URL") or "http://localhost:10085"
-BASE_URL_B = os.environ.get("TINKER_BASE_URL_B") or os.environ.get("TINKER_BASE_URL2") or "http://localhost:10086"
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
+BASE_URL_A = os.environ.get("MINT_BASE_URL_A") or os.environ.get("MINT_BASE_URL") or "http://localhost:10085"
+BASE_URL_B = os.environ.get("MINT_BASE_URL_B") or os.environ.get("MINT_BASE_URL2") or "http://localhost:10086"
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
 
-POLL_TIMEOUT_S = float(os.environ.get("TINKER_POLL_TIMEOUT_S", "60"))
+POLL_TIMEOUT_S = float(os.environ.get("MINT_POLL_TIMEOUT_S", "60"))
 
 
 def _headers() -> dict[str, str]:

@@ -98,8 +98,8 @@ def _iter_jsonl(path: Path) -> list[dict[str, Any]]:
 
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--base-url", default=os.environ.get("TINKER_BASE_URL") or os.environ.get("MINT_BASE_URL") or DEFAULT_BASE_URL)
-    p.add_argument("--api-key", default=os.environ.get("TINKER_API_KEY") or os.environ.get("MINT_API_KEY") or "")
+    p.add_argument("--base-url", default=os.environ.get("MINT_BASE_URL") or os.environ.get("MINT_BASE_URL") or DEFAULT_BASE_URL)
+    p.add_argument("--api-key", default=os.environ.get("MINT_API_KEY") or os.environ.get("MINT_API_KEY") or "")
     p.add_argument("--models", default=DEFAULT_MODELS, help="Comma-separated base models")
     p.add_argument("--num-sessions", default="1", help="Comma-separated session counts, e.g. 1,2,4")
     p.add_argument("--prompt-logprobs", default="0,1", help="Comma-separated {0,1}")

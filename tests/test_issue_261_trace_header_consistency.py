@@ -4,8 +4,8 @@ from fastapi.testclient import TestClient
 
 
 def test_issue_261_response_uses_final_trace_id(monkeypatch):
-    from tinker_server import config as config_module
-    from tinker_server.app import api_key_auth_middleware
+    from mint_server import config as config_module
+    from mint_server.app import api_key_auth_middleware
 
     monkeypatch.setattr(config_module.config, "api_key", None, raising=False)
     monkeypatch.setattr(config_module.config, "internal_api_token", "", raising=False)

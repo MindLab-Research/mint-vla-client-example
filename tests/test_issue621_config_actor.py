@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from tinker_server.config import ServerConfig
-from tinker_server.runtime_config import (
+from mint_server.config import ServerConfig
+from mint_server.runtime_config import (
     CONFIG_ACTOR_DEFAULT_NAME,
     CONFIG_CLASS_ACTOR_CREATION_INPUT,
     CONFIG_CLASS_BOOTSTRAP_RUNTIME_ENV,
@@ -37,6 +37,8 @@ def test_runtime_config_classifies_bootstrap_actor_creation_snapshot_and_observa
     assert classify_env_key("MINT_VLLM_MAX_NUM_SEQS") == CONFIG_CLASS_SNAPSHOT_CONFIG
     assert classify_env_key("MINT_MEGATRON_STICKY_IDLE_TIMEOUT_S") == CONFIG_CLASS_SNAPSHOT_CONFIG
     assert classify_env_key("OTEL_EXPORTER_OTLP_ENDPOINT") == CONFIG_CLASS_OBSERVABILITY
+    assert classify_env_key("MINT_DEPLOYMENT_ENV") == CONFIG_CLASS_OBSERVABILITY
+    assert classify_env_key("MINT_CLUSTER_ID") == CONFIG_CLASS_OBSERVABILITY
     assert classify_env_key("MINT_TASK_STATE_STORE_DB_PATH") == CONFIG_CLASS_TASK_STATE
     assert classify_env_key("MINT_TASK_STATE_STORE_OWNER_TTL_S") == CONFIG_CLASS_TASK_STATE
 
@@ -47,6 +49,8 @@ def test_runtime_config_classifies_bootstrap_actor_creation_snapshot_and_observa
             "MINT_VLLM_MAX_NUM_BATCHED_TOKENS": "4096",
             "OTEL_SERVICE_NAME": "mint",
             "OTEL_EXPORTER_OTLP_HEADERS": "Authorization=secret",
+            "MINT_DEPLOYMENT_ENV": "prod",
+            "MINT_CLUSTER_ID": "volcano",
             "MINT_TASK_STATE_STORE_DB_PATH": "/tmp/task.sqlite3",
             "MINT_TASK_STATE_STORE_OWNER_RENEW_S": "10",
             "UNRELATED_ENV": "ignored",
@@ -58,6 +62,8 @@ def test_runtime_config_classifies_bootstrap_actor_creation_snapshot_and_observa
     assert grouped[CONFIG_CLASS_SNAPSHOT_CONFIG]["MINT_VLLM_MAX_NUM_BATCHED_TOKENS"] == "4096"
     assert grouped[CONFIG_CLASS_OBSERVABILITY]["OTEL_SERVICE_NAME"] == "mint"
     assert grouped[CONFIG_CLASS_OBSERVABILITY]["OTEL_EXPORTER_OTLP_HEADERS"] == REDACTED_VALUE
+    assert grouped[CONFIG_CLASS_OBSERVABILITY]["MINT_DEPLOYMENT_ENV"] == "prod"
+    assert grouped[CONFIG_CLASS_OBSERVABILITY]["MINT_CLUSTER_ID"] == "volcano"
     assert grouped[CONFIG_CLASS_TASK_STATE]["MINT_TASK_STATE_STORE_DB_PATH"] == "/tmp/task.sqlite3"
     assert grouped[CONFIG_CLASS_TASK_STATE]["MINT_TASK_STATE_STORE_OWNER_RENEW_S"] == "10"
     assert "UNRELATED_ENV" not in grouped["unclassified"]
@@ -128,7 +134,7 @@ def test_actor_env_from_environ_keeps_real_values_for_actor_hydration() -> None:
 
 
 def test_config_actor_exposes_no_mutating_api() -> None:
-    from tinker_server.backend import config_actor
+    from mint_server.backend import config_actor
 
     assert hasattr(config_actor, "ensure_started")
     assert hasattr(config_actor, "get_snapshot")
@@ -138,7 +144,7 @@ def test_config_actor_exposes_no_mutating_api() -> None:
 
 
 def test_config_actor_detects_existing_snapshot_mismatch(monkeypatch) -> None:
-    from tinker_server.backend import config_actor
+    from mint_server.backend import config_actor
 
     expected = build_config_snapshot(
         environ={"MINT_CONFIG_ACTOR_NAME": "mint_config"},
@@ -170,7 +176,7 @@ def test_config_actor_detects_existing_snapshot_mismatch(monkeypatch) -> None:
 
 
 def test_config_actor_options_are_detached_namespace_local(monkeypatch) -> None:
-    from tinker_server.backend import config_actor
+    from mint_server.backend import config_actor
 
     monkeypatch.setattr(config_actor, "RAY_NAMESPACE", "mint-ns")
     monkeypatch.setattr(config_actor, "PFS_PYTHONPATH", "/pythonpath")
@@ -202,7 +208,7 @@ def test_config_actor_options_are_detached_namespace_local(monkeypatch) -> None:
 
 
 def test_actor_runtime_env_hydration_flag_is_default_and_not_extra_overridable(monkeypatch) -> None:
-    from tinker_server import config as server_config
+    from mint_server import config as server_config
 
     monkeypatch.setattr(server_config, "PFS_RUNTIME_ENV_ROOT", "/runtime")
     monkeypatch.setattr(server_config, "MINT_CODE_ROOT", "/repo")
@@ -221,7 +227,7 @@ def test_actor_runtime_env_hydration_flag_is_default_and_not_extra_overridable(m
 def test_only_config_actor_disables_config_actor_hydration() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     matches: list[tuple[str, str]] = []
-    for path in sorted((repo_root / "tinker_server").rglob("*.py")):
+    for path in sorted((repo_root / "mint_server").rglob("*.py")):
         text = path.read_text(encoding="utf-8")
         for lineno, line in enumerate(text.splitlines(), start=1):
             if "include_config_snapshot=False" in line:
@@ -229,14 +235,14 @@ def test_only_config_actor_disables_config_actor_hydration() -> None:
 
     assert matches == [
         (
-            "tinker_server/backend/config_actor.py",
+            "mint_server/backend/config_actor.py",
             "include_config_snapshot=False,",
         )
     ]
 
 
 def test_config_hydration_applies_actor_env_once(monkeypatch) -> None:
-    from tinker_server import config_hydration
+    from mint_server import config_hydration
 
     class FakeRef:
         pass
@@ -266,7 +272,7 @@ def test_config_hydration_applies_actor_env_once(monkeypatch) -> None:
 
     environ = {
         "MINT_CONFIG_ACTOR_HYDRATE": "1",
-        "TINKER_RAY_NAMESPACE": "mint-ns",
+        "MINT_RAY_NAMESPACE": "mint-ns",
     }
     monkeypatch.setattr(config_hydration, "_HYDRATED", False)
     monkeypatch.setitem(__import__("sys").modules, "ray", FakeRay)

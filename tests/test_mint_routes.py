@@ -56,7 +56,7 @@ class _StubModelWorkScheduler:
 
 
 def test_mint_action_route_cleans_up_future_when_enqueue_fails(monkeypatch) -> None:
-    from tinker_server.routes import mint as mint_routes
+    from mint_server.routes import mint as mint_routes
 
     task_futures = _StubTaskFutureService()
     scheduler = _StubModelWorkScheduler(fail=True)
@@ -64,7 +64,7 @@ def test_mint_action_route_cleans_up_future_when_enqueue_fails(monkeypatch) -> N
     monkeypatch.setattr(mint_routes, "task_futures", task_futures, raising=False)
     monkeypatch.setattr(mint_routes, "action_session_manager", object(), raising=False)
 
-    import tinker_server.backend.model_work_scheduler as mws
+    import mint_server.backend.model_work_scheduler as mws
 
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
 
@@ -102,14 +102,14 @@ def test_mint_action_route_cleans_up_future_when_enqueue_fails(monkeypatch) -> N
 
 
 def test_mint_create_action_session_maps_capacity_runtime_error_to_503(monkeypatch) -> None:
-    from tinker_server.routes import mint as mint_routes
-    import tinker_server.supported_models_gate as supported_models_gate
+    from mint_server.routes import mint as mint_routes
+    import mint_server.supported_models_gate as supported_models_gate
 
     class _StubActionSessionManager:
         async def create_session(self, **kwargs):
             _ = kwargs
             raise RuntimeError(
-                "[OpenPIActionRuntime] node pinning model='openpi/pi0-fast-libero-low-mem-finetune' actor='openpi_action_runtime_test': "
+                "[OpenPIActionRuntime] node pinning model='openpi/pi0-fast-libero-low-mem-finetune' actor='mint_openpi_action_test': "
                 "pinned node capacity check failed: required_by_node={'192.168.38.176': 1}"
             )
 
@@ -142,8 +142,8 @@ def test_mint_create_action_session_maps_capacity_runtime_error_to_503(monkeypat
 
 
 def test_mint_create_action_session_uses_bypass_cap_for_checkpoint_paths(monkeypatch) -> None:
-    from tinker_server.routes import mint as mint_routes
-    import tinker_server.supported_models_gate as supported_models_gate
+    from mint_server.routes import mint as mint_routes
+    import mint_server.supported_models_gate as supported_models_gate
 
     captured: dict[str, object] = {}
 
@@ -214,7 +214,7 @@ def test_mint_create_action_session_uses_bypass_cap_for_checkpoint_paths(monkeyp
 
 
 def test_mint_vla_train_step_route_enqueues_expected_request(monkeypatch) -> None:
-    from tinker_server.routes import mint as mint_routes
+    from mint_server.routes import mint as mint_routes
 
     task_futures = _StubTaskFutureService()
     scheduler = _StubModelWorkScheduler()
@@ -240,8 +240,8 @@ def test_mint_vla_train_step_route_enqueues_expected_request(monkeypatch) -> Non
     monkeypatch.setattr(mint_routes, "training_manager", _StubTrainingManager())
     monkeypatch.setattr(mint_routes, "_get_user_id", lambda _request: "user-a")
 
-    import tinker_server.backend.model_work_scheduler as mws
-    from tinker_server.routes import training as training_routes
+    import mint_server.backend.model_work_scheduler as mws
+    from mint_server.routes import training as training_routes
 
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
     monkeypatch.setattr(training_routes, "_get_max_model_len", lambda _base_model: 2048)
@@ -331,9 +331,9 @@ def test_mint_vla_train_step_route_enqueues_expected_request(monkeypatch) -> Non
 
 
 def test_mint_vla_train_step_background_lowers_observation_and_supervision(monkeypatch) -> None:
-    from tinker_server.models.mint_types import VLATrainStepRequest
-    from tinker_server.routes import mint as mint_routes
-    from tinker_server.routes import training as training_routes
+    from mint_server.models.mint_types import VLATrainStepRequest
+    from mint_server.routes import mint as mint_routes
+    from mint_server.routes import training as training_routes
 
     task_futures = _StubTaskFutureService()
     mark_calls: list[tuple[str, int]] = []
@@ -392,8 +392,8 @@ def test_mint_vla_train_step_background_lowers_observation_and_supervision(monke
 
 
 def test_mint_vla_train_step_route_uses_detached_session_info(monkeypatch) -> None:
-    from tinker_server.routes import mint as mint_routes
-    from tinker_server.routes import training as training_routes
+    from mint_server.routes import mint as mint_routes
+    from mint_server.routes import training as training_routes
 
     task_futures = _StubTaskFutureService()
     scheduler = _StubModelWorkScheduler()
@@ -414,7 +414,7 @@ def test_mint_vla_train_step_route_uses_detached_session_info(monkeypatch) -> No
     monkeypatch.setattr(mint_routes, "_get_user_id", lambda _request: "user-a")
     monkeypatch.setattr(mint_routes, "_get_route_training_store_info", _fake_route_session_info)
 
-    import tinker_server.backend.model_work_scheduler as mws
+    import mint_server.backend.model_work_scheduler as mws
 
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
     monkeypatch.setattr(training_routes, "_get_max_model_len", lambda _base_model: 2048)
@@ -465,7 +465,7 @@ def test_mint_vla_train_step_route_uses_detached_session_info(monkeypatch) -> No
 
 
 def test_model_work_dispatch_executes_mint_vla_train_step(monkeypatch) -> None:
-    from tinker_server.backend import model_work_dispatch as dispatch
+    from mint_server.backend import model_work_dispatch as dispatch
     import ray
 
     captured: dict[str, object] = {}
@@ -475,7 +475,7 @@ def test_model_work_dispatch_executes_mint_vla_train_step(monkeypatch) -> None:
         captured["request"] = request
         captured["user_id"] = user_id
 
-    from tinker_server.routes import mint as mint_routes
+    from mint_server.routes import mint as mint_routes
 
     monkeypatch.setattr(ray, "is_initialized", lambda: True)
     monkeypatch.setattr(mint_routes, "_do_vla_train_step", _fake_do_vla_train_step)
@@ -512,7 +512,7 @@ def test_model_work_dispatch_executes_mint_vla_train_step(monkeypatch) -> None:
 
 
 def test_mint_interpolate_route_enqueues_expected_request(monkeypatch) -> None:
-    from tinker_server.routes import mint as mint_routes
+    from mint_server.routes import mint as mint_routes
 
     task_futures = _StubTaskFutureService()
     scheduler = _StubModelWorkScheduler()
@@ -522,7 +522,7 @@ def test_mint_interpolate_route_enqueues_expected_request(monkeypatch) -> None:
     monkeypatch.setattr(mint_routes, "training_manager", object())
     monkeypatch.setattr(mint_routes, "_get_user_id", lambda _request: "user-a")
 
-    import tinker_server.backend.model_work_scheduler as mws
+    import mint_server.backend.model_work_scheduler as mws
 
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
 
@@ -578,9 +578,9 @@ def test_mint_interpolate_route_enqueues_expected_request(monkeypatch) -> None:
 
 
 def test_mint_interpolate_do_path_claims_checkpoint_and_writes_ckpt_id(monkeypatch, tmp_path) -> None:
-    from tinker_server.models.mint_types import InterpolateCheckpointsRequest
-    from tinker_server.routes import mint as mint_routes
-    import tinker_server.backend.mintx_ops as mintx_ops
+    from mint_server.models.mint_types import InterpolateCheckpointsRequest
+    from mint_server.routes import mint as mint_routes
+    import mint_server.backend.mintx_ops as mintx_ops
 
     task_futures = _StubTaskFutureService()
     written: dict[str, object] = {}
@@ -620,7 +620,7 @@ def test_mint_interpolate_do_path_claims_checkpoint_and_writes_ckpt_id(monkeypat
     monkeypatch.setattr(
         mint_routes,
         "begin_async_checkpoint_mirror",
-        lambda *_args, **_kwargs: "/tos-mindverse/tinker_checkpoints/owner-a/model-123/ema-0010/sampler",
+        lambda *_args, **_kwargs: "/tos-mindverse/mint_checkpoints/owner-a/model-123/ema-0010/sampler",
     )
     monkeypatch.setattr(
         mint_routes,
@@ -659,7 +659,7 @@ def test_mint_interpolate_do_path_claims_checkpoint_and_writes_ckpt_id(monkeypat
                 "coefficients": [0.9, 0.1],
                 "has_rank_shards": False,
                 "filesystem_path": str(tmp_path / "persistent_cache" / "owner-a" / "model-123" / "ema-0010"),
-                "persistent_filesystem_path": "/tos-mindverse/tinker_checkpoints/owner-a/model-123/ema-0010/sampler",
+                "persistent_filesystem_path": "/tos-mindverse/mint_checkpoints/owner-a/model-123/ema-0010/sampler",
                 "mirror_status": "pending",
                 "type": "mint_interpolate_checkpoints",
             },
@@ -668,9 +668,9 @@ def test_mint_interpolate_do_path_claims_checkpoint_and_writes_ckpt_id(monkeypat
 
 
 def test_mint_interpolate_do_path_marks_failed_checkpoint(monkeypatch, tmp_path) -> None:
-    from tinker_server.models.mint_types import InterpolateCheckpointsRequest
-    from tinker_server.routes import mint as mint_routes
-    import tinker_server.backend.mintx_ops as mintx_ops
+    from mint_server.models.mint_types import InterpolateCheckpointsRequest
+    from mint_server.routes import mint as mint_routes
+    import mint_server.backend.mintx_ops as mintx_ops
 
     task_futures = _StubTaskFutureService()
     failed_marks: list[tuple[str | None, str]] = []
@@ -715,9 +715,9 @@ def test_mint_interpolate_do_path_marks_failed_checkpoint(monkeypatch, tmp_path)
 
 
 def test_mint_interpolate_do_path_mark_failed_error_does_not_mask_root_failure(monkeypatch, tmp_path) -> None:
-    from tinker_server.models.mint_types import InterpolateCheckpointsRequest
-    from tinker_server.routes import mint as mint_routes
-    import tinker_server.backend.mintx_ops as mintx_ops
+    from mint_server.models.mint_types import InterpolateCheckpointsRequest
+    from mint_server.routes import mint as mint_routes
+    import mint_server.backend.mintx_ops as mintx_ops
 
     task_futures = _StubTaskFutureService()
 
@@ -761,9 +761,9 @@ def test_mint_interpolate_do_path_mark_failed_error_does_not_mask_root_failure(m
 
 
 def test_mint_reverse_kl_route_and_background_path(monkeypatch) -> None:
-    from tinker_server.routes import mint as mint_routes
-    from tinker_server.routes import training as training_routes
-    from tinker_server.models.mint_types import ForwardBackwardReverseKLRequest
+    from mint_server.routes import mint as mint_routes
+    from mint_server.routes import training as training_routes
+    from mint_server.models.mint_types import ForwardBackwardReverseKLRequest
 
     task_futures = _StubTaskFutureService()
     scheduler = _StubModelWorkScheduler()
@@ -829,7 +829,7 @@ def test_mint_reverse_kl_route_and_background_path(monkeypatch) -> None:
     monkeypatch.setattr(mint_routes, "_protect_training_session_enqueue_window", _noop_protect)
     monkeypatch.setattr(mint_routes, "_get_max_model_len", lambda _base_model: 2048, raising=False)
 
-    import tinker_server.backend.model_work_scheduler as mws
+    import mint_server.backend.model_work_scheduler as mws
 
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
     monkeypatch.setattr(training_routes, "_get_max_model_len", lambda _base_model: 2048)
@@ -905,8 +905,8 @@ def test_mint_reverse_kl_route_and_background_path(monkeypatch) -> None:
 
 
 def test_mint_reverse_kl_route_uses_detached_training_info_without_route_runtime(monkeypatch) -> None:
-    from tinker_server.routes import mint as mint_routes
-    from tinker_server.routes import training as training_routes
+    from mint_server.routes import mint as mint_routes
+    from mint_server.routes import training as training_routes
 
     task_futures = _StubTaskFutureService()
     scheduler = _StubModelWorkScheduler()
@@ -934,7 +934,7 @@ def test_mint_reverse_kl_route_uses_detached_training_info_without_route_runtime
     monkeypatch.setattr(mint_routes, "_protect_training_session_enqueue_window", _noop_protect)
     monkeypatch.setattr(mint_routes, "_get_route_training_store_info", _get_training_route_session_info)
 
-    import tinker_server.backend.model_work_scheduler as mws
+    import mint_server.backend.model_work_scheduler as mws
 
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
     monkeypatch.setattr(training_routes, "_get_max_model_len", lambda _base_model: 2048)
@@ -980,7 +980,7 @@ def test_mint_reverse_kl_route_uses_detached_training_info_without_route_runtime
 
 def test_mint_reverse_kl_route_propagates_detached_store_503(monkeypatch) -> None:
     from fastapi import HTTPException
-    from tinker_server.routes import mint as mint_routes
+    from mint_server.routes import mint as mint_routes
 
     async def _raise_store_error(_model_id: str):
         raise HTTPException(status_code=503, detail="Training session store unavailable")
@@ -1012,8 +1012,8 @@ def test_mint_reverse_kl_route_propagates_detached_store_503(monkeypatch) -> Non
     assert resp.status_code == 503, resp.text
     assert resp.json()["detail"] == "Training session store unavailable"
 def test_mint_reverse_kl_route_refreshes_detached_enqueue_protection(monkeypatch) -> None:
-    from tinker_server.routes import mint as mint_routes
-    from tinker_server.routes import training as training_routes
+    from mint_server.routes import mint as mint_routes
+    from mint_server.routes import training as training_routes
 
     task_futures = _StubTaskFutureService()
     scheduler = _StubModelWorkScheduler()
@@ -1042,7 +1042,7 @@ def test_mint_reverse_kl_route_refreshes_detached_enqueue_protection(monkeypatch
     monkeypatch.setattr(mint_routes, "_protect_training_session_enqueue_window", _protect_training_session_enqueue_window)
     monkeypatch.setattr(mint_routes, "_get_route_training_store_info", _get_training_route_session_info)
 
-    import tinker_server.backend.model_work_scheduler as mws
+    import mint_server.backend.model_work_scheduler as mws
 
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
     monkeypatch.setattr(training_routes, "_get_max_model_len", lambda _base_model: 2048)

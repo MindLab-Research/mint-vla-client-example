@@ -1,11 +1,11 @@
 import anyio
 import httpx
 
-import tinker_server.logging_context as logging_context
+import mint_server.logging_context as logging_context
 
 
 def test_issue_217_gateway_forward_json_reuses_client(monkeypatch):
-    import tinker_server.gateway as gw
+    import mint_server.gateway as gw
 
     class _DummyAsyncClient:
         created = 0
@@ -52,7 +52,7 @@ def test_issue_217_gateway_forward_json_reuses_client(monkeypatch):
 
 
 def test_issue_217_gateway_forwards_trace_headers(monkeypatch):
-    import tinker_server.gateway as gw
+    import mint_server.gateway as gw
 
     captured: dict[str, object] = {}
 

@@ -9,16 +9,16 @@ import uuid
 import requests
 
 
-GATEWAY_BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:10276").rstrip("/")
-UPSTREAM_BASE_URL = os.environ.get("TINKER_UPSTREAM_BASE_URL", "http://localhost:10277").rstrip("/")
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
-BASE_MODEL = os.environ.get("TINKER_MODEL", "Qwen/Qwen3-0.6B")
+GATEWAY_BASE_URL = os.environ.get("MINT_BASE_URL", "http://localhost:10276").rstrip("/")
+UPSTREAM_BASE_URL = os.environ.get("MINT_UPSTREAM_BASE_URL", "http://localhost:10277").rstrip("/")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
+BASE_MODEL = os.environ.get("MINT_MODEL", "Qwen/Qwen3-0.6B")
 MINT_DEV_HOST = os.environ.get("MINT_DEV_HOST", "mint-dev")
-RAY_ADDRESS = os.environ.get("TINKER_RAY_ADDRESS", "192.168.37.63:6379")
-GATEWAY_NAMESPACE = os.environ.get("TINKER_GATEWAY_NAMESPACE", "tinker_yiwen_issue_276_gateway")
-UPSTREAM_ALIAS = os.environ.get("TINKER_UPSTREAM_ALIAS", "issue276-upstream")
-CHECKPOINTS_DIR = os.environ.get("TINKER_CHECKPOINT_DIR", "/vePFS-Mindverse/share/tinker_checkpoints")
-HTTP_TIMEOUT_S = float(os.environ.get("TINKER_HTTP_TIMEOUT_S", "60"))
+RAY_ADDRESS = os.environ.get("MINT_RAY_ADDRESS", "192.168.37.63:6379")
+GATEWAY_NAMESPACE = os.environ.get("MINT_GATEWAY_NAMESPACE", "mint_yiwen_issue_276_gateway")
+UPSTREAM_ALIAS = os.environ.get("MINT_UPSTREAM_ALIAS", "issue276-upstream")
+CHECKPOINTS_DIR = os.environ.get("MINT_CHECKPOINT_DIR", "/vePFS-Mindverse/share/mint_checkpoints")
+HTTP_TIMEOUT_S = float(os.environ.get("MINT_HTTP_TIMEOUT_S", "60"))
 
 
 def _headers(*, user_agent: str | None = None) -> dict[str, str]:
@@ -70,13 +70,13 @@ def _make_training_archive(*, root: str, model_id: str) -> bytes:
 
 def _seed_gateway_remote_training_model(*, model_id: str) -> None:
     script = f"""
-cd /root/tinker_project/tinker-server-issue-276
+cd /root/mint_project/mint-server-issue-276
 env RAY_ADDRESS={RAY_ADDRESS} \
-PYTHONPATH=/root/tinker_project/tinker-server-issue-276 \
-TINKER_RAY_NAMESPACE={GATEWAY_NAMESPACE} \
+PYTHONPATH=/root/mint_project/mint-server-issue-276 \
+MINT_RAY_NAMESPACE={GATEWAY_NAMESPACE} \
 MINT_RAY_NAMESPACE={GATEWAY_NAMESPACE} \
 /root/venv_k2_py31213/bin/python - <<'PY'
-from tinker_server.backend import gateway_session_store
+from mint_server.backend import gateway_session_store
 gateway_session_store.upsert_training_model(
     model_id={model_id!r},
     upstream_alias={UPSTREAM_ALIAS!r},

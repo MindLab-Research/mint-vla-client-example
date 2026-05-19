@@ -1,6 +1,6 @@
-# tinker-server config file (TOML)
+# mint-server config file (TOML)
 
-`tinker-server` supports an optional TOML config file.
+`mint-server` supports an optional TOML config file.
 
 ## Location and precedence
 

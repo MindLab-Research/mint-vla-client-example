@@ -40,8 +40,8 @@ def anyio_backend():
 
 @pytest.mark.anyio
 async def test_issue_319_save_weights_for_sampler_rejects_invalid_checkpoint_name(monkeypatch, tmp_path: Path) -> None:
-    from tinker_server.models.types import SaveWeightsForSamplerRequest
-    from tinker_server.routes import training as tr
+    from mint_server.models.types import SaveWeightsForSamplerRequest
+    from mint_server.routes import training as tr
 
     async def _identity_materialize(session):
         return session
@@ -92,8 +92,8 @@ async def test_issue_319_save_weights_for_sampler_rejects_invalid_checkpoint_nam
 
 @pytest.mark.anyio
 async def test_issue_319_save_weights_for_sampler_fails_before_metadata(monkeypatch, tmp_path: Path) -> None:
-    from tinker_server.models.types import SaveWeightsForSamplerRequest
-    from tinker_server.routes import training as tr
+    from mint_server.models.types import SaveWeightsForSamplerRequest
+    from mint_server.routes import training as tr
 
     async def _identity_materialize(session):
         return session
@@ -159,8 +159,8 @@ async def test_issue_319_save_weights_for_sampler_fails_before_metadata(monkeypa
 async def test_issue_319_save_weights_for_sampler_mark_failed_error_does_not_mask_root_failure(
     monkeypatch, tmp_path: Path
 ) -> None:
-    from tinker_server.models.types import SaveWeightsForSamplerRequest
-    from tinker_server.routes import training as tr
+    from mint_server.models.types import SaveWeightsForSamplerRequest
+    from mint_server.routes import training as tr
 
     async def _identity_materialize(session):
         return session
@@ -228,8 +228,8 @@ async def test_issue_319_save_weights_for_sampler_mark_failed_error_does_not_mas
 async def test_issue_319_save_weights_for_sampler_rejects_corrupt_safetensors(
     monkeypatch, tmp_path: Path
 ) -> None:
-    from tinker_server.models.types import SaveWeightsForSamplerRequest
-    from tinker_server.routes import training as tr
+    from mint_server.models.types import SaveWeightsForSamplerRequest
+    from mint_server.routes import training as tr
 
     async def _identity_materialize(session):
         return session
@@ -293,8 +293,8 @@ async def test_issue_319_save_weights_for_sampler_rejects_corrupt_safetensors(
 
 @pytest.mark.anyio
 async def test_issue_319_save_state_fails_before_metadata(monkeypatch, tmp_path: Path) -> None:
-    from tinker_server.models.types import SaveStateRequest
-    from tinker_server.routes import weights as wt
+    from mint_server.models.types import SaveStateRequest
+    from mint_server.routes import weights as wt
 
     ckpt_dir = tmp_path / "training_missing_lora"
     _touch(ckpt_dir / "optimizer.pt", b"optimizer")
@@ -348,8 +348,8 @@ async def test_issue_319_save_state_fails_before_metadata(monkeypatch, tmp_path:
 async def test_issue_319_save_state_mark_failed_error_does_not_mask_root_failure(
     monkeypatch, tmp_path: Path
 ) -> None:
-    from tinker_server.models.types import SaveStateRequest
-    from tinker_server.routes import weights as wt
+    from mint_server.models.types import SaveStateRequest
+    from mint_server.routes import weights as wt
 
     ckpt_dir = tmp_path / "training_missing_lora_mark_failed"
     _touch(ckpt_dir / "optimizer.pt", b"optimizer")
@@ -408,8 +408,8 @@ async def test_issue_319_save_state_mark_failed_error_does_not_mask_root_failure
 async def test_issue_319_save_state_accepts_openpi_training_checkpoint_before_metadata(
     monkeypatch, tmp_path: Path
 ) -> None:
-    from tinker_server.models.types import SaveStateRequest
-    from tinker_server.routes import weights as wt
+    from mint_server.models.types import SaveStateRequest
+    from mint_server.routes import weights as wt
 
     ckpt_dir = tmp_path / "training_openpi"
     _touch(ckpt_dir / "1" / "params" / "_METADATA")
@@ -463,8 +463,8 @@ async def test_issue_319_save_state_accepts_openpi_training_checkpoint_before_me
 
 
 def test_issue_319_list_checkpoints_skips_invalid_sampler_dirs(monkeypatch, tmp_path: Path) -> None:
-    from tinker_server.checkpoints import write_checkpoint_metadata
-    from tinker_server.routes import weights as wt
+    from mint_server.checkpoints import write_checkpoint_metadata
+    from mint_server.routes import weights as wt
 
     root = tmp_path / "checkpoints"
     model_id = "run-319"
@@ -555,8 +555,8 @@ def test_issue_319_list_checkpoints_skips_invalid_sampler_dirs(monkeypatch, tmp_
 
 
 def test_issue_319_list_checkpoints_skips_shard_only_sampler_dirs(monkeypatch, tmp_path: Path) -> None:
-    from tinker_server.checkpoints import write_checkpoint_metadata
-    from tinker_server.routes import weights as wt
+    from mint_server.checkpoints import write_checkpoint_metadata
+    from mint_server.routes import weights as wt
 
     root = tmp_path / "checkpoints"
     model_id = "run-319-mismatch"
@@ -615,8 +615,8 @@ def test_issue_319_list_checkpoints_skips_shard_only_sampler_dirs(monkeypatch, t
 
 
 def test_issue_319_list_checkpoints_skips_corrupt_sampler_dirs(monkeypatch, tmp_path: Path) -> None:
-    from tinker_server.checkpoints import write_checkpoint_metadata
-    from tinker_server.routes import weights as wt
+    from mint_server.checkpoints import write_checkpoint_metadata
+    from mint_server.routes import weights as wt
 
     root = tmp_path / "checkpoints"
     model_id = "run-319-corrupt"

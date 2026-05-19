@@ -10,38 +10,38 @@ from typing import Any
 import requests
 
 
-BASE_URL = os.environ.get("TINKER_BASE_URL")
+BASE_URL = os.environ.get("MINT_BASE_URL")
 if not BASE_URL:
-    port = os.environ.get("TINKER_PORT", "10200")
+    port = os.environ.get("MINT_PORT", "10200")
     BASE_URL = f"http://localhost:{port}"
 BASE_URL = BASE_URL.rstrip("/")
 
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
 
-BASE_MODEL = os.environ.get("TINKER_BASE_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
+BASE_MODEL = os.environ.get("MINT_BASE_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
 
 # Must be a shared-filesystem path accessible to vLLM workers.
 # Default points at a deliberately NaN-corrupted adapter to deterministically hit
 # the non-finite sampled-token logprob path.
 MODEL_PATH = os.environ.get(
-    "TINKER_MODEL_PATH",
-    "/vePFS-Mindverse/share/tinker_checkpoints/issue_200_nan_adapter",
+    "MINT_MODEL_PATH",
+    "/vePFS-Mindverse/share/mint_checkpoints/issue_200_nan_adapter",
 ).strip()
 
 # Per official reference: -1 disables top-k.
-TOP_K = int(os.environ.get("TINKER_TOP_K", "-1"))
-TOP_P = float(os.environ.get("TINKER_TOP_P", "1.0"))
-TEMPERATURE = float(os.environ.get("TINKER_TEMPERATURE", "1.0"))
-MAX_TOKENS = int(os.environ.get("TINKER_MAX_TOKENS", "64"))
-NUM_SAMPLES = int(os.environ.get("TINKER_NUM_SAMPLES", "8"))
-NUM_ATTEMPTS = int(os.environ.get("TINKER_NUM_ATTEMPTS", "50"))
+TOP_K = int(os.environ.get("MINT_TOP_K", "-1"))
+TOP_P = float(os.environ.get("MINT_TOP_P", "1.0"))
+TEMPERATURE = float(os.environ.get("MINT_TEMPERATURE", "1.0"))
+MAX_TOKENS = int(os.environ.get("MINT_MAX_TOKENS", "64"))
+NUM_SAMPLES = int(os.environ.get("MINT_NUM_SAMPLES", "8"))
+NUM_ATTEMPTS = int(os.environ.get("MINT_NUM_ATTEMPTS", "50"))
 
-POLL_TIMEOUT_S = float(os.environ.get("TINKER_POLL_TIMEOUT_S", "1800"))
-POLL_SLEEP_S = float(os.environ.get("TINKER_POLL_SLEEP_S", "2.0"))
+POLL_TIMEOUT_S = float(os.environ.get("MINT_POLL_TIMEOUT_S", "1800"))
+POLL_SLEEP_S = float(os.environ.get("MINT_POLL_SLEEP_S", "2.0"))
 
-CREATE_SESSION_TIMEOUT_S = float(os.environ.get("TINKER_CREATE_SESSION_TIMEOUT_S", "30"))
-CREATE_SAMPLING_TIMEOUT_S = float(os.environ.get("TINKER_CREATE_SAMPLING_TIMEOUT_S", "120"))
-ASAMPLE_TIMEOUT_S = float(os.environ.get("TINKER_ASAMPLE_TIMEOUT_S", "60"))
+CREATE_SESSION_TIMEOUT_S = float(os.environ.get("MINT_CREATE_SESSION_TIMEOUT_S", "30"))
+CREATE_SAMPLING_TIMEOUT_S = float(os.environ.get("MINT_CREATE_SAMPLING_TIMEOUT_S", "120"))
+ASAMPLE_TIMEOUT_S = float(os.environ.get("MINT_ASAMPLE_TIMEOUT_S", "60"))
 
 
 def _headers() -> dict[str, str]:
@@ -63,7 +63,7 @@ def _post_json(path: str, payload: dict[str, Any], *, timeout_s: float) -> dict[
 
 
 def _get_prompt_tokens() -> list[int]:
-    raw = os.environ.get("TINKER_PROMPT_TOKENS", "").strip()
+    raw = os.environ.get("MINT_PROMPT_TOKENS", "").strip()
     if not raw:
         # Default: a minimal Qwen chat-template prompt that reliably generates
         # `max_tokens` outputs under normal conditions.

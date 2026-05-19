@@ -5,7 +5,7 @@
 1. `POST /api/v1/create_sampling_session` validates access and chooses `base_model`.
 2. `SessionManager.get_engine_for_model(base_model)` selects/creates a `MultiLoRAInferenceEngine` via `MultiModelInferenceManager`.
 3. `MultiLoRAInferenceEngine.initialize()` connects to an existing detached vLLM actor or creates a new one:
-  - `namespace=tinker_server.config.RAY_NAMESPACE` (from `MINT_RAY_NAMESPACE`) so actors can be rediscovered across server restarts.
+  - `namespace=mint_server.config.RAY_NAMESPACE` (from `MINT_RAY_NAMESPACE`) so actors can be rediscovered across server restarts.
   - detached lifetime so actors survive API server restarts.
   - registers the actor in `ModelActorInventory` for GPU accounting and observability.
 4. If a LoRA adapter is provided, the server loads weights and registers them for the session:
@@ -18,7 +18,7 @@
 ## Multi-node inference (multi-node TP or MoE TP>=4)
 
 `MultiModelInferenceManager.get_engine()` selects a different engine implementation when vLLM must run via Ray distributed execution:
-- `MultiNodeInferenceEngine` (in `tinker_server/backend/multinode_inference.py`) for:
+- `MultiNodeInferenceEngine` (in `mint_server/backend/multinode_inference.py`) for:
   - `config.total_gpus > 8` (true multi-node TP), or
   - `(config.is_moe and config.total_gpus >= 4)` (route MoE TP>=4 through the same engine even if it fits on one node).
 - `MultiLoRAInferenceEngine` otherwise.

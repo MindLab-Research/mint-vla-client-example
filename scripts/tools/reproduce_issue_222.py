@@ -12,7 +12,7 @@ def _fail(msg: str) -> int:
 def main() -> int:
     print(f"issue={ISSUE_NUMBER}")
 
-    from tinker_server.backend.vllm_stop import vllm_stop_kwargs
+    from mint_server.backend.vllm_stop import vllm_stop_kwargs
 
     # The prod issue shows trained models emitting a literal "\\n\\n" suffix (two chars: backslash+n)
     # after a JSON object, so stop="\n\n" (real newlines) does not terminate.

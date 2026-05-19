@@ -9,7 +9,7 @@ def anyio_backend() -> str:
 
 
 def test_issue_364_future_reaper_once_reaps_task_state(monkeypatch) -> None:
-    from tinker_server.backend import maintenance_cron_actor as ors
+    from mint_server.backend import maintenance_cron_actor as ors
 
     class _FakeTaskFutureService:
         async def async_ensure_started(self) -> dict:
@@ -20,7 +20,7 @@ def test_issue_364_future_reaper_once_reaps_task_state(monkeypatch) -> None:
 
     import importlib
 
-    task_state_store_module = importlib.import_module("tinker_server.backend.task_state_store")
+    task_state_store_module = importlib.import_module("mint_server.backend.task_state_store")
 
     monkeypatch.setattr(task_state_store_module, "task_futures", _FakeTaskFutureService())
 
@@ -33,7 +33,7 @@ def test_issue_364_future_reaper_once_reaps_task_state(monkeypatch) -> None:
 
 
 def test_issue_364_checkpoint_helpers_proxy_results(monkeypatch) -> None:
-    from tinker_server.backend import maintenance_cron_actor as ors
+    from mint_server.backend import maintenance_cron_actor as ors
 
     monkeypatch.setattr(ors, "reap_runtime_checkpoints", lambda: {"ephemeral": ["a"], "persistent_cache": [], "persistent": []})
     monkeypatch.setattr(ors, "process_pending_checkpoint_mirrors", lambda: {"mirrored": ["m1"], "failed": ["f1"]})
@@ -47,14 +47,14 @@ def test_issue_364_checkpoint_helpers_proxy_results(monkeypatch) -> None:
 
 
 def test_issue_364_training_cleanup_runner_proxies_results(monkeypatch) -> None:
-    from tinker_server.backend import maintenance_cron_actor as ors
+    from mint_server.backend import maintenance_cron_actor as ors
 
     class _FakeTrainingCleanupExecutor:
         async def async_cleanup_stale_sessions_once(self, *, stale_after_s=None):
             return ["model-a", "model-b"]
 
     monkeypatch.setattr(
-        "tinker_server.backend.training_cleanup_executor.training_cleanup_executor",
+        "mint_server.backend.training_cleanup_executor.training_cleanup_executor",
         _FakeTrainingCleanupExecutor(),
     )
 
@@ -62,7 +62,7 @@ def test_issue_364_training_cleanup_runner_proxies_results(monkeypatch) -> None:
 
 
 def test_issue_364_training_cleanup_runner_respects_disable_env(monkeypatch) -> None:
-    from tinker_server.backend import maintenance_cron_actor as ors
+    from mint_server.backend import maintenance_cron_actor as ors
 
     monkeypatch.setenv("MINT_TRAINING_HEARTBEAT_STALE_S", "0")
 
@@ -70,14 +70,14 @@ def test_issue_364_training_cleanup_runner_respects_disable_env(monkeypatch) -> 
 
 
 def test_issue_364_sampling_cleanup_runner_proxies_results(monkeypatch) -> None:
-    from tinker_server.backend import maintenance_cron_actor as ors
+    from mint_server.backend import maintenance_cron_actor as ors
 
     class _FakeSamplingCleanupExecutor:
         async def async_cleanup_stale_sessions_once(self):
             return ["sess-a", "sess-b"]
 
     monkeypatch.setattr(
-        "tinker_server.backend.sampling_cleanup_executor.sampling_cleanup_executor",
+        "mint_server.backend.sampling_cleanup_executor.sampling_cleanup_executor",
         _FakeSamplingCleanupExecutor(),
     )
 
@@ -87,8 +87,8 @@ def test_issue_364_sampling_cleanup_runner_proxies_results(monkeypatch) -> None:
 def test_issue_364_runtime_degraded_healthz() -> None:
     from fastapi.responses import JSONResponse
 
-    from tinker_server.health_checks import public_healthz_response
-    from tinker_server.health_state import clear_runtime_degraded_state, set_runtime_degraded_state
+    from mint_server.health_checks import public_healthz_response
+    from mint_server.health_state import clear_runtime_degraded_state, set_runtime_degraded_state
 
     clear_runtime_degraded_state()
     set_runtime_degraded_state(
@@ -118,7 +118,7 @@ def test_issue_364_runtime_degraded_healthz() -> None:
 
 @pytest.mark.anyio
 async def test_issue_364_internal_maintenance_cron_actor_health(monkeypatch) -> None:
-    from tinker_server.routes import internal
+    from mint_server.routes import internal
 
     class _FakeMaintenanceCronActor:
         async def async_health_snapshot(self, *, timeout_s: float = 10.0):
@@ -128,7 +128,7 @@ async def test_issue_364_internal_maintenance_cron_actor_health(monkeypatch) -> 
                 "timeout_s": float(timeout_s),
             }
 
-    monkeypatch.setattr("tinker_server.backend.maintenance_cron_actor.maintenance_cron_actor", _FakeMaintenanceCronActor())
+    monkeypatch.setattr("mint_server.backend.maintenance_cron_actor.maintenance_cron_actor", _FakeMaintenanceCronActor())
 
     out = await internal.maintenance_cron_actor_health()
 
@@ -139,7 +139,7 @@ async def test_issue_364_internal_maintenance_cron_actor_health(monkeypatch) -> 
 
 
 def test_issue_364_maintenance_cron_loop_snapshot_includes_error_details(monkeypatch):
-    from tinker_server.backend import maintenance_cron_actor as ors
+    from mint_server.backend import maintenance_cron_actor as ors
 
     actor_cls_box = {}
 

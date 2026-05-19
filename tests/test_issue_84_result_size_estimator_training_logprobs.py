@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from tinker_server.backend.result_size_estimator import estimate_forward_result_bytes
-from tinker_server.models.types import (
+from mint_server.backend.result_size_estimator import estimate_forward_result_bytes
+from mint_server.models.types import (
     Datum,
     EncodedTextChunk,
     ForwardBackwardInput,

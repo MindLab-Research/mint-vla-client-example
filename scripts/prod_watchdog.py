@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Watchdog for prod tinker-server-auth (server/ops side).
+"""Watchdog for prod mint-server-auth (server/ops side).
 
 `/api/v1/healthz` is the public API-worker readiness endpoint and should remain
 cheap. Trust it directly instead of falling back to root-path liveness.
@@ -50,7 +50,7 @@ def main() -> int:
     interval_s = float(os.environ.get("MINT_WATCHDOG_INTERVAL_S", "60"))
     fails_to_restart = int(os.environ.get("MINT_WATCHDOG_FAILS_TO_RESTART", "6"))
     restart_cooldown_s = float(os.environ.get("MINT_WATCHDOG_RESTART_COOLDOWN_S", "60"))
-    program = os.environ.get("MINT_WATCHDOG_PROGRAM", "tinker-server-auth")
+    program = os.environ.get("MINT_WATCHDOG_PROGRAM", "mint-server-auth")
 
     fails = 0
 

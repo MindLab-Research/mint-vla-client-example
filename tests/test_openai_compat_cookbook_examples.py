@@ -1,6 +1,6 @@
 # Run:
-#   cd /vePFS-Mindverse/share/code/leixiang/tinker-server
-#   /root/tinker_project/tinker-server/.venv31213/bin/pytest tests/test_openai_compat_cookbook_examples.py -v
+#   cd /vePFS-Mindverse/share/code/leixiang/mint-server
+#   /root/mint_project/mint-server/.venv31213/bin/pytest tests/test_openai_compat_cookbook_examples.py -v
 
 import anyio
 import httpx
@@ -9,11 +9,11 @@ from fastapi.testclient import TestClient
 from openai import AsyncOpenAI
 from types import SimpleNamespace
 
-from tinker_server.models.types import SampledSequence
-from tinker_server.routes import futures as futures_route
-from tinker_server.routes import openai_compat
-from tinker_server.routes import sampling as sampling_route
-from tinker_server.routes import service as service_route
+from mint_server.models.types import SampledSequence
+from mint_server.routes import futures as futures_route
+from mint_server.routes import openai_compat
+from mint_server.routes import sampling as sampling_route
+from mint_server.routes import service as service_route
 
 
 class _DummyTokenizer:
@@ -170,7 +170,7 @@ def test_openai_completions_supports_gateway_routed_base_model(monkeypatch):
     monkeypatch.setattr(openai_compat, "sample_once", sampling_route.sample_once)
     monkeypatch.setattr(sampling_route, "session_manager", None)
 
-    import tinker_server.gateway as gw
+    import mint_server.gateway as gw
 
     monkeypatch.setattr(
         gw,
@@ -325,7 +325,7 @@ def test_openai_completions_falls_back_to_service_session_manager(monkeypatch):
     monkeypatch.setattr(sampling_route, "_persist_usage_events", _fake_no_usage)
     monkeypatch.setattr(sampling_route, "build_billing_auth_context", lambda *_a, **_k: None)
 
-    import tinker_server.gateway as gw
+    import mint_server.gateway as gw
 
     async def _fake_async_remote_sampling_session(_sid: str):
         return None
@@ -407,7 +407,7 @@ def test_openai_completions_uses_detached_queue_when_route_session_managers_unbo
     monkeypatch.setattr(sampling_route, "asample", _fake_asample)
     monkeypatch.setattr(futures_route, "retrieve_future", _fake_retrieve_future)
 
-    import tinker_server.gateway as gw
+    import mint_server.gateway as gw
 
     async def _fake_async_remote_sampling_session(_sid: str):
         return None
@@ -491,7 +491,7 @@ def test_openai_chat_completions_uses_detached_queue_when_route_session_managers
     monkeypatch.setattr(sampling_route, "asample", _fake_asample)
     monkeypatch.setattr(futures_route, "retrieve_future", _fake_retrieve_future)
 
-    import tinker_server.gateway as gw
+    import mint_server.gateway as gw
 
     async def _fake_async_remote_sampling_session(_sid: str):
         return None
@@ -1637,7 +1637,7 @@ def test_session_cache_evicts_oldest_when_full(monkeypatch):
 def test_list_models_returns_oai_format(monkeypatch):
     """/models 端点返回 OpenAI 格式的 model 列表。"""
     monkeypatch.setattr(
-        "tinker_server.backend.model_registry.list_supported_models",
+        "mint_server.backend.model_registry.list_supported_models",
         lambda: ["Qwen/Qwen3-4B-Instruct-2507", "Qwen/Qwen3-30B-A3B-Instruct-2507"],
         raising=False,
     )
@@ -1658,7 +1658,7 @@ def test_list_models_returns_oai_format(monkeypatch):
 def test_retrieve_model_returns_oai_format(monkeypatch):
     """/models/{id} 端点返回单个 OpenAI model 对象。"""
     monkeypatch.setattr(
-        "tinker_server.backend.model_registry.list_supported_models",
+        "mint_server.backend.model_registry.list_supported_models",
         lambda: ["Qwen/Qwen3-4B-Instruct-2507", "Qwen/Qwen3-30B-A3B-Instruct-2507"],
         raising=False,
     )
@@ -1674,7 +1674,7 @@ def test_retrieve_model_returns_oai_format(monkeypatch):
 
 def test_retrieve_model_not_found_returns_oai_error_json(monkeypatch):
     monkeypatch.setattr(
-        "tinker_server.backend.model_registry.list_supported_models",
+        "mint_server.backend.model_registry.list_supported_models",
         lambda: ["Qwen/Qwen3-4B-Instruct-2507"],
         raising=False,
     )
@@ -1692,7 +1692,7 @@ def test_list_models_registry_error_returns_oai_error_json(monkeypatch):
         raise ValueError("bad config")
 
     monkeypatch.setattr(
-        "tinker_server.backend.model_registry.list_supported_models",
+        "mint_server.backend.model_registry.list_supported_models",
         _boom,
         raising=False,
     )

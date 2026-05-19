@@ -4,13 +4,13 @@ import asyncio
 
 import pytest
 
-from tinker_server.routes import internal as internal_routes
+from mint_server.routes import internal as internal_routes
 
 
 @pytest.mark.anyio
 async def test_issue_593_internal_model_visibility_endpoints(monkeypatch: pytest.MonkeyPatch) -> None:
-    import tinker_server.backend.model_actor_supervisor as supervisor_module
-    import tinker_server.backend.model_work_scheduler as scheduler_module
+    import mint_server.backend.model_actor_supervisor as supervisor_module
+    import mint_server.backend.model_work_scheduler as scheduler_module
 
     class _FakeScheduler:
         async def stats(self, *, timeout_s: float = 10.0) -> dict:

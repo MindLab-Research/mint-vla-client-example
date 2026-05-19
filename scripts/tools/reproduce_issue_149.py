@@ -12,23 +12,23 @@ from typing import Any
 import requests
 
 
-BASE_URL = os.environ.get("TINKER_BASE_URL")
+BASE_URL = os.environ.get("MINT_BASE_URL")
 if not BASE_URL:
-    port = os.environ.get("TINKER_PORT", "8000")
+    port = os.environ.get("MINT_PORT", "8000")
     BASE_URL = f"http://localhost:{port}"
 BASE_URL = BASE_URL.rstrip("/")
 
-ADMIN_API_KEY = os.environ.get("TINKER_ADMIN_API_KEY") or os.environ.get("TINKER_API_KEY", "")
+ADMIN_API_KEY = os.environ.get("MINT_ADMIN_API_KEY") or os.environ.get("MINT_API_KEY", "")
 
-TOKEN_SECRET_KEY = os.environ.get("TINKER_TOKEN_SECRET_KEY") or os.environ.get("TINKER_USER_TOKEN_SECRET_KEY") or ""
-USER_API_KEY = os.environ.get("TINKER_USER_API_KEY", "").strip()
-USER_ID = os.environ.get("TINKER_USER_ID", "issue_149_user")
+TOKEN_SECRET_KEY = os.environ.get("MINT_TOKEN_SECRET_KEY") or os.environ.get("MINT_USER_TOKEN_SECRET_KEY") or ""
+USER_API_KEY = os.environ.get("MINT_USER_API_KEY", "").strip()
+USER_ID = os.environ.get("MINT_USER_ID", "issue_149_user")
 
-MODEL = os.environ.get("TINKER_MODEL", "Qwen/Qwen3-0.6B")
-LORA_RANK = int(os.environ.get("TINKER_LORA_RANK", "16"))
+MODEL = os.environ.get("MINT_MODEL", "Qwen/Qwen3-0.6B")
+LORA_RANK = int(os.environ.get("MINT_LORA_RANK", "16"))
 
-POLL_TIMEOUT_S = float(os.environ.get("TINKER_POLL_TIMEOUT_S", "120"))
-POLL_SLEEP_S = float(os.environ.get("TINKER_POLL_SLEEP_S", "1.0"))
+POLL_TIMEOUT_S = float(os.environ.get("MINT_POLL_TIMEOUT_S", "120"))
+POLL_SLEEP_S = float(os.environ.get("MINT_POLL_SLEEP_S", "1.0"))
 
 GENERIC_ERROR_MESSAGE = "Operation failed. Contact administrator if issue persists."
 
@@ -82,7 +82,7 @@ def _assert_auth_enabled() -> None:
     if r.status_code == 200:
         raise RuntimeError(
             "auth appears disabled (GET /api/v1/get_server_capabilities returned 200 without API key). "
-            "Start the issue-scoped server with TINKER_API_KEY (admin) and TINKER_TOKEN_SECRET_KEY (for sk- tokens)."
+            "Start the issue-scoped server with MINT_API_KEY (admin) and MINT_TOKEN_SECRET_KEY (for sk- tokens)."
         )
     if r.status_code != 401:
         raise RuntimeError(f"unexpected auth probe status={r.status_code} body={r.text[:200]!r}")
@@ -93,8 +93,8 @@ def _get_user_api_key() -> str:
         return USER_API_KEY
     if not TOKEN_SECRET_KEY:
         raise RuntimeError(
-            "Need non-admin credentials: set TINKER_USER_API_KEY to a valid sk- token, "
-            "or set TINKER_TOKEN_SECRET_KEY (matching the server) so this script can mint one."
+            "Need non-admin credentials: set MINT_USER_API_KEY to a valid sk- token, "
+            "or set MINT_TOKEN_SECRET_KEY (matching the server) so this script can mint one."
         )
     try:
         from cryptography.hazmat.backends import default_backend
@@ -154,7 +154,7 @@ def main() -> int:
     archive_path: str | None = None
     try:
         if not ADMIN_API_KEY:
-            return _fail("missing admin key: set TINKER_API_KEY or TINKER_ADMIN_API_KEY")
+            return _fail("missing admin key: set MINT_API_KEY or MINT_ADMIN_API_KEY")
 
         _assert_auth_enabled()
         user_key = _get_user_api_key()

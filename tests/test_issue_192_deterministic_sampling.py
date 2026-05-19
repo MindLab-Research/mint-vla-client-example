@@ -3,9 +3,9 @@ from types import SimpleNamespace
 
 from fastapi import HTTPException
 
-from tinker_server.models.types import CreateSamplingSessionRequest, ModelInput, SampleRequest, SamplingParams
-from tinker_server.routes import sampling as sampling_route
-from tinker_server.routes import service as service_route
+from mint_server.models.types import CreateSamplingSessionRequest, ModelInput, SampleRequest, SamplingParams
+from mint_server.routes import sampling as sampling_route
+from mint_server.routes import service as service_route
 
 
 class _StubSessionManager:
@@ -145,8 +145,8 @@ def _dummy_request(user_id: str | None = None):
 def _install_detached_sampling_store(monkeypatch):
     detached_sessions: dict[str, dict] = {}
 
-    import tinker_server.backend.sampling_session_store as sss
-    import tinker_server.backend.session_index_store as sis
+    import mint_server.backend.sampling_session_store as sss
+    import mint_server.backend.session_index_store as sis
 
     def _upsert_sampling_session(info: dict) -> None:
         detached_sessions[str(info["session_id"])] = dict(info)
@@ -167,8 +167,8 @@ def test_create_sampling_session_deterministic_idempotent(monkeypatch):
     monkeypatch.setattr(service_route, "session_manager", stub)
     _install_detached_sampling_store(monkeypatch)
 
-    import tinker_server.supported_models_gate as gate
-    import tinker_server.gateway as gw
+    import mint_server.supported_models_gate as gate
+    import mint_server.gateway as gw
 
     async def _allow(base_model: str, http_request=None):
         return base_model
@@ -195,8 +195,8 @@ def test_create_sampling_session_conflict(monkeypatch):
     monkeypatch.setattr(service_route, "session_manager", stub)
     _install_detached_sampling_store(monkeypatch)
 
-    import tinker_server.supported_models_gate as gate
-    import tinker_server.gateway as gw
+    import mint_server.supported_models_gate as gate
+    import mint_server.gateway as gw
 
     async def _allow(base_model: str, http_request=None):
         return base_model
@@ -234,9 +234,9 @@ def test_create_sampling_session_keeps_generic_samplers_out_of_heartbeat_fanout(
 
     monkeypatch.setattr(service_route, "session_manager", stub)
 
-    import tinker_server.backend.session_index_store as sis
-    import tinker_server.supported_models_gate as gate
-    import tinker_server.gateway as gw
+    import mint_server.backend.session_index_store as sis
+    import mint_server.supported_models_gate as gate
+    import mint_server.gateway as gw
 
     async def _allow(base_model: str, http_request=None):
         return base_model
@@ -302,8 +302,8 @@ def test_asample_deterministic_request_id_dedup(monkeypatch):
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
     monkeypatch.setattr(sampling_route, "task_futures", stub_fs)
 
-    import tinker_server.backend.model_registry as model_registry
-    import tinker_server.backend.model_work_scheduler as mws
+    import mint_server.backend.model_registry as model_registry
+    import mint_server.backend.model_work_scheduler as mws
 
     monkeypatch.setattr(model_registry, "get_model_config", lambda _model: SimpleNamespace(max_model_len=4096))
     monkeypatch.setattr(mws, "model_work_scheduler", stub_scheduler)
@@ -337,8 +337,8 @@ def test_asample_sets_deterministic_request_id_in_logging_context_first(monkeypa
     monkeypatch.setattr(sampling_route, "task_futures", stub_fs)
     monkeypatch.setattr(sampling_route, "set_request_id", lambda rid: request_id_bindings.append(rid))
 
-    import tinker_server.backend.model_registry as model_registry
-    import tinker_server.backend.model_work_scheduler as mws
+    import mint_server.backend.model_registry as model_registry
+    import mint_server.backend.model_work_scheduler as mws
 
     monkeypatch.setattr(model_registry, "get_model_config", lambda _model: SimpleNamespace(max_model_len=4096))
     monkeypatch.setattr(mws, "model_work_scheduler", stub_scheduler)
@@ -364,8 +364,8 @@ def test_asample_duplicate_payload_conflict(monkeypatch):
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
     monkeypatch.setattr(sampling_route, "task_futures", stub_fs)
 
-    import tinker_server.backend.model_registry as model_registry
-    import tinker_server.backend.model_work_scheduler as mws
+    import mint_server.backend.model_registry as model_registry
+    import mint_server.backend.model_work_scheduler as mws
 
     monkeypatch.setattr(model_registry, "get_model_config", lambda _model: SimpleNamespace(max_model_len=4096))
     monkeypatch.setattr(mws, "model_work_scheduler", stub_scheduler)

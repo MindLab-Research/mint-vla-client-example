@@ -2,8 +2,8 @@ import asyncio
 
 import pytest
 
-from tinker_server.backend.session_manager import SessionManager
-from tinker_server.routes import sampling as sampling_route
+from mint_server.backend.session_manager import SessionManager
+from mint_server.routes import sampling as sampling_route
 
 
 class _FakeEngine:

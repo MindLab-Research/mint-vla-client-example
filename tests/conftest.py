@@ -86,7 +86,7 @@ _install_fake_ray()
 
 def _runtime_manifest() -> dict:
     runtime = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["tool"][
-        "tinker"
+        "mint"
     ]["runtime_env"]
     return {
         "runtime_env": {
@@ -100,7 +100,7 @@ def _runtime_manifest() -> dict:
 
 
 def _materialize_runtime_env(root: Path, *, with_host_python: bool) -> object:
-    from tinker_server.runtime_env import checkout_runtime_env_layout
+    from mint_server.runtime_env import checkout_runtime_env_layout
 
     layout = checkout_runtime_env_layout(str(root))
     root.mkdir(parents=True, exist_ok=True)
@@ -120,20 +120,20 @@ def _materialize_runtime_env(root: Path, *, with_host_python: bool) -> object:
 
 @pytest.fixture
 def configure_runtime_env(monkeypatch, tmp_path):
-    from tinker_server.runtime_env import bootstrap_runtime_pythonpath
+    from mint_server.runtime_env import bootstrap_runtime_pythonpath
 
     def _configure(*, with_host_python: bool = True) -> dict[str, object]:
         env_root = tmp_path / "runtime"
         layout = _materialize_runtime_env(env_root, with_host_python=with_host_python)
-        tinker_root = tmp_path / "repo"
+        mint_root = tmp_path / "repo"
         hf_modules = tmp_path / "hf-modules"
         hf_home = tmp_path / "hf-home"
         openpi_data_home = tmp_path / "openpi-cache"
-        for path in (tinker_root, hf_modules, hf_home, openpi_data_home):
+        for path in (mint_root, hf_modules, hf_home, openpi_data_home):
             path.mkdir(parents=True, exist_ok=True)
 
         monkeypatch.setenv("PFS_RUNTIME_ENV_ROOT", str(env_root))
-        monkeypatch.setenv("MINT_CODE_ROOT", str(tinker_root))
+        monkeypatch.setenv("MINT_CODE_ROOT", str(mint_root))
         monkeypatch.setenv("PFS_HF_MODULES_PATH", str(hf_modules))
         monkeypatch.setenv("HF_HOME", str(hf_home))
         monkeypatch.setenv("HF_HUB_OFFLINE", "1")
@@ -153,7 +153,7 @@ def configure_runtime_env(monkeypatch, tmp_path):
         return {
             "env_root": env_root,
             "layout": layout,
-            "tinker_root": tinker_root,
+            "mint_root": mint_root,
             "hf_modules": hf_modules,
             "hf_home": hf_home,
             "openpi_data_home": openpi_data_home,

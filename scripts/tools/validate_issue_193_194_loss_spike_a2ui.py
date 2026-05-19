@@ -209,8 +209,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-path", type=Path, required=True)
     parser.add_argument("--train-data", type=Path, default=_default_cover_path("train_v4.json"))
     parser.add_argument("--eval-data", type=Path, default=_default_cover_path("eval_v4.json"))
-    parser.add_argument("--base-url", default=os.environ.get("TINKER_BASE_URL", "http://localhost:8000"))
-    parser.add_argument("--api-key", default=os.environ.get("TINKER_API_KEY", "dummy"))
+    parser.add_argument("--base-url", default=os.environ.get("MINT_BASE_URL", "http://localhost:8000"))
+    parser.add_argument("--api-key", default=os.environ.get("MINT_API_KEY", "dummy"))
     parser.add_argument("--model-name", default="Qwen/Qwen3-30B-A3B-Instruct-2507")
     parser.add_argument("--renderer-name", default=None)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -309,7 +309,7 @@ def main() -> int:
         print(f"[run] cwd={args.a2ui_repo_path}")
         print(f"[run] command={' '.join(command)}")
         env = os.environ.copy()
-        env["TINKER_API_KEY"] = args.api_key
+        env["MINT_API_KEY"] = args.api_key
         completed = subprocess.run(command, cwd=args.a2ui_repo_path, env=env, check=False)
         if completed.returncode != 0:
             print(f"[error] training exited with code {completed.returncode}", file=sys.stderr)

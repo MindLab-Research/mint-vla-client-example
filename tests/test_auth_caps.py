@@ -1,13 +1,13 @@
 from types import SimpleNamespace
 
-from tinker_server.auth_identity import (
+from mint_server.auth_identity import (
     can_bypass_ownership_user_data,
     can_manage_system_user_data,
     can_view_internal_errors_user_data,
     can_write_user_data,
 )
-from tinker_server.gateway_auth import GatewayAuthContext, build_billing_auth_context, extract_gateway_auth_context_from_headers, has_gateway_auth_headers
-from tinker_server.routes import futures as futures_route
+from mint_server.gateway_auth import GatewayAuthContext, build_billing_auth_context, extract_gateway_auth_context_from_headers, has_gateway_auth_headers
+from mint_server.routes import futures as futures_route
 
 
 def test_extract_gateway_auth_context_accepts_explicit_caps_without_role():

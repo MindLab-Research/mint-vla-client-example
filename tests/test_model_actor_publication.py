@@ -3,9 +3,9 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Any
 
-from tinker_server.backend import model_actor_publication as publication
-from tinker_server.backend import model_actor_supervisor as supervisor_mod
-from tinker_server.backend.model_actor_inventory import ActorType
+from mint_server.backend import model_actor_publication as publication
+from mint_server.backend import model_actor_supervisor as supervisor_mod
+from mint_server.backend.model_actor_inventory import ActorType
 
 
 class _Supervisor:

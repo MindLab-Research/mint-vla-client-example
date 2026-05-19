@@ -45,7 +45,7 @@ def _mk_checkpoint_view(
 
 
 def test_checkpoint_namespace_resolution_prefers_typed_view(tmp_path, monkeypatch) -> None:
-    from tinker_server import checkpoints
+    from mint_server import checkpoints
 
     persistent_root = tmp_path / "tos"
     runtime_root = tmp_path / "runtime"
@@ -81,7 +81,7 @@ def test_checkpoint_namespace_resolution_prefers_typed_view(tmp_path, monkeypatc
 
 
 def test_checkpoint_namespace_resolution_falls_back_to_legacy_flat_dir(tmp_path, monkeypatch) -> None:
-    from tinker_server import checkpoints
+    from mint_server import checkpoints
 
     persistent_root = tmp_path / "tos"
     runtime_root = tmp_path / "runtime"
@@ -105,7 +105,7 @@ def test_checkpoint_namespace_resolution_falls_back_to_legacy_flat_dir(tmp_path,
 
 
 def test_checkpoint_namespace_resolution_allows_legacy_anonymous_cache(tmp_path, monkeypatch) -> None:
-    from tinker_server import checkpoints
+    from mint_server import checkpoints
 
     persistent_root = tmp_path / "tos"
     runtime_root = tmp_path / "runtime"
@@ -129,7 +129,7 @@ def test_checkpoint_namespace_resolution_allows_legacy_anonymous_cache(tmp_path,
 
 
 def test_checkpoint_namespace_rejects_untyped_uri(tmp_path, monkeypatch) -> None:
-    from tinker_server import checkpoints
+    from mint_server import checkpoints
 
     persistent_root = tmp_path / "tos"
     runtime_root = tmp_path / "runtime"
@@ -154,7 +154,7 @@ def test_checkpoint_namespace_rejects_untyped_uri(tmp_path, monkeypatch) -> None
 
 
 def test_checkpoint_namespace_reap_typed_ephemeral_leaf(monkeypatch) -> None:
-    from tinker_server import checkpoints
+    from mint_server import checkpoints
 
     with TemporaryDirectory() as td:
         root = Path(td)
@@ -184,8 +184,8 @@ def test_checkpoint_namespace_reap_typed_ephemeral_leaf(monkeypatch) -> None:
 
 
 def test_checkpoint_namespace_list_exposes_training_and_sampler_views(tmp_path: Path, monkeypatch) -> None:
-    from tinker_server import checkpoints
-    from tinker_server.routes import weights as weights_routes
+    from mint_server import checkpoints
+    from mint_server.routes import weights as weights_routes
 
     weights_routes.CHECKPOINTS_DIR = str(tmp_path)
     checkpoints.CHECKPOINTS_DIR = str(tmp_path)
@@ -251,8 +251,8 @@ def test_checkpoint_namespace_list_exposes_training_and_sampler_views(tmp_path: 
 
 
 def test_checkpoint_namespace_archive_prefers_requested_type(tmp_path: Path) -> None:
-    from tinker_server import checkpoints
-    from tinker_server.routes import weights as weights_routes
+    from mint_server import checkpoints
+    from mint_server.routes import weights as weights_routes
 
     weights_routes.CHECKPOINTS_DIR = str(tmp_path)
     checkpoints.CHECKPOINTS_DIR = str(tmp_path)

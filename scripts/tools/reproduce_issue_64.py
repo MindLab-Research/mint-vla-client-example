@@ -8,9 +8,9 @@ from typing import Any
 
 import requests
 
-BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000").rstrip("/")
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
-SSH_HOST = os.environ.get("TINKER_SSH_HOST", "volcano")
+BASE_URL = os.environ.get("MINT_BASE_URL", "http://localhost:8000").rstrip("/")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
+SSH_HOST = os.environ.get("MINT_SSH_HOST", "volcano")
 
 
 def _headers() -> dict[str, str]:
@@ -33,7 +33,7 @@ def _get_json(url: str, *, timeout_s: float = 60.0) -> dict[str, Any]:
 
 
 def _infer_remote_log_dir() -> str:
-    v = os.environ.get("TINKER_USAGE_LOG_DIR")
+    v = os.environ.get("MINT_USAGE_LOG_DIR")
     if v:
         return v
 
@@ -45,13 +45,13 @@ def _infer_remote_log_dir() -> str:
             .get("target")
         )
         if isinstance(stdout_target, str):
-            m = re.search(r"/tmp/tinker_server_issue_(\d+)\.log$", stdout_target)
+            m = re.search(r"/tmp/mint_server_issue_(\d+)\.log$", stdout_target)
             if m:
-                return f"/tmp/tinker_usage_issue_{m.group(1)}"
+                return f"/tmp/mint_usage_issue_{m.group(1)}"
     except Exception:
         pass
 
-    return "/tmp/tinker_usage"
+    return "/tmp/mint_usage"
 
 
 def _ssh_write_usage_logs(*, user_id: str, date_str: str, remote_log_dir: str) -> None:

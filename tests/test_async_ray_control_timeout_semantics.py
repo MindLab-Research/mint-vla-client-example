@@ -17,7 +17,7 @@ class _FutureRayRef:
 def test_async_get_ray_ref_timeout_does_not_cancel_ray_future() -> None:
     import ray
 
-    from tinker_server.backend.async_ray_control import async_get_ray_ref
+    from mint_server.backend.async_ray_control import async_get_ray_ref
 
     fut: concurrent.futures.Future = concurrent.futures.Future()
 
@@ -33,7 +33,7 @@ def test_async_get_ray_ref_timeout_does_not_cancel_ray_future() -> None:
 
 
 def test_async_get_ray_ref_cancellation_silences_late_exception(monkeypatch) -> None:
-    from tinker_server.backend import async_ray_control
+    from mint_server.backend import async_ray_control
 
     discarded: list[str] = []
 
@@ -72,7 +72,7 @@ def test_async_get_ray_ref_cancellation_silences_late_exception(monkeypatch) -> 
 
 
 def test_async_get_ray_ref_prefers_future_bridge_over_direct_await() -> None:
-    from tinker_server.backend.async_ray_control import async_get_ray_ref
+    from mint_server.backend.async_ray_control import async_get_ray_ref
 
     fut: concurrent.futures.Future = concurrent.futures.Future()
     fut.set_result("ok")
@@ -87,7 +87,7 @@ def test_async_get_ray_ref_prefers_future_bridge_over_direct_await() -> None:
 def test_sync_get_ray_ref_timeout_does_not_cancel_ray_future() -> None:
     import ray
 
-    from tinker_server.backend.async_ray_control import sync_get_ray_ref
+    from mint_server.backend.async_ray_control import sync_get_ray_ref
 
     fut: concurrent.futures.Future = concurrent.futures.Future()
 
@@ -99,7 +99,7 @@ def test_sync_get_ray_ref_timeout_does_not_cancel_ray_future() -> None:
 
 
 def test_sync_get_ray_ref_prefers_future_bridge_over_direct_await() -> None:
-    from tinker_server.backend.async_ray_control import sync_get_ray_ref
+    from mint_server.backend.async_ray_control import sync_get_ray_ref
 
     fut: concurrent.futures.Future = concurrent.futures.Future()
     fut.set_result("ok")
@@ -112,7 +112,7 @@ def test_sync_get_ray_ref_prefers_future_bridge_over_direct_await() -> None:
 
 
 def test_sync_get_ray_ref_awaitable_inside_running_loop() -> None:
-    from tinker_server.backend.async_ray_control import sync_get_ray_ref
+    from mint_server.backend.async_ray_control import sync_get_ray_ref
 
     async def _value() -> str:
         await asyncio.sleep(0)
@@ -125,7 +125,7 @@ def test_sync_get_ray_ref_awaitable_inside_running_loop() -> None:
 
 
 def test_sync_get_ray_ref_done_asyncio_future_inside_running_loop() -> None:
-    from tinker_server.backend.async_ray_control import sync_get_ray_ref
+    from mint_server.backend.async_ray_control import sync_get_ray_ref
 
     async def _run() -> str:
         fut = asyncio.get_running_loop().create_future()
@@ -136,7 +136,7 @@ def test_sync_get_ray_ref_done_asyncio_future_inside_running_loop() -> None:
 
 
 def test_sync_get_ray_ref_pending_asyncio_future_inside_running_loop_fails_fast() -> None:
-    from tinker_server.backend.async_ray_control import sync_get_ray_ref
+    from mint_server.backend.async_ray_control import sync_get_ray_ref
 
     async def _run() -> None:
         fut = asyncio.get_running_loop().create_future()

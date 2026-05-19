@@ -51,7 +51,7 @@ Hard rules:
 - Never substitute requirements. If reproduction fails, fix the real failure.
 - Restart the issue-scoped dev server after code changes (Python server does not hot-reload).
 - Do not stop/replace the default dev server. Auto-bugfix runs on an issue-specific port and issue-specific server root.
-- Never create/get/kill Ray actors outside the active `TINKER_RAY_NAMESPACE` unless the user explicitly requests cross-namespace action.
+- Never create/get/kill Ray actors outside the active `MINT_RAY_NAMESPACE` unless the user explicitly requests cross-namespace action.
 - Do not modify git config (no `git config ...`). Commit identity must be set per command.
 - Orchestrator, bugfixer, and reviewer MUST read the entire issue thread (body + all comments) before coding/reviewing.
   If the issue references another issue/PR for context, read that too before acting.
@@ -186,28 +186,28 @@ fi
 Use `mint-dev` for shared dev constraints and definitions. Do not reuse its start/stop/log commands because this skill must not stop or replace the default dev server.
 
 Namespace goal: isolate Ray actor state per issue while requiring post-issue cleanup so detached actors do not proliferate.
-`mint-dev` documents `TINKER_RAY_NAMESPACE` for this.
+`mint-dev` documents `MINT_RAY_NAMESPACE` for this.
 Hard rules:
 - Do not kill or manipulate actors in other namespaces to "free GPUs" unless the user explicitly requests it.
-- Use issue-specific `TINKER_RAY_NAMESPACE` (do not reuse across issues).
+- Use issue-specific `MINT_RAY_NAMESPACE` (do not reuse across issues).
 - Kill all actors in the issue namespace at the end of the issue (and before starting the issue-scoped server if rerunning) so detached actors do not accumulate.
 
 Example issue-specific namespace + issue-specific server checkout:
 ```bash
 export ISSUE=123
-export TINKER_RAY_NAMESPACE="tinker_${USER}_issue_${ISSUE}"
-export PFS_TINKER_PATH="/vePFS-Mindverse/share/mint/dev/tmp/issue-$ISSUE/mint-server"
-export TINKER_PORT="$((10000 + ISSUE % 5000))"
+export MINT_RAY_NAMESPACE="mint_${USER}_issue_${ISSUE}"
+export MINT_CODE_ROOT="/vePFS-Mindverse/share/mint/dev/tmp/issue-$ISSUE/mint-server"
+export MINT_PORT="$((10000 + ISSUE % 5000))"
 ```
 
 Namespace cleanup (run before starting the issue-scoped server, and after finishing the issue):
 ```bash
-# Pass `TINKER_RAY_NAMESPACE` explicitly (ssh does not forward local env by default).
-ssh mint-dev "TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' MINT_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' python3 -c \"
+# Pass `MINT_RAY_NAMESPACE` explicitly (ssh does not forward local env by default).
+ssh mint-dev "MINT_RAY_NAMESPACE='${MINT_RAY_NAMESPACE:?unset}' python3 -c \"
 import os
 import ray
 ray.init(address=\"auto\", ignore_reinit_error=True)
-ns = os.environ[\"TINKER_RAY_NAMESPACE\"]
+ns = os.environ[\"MINT_RAY_NAMESPACE\"]
 actors = ray.util.list_named_actors(all_namespaces=True)
 killed = 0
 for a in actors:
@@ -226,15 +226,15 @@ Issue-specific code update uses git. Push the branch, then clone or update the
 server checkout on `mint-dev`:
 ```bash
 git push -u origin HEAD
-PFS_TINKER_PARENT="${PFS_TINKER_PATH%/*}"
-ssh mint-dev "mkdir -p '$PFS_TINKER_PARENT'"
-ssh mint-dev "if [ ! -d '$PFS_TINKER_PATH/.git' ]; then git clone https://github.com/MindLab-Research/mint.git '$PFS_TINKER_PATH'; fi"
-ssh mint-dev "cd '$PFS_TINKER_PATH' && git fetch origin && git checkout '$BRANCH' && git pull --ff-only origin '$BRANCH' && git rev-parse HEAD"
+MINT_CODE_PARENT="${MINT_CODE_ROOT%/*}"
+ssh mint-dev "mkdir -p '$MINT_CODE_PARENT'"
+ssh mint-dev "if [ ! -d '$MINT_CODE_ROOT/.git' ]; then git clone https://github.com/MindLab-Research/mint.git '$MINT_CODE_ROOT'; fi"
+ssh mint-dev "cd '$MINT_CODE_ROOT' && git fetch origin && git checkout '$BRANCH' && git pull --ff-only origin '$BRANCH' && git rev-parse HEAD"
 ```
 
 Issue-specific server root on mint-dev:
 ```bash
-ssh mint-dev "ln -sfn $PFS_TINKER_PATH /root/tinker_project/tinker-server-issue-$ISSUE"
+ssh mint-dev "mkdir -p /root/mint_project && ln -sfn $MINT_CODE_ROOT /root/mint_project/mint-server-issue-$ISSUE"
 ```
 
 Start an issue-scoped dev server (does not touch the default dev server on port 8000):
@@ -242,38 +242,37 @@ Start an issue-scoped dev server (does not touch the default dev server on port 
 ssh mint-dev "cat > /share/mint/dev/tmp/start_issue_$ISSUE.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-cd '$PFS_TINKER_PATH'
+cd '$MINT_CODE_ROOT'
 set -a
 . /share/mint/dev/config/common.env
 if [ -f /share/mint/dev/config/secrets.env ]; then
   . /share/mint/dev/config/secrets.env
 fi
 set +a
-export PFS_TINKER_PATH='$PFS_TINKER_PATH'
-export TINKER_RAY_NAMESPACE='$TINKER_RAY_NAMESPACE'
-export MINT_RAY_NAMESPACE='$TINKER_RAY_NAMESPACE'
-export TINKER_PORT='$TINKER_PORT'
-export TINKER_USAGE_LOG_DIR='/tmp/tinker_usage_issue_$ISSUE'
+export MINT_CODE_ROOT='$MINT_CODE_ROOT'
+export MINT_RAY_NAMESPACE='$MINT_RAY_NAMESPACE'
+export MINT_PORT='$MINT_PORT'
+export MINT_USAGE_LOG_DIR='/tmp/mint_usage_issue_$ISSUE'
 exec /share/mint/dev/runtime/host-venv/bin/python scripts/run_server.py
 SH
 chmod +x /share/mint/dev/tmp/start_issue_$ISSUE.sh
-nohup /share/mint/dev/tmp/start_issue_$ISSUE.sh >> /tmp/tinker_server_issue_$ISSUE.log 2>&1 & echo \$! > /tmp/tinker_server_issue_$ISSUE.pid"
+nohup /share/mint/dev/tmp/start_issue_$ISSUE.sh >> /tmp/mint_server_issue_$ISSUE.log 2>&1 & echo \$! > /tmp/mint_server_issue_$ISSUE.pid"
 ```
 
 Issue-scoped health check (via local SSH tunnel):
 ```bash
-ssh -f -N -L ${TINKER_PORT}:localhost:${TINKER_PORT} mint-dev
-curl http://localhost:$TINKER_PORT/api/v1/healthz
+ssh -f -N -L ${MINT_PORT}:localhost:${MINT_PORT} mint-dev
+curl http://localhost:$MINT_PORT/api/v1/healthz
 ```
 
 Issue-scoped logs:
 ```bash
-ssh mint-dev "tail -50 /tmp/tinker_server_issue_$ISSUE.log"
+ssh mint-dev "tail -50 /tmp/mint_server_issue_$ISSUE.log"
 ```
 
 Issue-scoped stop:
 ```bash
-ssh mint-dev "test -f /tmp/tinker_server_issue_$ISSUE.pid && xargs -r kill < /tmp/tinker_server_issue_$ISSUE.pid || true"
+ssh mint-dev "test -f /tmp/mint_server_issue_$ISSUE.pid && xargs -r kill < /tmp/mint_server_issue_$ISSUE.pid || true"
 ```
 
 ### 3c) Delegate the fix to a bugfixer subagent
@@ -283,8 +282,8 @@ Spawn a subagent using `.claude/skills/auto-bugfix/prompts/bugfixer.md`.
 Inputs to bugfixer:
 - issue number and URL
 - branch name
-- chosen `TINKER_RAY_NAMESPACE`
-- chosen `PFS_TINKER_PATH`
+- chosen `MINT_RAY_NAMESPACE`
+- chosen `MINT_CODE_ROOT`
 
 Bugfixer deliverable back to orchestrator:
 - a short issue digest (3-8 bullets) summarizing the problem + constraints, citing specific issue comment(s) (URL or quoted detail). If the issue has 2+ comments, cite at least 2 comments.
@@ -301,10 +300,10 @@ Use the `bugfix` workflow:
 - Create an environment-agnostic reproduction script: `scripts/tools/reproduce_issue_<NUMBER>.py` that exercises the system (no source inspection, no stubs).
   - If the bug is observable via an HTTP endpoint, the repro must call that endpoint against the running issue-scoped server (not internal helpers).
   - If the production path uses Ray, the repro must run against a server connected to Ray and must not bypass/stub Ray.
-- Run it against the issue-scoped dev server (`TINKER_BASE_URL=http://localhost:$TINKER_PORT`, `TINKER_API_KEY=dummy`) and capture output.
+- Run it against the issue-scoped dev server (`MINT_BASE_URL=http://localhost:$MINT_PORT`, `MINT_API_KEY=dummy`) and capture output.
 - Require: FAIL on old code, PASS on new code (same command line).
 - After the fix, run a baseline integrated smoke check:
-  - `TINKER_BASE_URL=http://localhost:$TINKER_PORT TINKER_API_KEY=dummy python scripts/tools/smoke.py service`
+  - `MINT_BASE_URL=http://localhost:$MINT_PORT MINT_API_KEY=dummy python scripts/tools/smoke.py service`
 - Post the reproduction command(s) and observed output in the PR (so review does not rely on trust).
 
 ### 3e) Bugfixer: Fix issue
@@ -314,11 +313,11 @@ Implement the minimal root-cause fix.
 After code changes:
 1) push the branch and update the issue checkout on `mint-dev` with git
 2) if the change touches code that can be imported/executed inside detached actors, run the 3b "Namespace cleanup" snippet to kill the issue namespace actors so the next run loads new code:
-   - vLLM: `tinker_server/backend/verl_inference.py`, `tinker_server/backend/multi_lora_engine.py`, `tinker_server/backend/multinode_inference.py`, `tinker_server/backend/vllm_*.py`
-   - Megatron: `tinker_server/backend/megatron_distributed.py`, `tinker_server/backend/megatron_training.py`, `tinker_server/backend/verl_patches.py`
-   - Dense training pool: `tinker_server/backend/verl_training.py`
-   - Detached stores/schedulers: `tinker_server/backend/task_state_store.py`, `tinker_server/backend/model_work_scheduler.py`, `tinker_server/backend/model_runtime_actor.py`, `tinker_server/backend/training_session_store.py`, `tinker_server/backend/gateway_session_store.py`
-   - Shared (kills required for all GPU actor types): `tinker_server/config.py`, `tinker_server/ray_utils.py`, `tinker_server/backend/ray_kill.py`, `tinker_server/backend/model_registry.py`
+   - vLLM: `mint_server/backend/verl_inference.py`, `mint_server/backend/multi_lora_engine.py`, `mint_server/backend/multinode_inference.py`, `mint_server/backend/vllm_*.py`
+   - Megatron: `mint_server/backend/megatron_distributed.py`, `mint_server/backend/megatron_training.py`, `mint_server/backend/verl_patches.py`
+   - Dense training pool: `mint_server/backend/verl_training.py`
+   - Detached stores/schedulers: `mint_server/backend/task_state_store.py`, `mint_server/backend/model_work_scheduler.py`, `mint_server/backend/model_runtime_actor.py`, `mint_server/backend/training_session_store.py`, `mint_server/backend/gateway_session_store.py`
+   - Shared (kills required for all GPU actor types): `mint_server/config.py`, `mint_server/ray_utils.py`, `mint_server/backend/ray_kill.py`, `mint_server/backend/model_registry.py`
    - If uncertain: run namespace cleanup (issue namespace makes this safe).
 3) restart the issue-scoped dev server (stop/start using the issue-scoped commands in 3b)
 4) confirm health endpoint

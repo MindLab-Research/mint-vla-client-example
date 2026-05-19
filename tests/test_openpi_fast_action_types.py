@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from tinker_server.models.types import (
+from mint_server.models.types import (
     ActRequest,
     ActResponse,
     CreateActionSessionRequest,

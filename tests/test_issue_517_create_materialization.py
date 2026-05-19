@@ -4,13 +4,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from tinker_server.backend.training_session_manager import (
+from mint_server.backend.training_session_manager import (
     MATERIALIZATION_STATE_READY,
     MATERIALIZATION_STATE_UNMATERIALIZED,
     TrainingSessionManager,
 )
-from tinker_server.models.types import CreateModelRequest, ForwardBackwardInput, ForwardBackwardRequest, LoRAConfig
-from tinker_server.routes import training as training_route
+from mint_server.models.types import CreateModelRequest, ForwardBackwardInput, ForwardBackwardRequest, LoRAConfig
+from mint_server.routes import training as training_route
 
 
 @pytest.fixture
@@ -79,11 +79,11 @@ async def test_issue_517_do_create_model_persists_unmaterialized_session_without
     )
     monkeypatch.setattr(training_route, "_best_effort_local_tokenizer_metadata_for_session", _best_effort_tokenizer_metadata)
     monkeypatch.setattr(
-        "tinker_server.backend.training_session_store.async_upsert_training_session",
+        "mint_server.backend.training_session_store.async_upsert_training_session",
         _async_upsert_training_session,
     )
     monkeypatch.setattr(
-        "tinker_server.backend.session_index_store.add_training_run_to_session",
+        "mint_server.backend.session_index_store.add_training_run_to_session",
         lambda **_kwargs: None,
     )
     monkeypatch.setattr(
@@ -168,7 +168,7 @@ async def test_issue_517_forward_backward_materializes_unmaterialized_session_on
     monkeypatch.setattr(training_route, "training_engine", engine)
     monkeypatch.setattr(training_route, "_collect_control_plane_tokenizer_metadata", _collect_tokenizer_metadata)
     monkeypatch.setattr(
-        "tinker_server.backend.training_session_store.async_upsert_training_session",
+        "mint_server.backend.training_session_store.async_upsert_training_session",
         _async_upsert_training_session,
     )
     monkeypatch.setattr(training_route, "_get_max_model_len", lambda _base_model: 4096)
@@ -208,16 +208,16 @@ def test_issue_517_build_create_scheduler_extra_uses_control_plane_lane_only_for
         training_op="create_model_from_state",
     )
 
-    assert extra_create["scheduler_domain"] == "megatron:megatron_qwen3_235b_a22b_instruct_2507"
-    assert extra_restore["scheduler_domain"] == "megatron:megatron_qwen3_235b_a22b_instruct_2507"
+    assert extra_create["scheduler_domain"] == "megatron:mint_megatron_qwen3_235b_a22b_instruct_2507"
+    assert extra_restore["scheduler_domain"] == "megatron:mint_megatron_qwen3_235b_a22b_instruct_2507"
 
 
 @pytest.mark.anyio
 async def test_issue_517_create_model_route_enqueues_without_local_training_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import tinker_server.gateway as gateway_module
-    import tinker_server.supported_models_gate as supported_models_gate_module
+    import mint_server.gateway as gateway_module
+    import mint_server.supported_models_gate as supported_models_gate_module
 
     enqueued: dict[str, object] = {}
 
@@ -241,7 +241,7 @@ async def test_issue_517_create_model_route_enqueues_without_local_training_runt
     monkeypatch.setattr(supported_models_gate_module, "enforce_base_model_allowed", _allow_model)
     monkeypatch.setattr(gateway_module, "upstream_for_model", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(gateway_module, "get_gateway_config", lambda: None)
-    monkeypatch.setattr("tinker_server.backend.model_work_admission.enqueue_model_work", _fake_enqueue_model_work)
+    monkeypatch.setattr("mint_server.backend.model_work_admission.enqueue_model_work", _fake_enqueue_model_work)
 
     req = CreateModelRequest(
         session_id="route-517",
@@ -334,11 +334,11 @@ async def test_issue_528_do_create_model_dense_is_metadata_only_until_first_stat
     )
     monkeypatch.setattr(training_route, "_best_effort_local_tokenizer_metadata_for_session", _best_effort_tokenizer_metadata)
     monkeypatch.setattr(
-        "tinker_server.backend.training_session_store.async_upsert_training_session",
+        "mint_server.backend.training_session_store.async_upsert_training_session",
         _async_upsert_training_session,
     )
     monkeypatch.setattr(
-        "tinker_server.backend.session_index_store.add_training_run_to_session",
+        "mint_server.backend.session_index_store.add_training_run_to_session",
         lambda **_kwargs: None,
     )
     monkeypatch.setattr(
@@ -414,7 +414,7 @@ async def test_issue_528_dense_materialization_happens_once_on_first_stateful_us
     monkeypatch.setattr(training_route, "training_engine", engine)
     monkeypatch.setattr(training_route, "_collect_control_plane_tokenizer_metadata", _collect_tokenizer_metadata)
     monkeypatch.setattr(
-        "tinker_server.backend.training_session_store.async_upsert_training_session",
+        "mint_server.backend.training_session_store.async_upsert_training_session",
         _async_upsert_training_session,
     )
     monkeypatch.setattr(training_route, "_get_max_model_len", lambda _base_model: 4096)

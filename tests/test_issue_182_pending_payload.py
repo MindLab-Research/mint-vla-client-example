@@ -3,9 +3,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from tinker_server.backend.task_state_store import FutureStatus
-from tinker_server.models.types import FutureRetrieveRequest
-from tinker_server.routes import futures as futures_route
+from mint_server.backend.task_state_store import FutureStatus
+from mint_server.models.types import FutureRetrieveRequest
+from mint_server.routes import futures as futures_route
 
 
 @pytest.fixture(autouse=True)
@@ -68,7 +68,7 @@ class _StubModelWorkScheduler:
 
 
 def _install_scheduler(monkeypatch, *, present: bool = True) -> _StubModelWorkScheduler:
-    import tinker_server.backend.model_work_scheduler as mws
+    import mint_server.backend.model_work_scheduler as mws
 
     scheduler = _StubModelWorkScheduler(present=present)
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
@@ -198,7 +198,7 @@ def test_issue_182_pending_payload_training_correlation_fields(monkeypatch):
 
 def test_issue_182_gateway_request_id_overrides_upstream(monkeypatch):
     import httpx
-    import tinker_server.gateway as gateway
+    import mint_server.gateway as gateway
 
     monkeypatch.setattr(gateway, "decode_request_id", lambda rid: ("upstream-a", "raw-123"))
     monkeypatch.setattr(
@@ -227,7 +227,7 @@ def test_issue_182_gateway_request_id_overrides_upstream(monkeypatch):
 
 def test_issue_182_gateway_request_id_overrides_upstream_200(monkeypatch):
     import httpx
-    import tinker_server.gateway as gateway
+    import mint_server.gateway as gateway
 
     monkeypatch.setattr(gateway, "decode_request_id", lambda rid: ("upstream-a", "raw-123"))
     monkeypatch.setattr(

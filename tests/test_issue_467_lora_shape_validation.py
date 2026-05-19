@@ -4,7 +4,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from tinker_server.backend.lora_utils import (
+from mint_server.backend.lora_utils import (
     maybe_validate_peft_adapter_checkpoint_shapes,
     validate_peft_adapter_checkpoint_shapes,
 )

@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-import tinker_server.models.types as types_module
+import mint_server.models.types as types_module
 
 
 def test_model_input_supports_multimodal_chunks_and_length() -> None:

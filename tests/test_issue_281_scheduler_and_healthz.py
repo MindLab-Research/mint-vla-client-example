@@ -90,9 +90,9 @@ async def _noop_async(*_args, **_kwargs) -> None:
 
 @pytest.mark.anyio
 async def test_issue_281_forward_enqueues_scheduler_metadata(monkeypatch) -> None:
-    import tinker_server.backend.model_work_scheduler as mws
-    from tinker_server.models.types import ForwardBackwardInput, ForwardRequest
-    from tinker_server.routes import training as tr
+    import mint_server.backend.model_work_scheduler as mws
+    from mint_server.models.types import ForwardBackwardInput, ForwardRequest
+    from mint_server.routes import training as tr
 
     monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "1")
 
@@ -169,9 +169,9 @@ async def test_issue_281_forward_enqueues_scheduler_metadata(monkeypatch) -> Non
 async def test_issue_281_training_routes_mark_queued_stage_metadata(
     monkeypatch, route_name: str, request_obj, training_op: str
 ) -> None:
-    import tinker_server.backend.model_work_scheduler as mws
-    from tinker_server.models import types as model_types
-    from tinker_server.routes import training as tr
+    import mint_server.backend.model_work_scheduler as mws
+    from mint_server.models import types as model_types
+    from mint_server.routes import training as tr
 
     monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "1")
 
@@ -213,12 +213,12 @@ async def test_issue_281_training_routes_mark_queued_stage_metadata(
     assert queued_meta["stage"] == "queued"
     assert isinstance(queued_meta["queued_at"], float)
     assert captured["extra"]["scheduler_enabled"] is True
-    assert captured["extra"]["scheduler_domain"] == "megatron:megatron_qwen3_30b_a3b_instruct_2507"
+    assert captured["extra"]["scheduler_domain"] == "megatron:mint_megatron_qwen3_30b_a3b_instruct_2507"
     assert captured["extra"]["scheduler_session_key"] == "run-281"
     assert captured["extra"]["execution_serial_key"] == "training_session:run-281"
     assert captured["extra"]["training_op"] == training_op
     assert captured["extra"]["queue_priority"] == 0
-    assert captured["domain_key"] == "megatron:megatron_qwen3_30b_a3b_instruct_2507"
+    assert captured["domain_key"] == "megatron:mint_megatron_qwen3_30b_a3b_instruct_2507"
     assert captured["affinity_group"] == "training_session:run-281"
     assert captured["ordering_key"] == "training_session:run-281"
     assert captured["extra"]["model_work_scheduler"] is True
@@ -226,10 +226,10 @@ async def test_issue_281_training_routes_mark_queued_stage_metadata(
 
 @pytest.mark.anyio
 async def test_issue_281_save_weights_for_sampler_enqueues_scheduler_metadata(monkeypatch) -> None:
-    import tinker_server.backend.model_work_scheduler as mws
-    import tinker_server.client_compat as client_compat
-    from tinker_server.models.types import SaveWeightsForSamplerRequest
-    from tinker_server.routes import training as tr
+    import mint_server.backend.model_work_scheduler as mws
+    import mint_server.client_compat as client_compat
+    from mint_server.models.types import SaveWeightsForSamplerRequest
+    from mint_server.routes import training as tr
 
     monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "1")
 
@@ -257,7 +257,7 @@ async def test_issue_281_save_weights_for_sampler_enqueues_scheduler_metadata(mo
     await tr.save_weights_for_sampler(req, _DummyRequest(user_id="owner-a"))
 
     assert captured["extra"]["scheduler_enabled"] is True
-    assert captured["extra"]["scheduler_domain"] == "megatron:megatron_qwen3_30b_a3b_instruct_2507"
+    assert captured["extra"]["scheduler_domain"] == "megatron:mint_megatron_qwen3_30b_a3b_instruct_2507"
     assert captured["extra"]["scheduler_session_key"] == "run-281"
     assert captured["extra"]["execution_serial_key"] == "training_session:run-281"
     assert captured["extra"]["training_op"] == "save_weights_for_sampler"
@@ -265,7 +265,7 @@ async def test_issue_281_save_weights_for_sampler_enqueues_scheduler_metadata(mo
     assert captured["extra"]["queue_priority"] == 0
     assert captured["extra"]["prefer_tinker"] is True
     assert captured["extra"]["is_admin"] is False
-    assert captured["domain_key"] == "megatron:megatron_qwen3_30b_a3b_instruct_2507"
+    assert captured["domain_key"] == "megatron:mint_megatron_qwen3_30b_a3b_instruct_2507"
     assert captured["affinity_group"] == "training_session:run-281"
     assert captured["ordering_key"] == "training_session:run-281"
     assert captured["extra"]["model_work_scheduler"] is True
@@ -273,10 +273,10 @@ async def test_issue_281_save_weights_for_sampler_enqueues_scheduler_metadata(mo
 
 @pytest.mark.anyio
 async def test_issue_281_asample_enqueues_scheduler_metadata(monkeypatch) -> None:
-    import tinker_server.backend.model_work_scheduler as mws
-    import tinker_server.backend.model_registry as model_registry
-    from tinker_server.models.types import ModelInput, SampleRequest, SamplingParams
-    from tinker_server.routes import sampling as sr
+    import mint_server.backend.model_work_scheduler as mws
+    import mint_server.backend.model_registry as model_registry
+    from mint_server.models.types import ModelInput, SampleRequest, SamplingParams
+    from mint_server.routes import sampling as sr
 
     monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "1")
 
@@ -315,10 +315,10 @@ async def test_issue_281_asample_enqueues_scheduler_metadata(monkeypatch) -> Non
 
 @pytest.mark.anyio
 async def test_issue_281_compute_logprobs_enqueues_scheduler_metadata(monkeypatch) -> None:
-    import tinker_server.backend.model_work_scheduler as mws
-    import tinker_server.backend.model_registry as model_registry
-    from tinker_server.models.types import ComputeLogprobsRequest, ModelInput
-    from tinker_server.routes import sampling as sr
+    import mint_server.backend.model_work_scheduler as mws
+    import mint_server.backend.model_registry as model_registry
+    from mint_server.models.types import ComputeLogprobsRequest, ModelInput
+    from mint_server.routes import sampling as sr
 
     monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "1")
 
@@ -364,8 +364,8 @@ async def test_issue_281_compute_logprobs_enqueues_scheduler_metadata(monkeypatc
 
 @pytest.mark.anyio
 async def test_issue_281_do_create_model_active_duplicate_fails_without_deleting_existing(monkeypatch) -> None:
-    from tinker_server.models.types import CreateModelRequest, LoRAConfig
-    from tinker_server.routes import training as tr
+    from mint_server.models.types import CreateModelRequest, LoRAConfig
+    from mint_server.routes import training as tr
 
     deleted: list[str] = []
     failed: dict = {}
@@ -411,8 +411,8 @@ async def test_issue_281_do_create_model_active_duplicate_fails_without_deleting
 
 @pytest.mark.anyio
 async def test_issue_281_do_create_model_from_state_active_duplicate_fails_without_deleting_existing(monkeypatch) -> None:
-    from tinker_server.models.types import CreateModelFromStateRequest, LoRAConfig
-    from tinker_server.routes import training as tr
+    from mint_server.models.types import CreateModelFromStateRequest, LoRAConfig
+    from mint_server.routes import training as tr
 
     deleted: list[str] = []
     failed: dict = {}
@@ -459,8 +459,8 @@ async def test_issue_281_do_create_model_from_state_active_duplicate_fails_witho
 
 @pytest.mark.anyio
 async def test_issue_281_do_reset_expert_bias_resolves_future(monkeypatch) -> None:
-    from tinker_server.models.types import ResetExpertBiasRequest
-    from tinker_server.routes import training as tr
+    from mint_server.models.types import ResetExpertBiasRequest
+    from mint_server.routes import training as tr
 
     resolved: dict = {}
 
@@ -507,9 +507,9 @@ async def test_issue_281_do_reset_expert_bias_resolves_future(monkeypatch) -> No
 @pytest.mark.anyio
 async def test_issue_281_do_delete_model_deletes_then_resolves(monkeypatch) -> None:
     _install_ray_stub(monkeypatch)
-    import tinker_server.backend.model_actor_supervisor as model_actor_inventory
-    import tinker_server.backend.training_session_store as training_session_store
-    from tinker_server.routes import training as tr
+    import mint_server.backend.model_actor_supervisor as model_actor_inventory
+    import mint_server.backend.training_session_store as training_session_store
+    from mint_server.routes import training as tr
 
     calls: dict[str, list] = {
         "engine_delete": [],
@@ -567,10 +567,10 @@ async def test_issue_281_do_delete_model_deletes_then_resolves(monkeypatch) -> N
 
 @pytest.mark.anyio
 async def test_issue_281_asample_falls_back_to_base_model_scheduler_domain(monkeypatch) -> None:
-    import tinker_server.backend.model_work_scheduler as mws
-    import tinker_server.backend.model_registry as model_registry
-    from tinker_server.models.types import ModelInput, SampleRequest, SamplingParams
-    from tinker_server.routes import sampling as sr
+    import mint_server.backend.model_work_scheduler as mws
+    import mint_server.backend.model_registry as model_registry
+    from mint_server.models.types import ModelInput, SampleRequest, SamplingParams
+    from mint_server.routes import sampling as sr
 
     monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "1")
 
@@ -607,10 +607,10 @@ async def test_issue_281_asample_falls_back_to_base_model_scheduler_domain(monke
 
 @pytest.mark.anyio
 async def test_issue_281_internal_serialized_op_marks_inflight_until_worker_finishes(monkeypatch) -> None:
-    import tinker_server.backend.model_work_scheduler as mws
-    from tinker_server.backend.training_session_manager import TrainingSessionManager
-    from tinker_server.models.types import ResetExpertBiasRequest
-    from tinker_server.routes import training as tr
+    import mint_server.backend.model_work_scheduler as mws
+    from mint_server.backend.training_session_manager import TrainingSessionManager
+    from mint_server.models.types import ResetExpertBiasRequest
+    from mint_server.routes import training as tr
 
     manager = TrainingSessionManager()
     manager.create_session("run-281", "sess-281", 0, "Qwen/Qwen3-30B-A3B-Instruct-2507")
@@ -664,8 +664,8 @@ async def test_issue_281_internal_serialized_op_marks_inflight_until_worker_fini
 
 @pytest.mark.anyio
 async def test_issue_281_public_healthz_ignores_timeout_observation(monkeypatch) -> None:
-    from tinker_server.health_state import clear_runtime_degraded_state, clear_startup_degraded_state
-    from tinker_server.routes import service
+    from mint_server.health_state import clear_runtime_degraded_state, clear_startup_degraded_state
+    from mint_server.routes import service
 
     clear_startup_degraded_state()
     clear_runtime_degraded_state()
@@ -678,8 +678,8 @@ async def test_issue_281_public_healthz_ignores_timeout_observation(monkeypatch)
 
 @pytest.mark.anyio
 async def test_issue_281_public_healthz_ignores_pending_pg_observation(monkeypatch) -> None:
-    from tinker_server.health_state import clear_runtime_degraded_state, clear_startup_degraded_state
-    from tinker_server.routes import service
+    from mint_server.health_state import clear_runtime_degraded_state, clear_startup_degraded_state
+    from mint_server.routes import service
 
     clear_startup_degraded_state()
     clear_runtime_degraded_state()
@@ -693,7 +693,7 @@ async def test_issue_281_public_healthz_ignores_pending_pg_observation(monkeypat
 def test_issue_281_http_route_label_prefers_route_template() -> None:
     from starlette.requests import Request
 
-    from tinker_server.app import _http_route_label
+    from mint_server.app import _http_route_label
 
     request = Request(
         {

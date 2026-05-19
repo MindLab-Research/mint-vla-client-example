@@ -31,8 +31,8 @@ Screenshots, partial errors, vague descriptions. Extract: what action failed, wh
 ```python
 # scripts/reproduce_user_report.py
 import os
-BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000")
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
+BASE_URL = os.environ.get("MINT_BASE_URL", "http://localhost:8000")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
 ```
 
 ### Run against production (HTTP-only)
@@ -42,7 +42,7 @@ Do not run any production-side kill/restart commands while triaging a report.
 ### Check logs (read-only)
 
 ```bash
-ssh mint-prod-volcano "tail -200 /tmp/tinker_server_auth.log"
+ssh mint-prod-volcano "tail -200 /tmp/mint_server_auth.log"
 ```
 
 ## 2. Analyze
@@ -58,8 +58,8 @@ Read source code to trace the failure. Reference specific files and line numbers
 ## 3. Check duplicates
 
 ```bash
-gh issue list --repo MindLab-Research/tinker-server --state open --search "keyword"
-gh issue list --repo MindLab-Research/tinker-server --state closed --search "keyword"
+gh issue list --repo MindLab-Research/mint --state open --search "keyword"
+gh issue list --repo MindLab-Research/mint --state closed --search "keyword"
 ```
 
 If duplicate exists, comment on existing issue instead of creating new one.
@@ -69,7 +69,7 @@ If duplicate exists, comment on existing issue instead of creating new one.
 ### Query labels first
 
 ```bash
-gh label list --repo MindLab-Research/tinker-server
+gh label list --repo MindLab-Research/mint
 ```
 
 Use only labels that exist. Do not fabricate.
@@ -98,7 +98,7 @@ Hard rules:
 ### Create
 
 ```bash
-gh issue create --repo MindLab-Research/tinker-server \
+gh issue create --repo MindLab-Research/mint \
   --title "Concise technical description" \
   --body "..." \
   --label "label1,label2"

@@ -1,4 +1,4 @@
-from tinker_server.backend.model_registry import MODEL_CONFIGS, list_supported_models
+from mint_server.backend.model_registry import MODEL_CONFIGS, list_supported_models
 
 
 OPENPI_FAST_MODEL = "openpi/pi0-fast-libero-low-mem-finetune"
@@ -18,6 +18,6 @@ def test_openpi_fast_profile_is_registered_with_vla_metadata() -> None:
 
 def test_openpi_fast_profile_is_in_default_supported_models(monkeypatch) -> None:
     monkeypatch.delenv("MINT_SUPPORTED_MODELS", raising=False)
-    monkeypatch.delenv("TINKER_SUPPORTED_MODELS", raising=False)
+    monkeypatch.delenv("MINT_SUPPORTED_MODELS", raising=False)
 
     assert OPENPI_FAST_MODEL in list_supported_models()

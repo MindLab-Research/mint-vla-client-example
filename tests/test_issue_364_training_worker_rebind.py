@@ -5,10 +5,10 @@ from types import SimpleNamespace
 
 import pytest
 
-import tinker_server.backend.dense_trainer as dense_trainer
-import tinker_server.backend.runtime_observability as runtime_obs_module
-from tinker_server.backend.verl_training import TrainingWorker, VerlTrainingEngine
-from tinker_server.backend.training_session_manager import TrainingSession
+import mint_server.backend.dense_trainer as dense_trainer
+import mint_server.backend.runtime_observability as runtime_obs_module
+from mint_server.backend.verl_training import TrainingWorker, VerlTrainingEngine
+from mint_server.backend.training_session_manager import TrainingSession
 
 
 @pytest.fixture
@@ -154,8 +154,8 @@ async def test_issue_561_dense_fatal_error_retires_actor(monkeypatch: pytest.Mon
         base_model="Qwen/Qwen3-0.6B",
         backend="peft",
     )
-    session.actor_name = "peft_trainer_qwen__qwen3_0_6b_maxr64"
-    session.namespace = "tinker"
+    session.actor_name = "mint_dense_qwen__qwen3_0_6b"
+    session.namespace = "mint"
     engine._model_actor_supervisor_actor_names[session.model_id] = session.actor_name
 
     worker = SimpleNamespace(forward_backward=_RemoteCall())
@@ -203,7 +203,7 @@ async def test_issue_561_dense_fatal_error_retires_actor(monkeypatch: pytest.Mon
         await engine.forward_backward(session, request)
 
     assert len(retire_calls) == 1
-    assert retire_calls[0]["actor_name"] == "peft_trainer_qwen__qwen3_0_6b_maxr64"
+    assert retire_calls[0]["actor_name"] == "mint_dense_qwen__qwen3_0_6b"
     assert retire_calls[0]["session_id"] == session.model_id
     assert retire_calls[0]["fatal_op"] == "forward_backward"
     assert "forward_backward" in str(retire_calls[0]["reason"])
@@ -244,8 +244,8 @@ async def test_issue_561_dense_retire_failure_hard_poisons_session(monkeypatch: 
         base_model="Qwen/Qwen3-0.6B",
         backend="peft",
     )
-    session.actor_name = "peft_trainer_qwen__qwen3_0_6b_maxr64"
-    session.namespace = "tinker"
+    session.actor_name = "mint_dense_qwen__qwen3_0_6b"
+    session.namespace = "mint"
     engine._model_actor_supervisor_actor_names[session.model_id] = session.actor_name
 
     worker = SimpleNamespace(forward_backward=_RemoteCall())
@@ -310,8 +310,8 @@ async def test_issue_561_rebind_refuses_poisoned_dense_actor(monkeypatch: pytest
         base_model="Qwen/Qwen3-0.6B",
         backend="peft",
     )
-    session.actor_name = "peft_trainer_qwen__qwen3_0_6b_maxr64"
-    session.namespace = "tinker"
+    session.actor_name = "mint_dense_qwen__qwen3_0_6b"
+    session.namespace = "mint"
 
     monkeypatch.setattr(
         dense_trainer,
@@ -319,7 +319,7 @@ async def test_issue_561_rebind_refuses_poisoned_dense_actor(monkeypatch: pytest
         lambda actor_name: "forward_backward:CUDA error: device-side assert triggered",
     )
     monkeypatch.setattr(
-        "tinker_server.backend.verl_training.ray.get_actor",
+        "mint_server.backend.verl_training.ray.get_actor",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("poisoned actor must not be rebound")),
     )
 
@@ -352,10 +352,10 @@ def test_issue_561_training_worker_validates_input_contract_before_gpu(monkeypat
 
     obs = runtime_obs_module.RuntimeObservability()
     events: list[tuple[str, dict[str, object] | None]] = []
-    monkeypatch.setattr("tinker_server.backend.verl_training._get_torch", lambda: SimpleNamespace())
+    monkeypatch.setattr("mint_server.backend.verl_training._get_torch", lambda: SimpleNamespace())
     monkeypatch.setattr(runtime_obs_module, "runtime_observability", obs)
     monkeypatch.setattr(
-        "tinker_server.backend.verl_training.record_span_event_otel",
+        "mint_server.backend.verl_training.record_span_event_otel",
         lambda name, *, attributes=None: events.append((name, attributes)),
     )
 
@@ -427,8 +427,8 @@ def test_issue_561_rejects_non_finite_weight_inputs_before_gpu(monkeypatch: pyte
     )
     worker.tokenizer = SimpleNamespace(vocab_size=16)
 
-    monkeypatch.setattr("tinker_server.backend.verl_training._get_torch", lambda: SimpleNamespace())
-    monkeypatch.setattr("tinker_server.backend.verl_training.record_span_event_otel", lambda *args, **kwargs: None)
+    monkeypatch.setattr("mint_server.backend.verl_training._get_torch", lambda: SimpleNamespace())
+    monkeypatch.setattr("mint_server.backend.verl_training.record_span_event_otel", lambda *args, **kwargs: None)
     monkeypatch.setattr(runtime_obs_module, "runtime_observability", runtime_obs_module.RuntimeObservability())
 
     bad_item = {

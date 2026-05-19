@@ -1,4 +1,4 @@
-# tinker-server
+# mint-server
 
 ## Skills Reference
 
@@ -34,7 +34,7 @@ background file sync.
 
 ```bash
 # Requires SSH tunnel: ssh -f -N -L 8000:localhost:8000 mint-dev
-TINKER_BASE_URL=http://localhost:8000 TINKER_API_KEY=dummy python scripts/tools/smoke.py service
+MINT_BASE_URL=http://localhost:8000 MINT_API_KEY=dummy python scripts/tools/smoke.py service
 ```
 
 For production (port 18000), use the `mint-prod` skill.
@@ -49,7 +49,7 @@ Goal: avoid running scripts in the wrong place.
 
 - Persistent tool scripts (run on your workstation; talk to the server over HTTP):
   - `scripts/tools/*`
-  - Use `TINKER_BASE_URL`/`TINKER_API_KEY` (or `MINT_*` aliases) to target the intended server.
+  - Use canonical `MINT_BASE_URL`/`MINT_API_KEY` (`MINT_*` is accepted only for Tinker SDK compatibility) to target the intended server.
   - Do not rely on SDK defaults that may point at production.
 
 - Throwaway test scripts:
@@ -71,7 +71,7 @@ Engineering notes/specs live under `.claude/skills/architecture-design/reference
                         ───────────                          ──────────
 Local Machine           mint-dev:8000                        mint-prod:18000
 ─────────────           ────────────                         ──────────────
-tinker-cookbook ──HTTP──> tinker-server ──Ray──> GPU Workers (MegatronWorker, vLLM)
+tinker-cookbook ──HTTP──> mint-server ──Ray──> GPU Workers (MegatronWorker, vLLM)
                     ↑                                  ↑
               SSH tunnel                         SSH tunnel
          localhost:8000 -> mint-dev:8000     localhost:18000 -> mint-prod:18000
@@ -79,12 +79,12 @@ tinker-cookbook ──HTTP──> tinker-server ──Ray──> GPU Workers (Me
 
 | Environment | SSH Host | Port | Auth | Log File |
 |-------------|----------|------|------|----------|
-| Development | `mint-dev` | 8000 | No | `/share/mint/dev/logs/tinker_server_auth.log` |
-| Production | `mint-prod` | 18000 | Yes (`X-API-Key`) | `/share/mint/prod/logs/tinker_server_auth.log` |
+| Development | `mint-dev` | 8000 | No | `/share/mint/dev/logs/mint_server_auth.log` |
+| Production | `mint-prod` | 18000 | Yes (`X-API-Key`) | `/share/mint/prod/logs/mint_server_auth.log` |
 
 ## Multi-target Production Routing
 
-The API server can act as a gateway and forward selected base models to other tinker-server deployments via `MINT_GATEWAY_CONFIG_JSON` (`TINKER_GATEWAY_CONFIG_JSON` is accepted as a compatibility alias).
+The API server can act as a gateway and forward selected base models to other mint-server deployments via `MINT_GATEWAY_CONFIG_JSON` (`MINT_GATEWAY_CONFIG_JSON` is accepted as a compatibility alias).
 
 Current deployment plan:
 - `mint-prod-volcano` (router/master): `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-4B-Instruct-2507`, `Qwen/Qwen3-30B-A3B-Instruct-2507`, `moonshotai/Kimi-K2-Thinking`
@@ -113,7 +113,7 @@ export MINT_GATEWAY_CONFIG_JSON='
 
 Per-deployment model advertisement and tuning:
 - Set `MINT_SUPPORTED_MODELS` on each server to the models that deployment should advertise.
-- Tune `tinker_server/backend/model_registry.py` (or set `MINT_MODEL_CONFIG_OVERRIDES_JSON`) to match the GPU type and desired TP/EP/CP.
+- Tune `mint_server/backend/model_registry.py` (or set `MINT_MODEL_CONFIG_OVERRIDES_JSON`) to match the GPU type and desired TP/EP/CP.
 
 **Finding the running server process:**
 ```bash
@@ -123,7 +123,7 @@ ssh <host> 'ls -la /proc/<PID>/fd/1'  # Shows actual log file location
 
 **Key points:**
 - **tinker-cookbook**: Runs LOCALLY on your workstation. Requires Python 3.11+ (for `chz` package).
-- **tinker-server**: Runs on API server (mint-dev for dev, mint-prod for prod). Receives HTTP requests, dispatches to Ray workers.
+- **mint-server**: Runs on API server (mint-dev for dev, mint-prod for prod). Receives HTTP requests, dispatches to Ray workers.
 - **GPU Workers**: Run on Ray cluster nodes. Execute training (Megatron) and inference (vLLM).
 - **Data transfer**: Weights via Ray object store, not file paths.
 
@@ -167,7 +167,7 @@ cd <tinker-cookbook-repo>
 ssh -f -N -L 8000:localhost:8000 mint-dev
 
 # Arithmetic RL (~5 min)
-TINKER_BASE_URL=http://localhost:8000 TINKER_API_KEY=dummy \
+MINT_BASE_URL=http://localhost:8000 MINT_API_KEY=dummy \
 python -m tinker_cookbook.recipes.math_rl.train \
     model_name="Qwen/Qwen3-4B-Instruct-2507" \
     renderer_name="qwen3_instruct" \
@@ -176,7 +176,7 @@ python -m tinker_cookbook.recipes.math_rl.train \
 
 Note: `renderer_name="qwen3_instruct"` bypasses model lookup.
 
-For production testing, use port 18000 and set valid `TINKER_API_KEY`.
+For production testing, use port 18000 and set valid `MINT_API_KEY`.
 
 ---
 
@@ -217,8 +217,8 @@ Agent mistakes that wasted time. Read this before starting any task.
 | 2026-01-29 | **FALSE POSITIVE (transformer_engine)**: Claimed `transformer_engine` was "installed", then set `PFS_EXTRA_PYTHONPATH` to a CPFS `transformer-engine-pkg` directory that did not include the `transformer_engine.pytorch` extension module, causing Megatron init to crash with `StopIteration` in `transformer_engine/pytorch/__init__.py` (missing `*.so` glob). | **VERIFY THE ACTUAL IMPORT ON A GPU POD BEFORE DECLARING FIXED:** (1) `python -c "import transformer_engine.pytorch as te; print(te.__file__)"` must succeed on a DLC GPU worker. (2) Do not shadow in-image deps with partial CPFS installs; if using CPFS `--target`, ensure the wheel installs the Python extension `.so` files under `transformer_engine/pytorch`. (3) Encode the exact validation command + expected output into `.claude/skills/aliyun-cluster/SKILL.md`. |
 | 2026-01-29 | **ALIYUN RAY CONTROL-PLANE SELF-SABOTAGE**: Started a local `raylet` on the CPU-only API host (`mint-prod-aliyun`) and allowed it to be schedulable. Then restarted/killed that local node while debugging, SIGTERM-killing actors placed on that node and causing `save_weights_for_sampler` to fail with `ActorDiedError`. Also wrote/used a nondeterministic SOP mixing `PYTHONPATH=cpu-pydeps` Ray with a project venv, and misread `/opt/venv` in worker tracebacks as something acceptable to use on the API host. | **DRIVER-ONLY API HOST, DETERMINISTIC CLUSTER LAYOUT:** (1) API hosts are Ray drivers only (`ray.init(address=...)`); never run `ray start`/`raylet` there. (2) DLC head must be `0 GPU` and started with `--num-gpus=0`; only worker pods advertise GPUs. (3) Never "fix" actor failures by restarting Ray on any node; locate the actor's node and fix that node/pod. (4) Treat `/opt/venv` as internal to the worker image; never reference it in SOPs or host setup. |
 | 2026-01-29 | **CREDENTIAL LEAK (process env dump)**: Printed sensitive tokens by dumping `/proc/<PID>/environ` during debugging. | **NEVER DUMP ENV/CONFIGS VERBATIM:** (1) Do not read or print `/proc/<PID>/environ`. (2) When checking env, whitelist non-secret keys and redact values (`KEY=<redacted>`). (3) Treat any `*_KEY`, `*_SECRET`, `*_TOKEN`, `*_PASSWORD` as secrets and keep them out of logs and terminal output. |
-| 2026-01-29 | **ALIYUN PYTHONPATH MISMATCH (wrong default code root)**: Left runtime config defaulting to a Volcano-only code path on Aliyun, causing Ray worker `runtime_env` to import from a non-existent directory and triggering actor creation failure. | **PIN CODE ROOT EXPLICITLY + VERIFY ON-CLUSTER:** (1) Set the Mint code root in the environment/config used by the deployment. (2) Verify inside Ray runtime_env before running real training: run a `num_gpus=1` probe `python -c "import tinker_server; print(tinker_server.__file__)"` and confirm it imports from the intended code root. (3) If `runtime_env` sets `PYTHONPATH`, include the code root and do not clobber it with stale defaults. |
-| 2026-01-13 | **UNSUBSTANTIATED CLAIMS**: When investigating server crash, ran `ray.get_actor("tinker_vllm_Qwen-Qwen3-30B-A3B-Instruct-2507")` which failed to find actor. Immediately concluded "vLLM actor: DEAD" and wasted 10+ minutes searching Ray logs, trying to SSH to worker nodes, looking for crash reasons. The actual actor name was `tinker_vllm_qwen3-30b-a3b-instruct-2507` (different case/format) and it was ALIVE the whole time. A simple `ray list actors` would have shown this in 5 seconds. | **VERIFY BEFORE CONCLUDING:** (1) A failed lookup could mean: wrong name, wrong namespace, OR actually dead. (2) **ALWAYS list actors first** (`ray list actors \| grep vllm`) to see what exists. (3) Never report "X is dead" without seeing it in the dead actors list. (4) Wrong conclusions waste time chasing phantom bugs. (5) The skill doc section 9 now documents the correct procedure. |
+| 2026-01-29 | **ALIYUN PYTHONPATH MISMATCH (wrong default code root)**: Left runtime config defaulting to a Volcano-only code path on Aliyun, causing Ray worker `runtime_env` to import from a non-existent directory and triggering actor creation failure. | **PIN CODE ROOT EXPLICITLY + VERIFY ON-CLUSTER:** (1) Set the Mint code root in the environment/config used by the deployment. (2) Verify inside Ray runtime_env before running real training: run a `num_gpus=1` probe `python -c "import mint_server; print(mint_server.__file__)"` and confirm it imports from the intended code root. (3) If `runtime_env` sets `PYTHONPATH`, include the code root and do not clobber it with stale defaults. |
+| 2026-01-13 | **UNSUBSTANTIATED CLAIMS**: When investigating server crash, ran `ray.get_actor("mint_vllm_Qwen-Qwen3-30B-A3B-Instruct-2507")` which failed to find actor. Immediately concluded "vLLM actor: DEAD" and wasted 10+ minutes searching Ray logs, trying to SSH to worker nodes, looking for crash reasons. The actual actor name was `mint_vllm_qwen3-30b-a3b-instruct-2507` (different case/format) and it was ALIVE the whole time. A simple `ray list actors` would have shown this in 5 seconds. | **VERIFY BEFORE CONCLUDING:** (1) A failed lookup could mean: wrong name, wrong namespace, OR actually dead. (2) **ALWAYS list actors first** (`ray list actors \| grep vllm`) to see what exists. (3) Never report "X is dead" without seeing it in the dead actors list. (4) Wrong conclusions waste time chasing phantom bugs. (5) The skill doc section 9 now documents the correct procedure. |
 | 2026-03-13 | **MINT-DEV ENV AND PLACEMENT THRASH**: Repeatedly launched dev API servers with repo-root-only `PYTHONPATH`, causing fake `verl_http` import failures on the Python 3.12 host. Then used system Python 3.10 for Ray inspection against a Python 3.12 cluster, producing version-mismatch errors instead of real state. Also retried `235B` placement while stale detached placement groups still logically occupied `138/139`, even when the GPUs were physically idle. Wasted hours on nonexistent dependency and scheduling problems. | **PRE-FLIGHT BEFORE ANY MINT-DEV DEBUGGING:** (1) Start API servers with `/root/venv_k2_py31213/bin/python` and full PFS `PYTHONPATH` (`vllm`, `verl`, `megatron-bridge`, repo, HF modules). (2) Use the same Python 3.12 venv for all host-side Ray inspection commands. Never use system Python against the dev Ray cluster. (3) If a PG says `NO_RESOURCES` while GPUs look idle, inspect global placement-group state first and remove only owned stale PGs before any retry. (4) Do not pip-install missing packages until you have proved the API-host `PYTHONPATH` is correct. |
 | 2026-03-13 | **STALE PG AMNESIA**: Repeatedly retried placement while old detached 235B placement groups still existed logically, even after the user explicitly said to remove them. This turned a deterministic pre-flight check into repeated failed bringups. | **PG CLEANUP IS A HARD GATE, NOT A SUGGESTION:** Before any new placement attempt, list all non-REMOVED placement groups cluster-wide. If any owned stale or pending PG can reserve the target GPUs, remove it first. Do not start a new server or actor until this check is done and the result is written down. |
 

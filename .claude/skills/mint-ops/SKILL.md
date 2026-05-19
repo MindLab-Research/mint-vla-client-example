@@ -55,7 +55,7 @@ Production:
 ```bash
 source /share/mint/prod/config/secrets.env
 BASE=http://localhost:18000
-curl -s -H "X-API-Key: $TINKER_API_KEY" "$BASE/internal/actors?type=vllm" | jq
+curl -s -H "X-API-Key: $MINT_API_KEY" "$BASE/internal/actors?type=vllm" | jq
 ```
 
 ### Read-only Endpoints
@@ -84,7 +84,7 @@ curl -s "$BASE/internal/model_work_scheduler/debug_state" | jq
 curl -s "$BASE/internal/admission_stats?include_actor_rss=false" | jq
 ```
 
-For prod, add `-H "X-API-Key: $TINKER_API_KEY"` to the curl commands above.
+For prod, add `-H "X-API-Key: $MINT_API_KEY"` to the curl commands above.
 
 ### Actor Kill
 
@@ -116,7 +116,7 @@ curl -s -X POST -H "Content-Type: application/json" \
   "$BASE/internal/actors/kill" | jq
 ```
 
-For prod, add `-H "X-API-Key: $TINKER_API_KEY"`.
+For prod, add `-H "X-API-Key: $MINT_API_KEY"`.
 
 ### Evidence To Report
 

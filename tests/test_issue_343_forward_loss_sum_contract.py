@@ -8,7 +8,7 @@ import torch
 
 pytest.importorskip("ray")
 
-from tinker_server.backend.megatron_distributed import DistributedConfig, MegatronRankWorker
+from mint_server.backend.megatron_distributed import DistributedConfig, MegatronRankWorker
 
 
 class _FakeEvalMode:
@@ -58,17 +58,17 @@ def test_issue_343_megatron_forward_preserves_loss_sum_contract(monkeypatch) -> 
     worker._is_output_rank = lambda: True
     worker.log_memory_breakdown = lambda tag: None
 
-    fake_training = types.ModuleType("tinker_server.backend.megatron_training")
+    fake_training = types.ModuleType("mint_server.backend.megatron_training")
     fake_training.tinker_to_tensordict = lambda *args, **kwargs: "fake_tensordict"  # type: ignore[attr-defined]
     fake_training.create_logprob_extractor_fn = lambda: "fake_loss_fn"  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "tinker_server.backend.megatron_training", fake_training)
+    monkeypatch.setitem(sys.modules, "mint_server.backend.megatron_training", fake_training)
 
     monkeypatch.setattr(
-        "tinker_server.backend.megatron_distributed.get_model_config",
+        "mint_server.backend.megatron_distributed.get_model_config",
         lambda model: types.SimpleNamespace(max_model_len=2048),
     )
     monkeypatch.setattr(
-        "tinker_server.backend.megatron_distributed.flatten_encoded_text_chunks",
+        "mint_server.backend.megatron_distributed.flatten_encoded_text_chunks",
         lambda model_input: list(model_input["chunks"][0]["tokens"]),
     )
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)

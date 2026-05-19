@@ -8,7 +8,7 @@ def test_issue_193_actor_only_state_marker_corruption_fails_closed(tmp_path: Pat
     marker_path.write_text("{not-json", encoding="utf-8")
 
     with pytest.raises(RuntimeError, match="Failed to read actor_only_state marker"):
-        manager.list_actor_only_state_sessions("megatron_qwen3_30b_a3b_instruct_2507")
+        manager.list_actor_only_state_sessions("mint_megatron_qwen3_30b_a3b_instruct_2507")
 
 
 def test_issue_193_session_metadata_cache_does_not_mask_disk_corruption(tmp_path: Path):
@@ -59,7 +59,7 @@ def test_issue_193_prime_session_uses_sidecars_and_detaches_on_dirty(tmp_path: P
     manager.mark_actor_only_state(
         session_id,
         reason="forward_backward",
-        actor_name="megatron_qwen3_30b_a3b_instruct_2507",
+        actor_name="mint_megatron_qwen3_30b_a3b_instruct_2507",
     )
 
     assert session_path.exists()
@@ -270,7 +270,7 @@ def test_issue_193_megatron_explicit_load_prepare_converges_outgoing_actor_only_
     assert persisted_manifest_calls == [
         {
             "session_id": "session_outgoing",
-            "actor_name": "megatron_qwen3_30b_a3b_instruct_2507",
+            "actor_name": "mint_megatron_qwen3_30b_a3b_instruct_2507",
             "worker_entries": [{"rank": 0, "path": "/tmp/r0.pt", "bytes": 123}],
         }
     ]
@@ -837,7 +837,7 @@ def test_issue_527_trusted_recovery_baseline_marker_roundtrip(tmp_path: Path):
         checkpoint_path=str(ckpt_dir),
         checkpoint_identity=identity,
         reason="unit_test",
-        actor_name="megatron_qwen3_30b_a3b_instruct_2507",
+        actor_name="mint_megatron_qwen3_30b_a3b_instruct_2507",
     )
 
     fresh = manager.get_trusted_recovery_baseline(session_id)

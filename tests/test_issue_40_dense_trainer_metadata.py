@@ -4,8 +4,8 @@ import pytest
 
 pytest.importorskip("ray")
 
-import tinker_server.backend.model_actor_inventory as model_actor_inventory_module
-from tinker_server.backend.model_actor_supervisor import ActorType, get_model_actor_supervisor
+import mint_server.backend.model_actor_inventory as model_actor_inventory_module
+from mint_server.backend.model_actor_supervisor import ActorType, get_model_actor_supervisor
 
 
 def test_model_actor_inventory_list_actors_includes_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -30,7 +30,7 @@ def test_model_actor_inventory_list_actors_labels_openpi_backend(monkeypatch: py
         num_gpus=1,
         base_model="openpi/pi0-fast-libero-low-mem-finetune",
         session_id="session_openpi",
-        metadata={"actor_id": "actor-123", "worker_module": "tinker_server.backend.openpi_fast_worker"},
+        metadata={"actor_id": "actor-123", "worker_module": "mint_server.backend.openpi_fast_worker"},
     )
     pool.mark_ready(actor_name)
 

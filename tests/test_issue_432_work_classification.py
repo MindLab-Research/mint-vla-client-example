@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from tinker_server.backend.work_classification import (
+from mint_server.backend.work_classification import (
     WorkClassification,
     build_sampling_work_classification,
     build_training_work_classification,

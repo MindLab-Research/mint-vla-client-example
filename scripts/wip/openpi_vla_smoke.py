@@ -116,8 +116,8 @@ def _delete_model(base_url: str, headers: dict[str, str], model_id: str) -> None
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--base-url", default=os.environ.get("TINKER_BASE_URL", "http://localhost:8000"))
-    parser.add_argument("--api-key", default=os.environ.get("TINKER_API_KEY", "dummy"))
+    parser.add_argument("--base-url", default=os.environ.get("MINT_BASE_URL", "http://localhost:8000"))
+    parser.add_argument("--api-key", default=os.environ.get("MINT_API_KEY", "dummy"))
     parser.add_argument("--model", choices=["openpi/pi0-fast-libero-low-mem-finetune", "openpi/pi05-libero-low-mem-finetune"], default="openpi/pi0-fast-libero-low-mem-finetune")
     parser.add_argument("--skip-action", action="store_true")
     parser.add_argument("--output-json", default="")

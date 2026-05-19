@@ -1,7 +1,7 @@
 import asyncio
 from types import SimpleNamespace
 
-from tinker_server.backend.training_engine_router import TrainingEngineRouter
+from mint_server.backend.training_engine_router import TrainingEngineRouter
 
 
 class _RecordingEngine:
@@ -81,7 +81,7 @@ def test_training_engine_router_delegates_openpi_pi05_models_by_training_backend
     session = SimpleNamespace(base_model="openpi/pi05-libero-low-mem-finetune")
 
     monkeypatch.setattr(
-        "tinker_server.backend.training_engine_router.get_model_config",
+        "mint_server.backend.training_engine_router.get_model_config",
         lambda base_model: SimpleNamespace(training_backend="openpi_pi05"),
     )
 
@@ -135,7 +135,7 @@ def test_training_engine_router_session_guard_state_fallback_when_backend_missin
     session = SimpleNamespace(base_model="openpi/no-guard", model_id="m-2")
 
     monkeypatch.setattr(
-        "tinker_server.backend.training_engine_router.get_model_config",
+        "mint_server.backend.training_engine_router.get_model_config",
         lambda base_model: SimpleNamespace(training_backend="openpi_fast"),
     )
 

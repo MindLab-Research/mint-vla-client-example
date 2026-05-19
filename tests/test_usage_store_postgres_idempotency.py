@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tinker_server.usage_store import PostgresUsageStore, UsageEvent
+from mint_server.usage_store import PostgresUsageStore, UsageEvent
 
 
 class _FakeConn:
@@ -511,7 +511,7 @@ def test_postgres_usage_store_requires_migration_when_event_id_nulls_exist(monke
 
 
 def test_schedule_usage_events_rejects_new_tasks_after_close_started(monkeypatch):
-    import tinker_server.usage_store as usage_store_module
+    import mint_server.usage_store as usage_store_module
 
     async def _never_write(events):
         await asyncio.sleep(60)
@@ -611,7 +611,7 @@ def test_postgres_usage_store_requires_source_index_default(monkeypatch):
 
 
 def test_close_usage_store_flushes_pending_tasks_before_cancel(monkeypatch):
-    import tinker_server.usage_store as usage_store_module
+    import mint_server.usage_store as usage_store_module
 
     wrote: list[str] = []
 
@@ -784,7 +784,7 @@ def test_postgres_usage_store_logs_pg_constraint_detail(monkeypatch, caplog):
             await store.write_event(event)
         await store.close()
 
-    caplog.set_level("WARNING", logger="tinker_server.usage_store")
+    caplog.set_level("WARNING", logger="mint_server.usage_store")
     asyncio.run(_run())
 
     assert "error_type=_PgDetailError" in caplog.text
@@ -818,7 +818,7 @@ def test_postgres_usage_store_does_not_retry_permanent_pg_constraint_errors(monk
             await store.write_event(event)
         await store.close()
 
-    caplog.set_level("WARNING", logger="tinker_server.usage_store")
+    caplog.set_level("WARNING", logger="mint_server.usage_store")
     asyncio.run(_run())
 
     assert state["insert_fetch_calls"] == 1

@@ -108,19 +108,19 @@ def test_issue_193_megatron_create_training_session_waits_for_ready_probe(monkey
 
     monkeypatch.setattr(engine, "_resolve_hf_model_path", lambda requested_model: f"/resolved/{requested_model}")
     monkeypatch.setattr(
-        "tinker_server.backend.model_registry.get_model_config",
+        "mint_server.backend.model_registry.get_model_config",
         lambda _model: SimpleNamespace(is_moe=True, train_use_fp8=False),
     )
     monkeypatch.setattr(
-        "tinker_server.backend.model_registry.get_training_parallelism",
+        "mint_server.backend.model_registry.get_training_parallelism",
         lambda _model: (1, 1, 1, 1, 1),
     )
     monkeypatch.setattr(
-        "tinker_server.backend.megatron_distributed.async_get_or_create_megatron_worker_group",
+        "mint_server.backend.megatron_distributed.async_get_or_create_megatron_worker_group",
         lambda **kwargs: asyncio.sleep(0, result=worker),
     )
     monkeypatch.setattr(
-        "tinker_server.backend.model_actor_supervisor.get_model_actor_supervisor",
+        "mint_server.backend.model_actor_supervisor.get_model_actor_supervisor",
         lambda: SimpleNamespace(
             touch=lambda *_args, **_kwargs: None,
             set_session=lambda *_args, **_kwargs: None,

@@ -2,7 +2,7 @@
 
 ## Scope
 
-This note documents usage billing storage migration in `tinker_server`:
+This note documents usage billing storage migration in `mint_server`:
 
 - Keep existing billing anchors in sampling/training success paths.
 - Replace sync JSONL-only sink with async usage store abstraction.
@@ -27,7 +27,7 @@ Each anchor emits one or more `UsageEvent` rows with:
 
 ## Storage abstraction
 
-`tinker_server/usage_store.py` defines:
+`mint_server/usage_store.py` defines:
 
 - `UsageStore` protocol (async write/query/summary/health)
 - `PostgresUsageStore` (asyncpg pool + sqlite durable outbox)

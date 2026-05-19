@@ -6,18 +6,18 @@ Date: 2026-04-08
 
 - Ray head: `192.168.39.23`
 - Assigned worker: `192.168.39.28`
-- Dedicated code root: `/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402`
+- Dedicated code root: `/vePFS-Mindverse/share/code/root/mint-server-pr422-vla-20260402`
 - Dedicated runtime env: `/vePFS-Mindverse/share/code/root/mint-runtime-py31213-openpi-pr422-20260402`
-- Dedicated namespaces used during the clean latest runs include `tinker_root_vla_pr422_20260408d` and `tinker_root_vla_pr422_20260408f`
+- Dedicated namespaces used during the clean latest runs include `mint_root_vla_pr422_20260408d` and `mint_root_vla_pr422_20260408f`
 
 ## Major fixes landed during validation
 
-- Action temperature is now forwarded into action sampling in `tinker_server/routes/action_sampling.py:20-30`.
-- Action-session recovery across queued act paths is now worker-module-aware in `tinker_server/backend/action_session_manager.py:96-122` and `tinker_server/backend/action_session_manager.py:453-485`.
-- Action-session state roots are now namespace-scoped in `tinker_server/backend/openpi_ray_runtime.py:41`.
-- FAST action decoding now fails loudly on malformed outputs in `tinker_server/backend/openpi_fast_action_worker.py:239-338`.
+- Action temperature is now forwarded into action sampling in `mint_server/routes/action_sampling.py:20-30`.
+- Action-session recovery across queued act paths is now worker-module-aware in `mint_server/backend/action_session_manager.py:96-122` and `mint_server/backend/action_session_manager.py:453-485`.
+- Action-session state roots are now namespace-scoped in `mint_server/backend/openpi_ray_runtime.py:41`.
+- FAST action decoding now fails loudly on malformed outputs in `mint_server/backend/openpi_fast_action_worker.py:239-338`.
 - The grouped RL harness no longer aborts on a same-state group with zero within-group reward variance; zero-variance groups now contribute zero centered reward instead.
-- Shared FAST action actor recreate drift on the tested deterministic paths was removed on the XLA-flags setup wired through `scripts/wip/openpi_vla_start_server.sh` and `tinker_server/backend/openpi_ray_runtime.py`.
+- Shared FAST action actor recreate drift on the tested deterministic paths was removed on the XLA-flags setup wired through `scripts/wip/openpi_vla_start_server.sh` and `mint_server/backend/openpi_ray_runtime.py`.
 
 ## Prompt task status
 

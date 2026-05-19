@@ -13,7 +13,7 @@ fi
 
 echo "CPFS_MOUNT $(mount | grep -F ' /vePFS-Mindverse ' || true)" >&2
 
-ckpt_root="/vePFS-Mindverse/share/tinker_checkpoints"
+ckpt_root="/vePFS-Mindverse/share/mint_checkpoints"
 if ! mkdir -p "${ckpt_root}" 2>/dev/null; then
   echo "ERROR: CPFS is not writable (mkdir failed): ${ckpt_root}" >&2
   exit 1

@@ -5,8 +5,8 @@ import sys
 import types
 from types import SimpleNamespace
 
-from tinker_server.backend import model_work_dispatch
-from tinker_server.models.types import ModelInput, SampleRequest, SamplingParams
+from mint_server.backend import model_work_dispatch
+from mint_server.models.types import ModelInput, SampleRequest, SamplingParams
 
 
 def test_sampling_work_executor_forwards_gateway_auth(monkeypatch):
@@ -47,7 +47,7 @@ def test_sampling_work_executor_forwards_gateway_auth(monkeypatch):
     )
 
     monkeypatch.setitem(sys.modules, "ray", ray_module)
-    monkeypatch.setattr("tinker_server.routes.sampling._do_sample", _capture_do_sample)
+    monkeypatch.setattr("mint_server.routes.sampling._do_sample", _capture_do_sample)
 
     asyncio.run(model_work_dispatch.execute_model_work_item(item))
 

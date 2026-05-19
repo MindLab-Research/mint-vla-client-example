@@ -40,10 +40,10 @@ def _queued_payload(call: dict) -> dict:
 def test_issue_283_create_model_from_state_queues_resolved_checkpoint_path_without_admission_reservation(
     tmp_path: Path, monkeypatch
 ) -> None:
-    from tinker_server.routes import training as training_routes
-    from tinker_server import checkpoints as checkpoints_module
-    import tinker_server.backend.model_work_scheduler as scheduler_module
-    import tinker_server.gateway as gateway_module
+    from mint_server.routes import training as training_routes
+    from mint_server import checkpoints as checkpoints_module
+    import mint_server.backend.model_work_scheduler as scheduler_module
+    import mint_server.gateway as gateway_module
 
     training_routes.CHECKPOINTS_DIR = str(tmp_path)
     checkpoints_module.CHECKPOINTS_DIR = str(tmp_path)
@@ -123,9 +123,9 @@ def test_issue_283_create_model_from_state_queues_resolved_checkpoint_path_witho
 def test_issue_283_create_model_from_state_missing_checkpoint_returns_404(
     tmp_path: Path, monkeypatch
 ) -> None:
-    from tinker_server.routes import training as training_routes
-    from tinker_server import checkpoints as checkpoints_module
-    import tinker_server.gateway as gateway_module
+    from mint_server.routes import training as training_routes
+    from mint_server import checkpoints as checkpoints_module
+    import mint_server.gateway as gateway_module
 
     training_routes.CHECKPOINTS_DIR = str(tmp_path)
     checkpoints_module.CHECKPOINTS_DIR = str(tmp_path)
@@ -160,8 +160,8 @@ def test_issue_283_create_model_from_state_missing_checkpoint_returns_404(
 
 
 def test_issue_283_create_model_from_state_background_uses_resolved_path(tmp_path: Path, monkeypatch) -> None:
-    from tinker_server.routes import training as training_routes
-    from tinker_server.models.types import CreateModelFromStateRequest, LoRAConfig
+    from mint_server.routes import training as training_routes
+    from mint_server.models.types import CreateModelFromStateRequest, LoRAConfig
 
     checkpoint_dir = tmp_path / "resolved-checkpoint"
     checkpoint_dir.mkdir()
@@ -230,8 +230,8 @@ def test_issue_283_create_model_from_state_background_uses_resolved_path(tmp_pat
     stub_engine = StubTrainingEngine()
     stub_task_futures = StubTaskFutureService()
 
-    import tinker_server.backend.session_index_store as session_index_store_module
-    import tinker_server.backend.training_session_store as training_store_module
+    import mint_server.backend.session_index_store as session_index_store_module
+    import mint_server.backend.training_session_store as training_store_module
 
     training_store_updates: list[dict] = []
     session_index_updates: list[tuple[str, str, str | None, str]] = []
@@ -277,11 +277,11 @@ def test_issue_283_create_model_from_state_background_uses_resolved_path(tmp_pat
 def test_issue_417_create_model_from_state_persists_loaded_lora_config(
     tmp_path: Path, monkeypatch
 ) -> None:
-    from tinker_server.routes import training as training_routes
-    from tinker_server.backend.training_session_manager import TrainingSessionManager
-    from tinker_server.models.types import CreateModelFromStateRequest, LoRAConfig
-    import tinker_server.backend.session_index_store as session_index_store_module
-    import tinker_server.backend.training_session_store as training_store_module
+    from mint_server.routes import training as training_routes
+    from mint_server.backend.training_session_manager import TrainingSessionManager
+    from mint_server.models.types import CreateModelFromStateRequest, LoRAConfig
+    import mint_server.backend.session_index_store as session_index_store_module
+    import mint_server.backend.training_session_store as training_store_module
 
     checkpoint_dir = tmp_path / "loaded-config-checkpoint"
     checkpoint_dir.mkdir()
@@ -370,11 +370,11 @@ def test_issue_417_create_model_from_state_persists_loaded_lora_config(
 def test_issue_283_create_model_from_state_background_restores_openpi_training_checkpoint(
     tmp_path: Path, monkeypatch
 ) -> None:
-    from tinker_server.routes import training as training_routes
-    from tinker_server.backend.training_engine_router import TrainingEngineRouter
-    from tinker_server.models.types import CreateModelFromStateRequest
-    import tinker_server.backend.session_index_store as session_index_store_module
-    import tinker_server.backend.training_session_store as training_store_module
+    from mint_server.routes import training as training_routes
+    from mint_server.backend.training_engine_router import TrainingEngineRouter
+    from mint_server.models.types import CreateModelFromStateRequest
+    import mint_server.backend.session_index_store as session_index_store_module
+    import mint_server.backend.training_session_store as training_store_module
 
     checkpoint_dir = tmp_path / "openpi-training"
     (checkpoint_dir / "1" / "params").mkdir(parents=True)
@@ -502,10 +502,10 @@ def test_issue_283_create_model_from_state_background_restores_openpi_training_c
 
 
 def test_issue_283_load_state_route_queues_resolved_path(tmp_path: Path, monkeypatch) -> None:
-    from tinker_server.routes import training as training_routes
-    from tinker_server.routes import weights as weights_routes
-    from tinker_server import checkpoints as checkpoints_module
-    import tinker_server.backend.model_work_scheduler as scheduler_module
+    from mint_server.routes import training as training_routes
+    from mint_server.routes import weights as weights_routes
+    from mint_server import checkpoints as checkpoints_module
+    import mint_server.backend.model_work_scheduler as scheduler_module
 
     weights_routes.CHECKPOINTS_DIR = str(tmp_path)
     checkpoints_module.CHECKPOINTS_DIR = str(tmp_path)
@@ -599,9 +599,9 @@ def test_issue_283_load_state_route_queues_resolved_path(tmp_path: Path, monkeyp
 
 
 def test_issue_283_load_state_background_uses_resolved_path(tmp_path: Path, monkeypatch) -> None:
-    from tinker_server.routes import weights as weights_routes
-    from tinker_server.models.types import LoadStateRequest
-    import tinker_server.backend.training_session_store as training_store_module
+    from mint_server.routes import weights as weights_routes
+    from mint_server.models.types import LoadStateRequest
+    import mint_server.backend.training_session_store as training_store_module
 
     checkpoint_dir = tmp_path / "resolved-load-state"
     checkpoint_dir.mkdir()
@@ -701,9 +701,9 @@ def test_issue_283_load_state_background_uses_resolved_path(tmp_path: Path, monk
 
 
 def test_issue_417_load_state_persists_loaded_lora_config(tmp_path: Path, monkeypatch) -> None:
-    from tinker_server.routes import weights as weights_routes
-    from tinker_server.models.types import LoadStateRequest, LoRAConfig
-    import tinker_server.backend.training_session_store as training_store_module
+    from mint_server.routes import weights as weights_routes
+    from mint_server.models.types import LoadStateRequest, LoRAConfig
+    import mint_server.backend.training_session_store as training_store_module
 
     checkpoint_dir = tmp_path / "issue-417-load"
     checkpoint_dir.mkdir()
@@ -810,7 +810,7 @@ def test_issue_417_load_state_persists_loaded_lora_config(tmp_path: Path, monkey
             "current_step": 12,
             "backend": "megatron",
             "actor_name": "megatron-actor-417",
-            "namespace": "tinker",
+            "namespace": "mint",
             "user_id": "original-user",
             "created_at": "2026-03-13T00:00:00Z",
             "last_activity": 1.0,
@@ -827,9 +827,9 @@ def test_issue_417_load_state_reports_success_when_metadata_persist_fails_after_
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    from tinker_server.routes import weights as weights_routes
-    from tinker_server.models.types import LoadStateRequest, LoRAConfig
-    import tinker_server.backend.training_session_store as training_store_module
+    from mint_server.routes import weights as weights_routes
+    from mint_server.models.types import LoadStateRequest, LoRAConfig
+    import mint_server.backend.training_session_store as training_store_module
 
     checkpoint_dir = tmp_path / "issue-417-load-persist-fail"
     checkpoint_dir.mkdir()
@@ -932,9 +932,9 @@ def test_issue_417_load_state_reports_success_when_metadata_persist_fails_after_
 
 
 def test_issue_283_save_routes_use_detached_training_info_without_route_runtime(monkeypatch) -> None:
-    from tinker_server.routes import training as training_routes
-    from tinker_server.routes import weights as weights_routes
-    import tinker_server.backend.model_work_scheduler as scheduler_module
+    from mint_server.routes import training as training_routes
+    from mint_server.routes import weights as weights_routes
+    import mint_server.backend.model_work_scheduler as scheduler_module
 
     class StubTaskFutureService:
         async def async_create_with_id(self, request_id: str) -> None:
@@ -981,10 +981,10 @@ def test_issue_283_save_routes_use_detached_training_info_without_route_runtime(
 
 
 def test_issue_283_load_state_route_uses_detached_training_info_without_route_runtime(tmp_path: Path, monkeypatch) -> None:
-    from tinker_server.routes import training as training_routes
-    from tinker_server.routes import weights as weights_routes
-    from tinker_server import checkpoints as checkpoints_module
-    import tinker_server.backend.model_work_scheduler as scheduler_module
+    from mint_server.routes import training as training_routes
+    from mint_server.routes import weights as weights_routes
+    from mint_server import checkpoints as checkpoints_module
+    import mint_server.backend.model_work_scheduler as scheduler_module
 
     weights_routes.CHECKPOINTS_DIR = str(tmp_path)
     checkpoints_module.CHECKPOINTS_DIR = str(tmp_path)
@@ -1065,9 +1065,9 @@ def test_issue_283_load_state_route_uses_detached_training_info_without_route_ru
 
 
 def test_issue_283_save_routes_restore_inflight_protection(monkeypatch) -> None:
-    from tinker_server.routes import training as training_routes
-    from tinker_server.routes import weights as weights_routes
-    import tinker_server.backend.model_work_scheduler as scheduler_module
+    from mint_server.routes import training as training_routes
+    from mint_server.routes import weights as weights_routes
+    import mint_server.backend.model_work_scheduler as scheduler_module
 
     class StubTaskFutureService:
         async def async_create_with_id(self, request_id: str) -> None:
@@ -1121,10 +1121,10 @@ def test_issue_283_save_routes_restore_inflight_protection(monkeypatch) -> None:
 
 
 def test_issue_283_load_state_route_restores_inflight_protection(tmp_path: Path, monkeypatch) -> None:
-    from tinker_server.routes import training as training_routes
-    from tinker_server.routes import weights as weights_routes
-    from tinker_server import checkpoints as checkpoints_module
-    import tinker_server.backend.model_work_scheduler as scheduler_module
+    from mint_server.routes import training as training_routes
+    from mint_server.routes import weights as weights_routes
+    from mint_server import checkpoints as checkpoints_module
+    import mint_server.backend.model_work_scheduler as scheduler_module
 
     weights_routes.CHECKPOINTS_DIR = str(tmp_path)
     checkpoints_module.CHECKPOINTS_DIR = str(tmp_path)
@@ -1210,10 +1210,10 @@ def test_issue_283_load_state_route_restores_inflight_protection(tmp_path: Path,
 
 @pytest.mark.parametrize("route_path", ["save_weights", "save_state", "load_state"])
 def test_issue_283_weights_routes_propagate_detached_store_503(monkeypatch, route_path: str) -> None:
-    from tinker_server.routes import training as training_routes
-    from tinker_server.routes import weights as weights_routes
-    import tinker_server.backend.training_session_store as training_store_module
-    import tinker_server.gateway as gateway_module
+    from mint_server.routes import training as training_routes
+    from mint_server.routes import weights as weights_routes
+    import mint_server.backend.training_session_store as training_store_module
+    import mint_server.gateway as gateway_module
 
     async def _get_training_route_session_info(_model_id: str):
         return None
@@ -1243,9 +1243,9 @@ def test_issue_283_weights_routes_propagate_detached_store_503(monkeypatch, rout
     assert resp.status_code == 503, resp.text
     assert resp.json()["detail"] == "Training session store unavailable"
 def test_issue_283_save_routes_refresh_detached_enqueue_protection(monkeypatch) -> None:
-    from tinker_server.routes import training as training_routes
-    from tinker_server.routes import weights as weights_routes
-    import tinker_server.backend.model_work_scheduler as scheduler_module
+    from mint_server.routes import training as training_routes
+    from mint_server.routes import weights as weights_routes
+    import mint_server.backend.model_work_scheduler as scheduler_module
 
     class StubTaskFutureService:
         async def async_create_with_id(self, request_id: str) -> None:
@@ -1297,10 +1297,10 @@ def test_issue_283_save_routes_refresh_detached_enqueue_protection(monkeypatch) 
     assert [entry["session_id"] for entry in protected] == ["sess-283", "sess-283"]
 
 def test_issue_283_load_state_route_refreshes_detached_enqueue_protection(tmp_path: Path, monkeypatch) -> None:
-    from tinker_server.routes import training as training_routes
-    from tinker_server.routes import weights as weights_routes
-    from tinker_server import checkpoints as checkpoints_module
-    import tinker_server.backend.model_work_scheduler as scheduler_module
+    from mint_server.routes import training as training_routes
+    from mint_server.routes import weights as weights_routes
+    from mint_server import checkpoints as checkpoints_module
+    import mint_server.backend.model_work_scheduler as scheduler_module
 
     weights_routes.CHECKPOINTS_DIR = str(tmp_path)
     checkpoints_module.CHECKPOINTS_DIR = str(tmp_path)

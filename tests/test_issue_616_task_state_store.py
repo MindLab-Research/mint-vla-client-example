@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from tinker_server.backend.task_state_store import (
+from mint_server.backend.task_state_store import (
     TaskStateConflictError,
     TaskStateStore,
     _TaskStateStoreActor,

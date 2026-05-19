@@ -7,11 +7,11 @@ from typing import Any
 import requests
 
 
-BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000").rstrip("/")
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
+BASE_URL = os.environ.get("MINT_BASE_URL", "http://localhost:8000").rstrip("/")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
 
-MODEL = os.environ.get("TINKER_MODEL") or "Qwen/Qwen3-30B-A3B-Instruct-2507"
-POLL_DELAY_S = float(os.environ.get("TINKER_POLL_DELAY_S", "0.2"))
+MODEL = os.environ.get("MINT_MODEL") or "Qwen/Qwen3-30B-A3B-Instruct-2507"
+POLL_DELAY_S = float(os.environ.get("MINT_POLL_DELAY_S", "0.2"))
 
 
 def _headers() -> dict[str, str]:

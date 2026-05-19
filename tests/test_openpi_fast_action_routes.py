@@ -132,7 +132,7 @@ class _StubModelWorkScheduler:
 
 
 def test_create_action_session_route_resolves_checkpoint_path_before_manager(monkeypatch) -> None:
-    from tinker_server.routes import mint as mint_routes
+    from mint_server.routes import mint as mint_routes
 
     manager = _FakeActionSessionManager()
     resolve_calls: list[dict[str, object]] = []
@@ -184,7 +184,7 @@ def test_create_action_session_route_resolves_checkpoint_path_before_manager(mon
 
 
 def test_create_action_session_route_infers_base_model_with_admin_scope(monkeypatch) -> None:
-    from tinker_server.routes import mint as mint_routes
+    from mint_server.routes import mint as mint_routes
 
     manager = _FakeActionSessionManager()
     infer_calls: list[dict[str, object]] = []
@@ -251,7 +251,7 @@ def test_create_action_session_route_infers_base_model_with_admin_scope(monkeypa
 
 
 def test_act_route_rejects_missing_state(monkeypatch) -> None:
-    from tinker_server.routes import mint as mint_routes
+    from mint_server.routes import mint as mint_routes
 
     monkeypatch.setattr(mint_routes, "action_session_manager", _FakeActionSessionManager(), raising=False)
 
@@ -286,7 +286,7 @@ def test_act_route_rejects_missing_state(monkeypatch) -> None:
 
 
 def test_delete_action_session_route_calls_shutdown(monkeypatch) -> None:
-    from tinker_server.routes import mint as mint_routes
+    from mint_server.routes import mint as mint_routes
 
     manager = _FakeActionSessionManager()
     monkeypatch.setattr(mint_routes, "action_session_manager", manager, raising=False)
@@ -306,8 +306,8 @@ def test_delete_action_session_route_calls_shutdown(monkeypatch) -> None:
 
 
 def test_do_act_resolves_future_with_actions(monkeypatch) -> None:
-    from tinker_server.routes import action_sampling as action_routes
-    from tinker_server.models.types import ActRequest, EncodedTextChunk, ImageChunk, ModelInput, TensorData
+    from mint_server.routes import action_sampling as action_routes
+    from mint_server.models.types import ActRequest, EncodedTextChunk, ImageChunk, ModelInput, TensorData
 
     manager = _FakeActionSessionManager()
     task_futures = _FakeTaskFutureService()
@@ -354,8 +354,8 @@ def test_do_act_resolves_future_with_actions(monkeypatch) -> None:
 
 
 def test_do_act_prefers_async_task_futures_api(monkeypatch) -> None:
-    from tinker_server.routes import action_sampling as action_routes
-    from tinker_server.models.types import ActRequest, EncodedTextChunk, ImageChunk, ModelInput, TensorData
+    from mint_server.routes import action_sampling as action_routes
+    from mint_server.models.types import ActRequest, EncodedTextChunk, ImageChunk, ModelInput, TensorData
 
     manager = _FakeActionSessionManager()
     task_futures = _AsyncResolvingTaskFutureService()
@@ -402,8 +402,8 @@ def test_do_act_prefers_async_task_futures_api(monkeypatch) -> None:
 
 
 def test_do_act_logs_when_future_fail_marking_fails(monkeypatch) -> None:
-    from tinker_server.routes import action_sampling as action_routes
-    from tinker_server.models.types import ActRequest, EncodedTextChunk, ImageChunk, ModelInput, TensorData
+    from mint_server.routes import action_sampling as action_routes
+    from mint_server.models.types import ActRequest, EncodedTextChunk, ImageChunk, ModelInput, TensorData
 
     class _ExplodingActionSessionManager:
         async def act(self, *, action_session_id: str, observation, extra_inputs):
@@ -449,7 +449,7 @@ def test_do_act_logs_when_future_fail_marking_fails(monkeypatch) -> None:
 
 
 def test_mint_action_route_enqueues_expected_request(monkeypatch) -> None:
-    from tinker_server.routes import mint as mint_routes
+    from mint_server.routes import mint as mint_routes
 
     task_futures = _AsyncFakeTaskFutureService()
     scheduler = _StubModelWorkScheduler()
@@ -457,7 +457,7 @@ def test_mint_action_route_enqueues_expected_request(monkeypatch) -> None:
     monkeypatch.setattr(mint_routes, "task_futures", task_futures, raising=False)
     monkeypatch.setattr(mint_routes, "action_session_manager", object(), raising=False)
 
-    import tinker_server.backend.model_work_scheduler as mws
+    import mint_server.backend.model_work_scheduler as mws
 
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
 
@@ -510,9 +510,9 @@ def test_mint_action_route_enqueues_expected_request(monkeypatch) -> None:
 
 
 def test_legacy_action_public_routes_are_not_exposed(monkeypatch) -> None:
-    from tinker_server.routes import action_sampling as action_routes
-    from tinker_server.routes import mint as mint_routes
-    from tinker_server.routes import service as service_routes
+    from mint_server.routes import action_sampling as action_routes
+    from mint_server.routes import mint as mint_routes
+    from mint_server.routes import service as service_routes
 
     manager = _FakeActionSessionManager()
     monkeypatch.setattr(service_routes, "action_session_manager", manager, raising=False)

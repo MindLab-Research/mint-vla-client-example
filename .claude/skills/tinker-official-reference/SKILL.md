@@ -14,7 +14,7 @@ description: |
 
 Primary reference: section files under `references/upstream/` (docs pages and api-reference pages).
 
-When updating routes or `tinker_server/models/types.py`, treat this reference as the source of truth for client-visible semantics.
+When updating routes or `mint_server/models/types.py`, treat this reference as the source of truth for client-visible semantics.
 
 ## Upstream source and updates
 

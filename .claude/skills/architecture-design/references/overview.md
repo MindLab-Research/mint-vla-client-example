@@ -1,6 +1,6 @@
 # Mint architecture overview
 
-Mint (tinker-server) is a FastAPI service that implements the Tinker REST contract and brokers training and inference to Ray GPU actors. The server is a control plane plus request validation, not a compute engine. The design is shaped by two goals: keep compatibility with the Tinker API contract, and multiplex GPU resources across many LoRA sessions for both inference and training.
+mint-server is a FastAPI service that implements the Tinker REST contract and brokers training and inference to Ray GPU actors. The server is a control plane plus request validation, not a compute engine. The design is shaped by two goals: keep compatibility with the Tinker API contract, and multiplex GPU resources across many LoRA sessions for both inference and training.
 
 Dependency management follows the same control-plane versus compute-engine split:
 - the worker image owns ABI-bound GPU packages

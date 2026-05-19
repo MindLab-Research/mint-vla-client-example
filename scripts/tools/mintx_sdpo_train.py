@@ -21,8 +21,8 @@ import tinker
 from transformers import AutoTokenizer
 
 OWNER_ID = (
-    os.environ.get("TINKER_OWNER_ID")
-    or os.environ.get("TINKER_USER_ID")
+    os.environ.get("MINT_OWNER_ID")
+    or os.environ.get("MINT_USER_ID")
     or os.environ.get("MINT_GATEWAY_USER_ID")
     or "mintx_sdpo_user"
 )

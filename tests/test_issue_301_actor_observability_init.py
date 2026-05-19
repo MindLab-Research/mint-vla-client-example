@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-import tinker_server.logging_context as logging_context
+import mint_server.logging_context as logging_context
 
 
 def test_issue_301_configure_logging_fallback_without_structlog(monkeypatch):
@@ -26,14 +26,14 @@ def test_issue_301_configure_logging_fallback_without_structlog(monkeypatch):
 def test_issue_301_actor_entrypoints_call_observability_init():
     repo_root = Path(__file__).resolve().parents[1]
     required = {
-        "tinker_server/backend/verl_inference.py": 1,
-        "tinker_server/backend/multinode_inference.py": 1,
-        "tinker_server/backend/megatron_distributed.py": 2,
-        "tinker_server/backend/verl_training.py": 1,
-        "tinker_server/backend/sampling_session_store.py": 1,
-        "tinker_server/backend/session_index_store.py": 1,
-        "tinker_server/backend/training_session_store.py": 1,
-        "tinker_server/backend/gateway_session_store.py": 1,
+        "mint_server/backend/verl_inference.py": 1,
+        "mint_server/backend/multinode_inference.py": 1,
+        "mint_server/backend/megatron_distributed.py": 2,
+        "mint_server/backend/verl_training.py": 1,
+        "mint_server/backend/sampling_session_store.py": 1,
+        "mint_server/backend/session_index_store.py": 1,
+        "mint_server/backend/training_session_store.py": 1,
+        "mint_server/backend/gateway_session_store.py": 1,
     }
 
     for rel_path, min_count in required.items():
@@ -45,8 +45,8 @@ def test_issue_301_actor_entrypoints_call_observability_init():
 def test_issue_301_sampling_actor_entrypoints_use_traceparent_span_decorator():
     repo_root = Path(__file__).resolve().parents[1]
     required = {
-        "tinker_server/backend/verl_inference.py": 7,
-        "tinker_server/backend/multinode_inference.py": 4,
+        "mint_server/backend/verl_inference.py": 7,
+        "mint_server/backend/multinode_inference.py": 4,
     }
 
     for rel_path, min_count in required.items():

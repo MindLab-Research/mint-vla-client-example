@@ -31,7 +31,7 @@ class OpsBackendConfig:
         mint_base_url = (
             os.getenv("MINT_OPS_MINT_BASE_URL")
             or os.getenv("MINT_BASE_URL")
-            or os.getenv("TINKER_BASE_URL")
+            or os.getenv("MINT_BASE_URL")
             or ""
         ).strip()
         ray_address = (
@@ -42,7 +42,7 @@ class OpsBackendConfig:
         api_key = (
             os.getenv("MINT_OPS_API_KEY")
             or os.getenv("MINT_API_KEY")
-            or os.getenv("TINKER_API_KEY")
+            or os.getenv("MINT_API_KEY")
             or None
         )
         return cls(

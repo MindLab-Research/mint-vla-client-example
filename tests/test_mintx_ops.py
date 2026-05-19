@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 from safetensors.torch import load_file, save_file
 
-from tinker_server.backend.mintx_ops import (
+from mint_server.backend.mintx_ops import (
     compute_teacher_log_probs_cpu,
     interpolate_checkpoints_to_dir,
     reverse_kl_from_teacher_log_probs,

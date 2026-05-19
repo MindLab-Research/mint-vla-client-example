@@ -4,8 +4,8 @@ from types import SimpleNamespace
 
 
 def test_issue_439_megatron_pg_recreates_incompatible_named_group(monkeypatch) -> None:
-    from tinker_server.backend import megatron_distributed as dist
-    from tinker_server.backend.ray_placement_groups import PlacementGroupMismatchError
+    from mint_server.backend import megatron_distributed as dist
+    from mint_server.backend.ray_placement_groups import PlacementGroupMismatchError
 
     old_pg = object()
     new_pg = object()
@@ -31,7 +31,7 @@ def test_issue_439_megatron_pg_recreates_incompatible_named_group(monkeypatch) -
 
 
 def test_issue_439_node_affinity_resources_follow_bundle_pin() -> None:
-    from tinker_server.backend import megatron_distributed as dist
+    from mint_server.backend import megatron_distributed as dist
 
     bundle = {"GPU": 1, "CPU": 1, "node:192.168.38.175": 0.001}
     assert dist._bundle_node_ip(bundle) == "192.168.38.175"
@@ -42,7 +42,7 @@ def test_issue_439_node_affinity_resources_follow_bundle_pin() -> None:
 
 
 def test_issue_439_megatron_pg_name_is_namespace_scoped() -> None:
-    from tinker_server.backend import megatron_distributed as dist
+    from mint_server.backend import megatron_distributed as dist
 
     name_a = dist._make_megatron_pg_name(
         "Qwen/Qwen3-30B-A3B-Instruct-2507",
@@ -54,12 +54,12 @@ def test_issue_439_megatron_pg_name_is_namespace_scoped() -> None:
     )
 
     assert name_a != name_b
-    assert name_a.startswith("megatron_qwen3_30b_a3b_instruct_2507_")
+    assert name_a.startswith("mint_megatron_qwen3_30b_a3b_instruct_2507_")
     assert name_a.endswith("_pg")
 
 
 def test_issue_439_megatron_diagnostics_report_requested_nodes() -> None:
-    from tinker_server.backend import megatron_distributed as dist
+    from mint_server.backend import megatron_distributed as dist
 
     cls = dist.MegatronWorkerGroup.__ray_metadata__.modified_class
     group = cls.__new__(cls)

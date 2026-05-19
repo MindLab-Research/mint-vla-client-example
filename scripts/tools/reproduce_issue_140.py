@@ -6,12 +6,12 @@ from typing import Any
 
 import requests
 
-BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000").rstrip("/")
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
+BASE_URL = os.environ.get("MINT_BASE_URL", "http://localhost:8000").rstrip("/")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
 
-BASE_MODEL = os.environ.get("TINKER_MODEL", "Qwen/Qwen3-0.6B")
-IDLE_S = float(os.environ.get("TINKER_IDLE_S", "360"))
-POLL_TIMEOUT_S = float(os.environ.get("TINKER_POLL_TIMEOUT_S", "600"))
+BASE_MODEL = os.environ.get("MINT_MODEL", "Qwen/Qwen3-0.6B")
+IDLE_S = float(os.environ.get("MINT_IDLE_S", "360"))
+POLL_TIMEOUT_S = float(os.environ.get("MINT_POLL_TIMEOUT_S", "600"))
 
 
 def _headers() -> dict[str, str]:

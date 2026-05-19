@@ -621,10 +621,10 @@ def _run_distribution(
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--base-url", default=os.environ.get("TINKER_BASE_URL") or os.environ.get("MINT_BASE_URL") or "http://localhost:8000")
+    p.add_argument("--base-url", default=os.environ.get("MINT_BASE_URL") or os.environ.get("MINT_BASE_URL") or "http://localhost:8000")
     p.add_argument("--model", required=True)
     p.add_argument("--distributions", default="distinct,uniform,skewed,identical")
-    p.add_argument("--api-key", default=os.environ.get("TINKER_API_KEY") or os.environ.get("MINT_API_KEY") or "")
+    p.add_argument("--api-key", default=os.environ.get("MINT_API_KEY") or os.environ.get("MINT_API_KEY") or "")
     p.add_argument("--num-requests", type=int, default=24)
     p.add_argument("--num-samples", type=int, default=8)
     p.add_argument("--prompt-lens", default="2048,8192,16000")

@@ -9,14 +9,14 @@ from fastapi.responses import JSONResponse
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
 
-from tinker_server import app as app_module
-from tinker_server.gateway_auth import GatewayAuthContext
-from tinker_server.gateway_auth import (
+from mint_server import app as app_module
+from mint_server.gateway_auth import GatewayAuthContext
+from mint_server.gateway_auth import (
     build_billing_auth_context,
     extract_gateway_auth_context_from_headers,
     has_gateway_auth_headers,
 )
-from tinker_server.model_access_control import can_access_model
+from mint_server.model_access_control import can_access_model
 
 
 @pytest.fixture
@@ -324,10 +324,10 @@ async def test_http_observability_includes_gateway_identity(monkeypatch, caplog,
     request = Request(scope)
 
     async def endpoint(_request):
-        logging.getLogger("tinker_server.app").info("inside-endpoint")
+        logging.getLogger("mint_server.app").info("inside-endpoint")
         return JSONResponse({"ok": True})
 
-    with caplog.at_level(logging.INFO, logger="tinker_server.app"):
+    with caplog.at_level(logging.INFO, logger="mint_server.app"):
         response = await app_module.api_key_auth_middleware(
             request,
             lambda req: app_module.otel_trace_metrics_middleware(req, endpoint),

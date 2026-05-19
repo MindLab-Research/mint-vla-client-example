@@ -5,9 +5,9 @@ import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
 
-from tinker_server.models.types import ModelInput, SampleRequest, SamplingParams
-from tinker_server.routes import sampling as sampling_route
-from tinker_server.routes import service as service_route
+from mint_server.models.types import ModelInput, SampleRequest, SamplingParams
+from mint_server.routes import sampling as sampling_route
+from mint_server.routes import service as service_route
 
 
 class _StubSamplingSessionManager:
@@ -138,8 +138,8 @@ def test_asample_normalizes_direct_selector_before_enqueue(monkeypatch, selector
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
     monkeypatch.setattr(sampling_route, "task_futures", stub_fs)
 
-    import tinker_server.backend.model_registry as model_registry
-    import tinker_server.backend.model_work_scheduler as mws
+    import mint_server.backend.model_registry as model_registry
+    import mint_server.backend.model_work_scheduler as mws
 
     monkeypatch.setattr(model_registry, "get_model_config", lambda _model: SimpleNamespace(max_model_len=4096))
     monkeypatch.setattr(mws, "model_work_scheduler", stub_scheduler)

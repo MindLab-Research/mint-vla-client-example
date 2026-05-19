@@ -1,4 +1,4 @@
-from tinker_server.backend.multinode_resources import compute_multinode_engine_resources
+from mint_server.backend.multinode_resources import compute_multinode_engine_resources
 
 
 def test_issue_82_multinode_controller_does_not_reserve_extra_gpu() -> None:

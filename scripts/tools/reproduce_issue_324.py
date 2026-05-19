@@ -12,7 +12,7 @@ from typing import Any
 
 import requests
 
-from tinker_server.models.types import ModelInput, SampleRequest, SamplingParams
+from mint_server.models.types import ModelInput, SampleRequest, SamplingParams
 
 
 @dataclass(frozen=True)
@@ -29,7 +29,7 @@ def _fail(message: str) -> int:
 
 
 def _env() -> Env:
-    base_url = (os.environ.get("TINKER_BASE_URL") or "http://localhost:8000").rstrip("/")
+    base_url = (os.environ.get("MINT_BASE_URL") or "http://localhost:8000").rstrip("/")
     internal_api_token = (os.environ.get("INTERNAL_API_TOKEN") or "").strip()
     if not internal_api_token:
         raise SystemExit("error: missing env INTERNAL_API_TOKEN")

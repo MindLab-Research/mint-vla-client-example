@@ -6,7 +6,7 @@ import pytest
 
 
 def test_lifespan_fails_before_yield_when_ray_init_fails(monkeypatch: pytest.MonkeyPatch) -> None:
-    from tinker_server import app as app_module
+    from mint_server import app as app_module
 
     def _fail_init_ray(*_args, **_kwargs) -> None:
         raise RuntimeError("ray startup unavailable")

@@ -2,8 +2,9 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
-from tinker_server.app import external_compatibility_middleware
-from tinker_server.compatibility import rewrite_legacy_tinker_uris
+from mint_server.app import external_compatibility_middleware
+from mint_server.compatibility import rewrite_legacy_tinker_uris
+from mint_server.runtime_env import env_get
 
 
 def test_rewrite_legacy_tinker_uris_recurses() -> None:
@@ -45,3 +46,18 @@ def test_external_compatibility_middleware_rewrites_json_body() -> None:
         "model_path": "mint://run/sampler_weights/ckpt",
         "nested": {"state_path": "mint://run/weights/ckpt"},
     }
+
+
+def test_tinker_env_aliases_are_compatibility_inputs(monkeypatch) -> None:
+    env = {
+        "TINKER_BASE_URL": "http://compat.example",
+        "TINKER_API_KEY": "compat-key",
+    }
+
+    assert env_get(env, "MINT_BASE_URL") == "http://compat.example"
+    assert env_get(env, "MINT_API_KEY") == "compat-key"
+
+    monkeypatch.setenv("TINKER_BASE_URL", "http://launcher.example")
+    from scripts.run_server import _env_get
+
+    assert _env_get({"TINKER_BASE_URL": "http://launcher.example"}, "MINT_BASE_URL") == "http://launcher.example"

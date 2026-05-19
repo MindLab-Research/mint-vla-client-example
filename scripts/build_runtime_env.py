@@ -82,7 +82,7 @@ def _load_pyproject() -> dict[str, Any]:
 
 
 def _runtime_table(pyproject: dict[str, Any]) -> dict[str, Any]:
-    return pyproject["tool"]["tinker"]["runtime_env"]
+    return pyproject["tool"]["mint"]["runtime_env"]
 
 
 def _shared_deps(pyproject: dict[str, Any]) -> list[str]:
@@ -124,7 +124,7 @@ def _partition_host_requirements(requirements: list[str]) -> tuple[list[str], li
 
 
 def _runtime_env_symbols():
-    from tinker_server.runtime_env import (
+    from mint_server.runtime_env import (
         DEFAULT_BASE_PYTHON_DIRNAME,
         DEFAULT_HOST_VENV_DIRNAME,
         DEFAULT_SITE_PACKAGES_DIRNAME,
@@ -448,7 +448,7 @@ def _write_host_pth(env_root: Path, host_python: Path) -> None:
         [str(host_python), "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
         text=True,
     ).strip()
-    pth = Path(purelib) / "tinker_runtime_env.pth"
+    pth = Path(purelib) / "mint_runtime_env.pth"
     lines = [layout.site_packages, *layout.pythonpath_entries[1:], *layout.host_pythonpath_entries]
     code = (
         "import sys; "

@@ -8,7 +8,7 @@ import time
 from queue import Empty
 from types import SimpleNamespace
 
-from tinker_server import ray_utils
+from mint_server import ray_utils
 
 
 def _holder_proc(lock_path: str, acquired_evt: mp.synchronize.Event, release_evt: mp.synchronize.Event, out_q: mp.Queue) -> None:
@@ -86,12 +86,12 @@ def test_init_ray_resolves_auto_address(monkeypatch):
     monkeypatch.setattr(ray_utils, "_ray_init_interprocess_lock", _no_lock)
     monkeypatch.setitem(sys.modules, "ray", fake_ray)
 
-    out = ray_utils.init_ray(address="auto", namespace="tinker", ignore_reinit_error=True)
+    out = ray_utils.init_ray(address="auto", namespace="mint", ignore_reinit_error=True)
 
     assert out == {"ok": True}
     assert len(calls) == 1
     assert calls[0]["address"] == "192.168.38.184:6379"
-    assert calls[0]["namespace"] == "tinker"
+    assert calls[0]["namespace"] == "mint"
     assert calls[0]["ignore_reinit_error"] is True
     assert calls[0]["log_to_driver"] is False
 
@@ -113,7 +113,7 @@ def test_init_ray_skips_lock_when_attaching_to_existing_cluster(monkeypatch):
     monkeypatch.setattr(ray_utils, "_ray_init_interprocess_lock", _unexpected_lock)
     monkeypatch.setitem(sys.modules, "ray", fake_ray)
 
-    out = ray_utils.init_ray(namespace="tinker", ignore_reinit_error=True)
+    out = ray_utils.init_ray(namespace="mint", ignore_reinit_error=True)
 
     assert out == {"ok": True}
     assert calls[0]["address"] == "192.168.38.184:6379"
@@ -127,7 +127,7 @@ def test_init_ray_skips_when_already_initialized(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "ray", fake_ray)
 
-    out = ray_utils.init_ray(namespace="tinker", ignore_reinit_error=True)
+    out = ray_utils.init_ray(namespace="mint", ignore_reinit_error=True)
     assert out is None
 
 
@@ -136,7 +136,7 @@ def test_init_ray_reuses_existing_worker_context(monkeypatch):
     fake_ray = SimpleNamespace(
         WORKER_MODE=1,
         is_initialized=lambda: True,
-        get_runtime_context=lambda: SimpleNamespace(worker=fake_worker, namespace="tinker"),
+        get_runtime_context=lambda: SimpleNamespace(worker=fake_worker, namespace="mint"),
         init=lambda **kwargs: (_ for _ in ()).throw(RuntimeError("init should not run inside worker context")),
         shutdown=lambda: (_ for _ in ()).throw(RuntimeError("shutdown should not run inside worker context")),
     )
@@ -145,7 +145,7 @@ def test_init_ray_reuses_existing_worker_context(monkeypatch):
     monkeypatch.setattr(ray_utils, "_RAY_LAST_INIT_ADDRESS", None)
     monkeypatch.setitem(sys.modules, "ray", fake_ray)
 
-    out = ray_utils.init_ray(namespace="tinker", ignore_reinit_error=True)
+    out = ray_utils.init_ray(namespace="mint", ignore_reinit_error=True)
 
     assert out is None
     assert ray_utils._RAY_LAST_INIT_ADDRESS == "192.168.38.184:6379"

@@ -1,7 +1,7 @@
 ---
 name: architecture-design
 description: |
-  Architectural design reference for tinker-server (MinT).
+  Architectural design reference for mint-server (MinT).
 
   Use for: understanding or changing system boundaries (FastAPI routes, Ray actor lifecycles,
   training vs inference backends, weight transfer, and GPU scheduling via ModelActorSupervisor/ModelWorkScheduler).
@@ -10,7 +10,7 @@ description: |
   "training/inference", "weights transfer", "session lifecycle", "model actor registry"
 ---
 
-# Architecture design (tinker-server)
+# Architecture design (mint-server)
 
 Engineering docs/specs live under `.claude/skills/architecture-design/references/` (not `docs/`).
 
@@ -32,6 +32,6 @@ When a change crosses a boundary, write down (in your own scratch notes) the ans
 - Which identifier(s) are involved (`session_id`, `model_id`, `sampling_session_id`, `request_id`)?
 - Where will the source-of-truth state live after the change (server memory, Ray actor, filesystem)?
 - What happens on API server restart (which state is lost, which actors survive)?
-- Does startup reconciliation need updating (`tinker_server/app.py:_cleanup_stale_actors`)?
+- Does startup reconciliation need updating (`mint_server/app.py:_cleanup_stale_actors`)?
 
-For API semantics (types, loss functions, polling behavior), consult the `tinker-official-reference` skill section files under `.claude/skills/tinker-official-reference/references/upstream/` and keep `tinker_server/models/types.py` aligned.
+For API semantics (types, loss functions, polling behavior), consult the `tinker-official-reference` skill section files under `.claude/skills/tinker-official-reference/references/upstream/` and keep `mint_server/models/types.py` aligned.

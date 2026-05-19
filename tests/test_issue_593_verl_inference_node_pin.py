@@ -5,8 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 
-import tinker_server.config as server_config_module
-from tinker_server.backend import verl_inference
+import mint_server.config as server_config_module
+from mint_server.backend import verl_inference
 
 
 def test_issue_593_verl_inference_builds_node_affinity_options(monkeypatch):
@@ -126,7 +126,7 @@ async def test_issue_593_verl_inference_disables_sleep_mode_by_default(monkeypat
     monkeypatch.setenv("PFS_RUNTIME_ENV_ROOT", "/tmp/runtime")
     monkeypatch.setenv("MINT_CODE_ROOT", "/tmp/repo")
     monkeypatch.setenv("PFS_HF_MODULES_PATH", "/tmp/hf")
-    config_module = sys.modules["tinker_server.config"]
+    config_module = sys.modules["mint_server.config"]
     monkeypatch.setattr(config_module, "PFS_RUNTIME_ENV_ROOT", "/tmp/runtime")
     monkeypatch.setattr(config_module, "MINT_CODE_ROOT", "/tmp/repo")
     monkeypatch.setattr(config_module, "PFS_HF_MODULES_PATH", "/tmp/hf")

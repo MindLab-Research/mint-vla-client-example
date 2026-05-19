@@ -3,15 +3,15 @@ import asyncio
 import anyio
 import pytest
 
-from tinker_server.backend.megatron_distributed import (
+from mint_server.backend.megatron_distributed import (
     MegatronRankWorker,
     MegatronSessionStateManager,
     MegatronWorkerGroup,
 )
-from tinker_server.backend.runtime_observability import RuntimeObservability
-from tinker_server.backend.verl_training import TrainingWorker, VerlTrainingEngine
-from tinker_server.models.types import ComputeLogprobsRequest, ModelInput, SampleRequest, SamplingParams
-from tinker_server.routes import sampling as sampling_route
+from mint_server.backend.runtime_observability import RuntimeObservability
+from mint_server.backend.verl_training import TrainingWorker, VerlTrainingEngine
+from mint_server.models.types import ComputeLogprobsRequest, ModelInput, SampleRequest, SamplingParams
+from mint_server.routes import sampling as sampling_route
 
 
 class _StubTaskFutureService:
@@ -81,7 +81,7 @@ def test_issue_439_asample_cancellation_decrements_active_requests(monkeypatch: 
         lambda *_args, **_kwargs: anyio.sleep(0),
     )
     monkeypatch.setattr(
-        "tinker_server.backend.runtime_observability.runtime_observability",
+        "mint_server.backend.runtime_observability.runtime_observability",
         obs,
     )
 
@@ -126,7 +126,7 @@ def test_issue_439_compute_logprobs_cancellation_decrements_active_requests(monk
     monkeypatch.setattr(sampling_route, "task_futures", task_futures)
     monkeypatch.setattr(sampling_route, "session_manager", session_manager)
     monkeypatch.setattr(
-        "tinker_server.backend.runtime_observability.runtime_observability",
+        "mint_server.backend.runtime_observability.runtime_observability",
         obs,
     )
 

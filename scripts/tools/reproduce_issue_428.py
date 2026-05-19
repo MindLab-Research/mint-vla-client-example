@@ -17,21 +17,21 @@ def _env(name: str, default: str) -> str:
     return value if value is not None and value != "" else default
 
 
-BASE_URL = _env("TINKER_BASE_URL", "http://localhost:8000").rstrip("/")
-API_KEY = _env("TINKER_API_KEY", "")
-MODEL = _env("TINKER_BASE_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
-REQUEST_TIMEOUT_S = float(_env("TINKER_REQUEST_TIMEOUT_S", "30"))
-POLL_TIMEOUT_S = float(_env("TINKER_POLL_TIMEOUT_S", "600"))
-POLL_SLEEP_S = float(_env("TINKER_POLL_SLEEP_S", "0.5"))
-SUBMIT_GAP_S = float(_env("TINKER_SUBMIT_GAP_S", "1.0"))
-TRIALS = int(_env("TINKER_TRIALS", "2"))
-MULTI_NUM_SAMPLES = int(_env("TINKER_MULTI_NUM_SAMPLES", "4"))
-MULTI_MAX_TOKENS = int(_env("TINKER_MULTI_MAX_TOKENS", "128"))
-ORDINARY_CONCURRENCY = int(_env("TINKER_ORDINARY_CONCURRENCY", "1"))
-ORDINARY_MAX_TOKENS = int(_env("TINKER_ORDINARY_MAX_TOKENS", "16"))
-EXPECT_ORDINARY_BEFORE_MULTI_MIN = int(_env("TINKER_EXPECT_ORDINARY_BEFORE_MULTI_MIN", str(ORDINARY_CONCURRENCY)))
-WARMUP_MAX_TOKENS = int(_env("TINKER_WARMUP_MAX_TOKENS", "8"))
-RUN_WARMUP = _env("TINKER_RUN_WARMUP", "1") in {"1", "true", "yes", "on"}
+BASE_URL = _env("MINT_BASE_URL", "http://localhost:8000").rstrip("/")
+API_KEY = _env("MINT_API_KEY", "")
+MODEL = _env("MINT_BASE_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
+REQUEST_TIMEOUT_S = float(_env("MINT_REQUEST_TIMEOUT_S", "30"))
+POLL_TIMEOUT_S = float(_env("MINT_POLL_TIMEOUT_S", "600"))
+POLL_SLEEP_S = float(_env("MINT_POLL_SLEEP_S", "0.5"))
+SUBMIT_GAP_S = float(_env("MINT_SUBMIT_GAP_S", "1.0"))
+TRIALS = int(_env("MINT_TRIALS", "2"))
+MULTI_NUM_SAMPLES = int(_env("MINT_MULTI_NUM_SAMPLES", "4"))
+MULTI_MAX_TOKENS = int(_env("MINT_MULTI_MAX_TOKENS", "128"))
+ORDINARY_CONCURRENCY = int(_env("MINT_ORDINARY_CONCURRENCY", "1"))
+ORDINARY_MAX_TOKENS = int(_env("MINT_ORDINARY_MAX_TOKENS", "16"))
+EXPECT_ORDINARY_BEFORE_MULTI_MIN = int(_env("MINT_EXPECT_ORDINARY_BEFORE_MULTI_MIN", str(ORDINARY_CONCURRENCY)))
+WARMUP_MAX_TOKENS = int(_env("MINT_WARMUP_MAX_TOKENS", "8"))
+RUN_WARMUP = _env("MINT_RUN_WARMUP", "1") in {"1", "true", "yes", "on"}
 
 # Minimal qwen-ish encoded prompt prefix that works with the existing mint API.
 MULTI_PROMPT_TOKENS = [151644, 77091, 198, 4321, 4322, 4323, 151645]

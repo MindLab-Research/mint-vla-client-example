@@ -1,7 +1,7 @@
 ---
 name: observability-standards
 description: |
-  Observability standards for MinT/tinker-server based on OpenTelemetry.
+  Observability standards for MinT/mint-server based on OpenTelemetry.
 
   Use for: trace/log/metric design, request_id/trace_id semantics, context propagation,
   error diagnostics, and OTLP exporter conventions.

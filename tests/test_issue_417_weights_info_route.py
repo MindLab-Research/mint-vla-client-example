@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 
 
 def test_issue_417_weights_info_reads_training_checkpoint_metadata(tmp_path: Path, monkeypatch) -> None:
-    from tinker_server.routes import weights as weights_routes
+    from mint_server.routes import weights as weights_routes
 
     ckpt = tmp_path / "ckpt_417"
     ckpt.mkdir()
@@ -70,7 +70,7 @@ def test_issue_417_weights_info_rejects_sampler_checkpoint_for_training_resume(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    from tinker_server.routes import weights as weights_routes
+    from mint_server.routes import weights as weights_routes
 
     ckpt = tmp_path / "sampler_ckpt"
     ckpt.mkdir()
@@ -106,7 +106,7 @@ def test_issue_417_weights_info_rejects_metadata_less_sampler_shape(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    from tinker_server.routes import weights as weights_routes
+    from mint_server.routes import weights as weights_routes
 
     ckpt = tmp_path / "metadata_less_sampler_ckpt"
     ckpt.mkdir()
@@ -142,7 +142,7 @@ def test_issue_417_weights_info_rejects_megatron_peft_shape_without_rank_shards(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    from tinker_server.routes import weights as weights_routes
+    from mint_server.routes import weights as weights_routes
 
     ckpt = tmp_path / "megatron_peft_shape_ckpt"
     ckpt.mkdir()
@@ -189,7 +189,7 @@ def test_issue_417_weights_info_accepts_peft_training_adapter_checkpoint(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    from tinker_server.routes import weights as weights_routes
+    from mint_server.routes import weights as weights_routes
 
     ckpt = tmp_path / "peft_training_ckpt"
     ckpt.mkdir()
@@ -243,7 +243,7 @@ def test_issue_417_weights_info_accepts_peft_optimizerless_training_adapter_chec
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    from tinker_server.routes import weights as weights_routes
+    from mint_server.routes import weights as weights_routes
 
     ckpt = tmp_path / "peft_optimizerless_training_ckpt"
     ckpt.mkdir()
@@ -296,7 +296,7 @@ def test_issue_417_weights_info_rejects_peft_rank_shard_without_peft_artifacts(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    from tinker_server.routes import weights as weights_routes
+    from mint_server.routes import weights as weights_routes
 
     ckpt = tmp_path / "peft_rank_shard_only_ckpt"
     ckpt.mkdir()
@@ -341,7 +341,7 @@ def test_issue_417_weights_info_accepts_optimizerless_training_adapter_checkpoin
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    from tinker_server.routes import weights as weights_routes
+    from mint_server.routes import weights as weights_routes
 
     ckpt = tmp_path / "adapter_only_training_ckpt"
     ckpt.mkdir()
@@ -401,7 +401,7 @@ def test_issue_417_weights_info_rejects_lora_checkpoint_without_rank(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    from tinker_server.routes import weights as weights_routes
+    from mint_server.routes import weights as weights_routes
 
     ckpt = tmp_path / "malformed_lora_ckpt"
     ckpt.mkdir()
@@ -448,7 +448,7 @@ def test_issue_417_weights_info_rejects_malformed_adapter_config_as_400(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    from tinker_server.routes import weights as weights_routes
+    from mint_server.routes import weights as weights_routes
 
     ckpt = tmp_path / "malformed_json_ckpt"
     ckpt.mkdir()
@@ -486,7 +486,7 @@ def test_issue_417_weights_info_rejects_non_object_metadata_as_400(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    from tinker_server.routes import weights as weights_routes
+    from mint_server.routes import weights as weights_routes
 
     ckpt = tmp_path / "non_object_metadata_ckpt"
     ckpt.mkdir()
@@ -524,7 +524,7 @@ def test_issue_417_weights_info_accepts_non_lora_training_checkpoint(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    from tinker_server.routes import weights as weights_routes
+    from mint_server.routes import weights as weights_routes
 
     ckpt = tmp_path / "openpi_training_ckpt"
     (ckpt / "1" / "params").mkdir(parents=True)

@@ -29,7 +29,7 @@ for _path in (REPO_ROOT, SCRIPT_DIR):
 
 def _request_headers() -> dict[str, str]:
     headers = {'Connection': 'close'}
-    api_key = (os.environ.get('MINT_API_KEY') or os.environ.get('TINKER_API_KEY') or '').strip()
+    api_key = (os.environ.get('MINT_API_KEY') or os.environ.get('MINT_API_KEY') or '').strip()
     if api_key:
         headers['X-API-Key'] = api_key
     return headers
@@ -58,7 +58,7 @@ requests.delete = _delete
 
 import openpi.training.config as config_mod
 from openpi import transforms as T
-from tinker_server.backend.model_registry import MODEL_CONFIGS
+from mint_server.backend.model_registry import MODEL_CONFIGS
 
 DATASET_ROOT = Path('/vePFS-Mindverse/share/code/conley/.hf-lerobot/physical-intelligence/libero')
 ASSETS_DIR_BY_BASE_MODEL = {

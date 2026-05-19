@@ -4,12 +4,12 @@ import os
 
 import pytest
 
-from tinker_server.backend.model_actor_inventory import ActorType
-from tinker_server.backend.model_actor_launchers import (
+from mint_server.backend.model_actor_inventory import ActorType
+from mint_server.backend.model_actor_launchers import (
     ModelActorLauncherRegistry,
     placement_env_for_spec,
 )
-from tinker_server.backend.model_actor_supervisor import (
+from mint_server.backend.model_actor_supervisor import (
     ModelActorSpec,
     ModelActorSupervisor,
     desired_specs_from_env,
@@ -17,7 +17,7 @@ from tinker_server.backend.model_actor_supervisor import (
     domain_key_for_vllm_base_model,
     queue_id_for_replica,
 )
-from tinker_server.backend.model_actor_placement import ModelActorPlacementReconciler
+from mint_server.backend.model_actor_placement import ModelActorPlacementReconciler
 
 
 class _FakeRuntimeActor:
@@ -617,11 +617,11 @@ def test_issue_593_placement_reconciler_uses_node_pin_and_removes_owned_orphan_p
         )
 
     reconciler = ModelActorPlacementReconciler(
-        namespace="tinker",
+        namespace="mint",
         actor_exists=lambda _name, _namespace: False,
         actor_killer=lambda name, namespace, reason: killed.append((name, namespace, reason)) or True,
         actor_lister=lambda: [
-            {"name": "mint_model_runtime_old", "namespace": "tinker"},
+            {"name": "mint_model_runtime_old", "namespace": "mint"},
             {"name": "foreign_actor", "namespace": "other"},
         ],
         capacity_checker=_capacity,
@@ -643,7 +643,7 @@ def test_issue_593_placement_reconciler_uses_node_pin_and_removes_owned_orphan_p
     assert out["ok"] is True
     assert out["node_pins"]["vllm:Qwen/Test::replica-1"] == ["10.0.0.17"]
     assert out["cleaned_actor_names"] == ["mint_model_runtime_old"]
-    assert ("mint_model_runtime_old", "tinker", "model_actor_supervisor_undesired_wrapper") in killed
+    assert ("mint_model_runtime_old", "mint", "model_actor_supervisor_undesired_wrapper") in killed
     assert capacity_checks == [
         {
             "required": {"10.0.0.17": 4},
@@ -651,7 +651,7 @@ def test_issue_593_placement_reconciler_uses_node_pin_and_removes_owned_orphan_p
             "ignore_pg_names": {
                 "mint_model_actor_vllm-Qwen-Test_replica-1_pg",
             },
-            "namespace": "tinker",
+            "namespace": "mint",
         }
     ]
 
@@ -674,7 +674,7 @@ def test_issue_593_placement_reconciler_evicts_foreign_blockers_when_target_abse
             raise RuntimeError("insufficient GPU on pinned node; blocker=foreign_vllm_pg")
 
     reconciler = ModelActorPlacementReconciler(
-        namespace="tinker",
+        namespace="mint",
         actor_exists=lambda _name, _namespace: False,
         actor_killer=lambda name, namespace, reason: killed.append((name, namespace, reason)) or True,
         capacity_checker=_capacity,
@@ -728,7 +728,7 @@ def test_issue_593_placement_reconciler_does_not_preempt_on_non_capacity_failure
     killed: list[tuple[str, str, str]] = []
 
     reconciler = ModelActorPlacementReconciler(
-        namespace="tinker",
+        namespace="mint",
         actor_exists=lambda _name, _namespace: False,
         actor_killer=lambda name, namespace, reason: killed.append((name, namespace, reason)) or True,
         capacity_checker=lambda *_args: (_ for _ in ()).throw(RuntimeError("ray state lookup failed")),
@@ -784,7 +784,7 @@ def test_issue_593_placement_reconciler_removes_unknown_namespace_pg_as_current_
             raise RuntimeError("pinned node capacity check failed: blocker=unknown_ns_pg")
 
     reconciler = ModelActorPlacementReconciler(
-        namespace="tinker",
+        namespace="mint",
         actor_exists=lambda _name, _namespace: False,
         actor_killer=lambda name, namespace, reason: killed.append((name, namespace, reason)) or True,
         capacity_checker=_capacity,
@@ -816,7 +816,7 @@ def test_issue_593_placement_reconciler_removes_unknown_namespace_pg_as_current_
     assert out["ok"] is True
     assert capacity_checks == 2
     assert killed == []
-    assert ("unknown_ns_pg", "tinker") in removed_pgs
+    assert ("unknown_ns_pg", "mint") in removed_pgs
     assert out["evicted_actor_names"] == []
     assert out["evicted_placement_group_names"] == ["unknown_ns_pg"]
 
@@ -841,7 +841,7 @@ def test_issue_593_placement_reconciler_does_not_evict_foreign_blockers_when_tar
         raise RuntimeError("insufficient GPU on pinned node; blocker=foreign_vllm_pg")
 
     reconciler = ModelActorPlacementReconciler(
-        namespace="tinker",
+        namespace="mint",
         actor_exists=_actor_exists,
         actor_killer=lambda name, namespace, reason: killed.append((name, namespace, reason)) or True,
         capacity_checker=_capacity,

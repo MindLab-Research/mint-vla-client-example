@@ -1,2 +1,2 @@
-# tinker-server
+# mint-server
 Tinker-compatible server

@@ -7,8 +7,8 @@ import requests
 import tinker
 
 
-BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000").rstrip("/")
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
+BASE_URL = os.environ.get("MINT_BASE_URL", "http://localhost:8000").rstrip("/")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
 
 
 def _download_to_tmp(url: str) -> str:
@@ -34,8 +34,8 @@ def _assert_is_tar_gz(path: str) -> None:
 
 
 def main() -> int:
-    os.environ.setdefault("TINKER_BASE_URL", BASE_URL)
-    os.environ.setdefault("TINKER_API_KEY", API_KEY)
+    os.environ.setdefault("MINT_BASE_URL", BASE_URL)
+    os.environ.setdefault("MINT_API_KEY", API_KEY)
 
     service_client = tinker.ServiceClient()
     rest_client = service_client.create_rest_client()

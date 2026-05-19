@@ -7,17 +7,17 @@ from typing import Any
 import requests
 
 
-BASE_URL = os.environ.get("TINKER_BASE_URL")
+BASE_URL = os.environ.get("MINT_BASE_URL")
 if not BASE_URL:
-    port = os.environ.get("TINKER_PORT", "8000")
+    port = os.environ.get("MINT_PORT", "8000")
     BASE_URL = f"http://localhost:{port}"
 BASE_URL = BASE_URL.rstrip("/")
 
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
 
-MODEL = os.environ.get("TINKER_MODEL", "Qwen/Qwen3-0.6B")
-POLL_TIMEOUT_S = float(os.environ.get("TINKER_POLL_TIMEOUT_S", "1800"))
-POLL_SLEEP_S = float(os.environ.get("TINKER_POLL_SLEEP_S", "2.0"))
+MODEL = os.environ.get("MINT_MODEL", "Qwen/Qwen3-0.6B")
+POLL_TIMEOUT_S = float(os.environ.get("MINT_POLL_TIMEOUT_S", "1800"))
+POLL_SLEEP_S = float(os.environ.get("MINT_POLL_SLEEP_S", "2.0"))
 
 
 def _headers() -> dict[str, str]:
@@ -37,7 +37,7 @@ def _model_to_vllm_actor_name(model_name: str) -> str:
     else:
         model_part = model_name
     safe_name = model_part.lower().replace(" ", "_")
-    return f"tinker_vllm_{safe_name}"
+    return f"mint_vllm_{safe_name}"
 
 
 def _get(path: str, *, timeout_s: float, expect_status: int = 200) -> requests.Response:

@@ -27,9 +27,9 @@ from openpi_libero_fast_real_eval_report import (
     _save_weights_for_sampler,
 )
 
-BASE_URL = os.environ.get('TINKER_BASE_URL', 'http://localhost:18080')
+BASE_URL = os.environ.get('MINT_BASE_URL', 'http://localhost:18080')
 BASE_MODEL = 'openpi/pi0-fast-libero-low-mem-finetune'
-OUT_DIR = Path(os.environ.get('OPENPI_VLA_OUT_DIR', '/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/rl_pi0fast_fixed_eval_object0_v9'))
+OUT_DIR = Path(os.environ.get('OPENPI_VLA_OUT_DIR', '/vePFS-Mindverse/share/code/root/mint-server-pr422-vla-20260402/results/rl_pi0fast_fixed_eval_object0_v9'))
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 METRICS_PATH = OUT_DIR / 'metrics.jsonl'
 TASK_SUITE = 'libero_object'

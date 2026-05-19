@@ -1,11 +1,11 @@
 import asyncio
 import time
 
-from tinker_server.backend.lora_registry import LoRARegistry
+from mint_server.backend.lora_registry import LoRARegistry
 
 
 def test_lru_candidates_skip_recently_used(monkeypatch):
-    monkeypatch.setenv("TINKER_LORA_EVICT_MIN_IDLE_S", "5.0")
+    monkeypatch.setenv("MINT_LORA_EVICT_MIN_IDLE_S", "5.0")
 
     reg = LoRARegistry()
 
@@ -24,7 +24,7 @@ def test_lru_candidates_skip_recently_used(monkeypatch):
 
 
 def test_lru_candidates_invalid_env_var_falls_back(monkeypatch):
-    monkeypatch.setenv("TINKER_LORA_EVICT_MIN_IDLE_S", "not-a-float")
+    monkeypatch.setenv("MINT_LORA_EVICT_MIN_IDLE_S", "not-a-float")
 
     reg = LoRARegistry()
 

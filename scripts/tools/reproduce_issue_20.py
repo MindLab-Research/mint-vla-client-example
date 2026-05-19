@@ -4,7 +4,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-from tinker_server.sampling_utils import sampled_sequence_from_result  # noqa: E402
+from mint_server.sampling_utils import sampled_sequence_from_result  # noqa: E402
 
 
 def _fail(msg: str) -> int:

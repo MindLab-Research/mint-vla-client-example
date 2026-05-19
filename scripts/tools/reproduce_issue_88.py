@@ -78,7 +78,7 @@ def main() -> int:
         # Ensure weights.py picks up local temp checkpoints dir at import time.
         import os
 
-        os.environ["TINKER_CHECKPOINT_DIR"] = str(tmp_path)
+        os.environ["MINT_CHECKPOINT_DIR"] = str(tmp_path)
 
         archive_path = tmp_path / "ckpt.tar.gz"
         root = "ckpt_original"
@@ -98,7 +98,7 @@ def main() -> int:
         from starlette.exceptions import HTTPException  # noqa: E402
         import asyncio  # noqa: E402
 
-        from tinker_server.routes.weights import CHECKPOINTS_DIR, upload_checkpoint_archive  # noqa: E402
+        from mint_server.routes.weights import CHECKPOINTS_DIR, upload_checkpoint_archive  # noqa: E402
 
         dummy_req = types.SimpleNamespace(state=types.SimpleNamespace(user_data=None))
         upload = UploadFile(file=open(archive_path, "rb"), filename="ckpt.tar.gz")

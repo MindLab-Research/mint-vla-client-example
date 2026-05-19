@@ -77,11 +77,11 @@ load_local_env(REPO_ROOT / ".env")
 
 
 def base_url() -> str:
-    return (os.environ.get("MINT_BASE_URL") or os.environ.get("TINKER_BASE_URL") or "http://localhost:8000").rstrip("/")
+    return (os.environ.get("MINT_BASE_URL") or os.environ.get("MINT_BASE_URL") or "http://localhost:8000").rstrip("/")
 
 
 def api_key() -> str:
-    return os.environ.get("MINT_API_KEY") or os.environ.get("TINKER_API_KEY") or "dummy"
+    return os.environ.get("MINT_API_KEY") or os.environ.get("MINT_API_KEY") or "dummy"
 
 
 def headers() -> dict[str, str]:

@@ -14,7 +14,7 @@
 #
 # Reference:
 # - This file is no longer the source of truth for server runtime deps.
-# - `pyproject.toml` plus `tool.tinker.runtime_env` define the canonical shared runtime env.
+# - `pyproject.toml` plus `tool.mint.runtime_env` define the canonical shared runtime env.
 #
 # Installation note:
 # - `torch==2.9.1+cpu` may require the PyTorch CPU wheel index. Example:

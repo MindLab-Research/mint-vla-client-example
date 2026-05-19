@@ -10,17 +10,17 @@ from typing import Any
 import requests
 
 
-BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000").rstrip("/")
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
-BASE_MODEL = os.environ.get("TINKER_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
-LORA_RANK = int(os.environ.get("TINKER_LORA_RANK", "8"))
-LEARNING_RATE = float(os.environ.get("TINKER_LEARNING_RATE", "1e-4"))
-SMALL_SEQ_LEN = int(os.environ.get("TINKER_SMALL_SEQ_LEN", "256"))
-LARGE_SEQ_LEN = int(os.environ.get("TINKER_LARGE_SEQ_LEN", "0"))
-CREATE_TIMEOUT_S = float(os.environ.get("TINKER_CREATE_TIMEOUT_S", "3600"))
-POLL_TIMEOUT_S = float(os.environ.get("TINKER_POLL_TIMEOUT_S", "3600"))
-REQUEST_TIMEOUT_S = float(os.environ.get("TINKER_REQUEST_TIMEOUT_S", "120"))
-POLL_REQUEST_TIMEOUT_S = float(os.environ.get("TINKER_POLL_REQUEST_TIMEOUT_S", "180"))
+BASE_URL = os.environ.get("MINT_BASE_URL", "http://localhost:8000").rstrip("/")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
+BASE_MODEL = os.environ.get("MINT_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
+LORA_RANK = int(os.environ.get("MINT_LORA_RANK", "8"))
+LEARNING_RATE = float(os.environ.get("MINT_LEARNING_RATE", "1e-4"))
+SMALL_SEQ_LEN = int(os.environ.get("MINT_SMALL_SEQ_LEN", "256"))
+LARGE_SEQ_LEN = int(os.environ.get("MINT_LARGE_SEQ_LEN", "0"))
+CREATE_TIMEOUT_S = float(os.environ.get("MINT_CREATE_TIMEOUT_S", "3600"))
+POLL_TIMEOUT_S = float(os.environ.get("MINT_POLL_TIMEOUT_S", "3600"))
+REQUEST_TIMEOUT_S = float(os.environ.get("MINT_REQUEST_TIMEOUT_S", "120"))
+POLL_REQUEST_TIMEOUT_S = float(os.environ.get("MINT_POLL_REQUEST_TIMEOUT_S", "180"))
 
 
 def _headers() -> dict[str, str]:

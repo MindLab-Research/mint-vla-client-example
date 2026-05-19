@@ -3,7 +3,7 @@
 
 Run this from the Mint driver host, for example:
 
-    ssh mint-prod-volcano 'cd /vePFS-Mindverse/share/code/tinker-server-auth && python3 scripts/tools/start_nvml_otel_probe.py start'
+    ssh mint-prod-volcano 'cd /vePFS-Mindverse/share/mint/prod/mint-server && python3 scripts/tools/start_nvml_otel_probe.py start'
 
 The probe is read-only. It requests CPU only and never requests Ray GPU resources.
 """
@@ -426,7 +426,7 @@ def _connect_ray(address: str, namespace: str) -> None:
 
 def _probe_runtime_env() -> dict[str, object] | None:
     try:
-        from tinker_server.config import PFS_PYTHONPATH, actor_runtime_env, otel_env_vars
+        from mint_server.config import PFS_PYTHONPATH, actor_runtime_env, otel_env_vars
 
         env_vars = actor_runtime_env(pythonpath=PFS_PYTHONPATH, extra=otel_env_vars()).get("env_vars", {})
     except Exception:
@@ -533,7 +533,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("start", "sample", "status", "stop"))
     parser.add_argument("--ray-address", default="auto")
-    parser.add_argument("--namespace", default=os.getenv("MINT_RAY_NAMESPACE") or os.getenv("TINKER_RAY_NAMESPACE") or "tinker")
+    parser.add_argument("--namespace", default=os.getenv("MINT_RAY_NAMESPACE") or "mint")
     parser.add_argument("--interval-s", type=float, default=DEFAULT_INTERVAL_S)
     parser.add_argument("--timeout-s", type=float, default=30.0)
     parser.add_argument("--no-start-loop", action="store_true", help="Create actors but do not start run_forever loops")

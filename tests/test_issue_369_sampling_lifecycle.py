@@ -4,12 +4,12 @@ from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
 
-from tinker_server.backend import sampling_cleanup_executor as cleanup_executor_module
-from tinker_server.backend import sampling_session_store as sampling_store_module
-from tinker_server.backend import session_manager as session_manager_module
-from tinker_server.routes import service as service_route
+from mint_server.backend import sampling_cleanup_executor as cleanup_executor_module
+from mint_server.backend import sampling_session_store as sampling_store_module
+from mint_server.backend import session_manager as session_manager_module
+from mint_server.routes import service as service_route
 
-task_state_store_module = importlib.import_module("tinker_server.backend.task_state_store")
+task_state_store_module = importlib.import_module("mint_server.backend.task_state_store")
 
 
 @pytest.fixture
@@ -150,7 +150,7 @@ async def test_issue_369_sampling_heartbeat_sampling_store_failure_is_503(monkey
         raise RuntimeError("store down")
 
     service_route.session_manager = _StubSessionManager()
-    monkeypatch.setattr("tinker_server.routes.service.session_heartbeat_store.async_update", _async_update)
+    monkeypatch.setattr("mint_server.routes.service.session_heartbeat_store.async_update", _async_update)
     monkeypatch.setattr(sampling_store_module, "async_set_sampling_session_last_activity", _async_set_last_activity)
 
     http_request = SimpleNamespace(state=SimpleNamespace(user_data=None))
@@ -177,7 +177,7 @@ async def test_issue_369_sampling_heartbeat_updates_detached_last_activity(monke
         touched.append(("sampling_last_activity", session_id, isinstance(last_activity, float)))
         return last_activity
 
-    monkeypatch.setattr("tinker_server.routes.service.session_heartbeat_store.async_update", _async_update)
+    monkeypatch.setattr("mint_server.routes.service.session_heartbeat_store.async_update", _async_update)
     monkeypatch.setattr(sampling_store_module, "async_set_sampling_session_last_activity", _async_set_last_activity)
 
     async def _noop_touch_child_sampler_sessions(*_args, **_kwargs):
@@ -198,7 +198,7 @@ async def test_issue_369_sampling_heartbeat_updates_detached_last_activity(monke
 def test_issue_369_session_manager_base_model_getter_restores_from_detached_store(monkeypatch) -> None:
     manager = session_manager_module.SessionManager()
     monkeypatch.setattr(
-        "tinker_server.backend.sampling_session_store.get_sampling_session_info",
+        "mint_server.backend.sampling_session_store.get_sampling_session_info",
         lambda session_id: {
             "session_id": session_id,
             "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",

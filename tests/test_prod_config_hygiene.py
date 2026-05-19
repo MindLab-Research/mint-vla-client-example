@@ -28,7 +28,7 @@ def test_secrets_env_contains_only_secret_exports() -> None:
         pytest.skip(".secrets.env is intentionally absent in this worktree")
     names = _exported_names(SECRETS_ENV)
     assert names == [
-        "TINKER_API_KEY",
+        "MINT_API_KEY",
         "MINT_API_KEY",
         "CRS_OAI_KEY",
         "MINT_APMPLUS_APP_KEY",

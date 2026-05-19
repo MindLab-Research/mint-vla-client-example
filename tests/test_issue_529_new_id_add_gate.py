@@ -6,8 +6,8 @@ import types
 
 import pytest
 
-import tinker_server.backend.lora_utils as lora_utils
-import tinker_server.backend.multinode_inference as mni
+import mint_server.backend.lora_utils as lora_utils
+import mint_server.backend.multinode_inference as mni
 
 
 @pytest.fixture
@@ -43,7 +43,7 @@ def _install_fake_vllm(monkeypatch):
     monkeypatch.setitem(sys.modules, "vllm.lora.request", request_mod)
 
 
-def test_multinode_vllm_async_engine_imports_top_level_exports(monkeypatch):
+def test_mint_vllm_multinode_async_engine_imports_top_level_exports(monkeypatch):
     class TopLevelArgs:
         pass
 
@@ -58,7 +58,7 @@ def test_multinode_vllm_async_engine_imports_top_level_exports(monkeypatch):
     assert mni._import_vllm_async_engine_components() == (TopLevelArgs, TopLevelEngine)
 
 
-def test_multinode_vllm_async_engine_imports_legacy_submodules(monkeypatch):
+def test_mint_vllm_multinode_async_engine_imports_legacy_submodules(monkeypatch):
     class LegacyArgs:
         pass
 
@@ -79,7 +79,7 @@ def test_multinode_vllm_async_engine_imports_legacy_submodules(monkeypatch):
     assert mni._import_vllm_async_engine_components() == (LegacyArgs, LegacyEngine)
 
 
-def test_multinode_vllm_child_env_disables_tensorflow_and_flax(monkeypatch):
+def test_mint_vllm_multinode_child_env_disables_tensorflow_and_flax(monkeypatch):
     monkeypatch.delenv("USE_TF", raising=False)
     monkeypatch.delenv("USE_FLAX", raising=False)
     monkeypatch.setattr(mni.os.path, "isdir", lambda _path: False)
@@ -91,7 +91,7 @@ def test_multinode_vllm_child_env_disables_tensorflow_and_flax(monkeypatch):
     assert mni.os.environ["USE_FLAX"] == "0"
 
 
-def test_multinode_vllm_runtime_env_disables_tensorflow_and_flax_by_default():
+def test_mint_vllm_multinode_runtime_env_disables_tensorflow_and_flax_by_default():
     env_vars: dict[str, str] = {}
 
     mni._set_default_vllm_runtime_env(env_vars)
@@ -102,7 +102,7 @@ def test_multinode_vllm_runtime_env_disables_tensorflow_and_flax_by_default():
 
 def _make_actor_impl(monkeypatch):
     monkeypatch.setattr(mni, "init_actor_observability", lambda: None)
-    remote_cls = mni._create_multinode_vllm_actor()
+    remote_cls = mni._create_mint_vllm_multinode_actor()
     return remote_cls.__ray_metadata__.modified_class
 
 

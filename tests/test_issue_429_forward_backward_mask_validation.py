@@ -37,7 +37,7 @@ def _client_with_auth(router) -> TestClient:
 
 
 def test_issue_429_forward_backward_rejects_missing_explicit_loss_mask_before_backend() -> None:
-    from tinker_server.routes import training as training_routes
+    from mint_server.routes import training as training_routes
 
     client = _client_with_auth(training_routes.router)
 
@@ -57,7 +57,7 @@ def test_issue_429_forward_backward_rejects_missing_explicit_loss_mask_before_ba
 
 
 def test_issue_429_train_step_rejects_missing_explicit_loss_mask_before_backend() -> None:
-    from tinker_server.routes import training as training_routes
+    from mint_server.routes import training as training_routes
 
     client = _client_with_auth(training_routes.router)
 
@@ -78,7 +78,7 @@ def test_issue_429_train_step_rejects_missing_explicit_loss_mask_before_backend(
 
 
 def test_issue_429_validation_accepts_weights_mask_and_loss_mask_aliases() -> None:
-    from tinker_server.routes import training as training_routes
+    from mint_server.routes import training as training_routes
 
     for mask_key in ("weights", "mask", "loss_mask"):
         datum = training_routes.Datum.model_validate(_datum_with_mask_key(mask_key))
@@ -86,7 +86,7 @@ def test_issue_429_validation_accepts_weights_mask_and_loss_mask_aliases() -> No
 
 
 def test_issue_429_validation_reports_item_index() -> None:
-    from tinker_server.routes import training as training_routes
+    from mint_server.routes import training as training_routes
 
     data = [
         training_routes.Datum.model_validate(_datum_with_mask_key("weights")),

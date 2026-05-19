@@ -8,7 +8,7 @@ import pytest
 
 pytest.importorskip("ray")
 
-from tinker_server.backend.megatron_distributed import MegatronSessionStateManager, MegatronWorkerGroup
+from mint_server.backend.megatron_distributed import MegatronSessionStateManager, MegatronWorkerGroup
 
 
 def _write_adapter(session_path: Path, *, size: int = 64) -> None:
@@ -590,7 +590,7 @@ def test_issue_414_load_checkpoint_without_optimizer_invalidates_existing_extern
         "sess-2",
         checkpoint_path="/checkpoints/actor-a/sess-2",
         reason="save_checkpoint",
-        actor_name="megatron_qwen3_30b_a3b_instruct_2507",
+        actor_name="mint_megatron_qwen3_30b_a3b_instruct_2507",
     )
 
     group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
@@ -616,7 +616,7 @@ def test_issue_414_load_checkpoint_without_optimizer_invalidates_existing_extern
     assert marker["is_fresh"] is False
     assert marker["invalidated_reason"] == "load_checkpoint_without_optimizer"
 
-    usage = manager.get_cache_usage(actor_name="megatron_qwen3_30b_a3b_instruct_2507")
+    usage = manager.get_cache_usage(actor_name="mint_megatron_qwen3_30b_a3b_instruct_2507")
     assert usage["stale_external_checkpoint_count"] == 1
     assert usage["evictable_session_count"] == 0
 
@@ -638,7 +638,7 @@ def test_issue_414_load_checkpoint_without_optimizer_stales_marker_before_reset(
         "sess-3",
         checkpoint_path="/checkpoints/actor-a/sess-3",
         reason="save_checkpoint",
-        actor_name="megatron_qwen3_30b_a3b_instruct_2507",
+        actor_name="mint_megatron_qwen3_30b_a3b_instruct_2507",
     )
 
     group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
@@ -675,7 +675,7 @@ def test_issue_414_reinit_lora_weights_invalidates_existing_external_checkpoint(
         "sess-4",
         checkpoint_path="/checkpoints/actor-a/sess-4",
         reason="save_checkpoint",
-        actor_name="megatron_qwen3_30b_a3b_instruct_2507",
+        actor_name="mint_megatron_qwen3_30b_a3b_instruct_2507",
     )
 
     class _RemoteCall:
@@ -700,7 +700,7 @@ def test_issue_414_reinit_lora_weights_invalidates_existing_external_checkpoint(
     group._bind_traceparent = lambda traceparent: None
     group._session_manager = manager
 
-    monkeypatch.setattr("tinker_server.backend.megatron_distributed.ray.get", lambda refs, timeout=None: refs)
+    monkeypatch.setattr("mint_server.backend.megatron_distributed.ray.get", lambda refs, timeout=None: refs)
 
     out = group.reinit_lora_weights()
 
@@ -740,7 +740,7 @@ def test_issue_414_save_checkpoint_marks_external_checkpoint(monkeypatch: pytest
         },
     )()
 
-    monkeypatch.setattr("tinker_server.backend.megatron_distributed.ray.get", lambda refs, timeout=None: [{}])
+    monkeypatch.setattr("mint_server.backend.megatron_distributed.ray.get", lambda refs, timeout=None: [{}])
 
     out = group.save_checkpoint("/checkpoints/alice/model_x/ckpt_7", session_id="sess-1")
 
@@ -750,6 +750,6 @@ def test_issue_414_save_checkpoint_marks_external_checkpoint(monkeypatch: pytest
             "sess-1",
             "/checkpoints/alice/model_x/ckpt_7",
             "save_checkpoint",
-            "megatron_qwen3_30b_a3b_instruct_2507",
+            "mint_megatron_qwen3_30b_a3b_instruct_2507",
         )
     ]

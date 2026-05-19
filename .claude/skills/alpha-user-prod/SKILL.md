@@ -39,9 +39,9 @@ Rules:
 - **Production is read-only.**
   - Do not use privileged/admin endpoints (kill/restart/actor management).
   - Read-only access is allowed:
-    - You may SSH into the prod API host to tail logs (read-only) to speed up triage: `ssh mint-prod-volcano "tail -200 /tmp/tinker_server_auth.log"`.
+    - You may SSH into the prod API host to tail logs (read-only) to speed up triage: `ssh mint-prod-volcano "tail -200 /tmp/mint_server_auth.log"`.
     - Do not run supervisor restarts, kill endpoints, or any actor-management operations.
-- **No secrets leakage.** Never print or dump `MINT_API_KEY`/`TINKER_API_KEY` (or any `*_KEY/*_TOKEN/*_SECRET/*_PASSWORD`).
+- **No secrets leakage.** Never print or dump `MINT_API_KEY`/`MINT_API_KEY` (or any `*_KEY/*_TOKEN/*_SECRET/*_PASSWORD`).
 - **No requirement substitution.**
   - Do not "prove" prod health by switching to dev.
   - Do not replace MinT runs with HuggingFace local inference/training as a substitute for MinT behavior.
@@ -127,7 +127,7 @@ A "soft expectation" failing is not a server bug by itself. Only treat it as a b
 - Write a runnable script under `scripts/wip/alpha_user_prod/<demo_id>.py`.
 - Run it against production:
   - Base URL: `https://mint.macaron.im` (international) or `https://mint.macaron.xin` (China)
-  - Auth: via `MINT_API_KEY` (or `TINKER_API_KEY` depending on the SDK alias used by the script).
+  - Auth: via `MINT_API_KEY` (or `MINT_API_KEY` depending on the SDK alias used by the script).
 - Prefer `asyncio` + async SDK methods for concurrency and for exercising futures ordering semantics.
 - Emulate one or more "alpha users" as separate personas (independent sessions/clients) and interleave their requests.
 

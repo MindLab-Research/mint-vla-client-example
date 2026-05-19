@@ -8,9 +8,9 @@ import pytest
 
 
 def _import_config(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.delenv("TINKER_CONFIG_PATH", raising=False)
-    sys.modules.pop("tinker_server.config", None)
-    return importlib.import_module("tinker_server.config")
+    monkeypatch.delenv("MINT_CONFIG_PATH", raising=False)
+    sys.modules.pop("mint_server.config", None)
+    return importlib.import_module("mint_server.config")
 
 
 def test_preferred_vllm_python_executable_uses_existing_override(

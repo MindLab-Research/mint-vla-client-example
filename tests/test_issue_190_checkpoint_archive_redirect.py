@@ -37,7 +37,7 @@ def _mk_checkpoint(
 
 
 def test_issue_190_archive_endpoint_redirect_for_tinker_sdk(tmp_path: Path) -> None:
-    from tinker_server.routes import weights as weights_routes
+    from mint_server.routes import weights as weights_routes
 
     # Patch checkpoints root for this test module.
     weights_routes.CHECKPOINTS_DIR = str(tmp_path)
@@ -100,7 +100,7 @@ def test_issue_190_archive_endpoint_redirect_for_tinker_sdk(tmp_path: Path) -> N
 
 
 def test_issue_190_invalid_checkpoint_is_404_even_for_tinker(tmp_path: Path) -> None:
-    from tinker_server.routes import weights as weights_routes
+    from mint_server.routes import weights as weights_routes
 
     weights_routes.CHECKPOINTS_DIR = str(tmp_path)
     run_id = "run-190-missing"

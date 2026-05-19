@@ -13,10 +13,10 @@ def anyio_backend() -> str:
 
 @pytest.mark.anyio
 async def test_issue_439_internal_noop_dispatch_uses_async_task_futures(monkeypatch) -> None:
-    from tinker_server.backend import model_work_dispatch as dispatch
+    from mint_server.backend import model_work_dispatch as dispatch
     import ray
 
-    task_state_store_module = importlib.import_module("tinker_server.backend.task_state_store")
+    task_state_store_module = importlib.import_module("mint_server.backend.task_state_store")
     calls: list[tuple[str, str]] = []
 
     class _AsyncOnlyTaskFutureService:
@@ -49,8 +49,8 @@ async def test_issue_439_internal_noop_dispatch_uses_async_task_futures(monkeypa
 
 @pytest.mark.anyio
 async def test_model_work_dispatch_does_not_lazy_init_ray(monkeypatch) -> None:
-    from tinker_server.backend import model_work_dispatch as dispatch
-    from tinker_server import ray_utils
+    from mint_server.backend import model_work_dispatch as dispatch
+    from mint_server import ray_utils
     import ray
 
     init_ray_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []

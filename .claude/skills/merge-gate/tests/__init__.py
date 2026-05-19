@@ -1,7 +1,7 @@
 """Merge gate test suite.
 
 Run all tests:
-    TINKER_BASE_URL=http://localhost:8000 python -m pytest .claude/skills/merge-gate/tests/ -v
+    MINT_BASE_URL=http://localhost:8000 python -m pytest .claude/skills/merge-gate/tests/ -v
 
 Run specific phase:
     python -m pytest .claude/skills/merge-gate/tests/test_dense_*.py -v  # Dense only

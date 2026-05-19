@@ -226,9 +226,9 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--base-url",
-        default=os.environ.get("MINT_BASE_URL") or os.environ.get("TINKER_BASE_URL") or "http://localhost:8000",
+        default=os.environ.get("MINT_BASE_URL") or os.environ.get("MINT_BASE_URL") or "http://localhost:8000",
     )
-    parser.add_argument("--api-key", default=os.environ.get("MINT_API_KEY") or os.environ.get("TINKER_API_KEY") or "")
+    parser.add_argument("--api-key", default=os.environ.get("MINT_API_KEY") or os.environ.get("MINT_API_KEY") or "")
     parser.add_argument("--model", default="openpi/pi0-fast-libero-low-mem-finetune")
     parser.add_argument("--output-json", default="")
     args = parser.parse_args()

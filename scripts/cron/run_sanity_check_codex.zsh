@@ -1,12 +1,12 @@
 #!/bin/zsh
 set -eo pipefail
 
-cd /home/yiwen/tinker_project/tinker-server-prod
+cd /home/yiwen/mint_project/mint-server-prod
 
 # Cron-safe environment: do not source interactive shell configs.
 export PATH="$HOME/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-secrets_env="/home/yiwen/tinker_project/tinker-server-prod/.secrets.env"
+secrets_env="/home/yiwen/mint_project/mint-server-prod/.secrets.env"
 if [ ! -f "$secrets_env" ]; then
   print -u2 "missing $secrets_env"
   exit 1

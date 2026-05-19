@@ -19,7 +19,7 @@ def anyio_backend():
 
 
 def test_issue_317_begin_async_checkpoint_mirror_marks_pending(monkeypatch, tmp_path: Path) -> None:
-    from tinker_server import checkpoints
+    from mint_server import checkpoints
 
     runtime_root = tmp_path / "runtime"
     persistent_root = tmp_path / "tos"
@@ -60,7 +60,7 @@ def test_issue_317_begin_async_checkpoint_mirror_marks_pending(monkeypatch, tmp_
 
 
 def test_issue_317_update_checkpoint_metadata_refuses_to_clobber_invalid_json(tmp_path: Path) -> None:
-    from tinker_server import checkpoints
+    from mint_server import checkpoints
 
     cache_dir = tmp_path / "runtime" / "persistent_cache" / "owner-a" / "run-317" / "ckpt-a"
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -77,7 +77,7 @@ def test_issue_317_update_checkpoint_metadata_refuses_to_clobber_invalid_json(tm
 
 
 def test_issue_317_process_pending_checkpoint_mirrors_updates_metadata(monkeypatch, tmp_path: Path) -> None:
-    from tinker_server import checkpoints
+    from mint_server import checkpoints
 
     runtime_root = tmp_path / "runtime"
     persistent_root = tmp_path / "tos"
@@ -115,7 +115,7 @@ def test_issue_317_process_pending_checkpoint_mirrors_updates_metadata(monkeypat
 
 
 def test_issue_317_reaper_keeps_pending_cache(monkeypatch, tmp_path: Path) -> None:
-    from tinker_server import checkpoints
+    from mint_server import checkpoints
 
     runtime_root = tmp_path / "runtime"
     persistent_root = tmp_path / "tos"
@@ -151,7 +151,7 @@ def test_issue_317_reaper_keeps_pending_cache(monkeypatch, tmp_path: Path) -> No
 
 
 def test_issue_317_failed_mirror_status_is_stable(monkeypatch, tmp_path: Path) -> None:
-    from tinker_server import checkpoints
+    from mint_server import checkpoints
 
     runtime_root = tmp_path / "runtime"
     persistent_root = tmp_path / "tos"
@@ -189,8 +189,8 @@ def test_issue_317_failed_mirror_status_is_stable(monkeypatch, tmp_path: Path) -
 
 
 def test_issue_317_publish_not_found_stays_failed(monkeypatch, tmp_path: Path) -> None:
-    from tinker_server import checkpoints
-    from tinker_server.checkpoint_index import CheckpointNotFoundError
+    from mint_server import checkpoints
+    from mint_server.checkpoint_index import CheckpointNotFoundError
 
     runtime_root = tmp_path / "runtime"
     persistent_root = tmp_path / "tos"
@@ -233,7 +233,7 @@ def test_issue_317_publish_not_found_stays_failed(monkeypatch, tmp_path: Path) -
 
 
 def test_issue_317_publish_retry_backoff_skips_immediate_retries(monkeypatch, tmp_path: Path) -> None:
-    from tinker_server import checkpoints
+    from mint_server import checkpoints
 
     runtime_root = tmp_path / "runtime"
     persistent_root = tmp_path / "tos"
@@ -282,8 +282,8 @@ def test_issue_317_publish_retry_backoff_skips_immediate_retries(monkeypatch, tm
 
 
 def test_issue_317_list_checkpoints_includes_pending_cache_status(monkeypatch, tmp_path: Path) -> None:
-    from tinker_server import checkpoints
-    from tinker_server.routes import weights as wt
+    from mint_server import checkpoints
+    from mint_server.routes import weights as wt
 
     root = tmp_path / "tos"
     runtime_root = tmp_path / "runtime"
@@ -354,8 +354,8 @@ def test_issue_317_list_checkpoints_includes_pending_cache_status(monkeypatch, t
 def test_issue_317_list_checkpoints_finds_owner_scoped_pending_cache(
     monkeypatch, tmp_path: Path
 ) -> None:
-    from tinker_server import checkpoints
-    from tinker_server.routes import weights as wt
+    from mint_server import checkpoints
+    from mint_server.routes import weights as wt
 
     root = tmp_path / "tos"
     runtime_root = tmp_path / "runtime"
@@ -425,8 +425,8 @@ def test_issue_317_list_checkpoints_finds_owner_scoped_pending_cache(
 async def test_issue_317_save_state_does_not_wait_for_sampling_registration(
     monkeypatch, tmp_path: Path
 ) -> None:
-    from tinker_server.models.types import SaveStateRequest
-    from tinker_server.routes import weights as wt
+    from mint_server.models.types import SaveStateRequest
+    from mint_server.routes import weights as wt
 
     ckpt_dir = tmp_path / "training_named"
     resolved: dict[str, dict] = {}
@@ -470,7 +470,7 @@ async def test_issue_317_save_state_does_not_wait_for_sampling_registration(
     monkeypatch.setattr(
         wt,
         "begin_async_checkpoint_mirror",
-        lambda *_args, **_kwargs: "/tos-mindverse/tinker_checkpoints/user-a/run-317/ckpt-a",
+        lambda *_args, **_kwargs: "/tos-mindverse/mint_checkpoints/user-a/run-317/ckpt-a",
     )
     monkeypatch.setattr(wt, "inference_manager", _ForbiddenInferenceManager())
 
@@ -493,8 +493,8 @@ async def test_issue_317_save_state_does_not_wait_for_sampling_registration(
 async def test_issue_317_named_save_weights_for_sampler_preserves_type(
     monkeypatch, tmp_path: Path
 ) -> None:
-    from tinker_server.models.types import SaveWeightsForSamplerRequest
-    from tinker_server.routes import training as tr
+    from mint_server.models.types import SaveWeightsForSamplerRequest
+    from mint_server.routes import training as tr
 
     async def _identity_materialize(session):
         return session
@@ -553,7 +553,7 @@ async def test_issue_317_named_save_weights_for_sampler_preserves_type(
     monkeypatch.setattr(
         tr,
         "begin_async_checkpoint_mirror",
-        lambda *_args, **_kwargs: "/tos-mindverse/tinker_checkpoints/user-a/run-317/sampler-a",
+        lambda *_args, **_kwargs: "/tos-mindverse/mint_checkpoints/user-a/run-317/sampler-a",
     )
 
     request = SaveWeightsForSamplerRequest(model_id="run-317", seq_id=0, path="sampler-a")
@@ -576,9 +576,9 @@ async def test_issue_317_named_save_weights_for_sampler_preserves_type(
 async def test_issue_317_named_save_weights_for_sampler_admin_owner_is_anonymous(
     monkeypatch, tmp_path: Path
 ) -> None:
-    from tinker_server.checkpoints import read_checkpoint_metadata
-    from tinker_server.models.types import SaveWeightsForSamplerRequest
-    from tinker_server.routes import training as tr
+    from mint_server.checkpoints import read_checkpoint_metadata
+    from mint_server.models.types import SaveWeightsForSamplerRequest
+    from mint_server.routes import training as tr
 
     async def _identity_materialize(session):
         return session
@@ -633,7 +633,7 @@ async def test_issue_317_named_save_weights_for_sampler_admin_owner_is_anonymous
     monkeypatch.setattr(
         tr,
         "begin_async_checkpoint_mirror",
-        lambda *_args, **_kwargs: "/tos-mindverse/tinker_checkpoints/anonymous/run-317/sampler-admin",
+        lambda *_args, **_kwargs: "/tos-mindverse/mint_checkpoints/anonymous/run-317/sampler-admin",
     )
 
     request = SaveWeightsForSamplerRequest(model_id="run-317", seq_id=0, path="sampler-admin")

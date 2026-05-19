@@ -85,7 +85,7 @@ def _load_env() -> None:
 
     # Prevent mint SDK from defaulting to https://mint.macaron.im when running tools
     # without explicit target configuration.
-    if "MINT_BASE_URL" not in os.environ and "TINKER_BASE_URL" not in os.environ:
+    if "MINT_BASE_URL" not in os.environ and "MINT_BASE_URL" not in os.environ:
         os.environ["MINT_BASE_URL"] = DEFAULT_BASE_URL
 
 
@@ -206,16 +206,16 @@ def _parse_args() -> argparse.Namespace:
     sub = p.add_subparsers(dest="cmd")
 
     p_single = sub.add_parser("single", help="Run RL loop for one model")
-    p_single.add_argument("--base-url", default=None, help="MINT_BASE_URL/TINKER_BASE_URL override")
-    p_single.add_argument("--api-key", default=None, help="MINT_API_KEY/TINKER_API_KEY override")
+    p_single.add_argument("--base-url", default=None, help="MINT_BASE_URL/MINT_BASE_URL override")
+    p_single.add_argument("--api-key", default=None, help="MINT_API_KEY/MINT_API_KEY override")
     p_single.add_argument("--model", required=True, help="HF model name")
     p_single.add_argument("--session-idx", type=int, default=0, help="Optional session index for logging")
     p_single.add_argument("--jsonl-path", default=None, help="Write per-stage timing logs to this JSONL file")
     p_single.add_argument("--barrier-dir", default=None, help="Optional directory for step barrier files")
     p_single.add_argument("--barrier-sessions", type=int, default=0, help="Expected session count for step barrier")
     p_conc = sub.add_parser("concurrent", help="Run RL loops concurrently (default)")
-    p_conc.add_argument("--base-url", default=None, help="MINT_BASE_URL/TINKER_BASE_URL override")
-    p_conc.add_argument("--api-key", default=None, help="MINT_API_KEY/TINKER_API_KEY override")
+    p_conc.add_argument("--base-url", default=None, help="MINT_BASE_URL/MINT_BASE_URL override")
+    p_conc.add_argument("--api-key", default=None, help="MINT_API_KEY/MINT_API_KEY override")
     p_conc.add_argument("--models", default=DEFAULT_MODELS, help="Comma-separated HF model names")
     p_conc.add_argument("--run-dir", default=None, help="Directory to write per-model logs")
     p_conc.add_argument("--stagger-s", type=float, default=0.0, help="Sleep between process launches")
@@ -223,8 +223,8 @@ def _parse_args() -> argparse.Namespace:
     p_conc.add_argument("--max-runtime-s", type=float, default=0.0, help="0 = no limit")
 
     p_ms = sub.add_parser("multi-session", help="Run multiple RL sessions concurrently for one base model")
-    p_ms.add_argument("--base-url", default=None, help="MINT_BASE_URL/TINKER_BASE_URL override")
-    p_ms.add_argument("--api-key", default=None, help="MINT_API_KEY/TINKER_API_KEY override")
+    p_ms.add_argument("--base-url", default=None, help="MINT_BASE_URL/MINT_BASE_URL override")
+    p_ms.add_argument("--api-key", default=None, help="MINT_API_KEY/MINT_API_KEY override")
     p_ms.add_argument("--model", required=True, help="HF model name")
     p_ms.add_argument("--num-sessions", type=int, required=True, help="Number of concurrent sessions (>=2)")
     p_ms.add_argument("--run-dir", default=None, help="Directory to write per-session logs")
@@ -1108,11 +1108,11 @@ def main() -> int:
     cmd = args.cmd or "concurrent"
 
     if cmd == "single":
-        base_url = _coalesce(args.base_url, os.environ.get("MINT_BASE_URL"), os.environ.get("TINKER_BASE_URL"))
+        base_url = _coalesce(args.base_url, os.environ.get("MINT_BASE_URL"), os.environ.get("MINT_BASE_URL"))
         if not base_url:
-            print("Set --base-url or MINT_BASE_URL/TINKER_BASE_URL", file=sys.stderr)
+            print("Set --base-url or MINT_BASE_URL/MINT_BASE_URL", file=sys.stderr)
             return 2
-        api_key = _coalesce(args.api_key, os.environ.get("MINT_API_KEY"), os.environ.get("TINKER_API_KEY"))
+        api_key = _coalesce(args.api_key, os.environ.get("MINT_API_KEY"), os.environ.get("MINT_API_KEY"))
         cfg = _rl_cfg_from_args(args)
         jsonl_path = Path(args.jsonl_path) if getattr(args, "jsonl_path", None) else None
         barrier_dir = Path(args.barrier_dir) if getattr(args, "barrier_dir", None) else None
@@ -1145,8 +1145,8 @@ def main() -> int:
             return 1
 
     if cmd == "multi-session":
-        base_url = _coalesce(args.base_url, os.environ.get("MINT_BASE_URL"), os.environ.get("TINKER_BASE_URL"), DEFAULT_BASE_URL)
-        api_key = _coalesce(args.api_key, os.environ.get("MINT_API_KEY"), os.environ.get("TINKER_API_KEY"))
+        base_url = _coalesce(args.base_url, os.environ.get("MINT_BASE_URL"), os.environ.get("MINT_BASE_URL"), DEFAULT_BASE_URL)
+        api_key = _coalesce(args.api_key, os.environ.get("MINT_API_KEY"), os.environ.get("MINT_API_KEY"))
         cfg = _rl_cfg_from_args(args)
         prompt_logprobs = _parse_bool_flag(getattr(args, "prompt_logprobs", "0"))
         compute_logprobs = _parse_bool_flag(getattr(args, "compute_logprobs", "0"))
@@ -1178,8 +1178,8 @@ def main() -> int:
         print(f"Unknown cmd: {cmd}", file=sys.stderr)
         return 2
 
-    base_url = _coalesce(args.base_url, os.environ.get("MINT_BASE_URL"), os.environ.get("TINKER_BASE_URL"), DEFAULT_BASE_URL)
-    api_key = _coalesce(args.api_key, os.environ.get("MINT_API_KEY"), os.environ.get("TINKER_API_KEY"))
+    base_url = _coalesce(args.base_url, os.environ.get("MINT_BASE_URL"), os.environ.get("MINT_BASE_URL"), DEFAULT_BASE_URL)
+    api_key = _coalesce(args.api_key, os.environ.get("MINT_API_KEY"), os.environ.get("MINT_API_KEY"))
     cfg = _rl_cfg_from_args(args)
     prompt_logprobs = _parse_bool_flag(getattr(args, "prompt_logprobs", "0"))
     compute_logprobs = _parse_bool_flag(getattr(args, "compute_logprobs", "0"))

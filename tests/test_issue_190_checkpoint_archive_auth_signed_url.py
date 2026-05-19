@@ -40,9 +40,9 @@ def _mk_checkpoint(
 def test_issue_190_redirect_location_is_fetchable_without_headers_under_auth(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from tinker_server import config as config_module
-    from tinker_server.app import api_key_auth_middleware
-    from tinker_server.routes import weights as weights_routes
+    from mint_server import config as config_module
+    from mint_server.app import api_key_auth_middleware
+    from mint_server.routes import weights as weights_routes
 
     weights_routes.CHECKPOINTS_DIR = str(tmp_path)
 

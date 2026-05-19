@@ -36,9 +36,9 @@ PALIGEMMA_TOKENIZER_PATH = Path('/vePFS-Mindverse/share/code/root/.openpi-data-v
 
 def _request_headers() -> dict[str, str]:
     api_key = (
-        os.environ.get("TINKER_API_KEY")
+        os.environ.get("MINT_API_KEY")
         or os.environ.get("MINT_API_KEY")
-        or os.environ.get("TINKER_BASE_API_KEY")
+        or os.environ.get("MINT_BASE_API_KEY")
         or ""
     ).strip()
     if not api_key:
@@ -270,7 +270,7 @@ def _plot_success_curve(out_path: Path, records: list[dict]) -> None:
 def main():
     base_url = 'http://localhost:8000'
     base_model = 'openpi/pi0-fast-libero-low-mem-finetune'
-    out_dir = Path('/vePFS-Mindverse/share/code/root/tinker-server-pr422-vla-20260402/results/rl_pi0fast_real_eval_task0_r')
+    out_dir = Path('/vePFS-Mindverse/share/code/root/mint-server-pr422-vla-20260402/results/rl_pi0fast_real_eval_task0_r')
     out_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = out_dir / 'metrics.jsonl'
 

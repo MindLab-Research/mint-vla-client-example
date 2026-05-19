@@ -5,8 +5,8 @@ from typing import Any
 
 import requests
 
-BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000").rstrip("/")
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
+BASE_URL = os.environ.get("MINT_BASE_URL", "http://localhost:8000").rstrip("/")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
 
 
 def _headers() -> dict[str, str]:
@@ -50,7 +50,7 @@ def main() -> int:
         caps = _get_json(f"{BASE_URL}/api/v1/get_server_capabilities", timeout_s=30.0)
         supported = caps.get("supported_models") or []
         names = [m.get("model_name") for m in supported if isinstance(m, dict)]
-        base_model = os.environ.get("TINKER_BASE_MODEL") or "Qwen/Qwen3-0.6B"
+        base_model = os.environ.get("MINT_BASE_MODEL") or "Qwen/Qwen3-0.6B"
         if base_model not in names and names:
             base_model = str(names[0])
 

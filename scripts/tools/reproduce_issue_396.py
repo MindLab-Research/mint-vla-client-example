@@ -9,15 +9,15 @@ from typing import Any
 import requests
 
 
-BASE_URL = (os.environ.get("TINKER_BASE_URL") or "http://localhost:10396").rstrip("/")
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
-MODEL = os.environ.get("TINKER_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
+BASE_URL = (os.environ.get("MINT_BASE_URL") or "http://localhost:10396").rstrip("/")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
+MODEL = os.environ.get("MINT_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
 
-VALID_TOPK = int(os.environ.get("TINKER_VALID_TOPK", "1"))
-INVALID_TOPK = int(os.environ.get("TINKER_INVALID_TOPK", "21"))
-HTTP_TIMEOUT_S = float(os.environ.get("TINKER_HTTP_TIMEOUT_S", "60"))
-POLL_TIMEOUT_S = float(os.environ.get("TINKER_POLL_TIMEOUT_S", "600"))
-POLL_SLEEP_S = float(os.environ.get("TINKER_POLL_SLEEP_S", "1.0"))
+VALID_TOPK = int(os.environ.get("MINT_VALID_TOPK", "1"))
+INVALID_TOPK = int(os.environ.get("MINT_INVALID_TOPK", "21"))
+HTTP_TIMEOUT_S = float(os.environ.get("MINT_HTTP_TIMEOUT_S", "60"))
+POLL_TIMEOUT_S = float(os.environ.get("MINT_POLL_TIMEOUT_S", "600"))
+POLL_SLEEP_S = float(os.environ.get("MINT_POLL_SLEEP_S", "1.0"))
 
 PROMPT_TOKENS = [101, 102, 103]
 
@@ -36,7 +36,7 @@ def _fail(msg: str) -> int:
 
 def _actor_name_for_model(model_name: str) -> str:
     model_part = model_name.split("/")[-1] if "/" in model_name else model_name
-    return f"tinker_vllm_{model_part.lower().replace(' ', '_')}"
+    return f"mint_vllm_{model_part.lower().replace(' ', '_')}"
 
 
 def _get_json(path: str) -> tuple[int, dict[str, Any]]:

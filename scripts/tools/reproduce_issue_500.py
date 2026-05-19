@@ -12,7 +12,7 @@ import requests
 
 
 DEFAULT_BASE_URL = "http://localhost:8000"
-HTTP_TIMEOUT_S = float(os.environ.get("TINKER_HTTP_TIMEOUT_S", "120"))
+HTTP_TIMEOUT_S = float(os.environ.get("MINT_HTTP_TIMEOUT_S", "120"))
 DEFAULT_PROMPT = "Reply with exactly: hi"
 
 
@@ -41,13 +41,13 @@ def _parse_args() -> argparse.Namespace:
 
 def _base_url(args: argparse.Namespace) -> str:
     return (
-        _coalesce(args.base_url, os.environ.get("TINKER_BASE_URL"), os.environ.get("MINT_BASE_URL"), DEFAULT_BASE_URL)
+        _coalesce(args.base_url, os.environ.get("MINT_BASE_URL"), os.environ.get("MINT_BASE_URL"), DEFAULT_BASE_URL)
         or DEFAULT_BASE_URL
     ).rstrip("/")
 
 
 def _headers(args: argparse.Namespace) -> dict[str, str]:
-    api_key = _coalesce(args.api_key, os.environ.get("TINKER_API_KEY"), os.environ.get("MINT_API_KEY"))
+    api_key = _coalesce(args.api_key, os.environ.get("MINT_API_KEY"), os.environ.get("MINT_API_KEY"))
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["X-API-Key"] = api_key
@@ -89,7 +89,7 @@ def _extract_supported_models(body: dict[str, Any]) -> list[str]:
 
 
 def _select_model(args: argparse.Namespace, base_url: str, headers: dict[str, str]) -> str:
-    explicit = _coalesce(args.model, os.environ.get("TINKER_MODEL"), os.environ.get("MINT_MODEL"))
+    explicit = _coalesce(args.model, os.environ.get("MINT_MODEL"), os.environ.get("MINT_MODEL"))
     status, body = _get_json(base_url, headers, "/api/v1/get_server_capabilities")
     if status != 200:
         raise RuntimeError(f"get_server_capabilities returned {status}: {body!r}")

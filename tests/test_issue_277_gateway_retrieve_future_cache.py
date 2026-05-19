@@ -7,13 +7,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from tinker_server.models.types import FutureRetrieveRequest
-from tinker_server.routes import futures as futures_route
+from mint_server.models.types import FutureRetrieveRequest
+from mint_server.routes import futures as futures_route
 
 
 def _reset_gateway_and_cache():
     """Reset gateway config and _recent cache."""
-    import tinker_server.gateway as gw
+    import mint_server.gateway as gw
     gw._gateway_config = None
     gw._remote_sampling_sessions.clear()
     gw._remote_training_models.clear()
@@ -53,7 +53,7 @@ async def test_gateway_retrieve_future_caches_terminal_response(monkeypatch):
             "test-upstream": {"base_url": "http://test:8000", "auth_mode": "none"}
         },
     }
-    monkeypatch.setenv("TINKER_GATEWAY_CONFIG_JSON", json.dumps(cfg))
+    monkeypatch.setenv("MINT_GATEWAY_CONFIG_JSON", json.dumps(cfg))
 
     # Mock forward_json to simulate upstream response
     forward_call_count = 0
@@ -62,7 +62,7 @@ async def test_gateway_retrieve_future_caches_terminal_response(monkeypatch):
         forward_call_count += 1
         return _mock_upstream_response(200, {"result": "success", "data": "test_data"})
 
-    import tinker_server.gateway as gw
+    import mint_server.gateway as gw
     monkeypatch.setattr(gw, "forward_json", mock_forward_json)
 
     # First retrieve_future call
@@ -93,7 +93,7 @@ async def test_gateway_retrieve_future_caches_error_response(monkeypatch):
             "test-upstream": {"base_url": "http://test:8000", "auth_mode": "none"}
         },
     }
-    monkeypatch.setenv("TINKER_GATEWAY_CONFIG_JSON", json.dumps(cfg))
+    monkeypatch.setenv("MINT_GATEWAY_CONFIG_JSON", json.dumps(cfg))
 
     forward_call_count = 0
     async def mock_forward_json(*args, **kwargs):
@@ -101,7 +101,7 @@ async def test_gateway_retrieve_future_caches_error_response(monkeypatch):
         forward_call_count += 1
         return _mock_upstream_response(200, {"error": "Future already retrieved", "category": "system"})
 
-    import tinker_server.gateway as gw
+    import mint_server.gateway as gw
     monkeypatch.setattr(gw, "forward_json", mock_forward_json)
 
     body = FutureRetrieveRequest(request_id="gw:test-upstream:xyz789")
@@ -130,7 +130,7 @@ async def test_gateway_retrieve_future_does_not_cache_pending(monkeypatch):
             "test-upstream": {"base_url": "http://test:8000", "auth_mode": "none"}
         },
     }
-    monkeypatch.setenv("TINKER_GATEWAY_CONFIG_JSON", json.dumps(cfg))
+    monkeypatch.setenv("MINT_GATEWAY_CONFIG_JSON", json.dumps(cfg))
 
     # Disable pending throttle to test actual forwarding behavior
     monkeypatch.setattr(futures_route, "_pending_hint_maybe_throttle", lambda req_id: None)
@@ -141,7 +141,7 @@ async def test_gateway_retrieve_future_does_not_cache_pending(monkeypatch):
         forward_call_count += 1
         return _mock_upstream_response(408, {})
 
-    import tinker_server.gateway as gw
+    import mint_server.gateway as gw
     monkeypatch.setattr(gw, "forward_json", mock_forward_json)
 
     body = FutureRetrieveRequest(request_id="gw:test-upstream:pending123")
@@ -168,7 +168,7 @@ async def test_gateway_retrieve_future_cached_response_preserves_public_error_an
             "test-upstream": {"base_url": "http://test:8000", "auth_mode": "none"}
         },
     }
-    monkeypatch.setenv("TINKER_GATEWAY_CONFIG_JSON", json.dumps(cfg))
+    monkeypatch.setenv("MINT_GATEWAY_CONFIG_JSON", json.dumps(cfg))
     monkeypatch.setattr(futures_route, "_is_privileged", lambda _req: False)
 
     forward_call_count = 0
@@ -181,7 +181,7 @@ async def test_gateway_retrieve_future_cached_response_preserves_public_error_an
             {"error": "sensitive internal detail", "category": "system", "request_id": "upstream-123"},
         )
 
-    import tinker_server.gateway as gw
+    import mint_server.gateway as gw
     monkeypatch.setattr(gw, "forward_json", mock_forward_json)
 
     body = FutureRetrieveRequest(request_id="gw:test-upstream:upstream-123")
@@ -213,7 +213,7 @@ async def test_gateway_retrieve_future_cached_response_preserves_terminal_status
             "test-upstream": {"base_url": "http://test:8000", "auth_mode": "none"}
         },
     }
-    monkeypatch.setenv("TINKER_GATEWAY_CONFIG_JSON", json.dumps(cfg))
+    monkeypatch.setenv("MINT_GATEWAY_CONFIG_JSON", json.dumps(cfg))
     monkeypatch.setattr(futures_route, "_is_privileged", lambda _req: False)
 
     forward_call_count = 0
@@ -223,7 +223,7 @@ async def test_gateway_retrieve_future_cached_response_preserves_terminal_status
         forward_call_count += 1
         return _mock_upstream_response(503, {"detail": "internal upstream detail"})
 
-    import tinker_server.gateway as gw
+    import mint_server.gateway as gw
     monkeypatch.setattr(gw, "forward_json", mock_forward_json)
 
     body = FutureRetrieveRequest(request_id="gw:test-upstream:upstream-503")

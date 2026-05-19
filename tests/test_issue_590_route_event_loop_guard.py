@@ -8,11 +8,11 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 SCAN_PATHS = (
-    REPO_ROOT / "tinker_server/routes",
-    REPO_ROOT / "tinker_server/health_checks.py",
-    REPO_ROOT / "tinker_server/ray_cluster_health.py",
-    REPO_ROOT / "tinker_server/ray_gcs_metrics.py",
-    REPO_ROOT / "tinker_server/backend/model_work_dispatch.py",
+    REPO_ROOT / "mint_server/routes",
+    REPO_ROOT / "mint_server/health_checks.py",
+    REPO_ROOT / "mint_server/ray_cluster_health.py",
+    REPO_ROOT / "mint_server/ray_gcs_metrics.py",
+    REPO_ROOT / "mint_server/backend/model_work_dispatch.py",
 )
 
 BLOCKING_PATTERNS = (
@@ -28,17 +28,17 @@ BLOCKING_PATTERNS = (
 
 EXISTING_ROUTE_BLOCKING_DEBT = Counter(
     {
-        ("tinker_server/routes/internal.py", "subprocess.Popen(", "proc = subprocess.Popen("): 1,
+        ("mint_server/routes/internal.py", "subprocess.Popen(", "proc = subprocess.Popen("): 1,
         (
-            "tinker_server/routes/training.py",
+            "mint_server/routes/training.py",
             "asyncio.to_thread",
             "worker = await asyncio.to_thread(ray.get_actor, actor_name, namespace=namespace)",
         ): 1,
-        ("tinker_server/routes/training.py", "asyncio.to_thread", "local_metadata = await asyncio.to_thread("): 1,
-        ("tinker_server/routes/training.py", "asyncio.to_thread", "return await asyncio.to_thread("): 1,
-        ("tinker_server/routes/training.py", "asyncio.to_thread", "tokenizer_metadata = await asyncio.to_thread("): 1,
-        ("tinker_server/routes/weights.py", "time.sleep(", "time.sleep(0.25)"): 1,
-        ("tinker_server/routes/weights.py", "subprocess.Popen(", "proc = subprocess.Popen("): 1,
+        ("mint_server/routes/training.py", "asyncio.to_thread", "local_metadata = await asyncio.to_thread("): 1,
+        ("mint_server/routes/training.py", "asyncio.to_thread", "return await asyncio.to_thread("): 1,
+        ("mint_server/routes/training.py", "asyncio.to_thread", "tokenizer_metadata = await asyncio.to_thread("): 1,
+        ("mint_server/routes/weights.py", "time.sleep(", "time.sleep(0.25)"): 1,
+        ("mint_server/routes/weights.py", "subprocess.Popen(", "proc = subprocess.Popen("): 1,
     }
 )
 

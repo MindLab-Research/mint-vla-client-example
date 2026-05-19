@@ -1,6 +1,6 @@
 # MintX API Reference
 
-Keep this file synchronized with the implementation in `tinker_server/routes/mint.py`, `tinker_server/models/mint_types.py`, and `mint.mint` client helpers.
+Keep this file synchronized with the implementation in `mint_server/routes/mint.py`, `mint_server/models/mint_types.py`, and `mint.mint` client helpers.
 
 ## Server Namespace
 

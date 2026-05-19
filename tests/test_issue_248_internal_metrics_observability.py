@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import time
-import tinker_server.routes.internal as internal_routes
+import mint_server.routes.internal as internal_routes
 
 
 async def _fake_admission_stats(*, include_actor_rss: bool = True) -> dict:
@@ -160,7 +160,7 @@ async def _fake_admission_stats(*, include_actor_rss: bool = True) -> dict:
             {
                 "actor_type": "dense",
                 "base_model": "Qwen/Qwen3-4B-Instruct-2507",
-                "actor_name": "peft_trainer_qwen__qwen3_4b_instruct_2507_maxr64",
+                "actor_name": "mint_dense_qwen__qwen3_4b_instruct_2507",
                 "idle_time": 1,
                 "age": 33,
                 "rss_bytes": 150,
@@ -355,12 +355,12 @@ def test_issue_248_internal_metrics_omits_unknown_model_actor_inventory_rss(monk
         'mint_model_actor_inventory_observability_refresh_failures_total{actor_type="megatron"} 1',
         'mint_model_actor_inventory_observability_cache_hits_total{actor_type="vllm"} 12',
         'mint_model_actor_inventory_observability_refresh_success_total{actor_type="vllm"} 3',
-        'mint_dense_actor_poisoned{actor_name="peft_trainer_qwen__qwen3_4b_instruct_2507_maxr64",base_model="Qwen/Qwen3-4B-Instruct-2507",last_fatal_op="reinit_lora_weights"} 1',
+        'mint_dense_actor_poisoned{actor_name="mint_dense_qwen__qwen3_4b_instruct_2507",base_model="Qwen/Qwen3-4B-Instruct-2507",last_fatal_op="reinit_lora_weights"} 1',
         'mint_dense_poisoned_actors{base_model="Qwen/Qwen3-4B-Instruct-2507",last_fatal_op="reinit_lora_weights"} 1',
     )
     for line in extra_lines:
         assert line in text, f"missing metric line: {line}"
-    assert 'mint_dense_actor_poisoned_age_s{actor_name="peft_trainer_qwen__qwen3_4b_instruct_2507_maxr64",base_model="Qwen/Qwen3-4B-Instruct-2507",last_fatal_op="reinit_lora_weights"}' in text
+    assert 'mint_dense_actor_poisoned_age_s{actor_name="mint_dense_qwen__qwen3_4b_instruct_2507",base_model="Qwen/Qwen3-4B-Instruct-2507",last_fatal_op="reinit_lora_weights"}' in text
 
     assert 'mint_actor_rss_bytes{actor="task_futures"}' not in text
     assert 'mint_model_actor_inventory_actor_rss_bytes{actor_name="vllm-1"' not in text
@@ -412,17 +412,17 @@ def test_issue_248_internal_metrics_marks_stale_cached_rss_without_emitting_valu
 
 
 def test_issue_588_admission_stats_rss_path_preserves_model_actor_inventory_metadata(monkeypatch) -> None:
-    task_state_store_module = importlib.import_module("tinker_server.backend.task_state_store")
-    model_actor_supervisor_module = importlib.import_module("tinker_server.backend.model_actor_supervisor")
-    model_work_scheduler_module = importlib.import_module("tinker_server.backend.model_work_scheduler")
-    maintenance_cron_actor_module = importlib.import_module("tinker_server.backend.maintenance_cron_actor")
-    model_actor_inventory_module = importlib.import_module("tinker_server.backend.model_actor_supervisor")
-    session_heartbeat_store_module = importlib.import_module("tinker_server.backend.session_heartbeat_store")
-    sampling_route = importlib.import_module("tinker_server.routes.sampling")
-    service_route = importlib.import_module("tinker_server.routes.service")
-    dense_session_state_module = importlib.import_module("tinker_server.backend.dense_session_state")
-    ray_cluster_health_module = importlib.import_module("tinker_server.ray_cluster_health")
-    ray_gcs_metrics_module = importlib.import_module("tinker_server.ray_gcs_metrics")
+    task_state_store_module = importlib.import_module("mint_server.backend.task_state_store")
+    model_actor_supervisor_module = importlib.import_module("mint_server.backend.model_actor_supervisor")
+    model_work_scheduler_module = importlib.import_module("mint_server.backend.model_work_scheduler")
+    maintenance_cron_actor_module = importlib.import_module("mint_server.backend.maintenance_cron_actor")
+    model_actor_inventory_module = importlib.import_module("mint_server.backend.model_actor_supervisor")
+    session_heartbeat_store_module = importlib.import_module("mint_server.backend.session_heartbeat_store")
+    sampling_route = importlib.import_module("mint_server.routes.sampling")
+    service_route = importlib.import_module("mint_server.routes.service")
+    dense_session_state_module = importlib.import_module("mint_server.backend.dense_session_state")
+    ray_cluster_health_module = importlib.import_module("mint_server.ray_cluster_health")
+    ray_gcs_metrics_module = importlib.import_module("mint_server.ray_gcs_metrics")
 
     class _FakeModelWorkScheduler:
         async def stats(self, *, timeout_s: float = 10.0) -> dict:
@@ -496,17 +496,17 @@ def test_issue_588_admission_stats_rss_path_preserves_model_actor_inventory_meta
 
 
 def test_issue_248_admission_stats_metrics_path_uses_cached_pool_snapshot(monkeypatch) -> None:
-    task_state_store_module = importlib.import_module("tinker_server.backend.task_state_store")
-    model_actor_supervisor_module = importlib.import_module("tinker_server.backend.model_actor_supervisor")
-    model_work_scheduler_module = importlib.import_module("tinker_server.backend.model_work_scheduler")
-    maintenance_cron_actor_module = importlib.import_module("tinker_server.backend.maintenance_cron_actor")
-    model_actor_inventory_module = importlib.import_module("tinker_server.backend.model_actor_supervisor")
-    session_heartbeat_store_module = importlib.import_module("tinker_server.backend.session_heartbeat_store")
-    sampling_route = importlib.import_module("tinker_server.routes.sampling")
-    service_route = importlib.import_module("tinker_server.routes.service")
-    dense_session_state_module = importlib.import_module("tinker_server.backend.dense_session_state")
-    ray_cluster_health_module = importlib.import_module("tinker_server.ray_cluster_health")
-    ray_gcs_metrics_module = importlib.import_module("tinker_server.ray_gcs_metrics")
+    task_state_store_module = importlib.import_module("mint_server.backend.task_state_store")
+    model_actor_supervisor_module = importlib.import_module("mint_server.backend.model_actor_supervisor")
+    model_work_scheduler_module = importlib.import_module("mint_server.backend.model_work_scheduler")
+    maintenance_cron_actor_module = importlib.import_module("mint_server.backend.maintenance_cron_actor")
+    model_actor_inventory_module = importlib.import_module("mint_server.backend.model_actor_supervisor")
+    session_heartbeat_store_module = importlib.import_module("mint_server.backend.session_heartbeat_store")
+    sampling_route = importlib.import_module("mint_server.routes.sampling")
+    service_route = importlib.import_module("mint_server.routes.service")
+    dense_session_state_module = importlib.import_module("mint_server.backend.dense_session_state")
+    ray_cluster_health_module = importlib.import_module("mint_server.ray_cluster_health")
+    ray_gcs_metrics_module = importlib.import_module("mint_server.ray_gcs_metrics")
 
     class _FakeModelWorkScheduler:
         async def stats(self, *, timeout_s: float = 10.0) -> dict:
@@ -614,7 +614,7 @@ def test_issue_248_metrics_path_exports_cached_scheduler_model_load(monkeypatch)
 
 
 def test_issue_248_scheduler_decisions_debug_route_proxies_filters(monkeypatch) -> None:
-    model_work_scheduler_module = importlib.import_module("tinker_server.backend.model_work_scheduler")
+    model_work_scheduler_module = importlib.import_module("mint_server.backend.model_work_scheduler")
 
     class _FakeModelWorkScheduler:
         async def stats(self, *, timeout_s: float = 10.0) -> dict:

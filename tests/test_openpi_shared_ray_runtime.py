@@ -8,11 +8,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from tinker_server.backend.training_session_manager import TrainingSession
+from mint_server.backend.training_session_manager import TrainingSession
 
 
-def _spec(*, worker_module: str = "tinker_server.backend.openpi_fast_worker"):
-    from tinker_server.backend.openpi_fast_runtime import OpenPIFastRuntimeSpec
+def _spec(*, worker_module: str = "mint_server.backend.openpi_fast_worker"):
+    from mint_server.backend.openpi_fast_runtime import OpenPIFastRuntimeSpec
 
     return OpenPIFastRuntimeSpec(
         python_executable=os.sys.executable,
@@ -99,7 +99,7 @@ def _reset_shared_runtime_test_state(monkeypatch, openpi_shared_ray_runtime) -> 
 
 
 def test_start_openpi_shared_ray_runtime_reuses_actor_for_same_pool_key(monkeypatch) -> None:
-    from tinker_server.backend import openpi_shared_ray_runtime
+    from mint_server.backend import openpi_shared_ray_runtime
 
     state: dict[str, object] = {"remote_calls": [], "client_inits": []}
 
@@ -161,7 +161,7 @@ def test_start_openpi_shared_ray_runtime_reuses_actor_for_same_pool_key(monkeypa
     assert len(state["remote_calls"]) == 1
     actor_name = state["remote_calls"][0]["actor_name"]
     assert state["options"]["runtime_env"]["env_vars"]["MINT_OPENPI_FAST_ACTION_SESSION_STATE_ROOT"] == (
-        f"/repo/checkpoints/openpi_action_session_state/tinker/{actor_name}"
+        f"/repo/checkpoints/openpi_action_session_state/mint/{actor_name}"
     )
     assert state["client_inits"] == [
         {
@@ -169,7 +169,7 @@ def test_start_openpi_shared_ray_runtime_reuses_actor_for_same_pool_key(monkeypa
             "actor_name": state["client_inits"][0]["actor_name"],
             "session_id": "model-a",
             "ready_timeout_s": 300.0,
-            "worker_module": "tinker_server.backend.openpi_fast_worker",
+            "worker_module": "mint_server.backend.openpi_fast_worker",
             "owns_started_actor": True,
         },
         {
@@ -177,14 +177,14 @@ def test_start_openpi_shared_ray_runtime_reuses_actor_for_same_pool_key(monkeypa
             "actor_name": state["client_inits"][0]["actor_name"],
             "session_id": "model-b",
             "ready_timeout_s": 300.0,
-            "worker_module": "tinker_server.backend.openpi_fast_worker",
+            "worker_module": "mint_server.backend.openpi_fast_worker",
             "owns_started_actor": False,
         },
     ]
 
 
 def test_start_openpi_shared_ray_runtime_registers_actor_metadata_in_model_actor_inventory(monkeypatch) -> None:
-    from tinker_server.backend import openpi_shared_ray_runtime
+    from mint_server.backend import openpi_shared_ray_runtime
 
     state: dict[str, object] = {}
 
@@ -249,11 +249,11 @@ def test_start_openpi_shared_ray_runtime_registers_actor_metadata_in_model_actor
     register = state["register"]
     actor_name = state["remote"]["actor_name"]
     assert state["options"]["runtime_env"]["env_vars"]["MINT_OPENPI_FAST_ACTION_SESSION_STATE_ROOT"] == (
-        f"/repo/checkpoints/openpi_action_session_state/tinker/{actor_name}"
+        f"/repo/checkpoints/openpi_action_session_state/mint/{actor_name}"
     )
     assert register["actor_type"].value == "openpi"
     assert register["node_id"] == "node-456"
-    assert register["metadata"]["worker_module"] == "tinker_server.backend.openpi_fast_worker"
+    assert register["metadata"]["worker_module"] == "mint_server.backend.openpi_fast_worker"
     assert register["metadata"]["actor_id"] == "actor-123"
     assert register["metadata"]["node_ip"] == "192.168.0.8"
     assert register["metadata"]["pid"] == 999
@@ -262,7 +262,7 @@ def test_start_openpi_shared_ray_runtime_registers_actor_metadata_in_model_actor
 
 def test_start_openpi_shared_ray_runtime_refreshes_stale_cached_actor_handle(monkeypatch) -> None:
     pytest.importorskip("ray")
-    from tinker_server.backend import openpi_shared_ray_runtime
+    from mint_server.backend import openpi_shared_ray_runtime
 
     state: dict[str, object] = {"client_inits": []}
 
@@ -322,7 +322,7 @@ def test_start_openpi_shared_ray_runtime_refreshes_stale_cached_actor_handle(mon
             "actor_name": actor_name,
             "session_id": "model-a",
             "ready_timeout_s": 300.0,
-            "worker_module": "tinker_server.backend.openpi_fast_worker",
+            "worker_module": "mint_server.backend.openpi_fast_worker",
             "owns_started_actor": False,
         }
     ]
@@ -331,7 +331,7 @@ def test_start_openpi_shared_ray_runtime_refreshes_stale_cached_actor_handle(mon
 
 def test_openpi_shared_runtime_client_refreshes_named_actor_before_request(monkeypatch) -> None:
     pytest.importorskip("ray")
-    from tinker_server.backend import openpi_shared_ray_runtime
+    from mint_server.backend import openpi_shared_ray_runtime
 
     calls: list[tuple[str, object]] = []
 
@@ -354,7 +354,7 @@ def test_openpi_shared_runtime_client_refreshes_named_actor_before_request(monke
 
     client = openpi_shared_ray_runtime.OpenPISharedRayRuntimeClient(
         actor="stale-actor",
-        actor_name="openpi_shared_runtime_deadbeef",
+        actor_name="mint_openpi_shared_deadbeef",
         spec=_spec(),
         session_id="model-a",
         ready_timeout_s=300.0,
@@ -377,7 +377,7 @@ def test_openpi_shared_runtime_client_refreshes_named_actor_before_request(monke
 
 def test_openpi_shared_ray_runtime_client_ray_get_awaits_future_without_ray_get(monkeypatch) -> None:
     pytest.importorskip("ray")
-    from tinker_server.backend.openpi_shared_ray_runtime import OpenPISharedRayRuntimeClient
+    from mint_server.backend.openpi_shared_ray_runtime import OpenPISharedRayRuntimeClient
 
     client = OpenPISharedRayRuntimeClient(
         actor=object(),
@@ -391,7 +391,7 @@ def test_openpi_shared_ray_runtime_client_ray_get_awaits_future_without_ray_get(
     ref = SimpleNamespace(future=lambda: fut)
 
     monkeypatch.setattr(
-        "tinker_server.backend.openpi_shared_ray_runtime.ray.get",
+        "mint_server.backend.openpi_shared_ray_runtime.ray.get",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("ray.get should not be called")),
     )
 
@@ -399,7 +399,7 @@ def test_openpi_shared_ray_runtime_client_ray_get_awaits_future_without_ray_get(
 
 
 def test_start_openpi_shared_ray_runtime_applies_single_node_pin(monkeypatch) -> None:
-    from tinker_server.backend import openpi_shared_ray_runtime
+    from mint_server.backend import openpi_shared_ray_runtime
 
     state: dict[str, object] = {}
     node_id = "a" * 56
@@ -486,7 +486,7 @@ def test_start_openpi_shared_ray_runtime_applies_single_node_pin(monkeypatch) ->
 
 
 def test_shared_client_close_cleans_up_new_actor_after_failed_initial_create_session(monkeypatch) -> None:
-    from tinker_server.backend import openpi_shared_ray_runtime
+    from mint_server.backend import openpi_shared_ray_runtime
 
     shutdown_ref = _completed_ref("shutdown-ref")
     state: dict[str, object] = {
@@ -554,7 +554,7 @@ def test_shared_client_close_cleans_up_new_actor_after_failed_initial_create_ses
         raise AssertionError(f"unexpected ref {ref!r}")
 
     async def _record_shutdown_ref(ref, *, timeout_s=None):
-        from tinker_server.backend.async_ray_control import async_get_ray_ref as _real_async_get_ray_ref
+        from mint_server.backend.async_ray_control import async_get_ray_ref as _real_async_get_ray_ref
 
         if ref is shutdown_ref:
             state["shutdown_refs"].append(("shutdown-ref", timeout_s))
@@ -596,7 +596,7 @@ def test_shared_client_close_cleans_up_new_actor_after_failed_initial_create_ses
 
 
 def test_shared_client_close_does_not_kill_actor_after_successful_create_session(monkeypatch) -> None:
-    from tinker_server.backend import openpi_shared_ray_runtime
+    from mint_server.backend import openpi_shared_ray_runtime
 
     state: dict[str, object] = {
         "unregister": [],
@@ -697,7 +697,7 @@ def test_shared_client_close_does_not_kill_actor_after_successful_create_session
 
 
 def test_shared_client_shutdown_reclaims_actor_when_last_session_exits(monkeypatch) -> None:
-    from tinker_server.backend import openpi_shared_ray_runtime
+    from mint_server.backend import openpi_shared_ray_runtime
 
     shutdown_ref = _completed_ref("shutdown-ref")
     state: dict[str, object] = {
@@ -772,7 +772,7 @@ def test_shared_client_shutdown_reclaims_actor_when_last_session_exits(monkeypat
         raise AssertionError(f"unexpected ref {ref!r}")
 
     async def _record_shutdown_ref(ref, *, timeout_s=None):
-        from tinker_server.backend.async_ray_control import async_get_ray_ref as _real_async_get_ray_ref
+        from mint_server.backend.async_ray_control import async_get_ray_ref as _real_async_get_ray_ref
 
         if ref is shutdown_ref:
             state["shutdown_refs"].append(("shutdown-ref", timeout_s))
@@ -814,7 +814,7 @@ def test_shared_client_shutdown_reclaims_actor_when_last_session_exits(monkeypat
 
 
 def test_start_openpi_shared_ray_runtime_uses_model_id_as_runtime_session_key(monkeypatch) -> None:
-    from tinker_server.backend import openpi_shared_ray_runtime
+    from mint_server.backend import openpi_shared_ray_runtime
 
     state: dict[str, object] = {"client_inits": []}
 
@@ -879,7 +879,7 @@ def test_start_openpi_shared_ray_runtime_uses_model_id_as_runtime_session_key(mo
 
 
 def test_start_openpi_shared_ray_runtime_cleans_up_detached_actor_when_ready_fails(monkeypatch) -> None:
-    from tinker_server.backend import openpi_shared_ray_runtime
+    from mint_server.backend import openpi_shared_ray_runtime
 
     shutdown_ref = _completed_ref("shutdown-ref")
     state: dict[str, object] = {"shutdown_refs": [], "kill_calls": [], "unregister": []}
@@ -923,7 +923,7 @@ def test_start_openpi_shared_ray_runtime_cleans_up_detached_actor_when_ready_fai
         return None
 
     async def _fake_async_get_ray_ref(ref, *, timeout_s=None):
-        from tinker_server.backend.async_ray_control import async_get_ray_ref as _real_async_get_ray_ref
+        from mint_server.backend.async_ray_control import async_get_ray_ref as _real_async_get_ray_ref
 
         if ref is shutdown_ref:
             state["shutdown_refs"].append(("shutdown-ref", timeout_s))
@@ -963,7 +963,7 @@ def test_start_openpi_shared_ray_runtime_cleans_up_detached_actor_when_ready_fai
 
 
 def test_openpi_shared_runtime_core_swaps_sessions_on_a_b_a() -> None:
-    from tinker_server.backend.openpi_shared_ray_runtime import (
+    from mint_server.backend.openpi_shared_ray_runtime import (
         OpenPISharedRuntimeCore,
         _template_session_id,
     )
@@ -997,9 +997,9 @@ def test_openpi_shared_runtime_core_swaps_sessions_on_a_b_a() -> None:
     core = OpenPISharedRuntimeCore(
         spec=_spec(),
         runtime_factory=lambda spec: runtime,
-        actor_metadata={"actor_name": "openpi_shared_runtime_fast"},
+        actor_metadata={"actor_name": "mint_openpi_shared_fast"},
     )
-    template_session_id = _template_session_id({"actor_name": "openpi_shared_runtime_fast"})
+    template_session_id = _template_session_id({"actor_name": "mint_openpi_shared_fast"})
 
     asyncio.run(core.register_session(session_a.session_id, _create_payload(session_a)))
     asyncio.run(core.request_for_session(session_a.session_id, "forward_backward", {"batch": []}))
@@ -1022,7 +1022,7 @@ def test_openpi_shared_runtime_core_swaps_sessions_on_a_b_a() -> None:
 
 
 def test_openpi_shared_runtime_core_bootstraps_distinct_sessions_when_template_not_reusable() -> None:
-    from tinker_server.backend.openpi_shared_ray_runtime import OpenPISharedRuntimeCore, _template_session_id
+    from mint_server.backend.openpi_shared_ray_runtime import OpenPISharedRuntimeCore, _template_session_id
 
     class _FakeWorkerRuntime:
         def __init__(self) -> None:
@@ -1050,9 +1050,9 @@ def test_openpi_shared_runtime_core_bootstraps_distinct_sessions_when_template_n
     session_a = _make_session("model-a", "session-a")
     session_b = _make_session("model-b", "session-b")
 
-    actor_metadata = {"actor_name": "openpi_shared_runtime_action_fast"}
+    actor_metadata = {"actor_name": "mint_openpi_shared_action_fast"}
     core = OpenPISharedRuntimeCore(
-        spec=_spec(worker_module="tinker_server.backend.openpi_fast_action_worker"),
+        spec=_spec(worker_module="mint_server.backend.openpi_fast_action_worker"),
         runtime_factory=lambda spec: runtime,
         actor_metadata=actor_metadata,
         template_reusable=False,
@@ -1081,7 +1081,7 @@ def test_openpi_shared_runtime_core_bootstraps_distinct_sessions_when_template_n
 
 
 def test_openpi_shared_runtime_core_surfaces_restore_failures_without_fallback() -> None:
-    from tinker_server.backend.openpi_shared_ray_runtime import OpenPISharedRuntimeCore
+    from mint_server.backend.openpi_shared_ray_runtime import OpenPISharedRuntimeCore
 
     class _FakeWorkerRuntime:
         def __init__(self) -> None:
@@ -1122,8 +1122,8 @@ def test_openpi_shared_runtime_core_surfaces_restore_failures_without_fallback()
 
 
 def test_openpi_shared_runtime_core_isolates_template_state_per_actor(tmp_path) -> None:
-    from tinker_server.backend.openpi_session_state import OpenPISessionStateManager
-    from tinker_server.backend.openpi_shared_ray_runtime import OpenPISharedRuntimeCore
+    from mint_server.backend.openpi_session_state import OpenPISessionStateManager
+    from mint_server.backend.openpi_shared_ray_runtime import OpenPISharedRuntimeCore
 
     class _StateBackedRuntime:
         def __init__(self, *, worker_module: str, state_root) -> None:
@@ -1180,23 +1180,23 @@ def test_openpi_shared_runtime_core_isolates_template_state_per_actor(tmp_path) 
 
     state_root = tmp_path / "_mint_session_state"
     fast_runtime = _StateBackedRuntime(
-        worker_module="tinker_server.backend.openpi_fast_worker",
+        worker_module="mint_server.backend.openpi_fast_worker",
         state_root=state_root,
     )
     pi05_runtime = _StateBackedRuntime(
-        worker_module="tinker_server.backend.openpi_pi05_worker",
+        worker_module="mint_server.backend.openpi_pi05_worker",
         state_root=state_root,
     )
 
     fast_core = OpenPISharedRuntimeCore(
         spec=_spec(),
         runtime_factory=lambda spec: fast_runtime,
-        actor_metadata={"actor_name": "openpi_shared_runtime_fast"},
+        actor_metadata={"actor_name": "mint_openpi_shared_fast"},
     )
     pi05_core = OpenPISharedRuntimeCore(
-        spec=_spec(worker_module="tinker_server.backend.openpi_pi05_worker"),
+        spec=_spec(worker_module="mint_server.backend.openpi_pi05_worker"),
         runtime_factory=lambda spec: pi05_runtime,
-        actor_metadata={"actor_name": "openpi_shared_runtime_pi05"},
+        actor_metadata={"actor_name": "mint_openpi_shared_pi05"},
     )
 
     fast_session_a = _make_session("fast-model-a", "fast-session-a")
@@ -1215,7 +1215,7 @@ def test_openpi_shared_runtime_core_isolates_template_state_per_actor(tmp_path) 
 
 
 def test_openpi_shared_runtime_core_resets_after_initial_create_session_failure() -> None:
-    from tinker_server.backend.openpi_shared_ray_runtime import OpenPISharedRuntimeCore
+    from mint_server.backend.openpi_shared_ray_runtime import OpenPISharedRuntimeCore
 
     class _FailingRuntime:
         def __init__(self, *, should_fail: bool) -> None:

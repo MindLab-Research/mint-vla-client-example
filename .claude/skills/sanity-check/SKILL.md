@@ -1,7 +1,7 @@
 ---
 name: sanity-check
 description: |
-  Production sanity-check runner for MinT/tinker-server.
+  Production sanity-check runner for MinT/mint-server.
 
   Objective: run non-trivial RL training loops (not just healthz) against production for 4 base models
   (0.6B, 4B, 30B, 235B), collect evidence on failure, do minimal ops remediation when justified,
@@ -35,7 +35,7 @@ Hard rules:
 ## Inputs
 
 Required local file (repo root):
-- `.secrets.env` (do not print); must provide `TINKER_BASE_URL` and `TINKER_API_KEY` (or `MINT_BASE_URL`/`MINT_API_KEY`).
+- `.secrets.env` (do not print); must provide `MINT_BASE_URL` and `MINT_API_KEY`.
 
 Required access:
 - `ssh mint-prod-volcano` (Volcano router/master)
@@ -66,14 +66,14 @@ set -a && source .secrets.env && set +a
 ```
 
 2) Confirm production targeting:
-- Set `TINKER_BASE_URL=https://mint.macaron.xin`.
+- Set `MINT_BASE_URL=https://mint.macaron.xin`.
 - Set `MINT_TEST_CHECKPOINT_OWNER_ID` to the production owner ObjectId used for owner-scoped checkpoint sampling.
-- Refuse to run if `TINKER_BASE_URL` is anything else (including `localhost:*` and `https://mint.macaron.im`).
+- Refuse to run if `MINT_BASE_URL` is anything else (including `localhost:*` and `https://mint.macaron.im`).
 
 3) (Optional) Quick read-only probes (not sufficient alone):
 ```bash
-curl -sS "$TINKER_BASE_URL/api/v1/healthz"
-curl -sS -H "X-API-Key: $TINKER_API_KEY" "$TINKER_BASE_URL/internal/actors"
+curl -sS "$MINT_BASE_URL/api/v1/healthz"
+curl -sS -H "X-API-Key: $MINT_API_KEY" "$MINT_BASE_URL/internal/actors"
 ```
 
 ### 1) Run the 4 RL tests (must)
@@ -108,14 +108,14 @@ After each run, preserve these timing outputs as evidence:
 
 1) Check prod logs:
 - Always check the router/master first:
-  - `ssh mint-prod-volcano "tail -400 /tmp/tinker_server_auth.log"`
+  - `ssh mint-prod-volcano "tail -400 /tmp/mint_server_auth.log"`
 - Do not assume `235B -> Aliyun`.
 - Before checking any remote upstream, verify the current routing target from current prod evidence:
   - shared prod config under `/share/mint/prod/config`
-  - live routing env such as `TINKER_GATEWAY_CONFIG_JSON`
+  - live routing env such as `MINT_GATEWAY_CONFIG_JSON`
   - current actor inventory from `/internal/actors`
 - Only if that evidence shows the model is remotely routed should you inspect the remote target logs, for example:
-  - `ssh mint-prod-aliyun "tail -400 /tmp/tinker_server_auth.log"`
+  - `ssh mint-prod-aliyun "tail -400 /tmp/mint_server_auth.log"`
 
 2) If 235B is "slow but pending" (no exception, just long `retrieve_future` / pending sampling):
 - Do not interrupt or kill vLLM solely due to elapsed time.
@@ -136,9 +136,9 @@ Prefer the smallest blast radius:
 1) Kill a specific actor type for the specific model (admin only when auth enabled):
 ```bash
 curl -sS -X POST \
-  -H "X-API-Key: $TINKER_API_KEY" \
+  -H "X-API-Key: $MINT_API_KEY" \
   -H "Content-Type: application/json" \
-  "$TINKER_BASE_URL/internal/actors/kill" \
+  "$MINT_BASE_URL/internal/actors/kill" \
   -d '{"actor_type":"vllm","model_name":"Qwen/Qwen3-4B-Instruct-2507"}'
 ```
 
@@ -154,7 +154,7 @@ Notes:
   - follow the `mint-prod` restart procedure
 - Remote upstream:
   - Only if current routing/config proves the failing model is hosted there, follow that deployment's start SOP.
-  - For Aliyun specifically, follow `.claude/skills/aliyun-cluster/SKILL.md` "Start tinker-server on mint-prod-aliyun".
+  - For Aliyun specifically, follow `.claude/skills/aliyun-cluster/SKILL.md` "Start mint-server on mint-prod-aliyun".
   - Do not restart the local Ray head while actors exist.
 
 3) Log every remediation:

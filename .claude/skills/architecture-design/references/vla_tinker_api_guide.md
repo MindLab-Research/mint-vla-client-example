@@ -245,7 +245,7 @@ Do not interpret successful private development runs as proof that a shared runt
 
 The current runtime contract is repo-owned:
 
-- `src/mint/pyproject.toml` declares the canonical `tool.tinker.runtime_env` sources and host requirements
+- `src/mint/pyproject.toml` declares the canonical `tool.mint.runtime_env` sources and host requirements
 - the `openpi` source contract includes both `src` and `packages/openpi-client/src`
 - host-side requirements explicitly include the OpenPI worker stack such as `jax[cuda12]`, `flax`, `optax`, `orbax-checkpoint`, `ml_collections`, `jaxtyping`, `augmax`, `tqdm-loggable`, and `tyro`
 - `src/mint/scripts/build_runtime_env.py --inspect --env-root ...` is the standard probe for manifest, layout, and host-python import checks

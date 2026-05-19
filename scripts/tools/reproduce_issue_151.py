@@ -6,20 +6,20 @@ from typing import Any
 import requests
 
 
-BASE_URL = os.environ.get("TINKER_BASE_URL")
+BASE_URL = os.environ.get("MINT_BASE_URL")
 if not BASE_URL:
-    port = os.environ.get("TINKER_PORT", "8000")
+    port = os.environ.get("MINT_PORT", "8000")
     BASE_URL = f"http://localhost:{port}"
 BASE_URL = BASE_URL.rstrip("/")
 
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
 
 # A base model that the gateway is configured to route to an upstream deployment.
-MODEL = os.environ.get("TINKER_MODEL", "Qwen/Qwen3-235B-A22B-Instruct-2507")
-LORA_RANK = int(os.environ.get("TINKER_LORA_RANK", "32"))
+MODEL = os.environ.get("MINT_MODEL", "Qwen/Qwen3-235B-A22B-Instruct-2507")
+LORA_RANK = int(os.environ.get("MINT_LORA_RANK", "32"))
 
-POLL_TIMEOUT_S = float(os.environ.get("TINKER_POLL_TIMEOUT_S", "1800"))
-POLL_SLEEP_S = float(os.environ.get("TINKER_POLL_SLEEP_S", "2.0"))
+POLL_TIMEOUT_S = float(os.environ.get("MINT_POLL_TIMEOUT_S", "1800"))
+POLL_SLEEP_S = float(os.environ.get("MINT_POLL_SLEEP_S", "2.0"))
 
 
 def _headers() -> dict[str, str]:

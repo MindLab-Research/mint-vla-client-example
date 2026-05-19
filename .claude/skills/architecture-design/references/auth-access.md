@@ -1,6 +1,6 @@
 # Authentication and model access
 
-Auth is enforced in `tinker_server/app.py` middleware for both `/api/v1/*` and `/internal/*` when `INTERNAL_API_TOKEN` is configured. If it is not configured, the server runs in dev pass-through mode and stamps a local admin identity.
+Auth is enforced in `mint_server/app.py` middleware for both `/api/v1/*` and `/internal/*` when `INTERNAL_API_TOKEN` is configured. If it is not configured, the server runs in dev pass-through mode and stamps a local admin identity.
 
 ## API keys and identities
 
@@ -29,4 +29,4 @@ Privilege boundary:
 
 ## Model access control
 
-Model access control is centralized in `tinker_server/model_access_control.py` and is applied in routes like `POST /api/v1/create_sampling_session` based on `request.state.user_data`.
+Model access control is centralized in `mint_server/model_access_control.py` and is applied in routes like `POST /api/v1/create_sampling_session` based on `request.state.user_data`.

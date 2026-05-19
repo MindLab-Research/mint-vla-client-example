@@ -6,12 +6,12 @@ from typing import Any
 import requests
 
 
-BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000").rstrip("/")
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
+BASE_URL = os.environ.get("MINT_BASE_URL", "http://localhost:8000").rstrip("/")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
 
-RAY_NAMESPACE = os.environ.get("TINKER_RAY_NAMESPACE", "").strip()
+RAY_NAMESPACE = os.environ.get("MINT_RAY_NAMESPACE", "").strip()
 
-PG_BUNDLE_COUNT = os.environ.get("TINKER_REPRO_PG_BUNDLE_COUNT", "").strip()
+PG_BUNDLE_COUNT = os.environ.get("MINT_REPRO_PG_BUNDLE_COUNT", "").strip()
 
 
 def _headers() -> dict[str, str]:
@@ -34,7 +34,7 @@ def _get_json(url: str, *, timeout_s: float) -> tuple[int, dict[str, Any] | None
 
 def main() -> int:
     if not RAY_NAMESPACE:
-        return _fail("TINKER_RAY_NAMESPACE is required (run on mint-dev with the server namespace)")
+        return _fail("MINT_RAY_NAMESPACE is required (run on mint-dev with the server namespace)")
     ray_address = os.environ.get("RAY_ADDRESS", "").strip()
     if not ray_address:
         return _fail("RAY_ADDRESS is required and must be the validated GCS address")
@@ -59,7 +59,7 @@ def main() -> int:
             try:
                 pg_bundles = int(PG_BUNDLE_COUNT)
             except Exception:
-                return _fail(f"Invalid TINKER_REPRO_PG_BUNDLE_COUNT={PG_BUNDLE_COUNT!r} (expected int)")
+                return _fail(f"Invalid MINT_REPRO_PG_BUNDLE_COUNT={PG_BUNDLE_COUNT!r} (expected int)")
         else:
             # Force a pending placement group by requesting strictly more bundles than the cluster can satisfy.
             pg_bundles = int(gpu_total) + 1

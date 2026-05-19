@@ -71,7 +71,7 @@ def _coalesce(*values: str | None) -> str | None:
 def _base_url(args: argparse.Namespace) -> str:
     base = _coalesce(
         getattr(args, "base_url", None),
-        os.environ.get("TINKER_BASE_URL"),
+        os.environ.get("MINT_BASE_URL"),
         os.environ.get("MINT_BASE_URL"),
         DEFAULT_BASE_URL,
     ) or DEFAULT_BASE_URL
@@ -81,7 +81,7 @@ def _base_url(args: argparse.Namespace) -> str:
 def _headers(args: argparse.Namespace) -> dict[str, str]:
     api_key = _coalesce(
         getattr(args, "api_key", None),
-        os.environ.get("TINKER_API_KEY"),
+        os.environ.get("MINT_API_KEY"),
         os.environ.get("MINT_API_KEY"),
     )
     return {"X-API-Key": api_key} if api_key else {}
@@ -1142,7 +1142,7 @@ def run_ppo_experiment(args: argparse.Namespace) -> int:
     print(f"Format reward coef: {format_reward_coef}", flush=True)
     print(f"Explicit sampling stop_token_ids: {explicit_stop_token_ids}", flush=True)
     print(
-        "Note: train_prompt_mini_bsz/ppo_micro_batch_size_per_gpu are server-side in tinker-server.",
+        "Note: train_prompt_mini_bsz/ppo_micro_batch_size_per_gpu are server-side in mint-server.",
         flush=True,
     )
     print(flush=True)

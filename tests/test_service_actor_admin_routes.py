@@ -70,9 +70,9 @@ class _FakePool:
 
 
 def _build_client(monkeypatch, pool: _FakePool, *, patch_placement_groups: bool = True) -> TestClient:
-    from tinker_server.routes import internal as internal_routes
-    import tinker_server.backend.actor_admin as actor_admin
-    import tinker_server.backend.model_actor_supervisor as model_actor_inventory
+    from mint_server.routes import internal as internal_routes
+    import mint_server.backend.actor_admin as actor_admin
+    import mint_server.backend.model_actor_supervisor as model_actor_inventory
 
     monkeypatch.setattr(actor_admin, "require_admin", lambda _request: None)
     monkeypatch.setattr(model_actor_inventory, "get_model_actor_supervisor", lambda: pool)
@@ -88,7 +88,7 @@ def _build_client(monkeypatch, pool: _FakePool, *, patch_placement_groups: bool 
 
 
 def test_list_actors_uses_startup_ray_driver_without_request_path_init(monkeypatch) -> None:
-    import tinker_server.ray_utils as ray_utils
+    import mint_server.ray_utils as ray_utils
 
     _install_ray_stub(monkeypatch)
     init_ray_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
@@ -137,7 +137,7 @@ def test_list_actors_can_skip_metadata_refresh(monkeypatch) -> None:
 
 
 def test_list_actors_passes_filters_to_model_actor_inventory_before_refresh(monkeypatch) -> None:
-    from tinker_server.backend.model_actor_supervisor import ActorType
+    from mint_server.backend.model_actor_supervisor import ActorType
 
     _install_ray_stub(monkeypatch)
     pool = _FakePool(
@@ -210,7 +210,7 @@ def test_list_actors_returns_503_when_model_actor_inventory_gpu_total_fails(monk
 
 
 def test_kill_dense_actors_returns_503_without_unregistering_when_ray_driver_is_unavailable(monkeypatch) -> None:
-    from tinker_server.backend.model_actor_supervisor import ActorType
+    from mint_server.backend.model_actor_supervisor import ActorType
 
     _install_ray_stub(monkeypatch)
 
@@ -235,8 +235,8 @@ def test_kill_dense_actors_returns_503_without_unregistering_when_ray_driver_is_
 
 
 def test_kill_exact_dense_actor_returns_503_without_unregistering_when_kill_fails(monkeypatch) -> None:
-    import tinker_server.backend.actor_admin as actor_admin
-    from tinker_server.backend.model_actor_supervisor import ActorType
+    import mint_server.backend.actor_admin as actor_admin
+    from mint_server.backend.model_actor_supervisor import ActorType
 
     _install_ray_stub(monkeypatch)
     remove_pg_calls: list[str] = []
@@ -273,8 +273,8 @@ def test_kill_exact_dense_actor_returns_503_without_unregistering_when_kill_fail
 
 
 def test_kill_dense_actors_returns_503_without_unregistering_when_kill_fails(monkeypatch) -> None:
-    import tinker_server.backend.actor_admin as actor_admin
-    from tinker_server.backend.model_actor_supervisor import ActorType
+    import mint_server.backend.actor_admin as actor_admin
+    from mint_server.backend.model_actor_supervisor import ActorType
 
     _install_ray_stub(monkeypatch)
     remove_pg_calls: list[str] = []
@@ -307,8 +307,8 @@ def test_kill_dense_actors_returns_503_without_unregistering_when_kill_fails(mon
 
 
 def test_kill_dense_actors_returns_503_when_pg_removal_fails(monkeypatch) -> None:
-    import tinker_server.backend.actor_admin as actor_admin
-    from tinker_server.backend.model_actor_supervisor import ActorType
+    import mint_server.backend.actor_admin as actor_admin
+    from mint_server.backend.model_actor_supervisor import ActorType
 
     _install_ray_stub(monkeypatch)
 
@@ -342,8 +342,8 @@ def test_kill_dense_actors_returns_503_when_pg_removal_fails(monkeypatch) -> Non
 
 
 def test_infer_base_model_from_checkpoint_passes_admin_scope(monkeypatch, tmp_path) -> None:
-    from tinker_server.routes import service as service_routes
-    import tinker_server.checkpoints as checkpoints
+    from mint_server.routes import service as service_routes
+    import mint_server.checkpoints as checkpoints
 
     checkpoint_dir = tmp_path / "admin-ckpt"
     checkpoint_dir.mkdir()
@@ -389,9 +389,9 @@ def test_infer_base_model_from_checkpoint_passes_admin_scope(monkeypatch, tmp_pa
 
 
 def test_kill_dense_actors_returns_503_when_pg_lookup_mismatches_namespace(monkeypatch) -> None:
-    import tinker_server.backend.actor_admin as actor_admin
-    import tinker_server.backend.ray_placement_groups as ray_placement_groups
-    from tinker_server.backend.model_actor_supervisor import ActorType
+    import mint_server.backend.actor_admin as actor_admin
+    import mint_server.backend.ray_placement_groups as ray_placement_groups
+    from mint_server.backend.model_actor_supervisor import ActorType
 
     _install_ray_stub(monkeypatch)
 

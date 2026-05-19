@@ -5,7 +5,7 @@
 # - (Optionally) an API server container, but in our deployments the API server / Ray driver
 #   typically runs on the host using a dedicated venv (see deployment_scales.md).
 #
-# This Dockerfile must not assume the build context contains tinker-server code.
+# This Dockerfile must not assume the build context contains mint-server code.
 # (The platform build environment may only provide this Dockerfile.)
 
 # Base image from the private Volcano registry with:

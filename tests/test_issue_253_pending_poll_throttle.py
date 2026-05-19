@@ -1,9 +1,9 @@
 import anyio
 from types import SimpleNamespace
 
-from tinker_server.backend.task_state_store import FutureStatus
-from tinker_server.models.types import FutureRetrieveRequest
-from tinker_server.routes import futures as futures_route
+from mint_server.backend.task_state_store import FutureStatus
+from mint_server.models.types import FutureRetrieveRequest
+from mint_server.routes import futures as futures_route
 
 
 class _StubTaskFutureService:

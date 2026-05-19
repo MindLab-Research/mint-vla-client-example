@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-NS="${TINKER_RAY_NAMESPACE:?set TINKER_RAY_NAMESPACE}"
-PORT="${TINKER_PORT:-10427}"
-ROOT="${ISSUE_SERVER_ROOT:-/root/tinker_project/tinker-server-issue-416}"
+NS="${MINT_RAY_NAMESPACE:?set MINT_RAY_NAMESPACE}"
+PORT="${MINT_PORT:-10427}"
+ROOT="${ISSUE_SERVER_ROOT:-/root/mint_project/mint-server-issue-416}"
 MINT_ROOT="${MINT_CODE_ROOT:?set MINT_CODE_ROOT}"
-LOG="${ISSUE_LOG_FILE:-/tmp/tinker_server_issue_416_r17.log}"
+LOG="${ISSUE_LOG_FILE:-/tmp/mint_server_issue_416_r17.log}"
 RAY_ADDR="${RAY_ADDRESS:?set RAY_ADDRESS=ray://<head>:10001}"
-PY="${TINKER_HOST_PYTHON:-/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python}"
-SSH_HOST="${TINKER_DEV_SSH_HOST:-mint-dev}"
+PY="${MINT_HOST_PYTHON:-/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python}"
+SSH_HOST="${MINT_DEV_SSH_HOST:-mint-dev}"
 
 ssh "$SSH_HOST" 'bash -s' <<EOF
 set -euo pipefail
@@ -27,14 +27,14 @@ if [ -n "\$PID" ]; then
   kill -9 "\$PID" 2>/dev/null || true
 fi
 
-RAY_ADDRESS="\$RAY_ADDR" TINKER_RAY_NAMESPACE="\$NS" MINT_RAY_NAMESPACE="\$NS" "\$PY" - <<'PYCODE'
+RAY_ADDRESS="\$RAY_ADDR" MINT_RAY_NAMESPACE="\$NS" MINT_RAY_NAMESPACE="\$NS" "\$PY" - <<'PYCODE'
 import json
 import os
 import ray
 from ray.util.placement_group import PlacementGroup, placement_group_table, remove_placement_group
 
 ray.init(address=os.environ["RAY_ADDRESS"], ignore_reinit_error=True)
-ns = os.environ["TINKER_RAY_NAMESPACE"]
+ns = os.environ["MINT_RAY_NAMESPACE"]
 killed = 0
 for actor in ray.util.list_named_actors(all_namespaces=True):
     if actor.get("namespace") != ns:
@@ -63,10 +63,10 @@ cd "\$ROOT"
 nohup env \
   ISSUE_SERVER_ROOT="\$ROOT" \
   ISSUE_NAMESPACE="\$NS" \
-  ISSUE_STARTUP_LEASE=tinker_startup_lease_issue_416_r17 \
+  ISSUE_STARTUP_LEASE=mint_startup_lease_issue_416_r17 \
   ISSUE_PORT="\$PORT" \
   ISSUE_LOG_FILE="\$LOG" \
-  ISSUE_USAGE_LOG_DIR=/tmp/tinker_usage_issue_416_r17 \
+  ISSUE_USAGE_LOG_DIR=/tmp/mint_usage_issue_416_r17 \
   ISSUE_SUPPORTED_MODELS=Qwen/Qwen3-30B-A3B-Instruct-2507 \
   RAY_ADDRESS="\$RAY_ADDR" \
   MINT_RAY_CLIENT_ADDRESS="\$RAY_ADDR" \
@@ -84,18 +84,18 @@ done
 
 curl -sf "http://localhost:\$PORT/api/v1/healthz"
 
-cd /vePFS-Mindverse/share/code/yiwen/tinker-server-issue-416
-TINKER_BASE_URL="http://localhost:\$PORT" \
-TINKER_API_KEY=dummy \
+cd /vePFS-Mindverse/share/code/yiwen/mint-server-issue-416
+MINT_BASE_URL="http://localhost:\$PORT" \
+MINT_API_KEY=dummy \
 RAY_ADDRESS="\$RAY_ADDR" \
-TINKER_RAY_NAMESPACE="\$NS" \
-TINKER_DEV_SSH_HOST=local \
+MINT_RAY_NAMESPACE="\$NS" \
+MINT_DEV_SSH_HOST=local \
 "\$PY" scripts/tools/reproduce_issue_476.py
 
-TINKER_BASE_URL="http://localhost:\$PORT" \
-TINKER_API_KEY=dummy \
+MINT_BASE_URL="http://localhost:\$PORT" \
+MINT_API_KEY=dummy \
 RAY_ADDRESS="\$RAY_ADDR" \
-TINKER_RAY_NAMESPACE="\$NS" \
-TINKER_DEV_SSH_HOST=local \
+MINT_RAY_NAMESPACE="\$NS" \
+MINT_DEV_SSH_HOST=local \
 "\$PY" scripts/tools/reproduce_issue_416.py
 EOF

@@ -19,9 +19,9 @@ def _env(name: str, default: str) -> str:
     return value if value is not None and value != "" else default
 
 
-BASE_URL = _env("TINKER_BASE_URL", "http://127.0.0.1:8010").rstrip("/")
-API_KEY = _env("TINKER_API_KEY", "dummy")
-BASE_MODEL = _env("TINKER_BASE_MODEL", "Qwen/Qwen3-0.6B")
+BASE_URL = _env("MINT_BASE_URL", "http://127.0.0.1:8010").rstrip("/")
+API_KEY = _env("MINT_API_KEY", "dummy")
+BASE_MODEL = _env("MINT_BASE_MODEL", "Qwen/Qwen3-0.6B")
 
 
 @dataclass

@@ -186,13 +186,13 @@ Heavy logic accumulation requires cleanup.
 
 | Category | Count | Action |
 |----------|-------|--------|
-| Directory | 1 | `tinker_server/` → `mint/` |
-| Imports | ~50 files | `from tinker_server` → `from mint` |
-| Config vars | ~10 | `TINKER_MODEL_PATH` → `MINT_MODEL_PATH` |
+| Directory | 1 | `mint_server/` → `mint/` |
+| Imports | ~50 files | `from mint_server` → `from mint` |
+| Config vars | ~10 | `MINT_MODEL_PATH` → `MINT_MODEL_PATH` |
 | Test scripts | 39 | Consolidate overlapping scripts |
 | Common utilities | - | Extract duplicated `poll_future()`, `create_session()` to `tests/utils.py` |
 
-Keep `TINKER_BASE_URL`, `TINKER_API_KEY` for client-side Tinker API compatibility.
+Keep `MINT_BASE_URL`, `MINT_API_KEY` for client-side Tinker API compatibility.
 
 ---
 

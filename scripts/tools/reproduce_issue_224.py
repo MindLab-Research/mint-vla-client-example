@@ -16,15 +16,15 @@ def main() -> int:
     print(f"issue={ISSUE_NUMBER}")
 
     # Enable gateway mode so register_remote_* attempts to persist routing metadata.
-    os.environ["TINKER_GATEWAY_CONFIG_JSON"] = json.dumps(
+    os.environ["MINT_GATEWAY_CONFIG_JSON"] = json.dumps(
         {
             "model_to_upstream": {"Qwen/Qwen3-0.6B": "u1"},
             "upstreams": {"u1": {"base_url": "http://example.invalid:18000", "auth_mode": "pass_through"}},
         }
     )
 
-    import tinker_server.gateway as gw
-    import tinker_server.backend as backend
+    import mint_server.gateway as gw
+    import mint_server.backend as backend
 
     gw._gateway_config = None
     gw._remote_sampling_sessions.clear()
@@ -40,7 +40,7 @@ def main() -> int:
     )
 
     backend.gateway_session_store = stub_store
-    sys.modules["tinker_server.backend.gateway_session_store"] = stub_store  # Defensive for import paths.
+    sys.modules["mint_server.backend.gateway_session_store"] = stub_store  # Defensive for import paths.
 
     try:
         gw.register_remote_sampling_session(

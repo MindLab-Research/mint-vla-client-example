@@ -2,7 +2,7 @@ import json
 
 
 def test_list_supported_models_env(monkeypatch):
-    from tinker_server.backend import model_registry as mr
+    from mint_server.backend import model_registry as mr
 
     monkeypatch.setenv(
         "MINT_SUPPORTED_MODELS",
@@ -13,7 +13,7 @@ def test_list_supported_models_env(monkeypatch):
 
 
 def test_list_supported_models_env_unknown_raises(monkeypatch):
-    from tinker_server.backend import model_registry as mr
+    from mint_server.backend import model_registry as mr
 
     monkeypatch.setenv("MINT_SUPPORTED_MODELS", "does/not-exist")
     try:
@@ -25,11 +25,11 @@ def test_list_supported_models_env_unknown_raises(monkeypatch):
 
 
 def test_list_supported_models_env_accepts_gateway_routed_model(monkeypatch):
-    from tinker_server.backend import model_registry as mr
+    from mint_server.backend import model_registry as mr
 
     monkeypatch.setenv("MINT_SUPPORTED_MODELS", "Qwen/Qwen3-0.6B, zai-org/GLM-5.1")
     monkeypatch.setenv(
-        "TINKER_GATEWAY_CONFIG_JSON",
+        "MINT_GATEWAY_CONFIG_JSON",
         json.dumps(
             {
                 "model_to_upstream": {"zai-org/GLM-5.1": "glm51"},
@@ -50,7 +50,7 @@ def test_list_supported_models_env_accepts_gateway_routed_model(monkeypatch):
 
 
 def test_model_config_overrides_json(monkeypatch):
-    from tinker_server.backend import model_registry as mr
+    from mint_server.backend import model_registry as mr
 
     monkeypatch.setenv(
         "MINT_MODEL_CONFIG_OVERRIDES_JSON",
@@ -62,7 +62,7 @@ def test_model_config_overrides_json(monkeypatch):
 
 
 def test_model_config_overrides_json_unknown_field_raises(monkeypatch):
-    from tinker_server.backend import model_registry as mr
+    from mint_server.backend import model_registry as mr
 
     monkeypatch.setenv(
         "MINT_MODEL_CONFIG_OVERRIDES_JSON",
@@ -77,7 +77,7 @@ def test_model_config_overrides_json_unknown_field_raises(monkeypatch):
 
 
 def test_is_persistent_model_matches_hf_and_snapshot(monkeypatch):
-    from tinker_server.backend import model_registry as mr
+    from mint_server.backend import model_registry as mr
 
     monkeypatch.setenv("MINT_PERSISTENT_MODELS", "Qwen/Qwen3-0.6B")
     assert mr.is_persistent_model("Qwen/Qwen3-0.6B")
@@ -87,7 +87,7 @@ def test_is_persistent_model_matches_hf_and_snapshot(monkeypatch):
 
 
 def test_is_persistent_model_accepts_snapshot_entries(monkeypatch):
-    from tinker_server.backend import model_registry as mr
+    from mint_server.backend import model_registry as mr
 
     monkeypatch.setenv(
         "MINT_PERSISTENT_MODELS",

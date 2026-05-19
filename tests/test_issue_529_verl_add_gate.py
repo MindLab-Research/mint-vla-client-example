@@ -6,8 +6,8 @@ import types
 
 import pytest
 
-import tinker_server.backend.lora_utils as lora_utils
-import tinker_server.backend.verl_inference as verl_inference
+import mint_server.backend.lora_utils as lora_utils
+import mint_server.backend.verl_inference as verl_inference
 
 
 @pytest.fixture

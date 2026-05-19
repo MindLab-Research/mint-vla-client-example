@@ -11,12 +11,12 @@ from typing import Any
 import requests
 
 
-BASE_URL = (os.environ.get("TINKER_BASE_URL") or f"http://localhost:{os.environ.get('TINKER_PORT', '10319')}").rstrip("/")
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
-SSH_HOST = os.environ.get("TINKER_SSH_HOST", "mint-dev")
-BASE_MODEL = os.environ.get("TINKER_BASE_MODEL", "Qwen/Qwen3-0.6B")
-POLL_TIMEOUT_S = float(os.environ.get("TINKER_POLL_TIMEOUT_S", "300"))
-POLL_SLEEP_S = float(os.environ.get("TINKER_POLL_SLEEP_S", "1.0"))
+BASE_URL = (os.environ.get("MINT_BASE_URL") or f"http://localhost:{os.environ.get('MINT_PORT', '10319')}").rstrip("/")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
+SSH_HOST = os.environ.get("MINT_SSH_HOST", "mint-dev")
+BASE_MODEL = os.environ.get("MINT_BASE_MODEL", "Qwen/Qwen3-0.6B")
+POLL_TIMEOUT_S = float(os.environ.get("MINT_POLL_TIMEOUT_S", "300"))
+POLL_SLEEP_S = float(os.environ.get("MINT_POLL_SLEEP_S", "1.0"))
 
 
 def _headers() -> dict[str, str]:
@@ -76,13 +76,13 @@ def _poll_future(request_id: str) -> dict[str, Any]:
 
 
 def _server_checkpoints_root() -> str:
-    explicit = os.environ.get("TINKER_CHECKPOINTS_ROOT")
+    explicit = os.environ.get("MINT_CHECKPOINTS_ROOT")
     if explicit:
         return explicit
     code = r"""
 import os
 
-pid_path = "/tmp/tinker_server_issue_319.pid"
+pid_path = "/tmp/mint_server_issue_319.pid"
 with open(pid_path, "r", encoding="utf-8") as f:
     pid = f.read().strip()
 env = {}
@@ -93,9 +93,9 @@ with open(f"/proc/{pid}/environ", "rb") as f:
         key, value = raw.split(b"=", 1)
         env[key.decode("utf-8")] = value.decode("utf-8")
 print(
-    env.get("TINKER_PERSISTENT_CHECKPOINT_DIR")
-    or env.get("TINKER_CHECKPOINT_DIR")
-    or "/tos-mindverse/tinker_checkpoints"
+    env.get("MINT_PERSISTENT_CHECKPOINT_DIR")
+    or env.get("MINT_CHECKPOINT_DIR")
+    or "/tos-mindverse/mint_checkpoints"
 )
 """
     root = _ssh_python(code).strip()
@@ -202,7 +202,7 @@ def main() -> int:
     model_id = f"run-319-{uuid.uuid4().hex[:8]}"
     checkpoint_name = f"sampler-bad-{uuid.uuid4().hex[:8]}"
     checkpoint_id = f"sampler_weights/{checkpoint_name}"
-    model_path = f"tinker://{model_id}/{checkpoint_id}"
+    model_path = f"mint://{model_id}/{checkpoint_id}"
     checkpoints_root: str | None = None
     try:
         health_status, _ = _get_json("/api/v1/healthz", timeout_s=10.0)

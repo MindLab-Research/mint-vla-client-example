@@ -3,7 +3,7 @@ from pathlib import Path
 
 
 def test_issue_18_resolve_and_materialize_persistent_checkpoint(tmp_path, monkeypatch) -> None:
-    from tinker_server import checkpoints
+    from mint_server import checkpoints
 
     legacy_root = tmp_path / "legacy"
     persistent_root = tmp_path / "tos"
@@ -41,7 +41,7 @@ def test_issue_18_resolve_and_materialize_persistent_checkpoint(tmp_path, monkey
 
 
 def test_issue_18_resolve_prefers_cache_when_persistent_view_is_partial(tmp_path, monkeypatch) -> None:
-    from tinker_server import checkpoints
+    from mint_server import checkpoints
 
     persistent_root = tmp_path / "tos"
     runtime_root = tmp_path / "runtime"
@@ -94,7 +94,7 @@ def test_issue_18_resolve_prefers_cache_when_persistent_view_is_partial(tmp_path
 
 
 def test_issue_18_reap_runtime_checkpoints(tmp_path, monkeypatch) -> None:
-    from tinker_server import checkpoints
+    from mint_server import checkpoints
 
     persistent_root = tmp_path / "tos"
     runtime_root = tmp_path / "runtime"
@@ -141,7 +141,7 @@ def test_issue_18_reap_runtime_checkpoints(tmp_path, monkeypatch) -> None:
 
 
 def test_issue_18_no_legacy_fallback_resolution(tmp_path, monkeypatch) -> None:
-    from tinker_server import checkpoints
+    from mint_server import checkpoints
 
     legacy_root = tmp_path / "legacy"
     persistent_root = tmp_path / "tos"
@@ -174,7 +174,7 @@ def test_issue_18_no_legacy_fallback_resolution(tmp_path, monkeypatch) -> None:
 
 
 def test_issue_18_session_manager_rejects_checkpoint_uri() -> None:
-    from tinker_server.backend.session_manager import SessionManager
+    from mint_server.backend.session_manager import SessionManager
 
     manager = SessionManager()
     try:

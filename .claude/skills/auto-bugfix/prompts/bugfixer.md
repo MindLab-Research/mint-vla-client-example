@@ -1,6 +1,6 @@
 # auto-bugfix subagent: bugfixer
 
-You handle exactly one GitHub issue end-to-end on an issue-scoped dev server (`mint-dev` on `TINKER_PORT`, not 8000).
+You handle exactly one GitHub issue end-to-end on an issue-scoped dev server (`mint-dev` on `MINT_PORT`, not 8000).
 
 Scope boundary:
 - You do implementation and troubleshooting (repro, dev server, debugging, code edits).
@@ -28,21 +28,21 @@ Non-negotiable rules:
   and retrieve it via `/api/v1/retrieve_future`, asserting on the returned payload (end-to-end through the running system).
 - Restart the issue-scoped dev server after code changes (no hot reload).
 - If uncertain whether a code change is used by a detached actor, run the namespace cleanup snippet (issue namespace makes this safe).
-- Use issue-specific `TINKER_RAY_NAMESPACE` and run the namespace cleanup snippet from `.claude/skills/auto-bugfix/SKILL.md` after finishing the issue so detached actors do not accumulate.
-- Ensure `MINT_RAY_NAMESPACE` matches `TINKER_RAY_NAMESPACE` so detached store actors are also issue-scoped.
-- Never create/get/kill Ray actors outside the provided `TINKER_RAY_NAMESPACE` unless the user explicitly requests cross-namespace action.
-- Use issue-specific `PFS_TINKER_PATH` so Ray workers import the intended code snapshot.
+- Use issue-specific `MINT_RAY_NAMESPACE` and run the namespace cleanup snippet from `.claude/skills/auto-bugfix/SKILL.md` after finishing the issue so detached actors do not accumulate.
+- Ensure `MINT_RAY_NAMESPACE` matches `MINT_RAY_NAMESPACE` so detached store actors are also issue-scoped.
+- Never create/get/kill Ray actors outside the provided `MINT_RAY_NAMESPACE` unless the user explicitly requests cross-namespace action.
+- Use issue-specific `MINT_CODE_ROOT` so Ray workers import the intended code snapshot.
 
 Inputs you will be given by the orchestrator:
 - issue number and URL
 - branch name (based on `origin/develop`)
-- chosen `TINKER_RAY_NAMESPACE`
-- chosen `PFS_TINKER_PATH`
+- chosen `MINT_RAY_NAMESPACE`
+- chosen `MINT_CODE_ROOT`
 
 Process:
 1) Read the entire issue thread (body + all comments). Do not skip context.
-2) Create or update `scripts/tools/reproduce_issue_<NUMBER>.py` (default: run via `TINKER_BASE_URL` and `TINKER_API_KEY` and hit the server over HTTP; only treat as local-only if you can justify why the issue has no server/runtime surface).
-3) Ensure the issue-scoped dev server is running in the provided `TINKER_RAY_NAMESPACE`, `PFS_TINKER_PATH`, and port (via `TINKER_PORT`) per `.claude/skills/auto-bugfix/SKILL.md`.
+2) Create or update `scripts/tools/reproduce_issue_<NUMBER>.py` (default: run via `MINT_BASE_URL` and `MINT_API_KEY` and hit the server over HTTP; only treat as local-only if you can justify why the issue has no server/runtime surface).
+3) Ensure the issue-scoped dev server is running in the provided `MINT_RAY_NAMESPACE`, `MINT_CODE_ROOT`, and port (via `MINT_PORT`) per `.claude/skills/auto-bugfix/SKILL.md`.
 4) Run the reproduction script until it fails deterministically.
 5) Identify root cause and implement the minimal fix.
 6) Restart dev server, then run the reproduction script again until it passes.

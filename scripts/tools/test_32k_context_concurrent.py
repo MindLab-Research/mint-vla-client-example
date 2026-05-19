@@ -9,8 +9,8 @@ length (default: 32000 tokens). Default models are the 4 always-on prod models:
   - Qwen/Qwen3-235B-A22B-Instruct-2507
 
 Target server:
-  - Set MINT_BASE_URL or TINKER_BASE_URL (expected to be a localhost tunnel).
-  - Set MINT_API_KEY or TINKER_API_KEY if your deployment requires auth.
+  - Set MINT_BASE_URL or MINT_BASE_URL (expected to be a localhost tunnel).
+  - Set MINT_API_KEY or MINT_API_KEY if your deployment requires auth.
 
 Exit codes:
   - 0: all tasks completed
@@ -67,7 +67,7 @@ def _load_env() -> None:
     if repo_root_env.exists():
         load_dotenv(repo_root_env, override=False)
 
-    if "MINT_BASE_URL" not in os.environ and "TINKER_BASE_URL" not in os.environ:
+    if "MINT_BASE_URL" not in os.environ and "MINT_BASE_URL" not in os.environ:
         os.environ["MINT_BASE_URL"] = DEFAULT_BASE_URL
 
 
@@ -90,8 +90,8 @@ def _wait_future(fut: Any, *, label: str, timeout_s: float, heartbeat_s: float) 
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument("--base-url", default=None, help="Overrides MINT_BASE_URL/TINKER_BASE_URL")
-    p.add_argument("--api-key", default=None, help="Overrides MINT_API_KEY/TINKER_API_KEY")
+    p.add_argument("--base-url", default=None, help="Overrides MINT_BASE_URL/MINT_BASE_URL")
+    p.add_argument("--api-key", default=None, help="Overrides MINT_API_KEY/MINT_API_KEY")
     p.add_argument("--models", default=DEFAULT_MODELS, help="Comma-separated HF model names")
     p.add_argument("--max-context-len", type=int, default=32000)
     p.add_argument("--steps", type=int, default=2)
@@ -271,8 +271,8 @@ def main() -> int:
     _load_env()
     args = _parse_args()
 
-    base_url = _coalesce(args.base_url, os.environ.get("MINT_BASE_URL"), os.environ.get("TINKER_BASE_URL"), DEFAULT_BASE_URL)
-    api_key = _coalesce(args.api_key, os.environ.get("MINT_API_KEY"), os.environ.get("TINKER_API_KEY"))
+    base_url = _coalesce(args.base_url, os.environ.get("MINT_BASE_URL"), os.environ.get("MINT_BASE_URL"), DEFAULT_BASE_URL)
+    api_key = _coalesce(args.api_key, os.environ.get("MINT_API_KEY"), os.environ.get("MINT_API_KEY"))
 
     print(f"Base URL: {base_url}", flush=True)
     if api_key:

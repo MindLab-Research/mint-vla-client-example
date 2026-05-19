@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end billing (usage_events) reliability test against a running tinker-server.
+"""End-to-end billing (usage_events) reliability test against a running mint-server.
 
 This script:
 1) Creates a sampling session for a base model.
@@ -263,10 +263,10 @@ def main() -> None:
 
     _load_env()
     base_url = (
-        _coalesce(args.base_url, os.environ.get("TINKER_BASE_URL"), os.environ.get("MINT_BASE_URL"), DEFAULT_BASE_URL)
+        _coalesce(args.base_url, os.environ.get("MINT_BASE_URL"), os.environ.get("MINT_BASE_URL"), DEFAULT_BASE_URL)
         .rstrip("/")
     )
-    api_key = _coalesce(args.api_key, os.environ.get("TINKER_API_KEY"), os.environ.get("MINT_API_KEY"))
+    api_key = _coalesce(args.api_key, os.environ.get("MINT_API_KEY"), os.environ.get("MINT_API_KEY"))
     headers = _headers(api_key)
     summary_account_id = _coalesce(
         os.environ.get("MINT_BILLING_ACCOUNT_ID"),

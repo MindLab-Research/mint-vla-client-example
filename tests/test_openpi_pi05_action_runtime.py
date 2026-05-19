@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from tinker_server.models.types import EncodedTextChunk, ImageChunk, ModelInput, TensorData
+from mint_server.models.types import EncodedTextChunk, ImageChunk, ModelInput, TensorData
 
 
 OPENPI_PI05_MODEL = "openpi/pi05-libero-low-mem-finetune"
@@ -96,10 +96,10 @@ def test_openpi_pi05_action_session_manager_create_session_starts_runtime_from_c
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    from tinker_server.backend.action_session_manager import OpenPIPi05ActionSessionManager
+    from mint_server.backend.action_session_manager import OpenPIPi05ActionSessionManager
 
     monkeypatch.setattr(
-        "tinker_server.backend.action_session_manager.get_model_config",
+        "mint_server.backend.action_session_manager.get_model_config",
         _fake_get_model_config,
     )
 
@@ -146,10 +146,10 @@ def test_openpi_pi05_action_session_manager_create_session_starts_runtime_from_c
 
 
 def test_openpi_pi05_action_session_manager_act_returns_actions(monkeypatch, tmp_path: Path) -> None:
-    from tinker_server.backend.action_session_manager import OpenPIPi05ActionSessionManager
+    from mint_server.backend.action_session_manager import OpenPIPi05ActionSessionManager
 
     monkeypatch.setattr(
-        "tinker_server.backend.action_session_manager.get_model_config",
+        "mint_server.backend.action_session_manager.get_model_config",
         _fake_get_model_config,
     )
 
@@ -189,10 +189,10 @@ def test_openpi_pi05_action_session_manager_act_returns_actions(monkeypatch, tmp
 
 
 def test_openpi_pi05_action_session_manager_rejects_unsupported_model_family(monkeypatch, tmp_path: Path) -> None:
-    from tinker_server.backend.action_session_manager import OpenPIPi05ActionSessionManager
+    from mint_server.backend.action_session_manager import OpenPIPi05ActionSessionManager
 
     monkeypatch.setattr(
-        "tinker_server.backend.action_session_manager.get_model_config",
+        "mint_server.backend.action_session_manager.get_model_config",
         _fake_get_model_config,
     )
 

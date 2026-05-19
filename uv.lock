@@ -2687,7 +2687,7 @@ wheels = [
 ]
 
 [[package]]
-name = "tinker-server"
+name = "mint-server"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

@@ -46,15 +46,15 @@ def test_initialize_ray_cluster_uses_explicit_address_for_mint_init(monkeypatch)
     fake_ray = types.ModuleType("ray")
     fake_ray.is_initialized = lambda: False  # type: ignore[attr-defined]
 
-    fake_tinker = _fake_package("tinker_server")
-    fake_tinker_ray_utils = types.ModuleType("tinker_server.ray_utils")
+    fake_mint = _fake_package("mint_server")
+    fake_mint_ray_utils = types.ModuleType("mint_server.ray_utils")
 
     def fake_init_ray(**kwargs):
         calls["mint_init_ray"] = kwargs
         return None
 
-    fake_tinker_ray_utils.init_ray = fake_init_ray  # type: ignore[attr-defined]
-    fake_tinker.ray_utils = fake_tinker_ray_utils  # type: ignore[attr-defined]
+    fake_mint_ray_utils.init_ray = fake_init_ray  # type: ignore[attr-defined]
+    fake_mint.ray_utils = fake_mint_ray_utils  # type: ignore[attr-defined]
 
     monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
     monkeypatch.setitem(sys.modules, "vllm.v1", fake_vllm_v1)
@@ -62,8 +62,8 @@ def test_initialize_ray_cluster_uses_explicit_address_for_mint_init(monkeypatch)
     monkeypatch.setitem(sys.modules, "vllm.v1.executor.ray_executor", fake_ray_exec_mod)
     monkeypatch.setitem(sys.modules, "vllm.v1.executor.ray_utils", fake_ray_utils_mod)
     monkeypatch.setitem(sys.modules, "ray", fake_ray)
-    monkeypatch.setitem(sys.modules, "tinker_server", fake_tinker)
-    monkeypatch.setitem(sys.modules, "tinker_server.ray_utils", fake_tinker_ray_utils)
+    monkeypatch.setitem(sys.modules, "mint_server", fake_mint)
+    monkeypatch.setitem(sys.modules, "mint_server.ray_utils", fake_mint_ray_utils)
     monkeypatch.delenv("RAY_ADDRESS", raising=False)
 
     module = _load_repo_sitecustomize()

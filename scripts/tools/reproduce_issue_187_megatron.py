@@ -7,13 +7,13 @@ from typing import Any
 
 import requests
 
-BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000").rstrip("/")
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
-SSH_HOST = os.environ.get("TINKER_SSH_HOST", "mint-dev")
+BASE_URL = os.environ.get("MINT_BASE_URL", "http://localhost:8000").rstrip("/")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
+SSH_HOST = os.environ.get("MINT_SSH_HOST", "mint-dev")
 
 DEFAULT_MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
-BASE_MODEL = os.environ.get("TINKER_MODEL", DEFAULT_MODEL)
-LORA_RANK = int(os.environ.get("TINKER_LORA_RANK", "8"))
+BASE_MODEL = os.environ.get("MINT_MODEL", DEFAULT_MODEL)
+LORA_RANK = int(os.environ.get("MINT_LORA_RANK", "8"))
 
 
 def _headers() -> dict[str, str]:

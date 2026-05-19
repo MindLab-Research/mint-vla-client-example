@@ -6,7 +6,7 @@ import pytest
 
 
 def test_openpi_session_state_roundtrip_preserves_auxiliary_state(tmp_path: Path) -> None:
-    from tinker_server.backend.openpi_session_state import OpenPISessionStateManager
+    from mint_server.backend.openpi_session_state import OpenPISessionStateManager
 
     manager = OpenPISessionStateManager(tmp_path)
     state_store: dict[str, object] = {}
@@ -19,7 +19,7 @@ def test_openpi_session_state_roundtrip_preserves_auxiliary_state(tmp_path: Path
 
     manager.save_state(
         "session-a",
-        worker_module="tinker_server.backend.openpi_fast_worker",
+        worker_module="mint_server.backend.openpi_fast_worker",
         runtime_signature={"base_model": "openpi/pi0-fast-libero-low-mem-finetune"},
         state={"params": {"w": [1, 2, 3]}},
         rng={"seed": [11, 12]},
@@ -31,7 +31,7 @@ def test_openpi_session_state_roundtrip_preserves_auxiliary_state(tmp_path: Path
 
     restored = manager.load_state(
         "session-a",
-        expected_worker_module="tinker_server.backend.openpi_fast_worker",
+        expected_worker_module="mint_server.backend.openpi_fast_worker",
         expected_runtime_signature={"base_model": "openpi/pi0-fast-libero-low-mem-finetune"},
         load_train_state_fn=_load_train_state,
     )
@@ -45,14 +45,14 @@ def test_openpi_session_state_roundtrip_preserves_auxiliary_state(tmp_path: Path
 
 
 def test_openpi_session_state_rejects_worker_module_mismatch(tmp_path: Path) -> None:
-    from tinker_server.backend.openpi_session_state import OpenPISessionStateManager
+    from mint_server.backend.openpi_session_state import OpenPISessionStateManager
 
     manager = OpenPISessionStateManager(tmp_path)
     state_store: dict[str, object] = {}
 
     manager.save_state(
         "session-a",
-        worker_module="tinker_server.backend.openpi_fast_worker",
+        worker_module="mint_server.backend.openpi_fast_worker",
         runtime_signature={"base_model": "openpi/pi0-fast-libero-low-mem-finetune"},
         state={"params": {"w": [1, 2, 3]}},
         rng={"seed": [11, 12]},
@@ -65,21 +65,21 @@ def test_openpi_session_state_rejects_worker_module_mismatch(tmp_path: Path) -> 
     with pytest.raises(ValueError, match="worker_module"):
         manager.load_state(
             "session-a",
-            expected_worker_module="tinker_server.backend.openpi_pi05_worker",
+            expected_worker_module="mint_server.backend.openpi_pi05_worker",
             expected_runtime_signature={"base_model": "openpi/pi0-fast-libero-low-mem-finetune"},
             load_train_state_fn=lambda path: state_store[str(path)],
         )
 
 
 def test_openpi_session_state_rejects_runtime_signature_mismatch(tmp_path: Path) -> None:
-    from tinker_server.backend.openpi_session_state import OpenPISessionStateManager
+    from mint_server.backend.openpi_session_state import OpenPISessionStateManager
 
     manager = OpenPISessionStateManager(tmp_path)
     state_store: dict[str, object] = {}
 
     manager.save_state(
         "session-a",
-        worker_module="tinker_server.backend.openpi_fast_worker",
+        worker_module="mint_server.backend.openpi_fast_worker",
         runtime_signature={"base_model": "openpi/pi0-fast-libero-low-mem-finetune"},
         state={"params": {"w": [1, 2, 3]}},
         rng={"seed": [11, 12]},
@@ -92,21 +92,21 @@ def test_openpi_session_state_rejects_runtime_signature_mismatch(tmp_path: Path)
     with pytest.raises(ValueError, match="runtime_signature"):
         manager.load_state(
             "session-a",
-            expected_worker_module="tinker_server.backend.openpi_fast_worker",
+            expected_worker_module="mint_server.backend.openpi_fast_worker",
             expected_runtime_signature={"base_model": "openpi/pi05-libero-low-mem-finetune"},
             load_train_state_fn=lambda path: state_store[str(path)],
         )
 
 
 def test_openpi_session_state_load_raises_for_missing_session(tmp_path: Path) -> None:
-    from tinker_server.backend.openpi_session_state import OpenPISessionStateManager
+    from mint_server.backend.openpi_session_state import OpenPISessionStateManager
 
     manager = OpenPISessionStateManager(tmp_path)
 
     with pytest.raises(FileNotFoundError, match="session-missing"):
         manager.load_state(
             "session-missing",
-            expected_worker_module="tinker_server.backend.openpi_fast_worker",
+            expected_worker_module="mint_server.backend.openpi_fast_worker",
             expected_runtime_signature={"base_model": "openpi/pi0-fast-libero-low-mem-finetune"},
             load_train_state_fn=lambda path: path,
         )

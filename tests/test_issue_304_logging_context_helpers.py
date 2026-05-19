@@ -5,7 +5,7 @@ import logging
 import sys
 import types
 
-import tinker_server.logging_context as logging_context
+import mint_server.logging_context as logging_context
 
 
 def test_issue_304_bind_request_trace_context_restores_previous_values():

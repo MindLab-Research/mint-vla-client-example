@@ -106,11 +106,11 @@ def test_main_uses_import_string_when_workers_default(monkeypatch) -> None:
     monkeypatch.setattr(module, "_set_exact_pythonpath", lambda entries: entries)
     monkeypatch.setattr(module, "_set_exact_torch_ld_library_path", lambda: "/tmp/torch")
     monkeypatch.setattr(module, "_reexec_if_env_mismatch", lambda **_kwargs: None)
-    monkeypatch.setitem(sys.modules, "tinker_server.logging_context", SimpleNamespace(configure_logging=lambda: None))
-    monkeypatch.setitem(sys.modules, "tinker_server.app", SimpleNamespace(app="APP"))
+    monkeypatch.setitem(sys.modules, "mint_server.logging_context", SimpleNamespace(configure_logging=lambda: None))
+    monkeypatch.setitem(sys.modules, "mint_server.app", SimpleNamespace(app="APP"))
     monkeypatch.setitem(
         sys.modules,
-        "tinker_server.config",
+        "mint_server.config",
         SimpleNamespace(config=SimpleNamespace(host="127.0.0.1", port=8123)),
     )
     monkeypatch.setitem(sys.modules, "uvicorn", SimpleNamespace(run=lambda target, **kwargs: calls.append((target, kwargs))))

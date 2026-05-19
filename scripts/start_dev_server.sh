@@ -32,7 +32,7 @@ export TMPDIR="${api_tmp_link}/t"
 export XDG_CACHE_HOME="${api_tmp_link}/c"
 mkdir -p "${TMPDIR}" "${XDG_CACHE_HOME}" "${MINT_RUNTIME_CHECKPOINT_DIR}"
 
-ray_head_ip_path="${MINT_RAY_HEAD_ADDRESS_PATH:-/vePFS-Mindverse/share/code/tinker-server/ray_head_ip.txt}"
+ray_head_ip_path="${MINT_RAY_HEAD_ADDRESS_PATH:-/share/mint/dev/mint-server/ray_head_ip.txt}"
 ray_head_ip=""
 if [ -r "$ray_head_ip_path" ]; then
   ray_head_ip=$(tr -d '[:space:]' < "$ray_head_ip_path")

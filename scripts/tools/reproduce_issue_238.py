@@ -40,19 +40,19 @@ def _coalesce(*vals: str | None) -> str | None:
 
 
 def _env() -> Env:
-    port = int(os.environ.get("TINKER_PORT", "10238"))
-    base_url = os.environ.get("TINKER_BASE_URL", f"http://localhost:{port}")
-    api_key = _coalesce(os.environ.get("TINKER_API_KEY"), os.environ.get("MINT_API_KEY"), "dummy") or "dummy"
+    port = int(os.environ.get("MINT_PORT", "10238"))
+    base_url = os.environ.get("MINT_BASE_URL", f"http://localhost:{port}")
+    api_key = _coalesce(os.environ.get("MINT_API_KEY"), os.environ.get("MINT_API_KEY"), "dummy") or "dummy"
     ray_address = _require_env("RAY_ADDRESS")
-    ray_namespace = _coalesce(os.environ.get("TINKER_RAY_NAMESPACE"), os.environ.get("MINT_RAY_NAMESPACE"))
+    ray_namespace = _coalesce(os.environ.get("MINT_RAY_NAMESPACE"), os.environ.get("MINT_RAY_NAMESPACE"))
     if not ray_namespace:
-        raise SystemExit("error: missing env TINKER_RAY_NAMESPACE or MINT_RAY_NAMESPACE")
+        raise SystemExit("error: missing env MINT_RAY_NAMESPACE or MINT_RAY_NAMESPACE")
 
-    ssh_host = os.environ.get("TINKER_ISSUE_SSH_HOST", "mint-dev")
-    server_root = os.environ.get("TINKER_ISSUE_SERVER_ROOT", "/root/tinker_project/tinker-server-issue-238")
+    ssh_host = os.environ.get("MINT_ISSUE_SSH_HOST", "mint-dev")
+    server_root = os.environ.get("MINT_ISSUE_SERVER_ROOT", "/root/mint_project/mint-server-issue-238")
     mint_code_root = _require_env("MINT_CODE_ROOT")
-    pidfile = os.environ.get("TINKER_ISSUE_PIDFILE", "/tmp/tinker_server_issue_238.pid")
-    logfile = os.environ.get("TINKER_ISSUE_LOGFILE", "/tmp/tinker_server_issue_238.log")
+    pidfile = os.environ.get("MINT_ISSUE_PIDFILE", "/tmp/mint_server_issue_238.pid")
+    logfile = os.environ.get("MINT_ISSUE_LOGFILE", "/tmp/mint_server_issue_238.log")
     return Env(
         base_url=str(base_url).rstrip("/"),
         api_key=str(api_key),
@@ -91,11 +91,11 @@ def _start_server(env: Env) -> int:
         + env.server_root
         + " && nohup bash -c "
         + json.dumps(
-            "export TINKER_PORT={port}; "
-            "export TINKER_RAY_NAMESPACE={ns}; "
+            "export MINT_PORT={port}; "
+            "export MINT_RAY_NAMESPACE={ns}; "
             "export MINT_RAY_NAMESPACE={ns}; "
             "export MINT_CODE_ROOT={mint_root}; "
-            "export TINKER_TELEMETRY=0; "
+            "export MINT_TELEMETRY=0; "
             "PYTHONPATH={py_path} python scripts/run_server.py".format(
                 port=int(env.port),
                 ns=env.ray_namespace,
@@ -131,7 +131,7 @@ def _kill_namespace_actors(env: Env) -> None:
         env,
         "RAY_ADDRESS="
         + json.dumps(env.ray_address)
-        + " TINKER_RAY_NAMESPACE="
+        + " MINT_RAY_NAMESPACE="
         + json.dumps(env.ray_namespace)
         + " MINT_RAY_NAMESPACE="
         + json.dumps(env.ray_namespace)
@@ -139,7 +139,7 @@ def _kill_namespace_actors(env: Env) -> None:
         "import os\n"
         "import ray\n"
         "ray.init(address=os.environ['RAY_ADDRESS'], ignore_reinit_error=True)\n"
-        "ns = os.environ['TINKER_RAY_NAMESPACE']\n"
+        "ns = os.environ['MINT_RAY_NAMESPACE']\n"
         "actors = ray.util.list_named_actors(all_namespaces=True)\n"
         "killed = 0\n"
         "for a in actors:\n"

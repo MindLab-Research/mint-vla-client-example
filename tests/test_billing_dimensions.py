@@ -1,8 +1,8 @@
 import anyio
 from types import SimpleNamespace
 
-from tinker_server.models.types import ComputeLogprobsRequest, ModelInput, SampleRequest, SamplingParams
-from tinker_server.routes import sampling as sampling_route
+from mint_server.models.types import ComputeLogprobsRequest, ModelInput, SampleRequest, SamplingParams
+from mint_server.routes import sampling as sampling_route
 
 
 class _StubTaskFutureService:

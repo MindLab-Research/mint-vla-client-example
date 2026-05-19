@@ -10,9 +10,7 @@ def _load_module_with_fake_ray(monkeypatch):
     ray_module = types.ModuleType("ray")
     ray_util_module = types.ModuleType("ray.util")
 
-    ray_util_module.list_named_actors = lambda *args, **kwargs: [
-        {"name": "multinode_vllm_qwen3-235b", "namespace": "other-ns"}
-    ]
+    ray_util_module.list_named_actors = lambda *args, **kwargs: [{"name": "mint_vllm_qwen3-235b", "namespace": "other-ns"}]
     ray_util_module.get_placement_group = lambda *args, **kwargs: object()
     ray_util_module.placement_group_table = lambda *_args, **_kwargs: {
         "bundles_to_node_id": {"0": "node-a", "1": "node-b"},
@@ -48,7 +46,7 @@ def test_get_actor_placements_counts_multi_node_gpus_per_node(monkeypatch) -> No
 
     assert placements["10.0.0.1"] == [
         {
-            "actor_name": "multinode_vllm_qwen3-235b",
+            "actor_name": "mint_vllm_qwen3-235b",
             "namespace": "other-ns",
             "gpus": 8,
             "pg_state": "CREATED",
@@ -56,7 +54,7 @@ def test_get_actor_placements_counts_multi_node_gpus_per_node(monkeypatch) -> No
     ]
     assert placements["10.0.0.2"] == [
         {
-            "actor_name": "multinode_vllm_qwen3-235b",
+            "actor_name": "mint_vllm_qwen3-235b",
             "namespace": "other-ns",
             "gpus": 8,
             "pg_state": "CREATED",

@@ -7,14 +7,14 @@ from typing import Any
 
 import requests
 
-BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000").rstrip("/")
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
+BASE_URL = os.environ.get("MINT_BASE_URL", "http://localhost:8000").rstrip("/")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
 
-BASE_MODEL = os.environ.get("TINKER_MODEL", "Qwen/Qwen3-0.6B")
-LORA_RANK = int(os.environ.get("TINKER_LORA_RANK", "8"))
+BASE_MODEL = os.environ.get("MINT_MODEL", "Qwen/Qwen3-0.6B")
+LORA_RANK = int(os.environ.get("MINT_LORA_RANK", "8"))
 
-CREATE_TIMEOUT_S = float(os.environ.get("TINKER_CREATE_MODEL_TIMEOUT_S", "3600"))
-FWDBWD_TIMEOUT_S = float(os.environ.get("TINKER_FORWARD_BACKWARD_TIMEOUT_S", "3600"))
+CREATE_TIMEOUT_S = float(os.environ.get("MINT_CREATE_MODEL_TIMEOUT_S", "3600"))
+FWDBWD_TIMEOUT_S = float(os.environ.get("MINT_FORWARD_BACKWARD_TIMEOUT_S", "3600"))
 
 
 def _headers() -> dict[str, str]:

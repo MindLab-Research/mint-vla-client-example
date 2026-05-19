@@ -7,23 +7,23 @@ from typing import Any
 import requests
 
 
-BASE_URL = (os.environ.get("TINKER_BASE_URL") or "http://localhost:10216").rstrip("/")
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
+BASE_URL = (os.environ.get("MINT_BASE_URL") or "http://localhost:10216").rstrip("/")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
 
-BASE_MODEL = os.environ.get("TINKER_BASE_MODEL") or "Qwen/Qwen3-30B-A3B-Instruct-2507"
-ADAPTER_PATH = os.environ.get("TINKER_ADAPTER_PATH") or (
-    "/tos-mindverse/tinker_checkpoints/"
+BASE_MODEL = os.environ.get("MINT_BASE_MODEL") or "Qwen/Qwen3-30B-A3B-Instruct-2507"
+ADAPTER_PATH = os.environ.get("MINT_ADAPTER_PATH") or (
+    "/tos-mindverse/mint_checkpoints/"
     "eb69ea65-3302-4c97-a74e-f6838f79909d_0/rl-step-0"
 )
 
-PRESSURE_MODEL = os.environ.get("TINKER_PRESSURE_MODEL") or "moonshotai/Kimi-K2-Instruct"
-PRESSURE_LORA_RANK = int(os.environ.get("TINKER_PRESSURE_LORA_RANK", "16"))
-PRESSURE_CREATE_MODEL_COUNT = int(os.environ.get("TINKER_PRESSURE_CREATE_MODEL_COUNT", "2"))
+PRESSURE_MODEL = os.environ.get("MINT_PRESSURE_MODEL") or "moonshotai/Kimi-K2-Instruct"
+PRESSURE_LORA_RANK = int(os.environ.get("MINT_PRESSURE_LORA_RANK", "16"))
+PRESSURE_CREATE_MODEL_COUNT = int(os.environ.get("MINT_PRESSURE_CREATE_MODEL_COUNT", "2"))
 
-IDLE_WAIT_S = float(os.environ.get("TINKER_IDLE_WAIT_S", "2.0"))
-EVICT_DELAY_S = float(os.environ.get("TINKER_EVICT_DELAY_S", "2.0"))
-POLL_DELAY_S = float(os.environ.get("TINKER_POLL_DELAY_S", "0.25"))
-POLL_TIMEOUT_S = float(os.environ.get("TINKER_POLL_TIMEOUT_S", "300.0"))
+IDLE_WAIT_S = float(os.environ.get("MINT_IDLE_WAIT_S", "2.0"))
+EVICT_DELAY_S = float(os.environ.get("MINT_EVICT_DELAY_S", "2.0"))
+POLL_DELAY_S = float(os.environ.get("MINT_POLL_DELAY_S", "0.25"))
+POLL_TIMEOUT_S = float(os.environ.get("MINT_POLL_TIMEOUT_S", "300.0"))
 
 
 def _headers() -> dict[str, str]:

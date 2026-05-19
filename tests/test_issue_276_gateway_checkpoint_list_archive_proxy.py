@@ -18,7 +18,7 @@ def _patch_async_remote_training_model_info(monkeypatch, gw, payload: dict) -> N
 
 
 def _client() -> TestClient:
-    from tinker_server.routes import weights as weights_routes
+    from mint_server.routes import weights as weights_routes
 
     app = FastAPI()
     app.include_router(weights_routes.router, prefix="/api/v1")
@@ -26,7 +26,7 @@ def _client() -> TestClient:
 
 
 def _client_with_user(user_data: dict | None) -> TestClient:
-    from tinker_server.routes import weights as weights_routes
+    from mint_server.routes import weights as weights_routes
 
     app = FastAPI()
 
@@ -40,9 +40,9 @@ def _client_with_user(user_data: dict | None) -> TestClient:
 
 
 def test_issue_276_gateway_list_checkpoints_proxies_remote(monkeypatch) -> None:
-    import tinker_server.gateway as gw
-    from tinker_server.gateway import Upstream
-    from tinker_server.routes import weights as wt
+    import mint_server.gateway as gw
+    from mint_server.gateway import Upstream
+    from mint_server.routes import weights as wt
 
     _patch_async_remote_training_model_info(
         monkeypatch,
@@ -85,9 +85,9 @@ def test_issue_276_gateway_list_checkpoints_proxies_remote(monkeypatch) -> None:
 
 
 def test_issue_276_gateway_list_checkpoints_remote_error_passthrough(monkeypatch) -> None:
-    import tinker_server.gateway as gw
-    from tinker_server.gateway import Upstream
-    from tinker_server.routes import weights as wt
+    import mint_server.gateway as gw
+    from mint_server.gateway import Upstream
+    from mint_server.routes import weights as wt
 
     _patch_async_remote_training_model_info(
         monkeypatch,
@@ -108,9 +108,9 @@ def test_issue_276_gateway_list_checkpoints_remote_error_passthrough(monkeypatch
 
 
 def test_issue_276_gateway_archive_redirect_proxies_remote(monkeypatch) -> None:
-    import tinker_server.gateway as gw
-    from tinker_server.gateway import Upstream
-    from tinker_server.routes import weights as wt
+    import mint_server.gateway as gw
+    from mint_server.gateway import Upstream
+    from mint_server.routes import weights as wt
 
     _patch_async_remote_training_model_info(
         monkeypatch,
@@ -145,9 +145,9 @@ def test_issue_276_gateway_archive_redirect_proxies_remote(monkeypatch) -> None:
 
 
 def test_issue_276_gateway_archive_direct_download_proxies_remote(monkeypatch) -> None:
-    import tinker_server.gateway as gw
-    from tinker_server.gateway import Upstream
-    from tinker_server.routes import weights as wt
+    import mint_server.gateway as gw
+    from mint_server.gateway import Upstream
+    from mint_server.routes import weights as wt
 
     _patch_async_remote_training_model_info(
         monkeypatch,
@@ -186,9 +186,9 @@ def test_issue_276_gateway_archive_direct_download_proxies_remote(monkeypatch) -
     ],
 )
 def test_issue_276_gateway_archive_remote_error_passthrough(monkeypatch, status_code: int, detail: str) -> None:
-    import tinker_server.gateway as gw
-    from tinker_server.gateway import Upstream
-    from tinker_server.routes import weights as wt
+    import mint_server.gateway as gw
+    from mint_server.gateway import Upstream
+    from mint_server.routes import weights as wt
 
     _patch_async_remote_training_model_info(
         monkeypatch,
@@ -209,9 +209,9 @@ def test_issue_276_gateway_archive_remote_error_passthrough(monkeypatch, status_
 
 
 def test_issue_276_gateway_remote_checkpoint_owner_mismatch_denied_before_forward(monkeypatch) -> None:
-    import tinker_server.gateway as gw
-    from tinker_server.gateway import Upstream
-    from tinker_server.routes import weights as wt
+    import mint_server.gateway as gw
+    from mint_server.gateway import Upstream
+    from mint_server.routes import weights as wt
 
     _patch_async_remote_training_model_info(
         monkeypatch,

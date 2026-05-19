@@ -6,15 +6,15 @@ import uuid
 
 import requests
 
-GATEWAY_BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000").rstrip("/")
-UPSTREAM_BASE_URL = os.environ.get("TINKER_UPSTREAM_BASE_URL", "http://localhost:8000").rstrip("/")
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
+GATEWAY_BASE_URL = os.environ.get("MINT_BASE_URL", "http://localhost:8000").rstrip("/")
+UPSTREAM_BASE_URL = os.environ.get("MINT_UPSTREAM_BASE_URL", "http://localhost:8000").rstrip("/")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
 
-BASE_MODEL = os.environ.get("TINKER_BASE_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
+BASE_MODEL = os.environ.get("MINT_BASE_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
 
-HTTP_TIMEOUT_S = float(os.environ.get("TINKER_HTTP_TIMEOUT_S", "60"))
-FUTURE_TIMEOUT_S = float(os.environ.get("TINKER_FUTURE_TIMEOUT_S", "1800"))
-POLL_INTERVAL_S = float(os.environ.get("TINKER_POLL_INTERVAL_S", "2.0"))
+HTTP_TIMEOUT_S = float(os.environ.get("MINT_HTTP_TIMEOUT_S", "60"))
+FUTURE_TIMEOUT_S = float(os.environ.get("MINT_FUTURE_TIMEOUT_S", "1800"))
+POLL_INTERVAL_S = float(os.environ.get("MINT_POLL_INTERVAL_S", "2.0"))
 
 
 def _fail(msg: str) -> int:
@@ -64,7 +64,7 @@ def _wait_future(*, request_id: str, label: str) -> dict:
 
 
 def _parse_checkpoint_dirname(uri: str) -> str:
-    # save_state returns mint://{model_id}/{checkpoint_name} or tinker://{model_id}/{checkpoint_name}
+    # save_state returns mint://{model_id}/{checkpoint_name} or mint://{model_id}/{checkpoint_name}
     parts = uri.split("/")
     if len(parts) < 2:
         raise ValueError(f"unexpected checkpoint uri: {uri!r}")

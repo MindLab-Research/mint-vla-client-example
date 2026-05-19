@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
-"""OpenAI-compatible SDK examples and smoke tests for tinker-server.
+"""OpenAI-compatible SDK examples and smoke tests for mint-server.
 
 Examples:
-  TINKER_BASE_URL=http://127.0.0.1:8000 \
+  MINT_BASE_URL=http://127.0.0.1:8000 \
     python scripts/tools/openai_compat_minimal.py completions \
       --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
       --prompt "The capital of France is"
 
-  TINKER_BASE_URL=http://127.0.0.1:8000 \
+  MINT_BASE_URL=http://127.0.0.1:8000 \
     python scripts/tools/openai_compat_minimal.py chat \
       --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
       --user-message "What is 2+2?"
 
-  TINKER_BASE_URL=http://127.0.0.1:8000 \
+  MINT_BASE_URL=http://127.0.0.1:8000 \
     python scripts/tools/openai_compat_minimal.py tool \
       --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
       --user-message "北京天气如何"
 
-  TINKER_BASE_URL=http://127.0.0.1:8000 \
+  MINT_BASE_URL=http://127.0.0.1:8000 \
     python scripts/tools/openai_compat_minimal.py smoke \
       --model Qwen/Qwen3-30B-A3B-Instruct-2507
 """
@@ -35,7 +35,7 @@ from openai import AsyncOpenAI, OpenAI
 
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8000"
-DEFAULT_MODEL = os.environ.get("TINKER_OAI_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
+DEFAULT_MODEL = os.environ.get("MINT_OAI_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
 
 
 @dataclass
@@ -53,14 +53,14 @@ def _coalesce(*values: Optional[str]) -> Optional[str]:
 
 
 def _oai_base_url(args: argparse.Namespace) -> str:
-    base_url = _coalesce(args.base_url, os.environ.get("TINKER_BASE_URL"), os.environ.get("MINT_BASE_URL"))
+    base_url = _coalesce(args.base_url, os.environ.get("MINT_BASE_URL"))
     if not base_url:
         base_url = DEFAULT_BASE_URL
     return base_url.rstrip("/") + "/oai/api/v1"
 
 
 def _api_key(args: argparse.Namespace) -> str:
-    return _coalesce(args.api_key, os.environ.get("TINKER_API_KEY"), os.environ.get("MINT_API_KEY"), "dummy") or "dummy"
+    return _coalesce(args.api_key, os.environ.get("MINT_API_KEY"), "dummy") or "dummy"
 
 
 def _mask_secret(value: str) -> str:
@@ -133,29 +133,29 @@ def _record(results: list[CheckResult], name: str, ok: bool, detail: Any) -> Non
 
 def _parse_args() -> argparse.Namespace:
     examples = """Examples:
-  TINKER_BASE_URL=http://127.0.0.1:8000 \\
+  MINT_BASE_URL=http://127.0.0.1:8000 \\
     python scripts/tools/openai_compat_minimal.py completions \\
       --model Qwen/Qwen3-30B-A3B-Instruct-2507 \\
       --prompt "The capital of France is"
 
-  TINKER_BASE_URL=http://127.0.0.1:8000 \\
+  MINT_BASE_URL=http://127.0.0.1:8000 \\
     python scripts/tools/openai_compat_minimal.py chat \\
       --model Qwen/Qwen3-30B-A3B-Instruct-2507 \\
       --user-message "What is 2+2?"
 
-  TINKER_BASE_URL=http://127.0.0.1:8000 \\
+  MINT_BASE_URL=http://127.0.0.1:8000 \\
     python scripts/tools/openai_compat_minimal.py tool \\
       --model Qwen/Qwen3-30B-A3B-Instruct-2507 \\
       --user-message "北京天气如何"
 
-  TINKER_BASE_URL=http://127.0.0.1:8000 \\
+  MINT_BASE_URL=http://127.0.0.1:8000 \\
     python scripts/tools/openai_compat_minimal.py smoke \\
       --model Qwen/Qwen3-30B-A3B-Instruct-2507
 
 Environment:
-  TINKER_BASE_URL / MINT_BASE_URL  Base server URL without /oai/api/v1 suffix
-  TINKER_API_KEY / MINT_API_KEY    API key
-  TINKER_OAI_MODEL                 Default model name for --model
+  MINT_BASE_URL  Base server URL without /oai/api/v1 suffix
+  MINT_API_KEY    API key
+  MINT_OAI_MODEL  Default model name for --model
 """
     p = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter, epilog=examples)
     p.add_argument("--base-url", default=None, help="Server base URL without /oai/api/v1 suffix")
@@ -207,7 +207,7 @@ Environment:
 
     args = p.parse_args()
     if not getattr(args, "model", None):
-        p.error("--model is required (or set TINKER_OAI_MODEL)")
+        p.error("--model is required (or set MINT_OAI_MODEL)")
     args.oai_base_url = _oai_base_url(args)
     args.resolved_api_key = _api_key(args)
     return args

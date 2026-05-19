@@ -4,11 +4,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from tinker_server.backend import session_heartbeat_store as heartbeat_store_module
-from tinker_server.backend import training_session_store as training_store_module
-from tinker_server.routes import training as training_routes
+from mint_server.backend import session_heartbeat_store as heartbeat_store_module
+from mint_server.backend import training_session_store as training_store_module
+from mint_server.routes import training as training_routes
 
-task_state_store_module = importlib.import_module("tinker_server.backend.task_state_store")
+task_state_store_module = importlib.import_module("mint_server.backend.task_state_store")
 
 
 @pytest.fixture
@@ -138,7 +138,7 @@ async def test_issue_368_cleanup_stale_training_sessions(monkeypatch: pytest.Mon
     )
     monkeypatch.setattr(heartbeat_store_module, "session_heartbeat_store", heartbeat_store)
     monkeypatch.setattr(
-        "tinker_server.backend.model_actor_supervisor.get_model_actor_supervisor",
+        "mint_server.backend.model_actor_supervisor.get_model_actor_supervisor",
         lambda: SimpleNamespace(clear_session=lambda model_id: cleared_model_ids.append(model_id)),
     )
 
@@ -190,7 +190,7 @@ async def test_issue_368_cleanup_can_restore_session_before_shutdown(monkeypatch
 
     monkeypatch.setattr(training_routes, "_restore_training_session", _restore_training_session)
     monkeypatch.setattr(
-        "tinker_server.backend.model_actor_supervisor.get_model_actor_supervisor",
+        "mint_server.backend.model_actor_supervisor.get_model_actor_supervisor",
         lambda: SimpleNamespace(clear_session=lambda model_id: None),
     )
 
@@ -232,7 +232,7 @@ async def test_issue_368_cleanup_aborts_if_future_fail_path_errors(monkeypatch: 
     )
     monkeypatch.setattr(heartbeat_store_module, "session_heartbeat_store", heartbeat_store)
     monkeypatch.setattr(
-        "tinker_server.backend.model_actor_supervisor.get_model_actor_supervisor",
+        "mint_server.backend.model_actor_supervisor.get_model_actor_supervisor",
         lambda: SimpleNamespace(clear_session=lambda model_id: None),
     )
 
@@ -292,7 +292,7 @@ async def test_issue_368_cleanup_skips_shared_actor_shutdown_after_restore(
     monkeypatch.setitem(sys.modules, "ray", SimpleNamespace(get=lambda value, timeout=None: value))
     monkeypatch.setattr(training_routes, "async_get_ray_ref", _async_get_ray_ref)
     monkeypatch.setattr(
-        "tinker_server.backend.model_actor_supervisor.get_model_actor_supervisor",
+        "mint_server.backend.model_actor_supervisor.get_model_actor_supervisor",
         lambda: SimpleNamespace(clear_session=lambda model_id: None),
     )
 

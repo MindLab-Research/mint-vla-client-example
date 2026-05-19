@@ -7,8 +7,8 @@ import uuid
 import httpx
 
 
-BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000").rstrip("/")
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
+BASE_URL = os.environ.get("MINT_BASE_URL", "http://localhost:8000").rstrip("/")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
 
 
 def _headers() -> dict[str, str]:
@@ -29,9 +29,9 @@ async def _post_json(client: httpx.AsyncClient, path: str, payload: dict) -> htt
 
 
 async def main() -> None:
-    trials = int(os.environ.get("TINKER_REPRO_TRIALS", "50"))
-    poll_attempts = int(os.environ.get("TINKER_REPRO_POLL_ATTEMPTS", "20"))
-    poll_sleep_s = float(os.environ.get("TINKER_REPRO_POLL_SLEEP_S", "0.05"))
+    trials = int(os.environ.get("MINT_REPRO_TRIALS", "50"))
+    poll_attempts = int(os.environ.get("MINT_REPRO_POLL_ATTEMPTS", "20"))
+    poll_sleep_s = float(os.environ.get("MINT_REPRO_POLL_SLEEP_S", "0.05"))
 
     limits = httpx.Limits(max_connections=1, max_keepalive_connections=0)
     transport = httpx.AsyncHTTPTransport(retries=0)

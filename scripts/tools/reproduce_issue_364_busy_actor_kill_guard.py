@@ -10,12 +10,12 @@ from typing import Any
 import requests
 
 
-BASE_URL = (os.environ.get("TINKER_BASE_URL") or "http://localhost:8000").rstrip("/")
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
-MODEL = os.environ.get("TINKER_MODEL", "Qwen/Qwen3-0.6B")
-PENDING_WAIT_S = float(os.environ.get("TINKER_PENDING_WAIT_S", "30"))
-FINAL_TIMEOUT_S = float(os.environ.get("TINKER_FINAL_TIMEOUT_S", "180"))
-MAX_TOKENS = int(os.environ.get("TINKER_MAX_TOKENS", "512"))
+BASE_URL = (os.environ.get("MINT_BASE_URL") or "http://localhost:8000").rstrip("/")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
+MODEL = os.environ.get("MINT_MODEL", "Qwen/Qwen3-0.6B")
+PENDING_WAIT_S = float(os.environ.get("MINT_PENDING_WAIT_S", "30"))
+FINAL_TIMEOUT_S = float(os.environ.get("MINT_FINAL_TIMEOUT_S", "180"))
+MAX_TOKENS = int(os.environ.get("MINT_MAX_TOKENS", "512"))
 
 
 def _headers() -> dict[str, str]:

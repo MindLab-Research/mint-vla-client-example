@@ -18,7 +18,7 @@ Patterns used:
 - Path-based loading on shared filesystem: used to avoid serializing 10k+ tensors through Ray.
 
 Key knobs and locations:
-- `MINT_CHECKPOINT_DIR` controls where server-side code expects checkpoints/adapters for `file://` and `mint://` URIs (see `tinker_server/routes/service.py` and `tinker_server/backend/session_manager.py`).
+- `MINT_CHECKPOINT_DIR` controls where server-side code expects checkpoints/adapters for `file://` and `mint://` URIs (see `mint_server/routes/service.py` and `mint_server/backend/session_manager.py`).
 - External `tinker://` request payloads are accepted only at the API compatibility boundary and rewritten to `mint://` before route handlers run.
 
 ## Resume metadata lookup
@@ -85,13 +85,13 @@ MoE training runs in Megatron, but inference consumes PEFT-style adapter checkpo
 - Some "export weights" APIs merge LoRA into base weights, which is unusable for vLLM multi-LoRA.
 
 Implementation locations:
-- Extraction and conversion logic: `tinker_server/backend/megatron_distributed.py` (MegatronRankWorker.get_lora_state_dict)
-- Writing adapter checkpoint files: `tinker_server/backend/megatron_distributed.py` (MegatronRankWorker.save_checkpoint)
+- Extraction and conversion logic: `mint_server/backend/megatron_distributed.py` (MegatronRankWorker.get_lora_state_dict)
+- Writing adapter checkpoint files: `mint_server/backend/megatron_distributed.py` (MegatronRankWorker.save_checkpoint)
 
 Preferred path (default):
 - Use Megatron-Bridge's newer adapter export API when available:
   - `export_adapter_weights(...)` returns adapter weights without merging into the base model.
-  - The default Ray worker `PYTHONPATH` prefers a newer Megatron-Bridge variant (see `tinker_server/config.py`), so this API is typically present.
+  - The default Ray worker `PYTHONPATH` prefers a newer Megatron-Bridge variant (see `mint_server/config.py`), so this API is typically present.
 
 Fallback paths:
 - Custom extraction from `named_parameters()` plus explicit gathering:
@@ -107,5 +107,5 @@ Output:
 
 For MoE sessions that train MLP LoRA, Mint can export adapters in a per-expert format that vLLM expects.
 
-`POST /api/v1/save_weights_for_sampler` behavior (`tinker_server/routes/training.py`):
+`POST /api/v1/save_weights_for_sampler` behavior (`mint_server/routes/training.py`):
 - If `session.backend == "megatron"` and the request does not explicitly set `use_per_expert_lora`, the server defaults `use_per_expert_lora=True` when the session's LoRA config indicates MLP LoRA training.

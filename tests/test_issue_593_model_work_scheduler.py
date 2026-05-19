@@ -3,12 +3,12 @@ import time
 
 import pytest
 
-from tinker_server.backend.model_work_scheduler import (
+from mint_server.backend.model_work_scheduler import (
     ModelWorkSchedulerConflictError,
     _ModelWorkSchedulerActor,
     _ray_model_work_scheduler_actor_name,
 )
-from tinker_server.backend.task_state_store import TaskStateStore
+from mint_server.backend.task_state_store import TaskStateStore
 
 
 def _work(

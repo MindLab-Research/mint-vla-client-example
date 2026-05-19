@@ -167,8 +167,8 @@ def _run_one(
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--base-url", default=os.environ.get("TINKER_BASE_URL") or os.environ.get("MINT_BASE_URL") or "http://localhost:8000")
-    p.add_argument("--api-key", default=os.environ.get("TINKER_API_KEY") or os.environ.get("MINT_API_KEY") or None)
+    p.add_argument("--base-url", default=os.environ.get("MINT_BASE_URL") or os.environ.get("MINT_BASE_URL") or "http://localhost:8000")
+    p.add_argument("--api-key", default=os.environ.get("MINT_API_KEY") or os.environ.get("MINT_API_KEY") or None)
     p.add_argument("--label", default="", help="Freeform label to tag the run (e.g. coalesce0/coalesce1)")
     p.add_argument("--model", required=True, help="HF base model name")
     p.add_argument("--rank", type=int, default=16, help="LoRA rank for the benchmark session")

@@ -17,14 +17,14 @@ Entrypoint: |
   export PYTHONDONTWRITEBYTECODE=1  # Disable .pyc cache
 
   # Symlink to the production server checkout for debugging and explicit local probes.
-  rm -rf /root/tinker_project/mint-server
-  mkdir -p /root/tinker_project
-  ln -s /vePFS-Mindverse/share/mint/prod/mint-server /root/tinker_project/mint-server
+  rm -rf /root/mint_project/mint-server
+  mkdir -p /root/mint_project
+  ln -s /vePFS-Mindverse/share/mint/prod/mint-server /root/mint_project/mint-server
 
   echo "=== MINT PRODUCTION WORKER ==="
   echo "Started at $(date)"
   echo "Using PFS code via symlink:"
-  ls -la /root/tinker_project/mint-server/
+  ls -la /root/mint_project/mint-server/
 
   # Note: Ray CLI crashes on startup; start Ray via Python internals.
   set -euo pipefail

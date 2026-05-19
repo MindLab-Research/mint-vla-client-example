@@ -189,8 +189,8 @@ def _run_compute_logprobs(
 
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--base-url", default=(os.environ.get("TINKER_BASE_URL") or "http://localhost:8002").rstrip("/"))
-    p.add_argument("--api-key", default=os.environ.get("TINKER_API_KEY", "dummy"))
+    p.add_argument("--base-url", default=(os.environ.get("MINT_BASE_URL") or "http://localhost:8002").rstrip("/"))
+    p.add_argument("--api-key", default=os.environ.get("MINT_API_KEY", "dummy"))
     p.add_argument("--base-model", required=True)
     p.add_argument("--model-path", required=True)
     p.add_argument("--lora-rank", type=int, required=True)
@@ -308,7 +308,7 @@ def main() -> int:
         "engine_dead_like": [
             asdict(x)
             for x in outcomes
-            if x.error and any(s in x.error for s in ("EngineDeadError", "ActorDiedError", "multinode_vllm_ray_get_failed", "out of memory", "CUDA out of memory"))
+            if x.error and any(s in x.error for s in ("EngineDeadError", "ActorDiedError", "mint_vllm_multinode_ray_get_failed", "out of memory", "CUDA out of memory"))
         ],
     }
     with open(args.output_json, "w", encoding="utf-8") as f:

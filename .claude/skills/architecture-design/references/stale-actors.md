@@ -8,7 +8,7 @@ Detached Ray actors persist across server restarts and consume GPU resources ind
 
 1. Server appears stuck: health check timeouts, requests hang
 2. Training fails: \"Insufficient GPUs: need 1, available 0 after eviction\"
-3. Actor name conflicts: \"The name tinker_vllm_qwen3-0.6b is already taken\"
+3. Actor name conflicts: \"The name mint_vllm_qwen3-0.6b is already taken\"
 
 ## Root Cause
 
@@ -21,7 +21,7 @@ Before starting a new server process in a namespace, kill named actors in that n
 ## Related Logs
 
 ```
-ValueError: The name tinker_vllm_qwen3-0.6b (namespace=tinker) is already taken
+ValueError: The name mint_vllm_qwen3-0.6b (namespace=mint) is already taken
 ```
 
 ```

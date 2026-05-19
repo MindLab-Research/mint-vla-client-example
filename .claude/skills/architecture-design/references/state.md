@@ -6,13 +6,13 @@ This project has multiple identifiers that look similar but have different owner
 
 - `session_id`
   - Created by `POST /api/v1/create_session`.
-  - Live request metadata is cached in server memory (`tinker_server/routes/service.py:sessions`).
+  - Live request metadata is cached in server memory (`mint_server/routes/service.py:sessions`).
   - Minimal index metadata is also mirrored into the detached session-index store for REST reads after API restart.
   - Used mainly for grouping/metadata; it does not own model weights.
 
 - `model_id`
   - Created by `POST /api/v1/create_model` (training routes).
-  - Tracks a live training session in server memory (`tinker_server/backend/training_session_manager.py`).
+  - Tracks a live training session in server memory (`mint_server/backend/training_session_manager.py`).
   - Minimal recovery metadata is mirrored into the detached training-session store.
   - The actual trainable weights/optimizer live in Ray actors (backend-dependent).
   - Automatically cleaned up after idle timeout (`MINT_TRAINING_INACTIVITY_TIMEOUT`, default 3600s).

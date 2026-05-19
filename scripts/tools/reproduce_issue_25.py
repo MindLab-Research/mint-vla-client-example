@@ -14,18 +14,18 @@ def _fail(msg: str) -> int:
     return 1
 
 
-BASE_URL = (os.environ.get("TINKER_BASE_URL") or os.environ.get("MINT_BASE_URL") or "http://localhost:10025").rstrip(
+BASE_URL = (os.environ.get("MINT_BASE_URL") or os.environ.get("MINT_BASE_URL") or "http://localhost:10025").rstrip(
     "/"
 )
-API_KEY = os.environ.get("TINKER_API_KEY") or os.environ.get("MINT_API_KEY") or ""
+API_KEY = os.environ.get("MINT_API_KEY") or os.environ.get("MINT_API_KEY") or ""
 
-BASE_MODEL = os.environ.get("TINKER_BASE_MODEL", "Qwen/Qwen3-0.6B")
-LORA_A = os.environ.get("TINKER_LORA_A", "mint://ckpt_a7c51d595f34")
-LORA_B = os.environ.get("TINKER_LORA_B", "mint://ckpt_6722008bf425")
+BASE_MODEL = os.environ.get("MINT_BASE_MODEL", "Qwen/Qwen3-0.6B")
+LORA_A = os.environ.get("MINT_LORA_A", "mint://ckpt_a7c51d595f34")
+LORA_B = os.environ.get("MINT_LORA_B", "mint://ckpt_6722008bf425")
 
-POLL_TIMEOUT_S = float(os.environ.get("TINKER_POLL_TIMEOUT_S", "600"))
-EXPECTED_MAX_LORAS = int(os.environ.get("TINKER_EXPECTED_MAX_LORAS", "1"))
-EXPECTED_MAX_CPU_LORAS = int(os.environ.get("TINKER_EXPECTED_MAX_CPU_LORAS", "1"))
+POLL_TIMEOUT_S = float(os.environ.get("MINT_POLL_TIMEOUT_S", "600"))
+EXPECTED_MAX_LORAS = int(os.environ.get("MINT_EXPECTED_MAX_LORAS", "1"))
+EXPECTED_MAX_CPU_LORAS = int(os.environ.get("MINT_EXPECTED_MAX_CPU_LORAS", "1"))
 
 
 def _headers() -> dict[str, str]:

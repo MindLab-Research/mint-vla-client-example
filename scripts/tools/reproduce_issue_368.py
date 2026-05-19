@@ -66,13 +66,13 @@ def _coalesce(*values: str | None) -> str | None:
 
 
 def _headers(args: argparse.Namespace) -> dict[str, str]:
-    api_key = _coalesce(args.api_key, os.environ.get("TINKER_API_KEY"), os.environ.get("MINT_API_KEY"))
+    api_key = _coalesce(args.api_key, os.environ.get("MINT_API_KEY"), os.environ.get("MINT_API_KEY"))
     return {"X-API-Key": api_key} if api_key else {}
 
 
 def _base_url(args: argparse.Namespace) -> str:
     return (
-        _coalesce(args.base_url, os.environ.get("TINKER_BASE_URL"), os.environ.get("MINT_BASE_URL"), DEFAULT_BASE_URL)
+        _coalesce(args.base_url, os.environ.get("MINT_BASE_URL"), os.environ.get("MINT_BASE_URL"), DEFAULT_BASE_URL)
         .rstrip("/")
     )
 
@@ -89,7 +89,7 @@ def _post(url: str, *, headers: dict[str, str], payload: dict[str, Any], timeout
 
 def _configure_ray_access(*, ray_address: str, ray_namespace: str) -> None:
     os.environ["RAY_ADDRESS"] = str(ray_address)
-    os.environ["TINKER_RAY_NAMESPACE"] = str(ray_namespace)
+    os.environ["MINT_RAY_NAMESPACE"] = str(ray_namespace)
     os.environ["MINT_RAY_NAMESPACE"] = str(ray_namespace)
 
 
@@ -101,7 +101,7 @@ def _ensure_ray_initialized(*, ray_address: str, ray_namespace: str) -> None:
         ray.shutdown()
     ray.init(address=str(ray_address), namespace=str(ray_namespace), ignore_reinit_error=True)
     try:
-        from tinker_server.backend.task_state_store import task_state_futures
+        from mint_server.backend.task_state_store import task_state_futures
 
         task_state_futures._task_state._reset_ray_actor()
     except Exception:
@@ -206,7 +206,7 @@ def _wait_for_model_absence(
 
 def _get_detached_training_session_info(model_id: str, *, ray_address: str, ray_namespace: str) -> dict[str, Any]:
     _ensure_ray_initialized(ray_address=ray_address, ray_namespace=ray_namespace)
-    from tinker_server.backend.training_session_store import get_training_session_info
+    from mint_server.backend.training_session_store import get_training_session_info
 
     info = get_training_session_info(model_id)
     if not isinstance(info, dict):
@@ -216,7 +216,7 @@ def _get_detached_training_session_info(model_id: str, *, ray_address: str, ray_
 
 def _create_synthetic_pending_training_future(model_id: str, *, ray_address: str, ray_namespace: str) -> str:
     _ensure_ray_initialized(ray_address=ray_address, ray_namespace=ray_namespace)
-    from tinker_server.backend.task_state_store import task_state_futures
+    from mint_server.backend.task_state_store import task_state_futures
 
     request_id = f"issue368-synthetic-{uuid.uuid4().hex}"
     asyncio.run(task_state_futures.async_create_with_id(request_id))
@@ -242,7 +242,7 @@ def _wait_for_synthetic_future_failure(
     timeout_s: float,
 ) -> tuple[str, str | None]:
     _ensure_ray_initialized(ray_address=ray_address, ray_namespace=ray_namespace)
-    from tinker_server.backend.task_state_store import FutureStatus, task_state_futures
+    from mint_server.backend.task_state_store import FutureStatus, task_state_futures
 
     deadline = time.monotonic() + timeout_s
     while True:
@@ -266,7 +266,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stale-after-s", type=float, required=True)
     parser.add_argument("--cleanup-timeout-s", type=float, default=90.0)
     parser.add_argument("--ray-address", default=_coalesce(os.environ.get("RAY_ADDRESS"), "192.168.36.5:26379"))
-    parser.add_argument("--ray-namespace", default=_coalesce(os.environ.get("TINKER_RAY_NAMESPACE"), "tinker_local_nolanho"))
+    parser.add_argument("--ray-namespace", default=_coalesce(os.environ.get("MINT_RAY_NAMESPACE"), "mint_local_nolanho"))
     parser.add_argument("--report-json", default=None)
     return parser.parse_args()
 

@@ -220,7 +220,7 @@ def _evaluate_checkpoint_reward(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument('--base-url', default=os.environ.get('TINKER_BASE_URL', 'http://localhost:8000'))
+    parser.add_argument('--base-url', default=os.environ.get('MINT_BASE_URL', 'http://localhost:8000'))
     parser.add_argument('--task-index', type=int, default=16)
     parser.add_argument('--steps', type=int, default=6)
     parser.add_argument('--groups-per-step', type=int, default=4)

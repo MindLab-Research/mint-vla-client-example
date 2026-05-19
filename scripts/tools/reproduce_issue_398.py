@@ -27,8 +27,8 @@ def _fail(message: str) -> int:
 
 def _env() -> Env:
     return Env(
-        base_url=(os.environ.get("TINKER_BASE_URL") or "http://localhost:8000").rstrip("/"),
-        api_key=os.environ.get("TINKER_API_KEY") or "dummy",
+        base_url=(os.environ.get("MINT_BASE_URL") or "http://localhost:8000").rstrip("/"),
+        api_key=os.environ.get("MINT_API_KEY") or "dummy",
         timeout_s=float(os.environ.get("ISSUE398_TIMEOUT_S") or "120"),
         poll_timeout_s=float(os.environ.get("ISSUE398_POLL_TIMEOUT_S") or "240"),
         poll_sleep_s=float(os.environ.get("ISSUE398_POLL_SLEEP_S") or "1.0"),

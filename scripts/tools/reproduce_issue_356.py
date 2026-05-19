@@ -9,7 +9,7 @@ Requirements:
   - SSH tunnel to dev server active (localhost:8000 -> mint-dev:8000)
 
 Usage:
-  TINKER_BASE_URL=http://localhost:8000 TINKER_API_KEY=dummy \
+  MINT_BASE_URL=http://localhost:8000 MINT_API_KEY=dummy \
     python scripts/tools/reproduce_issue_356.py
 
 Expected:
@@ -26,15 +26,15 @@ from typing import Any
 import requests
 
 
-BASE_URL = os.environ.get("TINKER_BASE_URL")
+BASE_URL = os.environ.get("MINT_BASE_URL")
 if not BASE_URL:
-    port = os.environ.get("TINKER_PORT", "8000")
+    port = os.environ.get("MINT_PORT", "8000")
     BASE_URL = f"http://localhost:{port}"
 BASE_URL = BASE_URL.rstrip("/")
 
-API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
+API_KEY = os.environ.get("MINT_API_KEY", "dummy")
 
-MODEL = os.environ.get("TINKER_MODEL", "Qwen/Qwen3-0.6B")
+MODEL = os.environ.get("MINT_MODEL", "Qwen/Qwen3-0.6B")
 
 # Server must be started with MINT_TRAINING_INACTIVITY_TIMEOUT set to this value.
 INACTIVITY_TIMEOUT_S = int(os.environ.get("MINT_TRAINING_INACTIVITY_TIMEOUT", "60"))

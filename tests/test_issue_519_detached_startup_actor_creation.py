@@ -53,15 +53,15 @@ def _install_fake_ray(monkeypatch):
 @pytest.mark.parametrize(
     ("module_name", "factory_name"),
     [
-        ("tinker_server.backend.maintenance_cron_actor", "_get_or_create_actor"),
-        ("tinker_server.backend.training_cleanup_executor", "_get_or_create_actor"),
-        ("tinker_server.backend.sampling_cleanup_executor", "_get_or_create_actor"),
+        ("mint_server.backend.maintenance_cron_actor", "_get_or_create_actor"),
+        ("mint_server.backend.training_cleanup_executor", "_get_or_create_actor"),
+        ("mint_server.backend.sampling_cleanup_executor", "_get_or_create_actor"),
     ],
 )
 def test_issue_519_detached_actor_creation_skips_blocking_probe(monkeypatch, module_name: str, factory_name: str) -> None:
     fake_ray = _install_fake_ray(monkeypatch)
     module = importlib.import_module(module_name)
-    config_module = importlib.import_module("tinker_server.config")
+    config_module = importlib.import_module("mint_server.config")
     monkeypatch.setattr(module, "_ACTOR_HANDLE", None, raising=False)
     monkeypatch.setattr(module, "apply_detached_actor_resources", lambda *_args, **_kwargs: None, raising=False)
     monkeypatch.setattr(module, "actor_runtime_env", lambda **_kwargs: {"env_vars": {}}, raising=False)

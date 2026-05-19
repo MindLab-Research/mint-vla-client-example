@@ -8,8 +8,8 @@ from fastapi.testclient import TestClient
 def test_issue_187_create_model_from_state_rejects_sampler_checkpoint_with_optimizer(
     tmp_path: Path,
 ) -> None:
-    from tinker_server.routes import training as training_routes
-    from tinker_server import checkpoints as checkpoints_module
+    from mint_server.routes import training as training_routes
+    from mint_server import checkpoints as checkpoints_module
 
     # Patch checkpoints root for this test module (resolver reads from checkpoints.py).
     training_routes.CHECKPOINTS_DIR = str(tmp_path)
