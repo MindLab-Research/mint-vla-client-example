@@ -30,8 +30,8 @@ async def initialize_execution_bindings() -> dict[str, Any]:
     from ..config import config
     from ..routes import action_sampling, sampling, service, training, weights
     from .action_session_manager import ActionSessionRouter
-    from .sampling_session_store import ensure_ready as ensure_sampling_session_store_ready
     from .session_manager import DEFAULT_INACTIVITY_TIMEOUT, SessionManager
+    from .task_state_store import task_state_store
     from .training_engine_router import TrainingEngineRouter
     from .training_session_manager import TrainingSessionManager
 
@@ -59,7 +59,7 @@ async def initialize_execution_bindings() -> dict[str, Any]:
 
     restored_sampling_sessions = 0
     try:
-        await asyncio.to_thread(ensure_sampling_session_store_ready)
+        await task_state_store.async_ensure_started()
         restored_sampling_sessions = await _restore_sampling_sessions_for_worker(inference_manager)
     except Exception as e:
         logger.warning(

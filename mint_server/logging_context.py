@@ -67,6 +67,8 @@ _HTTP_DURATION_HISTOGRAM: Any | None = None
 _HTTP_ERROR_COUNTER: Any | None = None
 _SAMPLING_ADMISSION_COUNTER: Any | None = None
 _TASK_STATE_FUTURES_TIMEOUT_COUNTER: Any | None = None
+_TASK_FUTURE_REAPER_ROWS_COUNTER: Any | None = None
+_TASK_FUTURE_PAYLOAD_EVICT_ERROR_COUNTER: Any | None = None
 _VLLM_ACTOR_REQUEST_COUNTER: Any | None = None
 _VLLM_ACTOR_REQUEST_DURATION_HISTOGRAM: Any | None = None
 _TRAINING_OPERATION_COUNTER: Any | None = None
@@ -78,6 +80,7 @@ _SCHEDULER_SWITCH_COUNTER: Any | None = None
 _SCHEDULER_QUEUE_WAIT_HISTOGRAM: Any | None = None
 _SCHEDULER_READY_SESSIONS_HISTOGRAM: Any | None = None
 _SCHEDULER_CHOSEN_QUEUE_DEPTH_HISTOGRAM: Any | None = None
+_PUBLIC_HEALTHZ_REFRESH_COUNTER: Any | None = None
 _TRACER: Any | None = None
 _OP_PREFIX_RE = re.compile(r"^\[([A-Za-z0-9_.:-]+)\]")
 _ACTOR_OBS_INITIALIZED = False
@@ -598,11 +601,13 @@ def _configure_opentelemetry(root_logger: logging.Logger) -> None:
     global _OTEL_ENABLED, _OTEL_INITIALIZED, _OTEL_LOG_HANDLER_ATTACHED
     global _HTTP_REQUEST_COUNTER, _HTTP_DURATION_HISTOGRAM, _HTTP_ERROR_COUNTER
     global _SAMPLING_ADMISSION_COUNTER, _TASK_STATE_FUTURES_TIMEOUT_COUNTER
+    global _TASK_FUTURE_REAPER_ROWS_COUNTER, _TASK_FUTURE_PAYLOAD_EVICT_ERROR_COUNTER
     global _VLLM_ACTOR_REQUEST_COUNTER, _VLLM_ACTOR_REQUEST_DURATION_HISTOGRAM
     global _TRAINING_OPERATION_COUNTER, _TRAINING_OPERATION_DURATION_HISTOGRAM
     global _MEGATRON_SESSION_SWITCH_COUNTER, _MEGATRON_SESSION_SWITCH_DURATION_COUNTER
     global _SCHEDULER_DECISION_COUNTER, _SCHEDULER_SWITCH_COUNTER, _SCHEDULER_QUEUE_WAIT_HISTOGRAM
-    global _SCHEDULER_READY_SESSIONS_HISTOGRAM, _SCHEDULER_CHOSEN_QUEUE_DEPTH_HISTOGRAM, _TRACER
+    global _SCHEDULER_READY_SESSIONS_HISTOGRAM, _SCHEDULER_CHOSEN_QUEUE_DEPTH_HISTOGRAM
+    global _PUBLIC_HEALTHZ_REFRESH_COUNTER, _TRACER
 
     if _OTEL_INITIALIZED:
         return
@@ -691,6 +696,16 @@ def _configure_opentelemetry(root_logger: logging.Logger) -> None:
             unit="{timeout}",
             description="task state future queue and execution timeout events observed by mint",
         )
+        _TASK_FUTURE_REAPER_ROWS_COUNTER = meter.create_counter(
+            "mint_task_future_reaper_rows_total",
+            unit="{row}",
+            description="Task future rows processed by the durable reaper",
+        )
+        _TASK_FUTURE_PAYLOAD_EVICT_ERROR_COUNTER = meter.create_counter(
+            "mint_task_future_payload_evict_errors_total",
+            unit="{error}",
+            description="Task future payload eviction errors",
+        )
         _VLLM_ACTOR_REQUEST_COUNTER = meter.create_counter(
             "mint_vllm_actor_requests_total",
             unit="{request}",
@@ -746,6 +761,30 @@ def _configure_opentelemetry(root_logger: logging.Logger) -> None:
             unit="{request}",
             description="Chosen session queue depth seen at scheduler decision time",
         )
+        _PUBLIC_HEALTHZ_REFRESH_COUNTER = meter.create_counter(
+            "mint_public_healthz_refresh_total",
+            unit="{refresh}",
+            description="Public healthz cache refresh attempts by result",
+        )
+        try:
+            from opentelemetry.metrics import Observation
+
+            def _observe_public_healthz_cache_age(_options):
+                from .health_checks import public_healthz_cache_age_seconds
+
+                age_s = public_healthz_cache_age_seconds()
+                if age_s is None:
+                    return []
+                return [Observation(float(age_s), {})]
+
+            meter.create_observable_gauge(
+                "mint_public_healthz_cache_age_seconds",
+                callbacks=[_observe_public_healthz_cache_age],
+                unit="s",
+                description="Age in seconds of the successful public healthz cache entry",
+            )
+        except Exception:
+            pass
 
         # 3) Logs
         log_exporter = OTLPLogExporter(endpoint=endpoint, headers=headers or None, insecure=insecure)
@@ -802,6 +841,16 @@ def record_http_server_metrics(*, method: str, route: str, status_code: int, dur
         pass
 
 
+def record_public_healthz_refresh_metric(*, result: str) -> None:
+    if not _OTEL_ENABLED:
+        return
+    try:
+        if _PUBLIC_HEALTHZ_REFRESH_COUNTER is not None:
+            _PUBLIC_HEALTHZ_REFRESH_COUNTER.add(1, attributes={"result": str(result)})
+    except Exception:
+        pass
+
+
 def record_sampling_admission_metric(
     *,
     route: str,
@@ -834,6 +883,26 @@ def record_task_futures_timeout_metric(*, kind: str, op: str | None = None) -> N
     try:
         if _TASK_STATE_FUTURES_TIMEOUT_COUNTER is not None:
             _TASK_STATE_FUTURES_TIMEOUT_COUNTER.add(1, attributes=attrs)
+    except Exception:
+        pass
+
+
+def record_task_future_reaper_rows_metric(*, action: str, count: int = 1) -> None:
+    if not _OTEL_ENABLED:
+        return
+    try:
+        if _TASK_FUTURE_REAPER_ROWS_COUNTER is not None:
+            _TASK_FUTURE_REAPER_ROWS_COUNTER.add(int(count), attributes={"action": str(action)})
+    except Exception:
+        pass
+
+
+def record_task_future_payload_evict_error_metric(*, count: int = 1) -> None:
+    if not _OTEL_ENABLED:
+        return
+    try:
+        if _TASK_FUTURE_PAYLOAD_EVICT_ERROR_COUNTER is not None:
+            _TASK_FUTURE_PAYLOAD_EVICT_ERROR_COUNTER.add(int(count))
     except Exception:
         pass
 

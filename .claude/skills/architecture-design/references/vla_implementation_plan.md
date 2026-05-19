@@ -2,19 +2,19 @@
 
 This file is historical design input, not the normative contract.
 
-Current normative sources are:
+Historical source materials referenced by this plan were:
 
-- `docs/mint-openpi-vla-target.md`
-- `docs/README.md`
-- `docs/sub-targets/*.md`
-- `docs/plans/2026-03-30-pr422-long-term-remediation.md`
+- the PR422 Mint OpenPI VLA target document
+- the PR422 VLA docs README
+- the PR422 VLA sub-target documents
+- the PR422 long-term remediation plan
 - the verified stage-local scripts under `src/mindlab-toolkit/examples/`
 
-This file remains useful only as a record of early design pressures and boundary questions. It should not be used as the merge-readiness checklist or as the current implementation plan.
+This file remains useful only as a record of early design pressures and boundary questions. It should not be used as the merge-readiness checklist or as an implementation plan. Normative Mint architecture guidance lives in this `references/` directory.
 
 ## What survived from the historical plan
 
-Several early decisions were directionally right and still survive in the current repo:
+Several early decisions were directionally right and survived into the PR422-era repo:
 
 - keep `Datum` as the user-facing training unit
 - keep `import mint` as the user entrypoint instead of pushing users into upstream `openpi`
@@ -23,11 +23,11 @@ Several early decisions were directionally right and still survive in the curren
 - keep `pi0.5` RL out of the first-stage contract
 - avoid promising vLLM-style multi-LoRA serving economics for OpenPI checkpoints
 
-Those ideas now live in the target doc and stage docs instead of in this file.
+Those ideas later moved into the target doc and stage docs instead of this file.
 
 ## What changed after this plan
 
-The original plan predated the final PR422 convergence work. The current repo contract differs in five important ways.
+The original plan predated the final PR422 convergence work. The PR422-era repo contract differed in five important ways.
 
 ### 1. Public training examples now use `train_step(...)`
 
@@ -56,14 +56,14 @@ The old `/api/v1/create_action_session`, `/api/v1/act`, and `/api/v1/action_sess
 
 ### 3. Default action execution now stays inside Mint control-plane semantics
 
-The current repo no longer treats action inference as a side path outside Mint scheduling.
+The PR422-era repo no longer treated action inference as a side path outside Mint scheduling.
 
 Default action requests now:
 
 - create a future
 - go through `ModelWorkScheduler` when async model-runtime scheduling is needed
 - execute on Mint-managed Ray actors
-- surface placement and lifecycle through `ModelActorSupervisor`, `ModelWorkScheduler`, and `ModelActorInventory`
+- surface placement and lifecycle through `ModelActorSupervisor` inventory and `ModelWorkScheduler`
 
 ### 4. Runtime declaration is now repo-owned
 
@@ -91,19 +91,19 @@ Keep these distinct:
 
 `pi0.5` should not be treated as repo-default exposure just because the candidate runtime root is valid.
 
-## Current reading path
+## Historical reading path
 
-If you need the actual current contract, read in this order:
+For historical PR422 context, the original reading order was:
 
-1. `docs/README.md`
-2. `docs/mint-openpi-vla-target.md`
-3. `docs/sub-targets/st-07-openpi-ray-gpu-actor.md`
-4. `docs/sub-targets/st-08-openpi-shared-ray-actor-pool.md`
-5. `docs/sub-targets/st-09-mintx-action-boundary-runtime-contract.md`
-6. `docs/plans/2026-04-01-shared-runtime-candidate-rollout-verification.md`
-7. `docs/plans/2026-04-01-mint-dev-shared-runtime-rollout-readiness.md`
+1. the PR422 VLA docs README
+2. the PR422 Mint OpenPI VLA target document
+3. the OpenPI Ray GPU actor sub-target
+4. the OpenPI shared Ray actor pool sub-target
+5. the MintX action boundary runtime contract sub-target
+6. the shared-runtime candidate rollout verification plan
+7. the mint-dev shared-runtime rollout readiness plan
 
-Then use the verified example scripts as the executable surface:
+Then the verified example scripts were used as the executable surface:
 
 - `src/mindlab-toolkit/examples/st06_mint_vla_minimal_closure.py`
 - `src/mindlab-toolkit/examples/st07_openpi_ray_single_gpu_actor_acceptance.py`
@@ -125,4 +125,4 @@ Do not use this file to infer any of the following:
 
 Keep this file only as historical background.
 
-For current development work, follow the target doc, stage docs, rollout/readiness docs, and the verified example scripts.
+For current architecture work, use this `references/` directory. The historical PR422 docs and verified example scripts are background evidence only.

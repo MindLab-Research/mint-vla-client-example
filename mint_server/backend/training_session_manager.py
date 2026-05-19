@@ -375,7 +375,7 @@ class TrainingSessionManager:
     def get_session(self, model_id: str) -> TrainingSession | None:
         """Get training session by model_id.
 
-        Detached training_session_store is the authoritative state source.
+        TaskStateStore training-session methods are the authoritative state source.
         The local map is only a request-path cache plus create-time scratch state.
         """
         session = self._sessions.get(model_id)
@@ -400,7 +400,7 @@ class TrainingSessionManager:
         return restored
 
     def list_sessions(self) -> list[TrainingSession]:
-        """List training sessions from detached authority plus local pending creates."""
+        """List training sessions from TaskStateStore-backed metadata plus local pending creates."""
         out: list[TrainingSession] = []
         seen: set[str] = set()
         try:
@@ -579,32 +579,32 @@ class TrainingSessionManager:
         try:
             from .training_session_store import async_list_training_sessions
 
-            detached_infos = await async_list_training_sessions()
+            persisted_infos = await async_list_training_sessions()
         except Exception:
             return
 
-        detached_by_id: dict[str, dict[str, Any]] = {}
-        for info in detached_infos:
+        persisted_by_id: dict[str, dict[str, Any]] = {}
+        for info in persisted_infos:
             if not isinstance(info, dict):
                 continue
             model_id = str(info.get("model_id") or "")
             if not model_id:
                 continue
-            detached_by_id[model_id] = info
+            persisted_by_id[model_id] = info
             self.restore_training_session_info(info)
 
         for model_id in list(self._sessions.keys()):
-            if model_id not in detached_by_id and not bool(getattr(self._sessions[model_id], "pending_persist", False)):
+            if model_id not in persisted_by_id and not bool(getattr(self._sessions[model_id], "pending_persist", False)):
                 self.delete_session(model_id)
 
         for model_id, session in list(self._sessions.items()):
-            detached = detached_by_id.get(model_id)
-            if not isinstance(detached, dict):
+            persisted = persisted_by_id.get(model_id)
+            if not isinstance(persisted, dict):
                 continue
             try:
                 session.last_activity = max(
                     float(session.last_activity),
-                    float(detached.get("last_activity", session.last_activity)),
+                    float(persisted.get("last_activity", session.last_activity)),
                 )
             except Exception:
                 pass
@@ -613,7 +613,7 @@ class TrainingSessionManager:
         inactive = [
             model_id
             for model_id, session in self._sessions.items()
-            if model_id in detached_by_id
+            if model_id in persisted_by_id
             if session.inflight_ops == 0
             if now - session.last_activity > self._inactivity_timeout
         ]
@@ -634,8 +634,8 @@ class TrainingSessionManager:
         Mirrors the DELETE /models/{model_id} flow:
         1. engine.delete_session (delete actor-local state, then unbind/kill actor if applicable)
         2. delete_session (remove from in-memory manager)
-        3. delete_training_session (remove from detached Ray store)
-        4. model_actor_inventory.clear_session (clear stale session pins)
+        3. delete_training_session (remove TaskStateStore-backed training metadata)
+        4. ModelActorSupervisor.clear_session (clear stale supervisor-owned session pins)
         """
         session = self._sessions.get(model_id)
         if session is None:
@@ -675,7 +675,7 @@ class TrainingSessionManager:
         # 3. Remove from in-memory manager
         self.delete_session(model_id)
 
-        # 4. Remove from detached Ray store (best-effort)
+        # 4. Remove from TaskStateStore-backed training metadata (best-effort)
         try:
             from .training_session_store import delete_training_session
 
@@ -685,7 +685,7 @@ class TrainingSessionManager:
                 f"Failed to delete training session {model_id} from store: {e}"
             )
 
-        # 5. Clear ModelActorInventory session tracking (best-effort)
+        # 5. Clear supervisor-owned session tracking (best-effort)
         try:
             from .model_actor_supervisor import get_model_actor_supervisor
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sys
 from types import SimpleNamespace
 
 import pytest
@@ -254,55 +253,24 @@ async def test_issue_437_root_heartbeat_keeps_best_effort_on_index_failure(monke
     assert "session index lookup failed for root-session" in caplog.text
 
 
-def test_issue_437_add_heartbeat_sampler_compat_upserts_when_actor_lacks_method(monkeypatch, caplog) -> None:
+def test_issue_437_add_heartbeat_sampler_uses_task_state_store(monkeypatch) -> None:
     import mint_server.backend.session_index_store as sis
 
-    sampler_adds: list[tuple[str, str, str | None, str | None]] = []
-    upserts: list[tuple[str, dict]] = []
-
-    actor = SimpleNamespace(
-        add_sampler=SimpleNamespace(
-            remote=lambda session_id, sampler_id, user_id, created_at: sampler_adds.append(
-                (session_id, sampler_id, user_id, created_at)
-            )
-        ),
-        get_session=SimpleNamespace(
-            remote=lambda _session_id: {
-                "session_id": "root-session",
-                "heartbeat_sampler_ids": ["sampler-old"],
-            }
-        ),
-        upsert_session=SimpleNamespace(remote=lambda session_id, info: upserts.append((session_id, info))),
-    )
-
-    monkeypatch.setitem(
-        sys.modules,
-        "ray",
-        SimpleNamespace(
-            is_initialized=lambda: True,
-            get=lambda value: value,
+    calls: list[tuple[str, str, str | None, str | None]] = []
+    monkeypatch.setattr(
+        sis.task_state_store,
+        "add_heartbeat_sampler_to_session_index",
+        lambda *, session_id, sampler_id, user_id=None, created_at=None: calls.append(
+            (session_id, sampler_id, user_id, created_at)
         ),
     )
-    monkeypatch.setattr(sis, "_get_or_create_actor", lambda: actor)
 
-    with caplog.at_level("WARNING"):
-        sis.add_heartbeat_sampler_to_session(
-            session_id="root-session",
-            sampler_id="sampler-new",
-            user_id="owner-a",
-            created_at="2026-04-01T00:00:00",
-        )
+    sis.add_heartbeat_sampler_to_session(
+        session_id="root-session",
+        sampler_id="sampler-new",
+        user_id="owner-a",
+        created_at="2026-04-01T00:00:00",
+    )
 
-    assert sampler_adds == [
-        ("root-session", "sampler-new", "owner-a", "2026-04-01T00:00:00"),
-    ]
-    assert upserts == [
-        (
-            "root-session",
-            {
-                "session_id": "root-session",
-                "heartbeat_sampler_ids": ["sampler-old", "sampler-new"],
-            },
-        )
-    ]
-    assert "actor missing add_heartbeat_sampler; using compatibility upsert" in caplog.text
+    assert calls == [("root-session", "sampler-new", "owner-a", "2026-04-01T00:00:00")]
+    assert not hasattr(sis, "_get_or_create_actor")

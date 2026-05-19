@@ -117,3 +117,25 @@ def get_snapshot(*, timeout_s: float = 10.0) -> dict[str, object]:
 
 async def async_get_snapshot(*, timeout_s: float = 10.0) -> dict[str, object]:
     return await asyncio.to_thread(get_snapshot, timeout_s=timeout_s)
+
+
+def ping(*, timeout_s: float = 5.0) -> dict[str, object]:
+    global _ACTOR_HANDLE
+    actor_name = config_actor_name()
+    if _ACTOR_HANDLE is None:
+        try:
+            _ACTOR_HANDLE = ray.get_actor(actor_name, namespace=_ray_namespace())
+        except Exception as e:
+            raise ConfigActorUnavailableError(
+                f"ConfigActor unavailable actor_name={actor_name!r} namespace={_ray_namespace()!r}"
+            ) from e
+    out = ray.get(_ACTOR_HANDLE.ping.remote(), timeout=timeout_s)
+    if not isinstance(out, dict):
+        raise TypeError(f"ConfigActor.ping returned non-dict: {type(out)}")
+    if not bool(out.get("ok")):
+        raise ConfigActorUnavailableError(f"ConfigActor ping failed: {out!r}")
+    return out
+
+
+async def async_ping(*, timeout_s: float = 5.0) -> dict[str, object]:
+    return await asyncio.to_thread(ping, timeout_s=timeout_s)

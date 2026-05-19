@@ -2901,7 +2901,7 @@ class MultiNodeInferenceEngine:
                 protected=is_persistent,
             ))
             logger.info(
-                f"Registered {self.actor_name} with ModelActorInventory ({total_required_gpus} GPUs)"
+                f"Published {self.actor_name} through ModelActorSupervisor inventory ({total_required_gpus} GPUs)"
             )
 
     async def add_lora_for_session(

@@ -2,9 +2,10 @@
 
 Date: 2026-04-07
 
-This note documents the current OpenPI sampling architecture in PR 422 and why it is still a mismatch with the intended MinT design.
+This historical note documents the OpenPI sampling architecture observed in PR
+422 on 2026-04-07 and why it was still a mismatch with the intended MinT design.
 
-## Current behavior
+## Observed behavior on 2026-04-07
 
 Training side:
 
@@ -24,7 +25,7 @@ Sampling side:
 
 MinT is intended to separate training and sampling while still treating sampling as a shared serving substrate.
 
-The current OpenPI sampling path does not do that.
+The OpenPI sampling path observed in this run did not do that.
 
 It achieves isolation by:
 
@@ -66,11 +67,12 @@ A MinT-clean OpenPI sampling design would still need all of the following:
 - this routing now exists for the tested path and must not regress
 
 5. capacity semantics that reflect logical sessions rather than checkpoint-derived sampler state churn
-- current capacity pressure is lower than actor-per-session spawning, but sampling still pays checkpoint-derived state-switch costs
+- observed capacity pressure was lower than actor-per-session spawning, but sampling still paid checkpoint-derived state-switch costs
 
 ## Practical implication
 
-The current implementation can be made operational and tested, but it should not be mistaken for the final MinT architecture.
+The implementation observed in this run could be made operational and tested,
+but it should not be mistaken for the final MinT architecture.
 
 The right status is:
 

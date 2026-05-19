@@ -12,7 +12,7 @@ The API surface follows the Tinker SDK expectations: create sessions and models,
 
 Contract implications:
 - Long-running work returns a `request_id` and is polled via `/api/v1/retrieve_future` (408 pending). This is the Tinker async protocol, not a server-specific choice.
-- `session_id`, `model_id`, and `sampling_session_id` are control-plane identifiers. Some live routing and engine bindings are in process, but minimal recovery metadata is also mirrored into detached Ray stores.
+- `session_id`, `model_id`, and `sampling_session_id` are control-plane identifiers. Some live routing and engine bindings are in process, but minimal recovery metadata is persisted through `TaskStateStore`.
 - The server can restart while detached Ray actors remain alive. Fast in-process registries are still lost, but detached control-plane actors keep enough metadata for reconciliation and selected REST reads.
 
 ## Multi-LoRA inference: one base model, many adapters
@@ -21,7 +21,9 @@ Inference uses a MultiLoRA design: one detached vLLM actor per base model, many 
 
 Flow:
 - `POST /api/v1/create_sampling_session` validates access and selects a base model.
-- The server attaches to an existing detached vLLM actor or creates one.
+- Request handling records durable session/task metadata and submits work through
+  the scheduler. Existing healthy vLLM actors can serve immediately; missing
+  desired actors are created by `ModelActorSupervisor`, not by the API worker.
 - Adapter weights are loaded on demand, then requests call `generate_with_lora` or `generate_base`.
 
 Boundaries and tradeoffs:
@@ -34,10 +36,12 @@ Boundaries and tradeoffs:
 
 Hot HTTP paths must not block the API event loop on synchronous Ray control-plane calls.
 
-- Request routes use async APIs on detached control-plane actors (`TaskStateStore`, `ModelWorkScheduler`, metadata stores, and cleanup actors) and await Ray refs directly. `TaskFutureService` is the in-process compatibility facade over `TaskStateStore`.
-- Startup is responsible for initializing Ray and warming detached actor handles.
-- Request paths fail fast when Ray is unavailable; they must not call `init_ray()` or silently reconnect from inside a route.
-- Detached metadata-store handles can be reacquired by name if the cached handle dies, but request paths still do not create new Ray clients or hide hard Ray outages.
+- Request routes use async APIs on detached control-plane actors through the API control-plane client. `TaskStateStore` owns futures and business indexes, `ModelWorkScheduler` owns hot scheduling, and `ModelActorSupervisor` owns live actor/node reconciliation. `TaskFutureService` is the in-process compatibility facade over `TaskStateStore`.
+- API startup may establish Ray connectivity and check required detached
+  control-plane actors. It must not ensure, create, or reconcile detached
+  actors, and handle warming is not a bootstrap responsibility.
+- Request paths fail fast when Ray or required detached control-plane actors are unavailable; they must not call `init_ray()` or silently reconnect from inside a route.
+- Cached handles can be reacquired by name through the control-plane client if they die, but request paths still do not create new Ray clients or hide hard Ray outages.
 
 ## Multi-tenant training: time-sliced state swap
 
@@ -77,7 +81,17 @@ MoE training uses Megatron and must export PEFT adapters by reconstructing full 
 
 ## ModelActorSupervisor, ModelWorkScheduler, and inventory
 
-`ModelActorSupervisor` owns desired long-lived actor reconciliation. Backend-specific vLLM, Megatron, dense, and OpenPI launchers still create their backend Ray actors, but they publish those actors through the supervisor launch-publication contract. The supervisor is also the planned home for topology-aware daemon actors such as per-node metrics collectors; daemon actors are reconciled separately from model replicas and are never synced to the scheduler. `ModelWorkScheduler` owns hot task scheduling, replica subqueues, and leases. `TaskStateStore` is the durable task/result/index source; Scheduler and Supervisor keep rebuildable in-memory projections. `ModelActorInventory` is a process-local helper owned by the supervisor for actor observability, inflight marking, session/protection metadata, and admin list/kill surfaces.
+`ConfigActor` must already exist before `ModelActorSupervisor` starts. External operations bootstrap only `mint_config`, then `mint_model_actor_supervisor`, then API workers. `ModelActorSupervisor` is a detached Ray actor and the only component allowed to reconcile long-lived model runtime actors, control-plane actors that it owns, and topology daemon actors. It ensures the remaining CPU control-plane actors, including `ModelWorkScheduler`, `TaskStateStore`, and `MaintenanceCronActor`, plus all desired GPU/CPU runtime actors. Backend-specific vLLM, Megatron, dense, and OpenPI launchers still create their backend Ray actors, but they publish those actors through the supervisor launch-publication contract. Daemon actors are reconciled separately from model replicas and are never synced to the scheduler.
+
+`MaintenanceCronActor` remains a detached cron runner only. It may run periodic cleanup/reaper jobs, but it must not call `ModelActorSupervisor`, own model actor reconciliation state, trigger reconcile, or make reconcile decisions. `ModelActorSupervisor` may manage the cron actor lifecycle; that dependency is one-way.
+
+`ModelWorkScheduler` owns hot task scheduling, replica subqueues, and leases. It must not use `TaskStateStore` as scheduling authority or lifecycle owner; `TaskStateStore` remains the durable task/result/index/session source and may be required for durable task admission and lease persistence. Scheduler and Supervisor keep rebuildable projections and must recover from `ConfigActor`, live Ray actor state, topology config, and provider state rather than from FastAPI process memory. `ModelActorInventory` is owned by the detached supervisor and is not a per-API-process authority. Supervisor live/operational metadata belongs to Supervisor; user and business metadata belongs to `TaskStateStore`.
+
+The FastAPI application is a stateless API boundary. It should assemble HTTP middleware and routes, connect to detached control-plane clients, and expose unhealthy status when the highest control plane is unavailable. It may read/check detached actors and submit work to `ModelWorkScheduler`, but it must not ensure, create, or reconcile control-plane actors. If a request observes that a desired model runtime is not ready, it may send a fire-and-forget supervisor nudge that asks the supervisor to run a fast ensure pass. The request must not wait for supervisor ensure/reconcile before enqueuing or returning. If the supervisor is already reconciling, the nudge should be acknowledged without starting a second reconcile.
+
+`ModelWorkScheduler` accepts work even when a desired replica is not yet registered. That work remains pending until the supervisor registers a healthy replica, subject to the request/task TTL. This preserves the Tinker async contract: submit returns a `request_id`, `retrieve_future` returns HTTP 408 while pending, and the request is only terminal when it succeeds, fails, expires, is cancelled, or is forgotten after retention. This lets existing healthy actors continue serving when the supervisor is temporarily unavailable, while new or missing actors will not be recreated until the supervisor recovers.
+
+Retention policy: retrieve hot-cache entries live for 300s, retrieve replay grace is 600s, pending/queued/assigned tasks expire after 24h, terminal result payloads are retained for 24h after `done_at` or `failed_at`, and tombstones are retained for 7d. `TaskFutureService.async_reap()` enforces this policy through `TaskStateStore` and `TaskPayloadStore`.
 
 Clients do not explicitly end all sessions, so idle timeouts still affect training and inference:
 - Detached inference actors can remain alive across server restarts and keep CUDA memory until evicted.
@@ -85,7 +99,18 @@ Clients do not explicitly end all sessions, so idle timeouts still affect traini
 
 Eviction is a resource policy. It is not a fault-tolerance mechanism.
 
-Mint can optionally pre-create and protect ("never evict") a set of persistent actors at startup (controlled by `MINT_PERSISTENT_MODELS`). This is a capacity planning knob, not a correctness requirement.
+Mint can optionally pre-create and protect ("never evict") a set of persistent actors through the detached supervisor. This is a capacity planning knob, not a correctness requirement.
+
+## API deployment mode
+
+The target API process is stateless and runs as an external FastAPI/Uvicorn service that connects to Ray through a control-plane client. It is not deployed through Ray Serve.
+
+API workers may access Ray for read/check and scheduling operations through the client, but they must not ensure or recreate detached control-plane actors. `mint_config` and `mint_model_actor_supervisor` are bootstrapped and kept highly available by external operations.
+
+Health policy:
+- `/api/v1/healthz` is the external business health endpoint. It is lightweight and answers only whether normal traffic can be served. It checks `ModelWorkScheduler` and `TaskStateStore` through a per-API-worker cache with a 30s TTL. A dirty cache is refreshed synchronously with single-flight behavior; concurrent callers wait up to 5s total. The underlying Scheduler and TaskStateStore pings each get a shorter timeout, leaving room inside that 5s budget. If refresh fails, the dirty previous value is ignored and the response is HTTP 503 with `{"status": "unhealthy"}`. A ready response is HTTP 200 with `{"status": "ready"}`. The response must not expose degraded state, actor names, supervisor availability, cron status, Ray cluster details, or internal reasons. The initial no-cache request follows the same 5s limit and returns 503 on failure.
+- `/api/v1/internal/healthz` is the internal operations health endpoint. It is still lightweight: it reads the current `ModelActorSupervisor` summary snapshot plus process-local maintenance-cron/startup degraded markers, rather than fanning out to every runtime actor on each request. It reports `ready`, `degraded`, or `unhealthy` with supervisor reachability, supervisor summary counters, maintenance cron degraded state, and startup control-plane check state. `ModelActorSupervisor` unavailable is unhealthy for the internal endpoint. A supervisor snapshot whose `snapshot_generated_at`, `observed_at`, or topology `observed_at` timestamp is older than 60s is degraded; do not use `last_reconcile_at` for snapshot staleness. `MaintenanceCronActor` unavailable is degraded unless it also prevents required control-plane state from being read.
+- Component endpoints such as scheduler stats, supervisor snapshot, cron health, Ray cluster health, and admission stats are debug/diagnostic endpoints, not external health probes.
 
 ## Auth and access boundaries
 

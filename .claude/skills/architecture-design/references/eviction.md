@@ -53,12 +53,12 @@ The only config knob left for this surface is `[model_actor_inventory].session_i
 
 ## Admin kill
 
-Admin kill remains explicit. `ModelActorInventory.clear(kill_actors=True)` and actor-family kill routes:
+Admin kill remains explicit. `ModelActorSupervisor.clear(kill_actors=True)` and actor-family kill routes:
 
 - look up actor handles by name and namespace;
 - try `shutdown.remote()` when present;
 - call `ray_kill.kill(...)`;
-- unregister local inventory state.
+- unregister supervisor-owned inventory state.
 
 This is an operator action, not automatic admission control.
 

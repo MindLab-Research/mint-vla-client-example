@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import os
+import sqlite3
+import sys
+import types
 
 import pytest
 
@@ -11,6 +14,7 @@ from mint_server.backend.model_actor_launchers import (
 )
 from mint_server.backend.model_actor_supervisor import (
     ModelActorSpec,
+    ModelActorSupervisorClient,
     ModelActorSupervisor,
     desired_specs_from_env,
     domain_key_for_training_base_model,
@@ -18,6 +22,11 @@ from mint_server.backend.model_actor_supervisor import (
     queue_id_for_replica,
 )
 from mint_server.backend.model_actor_placement import ModelActorPlacementReconciler
+from mint_server.backend.supervisor_state_store import (
+    SupervisorMemoryStateStore,
+    SupervisorSQLiteStateStore,
+    SupervisorStateOwnerConflictError,
+)
 
 
 class _FakeRuntimeActor:
@@ -55,6 +64,149 @@ class _FakeRuntimeActor:
         return self.health_snapshot()
 
 
+class _FakeRayRef:
+    def __init__(self, value):
+        self.value = value
+
+
+class _FakeRemoteMethod:
+    def __init__(self, calls: list[tuple[str, tuple, dict]], name: str, value=None) -> None:
+        self._calls = calls
+        self._name = name
+        self._value = value if value is not None else {"ok": True}
+
+    def remote(self, *args, **kwargs):
+        self._calls.append((self._name, args, kwargs))
+        return _FakeRayRef(self._value)
+
+
+class _FakeActorHandle:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, tuple, dict]] = []
+        self.snapshot = _FakeRemoteMethod(self.calls, "snapshot", {"desired_total": 0})
+        self.async_snapshot = _FakeRemoteMethod(
+            self.calls,
+            "async_snapshot",
+            {"desired_total": 0, "async": True},
+        )
+        self.register = _FakeRemoteMethod(
+            self.calls,
+            "register",
+            {"actor_name": "actor-a", "metadata": {"launcher_contract": "model_actor_supervisor"}},
+        )
+        self.mark_ready = _FakeRemoteMethod(self.calls, "mark_ready", None)
+        self.clear_session = _FakeRemoteMethod(self.calls, "clear_session", 3)
+        self.sync_replicas = _FakeRemoteMethod(self.calls, "sync_replicas", {"ok": True})
+        self.total_gpus_used = _FakeRemoteMethod(self.calls, "total_gpus_used", 7)
+        self.gpus_used_by_node = _FakeRemoteMethod(self.calls, "gpus_used_by_node", {"node-a": 4})
+
+
+class _FakeRemoteActorClass:
+    def __init__(self, created: dict) -> None:
+        self.created = created
+
+    def options(self, **options):
+        self.created["options"] = options
+        return self
+
+    def remote(self, *args, **kwargs):
+        self.created["remote_args"] = args
+        self.created["remote_kwargs"] = kwargs
+        return self.created["actor"]
+
+
+def test_issue_593_get_model_actor_supervisor_returns_client_facade() -> None:
+    import mint_server.backend.model_actor_supervisor as supervisor_module
+
+    assert isinstance(supervisor_module.get_model_actor_supervisor(), ModelActorSupervisorClient)
+    assert supervisor_module.get_model_actor_supervisor() is supervisor_module.model_actor_supervisor
+    assert not isinstance(supervisor_module.get_model_actor_supervisor(), ModelActorSupervisor)
+
+
+def test_issue_593_supervisor_detached_actor_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    import mint_server.backend.model_actor_supervisor as supervisor_module
+
+    actor = _FakeActorHandle()
+    created = {"actor": actor, "remote_args": None, "remote_kwargs": None, "remote_decorator": None}
+
+    fake_ray = types.SimpleNamespace(
+        is_initialized=lambda: True,
+        cluster_resources=lambda: {"node:__internal_head__": 1.0},
+    )
+
+    def _remote(**kwargs):
+        created["remote_decorator"] = kwargs
+        return lambda _cls: _FakeRemoteActorClass(created)
+
+    fake_ray.remote = _remote
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    monkeypatch.setattr(supervisor_module, "PFS_PYTHONPATH", "PFS_PATH", raising=False)
+    monkeypatch.setattr(
+        supervisor_module,
+        "actor_runtime_env",
+        lambda **kwargs: {"env_vars": {"PYTHONPATH": kwargs["pythonpath"], "OTEL_SERVICE_NAME": "mint-test"}},
+        raising=False,
+    )
+    monkeypatch.setattr(supervisor_module, "otel_env_vars", lambda: {"OTEL_SERVICE_NAME": "mint-test"}, raising=False)
+    monkeypatch.setattr(supervisor_module, "sync_get_ray_ref", lambda ref, **_kwargs: ref.value, raising=False)
+
+    out = supervisor_module._create_ray_actor(require_ready=True)
+
+    assert out is actor
+    assert created["remote_decorator"] == {
+        "num_cpus": 0,
+        "max_concurrency": 128,
+        "max_restarts": 0,
+    }
+    assert created["options"]["name"] == "mint_model_actor_supervisor"
+    assert created["options"]["namespace"] == "mint"
+    assert created["options"]["lifetime"] == "detached"
+    assert created["options"]["get_if_exists"] is True
+    assert created["options"]["runtime_env"] == {
+        "env_vars": {"PYTHONPATH": "PFS_PATH", "OTEL_SERVICE_NAME": "mint-test"}
+    }
+    assert created["options"]["resources"] == {"node:__internal_head__": 0.001}
+    assert created["remote_kwargs"]["specs"] == desired_specs_from_env()
+    assert actor.calls == [("snapshot", (), {})]
+
+
+@pytest.mark.anyio
+async def test_issue_593_supervisor_client_forwards_sync_and_async_methods(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mint_server.backend.model_actor_supervisor as supervisor_module
+
+    actor = _FakeActorHandle()
+    fake_ray = types.SimpleNamespace(
+        is_initialized=lambda: True,
+        get_actor=lambda name, namespace=None: actor,
+    )
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    monkeypatch.setattr(supervisor_module, "sync_get_ray_ref", lambda ref, **_kwargs: ref.value, raising=False)
+
+    async def _async_get(ref, **_kwargs):
+        return ref.value
+
+    monkeypatch.setattr(supervisor_module, "async_get_ray_ref", _async_get, raising=False)
+    client = ModelActorSupervisorClient()
+
+    assert client.snapshot(timeout_s=2.0) == {"desired_total": 0}
+    assert await client.async_snapshot(timeout_s=3.0) == {"desired_total": 0, "async": True}
+    assert client.total_gpus_used() == 7
+    assert client.gpus_used_by_node() == {"node-a": 4}
+    assert client.clear_session("session-a", actor_type=ActorType.VLLM) == 3
+    assert await client.sync_replicas() == {"ok": True}
+    client.mark_ready("actor-a")
+
+    assert ("snapshot", (), {}) in actor.calls
+    assert ("async_snapshot", (), {"timeout_s": 3.0}) in actor.calls
+    assert ("total_gpus_used", (), {}) in actor.calls
+    assert ("gpus_used_by_node", (), {}) in actor.calls
+    assert ("clear_session", ("session-a",), {"actor_type": ActorType.VLLM}) in actor.calls
+    assert ("sync_replicas", (), {}) in actor.calls
+    assert ("mark_ready", ("actor-a",), {}) in actor.calls
+
+
 def test_issue_593_supervisor_exposes_explicit_inventory_contract() -> None:
     supervisor = ModelActorSupervisor()
 
@@ -80,6 +232,98 @@ def test_issue_593_supervisor_exposes_explicit_inventory_contract() -> None:
 
     assert supervisor.clear_session("session-a", actor_type=ActorType.VLLM) == 1
     assert supervisor.unregister("vllm-contract-actor") is True
+
+
+def test_issue_593_supervisor_memory_state_backend_owner_and_events() -> None:
+    store = SupervisorMemoryStateStore(event_limit=2)
+    owner = store.acquire_owner(name="model_actor_supervisor", owner_id="owner-a", ttl_s=30, now=10)
+    assert owner == {
+        "name": "model_actor_supervisor",
+        "owner_id": "owner-a",
+        "epoch": 1,
+        "started_at": 10.0,
+        "last_heartbeat_at": 10.0,
+        "lease_until": 40.0,
+        "schema_version": 1,
+    }
+    with pytest.raises(SupervisorStateOwnerConflictError):
+        store.acquire_owner(name="model_actor_supervisor", owner_id="owner-b", ttl_s=30, now=11)
+
+    renewed = store.heartbeat_owner(
+        name="model_actor_supervisor",
+        owner_id="owner-a",
+        epoch=1,
+        ttl_s=30,
+        now=12,
+    )
+    assert renewed["last_heartbeat_at"] == 12.0
+    assert renewed["lease_until"] == 42.0
+
+    store.append_event("a", {"n": 1}, owner=renewed, now=13)
+    store.append_event("b", {"n": 2}, owner=renewed, now=14)
+    store.append_event("c", {"n": 3}, owner=renewed, now=15)
+    assert [event["event_type"] for event in store.list_events(limit=10)] == ["b", "c"]
+
+
+def test_issue_593_supervisor_sqlite_state_backend_schema_and_generation(tmp_path) -> None:
+    db_path = tmp_path / "supervisor_state.sqlite3"
+    store = SupervisorSQLiteStateStore(db_path, event_limit=2)
+    owner = store.acquire_owner(name="model_actor_supervisor", owner_id="owner-a", ttl_s=30, now=10)
+    assert owner["schema_version"] == 1
+    assert store.reserve_generation("generation:vllm:model-a::replica-0", floor=100, now=11) == 100
+    assert store.reserve_generation("generation:vllm:model-a::replica-0", floor=100, now=12) == 101
+    store.append_event("a", {"n": 1}, owner=owner, now=13)
+    store.append_event("b", {"n": 2}, owner=owner, now=14)
+    store.append_event("c", {"n": 3}, owner=owner, now=15)
+    store.close()
+
+    conn = sqlite3.connect(db_path)
+    try:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+        assert tables == {"kv", "owner", "events"}
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(owner)")}
+        assert {
+            "owner_id",
+            "epoch",
+            "started_at",
+            "last_heartbeat_at",
+            "lease_until",
+            "schema_version",
+        }.issubset(columns)
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal"
+        assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 2
+    finally:
+        conn.close()
+
+
+def test_issue_593_supervisor_uses_sqlite_generation_hint_across_instances(tmp_path) -> None:
+    db_path = tmp_path / "supervisor_state.sqlite3"
+    store_a = SupervisorSQLiteStateStore(db_path)
+    supervisor_a = ModelActorSupervisor(
+        specs=[ModelActorSpec(domain_key="vllm:model-a", replica_id="replica-0")],
+        state_store=store_a,
+        owner_id="owner-a",
+        owner_ttl_s=1,
+    )
+    generation_a = supervisor_a._next_generation(("vllm:model-a", "replica-0"))
+    store_a.close()
+
+    store_b = SupervisorSQLiteStateStore(db_path)
+    supervisor_b = ModelActorSupervisor(
+        specs=[ModelActorSpec(domain_key="vllm:model-a", replica_id="replica-0")],
+        state_store=store_b,
+        owner_id="owner-a",
+        owner_ttl_s=1,
+    )
+    generation_b = supervisor_b._next_generation(("vllm:model-a", "replica-0"))
+    store_b.close()
+
+    assert generation_b > generation_a
 
 
 @pytest.mark.anyio
@@ -649,7 +893,7 @@ def test_issue_593_placement_reconciler_uses_node_pin_and_removes_owned_orphan_p
             "required": {"10.0.0.17": 4},
             "context": "model_actor_supervisor placement domain='vllm:Qwen/Test' replica='replica-1'",
             "ignore_pg_names": {
-                "mint_model_actor_vllm-Qwen-Test_replica-1_pg",
+                "mint_model_runtime_vllm-Qwen-Test_replica-1_pg",
             },
             "namespace": "mint",
         }
@@ -827,7 +1071,7 @@ def test_issue_593_placement_reconciler_does_not_evict_foreign_blockers_when_tar
     killed: list[tuple[str, str, str]] = []
 
     def _actor_exists(name: str, _namespace: str) -> bool:
-        return name == "mint_model_actor_vllm-Qwen-Test_replica-1"
+        return name == "mint_model_runtime_vllm-Qwen-Test_replica-1"
 
     def _capacity(required, context, ignore_pg_names, namespace):
         capacity_checks.append(

@@ -30,10 +30,6 @@ def test_issue_301_actor_entrypoints_call_observability_init():
         "mint_server/backend/multinode_inference.py": 1,
         "mint_server/backend/megatron_distributed.py": 2,
         "mint_server/backend/verl_training.py": 1,
-        "mint_server/backend/sampling_session_store.py": 1,
-        "mint_server/backend/session_index_store.py": 1,
-        "mint_server/backend/training_session_store.py": 1,
-        "mint_server/backend/gateway_session_store.py": 1,
     }
 
     for rel_path, min_count in required.items():

@@ -1005,6 +1005,14 @@ class _ModelWorkSchedulerActor:
             },
         }
 
+    def ping(self) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "actor_name": _ray_model_work_scheduler_actor_name(),
+            "namespace": _ray_namespace(),
+            "scheduler_instance_id": self._instance_id,
+        }
+
 
 def _await_ray_ref_sync(ref: Any, *, timeout_s: float | None = None) -> Any:
     return sync_get_ray_ref(ref, timeout_s=timeout_s)
@@ -1050,7 +1058,12 @@ class ModelWorkSchedulerClient:
     def _reset_ray_actor(self) -> None:
         self._ray_actor = None
 
-    async def _get_ray_actor_async(self, *, require_ready: bool = True):
+    async def _get_ray_actor_async(
+        self,
+        *,
+        require_ready: bool = True,
+        create_if_missing: bool = True,
+    ):
         _append_model_work_scheduler_debug("get_ray_actor_async_begin", require_ready=require_ready)
         try:
             import ray
@@ -1084,8 +1097,16 @@ class ModelWorkSchedulerClient:
             )
             return self._ray_actor
         except ValueError:
+            if not create_if_missing:
+                raise ModelWorkSchedulerUnavailableError(
+                    f"Detached Ray ModelWorkScheduler actor unavailable actor_name={actor_name!r}"
+                )
             logger.info("[model_work_scheduler] actor %s not found; creating", actor_name)
         except Exception:
+            if not create_if_missing:
+                raise ModelWorkSchedulerUnavailableError(
+                    f"Detached Ray ModelWorkScheduler actor unavailable actor_name={actor_name!r}"
+                )
             logger.info("[model_work_scheduler] failed to fetch actor %s; creating", actor_name)
 
         try:
@@ -1370,12 +1391,33 @@ class ModelWorkSchedulerClient:
             raise TypeError(f"ModelWorkScheduler.expire_leases returned non-dict: {type(out)}")
         return out
 
-    async def stats(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
-        actor = await self._get_ray_actor_async(require_ready=False)
+    async def stats(
+        self,
+        *,
+        timeout_s: float = 10.0,
+        create_if_missing: bool = True,
+    ) -> dict[str, Any]:
+        actor = await self._get_ray_actor_async(require_ready=False, create_if_missing=create_if_missing)
         out = await self._await_ray_ref(actor.stats.remote(), timeout_s=timeout_s)
         if not isinstance(out, dict):
             raise TypeError(f"ModelWorkScheduler.stats returned non-dict: {type(out)}")
         return out
+
+    async def async_ping(self, *, timeout_s: float = 5.0) -> dict[str, Any]:
+        actor = await self._get_ray_actor_async(require_ready=False, create_if_missing=False)
+        try:
+            out = await self._await_ray_ref(actor.ping.remote(), timeout_s=timeout_s)
+        except Exception:
+            self._reset_ray_actor()
+            raise
+        if not isinstance(out, dict):
+            raise TypeError(f"ModelWorkScheduler.ping returned non-dict: {type(out)}")
+        if not bool(out.get("ok")):
+            raise ModelWorkSchedulerUnavailableError(f"ModelWorkScheduler ping failed: {out!r}")
+        return out
+
+    async def ping(self, *, timeout_s: float = 5.0) -> dict[str, Any]:
+        return await self.async_ping(timeout_s=timeout_s)
 
 
 model_work_scheduler = ModelWorkSchedulerClient()

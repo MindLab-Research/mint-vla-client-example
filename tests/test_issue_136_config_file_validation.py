@@ -108,6 +108,9 @@ def test_config_file_retrieve_future_settings_load(tmp_path):
                 "retrieve_future_hot_ttl_s = 30",
                 "retrieve_future_grace_s = 45",
                 "retrieve_future_min_poll_s = 2.5",
+                "task_pending_ttl_s = 100",
+                "task_result_ttl_s = 200",
+                "task_tombstone_ttl_s = 300",
             ]
         )
         + "\n",
@@ -117,6 +120,9 @@ def test_config_file_retrieve_future_settings_load(tmp_path):
     assert cfg.future.retrieve_future_hot_ttl_s == 30
     assert cfg.future.retrieve_future_grace_s == 45
     assert cfg.future.retrieve_future_min_poll_s == 2.5
+    assert cfg.future.task_pending_ttl_s == 100
+    assert cfg.future.task_result_ttl_s == 200
+    assert cfg.future.task_tombstone_ttl_s == 300
 
 
 def test_server_config_retrieve_future_settings_read_from_file(tmp_path):
@@ -128,6 +134,9 @@ def test_server_config_retrieve_future_settings_read_from_file(tmp_path):
                 "retrieve_future_hot_ttl_s = 30",
                 "retrieve_future_grace_s = 45",
                 "retrieve_future_min_poll_s = 2.5",
+                "task_pending_ttl_s = 100",
+                "task_result_ttl_s = 200",
+                "task_tombstone_ttl_s = 300",
             ]
         )
         + "\n",
@@ -144,6 +153,19 @@ def test_server_config_retrieve_future_settings_read_from_file(tmp_path):
     assert cfg.retrieve_future_hot_ttl_s == 30.0
     assert cfg.retrieve_future_grace_s == 45.0
     assert cfg.retrieve_future_min_poll_s == 2.5
+    assert cfg.task_pending_ttl_s == 100.0
+    assert cfg.task_result_ttl_s == 200.0
+    assert cfg.task_tombstone_ttl_s == 300.0
+
+
+def test_server_config_task_future_ttl_defaults():
+    cfg = ServerConfig.from_sources(environ={}, config_path=None, config_file=None)
+
+    assert cfg.retrieve_future_hot_ttl_s == 300.0
+    assert cfg.retrieve_future_grace_s == 600.0
+    assert cfg.task_pending_ttl_s == 86400.0
+    assert cfg.task_result_ttl_s == 86400.0
+    assert cfg.task_tombstone_ttl_s == 604800.0
 
 
 def test_config_file_task_state_store_settings_load(tmp_path):
@@ -175,6 +197,63 @@ def test_config_file_task_state_store_settings_load(tmp_path):
     assert cfg.task_state_store_owner_renew_s == 15.0
 
 
+def test_config_file_supervisor_state_settings_load(tmp_path):
+    p = tmp_path / "ok.toml"
+    p.write_text(
+        "\n".join(
+            [
+                "[supervisor_state]",
+                "backend = 'sqlite'",
+                "db_path = '/tmp/supervisor-state.sqlite3'",
+                "owner_ttl_s = 45",
+                "event_limit = 17",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    file_cfg = load_mint_config_file(p)
+
+    cfg = ServerConfig.from_sources(
+        environ={},
+        config_path=str(p),
+        config_file=file_cfg,
+    )
+
+    assert cfg.supervisor_state_backend == "sqlite"
+    assert cfg.supervisor_state_db_path == "/tmp/supervisor-state.sqlite3"
+    assert cfg.supervisor_state_owner_ttl_s == 45.0
+    assert cfg.supervisor_state_event_limit == 17
+
+
+def test_server_config_supervisor_state_defaults_and_env_override():
+    dev = ServerConfig.from_sources(environ={}, config_path=None, config_file=None)
+    assert dev.supervisor_state_backend == "memory"
+    assert dev.supervisor_state_db_path == "/vePFS-Mindverse/share/mint/dev/runtime/supervisor_state.sqlite3"
+
+    prod = ServerConfig.from_sources(
+        environ={"MINT_DEPLOYMENT_ENV": "prod"},
+        config_path=None,
+        config_file=None,
+    )
+    assert prod.supervisor_state_db_path == "/vePFS-Mindverse/share/mint/prod/runtime/supervisor_state.sqlite3"
+
+    override = ServerConfig.from_sources(
+        environ={
+            "MINT_SUPERVISOR_STATE_BACKEND": "sqlite",
+            "MINT_SUPERVISOR_STATE_DB_PATH": "/tmp/override.sqlite3",
+            "MINT_SUPERVISOR_STATE_OWNER_TTL_S": "9",
+            "MINT_SUPERVISOR_STATE_EVENT_LIMIT": "11",
+        },
+        config_path=None,
+        config_file=None,
+    )
+    assert override.supervisor_state_backend == "sqlite"
+    assert override.supervisor_state_db_path == "/tmp/override.sqlite3"
+    assert override.supervisor_state_owner_ttl_s == 9.0
+    assert override.supervisor_state_event_limit == 11
+
+
 def test_server_config_task_state_store_defaults_follow_auth_mode():
     dev = ServerConfig.from_sources(environ={}, config_path=None, config_file=None)
     assert dev.task_state_store_db_path == "/vePFS-Mindverse/share/mint/dev/data/task-state/task_state.sqlite3"
@@ -204,12 +283,18 @@ def test_server_config_retrieve_future_env_overrides_file_independently(tmp_path
     cfg = ServerConfig.from_sources(
         environ={
             "MINT_RETRIEVE_FUTURE_HOT_TTL_S": "31",
+            "MINT_TASK_PENDING_TTL_S": "101",
+            "MINT_TASK_RESULT_TTL_S": "201",
+            "MINT_TASK_TOMBSTONE_TTL_S": "301",
         },
         config_path=None,
         config_file=file_cfg,
     )
 
     assert cfg.retrieve_future_hot_ttl_s == 31.0
+    assert cfg.task_pending_ttl_s == 101.0
+    assert cfg.task_result_ttl_s == 201.0
+    assert cfg.task_tombstone_ttl_s == 301.0
 
 
 def test_server_config_reads_usage_log_dir_from_env():

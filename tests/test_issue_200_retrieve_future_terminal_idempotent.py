@@ -32,6 +32,14 @@ class _StubTaskFutureService:
         self.cleanup_calls.append(request_id)
 
 
+class _TaskStateTerminalStub:
+    def __init__(self, record):
+        self._record = record
+
+    async def async_get_task(self, request_id: str):
+        return self._record
+
+
 def _request_with_admin_user():
     return SimpleNamespace(state=SimpleNamespace(user_data={"user_id": "admin"}), headers={})
 
@@ -86,3 +94,33 @@ def test_retrieved_error_is_served_idempotently(monkeypatch):
 
     assert payload == {"error": "error:rid_retrieved_failed", "category": "system"}
     assert stub.cleanup_calls == []
+
+
+def test_terminal_payload_evicted_is_served_as_known_future(monkeypatch):
+    record = {
+        "request_id": "rid_evicted",
+        "op": "sampling.asample",
+        "status": "done",
+        "result_path": None,
+        "result_checksum": None,
+        "error": None,
+        "updated_at": 200.0,
+        "metadata": {
+            "op": "sampling.asample",
+            "done_at": 100.0,
+            "payload_evicted_at": 150.0,
+        },
+    }
+    stub = _StubTaskFutureService(FutureStatus.DONE, result=None, error=None)
+    monkeypatch.setattr(futures_route, "task_futures", stub)
+    monkeypatch.setattr(futures_route, "_recent_get", lambda _request_id: None)
+    monkeypatch.setattr("mint_server.backend.task_state_store.task_state_store", _TaskStateTerminalStub(record))
+
+    body = FutureRetrieveRequest(request_id="rid_evicted")
+    response = _response_stub()
+    payload = anyio.run(futures_route.retrieve_future, body, _request_with_admin_user(), response)
+
+    assert payload["error"] == "Known terminal future evicted"
+    assert payload["request_id"] == "rid_evicted"
+    assert payload["op"] == "sampling.asample"
+    assert response.status_code == 200

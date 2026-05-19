@@ -2,7 +2,8 @@
 
 Date: 2026-04-04
 
-This memo is the detailed benchmark and demo follow-up for PR 422 VLA work.
+This historical memo is the detailed benchmark and demo follow-up for PR 422 VLA
+work as of 2026-04-04.
 
 ## Recommendation summary
 

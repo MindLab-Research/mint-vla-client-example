@@ -451,9 +451,9 @@ def test_issue_364_restore_sampling_session_merges_last_activity_without_version
 
 def test_issue_364_model_actor_inventory_wrapper_preserves_metadata_without_ray(monkeypatch: pytest.MonkeyPatch) -> None:
     import mint_server.backend.model_actor_inventory as model_actor_inventory_module
-    from mint_server.backend.model_actor_supervisor import ActorType, get_model_actor_supervisor
+    from mint_server.backend.model_actor_supervisor import ActorType, ModelActorSupervisor
     monkeypatch.setattr(model_actor_inventory_module.ray, "is_initialized", lambda: False)
-    pool = get_model_actor_supervisor()
+    pool = ModelActorSupervisor()
     pool.clear(kill_actors=False)
     actor_name = "actor-364-wrapper-local"
     pool.unregister(actor_name)

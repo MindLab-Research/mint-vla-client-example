@@ -37,7 +37,7 @@ Environment-specific skills provide host, port, auth, and restart rules:
 - Default to read-only endpoints.
 - Mutating calls, especially `/internal/actors/kill`, require an explicit actor family, model, actor name, or reason.
 - Do not dump secrets. Source shared private config without printing it.
-- Public `/api/v1/healthz` is cheap API-worker health. Use `/internal/healthz/deep` only when Ray / placement-group diagnostics are needed.
+- Public `/api/v1/healthz` is cheap business health. `/api/v1/internal/healthz` is the lightweight internal operations health view from cached control-plane snapshots.
 - `/internal/actors` is an inventory/admin view, not the scheduling source of truth. Scheduler state is under `/internal/model_work_scheduler`; desired runtime state is under `/internal/model_actor_supervisor`.
 - Do not run local `ray` or `volc` commands through this skill. Use the environment skill or `volcano-cluster`.
 
@@ -62,8 +62,8 @@ curl -s -H "X-API-Key: $MINT_API_KEY" "$BASE/internal/actors?type=vllm" | jq
 
 | Endpoint | Meaning |
 |----------|---------|
-| `/internal/health` | Internal API + usage store health |
-| `/internal/healthz/deep` | Costly Ray / placement-group health observation |
+| `/api/v1/healthz` | External business health; unauthenticated and cache-backed |
+| `/api/v1/internal/healthz` | Internal operations health; supervisor/control-plane cached snapshot |
 | `/internal/admission_stats` | Combined scheduler, actor, store, process, Ray summary |
 | `/internal/metrics` | Prometheus-style metrics |
 | `/internal/model_work_scheduler` | Scheduler health and hot subqueue state |

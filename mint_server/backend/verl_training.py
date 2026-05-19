@@ -2068,7 +2068,7 @@ class VerlTrainingEngine:
         self.default_base_model = default_base_model
         self.default_lora_rank = default_lora_rank
         self._workers: dict[str, ray.actor.ActorHandle] = {}
-        # Map model_id -> Ray actor name registered in ModelActorInventory, used to keep
+        # Map model_id -> Ray actor name published in ModelActorSupervisor inventory, used to keep
         # actors marked as active during long-running calls (32k forward/backward).
         self._model_actor_supervisor_actor_names: dict[str, str] = {}
         self._actor_loaded_sessions: dict[str, str] = {}
@@ -2148,7 +2148,7 @@ class VerlTrainingEngine:
     def _touch_actor(self, session: "TrainingSession") -> None:
         """Update last_accessed timestamp and session for the session's actor.
 
-        ModelActorInventory idleness is time-based; a 32k forward/backward can easily run
+        Supervisor inventory idleness is time-based; a 32k forward/backward can easily run
         longer than the idle timeout. We keep actors marked as active while a
         request is in-flight to prevent eviction of busy actors.
         """
@@ -3156,7 +3156,7 @@ class VerlTrainingEngine:
         if session.backend != "peft":
             return worker
 
-        # Dense trainer can be evicted by ModelActorInventory between RL stages.
+        # Dense trainer can be evicted by supervisor inventory policy between RL stages.
         try:
             await async_get_ray_ref(worker.heartbeat.remote(), timeout_s=5)
             return worker
@@ -3407,7 +3407,7 @@ class VerlTrainingEngine:
         interval_s: float = 30.0,
         timeout_s: float | None = None,
     ):
-        """Await a Ray call while periodically touching ModelActorInventory.
+        """Await a Ray call while periodically touching supervisor inventory.
 
         Uses one Ray ObjectRef future so polling-slice timeouts do not cancel
         or restart the underlying Ray wait.

@@ -78,6 +78,7 @@ def test_core_service_no_legacy_names() -> None:
         "load_" + "tinker" + "_config_file",
         "Tinker" + "ConfigFile",
         "tinker" + "_vllm_",
+        "mint" + "_vllm" + "_server",
         "multinode" + "_vllm_",
         "peft" + "_trainer_",
         "tinker" + "_training_session_store",
@@ -119,6 +120,21 @@ def test_env_aliases_stay_in_compatibility_boundary() -> None:
             hits.append(rel)
 
     assert hits == []
+
+
+def test_vllm_requires_model_specific_actor_name() -> None:
+    from mint_server.backend.multi_lora_engine import MultiLoRAInferenceEngine, _model_to_actor_name
+
+    actor_name = _model_to_actor_name("Qwen/Qwen3-30B-A3B-Instruct-2507")
+    assert actor_name == "mint_vllm_qwen3-30b-a3b-instruct-2507"
+    assert actor_name != "mint" + "_vllm" + "_server"
+
+    try:
+        MultiLoRAInferenceEngine(model_path="/tmp/model")
+    except ValueError as exc:
+        assert "model-specific actor_name" in str(exc)
+    else:
+        raise AssertionError("MultiLoRAInferenceEngine must not create a default vLLM actor")
 
 
 def test_compat_uris_stay_in_compatibility_boundary() -> None:

@@ -49,7 +49,6 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
-_STARTUP_LEASE_ROLE = os.environ.get("MINT_STARTUP_LEASE_ROLE", "mint_api_startup_owner")
 _DISABLE_MINT_ROUTE = os.environ.get("MINT_DISABLE_MINT_ROUTE", "").strip().lower() in {
     "1",
     "true",
@@ -111,17 +110,35 @@ def _should_preload_openai_tokenizers() -> bool:
     return workers <= 1
 
 
-async def _cleanup_stale_actors() -> None:
-    try:
-        from .backend.actor_reconciliation import cleanup_stale_actors_once
+async def _check_startup_control_plane(*, maintenance_cron_local_only: bool) -> None:
+    from .backend.config_actor import async_ping as async_ping_config_actor
+    from .backend.maintenance_cron_actor import maintenance_cron_actor
+    from .backend.model_work_scheduler import model_work_scheduler
+    from .backend.task_state_store import task_futures, task_state_store
 
-        await cleanup_stale_actors_once()
-    except Exception as e:
+    checks: list[tuple[str, object]] = [
+        ("config_actor", async_ping_config_actor(timeout_s=5.0)),
+        ("task_state_store", task_state_store.async_ping(timeout_s=5.0)),
+        ("task_futures", task_futures.async_ping(timeout_s=5.0)),
+        ("model_work_scheduler", model_work_scheduler.async_ping(timeout_s=5.0)),
+    ]
+    if not maintenance_cron_local_only:
+        checks.append(("maintenance_cron_actor", maintenance_cron_actor.async_ping(timeout_s=5.0)))
+
+    failures: dict[str, str] = {}
+    for name, awaitable in checks:
+        try:
+            await awaitable  # type: ignore[misc]
+        except Exception as e:
+            failures[name] = f"{type(e).__name__}: {e}"
+
+    if failures:
         set_startup_degraded_state(
-            reason="startup_actor_cleanup_failed",
-            error=f"{type(e).__name__}: {e}",
+            reason="control_plane_unavailable",
+            error="one or more detached control-plane actors are unavailable",
+            details={"failures": failures},
         )
-        logger.error(f"Actor cleanup failed; healthz will be degraded: {type(e).__name__}: {e}")
+        logger.warning("Control-plane startup check degraded: %s", failures)
 
 
 async def _cancel_task(task: asyncio.Task | None) -> None:
@@ -192,7 +209,7 @@ def _clear_local_execution_route_globals() -> None:
     weights.inference_manager = None
 
 async def _restore_sampling_sessions(inference_manager: SessionManager) -> int:
-    """Restore detached sampling-session metadata into SessionManager."""
+    """Restore TaskStateStore-backed sampling-session metadata into SessionManager."""
     from .backend.sampling_session_store import async_list_sampling_sessions
 
     restored = 0
@@ -224,31 +241,10 @@ async def lifespan(app: FastAPI):
     # ==========================================================================
     clear_startup_degraded_state()
     clear_runtime_degraded_state()
-    from .backend.task_state_store import task_futures
-    from .backend.config_actor import async_ensure_started as async_ensure_config_actor_started
-    from .backend.gateway_session_store import ensure_ready as ensure_gateway_session_store_ready
     from .backend.maintenance_cron_actor import maintenance_cron_actor
-    from .backend.sampling_session_store import ensure_ready as ensure_sampling_session_store_ready
-    from .backend.session_heartbeat_store import session_heartbeat_store
-    from .backend.session_index_store import ensure_ready as ensure_session_index_store_ready
-    from .backend.startup_lease import acquire_startup_lease
-    from .backend.training_session_store import ensure_ready as ensure_training_session_store_ready
     from .config import RAY_NAMESPACE
 
     init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
-
-    startup_lease = await acquire_startup_lease(_STARTUP_LEASE_ROLE)
-    startup_owner = bool(startup_lease.is_owner)
-    startup_lease_task: asyncio.Task | None = None
-    if startup_owner and not startup_lease.local_only:
-        startup_lease_task = asyncio.create_task(startup_lease.heartbeat_loop())
-    logger.info(
-        "startup lease role=%s is_owner=%s local_only=%s owner_id=%s",
-        _STARTUP_LEASE_ROLE,
-        startup_owner,
-        startup_lease.local_only,
-        startup_lease.owner_id,
-    )
 
     maintenance_cron_local_only = os.environ.get("MINT_MAINTENANCE_CRON_LOCAL_ONLY", "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -257,18 +253,22 @@ async def lifespan(app: FastAPI):
     usage_store = await get_usage_store()
     if not await usage_store.health_check():
         raise RuntimeError("usage billing postgres health check failed")
-    if startup_owner:
-        await async_ensure_config_actor_started()
-        await task_futures.async_ensure_started()
-        ensure_gateway_session_store_ready()
-        ensure_sampling_session_store_ready()
-        session_heartbeat_store.ensure_ready()
-        ensure_session_index_store_ready()
-        ensure_training_session_store_ready()
+    await _check_startup_control_plane(maintenance_cron_local_only=maintenance_cron_local_only)
     if maintenance_cron_local_only:
         maintenance_cron = {"actor_name": "local_maintenance_cron_actor", "epoch_id": "local"}
     else:
-        maintenance_cron = await maintenance_cron_actor.async_ensure_started()
+        try:
+            maintenance_cron = await maintenance_cron_actor.async_health_snapshot(
+                timeout_s=5.0,
+                create_if_missing=False,
+            )
+        except Exception as e:
+            maintenance_cron = {"actor_name": "unavailable", "epoch_id": None}
+            set_runtime_degraded_state(
+                reason="maintenance_cron_actor_unavailable",
+                error=f"{type(e).__name__}: {e}",
+                details={},
+            )
 
     from .backend.action_session_manager import ActionSessionRouter
 
@@ -313,7 +313,10 @@ async def lifespan(app: FastAPI):
     async def _maintenance_cron_health_loop() -> None:
         while True:
             try:
-                snapshot = await maintenance_cron_actor.async_health_snapshot(timeout_s=10.0)
+                snapshot = await maintenance_cron_actor.async_health_snapshot(
+                    timeout_s=10.0,
+                    create_if_missing=False,
+                )
                 err = _maintenance_cron_health_error(snapshot)
                 if err is None:
                     clear_runtime_degraded_state()
@@ -334,7 +337,6 @@ async def lifespan(app: FastAPI):
     else:
         maintenance_cron_health_task = asyncio.create_task(_maintenance_cron_health_loop())
     ray_reconnect_watch_task: asyncio.Task | None = None
-    model_actor_supervisor_task: asyncio.Task | None = None
     last_ray_connection_epoch = ray_connection_epoch()
 
     inference_manager = None
@@ -344,19 +346,8 @@ async def lifespan(app: FastAPI):
 
     try:
         # ==========================================================================
-        # Cleanup: Kill stale actors from previous server runs
-        # ==========================================================================
-        if startup_owner:
-            if maintenance_cron_local_only:
-                await _cleanup_stale_actors()
-            else:
-                await maintenance_cron_actor.async_run_once("actor_reconciliation", timeout_s=60.0)
-        else:
-            logger.info("Skipping stale-actor cleanup on follower worker")
-
-        # ==========================================================================
         # Action route layer: process-local router can recover detached runtimes
-        # from ModelActorInventory metadata after API or worker restarts.
+        # from ModelActorSupervisor inventory metadata after API or worker restarts.
         # ==========================================================================
         action_sampling.action_session_manager = action_manager
         if mint is not None:
@@ -389,9 +380,6 @@ async def lifespan(app: FastAPI):
         # ==========================================================================
         # Persistent prewarm runs inside the execution runtime that owns training state.
         # ==========================================================================
-        if not startup_owner:
-            logger.info("Skipping execution-runtime prewarm on follower worker")
-
         # ==========================================================================
         # OpenAI compat: preload tokenizers only for single-worker startup.
         # Multi-worker preloading duplicates large tokenizer state in every API process
@@ -415,32 +403,18 @@ async def lifespan(app: FastAPI):
         # ==========================================================================
         # Model scheduler + runtime supervisors
         # ==========================================================================
-        from .backend.model_actor_supervisor import model_actor_supervisor
         from .backend.model_work_scheduler import model_work_scheduler
 
         logger.info("startup stage=before_model_work_scheduler_started")
-        await model_work_scheduler.stats(timeout_s=10.0)
+        try:
+            await model_work_scheduler.async_ping(timeout_s=5.0)
+        except Exception as e:
+            set_startup_degraded_state(
+                reason="model_work_scheduler_unavailable",
+                error=f"{type(e).__name__}: {e}",
+            )
+            logger.warning("Model work scheduler unavailable during API startup: %s: %s", type(e).__name__, e)
         logger.info("startup stage=after_model_work_scheduler_started")
-
-        if startup_owner and model_actor_supervisor.snapshot().get("desired_total", 0):
-            logger.info("startup stage=before_model_actor_supervisor_reconcile")
-            await model_actor_supervisor.reconcile_once()
-            logger.info("startup stage=after_model_actor_supervisor_reconcile")
-
-        async def _model_actor_supervisor_loop() -> None:
-            interval_s = float(os.environ.get("MINT_MODEL_ACTOR_SUPERVISOR_RECONCILE_INTERVAL_S", "5.0"))
-            while True:
-                await asyncio.sleep(max(1.0, interval_s))
-                try:
-                    if model_actor_supervisor.snapshot().get("desired_total", 0):
-                        await model_actor_supervisor.reconcile_once()
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    logger.exception("model actor supervisor reconcile failed")
-
-        if startup_owner and model_actor_supervisor.snapshot().get("desired_total", 0):
-            model_actor_supervisor_task = asyncio.create_task(_model_actor_supervisor_loop())
 
         async def _ray_reconnect_watch_loop() -> None:
             nonlocal last_ray_connection_epoch
@@ -457,16 +431,9 @@ async def lifespan(app: FastAPI):
                         "Ray connection epoch advanced to %s; refreshing detached control-plane handles",
                         current_epoch,
                     )
-                    await async_ensure_config_actor_started()
-                    await task_futures.async_ensure_started()
-                    ensure_gateway_session_store_ready()
-                    ensure_sampling_session_store_ready()
-                    session_heartbeat_store.ensure_ready()
-                    ensure_session_index_store_ready()
-                    ensure_training_session_store_ready()
-                    await model_work_scheduler.stats(timeout_s=10.0)
-                    if model_actor_supervisor.snapshot().get("desired_total", 0):
-                        await model_actor_supervisor.reconcile_once()
+                    await _check_startup_control_plane(
+                        maintenance_cron_local_only=maintenance_cron_local_only
+                    )
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -477,10 +444,7 @@ async def lifespan(app: FastAPI):
         stale_training_heartbeat_task = None
 
     except Exception:
-        await _cancel_task(model_actor_supervisor_task)
         await _cancel_task(ray_reconnect_watch_task)
-        await _cancel_task(startup_lease_task)
-        await startup_lease.release()
         if train_manager is not None:
             await _shutdown_local_training_runtime(train_manager)
         if inference_manager is not None:
@@ -496,11 +460,8 @@ async def lifespan(app: FastAPI):
     # Shutdown
     # ==========================================================================
     await _cancel_task(ray_reconnect_watch_task)
-    await _cancel_task(model_actor_supervisor_task)
     await _cancel_task(maintenance_cron_health_task)
     await _cancel_task(stale_training_heartbeat_task)
-    await _cancel_task(startup_lease_task)
-    await startup_lease.release()
     logger.info("Shutting down local runtime state")
 
     # Do not let an arbitrary API worker exit delete shared metadata or global actors.
@@ -550,6 +511,7 @@ _OTEL_EXCLUDE_NONE = os.environ.get("MINT_OTEL_EXCLUDE_NONE", "").strip().lower(
 _OTEL_EXCLUDED_PATHS: set[str] = set() if _OTEL_EXCLUDE_NONE else {
     "/api/v1/retrieve_future",
     "/api/v1/healthz",
+    "/api/v1/internal/healthz",
     "/api/v1/telemetry",
     "/api/v1/session_heartbeat",
     "/api/v1/internal/admission_stats",

@@ -83,14 +83,6 @@ def _post(base_url: str, path: str, headers: dict[str, str], payload: dict[str, 
     return out
 
 
-def _parse_server_time(health: dict[str, Any]) -> dt.datetime:
-    raw = str(health.get("timestamp") or "").strip()
-    if not raw:
-        raise ValueError(f"internal health missing timestamp: {health}")
-    # Example: 2026-03-05T16:29:08.544390+00:00
-    return dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
-
-
 def _create_sampling_session(
     *,
     base_url: str,
@@ -275,9 +267,7 @@ def main() -> None:
     )
 
     pre_summary = _get(base_url, f"/internal/usage_summary/{summary_account_id}", headers, timeout_s=float(args.timeout_s))
-    health = _get(base_url, "/internal/health", headers, timeout_s=float(args.timeout_s))
-    start_server_ts = _parse_server_time(health)
-    since_iso = _iso(start_server_ts - dt.timedelta(seconds=1))
+    since_iso = _iso(dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=1))
 
     session_id, sampling_session_id = _create_sampling_session(
         base_url=base_url,

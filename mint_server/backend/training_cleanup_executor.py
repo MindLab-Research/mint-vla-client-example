@@ -1,25 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import logging
 import os
 from typing import Any
 
-from ..config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources, otel_env_vars
-from ..ray_utils import register_ray_reconnect_invalidator as _register_ray_reconnect_invalidator
 from ..runtime_env import env_nonempty
 from .async_ray_control import async_get_ray_ref
 
 logger = logging.getLogger(__name__)
-_ACTOR_HANDLE = None
-
-def _reset_cached_actor_handle() -> None:
-    global _ACTOR_HANDLE
-    _ACTOR_HANDLE = None
-
-
-_register_ray_reconnect_invalidator(_reset_cached_actor_handle)
 
 
 def _ray_namespace() -> str:
@@ -34,10 +23,6 @@ def _ray_namespace() -> str:
         return "mint"
 
 
-def _actor_name() -> str:
-    return os.environ.get("MINT_TRAINING_CLEANUP_EXECUTOR_ACTOR_NAME", "mint_training_cleanup_executor")
-
-
 def _training_heartbeat_stale_timeout_s() -> float:
     raw = os.environ.get("MINT_TRAINING_HEARTBEAT_STALE_S", "300")
     try:
@@ -45,23 +30,6 @@ def _training_heartbeat_stale_timeout_s() -> float:
     except Exception:
         logger.warning("Invalid MINT_TRAINING_HEARTBEAT_STALE_S=%r; defaulting to 300s", raw)
         return 300.0
-
-
-async def _await_ray_ref(ref: Any) -> Any:
-    if hasattr(ref, "__await__"):
-        return await ref
-
-    to_future = getattr(ref, "future", None)
-    if callable(to_future):
-        fut = to_future()
-        if isinstance(fut, asyncio.Future):
-            return await fut
-        if isinstance(fut, concurrent.futures.Future):
-            return await asyncio.wrap_future(fut)
-        if hasattr(fut, "__await__"):
-            return await fut
-
-    raise TypeError(f"Ray ref is not awaitable: {type(ref)}")
 
 
 async def _delete_shared_worker_session(*, actor_name: str, namespace: str, model_id: str) -> None:
@@ -116,7 +84,7 @@ async def cleanup_stale_training_sessions_once_impl(*, stale_after_s: float | No
         infos = await async_list_training_sessions()
     except Exception as e:
         logger.warning(
-            "training cleanup executor skipped: failed to list detached training sessions: %s: %s",
+            "training cleanup executor skipped: failed to list TaskStateStore-backed training sessions: %s: %s",
             type(e).__name__,
             e,
         )
@@ -151,14 +119,14 @@ async def cleanup_stale_training_sessions_once_impl(*, stale_after_s: float | No
             )
             if failed_request_ids:
                 logger.warning(
-                    "[%s] failed pending training futures during detached cleanup (%s): request_ids=%s",
+                    "[%s] failed pending training futures during TaskStateStore-backed cleanup (%s): request_ids=%s",
                     model_id,
                     reason,
                     failed_request_ids,
                 )
         except Exception as e:
             logger.warning(
-                "[%s] detached training cleanup aborted because future fail failed (%s): %s: %s",
+                "[%s] TaskStateStore-backed training cleanup aborted because future fail failed (%s): %s: %s",
                 model_id,
                 reason,
                 type(e).__name__,
@@ -175,7 +143,7 @@ async def cleanup_stale_training_sessions_once_impl(*, stale_after_s: float | No
                     await _delete_shared_worker_session(actor_name=actor_name, namespace=namespace, model_id=model_id)
         except Exception as e:
             logger.warning(
-                "[%s] detached training cleanup actor actuation failed (%s): %s: %s",
+                "[%s] TaskStateStore-backed training cleanup actor actuation failed (%s): %s: %s",
                 model_id,
                 reason,
                 type(e).__name__,
@@ -186,7 +154,7 @@ async def cleanup_stale_training_sessions_once_impl(*, stale_after_s: float | No
             delete_training_session(model_id)
         except Exception as e:
             logger.warning(
-                "[%s] detached training cleanup store delete failed (%s): %s: %s",
+                "[%s] TaskStateStore-backed training cleanup store delete failed (%s): %s: %s",
                 model_id,
                 reason,
                 type(e).__name__,
@@ -207,7 +175,7 @@ async def cleanup_stale_training_sessions_once_impl(*, stale_after_s: float | No
 
         cleaned.append(model_id)
         logger.warning(
-            "[%s] detached training cleanup removed stale session: session_id=%s actor_name=%s allow_actor_shutdown=%s actor_refcount=%s",
+            "[%s] TaskStateStore-backed training cleanup removed stale session: session_id=%s actor_name=%s allow_actor_shutdown=%s actor_refcount=%s",
             model_id,
             session_id,
             actor_name or "<unknown>",
@@ -218,78 +186,9 @@ async def cleanup_stale_training_sessions_once_impl(*, stale_after_s: float | No
     return cleaned
 
 
-def _get_or_create_actor():
-    import ray
-
-    global _ACTOR_HANDLE
-    name = _actor_name()
-    namespace = _ray_namespace()
-    try:
-        _ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)
-        return _ACTOR_HANDLE
-    except ValueError:
-        pass
-
-    @ray.remote(num_cpus=0, max_concurrency=16)
-    class _TrainingCleanupExecutorActor:
-        async def cleanup_stale_sessions_once(self, stale_after_s: float | None = None) -> dict[str, Any]:
-            cleaned = await cleanup_stale_training_sessions_once_impl(stale_after_s=stale_after_s)
-            return {"cleaned": list(cleaned)}
-
-        def health_snapshot(self) -> dict[str, Any]:
-            return {
-                "actor_name": _actor_name(),
-                "namespace": _ray_namespace(),
-            }
-
-    options: dict[str, Any] = {
-        "name": name,
-        "namespace": namespace,
-        "lifetime": "detached",
-    }
-    apply_detached_actor_resources(options, ray)
-    options["runtime_env"] = actor_runtime_env(pythonpath=PFS_PYTHONPATH, extra=otel_env_vars())
-
-    try:
-        created = _TrainingCleanupExecutorActor.options(**options).remote()
-        _ACTOR_HANDLE = created
-        return _ACTOR_HANDLE
-    except Exception:
-        _ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)
-        return _ACTOR_HANDLE
-
-
 class TrainingCleanupExecutor:
-    def __init__(self) -> None:
-        self._ray_actor = None
-
-    def _get_ray_actor(self):
-        import ray
-
-        global _ACTOR_HANDLE
-        if self._ray_actor is not None:
-            return self._ray_actor
-        if _ACTOR_HANDLE is not None:
-            self._ray_actor = _ACTOR_HANDLE
-            return self._ray_actor
-        if not ray.is_initialized():
-            raise RuntimeError("Ray not initialized")
-        self._ray_actor = _get_or_create_actor()
-        return self._ray_actor
-
-    def ensure_ready(self) -> dict[str, Any]:
-        import ray
-
-        actor = self._get_ray_actor()
-        return ray.get(actor.health_snapshot.remote())
-
     async def async_cleanup_stale_sessions_once(self, *, stale_after_s: float | None = None) -> list[str]:
-        actor = self._get_ray_actor()
-        out = await _await_ray_ref(actor.cleanup_stale_sessions_once.remote(stale_after_s=stale_after_s))
-        if not isinstance(out, dict):
-            raise TypeError(f"TrainingCleanupExecutor returned non-dict: {type(out)}")
-        cleaned = out.get("cleaned") or []
-        return [str(model_id) for model_id in cleaned]
+        return await cleanup_stale_training_sessions_once_impl(stale_after_s=stale_after_s)
 
 
 training_cleanup_executor = TrainingCleanupExecutor()

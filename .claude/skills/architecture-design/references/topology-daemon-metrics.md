@@ -9,9 +9,16 @@ Mint needs a topology-aware control plane for two related concerns:
 2. Node-local observability should run as a per-node daemon actor and push
    metrics through OpenTelemetry.
 
-`ModelActorSupervisor` owns this reconciliation. It remains the single
-supervisor for long-lived Ray actors that Mint intentionally keeps alive, but it
-must keep model-runtime actors and daemon actors as separate scheduling classes.
+`ModelActorSupervisor` owns this reconciliation as a detached Ray actor. It is
+the single supervisor for long-lived Ray actors that Mint intentionally keeps
+alive, but it must keep model-runtime actors and daemon actors as separate
+scheduling classes.
+
+`MaintenanceCronActor` is not a reconciler. It owns cron-style jobs such as
+future reaping, checkpoint cleanup, and stale-session cleanup. It must not call
+`ModelActorSupervisor`, trigger reconcile, or own model/daemon reconciliation
+state. `ModelActorSupervisor` may manage the cron actor lifecycle; cron does not
+know about the supervisor.
 
 ## Non-goals
 
@@ -29,9 +36,9 @@ Node topology describes the cluster workers that Mint may target. V1 topology
 is an independent YAML file owned by deployment configuration, not a subsection
 of model config. The file path is provided by `MINT_TOPOLOGY_CONFIG_PATH`.
 
-- `alias`: stable name in the form `mint-worker-{idx}`, for example
-  `mint-worker-0`. The index is deployment-local and must not be reused for two
-  live nodes in the same topology generation.
+- `alias`: stable reusable name in the form `mint-worker-{idx}`, for example
+  `mint-worker-0`. The index is deployment-local and must not point at two live
+  provider tasks at the same time.
 - `node_ip`: Ray node IP.
 - `ray_node_id`: optional Ray node ID observed at runtime.
 - `provider`: explicit provider discriminator. V1 implementation may only
@@ -53,33 +60,51 @@ Example:
 version: 1
 deployment_env: prod
 cluster_id: volcano
+state_path: /vePFS-Mindverse/share/mint/prod/runtime/topology_state.yaml
+ray:
+  head_ip_path: /vePFS-Mindverse/share/mint/prod/ray/head-address/ray_head_ip.txt
+providers:
+  volcano:
+    submit_host: mint-prod-volcano
+    volc_bin: /root/.volc/bin/volc
+    templates:
+      a800-8gpu-c1:
+        template_path: /vePFS-Mindverse/share/mint/prod/mint-server/.claude/skills/volcano-cluster/configs/mint-prod-worker.yaml
+        resource_queue_id: q-20251126180002-26lwz
+        gpu_count: 8
 nodes:
-  - alias: mint-worker-0
-    provider: volc
-    role: gpu
-    enabled: true
-    gpu_count: 8
-    node_ip: 192.168.39.110
-    provider_identity:
-      worker_index: 0
-      resource_queue_id: q-example
-    labels:
-      pool: qwen
+  desired:
+    - alias: mint-worker-0
+      provider: volcano
+      template: a800-8gpu-c1
+      role: gpu
+      enabled: true
+      labels:
+        pool: qwen
 ```
 
-V1 reads this from a static config file and verifies it against `ray.nodes()`.
-The topology reader may mark nodes stale or unavailable, but it should not
-provision or tear down cloud nodes.
+V1 reads desired state from the static config file, then rebuilds runtime state
+from the provider and Ray. For Volcano, `providers.volcano.submit_host` lets the
+server run `volc ml_task list/logs/submit` on the configured bastion instead of
+requiring a local Volcano CLI. Ray liveness is observed from initialized
+`ray.nodes()` when available and from the Ray dashboard `/api/v0/nodes` using
+`ray.dashboard_url` or `ray.head_ip_path`.
 
-The future provider interface may expose operations like "request node from
-template" and "wait for node to join Ray", but those operations are not part of
-the first implementation. V1 topology is read-only from the server's
-perspective.
+`topology_state.yaml` is output-only debug/runtime state. The supervisor writes
+it atomically after each reconcile; it must not be used as startup recovery
+input. If a live provider task and alive Ray node already satisfy an alias, V1
+must reuse it and must not submit a duplicate worker. V1 is scale-up only and
+does not cancel or tear down disabled/removed cloud nodes automatically.
+
+Worker creation is ordered by the numeric suffix in `mint-worker-{idx}`. If a
+lower alias is missing or not ready, higher aliases are marked `waiting` with a
+clear `waiting for lower worker alias ...` reason in `topology_state.yaml`.
+This identifies the missing idx and avoids out-of-order resource acquisition.
 
 ### 2. Static Actor Placement
 
-Model runtime placement should become topology-aware. The target configuration
-references node aliases, not raw IPs:
+Model runtime placement is topology-aware. Preferred configuration references
+node aliases, not raw IPs:
 
 ```yaml
 models:
@@ -110,11 +135,10 @@ Accepted topology-aware placement keys:
 - `labels`: optional selector metadata for future placement policies.
 
 At runtime, the supervisor resolves the alias into `node_ip` and passes only the
-resolved placement to Ray launchers. The refactor target is to remove raw
-`node_ip` from internal placement. During migration, any old raw-IP placement
-parsing must be isolated at the config boundary and normalized immediately.
-After configs have moved to aliases, `node_ip` should be rejected in model
-placement config with a clear "use worker/worker_alias" error.
+resolved placement to Ray launchers. Raw-IP placement is allowed only as an
+explicit compatibility input at the config boundary. If the alias already exists
+and is an IP address, the supervisor treats that node as pre-existing, does not
+create a cloud worker for it, and records the resolved state for debugging.
 
 The normalized internal form is:
 
@@ -126,14 +150,14 @@ ResolvedPlacement(
 )
 ```
 
-Implementation migration points:
+Current implementation requirements:
 
-- `ModelActorSpec` and placement parsing must accept alias fields and stop
-  treating `worker`, `worker_idx`, or `worker_index` as raw runtime pins.
+- `ModelActorSpec` and placement parsing accept alias fields and normalize raw-IP
+  compatibility input at the config boundary.
 - `volc_placement`, dense launchers, vLLM launchers, and Megatron launchers
-  should receive resolved node placements, not parse topology themselves.
-- Shared dev/prod config must be updated before raw `node_ip` rejection is
-  enforced.
+  receive resolved node placements and do not parse topology themselves.
+- Raw `node_ip` placement remains a compatibility/pre-existing-node input; new
+  configs should use `worker` or `worker_alias`.
 
 Static placement still applies to model-runtime actors only. Those actors are
 registered with `ModelWorkScheduler` as replicas and may consume scheduler
@@ -154,19 +178,39 @@ Dynamic placement V1 supports only a DaemonSet policy:
 
 The first daemon actor is `NodeMetricsCollectorActor`.
 
+Node metrics daemon actors are enabled by default. Set
+`MINT_NODE_METRICS_DAEMON_ENABLED=0` only for emergency rollback or isolated
+tests. When disabled, topology and model placement still reconcile but no
+daemon actors are created. Actor names are stable:
+`mint_daemon_node_metrics_{worker_alias}`.
+
 Daemon actors are not model replicas. They must not be registered with
 `ModelWorkScheduler`, must not have queue IDs, and must not participate in task
 claiming.
 
 ## ModelActorSupervisor Shape
 
-`ModelActorSupervisor` should own both scheduling classes:
+`ModelActorSupervisor` is a detached actor. External operations bootstrap only
+`mint_config`, then `mint_model_actor_supervisor`, then API workers. The
+supervisor ensures the remaining CPU control-plane actors and all desired
+runtime/daemon actors.
+
+API processes, route handlers, and backend launchers must access it through a
+client facade instead of importing a process-local singleton as an authority.
+API clients may read/check supervisor state and may send fire-and-forget nudges,
+but they must not ensure, create, or wait for supervisor reconciliation. A nudge
+asks the supervisor to run a fast ensure pass for a desired domain. If the
+supervisor is already reconciling, the nudge should return immediately without
+starting duplicate work. Cron jobs must not call supervisor APIs.
+
+It owns both scheduling classes:
 
 ```python
 ModelActorSupervisor
   - model_specs: dict[(domain_key, replica_id), ModelActorSpec]
   - daemon_specs: dict[name, DaemonActorSpec]
   - topology: ClusterTopology
+  - inventory: ModelActorInventoryState
 ```
 
 Hard implementation invariants:
@@ -182,6 +226,33 @@ Hard implementation invariants:
   `/internal/actors` admin behavior.
 - Daemon snapshot/admin state lives under the supervisor's separate
   `daemons` snapshot.
+- `ModelActorInventory` state is owned by the detached supervisor. API
+  processes may cache actor handles, but cached process-local inventory must not
+  be treated as authoritative.
+- OpenPI runtime actors are model/runtime actors for supervisor purposes. OpenPI
+  shared runtime actors are durable model/runtime actors and must publish
+  lifecycle, session binding, node placement, and GPU metadata through the
+  supervisor contract instead of maintaining an independent runtime registry.
+  Per-action-session named actors are not the target durable shape; migrate them
+  into shared runtime sessions or keep them short-lived and outside scheduler
+  leases.
+- Supervisor owns operational/live state such as runtime health, actor handles,
+  node placement, session binding, and inflight/protection metadata. User and
+  business metadata such as task results, session indexes, heartbeats, and
+  gateway routing belongs in `TaskStateStore`.
+- Supervisor state storage must support memory-only and SQLite modes. The
+  SQLite DB path defaults to
+  `/vePFS-Mindverse/share/mint/<env>/runtime/supervisor_state.sqlite3` and may
+  be overridden by `MINT_SUPERVISOR_STATE_DB_PATH`. The SQLite store is internal
+  to `ModelActorSupervisor` and stores operational state needed for reconcile
+  continuity; it is not a business metadata store and it must not make
+  `ModelWorkScheduler` depend on `TaskStateStore`.
+- `ModelWorkScheduler` may accept work for desired domains before a healthy
+  replica exists. Such work remains pending until supervisor registers a healthy
+  replica, bounded by request/task TTL. Preserve Tinker async semantics: clients
+  keep polling `retrieve_future` and receive HTTP 408 while the task is pending.
+  Durable pending/result/tombstone TTLs are enforced by the async future reaper;
+  scheduler lease TTLs remain separate and only protect ownership recovery.
 
 `reconcile_once()` should run in this order:
 
@@ -191,6 +262,50 @@ Hard implementation invariants:
 4. sync model runtime replicas to `ModelWorkScheduler`
 
 Only model runtime actors are synced to the scheduler.
+
+The supervisor does not watch config files. External operations own reload or
+restart. After reload/restart, the supervisor still performs reconciliation from
+the current config, topology, provider state, Ray live state, and runtime actor
+health.
+
+The first supervisor storage implementation should include memory-only and
+SQLite modes. On vePFS, prefer conservative SQLite journaling such as DELETE or
+TRUNCATE with `synchronous=NORMAL`; do not enable WAL unless explicitly
+configured and validated for the deployment filesystem. The SQLite schema should
+stay small: `kv`, `owner`, and bounded `events`. `owner` records must include
+`owner_id`, `epoch`, `started_at`, `last_heartbeat_at`, `lease_until`, and
+`schema_version` so future HA work has a fencing boundary from the first
+version.
+`ModelWorkScheduler` owns hot scheduling state and must not use
+`TaskStateStore` as scheduling authority or lifecycle owner. It may depend on
+`TaskStateStore` for durable task admission, lease persistence, indexes, and
+recovery.
+
+API health contract:
+
+- `/api/v1/healthz`: external business health. It is cached per API worker for
+  30s and checks only `mint_model_work_scheduler` and `mint_task_state_store`.
+  Dirty cache refresh is single-flight; concurrent calls wait up to 5s total.
+  Underlying scheduler/task-store pings must use shorter timeouts inside that
+  budget. Initial no-cache requests use the same limit. A dirty previous value
+  is invalid if refresh fails. Responses are only
+  `{"status":"ready"}` with HTTP 200 or `{"status":"unhealthy"}` with HTTP 503.
+  Do not expose supervisor, cron, actor, Ray, or degraded details here.
+- `/api/v1/internal/healthz`: internal operations health. It reads the current
+  `mint_model_actor_supervisor` summary snapshot plus process-local
+  maintenance-cron/startup degraded markers, returning ready/degraded/unhealthy
+  with a deliberately small component summary. It must not fan out to every
+  runtime actor on request and must not synthesize scheduler/task/topology/reaper
+  inventories. Missing `mint_model_actor_supervisor` is unhealthy. A supervisor
+  snapshot whose `snapshot_generated_at`, `observed_at`, or topology
+  `observed_at` timestamp is older than 60s is degraded; do not use
+  `last_reconcile_at` as the snapshot-staleness clock. Missing or degraded
+  `mint_maintenance_cron` is degraded.
+
+Health metrics:
+
+- `mint_public_healthz_cache_age_seconds`
+- `mint_public_healthz_refresh_total{result="ready|unhealthy|timeout|error"}`
 
 The supervisor snapshot should expose daemon state separately:
 
@@ -212,16 +327,16 @@ The supervisor snapshot should expose daemon state separately:
 
 ## Deployment Labels and OTel Resource Attributes
 
-All API processes, model runtime actors, and daemon actors must receive these
-deployment labels:
+All production API processes, model runtime actors, and daemon actors should
+receive these deployment labels from environment or runtime config:
 
 - `MINT_DEPLOYMENT_ENV`: `dev` or `prod`.
 - `MINT_CLUSTER_ID`: `volcano` or `aliyun`. This is the stable Mint cluster
   family label; provider-specific values such as `volc`, `pai`, or DLC job
   names stay in topology metadata and must not replace this label.
 
-They must be forwarded into Ray actor runtime environments and attached to OTel
-resource attributes/metric attributes:
+When present, they are forwarded into Ray actor runtime environments and attached
+to OTel resource attributes/metric attributes:
 
 - `deployment.env` from `MINT_DEPLOYMENT_ENV`
 - `mint.cluster_id` from `MINT_CLUSTER_ID`
@@ -230,9 +345,10 @@ resource attributes/metric attributes:
 The API server service name is `mint-server`. The node metrics daemon service
 name is `mint-node-metrics`. New service names must use the `mint-*` namespace.
 
-`MINT_DEPLOYMENT_ENV` and `MINT_CLUSTER_ID` are part of metric identity. They
-must be present on node metrics, actor binding facts, and supervisor lifecycle
-metrics so dev/prod and Volcano/Aliyun data never join accidentally.
+`MINT_DEPLOYMENT_ENV` and `MINT_CLUSTER_ID` are part of metric identity for
+production deployments. Missing labels are omitted rather than filled with
+untrusted defaults; deployment wiring should set them so dev/prod and
+Volcano/Aliyun data never join accidentally.
 
 ## Actor Naming
 
@@ -246,8 +362,10 @@ Canonical GPU actor names:
 - Megatron: `mint_megatron_{model_slug}`
 - Dense trainer: `mint_dense_{model_slug}`
 - OpenPI shared runtime: `mint_openpi_shared_{pool_slug_or_hash}`
-- OpenPI action/session runtime: `mint_openpi_action_{hash}`; this is
-  session-scoped and must not be treated as a low-cardinality metrics label.
+- OpenPI action/session runtime: prefer shared-runtime logical sessions. If
+  `mint_openpi_action_{hash}` remains as a compatibility path, it is
+  session-scoped and must not be treated as durable low-cardinality model
+  capacity.
 
 Canonical daemon actor names:
 
@@ -255,7 +373,15 @@ Canonical daemon actor names:
 
 Canonical supervisor wrapper names, if the wrapper actor remains necessary:
 
-- Model runtime wrapper: `mint_runtime_{backend}_{model_slug}_{replica_id}`
+- Model runtime wrapper: `mint_model_runtime_{backend}_{model_slug}_{replica_id}`
+
+The topology/daemon design introduces only the node metrics daemon actor. Other
+detached control-plane actors such as `mint_task_state_store`,
+`mint_model_work_scheduler`, `mint_config`, `mint_model_actor_supervisor`, and
+`mint_maintenance_cron` are pre-existing durable control-plane state and should
+not be counted as topology daemon actors. Session/index/heartbeat/gateway
+metadata lives under `mint_task_state_store`; do not reintroduce separate
+session metadata-store actors, cleanup-executor actors, or startup-lease actors.
 
 Do not include these in detached actor names:
 
@@ -294,13 +420,16 @@ Required behavior:
 
 - exporter failure must not kill the actor
 - missing NVML/nvidia-smi marks collector degraded but keeps the loop alive
-- collection interval defaults to 5 seconds
-- `health_snapshot()` reports last successful sample time, last error, sample
-  count, node identity, and exporter status
-- `health_snapshot()` includes `last_sample_success_at`,
-  `last_export_success_at`, `last_export_error`,
-  `export_consecutive_failures`, `sampling_loop_alive`, and `collector_state`
-- `shutdown()` stops the sampling loop and flushes OTel best-effort
+- OTel push is the default metrics path when `OTEL_EXPORTER_OTLP_ENDPOINT` is
+  set; exporter setup failure is recorded in `health_snapshot()` and does not
+  block startup
+- `health_snapshot()` reports sample time, last error, sample count, node
+  identity, and exporter status
+- `sample_cached()` returns the recent cached sample when fresh and may perform
+  an on-demand refresh when the cache is stale; the background loop remains the
+  normal producer
+- `shutdown()` stops the sampling loop and flushes OTel providers best-effort;
+  flush failure must not make shutdown fail
 
 Exporter failure is not a supervisor restart condition. It marks the collector
 as degraded because an unavailable OTel backend also prevents export-error
@@ -320,8 +449,7 @@ actor correlation is unavailable; degrade to node/worker-level observability
 instead of guessing from GPU index or PID.
 
 - `mint_node_gpu_present`
-- `mint_node_gpu_utilization_ratio`
-- `mint_node_gpu_memory_utilization_ratio`
+- `mint_node_gpu_utilization_percent`
 - `mint_node_gpu_memory_used_bytes`
 - `mint_node_gpu_memory_total_bytes`
 - `mint_node_gpu_power_draw_watts`
@@ -360,7 +488,7 @@ Emit per `deployment.env`, `mint.cluster_id`, and `worker_alias`. `node_ip` and
 dashboard grouping because they can churn across cluster recreates.
 
 - `mint_node_cpu_utilization_ratio`
-- `mint_node_load1`
+- `mint_node_load_1m`
 - `mint_node_load5`
 - `mint_node_load15`
 - `mint_node_memory_used_bytes`
@@ -372,11 +500,14 @@ dashboard grouping because they can churn across cluster recreates.
 - `mint_node_metrics_collector_sample_duration_ms`
 - `mint_node_metrics_collector_errors_total`
 
-The disk path defaults to `/share/mint` and should be configurable.
+The disk usage sampling path defaults to `/vePFS-Mindverse/share/mint/<env>`
+when `MINT_DEPLOYMENT_ENV` is set, otherwise `/vePFS-Mindverse/share/mint`.
+Override it with `MINT_NODE_METRICS_DISK_PATH` for local development or
+specialized mounts.
 
 ## Actor Correlation
 
-Actor-to-GPU correlation stays in `ModelActorInventory`:
+Actor-to-GPU correlation stays in supervisor-owned inventory:
 
 - model actors publish `gpu_bindings`
 - each binding should include `gpu_uuid` when possible
@@ -464,17 +595,4 @@ only.
 
 ## Open Decisions Before Implementation
 
-- Exact static topology file path and schema ownership.
-- Whether topology-aware placement rejects raw `node_ip` immediately or after a
-  short config migration commit.
-- Whether worker alias should be emitted as `worker` or `worker_alias` label;
-  prefer `worker_alias` for clarity.
-- Daemon feature flag and rollout default.
-- Daemon actor naming and generation policy.
-- Exact daemon state/admin surface under `ModelActorSupervisor`.
-- OTel no-op behavior when exporter env or Python dependencies are missing.
-- Provider fields required in V1 for Volc and PAI static topology.
-- Alias uniqueness and conflict behavior when Ray reports duplicate/stale nodes.
-- Topology hot reload behavior and whether config changes require supervisor
-  restart.
 - Metric label cardinality budgets per backend.

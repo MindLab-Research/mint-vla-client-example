@@ -76,9 +76,9 @@ Observed successful cold-start reference:
 
 If cold-start regresses, inspect in this order:
 
-1. `startup_lease`
-2. `task_state_store`
-3. `sampling_session_store`, `session_heartbeat_store`, `session_index_store`, `training_session_store`
+1. `mint_config`
+2. `mint_model_actor_supervisor`
+3. `task_state_store` / `TaskStateStore` session, index, heartbeat, gateway, and future methods
 4. `maintenance_cron_actor`
 5. `model_work_scheduler`
 6. `mint_model_runtime_*`

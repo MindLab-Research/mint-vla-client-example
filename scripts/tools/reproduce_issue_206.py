@@ -1,35 +1,17 @@
 import os
 import sys
+import asyncio
 import uuid
-from typing import Any
 
-import requests
-
-
-BASE_URL = os.environ.get("MINT_BASE_URL", "http://localhost:8000").rstrip("/")
-API_KEY = os.environ.get("MINT_API_KEY", "dummy")
 
 RAY_NAMESPACE = os.environ.get("MINT_RAY_NAMESPACE", "").strip()
 
 PG_BUNDLE_COUNT = os.environ.get("MINT_REPRO_PG_BUNDLE_COUNT", "").strip()
 
 
-def _headers() -> dict[str, str]:
-    return {"X-API-Key": API_KEY} if API_KEY else {}
-
-
 def _fail(msg: str) -> int:
     print(f"FAIL: {msg}", file=sys.stderr)
     return 1
-
-
-def _get_json(url: str, *, timeout_s: float) -> tuple[int, dict[str, Any] | None, str]:
-    resp = requests.get(url, headers=_headers(), timeout=timeout_s)
-    try:
-        data = resp.json()
-    except Exception:
-        data = None
-    return resp.status_code, data, resp.text
 
 
 def main() -> int:
@@ -87,16 +69,13 @@ def main() -> int:
         if state in ("CREATED", "REMOVED"):
             return _fail(f"Expected placement group to be pending, got state={state!r}")
 
-        code, data, text = _get_json(f"{BASE_URL}/internal/healthz/deep", timeout_s=10.0)
-        if code != 200:
-            return _fail(f"internal deep health returned {code}, expected 200. body={text[:400]!r}")
-        if not isinstance(data, dict) or data.get("status") != "ready":
-            return _fail(f"internal deep health returned unexpected json: {data!r}")
-        obs = data.get("ray_observation")
+        from mint_server.backend.async_ray_control import async_pending_gpu_pg_observation
+
+        obs = asyncio.run(async_pending_gpu_pg_observation(timeout_s=10.0))
         if not isinstance(obs, dict):
-            return _fail(f"internal deep health missing ray_observation: {data!r}")
+            return _fail(f"pending placement-group observation missing: {obs!r}")
         if obs.get("reason") != "pending_placement_groups":
-            return _fail(f"internal deep health unexpected reason: {obs.get('reason')!r} body={data!r}")
+            return _fail(f"pending placement-group observation unexpected reason: {obs.get('reason')!r} body={obs!r}")
 
         print("PASS")
         return 0

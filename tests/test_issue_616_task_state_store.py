@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from mint_server.backend.task_state_store import (
     TaskStateConflictError,
+    TaskFutureService,
     TaskStateStore,
     _TaskStateStoreActor,
 )
@@ -408,6 +411,83 @@ def test_finalize_failure_records_terminal_error() -> None:
         store.close()
 
 
+def test_task_state_store_reaper_expires_pending_payloads_and_tombstones() -> None:
+    store = TaskStateStore.in_memory()
+    try:
+        store.ensure_task(
+            request_id="pending-old",
+            op="sampling.asample",
+            domain_key="vllm:test",
+            request_json=b"{}",
+            status="pending",
+            now=100.0,
+        )
+        store.ensure_task(
+            request_id="queued-old",
+            op="sampling.asample",
+            domain_key="vllm:test",
+            request_json=b"{}",
+            status="queued",
+            now=101.0,
+        )
+        store.ensure_task(
+            request_id="assigned-old",
+            op="sampling.asample",
+            domain_key="vllm:test",
+            request_json=b"{}",
+            status="assigned",
+            now=102.0,
+        )
+        store.ensure_task(
+            request_id="running-old",
+            op="sampling.asample",
+            domain_key="vllm:test",
+            request_json=b"{}",
+            status="running",
+            now=100.0,
+        )
+        expired = store.expire_active_tasks(older_than_s=10.0, now=200.0, limit=1000)
+        assert expired == ["pending-old", "queued-old", "assigned-old"]
+        assert store.get_task("pending-old")["status"] == "expired"
+        assert store.get_task("queued-old")["status"] == "expired"
+        assert store.get_task("assigned-old")["status"] == "expired"
+        assert store.get_task("running-old")["status"] == "running"
+
+        store.ensure_task(
+            request_id="done-old",
+            op="sampling.asample",
+            domain_key="vllm:test",
+            request_json=b"{}",
+            status="pending",
+            now=10.0,
+        )
+        store.complete_task_success(
+            request_id="done-old",
+            result_path="/tmp/done-old.json",
+            result_checksum="sha256:abc",
+            result_size_bytes=12,
+            metadata={"done_at": 20.0},
+            now=20.0,
+        )
+        payloads = store.list_terminal_payloads_for_eviction(older_than_s=100.0, now=200.0, limit=1000)
+        assert [record["request_id"] for record in payloads] == ["done-old"]
+        marked = store.mark_payload_evicted(
+            request_id="done-old",
+            expected_result_path="/tmp/done-old.json",
+            now=201.0,
+        )
+        assert marked["record"]["result_path"] is None
+        assert marked["record"]["metadata"]["payload_evicted_at"] == 201.0
+
+        assert store.delete_expired_tombstones(older_than_s=1000.0, now=300.0, limit=1000) == []
+        deleted = store.delete_expired_tombstones(older_than_s=100.0, now=200.0, limit=1000)
+        assert deleted == ["done-old"]
+        with pytest.raises(KeyError):
+            store.get_task("done-old")
+    finally:
+        store.close()
+
+
 def test_expired_leases_include_finalizing_deadline() -> None:
     store = TaskStateStore.in_memory()
     try:
@@ -461,3 +541,277 @@ def test_task_state_store_actor_uses_single_db_path(tmp_path) -> None:
         assert [record["request_id"] for record in reopened.list_active_tasks()] == ["req-actor"]
     finally:
         reopened.close()
+
+
+def test_task_state_store_owns_sampling_session_metadata() -> None:
+    store = TaskStateStore.in_memory()
+    try:
+        store.upsert_sampling_session(
+            session_id="sampler-a",
+            info={
+                "session_id": "sampler-a",
+                "base_model": "Qwen/Test",
+                "last_activity": 100.0,
+                "metadata_version": 3,
+            },
+        )
+        stale = {
+            "session_id": "sampler-a",
+            "base_model": "stale",
+            "last_activity": 120.0,
+            "metadata_version": 2,
+        }
+        store.upsert_sampling_session(session_id="sampler-a", info=stale)
+
+        info = store.get_sampling_session(session_id="sampler-a")
+        assert info is not None
+        assert info["base_model"] == "Qwen/Test"
+        assert info["last_activity"] == 120.0
+        assert store.set_sampling_session_last_activity(session_id="sampler-a", last_activity=130.0) == 130.0
+        assert store.list_sampling_sessions()[0]["last_activity"] == 130.0
+
+        store.delete_sampling_session(session_id="sampler-a")
+        assert store.get_sampling_session(session_id="sampler-a") is None
+    finally:
+        store.close()
+
+
+def test_task_state_store_owns_session_and_sampler_indices() -> None:
+    store = TaskStateStore.in_memory()
+    try:
+        store.upsert_session_index(
+            session_id="root-session",
+            info={"session_id": "root-session", "user_id": "owner-a"},
+        )
+        store.add_training_run_to_session_index(
+            session_id="root-session",
+            training_run_id="train-1",
+            user_id="owner-b",
+            created_at="2026-04-01T00:00:00",
+        )
+        store.add_training_run_to_session_index(session_id="root-session", training_run_id="train-1")
+        store.add_sampler_to_session_index(session_id="root-session", sampler_id="sampler-a")
+        store.add_heartbeat_sampler_to_session_index(session_id="root-session", sampler_id="sampler-b")
+
+        index = store.get_session_index(session_id="root-session")
+        assert index is not None
+        assert index["user_id"] == "owner-a"
+        assert index["training_run_ids"] == ["train-1"]
+        assert index["sampler_ids"] == ["sampler-a", "sampler-b"]
+        assert index["heartbeat_sampler_ids"] == ["sampler-b"]
+
+        store.upsert_sampler_index(sampler_id="sampler-b", info={"sampler_id": "sampler-b", "session_id": "root-session"})
+        assert store.get_sampler_index(sampler_id="sampler-b") == {
+            "sampler_id": "sampler-b",
+            "session_id": "root-session",
+        }
+
+        store.remove_sampler_from_session_index(session_id="root-session", sampler_id="sampler-b")
+        assert store.get_session_index(session_id="root-session")["sampler_ids"] == ["sampler-a"]
+        assert store.get_session_index(session_id="root-session")["heartbeat_sampler_ids"] == []
+
+        store.delete_sampler_index(sampler_id="sampler-b")
+        assert store.get_sampler_index(sampler_id="sampler-b") is None
+    finally:
+        store.close()
+
+
+def test_task_state_store_owns_session_heartbeats() -> None:
+    store = TaskStateStore.in_memory()
+    try:
+        store.update_session_heartbeat(session_id="session-old", now=10.0)
+        store.update_session_heartbeat(session_id="session-fresh", now=100.0)
+
+        assert store.session_heartbeat_size() == 2
+        assert store.get_session_heartbeat(session_id="session-old") == 10.0
+        assert store.is_session_heartbeat_stale(session_id="session-old", ttl_s=50.0, now=100.0) is True
+        assert store.is_session_heartbeat_stale(session_id="missing", ttl_s=50.0, now=100.0) is False
+
+        assert store.prune_session_heartbeats(max_age_s=50.0, now=100.0) == 1
+        assert store.get_session_heartbeat(session_id="session-old") is None
+        assert store.delete_session_heartbeat(session_id="session-fresh") is True
+        assert store.session_heartbeat_size() == 0
+    finally:
+        store.close()
+
+
+def test_task_state_store_owns_training_session_metadata() -> None:
+    store = TaskStateStore.in_memory()
+    try:
+        store.upsert_training_session(
+            model_id="model-a",
+            info={
+                "model_id": "model-a",
+                "session_id": "session-a",
+                "current_step": 3,
+                "last_activity": 100.0,
+                "metadata_version": 3,
+            },
+        )
+        store.upsert_training_session(
+            model_id="model-a",
+            info={
+                "model_id": "model-a",
+                "session_id": "stale",
+                "current_step": 5,
+                "last_activity": 120.0,
+                "metadata_version": 2,
+            },
+        )
+
+        info = store.get_training_session(model_id="model-a")
+        assert info is not None
+        assert info["session_id"] == "session-a"
+        assert info["current_step"] == 5
+        assert info["last_activity"] == 120.0
+        assert store.bump_training_session_step(model_id="model-a") == 6
+        assert store.set_training_session_step(model_id="model-a", step=4) == 6
+        assert store.set_training_session_last_activity(model_id="model-a", last_activity=130.0) == 130.0
+        assert store.list_training_sessions()[0]["current_step"] == 6
+
+        store.delete_training_session(model_id="model-a")
+        assert store.get_training_session(model_id="model-a") is None
+    finally:
+        store.close()
+
+
+def test_task_state_store_owns_gateway_routes() -> None:
+    store = TaskStateStore.in_memory()
+    try:
+        store.upsert_gateway_sampling_session(
+            sampling_session_id="sampler-a",
+            upstream_alias="mint-prod-aliyun",
+            base_model="Qwen/Test",
+        )
+        store.upsert_gateway_training_model(
+            model_id="model-a",
+            upstream_alias="mint-prod-aliyun",
+            base_model="Qwen/Test",
+            owner_id="owner-a",
+        )
+
+        assert store.get_gateway_sampling_session(sampling_session_id="sampler-a") == {
+            "upstream_alias": "mint-prod-aliyun",
+            "base_model": "Qwen/Test",
+        }
+        assert store.get_gateway_training_model(model_id="model-a") == {
+            "upstream_alias": "mint-prod-aliyun",
+            "base_model": "Qwen/Test",
+            "owner_id": "owner-a",
+        }
+        snapshot = store.list_gateway_routes()
+        assert sorted(snapshot) == ["sampling_sessions", "training_models"]
+
+        store.delete_gateway_sampling_session(sampling_session_id="sampler-a")
+        store.delete_gateway_training_model(model_id="model-a")
+        assert store.get_gateway_sampling_session(sampling_session_id="sampler-a") is None
+        assert store.get_gateway_training_model(model_id="model-a") is None
+    finally:
+        store.close()
+
+
+def test_task_state_store_actor_exposes_session_metadata_methods(tmp_path) -> None:
+    actor = _TaskStateStoreActor(str(tmp_path / "task_state.sqlite3"))
+    try:
+        actor.upsert_sampling_session(session_id="sampler-a", info={"session_id": "sampler-a"})
+        assert actor.get_sampling_session(session_id="sampler-a")["session_id"] == "sampler-a"
+
+        actor.upsert_training_session(model_id="model-a", info={"model_id": "model-a"})
+        assert actor.get_training_session(model_id="model-a")["model_id"] == "model-a"
+
+        actor.upsert_gateway_sampling_session(
+            sampling_session_id="sampler-a",
+            upstream_alias="upstream-a",
+            base_model="Qwen/Test",
+        )
+        assert actor.get_gateway_sampling_session(sampling_session_id="sampler-a")["upstream_alias"] == "upstream-a"
+
+        actor.add_heartbeat_sampler_to_session_index(session_id="root-session", sampler_id="sampler-a")
+        assert actor.get_session_index(session_id="root-session")["heartbeat_sampler_ids"] == ["sampler-a"]
+
+        actor.update_session_heartbeat(session_id="root-session", now=12.0)
+        assert actor.get_session_heartbeat(session_id="root-session") == 12.0
+    finally:
+        actor.close()
+
+
+def test_task_future_service_reaper_retries_payload_delete_failures(tmp_path, monkeypatch) -> None:
+    from mint_server import config as config_module
+
+    store = TaskStateStore.in_memory()
+
+    class _FailingPayloadStore:
+        async def async_delete_json_payload(self, *, path):
+            raise RuntimeError("delete failed")
+
+    class _WorkingPayloadStore:
+        async def async_delete_json_payload(self, *, path):
+            from pathlib import Path
+
+            Path(path).unlink()
+            return True
+
+    class _LocalTaskStateClient:
+        async def async_ensure_task(self, **kwargs):
+            return store.ensure_task(**kwargs)
+
+        async def async_complete_task_success(self, **kwargs):
+            return store.complete_task_success(**kwargs)
+
+        async def async_expire_active_tasks(self, **kwargs):
+            return store.expire_active_tasks(**kwargs)
+
+        async def async_list_terminal_payloads_for_eviction(self, **kwargs):
+            return store.list_terminal_payloads_for_eviction(**kwargs)
+
+        async def async_mark_payload_evicted(self, **kwargs):
+            return store.mark_payload_evicted(**kwargs)
+
+        async def async_delete_expired_tombstones(self, **kwargs):
+            return store.delete_expired_tombstones(**kwargs)
+
+        async def async_record_payload_evict_error(self, **kwargs):
+            return store.record_payload_evict_error(**kwargs)
+
+    try:
+        store.ensure_task(
+            request_id="req-fail-delete",
+            op="sampling.asample",
+            domain_key="vllm:test",
+            request_json=b"{}",
+            status="pending",
+            now=1.0,
+        )
+        result_path = tmp_path / "payload.json"
+        result_path.write_text("{}", encoding="utf-8")
+        store.complete_task_success(
+            request_id="req-fail-delete",
+            result_path=str(result_path),
+            result_checksum="sha256:abc",
+            result_size_bytes=2,
+            metadata={"done_at": 10.0},
+            now=10.0,
+        )
+        monkeypatch.setattr(config_module.config, "task_pending_ttl_s", 86400.0, raising=False)
+        monkeypatch.setattr(config_module.config, "task_result_ttl_s", 1.0, raising=False)
+        monkeypatch.setattr(config_module.config, "task_tombstone_ttl_s", 10**12, raising=False)
+
+        service = TaskFutureService(task_state_client=_LocalTaskStateClient(), payload_store=_FailingPayloadStore())
+        out = asyncio.run(service.async_reap())
+
+        assert out["payload_evicted"] == []
+        assert out["payload_evict_errors"][0]["request_id"] == "req-fail-delete"
+        record = store.get_task("req-fail-delete")
+        assert record["result_path"] == str(result_path)
+        assert "payload_evicted_at" not in record["metadata"]
+
+        service = TaskFutureService(task_state_client=_LocalTaskStateClient(), payload_store=_WorkingPayloadStore())
+        out = asyncio.run(service.async_reap())
+
+        assert out["payload_evicted"] == ["req-fail-delete"]
+        record = store.get_task("req-fail-delete")
+        assert record["result_path"] is None
+        assert record["metadata"]["payload_evicted_at"] > 0
+        assert not result_path.exists()
+    finally:
+        store.close()

@@ -1,27 +1,16 @@
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import logging
 import os
 import shutil
 import time
 from typing import Any
 
-from ..config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources, otel_env_vars
-from ..ray_utils import register_ray_reconnect_invalidator as _register_ray_reconnect_invalidator
 from ..runtime_env import env_nonempty
 from .async_ray_control import async_get_ray_ref
 
 logger = logging.getLogger(__name__)
-_ACTOR_HANDLE = None
-
-def _reset_cached_actor_handle() -> None:
-    global _ACTOR_HANDLE
-    _ACTOR_HANDLE = None
-
-
-_register_ray_reconnect_invalidator(_reset_cached_actor_handle)
 
 
 def _ray_namespace() -> str:
@@ -36,10 +25,6 @@ def _ray_namespace() -> str:
         return "mint"
 
 
-def _actor_name() -> str:
-    return os.environ.get("MINT_SAMPLING_CLEANUP_EXECUTOR_ACTOR_NAME", "mint_sampling_cleanup_executor")
-
-
 def _sampling_inactivity_timeout_s() -> float:
     raw = env_nonempty(os.environ, "MINT_SESSION_INACTIVITY_TIMEOUT_S") or env_nonempty(
         os.environ,
@@ -50,23 +35,6 @@ def _sampling_inactivity_timeout_s() -> float:
     except Exception:
         logger.warning("Invalid sampling inactivity timeout=%r; defaulting to 1800s", raw)
         return 1800.0
-
-
-async def _await_ray_ref(ref: Any) -> Any:
-    if hasattr(ref, "__await__"):
-        return await ref
-
-    to_future = getattr(ref, "future", None)
-    if callable(to_future):
-        fut = to_future()
-        if isinstance(fut, asyncio.Future):
-            return await fut
-        if isinstance(fut, concurrent.futures.Future):
-            return await asyncio.wrap_future(fut)
-        if hasattr(fut, "__await__"):
-            return await fut
-
-    raise TypeError(f"Ray ref is not awaitable: {type(ref)}")
 
 
 def _cleanup_sampler_indices(sampler_id: str) -> None:
@@ -114,7 +82,7 @@ async def cleanup_stale_sampling_sessions_once_impl(*, stale_after_s: float | No
         infos = await async_list_sampling_sessions()
     except Exception as e:
         logger.warning(
-            "sampling cleanup executor skipped: failed to list detached sampling sessions: %s: %s",
+            "sampling cleanup executor skipped: failed to list TaskStateStore-backed sampling sessions: %s: %s",
             type(e).__name__,
             e,
         )
@@ -160,14 +128,14 @@ async def cleanup_stale_sampling_sessions_once_impl(*, stale_after_s: float | No
             )
             if failed_request_ids:
                 logger.warning(
-                    "[%s] failed pending sampling futures during detached cleanup (%s): request_ids=%s",
+                    "[%s] failed pending sampling futures during TaskStateStore-backed cleanup (%s): request_ids=%s",
                     session_id,
                     reason,
                     failed_request_ids,
                 )
         except Exception as e:
             logger.warning(
-                "[%s] detached sampling cleanup aborted because future fail failed (%s): %s: %s",
+                "[%s] TaskStateStore-backed sampling cleanup aborted because future fail failed (%s): %s: %s",
                 session_id,
                 reason,
                 type(e).__name__,
@@ -182,7 +150,7 @@ async def cleanup_stale_sampling_sessions_once_impl(*, stale_after_s: float | No
                 await _remove_loaded_lora_if_last_reference(base_model=base_model, lora_int_id=int(lora_int_id))
             except Exception as e:
                 logger.warning(
-                    "[%s] detached sampling cleanup actor actuation failed (%s): %s: %s",
+                    "[%s] TaskStateStore-backed sampling cleanup actor actuation failed (%s): %s: %s",
                     session_id,
                     reason,
                     type(e).__name__,
@@ -193,7 +161,7 @@ async def cleanup_stale_sampling_sessions_once_impl(*, stale_after_s: float | No
             delete_sampling_session(session_id)
         except Exception as e:
             logger.warning(
-                "[%s] detached sampling cleanup store delete failed (%s): %s: %s",
+                "[%s] TaskStateStore-backed sampling cleanup store delete failed (%s): %s: %s",
                 session_id,
                 reason,
                 type(e).__name__,
@@ -208,7 +176,7 @@ async def cleanup_stale_sampling_sessions_once_impl(*, stale_after_s: float | No
                     await asyncio.to_thread(shutil.rmtree, adapter_path)
             except Exception as e:
                 logger.warning(
-                    "[%s] detached sampling cleanup adapter delete failed (%s): %s: %s",
+                    "[%s] TaskStateStore-backed sampling cleanup adapter delete failed (%s): %s: %s",
                     session_id,
                     reason,
                     type(e).__name__,
@@ -220,7 +188,7 @@ async def cleanup_stale_sampling_sessions_once_impl(*, stale_after_s: float | No
 
         cleaned.append(session_id)
         logger.warning(
-            "[%s] detached sampling cleanup removed stale session: base_model=%s should_unload=%s adapter_refcount=%s",
+            "[%s] TaskStateStore-backed sampling cleanup removed stale session: base_model=%s should_unload=%s adapter_refcount=%s",
             session_id,
             base_model,
             should_unload,
@@ -230,78 +198,9 @@ async def cleanup_stale_sampling_sessions_once_impl(*, stale_after_s: float | No
     return cleaned
 
 
-def _get_or_create_actor():
-    import ray
-
-    global _ACTOR_HANDLE
-    name = _actor_name()
-    namespace = _ray_namespace()
-    try:
-        _ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)
-        return _ACTOR_HANDLE
-    except ValueError:
-        pass
-
-    @ray.remote(num_cpus=0, max_concurrency=16)
-    class _SamplingCleanupExecutorActor:
-        async def cleanup_stale_sessions_once(self, stale_after_s: float | None = None) -> dict[str, Any]:
-            cleaned = await cleanup_stale_sampling_sessions_once_impl(stale_after_s=stale_after_s)
-            return {"cleaned": list(cleaned)}
-
-        def health_snapshot(self) -> dict[str, Any]:
-            return {
-                "actor_name": _actor_name(),
-                "namespace": _ray_namespace(),
-            }
-
-    options: dict[str, Any] = {
-        "name": name,
-        "namespace": namespace,
-        "lifetime": "detached",
-    }
-    apply_detached_actor_resources(options, ray)
-    options["runtime_env"] = actor_runtime_env(pythonpath=PFS_PYTHONPATH, extra=otel_env_vars())
-
-    try:
-        created = _SamplingCleanupExecutorActor.options(**options).remote()
-        _ACTOR_HANDLE = created
-        return _ACTOR_HANDLE
-    except Exception:
-        _ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)
-        return _ACTOR_HANDLE
-
-
 class SamplingCleanupExecutor:
-    def __init__(self) -> None:
-        self._ray_actor = None
-
-    def _get_ray_actor(self):
-        import ray
-
-        global _ACTOR_HANDLE
-        if self._ray_actor is not None:
-            return self._ray_actor
-        if _ACTOR_HANDLE is not None:
-            self._ray_actor = _ACTOR_HANDLE
-            return self._ray_actor
-        if not ray.is_initialized():
-            raise RuntimeError("Ray not initialized")
-        self._ray_actor = _get_or_create_actor()
-        return self._ray_actor
-
-    def ensure_ready(self) -> dict[str, Any]:
-        import ray
-
-        actor = self._get_ray_actor()
-        return ray.get(actor.health_snapshot.remote())
-
     async def async_cleanup_stale_sessions_once(self, *, stale_after_s: float | None = None) -> list[str]:
-        actor = self._get_ray_actor()
-        out = await _await_ray_ref(actor.cleanup_stale_sessions_once.remote(stale_after_s=stale_after_s))
-        if not isinstance(out, dict):
-            raise TypeError(f"SamplingCleanupExecutor returned non-dict: {type(out)}")
-        cleaned = out.get("cleaned") or []
-        return [str(session_id) for session_id in cleaned]
+        return await cleanup_stale_sampling_sessions_once_impl(stale_after_s=stale_after_s)
 
 
 sampling_cleanup_executor = SamplingCleanupExecutor()

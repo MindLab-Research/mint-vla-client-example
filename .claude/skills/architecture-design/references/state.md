@@ -7,13 +7,13 @@ This project has multiple identifiers that look similar but have different owner
 - `session_id`
   - Created by `POST /api/v1/create_session`.
   - Live request metadata is cached in server memory (`mint_server/routes/service.py:sessions`).
-  - Minimal index metadata is also mirrored into the detached session-index store for REST reads after API restart.
+  - Minimal index metadata is persisted through `TaskStateStore` session/index methods for REST reads after API restart.
   - Used mainly for grouping/metadata; it does not own model weights.
 
 - `model_id`
   - Created by `POST /api/v1/create_model` (training routes).
   - Tracks a live training session in server memory (`mint_server/backend/training_session_manager.py`).
-  - Minimal recovery metadata is mirrored into the detached training-session store.
+  - Minimal recovery metadata is persisted through `TaskStateStore` training-session methods.
   - The actual trainable weights/optimizer live in Ray actors (backend-dependent).
   - Automatically cleaned up after idle timeout (`MINT_TRAINING_INACTIVITY_TIMEOUT`, default 3600s).
 
@@ -21,7 +21,7 @@ This project has multiple identifiers that look similar but have different owner
   - Created by `POST /api/v1/create_sampling_session`.
   - Used by sampling endpoints to select a base model and optional LoRA adapter.
   - In multi-LoRA mode, `sampling_session_id` is mapped (in-process) to a `lora_int_id` that vLLM uses to select frozen adapter weights.
-  - In gateway mode, upstream routing metadata for remote sampling sessions is mirrored into the detached gateway-session store.
+  - In gateway mode, upstream routing metadata for remote sampling sessions is persisted through `TaskStateStore` gateway-session methods.
 
 - `request_id`
   - Created through the `TaskFutureService` facade and returned by endpoints that run async work in the background.

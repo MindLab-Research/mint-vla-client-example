@@ -28,7 +28,6 @@ def test_start_issue_server_helper_scopes_control_plane_actor_names() -> None:
             "MINT_RAY_CLIENT_ADDRESS": "ray://192.168.39.87:10001",
             "MINT_CODE_ROOT": "/vePFS-Mindverse/share/code/yiwen/mint-server-issue-416",
             "ISSUE_NAMESPACE": "mint_yiwen_issue_416_r9",
-            "ISSUE_STARTUP_LEASE": "mint_startup_lease_issue_416_r9",
             "ISSUE_PORT": "10419",
             "ISSUE_LOG_FILE": "/tmp/mint_server_issue_416_r9.log",
             "ISSUE_USAGE_LOG_DIR": "/tmp/mint_usage_issue_416_r9",
@@ -60,7 +59,6 @@ def test_start_issue_server_helper_scopes_control_plane_actor_names() -> None:
         == "/vePFS-Mindverse/share/code/yiwen/mint-server-issue-416/mint_server"
     )
     assert data["MINT_RAY_NAMESPACE"] == "mint_yiwen_issue_416_r9"
-    assert data["MINT_STARTUP_LEASE_ACTOR_NAME"] == "mint_startup_lease_issue_416_r9"
     assert data["MINT_DISABLE_MINT_ROUTE"] == "1"
     assert data["MINT_API_KEY"] == "dummy"
     assert (
@@ -76,24 +74,11 @@ def test_start_issue_server_helper_scopes_control_plane_actor_names() -> None:
 
     assert token in data["MINT_MODEL_WORK_SCHEDULER_ACTOR_NAME"]
     assert token in data["MINT_TASK_STATE_STORE_ACTOR_NAME"]
-    assert token in data["MINT_GATEWAY_SESSION_STORE_ACTOR_NAME"]
-    assert token in data["MINT_SAMPLING_SESSION_STORE_ACTOR_NAME"]
-    assert token in data["MINT_TRAINING_SESSION_STORE_ACTOR_NAME"]
-    assert token in data["MINT_SESSION_HEARTBEAT_ACTOR_NAME"]
-    assert token in data["MINT_SESSION_INDEX_ACTOR_NAME"]
     assert token in data["MINT_MAINTENANCE_CRON_ACTOR_NAME"]
-    assert token in data["MINT_TRAINING_CLEANUP_EXECUTOR_ACTOR_NAME"]
-    assert token in data["MINT_SAMPLING_CLEANUP_EXECUTOR_ACTOR_NAME"]
     forbidden = {
         "mint_model_work_scheduler",
         "mint_task_state_store",
-        "mint_training_session_store",
-        "mint_sampling_session_store",
-        "mint_session_heartbeat_store",
-        "mint_session_index_store",
         "mint_maintenance_cron",
-        "mint_training_cleanup_executor",
-        "mint_sampling_cleanup_executor",
     }
     for key, value in data.items():
         if key.endswith("_ACTOR_NAME"):

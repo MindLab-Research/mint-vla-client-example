@@ -861,7 +861,7 @@ async def cleanup_stale_training_sessions_once(*, stale_after_s: float | None = 
         infos = await async_list_training_sessions()
     except Exception as e:
         logger.warning(
-            "stale training cleanup skipped: failed to list detached training sessions: %s: %s",
+            "stale training cleanup skipped: failed to list TaskStateStore-backed training sessions: %s: %s",
             type(e).__name__,
             e,
         )

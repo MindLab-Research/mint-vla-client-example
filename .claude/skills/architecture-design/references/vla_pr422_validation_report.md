@@ -2,6 +2,9 @@
 
 Date: 2026-04-08
 
+This is a historical validation report for the environment and code state named
+below. It is evidence, not the current normative architecture contract.
+
 ## Environment used
 
 - Ray head: `192.168.39.23`
@@ -189,7 +192,7 @@ Current recommendation order:
 
 ### 10. Final report
 
-This file is the current repository-tracked validation report.
+This file is the repository-tracked validation report for the 2026-04-08 run.
 
 ## Answers to the six verification areas
 
@@ -242,14 +245,14 @@ Not established in this pass.
 
 ## Bottom line
 
-The current repository state supports these concrete claims:
+The repository state tested on 2026-04-08 supported these concrete claims:
 - the dedicated OpenPI VLA path on the assigned worker is usable
 - pi0-fast SFT and pi0.5 SFT each have real downward curves on tested LIBERO tasks
 - tested save-resume continuity exists for pi0-fast and pi0.5 on the chosen tasks
 - the pi0-fast PPO path is now numerically sane on the tested 6-step run
 - narrow shared-action actor sampling correctness is established on a tested path
 
-The current repository state does not yet support these stronger claims:
+The repository state tested on 2026-04-08 did not support these stronger claims:
 - meaningful pi0-fast RL
 - decisive mixed-client contamination freedom
 - fully passing 30-client pressure behavior

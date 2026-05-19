@@ -804,7 +804,7 @@ def test_config_import_does_not_require_runtime_root():
     assert out.stdout.strip() == "True"
 
 
-def test_gateway_session_store_namespace_respects_config_file(tmp_path):
+def test_detached_actor_namespaces_respect_config_file(tmp_path):
     cfg = tmp_path / "cfg.toml"
     cfg.write_text("[ray]\nnamespace = 'cfg_ns'\n", encoding="utf-8")
 
@@ -819,9 +819,9 @@ def test_gateway_session_store_namespace_respects_config_file(tmp_path):
             "-c",
             (
                 "import mint_server.config as c; "
-                "import mint_server.backend.gateway_session_store as g; "
+                "import mint_server.backend.task_state_store as s; "
                 "print(c.RAY_NAMESPACE); "
-                "print(g._ray_namespace())"
+                "print(s._ray_namespace())"
             ),
         ],
         cwd=Path(__file__).resolve().parents[1],
@@ -831,41 +831,6 @@ def test_gateway_session_store_namespace_respects_config_file(tmp_path):
         env=env,
     )
     assert out.stdout.strip().splitlines() == ["cfg_ns", "cfg_ns"]
-
-
-def test_detached_store_namespaces_respect_config_file(tmp_path):
-    cfg = tmp_path / "cfg.toml"
-    cfg.write_text("[ray]\nnamespace = 'cfg_ns'\n", encoding="utf-8")
-
-    env = os.environ.copy()
-    env["MINT_CONFIG_PATH"] = str(cfg)
-    env.pop("MINT_RAY_NAMESPACE", None)
-    env.pop("MINT_RAY_NAMESPACE", None)
-
-    out = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import mint_server.config as c; "
-                "import mint_server.backend.gateway_session_store as g; "
-                "import mint_server.backend.sampling_session_store as p; "
-                "import mint_server.backend.session_index_store as s; "
-                "import mint_server.backend.training_session_store as t; "
-                "print(c.RAY_NAMESPACE); "
-                "print(g._ray_namespace()); "
-                "print(p._ray_namespace()); "
-                "print(s._ray_namespace()); "
-                "print(t._ray_namespace())"
-            ),
-        ],
-        cwd=Path(__file__).resolve().parents[1],
-        check=True,
-        capture_output=True,
-        text=True,
-        env=env,
-    )
-    assert out.stdout.strip().splitlines() == ["cfg_ns", "cfg_ns", "cfg_ns", "cfg_ns", "cfg_ns"]
 
 
 def test_config_import_fails_on_namespace_mismatch(tmp_path):
@@ -1082,7 +1047,6 @@ def test_actor_runtime_env_vars_forwards_control_plane_pin_envs(tmp_path):
             "RAY_ADDRESS": "ray://cfg-test",
             "MINT_CONTROL_PLANE_PINNED_NODE_IP": "192.168.38.176",
             "MINT_MODEL_WORK_SCHEDULER_PINNED_NODE_IP": "192.168.38.176",
-            "MINT_STARTUP_LEASE_PINNED_NODE_IP": "192.168.38.176",
         },
     )
     data = payload["runtime_env"]
@@ -1091,7 +1055,6 @@ def test_actor_runtime_env_vars_forwards_control_plane_pin_envs(tmp_path):
     assert "MINT_CONTROL_PLANE_PINNED_NODE_IP" not in data
     assert actor_env["MINT_CONTROL_PLANE_PINNED_NODE_IP"] == "192.168.38.176"
     assert actor_env["MINT_MODEL_WORK_SCHEDULER_PINNED_NODE_IP"] == "192.168.38.176"
-    assert actor_env["MINT_STARTUP_LEASE_PINNED_NODE_IP"] == "192.168.38.176"
 
 
 def test_actor_runtime_env_vars_forwards_vllm_envs(tmp_path):
@@ -1210,18 +1173,10 @@ def test_actor_runtime_env_vars_forwards_control_plane_actor_names(tmp_path):
             "RAY_ADDRESS": "ray://cfg-test",
             "MINT_RAY_NAMESPACE": "mint-test-ns",
             "MINT_RAY_NAMESPACE": "mint-test-ns",
-            "MINT_GATEWAY_SESSION_STORE_ACTOR_NAME": "mint-gateway-session-store-test",
-            "MINT_SAMPLING_SESSION_STORE_ACTOR_NAME": "mint-sampling-session-store-test",
-            "MINT_TRAINING_SESSION_STORE_ACTOR_NAME": "mint-training-session-store-test",
-            "MINT_SESSION_HEARTBEAT_ACTOR_NAME": "mint-session-heartbeat-test",
-            "MINT_SESSION_INDEX_ACTOR_NAME": "mint-session-index-test",
-            "MINT_TRAINING_CLEANUP_EXECUTOR_ACTOR_NAME": "mint-training-cleanup-test",
-            "MINT_SAMPLING_CLEANUP_EXECUTOR_ACTOR_NAME": "mint-sampling-cleanup-test",
             "MINT_RETRIEVE_FUTURE_HOT_TTL_S": "45",
             "MINT_MODEL_WORK_SCHEDULER_ACTOR_NAME": "mint-model-work-scheduler-test",
             "MINT_MODEL_WORK_SCHEDULER_PINNED_NODE_IP": "192.168.39.110",
             "MINT_TASK_STATE_STORE_ACTOR_NAME": "mint-task-state-store-test",
-            "MINT_STARTUP_LEASE_ACTOR_NAME": "mint-startup-lease-test",
             "MINT_MAINTENANCE_CRON_ACTOR_NAME": "mint-maintenance-cron-test",
         },
     )
@@ -1229,18 +1184,10 @@ def test_actor_runtime_env_vars_forwards_control_plane_actor_names(tmp_path):
     actor_env = payload["actor_env"]
     assert data["MINT_RAY_NAMESPACE"] == "mint-test-ns"
     assert data["MINT_RAY_NAMESPACE"] == "mint-test-ns"
-    assert actor_env["MINT_GATEWAY_SESSION_STORE_ACTOR_NAME"] == "mint-gateway-session-store-test"
-    assert actor_env["MINT_SAMPLING_SESSION_STORE_ACTOR_NAME"] == "mint-sampling-session-store-test"
-    assert actor_env["MINT_TRAINING_SESSION_STORE_ACTOR_NAME"] == "mint-training-session-store-test"
-    assert actor_env["MINT_SESSION_HEARTBEAT_ACTOR_NAME"] == "mint-session-heartbeat-test"
-    assert actor_env["MINT_SESSION_INDEX_ACTOR_NAME"] == "mint-session-index-test"
-    assert actor_env["MINT_TRAINING_CLEANUP_EXECUTOR_ACTOR_NAME"] == "mint-training-cleanup-test"
-    assert actor_env["MINT_SAMPLING_CLEANUP_EXECUTOR_ACTOR_NAME"] == "mint-sampling-cleanup-test"
     assert actor_env["MINT_RETRIEVE_FUTURE_HOT_TTL_S"] == "45"
     assert actor_env["MINT_MODEL_WORK_SCHEDULER_ACTOR_NAME"] == "mint-model-work-scheduler-test"
     assert actor_env["MINT_MODEL_WORK_SCHEDULER_PINNED_NODE_IP"] == "192.168.39.110"
     assert actor_env["MINT_TASK_STATE_STORE_ACTOR_NAME"] == "mint-task-state-store-test"
-    assert actor_env["MINT_STARTUP_LEASE_ACTOR_NAME"] == "mint-startup-lease-test"
     assert actor_env["MINT_MAINTENANCE_CRON_ACTOR_NAME"] == "mint-maintenance-cron-test"
 
 

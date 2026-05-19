@@ -3,15 +3,23 @@
 ## Primary path (multi-LoRA)
 
 1. `POST /api/v1/create_sampling_session` validates access and chooses `base_model`.
-2. `SessionManager.get_engine_for_model(base_model)` selects/creates a `MultiLoRAInferenceEngine` via `MultiModelInferenceManager`.
-3. `MultiLoRAInferenceEngine.initialize()` connects to an existing detached vLLM actor or creates a new one:
-  - `namespace=mint_server.config.RAY_NAMESPACE` (from `MINT_RAY_NAMESPACE`) so actors can be rediscovered across server restarts.
-  - detached lifetime so actors survive API server restarts.
-  - registers the actor in `ModelActorInventory` for GPU accounting and observability.
-4. If a LoRA adapter is provided, the server loads weights and registers them for the session:
+2. The route records durable session/task metadata through `TaskStateStore` and
+   submits runtime work through `ModelWorkScheduler` when model-runtime
+   scheduling is enabled.
+3. `ModelActorSupervisor` owns the desired vLLM runtime lifecycle. Existing
+   healthy vLLM actors can keep serving while the supervisor is temporarily
+   unavailable; missing desired actors are recreated only by the supervisor.
+4. Backend launchers may still instantiate `MultiLoRAInferenceEngine` or
+   `MultiNodeInferenceEngine` under the supervisor-owned runtime wrapper, but
+   they must publish lifecycle, placement, and GPU metadata through the
+   supervisor inventory contract.
+5. Detached vLLM actors use `namespace=mint_server.config.RAY_NAMESPACE` (from
+   `MINT_RAY_NAMESPACE`) and stable model-specific names so they can be
+   rediscovered across server restarts.
+6. If a LoRA adapter is provided, the server loads weights and registers them for the session:
    - Small/medium adapters: tensors transferred via Ray object store (`add_lora_with_id`).
    - Very large adapters (MoE with many tensors): path-based load (`add_lora_from_path`) to avoid Ray serialization overhead.
-5. `POST /api/v1/asample` uses `sampling_session_id` (or `model_id`, via SDK aliasing) to pick the right engine and then calls:
+7. `POST /api/v1/asample` uses `sampling_session_id` (or `model_id`, via SDK aliasing) to pick the right engine and then calls:
    - `generate_with_lora` when `sampling_session_id` resolves to a `lora_int_id`
    - `generate_base` when no LoRA is registered for the session
 
@@ -29,7 +37,8 @@ Mechanics (MultiNodeInferenceEngine):
   - a detached placement group with `total_required_gpus = worker_gpus` GPU bundles plus one CPU-only controller bundle (strategy `PACK`)
   - a detached controller actor with `num_gpus=0`, pinned to the controller bundle index
   - child vLLM workers captured into the same placement group (`placement_group_capture_child_tasks=True`)
-- `ModelActorInventory` accounts for the full `total_required_gpus` so eviction decisions reflect the real cluster footprint.
+- `ModelActorSupervisor` inventory accounts for the full `total_required_gpus`
+  so admin and observability decisions reflect the real cluster footprint.
 
 ## Why multi-LoRA is central
 

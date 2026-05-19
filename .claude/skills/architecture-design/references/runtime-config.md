@@ -19,8 +19,8 @@ Runtime configuration is split by when the value must be available:
 - Actor name: `mint_config`, overridable by `MINT_CONFIG_ACTOR_NAME` for tests or controlled migrations.
 - API: `get_snapshot()` only.
 - Mutation: none. V1 has no `put`, no `set_many`, and no watch mechanism.
-- Startup behavior: the startup owner creates or attaches to the actor. If an existing actor has a different snapshot fingerprint, startup fails fast instead of silently using stale configuration.
-- Persistence: none inside ConfigActor. The API process rebuilds the read-only snapshot from env/config file on startup.
+- Bootstrap behavior: external operations create or attach to `mint_config` before `mint_model_actor_supervisor` and API workers start. If an existing actor has a different snapshot fingerprint, bootstrap fails fast instead of silently using stale configuration. API workers only read/check the existing actor and must not create it.
+- Persistence: none inside ConfigActor. The read-only snapshot is rebuilt from env/config file during external bootstrap.
 - Actor hydration: normal Ray actors receive only bootstrap runtime_env plus `MINT_CONFIG_ACTOR_HYDRATE=1`. `mint_server.config` fetches ConfigActor once on import and overlays `actor_env` into `os.environ` before module-level config constants are computed.
 - Secret handling: `env` and `server_config` remain redacted for introspection, but `actor_env` contains real values because it is the actor configuration distribution payload. Namespace access to ConfigActor is therefore a trust boundary.
 

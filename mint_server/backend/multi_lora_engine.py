@@ -66,9 +66,6 @@ def _read_process_env_var(name: str) -> str:
     return os.environ.get(name, "")
 
 
-# Well-known fallback name for the singleton persistent vLLM actor.
-PERSISTENT_VLLM_ACTOR_NAME = "vllm_server"
-
 # Fixed namespace for persistent actors (without this, each process gets random namespace)
 PERSISTENT_NAMESPACE = RAY_NAMESPACE
 
@@ -189,8 +186,9 @@ class MultiLoRAInferenceEngine:
         self.max_cpu_loras = max_cpu_loras
         self.max_lora_rank = max_lora_rank
         self.pinned_node_ip = pinned_node_ip.strip() if isinstance(pinned_node_ip, str) else None
-        # Custom actor name for multi-model support (one actor per base model)
-        self.actor_name = actor_name or PERSISTENT_VLLM_ACTOR_NAME
+        if not actor_name:
+            raise ValueError("PersistentVLLMEngine requires a model-specific actor_name")
+        self.actor_name = actor_name
 
         self.registry = LoRARegistry()
         self.server = None
@@ -257,7 +255,7 @@ class MultiLoRAInferenceEngine:
                         )
                         self._initialized = True
 
-                        # Register existing actor with model actor registry for LRU tracking
+                        # Publish existing actor through supervisor inventory.
                         # Include node_id for proper per-node GPU scheduling
                         from mint_server.backend.model_actor_inventory import ActorType
                         from mint_server.backend.model_actor_publication import (
@@ -266,7 +264,7 @@ class MultiLoRAInferenceEngine:
                         )
                         total_gpus = self.tensor_parallel_size * self.data_parallel_size
                         actor_node_id = _get_actor_node_id(self.server)
-                        logger.info(f"Registering existing actor {self.actor_name} with ModelActorInventory (node={actor_node_id[:8] if actor_node_id else 'unknown'})")
+                        logger.info(f"Publishing existing actor {self.actor_name} through ModelActorSupervisor inventory (node={actor_node_id[:8] if actor_node_id else 'unknown'})")
                         publish_backend_model_actor(BackendModelActorLaunch(
                             actor_name=self.actor_name,
                             actor_type=ActorType.VLLM,
@@ -317,7 +315,7 @@ class MultiLoRAInferenceEngine:
                     total_gpus = self.tensor_parallel_size * self.data_parallel_size
                     actor_node_id = _get_actor_node_id(self.server)
                     logger.info(
-                        f"Registering existing actor {self.actor_name} with ModelActorInventory (node={actor_node_id[:8] if actor_node_id else 'unknown'})"
+                        f"Publishing existing actor {self.actor_name} through ModelActorSupervisor inventory (node={actor_node_id[:8] if actor_node_id else 'unknown'})"
                     )
                     publish_backend_model_actor(BackendModelActorLaunch(
                         actor_name=self.actor_name,
@@ -1834,7 +1832,7 @@ class MultiModelInferenceManager:
 def _list_named_vllm_actor_names(*, namespace: str) -> list[str]:
     """List vLLM actor names by Ray named actor registry.
 
-    This is useful for detecting inventory mismatches (ModelActorInventory staleness).
+    This is useful for detecting supervisor inventory mismatches.
     Callers must not silently treat this registry as authoritative.
     """
     names: list[str] = []
@@ -1844,7 +1842,7 @@ def _list_named_vllm_actor_names(*, namespace: str) -> list[str]:
         name = a.get("name") or ""
         if not name:
             continue
-        if name.startswith("mint_vllm_") or name == PERSISTENT_VLLM_ACTOR_NAME:
+        if name.startswith("mint_vllm_"):
             names.append(name)
     return sorted(set(names))
 
@@ -1860,7 +1858,7 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
         True if any actor was killed, False if none found.
 
     Raises:
-        ModelActorSupervisorStaleError: When ModelActorInventory reports no vLLM actors but Ray named
+        ModelActorSupervisorStaleError: When supervisor inventory reports no vLLM actors but Ray named
             actors exist in the namespace. This is an accounting invariant violation
             and must be surfaced rather than falling back silently.
     """
@@ -1940,10 +1938,10 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
             named = _list_named_vllm_actor_names(namespace=PERSISTENT_NAMESPACE)
             if named:
                 raise ModelActorSupervisorStaleError(
-                    "ModelActorInventory lists 0 vLLM actors but Ray named-actor registry has "
+                    "ModelActorSupervisor inventory lists 0 vLLM actors but Ray named-actor registry has "
                     f"{len(named)} vLLM actor(s) in namespace={PERSISTENT_NAMESPACE!r}: {named!r}"
                 )
-            logger.info("No vLLM actors found in ModelActorInventory")
+            logger.info("No vLLM actors found in ModelActorSupervisor inventory")
         return killed_any
 
 

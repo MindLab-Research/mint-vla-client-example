@@ -86,12 +86,24 @@ class _ModelActorInventorySection(BaseModel):
     session_idle_timeout_s: int | None = None
 
 
+class _SupervisorStateSection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    backend: str | None = None
+    db_path: str | None = None
+    owner_ttl_s: float | None = None
+    event_limit: int | None = None
+
+
 class _FutureSection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     retrieve_future_hot_ttl_s: float | None = None
     retrieve_future_grace_s: float | None = None
     retrieve_future_min_poll_s: float | None = None
+    task_pending_ttl_s: float | None = None
+    task_result_ttl_s: float | None = None
+    task_tombstone_ttl_s: float | None = None
 
 
 class _TaskStateStoreSection(BaseModel):
@@ -148,6 +160,7 @@ class MintConfigFile(BaseModel):
     paths: _PathsSection = Field(default_factory=_PathsSection)
     megatron_bridge: _MegatronBridgeSection = Field(default_factory=_MegatronBridgeSection)
     model_actor_inventory: _ModelActorInventorySection = Field(default_factory=_ModelActorInventorySection)
+    supervisor_state: _SupervisorStateSection = Field(default_factory=_SupervisorStateSection)
     future: _FutureSection = Field(default_factory=_FutureSection)
     task_state_store: _TaskStateStoreSection = Field(default_factory=_TaskStateStoreSection)
     training: _TrainingSection = Field(default_factory=_TrainingSection)

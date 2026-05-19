@@ -5,13 +5,21 @@ import pytest
 
 pytest.importorskip("ray")
 
-from mint_server.backend.model_actor_supervisor import ActorType, get_model_actor_supervisor
+from mint_server.backend.model_actor_supervisor import ActorType, ModelActorSupervisor
 from mint_server.backend.training_session_manager import TrainingSession
 from mint_server.backend.verl_training import VerlTrainingEngine
 
 
 def _get_local_model_actor_inventory(monkeypatch: pytest.MonkeyPatch):
-    pool = get_model_actor_supervisor()
+    pool = ModelActorSupervisor()
+    import mint_server.backend.model_actor_supervisor as supervisor_module
+    import mint_server.backend.ray_keepalive as ray_keepalive
+    import mint_server.backend.verl_training as verl_training
+
+    monkeypatch.setattr(supervisor_module, "model_actor_supervisor", pool)
+    monkeypatch.setattr(supervisor_module, "get_model_actor_supervisor", lambda: pool)
+    monkeypatch.setattr(ray_keepalive, "get_model_actor_supervisor", lambda: pool)
+    monkeypatch.setattr(verl_training, "get_model_actor_supervisor", lambda: pool, raising=False)
     pool.clear(kill_actors=False)
     return pool
 

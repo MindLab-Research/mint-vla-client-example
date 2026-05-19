@@ -5,6 +5,35 @@ Two recurring constraints drive this code:
 1. API server and GPU actors can have different local filesystems.
 2. Some models produce adapter state that is too large/too fragmented to transfer as Python objects efficiently.
 
+## Storage tiers
+
+Async future result payloads and checkpoint/weight artifacts are separate
+storage systems with separate reapers and metrics.
+
+Async future results:
+
+- Hot cache: per-API-process retrieve cache, default 300s.
+- Durable metadata: `TaskStateStore` rows, including status, terminal metadata,
+  result path, checksum, and size.
+- Durable payload: `TaskPayloadStore` JSON files on vePFS.
+
+Checkpoint and weight artifacts:
+
+- Metadata/catalog: PostgreSQL checkpoint index.
+- Ephemeral cache: vePFS runtime checkpoint cache for temporary sampler or
+  checkpoint materialization, default TTL 24h.
+- Persistent upload cache: vePFS `persistent_cache` used as TOS mirror
+  staging/cache. It is eligible for cleanup only after mirror completion and
+  after its TTL.
+- Persistent store: TOS checkpoint directory, the authoritative artifact store.
+
+The future result payload reaper must not delete checkpoint artifacts. The
+checkpoint reaper must not delete `TaskPayloadStore` JSON payloads.
+
+`/api/v1/internal/healthz` does not scan PostgreSQL checkpoint rows against TOS
+artifact existence. Checkpoint catalog/artifact consistency belongs to
+checkpoint-specific validation or repair jobs, not lightweight health.
+
 ## File formats and semantics
 
 This repo uses "HuggingFace/PEFT LoRA adapter format" as the interchange format for inference:
@@ -63,11 +92,11 @@ After `load_state(..., optimizer=True)`, the session cache is primed from the lo
 
 After `load_state(..., optimizer=False)`, `training_meta.json` is optional. If the file exists, `current_step` and `learning_rate` are validated strictly and used. If it is absent, step resets to `0`, the session learning rate is preserved, and optimizer, gradient, and scheduler authority are `none`.
 
-The loaded checkpoint's LoRA rank and train-target flags become the session's active LoRA configuration. The `/load_state` route must persist those metadata-derived flags back to the detached training-session store before resolving the future; otherwise an API restart can restore stale create-time defaults. Later Megatron operations must use those metadata-derived flags instead of the stale create-time request defaults.
+The loaded checkpoint's LoRA rank and train-target flags become the session's active LoRA configuration. The `/load_state` route must persist those metadata-derived flags back through `TaskStateStore` training-session methods before resolving the future; otherwise an API restart can restore stale create-time defaults. Later Megatron operations must use those metadata-derived flags instead of the stale create-time request defaults.
 
-If `/load_state` mutates the live actor successfully but the detached training-session metadata mirror fails to persist afterward, the load future reports success with `metadata_persisted=false` and the error string. Reporting a failed load after actor state changed is a split-brain signal unless the implementation also rolls the actor back.
+If `/load_state` mutates the live actor successfully but the durable training-session metadata fails to persist afterward, the load future reports success with `metadata_persisted=false` and the error string. Reporting a failed load after actor state changed is a split-brain signal unless the implementation also rolls the actor back.
 
-The same persistence rule applies to `/create_model_from_state`: after checkpoint load, detached training-session metadata must use the session's post-load LoRA configuration, not the raw request payload.
+The same persistence rule applies to `/create_model_from_state`: after checkpoint load, durable training-session metadata must use the session's post-load LoRA configuration, not the raw request payload.
 
 After `optim_step`, weights as well as optimizer state are actor-local until a later session switch or save writes them to a checkpoint/cache. The authority record should represent those live actor weights directly.
 

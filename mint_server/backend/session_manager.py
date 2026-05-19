@@ -205,14 +205,14 @@ class SessionManager:
                 try:
                     from .sampling_session_store import async_get_sampling_session_info
 
-                    detached = await async_get_sampling_session_info(sid)
+                    persisted = await async_get_sampling_session_info(sid)
                 except Exception:
-                    detached = None
-                if isinstance(detached, dict):
+                    persisted = None
+                if isinstance(persisted, dict):
                     try:
                         info.last_activity = max(
                             float(info.last_activity),
-                            float(detached.get("last_activity", info.last_activity)),
+                            float(persisted.get("last_activity", info.last_activity)),
                         )
                     except Exception:
                         pass
@@ -614,7 +614,7 @@ class SessionManager:
             logger.info("Shutdown shared engine")
 
     def list_sessions(self) -> list[str]:
-        """List active session IDs from detached authority plus local pending sessions."""
+        """List active session IDs from TaskStateStore-backed metadata plus local pending sessions."""
         session_ids: set[str] = set(self._sessions.keys())
         try:
             from .sampling_session_store import list_sampling_sessions

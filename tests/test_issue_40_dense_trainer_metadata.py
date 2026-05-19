@@ -5,12 +5,12 @@ import pytest
 pytest.importorskip("ray")
 
 import mint_server.backend.model_actor_inventory as model_actor_inventory_module
-from mint_server.backend.model_actor_supervisor import ActorType, get_model_actor_supervisor
+from mint_server.backend.model_actor_supervisor import ActorType, ModelActorSupervisor
 
 
 def test_model_actor_inventory_list_actors_includes_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(model_actor_inventory_module.ray, "is_initialized", lambda: False)
-    pool = get_model_actor_supervisor()
+    pool = ModelActorSupervisor()
     pool.clear(kill_actors=False)
     actor_name = f"test_issue_40_dense_{uuid.uuid4().hex}"
 
@@ -19,7 +19,7 @@ def test_model_actor_inventory_list_actors_includes_metadata(monkeypatch: pytest
 
 def test_model_actor_inventory_list_actors_labels_openpi_backend(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(model_actor_inventory_module.ray, "is_initialized", lambda: False)
-    pool = get_model_actor_supervisor()
+    pool = ModelActorSupervisor()
     pool.clear(kill_actors=False)
     actor_name = f"test_issue_40_openpi_{uuid.uuid4().hex}"
 

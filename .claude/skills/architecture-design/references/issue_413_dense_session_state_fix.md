@@ -91,7 +91,7 @@
 
 server 启动时会：
 
-- 读取 detached training session store，找出当前仍然活跃的 `model_id`
+- 读取 TaskStateStore-backed training session metadata，找出当前仍然活跃的 `model_id`
 - 对活跃 session：如果它们的状态还在 legacy `/tmp`，就迁到新根目录
 - 对不活跃且足够陈旧的 legacy 目录：直接清理
 - 对较新的非活跃目录：先跳过，并打日志

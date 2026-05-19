@@ -39,13 +39,33 @@ Async endpoints that require model-runtime scheduling go through `ModelWorkSched
 
 On admission failure, the API must return HTTP 429 with a structured overload reason. V1 does not enforce a hard active-task cap; add one only if the active-task index becomes a measured bottleneck.
 
+Pending tasks may wait for `ModelActorSupervisor` to create/register the desired
+runtime actor. This must keep Tinker async semantics: the client receives a
+`request_id`, `retrieve_future` returns HTTP 408 while the task is pending, and
+the task eventually becomes `DONE`, `FAILED`, `EXPIRED`, `CANCELLED`, or
+forgotten after retention.
+
+TTL facts:
+
+- `MINT_RETRIEVE_FUTURE_HOT_TTL_S` defaults to 300s and only controls the
+  process-local retrieve hot cache.
+- `MINT_RETRIEVE_FUTURE_GRACE_S` defaults to 600s for cached retrieve
+  replay.
+- Scheduler owner/lease TTLs default to 30s and only protect scheduler
+  ownership/claim recovery.
+- Durable pending/task result/tombstone TTLs are enforced by the async future
+  reaper and default to `MINT_TASK_PENDING_TTL_S=86400`,
+  `MINT_TASK_RESULT_TTL_S=86400`, and
+  `MINT_TASK_TOMBSTONE_TTL_S=604800`.
+
 ## Request-path async rules
 
 The request path uses native async Ray integration on hot control-plane operations:
 
 - Routes await Ray refs directly through async helpers instead of calling blocking `ray.get(...)`.
 - Request paths do not call `init_ray()` or attempt reconnection. Startup owns Ray initialization.
-- Startup warms cached detached-actor handles for the request-path stores.
+- Startup may check detached-actor availability, but it must not create
+  request-path stores or treat handle warming as a bootstrap responsibility.
 - If a cached detached-actor handle dies, the async helper may reacquire the actor by name once. This is a stale-handle recovery path, not permission for routes to bootstrap a new Ray client or hide a missing actor.
 
 ## Model work scheduling
@@ -81,7 +101,37 @@ This is a deliberate tradeoff: global strict FIFO across sessions is relaxed for
 
 ## Reaping and cleanup
 
-`MaintenanceCronActor` owns periodic cleanup. `TaskFutureService.async_reap()` is currently a compatibility facade over `TaskStateStore`; task/result retention policy belongs in `TaskStateStore` and payload-store cleanup.
+`MaintenanceCronActor` owns periodic cleanup. `TaskFutureService.async_reap()`
+is the facade, but task/result retention policy belongs in `TaskStateStore` and
+payload deletion belongs in `TaskPayloadStore`.
+
+Reaper contract:
+
+- Each reaper tick runs in this fixed order: expire active pending work, evict
+  terminal result payloads, then delete old tombstones. Each phase has its own
+  batch limit; the default is 1000 rows per phase per loop.
+- Expire only `pending`, `queued`, and `assigned` tasks older than
+  `MINT_TASK_PENDING_TTL_S`.
+- Do not expire `leased`, `running`, or `finalizing` by pending TTL; scheduler
+  lease expiry/requeue/failure owns those states.
+- Result TTL is counted from `done_at` or `failed_at`; fall back to
+  `updated_at` only for older rows without terminal timestamps.
+- After result TTL, delete the payload file and mark metadata with
+  `payload_evicted_at`, but keep a terminal tombstone.
+- If payload deletion fails, do not mark `payload_evicted_at`; record the reaper
+  error and retry on a later loop.
+- `retrieve_future` for a terminal row whose payload was evicted returns a
+  stable `{"error": "Known terminal future evicted", ...}` payload, not HTTP
+  404 and not pending.
+- After `MINT_TASK_TOMBSTONE_TTL_S`, delete task rows, events, and any remaining
+  payload residue.
+- Future payload reaper metrics are separate from checkpoint/artifact reaper
+  metrics.
+
+Future reaper metrics:
+
+- `mint_task_future_reaper_rows_total{action="expire|payload_evict|tombstone_delete"}`
+- `mint_task_future_payload_evict_errors_total`
 
 ## Detached actor hygiene
 

@@ -14,9 +14,13 @@ Detached Ray actors persist across server restarts and consume GPU resources ind
 
 Ray actors created with `lifetime=\"detached\"` survive server process restarts and hold GPU allocations.
 
-## Workaround
+## Current remediation
 
-Before starting a new server process in a namespace, kill named actors in that namespace.
+API startup must not kill or reconcile actors. Normal recovery is owned by
+`mint_model_actor_supervisor`, which reconciles desired runtime actors and
+publishes inventory state. Manual actor kill is an explicit operator/admin
+remediation only; prefer supervisor reconciliation and `/internal/actors` admin
+views before deleting named actors by hand.
 
 ## Related Logs
 

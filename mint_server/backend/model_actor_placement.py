@@ -50,7 +50,7 @@ def _owned_actor_names_for_spec(spec: Any) -> set[str]:
 
 
 def _is_supervisor_wrapper_actor_name(name: str) -> bool:
-    return name.startswith("mint_model_actor_") or name.startswith("mint_model_runtime_")
+    return name.startswith("mint_model_runtime_")
 
 
 def _default_actor_exists(actor_name: str, namespace: str) -> bool:

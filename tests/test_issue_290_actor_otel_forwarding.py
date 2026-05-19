@@ -44,12 +44,9 @@ def test_issue_290_all_actor_runtime_env_call_otel_env_vars():
         "mint_server/backend/verl_inference.py": 1,
         "mint_server/backend/model_runtime_actor.py": 1,
         "mint_server/backend/model_work_scheduler.py": 1,
+        "mint_server/backend/node_metrics_daemon.py": 1,
         "mint_server/backend/task_state_store.py": 1,
         "mint_server/backend/config_actor.py": 1,
-        "mint_server/backend/gateway_session_store.py": 1,
-        "mint_server/backend/sampling_session_store.py": 1,
-        "mint_server/backend/session_index_store.py": 1,
-        "mint_server/backend/training_session_store.py": 1,
     }
 
     for rel_path, min_count in required.items():

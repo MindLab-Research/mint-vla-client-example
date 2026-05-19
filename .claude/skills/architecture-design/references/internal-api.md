@@ -16,7 +16,8 @@ Examples:
 - session creation and training/sampling submission
 - future retrieval
 - user-visible weight and checkpoint operations
-- public health checks that do not perform expensive Ray diagnostics
+- public health checks that do not perform expensive Ray diagnostics and only
+  return `{"status":"ready"}` or `{"status":"unhealthy"}`
 
 ## Mint user extensions: `/api/v1/mint`
 
@@ -38,7 +39,7 @@ Contract:
 - Internal routes may expose implementation details such as Ray actor names, replica queues, placement state, and task indexes.
 
 Current categories:
-- Health and observability: `/internal/health`, `/internal/healthz/deep`, `/internal/admission_stats`.
+- Health and observability: `/api/v1/healthz`, `/api/v1/internal/healthz`, `/internal/admission_stats`.
 - Optional debug metrics: `/internal/metrics` when explicitly enabled; the default metrics path is OTel push from node collectors, not Prometheus scraping.
 - Scheduler state: `/internal/model_work_scheduler`, `/internal/model_work_scheduler/debug_state`, `/internal/debug/scheduler_decisions`, `/internal/model_work_scheduler/noop`.
 - Runtime desired state: `/internal/model_actor_supervisor`.
@@ -46,6 +47,17 @@ Current categories:
 - Actor administration: `/internal/actors`, `/internal/actors/kill`.
 - Maintenance actor diagnostics: `/internal/maintenance_cron_actor`.
 - Usage and checkpoint operator views: `/internal/usage_logs`, `/internal/usage_summary/{account_id}`, `/internal/v1/checkpoints`.
+
+`/api/v1/healthz` is intentionally public and minimal: it checks only the
+business control-plane dependencies needed to accept and track work, caches a
+successful value for 30s per API worker, and does not expose degraded internal
+state.
+
+`/api/v1/internal/healthz` is an internal lightweight health endpoint. It reads
+the current `ModelActorSupervisor` summary snapshot and process-local
+maintenance-cron/startup degraded markers, then returns a small component
+summary. It must not perform per-request fanout to runtime actors and does not
+promise scheduler, task, topology, or reaper summaries.
 
 ## Actor admin semantics
 

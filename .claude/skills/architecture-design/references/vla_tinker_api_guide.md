@@ -2,14 +2,14 @@
 
 This file is background material, not the normative contract.
 
-Current normative sources are:
+Historical source materials referenced by this guide were:
 
-- `docs/mint-openpi-vla-target.md`
-- `docs/README.md`
-- `docs/sub-targets/*.md`
+- the PR422 Mint OpenPI VLA target document
+- the PR422 VLA docs README
+- the PR422 VLA sub-target documents
 - the verified stage-local scripts under `src/mindlab-toolkit/examples/`
 
-This guide exists for readers who already know the upstream OpenPI workflow and want a concise map from that workflow to the current Mint surface.
+This guide exists for readers who already know the upstream OpenPI workflow and want a concise map from that workflow to the Mint surface tested during the VLA work. Current Mint architecture guidance lives in this `references/` directory.
 
 ## What Mint changes and what it does not
 
@@ -291,11 +291,11 @@ This file is now aligned with the current public Mint shape:
 
 This file is still not the normative source.
 
-If there is any conflict between this file and:
+At the time this guide was written, if there was any conflict between this file and:
 
-- `docs/mint-openpi-vla-target.md`
-- `docs/README.md`
-- `docs/sub-targets/*.md`
+- the PR422 Mint OpenPI VLA target document
+- the PR422 VLA docs README
+- the PR422 VLA sub-target documents
 - the verified stage-local scripts
 
-the normative docs and verified examples win.
+the then-normative docs and verified examples won. For current architecture, use this `references/` directory.

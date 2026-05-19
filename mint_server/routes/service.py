@@ -28,7 +28,7 @@ from ..auth_identity import can_manage_system
 from ..auth_identity import get_user_data as _request_user_data
 from ..auth_identity import get_user_id as _request_user_id
 from ..backend.session_heartbeat_store import session_heartbeat_store
-from ..health_checks import public_healthz_response
+from ..health_checks import internal_lightweight_healthz_response, public_business_healthz_response
 from ..model_access_control import can_access_model, get_access_denied_error
 from ..models.types import (
     CreateSamplingSessionRequest,
@@ -126,8 +126,14 @@ def _infer_base_model_from_checkpoint(
 
 @router.get("/healthz", response_model=None)
 async def healthz() -> dict:
-    """Public health endpoint for cheap API-worker readiness only."""
-    return public_healthz_response()
+    """Public business health endpoint for client readiness."""
+    return await public_business_healthz_response()
+
+
+@router.get("/internal/healthz", response_model=None)
+async def internal_healthz() -> dict:
+    """Lightweight internal operational health for gateway-mounted path."""
+    return await internal_lightweight_healthz_response()
 
 
 @router.get("/get_server_capabilities")
@@ -637,11 +643,11 @@ async def get_sampler(sampler_id: str, http_request: Request) -> GetSamplerRespo
             try:
                 from ..backend.sampling_session_store import async_get_sampling_session_info
 
-                detached = await async_get_sampling_session_info(sampler_id)
+                persisted = await async_get_sampling_session_info(sampler_id)
             except Exception:
-                detached = None
-            if isinstance(detached, dict):
-                base_model = detached.get("base_model")
+                persisted = None
+            if isinstance(persisted, dict):
+                base_model = persisted.get("base_model")
             elif session_manager is not None:
                 base_model, _adapter_path, _rank = _local_sampling_config(sampler_id)
 
@@ -680,11 +686,11 @@ async def get_sampler(sampler_id: str, http_request: Request) -> GetSamplerRespo
     try:
         from ..backend.sampling_session_store import async_get_sampling_session_info
 
-        detached = await async_get_sampling_session_info(sampler_id)
+        persisted = await async_get_sampling_session_info(sampler_id)
     except Exception:
-        detached = None
-    if isinstance(detached, dict):
-        base_model = detached.get("base_model")
+        persisted = None
+    if isinstance(persisted, dict):
+        base_model = persisted.get("base_model")
         if base_model:
             return GetSamplerResponse(
                 sampler_id=sampler_id,

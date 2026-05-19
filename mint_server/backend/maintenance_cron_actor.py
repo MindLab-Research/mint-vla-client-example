@@ -35,7 +35,6 @@ _register_ray_reconnect_invalidator(_reset_cached_actor_handle)
 _LOOP_FUTURE_REAPER = "future_reaper"
 _LOOP_CHECKPOINT_REAPER = "checkpoint_reaper"
 _LOOP_CHECKPOINT_MIRROR = "checkpoint_mirror"
-_LOOP_ACTOR_RECONCILIATION = "actor_reconciliation"
 _LOOP_TRAINING_CLEANUP = "training_cleanup"
 _LOOP_SAMPLING_CLEANUP = "sampling_cleanup"
 
@@ -63,11 +62,13 @@ def _future_reap_interval_s() -> float:
 def run_future_reaper_once() -> dict[str, Any]:
     from .task_state_store import task_futures
 
-    asyncio.run(task_futures.async_ensure_started())
     reaped = asyncio.run(task_futures.async_reap())
     return {
         "expired": list(reaped.get("expired", [])),
         "timed_out": list(reaped.get("timed_out", [])),
+        "payload_evicted": list(reaped.get("payload_evicted", [])),
+        "tombstones_deleted": list(reaped.get("tombstones_deleted", [])),
+        "payload_evict_errors": list(reaped.get("payload_evict_errors", [])),
     }
 
 
@@ -79,37 +80,25 @@ def run_checkpoint_mirror_once() -> dict[str, Any]:
     return process_pending_checkpoint_mirrors()
 
 
-def _actor_reconcile_interval_s() -> float:
-    return float(os.environ.get("MINT_ACTOR_RECONCILE_INTERVAL_S", "60"))
-
-
-def run_actor_reconciliation_once() -> dict[str, Any]:
-    from .actor_reconciliation import cleanup_stale_actors_once
-
-    import asyncio
-
-    return asyncio.run(cleanup_stale_actors_once())
-
-
 def run_training_cleanup_once() -> dict[str, Any]:
     stale_after_s = float(os.environ.get("MINT_TRAINING_HEARTBEAT_STALE_S", "300"))
     if stale_after_s <= 0:
         return {"cleaned": []}
 
-    from .training_cleanup_executor import training_cleanup_executor
+    from .training_cleanup_executor import cleanup_stale_training_sessions_once_impl
 
     import asyncio
 
-    cleaned = asyncio.run(training_cleanup_executor.async_cleanup_stale_sessions_once(stale_after_s=stale_after_s))
+    cleaned = asyncio.run(cleanup_stale_training_sessions_once_impl(stale_after_s=stale_after_s))
     return {"cleaned": list(cleaned)}
 
 
 def run_sampling_cleanup_once() -> dict[str, Any]:
-    from .sampling_cleanup_executor import sampling_cleanup_executor
+    from .sampling_cleanup_executor import cleanup_stale_sampling_sessions_once_impl
 
     import asyncio
 
-    cleaned = asyncio.run(sampling_cleanup_executor.async_cleanup_stale_sessions_once())
+    cleaned = asyncio.run(cleanup_stale_sampling_sessions_once_impl())
     return {"cleaned": list(cleaned)}
 
 
@@ -185,11 +174,6 @@ def _get_or_create_actor():
                     "interval_s": float(get_checkpoint_mirror_poll_s()),
                     "run_immediately": True,
                     "runner": run_checkpoint_mirror_once,
-                },
-                _LOOP_ACTOR_RECONCILIATION: {
-                    "interval_s": _actor_reconcile_interval_s(),
-                    "run_immediately": False,
-                    "runner": run_actor_reconciliation_once,
                 },
                 _LOOP_TRAINING_CLEANUP: {
                     "interval_s": _future_reap_interval_s(),
@@ -327,7 +311,7 @@ class MaintenanceCronActor:
         _ACTOR_HANDLE = None
         self._ray_actor = None
 
-    def _get_ray_actor(self):
+    def _get_ray_actor(self, *, create_if_missing: bool = True):
         import ray
 
         global _ACTOR_HANDLE
@@ -338,6 +322,17 @@ class MaintenanceCronActor:
             return self._ray_actor
         if not ray.is_initialized():
             raise RuntimeError("Ray not initialized")
+        if not create_if_missing:
+            name = _actor_name()
+            namespace = _ray_namespace()
+            try:
+                self._ray_actor = ray.get_actor(name, namespace=namespace)
+            except Exception as e:
+                raise RuntimeError(
+                    f"MaintenanceCronActor unavailable actor_name={name!r} namespace={namespace!r}"
+                ) from e
+            _ACTOR_HANDLE = self._ray_actor
+            return self._ray_actor
         self._ray_actor = _get_or_create_actor()
         return self._ray_actor
 
@@ -395,25 +390,48 @@ class MaintenanceCronActor:
         actor = self._get_ray_actor()
         return _await_ray_ref_sync(actor.ensure_started.remote(), timeout_s=float(timeout_s))
 
-    async def async_health_snapshot(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
-        actor = self._get_ray_actor()
+    async def async_health_snapshot(
+        self,
+        *,
+        timeout_s: float = 10.0,
+        create_if_missing: bool = True,
+    ) -> dict[str, Any]:
+        actor = self._get_ray_actor(create_if_missing=create_if_missing)
         snapshot = await _await_with_ray_get_timeout(
             _await_ray_ref(actor.async_health_snapshot.remote()),
             timeout_s=float(timeout_s),
         )
+        if not create_if_missing:
+            return snapshot
         await self._ensure_code_identity_async(snapshot)
-        actor = self._get_ray_actor()
+        actor = self._get_ray_actor(create_if_missing=create_if_missing)
         return await _await_with_ray_get_timeout(
             _await_ray_ref(actor.async_health_snapshot.remote()),
             timeout_s=float(timeout_s),
         )
 
-    def health_snapshot(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
-        actor = self._get_ray_actor()
+    def health_snapshot(
+        self,
+        *,
+        timeout_s: float = 10.0,
+        create_if_missing: bool = True,
+    ) -> dict[str, Any]:
+        actor = self._get_ray_actor(create_if_missing=create_if_missing)
         snapshot = _await_ray_ref_sync(actor.health_snapshot.remote(), timeout_s=float(timeout_s))
+        if not create_if_missing:
+            return snapshot
         self._ensure_code_identity_sync(snapshot)
-        actor = self._get_ray_actor()
+        actor = self._get_ray_actor(create_if_missing=create_if_missing)
         return _await_ray_ref_sync(actor.health_snapshot.remote(), timeout_s=float(timeout_s))
+
+    async def async_ping(self, *, timeout_s: float = 5.0) -> dict[str, Any]:
+        snapshot = await self.async_health_snapshot(timeout_s=timeout_s, create_if_missing=False)
+        return {
+            "ok": True,
+            "actor_name": snapshot.get("actor_name"),
+            "namespace": snapshot.get("namespace"),
+            "epoch_id": snapshot.get("epoch_id"),
+        }
 
     async def async_run_once(self, loop_name: str, *, timeout_s: float = 30.0) -> dict[str, Any]:
         actor = self._get_ray_actor()

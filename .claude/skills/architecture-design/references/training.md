@@ -12,9 +12,16 @@ See `training-multitenancy.md` for the dense vs Megatron swap mechanisms.
 
 ## State ownership
 
-- `TrainingSessionManager` stores per-`model_id` metadata and lifecycle in server memory.
+- `TrainingSessionManager` keeps API-process working objects for active
+  `model_id`s, inflight counters, and create-time scratch state. It is not the
+  durable authority.
+- `TaskStateStore` owns durable per-`model_id` training-session metadata,
+  session indexes, heartbeats, and restore records through the
+  `training_session_store`, `session_index_store`, and
+  `session_heartbeat_store` facades.
 - The actual training state (weights, optimizer, step counters) lives inside Ray actors.
-- `ModelActorSupervisor` and `ModelWorkScheduler` own runtime reconciliation and scheduling. `ModelActorInventory` is the local inventory for GPU actors.
+- `ModelActorSupervisor` owns runtime reconciliation and its internal
+  supervisor inventory; `ModelWorkScheduler` owns hot scheduling and leases.
 
 ## Backends
 
@@ -34,14 +41,14 @@ The idle cleanup mirrors the inference `SessionManager._cleanup_loop` pattern, i
 - **Queued HTTP handlers** call `mark_inflight(+1)` before enqueue so queue delay cannot race idle cleanup.
 - **Background workers** for queued existing-session operations release that claim with `mark_inflight(-1)` in `finally`, which also refreshes `last_activity` on completion.
 - **`_do_create_model`** / **`_do_create_model_from_state`** call `mark_inflight(+1)` right after `create_session()` to protect during slow actor creation.
-- **Session activity persistence**: `touch_session()` / `mark_inflight()` write `last_activity` into the detached training-session store so API restarts restore the real idle deadline instead of falling back to `created_at`.
+- **Session activity persistence**: `touch_session()` / `mark_inflight()` write `last_activity` through `TaskStateStore` training-session methods so API restarts restore the real idle deadline instead of falling back to `created_at`.
 - **Read-only lookups** (`GET /models/{model_id}`, `GET /training_runs`, existence checks) do NOT extend the idle deadline.
 - **`_restore_training_session`** restores persisted `last_activity` when present, and falls back to `created_at` only for older store entries that predate that field.
 
 When cleanup fires, it skips sessions with `inflight_ops > 0`, then performs the full deletion flow:
 1. `engine.shutdown_session` (release GPU actor reference)
 2. `delete_session` (remove from in-memory manager)
-3. `delete_training_session` (remove from detached Ray store)
-4. `model_actor_inventory.clear_session` (clear stale session pins)
+3. `delete_training_session` (remove TaskStateStore-backed training metadata)
+4. `ModelActorSupervisor.clear_session` (clear stale supervisor-owned session pins)
 
 This prevents unbounded session accumulation when clients disconnect without calling DELETE.

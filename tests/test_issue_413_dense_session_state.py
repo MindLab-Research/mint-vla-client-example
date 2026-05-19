@@ -10,7 +10,7 @@ pytest.importorskip("ray")
 
 from mint_server.backend import dense_session_state as dense_state_module
 import mint_server.backend.model_actor_inventory as model_actor_inventory_module
-from mint_server.backend.model_actor_supervisor import ActorType, get_model_actor_supervisor
+from mint_server.backend.model_actor_supervisor import ActorType, ModelActorSupervisor
 from mint_server.backend.training_session_manager import TrainingSession
 from mint_server.backend.verl_training import SessionStateManager, TrainingWorker, VerlTrainingEngine
 from mint_server.config import config as server_config
@@ -85,7 +85,13 @@ def test_issue_413_shutdown_session_reclaims_dense_state_for_shared_actor(
     monkeypatch.setattr(config_module, "PFS_RUNTIME_ENV_ROOT", str(runtime_env_root))
     monkeypatch.setattr(config_module, "PFS_PYTHONPATH", str((tmp_path / "runtime_py").resolve()))
     monkeypatch.setattr(model_actor_inventory_module.ray, "is_initialized", lambda: False)
-    pool = get_model_actor_supervisor()
+    pool = ModelActorSupervisor()
+    import mint_server.backend.model_actor_supervisor as supervisor_module
+    import mint_server.backend.verl_training as verl_training
+
+    monkeypatch.setattr(supervisor_module, "model_actor_supervisor", pool)
+    monkeypatch.setattr(supervisor_module, "get_model_actor_supervisor", lambda: pool)
+    monkeypatch.setattr(verl_training, "get_model_actor_supervisor", lambda: pool, raising=False)
     pool.clear(kill_actors=False)
     actor_name = f"mint_dense_test_{uuid.uuid4().hex}"
     model_id = f"model_{uuid.uuid4().hex}"
@@ -134,6 +140,8 @@ def test_issue_413_shutdown_session_reclaims_dense_state_for_shared_actor(
 
 @pytest.mark.anyio
 async def test_issue_413_internal_metrics_include_dense_session_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MINT_INTERNAL_PROMETHEUS_METRICS_ENABLED", "1")
+
     async def _fake_admission_stats(*, include_actor_rss: bool = True) -> dict:
         assert include_actor_rss is False
         return {

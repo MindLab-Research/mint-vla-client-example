@@ -275,6 +275,7 @@ async def _fake_admission_stats_with_stale_cached_rss(*, include_actor_rss: bool
 
 
 def test_issue_248_internal_metrics_omits_unknown_model_actor_inventory_rss(monkeypatch) -> None:
+    monkeypatch.setenv("MINT_INTERNAL_PROMETHEUS_METRICS_ENABLED", "1")
     monkeypatch.setattr(internal_routes, "admission_stats", _fake_admission_stats)
     resp = asyncio.run(internal_routes.metrics())
     text = resp.body.decode("utf-8")
@@ -368,6 +369,7 @@ def test_issue_248_internal_metrics_omits_unknown_model_actor_inventory_rss(monk
 
 
 def test_issue_248_internal_metrics_emits_group_rss_when_cached_sample_exists(monkeypatch) -> None:
+    monkeypatch.setenv("MINT_INTERNAL_PROMETHEUS_METRICS_ENABLED", "1")
     monkeypatch.setattr(internal_routes, "admission_stats", _fake_admission_stats_with_cached_rss)
     resp = asyncio.run(internal_routes.metrics())
     text = resp.body.decode("utf-8")
@@ -391,6 +393,7 @@ def test_issue_248_internal_metrics_emits_group_rss_when_cached_sample_exists(mo
 
 
 def test_issue_248_internal_metrics_marks_stale_cached_rss_without_emitting_value(monkeypatch) -> None:
+    monkeypatch.setenv("MINT_INTERNAL_PROMETHEUS_METRICS_ENABLED", "1")
     monkeypatch.setattr(internal_routes, "admission_stats", _fake_admission_stats_with_stale_cached_rss)
     resp = asyncio.run(internal_routes.metrics())
     text = resp.body.decode("utf-8")
@@ -566,6 +569,8 @@ def test_issue_248_admission_stats_metrics_path_uses_cached_pool_snapshot(monkey
 
 
 def test_issue_248_metrics_path_exports_cached_scheduler_model_load(monkeypatch) -> None:
+    monkeypatch.setenv("MINT_INTERNAL_PROMETHEUS_METRICS_ENABLED", "1")
+
     async def _stats(*, include_actor_rss: bool = True) -> dict:
         return {
             "model_work_scheduler": {
@@ -617,7 +622,8 @@ def test_issue_248_scheduler_decisions_debug_route_proxies_filters(monkeypatch) 
     model_work_scheduler_module = importlib.import_module("mint_server.backend.model_work_scheduler")
 
     class _FakeModelWorkScheduler:
-        async def stats(self, *, timeout_s: float = 10.0) -> dict:
+        async def stats(self, *, timeout_s: float = 10.0, create_if_missing: bool = True) -> dict:
+            assert create_if_missing is False
             return {
                 "depth": 2,
                 "backlog_depth_by_domain": {
@@ -658,6 +664,8 @@ def test_issue_248_scheduler_decisions_debug_route_proxies_filters(monkeypatch) 
 
 
 def test_issue_248_internal_metrics_exports_ray_control_plane_cache_timestamps(monkeypatch) -> None:
+    monkeypatch.setenv("MINT_INTERNAL_PROMETHEUS_METRICS_ENABLED", "1")
+
     async def _fake_with_ray(*, include_actor_rss: bool = True) -> dict:
         stats = await _fake_admission_stats(include_actor_rss=include_actor_rss)
         stats["ray_cluster"] = {

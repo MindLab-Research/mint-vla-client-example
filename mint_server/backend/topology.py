@@ -4,9 +4,11 @@ import ipaddress
 import json
 import os
 import re
+import shlex
 import subprocess
 import tempfile
 import time
+import urllib.request
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,6 +39,8 @@ class TopologyConfig:
     state_path: str
     nodes: dict[str, TopologyNodeDesired]
     providers: dict[str, Any] = field(default_factory=dict)
+    ray_dashboard_url: str | None = None
+    ray_head_ip_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -136,9 +140,19 @@ def stable_provider_task_name(deployment_env: str, alias: str) -> str:
     return f"mint-{env}-worker-{idx}"
 
 
+def worker_alias_index(alias: str) -> int:
+    alias = _validate_alias(alias)
+    return int(alias.rsplit("-", 1)[-1])
+
+
 def default_topology_state_path(deployment_env: str) -> str:
     env = str(deployment_env or "").strip() or "dev"
     return f"/vePFS-Mindverse/share/mint/{env}/runtime/topology_state.yaml"
+
+
+def default_ray_head_ip_path(deployment_env: str) -> str:
+    env = str(deployment_env or "").strip() or "dev"
+    return f"/vePFS-Mindverse/share/mint/{env}/ray/head-address/ray_head_ip.txt"
 
 
 def load_topology_config(path: str | os.PathLike[str]) -> TopologyConfig:
@@ -165,6 +179,17 @@ def load_topology_config(path: str | os.PathLike[str]) -> TopologyConfig:
     if not isinstance(desired_raw, list):
         raise ValueError("topology config nodes.desired must be a list")
     providers = _require_mapping(root.get("providers") or {}, context="topology config providers")
+    ray_root = _require_mapping(root.get("ray") or {}, context="topology config ray")
+    ray_dashboard_url = str(
+        os.environ.get("MINT_RAY_DASHBOARD_URL")
+        or ray_root.get("dashboard_url")
+        or ""
+    ).strip() or None
+    ray_head_ip_path = str(
+        os.environ.get("MINT_RAY_HEAD_ADDRESS_PATH")
+        or ray_root.get("head_ip_path")
+        or default_ray_head_ip_path(deployment_env)
+    ).strip()
     nodes: dict[str, TopologyNodeDesired] = {}
     for idx, item in enumerate(desired_raw):
         item_map = _require_mapping(item, context=f"topology config nodes.desired[{idx}]")
@@ -209,6 +234,8 @@ def load_topology_config(path: str | os.PathLike[str]) -> TopologyConfig:
         state_path=state_path,
         nodes=nodes,
         providers=providers,
+        ray_dashboard_url=ray_dashboard_url,
+        ray_head_ip_path=ray_head_ip_path,
     )
 
 
@@ -252,6 +279,87 @@ def default_ray_node_lister() -> Iterable[RayNodeState]:
             )
         )
     return nodes
+
+
+def _ray_nodes_from_dashboard_payload(payload: Any) -> list[RayNodeState]:
+    if not isinstance(payload, dict):
+        return []
+    result = payload.get("data")
+    if isinstance(result, dict):
+        result = result.get("result", result)
+    if isinstance(result, dict):
+        rows = result.get("result", [])
+    elif isinstance(result, list):
+        rows = result
+    else:
+        rows = []
+    if not isinstance(rows, list):
+        return []
+    nodes: list[RayNodeState] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        node_ip = str(row.get("node_ip") or row.get("nodeName") or "").strip()
+        if not node_ip:
+            continue
+        resources = row.get("resources_total") or row.get("resourcesTotal") or {}
+        gpu_count = None
+        if isinstance(resources, dict) and "GPU" in resources:
+            try:
+                gpu_count = int(resources.get("GPU") or 0)
+            except Exception:
+                gpu_count = None
+        state = str(row.get("state") or "").strip().upper()
+        nodes.append(
+            RayNodeState(
+                node_ip=node_ip,
+                ray_node_id=str(row.get("node_id") or row.get("nodeId") or "").strip() or None,
+                alive=state == "ALIVE" if state else bool(row.get("alive", True)),
+                gpu_count=gpu_count,
+                hostname=str(row.get("node_name") or row.get("hostname") or "").strip() or None,
+            )
+        )
+    return nodes
+
+
+def ray_dashboard_node_lister(
+    *,
+    dashboard_url: str | None = None,
+    head_ip_path: str | os.PathLike[str] | None = None,
+    timeout_s: float = 5.0,
+) -> Iterable[RayNodeState]:
+    url = str(dashboard_url or "").strip().rstrip("/")
+    if not url and head_ip_path:
+        try:
+            head_ip = Path(head_ip_path).read_text(encoding="utf-8").strip()
+        except OSError:
+            head_ip = ""
+        if head_ip:
+            url = f"http://{head_ip}:8265"
+    if not url:
+        return []
+    try:
+        with urllib.request.urlopen(f"{url}/api/v0/nodes", timeout=float(timeout_s)) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return []
+    return _ray_nodes_from_dashboard_payload(payload)
+
+
+def default_ray_node_lister_for_config(config: TopologyConfig | None) -> RayNodeLister:
+    def _list_nodes() -> Iterable[RayNodeState]:
+        by_ip: dict[str, RayNodeState] = {}
+        for node in default_ray_node_lister():
+            by_ip[node.node_ip] = node
+        if config is not None:
+            for node in ray_dashboard_node_lister(
+                dashboard_url=config.ray_dashboard_url,
+                head_ip_path=config.ray_head_ip_path,
+            ):
+                by_ip[node.node_ip] = node
+        return list(by_ip.values())
+
+    return _list_nodes
 
 
 def _strip_volc_json_banner(output: str) -> Any:
@@ -318,16 +426,28 @@ class VolcanoTopologyProvider:
         self,
         *,
         volc_bin: str = "/root/.volc/bin/volc",
+        submit_host: str | None = None,
         command_runner: CommandRunner | None = None,
         timeout_s: float = 30.0,
         fetch_logs: bool = True,
     ) -> None:
         self._volc_bin = str(volc_bin or "/root/.volc/bin/volc")
+        self._submit_host = str(submit_host or "").strip() or None
         self._command_runner = command_runner or _default_command_runner
         self._timeout_s = float(timeout_s)
         self._fetch_logs = bool(fetch_logs)
 
     def _run(self, argv: list[str], *, timeout_s: float | None = None) -> str:
+        if self._submit_host:
+            argv = [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                self._submit_host,
+                shlex.join(argv),
+            ]
         return self._command_runner(argv, self._timeout_s if timeout_s is None else float(timeout_s))
 
     def list_tasks(self, config: TopologyConfig) -> Iterable[ProviderTaskState]:
@@ -400,9 +520,22 @@ class VolcanoTopologyProvider:
             deployment_env=config.deployment_env,
             cluster_id=config.cluster_id,
         )
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".yaml", delete=False) as f:
-            temp_path = f.name
-            f.write(rendered)
+        if self._submit_host:
+            submit_dir = Path(config.state_path).parent / "topology-submits"
+            submit_dir.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                suffix=".yaml",
+                dir=str(submit_dir),
+                delete=False,
+            ) as f:
+                temp_path = f.name
+                f.write(rendered)
+        else:
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".yaml", delete=False) as f:
+                temp_path = f.name
+                f.write(rendered)
         try:
             self._run([self._volc_bin, "ml_task", "submit", "-c", temp_path, "--output", "json"])
         finally:
@@ -459,10 +592,10 @@ def render_volcano_worker_template(
 def default_provider_task_lister_for_config(config: TopologyConfig) -> ProviderTaskLister:
     providers = {node.provider for node in config.nodes.values()}
     if providers == {"volcano"}:
+        provider_cfg = config.providers.get("volcano") if isinstance(config.providers.get("volcano"), dict) else {}
         provider = VolcanoTopologyProvider(
-            volc_bin=str((config.providers.get("volcano") or {}).get("volc_bin") or "/root/.volc/bin/volc")
-            if isinstance(config.providers.get("volcano"), dict)
-            else "/root/.volc/bin/volc"
+            volc_bin=str(provider_cfg.get("volc_bin") or "/root/.volc/bin/volc"),
+            submit_host=str(provider_cfg.get("submit_host") or "").strip() or None,
         )
         return provider.list_tasks
     return empty_provider_task_lister
@@ -471,10 +604,10 @@ def default_provider_task_lister_for_config(config: TopologyConfig) -> ProviderT
 def default_provider_task_submitter_for_config(config: TopologyConfig) -> ProviderTaskSubmitter:
     providers = {node.provider for node in config.nodes.values()}
     if providers == {"volcano"}:
+        provider_cfg = config.providers.get("volcano") if isinstance(config.providers.get("volcano"), dict) else {}
         provider = VolcanoTopologyProvider(
-            volc_bin=str((config.providers.get("volcano") or {}).get("volc_bin") or "/root/.volc/bin/volc")
-            if isinstance(config.providers.get("volcano"), dict)
-            else "/root/.volc/bin/volc"
+            volc_bin=str(provider_cfg.get("volc_bin") or "/root/.volc/bin/volc"),
+            submit_host=str(provider_cfg.get("submit_host") or "").strip() or None,
         )
         return provider.submit_task
     return noop_provider_task_submitter
@@ -508,7 +641,7 @@ class TopologyManager:
             if self._config is not None
             else noop_provider_task_submitter
         )
-        self._ray_node_lister = ray_node_lister or default_ray_node_lister
+        self._ray_node_lister = ray_node_lister or default_ray_node_lister_for_config(self._config)
         self._state: TopologyRuntimeState | None = None
 
     @property
@@ -530,7 +663,8 @@ class TopologyManager:
         provider_tasks = {task.alias: task for task in self._provider_task_lister(config)}
         ray_nodes_by_ip = {node.node_ip: node for node in self._ray_node_lister() if node.node_ip}
         runtime_nodes: dict[str, TopologyNodeRuntime] = {}
-        for alias, desired in sorted(config.nodes.items()):
+        first_blocking_alias: str | None = None
+        for alias, desired in sorted(config.nodes.items(), key=lambda item: worker_alias_index(item[0])):
             task_name = stable_provider_task_name(config.deployment_env, alias)
             task = provider_tasks.get(alias)
             if not desired.enabled:
@@ -544,8 +678,28 @@ class TopologyManager:
                     last_error=None,
                 )
                 continue
+            if first_blocking_alias is not None:
+                runtime_nodes[alias] = TopologyNodeRuntime(
+                    alias=alias,
+                    state="waiting",
+                    provider=desired.provider,
+                    provider_task_name=task_name,
+                    template=desired.template,
+                    enabled=True,
+                    provider_task_id=task.task_id if task else None,
+                    node_ip=task.node_ip if task else None,
+                    gpu_count=task.gpu_count if task else desired.gpu_count,
+                    last_error=f"waiting for lower worker alias {first_blocking_alias}",
+                )
+                continue
             if task is None or not task.live:
                 self._provider_task_submitter(config, desired)
+                last_error = (
+                    task.error
+                    or f"provider task {task.task_name} is not live: state={task.raw_state}"
+                    if task
+                    else f"missing provider task {task_name}"
+                )
                 runtime_nodes[alias] = TopologyNodeRuntime(
                     alias=alias,
                     state="provisioning",
@@ -556,8 +710,9 @@ class TopologyManager:
                     provider_task_id=task.task_id if task else None,
                     node_ip=task.node_ip if task else None,
                     gpu_count=task.gpu_count if task else desired.gpu_count,
-                    last_error=task.error if task else "provider task is not live",
+                    last_error=last_error,
                 )
+                first_blocking_alias = alias
                 continue
             node_ip = str(task.node_ip or "").strip()
             if not node_ip:
@@ -570,8 +725,9 @@ class TopologyManager:
                     enabled=True,
                     provider_task_id=task.task_id,
                     gpu_count=task.gpu_count or desired.gpu_count,
-                    last_error="provider task has no node_ip",
+                    last_error=f"provider task {task.task_name} has no node_ip",
                 )
+                first_blocking_alias = alias
                 continue
             ray_node = ray_nodes_by_ip.get(node_ip)
             if ray_node is None or not ray_node.alive:
@@ -585,8 +741,9 @@ class TopologyManager:
                     provider_task_id=task.task_id,
                     node_ip=node_ip,
                     gpu_count=task.gpu_count or desired.gpu_count,
-                    last_error="Ray node is not alive",
+                    last_error=f"Ray node {node_ip} is not alive",
                 )
+                first_blocking_alias = alias
                 continue
             gpu_count = ray_node.gpu_count if ray_node.gpu_count is not None else task.gpu_count
             if desired.gpu_count is not None and gpu_count is not None and int(gpu_count) < int(desired.gpu_count):
@@ -603,6 +760,7 @@ class TopologyManager:
                     gpu_count=gpu_count,
                     last_error=f"Ray node GPU count {gpu_count} < desired {desired.gpu_count}",
                 )
+                first_blocking_alias = alias
                 continue
             runtime_nodes[alias] = TopologyNodeRuntime(
                 alias=alias,

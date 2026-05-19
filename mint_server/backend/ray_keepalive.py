@@ -22,9 +22,9 @@ async def ray_get_with_model_actor_supervisor_keepalive(
     timeout_s: float | None = None,
     request_id: str | None = None,
 ) -> Any:
-    """ray.get(ref) while periodically touching ModelActorInventory for actor_name.
+    """ray.get(ref) while periodically touching supervisor inventory for actor_name.
 
-    vLLM inference requests can run longer than ModelActorInventory's session idle
+    vLLM inference requests can run longer than supervisor inventory's session idle
     timeout; without periodic touches, a busy vLLM actor can be considered idle
     and evicted mid-request.
 
@@ -35,7 +35,7 @@ async def ray_get_with_model_actor_supervisor_keepalive(
     if interval_s <= 0:
         interval_s = 30.0
 
-    # Keepalive must be more frequent than ModelActorInventory's idle cutoff, otherwise
+    # Keepalive must be more frequent than supervisor inventory's idle cutoff, otherwise
     # a busy actor can still appear idle and be evicted mid-request.
     idle_timeout_s = float(getattr(server_config, "model_actor_inventory_session_idle_timeout_s", 300) or 300)
     interval_s = min(interval_s, max(0.5, idle_timeout_s / 4.0))

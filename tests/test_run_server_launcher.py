@@ -72,7 +72,6 @@ def test_launcher_observability_reports_normalization_flags() -> None:
         },
         environ={
             "MINT_RAY_NAMESPACE": "ns-test",
-            "MINT_STARTUP_LEASE_ACTOR_NAME": "lease-test",
             "RAY_ADDRESS": "192.168.38.184:6379",
             "RAY_CLIENT_ADDRESS": "ray://192.168.38.184:10001",
             "MINT_SERVER_ENV_NORMALIZED": "1",
@@ -85,7 +84,6 @@ def test_launcher_observability_reports_normalization_flags() -> None:
     assert meta["mode"] == "multi-worker"
     assert meta["workers"] == 8
     assert meta["namespace"] == "ns-test"
-    assert meta["startup_lease_actor"] == "lease-test"
     assert meta["env_normalized"] is True
     assert meta["pythonpath_changed"] is True
     assert meta["ld_library_path_changed"] is False

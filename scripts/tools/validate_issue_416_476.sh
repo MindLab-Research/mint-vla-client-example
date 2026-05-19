@@ -63,7 +63,6 @@ cd "\$ROOT"
 nohup env \
   ISSUE_SERVER_ROOT="\$ROOT" \
   ISSUE_NAMESPACE="\$NS" \
-  ISSUE_STARTUP_LEASE=mint_startup_lease_issue_416_r17 \
   ISSUE_PORT="\$PORT" \
   ISSUE_LOG_FILE="\$LOG" \
   ISSUE_USAGE_LOG_DIR=/tmp/mint_usage_issue_416_r17 \

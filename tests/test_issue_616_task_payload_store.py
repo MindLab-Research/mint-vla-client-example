@@ -68,3 +68,20 @@ def test_task_payload_store_rejects_read_outside_root(tmp_path) -> None:
 
     with pytest.raises(TaskPayloadStoreError, match="outside root"):
         store.read_json_payload(path=outside)
+
+
+def test_task_payload_store_deletes_json_payload(tmp_path) -> None:
+    store = TaskPayloadStore(tmp_path)
+    out = store.write_json_payload(request_id="req-delete", attempt_id="attempt-1", payload={"ok": True})
+
+    assert store.delete_json_payload(path=out["path"]) is True
+    assert store.delete_json_payload(path=out["path"]) is False
+
+
+def test_task_payload_store_rejects_delete_outside_root(tmp_path) -> None:
+    store = TaskPayloadStore(tmp_path / "root")
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(TaskPayloadStoreError, match="outside root"):
+        store.delete_json_payload(path=outside)

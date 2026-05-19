@@ -29,7 +29,7 @@ def _retrieve_grace_s() -> float:
     try:
         return max(0.0, float(server_config.retrieve_future_grace_s))
     except Exception:
-        return 120.0
+        return 600.0
 
 
 def _retrieve_pending_min_poll_s() -> float:
@@ -71,7 +71,7 @@ def _local_hot_ttl_s() -> float:
     try:
         return max(0.0, float(server_config.retrieve_future_hot_ttl_s))
     except Exception:
-        return 0.0
+        return 300.0
 
 
 def _recent_put(request_id: str, payload: Any, *, ttl_s: float | None = None) -> None:
@@ -739,7 +739,19 @@ async def retrieve_future(
         return payload
     else:
         _pending_hint_clear(body.request_id)
-        result = await task_futures.async_get_result(body.request_id)
+        try:
+            result = await task_futures.async_get_result(body.request_id)
+        except Exception:
+            task_state_payload = await _lookup_task_state_terminal(body.request_id, http_request)
+            if task_state_payload is not None:
+                logger.info("[retrieve_future] request_id=%s status=done served=task_state_store", body.request_id)
+                return task_state_payload
+            raise
+        if result is None:
+            task_state_payload = await _lookup_task_state_terminal(body.request_id, http_request)
+            if task_state_payload is not None:
+                logger.info("[retrieve_future] request_id=%s status=done served=task_state_store", body.request_id)
+                return task_state_payload
         _recent_put(body.request_id, result, ttl_s=_local_hot_ttl_s())
         logger.info("[retrieve_future] request_id=%s status=done", body.request_id)
         try:

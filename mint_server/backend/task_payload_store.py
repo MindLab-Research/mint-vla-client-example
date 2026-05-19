@@ -135,6 +135,22 @@ class TaskPayloadStore:
             )
         return json.loads(data.decode("utf-8"))
 
+    def delete_json_payload(self, *, path: str | os.PathLike[str]) -> bool:
+        p = Path(path)
+        try:
+            resolved = p.resolve(strict=False)
+            root = self._root_dir.resolve()
+        except OSError as e:
+            raise TaskPayloadStoreError(f"failed to resolve payload path: {p}") from e
+        if root not in resolved.parents and resolved != root:
+            raise TaskPayloadStoreError(f"payload path outside root: {p}")
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            return False
+        _fsync_directory(p.parent)
+        return True
+
     async def async_read_json_payload(
         self,
         *,
@@ -146,3 +162,6 @@ class TaskPayloadStore:
             path=path,
             expected_checksum=expected_checksum,
         )
+
+    async def async_delete_json_payload(self, *, path: str | os.PathLike[str]) -> bool:
+        return await asyncio.to_thread(self.delete_json_payload, path=path)

@@ -49,7 +49,10 @@ Failure and restart behavior:
 - The disk-backed session swap is an isolation mechanism for time-slicing, not a durable "resume training anywhere" mechanism.
 
 Idle behavior:
-- `TrainingWorker` is created with `idle_timeout=0` by default (no self-termination); scheduler-owned runtimes are reconciled by `ModelActorSupervisor`, while direct paths register live actors in `ModelActorInventory`.
+- `TrainingWorker` is created with `idle_timeout=0` by default (no
+  self-termination); scheduler-owned runtimes are reconciled by
+  `ModelActorSupervisor`, while direct launch paths must publish live actor
+  metadata through the supervisor inventory contract.
 
 ## MoE training: shared MegatronWorkerGroup with per-session isolation
 
@@ -95,8 +98,10 @@ Failure and restart behavior:
 Eviction kills whole actors. Session state caches in memory are lost.
 
 To reduce accidental eviction during active training:
-- MoE actors: `VerlTrainingEngine._touch_actor()` calls `ModelActorInventory.touch(actor_name)` and sets `current_session`.
-- Dense pool entries and registry entries are also touched on reuse.
+- MoE actors: `VerlTrainingEngine._touch_actor()` touches the actor through
+  `ModelActorSupervisor` inventory methods and sets `current_session`.
+- Dense pool entries and registry entries are also touched on reuse through the
+  same supervisor-owned inventory surface.
 
 Eviction is still possible when a session stops making requests long enough to be considered idle.
 

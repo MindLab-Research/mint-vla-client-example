@@ -1,6 +1,10 @@
 # VLA next benchmarks and demos
 
-This note summarizes the most realistic next benchmarks and demos for the current MinT VLA stack, based on the OpenPI and LIBERO-oriented path that already runs in this repository.
+Date: 2026-04-08
+
+This historical research note summarizes the most realistic next benchmarks and
+demos for the MinT VLA stack observed on 2026-04-08, based on the OpenPI and
+LIBERO-oriented path that ran in that repository state.
 
 ## Source-grounded constraints
 
@@ -63,7 +67,7 @@ Why it is attractive:
 - It tests long-horizon compositional control, which is a stronger story than single-instruction tabletop tasks.
 
 What blocks it:
-- The current MinT VLA path needs a better sequential-evaluation story first.
+- The MinT VLA path observed on 2026-04-08 needed a better sequential-evaluation story first.
 
 ### RLBench
 

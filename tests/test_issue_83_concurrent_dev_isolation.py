@@ -49,14 +49,8 @@ def test_detached_store_actors_use_mint_ray_namespace(monkeypatch):
     import importlib
 
     task_state_store_mod = importlib.import_module("mint_server.backend.task_state_store")
-    gateway_session_store_mod = importlib.import_module("mint_server.backend.gateway_session_store")
-    sampling_session_store_mod = importlib.import_module("mint_server.backend.sampling_session_store")
-    training_session_store_mod = importlib.import_module("mint_server.backend.training_session_store")
 
     assert task_state_store_mod._ray_namespace() == "ns_mint"
-    assert sampling_session_store_mod._ray_namespace() == "ns_mint"
-    assert training_session_store_mod._ray_namespace() == "ns_mint"
-    assert gateway_session_store_mod._ray_namespace() == "ns_mint"
 
 
 def test_training_session_metadata_namespace_is_ray_namespace():

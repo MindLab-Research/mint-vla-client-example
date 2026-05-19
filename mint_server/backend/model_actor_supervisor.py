@@ -1,15 +1,26 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import logging
 import os
 import re
+import socket
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
-from .async_ray_control import async_get_ray_ref
+from ..config import (
+    PFS_PYTHONPATH,
+    actor_runtime_env,
+    config as server_config,
+    otel_env_vars,
+    preferred_control_plane_resources,
+)
+from ..runtime_env import env_nonempty
+from .async_ray_control import async_get_ray_ref, sync_get_ray_ref
 from .model_actor_inventory import (
     ActorEntry,
     ActorType,
@@ -25,6 +36,17 @@ from .model_actor_launchers import (
 )
 from .model_actor_placement import model_actor_placement_reconciler
 from .model_work_scheduler import ModelReplicaRegistration, ModelWorkSchedulerClient, model_work_scheduler
+from .node_metrics_daemon import (
+    NodeMetricsDaemonSpec,
+    get_or_create_node_metrics_collector_actor,
+    node_metrics_actor_name,
+)
+from .supervisor_state_store import (
+    SupervisorMemoryStateStore,
+    SupervisorSQLiteStateStore,
+    SupervisorStateOwnerConflictError,
+    create_supervisor_state_store,
+)
 from .topology import TopologyManager, is_ip_address
 
 logger = logging.getLogger(__name__)
@@ -34,7 +56,10 @@ __all__ = [
     "ActorType",
     "ModelActorSpec",
     "ModelActorSupervisor",
+    "ModelActorSupervisorClient",
+    "ModelActorSupervisorCore",
     "ModelActorSupervisorStaleError",
+    "ModelActorSupervisorUnavailableError",
     "_ModelActorInventoryState",
     "actor_observability_metadata",
     "async_actor_observability_metadata",
@@ -43,8 +68,33 @@ __all__ = [
     "domain_key_for_training_base_model",
     "domain_key_for_vllm_base_model",
     "get_model_actor_supervisor",
+    "ensure_started",
+    "async_ensure_started",
     "model_actor_supervisor",
 ]
+
+MODEL_ACTOR_SUPERVISOR_ACTOR_NAME = "mint_model_actor_supervisor"
+
+
+class ModelActorSupervisorUnavailableError(RuntimeError):
+    pass
+
+
+def _ray_namespace() -> str:
+    value = env_nonempty(os.environ, "MINT_RAY_NAMESPACE")
+    if value:
+        return value
+    try:
+        from ..config import RAY_NAMESPACE
+
+        return RAY_NAMESPACE
+    except Exception:
+        return "mint"
+
+
+def _node_metrics_enabled_by_default() -> bool:
+    raw = str(os.environ.get("MINT_NODE_METRICS_DAEMON_ENABLED") or "").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
 
 
 @dataclass(frozen=True)
@@ -98,6 +148,8 @@ SchedulerStats = Callable[[], dict[str, Any] | Awaitable[dict[str, Any]]]
 OrphanPlacementGroupCleaner = Callable[[dict[tuple[str, str], ModelActorSpec]], Any | Awaitable[Any]]
 PlacementReconciler = Callable[[dict[tuple[str, str], ModelActorSpec]], Any | Awaitable[dict[str, Any]]]
 TopologyResolver = Callable[[dict[tuple[str, str], ModelActorSpec]], Any | Awaitable[dict[str, Any]]]
+NodeMetricsFactory = Callable[[NodeMetricsDaemonSpec], Any | Awaitable[Any]]
+SupervisorStateStore = SupervisorMemoryStateStore | SupervisorSQLiteStateStore
 
 
 def domain_key_for_vllm_base_model(base_model: str) -> str:
@@ -132,7 +184,7 @@ def domain_key_for_internal_control() -> str:
 
 
 def default_model_actor_name(domain_key: str, replica_id: str) -> str:
-    raw = f"mint_model_actor_{domain_key}_{replica_id}"
+    raw = f"mint_model_runtime_{domain_key}_{replica_id}"
     return re.sub(r"[^A-Za-z0-9_.-]+", "-", raw).strip("-")
 
 
@@ -460,7 +512,7 @@ async def _invoke_actor(actor: Any, method_name: str, *args: Any, **kwargs: Any)
     return await _maybe_await(method(*args, **kwargs))
 
 
-class ModelActorSupervisor:
+class ModelActorSupervisorCore:
     def __init__(
         self,
         *,
@@ -474,7 +526,15 @@ class ModelActorSupervisor:
         placement_reconciler: PlacementReconciler | None = None,
         topology_resolver: TopologyResolver | None = None,
         topology_manager: TopologyManager | None = None,
+        node_metrics_factory: NodeMetricsFactory | None = None,
+        node_metrics_enabled: bool | None = None,
         launcher_registry: ModelActorLauncherRegistry | None = None,
+        state_store: SupervisorStateStore | None = None,
+        state_backend: str | None = None,
+        state_db_path: str | None = None,
+        owner_id: str | None = None,
+        owner_ttl_s: float | None = None,
+        state_event_limit: int | None = None,
     ) -> None:
         self._desired: dict[tuple[str, str], ModelActorSpec] = {}
         self._launcher_registry = launcher_registry or default_model_actor_launcher_registry()
@@ -487,6 +547,18 @@ class ModelActorSupervisor:
         self._placement_reconciler = placement_reconciler or model_actor_placement_reconciler
         self._topology_manager = topology_manager if topology_manager is not None else TopologyManager()
         self._topology_resolver = topology_resolver or self._resolve_topology_placements
+        self._node_metrics_factory = node_metrics_factory
+        self._node_metrics_enabled = (
+            _node_metrics_enabled_by_default()
+            if node_metrics_enabled is None
+            else bool(node_metrics_enabled)
+        )
+        if self._node_metrics_factory is None and self._node_metrics_enabled:
+            self._node_metrics_factory = get_or_create_node_metrics_collector_actor
+        self._node_metric_actors: dict[str, Any] = {}
+        self._node_metric_states: dict[str, dict[str, Any]] = {}
+        self._node_metrics_created_total = 0
+        self._node_metrics_reconcile_failures_total = 0
         self._actors: dict[tuple[str, str], Any] = {}
         self._generations: dict[tuple[str, str], int] = {}
         self._states: dict[tuple[str, str], dict[str, Any]] = {}
@@ -504,8 +576,79 @@ class ModelActorSupervisor:
         self._last_placement_reconcile: dict[str, Any] | None = None
         self._last_topology_reconcile: dict[str, Any] | None = None
         self._inventory = ModelActorInventory()
+        self._state_store: SupervisorStateStore = state_store or create_supervisor_state_store(
+            backend=state_backend or server_config.supervisor_state_backend,
+            db_path=state_db_path or server_config.supervisor_state_db_path,
+            event_limit=(
+                int(state_event_limit)
+                if state_event_limit is not None
+                else int(server_config.supervisor_state_event_limit)
+            ),
+        )
+        self._owner_name = "model_actor_supervisor"
+        self._owner_id = owner_id or self._default_owner_id()
+        self._owner_ttl_s = float(
+            owner_ttl_s
+            if owner_ttl_s is not None
+            else server_config.supervisor_state_owner_ttl_s
+        )
+        self._state_owner: dict[str, Any] | None = None
+        self._state_store_failures_total = 0
+        self._ensure_state_owner()
         for spec in specs or []:
             self.set_desired(spec)
+
+    @staticmethod
+    def _default_owner_id() -> str:
+        return f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex}"
+
+    def _ensure_state_owner(self) -> dict[str, Any] | None:
+        if self._state_owner is not None:
+            return self._state_owner
+        try:
+            self._state_owner = self._state_store.acquire_owner(
+                name=self._owner_name,
+                owner_id=self._owner_id,
+                ttl_s=self._owner_ttl_s,
+            )
+            self._state_store.append_event(
+                "owner_acquired",
+                {"backend": self._state_store.backend},
+                owner=self._state_owner,
+            )
+        except SupervisorStateOwnerConflictError:
+            raise
+        except Exception as e:
+            self._state_store_failures_total += 1
+            logger.warning(
+                "[model_actor_supervisor] state owner acquire failed: %s: %s",
+                type(e).__name__,
+                e,
+            )
+            self._state_owner = None
+        return self._state_owner
+
+    def _heartbeat_state_owner(self) -> None:
+        owner = self._state_owner or self._ensure_state_owner()
+        if owner is None:
+            return
+        try:
+            self._state_owner = self._state_store.heartbeat_owner(
+                name=self._owner_name,
+                owner_id=str(owner["owner_id"]),
+                epoch=int(owner["epoch"]),
+                ttl_s=self._owner_ttl_s,
+            )
+        except Exception as e:
+            self._state_store_failures_total += 1
+            logger.warning(
+                "[model_actor_supervisor] state owner heartbeat failed: %s: %s",
+                type(e).__name__,
+                e,
+            )
+
+    def _state_generation_key(self, key: tuple[str, str]) -> str:
+        return f"generation:{_label(key)}"
 
     async def _sync_active_scheduler_domains(self) -> None:
         stats: dict[str, Any] | None = None
@@ -851,6 +994,123 @@ class ModelActorSupervisor:
             enabled=spec.enabled,
         )
 
+    def _node_metric_spec_from_runtime_node(self, alias: str, node: dict[str, Any]) -> NodeMetricsDaemonSpec | None:
+        node_ip = str(node.get("node_ip") or "").strip()
+        if str(node.get("state") or "") != "ready" or not node_ip:
+            return None
+        topology = self._topology_manager.snapshot() if self._topology_manager is not None else {}
+        deployment_env = str(topology.get("deployment_env") or os.environ.get("MINT_DEPLOYMENT_ENV") or "").strip()
+        cluster_id = str(topology.get("cluster_id") or os.environ.get("MINT_CLUSTER_ID") or "").strip()
+        gpu_count = node.get("gpu_count")
+        return NodeMetricsDaemonSpec(
+            worker_alias=str(alias),
+            node_ip=node_ip,
+            ray_node_id=None if node.get("ray_node_id") is None else str(node.get("ray_node_id")),
+            gpu_count=None if gpu_count is None else int(gpu_count),
+            deployment_env=deployment_env or None,
+            cluster_id=cluster_id or None,
+            actor_name=node_metrics_actor_name(str(alias)),
+        )
+
+    async def _reconcile_node_metrics_daemons(self) -> None:
+        if not self._node_metrics_enabled or self._node_metrics_factory is None:
+            self._node_metric_states = {}
+            return
+        topology = self._topology_manager.snapshot() if self._topology_manager is not None else {}
+        topology_nodes = topology.get("nodes") if isinstance(topology, dict) else {}
+        if not isinstance(topology_nodes, dict):
+            topology_nodes = {}
+        desired_specs: dict[str, NodeMetricsDaemonSpec] = {}
+        for alias, raw_node in sorted(topology_nodes.items()):
+            if not isinstance(raw_node, dict):
+                continue
+            spec = self._node_metric_spec_from_runtime_node(str(alias), raw_node)
+            if spec is not None:
+                desired_specs[str(alias)] = spec
+
+        for alias in sorted(set(self._node_metric_actors) - set(desired_specs)):
+            actor = self._node_metric_actors.pop(alias, None)
+            previous = dict(self._node_metric_states.get(alias, {}))
+            try:
+                if actor is not None:
+                    await _invoke_actor(actor, "shutdown")
+            except Exception as e:
+                previous["last_error"] = f"{type(e).__name__}: {e}"
+            previous.update(
+                {
+                    "worker_alias": alias,
+                    "state": "stale",
+                    "last_action": "removed_from_topology",
+                    "last_action_at": time.time(),
+                }
+            )
+            self._node_metric_states[alias] = previous
+
+        for alias, spec in sorted(desired_specs.items()):
+            actor = self._node_metric_actors.get(alias)
+            if actor is None:
+                try:
+                    actor = await _maybe_await(self._node_metrics_factory(spec))
+                    self._node_metric_actors[alias] = actor
+                    self._node_metrics_created_total += 1
+                    self._node_metric_states[alias] = {
+                        "worker_alias": alias,
+                        "node_ip": spec.node_ip,
+                        "ray_node_id": spec.ray_node_id,
+                        "actor_name": spec.normalized_actor_name(),
+                        "state": "starting",
+                        "last_error": None,
+                        "last_action": "create",
+                        "last_action_at": time.time(),
+                    }
+                except Exception as e:
+                    self._node_metrics_reconcile_failures_total += 1
+                    self._node_metric_states[alias] = {
+                        "worker_alias": alias,
+                        "node_ip": spec.node_ip,
+                        "ray_node_id": spec.ray_node_id,
+                        "actor_name": spec.normalized_actor_name(),
+                        "state": "failed",
+                        "last_error": f"{type(e).__name__}: {e}",
+                        "last_action": "create_failed",
+                        "last_action_at": time.time(),
+                    }
+                    continue
+            try:
+                health = await _invoke_actor(actor, "health_snapshot")
+                if not isinstance(health, dict):
+                    raise TypeError(f"node metrics health_snapshot returned {type(health)}")
+                sample = await _invoke_actor(actor, "sample_cached")
+                if isinstance(sample, dict):
+                    health = {**health, "last_sample": sample}
+                running = bool(health.get("running", True))
+                self._node_metric_states[alias] = {
+                    **self._node_metric_states.get(alias, {}),
+                    "worker_alias": alias,
+                    "node_ip": spec.node_ip,
+                    "ray_node_id": spec.ray_node_id,
+                    "actor_name": spec.normalized_actor_name(),
+                    "state": "healthy" if running else "unhealthy",
+                    "health": health,
+                    "last_error": None if running else "node metrics daemon not running",
+                    "last_action": "health_check",
+                    "last_action_at": time.time(),
+                }
+            except Exception as e:
+                self._node_metrics_reconcile_failures_total += 1
+                self._node_metric_actors.pop(alias, None)
+                self._node_metric_states[alias] = {
+                    **self._node_metric_states.get(alias, {}),
+                    "worker_alias": alias,
+                    "node_ip": spec.node_ip,
+                    "ray_node_id": spec.ray_node_id,
+                    "actor_name": spec.normalized_actor_name(),
+                    "state": "dead",
+                    "last_error": f"{type(e).__name__}: {e}",
+                    "last_action": "health_failed",
+                    "last_action_at": time.time(),
+                }
+
     async def _actor_health(self, actor: Any) -> dict[str, Any]:
         out = await _invoke_actor(actor, "health_snapshot")
         if not isinstance(out, dict):
@@ -860,7 +1120,18 @@ class ModelActorSupervisor:
     def _next_generation(self, key: tuple[str, str]) -> int:
         previous = int(self._generations.get(key, 0))
         now = int(time.time())
-        return max(now, previous + 1)
+        floor = max(now, previous + 1)
+        try:
+            return int(self._state_store.reserve_generation(self._state_generation_key(key), floor=floor))
+        except Exception as e:
+            self._state_store_failures_total += 1
+            logger.warning(
+                "[model_actor_supervisor] state generation reserve failed key=%s error_type=%s error=%s",
+                _label(key),
+                type(e).__name__,
+                e,
+            )
+            return floor
 
     async def _create_runtime(self, spec: ModelActorSpec, *, reason: str) -> Any:
         key = spec.key
@@ -877,6 +1148,21 @@ class ModelActorSupervisor:
         self._created_total += 1
         if reason != "missing":
             self._restarted_total += 1
+        try:
+            self._state_store.append_event(
+                "runtime_created",
+                {
+                    "domain_key": spec.domain_key,
+                    "replica_id": spec.replica_id,
+                    "actor_name": spec.normalized_actor_name(),
+                    "generation": generation,
+                    "reason": reason,
+                },
+                owner=self._state_owner,
+            )
+        except Exception as e:
+            self._state_store_failures_total += 1
+            logger.debug("[model_actor_supervisor] state event append failed: %s: %s", type(e).__name__, e)
         self._states[key] = {
             "domain_key": spec.domain_key,
             "replica_id": spec.replica_id,
@@ -954,9 +1240,14 @@ class ModelActorSupervisor:
                 e,
             )
 
+    async def sync_replicas(self) -> dict[str, Any]:
+        await self._sync_scheduler()
+        return {"ok": True, "last_scheduler_sync_at": self._last_scheduler_sync_at}
+
     async def reconcile_once(self) -> dict[str, Any]:
         self._reconcile_total += 1
         self._last_reconcile_at = time.time()
+        self._heartbeat_state_owner()
         await self._sync_active_scheduler_domains()
         if self._orphan_pg_cleaner is not None:
             await _maybe_await(self._orphan_pg_cleaner(dict(self._desired)))
@@ -976,6 +1267,7 @@ class ModelActorSupervisor:
                     type(e).__name__,
                     e,
                 )
+        await self._reconcile_node_metrics_daemons()
         topology_blocked = topology_out.get("blocked") if isinstance(topology_out, dict) else {}
         if not isinstance(topology_blocked, dict):
             topology_blocked = {}
@@ -1259,6 +1551,19 @@ class ModelActorSupervisor:
                 domain["healthy"] += 1
             elif state.get("state") in {"dead", "unhealthy", "blocked"}:
                 domain["unhealthy"] += 1
+        topology_snapshot = self._topology_manager.snapshot() if self._topology_manager is not None else {}
+        topology_nodes = topology_snapshot.get("nodes", {}) if isinstance(topology_snapshot, dict) else {}
+        if not isinstance(topology_nodes, dict):
+            topology_nodes = {}
+        node_metrics_desired_total = len(
+            [
+                alias
+                for alias, node in topology_nodes.items()
+                if isinstance(node, dict)
+                and str(node.get("state") or "") == "ready"
+                and str(node.get("node_ip") or "").strip()
+            ]
+        )
         return {
             "desired_total": int(len(self._desired)),
             "managed_total": int(len(self._actors)),
@@ -1271,12 +1576,28 @@ class ModelActorSupervisor:
             "scheduler_sync_failures_total": int(self._scheduler_sync_failures_total),
             "placement_reconcile_failures_total": int(self._placement_reconcile_failures_total),
             "topology_reconcile_failures_total": int(self._topology_reconcile_failures_total),
+            "node_metrics_created_total": int(self._node_metrics_created_total),
+            "node_metrics_reconcile_failures_total": int(self._node_metrics_reconcile_failures_total),
+            "state_store_failures_total": int(self._state_store_failures_total),
             "placement_reclaimed_total": int(self._placement_reclaimed_total),
             "last_reconcile_at": self._last_reconcile_at,
             "last_scheduler_sync_at": self._last_scheduler_sync_at,
             "last_placement_reconcile": self._last_placement_reconcile,
             "last_topology_reconcile": self._last_topology_reconcile,
-            "topology": self._topology_manager.snapshot() if self._topology_manager is not None else {},
+            "topology": topology_snapshot,
+            "state_store": {
+                "backend": self._state_store.backend,
+                "db_path": self._state_store.db_path,
+                "owner": self._state_store.owner_snapshot(name=self._owner_name),
+            },
+            "daemons": {
+                "node_metrics": {
+                    "enabled": bool(self._node_metrics_enabled),
+                    "desired_total": node_metrics_desired_total,
+                    "managed_total": len(self._node_metric_actors),
+                    "nodes": {alias: dict(state) for alias, state in sorted(self._node_metric_states.items())},
+                }
+            },
             "domains": domains,
             "replicas": replicas,
         }
@@ -1284,6 +1605,9 @@ class ModelActorSupervisor:
     async def async_snapshot(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
         _ = timeout_s
         return self.snapshot()
+
+
+ModelActorSupervisor = ModelActorSupervisorCore
 
 
 def _key(domain_key: str, replica_id: str) -> tuple[str, str]:
@@ -1302,8 +1626,355 @@ def consumer_id_for_replica(domain_key: str, replica_id: str, generation: int) -
     return f"{domain_key}::{replica_id}::generation::{int(generation)}"
 
 
-model_actor_supervisor = ModelActorSupervisor(specs=desired_specs_from_env())
+def _ray_model_actor_supervisor_actor_name() -> str:
+    return str(
+        os.environ.get("MINT_MODEL_ACTOR_SUPERVISOR_ACTOR_NAME")
+        or getattr(server_config, "model_actor_supervisor_actor_name", MODEL_ACTOR_SUPERVISOR_ACTOR_NAME)
+    )
 
 
-def get_model_actor_supervisor() -> ModelActorSupervisor:
+def _model_actor_supervisor_actor_resources() -> dict[str, float] | None:
+    pinned_ip = str(os.environ.get("MINT_MODEL_ACTOR_SUPERVISOR_PINNED_NODE_IP") or "").strip()
+    if pinned_ip:
+        return {f"node:{pinned_ip}": 0.001}
+    try:
+        import ray
+
+        return preferred_control_plane_resources(
+            ray.cluster_resources(),
+            env_var="MINT_MODEL_ACTOR_SUPERVISOR_PINNED_NODE_IP",
+        )
+    except Exception:
+        return None
+
+
+def _create_ray_actor(*, require_ready: bool = True):
+    try:
+        import ray
+    except Exception as e:
+        raise ModelActorSupervisorUnavailableError("Ray import failed") from e
+
+    actor_name = _ray_model_actor_supervisor_actor_name()
+    max_concurrency = int(os.environ.get("MINT_MODEL_ACTOR_SUPERVISOR_ACTOR_MAX_CONCURRENCY", "128"))
+
+    @ray.remote(num_cpus=0, max_concurrency=max_concurrency, max_restarts=0)
+    class _RayModelActorSupervisorActor(ModelActorSupervisorCore):
+        pass
+
+    options: dict[str, Any] = {
+        "name": actor_name,
+        "namespace": _ray_namespace(),
+        "lifetime": "detached",
+        "get_if_exists": True,
+        "runtime_env": actor_runtime_env(pythonpath=PFS_PYTHONPATH, extra=otel_env_vars()),
+    }
+    resources = _model_actor_supervisor_actor_resources()
+    if resources:
+        options["resources"] = resources
+
+    actor = _RayModelActorSupervisorActor.options(**options).remote(specs=desired_specs_from_env())
+    if require_ready:
+        out = sync_get_ray_ref(actor.snapshot.remote(), timeout_s=5.0)
+        if not isinstance(out, dict):
+            raise TypeError(f"ModelActorSupervisor.snapshot returned non-dict: {type(out)}")
+    return actor
+
+
+class ModelActorSupervisorClient:
+    def __init__(self) -> None:
+        self._ray_actor = None
+
+    def _reset_ray_actor(self) -> None:
+        self._ray_actor = None
+
+    def _get_ray_actor_sync(self, *, require_ready: bool = False):
+        try:
+            import ray
+        except Exception as e:
+            raise ModelActorSupervisorUnavailableError("Ray import failed") from e
+        if not ray.is_initialized():
+            raise ModelActorSupervisorUnavailableError("Ray not initialized")
+        if self._ray_actor is not None:
+            if not require_ready:
+                return self._ray_actor
+            try:
+                out = sync_get_ray_ref(self._ray_actor.snapshot.remote(), timeout_s=1.0)
+                if not isinstance(out, dict):
+                    raise TypeError(f"ModelActorSupervisor.snapshot returned non-dict: {type(out)}")
+                return self._ray_actor
+            except Exception:
+                self._reset_ray_actor()
+        actor_name = _ray_model_actor_supervisor_actor_name()
+        try:
+            self._ray_actor = ray.get_actor(actor_name, namespace=_ray_namespace())
+        except Exception as e:
+            raise ModelActorSupervisorUnavailableError(
+                f"Detached Ray ModelActorSupervisor actor not found: {actor_name}"
+            ) from e
+        return self._ray_actor
+
+    async def _get_ray_actor_async(self, *, require_ready: bool = False):
+        try:
+            import ray
+        except Exception as e:
+            raise ModelActorSupervisorUnavailableError("Ray import failed") from e
+        if not ray.is_initialized():
+            raise ModelActorSupervisorUnavailableError("Ray not initialized")
+        if self._ray_actor is not None:
+            if not require_ready:
+                return self._ray_actor
+            try:
+                out = await async_get_ray_ref(self._ray_actor.snapshot.remote(), timeout_s=1.0)
+                if not isinstance(out, dict):
+                    raise TypeError(f"ModelActorSupervisor.snapshot returned non-dict: {type(out)}")
+                return self._ray_actor
+            except Exception:
+                self._reset_ray_actor()
+        actor_name = _ray_model_actor_supervisor_actor_name()
+        try:
+            self._ray_actor = await asyncio.to_thread(
+                ray.get_actor,
+                actor_name,
+                namespace=_ray_namespace(),
+            )
+        except Exception as e:
+            raise ModelActorSupervisorUnavailableError(
+                f"Detached Ray ModelActorSupervisor actor not found: {actor_name}"
+            ) from e
+        return self._ray_actor
+
+    def ensure_started(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
+        self._ray_actor = _create_ray_actor(require_ready=False)
+        out = sync_get_ray_ref(self._ray_actor.snapshot.remote(), timeout_s=timeout_s)
+        if not isinstance(out, dict):
+            raise TypeError(f"ModelActorSupervisor.snapshot returned non-dict: {type(out)}")
+        return out
+
+    async def async_ensure_started(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
+        self._ray_actor = _create_ray_actor(require_ready=False)
+        out = await async_get_ray_ref(self._ray_actor.snapshot.remote(), timeout_s=timeout_s)
+        if not isinstance(out, dict):
+            raise TypeError(f"ModelActorSupervisor.snapshot returned non-dict: {type(out)}")
+        return out
+
+    def _call_sync(
+        self,
+        method: str,
+        *args: Any,
+        ray_timeout_s: float | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        actor = self._get_ray_actor_sync(require_ready=False)
+        try:
+            remote = getattr(actor, method).remote
+            return sync_get_ray_ref(remote(*args, **kwargs), timeout_s=ray_timeout_s)
+        except Exception:
+            self._reset_ray_actor()
+            raise
+
+    async def _call_async(
+        self,
+        method: str,
+        *args: Any,
+        ray_timeout_s: float | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        actor = await self._get_ray_actor_async(require_ready=False)
+        try:
+            remote = getattr(actor, method).remote
+            return await async_get_ray_ref(remote(*args, **kwargs), timeout_s=ray_timeout_s)
+        except Exception:
+            self._reset_ray_actor()
+            raise
+
+    def register(self, **kwargs: Any) -> ActorEntry:
+        return self._call_sync("register", **kwargs)
+
+    def unregister(self, actor_name: str) -> bool:
+        return bool(self._call_sync("unregister", actor_name))
+
+    def get(self, actor_name: str) -> ActorEntry | None:
+        return self._call_sync("get", actor_name)
+
+    def set_session(self, actor_name: str, session_id: str | None) -> None:
+        self._call_sync("set_session", actor_name, session_id)
+
+    async def async_set_session(self, actor_name: str, session_id: str | None) -> None:
+        await self._call_async("async_set_session", actor_name, session_id)
+
+    def set_protected(self, actor_name: str, protected: bool = True) -> bool:
+        return bool(self._call_sync("set_protected", actor_name, protected))
+
+    def is_protected(self, actor_name: str) -> bool:
+        return bool(self._call_sync("is_protected", actor_name))
+
+    def touch(self, actor_name: str) -> bool:
+        return bool(self._call_sync("touch", actor_name))
+
+    async def async_touch(self, actor_name: str) -> bool:
+        return bool(await self._call_async("async_touch", actor_name))
+
+    def mark_inflight(self, actor_name: str, delta: int) -> None:
+        self._call_sync("mark_inflight", actor_name, int(delta))
+
+    def mark_ready(self, actor_name: str) -> None:
+        self._call_sync("mark_ready", actor_name)
+
+    def update_metadata(
+        self,
+        actor_name: str,
+        metadata: dict[str, Any],
+        *,
+        sample_time: float | None = None,
+        source: str | None = None,
+    ) -> bool:
+        return bool(
+            self._call_sync(
+                "update_metadata",
+                actor_name,
+                metadata,
+                sample_time=sample_time,
+                source=source,
+            )
+        )
+
+    async def async_update_metadata(
+        self,
+        actor_name: str,
+        metadata: dict[str, Any],
+        *,
+        sample_time: float | None = None,
+        source: str | None = None,
+    ) -> bool:
+        return bool(
+            await self._call_async(
+                "async_update_metadata",
+                actor_name,
+                metadata,
+                sample_time=sample_time,
+                source=source,
+            )
+        )
+
+    def list_actors(
+        self,
+        *,
+        refresh_metadata: bool = False,
+        actor_type: ActorType | None = None,
+        model_name: str | None = None,
+    ) -> list[dict[str, Any]]:
+        out = self._call_sync(
+            "list_actors",
+            refresh_metadata=refresh_metadata,
+            actor_type=actor_type,
+            model_name=model_name,
+        )
+        return list(out)
+
+    async def async_list_actors(
+        self,
+        *,
+        refresh_metadata: bool = False,
+        actor_type: ActorType | None = None,
+        model_name: str | None = None,
+    ) -> list[dict[str, Any]]:
+        out = await self._call_async(
+            "async_list_actors",
+            refresh_metadata=refresh_metadata,
+            actor_type=actor_type,
+            model_name=model_name,
+        )
+        return list(out)
+
+    def metadata_cache_metrics_snapshot(self) -> list[dict[str, int | str]]:
+        return list(self._call_sync("metadata_cache_metrics_snapshot"))
+
+    def lifecycle_metrics_snapshot(self) -> list[dict[str, int | str]]:
+        return list(self._call_sync("lifecycle_metrics_snapshot"))
+
+    def cached_snapshot(self) -> list[dict[str, Any]]:
+        return list(self._call_sync("cached_snapshot"))
+
+    def rss_snapshot(self, *, timeout_s: float = 10.0) -> list[dict]:
+        return list(self._call_sync("rss_snapshot", timeout_s=timeout_s))
+
+    def iter_entries(self, *, prune_stale: bool = False) -> list[ActorEntry]:
+        return list(self._call_sync("iter_entries", prune_stale=prune_stale))
+
+    async def async_iter_entries(self, *, prune_stale: bool = False) -> list[ActorEntry]:
+        return list(await self._call_async("async_iter_entries", prune_stale=prune_stale))
+
+    def clear_session(self, session_id: str, *, actor_type: ActorType | None = None) -> int:
+        return int(self._call_sync("clear_session", session_id, actor_type=actor_type))
+
+    def total_gpus_used(self) -> int:
+        return int(self._call_sync("total_gpus_used"))
+
+    async def async_total_gpus_used(self) -> int:
+        return int(await self._call_async("async_total_gpus_used"))
+
+    def gpus_used_by_node(self) -> dict[str, int]:
+        return dict(self._call_sync("gpus_used_by_node"))
+
+    def clear(self, kill_actors: bool = True) -> int:
+        return int(self._call_sync("clear", kill_actors=kill_actors))
+
+    def set_desired(self, spec: ModelActorSpec) -> None:
+        self._call_sync("set_desired", spec)
+
+    def remove_desired(self, *, domain_key: str, replica_id: str) -> None:
+        self._call_sync("remove_desired", domain_key=domain_key, replica_id=replica_id)
+
+    async def sync_replicas(self) -> dict[str, Any]:
+        out = await self._call_async("sync_replicas")
+        if not isinstance(out, dict):
+            raise TypeError(f"ModelActorSupervisor.sync_replicas returned non-dict: {type(out)}")
+        return out
+
+    async def reconcile_once(self) -> dict[str, Any]:
+        out = await self._call_async("reconcile_once")
+        if not isinstance(out, dict):
+            raise TypeError(f"ModelActorSupervisor.reconcile_once returned non-dict: {type(out)}")
+        return out
+
+    async def recycle(self, *, domain_key: str, replica_id: str, force: bool = False) -> dict[str, Any]:
+        out = await self._call_async(
+            "recycle",
+            domain_key=domain_key,
+            replica_id=replica_id,
+            force=force,
+        )
+        if not isinstance(out, dict):
+            raise TypeError(f"ModelActorSupervisor.recycle returned non-dict: {type(out)}")
+        return out
+
+    def snapshot(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
+        out = self._call_sync("snapshot", ray_timeout_s=timeout_s)
+        if not isinstance(out, dict):
+            raise TypeError(f"ModelActorSupervisor.snapshot returned non-dict: {type(out)}")
+        return out
+
+    async def async_snapshot(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
+        out = await self._call_async(
+            "async_snapshot",
+            timeout_s=timeout_s,
+            ray_timeout_s=timeout_s,
+        )
+        if not isinstance(out, dict):
+            raise TypeError(f"ModelActorSupervisor.async_snapshot returned non-dict: {type(out)}")
+        return out
+
+
+model_actor_supervisor = ModelActorSupervisorClient()
+
+
+def get_model_actor_supervisor() -> ModelActorSupervisorClient:
     return model_actor_supervisor
+
+
+def ensure_started(*, timeout_s: float = 10.0) -> dict[str, Any]:
+    return model_actor_supervisor.ensure_started(timeout_s=timeout_s)
+
+
+async def async_ensure_started(*, timeout_s: float = 10.0) -> dict[str, Any]:
+    return await model_actor_supervisor.async_ensure_started(timeout_s=timeout_s)

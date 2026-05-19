@@ -26,7 +26,6 @@ from ..checkpoint_index import (
     get_catalog_checkpoint,
     list_catalog_checkpoints,
 )
-from ..health_checks import deep_healthz_response
 from ..logging_context import get_otel_tracer
 from ..queue_priority import merge_queue_priority_extra
 from ..ray_cluster_health import get_ray_cluster_health_snapshot
@@ -36,6 +35,15 @@ from ..backend.actor_admin import KillActorsRequest
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+def _internal_prometheus_metrics_enabled() -> bool:
+    return os.environ.get("MINT_INTERNAL_PROMETHEUS_METRICS_ENABLED", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 async def _enqueue_internal_request_with_trace(
@@ -119,14 +127,6 @@ class UsageSummaryResponse(BaseModel):
     charge_item_totals: dict[str, int]
 
 
-class HealthResponse(BaseModel):
-    """Response for health check."""
-
-    status: str
-    database: str
-    timestamp: str
-
-
 @router.get("/usage_logs", response_model=UsageLogsResponse)
 async def get_usage_logs(
     request: Request,
@@ -195,25 +195,6 @@ async def get_usage_summary(account_id: str, request: Request):
     )
 
 
-@router.get("/health", response_model=HealthResponse)
-async def health_check():
-    """Health check endpoint for internal monitoring."""
-    usage_store = await get_usage_store()
-    db_status = "ok" if await usage_store.health_check() else "error"
-
-    return HealthResponse(
-        status="ok",
-        database=db_status,
-        timestamp=datetime.now(timezone.utc).isoformat(),
-    )
-
-
-@router.get("/healthz/deep", response_model=None)
-async def deep_health_check():
-    """Costly internal health endpoint with active Ray diagnostics."""
-    return await deep_healthz_response()
-
-
 @router.get("/actors")
 async def list_actors(
     request: Request,
@@ -278,7 +259,7 @@ async def admission_stats(*, include_actor_rss: bool = True) -> dict:
 
     model_scheduler = None
     try:
-        model_scheduler = await model_work_scheduler.stats(timeout_s=timeout_s)
+        model_scheduler = await model_work_scheduler.stats(timeout_s=timeout_s, create_if_missing=False)
         if not isinstance(model_scheduler, dict):
             model_scheduler = {"error": f"model_work_scheduler snapshot returned non-dict: {type(model_scheduler)}"}
     except Exception as e:
@@ -294,21 +275,20 @@ async def admission_stats(*, include_actor_rss: bool = True) -> dict:
 
     fs = None
     try:
-        if not include_actor_rss and hasattr(task_futures, "metrics_snapshot"):
+        if hasattr(task_futures, "async_ensure_ready"):
+            fs = await task_futures.async_ensure_ready(timeout_s=timeout_s, create_if_missing=False)
+        elif not include_actor_rss and hasattr(task_futures, "metrics_snapshot"):
             fs = task_futures.metrics_snapshot()
-        elif hasattr(task_futures, "async_ensure_ready"):
-            fs = await task_futures.async_ensure_ready(timeout_s=timeout_s)
         else:
-            fs = task_futures.ensure_ready(timeout_s=timeout_s)
+            fs = task_futures.ping(timeout_s=timeout_s)
     except Exception as e:
         fs = {"error": f"{type(e).__name__}: {e}"}
 
     actors: dict = {}
     if include_actor_rss:
         try:
-            actors["task_futures"] = {
-                "rss_bytes": int(await task_futures.async_rss_bytes(timeout_s=timeout_s))
-            }
+            await task_futures.async_ping(timeout_s=timeout_s)
+            actors["task_futures"] = {"rss_bytes": int(await task_futures.async_rss_bytes(timeout_s=timeout_s))}
         except Exception as e:
             actors["task_futures"] = {"error": f"{type(e).__name__}: {e}"}
 
@@ -341,7 +321,7 @@ async def admission_stats(*, include_actor_rss: bool = True) -> dict:
         proc["rss_error"] = f"{type(e).__name__}: {e}"
 
     try:
-        session_heartbeat_entries = int(await session_heartbeat_store.async_size())
+        session_heartbeat_entries = int(await session_heartbeat_store.async_size(create_if_missing=False))
     except Exception as e:
         session_heartbeat_entries = 0
         actors["session_heartbeat_store"] = {"error": f"{type(e).__name__}: {e}"}
@@ -383,7 +363,10 @@ async def admission_stats(*, include_actor_rss: bool = True) -> dict:
 
     maintenance_cron = None
     try:
-        maintenance_cron = await maintenance_cron_actor.async_health_snapshot(timeout_s=timeout_s)
+        maintenance_cron = await maintenance_cron_actor.async_health_snapshot(
+            timeout_s=timeout_s,
+            create_if_missing=False,
+        )
     except Exception as e:
         maintenance_cron = {"error": f"{type(e).__name__}: {e}"}
 
@@ -404,14 +387,14 @@ async def admission_stats(*, include_actor_rss: bool = True) -> dict:
 async def maintenance_cron_actor_health() -> dict:
     from ..backend.maintenance_cron_actor import maintenance_cron_actor
 
-    return await maintenance_cron_actor.async_health_snapshot(timeout_s=10.0)
+    return await maintenance_cron_actor.async_health_snapshot(timeout_s=10.0, create_if_missing=False)
 
 
 @router.get("/model_work_scheduler")
 async def model_work_scheduler_health() -> dict:
     from ..backend.model_work_scheduler import model_work_scheduler
 
-    return await model_work_scheduler.stats(timeout_s=10.0)
+    return await model_work_scheduler.stats(timeout_s=10.0, create_if_missing=False)
 
 
 @router.get("/model_actor_supervisor")
@@ -577,6 +560,8 @@ def _model_actor_inventory_gpu_bindings(rec: dict[str, object]) -> list[dict[str
 
 @router.get("/metrics")
 async def metrics() -> Response:
+    if not _internal_prometheus_metrics_enabled():
+        raise HTTPException(status_code=404, detail="metrics endpoint disabled")
     stats = await admission_stats(include_actor_rss=False)
     lines: list[str] = []
     megatron_actor_lifecycle_counts: dict[tuple[str, str], float] = {}
@@ -663,8 +648,131 @@ async def metrics() -> Response:
             "blocked_total",
             "busy_recycle_skipped_total",
             "scheduler_sync_failures_total",
+            "topology_reconcile_failures_total",
+            "node_metrics_created_total",
+            "node_metrics_reconcile_failures_total",
         ):
             _append_metric(lines, f"mint_model_actor_supervisor_{key}", model_supervisor.get(key))
+        topology = model_supervisor.get("topology")
+        if isinstance(topology, dict):
+            nodes = topology.get("nodes")
+            if isinstance(nodes, dict):
+                for alias, rec in nodes.items():
+                    if not isinstance(rec, dict):
+                        continue
+                    labels = {
+                        "worker_alias": str(alias),
+                        "state": str(rec.get("state") or "unknown"),
+                        "provider": str(rec.get("provider") or "unknown"),
+                    }
+                    _append_metric(lines, "mint_topology_node_state", 1, labels=labels)
+                    _append_metric(lines, "mint_topology_node_gpus", rec.get("gpu_count"), labels=labels)
+        daemons = model_supervisor.get("daemons")
+        if isinstance(daemons, dict):
+            node_metrics = daemons.get("node_metrics")
+            if isinstance(node_metrics, dict):
+                _append_metric(lines, "mint_node_metrics_daemon_enabled", int(bool(node_metrics.get("enabled"))))
+                _append_metric(lines, "mint_node_metrics_daemon_desired_total", node_metrics.get("desired_total"))
+                _append_metric(lines, "mint_node_metrics_daemon_managed_total", node_metrics.get("managed_total"))
+                nodes = node_metrics.get("nodes")
+                if isinstance(nodes, dict):
+                    for alias, rec in nodes.items():
+                        if not isinstance(rec, dict):
+                            continue
+                        labels = {
+                            "worker_alias": str(alias),
+                            "state": str(rec.get("state") or "unknown"),
+                        }
+                        _append_metric(lines, "mint_node_metrics_daemon_state", 1, labels=labels)
+                        health = rec.get("health")
+                        if isinstance(health, dict):
+                            _append_metric(
+                                lines,
+                                "mint_node_metrics_daemon_sample_count",
+                                health.get("sample_count"),
+                                labels=labels,
+                            )
+                            _append_metric(
+                                lines,
+                                "mint_node_metrics_daemon_error_count",
+                                health.get("error_count"),
+                                labels=labels,
+                            )
+                            sample = health.get("last_sample")
+                            if isinstance(sample, dict):
+                                metric_labels = {
+                                    "worker_alias": str(alias),
+                                    "deployment_env": sample.get("deployment_env") or health.get("deployment_env") or "",
+                                    "cluster_id": sample.get("cluster_id") or health.get("cluster_id") or "",
+                                }
+                                for metric_name, sample_key in (
+                                    ("mint_node_cpu_utilization_ratio", "cpu_utilization_ratio"),
+                                    ("mint_node_load_1m", "load_1m"),
+                                    ("mint_node_load5", "load_5m"),
+                                    ("mint_node_load15", "load_15m"),
+                                    ("mint_node_memory_used_bytes", "memory_used_bytes"),
+                                    ("mint_node_memory_total_bytes", "memory_total_bytes"),
+                                    ("mint_node_disk_used_bytes", "disk_used_bytes"),
+                                    ("mint_node_disk_total_bytes", "disk_total_bytes"),
+                                    ("mint_node_metrics_collector_sample_duration_ms", "sample_duration_ms"),
+                                ):
+                                    _append_metric(lines, metric_name, sample.get(sample_key), labels=metric_labels)
+                                sampled_at = _prom_number(sample.get("sampled_at"))
+                                if sampled_at is not None:
+                                    _append_metric(
+                                        lines,
+                                        "mint_node_metrics_collector_sample_age_s",
+                                        max(0.0, time.time() - sampled_at),
+                                        labels=metric_labels,
+                                    )
+                                _append_metric(
+                                    lines,
+                                    "mint_node_metrics_collector_up",
+                                    0 if sample.get("gpu_error") or sample.get("host_error") else 1,
+                                    labels=metric_labels,
+                                )
+                                gpus = sample.get("gpus")
+                                if isinstance(gpus, list):
+                                    for gpu in gpus:
+                                        if not isinstance(gpu, dict):
+                                            continue
+                                        gpu_uuid = str(gpu.get("gpu_uuid") or "")
+                                        if not gpu_uuid:
+                                            continue
+                                        gpu_labels = {**metric_labels, "gpu_uuid": gpu_uuid}
+                                        _append_metric(lines, "mint_node_gpu_present", 1, labels=gpu_labels)
+                                        for metric_name, sample_key in (
+                                            ("mint_node_gpu_utilization_percent", "utilization_gpu_percent"),
+                                            ("mint_node_gpu_memory_used_bytes", "memory_used_bytes"),
+                                            ("mint_node_gpu_memory_total_bytes", "memory_total_bytes"),
+                                            ("mint_node_gpu_power_draw_watts", "power_draw_watts"),
+                                            ("mint_node_gpu_power_limit_watts", "power_limit_watts"),
+                                            ("mint_node_gpu_temperature_celsius", "temperature_celsius"),
+                                            ("mint_node_gpu_sm_clock_mhz", "sm_clock_mhz"),
+                                            ("mint_node_gpu_memory_clock_mhz", "memory_clock_mhz"),
+                                            ("mint_node_gpu_pcie_link_gen", "pcie_link_gen"),
+                                            ("mint_node_gpu_pcie_link_width", "pcie_link_width"),
+                                        ):
+                                            _append_metric(lines, metric_name, gpu.get(sample_key), labels=gpu_labels)
+                                        processes = gpu.get("processes")
+                                        if isinstance(processes, list):
+                                            for proc in processes:
+                                                if not isinstance(proc, dict):
+                                                    continue
+                                                process_class = str(proc.get("process_class") or "other")
+                                                proc_labels = {**gpu_labels, "process_class": process_class}
+                                                _append_metric(
+                                                    lines,
+                                                    "mint_node_gpu_processes",
+                                                    proc.get("process_count"),
+                                                    labels=proc_labels,
+                                                )
+                                                _append_metric(
+                                                    lines,
+                                                    "mint_node_gpu_process_memory_used_bytes",
+                                                    proc.get("memory_used_bytes"),
+                                                    labels=proc_labels,
+                                                )
         domains = model_supervisor.get("domains")
         if isinstance(domains, dict):
             for domain_key, rec in domains.items():
@@ -750,6 +858,23 @@ async def metrics() -> Response:
                             rec.get(kind),
                             labels={"op": op, "kind": kind},
                         )
+
+        reaper = fs.get("task_future_reaper")
+        if isinstance(reaper, dict):
+            rows_total = reaper.get("rows_total")
+            if isinstance(rows_total, dict):
+                for action, count in rows_total.items():
+                    _append_metric(
+                        lines,
+                        "mint_task_future_reaper_rows_total",
+                        count,
+                        labels={"action": action},
+                    )
+            _append_metric(
+                lines,
+                "mint_task_future_payload_evict_errors_total",
+                reaper.get("payload_evict_errors_total"),
+            )
 
     actors = stats.get("actors")
     if isinstance(actors, dict):
@@ -1210,7 +1335,7 @@ async def model_work_scheduler_noop(http_request: Request) -> dict:
 async def model_work_scheduler_debug_state() -> dict:
     from ..backend.model_work_scheduler import model_work_scheduler
 
-    return await model_work_scheduler.stats(timeout_s=10.0)
+    return await model_work_scheduler.stats(timeout_s=10.0, create_if_missing=False)
 
 
 @router.get("/debug/scheduler_decisions")
@@ -1222,7 +1347,7 @@ async def scheduler_decisions_debug(
 ) -> dict:
     from ..backend.model_work_scheduler import model_work_scheduler
 
-    stats = await model_work_scheduler.stats(timeout_s=10.0)
+    stats = await model_work_scheduler.stats(timeout_s=10.0, create_if_missing=False)
     domain_filter = scheduler_domain.strip() if isinstance(scheduler_domain, str) else None
     if not domain_filter and reason is None and since_seq is None:
         return stats

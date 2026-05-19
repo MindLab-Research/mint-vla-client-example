@@ -664,12 +664,23 @@ async def test_issue_281_internal_serialized_op_marks_inflight_until_worker_fini
 
 @pytest.mark.anyio
 async def test_issue_281_public_healthz_ignores_timeout_observation(monkeypatch) -> None:
+    import mint_server.backend.model_work_scheduler as mws
+    import mint_server.backend.task_state_store as tss
+    from mint_server import health_checks
     from mint_server.health_state import clear_runtime_degraded_state, clear_startup_degraded_state
     from mint_server.routes import service
 
     clear_startup_degraded_state()
     clear_runtime_degraded_state()
+    health_checks.reset_public_healthz_cache()
     _install_ray_stub(monkeypatch)
+
+    class _Ping:
+        async def async_ping(self, *, timeout_s: float = 5.0) -> dict:
+            return {"ok": True}
+
+    monkeypatch.setattr(mws, "model_work_scheduler", _Ping())
+    monkeypatch.setattr(tss, "task_state_store", _Ping())
 
     payload = await service.healthz()
     assert payload["status"] == "ready"
@@ -678,12 +689,23 @@ async def test_issue_281_public_healthz_ignores_timeout_observation(monkeypatch)
 
 @pytest.mark.anyio
 async def test_issue_281_public_healthz_ignores_pending_pg_observation(monkeypatch) -> None:
+    import mint_server.backend.model_work_scheduler as mws
+    import mint_server.backend.task_state_store as tss
+    from mint_server import health_checks
     from mint_server.health_state import clear_runtime_degraded_state, clear_startup_degraded_state
     from mint_server.routes import service
 
     clear_startup_degraded_state()
     clear_runtime_degraded_state()
+    health_checks.reset_public_healthz_cache()
     _install_ray_stub(monkeypatch, available={"GPU": 2}, total={"GPU": 8})
+
+    class _Ping:
+        async def async_ping(self, *, timeout_s: float = 5.0) -> dict:
+            return {"ok": True}
+
+    monkeypatch.setattr(mws, "model_work_scheduler", _Ping())
+    monkeypatch.setattr(tss, "task_state_store", _Ping())
 
     payload = await service.healthz()
     assert payload["status"] == "ready"

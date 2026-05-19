@@ -49,6 +49,18 @@ def _default_task_state_store_db_path(*, auth_enabled: bool) -> str:
     return "/vePFS-Mindverse/share/mint/dev/data/task-state/task_state.sqlite3"
 
 
+def _deployment_env_for_defaults(environ: dict[str, str], *, auth_enabled: bool) -> str:
+    raw = _env_nonempty(environ, "MINT_DEPLOYMENT_ENV")
+    if raw is not None:
+        return raw
+    return "prod" if auth_enabled else "dev"
+
+
+def _default_supervisor_state_db_path(deployment_env: str) -> str:
+    env = str(deployment_env or "").strip() or "dev"
+    return f"/vePFS-Mindverse/share/mint/{env}/runtime/supervisor_state.sqlite3"
+
+
 def _load_config_file_for_process(environ: dict[str, str]) -> tuple[str | None, object | None]:
     path = _env_nonempty(environ, "MINT_CONFIG_PATH")
     if not path:
@@ -454,10 +466,20 @@ class ServerConfig:
     # ModelActorSupervisor inventory settings
     model_actor_inventory_session_idle_timeout_s: int = 300
 
+    # ModelActorSupervisor state backend. Desired/runtime actor source of truth
+    # stays in config/Ray/reconcile; KV stores operational hints only.
+    supervisor_state_backend: str = "memory"
+    supervisor_state_db_path: str = "/vePFS-Mindverse/share/mint/dev/runtime/supervisor_state.sqlite3"
+    supervisor_state_owner_ttl_s: float = 30.0
+    supervisor_state_event_limit: int = 1000
+
     # Retrieve polling/cache settings. Durable terminal state lives in TaskStateStore.
-    retrieve_future_hot_ttl_s: float = 60.0
-    retrieve_future_grace_s: float = 120.0
+    retrieve_future_hot_ttl_s: float = 300.0
+    retrieve_future_grace_s: float = 600.0
     retrieve_future_min_poll_s: float = 1.0
+    task_pending_ttl_s: float = 86400.0
+    task_result_ttl_s: float = 86400.0
+    task_tombstone_ttl_s: float = 604800.0
 
     # TaskStateStore settings (backend/task_state_store.py)
     task_state_store_actor_name: str = "mint_task_state_store"
@@ -519,12 +541,14 @@ class ServerConfig:
         auth_enabled = bool(internal_api_token)
         file_sampling = config_file.sampling if config_file is not None else None
         file_model_actor_inventory = config_file.model_actor_inventory if config_file is not None else None
+        file_supervisor_state = config_file.supervisor_state if config_file is not None else None
         file_future = config_file.future if config_file is not None else None
         file_task_state_store = config_file.task_state_store if config_file is not None else None
         file_training = config_file.training if config_file is not None else None
         file_prewarm = config_file.prewarm if config_file is not None else None
         file_docs = config_file.docs if config_file is not None else None
         file_internal = config_file.internal if config_file is not None else None
+        deployment_env = _deployment_env_for_defaults(environ, auth_enabled=auth_enabled)
         dense_session_state_default_root = os.path.join(
             _env_nonempty(environ, "MINT_RUNTIME_CHECKPOINT_DIR") or DEFAULT_RUNTIME_CHECKPOINTS_DIR,
             "dense_session_state",
@@ -741,23 +765,58 @@ class ServerConfig:
                 file_model_actor_inventory.session_idle_timeout_s if file_model_actor_inventory is not None else None,
                 300,
             ),
+            supervisor_state_backend=_pick_str(
+                "MINT_SUPERVISOR_STATE_BACKEND",
+                file_supervisor_state.backend if file_supervisor_state is not None else None,
+                "memory",
+            ),
+            supervisor_state_db_path=_pick_str(
+                "MINT_SUPERVISOR_STATE_DB_PATH",
+                file_supervisor_state.db_path if file_supervisor_state is not None else None,
+                _default_supervisor_state_db_path(deployment_env),
+            ),
+            supervisor_state_owner_ttl_s=_pick_float(
+                "MINT_SUPERVISOR_STATE_OWNER_TTL_S",
+                file_supervisor_state.owner_ttl_s if file_supervisor_state is not None else None,
+                30.0,
+            ),
+            supervisor_state_event_limit=_pick_int(
+                "MINT_SUPERVISOR_STATE_EVENT_LIMIT",
+                file_supervisor_state.event_limit if file_supervisor_state is not None else None,
+                1000,
+            ),
             # Retrieve settings
             retrieve_future_hot_ttl_s=_pick_float(
                 "MINT_RETRIEVE_FUTURE_HOT_TTL_S",
                 file_future.retrieve_future_hot_ttl_s if file_future is not None else None,
-                60.0,
+                300.0,
             ),
             retrieve_future_grace_s=_pick_float_alias(
                 "MINT_RETRIEVE_FUTURE_GRACE_S",
                 ("MINT_RETRIEVE_FUTURE_GRACE_S",),
                 file_future.retrieve_future_grace_s if file_future is not None else None,
-                120.0,
+                600.0,
             ),
             retrieve_future_min_poll_s=_pick_float_alias(
                 "MINT_RETRIEVE_FUTURE_MIN_POLL_S",
                 ("MINT_RETRIEVE_FUTURE_MIN_POLL_S",),
                 file_future.retrieve_future_min_poll_s if file_future is not None else None,
                 1.0,
+            ),
+            task_pending_ttl_s=_pick_float(
+                "MINT_TASK_PENDING_TTL_S",
+                file_future.task_pending_ttl_s if file_future is not None else None,
+                86400.0,
+            ),
+            task_result_ttl_s=_pick_float(
+                "MINT_TASK_RESULT_TTL_S",
+                file_future.task_result_ttl_s if file_future is not None else None,
+                86400.0,
+            ),
+            task_tombstone_ttl_s=_pick_float(
+                "MINT_TASK_TOMBSTONE_TTL_S",
+                file_future.task_tombstone_ttl_s if file_future is not None else None,
+                604800.0,
             ),
             # TaskStateStore settings
             task_state_store_actor_name=_pick_str(

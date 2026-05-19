@@ -30,7 +30,7 @@ async def prewarm_persistent_models(
       - Training actors (pooled PEFT trainers and MegatronWorkerGroup)
       - vLLM inference actors (MultiModelInferenceManager)
 
-    and marks them as ModelActorInventory protected for admin/lifecycle visibility.
+    and marks them protected in ModelActorSupervisor inventory for admin/lifecycle visibility.
     """
     failures: list[str] = []
 
@@ -239,7 +239,7 @@ async def prewarm_persistent_models(
             if ok:
                 logger.info(f"[prewarm] inference ready+protected model={model_name} actor={actor_name}")
             else:
-                logger.warning(f"[prewarm] inference ready (but not in ModelActorInventory) model={model_name} actor={actor_name}")
+                logger.warning(f"[prewarm] inference ready (but not in ModelActorSupervisor inventory) model={model_name} actor={actor_name}")
         except SystemExit as e:
             if getattr(e, "code", None) == 15:
                 raise
