@@ -8,7 +8,9 @@ from mint_server.backend.topology import (
     ProviderTaskState,
     RayNodeState,
     TopologyManager,
+    VolcanoTopologyProvider,
     load_topology_config,
+    render_volcano_worker_template,
     stable_provider_task_name,
 )
 
@@ -151,6 +153,110 @@ def test_issue_627_topology_manager_submits_missing_task_and_blocks_alias(tmp_pa
     node_ip, error = manager.resolve_alias("mint-worker-0")
     assert node_ip is None
     assert "not ready" in str(error)
+
+
+def test_issue_627_volcano_provider_lists_stable_tasks_and_extracts_log_ip(tmp_path) -> None:
+    config = load_topology_config(_write_topology_config(tmp_path))
+    calls: list[list[str]] = []
+
+    def _runner(argv: list[str], _timeout_s: float) -> str:
+        calls.append(argv)
+        if argv[1:3] == ["ml_task", "list"]:
+            return (
+                "volc banner\n"
+                '[{"JobId":"t-1","JobName":"mint-prod-worker-0","Status":"Running",'
+                '"TaskRoleSpecs":[{"RoleReplicas":1,"ResourceSpecId":"ml.hpcpni2l.28xlarge"}]},'
+                '{"JobId":"t-2","JobName":"other","Status":"Running"}]'
+            )
+        if argv[1:3] == ["ml_task", "logs"]:
+            return "noise\nLocal node IP: 10.0.0.7\n"
+        raise AssertionError(argv)
+
+    provider = VolcanoTopologyProvider(command_runner=_runner)
+
+    states = list(provider.list_tasks(config))
+
+    assert len(states) == 1
+    assert states[0].alias == "mint-worker-0"
+    assert states[0].task_name == "mint-prod-worker-0"
+    assert states[0].live is True
+    assert states[0].node_ip == "10.0.0.7"
+    assert states[0].gpu_count == 8
+    assert any(call[1:3] == ["ml_task", "logs"] for call in calls)
+
+
+def test_issue_627_volcano_provider_renders_template_and_submits(tmp_path) -> None:
+    template = tmp_path / "worker.yaml"
+    template.write_text(
+        "\n".join(
+            [
+                'TaskName: "mint-prod-worker"',
+                'Description: "worker"',
+                "Entrypoint: |",
+                "  echo start",
+                'ResourceQueueID: "<GPU_QUEUE_ID>"',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config_path = _write_topology_config(tmp_path)
+    config = load_topology_config(config_path)
+    provider_cfg = dict(config.providers["volcano"])
+    templates = dict(provider_cfg["templates"])
+    templates["a800-8gpu-c1"] = {**templates["a800-8gpu-c1"], "template_path": str(template)}
+    provider_cfg["templates"] = templates
+    config = type(config)(
+        version=config.version,
+        deployment_env=config.deployment_env,
+        cluster_id=config.cluster_id,
+        state_path=config.state_path,
+        nodes=config.nodes,
+        providers={"volcano": provider_cfg},
+    )
+    submitted: list[list[str]] = []
+    submitted_yaml: list[str] = []
+
+    def _runner(argv: list[str], _timeout_s: float) -> str:
+        submitted.append(argv)
+        submitted_yaml.append(open(argv[argv.index("-c") + 1], encoding="utf-8").read())
+        return '{"JobId":"t-new"}'
+
+    provider = VolcanoTopologyProvider(command_runner=_runner)
+
+    provider.submit_task(config, config.nodes["mint-worker-0"])
+
+    assert submitted[0][1:4] == ["ml_task", "submit", "-c"]
+    assert 'TaskName: "mint-prod-worker-0"' in submitted_yaml[0]
+    assert 'ResourceQueueID: "rq-a"' in submitted_yaml[0]
+    assert 'export MINT_WORKER_ALIAS="mint-worker-0"' in submitted_yaml[0]
+    assert 'export MINT_DEPLOYMENT_ENV="prod"' in submitted_yaml[0]
+    assert 'export MINT_CLUSTER_ID="volcano"' in submitted_yaml[0]
+
+
+def test_issue_627_render_volcano_template_is_stable(tmp_path) -> None:
+    template = tmp_path / "worker.yaml"
+    template.write_text(
+        'TaskName: "mint-prod-worker"\n'
+        'Description: "worker"\n'
+        "Entrypoint: |\n"
+        "  echo start\n"
+        'ResourceQueueID: "<GPU_QUEUE_ID>"\n',
+        encoding="utf-8",
+    )
+
+    rendered = render_volcano_worker_template(
+        template_path=template,
+        task_name="mint-prod-worker-0",
+        resource_queue_id="q-123",
+        worker_alias="mint-worker-0",
+        deployment_env="prod",
+        cluster_id="volcano",
+    )
+
+    assert 'TaskName: "mint-prod-worker-0"' in rendered
+    assert 'ResourceQueueID: "q-123"' in rendered
+    assert "/runtime/workers/mint-worker-0.env" in rendered
 
 
 @pytest.mark.anyio
