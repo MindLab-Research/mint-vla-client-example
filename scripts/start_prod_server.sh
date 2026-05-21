@@ -19,6 +19,10 @@ fi
 . "${prod_secrets_env}"
 set +a
 
+if [ -z "${MINT_RUNTIME_CHECKPOINT_DIR:-}" ]; then
+  export MINT_RUNTIME_CHECKPOINT_DIR="${TINKER_RUNTIME_CHECKPOINT_DIR:-/vePFS-Mindverse/share/mint/prod/data/runtime-checkpoints}"
+fi
+
 if [ -n "${MINT_GATEWAY_GLM51_BASE_URL:-}" ]; then
   if [ "${MINT_GATEWAY_GLM51_AUTH_MODE:-static_api_key}" != "static_api_key" ]; then
     echo "unsupported GLM5.1 gateway auth mode: ${MINT_GATEWAY_GLM51_AUTH_MODE}" >&2

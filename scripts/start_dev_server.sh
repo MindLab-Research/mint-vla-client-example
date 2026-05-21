@@ -17,6 +17,10 @@ if [ -r "${dev_secrets_env}" ]; then
 fi
 set +a
 
+if [ -z "${MINT_RUNTIME_CHECKPOINT_DIR:-}" ]; then
+  export MINT_RUNTIME_CHECKPOINT_DIR="${TINKER_RUNTIME_CHECKPOINT_DIR:-/vePFS-Mindverse/share/mint/dev/data/runtime-checkpoints}"
+fi
+
 api_tmp_root="${MINT_TMP_ROOT}/api/${USER:-unknown}"
 api_tmp_link="/tmp/mda"
 mkdir -p "$api_tmp_root"

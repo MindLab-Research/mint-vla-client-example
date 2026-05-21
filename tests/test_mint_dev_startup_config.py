@@ -17,6 +17,7 @@ def test_start_dev_server_script_sources_env_and_uses_runtime_python() -> None:
     assert 'dev_config_env="${MINT_DEV_CONFIG_ENV:-/vePFS-Mindverse/share/mint/dev/config/common.env}"' in text
     assert '. "${dev_config_env}"' in text
     assert 'dev_secrets_env="${MINT_DEV_SECRETS_ENV:-/vePFS-Mindverse/share/mint/dev/config/secrets.env}"' in text
+    assert 'export MINT_RUNTIME_CHECKPOINT_DIR="${TINKER_RUNTIME_CHECKPOINT_DIR:-/vePFS-Mindverse/share/mint/dev/data/runtime-checkpoints}"' in text
     assert 'api_tmp_root="${MINT_TMP_ROOT}/api/${USER:-unknown}"' in text
     assert 'api_tmp_link="/tmp/mda"' in text
     assert 'export TMPDIR="${api_tmp_link}/t"' in text
@@ -42,6 +43,7 @@ def test_start_prod_server_script_uses_tmp_root_shortlink() -> None:
     assert '. "${prod_config_env}"' in text
     assert 'prod_secrets_env="${MINT_PROD_SECRETS_ENV:-/vePFS-Mindverse/share/mint/prod/config/secrets.env}"' in text
     assert '. "${prod_secrets_env}"' in text
+    assert 'export MINT_RUNTIME_CHECKPOINT_DIR="${TINKER_RUNTIME_CHECKPOINT_DIR:-/vePFS-Mindverse/share/mint/prod/data/runtime-checkpoints}"' in text
     assert 'if [ -n "${MINT_GATEWAY_GLM51_BASE_URL:-}" ]; then' in text
     assert 'missing MINT_API_KEY for GLM5.1 static gateway auth' in text
     assert 'model_to_upstream[model] = alias' in text
