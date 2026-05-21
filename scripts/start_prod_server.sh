@@ -26,6 +26,19 @@ if [ -z "${MINT_CODE_ROOT:-}" ]; then
   export MINT_CODE_ROOT="${PFS_TINKER_PATH:-$repo_root}"
 fi
 
+if [ -z "${MINT_GATEWAY_GLM51_MODEL:-}" ] && [ -n "${TINKER_GATEWAY_GLM51_MODEL:-}" ]; then
+  export MINT_GATEWAY_GLM51_MODEL="${TINKER_GATEWAY_GLM51_MODEL}"
+fi
+if [ -z "${MINT_GATEWAY_GLM51_ALIAS:-}" ] && [ -n "${TINKER_GATEWAY_GLM51_ALIAS:-}" ]; then
+  export MINT_GATEWAY_GLM51_ALIAS="${TINKER_GATEWAY_GLM51_ALIAS}"
+fi
+if [ -z "${MINT_GATEWAY_GLM51_BASE_URL:-}" ] && [ -n "${TINKER_GATEWAY_GLM51_BASE_URL:-}" ]; then
+  export MINT_GATEWAY_GLM51_BASE_URL="${TINKER_GATEWAY_GLM51_BASE_URL}"
+fi
+if [ -z "${MINT_GATEWAY_GLM51_AUTH_MODE:-}" ] && [ -n "${TINKER_GATEWAY_GLM51_AUTH_MODE:-}" ]; then
+  export MINT_GATEWAY_GLM51_AUTH_MODE="${TINKER_GATEWAY_GLM51_AUTH_MODE}"
+fi
+
 if [ -n "${MINT_GATEWAY_GLM51_BASE_URL:-}" ]; then
   if [ "${MINT_GATEWAY_GLM51_AUTH_MODE:-static_api_key}" != "static_api_key" ]; then
     echo "unsupported GLM5.1 gateway auth mode: ${MINT_GATEWAY_GLM51_AUTH_MODE}" >&2
