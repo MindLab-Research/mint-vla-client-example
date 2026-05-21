@@ -443,19 +443,16 @@ class PostgresUsageStore:
         for attempt in range(3):
             try:
                 async with pool.acquire() as conn:
-                    rows = await asyncio.wait_for(
-                        conn.fetch(
-                            sql,
-                            [event.event_id for event in events],
-                            [self._normalize_event_time(event.event_time) for event in events],
-                            [event.account_id for event in events],
-                            [event.apikey_id for event in events],
-                            [event.charge_item for event in events],
-                            [event.quantity for event in events],
-                            [event.request_id for event in events],
-                            [event.label or "" for event in events],
-                        ),
-                        timeout=self._write_timeout_s,
+                    rows = await conn.fetch(
+                        sql,
+                        [event.event_id for event in events],
+                        [self._normalize_event_time(event.event_time) for event in events],
+                        [event.account_id for event in events],
+                        [event.apikey_id for event in events],
+                        [event.charge_item for event in events],
+                        [event.quantity for event in events],
+                        [event.request_id for event in events],
+                        [event.label or "" for event in events],
                     )
                 return [str(row["event_id"]) for row in rows]
             except Exception as e:
@@ -520,10 +517,7 @@ class PostgresUsageStore:
             return
         pool = await self._ensure_pool()
         async with pool.acquire() as conn:
-            await asyncio.wait_for(
-                conn.execute(f"DELETE FROM {self._table} WHERE event_id = ANY($1::text[])", normalized),
-                timeout=self._write_timeout_s,
-            )
+            await conn.execute(f"DELETE FROM {self._table} WHERE event_id = ANY($1::text[])", normalized)
 
     def _build_where(
         self,
