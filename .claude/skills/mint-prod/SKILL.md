@@ -43,17 +43,34 @@ Use `/vePFS-Mindverse/share/mint/prod/config/prod.env` as the production server 
 
 ## Code Versioning
 
-Production server code is managed as a git checkout on the production host. Do
-not deploy with file sync tools.
+Production server code is managed as a git checkout under the shared vePFS
+deployment directory. The local development machine and the production driver
+see the same `/vePFS-Mindverse/share/mint/prod/mint-server` path, so update the
+checkout locally first. This avoids relying on GitHub credentials on the driver.
+Do not deploy with file sync tools.
+
+```bash
+cd /vePFS-Mindverse/share/mint/prod/mint-server
+git fetch origin
+git status --short --branch
+git checkout refactor
+git pull --ff-only origin refactor
+```
+
+If the local shared path is unavailable or the local git operation fails for an
+environmental reason, fall back to running the same git commands on the driver:
 
 ```bash
 ssh mint-prod-volcano 'cd /vePFS-Mindverse/share/mint/prod/mint-server && git fetch origin && git status --short --branch'
 ssh mint-prod-volcano 'cd /vePFS-Mindverse/share/mint/prod/mint-server && git checkout refactor && git pull --ff-only origin refactor'
 ```
 
-Record the commit SHA before and after a production deploy:
+Record the commit SHA before and after a production deploy. Prefer local checks
+on the shared checkout, and use the driver only to confirm what the running host
+will see:
 
 ```bash
+cd /vePFS-Mindverse/share/mint/prod/mint-server && git rev-parse HEAD
 ssh mint-prod-volcano 'cd /vePFS-Mindverse/share/mint/prod/mint-server && git rev-parse HEAD'
 ```
 
