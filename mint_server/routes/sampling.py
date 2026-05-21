@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 from fastapi import APIRouter, HTTPException, Request, Response
 
 from ..config import config as server_config
+from ..backend.model_work_scheduler import ModelWorkSchedulerConflictError
 from ..backend.task_state_store import (
     FutureStatus,
     TaskStateStoreUnavailableError,
@@ -1089,7 +1090,6 @@ async def asample(
         http_request,
         billing_auth=billing_auth,
     )
-    created_pending = False
     model_work_attempt_id = uuid.uuid4().hex
     base_model = snapshot.base_model if snapshot is not None else None
     if snapshot is None or not base_model:
@@ -1102,47 +1102,6 @@ async def asample(
     set_request_id(request_id)
     logger.info(f"asample request received: session_id={session_id}, seq_id={request.seq_id}")
 
-    if request.seq_id is not None:
-        for attempt in range(2):
-            try:
-                ensure = await task_futures.async_ensure_pending(
-                    request_id=request_id,
-                    meta={
-                        "payload_hash": payload_hash,
-                        "model_work_attempt_id": model_work_attempt_id,
-                    },
-                )
-            except TaskStateStoreUnavailableError:
-                raise HTTPException(status_code=503, detail="Ray unavailable: TaskStateStore requires Ray")
-            if bool(ensure.get("created")):
-                created_pending = True
-                break
-            meta = ensure.get("meta")
-            existing_hash = meta.get("payload_hash") if isinstance(meta, dict) else None
-            if not isinstance(existing_hash, str) or not existing_hash:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Duplicate seq_id with existing request lacking payload hash",
-                )
-            if existing_hash != payload_hash:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Duplicate seq_id with different request payload",
-                )
-            try:
-                await task_futures.async_get_status(request_id)
-            except TaskStateStoreUnavailableError:
-                raise HTTPException(status_code=503, detail="Ray unavailable: TaskStateStore requires Ray")
-            except KeyError:
-                if attempt == 0:
-                    continue
-                raise HTTPException(
-                    status_code=503,
-                    detail="Duplicate seq_id lost while confirming pending request",
-                )
-            return UntypedAPIFuture(request_id=request_id)
-
-    created_by_admission = False
     scheduler_append_confirmed = False
     try:
         domain_key = _model_work_domain_key(str(base_model))
@@ -1186,7 +1145,7 @@ async def asample(
                 "model_work_attempt_id": model_work_attempt_id,
             },
             queued_meta=queued_meta,
-            create_future=not created_pending,
+            create_future=True,
             payload_hash=payload_hash,
             task_futures_client=task_futures,
             trace_enqueue=_enqueue_sampling_request_with_trace,
@@ -1198,7 +1157,6 @@ async def asample(
         )
         scheduler_result = admission.scheduler_result
         scheduler_append_confirmed = bool(scheduler_result.get("ok"))
-        created_by_admission = not created_pending
         if scheduler_result.get("scheduler_instance_id"):
             await task_futures.async_update_meta(
                 request_id,
@@ -1209,7 +1167,54 @@ async def asample(
                     "model_work_attempt_id": model_work_attempt_id,
                 },
             )
+    except ModelWorkSchedulerConflictError:
+        if request.seq_id is None:
+            logger.exception(
+                "[sampling.asample] enqueue duplicate request_id without seq_id request_id=%s error_type=%s error=%s",
+                request_id,
+                "ModelWorkSchedulerConflictError",
+                "duplicate request_id",
+            )
+            raise HTTPException(status_code=503, detail="Failed to enqueue sampling request: duplicate request_id")
+        try:
+            meta = await task_futures.async_get_meta(request_id)
+            existing_hash = meta.get("payload_hash") if isinstance(meta, dict) else None
+            if not isinstance(existing_hash, str) or not existing_hash:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Duplicate seq_id with existing request lacking payload hash",
+                )
+            if existing_hash != payload_hash:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Duplicate seq_id with different request payload",
+                )
+            await task_futures.async_get_status(request_id)
+        except HTTPException:
+            raise
+        except TaskStateStoreUnavailableError:
+            raise HTTPException(status_code=503, detail="Ray unavailable: TaskStateStore requires Ray")
+        except KeyError:
+            logger.exception(
+                "[sampling.asample] duplicate request_id missing from TaskStateStore request_id=%s session_id=%s seq_id=%s",
+                request_id,
+                session_id,
+                request.seq_id,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Duplicate seq_id lost while confirming pending request",
+            )
+        return UntypedAPIFuture(request_id=request_id)
     except Exception as e:
+        logger.exception(
+            "[sampling.asample] enqueue failed request_id=%s session_id=%s seq_id=%s error_type=%s error=%s",
+            request_id,
+            session_id,
+            request.seq_id,
+            type(e).__name__,
+            str(e),
+        )
         if scheduler_append_confirmed:
             try:
                 from ..backend.model_work_scheduler import model_work_scheduler
@@ -1220,12 +1225,7 @@ async def asample(
                 )
             except Exception:
                 pass
-        if created_pending:
-            try:
-                await task_futures.async_forget(request_id)
-            except TaskStateStoreUnavailableError:
-                raise HTTPException(status_code=503, detail="Ray unavailable: TaskStateStore requires Ray")
-        elif created_by_admission:
+        if scheduler_append_confirmed:
             await task_futures.async_cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue sampling request: {e}")
 

@@ -109,6 +109,9 @@ class _StubTaskFutureService:
             return "PENDING"
         raise KeyError(f"Unknown request_id: {request_id}")
 
+    async def async_get_meta(self, request_id: str) -> dict | None:
+        return self.pending.get(request_id)
+
     async def async_cleanup(self, _request_id: str) -> None:
         return None
 
@@ -130,7 +133,20 @@ class _StubModelWorkScheduler:
         self.calls: list[dict] = []
 
     async def append(self, **kwargs):
+        from mint_server.backend.model_work_scheduler import ModelWorkSchedulerConflictError
+
+        request_id = kwargs["request_id"]
+        if any(call["request_id"] == request_id for call in self.calls):
+            raise ModelWorkSchedulerConflictError(f"duplicate request_id: {request_id}")
         self.calls.append(dict(kwargs))
+        try:
+            from mint_server.routes import sampling as sampling_route
+
+            cur = sampling_route.task_futures.pending.get(request_id) or {}
+            cur.update(dict(kwargs.get("extra") or {}))
+            sampling_route.task_futures.pending[request_id] = cur
+        except Exception:
+            pass
         return {"ok": True, "scheduler_instance_id": "scheduler-test"}
 
     async def cancel_request(self, **_kwargs):

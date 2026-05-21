@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
@@ -47,15 +46,21 @@ async def enqueue_model_work(
     if ordering_key is not None:
         enqueue_extra["ordering_key"] = str(ordering_key)
 
+    _ = task_futures_client
     scheduler_confirmed = False
-    if task_futures_client is None:
-        from .task_state_store import task_futures as store
-    else:
-        store = task_futures_client
     if scheduler_client is None:
         from .model_work_scheduler import model_work_scheduler as scheduler
     else:
         scheduler = scheduler_client
+    scheduler_extra = {
+        **enqueue_extra,
+        **dict(queued_meta),
+        "model_work_scheduler": True,
+        "domain_key": str(domain_key),
+        "request_json_bytes": len(request_json),
+    }
+    if payload_hash is not None:
+        scheduler_extra["payload_hash"] = str(payload_hash)
     try:
         append_coro = scheduler.append(
             request_id=request_id,
@@ -71,7 +76,7 @@ async def enqueue_model_work(
             token_cost=token_cost,
             assign=assign,
             assign_max_items=assign_max_items,
-            extra=enqueue_extra,
+            extra=scheduler_extra,
         )
         if trace_enqueue is None:
             out = await append_coro
@@ -83,19 +88,7 @@ async def enqueue_model_work(
                 enqueue_coro=append_coro,
             )
         scheduler_confirmed = isinstance(out, dict) and bool(out.get("ok"))
-        if create_future:
-            await store.async_mark_queued(
-                request_id,
-                meta={
-                    "queue_state": "queued",
-                    "stage": "queued",
-                    "queued_at": time.time(),
-                    **dict(queued_meta),
-                    "model_work_scheduler": True,
-                    "domain_key": str(domain_key),
-                    "request_json_bytes": len(request_json),
-                },
-            )
+        _ = create_future
         return ModelWorkAdmissionResult(
             request_id=request_id,
             scheduler_result=out if isinstance(out, dict) else {},

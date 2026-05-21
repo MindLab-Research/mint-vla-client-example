@@ -29,6 +29,12 @@ class _StubTaskFutureService:
             raise RuntimeError("update meta failed")
         self.updated.append((request_id, None if meta is None else dict(meta)))
 
+    async def async_get_meta(self, _request_id: str) -> dict | None:
+        return None
+
+    async def async_get_status(self, _request_id: str) -> str:
+        raise KeyError("unknown request_id")
+
     async def async_cleanup(self, request_id: str) -> None:
         self.cleaned.append(request_id)
 
@@ -119,10 +125,12 @@ def test_issue_593_asample_routes_multi_lora_to_model_work_scheduler(monkeypatch
     assert call["extra"]["model_work_scheduler"] is True
     assert isinstance(call["extra"]["model_work_attempt_id"], str)
     assert call["extra"]["model_work_attempt_id"]
-    assert stub_fs.queued[0][1]["queue_state"] == "queued"
-    assert stub_fs.queued[0][1]["queue_kind"] == "model_work_scheduler"
-    assert stub_fs.queued[0][1]["domain_key"] == "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507"
-    assert stub_fs.queued[0][1]["model_work_attempt_id"] == call["extra"]["model_work_attempt_id"]
+    assert stub_fs.queued == []
+    assert call["extra"]["queue_state"] == "queued"
+    assert call["extra"]["queue_kind"] == "model_work_scheduler"
+    assert call["extra"]["domain_key"] == "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507"
+    assert isinstance(call["extra"]["payload_hash"], str)
+    assert call["extra"]["payload_hash"]
     assert stub_fs.updated == [
         (
             out.request_id,
