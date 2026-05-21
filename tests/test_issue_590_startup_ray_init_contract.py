@@ -10,9 +10,12 @@ import pytest
 def test_lifespan_fails_before_yield_when_ray_init_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     from mint_server import app as app_module
 
+    calls: list[str] = []
+
     def _fail_init_ray(*_args, **_kwargs) -> None:
         raise RuntimeError("ray startup unavailable")
 
+    monkeypatch.setattr(app_module, "configure_logging", lambda: calls.append("configure_logging"))
     monkeypatch.setattr(app_module, "init_ray", _fail_init_ray)
 
     async def _run() -> None:
@@ -21,6 +24,7 @@ def test_lifespan_fails_before_yield_when_ray_init_fails(monkeypatch: pytest.Mon
                 raise AssertionError("lifespan should not yield when Ray startup fails")
 
     asyncio.run(_run())
+    assert calls == ["configure_logging"]
 
 
 def test_lifespan_checks_control_plane_without_creating_actors(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -74,6 +78,7 @@ def test_lifespan_checks_control_plane_without_creating_actors(monkeypatch: pyte
     async def _close_http_clients() -> None:
         calls.append("http.close")
 
+    monkeypatch.setattr(app_module, "configure_logging", lambda: calls.append("configure_logging"))
     monkeypatch.setattr(app_module, "init_ray", lambda *_args, **_kwargs: calls.append("init_ray"))
     monkeypatch.setattr(app_module, "ray_connection_epoch", lambda: 0)
     monkeypatch.setattr(app_module, "ray_reconnect_poll_s", lambda: 3600.0)
@@ -111,6 +116,7 @@ def test_lifespan_checks_control_plane_without_creating_actors(monkeypatch: pyte
 
     assert "usage.close" in calls
     assert "http.close" in calls
+    assert calls.index("configure_logging") < calls.index("init_ray")
 
 
 def test_lifespan_degrades_but_yields_when_usage_postgres_unhealthy(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -147,6 +153,7 @@ def test_lifespan_degrades_but_yields_when_usage_postgres_unhealthy(monkeypatch:
     async def _close_http_clients() -> None:
         pass
 
+    monkeypatch.setattr(app_module, "configure_logging", lambda: calls.append("configure_logging"))
     monkeypatch.setattr(app_module, "init_ray", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(app_module, "ray_connection_epoch", lambda: 0)
     monkeypatch.setattr(app_module, "ray_reconnect_poll_s", lambda: 3600.0)

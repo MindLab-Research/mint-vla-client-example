@@ -30,6 +30,7 @@ from .gateway_auth import extract_gateway_auth_context, has_gateway_auth_headers
 from .logging_context import (
     classify_failure_reason,
     bind_request_trace_context,
+    configure_logging,
     ensure_trace_id,
     extract_trace_id_from_traceparent,
     get_trace_id,
@@ -230,6 +231,10 @@ async def lifespan(app: FastAPI):
     Initializes both inference SessionManager and training components
     on startup, shuts down all sessions on application exit.
     """
+    # Uvicorn multi-worker mode imports this app inside forked worker
+    # processes. Initialize logging/OTel here so each request-serving process
+    # owns its metric provider and process identity.
+    configure_logging()
     # ==========================================================================
     # Ray driver: startup invariant
     # ==========================================================================
