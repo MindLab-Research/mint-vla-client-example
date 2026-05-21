@@ -814,6 +814,7 @@ def test_issue_627_build_volcano_create_job_request_converts_storages(
                 '    Flavor: "ml.hpcpni2l.28xlarge"',
                 "Storages:",
                 '  - Type: "Vepfs"',
+                '    Id: "vepfs-test"',
                 '    MountPath: "/vePFS-Mindverse/share"',
                 '    SubPath: "share"',
                 "    ReadOnly: false",
@@ -846,10 +847,59 @@ def test_issue_627_build_volcano_create_job_request_converts_storages(
 
     assert len(request.storage_config.storages) == 2
     assert request.storage_config.storages[0].type == "Vepfs"
+    assert request.storage_config.storages[0].config.vepfs.id == "vepfs-test"
     assert request.storage_config.storages[0].config.vepfs.sub_path == "share"
     assert request.storage_config.storages[1].type == "Tos"
     assert request.storage_config.storages[1].config.tos.bucket == "tos-mindverse"
     assert request.storage_config.credential.use_service_linked_role is True
+
+
+def test_issue_627_build_volcano_create_job_request_requires_vepfs_identifier(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    _install_fake_volcano_sdk(monkeypatch)
+    template = tmp_path / "worker.yaml"
+    template.write_text(
+        "\n".join(
+            [
+                'TaskName: "mint-prod-worker"',
+                'Description: "worker"',
+                "Entrypoint: |",
+                "  echo start",
+                'ImageUrl: "image"',
+                'ResourceQueueID: "<GPU_QUEUE_ID>"',
+                "TaskRoleSpecs:",
+                '  - RoleName: "worker"',
+                "    RoleReplicas: 1",
+                '    Flavor: "ml.hpcpni2l.28xlarge"',
+                "Storages:",
+                '  - Type: "Vepfs"',
+                '    MountPath: "/vePFS-Mindverse/share"',
+                '    SubPath: "share"',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config = load_topology_config(_write_topology_config(tmp_path))
+    provider_cfg = dict(config.providers["volcano"])
+    templates = dict(provider_cfg["templates"])
+    templates["a800-8gpu-c1"] = {**templates["a800-8gpu-c1"], "template_path": str(template)}
+    provider_cfg["templates"] = templates
+    config = type(config)(
+        version=config.version,
+        deployment_env=config.deployment_env,
+        cluster_id=config.cluster_id,
+        state_path=config.state_path,
+        nodes=config.nodes,
+        providers={"volcano": provider_cfg},
+        ray_dashboard_url=config.ray_dashboard_url,
+        ray_head_ip_path=config.ray_head_ip_path,
+    )
+
+    with pytest.raises(ValueError, match="Vepfs storage must include Id or FileSystemName"):
+        build_volcano_create_job_request(config, config.nodes["mint-worker-0"])
 
 
 def test_issue_627_build_volcano_create_job_request_maps_volcengine_cr_image(

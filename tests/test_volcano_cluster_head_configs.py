@@ -38,6 +38,7 @@ def test_dev_head_keeps_dashboard_and_ray_client_enabled() -> None:
     assert 'MountPath: "/tos-mindverse-prod"' in text
     assert 'Bucket: "tos-mindverse"' in text
     assert 'Flavor: "ml.r3i.4xlarge"' in text
+    assert 'Id: "vepfs-cnbjecc87dad63ea"' in text
 
 
 def test_dev_worker_uses_short_temp_paths() -> None:
@@ -65,6 +66,7 @@ def test_dev_worker_uses_short_temp_paths() -> None:
     assert 'Bucket: "tos-mindverse-dev"' in text
     assert 'MountPath: "/tos-mindverse-prod"' in text
     assert 'Bucket: "tos-mindverse"' in text
+    assert 'Id: "vepfs-cnbjecc87dad63ea"' in text
 
 
 def test_prod_head_self_heals_without_dashboard_or_ray_client() -> None:
@@ -95,6 +97,7 @@ def test_prod_head_self_heals_without_dashboard_or_ray_client() -> None:
     assert "node.dead_processes()" in text
     assert "kill_all_processes(check_alive=False, allow_graceful=False, wait=True)" in text
     assert "restart_delay_s = min(BACKOFF_MAX_S, restart_delay_s * 2)" in text
+    assert text.count('Id: "vepfs-cnbjecc87dad63ea"') == 2
 
 
 def test_prod_worker_self_heals_with_backoff() -> None:
@@ -121,3 +124,4 @@ def test_prod_worker_self_heals_with_backoff() -> None:
     assert "kill_all_processes(check_alive=False, allow_graceful=False, wait=True)" in text
     assert "restart_delay_s = min(BACKOFF_MAX_S, restart_delay_s * 2)" in text
     assert "sleep 300" not in text
+    assert text.count('Id: "vepfs-cnbjecc87dad63ea"') == 2

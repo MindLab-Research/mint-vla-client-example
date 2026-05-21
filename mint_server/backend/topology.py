@@ -739,10 +739,17 @@ def _volcano_storage_for_create_job(sdk: Any, raw: dict[str, Any]) -> Any:
     config_obj = None
     sdk_storage_type = storage_type
     if storage_type == "Vepfs":
+        vepfs_id = str(raw.get("Id") or "").strip() or None
+        file_system_name = str(raw.get("FileSystemName") or "").strip() or None
+        if not vepfs_id and not file_system_name:
+            raise ValueError(
+                "Volcano Vepfs storage must include Id or FileSystemName; "
+                f"mount_path={mount_path!r}"
+            )
         config_obj = sdk.ConfigForCreateJobInput(
             vepfs=sdk.VepfsForCreateJobInput(
-                id=str(raw.get("Id") or "").strip() or None,
-                file_system_name=str(raw.get("FileSystemName") or "").strip() or None,
+                id=vepfs_id,
+                file_system_name=file_system_name,
                 sub_path=str(raw.get("SubPath") or "").strip() or None,
                 host_path=str(raw.get("HostPath") or "").strip() or None,
             )
