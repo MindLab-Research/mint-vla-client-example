@@ -88,6 +88,7 @@ _TRACER: Any | None = None
 _OP_PREFIX_RE = re.compile(r"^\[([A-Za-z0-9_.:-]+)\]")
 _ACTOR_OBS_INITIALIZED = False
 _ACTOR_OBS_LOCK = threading.Lock()
+_OTEL_RESOURCE_LOGGED = False
 _T = TypeVar("_T")
 _PROCESS_INSTANCE_TOKEN = uuid.uuid4().hex
 
@@ -638,7 +639,7 @@ def _parse_headers(raw: str | None) -> dict[str, str]:
 
 def _configure_opentelemetry(root_logger: logging.Logger) -> None:
     """Configure OTLP trace/metric/log export (APMPlus or collector)."""
-    global _OTEL_ENABLED, _OTEL_INITIALIZED, _OTEL_LOG_HANDLER_ATTACHED
+    global _OTEL_ENABLED, _OTEL_INITIALIZED, _OTEL_LOG_HANDLER_ATTACHED, _OTEL_RESOURCE_LOGGED
     global _HTTP_REQUEST_COUNTER, _HTTP_DURATION_HISTOGRAM, _HTTP_ERROR_COUNTER
     global _RETRIEVE_FUTURE_WAIT_COUNTER
     global _SAMPLING_ADMISSION_COUNTER, _TASK_STATE_FUTURES_TIMEOUT_COUNTER
@@ -675,7 +676,16 @@ def _configure_opentelemetry(root_logger: logging.Logger) -> None:
         return
 
     # Use explicit resource attributes only; avoid default detector payloads.
-    resource = Resource(attributes=_otel_resource_attributes())
+    resource_attributes = _otel_resource_attributes()
+    if not _OTEL_RESOURCE_LOGGED:
+        root_logger.info(
+            "[otel.resource] service_name=%s service_instance_id=%s metric_instance_id=%s",
+            resource_attributes.get("service.name"),
+            resource_attributes.get("service.instance.id"),
+            _otel_process_metric_attributes().get("mint.instance_id"),
+        )
+        _OTEL_RESOURCE_LOGGED = True
+    resource = Resource(attributes=resource_attributes)
     headers = _parse_headers(os.getenv("OTEL_EXPORTER_OTLP_HEADERS"))
     app_key = (
         os.getenv("MINT_APMPLUS_APP_KEY")
