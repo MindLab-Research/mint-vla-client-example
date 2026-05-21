@@ -239,24 +239,24 @@ ssh mint-dev "mkdir -p /root/mint_project && ln -sfn $MINT_CODE_ROOT /root/mint_
 
 Start an issue-scoped dev server (does not touch the default dev server on port 8000):
 ```bash
-ssh mint-dev "cat > /share/mint/dev/tmp/start_issue_$ISSUE.sh <<'SH'
+ssh mint-dev "cat > /vePFS-Mindverse/share/mint/dev/tmp/start_issue_$ISSUE.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 cd '$MINT_CODE_ROOT'
 set -a
-. /share/mint/dev/config/common.env
-if [ -f /share/mint/dev/config/secrets.env ]; then
-  . /share/mint/dev/config/secrets.env
+. /vePFS-Mindverse/share/mint/dev/config/common.env
+if [ -f /vePFS-Mindverse/share/mint/dev/config/secrets.env ]; then
+  . /vePFS-Mindverse/share/mint/dev/config/secrets.env
 fi
 set +a
 export MINT_CODE_ROOT='$MINT_CODE_ROOT'
 export MINT_RAY_NAMESPACE='$MINT_RAY_NAMESPACE'
 export MINT_PORT='$MINT_PORT'
 export MINT_USAGE_LOG_DIR='/tmp/mint_usage_issue_$ISSUE'
-exec /share/mint/dev/runtime/host-venv/bin/python scripts/run_server.py
+exec /vePFS-Mindverse/share/mint/dev/runtime/host-venv/bin/python scripts/run_server.py
 SH
-chmod +x /share/mint/dev/tmp/start_issue_$ISSUE.sh
-nohup /share/mint/dev/tmp/start_issue_$ISSUE.sh >> /tmp/mint_server_issue_$ISSUE.log 2>&1 & echo \$! > /tmp/mint_server_issue_$ISSUE.pid"
+chmod +x /vePFS-Mindverse/share/mint/dev/tmp/start_issue_$ISSUE.sh
+nohup /vePFS-Mindverse/share/mint/dev/tmp/start_issue_$ISSUE.sh >> /tmp/mint_server_issue_$ISSUE.log 2>&1 & echo \$! > /tmp/mint_server_issue_$ISSUE.pid"
 ```
 
 Issue-scoped health check (via local SSH tunnel):

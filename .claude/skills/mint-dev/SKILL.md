@@ -26,11 +26,11 @@ update the skill instead of reviving old deployment paths.
 |------|-------|
 | SSH host | `mint-dev` |
 | API port | `8000` |
-| Code checkout | `/share/mint/dev/mint-server` |
-| Runtime root | `/share/mint/dev/runtime` |
-| Public config | `/share/mint/dev/config/common.env` |
-| Private config | `/share/mint/dev/config/secrets.env` |
-| Log file | `/share/mint/dev/logs/mint_server_auth.log` |
+| Code checkout | `/vePFS-Mindverse/share/mint/dev/mint-server` |
+| Runtime root | `/vePFS-Mindverse/share/mint/dev/runtime` |
+| Public config | `/vePFS-Mindverse/share/mint/dev/config/common.env` |
+| Private config | `/vePFS-Mindverse/share/mint/dev/config/secrets.env` |
+| Log file | `/vePFS-Mindverse/share/mint/dev/logs/mint_server_auth.log` |
 
 Dev config is split deliberately:
 - `common.env`: non-secret deployment config such as port, Ray address, runtime
@@ -38,7 +38,7 @@ Dev config is split deliberately:
 - `secrets.env`: private values such as API keys or credentials. Source it only
   when needed; never print it, commit it, or paste its contents into logs.
 
-Use `/share/mint/dev/config/common.env` as the dev server startup contract.
+Use `/vePFS-Mindverse/share/mint/dev/config/common.env` as the dev server startup contract.
 
 ## Code Versioning
 
@@ -46,35 +46,35 @@ The dev server code is managed as a git checkout on the server host. Do not use
 file sync tools.
 
 ```bash
-ssh mint-dev 'cd /share/mint/dev/mint-server && git fetch origin && git status --short --branch'
-ssh mint-dev 'cd /share/mint/dev/mint-server && git checkout refactor && git pull --ff-only origin refactor'
+ssh mint-dev 'cd /vePFS-Mindverse/share/mint/dev/mint-server && git fetch origin && git status --short --branch'
+ssh mint-dev 'cd /vePFS-Mindverse/share/mint/dev/mint-server && git checkout refactor && git pull --ff-only origin refactor'
 ```
 
 For issue branches, checkout the requested remote branch in
-`/share/mint/dev/mint-server` and record the commit SHA before testing.
+`/vePFS-Mindverse/share/mint/dev/mint-server` and record the commit SHA before testing.
 
 ## Start Or Restart
 
-Use the runtime interpreter from `/share/mint/dev/runtime`; do not use system
+Use the runtime interpreter from `/vePFS-Mindverse/share/mint/dev/runtime`; do not use system
 Python for server startup or Ray inspection.
 
 ```bash
 ssh mint-dev 'pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true'
 
-ssh mint-dev 'cat > /share/mint/dev/tmp/start_mint_dev.sh <<'"'"'SH'"'"'
+ssh mint-dev 'cat > /vePFS-Mindverse/share/mint/dev/tmp/start_mint_dev.sh <<'"'"'SH'"'"'
 #!/usr/bin/env bash
 set -euo pipefail
-cd /share/mint/dev/mint-server
+cd /vePFS-Mindverse/share/mint/dev/mint-server
 set -a
-. /share/mint/dev/config/common.env
-if [ -f /share/mint/dev/config/secrets.env ]; then
-  . /share/mint/dev/config/secrets.env
+. /vePFS-Mindverse/share/mint/dev/config/common.env
+if [ -f /vePFS-Mindverse/share/mint/dev/config/secrets.env ]; then
+  . /vePFS-Mindverse/share/mint/dev/config/secrets.env
 fi
 set +a
-exec /share/mint/dev/runtime/host-venv/bin/python scripts/run_server.py
+exec /vePFS-Mindverse/share/mint/dev/runtime/host-venv/bin/python scripts/run_server.py
 SH
-chmod +x /share/mint/dev/tmp/start_mint_dev.sh
-nohup /share/mint/dev/tmp/start_mint_dev.sh >> /share/mint/dev/logs/mint_server_auth.log 2>&1 &'
+chmod +x /vePFS-Mindverse/share/mint/dev/tmp/start_mint_dev.sh
+nohup /vePFS-Mindverse/share/mint/dev/tmp/start_mint_dev.sh >> /vePFS-Mindverse/share/mint/dev/logs/mint_server_auth.log 2>&1 &'
 ```
 
 After any code change, restart the server before validating behavior. Python
@@ -84,7 +84,7 @@ servers do not hot-reload.
 
 ```bash
 curl http://localhost:8000/api/v1/healthz
-ssh mint-dev 'tail -n 200 /share/mint/dev/logs/mint_server_auth.log'
+ssh mint-dev 'tail -n 200 /vePFS-Mindverse/share/mint/dev/logs/mint_server_auth.log'
 ssh mint-dev 'ps aux | grep "[s]cripts/run_server.py"'
 ```
 
@@ -109,8 +109,8 @@ Volcano CLI commands to list, submit, cancel, or inspect worker jobs.
 Use the `volcano-cluster` skill. The operator entrypoint on `mint-dev` is:
 
 ```bash
-ssh mint-dev 'cd /share/mint/dev/mint-server && /share/mint/dev/runtime/host-venv/bin/python scripts/tools/volcano_sdk_jobs.py --region cn-beijing list --name-contains mint-dev-worker- --limit 200'
-ssh mint-dev 'cd /share/mint/dev/mint-server && /share/mint/dev/runtime/host-venv/bin/python scripts/tools/volcano_sdk_jobs.py --region cn-beijing submit-topology-node --config /share/mint/dev/runtime/topology.yaml --alias mint-worker-0'
+ssh mint-dev 'cd /vePFS-Mindverse/share/mint/dev/mint-server && /vePFS-Mindverse/share/mint/dev/runtime/host-venv/bin/python scripts/tools/volcano_sdk_jobs.py --region cn-beijing list --name-contains mint-dev-worker- --limit 200'
+ssh mint-dev 'cd /vePFS-Mindverse/share/mint/dev/mint-server && /vePFS-Mindverse/share/mint/dev/runtime/host-venv/bin/python scripts/tools/volcano_sdk_jobs.py --region cn-beijing submit-topology-node --config /vePFS-Mindverse/share/mint/dev/runtime/topology.yaml --alias mint-worker-0'
 ```
 
 Credential checks may report only source existence. Never print secret values,
@@ -125,4 +125,4 @@ credential files, signed requests, or process environments.
 - Do not switch ports to hide a failed restart; fix the listener or process that
   owns port `8000`.
 - Do not install packages until the runtime root and `PYTHONPATH` from
-  `/share/mint/dev/config/common.env` have been verified.
+  `/vePFS-Mindverse/share/mint/dev/config/common.env` have been verified.

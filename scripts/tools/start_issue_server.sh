@@ -16,7 +16,7 @@ _INPUT_MINT_VLLM_CHILD_PYTHON_EXECUTABLE="${MINT_VLLM_CHILD_PYTHON_EXECUTABLE:-}
 _INPUT_MINT_TOPOLOGY_CONFIG_PATH="${MINT_TOPOLOGY_CONFIG_PATH:-}"
 
 cd "${ISSUE_SERVER_ROOT}"
-dev_config_env="${MINT_DEV_CONFIG_ENV:-/share/mint/dev/config/common.env}"
+dev_config_env="${MINT_DEV_CONFIG_ENV:-/vePFS-Mindverse/share/mint/dev/config/common.env}"
 if [[ ! -r "${dev_config_env}" ]]; then
   echo "missing dev config: ${dev_config_env}" >&2
   exit 1

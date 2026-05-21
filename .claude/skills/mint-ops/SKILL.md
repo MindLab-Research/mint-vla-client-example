@@ -53,7 +53,7 @@ curl -s "$BASE/internal/actors?type=vllm" | jq
 Production:
 
 ```bash
-source /share/mint/prod/config/secrets.env
+source /vePFS-Mindverse/share/mint/prod/config/secrets.env
 BASE=http://localhost:18000
 curl -s -H "X-API-Key: $MINT_API_KEY" "$BASE/internal/actors?type=vllm" | jq
 ```
@@ -130,7 +130,7 @@ Use this section when the task is specifically about deploying or operating the 
 
 - Target host: `mint-prod-volcano`
 - Remote app root: `/vePFS-Mindverse/share/mint-ops`
-- Python env: `/share/mint/prod/runtime/host-venv/bin/python`
+- Python env: `/vePFS-Mindverse/share/mint/prod/runtime/host-venv/bin/python`
 - Mint API: `http://127.0.0.1:18000`
 - Ray: deploy on the driver node, so default to `auto`
 - Supervisor config: `/mlplatform/supervisord/supervisord.conf`
@@ -140,7 +140,7 @@ Use this section when the task is specifically about deploying or operating the 
 
 - Use `ssh mint-prod-volcano`, not a guessed host or raw IP, for server-side changes.
 - Manage the ops console as a git checkout under the remote app root.
-- Do not print secrets from `/share/mint/prod/config/secrets.env`.
+- Do not print secrets from `/vePFS-Mindverse/share/mint/prod/config/secrets.env`.
 - Production should use one service only: build the frontend with relative `/api` paths and let `ops.backend` serve `ops/frontend/dist/`.
 - Keep backend pointed at local Mint (`http://127.0.0.1:18000`) and source the API key from shared private config.
 
@@ -167,7 +167,7 @@ Append one program to `/mlplatform/supervisord/supervisord.conf`:
 
 ```ini
 [program:mint-ops-backend]
-command=/usr/bin/bash -lc 'cd /vePFS-Mindverse/share/mint-ops && set -a && source /share/mint/prod/config/prod.env && source /share/mint/prod/config/secrets.env && set +a && export PYTHONPATH=/vePFS-Mindverse/share/mint-ops:/share/mint/prod/mint-server && export MINT_OPS_MINT_BASE_URL=http://127.0.0.1:18000 && exec /share/mint/prod/runtime/host-venv/bin/python -m ops.backend --bind 0.0.0.0 --backend-port 8787'
+command=/usr/bin/bash -lc 'cd /vePFS-Mindverse/share/mint-ops && set -a && source /vePFS-Mindverse/share/mint/prod/config/prod.env && source /vePFS-Mindverse/share/mint/prod/config/secrets.env && set +a && export PYTHONPATH=/vePFS-Mindverse/share/mint-ops:/vePFS-Mindverse/share/mint/prod/mint-server && export MINT_OPS_MINT_BASE_URL=http://127.0.0.1:18000 && exec /vePFS-Mindverse/share/mint/prod/runtime/host-venv/bin/python -m ops.backend --bind 0.0.0.0 --backend-port 8787'
 directory=/vePFS-Mindverse/share/mint-ops
 autostart=true
 autorestart=true

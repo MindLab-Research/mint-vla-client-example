@@ -5,13 +5,13 @@ repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo_root"
 
 set -a
-dev_config_env="${MINT_DEV_CONFIG_ENV:-/share/mint/dev/config/common.env}"
+dev_config_env="${MINT_DEV_CONFIG_ENV:-/vePFS-Mindverse/share/mint/dev/config/common.env}"
 if [ ! -r "${dev_config_env}" ]; then
   echo "missing dev config: ${dev_config_env}" >&2
   exit 1
 fi
 . "${dev_config_env}"
-dev_secrets_env="${MINT_DEV_SECRETS_ENV:-/share/mint/dev/config/secrets.env}"
+dev_secrets_env="${MINT_DEV_SECRETS_ENV:-/vePFS-Mindverse/share/mint/dev/config/secrets.env}"
 if [ -r "${dev_secrets_env}" ]; then
   . "${dev_secrets_env}"
 fi
@@ -32,7 +32,7 @@ export TMPDIR="${api_tmp_link}/t"
 export XDG_CACHE_HOME="${api_tmp_link}/c"
 mkdir -p "${TMPDIR}" "${XDG_CACHE_HOME}" "${MINT_RUNTIME_CHECKPOINT_DIR}"
 
-ray_head_ip_path="${MINT_RAY_HEAD_ADDRESS_PATH:-/share/mint/dev/mint-server/ray_head_ip.txt}"
+ray_head_ip_path="${MINT_RAY_HEAD_ADDRESS_PATH:-/vePFS-Mindverse/share/mint/dev/mint-server/ray_head_ip.txt}"
 ray_head_ip=""
 if [ -r "$ray_head_ip_path" ]; then
   ray_head_ip=$(tr -d '[:space:]' < "$ray_head_ip_path")

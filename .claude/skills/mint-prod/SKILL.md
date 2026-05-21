@@ -27,11 +27,11 @@ auth-required; do not guess process names, paths, or credentials.
 | SSH host | `mint-prod-volcano` |
 | API port | `18000` |
 | Public URLs | `https://mint.macaron.im`, `https://mint.macaron.xin` |
-| Code checkout | `/share/mint/prod/mint-server` |
-| Runtime root | `/share/mint/prod/runtime` |
-| Public config | `/share/mint/prod/config/prod.env` |
-| Private config | `/share/mint/prod/config/secrets.env` |
-| Log file | `/share/mint/prod/logs/mint_server_auth.log` |
+| Code checkout | `/vePFS-Mindverse/share/mint/prod/mint-server` |
+| Runtime root | `/vePFS-Mindverse/share/mint/prod/runtime` |
+| Public config | `/vePFS-Mindverse/share/mint/prod/config/prod.env` |
+| Private config | `/vePFS-Mindverse/share/mint/prod/config/secrets.env` |
+| Log file | `/vePFS-Mindverse/share/mint/prod/logs/mint_server_auth.log` |
 
 Production config is split deliberately:
 - `prod.env`: non-secret deployment config such as port, Ray address, runtime
@@ -39,7 +39,7 @@ Production config is split deliberately:
 - `secrets.env`: private values such as API keys or credentials. Source it only
   when needed; never print it, commit it, or paste its contents into logs.
 
-Use `/share/mint/prod/config/prod.env` as the production server startup contract.
+Use `/vePFS-Mindverse/share/mint/prod/config/prod.env` as the production server startup contract.
 
 ## Code Versioning
 
@@ -47,14 +47,14 @@ Production server code is managed as a git checkout on the production host. Do
 not deploy with file sync tools.
 
 ```bash
-ssh mint-prod-volcano 'cd /share/mint/prod/mint-server && git fetch origin && git status --short --branch'
-ssh mint-prod-volcano 'cd /share/mint/prod/mint-server && git checkout refactor && git pull --ff-only origin refactor'
+ssh mint-prod-volcano 'cd /vePFS-Mindverse/share/mint/prod/mint-server && git fetch origin && git status --short --branch'
+ssh mint-prod-volcano 'cd /vePFS-Mindverse/share/mint/prod/mint-server && git checkout refactor && git pull --ff-only origin refactor'
 ```
 
 Record the commit SHA before and after a production deploy:
 
 ```bash
-ssh mint-prod-volcano 'cd /share/mint/prod/mint-server && git rev-parse HEAD'
+ssh mint-prod-volcano 'cd /vePFS-Mindverse/share/mint/prod/mint-server && git rev-parse HEAD'
 ```
 
 ## Start Or Restart
@@ -70,17 +70,17 @@ If the process is not supervisor-managed, start it with the shared runtime and
 config:
 
 ```bash
-ssh mint-prod-volcano 'cat > /share/mint/prod/tmp/start_mint_prod.sh <<'"'"'SH'"'"'
+ssh mint-prod-volcano 'cat > /vePFS-Mindverse/share/mint/prod/tmp/start_mint_prod.sh <<'"'"'SH'"'"'
 #!/usr/bin/env bash
 set -euo pipefail
-cd /share/mint/prod/mint-server
+cd /vePFS-Mindverse/share/mint/prod/mint-server
 set -a
-. /share/mint/prod/config/prod.env
-. /share/mint/prod/config/secrets.env
+. /vePFS-Mindverse/share/mint/prod/config/prod.env
+. /vePFS-Mindverse/share/mint/prod/config/secrets.env
 set +a
-exec /share/mint/prod/runtime/host-venv/bin/python scripts/run_server.py
+exec /vePFS-Mindverse/share/mint/prod/runtime/host-venv/bin/python scripts/run_server.py
 SH
-chmod +x /share/mint/prod/tmp/start_mint_prod.sh'
+chmod +x /vePFS-Mindverse/share/mint/prod/tmp/start_mint_prod.sh'
 ```
 
 Use the exact configured supervisor program or an explicit listener/process
@@ -90,7 +90,7 @@ target for restart. Do not use broad `pkill` patterns in production.
 
 ```bash
 curl http://localhost:18000/api/v1/healthz
-ssh mint-prod-volcano 'tail -n 200 /share/mint/prod/logs/mint_server_auth.log'
+ssh mint-prod-volcano 'tail -n 200 /vePFS-Mindverse/share/mint/prod/logs/mint_server_auth.log'
 ssh mint-prod-volcano 'ps aux | grep "[s]cripts/run_server.py"'
 ```
 
@@ -98,7 +98,7 @@ Authenticated calls must include `X-API-Key`:
 
 ```bash
 set -a
-. /share/mint/prod/config/secrets.env
+. /vePFS-Mindverse/share/mint/prod/config/secrets.env
 set +a
 curl -H "X-API-Key: $MINT_API_KEY" http://localhost:18000/internal/actors
 ```
@@ -123,8 +123,8 @@ Public `/api/v1/healthz` is only a cheap API-worker health check.
 - Use the Volcano SDK operator helper from the production checkout:
 
 ```bash
-ssh mint-prod-volcano 'cd /share/mint/prod/mint-server && /share/mint/prod/runtime/host-venv/bin/python scripts/tools/volcano_sdk_jobs.py --region cn-beijing list --name-contains mint-prod-worker- --limit 200'
-ssh mint-prod-volcano 'cd /share/mint/prod/mint-server && /share/mint/prod/runtime/host-venv/bin/python scripts/tools/volcano_sdk_jobs.py --region cn-beijing instances --job-id <job_id>'
+ssh mint-prod-volcano 'cd /vePFS-Mindverse/share/mint/prod/mint-server && /vePFS-Mindverse/share/mint/prod/runtime/host-venv/bin/python scripts/tools/volcano_sdk_jobs.py --region cn-beijing list --name-contains mint-prod-worker- --limit 200'
+ssh mint-prod-volcano 'cd /vePFS-Mindverse/share/mint/prod/mint-server && /vePFS-Mindverse/share/mint/prod/runtime/host-venv/bin/python scripts/tools/volcano_sdk_jobs.py --region cn-beijing instances --job-id <job_id>'
 ```
 
 Credential checks may report only source existence. Never print secret values,

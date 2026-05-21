@@ -38,7 +38,7 @@ def test_secrets_env_contains_only_secret_exports() -> None:
 def test_repo_prod_env_is_external_config_wrapper() -> None:
     assert PROD_ENV.exists()
     text = PROD_ENV.read_text(encoding="utf-8")
-    assert "/share/mint/prod/config/prod.env" in text
+    assert "/vePFS-Mindverse/share/mint/prod/config/prod.env" in text
     assert "MINT_PROD_CONFIG_ENV" in text
     assert "MINT_VLLM_MODEL_PLACEMENT_JSON=" not in text
     assert "node_ip" not in text
@@ -47,7 +47,7 @@ def test_repo_prod_env_is_external_config_wrapper() -> None:
 def test_repo_dev_env_is_external_config_wrapper() -> None:
     assert DEV_ENV.exists()
     text = DEV_ENV.read_text(encoding="utf-8")
-    assert "/share/mint/dev/config/common.env" in text
+    assert "/vePFS-Mindverse/share/mint/dev/config/common.env" in text
     assert "MINT_DEV_CONFIG_ENV" in text
     assert "MINT_VLLM_MODEL_PLACEMENT_JSON=" not in text
     assert "node_ip" not in text

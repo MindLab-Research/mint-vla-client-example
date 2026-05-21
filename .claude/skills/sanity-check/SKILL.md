@@ -111,7 +111,7 @@ After each run, preserve these timing outputs as evidence:
   - `ssh mint-prod-volcano "tail -400 /tmp/mint_server_auth.log"`
 - Do not assume `235B -> Aliyun`.
 - Before checking any remote upstream, verify the current routing target from current prod evidence:
-  - shared prod config under `/share/mint/prod/config`
+  - shared prod config under `/vePFS-Mindverse/share/mint/prod/config`
   - live routing env such as `MINT_GATEWAY_CONFIG_JSON`
   - current actor inventory from `/internal/actors`
 - Only if that evidence shows the model is remotely routed should you inspect the remote target logs, for example:

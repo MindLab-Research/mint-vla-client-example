@@ -5,13 +5,13 @@ repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo_root"
 
 set -a
-prod_config_env="${MINT_PROD_CONFIG_ENV:-/share/mint/prod/config/prod.env}"
+prod_config_env="${MINT_PROD_CONFIG_ENV:-/vePFS-Mindverse/share/mint/prod/config/prod.env}"
 if [ ! -r "${prod_config_env}" ]; then
   echo "missing prod config: ${prod_config_env}" >&2
   exit 1
 fi
 . "${prod_config_env}"
-prod_secrets_env="${MINT_PROD_SECRETS_ENV:-/share/mint/prod/config/secrets.env}"
+prod_secrets_env="${MINT_PROD_SECRETS_ENV:-/vePFS-Mindverse/share/mint/prod/config/secrets.env}"
 if [ ! -r "${prod_secrets_env}" ]; then
   echo "missing prod secrets: ${prod_secrets_env}" >&2
   exit 1
