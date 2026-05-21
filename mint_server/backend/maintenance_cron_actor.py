@@ -464,11 +464,28 @@ class MaintenanceCronActor:
         timeout_s: float = 10.0,
         create_if_missing: bool = True,
     ) -> dict[str, Any]:
-        actor = self._get_ray_actor(create_if_missing=create_if_missing)
-        snapshot = await _await_with_ray_get_timeout(
-            _await_ray_ref(actor.async_health_snapshot.remote()),
-            timeout_s=float(timeout_s),
-        )
+        try:
+            actor = self._get_ray_actor(create_if_missing=create_if_missing)
+            snapshot = await _await_with_ray_get_timeout(
+                _await_ray_ref(actor.async_health_snapshot.remote()),
+                timeout_s=float(timeout_s),
+            )
+        except Exception as e:
+            if not create_if_missing or not _looks_like_dead_actor_error(e):
+                raise
+            logger.warning(
+                "maintenance cron actor health handle stale; recreating actor_name=%r namespace=%r error_type=%s error=%s",
+                _actor_name(),
+                _ray_namespace(),
+                type(e).__name__,
+                e,
+            )
+            self._reset_cached_actor()
+            actor = self._get_ray_actor(create_if_missing=create_if_missing)
+            snapshot = await _await_with_ray_get_timeout(
+                _await_ray_ref(actor.async_health_snapshot.remote()),
+                timeout_s=float(timeout_s),
+            )
         if not create_if_missing:
             return snapshot
         await self._ensure_code_identity_async(snapshot)
@@ -484,8 +501,22 @@ class MaintenanceCronActor:
         timeout_s: float = 10.0,
         create_if_missing: bool = True,
     ) -> dict[str, Any]:
-        actor = self._get_ray_actor(create_if_missing=create_if_missing)
-        snapshot = _await_ray_ref_sync(actor.health_snapshot.remote(), timeout_s=float(timeout_s))
+        try:
+            actor = self._get_ray_actor(create_if_missing=create_if_missing)
+            snapshot = _await_ray_ref_sync(actor.health_snapshot.remote(), timeout_s=float(timeout_s))
+        except Exception as e:
+            if not create_if_missing or not _looks_like_dead_actor_error(e):
+                raise
+            logger.warning(
+                "maintenance cron actor health handle stale; recreating actor_name=%r namespace=%r error_type=%s error=%s",
+                _actor_name(),
+                _ray_namespace(),
+                type(e).__name__,
+                e,
+            )
+            self._reset_cached_actor()
+            actor = self._get_ray_actor(create_if_missing=create_if_missing)
+            snapshot = _await_ray_ref_sync(actor.health_snapshot.remote(), timeout_s=float(timeout_s))
         if not create_if_missing:
             return snapshot
         self._ensure_code_identity_sync(snapshot)
