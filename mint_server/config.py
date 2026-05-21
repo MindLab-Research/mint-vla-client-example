@@ -186,7 +186,17 @@ def otel_env_vars() -> dict[str, str]:
 
 
 def preferred_control_plane_resources(cluster_resources: dict[str, float] | None) -> dict[str, float] | None:
-    if cluster_resources and "node:__internal_head__" in cluster_resources:
+    if not cluster_resources:
+        return None
+    try:
+        from ray.util import get_node_ip_address
+
+        driver_node_key = f"node:{get_node_ip_address()}"
+    except Exception:
+        driver_node_key = ""
+    if driver_node_key and driver_node_key in cluster_resources:
+        return {driver_node_key: 0.001}
+    if "node:__internal_head__" in cluster_resources:
         return {"node:__internal_head__": 0.001}
     return None
 

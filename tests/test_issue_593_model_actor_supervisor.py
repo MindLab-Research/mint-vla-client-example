@@ -156,7 +156,7 @@ def test_issue_593_supervisor_detached_actor_options(monkeypatch: pytest.MonkeyP
 
     fake_ray = types.SimpleNamespace(
         is_initialized=lambda: True,
-        cluster_resources=lambda: {"node:__internal_head__": 1.0},
+        cluster_resources=lambda: {"node:10.1.2.3": 1.0, "node:__internal_head__": 1.0},
     )
 
     def _remote(**kwargs):
@@ -164,6 +164,8 @@ def test_issue_593_supervisor_detached_actor_options(monkeypatch: pytest.MonkeyP
         return lambda _cls: _FakeRemoteActorClass(created)
 
     fake_ray.remote = _remote
+    fake_ray_util = types.SimpleNamespace(get_node_ip_address=lambda: "10.1.2.3")
+    monkeypatch.setitem(sys.modules, "ray.util", fake_ray_util)
     monkeypatch.setitem(sys.modules, "ray", fake_ray)
     monkeypatch.setattr(supervisor_module, "PFS_PYTHONPATH", "PFS_PATH", raising=False)
     monkeypatch.setattr(
@@ -190,7 +192,7 @@ def test_issue_593_supervisor_detached_actor_options(monkeypatch: pytest.MonkeyP
     assert created["options"]["runtime_env"] == {
         "env_vars": {"PYTHONPATH": "PFS_PATH", "OTEL_SERVICE_NAME": "mint-test"}
     }
-    assert created["options"]["resources"] == {"node:__internal_head__": 0.001}
+    assert created["options"]["resources"] == {"node:10.1.2.3": 0.001}
     assert created["remote_kwargs"]["specs"] == desired_specs_from_env()
     assert actor.calls == [("snapshot", (), {})]
 
