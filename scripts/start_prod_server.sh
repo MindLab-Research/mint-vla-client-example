@@ -22,6 +22,9 @@ set +a
 if [ -z "${MINT_RUNTIME_CHECKPOINT_DIR:-}" ]; then
   export MINT_RUNTIME_CHECKPOINT_DIR="${TINKER_RUNTIME_CHECKPOINT_DIR:-/vePFS-Mindverse/share/mint/prod/data/runtime-checkpoints}"
 fi
+if [ -z "${MINT_CODE_ROOT:-}" ]; then
+  export MINT_CODE_ROOT="${PFS_TINKER_PATH:-$repo_root}"
+fi
 
 if [ -n "${MINT_GATEWAY_GLM51_BASE_URL:-}" ]; then
   if [ "${MINT_GATEWAY_GLM51_AUTH_MODE:-static_api_key}" != "static_api_key" ]; then
