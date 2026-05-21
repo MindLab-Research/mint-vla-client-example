@@ -112,7 +112,14 @@ ProviderTaskLister = Callable[[TopologyConfig], Iterable[ProviderTaskState]]
 ProviderTaskSubmitter = Callable[[TopologyConfig, TopologyNodeDesired], Any]
 RayNodeLister = Callable[[], Iterable[RayNodeState]]
 
-LIVE_PROVIDER_TASK_STATES = {"Queue", "Staging", "Running", "Initialized"}
+LIVE_PROVIDER_TASK_STATES = {
+    "Deploying",
+    "Initialized",
+    "Queue",
+    "Queueing",
+    "Running",
+    "Staging",
+}
 TERMINAL_PROVIDER_TASK_STATES = {"Succeeded", "Failed", "Cancelled", "Stopped", "Killing", "Terminated"}
 
 
@@ -463,6 +470,10 @@ def _job_name(task: Any) -> str:
     return str(_object_get(task, "JobName", "Name", "name") or "").strip()
 
 
+def _provider_task_sort_key(state: ProviderTaskState) -> tuple[int, str]:
+    return (1 if state.live else 0, state.task_id or "")
+
+
 def _extract_instance_node_ip(instance: Any) -> str | None:
     ips = _object_get(instance, "Ips", "ips")
     for name in ("PrimaryIp", "primary_ip", "HostIp", "host_ip"):
@@ -511,7 +522,7 @@ class VolcanoTopologyProvider:
             stable_provider_task_name(config.deployment_env, alias): alias
             for alias in config.nodes
         }
-        states: list[ProviderTaskState] = []
+        states_by_alias: dict[str, ProviderTaskState] = {}
         for task in tasks:
             task_name = _job_name(task)
             alias = task_names.get(task_name)
@@ -533,20 +544,21 @@ class VolcanoTopologyProvider:
                             break
                 except Exception as e:
                     error = f"volcano list_job_instances failed: {type(e).__name__}: {e}"
-            states.append(
-                ProviderTaskState(
-                    alias=alias,
-                    provider="volcano",
-                    task_name=task_name,
-                    live=live,
-                    task_id=task_id,
-                    node_ip=node_ip,
-                    gpu_count=_task_gpu_count(task),
-                    raw_state=raw_state,
-                    error=error,
-                )
+            state = ProviderTaskState(
+                alias=alias,
+                provider="volcano",
+                task_name=task_name,
+                live=live,
+                task_id=task_id,
+                node_ip=node_ip,
+                gpu_count=_task_gpu_count(task),
+                raw_state=raw_state,
+                error=error,
             )
-        return states
+            previous = states_by_alias.get(alias)
+            if previous is None or _provider_task_sort_key(state) > _provider_task_sort_key(previous):
+                states_by_alias[alias] = state
+        return states_by_alias.values()
 
     def submit_task(self, config: TopologyConfig, node: TopologyNodeDesired) -> None:
         request = build_volcano_create_job_request(config, node)

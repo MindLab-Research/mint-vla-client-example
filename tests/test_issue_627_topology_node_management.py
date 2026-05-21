@@ -752,6 +752,53 @@ def test_issue_627_volcano_provider_lists_stable_tasks_and_extracts_instance_ip(
     assert client.list_job_instances_requests[0].job_id == "t-1"
 
 
+def test_issue_627_volcano_provider_treats_deploying_as_live_and_dedupes_alias(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    _install_fake_volcano_sdk(monkeypatch)
+    config = load_topology_config(_write_topology_config(tmp_path))
+    client = _FakeVolcanoClient(
+        jobs=[
+            _SdkModel(id="t-old", name="mint-prod-worker-0", status=_SdkModel(state="Stopped")),
+            _SdkModel(
+                id="t-live-1",
+                name="mint-prod-worker-0",
+                status=_SdkModel(state="Deploying"),
+                resource_config=_SdkModel(
+                    roles=[
+                        _SdkModel(
+                            replicas=1,
+                            resource=_SdkModel(instance_type_id="ml.hpcpni2l.28xlarge"),
+                        )
+                    ]
+                ),
+            ),
+            _SdkModel(
+                id="t-live-2",
+                name="mint-prod-worker-0",
+                status=_SdkModel(state="Queueing"),
+                resource_config=_SdkModel(
+                    roles=[
+                        _SdkModel(
+                            replicas=1,
+                            resource=_SdkModel(instance_type_id="ml.hpcpni2l.28xlarge"),
+                        )
+                    ]
+                ),
+            ),
+        ]
+    )
+
+    states = list(VolcanoTopologyProvider(client=client).list_tasks(config))
+
+    assert len(states) == 1
+    assert states[0].alias == "mint-worker-0"
+    assert states[0].live is True
+    assert states[0].task_id == "t-live-2"
+    assert states[0].raw_state == "Queueing"
+
+
 def test_issue_627_volcano_provider_uses_sdk_default_credentials_not_submit_host(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
