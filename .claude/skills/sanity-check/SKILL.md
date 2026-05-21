@@ -47,6 +47,8 @@ Required access:
 - `ssh mint-prod-aliyun` only if live routing/config proves the failing model is routed there.
 
 Scripts:
+- Canonical wrapper: `scripts/wip/check.sh`
+- Wrapper implementation: `scripts/wip/train_check.py`
 - Main runner: `.claude/skills/sanity-check/mint_rl_test_long.py`
 - Feishu notifier: `.claude/skills/sanity-check/feishu_notify.py`
 
@@ -110,12 +112,30 @@ Optional read-only probes are allowed but are not the sanity check:
 
 ```bash
 curl -sS "$MINT_BASE_URL/api/v1/healthz"
-curl -sS -H "X-API-Key: $MINT_API_KEY" "$MINT_BASE_URL/api/v1/internal/healthz"
+curl -sS -H "X-API-Key: $MINT_API_KEY" "$MINT_BASE_URL/api/v1/actors"
 ```
 
 Do not use the optional probe result as PASS evidence.
 
 ### 1) Run the four RL loops
+
+Preferred command:
+
+```bash
+./scripts/wip/check.sh --all-models --timeout-s=7200
+```
+
+The wrapper is part of this skill contract. It must:
+- refuse any base URL other than `https://mint.macaron.xin`,
+- load `.secrets.env` without printing secrets,
+- require `MINT_TEST_CHECKPOINT_OWNER_ID`,
+- run `--all-models` sequentially in the required order,
+- write artifacts under `/root/run_results/mint/<timestamp>/`,
+- discover nested timing files recursively,
+- write `summary.json`, `summary.md`, and `final_feishu_report.md`,
+- send exactly one final Feishu report for `--all-models`.
+
+Use the manual pattern below only if the wrapper itself is broken.
 
 Run exactly these four models in order:
 
