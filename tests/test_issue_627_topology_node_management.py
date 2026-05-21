@@ -846,7 +846,7 @@ def test_issue_627_build_volcano_create_job_request_converts_storages(
     assert len(request.storage_config.storages) == 2
     assert request.storage_config.storages[0].type == "Vepfs"
     assert request.storage_config.storages[0].config.vepfs.sub_path == "share"
-    assert request.storage_config.storages[1].type == "TosFuse"
+    assert request.storage_config.storages[1].type == "Tos"
     assert request.storage_config.storages[1].config.tos.bucket == "tos-mindverse"
 
 

@@ -724,6 +724,7 @@ def _volcano_storage_for_create_job(sdk: Any, raw: dict[str, Any]) -> Any:
     if not storage_type or not mount_path:
         raise ValueError("Volcano storage item must include Type and MountPath")
     config_obj = None
+    sdk_storage_type = storage_type
     if storage_type == "Vepfs":
         config_obj = sdk.ConfigForCreateJobInput(
             vepfs=sdk.VepfsForCreateJobInput(
@@ -734,6 +735,7 @@ def _volcano_storage_for_create_job(sdk: Any, raw: dict[str, Any]) -> Any:
             )
         )
     elif storage_type == "TosFuse":
+        sdk_storage_type = "Tos"
         config_obj = sdk.ConfigForCreateJobInput(
             tos=sdk.TosForCreateJobInput(
                 bucket=str(raw.get("Bucket") or "").strip() or None,
@@ -743,7 +745,7 @@ def _volcano_storage_for_create_job(sdk: Any, raw: dict[str, Any]) -> Any:
     else:
         raise ValueError(f"unsupported Volcano storage type in topology worker template: {storage_type!r}")
     return sdk.StorageForCreateJobInput(
-        type=storage_type,
+        type=sdk_storage_type,
         mount_path=mount_path,
         read_only=read_only,
         config=config_obj,
