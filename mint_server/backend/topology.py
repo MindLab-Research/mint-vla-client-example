@@ -689,9 +689,13 @@ def build_volcano_create_job_request(config: TopologyConfig, node: TopologyNodeD
             )
         )
     storage_specs = []
+    uses_tos_storage = False
     for raw_storage in payload.get("Storages") or []:
         if not isinstance(raw_storage, dict):
             raise ValueError(f"Storages item for {node.alias} must be a mapping")
+        raw_storage_type = str(raw_storage.get("Type") or raw_storage.get("type") or "").strip()
+        if raw_storage_type in {"Tos", "TosFuse"}:
+            uses_tos_storage = True
         storage_specs.append(_volcano_storage_for_create_job(sdk, raw_storage))
     image_url = str(payload.get("ImageUrl") or "").strip()
     if not image_url:
@@ -713,7 +717,16 @@ def build_volcano_create_job_request(config: TopologyConfig, node: TopologyNodeD
             framework=str(payload.get("Framework") or "Custom"),
             image=sdk.ImageForCreateJobInput(type=image_type, url=image_url),
         ),
-        storage_config=sdk.StorageConfigForCreateJobInput(storages=storage_specs) if storage_specs else None,
+        storage_config=sdk.StorageConfigForCreateJobInput(
+            credential=(
+                sdk.ConvertCredentialForCreateJobInput(use_service_linked_role=True)
+                if uses_tos_storage
+                else None
+            ),
+            storages=storage_specs,
+        )
+        if storage_specs
+        else None,
     )
 
 

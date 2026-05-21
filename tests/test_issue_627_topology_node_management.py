@@ -41,6 +41,7 @@ def _install_fake_volcano_sdk(monkeypatch: pytest.MonkeyPatch):
         RoleForCreateJobInput=type("RoleForCreateJobInput", (_SdkModel,), {}),
         ResourceForCreateJobInput=type("ResourceForCreateJobInput", (_SdkModel,), {}),
         StorageConfigForCreateJobInput=type("StorageConfigForCreateJobInput", (_SdkModel,), {}),
+        ConvertCredentialForCreateJobInput=type("ConvertCredentialForCreateJobInput", (_SdkModel,), {}),
         StorageForCreateJobInput=type("StorageForCreateJobInput", (_SdkModel,), {}),
         ConfigForCreateJobInput=type("ConfigForCreateJobInput", (_SdkModel,), {}),
         VepfsForCreateJobInput=type("VepfsForCreateJobInput", (_SdkModel,), {}),
@@ -848,6 +849,7 @@ def test_issue_627_build_volcano_create_job_request_converts_storages(
     assert request.storage_config.storages[0].config.vepfs.sub_path == "share"
     assert request.storage_config.storages[1].type == "Tos"
     assert request.storage_config.storages[1].config.tos.bucket == "tos-mindverse"
+    assert request.storage_config.credential.use_service_linked_role is True
 
 
 def test_issue_627_build_volcano_create_job_request_maps_volcengine_cr_image(
