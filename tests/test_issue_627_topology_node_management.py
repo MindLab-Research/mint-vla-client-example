@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import types
 
 import yaml
@@ -352,6 +353,50 @@ def test_issue_627_sdk_client_can_bridge_legacy_volc_cli_credentials(
     assert configuration.region == "cn-beijing"
     assert configuration.connect_timeout == 3
     assert configuration.read_timeout == 5
+
+
+def test_issue_627_volcano_sdk_import_falls_back_to_host_venv_site_packages(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    from mint_server.backend import topology as topology_module
+
+    sdk = _install_fake_volcano_sdk(monkeypatch)
+    monkeypatch.delitem(sys.modules, "volcenginesdkmlplatform20240701")
+    runtime_root = tmp_path / "runtime"
+    host_site = tmp_path / "runtime" / "host-venv" / "lib" / "python3.12" / "site-packages"
+    host_site.mkdir(parents=True)
+    (runtime_root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "runtime_env": {
+                    "site_packages_dir": "site-packages",
+                    "source_dir": "src",
+                    "base_python_dir": "base-python",
+                    "host_venv_dir": "host-venv",
+                },
+                "sources": [{"name": "dummy"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PFS_RUNTIME_ENV_ROOT", str(runtime_root))
+
+    real_import = topology_module.importlib.import_module
+
+    def _import(name: str):
+        if name == "volcenginesdkcore":
+            return types.SimpleNamespace()
+        if name == "volcenginesdkmlplatform20240701":
+            if str(host_site) not in sys.path:
+                raise ImportError(name)
+            return sdk
+        return real_import(name)
+
+    monkeypatch.setattr(topology_module.importlib, "import_module", _import)
+
+    assert topology_module._volcano_sdk_module() is sdk
+    assert str(host_site) in sys.path
 
 
 def test_issue_627_sdk_client_prefers_modern_credential_chain_over_legacy_cli(

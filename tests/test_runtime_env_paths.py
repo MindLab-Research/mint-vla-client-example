@@ -15,6 +15,7 @@ from mint_server.runtime_env import (
     bootstrap_runtime_pythonpath,
     build_runtime_pythonpath,
     checkout_runtime_env_layout,
+    host_venv_site_packages,
     runtime_env_layout,
     validate_runtime_env_layout,
 )
@@ -209,6 +210,16 @@ def test_runtime_env_layout_tracks_host_only_pythonpaths():
             expected.append(f"/tmp/runtime/src/{source['name']}{suffix}")
     layout = checkout_runtime_env_layout("/tmp/runtime")
     assert list(layout.host_pythonpath_entries) == expected
+
+
+def test_host_venv_site_packages_points_inside_runtime_root(tmp_path):
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env(env_root)
+
+    out = host_venv_site_packages(str(env_root))
+
+    assert out.startswith(str(env_root / "host-venv"))
+    assert out.endswith("site-packages")
 
 
 def test_runtime_env_layout_includes_openpi_source_checkout():

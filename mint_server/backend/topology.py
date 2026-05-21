@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import ipaddress
+import importlib
 import json
 import os
 import re
+import sys
 import tempfile
 import time
 import urllib.request
@@ -553,12 +555,49 @@ class VolcanoTopologyProvider:
 
 def _volcano_sdk_module() -> Any:
     try:
-        import volcenginesdkmlplatform20240701 as sdk
+        return importlib.import_module("volcenginesdkmlplatform20240701")
     except ImportError as e:
-        raise RuntimeError(
-            "volcengine-python-sdk is required for Volcano topology node management"
-        ) from e
-    return sdk
+        if _prepend_host_venv_site_packages():
+            try:
+                return importlib.import_module("volcenginesdkmlplatform20240701")
+            except ImportError:
+                pass
+        raise RuntimeError("volcengine-python-sdk is required for Volcano topology node management") from e
+
+
+def _import_volcano_sdk_modules() -> tuple[Any, Any]:
+    try:
+        return (
+            importlib.import_module("volcenginesdkcore"),
+            importlib.import_module("volcenginesdkmlplatform20240701"),
+        )
+    except ImportError as e:
+        if _prepend_host_venv_site_packages():
+            try:
+                return (
+                    importlib.import_module("volcenginesdkcore"),
+                    importlib.import_module("volcenginesdkmlplatform20240701"),
+                )
+            except ImportError:
+                pass
+        raise RuntimeError("volcengine-python-sdk is required for Volcano topology node management") from e
+
+
+def _prepend_host_venv_site_packages() -> bool:
+    env_root = str(os.environ.get("PFS_RUNTIME_ENV_ROOT") or "").strip()
+    if not env_root:
+        return False
+    try:
+        from ..runtime_env import host_venv_site_packages
+
+        path = host_venv_site_packages(env_root)
+    except Exception:
+        return False
+    if not path or not Path(path).is_dir():
+        return False
+    if path not in sys.path:
+        sys.path.insert(0, path)
+    return True
 
 
 def _legacy_volc_cli_credentials() -> dict[str, str]:
@@ -620,13 +659,7 @@ def _create_volcano_mlplatform_client(
     connect_timeout: float | None = None,
     read_timeout: float | None = None,
 ) -> Any:
-    try:
-        import volcenginesdkcore
-        import volcenginesdkmlplatform20240701 as sdk
-    except ImportError as e:
-        raise RuntimeError(
-            "volcengine-python-sdk is required for Volcano topology node management"
-        ) from e
+    volcenginesdkcore, sdk = _import_volcano_sdk_modules()
     configuration = volcenginesdkcore.Configuration()
     if region:
         configuration.region = str(region)

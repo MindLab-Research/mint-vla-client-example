@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from functools import lru_cache
 from dataclasses import dataclass
 from pathlib import Path
@@ -205,6 +206,16 @@ def validate_runtime_env_layout(env_root: str, *, require_host_python: bool = Tr
 def host_only_pythonpath_entries(env_root: str) -> tuple[str, ...]:
     layout = runtime_env_layout(env_root)
     return tuple(layout.host_pythonpath_entries)
+
+
+def host_venv_site_packages(env_root: str) -> str:
+    layout = runtime_env_layout(env_root)
+    return os.path.join(
+        layout.host_venv_root,
+        "lib",
+        f"python{sys.version_info.major}.{sys.version_info.minor}",
+        "site-packages",
+    )
 
 
 def sanitize_worker_pythonpath(raw: str | None, *, env_root: str | None) -> str:
