@@ -782,6 +782,7 @@ def test_issue_627_volcano_provider_renders_template_and_submits_sdk_job(
     assert request.name == "mint-prod-worker-0"
     assert request.resource_config.resource_queue_id == "rq-a"
     assert request.runtime_config.framework == "Custom"
+    assert request.runtime_config.image.type == "Public"
     assert request.runtime_config.image.url == "image"
     assert request.resource_config.roles[0].name == "worker"
     assert request.resource_config.roles[0].replicas == 1
@@ -847,6 +848,97 @@ def test_issue_627_build_volcano_create_job_request_converts_storages(
     assert request.storage_config.storages[0].config.vepfs.sub_path == "share"
     assert request.storage_config.storages[1].type == "TosFuse"
     assert request.storage_config.storages[1].config.tos.bucket == "tos-mindverse"
+
+
+def test_issue_627_build_volcano_create_job_request_maps_volcengine_cr_image(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    _install_fake_volcano_sdk(monkeypatch)
+    template = tmp_path / "worker.yaml"
+    template.write_text(
+        "\n".join(
+            [
+                'TaskName: "mint-prod-worker"',
+                'Description: "worker"',
+                "Entrypoint: |",
+                "  echo start",
+                'ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:16-sm80"',
+                'ResourceQueueID: "<GPU_QUEUE_ID>"',
+                "TaskRoleSpecs:",
+                '  - RoleName: "worker"',
+                "    RoleReplicas: 1",
+                '    Flavor: "ml.hpcpni2l.28xlarge"',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config = load_topology_config(_write_topology_config(tmp_path))
+    provider_cfg = dict(config.providers["volcano"])
+    templates = dict(provider_cfg["templates"])
+    templates["a800-8gpu-c1"] = {**templates["a800-8gpu-c1"], "template_path": str(template)}
+    provider_cfg["templates"] = templates
+    config = type(config)(
+        version=config.version,
+        deployment_env=config.deployment_env,
+        cluster_id=config.cluster_id,
+        state_path=config.state_path,
+        nodes=config.nodes,
+        providers={"volcano": provider_cfg},
+        ray_dashboard_url=config.ray_dashboard_url,
+        ray_head_ip_path=config.ray_head_ip_path,
+    )
+
+    request = build_volcano_create_job_request(config, config.nodes["mint-worker-0"])
+
+    assert request.runtime_config.image.type == "VolcEngine"
+
+
+def test_issue_627_build_volcano_create_job_request_allows_explicit_image_type(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    _install_fake_volcano_sdk(monkeypatch)
+    template = tmp_path / "worker.yaml"
+    template.write_text(
+        "\n".join(
+            [
+                'TaskName: "mint-prod-worker"',
+                'Description: "worker"',
+                "Entrypoint: |",
+                "  echo start",
+                'ImageType: "Prebuild"',
+                'ImageUrl: "prebuild-image-name"',
+                'ResourceQueueID: "<GPU_QUEUE_ID>"',
+                "TaskRoleSpecs:",
+                '  - RoleName: "worker"',
+                "    RoleReplicas: 1",
+                '    Flavor: "ml.hpcpni2l.28xlarge"',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config = load_topology_config(_write_topology_config(tmp_path))
+    provider_cfg = dict(config.providers["volcano"])
+    templates = dict(provider_cfg["templates"])
+    templates["a800-8gpu-c1"] = {**templates["a800-8gpu-c1"], "template_path": str(template)}
+    provider_cfg["templates"] = templates
+    config = type(config)(
+        version=config.version,
+        deployment_env=config.deployment_env,
+        cluster_id=config.cluster_id,
+        state_path=config.state_path,
+        nodes=config.nodes,
+        providers={"volcano": provider_cfg},
+        ray_dashboard_url=config.ray_dashboard_url,
+        ray_head_ip_path=config.ray_head_ip_path,
+    )
+
+    request = build_volcano_create_job_request(config, config.nodes["mint-worker-0"])
+
+    assert request.runtime_config.image.type == "Prebuild"
 
 
 def test_issue_627_render_volcano_template_is_stable(tmp_path) -> None:

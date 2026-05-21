@@ -444,6 +444,15 @@ def _job_state(task: Any) -> str:
     return str(_object_get(status, "State", "state") or status or "").strip()
 
 
+def _volcano_image_type_for_create_job(raw_type: Any, image_url: str) -> str:
+    image_type = str(raw_type or "").strip()
+    if image_type:
+        return image_type
+    if ".cr.volces.com/" in image_url:
+        return "VolcEngine"
+    return "Public"
+
+
 def _job_id(task: Any) -> str | None:
     return str(_object_get(task, "JobId", "Id", "id") or "").strip() or None
 
@@ -687,6 +696,7 @@ def build_volcano_create_job_request(config: TopologyConfig, node: TopologyNodeD
     image_url = str(payload.get("ImageUrl") or "").strip()
     if not image_url:
         raise ValueError(f"rendered Volcano worker template for {node.alias} must include ImageUrl")
+    image_type = _volcano_image_type_for_create_job(payload.get("ImageType"), image_url)
     command = str(payload.get("Entrypoint") or "").strip()
     if not command:
         raise ValueError(f"rendered Volcano worker template for {node.alias} must include Entrypoint")
@@ -701,7 +711,7 @@ def build_volcano_create_job_request(config: TopologyConfig, node: TopologyNodeD
         runtime_config=sdk.RuntimeConfigForCreateJobInput(
             command=command,
             framework=str(payload.get("Framework") or "Custom"),
-            image=sdk.ImageForCreateJobInput(type="ImageUrl", url=image_url),
+            image=sdk.ImageForCreateJobInput(type=image_type, url=image_url),
         ),
         storage_config=sdk.StorageConfigForCreateJobInput(storages=storage_specs) if storage_specs else None,
     )
