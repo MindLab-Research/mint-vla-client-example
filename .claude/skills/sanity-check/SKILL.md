@@ -3,9 +3,9 @@ name: sanity-check
 description: |
   Production sanity-check runner for MinT/mint-server.
 
-  Objective: run non-trivial RL training loops (not just healthz) against production for 4 base models
-  (0.6B, 4B, 30B, 235B), collect evidence on failure, do minimal ops remediation when justified,
-  and report a final incident report to a Feishu bot when issues are encountered.
+  Objective: run non-trivial RL training loops against MinT production for the 4 production base models
+  (0.6B, 4B, 30B, 235B), collect timing evidence, perform only minimal ops remediation when justified,
+  and send exactly one final Feishu report.
 
   Triggers: "sanity check", "sanity-check", "prod sanity", "production sanity"
 
@@ -17,123 +17,221 @@ description: |
 Procedure contract:
 - Read this SKILL.md end-to-end before taking any action.
 - Do not sample sections opportunistically while already in motion.
-- If the procedure is missing something important, update the skill. Do not improvise around the gap.
+- If the procedure is missing something important, update the skill first. Do not improvise around the gap.
 
 Hard rules:
-- Production only. Refuse to run if base URL points to dev (port 8000).
-- No requirement substitution: do not use inference-only mode; run the RL loop.
+- Production only. The base URL for this workflow is exactly `https://mint.macaron.xin`.
+- Refuse to run if the effective base URL is anything else, including localhost, SSH tunnels, dev ports, `https://mint.macaron.im`, or an internal host/port.
+- No requirement substitution: do not use `--inference-only`; run the RL loop with a training client.
 - Ops only: no non-trivial code changes in this workflow.
-- Minimize downtime: prefer killing a single actor over restarting the whole server.
-- Never swallow an incident: always leave artifacts under `results/` and, when appropriate, file a GitHub issue.
-- No START notifications. Send exactly one final Feishu report at the end, even if all results are OK.
-- Production base URLs:
-  - `https://mint.macaron.im` (international access)
-  - `https://mint.macaron.xin` (China access)
-- In this skill, use `https://mint.macaron.xin` as the base URL (do not use SSH tunnels / `localhost`).
-- Do not use an ad-hoc "hung after 240s" cutoff. Under load, 235B sampling can queue for many minutes. Treat only the configured per-request timeout (`--timeout-s` / `MINT_TEST_TIMEOUT_S`) or explicit server-side errors as failure signals.
+- Minimize downtime: prefer killing one specific actor for one specific model over restarting the API process; do not restart Ray/head/worker nodes as first response.
+- Do not use an ad-hoc "hung after N seconds" cutoff. Under load, 235B can queue for many minutes. Treat only the configured timeout or explicit service/server error as failure.
+- No START notifications. Send exactly one final Feishu report at the end, even if all models pass.
+- Never print secrets, process environments, or full `.secrets.env` contents.
 
 ## Inputs
 
-Required local file (repo root):
-- `.secrets.env` (do not print); must provide `MINT_BASE_URL` and `MINT_API_KEY`.
+Required working directory:
+- `/root/code/mint`.
+
+Required local file:
+- `/root/code/mint/.secrets.env`.
+- Source it without printing it. It must provide an API key through `MINT_API_KEY` or Tinker SDK compatibility `TINKER_API_KEY`.
+
+Required production owner:
+- `MINT_TEST_CHECKPOINT_OWNER_ID` must be set to the production owner ObjectId.
+- It must be a 24-character hex ObjectId. Refuse to run if missing or invalid.
 
 Required access:
-- `ssh mint-prod-volcano` (Volcano router/master)
-- `ssh mint-prod-aliyun` only if current prod routing/config actually targets an Aliyun upstream
+- `ssh mint-prod-volcano` for router/master logs and production ops.
+- `ssh mint-prod-aliyun` only if live routing/config proves the failing model is routed there.
 
-## What this skill runs
+Scripts:
+- Main runner: `.claude/skills/sanity-check/mint_rl_test_long.py`
+- Feishu notifier: `.claude/skills/sanity-check/feishu_notify.py`
 
-Main test script (vendored copy):
-- `.claude/skills/sanity-check/mint_rl_test_long.py`
+Artifact root:
+- `/root/run_results/mint/<timestamp>/`, where `<timestamp>` is `YYYYMMDD-HHMMSS`.
+- `/root/run_results/mint` is expected to point at `/vePFS-Mindverse/user/nolanho/run_results/mint`.
 
-Feishu notifier:
-- `.claude/skills/sanity-check/feishu_notify.py`
+Per-model artifacts:
+- Create one directory per model under the run root.
+- Capture stdout/stderr separately for each model.
+- Set `MINT_TEST_EXPERIMENT_ROOT` to that model directory.
+- `mint_rl_test_long.py` creates an additional timestamped subdirectory under `MINT_TEST_EXPERIMENT_ROOT`; timing files are inside that subdirectory. Locate them with `find "$MODEL_DIR" -name timing_summary.json` rather than assuming they sit directly in the model directory.
 
-Artifacts (gitignored):
-- `results/sanity-check/<timestamp>/`
-- Per-model timing artifacts written by `mint_rl_test_long.py`:
-  - `timing_events.jsonl`
-  - `timing_summary.json`
-  - `timing_summary.md`
+Timing evidence to preserve:
+- `timing_events.jsonl`
+- `timing_summary.json`
+- `timing_summary.md`
 
 ## Procedure
 
-### 0) Preflight (must)
+### 0) Preflight
 
-1) Load credentials (local):
+Run from `/root/code/mint`:
+
 ```bash
-set -a && source .secrets.env && set +a
+cd /root/code/mint
+set -a
+. ./.secrets.env
+set +a
+export MINT_BASE_URL=https://mint.macaron.xin
+export TINKER_BASE_URL=https://mint.macaron.xin
 ```
 
-2) Confirm production targeting:
-- Set `MINT_BASE_URL=https://mint.macaron.xin`.
-- Set `MINT_TEST_CHECKPOINT_OWNER_ID` to the production owner ObjectId used for owner-scoped checkpoint sampling.
-- Refuse to run if `MINT_BASE_URL` is anything else (including `localhost:*` and `https://mint.macaron.im`).
+Validate target and required owner without printing secrets:
 
-3) (Optional) Quick read-only probes (not sufficient alone):
+```bash
+python - <<'PY'
+import os, re
+base = os.environ.get("MINT_BASE_URL") or os.environ.get("TINKER_BASE_URL")
+owner = os.environ.get("MINT_TEST_CHECKPOINT_OWNER_ID", "")
+if base != "https://mint.macaron.xin":
+    raise SystemExit(f"refusing non-production sanity base URL: {base!r}")
+if not re.fullmatch(r"[0-9a-fA-F]{24}", owner):
+    raise SystemExit("MINT_TEST_CHECKPOINT_OWNER_ID must be a 24-character production owner ObjectId")
+if not (os.environ.get("MINT_API_KEY") or os.environ.get("TINKER_API_KEY")):
+    raise SystemExit("missing production API key")
+print("sanity preflight ok: production URL and owner id are set; API key is present (redacted)")
+PY
+```
+
+Create the run directory:
+
+```bash
+TS=$(date +%Y%m%d-%H%M%S)
+RUN_ROOT=/root/run_results/mint/$TS
+mkdir -p "$RUN_ROOT"
+printf '%s\n' "$TS" > "$RUN_ROOT/timestamp.txt"
+```
+
+Optional read-only probes are allowed but are not the sanity check:
+
 ```bash
 curl -sS "$MINT_BASE_URL/api/v1/healthz"
-curl -sS -H "X-API-Key: $MINT_API_KEY" "$MINT_BASE_URL/internal/actors"
+curl -sS -H "X-API-Key: $MINT_API_KEY" "$MINT_BASE_URL/api/v1/internal/healthz"
 ```
 
-### 1) Run the 4 RL tests (must)
+Do not use the optional probe result as PASS evidence.
 
-Run sequentially (default models: 0.6B, 4B, 30B, 235B). Do this as an agent-run workflow,
-capturing stdout/stderr per model into `results/sanity-check/<timestamp>/`.
-For each model, set `MINT_TEST_EXPERIMENT_ROOT` to that model's artifact directory so the runner writes
-timing reports next to the captured logs instead of under `/tmp`.
+### 1) Run the four RL loops
 
-Example per-model command:
+Run exactly these four models in order:
+
+1. `Qwen/Qwen3-0.6B`
+2. `Qwen/Qwen3-4B-Instruct-2507`
+3. `Qwen/Qwen3-30B-A3B-Instruct-2507`
+4. `Qwen/Qwen3-235B-A22B-Instruct-2507`
+
+Use this pattern for each model. Keep each model as a separate process and preserve its exit code.
+
 ```bash
-RUN_DIR="results/sanity-check/<timestamp>/<model_slug>"
-mkdir -p "$RUN_DIR"
-MINT_TEST_EXPERIMENT_ROOT="$RUN_DIR" \
-MINT_TEST_CHECKPOINT_OWNER_ID="$MINT_TEST_CHECKPOINT_OWNER_ID" \
-python .claude/skills/sanity-check/mint_rl_test_long.py \
-  --model <MODEL_NAME> \
-  --num-rl-steps=1 \
-  --batch-size=2 \
-  --group-size=4 \
-  --max-tokens=128
+MODEL='Qwen/Qwen3-0.6B'
+SLUG=$(MODEL="$MODEL" python - <<'PY'
+import os, re
+print(re.sub(r'[^A-Za-z0-9_.-]+', '_', os.environ['MODEL']).strip('_'))
+PY
+)
+MODEL_DIR="$RUN_ROOT/$SLUG"
+mkdir -p "$MODEL_DIR"
+START_EPOCH=$(date +%s)
+(
+  set -a
+  . ./.secrets.env
+  set +a
+  export MINT_BASE_URL=https://mint.macaron.xin
+  export TINKER_BASE_URL=https://mint.macaron.xin
+  export MINT_TEST_EXPERIMENT_ROOT="$MODEL_DIR"
+  export MINT_TEST_CHECKPOINT_OWNER_ID="$MINT_TEST_CHECKPOINT_OWNER_ID"
+  python .claude/skills/sanity-check/mint_rl_test_long.py \
+    --model "$MODEL" \
+    --num-rl-steps=1 \
+    --batch-size=2 \
+    --group-size=4 \
+    --max-tokens=128
+) >"$MODEL_DIR/stdout.log" 2>"$MODEL_DIR/stderr.log"
+STATUS=$?
+END_EPOCH=$(date +%s)
+MODEL="$MODEL" STATUS="$STATUS" WALL="$((END_EPOCH-START_EPOCH))" python - <<'PY' > "$MODEL_DIR/result.json"
+import json, os
+print(json.dumps({
+    "model": os.environ["MODEL"],
+    "exit_code": int(os.environ["STATUS"]),
+    "wall_clock_s": int(os.environ["WALL"]),
+}))
+PY
+find "$MODEL_DIR" -name timing_summary.json -o -name timing_summary.md -o -name timing_events.jsonl | sort > "$MODEL_DIR/artifacts.txt"
 ```
 
-Do not add `--inference-only`.
-Do not omit `MINT_TEST_CHECKPOINT_OWNER_ID` when testing production owner-scoped checkpoints; without it, admin checkpoint references fail at sampling-client creation.
-After each run, preserve these timing outputs as evidence:
-- `timing_events.jsonl`: one record per timed stage call (sample, save_weights_for_sampler, forward_backward, optim_step, eval_sample, save_state, and client creation calls).
-- `timing_summary.json`: machine-readable per-stage aggregates.
-- `timing_summary.md`: human-readable stage table for quick inspection.
+Important runner constraints:
+- Do not pass `--inference-only`.
+- Do not omit `MINT_TEST_CHECKPOINT_OWNER_ID`.
+- Do not lower `MINT_TEST_TIMEOUT_S` just to make the run finish faster.
+- For 235B, wait for the configured timeout or an explicit error. Pending sampling alone is not failure.
 
-### 2) If any test fails: evidence first, then remediation
+### 2) Summarize timing after each model
 
-1) Check prod logs:
-- Always check the router/master first:
-  - `ssh mint-prod-volcano "tail -400 /tmp/mint_server_auth.log"`
-- Do not assume `235B -> Aliyun`.
-- Before checking any remote upstream, verify the current routing target from current prod evidence:
-  - shared prod config under `/vePFS-Mindverse/share/mint/prod/config`
-  - live routing env such as `MINT_GATEWAY_CONFIG_JSON`
-  - current actor inventory from `/internal/actors`
-- Only if that evidence shows the model is remotely routed should you inspect the remote target logs, for example:
-  - `ssh mint-prod-aliyun "tail -400 /tmp/mint_server_auth.log"`
+For each model, parse the newest `timing_summary.json` under that model directory and write a compact summary that can be used in the final Feishu report:
 
-2) If 235B is "slow but pending" (no exception, just long `retrieve_future` / pending sampling):
-- Do not interrupt or kill vLLM solely due to elapsed time.
-- Capture request_id(s) from local debug output, and rely on the configured per-request timeout for termination.
+```bash
+python - "$MODEL_DIR" <<'PY'
+import json, pathlib, sys
+model_dir = pathlib.Path(sys.argv[1])
+result_path = model_dir / "result.json"
+result = json.loads(result_path.read_text()) if result_path.exists() else {"exit_code": None, "wall_clock_s": None}
+summaries = sorted(model_dir.glob("**/timing_summary.json"), key=lambda p: p.stat().st_mtime)
+summary = json.loads(summaries[-1].read_text()) if summaries else {"stages": [], "wall_clock_s": result.get("wall_clock_s")}
+stages = summary.get("stages") or []
+slowest = max(stages, key=lambda s: float(s.get("max_s", 0.0)), default={"stage": "none", "max_s": 0.0})
+out = {
+    "model": result.get("model") or summary.get("base_model"),
+    "ok": result.get("exit_code") == 0,
+    "exit_code": result.get("exit_code"),
+    "slowest_stage": slowest.get("stage"),
+    "max_s": slowest.get("max_s"),
+    "wall_clock_s": summary.get("wall_clock_s", result.get("wall_clock_s")),
+}
+(model_dir / "report_summary.json").write_text(json.dumps(out, indent=2) + "\n")
+print(json.dumps(out, sort_keys=True))
+PY
+```
 
-3) Determine failure class:
-- Client-side (bad base URL/auth) -> fix env and rerun; still report as incident.
-- Capacity / scheduling (placement group pending, GPUs held by detached actors) -> kill the smallest relevant actor(s).
-- Server crash / exception -> collect traceback + request_id and file an issue (see below).
-- Timing-only degradation (no hard failure, but one stage is materially slower than the others) -> keep the timing report and call out the slow stage explicitly in the final Feishu report and any GitHub issue.
+### 3) Failure handling: evidence first
 
-After the workflow stabilizes (either fixed+rerun passes, or persistent failure), send a final Feishu report.
+If any model process exits non-zero:
 
-### 3) Minimal ops remediation (allowed, when justified)
+1. Preserve local artifacts already written under `/root/run_results/mint/<timestamp>/`.
+2. Record the failing model, exit code, failing stage if timing captured one, request IDs visible in stdout, and the slowest completed stage.
+3. Check the production router/master logs first using the current production log path:
 
-Prefer the smallest blast radius:
+```bash
+ssh mint-prod-volcano 'tail -400 /vePFS-Mindverse/share/mint/prod/logs/mint_server_auth.log'
+```
 
-1) Kill a specific actor type for the specific model (admin only when auth enabled):
+4. Do not assume `235B -> Aliyun`. Before checking upstream logs, prove routing from current evidence:
+   - live capabilities / actor inventory,
+   - production topology/config in `/vePFS-Mindverse/share/mint/prod/config/`,
+   - gateway config if present,
+   - or logs that clearly show upstream forwarding.
+5. If evidence proves a remote upstream is used, inspect only that target's logs via its own skill/SOP.
+
+Failure classes:
+- `client env/auth`: base URL, API key, platform auth, or owner id issue.
+- `capacity/scheduling`: placement pending, actor not registered, queue not consumed, GPU/PG held by stale actor.
+- `server exception`: traceback, 5xx, explicit request failure, actor crash.
+- `timing degradation`: no hard failure, but one stage is materially slower than expected.
+
+For 235B pending:
+- Do not kill vLLM or Megatron solely because elapsed time is large.
+- Capture request IDs from stdout and wait for the configured timeout or an explicit server error.
+
+### 4) Minimal remediation, only when justified
+
+Use the smallest blast radius.
+
+Use model-specific actor kill only when evidence shows a specific actor is stale or crashed:
+
 ```bash
 curl -sS -X POST \
   -H "X-API-Key: $MINT_API_KEY" \
@@ -142,77 +240,81 @@ curl -sS -X POST \
   -d '{"actor_type":"vllm","model_name":"Qwen/Qwen3-4B-Instruct-2507"}'
 ```
 
-Valid `actor_type`: `vllm`, `megatron`, `dense`, `all`.
+Valid actor types for this workflow: `vllm`, `megatron`, `dense`, `all`.
 
-Notes:
-- Detached actors persist across API server restarts; killing the API server alone may not free GPUs.
-- Megatron and multi-node vLLM use Ray placement groups; if you kill a Megatron actor and GPUs stay reserved,
-  treat it as a placement-group leak and follow the `volcano-cluster` cleanup SOP (do not guess).
+Rules:
+- Prefer `vllm` for sampling/runtime crashes and `megatron` for training/runtime crashes.
+- Do not kill `all` unless the evidence shows systemic actor corruption and a narrower kill cannot work.
+- Restart the API server only when the server process itself is unhealthy. Detached actors survive API restart, so API restart is not actor remediation.
+- Do not restart Ray head/worker nodes in this workflow.
+- If a placement group leak is suspected after actor kill, follow `volcano-cluster` cleanup SOP; do not guess commands.
 
-2) Restart API server only if the server process itself is unhealthy:
-- Volcano:
-  - follow the `mint-prod` restart procedure
-- Remote upstream:
-  - Only if current routing/config proves the failing model is hosted there, follow that deployment's start SOP.
-  - For Aliyun specifically, follow `.claude/skills/aliyun-cluster/SKILL.md` "Start mint-server on mint-prod-aliyun".
-  - Do not restart the local Ray head while actors exist.
+Write every remediation to:
+- `$RUN_ROOT/INCIDENT.md`
 
-3) Log every remediation:
-- Write a short incident note into `results/sanity-check/<timestamp>/INCIDENT.md` including:
-  timestamp, model, failure symptom, request_id if available, what ops action was taken, and what was observed after.
+Include timestamp, model, symptom, request IDs, evidence, exact ops action, and observed result. Do not include secrets.
 
-### 4) Re-test (must)
+### 5) Re-test after remediation
 
-After any remediation (actor kill, server restart, redeploy), rerun ALL four tests:
+After any remediation, rerun all four models from the beginning in the same required order. Create a new attempt subdirectory under the same timestamp root, for example:
+
 ```bash
-python .claude/skills/sanity-check/mint_rl_test_long.py --model Qwen/Qwen3-0.6B --num-rl-steps=1 --batch-size=2 --group-size=4 --max-tokens=128
-python .claude/skills/sanity-check/mint_rl_test_long.py --model Qwen/Qwen3-4B-Instruct-2507 --num-rl-steps=1 --batch-size=2 --group-size=4 --max-tokens=128
-python .claude/skills/sanity-check/mint_rl_test_long.py --model Qwen/Qwen3-30B-A3B-Instruct-2507 --num-rl-steps=1 --batch-size=2 --group-size=4 --max-tokens=128
-python .claude/skills/sanity-check/mint_rl_test_long.py --model Qwen/Qwen3-235B-A22B-Instruct-2507 --num-rl-steps=1 --batch-size=2 --group-size=4 --max-tokens=128
+RUN_ROOT=/root/run_results/mint/$TS/attempt-2
+mkdir -p "$RUN_ROOT"
 ```
 
-If a failure persists after remediation, stop doing ops and switch to evidence + issue filing.
+If any failure persists after one justified remediation pass, stop doing ops and switch to evidence + issue filing.
 
-### 5) If it looks like an implementation issue: file an issue
+### 6) GitHub issue when evidence supports an implementation issue
 
 Invoke `issue-reporter` and include:
-- Exact command that failed (and the captured local stdout/stderr path)
-- Model name and whether it was local or remotely routed, plus the concrete remote target if confirmed from config/logs
-- Timestamps
-- Request IDs (from the test output, if present)
-- The timing summary for the run, especially the slowest stage and its `max_s`
-- Minimal relevant server log excerpt (no secrets)
+- Model name.
+- Whether the model was local or remotely routed, with concrete target only if proven.
+- Failing operation/stage and request IDs.
+- Timing summary: slowest stage, `max_s`, `wall_clock_s`.
+- Minimal relevant server log excerpt with no secrets.
+- Remediation attempted and result.
 
-## Feishu reporting
+Do not file an issue for a local client environment mistake that was fixed and rerun cleanly unless it exposed a product defect.
 
-Do not send START notifications. Send exactly one final report at the end (both PASS and incident runs).
+## Final Feishu report
 
-Required report style (message + evidence):
-- Must include: model outcomes (OK/FAIL), the failure surface (what component/operation failed), the timing surface (concrete durations taken from `timing_summary.json` / `timing_summary.md`), what ops was attempted and whether it changed anything, and the GitHub issue link if filed.
-- The final Feishu report is incomplete if it does not contain timing information.
-- Include at least one timing line per model run. Minimum acceptable content for each model:
-  - slowest stage name
-  - that stage's `max_s`
-  - total wall-clock time for the run
-- For failed runs, also name the failing stage if the timing report captured one; otherwise use the slowest completed stage and say the failure happened after or during that phase.
-- Must not include: local file paths, internal timestamps, base URLs/ports, log line numbers, or command transcripts.
+Send exactly one final Feishu report at the end for both PASS and FAIL workflows.
 
-Required Feishu timing shape:
+The report must include one line per model with:
+- `OK` or `FAIL`
+- slowest stage
+- `max_s`
+- `wall_clock_s`
+
+For failed models, also include:
+- failure surface/class,
+- failing stage or slowest completed stage if the failure happened after the last recorded stage,
+- ops attempted,
+- whether a GitHub issue was created.
+
+Do not include:
+- local file paths,
+- internal base URLs/ports,
+- full command transcripts,
+- secrets,
+- raw log dumps.
+
+Required timing shape:
+
 ```markdown
-- Qwen/Qwen3-4B-Instruct-2507: OK. Timing: slowest stage=`sample` max_s=`38.4` wall_clock_s=`91.2`.
-- Qwen/Qwen3-235B-A22B-Instruct-2507: FAIL in `create_model`. Timing: slowest completed stage=`save_weights_for_sampler` max_s=`412.7` wall_clock_s=`645.9`.
+- Qwen/Qwen3-0.6B: OK. Timing: slowest stage=`sample` max_s=`38.4` wall_clock_s=`91.2`.
+- Qwen/Qwen3-235B-A22B-Instruct-2507: FAIL in `create_model`. Timing: slowest completed stage=`save_weights_for_sampler` max_s=`412.7` wall_clock_s=`645.9`. Ops: killed model-specific vLLM actor; rerun still failed. Issue: #123.
 ```
 
-If the report omits those timing lines, treat the Feishu step as not done and rewrite the report before sending.
+If the report omits timing lines, the Feishu step is not complete. Rewrite the report before sending.
 
 Send via:
+
 ```bash
 python .claude/skills/sanity-check/feishu_notify.py \
   --title "MinT sanity-check report" \
   --markdown "<agent-written report markdown>"
 ```
 
-Override via env var:
-- `FEISHU_WEBHOOK_URL` (default is the requested hook, hardcoded in `.claude/skills/sanity-check/feishu_notify.py`)
-
-If Feishu posting fails, treat it as a failure of this workflow (do not ignore it).
+`FEISHU_WEBHOOK_URL` may override the default webhook. If posting fails, this workflow is failed; do not silently ignore it.
