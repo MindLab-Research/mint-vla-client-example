@@ -1599,3 +1599,28 @@ async def test_issue_627_raw_ip_worker_alias_works_without_topology_config() -> 
     assert out["snapshot"]["replicas"][label]["state"] == "healthy"
     assert out["snapshot"]["replicas"][label]["node_pins"] == ["10.0.0.99"]
     assert created[0].normalized_node_pins() == ["10.0.0.99"]
+
+
+@pytest.mark.anyio
+async def test_issue_627_supervisor_reconciles_desired_nodes_without_model_placement(tmp_path) -> None:
+    config = load_topology_config(_write_topology_config(tmp_path))
+    submitted: list[str] = []
+    manager = TopologyManager(
+        config,
+        provider_task_lister=lambda _config: [],
+        provider_task_submitter=lambda _config, node: submitted.append(node.alias),
+        ray_node_lister=lambda: [],
+    )
+    supervisor = ModelActorSupervisor(
+        specs=[],
+        topology_manager=manager,
+        runtime_factory=lambda _spec, _generation: None,
+        placement_reconciler=lambda desired: {"ok": True, "blocked": {}, "node_pins": {}},
+        scheduler_sync=lambda _registrations: None,
+        control_plane_dependencies=[],
+    )
+
+    out = await supervisor.reconcile_once()
+
+    assert submitted == ["mint-worker-0"]
+    assert out["snapshot"]["topology"]["nodes"]["mint-worker-0"]["state"] == "provisioning"

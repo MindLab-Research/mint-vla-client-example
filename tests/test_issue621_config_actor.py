@@ -38,6 +38,8 @@ def test_runtime_config_classifies_bootstrap_actor_creation_snapshot_and_observa
     assert classify_env_key("MINT_MODEL_ACTOR_REPLICA_ID") == CONFIG_CLASS_UNCLASSIFIED
     assert classify_env_key("MINT_VLLM_MAX_NUM_SEQS") == CONFIG_CLASS_SNAPSHOT_CONFIG
     assert classify_env_key("MINT_MEGATRON_STICKY_IDLE_TIMEOUT_S") == CONFIG_CLASS_SNAPSHOT_CONFIG
+    assert classify_env_key("MINT_TOPOLOGY_CONFIG_PATH") == CONFIG_CLASS_SNAPSHOT_CONFIG
+    assert classify_env_key("MINT_TOPOLOGY_STATE_PATH") == CONFIG_CLASS_SNAPSHOT_CONFIG
     assert classify_env_key("OTEL_EXPORTER_OTLP_ENDPOINT") == CONFIG_CLASS_OBSERVABILITY
     assert classify_env_key("MINT_DEPLOYMENT_ENV") == CONFIG_CLASS_OBSERVABILITY
     assert classify_env_key("MINT_CLUSTER_ID") == CONFIG_CLASS_OBSERVABILITY
@@ -116,6 +118,10 @@ def test_actor_env_from_environ_keeps_real_values_for_actor_hydration() -> None:
             "MINT_MODEL_PLACEMENT_JSON": "{}",
             "MINT_MODEL_ACTOR_REPLICA_ID": "replica-0",
             "MINT_VLLM_MAX_NUM_SEQS": "32",
+            "MINT_TOPOLOGY_CONFIG_PATH": "/vePFS-Mindverse/share/mint/prod/runtime/topology.yaml",
+            "MINT_TOPOLOGY_STATE_PATH": "/vePFS-Mindverse/share/mint/prod/runtime/topology_state.yaml",
+            "MINT_DEPLOYMENT_ENV": "prod",
+            "MINT_CLUSTER_ID": "volcano",
             "OTEL_EXPORTER_OTLP_HEADERS": "Authorization=secret",
             "MINT_TASK_STATE_STORE_DB_PATH": "/tmp/task.sqlite3",
             "MINT_TASK_STATE_STORE_OWNER_TTL_S": "30",
@@ -132,6 +138,10 @@ def test_actor_env_from_environ_keeps_real_values_for_actor_hydration() -> None:
     assert "MINT_MODEL_PLACEMENT_JSON" not in actor_env
     assert "MINT_MODEL_ACTOR_REPLICA_ID" not in actor_env
     assert actor_env["MINT_VLLM_MAX_NUM_SEQS"] == "32"
+    assert actor_env["MINT_TOPOLOGY_CONFIG_PATH"] == "/vePFS-Mindverse/share/mint/prod/runtime/topology.yaml"
+    assert actor_env["MINT_TOPOLOGY_STATE_PATH"] == "/vePFS-Mindverse/share/mint/prod/runtime/topology_state.yaml"
+    assert actor_env["MINT_DEPLOYMENT_ENV"] == "prod"
+    assert actor_env["MINT_CLUSTER_ID"] == "volcano"
     assert actor_env["OTEL_EXPORTER_OTLP_HEADERS"] == "Authorization=secret"
     assert actor_env["MINT_TASK_STATE_STORE_DB_PATH"] == "/tmp/task.sqlite3"
     assert actor_env["MINT_TASK_STATE_STORE_OWNER_TTL_S"] == "30"
