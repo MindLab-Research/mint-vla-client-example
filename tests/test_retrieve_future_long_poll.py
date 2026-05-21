@@ -63,10 +63,12 @@ def test_local_retrieve_future_long_poll_returns_terminal_result(monkeypatch):
         wait_status=FutureStatus.DONE,
         result={"ok": True},
     )
+    metrics = []
 
     monkeypatch.setattr(futures_route, "task_futures", stub)
     monkeypatch.setattr(futures_route, "_retrieve_wait_timeout_s", lambda: 0.02)
     monkeypatch.setattr(futures_route, "_retrieve_pending_min_poll_s", lambda: 0.01)
+    monkeypatch.setattr(futures_route, "record_retrieve_future_wait_metric", lambda **kwargs: metrics.append(kwargs))
 
     response = _response_stub()
     payload = asyncio.run(
@@ -82,14 +84,17 @@ def test_local_retrieve_future_long_poll_returns_terminal_result(monkeypatch):
     assert stub.status_calls == 1
     assert stub.wait_calls == [("rid-long-poll-done", 0.02)]
     assert stub.cleaned == ["rid-long-poll-done"]
+    assert metrics == [{"path": "local", "outcome": "ready", "waited": True}]
 
 
 def test_local_retrieve_future_long_poll_timeout_preserves_pending(monkeypatch):
     stub = _WatchingTaskFutureService(wait_status=None)
+    metrics = []
 
     monkeypatch.setattr(futures_route, "task_futures", stub)
     monkeypatch.setattr(futures_route, "_retrieve_wait_timeout_s", lambda: 0.02)
     monkeypatch.setattr(futures_route, "_retrieve_pending_min_poll_s", lambda: 0.01)
+    monkeypatch.setattr(futures_route, "record_retrieve_future_wait_metric", lambda **kwargs: metrics.append(kwargs))
 
     response = _response_stub()
     payload = asyncio.run(
@@ -106,3 +111,4 @@ def test_local_retrieve_future_long_poll_timeout_preserves_pending(monkeypatch):
     assert payload.get("type") == "try_again"
     assert stub.status_calls == 1
     assert stub.wait_calls == [("rid-long-poll-pending", 0.02)]
+    assert metrics == [{"path": "local", "outcome": "timeout", "waited": True}]

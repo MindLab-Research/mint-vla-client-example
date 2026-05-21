@@ -65,6 +65,7 @@ _STRUCTLOG_WARNED = False
 _HTTP_REQUEST_COUNTER: Any | None = None
 _HTTP_DURATION_HISTOGRAM: Any | None = None
 _HTTP_ERROR_COUNTER: Any | None = None
+_RETRIEVE_FUTURE_WAIT_COUNTER: Any | None = None
 _SAMPLING_ADMISSION_COUNTER: Any | None = None
 _TASK_STATE_FUTURES_TIMEOUT_COUNTER: Any | None = None
 _TASK_FUTURE_REAPER_ROWS_COUNTER: Any | None = None
@@ -600,6 +601,7 @@ def _configure_opentelemetry(root_logger: logging.Logger) -> None:
     """Configure OTLP trace/metric/log export (APMPlus or collector)."""
     global _OTEL_ENABLED, _OTEL_INITIALIZED, _OTEL_LOG_HANDLER_ATTACHED
     global _HTTP_REQUEST_COUNTER, _HTTP_DURATION_HISTOGRAM, _HTTP_ERROR_COUNTER
+    global _RETRIEVE_FUTURE_WAIT_COUNTER
     global _SAMPLING_ADMISSION_COUNTER, _TASK_STATE_FUTURES_TIMEOUT_COUNTER
     global _TASK_FUTURE_REAPER_ROWS_COUNTER, _TASK_FUTURE_PAYLOAD_EVICT_ERROR_COUNTER
     global _VLLM_ACTOR_REQUEST_COUNTER, _VLLM_ACTOR_REQUEST_DURATION_HISTOGRAM
@@ -685,6 +687,11 @@ def _configure_opentelemetry(root_logger: logging.Logger) -> None:
             "mint_http_server_request_duration_ms",
             unit="ms",
             description="HTTP request duration in milliseconds",
+        )
+        _RETRIEVE_FUTURE_WAIT_COUNTER = meter.create_counter(
+            "mint_retrieve_future_wait_total",
+            unit="{request}",
+            description="retrieve_future wait outcomes split by routing path and wait behavior",
         )
         _SAMPLING_ADMISSION_COUNTER = meter.create_counter(
             "mint_sampling_admission_total",
@@ -847,6 +854,27 @@ def record_public_healthz_refresh_metric(*, result: str) -> None:
     try:
         if _PUBLIC_HEALTHZ_REFRESH_COUNTER is not None:
             _PUBLIC_HEALTHZ_REFRESH_COUNTER.add(1, attributes={"result": str(result)})
+    except Exception:
+        pass
+
+
+def record_retrieve_future_wait_metric(*, path: str, outcome: str, waited: bool) -> None:
+    if not _OTEL_ENABLED:
+        return
+    safe_path = str(path)
+    if safe_path not in {"local", "gateway"}:
+        safe_path = "local"
+    safe_outcome = str(outcome)
+    if safe_outcome not in {"ready", "timeout", "unknown"}:
+        safe_outcome = "unknown"
+    attrs = {
+        "path": safe_path,
+        "outcome": safe_outcome,
+        "waited": "true" if bool(waited) else "false",
+    }
+    try:
+        if _RETRIEVE_FUTURE_WAIT_COUNTER is not None:
+            _RETRIEVE_FUTURE_WAIT_COUNTER.add(1, attributes=attrs)
     except Exception:
         pass
 

@@ -17,6 +17,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from ..auth_identity import can_view_internal_errors
 from ..backend.task_state_store import FutureStatus, TaskStateStoreUnavailableError, task_futures
 from ..futures_utils import pending_future_http_response
+from ..logging_context import record_retrieve_future_wait_metric
 from ..models.types import FutureRetrieveRequest
 
 router = APIRouter()
@@ -141,6 +142,10 @@ def _pending_hint_note_pending(request_id: str) -> None:
 
 def _pending_hint_clear(request_id: str) -> None:
     _PENDING_HINTS.pop(request_id, None)
+
+
+def _record_retrieve_wait(*, path: str, outcome: str, waited: bool) -> None:
+    record_retrieve_future_wait_metric(path=path, outcome=outcome, waited=waited)
 
 
 async def _lookup_task_state_terminal(request_id: str, http_request: Request) -> Any | None:
@@ -284,17 +289,20 @@ async def retrieve_future(
         if throttled_pending is not None:
             response.status_code = throttled_pending.status_code
             response.headers.update(throttled_pending.headers)
+            _record_retrieve_wait(path="gateway", outcome="timeout", waited=False)
             return throttled_pending.body
 
         # Check cache first for gateway-routed futures
         cached = _recent_get(body.request_id)
         if cached is not None:
             logger.info("[retrieve_future] request_id=%s gateway_cache_hit=true", body.request_id)
+            _record_retrieve_wait(path="gateway", outcome="ready", waited=False)
             return _apply_cached_response(cached, response)
 
         upstream_alias, upstream_request_id = decoded
         upstream = upstream_for_alias(upstream_alias)
         if upstream is None:
+            _record_retrieve_wait(path="gateway", outcome="unknown", waited=False)
             raise HTTPException(
                 status_code=500,
                 detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}",
@@ -310,6 +318,7 @@ async def retrieve_future(
                 timeout_s=30.0,
             )
         except Exception:
+            _record_retrieve_wait(path="gateway", outcome="unknown", waited=False)
             raise HTTPException(status_code=503, detail=f"Upstream {upstream_alias!r} retrieve_future failed")
 
         response.status_code = upstream_resp.status_code
@@ -320,6 +329,7 @@ async def retrieve_future(
         try:
             payload = upstream_resp.json()
         except Exception:
+            _record_retrieve_wait(path="gateway", outcome="unknown", waited=False)
             raise HTTPException(
                 status_code=502,
                 detail=f"Upstream {upstream_alias!r} returned non-JSON retrieve_future payload",
@@ -340,6 +350,7 @@ async def retrieve_future(
                     "upstream_request_id": upstream_request_id,
                     "upstream_detail": payload.get("detail"),
                 }
+            _record_retrieve_wait(path="gateway", outcome="unknown", waited=False)
             raise HTTPException(status_code=503, detail=detail)
 
         # If this future corresponds to an ephemeral save_weights_for_sampler on an upstream,
@@ -387,6 +398,10 @@ async def retrieve_future(
                     body=payload,
                 ),
             )
+        outcome = "timeout" if upstream_resp.status_code == 408 else "ready"
+        if upstream_resp.status_code not in {200, 408}:
+            outcome = "unknown"
+        _record_retrieve_wait(path="gateway", outcome=outcome, waited=False)
         return payload
 
     if _retrieve_wait_timeout_s() <= 0:
@@ -394,22 +409,26 @@ async def retrieve_future(
         if throttled_pending is not None:
             response.status_code = throttled_pending.status_code
             response.headers.update(throttled_pending.headers)
+            _record_retrieve_wait(path="local", outcome="timeout", waited=False)
             return throttled_pending.body
 
     cached = _recent_get(body.request_id)
     if cached is not None:
         logger.info("[retrieve_future] request_id=%s local_cache_hit=true", body.request_id)
+        _record_retrieve_wait(path="local", outcome="ready", waited=False)
         return _apply_cached_response(cached, response)
 
     try:
         status = await task_futures.async_get_status(body.request_id)
     except TaskStateStoreUnavailableError:
+        _record_retrieve_wait(path="local", outcome="unknown", waited=False)
         raise HTTPException(status_code=503, detail="TaskStateStore unavailable")
     except KeyError:
         task_state_payload = await _lookup_task_state_terminal(body.request_id, http_request)
         if task_state_payload is not None:
             _pending_hint_clear(body.request_id)
             logger.info("[retrieve_future] request_id=%s task_state_store_terminal_hit=true", body.request_id)
+            _record_retrieve_wait(path="local", outcome="ready", waited=False)
             return task_state_payload
         _pending_hint_clear(body.request_id)
         logger.info("[retrieve_future] request_id=%s status=unknown", body.request_id)
@@ -420,8 +439,10 @@ async def retrieve_future(
                 "request_id": body.request_id,
                 "task_state_store": await task_futures.async_debug_snapshot(),
             }
+        _record_retrieve_wait(path="local", outcome="unknown", waited=False)
         raise HTTPException(status_code=404, detail=detail)
 
+    waited_for_status_change = False
     if status == FutureStatus.PENDING:
         task_state_payload = await _lookup_task_state_terminal(body.request_id, http_request)
         if task_state_payload is not None:
@@ -431,8 +452,13 @@ async def retrieve_future(
             except Exception:
                 pass
             logger.info("[retrieve_future] request_id=%s task_state_store_terminal_hit=true", body.request_id)
+            _record_retrieve_wait(path="local", outcome="ready", waited=False)
             return task_state_payload
         try:
+            waited_for_status_change = (
+                _retrieve_wait_timeout_s() > 0
+                and getattr(task_futures, "async_wait_status_change", None) is not None
+            )
             waited_status = await _wait_until_not_pending(body.request_id, http_request)
             if waited_status is not None:
                 status = waited_status
@@ -441,6 +467,7 @@ async def retrieve_future(
             if task_state_payload is not None:
                 _pending_hint_clear(body.request_id)
                 logger.info("[retrieve_future] request_id=%s task_state_store_terminal_hit=true", body.request_id)
+                _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
                 return task_state_payload
             _pending_hint_clear(body.request_id)
             logger.info("[retrieve_future] request_id=%s status=unknown", body.request_id)
@@ -451,6 +478,7 @@ async def retrieve_future(
                     "request_id": body.request_id,
                     "task_state_store": await task_futures.async_debug_snapshot(),
                 }
+            _record_retrieve_wait(path="local", outcome="unknown", waited=waited_for_status_change)
             raise HTTPException(status_code=404, detail=detail)
 
     if status == FutureStatus.PENDING:
@@ -462,6 +490,7 @@ async def retrieve_future(
             except Exception:
                 pass
             logger.info("[retrieve_future] request_id=%s task_state_store_terminal_hit=true", body.request_id)
+            _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
             return task_state_payload
         meta = None
         try:
@@ -633,6 +662,7 @@ async def retrieve_future(
                         "[retrieve_future] request_id=%s status=model_work_orphan_failed",
                         body.request_id,
                     )
+                    _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
                     return payload
             except Exception:
                 logger.exception(
@@ -759,21 +789,25 @@ async def retrieve_future(
         )
         response.status_code = pending.status_code
         response.headers.update(pending.headers)
+        _record_retrieve_wait(path="local", outcome="timeout", waited=waited_for_status_change)
         return pending.body
     elif status == FutureStatus.EXPIRED:
         _pending_hint_clear(body.request_id)
         logger.info("[retrieve_future] request_id=%s status=expired", body.request_id)
+        _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
         return {"error": "Future expired", "category": "system"}
     elif status == FutureStatus.RETRIEVED:
         _pending_hint_clear(body.request_id)
         cached = _recent_get(body.request_id)
         if cached is not None:
             logger.info("[retrieve_future] request_id=%s status=retrieved served=cached", body.request_id)
+            _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
             return _apply_cached_response(cached, response)
         task_state_payload = await _lookup_task_state_terminal(body.request_id, http_request)
         if task_state_payload is not None:
             _pending_hint_clear(body.request_id)
             logger.info("[retrieve_future] request_id=%s status=retrieved served=task_state_store", body.request_id)
+            _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
             return task_state_payload
         try:
             result = await task_futures.async_get_result(body.request_id)
@@ -782,14 +816,17 @@ async def retrieve_future(
         if result is not None:
             _recent_put(body.request_id, result, ttl_s=_local_hot_ttl_s())
             logger.info("[retrieve_future] request_id=%s status=retrieved served=facade_result", body.request_id)
+            _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
             return result
         error = await task_futures.async_get_error(body.request_id)
         if error is not None:
             payload = _failed_payload(error, http_request)
             _recent_put(body.request_id, payload, ttl_s=_local_hot_ttl_s())
             logger.info("[retrieve_future] request_id=%s status=retrieved served=facade_error", body.request_id)
+            _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
             return payload
         logger.info("[retrieve_future] request_id=%s status=retrieved served=error", body.request_id)
+        _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
         return {"error": "Future already retrieved", "category": "system"}
     elif status == FutureStatus.FAILED:
         _pending_hint_clear(body.request_id)
@@ -801,6 +838,7 @@ async def retrieve_future(
             await task_futures.async_cleanup(body.request_id)
         except Exception:
             pass
+        _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
         return payload
     else:
         _pending_hint_clear(body.request_id)
@@ -810,12 +848,14 @@ async def retrieve_future(
             task_state_payload = await _lookup_task_state_terminal(body.request_id, http_request)
             if task_state_payload is not None:
                 logger.info("[retrieve_future] request_id=%s status=done served=task_state_store", body.request_id)
+                _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
                 return task_state_payload
             raise
         if result is None:
             task_state_payload = await _lookup_task_state_terminal(body.request_id, http_request)
             if task_state_payload is not None:
                 logger.info("[retrieve_future] request_id=%s status=done served=task_state_store", body.request_id)
+                _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
                 return task_state_payload
         _recent_put(body.request_id, result, ttl_s=_local_hot_ttl_s())
         logger.info("[retrieve_future] request_id=%s status=done", body.request_id)
@@ -823,4 +863,5 @@ async def retrieve_future(
             await task_futures.async_cleanup(body.request_id)
         except Exception:
             pass
+        _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
         return result

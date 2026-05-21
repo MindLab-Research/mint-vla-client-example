@@ -45,6 +45,7 @@ def _mock_upstream_response(status_code: int, payload: dict):
 async def test_gateway_retrieve_future_caches_terminal_response(monkeypatch):
     """First retrieve forwards to upstream and caches result, second retrieve returns from cache."""
     _reset_gateway_and_cache()
+    metrics = []
 
     # Setup gateway config
     cfg = {
@@ -64,6 +65,7 @@ async def test_gateway_retrieve_future_caches_terminal_response(monkeypatch):
 
     import mint_server.gateway as gw
     monkeypatch.setattr(gw, "forward_json", mock_forward_json)
+    monkeypatch.setattr(futures_route, "record_retrieve_future_wait_metric", lambda **kwargs: metrics.append(kwargs))
 
     # First retrieve_future call
     body = FutureRetrieveRequest(request_id="gw:test-upstream:abc123")
@@ -80,6 +82,10 @@ async def test_gateway_retrieve_future_caches_terminal_response(monkeypatch):
 
     assert payload2 == payload1
     assert forward_call_count == 1  # Should NOT forward again
+    assert metrics == [
+        {"path": "gateway", "outcome": "ready", "waited": False},
+        {"path": "gateway", "outcome": "ready", "waited": False},
+    ]
 
 
 @pytest.mark.anyio
@@ -123,6 +129,7 @@ async def test_gateway_retrieve_future_caches_error_response(monkeypatch):
 async def test_gateway_retrieve_future_does_not_cache_pending(monkeypatch):
     """Pending responses (408) should NOT be cached."""
     _reset_gateway_and_cache()
+    metrics = []
 
     cfg = {
         "model_to_upstream": {"test-model": "test-upstream"},
@@ -143,6 +150,7 @@ async def test_gateway_retrieve_future_does_not_cache_pending(monkeypatch):
 
     import mint_server.gateway as gw
     monkeypatch.setattr(gw, "forward_json", mock_forward_json)
+    monkeypatch.setattr(futures_route, "record_retrieve_future_wait_metric", lambda **kwargs: metrics.append(kwargs))
 
     body = FutureRetrieveRequest(request_id="gw:test-upstream:pending123")
     response = _response_stub()
@@ -155,6 +163,10 @@ async def test_gateway_retrieve_future_does_not_cache_pending(monkeypatch):
     response2 = _response_stub()
     await futures_route.retrieve_future(body, _request_stub(), response2)
     assert forward_call_count == 2
+    assert metrics == [
+        {"path": "gateway", "outcome": "timeout", "waited": False},
+        {"path": "gateway", "outcome": "timeout", "waited": False},
+    ]
 
 
 @pytest.mark.anyio
