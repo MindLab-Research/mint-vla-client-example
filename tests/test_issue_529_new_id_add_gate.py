@@ -100,6 +100,32 @@ def test_mint_vllm_multinode_runtime_env_disables_tensorflow_and_flax_by_default
     assert env_vars["USE_FLAX"] == "0"
 
 
+def test_mint_vllm_multinode_runtime_env_drops_driver_ray_attach_hints():
+    env_vars = {
+        "MINT_RAY_TEMP_DIR": "/tmp/mph/t",
+        "MINT_RAY_NODE_IP_ADDRESS": "192.168.39.234",
+    }
+
+    mni._prepare_multinode_vllm_runtime_env(env_vars)
+
+    assert "MINT_RAY_TEMP_DIR" not in env_vars
+    assert "MINT_RAY_NODE_IP_ADDRESS" not in env_vars
+    assert env_vars["MINT_ENABLE_VLLM_IMPORT_PATCHES"] == "1"
+
+
+def test_mint_vllm_child_environment_sets_worker_local_ray_node_ip(monkeypatch):
+    monkeypatch.delenv("MINT_RAY_NODE_IP_ADDRESS", raising=False)
+    monkeypatch.setenv("MINT_RAY_TEMP_DIR", "/tmp/mph/t")
+    monkeypatch.setattr(mni.ray.util, "get_node_ip_address", lambda: "192.168.40.12", raising=False)
+    monkeypatch.setattr(mni.os.path, "isdir", lambda _path: False)
+    monkeypatch.setattr(mni, "preferred_torch_lib_dirs", lambda: [])
+
+    mni._stabilize_vllm_child_environment()
+
+    assert mni.os.environ["MINT_RAY_NODE_IP_ADDRESS"] == "192.168.40.12"
+    assert "MINT_RAY_TEMP_DIR" not in mni.os.environ
+
+
 def _make_actor_impl(monkeypatch):
     monkeypatch.setattr(mni, "init_actor_observability", lambda: None)
     remote_cls = mni._create_mint_vllm_multinode_actor()

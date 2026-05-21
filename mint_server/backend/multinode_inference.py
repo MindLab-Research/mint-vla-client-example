@@ -108,6 +108,14 @@ def _set_default_vllm_runtime_env(env_vars: dict[str, str]) -> None:
     env_vars.setdefault("USE_FLAX", "0")
 
 
+def _prepare_multinode_vllm_runtime_env(env_vars: dict[str, str]) -> None:
+    _set_default_vllm_runtime_env(env_vars)
+    # Driver/head temp-dir hints are not portable into Ray worker-hosted vLLM
+    # EngineCore subprocesses. Let each controller actor stamp its local node IP.
+    env_vars.pop("MINT_RAY_TEMP_DIR", None)
+    env_vars.pop("MINT_RAY_NODE_IP_ADDRESS", None)
+
+
 def _prepend_env_path_entries(raw: str | None, entries: list[str], *, blocked: set[str] | None = None) -> str:
     blocked = blocked or set()
     out: list[str] = []
@@ -126,6 +134,11 @@ def _prepend_env_path_entries(raw: str | None, entries: list[str], *, blocked: s
 def _stabilize_vllm_child_environment() -> None:
     os.environ.setdefault("USE_TF", "0")
     os.environ.setdefault("USE_FLAX", "0")
+    try:
+        os.environ["MINT_RAY_NODE_IP_ADDRESS"] = ray.util.get_node_ip_address()
+    except Exception:
+        pass
+    os.environ.pop("MINT_RAY_TEMP_DIR", None)
 
     pyver = f"python{sys.version_info.major}.{sys.version_info.minor}"
     python_entries = [
@@ -2499,9 +2512,12 @@ class MultiNodeInferenceEngine:
                         f"[MultiNodeInferenceEngine] mp pin model={self.model_name} node={mp_pinned_node_ip}"
                     )
                 else:
+                    pg_name = f"{self.actor_name}_pg"
                     assert_node_ip_capacity(
                         required_gpus_by_node_ip=preferred_placement.required_gpus_by_node_ip(),
                         context=f"mint_vllm_multinode_node_pin model={self.model_name}",
+                        ignore_placement_group_names={pg_name},
+                        ignore_placement_group_namespace=PERSISTENT_NAMESPACE,
                     )
                     pg_bundles = preferred_placement.pg_bundles()
                     if resources is None:
@@ -2656,7 +2672,7 @@ class MultiNodeInferenceEngine:
             )
             if "CUDA_LAUNCH_BLOCKING" in os.environ:
                 env_vars["CUDA_LAUNCH_BLOCKING"] = os.environ["CUDA_LAUNCH_BLOCKING"]
-            _set_default_vllm_runtime_env(env_vars)
+            _prepare_multinode_vllm_runtime_env(env_vars)
             if "MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE" in os.environ:
                 env_vars["MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE"] = os.environ[
                     "MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE"

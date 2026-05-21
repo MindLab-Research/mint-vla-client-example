@@ -25,6 +25,18 @@ CURRENT_CODE_IDENTITY = os.environ.get("MINT_GIT_SHA") or _git_sha()
 logger = logging.getLogger(__name__)
 _ACTOR_HANDLE = None
 
+
+def _looks_like_dead_actor_error(exc: BaseException) -> bool:
+    name = type(exc).__name__
+    text = str(exc)
+    return (
+        name in {"ActorDiedError", "ActorUnavailableError", "RayActorError"}
+        or "actor died" in text.lower()
+        or "actor is dead" in text.lower()
+        or "actor is temporarily unavailable" in text.lower()
+        or "Failed to look up actor" in text
+    )
+
 def _reset_cached_actor_handle() -> None:
     global _ACTOR_HANDLE
     _ACTOR_HANDLE = None
@@ -396,11 +408,28 @@ class MaintenanceCronActor:
             )
 
     async def async_ensure_started(self, *, timeout_s: float = 15.0) -> dict[str, Any]:
-        actor = self._get_ray_actor()
-        snapshot = await _await_with_ray_get_timeout(
-            _await_ray_ref(actor.async_health_snapshot.remote()),
-            timeout_s=float(timeout_s),
-        )
+        try:
+            actor = self._get_ray_actor()
+            snapshot = await _await_with_ray_get_timeout(
+                _await_ray_ref(actor.async_health_snapshot.remote()),
+                timeout_s=float(timeout_s),
+            )
+        except Exception as e:
+            if not _looks_like_dead_actor_error(e):
+                raise
+            logger.warning(
+                "maintenance cron actor handle stale; recreating actor_name=%r namespace=%r error_type=%s error=%s",
+                _actor_name(),
+                _ray_namespace(),
+                type(e).__name__,
+                e,
+            )
+            self._reset_cached_actor()
+            actor = self._get_ray_actor()
+            snapshot = await _await_with_ray_get_timeout(
+                _await_ray_ref(actor.async_health_snapshot.remote()),
+                timeout_s=float(timeout_s),
+            )
         await self._ensure_code_identity_async(snapshot)
         actor = self._get_ray_actor()
         return await _await_with_ray_get_timeout(
@@ -409,8 +438,22 @@ class MaintenanceCronActor:
         )
 
     def ensure_started(self, *, timeout_s: float = 15.0) -> dict[str, Any]:
-        actor = self._get_ray_actor()
-        snapshot = _await_ray_ref_sync(actor.health_snapshot.remote(), timeout_s=float(timeout_s))
+        try:
+            actor = self._get_ray_actor()
+            snapshot = _await_ray_ref_sync(actor.health_snapshot.remote(), timeout_s=float(timeout_s))
+        except Exception as e:
+            if not _looks_like_dead_actor_error(e):
+                raise
+            logger.warning(
+                "maintenance cron actor handle stale; recreating actor_name=%r namespace=%r error_type=%s error=%s",
+                _actor_name(),
+                _ray_namespace(),
+                type(e).__name__,
+                e,
+            )
+            self._reset_cached_actor()
+            actor = self._get_ray_actor()
+            snapshot = _await_ray_ref_sync(actor.health_snapshot.remote(), timeout_s=float(timeout_s))
         self._ensure_code_identity_sync(snapshot)
         actor = self._get_ray_actor()
         return _await_ray_ref_sync(actor.ensure_started.remote(), timeout_s=float(timeout_s))

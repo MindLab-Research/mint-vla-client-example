@@ -50,6 +50,40 @@ def test_get_named_placement_group_rejects_wrong_namespace(monkeypatch: pytest.M
         module.get_named_placement_group("megatron_qwen_pg", namespace="ns-a")
 
 
+def test_get_named_placement_group_passes_namespace_when_supported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ray_module = types.ModuleType("ray")
+    ray_util_module = types.ModuleType("ray.util")
+    calls: list[tuple[str, str | None]] = []
+    handle = object()
+
+    def _get_placement_group(name: str, namespace: str | None = None):
+        calls.append((name, namespace))
+        return handle
+
+    def _placement_group_table(arg=None):
+        assert arg is handle
+        return {
+            "name": "megatron_qwen_pg",
+            "namespace": "ns-a",
+            "bundles": [{"GPU": 1, "node:192.168.38.38": 0.001}],
+        }
+
+    ray_util_module.get_placement_group = _get_placement_group
+    ray_util_module.remove_placement_group = lambda _pg: None
+    ray_util_module.placement_group_table = _placement_group_table
+    ray_module.util = ray_util_module
+
+    monkeypatch.setitem(sys.modules, "ray", ray_module)
+    monkeypatch.setitem(sys.modules, "ray.util", ray_util_module)
+    sys.modules.pop("mint_server.backend.ray_placement_groups", None)
+    module = importlib.import_module("mint_server.backend.ray_placement_groups")
+
+    assert module.get_named_placement_group("megatron_qwen_pg", namespace="ns-a") is handle
+    assert calls == [("megatron_qwen_pg", "ns-a")]
+
+
 def test_get_named_placement_group_rejects_incompatible_pinned_nodes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

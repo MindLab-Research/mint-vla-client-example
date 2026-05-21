@@ -1517,10 +1517,29 @@ class ModelActorSupervisorCore:
 
             try:
                 health = await self._actor_health(actor)
-                state = "healthy" if bool(health.get("running", True)) else "unhealthy"
+                runtime_last_error = str(health.get("last_error") or "").strip()
+                runtime_failed_total = int(health.get("failed_total") or 0)
+                runtime_completed_total = int(health.get("completed_total") or 0)
+                runtime_processed_total = int(health.get("processed_total") or 0)
+                health_error_unrecovered = bool(
+                    _runtime_error_requires_recreate(runtime_last_error)
+                    and runtime_failed_total > 0
+                    and runtime_completed_total <= 0
+                    and runtime_processed_total <= runtime_failed_total
+                )
+                state = (
+                    "healthy"
+                    if bool(health.get("running", True)) and not health_error_unrecovered
+                    else "unhealthy"
+                )
                 if state == "unhealthy":
                     previous = self._states.get(key, {})
                     crash_count = int(previous.get("crash_count", 0)) + 1
+                    last_error = (
+                        runtime_last_error
+                        if health_error_unrecovered
+                        else "runtime actor not running"
+                    )
                     self._states[key] = {
                         **previous,
                         "domain_key": spec.domain_key,
@@ -1537,7 +1556,7 @@ class ModelActorSupervisorCore:
                         ),
                         "health": health,
                         "crash_count": crash_count,
-                        "last_error": "runtime actor not running",
+                        "last_error": last_error,
                         "last_action": "health_unhealthy",
                         "last_action_at": time.time(),
                         "node_pins": resolved_node_pins,
@@ -1776,6 +1795,19 @@ def _key(domain_key: str, replica_id: str) -> tuple[str, str]:
 
 def _label(key: tuple[str, str]) -> str:
     return f"{key[0]}::{key[1]}"
+
+
+def _runtime_error_requires_recreate(error: str) -> bool:
+    text = str(error or "").lower()
+    return any(
+        needle in text
+        for needle in (
+            "engine core initialization failed",
+            "engine startup failed",
+            "enginecore failed to start",
+            "consumer_id mismatch",
+        )
+    )
 
 
 def queue_id_for_replica(domain_key: str, replica_id: str) -> str:

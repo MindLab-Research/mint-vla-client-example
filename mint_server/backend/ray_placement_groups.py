@@ -118,7 +118,18 @@ def get_named_placement_group(
     expected_bundles: object | None = None,
 ) -> Any:
     target_namespace = namespace or _ray_namespace()
-    pg = ray.util.get_placement_group(name)
+    pg = None
+    try:
+        pg = ray.util.get_placement_group(name, namespace=target_namespace)
+    except TypeError:
+        pg = ray.util.get_placement_group(name)
+    except Exception:
+        info = _lookup_named_pg_info(name, target_namespace)
+        if info is None:
+            raise
+        pg = _placement_group_from_info(info)
+        if pg is None:
+            raise
 
     info = None
     try:

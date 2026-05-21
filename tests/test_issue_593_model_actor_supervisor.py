@@ -62,6 +62,10 @@ class _FakeRuntimeActor:
         self.start_calls = 0
         self.shutdown_calls = 0
         self.health_errors: list[BaseException] = []
+        self.last_error: str | None = None
+        self.failed_total = 0
+        self.completed_total = 0
+        self.processed_total = 0
 
     def health_snapshot(self) -> dict:
         if self.health_errors:
@@ -73,6 +77,10 @@ class _FakeRuntimeActor:
             "actor_generation": self.generation,
             "running": self.running,
             "active_request_id": self.active_request_id,
+            "last_error": self.last_error,
+            "failed_total": self.failed_total,
+            "completed_total": self.completed_total,
+            "processed_total": self.processed_total,
         }
 
     def shutdown(self) -> dict:
@@ -688,6 +696,82 @@ async def test_issue_593_supervisor_restarts_runtime_that_reports_not_running() 
     assert replica["crash_count"] == 1
     assert out["snapshot"]["restarted_total"] == 1
     assert synced[-1][0]["status"] == "healthy"
+
+
+@pytest.mark.anyio
+async def test_issue_593_supervisor_restarts_runtime_with_unrecovered_execution_error() -> None:
+    created: list[_FakeRuntimeActor] = []
+    synced: list[list[dict]] = []
+
+    async def _factory(spec: ModelActorSpec, generation: int):
+        actor = _FakeRuntimeActor(
+            actor_name=spec.normalized_actor_name(),
+            domain_key=spec.domain_key,
+            replica_id=spec.replica_id,
+            generation=generation,
+        )
+        created.append(actor)
+        return actor
+
+    supervisor = ModelActorSupervisor(
+        specs=[ModelActorSpec(domain_key="vllm:model-a", replica_id="replica-0")],
+        runtime_factory=_factory,
+        scheduler_sync=lambda registrations: synced.append(
+            [registration.to_dict() for registration in registrations]
+        ),
+        **_disabled_control_plane_kwargs(),
+    )
+    await supervisor.reconcile_once()
+    first_generation = created[0].generation
+    created[0].last_error = "future failed: engine startup failed"
+    created[0].failed_total = 2
+    created[0].processed_total = 2
+    created[0].completed_total = 0
+
+    out = await supervisor.reconcile_once()
+
+    assert len(created) == 2
+    assert created[1].generation > first_generation
+    replica = out["snapshot"]["replicas"]["vllm:model-a::replica-0"]
+    assert replica["state"] == "healthy"
+    assert replica["generation"] == created[1].generation
+    assert replica["crash_count"] == 1
+    assert out["snapshot"]["restarted_total"] == 1
+    assert synced[-1][0]["status"] == "healthy"
+
+
+@pytest.mark.anyio
+async def test_issue_593_supervisor_keeps_runtime_with_recovered_execution_error() -> None:
+    created: list[_FakeRuntimeActor] = []
+
+    async def _factory(spec: ModelActorSpec, generation: int):
+        actor = _FakeRuntimeActor(
+            actor_name=spec.normalized_actor_name(),
+            domain_key=spec.domain_key,
+            replica_id=spec.replica_id,
+            generation=generation,
+        )
+        created.append(actor)
+        return actor
+
+    supervisor = ModelActorSupervisor(
+        specs=[ModelActorSpec(domain_key="vllm:model-a", replica_id="replica-0")],
+        runtime_factory=_factory,
+        scheduler_sync=lambda _registrations: None,
+        **_disabled_control_plane_kwargs(),
+    )
+    await supervisor.reconcile_once()
+    created[0].last_error = "future failed: transient"
+    created[0].failed_total = 1
+    created[0].processed_total = 2
+    created[0].completed_total = 1
+
+    out = await supervisor.reconcile_once()
+
+    assert len(created) == 1
+    replica = out["snapshot"]["replicas"]["vllm:model-a::replica-0"]
+    assert replica["state"] == "healthy"
+    assert replica["last_error"] is None
 
 
 @pytest.mark.anyio

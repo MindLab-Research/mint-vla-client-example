@@ -39,6 +39,16 @@ Mechanics (MultiNodeInferenceEngine):
   - child vLLM workers captured into the same placement group (`placement_group_capture_child_tasks=True`)
 - `ModelActorSupervisor` inventory accounts for the full `total_required_gpus`
   so admin and observability decisions reflect the real cluster footprint.
+- The multi-node vLLM runtime_env must not propagate driver/head-local Ray temp-dir
+  hints into EngineCore subprocesses. In particular, `MINT_RAY_TEMP_DIR` is
+  stripped for multi-node vLLM and `MINT_RAY_NODE_IP_ADDRESS` is stamped from
+  the controller actor's worker-local `ray.util.get_node_ip_address()`. This
+  prevents EngineCore from trying to attach to the cluster using a head-node
+  session directory while running on a GPU worker.
+- Existing detached vLLM placement groups are ignored when validating capacity
+  for that same actor name, then reused if their bundle shape matches the desired
+  topology. This lets a failed EngineCore retry reuse its reservation instead of
+  failing capacity checks against its own placement group.
 
 ## Why multi-LoRA is central
 

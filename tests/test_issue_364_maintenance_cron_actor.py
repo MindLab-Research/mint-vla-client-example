@@ -268,3 +268,56 @@ def test_issue_593_maintenance_cron_does_not_own_model_reconcile_loops(monkeypat
 
     assert "model_actor_supervisor" not in loops
     assert "actor_reconciliation" not in loops
+
+
+@pytest.mark.anyio
+async def test_issue_364_maintenance_cron_recreates_dead_cached_handle(monkeypatch) -> None:
+    from mint_server.backend import maintenance_cron_actor as ors
+
+    class _RemoteMethod:
+        def __init__(self, value=None, exc: BaseException | None = None) -> None:
+            self.value = value
+            self.exc = exc
+
+        def remote(self):
+            if self.exc is not None:
+                raise self.exc
+            return self.value
+
+    class _DeadActor:
+        async_health_snapshot = _RemoteMethod(exc=RuntimeError("actor is dead"))
+
+    class _LiveActor:
+        def __init__(self) -> None:
+            self.async_health_snapshot = _RemoteMethod(
+                {
+                    "actor_name": "mint_maintenance_cron",
+                    "namespace": "mint",
+                    "epoch_id": "live",
+                    "code_identity": ors.CURRENT_CODE_IDENTITY,
+                }
+            )
+            self.ensure_started = _RemoteMethod({"actor_name": "mint_maintenance_cron", "epoch_id": "live"})
+
+    live = _LiveActor()
+    get_calls = []
+    handles = [_DeadActor(), live, live]
+
+    async def _await_value(value, *, timeout_s=None):
+        return value
+
+    monkeypatch.setattr(ors, "_await_ray_ref", lambda ref: ref)
+    monkeypatch.setattr(ors, "_await_with_ray_get_timeout", _await_value)
+
+    def _get_handle(self, *, create_if_missing=True):
+        get_calls.append(create_if_missing)
+        return handles.pop(0)
+
+    monkeypatch.setattr(ors.MaintenanceCronActor, "_get_ray_actor", _get_handle)
+
+    actor = ors.MaintenanceCronActor()
+
+    out = await actor.async_ensure_started()
+
+    assert out["epoch_id"] == "live"
+    assert get_calls == [True, True, True]
