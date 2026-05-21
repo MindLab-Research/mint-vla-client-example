@@ -471,7 +471,7 @@ class MaintenanceCronActor:
                 timeout_s=float(timeout_s),
             )
         except Exception as e:
-            if not create_if_missing or not _looks_like_dead_actor_error(e):
+            if not _looks_like_dead_actor_error(e):
                 raise
             logger.warning(
                 "maintenance cron actor health handle stale; recreating actor_name=%r namespace=%r error_type=%s error=%s",
@@ -505,7 +505,7 @@ class MaintenanceCronActor:
             actor = self._get_ray_actor(create_if_missing=create_if_missing)
             snapshot = _await_ray_ref_sync(actor.health_snapshot.remote(), timeout_s=float(timeout_s))
         except Exception as e:
-            if not create_if_missing or not _looks_like_dead_actor_error(e):
+            if not _looks_like_dead_actor_error(e):
                 raise
             logger.warning(
                 "maintenance cron actor health handle stale; recreating actor_name=%r namespace=%r error_type=%s error=%s",
