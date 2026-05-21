@@ -119,10 +119,15 @@ input. If a live provider task and alive Ray node already satisfy an alias, V1
 must reuse it and must not submit a duplicate worker. V1 is scale-up only and
 does not cancel or tear down disabled/removed cloud nodes automatically.
 
-Worker creation is ordered by the numeric suffix in `mint-worker-{idx}`. If a
-lower alias is missing or not ready, higher aliases are marked `waiting` with a
-clear `waiting for lower worker alias ...` reason in `topology_state.yaml`.
-This identifies the missing idx and avoids out-of-order resource acquisition.
+Worker creation is keyed by the numeric suffix in `mint-worker-{idx}` and by the
+stable provider task name for that alias. A reconcile pass may submit all
+missing desired workers in one bounded parallel batch
+(`MINT_TOPOLOGY_SUBMIT_CONCURRENCY`, default 8), because the desired set is
+static and alias-to-task-name mapping is deterministic. Provider/Ray readiness
+is still evaluated per alias: model runtime placement can only resolve aliases
+whose provider task has a node IP and whose Ray node is alive. Submit failures
+are recorded on the affected alias in `topology_state.yaml`; successful live
+tasks are always reused and must not be submitted again.
 
 ### 2. Static Actor Placement
 

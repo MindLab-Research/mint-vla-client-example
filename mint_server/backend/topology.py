@@ -7,8 +7,10 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Callable, Iterable
 from configparser import ConfigParser
 from dataclasses import dataclass, field
@@ -905,12 +907,19 @@ def default_provider_task_submitter_for_config(config: TopologyConfig) -> Provid
     providers = {node.provider for node in config.nodes.values()}
     if providers == {"volcano"}:
         provider_cfg = config.providers.get("volcano") if isinstance(config.providers.get("volcano"), dict) else {}
-        provider = VolcanoTopologyProvider(
-            region=str(provider_cfg.get("region") or "").strip() or None,
-            connect_timeout=_optional_float(provider_cfg.get("connect_timeout_s")),
-            read_timeout=_optional_float(provider_cfg.get("read_timeout_s")),
-        )
-        return provider.submit_task
+        region = str(provider_cfg.get("region") or "").strip() or None
+        connect_timeout = _optional_float(provider_cfg.get("connect_timeout_s"))
+        read_timeout = _optional_float(provider_cfg.get("read_timeout_s"))
+
+        def _submit(config: TopologyConfig, node: TopologyNodeDesired) -> None:
+            provider = VolcanoTopologyProvider(
+                region=region,
+                connect_timeout=connect_timeout,
+                read_timeout=read_timeout,
+            )
+            provider.submit_task(config, node)
+
+        return _submit
     if providers:
         raise UnsupportedTopologyProviderError(
             f"unsupported topology providers: {', '.join(sorted(providers))}; supported providers: volcano"
@@ -924,6 +933,16 @@ def empty_provider_task_lister(_config: TopologyConfig) -> Iterable[ProviderTask
 
 def noop_provider_task_submitter(_config: TopologyConfig, _node: TopologyNodeDesired) -> None:
     return None
+
+
+def _topology_submit_concurrency() -> int:
+    raw = str(os.environ.get("MINT_TOPOLOGY_SUBMIT_CONCURRENCY") or "").strip()
+    if not raw:
+        return 8
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 8
 
 
 class TopologyManager:
@@ -948,6 +967,7 @@ class TopologyManager:
         )
         self._ray_node_lister = ray_node_lister or default_ray_node_lister_for_config(self._config)
         self._state: TopologyRuntimeState | None = None
+        self._submit_lock = threading.Lock()
 
     @property
     def enabled(self) -> bool:
@@ -968,7 +988,7 @@ class TopologyManager:
         provider_tasks = {task.alias: task for task in self._provider_task_lister(config)}
         ray_nodes_by_ip = {node.node_ip: node for node in self._ray_node_lister() if node.node_ip}
         runtime_nodes: dict[str, TopologyNodeRuntime] = {}
-        first_blocking_alias: str | None = None
+        submit_candidates: list[TopologyNodeDesired] = []
         for alias, desired in sorted(config.nodes.items(), key=lambda item: worker_alias_index(item[0])):
             task_name = stable_provider_task_name(config.deployment_env, alias)
             task = provider_tasks.get(alias)
@@ -986,25 +1006,8 @@ class TopologyManager:
                     last_error=None,
                 )
                 continue
-            if first_blocking_alias is not None:
-                runtime_nodes[alias] = TopologyNodeRuntime(
-                    alias=alias,
-                    state="waiting",
-                    provider=desired.provider,
-                    provider_task_name=task_name,
-                    template=desired.template,
-                    enabled=True,
-                    role=desired.role,
-                    mount_ok=desired.mount_ok,
-                    runtime_env_ok=desired.runtime_env_ok,
-                    provider_task_id=task.task_id if task else None,
-                    node_ip=task.node_ip if task else None,
-                    gpu_count=task.gpu_count if task else desired.gpu_count,
-                    last_error=f"waiting for lower worker alias {first_blocking_alias}",
-                )
-                continue
             if task is None or not task.live:
-                self._provider_task_submitter(config, desired)
+                submit_candidates.append(desired)
                 last_error = (
                     task.error
                     or f"provider task {task.task_name} is not live: state={task.raw_state}"
@@ -1026,7 +1029,6 @@ class TopologyManager:
                     gpu_count=task.gpu_count if task else desired.gpu_count,
                     last_error=last_error,
                 )
-                first_blocking_alias = alias
                 continue
             node_ip = str(task.node_ip or "").strip()
             if not node_ip:
@@ -1044,7 +1046,6 @@ class TopologyManager:
                     gpu_count=task.gpu_count or desired.gpu_count,
                     last_error=f"provider task {task.task_name} has no node_ip",
                 )
-                first_blocking_alias = alias
                 continue
             ray_node = ray_nodes_by_ip.get(node_ip)
             if ray_node is None or not ray_node.alive:
@@ -1063,7 +1064,6 @@ class TopologyManager:
                     gpu_count=task.gpu_count or desired.gpu_count,
                     last_error=f"Ray node {node_ip} is not alive",
                 )
-                first_blocking_alias = alias
                 continue
             gpu_count = ray_node.gpu_count if ray_node.gpu_count is not None else task.gpu_count
             if desired.gpu_count is not None and gpu_count is not None and int(gpu_count) < int(desired.gpu_count):
@@ -1083,7 +1083,6 @@ class TopologyManager:
                     gpu_count=gpu_count,
                     last_error=f"Ray node GPU count {gpu_count} < desired {desired.gpu_count}",
                 )
-                first_blocking_alias = alias
                 continue
             runtime_nodes[alias] = TopologyNodeRuntime(
                 alias=alias,
@@ -1102,6 +1101,28 @@ class TopologyManager:
                 validated_at=time.time(),
                 last_error=None,
             )
+        submit_errors = self._submit_missing_nodes(config, submit_candidates)
+        for alias, error in submit_errors.items():
+            node = runtime_nodes.get(alias)
+            if node is None:
+                continue
+            runtime_nodes[alias] = TopologyNodeRuntime(
+                alias=node.alias,
+                state="failed",
+                provider=node.provider,
+                provider_task_name=node.provider_task_name,
+                template=node.template,
+                enabled=node.enabled,
+                role=node.role,
+                mount_ok=node.mount_ok,
+                runtime_env_ok=node.runtime_env_ok,
+                provider_task_id=node.provider_task_id,
+                node_ip=node.node_ip,
+                ray_node_id=node.ray_node_id,
+                gpu_count=node.gpu_count,
+                validated_at=node.validated_at,
+                last_error=error,
+            )
         state = TopologyRuntimeState(
             version=config.version,
             deployment_env=config.deployment_env,
@@ -1113,6 +1134,41 @@ class TopologyManager:
         self._state = state
         write_topology_state(config.state_path, state)
         return state
+
+    def _submit_missing_nodes(
+        self,
+        config: TopologyConfig,
+        candidates: list[TopologyNodeDesired],
+    ) -> dict[str, str]:
+        if not candidates:
+            return {}
+        candidates = sorted(candidates, key=lambda node: worker_alias_index(node.alias))
+        max_workers = min(len(candidates), _topology_submit_concurrency())
+        errors: dict[str, str] = {}
+        with self._submit_lock:
+            if max_workers <= 1:
+                for node in candidates:
+                    try:
+                        self._provider_task_submitter(config, node)
+                    except Exception as e:
+                        errors[node.alias] = (
+                            f"provider task submit failed for {node.alias}: {type(e).__name__}: {e}"
+                        )
+                return errors
+            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="mint-topology-submit") as pool:
+                futures = {
+                    pool.submit(self._provider_task_submitter, config, node): node.alias
+                    for node in candidates
+                }
+                for future in as_completed(futures):
+                    alias = futures[future]
+                    try:
+                        future.result()
+                    except Exception as e:
+                        errors[alias] = (
+                            f"provider task submit failed for {alias}: {type(e).__name__}: {e}"
+                        )
+        return errors
 
     def resolve_alias(self, alias: str) -> tuple[str | None, str | None]:
         if is_ip_address(alias):

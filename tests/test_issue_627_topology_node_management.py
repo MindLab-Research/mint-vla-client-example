@@ -642,7 +642,7 @@ def test_issue_627_topology_manager_submits_missing_task_and_blocks_alias(tmp_pa
     assert "not ready" in str(error)
 
 
-def test_issue_627_topology_manager_submits_missing_workers_by_idx_order(tmp_path) -> None:
+def test_issue_627_topology_manager_submits_all_missing_workers_by_idx_order(tmp_path) -> None:
     config = load_topology_config(
         _write_topology_config(
             tmp_path,
@@ -663,11 +663,11 @@ def test_issue_627_topology_manager_submits_missing_workers_by_idx_order(tmp_pat
     state = manager.reconcile_once()
 
     assert state is not None
-    assert submitted == ["mint-worker-0"]
+    assert set(submitted) == {"mint-worker-0", "mint-worker-1"}
     assert state.nodes["mint-worker-0"].state == "provisioning"
     assert state.nodes["mint-worker-0"].last_error == "missing provider task mint-prod-worker-0"
-    assert state.nodes["mint-worker-1"].state == "waiting"
-    assert state.nodes["mint-worker-1"].last_error == "waiting for lower worker alias mint-worker-0"
+    assert state.nodes["mint-worker-1"].state == "provisioning"
+    assert state.nodes["mint-worker-1"].last_error == "missing provider task mint-prod-worker-1"
 
 
 def test_issue_627_topology_manager_submits_next_idx_after_lower_ready(tmp_path) -> None:
@@ -706,6 +706,41 @@ def test_issue_627_topology_manager_submits_next_idx_after_lower_ready(tmp_path)
     assert state.nodes["mint-worker-0"].state == "ready"
     assert state.nodes["mint-worker-1"].state == "provisioning"
     assert submitted == ["mint-worker-1"]
+
+
+def test_issue_627_topology_manager_records_parallel_submit_errors(tmp_path) -> None:
+    config = load_topology_config(
+        _write_topology_config(
+            tmp_path,
+            desired_nodes=[
+                {"alias": "mint-worker-0", "provider": "volcano", "template": "a800-8gpu-c1"},
+                {"alias": "mint-worker-1", "provider": "volcano", "template": "a800-8gpu-c1"},
+            ],
+        )
+    )
+    submitted: list[str] = []
+
+    def _submit(_config, node) -> None:
+        submitted.append(node.alias)
+        if node.alias == "mint-worker-1":
+            raise RuntimeError("quota exceeded")
+
+    manager = TopologyManager(
+        config,
+        provider_task_lister=lambda _config: [],
+        provider_task_submitter=_submit,
+        ray_node_lister=lambda: [],
+    )
+
+    state = manager.reconcile_once()
+
+    assert state is not None
+    assert set(submitted) == {"mint-worker-0", "mint-worker-1"}
+    assert state.nodes["mint-worker-0"].state == "provisioning"
+    assert state.nodes["mint-worker-1"].state == "failed"
+    assert "provider task submit failed for mint-worker-1: RuntimeError: quota exceeded" == state.nodes[
+        "mint-worker-1"
+    ].last_error
 
 
 def test_issue_627_volcano_provider_lists_stable_tasks_and_extracts_instance_ip(
