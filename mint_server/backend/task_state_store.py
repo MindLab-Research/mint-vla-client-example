@@ -2815,8 +2815,13 @@ class TaskStateStoreClient:
         remote = getattr(actor, method).remote
         return sync_get_ray_ref(remote(**kwargs))
 
-    def ensure_ready(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
-        actor = self._get_ray_actor_sync(create_if_missing=False)
+    def ensure_ready(
+        self,
+        *,
+        timeout_s: float = 10.0,
+        create_if_missing: bool = False,
+    ) -> dict[str, Any]:
+        actor = self._get_ray_actor_sync(require_ready=False, create_if_missing=create_if_missing)
         out = sync_get_ray_ref(actor.stats.remote(), timeout_s=timeout_s)
         if not isinstance(out, dict):
             raise TypeError(f"TaskStateStore.stats returned non-dict: {type(out)}")
@@ -2844,6 +2849,18 @@ class TaskStateStoreClient:
 
     async def async_ensure_started(self) -> None:
         await self._get_ray_actor_async(require_ready=False, create_if_missing=True)
+
+    async def async_ensure_ready(
+        self,
+        *,
+        timeout_s: float = 10.0,
+        create_if_missing: bool = False,
+    ) -> dict[str, Any]:
+        actor = await self._get_ray_actor_async(require_ready=False, create_if_missing=create_if_missing)
+        out = await async_get_ray_ref(actor.stats.remote(), timeout_s=timeout_s)
+        if not isinstance(out, dict):
+            raise TypeError(f"TaskStateStore.stats returned non-dict: {type(out)}")
+        return out
 
     async def async_ping(self, *, timeout_s: float = 5.0) -> dict[str, Any]:
         actor = await self._get_ray_actor_async(require_ready=False, create_if_missing=False)

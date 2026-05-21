@@ -11,6 +11,7 @@ from mint_server.backend.task_state_store import (
     TaskStateConflictError,
     TaskFutureService,
     TaskStateStore,
+    TaskStateStoreClient,
     _TaskStateStoreActor,
     build_billing_observation,
 )
@@ -28,6 +29,39 @@ def _create_task(store: TaskStateStore, request_id: str = "req-1") -> None:
     )
     assert created["ok"] is True
     assert created["created"] is True
+
+
+def test_task_state_store_client_async_ensure_ready_can_create_actor(monkeypatch) -> None:
+    import mint_server.backend.task_state_store as module
+    import ray
+
+    calls: dict[str, object] = {}
+
+    class _StatsRemote:
+        def remote(self) -> dict[str, object]:
+            return {"actor_name": "mint_task_state_store", "active_tasks": 0}
+
+    class _Actor:
+        stats = _StatsRemote()
+
+    async def _fake_async_get_ray_ref(ref, *, timeout_s=10.0):
+        calls["timeout_s"] = timeout_s
+        return ref
+
+    def _fake_create_ray_actor(*, require_ready: bool = True):
+        calls["require_ready"] = require_ready
+        return _Actor()
+
+    monkeypatch.setattr(ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(ray, "get_actor", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("missing")))
+    monkeypatch.setattr(module, "_create_ray_actor", _fake_create_ray_actor)
+    monkeypatch.setattr(module, "async_get_ray_ref", _fake_async_get_ray_ref)
+
+    client = TaskStateStoreClient()
+    out = asyncio.run(client.async_ensure_ready(timeout_s=7.0, create_if_missing=True))
+
+    assert out == {"actor_name": "mint_task_state_store", "active_tasks": 0}
+    assert calls == {"require_ready": False, "timeout_s": 7.0}
 
 
 def _own_scheduler(store: TaskStateStore, owner_id: str = "scheduler-a") -> int:
