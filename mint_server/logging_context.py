@@ -8,6 +8,8 @@ Environment Variables:
     OTEL_EXPORTER_OTLP_HEADERS: OTLP headers (e.g. "x-byteapm-appkey=xxx")
     OTEL_EXPORTER_OTLP_INSECURE: grpc insecure transport (default: true)
     OTEL_SERVICE_NAME: service.name resource attribute (default: mint-server)
+    OTEL_SERVICE_INSTANCE_ID: optional service.instance.id override
+    MINT_SERVICE_INSTANCE_ID: optional service.instance.id override
     OTEL_METRIC_EXPORT_INTERVAL_MS: metrics export interval (default: 60000)
     OTEL_LOG_LEVEL: OTLP log handler level (default: INFO)
     MINT_APMPLUS_APP_KEY: optional shortcut for x-byteapm-appkey header
@@ -87,6 +89,7 @@ _OP_PREFIX_RE = re.compile(r"^\[([A-Za-z0-9_.:-]+)\]")
 _ACTOR_OBS_INITIALIZED = False
 _ACTOR_OBS_LOCK = threading.Lock()
 _T = TypeVar("_T")
+_PROCESS_INSTANCE_TOKEN = uuid.uuid4().hex
 
 
 def _detect_hostname() -> str:
@@ -100,6 +103,38 @@ def _detect_hostname() -> str:
 
 
 _HOSTNAME = _detect_hostname()
+
+
+def _otel_service_instance_id(pid: int | None = None) -> str:
+    configured = (
+        os.getenv("OTEL_SERVICE_INSTANCE_ID")
+        or os.getenv("MINT_SERVICE_INSTANCE_ID")
+        or ""
+    ).strip()
+    if configured:
+        return configured
+    actual_pid = os.getpid() if pid is None else pid
+    return f"{_HOSTNAME}:{actual_pid}:{_PROCESS_INSTANCE_TOKEN}"
+
+
+def _otel_resource_attributes() -> dict[str, object]:
+    service_name = (os.getenv("OTEL_SERVICE_NAME") or "mint-server").strip() or "mint-server"
+    pid = os.getpid()
+    # OTel metrics use cumulative counters. API workers and Ray actors must not
+    # share one resource identity or the backend will merge independent counters.
+    resource_attributes: dict[str, object] = {
+        "service.name": service_name,
+        "service.instance.id": _otel_service_instance_id(pid),
+        "process.pid": pid,
+        "host.name": _HOSTNAME,
+    }
+    deployment_env = (os.getenv("MINT_DEPLOYMENT_ENV") or "").strip()
+    cluster_id = (os.getenv("MINT_CLUSTER_ID") or "").strip()
+    if deployment_env:
+        resource_attributes["deployment.env"] = deployment_env
+    if cluster_id:
+        resource_attributes["mint.cluster_id"] = cluster_id
+    return resource_attributes
 
 
 def _coerce_file_line(pathname: object, lineno: object) -> tuple[str, int, str]:
@@ -635,16 +670,8 @@ def _configure_opentelemetry(root_logger: logging.Logger) -> None:
         print(f"Warning: OpenTelemetry dependencies unavailable: {e}", file=sys.stderr)
         return
 
-    service_name = (os.getenv("OTEL_SERVICE_NAME") or "mint-server").strip() or "mint-server"
     # Use explicit resource attributes only; avoid default detector payloads.
-    resource_attributes = {"service.name": service_name}
-    deployment_env = (os.getenv("MINT_DEPLOYMENT_ENV") or "").strip()
-    cluster_id = (os.getenv("MINT_CLUSTER_ID") or "").strip()
-    if deployment_env:
-        resource_attributes["deployment.env"] = deployment_env
-    if cluster_id:
-        resource_attributes["mint.cluster_id"] = cluster_id
-    resource = Resource(attributes=resource_attributes)
+    resource = Resource(attributes=_otel_resource_attributes())
     headers = _parse_headers(os.getenv("OTEL_EXPORTER_OTLP_HEADERS"))
     app_key = (
         os.getenv("MINT_APMPLUS_APP_KEY")

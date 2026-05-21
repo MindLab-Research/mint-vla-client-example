@@ -2,10 +2,40 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 import types
 
 import mint_server.logging_context as logging_context
+
+
+def test_issue_304_otel_resource_attributes_include_process_identity(monkeypatch):
+    monkeypatch.delenv("OTEL_SERVICE_NAME", raising=False)
+    monkeypatch.delenv("OTEL_SERVICE_INSTANCE_ID", raising=False)
+    monkeypatch.delenv("MINT_SERVICE_INSTANCE_ID", raising=False)
+    monkeypatch.setattr(logging_context, "_HOSTNAME", "mint-host")
+    monkeypatch.setattr(logging_context, "_PROCESS_INSTANCE_TOKEN", "token")
+
+    attrs = logging_context._otel_resource_attributes()
+
+    assert attrs["service.name"] == "mint-server"
+    assert attrs["process.pid"] == os.getpid()
+    assert attrs["host.name"] == "mint-host"
+    assert attrs["service.instance.id"] == f"mint-host:{os.getpid()}:token"
+
+
+def test_issue_304_otel_resource_attributes_keep_env_labels_and_instance_override(monkeypatch):
+    monkeypatch.setenv("OTEL_SERVICE_NAME", "mint")
+    monkeypatch.setenv("OTEL_SERVICE_INSTANCE_ID", "api-worker-1")
+    monkeypatch.setenv("MINT_DEPLOYMENT_ENV", "prod")
+    monkeypatch.setenv("MINT_CLUSTER_ID", "volcano")
+
+    attrs = logging_context._otel_resource_attributes()
+
+    assert attrs["service.name"] == "mint"
+    assert attrs["service.instance.id"] == "api-worker-1"
+    assert attrs["deployment.env"] == "prod"
+    assert attrs["mint.cluster_id"] == "volcano"
 
 
 def test_issue_304_bind_request_trace_context_restores_previous_values():
