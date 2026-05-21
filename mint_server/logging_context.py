@@ -139,7 +139,10 @@ def _otel_resource_attributes() -> dict[str, object]:
 
 
 def _otel_process_metric_attributes() -> dict[str, str]:
-    return {"mint.instance_id": _otel_service_instance_id(os.getpid())}
+    # VictoriaMetrics' OTLP path keeps dotted semantic HTTP labels, but custom
+    # dotted labels may be dropped by intermediate conversion. Use Prometheus-
+    # native naming for the process identity dimension.
+    return {"mint_instance_id": _otel_service_instance_id(os.getpid())}
 
 
 def _coerce_file_line(pathname: object, lineno: object) -> tuple[str, int, str]:
@@ -682,7 +685,7 @@ def _configure_opentelemetry(root_logger: logging.Logger) -> None:
             "[otel.resource] service_name=%s service_instance_id=%s metric_instance_id=%s",
             resource_attributes.get("service.name"),
             resource_attributes.get("service.instance.id"),
-            _otel_process_metric_attributes().get("mint.instance_id"),
+            _otel_process_metric_attributes().get("mint_instance_id"),
         )
         _OTEL_RESOURCE_LOGGED = True
     resource = Resource(attributes=resource_attributes)

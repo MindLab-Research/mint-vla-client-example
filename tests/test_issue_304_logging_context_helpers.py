@@ -52,7 +52,7 @@ def test_issue_304_http_metrics_include_process_instance_attribute(monkeypatch):
     monkeypatch.setattr(logging_context, "_HTTP_REQUEST_COUNTER", _Recorder())
     monkeypatch.setattr(logging_context, "_HTTP_ERROR_COUNTER", _Recorder())
     monkeypatch.setattr(logging_context, "_HTTP_DURATION_HISTOGRAM", _Recorder())
-    monkeypatch.setattr(logging_context, "_otel_process_metric_attributes", lambda: {"mint.instance_id": "api-1"})
+    monkeypatch.setattr(logging_context, "_otel_process_metric_attributes", lambda: {"mint_instance_id": "api-1"})
 
     logging_context.record_http_server_metrics(
         method="POST",
@@ -69,7 +69,7 @@ def test_issue_304_http_metrics_include_process_instance_attribute(monkeypatch):
                 "http.method": "POST",
                 "http.route": "/api/v1/retrieve_future",
                 "http.status_code": 408,
-                "mint.instance_id": "api-1",
+                "mint_instance_id": "api-1",
             },
         ),
         (
@@ -79,7 +79,7 @@ def test_issue_304_http_metrics_include_process_instance_attribute(monkeypatch):
                 "http.method": "POST",
                 "http.route": "/api/v1/retrieve_future",
                 "http.status_code": 408,
-                "mint.instance_id": "api-1",
+                "mint_instance_id": "api-1",
             },
         ),
     ]
@@ -94,7 +94,7 @@ def test_issue_304_retrieve_future_wait_metric_includes_process_instance_attribu
 
     monkeypatch.setattr(logging_context, "_OTEL_ENABLED", True)
     monkeypatch.setattr(logging_context, "_RETRIEVE_FUTURE_WAIT_COUNTER", _Counter())
-    monkeypatch.setattr(logging_context, "_otel_process_metric_attributes", lambda: {"mint.instance_id": "api-1"})
+    monkeypatch.setattr(logging_context, "_otel_process_metric_attributes", lambda: {"mint_instance_id": "api-1"})
 
     logging_context.record_retrieve_future_wait_metric(path="gateway", outcome="timeout", waited=True)
 
@@ -105,7 +105,7 @@ def test_issue_304_retrieve_future_wait_metric_includes_process_instance_attribu
                 "path": "gateway",
                 "outcome": "timeout",
                 "waited": "true",
-                "mint.instance_id": "api-1",
+                "mint_instance_id": "api-1",
             },
         )
     ]
