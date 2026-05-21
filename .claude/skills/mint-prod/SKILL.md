@@ -113,8 +113,18 @@ Public `/api/v1/healthz` is only a cheap API-worker health check.
 
 - Volcano production is the router/master deployment for the local production
   models.
-- Additional upstream deployments can be routed through gateway config in the
-  shared production config.
+- Volcano production hosts Qwen3 0.6B, Qwen3 4B Instruct, Qwen3 4B Thinking,
+  Qwen3 30B A3B Instruct, Qwen3 235B A22B Instruct, and OpenPI runtime models.
+- Do not advertise `zai-org/GLM-5.1` unless a current registry/gateway route is
+  configured for it.
+- 235B is deployed locally on Volcano with 16 GPUs for vLLM and 16 GPUs for
+  Megatron. This requires the production model override to set the 235B
+  Megatron world size to 16 GPUs.
+- Topology aliases are the stable placement contract:
+  - `mint-worker-0`: 30B vLLM plus 30B Megatron.
+  - `mint-worker-1`: 0.6B/4B vLLM, dense training, and OpenPI runtimes.
+  - `mint-worker-2` and `mint-worker-3`: 235B vLLM, 8 GPUs each.
+  - `mint-worker-4` and `mint-worker-5`: 235B Megatron, 8 GPUs each.
 - GPU worker lifecycle belongs to `volcano-cluster` or the relevant cluster
   skill, not this server operation skill.
 - Volcano production worker nodes are topology/Supervisor owned. Do not use
