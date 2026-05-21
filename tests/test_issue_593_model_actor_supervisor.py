@@ -98,6 +98,13 @@ class _FakeRayRef:
     def __init__(self, value):
         self.value = value
 
+    def __await__(self):
+        async def _never():
+            while True:
+                await __import__("asyncio").sleep(3600)
+
+        return _never().__await__()
+
 
 class _FakeRemoteMethod:
     def __init__(self, calls: list[tuple[str, tuple, dict]], name: str, value=None) -> None:
@@ -147,6 +154,25 @@ class _FakeRemoteActorClass:
         self.created["remote_args"] = args
         self.created["remote_kwargs"] = kwargs
         return self.created["actor"]
+
+
+@pytest.mark.anyio
+async def test_issue_593_maybe_await_uses_ray_timeout_for_object_ref(monkeypatch: pytest.MonkeyPatch) -> None:
+    import mint_server.backend.model_actor_supervisor as supervisor_module
+
+    calls: list[tuple[object, float | None]] = []
+    ref = _FakeRayRef({"ok": True})
+
+    async def _fake_async_get_ray_ref(value, *, timeout_s=None):
+        calls.append((value, timeout_s))
+        return value.value
+
+    monkeypatch.setattr(supervisor_module, "async_get_ray_ref", _fake_async_get_ray_ref, raising=False)
+
+    out = await supervisor_module._maybe_await(ref)
+
+    assert out == {"ok": True}
+    assert calls == [(ref, 10.0)]
 
 
 def test_issue_593_get_model_actor_supervisor_returns_client_facade() -> None:

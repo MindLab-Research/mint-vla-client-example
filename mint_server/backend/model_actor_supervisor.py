@@ -531,11 +531,11 @@ def default_control_plane_dependencies() -> list[ControlPlaneDependency]:
 
 
 async def _maybe_await(value: Any) -> Any:
-    if inspect.isawaitable(value):
-        return await value
     try:
         return await async_get_ray_ref(value, timeout_s=10.0)
     except TypeError:
+        if inspect.isawaitable(value):
+            return await value
         return value
 
 
