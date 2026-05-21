@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import sys
+import time
 import types
 
 import pytest
@@ -428,6 +429,31 @@ async def test_issue_593_supervisor_bootstrap_starts_reconcile_loop() -> None:
                 await task
             except BaseException:
                 pass
+
+
+@pytest.mark.anyio
+async def test_issue_593_supervisor_recovers_stale_reconcile_inflight() -> None:
+    calls = 0
+
+    async def _sync(_registrations):
+        nonlocal calls
+        calls += 1
+
+    supervisor = ModelActorSupervisor(
+        specs=[],
+        scheduler_sync=_sync,
+        reconcile_interval_s=1.0,
+        **_disabled_control_plane_kwargs(),
+    )
+    supervisor._reconcile_inflight = True
+    supervisor._reconcile_inflight_started_at = time.time() - 60.0
+
+    out = await supervisor.reconcile_once()
+
+    assert out["ok"] is True
+    assert calls == 1
+    assert supervisor.snapshot()["reconcile_inflight"] is False
+    assert "reconcile_inflight stale" in (supervisor.snapshot()["last_reconcile_loop_error"] or "")
 
 
 @pytest.mark.anyio

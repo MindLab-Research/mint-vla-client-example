@@ -648,6 +648,7 @@ class ModelActorSupervisorCore:
         )
         self._reconcile_task: asyncio.Task | None = None
         self._reconcile_inflight = False
+        self._reconcile_inflight_started_at: float | None = None
         self._last_reconcile_loop_error: str | None = None
         for spec in specs or []:
             self.set_desired(spec)
@@ -1341,12 +1342,28 @@ class ModelActorSupervisorCore:
 
     async def reconcile_once(self) -> dict[str, Any]:
         if self._reconcile_inflight:
-            return {"ok": True, "skipped": "reconcile_inflight", "snapshot": self.snapshot()}
+            now = time.time()
+            started_at = self._reconcile_inflight_started_at
+            stale_after_s = max(30.0, float(self._reconcile_interval_s) * 3.0)
+            if started_at is None or now - float(started_at) <= stale_after_s:
+                return {
+                    "ok": True,
+                    "skipped": "reconcile_inflight",
+                    "reconcile_inflight_started_at": started_at,
+                    "snapshot": self.snapshot(),
+                }
+            self._reconcile_inflight = False
+            self._reconcile_inflight_started_at = None
+            self._last_reconcile_loop_error = (
+                f"reconcile_inflight stale for {now - float(started_at):.1f}s; forcing new reconcile"
+            )
         self._reconcile_inflight = True
+        self._reconcile_inflight_started_at = time.time()
         try:
             return await self._reconcile_once_impl()
         finally:
             self._reconcile_inflight = False
+            self._reconcile_inflight_started_at = None
 
     async def _reconcile_once_impl(self) -> dict[str, Any]:
         self._reconcile_total += 1
@@ -1712,6 +1729,8 @@ class ModelActorSupervisorCore:
             "state_store_failures_total": int(self._state_store_failures_total),
             "placement_reclaimed_total": int(self._placement_reclaimed_total),
             "last_reconcile_at": self._last_reconcile_at,
+            "reconcile_inflight": bool(self._reconcile_inflight),
+            "reconcile_inflight_started_at": self._reconcile_inflight_started_at,
             "reconcile_loop_running": self._reconcile_task is not None and not self._reconcile_task.done(),
             "reconcile_interval_s": float(self._reconcile_interval_s),
             "last_reconcile_loop_error": self._last_reconcile_loop_error,
