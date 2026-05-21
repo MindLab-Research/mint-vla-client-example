@@ -93,22 +93,6 @@ def test_build_usage_store_returns_postgres_store(monkeypatch):
     assert store._table == "public.usage_event"
 
 
-def test_usage_env_int_falls_back_on_invalid_value(monkeypatch, caplog):
-    caplog.set_level(logging.WARNING, logger="mint_server.usage_store")
-    monkeypatch.setenv("MINT_USAGE_MAX_PENDING_WRITE_TASKS", "not-int")
-
-    assert usage_store_module._env_int("MINT_USAGE_MAX_PENDING_WRITE_TASKS", 1024, minimum=1) == 1024
-    assert "Invalid MINT_USAGE_MAX_PENDING_WRITE_TASKS" in caplog.text
-
-
-def test_usage_env_float_falls_back_on_invalid_value(monkeypatch, caplog):
-    caplog.set_level(logging.WARNING, logger="mint_server.usage_store")
-    monkeypatch.setenv("MINT_USAGE_SHUTDOWN_FLUSH_TIMEOUT_S", "not-float")
-
-    assert usage_store_module._env_float("MINT_USAGE_SHUTDOWN_FLUSH_TIMEOUT_S", 5.0, minimum=0.0) == 5.0
-    assert "Invalid MINT_USAGE_SHUTDOWN_FLUSH_TIMEOUT_S" in caplog.text
-
-
 def test_postgres_usage_store_warns_when_outbox_config_is_supplied(caplog):
     caplog.set_level(logging.WARNING, logger="mint_server.usage_store")
     PostgresUsageStore(
@@ -117,4 +101,4 @@ def test_postgres_usage_store_warns_when_outbox_config_is_supplied(caplog):
         outbox_flush_interval_s=1.0,
     )
 
-    assert "ignores outbox configuration" in caplog.text
+    assert "TaskStateStore owns billing outbox flushing" in caplog.text

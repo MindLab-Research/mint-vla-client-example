@@ -149,7 +149,7 @@ async def launch_model_runtime_actor(spec: ModelActorSpecLike, generation: int) 
 
 def default_model_actor_launcher_registry() -> ModelActorLauncherRegistry:
     launchers = {
-        "internal_control": launch_model_runtime_actor,
+        "cpu_runtime": launch_model_runtime_actor,
         "training": launch_model_runtime_actor,
         "vllm": launch_model_runtime_actor,
         "model_runtime": launch_model_runtime_actor,

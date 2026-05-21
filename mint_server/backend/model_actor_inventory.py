@@ -536,13 +536,10 @@ class ModelActorInventory:
         )
         self._local_lock = threading.Lock()
         self._handle_cache: dict[str, ActorHandle] = {}
-        self.RSS_TTL_S = float(os.environ.get("MINT_MODEL_ACTOR_INVENTORY_RSS_TTL_S", "60.0"))
-        self.METADATA_TTL_S = float(os.environ.get("MINT_MODEL_ACTOR_INVENTORY_OBSERVABILITY_TTL_S", "30.0"))
-        self.METADATA_TIMEOUT_S = float(os.environ.get("MINT_MODEL_ACTOR_INVENTORY_OBSERVABILITY_TIMEOUT_S", "1.0"))
-        self.METADATA_REFRESH_CONCURRENCY = max(
-            1,
-            int(os.environ.get("MINT_MODEL_ACTOR_INVENTORY_OBSERVABILITY_REFRESH_CONCURRENCY", "8")),
-        )
+        self.RSS_TTL_S = 60.0
+        self.METADATA_TTL_S = 30.0
+        self.METADATA_TIMEOUT_S = 1.0
+        self.METADATA_REFRESH_CONCURRENCY = 8
         self._metadata_metrics_lock = threading.Lock()
         self._metadata_metrics: dict[str, dict[str, int]] = {}
         # Backward-compatible aliases used by observability tests.

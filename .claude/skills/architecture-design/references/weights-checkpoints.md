@@ -14,8 +14,10 @@ Async future results:
 
 - Hot cache: per-API-process retrieve cache, default 300s.
 - Durable metadata: `TaskStateStore` rows, including status, terminal metadata,
-  result path, checksum, and size.
-- Durable payload: `TaskPayloadStore` JSON files on vePFS.
+  active staged payload path, abandoned staged payload paths for GC attribution,
+  terminal result path, checksum, and size.
+- Durable payload: JSON files on vePFS written through the in-process
+  `TaskPayloadStore` helper.
 
 Checkpoint and weight artifacts:
 

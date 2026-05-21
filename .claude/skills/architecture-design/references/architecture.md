@@ -8,7 +8,7 @@ This reference is split by topic for faster lookup. Start here, then open the re
 - System boundary and code map: `system.md`
 - HTTP API boundary and internal routes: `internal-api.md`
 - Identifiers and state ownership: `state.md`
-- Async futures (Tinker polling protocol): `async-futures.md`
+- Async futures (Mint polling protocol): `async-futures.md`
 - Inference architecture (vLLM, multi-LoRA): `inference.md`
 - Training architecture (dense vs Megatron): `training.md`
 - Training multi-tenancy (state swap): `training-multitenancy.md`
@@ -21,5 +21,5 @@ This reference is split by topic for faster lookup. Start here, then open the re
 - Topology-aware supervision and node metrics DaemonSet: `topology-daemon-metrics.md`
 - Usage billing storage (JSONL -> async PostgreSQL): `usage-billing-storage.md`
 - Design constraints and change checklist: `constraints-checklist.md`
-- VLA user-facing API guide: `vla_tinker_api_guide.md`
+- VLA user-facing API guide: `vla_mint_api_guide.md`
 - VLA implementation plan: `vla_implementation_plan.md`

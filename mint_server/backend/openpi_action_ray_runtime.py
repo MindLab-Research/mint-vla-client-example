@@ -26,7 +26,7 @@ from .openpi_ray_runtime import (
     ensure_openpi_ray_initialized,
 )
 from .model_actor_supervisor import ActorType, get_model_actor_supervisor
-from .volc_placement import (
+from .node_placement import (
     assert_node_ip_capacity,
     parse_model_gpu_placement,
 )

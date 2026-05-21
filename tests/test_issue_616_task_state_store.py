@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
+from pathlib import Path
 
 import pytest
 
+from mint_server.backend.task_payload_store import TaskPayloadStore
 from mint_server.backend.task_state_store import (
     TaskStateConflictError,
     TaskFutureService,
     TaskStateStore,
     _TaskStateStoreActor,
+    build_billing_observation,
 )
 
 
@@ -83,6 +87,56 @@ def test_owner_epoch_fences_stale_scheduler() -> None:
         store.close()
 
 
+def test_task_state_store_migrates_staged_payload_columns(tmp_path) -> None:
+    db_path = tmp_path / "task_state.sqlite3"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE tasks (
+                request_id TEXT PRIMARY KEY,
+                op TEXT NOT NULL,
+                status TEXT NOT NULL,
+                domain_key TEXT NOT NULL,
+                subqueue_id TEXT,
+                lease_id TEXT,
+                attempt_id TEXT,
+                scheduler_epoch INTEGER,
+                runtime_generation INTEGER,
+                consumer_id TEXT,
+                request_json BLOB NOT NULL,
+                payload_hash TEXT,
+                result_path TEXT,
+                result_checksum TEXT,
+                result_size_bytes INTEGER,
+                error TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                assigned_at REAL,
+                leased_at REAL,
+                lease_expires_at REAL,
+                finalizing_until REAL
+            );
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    store = TaskStateStore(db_path)
+    try:
+        columns = {
+            str(row[1])
+            for row in store._conn.execute("PRAGMA table_info(tasks)").fetchall()
+        }
+        assert "staged_payload_path" in columns
+        assert "staged_payload_checksum" in columns
+        assert "staged_payload_size_bytes" in columns
+    finally:
+        store.close()
+
+
 def test_task_state_store_active_load_and_claim_lifecycle() -> None:
     store = TaskStateStore.in_memory()
     try:
@@ -143,9 +197,12 @@ def test_finalize_success_is_cas_fenced_and_idempotent() -> None:
             scheduler_epoch=epoch,
             runtime_generation=7,
             finalize_ttl_s=30.0,
+            staged_payload_path="/vePFS-Mindverse/share/mint-results/req-1.json",
             now=104.0,
         )
         assert finalizing["record"]["status"] == "finalizing"
+        assert finalizing["record"]["staged_payload_path"] == "/vePFS-Mindverse/share/mint-results/req-1.json"
+        assert finalizing["record"]["result_path"] is None
 
         committed = store.commit_finalize_success(
             request_id="req-1",
@@ -161,6 +218,8 @@ def test_finalize_success_is_cas_fenced_and_idempotent() -> None:
         assert committed["ok"] is True
         assert committed["idempotent"] is False
         assert committed["record"]["status"] == "done"
+        assert committed["record"]["result_path"] == "/vePFS-Mindverse/share/mint-results/req-1.json"
+        assert committed["record"]["staged_payload_path"] is None
         assert store.list_active_tasks() == []
 
         repeated = store.commit_finalize_success(
@@ -192,6 +251,152 @@ def test_finalize_success_is_cas_fenced_and_idempotent() -> None:
         store.close()
 
 
+def test_finalize_success_rejects_payload_path_that_does_not_match_staged_path() -> None:
+    store = TaskStateStore.in_memory()
+    try:
+        epoch, lease_id, attempt_id = _leased_task(store)
+        store.begin_finalize(
+            request_id="req-1",
+            lease_id=lease_id,
+            attempt_id=attempt_id,
+            scheduler_epoch=epoch,
+            runtime_generation=7,
+            finalize_ttl_s=30.0,
+            staged_payload_path="/vePFS-Mindverse/share/mint-results/req-1.json",
+            now=104.0,
+        )
+
+        with pytest.raises(TaskStateConflictError):
+            store.commit_finalize_success(
+                request_id="req-1",
+                lease_id=lease_id,
+                attempt_id=attempt_id,
+                scheduler_epoch=epoch,
+                runtime_generation=7,
+                result_path="/vePFS-Mindverse/share/mint-results/other.json",
+                result_checksum="sha256:abc",
+                result_size_bytes=123,
+                now=105.0,
+            )
+
+        record = store.get_task("req-1")
+        assert record["status"] == "finalizing"
+        assert record["staged_payload_path"] == "/vePFS-Mindverse/share/mint-results/req-1.json"
+    finally:
+        store.close()
+
+
+def test_failure_commit_after_stage_preserves_abandoned_staged_payload() -> None:
+    store = TaskStateStore.in_memory()
+    try:
+        store.ensure_task(
+            request_id="req-direct-fail",
+            op="sampling.asample",
+            domain_key="vllm:test",
+            request_json=b"{}",
+            status="pending",
+            now=1.0,
+        )
+        store.stage_payload(
+            request_id="req-direct-fail",
+            staged_payload_path="/tmp/payloads/re/req-direct-fail/future__stage-a.json",
+            now=2.0,
+        )
+
+        failed = store.complete_task_failure(
+            request_id="req-direct-fail",
+            error="payload write failed",
+            now=3.0,
+        )
+
+        assert failed["record"]["status"] == "failed"
+        assert failed["record"]["staged_payload_path"] is None
+        assert failed["record"]["metadata"]["abandoned_staged_payload_paths"] == [
+            "/tmp/payloads/re/req-direct-fail/future__stage-a.json"
+        ]
+    finally:
+        store.close()
+
+
+def test_finalize_failure_after_stage_preserves_abandoned_staged_payload() -> None:
+    store = TaskStateStore.in_memory()
+    try:
+        epoch, lease_id, attempt_id = _leased_task(store)
+        store.begin_finalize(
+            request_id="req-1",
+            lease_id=lease_id,
+            attempt_id=attempt_id,
+            scheduler_epoch=epoch,
+            runtime_generation=7,
+            finalize_ttl_s=30.0,
+            staged_payload_path="/tmp/payloads/re/req-1/attempt-1__lease-1.json",
+            now=104.0,
+        )
+
+        failed = store.commit_finalize_failure(
+            request_id="req-1",
+            lease_id=lease_id,
+            attempt_id=attempt_id,
+            scheduler_epoch=epoch,
+            runtime_generation=7,
+            error="executor failed after staging",
+            now=105.0,
+        )
+
+        assert failed["record"]["status"] == "failed"
+        assert failed["record"]["staged_payload_path"] is None
+        assert failed["record"]["metadata"]["abandoned_staged_payload_paths"] == [
+            "/tmp/payloads/re/req-1/attempt-1__lease-1.json"
+        ]
+    finally:
+        store.close()
+
+
+def test_staged_payload_path_is_not_terminal_payload_until_commit() -> None:
+    store = TaskStateStore.in_memory()
+    try:
+        epoch, lease_id, attempt_id = _leased_task(store)
+        store.begin_finalize(
+            request_id="req-1",
+            lease_id=lease_id,
+            attempt_id=attempt_id,
+            scheduler_epoch=epoch,
+            runtime_generation=7,
+            finalize_ttl_s=30.0,
+            staged_payload_path="/tmp/staged-req-1.json",
+            now=104.0,
+        )
+
+        assert store.list_terminal_payloads_for_eviction(
+            older_than_s=1.0,
+            now=10_000.0,
+            limit=1000,
+        ) == []
+
+        committed = store.commit_finalize_success(
+            request_id="req-1",
+            lease_id=lease_id,
+            attempt_id=attempt_id,
+            scheduler_epoch=epoch,
+            runtime_generation=7,
+            result_path="/tmp/staged-req-1.json",
+            result_checksum="sha256:abc",
+            result_size_bytes=123,
+            now=105.0,
+        )
+        assert committed["record"]["staged_payload_path"] is None
+
+        payloads = store.list_terminal_payloads_for_eviction(
+            older_than_s=1.0,
+            now=10_000.0,
+            limit=1000,
+        )
+        assert [record["request_id"] for record in payloads] == ["req-1"]
+        assert payloads[0]["result_path"] == "/tmp/staged-req-1.json"
+    finally:
+        store.close()
+
+
 def test_runtime_commit_does_not_require_live_scheduler_owner() -> None:
     store = TaskStateStore.in_memory()
     try:
@@ -203,6 +408,7 @@ def test_runtime_commit_does_not_require_live_scheduler_owner() -> None:
             scheduler_epoch=epoch,
             runtime_generation=7,
             finalize_ttl_s=30.0,
+            staged_payload_path="/vePFS-Mindverse/share/mint-results/req-1.json",
             now=104.0,
         )
         owner_b = store.acquire_scheduler_owner(owner_id="scheduler-b", ttl_s=30.0, now=132.0)
@@ -222,6 +428,7 @@ def test_runtime_commit_does_not_require_live_scheduler_owner() -> None:
         )
 
         assert committed["record"]["status"] == "done"
+        assert committed["record"]["staged_payload_path"] is None
     finally:
         store.close()
 
@@ -258,6 +465,16 @@ def test_requeue_task_resets_active_record_for_reclaim() -> None:
     store = TaskStateStore.in_memory()
     try:
         epoch, lease_id, attempt_id = _leased_task(store)
+        store.begin_finalize(
+            request_id="req-1",
+            lease_id=lease_id,
+            attempt_id=attempt_id,
+            scheduler_epoch=epoch,
+            runtime_generation=7,
+            finalize_ttl_s=30.0,
+            staged_payload_path="/tmp/payloads/re/req-1/attempt-1__lease-1.json",
+            now=103.5,
+        )
         requeued = store.requeue_task(
             request_id="req-1",
             scheduler_epoch=epoch,
@@ -267,6 +484,10 @@ def test_requeue_task_resets_active_record_for_reclaim() -> None:
         assert requeued["record"]["status"] == "pending"
         assert requeued["record"]["lease_id"] is None
         assert requeued["record"]["attempt_id"] is None
+        assert requeued["record"]["staged_payload_path"] is None
+        assert requeued["record"]["metadata"]["abandoned_staged_payload_paths"] == [
+            "/tmp/payloads/re/req-1/attempt-1__lease-1.json"
+        ]
 
         store.assign_task(
             request_id="req-1",
@@ -287,6 +508,100 @@ def test_requeue_task_resets_active_record_for_reclaim() -> None:
         )
         assert claimed["record"]["status"] == "leased"
         assert claimed["record"]["lease_id"] == "lease-1-retry"
+    finally:
+        store.close()
+
+
+def test_stale_finalizer_uses_distinct_payload_path_and_cannot_overwrite_retry(tmp_path) -> None:
+    store = TaskStateStore.in_memory()
+    payloads = TaskPayloadStore(tmp_path)
+    try:
+        epoch, lease_id, attempt_id = _leased_task(store)
+        stale_path = payloads.payload_path(request_id="req-1", attempt_id=f"{attempt_id}__{lease_id}")
+        store.begin_finalize(
+            request_id="req-1",
+            lease_id=lease_id,
+            attempt_id=attempt_id,
+            scheduler_epoch=epoch,
+            runtime_generation=7,
+            finalize_ttl_s=30.0,
+            staged_payload_path=str(stale_path),
+            now=104.0,
+        )
+        store.requeue_task(
+            request_id="req-1",
+            scheduler_epoch=epoch,
+            reason="lease_expired",
+            now=105.0,
+        )
+        store.assign_task(
+            request_id="req-1",
+            subqueue_id="vllm:Qwen/Qwen3-4B-Instruct-2507::replica-0",
+            scheduler_epoch=epoch,
+            now=106.0,
+        )
+        store.claim_task(
+            request_id="req-1",
+            subqueue_id="vllm:Qwen/Qwen3-4B-Instruct-2507::replica-0",
+            lease_id="lease-2",
+            attempt_id=attempt_id,
+            consumer_id="runtime-0",
+            scheduler_epoch=epoch,
+            runtime_generation=7,
+            lease_ttl_s=30.0,
+            now=107.0,
+        )
+        retry_path = payloads.payload_path(request_id="req-1", attempt_id=f"{attempt_id}__lease-2")
+        store.begin_finalize(
+            request_id="req-1",
+            lease_id="lease-2",
+            attempt_id=attempt_id,
+            scheduler_epoch=epoch,
+            runtime_generation=7,
+            finalize_ttl_s=30.0,
+            staged_payload_path=str(retry_path),
+            now=108.0,
+        )
+        retry_meta = payloads.write_json_payload(
+            request_id="req-1",
+            attempt_id=f"{attempt_id}__lease-2",
+            payload={"winner": "retry"},
+        )
+        committed = store.commit_finalize_success(
+            request_id="req-1",
+            lease_id="lease-2",
+            attempt_id=attempt_id,
+            scheduler_epoch=epoch,
+            runtime_generation=7,
+            result_path=str(retry_meta["path"]),
+            result_checksum=str(retry_meta["checksum"]),
+            result_size_bytes=int(retry_meta["size_bytes"]),
+            now=109.0,
+        )
+        assert committed["record"]["status"] == "done"
+
+        payloads.write_json_payload(
+            request_id="req-1",
+            attempt_id=f"{attempt_id}__{lease_id}",
+            payload={"winner": "stale"},
+        )
+        with pytest.raises(TaskStateConflictError):
+            store.commit_finalize_success(
+                request_id="req-1",
+                lease_id=lease_id,
+                attempt_id=attempt_id,
+                scheduler_epoch=epoch,
+                runtime_generation=7,
+                result_path=str(stale_path),
+                result_checksum="sha256:stale",
+                result_size_bytes=1,
+                now=110.0,
+            )
+        assert payloads.read_json_payload(
+            path=str(retry_meta["path"]),
+            expected_checksum=str(retry_meta["checksum"]),
+        ) == {"winner": "retry"}
+        assert store.get_task("req-1")["metadata"]["abandoned_staged_payload_paths"] == [str(stale_path)]
     finally:
         store.close()
 
@@ -333,6 +648,344 @@ def test_future_style_task_lifecycle_and_metadata_lookup() -> None:
         retrieved = store.mark_task_retrieved(request_id="future-1", now=103.0)
         assert retrieved["record"]["status"] == "retrieved"
         assert retrieved["record"]["metadata"]["terminal_status"] == "done"
+    finally:
+        store.close()
+
+
+def test_billing_outbox_claim_delete_and_terminal_metadata() -> None:
+    store = TaskStateStore.in_memory()
+    try:
+        store.ensure_task(
+            request_id="future-bill",
+            op="sampling.asample",
+            domain_key="future:default",
+            metadata={},
+            status="running",
+            now=100.0,
+        )
+        observation = build_billing_observation(
+            account_id="acct-1",
+            apikey_id="key-1",
+            request_id="future-bill",
+            charge_item="sampling",
+            quantity=7,
+            unit="tokens",
+            route="sampling.asample",
+            dimension="sample",
+            model="Qwen/Test",
+            observed_at=101.0,
+        )
+        completed = store.complete_task_success(
+            request_id="future-bill",
+            result_path="/tmp/result.json",
+            result_checksum="sha256:abc",
+            result_size_bytes=17,
+            metadata={"done_at": 102.0},
+            billing_observations=[observation],
+            now=102.0,
+        )
+        assert completed["record"]["metadata"]["billing_status"] == "outboxed"
+        assert completed["record"]["metadata"]["billing_observation_count"] == 1
+
+        stats = store.billing_outbox_stats(now=103.0)
+        assert stats["by_status"]["pending"]["rows"] == 1
+
+        claimed = store.claim_billing_outbox(claim_id="claim-1", limit=10, lease_ttl_s=30.0, now=104.0)
+        assert len(claimed) == 1
+        assert claimed[0]["event"]["charge_item"] == "sampling"
+        assert claimed[0]["event"]["quantity"] == 7
+        assert claimed[0]["event"]["label"] == (
+            "model=Qwen/Test,route=sampling.asample,dimension=sample,unit=tokens"
+        )
+
+        stats = store.billing_outbox_stats(now=105.0)
+        assert stats["by_status"]["flushing"]["rows"] == 1
+
+        deleted = store.delete_billing_outbox_claim(
+            claim_id="claim-1",
+            outbox_ids=[claimed[0]["outbox_id"]],
+        )
+        assert deleted == {"ok": True, "deleted": 1}
+        assert store.billing_outbox_stats(now=106.0)["by_status"] == {}
+    finally:
+        store.close()
+
+
+def test_billing_outbox_failure_terminal_is_not_billed() -> None:
+    store = TaskStateStore.in_memory()
+    try:
+        store.ensure_task(
+            request_id="future-fail",
+            op="sampling.asample",
+            domain_key="future:default",
+            metadata={},
+            status="running",
+            now=100.0,
+        )
+        store.complete_task_failure(
+            request_id="future-fail",
+            error="boom",
+            metadata={"failed_at": 102.0},
+            now=102.0,
+        )
+        assert store.billing_outbox_stats(now=103.0)["by_status"] == {}
+    finally:
+        store.close()
+
+
+def test_billing_outbox_write_failure_sets_underbilling_signal(monkeypatch) -> None:
+    store = TaskStateStore.in_memory()
+    try:
+        store.ensure_task(
+            request_id="future-bill-drop",
+            op="sampling.asample",
+            domain_key="future:default",
+            metadata={},
+            status="running",
+            now=100.0,
+        )
+        observation = build_billing_observation(
+            account_id="acct-1",
+            apikey_id="key-1",
+            request_id="future-bill-drop",
+            charge_item="sampling",
+            quantity=7,
+            unit="tokens",
+            route="sampling.asample",
+            dimension="sample",
+            model="Qwen/Test",
+            observed_at=101.0,
+        )
+
+        def _fail_append(*_args, **_kwargs):
+            return {"ok": False, "errors": [{"error": "sqlite unavailable"}], "inserted": 0}
+
+        monkeypatch.setattr(store, "_append_billing_outbox_locked", _fail_append)
+
+        completed = store.complete_task_success(
+            request_id="future-bill-drop",
+            result_path="/tmp/result.json",
+            result_checksum="sha256:abc",
+            result_size_bytes=17,
+            metadata={"done_at": 102.0},
+            billing_observations=[observation],
+            now=102.0,
+        )
+        assert completed["record"]["status"] == "done"
+        assert completed["record"]["metadata"]["billing_status"] == "dropped"
+        assert completed["record"]["metadata"]["billing_error"]["errors"][0]["error"] == "sqlite unavailable"
+    finally:
+        store.close()
+
+
+def test_billing_outbox_hash_conflict_sets_underbilling_signal() -> None:
+    store = TaskStateStore.in_memory()
+    try:
+        first = build_billing_observation(
+            account_id="acct-1",
+            apikey_id="key-1",
+            request_id="future-bill-conflict",
+            charge_item="sampling",
+            quantity=7,
+            unit="tokens",
+            route="sampling.asample",
+            dimension="sample",
+            model="Qwen/Test",
+            observed_at=101.0,
+        )
+        assert store.append_billing_outbox(observations=[first], source="test", now=101.0)["ok"] is True
+        store.ensure_task(
+            request_id="future-bill-conflict",
+            op="sampling.asample",
+            domain_key="future:default",
+            metadata={},
+            status="running",
+            now=102.0,
+        )
+        conflicting = dict(first)
+        conflicting["quantity"] = 9
+        completed = store.complete_task_success(
+            request_id="future-bill-conflict",
+            result_path="/tmp/result.json",
+            result_checksum="sha256:abc",
+            result_size_bytes=17,
+            metadata={"done_at": 103.0},
+            billing_observations=[conflicting],
+            now=103.0,
+        )
+        assert completed["record"]["status"] == "done"
+        assert completed["record"]["metadata"]["billing_status"] == "dropped"
+        assert completed["record"]["metadata"]["billing_error"]["conflicts"] == 1
+    finally:
+        store.close()
+
+
+def test_task_future_service_flushes_billing_outbox_and_deletes_conflicts(monkeypatch) -> None:
+    store = TaskStateStore.in_memory()
+    try:
+        observations = [
+            build_billing_observation(
+                account_id="acct-1",
+                apikey_id="key-1",
+                request_id="req-bill-flush",
+                charge_item="sampling",
+                quantity=3,
+                unit="tokens",
+                route="sampling.asample",
+                dimension="prefill",
+                model="Qwen/Test",
+                observed_at=101.0,
+            ),
+            build_billing_observation(
+                account_id="acct-1",
+                apikey_id="key-1",
+                request_id="req-bill-flush",
+                charge_item="sampling",
+                quantity=5,
+                unit="tokens",
+                route="sampling.asample",
+                dimension="sample",
+                model="Qwen/Test",
+                observed_at=101.0,
+            ),
+        ]
+        store.append_billing_outbox(observations=observations, source="test", now=102.0)
+
+        class _TaskState:
+            async def async_claim_billing_outbox(self, **kwargs):
+                return store.claim_billing_outbox(**kwargs)
+
+            async def async_delete_billing_outbox_claim(self, **kwargs):
+                return store.delete_billing_outbox_claim(**kwargs)
+
+            async def async_mark_billing_outbox_claim_failed(self, **kwargs):
+                return store.mark_billing_outbox_claim_failed(**kwargs)
+
+        class _UsageStore:
+            def __init__(self):
+                self.events = []
+
+            async def write_events(self, events):
+                self.events.extend(list(events))
+                return [self.events[0].event_id]
+
+        usage_store = _UsageStore()
+
+        async def _fake_get_usage_store():
+            return usage_store
+
+        monkeypatch.setattr("mint_server.usage_store.get_usage_store", _fake_get_usage_store)
+
+        service = TaskFutureService(task_state_client=_TaskState())
+        out = asyncio.run(service.async_flush_billing_outbox(limit=10, lease_ttl_s=60.0, claim_id="claim-flush"))
+
+        assert out == {"ok": True, "claimed": 2, "inserted": 1, "conflict": 1, "failed": 0}
+        assert len(usage_store.events) == 2
+        assert store.billing_outbox_stats(now=110.0)["by_status"] == {}
+    finally:
+        store.close()
+
+
+def test_task_future_service_flush_failure_releases_claim(monkeypatch) -> None:
+    store = TaskStateStore.in_memory()
+    try:
+        store.append_billing_outbox(
+            observations=[
+                build_billing_observation(
+                    account_id="acct-1",
+                    apikey_id="key-1",
+                    request_id="req-bill-fail",
+                    charge_item="sampling",
+                    quantity=3,
+                    unit="tokens",
+                    route="sampling.asample",
+                    dimension="prefill",
+                    model="Qwen/Test",
+                    observed_at=101.0,
+                )
+            ],
+            source="test",
+            now=102.0,
+        )
+
+        class _TaskState:
+            async def async_claim_billing_outbox(self, **kwargs):
+                return store.claim_billing_outbox(**kwargs)
+
+            async def async_delete_billing_outbox_claim(self, **kwargs):
+                return store.delete_billing_outbox_claim(**kwargs)
+
+            async def async_mark_billing_outbox_claim_failed(self, **kwargs):
+                return store.mark_billing_outbox_claim_failed(**kwargs)
+
+        class _UsageStore:
+            async def write_events(self, _events):
+                raise RuntimeError("pg unavailable")
+
+        async def _fake_get_usage_store():
+            return _UsageStore()
+
+        monkeypatch.setattr("mint_server.usage_store.get_usage_store", _fake_get_usage_store)
+
+        service = TaskFutureService(task_state_client=_TaskState())
+        out = asyncio.run(service.async_flush_billing_outbox(limit=10, lease_ttl_s=60.0, claim_id="claim-fail"))
+
+        assert out["ok"] is False
+        assert out["failed"] == 1
+        stats = store.billing_outbox_stats(now=110.0)
+        assert stats["by_status"]["pending"]["rows"] == 1
+    finally:
+        store.close()
+
+
+def test_task_future_service_permanent_usage_error_marks_outbox_failed(monkeypatch) -> None:
+    store = TaskStateStore.in_memory()
+    try:
+        store.append_billing_outbox(
+            observations=[
+                build_billing_observation(
+                    account_id="acct-1",
+                    apikey_id="key-1",
+                    request_id="req-bill-permanent",
+                    charge_item="sampling",
+                    quantity=3,
+                    unit="tokens",
+                    route="sampling.asample",
+                    dimension="prefill",
+                    model="Qwen/Test",
+                    observed_at=101.0,
+                )
+            ],
+            source="test",
+            now=102.0,
+        )
+
+        class _TaskState:
+            async def async_claim_billing_outbox(self, **kwargs):
+                return store.claim_billing_outbox(**kwargs)
+
+            async def async_delete_billing_outbox_claim(self, **kwargs):
+                return store.delete_billing_outbox_claim(**kwargs)
+
+            async def async_mark_billing_outbox_claim_failed(self, **kwargs):
+                return store.mark_billing_outbox_claim_failed(**kwargs)
+
+        class _UsageStore:
+            async def write_events(self, _events):
+                raise ValueError("unsupported usage_event charge_item: 'bad'")
+
+        async def _fake_get_usage_store():
+            return _UsageStore()
+
+        monkeypatch.setattr("mint_server.usage_store.get_usage_store", _fake_get_usage_store)
+
+        service = TaskFutureService(task_state_client=_TaskState())
+        out = asyncio.run(service.async_flush_billing_outbox(limit=10, lease_ttl_s=60.0, claim_id="claim-permanent"))
+
+        assert out["ok"] is False
+        assert out["permanent"] is True
+        stats = store.billing_outbox_stats(now=110.0)
+        assert stats["by_status"]["failed"]["rows"] == 1
     finally:
         store.close()
 
@@ -675,6 +1328,56 @@ def test_task_state_store_owns_training_session_metadata() -> None:
         store.close()
 
 
+def test_task_future_service_stages_payload_metadata_before_direct_resolve(tmp_path) -> None:
+    store = TaskStateStore.in_memory()
+    observed_updates: list[dict] = []
+    try:
+        store.ensure_task(
+            request_id="req-direct",
+            op="sampling.asample",
+            domain_key="vllm:test",
+            request_json=b"{}",
+            metadata={"model_work_attempt_id": "stale-model-work-attempt"},
+            status="pending",
+            now=1.0,
+        )
+
+        class _LocalTaskStateClient:
+            async def async_get_task(self, request_id: str) -> dict:
+                return store.get_task(request_id)
+
+            async def async_stage_payload(self, **kwargs):
+                observed_updates.append(dict(kwargs))
+                out = store.stage_payload(**kwargs)
+                assert out["record"]["status"] == "pending"
+                return out
+
+            async def async_complete_task_success(self, **kwargs):
+                return store.complete_task_success(**kwargs)
+
+        service = TaskFutureService(
+            task_state_client=_LocalTaskStateClient(),
+            payload_store=TaskPayloadStore(tmp_path),
+        )
+
+        asyncio.run(service.async_resolve("req-direct", {"ok": True}))
+
+        assert observed_updates[0]["request_id"] == "req-direct"
+        assert observed_updates[0]["staged_payload_path"].startswith(str(tmp_path / "re" / "req-direct" / "future__"))
+        assert "stale-model-work-attempt" not in observed_updates[0]["staged_payload_path"]
+        assert observed_updates[0]["metadata"] == {
+            "staged_payload_path": observed_updates[0]["staged_payload_path"],
+        }
+        record = store.get_task("req-direct")
+        assert record["status"] == "done"
+        assert record["result_path"] == observed_updates[0]["staged_payload_path"]
+        assert record["staged_payload_path"] is None
+        assert record["metadata"]["payload_state"] == "committed"
+        assert record["metadata"]["staged_payload_path"] is None
+    finally:
+        store.close()
+
+
 def test_task_state_store_owns_gateway_routes() -> None:
     store = TaskStateStore.in_memory()
     try:
@@ -773,6 +1476,12 @@ def test_task_future_service_reaper_retries_payload_delete_failures(tmp_path, mo
         async def async_record_payload_evict_error(self, **kwargs):
             return store.record_payload_evict_error(**kwargs)
 
+        async def async_list_staged_payloads_for_gc(self, **kwargs):
+            return store.list_staged_payloads_for_gc(**kwargs)
+
+        async def async_mark_staged_payload_gc_deleted(self, **kwargs):
+            return store.mark_staged_payload_gc_deleted(**kwargs)
+
     try:
         store.ensure_task(
             request_id="req-fail-delete",
@@ -813,5 +1522,75 @@ def test_task_future_service_reaper_retries_payload_delete_failures(tmp_path, mo
         assert record["result_path"] is None
         assert record["metadata"]["payload_evicted_at"] > 0
         assert not result_path.exists()
+    finally:
+        store.close()
+
+
+def test_task_future_service_reaper_deletes_abandoned_staged_payload(tmp_path, monkeypatch) -> None:
+    from mint_server import config as config_module
+
+    store = TaskStateStore.in_memory()
+
+    class _LocalTaskStateClient:
+        async def async_expire_active_tasks(self, **kwargs):
+            return store.expire_active_tasks(**kwargs)
+
+        async def async_list_terminal_payloads_for_eviction(self, **kwargs):
+            return store.list_terminal_payloads_for_eviction(**kwargs)
+
+        async def async_mark_payload_evicted(self, **kwargs):
+            return store.mark_payload_evicted(**kwargs)
+
+        async def async_delete_expired_tombstones(self, **kwargs):
+            return store.delete_expired_tombstones(**kwargs)
+
+        async def async_record_payload_evict_error(self, **kwargs):
+            return store.record_payload_evict_error(**kwargs)
+
+        async def async_list_staged_payloads_for_gc(self, **kwargs):
+            return store.list_staged_payloads_for_gc(**kwargs)
+
+        async def async_mark_staged_payload_gc_deleted(self, **kwargs):
+            return store.mark_staged_payload_gc_deleted(**kwargs)
+
+    try:
+        store.ensure_task(
+            request_id="req-stage-gc",
+            op="sampling.asample",
+            domain_key="vllm:test",
+            request_json=b"{}",
+            status="pending",
+            now=1.0,
+        )
+        payloads = TaskPayloadStore(tmp_path)
+        staged_meta = payloads.write_json_payload(
+            request_id="req-stage-gc",
+            attempt_id="future__old-stage",
+            payload={"stale": True},
+        )
+        store.stage_payload(
+            request_id="req-stage-gc",
+            staged_payload_path=str(staged_meta["path"]),
+            now=2.0,
+        )
+        store.complete_task_failure(
+            request_id="req-stage-gc",
+            error="failed after staging",
+            now=3.0,
+        )
+        monkeypatch.setattr(config_module.config, "task_pending_ttl_s", 86400.0, raising=False)
+        monkeypatch.setattr(config_module.config, "task_result_ttl_s", 1.0, raising=False)
+        monkeypatch.setattr(config_module.config, "task_tombstone_ttl_s", 10**12, raising=False)
+
+        out = asyncio.run(
+            TaskFutureService(
+                task_state_client=_LocalTaskStateClient(),
+                payload_store=payloads,
+            ).async_reap()
+        )
+
+        assert out["staged_payload_gc_deleted"] == ["req-stage-gc"]
+        assert not Path(staged_meta["path"]).exists()
+        assert store.get_task("req-stage-gc")["metadata"]["abandoned_staged_payload_paths"] == []
     finally:
         store.close()

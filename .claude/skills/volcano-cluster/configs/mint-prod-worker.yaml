@@ -3,10 +3,11 @@
 #
 # Before submitting:
 #   - Ensure mint-prod-head is running and has written ray_head_ip.txt
-#   - (Optional) Verify head IP: volc ml_task logs -t <head_task_id> -i worker_0 | grep "MINT Production Ray head IP"
-#   - Replace <GPU_QUEUE_ID> below with the desired GPU queue id (prod prefers C1 or C2)
+#   - Configure this file as a template in MINT_TOPOLOGY_CONFIG_PATH
+#   - Let mint_model_actor_supervisor submit one 1-node task per mint-worker-{idx}
 #
-# Submit with: volc ml_task submit -c mint-prod-worker.yaml --output json
+# Node lifecycle is submitted through VolcanoTopologyProvider /
+# scripts/tools/volcano_sdk_jobs.py, not the Volcano CLI.
 
 TaskName: "mint-prod-worker"
 Description: "MINT PRODUCTION - Ray GPU worker - DO NOT USE FOR DEV"

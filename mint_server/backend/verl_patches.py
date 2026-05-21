@@ -48,7 +48,7 @@ def _apply_megatron_router_expert_bias_no_stack_patch() -> None:
         )
         return
 
-    if getattr(fmg, "_tinker_router_expert_bias_no_stack_patched", False):
+    if getattr(fmg, "_mint_router_expert_bias_no_stack_patched", False):
         return
 
     if not hasattr(fmg, "_update_router_expert_bias"):
@@ -74,11 +74,11 @@ def _apply_megatron_router_expert_bias_no_stack_patch() -> None:
             and getattr(config, "context_parallel_size", None) == 2
             and getattr(config, "expert_tensor_parallel_size", 1) == 1
         ):
-            if not getattr(patched, "_tinker_k2_expert_bias_disabled_logged", False):
+            if not getattr(patched, "_mint_k2_expert_bias_disabled_logged", False):
                 print(
                     "[VERL_PATCH] Disabled Megatron _update_router_expert_bias for K2 (TP=64 EP=64 CP=2) to avoid NCCL OOM"
                 )
-                patched._tinker_k2_expert_bias_disabled_logged = True  # type: ignore[attr-defined]
+                patched._mint_k2_expert_bias_disabled_logged = True  # type: ignore[attr-defined]
 
             import torch
 
@@ -115,7 +115,7 @@ def _apply_megatron_router_expert_bias_no_stack_patch() -> None:
                 t.zero_()
 
     fmg._update_router_expert_bias = patched  # type: ignore[attr-defined]
-    fmg._tinker_router_expert_bias_no_stack_patched = True  # type: ignore[attr-defined]
+    fmg._mint_router_expert_bias_no_stack_patched = True  # type: ignore[attr-defined]
     print("[VERL_PATCH] Patched Megatron _update_router_expert_bias (no stacking, in-place update)")
 
 
@@ -523,7 +523,7 @@ def _apply_external_label_patch():
         )
         return
 
-    if not getattr(verl_engine_utils, "_tinker_packed_logprob_postprocess_patched", False):
+    if not getattr(verl_engine_utils, "_mint_packed_logprob_postprocess_patched", False):
         original_postprocess_batch_func = verl_engine_utils.postprocess_batch_func
 
         @wraps(original_postprocess_batch_func)
@@ -564,7 +564,7 @@ def _apply_external_label_patch():
 
         verl_engine_utils.postprocess_batch_func = patched_postprocess_batch_func
         verl_transformer_impl.postprocess_batch_func = patched_postprocess_batch_func
-        verl_engine_utils._tinker_packed_logprob_postprocess_patched = True  # type: ignore[attr-defined]
+        verl_engine_utils._mint_packed_logprob_postprocess_patched = True  # type: ignore[attr-defined]
         logger.info("Applied packed logprob postprocess patch")
 
 
@@ -585,7 +585,7 @@ def _apply_rope_thd_cp_len_clamp_patch() -> None:
         logger.warning(f"Could not import megatron rope_utils; skipping RoPE CP patch: {type(e).__name__}: {e}")
         return
 
-    if getattr(rope_utils, "_tinker_rope_thd_cp_full_seqlen_clamp_patched", False):
+    if getattr(rope_utils, "_mint_rope_thd_cp_full_seqlen_clamp_patched", False):
         return
 
     original = rope_utils._get_thd_freqs_on_this_cp_rank
@@ -615,7 +615,7 @@ def _apply_rope_thd_cp_len_clamp_patch() -> None:
         )
 
     rope_utils._get_thd_freqs_on_this_cp_rank = patched  # type: ignore[attr-defined]
-    rope_utils._tinker_rope_thd_cp_full_seqlen_clamp_patched = True  # type: ignore[attr-defined]
+    rope_utils._mint_rope_thd_cp_full_seqlen_clamp_patched = True  # type: ignore[attr-defined]
     print("[VERL_PATCH] Patched rope_utils._get_thd_freqs_on_this_cp_rank (clamp full_seqlen)")
 
 
@@ -644,7 +644,7 @@ def _apply_yarn_rope_cp_seq_len_align_patch() -> None:
         )
         return
 
-    if getattr(yarn_rotary_pos_embedding, "_tinker_yarn_rope_cp_seq_len_align_patched", False):
+    if getattr(yarn_rotary_pos_embedding, "_mint_yarn_rope_cp_seq_len_align_patched", False):
         return
 
     original = yarn_rotary_pos_embedding.YarnRotaryEmbedding._set_cos_sin_cache
@@ -659,7 +659,7 @@ def _apply_yarn_rope_cp_seq_len_align_patch() -> None:
         return original(self, seq_len, offset, dtype, packed_seq)
 
     yarn_rotary_pos_embedding.YarnRotaryEmbedding._set_cos_sin_cache = patched  # type: ignore[assignment]
-    yarn_rotary_pos_embedding._tinker_yarn_rope_cp_seq_len_align_patched = True  # type: ignore[attr-defined]
+    yarn_rotary_pos_embedding._mint_yarn_rope_cp_seq_len_align_patched = True  # type: ignore[attr-defined]
     print("[VERL_PATCH] Patched YarnRotaryEmbedding._set_cos_sin_cache (CP-aligned cache len)")
 
 
@@ -678,7 +678,7 @@ def _apply_preprocess_thd_no_padding_cp_short_seq_patch() -> None:
         logger.warning(f"Could not import verl.models.mcore.util; skipping CP short-seq patch: {type(e).__name__}: {e}")
         return
 
-    if getattr(verl_mcore_util, "_tinker_preprocess_thd_no_padding_cp_short_seq_patched", False):
+    if getattr(verl_mcore_util, "_mint_preprocess_thd_no_padding_cp_short_seq_patched", False):
         return
 
     import torch
@@ -784,7 +784,7 @@ def _apply_preprocess_thd_no_padding_cp_short_seq_patch() -> None:
         verl_mcore_model_forward = None
     if verl_mcore_model_forward is not None and hasattr(verl_mcore_model_forward, "preprocess_thd_no_padding"):
         verl_mcore_model_forward.preprocess_thd_no_padding = patched_preprocess_thd_no_padding  # type: ignore[assignment]
-    verl_mcore_util._tinker_preprocess_thd_no_padding_cp_short_seq_patched = True  # type: ignore[attr-defined]
+    verl_mcore_util._mint_preprocess_thd_no_padding_cp_short_seq_patched = True  # type: ignore[attr-defined]
     print("[VERL_PATCH] Patched verl preprocess_thd_no_padding (CP short-seq clamp)")
 
 
@@ -807,7 +807,7 @@ def _apply_te_triton_get_int_dtype_patch() -> None:
         logger.warning(f"Could not import transformer_engine triton permutation; skipping patch: {type(e).__name__}: {e}")
         return
 
-    if getattr(te_perm, "_tinker_te_triton_get_int_dtype_patched", False):
+    if getattr(te_perm, "_mint_te_triton_get_int_dtype_patched", False):
         return
 
     try:
@@ -846,7 +846,7 @@ def _apply_te_triton_get_int_dtype_patch() -> None:
         return ret.to(x.dtype, bitcast=True), ind
 
     te_perm._compare_and_swap = _compare_and_swap  # type: ignore[assignment]
-    te_perm._tinker_te_triton_get_int_dtype_patched = True  # type: ignore[attr-defined]
+    te_perm._mint_te_triton_get_int_dtype_patched = True  # type: ignore[attr-defined]
     print("[VERL_PATCH] Patched transformer_engine triton permutation _compare_and_swap (no core.get_int_dtype)")
 
 
@@ -861,7 +861,7 @@ def _apply_megatron_checkpoint_cleanup_patch() -> None:
         )
         return
 
-    if getattr(tp_random, "_tinker_checkpoint_cleanup_patched", False):
+    if getattr(tp_random, "_mint_checkpoint_cleanup_patched", False):
         return
 
     def _clear_many(*values) -> None:
@@ -1018,7 +1018,7 @@ def _apply_megatron_checkpoint_cleanup_patch() -> None:
                     pass
 
     tp_random.CheckpointWithoutOutputFunction.backward = patched_without_output_backward
-    tp_random._tinker_checkpoint_cleanup_patched = True  # type: ignore[attr-defined]
+    tp_random._mint_checkpoint_cleanup_patched = True  # type: ignore[attr-defined]
     logger.info("Applied Megatron checkpoint backward cleanup patch")
 
 
@@ -1033,7 +1033,7 @@ def _apply_megatron_backward_shape_diag_patch() -> None:
         )
         return
 
-    if getattr(schedules, "_tinker_backward_shape_diag_patched", False):
+    if getattr(schedules, "_mint_backward_shape_diag_patched", False):
         return
 
     original_backward_step = schedules.backward_step
@@ -1082,7 +1082,7 @@ def _apply_megatron_backward_shape_diag_patch() -> None:
             ) from e
 
     schedules.backward_step = patched_backward_step
-    schedules._tinker_backward_shape_diag_patched = True  # type: ignore[attr-defined]
+    schedules._mint_backward_shape_diag_patched = True  # type: ignore[attr-defined]
     logger.info("Applied Megatron backward-step shape diag patch")
 
 
@@ -1098,7 +1098,7 @@ def _apply_nested_no_padding_slice_patch() -> None:
         )
         return
 
-    if getattr(verl_losses, "_tinker_nested_no_padding_slice_patched", False):
+    if getattr(verl_losses, "_mint_nested_no_padding_slice_patched", False):
         return
 
     def _slice_from_padded(tensor: torch.Tensor, data, *, max_response_len_default: int | None = None):
@@ -1168,7 +1168,7 @@ def _apply_nested_no_padding_slice_patch() -> None:
     verl_losses._slice_response_from_unpad_output = patched_slice_response_from_unpad_output
     verl_padding.no_padding_2_padding = patched_no_padding_2_padding
     verl_losses.no_padding_2_padding = patched_no_padding_2_padding
-    verl_losses._tinker_nested_no_padding_slice_patched = True  # type: ignore[attr-defined]
+    verl_losses._mint_nested_no_padding_slice_patched = True  # type: ignore[attr-defined]
     logger.info("Applied nested no-padding response slice patch")
 
 
@@ -1202,7 +1202,7 @@ def _enable_megatron_determinism(seed: int = 42):
         import importlib.metadata as _imd
 
         _orig_version = getattr(_imd, "version", None)
-        if callable(_orig_version) and not getattr(_orig_version, "_tinker_flash_attn_version_patch", False):
+        if callable(_orig_version) and not getattr(_orig_version, "_mint_flash_attn_version_patch", False):
             def _patched_version(dist_name: str) -> str:
                 v = _orig_version(dist_name)
                 if dist_name == "flash-attn" and isinstance(v, str):
@@ -1214,7 +1214,7 @@ def _enable_megatron_determinism(seed: int = 42):
                     return v.split("+", 1)[0]
                 return v
 
-            _patched_version._tinker_flash_attn_version_patch = True  # type: ignore[attr-defined]
+            _patched_version._mint_flash_attn_version_patch = True  # type: ignore[attr-defined]
             _imd.version = _patched_version  # type: ignore[assignment]
     except Exception as e:
         logger.warning(f"Failed to patch importlib.metadata.version for flash-attn: {e}")
@@ -1460,7 +1460,7 @@ def _apply_mla_get_query_key_value_patch():
         return
 
     original = MLASelfAttention.get_query_key_value_tensors
-    if getattr(original, "_tinker_mla_qkv_patch", False):
+    if getattr(original, "_mint_mla_qkv_patch", False):
         return
 
     def patch_get_query_key_value_tensors(
@@ -1655,7 +1655,7 @@ def _apply_mla_get_query_key_value_patch():
 
         return query, key, value, q_compressed, kv_compressed
 
-    patch_get_query_key_value_tensors._tinker_mla_qkv_patch = True  # type: ignore[attr-defined]
+    patch_get_query_key_value_tensors._mint_mla_qkv_patch = True  # type: ignore[attr-defined]
     MLASelfAttention.get_query_key_value_tensors = patch_get_query_key_value_tensors
     logger.info("Applied MLA get_query_key_value_tensors patch aligned with current Megatron runtime")
 

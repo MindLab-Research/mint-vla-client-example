@@ -24,7 +24,7 @@ from . import ray_kill
 from .ray_placement_groups import PlacementGroupMismatchError, get_named_placement_group
 from .model_actor_publication import BackendModelActorLaunch, publish_backend_model_actor
 from .model_actor_supervisor import ActorType, get_model_actor_supervisor
-from .volc_placement import parse_model_gpu_placement
+from .node_placement import parse_model_gpu_placement
 from ..config import PFS_PYTHONPATH, RAY_NAMESPACE
 
 logger = logging.getLogger(__name__)
@@ -437,10 +437,10 @@ def get_or_create_dense_trainer(
         try:
             bind_decision = "create"
 
-            from .model_registry import is_persistent_model
+            from .model_registry import is_topology_desired_model
             from .runtime_observability import runtime_observability
 
-            is_persistent = is_persistent_model(base_model)
+            is_topology_desired = is_topology_desired_model(base_model)
 
             reuse_block_reason = dense_trainer_reuse_block_reason(actor_name)
 
@@ -596,7 +596,7 @@ def get_or_create_dense_trainer(
                 namespace=PERSISTENT_DENSE_NAMESPACE,
                 base_model=base_model,
                 session_id=session_id,
-                protected=is_persistent,
+                protected=is_topology_desired,
                 metadata={
                     **_base_dense_metadata(
                         actual_rank=int(lora_rank),
@@ -619,7 +619,7 @@ def get_or_create_dense_trainer(
                 actor_name=actor_name,
                 session_id=None if session_id is None else str(session_id),
                 detail=bind_decision,
-                context={"protected": bool(is_persistent)},
+                context={"protected": bool(is_topology_desired)},
             )
 
             return DenseTrainerHandle(

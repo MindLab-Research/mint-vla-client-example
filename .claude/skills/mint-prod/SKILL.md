@@ -117,6 +117,18 @@ Public `/api/v1/healthz` is only a cheap API-worker health check.
   shared production config.
 - GPU worker lifecycle belongs to `volcano-cluster` or the relevant cluster
   skill, not this server operation skill.
+- Volcano production worker nodes are topology/Supervisor owned. Do not use
+  historical Volcano CLI commands to list, submit, cancel, or inspect worker
+  jobs.
+- Use the Volcano SDK operator helper from the production checkout:
+
+```bash
+ssh mint-prod-volcano 'cd /share/mint/prod/mint-server && /share/mint/prod/runtime/host-venv/bin/python scripts/tools/volcano_sdk_jobs.py --region cn-beijing list --name-contains mint-prod-worker- --limit 200'
+ssh mint-prod-volcano 'cd /share/mint/prod/mint-server && /share/mint/prod/runtime/host-venv/bin/python scripts/tools/volcano_sdk_jobs.py --region cn-beijing instances --job-id <job_id>'
+```
+
+Credential checks may report only source existence. Never print secret values,
+credential files, signed requests, or process environments.
 
 ## Hard Rules
 

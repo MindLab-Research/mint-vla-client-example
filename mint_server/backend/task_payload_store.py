@@ -61,6 +61,18 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
+def _ensure_directory_durable(path: Path) -> None:
+    missing: list[Path] = []
+    cur = path
+    while not cur.exists() and cur != cur.parent:
+        missing.append(cur)
+        cur = cur.parent
+    path.mkdir(parents=True, exist_ok=True)
+    for created in reversed(missing):
+        _fsync_directory(created.parent)
+        _fsync_directory(created)
+
+
 class TaskPayloadStore:
     """Filesystem payload store with temp-file + atomic rename publish."""
 
@@ -71,11 +83,14 @@ class TaskPayloadStore:
     def root_dir(self) -> Path:
         return self._root_dir
 
-    def _final_path(self, *, request_id: str, attempt_id: str) -> Path:
+    def payload_path(self, *, request_id: str, attempt_id: str) -> Path:
         request_id = _safe_component(request_id)
         attempt_id = _safe_component(attempt_id)
         shard = request_id[:2] if len(request_id) >= 2 else "__"
         return self._root_dir / shard / request_id / f"{attempt_id}.json"
+
+    def _final_path(self, *, request_id: str, attempt_id: str) -> Path:
+        return self.payload_path(request_id=request_id, attempt_id=attempt_id)
 
     def write_json_payload(
         self,
@@ -85,7 +100,7 @@ class TaskPayloadStore:
         payload: Any,
     ) -> dict[str, Any]:
         final_path = self._final_path(request_id=request_id, attempt_id=attempt_id)
-        final_path.parent.mkdir(parents=True, exist_ok=True)
+        _ensure_directory_durable(final_path.parent)
         tmp_path = final_path.with_name(f".{final_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
         encoded = json.dumps(
             _jsonable(payload),

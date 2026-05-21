@@ -118,7 +118,7 @@ PFS_RUNTIME_ENV_ROOT = _resolve_env_or_config(
 
 # Toggle to use Megatron-Bridge export_adapter_weights API instead of custom implementation
 _file_use_lora_export = _CONFIG_FILE.megatron_bridge.use_mbridge_lora_export if _CONFIG_FILE is not None else None
-_env_use_lora_export = _env_nonempty(os.environ, "USE_MBRIDGE_LORA_EXPORT")
+_env_use_lora_export = _env_nonempty(os.environ, "MINT_USE_MBRIDGE_LORA_EXPORT")
 USE_MBRIDGE_LORA_EXPORT = (
     _parse_bool(_env_use_lora_export)
     if _env_use_lora_export is not None
@@ -185,17 +185,7 @@ def otel_env_vars() -> dict[str, str]:
     return out
 
 
-def preferred_control_plane_resources(
-    cluster_resources: dict[str, float] | None,
-    *,
-    env_var: str | None = None,
-) -> dict[str, float] | None:
-    for candidate in (env_var, "MINT_CONTROL_PLANE_PINNED_NODE_IP"):
-        if not candidate:
-            continue
-        pinned_node_ip = _env_nonempty(os.environ, candidate)
-        if pinned_node_ip is not None:
-            return {f"node:{pinned_node_ip}": 0.001}
+def preferred_control_plane_resources(cluster_resources: dict[str, float] | None) -> dict[str, float] | None:
     if cluster_resources and "node:__internal_head__" in cluster_resources:
         return {"node:__internal_head__": 0.001}
     return None
@@ -302,9 +292,6 @@ def actor_runtime_env(
 
 
 def detached_actor_resource_key(ray_module: Any | None = None) -> str | None:
-    pinned_ip = _env_nonempty(os.environ, "MINT_DETACHED_ACTOR_NODE_IP")
-    if pinned_ip is not None:
-        return f"node:{pinned_ip}"
     try:
         cluster_resources = (ray_module or __import__("ray")).cluster_resources()
     except Exception:
@@ -406,7 +393,7 @@ def actor_ld_library_path() -> str:
     )
 
 # When false (default), reject requests for base_model not in list_supported_models().
-ALLOW_UNSUPPORTED_MODELS = _parse_bool(_env_nonempty(os.environ, "ALLOW_UNSUPPORTED_MODELS") or "false")
+ALLOW_UNSUPPORTED_MODELS = _parse_bool(_env_nonempty(os.environ, "MINT_ALLOW_UNSUPPORTED_MODELS") or "false")
 
 
 @dataclass
@@ -422,7 +409,6 @@ class ServerConfig:
     internal_api_token: str = ""  # Shared token for trusting platform-forwarded identity headers.
 
     # Usage billing
-    usage_log_dir: str = "/tmp/mint_usage"  # deprecated; billing writes directly to PostgreSQL
     usage_backend: str = "postgres"  # only postgres is supported
     usage_pg_dsn: str = ""
     usage_pg_host: str = ""
@@ -436,8 +422,6 @@ class ServerConfig:
     usage_pg_table: str = "usage_event"
     checkpoint_index_pg_dsn: str = ""
     checkpoint_index_write_timeout_ms: int = 2000
-    skip_actor_cleanup: bool = False  # MINT_SKIP_ACTOR_CLEANUP
-
     # Model settings (no default model - clients specify per-request)
     tensor_parallel_size: int = 1
     data_parallel_size: int = 1  # For MoE: EP = TP * DP
@@ -501,14 +485,6 @@ class ServerConfig:
     training_actor_ready_timeout_s: float | None = None
     training_remote_call_timeout_s: float | None = None
 
-    # Persistent-prewarm settings (app.py)
-    prewarm_persistent_models_csv: str = ""
-    prewarm_train_lora_rank: int = 16
-    prewarm_train_lr: float = 5e-5
-    prewarm_megatron_ready_timeout_s: float = 3600.0
-    prewarm_enable_training: bool = True
-    prewarm_enable_inference: bool = True
-
     # Docs / internal paths
     doc_path: str | None = None  # MINT_DOC_PATH
     checkpoint_dir: str = "/tos-mindverse/mint_checkpoints"  # MINT_CHECKPOINT_DIR
@@ -534,7 +510,7 @@ class ServerConfig:
             environ, "MINT_INACTIVITY_TIMEOUT_S"
         )
         file_server = config_file.server if config_file is not None else None
-        internal_api_token = _env_nonempty(environ, "INTERNAL_API_TOKEN") or (
+        internal_api_token = _env_nonempty(environ, "MINT_INTERNAL_API_TOKEN") or (
             file_server.internal_api_token if file_server is not None else None
         )
         # Auth is disabled in dev unless a platform internal token is configured.
@@ -545,7 +521,6 @@ class ServerConfig:
         file_future = config_file.future if config_file is not None else None
         file_task_state_store = config_file.task_state_store if config_file is not None else None
         file_training = config_file.training if config_file is not None else None
-        file_prewarm = config_file.prewarm if config_file is not None else None
         file_docs = config_file.docs if config_file is not None else None
         file_internal = config_file.internal if config_file is not None else None
         deployment_env = _deployment_env_for_defaults(environ, auth_enabled=auth_enabled)
@@ -604,7 +579,7 @@ class ServerConfig:
             port=_pick_int("MINT_PORT", file_server.port if file_server is not None else None, 8000),
             api_key=api_key,
             internal_api_token=_pick_str(
-                "INTERNAL_API_TOKEN",
+                "MINT_INTERNAL_API_TOKEN",
                 file_server.internal_api_token if file_server is not None else None,
                 "",
             ),
@@ -613,11 +588,6 @@ class ServerConfig:
                 file_server.usage_backend if file_server is not None else None,
                 "postgres",
             ).lower(),
-            usage_log_dir=_pick_str(
-                "MINT_USAGE_LOG_DIR",
-                file_server.usage_log_dir if file_server is not None else None,
-                "/tmp/mint_usage",
-            ),
             usage_pg_dsn=(
                 _pick_str(
                     "MINT_USAGE_PG_DSN",
@@ -691,9 +661,6 @@ class ServerConfig:
                 "MINT_CHECKPOINT_INDEX_WRITE_TIMEOUT_MS",
                 file_server.checkpoint_index_write_timeout_ms if file_server is not None else None,
                 2000,
-            ),
-            skip_actor_cleanup=_pick_bool(
-                "MINT_SKIP_ACTOR_CLEANUP", file_server.skip_actor_cleanup if file_server is not None else None, False
             ),
             tensor_parallel_size=_pick_int("MINT_TP_SIZE", file_server.tensor_parallel_size if file_server is not None else None, 1),
             data_parallel_size=_pick_int("MINT_DP_SIZE", file_server.data_parallel_size if file_server is not None else None, 1),
@@ -881,37 +848,6 @@ class ServerConfig:
                 "MINT_ROUTER_REPLAY_MODE",
                 None,
                 "disabled",
-            ),
-            # Persistent prewarm settings
-            prewarm_persistent_models_csv=_pick_str(
-                "MINT_PERSISTENT_MODELS",
-                file_prewarm.persistent_models_csv if file_prewarm is not None else None,
-                "",
-            ),
-            prewarm_train_lora_rank=_pick_int(
-                "MINT_PERSISTENT_TRAIN_LORA_RANK",
-                file_prewarm.train_lora_rank if file_prewarm is not None else None,
-                16,
-            ),
-            prewarm_train_lr=_pick_float(
-                "MINT_PERSISTENT_TRAIN_LR",
-                file_prewarm.train_lr if file_prewarm is not None else None,
-                5e-5,
-            ),
-            prewarm_megatron_ready_timeout_s=_pick_float(
-                "MINT_PERSISTENT_MEGATRON_READY_TIMEOUT_S",
-                file_prewarm.megatron_ready_timeout_s if file_prewarm is not None else None,
-                3600.0,
-            ),
-            prewarm_enable_training=_pick_bool(
-                "MINT_PERSISTENT_PREWARM_TRAINING",
-                None,
-                True,
-            ),
-            prewarm_enable_inference=_pick_bool(
-                "MINT_PERSISTENT_PREWARM_INFERENCE",
-                None,
-                True,
             ),
             doc_path=_pick_str(
                 "MINT_DOC_PATH",

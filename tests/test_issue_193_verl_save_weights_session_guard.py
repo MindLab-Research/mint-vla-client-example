@@ -1549,7 +1549,7 @@ def test_issue_193_megatron_rebind_re_registers_model_actor_inventory(monkeypatc
         lambda _model: (1, 1, 1, 1, 1),
     )
     monkeypatch.setattr(
-        "mint_server.backend.model_registry.is_persistent_model",
+        "mint_server.backend.model_registry.is_topology_desired_model",
         lambda _model: False,
     )
     monkeypatch.setattr(
@@ -1613,7 +1613,7 @@ def test_issue_193_megatron_rebind_ready_death_maps_to_missing_worker(monkeypatc
         lambda _model: (1, 1, 1, 1, 1),
     )
     monkeypatch.setattr(
-        "mint_server.backend.model_registry.is_persistent_model",
+        "mint_server.backend.model_registry.is_topology_desired_model",
         lambda _model: False,
     )
     monkeypatch.setattr(

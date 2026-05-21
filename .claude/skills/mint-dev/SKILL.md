@@ -101,6 +101,21 @@ For `/internal/*` actor inventory, actor kill, scheduler diagnostics, deep
 health, and Ray diagnostics, read and use the `mint-ops` skill after this one.
 Public `/api/v1/healthz` is only a cheap API-worker health check.
 
+## Worker Node Lifecycle
+
+Dev GPU worker lifecycle is topology/Supervisor owned. Do not use historical
+Volcano CLI commands to list, submit, cancel, or inspect worker jobs.
+
+Use the `volcano-cluster` skill. The operator entrypoint on `mint-dev` is:
+
+```bash
+ssh mint-dev 'cd /share/mint/dev/mint-server && /share/mint/dev/runtime/host-venv/bin/python scripts/tools/volcano_sdk_jobs.py --region cn-beijing list --name-contains mint-dev-worker- --limit 200'
+ssh mint-dev 'cd /share/mint/dev/mint-server && /share/mint/dev/runtime/host-venv/bin/python scripts/tools/volcano_sdk_jobs.py --region cn-beijing submit-topology-node --config /share/mint/dev/runtime/topology.yaml --alias mint-worker-0'
+```
+
+Credential checks may report only source existence. Never print secret values,
+credential files, signed requests, or process environments.
+
 ## Hard Rules
 
 - Do not perform production operations from this skill.

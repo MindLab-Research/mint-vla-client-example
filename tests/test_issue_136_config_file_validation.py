@@ -259,7 +259,7 @@ def test_server_config_task_state_store_defaults_follow_auth_mode():
     assert dev.task_state_store_db_path == "/vePFS-Mindverse/share/mint/dev/data/task-state/task_state.sqlite3"
 
     prod = ServerConfig.from_sources(
-        environ={"INTERNAL_API_TOKEN": "secret"},
+        environ={"MINT_INTERNAL_API_TOKEN": "secret"},
         config_path=None,
         config_file=None,
     )
@@ -295,30 +295,6 @@ def test_server_config_retrieve_future_env_overrides_file_independently(tmp_path
     assert cfg.task_pending_ttl_s == 101.0
     assert cfg.task_result_ttl_s == 201.0
     assert cfg.task_tombstone_ttl_s == 301.0
-
-
-def test_server_config_reads_usage_log_dir_from_env():
-    cfg = ServerConfig.from_sources(
-        environ={"MINT_USAGE_LOG_DIR": "/vePFS/shared/billing"},
-        config_path=None,
-        config_file=None,
-    )
-
-    assert cfg.usage_log_dir == "/vePFS/shared/billing"
-
-
-def test_server_config_reads_usage_log_dir_from_file(tmp_path):
-    p = tmp_path / "usage.toml"
-    p.write_text("[server]\nusage_log_dir = '/vePFS/shared/from-file'\n", encoding="utf-8")
-    file_cfg = load_mint_config_file(p)
-
-    cfg = ServerConfig.from_sources(
-        environ={},
-        config_path=str(p),
-        config_file=file_cfg,
-    )
-
-    assert cfg.usage_log_dir == "/vePFS/shared/from-file"
 
 
 def test_server_config_fails_fast_for_non_postgres_usage_backend():

@@ -63,6 +63,7 @@ dependencies = [
     "opentelemetry-exporter-otlp==1.40.0",
     "opentelemetry-instrumentation==0.61b0",
     "opentelemetry-instrumentation-logging==0.61b0",
+    "volcengine-python-sdk>=5.0.27",
     "anyio>=4.12.0",
 ]
 

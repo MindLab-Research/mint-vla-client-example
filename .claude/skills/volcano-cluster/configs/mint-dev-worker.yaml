@@ -2,10 +2,11 @@
 #
 # Before submitting:
 #   1. Ensure mint-dev-head is running and has written ray_head_ip.txt to PFS
-#   2. Replace <GPU_QUEUE_ID> below with the desired GPU queue id (confirm in Volcano console)
-#   3. Submit one 1-node task per worker for easier rescheduling
+#   2. Configure this file as a template in MINT_TOPOLOGY_CONFIG_PATH
+#   3. Let mint_model_actor_supervisor submit one 1-node task per mint-worker-{idx}
 #
-# Submit with: volc ml_task submit -c mint-dev-worker.yaml --output json
+# Node lifecycle is submitted through VolcanoTopologyProvider /
+# scripts/tools/volcano_sdk_jobs.py, not the Volcano CLI.
 
 TaskName: "mint-dev-worker"
 Description: "mint-dev-worker 8-gpu worker"

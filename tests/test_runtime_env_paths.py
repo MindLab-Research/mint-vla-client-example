@@ -1036,27 +1036,6 @@ def test_set_exact_pythonpath_removes_local_checkout_masking(monkeypatch):
     assert "/usr/lib/python3.12" in run_server.sys.path
 
 
-def test_actor_runtime_env_vars_forwards_control_plane_pin_envs(tmp_path):
-    env_root = tmp_path / "runtime"
-    _materialize_runtime_env(env_root)
-    payload = _load_actor_runtime_env_payload(
-        {
-            "PFS_RUNTIME_ENV_ROOT": str(env_root),
-            "MINT_CODE_ROOT": str(tmp_path / 'repo'),
-            "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
-            "RAY_ADDRESS": "ray://cfg-test",
-            "MINT_CONTROL_PLANE_PINNED_NODE_IP": "192.168.38.176",
-            "MINT_MODEL_WORK_SCHEDULER_PINNED_NODE_IP": "192.168.38.176",
-        },
-    )
-    data = payload["runtime_env"]
-    actor_env = payload["actor_env"]
-    assert data["MINT_CONFIG_ACTOR_HYDRATE"] == "1"
-    assert "MINT_CONTROL_PLANE_PINNED_NODE_IP" not in data
-    assert actor_env["MINT_CONTROL_PLANE_PINNED_NODE_IP"] == "192.168.38.176"
-    assert actor_env["MINT_MODEL_WORK_SCHEDULER_PINNED_NODE_IP"] == "192.168.38.176"
-
-
 def test_actor_runtime_env_vars_forwards_vllm_envs(tmp_path):
     env_root = tmp_path / "runtime"
     _materialize_runtime_env(env_root)
@@ -1077,6 +1056,7 @@ def test_actor_runtime_env_vars_forwards_vllm_envs(tmp_path):
             "MINT_VLLM_MAX_LORA_RANK": "16",
             "MINT_MODEL_PLACEMENT_JSON": '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"node_ip":"10.0.0.17","gpu_count":4}}',
             "MINT_MEGATRON_MODEL_PLACEMENT_JSON": '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"node_ip":"10.0.0.17","gpu_count":4}}',
+            "MINT_MODEL_ACTOR_REPLICA_ID": "replica-0",
         },
     )
     data = payload["runtime_env"]
@@ -1092,8 +1072,9 @@ def test_actor_runtime_env_vars_forwards_vllm_envs(tmp_path):
     assert actor_env["MINT_VLLM_MAX_LORAS"] == "4"
     assert actor_env["MINT_VLLM_MAX_CPU_LORAS"] == "8"
     assert actor_env["MINT_VLLM_MAX_LORA_RANK"] == "16"
-    assert actor_env["MINT_MODEL_PLACEMENT_JSON"] == '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"node_ip":"10.0.0.17","gpu_count":4}}'
-    assert actor_env["MINT_MEGATRON_MODEL_PLACEMENT_JSON"] == '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"node_ip":"10.0.0.17","gpu_count":4}}'
+    assert "MINT_MODEL_PLACEMENT_JSON" not in actor_env
+    assert "MINT_MEGATRON_MODEL_PLACEMENT_JSON" not in actor_env
+    assert "MINT_MODEL_ACTOR_REPLICA_ID" not in actor_env
 
 
 def test_actor_runtime_env_vars_forwards_config_path(tmp_path):
@@ -1122,7 +1103,6 @@ def test_actor_runtime_env_vars_forwards_config_path(tmp_path):
             "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
             "RAY_ADDRESS": "ray://cfg-test",
             "MINT_CONFIG_PATH": str(cfg),
-            "MINT_DETACHED_ACTOR_NODE_IP": "192.168.38.175",
             "MINT_MODEL_WORK_SCHEDULER_ACTOR_NAME": "issue440-model-work-scheduler",
             "MINT_TASK_STATE_STORE_ACTOR_NAME": "issue440-task-state-store",
         },
@@ -1132,7 +1112,6 @@ def test_actor_runtime_env_vars_forwards_config_path(tmp_path):
     assert data["RAY_ADDRESS"] == "ray://cfg-test"
     assert data["MINT_CONFIG_PATH"] == str(cfg)
     assert data["MINT_RAY_NAMESPACE"] == "cfg_ns"
-    assert actor_env["MINT_DETACHED_ACTOR_NODE_IP"] == "192.168.38.175"
     assert actor_env["MINT_MODEL_WORK_SCHEDULER_ACTOR_NAME"] == "issue440-model-work-scheduler"
     assert actor_env["MINT_TASK_STATE_STORE_ACTOR_NAME"] == "issue440-task-state-store"
 
@@ -1175,7 +1154,6 @@ def test_actor_runtime_env_vars_forwards_control_plane_actor_names(tmp_path):
             "MINT_RAY_NAMESPACE": "mint-test-ns",
             "MINT_RETRIEVE_FUTURE_HOT_TTL_S": "45",
             "MINT_MODEL_WORK_SCHEDULER_ACTOR_NAME": "mint-model-work-scheduler-test",
-            "MINT_MODEL_WORK_SCHEDULER_PINNED_NODE_IP": "192.168.39.110",
             "MINT_TASK_STATE_STORE_ACTOR_NAME": "mint-task-state-store-test",
             "MINT_MAINTENANCE_CRON_ACTOR_NAME": "mint-maintenance-cron-test",
         },
@@ -1186,7 +1164,6 @@ def test_actor_runtime_env_vars_forwards_control_plane_actor_names(tmp_path):
     assert data["MINT_RAY_NAMESPACE"] == "mint-test-ns"
     assert actor_env["MINT_RETRIEVE_FUTURE_HOT_TTL_S"] == "45"
     assert actor_env["MINT_MODEL_WORK_SCHEDULER_ACTOR_NAME"] == "mint-model-work-scheduler-test"
-    assert actor_env["MINT_MODEL_WORK_SCHEDULER_PINNED_NODE_IP"] == "192.168.39.110"
     assert actor_env["MINT_TASK_STATE_STORE_ACTOR_NAME"] == "mint-task-state-store-test"
     assert actor_env["MINT_MAINTENANCE_CRON_ACTOR_NAME"] == "mint-maintenance-cron-test"
 
@@ -1200,15 +1177,13 @@ def test_actor_runtime_env_vars_forwards_usage_envs(tmp_path):
             "MINT_CODE_ROOT": str(tmp_path / 'repo'),
             "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
             "RAY_ADDRESS": "ray://cfg-test",
-            "MINT_USAGE_LOG_DIR": "/vePFS/shared/usage",
             "MINT_USAGE_BACKEND": "postgres",
             "MINT_USAGE_PG_DSN": "postgresql://mint:test@db/usage",
         },
     )
     data = payload["runtime_env"]
     actor_env = payload["actor_env"]
-    assert "MINT_USAGE_LOG_DIR" not in data
-    assert actor_env["MINT_USAGE_LOG_DIR"] == "/vePFS/shared/usage"
+    assert "MINT_USAGE_BACKEND" not in data
     assert actor_env["MINT_USAGE_BACKEND"] == "postgres"
     assert actor_env["MINT_USAGE_PG_DSN"] == "postgresql://mint:test@db/usage"
 

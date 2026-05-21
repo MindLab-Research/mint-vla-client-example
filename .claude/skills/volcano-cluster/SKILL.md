@@ -5,7 +5,7 @@ description: |
 
   Use for: create cluster, tear down cluster, list tasks, cancel tasks, check Ray dashboard, GPU allocation, stale actor cleanup.
 
-  Triggers: "create cluster", "tear down", "list tasks", "cancel task", "Ray dashboard", "stale actor", "GPU", "volc"
+  Triggers: "create cluster", "tear down", "list tasks", "cancel tasks", "Ray dashboard", "stale actor", "GPU", "volcano", "volc"
 
   This skill covers generic Volcano/Ray operations. For environment-specific server operations, use mint-dev or mint-prod.
 
@@ -19,531 +19,213 @@ Procedure contract:
 - Do not sample sections opportunistically while already in motion.
 - If the procedure is missing something important, update the skill. Do not improvise around the gap.
 
+## Core Rule
+
+Mint node lifecycle is managed through the Volcano Engine Python SDK, not by shelling out to the Volcano CLI.
+
+Use one of these two paths:
+- Preferred service path: start `mint_model_actor_supervisor` with `MINT_TOPOLOGY_CONFIG_PATH`; it reconciles desired `mint-worker-{idx}` nodes through `VolcanoTopologyProvider`.
+- Operator path: run `scripts/tools/volcano_sdk_jobs.py` on the trusted driver/bastion host to list, submit, inspect, or stop Volcano jobs.
+
+Do not print AK/SK, session tokens, credential files, signed headers, or process environments. Credential checks may report only whether a credential source exists.
+
 ## Quick Reference
 
+Run SDK commands on the matching driver host with the canonical runtime Python:
+
 ```bash
-# Volcano CLI is pre-installed and configured on the SSH bastions:
-# - Dev:  ssh mint-dev
-# - Prod: ssh mint-prod-volcano
-#
-# Use the absolute path to avoid PATH mismatches:
-#   /root/.volc/bin/volc
-#
-# Note: /root/.volc/bin/volc prints a version banner before JSON output.
-# When parsing JSON, strip everything before the first '[' or '{'.
+cd /vePFS-Mindverse/share/mint/<env>/mint-server
+PY=/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python
 
-# Version (do NOT use "--version")
-/root/.volc/bin/volc version
+# List Mint worker jobs
+$PY scripts/tools/volcano_sdk_jobs.py --region cn-beijing list --name-contains mint-<env>-worker- --limit 200
 
-# List all tasks
-ssh mint-prod-volcano '/root/.volc/bin/volc ml_task list --output json'
+# Inspect job instances and node IPs
+$PY scripts/tools/volcano_sdk_jobs.py --region cn-beijing instances --job-id <job_id>
 
-# Cancel task
-ssh mint-prod-volcano '/root/.volc/bin/volc ml_task cancel --id <task_id>'
+# Submit one desired topology alias
+$PY scripts/tools/volcano_sdk_jobs.py --region cn-beijing submit-topology-node \
+  --config /vePFS-Mindverse/share/mint/<env>/runtime/topology.yaml \
+  --alias mint-worker-0
 
-# View task logs (find Ray IP here)
-ssh mint-prod-volcano '/root/.volc/bin/volc ml_task logs -t <task_id> -i worker_0'
-
-# Ray dashboard
-http://<RAY_HEAD_IP>:8265
+# Stop a job
+$PY scripts/tools/volcano_sdk_jobs.py --region cn-beijing stop --job-id <job_id>
 ```
 
-**IMPORTANT:** Use `--output json` to avoid interactive TUI mode.
-**IMPORTANT:** `volc ml_task list --output json` emits a banner before the JSON payload.
-**NOTE:** `volc ml_task cancel` does not support `--output json` on the current CLI version.
+`volcano_sdk_jobs.py` uses the SDK default credential chain and never prints credentials. If read calls hang or fail, first verify SSH connectivity and then verify that the driver host exposes a supported credential source.
 
----
+## Credential Model
 
-## 1. Instance Flavors
+Only the trusted driver/control-plane host should hold Volcano credentials. API workers, ConfigActor, model actors, metrics daemon actors, and Ray runtime actors must not receive provider credentials.
 
-| Flavor | GPUs | Memory | Use Case |
-|--------|------|--------|----------|
-| `ml.r3i.4xlarge` | 0 (CPU only) | - | Ray head node |
-| `ml.hpcpni2l.28xlarge` | 8x A800 80GB | 1960 GiB | GPU workers (RDMA) |
+Supported credential sources depend on the installed `volcengine-python-sdk` version. Prefer:
+- `VOLCENGINE_ACCESS_KEY` / `VOLCENGINE_SECRET_KEY`, with optional `VOLCENGINE_SESSION_TOKEN`
+- `VOLCENGINE_CLI_CONFIG_FILE`
+- `~/.volcengine/config.json`
+- OIDC or ECS role metadata when intentionally configured on the driver host
 
-**Worker scaling:** Adjust `RoleReplicas` in worker YAML. N replicas = 8N GPUs = 640N GB GPU memory.
+Older CLI locations such as `~/.volc/config`, `~/.volc/credentials`, `VOLC_ACCESSKEY`, or `VOLC_SECRETKEY` are not the target contract. Treat them as compatibility only after verifying the installed SDK reads them.
 
-## 1.1 Resource Queues
+Safe credential probe:
+
+```bash
+python3 - <<'PY'
+import os
+from pathlib import Path
+for p in (Path.home()/".volcengine/config.json", Path.home()/".volc/config", Path.home()/".volc/credentials"):
+    print(str(p), "exists", p.exists())
+for key in ("VOLCENGINE_ACCESS_KEY", "VOLCENGINE_SECRET_KEY", "VOLCENGINE_SESSION_TOKEN", "VOLCENGINE_CLI_CONFIG_FILE", "VOLCENGINE_PROFILE"):
+    print(key, "set", key in os.environ)
+PY
+```
+
+Do not dump credential file contents or process environments.
+
+## Instance Flavors And Queues
+
+| Flavor | GPUs | Use Case |
+|--------|------|----------|
+| `ml.r3i.4xlarge` | 0 | Ray head node |
+| `ml.hpcpni2l.28xlarge` | 8x A800 80GB | GPU workers |
 
 | Queue Name | Queue ID | Type | Use Case |
 |------------|----------|------|----------|
-| `cpu-mindverse` | `q-20251225183621-m2297` | CPU | Ray head node (CPU-only instances) |
-| `a800-mindverse-B` | `q-20260124095758-ngkg7` | GPU | Deprecated or unavailable. Confirm in Volcano console before use. |
-| `a800-mindverse-C1` | `q-20251126180002-26lwz` | GPU | Prod GPU workers (A800 instances, 128 GPUs total) |
-| `a800-mindverse-C2` | `q-20260203101340-www2h` | GPU | Prod C2 worker pool (K2 multinode vLLM) |
+| `cpu-mindverse` | `q-20251225183621-m2297` | CPU | Ray head node |
+| `a800-mindverse-C1` | `q-20251126180002-26lwz` | GPU | Default/prod A800 workers |
+| `a800-mindverse-C2` | `q-20260203101340-www2h` | GPU | Reserved specialist pool |
 
-**IMPORTANT:** CPU-only instances (ml.r3i.4xlarge) MUST use the CPU queue. GPU instances MUST use a GPU queue.
+CPU-only instances must use CPU queues. GPU instances must use GPU queues. Queue capacity still comes from the Volcano console; the SDK job list is an estimate of current demand, not an authoritative free-capacity API.
 
-## 1.2 Queue Availability (CLI)
+## Topology-Managed Workers
 
-`volc ml_task submit` supports selecting a queue via `--resource_queue_id` / `--resource_queue_name`, but this CLI does not appear to provide a "show free GPUs per queue" command (only task listing). Use the Volcano console for queue capacity (used/total) and treat the CLI as "tasks demand and state".
+Workers are named by alias:
+- Desired alias: `mint-worker-{idx}`
+- Provider job name: `mint-{deployment_env}-worker-{idx}`
+- Runtime debug state: `/vePFS-Mindverse/share/mint/<env>/runtime/topology_state.yaml`
 
-If you need a CLI-only estimate of current demand per queue, aggregate non-terminal tasks by `ResourceQueueId` and multiply `RoleReplicas` by GPUs-per-flavor:
+`topology_state.yaml` is output-only. On restart, the supervisor reads the static topology config and provider/Ray live state, then rewrites the state file. Do not edit `topology_state.yaml` as input.
 
-```bash
-ssh mint-prod-volcano '/root/.volc/bin/volc ml_task list --output json --limit 200' | python3 - <<'PY'
-import json, re, sys
-s=sys.stdin.read()
-m=re.search(r'[\[{]', s)
-if not m:
-    raise SystemExit("no JSON in volc output")
-j=json.loads(s[m.start():])
+Minimal topology shape:
 
-flavor_gpus = {
-    "ml.hpcpni2l.28xlarge": 8,
-    "ml.hpcpni2l.14xlarge": 4,
-    "ml.hpcpni2l.7xlarge": 2,
-    "ml.r3i.4xlarge": 0,
-}
-
-def task_gpus(t):
-    g = 0
-    for spec in t.get("TaskRoleSpecs") or []:
-        reps = spec.get("RoleReplicas") or 0
-        flavor = spec.get("ResourceSpecId") or (spec.get("ResourceSpec") or {}).get("FlavorID")
-        g += reps * flavor_gpus.get(flavor, 0)
-    return g
-
-by_queue = {}
-for t in j:
-    q = t.get("ResourceQueueId") or ""
-    st = t.get("Status") or ""
-    if st not in ("Queue", "Staging", "Running", "Killing", "Initialized"):
-        continue
-    by_queue.setdefault(q, {"Running": 0, "Queue": 0, "Other": 0})
-    g = task_gpus(t)
-    if st == "Running":
-        by_queue[q]["Running"] += g
-    elif st == "Queue":
-        by_queue[q]["Queue"] += g
-    else:
-        by_queue[q]["Other"] += g
-
-for q, v in sorted(by_queue.items(), key=lambda kv: (-(kv[1]["Running"]+kv[1]["Queue"]), kv[0])):
-    print(q, "running_gpus", v["Running"], "queued_gpus", v["Queue"], "other_gpus", v["Other"])
-PY
+```yaml
+version: 1
+deployment_env: dev
+cluster_id: volcano
+state_path: /vePFS-Mindverse/share/mint/dev/runtime/topology_state.yaml
+ray:
+  head_ip_path: /vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt
+providers:
+  volcano:
+    region: cn-beijing
+    credentials:
+      mode: default_chain
+    templates:
+      a800-8gpu-c1:
+        template_path: /vePFS-Mindverse/share/mint/dev/mint-server/.claude/skills/volcano-cluster/configs/mint-dev-worker.yaml
+        resource_queue_id: q-20251126180002-26lwz
+        gpu_count: 8
+nodes:
+  desired:
+    - alias: mint-worker-0
+      provider: volcano
+      template: a800-8gpu-c1
+      role: gpu
+      enabled: true
 ```
 
-### Prod C1/C2 placement policy
+The supervisor submits workers in ascending alias order. If `mint-worker-0` is missing, `mint-worker-1` waits and `topology_state.yaml` explains the missing lower alias. If a live provider job and alive Ray node already satisfy an alias, the supervisor reuses it instead of submitting another job.
 
-When operating on prod (`mint-prod-volcano`), enforce:
+## Head Nodes
 
-- K2 Megatron (`moonshotai/Kimi-K2-Instruct`) to C1 (`q-20251126180002-26lwz`)
-- K2 vLLM to C2 (`q-20260203101340-www2h`)
-- all other actors/workloads to C1
+Head-node lifecycle is still environment-owned bootstrap. Worker lifecycle is topology/SDK-owned.
 
-Use the placement verification SOP in `.claude/skills/mint-prod/SKILL.md`:
+Head templates:
+- `.claude/skills/volcano-cluster/configs/mint-dev-head.yaml`
+- `.claude/skills/volcano-cluster/configs/mint-prod-head.yaml`
 
-- actor inventory query (`/internal/actors`)
-- queue-to-node-IP query (`list_node_ips_for_resource_queue`)
-- per-run `MegatronRankWorker ip=...` window check against C1/C2 IP sets
+Head nodes publish their IP to:
+- Dev: `/vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt`
+- Prod: `/vePFS-Mindverse/share/mint/prod/ray/head-address/ray_head_ip.txt`
 
----
+Workers read the head IP from that PFS file. Do not patch head IPs into worker templates.
 
-## 2. Network Access
+## Ray Driver Rules
 
-| Component | Internet | Proxy |
-|-----------|----------|-------|
-| SSH server | Via proxy | `localhost:1081` (HTTP), `localhost:1080` (SOCKS5) |
-| Ray workers | None | N/A |
+- Do not run `ray start` on `mint-dev`.
+- Do not start a schedulable Ray node on API/bastion hosts.
+- On dev API hosts, attach Python through Ray client: `ray://<RAY_HEAD_IP>:10001`.
+- For CLI-style status checks, use the canonical Ray wrapper and connect to the head address.
 
-Workers must use packages pre-installed in image or via PFS PYTHONPATH.
-
----
-
-## 3. PFS Directory Structure
-
-| Path | Purpose |
-|------|---------|
-| `/vePFS-Mindverse/share/mint/dev/mint-server/` | Dev server git checkout |
-| `/vePFS-Mindverse/share/mint/prod/mint-server/` | Prod server git checkout |
-| `/vePFS-Mindverse/share/mint/dev/runtime/` | Dev runtime symlink |
-| `/vePFS-Mindverse/share/mint/prod/runtime/` | Prod runtime symlink |
-| `/vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt` | Dev Ray head pointer |
-| `/vePFS-Mindverse/share/mint/prod/ray/head-address/ray_head_ip.txt` | Prod Ray head pointer |
-| `/vePFS-Mindverse/share/huggingface/` | HuggingFace cache (models, tokenizers) |
-| `/vePFS-Mindverse/share/models/` | Model checkpoints |
-| `/vePFS-Mindverse/share/dataset/` | Training datasets |
-
----
-
-## 4. Create Cluster
-
-## 4.0 Pre-flight: identify current usage (dev vs prod)
-
-Always measure what is already running before submitting or canceling tasks.
-
-### List Volcano jobs (from prod bastion)
+Example:
 
 ```bash
-ssh mint-prod-volcano '/root/.volc/bin/volc ml_task list --output json --limit 200' | python3 - <<'PY'
-import json, re, sys
-s=sys.stdin.read()
-m=re.search(r'[\[{]', s)
-if not m:
-    raise SystemExit("no JSON in volc output")
-j=json.loads(s[m.start():])
-for job in j:
-    name=job.get("JobName","")
-    jid=job.get("JobId","")
-    status=job.get("Status","")
-    start=job.get("Start","")
-    rq=job.get("ResourceQueueId","")
-    specs=job.get("TaskRoleSpecs") or []
-    reps=[]
-    flavors=[]
-    for spec in specs:
-        reps.append(str(spec.get("RoleReplicas")))
-        flavors.append(str(spec.get("ResourceSpecId")))
-    print(f"{status}\t{name}\t{jid}\t{start}\t{rq}\treps={','.join(reps)}\tflavors={','.join(flavors)}")
-PY
-```
-
-Conventions used by these configs:
-- Prod head: `mint-prod-head`
-- Prod workers: `mint-prod-worker*`
-- Dev head: `mint-dev-head`
-- Dev workers: `mint-dev-worker*`
-
-### List Ray GPU nodes (no Volcano CLI required)
-
-```bash
-ssh mint-prod-volcano python3 - <<'PY'
+PY=/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python
+$PY - <<'PY'
 import ray
-ray.init(address="auto")
-nodes=[n for n in ray.nodes() if n.get("Alive")]
-gpu_nodes=[n for n in nodes if (n.get("Resources") or {}).get("GPU",0)]
-print("prod_gpu_nodes", len(gpu_nodes), "gpu_total", ray.cluster_resources().get("GPU"), "gpu_avail", ray.available_resources().get("GPU"))
-PY
-
-ssh mint-dev python3 - <<'PY'
-import ray
-ray.init(address="auto")
-nodes=[n for n in ray.nodes() if n.get("Alive")]
-gpu_nodes=[n for n in nodes if (n.get("Resources") or {}).get("GPU",0)]
-print("dev_gpu_nodes", len(gpu_nodes), "gpu_total", ray.cluster_resources().get("GPU"), "gpu_avail", ray.available_resources().get("GPU"))
+ray.init(address="ray://<RAY_HEAD_IP>:10001")
+print(ray.cluster_resources())
+ray.shutdown()
 PY
 ```
 
-### Development Cluster
+## Stale Actor Cleanup
 
-1. **Submit head:**
-   ```bash
-   tmp=/tmp/mint-dev-head.yaml
-   cp .claude/skills/volcano-cluster/configs/mint-dev-head.yaml "$tmp"
-   ssh mint-dev 'cat > /tmp/mint-dev-head.yaml' < "$tmp"
-   ssh mint-dev 'export PATH=/root/.volc/bin:$PATH; /root/.volc/bin/volc ml_task submit -c /tmp/mint-dev-head.yaml --output json'
-   ```
-   Do not assume the shared PFS copy of the template is current. Submit the checked-in local template you are actually reviewing.
-
-2. **Get head IP from logs and confirm PFS publication:**
-   ```bash
-   ssh mint-dev '/root/.volc/bin/volc ml_task logs -t <head_task_id> -i worker_0 | grep \"Local node IP\"'
-   ssh mint-dev 'cat /vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt'
-   ```
-
-3. **Copy worker template and set only the GPU queue:**
-   ```bash
-   cp .claude/skills/volcano-cluster/configs/mint-dev-worker.yaml /tmp/mint-dev-worker.yaml
-   sed -i "s/<GPU_QUEUE_ID>/<queue_id>/g" /tmp/mint-dev-worker.yaml
-   ```
-   `mint-dev-worker.yaml` reads the head IP from `/vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt`, so do not patch the head IP into the worker template.
-   Choose a GPU queue that is currently available in the Volcano console. If only prod GPU queues are available, get user approval before submitting dev workers.
-
-4. **Submit one worker task per node:**
-   ```bash
-   for i in 1 2 3 4 5 6; do
-     ssh mint-dev "/root/.volc/bin/volc ml_task submit -c /tmp/mint-dev-worker.yaml --task_name mint_dev_worker${i} --output json"
-   done
-   ```
-
-5. **Do not run `ray start` on `mint-dev`:**
-   - `mint-dev` is a driver/API host. Starting a local raylet makes it schedulable and can steal actor placement.
-   - Dev uses Ray client mode, so the bastion does not need to join the cluster as a zero-resource driver node.
-   - Use `ray.init(address=...)` in Python or Ray CLI commands that connect to the head directly.
-
-   ```bash
-   ssh mint-dev "/vePFS-Mindverse/share/mint/dev/runtime/host-venv/bin/ray status --address='<RAY_HEAD_IP>:6379'"
-   ssh mint-dev "/vePFS-Mindverse/share/mint/dev/runtime/host-venv/bin/python - <<'PY'\nimport ray\nray.init(address='<RAY_HEAD_IP>:6379')\nprint(ray.cluster_resources())\nray.shutdown()\nPY"
-   ```
-
-### Production Cluster
-
-Prod head self-heals the Ray control plane, writes IP to PFS automatically, and keeps dashboard plus Ray client disabled. Workers read from PFS.
-
-1. **Submit head:**
-   ```bash
-   tmp=/tmp/mint-prod-head.yaml
-   cp .claude/skills/volcano-cluster/configs/mint-prod-head.yaml "$tmp"
-   ssh mint-prod-volcano 'cat > /tmp/mint-prod-head.yaml' < "$tmp"
-   ssh mint-prod-volcano '/root/.volc/bin/volc ml_task submit -c /tmp/mint-prod-head.yaml --output json'
-   ```
-
-2. **Wait for head to write IP to PFS:**
-   ```bash
-   # Check PFS file (head MUST write on startup)
-   ssh mint-prod-volcano 'ls -la /vePFS-Mindverse/share/mint/prod/ray/head-address/ray_head_ip.txt && cat /vePFS-Mindverse/share/mint/prod/ray/head-address/ray_head_ip.txt'
-   ```
-
-   If the file is missing but the Ray cluster is running, recover it from Ray and write it:
-
-   ```bash
-ssh mint-prod-volcano 'ip=$(python3 - <<\"PY\"
-import ray
-ray.init(address=\"auto\")
-nodes=[n for n in ray.nodes() if n.get(\"Alive\")]
-head=[n for n in nodes if (n.get(\"Resources\") or {}).get(\"node:__internal_head__\")]
-print(head[0][\"NodeManagerAddress\"] if head else \"\")
-PY
-); test -n \"$ip\" && echo \"$ip\" > /vePFS-Mindverse/share/mint/prod/ray/head-address/ray_head_ip.txt && cat /vePFS-Mindverse/share/mint/prod/ray/head-address/ray_head_ip.txt'
-   ```
-
-3. **Copy template, choose GPU queue, submit worker (reads head IP from PFS):**
-   ```bash
-   # Prefer a800-mindverse-C1 or a800-mindverse-C2 for prod workers.
-   cp .claude/skills/volcano-cluster/configs/mint-prod-worker.yaml /tmp/mint-prod-worker.yaml
-   sed -i "s/<GPU_QUEUE_ID>/q-20251126180002-26lwz/g" /tmp/mint-prod-worker.yaml
-   ssh mint-prod-volcano 'cat > /tmp/mint-prod-worker.yaml' < /tmp/mint-prod-worker.yaml
-   ssh mint-prod-volcano '/root/.volc/bin/volc ml_task submit -c /tmp/mint-prod-worker.yaml --output json'
-   ```
-
-4. **Production join is a bootstrap step, not a test step:**
-   - `mint-prod-volcano` may need the documented one-time local 0-GPU join before the production API server can start cleanly.
-   - Do not repeat `ray start` during normal tests or inspection once that join is already in place.
-   - For tests and connectivity checks, use `ray.init(address=...)` in Python or Ray CLI commands that connect to the head directly.
-
-   ```bash
-   ssh mint-prod-volcano "ray status --address='<RAY_HEAD_IP>:6379'"
-   ssh mint-prod-volcano "python3 - <<'PY'\nimport ray\nray.init(address='<RAY_HEAD_IP>:6379')\nprint(ray.cluster_resources())\nPY"
-   ```
-
----
-
-## 5. Tear Down Cluster
-
-### List Tasks
+Use API surfaces first. Do not restart Ray as a first response to actor placement issues.
 
 ```bash
-ssh mint-prod-volcano '/root/.volc/bin/volc ml_task list --output json --limit 200'
-```
-
-Look for task names containing your cluster identifier.
-
-### Cancel Tasks
-
-```bash
-# Cancel single task
-ssh mint-prod-volcano '/root/.volc/bin/volc ml_task cancel --id <task_id>'
-
-# Cancel multiple (run sequentially)
-ssh mint-prod-volcano '/root/.volc/bin/volc ml_task cancel --id <worker_task_id>'
-ssh mint-prod-volcano '/root/.volc/bin/volc ml_task cancel --id <head_task_id>'
-```
-
-**WARNING:** Production tasks include "prod" in names. Never cancel prod tasks for dev work.
-
-### If you accidentally started a local raylet on a driver/bastion
-
-This should not be needed in normal operation.
-
-```bash
-ssh mint-dev "ray stop || true"
-ssh mint-prod-volcano "ray stop || true"
-```
-
----
-
-## 6. Stale Actor Cleanup
-
-When actors become unresponsive (OOM, stuck, orphaned):
-
-### Check GPU and Actor Status
-
-```bash
-# Dev cluster
-ssh mint-dev 'python3 << "PYEOF"
-import os
-import ray
-ray.init(address="auto", ignore_reinit_error=True)
-r = ray.available_resources()
-t = ray.cluster_resources()
-gpu_avail = r.get("GPU", 0)
-gpu_total = t.get("GPU", 0)
-print(f"GPUs: {gpu_avail:.0f} / {gpu_total:.0f}")
-ns = os.environ.get("MINT_RAY_NAMESPACE") or "mint"
-actors = ray.util.list_named_actors(all_namespaces=True)
-for a in actors:
-    if a.get("namespace") != ns:
-        continue
-    name = a.get("name", "")
-    if (
-        name.startswith("mint_vllm_")
-        or name == "vllm_server"
-        or name.startswith("mint_megatron_")
-        or name.startswith("mint_dense_")
-    ):
-        print(f"{name}: ALIVE")
-PYEOF'
-
-# Prod cluster - use mint-prod-volcano instead of mint-dev
-```
-
-### Kill Actors
-
-```bash
-# Kill Megatron (dev)
-curl -X POST -H "Content-Type: application/json" \
-  -d '{"actor_type":"megatron"}' \
-  http://localhost:8000/internal/actors/kill
-
-# Kill Megatron (prod - admin only when auth is enabled)
-curl -X POST -H "X-API-Key: $MINT_API_KEY" -H "Content-Type: application/json" \
-  -d '{"actor_type":"megatron"}' \
-  http://localhost:18000/internal/actors/kill
-
-# Kill vLLM (dev)
-curl -X POST -H "Content-Type: application/json" \
-  -d '{"actor_type":"vllm"}' \
-  http://localhost:8000/internal/actors/kill
-
-# Kill vLLM (prod - admin only when auth is enabled)
-curl -X POST -H "X-API-Key: $MINT_API_KEY" -H "Content-Type: application/json" \
-  -d '{"actor_type":"vllm"}' \
-  http://localhost:18000/internal/actors/kill
-
-# Kill all tracked GPU actors (dev; admin only when auth is enabled)
-curl -X POST -H "Content-Type: application/json" \
-  -d '{"actor_type":"all"}' \
-  http://localhost:8000/internal/actors/kill
-
-# Check status
+# Dev
 curl -s "http://localhost:8000/internal/actors?type=megatron" | jq
-curl -s "http://localhost:8000/internal/actors?type=vllm" | jq
+curl -s -X POST -H "Content-Type: application/json" -d '{"actor_type":"megatron"}' http://localhost:8000/internal/actors/kill
+
+# Prod
+curl -s -H "X-API-Key: $MINT_API_KEY" "http://localhost:18000/internal/actors?type=megatron" | jq
+curl -s -X POST -H "X-API-Key: $MINT_API_KEY" -H "Content-Type: application/json" \
+  -d '{"actor_type":"megatron"}' http://localhost:18000/internal/actors/kill
 ```
 
-### Actor Names Reference
+Actor naming reference:
 
-| Actor | Name Pattern | Namespace |
-|-------|--------------|-----------|
-| Megatron | `mint_megatron_{model_slug}` (example: `mint_megatron_kimi_k2_thinking`) | `MINT_RAY_NAMESPACE` |
-| vLLM per-model | `mint_vllm_{model_slug}` (example: `mint_vllm_kimi-k2-thinking`) | `MINT_RAY_NAMESPACE` |
-| vLLM persistent singleton | `vllm_server` | `MINT_RAY_NAMESPACE` |
-| Dense trainer pool | `mint_dense_{model_slug}` | `MINT_RAY_NAMESPACE` |
-| Stores/schedulers | `mint_task_state_store`, `mint_model_work_scheduler`, `mint_model_runtime_*`, `mint_maintenance_cron`, `mint_training_session_store`, `mint_gateway_session_store` | `MINT_RAY_NAMESPACE` |
+| Actor | Name Pattern |
+|-------|--------------|
+| Supervisor | `mint_model_actor_supervisor` |
+| Config | `mint_config` |
+| Task state | `mint_task_state_store` |
+| Scheduler | `mint_model_work_scheduler` |
+| Maintenance cron | `mint_maintenance_cron` |
+| Megatron | `mint_megatron_{model_slug}` |
+| vLLM per model | `mint_vllm_{model_slug}` |
+| Dense trainer | `mint_dense_{model_slug}` |
+| Runtime session | `mint_model_runtime_*` |
+| Node metrics daemon | `mint_node_metrics_{worker_alias}` |
 
-Model name normalization differs by subsystem:
-- Megatron: last component, lowercase, replace `-` and `.` with `_`.
-- vLLM: last component, lowercase, replace spaces with `_` (hyphens/dots preserved).
+`vllm_server` is not a valid default actor for new topology-managed model runtime.
 
-### Nuclear Option
+## Monitoring
 
-If actors cannot be killed via API:
+Ray dashboard:
 
-1. Cancel all worker tasks
-2. Cancel head task
-3. Redeploy cluster
-
----
-
-## 7. Monitoring
-
-### Ray Dashboard
-
-```
+```text
 http://<RAY_HEAD_IP>:8265
 ```
 
-Shows: actors, tasks, resources, logs, errors.
-
-### Task Logs
+Worker IPs:
 
 ```bash
-ssh mint-prod-volcano '/root/.volc/bin/volc ml_task logs -t <task_id> -i worker_0'
+PY=/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python
+$PY scripts/tools/volcano_sdk_jobs.py --region cn-beijing instances --job-id <job_id>
+cat /vePFS-Mindverse/share/mint/<env>/runtime/topology_state.yaml
 ```
-
-### Finding Ray Head IP
-
-**Dev cluster:**
-```bash
-volc ml_task logs -t <head_task_id> -i worker_0 | grep "Local node IP"
-```
-
-**Prod cluster:**
-```bash
-# From logs
-volc ml_task logs -t <head_task_id> -i worker_0 | grep "MINT Production Ray head IP"
-
-# From PFS (MUST if present)
-cat /vePFS-Mindverse/share/mint/prod/ray/head-address/ray_head_ip.txt
-```
-
----
-
-## 8. Runtime Upgrades
-
-Workers use the image plus the runtime roots under `/vePFS-Mindverse/share/mint`.
-Do not install ad hoc packages into live worker paths. Rebuild or copy a runtime
-root with `scripts/build_runtime_env.py`, promote the environment symlink, and
-restart the affected Ray workers or actors.
-
----
-
-## 9. Common YAML Parameters
-
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `ActiveDeadlineSeconds` | Max runtime (0 = unlimited) | 0 |
-| `DelayExitTimeSeconds` | Keep instance alive after completion | 0 |
-| `ResourceQueueID` | CPU queue for heads, GPU queue for workers | See configs |
-| `RoleReplicas` | Number of instances (workers: N = 8N GPUs) | 1 |
-
----
 
 ## Troubleshooting
 
-### Queued even though the queue has free GPUs
-
-Sometimes a large worker submit stays in `Queue` even when the resource queue has enough free GPUs (as shown in the Volcano console). In that case, split one big task into multiple smaller tasks (fewer `RoleReplicas` per task). Example: if `RoleReplicas: 10` is queued, try `4 + 4 + 2`.
-
-This reduces scheduler coupling: each task is an independent allocation request, so partial capacity can be used immediately instead of waiting for one big request to fit.
-
-**Prod example (split 10 replicas into 4+4+2):**
-```bash
-ssh mint-prod-volcano 'set -euo pipefail
-base=/vePFS-Mindverse/share/mint/prod/mint-server/.claude/skills/volcano-cluster/configs/mint-prod-worker.yaml
-queue_id=q-20251126180002-26lwz  # a800-mindverse-C1 (set explicitly)
-
-tmp4a=/tmp/mint-prod-worker-scale4a-$(date +%Y%m%d%H%M%S).yaml
-cp "$base" "$tmp4a"
-sed -i "s/^TaskName: \\\"mint-prod-worker\\\"/TaskName: \\\"mint-prod-worker-scale4a\\\"/" "$tmp4a"
-sed -i "s/^\\s*RoleReplicas: 1/      RoleReplicas: 4/" "$tmp4a"
-sed -i "s/<GPU_QUEUE_ID>/$queue_id/g" "$tmp4a"
-/root/.volc/bin/volc ml_task submit -c "$tmp4a" --output json
-
-tmp4b=/tmp/mint-prod-worker-scale4b-$(date +%Y%m%d%H%M%S).yaml
-cp "$base" "$tmp4b"
-sed -i "s/^TaskName: \\\"mint-prod-worker\\\"/TaskName: \\\"mint-prod-worker-scale4b\\\"/" "$tmp4b"
-sed -i "s/^\\s*RoleReplicas: 1/      RoleReplicas: 4/" "$tmp4b"
-sed -i "s/<GPU_QUEUE_ID>/$queue_id/g" "$tmp4b"
-/root/.volc/bin/volc ml_task submit -c "$tmp4b" --output json
-
-tmp2=/tmp/mint-prod-worker-scale2-$(date +%Y%m%d%H%M%S).yaml
-cp "$base" "$tmp2"
-sed -i "s/^TaskName: \\\"mint-prod-worker\\\"/TaskName: \\\"mint-prod-worker-scale2\\\"/" "$tmp2"
-sed -i "s/^\\s*RoleReplicas: 1/      RoleReplicas: 2/" "$tmp2"
-sed -i "s/<GPU_QUEUE_ID>/$queue_id/g" "$tmp2"
-/root/.volc/bin/volc ml_task submit -c "$tmp2" --output json
-'
-```
-
-| Symptom | Fix |
-|---------|-----|
-| Task stuck in Queue | Check queue capacity. If capacity is sufficient but still queued, split into multiple tasks with smaller `RoleReplicas` (example: `4 + 4 + 2`) and unique `TaskName`s. |
-| Worker fails to join | Verify HEAD_IP correct, check network, same image version |
-| Out of memory | Reduce batch size, enable gradient checkpointing |
-| Stale actors | Kill via API or tear down cluster |
-
----
+| Symptom | Action |
+|---------|--------|
+| SDK read call times out | Verify SSH connectivity first, then credential source existence. Do not fall back to CLI lifecycle commands. |
+| Worker job exists but alias is not ready | Inspect `instances --job-id` and `topology_state.yaml`; confirm Ray node joined. |
+| Higher alias waits | Fix the lower missing alias first; creation is ordered by index. |
+| Task stuck in Queue | Check Volcano console capacity. If capacity is sufficient but the job remains queued, split desired nodes into one-job-per-node aliases. |
+| Worker fails to join Ray | Confirm head IP file, port reachability, image/runtime path, and PFS mounts. |
+| Stale actors block placement | Kill via Mint API or supervisor-owned actor cleanup before canceling provider jobs. |
 
 ## Config Files
 
@@ -552,4 +234,4 @@ sed -i "s/<GPU_QUEUE_ID>/$queue_id/g" "$tmp2"
 | Dev | `mint-dev-head.yaml` | `mint-dev-worker.yaml` |
 | Prod | `mint-prod-head.yaml` | `mint-prod-worker.yaml` |
 
-All configs in `.claude/skills/volcano-cluster/configs/`
+All configs live in `.claude/skills/volcano-cluster/configs/`.

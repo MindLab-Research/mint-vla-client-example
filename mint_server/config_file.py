@@ -18,7 +18,6 @@ class _ServerSection(BaseModel):
     port: int | None = None
 
     internal_api_token: str | None = None
-    usage_log_dir: str | None = None  # deprecated; billing writes directly to PostgreSQL
     usage_backend: str | None = None  # postgres, disabled, or noop
     usage_pg_dsn: str | None = None
     usage_pg_host: str | None = None
@@ -32,8 +31,6 @@ class _ServerSection(BaseModel):
     usage_pg_table: str | None = None
     checkpoint_index_pg_dsn: str | None = None
     checkpoint_index_write_timeout_ms: int | None = None
-    skip_actor_cleanup: bool | None = None
-
     tensor_parallel_size: int | None = None
     data_parallel_size: int | None = None
     gpu_memory_utilization: float | None = None
@@ -130,15 +127,6 @@ class _TrainingSection(BaseModel):
     remote_call_timeout_s: float | None = None
 
 
-class _PrewarmSection(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    persistent_models_csv: str | None = None
-    train_lora_rank: int | None = None
-    train_lr: float | None = None
-    megatron_ready_timeout_s: float | None = None
-
-
 class _DocsSection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -164,7 +152,6 @@ class MintConfigFile(BaseModel):
     future: _FutureSection = Field(default_factory=_FutureSection)
     task_state_store: _TaskStateStoreSection = Field(default_factory=_TaskStateStoreSection)
     training: _TrainingSection = Field(default_factory=_TrainingSection)
-    prewarm: _PrewarmSection = Field(default_factory=_PrewarmSection)
     docs: _DocsSection = Field(default_factory=_DocsSection)
     internal: _InternalSection = Field(default_factory=_InternalSection)
 

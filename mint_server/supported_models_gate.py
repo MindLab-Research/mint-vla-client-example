@@ -17,7 +17,7 @@ def _normalize_local_model_name(base_model: str) -> str | None:
 
 
 async def enforce_base_model_allowed(*, base_model: str, http_request: Request) -> str:
-    """Reject `base_model` based on MINT_SUPPORTED_MODELS + ALLOW_UNSUPPORTED_MODELS policy.
+    """Reject `base_model` based on MINT_SUPPORTED_MODELS + MINT_ALLOW_UNSUPPORTED_MODELS policy.
 
     Returns:
         Canonical local model name (for MODEL_CONFIGS-backed models), or the original
@@ -35,7 +35,7 @@ async def enforce_base_model_allowed(*, base_model: str, http_request: Request) 
                 status_code=400,
                 detail=(
                     f"Unsupported base_model: {local_name!r}. "
-                    "Not present in MINT_SUPPORTED_MODELS; set ALLOW_UNSUPPORTED_MODELS=1 to override."
+                    "Not present in MINT_SUPPORTED_MODELS; set MINT_ALLOW_UNSUPPORTED_MODELS=1 to override."
                 ),
             )
         return local_name
@@ -50,7 +50,7 @@ async def enforce_base_model_allowed(*, base_model: str, http_request: Request) 
                 status_code=400,
                 detail=(
                     f"Unsupported base_model: {base_model!r}. "
-                    "Not present in MINT_SUPPORTED_MODELS; set ALLOW_UNSUPPORTED_MODELS=1 to override."
+                    "Not present in MINT_SUPPORTED_MODELS; set MINT_ALLOW_UNSUPPORTED_MODELS=1 to override."
                 ),
             )
         caps = await get_upstream_capabilities(upstream=upstream, incoming_headers=dict(http_request.headers))

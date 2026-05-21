@@ -25,8 +25,8 @@ nohup bash scripts/wip/openpi_vla_start_server.sh mint_root_vla_pr422_20260404c 
 - Keep `MINT_UVICORN_WORKERS=1`.
 - Use a fresh Ray namespace for each cold-start validation.
 - Use a namespace-specific scheduler actor name via `MINT_MODEL_WORK_SCHEDULER_ACTOR_NAME`.
-- Pin the scheduler actor with `MINT_MODEL_WORK_SCHEDULER_PINNED_NODE_IP=192.168.38.176`.
-- Pin the detached control-plane actors with `MINT_CONTROL_PLANE_PINNED_NODE_IP=192.168.38.176`.
+- Keep control-plane actors in the Supervisor-managed topology; do not rely on
+  per-process pinned IP environment variables.
 - Set `MINT_OPENPI_FAST_WEIGHTS_PATH` to the shared params directory: `/vePFS-Mindverse/share/models/openpi/pi0_fast_base/params`.
 - Set `MINT_OPENPI_PI05_WEIGHTS_PATH` to the shared params directory: `/vePFS-Mindverse/share/models/openpi/pi05_base/params`.
 - Set `MINT_OPENPI_FAST_ASSETS_BASE_DIR` to a source assets tree that actually contains `assets/**/norm_stats.json`:
@@ -43,15 +43,15 @@ Fresh cold-starts were failing serially on detached control-plane actors because
 
 1. Many detached startup actors were hard-pinned to `node:__internal_head__`.
 2. Pinning the first actor only was insufficient.
-3. Nested detached actors created by other actors still fell back to head pinning because `MINT_CONTROL_PLANE_PINNED_NODE_IP` was not forwarded through `actor_runtime_env_vars()`.
+3. Nested detached actors created by other actors still fell back to head pinning
+   instead of using the topology/Supervisor placement plan.
 
 The deterministic fix is:
 
-- `preferred_control_plane_resources()` selects the explicit worker pin when `MINT_CONTROL_PLANE_PINNED_NODE_IP` is set.
-- `actor_runtime_env_vars()` now forwards:
-  - `MINT_CONTROL_PLANE_PINNED_NODE_IP`
-  - `MINT_MODEL_WORK_SCHEDULER_PINNED_NODE_IP`
-  - `MINT_STARTUP_LEASE_PINNED_NODE_IP`
+- Control-plane placement is expressed through topology/Supervisor metadata and
+  applied at actor creation time.
+- `actor_runtime_env_vars()` no longer exposes startup-lease or cleanup
+  placement toggles as deployment contract.
 
 That makes both top-level and nested detached actors inherit the same cold-start placement policy.
 

@@ -2380,7 +2380,7 @@ class VerlTrainingEngine:
             _make_megatron_actor_name,
             async_get_or_create_megatron_worker_group,
         )
-        from .model_registry import is_persistent_model
+        from .model_registry import is_topology_desired_model
         from .model_actor_inventory import ActorType
         from .model_actor_publication import BackendModelActorLaunch, publish_backend_model_actor
 
@@ -2436,7 +2436,7 @@ class VerlTrainingEngine:
             namespace=PERSISTENT_NAMESPACE,
             base_model=base_model or requested_model or "",
             session_id=session.model_id,
-            protected=is_persistent_model(base_model or requested_model or ""),
+            protected=is_topology_desired_model(base_model or requested_model or ""),
         ),
             refresh_observability=False,
         )

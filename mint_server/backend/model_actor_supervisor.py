@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import json
 import logging
 import os
 import re
@@ -47,7 +46,7 @@ from .supervisor_state_store import (
     SupervisorStateOwnerConflictError,
     create_supervisor_state_store,
 )
-from .topology import TopologyManager, is_ip_address
+from .topology import TopologyManager, is_ip_address, load_topology_config_from_env
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +63,7 @@ __all__ = [
     "actor_observability_metadata",
     "async_actor_observability_metadata",
     "default_model_actor_name",
-    "domain_key_for_internal_control",
+    "domain_key_for_internal_runtime",
     "domain_key_for_training_base_model",
     "domain_key_for_vllm_base_model",
     "get_model_actor_supervisor",
@@ -95,6 +94,19 @@ def _ray_namespace() -> str:
 def _node_metrics_enabled_by_default() -> bool:
     raw = str(os.environ.get("MINT_NODE_METRICS_DAEMON_ENABLED") or "").strip().lower()
     return raw not in {"0", "false", "no", "off"}
+
+
+def _reconcile_interval_s_from_env() -> float:
+    raw = str(os.environ.get("MINT_ACTOR_RECONCILE_INTERVAL_S") or "5").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "[model_actor_supervisor] invalid MINT_ACTOR_RECONCILE_INTERVAL_S=%r; using 5s",
+            raw,
+        )
+        return 5.0
+    return max(0.1, value)
 
 
 @dataclass(frozen=True)
@@ -152,6 +164,13 @@ NodeMetricsFactory = Callable[[NodeMetricsDaemonSpec], Any | Awaitable[Any]]
 SupervisorStateStore = SupervisorMemoryStateStore | SupervisorSQLiteStateStore
 
 
+@dataclass(frozen=True)
+class ControlPlaneDependency:
+    name: str
+    ensure: Callable[[], Awaitable[Any]]
+    ping: Callable[[], Awaitable[Any]]
+
+
 def domain_key_for_vllm_base_model(base_model: str) -> str:
     model = str(base_model).strip()
     if not model:
@@ -179,8 +198,8 @@ def domain_key_for_training_base_model(base_model: str) -> str:
     return f"training:{model}"
 
 
-def domain_key_for_internal_control() -> str:
-    return "internal:control"
+def domain_key_for_internal_runtime() -> str:
+    return "internal:runtime"
 
 
 def default_model_actor_name(domain_key: str, replica_id: str) -> str:
@@ -237,167 +256,169 @@ def _spec_from_obj(obj: Any) -> ModelActorSpec:
     )
 
 
-def _placement_spec_overlay(raw_json: str | None, model: str) -> dict[str, Any]:
-    raw = str(raw_json or "").strip()
-    if not raw:
-        return {}
-    payload = json.loads(raw)
-    if not isinstance(payload, dict):
-        raise ValueError("model placement JSON must be an object keyed by base model")
-    raw_entry = payload.get(model)
-    if raw_entry is None:
-        return {}
-    entries = raw_entry if isinstance(raw_entry, list) else [raw_entry]
-    if not entries:
-        raise ValueError(f"model placement entry for {model!r} must not be empty")
-    for entry in entries:
-        if not isinstance(entry, dict):
-            raise ValueError(f"model placement entry for {model!r} must be an object")
-        if "worker_index" in entry or "worker_idx" in entry:
-            raise ValueError(f"model placement entry for {model!r} uses worker_index; use node_ip")
-    first = entries[0]
-    out: dict[str, Any] = {}
-    if "replica_id" in first:
-        out["replica_id"] = first["replica_id"]
-    elif "replica" in first:
-        out["replica_id"] = _replica_id(first["replica"])
-    target_replica_id = str(out.get("replica_id") or "replica-0")
-    placement_slices: list[tuple[str, str, int]] = []
-    placement_alias_slices: list[tuple[str, str, int]] = []
-    for entry in entries:
-        entry_replica_id = _replica_id(entry.get("replica_id", entry.get("replica", 0)))
-        if entry_replica_id != target_replica_id:
+def _topology_model_specs_from_config_models(models: dict[str, Any]) -> list[ModelActorSpec]:
+    specs: list[ModelActorSpec] = []
+    for model, raw_cfg in sorted(models.items()):
+        if not isinstance(raw_cfg, dict):
             continue
-        raw_node_ip = entry.get("node_ip", entry.get("node_pin"))
-        node_ip = str(raw_node_ip).strip() if raw_node_ip is not None else ""
-        raw_worker_alias = entry.get("worker_alias", entry.get("worker"))
-        worker_alias = str(raw_worker_alias).strip() if raw_worker_alias is not None else ""
-        raw_gpu_count = entry.get("gpu_count")
-        if node_ip and raw_gpu_count is not None:
-            placement_slices.append((entry_replica_id, node_ip, int(raw_gpu_count)))
-        elif worker_alias and raw_gpu_count is not None:
-            if is_ip_address(worker_alias):
-                placement_slices.append((entry_replica_id, worker_alias, int(raw_gpu_count)))
-            else:
-                placement_alias_slices.append((entry_replica_id, worker_alias, int(raw_gpu_count)))
-    if placement_slices:
-        out["placement_slices"] = tuple(placement_slices)
-        out["node_pins"] = tuple(node_ip for _replica_id, node_ip, _gpu_count in placement_slices)
-        out["gpu_count"] = int(placement_slices[0][2])
-    elif placement_alias_slices:
-        out["placement_alias_slices"] = tuple(placement_alias_slices)
-        out["worker_aliases"] = tuple(alias for _replica_id, alias, _gpu_count in placement_alias_slices)
-        out["gpu_count"] = int(placement_alias_slices[0][2])
-    elif "node_ip" in first:
-        out["node_pin"] = str(first["node_ip"])
-    elif "node_pin" in first:
-        out["node_pin"] = str(first["node_pin"])
-    elif "worker_alias" in first or "worker" in first:
-        worker_alias = str(first.get("worker_alias", first.get("worker"))).strip()
-        if is_ip_address(worker_alias):
-            out["node_pin"] = worker_alias
-        else:
-            out["worker_alias"] = worker_alias
-    if "node_pins" in first:
-        raw_pins = first["node_pins"]
-        if isinstance(raw_pins, str):
-            out["node_pins"] = tuple(pin.strip() for pin in raw_pins.split(",") if pin.strip())
-        else:
-            out["node_pins"] = tuple(str(pin) for pin in raw_pins if str(pin).strip())
-    if "worker_aliases" in first:
-        raw_aliases = first["worker_aliases"]
-        if isinstance(raw_aliases, str):
-            out["worker_aliases"] = tuple(alias.strip() for alias in raw_aliases.split(",") if alias.strip())
-        else:
-            out["worker_aliases"] = tuple(str(alias) for alias in raw_aliases if str(alias).strip())
-    if "gpu_count" in first and "gpu_count" not in out:
-        out["gpu_count"] = int(first["gpu_count"])
-    return out
+        base_model = str(model).strip()
+        if not base_model:
+            continue
+        for launcher_key, domain_key in (
+            ("vllm", domain_key_for_vllm_base_model(base_model)),
+            ("training", domain_key_for_training_base_model(base_model)),
+            ("megatron", domain_key_for_training_base_model(base_model)),
+        ):
+            raw_launcher_cfg = raw_cfg.get(launcher_key)
+            if raw_launcher_cfg is None:
+                continue
+            launcher_cfg = raw_launcher_cfg if isinstance(raw_launcher_cfg, dict) else {}
+            if launcher_key == "megatron" and not domain_key.startswith("megatron:"):
+                continue
+            placement_items = launcher_cfg.get("placement") or []
+            if isinstance(placement_items, dict):
+                placement_items = [placement_items]
+            if placement_items and not isinstance(placement_items, list):
+                raise ValueError(f"topology model placement for {base_model!r}/{launcher_key} must be a list")
+            default_replica_id = _replica_id(launcher_cfg.get("replica_id", launcher_cfg.get("replica", 0)))
+            default_gpu_count = launcher_cfg.get("gpu_count")
+            by_replica: dict[str, dict[str, Any]] = {}
+            for item in placement_items:
+                if not isinstance(item, dict):
+                    raise ValueError(f"topology model placement item for {base_model!r}/{launcher_key} must be an object")
+                item_replica = _replica_id(item.get("replica_id", item.get("replica", default_replica_id)))
+                bucket = by_replica.setdefault(
+                    item_replica,
+                    {
+                        "node_pins": [],
+                        "worker_aliases": [],
+                        "placement_slices": [],
+                        "placement_alias_slices": [],
+                        "gpu_count": default_gpu_count,
+                    },
+                )
+                item_gpu_count = item.get("gpu_count", bucket.get("gpu_count"))
+                raw_worker = item.get("worker_alias", item.get("worker"))
+                raw_node_ip = item.get("node_ip", item.get("node_pin"))
+                has_node_ip = raw_node_ip is not None and bool(str(raw_node_ip).strip())
+                has_worker = raw_worker is not None and bool(str(raw_worker).strip())
+                if not has_node_ip and not has_worker:
+                    raise ValueError(
+                        f"topology model placement item for {base_model!r}/{launcher_key} "
+                        "must include worker/worker_alias or node_ip/node_pin"
+                    )
+                if item_gpu_count is None:
+                    raise ValueError(
+                        f"topology model placement item for {base_model!r}/{launcher_key} must include gpu_count"
+                    )
+                item_gpu_count_int = int(item_gpu_count)
+                if item_gpu_count is not None:
+                    bucket["gpu_count"] = item_gpu_count_int
+                if raw_node_ip is not None:
+                    node_ip = str(raw_node_ip).strip()
+                    if node_ip:
+                        bucket["node_pins"].append(node_ip)
+                        bucket["placement_slices"].append((item_replica, node_ip, item_gpu_count_int))
+                    continue
+                if raw_worker is not None:
+                    worker = str(raw_worker).strip()
+                    if not worker:
+                        continue
+                    if is_ip_address(worker):
+                        bucket["node_pins"].append(worker)
+                        bucket["placement_slices"].append((item_replica, worker, item_gpu_count_int))
+                    else:
+                        bucket["worker_aliases"].append(worker)
+                        bucket["placement_alias_slices"].append((item_replica, worker, item_gpu_count_int))
+            if not by_replica:
+                by_replica[default_replica_id] = {
+                    "node_pins": [],
+                    "worker_aliases": [],
+                    "placement_slices": [],
+                    "placement_alias_slices": [],
+                    "gpu_count": default_gpu_count,
+                }
+            spec_launcher = "training" if launcher_key == "megatron" else launcher_key
+            for replica_id, bucket in sorted(by_replica.items()):
+                gpu_count = bucket.get("gpu_count")
+                specs.append(
+                    ModelActorSpec(
+                        domain_key=domain_key,
+                        replica_id=replica_id,
+                        base_model=base_model,
+                        launcher_key=spec_launcher,
+                        node_pins=tuple(dict.fromkeys(bucket["node_pins"])),
+                        placement_slices=tuple(bucket["placement_slices"]),
+                        worker_aliases=tuple(dict.fromkeys(bucket["worker_aliases"])),
+                        placement_alias_slices=tuple(bucket["placement_alias_slices"]),
+                        gpu_count=None if gpu_count is None else int(gpu_count),
+                        enabled=bool(launcher_cfg.get("enabled", True)),
+                    )
+                )
+    return specs
 
 
-def _persistent_model_spec(
-    *,
-    model: str,
-    domain_key: str,
-    launcher_key: str,
-    placement_raw: str | None,
-) -> ModelActorSpec:
-    overlay = _placement_spec_overlay(placement_raw, model)
-    return ModelActorSpec(
-        domain_key=domain_key,
-        replica_id=str(overlay.get("replica_id") or "replica-0"),
-        base_model=model,
-        launcher_key=launcher_key,
-        node_pin=overlay.get("node_pin"),
-        node_pins=tuple(overlay.get("node_pins") or ()),
-        placement_slices=tuple(overlay.get("placement_slices") or ()),
-        worker_alias=overlay.get("worker_alias"),
-        worker_aliases=tuple(overlay.get("worker_aliases") or ()),
-        placement_alias_slices=tuple(overlay.get("placement_alias_slices") or ()),
-        gpu_count=overlay.get("gpu_count"),
-    )
+def _topology_model_specs_from_env() -> list[ModelActorSpec]:
+    config = load_topology_config_from_env()
+    if config is None:
+        return []
+    return _topology_model_specs_from_config_models(config.models)
 
 
 def _supported_model_specs_from_env() -> dict[str, ModelActorSpec]:
-    supported = os.environ.get("MINT_SUPPORTED_MODELS", "").strip()
-    if not supported:
-        return {}
+    specs = _topology_model_specs_from_env()
+    if not specs:
+        supported = os.environ.get("MINT_SUPPORTED_MODELS", "").strip()
+        if not supported:
+            return {}
 
-    specs: dict[str, ModelActorSpec] = {}
-    shared_placement_raw = os.environ.get("MINT_MODEL_PLACEMENT_JSON", "").strip()
-    vllm_placement_raw = os.environ.get("MINT_VLLM_MODEL_PLACEMENT_JSON", "").strip() or shared_placement_raw
-    training_placement_raw = os.environ.get("MINT_DENSE_MODEL_PLACEMENT_JSON", "").strip() or shared_placement_raw
-    megatron_placement_raw = os.environ.get("MINT_MEGATRON_MODEL_PLACEMENT_JSON", "").strip() or shared_placement_raw
-    for model in (item.strip() for item in supported.split(",")):
-        if not model:
-            continue
-        vllm_spec = _persistent_model_spec(
-            model=model,
-            domain_key=domain_key_for_vllm_base_model(model),
-            launcher_key="vllm",
-            placement_raw=vllm_placement_raw,
-        )
-        training_domain = domain_key_for_training_base_model(model)
-        training_spec = _persistent_model_spec(
-            model=model,
-            domain_key=training_domain,
-            launcher_key="training",
-            placement_raw=megatron_placement_raw if training_domain.startswith("megatron:") else training_placement_raw,
-        )
-        specs[vllm_spec.domain_key] = vllm_spec
-        specs[training_spec.domain_key] = training_spec
-    return specs
+        specs = []
+        for model in (item.strip() for item in supported.split(",")):
+            if not model:
+                continue
+            specs.append(
+                ModelActorSpec(
+                    domain_key=domain_key_for_vllm_base_model(model),
+                    base_model=model,
+                    launcher_key="vllm",
+                )
+            )
+            specs.append(
+                ModelActorSpec(
+                    domain_key=domain_key_for_training_base_model(model),
+                    base_model=model,
+                    launcher_key="training",
+                )
+            )
+    return {spec.domain_key: spec for spec in specs}
 
 
 def _spec_for_scheduler_domain_from_env(domain_key: str) -> ModelActorSpec | None:
     domain = str(domain_key).strip()
-    if not domain or domain == domain_key_for_internal_control():
+    if not domain or domain == domain_key_for_internal_runtime():
         return None
 
     supported = _supported_model_specs_from_env()
     if domain in supported:
         return supported[domain]
 
-    shared_placement_raw = os.environ.get("MINT_MODEL_PLACEMENT_JSON", "").strip()
     if domain.startswith("vllm:"):
         base_model = domain.removeprefix("vllm:").strip()
         if not base_model:
             return None
-        return _persistent_model_spec(
-            model=base_model,
+        return ModelActorSpec(
             domain_key=domain,
+            base_model=base_model,
             launcher_key="vllm",
-            placement_raw=os.environ.get("MINT_VLLM_MODEL_PLACEMENT_JSON", "").strip() or shared_placement_raw,
         )
     if domain.startswith("training:"):
         base_model = domain.removeprefix("training:").strip()
         if not base_model:
             return None
-        return _persistent_model_spec(
-            model=base_model,
+        return ModelActorSpec(
             domain_key=domain,
+            base_model=base_model,
             launcher_key="training",
-            placement_raw=os.environ.get("MINT_DENSE_MODEL_PLACEMENT_JSON", "").strip() or shared_placement_raw,
         )
     if domain.startswith("megatron:"):
         for spec in supported.values():
@@ -437,62 +458,76 @@ def _active_scheduler_domains(stats: dict[str, Any]) -> set[str]:
 
 
 def desired_specs_from_env() -> list[ModelActorSpec]:
-    def _with_internal_control(specs: list[ModelActorSpec]) -> list[ModelActorSpec]:
-        enabled = str(os.environ.get("MINT_MODEL_ACTOR_INTERNAL_CONTROL", "1")).strip().lower()
+    def _with_internal_runtime(specs: list[ModelActorSpec]) -> list[ModelActorSpec]:
+        enabled = str(os.environ.get("MINT_MODEL_ACTOR_INTERNAL_RUNTIME", "1")).strip().lower()
         if enabled in ("0", "false", "no", "n", "off"):
             return specs
-        domain_key = domain_key_for_internal_control()
+        domain_key = domain_key_for_internal_runtime()
         if any(spec.domain_key == domain_key for spec in specs):
             return specs
         return [
             *specs,
             ModelActorSpec(
                 domain_key=domain_key,
-                launcher_key="internal_control",
+                launcher_key="cpu_runtime",
                 gpu_count=0,
             ),
         ]
 
-    raw = os.environ.get("MINT_MODEL_ACTOR_DESIRED_JSON", "").strip()
-    if raw:
-        payload = json.loads(raw)
-        if isinstance(payload, dict):
-            items = payload.get("models") or payload.get("actors") or payload.get("items")
-        else:
-            items = payload
-        if not isinstance(items, list):
-            raise ValueError("MINT_MODEL_ACTOR_DESIRED_JSON must be a list or contain models/actors/items")
-        return _with_internal_control([_spec_from_obj(item) for item in items])
+    specs = _topology_model_specs_from_env()
+    if not specs:
+        return _with_internal_runtime([])
+    return _with_internal_runtime(specs)
 
-    persistent = os.environ.get("MINT_PERSISTENT_MODELS", "").strip()
-    if not persistent:
-        return _with_internal_control([])
-    specs: list[ModelActorSpec] = []
-    shared_placement_raw = os.environ.get("MINT_MODEL_PLACEMENT_JSON", "").strip()
-    vllm_placement_raw = os.environ.get("MINT_VLLM_MODEL_PLACEMENT_JSON", "").strip() or shared_placement_raw
-    training_placement_raw = os.environ.get("MINT_DENSE_MODEL_PLACEMENT_JSON", "").strip() or shared_placement_raw
-    megatron_placement_raw = os.environ.get("MINT_MEGATRON_MODEL_PLACEMENT_JSON", "").strip() or shared_placement_raw
-    for model in (item.strip() for item in persistent.split(",")):
-        if not model:
-            continue
-        training_domain = domain_key_for_training_base_model(model)
-        specs.append(
-            _persistent_model_spec(
-                model=model,
-                domain_key=domain_key_for_vllm_base_model(model),
-                launcher_key="vllm",
-                placement_raw=vllm_placement_raw,
-            )
-        )
-        specs.append(
-            _persistent_model_spec(
-                model=model,
-                domain_key=training_domain,
-                launcher_key="training",
-                placement_raw=megatron_placement_raw if training_domain.startswith("megatron:") else training_placement_raw,
-            )
-        )
-    return _with_internal_control(specs)
+
+def default_control_plane_dependencies() -> list[ControlPlaneDependency]:
+    async def _ensure_task_state_store() -> Any:
+        from .task_state_store import task_state_store
+
+        return await task_state_store.async_ensure_ready(timeout_s=5.0, create_if_missing=True)
+
+    async def _ping_task_state_store() -> Any:
+        from .task_state_store import task_state_store
+
+        return await task_state_store.async_ping(timeout_s=5.0)
+
+    async def _ensure_model_work_scheduler() -> Any:
+        from .model_work_scheduler import model_work_scheduler
+
+        return await model_work_scheduler.stats(timeout_s=5.0, create_if_missing=True)
+
+    async def _ping_model_work_scheduler() -> Any:
+        from .model_work_scheduler import model_work_scheduler
+
+        return await model_work_scheduler.async_ping(timeout_s=5.0)
+
+    async def _ensure_maintenance_cron() -> Any:
+        from .maintenance_cron_actor import maintenance_cron_actor
+
+        return await maintenance_cron_actor.async_ensure_started(timeout_s=15.0)
+
+    async def _ping_maintenance_cron() -> Any:
+        from .maintenance_cron_actor import maintenance_cron_actor
+
+        return await maintenance_cron_actor.async_ping(timeout_s=5.0)
+
+    return [
+        ControlPlaneDependency(
+            name="task_state_store",
+            ensure=_ensure_task_state_store,
+            ping=_ping_task_state_store,
+        ),
+        ControlPlaneDependency(
+            name="model_work_scheduler",
+            ensure=_ensure_model_work_scheduler,
+            ping=_ping_model_work_scheduler,
+        ),
+        ControlPlaneDependency(
+            name="maintenance_cron_actor",
+            ensure=_ensure_maintenance_cron,
+            ping=_ping_maintenance_cron,
+        ),
+    ]
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -528,6 +563,9 @@ class ModelActorSupervisorCore:
         topology_manager: TopologyManager | None = None,
         node_metrics_factory: NodeMetricsFactory | None = None,
         node_metrics_enabled: bool | None = None,
+        control_plane_dependencies: list[ControlPlaneDependency] | None = None,
+        control_plane_enabled: bool | None = None,
+        reconcile_interval_s: float | None = None,
         launcher_registry: ModelActorLauncherRegistry | None = None,
         state_store: SupervisorStateStore | None = None,
         state_backend: str | None = None,
@@ -559,6 +597,14 @@ class ModelActorSupervisorCore:
         self._node_metric_states: dict[str, dict[str, Any]] = {}
         self._node_metrics_created_total = 0
         self._node_metrics_reconcile_failures_total = 0
+        self._control_plane_enabled = True if control_plane_enabled is None else bool(control_plane_enabled)
+        self._control_plane_dependencies = (
+            list(control_plane_dependencies)
+            if control_plane_dependencies is not None
+            else default_control_plane_dependencies()
+        )
+        self._control_plane_states: dict[str, dict[str, Any]] = {}
+        self._control_plane_ensure_failures_total = 0
         self._actors: dict[tuple[str, str], Any] = {}
         self._generations: dict[tuple[str, str], int] = {}
         self._states: dict[tuple[str, str], dict[str, Any]] = {}
@@ -595,6 +641,14 @@ class ModelActorSupervisorCore:
         self._state_owner: dict[str, Any] | None = None
         self._state_store_failures_total = 0
         self._ensure_state_owner()
+        self._reconcile_interval_s = (
+            _reconcile_interval_s_from_env()
+            if reconcile_interval_s is None
+            else float(reconcile_interval_s)
+        )
+        self._reconcile_task: asyncio.Task | None = None
+        self._reconcile_inflight = False
+        self._last_reconcile_loop_error: str | None = None
         for spec in specs or []:
             self.set_desired(spec)
 
@@ -885,6 +939,39 @@ class ModelActorSupervisorCore:
             return True
         return all(pin in nodes for pin in pins)
 
+    async def _ensure_control_plane_dependencies(self) -> None:
+        if not self._control_plane_enabled:
+            self._control_plane_states = {}
+            return
+        now = time.time()
+        for dependency in self._control_plane_dependencies:
+            previous = dict(self._control_plane_states.get(dependency.name, {}))
+            try:
+                result = await _maybe_await(dependency.ensure())
+                self._control_plane_states[dependency.name] = {
+                    "name": dependency.name,
+                    "state": "ready",
+                    "last_error": None,
+                    "last_checked_at": now,
+                    "last_ready_at": now,
+                    "result": result if isinstance(result, dict) else {"value": repr(result)},
+                }
+            except Exception as e:
+                self._control_plane_ensure_failures_total += 1
+                self._control_plane_states[dependency.name] = {
+                    **previous,
+                    "name": dependency.name,
+                    "state": "unhealthy",
+                    "last_error": f"{type(e).__name__}: {e}",
+                    "last_checked_at": now,
+                }
+                logger.warning(
+                    "[model_actor_supervisor] control-plane ensure failed name=%s error_type=%s error=%s",
+                    dependency.name,
+                    type(e).__name__,
+                    e,
+                )
+
     async def _resolve_topology_placements(
         self,
         desired: dict[tuple[str, str], ModelActorSpec],
@@ -998,10 +1085,18 @@ class ModelActorSupervisorCore:
         node_ip = str(node.get("node_ip") or "").strip()
         if str(node.get("state") or "") != "ready" or not node_ip:
             return None
+        if node.get("enabled") is False:
+            return None
+        if str(node.get("role") or "gpu") != "gpu":
+            return None
+        gpu_count = node.get("gpu_count")
+        if gpu_count is not None and int(gpu_count) <= 0:
+            return None
+        if node.get("mount_ok") is False or node.get("runtime_env_ok") is False:
+            return None
         topology = self._topology_manager.snapshot() if self._topology_manager is not None else {}
         deployment_env = str(topology.get("deployment_env") or os.environ.get("MINT_DEPLOYMENT_ENV") or "").strip()
         cluster_id = str(topology.get("cluster_id") or os.environ.get("MINT_CLUSTER_ID") or "").strip()
-        gpu_count = node.get("gpu_count")
         return NodeMetricsDaemonSpec(
             worker_alias=str(alias),
             node_ip=node_ip,
@@ -1245,9 +1340,19 @@ class ModelActorSupervisorCore:
         return {"ok": True, "last_scheduler_sync_at": self._last_scheduler_sync_at}
 
     async def reconcile_once(self) -> dict[str, Any]:
+        if self._reconcile_inflight:
+            return {"ok": True, "skipped": "reconcile_inflight", "snapshot": self.snapshot()}
+        self._reconcile_inflight = True
+        try:
+            return await self._reconcile_once_impl()
+        finally:
+            self._reconcile_inflight = False
+
+    async def _reconcile_once_impl(self) -> dict[str, Any]:
         self._reconcile_total += 1
         self._last_reconcile_at = time.time()
         self._heartbeat_state_owner()
+        await self._ensure_control_plane_dependencies()
         await self._sync_active_scheduler_domains()
         if self._orphan_pg_cleaner is not None:
             await _maybe_await(self._orphan_pg_cleaner(dict(self._desired)))
@@ -1475,6 +1580,30 @@ class ModelActorSupervisorCore:
         await self._sync_scheduler()
         return {"ok": True, "replicas": results, "snapshot": self.snapshot()}
 
+    async def ensure_reconcile_loop_started(self) -> dict[str, Any]:
+        if self._reconcile_task is not None and not self._reconcile_task.done():
+            return self.snapshot()
+        await self.reconcile_once()
+        self._reconcile_task = asyncio.create_task(self._reconcile_loop())
+        return self.snapshot()
+
+    async def _reconcile_loop(self) -> None:
+        interval_s = max(0.1, float(self._reconcile_interval_s))
+        while True:
+            try:
+                await self.reconcile_once()
+                self._last_reconcile_loop_error = None
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._last_reconcile_loop_error = f"{type(e).__name__}: {e}"
+                logger.warning(
+                    "[model_actor_supervisor] reconcile loop failed error_type=%s error=%s",
+                    type(e).__name__,
+                    e,
+                )
+            await asyncio.sleep(interval_s)
+
     async def recycle(self, *, domain_key: str, replica_id: str, force: bool = False) -> dict[str, Any]:
         key = _key(domain_key, replica_id)
         actor = self._actors.get(key)
@@ -1521,6 +1650,7 @@ class ModelActorSupervisorCore:
         return {"ok": True, "domain_key": domain_key, "replica_id": replica_id, "recycled": True}
 
     def snapshot(self) -> dict[str, Any]:
+        snapshot_generated_at = time.time()
         replicas: dict[str, dict[str, Any]] = {}
         domains: dict[str, dict[str, Any]] = {}
         for key in sorted(set(self._states) | set(self._desired)):
@@ -1559,12 +1689,12 @@ class ModelActorSupervisorCore:
             [
                 alias
                 for alias, node in topology_nodes.items()
-                if isinstance(node, dict)
-                and str(node.get("state") or "") == "ready"
-                and str(node.get("node_ip") or "").strip()
+                if isinstance(node, dict) and self._node_metric_spec_from_runtime_node(str(alias), node) is not None
             ]
         )
         return {
+            "snapshot_generated_at": snapshot_generated_at,
+            "observed_at": snapshot_generated_at,
             "desired_total": int(len(self._desired)),
             "managed_total": int(len(self._actors)),
             "domain_total": int(len(domains)),
@@ -1578,9 +1708,13 @@ class ModelActorSupervisorCore:
             "topology_reconcile_failures_total": int(self._topology_reconcile_failures_total),
             "node_metrics_created_total": int(self._node_metrics_created_total),
             "node_metrics_reconcile_failures_total": int(self._node_metrics_reconcile_failures_total),
+            "control_plane_ensure_failures_total": int(self._control_plane_ensure_failures_total),
             "state_store_failures_total": int(self._state_store_failures_total),
             "placement_reclaimed_total": int(self._placement_reclaimed_total),
             "last_reconcile_at": self._last_reconcile_at,
+            "reconcile_loop_running": self._reconcile_task is not None and not self._reconcile_task.done(),
+            "reconcile_interval_s": float(self._reconcile_interval_s),
+            "last_reconcile_loop_error": self._last_reconcile_loop_error,
             "last_scheduler_sync_at": self._last_scheduler_sync_at,
             "last_placement_reconcile": self._last_placement_reconcile,
             "last_topology_reconcile": self._last_topology_reconcile,
@@ -1597,6 +1731,13 @@ class ModelActorSupervisorCore:
                     "managed_total": len(self._node_metric_actors),
                     "nodes": {alias: dict(state) for alias, state in sorted(self._node_metric_states.items())},
                 }
+            },
+            "control_plane": {
+                "enabled": bool(self._control_plane_enabled),
+                "dependencies": {
+                    name: dict(state)
+                    for name, state in sorted(self._control_plane_states.items())
+                },
             },
             "domains": domains,
             "replicas": replicas,
@@ -1634,16 +1775,10 @@ def _ray_model_actor_supervisor_actor_name() -> str:
 
 
 def _model_actor_supervisor_actor_resources() -> dict[str, float] | None:
-    pinned_ip = str(os.environ.get("MINT_MODEL_ACTOR_SUPERVISOR_PINNED_NODE_IP") or "").strip()
-    if pinned_ip:
-        return {f"node:{pinned_ip}": 0.001}
     try:
         import ray
 
-        return preferred_control_plane_resources(
-            ray.cluster_resources(),
-            env_var="MINT_MODEL_ACTOR_SUPERVISOR_PINNED_NODE_IP",
-        )
+        return preferred_control_plane_resources(ray.cluster_resources())
     except Exception:
         return None
 
@@ -1745,16 +1880,19 @@ class ModelActorSupervisorClient:
 
     def ensure_started(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
         self._ray_actor = _create_ray_actor(require_ready=False)
-        out = sync_get_ray_ref(self._ray_actor.snapshot.remote(), timeout_s=timeout_s)
+        out = sync_get_ray_ref(self._ray_actor.ensure_reconcile_loop_started.remote(), timeout_s=timeout_s)
         if not isinstance(out, dict):
-            raise TypeError(f"ModelActorSupervisor.snapshot returned non-dict: {type(out)}")
+            raise TypeError(f"ModelActorSupervisor.ensure_reconcile_loop_started returned non-dict: {type(out)}")
         return out
 
     async def async_ensure_started(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
         self._ray_actor = _create_ray_actor(require_ready=False)
-        out = await async_get_ray_ref(self._ray_actor.snapshot.remote(), timeout_s=timeout_s)
+        out = await async_get_ray_ref(
+            self._ray_actor.ensure_reconcile_loop_started.remote(),
+            timeout_s=timeout_s,
+        )
         if not isinstance(out, dict):
-            raise TypeError(f"ModelActorSupervisor.snapshot returned non-dict: {type(out)}")
+            raise TypeError(f"ModelActorSupervisor.ensure_reconcile_loop_started returned non-dict: {type(out)}")
         return out
 
     def _call_sync(

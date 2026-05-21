@@ -20,6 +20,7 @@ def _tracked_text_files() -> list[Path]:
         "AGENTS.md",
         "PLAN.md",
         "Dockerfile",
+        "sitecustomize.py",
     ]
     excluded_prefixes = {
         ".claude/skills/tinker-official-reference/",
@@ -64,6 +65,56 @@ def _tracked_text_files() -> list[Path]:
     return sorted(out)
 
 
+def _current_service_text_files() -> list[Path]:
+    roots = [
+        "mint_server",
+        ".claude/skills/architecture-design/references",
+        "pyproject.toml",
+        "requirements/api_server_driver_py31213.requirements.in",
+        "README.md",
+        "CLAUDE.md",
+        "AGENTS.md",
+        "PLAN.md",
+        "Dockerfile",
+    ]
+    excluded_exact = {
+        ".claude/skills/architecture-design/references/architecture.md",
+        ".claude/skills/architecture-design/references/checkpoint-compat-matrix.md",
+        ".claude/skills/architecture-design/references/weights-checkpoints.md",
+        "mint_server/app.py",
+        "mint_server/client_compat.py",
+        "mint_server/compatibility.py",
+        "mint_server/routes/service.py",
+        "mint_server/routes/training.py",
+        "mint_server/routes/weights.py",
+    }
+    text_suffixes = {
+        ".cfg",
+        ".conf",
+        ".in",
+        ".md",
+        ".py",
+        ".toml",
+        ".txt",
+        ".yaml",
+        ".yml",
+    }
+    out: list[Path] = []
+    for rel in roots:
+        path = REPO_ROOT / rel
+        if path.is_dir():
+            for p in path.rglob("*"):
+                if not p.is_file() or p.suffix not in text_suffixes:
+                    continue
+                rel_path = str(p.relative_to(REPO_ROOT))
+                if rel_path in excluded_exact:
+                    continue
+                out.append(p)
+        elif path.is_file():
+            out.append(path)
+    return sorted(out)
+
+
 ENV_ALIAS_TOKEN = "TINKER" + "_"
 URI_COMPAT_TOKEN = "tinker" + "://"
 
@@ -94,6 +145,27 @@ def test_core_service_no_legacy_names() -> None:
     )
     hits: list[str] = []
     for path in _tracked_text_files():
+        text = path.read_text(encoding="utf-8")
+        for token in forbidden:
+            if token in text:
+                hits.append(f"{path.relative_to(REPO_ROOT)} contains {token}")
+
+    assert hits == []
+
+
+def test_current_service_no_internal_tinker_or_direct_billing_surface() -> None:
+    forbidden = (
+        "tinker" + "_to_tensordict",
+        "_tinker" + "_",
+        "tinker" + "_lora_",
+        "schedule_usage_events(",
+        "persist_usage_events(",
+        "direct-PG",
+        "direct PG",
+        "directly to PostgreSQL",
+    )
+    hits: list[str] = []
+    for path in _current_service_text_files():
         text = path.read_text(encoding="utf-8")
         for token in forbidden:
             if token in text:

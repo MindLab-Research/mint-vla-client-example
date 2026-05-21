@@ -305,7 +305,7 @@ def _default_capacity_checker(
     ignore_placement_group_names: set[str],
     ignore_placement_group_namespace: str,
 ) -> None:
-    from .volc_placement import assert_node_ip_capacity
+    from .node_placement import assert_node_ip_capacity
 
     assert_node_ip_capacity(
         required_gpus_by_node_ip=required_gpus_by_node_ip,

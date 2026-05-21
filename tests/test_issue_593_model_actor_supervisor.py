@@ -6,6 +6,7 @@ import sys
 import types
 
 import pytest
+import yaml
 
 from mint_server.backend.model_actor_inventory import ActorType
 from mint_server.backend.model_actor_launchers import (
@@ -13,6 +14,7 @@ from mint_server.backend.model_actor_launchers import (
     placement_env_for_spec,
 )
 from mint_server.backend.model_actor_supervisor import (
+    ControlPlaneDependency,
     ModelActorSpec,
     ModelActorSupervisorClient,
     ModelActorSupervisor,
@@ -27,6 +29,25 @@ from mint_server.backend.supervisor_state_store import (
     SupervisorSQLiteStateStore,
     SupervisorStateOwnerConflictError,
 )
+
+
+def _write_supervisor_topology(tmp_path, models: dict[str, object]) -> str:
+    path = tmp_path / "topology.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "deployment_env": "dev",
+                "cluster_id": "volcano",
+                "state_path": str(tmp_path / "topology_state.yaml"),
+                "providers": {},
+                "nodes": {"desired": []},
+                "models": models,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return str(path)
 
 
 class _FakeRuntimeActor:
@@ -99,6 +120,10 @@ class _FakeActorHandle:
         self.sync_replicas = _FakeRemoteMethod(self.calls, "sync_replicas", {"ok": True})
         self.total_gpus_used = _FakeRemoteMethod(self.calls, "total_gpus_used", 7)
         self.gpus_used_by_node = _FakeRemoteMethod(self.calls, "gpus_used_by_node", {"node-a": 4})
+
+
+def _disabled_control_plane_kwargs() -> dict:
+    return {"control_plane_dependencies": [], "control_plane_enabled": False}
 
 
 class _FakeRemoteActorClass:
@@ -208,7 +233,7 @@ async def test_issue_593_supervisor_client_forwards_sync_and_async_methods(
 
 
 def test_issue_593_supervisor_exposes_explicit_inventory_contract() -> None:
-    supervisor = ModelActorSupervisor()
+    supervisor = ModelActorSupervisor(**_disabled_control_plane_kwargs())
 
     entry = supervisor.register(
         actor_name="vllm-contract-actor",
@@ -309,6 +334,7 @@ def test_issue_593_supervisor_uses_sqlite_generation_hint_across_instances(tmp_p
         state_store=store_a,
         owner_id="owner-a",
         owner_ttl_s=1,
+        **_disabled_control_plane_kwargs(),
     )
     generation_a = supervisor_a._next_generation(("vllm:model-a", "replica-0"))
     store_a.close()
@@ -319,11 +345,87 @@ def test_issue_593_supervisor_uses_sqlite_generation_hint_across_instances(tmp_p
         state_store=store_b,
         owner_id="owner-a",
         owner_ttl_s=1,
+        **_disabled_control_plane_kwargs(),
     )
     generation_b = supervisor_b._next_generation(("vllm:model-a", "replica-0"))
     store_b.close()
 
     assert generation_b > generation_a
+
+
+@pytest.mark.anyio
+async def test_issue_593_supervisor_reconciles_control_plane_dependencies() -> None:
+    calls: list[tuple[str, str]] = []
+
+    async def _ensure_scheduler() -> dict:
+        calls.append(("model_work_scheduler", "ensure"))
+        return {"ok": True}
+
+    async def _ping_scheduler() -> dict:
+        calls.append(("model_work_scheduler", "ping"))
+        return {"ok": True}
+
+    async def _ensure_task_state() -> dict:
+        calls.append(("task_state_store", "ensure"))
+        return {"ok": True}
+
+    async def _ping_task_state() -> dict:
+        calls.append(("task_state_store", "ping"))
+        return {"ok": True}
+
+    dependencies = [
+        ControlPlaneDependency("model_work_scheduler", _ensure_scheduler, _ping_scheduler),
+        ControlPlaneDependency("task_state_store", _ensure_task_state, _ping_task_state),
+    ]
+    supervisor = ModelActorSupervisor(
+        specs=[],
+        control_plane_dependencies=dependencies,
+        scheduler_sync=lambda _registrations: None,
+    )
+
+    out = await supervisor.reconcile_once()
+
+    assert calls == [
+        ("model_work_scheduler", "ensure"),
+        ("task_state_store", "ensure"),
+    ]
+    assert out["snapshot"]["control_plane"]["dependencies"]["model_work_scheduler"]["state"] == "ready"
+    assert out["snapshot"]["control_plane"]["dependencies"]["task_state_store"]["state"] == "ready"
+
+
+@pytest.mark.anyio
+async def test_issue_593_supervisor_bootstrap_starts_reconcile_loop() -> None:
+    calls: list[str] = []
+
+    async def _ensure_dependency() -> dict:
+        calls.append("ensure")
+        return {"ok": True}
+
+    dependency = ControlPlaneDependency(
+        "task_state_store",
+        _ensure_dependency,
+        lambda: {"ok": True},
+    )
+    supervisor = ModelActorSupervisor(
+        specs=[],
+        control_plane_dependencies=[dependency],
+        scheduler_sync=lambda _registrations: None,
+        reconcile_interval_s=3600.0,
+    )
+
+    out = await supervisor.ensure_reconcile_loop_started()
+    try:
+        assert calls == ["ensure"]
+        assert out["reconcile_loop_running"] is True
+        assert out["last_reconcile_at"] is not None
+    finally:
+        task = supervisor._reconcile_task
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except BaseException:
+                pass
 
 
 @pytest.mark.anyio
@@ -355,6 +457,7 @@ async def test_issue_593_supervisor_uses_launcher_registry_when_no_factory() -> 
         scheduler_sync=_sync,
         placement_reconciler=lambda _desired: {"reclaimed": 0},
         launcher_registry=ModelActorLauncherRegistry({"test_launcher": _launch}),
+        **_disabled_control_plane_kwargs(),
     )
 
     await supervisor.reconcile_once()
@@ -394,6 +497,7 @@ async def test_issue_593_supervisor_creates_replica_and_syncs_scheduler() -> Non
         ],
         runtime_factory=_factory,
         scheduler_sync=_sync,
+        **_disabled_control_plane_kwargs(),
     )
 
     out = await supervisor.reconcile_once()
@@ -416,18 +520,24 @@ async def test_issue_593_supervisor_creates_replica_and_syncs_scheduler() -> Non
     assert synced[-1][0]["queue_id"] == "vllm:model-a::replica-0"
     assert synced[-1][0]["status"] == "healthy"
     assert synced[-1][0]["capacity"] == 4
-    assert await supervisor.async_snapshot() == supervisor.snapshot()
+    async_snapshot = await supervisor.async_snapshot()
+    assert async_snapshot["replicas"] == supervisor.snapshot()["replicas"]
+    assert isinstance(async_snapshot["snapshot_generated_at"], float)
 
 
 @pytest.mark.anyio
 async def test_issue_593_supervisor_projects_scheduler_backlog_to_desired_runtime(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
 ) -> None:
     base_model = "Qwen/Qwen3-0.6B"
     monkeypatch.setenv("MINT_SUPPORTED_MODELS", base_model)
     monkeypatch.setenv(
-        "MINT_DENSE_MODEL_PLACEMENT_JSON",
-        f'{{"{base_model}":{{"replica":0,"node_ip":"10.0.0.8","gpu_count":1}}}}',
+        "MINT_TOPOLOGY_CONFIG_PATH",
+        _write_supervisor_topology(
+            tmp_path,
+            {base_model: {"training": {"placement": [{"replica": 0, "node_ip": "10.0.0.8", "gpu_count": 1}]}}},
+        ),
     )
     created: list[_FakeRuntimeActor] = []
     synced: list[list[dict]] = []
@@ -459,6 +569,7 @@ async def test_issue_593_supervisor_projects_scheduler_backlog_to_desired_runtim
         scheduler_sync=lambda registrations: synced.append(
             [registration.to_dict() for registration in registrations]
         ),
+        **_disabled_control_plane_kwargs(),
     )
 
     out = await supervisor.reconcile_once()
@@ -494,6 +605,7 @@ async def test_issue_593_supervisor_restarts_dead_runtime_with_monotonic_generat
         scheduler_sync=lambda registrations: synced.append(
             [registration.to_dict() for registration in registrations]
         ),
+        **_disabled_control_plane_kwargs(),
     )
     await supervisor.reconcile_once()
     first_generation = created[0].generation
@@ -532,6 +644,7 @@ async def test_issue_593_supervisor_restarts_runtime_that_reports_not_running() 
         scheduler_sync=lambda registrations: synced.append(
             [registration.to_dict() for registration in registrations]
         ),
+        **_disabled_control_plane_kwargs(),
     )
     await supervisor.reconcile_once()
     first_generation = created[0].generation
@@ -583,6 +696,7 @@ async def test_issue_593_supervisor_blocks_unavailable_node_pin_and_syncs_unclai
         node_inventory=lambda: {"10.0.0.1"},
         scheduler_sync=_sync,
         orphan_pg_cleaner=_cleaner,
+        **_disabled_control_plane_kwargs(),
     )
 
     out = await supervisor.reconcile_once()
@@ -617,6 +731,7 @@ async def test_issue_593_supervisor_does_not_recycle_busy_runtime_without_force(
         scheduler_sync=lambda registrations: synced.append(
             [registration.to_dict() for registration in registrations]
         ),
+        **_disabled_control_plane_kwargs(),
     )
     await supervisor.reconcile_once()
     created[0].active_request_id = "active-req"
@@ -640,30 +755,6 @@ async def test_issue_593_supervisor_does_not_recycle_busy_runtime_without_force(
     assert created[0].shutdown_calls == 1
     assert supervisor.snapshot()["busy_recycle_skipped_total"] == 1
     assert synced[-1][0]["status"] == "dead"
-
-
-def test_issue_593_supervisor_parses_desired_specs_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(
-        "MINT_MODEL_ACTOR_DESIRED_JSON",
-        '[{"base_model":"Qwen/Test","replica":1,"node_pins":["10.0.0.1"],"gpu_count":4}]',
-    )
-
-    specs = desired_specs_from_env()
-
-    assert specs == [
-        ModelActorSpec(
-            domain_key="vllm:Qwen/Test",
-            replica_id="replica-1",
-            base_model="Qwen/Test",
-            node_pins=("10.0.0.1",),
-            gpu_count=4,
-        ),
-        ModelActorSpec(
-            domain_key="internal:control",
-            launcher_key="internal_control",
-            gpu_count=0,
-        ),
-    ]
 
 
 def test_issue_593_supervisor_builds_runtime_placement_env_from_node_pin() -> None:
@@ -735,13 +826,20 @@ def test_issue_593_supervisor_builds_runtime_placement_env_from_multi_node_pins(
     }
 
 
-def test_issue_593_supervisor_falls_back_to_persistent_models(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("MINT_MODEL_ACTOR_DESIRED_JSON", raising=False)
-    monkeypatch.delenv("MINT_MODEL_PLACEMENT_JSON", raising=False)
-    monkeypatch.delenv("MINT_VLLM_MODEL_PLACEMENT_JSON", raising=False)
-    monkeypatch.delenv("MINT_DENSE_MODEL_PLACEMENT_JSON", raising=False)
-    monkeypatch.delenv("MINT_MEGATRON_MODEL_PLACEMENT_JSON", raising=False)
-    monkeypatch.setenv("MINT_PERSISTENT_MODELS", "Qwen/A, Qwen/B")
+def test_issue_593_supervisor_builds_desired_specs_from_topology(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv(
+        "MINT_TOPOLOGY_CONFIG_PATH",
+        _write_supervisor_topology(
+            tmp_path,
+            {
+                "Qwen/A": {"vllm": {}, "training": {}},
+                "Qwen/B": {"vllm": {}, "training": {}},
+            },
+        ),
+    )
 
     specs = desired_specs_from_env()
 
@@ -750,22 +848,27 @@ def test_issue_593_supervisor_falls_back_to_persistent_models(monkeypatch: pytes
         "training:Qwen/A",
         "vllm:Qwen/B",
         "training:Qwen/B",
-        "internal:control",
+        "internal:runtime",
     ]
     assert domain_key_for_vllm_base_model("Qwen/A") == "vllm:Qwen/A"
     assert queue_id_for_replica("vllm:Qwen/A", "replica-2") == "vllm:Qwen/A::replica-2"
 
 
-def test_issue_593_persistent_specs_inherit_runtime_placement(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("MINT_MODEL_ACTOR_DESIRED_JSON", raising=False)
-    monkeypatch.setenv("MINT_PERSISTENT_MODELS", "Qwen/A")
+def test_issue_593_topology_specs_inherit_runtime_placement(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
     monkeypatch.setenv(
-        "MINT_VLLM_MODEL_PLACEMENT_JSON",
-        '{"Qwen/A":{"replica":1,"node_ip":"10.0.0.7","gpu_count":2}}',
-    )
-    monkeypatch.setenv(
-        "MINT_DENSE_MODEL_PLACEMENT_JSON",
-        '{"Qwen/A":{"replica":0,"node_ip":"10.0.0.8","gpu_count":1}}',
+        "MINT_TOPOLOGY_CONFIG_PATH",
+        _write_supervisor_topology(
+            tmp_path,
+            {
+                "Qwen/A": {
+                    "vllm": {"placement": [{"replica": 1, "node_ip": "10.0.0.7", "gpu_count": 2}]},
+                    "training": {"placement": [{"replica": 0, "node_ip": "10.0.0.8", "gpu_count": 1}]},
+                }
+            },
+        ),
     )
 
     specs = desired_specs_from_env()
@@ -791,21 +894,26 @@ def test_issue_593_persistent_specs_inherit_runtime_placement(monkeypatch: pytes
     ]
 
 
-def test_issue_593_persistent_specs_preserve_multi_node_placement(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("MINT_MODEL_ACTOR_DESIRED_JSON", raising=False)
-    monkeypatch.setenv("MINT_PERSISTENT_MODELS", "Qwen/A")
+def test_issue_593_topology_specs_preserve_multi_node_placement(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
     monkeypatch.setenv(
-        "MINT_VLLM_MODEL_PLACEMENT_JSON",
-        (
-            '{"Qwen/A":['
-            '{"replica":0,"node_ip":"10.0.0.7","gpu_count":4},'
-            '{"replica":0,"node_ip":"10.0.0.8","gpu_count":4}'
-            "]}"
+        "MINT_TOPOLOGY_CONFIG_PATH",
+        _write_supervisor_topology(
+            tmp_path,
+            {
+                "Qwen/A": {
+                    "vllm": {
+                        "placement": [
+                            {"replica": 0, "node_ip": "10.0.0.7", "gpu_count": 4},
+                            {"replica": 0, "node_ip": "10.0.0.8", "gpu_count": 4},
+                        ]
+                    },
+                    "training": {"placement": [{"replica": 0, "node_ip": "10.0.0.9", "gpu_count": 1}]},
+                }
+            },
         ),
-    )
-    monkeypatch.setenv(
-        "MINT_DENSE_MODEL_PLACEMENT_JSON",
-        '{"Qwen/A":{"replica":0,"node_ip":"10.0.0.9","gpu_count":1}}',
     )
 
     specs = desired_specs_from_env()
@@ -820,26 +928,120 @@ def test_issue_593_persistent_specs_preserve_multi_node_placement(monkeypatch: p
     )
 
 
-def test_issue_593_persistent_specs_reject_worker_aliases(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("MINT_MODEL_ACTOR_DESIRED_JSON", raising=False)
-    monkeypatch.setenv("MINT_PERSISTENT_MODELS", "Qwen/A")
+def test_issue_593_topology_specs_split_distinct_replicas(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
     monkeypatch.setenv(
-        "MINT_VLLM_MODEL_PLACEMENT_JSON",
-        '{"Qwen/A":{"replica":0,"worker_idx":1,"gpu_count":1}}',
+        "MINT_TOPOLOGY_CONFIG_PATH",
+        _write_supervisor_topology(
+            tmp_path,
+            {
+                "Qwen/A": {
+                    "vllm": {
+                        "placement": [
+                            {"replica": 0, "worker_alias": "mint-worker-0", "gpu_count": 2},
+                            {"replica": 1, "worker_alias": "mint-worker-1", "gpu_count": 2},
+                        ]
+                    },
+                }
+            },
+        ),
     )
 
-    with pytest.raises(ValueError, match="uses worker_index; use node_ip"):
+    specs = desired_specs_from_env()
+
+    assert specs[:2] == [
+        ModelActorSpec(
+            domain_key="vllm:Qwen/A",
+            replica_id="replica-0",
+            base_model="Qwen/A",
+            launcher_key="vllm",
+            worker_aliases=("mint-worker-0",),
+            placement_alias_slices=(("replica-0", "mint-worker-0", 2),),
+            gpu_count=2,
+        ),
+        ModelActorSpec(
+            domain_key="vllm:Qwen/A",
+            replica_id="replica-1",
+            base_model="Qwen/A",
+            launcher_key="vllm",
+            worker_aliases=("mint-worker-1",),
+            placement_alias_slices=(("replica-1", "mint-worker-1", 2),),
+            gpu_count=2,
+        ),
+    ]
+
+
+def test_issue_593_topology_placement_without_gpu_count_fails_fast(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv(
+        "MINT_TOPOLOGY_CONFIG_PATH",
+        _write_supervisor_topology(
+            tmp_path,
+            {
+                "Qwen/A": {
+                    "vllm": {"placement": [{"replica": 0, "node_ip": "10.0.0.7"}]},
+                }
+            },
+        ),
+    )
+
+    with pytest.raises(ValueError, match="must include gpu_count"):
+        desired_specs_from_env()
+
+
+def test_issue_593_topology_specs_preserve_disabled_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv(
+        "MINT_TOPOLOGY_CONFIG_PATH",
+        _write_supervisor_topology(
+            tmp_path,
+            {
+                "Qwen/A": {
+                    "vllm": {"enabled": False},
+                }
+            },
+        ),
+    )
+
+    specs = desired_specs_from_env()
+
+    assert specs[0] == ModelActorSpec(
+        domain_key="vllm:Qwen/A",
+        base_model="Qwen/A",
+        launcher_key="vllm",
+        enabled=False,
+    )
+
+
+def test_issue_593_topology_specs_reject_bad_placement_items(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv(
+        "MINT_TOPOLOGY_CONFIG_PATH",
+        _write_supervisor_topology(
+            tmp_path,
+            {"Qwen/A": {"vllm": {"placement": "not-a-list"}}},
+        ),
+    )
+
+    with pytest.raises(ValueError, match="must be a list"):
         desired_specs_from_env()
 
 
 def test_issue_593_supervisor_empty_env_has_no_desired_specs(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("MINT_MODEL_ACTOR_DESIRED_JSON", raising=False)
-    monkeypatch.delenv("MINT_PERSISTENT_MODELS", raising=False)
+    monkeypatch.delenv("MINT_TOPOLOGY_CONFIG_PATH", raising=False)
 
     assert desired_specs_from_env() == [
         ModelActorSpec(
-            domain_key="internal:control",
-            launcher_key="internal_control",
+            domain_key="internal:runtime",
+            launcher_key="cpu_runtime",
             gpu_count=0,
         )
     ]
@@ -1167,6 +1369,7 @@ async def test_issue_593_supervisor_blocks_placement_capacity_failure_without_cr
             [registration.to_dict() for registration in registrations]
         ),
         placement_reconciler=_placement,
+        **_disabled_control_plane_kwargs(),
     )
 
     out = await supervisor.reconcile_once()
@@ -1178,4 +1381,3 @@ async def test_issue_593_supervisor_blocks_placement_capacity_failure_without_cr
     assert replica["last_action"] == "blocked:placement"
     assert "blocker_pg" in replica["last_error"]
     assert synced[-1][0]["status"] == "blocked"
-    assert os.environ.get("MINT_MODEL_ACTOR_DESIRED_JSON") is None

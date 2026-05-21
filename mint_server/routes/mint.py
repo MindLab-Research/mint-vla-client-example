@@ -361,13 +361,13 @@ async def act(
     request_json = queued_request.model_dump_json().encode("utf-8")
     request_id = f"act_{uuid.uuid4().hex}"
     try:
-        from ..backend.model_actor_supervisor import domain_key_for_internal_control
+        from ..backend.model_actor_supervisor import domain_key_for_internal_runtime
 
         await _enqueue_mint_model_work(
             request_id=request_id,
             op="mint.action.act",
             request_json=request_json,
-            domain_key=domain_key_for_internal_control(),
+            domain_key=domain_key_for_internal_runtime(),
             affinity_group=f"action_session:{action_session_id}",
             ordering_key=f"action_session:{action_session_id}",
             queued_meta=_build_mint_future_meta(
@@ -548,13 +548,13 @@ async def interpolate_checkpoints(
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
     try:
-        from ..backend.model_actor_supervisor import domain_key_for_internal_control
+        from ..backend.model_actor_supervisor import domain_key_for_internal_runtime
 
         await _enqueue_mint_model_work(
             request_id=request_id,
             op="mint.interpolate_checkpoints",
             request_json=request_json,
-            domain_key=domain_key_for_internal_control(),
+            domain_key=domain_key_for_internal_runtime(),
             affinity_group="mint:checkpoint",
             ordering_key=None,
             queued_meta=_build_mint_future_meta(

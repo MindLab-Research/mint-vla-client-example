@@ -568,7 +568,7 @@ def test_mint_interpolate_route_enqueues_expected_request(monkeypatch) -> None:
     queued = scheduler.calls[0]
     assert queued["op"] == "mint.interpolate_checkpoints"
     assert queued["user_id"] == "user-a"
-    assert queued["domain_key"] == "internal:control"
+    assert queued["domain_key"] == "internal:runtime"
     request_json = json.loads(queued["request_json"].decode("utf-8"))
     assert request_json["source_paths"] == [
         "/resolved/user-a/ckpt-a",

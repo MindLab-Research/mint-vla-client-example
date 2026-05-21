@@ -1,17 +1,17 @@
 # Mint architecture overview
 
-mint-server is a FastAPI service that implements the Tinker REST contract and brokers training and inference to Ray GPU actors. The server is a control plane plus request validation, not a compute engine. The design is shaped by two goals: keep compatibility with the Tinker API contract, and multiplex GPU resources across many LoRA sessions for both inference and training.
+mint-server is a FastAPI service that implements the Mint REST contract and brokers training and inference to Ray GPU actors. The server is a control plane plus request validation, not a compute engine. The design is shaped by two goals: keep the SDK-compatible HTTP contract stable, and multiplex GPU resources across many LoRA sessions for both inference and training.
 
 Dependency management follows the same control-plane versus compute-engine split:
 - the worker image owns ABI-bound GPU packages
 - a PFS runtime-env root owns the shared Python dependency graph and pinned source overlays for the API host and Ray actors
 
-## Tinker API contract as the boundary
+## Mint API contract as the boundary
 
-The API surface follows the Tinker SDK expectations: create sessions and models, submit work, poll for completion, and manage weights. The server owns HTTP, auth, and request validation. The GPU actors own model weights and do the compute. That split is the primary boundary.
+The API surface follows the Mint SDK expectations while preserving the externally compatible HTTP contract: create sessions and models, submit work, poll for completion, and manage weights. The server owns HTTP, auth, and request validation. The GPU actors own model weights and do the compute. That split is the primary boundary.
 
 Contract implications:
-- Long-running work returns a `request_id` and is polled via `/api/v1/retrieve_future` (408 pending). This is the Tinker async protocol, not a server-specific choice.
+- Long-running work returns a `request_id` and is polled via `/api/v1/retrieve_future` (408 pending). This is the Mint async future protocol, not a server-specific choice.
 - `session_id`, `model_id`, and `sampling_session_id` are control-plane identifiers. Some live routing and engine bindings are in process, but minimal recovery metadata is persisted through `TaskStateStore`.
 - The server can restart while detached Ray actors remain alive. Fast in-process registries are still lost, but detached control-plane actors keep enough metadata for reconciliation and selected REST reads.
 
@@ -81,7 +81,7 @@ MoE training uses Megatron and must export PEFT adapters by reconstructing full 
 
 ## ModelActorSupervisor, ModelWorkScheduler, and inventory
 
-`ConfigActor` must already exist before `ModelActorSupervisor` starts. External operations bootstrap only `mint_config`, then `mint_model_actor_supervisor`, then API workers. `ModelActorSupervisor` is a detached Ray actor and the only component allowed to reconcile long-lived model runtime actors, control-plane actors that it owns, and topology daemon actors. It ensures the remaining CPU control-plane actors, including `ModelWorkScheduler`, `TaskStateStore`, and `MaintenanceCronActor`, plus all desired GPU/CPU runtime actors. Backend-specific vLLM, Megatron, dense, and OpenPI launchers still create their backend Ray actors, but they publish those actors through the supervisor launch-publication contract. Daemon actors are reconciled separately from model replicas and are never synced to the scheduler.
+`ConfigActor` must already exist before `ModelActorSupervisor` starts. External operations bootstrap only `mint_config`, then `mint_model_actor_supervisor`, then API workers. `ModelActorSupervisor` starts its own periodic reconcile loop and is the only component allowed to reconcile long-lived model runtime actors, control-plane actors that it owns, and topology daemon actors. It ensures the remaining CPU control-plane actors, including `ModelWorkScheduler`, `TaskStateStore`, and `MaintenanceCronActor`, plus all desired GPU/CPU runtime actors. Backend-specific vLLM, Megatron, dense, and OpenPI launchers still create their backend Ray actors, but they publish those actors through the supervisor launch-publication contract. Daemon actors are reconciled separately from model replicas and are never synced to the scheduler.
 
 `MaintenanceCronActor` remains a detached cron runner only. It may run periodic cleanup/reaper jobs, but it must not call `ModelActorSupervisor`, own model actor reconciliation state, trigger reconcile, or make reconcile decisions. `ModelActorSupervisor` may manage the cron actor lifecycle; that dependency is one-way.
 
@@ -89,9 +89,9 @@ MoE training uses Megatron and must export PEFT adapters by reconstructing full 
 
 The FastAPI application is a stateless API boundary. It should assemble HTTP middleware and routes, connect to detached control-plane clients, and expose unhealthy status when the highest control plane is unavailable. It may read/check detached actors and submit work to `ModelWorkScheduler`, but it must not ensure, create, or reconcile control-plane actors. If a request observes that a desired model runtime is not ready, it may send a fire-and-forget supervisor nudge that asks the supervisor to run a fast ensure pass. The request must not wait for supervisor ensure/reconcile before enqueuing or returning. If the supervisor is already reconciling, the nudge should be acknowledged without starting a second reconcile.
 
-`ModelWorkScheduler` accepts work even when a desired replica is not yet registered. That work remains pending until the supervisor registers a healthy replica, subject to the request/task TTL. This preserves the Tinker async contract: submit returns a `request_id`, `retrieve_future` returns HTTP 408 while pending, and the request is only terminal when it succeeds, fails, expires, is cancelled, or is forgotten after retention. This lets existing healthy actors continue serving when the supervisor is temporarily unavailable, while new or missing actors will not be recreated until the supervisor recovers.
+`ModelWorkScheduler` accepts work even when a desired replica is not yet registered. That work remains pending until the supervisor registers a healthy replica, subject to the request/task TTL. This preserves the Mint async future contract: submit returns a `request_id`, `retrieve_future` returns HTTP 408 while pending, and the request is only terminal when it succeeds, fails, expires, is cancelled, or is forgotten after retention. This lets existing healthy actors continue serving when the supervisor is temporarily unavailable, while new or missing actors will not be recreated until the supervisor recovers.
 
-Retention policy: retrieve hot-cache entries live for 300s, retrieve replay grace is 600s, pending/queued/assigned tasks expire after 24h, terminal result payloads are retained for 24h after `done_at` or `failed_at`, and tombstones are retained for 7d. `TaskFutureService.async_reap()` enforces this policy through `TaskStateStore` and `TaskPayloadStore`.
+Retention policy: retrieve hot-cache entries live for 300s, retrieve replay grace is 600s, pending/queued/assigned tasks expire after 24h, terminal result payloads are retained for 24h after `done_at` or `failed_at`, and tombstones are retained for 7d. `TaskFutureService.async_reap()` enforces this policy through `TaskStateStore` and the in-process `TaskPayloadStore` filesystem helper.
 
 Clients do not explicitly end all sessions, so idle timeouts still affect training and inference:
 - Detached inference actors can remain alive across server restarts and keep CUDA memory until evicted.
@@ -114,7 +114,7 @@ Health policy:
 
 ## Auth and access boundaries
 
-Auth is enforced by middleware when `INTERNAL_API_TOKEN` is configured. In
+Auth is enforced by middleware when `MINT_INTERNAL_API_TOKEN` is configured. In
 production the platform authenticates callers and forwards trusted `X-MinT-*`
 identity headers plus `X-Internal-Token`.
 

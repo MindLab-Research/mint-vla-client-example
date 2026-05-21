@@ -27,7 +27,7 @@ from mint_server.model_input_utils import flatten_encoded_text_chunks
 logger = logging.getLogger(__name__)
 
 
-def tinker_to_tensordict(
+def mint_datum_to_tensordict(
     data_items: list[dict],
     max_token_len_per_gpu: int = 10240,  # Single sample max: prompt (~2K) + max_tokens (8K)
     device: str | torch.device | None = None,
@@ -190,7 +190,7 @@ def tinker_to_tensordict(
             has_external_labels = True
             target_tokens_list.append(target_tokens)
             logger.debug(
-                "[tinker_to_tensordict] Extracted target_tokens, len=%d",
+                "[mint_datum_to_tensordict] Extracted target_tokens, len=%d",
                 len(target_tokens),
             )
         else:
@@ -316,16 +316,16 @@ def tinker_to_tensordict(
             td["target"] = torch.nested.as_nested_tensor(target_tokens_tensors, layout=torch.jagged)
             td.set_non_tensor("use_external_label", True)
             logger.debug(
-                "[tinker_to_tensordict] Added external labels (key='target', no roll), batch_size=%d",
+                "[mint_datum_to_tensordict] Added external labels (key='target', no roll), batch_size=%d",
                 len(target_tokens_list),
             )
         else:
             logger.warning(
-                "[tinker_to_tensordict] Mixed target_tokens presence in batch; "
+                "[mint_datum_to_tensordict] Mixed target_tokens presence in batch; "
                 "skipping external labels to avoid TensorDict shape mismatch."
             )
     elif has_external_labels and disable_external_label:
-        logger.warning("[tinker_to_tensordict] MINT_DISABLE_EXTERNAL_LABEL=1; forcing original rolled labels")
+        logger.warning("[mint_datum_to_tensordict] MINT_DISABLE_EXTERNAL_LABEL=1; forcing original rolled labels")
 
     require_r3 = (server_config.router_replay_mode == "R3")
     if require_r3:
@@ -343,7 +343,7 @@ def tinker_to_tensordict(
             td.set_non_tensor("enable_routing_replay", True)
         elif has_routed_experts:
             logger.warning(
-                "[tinker_to_tensordict] Mixed routed_experts presence in batch; skipping R3"
+                "[mint_datum_to_tensordict] Mixed routed_experts presence in batch; skipping R3"
             )
 
     # Add non-tensor metadata for verl's prepare_micro_batches

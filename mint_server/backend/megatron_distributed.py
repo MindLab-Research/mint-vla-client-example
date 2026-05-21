@@ -46,7 +46,7 @@ from mint_server.config import MINT_CODE_ROOT, PFS_PYTHONPATH, RAY_NAMESPACE, co
 from mint_server.backend.model_registry import get_model_config
 from mint_server.ray_utils import init_ray
 from mint_server.model_input_utils import flatten_encoded_text_chunks
-from mint_server.backend.volc_placement import (
+from mint_server.backend.node_placement import (
     assert_node_ip_capacity,
     ModelGpuPlacement,
     parse_model_gpu_placement,
@@ -141,7 +141,7 @@ def _patch_flash_attn_metadata_version() -> None:
         import importlib.metadata as _imd
 
         _orig_version = getattr(_imd, "version", None)
-        if not callable(_orig_version) or getattr(_orig_version, "_tinker_flash_attn_version_patch", False):
+        if not callable(_orig_version) or getattr(_orig_version, "_mint_flash_attn_version_patch", False):
             return
 
         def _patched_version(dist_name: str) -> str:
@@ -155,7 +155,7 @@ def _patch_flash_attn_metadata_version() -> None:
                 return version_text.split("+", 1)[0]
             return version_text
 
-        _patched_version._tinker_flash_attn_version_patch = True  # type: ignore[attr-defined]
+        _patched_version._mint_flash_attn_version_patch = True  # type: ignore[attr-defined]
         _imd.version = _patched_version  # type: ignore[assignment]
     except Exception as exc:
         logger.warning("Failed to patch flash-attn metadata version: %s", exc)
@@ -2848,7 +2848,7 @@ class MegatronRankWorker:
         """
         import torch
         from mint_server.backend.megatron_training import (
-            create_sft_loss_fn, create_ppo_loss_fn, tinker_to_tensordict
+            create_sft_loss_fn, create_ppo_loss_fn, mint_datum_to_tensordict
         )
 
         self._bind_traceparent(traceparent)
@@ -2885,7 +2885,7 @@ class MegatronRankWorker:
         # Create TensorDict directly on GPU to avoid .to() issues with nested tensors
         # verl's forward_step calls batch.to(device) which fails for nested tensors on CPU
         max_token_len = get_model_config(self.base_model).max_model_len
-        data = tinker_to_tensordict(data_items, max_token_len_per_gpu=max_token_len, device=f"cuda:{device}")
+        data = mint_datum_to_tensordict(data_items, max_token_len_per_gpu=max_token_len, device=f"cuda:{device}")
 
         # Log memory before forward-backward
         self.log_memory_breakdown("before_forward_backward")
@@ -3267,7 +3267,7 @@ class MegatronRankWorker:
                 This ensures logprobs match vLLM (which always has bias=0).
         """
         import torch
-        from mint_server.backend.megatron_training import tinker_to_tensordict
+        from mint_server.backend.megatron_training import mint_datum_to_tensordict
 
         self._bind_traceparent(traceparent)
         reset_bias = self._resolve_reset_bias(reset_bias, default=True)
@@ -3290,7 +3290,7 @@ class MegatronRankWorker:
         # Create TensorDict directly on GPU to avoid .to() issues with nested tensors
         device = torch.cuda.current_device()
         max_token_len = get_model_config(self.base_model).max_model_len
-        data = tinker_to_tensordict(data_items, max_token_len_per_gpu=max_token_len, device=f"cuda:{device}")
+        data = mint_datum_to_tensordict(data_items, max_token_len_per_gpu=max_token_len, device=f"cuda:{device}")
 
         # Use logprob extractor to get per-token log probabilities
         from mint_server.backend.megatron_training import create_logprob_extractor_fn
@@ -3429,7 +3429,7 @@ class MegatronRankWorker:
         from mint_server.backend.megatron_training import (
             create_reverse_kl_loss_fn,
             create_vocab_parallel_logits_extractor_fn,
-            tinker_to_tensordict,
+            mint_datum_to_tensordict,
         )
         from verl.utils.megatron_peft_utils import _get_rank_checkpoint_path
 
@@ -3500,7 +3500,7 @@ class MegatronRankWorker:
 
         device = torch.cuda.current_device()
         max_token_len = get_model_config(self.base_model).max_model_len
-        student_data = tinker_to_tensordict(
+        student_data = mint_datum_to_tensordict(
             student_items,
             max_token_len_per_gpu=max_token_len,
             device=f"cuda:{device}",
@@ -3508,7 +3508,7 @@ class MegatronRankWorker:
         student_data.set_non_tensor("temperature", float(temperature))
         student_data.set_non_tensor("return_vocab_parallel_logits", True)
         if reference_full_log_prob_chunks is None:
-            reference_data = tinker_to_tensordict(
+            reference_data = mint_datum_to_tensordict(
                 reference_items,
                 max_token_len_per_gpu=max_token_len,
                 device=f"cuda:{device}",
@@ -3699,7 +3699,7 @@ class MegatronRankWorker:
         import torch
         from mint_server.backend.megatron_training import (
             create_vocab_parallel_logits_extractor_fn,
-            tinker_to_tensordict,
+            mint_datum_to_tensordict,
         )
 
         from .mintx_ops import vocab_parallel_log_probs_from_logits_no_grad
@@ -3717,7 +3717,7 @@ class MegatronRankWorker:
 
         device = torch.cuda.current_device()
         max_token_len = get_model_config(self.base_model).max_model_len
-        td = tinker_to_tensordict(data_items, max_token_len_per_gpu=max_token_len, device=f"cuda:{device}")
+        td = mint_datum_to_tensordict(data_items, max_token_len_per_gpu=max_token_len, device=f"cuda:{device}")
         td.set_non_tensor("temperature", float(temperature))
         td.set_non_tensor("return_vocab_parallel_logits", True)
 
@@ -4028,18 +4028,18 @@ class MegatronRankWorker:
 
             _missing = object()
             previous_attr_values = {
-                "_tinker_export_train_attn": getattr(bridge_cls, "_tinker_export_train_attn", _missing),
-                "_tinker_export_train_mlp": getattr(bridge_cls, "_tinker_export_train_mlp", _missing),
-                "_tinker_export_train_unembed": getattr(bridge_cls, "_tinker_export_train_unembed", _missing),
+                "_mint_export_train_attn": getattr(bridge_cls, "_mint_export_train_attn", _missing),
+                "_mint_export_train_mlp": getattr(bridge_cls, "_mint_export_train_mlp", _missing),
+                "_mint_export_train_unembed": getattr(bridge_cls, "_mint_export_train_unembed", _missing),
             }
-            setattr(bridge_cls, "_tinker_export_train_attn", train_attn)
-            setattr(bridge_cls, "_tinker_export_train_mlp", train_mlp)
-            setattr(bridge_cls, "_tinker_export_train_unembed", train_unembed)
+            setattr(bridge_cls, "_mint_export_train_attn", train_attn)
+            setattr(bridge_cls, "_mint_export_train_mlp", train_mlp)
+            setattr(bridge_cls, "_mint_export_train_unembed", train_unembed)
 
             def _allow_target(bridge_self, param_name: str) -> bool:
-                allow_attn = bool(getattr(bridge_self, "_tinker_export_train_attn", True))
-                allow_mlp = bool(getattr(bridge_self, "_tinker_export_train_mlp", True))
-                allow_unembed = bool(getattr(bridge_self, "_tinker_export_train_unembed", True))
+                allow_attn = bool(getattr(bridge_self, "_mint_export_train_attn", True))
+                allow_mlp = bool(getattr(bridge_self, "_mint_export_train_mlp", True))
+                allow_unembed = bool(getattr(bridge_self, "_mint_export_train_unembed", True))
                 tgt = MegatronRankWorker._classify_lora_param_target(param_name.lower())
                 if tgt == "attn":
                     return allow_attn
@@ -6973,11 +6973,11 @@ class MegatronWorkerGroup:
 
         # Create placement group with N GPU bundles
         bundles = [{"GPU": 1, "CPU": 1} for _ in range(world_size)]
-        from .volc_placement import parse_csv
+        from .node_placement import parse_csv
 
         allowed_ips = parse_csv(os.environ.get("MINT_MEGATRON_NODE_IPS_CSV", ""))
         if allowed_ips:
-            from .volc_placement import build_node_affinity_gpu_bundles, select_free_nodes_from_allowed_ips
+            from .node_placement import build_node_affinity_gpu_bundles, select_free_nodes_from_allowed_ips
 
             node_ips, gpus_per_node = select_free_nodes_from_allowed_ips(
                 allowed_node_ips=allowed_ips,
@@ -10083,11 +10083,11 @@ def get_or_create_megatron_worker_group(
         BackendModelActorLaunch,
         publish_backend_model_actor,
     )
-    from .model_registry import is_persistent_model
+    from .model_registry import is_topology_desired_model
 
     config = distributed_config or DistributedConfig()
     num_gpus = config.world_size
-    is_persistent = is_persistent_model(base_model)
+    is_topology_desired = is_topology_desired_model(base_model)
     observability_model = str(observability_base_model or base_model or "unknown")
     request_id = str(request_id or get_request_id() or "") or None
     rank_metadata = {
@@ -10164,7 +10164,7 @@ def get_or_create_megatron_worker_group(
 
     create_lock = _get_megatron_create_lock(actor_name)
     with create_lock:
-        # Try to get existing persistent actor for this model.
+        # Try to get an existing detached actor for this model.
         # Must be inside a per-actor lock to avoid concurrent create_lora_training_client races.
         try:
             with start_as_current_span_from_traceparent(
@@ -10207,7 +10207,7 @@ def get_or_create_megatron_worker_group(
                     "actor_name": str(actor_name),
                     "base_model": str(base_model),
                     "world_size": int(num_gpus),
-                    "is_persistent": bool(is_persistent),
+                    "is_topology_desired": bool(is_topology_desired),
                 },
             ):
                 # Register with model actor registry (reconnection case)
@@ -10218,7 +10218,7 @@ def get_or_create_megatron_worker_group(
                     actor_handle=actor,
                     namespace=PERSISTENT_NAMESPACE,
                     base_model=observability_model,
-                    protected=is_persistent,
+                    protected=is_topology_desired,
                     metadata=rank_metadata,
                 ))
             # NOTE: Do NOT reinit weights here for existing actors.
@@ -10393,17 +10393,6 @@ def get_or_create_megatron_worker_group(
         megatron_model_placement_json = os.environ.get("MINT_MEGATRON_MODEL_PLACEMENT_JSON")
         if explicit_node_ips_csv:
             runtime_env["env_vars"]["MINT_MEGATRON_NODE_IPS_CSV"] = explicit_node_ips_csv
-        elif not megatron_model_placement_json:
-            volc_rq = os.environ.get("MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID", "").strip()
-            if volc_rq:
-                from .volc_placement import list_node_ips_for_resource_queue
-
-                node_ips = list_node_ips_for_resource_queue(resource_queue_id=volc_rq)
-                if not node_ips:
-                    raise RuntimeError(
-                        f"no Ray GPU nodes found for MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID={volc_rq}"
-                    )
-                runtime_env["env_vars"]["MINT_MEGATRON_NODE_IPS_CSV"] = ",".join(node_ips)
 
         timing = os.environ.get("MINT_TIMING_DIAG")
         if timing is not None:
@@ -10425,7 +10414,7 @@ def get_or_create_megatron_worker_group(
                 "base_model": str(base_model),
                 "world_size": int(num_gpus),
                 "session_id": str(session_id) if session_id is not None else None,
-                "is_persistent": bool(is_persistent),
+                "is_topology_desired": bool(is_topology_desired),
             },
         ) as create_span:
             try:
@@ -10471,7 +10460,7 @@ def get_or_create_megatron_worker_group(
                 "base_model": str(base_model),
                 "world_size": int(num_gpus),
                 "session_id": str(session_id) if session_id is not None else None,
-                "is_persistent": bool(is_persistent),
+                "is_topology_desired": bool(is_topology_desired),
             },
         ):
             # Register immediately (creating=True) to account for GPU usage and prevent eviction.
@@ -10485,7 +10474,7 @@ def get_or_create_megatron_worker_group(
                 namespace=PERSISTENT_NAMESPACE,
                 base_model=observability_model,
                 session_id=session_id,
-                protected=is_persistent,
+                protected=is_topology_desired,
                 metadata=rank_metadata,
             ),
                 ready=False,

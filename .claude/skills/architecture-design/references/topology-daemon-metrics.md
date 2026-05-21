@@ -65,8 +65,9 @@ ray:
   head_ip_path: /vePFS-Mindverse/share/mint/prod/ray/head-address/ray_head_ip.txt
 providers:
   volcano:
-    submit_host: mint-prod-volcano
-    volc_bin: /root/.volc/bin/volc
+    region: cn-beijing
+    credentials:
+      mode: default_chain
     templates:
       a800-8gpu-c1:
         template_path: /vePFS-Mindverse/share/mint/prod/mint-server/.claude/skills/volcano-cluster/configs/mint-prod-worker.yaml
@@ -84,11 +85,33 @@ nodes:
 ```
 
 V1 reads desired state from the static config file, then rebuilds runtime state
-from the provider and Ray. For Volcano, `providers.volcano.submit_host` lets the
-server run `volc ml_task list/logs/submit` on the configured bastion instead of
-requiring a local Volcano CLI. Ray liveness is observed from initialized
-`ray.nodes()` when available and from the Ray dashboard `/api/v0/nodes` using
-`ray.dashboard_url` or `ray.head_ip_path`.
+from the provider and Ray. For Volcano, node management uses the Volcano Engine
+ML Platform Python SDK (`volcengine-python-sdk`) from the detached
+`mint_model_actor_supervisor` process. The supervisor must run on the trusted
+driver/control-plane node; model/runtime actors, daemon actors, API workers, and
+ConfigActor must not hold cloud provider credentials.
+
+Volcano SDK credentials use the SDK default credential chain. This can reuse
+credentials created by the Volcano CLI, but only when those credentials are
+available to the driver process. Current SDKs read `VOLCENGINE_ACCESS_KEY` /
+`VOLCENGINE_SECRET_KEY`, `VOLCENGINE_SESSION_TOKEN`, `VOLCENGINE_CLI_CONFIG_FILE`
+or `~/.volcengine/config.json`, OIDC, and ECS role metadata. Older ML Platform
+SDK docs also document `volc configure` writing `~/.volc/config` and
+`~/.volc/credentials` plus `VOLC_ACCESSKEY` / `VOLC_SECRETKEY`; do not rely on
+that legacy location unless the installed SDK version is verified to read it.
+AK/SK, session tokens, signed requests, and credential file contents must not be
+written to topology YAML, ConfigActor snapshots, Ray runtime_env, logs, metrics,
+or `topology_state.yaml`.
+
+The SDK provider lists jobs with `list_jobs`, reads worker IPs from
+`list_job_instances` (`Ips.PrimaryIp` / `Ips.HostIp`), and submits new workers
+with `create_job`. It must not scrape job logs for node IPs. Worker templates
+remain YAML for operator readability, but the provider renders the template and
+then converts the supported fields into a `CreateJobRequest`; unsupported
+template features must fail loudly instead of silently falling back to CLI
+submission. Ray liveness is observed from initialized `ray.nodes()` when
+available and from the Ray dashboard `/api/v0/nodes` using `ray.dashboard_url`
+or `ray.head_ip_path`.
 
 `topology_state.yaml` is output-only debug/runtime state. The supervisor writes
 it atomically after each reconcile; it must not be used as startup recovery
@@ -134,6 +157,17 @@ Accepted topology-aware placement keys:
 - `replica`: optional replica number, normalized into `replica_id`.
 - `labels`: optional selector metadata for future placement policies.
 
+Placement entries with the same `replica` are merged into one multi-node
+runtime replica. Placement entries with distinct `replica` values produce
+distinct `ModelActorSpec` entries and distinct scheduler replicas. Topology
+shape names such as dense, multinode, or model shape should remain supervisor
+metadata rather than actor-name components.
+
+GPU placement entries fail fast if `gpu_count` is missing. A topology placement
+item that names a `worker`, `worker_alias`, `node_ip`, or `node_pin` without a
+GPU count is invalid because the launchers need the resolved placement slices to
+build the per-actor execution contract.
+
 At runtime, the supervisor resolves the alias into `node_ip` and passes only the
 resolved placement to Ray launchers. Raw-IP placement is allowed only as an
 explicit compatibility input at the config boundary. If the alias already exists
@@ -154,7 +188,7 @@ Current implementation requirements:
 
 - `ModelActorSpec` and placement parsing accept alias fields and normalize raw-IP
   compatibility input at the config boundary.
-- `volc_placement`, dense launchers, vLLM launchers, and Megatron launchers
+- `node_placement`, dense launchers, vLLM launchers, and Megatron launchers
   receive resolved node placements and do not parse topology themselves.
 - Raw `node_ip` placement remains a compatibility/pre-existing-node input; new
   configs should use `worker` or `worker_alias`.
@@ -193,7 +227,11 @@ claiming.
 `ModelActorSupervisor` is a detached actor. External operations bootstrap only
 `mint_config`, then `mint_model_actor_supervisor`, then API workers. The
 supervisor ensures the remaining CPU control-plane actors and all desired
-runtime/daemon actors.
+runtime/daemon actors. Starting the supervisor also starts its owned periodic
+reconcile loop; `MINT_ACTOR_RECONCILE_INTERVAL_S` controls the loop interval
+and defaults to 5s. External operations may call one bootstrap command that
+performs the same ordered steps, but API workers must not be the component that
+creates the detached actors.
 
 API processes, route handlers, and backend launchers must access it through a
 client facade instead of importing a process-local singleton as an authority.
@@ -256,10 +294,12 @@ Hard implementation invariants:
 
 `reconcile_once()` should run in this order:
 
-1. refresh/resolve topology
-2. reconcile daemon actors
-3. reconcile model runtime actors
-4. sync model runtime replicas to `ModelWorkScheduler`
+1. ensure Supervisor-owned CPU control-plane dependencies
+2. hydrate desired domains from active scheduler state
+3. refresh/resolve topology
+4. reconcile daemon actors
+5. reconcile model runtime actors
+6. sync model runtime replicas to `ModelWorkScheduler`
 
 Only model runtime actors are synced to the scheduler.
 
@@ -378,10 +418,13 @@ Canonical supervisor wrapper names, if the wrapper actor remains necessary:
 The topology/daemon design introduces only the node metrics daemon actor. Other
 detached control-plane actors such as `mint_task_state_store`,
 `mint_model_work_scheduler`, `mint_config`, `mint_model_actor_supervisor`, and
-`mint_maintenance_cron` are pre-existing durable control-plane state and should
-not be counted as topology daemon actors. Session/index/heartbeat/gateway
-metadata lives under `mint_task_state_store`; do not reintroduce separate
-session metadata-store actors, cleanup-executor actors, or startup-lease actors.
+`mint_maintenance_cron` are durable control-plane state managed outside the
+topology daemon set. External operations bootstrap `mint_config` and
+`mint_model_actor_supervisor`; the supervisor ensures the remaining CPU
+control-plane actors. None of those actors should be counted as topology daemon
+actors. Session/index/heartbeat/gateway metadata lives under
+`mint_task_state_store`; do not reintroduce separate session metadata-store
+actors, cleanup-executor actors, or startup-lease actors.
 
 Do not include these in detached actor names:
 

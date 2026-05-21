@@ -30,7 +30,7 @@ from . import ray_kill
 from .lora_registry import LoRARegistry
 from .ray_placement_groups import remove_named_placement_group
 from .ray_keepalive import ray_get_with_model_actor_supervisor_keepalive
-from .volc_placement import (
+from .node_placement import (
     assert_node_ip_capacity,
     parse_model_gpu_placement,
 )
@@ -1795,17 +1795,16 @@ class MultiModelInferenceManager:
             logger.info("get_engine model=%s stage=after_engine_initialize", model_name)
 
             self._engines[model_name] = engine
-            persistent_csv = os.environ.get("MINT_PERSISTENT_MODELS", "").strip()
-            if persistent_csv:
-                persistent_models = {m.strip() for m in persistent_csv.split(",") if m.strip()}
-                if model_name in persistent_models:
-                    from mint_server.backend.model_actor_supervisor import get_model_actor_supervisor
+            from .model_registry import is_topology_desired_model
 
-                    model_actor_supervisor = get_model_actor_supervisor()
-                    if not model_actor_supervisor.set_protected(actor_name, True):
-                        logger.warning(
-                            f"Failed to protect vLLM actor for persistent model {model_name}: actor={actor_name}"
-                        )
+            if is_topology_desired_model(model_name):
+                from mint_server.backend.model_actor_supervisor import get_model_actor_supervisor
+
+                model_actor_supervisor = get_model_actor_supervisor()
+                if not model_actor_supervisor.set_protected(actor_name, True):
+                    logger.warning(
+                        f"Failed to protect vLLM actor for topology desired model {model_name}: actor={actor_name}"
+                    )
             logger.info(f"Engine created for {model_name}")
             return engine
 

@@ -16,15 +16,13 @@ Unknown keys and type mismatches fail fast at startup with a validation error.
 
 ## Supported keys
 
-Secrets stay in environment variables. `INTERNAL_API_TOKEN` is the production
+Secrets stay in environment variables. `MINT_INTERNAL_API_TOKEN` is the production
 trust boundary between the platform and Mint API process.
 
 ### `[server]`
 
 - `host` (str)
 - `port` (int)
-- `usage_log_dir` (str)
-- `skip_actor_cleanup` (bool) [env: `MINT_SKIP_ACTOR_CLEANUP`]
 - `tensor_parallel_size` (int) [env: `MINT_TP_SIZE`]
 - `data_parallel_size` (int) [env: `MINT_DP_SIZE`]
 - `gpu_memory_utilization` (float) [env: `MINT_GPU_MEM_UTIL`]
@@ -60,7 +58,7 @@ actor/runtime dependency assembly.
 
 ### `[megatron_bridge]`
 
-- `use_mbridge_lora_export` (bool) [env: `USE_MBRIDGE_LORA_EXPORT`]
+- `use_mbridge_lora_export` (bool) [env: `MINT_USE_MBRIDGE_LORA_EXPORT`]
 
 ### `[model_actor_inventory]`
 
@@ -87,13 +85,6 @@ actor/runtime dependency assembly.
 - `dense_get_or_create_timeout_s` (float) [env: `MINT_DENSE_GET_OR_CREATE_TIMEOUT_S`]
 - `reinit_lora_timeout_s` (float) [env: `MINT_REINIT_LORA_TIMEOUT_S`]
 - `actor_ready_timeout_s` (float) [env: `MINT_ACTOR_READY_TIMEOUT_S`]
-
-### `[prewarm]`
-
-- `persistent_models_csv` (str) [env: `MINT_PERSISTENT_MODELS`]
-- `train_lora_rank` (int) [env: `MINT_PERSISTENT_TRAIN_LORA_RANK`]
-- `train_lr` (float) [env: `MINT_PERSISTENT_TRAIN_LR`]
-- `megatron_ready_timeout_s` (float) [env: `MINT_PERSISTENT_MEGATRON_READY_TIMEOUT_S`]
 
 ### `[docs]`
 

@@ -55,7 +55,7 @@ from ..logging_context import (
     start_as_current_span_from_traceparent,
 )
 
-from ..backend.task_state_store import FutureStatus, task_futures
+from ..backend.task_state_store import FutureStatus, billing_observations_from_auth, task_futures
 from ..checkpoint_index import (
     CheckpointAlreadyExistsError,
     CheckpointAlreadyFailedError,
@@ -106,7 +106,6 @@ from ..models.types import (
     TrainStepRequest,
     UntypedAPIFuture,
 )
-from ..usage_store import UsageEvent, schedule_usage_events
 from ..webhook import EventType, send_task_event
 
 if TYPE_CHECKING:
@@ -209,6 +208,27 @@ def _build_training_usage_label(*, model: str, route: str) -> str:
     return f"model={model},route={route},dimension=train"
 
 
+def _build_training_billing_observations(
+    *,
+    gateway_auth: dict | None,
+    request_id: str,
+    model: str,
+    route: str,
+    token_count: int,
+) -> list[dict]:
+    auth_ctx = GatewayAuthContext(**gateway_auth) if gateway_auth else None
+    return billing_observations_from_auth(
+        auth_ctx=auth_ctx,
+        request_id=request_id,
+        charge_item="training",
+        quantity=int(token_count),
+        unit="tokens",
+        route=route,
+        dimension="train",
+        model=model,
+    )
+
+
 def _cleanup_generated_checkpoint_dir(path: str | None) -> None:
     if not path:
         return
@@ -235,10 +255,6 @@ def _training_heartbeat_stale_timeout_s() -> float:
     except Exception:
         logger.warning("Invalid MINT_TRAINING_HEARTBEAT_STALE_S=%r; defaulting to 300s", raw)
         return 300.0
-
-
-async def _persist_usage_events(*, events: list[UsageEvent]) -> None:
-    schedule_usage_events(events)
 
 
 async def _enqueue_training_request_with_trace(
@@ -2571,24 +2587,17 @@ async def _do_forward_backward(
         logger.info(
             f"[{session.model_id}] forward_backward done: elapsed_s={elapsed_s:.3f}"
         )
-        await task_futures.async_resolve(request_id, result)
-        if gateway_auth:
-            auth_ctx = GatewayAuthContext(**gateway_auth)
-            await _persist_usage_events(
-                events=[
-                    UsageEvent(
-                        account_id=auth_ctx.account_id,
-                        apikey_id=auth_ctx.apikey_id,
-                        charge_item="training",
-                        quantity=token_count,
-                        request_id=auth_ctx.request_id,
-                        label=_build_training_usage_label(
-                            model=session.base_model,
-                            route="training.forward_backward",
-                        ),
-                    )
-                ]
-            )
+        await task_futures.async_resolve(
+            request_id,
+            result,
+            billing_observations=_build_training_billing_observations(
+                gateway_auth=gateway_auth,
+                request_id=request_id,
+                model=session.base_model,
+                route="training.forward_backward",
+                token_count=token_count,
+            ),
+        )
 
     except asyncio.CancelledError:
         raise
@@ -2790,24 +2799,17 @@ async def _do_train_step(
         elapsed_s = time.time() - t0
         msg = f"[{session.model_id}] train_step done request_id={request_id} elapsed_s={elapsed_s:.3f}"
         logger.info(msg)
-        await task_futures.async_resolve(request_id, result)
-        if gateway_auth:
-            auth_ctx = GatewayAuthContext(**gateway_auth)
-            await _persist_usage_events(
-                events=[
-                    UsageEvent(
-                        account_id=auth_ctx.account_id,
-                        apikey_id=auth_ctx.apikey_id,
-                        charge_item="training",
-                        quantity=token_count,
-                        request_id=auth_ctx.request_id,
-                        label=_build_training_usage_label(
-                            model=session.base_model,
-                            route="training.train_step",
-                        ),
-                    )
-                ]
-            )
+        await task_futures.async_resolve(
+            request_id,
+            result,
+            billing_observations=_build_training_billing_observations(
+                gateway_auth=gateway_auth,
+                request_id=request_id,
+                model=session.base_model,
+                route="training.train_step",
+                token_count=token_count,
+            ),
+        )
 
     except asyncio.CancelledError:
         raise
@@ -3008,24 +3010,17 @@ async def _do_forward(
         )
         elapsed_s = time.time() - t0
         logger.info(f"[{session.model_id}] forward done: elapsed_s={elapsed_s:.3f}")
-        await task_futures.async_resolve(request_id, result)
-        if gateway_auth:
-            auth_ctx = GatewayAuthContext(**gateway_auth)
-            await _persist_usage_events(
-                events=[
-                    UsageEvent(
-                        account_id=auth_ctx.account_id,
-                        apikey_id=auth_ctx.apikey_id,
-                        charge_item="training",
-                        quantity=token_count,
-                        request_id=auth_ctx.request_id,
-                        label=_build_training_usage_label(
-                            model=session.base_model,
-                            route="training.forward",
-                        ),
-                    )
-                ]
-            )
+        await task_futures.async_resolve(
+            request_id,
+            result,
+            billing_observations=_build_training_billing_observations(
+                gateway_auth=gateway_auth,
+                request_id=request_id,
+                model=session.base_model,
+                route="training.forward",
+                token_count=token_count,
+            ),
+        )
 
     except asyncio.CancelledError:
         raise

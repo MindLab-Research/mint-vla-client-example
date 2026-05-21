@@ -249,7 +249,7 @@ def _prepare_worker_for_forward_backward(worker, monkeypatch):
     worker._resolve_reset_bias = lambda val, default: False
 
     # Patch the heavy imports inside forward_backward body:
-    # 1. tinker_to_tensordict -> returns a dummy
+    # 1. mint_datum_to_tensordict -> returns a dummy
     # 2. create_sft_loss_fn -> returns a dummy
     # 3. torch.cuda.current_device -> returns 0
     # 4. torch.ones -> returns a no-op object
@@ -264,7 +264,7 @@ def _prepare_worker_for_forward_backward(worker, monkeypatch):
     fake_training = types.ModuleType("mint_server.backend.megatron_training")
     fake_training.create_sft_loss_fn = lambda **kw: (lambda *a, **k: None)  # type: ignore
     fake_training.create_ppo_loss_fn = lambda *a, **kw: (lambda *a2, **k2: None)  # type: ignore
-    fake_training.tinker_to_tensordict = lambda *a, **kw: "fake_tensordict"  # type: ignore
+    fake_training.mint_datum_to_tensordict = lambda *a, **kw: "fake_tensordict"  # type: ignore
     monkeypatch.setitem(sys.modules, "mint_server.backend.megatron_training", fake_training)
 
     monkeypatch.setattr(
@@ -3372,9 +3372,9 @@ def test_issue_495_get_lora_state_dict_single_pp_path_restores_bridge_patch(monk
         def export_adapter_weights(self, _module, cpu=True, show_progress=False):
             assert cpu is True
             assert show_progress is False
-            assert getattr(type(self), "_tinker_export_train_attn") is False
-            assert getattr(type(self), "_tinker_export_train_mlp") is True
-            assert getattr(type(self), "_tinker_export_train_unembed") is False
+            assert getattr(type(self), "_mint_export_train_attn") is False
+            assert getattr(type(self), "_mint_export_train_mlp") is True
+            assert getattr(type(self), "_mint_export_train_unembed") is False
             gathered = self._gather_expert_adapter_weight(torch.ones(2))
             assert len(gathered) == 2
             return [("adapter.weight", torch.ones(1))]
@@ -3440,9 +3440,9 @@ def test_issue_495_get_lora_state_dict_single_pp_path_restores_bridge_patch(monk
     assert all_gather_calls == [("cpu", ("gloo", (0, 1)), 2)]
     assert FakeBridge._gather_expert_adapter_weight is original_gather
     assert FakeBridge._megatron_global_adapters_info_all_pp_ranks is original_collect
-    assert not hasattr(FakeBridge, "_tinker_export_train_attn")
-    assert not hasattr(FakeBridge, "_tinker_export_train_mlp")
-    assert not hasattr(FakeBridge, "_tinker_export_train_unembed")
+    assert not hasattr(FakeBridge, "_mint_export_train_attn")
+    assert not hasattr(FakeBridge, "_mint_export_train_mlp")
+    assert not hasattr(FakeBridge, "_mint_export_train_unembed")
 
 
 

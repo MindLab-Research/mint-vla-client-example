@@ -22,6 +22,7 @@ class ModelWorkFinalize:
     kind: str
     request_id: str
     payload: object
+    billing_observations: list[dict] | None = None
 
 
 @dataclass

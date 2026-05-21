@@ -46,7 +46,7 @@ from .vllm_scheduler_observability import (
     install_vllm_iteration_observability_patches,
     make_vllm_stats_logger_factory,
 )
-from .volc_placement import (
+from .node_placement import (
     assert_node_ip_capacity,
     ModelGpuPlacement,
     parse_model_gpu_placement,
@@ -184,7 +184,7 @@ def _patch_vllm_fused_moe_slice_for_fully_sharded_loras() -> None:
         original = getattr(cls, "_slice_w13_a", None)
         if original is None:
             raise RuntimeError(f"vLLM class {cls.__name__} has no _slice_w13_a")
-        if getattr(original, "_tinker_patched_fully_sharded", False):
+        if getattr(original, "_mint_patched_fully_sharded", False):
             return
 
         def _slice_w13_a(self, w13_lora_a):  # type: ignore[no-untyped-def]
@@ -207,7 +207,7 @@ def _patch_vllm_fused_moe_slice_for_fully_sharded_loras() -> None:
             end_idx = (self.tp_rank + 1) * sliced_rank
             return w13_lora_a[:, start_idx:end_idx, :]
 
-        _slice_w13_a._tinker_patched_fully_sharded = True  # type: ignore[attr-defined]
+        _slice_w13_a._mint_patched_fully_sharded = True  # type: ignore[attr-defined]
         cls._slice_w13_a = _slice_w13_a  # type: ignore[method-assign]
 
     for name in ("FusedMoEWithLoRA", "FusedMoE3DWithLoRA"):
@@ -224,7 +224,7 @@ def _node_affinity_scheduling_opts_for_model(
 ) -> dict[str, Any]:
     """Optional single-node pinning for vLLM actors (mp backend).
 
-    Use-case: pack MoE inference+training on the same 8-GPU node during prewarm.
+    Use-case: pack MoE inference+training on the same 8-GPU node under topology placement.
     Controlled by MINT_VLLM_MODEL_PLACEMENT_JSON or MINT_MODEL_PLACEMENT_JSON.
     """
     if not model_name:
@@ -1231,10 +1231,10 @@ def _create_mint_vllm_multinode_actor(
                 pack_moe_orig = getattr(pack_moe_cm, "__func__", None)
                 pack_moe_sparse_ok = bool(getattr(pack_moe_orig, "__mint_sparse_ok__", False))
                 lora_opt_safe = bool(
-                    getattr(getattr(LoRA, "optimize", None), "_tinker_overlap_safe", False)
+                    getattr(getattr(LoRA, "optimize", None), "_mint_overlap_safe", False)
                 )
                 packed_opt_safe = bool(
-                    getattr(getattr(Packed, "optimize", None), "_tinker_overlap_safe", False)
+                    getattr(getattr(Packed, "optimize", None), "_mint_overlap_safe", False)
                 )
             except Exception as e:
                 pack_moe_sparse_ok = False
@@ -2332,11 +2332,9 @@ class MultiNodeInferenceEngine:
             else:
                 init_timeout = 600
 
-            is_persistent = False
-            persistent_csv = os.environ.get("MINT_PERSISTENT_MODELS", "").strip()
-            if persistent_csv and self.model_name:
-                persistent_models = {m.strip() for m in persistent_csv.split(",") if m.strip()}
-                is_persistent = self.model_name in persistent_models
+            from .model_registry import is_topology_desired_model
+
+            is_topology_desired = bool(self.model_name and is_topology_desired_model(self.model_name))
 
             def _attach_existing_actor(existing_actor_handle) -> None:
                 self.engine = existing_actor_handle
@@ -2354,7 +2352,7 @@ class MultiNodeInferenceEngine:
                     actor_handle=self.engine,
                     namespace=PERSISTENT_NAMESPACE,
                     base_model=self.model_path,
-                    protected=is_persistent,
+                    protected=is_topology_desired,
                 ))
 
             # Try to connect to existing actor
@@ -2475,9 +2473,8 @@ class MultiNodeInferenceEngine:
                     raise RuntimeError(
                         f"MINT_MODEL_PLACEMENT_JSON GPU count mismatch for model={self.model_name!r}: "
                         f"need {worker_gpus} GPUs, got {preferred_placement.total_gpus}"
-                    )
+                )
                 node_ips = preferred_placement.node_ips
-                volc_rq = ""
                 logger.info(
                     "[MultiNodeInferenceEngine] Using pinned placement for model=%s slices=%s",
                     self.model_name,
@@ -2517,54 +2514,6 @@ class MultiNodeInferenceEngine:
                         pg_bundles=pg_bundles + [resources.pg_bundles[-1]],
                         controller_bundle_index=int(worker_gpus),
                     )
-            else:
-                k2_models = ("moonshotai/Kimi-K2-Instruct", "unsloth/Kimi-K2-Instruct-0905-BF16")
-                if self.model_name in k2_models:
-                    volc_rq = os.environ.get("MINT_K2_INFER_VOLC_RESOURCE_QUEUE_ID", "").strip()
-                    if not volc_rq:
-                        raise RuntimeError(
-                            "K2 multinode inference requires MINT_K2_INFER_VOLC_RESOURCE_QUEUE_ID to be set "
-                            "(expected to pin vLLM workers to queue C2)"
-                        )
-                else:
-                    volc_rq = (
-                        os.environ.get("MINT_VLLM_VOLC_RESOURCE_QUEUE_ID", "").strip()
-                        or os.environ.get("MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID", "").strip()
-                    )
-
-            if volc_rq:
-                from .volc_placement import select_free_nodes_for_resource_queue
-
-                node_ips, gpus_per_node = select_free_nodes_for_resource_queue(
-                    resource_queue_id=volc_rq,
-                    required_gpus=worker_gpus,
-                )
-                logger.info(
-                    f"[MultiNodeInferenceEngine] Volcano placement model={self.model_name} "
-                    f"rq={volc_rq} nodes={node_ips}"
-                )
-                if distributed_executor_backend == "mp":
-                    # mp backend must run on a single node with all GPUs visible.
-                    if not node_ips:
-                        raise RuntimeError(
-                            f"no Volcano nodes selected for mp vLLM (rq={volc_rq}, required_gpus={worker_gpus})"
-                        )
-                    if len(node_ips) != 1:
-                        raise RuntimeError(
-                            f"mp vLLM requires exactly 1 node, got nodes={node_ips} (rq={volc_rq})"
-                        )
-                    mp_pinned_node_ip = node_ips[0]
-                    logger.info(
-                        f"[MultiNodeInferenceEngine] mp pin model={self.model_name} node={mp_pinned_node_ip}"
-                    )
-                else:
-                    resources = compute_multinode_engine_resources(
-                        worker_gpus, preferred_node_ips=node_ips, gpus_per_node=gpus_per_node
-                    )
-                    controller_gpus = resources.controller_gpus
-                    controller_cpus = resources.controller_cpus
-                    total_required_gpus = resources.total_required_gpus
-
             # Ensure shared adapter directory exists
             os.makedirs(self.shared_adapter_dir, exist_ok=True)
 
@@ -2898,7 +2847,7 @@ class MultiNodeInferenceEngine:
                 actor_handle=self.engine,
                 namespace=PERSISTENT_NAMESPACE,
                 base_model=self.model_path,
-                protected=is_persistent,
+                protected=is_topology_desired,
             ))
             logger.info(
                 f"Published {self.actor_name} through ModelActorSupervisor inventory ({total_required_gpus} GPUs)"

@@ -236,7 +236,7 @@ def _patch_vllm_fused_moe_slice_for_fully_sharded_loras() -> None:
         original = getattr(cls, "_slice_w13_a", None)
         if original is None:
             raise RuntimeError(f"vLLM class {cls.__name__} has no _slice_w13_a")
-        if getattr(original, "_tinker_patched_fully_sharded", False):
+        if getattr(original, "_mint_patched_fully_sharded", False):
             return
 
         def _slice_w13_a(self, w13_lora_a):  # type: ignore[no-untyped-def]
@@ -276,7 +276,7 @@ def _patch_vllm_fused_moe_slice_for_fully_sharded_loras() -> None:
                 return w13_lora_a[:, start_idx:end_idx, :]
             return w13_lora_a[:, :, start_idx:end_idx]
 
-        _slice_w13_a._tinker_patched_fully_sharded = True  # type: ignore[attr-defined]
+        _slice_w13_a._mint_patched_fully_sharded = True  # type: ignore[attr-defined]
         cls._slice_w13_a = _slice_w13_a  # type: ignore[method-assign]
 
     for name in ("FusedMoEWithLoRA", "FusedMoE3DWithLoRA"):
@@ -310,7 +310,7 @@ def _patch_vllm_ray_executor_sample_tokens_no_compiled_dag() -> None:
     original = getattr(cls, "sample_tokens", None)
     if original is None:
         raise RuntimeError("vLLM RayDistributedExecutor missing sample_tokens")
-    if getattr(original, "_tinker_patched_no_compiled_dag_sample", False):
+    if getattr(original, "_mint_patched_no_compiled_dag_sample", False):
         return
 
     completed_none = getattr(ray_exec_mod, "COMPLETED_NONE_FUTURE")
@@ -356,14 +356,14 @@ def _patch_vllm_ray_executor_sample_tokens_no_compiled_dag() -> None:
         if self.scheduler_output is None:
             return completed_none if non_block else None
 
-        if not getattr(self, "_tinker_logged_no_cdag_sample", False):
+        if not getattr(self, "_mint_logged_no_cdag_sample", False):
             print(
                 "[mint patch] RayDistributedExecutor.sample_tokens using "
                 "no-compiled-dag fallback",
                 file=sys.stderr,
                 flush=True,
             )
-            self._tinker_logged_no_cdag_sample = True
+            self._mint_logged_no_cdag_sample = True
 
         if not non_block:
             return _run_plain_collective(self, grammar_output)
@@ -383,7 +383,7 @@ def _patch_vllm_ray_executor_sample_tokens_no_compiled_dag() -> None:
         ).start()
         return fut
 
-    sample_tokens._tinker_patched_no_compiled_dag_sample = True  # type: ignore[attr-defined]
+    sample_tokens._mint_patched_no_compiled_dag_sample = True  # type: ignore[attr-defined]
     cls.sample_tokens = sample_tokens  # type: ignore[method-assign]
 
 
@@ -402,7 +402,7 @@ def _patch_vllm_ray_executor_use_explicit_cluster_address() -> None:
     original = getattr(ray_utils_mod, "initialize_ray_cluster", None)
     if original is None:
         raise RuntimeError("vLLM missing initialize_ray_cluster")
-    if getattr(original, "_tinker_patched_explicit_cluster_address", False):
+    if getattr(original, "_mint_patched_explicit_cluster_address", False):
         return
 
     def initialize_ray_cluster(parallel_config, ray_address=None):  # type: ignore[no-untyped-def]
@@ -429,7 +429,7 @@ def _patch_vllm_ray_executor_use_explicit_cluster_address() -> None:
             )
         return original(parallel_config, ray_address=addr)
 
-    initialize_ray_cluster._tinker_patched_explicit_cluster_address = True  # type: ignore[attr-defined]
+    initialize_ray_cluster._mint_patched_explicit_cluster_address = True  # type: ignore[attr-defined]
     ray_utils_mod.initialize_ray_cluster = initialize_ray_cluster  # type: ignore[assignment]
     ray_exec_mod.initialize_ray_cluster = initialize_ray_cluster  # type: ignore[assignment]
 
@@ -462,7 +462,7 @@ def _patch_vllm_skip_dummy_lora_setup_when_inactive() -> None:
         raise RuntimeError(
             "vLLM LoRAModelRunnerMixin missing maybe_dummy_run_with_lora"
         )
-    if getattr(original, "_tinker_patched_skip_dummy_inactive", False):
+    if getattr(original, "_mint_patched_skip_dummy_inactive", False):
         return
     original_sig = inspect.signature(original)
 
@@ -511,7 +511,7 @@ def _patch_vllm_skip_dummy_lora_setup_when_inactive() -> None:
         ):
             yield
 
-    maybe_dummy_run_with_lora._tinker_patched_skip_dummy_inactive = True  # type: ignore[attr-defined]
+    maybe_dummy_run_with_lora._mint_patched_skip_dummy_inactive = True  # type: ignore[attr-defined]
     cls.maybe_dummy_run_with_lora = maybe_dummy_run_with_lora  # type: ignore[method-assign]
 
 
@@ -536,7 +536,7 @@ def _patch_vllm_profile_run_disable_dummy_active_loras() -> None:
     original = getattr(cls, "_dummy_run", None)
     if original is None:
         raise RuntimeError("vLLM GPUModelRunner missing _dummy_run")
-    if getattr(original, "_tinker_patched_disable_profile_dummy_loras", False):
+    if getattr(original, "_mint_patched_disable_profile_dummy_loras", False):
         return
     try:
         original_sig = inspect.signature(original)
@@ -592,7 +592,7 @@ def _patch_vllm_profile_run_disable_dummy_active_loras() -> None:
                     old_bypass_dense
                 )
 
-    _dummy_run._tinker_patched_disable_profile_dummy_loras = True  # type: ignore[attr-defined]
+    _dummy_run._mint_patched_disable_profile_dummy_loras = True  # type: ignore[attr-defined]
     cls._dummy_run = _dummy_run  # type: ignore[method-assign]
 
 
@@ -615,7 +615,7 @@ def _patch_vllm_fused_moe_lora_profile_noop() -> None:
         return
 
     def _wrap_noop(original):  # type: ignore[no-untyped-def]
-        if not callable(original) or getattr(original, "_tinker_profile_noop", False):
+        if not callable(original) or getattr(original, "_mint_profile_noop", False):
             return original
 
         def wrapped(*args, **kwargs):  # type: ignore[no-untyped-def]
@@ -623,7 +623,7 @@ def _patch_vllm_fused_moe_lora_profile_noop() -> None:
                 return original(*args, **kwargs)
             return None
 
-        wrapped._tinker_profile_noop = True  # type: ignore[attr-defined]
+        wrapped._mint_profile_noop = True  # type: ignore[attr-defined]
         return wrapped
 
     for name in (
@@ -650,7 +650,7 @@ def _patch_vllm_fused_moe_lora_profile_noop() -> None:
     add_lora_embedding = getattr(punica_gpu, "PunicaWrapperGPU", None)
     add_lora_embedding = getattr(add_lora_embedding, "add_lora_embedding", None)
     if callable(add_lora_embedding) and not getattr(
-        add_lora_embedding, "_tinker_profile_noop", False
+        add_lora_embedding, "_mint_profile_noop", False
     ):
 
         def wrapped_add_lora_embedding(
@@ -662,7 +662,7 @@ def _patch_vllm_fused_moe_lora_profile_noop() -> None:
                 self, y, x, lora_b_stacked, add_inputs=add_inputs, **kwargs
             )
 
-        wrapped_add_lora_embedding._tinker_profile_noop = True  # type: ignore[attr-defined]
+        wrapped_add_lora_embedding._mint_profile_noop = True  # type: ignore[attr-defined]
         punica_gpu.PunicaWrapperGPU.add_lora_embedding = wrapped_add_lora_embedding  # type: ignore[method-assign]
 
     try:
@@ -674,7 +674,7 @@ def _patch_vllm_fused_moe_lora_profile_noop() -> None:
     except Exception:
         return
     if callable(vocab_forward) and not getattr(
-        vocab_forward, "_tinker_profile_noop", False
+        vocab_forward, "_mint_profile_noop", False
     ):
 
         def wrapped_vocab_forward(self, x):  # type: ignore[no-untyped-def]
@@ -682,7 +682,7 @@ def _patch_vllm_fused_moe_lora_profile_noop() -> None:
                 return self.base_layer.forward(x)
             return vocab_forward(self, x)
 
-        wrapped_vocab_forward._tinker_profile_noop = True  # type: ignore[attr-defined]
+        wrapped_vocab_forward._mint_profile_noop = True  # type: ignore[attr-defined]
         vocab_cls.forward = wrapped_vocab_forward  # type: ignore[method-assign]
 
 
@@ -703,7 +703,7 @@ def _patch_vllm_profile_run_scope_bypass_fused_moe_lora() -> None:
 
     original = getattr(cls, "profile_run", None)
     if not callable(original) or getattr(
-        original, "_tinker_profile_scope_bypass", False
+        original, "_mint_profile_scope_bypass", False
     ):
         return
 
@@ -718,7 +718,7 @@ def _patch_vllm_profile_run_scope_bypass_fused_moe_lora() -> None:
             else:
                 os.environ["MINT_VLLM_BYPASS_FUSED_MOE_LORA_OP"] = old
 
-    profile_run._tinker_profile_scope_bypass = True  # type: ignore[attr-defined]
+    profile_run._mint_profile_scope_bypass = True  # type: ignore[attr-defined]
     cls.profile_run = profile_run  # type: ignore[method-assign]
 
 
@@ -747,7 +747,7 @@ def _patch_vllm_unquantized_moe_startup_use_naive_batched_experts() -> None:
     original = getattr(cls, "select_gemm_impl", None)
     if not callable(original):
         raise RuntimeError("vLLM UnquantizedFusedMoEMethod missing select_gemm_impl")
-    if getattr(original, "_tinker_patched_startup_naive_batched", False):
+    if getattr(original, "_mint_patched_startup_naive_batched", False):
         return
 
     def select_gemm_impl(self, prepare_finalize, layer):  # type: ignore[no-untyped-def]
@@ -768,7 +768,7 @@ def _patch_vllm_unquantized_moe_startup_use_naive_batched_experts() -> None:
             )
         return original(self, prepare_finalize, layer)
 
-    select_gemm_impl._tinker_patched_startup_naive_batched = True  # type: ignore[attr-defined]
+    select_gemm_impl._mint_patched_startup_naive_batched = True  # type: ignore[attr-defined]
     cls.select_gemm_impl = select_gemm_impl  # type: ignore[method-assign]
 
 
@@ -791,7 +791,7 @@ def _patch_vllm_fused_moe_forward_startup_fake() -> None:
     original = getattr(cls, "forward_native", None)
     if not callable(original):
         raise RuntimeError("vLLM FusedMoE missing forward_native")
-    if getattr(original, "_tinker_patched_startup_fake_forward", False):
+    if getattr(original, "_mint_patched_startup_fake_forward", False):
         return
 
     def forward_native(self, hidden_states, router_logits):  # type: ignore[no-untyped-def]
@@ -807,7 +807,7 @@ def _patch_vllm_fused_moe_forward_startup_fake() -> None:
             return fused_out
         return torch.zeros_like(hidden_states), fused_out
 
-    forward_native._tinker_patched_startup_fake_forward = True  # type: ignore[attr-defined]
+    forward_native._mint_patched_startup_fake_forward = True  # type: ignore[attr-defined]
     cls.forward_native = forward_native  # type: ignore[method-assign]
 
 
@@ -819,7 +819,7 @@ def _patch_vllm_invoke_fused_moe_kernel_startup_noop() -> bool:
     original = getattr(fused_moe_mod, "invoke_fused_moe_kernel", None)
     if not callable(original):
         return False
-    if getattr(original, "_tinker_patched_startup_noop", False):
+    if getattr(original, "_mint_patched_startup_noop", False):
         return True
 
     def invoke_fused_moe_kernel(*args, **kwargs):  # type: ignore[no-untyped-def]
@@ -838,7 +838,7 @@ def _patch_vllm_invoke_fused_moe_kernel_startup_noop() -> bool:
         output.zero_()
         return None
 
-    invoke_fused_moe_kernel._tinker_patched_startup_noop = True  # type: ignore[attr-defined]
+    invoke_fused_moe_kernel._mint_patched_startup_noop = True  # type: ignore[attr-defined]
     fused_moe_mod.invoke_fused_moe_kernel = invoke_fused_moe_kernel  # type: ignore[assignment]
     return True
 
@@ -862,7 +862,7 @@ def _patch_vllm_device_memory_profiler_skip_exit_measure() -> None:
     original = getattr(cls, "__exit__", None)
     if original is None:
         raise RuntimeError("vLLM DeviceMemoryProfiler missing __exit__")
-    if getattr(original, "_tinker_patched_skip_exit_measure", False):
+    if getattr(original, "_mint_patched_skip_exit_measure", False):
         return
 
     def __exit__(self, exc_type, exc_val, exc_tb):  # type: ignore[no-untyped-def]
@@ -872,7 +872,7 @@ def _patch_vllm_device_memory_profiler_skip_exit_measure() -> None:
 
         gc.collect()
 
-    __exit__._tinker_patched_skip_exit_measure = True  # type: ignore[attr-defined]
+    __exit__._mint_patched_skip_exit_measure = True  # type: ignore[attr-defined]
     cls.__exit__ = __exit__  # type: ignore[method-assign]
 
 
@@ -899,7 +899,7 @@ def _patch_vllm_skip_startup_memory_profile() -> None:
 
     original = getattr(cls, "determine_available_memory", None)
     if not callable(original) or getattr(
-        original, "_tinker_skip_startup_profile", False
+        original, "_mint_skip_startup_profile", False
     ):
         return
 
@@ -928,7 +928,7 @@ def _patch_vllm_skip_startup_memory_profile() -> None:
         gc.collect()
         return available_kv_cache_memory_bytes
 
-    determine_available_memory._tinker_skip_startup_profile = True  # type: ignore[attr-defined]
+    determine_available_memory._mint_skip_startup_profile = True  # type: ignore[attr-defined]
     cls.determine_available_memory = determine_available_memory  # type: ignore[method-assign]
 
 
@@ -952,7 +952,7 @@ def _patch_vllm_dummy_lora_weights_use_empty() -> None:
     original = getattr(LoRALayerWeights, "create_dummy_lora_weights", None)
     if original is None:
         raise RuntimeError("vLLM create_dummy_lora_weights missing; cannot patch")
-    if getattr(original, "_tinker_patched_dummy_empty", False):
+    if getattr(original, "_mint_patched_dummy_empty", False):
         return
 
     is_pin_memory_available = getattr(lw, "is_pin_memory_available", None)
@@ -990,7 +990,7 @@ def _patch_vllm_dummy_lora_weights_use_empty() -> None:
             lora_b=lora_b,
         )
 
-    create_dummy_lora_weights._tinker_patched_dummy_empty = True  # type: ignore[attr-defined]
+    create_dummy_lora_weights._mint_patched_dummy_empty = True  # type: ignore[attr-defined]
     LoRALayerWeights.create_dummy_lora_weights = create_dummy_lora_weights  # type: ignore[method-assign]
 
 
@@ -1007,13 +1007,13 @@ def _patch_vllm_lora_from_tensors_disable_pin_memory() -> None:
     import vllm.lora.lora_model as lora_model  # type: ignore
 
     current = getattr(lora_model, "is_pin_memory_available", None)
-    if current is None or getattr(current, "_tinker_disable_pin_memory", False):
+    if current is None or getattr(current, "_mint_disable_pin_memory", False):
         return
 
     def _disabled_pin_memory() -> bool:
         return False
 
-    _disabled_pin_memory._tinker_disable_pin_memory = True  # type: ignore[attr-defined]
+    _disabled_pin_memory._mint_disable_pin_memory = True  # type: ignore[attr-defined]
     lora_model.is_pin_memory_available = _disabled_pin_memory  # type: ignore[assignment]
 
 
@@ -1030,7 +1030,7 @@ def _patch_vllm_worker_lora_load_to_device() -> None:
     from vllm.lora.worker_manager import WorkerLoRAManager
 
     original = getattr(WorkerLoRAManager, "_load_adapter", None)
-    if not callable(original) or getattr(original, "_tinker_load_to_device", False):
+    if not callable(original) or getattr(original, "_mint_load_to_device", False):
         return
 
     def _load_adapter(self, lora_request):  # type: ignore[no-untyped-def]
@@ -1077,7 +1077,7 @@ def _patch_vllm_worker_lora_load_to_device() -> None:
                 f"Loading lora {lora_request.lora_name} failed: No adapter found for {lora_request.lora_path}"
             ) from e
 
-    _load_adapter._tinker_load_to_device = True  # type: ignore[attr-defined]
+    _load_adapter._mint_load_to_device = True  # type: ignore[attr-defined]
     WorkerLoRAManager._load_adapter = _load_adapter  # type: ignore[method-assign]
 
 
@@ -1091,10 +1091,10 @@ class _SparseShardTensor:
     ):  # type: ignore[no-untyped-def]
         if not shard_tensors:
             raise RuntimeError("Sparse shard tensor requires representative tensors")
-        self._tinker_sparse_shards = tuple(shard_tensors)
-        self._tinker_shard_starts = tuple(int(x) for x in shard_starts)
-        self._tinker_num_experts = int(num_experts)
-        self._tinker_scale_factors = (
+        self._mint_sparse_shards = tuple(shard_tensors)
+        self._mint_shard_starts = tuple(int(x) for x in shard_starts)
+        self._mint_num_experts = int(num_experts)
+        self._mint_scale_factors = (
             None if scale_factors is None else tuple(float(x) for x in scale_factors)
         )
         first = shard_tensors[0]
@@ -1103,18 +1103,18 @@ class _SparseShardTensor:
 
     def map(self, fn):  # type: ignore[no-untyped-def]
         return _SparseShardTensor(
-            tuple(fn(t) for t in self._tinker_sparse_shards),
-            self._tinker_shard_starts,
-            self._tinker_num_experts,
-            self._tinker_scale_factors,
+            tuple(fn(t) for t in self._mint_sparse_shards),
+            self._mint_shard_starts,
+            self._mint_num_experts,
+            self._mint_scale_factors,
         )
 
     def get_rep(self, rep_idx: int):  # type: ignore[no-untyped-def]
         rep_idx = int(rep_idx)
-        rep = self._tinker_sparse_shards[rep_idx]
-        if self._tinker_scale_factors is None:
+        rep = self._mint_sparse_shards[rep_idx]
+        if self._mint_scale_factors is None:
             return rep
-        return rep * self._tinker_scale_factors[rep_idx]
+        return rep * self._mint_scale_factors[rep_idx]
 
     def pin_memory(self):  # type: ignore[no-untyped-def]
         return self
@@ -1376,7 +1376,7 @@ def _patch_vllm_fused_moe_set_lora_sparse_shards() -> None:
     def _get_spans(
         tensor: "torch.Tensor", num_experts: int
     ) -> list[tuple[int, int]] | None:  # type: ignore[name-defined]
-        starts = getattr(tensor, "_tinker_shard_starts", None)
+        starts = getattr(tensor, "_mint_shard_starts", None)
         if starts is None:
             return None
         starts = [int(x) for x in starts]
@@ -1390,10 +1390,10 @@ def _patch_vllm_fused_moe_set_lora_sparse_shards() -> None:
             raise RuntimeError(
                 f"Sparse MoE shard metadata must be sorted: starts={starts}"
             )
-        if int(getattr(tensor, "_tinker_num_experts", num_experts)) != num_experts:
+        if int(getattr(tensor, "_mint_num_experts", num_experts)) != num_experts:
             raise RuntimeError(
                 "Sparse MoE shard metadata num_experts mismatch: "
-                f"tensor_num_experts={getattr(tensor, '_tinker_num_experts', None)} expected={num_experts}"
+                f"tensor_num_experts={getattr(tensor, '_mint_num_experts', None)} expected={num_experts}"
             )
         if tensor.shape[0] != len(starts):
             raise RuntimeError(
@@ -1418,7 +1418,7 @@ def _patch_vllm_fused_moe_set_lora_sparse_shards() -> None:
     ) -> None:  # type: ignore[name-defined]
         for rep_idx, (start, end) in enumerate(spans):
             expert_count = end - start
-            if hasattr(src, "_tinker_sparse_shards"):
+            if hasattr(src, "_mint_sparse_shards"):
                 rep = src.get_rep(rep_idx)
             else:
                 rep = src[rep_idx : rep_idx + 1]
@@ -1453,7 +1453,7 @@ def _patch_vllm_fused_moe_set_lora_sparse_shards() -> None:
             target_view.copy_(expanded, non_blocking=True)
 
     def _slice_sparse(src, slicer, reshape_fn=None):  # type: ignore[no-untyped-def]
-        if hasattr(src, "_tinker_sparse_shards"):
+        if hasattr(src, "_mint_sparse_shards"):
             if reshape_fn is None:
                 return src.map(slicer)
             return src.map(lambda t: slicer(reshape_fn(t)))
@@ -1465,7 +1465,7 @@ def _patch_vllm_fused_moe_set_lora_sparse_shards() -> None:
     original = getattr(cls, "set_lora", None)
     if not callable(original):
         raise RuntimeError("vLLM FusedMoEWithLoRA.set_lora missing")
-    if not getattr(original, "_tinker_sparse_shards", False):
+    if not getattr(original, "_mint_sparse_shards", False):
 
         def set_lora(self, index: int, lora_a, lora_b):  # type: ignore[no-untyped-def]
             assert isinstance(lora_a, list)
@@ -1552,7 +1552,7 @@ def _patch_vllm_fused_moe_set_lora_sparse_shards() -> None:
                     flush=True,
                 )
 
-        set_lora._tinker_sparse_shards = True  # type: ignore[attr-defined]
+        set_lora._mint_sparse_shards = True  # type: ignore[attr-defined]
         cls.set_lora = set_lora  # type: ignore[method-assign]
 
     cls3d = getattr(fused_moe_mod, "FusedMoE3DWithLoRA", None)
@@ -1561,7 +1561,7 @@ def _patch_vllm_fused_moe_set_lora_sparse_shards() -> None:
     original3d = getattr(cls3d, "set_lora", None)
     if not callable(original3d):
         raise RuntimeError("vLLM FusedMoE3DWithLoRA.set_lora missing")
-    if not getattr(original3d, "_tinker_sparse_shards", False):
+    if not getattr(original3d, "_mint_sparse_shards", False):
 
         def set_lora_3d(self, index: int, lora_a, lora_b):  # type: ignore[no-untyped-def]
             assert isinstance(lora_a, list)
@@ -1586,7 +1586,7 @@ def _patch_vllm_fused_moe_set_lora_sparse_shards() -> None:
             w13_lora_a, w2_lora_a = lora_a
             w13_lora_b, w2_lora_b = lora_b
             src_experts = len(spans)
-            if not hasattr(w13_lora_a, "_tinker_sparse_shards"):
+            if not hasattr(w13_lora_a, "_mint_sparse_shards"):
                 w13_lora_a = w13_lora_a.reshape(src_experts, -1, w13_lora_a.shape[-1])
                 w2_lora_a = w2_lora_a.reshape(src_experts, -1, w2_lora_a.shape[-1])
                 w13_lora_b = w13_lora_b.reshape(
@@ -1648,7 +1648,7 @@ def _patch_vllm_fused_moe_set_lora_sparse_shards() -> None:
                     flush=True,
                 )
 
-        set_lora_3d._tinker_sparse_shards = True  # type: ignore[attr-defined]
+        set_lora_3d._mint_sparse_shards = True  # type: ignore[attr-defined]
         cls3d.set_lora = set_lora_3d  # type: ignore[method-assign]
 
 
@@ -1683,7 +1683,7 @@ def _patch_vllm_lora_optimize_overlap_safe() -> None:
             return False
 
     orig_opt = getattr(LoRA, "optimize", None)
-    if callable(orig_opt) and not getattr(orig_opt, "_tinker_overlap_safe", False):
+    if callable(orig_opt) and not getattr(orig_opt, "_mint_overlap_safe", False):
 
         def optimize(self):  # type: ignore[no-untyped-def]
             if getattr(self, "scaling", 1) == 1:
@@ -1698,11 +1698,11 @@ def _patch_vllm_lora_optimize_overlap_safe() -> None:
             self.scaling = 1
             return self
 
-        optimize._tinker_overlap_safe = True  # type: ignore[attr-defined]
+        optimize._mint_overlap_safe = True  # type: ignore[attr-defined]
         LoRA.optimize = optimize  # type: ignore[method-assign]
 
     orig_popt = getattr(Packed, "optimize", None)
-    if callable(orig_popt) and not getattr(orig_popt, "_tinker_overlap_safe", False):
+    if callable(orig_popt) and not getattr(orig_popt, "_mint_overlap_safe", False):
 
         def optimize(self):  # type: ignore[no-untyped-def]
             for i in range(len(self.lora_b)):
@@ -1716,7 +1716,7 @@ def _patch_vllm_lora_optimize_overlap_safe() -> None:
                 self.scaling[i] = 1  # type: ignore
             return self
 
-        optimize._tinker_overlap_safe = True  # type: ignore[attr-defined]
+        optimize._mint_overlap_safe = True  # type: ignore[attr-defined]
         Packed.optimize = optimize  # type: ignore[method-assign]
 
 
@@ -1744,7 +1744,7 @@ def _patch_vllm_lora_pin_memory_overlap_safe() -> None:
         return
 
     orig = getattr(LoRAModelManager, "_create_merged_loras_inplace", None)
-    if not callable(orig) or getattr(orig, "_tinker_pin_memory_overlap_safe", False):
+    if not callable(orig) or getattr(orig, "_mint_pin_memory_overlap_safe", False):
         return
 
     def _create_merged_loras_inplace(self, lora_model):  # type: ignore[no-untyped-def]
@@ -1768,7 +1768,7 @@ def _patch_vllm_lora_pin_memory_overlap_safe() -> None:
         finally:
             torch.Tensor.pin_memory = orig_pin  # type: ignore[assignment]
 
-    _create_merged_loras_inplace._tinker_pin_memory_overlap_safe = True  # type: ignore[attr-defined]
+    _create_merged_loras_inplace._mint_pin_memory_overlap_safe = True  # type: ignore[attr-defined]
     LoRAModelManager._create_merged_loras_inplace = _create_merged_loras_inplace  # type: ignore[method-assign]
 
 
@@ -1789,7 +1789,7 @@ def _patch_vllm_ray_env_carry_over_pythonpath() -> None:
         return
 
     orig = getattr(ray_env, "get_env_vars_to_copy", None)
-    if not callable(orig) or getattr(orig, "_tinker_pythonpath_carryover", False):
+    if not callable(orig) or getattr(orig, "_mint_pythonpath_carryover", False):
         return
 
     def get_env_vars_to_copy(  # type: ignore[no-untyped-def]
@@ -1819,12 +1819,12 @@ def _patch_vllm_ray_env_carry_over_pythonpath() -> None:
             destination=destination,
         )
 
-    get_env_vars_to_copy._tinker_pythonpath_carryover = True  # type: ignore[attr-defined]
+    get_env_vars_to_copy._mint_pythonpath_carryover = True  # type: ignore[attr-defined]
     ray_env.get_env_vars_to_copy = get_env_vars_to_copy  # type: ignore[method-assign]
 
 
 def _patch_ray_placement_group_bundle_cache() -> None:
-    """Handle Ray state payloads that omit `bundles` for direct PG lookup."""
+    """Handle Ray state payloads that omit `bundles` for direct placement-group lookup."""
     try:
         import importlib
 
@@ -1833,7 +1833,7 @@ def _patch_ray_placement_group_bundle_cache() -> None:
         return
 
     original = getattr(pg_mod, "_get_bundle_cache", None)
-    if not callable(original) or getattr(original, "_tinker_bundle_cache_patch", False):
+    if not callable(original) or getattr(original, "_mint_bundle_cache_patch", False):
         return
 
     def _normalize_pg_id(pg_id):  # type: ignore[no-untyped-def]
@@ -1863,7 +1863,7 @@ def _patch_ray_placement_group_bundle_cache() -> None:
             f"direct_keys={sorted(info.keys())}"
         )
 
-    _get_bundle_cache._tinker_bundle_cache_patch = True  # type: ignore[attr-defined]
+    _get_bundle_cache._mint_bundle_cache_patch = True  # type: ignore[attr-defined]
     pg_mod._get_bundle_cache = _get_bundle_cache  # type: ignore[assignment]
 
 
@@ -1883,7 +1883,7 @@ def _patch_vllm_fused_moe_lora_use_torch_dist_tp_collectives() -> None:
     except Exception:
         return
 
-    if getattr(op, "_tinker_patched_fused_moe_lora_torch_dist_tp", False):
+    if getattr(op, "_mint_patched_fused_moe_lora_torch_dist_tp", False):
         return
 
     def _get_tp_process_group():  # type: ignore[no-untyped-def]
@@ -1937,7 +1937,7 @@ def _patch_vllm_fused_moe_lora_use_torch_dist_tp_collectives() -> None:
 
     setattr(op, "tensor_model_parallel_all_reduce", tensor_model_parallel_all_reduce)
     setattr(op, "tensor_model_parallel_all_gather", tensor_model_parallel_all_gather)
-    setattr(op, "_tinker_patched_fused_moe_lora_torch_dist_tp", True)
+    setattr(op, "_mint_patched_fused_moe_lora_torch_dist_tp", True)
 
 
 def _patch_vllm_gpu_worker_kv_debug_info() -> None:
@@ -1951,7 +1951,7 @@ def _patch_vllm_gpu_worker_kv_debug_info() -> None:
         return
 
     original = getattr(cls, "get_kv_debug_info", None)
-    if callable(original) and getattr(original, "_tinker_kv_debug_info", False):
+    if callable(original) and getattr(original, "_mint_kv_debug_info", False):
         return
 
     def get_kv_debug_info(self):  # type: ignore[no-untyped-def]
@@ -1965,7 +1965,7 @@ def _patch_vllm_gpu_worker_kv_debug_info() -> None:
             "kv_cache_groups": len(getattr(kv_cfg, "kv_cache_groups", []) or []) if kv_cfg is not None else 0,
         }
 
-    get_kv_debug_info._tinker_kv_debug_info = True  # type: ignore[attr-defined]
+    get_kv_debug_info._mint_kv_debug_info = True  # type: ignore[attr-defined]
     cls.get_kv_debug_info = get_kv_debug_info  # type: ignore[method-assign]
 
 

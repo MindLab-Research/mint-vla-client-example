@@ -9,33 +9,28 @@ class _StubTaskFutureService:
     def __init__(self, order: list[str] | None = None):
         self.resolved: dict[str, dict] = {}
         self.failed: dict[str, str] = {}
+        self.billing_observations: dict[str, list[dict]] = {}
+        self.outbox_observations: list[dict] = []
         self.order = order if order is not None else []
 
     def resolve(self, request_id: str, payload: dict) -> None:
         self.order.append("resolve")
         self.resolved[request_id] = dict(payload)
 
-    async def async_resolve(self, request_id: str, payload: dict) -> None:
+    async def async_resolve(self, request_id: str, payload: dict, *, billing_observations=None) -> None:
         self.resolve(request_id, payload)
+        self.billing_observations[request_id] = list(billing_observations or [])
+
+    async def async_append_billing_outbox(self, observations, *, source: str = "unknown") -> dict:
+        self.order.append(f"append:{source}")
+        self.outbox_observations.extend(list(observations or []))
+        return {"ok": True, "inserted": len(list(observations or []))}
 
     def fail(self, request_id: str, error: str) -> None:
         self.failed[request_id] = str(error)
 
     async def async_fail(self, request_id: str, error: str) -> None:
         self.fail(request_id, error)
-
-
-class _StubUsageStore:
-    def __init__(self, order: list[str] | None = None):
-        self.events = []
-        self.order = order if order is not None else []
-
-    async def write_events(self, events) -> None:
-        self.schedule_events(events)
-
-    def schedule_events(self, events) -> None:
-        self.order.append("write_events")
-        self.events.extend(list(events))
 
 
 class _StubSamplingEngine:
@@ -83,12 +78,9 @@ def _gateway_auth() -> dict[str, str]:
 
 def test_asample_logs_prefill_and_sample_dimensions(monkeypatch):
     task_futures = _StubTaskFutureService()
-    usage_store = _StubUsageStore()
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSessionManager())
     monkeypatch.setattr(sampling_route, "task_futures", task_futures)
-
-    monkeypatch.setattr(sampling_route, "schedule_usage_events", usage_store.schedule_events)
 
     request = SampleRequest(
         sampling_session_id="sess-1",
@@ -101,23 +93,23 @@ def test_asample_logs_prefill_and_sample_dimensions(monkeypatch):
 
     assert "req-sample" in task_futures.resolved
     assert task_futures.failed == {}
-    assert [event.charge_item for event in usage_store.events] == ["sampling", "sampling"]
-    assert [event.quantity for event in usage_store.events] == [3, 2]
-    assert [event.label for event in usage_store.events] == [
-        "model=Qwen/Test,route=sampling.asample,dimension=prefill",
-        "model=Qwen/Test,route=sampling.asample,dimension=sample",
+    observations = task_futures.billing_observations["req-sample"]
+    assert [event["charge_item"] for event in observations] == ["sampling", "sampling"]
+    assert [event["quantity"] for event in observations] == [3, 2]
+    assert [event["route"] for event in observations] == ["sampling.asample", "sampling.asample"]
+    assert [event["dimension"] for event in observations] == [
+        "prefill",
+        "sample",
     ]
+    assert [event["model"] for event in observations] == ["Qwen/Test", "Qwen/Test"]
 
 
-def test_asample_resolves_future_before_persisting_usage(monkeypatch):
+def test_asample_attaches_billing_to_future_resolve(monkeypatch):
     order: list[str] = []
     task_futures = _StubTaskFutureService(order=order)
-    usage_store = _StubUsageStore(order=order)
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSessionManager())
     monkeypatch.setattr(sampling_route, "task_futures", task_futures)
-
-    monkeypatch.setattr(sampling_route, "schedule_usage_events", usage_store.schedule_events)
 
     request = SampleRequest(
         sampling_session_id="sess-1",
@@ -128,17 +120,15 @@ def test_asample_resolves_future_before_persisting_usage(monkeypatch):
 
     anyio.run(sampling_route._do_sample, "req-order", request, None, _gateway_auth())
 
-    assert order == ["resolve", "write_events"]
+    assert order == ["resolve"]
+    assert len(task_futures.billing_observations["req-order"]) == 2
 
 
 def test_compute_logprobs_logs_prefill_dimension(monkeypatch):
     task_futures = _StubTaskFutureService()
-    usage_store = _StubUsageStore()
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSessionManager())
     monkeypatch.setattr(sampling_route, "task_futures", task_futures)
-
-    monkeypatch.setattr(sampling_route, "schedule_usage_events", usage_store.schedule_events)
 
     request = ComputeLogprobsRequest(
         sampling_session_id="sess-1",
@@ -150,7 +140,9 @@ def test_compute_logprobs_logs_prefill_dimension(monkeypatch):
 
     assert "req-logprobs" in task_futures.resolved
     assert task_futures.failed == {}
-    assert len(usage_store.events) == 1
-    assert usage_store.events[0].charge_item == "sampling"
-    assert usage_store.events[0].quantity == 4
-    assert usage_store.events[0].label == "model=Qwen/Test,route=sampling.compute_logprobs,dimension=prefill"
+    observations = task_futures.billing_observations["req-logprobs"]
+    assert len(observations) == 1
+    assert observations[0]["charge_item"] == "sampling"
+    assert observations[0]["quantity"] == 4
+    assert observations[0]["route"] == "sampling.compute_logprobs"
+    assert observations[0]["dimension"] == "prefill"

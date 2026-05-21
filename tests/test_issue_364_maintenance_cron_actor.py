@@ -20,8 +20,10 @@ def test_issue_364_future_reaper_once_reaps_task_state(monkeypatch) -> None:
                 "expired": ["req-expired"],
                 "timed_out": ["req-timeout"],
                 "payload_evicted": ["req-payload"],
+                "staged_payload_gc_deleted": ["req-stage"],
                 "tombstones_deleted": ["req-tombstone"],
                 "payload_evict_errors": [{"request_id": "req-error", "error": "boom"}],
+                "staged_payload_gc_errors": [{"request_id": "req-stage-error", "error": "boom"}],
             }
 
     import importlib
@@ -36,9 +38,31 @@ def test_issue_364_future_reaper_once_reaps_task_state(monkeypatch) -> None:
         "expired": ["req-expired"],
         "timed_out": ["req-timeout"],
         "payload_evicted": ["req-payload"],
+        "staged_payload_gc_deleted": ["req-stage"],
         "tombstones_deleted": ["req-tombstone"],
         "payload_evict_errors": [{"request_id": "req-error", "error": "boom"}],
+        "staged_payload_gc_errors": [{"request_id": "req-stage-error", "error": "boom"}],
     }
+
+
+def test_issue_630_billing_outbox_runner_proxies_task_state(monkeypatch) -> None:
+    from mint_server.backend import maintenance_cron_actor as ors
+
+    class _FakeTaskFutureService:
+        async def async_flush_billing_outbox(self, *, limit: int, lease_ttl_s: float):
+            assert limit == 17
+            assert lease_ttl_s == 42.0
+            return {"ok": True, "claimed": 2, "inserted": 2}
+
+    import importlib
+
+    task_state_store_module = importlib.import_module("mint_server.backend.task_state_store")
+
+    monkeypatch.setattr(task_state_store_module, "task_futures", _FakeTaskFutureService())
+    monkeypatch.setenv("MINT_BILLING_OUTBOX_FLUSH_BATCH_SIZE", "17")
+    monkeypatch.setenv("MINT_BILLING_OUTBOX_CLAIM_TTL_S", "42")
+
+    assert ors.run_billing_outbox_once() == {"ok": True, "claimed": 2, "inserted": 2}
 
 
 def test_issue_364_checkpoint_helpers_proxy_results(monkeypatch) -> None:

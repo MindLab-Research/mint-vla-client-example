@@ -1,6 +1,6 @@
 # Authentication and model access
 
-Auth is enforced in `mint_server/app.py` middleware for both `/api/v1/*` and `/internal/*` when `INTERNAL_API_TOKEN` is configured. If it is not configured, the server runs in dev pass-through mode and stamps a local admin identity.
+Auth is enforced in `mint_server/app.py` middleware for both `/api/v1/*` and `/internal/*` when `MINT_INTERNAL_API_TOKEN` is configured. If it is not configured, the server runs in dev pass-through mode and stamps a local admin identity.
 
 ## API keys and identities
 
@@ -15,7 +15,7 @@ Gateway-forwarded trusted identity:
 - `X-Internal-Token`
 
 Trusted identity rules:
-- `X-MinT-*` headers are only accepted when `INTERNAL_API_TOKEN` is configured and `X-Internal-Token` matches.
+- `X-MinT-*` headers are only accepted when `MINT_INTERNAL_API_TOKEN` is configured and `X-Internal-Token` matches.
 - `X-Request-Id` alone must not trigger trusted-header mode.
 - Admin authorization uses trusted capabilities from headers when present, or
   the trusted `user_role == "admin"` role.

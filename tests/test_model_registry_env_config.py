@@ -1,4 +1,24 @@
 import json
+import yaml
+
+
+def _write_model_topology(tmp_path, models):
+    path = tmp_path / "topology.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "deployment_env": "dev",
+                "cluster_id": "volcano",
+                "state_path": str(tmp_path / "topology_state.yaml"),
+                "providers": {},
+                "nodes": {"desired": []},
+                "models": models,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return str(path)
 
 
 def test_list_supported_models_env(monkeypatch):
@@ -76,21 +96,27 @@ def test_model_config_overrides_json_unknown_field_raises(monkeypatch):
         raise AssertionError("expected ValueError")
 
 
-def test_is_persistent_model_matches_hf_and_snapshot(monkeypatch):
+def test_is_topology_desired_model_matches_hf_and_snapshot(monkeypatch, tmp_path):
     from mint_server.backend import model_registry as mr
 
-    monkeypatch.setenv("MINT_PERSISTENT_MODELS", "Qwen/Qwen3-0.6B")
-    assert mr.is_persistent_model("Qwen/Qwen3-0.6B")
-    assert mr.is_persistent_model(
+    monkeypatch.setenv(
+        "MINT_TOPOLOGY_CONFIG_PATH",
+        _write_model_topology(tmp_path, {"Qwen/Qwen3-0.6B": {"vllm": {}}}),
+    )
+    assert mr.is_topology_desired_model("Qwen/Qwen3-0.6B")
+    assert mr.is_topology_desired_model(
         "/vePFS-Mindverse/share/huggingface/models--Qwen--Qwen3-0.6B/snapshots/abc123"
     )
 
 
-def test_is_persistent_model_accepts_snapshot_entries(monkeypatch):
+def test_is_topology_desired_model_accepts_snapshot_entries(monkeypatch, tmp_path):
     from mint_server.backend import model_registry as mr
 
     monkeypatch.setenv(
-        "MINT_PERSISTENT_MODELS",
-        "/vePFS-Mindverse/share/huggingface/models--Qwen--Qwen3-0.6B/snapshots/abc123",
+        "MINT_TOPOLOGY_CONFIG_PATH",
+        _write_model_topology(
+            tmp_path,
+            {"/vePFS-Mindverse/share/huggingface/models--Qwen--Qwen3-0.6B/snapshots/abc123": {"vllm": {}}},
+        ),
     )
-    assert mr.is_persistent_model("Qwen/Qwen3-0.6B")
+    assert mr.is_topology_desired_model("Qwen/Qwen3-0.6B")

@@ -718,7 +718,7 @@ def test_issue_193_megatron_rebind_reuses_existing_actor_without_ready_probe(mon
         lambda _model: (1, 1, 1, 1, 1),
     )
     monkeypatch.setattr(
-        "mint_server.backend.model_registry.is_persistent_model",
+        "mint_server.backend.model_registry.is_topology_desired_model",
         lambda _model: False,
     )
     monkeypatch.setattr(
@@ -782,7 +782,7 @@ def test_issue_193_megatron_rebind_created_actor_ready_death_maps_to_missing_wor
         lambda _model: (1, 1, 1, 1, 1),
     )
     monkeypatch.setattr(
-        "mint_server.backend.model_registry.is_persistent_model",
+        "mint_server.backend.model_registry.is_topology_desired_model",
         lambda _model: False,
     )
     monkeypatch.setattr(

@@ -10,13 +10,10 @@ Optional:
 Environment variables:
     MINT_HOST: Server host (default: 0.0.0.0)
     MINT_PORT: Server port (default: 8000)
-    MINT_TP_SIZE: Tensor parallel size (default: auto-detected per model)
-    MINT_DP_SIZE: Data parallel size for MoE (default: auto-detected per model)
-    MINT_GPU_MEM_UTIL: GPU memory utilization (default: 0.9)
-    MINT_MAX_MODEL_LEN: Maximum model context length (default: auto)
 
-Note: No default model is configured. Clients specify models per-request.
-Parallelism is auto-detected from the model registry when engines are created.
+Before starting API workers, run scripts/bootstrap_control_plane.py from the
+same environment. That creates ConfigActor, then starts ModelActorSupervisor,
+which owns the remaining detached control-plane actors and runtime reconcile.
 """
 
 import argparse

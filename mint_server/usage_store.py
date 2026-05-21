@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
 import uuid
 from contextlib import suppress
@@ -20,34 +19,6 @@ ChargeItem = Literal["sampling", "inference", "training", "checkpoint_storage"]
 _ALLOWED_CHARGE_ITEMS = {"sampling", "inference", "training", "checkpoint_storage"}
 _SQL_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _EVENT_ID_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "mindlab.mint.billing.usage_event.v1")
-_PENDING_WRITE_TASKS: set[asyncio.Task] = set()
-_USAGE_STORE_CLOSING = False
-
-
-def _env_int(name: str, default: int, *, minimum: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None or raw.strip() == "":
-        return default
-    try:
-        return max(minimum, int(raw))
-    except ValueError:
-        logger.warning("Invalid %s=%r; using default %s", name, raw, default)
-        return default
-
-
-def _env_float(name: str, default: float, *, minimum: float) -> float:
-    raw = os.environ.get(name)
-    if raw is None or raw.strip() == "":
-        return default
-    try:
-        return max(minimum, float(raw))
-    except ValueError:
-        logger.warning("Invalid %s=%r; using default %s", name, raw, default)
-        return default
-
-
-_MAX_PENDING_WRITE_TASKS = _env_int("MINT_USAGE_MAX_PENDING_WRITE_TASKS", 1024, minimum=1)
-_SHUTDOWN_FLUSH_TIMEOUT_S = _env_float("MINT_USAGE_SHUTDOWN_FLUSH_TIMEOUT_S", 5.0, minimum=0.0)
 
 
 def _import_asyncpg():
@@ -76,6 +47,26 @@ def _is_permanent_pg_write_error(exc: BaseException) -> bool:
     # SQLSTATE class 23 is integrity constraint violation. Retrying cannot fix
     # permanent identity/schema issues such as missing apikey FK rows.
     return sqlstate.startswith("23")
+
+
+def is_permanent_usage_write_error(exc: BaseException) -> bool:
+    if _is_permanent_pg_write_error(exc):
+        return True
+    message = str(exc)
+    if isinstance(exc, ValueError) and (
+        "unsupported usage_event charge_item" in message
+        or "usage_event quantity must be non-negative" in message
+        or "duplicate usage_event event_id" in message
+    ):
+        return True
+    if isinstance(exc, RuntimeError) and (
+        "requires a full-table unique index on event_id" in message
+        or "missing usage_event columns" in message
+        or "billing migration" in message
+        or "requires source_index default" in message
+    ):
+        return True
+    return False
 
 
 def _event_detail(events: list["UsageEvent"]) -> dict[str, Any]:
@@ -142,7 +133,9 @@ class PostgresUsageStore:
         if not dsn:
             raise ValueError("Postgres DSN is required for usage backend")
         if outbox_path or float(outbox_flush_interval_s or 0.0) != 0.0:
-            logger.warning("PostgresUsageStore ignores outbox configuration; direct PostgreSQL usage writes are required")
+            logger.warning(
+                "PostgresUsageStore ignores local outbox configuration; TaskStateStore owns billing outbox flushing"
+            )
         self._dsn = dsn
         self._pool_min = max(1, int(pool_min))
         self._pool_max = max(self._pool_min, int(pool_max))
@@ -330,8 +323,8 @@ class PostgresUsageStore:
             "created_at",
         ]
         migration_hint = (
-            "run the platform direct-PG billing migration, or scripts/tools/init_usage_pg.sql "
-            "for a standalone MinT usage DB, before starting MinT direct-PG billing"
+            "run the platform billing migration, or scripts/tools/init_usage_pg.sql "
+            "for a standalone MinT usage DB, before starting the PostgreSQL billing sink"
         )
         table_exists = await conn.fetchval(
             """
@@ -361,7 +354,7 @@ class PostgresUsageStore:
             required_columns,
         )
         if int(column_count or 0) != len(required_columns):
-            raise RuntimeError(f"{self._table} schema is missing direct-PG usage_event columns; {migration_hint}")
+            raise RuntimeError(f"{self._table} schema is missing usage_event columns; {migration_hint}")
 
         not_null_count = await conn.fetchval(
             """
@@ -377,7 +370,7 @@ class PostgresUsageStore:
             required_not_null,
         )
         if int(not_null_count or 0) != len(required_not_null):
-            raise RuntimeError(f"{self._table} schema has nullable direct-PG usage_event columns; {migration_hint}")
+            raise RuntimeError(f"{self._table} schema has nullable usage_event columns; {migration_hint}")
 
         source_index_default = await conn.fetchval(
             """
@@ -692,71 +685,8 @@ async def get_usage_store() -> UsageStore:
     return _usage_store
 
 
-async def _write_usage_events_safely(events: list[UsageEvent]) -> None:
-    try:
-        usage_store = await get_usage_store()
-        await usage_store.write_events(events)
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:
-        event_detail = _event_detail(events)
-        error_detail = _exception_detail(e)
-        logger.exception(
-            "usage_event async persistence failed after user result completed: event_ids=%s request_ids=%s charge_items=%s event_count=%s error_type=%s sqlstate=%s constraint_name=%s table_name=%s",
-            event_detail["event_ids"],
-            event_detail["request_ids"],
-            event_detail["charge_items"],
-            event_detail["event_count"],
-            error_detail["error_type"],
-            error_detail["sqlstate"],
-            error_detail["constraint_name"],
-            error_detail["table_name"],
-        )
-
-
-async def persist_usage_events(events: list[UsageEvent]) -> None:
-    normalized = list(events)
-    if normalized:
-        await _write_usage_events_safely(normalized)
-
-
-def schedule_usage_events(events: list[UsageEvent]) -> None:
-    normalized = list(events)
-    if not normalized:
-        return
-    if _USAGE_STORE_CLOSING:
-        logger.error(
-            "usage_event async persistence dropped because usage store is closing: request_ids=%s",
-            [event.request_id for event in normalized],
-        )
-        return
-    if len(_PENDING_WRITE_TASKS) >= _MAX_PENDING_WRITE_TASKS:
-        logger.error(
-            "usage_event async persistence dropped because pending task limit is full: pending=%s limit=%s request_ids=%s",
-            len(_PENDING_WRITE_TASKS),
-            _MAX_PENDING_WRITE_TASKS,
-            [event.request_id for event in normalized],
-        )
-        return
-    task = asyncio.create_task(_write_usage_events_safely(normalized))
-    _PENDING_WRITE_TASKS.add(task)
-    task.add_done_callback(_PENDING_WRITE_TASKS.discard)
-
-
 async def close_usage_store() -> None:
-    global _usage_store, _USAGE_STORE_CLOSING
-    _USAGE_STORE_CLOSING = True
-    pending = list(_PENDING_WRITE_TASKS)
-    if pending:
-        done, pending_set = await asyncio.wait(pending, timeout=_SHUTDOWN_FLUSH_TIMEOUT_S)
-        for task in done:
-            with suppress(Exception, asyncio.CancelledError):
-                task.result()
-        for task in pending_set:
-            task.cancel()
-        if pending_set:
-            await asyncio.gather(*pending_set, return_exceptions=True)
-        _PENDING_WRITE_TASKS.clear()
+    global _usage_store
     async with _usage_store_guard:
         if _usage_store is not None:
             await _usage_store.close()

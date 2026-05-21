@@ -25,7 +25,7 @@ This project has multiple identifiers that look similar but have different owner
 
 - `request_id`
   - Created through the `TaskFutureService` facade and returned by endpoints that run async work in the background.
-  - Polled via `POST /api/v1/retrieve_future` (Tinker polling protocol).
+  - Polled via `POST /api/v1/retrieve_future` (Mint polling protocol).
   - Stored in detached `TaskStateStore`, not in API-process memory. Terminal replay also uses this same task record plus `TaskPayloadStore`; there is no second future index.
 
 ## Persistence and restart behavior
@@ -51,4 +51,4 @@ Many Ray actors are detached and can survive server restarts. This is useful for
 
 - `model_id` refers to mutable training state owned by trainer actors (weights, optimizer, step counters).
 - `sampling_session_id` refers to frozen adapter state in inference (a LoRA loaded into a shared vLLM actor).
-- `request_id` exists because GPU work is asynchronous and is polled to match the Tinker client contract.
+- `request_id` exists because GPU work is asynchronous and is polled to match the Mint client contract.

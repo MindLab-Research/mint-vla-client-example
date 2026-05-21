@@ -67,7 +67,6 @@ def get_actor_placements() -> dict[str, list[dict]]:
         # Only track vLLM and Megatron actors (the ones that use GPUs)
         if not (
             actor_name.startswith("mint_vllm_")
-            or actor_name == "vllm_server"
             or actor_name.startswith("mint_megatron_")
             or actor_name.startswith("mint_dense_")
         ):

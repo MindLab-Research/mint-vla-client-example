@@ -876,6 +876,82 @@ async def metrics() -> Response:
                 reaper.get("payload_evict_errors_total"),
             )
 
+        billing_outbox = fs.get("billing_outbox")
+        if isinstance(billing_outbox, dict):
+            process_billing_metrics: dict[str, float] = {}
+            try:
+                from ..backend.task_state_store import billing_metrics_snapshot
+
+                process_billing_metrics = {
+                    str(key): float(value)
+                    for key, value in billing_metrics_snapshot().items()
+                    if isinstance(value, (int, float))
+                }
+            except Exception:
+                process_billing_metrics = {}
+            by_status = billing_outbox.get("by_status")
+            if isinstance(by_status, dict):
+                for status, rec in by_status.items():
+                    if not isinstance(rec, dict):
+                        continue
+                    labels = {"status": str(status)}
+                    _append_metric(lines, "mint_billing_outbox_rows", rec.get("rows"), labels=labels)
+                    _append_metric(
+                        lines,
+                        "mint_billing_outbox_oldest_age_s",
+                        rec.get("oldest_age_s"),
+                        labels=labels,
+                    )
+            metrics = billing_outbox.get("metrics")
+            if isinstance(metrics, dict):
+                merged_metrics = dict(metrics)
+                for key, value in process_billing_metrics.items():
+                    merged_metrics[key] = float(merged_metrics.get(key) or 0.0) + float(value)
+                _append_metric(
+                    lines,
+                    "mint_billing_outbox_flush_attempts_total",
+                    merged_metrics.get("flush_success"),
+                    labels={"result": "success"},
+                )
+                _append_metric(
+                    lines,
+                    "mint_billing_outbox_flush_attempts_total",
+                    merged_metrics.get("flush_transient_error"),
+                    labels={"result": "transient_error"},
+                )
+                _append_metric(
+                    lines,
+                    "mint_billing_outbox_flush_attempts_total",
+                    merged_metrics.get("flush_permanent_error"),
+                    labels={"result": "permanent_error"},
+                )
+                _append_metric(
+                    lines,
+                    "mint_billing_outbox_events_total",
+                    merged_metrics.get("event_inserted"),
+                    labels={"result": "inserted"},
+                )
+                _append_metric(
+                    lines,
+                    "mint_billing_outbox_events_total",
+                    merged_metrics.get("event_conflict"),
+                    labels={"result": "conflict"},
+                )
+                _append_metric(
+                    lines,
+                    "mint_billing_outbox_events_total",
+                    merged_metrics.get("event_failed"),
+                    labels={"result": "failed"},
+                )
+                _append_metric(lines, "mint_billing_outbox_write_errors_total", merged_metrics.get("write_error"))
+                _append_metric(lines, "mint_billing_outbox_conflict_total", merged_metrics.get("outbox_conflict"))
+                _append_metric(
+                    lines,
+                    "mint_billing_observation_skipped_total",
+                    merged_metrics.get("skipped_missing_billing_context"),
+                    labels={"reason": "missing_billing_context"},
+                )
+
     actors = stats.get("actors")
     if isinstance(actors, dict):
         for actor_key in ("task_futures",):
@@ -1294,7 +1370,7 @@ async def metrics() -> Response:
 @router.post("/model_work_scheduler/noop")
 async def model_work_scheduler_noop(http_request: Request) -> dict:
     from ..backend.task_state_store import task_futures
-    from ..backend.model_actor_supervisor import domain_key_for_internal_control
+    from ..backend.model_actor_supervisor import domain_key_for_internal_runtime
     from ..backend.model_work_admission import enqueue_model_work
 
     route_start_s = time.perf_counter()
@@ -1311,7 +1387,7 @@ async def model_work_scheduler_noop(http_request: Request) -> dict:
                 request_json=request_json,
                 user_id=None,
                 webhook_url=None,
-                domain_key=domain_key_for_internal_control(),
+                domain_key=domain_key_for_internal_runtime(),
                 affinity_group="internal:no-op",
                 ordering_key=None,
                 token_cost=1,

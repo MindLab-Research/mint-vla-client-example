@@ -47,16 +47,10 @@ def _ray_model_work_scheduler_actor_name() -> str:
 
 
 def _model_work_scheduler_actor_resources() -> dict[str, float] | None:
-    pinned_ip = str(os.environ.get("MINT_MODEL_WORK_SCHEDULER_PINNED_NODE_IP") or "").strip()
-    if pinned_ip:
-        return {f"node:{pinned_ip}": 0.001}
     try:
         import ray
 
-        return preferred_control_plane_resources(
-            ray.cluster_resources(),
-            env_var="MINT_MODEL_WORK_SCHEDULER_PINNED_NODE_IP",
-        )
+        return preferred_control_plane_resources(ray.cluster_resources())
     except Exception:
         return None
 
@@ -266,6 +260,11 @@ class _ModelWorkSchedulerActor:
         self._appended = 0
         self._assigned = 0
         self._claimed = 0
+        self._assignment_loop_task: asyncio.Task | None = None
+        self._assignment_loop_interval_s = float(
+            os.environ.get("MINT_MODEL_WORK_SCHEDULER_ASSIGNMENT_INTERVAL_S", "1.0")
+        )
+        self._ensure_assignment_loop_started()
 
     def _all_request_ids(self) -> set[str]:
         return set(self._request_locations)
@@ -303,6 +302,31 @@ class _ModelWorkSchedulerActor:
             raise ModelWorkSchedulerConflictError(f"failed to acquire scheduler owner: {acquired}")
         self._scheduler_epoch = int(acquired["epoch"])
         return int(self._scheduler_epoch)
+
+    async def _assignment_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self._assignment_loop_interval_s)
+            try:
+                await self.assign_pending()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(
+                    "[model_work_scheduler] assignment loop failed error_type=%s error=%s",
+                    type(e).__name__,
+                    e,
+                )
+
+    def _ensure_assignment_loop_started(self) -> None:
+        if self._assignment_loop_interval_s <= 0:
+            return
+        if self._assignment_loop_task is not None and not self._assignment_loop_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._assignment_loop_task = loop.create_task(self._assignment_loop())
 
     def _work_item_from_task_record(self, record: dict[str, Any]) -> ModelWorkItem:
         metadata = dict(record.get("metadata") or {})
@@ -345,6 +369,7 @@ class _ModelWorkSchedulerActor:
         raise ModelWorkSchedulerConflictError(f"failed to requeue task {request_id}: {out!r}")
 
     async def _ensure_task_state_ready(self) -> int | None:
+        self._ensure_assignment_loop_started()
         epoch = await self._ensure_task_state_owner()
         if not self._use_task_state_store or self._task_state_hydrated:
             return epoch
@@ -515,6 +540,7 @@ class _ModelWorkSchedulerActor:
         assign: bool = False,
         assign_max_items: int | None = None,
     ) -> dict[str, Any]:
+        self._ensure_assignment_loop_started()
         work = ModelWorkItem.from_dict(item)
         if self._use_task_state_store:
             await self._ensure_task_state_ready()
@@ -621,6 +647,7 @@ class _ModelWorkSchedulerActor:
             )
 
     async def sync_replicas(self, replicas: list[dict[str, Any]]) -> dict[str, Any]:
+        self._ensure_assignment_loop_started()
         now = time.time()
         if self._use_task_state_store:
             await self._ensure_task_state_ready()
@@ -698,6 +725,7 @@ class _ModelWorkSchedulerActor:
             }
 
     async def assign_pending(self, *, max_items: int | None = None) -> dict[str, Any]:
+        self._ensure_assignment_loop_started()
         if self._use_task_state_store:
             await self._ensure_task_state_ready()
         async with self._cv:
@@ -748,6 +776,7 @@ class _ModelWorkSchedulerActor:
         token_budget: int | None = None,
         lease_ttl_s: float = 30.0,
     ) -> dict[str, Any]:
+        self._ensure_assignment_loop_started()
         now = time.time()
         if self._use_task_state_store:
             await self._ensure_task_state_ready()
@@ -824,6 +853,7 @@ class _ModelWorkSchedulerActor:
         consumer_id: str,
         consumer_generation: int,
         finalize_ttl_s: float = 30.0,
+        staged_payload_path: str | None = None,
     ) -> dict[str, Any]:
         if self._use_task_state_store:
             await self._ensure_task_state_ready()
@@ -845,6 +875,7 @@ class _ModelWorkSchedulerActor:
                     scheduler_epoch=int(self._scheduler_epoch or 0),
                     runtime_generation=int(consumer_generation),
                     finalize_ttl_s=max(1.0, float(finalize_ttl_s)),
+                    staged_payload_path=staged_payload_path,
                 )
             lease.finalizing_until = now + max(1.0, float(finalize_ttl_s))
             lease.lease_expires_at = max(float(lease.lease_expires_at), lease.finalizing_until)
@@ -963,6 +994,7 @@ class _ModelWorkSchedulerActor:
             return {"ok": True, "expired": expired}
 
     def stats(self) -> dict[str, Any]:
+        self._ensure_assignment_loop_started()
         now = time.time()
         backlog_depth_by_domain = {
             domain: len(backlog) for domain, backlog in sorted(self._domain_backlog.items())
@@ -986,6 +1018,8 @@ class _ModelWorkSchedulerActor:
             "scheduler_instance_id": self._instance_id,
             "scheduler_epoch": self._scheduler_epoch,
             "task_state_store_enabled": self._use_task_state_store,
+            "assignment_loop_interval_s": self._assignment_loop_interval_s,
+            "assignment_loop_running": self._assignment_loop_task is not None and not self._assignment_loop_task.done(),
             "now": now,
             "depth": sum(backlog_depth_by_domain.values())
             + sum(len(queue) for queue in self._replica_queues.values())
@@ -1038,12 +1072,7 @@ def _create_ray_actor(*, require_ready: bool = True):
     class _RayModelWorkSchedulerActor(_ModelWorkSchedulerActor):
         pass
 
-    actor = _RayModelWorkSchedulerActor.options(**options).remote(
-        use_task_state_store=str(
-            os.environ.get("MINT_MODEL_WORK_SCHEDULER_TASK_STATE_STORE", "1")
-        ).strip().lower()
-        not in {"0", "false", "no", "off"}
-    )
+    actor = _RayModelWorkSchedulerActor.options(**options).remote(use_task_state_store=True)
     if require_ready:
         stats = _await_ray_ref_sync(actor.stats.remote(), timeout_s=5.0)
         if not isinstance(stats, dict):
@@ -1062,7 +1091,7 @@ class ModelWorkSchedulerClient:
         self,
         *,
         require_ready: bool = True,
-        create_if_missing: bool = True,
+        create_if_missing: bool = False,
     ):
         _append_model_work_scheduler_debug("get_ray_actor_async_begin", require_ready=require_ready)
         try:
@@ -1138,7 +1167,7 @@ class ModelWorkSchedulerClient:
         assign: bool = False,
         assign_max_items: int | None = None,
     ) -> dict[str, Any]:
-        actor = await self._get_ray_actor_async()
+        actor = await self._get_ray_actor_async(create_if_missing=False)
         item = ModelWorkItem(
             request_id=str(request_id),
             op=str(op),
@@ -1174,7 +1203,7 @@ class ModelWorkSchedulerClient:
         *,
         timeout_s: float = 10.0,
     ) -> dict[str, Any]:
-        actor = await self._get_ray_actor_async()
+        actor = await self._get_ray_actor_async(create_if_missing=False)
         payload = [
             replica.to_dict() if isinstance(replica, ModelReplicaRegistration) else dict(replica)
             for replica in replicas
@@ -1190,7 +1219,7 @@ class ModelWorkSchedulerClient:
         max_items: int | None = None,
         timeout_s: float = 10.0,
     ) -> dict[str, Any]:
-        actor = await self._get_ray_actor_async()
+        actor = await self._get_ray_actor_async(create_if_missing=False)
         out = await self._await_ray_ref(
             actor.assign_pending.remote(max_items=max_items),
             timeout_s=timeout_s,
@@ -1206,7 +1235,7 @@ class ModelWorkSchedulerClient:
         reason: str = "cancelled",
         timeout_s: float = 10.0,
     ) -> dict[str, Any]:
-        actor = await self._get_ray_actor_async()
+        actor = await self._get_ray_actor_async(create_if_missing=False)
         out = await self._await_ray_ref(
             actor.cancel_request.remote(request_id=str(request_id), reason=str(reason)),
             timeout_s=timeout_s,
@@ -1221,7 +1250,7 @@ class ModelWorkSchedulerClient:
         request_id: str,
         timeout_s: float = 10.0,
     ) -> dict[str, Any]:
-        actor = await self._get_ray_actor_async()
+        actor = await self._get_ray_actor_async(create_if_missing=False)
         out = await self._await_ray_ref(
             actor.contains_request.remote(request_id=str(request_id)),
             timeout_s=timeout_s,
@@ -1231,7 +1260,7 @@ class ModelWorkSchedulerClient:
         return out
 
     async def is_empty(self, *, timeout_s: float = 10.0) -> bool:
-        actor = await self._get_ray_actor_async()
+        actor = await self._get_ray_actor_async(create_if_missing=False)
         out = await self._await_ray_ref(actor.is_empty.remote(), timeout_s=timeout_s)
         return bool(out)
 
@@ -1247,7 +1276,7 @@ class ModelWorkSchedulerClient:
         lease_ttl_s: float = 30.0,
         timeout_s: float = 10.0,
     ) -> dict[str, Any]:
-        actor = await self._get_ray_actor_async()
+        actor = await self._get_ray_actor_async(create_if_missing=False)
         out = await self._await_ray_ref(
             actor.claim_from_replica_queue.remote(
                 domain_key=str(domain_key),
@@ -1275,7 +1304,7 @@ class ModelWorkSchedulerClient:
         lease_ttl_s: float = 30.0,
         timeout_s: float = 10.0,
     ) -> dict[str, Any]:
-        actor = await self._get_ray_actor_async()
+        actor = await self._get_ray_actor_async(create_if_missing=False)
         out = await self._await_ray_ref(
             actor.renew_lease.remote(
                 lease_id=str(lease_id),
@@ -1297,7 +1326,7 @@ class ModelWorkSchedulerClient:
         consumer_generation: int,
         timeout_s: float = 10.0,
     ) -> dict[str, Any]:
-        actor = await self._get_ray_actor_async()
+        actor = await self._get_ray_actor_async(create_if_missing=False)
         out = await self._await_ray_ref(
             actor.complete_lease.remote(
                 lease_id=str(lease_id),
@@ -1317,15 +1346,17 @@ class ModelWorkSchedulerClient:
         consumer_id: str,
         consumer_generation: int,
         finalize_ttl_s: float = 30.0,
+        staged_payload_path: str | None = None,
         timeout_s: float = 10.0,
     ) -> dict[str, Any]:
-        actor = await self._get_ray_actor_async()
+        actor = await self._get_ray_actor_async(create_if_missing=False)
         out = await self._await_ray_ref(
             actor.begin_finalize_lease.remote(
                 lease_id=str(lease_id),
                 consumer_id=str(consumer_id),
                 consumer_generation=int(consumer_generation),
                 finalize_ttl_s=float(finalize_ttl_s),
+                staged_payload_path=staged_payload_path,
             ),
             timeout_s=timeout_s,
         )
@@ -1341,7 +1372,7 @@ class ModelWorkSchedulerClient:
         consumer_generation: int,
         timeout_s: float = 10.0,
     ) -> dict[str, Any]:
-        actor = await self._get_ray_actor_async()
+        actor = await self._get_ray_actor_async(create_if_missing=False)
         out = await self._await_ray_ref(
             actor.validate_lease.remote(
                 lease_id=str(lease_id),
@@ -1364,7 +1395,7 @@ class ModelWorkSchedulerClient:
         reason: str = "failed",
         timeout_s: float = 10.0,
     ) -> dict[str, Any]:
-        actor = await self._get_ray_actor_async()
+        actor = await self._get_ray_actor_async(create_if_missing=False)
         out = await self._await_ray_ref(
             actor.fail_lease.remote(
                 lease_id=str(lease_id),
@@ -1385,7 +1416,7 @@ class ModelWorkSchedulerClient:
         now: float | None = None,
         timeout_s: float = 10.0,
     ) -> dict[str, Any]:
-        actor = await self._get_ray_actor_async()
+        actor = await self._get_ray_actor_async(create_if_missing=False)
         out = await self._await_ray_ref(actor.expire_leases.remote(now=now), timeout_s=timeout_s)
         if not isinstance(out, dict):
             raise TypeError(f"ModelWorkScheduler.expire_leases returned non-dict: {type(out)}")
@@ -1395,7 +1426,7 @@ class ModelWorkSchedulerClient:
         self,
         *,
         timeout_s: float = 10.0,
-        create_if_missing: bool = True,
+        create_if_missing: bool = False,
     ) -> dict[str, Any]:
         actor = await self._get_ray_actor_async(require_ready=False, create_if_missing=create_if_missing)
         out = await self._await_ray_ref(actor.stats.remote(), timeout_s=timeout_s)

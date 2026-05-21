@@ -11,6 +11,11 @@ from mint_server.backend.model_work_scheduler import (
 from mint_server.backend.task_state_store import TaskStateStore
 
 
+@pytest.fixture(autouse=True)
+def disable_scheduler_assignment_loop(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MINT_MODEL_WORK_SCHEDULER_ASSIGNMENT_INTERVAL_S", "0")
+
+
 def _work(
     request_id: str,
     *,
@@ -111,6 +116,25 @@ def test_scheduler_append_can_assign_immediately() -> None:
         assert actor.stats()["replica_queues"][
             "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507::replica-0"
         ]["depth"] == 1
+
+    asyncio.run(_run())
+
+
+def test_scheduler_assignment_loop_moves_backlog_to_replica_queue(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MINT_MODEL_WORK_SCHEDULER_ASSIGNMENT_INTERVAL_S", "0.01")
+    actor = _ModelWorkSchedulerActor()
+
+    async def _run() -> None:
+        assert (await actor.append(_work("req-loop")))["ok"] is True
+        await actor.sync_replicas([_replica("replica-0")])
+        for _ in range(20):
+            stats = actor.stats()
+            queue = stats["replica_queues"]["vllm:Qwen/Qwen3-30B-A3B-Instruct-2507::replica-0"]
+            if stats["backlog_depth"] == 0 and queue["depth"] == 1:
+                return
+            await asyncio.sleep(0.02)
+        stats = actor.stats()
+        raise AssertionError(f"assignment loop did not drain backlog: {stats!r}")
 
     asyncio.run(_run())
 
@@ -390,9 +414,12 @@ def test_scheduler_persists_append_assign_claim_and_begin_finalize_to_task_state
             consumer_id="consumer-replica-0",
             consumer_generation=10,
             finalize_ttl_s=30.0,
+            staged_payload_path="/tmp/req-persisted.json",
         )
         assert finalizing["ok"] is True
-        assert store.get_task("req-persisted")["status"] == "finalizing"
+        record = store.get_task("req-persisted")
+        assert record["status"] == "finalizing"
+        assert record["staged_payload_path"] == "/tmp/req-persisted.json"
         assert actor.stats()["task_state_store_enabled"] is True
         assert actor.stats()["scheduler_epoch"] == 1
 

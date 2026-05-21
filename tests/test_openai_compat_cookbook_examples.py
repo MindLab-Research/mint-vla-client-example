@@ -75,13 +75,13 @@ def test_cookbook_openai_completions_example_shape(monkeypatch):
         seen["sample_kwargs"] = kwargs
         return SampledSequence(tokens=[11, 12], logprobs=None, stop_reason="eos")
 
-    async def _unexpected_usage_write(_events):
-        raise AssertionError("empty usage events should not schedule background persistence")
+    async def _unexpected_billing_outbox_append(_events):
+        raise AssertionError("empty billing observations should not schedule outbox append")
 
     monkeypatch.setattr(openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session)
     monkeypatch.setattr(openai_compat, "_get_tokenizer", _fake_get_tokenizer)
     monkeypatch.setattr(openai_compat, "sample_once", _fake_sample_once)
-    monkeypatch.setattr(openai_compat, "_write_usage_events_after_response", _unexpected_usage_write)
+    monkeypatch.setattr(openai_compat, "_append_billing_observations", _unexpected_billing_outbox_append)
 
     app = _build_app()
 
@@ -113,6 +113,55 @@ def test_cookbook_openai_completions_example_shape(monkeypatch):
     assert seen["sample_kwargs"]["max_tokens"] == 50
     assert seen["sample_kwargs"]["temperature"] == 0.2
     assert seen["sample_kwargs"]["top_p"] == 0.9
+
+
+def test_openai_completions_appends_billing_outbox_before_response(monkeypatch):
+    _reset_openai_compat_state(monkeypatch)
+    tokenizer = _DummyTokenizer()
+    seen: dict[str, object] = {}
+
+    async def _fake_ensure_sampling_session(*, model_path: str, http_request: Request, parent_session_id=None):
+        return "sample-bill", "Qwen/Qwen3-4B-Instruct-2507"
+
+    async def _fake_get_tokenizer(_base_model: str):
+        return tokenizer
+
+    async def _fake_sample_once(**kwargs):
+        seen["sample_kwargs"] = kwargs
+        return SampledSequence(tokens=[11, 12], logprobs=None, stop_reason="eos")
+
+    async def _append_billing_observations(observations):
+        seen["billing_before_response"] = True
+        seen["billing_observations"] = list(observations)
+
+    def _build_billing_observations(**_kwargs):
+        return [
+            {"route": "sampling.sample_once", "dimension": "prefill", "request_id": "req-oai-billing"},
+            {"route": "sampling.sample_once", "dimension": "sample", "request_id": "req-oai-billing"},
+        ]
+
+    monkeypatch.setattr(openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session)
+    monkeypatch.setattr(openai_compat, "_get_tokenizer", _fake_get_tokenizer)
+    monkeypatch.setattr(openai_compat, "sample_once", _fake_sample_once)
+    monkeypatch.setattr(openai_compat, "build_sample_once_billing_observations", _build_billing_observations)
+    monkeypatch.setattr(openai_compat, "_append_billing_observations", _append_billing_observations)
+
+    client = TestClient(_build_app())
+    response = client.post(
+        "/oai/api/v1/completions",
+        json={
+            "model": "mint://exp/sampler_weights/000080",
+            "prompt": "hello",
+            "max_tokens": 8,
+        },
+    )
+
+    assert response.status_code == 200
+    assert seen["billing_before_response"] is True
+    observations = seen["billing_observations"]
+    assert [obs["route"] for obs in observations] == ["sampling.sample_once", "sampling.sample_once"]
+    assert [obs["dimension"] for obs in observations] == ["prefill", "sample"]
+    assert [obs["request_id"] for obs in observations] == ["req-oai-billing", "req-oai-billing"]
 
 
 def test_openai_completions_supports_gateway_routed_base_model(monkeypatch):
@@ -222,13 +271,13 @@ def test_cookbook_openai_chat_completions_example_shape(monkeypatch):
         seen["sample_kwargs"] = kwargs
         return SampledSequence(tokens=[21, 22, 23], logprobs=None, stop_reason="length")
 
-    async def _unexpected_usage_write(_events):
-        raise AssertionError("empty usage events should not schedule background persistence")
+    async def _unexpected_billing_outbox_append(_events):
+        raise AssertionError("empty billing observations should not schedule outbox append")
 
     monkeypatch.setattr(openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session)
     monkeypatch.setattr(openai_compat, "_get_tokenizer", _fake_get_tokenizer)
     monkeypatch.setattr(openai_compat, "sample_once", _fake_sample_once)
-    monkeypatch.setattr(openai_compat, "_write_usage_events_after_response", _unexpected_usage_write)
+    monkeypatch.setattr(openai_compat, "_append_billing_observations", _unexpected_billing_outbox_append)
 
     app = _build_app()
 
@@ -307,7 +356,7 @@ def test_openai_completions_falls_back_to_service_session_manager(monkeypatch):
     async def _fake_create_sampling_session(_request, _http_request):
         return SimpleNamespace(sampling_session_id="sample-local")
 
-    async def _fake_no_usage(**_kwargs):
+    async def _fake_no_billing_outbox(**_kwargs):
         return None
 
     async def _fake_snapshot(_sid: str):
@@ -322,7 +371,7 @@ def test_openai_completions_falls_back_to_service_session_manager(monkeypatch):
     monkeypatch.setattr(service_route, "session_manager", manager)
     monkeypatch.setattr(sampling_route, "session_manager", None)
     monkeypatch.setattr(sampling_route, "_async_get_detached_sampling_snapshot", _fake_snapshot)
-    monkeypatch.setattr(sampling_route, "_persist_usage_events", _fake_no_usage)
+    monkeypatch.setattr(sampling_route, "_append_billing_observations", _fake_no_billing_outbox)
     monkeypatch.setattr(sampling_route, "build_billing_auth_context", lambda *_a, **_k: None)
 
     import mint_server.gateway as gw

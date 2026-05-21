@@ -3,7 +3,6 @@ from __future__ import annotations
 import dataclasses
 import logging
 import uuid
-from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
 
 import ray
@@ -20,7 +19,6 @@ from .openpi_fast_training import (
     OPENPI_FAST_TRAINING_BACKEND,
     get_openpi_fast_config_name,
 )
-from .openpi_shared_ray_runtime import start_openpi_shared_ray_runtime
 from .openpi_shared_ray_runtime import OpenPISharedRayRuntimeClient
 from .openpi_pi05_training import (
     OPENPI_PI05_TRAINING_BACKEND,
@@ -53,13 +51,9 @@ async def _default_runtime_factory(
     model_config: Any,
     config_name: str,
 ) -> Any:
-    del checkpoint_path
-    return await start_openpi_shared_ray_runtime(
-        session=SimpleNamespace(model_id=action_session_id, base_model=base_model),
-        spec=OpenPIFastActionRuntimeSpec.from_env(),
-        config_name=config_name,
-        model_config=model_config,
-        template_reusable=False,
+    del checkpoint_path, action_session_id, base_model, model_config, config_name
+    raise RuntimeError(
+        "OpenPI FAST action runtime must be reconciled by ModelActorSupervisor before request handling"
     )
 
 
@@ -71,17 +65,9 @@ async def _default_pi05_runtime_factory(
     model_config: Any,
     config_name: str,
 ) -> Any:
-    del checkpoint_path
-    spec = dataclasses.replace(
-        OpenPIFastActionRuntimeSpec.from_env(),
-        worker_module="mint_server.backend.openpi_pi05_action_worker",
-    )
-    return await start_openpi_shared_ray_runtime(
-        session=SimpleNamespace(model_id=action_session_id, base_model=base_model),
-        spec=spec,
-        config_name=config_name,
-        model_config=model_config,
-        template_reusable=False,
+    del checkpoint_path, action_session_id, base_model, model_config, config_name
+    raise RuntimeError(
+        "OpenPI pi0.5 action runtime must be reconciled by ModelActorSupervisor before request handling"
     )
 
 

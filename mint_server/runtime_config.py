@@ -52,21 +52,9 @@ BOOTSTRAP_RUNTIME_ENV_KEYS = frozenset(
 ACTOR_CREATION_INPUT_KEYS = frozenset(
     {
         "MINT_CONFIG_ACTOR_NAME",
-        "MINT_DETACHED_ACTOR_NODE_IP",
-        "MINT_CONTROL_PLANE_PINNED_NODE_IP",
-        "MINT_MODEL_WORK_SCHEDULER_PINNED_NODE_IP",
-        "MINT_MODEL_PLACEMENT_JSON",
-        "MINT_VLLM_MODEL_PLACEMENT_JSON",
-        "MINT_DENSE_MODEL_PLACEMENT_JSON",
-        "MINT_MEGATRON_MODEL_PLACEMENT_JSON",
         "MINT_MEGATRON_NODE_IPS_CSV",
-        "MINT_K2_INFER_VOLC_RESOURCE_QUEUE_ID",
-        "MINT_VLLM_VOLC_RESOURCE_QUEUE_ID",
-        "MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID",
         "MINT_MODEL_WORK_SCHEDULER_ACTOR_NAME",
         "MINT_MAINTENANCE_CRON_ACTOR_NAME",
-        "MINT_MODEL_RUNTIME_POLL_INTERVAL_S",
-        "MINT_MODEL_RUNTIME_LEASE_TTL_S",
     }
 )
 
@@ -89,7 +77,6 @@ SNAPSHOT_CONFIG_ENV_KEYS = frozenset(
         "MINT_REVERSE_KL_DIAG_FAIL",
         "MINT_DENSE_SESSION_STATE_ROOT",
         "MINT_RUNTIME_CHECKPOINT_DIR",
-        "MINT_USAGE_LOG_DIR",
         "MINT_USAGE_BACKEND",
         "MINT_USAGE_PG_DSN",
         "MINT_CHECKPOINT_INDEX_PG_DSN",
@@ -97,8 +84,6 @@ SNAPSHOT_CONFIG_ENV_KEYS = frozenset(
         "MINT_CHECKPOINT_INDEX_UPLOADING_STALE_S",
         "MINT_CHECKPOINT_INDEX_PUBLISH_RETRY_S",
         "MINT_MODEL_WORK_SCHEDULER_DEBUG_LOG_PATH",
-        "MINT_RETRIEVE_FUTURE_TASK_STATE_STORE",
-        "MINT_MODEL_WORK_SCHEDULER_TASK_STATE_STORE",
         "MINT_SCHEDULER_ENABLE",
         "MINT_SCHEDULER_MAX_CONSECUTIVE",
         "MINT_SCHEDULER_FAIRNESS",
@@ -122,15 +107,11 @@ SNAPSHOT_CONFIG_ENV_KEYS = frozenset(
         "MINT_TIMING_DIAG",
         "MINT_SUPPORTED_MODELS",
         "MINT_GATEWAY_CONFIG_JSON",
-        "MINT_MODEL_ACTOR_DESIRED_JSON",
-        "MINT_PERSISTENT_MODELS",
         "MINT_MAINTENANCE_REAP_INTERVAL_S",
         "MINT_ACTOR_RECONCILE_INTERVAL_S",
+        "MINT_MODEL_RUNTIME_POLL_INTERVAL_S",
+        "MINT_MODEL_RUNTIME_LEASE_TTL_S",
         "MINT_TRAINING_HEARTBEAT_STALE_S",
-        "MINT_MODEL_ACTOR_INVENTORY_RSS_TTL_S",
-        "MINT_MODEL_ACTOR_INVENTORY_OBSERVABILITY_TTL_S",
-        "MINT_MODEL_ACTOR_INVENTORY_OBSERVABILITY_TIMEOUT_S",
-        "MINT_MODEL_ACTOR_INVENTORY_OBSERVABILITY_REFRESH_CONCURRENCY",
         "MINT_SUPERVISOR_STATE_BACKEND",
         "MINT_SUPERVISOR_STATE_DB_PATH",
         "MINT_SUPERVISOR_STATE_OWNER_TTL_S",
@@ -200,13 +181,11 @@ SNAPSHOT_CONFIG_ENV_KEYS = frozenset(
         "MINT_PPO_LOSS_DEBUG",
         "MINT_VERL_DIAGNOSTICS",
         "MINT_LORA_EVICT_MIN_IDLE_S",
-        "MINT_STARTUP_RECONCILE_READY_TIMEOUT_S",
         "MINT_MEGATRON_SESSIONS_BASE_PATH",
         "MINT_TORCH_DIST_TIMEOUT_S",
         "MINT_MEGATRON_ENFORCE_TRUSTED_PAIR",
         "MINT_MEGATRON_SAVE_CHECKPOINT_TIMEOUT_S",
         "MINT_MEGATRON_SAVE_LORA_TIMEOUT_S",
-        "MINT_VOLC_BIN",
         "MINT_TP_SIZE",
         "MINT_DP_SIZE",
         "MINT_GPU_MEM_UTIL",
@@ -236,11 +215,6 @@ SNAPSHOT_CONFIG_ENV_KEYS = frozenset(
         "MINT_ACTOR_READY_TIMEOUT_S",
         "MINT_TRAINING_REMOTE_CALL_TIMEOUT_S",
         "MINT_ROUTER_REPLAY_MODE",
-        "MINT_PERSISTENT_TRAIN_LORA_RANK",
-        "MINT_PERSISTENT_TRAIN_LR",
-        "MINT_PERSISTENT_MEGATRON_READY_TIMEOUT_S",
-        "MINT_PERSISTENT_PREWARM_TRAINING",
-        "MINT_PERSISTENT_PREWARM_INFERENCE",
         "MINT_DOC_PATH",
         "MINT_CHECKPOINT_DIR",
     }
@@ -295,7 +269,23 @@ CONFIG_ACTOR_HYDRATION_CONTROL_KEYS = frozenset(
         "MINT_CONFIG_ACTOR_SELF",
     }
 )
-CONFIG_ACTOR_HYDRATION_PREFIXES = ("MINT_", "TINKER_", "OTEL_")
+CONFIG_ACTOR_ENV_EXCLUDED_KEYS = frozenset(
+    {
+        "MINT_API_KEY",
+        "MINT_BASE_URL",
+        "MINT_PROD_CONFIG_ENV",
+        "MINT_PROD_SECRETS_ENV",
+        "MINT_DEV_CONFIG_ENV",
+        "MINT_DEV_SECRETS_ENV",
+        "MINT_MODEL_PLACEMENT_JSON",
+        "MINT_VLLM_MODEL_PLACEMENT_JSON",
+        "MINT_DENSE_MODEL_PLACEMENT_JSON",
+        "MINT_MEGATRON_MODEL_PLACEMENT_JSON",
+        "MINT_MODEL_ACTOR_REPLICA",
+        "MINT_MODEL_ACTOR_REPLICA_ID",
+    }
+)
+CONFIG_ACTOR_HYDRATION_PREFIXES = ("OTEL_",)
 
 
 def config_actor_name(environ: Mapping[str, str] | None = None) -> str:
@@ -327,6 +317,8 @@ def classify_env(environ: Mapping[str, str]) -> dict[str, dict[str, str]]:
         canonical_key = canonical_mint_env_name(key)
         if canonical_key != key and canonical_key in environ:
             continue
+        if canonical_key in CONFIG_ACTOR_ENV_EXCLUDED_KEYS:
+            continue
         config_class = classify_env_key(canonical_key)
         if config_class == CONFIG_CLASS_UNCLASSIFIED:
             continue
@@ -357,13 +349,15 @@ def actor_env_from_environ(environ: Mapping[str, str]) -> dict[str, str]:
         canonical_key = canonical_mint_env_name(key)
         if canonical_key != key and canonical_key in environ:
             continue
+        if canonical_key in CONFIG_ACTOR_ENV_EXCLUDED_KEYS:
+            continue
         config_class = classify_env_key(canonical_key)
         if config_class in {
             CONFIG_CLASS_ACTOR_CREATION_INPUT,
             CONFIG_CLASS_SNAPSHOT_CONFIG,
             CONFIG_CLASS_OBSERVABILITY,
             CONFIG_CLASS_TASK_STATE,
-        } or (config_class == CONFIG_CLASS_UNCLASSIFIED and key.startswith(CONFIG_ACTOR_HYDRATION_PREFIXES)):
+        } or (config_class == CONFIG_CLASS_UNCLASSIFIED and canonical_key.startswith(CONFIG_ACTOR_HYDRATION_PREFIXES)):
             out[canonical_key] = str(value)
     return out
 

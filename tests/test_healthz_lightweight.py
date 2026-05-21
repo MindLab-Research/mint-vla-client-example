@@ -8,6 +8,14 @@ def anyio_backend():
     return "asyncio"
 
 
+async def _ready_billing_outbox_health_snapshot() -> dict:
+    return {"status": "ready"}
+
+
+def _ready_cached_health_snapshot() -> dict:
+    return {"status": "ready"}
+
+
 @pytest.mark.anyio
 async def test_public_healthz_uses_ping_cache_and_minimal_payload(monkeypatch: pytest.MonkeyPatch) -> None:
     import mint_server.backend.model_work_scheduler as scheduler_module
@@ -175,10 +183,40 @@ async def test_internal_healthz_degrades_on_stale_supervisor_snapshot(monkeypatc
 
     monkeypatch.setattr(health_checks.time, "time", lambda: now)
     monkeypatch.setattr(supervisor_module, "get_model_actor_supervisor", lambda: _Supervisor())
-    monkeypatch.setattr(health_checks, "_cached_maintenance_cron_snapshot", lambda: {"status": "ready"})
+    monkeypatch.setattr(health_checks, "_cached_maintenance_cron_snapshot", _ready_cached_health_snapshot)
+    monkeypatch.setattr(health_checks, "_billing_outbox_health_snapshot", _ready_billing_outbox_health_snapshot)
 
     out = await health_checks.internal_lightweight_healthz_response()
     assert out["status"] == "degraded"
+
+
+@pytest.mark.anyio
+async def test_internal_healthz_uses_top_level_supervisor_snapshot_timestamp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mint_server.backend.model_actor_supervisor as supervisor_module
+    from mint_server import health_checks
+
+    now = 1000.0
+
+    class _Supervisor:
+        def snapshot(self) -> dict:
+            return {
+                "snapshot_generated_at": now,
+                "desired_total": 1,
+                "managed_total": 1,
+                "last_reconcile_at": now - 600.0,
+                "topology": {},
+            }
+
+    monkeypatch.setattr(health_checks.time, "time", lambda: now)
+    monkeypatch.setattr(supervisor_module, "get_model_actor_supervisor", lambda: _Supervisor())
+    monkeypatch.setattr(health_checks, "_cached_maintenance_cron_snapshot", _ready_cached_health_snapshot)
+    monkeypatch.setattr(health_checks, "_billing_outbox_health_snapshot", _ready_billing_outbox_health_snapshot)
+
+    out = await health_checks.internal_lightweight_healthz_response()
+    assert out["status"] == "ready"
+    assert out["model_actor_supervisor"]["snapshot_generated_at"] == now
 
 
 @pytest.mark.anyio
@@ -204,6 +242,7 @@ async def test_internal_healthz_degrades_when_cron_unreachable(monkeypatch: pyte
         "_cached_maintenance_cron_snapshot",
         lambda: {"status": "degraded", "reason": "maintenance_cron_actor_unavailable"},
     )
+    monkeypatch.setattr(health_checks, "_billing_outbox_health_snapshot", _ready_billing_outbox_health_snapshot)
 
     out = await health_checks.internal_lightweight_healthz_response()
     assert out["status"] == "degraded"
@@ -228,7 +267,8 @@ async def test_internal_healthz_degrades_on_startup_control_plane_failure(monkey
 
     monkeypatch.setattr(health_checks.time, "time", lambda: now)
     monkeypatch.setattr(supervisor_module, "get_model_actor_supervisor", lambda: _Supervisor())
-    monkeypatch.setattr(health_checks, "_cached_maintenance_cron_snapshot", lambda: {"status": "ready"})
+    monkeypatch.setattr(health_checks, "_cached_maintenance_cron_snapshot", _ready_cached_health_snapshot)
+    monkeypatch.setattr(health_checks, "_billing_outbox_health_snapshot", _ready_billing_outbox_health_snapshot)
     clear_startup_degraded_state()
     set_startup_degraded_state(
         reason="control_plane_unavailable",
@@ -241,6 +281,46 @@ async def test_internal_healthz_degrades_on_startup_control_plane_failure(monkey
         assert out["startup"]["reason"] == "control_plane_unavailable"
     finally:
         clear_startup_degraded_state()
+
+
+@pytest.mark.anyio
+async def test_internal_healthz_degrades_on_billing_outbox_backlog(monkeypatch: pytest.MonkeyPatch) -> None:
+    import mint_server.backend.model_actor_supervisor as supervisor_module
+    import mint_server.backend.task_state_store as task_state_module
+    from mint_server import health_checks
+
+    now = 1000.0
+
+    class _Supervisor:
+        def snapshot(self) -> dict:
+            return {
+                "desired_total": 0,
+                "managed_total": 0,
+                "last_reconcile_at": now,
+                "topology": {"observed_at": now},
+            }
+
+    class _TaskFutures:
+        async def async_billing_outbox_stats(self):
+            return {
+                "by_status": {
+                    "pending": {"rows": 2, "oldest_age_s": 6.0},
+                    "failed": {"rows": 0, "oldest_age_s": 0.0},
+                },
+                "metrics": {"flush_permanent_error": 0},
+            }
+
+    monkeypatch.setattr(health_checks.time, "time", lambda: now)
+    monkeypatch.setenv("MINT_BILLING_OUTBOX_DEGRADED_ROWS", "10")
+    monkeypatch.setenv("MINT_BILLING_OUTBOX_DEGRADED_AGE_S", "5")
+    monkeypatch.setattr(supervisor_module, "get_model_actor_supervisor", lambda: _Supervisor())
+    monkeypatch.setattr(task_state_module, "task_futures", _TaskFutures())
+    monkeypatch.setattr(health_checks, "_cached_maintenance_cron_snapshot", _ready_cached_health_snapshot)
+
+    out = await health_checks.internal_lightweight_healthz_response()
+    assert out["status"] == "degraded"
+    assert out["billing_outbox"]["status"] == "degraded"
+    assert "oldest_pending_age" in out["billing_outbox"]["reasons"]
 
 
 @pytest.mark.anyio

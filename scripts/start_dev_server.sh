@@ -49,4 +49,5 @@ if [ -z "${MINT_RAY_CLIENT_ADDRESS:-}" ]; then
   esac
 fi
 
+"${PFS_RUNTIME_ENV_ROOT}/host-venv/bin/python" scripts/bootstrap_control_plane.py
 exec "${PFS_RUNTIME_ENV_ROOT}/host-venv/bin/python" scripts/run_server.py

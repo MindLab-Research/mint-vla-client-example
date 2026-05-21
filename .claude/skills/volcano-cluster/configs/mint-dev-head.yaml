@@ -1,5 +1,5 @@
 # Ray Head Node - CPU only, persistent
-# Submit with: volc ml_task submit -c ray_head.yaml --output json
+# Head bootstrap is environment-owned. Worker lifecycle is SDK/topology-owned.
 
 TaskName: "mint-dev-head"
 Description: "mint-dev-head cpu task"

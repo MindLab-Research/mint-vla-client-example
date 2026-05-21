@@ -2048,8 +2048,8 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
 # =============================================================================
 
 
-def _split_tinker_checkpoint_id(checkpoint_id: str) -> tuple[str, str | None]:
-    # Tinker canonical checkpoint IDs include an explicit kind prefix:
+def _split_sdk_checkpoint_id(checkpoint_id: str) -> tuple[str, str | None]:
+    # SDK checkpoint IDs can include an explicit kind prefix:
     # - weights/<name> -> training
     # - sampler_weights/<name> -> sampler
     parts = checkpoint_id.split("/")
@@ -2129,7 +2129,7 @@ async def _resolve_weight_checkpoint(
     owner_id: str | None,
     is_admin: bool,
 ) -> tuple[str, dict[str, Any], dict[str, Any] | None]:
-    checkpoint_name, expected_type = _split_tinker_checkpoint_id(checkpoint_id)
+    checkpoint_name, expected_type = _split_sdk_checkpoint_id(checkpoint_id)
     scoped_owner_id = _checkpoint_owner_scope(
         request_user_id=request_user_id,
         requested_owner_id=owner_id,

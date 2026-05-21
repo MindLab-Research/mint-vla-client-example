@@ -110,10 +110,6 @@ class _FakeScheduler:
         self.failed.append(kwargs)
         return {"ok": True, **kwargs}
 
-    async def assign_pending(self, **kwargs):
-        self.assigned.append(kwargs)
-        return {"ok": True, "assigned": 0, "expired": 0}
-
 
 class _FakeTaskFutureService:
     def __init__(
@@ -243,7 +239,7 @@ async def test_issue_593_model_runtime_claims_executes_renews_and_completes() ->
             "lease_ttl_s": 0.3,
         }
     ]
-    assert scheduler.assigned == [{"max_items": 1}]
+    assert scheduler.assigned == []
     assert seen_context == [(lease["lease_id"], "vllm:model-a::replica-0::generation::3", 3)]
     assert task_futures.running[0][0] == lease["item"]["request_id"]
     assert task_futures.running[0][1]["domain_key"] == "vllm:model-a"
@@ -259,8 +255,12 @@ async def test_issue_593_model_runtime_claims_executes_renews_and_completes() ->
             "consumer_id": "vllm:model-a::replica-0::generation::3",
             "consumer_generation": 3,
             "finalize_ttl_s": 0.3,
+            "staged_payload_path": scheduler.begin_finalized[0]["staged_payload_path"],
         }
     ]
+    assert scheduler.begin_finalized[0]["staged_payload_path"].endswith(
+        "/ru/runtime-req-1/attempt-runtime-req-1__lease-runtime-req-1.json"
+    )
     assert scheduler.completed == [
         {
             "lease_id": lease["lease_id"],

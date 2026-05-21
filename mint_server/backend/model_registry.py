@@ -461,7 +461,7 @@ def normalize_model_name(model_name_or_path: str) -> str:
 
 
 def maybe_normalize_model_name(model_name_or_path: str) -> str | None:
-    """Best-effort normalization for persistent model matching.
+    """Best-effort normalization for model matching.
 
     Returns a supported HF model name if it can be identified from a name/path,
     otherwise returns None.
@@ -481,20 +481,25 @@ def maybe_normalize_model_name(model_name_or_path: str) -> str | None:
     return None
 
 
-def is_persistent_model(model_name_or_path: str) -> bool:
-    models_csv = os.environ.get("MINT_PERSISTENT_MODELS", "").strip()
-    if not models_csv:
+def is_topology_desired_model(model_name_or_path: str) -> bool:
+    try:
+        from .topology import load_topology_config_from_env
+
+        topology = load_topology_config_from_env()
+    except Exception:
+        topology = None
+    if topology is None:
         return False
 
-    raw = {s.strip() for s in models_csv.split(",") if s.strip()}
+    raw = {str(name).strip() for name in topology.models if str(name).strip()}
     normalized = {m for s in raw if (m := maybe_normalize_model_name(s)) is not None}
-    persistent_ids = raw | normalized
+    model_ids = raw | normalized
 
-    if model_name_or_path in persistent_ids:
+    if model_name_or_path in model_ids:
         return True
 
     m = maybe_normalize_model_name(model_name_or_path)
-    return m in persistent_ids if m is not None else False
+    return m in model_ids if m is not None else False
 
 
 def get_model_config(model_name: str) -> ModelConfig:

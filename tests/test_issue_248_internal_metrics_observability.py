@@ -248,6 +248,23 @@ async def _fake_admission_stats(*, include_actor_rss: bool = True) -> dict:
                 "avg_done_s": 1.5,
             },
             "payload_stats": {"result_refs_count": 4, "errors_count": 0, "refs_count": 5},
+            "billing_outbox": {
+                "by_status": {
+                    "pending": {"rows": 2, "oldest_age_s": 11.0},
+                    "flushing": {"rows": 1, "oldest_age_s": 3.0},
+                },
+                "metrics": {
+                    "flush_success": 5,
+                    "flush_transient_error": 1,
+                    "flush_permanent_error": 0,
+                    "event_inserted": 9,
+                    "event_conflict": 2,
+                    "event_failed": 1,
+                    "write_error": 1,
+                    "outbox_conflict": 4,
+                    "skipped_missing_billing_context": 3,
+                },
+            },
         },
         "actors": actors,
         "process": {"rss_bytes": 12345, "pid": 999},
@@ -277,6 +294,10 @@ async def _fake_admission_stats_with_stale_cached_rss(*, include_actor_rss: bool
 def test_issue_248_internal_metrics_omits_unknown_model_actor_inventory_rss(monkeypatch) -> None:
     monkeypatch.setenv("MINT_INTERNAL_PROMETHEUS_METRICS_ENABLED", "1")
     monkeypatch.setattr(internal_routes, "admission_stats", _fake_admission_stats)
+    monkeypatch.setattr(
+        "mint_server.backend.task_state_store.billing_metrics_snapshot",
+        lambda: {},
+    )
     resp = asyncio.run(internal_routes.metrics())
     text = resp.body.decode("utf-8")
 
@@ -292,6 +313,15 @@ def test_issue_248_internal_metrics_omits_unknown_model_actor_inventory_rss(monk
         'mint_task_futures_pending{op="asample"} 1',
         "mint_task_futures_oldest_pending_s 8",
         "mint_task_futures_result_refs_count 4",
+        'mint_billing_outbox_rows{status="pending"} 2',
+        'mint_billing_outbox_oldest_age_s{status="pending"} 11',
+        'mint_billing_outbox_flush_attempts_total{result="success"} 5',
+        'mint_billing_outbox_flush_attempts_total{result="transient_error"} 1',
+        'mint_billing_outbox_events_total{result="inserted"} 9',
+        'mint_billing_outbox_events_total{result="conflict"} 2',
+        "mint_billing_outbox_write_errors_total 1",
+        "mint_billing_outbox_conflict_total 4",
+        'mint_billing_observation_skipped_total{reason="missing_billing_context"} 3',
         'mint_model_actor_inventory_actor_idle_time_s{actor_name="vllm-1",actor_type="vllm",model="Qwen/Qwen3-4B-Instruct-2507"} 2',
         'mint_model_actor_inventory_actor_age_s{actor_name="vllm-1",actor_type="vllm",model="Qwen/Qwen3-4B-Instruct-2507"} 50',
         'mint_model_actor_inventory_actors{actor_type="vllm",model="Qwen/Qwen3-4B-Instruct-2507"} 1',

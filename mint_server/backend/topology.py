@@ -4,12 +4,11 @@ import ipaddress
 import json
 import os
 import re
-import shlex
-import subprocess
 import tempfile
 import time
 import urllib.request
 from collections.abc import Callable, Iterable
+from configparser import ConfigParser
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -27,6 +26,8 @@ class TopologyNodeDesired:
     template: str
     role: str = "gpu"
     enabled: bool = True
+    mount_ok: bool = True
+    runtime_env_ok: bool = True
     labels: dict[str, str] = field(default_factory=dict)
     gpu_count: int | None = None
 
@@ -38,6 +39,7 @@ class TopologyConfig:
     cluster_id: str
     state_path: str
     nodes: dict[str, TopologyNodeDesired]
+    models: dict[str, Any] = field(default_factory=dict)
     providers: dict[str, Any] = field(default_factory=dict)
     ray_dashboard_url: str | None = None
     ray_head_ip_path: str | None = None
@@ -73,6 +75,9 @@ class TopologyNodeRuntime:
     provider_task_name: str
     template: str
     enabled: bool
+    role: str = "gpu"
+    mount_ok: bool = True
+    runtime_env_ok: bool = True
     node_ip: str | None = None
     ray_node_id: str | None = None
     provider_task_id: str | None = None
@@ -104,10 +109,13 @@ class TopologyRuntimeState:
 ProviderTaskLister = Callable[[TopologyConfig], Iterable[ProviderTaskState]]
 ProviderTaskSubmitter = Callable[[TopologyConfig, TopologyNodeDesired], Any]
 RayNodeLister = Callable[[], Iterable[RayNodeState]]
-CommandRunner = Callable[[list[str], float], str]
 
 LIVE_PROVIDER_TASK_STATES = {"Queue", "Staging", "Running", "Initialized"}
 TERMINAL_PROVIDER_TASK_STATES = {"Succeeded", "Failed", "Cancelled", "Stopped", "Killing", "Terminated"}
+
+
+class UnsupportedTopologyProviderError(ValueError):
+    pass
 
 
 def is_ip_address(value: str) -> bool:
@@ -122,6 +130,15 @@ def _require_mapping(value: Any, *, context: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{context} must be a mapping")
     return value
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    return float(raw)
 
 
 def _validate_alias(alias: str) -> str:
@@ -179,6 +196,7 @@ def load_topology_config(path: str | os.PathLike[str]) -> TopologyConfig:
     if not isinstance(desired_raw, list):
         raise ValueError("topology config nodes.desired must be a list")
     providers = _require_mapping(root.get("providers") or {}, context="topology config providers")
+    models = _require_mapping(root.get("models") or {}, context="topology config models")
     ray_root = _require_mapping(root.get("ray") or {}, context="topology config ray")
     ray_dashboard_url = str(
         os.environ.get("MINT_RAY_DASHBOARD_URL")
@@ -223,6 +241,8 @@ def load_topology_config(path: str | os.PathLike[str]) -> TopologyConfig:
             template=template,
             role=str(item_map.get("role") or "gpu"),
             enabled=bool(item_map.get("enabled", True)),
+            mount_ok=bool(item_map.get("mount_ok", True)),
+            runtime_env_ok=bool(item_map.get("runtime_env_ok", True)),
             labels={str(k): str(v) for k, v in labels_raw.items()},
             gpu_count=None if node_gpu_count is None else int(node_gpu_count),
         )
@@ -233,6 +253,7 @@ def load_topology_config(path: str | os.PathLike[str]) -> TopologyConfig:
         cluster_id=cluster_id,
         state_path=state_path,
         nodes=nodes,
+        models=models,
         providers=providers,
         ray_dashboard_url=ray_dashboard_url,
         ray_head_ip_path=ray_head_ip_path,
@@ -362,62 +383,81 @@ def default_ray_node_lister_for_config(config: TopologyConfig | None) -> RayNode
     return _list_nodes
 
 
-def _strip_volc_json_banner(output: str) -> Any:
-    text = str(output or "")
-    starts = [idx for idx in (text.find("["), text.find("{")) if idx >= 0]
-    if not starts:
-        raise ValueError("volc output did not contain JSON payload")
-    return json.loads(text[min(starts):])
+def _object_get(value: Any, *names: str) -> Any:
+    for name in names:
+        if isinstance(value, dict):
+            for key in (name, _camel_to_pascal(name), _pascal_to_snake(name)):
+                if key in value:
+                    return value[key]
+        if hasattr(value, name):
+            return getattr(value, name)
+        snake = _pascal_to_snake(name)
+        if hasattr(value, snake):
+            return getattr(value, snake)
+    return None
 
 
-def _default_command_runner(argv: list[str], timeout_s: float) -> str:
-    result = subprocess.run(
-        argv,
-        check=True,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=float(timeout_s),
-    )
-    return result.stdout
+def _camel_to_pascal(value: str) -> str:
+    raw = str(value or "")
+    if not raw:
+        return raw
+    if "_" in raw:
+        return "".join(part[:1].upper() + part[1:] for part in raw.split("_") if part)
+    return raw[:1].upper() + raw[1:]
 
 
-def _task_gpu_count(task: dict[str, Any]) -> int | None:
+def _pascal_to_snake(value: str) -> str:
+    raw = str(value or "")
+    out = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", raw)
+    out = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", out)
+    return out.lower()
+
+
+def _task_gpu_count(task: Any) -> int | None:
     flavor_gpus = {
         "ml.hpcpni2l.28xlarge": 8,
         "ml.hpcpni2l.14xlarge": 4,
         "ml.hpcpni2l.7xlarge": 2,
         "ml.r3i.4xlarge": 0,
     }
+    resource_config = _object_get(task, "ResourceConfig", "resource_config")
+    specs = _object_get(resource_config, "Roles", "roles") if resource_config is not None else None
+    if specs is None:
+        specs = _object_get(task, "TaskRoleSpecs", "task_role_specs") or []
     total = 0
     seen = False
-    for spec in task.get("TaskRoleSpecs") or []:
-        if not isinstance(spec, dict):
-            continue
+    for spec in specs or []:
         try:
-            replicas = int(spec.get("RoleReplicas") or 0)
+            replicas = int(_object_get(spec, "RoleReplicas", "replicas") or 0)
         except Exception:
             replicas = 0
-        flavor = str(
-            spec.get("ResourceSpecId")
-            or (spec.get("ResourceSpec") or {}).get("FlavorID")
-            or ""
-        )
+        resource = _object_get(spec, "ResourceSpec", "resource")
+        flavor = str(_object_get(spec, "ResourceSpecId", "instance_type_id") or _object_get(resource, "FlavorID", "instance_type_id") or "")
         if flavor in flavor_gpus:
             seen = True
             total += replicas * flavor_gpus[flavor]
     return total if seen else None
 
 
-def _extract_node_ip_from_worker_logs(logs: str) -> str | None:
-    for pattern in (
-        r"Local node IP:\s*([0-9]+(?:\.[0-9]+){3})",
-        r"published IP:\s*([0-9]+(?:\.[0-9]+){3})",
-        r"Ray head IP:\s*([0-9]+(?:\.[0-9]+){3})",
-    ):
-        match = re.search(pattern, logs)
-        if match:
-            return match.group(1)
+def _job_state(task: Any) -> str:
+    status = _object_get(task, "Status", "status")
+    return str(_object_get(status, "State", "state") or status or "").strip()
+
+
+def _job_id(task: Any) -> str | None:
+    return str(_object_get(task, "JobId", "Id", "id") or "").strip() or None
+
+
+def _job_name(task: Any) -> str:
+    return str(_object_get(task, "JobName", "Name", "name") or "").strip()
+
+
+def _extract_instance_node_ip(instance: Any) -> str | None:
+    ips = _object_get(instance, "Ips", "ips")
+    for name in ("PrimaryIp", "primary_ip", "HostIp", "host_ip"):
+        value = str(_object_get(ips, name) or "").strip()
+        if value and is_ip_address(value):
+            return value
     return None
 
 
@@ -425,64 +465,63 @@ class VolcanoTopologyProvider:
     def __init__(
         self,
         *,
-        volc_bin: str = "/root/.volc/bin/volc",
-        submit_host: str | None = None,
-        command_runner: CommandRunner | None = None,
-        timeout_s: float = 30.0,
-        fetch_logs: bool = True,
+        client: Any | None = None,
+        client_factory: Callable[[], Any] | None = None,
+        region: str | None = None,
+        connect_timeout: float | None = None,
+        read_timeout: float | None = None,
     ) -> None:
-        self._volc_bin = str(volc_bin or "/root/.volc/bin/volc")
-        self._submit_host = str(submit_host or "").strip() or None
-        self._command_runner = command_runner or _default_command_runner
-        self._timeout_s = float(timeout_s)
-        self._fetch_logs = bool(fetch_logs)
+        self._client = client
+        self._client_factory = client_factory or (
+            lambda: _create_volcano_mlplatform_client(
+                region=region,
+                connect_timeout=connect_timeout,
+                read_timeout=read_timeout,
+            )
+        )
 
-    def _run(self, argv: list[str], *, timeout_s: float | None = None) -> str:
-        if self._submit_host:
-            argv = [
-                "ssh",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=10",
-                self._submit_host,
-                shlex.join(argv),
-            ]
-        return self._command_runner(argv, self._timeout_s if timeout_s is None else float(timeout_s))
+    @property
+    def client(self) -> Any:
+        if self._client is None:
+            self._client = self._client_factory()
+        return self._client
 
     def list_tasks(self, config: TopologyConfig) -> Iterable[ProviderTaskState]:
-        output = self._run(
-            [self._volc_bin, "ml_task", "list", "--output", "json", "--limit", "200"]
+        sdk = _volcano_sdk_module()
+        response = self.client.list_jobs(
+            sdk.ListJobsRequest(
+                name_contains=f"mint-{config.deployment_env}-worker-",
+                page_number=1,
+                page_size=100,
+            )
         )
-        payload = _strip_volc_json_banner(output)
-        if not isinstance(payload, list):
-            raise ValueError("volc ml_task list JSON payload must be a list")
+        tasks = _object_get(response, "Items", "items") or []
         task_names = {
             stable_provider_task_name(config.deployment_env, alias): alias
             for alias in config.nodes
         }
         states: list[ProviderTaskState] = []
-        for task in payload:
-            if not isinstance(task, dict):
-                continue
-            task_name = str(task.get("JobName") or "").strip()
+        for task in tasks:
+            task_name = _job_name(task)
             alias = task_names.get(task_name)
             if alias is None:
                 continue
-            raw_state = str(task.get("Status") or "").strip()
+            raw_state = _job_state(task)
             live = raw_state in LIVE_PROVIDER_TASK_STATES
-            task_id = str(task.get("JobId") or "").strip() or None
+            task_id = _job_id(task)
             node_ip = None
             error = None
-            if live and task_id and self._fetch_logs:
+            if live and task_id:
                 try:
-                    logs = self._run(
-                        [self._volc_bin, "ml_task", "logs", "-t", task_id, "-i", "worker_0"],
-                        timeout_s=10.0,
+                    instance_response = self.client.list_job_instances(
+                        sdk.ListJobInstancesRequest(job_id=task_id, page_number=1, page_size=20)
                     )
-                    node_ip = _extract_node_ip_from_worker_logs(logs)
+                    for instance in _object_get(instance_response, "Items", "items") or []:
+                        node_ip = _extract_instance_node_ip(instance)
+                        if node_ip:
+                            break
                 except Exception as e:
-                    error = f"volc logs failed: {type(e).__name__}: {e}"
+                    error = f"volcano list_job_instances failed: {type(e).__name__}: {e}"
             states.append(
                 ProviderTaskState(
                     alias=alias,
@@ -499,50 +538,206 @@ class VolcanoTopologyProvider:
         return states
 
     def submit_task(self, config: TopologyConfig, node: TopologyNodeDesired) -> None:
-        provider_cfg = config.providers.get(node.provider) or {}
-        if not isinstance(provider_cfg, dict):
-            raise ValueError(f"provider config for {node.provider!r} must be a mapping")
-        template_cfg = (provider_cfg.get("templates") or {}).get(node.template) or {}
-        if not isinstance(template_cfg, dict):
-            raise ValueError(f"template config for {node.template!r} must be a mapping")
-        template_path = str(template_cfg.get("template_path") or "").strip()
-        queue_id = str(template_cfg.get("resource_queue_id") or template_cfg.get("ResourceQueueID") or "").strip()
-        if not template_path:
-            raise ValueError(f"topology node {node.alias} template_path is required")
-        if not queue_id:
-            raise ValueError(f"topology node {node.alias} resource_queue_id is required")
-        task_name = stable_provider_task_name(config.deployment_env, node.alias)
-        rendered = render_volcano_worker_template(
-            template_path=template_path,
-            task_name=task_name,
-            resource_queue_id=queue_id,
-            worker_alias=node.alias,
-            deployment_env=config.deployment_env,
-            cluster_id=config.cluster_id,
+        request = build_volcano_create_job_request(config, node)
+        self.client.create_job(request)
+
+
+def _volcano_sdk_module() -> Any:
+    try:
+        import volcenginesdkmlplatform20240701 as sdk
+    except ImportError as e:
+        raise RuntimeError(
+            "volcengine-python-sdk is required for Volcano topology node management"
+        ) from e
+    return sdk
+
+
+def _legacy_volc_cli_credentials() -> dict[str, str]:
+    """Read legacy Volcano CLI credentials for SDK compatibility.
+
+    The Volcano SDK default chain reads ~/.volcengine/config.json, while the
+    older ml_task CLI used ~/.volc/config plus ~/.volc/credentials. Keep this
+    bridge local to the driver process and never expose the returned values in
+    topology config, logs, metrics, or state snapshots.
+    """
+
+    has_modern_source = any(
+        str(os.environ.get(name) or "").strip()
+        for name in (
+            "VOLCENGINE_ACCESS_KEY",
+            "VOLCENGINE_SECRET_KEY",
+            "VOLCENGINE_SESSION_TOKEN",
+            "VOLCENGINE_CLI_CONFIG_FILE",
         )
-        if self._submit_host:
-            submit_dir = Path(config.state_path).parent / "topology-submits"
-            submit_dir.mkdir(parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile(
-                "w",
-                encoding="utf-8",
-                suffix=".yaml",
-                dir=str(submit_dir),
-                delete=False,
-            ) as f:
-                temp_path = f.name
-                f.write(rendered)
-        else:
-            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".yaml", delete=False) as f:
-                temp_path = f.name
-                f.write(rendered)
-        try:
-            self._run([self._volc_bin, "ml_task", "submit", "-c", temp_path, "--output", "json"])
-        finally:
-            try:
-                os.unlink(temp_path)
-            except FileNotFoundError:
-                pass
+    ) or Path(os.path.expanduser("~/.volcengine/config.json")).is_file()
+    if has_modern_source:
+        return {}
+
+    cred_path = Path(os.path.expanduser("~/.volc/credentials"))
+    if not cred_path.is_file():
+        return {}
+    creds = ConfigParser()
+    creds.read(cred_path, encoding="utf-8")
+    section = os.environ.get("VOLC_PROFILE") or os.environ.get("VOLCENGINE_PROFILE") or "default"
+    if not creds.has_section(section):
+        return {}
+    ak = str(creds.get(section, "access_key_id", fallback="")).strip()
+    sk = str(creds.get(section, "secret_access_key", fallback="")).strip()
+    token = str(creds.get(section, "session_token", fallback="")).strip()
+    if not ak or not sk:
+        return {}
+
+    config_path = Path(os.path.expanduser("~/.volc/config"))
+    region = ""
+    if config_path.is_file():
+        cfg = ConfigParser()
+        cfg.read(config_path, encoding="utf-8")
+        if cfg.has_section(section):
+            region = str(cfg.get(section, "region", fallback="")).strip()
+        if not region and cfg.has_section("default"):
+            region = str(cfg.get("default", "region", fallback="")).strip()
+
+    out = {"ak": ak, "sk": sk}
+    if token:
+        out["session_token"] = token
+    if region:
+        out["region"] = region
+    return out
+
+
+def _create_volcano_mlplatform_client(
+    *,
+    region: str | None = None,
+    connect_timeout: float | None = None,
+    read_timeout: float | None = None,
+) -> Any:
+    try:
+        import volcenginesdkcore
+        import volcenginesdkmlplatform20240701 as sdk
+    except ImportError as e:
+        raise RuntimeError(
+            "volcengine-python-sdk is required for Volcano topology node management"
+        ) from e
+    configuration = volcenginesdkcore.Configuration()
+    if region:
+        configuration.region = str(region)
+    legacy_credentials = _legacy_volc_cli_credentials()
+    if legacy_credentials:
+        configuration.ak = legacy_credentials["ak"]
+        configuration.sk = legacy_credentials["sk"]
+        if legacy_credentials.get("session_token"):
+            configuration.session_token = legacy_credentials["session_token"]
+        if not region and legacy_credentials.get("region"):
+            configuration.region = legacy_credentials["region"]
+    if connect_timeout is not None:
+        configuration.connect_timeout = float(connect_timeout)
+    if read_timeout is not None:
+        configuration.read_timeout = float(read_timeout)
+    configuration.debug = False
+    return sdk.MLPLATFORM20240701Api(volcenginesdkcore.ApiClient(configuration))
+
+
+def build_volcano_create_job_request(config: TopologyConfig, node: TopologyNodeDesired) -> Any:
+    sdk = _volcano_sdk_module()
+    provider_cfg = config.providers.get(node.provider) or {}
+    if not isinstance(provider_cfg, dict):
+        raise ValueError(f"provider config for {node.provider!r} must be a mapping")
+    template_cfg = (provider_cfg.get("templates") or {}).get(node.template) or {}
+    if not isinstance(template_cfg, dict):
+        raise ValueError(f"template config for {node.template!r} must be a mapping")
+    template_path = str(template_cfg.get("template_path") or "").strip()
+    queue_id = str(template_cfg.get("resource_queue_id") or template_cfg.get("ResourceQueueID") or "").strip()
+    if not template_path:
+        raise ValueError(f"topology node {node.alias} template_path is required")
+    if not queue_id:
+        raise ValueError(f"topology node {node.alias} resource_queue_id is required")
+    task_name = stable_provider_task_name(config.deployment_env, node.alias)
+    rendered = render_volcano_worker_template(
+        template_path=template_path,
+        task_name=task_name,
+        resource_queue_id=queue_id,
+        worker_alias=node.alias,
+        deployment_env=config.deployment_env,
+        cluster_id=config.cluster_id,
+    )
+    payload = yaml.safe_load(rendered) or {}
+    if not isinstance(payload, dict):
+        raise ValueError(f"rendered Volcano worker template for {node.alias} must be a mapping")
+    role_specs = []
+    for raw_role in payload.get("TaskRoleSpecs") or []:
+        if not isinstance(raw_role, dict):
+            raise ValueError(f"TaskRoleSpecs item for {node.alias} must be a mapping")
+        role_name = str(raw_role.get("RoleName") or "").strip()
+        replicas = int(raw_role.get("RoleReplicas") or 1)
+        flavor = str(raw_role.get("Flavor") or raw_role.get("ResourceSpecId") or "").strip()
+        if not role_name or not flavor:
+            raise ValueError(f"TaskRoleSpecs item for {node.alias} must include RoleName and Flavor")
+        role_specs.append(
+            sdk.RoleForCreateJobInput(
+                name=role_name,
+                replicas=replicas,
+                resource=sdk.ResourceForCreateJobInput(instance_type_id=flavor),
+            )
+        )
+    storage_specs = []
+    for raw_storage in payload.get("Storages") or []:
+        if not isinstance(raw_storage, dict):
+            raise ValueError(f"Storages item for {node.alias} must be a mapping")
+        storage_specs.append(_volcano_storage_for_create_job(sdk, raw_storage))
+    image_url = str(payload.get("ImageUrl") or "").strip()
+    if not image_url:
+        raise ValueError(f"rendered Volcano worker template for {node.alias} must include ImageUrl")
+    command = str(payload.get("Entrypoint") or "").strip()
+    if not command:
+        raise ValueError(f"rendered Volcano worker template for {node.alias} must include Entrypoint")
+    return sdk.CreateJobRequest(
+        name=task_name,
+        description=str(payload.get("Description") or f"{task_name} topology worker"),
+        resource_config=sdk.ResourceConfigForCreateJobInput(
+            resource_queue_id=queue_id,
+            max_runtime_seconds=int(payload.get("ActiveDeadlineSeconds") or 0),
+            roles=role_specs,
+        ),
+        runtime_config=sdk.RuntimeConfigForCreateJobInput(
+            command=command,
+            framework=str(payload.get("Framework") or "Custom"),
+            image=sdk.ImageForCreateJobInput(type="ImageUrl", url=image_url),
+        ),
+        storage_config=sdk.StorageConfigForCreateJobInput(storages=storage_specs) if storage_specs else None,
+    )
+
+
+def _volcano_storage_for_create_job(sdk: Any, raw: dict[str, Any]) -> Any:
+    storage_type = str(raw.get("Type") or raw.get("type") or "").strip()
+    mount_path = str(raw.get("MountPath") or raw.get("mount_path") or "").strip()
+    read_only = bool(raw.get("ReadOnly", raw.get("read_only", False)))
+    if not storage_type or not mount_path:
+        raise ValueError("Volcano storage item must include Type and MountPath")
+    config_obj = None
+    if storage_type == "Vepfs":
+        config_obj = sdk.ConfigForCreateJobInput(
+            vepfs=sdk.VepfsForCreateJobInput(
+                id=str(raw.get("Id") or "").strip() or None,
+                file_system_name=str(raw.get("FileSystemName") or "").strip() or None,
+                sub_path=str(raw.get("SubPath") or "").strip() or None,
+                host_path=str(raw.get("HostPath") or "").strip() or None,
+            )
+        )
+    elif storage_type == "TosFuse":
+        config_obj = sdk.ConfigForCreateJobInput(
+            tos=sdk.TosForCreateJobInput(
+                bucket=str(raw.get("Bucket") or "").strip() or None,
+                prefix=str(raw.get("Prefix") or "").strip() or None,
+            )
+        )
+    else:
+        raise ValueError(f"unsupported Volcano storage type in topology worker template: {storage_type!r}")
+    return sdk.StorageForCreateJobInput(
+        type=storage_type,
+        mount_path=mount_path,
+        read_only=read_only,
+        config=config_obj,
+    )
 
 
 def render_volcano_worker_template(
@@ -594,10 +789,15 @@ def default_provider_task_lister_for_config(config: TopologyConfig) -> ProviderT
     if providers == {"volcano"}:
         provider_cfg = config.providers.get("volcano") if isinstance(config.providers.get("volcano"), dict) else {}
         provider = VolcanoTopologyProvider(
-            volc_bin=str(provider_cfg.get("volc_bin") or "/root/.volc/bin/volc"),
-            submit_host=str(provider_cfg.get("submit_host") or "").strip() or None,
+            region=str(provider_cfg.get("region") or "").strip() or None,
+            connect_timeout=_optional_float(provider_cfg.get("connect_timeout_s")),
+            read_timeout=_optional_float(provider_cfg.get("read_timeout_s")),
         )
         return provider.list_tasks
+    if providers:
+        raise UnsupportedTopologyProviderError(
+            f"unsupported topology providers: {', '.join(sorted(providers))}; supported providers: volcano"
+        )
     return empty_provider_task_lister
 
 
@@ -606,10 +806,15 @@ def default_provider_task_submitter_for_config(config: TopologyConfig) -> Provid
     if providers == {"volcano"}:
         provider_cfg = config.providers.get("volcano") if isinstance(config.providers.get("volcano"), dict) else {}
         provider = VolcanoTopologyProvider(
-            volc_bin=str(provider_cfg.get("volc_bin") or "/root/.volc/bin/volc"),
-            submit_host=str(provider_cfg.get("submit_host") or "").strip() or None,
+            region=str(provider_cfg.get("region") or "").strip() or None,
+            connect_timeout=_optional_float(provider_cfg.get("connect_timeout_s")),
+            read_timeout=_optional_float(provider_cfg.get("read_timeout_s")),
         )
         return provider.submit_task
+    if providers:
+        raise UnsupportedTopologyProviderError(
+            f"unsupported topology providers: {', '.join(sorted(providers))}; supported providers: volcano"
+        )
     return noop_provider_task_submitter
 
 
@@ -675,6 +880,9 @@ class TopologyManager:
                     provider_task_name=task_name,
                     template=desired.template,
                     enabled=False,
+                    role=desired.role,
+                    mount_ok=desired.mount_ok,
+                    runtime_env_ok=desired.runtime_env_ok,
                     last_error=None,
                 )
                 continue
@@ -686,6 +894,9 @@ class TopologyManager:
                     provider_task_name=task_name,
                     template=desired.template,
                     enabled=True,
+                    role=desired.role,
+                    mount_ok=desired.mount_ok,
+                    runtime_env_ok=desired.runtime_env_ok,
                     provider_task_id=task.task_id if task else None,
                     node_ip=task.node_ip if task else None,
                     gpu_count=task.gpu_count if task else desired.gpu_count,
@@ -707,6 +918,9 @@ class TopologyManager:
                     provider_task_name=task_name,
                     template=desired.template,
                     enabled=True,
+                    role=desired.role,
+                    mount_ok=desired.mount_ok,
+                    runtime_env_ok=desired.runtime_env_ok,
                     provider_task_id=task.task_id if task else None,
                     node_ip=task.node_ip if task else None,
                     gpu_count=task.gpu_count if task else desired.gpu_count,
@@ -723,6 +937,9 @@ class TopologyManager:
                     provider_task_name=task_name,
                     template=desired.template,
                     enabled=True,
+                    role=desired.role,
+                    mount_ok=desired.mount_ok,
+                    runtime_env_ok=desired.runtime_env_ok,
                     provider_task_id=task.task_id,
                     gpu_count=task.gpu_count or desired.gpu_count,
                     last_error=f"provider task {task.task_name} has no node_ip",
@@ -738,6 +955,9 @@ class TopologyManager:
                     provider_task_name=task_name,
                     template=desired.template,
                     enabled=True,
+                    role=desired.role,
+                    mount_ok=desired.mount_ok,
+                    runtime_env_ok=desired.runtime_env_ok,
                     provider_task_id=task.task_id,
                     node_ip=node_ip,
                     gpu_count=task.gpu_count or desired.gpu_count,
@@ -754,6 +974,9 @@ class TopologyManager:
                     provider_task_name=task_name,
                     template=desired.template,
                     enabled=True,
+                    role=desired.role,
+                    mount_ok=desired.mount_ok,
+                    runtime_env_ok=desired.runtime_env_ok,
                     provider_task_id=task.task_id,
                     node_ip=node_ip,
                     ray_node_id=ray_node.ray_node_id,
@@ -769,6 +992,9 @@ class TopologyManager:
                 provider_task_name=task_name,
                 template=desired.template,
                 enabled=True,
+                role=desired.role,
+                mount_ok=desired.mount_ok,
+                runtime_env_ok=desired.runtime_env_ok,
                 provider_task_id=task.task_id,
                 node_ip=node_ip,
                 ray_node_id=ray_node.ray_node_id,
@@ -822,6 +1048,9 @@ def topology_state_to_dict(state: TopologyRuntimeState | None) -> dict[str, Any]
                 "provider_task_name": node.provider_task_name,
                 "template": node.template,
                 "enabled": node.enabled,
+                "role": node.role,
+                "mount_ok": node.mount_ok,
+                "runtime_env_ok": node.runtime_env_ok,
                 "node_ip": node.node_ip,
                 "ray_node_id": node.ray_node_id,
                 "gpu_count": node.gpu_count,

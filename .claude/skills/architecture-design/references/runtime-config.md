@@ -22,7 +22,7 @@ Runtime configuration is split by when the value must be available:
 - Bootstrap behavior: external operations create or attach to `mint_config` before `mint_model_actor_supervisor` and API workers start. If an existing actor has a different snapshot fingerprint, bootstrap fails fast instead of silently using stale configuration. API workers only read/check the existing actor and must not create it.
 - Persistence: none inside ConfigActor. The read-only snapshot is rebuilt from env/config file during external bootstrap.
 - Actor hydration: normal Ray actors receive only bootstrap runtime_env plus `MINT_CONFIG_ACTOR_HYDRATE=1`. `mint_server.config` fetches ConfigActor once on import and overlays `actor_env` into `os.environ` before module-level config constants are computed.
-- Secret handling: `env` and `server_config` remain redacted for introspection, but `actor_env` contains real values because it is the actor configuration distribution payload. Namespace access to ConfigActor is therefore a trust boundary.
+- Secret handling: `env` and `server_config` remain redacted for introspection, while `actor_env` contains real values for actor-readable configuration. API/client-only values such as `MINT_API_KEY` and `MINT_BASE_URL` are denied from `actor_env` and must stay in the API worker/client environment.
 
 ## Bootstrap runtime_env
 
@@ -46,8 +46,9 @@ These cannot be fetched after actor startup because Ray needs them when creating
 
 - actor name, lifetime, restart policy, max concurrency;
 - `num_gpus`, custom resources, node pins, placement group strategy;
-- control-plane pinning such as `MINT_CONTROL_PLANE_PINNED_NODE_IP`;
-- model placement maps that determine actor creation placement.
+- node/custom resource pins selected by topology or by explicit actor creation
+  calls;
+- resolved per-actor placement passed by `ModelActorSupervisor` to launchers.
 
 The snapshot can include these for audit/debugging, but not as the source of truth for already-created actors.
 
@@ -56,10 +57,14 @@ The snapshot can include these for audit/debugging, but not as the source of tru
 ConfigActor owns actor-readable deployment/runtime configuration. The API process builds `actor_env` from:
 
 - known actor creation, snapshot, observability, and task-state configuration keys;
-- unclassified `MINT_`, compatibility alias, and `OTEL_` keys, so newly added deployment knobs do not silently fall back to direct runtime_env forwarding;
-- canonicalized `MINT_*` names when only a compatibility alias is set.
+- unclassified `OTEL_` keys, so new observability knobs continue to reach actors;
+- canonicalized `MINT_*` names only for explicitly classified compatibility aliases.
 
-`actor_env` deliberately excludes bootstrap runtime_env keys and ConfigActor hydration control flags. Per-actor identity or execution contract values may still be passed through `extra` at actor creation, because they are not deployment configuration.
+`actor_env` deliberately excludes bootstrap runtime_env keys, ConfigActor hydration
+control flags, API/client-only keys, and per-actor placement/replica identity
+keys. Resolved placement values may still be passed through `extra` at actor
+creation by `ModelActorSupervisor`, because they are actor identity/execution
+contract rather than deployment configuration.
 
 ## Observability
 

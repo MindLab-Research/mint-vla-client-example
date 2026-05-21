@@ -54,7 +54,7 @@ def _headers(api_key: str | None) -> dict[str, str]:
     if gateway_user_id and gateway_apikey_id:
         headers["X-MinT-User-Id"] = gateway_user_id
         headers["X-MinT-Apikey-Id"] = gateway_apikey_id
-        internal_token = _coalesce(os.environ.get("INTERNAL_API_TOKEN"), os.environ.get("MINT_INTERNAL_API_TOKEN"))
+        internal_token = _coalesce(os.environ.get("MINT_INTERNAL_API_TOKEN"))
         if internal_token:
             headers["X-Internal-Token"] = internal_token
     return headers

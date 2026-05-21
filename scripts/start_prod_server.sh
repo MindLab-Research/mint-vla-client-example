@@ -93,4 +93,5 @@ mkdir -p "${ray_temp_dir}"
     exit 1
   }
 
+"${PFS_RUNTIME_ENV_ROOT}/host-venv/bin/python" scripts/bootstrap_control_plane.py
 exec "${PFS_RUNTIME_ENV_ROOT}/host-venv/bin/python" scripts/run_server.py

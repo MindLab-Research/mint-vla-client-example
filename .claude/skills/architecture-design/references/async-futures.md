@@ -1,4 +1,4 @@
-# Async futures (Tinker polling protocol)
+# Async futures (Mint polling protocol)
 
 Many endpoints return `{"request_id": "<uuid>"}` immediately and complete the work asynchronously. The polling surface is the Tinker contract and must be preserved.
 
@@ -15,13 +15,15 @@ Important detail: `TaskStateStore` is the single durable source of truth for tas
 
 ## Why futures exist in Mint
 
-Most work runs on Ray GPU actors and can exceed typical HTTP request lifetimes. The futures protocol keeps the HTTP surface stable and matches the Tinker client contract. Do not silently change status codes (for example, 408 to 202) or switch to streaming without updating the client contract.
+Most work runs on Ray GPU actors and can exceed typical HTTP request lifetimes. The futures protocol keeps the HTTP surface stable and matches the Mint SDK client contract. Do not silently change status codes (for example, 408 to 202) or switch to streaming without updating the client contract.
 
 ## Where futures live
 
-`TaskFutureService` is an in-process facade. Durable task state lives in the detached `TaskStateStore` actor (`mint_task_state_store` by default), and result payloads are written through `TaskPayloadStore`.
+`TaskFutureService` is an in-process facade. Durable task state lives in the detached `TaskStateStore` actor (`mint_task_state_store` by default), and result payloads are written through the in-process `TaskPayloadStore` filesystem helper. `TaskPayloadStore` is not a Ray actor and has no lifecycle to reconcile.
 
-The facade preserves the old Tinker future methods (`async_resolve`, `async_fail`, `async_get_status`, etc.) while routing all persistent state through `TaskStateStore`. Completed result payloads are written to the payload store, and the task record stores the payload path, checksum, size, status, error, and metadata.
+The facade preserves the old Tinker future methods (`async_resolve`, `async_fail`, `async_get_status`, etc.) while routing all persistent state through `TaskStateStore`. Completed result payloads use a staged commit protocol: first SQLite records the expected payload path, then the payload store helper atomically publishes the vePFS JSON file, then SQLite commits the terminal status, checksum, size, and result pointer. Model-work finalization records the lease identity and `finalizing_until`; direct in-process future resolution records the staged path while leaving the task pending until terminal commit. This is primarily for GC correctness: every non-temporary payload path is attributable to a task row even if the process crashes between file publish and terminal metadata commit.
+
+Direct in-process future resolution always uses a fresh `future__<uuid>` staged path, even if request metadata contains a model-work attempt id. Model-work attempt ids are valid only on the scheduler lease finalization path.
 
 There is no separate future replay index. Retrieve hot-cache entries are process-local accelerators only; restart recovery, terminal replay, and payload-evicted detection all use `TaskStateStore`.
 
@@ -40,7 +42,7 @@ Async endpoints that require model-runtime scheduling go through `ModelWorkSched
 On admission failure, the API must return HTTP 429 with a structured overload reason. V1 does not enforce a hard active-task cap; add one only if the active-task index becomes a measured bottleneck.
 
 Pending tasks may wait for `ModelActorSupervisor` to create/register the desired
-runtime actor. This must keep Tinker async semantics: the client receives a
+runtime actor. This must keep Mint async semantics: the client receives a
 `request_id`, `retrieve_future` returns HTTP 408 while the task is pending, and
 the task eventually becomes `DONE`, `FAILED`, `EXPIRED`, `CANCELLED`, or
 forgotten after retention.
@@ -103,7 +105,7 @@ This is a deliberate tradeoff: global strict FIFO across sessions is relaxed for
 
 `MaintenanceCronActor` owns periodic cleanup. `TaskFutureService.async_reap()`
 is the facade, but task/result retention policy belongs in `TaskStateStore` and
-payload deletion belongs in `TaskPayloadStore`.
+payload deletion is performed through the in-process `TaskPayloadStore` helper.
 
 Reaper contract:
 
@@ -120,6 +122,17 @@ Reaper contract:
   `payload_evicted_at`, but keep a terminal tombstone.
 - If payload deletion fails, do not mark `payload_evicted_at`; record the reaper
   error and retry on a later loop.
+- Active rows may contain staged payload pointers. The reaper must treat model
+  work `finalizing` staged paths as referenced until the finalizing lease expires.
+  If an active row is requeued or restaged, the previous staged path is retained
+  in task metadata as an abandoned staged payload so GC can classify it from
+  `TaskStateStore` rather than from an unowned filesystem scan. The reaper
+  deletes GC-eligible staged/abandoned payload files separately from terminal
+  result payload eviction. V1 uses `MINT_TASK_RESULT_TTL_S` as the safety window
+  after finalizing expiry or abandoned-path update time; a dedicated staged GC
+  TTL can be added later if that coupling becomes too coarse.
+- `staged_payload_checksum` and `staged_payload_size_bytes` are schema-reserved
+  for future recovery. V1 GC attribution does not populate or depend on them.
 - `retrieve_future` for a terminal row whose payload was evicted returns a
   stable `{"error": "Known terminal future evicted", ...}` payload, not HTTP
   404 and not pending.
@@ -130,7 +143,7 @@ Reaper contract:
 
 Future reaper metrics:
 
-- `mint_task_future_reaper_rows_total{action="expire|payload_evict|tombstone_delete"}`
+- `mint_task_future_reaper_rows_total{action="expire_pending|evict_payload|gc_staged_payload|delete_tombstone"}`
 - `mint_task_future_payload_evict_errors_total`
 
 ## Detached actor hygiene

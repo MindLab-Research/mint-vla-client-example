@@ -240,7 +240,7 @@ async def retrieve_future(
 ) -> dict:
     """Retrieve the result of an async operation.
 
-    Tinker polling protocol:
+    Mint polling protocol:
         - HTTP 408: operation pending, client should retry
         - HTTP 200 with {"error": "..."}: operation failed
         - HTTP 200 with result: operation completed

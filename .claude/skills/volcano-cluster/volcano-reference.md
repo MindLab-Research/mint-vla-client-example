@@ -1,5 +1,9 @@
 # Volcano ML Platform Reference
 
+This reference is subordinate to `SKILL.md`. Node lifecycle must use the
+Volcano Engine Python SDK through `scripts/tools/volcano_sdk_jobs.py` or the
+topology reconciler in `mint_model_actor_supervisor`.
+
 ## Network Access
 
 | Component | Internet | Proxy |
@@ -7,17 +11,16 @@
 | SSH server | Via proxy | `localhost:1081` (HTTP), `localhost:1080` (SOCKS5) |
 | Ray workers | None | N/A |
 
-Workers must use packages pre-installed in image or via PFS PYTHONPATH.
+Workers must use packages pre-installed in the image or via PFS runtime paths.
 
 ## Instance Flavors
 
-| Flavor | GPUs | Memory | Use Case |
-|--------|------|--------|----------|
-| `ml.hpcpni2l.7xlarge` | 2x A800 80GB | 490 GiB | Small training (RDMA) |
-| `ml.hpcpni2l.14xlarge` | 4x A800 80GB | 980 GiB | Medium training (RDMA) |
-| `ml.hpcpni2l.28xlarge` | 8x A800 80GB | 1960 GiB | Large training/MoE (RDMA) |
-
-**GPU allocation is flexible.** Adjust `Flavor` and `--num-gpus` in configs as needed.
+| Flavor | GPUs | Use Case |
+|--------|------|----------|
+| `ml.hpcpni2l.7xlarge` | 2x A800 80GB | Small training |
+| `ml.hpcpni2l.14xlarge` | 4x A800 80GB | Medium training |
+| `ml.hpcpni2l.28xlarge` | 8x A800 80GB | Standard Mint GPU worker |
+| `ml.r3i.4xlarge` | 0 | Ray head node |
 
 ## Storage Mounts
 
@@ -39,43 +42,25 @@ Storages:
 | `/vePFS-Mindverse/share/mint/prod/runtime/` | Prod runtime symlink |
 | `/vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt` | Dev Ray head pointer |
 | `/vePFS-Mindverse/share/mint/prod/ray/head-address/ray_head_ip.txt` | Prod Ray head pointer |
-| `/vePFS-Mindverse/share/huggingface/` | HuggingFace cache (models, tokenizers) |
+| `/vePFS-Mindverse/share/mint/<env>/runtime/topology_state.yaml` | Supervisor-written topology debug state |
+| `/vePFS-Mindverse/share/huggingface/` | HuggingFace cache |
 | `/vePFS-Mindverse/share/models/` | Model checkpoints |
 | `/vePFS-Mindverse/share/dataset/` | Training datasets |
 
-## Common YAML Parameters
-
-| Parameter | Description |
-|-----------|-------------|
-| `ActiveDeadlineSeconds` | Max runtime in seconds (432000 = 5 days) |
-| `DelayExitTimeSeconds` | Keep instance alive after completion |
-| `ResourceQueueID` | Queue for resource allocation |
-
-## CLI Commands
-
-**Important:** Use `--output json` to avoid interactive TUI mode.
+## SDK Commands
 
 ```bash
-volc ml_task list --output json                 # List tasks
-volc ml_task submit -c config.yaml --output json  # Submit new task
-volc ml_task cancel --id TASK_ID                # Cancel task (no --output json support on current CLI)
-volc ml_task logs -t TASK_ID -i worker_0        # View logs (find Ray IP here)
+PY=/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python
+$PY scripts/tools/volcano_sdk_jobs.py --region cn-beijing list --name-contains mint-<env>-worker- --limit 200
+$PY scripts/tools/volcano_sdk_jobs.py --region cn-beijing instances --job-id <job_id>
+$PY scripts/tools/volcano_sdk_jobs.py --region cn-beijing submit-topology-node --config <topology.yaml> --alias mint-worker-0
+$PY scripts/tools/volcano_sdk_jobs.py --region cn-beijing stop --job-id <job_id>
 ```
-
-**Finding Ray head IP:** Check logs for "Local node IP: 192.x.x.x"
 
 ## Troubleshooting
 
-### Task stuck in Queue
-- Check queue capacity: `volc ml_task list`
-- Try lower priority or different queue
-
-### Worker fails to join
-- Verify HEAD_IP is correct
-- Check network connectivity between instances
-- Ensure both use same image version
-
-### Out of memory
-- Reduce batch size
-- Enable gradient checkpointing
-- Use parameter offloading
+| Symptom | Action |
+|---------|--------|
+| Worker remains queued | Check Volcano console capacity; keep one worker node per alias. |
+| Worker fails to join | Verify the head IP file, runtime path, PFS mounts, and network reachability. |
+| Cannot obtain worker IP | Use `instances --job-id` and `topology_state.yaml`; do not scrape provider logs. |

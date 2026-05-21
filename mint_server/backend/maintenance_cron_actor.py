@@ -37,6 +37,7 @@ _LOOP_CHECKPOINT_REAPER = "checkpoint_reaper"
 _LOOP_CHECKPOINT_MIRROR = "checkpoint_mirror"
 _LOOP_TRAINING_CLEANUP = "training_cleanup"
 _LOOP_SAMPLING_CLEANUP = "sampling_cleanup"
+_LOOP_BILLING_OUTBOX = "billing_outbox"
 
 
 def _actor_name() -> str:
@@ -59,6 +60,10 @@ def _future_reap_interval_s() -> float:
     return float(os.environ.get("MINT_MAINTENANCE_REAP_INTERVAL_S", "5.0"))
 
 
+def _billing_outbox_interval_s() -> float:
+    return float(os.environ.get("MINT_BILLING_OUTBOX_FLUSH_INTERVAL_S", "5.0"))
+
+
 def run_future_reaper_once() -> dict[str, Any]:
     from .task_state_store import task_futures
 
@@ -67,8 +72,10 @@ def run_future_reaper_once() -> dict[str, Any]:
         "expired": list(reaped.get("expired", [])),
         "timed_out": list(reaped.get("timed_out", [])),
         "payload_evicted": list(reaped.get("payload_evicted", [])),
+        "staged_payload_gc_deleted": list(reaped.get("staged_payload_gc_deleted", [])),
         "tombstones_deleted": list(reaped.get("tombstones_deleted", [])),
         "payload_evict_errors": list(reaped.get("payload_evict_errors", [])),
+        "staged_payload_gc_errors": list(reaped.get("staged_payload_gc_errors", [])),
     }
 
 
@@ -100,6 +107,19 @@ def run_sampling_cleanup_once() -> dict[str, Any]:
 
     cleaned = asyncio.run(cleanup_stale_sampling_sessions_once_impl())
     return {"cleaned": list(cleaned)}
+
+
+def run_billing_outbox_once() -> dict[str, Any]:
+    from .task_state_store import task_futures
+
+    limit = int(os.environ.get("MINT_BILLING_OUTBOX_FLUSH_BATCH_SIZE", "100"))
+    lease_ttl_s = float(os.environ.get("MINT_BILLING_OUTBOX_CLAIM_TTL_S", "60"))
+    return asyncio.run(
+        task_futures.async_flush_billing_outbox(
+            limit=limit,
+            lease_ttl_s=lease_ttl_s,
+        )
+    )
 
 
 async def _await_ray_ref(ref: Any) -> Any:
@@ -184,6 +204,11 @@ def _get_or_create_actor():
                     "interval_s": _future_reap_interval_s(),
                     "run_immediately": False,
                     "runner": run_sampling_cleanup_once,
+                },
+                _LOOP_BILLING_OUTBOX: {
+                    "interval_s": _billing_outbox_interval_s(),
+                    "run_immediately": False,
+                    "runner": run_billing_outbox_once,
                 },
             }
             for name, spec in self._loop_specs.items():

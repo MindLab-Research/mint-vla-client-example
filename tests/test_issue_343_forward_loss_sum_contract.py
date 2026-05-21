@@ -59,7 +59,7 @@ def test_issue_343_megatron_forward_preserves_loss_sum_contract(monkeypatch) -> 
     worker.log_memory_breakdown = lambda tag: None
 
     fake_training = types.ModuleType("mint_server.backend.megatron_training")
-    fake_training.tinker_to_tensordict = lambda *args, **kwargs: "fake_tensordict"  # type: ignore[attr-defined]
+    fake_training.mint_datum_to_tensordict = lambda *args, **kwargs: "fake_tensordict"  # type: ignore[attr-defined]
     fake_training.create_logprob_extractor_fn = lambda: "fake_loss_fn"  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "mint_server.backend.megatron_training", fake_training)
 

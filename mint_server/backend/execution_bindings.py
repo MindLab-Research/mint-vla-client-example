@@ -59,7 +59,6 @@ async def initialize_execution_bindings() -> dict[str, Any]:
 
     restored_sampling_sessions = 0
     try:
-        await task_state_store.async_ensure_started()
         restored_sampling_sessions = await _restore_sampling_sessions_for_worker(inference_manager)
     except Exception as e:
         logger.warning(

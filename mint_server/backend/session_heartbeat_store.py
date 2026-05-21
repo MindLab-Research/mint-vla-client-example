@@ -19,7 +19,7 @@ class SessionHeartbeatStore:
     def size(self) -> int:
         return task_state_store.session_heartbeat_size()
 
-    async def async_size(self, *, create_if_missing: bool = True) -> int:
+    async def async_size(self, *, create_if_missing: bool = False) -> int:
         return await task_state_store.async_session_heartbeat_size(create_if_missing=create_if_missing)
 
     def is_stale(self, session_id: str, ttl_s: float) -> bool:

@@ -1,6 +1,6 @@
 # MINT Production Ray Head Node - DO NOT MODIFY FOR DEV
 # This cluster is for production deployment only.
-# Submit with: volc ml_task submit -c mint-prod-head.yaml --output json
+# Head bootstrap is environment-owned. Worker lifecycle is SDK/topology-owned.
 
 TaskName: "mint-prod-head"
 Description: "MINT PRODUCTION - Ray head node - DO NOT USE FOR DEV"

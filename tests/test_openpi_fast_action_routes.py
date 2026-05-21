@@ -503,7 +503,7 @@ def test_mint_action_route_enqueues_expected_request(monkeypatch) -> None:
     assert len(scheduler.calls) == 1
     queued = scheduler.calls[0]
     assert queued["op"] == "mint.action.act"
-    assert queued["domain_key"] == "internal:control"
+    assert queued["domain_key"] == "internal:runtime"
     request_json = json.loads(queued["request_json"].decode("utf-8"))
     assert request_json["action_session_id"] == "action-session-1"
     assert request_json["extra_inputs"]["state"]["shape"] == [8]

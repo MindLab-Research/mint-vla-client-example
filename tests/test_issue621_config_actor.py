@@ -13,6 +13,7 @@ from mint_server.runtime_config import (
     CONFIG_CLASS_OBSERVABILITY,
     CONFIG_CLASS_SNAPSHOT_CONFIG,
     CONFIG_CLASS_TASK_STATE,
+    CONFIG_CLASS_UNCLASSIFIED,
     REDACTED_VALUE,
     ConfigSnapshot,
     actor_env_from_environ,
@@ -33,7 +34,8 @@ def test_config_actor_uses_stable_namespace_local_name_by_default() -> None:
 def test_runtime_config_classifies_bootstrap_actor_creation_snapshot_and_observability() -> None:
     assert classify_env_key("PFS_RUNTIME_ENV_ROOT") == CONFIG_CLASS_BOOTSTRAP_RUNTIME_ENV
     assert classify_env_key("MINT_RAY_JOB_WORKING_DIR") == CONFIG_CLASS_BOOTSTRAP_RUNTIME_ENV
-    assert classify_env_key("MINT_MODEL_PLACEMENT_JSON") == CONFIG_CLASS_ACTOR_CREATION_INPUT
+    assert classify_env_key("MINT_MODEL_PLACEMENT_JSON") == CONFIG_CLASS_UNCLASSIFIED
+    assert classify_env_key("MINT_MODEL_ACTOR_REPLICA_ID") == CONFIG_CLASS_UNCLASSIFIED
     assert classify_env_key("MINT_VLLM_MAX_NUM_SEQS") == CONFIG_CLASS_SNAPSHOT_CONFIG
     assert classify_env_key("MINT_MEGATRON_STICKY_IDLE_TIMEOUT_S") == CONFIG_CLASS_SNAPSHOT_CONFIG
     assert classify_env_key("OTEL_EXPORTER_OTLP_ENDPOINT") == CONFIG_CLASS_OBSERVABILITY
@@ -112,23 +114,30 @@ def test_actor_env_from_environ_keeps_real_values_for_actor_hydration() -> None:
         {
             "PFS_RUNTIME_ENV_ROOT": "/runtime",
             "MINT_MODEL_PLACEMENT_JSON": "{}",
+            "MINT_MODEL_ACTOR_REPLICA_ID": "replica-0",
             "MINT_VLLM_MAX_NUM_SEQS": "32",
             "OTEL_EXPORTER_OTLP_HEADERS": "Authorization=secret",
             "MINT_TASK_STATE_STORE_DB_PATH": "/tmp/task.sqlite3",
             "MINT_TASK_STATE_STORE_OWNER_TTL_S": "30",
+            "MINT_API_KEY": "api-secret",
+            "MINT_BASE_URL": "http://client-only",
             "MINT_NEW_FEATURE_FLAG": "1",
             "MINT_CONFIG_ACTOR_HYDRATE": "1",
             "UNRELATED": "ignored",
+            "TINKER_API_KEY": "compat-secret",
         }
     )
 
     assert "PFS_RUNTIME_ENV_ROOT" not in actor_env
-    assert actor_env["MINT_MODEL_PLACEMENT_JSON"] == "{}"
+    assert "MINT_MODEL_PLACEMENT_JSON" not in actor_env
+    assert "MINT_MODEL_ACTOR_REPLICA_ID" not in actor_env
     assert actor_env["MINT_VLLM_MAX_NUM_SEQS"] == "32"
     assert actor_env["OTEL_EXPORTER_OTLP_HEADERS"] == "Authorization=secret"
     assert actor_env["MINT_TASK_STATE_STORE_DB_PATH"] == "/tmp/task.sqlite3"
     assert actor_env["MINT_TASK_STATE_STORE_OWNER_TTL_S"] == "30"
-    assert actor_env["MINT_NEW_FEATURE_FLAG"] == "1"
+    assert "MINT_API_KEY" not in actor_env
+    assert "MINT_BASE_URL" not in actor_env
+    assert "MINT_NEW_FEATURE_FLAG" not in actor_env
     assert "MINT_CONFIG_ACTOR_HYDRATE" not in actor_env
     assert "UNRELATED" not in actor_env
 

@@ -21,7 +21,12 @@ from typing import TYPE_CHECKING
 from fastapi import APIRouter, HTTPException, Request, Response
 
 from ..config import config as server_config
-from ..backend.task_state_store import FutureStatus, TaskStateStoreUnavailableError, task_futures
+from ..backend.task_state_store import (
+    FutureStatus,
+    TaskStateStoreUnavailableError,
+    billing_observations_from_auth,
+    task_futures,
+)
 from ..backend.model_work_admission import enqueue_model_work
 from ..gateway_auth import GatewayAuthContext, build_billing_auth_context
 from ..logging_context import (
@@ -46,7 +51,6 @@ from ..models.types import (
     UntypedAPIFuture,
 )
 from ..sampling_utils import normalize_prompt_logprobs_for_tinker, sampled_sequence_from_result
-from ..usage_store import UsageEvent, schedule_usage_events
 
 if TYPE_CHECKING:
     from ..backend.session_manager import SessionManager
@@ -138,44 +142,38 @@ def _build_sampling_usage_label(*, model: str, route: str, dimension: str) -> st
     return f"model={model},route={route},dimension={dimension}"
 
 
-def build_sample_once_usage_events(
+def build_sample_once_billing_observations(
     *,
     session_id: str,
     token_ids: list[int],
     sequence,
     http_request: Request,
     request_id: str,
-) -> list[UsageEvent]:
+) -> list[dict]:
     billing_auth = build_billing_auth_context(http_request, fallback_request_id=request_id)
-    if billing_auth is None:
-        return []
     label_model = _resolve_billing_model(session_id)
-    return [
-        UsageEvent(
-            account_id=billing_auth.account_id,
-            apikey_id=billing_auth.apikey_id,
+    return (
+        billing_observations_from_auth(
+            auth_ctx=billing_auth,
+            request_id=request_id,
             charge_item="sampling",
             quantity=len(token_ids),
-            request_id=billing_auth.request_id,
-            label=_build_sampling_usage_label(
-                model=label_model,
-                route="sampling.sample_once",
-                dimension="prefill",
-            ),
-        ),
-        UsageEvent(
-            account_id=billing_auth.account_id,
-            apikey_id=billing_auth.apikey_id,
+            unit="tokens",
+            route="sampling.sample_once",
+            dimension="prefill",
+            model=label_model,
+        )
+        + billing_observations_from_auth(
+            auth_ctx=billing_auth,
+            request_id=request_id,
             charge_item="sampling",
             quantity=len(sequence.tokens),
-            request_id=billing_auth.request_id,
-            label=_build_sampling_usage_label(
-                model=label_model,
-                route="sampling.sample_once",
-                dimension="sample",
-            ),
-        ),
-    ]
+            unit="tokens",
+            route="sampling.sample_once",
+            dimension="sample",
+            model=label_model,
+        )
+    )
 
 
 def _record_vllm_workload_start(*, actor_name: str | None, base_model: str, op: str) -> None:
@@ -948,9 +946,10 @@ def _get_asample_throttle_identity(
     return None, None, "anonymous"
 
 
-async def _persist_usage_events(*, auth_ctx: GatewayAuthContext, events: list[UsageEvent]) -> None:
-    _ = auth_ctx
-    schedule_usage_events(events)
+async def _append_billing_observations(*, observations: list[dict], source: str) -> None:
+    if not observations:
+        return
+    await task_futures.async_append_billing_outbox(observations, source=source)
 
 
 @router.post("/asample")
@@ -1544,14 +1543,15 @@ async def sample_once(
 
         sequence = sampled_sequence_from_result(result)
         if bill_usage:
-            schedule_usage_events(
-                build_sample_once_usage_events(
+            await _append_billing_observations(
+                observations=build_sample_once_billing_observations(
                     session_id=session_id,
                     token_ids=token_ids,
                     sequence=sequence,
                     http_request=http_request,
                     request_id=request_id,
-                )
+                ),
+                source="sync_http",
             )
         return sequence
     except HTTPException:
@@ -1887,44 +1887,38 @@ async def _do_sample(
                     request.topk_prompt_logprobs,
                 )
 
-            usage_events: list[UsageEvent] = []
-            if gateway_auth:
-                auth_ctx = GatewayAuthContext(**gateway_auth)
-                prefill_tokens = len(token_ids)
-                sampling_tokens = sum(len(seq.tokens) for seq in sequences)
-                label_model = _resolve_billing_model(session_id)
-                usage_events.extend(
-                    [
-                        UsageEvent(
-                            account_id=auth_ctx.account_id,
-                            apikey_id=auth_ctx.apikey_id,
-                            charge_item="sampling",
-                            quantity=prefill_tokens,
-                            request_id=auth_ctx.request_id,
-                            label=_build_sampling_usage_label(
-                                model=label_model,
-                                route="sampling.asample",
-                                dimension="prefill",
-                            ),
-                        ),
-                        UsageEvent(
-                            account_id=auth_ctx.account_id,
-                            apikey_id=auth_ctx.apikey_id,
-                            charge_item="sampling",
-                            quantity=sampling_tokens,
-                            request_id=auth_ctx.request_id,
-                            label=_build_sampling_usage_label(
-                                model=label_model,
-                                route="sampling.asample",
-                                dimension="sample",
-                            ),
-                        ),
-                    ]
+            auth_ctx = GatewayAuthContext(**gateway_auth) if gateway_auth else None
+            prefill_tokens = len(token_ids)
+            sampling_tokens = sum(len(seq.tokens) for seq in sequences)
+            label_model = _resolve_billing_model(session_id)
+            billing_observations = (
+                billing_observations_from_auth(
+                    auth_ctx=auth_ctx,
+                    request_id=request_id,
+                    charge_item="sampling",
+                    quantity=prefill_tokens,
+                    unit="tokens",
+                    route="sampling.asample",
+                    dimension="prefill",
+                    model=label_model,
                 )
+                + billing_observations_from_auth(
+                    auth_ctx=auth_ctx,
+                    request_id=request_id,
+                    charge_item="sampling",
+                    quantity=sampling_tokens,
+                    unit="tokens",
+                    route="sampling.asample",
+                    dimension="sample",
+                    model=label_model,
+                )
+            )
             # Compatibility: older tinker clients don't accept a top-level `type` field on SampleResponse.
-            await task_futures.async_resolve(request_id, response.model_dump(exclude={"type"}))
-            if usage_events:
-                await _persist_usage_events(auth_ctx=auth_ctx, events=usage_events)
+            await task_futures.async_resolve(
+                request_id,
+                response.model_dump(exclude={"type"}),
+                billing_observations=billing_observations,
+            )
             workload_status = "ok"
             workload_generated_tokens = sum(len(seq.tokens) for seq in sequences)
             workload_obs = _vllm_request_observation(results, workload_generated_tokens)
@@ -2254,26 +2248,22 @@ async def _do_compute_logprobs(
         logprobs = normalize_prompt_logprobs_for_tinker(logprobs, prompt_len=len(token_ids))
         response = ComputeLogprobsResponse(logprobs=logprobs)
         # Compatibility: older tinker clients don't accept a top-level `type` field on ComputeLogprobsResponse.
-        await task_futures.async_resolve(request_id, response.model_dump(exclude={"type"}))
-        if gateway_auth:
-            auth_ctx = GatewayAuthContext(**gateway_auth)
-            await _persist_usage_events(
-                auth_ctx=auth_ctx,
-                events=[
-                    UsageEvent(
-                        account_id=auth_ctx.account_id,
-                        apikey_id=auth_ctx.apikey_id,
-                        charge_item="sampling",
-                        quantity=len(token_ids),
-                        request_id=auth_ctx.request_id,
-                        label=_build_sampling_usage_label(
-                            model=_resolve_billing_model(session_id),
-                            route="sampling.compute_logprobs",
-                            dimension="prefill",
-                        ),
-                    )
-                ],
-            )
+        auth_ctx = GatewayAuthContext(**gateway_auth) if gateway_auth else None
+        billing_observations = billing_observations_from_auth(
+            auth_ctx=auth_ctx,
+            request_id=request_id,
+            charge_item="sampling",
+            quantity=len(token_ids),
+            unit="tokens",
+            route="sampling.compute_logprobs",
+            dimension="prefill",
+            model=_resolve_billing_model(session_id),
+        )
+        await task_futures.async_resolve(
+            request_id,
+            response.model_dump(exclude={"type"}),
+            billing_observations=billing_observations,
+        )
         workload_status = "ok"
         logger.debug(f"Request {request_id} computed {len(logprobs)} logprobs")
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import types
 
 import yaml
 import pytest
@@ -12,13 +13,62 @@ from mint_server.backend.topology import (
     ProviderTaskState,
     RayNodeState,
     TopologyManager,
+    UnsupportedTopologyProviderError,
     VolcanoTopologyProvider,
+    build_volcano_create_job_request,
     load_topology_config,
     ray_dashboard_node_lister,
     render_volcano_worker_template,
     stable_provider_task_name,
     worker_alias_index,
 )
+
+
+class _SdkModel:
+    def __init__(self, **kwargs):
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+
+def _install_fake_volcano_sdk(monkeypatch: pytest.MonkeyPatch):
+    sdk = types.SimpleNamespace(
+        ListJobsRequest=type("ListJobsRequest", (_SdkModel,), {}),
+        ListJobInstancesRequest=type("ListJobInstancesRequest", (_SdkModel,), {}),
+        CreateJobRequest=type("CreateJobRequest", (_SdkModel,), {}),
+        ResourceConfigForCreateJobInput=type("ResourceConfigForCreateJobInput", (_SdkModel,), {}),
+        RuntimeConfigForCreateJobInput=type("RuntimeConfigForCreateJobInput", (_SdkModel,), {}),
+        ImageForCreateJobInput=type("ImageForCreateJobInput", (_SdkModel,), {}),
+        RoleForCreateJobInput=type("RoleForCreateJobInput", (_SdkModel,), {}),
+        ResourceForCreateJobInput=type("ResourceForCreateJobInput", (_SdkModel,), {}),
+        StorageConfigForCreateJobInput=type("StorageConfigForCreateJobInput", (_SdkModel,), {}),
+        StorageForCreateJobInput=type("StorageForCreateJobInput", (_SdkModel,), {}),
+        ConfigForCreateJobInput=type("ConfigForCreateJobInput", (_SdkModel,), {}),
+        VepfsForCreateJobInput=type("VepfsForCreateJobInput", (_SdkModel,), {}),
+        TosForCreateJobInput=type("TosForCreateJobInput", (_SdkModel,), {}),
+    )
+    monkeypatch.setitem(__import__("sys").modules, "volcenginesdkmlplatform20240701", sdk)
+    return sdk
+
+
+class _FakeVolcanoClient:
+    def __init__(self, *, jobs=None, instances=None) -> None:
+        self.jobs = jobs or []
+        self.instances = instances or {}
+        self.list_jobs_requests = []
+        self.list_job_instances_requests = []
+        self.created_jobs = []
+
+    def list_jobs(self, request):
+        self.list_jobs_requests.append(request)
+        return _SdkModel(items=self.jobs)
+
+    def list_job_instances(self, request):
+        self.list_job_instances_requests.append(request)
+        return _SdkModel(items=self.instances.get(request.job_id, []))
+
+    def create_job(self, request):
+        self.created_jobs.append(request)
+        return _SdkModel(id="created-job")
 
 
 class _FakeRuntimeActor:
@@ -168,18 +218,174 @@ def test_issue_627_ray_config_accepts_dashboard_and_head_ip_path(tmp_path) -> No
     assert config.ray_head_ip_path == "/tmp/ray_head_ip.txt"
 
 
-def test_issue_627_desired_specs_accept_worker_alias_placement(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("MINT_MODEL_ACTOR_DESIRED_JSON", raising=False)
-    monkeypatch.setenv("MINT_MODEL_ACTOR_INTERNAL_CONTROL", "0")
-    monkeypatch.setenv("MINT_PERSISTENT_MODELS", "Qwen/Test")
-    monkeypatch.setenv(
-        "MINT_VLLM_MODEL_PLACEMENT_JSON",
-        '{"Qwen/Test":{"replica":0,"worker_alias":"mint-worker-0","gpu_count":4}}',
+def test_issue_627_non_volcano_provider_fails_loudly(tmp_path) -> None:
+    from mint_server.backend.topology import (
+        default_provider_task_lister_for_config,
+        default_provider_task_submitter_for_config,
     )
-    monkeypatch.setenv(
-        "MINT_DENSE_MODEL_PLACEMENT_JSON",
-        '{"Qwen/Test":{"replica":0,"worker_alias":"10.0.0.99","gpu_count":1}}',
+
+    config_path = _write_topology_config(
+        tmp_path,
+        desired_nodes=[
+            {
+                "alias": "mint-worker-0",
+                "provider": "aliyun",
+                "template": "a800-8gpu-c1",
+                "enabled": True,
+            }
+        ],
     )
+    payload = yaml.safe_load(open(config_path, encoding="utf-8").read())
+    payload["providers"]["aliyun"] = {"templates": {"a800-8gpu-c1": {"gpu_count": 8}}}
+    open(config_path, "w", encoding="utf-8").write(yaml.safe_dump(payload))
+    config = load_topology_config(config_path)
+
+    with pytest.raises(UnsupportedTopologyProviderError, match="unsupported topology providers: aliyun"):
+        default_provider_task_lister_for_config(config)
+    with pytest.raises(UnsupportedTopologyProviderError, match="unsupported topology providers: aliyun"):
+        default_provider_task_submitter_for_config(config)
+
+
+def test_issue_627_default_volcano_provider_uses_sdk_region_not_cli_args(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    from mint_server.backend import topology as topology_module
+    from mint_server.backend.topology import default_provider_task_lister_for_config
+
+    _install_fake_volcano_sdk(monkeypatch)
+    config = load_topology_config(_write_topology_config(tmp_path))
+    provider_cfg = dict(config.providers["volcano"])
+    provider_cfg["region"] = "cn-beijing"
+    provider_cfg["connect_timeout_s"] = 3
+    provider_cfg["read_timeout_s"] = 5
+    provider_cfg["submit_host"] = "must-not-be-used"
+    provider_cfg["volc_bin"] = "/must/not/be/used"
+    config = type(config)(
+        version=config.version,
+        deployment_env=config.deployment_env,
+        cluster_id=config.cluster_id,
+        state_path=config.state_path,
+        nodes=config.nodes,
+        providers={"volcano": provider_cfg},
+        ray_dashboard_url=config.ray_dashboard_url,
+        ray_head_ip_path=config.ray_head_ip_path,
+    )
+    client = _FakeVolcanoClient(
+        jobs=[
+            _SdkModel(
+                id="t-1",
+                name="mint-prod-worker-0",
+                status=_SdkModel(state="Running"),
+            )
+        ],
+        instances={"t-1": [_SdkModel(ips=_SdkModel(primary_ip="10.0.0.7"))]},
+    )
+    seen_calls: list[tuple[str | None, float | None, float | None]] = []
+
+    def _client_factory(*, region=None, connect_timeout=None, read_timeout=None):
+        seen_calls.append((region, connect_timeout, read_timeout))
+        return client
+
+    monkeypatch.setattr(topology_module, "_create_volcano_mlplatform_client", _client_factory)
+
+    lister = default_provider_task_lister_for_config(config)
+    states = list(lister(config))
+
+    assert seen_calls == [("cn-beijing", 3.0, 5.0)]
+    assert states[0].task_name == "mint-prod-worker-0"
+    assert states[0].node_ip == "10.0.0.7"
+    assert client.list_jobs_requests[0].name_contains == "mint-prod-worker-"
+
+
+def test_issue_627_sdk_client_can_bridge_legacy_volc_cli_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    from mint_server.backend import topology as topology_module
+
+    class _FakeConfiguration:
+        def __init__(self) -> None:
+            self.ak = ""
+            self.sk = ""
+            self.session_token = ""
+            self.region = ""
+            self.connect_timeout = None
+            self.read_timeout = None
+            self.debug = True
+
+    class _FakeApiClient:
+        def __init__(self, configuration) -> None:
+            self.configuration = configuration
+
+    class _FakeApi:
+        def __init__(self, api_client) -> None:
+            self.api_client = api_client
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("VOLCENGINE_ACCESS_KEY", raising=False)
+    monkeypatch.delenv("VOLCENGINE_SECRET_KEY", raising=False)
+    monkeypatch.delenv("VOLCENGINE_SESSION_TOKEN", raising=False)
+    monkeypatch.delenv("VOLCENGINE_CLI_CONFIG_FILE", raising=False)
+    volc_dir = tmp_path / ".volc"
+    volc_dir.mkdir()
+    (volc_dir / "config").write_text("[default]\nregion = cn-beijing\n", encoding="utf-8")
+    (volc_dir / "credentials").write_text(
+        "[default]\naccess_key_id = ak-test\nsecret_access_key = sk-test\n",
+        encoding="utf-8",
+    )
+    core = types.SimpleNamespace(Configuration=_FakeConfiguration, ApiClient=_FakeApiClient)
+    sdk = types.SimpleNamespace(MLPLATFORM20240701Api=_FakeApi)
+    monkeypatch.setitem(__import__("sys").modules, "volcenginesdkcore", core)
+    monkeypatch.setitem(__import__("sys").modules, "volcenginesdkmlplatform20240701", sdk)
+
+    client = topology_module._create_volcano_mlplatform_client(
+        region=None,
+        connect_timeout=3,
+        read_timeout=5,
+    )
+
+    configuration = client.api_client.configuration
+    assert configuration.ak == "ak-test"
+    assert configuration.sk == "sk-test"
+    assert configuration.region == "cn-beijing"
+    assert configuration.connect_timeout == 3
+    assert configuration.read_timeout == 5
+
+
+def test_issue_627_sdk_client_prefers_modern_credential_chain_over_legacy_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    from mint_server.backend import topology as topology_module
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("VOLCENGINE_ACCESS_KEY", "modern-ak")
+    volc_dir = tmp_path / ".volc"
+    volc_dir.mkdir()
+    (volc_dir / "credentials").write_text(
+        "[default]\naccess_key_id = legacy-ak\nsecret_access_key = legacy-sk\n",
+        encoding="utf-8",
+    )
+
+    assert topology_module._legacy_volc_cli_credentials() == {}
+
+
+def test_issue_627_desired_specs_accept_worker_alias_placement(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("MINT_MODEL_ACTOR_INTERNAL_RUNTIME", "0")
+    topology_path = _write_topology_config(tmp_path)
+    monkeypatch.setenv("MINT_TOPOLOGY_CONFIG_PATH", topology_path)
+    payload = yaml.safe_load(open(topology_path, encoding="utf-8"))
+    payload["models"] = {
+        "Qwen/Test": {
+            "vllm": {"placement": [{"replica": 0, "worker_alias": "mint-worker-0", "gpu_count": 4}]},
+            "training": {"placement": [{"replica": 0, "worker_alias": "10.0.0.99", "gpu_count": 1}]},
+        }
+    }
+    open(topology_path, "w", encoding="utf-8").write(yaml.safe_dump(payload))
 
     specs = desired_specs_from_env()
 
@@ -429,24 +635,37 @@ def test_issue_627_topology_manager_submits_next_idx_after_lower_ready(tmp_path)
     assert submitted == ["mint-worker-1"]
 
 
-def test_issue_627_volcano_provider_lists_stable_tasks_and_extracts_log_ip(tmp_path) -> None:
+def test_issue_627_volcano_provider_lists_stable_tasks_and_extracts_instance_ip(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    _install_fake_volcano_sdk(monkeypatch)
     config = load_topology_config(_write_topology_config(tmp_path))
-    calls: list[list[str]] = []
+    client = _FakeVolcanoClient(
+        jobs=[
+            _SdkModel(
+                id="t-1",
+                name="mint-prod-worker-0",
+                status=_SdkModel(state="Running"),
+                resource_config=_SdkModel(
+                    roles=[
+                        _SdkModel(
+                            replicas=1,
+                            resource=_SdkModel(instance_type_id="ml.hpcpni2l.28xlarge"),
+                        )
+                    ]
+                ),
+            ),
+            _SdkModel(id="t-2", name="other", status=_SdkModel(state="Running")),
+        ],
+        instances={
+            "t-1": [
+                _SdkModel(ips=_SdkModel(primary_ip="10.0.0.7", host_ip="172.16.0.7")),
+            ]
+        },
+    )
 
-    def _runner(argv: list[str], _timeout_s: float) -> str:
-        calls.append(argv)
-        if argv[1:3] == ["ml_task", "list"]:
-            return (
-                "volc banner\n"
-                '[{"JobId":"t-1","JobName":"mint-prod-worker-0","Status":"Running",'
-                '"TaskRoleSpecs":[{"RoleReplicas":1,"ResourceSpecId":"ml.hpcpni2l.28xlarge"}]},'
-                '{"JobId":"t-2","JobName":"other","Status":"Running"}]'
-            )
-        if argv[1:3] == ["ml_task", "logs"]:
-            return "noise\nLocal node IP: 10.0.0.7\n"
-        raise AssertionError(argv)
-
-    provider = VolcanoTopologyProvider(command_runner=_runner)
+    provider = VolcanoTopologyProvider(client=client)
 
     states = list(provider.list_tasks(config))
 
@@ -456,31 +675,70 @@ def test_issue_627_volcano_provider_lists_stable_tasks_and_extracts_log_ip(tmp_p
     assert states[0].live is True
     assert states[0].node_ip == "10.0.0.7"
     assert states[0].gpu_count == 8
-    assert any(call[1:3] == ["ml_task", "logs"] for call in calls)
+    assert client.list_jobs_requests[0].name_contains == "mint-prod-worker-"
+    assert client.list_job_instances_requests[0].job_id == "t-1"
 
 
-def test_issue_627_volcano_provider_can_run_via_submit_host(tmp_path) -> None:
+def test_issue_627_volcano_provider_uses_sdk_default_credentials_not_submit_host(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    _install_fake_volcano_sdk(monkeypatch)
     config = load_topology_config(_write_topology_config(tmp_path))
-    calls: list[list[str]] = []
+    client = _FakeVolcanoClient(
+        jobs=[
+            _SdkModel(
+                id="t-1",
+                name="mint-prod-worker-0",
+                status=_SdkModel(state="Running"),
+                resource_config=_SdkModel(
+                    roles=[
+                        _SdkModel(
+                            replicas=1,
+                            resource=_SdkModel(instance_type_id="ml.hpcpni2l.28xlarge"),
+                        )
+                    ]
+                ),
+            )
+        ]
+    )
 
-    def _runner(argv: list[str], _timeout_s: float) -> str:
-        calls.append(argv)
-        return (
-            "volc banner\n"
-            '[{"JobId":"t-1","JobName":"mint-prod-worker-0","Status":"Running",'
-            '"TaskRoleSpecs":[{"RoleReplicas":1,"ResourceSpecId":"ml.hpcpni2l.28xlarge"}]}]'
-        )
-
-    provider = VolcanoTopologyProvider(command_runner=_runner, submit_host="mint-prod-volcano", fetch_logs=False)
+    provider = VolcanoTopologyProvider(client=client)
 
     states = list(provider.list_tasks(config))
 
     assert states[0].task_name == "mint-prod-worker-0"
-    assert calls[0][:6] == ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "mint-prod-volcano"]
-    assert "/root/.volc/bin/volc ml_task list --output json --limit 200" in calls[0][-1]
+    assert client.list_jobs_requests[0].page_size == 100
 
 
-def test_issue_627_volcano_provider_renders_template_and_submits(tmp_path) -> None:
+def test_issue_627_volcano_sdk_jobs_list_clamps_page_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts.tools import volcano_sdk_jobs
+
+    _install_fake_volcano_sdk(monkeypatch)
+    client = _FakeVolcanoClient()
+    monkeypatch.setattr(volcano_sdk_jobs, "_create_volcano_mlplatform_client", lambda **_kwargs: client)
+
+    volcano_sdk_jobs._cmd_list(
+        types.SimpleNamespace(
+            region="cn-beijing",
+            connect_timeout=3,
+            read_timeout=5,
+            name_contains="mint-dev-worker-",
+            limit=200,
+            state=None,
+        )
+    )
+
+    assert client.list_jobs_requests[0].page_size == 100
+
+
+def test_issue_627_volcano_provider_renders_template_and_submits_sdk_job(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    _install_fake_volcano_sdk(monkeypatch)
     template = tmp_path / "worker.yaml"
     template.write_text(
         "\n".join(
@@ -489,7 +747,12 @@ def test_issue_627_volcano_provider_renders_template_and_submits(tmp_path) -> No
                 'Description: "worker"',
                 "Entrypoint: |",
                 "  echo start",
+                'ImageUrl: "image"',
                 'ResourceQueueID: "<GPU_QUEUE_ID>"',
+                "TaskRoleSpecs:",
+                '  - RoleName: "worker"',
+                "    RoleReplicas: 1",
+                '    Flavor: "ml.hpcpni2l.28xlarge"',
             ]
         )
         + "\n",
@@ -509,27 +772,30 @@ def test_issue_627_volcano_provider_renders_template_and_submits(tmp_path) -> No
         nodes=config.nodes,
         providers={"volcano": provider_cfg},
     )
-    submitted: list[list[str]] = []
-    submitted_yaml: list[str] = []
+    client = _FakeVolcanoClient()
 
-    def _runner(argv: list[str], _timeout_s: float) -> str:
-        submitted.append(argv)
-        submitted_yaml.append(open(argv[argv.index("-c") + 1], encoding="utf-8").read())
-        return '{"JobId":"t-new"}'
-
-    provider = VolcanoTopologyProvider(command_runner=_runner)
+    provider = VolcanoTopologyProvider(client=client)
 
     provider.submit_task(config, config.nodes["mint-worker-0"])
 
-    assert submitted[0][1:4] == ["ml_task", "submit", "-c"]
-    assert 'TaskName: "mint-prod-worker-0"' in submitted_yaml[0]
-    assert 'ResourceQueueID: "rq-a"' in submitted_yaml[0]
-    assert 'export MINT_WORKER_ALIAS="mint-worker-0"' in submitted_yaml[0]
-    assert 'export MINT_DEPLOYMENT_ENV="prod"' in submitted_yaml[0]
-    assert 'export MINT_CLUSTER_ID="volcano"' in submitted_yaml[0]
+    request = client.created_jobs[0]
+    assert request.name == "mint-prod-worker-0"
+    assert request.resource_config.resource_queue_id == "rq-a"
+    assert request.runtime_config.framework == "Custom"
+    assert request.runtime_config.image.url == "image"
+    assert request.resource_config.roles[0].name == "worker"
+    assert request.resource_config.roles[0].replicas == 1
+    assert request.resource_config.roles[0].resource.instance_type_id == "ml.hpcpni2l.28xlarge"
+    assert 'export MINT_WORKER_ALIAS="mint-worker-0"' in request.runtime_config.command
+    assert 'export MINT_DEPLOYMENT_ENV="prod"' in request.runtime_config.command
+    assert 'export MINT_CLUSTER_ID="volcano"' in request.runtime_config.command
 
 
-def test_issue_627_volcano_provider_submit_host_writes_runtime_submit_file(tmp_path) -> None:
+def test_issue_627_build_volcano_create_job_request_converts_storages(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    _install_fake_volcano_sdk(monkeypatch)
     template = tmp_path / "worker.yaml"
     template.write_text(
         "\n".join(
@@ -538,14 +804,27 @@ def test_issue_627_volcano_provider_submit_host_writes_runtime_submit_file(tmp_p
                 'Description: "worker"',
                 "Entrypoint: |",
                 "  echo start",
+                'ImageUrl: "image"',
                 'ResourceQueueID: "<GPU_QUEUE_ID>"',
+                "TaskRoleSpecs:",
+                '  - RoleName: "worker"',
+                "    RoleReplicas: 1",
+                '    Flavor: "ml.hpcpni2l.28xlarge"',
+                "Storages:",
+                '  - Type: "Vepfs"',
+                '    MountPath: "/vePFS-Mindverse/share"',
+                '    SubPath: "share"',
+                "    ReadOnly: false",
+                '  - Type: "TosFuse"',
+                '    MountPath: "/tos-mindverse"',
+                '    Bucket: "tos-mindverse"',
+                '    Prefix: "/"',
             ]
         )
         + "\n",
         encoding="utf-8",
     )
-    state_path = tmp_path / "runtime" / "topology_state.yaml"
-    config = load_topology_config(_write_topology_config(tmp_path, state_path=state_path))
+    config = load_topology_config(_write_topology_config(tmp_path))
     provider_cfg = dict(config.providers["volcano"])
     templates = dict(provider_cfg["templates"])
     templates["a800-8gpu-c1"] = {**templates["a800-8gpu-c1"], "template_path": str(template)}
@@ -560,21 +839,14 @@ def test_issue_627_volcano_provider_submit_host_writes_runtime_submit_file(tmp_p
         ray_dashboard_url=config.ray_dashboard_url,
         ray_head_ip_path=config.ray_head_ip_path,
     )
-    calls: list[list[str]] = []
 
-    def _runner(argv: list[str], _timeout_s: float) -> str:
-        calls.append(argv)
-        submit_path = argv[-1].split(" -c ", 1)[1].split(" ", 1)[0]
-        assert submit_path.startswith(str(state_path.parent / "topology-submits"))
-        assert open(submit_path, encoding="utf-8").read().startswith('TaskName: "mint-prod-worker-0"')
-        return '{"JobId":"t-new"}'
+    request = build_volcano_create_job_request(config, config.nodes["mint-worker-0"])
 
-    provider = VolcanoTopologyProvider(command_runner=_runner, submit_host="mint-prod-volcano")
-
-    provider.submit_task(config, config.nodes["mint-worker-0"])
-
-    assert calls[0][:6] == ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "mint-prod-volcano"]
-    assert "ml_task submit -c " in calls[0][-1]
+    assert len(request.storage_config.storages) == 2
+    assert request.storage_config.storages[0].type == "Vepfs"
+    assert request.storage_config.storages[0].config.vepfs.sub_path == "share"
+    assert request.storage_config.storages[1].type == "TosFuse"
+    assert request.storage_config.storages[1].config.tos.bucket == "tos-mindverse"
 
 
 def test_issue_627_render_volcano_template_is_stable(tmp_path) -> None:
@@ -720,6 +992,107 @@ async def test_issue_627_supervisor_reconciles_node_metrics_daemonset_separately
     assert daemon_specs[0].node_ip == "10.0.0.7"
     assert synced[-1] == []
     assert out["snapshot"]["replicas"] == {}
+
+
+@pytest.mark.anyio
+async def test_issue_627_supervisor_node_metrics_daemonset_filters_ineligible_nodes(tmp_path) -> None:
+    config = load_topology_config(
+        _write_topology_config(
+            tmp_path,
+            desired_nodes=[
+                {
+                    "alias": "mint-worker-0",
+                    "provider": "volcano",
+                    "template": "a800-8gpu-c1",
+                    "enabled": True,
+                    "role": "gpu",
+                    "gpu_count": 8,
+                },
+                {
+                    "alias": "mint-worker-1",
+                    "provider": "volcano",
+                    "template": "a800-8gpu-c1",
+                    "enabled": True,
+                    "role": "cpu",
+                    "gpu_count": 8,
+                },
+                {
+                    "alias": "mint-worker-2",
+                    "provider": "volcano",
+                    "template": "a800-8gpu-c1",
+                    "enabled": True,
+                    "role": "gpu",
+                    "gpu_count": 0,
+                },
+                {
+                    "alias": "mint-worker-3",
+                    "provider": "volcano",
+                    "template": "a800-8gpu-c1",
+                    "enabled": True,
+                    "role": "gpu",
+                    "gpu_count": 8,
+                    "mount_ok": False,
+                },
+                {
+                    "alias": "mint-worker-4",
+                    "provider": "volcano",
+                    "template": "a800-8gpu-c1",
+                    "enabled": True,
+                    "role": "gpu",
+                    "gpu_count": 8,
+                    "runtime_env_ok": False,
+                },
+            ],
+        )
+    )
+    manager = TopologyManager(
+        config,
+        provider_task_lister=lambda _config: [
+            ProviderTaskState(
+                alias=f"mint-worker-{idx}",
+                provider="volcano",
+                task_name=f"mint-prod-worker-{idx}",
+                task_id=f"task-{idx}",
+                live=True,
+                node_ip=f"10.0.0.{idx + 7}",
+                gpu_count=8 if idx != 2 else 0,
+            )
+            for idx in range(5)
+        ],
+        ray_node_lister=lambda: [
+            RayNodeState(
+                node_ip=f"10.0.0.{idx + 7}",
+                ray_node_id=f"ray-{idx}",
+                alive=True,
+                gpu_count=8 if idx != 2 else 0,
+            )
+            for idx in range(5)
+        ],
+    )
+    daemon_specs: list[NodeMetricsDaemonSpec] = []
+
+    async def _node_metrics_factory(spec: NodeMetricsDaemonSpec):
+        daemon_specs.append(spec)
+        return _FakeNodeMetricsActor(spec)
+
+    supervisor = ModelActorSupervisor(
+        specs=[],
+        topology_manager=manager,
+        node_metrics_enabled=True,
+        node_metrics_factory=_node_metrics_factory,
+        placement_reconciler=lambda _desired: {"ok": True, "blocked": {}},
+        scheduler_sync=lambda _registrations: None,
+    )
+
+    out = await supervisor.reconcile_once()
+
+    daemon = out["snapshot"]["daemons"]["node_metrics"]
+    assert [spec.worker_alias for spec in daemon_specs] == ["mint-worker-0"]
+    assert daemon["desired_total"] == 1
+    assert set(daemon["nodes"]) == {"mint-worker-0"}
+    assert out["snapshot"]["topology"]["nodes"]["mint-worker-1"]["role"] == "cpu"
+    assert out["snapshot"]["topology"]["nodes"]["mint-worker-3"]["mount_ok"] is False
+    assert out["snapshot"]["topology"]["nodes"]["mint-worker-4"]["runtime_env_ok"] is False
 
 
 @pytest.mark.anyio

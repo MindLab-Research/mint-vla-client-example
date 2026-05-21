@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from dataclasses import dataclass
 
@@ -199,6 +200,67 @@ def _cron_degraded_from_snapshot(snapshot: dict[str, object]) -> bool:
     return str(snapshot.get("status") or "").lower() in {"degraded", "unhealthy", "unreachable"}
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+async def _billing_outbox_health_snapshot() -> dict[str, object]:
+    try:
+        from .backend.task_state_store import task_futures
+
+        stats = await task_futures.async_billing_outbox_stats()
+    except Exception as e:
+        return {"status": "degraded", "error": f"{type(e).__name__}: {e}"}
+
+    by_status = stats.get("by_status") if isinstance(stats, dict) else {}
+    metrics = stats.get("metrics") if isinstance(stats, dict) else {}
+    if not isinstance(by_status, dict):
+        by_status = {}
+    if not isinstance(metrics, dict):
+        metrics = {}
+
+    pending = by_status.get("pending") if isinstance(by_status.get("pending"), dict) else {}
+    flushing = by_status.get("flushing") if isinstance(by_status.get("flushing"), dict) else {}
+    failed = by_status.get("failed") if isinstance(by_status.get("failed"), dict) else {}
+    pending_rows = int((pending or {}).get("rows") or 0)
+    flushing_rows = int((flushing or {}).get("rows") or 0)
+    failed_rows = int((failed or {}).get("rows") or 0)
+    oldest_pending_age_s = float((pending or {}).get("oldest_age_s") or 0.0)
+    oldest_failed_age_s = float((failed or {}).get("oldest_age_s") or 0.0)
+    degraded_rows = int(_env_float("MINT_BILLING_OUTBOX_DEGRADED_ROWS", 10000.0))
+    degraded_age_s = _env_float("MINT_BILLING_OUTBOX_DEGRADED_AGE_S", 900.0)
+    permanent_errors = float(metrics.get("flush_permanent_error") or 0.0)
+
+    reasons: list[str] = []
+    if failed_rows > 0:
+        reasons.append("failed_rows")
+    if permanent_errors > 0:
+        reasons.append("permanent_flush_errors")
+    if pending_rows >= degraded_rows:
+        reasons.append("pending_rows")
+    if oldest_pending_age_s >= degraded_age_s:
+        reasons.append("oldest_pending_age")
+
+    return {
+        "status": "degraded" if reasons else "ready",
+        "reasons": reasons,
+        "pending_rows": pending_rows,
+        "flushing_rows": flushing_rows,
+        "failed_rows": failed_rows,
+        "oldest_pending_age_s": oldest_pending_age_s,
+        "oldest_failed_age_s": oldest_failed_age_s,
+        "flush_permanent_error_total": permanent_errors,
+        "degraded_rows_threshold": degraded_rows,
+        "degraded_age_s_threshold": degraded_age_s,
+    }
+
+
 async def internal_lightweight_healthz_response() -> dict:
     """Internal operational health from process-local/cached control-plane state."""
     now = time.time()
@@ -228,6 +290,9 @@ async def internal_lightweight_healthz_response() -> dict:
     startup_snapshot = _cached_startup_snapshot()
     if _cron_degraded_from_snapshot(startup_snapshot) and status == "ready":
         status = "degraded"
+    billing_snapshot = await _billing_outbox_health_snapshot()
+    if _cron_degraded_from_snapshot(billing_snapshot) and status == "ready":
+        status = "degraded"
 
     observed_at = supervisor_snapshot.get("observed_at")
     topology = supervisor_snapshot.get("topology")
@@ -245,4 +310,5 @@ async def internal_lightweight_healthz_response() -> dict:
         },
         "maintenance_cron_actor": cron_snapshot,
         "startup": startup_snapshot,
+        "billing_outbox": billing_snapshot,
     }

@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from ..models.types import (
@@ -30,17 +30,17 @@ from ..models.types import (
     OAIToolCall,
     OAIUsage,
 )
+from ..backend.task_state_store import task_futures
 from ..runtime_env import env_get
-from ..usage_store import persist_usage_events
-from .sampling import build_sample_once_usage_events, sample_once
+from .sampling import build_sample_once_billing_observations, sample_once
 from .service import ensure_sampling_session
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-async def _write_usage_events_after_response(events) -> None:
-    await persist_usage_events(events)
+async def _append_billing_observations(observations) -> None:
+    await task_futures.async_append_billing_outbox(observations, source="sync_http")
 
 
 @dataclass
@@ -658,7 +658,7 @@ async def retrieve_model(model_id: str):
 
 
 @router.post("/completions", response_model=OAICompletionResponse)
-async def completions(request: OAICompletionRequest, http_request: Request, background_tasks: BackgroundTasks):
+async def completions(request: OAICompletionRequest, http_request: Request):
     try:
         if request.stream:
             raise HTTPException(status_code=400, detail="stream=True is not supported")
@@ -695,15 +695,15 @@ async def completions(request: OAICompletionRequest, http_request: Request, back
                 if attempt == 1:
                     raise
         text = tokenizer.decode(sequence.tokens, skip_special_tokens=True)
-        usage_events = build_sample_once_usage_events(
+        billing_observations = build_sample_once_billing_observations(
             session_id=sampling_session_id,
             token_ids=prompt_token_ids,
             sequence=sequence,
             http_request=http_request,
             request_id=sampling_request_id,
         )
-        if usage_events:
-            background_tasks.add_task(_write_usage_events_after_response, usage_events)
+        if billing_observations:
+            await _append_billing_observations(billing_observations)
         return OAICompletionResponse(
             id=f"cmpl-{uuid.uuid4().hex}",
             created=int(time.time()),
@@ -727,7 +727,7 @@ async def completions(request: OAICompletionRequest, http_request: Request, back
 
 
 @router.post("/chat/completions", response_model=OAIChatCompletionResponse)
-async def chat_completions(request: OAIChatCompletionRequest, http_request: Request, background_tasks: BackgroundTasks):
+async def chat_completions(request: OAIChatCompletionRequest, http_request: Request):
     try:
         if request.stream:
             raise HTTPException(status_code=400, detail="stream=True is not supported")
@@ -821,15 +821,15 @@ async def chat_completions(request: OAIChatCompletionRequest, http_request: Requ
 
             _validate_tool_calls(request, tool_calls=tool_calls)
             finish_reason = "tool_calls" if tool_calls else _finish_reason(sequence.stop_reason)
-            usage_events = build_sample_once_usage_events(
+            billing_observations = build_sample_once_billing_observations(
                 session_id=sampling_session_id,
                 token_ids=prompt_token_ids,
                 sequence=sequence,
                 http_request=http_request,
                 request_id=sampling_request_id,
             )
-            if usage_events:
-                background_tasks.add_task(_write_usage_events_after_response, usage_events)
+            if billing_observations:
+                await _append_billing_observations(billing_observations)
             return OAIChatCompletionResponse(
                 id=f"chatcmpl-{uuid.uuid4().hex}",
                 created=int(time.time()),

@@ -110,20 +110,14 @@ def _should_preload_openai_tokenizers() -> bool:
     return workers <= 1
 
 
-async def _check_startup_control_plane(*, maintenance_cron_local_only: bool) -> None:
+async def _check_startup_control_plane() -> None:
     from .backend.config_actor import async_ping as async_ping_config_actor
-    from .backend.maintenance_cron_actor import maintenance_cron_actor
-    from .backend.model_work_scheduler import model_work_scheduler
-    from .backend.task_state_store import task_futures, task_state_store
+    from .backend.model_actor_supervisor import model_actor_supervisor
 
     checks: list[tuple[str, object]] = [
         ("config_actor", async_ping_config_actor(timeout_s=5.0)),
-        ("task_state_store", task_state_store.async_ping(timeout_s=5.0)),
-        ("task_futures", task_futures.async_ping(timeout_s=5.0)),
-        ("model_work_scheduler", model_work_scheduler.async_ping(timeout_s=5.0)),
+        ("model_actor_supervisor", model_actor_supervisor.async_snapshot(timeout_s=5.0)),
     ]
-    if not maintenance_cron_local_only:
-        checks.append(("maintenance_cron_actor", maintenance_cron_actor.async_ping(timeout_s=5.0)))
 
     failures: dict[str, str] = {}
     for name, awaitable in checks:
@@ -246,29 +240,28 @@ async def lifespan(app: FastAPI):
 
     init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
 
-    maintenance_cron_local_only = os.environ.get("MINT_MAINTENANCE_CRON_LOCAL_ONLY", "").strip().lower() in {"1", "true", "yes", "on"}
-
     from .usage_store import get_usage_store
 
     usage_store = await get_usage_store()
     if not await usage_store.health_check():
-        raise RuntimeError("usage billing postgres health check failed")
-    await _check_startup_control_plane(maintenance_cron_local_only=maintenance_cron_local_only)
-    if maintenance_cron_local_only:
-        maintenance_cron = {"actor_name": "local_maintenance_cron_actor", "epoch_id": "local"}
-    else:
-        try:
-            maintenance_cron = await maintenance_cron_actor.async_health_snapshot(
-                timeout_s=5.0,
-                create_if_missing=False,
-            )
-        except Exception as e:
-            maintenance_cron = {"actor_name": "unavailable", "epoch_id": None}
-            set_runtime_degraded_state(
-                reason="maintenance_cron_actor_unavailable",
-                error=f"{type(e).__name__}: {e}",
-                details={},
-            )
+        set_startup_degraded_state(
+            reason="usage_billing_postgres_unavailable",
+            error="usage billing postgres health check failed",
+            details={},
+        )
+    await _check_startup_control_plane()
+    try:
+        maintenance_cron = await maintenance_cron_actor.async_health_snapshot(
+            timeout_s=5.0,
+            create_if_missing=False,
+        )
+    except Exception as e:
+        maintenance_cron = {"actor_name": "unavailable", "epoch_id": None}
+        set_runtime_degraded_state(
+            reason="maintenance_cron_actor_unavailable",
+            error=f"{type(e).__name__}: {e}",
+            details={},
+        )
 
     from .backend.action_session_manager import ActionSessionRouter
 
@@ -331,11 +324,7 @@ async def lifespan(app: FastAPI):
                 )
             await asyncio.sleep(5.0)
 
-    if maintenance_cron_local_only:
-        clear_runtime_degraded_state()
-        maintenance_cron_health_task = None
-    else:
-        maintenance_cron_health_task = asyncio.create_task(_maintenance_cron_health_loop())
+    maintenance_cron_health_task = asyncio.create_task(_maintenance_cron_health_loop())
     ray_reconnect_watch_task: asyncio.Task | None = None
     last_ray_connection_epoch = ray_connection_epoch()
 
@@ -354,7 +343,7 @@ async def lifespan(app: FastAPI):
             mint.action_session_manager = action_manager
 
         # ==========================================================================
-        # Inference route layer: stateless API path uses detached stores only
+        # Inference route layer: stateless API path uses detached control-plane actors.
         # ==========================================================================
         inference_manager = None
         service.session_manager = None
@@ -362,7 +351,7 @@ async def lifespan(app: FastAPI):
         multi_model_manager: MultiModelInferenceManager | None = None
 
         # ==========================================================================
-        # Training route layer: stateless API path uses detached stores only
+        # Training route layer: stateless API path uses detached control-plane actors.
         # ==========================================================================
         training.training_manager = None
         training.training_engine = None
@@ -374,11 +363,11 @@ async def lifespan(app: FastAPI):
         weights.training_engine = None
         weights.inference_manager = None
         logger.info(
-            "Training route globals left unbound in API process; detached queue runtime owns training execution state"
+            "Training route globals left unbound in API process; ModelWorkScheduler and ModelRuntimeActor own scheduled training execution state"
         )
 
         # ==========================================================================
-        # Persistent prewarm runs inside the execution runtime that owns training state.
+        # Topology desired model startup runs inside the execution runtime that owns training state.
         # ==========================================================================
         # ==========================================================================
         # OpenAI compat: preload tokenizers only for single-worker startup.
@@ -400,22 +389,6 @@ async def lifespan(app: FastAPI):
         else:
             logger.info("Skipping OpenAI-compatible tokenizer preload for multi-worker startup")
 
-        # ==========================================================================
-        # Model scheduler + runtime supervisors
-        # ==========================================================================
-        from .backend.model_work_scheduler import model_work_scheduler
-
-        logger.info("startup stage=before_model_work_scheduler_started")
-        try:
-            await model_work_scheduler.async_ping(timeout_s=5.0)
-        except Exception as e:
-            set_startup_degraded_state(
-                reason="model_work_scheduler_unavailable",
-                error=f"{type(e).__name__}: {e}",
-            )
-            logger.warning("Model work scheduler unavailable during API startup: %s: %s", type(e).__name__, e)
-        logger.info("startup stage=after_model_work_scheduler_started")
-
         async def _ray_reconnect_watch_loop() -> None:
             nonlocal last_ray_connection_epoch
             poll_s = ray_reconnect_poll_s()
@@ -431,9 +404,7 @@ async def lifespan(app: FastAPI):
                         "Ray connection epoch advanced to %s; refreshing detached control-plane handles",
                         current_epoch,
                     )
-                    await _check_startup_control_plane(
-                        maintenance_cron_local_only=maintenance_cron_local_only
-                    )
+                    await _check_startup_control_plane()
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -809,7 +780,7 @@ async def api_key_auth_middleware(request: Request, call_next):
                 return await _next_with_trace()
 
         # No internal token means local/dev mode. Prod should configure
-        # INTERNAL_API_TOKEN and send platform identity headers on every API call.
+        # MINT_INTERNAL_API_TOKEN and send platform identity headers on every API call.
         if not config.internal_api_token:
             existing_user_data = getattr(request.state, "user_data", None)
             if not isinstance(existing_user_data, dict):

@@ -377,17 +377,6 @@ class ModelRuntimeActor:
             token_budget=self._config.token_budget,
             lease_ttl_s=self._config.lease_ttl_s,
         )
-        try:
-            await self._scheduler.assign_pending(max_items=self._config.max_claim)
-        except Exception as e:
-            logger.warning(
-                "[model_runtime] assign_pending best-effort failed actor=%s domain=%s replica=%s error_type=%s error=%s",
-                self._config.actor_name,
-                self._config.domain_key,
-                self._config.replica_id,
-                type(e).__name__,
-                e,
-            )
         leases = claimed.get("leases") if isinstance(claimed, dict) else None
         if not leases:
             self._empty_polls_total += 1
@@ -475,11 +464,26 @@ class ModelRuntimeActor:
         extra = item.get("extra") if isinstance(item, dict) and isinstance(item.get("extra"), dict) else {}
         return str(extra.get("model_work_attempt_id") or "") or None
 
+    def _payload_attempt_id_for_lease(self, lease: dict[str, Any]) -> str:
+        attempt_id = str(lease["attempt_id"])
+        lease_id = str(lease["lease_id"])
+        return f"{attempt_id}__{lease_id}"
+
+    def _staged_payload_path_for_lease(self, lease: dict[str, Any]) -> str:
+        item = lease["item"]
+        return str(
+            self._payload_store.payload_path(
+                request_id=str(item["request_id"]),
+                attempt_id=self._payload_attempt_id_for_lease(lease),
+            )
+        )
+
     async def _commit_task_state_success(
         self,
         lease: dict[str, Any],
         *,
         payload: Any,
+        billing_observations: list[dict[str, Any]] | None = None,
     ) -> None:
         self._require_task_state_finalize(lease)
         item = lease["item"]
@@ -488,7 +492,7 @@ class ModelRuntimeActor:
         payload_meta = await asyncio.to_thread(
             self._payload_store.write_json_payload,
             request_id=request_id,
-            attempt_id=attempt_id,
+            attempt_id=self._payload_attempt_id_for_lease(lease),
             payload=payload,
         )
         await self._task_state_store.async_commit_finalize_success(
@@ -500,6 +504,7 @@ class ModelRuntimeActor:
             result_path=str(payload_meta["path"]),
             result_checksum=str(payload_meta["checksum"]),
             result_size_bytes=int(payload_meta["size_bytes"]),
+            billing_observations=billing_observations,
         )
 
     async def _commit_task_state_failure(
@@ -654,6 +659,11 @@ class ModelRuntimeActor:
                 consumer_id=self._config.consumer_id,
                 consumer_generation=self._config.actor_generation,
                 finalize_ttl_s=self._config.lease_ttl_s,
+                staged_payload_path=(
+                    self._staged_payload_path_for_lease(lease)
+                    if finalization.kind == "resolve"
+                    else None
+                ),
             )
             if not isinstance(begin_finalize, dict) or not bool(begin_finalize.get("ok")):
                 logger.warning(
@@ -683,7 +693,11 @@ class ModelRuntimeActor:
             task_state_committed = False
             try:
                 if finalization.kind == "resolve":
-                    await self._commit_task_state_success(lease, payload=finalization.payload)
+                    await self._commit_task_state_success(
+                        lease,
+                        payload=finalization.payload,
+                        billing_observations=finalization.billing_observations,
+                    )
                     task_state_committed = True
                 else:
                     await self._commit_task_state_failure(lease, error=str(finalization.payload))

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 
-def _import_volc_placement(monkeypatch: pytest.MonkeyPatch):
+def _import_node_placement(monkeypatch: pytest.MonkeyPatch):
     ray = types.ModuleType("ray")
     ray.is_initialized = lambda: True  # type: ignore[attr-defined]
     ray.nodes = lambda: []  # type: ignore[attr-defined]
@@ -22,37 +22,37 @@ def _import_volc_placement(monkeypatch: pytest.MonkeyPatch):
     ray_private.state = SimpleNamespace(available_resources_per_node=lambda: {})
     monkeypatch.setitem(sys.modules, "ray._private", ray_private)
 
-    sys.modules.pop("mint_server.backend.volc_placement", None)
-    return importlib.import_module("mint_server.backend.volc_placement")
+    sys.modules.pop("mint_server.backend.node_placement", None)
+    return importlib.import_module("mint_server.backend.node_placement")
 
 
 
 def test_parse_model_gpu_placement_resolves_node_ip_gpu_slices(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    vp = _import_volc_placement(monkeypatch)
+    vp = _import_node_placement(monkeypatch)
 
     monkeypatch.setattr(
         vp,
         "_list_alive_gpu_nodes",
         lambda: [
-            vp.VolcGpuNode(
+            vp.GpuNode(
                 node_id="node-1",
                 node_ip="10.0.0.7",
                 hostname="t-abc-worker-1",
                 total_gpus=8,
                 available_gpus=8,
-                volc_job_id=None,
-                volc_resource_queue_id=None,
+                provider_job_id=None,
+                provider_resource_queue_id=None,
             ),
-            vp.VolcGpuNode(
+            vp.GpuNode(
                 node_id="node-2",
                 node_ip="10.0.0.8",
                 hostname="t-abc-worker-2",
                 total_gpus=8,
                 available_gpus=8,
-                volc_job_id=None,
-                volc_resource_queue_id=None,
+                provider_job_id=None,
+                provider_resource_queue_id=None,
             ),
         ],
     )
@@ -78,7 +78,7 @@ def test_parse_model_gpu_placement_resolves_node_ip_gpu_slices(
 def test_parse_model_gpu_placement_rejects_worker_index_slice(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    vp = _import_volc_placement(monkeypatch)
+    vp = _import_node_placement(monkeypatch)
 
     with pytest.raises(RuntimeError, match="uses worker_index; use node_ip"):
         vp.parse_model_gpu_placement(
@@ -95,20 +95,20 @@ def test_parse_model_gpu_placement_rejects_worker_index_slice(
 def test_parse_model_gpu_placement_accepts_node_ip_slice(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    vp = _import_volc_placement(monkeypatch)
+    vp = _import_node_placement(monkeypatch)
 
     monkeypatch.setattr(
         vp,
         "_list_alive_gpu_nodes",
         lambda: [
-            vp.VolcGpuNode(
+            vp.GpuNode(
                 node_id="node-1",
                 node_ip="10.0.0.17",
                 hostname="t-abc-worker-1",
                 total_gpus=8,
                 available_gpus=8,
-                volc_job_id=None,
-                volc_resource_queue_id=None,
+                provider_job_id=None,
+                provider_resource_queue_id=None,
             )
         ],
     )
@@ -130,29 +130,29 @@ def test_parse_model_gpu_placement_accepts_node_ip_slice(
 def test_parse_model_gpu_placement_node_ip_slice_ignores_duplicate_hostname_worker_indexes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    vp = _import_volc_placement(monkeypatch)
+    vp = _import_node_placement(monkeypatch)
 
     monkeypatch.setattr(
         vp,
         "_list_alive_gpu_nodes",
         lambda: [
-            vp.VolcGpuNode(
+            vp.GpuNode(
                 node_id="node-1",
                 node_ip="10.0.0.17",
                 hostname="t-old-worker-0",
                 total_gpus=8,
                 available_gpus=8,
-                volc_job_id=None,
-                volc_resource_queue_id=None,
+                provider_job_id=None,
+                provider_resource_queue_id=None,
             ),
-            vp.VolcGpuNode(
+            vp.GpuNode(
                 node_id="node-2",
                 node_ip="10.0.0.18",
                 hostname="t-new-worker-0",
                 total_gpus=8,
                 available_gpus=8,
-                volc_job_id=None,
-                volc_resource_queue_id=None,
+                provider_job_id=None,
+                provider_resource_queue_id=None,
             ),
         ],
     )
@@ -173,20 +173,20 @@ def test_parse_model_gpu_placement_node_ip_slice_ignores_duplicate_hostname_work
 def test_parse_model_gpu_placement_selects_single_runtime_replica(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    vp = _import_volc_placement(monkeypatch)
+    vp = _import_node_placement(monkeypatch)
 
     monkeypatch.setattr(
         vp,
         "_list_alive_gpu_nodes",
         lambda: [
-            vp.VolcGpuNode(
+            vp.GpuNode(
                 node_id="node-1",
                 node_ip="10.0.0.7",
                 hostname="t-abc-worker-1",
                 total_gpus=8,
                 available_gpus=8,
-                volc_job_id=None,
-                volc_resource_queue_id=None,
+                provider_job_id=None,
+                provider_resource_queue_id=None,
             )
         ],
     )
@@ -213,20 +213,20 @@ def test_parse_model_gpu_placement_selects_single_runtime_replica(
 def test_parse_model_gpu_placement_filters_unused_replica_before_resolution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    vp = _import_volc_placement(monkeypatch)
+    vp = _import_node_placement(monkeypatch)
 
     monkeypatch.setattr(
         vp,
         "_list_alive_gpu_nodes",
         lambda: [
-            vp.VolcGpuNode(
+            vp.GpuNode(
                 node_id="node-1",
                 node_ip="10.0.0.7",
                 hostname="t-abc-worker-1",
                 total_gpus=8,
                 available_gpus=8,
-                volc_job_id=None,
-                volc_resource_queue_id=None,
+                provider_job_id=None,
+                provider_resource_queue_id=None,
             )
         ],
     )
@@ -251,20 +251,20 @@ def test_parse_model_gpu_placement_filters_unused_replica_before_resolution(
 def test_parse_model_gpu_placement_rejects_out_of_range_gpu_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    vp = _import_volc_placement(monkeypatch)
+    vp = _import_node_placement(monkeypatch)
 
     monkeypatch.setattr(
         vp,
         "_list_alive_gpu_nodes",
         lambda: [
-            vp.VolcGpuNode(
+            vp.GpuNode(
                 node_id="node-1",
                 node_ip="10.0.0.7",
                 hostname="t-abc-worker-1",
                 total_gpus=8,
                 available_gpus=8,
-                volc_job_id=None,
-                volc_resource_queue_id=None,
+                provider_job_id=None,
+                provider_resource_queue_id=None,
             )
         ],
     )
@@ -279,20 +279,20 @@ def test_parse_model_gpu_placement_rejects_out_of_range_gpu_id(
 
 
 def test_assert_node_ip_capacity_reports_pg_blocker(monkeypatch: pytest.MonkeyPatch) -> None:
-    vp = _import_volc_placement(monkeypatch)
+    vp = _import_node_placement(monkeypatch)
 
     monkeypatch.setattr(
         vp,
         "_list_alive_gpu_nodes",
         lambda: [
-            vp.VolcGpuNode(
+            vp.GpuNode(
                 node_id="node-1",
                 node_ip="10.0.0.7",
                 hostname="worker-7",
                 total_gpus=8,
                 available_gpus=0,
-                volc_job_id=None,
-                volc_resource_queue_id=None,
+                provider_job_id=None,
+                provider_resource_queue_id=None,
             )
         ],
     )
@@ -331,20 +331,20 @@ def test_assert_node_ip_capacity_reports_pg_blocker(monkeypatch: pytest.MonkeyPa
 
 
 def test_assert_node_ip_capacity_ignores_owned_pg_blocker(monkeypatch: pytest.MonkeyPatch) -> None:
-    vp = _import_volc_placement(monkeypatch)
+    vp = _import_node_placement(monkeypatch)
 
     monkeypatch.setattr(
         vp,
         "_list_alive_gpu_nodes",
         lambda: [
-            vp.VolcGpuNode(
+            vp.GpuNode(
                 node_id="node-1",
                 node_ip="10.0.0.7",
                 hostname="worker-7",
                 total_gpus=8,
                 available_gpus=0,
-                volc_job_id=None,
-                volc_resource_queue_id=None,
+                provider_job_id=None,
+                provider_resource_queue_id=None,
             )
         ],
     )
@@ -374,20 +374,20 @@ def test_assert_node_ip_capacity_ignores_owned_pg_blocker(monkeypatch: pytest.Mo
 def test_assert_node_ip_capacity_does_not_ignore_same_name_pg_from_other_namespace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    vp = _import_volc_placement(monkeypatch)
+    vp = _import_node_placement(monkeypatch)
 
     monkeypatch.setattr(
         vp,
         "_list_alive_gpu_nodes",
         lambda: [
-            vp.VolcGpuNode(
+            vp.GpuNode(
                 node_id="node-1",
                 node_ip="10.0.0.7",
                 hostname="worker-7",
                 total_gpus=8,
                 available_gpus=0,
-                volc_job_id=None,
-                volc_resource_queue_id=None,
+                provider_job_id=None,
+                provider_resource_queue_id=None,
             )
         ],
     )
@@ -418,20 +418,20 @@ def test_assert_node_ip_capacity_does_not_ignore_same_name_pg_from_other_namespa
 def test_assert_node_ip_capacity_ignores_namespace_suffixed_pg_when_ray_table_has_no_namespace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    vp = _import_volc_placement(monkeypatch)
+    vp = _import_node_placement(monkeypatch)
 
     monkeypatch.setattr(
         vp,
         "_list_alive_gpu_nodes",
         lambda: [
-            vp.VolcGpuNode(
+            vp.GpuNode(
                 node_id="node-1",
                 node_ip="10.0.0.7",
                 hostname="worker-7",
                 total_gpus=8,
                 available_gpus=0,
-                volc_job_id=None,
-                volc_resource_queue_id=None,
+                provider_job_id=None,
+                provider_resource_queue_id=None,
             )
         ],
     )
@@ -460,20 +460,20 @@ def test_assert_node_ip_capacity_ignores_namespace_suffixed_pg_when_ray_table_ha
 def test_assert_node_ip_capacity_does_not_ignore_unsuffixed_pg_when_ray_table_has_no_namespace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    vp = _import_volc_placement(monkeypatch)
+    vp = _import_node_placement(monkeypatch)
 
     monkeypatch.setattr(
         vp,
         "_list_alive_gpu_nodes",
         lambda: [
-            vp.VolcGpuNode(
+            vp.GpuNode(
                 node_id="node-1",
                 node_ip="10.0.0.7",
                 hostname="worker-7",
                 total_gpus=8,
                 available_gpus=0,
-                volc_job_id=None,
-                volc_resource_queue_id=None,
+                provider_job_id=None,
+                provider_resource_queue_id=None,
             )
         ],
     )
@@ -503,7 +503,7 @@ def test_assert_node_ip_capacity_does_not_ignore_unsuffixed_pg_when_ray_table_ha
 def test_assert_node_ip_capacity_reports_missing_node(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    vp = _import_volc_placement(monkeypatch)
+    vp = _import_node_placement(monkeypatch)
 
     monkeypatch.setattr(vp, "_list_alive_gpu_nodes", lambda: [])
     monkeypatch.setattr(vp, "_gpu_placement_groups", lambda: [])
@@ -518,7 +518,7 @@ def test_assert_node_ip_capacity_reports_missing_node(
 def test_list_alive_gpu_nodes_fails_closed_when_state_and_pg_fallback_fail(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    vp = _import_volc_placement(monkeypatch)
+    vp = _import_node_placement(monkeypatch)
 
     monkeypatch.setattr(
         vp.ray,
@@ -568,7 +568,7 @@ def test_list_alive_gpu_nodes_fails_closed_when_state_and_pg_fallback_fail(
 def test_list_alive_gpu_nodes_ray_client_mode_treats_missing_state_entry_as_schedulable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    vp = _import_volc_placement(monkeypatch)
+    vp = _import_node_placement(monkeypatch)
 
     monkeypatch.setattr(
         vp.ray,
@@ -606,7 +606,7 @@ def test_list_alive_gpu_nodes_ray_client_mode_treats_missing_state_entry_as_sche
 def test_list_alive_gpu_nodes_accounts_pending_list_bundles_via_pinned_ip(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    vp = _import_volc_placement(monkeypatch)
+    vp = _import_node_placement(monkeypatch)
 
     monkeypatch.setattr(
         vp.ray,
@@ -651,7 +651,7 @@ def test_list_alive_gpu_nodes_accounts_pending_list_bundles_via_pinned_ip(
 def test_select_free_nodes_from_allowed_ips_uses_fail_closed_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    vp = _import_volc_placement(monkeypatch)
+    vp = _import_node_placement(monkeypatch)
 
     monkeypatch.setattr(
         vp.ray,
@@ -694,7 +694,7 @@ def test_select_free_nodes_from_allowed_ips_uses_fail_closed_fallback(
 def test_list_alive_gpu_nodes_treats_missing_state_entry_as_zero_available(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    vp = _import_volc_placement(monkeypatch)
+    vp = _import_node_placement(monkeypatch)
 
     monkeypatch.setattr(
         vp.ray,
@@ -725,7 +725,7 @@ def test_list_alive_gpu_nodes_treats_missing_state_entry_as_zero_available(
 def test_list_alive_gpu_nodes_uses_actor_state_fallback_when_private_state_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    vp = _import_volc_placement(monkeypatch)
+    vp = _import_node_placement(monkeypatch)
 
     monkeypatch.setenv("RAY_ADDRESS", "ray://192.168.39.87:10001")
     monkeypatch.setattr(
@@ -762,7 +762,7 @@ def test_list_alive_gpu_nodes_uses_actor_state_fallback_when_private_state_unava
 def test_list_alive_gpu_nodes_actor_state_fallback_accounts_alive_gpu_actors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    vp = _import_volc_placement(monkeypatch)
+    vp = _import_node_placement(monkeypatch)
 
     monkeypatch.setenv("RAY_ADDRESS", "ray://192.168.39.87:10001")
     monkeypatch.setattr(
@@ -808,7 +808,7 @@ def test_list_alive_gpu_nodes_actor_state_fallback_accounts_alive_gpu_actors(
 def test_actor_state_fallback_omits_address_when_ray_is_already_initialized(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    vp = _import_volc_placement(monkeypatch)
+    vp = _import_node_placement(monkeypatch)
 
     monkeypatch.setenv("RAY_ADDRESS", "ray://192.168.39.87:10001")
 
@@ -832,7 +832,7 @@ def test_actor_state_fallback_omits_address_when_ray_is_already_initialized(
 def test_actor_state_fallback_uses_subprocess_after_direct_lookup_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    vp = _import_volc_placement(monkeypatch)
+    vp = _import_node_placement(monkeypatch)
 
     monkeypatch.setenv("RAY_ADDRESS", "ray://192.168.39.87:10001")
 
@@ -869,20 +869,20 @@ def test_actor_state_fallback_uses_subprocess_after_direct_lookup_failure(
 def test_assert_node_ip_capacity_handles_list_shaped_pg_table(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    vp = _import_volc_placement(monkeypatch)
+    vp = _import_node_placement(monkeypatch)
 
     monkeypatch.setattr(
         vp,
         "_list_alive_gpu_nodes",
         lambda: [
-            vp.VolcGpuNode(
+            vp.GpuNode(
                 node_id="node-1",
                 node_ip="10.0.0.7",
                 hostname="worker-7",
                 total_gpus=8,
                 available_gpus=0,
-                volc_job_id=None,
-                volc_resource_queue_id=None,
+                provider_job_id=None,
+                provider_resource_queue_id=None,
             )
         ],
     )

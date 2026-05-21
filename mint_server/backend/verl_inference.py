@@ -46,7 +46,7 @@ from mint_server.runtime_env import (
 
 from . import ray_kill
 from .gpu_binding_helpers import gpu_bindings_from_ray_gpu_ids
-from .volc_placement import assert_node_ip_capacity, parse_model_gpu_placement
+from .node_placement import assert_node_ip_capacity, parse_model_gpu_placement
 from .vllm_scheduler_observability import (
     VllmStatsObserver,
     attach_vllm_stats_logger,
@@ -1110,7 +1110,7 @@ def _create_extended_server_class(
             )
 
             # Create temp dir on THIS worker node
-            temp_dir = tempfile.mkdtemp(prefix="tinker_lora_")
+            temp_dir = tempfile.mkdtemp(prefix="mint_lora_")
             adapter_path = temp_dir
 
             # Save adapter files locally on worker node
@@ -1190,7 +1190,7 @@ def _create_extended_server_class(
             from vllm.lora.request import LoRARequest
 
             # Create temp dir on THIS worker node
-            temp_dir = tempfile.mkdtemp(prefix=f"tinker_lora_{lora_int_id}_")
+            temp_dir = tempfile.mkdtemp(prefix=f"mint_lora_{lora_int_id}_")
             adapter_path = temp_dir
 
             # DEBUG: Print tensor norms to trace LoRA values on vLLM side
