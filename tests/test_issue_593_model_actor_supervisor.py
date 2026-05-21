@@ -117,6 +117,22 @@ class _FakeRemoteMethod:
         return _FakeRayRef(self._value)
 
 
+class _FakeKillableActorHandle:
+    def __init__(self, *, code_identity: str | None) -> None:
+        self.code_identity = code_identity
+        self.calls: list[tuple[str, tuple, dict]] = []
+        self.snapshot = _FakeRemoteMethod(
+            self.calls,
+            "snapshot",
+            {"desired_total": 0, "code_identity": code_identity},
+        )
+        self.ensure_reconcile_loop_started = _FakeRemoteMethod(
+            self.calls,
+            "ensure_reconcile_loop_started",
+            {"desired_total": 0, "reconcile_loop_running": True, "code_identity": code_identity},
+        )
+
+
 class _FakeActorHandle:
     def __init__(self) -> None:
         self.calls: list[tuple[str, tuple, dict]] = []
@@ -206,7 +222,12 @@ def test_issue_593_supervisor_detached_actor_options(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(
         supervisor_module,
         "actor_runtime_env",
-        lambda **kwargs: {"env_vars": {"PYTHONPATH": kwargs["pythonpath"], "OTEL_SERVICE_NAME": "mint-test"}},
+        lambda **kwargs: {
+            "env_vars": {
+                "PYTHONPATH": kwargs["pythonpath"],
+                **dict(kwargs.get("extra") or {}),
+            }
+        },
         raising=False,
     )
     monkeypatch.setattr(supervisor_module, "otel_env_vars", lambda: {"OTEL_SERVICE_NAME": "mint-test"}, raising=False)
@@ -225,11 +246,52 @@ def test_issue_593_supervisor_detached_actor_options(monkeypatch: pytest.MonkeyP
     assert created["options"]["lifetime"] == "detached"
     assert created["options"]["get_if_exists"] is True
     assert created["options"]["runtime_env"] == {
-        "env_vars": {"PYTHONPATH": "PFS_PATH", "OTEL_SERVICE_NAME": "mint-test"}
+        "env_vars": {
+            "PYTHONPATH": "PFS_PATH",
+            "OTEL_SERVICE_NAME": "mint-test",
+            "MINT_GIT_SHA": supervisor_module.CURRENT_CODE_IDENTITY,
+        }
     }
     assert created["options"]["resources"] == {"node:10.1.2.3": 0.001}
     assert created["remote_kwargs"]["specs"] == desired_specs_from_env()
     assert actor.calls == [("snapshot", (), {})]
+
+
+def test_issue_593_supervisor_ensure_recreates_stale_code_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mint_server.backend.model_actor_supervisor as supervisor_module
+
+    old_actor = _FakeKillableActorHandle(code_identity="old-sha")
+    new_actor = _FakeKillableActorHandle(code_identity=supervisor_module.CURRENT_CODE_IDENTITY)
+    created = {"count": 0}
+    killed: list[tuple[object, bool]] = []
+
+    def _create(*, require_ready=True):
+        del require_ready
+        created["count"] += 1
+        return old_actor if created["count"] == 1 else new_actor
+
+    fake_ray = types.SimpleNamespace(
+        is_initialized=lambda: True,
+    )
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    monkeypatch.setattr(supervisor_module, "_create_ray_actor", _create, raising=False)
+    monkeypatch.setattr(
+        supervisor_module,
+        "_kill_supervisor_actor",
+        lambda actor, **_kwargs: killed.append((actor, True)),
+        raising=False,
+    )
+    monkeypatch.setattr(supervisor_module, "sync_get_ray_ref", lambda ref, **_kwargs: ref.value, raising=False)
+
+    out = ModelActorSupervisorClient().ensure_started(timeout_s=2.0)
+
+    assert out["reconcile_loop_running"] is True
+    assert created["count"] == 2
+    assert killed == [(old_actor, True)]
+    assert old_actor.calls == [("snapshot", (), {})]
+    assert new_actor.calls == [("ensure_reconcile_loop_started", (), {})]
 
 
 @pytest.mark.anyio

@@ -19,6 +19,7 @@ from ..config import (
     preferred_control_plane_resources,
 )
 from ..runtime_env import env_nonempty
+from ..server_info import _git_sha
 from .async_ray_control import async_get_ray_ref, sync_get_ray_ref
 from .model_actor_inventory import (
     ActorEntry,
@@ -73,9 +74,14 @@ __all__ = [
 ]
 
 MODEL_ACTOR_SUPERVISOR_ACTOR_NAME = "mint_model_actor_supervisor"
+CURRENT_CODE_IDENTITY = os.environ.get("MINT_GIT_SHA") or _git_sha()
 
 
 class ModelActorSupervisorUnavailableError(RuntimeError):
+    pass
+
+
+class ModelActorSupervisorCodeIdentityMismatchError(RuntimeError):
     pass
 
 
@@ -1731,6 +1737,9 @@ class ModelActorSupervisorCore:
         return {
             "snapshot_generated_at": snapshot_generated_at,
             "observed_at": snapshot_generated_at,
+            "actor_name": _ray_model_actor_supervisor_actor_name(),
+            "namespace": _ray_namespace(),
+            "code_identity": CURRENT_CODE_IDENTITY,
             "desired_total": int(len(self._desired)),
             "managed_total": int(len(self._actors)),
             "domain_total": int(len(domains)),
@@ -1834,6 +1843,28 @@ def _model_actor_supervisor_actor_resources() -> dict[str, float] | None:
         return None
 
 
+def _kill_supervisor_actor(actor: Any, *, reason: str) -> None:
+    from . import ray_kill
+
+    actor_name = _ray_model_actor_supervisor_actor_name()
+    namespace = _ray_namespace()
+    logger.warning(
+        "[model_actor_supervisor] killing detached actor reason=%s actor_name=%s namespace=%s",
+        reason,
+        actor_name,
+        namespace,
+    )
+    ray_kill.kill(
+        actor,
+        reason=reason,
+        actor_name=actor_name,
+        namespace=namespace,
+        no_restart=True,
+        verify_absent=True,
+        verify_timeout_s=15.0,
+    )
+
+
 def _create_ray_actor(*, require_ready: bool = True):
     try:
         import ray
@@ -1847,12 +1878,16 @@ def _create_ray_actor(*, require_ready: bool = True):
     class _RayModelActorSupervisorActor(ModelActorSupervisorCore):
         pass
 
+    extra_env = otel_env_vars()
+    if CURRENT_CODE_IDENTITY:
+        extra_env["MINT_GIT_SHA"] = str(CURRENT_CODE_IDENTITY)
+
     options: dict[str, Any] = {
         "name": actor_name,
         "namespace": _ray_namespace(),
         "lifetime": "detached",
         "get_if_exists": True,
-        "runtime_env": actor_runtime_env(pythonpath=PFS_PYTHONPATH, extra=otel_env_vars()),
+        "runtime_env": actor_runtime_env(pythonpath=PFS_PYTHONPATH, extra=extra_env),
     }
     resources = _model_actor_supervisor_actor_resources()
     if resources:
@@ -1873,6 +1908,24 @@ class ModelActorSupervisorClient:
     def _reset_ray_actor(self) -> None:
         self._ray_actor = None
 
+    def _validate_code_identity(self, snapshot: dict[str, Any]) -> None:
+        if not CURRENT_CODE_IDENTITY:
+            return
+        actor_code_identity = snapshot.get("code_identity")
+        if actor_code_identity == CURRENT_CODE_IDENTITY:
+            return
+        raise ModelActorSupervisorCodeIdentityMismatchError(
+            "model actor supervisor code identity mismatch: "
+            f"expected={CURRENT_CODE_IDENTITY!r} actual={actor_code_identity!r}"
+        )
+
+    def _kill_cached_actor_for_code_identity_mismatch(self, exc: BaseException) -> None:
+        actor = self._ray_actor
+        self._reset_ray_actor()
+        if actor is None:
+            raise exc
+        _kill_supervisor_actor(actor, reason="model_actor_supervisor_code_mismatch")
+
     def _get_ray_actor_sync(self, *, require_ready: bool = False):
         try:
             import ray
@@ -1887,6 +1940,7 @@ class ModelActorSupervisorClient:
                 out = sync_get_ray_ref(self._ray_actor.snapshot.remote(), timeout_s=1.0)
                 if not isinstance(out, dict):
                     raise TypeError(f"ModelActorSupervisor.snapshot returned non-dict: {type(out)}")
+                self._validate_code_identity(out)
                 return self._ray_actor
             except Exception:
                 self._reset_ray_actor()
@@ -1897,6 +1951,11 @@ class ModelActorSupervisorClient:
             raise ModelActorSupervisorUnavailableError(
                 f"Detached Ray ModelActorSupervisor actor not found: {actor_name}"
             ) from e
+        if require_ready:
+            out = sync_get_ray_ref(self._ray_actor.snapshot.remote(), timeout_s=5.0)
+            if not isinstance(out, dict):
+                raise TypeError(f"ModelActorSupervisor.snapshot returned non-dict: {type(out)}")
+            self._validate_code_identity(out)
         return self._ray_actor
 
     async def _get_ray_actor_async(self, *, require_ready: bool = False):
@@ -1913,6 +1972,7 @@ class ModelActorSupervisorClient:
                 out = await async_get_ray_ref(self._ray_actor.snapshot.remote(), timeout_s=1.0)
                 if not isinstance(out, dict):
                     raise TypeError(f"ModelActorSupervisor.snapshot returned non-dict: {type(out)}")
+                self._validate_code_identity(out)
                 return self._ray_actor
             except Exception:
                 self._reset_ray_actor()
@@ -1927,23 +1987,49 @@ class ModelActorSupervisorClient:
             raise ModelActorSupervisorUnavailableError(
                 f"Detached Ray ModelActorSupervisor actor not found: {actor_name}"
             ) from e
+        if require_ready:
+            out = await async_get_ray_ref(self._ray_actor.snapshot.remote(), timeout_s=5.0)
+            if not isinstance(out, dict):
+                raise TypeError(f"ModelActorSupervisor.snapshot returned non-dict: {type(out)}")
+            self._validate_code_identity(out)
         return self._ray_actor
 
     def ensure_started(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
         self._ray_actor = _create_ray_actor(require_ready=False)
+        out = sync_get_ray_ref(self._ray_actor.snapshot.remote(), timeout_s=min(float(timeout_s), 10.0))
+        if not isinstance(out, dict):
+            raise TypeError(f"ModelActorSupervisor.snapshot returned non-dict: {type(out)}")
+        try:
+            self._validate_code_identity(out)
+        except ModelActorSupervisorCodeIdentityMismatchError as e:
+            self._kill_cached_actor_for_code_identity_mismatch(e)
+            self._ray_actor = _create_ray_actor(require_ready=False)
         out = sync_get_ray_ref(self._ray_actor.ensure_reconcile_loop_started.remote(), timeout_s=timeout_s)
         if not isinstance(out, dict):
             raise TypeError(f"ModelActorSupervisor.ensure_reconcile_loop_started returned non-dict: {type(out)}")
+        self._validate_code_identity(out)
         return out
 
     async def async_ensure_started(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
         self._ray_actor = _create_ray_actor(require_ready=False)
+        out = await async_get_ray_ref(
+            self._ray_actor.snapshot.remote(),
+            timeout_s=min(float(timeout_s), 10.0),
+        )
+        if not isinstance(out, dict):
+            raise TypeError(f"ModelActorSupervisor.snapshot returned non-dict: {type(out)}")
+        try:
+            self._validate_code_identity(out)
+        except ModelActorSupervisorCodeIdentityMismatchError as e:
+            await asyncio.to_thread(self._kill_cached_actor_for_code_identity_mismatch, e)
+            self._ray_actor = _create_ray_actor(require_ready=False)
         out = await async_get_ray_ref(
             self._ray_actor.ensure_reconcile_loop_started.remote(),
             timeout_s=timeout_s,
         )
         if not isinstance(out, dict):
             raise TypeError(f"ModelActorSupervisor.ensure_reconcile_loop_started returned non-dict: {type(out)}")
+        self._validate_code_identity(out)
         return out
 
     def _call_sync(
