@@ -41,6 +41,15 @@ def _retrieve_pending_min_poll_s() -> float:
         return 1.0
 
 
+def _retrieve_wait_timeout_s() -> float:
+    from ..config import config as server_config
+
+    try:
+        return max(0.0, float(server_config.retrieve_future_wait_timeout_s))
+    except Exception:
+        return 20.0
+
+
 _RECENT_MAX = int(os.environ.get("MINT_RETRIEVE_FUTURE_RECENT_MAX", "2048"))
 _RECENT: "OrderedDict[str, tuple[float, float | None, Any]]" = OrderedDict()
 _PENDING_HINTS_MAX = int(os.environ.get("MINT_RETRIEVE_FUTURE_PENDING_MAX", "8192"))
@@ -179,6 +188,24 @@ async def _lookup_task_state_terminal(request_id: str, http_request: Request) ->
     return None
 
 
+async def _wait_until_not_pending(request_id: str, http_request: Request) -> FutureStatus | None:
+    wait = getattr(task_futures, "async_wait_status_change", None)
+    if wait is None:
+        return None
+    try:
+        return await wait(
+            request_id,
+            timeout_s=_retrieve_wait_timeout_s(),
+            terminal_only=True,
+        )
+    except KeyError:
+        terminal_payload = await _lookup_task_state_terminal(request_id, http_request)
+        if terminal_payload is not None:
+            _recent_put(request_id, terminal_payload, ttl_s=_local_hot_ttl_s())
+            return FutureStatus.DONE
+        raise
+
+
 GENERIC_ERROR_MESSAGE = "Operation failed. Contact administrator if issue persists."
 
 _SAFE_ERROR_PREFIXES = (
@@ -251,14 +278,14 @@ async def retrieve_future(
     """
     from ..gateway import decode_request_id, forward_json, upstream_for_alias
 
-    throttled_pending = _pending_hint_maybe_throttle(body.request_id)
-    if throttled_pending is not None:
-        response.status_code = throttled_pending.status_code
-        response.headers.update(throttled_pending.headers)
-        return throttled_pending.body
-
     decoded = decode_request_id(body.request_id)
     if decoded is not None:
+        throttled_pending = _pending_hint_maybe_throttle(body.request_id)
+        if throttled_pending is not None:
+            response.status_code = throttled_pending.status_code
+            response.headers.update(throttled_pending.headers)
+            return throttled_pending.body
+
         # Check cache first for gateway-routed futures
         cached = _recent_get(body.request_id)
         if cached is not None:
@@ -362,6 +389,13 @@ async def retrieve_future(
             )
         return payload
 
+    if _retrieve_wait_timeout_s() <= 0:
+        throttled_pending = _pending_hint_maybe_throttle(body.request_id)
+        if throttled_pending is not None:
+            response.status_code = throttled_pending.status_code
+            response.headers.update(throttled_pending.headers)
+            return throttled_pending.body
+
     cached = _recent_get(body.request_id)
     if cached is not None:
         logger.info("[retrieve_future] request_id=%s local_cache_hit=true", body.request_id)
@@ -387,6 +421,37 @@ async def retrieve_future(
                 "task_state_store": await task_futures.async_debug_snapshot(),
             }
         raise HTTPException(status_code=404, detail=detail)
+
+    if status == FutureStatus.PENDING:
+        task_state_payload = await _lookup_task_state_terminal(body.request_id, http_request)
+        if task_state_payload is not None:
+            _pending_hint_clear(body.request_id)
+            try:
+                await task_futures.async_cleanup(body.request_id)
+            except Exception:
+                pass
+            logger.info("[retrieve_future] request_id=%s task_state_store_terminal_hit=true", body.request_id)
+            return task_state_payload
+        try:
+            waited_status = await _wait_until_not_pending(body.request_id, http_request)
+            if waited_status is not None:
+                status = waited_status
+        except KeyError:
+            task_state_payload = await _lookup_task_state_terminal(body.request_id, http_request)
+            if task_state_payload is not None:
+                _pending_hint_clear(body.request_id)
+                logger.info("[retrieve_future] request_id=%s task_state_store_terminal_hit=true", body.request_id)
+                return task_state_payload
+            _pending_hint_clear(body.request_id)
+            logger.info("[retrieve_future] request_id=%s status=unknown", body.request_id)
+            detail: object = f"Unknown request_id: {body.request_id}"
+            if _is_privileged(http_request):
+                detail = {
+                    "error": detail,
+                    "request_id": body.request_id,
+                    "task_state_store": await task_futures.async_debug_snapshot(),
+                }
+            raise HTTPException(status_code=404, detail=detail)
 
     if status == FutureStatus.PENDING:
         task_state_payload = await _lookup_task_state_terminal(body.request_id, http_request)

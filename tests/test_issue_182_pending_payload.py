@@ -12,6 +12,7 @@ from mint_server.routes import futures as futures_route
 def _reset_retrieve_future_caches(monkeypatch):
     monkeypatch.setattr(futures_route, "_RECENT", futures_route.OrderedDict())
     monkeypatch.setattr(futures_route, "_PENDING_HINTS", futures_route.OrderedDict())
+    monkeypatch.setattr(futures_route, "_retrieve_wait_timeout_s", lambda: 0.0)
 
 
 class _StubTaskFutureService:

@@ -11,6 +11,22 @@ Implementation: `mint_server/routes/futures.py` backed by `TaskFutureService` in
 - HTTP 200 with result payload: `DONE`
 - HTTP 404: unknown `request_id` (server has forgotten it)
 
+Pending retrieval uses bounded long-polling for local futures. When a local
+future is still pending, the server keeps the HTTP request open until the task
+becomes terminal or `MINT_RETRIEVE_FUTURE_WAIT_TIMEOUT_S` elapses. The default
+wait timeout is 20s. If the timeout elapses with no terminal state, the response
+remains the existing SDK-compatible HTTP 408 pending shape. The wait is native
+to the detached `TaskStateStore` actor: API workers register a bounded waiter
+through `TaskFutureService`, and `TaskStateStore` wakes the waiter when that
+`request_id` changes status or metadata. API workers must not implement their
+own repeated status polling loop for local futures.
+
+This is a load-shedding and latency optimization, not a different future state.
+It reduces client-side high-frequency polling while preserving the Tinker/Mint
+polling contract. Gateway-routed futures still use the upstream retrieve
+response plus the local pending throttle, because the router is not the source
+of truth for the upstream future state.
+
 Important detail: `TaskStateStore` is the single durable source of truth for task state, result metadata, and terminal future indexes. After returning `DONE` or `FAILED`, the server marks the `request_id` as `RETRIEVED` while retaining terminal metadata and payload pointers. A second `retrieve_future` is served idempotently from `TaskStateStore` when the payload or error is still retained; if the payload has been removed but the terminal task record remains, the route returns `{"error": "Known terminal future evicted", ...}` rather than treating the request as unknown.
 
 ## Why futures exist in Mint
@@ -43,9 +59,9 @@ On admission failure, the API must return HTTP 429 with a structured overload re
 
 Pending tasks may wait for `ModelActorSupervisor` to create/register the desired
 runtime actor. This must keep Mint async semantics: the client receives a
-`request_id`, `retrieve_future` returns HTTP 408 while the task is pending, and
-the task eventually becomes `DONE`, `FAILED`, `EXPIRED`, `CANCELLED`, or
-forgotten after retention.
+`request_id`, `retrieve_future` may wait on the server for a bounded interval
+and returns HTTP 408 while the task is still pending, and the task eventually
+becomes `DONE`, `FAILED`, `EXPIRED`, `CANCELLED`, or forgotten after retention.
 
 TTL facts:
 
@@ -53,6 +69,12 @@ TTL facts:
   process-local retrieve hot cache.
 - `MINT_RETRIEVE_FUTURE_GRACE_S` defaults to 600s for cached retrieve
   replay.
+- `MINT_RETRIEVE_FUTURE_MIN_POLL_S` defaults to 1s and controls both the
+  recommended pending retry interval and the local pending-throttle window
+  used when long-polling is disabled.
+- `MINT_RETRIEVE_FUTURE_WAIT_TIMEOUT_S` defaults to 20s and bounds how long a
+  local `retrieve_future` request may wait for a pending task to become terminal
+  before returning HTTP 408.
 - Scheduler owner/lease TTLs default to 30s and only protect scheduler
   ownership/claim recovery.
 - Durable pending/task result/tombstone TTLs are enforced by the async future

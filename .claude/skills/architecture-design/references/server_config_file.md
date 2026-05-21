@@ -69,6 +69,7 @@ actor/runtime dependency assembly.
 - `retrieve_future_hot_ttl_s` (float) [env: `MINT_RETRIEVE_FUTURE_HOT_TTL_S`]
 - `retrieve_future_grace_s` (float) [env: `MINT_RETRIEVE_FUTURE_GRACE_S`]
 - `retrieve_future_min_poll_s` (float) [env: `MINT_RETRIEVE_FUTURE_MIN_POLL_S`]
+- `retrieve_future_wait_timeout_s` (float) [env: `MINT_RETRIEVE_FUTURE_WAIT_TIMEOUT_S`]
 
 ### `[task_state_store]`
 

@@ -471,6 +471,7 @@ class ServerConfig:
     retrieve_future_hot_ttl_s: float = 300.0
     retrieve_future_grace_s: float = 600.0
     retrieve_future_min_poll_s: float = 1.0
+    retrieve_future_wait_timeout_s: float = 20.0
     task_pending_ttl_s: float = 86400.0
     task_result_ttl_s: float = 86400.0
     task_tombstone_ttl_s: float = 604800.0
@@ -779,6 +780,11 @@ class ServerConfig:
                 ("MINT_RETRIEVE_FUTURE_MIN_POLL_S",),
                 file_future.retrieve_future_min_poll_s if file_future is not None else None,
                 1.0,
+            ),
+            retrieve_future_wait_timeout_s=_pick_float(
+                "MINT_RETRIEVE_FUTURE_WAIT_TIMEOUT_S",
+                file_future.retrieve_future_wait_timeout_s if file_future is not None else None,
+                20.0,
             ),
             task_pending_ttl_s=_pick_float(
                 "MINT_TASK_PENDING_TTL_S",

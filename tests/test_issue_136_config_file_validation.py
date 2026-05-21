@@ -108,6 +108,7 @@ def test_config_file_retrieve_future_settings_load(tmp_path):
                 "retrieve_future_hot_ttl_s = 30",
                 "retrieve_future_grace_s = 45",
                 "retrieve_future_min_poll_s = 2.5",
+                "retrieve_future_wait_timeout_s = 20",
                 "task_pending_ttl_s = 100",
                 "task_result_ttl_s = 200",
                 "task_tombstone_ttl_s = 300",
@@ -120,6 +121,7 @@ def test_config_file_retrieve_future_settings_load(tmp_path):
     assert cfg.future.retrieve_future_hot_ttl_s == 30
     assert cfg.future.retrieve_future_grace_s == 45
     assert cfg.future.retrieve_future_min_poll_s == 2.5
+    assert cfg.future.retrieve_future_wait_timeout_s == 20
     assert cfg.future.task_pending_ttl_s == 100
     assert cfg.future.task_result_ttl_s == 200
     assert cfg.future.task_tombstone_ttl_s == 300
@@ -134,6 +136,7 @@ def test_server_config_retrieve_future_settings_read_from_file(tmp_path):
                 "retrieve_future_hot_ttl_s = 30",
                 "retrieve_future_grace_s = 45",
                 "retrieve_future_min_poll_s = 2.5",
+                "retrieve_future_wait_timeout_s = 20",
                 "task_pending_ttl_s = 100",
                 "task_result_ttl_s = 200",
                 "task_tombstone_ttl_s = 300",
@@ -153,6 +156,7 @@ def test_server_config_retrieve_future_settings_read_from_file(tmp_path):
     assert cfg.retrieve_future_hot_ttl_s == 30.0
     assert cfg.retrieve_future_grace_s == 45.0
     assert cfg.retrieve_future_min_poll_s == 2.5
+    assert cfg.retrieve_future_wait_timeout_s == 20.0
     assert cfg.task_pending_ttl_s == 100.0
     assert cfg.task_result_ttl_s == 200.0
     assert cfg.task_tombstone_ttl_s == 300.0
@@ -163,6 +167,8 @@ def test_server_config_task_future_ttl_defaults():
 
     assert cfg.retrieve_future_hot_ttl_s == 300.0
     assert cfg.retrieve_future_grace_s == 600.0
+    assert cfg.retrieve_future_min_poll_s == 1.0
+    assert cfg.retrieve_future_wait_timeout_s == 20.0
     assert cfg.task_pending_ttl_s == 86400.0
     assert cfg.task_result_ttl_s == 86400.0
     assert cfg.task_tombstone_ttl_s == 604800.0
@@ -283,6 +289,7 @@ def test_server_config_retrieve_future_env_overrides_file_independently(tmp_path
     cfg = ServerConfig.from_sources(
         environ={
             "MINT_RETRIEVE_FUTURE_HOT_TTL_S": "31",
+            "MINT_RETRIEVE_FUTURE_WAIT_TIMEOUT_S": "21",
             "MINT_TASK_PENDING_TTL_S": "101",
             "MINT_TASK_RESULT_TTL_S": "201",
             "MINT_TASK_TOMBSTONE_TTL_S": "301",
@@ -292,6 +299,7 @@ def test_server_config_retrieve_future_env_overrides_file_independently(tmp_path
     )
 
     assert cfg.retrieve_future_hot_ttl_s == 31.0
+    assert cfg.retrieve_future_wait_timeout_s == 21.0
     assert cfg.task_pending_ttl_s == 101.0
     assert cfg.task_result_ttl_s == 201.0
     assert cfg.task_tombstone_ttl_s == 301.0

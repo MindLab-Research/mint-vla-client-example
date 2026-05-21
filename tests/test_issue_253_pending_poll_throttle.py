@@ -34,6 +34,7 @@ def test_pending_retrieve_short_circuits_repeat_polls(monkeypatch):
 
     monkeypatch.setattr(futures_route, "task_futures", stub)
     monkeypatch.setattr(futures_route.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(futures_route, "_retrieve_wait_timeout_s", lambda: 0.0)
     monkeypatch.setattr(futures_route, "_PENDING_HINTS", futures_route.OrderedDict())
 
     body = FutureRetrieveRequest(request_id="rid_pending")

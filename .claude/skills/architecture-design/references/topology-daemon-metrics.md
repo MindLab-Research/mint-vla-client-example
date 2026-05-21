@@ -293,7 +293,8 @@ Hard implementation invariants:
 - `ModelWorkScheduler` may accept work for desired domains before a healthy
   replica exists. Such work remains pending until supervisor registers a healthy
   replica, bounded by request/task TTL. Preserve Tinker async semantics: clients
-  keep polling `retrieve_future` and receive HTTP 408 while the task is pending.
+  call `retrieve_future`; local futures may wait on the server for the bounded
+  long-poll timeout and then receive HTTP 408 while the task is still pending.
   Durable pending/result/tombstone TTLs are enforced by the async future reaper;
   scheduler lease TTLs remain separate and only protect ownership recovery.
 

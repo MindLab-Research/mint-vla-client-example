@@ -2459,9 +2459,166 @@ class _TaskStateStoreActor:
     def __init__(self, db_path: str | None = None) -> None:
         self._started_at = time.time()
         self._store = TaskStateStore(db_path or _task_state_store_db_path())
+        self._watchers: dict[str, list[tuple[asyncio.AbstractEventLoop, asyncio.Event]]] = {}
+        self._watcher_count = 0
+        self._watcher_limit = max(1, int(os.environ.get("MINT_TASK_STATE_STORE_WATCHER_MAX", "8192")))
 
     def close(self) -> None:
         self._store.close()
+
+    def _read_task_or_none(self, request_id: str) -> dict[str, Any] | None:
+        try:
+            return self._store.get_task(str(request_id))
+        except TaskStateNotFoundError:
+            return None
+
+    @staticmethod
+    def _record_changed(
+        record: dict[str, Any] | None,
+        *,
+        baseline_status: str,
+        baseline_updated_at: float,
+        terminal_only: bool = False,
+    ) -> bool:
+        if record is None:
+            return True
+        if str(record.get("status") or "") in TERMINAL_TASK_STATUSES:
+            return True
+        if terminal_only:
+            return False
+        if str(record.get("status") or "") != str(baseline_status):
+            return True
+        try:
+            return float(record.get("updated_at") or 0.0) > float(baseline_updated_at)
+        except Exception:
+            return True
+
+    def _add_watcher(
+        self,
+        request_id: str,
+        loop: asyncio.AbstractEventLoop,
+        event: asyncio.Event,
+    ) -> bool:
+        if self._watcher_count >= self._watcher_limit:
+            return False
+        self._watchers.setdefault(str(request_id), []).append((loop, event))
+        self._watcher_count += 1
+        return True
+
+    def _remove_watcher(self, request_id: str, event: asyncio.Event) -> None:
+        waiters = self._watchers.get(str(request_id))
+        if not waiters:
+            return
+        kept: list[tuple[asyncio.AbstractEventLoop, asyncio.Event]] = []
+        removed = 0
+        for waiter in waiters:
+            if waiter[1] is event:
+                removed += 1
+            else:
+                kept.append(waiter)
+        if kept:
+            self._watchers[str(request_id)] = kept
+        else:
+            self._watchers.pop(str(request_id), None)
+        self._watcher_count = max(0, self._watcher_count - removed)
+
+    def _notify_task_changed(self, request_id: str | None) -> None:
+        if request_id is None:
+            return
+        waiters = self._watchers.pop(str(request_id), [])
+        if not waiters:
+            return
+        self._watcher_count = max(0, self._watcher_count - len(waiters))
+        for loop, event in waiters:
+            try:
+                loop.call_soon_threadsafe(event.set)
+            except RuntimeError:
+                pass
+
+    async def wait_task_status_change(
+        self,
+        *,
+        request_id: str,
+        timeout_s: float,
+        observed_status: str | None = None,
+        observed_updated_at: float | None = None,
+        terminal_only: bool = False,
+    ) -> dict[str, Any]:
+        request_id = str(request_id)
+        timeout_s = max(0.0, float(timeout_s))
+        record = self._read_task_or_none(request_id)
+        if record is None:
+            return {"changed": True, "missing": True, "request_id": request_id}
+
+        baseline_status = str(observed_status or record.get("status") or "")
+        try:
+            baseline_updated_at = float(observed_updated_at if observed_updated_at is not None else record.get("updated_at") or 0.0)
+        except Exception:
+            baseline_updated_at = 0.0
+
+        if self._record_changed(
+            record,
+            baseline_status=baseline_status,
+            baseline_updated_at=baseline_updated_at,
+            terminal_only=bool(terminal_only),
+        ):
+            return {"changed": True, "record": record}
+        if timeout_s <= 0:
+            return {"changed": False, "timeout": True, "record": record}
+
+        deadline = time.monotonic() + timeout_s
+        latest = record
+        while True:
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                return {"changed": False, "timeout": True, "record": latest}
+            loop = asyncio.get_running_loop()
+            event = asyncio.Event()
+            if not self._add_watcher(request_id, loop, event):
+                return {
+                    "changed": False,
+                    "watch_skipped": True,
+                    "reason": "watcher_limit",
+                    "record": latest,
+                }
+            try:
+                latest = self._read_task_or_none(request_id)
+                if self._record_changed(
+                    latest,
+                    baseline_status=baseline_status,
+                    baseline_updated_at=baseline_updated_at,
+                    terminal_only=bool(terminal_only),
+                ):
+                    if latest is None:
+                        return {"changed": True, "missing": True, "request_id": request_id}
+                    return {"changed": True, "record": latest}
+                try:
+                    await asyncio.wait_for(event.wait(), timeout=remaining_s)
+                except asyncio.TimeoutError:
+                    latest = self._read_task_or_none(request_id)
+                    if self._record_changed(
+                        latest,
+                        baseline_status=baseline_status,
+                        baseline_updated_at=baseline_updated_at,
+                        terminal_only=bool(terminal_only),
+                    ):
+                        if latest is None:
+                            return {"changed": True, "missing": True, "request_id": request_id}
+                        return {"changed": True, "record": latest}
+                    return {"changed": False, "timeout": True, "record": latest or record}
+
+                latest = self._read_task_or_none(request_id)
+                if latest is None:
+                    return {"changed": True, "missing": True, "request_id": request_id}
+                if self._record_changed(
+                    latest,
+                    baseline_status=baseline_status,
+                    baseline_updated_at=baseline_updated_at,
+                    terminal_only=bool(terminal_only),
+                ):
+                    return {"changed": True, "record": latest}
+            finally:
+                self._remove_watcher(request_id, event)
 
     def stats(self) -> dict[str, Any]:
         active = self._store.list_active_tasks()
@@ -2476,6 +2633,7 @@ class _TaskStateStoreActor:
             "started_at": self._started_at,
             "active_tasks": len(active),
             "active_by_status": by_status,
+            "watchers": self._watcher_count,
             "task_future_reaper": task_future_reaper_metrics_snapshot(),
             "billing_outbox": self._store.billing_outbox_stats(),
         }
@@ -2498,37 +2656,59 @@ class _TaskStateStoreActor:
         return self._store.renew_scheduler_owner(**kwargs)
 
     def create_task(self, **kwargs: Any) -> dict[str, Any]:
-        return self._store.create_task(**kwargs)
+        out = self._store.create_task(**kwargs)
+        self._notify_task_changed(kwargs.get("request_id"))
+        return out
 
     def ensure_task(self, **kwargs: Any) -> dict[str, Any]:
-        return self._store.ensure_task(**kwargs)
+        out = self._store.ensure_task(**kwargs)
+        self._notify_task_changed(kwargs.get("request_id"))
+        return out
 
     def update_task_metadata(self, **kwargs: Any) -> dict[str, Any]:
-        return self._store.update_task_metadata(**kwargs)
+        out = self._store.update_task_metadata(**kwargs)
+        self._notify_task_changed(kwargs.get("request_id"))
+        return out
 
     def complete_task_success(self, **kwargs: Any) -> dict[str, Any]:
-        return self._store.complete_task_success(**kwargs)
+        out = self._store.complete_task_success(**kwargs)
+        self._notify_task_changed(kwargs.get("request_id"))
+        return out
 
     def complete_task_failure(self, **kwargs: Any) -> dict[str, Any]:
-        return self._store.complete_task_failure(**kwargs)
+        out = self._store.complete_task_failure(**kwargs)
+        self._notify_task_changed(kwargs.get("request_id"))
+        return out
 
     def mark_task_retrieved(self, **kwargs: Any) -> dict[str, Any]:
-        return self._store.mark_task_retrieved(**kwargs)
+        out = self._store.mark_task_retrieved(**kwargs)
+        self._notify_task_changed(kwargs.get("request_id"))
+        return out
 
     def forget_task(self, **kwargs: Any) -> dict[str, Any]:
-        return self._store.forget_task(**kwargs)
+        out = self._store.forget_task(**kwargs)
+        self._notify_task_changed(kwargs.get("request_id"))
+        return out
 
     def expire_active_tasks(self, **kwargs: Any) -> list[str]:
-        return self._store.expire_active_tasks(**kwargs)
+        out = self._store.expire_active_tasks(**kwargs)
+        for request_id in out:
+            self._notify_task_changed(str(request_id))
+        return out
 
     def list_terminal_payloads_for_eviction(self, **kwargs: Any) -> list[dict[str, Any]]:
         return self._store.list_terminal_payloads_for_eviction(**kwargs)
 
     def mark_payload_evicted(self, **kwargs: Any) -> dict[str, Any]:
-        return self._store.mark_payload_evicted(**kwargs)
+        out = self._store.mark_payload_evicted(**kwargs)
+        self._notify_task_changed(kwargs.get("request_id"))
+        return out
 
     def delete_expired_tombstones(self, **kwargs: Any) -> list[str]:
-        return self._store.delete_expired_tombstones(**kwargs)
+        out = self._store.delete_expired_tombstones(**kwargs)
+        for request_id in out:
+            self._notify_task_changed(str(request_id))
+        return out
 
     def record_payload_evict_error(self, **kwargs: Any) -> dict[str, Any]:
         return self._store.record_payload_evict_error(**kwargs)
@@ -2552,31 +2732,47 @@ class _TaskStateStoreActor:
         return self._store.list_staged_payloads_for_gc(**kwargs)
 
     def mark_staged_payload_gc_deleted(self, **kwargs: Any) -> dict[str, Any]:
-        return self._store.mark_staged_payload_gc_deleted(**kwargs)
+        out = self._store.mark_staged_payload_gc_deleted(**kwargs)
+        self._notify_task_changed(kwargs.get("request_id"))
+        return out
 
     def list_tasks_by_metadata(self, **kwargs: Any) -> list[dict[str, Any]]:
         return self._store.list_tasks_by_metadata(**kwargs)
 
     def assign_task(self, **kwargs: Any) -> dict[str, Any]:
-        return self._store.assign_task(**kwargs)
+        out = self._store.assign_task(**kwargs)
+        self._notify_task_changed(kwargs.get("request_id"))
+        return out
 
     def claim_task(self, **kwargs: Any) -> dict[str, Any]:
-        return self._store.claim_task(**kwargs)
+        out = self._store.claim_task(**kwargs)
+        self._notify_task_changed(kwargs.get("request_id"))
+        return out
 
     def begin_finalize(self, **kwargs: Any) -> dict[str, Any]:
-        return self._store.begin_finalize(**kwargs)
+        out = self._store.begin_finalize(**kwargs)
+        self._notify_task_changed(kwargs.get("request_id"))
+        return out
 
     def stage_payload(self, **kwargs: Any) -> dict[str, Any]:
-        return self._store.stage_payload(**kwargs)
+        out = self._store.stage_payload(**kwargs)
+        self._notify_task_changed(kwargs.get("request_id"))
+        return out
 
     def commit_finalize_success(self, **kwargs: Any) -> dict[str, Any]:
-        return self._store.commit_finalize_success(**kwargs)
+        out = self._store.commit_finalize_success(**kwargs)
+        self._notify_task_changed(kwargs.get("request_id"))
+        return out
 
     def commit_finalize_failure(self, **kwargs: Any) -> dict[str, Any]:
-        return self._store.commit_finalize_failure(**kwargs)
+        out = self._store.commit_finalize_failure(**kwargs)
+        self._notify_task_changed(kwargs.get("request_id"))
+        return out
 
     def requeue_task(self, **kwargs: Any) -> dict[str, Any]:
-        return self._store.requeue_task(**kwargs)
+        out = self._store.requeue_task(**kwargs)
+        self._notify_task_changed(kwargs.get("request_id"))
+        return out
 
     def list_active_tasks(self, **kwargs: Any) -> list[dict[str, Any]]:
         return self._store.list_active_tasks(**kwargs)
@@ -2985,6 +3181,24 @@ class TaskStateStoreClient:
 
     async def async_get_task(self, request_id: str) -> dict[str, Any]:
         return await self._dict_call("get_task", request_id=str(request_id))
+
+    async def async_wait_task_status_change(
+        self,
+        *,
+        request_id: str,
+        timeout_s: float,
+        observed_status: str | None = None,
+        observed_updated_at: float | None = None,
+        terminal_only: bool = False,
+    ) -> dict[str, Any]:
+        return await self._dict_call(
+            "wait_task_status_change",
+            request_id=str(request_id),
+            timeout_s=float(timeout_s),
+            observed_status=observed_status,
+            observed_updated_at=observed_updated_at,
+            terminal_only=bool(terminal_only),
+        )
 
     def upsert_sampling_session(self, *, session_id: str, info: dict[str, Any]) -> None:
         self._call_sync("upsert_sampling_session", session_id=str(session_id), info=dict(info))
@@ -3512,6 +3726,30 @@ class TaskFutureService:
             record = await self._task_state.async_get_task(str(request_id))
         except (KeyError, TaskStateNotFoundError):
             raise KeyError(f"Unknown request_id: {request_id}") from None
+        return _status_from_task_record(record)
+
+    async def async_wait_status_change(
+        self,
+        request_id: str,
+        *,
+        timeout_s: float,
+        terminal_only: bool = False,
+    ) -> FutureStatus | None:
+        wait = getattr(self._task_state, "async_wait_task_status_change", None)
+        if wait is None:
+            return None
+        out = await wait(
+            request_id=str(request_id),
+            timeout_s=float(timeout_s),
+            terminal_only=bool(terminal_only),
+        )
+        if bool(out.get("missing")):
+            raise KeyError(f"Unknown request_id: {request_id}") from None
+        record = out.get("record")
+        if not isinstance(record, dict):
+            return None
+        if not bool(out.get("changed")) and bool(out.get("timeout")):
+            return None
         return _status_from_task_record(record)
 
     async def async_get_result(self, request_id: str) -> Any:

@@ -64,6 +64,113 @@ def test_task_state_store_client_async_ensure_ready_can_create_actor(monkeypatch
     assert calls == {"require_ready": False, "timeout_s": 7.0}
 
 
+def test_task_state_store_actor_wait_status_change_notifies(tmp_path) -> None:
+    async def _run() -> None:
+        actor = _TaskStateStoreActor(str(tmp_path / "task-state-watch.sqlite3"))
+        try:
+            actor.create_task(
+                request_id="req-watch",
+                op="sampling.asample",
+                domain_key="vllm:test",
+                request_json=b"{}",
+                now=1.0,
+            )
+
+            waiter = asyncio.create_task(
+                actor.wait_task_status_change(
+                    request_id="req-watch",
+                    timeout_s=1.0,
+                )
+            )
+            await asyncio.sleep(0.01)
+            actor.update_task_metadata(
+                request_id="req-watch",
+                metadata={"queue_state": "running"},
+                status="running",
+                now=2.0,
+            )
+
+            out = await waiter
+            assert out["changed"] is True
+            assert out["record"]["request_id"] == "req-watch"
+            assert out["record"]["status"] == "running"
+            assert out["record"]["metadata"]["queue_state"] == "running"
+        finally:
+            actor.close()
+
+    asyncio.run(_run())
+
+
+def test_task_state_store_actor_wait_status_change_times_out(tmp_path) -> None:
+    async def _run() -> None:
+        actor = _TaskStateStoreActor(str(tmp_path / "task-state-watch-timeout.sqlite3"))
+        try:
+            actor.create_task(
+                request_id="req-watch-timeout",
+                op="sampling.asample",
+                domain_key="vllm:test",
+                request_json=b"{}",
+                now=1.0,
+            )
+
+            out = await actor.wait_task_status_change(
+                request_id="req-watch-timeout",
+                timeout_s=0.01,
+            )
+
+            assert out["changed"] is False
+            assert out["timeout"] is True
+            assert out["record"]["request_id"] == "req-watch-timeout"
+            assert out["record"]["status"] == "pending"
+        finally:
+            actor.close()
+
+    asyncio.run(_run())
+
+
+def test_task_state_store_actor_wait_terminal_only_ignores_active_progress(tmp_path) -> None:
+    async def _run() -> None:
+        actor = _TaskStateStoreActor(str(tmp_path / "task-state-terminal-watch.sqlite3"))
+        try:
+            actor.create_task(
+                request_id="req-terminal-watch",
+                op="sampling.asample",
+                domain_key="vllm:test",
+                request_json=b"{}",
+                now=1.0,
+            )
+
+            waiter = asyncio.create_task(
+                actor.wait_task_status_change(
+                    request_id="req-terminal-watch",
+                    timeout_s=1.0,
+                    terminal_only=True,
+                )
+            )
+            await asyncio.sleep(0.01)
+            actor.update_task_metadata(
+                request_id="req-terminal-watch",
+                metadata={"queue_state": "running"},
+                status="running",
+                now=2.0,
+            )
+            await asyncio.sleep(0.01)
+            assert waiter.done() is False
+            actor.complete_task_failure(
+                request_id="req-terminal-watch",
+                error="boom",
+                now=3.0,
+            )
+
+            out = await waiter
+            assert out["changed"] is True
+            assert out["record"]["status"] == "failed"
+        finally:
+            actor.close()
+
+    asyncio.run(_run())
+
+
 def _own_scheduler(store: TaskStateStore, owner_id: str = "scheduler-a") -> int:
     owner = store.acquire_scheduler_owner(owner_id=owner_id, ttl_s=30.0, now=101.0)
     assert owner["ok"] is True

@@ -98,6 +98,7 @@ class _FutureSection(BaseModel):
     retrieve_future_hot_ttl_s: float | None = None
     retrieve_future_grace_s: float | None = None
     retrieve_future_min_poll_s: float | None = None
+    retrieve_future_wait_timeout_s: float | None = None
     task_pending_ttl_s: float | None = None
     task_result_ttl_s: float | None = None
     task_tombstone_ttl_s: float | None = None
