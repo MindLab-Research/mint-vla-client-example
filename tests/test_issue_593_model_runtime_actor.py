@@ -932,6 +932,29 @@ async def test_issue_593_model_runtime_empty_poll_preserves_last_error() -> None
 
 
 @pytest.mark.anyio
+async def test_issue_593_model_runtime_empty_poll_clears_transient_scheduler_mismatch() -> None:
+    scheduler = _FakeScheduler()
+    actor = ModelRuntimeActor(
+        domain_key="vllm:model-a",
+        replica_id="replica-0",
+        scheduler_client=scheduler,
+        task_futures_client=_FakeTaskFutureService(),
+        executor=lambda _lease: asyncio.sleep(0),
+    )
+    actor._last_error = (
+        "RayTaskError(ModelWorkSchedulerConflictError): consumer_id mismatch for replica "
+        "'replica-0': expected 'old', got 'new'"
+    )
+    actor._last_error_traceback = "traceback"
+
+    assert await actor.run_once() == {"claimed": 0, "executed": 0}
+
+    snapshot = actor.health_snapshot()
+    assert snapshot["last_error"] is None
+    assert snapshot["last_error_traceback"] is None
+
+
+@pytest.mark.anyio
 async def test_issue_593_model_runtime_success_clears_previous_error() -> None:
     failed_lease = _lease("runtime-req-failed-then-success")
     ok_lease = _lease("runtime-req-success-after-error")

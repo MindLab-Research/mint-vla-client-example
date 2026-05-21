@@ -380,6 +380,7 @@ class ModelRuntimeActor:
         leases = claimed.get("leases") if isinstance(claimed, dict) else None
         if not leases:
             self._empty_polls_total += 1
+            self._clear_transient_scheduler_error()
             return {"claimed": 0, "executed": 0}
 
         self._last_claimed_at = time.time()
@@ -407,6 +408,14 @@ class ModelRuntimeActor:
     def _record_error(self, e: BaseException) -> None:
         self._last_error = f"{type(e).__name__}: {e}"
         self._last_error_traceback = traceback.format_exc()
+
+    def _clear_transient_scheduler_error(self) -> None:
+        error = str(self._last_error or "").lower()
+        if not error:
+            return
+        if "modelworkschedulerconflicterror" in error or "consumer_id mismatch" in error:
+            self._last_error = None
+            self._last_error_traceback = None
 
     async def _status_is_pending(self, lease: dict[str, Any]) -> bool:
         item = lease["item"]
