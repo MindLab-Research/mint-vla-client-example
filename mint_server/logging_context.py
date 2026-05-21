@@ -137,6 +137,10 @@ def _otel_resource_attributes() -> dict[str, object]:
     return resource_attributes
 
 
+def _otel_process_metric_attributes() -> dict[str, str]:
+    return {"mint.instance_id": _otel_service_instance_id(os.getpid())}
+
+
 def _coerce_file_line(pathname: object, lineno: object) -> tuple[str, int, str]:
     path = str(pathname).strip() if isinstance(pathname, str) and pathname.strip() else "<unknown>"
     try:
@@ -862,6 +866,7 @@ def record_http_server_metrics(*, method: str, route: str, status_code: int, dur
         "http.method": str(method),
         "http.route": str(route),
         "http.status_code": int(status_code),
+        **_otel_process_metric_attributes(),
     }
     try:
         if _HTTP_REQUEST_COUNTER is not None:
@@ -898,6 +903,7 @@ def record_retrieve_future_wait_metric(*, path: str, outcome: str, waited: bool)
         "path": safe_path,
         "outcome": safe_outcome,
         "waited": "true" if bool(waited) else "false",
+        **_otel_process_metric_attributes(),
     }
     try:
         if _RETRIEVE_FUTURE_WAIT_COUNTER is not None:

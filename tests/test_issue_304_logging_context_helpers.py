@@ -38,6 +38,79 @@ def test_issue_304_otel_resource_attributes_keep_env_labels_and_instance_overrid
     assert attrs["mint.cluster_id"] == "volcano"
 
 
+def test_issue_304_http_metrics_include_process_instance_attribute(monkeypatch):
+    calls = []
+
+    class _Recorder:
+        def add(self, value, attributes=None):
+            calls.append(("add", value, attributes))
+
+        def record(self, value, attributes=None):
+            calls.append(("record", value, attributes))
+
+    monkeypatch.setattr(logging_context, "_OTEL_ENABLED", True)
+    monkeypatch.setattr(logging_context, "_HTTP_REQUEST_COUNTER", _Recorder())
+    monkeypatch.setattr(logging_context, "_HTTP_ERROR_COUNTER", _Recorder())
+    monkeypatch.setattr(logging_context, "_HTTP_DURATION_HISTOGRAM", _Recorder())
+    monkeypatch.setattr(logging_context, "_otel_process_metric_attributes", lambda: {"mint.instance_id": "api-1"})
+
+    logging_context.record_http_server_metrics(
+        method="POST",
+        route="/api/v1/retrieve_future",
+        status_code=408,
+        duration_ms=20_000,
+    )
+
+    assert calls == [
+        (
+            "add",
+            1,
+            {
+                "http.method": "POST",
+                "http.route": "/api/v1/retrieve_future",
+                "http.status_code": 408,
+                "mint.instance_id": "api-1",
+            },
+        ),
+        (
+            "record",
+            20_000.0,
+            {
+                "http.method": "POST",
+                "http.route": "/api/v1/retrieve_future",
+                "http.status_code": 408,
+                "mint.instance_id": "api-1",
+            },
+        ),
+    ]
+
+
+def test_issue_304_retrieve_future_wait_metric_includes_process_instance_attribute(monkeypatch):
+    calls = []
+
+    class _Counter:
+        def add(self, value, attributes=None):
+            calls.append((value, attributes))
+
+    monkeypatch.setattr(logging_context, "_OTEL_ENABLED", True)
+    monkeypatch.setattr(logging_context, "_RETRIEVE_FUTURE_WAIT_COUNTER", _Counter())
+    monkeypatch.setattr(logging_context, "_otel_process_metric_attributes", lambda: {"mint.instance_id": "api-1"})
+
+    logging_context.record_retrieve_future_wait_metric(path="gateway", outcome="timeout", waited=True)
+
+    assert calls == [
+        (
+            1,
+            {
+                "path": "gateway",
+                "outcome": "timeout",
+                "waited": "true",
+                "mint.instance_id": "api-1",
+            },
+        )
+    ]
+
+
 def test_issue_304_bind_request_trace_context_restores_previous_values():
     prev_request_id = logging_context.get_request_id()
     prev_trace_id = logging_context.get_trace_id()
