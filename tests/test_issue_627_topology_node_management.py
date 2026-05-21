@@ -417,6 +417,33 @@ def test_issue_627_sdk_client_prefers_modern_credential_chain_over_legacy_cli(
     assert topology_module._legacy_volc_cli_credentials() == {}
 
 
+def test_issue_627_legacy_volc_cli_credentials_use_explicit_cli_home(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    from mint_server.backend import topology as topology_module
+
+    monkeypatch.setenv("HOME", str(tmp_path / "not-root"))
+    monkeypatch.setenv("VOLC_CLI_HOME", str(tmp_path / "cli-home"))
+    monkeypatch.delenv("VOLCENGINE_ACCESS_KEY", raising=False)
+    monkeypatch.delenv("VOLCENGINE_SECRET_KEY", raising=False)
+    monkeypatch.delenv("VOLCENGINE_SESSION_TOKEN", raising=False)
+    monkeypatch.delenv("VOLCENGINE_CLI_CONFIG_FILE", raising=False)
+    volc_dir = tmp_path / "cli-home"
+    volc_dir.mkdir()
+    (volc_dir / "config").write_text("[default]\nregion = cn-beijing\n", encoding="utf-8")
+    (volc_dir / "credentials").write_text(
+        "[default]\naccess_key_id = explicit-ak\nsecret_access_key = explicit-sk\n",
+        encoding="utf-8",
+    )
+
+    assert topology_module._legacy_volc_cli_credentials() == {
+        "ak": "explicit-ak",
+        "sk": "explicit-sk",
+        "region": "cn-beijing",
+    }
+
+
 def test_issue_627_desired_specs_accept_worker_alias_placement(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,

@@ -621,7 +621,10 @@ def _legacy_volc_cli_credentials() -> dict[str, str]:
     if has_modern_source:
         return {}
 
-    cred_path = Path(os.path.expanduser("~/.volc/credentials"))
+    volc_cli_home = _legacy_volc_cli_home()
+    if volc_cli_home is None:
+        return {}
+    cred_path = volc_cli_home / "credentials"
     if not cred_path.is_file():
         return {}
     creds = ConfigParser()
@@ -635,7 +638,7 @@ def _legacy_volc_cli_credentials() -> dict[str, str]:
     if not ak or not sk:
         return {}
 
-    config_path = Path(os.path.expanduser("~/.volc/config"))
+    config_path = volc_cli_home / "config"
     region = ""
     if config_path.is_file():
         cfg = ConfigParser()
@@ -651,6 +654,26 @@ def _legacy_volc_cli_credentials() -> dict[str, str]:
     if region:
         out["region"] = region
     return out
+
+
+def _legacy_volc_cli_home() -> Path | None:
+    for name in ("VOLC_CLI_HOME", "VOLCENGINE_LEGACY_CLI_HOME"):
+        raw = str(os.environ.get(name) or "").strip()
+        if raw:
+            path = Path(raw).expanduser()
+            if path.is_dir():
+                return path
+
+    candidates = [Path(os.path.expanduser("~/.volc")), Path("/root/.volc")]
+    seen: set[str] = set()
+    for path in candidates:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        if path.is_dir():
+            return path
+    return None
 
 
 def _create_volcano_mlplatform_client(
