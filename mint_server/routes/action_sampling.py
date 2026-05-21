@@ -17,7 +17,11 @@ router = APIRouter()
 action_session_manager: object | None = None
 
 
-async def _do_act(request_id: str, request: ActRequest) -> None:
+async def _do_act(
+    request_id: str,
+    request: ActRequest,
+    billing_observations: list[dict] | None = None,
+) -> None:
     try:
         if action_session_manager is None:
             raise RuntimeError("Action session manager not initialized")
@@ -32,7 +36,11 @@ async def _do_act(request_id: str, request: ActRequest) -> None:
         payload["type"] = "act"
         async_resolve = getattr(task_futures, "async_resolve", None)
         if callable(async_resolve):
-            await async_resolve(request_id, payload)
+            await async_resolve(
+                request_id,
+                payload,
+                billing_observations=billing_observations,
+            )
         else:
             task_futures.resolve(request_id, payload)
     except Exception as e:

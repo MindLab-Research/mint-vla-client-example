@@ -8,12 +8,47 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 
+_USER_ID = "0123456789abcdef01234567"
+_ACCOUNT_ID = "111111111111111111111111"
+_APIKEY_ID = "222222222222222222222222"
+
+
+def _install_billing_user(monkeypatch, mint_routes) -> None:
+    from mint_server.gateway_auth import GatewayAuthContext
+
+    billing_auth = GatewayAuthContext(
+        user_id=_USER_ID,
+        user_role="user",
+        account_id=_ACCOUNT_ID,
+        apikey_id=_APIKEY_ID,
+        request_id="gateway-request-1",
+        cap_write=True,
+    )
+    monkeypatch.setattr(mint_routes, "_get_user_id", lambda _request: _USER_ID)
+    monkeypatch.setattr(
+        mint_routes,
+        "_get_user_data",
+        lambda _request: {
+            "user_id": _USER_ID,
+            "account_id": _ACCOUNT_ID,
+            "apikey_id": _APIKEY_ID,
+            "request_id": "gateway-request-1",
+        },
+    )
+    monkeypatch.setattr(
+        mint_routes,
+        "build_billing_auth_context",
+        lambda _request, *, fallback_request_id=None: billing_auth,
+    )
+
+
 class _StubTaskFutureService:
     def __init__(self) -> None:
         self.created: list[str] = []
         self.queued: list[tuple[str, dict | None]] = []
         self.cleaned: list[str] = []
         self.resolved: list[tuple[str, dict]] = []
+        self.billing_observations: dict[str, list[dict]] = {}
         self.failed: list[tuple[str, str]] = []
 
     async def async_create_with_id(self, request_id: str) -> None:
@@ -31,8 +66,9 @@ class _StubTaskFutureService:
     async def async_cleanup(self, request_id: str) -> None:
         self.cleaned.append(request_id)
 
-    async def async_resolve(self, request_id: str, payload: dict) -> None:
+    async def async_resolve(self, request_id: str, payload: dict, *, billing_observations=None) -> None:
         self.resolved.append((request_id, payload))
+        self.billing_observations[request_id] = list(billing_observations or [])
 
     async def async_fail(self, request_id: str, message: str) -> None:
         self.failed.append((request_id, message))
@@ -99,6 +135,72 @@ def test_mint_action_route_cleans_up_future_when_enqueue_fails(monkeypatch) -> N
     assert task_futures.created == []
     assert len(task_futures.cleaned) == 1
     assert len(scheduler.calls) == 1
+
+
+def test_mint_action_route_enqueues_billing_observation(monkeypatch) -> None:
+    from mint_server.routes import mint as mint_routes
+
+    task_futures = _StubTaskFutureService()
+    scheduler = _StubModelWorkScheduler()
+
+    class _StubActionSessionManager:
+        def get_billing_metadata(self, action_session_id: str) -> dict:
+            assert action_session_id == "action-session-1"
+            return {
+                "base_model": "openpi/pi0-fast-libero-low-mem-finetune",
+                "policy_family": "ar_action_tokens",
+                "action_dim": 7,
+                "action_horizon": 10,
+                "action_token_budget": 64,
+                "action_output_tokens": 64,
+            }
+
+    monkeypatch.setattr(mint_routes, "task_futures", task_futures, raising=False)
+    monkeypatch.setattr(mint_routes, "action_session_manager", _StubActionSessionManager(), raising=False)
+    _install_billing_user(monkeypatch, mint_routes)
+
+    import mint_server.backend.model_work_scheduler as mws
+
+    monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
+
+    app = FastAPI()
+    app.include_router(mint_routes.router, prefix="/api/v1/mint")
+    client = TestClient(app)
+
+    resp = client.post(
+        "/api/v1/mint/action_sessions/action-session-1/act",
+        json={
+            "observation": {
+                "state": {"data": [0.0] * 8, "shape": [8], "dtype": "float32"},
+                "model_input": {
+                    "chunks": [
+                        {"type": "image", "data": "aW1n", "format": "png", "expected_tokens": 256},
+                        {"type": "encoded_text", "tokens": [1, 2, 3]},
+                    ]
+                },
+            },
+            "temperature": 0.05,
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    queued = scheduler.calls[0]
+    observations = queued["extra"]["billing_observations"]
+    assert len(observations) == 1
+    observation = observations[0]
+    assert observation["account_id"] == _ACCOUNT_ID
+    assert observation["apikey_id"] == _APIKEY_ID
+    assert observation["charge_item"] == "inference"
+    assert observation["quantity"] == 323
+    assert observation["request_id"] == "gateway-request-1"
+    assert observation["unit"] == "estimated_tokens"
+    assert observation["route"] == "mint.action.act"
+    assert observation["dimension"] == "action"
+    assert observation["model"] == "openpi/pi0-fast-libero-low-mem-finetune"
+    assert observation["metadata"]["input_tokens"] == 259
+    assert observation["metadata"]["action_output_tokens"] == 64
+    assert observation["metadata"]["action_token_budget"] == 64
+    assert queued["extra"]["gateway_auth"]["apikey_id"] == _APIKEY_ID
 
 
 def test_mint_create_action_session_maps_capacity_runtime_error_to_503(monkeypatch) -> None:
@@ -238,7 +340,7 @@ def test_mint_vla_train_step_route_enqueues_expected_request(monkeypatch) -> Non
     monkeypatch.setattr(mint_routes, "task_futures", task_futures)
     monkeypatch.setattr(mint_routes, "training_engine", object())
     monkeypatch.setattr(mint_routes, "training_manager", _StubTrainingManager())
-    monkeypatch.setattr(mint_routes, "_get_user_id", lambda _request: "user-a")
+    _install_billing_user(monkeypatch, mint_routes)
 
     import mint_server.backend.model_work_scheduler as mws
     from mint_server.routes import training as training_routes
@@ -315,16 +417,30 @@ def test_mint_vla_train_step_route_enqueues_expected_request(monkeypatch) -> Non
     assert resp.status_code == 200, resp.text
     request_id = resp.json()["request_id"]
     assert task_futures.created == []
-    queued_request_id, queued_meta = task_futures.queued[0]
-    assert queued_request_id == request_id
-    assert queued_meta["op"] == "mint.vla.train_step"
-    assert queued_meta["model_id"] == "model-123"
-    assert queued_meta["queue_state"] == "queued"
     assert len(scheduler.calls) == 1
     queued = scheduler.calls[0]
     assert queued["op"] == "mint.vla.train_step"
+    assert queued["request_id"] == request_id
     assert queued["domain_key"] == "training:openpi/pi0-fast-libero-low-mem-finetune"
     assert queued["affinity_group"] == "training_session:model-123"
+    queued_meta = queued["extra"]
+    assert queued_meta["op"] == "mint.vla.train_step"
+    assert queued_meta["model_id"] == "model-123"
+    assert queued_meta["queue_state"] == "queued"
+    observations = queued["extra"]["billing_observations"]
+    assert len(observations) == 1
+    observation = observations[0]
+    assert observation["charge_item"] == "training"
+    assert observation["quantity"] == 261
+    assert observation["unit"] == "estimated_tokens"
+    assert observation["route"] == "mint.vla.train_step"
+    assert observation["dimension"] == "train"
+    assert observation["model"] == "openpi/pi0-fast-libero-low-mem-finetune"
+    assert observation["metadata"] == {
+        "model_id": "model-123",
+        "loss_fn": "cross_entropy",
+        "datum_count": 1,
+    }
     request_json = json.loads(queued["request_json"].decode("utf-8"))
     assert request_json["data"][0]["observation"]["state"]["shape"] == [8]
     assert request_json["data"][0]["supervision"]["target_tokens"]["shape"] == [2]
@@ -470,10 +586,18 @@ def test_model_work_dispatch_executes_mint_vla_train_step(monkeypatch) -> None:
 
     captured: dict[str, object] = {}
 
-    async def _fake_do_vla_train_step(request_id: str, request, user_id: str | None) -> None:
+    async def _fake_do_vla_train_step(
+        request_id: str,
+        request,
+        user_id: str | None,
+        gateway_auth=None,
+        billing_observations=None,
+    ) -> None:
         captured["request_id"] = request_id
         captured["request"] = request
         captured["user_id"] = user_id
+        captured["gateway_auth"] = gateway_auth
+        captured["billing_observations"] = billing_observations
 
     from mint_server.routes import mint as mint_routes
 
@@ -501,7 +625,10 @@ def test_model_work_dispatch_executes_mint_vla_train_step(monkeypatch) -> None:
             }
         ).encode("utf-8"),
         user_id="user-a",
-        extra=None,
+        extra={
+            "gateway_auth": {"account_id": "acct", "apikey_id": "key", "request_id": "gw-req"},
+            "billing_observations": [{"charge_item": "training", "quantity": 5}],
+        },
     )
 
     asyncio.run(dispatch.execute_model_work_item(item))
@@ -509,6 +636,45 @@ def test_model_work_dispatch_executes_mint_vla_train_step(monkeypatch) -> None:
     assert captured["request_id"] == "req-1"
     assert captured["user_id"] == "user-a"
     assert captured["request"].model_id == "model-123"
+    assert captured["gateway_auth"]["apikey_id"] == "key"
+    assert captured["billing_observations"] == [{"charge_item": "training", "quantity": 5}]
+
+
+def test_model_work_dispatch_executes_mint_action_with_billing(monkeypatch) -> None:
+    from mint_server.backend import model_work_dispatch as dispatch
+    import ray
+
+    captured: dict[str, object] = {}
+
+    async def _fake_do_act(request_id: str, request, billing_observations=None) -> None:
+        captured["request_id"] = request_id
+        captured["request"] = request
+        captured["billing_observations"] = billing_observations
+
+    from mint_server.routes import action_sampling
+
+    monkeypatch.setattr(ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(action_sampling, "_do_act", _fake_do_act)
+
+    item = SimpleNamespace(
+        op="mint.action.act",
+        request_id="act-1",
+        request_json=json.dumps(
+            {
+                "action_session_id": "action-session-1",
+                "observation": {"chunks": [{"type": "encoded_text", "tokens": [1, 2, 3]}]},
+                "extra_inputs": {},
+            }
+        ).encode("utf-8"),
+        user_id="user-a",
+        extra={"billing_observations": [{"charge_item": "inference", "quantity": 67}]},
+    )
+
+    asyncio.run(dispatch.execute_model_work_item(item))
+
+    assert captured["request_id"] == "act-1"
+    assert captured["request"].action_session_id == "action-session-1"
+    assert captured["billing_observations"] == [{"charge_item": "inference", "quantity": 67}]
 
 
 def test_mint_interpolate_route_enqueues_expected_request(monkeypatch) -> None:
@@ -520,7 +686,7 @@ def test_mint_interpolate_route_enqueues_expected_request(monkeypatch) -> None:
     monkeypatch.setattr(mint_routes, "task_futures", task_futures)
     monkeypatch.setattr(mint_routes, "training_engine", object())
     monkeypatch.setattr(mint_routes, "training_manager", object())
-    monkeypatch.setattr(mint_routes, "_get_user_id", lambda _request: "user-a")
+    _install_billing_user(monkeypatch, mint_routes)
 
     import mint_server.backend.model_work_scheduler as mws
 
@@ -556,23 +722,36 @@ def test_mint_interpolate_route_enqueues_expected_request(monkeypatch) -> None:
     body = resp.json()
     assert "request_id" in body
     assert task_futures.created == []
-    queued_request_id, queued_meta = task_futures.queued[0]
-    assert queued_request_id == body["request_id"]
+    assert len(scheduler.calls) == 1
+    queued = scheduler.calls[0]
+    assert queued["op"] == "mint.interpolate_checkpoints"
+    assert queued["request_id"] == body["request_id"]
+    assert queued["user_id"] == _USER_ID
+    assert queued["domain_key"] == "internal:runtime"
+    queued_meta = queued["extra"]
     assert queued_meta["op"] == "mint.interpolate_checkpoints"
     assert queued_meta["queue_state"] == "queued"
     assert queued_meta["stage"] == "queued"
     assert isinstance(queued_meta["queued_at"], float)
     assert queued_meta["checkpoint_count"] == 2
     assert queued_meta["output_path"] == "ema-0010"
-    assert len(scheduler.calls) == 1
-    queued = scheduler.calls[0]
-    assert queued["op"] == "mint.interpolate_checkpoints"
-    assert queued["user_id"] == "user-a"
-    assert queued["domain_key"] == "internal:runtime"
+    observations = queued["extra"]["billing_observations"]
+    assert len(observations) == 1
+    observation = observations[0]
+    assert observation["charge_item"] == "checkpoint_storage"
+    assert observation["quantity"] == 2
+    assert observation["unit"] == "checkpoint_inputs"
+    assert observation["route"] == "mint.interpolate_checkpoints"
+    assert observation["dimension"] == "checkpoint"
+    assert observation["metadata"] == {
+        "checkpoint_count": 2,
+        "output_path": "ema-0010",
+        "output_checkpoint_type": "sampler",
+    }
     request_json = json.loads(queued["request_json"].decode("utf-8"))
     assert request_json["source_paths"] == [
-        "/resolved/user-a/ckpt-a",
-        "/resolved/user-a/ckpt-b",
+        f"/resolved/{_USER_ID}/ckpt-a",
+        f"/resolved/{_USER_ID}/ckpt-b",
     ]
     assert resolved_flags == [True, True]
 
@@ -637,7 +816,15 @@ def test_mint_interpolate_do_path_claims_checkpoint_and_writes_ckpt_id(monkeypat
         retry=True,
     )
 
-    asyncio.run(mint_routes._do_interpolate_checkpoints("req-interp-1", request, "owner-a"))
+    billing_observations = [{"charge_item": "checkpoint_storage", "quantity": 2}]
+    asyncio.run(
+        mint_routes._do_interpolate_checkpoints(
+            "req-interp-1",
+            request,
+            "owner-a",
+            billing_observations,
+        )
+    )
 
     assert claimed["owner_id"] == "owner-a"
     assert claimed["model_id"] == "model-123"
@@ -647,6 +834,7 @@ def test_mint_interpolate_do_path_claims_checkpoint_and_writes_ckpt_id(monkeypat
     assert written["metadata"]["ckpt_id"] == "ckpt-rec-1"
     assert "created_at" in written["metadata"]
     assert task_futures.failed == []
+    assert task_futures.billing_observations["req-interp-1"] == billing_observations
     assert task_futures.resolved == [
         (
             "req-interp-1",
@@ -857,8 +1045,11 @@ def test_mint_reverse_kl_route_and_background_path(monkeypatch) -> None:
     assert resp.status_code == 200, resp.text
     request_id = resp.json()["request_id"]
     assert task_futures.created == []
-    queued_request_id, queued_meta = task_futures.queued[0]
-    assert queued_request_id == request_id
+    assert len(scheduler.calls) == 1
+    queued = scheduler.calls[0]
+    assert queued["op"] == "mint.forward_backward_reverse_kl"
+    assert queued["request_id"] == request_id
+    queued_meta = queued["extra"]
     assert queued_meta["op"] == "mint.forward_backward_reverse_kl"
     assert queued_meta["model_id"] == "model-123"
     assert queued_meta["session_id"] == "sess-123"
@@ -867,9 +1058,6 @@ def test_mint_reverse_kl_route_and_background_path(monkeypatch) -> None:
     assert queued_meta["queue_state"] == "queued"
     assert queued_meta["stage"] == "queued"
     assert isinstance(queued_meta["queued_at"], float)
-    assert len(scheduler.calls) == 1
-    queued = scheduler.calls[0]
-    assert queued["op"] == "mint.forward_backward_reverse_kl"
     queued_request_json = json.loads(queued["request_json"].decode("utf-8"))
     assert queued_request_json["reference_model_path"] == "/resolved/ref-step-0010"
     assert resolved_flags == [True]
@@ -961,8 +1149,11 @@ def test_mint_reverse_kl_route_uses_detached_training_info_without_route_runtime
     assert resp.status_code == 200, resp.text
     request_id = resp.json()["request_id"]
     assert task_futures.created == []
-    queued_request_id, queued_meta = task_futures.queued[0]
-    assert queued_request_id == request_id
+    assert len(scheduler.calls) == 1
+    queued = scheduler.calls[0]
+    assert queued["op"] == "mint.forward_backward_reverse_kl"
+    assert queued["request_id"] == request_id
+    queued_meta = queued["extra"]
     assert queued_meta["op"] == "mint.forward_backward_reverse_kl"
     assert queued_meta["model_id"] == "model-123"
     assert queued_meta["session_id"] == "sess-123"
@@ -971,9 +1162,6 @@ def test_mint_reverse_kl_route_uses_detached_training_info_without_route_runtime
     assert queued_meta["queue_state"] == "queued"
     assert queued_meta["stage"] == "queued"
     assert isinstance(queued_meta["queued_at"], float)
-    assert len(scheduler.calls) == 1
-    queued = scheduler.calls[0]
-    assert queued["op"] == "mint.forward_backward_reverse_kl"
     queued_request_json = json.loads(queued["request_json"].decode("utf-8"))
     assert queued_request_json["reference_model_path"] == "/resolved/ref-step-0010"
 

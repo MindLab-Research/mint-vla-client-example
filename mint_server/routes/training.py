@@ -2754,6 +2754,7 @@ async def _do_train_step(
     request: TrainStepRequest,
     user_id: str | None,
     gateway_auth: dict | None = None,
+    billing_observations: list[dict] | None = None,
 ) -> None:
     """Background task for train_step."""
     inflight_marked = False
@@ -2802,12 +2803,16 @@ async def _do_train_step(
         await task_futures.async_resolve(
             request_id,
             result,
-            billing_observations=_build_training_billing_observations(
-                gateway_auth=gateway_auth,
-                request_id=request_id,
-                model=session.base_model,
-                route="training.train_step",
-                token_count=token_count,
+            billing_observations=(
+                billing_observations
+                if billing_observations is not None
+                else _build_training_billing_observations(
+                    gateway_auth=gateway_auth,
+                    request_id=request_id,
+                    model=session.base_model,
+                    route="training.train_step",
+                    token_count=token_count,
+                )
             ),
         )
 

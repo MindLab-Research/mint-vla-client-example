@@ -159,6 +159,27 @@ def _shared_actor_known_sessions(actor_handle: Any) -> set[str]:
     return {str(session_id) for session_id in list(payload.get("known_session_ids") or []) if session_id}
 
 
+def _action_billing_metadata(base_model: str, model_config: Any) -> dict[str, Any]:
+    policy_family = str(getattr(model_config, "policy_family", "") or "")
+    action_token_budget = max(0, int(getattr(model_config, "action_token_budget", 0) or 0))
+    action_output_tokens = action_token_budget if policy_family == "ar_action_tokens" else 0
+    return {
+        "base_model": str(base_model or ""),
+        "policy_family": policy_family,
+        "action_dim": max(0, int(getattr(model_config, "action_dim", 0) or 0)),
+        "action_horizon": max(0, int(getattr(model_config, "action_horizon", 0) or 0)),
+        "action_token_budget": action_token_budget,
+        "action_output_tokens": action_output_tokens,
+    }
+
+
+def _action_billing_metadata_for_base_model(base_model: str) -> dict[str, Any]:
+    try:
+        return _action_billing_metadata(base_model, get_model_config(base_model))
+    except Exception:
+        return {"base_model": str(base_model or "")}
+
+
 def _is_retryable_openpi_runtime_error(exc: BaseException | None) -> bool:
     if exc is None:
         return False
@@ -288,6 +309,7 @@ class OpenPIFastActionSessionManager:
         self._runtime_factory = runtime_factory or _default_runtime_factory
         self._checkpoints_dir = checkpoints_dir or get_checkpoints_dir()
         self._runtime_clients: dict[str, Any] = {}
+        self._billing_metadata: dict[str, dict[str, Any]] = {}
 
     def _action_session_id(self, session_id: str, action_session_seq_id: int | None) -> str:
         if action_session_seq_id is None:
@@ -340,7 +362,12 @@ class OpenPIFastActionSessionManager:
         )
 
         self._runtime_clients[action_session_id] = client
+        self._billing_metadata[action_session_id] = _action_billing_metadata(base_model, model_config)
         return action_session_id
+
+    def get_billing_metadata(self, action_session_id: str) -> dict[str, Any] | None:
+        metadata = self._billing_metadata.get(action_session_id)
+        return None if metadata is None else dict(metadata)
 
     async def act(
         self,
@@ -372,6 +399,7 @@ class OpenPIFastActionSessionManager:
 
     async def shutdown_session(self, action_session_id: str) -> None:
         runtime = self._runtime_clients.pop(action_session_id, None)
+        self._billing_metadata.pop(action_session_id, None)
         if runtime is None:
             runtime = _recover_detached_action_runtime_client(
                 action_session_id=action_session_id,
@@ -403,6 +431,7 @@ class OpenPIPi05ActionSessionManager:
         self._runtime_factory = runtime_factory or _default_pi05_runtime_factory
         self._checkpoints_dir = checkpoints_dir or get_checkpoints_dir()
         self._runtime_clients: dict[str, Any] = {}
+        self._billing_metadata: dict[str, dict[str, Any]] = {}
 
     def _action_session_id(self, session_id: str, action_session_seq_id: int | None) -> str:
         if action_session_seq_id is None:
@@ -454,7 +483,12 @@ class OpenPIPi05ActionSessionManager:
         )
 
         self._runtime_clients[action_session_id] = client
+        self._billing_metadata[action_session_id] = _action_billing_metadata(base_model, model_config)
         return action_session_id
+
+    def get_billing_metadata(self, action_session_id: str) -> dict[str, Any] | None:
+        metadata = self._billing_metadata.get(action_session_id)
+        return None if metadata is None else dict(metadata)
 
     async def act(
         self,
@@ -486,6 +520,7 @@ class OpenPIPi05ActionSessionManager:
 
     async def shutdown_session(self, action_session_id: str) -> None:
         runtime = self._runtime_clients.pop(action_session_id, None)
+        self._billing_metadata.pop(action_session_id, None)
         if runtime is None:
             runtime = _recover_detached_action_runtime_client(
                 action_session_id=action_session_id,
@@ -517,6 +552,7 @@ class ActionSessionRouter:
         self._openpi_fast = openpi_fast_manager or OpenPIFastActionSessionManager()
         self._openpi_pi05 = openpi_pi05_manager or OpenPIPi05ActionSessionManager()
         self._manager_for_session: dict[str, object] = {}
+        self._billing_metadata: dict[str, dict[str, Any]] = {}
 
     def _manager_for_model(self, base_model: str) -> object:
         if _is_openpi_fast_model(base_model):
@@ -553,6 +589,9 @@ class ActionSessionRouter:
             if not recovered:
                 continue
             self._manager_for_session[action_session_id] = manager
+            self._billing_metadata[action_session_id] = _action_billing_metadata_for_base_model(
+                str(entry.base_model or "")
+            )
             return manager
         if len(candidate_managers) == 1:
             manager = next(iter(candidate_managers.values()))
@@ -582,7 +621,23 @@ class ActionSessionRouter:
             user_id=user_id,
         )
         self._manager_for_session[action_session_id] = manager
+        self._billing_metadata[action_session_id] = _action_billing_metadata_for_base_model(base_model)
         return action_session_id
+
+    def get_billing_metadata(self, action_session_id: str) -> dict[str, Any] | None:
+        metadata = self._billing_metadata.get(action_session_id)
+        if metadata is not None:
+            return dict(metadata)
+        manager = self._manager_for_session.get(action_session_id)
+        if manager is None:
+            manager = self._recover_manager_for_session(action_session_id)
+        getter = getattr(manager, "get_billing_metadata", None)
+        if callable(getter):
+            metadata = getter(action_session_id)
+            if isinstance(metadata, dict):
+                self._billing_metadata[action_session_id] = dict(metadata)
+                return dict(metadata)
+        return None
 
     async def act(
         self,
@@ -606,6 +661,7 @@ class ActionSessionRouter:
 
     async def shutdown_session(self, action_session_id: str) -> None:
         manager = self._manager_for_session.pop(action_session_id, None)
+        self._billing_metadata.pop(action_session_id, None)
         if manager is None:
             manager = self._recover_manager_for_session(action_session_id)
         if manager is None:
