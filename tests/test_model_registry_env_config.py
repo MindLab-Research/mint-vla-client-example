@@ -47,14 +47,14 @@ def test_list_supported_models_env_unknown_raises(monkeypatch):
 def test_list_supported_models_env_accepts_gateway_routed_model(monkeypatch):
     from mint_server.backend import model_registry as mr
 
-    monkeypatch.setenv("MINT_SUPPORTED_MODELS", "Qwen/Qwen3-0.6B, zai-org/GLM-5.1")
+    monkeypatch.setenv("MINT_SUPPORTED_MODELS", "Qwen/Qwen3-0.6B, zai-org/GLM-5")
     monkeypatch.setenv(
         "MINT_GATEWAY_CONFIG_JSON",
         json.dumps(
             {
-                "model_to_upstream": {"zai-org/GLM-5.1": "glm51"},
+                "model_to_upstream": {"zai-org/GLM-5": "glm5"},
                 "upstreams": {
-                    "glm51": {
+                    "glm5": {
                         "base_url": "http://example.com:18000",
                         "auth_mode": "static_api_key",
                         "api_key": "secret",
@@ -66,7 +66,7 @@ def test_list_supported_models_env_accepts_gateway_routed_model(monkeypatch):
 
     got = mr.list_supported_models()
 
-    assert got == ["Qwen/Qwen3-0.6B", "zai-org/GLM-5.1"]
+    assert got == ["Qwen/Qwen3-0.6B", "zai-org/GLM-5"]
 
 
 def test_model_config_overrides_json(monkeypatch):

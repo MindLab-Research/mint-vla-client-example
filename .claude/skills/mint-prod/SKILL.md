@@ -132,8 +132,6 @@ Public `/api/v1/healthz` is only a cheap API-worker health check.
   models.
 - Volcano production hosts Qwen3 0.6B, Qwen3 4B Instruct, Qwen3 4B Thinking,
   Qwen3 30B A3B Instruct, Qwen3 235B A22B Instruct, and OpenPI runtime models.
-- Do not advertise `zai-org/GLM-5.1` unless a current registry/gateway route is
-  configured for it.
 - 235B is deployed locally on Volcano with 16 GPUs for vLLM and 16 GPUs for
   Megatron. This requires the production model override to set the 235B
   Megatron world size to 16 GPUs.

@@ -46,10 +46,10 @@ def test_start_prod_server_script_uses_tmp_root_shortlink() -> None:
     assert '. "${prod_secrets_env}"' in text
     assert 'export MINT_RUNTIME_CHECKPOINT_DIR="/vePFS-Mindverse/share/mint/prod/data/runtime-checkpoints"' in text
     assert 'export MINT_CODE_ROOT="$repo_root"' in text
-    assert 'if [ -n "${MINT_GATEWAY_GLM51_BASE_URL:-}" ]; then' in text
-    assert 'missing MINT_API_KEY for GLM5.1 static gateway auth' in text
-    assert 'model_to_upstream[model] = alias' in text
-    assert 'upstreams[alias] = {' in text
+    legacy_gateway_prefix = "MINT_GATEWAY_" + "GLM" + "51"
+    legacy_model_label = "GLM" + "5.1"
+    assert legacy_gateway_prefix not in text
+    assert legacy_model_label not in text
     assert 'api_tmp_root="${MINT_TMP_ROOT}/api/${USER:-unknown}"' in text
     assert 'api_tmp_link="/tmp/mpa"' in text
     assert 'export TMPDIR="${api_tmp_link}/t"' in text
