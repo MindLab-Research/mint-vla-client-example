@@ -101,6 +101,92 @@ def test_task_state_store_actor_wait_status_change_notifies(tmp_path) -> None:
     asyncio.run(_run())
 
 
+def test_issue_638_task_state_store_stats_include_future_dashboard_fields(tmp_path) -> None:
+    actor = _TaskStateStoreActor(str(tmp_path / "task-state-metrics.sqlite3"))
+    try:
+        actor.create_task(
+            request_id="req-pending",
+            op="sampling.asample",
+            domain_key="vllm:test",
+            request_json=b"{}",
+            now=100.0,
+        )
+        actor.create_task(
+            request_id="req-done",
+            op="sampling.asample",
+            domain_key="vllm:test",
+            request_json=b"{}",
+            now=90.0,
+        )
+        actor.complete_task_success(
+            request_id="req-done",
+            result_path="/tmp/result.json",
+            result_checksum="sha256:abc",
+            result_size_bytes=17,
+            metadata={"done_at": 101.0},
+            now=101.0,
+        )
+
+        stats = actor.stats()
+
+        assert stats["pending"] == 1
+        assert stats["results"] == 1
+        assert stats["refs"] == 1
+        assert stats["by_op"]["sampling.asample"]["pending"] == 1
+        assert stats["by_op"]["sampling.asample"]["results"] == 1
+        assert stats["age_stats"]["oldest_pending_s"] >= 0
+        assert stats["payload_stats"]["result_refs_count"] == 1
+    finally:
+        actor.close()
+
+
+def test_issue_638_task_state_store_registers_otel_future_and_billing_gauges(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opentelemetry.metrics as otel_metrics
+
+    import mint_server.logging_context as logging_context
+
+    gauges: dict[str, list] = {}
+
+    class _FakeMeter:
+        def create_observable_gauge(self, name, **kwargs):
+            gauges[name] = list(kwargs.get("callbacks") or [])
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel.example:4317")
+    monkeypatch.setenv("MINT_DEPLOYMENT_ENV", "prod")
+    monkeypatch.setenv("MINT_CLUSTER_ID", "volcano")
+    monkeypatch.setattr(otel_metrics, "get_meter", lambda _name: _FakeMeter())
+    monkeypatch.setattr(logging_context, "init_actor_observability", lambda: None)
+
+    actor = _TaskStateStoreActor(str(tmp_path / "task-state-otel.sqlite3"))
+    try:
+        actor.create_task(
+            request_id="req-pending",
+            op="sampling.asample",
+            domain_key="vllm:test",
+            request_json=b"{}",
+            now=100.0,
+        )
+
+        assert "mint_task_futures_pending" in gauges
+        assert "mint_task_futures_oldest_pending_s" in gauges
+        assert "mint_billing_outbox_rows" in gauges
+        assert "mint_billing_outbox_flush_attempts_total" in gauges
+        assert "mint_billing_observation_skipped_total" in gauges
+
+        pending_obs = gauges["mint_task_futures_pending"][0](None)
+        assert any(obs.value == 1.0 and obs.attributes.get("op") is None for obs in pending_obs)
+        assert any(obs.value == 1.0 and obs.attributes.get("op") == "sampling.asample" for obs in pending_obs)
+        for obs in pending_obs:
+            assert obs.attributes["deployment.env"] == "prod"
+            assert obs.attributes["mint.cluster_id"] == "volcano"
+            assert "request_id" not in obs.attributes
+    finally:
+        actor.close()
+
+
 def test_task_state_store_actor_wait_status_change_times_out(tmp_path) -> None:
     async def _run() -> None:
         actor = _TaskStateStoreActor(str(tmp_path / "task-state-watch-timeout.sqlite3"))

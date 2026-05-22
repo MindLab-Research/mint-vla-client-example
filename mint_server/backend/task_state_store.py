@@ -204,6 +204,26 @@ def _now(now: float | None = None) -> float:
     return time.time() if now is None else float(now)
 
 
+def _otel_metric_attrs() -> dict[str, str]:
+    attrs = {
+        "deployment.env": os.getenv("MINT_DEPLOYMENT_ENV", "").strip(),
+        "mint.cluster_id": os.getenv("MINT_CLUSTER_ID", "").strip(),
+        "ray_namespace": _ray_namespace(),
+    }
+    return {key: value for key, value in attrs.items() if value}
+
+
+def _metric_number(value: object) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _json_dumps(value: dict[str, Any] | None) -> str:
     return json.dumps({} if value is None else dict(value), ensure_ascii=True, sort_keys=True)
 
@@ -2353,6 +2373,103 @@ class TaskStateStore:
             rows = self._conn.execute(sql, params).fetchall()
         return [self._row_to_record(row) for row in rows]
 
+    def future_metrics_stats(self, *, now: float | None = None) -> dict[str, Any]:
+        ts = _now(now)
+        active_statuses = tuple(sorted(ACTIVE_TASK_STATUSES))
+        terminal_statuses = tuple(sorted(TERMINAL_TASK_STATUSES))
+        with self._lock:
+            status_rows = self._conn.execute(
+                "SELECT status, COUNT(*) AS count FROM tasks GROUP BY status"
+            ).fetchall()
+            op_rows = self._conn.execute(
+                "SELECT op, status, COUNT(*) AS count FROM tasks GROUP BY op, status"
+            ).fetchall()
+            scalar_row = self._conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN result_path IS NOT NULL AND result_path != '' THEN 1 ELSE 0 END) AS refs,
+                    SUM(CASE WHEN metadata_json IS NOT NULL AND metadata_json != '{}' THEN 1 ELSE 0 END) AS meta
+                FROM tasks
+                """
+            ).fetchone()
+            pending_age_row = self._conn.execute(
+                f"""
+                SELECT
+                    COUNT(*) AS count,
+                    MAX(? - created_at) AS oldest_s,
+                    AVG(? - created_at) AS avg_s
+                FROM tasks
+                WHERE status IN ({",".join("?" for _ in active_statuses)})
+                """,
+                (ts, ts, *active_statuses),
+            ).fetchone()
+            done_age_row = self._conn.execute(
+                f"""
+                SELECT
+                    COUNT(*) AS count,
+                    MAX(? - updated_at) AS oldest_s,
+                    AVG(? - updated_at) AS avg_s
+                FROM tasks
+                WHERE status IN ({",".join("?" for _ in terminal_statuses)})
+                """,
+                (ts, ts, *terminal_statuses),
+            ).fetchone()
+
+        by_status = {str(row["status"]): int(row["count"] or 0) for row in status_rows}
+        pending_statuses = ACTIVE_TASK_STATUSES
+        result_statuses = {"done", "retrieved"}
+        error_statuses = {"failed"}
+
+        by_op: dict[str, dict[str, int]] = {}
+        for row in op_rows:
+            op = str(row["op"] or "unknown")
+            status = str(row["status"] or "unknown")
+            count = int(row["count"] or 0)
+            bucket = by_op.setdefault(op, {"pending": 0, "results": 0, "errors": 0})
+            if status in pending_statuses:
+                bucket["pending"] += count
+            elif status in result_statuses:
+                bucket["results"] += count
+            elif status in error_statuses:
+                bucket["errors"] += count
+
+        pending = sum(by_status.get(status, 0) for status in pending_statuses)
+        results = sum(by_status.get(status, 0) for status in result_statuses)
+        errors = sum(by_status.get(status, 0) for status in error_statuses)
+        refs = int(scalar_row["refs"] or 0) if scalar_row is not None else 0
+        meta = int(scalar_row["meta"] or 0) if scalar_row is not None else 0
+        oldest_pending_s = float(pending_age_row["oldest_s"] or 0.0) if pending_age_row is not None else 0.0
+        oldest_done_s = float(done_age_row["oldest_s"] or 0.0) if done_age_row is not None else 0.0
+        avg_pending_s = float(pending_age_row["avg_s"] or 0.0) if pending_age_row is not None else 0.0
+        avg_done_s = float(done_age_row["avg_s"] or 0.0) if done_age_row is not None else 0.0
+
+        return {
+            "pending": int(pending),
+            "results": int(results),
+            "errors": int(errors),
+            "refs": refs,
+            "meta": meta,
+            "expired": int(by_status.get("expired", 0)),
+            "retrieved": int(by_status.get("retrieved", 0)),
+            "execution_timeout_s": float(server_config.task_pending_ttl_s),
+            "queue_timeout_s": float(getattr(server_config, "retrieve_future_wait_timeout_s", 20.0)),
+            "result_ttl_s": float(server_config.task_result_ttl_s),
+            "tombstone_ttl_s": float(server_config.task_tombstone_ttl_s),
+            "by_op": by_op,
+            "age_stats": {
+                "oldest_pending_s": oldest_pending_s,
+                "oldest_done_s": oldest_done_s,
+                "avg_pending_s": avg_pending_s,
+                "avg_done_s": avg_done_s,
+            },
+            "payload_stats": {
+                "result_refs_count": refs,
+                "errors_count": int(errors),
+                "refs_count": refs,
+            },
+        }
+
     def list_expired_leases(self, *, now: float | None = None, limit: int | None = None) -> list[dict[str, Any]]:
         ts = _now(now)
         sql = """
@@ -2457,11 +2574,20 @@ def _task_state_store_db_path() -> str:
 
 class _TaskStateStoreActor:
     def __init__(self, db_path: str | None = None) -> None:
+        try:
+            from ..logging_context import init_actor_observability
+
+            init_actor_observability()
+        except Exception:
+            pass
         self._started_at = time.time()
         self._store = TaskStateStore(db_path or _task_state_store_db_path())
         self._watchers: dict[str, list[tuple[asyncio.AbstractEventLoop, asyncio.Event]]] = {}
         self._watcher_count = 0
         self._watcher_limit = max(1, int(os.environ.get("MINT_TASK_STATE_STORE_WATCHER_MAX", "8192")))
+        self._otel_enabled = False
+        self._otel_error: str | None = None
+        self._init_otel_metrics()
 
     def close(self) -> None:
         self._store.close()
@@ -2626,6 +2752,7 @@ class _TaskStateStoreActor:
         for record in active:
             status = str(record.get("status") or "unknown")
             by_status[status] = by_status.get(status, 0) + 1
+        future_stats = self._store.future_metrics_stats()
         return {
             "actor_name": _ray_task_state_store_actor_name(),
             "namespace": _ray_namespace(),
@@ -2634,9 +2761,178 @@ class _TaskStateStoreActor:
             "active_tasks": len(active),
             "active_by_status": by_status,
             "watchers": self._watcher_count,
+            **future_stats,
             "task_future_reaper": task_future_reaper_metrics_snapshot(),
             "billing_outbox": self._store.billing_outbox_stats(),
         }
+
+    def _init_otel_metrics(self) -> None:
+        endpoint = (os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT") or "").strip()
+        if not endpoint:
+            return
+        try:
+            from opentelemetry import metrics
+            from opentelemetry.metrics import Observation
+
+            meter = metrics.get_meter("mint.task_state_store")
+
+            def _attrs(**extra: object) -> dict[str, str]:
+                attrs = _otel_metric_attrs()
+                for key, value in extra.items():
+                    text = str(value if value is not None else "").strip()
+                    if text:
+                        attrs[key] = text
+                return attrs
+
+            def _gauge(name: str, callback, *, unit: str | None = None) -> None:
+                kwargs: dict[str, Any] = {"callbacks": [callback]}
+                if unit:
+                    kwargs["unit"] = unit
+                meter.create_observable_gauge(name, **kwargs)
+
+            def _scalar(field: str):
+                def _callback(_options):
+                    value = _metric_number(self.stats().get(field))
+                    if value is None:
+                        return []
+                    return [Observation(value, _attrs())]
+
+                return _callback
+
+            for key in (
+                "refs",
+                "meta",
+                "expired",
+                "retrieved",
+                "execution_timeout_s",
+                "queue_timeout_s",
+                "result_ttl_s",
+                "tombstone_ttl_s",
+            ):
+                _gauge(f"mint_task_futures_{key}", _scalar(key), unit="s" if key.endswith("_s") else None)
+
+            def _future_count(field: str):
+                def _callback(_options):
+                    stats = self.stats()
+                    observations = []
+                    value = _metric_number(stats.get(field))
+                    if value is not None:
+                        observations.append(Observation(value, _attrs()))
+                    by_op = stats.get("by_op")
+                    if not isinstance(by_op, dict):
+                        return observations
+                    for op, rec in sorted(by_op.items()):
+                        if not isinstance(rec, dict):
+                            continue
+                        op_value = _metric_number(rec.get(field))
+                        if op_value is None:
+                            continue
+                        observations.append(Observation(op_value, _attrs(op=op)))
+                    return observations
+
+                return _callback
+
+            _gauge("mint_task_futures_pending", _future_count("pending"))
+            _gauge("mint_task_futures_results", _future_count("results"))
+            _gauge("mint_task_futures_errors", _future_count("errors"))
+
+            def _nested_scalar(section: str, field: str):
+                def _callback(_options):
+                    section_value = self.stats().get(section)
+                    if not isinstance(section_value, dict):
+                        return []
+                    value = _metric_number(section_value.get(field))
+                    if value is None:
+                        return []
+                    return [Observation(value, _attrs())]
+
+                return _callback
+
+            for field in ("oldest_pending_s", "oldest_done_s", "avg_pending_s", "avg_done_s"):
+                _gauge(f"mint_task_futures_{field}", _nested_scalar("age_stats", field), unit="s")
+            _gauge("mint_task_futures_result_refs_count", _nested_scalar("payload_stats", "result_refs_count"))
+            _gauge("mint_task_futures_errors_count", _nested_scalar("payload_stats", "errors_count"))
+            _gauge("mint_task_futures_refs_count", _nested_scalar("payload_stats", "refs_count"))
+
+            def _billing_status(field: str):
+                def _callback(_options):
+                    billing = self.stats().get("billing_outbox")
+                    by_status = billing.get("by_status") if isinstance(billing, dict) else None
+                    if not isinstance(by_status, dict):
+                        return []
+                    observations = []
+                    for status, rec in sorted(by_status.items()):
+                        if not isinstance(rec, dict):
+                            continue
+                        value = _metric_number(rec.get(field))
+                        if value is None:
+                            continue
+                        observations.append(Observation(value, _attrs(status=status)))
+                    return observations
+
+                return _callback
+
+            _gauge("mint_billing_outbox_rows", _billing_status("rows"))
+            _gauge("mint_billing_outbox_oldest_age_s", _billing_status("oldest_age_s"), unit="s")
+
+            def _billing_metric(field: str, labels: dict[str, str] | None = None):
+                def _callback(_options):
+                    billing = self.stats().get("billing_outbox")
+                    metrics_map = billing.get("metrics") if isinstance(billing, dict) else None
+                    if not isinstance(metrics_map, dict):
+                        return []
+                    value = _metric_number(metrics_map.get(field))
+                    if value is None:
+                        return []
+                    return [Observation(value, _attrs(**dict(labels or {})))]
+
+                return _callback
+
+            def _billing_metric_by_result(mapping: tuple[tuple[str, str], ...]):
+                def _callback(_options):
+                    billing = self.stats().get("billing_outbox")
+                    metrics_map = billing.get("metrics") if isinstance(billing, dict) else None
+                    if not isinstance(metrics_map, dict):
+                        return []
+                    observations = []
+                    for result, field in mapping:
+                        value = _metric_number(metrics_map.get(field))
+                        if value is None:
+                            continue
+                        observations.append(Observation(value, _attrs(result=result)))
+                    return observations
+
+                return _callback
+
+            _gauge(
+                "mint_billing_outbox_flush_attempts_total",
+                _billing_metric_by_result(
+                    (
+                        ("success", "flush_success"),
+                        ("transient_error", "flush_transient_error"),
+                        ("permanent_error", "flush_permanent_error"),
+                    )
+                ),
+            )
+            _gauge(
+                "mint_billing_outbox_events_total",
+                _billing_metric_by_result(
+                    (
+                        ("inserted", "event_inserted"),
+                        ("conflict", "event_conflict"),
+                        ("failed", "event_failed"),
+                    )
+                ),
+            )
+            _gauge("mint_billing_outbox_write_errors_total", _billing_metric("write_error"))
+            _gauge("mint_billing_outbox_conflict_total", _billing_metric("outbox_conflict"))
+            _gauge(
+                "mint_billing_observation_skipped_total",
+                _billing_metric("skipped_missing_billing_context", {"reason": "missing_billing_context"}),
+            )
+            self._otel_enabled = True
+        except Exception as e:
+            self._otel_error = f"{type(e).__name__}: {e}"
 
     def ping(self) -> dict[str, Any]:
         out = self._store.ping()
