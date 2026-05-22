@@ -125,8 +125,7 @@ Call other skills only for their bounded responsibility:
 - `mint-prod`: production API process, production checkout, production logs, production config, and production server restart when evidence shows the API process itself is unhealthy.
 - `mint-dev`: development server only. Do not use it for production sanity-check remediation.
 - `mint-ops`: internal `/internal/*` actor inventory, model-specific actor kill, scheduler/admission/deep health, and Ray diagnostics through Mint control-plane APIs.
-- `ops` + `obsh`: incident evidence from request ids, trace ids, error text, endpoints, Victoria/Grafana signals, or a narrow time window. Prefer `obsh` over ad-hoc log tail when an id or time window exists.
-- `telemetry-direct-query`: direct Victoria queries only when `obsh` is unavailable or too limited.
+- `telemetry-query`: incident evidence from request ids, trace ids, error text, endpoints, Victoria/Grafana signals, metrics, or a narrow time window.
 - `volcano-cluster`: GPU worker lifecycle, Volcano job/node state, placement-group cleanup, and worker node recovery. Do not run local `ray` or `volc` commands.
 - `issue-reporter`: GitHub issue creation after evidence supports an implementation or production defect.
 
@@ -134,7 +133,7 @@ Capability split:
 - This skill decides pass/fail, preserves artifacts, sends the final report, and coordinates reruns.
 - Runtime remediation belongs to `mint-ops`/`mint-prod`.
 - Cluster remediation belongs to `volcano-cluster`.
-- Observability evidence belongs to `ops`/`obsh` or `telemetry-direct-query`.
+- Observability evidence belongs to `telemetry-query`.
 - Development validation belongs to `mint-dev`, not this production workflow.
 
 ### 1) Run the five RL loops

@@ -100,7 +100,7 @@ class VictoriaClient:
             url,
             headers={
                 "Accept": "application/json,text/plain;q=0.9,*/*;q=0.8",
-                "User-Agent": "mint-telemetry-direct-query/1",
+                "User-Agent": "mint-telemetry-query/1",
             },
         )
         try:

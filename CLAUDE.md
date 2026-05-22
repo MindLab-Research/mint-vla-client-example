@@ -7,7 +7,7 @@
 | `mint-dev` | Development server on `mint-dev` (port 8000, no auth) |
 | `mint-prod` | Production server on `mint-prod` (port 18000, auth required) |
 | `mintx` | Mint-only API extensions under `/api/v1/mint` and `mint.mint`; keep code and docs synced |
-| `telemetry-direct-query` | Query VictoriaLogs, VictoriaTraces, and VictoriaMetrics directly with curl, HTTPie, or Python when `obsh` is unavailable |
+| `telemetry-query` | Query VictoriaLogs, VictoriaTraces, and VictoriaMetrics with the project helper, HTTPie, or curl |
 | `volcano-cluster` | Ray cluster lifecycle (create/teardown worker tasks) |
 | `aliyun-cluster` | Aliyun DLC cluster lifecycle (create/stop/list jobs, logs) |
 | `merge-gate` | Pre-merge testing |

@@ -4,7 +4,7 @@ description: |
   Architectural design reference for mint-server (MinT).
 
   Use for: understanding or changing system boundaries (FastAPI routes, Ray actor lifecycles,
-  training vs inference backends, weight transfer, and GPU scheduling via ModelActorSupervisor/ModelWorkScheduler).
+  training vs inference backends, weight transfer, observability design, and GPU scheduling via ModelActorSupervisor/ModelWorkScheduler).
 
   Triggers: "architecture", "system design", "refactor", "add endpoint", "Ray actor",
   "training/inference", "weights transfer", "session lifecycle", "model actor registry"
@@ -26,6 +26,7 @@ Read `references/architecture.md` first (index). For design intent, read `refere
 - Weights and checkpoints: `references/weights-checkpoints.md`
 - Auto eviction and GPU allocation: `references/eviction.md`
 - Authentication and model access: `references/auth-access.md`
+- Observability architecture and OTel conventions: `references/observability.md`
 - Design constraints and change checklist: `references/constraints-checklist.md`
 
 When a change crosses a boundary, write down (in your own scratch notes) the answers to:
