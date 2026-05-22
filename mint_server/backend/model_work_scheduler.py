@@ -1270,7 +1270,7 @@ def _create_ray_actor(*, require_ready: bool = True):
     import ray
 
     actor_name = _ray_model_work_scheduler_actor_name()
-    max_concurrency = int(os.environ.get("MINT_MODEL_WORK_SCHEDULER_ACTOR_MAX_CONCURRENCY", "256"))
+    max_concurrency = int(os.environ.get("MINT_MODEL_WORK_SCHEDULER_ACTOR_MAX_CONCURRENCY", "64"))
     options: dict[str, Any] = {
         "name": actor_name,
         "namespace": _ray_namespace(),
@@ -1284,9 +1284,16 @@ def _create_ray_actor(*, require_ready: bool = True):
     else:
         apply_detached_actor_resources(options, ray)
 
-    @ray.remote(num_cpus=0, max_concurrency=max_concurrency, max_restarts=0)
+    @ray.remote(
+        num_cpus=0,
+        max_concurrency=max_concurrency,
+        max_restarts=0,
+        concurrency_groups={"health": 8},
+    )
     class _RayModelWorkSchedulerActor(_ModelWorkSchedulerActor):
-        pass
+        @ray.method(concurrency_group="health")
+        def ping(self) -> dict[str, Any]:
+            return super().ping()
 
     actor = _RayModelWorkSchedulerActor.options(**options).remote(use_task_state_store=True)
     if require_ready:
