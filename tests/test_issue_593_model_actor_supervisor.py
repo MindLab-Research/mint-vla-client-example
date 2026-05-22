@@ -932,9 +932,8 @@ async def test_issue_593_supervisor_bootstrap_starts_reconcile_loop() -> None:
 
     out = await supervisor.ensure_reconcile_loop_started()
     try:
-        assert calls == ["ensure"]
+        assert calls == []
         assert out["reconcile_loop_running"] is True
-        assert out["last_reconcile_at"] is not None
     finally:
         task = supervisor._reconcile_task
         if task is not None:

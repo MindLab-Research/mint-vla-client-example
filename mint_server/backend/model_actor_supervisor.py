@@ -2190,7 +2190,6 @@ class ModelActorSupervisorCore:
     async def ensure_reconcile_loop_started(self) -> dict[str, Any]:
         if self._reconcile_task is not None and not self._reconcile_task.done():
             return self.snapshot()
-        await self.reconcile_once()
         self._reconcile_task = asyncio.create_task(self._reconcile_loop())
         return self.snapshot()
 
