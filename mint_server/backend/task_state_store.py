@@ -13,7 +13,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Iterator
 
-from ..config import PFS_PYTHONPATH, actor_runtime_env, config as server_config, otel_env_vars
+from ..config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources, config as server_config, otel_env_vars
 from ..runtime_env import env_nonempty
 from .async_ray_control import async_get_ray_ref, sync_get_ray_ref
 from .model_work_execution_context import ModelWorkFinalize, get_current_model_work_finalize_buffer
@@ -2639,6 +2639,31 @@ def _task_state_store_db_path() -> str:
     )
 
 
+class _LockedTaskStateStore:
+    """Serialize store calls made by concurrent Ray actor tasks.
+
+    Ray may run synchronous actor methods on multiple worker threads when
+    max_concurrency is greater than one. The store owns one SQLite connection
+    and in-memory indexes, so actor-level access must be serialized while still
+    allowing long-poll waiters to block outside the lock.
+    """
+
+    def __init__(self, store: TaskStateStore, lock: threading.RLock) -> None:
+        self._store = store
+        self._lock = lock
+
+    def __getattr__(self, name: str) -> Any:
+        attr = getattr(self._store, name)
+        if not callable(attr):
+            return attr
+
+        def _locked(*args: Any, **kwargs: Any) -> Any:
+            with self._lock:
+                return attr(*args, **kwargs)
+
+        return _locked
+
+
 class _TaskStateStoreActor:
     def __init__(self, db_path: str | None = None) -> None:
         try:
@@ -2648,10 +2673,17 @@ class _TaskStateStoreActor:
         except Exception:
             pass
         self._started_at = time.time()
-        self._store = TaskStateStore(db_path or _task_state_store_db_path())
-        self._watchers: dict[str, list[tuple[asyncio.AbstractEventLoop, asyncio.Event]]] = {}
+        self._lock = threading.RLock()
+        self._store = _LockedTaskStateStore(
+            TaskStateStore(db_path or _task_state_store_db_path()),
+            self._lock,
+        )
+        self._watchers: dict[str, list[threading.Event]] = {}
         self._watcher_count = 0
         self._watcher_limit = max(1, int(os.environ.get("MINT_TASK_STATE_STORE_WATCHER_MAX", "8192")))
+        self._stats_cache: dict[str, Any] | None = None
+        self._stats_cache_at = 0.0
+        self._stats_cache_ttl_s = max(0.0, float(os.environ.get("MINT_TASK_STATE_STORE_STATS_CACHE_TTL_S", "5")))
         self._otel_enabled = False
         self._otel_error: str | None = None
         self._init_otel_metrics()
@@ -2689,46 +2721,45 @@ class _TaskStateStoreActor:
     def _add_watcher(
         self,
         request_id: str,
-        loop: asyncio.AbstractEventLoop,
-        event: asyncio.Event,
+        event: threading.Event,
     ) -> bool:
-        if self._watcher_count >= self._watcher_limit:
-            return False
-        self._watchers.setdefault(str(request_id), []).append((loop, event))
-        self._watcher_count += 1
-        return True
+        with self._lock:
+            if self._watcher_count >= self._watcher_limit:
+                return False
+            self._watchers.setdefault(str(request_id), []).append(event)
+            self._watcher_count += 1
+            return True
 
-    def _remove_watcher(self, request_id: str, event: asyncio.Event) -> None:
-        waiters = self._watchers.get(str(request_id))
-        if not waiters:
-            return
-        kept: list[tuple[asyncio.AbstractEventLoop, asyncio.Event]] = []
-        removed = 0
-        for waiter in waiters:
-            if waiter[1] is event:
-                removed += 1
+    def _remove_watcher(self, request_id: str, event: threading.Event) -> None:
+        with self._lock:
+            waiters = self._watchers.get(str(request_id))
+            if not waiters:
+                return
+            kept: list[threading.Event] = []
+            removed = 0
+            for waiter in waiters:
+                if waiter is event:
+                    removed += 1
+                else:
+                    kept.append(waiter)
+            if kept:
+                self._watchers[str(request_id)] = kept
             else:
-                kept.append(waiter)
-        if kept:
-            self._watchers[str(request_id)] = kept
-        else:
-            self._watchers.pop(str(request_id), None)
-        self._watcher_count = max(0, self._watcher_count - removed)
+                self._watchers.pop(str(request_id), None)
+            self._watcher_count = max(0, self._watcher_count - removed)
 
     def _notify_task_changed(self, request_id: str | None) -> None:
         if request_id is None:
             return
-        waiters = self._watchers.pop(str(request_id), [])
-        if not waiters:
-            return
-        self._watcher_count = max(0, self._watcher_count - len(waiters))
-        for loop, event in waiters:
-            try:
-                loop.call_soon_threadsafe(event.set)
-            except RuntimeError:
-                pass
+        with self._lock:
+            waiters = self._watchers.pop(str(request_id), [])
+            if not waiters:
+                return
+            self._watcher_count = max(0, self._watcher_count - len(waiters))
+        for event in waiters:
+            event.set()
 
-    async def wait_task_status_change(
+    def wait_task_status_change(
         self,
         *,
         request_id: str,
@@ -2765,9 +2796,8 @@ class _TaskStateStoreActor:
             remaining_s = deadline - time.monotonic()
             if remaining_s <= 0:
                 return {"changed": False, "timeout": True, "record": latest}
-            loop = asyncio.get_running_loop()
-            event = asyncio.Event()
-            if not self._add_watcher(request_id, loop, event):
+            event = threading.Event()
+            if not self._add_watcher(request_id, event):
                 return {
                     "changed": False,
                     "watch_skipped": True,
@@ -2786,8 +2816,10 @@ class _TaskStateStoreActor:
                         return {"changed": True, "missing": True, "request_id": request_id}
                     return {"changed": True, "record": latest}
                 try:
-                    await asyncio.wait_for(event.wait(), timeout=remaining_s)
-                except asyncio.TimeoutError:
+                    signaled = event.wait(timeout=max(0.0, remaining_s))
+                except Exception:
+                    signaled = False
+                if not signaled:
                     latest = self._read_task_or_none(request_id)
                     if self._record_changed(
                         latest,
@@ -2814,13 +2846,17 @@ class _TaskStateStoreActor:
                 self._remove_watcher(request_id, event)
 
     def stats(self) -> dict[str, Any]:
+        now = time.monotonic()
+        cached = self._stats_cache
+        if cached is not None and now - self._stats_cache_at <= self._stats_cache_ttl_s:
+            return dict(cached)
         active = self._store.list_active_tasks()
         by_status: dict[str, int] = {}
         for record in active:
             status = str(record.get("status") or "unknown")
             by_status[status] = by_status.get(status, 0) + 1
         future_stats = self._store.future_metrics_stats()
-        return {
+        out = {
             "actor_name": _ray_task_state_store_actor_name(),
             "namespace": _ray_namespace(),
             "db_path": self._store.db_path,
@@ -2832,6 +2868,9 @@ class _TaskStateStoreActor:
             "task_future_reaper": task_future_reaper_metrics_snapshot(),
             "billing_outbox": self._store.billing_outbox_stats(),
         }
+        self._stats_cache = dict(out)
+        self._stats_cache_at = time.monotonic()
+        return out
 
     def _init_otel_metrics(self) -> None:
         endpoint = (os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT") or "").strip()
@@ -3303,11 +3342,12 @@ def _create_ray_actor(*, require_ready: bool = True):
         "get_if_exists": True,
         "runtime_env": actor_runtime_env(pythonpath=PFS_PYTHONPATH, extra=otel_env_vars()),
     }
+    apply_detached_actor_resources(options, ray)
     actor = _RayTaskStateStoreActor.options(**options).remote(db_path)
     if require_ready:
-        out = sync_get_ray_ref(actor.stats.remote(), timeout_s=5.0)
+        out = sync_get_ray_ref(actor.ping.remote(), timeout_s=5.0)
         if not isinstance(out, dict):
-            raise TypeError(f"TaskStateStore.stats returned non-dict: {type(out)}")
+            raise TypeError(f"TaskStateStore.ping returned non-dict: {type(out)}")
     return actor
 
 
@@ -3407,9 +3447,16 @@ class TaskStateStoreClient:
         create_if_missing: bool = False,
     ) -> dict[str, Any]:
         actor = self._get_ray_actor_sync(require_ready=False, create_if_missing=create_if_missing)
-        out = sync_get_ray_ref(actor.stats.remote(), timeout_s=timeout_s)
+        try:
+            out = sync_get_ray_ref(actor.ping.remote(), timeout_s=timeout_s)
+        except Exception:
+            self._reset_ray_actor()
+            if not create_if_missing:
+                raise
+            actor = self._get_ray_actor_sync(require_ready=False, create_if_missing=True)
+            out = sync_get_ray_ref(actor.ping.remote(), timeout_s=timeout_s)
         if not isinstance(out, dict):
-            raise TypeError(f"TaskStateStore.stats returned non-dict: {type(out)}")
+            raise TypeError(f"TaskStateStore.ping returned non-dict: {type(out)}")
         return out
 
     def ensure_started(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
@@ -3442,9 +3489,16 @@ class TaskStateStoreClient:
         create_if_missing: bool = False,
     ) -> dict[str, Any]:
         actor = await self._get_ray_actor_async(require_ready=False, create_if_missing=create_if_missing)
-        out = await async_get_ray_ref(actor.stats.remote(), timeout_s=timeout_s)
+        try:
+            out = await async_get_ray_ref(actor.ping.remote(), timeout_s=timeout_s)
+        except Exception:
+            self._reset_ray_actor()
+            if not create_if_missing:
+                raise
+            actor = await self._get_ray_actor_async(require_ready=False, create_if_missing=True)
+            out = await async_get_ray_ref(actor.ping.remote(), timeout_s=timeout_s)
         if not isinstance(out, dict):
-            raise TypeError(f"TaskStateStore.stats returned non-dict: {type(out)}")
+            raise TypeError(f"TaskStateStore.ping returned non-dict: {type(out)}")
         return out
 
     async def async_ping(self, *, timeout_s: float = 5.0) -> dict[str, Any]:

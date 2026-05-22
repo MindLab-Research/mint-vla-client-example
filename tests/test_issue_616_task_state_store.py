@@ -37,12 +37,12 @@ def test_task_state_store_client_async_ensure_ready_can_create_actor(monkeypatch
 
     calls: dict[str, object] = {}
 
-    class _StatsRemote:
+    class _PingRemote:
         def remote(self) -> dict[str, object]:
-            return {"actor_name": "mint_task_state_store", "active_tasks": 0}
+            return {"ok": True, "actor_name": "mint_task_state_store"}
 
     class _Actor:
-        stats = _StatsRemote()
+        ping = _PingRemote()
 
     async def _fake_async_get_ray_ref(ref, *, timeout_s=10.0):
         calls["timeout_s"] = timeout_s
@@ -60,7 +60,7 @@ def test_task_state_store_client_async_ensure_ready_can_create_actor(monkeypatch
     client = TaskStateStoreClient()
     out = asyncio.run(client.async_ensure_ready(timeout_s=7.0, create_if_missing=True))
 
-    assert out == {"actor_name": "mint_task_state_store", "active_tasks": 0}
+    assert out == {"ok": True, "actor_name": "mint_task_state_store"}
     assert calls == {"require_ready": False, "timeout_s": 7.0}
 
 
@@ -77,7 +77,8 @@ def test_task_state_store_actor_wait_status_change_notifies(tmp_path) -> None:
             )
 
             waiter = asyncio.create_task(
-                actor.wait_task_status_change(
+                asyncio.to_thread(
+                    actor.wait_task_status_change,
                     request_id="req-watch",
                     timeout_s=1.0,
                 )
@@ -252,7 +253,8 @@ def test_task_state_store_actor_wait_status_change_times_out(tmp_path) -> None:
                 now=1.0,
             )
 
-            out = await actor.wait_task_status_change(
+            out = await asyncio.to_thread(
+                actor.wait_task_status_change,
                 request_id="req-watch-timeout",
                 timeout_s=0.01,
             )
@@ -280,7 +282,8 @@ def test_task_state_store_actor_wait_terminal_only_ignores_active_progress(tmp_p
             )
 
             waiter = asyncio.create_task(
-                actor.wait_task_status_change(
+                asyncio.to_thread(
+                    actor.wait_task_status_change,
                     request_id="req-terminal-watch",
                     timeout_s=1.0,
                     terminal_only=True,

@@ -188,6 +188,11 @@ def otel_env_vars() -> dict[str, str]:
 def preferred_control_plane_resources(cluster_resources: dict[str, float] | None) -> dict[str, float] | None:
     if not cluster_resources:
         return None
+    configured_node_ip = _env_nonempty(os.environ, "MINT_CONTROL_PLANE_NODE_IP")
+    if configured_node_ip is not None:
+        configured_node_key = f"node:{configured_node_ip}"
+        if configured_node_key in cluster_resources:
+            return {configured_node_key: 0.001}
     try:
         from ray.util import get_node_ip_address
 
@@ -244,6 +249,7 @@ def actor_runtime_env_vars(
         "MINT_RAY_CLIENT_ADDRESS",
         "RAY_CLIENT_ADDRESS",
         "MINT_RAY_NODE_IP_ADDRESS",
+        "MINT_CONTROL_PLANE_NODE_IP",
         "MINT_RAY_TEMP_DIR",
         "MINT_RAY_JOB_WORKING_DIR",
         "MINT_RAY_WORKING_DIR",
