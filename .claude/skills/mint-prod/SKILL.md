@@ -31,7 +31,7 @@ auth-required; do not guess process names, paths, or credentials.
 | Runtime root | `/vePFS-Mindverse/share/mint/prod/runtime` |
 | Public config | `/vePFS-Mindverse/share/mint/prod/config/prod.env` |
 | Private config | `/vePFS-Mindverse/share/mint/prod/config/secrets.env` |
-| Log file | `/vePFS-Mindverse/share/mint/prod/logs/tinker_server_auth.log` |
+| Log file | `/vePFS-Mindverse/share/mint/prod/logs/mint_server_auth.log` |
 
 Production config is split deliberately:
 - `prod.env`: non-secret deployment config such as port, Ray address, runtime
@@ -107,7 +107,7 @@ target for restart. Do not use broad `pkill` patterns in production.
 
 ```bash
 curl http://localhost:18000/api/v1/healthz
-ssh mint-prod-volcano 'tail -n 200 /vePFS-Mindverse/share/mint/prod/logs/tinker_server_auth.log'
+ssh mint-prod-volcano 'tail -n 200 /vePFS-Mindverse/share/mint/prod/logs/mint_server_auth.log'
 ssh mint-prod-volcano 'ps aux | grep "[s]cripts/run_server.py"'
 ```
 

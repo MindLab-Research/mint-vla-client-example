@@ -434,7 +434,7 @@ class NodeMetricsCollectorActor:
                 return observations
 
             def _collector_up(_options):
-                return [Observation(0.0 if self._last_error else 1.0, self._metric_attrs())]
+                return [Observation(0.0 if self._last_error or self._otel_error else 1.0, self._metric_attrs())]
 
             def _sample_age(_options):
                 if self._last_sample_at is None:

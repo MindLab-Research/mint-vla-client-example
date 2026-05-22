@@ -1751,6 +1751,39 @@ def test_issue_627_node_metrics_daemon_registers_expected_otel_gauges(
         actor.shutdown()
 
 
+def test_issue_638_node_metrics_collector_up_reflects_otel_init_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opentelemetry.metrics as otel_metrics
+
+    callbacks: dict[str, object] = {}
+
+    class _FailingMeter:
+        def create_observable_gauge(self, name, **kwargs):
+            callbacks[name] = kwargs["callbacks"][0]
+            if name == "mint_node_metrics_collector_sample_age_s":
+                raise RuntimeError("otel gauge registration failed")
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4317")
+    monkeypatch.setattr(otel_metrics, "get_meter", lambda _name: _FailingMeter())
+
+    actor = node_metrics_daemon_module.NodeMetricsCollectorActor(
+        worker_alias="mint-worker-0",
+        node_ip="10.0.0.7",
+        deployment_env="prod",
+        cluster_id="volcano",
+    )
+    try:
+        snapshot = actor.health_snapshot()
+        assert snapshot["otel_enabled"] is False
+        assert "otel gauge registration failed" in str(snapshot["otel_error"])
+        actor.sample_once()
+        obs = callbacks["mint_node_metrics_collector_up"](None)
+        assert obs[0].value == 0.0
+    finally:
+        actor.shutdown()
+
+
 def test_issue_638_node_metrics_daemon_registers_head_ray_global_otel_gauges(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
