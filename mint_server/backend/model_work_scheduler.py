@@ -46,6 +46,37 @@ def _ray_model_work_scheduler_actor_name() -> str:
     return str(getattr(server_config, "model_work_scheduler_actor_name", "mint_model_work_scheduler"))
 
 
+def _otel_metric_attrs() -> dict[str, str]:
+    attrs = {
+        "deployment.env": os.getenv("MINT_DEPLOYMENT_ENV", "").strip(),
+        "mint.cluster_id": os.getenv("MINT_CLUSTER_ID", "").strip(),
+        "ray_namespace": _ray_namespace(),
+    }
+    return {key: value for key, value in attrs.items() if value}
+
+
+def _metric_number(value: object) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _scheduler_domain_base_model(domain_key: object) -> str | None:
+    domain = str(domain_key or "").strip()
+    if not domain or ":" not in domain:
+        return None
+    backend, model = domain.split(":", 1)
+    if backend.strip().lower() != "vllm":
+        return None
+    model = model.strip()
+    return model or None
+
+
 def _model_work_scheduler_actor_resources() -> dict[str, float] | None:
     try:
         import ray
@@ -240,6 +271,12 @@ class _ModelWorkSchedulerActor:
         task_state_store: Any | None = None,
         owner_id: str | None = None,
     ) -> None:
+        try:
+            from ..logging_context import init_actor_observability
+
+            init_actor_observability()
+        except Exception:
+            logger.debug("[model_work_scheduler] actor observability init skipped", exc_info=True)
         self._cv = asyncio.Condition()
         self._instance_id = uuid.uuid4().hex
         self._owner_id = owner_id or f"{_ray_model_work_scheduler_actor_name()}:{self._instance_id}"
@@ -264,7 +301,174 @@ class _ModelWorkSchedulerActor:
         self._assignment_loop_interval_s = float(
             os.environ.get("MINT_MODEL_WORK_SCHEDULER_ASSIGNMENT_INTERVAL_S", "1.0")
         )
+        self._otel_enabled = False
+        self._otel_error: str | None = None
+        self._init_otel_metrics()
         self._ensure_assignment_loop_started()
+
+    def _init_otel_metrics(self) -> None:
+        endpoint = (os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT") or "").strip()
+        if not endpoint:
+            return
+        try:
+            from opentelemetry import metrics
+            from opentelemetry.metrics import Observation
+
+            meter = metrics.get_meter("mint.model_work_scheduler")
+
+            def _attrs(**extra: object) -> dict[str, str]:
+                attrs = _otel_metric_attrs()
+                for key, value in extra.items():
+                    text = str(value if value is not None else "").strip()
+                    if text:
+                        attrs[key] = text
+                return attrs
+
+            def _gauge(name: str, callback, *, unit: str | None = None) -> None:
+                kwargs: dict[str, Any] = {"callbacks": [callback]}
+                if unit:
+                    kwargs["unit"] = unit
+                meter.create_observable_gauge(name, **kwargs)
+
+            def _scalar(field: str):
+                def _callback(_options):
+                    value = _metric_number(self.stats().get(field))
+                    if value is None:
+                        return []
+                    return [Observation(value, _attrs())]
+
+                return _callback
+
+            _gauge("mint_model_work_scheduler_depth", _scalar("depth"))
+            _gauge("mint_model_work_scheduler_backlog_depth", _scalar("backlog_depth"))
+
+            def _counter(field: str):
+                def _callback(_options):
+                    counters = self.stats().get("counters")
+                    if not isinstance(counters, dict):
+                        return []
+                    value = _metric_number(counters.get(field))
+                    if value is None:
+                        return []
+                    return [Observation(value, _attrs())]
+
+                return _callback
+
+            for key in ("appended", "assigned", "claimed", "completed", "failed", "requeued"):
+                _gauge(f"mint_model_work_scheduler_{key}_total", _counter(key))
+
+            def _domain_backlog(_options):
+                backlog_by_domain = self.stats().get("backlog_depth_by_domain")
+                if not isinstance(backlog_by_domain, dict):
+                    return []
+                observations = []
+                for domain_key, depth in sorted(backlog_by_domain.items()):
+                    value = _metric_number(depth)
+                    if value is None:
+                        continue
+                    observations.append(Observation(value, _attrs(domain_key=domain_key)))
+                return observations
+
+            _gauge("mint_model_work_scheduler_domain_backlog_depth", _domain_backlog)
+
+            def _replica_queue_depth(_options):
+                replica_queues = self.stats().get("replica_queues")
+                if not isinstance(replica_queues, dict):
+                    return []
+                observations = []
+                for queue_id, rec in sorted(replica_queues.items()):
+                    if not isinstance(rec, dict):
+                        continue
+                    value = _metric_number(rec.get("depth"))
+                    if value is None:
+                        continue
+                    observations.append(
+                        Observation(
+                            value,
+                            _attrs(
+                                domain_key=rec.get("domain_key") or "unknown",
+                                replica_id=rec.get("replica_id") or "unknown",
+                                queue_id=queue_id,
+                                status=rec.get("status") or "unknown",
+                            ),
+                        )
+                    )
+                return observations
+
+            _gauge("mint_model_work_scheduler_replica_queue_depth", _replica_queue_depth)
+
+            def _leases(_options):
+                leases = self.stats().get("leases")
+                if not isinstance(leases, list):
+                    return []
+                return [Observation(float(len(leases)), _attrs())]
+
+            _gauge("mint_model_work_scheduler_leases", _leases)
+
+            def _sample_model_load(metric: str):
+                def _callback(_options):
+                    stats = self.stats()
+                    load: dict[str, dict[str, float]] = {}
+                    replica_queues = stats.get("replica_queues")
+                    if isinstance(replica_queues, dict):
+                        for rec in replica_queues.values():
+                            if not isinstance(rec, dict):
+                                continue
+                            base_model = _scheduler_domain_base_model(rec.get("domain_key"))
+                            if not base_model:
+                                continue
+                            bucket = load.setdefault(
+                                base_model,
+                                {"pending_requests": 0.0, "inflight_workers": 0.0, "capacity_workers": 0.0},
+                            )
+                            bucket["pending_requests"] += float(_metric_number(rec.get("depth")) or 0.0)
+                            if str(rec.get("status") or "").lower() in CLAIMABLE_REPLICA_STATUSES:
+                                bucket["capacity_workers"] += 1.0
+                    leases = stats.get("leases")
+                    if isinstance(leases, list):
+                        for lease in leases:
+                            if not isinstance(lease, dict):
+                                continue
+                            item = lease.get("item") if isinstance(lease.get("item"), dict) else {}
+                            base_model = _scheduler_domain_base_model(
+                                item.get("domain_key") or lease.get("domain_key")
+                            )
+                            if not base_model:
+                                continue
+                            bucket = load.setdefault(
+                                base_model,
+                                {"pending_requests": 0.0, "inflight_workers": 0.0, "capacity_workers": 0.0},
+                            )
+                            bucket["inflight_workers"] += 1.0
+                    observations = []
+                    for base_model, bucket in sorted(load.items()):
+                        capacity = float(bucket.get("capacity_workers", 0.0))
+                        values = {
+                            "pending_requests": float(bucket.get("pending_requests", 0.0)),
+                            "inflight_workers": float(bucket.get("inflight_workers", 0.0)),
+                            "capacity_workers": capacity,
+                            "load_pct": 0.0
+                            if capacity <= 0.0
+                            else 100.0 * float(bucket.get("inflight_workers", 0.0)) / capacity,
+                        }
+                        observations.append(
+                            Observation(
+                                values[metric],
+                                _attrs(base_model=base_model, workload="sample"),
+                            )
+                        )
+                    return observations
+
+                return _callback
+
+            _gauge("mint_model_load_pct", _sample_model_load("load_pct"))
+            _gauge("mint_model_pending_requests", _sample_model_load("pending_requests"))
+            _gauge("mint_model_inflight_workers", _sample_model_load("inflight_workers"))
+            _gauge("mint_model_capacity_workers", _sample_model_load("capacity_workers"))
+
+            self._otel_enabled = True
+        except Exception as e:
+            self._otel_error = f"{type(e).__name__}: {e}"
 
     def _all_request_ids(self) -> set[str]:
         return set(self._request_locations)

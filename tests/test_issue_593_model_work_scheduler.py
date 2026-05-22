@@ -96,6 +96,101 @@ def test_scheduler_default_actor_name_uses_mint_prefix(monkeypatch: pytest.Monke
     assert _ray_model_work_scheduler_actor_name() == "mint_model_work_scheduler"
 
 
+def test_issue_638_scheduler_registers_actor_observability(monkeypatch: pytest.MonkeyPatch) -> None:
+    import mint_server.logging_context as logging_context
+
+    calls = {"count": 0}
+    monkeypatch.setattr(logging_context, "init_actor_observability", lambda: calls.__setitem__("count", calls["count"] + 1))
+
+    _ModelWorkSchedulerActor()
+
+    assert calls["count"] == 1
+
+
+def test_issue_638_scheduler_registers_otel_gauges(monkeypatch: pytest.MonkeyPatch) -> None:
+    import opentelemetry.metrics as otel_metrics
+
+    import mint_server.logging_context as logging_context
+
+    gauges: dict[str, list] = {}
+
+    class _FakeMeter:
+        def create_observable_gauge(self, name, **kwargs):
+            gauges[name] = list(kwargs.get("callbacks") or [])
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel.example:4317")
+    monkeypatch.setattr(otel_metrics, "get_meter", lambda _name: _FakeMeter())
+    monkeypatch.setattr(logging_context, "init_actor_observability", lambda: None)
+
+    _ModelWorkSchedulerActor()
+
+    assert "mint_model_work_scheduler_depth" in gauges
+    assert "mint_model_work_scheduler_appended_total" in gauges
+    assert "mint_model_work_scheduler_domain_backlog_depth" in gauges
+    assert "mint_model_work_scheduler_replica_queue_depth" in gauges
+    assert "mint_model_work_scheduler_leases" in gauges
+    assert "mint_model_load_pct" in gauges
+    assert "mint_model_pending_requests" in gauges
+
+
+def test_issue_638_scheduler_otel_callbacks_emit_existing_dashboard_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opentelemetry.metrics as otel_metrics
+
+    import mint_server.logging_context as logging_context
+
+    gauges: dict[str, list] = {}
+
+    class _FakeMeter:
+        def create_observable_gauge(self, name, **kwargs):
+            gauges[name] = list(kwargs.get("callbacks") or [])
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel.example:4317")
+    monkeypatch.setenv("MINT_DEPLOYMENT_ENV", "prod")
+    monkeypatch.setenv("MINT_CLUSTER_ID", "volcano")
+    monkeypatch.setattr(otel_metrics, "get_meter", lambda _name: _FakeMeter())
+    monkeypatch.setattr(logging_context, "init_actor_observability", lambda: None)
+
+    actor = _ModelWorkSchedulerActor()
+
+    async def _setup() -> None:
+        await actor.sync_replicas([_replica("replica-0")])
+        await actor.append(_work("req-1"), assign=True)
+        claimed = await actor.claim_from_replica_queue(
+            domain_key="vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
+            replica_id="replica-0",
+            consumer_id="consumer-replica-0",
+            consumer_generation=10,
+            max_items=1,
+            lease_ttl_s=30.0,
+        )
+        assert len(claimed["leases"]) == 1
+
+    asyncio.run(_setup())
+
+    depth_obs = gauges["mint_model_work_scheduler_depth"][0](None)
+    assert depth_obs[0].value == 1.0
+    assert depth_obs[0].attributes["deployment.env"] == "prod"
+    assert depth_obs[0].attributes["mint.cluster_id"] == "volcano"
+
+    queue_obs = gauges["mint_model_work_scheduler_replica_queue_depth"][0](None)
+    assert len(queue_obs) == 1
+    assert queue_obs[0].value == 0.0
+    assert queue_obs[0].attributes["domain_key"] == "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507"
+    assert queue_obs[0].attributes["replica_id"] == "replica-0"
+    assert queue_obs[0].attributes["queue_id"] == "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507::replica-0"
+    assert queue_obs[0].attributes["status"] == "healthy"
+
+    lease_obs = gauges["mint_model_work_scheduler_leases"][0](None)
+    assert lease_obs[0].value == 1.0
+
+    inflight_obs = gauges["mint_model_inflight_workers"][0](None)
+    assert inflight_obs[0].value == 1.0
+    assert inflight_obs[0].attributes["base_model"] == "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    assert inflight_obs[0].attributes["workload"] == "sample"
+
+
 def test_scheduler_append_can_assign_immediately() -> None:
     actor = _ModelWorkSchedulerActor()
 
