@@ -1831,6 +1831,11 @@ def test_issue_638_ray_global_otel_callbacks_use_bounded_labels(
     monkeypatch.setenv("MINT_RAY_NAMESPACE", "mint")
     monkeypatch.setattr(otel_metrics, "get_meter", lambda _name: _FakeMeter())
     monkeypatch.setattr(
+        node_metrics_daemon_module.NodeMetricsCollectorActor,
+        "_start_sampling_loop",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
         node_metrics_daemon_module,
         "_ray_cluster_snapshot",
         lambda: {
@@ -1869,6 +1874,17 @@ def test_issue_638_ray_global_otel_callbacks_use_bounded_labels(
         is_head_node=True,
     )
     try:
+        actor.sample_once(collect_ray_global=True)
+        monkeypatch.setattr(
+            node_metrics_daemon_module,
+            "_ray_cluster_snapshot",
+            lambda: (_ for _ in ()).throw(AssertionError("OTel callback must not probe Ray")),
+        )
+        monkeypatch.setattr(
+            node_metrics_daemon_module,
+            "_ray_gcs_snapshot",
+            lambda: (_ for _ in ()).throw(AssertionError("OTel callback must not scrape GCS")),
+        )
         observations = []
         for name in (
             "mint_ray_cluster_nodes",

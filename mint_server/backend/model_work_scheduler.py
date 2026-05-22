@@ -332,7 +332,7 @@ class _ModelWorkSchedulerActor:
 
             def _scalar(field: str):
                 def _callback(_options):
-                    value = _metric_number(self.stats().get(field))
+                    value = _metric_number(self._stats_snapshot().get(field))
                     if value is None:
                         return []
                     return [Observation(value, _attrs())]
@@ -344,7 +344,7 @@ class _ModelWorkSchedulerActor:
 
             def _counter(field: str):
                 def _callback(_options):
-                    counters = self.stats().get("counters")
+                    counters = self._stats_snapshot().get("counters")
                     if not isinstance(counters, dict):
                         return []
                     value = _metric_number(counters.get(field))
@@ -358,7 +358,7 @@ class _ModelWorkSchedulerActor:
                 _gauge(f"mint_model_work_scheduler_{key}_total", _counter(key))
 
             def _domain_backlog(_options):
-                backlog_by_domain = self.stats().get("backlog_depth_by_domain")
+                backlog_by_domain = self._stats_snapshot().get("backlog_depth_by_domain")
                 if not isinstance(backlog_by_domain, dict):
                     return []
                 observations = []
@@ -372,7 +372,7 @@ class _ModelWorkSchedulerActor:
             _gauge("mint_model_work_scheduler_domain_backlog_depth", _domain_backlog)
 
             def _replica_queue_depth(_options):
-                replica_queues = self.stats().get("replica_queues")
+                replica_queues = self._stats_snapshot().get("replica_queues")
                 if not isinstance(replica_queues, dict):
                     return []
                 observations = []
@@ -398,7 +398,7 @@ class _ModelWorkSchedulerActor:
             _gauge("mint_model_work_scheduler_replica_queue_depth", _replica_queue_depth)
 
             def _leases(_options):
-                leases = self.stats().get("leases")
+                leases = self._stats_snapshot().get("leases")
                 if not isinstance(leases, list):
                     return []
                 return [Observation(float(len(leases)), _attrs())]
@@ -407,7 +407,7 @@ class _ModelWorkSchedulerActor:
 
             def _sample_model_load(metric: str):
                 def _callback(_options):
-                    stats = self.stats()
+                    stats = self._stats_snapshot()
                     load: dict[str, dict[str, float]] = {}
                     replica_queues = stats.get("replica_queues")
                     if isinstance(replica_queues, dict):
@@ -1197,8 +1197,7 @@ class _ModelWorkSchedulerActor:
                 self._cv.notify_all()
             return {"ok": True, "expired": expired}
 
-    def stats(self) -> dict[str, Any]:
-        self._ensure_assignment_loop_started()
+    def _stats_snapshot(self) -> dict[str, Any]:
         now = time.time()
         backlog_depth_by_domain = {
             domain: len(backlog) for domain, backlog in sorted(self._domain_backlog.items())
@@ -1242,6 +1241,10 @@ class _ModelWorkSchedulerActor:
                 "requeued": self._requeued,
             },
         }
+
+    def stats(self) -> dict[str, Any]:
+        self._ensure_assignment_loop_started()
+        return self._stats_snapshot()
 
     def ping(self) -> dict[str, Any]:
         return {

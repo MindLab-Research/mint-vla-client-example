@@ -524,38 +524,53 @@ def _model_actor_inventory_gpu_bindings(rec: dict[str, object]) -> list[dict[str
         for binding in bindings:
             if not isinstance(binding, dict):
                 continue
-            gpu_index = binding.get("gpu_index")
             gpu_uuid = binding.get("gpu_uuid")
-            if gpu_index is None and not (isinstance(gpu_uuid, str) and gpu_uuid.strip()):
+            if not isinstance(gpu_uuid, str) or not gpu_uuid.strip():
                 continue
             labels = {
                 "actor_name": actor_name,
                 "workload": workload,
                 "hostname": str(binding.get("hostname") or metadata.get("hostname") or "unknown"),
+                "gpu_uuid": gpu_uuid.strip(),
             }
-            if gpu_index is not None:
-                labels["gpu_index"] = str(gpu_index)
-            if isinstance(gpu_uuid, str) and gpu_uuid.strip():
-                labels["gpu_uuid"] = gpu_uuid.strip()
             out.append(labels)
         if out:
             return out
 
-    gpu_indices = metadata.get("gpu_indices") if isinstance(metadata, dict) else None
-    if not isinstance(gpu_indices, list):
-        return []
+    return []
+
+
+def _model_actor_inventory_gpu_binding_missing_uuid(rec: dict[str, object]) -> list[dict[str, str]]:
+    metadata = rec.get("metadata") if isinstance(rec.get("metadata"), dict) else {}
+    actor_name = str(rec.get("actor_name") or "unknown")
+    actor_type = str(rec.get("actor_type") or "unknown")
+    workload = _actor_workload(actor_type)
     hostname = str(metadata.get("hostname") or "unknown") if isinstance(metadata, dict) else "unknown"
-    out = []
-    for gpu_index in gpu_indices:
-        out.append(
-            {
-                "actor_name": actor_name,
-                "workload": workload,
-                "hostname": hostname,
-                "gpu_index": str(gpu_index),
-            }
-        )
-    return out
+
+    missing = 0
+    bindings = metadata.get("gpu_bindings") if isinstance(metadata, dict) else None
+    if isinstance(bindings, list):
+        for binding in bindings:
+            if not isinstance(binding, dict):
+                continue
+            gpu_uuid = binding.get("gpu_uuid")
+            if isinstance(gpu_uuid, str) and gpu_uuid.strip():
+                continue
+            if binding.get("gpu_index") is not None:
+                missing += 1
+
+    gpu_indices = metadata.get("gpu_indices") if isinstance(metadata, dict) else None
+    if not missing and isinstance(gpu_indices, list):
+        missing = len([value for value in gpu_indices if value is not None])
+
+    return [
+        {
+            "actor_name": actor_name,
+            "workload": workload,
+            "hostname": hostname,
+            "missing_count": str(missing),
+        }
+    ] if missing > 0 else []
 
 
 @router.get("/metrics")
@@ -1094,6 +1109,14 @@ async def metrics() -> Response:
                     dense_poisoned_grouped[key] = float(dense_poisoned_grouped.get(key, 0.0)) + 1.0
                 for binding in _model_actor_inventory_gpu_bindings(rec):
                     _append_metric(lines, "mint_model_actor_inventory_actor_gpu_binding", 1, labels=binding)
+                for binding in _model_actor_inventory_gpu_binding_missing_uuid(rec):
+                    missing_count = float(binding.pop("missing_count"))
+                    _append_metric(
+                        lines,
+                        "mint_model_actor_inventory_actor_gpu_binding_missing_uuid",
+                        missing_count,
+                        labels=binding,
+                    )
 
                 rss_state = str(rec.get("rss_cache_state") or "").strip().lower()
                 if rss_state not in {"fresh", "stale", "unknown"}:

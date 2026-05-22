@@ -191,6 +191,33 @@ def test_issue_638_scheduler_otel_callbacks_emit_existing_dashboard_metrics(
     assert inflight_obs[0].attributes["workload"] == "sample"
 
 
+def test_issue_638_scheduler_otel_callbacks_do_not_start_assignment_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opentelemetry.metrics as otel_metrics
+
+    import mint_server.logging_context as logging_context
+
+    gauges: dict[str, list] = {}
+
+    class _FakeMeter:
+        def create_observable_gauge(self, name, **kwargs):
+            gauges[name] = list(kwargs.get("callbacks") or [])
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel.example:4317")
+    monkeypatch.setattr(otel_metrics, "get_meter", lambda _name: _FakeMeter())
+    monkeypatch.setattr(logging_context, "init_actor_observability", lambda: None)
+
+    actor = _ModelWorkSchedulerActor()
+
+    def _unexpected_start():
+        raise AssertionError("OTel callback must not start assignment loop")
+
+    monkeypatch.setattr(actor, "_ensure_assignment_loop_started", _unexpected_start)
+
+    assert gauges["mint_model_work_scheduler_depth"][0](None)[0].value == 0.0
+
+
 def test_scheduler_append_can_assign_immediately() -> None:
     actor = _ModelWorkSchedulerActor()
 
