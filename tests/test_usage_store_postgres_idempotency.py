@@ -763,3 +763,63 @@ def test_postgres_usage_store_does_not_retry_permanent_pg_constraint_errors(monk
     assert state["insert_fetch_calls"] == 1
     assert "usage_event pg write failed, retrying" not in caplog.text
     assert "usage_event pg write exhausted" in caplog.text
+
+
+def test_issue_640_get_usage_store_is_event_loop_local(monkeypatch):
+    import mint_server.usage_store as usage_store_module
+
+    created: list[object] = []
+
+    class _Store:
+        async def close(self) -> None:
+            return None
+
+    def _build_store():
+        store = _Store()
+        created.append(store)
+        return store
+
+    monkeypatch.setattr(usage_store_module, "_usage_stores_by_loop", {})
+    monkeypatch.setattr(usage_store_module, "_usage_store_guards_by_loop", {})
+    monkeypatch.setattr(usage_store_module, "_build_usage_store", _build_store)
+
+    async def _get_twice():
+        first = await usage_store_module.get_usage_store()
+        second = await usage_store_module.get_usage_store()
+        assert first is second
+        return first
+
+    first_loop_store = asyncio.run(_get_twice())
+    second_loop_store = asyncio.run(_get_twice())
+
+    assert first_loop_store is not second_loop_store
+    assert created == [first_loop_store, second_loop_store]
+
+
+def test_issue_640_close_usage_store_only_closes_current_event_loop_store(monkeypatch):
+    import mint_server.usage_store as usage_store_module
+
+    closed: list[object] = []
+
+    class _Store:
+        async def close(self) -> None:
+            closed.append(self)
+
+    def _build_store():
+        return _Store()
+
+    monkeypatch.setattr(usage_store_module, "_usage_stores_by_loop", {})
+    monkeypatch.setattr(usage_store_module, "_usage_store_guards_by_loop", {})
+    monkeypatch.setattr(usage_store_module, "_build_usage_store", _build_store)
+
+    async def _get_and_close():
+        store = await usage_store_module.get_usage_store()
+        await usage_store_module.close_usage_store()
+        assert await usage_store_module.get_usage_store() is not store
+        return store
+
+    first_loop_store = asyncio.run(_get_and_close())
+    second_loop_store = asyncio.run(usage_store_module.get_usage_store())
+
+    assert closed == [first_loop_store]
+    assert second_loop_store is not first_loop_store

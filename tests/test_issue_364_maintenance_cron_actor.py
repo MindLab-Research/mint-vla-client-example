@@ -65,6 +65,39 @@ def test_issue_630_billing_outbox_runner_proxies_task_state(monkeypatch) -> None
     assert ors.run_billing_outbox_once() == {"ok": True, "claimed": 2, "inserted": 2}
 
 
+@pytest.mark.anyio
+async def test_issue_640_billing_outbox_actor_runner_stays_on_actor_event_loop(monkeypatch) -> None:
+    from mint_server.backend import maintenance_cron_actor as ors
+
+    class _FakeTaskFutureService:
+        async def async_flush_billing_outbox(self, *, limit: int, lease_ttl_s: float):
+            return {"ok": True, "claimed": 1, "inserted": 1, "limit": limit, "lease_ttl_s": lease_ttl_s}
+
+    import importlib
+
+    task_state_store_module = importlib.import_module("mint_server.backend.task_state_store")
+
+    monkeypatch.setattr(task_state_store_module, "task_futures", _FakeTaskFutureService())
+    monkeypatch.setenv("MINT_BILLING_OUTBOX_FLUSH_BATCH_SIZE", "3")
+    monkeypatch.setenv("MINT_BILLING_OUTBOX_CLAIM_TTL_S", "9")
+
+    out = await ors.async_run_billing_outbox_once()
+
+    assert out == {"ok": True, "claimed": 1, "inserted": 1, "limit": 3, "lease_ttl_s": 9.0}
+
+
+def test_issue_640_billing_outbox_loop_spec_is_async_runner() -> None:
+    import inspect
+
+    from mint_server.backend import maintenance_cron_actor as ors
+
+    source = inspect.getsource(ors._get_or_create_actor)
+
+    assert '"runner": async_run_billing_outbox_once' in source
+    assert '"async_runner": True' in source
+    assert '"runner": run_billing_outbox_once' not in source
+
+
 def test_issue_364_checkpoint_helpers_proxy_results(monkeypatch) -> None:
     from mint_server.backend import maintenance_cron_actor as ors
 

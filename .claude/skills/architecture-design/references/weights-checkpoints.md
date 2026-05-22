@@ -36,6 +36,27 @@ checkpoint reaper must not delete `TaskPayloadStore` JSON payloads.
 artifact existence. Checkpoint catalog/artifact consistency belongs to
 checkpoint-specific validation or repair jobs, not lightweight health.
 
+Checkpoint catalog publication is idempotent after artifact validation:
+
+- save routes first claim a `checkpoint_staging` row, write artifacts to
+  persistent cache, validate the checkpoint shape, then start the TOS mirror.
+- if the same owner/model/checkpoint/type already has a failed staging row and
+  no catalog row, a new save reuses that staging `ckpt_id` and resets it to
+  `uploading`. A failed local publication attempt must not force users to pick
+  a new checkpoint name.
+- the mirror worker validates the mirrored TOS directory before publishing the
+  catalog row.
+- once mirrored artifacts are validated, publication may move either an
+  `uploading` or `failed` staging row into `checkpoint_catalog`. This recovers
+  races where a long save or mirror was marked failed even though the payload
+  later completed successfully.
+- missing staging rows are not recovered implicitly. If no staging row and no
+  catalog row exist for the `ckpt_id`, publication fails and the checkpoint
+  remains failed for operator inspection.
+- successful catalog publication removes the staging row and writes one
+  catalog row. Retrying publication for an already-published `ckpt_id` returns
+  the existing catalog row.
+
 ## File formats and semantics
 
 This repo uses "HuggingFace/PEFT LoRA adapter format" as the interchange format for inference:
