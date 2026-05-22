@@ -4000,10 +4000,22 @@ class TaskFutureService:
         self,
         *,
         task_state_client: TaskStateStoreClient | None = None,
+        future_state_client: Any | None = None,
         payload_store: Any | None = None,
     ) -> None:
         self._task_state = task_state_client if task_state_client is not None else task_state_store
+        self._future_state_client = future_state_client
+        if self._future_state_client is None and task_state_client is not None:
+            self._future_state_client = task_state_client
         self._payload_store = payload_store
+
+    @property
+    def _future_state(self) -> Any:
+        if self._future_state_client is None:
+            from .future_state_store import future_state_store
+
+            self._future_state_client = future_state_store
+        return self._future_state_client
 
     @property
     def _payloads(self) -> Any:
@@ -4014,7 +4026,7 @@ class TaskFutureService:
         return self._payload_store
 
     async def async_create_with_id(self, request_id: str) -> str:
-        await self._task_state.async_ensure_task(request_id=str(request_id), status="pending")
+        await self._future_state.async_ensure_task(request_id=str(request_id), status="pending")
         return str(request_id)
 
     async def async_create_model_work_with_id(
@@ -4027,7 +4039,7 @@ class TaskFutureService:
         meta: dict[str, Any] | None = None,
         payload_hash: str | None = None,
     ) -> str:
-        await self._task_state.async_ensure_task(
+        await self._future_state.async_ensure_task(
             request_id=str(request_id),
             op=str(op),
             domain_key=str(domain_key),
@@ -4039,7 +4051,7 @@ class TaskFutureService:
         return str(request_id)
 
     async def async_ensure_pending(self, request_id: str, meta: dict[str, Any] | None = None) -> dict[str, Any]:
-        out = await self._task_state.async_ensure_task(
+        out = await self._future_state.async_ensure_task(
             request_id=str(request_id),
             op=str((meta or {}).get("op") or "unknown"),
             domain_key=str((meta or {}).get("domain_key") or "future:default"),
@@ -4049,7 +4061,7 @@ class TaskFutureService:
         return {"created": bool(out.get("created")), "meta": out.get("record", {}).get("metadata") or {}}
 
     async def async_mark_queued(self, request_id: str, meta: dict[str, Any] | None = None) -> None:
-        await self._task_state.async_ensure_task(
+        await self._future_state.async_ensure_task(
             request_id=str(request_id),
             op=str((meta or {}).get("op") or "unknown"),
             domain_key=str((meta or {}).get("domain_key") or "future:default"),
@@ -4058,14 +4070,14 @@ class TaskFutureService:
         )
 
     async def async_mark_running(self, request_id: str, meta: dict[str, Any] | None = None) -> None:
-        await self._task_state.async_update_task_metadata(
+        await self._future_state.async_update_task_metadata(
             request_id=str(request_id),
             metadata={**dict(meta or {}), "queue_state": "running"},
             status="running",
         )
 
     async def async_update_meta(self, request_id: str, meta: dict[str, Any] | None = None) -> None:
-        await self._task_state.async_update_task_metadata(
+        await self._future_state.async_update_task_metadata(
             request_id=str(request_id),
             metadata=dict(meta or {}),
         )
@@ -4093,7 +4105,7 @@ class TaskFutureService:
                 attempt_id=attempt_id,
             )
         )
-        await self._task_state.async_stage_payload(
+        await self._future_state.async_stage_payload(
             request_id=str(request_id),
             staged_payload_path=staged_payload_path,
             metadata={
@@ -4106,7 +4118,24 @@ class TaskFutureService:
             attempt_id=attempt_id,
             payload=result,
         )
-        await self._task_state.async_complete_task_success(
+        billing_metadata: dict[str, Any] = {}
+        if billing_observations:
+            try:
+                billing_result = await self._task_state.async_append_billing_outbox(
+                    observations=billing_observations,
+                    source="task_terminal",
+                )
+                if not bool(billing_result.get("ok")):
+                    billing_metadata = {"billing_status": "dropped", "billing_error": billing_result}
+                elif int(billing_result.get("inserted") or 0) > 0:
+                    billing_metadata = {
+                        "billing_status": "outboxed",
+                        "billing_observation_count": int(billing_result.get("inserted") or 0),
+                    }
+            except Exception as e:
+                _inc_billing_metric("write_error", 1)
+                billing_metadata = {"billing_status": "dropped", "billing_error": f"{type(e).__name__}: {e}"}
+        await self._future_state.async_complete_task_success(
             request_id=str(request_id),
             result_path=str(payload["path"]),
             result_checksum=str(payload["checksum"]),
@@ -4116,26 +4145,26 @@ class TaskFutureService:
                 "final_status": FutureStatus.DONE.value,
                 "payload_state": "committed",
                 "staged_payload_path": None,
+                **billing_metadata,
             },
-            billing_observations=billing_observations,
         )
 
     async def async_fail(self, request_id: str, error: str) -> None:
         if self._buffer_model_work_finalize(kind="fail", request_id=request_id, payload=str(error)):
             return
         try:
-            await self._task_state.async_complete_task_failure(
+            await self._future_state.async_complete_task_failure(
                 request_id=str(request_id),
                 error=str(error),
                 metadata={"failed_at": time.time(), "done_at": time.time(), "final_status": FutureStatus.FAILED.value},
             )
         except (KeyError, TaskStateNotFoundError):
-            await self._task_state.async_ensure_task(
+            await self._future_state.async_ensure_task(
                 request_id=str(request_id),
                 status="pending",
                 metadata={"failed_at": time.time()},
             )
-            await self._task_state.async_complete_task_failure(
+            await self._future_state.async_complete_task_failure(
                 request_id=str(request_id),
                 error=str(error),
                 metadata={"failed_at": time.time(), "done_at": time.time(), "final_status": FutureStatus.FAILED.value},
@@ -4149,7 +4178,7 @@ class TaskFutureService:
         expected_meta: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         try:
-            record = await self._task_state.async_get_task(str(request_id))
+            record = await self._future_state.async_get_task(str(request_id))
         except (KeyError, TaskStateNotFoundError):
             return {"failed": False, "reason": "unknown"}
         if _status_from_task_record(record) != FutureStatus.PENDING:
@@ -4163,9 +4192,12 @@ class TaskFutureService:
 
     async def async_get_status(self, request_id: str) -> FutureStatus:
         try:
-            record = await self._task_state.async_get_task(str(request_id))
+            record = await self._future_state.async_get_task(str(request_id))
         except (KeyError, TaskStateNotFoundError):
-            raise KeyError(f"Unknown request_id: {request_id}") from None
+            try:
+                record = await self._task_state.async_get_task(str(request_id))
+            except (KeyError, TaskStateNotFoundError):
+                raise KeyError(f"Unknown request_id: {request_id}") from None
         return _status_from_task_record(record)
 
     async def async_wait_status_change(
@@ -4175,7 +4207,7 @@ class TaskFutureService:
         timeout_s: float,
         terminal_only: bool = False,
     ) -> FutureStatus | None:
-        wait = getattr(self._task_state, "async_wait_task_status_change", None)
+        wait = getattr(self._future_state, "async_wait_task_status_change", None)
         if wait is None:
             return None
         out = await wait(
@@ -4193,7 +4225,12 @@ class TaskFutureService:
         return _status_from_task_record(record)
 
     async def async_get_result(self, request_id: str) -> Any:
-        record = await self._task_state.async_get_task(str(request_id))
+        try:
+            record = await self._future_state.async_get_task(str(request_id))
+            state_client = self._future_state
+        except (KeyError, TaskStateNotFoundError):
+            record = await self._task_state.async_get_task(str(request_id))
+            state_client = self._task_state
         status = str(record.get("status"))
         metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
         if status == "retrieved" and str(metadata.get("terminal_status") or "done") != "done":
@@ -4209,15 +4246,21 @@ class TaskFutureService:
             expected_checksum=record.get("result_checksum"),
         )
         if status != "retrieved":
-            await self._task_state.async_mark_task_retrieved(request_id=str(request_id))
+            await state_client.async_mark_task_retrieved(request_id=str(request_id))
         return payload
 
     async def async_get_error(self, request_id: str) -> str | None:
-        record = await self._task_state.async_get_task(str(request_id))
+        try:
+            record = await self._future_state.async_get_task(str(request_id))
+        except (KeyError, TaskStateNotFoundError):
+            record = await self._task_state.async_get_task(str(request_id))
         return None if record.get("error") is None else str(record.get("error"))
 
     async def async_get_meta(self, request_id: str) -> dict[str, Any] | None:
-        record = await self._task_state.async_get_task(str(request_id))
+        try:
+            record = await self._future_state.async_get_task(str(request_id))
+        except (KeyError, TaskStateNotFoundError):
+            record = await self._task_state.async_get_task(str(request_id))
         metadata = record.get("metadata")
         return dict(metadata) if isinstance(metadata, dict) else None
 
@@ -4227,7 +4270,7 @@ class TaskFutureService:
         *,
         limit: int = 1000,
     ) -> list[dict[str, Any]]:
-        records = await self._task_state.async_list_tasks_by_metadata(
+        records = await self._future_state.async_list_tasks_by_metadata(
             filters=dict(filters or {}),
             statuses=["pending", "queued", "assigned", "leased", "running", "finalizing"],
             limit=int(limit),
@@ -4262,7 +4305,7 @@ class TaskFutureService:
         op_prefix: str,
         error: str,
     ) -> list[str]:
-        records = await self._task_state.async_list_tasks_by_metadata(
+        records = await self._future_state.async_list_tasks_by_metadata(
             filters=dict(filters),
             statuses=["pending", "queued", "assigned", "leased", "running", "finalizing"],
             limit=10000,
@@ -4278,13 +4321,13 @@ class TaskFutureService:
         return failed
 
     async def async_forget(self, request_id: str) -> None:
-        await self._task_state.async_forget_task(request_id=str(request_id))
+        await self._future_state.async_forget_task(request_id=str(request_id))
 
     async def async_cleanup(self, request_id: str) -> None:
         try:
-            await self._task_state.async_mark_task_retrieved(request_id=str(request_id))
+            await self._future_state.async_mark_task_retrieved(request_id=str(request_id))
         except Exception:
-            await self._task_state.async_forget_task(request_id=str(request_id))
+            await self._future_state.async_forget_task(request_id=str(request_id))
 
     async def async_reap(self) -> dict[str, Any]:
         from ..config import config as cfg
@@ -4292,7 +4335,7 @@ class TaskFutureService:
         now = time.time()
         batch_size = max(1, int(os.environ.get("MINT_TASK_FUTURE_REAPER_BATCH_SIZE", "1000")))
 
-        expired = await self._task_state.async_expire_active_tasks(
+        expired = await self._future_state.async_expire_active_tasks(
             older_than_s=float(getattr(cfg, "task_pending_ttl_s", 86400.0)),
             now=now,
             limit=batch_size,
@@ -4302,7 +4345,7 @@ class TaskFutureService:
         payload_evict_errors: list[dict[str, str]] = []
         staged_payload_gc_deleted: list[str] = []
         staged_payload_gc_errors: list[dict[str, str]] = []
-        payload_candidates = await self._task_state.async_list_terminal_payloads_for_eviction(
+        payload_candidates = await self._future_state.async_list_terminal_payloads_for_eviction(
             older_than_s=float(getattr(cfg, "task_result_ttl_s", 86400.0)),
             now=now,
             limit=batch_size,
@@ -4315,7 +4358,7 @@ class TaskFutureService:
             try:
                 await self._payloads.async_delete_json_payload(path=result_path)
             except Exception as e:
-                await self._task_state.async_record_payload_evict_error(count=1)
+                await self._future_state.async_record_payload_evict_error(count=1)
                 payload_evict_errors.append(
                     {
                         "request_id": request_id,
@@ -4323,7 +4366,7 @@ class TaskFutureService:
                     }
                 )
                 continue
-            marked = await self._task_state.async_mark_payload_evicted(
+            marked = await self._future_state.async_mark_payload_evicted(
                 request_id=request_id,
                 expected_result_path=result_path,
                 now=now,
@@ -4331,7 +4374,7 @@ class TaskFutureService:
             if bool(marked.get("ok")):
                 evicted.append(request_id)
 
-        staged_candidates = await self._task_state.async_list_staged_payloads_for_gc(
+        staged_candidates = await self._future_state.async_list_staged_payloads_for_gc(
             older_than_s=float(getattr(cfg, "task_result_ttl_s", 86400.0)),
             now=now,
             limit=batch_size,
@@ -4346,7 +4389,7 @@ class TaskFutureService:
             except FileNotFoundError:
                 pass
             except Exception as e:
-                await self._task_state.async_record_payload_evict_error(count=1)
+                await self._future_state.async_record_payload_evict_error(count=1)
                 staged_payload_gc_errors.append(
                     {
                         "request_id": request_id,
@@ -4354,7 +4397,7 @@ class TaskFutureService:
                     }
                 )
                 continue
-            marked = await self._task_state.async_mark_staged_payload_gc_deleted(
+            marked = await self._future_state.async_mark_staged_payload_gc_deleted(
                 request_id=request_id,
                 expected_staged_payload_path=path,
                 now=now,
@@ -4362,7 +4405,7 @@ class TaskFutureService:
             if bool(marked.get("ok")):
                 staged_payload_gc_deleted.append(request_id)
 
-        deleted_tombstones = await self._task_state.async_delete_expired_tombstones(
+        deleted_tombstones = await self._future_state.async_delete_expired_tombstones(
             older_than_s=float(getattr(cfg, "task_tombstone_ttl_s", 604800.0)),
             now=now,
             limit=batch_size,
@@ -4380,7 +4423,7 @@ class TaskFutureService:
         }
 
     async def async_fail_stale_running_requests(self, active_consumer_job_id: str, error: str) -> list[str]:
-        records = await self._task_state.async_list_tasks_by_metadata(
+        records = await self._future_state.async_list_tasks_by_metadata(
             filters={"consumer_job_id": str(active_consumer_job_id)},
             statuses=["running"],
             limit=10000,
@@ -4392,7 +4435,7 @@ class TaskFutureService:
         return failed
 
     async def async_ensure_started(self) -> None:
-        await self._task_state.async_ensure_started()
+        await self._future_state.async_ensure_started()
 
     async def async_ensure_ready(
         self,
@@ -4400,17 +4443,17 @@ class TaskFutureService:
         timeout_s: float = 10.0,
         create_if_missing: bool = False,
     ) -> dict[str, Any]:
-        return await self._task_state.async_ensure_ready(
+        return await self._future_state.async_ensure_ready(
             timeout_s=timeout_s,
             create_if_missing=create_if_missing,
         )
 
     async def async_ping(self, *, timeout_s: float = 5.0) -> dict[str, Any]:
-        return await self._task_state.async_ping(timeout_s=timeout_s)
+        return await self._future_state.async_ping(timeout_s=timeout_s)
 
     def metrics_snapshot(self) -> dict[str, Any]:
         return {
-            "backend": "task_state_store",
+            "backend": "future_state_store",
             "task_future_reaper": task_future_reaper_metrics_snapshot(),
             "billing_outbox": billing_metrics_snapshot(),
         }
@@ -4436,9 +4479,13 @@ class TaskFutureService:
     async def async_debug_snapshot(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
         _ = timeout_s
         try:
-            return {"backend": "task_state_store", "task_state_store": await self._task_state.async_stats()}
+            return {
+                "backend": "future_state_store",
+                "future_state_store": await self._future_state.async_stats(),
+                "task_state_store": await self._task_state.async_stats(),
+            }
         except Exception as e:
-            return {"backend": "task_state_store", "error": f"{type(e).__name__}: {e}"}
+            return {"backend": "future_state_store", "error": f"{type(e).__name__}: {e}"}
 
     async def async_flush_billing_outbox(
         self,

@@ -24,6 +24,7 @@ from .model_actor_supervisor import consumer_id_for_replica, queue_id_for_replic
 from .model_work_scheduler import ModelWorkSchedulerClient, model_work_scheduler
 from .model_work_execution_context import ModelWorkFinalizeBuffer, model_work_execution_context
 from .task_payload_store import TaskPayloadStore
+from .future_state_store import future_state_store
 from .task_state_store import FutureStatus, task_futures, task_state_store
 
 logger = logging.getLogger(__name__)
@@ -211,6 +212,7 @@ class ModelRuntimeActor:
         scheduler_client: ModelWorkSchedulerClient | None = None,
         task_futures_client: Any | None = None,
         task_state_store_client: Any | None = None,
+        future_state_store_client: Any | None = None,
         payload_store: TaskPayloadStore | None = None,
         executor: ModelWorkExecutor | None = None,
     ) -> None:
@@ -249,6 +251,9 @@ class ModelRuntimeActor:
         self._task_futures = task_futures_client if task_futures_client is not None else task_futures
         self._task_state_store = (
             task_state_store_client if task_state_store_client is not None else task_state_store
+        )
+        self._future_state_store = (
+            future_state_store_client if future_state_store_client is not None else future_state_store
         )
         self._payload_store = payload_store if payload_store is not None else TaskPayloadStore()
         self._executor = executor if executor is not None else _default_executor
@@ -504,7 +509,23 @@ class ModelRuntimeActor:
             attempt_id=self._payload_attempt_id_for_lease(lease),
             payload=payload,
         )
-        await self._task_state_store.async_commit_finalize_success(
+        billing_metadata: dict[str, Any] = {}
+        if billing_observations:
+            try:
+                billing_result = await self._task_state_store.async_append_billing_outbox(
+                    observations=billing_observations,
+                    source="model_work_terminal",
+                )
+                if not bool(billing_result.get("ok")):
+                    billing_metadata = {"billing_status": "dropped", "billing_error": billing_result}
+                elif int(billing_result.get("inserted") or 0) > 0:
+                    billing_metadata = {
+                        "billing_status": "outboxed",
+                        "billing_observation_count": int(billing_result.get("inserted") or 0),
+                    }
+            except Exception as e:
+                billing_metadata = {"billing_status": "dropped", "billing_error": f"{type(e).__name__}: {e}"}
+        await self._future_state_store.async_commit_finalize_success(
             request_id=request_id,
             lease_id=str(lease["lease_id"]),
             attempt_id=attempt_id,
@@ -513,7 +534,7 @@ class ModelRuntimeActor:
             result_path=str(payload_meta["path"]),
             result_checksum=str(payload_meta["checksum"]),
             result_size_bytes=int(payload_meta["size_bytes"]),
-            billing_observations=billing_observations,
+            metadata=billing_metadata,
         )
 
     async def _commit_task_state_failure(
@@ -524,7 +545,7 @@ class ModelRuntimeActor:
     ) -> None:
         self._require_task_state_finalize(lease)
         item = lease["item"]
-        await self._task_state_store.async_commit_finalize_failure(
+        await self._future_state_store.async_commit_finalize_failure(
             request_id=str(item["request_id"]),
             lease_id=str(lease["lease_id"]),
             attempt_id=str(lease["attempt_id"]),

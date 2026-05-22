@@ -148,19 +148,19 @@ def _record_retrieve_wait(*, path: str, outcome: str, waited: bool) -> None:
     record_retrieve_future_wait_metric(path=path, outcome=outcome, waited=waited)
 
 
-async def _lookup_task_state_terminal(request_id: str, http_request: Request) -> Any | None:
+async def _lookup_legacy_task_state_terminal(request_id: str, http_request: Request) -> Any | None:
     try:
         from ..backend.task_payload_store import TaskPayloadStore
         from ..backend.task_state_store import TaskStateNotFoundError, task_state_store
     except Exception:
-        logger.exception("[retrieve_future] task_state_store terminal lookup unavailable request_id=%s", request_id)
+        logger.exception("[retrieve_future] legacy task_state_store terminal lookup unavailable request_id=%s", request_id)
         return None
     try:
         record = await task_state_store.async_get_task(request_id)
     except (KeyError, TaskStateNotFoundError):
         return None
     except Exception:
-        logger.exception("[retrieve_future] task_state_store terminal lookup failed request_id=%s", request_id)
+        logger.exception("[retrieve_future] legacy task_state_store terminal lookup failed request_id=%s", request_id)
         return None
 
     status = str(record.get("status") or "")
@@ -180,7 +180,7 @@ async def _lookup_task_state_terminal(request_id: str, http_request: Request) ->
                     expected_checksum=record.get("result_checksum"),
                 )
             except Exception:
-                logger.exception("[retrieve_future] task_state_store payload read failed request_id=%s", request_id)
+                logger.exception("[retrieve_future] legacy task_state_store payload read failed request_id=%s", request_id)
                 return _terminal_evicted_payload(record)
             _recent_put(request_id, result, ttl_s=_local_hot_ttl_s())
             return result
@@ -204,7 +204,7 @@ async def _wait_until_not_pending(request_id: str, http_request: Request) -> Fut
             terminal_only=True,
         )
     except KeyError:
-        terminal_payload = await _lookup_task_state_terminal(request_id, http_request)
+        terminal_payload = await _lookup_legacy_task_state_terminal(request_id, http_request)
         if terminal_payload is not None:
             _recent_put(request_id, terminal_payload, ttl_s=_local_hot_ttl_s())
             return FutureStatus.DONE
@@ -424,10 +424,10 @@ async def retrieve_future(
         _record_retrieve_wait(path="local", outcome="unknown", waited=False)
         raise HTTPException(status_code=503, detail="TaskStateStore unavailable")
     except KeyError:
-        task_state_payload = await _lookup_task_state_terminal(body.request_id, http_request)
+        task_state_payload = await _lookup_legacy_task_state_terminal(body.request_id, http_request)
         if task_state_payload is not None:
             _pending_hint_clear(body.request_id)
-            logger.info("[retrieve_future] request_id=%s task_state_store_terminal_hit=true", body.request_id)
+            logger.info("[retrieve_future] request_id=%s legacy_task_state_store_terminal_hit=true", body.request_id)
             _record_retrieve_wait(path="local", outcome="ready", waited=False)
             return task_state_payload
         _pending_hint_clear(body.request_id)
@@ -444,16 +444,6 @@ async def retrieve_future(
 
     waited_for_status_change = False
     if status == FutureStatus.PENDING:
-        task_state_payload = await _lookup_task_state_terminal(body.request_id, http_request)
-        if task_state_payload is not None:
-            _pending_hint_clear(body.request_id)
-            try:
-                await task_futures.async_cleanup(body.request_id)
-            except Exception:
-                pass
-            logger.info("[retrieve_future] request_id=%s task_state_store_terminal_hit=true", body.request_id)
-            _record_retrieve_wait(path="local", outcome="ready", waited=False)
-            return task_state_payload
         try:
             waited_for_status_change = (
                 _retrieve_wait_timeout_s() > 0
@@ -463,10 +453,10 @@ async def retrieve_future(
             if waited_status is not None:
                 status = waited_status
         except KeyError:
-            task_state_payload = await _lookup_task_state_terminal(body.request_id, http_request)
+            task_state_payload = await _lookup_legacy_task_state_terminal(body.request_id, http_request)
             if task_state_payload is not None:
                 _pending_hint_clear(body.request_id)
-                logger.info("[retrieve_future] request_id=%s task_state_store_terminal_hit=true", body.request_id)
+                logger.info("[retrieve_future] request_id=%s legacy_task_state_store_terminal_hit=true", body.request_id)
                 _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
                 return task_state_payload
             _pending_hint_clear(body.request_id)
@@ -482,16 +472,6 @@ async def retrieve_future(
             raise HTTPException(status_code=404, detail=detail)
 
     if status == FutureStatus.PENDING:
-        task_state_payload = await _lookup_task_state_terminal(body.request_id, http_request)
-        if task_state_payload is not None:
-            _pending_hint_clear(body.request_id)
-            try:
-                await task_futures.async_cleanup(body.request_id)
-            except Exception:
-                pass
-            logger.info("[retrieve_future] request_id=%s task_state_store_terminal_hit=true", body.request_id)
-            _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
-            return task_state_payload
         meta = None
         try:
             meta = await task_futures.async_get_meta(body.request_id)
@@ -803,15 +783,15 @@ async def retrieve_future(
             logger.info("[retrieve_future] request_id=%s status=retrieved served=cached", body.request_id)
             _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
             return _apply_cached_response(cached, response)
-        task_state_payload = await _lookup_task_state_terminal(body.request_id, http_request)
-        if task_state_payload is not None:
-            _pending_hint_clear(body.request_id)
-            logger.info("[retrieve_future] request_id=%s status=retrieved served=task_state_store", body.request_id)
-            _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
-            return task_state_payload
         try:
             result = await task_futures.async_get_result(body.request_id)
         except Exception:
+            task_state_payload = await _lookup_legacy_task_state_terminal(body.request_id, http_request)
+            if task_state_payload is not None:
+                _pending_hint_clear(body.request_id)
+                logger.info("[retrieve_future] request_id=%s status=retrieved served=legacy_task_state_store", body.request_id)
+                _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
+                return task_state_payload
             result = None
         if result is not None:
             _recent_put(body.request_id, result, ttl_s=_local_hot_ttl_s())
@@ -845,16 +825,16 @@ async def retrieve_future(
         try:
             result = await task_futures.async_get_result(body.request_id)
         except Exception:
-            task_state_payload = await _lookup_task_state_terminal(body.request_id, http_request)
+            task_state_payload = await _lookup_legacy_task_state_terminal(body.request_id, http_request)
             if task_state_payload is not None:
-                logger.info("[retrieve_future] request_id=%s status=done served=task_state_store", body.request_id)
+                logger.info("[retrieve_future] request_id=%s status=done served=legacy_task_state_store", body.request_id)
                 _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
                 return task_state_payload
             raise
         if result is None:
-            task_state_payload = await _lookup_task_state_terminal(body.request_id, http_request)
+            task_state_payload = await _lookup_legacy_task_state_terminal(body.request_id, http_request)
             if task_state_payload is not None:
-                logger.info("[retrieve_future] request_id=%s status=done served=task_state_store", body.request_id)
+                logger.info("[retrieve_future] request_id=%s status=done served=legacy_task_state_store", body.request_id)
                 _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
                 return task_state_payload
         _recent_put(body.request_id, result, ttl_s=_local_hot_ttl_s())
