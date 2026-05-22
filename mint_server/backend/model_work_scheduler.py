@@ -10,7 +10,14 @@ from collections import deque
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from ..config import PFS_PYTHONPATH, actor_runtime_env, config as server_config, otel_env_vars, preferred_control_plane_resources
+from ..config import (
+    PFS_PYTHONPATH,
+    actor_runtime_env,
+    apply_detached_actor_resources,
+    config as server_config,
+    otel_env_vars,
+    preferred_control_plane_resources,
+)
 from ..runtime_env import env_nonempty
 from .async_ray_control import async_get_ray_ref, sync_get_ray_ref
 
@@ -1274,6 +1281,8 @@ def _create_ray_actor(*, require_ready: bool = True):
     resources = _model_work_scheduler_actor_resources()
     if resources:
         options["resources"] = resources
+    else:
+        apply_detached_actor_resources(options, ray)
 
     @ray.remote(num_cpus=0, max_concurrency=max_concurrency, max_restarts=0)
     class _RayModelWorkSchedulerActor(_ModelWorkSchedulerActor):
@@ -1281,9 +1290,9 @@ def _create_ray_actor(*, require_ready: bool = True):
 
     actor = _RayModelWorkSchedulerActor.options(**options).remote(use_task_state_store=True)
     if require_ready:
-        stats = _await_ray_ref_sync(actor.stats.remote(), timeout_s=5.0)
-        if not isinstance(stats, dict):
-            raise TypeError(f"ModelWorkScheduler.stats returned non-dict: {type(stats)}")
+        out = _await_ray_ref_sync(actor.ping.remote(), timeout_s=5.0)
+        if not isinstance(out, dict):
+            raise TypeError(f"ModelWorkScheduler.ping returned non-dict: {type(out)}")
     return actor
 
 
@@ -1317,9 +1326,9 @@ class ModelWorkSchedulerClient:
             if not require_ready:
                 return self._ray_actor
             try:
-                stats = await self._await_ray_ref(self._ray_actor.stats.remote(), timeout_s=1.0)
-                if not isinstance(stats, dict):
-                    raise TypeError(f"ModelWorkScheduler.stats returned non-dict: {type(stats)}")
+                out = await self._await_ray_ref(self._ray_actor.ping.remote(), timeout_s=1.0)
+                if not isinstance(out, dict):
+                    raise TypeError(f"ModelWorkScheduler.ping returned non-dict: {type(out)}")
                 return self._ray_actor
             except Exception:
                 self._reset_ray_actor()
