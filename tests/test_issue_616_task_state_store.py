@@ -108,6 +108,7 @@ def test_issue_638_task_state_store_stats_include_future_dashboard_fields(tmp_pa
     task_state_store_module._FUTURE_TIMEOUT_METRICS.update(
         {"queue": 0.0, "execution": 0.0, "total": 0.0, "by_op": {}}
     )
+    task_state_store_module._BILLING_FLUSH_METRICS.clear()
     actor = _TaskStateStoreActor(str(tmp_path / "task-state-metrics.sqlite3"))
     try:
         actor.create_task(
@@ -151,6 +152,12 @@ def test_issue_638_task_state_store_stats_include_future_dashboard_fields(tmp_pa
         assert stats["timeout_counts"]["total"] == 1.0
         assert stats["timeout_counts"]["by_op"]["sampling.asample"]["execution"] == 1.0
         assert stats["timeout_counts"]["by_op"]["sampling.asample"]["total"] == 1.0
+
+        actor.record_billing_metrics({"flush_success": 1, "event_inserted": 2, "event_conflict": 1})
+        stats = actor.stats()
+        assert stats["billing_outbox"]["metrics"]["flush_success"] == 1.0
+        assert stats["billing_outbox"]["metrics"]["event_inserted"] == 2.0
+        assert stats["billing_outbox"]["metrics"]["event_conflict"] == 1.0
     finally:
         actor.close()
 
@@ -168,6 +175,7 @@ def test_issue_638_task_state_store_registers_otel_future_and_billing_gauges(
     task_state_store_module._FUTURE_TIMEOUT_METRICS.update(
         {"queue": 0.0, "execution": 0.0, "total": 0.0, "by_op": {}}
     )
+    task_state_store_module._BILLING_FLUSH_METRICS.clear()
 
     gauges: dict[str, list] = {}
 
@@ -190,6 +198,14 @@ def test_issue_638_task_state_store_registers_otel_future_and_billing_gauges(
             request_json=b"{}",
             now=100.0,
         )
+        actor.record_billing_metrics(
+            {
+                "flush_success": 1,
+                "flush_transient_error": 2,
+                "event_inserted": 3,
+                "skipped_missing_billing_context": 4,
+            }
+        )
 
         assert "mint_task_futures_pending" in gauges
         assert "mint_task_futures_oldest_pending_s" in gauges
@@ -209,6 +225,17 @@ def test_issue_638_task_state_store_registers_otel_future_and_billing_gauges(
         assert any(obs.value == 0.0 and obs.attributes.get("kind") == "queue" for obs in timeout_obs)
         assert any(obs.value == 0.0 and obs.attributes.get("kind") == "execution" for obs in timeout_obs)
         assert all("request_id" not in obs.attributes for obs in timeout_obs)
+        billing_flush_obs = gauges["mint_billing_outbox_flush_attempts_total"][0](None)
+        assert any(obs.value == 1.0 and obs.attributes.get("result") == "success" for obs in billing_flush_obs)
+        assert any(obs.value == 2.0 and obs.attributes.get("result") == "transient_error" for obs in billing_flush_obs)
+        billing_event_obs = gauges["mint_billing_outbox_events_total"][0](None)
+        assert any(obs.value == 3.0 and obs.attributes.get("result") == "inserted" for obs in billing_event_obs)
+        skipped_obs = gauges["mint_billing_observation_skipped_total"][0](None)
+        assert skipped_obs[0].value == 4.0
+        assert skipped_obs[0].attributes.get("reason") == "missing_billing_context"
+        for observations in (billing_flush_obs, billing_event_obs, skipped_obs):
+            for obs in observations:
+                assert "request_id" not in obs.attributes
     finally:
         actor.close()
 

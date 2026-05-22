@@ -325,6 +325,15 @@ def _inc_billing_metric(key: str, count: int = 1) -> None:
     _BILLING_FLUSH_METRICS[name] = float(_BILLING_FLUSH_METRICS.get(name, 0.0)) + float(count)
 
 
+def _inc_billing_metrics(metrics: dict[str, Any]) -> None:
+    for key, value in dict(metrics or {}).items():
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            continue
+        _inc_billing_metric(str(key), count)
+
+
 def billing_metrics_snapshot() -> dict[str, Any]:
     return dict(_BILLING_FLUSH_METRICS)
 
@@ -3089,6 +3098,10 @@ class _TaskStateStoreActor:
     def record_payload_evict_error(self, **kwargs: Any) -> dict[str, Any]:
         return self._store.record_payload_evict_error(**kwargs)
 
+    def record_billing_metrics(self, metrics: dict[str, Any]) -> dict[str, Any]:
+        _inc_billing_metrics(dict(metrics or {}))
+        return {"ok": True, "metrics": billing_metrics_snapshot()}
+
     def append_billing_outbox(self, **kwargs: Any) -> dict[str, Any]:
         return self._store.append_billing_outbox(**kwargs)
 
@@ -3509,6 +3522,9 @@ class TaskStateStoreClient:
 
     async def async_record_payload_evict_error(self, **kwargs: Any) -> dict[str, Any]:
         return await self._dict_call("record_payload_evict_error", **kwargs)
+
+    async def async_record_billing_metrics(self, metrics: dict[str, Any]) -> dict[str, Any]:
+        return await self._dict_call("record_billing_metrics", metrics=dict(metrics or {}))
 
     async def async_append_billing_outbox(self, **kwargs: Any) -> dict[str, Any]:
         return await self._dict_call("append_billing_outbox", **kwargs)
@@ -4420,9 +4436,15 @@ class TaskFutureService:
             inserted_ids = set(await usage_store.write_events(events))
             conflict = max(0, len(events) - len(inserted_ids))
             await self._task_state.async_delete_billing_outbox_claim(claim_id=claim, outbox_ids=outbox_ids)
-            _inc_billing_metric("flush_success", 1)
-            _inc_billing_metric("event_inserted", len(inserted_ids))
-            _inc_billing_metric("event_conflict", conflict)
+            billing_metrics = {
+                "flush_success": 1,
+                "event_inserted": len(inserted_ids),
+                "event_conflict": conflict,
+            }
+            try:
+                await self._task_state.async_record_billing_metrics(billing_metrics)
+            except Exception:
+                pass
             return {
                 "ok": True,
                 "claimed": len(rows),
@@ -4441,8 +4463,14 @@ class TaskFutureService:
                 permanent=permanent,
                 error=f"{type(e).__name__}: {e}",
             )
-            _inc_billing_metric("flush_permanent_error" if permanent else "flush_transient_error", 1)
-            _inc_billing_metric("event_failed", len(rows))
+            billing_metrics = {
+                "flush_permanent_error" if permanent else "flush_transient_error": 1,
+                "event_failed": len(rows),
+            }
+            try:
+                await self._task_state.async_record_billing_metrics(billing_metrics)
+            except Exception:
+                pass
             return {
                 "ok": False,
                 "claimed": len(rows),
