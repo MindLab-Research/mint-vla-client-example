@@ -180,3 +180,35 @@ def test_issue_413_otel_metrics_include_dense_session_state(monkeypatch: pytest.
     assert callbacks["mint_dense_session_state_bytes"](None)[0].value == 1234.0
     assert callbacks["mint_dense_session_state_dirs"](None)[0].value == 5.0
     assert callbacks["mint_dense_session_state_oldest_age_s"](None)[0].value == 67.5
+
+
+def test_issue_413_configure_logging_does_not_register_api_process_gauges_for_actors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opentelemetry.metrics as otel_metrics
+
+    import mint_server.logging_context as logging_context
+
+    created: list[str] = []
+
+    class _FakeMeter:
+        def create_counter(self, *_args, **_kwargs):
+            return None
+
+        def create_histogram(self, *_args, **_kwargs):
+            return None
+
+        def create_observable_gauge(self, name, **_kwargs):
+            created.append(name)
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel.example:4317")
+    monkeypatch.setattr(otel_metrics, "get_meter", lambda _name: _FakeMeter())
+    monkeypatch.setattr(logging_context, "_OTEL_INITIALIZED", False)
+    monkeypatch.setattr(logging_context, "_OTEL_ENABLED", False)
+    monkeypatch.setattr(logging_context, "_API_PROCESS_OBSERVABLES_REGISTERED", False)
+
+    logging_context._configure_opentelemetry(__import__("logging").getLogger("test"))
+
+    assert "mint_public_healthz_cache_age_seconds" in created
+    assert "mint_dense_session_state_bytes" not in created
+    assert "mint_driver_sampling_sessions_total" not in created

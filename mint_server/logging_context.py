@@ -958,7 +958,6 @@ def _configure_opentelemetry(root_logger: logging.Logger) -> None:
                 unit="s",
                 description="Age in seconds of the successful public healthz cache entry",
             )
-            _register_api_process_observable_metrics(meter, Observation)
         except Exception:
             pass
 
@@ -987,6 +986,19 @@ def _configure_opentelemetry(root_logger: logging.Logger) -> None:
         _OTEL_INITIALIZED = True
     except Exception as e:
         print(f"Warning: Failed to configure OpenTelemetry exporters: {e}", file=sys.stderr)
+
+
+def register_api_process_observable_metrics() -> None:
+    """Register API/driver-local gauges in request-serving processes only."""
+    if not _OTEL_ENABLED:
+        return
+    try:
+        from opentelemetry import metrics
+        from opentelemetry.metrics import Observation
+
+        _register_api_process_observable_metrics(metrics.get_meter("mint.http"), Observation)
+    except Exception:
+        pass
 
 
 def get_otel_tracer() -> Any | None:
