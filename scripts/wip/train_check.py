@@ -23,10 +23,18 @@ FEISHU_TITLE = "MinT sanity-check report"
 DEFAULT_MODELS = {
     "0.6b": "Qwen/Qwen3-0.6B",
     "4b": "Qwen/Qwen3-4B-Instruct-2507",
+    "4b-instruct": "Qwen/Qwen3-4B-Instruct-2507",
+    "4b-thinking": "Qwen/Qwen3-4B-Thinking-2507",
     "30b": "Qwen/Qwen3-30B-A3B-Instruct-2507",
     "235b": "Qwen/Qwen3-235B-A22B-Instruct-2507",
 }
-ALL_MODELS = list(DEFAULT_MODELS.values())
+ALL_MODELS = [
+    "Qwen/Qwen3-0.6B",
+    "Qwen/Qwen3-4B-Instruct-2507",
+    "Qwen/Qwen3-4B-Thinking-2507",
+    "Qwen/Qwen3-30B-A3B-Instruct-2507",
+    "Qwen/Qwen3-235B-A22B-Instruct-2507",
+]
 RUNNER = Path(".claude/skills/sanity-check/mint_rl_test_long.py")
 REQUEST_RE = re.compile(r"request_type=([A-Za-z0-9_]+)\s+request_id=([A-Za-z0-9_:-]+)")
 KV_RE = {
@@ -50,12 +58,12 @@ class ModelRun:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run MinT/Tinker training smoke checks with aligned params and artifacts."
+        description="Run MinT production RL sanity checks with aligned params and artifacts."
     )
     parser.add_argument(
         "models",
         nargs="*",
-        help="Model aliases or full model names. Aliases: 0.6b, 4b, 30b, 235b.",
+        help="Model aliases or full model names. Aliases: 0.6b, 4b, 4b-instruct, 4b-thinking, 30b, 235b.",
     )
     parser.add_argument(
         "--model",
@@ -135,6 +143,24 @@ def resolve_model(name: str) -> str:
     return DEFAULT_MODELS.get(lowered, name.strip())
 
 
+def selected_models(args: argparse.Namespace) -> list[str]:
+    requested = []
+    if args.all_models:
+        requested.extend(ALL_MODELS)
+    requested.extend(resolve_model(m) for m in args.models)
+    requested.extend(resolve_model(m) for m in args.models_flag)
+    if not requested:
+        requested = [DEFAULT_MODELS["0.6b"]]
+
+    deduped = []
+    seen = set()
+    for model in requested:
+        if model not in seen:
+            deduped.append(model)
+            seen.add(model)
+    return deduped
+
+
 def model_slug(model: str) -> str:
     return (
         model.lower()
@@ -210,21 +236,6 @@ def make_run_root(results_root: Path, run_name: str | None, *, create: bool = Tr
 
 
 def build_runs(args: argparse.Namespace, run_root: Path, *, create_dirs: bool = True) -> list[ModelRun]:
-    requested = []
-    if args.all_models:
-        requested.extend(ALL_MODELS)
-    requested.extend(resolve_model(m) for m in args.models)
-    requested.extend(resolve_model(m) for m in args.models_flag)
-    if not requested:
-        requested = [DEFAULT_MODELS["0.6b"]]
-
-    deduped = []
-    seen = set()
-    for model in requested:
-        if model not in seen:
-            deduped.append(model)
-            seen.add(model)
-
     base_env = os.environ.copy()
     base_env["TINKER_BASE_URL"] = args.base_url
     base_env["MINT_BASE_URL"] = args.base_url
@@ -234,7 +245,7 @@ def build_runs(args: argparse.Namespace, run_root: Path, *, create_dirs: bool = 
     base_env["MINT_API_KEY"] = os.environ["MINT_API_KEY"]
 
     runs = []
-    for model in deduped:
+    for model in selected_models(args):
         slug = model_slug(model)
         model_dir = run_root / slug
         if create_dirs:
@@ -384,6 +395,8 @@ def run_one(run: ModelRun) -> dict[str, object]:
 
     stdout_text = stdout_path.read_text() if stdout_path.exists() else ""
     experiment_dir = flatten_experiment_dir(run.run_dir, stdout_text)
+    stderr_text = stderr_path.read_text() if stderr_path.exists() else ""
+    combined_text = stdout_text + "\n" + stderr_text
     meta = parse_log_metadata(stdout_path)
     timing = load_timing_summary(run.run_dir)
     timing_json_path = find_latest_artifact(run.run_dir, "timing_summary.json")
@@ -404,6 +417,8 @@ def run_one(run: ModelRun) -> dict[str, object]:
         "experiment_dir": str(experiment_dir) if experiment_dir else None,
         "request_ids": meta["request_ids"],
         "session_ids": meta["session_ids"],
+        "failure_class": classify_failure(combined_text, exit_code=rc),
+        "failure_surface": failure_surface_from_logs(combined_text),
         "timing_summary_json": str(timing_json_path) if timing_json_path else None,
         "timing_summary_md": str(timing_md_path) if timing_md_path else None,
         "timing_events_jsonl": str(timing_events_path) if timing_events_path else None,
@@ -434,46 +449,122 @@ def run_parallel(runs: list[ModelRun], sequential: bool) -> list[dict[str, objec
     return [result for result in results if result is not None]
 
 
-def _fmt_seconds(value: object) -> str:
+def _fmt_duration(value: object) -> str:
     if isinstance(value, (int, float)):
-        return f"{float(value):.1f}"
+        return f"{float(value):.1f}s"
     return "n/a"
+
+
+def classify_failure(text: str, *, exit_code: int) -> str | None:
+    if exit_code == 0:
+        return None
+    lowered = text.lower()
+    if "cuda out of memory" in lowered or "actordiederror" in lowered or "enginedeaderror" in lowered:
+        return "server exception"
+    if "worker failed" in lowered or "requestfailederror" in lowered or "traceback" in lowered:
+        return "server exception"
+    if "no_resources" in lowered or "placement group" in lowered or "scheduling" in lowered:
+        return "capacity/scheduling"
+    if "api key" in lowered or "unauthorized" in lowered or "forbidden" in lowered:
+        return "client env/auth"
+    return "unknown"
+
+
+def failure_surface_from_logs(text: str) -> str | None:
+    patterns = [
+        r"FAIL in `?([A-Za-z0-9_./:-]+)`?",
+        r"Failure surface:\s*([^.\n]+)",
+        r"waiting label=([A-Za-z_]+)",
+        r"request_type=([A-Za-z0-9_]+)",
+    ]
+    for pattern in patterns:
+        matches = re.findall(pattern, text)
+        if matches:
+            return str(matches[-1]).strip()
+    if "preflight" in text.lower():
+        return "preflight"
+    return None
 
 
 def _failure_surface(result: dict[str, object]) -> str:
     if result.get("status") == "ok":
         return "completed"
+    if result.get("failure_surface"):
+        return str(result["failure_surface"])
     if result.get("slowest_stage"):
         return f"after_{result['slowest_stage']}"
-    request_ids = result.get("request_ids")
-    if request_ids:
+    if result.get("request_ids"):
         return "request_failed"
     return "unknown"
+
+
+def preflight_failure_results(models: list[str], message: str) -> list[dict[str, object]]:
+    return [
+        {
+            "model": model,
+            "slug": model_slug(model),
+            "exit_code": 2,
+            "status": "fail",
+            "run_dir": None,
+            "stdout_log": None,
+            "stderr_log": None,
+            "experiment_dir": None,
+            "request_ids": {},
+            "session_ids": {},
+            "failure_class": "client env/auth",
+            "failure_surface": "preflight",
+            "failure_detail": message,
+            "timing_summary_json": None,
+            "timing_summary_md": None,
+            "timing_events_jsonl": None,
+            "wall_clock_s": 0.0,
+            "slowest_stage": "preflight",
+            "slowest_max_s": 0.0,
+            "started_at_epoch_s": time.time(),
+            "finished_at_epoch_s": time.time(),
+        }
+        for model in models
+    ]
 
 
 def build_feishu_report(results: list[dict[str, object]]) -> str:
     lines: list[str] = []
     any_failed = False
+    ok_count = sum(1 for result in results if result.get("status") == "ok")
+    status = "PASS" if ok_count == len(results) else "FAIL"
+    lines.append(f"**Result:** {status} ({ok_count}/{len(results)} models passed)")
+    lines.append("")
+    lines.append("**Model timing**")
     for result in results:
         model = result["model"]
         slowest = result.get("slowest_stage") or "unknown"
-        max_s = _fmt_seconds(result.get("slowest_max_s"))
-        wall = _fmt_seconds(result.get("wall_clock_s"))
+        max_s = _fmt_duration(result.get("slowest_max_s"))
+        wall = _fmt_duration(result.get("wall_clock_s"))
         if result.get("status") == "ok":
             lines.append(
-                f"- {model}: OK. Timing: slowest stage=`{slowest}` max_s=`{max_s}` wall_clock_s=`{wall}`."
+                f"- PASS `{model}`: slowest=`{slowest}`, max=`{max_s}`, wall=`{wall}`."
             )
         else:
             any_failed = True
+            failure_class = result.get("failure_class") or "unknown"
             lines.append(
-                f"- {model}: FAIL in `{_failure_surface(result)}`. Timing: slowest completed stage=`{slowest}` max_s=`{max_s}` wall_clock_s=`{wall}`."
+                f"- FAIL `{model}`: failed=`{_failure_surface(result)}`, class=`{failure_class}`, slowest_completed=`{slowest}`, max=`{max_s}`, wall=`{wall}`."
             )
-    lines.append("- Ops attempted: none.")
-    lines.append("- GitHub issue: not filed.")
+    lines.append("")
+    lines.append("**Ops:** none attempted by wrapper.")
+    lines.append("**Issue:** not filed by wrapper.")
     if any_failed:
-        lines.append("- Result: failed; preserve local artifacts and investigate before rerun.")
+        details = [
+            str(result.get("failure_detail"))
+            for result in results
+            if result.get("failure_detail")
+        ]
+        if details:
+            lines.append(f"**Next:** {details[0]}")
+        else:
+            lines.append("**Next:** preserve artifacts, classify with logs/telemetry, remediate minimally, then rerun the full matrix.")
     else:
-        lines.append("- Result: all models passed.")
+        lines.append("**Next:** no action required.")
     return "\n".join(lines)
 
 
@@ -546,13 +637,38 @@ def main() -> int:
     args = parse_args()
     ensure_runner_exists()
     load_env_file(Path(".secrets.env"))
-    api_key = validate_production_env(args.base_url)
     if args.all_models and args.parallel:
         raise SystemExit("--all-models must run sequentially for production sanity-check")
 
     run_root = make_run_root(Path(args.results_root), args.run_name, create=not args.dry_run)
-    runs = build_runs(args, run_root, create_dirs=not args.dry_run)
+    models = selected_models(args)
     sequential = bool(args.sequential or args.all_models or not args.parallel)
+
+    try:
+        api_key = validate_production_env(args.base_url)
+    except SystemExit as exc:
+        message = str(exc)
+        if args.dry_run or not args.all_models:
+            raise
+        results = preflight_failure_results(models, message)
+        json_path, md_path = write_summary(results, run_root, args)
+        feishu_report = build_feishu_report(results)
+        feishu_report_path = run_root / "final_feishu_report.md"
+        feishu_report_path.write_text(feishu_report + "\n")
+        print(f"[summary] json={json_path}")
+        print(f"[summary] md={md_path}")
+        print(f"[summary] final_feishu_report={feishu_report_path}")
+        should_send_feishu = bool(args.feishu) if args.feishu is not None else True
+        if should_send_feishu:
+            try:
+                send_feishu_report(feishu_report)
+            except subprocess.CalledProcessError as send_exc:
+                print(f"[summary] Feishu report failed: {send_exc}", file=sys.stderr)
+                return 3
+        print(f"[summary] preflight failed: {message}", file=sys.stderr)
+        return 2
+
+    runs = build_runs(args, run_root, create_dirs=not args.dry_run)
 
     if args.dry_run:
         print_dry_run(runs, sequential)
@@ -561,10 +677,26 @@ def main() -> int:
     if not args.skip_preflight:
         try:
             preflight(args.base_url, api_key)
-        except (ImportError, AttributeError) as exc:
-            raise SystemExit(f"SDK preflight failed: {exc}") from exc
         except (HTTPError, URLError, TimeoutError) as exc:
-            raise SystemExit(f"HTTP preflight failed: {exc}") from exc
+            if not args.all_models:
+                raise SystemExit(f"HTTP preflight failed: {exc}") from exc
+            results = preflight_failure_results(models, f"HTTP preflight failed: {exc}")
+            json_path, md_path = write_summary(results, run_root, args)
+            feishu_report = build_feishu_report(results)
+            feishu_report_path = run_root / "final_feishu_report.md"
+            feishu_report_path.write_text(feishu_report + "\n")
+            print(f"[summary] json={json_path}")
+            print(f"[summary] md={md_path}")
+            print(f"[summary] final_feishu_report={feishu_report_path}")
+            should_send_feishu = bool(args.feishu) if args.feishu is not None else True
+            if should_send_feishu:
+                try:
+                    send_feishu_report(feishu_report)
+                except subprocess.CalledProcessError as send_exc:
+                    print(f"[summary] Feishu report failed: {send_exc}", file=sys.stderr)
+                    return 3
+            print(f"[summary] preflight failed: {exc}", file=sys.stderr)
+            return 2
 
     results = run_parallel(runs, sequential)
     json_path, md_path = write_summary(results, run_root, args)

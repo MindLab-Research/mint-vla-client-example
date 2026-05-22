@@ -3,8 +3,8 @@ name: sanity-check
 description: |
   Production sanity-check runner for MinT/mint-server.
 
-  Objective: run non-trivial RL training loops against MinT production for the 4 production base models
-  (0.6B, 4B, 30B, 235B), collect timing evidence, perform only minimal ops remediation when justified,
+  Objective: run non-trivial RL training loops against MinT production for the 5 production base models
+  (0.6B, 4B Instruct, 4B Thinking, 30B, 235B), collect timing evidence, perform only minimal ops remediation when justified,
   and send exactly one final Feishu report.
 
   Triggers: "sanity check", "sanity-check", "prod sanity", "production sanity"
@@ -117,7 +117,27 @@ curl -sS -H "X-API-Key: $MINT_API_KEY" "$MINT_BASE_URL/api/v1/actors"
 
 Do not use the optional probe result as PASS evidence.
 
-### 1) Run the four RL loops
+### Skill routing during this workflow
+
+Use this skill as the top-level owner for scheduled production sanity-checks.
+Call other skills only for their bounded responsibility:
+
+- `mint-prod`: production API process, production checkout, production logs, production config, and production server restart when evidence shows the API process itself is unhealthy.
+- `mint-dev`: development server only. Do not use it for production sanity-check remediation.
+- `mint-ops`: internal `/internal/*` actor inventory, model-specific actor kill, scheduler/admission/deep health, and Ray diagnostics through Mint control-plane APIs.
+- `ops` + `obsh`: incident evidence from request ids, trace ids, error text, endpoints, Victoria/Grafana signals, or a narrow time window. Prefer `obsh` over ad-hoc log tail when an id or time window exists.
+- `telemetry-direct-query`: direct Victoria queries only when `obsh` is unavailable or too limited.
+- `volcano-cluster`: GPU worker lifecycle, Volcano job/node state, placement-group cleanup, and worker node recovery. Do not run local `ray` or `volc` commands.
+- `issue-reporter`: GitHub issue creation after evidence supports an implementation or production defect.
+
+Capability split:
+- This skill decides pass/fail, preserves artifacts, sends the final report, and coordinates reruns.
+- Runtime remediation belongs to `mint-ops`/`mint-prod`.
+- Cluster remediation belongs to `volcano-cluster`.
+- Observability evidence belongs to `ops`/`obsh` or `telemetry-direct-query`.
+- Development validation belongs to `mint-dev`, not this production workflow.
+
+### 1) Run the five RL loops
 
 Preferred command:
 
@@ -130,6 +150,7 @@ The wrapper is part of this skill contract. It must:
 - load `.secrets.env` without printing secrets,
 - require `MINT_TEST_CHECKPOINT_OWNER_ID`,
 - run `--all-models` sequentially in the required order,
+- include both 4B Instruct and 4B Thinking,
 - write artifacts under `/root/run_results/mint/<timestamp>/`,
 - discover nested timing files recursively,
 - write `summary.json`, `summary.md`, and `final_feishu_report.md`,
@@ -137,12 +158,13 @@ The wrapper is part of this skill contract. It must:
 
 Use the manual pattern below only if the wrapper itself is broken.
 
-Run exactly these four models in order:
+Run exactly these five models in order:
 
 1. `Qwen/Qwen3-0.6B`
 2. `Qwen/Qwen3-4B-Instruct-2507`
-3. `Qwen/Qwen3-30B-A3B-Instruct-2507`
-4. `Qwen/Qwen3-235B-A22B-Instruct-2507`
+3. `Qwen/Qwen3-4B-Thinking-2507`
+4. `Qwen/Qwen3-30B-A3B-Instruct-2507`
+5. `Qwen/Qwen3-235B-A22B-Instruct-2507`
 
 Use this pattern for each model. Keep each model as a separate process and preserve its exit code.
 
@@ -276,7 +298,7 @@ Include timestamp, model, symptom, request IDs, evidence, exact ops action, and 
 
 ### 5) Re-test after remediation
 
-After any remediation, rerun all four models from the beginning in the same required order. Create a new attempt subdirectory under the same timestamp root, for example:
+After any remediation, rerun all five models from the beginning in the same required order. Create a new attempt subdirectory under the same timestamp root, for example:
 
 ```bash
 RUN_ROOT=/root/run_results/mint/$TS/attempt-2
@@ -299,13 +321,47 @@ Do not file an issue for a local client environment mistake that was fixed and r
 
 ## Final Feishu report
 
-Send exactly one final Feishu report at the end for both PASS and FAIL workflows.
+Send exactly one final Feishu report at the end for both PASS and FAIL workflows. The canonical wrapper sends this automatically for `--all-models`, including preflight failures.
+
+The report must use this compact structure:
+
+```markdown
+**Result:** PASS (5/5 models passed)
+
+**Model timing**
+- PASS `Qwen/Qwen3-0.6B`: slowest=`rl_step_total`, max=`24.6s`, wall=`50.0s`.
+- PASS `Qwen/Qwen3-4B-Instruct-2507`: slowest=`rl_step_total`, max=`41.2s`, wall=`82.5s`.
+- PASS `Qwen/Qwen3-4B-Thinking-2507`: slowest=`rl_step_total`, max=`42.0s`, wall=`84.0s`.
+- PASS `Qwen/Qwen3-30B-A3B-Instruct-2507`: slowest=`rl_step_total`, max=`213.5s`, wall=`336.1s`.
+- PASS `Qwen/Qwen3-235B-A22B-Instruct-2507`: slowest=`rl_step_total`, max=`356.7s`, wall=`584.2s`.
+
+**Ops:** none attempted by wrapper.
+**Issue:** not filed by wrapper.
+**Next:** no action required.
+```
+
+For failed or preflight-blocked workflows, keep the same structure:
+
+```markdown
+**Result:** FAIL (0/5 models passed)
+
+**Model timing**
+- FAIL `Qwen/Qwen3-0.6B`: failed=`preflight`, class=`client env/auth`, slowest_completed=`preflight`, max=`0.0s`, wall=`0.0s`.
+- FAIL `Qwen/Qwen3-4B-Instruct-2507`: failed=`preflight`, class=`client env/auth`, slowest_completed=`preflight`, max=`0.0s`, wall=`0.0s`.
+- FAIL `Qwen/Qwen3-4B-Thinking-2507`: failed=`preflight`, class=`client env/auth`, slowest_completed=`preflight`, max=`0.0s`, wall=`0.0s`.
+- FAIL `Qwen/Qwen3-30B-A3B-Instruct-2507`: failed=`preflight`, class=`client env/auth`, slowest_completed=`preflight`, max=`0.0s`, wall=`0.0s`.
+- FAIL `Qwen/Qwen3-235B-A22B-Instruct-2507`: failed=`preflight`, class=`client env/auth`, slowest_completed=`preflight`, max=`0.0s`, wall=`0.0s`.
+
+**Ops:** none attempted by wrapper.
+**Issue:** not filed by wrapper.
+**Next:** add a valid production `MINT_TEST_CHECKPOINT_OWNER_ID` ObjectId and rerun the scheduled sanity check.
+```
 
 The report must include one line per model with:
-- `OK` or `FAIL`
-- slowest stage
-- `max_s`
-- `wall_clock_s`
+- `PASS` or `FAIL`
+- slowest stage or slowest completed stage
+- `max`
+- `wall`
 
 For failed models, also include:
 - failure surface/class,
@@ -319,13 +375,6 @@ Do not include:
 - full command transcripts,
 - secrets,
 - raw log dumps.
-
-Required timing shape:
-
-```markdown
-- Qwen/Qwen3-0.6B: OK. Timing: slowest stage=`sample` max_s=`38.4` wall_clock_s=`91.2`.
-- Qwen/Qwen3-235B-A22B-Instruct-2507: FAIL in `create_model`. Timing: slowest completed stage=`save_weights_for_sampler` max_s=`412.7` wall_clock_s=`645.9`. Ops: killed model-specific vLLM actor; rerun still failed. Issue: #123.
-```
 
 If the report omits timing lines, the Feishu step is not complete. Rewrite the report before sending.
 
