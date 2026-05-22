@@ -492,9 +492,7 @@ _OTEL_EXCLUDED_PATHS: set[str] = set() if _OTEL_EXCLUDE_NONE else {
     "/api/v1/internal/healthz",
     "/api/v1/telemetry",
     "/api/v1/session_heartbeat",
-    "/api/v1/internal/admission_stats",
     "/internal/admission_stats",
-    "/api/v1/internal/metrics",
     "/internal/metrics",
 }
 

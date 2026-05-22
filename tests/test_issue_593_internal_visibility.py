@@ -7,6 +7,20 @@ import pytest
 from mint_server.routes import internal as internal_routes
 
 
+def test_issue_593_operator_routes_do_not_keep_api_v1_internal_aliases() -> None:
+    from mint_server.app import _OTEL_EXCLUDED_PATHS, app
+
+    paths = {getattr(route, "path", "") for route in app.routes}
+
+    assert "/api/v1/internal/healthz" in paths
+    assert "/internal/admission_stats" in paths
+    assert "/internal/metrics" in paths
+    assert "/api/v1/internal/admission_stats" not in paths
+    assert "/api/v1/internal/metrics" not in paths
+    assert "/api/v1/internal/admission_stats" not in _OTEL_EXCLUDED_PATHS
+    assert "/api/v1/internal/metrics" not in _OTEL_EXCLUDED_PATHS
+
+
 @pytest.mark.anyio
 async def test_issue_593_internal_model_visibility_endpoints(monkeypatch: pytest.MonkeyPatch) -> None:
     import mint_server.backend.model_actor_supervisor as supervisor_module
