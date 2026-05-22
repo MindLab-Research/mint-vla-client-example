@@ -23,10 +23,10 @@ making observability part of the request critical path.
   for metrics-daemon purposes so it can push Ray live-state, placement-group,
   GCS bridge health, selected raw GCS/grpc aggregates, and MinT-derived GCS
   gauges without entering model placement or worker provisioning semantics.
-- `/internal/metrics` is authenticated, opt-in, and debug/cached-only. Migrated
-  dashboards must not require `up{job="mint-internal-metrics"}` for their normal
-  runtime data path. It must not render Ray/GCS families that are owned by the
-  head `NodeMetricsCollectorActor`.
+- `/internal/metrics` is authenticated, opt-in, and sentinel-only. It must not
+  collect Ray actor snapshots, Ray/GCS state, scheduler state, supervisor state,
+  TaskStateStore state, runtime actor state, or node daemon samples. Production
+  dashboards must read MinT application metrics from OTel push only.
 
 Relevant implementation:
 - `mint_server/logging_context.py`

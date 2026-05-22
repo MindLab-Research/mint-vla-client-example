@@ -29,6 +29,13 @@ from mint_server.backend.supervisor_state_store import (
     SupervisorSQLiteStateStore,
     SupervisorStateOwnerConflictError,
 )
+from mint_server.backend.topology import (
+    ProviderTaskState,
+    RayNodeState,
+    TopologyConfig,
+    TopologyManager,
+    TopologyNodeDesired,
+)
 
 
 def _write_supervisor_topology(tmp_path, models: dict[str, object]) -> str:
@@ -300,6 +307,14 @@ def test_issue_638_supervisor_registers_otel_inventory_and_supervisor_gauges(
 
     expected = {
         "mint_model_actor_supervisor_desired_total",
+        "mint_topology_node_state",
+        "mint_topology_node_gpus",
+        "mint_node_metrics_daemon_enabled",
+        "mint_node_metrics_daemon_desired_total",
+        "mint_node_metrics_daemon_managed_total",
+        "mint_node_metrics_daemon_state",
+        "mint_node_metrics_daemon_sample_count",
+        "mint_node_metrics_daemon_error_count",
         "mint_model_actor_supervisor_domain_replicas",
         "mint_model_actor_supervisor_replica_state",
         "mint_model_actor_inventory_actors",
@@ -568,6 +583,96 @@ def test_issue_638_supervisor_otel_callbacks_emit_supervisor_state(
     assert replica_obs[0].value == 7.0
     assert replica_obs[0].attributes["actor_name"] == "mint_vllm_qwen3_0_6b"
     assert replica_obs[0].attributes["state"] == "healthy"
+
+
+def test_issue_638_supervisor_otel_callbacks_emit_topology_and_node_daemon_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    import opentelemetry.metrics as otel_metrics
+
+    import mint_server.backend.model_actor_supervisor as supervisor_module
+    import mint_server.logging_context as logging_context
+
+    gauges: dict[str, list] = {}
+
+    class _FakeMeter:
+        def create_observable_gauge(self, name, **kwargs):
+            gauges[name] = list(kwargs.get("callbacks") or [])
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel.example:4317")
+    monkeypatch.setattr(otel_metrics, "get_meter", lambda _name: _FakeMeter())
+    monkeypatch.setattr(logging_context, "init_actor_observability", lambda: None)
+
+    topology = TopologyConfig(
+        version=1,
+        deployment_env="prod",
+        cluster_id="volcano",
+        state_path=str(tmp_path / "topology_state.yaml"),
+        providers={"volcano": {"templates": {"gpu": {}}}},
+        nodes={
+            "mint-worker-0": TopologyNodeDesired(
+                alias="mint-worker-0",
+                provider="volcano",
+                template="gpu",
+                gpu_count=8,
+            )
+        },
+        models={},
+    )
+
+    supervisor = supervisor_module.ModelActorSupervisor(
+        specs=[],
+        state_store=SupervisorMemoryStateStore(),
+        topology_manager=TopologyManager(
+            config=topology,
+            provider_task_lister=lambda _config: [
+                ProviderTaskState(
+                    alias="mint-worker-0",
+                    provider="volcano",
+                    task_name="mint-prod-worker-0",
+                    live=True,
+                    node_ip="10.0.0.7",
+                    gpu_count=8,
+                )
+            ],
+            ray_node_lister=lambda: [
+                RayNodeState(
+                    node_ip="10.0.0.7",
+                    ray_node_id="node-0",
+                    alive=True,
+                    gpu_count=8,
+                )
+            ],
+        ),
+        node_metrics_enabled=True,
+        **_disabled_control_plane_kwargs(),
+    )
+    supervisor._topology_manager.reconcile_once()
+    supervisor._node_metric_states["mint-worker-0"] = {
+        "state": "healthy",
+        "health": {"sample_count": 3, "error_count": 1},
+    }
+    supervisor._node_metric_actors["mint-worker-0"] = object()
+
+    topology_state = gauges["mint_topology_node_state"][0](None)
+    assert topology_state[0].value == 1.0
+    assert topology_state[0].attributes["worker_alias"] == "mint-worker-0"
+    assert topology_state[0].attributes["provider"] == "volcano"
+
+    topology_gpus = gauges["mint_topology_node_gpus"][0](None)
+    assert topology_gpus[0].value == 8.0
+
+    assert gauges["mint_node_metrics_daemon_enabled"][0](None)[0].value == 1.0
+    assert gauges["mint_node_metrics_daemon_desired_total"][0](None)[0].value == 1.0
+    assert gauges["mint_node_metrics_daemon_managed_total"][0](None)[0].value == 1.0
+
+    daemon_state = gauges["mint_node_metrics_daemon_state"][0](None)
+    assert daemon_state[0].value == 1.0
+    assert daemon_state[0].attributes["worker_alias"] == "mint-worker-0"
+    assert daemon_state[0].attributes["state"] == "healthy"
+    assert gauges["mint_node_metrics_daemon_sample_count"][0](None)[0].value == 3.0
+    assert gauges["mint_node_metrics_daemon_error_count"][0](None)[0].value == 1.0
 
 
 def test_issue_593_supervisor_ensure_recreates_stale_code_identity(

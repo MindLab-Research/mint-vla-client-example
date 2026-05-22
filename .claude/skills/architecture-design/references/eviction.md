@@ -31,7 +31,7 @@ The inventory:
 - updates access timestamps on use;
 - tracks inflight counts so admin/metrics can distinguish busy actors;
 - keeps optional protection/session fields used by lifecycle code;
-- powers `/internal/actors`, `/internal/actors/kill`, `/internal/admission_stats`, and optional debug metrics when `/internal/metrics` is explicitly enabled.
+- powers `/internal/actors`, `/internal/actors/kill`, `/internal/admission_stats`, and OTel-pushed actor inventory metrics.
 
 It does not own desired placement and is not durable scheduling state.
 

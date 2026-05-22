@@ -40,7 +40,9 @@ Contract:
 
 Current categories:
 - Health and observability: `/api/v1/healthz`, `/api/v1/internal/healthz`, `/internal/admission_stats`.
-- Optional debug metrics: `/internal/metrics` when explicitly enabled; the default metrics path is OTel push from node collectors, not Prometheus scraping.
+- Optional metrics sentinel: `/internal/metrics` when explicitly enabled; the
+  default metrics path is OTel push from owning API/actor processes, not
+  Prometheus scraping.
 - Scheduler state: `/internal/model_work_scheduler`, `/internal/model_work_scheduler/debug_state`, `/internal/debug/scheduler_decisions`, `/internal/model_work_scheduler/noop`.
 - Runtime desired state: `/internal/model_actor_supervisor`.
 - Ray cluster diagnostics: `/internal/ray_cluster_health`, `/internal/ray_gcs_metrics`.
@@ -59,11 +61,11 @@ maintenance-cron/startup degraded markers, then returns a small component
 summary. It must not perform per-request fanout to runtime actors and does not
 promise scheduler, task, topology, or reaper summaries.
 
-`/internal/metrics` is a debug text endpoint, not the production metrics
-transport. It must not probe Ray/GCS or render families owned by the head
-`NodeMetricsCollectorActor`; use `/internal/ray_cluster_health` and
-`/internal/ray_gcs_metrics` for explicit JSON diagnostics, and OTel push for
-dashboards/alerts.
+`/internal/metrics` is a sentinel-only text endpoint, not the production metrics
+transport. It must not probe Ray/GCS, collect Ray actor snapshots, inspect
+scheduler/supervisor/task-store state, or render families owned by any OTel
+publisher. Use explicit JSON diagnostics for operator drill-down, and OTel push
+for dashboards/alerts.
 
 ## Actor admin semantics
 

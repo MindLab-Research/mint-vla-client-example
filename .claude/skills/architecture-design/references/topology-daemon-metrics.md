@@ -666,14 +666,12 @@ disabled by default. The required feature flag is
 return `404 Not Found` so Prometheus scrapes fail closed and operators do not
 mistake it for the supported metrics path.
 
-Existing Prometheus metrics may be removed or reduced only after their signals
-are covered by OTel push metrics and any dependent dashboard/alert has migrated.
-
-If `/internal/metrics` is enabled for debugging, it must remain authenticated and
-must not trigger node-local sampling or Ray/GCS probing. It may render cached
-process-local state only. Ray/GCS families are owned by the head
-`NodeMetricsCollectorActor` and must not be re-rendered through
-`/internal/metrics`.
+After OTel migration, `/internal/metrics` is sentinel-only. If enabled, it must
+remain authenticated and must not trigger node-local sampling, Ray/GCS probing,
+Ray actor snapshot collection, scheduler inspection, supervisor inspection, or
+TaskStateStore inspection. Ray/GCS families are owned by the head
+`NodeMetricsCollectorActor`; runtime, scheduler, supervisor, node, and
+TaskStateStore families are pushed by their owning process or actor.
 
 ## Failure Semantics
 

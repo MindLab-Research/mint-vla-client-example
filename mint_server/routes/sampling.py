@@ -132,6 +132,10 @@ async def _lora_load_lock_count() -> int:
         return len(_lora_load_locks)
 
 
+def _lora_load_lock_count_sync() -> int:
+    return len(_lora_load_locks)
+
+
 def _resolve_billing_model(session_id: str) -> str:
     snapshot = _get_sampling_snapshot(session_id)
     if snapshot is None:

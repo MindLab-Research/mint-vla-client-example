@@ -1199,6 +1199,125 @@ class ModelActorSupervisorCore:
             ):
                 _gauge(f"mint_model_actor_supervisor_{key}", _scalar(key))
 
+            def _topology_node_state(_options):
+                snapshot = self.snapshot()
+                topology = snapshot.get("topology")
+                nodes = topology.get("nodes") if isinstance(topology, dict) else None
+                if not isinstance(nodes, dict):
+                    return []
+                observations = []
+                for alias, rec in sorted(nodes.items()):
+                    if not isinstance(rec, dict):
+                        continue
+                    observations.append(
+                        Observation(
+                            1.0,
+                            _attrs(
+                                worker_alias=alias,
+                                state=rec.get("state") or "unknown",
+                                provider=rec.get("provider") or "unknown",
+                            ),
+                        )
+                    )
+                return observations
+
+            def _topology_node_gpus(_options):
+                snapshot = self.snapshot()
+                topology = snapshot.get("topology")
+                nodes = topology.get("nodes") if isinstance(topology, dict) else None
+                if not isinstance(nodes, dict):
+                    return []
+                observations = []
+                for alias, rec in sorted(nodes.items()):
+                    if not isinstance(rec, dict):
+                        continue
+                    value = _prom_number(rec.get("gpu_count"))
+                    if value is None:
+                        continue
+                    observations.append(
+                        Observation(
+                            value,
+                            _attrs(
+                                worker_alias=alias,
+                                state=rec.get("state") or "unknown",
+                                provider=rec.get("provider") or "unknown",
+                            ),
+                        )
+                    )
+                return observations
+
+            _gauge("mint_topology_node_state", _topology_node_state)
+            _gauge("mint_topology_node_gpus", _topology_node_gpus)
+
+            def _node_metrics_scalar(field: str):
+                def _callback(_options):
+                    snapshot = self.snapshot()
+                    daemons = snapshot.get("daemons")
+                    node_metrics = daemons.get("node_metrics") if isinstance(daemons, dict) else None
+                    if not isinstance(node_metrics, dict):
+                        return []
+                    value = _prom_number(node_metrics.get(field))
+                    if value is None:
+                        return []
+                    return [Observation(value, _attrs())]
+
+                return _callback
+
+            _gauge("mint_node_metrics_daemon_enabled", _node_metrics_scalar("enabled"))
+            _gauge("mint_node_metrics_daemon_desired_total", _node_metrics_scalar("desired_total"))
+            _gauge("mint_node_metrics_daemon_managed_total", _node_metrics_scalar("managed_total"))
+
+            def _node_metrics_state(_options):
+                snapshot = self.snapshot()
+                daemons = snapshot.get("daemons")
+                node_metrics = daemons.get("node_metrics") if isinstance(daemons, dict) else None
+                nodes = node_metrics.get("nodes") if isinstance(node_metrics, dict) else None
+                if not isinstance(nodes, dict):
+                    return []
+                observations = []
+                for alias, rec in sorted(nodes.items()):
+                    if not isinstance(rec, dict):
+                        continue
+                    observations.append(
+                        Observation(
+                            1.0,
+                            _attrs(worker_alias=alias, state=rec.get("state") or "unknown"),
+                        )
+                    )
+                return observations
+
+            def _node_metrics_health(field: str):
+                def _callback(_options):
+                    snapshot = self.snapshot()
+                    daemons = snapshot.get("daemons")
+                    node_metrics = daemons.get("node_metrics") if isinstance(daemons, dict) else None
+                    nodes = node_metrics.get("nodes") if isinstance(node_metrics, dict) else None
+                    if not isinstance(nodes, dict):
+                        return []
+                    observations = []
+                    for alias, rec in sorted(nodes.items()):
+                        if not isinstance(rec, dict):
+                            continue
+                        health = rec.get("health")
+                        if not isinstance(health, dict):
+                            continue
+                        value = _prom_number(health.get(field))
+                        if value is None:
+                            continue
+                        observations.append(
+                            Observation(
+                                value,
+                                _attrs(worker_alias=alias, state=rec.get("state") or "unknown"),
+                            )
+                        )
+                    return observations
+
+                return _callback
+
+            _gauge("mint_node_metrics_daemon_state", _node_metrics_state)
+            _gauge("mint_node_metrics_daemon_sample_count", _node_metrics_health("sample_count"))
+            _gauge("mint_node_metrics_daemon_error_count", _node_metrics_health("error_count"))
+
             def _domain_metric(field: str):
                 def _callback(_options):
                     snapshot = self.snapshot()
