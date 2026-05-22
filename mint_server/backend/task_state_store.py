@@ -2656,6 +2656,7 @@ class _TaskStateStoreActor:
         self._stats_cache: dict[str, Any] | None = None
         self._stats_cache_at = 0.0
         self._stats_cache_ttl_s = max(0.0, float(os.environ.get("MINT_TASK_STATE_STORE_STATS_CACHE_TTL_S", "5")))
+        self._stats_lock = threading.Lock()
         self._otel_enabled = False
         self._otel_error: str | None = None
         self._init_otel_metrics()
@@ -2827,27 +2828,32 @@ class _TaskStateStoreActor:
         cached = self._stats_cache
         if cached is not None and now - self._stats_cache_at <= self._stats_cache_ttl_s:
             return dict(cached)
-        active = self._store.list_active_tasks()
-        by_status: dict[str, int] = {}
-        for record in active:
-            status = str(record.get("status") or "unknown")
-            by_status[status] = by_status.get(status, 0) + 1
-        future_stats = self._store.future_metrics_stats()
-        out = {
-            "actor_name": _ray_task_state_store_actor_name(),
-            "namespace": _ray_namespace(),
-            "db_path": self._store.db_path,
-            "started_at": self._started_at,
-            "active_tasks": len(active),
-            "active_by_status": by_status,
-            "watchers": self._watcher_count,
-            **future_stats,
-            "task_future_reaper": task_future_reaper_metrics_snapshot(),
-            "billing_outbox": self._store.billing_outbox_stats(),
-        }
-        self._stats_cache = dict(out)
-        self._stats_cache_at = time.monotonic()
-        return out
+        with self._stats_lock:
+            now = time.monotonic()
+            cached = self._stats_cache
+            if cached is not None and now - self._stats_cache_at <= self._stats_cache_ttl_s:
+                return dict(cached)
+            active = self._store.list_active_tasks()
+            by_status: dict[str, int] = {}
+            for record in active:
+                status = str(record.get("status") or "unknown")
+                by_status[status] = by_status.get(status, 0) + 1
+            future_stats = self._store.future_metrics_stats()
+            out = {
+                "actor_name": _ray_task_state_store_actor_name(),
+                "namespace": _ray_namespace(),
+                "db_path": self._store.db_path,
+                "started_at": self._started_at,
+                "active_tasks": len(active),
+                "active_by_status": by_status,
+                "watchers": self._watcher_count,
+                **future_stats,
+                "task_future_reaper": task_future_reaper_metrics_snapshot(),
+                "billing_outbox": self._store.billing_outbox_stats(),
+            }
+            self._stats_cache = dict(out)
+            self._stats_cache_at = time.monotonic()
+            return out
 
     def _init_otel_metrics(self) -> None:
         endpoint = (os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT") or "").strip()
@@ -3040,11 +3046,11 @@ class _TaskStateStoreActor:
             self._otel_error = f"{type(e).__name__}: {e}"
 
     def ping(self) -> dict[str, Any]:
-        out = self._store.ping()
         return {
-            "ok": bool(out.get("ok")),
+            "ok": True,
             "actor_name": _ray_task_state_store_actor_name(),
             "namespace": _ray_namespace(),
+            "started_at": self._started_at,
         }
 
     def integrity_check(self) -> str:
@@ -3317,7 +3323,7 @@ def _create_ray_actor(*, require_ready: bool = True):
     actor_name = _ray_task_state_store_actor_name()
     namespace = _ray_namespace()
     db_path = _task_state_store_db_path()
-    max_concurrency = int(os.environ.get("MINT_TASK_STATE_STORE_ACTOR_MAX_CONCURRENCY", "128"))
+    max_concurrency = int(os.environ.get("MINT_TASK_STATE_STORE_ACTOR_MAX_CONCURRENCY", "16"))
 
     @ray.remote(num_cpus=0, max_concurrency=max_concurrency, max_restarts=0)
     class _RayTaskStateStoreActor(_TaskStateStoreActor):
@@ -3357,9 +3363,9 @@ class TaskStateStoreClient:
             if not require_ready:
                 return self._ray_actor
             try:
-                out = sync_get_ray_ref(self._ray_actor.stats.remote(), timeout_s=1.0)
+                out = sync_get_ray_ref(self._ray_actor.ping.remote(), timeout_s=1.0)
                 if not isinstance(out, dict):
-                    raise TypeError(f"TaskStateStore.stats returned non-dict: {type(out)}")
+                    raise TypeError(f"TaskStateStore.ping returned non-dict: {type(out)}")
                 return self._ray_actor
             except Exception:
                 self._reset_ray_actor()
@@ -3390,9 +3396,9 @@ class TaskStateStoreClient:
             if not require_ready:
                 return self._ray_actor
             try:
-                out = await async_get_ray_ref(self._ray_actor.stats.remote(), timeout_s=1.0)
+                out = await async_get_ray_ref(self._ray_actor.ping.remote(), timeout_s=1.0)
                 if not isinstance(out, dict):
-                    raise TypeError(f"TaskStateStore.stats returned non-dict: {type(out)}")
+                    raise TypeError(f"TaskStateStore.ping returned non-dict: {type(out)}")
                 return self._ray_actor
             except Exception:
                 self._reset_ray_actor()
@@ -3449,9 +3455,9 @@ class TaskStateStoreClient:
 
     def ensure_started(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
         actor = self._get_ray_actor_sync(require_ready=False, create_if_missing=True)
-        out = sync_get_ray_ref(actor.stats.remote(), timeout_s=timeout_s)
+        out = sync_get_ray_ref(actor.ping.remote(), timeout_s=timeout_s)
         if not isinstance(out, dict):
-            raise TypeError(f"TaskStateStore.stats returned non-dict: {type(out)}")
+            raise TypeError(f"TaskStateStore.ping returned non-dict: {type(out)}")
         return out
 
     def ping(self, *, timeout_s: float = 5.0) -> dict[str, Any]:
