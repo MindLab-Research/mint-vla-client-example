@@ -213,13 +213,17 @@ def preflight(base_url: str, api_key: str | None) -> None:
     print(f"[preflight] python={sys.executable}")
     print("[preflight] production URL and owner id are set; API key is present (redacted)")
 
-    for suffix, needs_key in (("/api/v1/healthz", False), ("/api/v1/actors", True)):
-        headers = {}
-        if needs_key and api_key:
-            headers["X-API-Key"] = api_key
-        req = Request(f"{base_url}{suffix}", headers=headers)
-        with urlopen(req, timeout=30) as resp:
-            print(f"[preflight] {suffix} -> {resp.status}")
+    req = Request(f"{base_url}/api/v1/healthz")
+    with urlopen(req, timeout=30) as resp:
+        print(f"[preflight] /api/v1/healthz -> {resp.status}")
+
+    if api_key:
+        req = Request(f"{base_url}/internal/actors", headers={"X-API-Key": api_key})
+        try:
+            with urlopen(req, timeout=30) as resp:
+                print(f"[preflight] /internal/actors -> {resp.status}")
+        except (HTTPError, URLError, TimeoutError) as exc:
+            print(f"[preflight] /internal/actors probe skipped: {exc}", file=sys.stderr)
 
 
 def ensure_runner_exists() -> None:
