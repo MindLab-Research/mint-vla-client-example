@@ -1288,8 +1288,111 @@ async def test_issue_627_supervisor_reconciles_node_metrics_daemonset_separately
     assert daemon["nodes"]["mint-worker-0"]["actor_name"] == "mint_daemon_node_metrics_mint-worker-0"
     assert daemon_specs[0].worker_alias == "mint-worker-0"
     assert daemon_specs[0].node_ip == "10.0.0.7"
+    assert daemon_specs[0].is_head_node is False
     assert synced[-1] == []
     assert out["snapshot"]["replicas"] == {}
+
+
+@pytest.mark.anyio
+async def test_issue_638_supervisor_marks_head_node_metrics_daemon_spec(tmp_path) -> None:
+    config = load_topology_config(_write_topology_config(tmp_path))
+    manager = TopologyManager(
+        config,
+        provider_task_lister=lambda _config: [
+            ProviderTaskState(
+                alias="mint-worker-0",
+                provider="volcano",
+                task_name="mint-prod-worker-0",
+                task_id="task-0",
+                live=True,
+                node_ip="10.0.0.7",
+                gpu_count=8,
+            )
+        ],
+        ray_node_lister=lambda: [
+            RayNodeState(
+                node_ip="10.0.0.7",
+                ray_node_id="ray-0",
+                alive=True,
+                gpu_count=8,
+                is_head_node=True,
+            )
+        ],
+    )
+    daemon_specs: list[NodeMetricsDaemonSpec] = []
+
+    async def _node_metrics_factory(spec: NodeMetricsDaemonSpec):
+        daemon_specs.append(spec)
+        return _FakeNodeMetricsActor(spec)
+
+    supervisor = ModelActorSupervisor(
+        specs=[],
+        topology_manager=manager,
+        node_metrics_enabled=True,
+        node_metrics_factory=_node_metrics_factory,
+        placement_reconciler=lambda _desired: {"ok": True, "blocked": {}},
+        scheduler_sync=lambda _registrations: None,
+    )
+
+    out = await supervisor.reconcile_once()
+
+    assert daemon_specs[0].is_head_node is True
+    assert out["snapshot"]["topology"]["nodes"]["mint-worker-0"]["is_head_node"] is True
+    assert out["snapshot"]["daemons"]["node_metrics"]["nodes"]["mint-worker-0"]["state"] == "healthy"
+
+
+@pytest.mark.anyio
+async def test_issue_638_supervisor_adds_observed_ray_head_node_metrics_daemon(
+    tmp_path,
+) -> None:
+    config = load_topology_config(_write_topology_config(tmp_path))
+    manager = TopologyManager(
+        config,
+        provider_task_lister=lambda _config: [
+            ProviderTaskState(
+                alias="mint-worker-0",
+                provider="volcano",
+                task_name="mint-prod-worker-0",
+                task_id="task-0",
+                live=True,
+                node_ip="10.0.0.7",
+                gpu_count=8,
+            )
+        ],
+        ray_node_lister=lambda: [
+            RayNodeState(
+                node_ip="10.0.0.1",
+                ray_node_id="ray-head",
+                alive=True,
+                gpu_count=0,
+                is_head_node=True,
+            ),
+            RayNodeState(node_ip="10.0.0.7", ray_node_id="ray-0", alive=True, gpu_count=8),
+        ],
+    )
+    daemon_specs: list[NodeMetricsDaemonSpec] = []
+
+    async def _node_metrics_factory(spec: NodeMetricsDaemonSpec):
+        daemon_specs.append(spec)
+        return _FakeNodeMetricsActor(spec)
+
+    supervisor = ModelActorSupervisor(
+        specs=[],
+        topology_manager=manager,
+        node_metrics_enabled=True,
+        node_metrics_factory=_node_metrics_factory,
+        placement_reconciler=lambda _desired: {"ok": True, "blocked": {}},
+        scheduler_sync=lambda _registrations: None,
+    )
+
+    out = await supervisor.reconcile_once()
+
+    specs_by_alias = {spec.worker_alias: spec for spec in daemon_specs}
+    assert set(specs_by_alias) == {"mint-head", "mint-worker-0"}
+    assert specs_by_alias["mint-head"].node_ip == "10.0.0.1"
+    assert specs_by_alias["mint-head"].is_head_node is True
+    assert out["snapshot"]["topology"]["nodes"]["mint-head"]["role"] == "head"
+    assert out["snapshot"]["topology"]["nodes"]["mint-head"]["is_head_node"] is True
 
 
 @pytest.mark.anyio
@@ -1527,6 +1630,71 @@ def test_issue_627_node_metrics_daemon_registers_expected_otel_gauges(
             "mint_node_metrics_collector_errors_total",
         }:
             assert expected in created
+    finally:
+        actor.shutdown()
+
+
+def test_issue_638_node_metrics_daemon_registers_head_ray_global_otel_gauges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opentelemetry.metrics as otel_metrics
+
+    created: list[str] = []
+
+    class _FakeMeter:
+        def create_observable_gauge(self, name, **_kwargs):
+            created.append(name)
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4317")
+    monkeypatch.setattr(otel_metrics, "get_meter", lambda _name: _FakeMeter())
+
+    actor = node_metrics_daemon_module.NodeMetricsCollectorActor(
+        worker_alias="mint-head",
+        node_ip="10.0.0.1",
+        deployment_env="prod",
+        cluster_id="volcano",
+        is_head_node=True,
+    )
+    try:
+        assert actor.health_snapshot()["is_head_node"] is True
+        for expected in {
+            "mint_ray_cluster_up",
+            "mint_ray_cluster_nodes",
+            "mint_ray_cluster_placement_groups_pending_gpu",
+            "mint_ray_cluster_probe_latency_ms",
+            "mint_ray_gcs_metrics_bridge_up",
+            "mint_ray_gcs_metrics_bridge_sample_count",
+        }:
+            assert expected in created
+    finally:
+        actor.shutdown()
+
+
+def test_issue_638_node_metrics_daemon_skips_ray_global_gauges_on_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opentelemetry.metrics as otel_metrics
+
+    created: list[str] = []
+
+    class _FakeMeter:
+        def create_observable_gauge(self, name, **_kwargs):
+            created.append(name)
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4317")
+    monkeypatch.setattr(otel_metrics, "get_meter", lambda _name: _FakeMeter())
+
+    actor = node_metrics_daemon_module.NodeMetricsCollectorActor(
+        worker_alias="mint-worker-0",
+        node_ip="10.0.0.7",
+        deployment_env="prod",
+        cluster_id="volcano",
+        is_head_node=False,
+    )
+    try:
+        assert actor.health_snapshot()["is_head_node"] is False
+        assert "mint_ray_cluster_up" not in created
+        assert "mint_ray_gcs_metrics_bridge_up" not in created
     finally:
         actor.shutdown()
 

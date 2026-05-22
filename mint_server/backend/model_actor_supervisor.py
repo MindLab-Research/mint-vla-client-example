@@ -1094,10 +1094,11 @@ class ModelActorSupervisorCore:
             return None
         if node.get("enabled") is False:
             return None
-        if str(node.get("role") or "gpu") != "gpu":
+        role = str(node.get("role") or "gpu")
+        if role not in {"gpu", "head"}:
             return None
         gpu_count = node.get("gpu_count")
-        if gpu_count is not None and int(gpu_count) <= 0:
+        if role == "gpu" and gpu_count is not None and int(gpu_count) <= 0:
             return None
         if node.get("mount_ok") is False or node.get("runtime_env_ok") is False:
             return None
@@ -1112,6 +1113,7 @@ class ModelActorSupervisorCore:
             deployment_env=deployment_env or None,
             cluster_id=cluster_id or None,
             actor_name=node_metrics_actor_name(str(alias)),
+            is_head_node=bool(node.get("is_head_node")),
         )
 
     async def _reconcile_node_metrics_daemons(self) -> None:

@@ -15,12 +15,23 @@ making observability part of the request critical path.
 - API and actor processes use distinct `service.instance.id` values; metrics add
   `mint_instance_id` to separate cumulative counters by process.
 - Do not assume Prometheus scrape is the primary source for MinT application
-  metrics. Some Ray/GCS metrics are still scraped separately.
+  metrics. Ray/GCS global metrics should be pushed by the head
+  `NodeMetricsCollectorActor` from cached snapshots, not collected by dashboard
+  refreshes through `/internal/metrics`.
+- `NodeMetricsCollectorActor` pushes node-local OS/NVML metrics from every ready
+  topology node. The observed Ray head node is also represented as `mint-head`
+  for metrics-daemon purposes so it can push Ray live-state, placement-group,
+  and GCS bridge health gauges without entering model placement or worker
+  provisioning semantics.
+- `/internal/metrics` is authenticated, opt-in, and debug/cached-only. Migrated
+  dashboards must not require `up{job="mint-internal-metrics"}` for their normal
+  runtime data path.
 
 Relevant implementation:
 - `mint_server/logging_context.py`
 - `mint_server/config.py::otel_env_vars`
 - route middleware in `mint_server/app.py`
+- node and Ray/GCS metric push in `mint_server/backend/node_metrics_daemon.py`
 
 ## Identifier Semantics
 
