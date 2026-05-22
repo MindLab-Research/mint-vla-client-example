@@ -4400,14 +4400,10 @@ class TaskFutureService:
         timeout_s: float = 10.0,
         create_if_missing: bool = False,
     ) -> dict[str, Any]:
-        actor = await self._task_state._get_ray_actor_async(
-            require_ready=False,
+        return await self._task_state.async_ensure_ready(
+            timeout_s=timeout_s,
             create_if_missing=create_if_missing,
         )
-        out = await async_get_ray_ref(actor.stats.remote(), timeout_s=timeout_s)
-        if not isinstance(out, dict):
-            raise TypeError(f"TaskStateStore.stats returned non-dict: {type(out)}")
-        return out
 
     async def async_ping(self, *, timeout_s: float = 5.0) -> dict[str, Any]:
         return await self._task_state.async_ping(timeout_s=timeout_s)
