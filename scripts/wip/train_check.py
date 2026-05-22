@@ -75,7 +75,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--all-models",
         action="store_true",
-        help="Run the standard 4-model matrix.",
+        help="Run the standard 5-model production matrix.",
     )
     parser.add_argument("--num-rl-steps", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=2)
@@ -228,7 +228,7 @@ def ensure_runner_exists() -> None:
 
 
 def make_run_root(results_root: Path, run_name: str | None, *, create: bool = True) -> Path:
-    timestamp = run_name or time.strftime("%Y%m%d_%H%M%S")
+    timestamp = run_name or time.strftime("%Y%m%d-%H%M%S")
     run_root = results_root / timestamp
     if create:
         run_root.mkdir(parents=True, exist_ok=True)
@@ -623,6 +623,32 @@ def write_summary(results: list[dict[str, object]], run_root: Path, args: argpar
     return json_path, md_path
 
 
+def write_outputs_and_maybe_notify(
+    results: list[dict[str, object]],
+    run_root: Path,
+    args: argparse.Namespace,
+    *,
+    default_send_feishu: bool,
+) -> bool:
+    json_path, md_path = write_summary(results, run_root, args)
+    feishu_report = build_feishu_report(results)
+    feishu_report_path = run_root / "final_feishu_report.md"
+    feishu_report_path.write_text(feishu_report + "\n")
+    print(f"[summary] json={json_path}")
+    print(f"[summary] md={md_path}")
+    print(f"[summary] final_feishu_report={feishu_report_path}")
+
+    should_send_feishu = bool(args.feishu) if args.feishu is not None else default_send_feishu
+    if not should_send_feishu:
+        return True
+    try:
+        send_feishu_report(feishu_report)
+    except subprocess.CalledProcessError as exc:
+        print(f"[summary] Feishu report failed: {exc}", file=sys.stderr)
+        return False
+    return True
+
+
 def print_dry_run(runs: list[ModelRun], sequential: bool) -> None:
     mode = "sequential" if sequential or len(runs) <= 1 else "parallel"
     print(f"[dry-run] mode={mode} models={len(runs)}")
@@ -651,20 +677,10 @@ def main() -> int:
         if args.dry_run or not args.all_models:
             raise
         results = preflight_failure_results(models, message)
-        json_path, md_path = write_summary(results, run_root, args)
-        feishu_report = build_feishu_report(results)
-        feishu_report_path = run_root / "final_feishu_report.md"
-        feishu_report_path.write_text(feishu_report + "\n")
-        print(f"[summary] json={json_path}")
-        print(f"[summary] md={md_path}")
-        print(f"[summary] final_feishu_report={feishu_report_path}")
-        should_send_feishu = bool(args.feishu) if args.feishu is not None else True
-        if should_send_feishu:
-            try:
-                send_feishu_report(feishu_report)
-            except subprocess.CalledProcessError as send_exc:
-                print(f"[summary] Feishu report failed: {send_exc}", file=sys.stderr)
-                return 3
+        if not write_outputs_and_maybe_notify(
+            results, run_root, args, default_send_feishu=True
+        ):
+            return 3
         print(f"[summary] preflight failed: {message}", file=sys.stderr)
         return 2
 
@@ -681,39 +697,18 @@ def main() -> int:
             if not args.all_models:
                 raise SystemExit(f"HTTP preflight failed: {exc}") from exc
             results = preflight_failure_results(models, f"HTTP preflight failed: {exc}")
-            json_path, md_path = write_summary(results, run_root, args)
-            feishu_report = build_feishu_report(results)
-            feishu_report_path = run_root / "final_feishu_report.md"
-            feishu_report_path.write_text(feishu_report + "\n")
-            print(f"[summary] json={json_path}")
-            print(f"[summary] md={md_path}")
-            print(f"[summary] final_feishu_report={feishu_report_path}")
-            should_send_feishu = bool(args.feishu) if args.feishu is not None else True
-            if should_send_feishu:
-                try:
-                    send_feishu_report(feishu_report)
-                except subprocess.CalledProcessError as send_exc:
-                    print(f"[summary] Feishu report failed: {send_exc}", file=sys.stderr)
-                    return 3
+            if not write_outputs_and_maybe_notify(
+                results, run_root, args, default_send_feishu=True
+            ):
+                return 3
             print(f"[summary] preflight failed: {exc}", file=sys.stderr)
             return 2
 
     results = run_parallel(runs, sequential)
-    json_path, md_path = write_summary(results, run_root, args)
-    feishu_report = build_feishu_report(results)
-    feishu_report_path = run_root / "final_feishu_report.md"
-    feishu_report_path.write_text(feishu_report + "\n")
-    print(f"[summary] json={json_path}")
-    print(f"[summary] md={md_path}")
-    print(f"[summary] final_feishu_report={feishu_report_path}")
-
-    should_send_feishu = bool(args.feishu) if args.feishu is not None else bool(args.all_models)
-    if should_send_feishu:
-        try:
-            send_feishu_report(feishu_report)
-        except subprocess.CalledProcessError as exc:
-            print(f"[summary] Feishu report failed: {exc}", file=sys.stderr)
-            return 3
+    if not write_outputs_and_maybe_notify(
+        results, run_root, args, default_send_feishu=bool(args.all_models)
+    ):
+        return 3
 
     failed = [result for result in results if result["exit_code"] != 0]
     if failed:
