@@ -78,6 +78,7 @@ _TRAINING_OPERATION_COUNTER: Any | None = None
 _TRAINING_OPERATION_DURATION_HISTOGRAM: Any | None = None
 _MEGATRON_SESSION_SWITCH_COUNTER: Any | None = None
 _MEGATRON_SESSION_SWITCH_DURATION_COUNTER: Any | None = None
+_MEGATRON_ACTOR_LIFECYCLE_COUNTER: Any | None = None
 _SCHEDULER_DECISION_COUNTER: Any | None = None
 _SCHEDULER_SWITCH_COUNTER: Any | None = None
 _SCHEDULER_QUEUE_WAIT_HISTOGRAM: Any | None = None
@@ -91,6 +92,12 @@ _ACTOR_OBS_LOCK = threading.Lock()
 _OTEL_RESOURCE_LOGGED = False
 _T = TypeVar("_T")
 _PROCESS_INSTANCE_TOKEN = uuid.uuid4().hex
+_MEGATRON_LIFECYCLE_EVENTS = frozenset({"startup_timeout", "recreate", "evicted", "unknown"})
+
+
+def _bounded_megatron_lifecycle_event(event: str | None) -> str:
+    value = str(event or "unknown").strip() or "unknown"
+    return value if value in _MEGATRON_LIFECYCLE_EVENTS else "unknown"
 
 
 def _detect_hostname() -> str:
@@ -650,6 +657,7 @@ def _configure_opentelemetry(root_logger: logging.Logger) -> None:
     global _VLLM_ACTOR_REQUEST_COUNTER, _VLLM_ACTOR_REQUEST_DURATION_HISTOGRAM
     global _TRAINING_OPERATION_COUNTER, _TRAINING_OPERATION_DURATION_HISTOGRAM
     global _MEGATRON_SESSION_SWITCH_COUNTER, _MEGATRON_SESSION_SWITCH_DURATION_COUNTER
+    global _MEGATRON_ACTOR_LIFECYCLE_COUNTER
     global _SCHEDULER_DECISION_COUNTER, _SCHEDULER_SWITCH_COUNTER, _SCHEDULER_QUEUE_WAIT_HISTOGRAM
     global _SCHEDULER_READY_SESSIONS_HISTOGRAM, _SCHEDULER_CHOSEN_QUEUE_DEPTH_HISTOGRAM
     global _PUBLIC_HEALTHZ_REFRESH_COUNTER, _TRACER
@@ -786,6 +794,11 @@ def _configure_opentelemetry(root_logger: logging.Logger) -> None:
             "mint_megatron_session_switch_duration_s_total",
             unit="s",
             description="Megatron session-switch duration totals observed by mint",
+        )
+        _MEGATRON_ACTOR_LIFECYCLE_COUNTER = meter.create_counter(
+            "mint_megatron_actor_lifecycle_events_total",
+            unit="{event}",
+            description="Megatron actor lifecycle events observed by mint",
         )
         _SCHEDULER_DECISION_COUNTER = meter.create_counter(
             "mint_scheduler_decision_total",
@@ -1052,6 +1065,27 @@ def record_megatron_session_switch_otel(
                 if total <= 0.0:
                     continue
                 _MEGATRON_SESSION_SWITCH_DURATION_COUNTER.add(total, attributes={**attrs, "phase": str(phase)})
+    except Exception:
+        pass
+
+
+def record_megatron_actor_lifecycle_otel(
+    *,
+    base_model: str,
+    event: str,
+    count: int = 1,
+) -> None:
+    if not _OTEL_ENABLED:
+        return
+    try:
+        if _MEGATRON_ACTOR_LIFECYCLE_COUNTER is not None and int(count) > 0:
+            _MEGATRON_ACTOR_LIFECYCLE_COUNTER.add(
+                int(count),
+                attributes={
+                    "base_model": str(base_model or "unknown"),
+                    "event": _bounded_megatron_lifecycle_event(event),
+                },
+            )
     except Exception:
         pass
 

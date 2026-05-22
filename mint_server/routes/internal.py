@@ -579,7 +579,6 @@ async def metrics() -> Response:
         raise HTTPException(status_code=404, detail="metrics endpoint disabled")
     stats = await admission_stats(include_actor_rss=False)
     lines: list[str] = []
-    megatron_actor_lifecycle_counts: dict[tuple[str, str], float] = {}
 
     model_scheduler = stats.get("model_work_scheduler")
     if isinstance(model_scheduler, dict):
@@ -995,101 +994,7 @@ async def metrics() -> Response:
                 _append_metric(lines, "mint_model_actor_inventory_actor_age_s", rec.get("age"), labels=labels)
                 _append_metric(lines, "mint_model_actor_inventory_actor_rss_bytes", rec.get("rss_bytes"), labels=labels)
                 _append_metric(lines, "mint_model_actor_inventory_actor_rss_sample_age_s", rec.get("rss_sample_age_s"), labels=labels)
-                if actor_type.strip().lower() == "vllm":
-                    vllm_labels = {"actor_name": actor_name, "base_model": model}
-                    _append_metric(
-                        lines,
-                        "mint_vllm_scheduler_waiting_requests",
-                        metadata.get("scheduler_waiting_requests"),
-                        labels=vllm_labels,
-                    )
-                    _append_metric(
-                        lines,
-                        "mint_vllm_scheduler_running_requests",
-                        metadata.get("scheduler_running_requests"),
-                        labels=vllm_labels,
-                    )
-                    _append_metric(
-                        lines,
-                        "mint_vllm_scheduler_kv_cache_usage_ratio",
-                        metadata.get("scheduler_kv_cache_usage_ratio"),
-                        labels=vllm_labels,
-                    )
-                    _append_metric(
-                        lines,
-                        "mint_vllm_prefix_cache_queries_total",
-                        metadata.get("prefix_cache_queries_total"),
-                        labels=vllm_labels,
-                    )
-                    _append_metric(
-                        lines,
-                        "mint_vllm_prefix_cache_hits_total",
-                        metadata.get("prefix_cache_hits_total"),
-                        labels=vllm_labels,
-                    )
-                    _append_metric(
-                        lines,
-                        "mint_vllm_prefix_cache_hit_ratio",
-                        metadata.get("prefix_cache_hit_ratio"),
-                        labels=vllm_labels,
-                    )
-                    _append_metric(
-                        lines,
-                        "mint_vllm_preemptions_total",
-                        metadata.get("preemptions_total"),
-                        labels=vllm_labels,
-                    )
-                    for stem in (
-                        "queue_time_s",
-                        "prefill_time_s",
-                        "decode_time_s",
-                        "time_per_output_token_s",
-                        "scheduled_tokens_iter",
-                        "scheduled_new_requests_iter",
-                        "scheduled_cached_requests_iter",
-                        "prefill_requests_iter",
-                        "decode_requests_iter",
-                        "prompt_tokens_iter",
-                        "generation_tokens_iter",
-                        "time_to_first_token_s",
-                        "inter_token_latency_s",
-                        "executor_execute_model_s",
-                        "worker_execute_model_s",
-                        "seq_slot_wait_s",
-                        "generate_lock_wait_s",
-                        "engine_read_lock_wait_s",
-                        "add_request_wait_s",
-                        "add_request_exec_s",
-                        "first_token_observed_s",
-                    ):
-                        _append_metric(lines, f"mint_vllm_{stem}_sum", metadata.get(f"{stem}_total"), labels=vllm_labels)
-                        _append_metric(lines, f"mint_vllm_{stem}_count", metadata.get(f"{stem}_count"), labels=vllm_labels)
-                        _append_metric(lines, f"mint_vllm_{stem}_max", metadata.get(f"{stem}_max"), labels=vllm_labels)
-                        _append_metric(
-                            lines,
-                            f"mint_vllm_{stem}_p50_recent",
-                            metadata.get(f"{stem}_p50_recent"),
-                            labels=vllm_labels,
-                        )
-                        _append_metric(
-                            lines,
-                            f"mint_vllm_{stem}_p95_recent",
-                            metadata.get(f"{stem}_p95_recent"),
-                            labels=vllm_labels,
-                        )
-                elif actor_type.strip().lower() == "megatron":
-                    megatron_labels = {"actor_name": actor_name, "base_model": model}
-                    for stem in (
-                        "active_sessions",
-                        "session_unknown",
-                        "session_step",
-                        "learning_rate",
-                        "gpu_memory_allocated_bytes",
-                        "gpu_memory_reserved_bytes",
-                        "gpu_memory_fragmentation_bytes",
-                    ):
-                        _append_metric(lines, f"mint_megatron_{stem}", metadata.get(stem), labels=megatron_labels)
-                elif actor_type.strip().lower() == "dense" and bool(metadata.get("poisoned")):
+                if actor_type.strip().lower() == "dense" and bool(metadata.get("poisoned")):
                     last_fatal_op = str(metadata.get("last_fatal_op") or "unknown")
                     poisoned_labels = {
                         "actor_name": actor_name,
@@ -1215,16 +1120,6 @@ async def metrics() -> Response:
                     labels=labels,
                 )
 
-        model_actor_inventory_lifecycle = actors.get("model_actor_inventory_lifecycle")
-        if isinstance(model_actor_inventory_lifecycle, list):
-            for row in model_actor_inventory_lifecycle:
-                if not isinstance(row, dict):
-                    continue
-                key = (str(row.get("base_model") or "unknown"), str(row.get("event") or "unknown"))
-                megatron_actor_lifecycle_counts[key] = float(megatron_actor_lifecycle_counts.get(key, 0.0)) + float(
-                    row.get("count") or 0.0
-                )
-
     proc = stats.get("process")
     if isinstance(proc, dict):
         _append_metric(lines, "mint_api_server_process_rss_bytes", proc.get("rss_bytes"))
@@ -1263,14 +1158,6 @@ async def metrics() -> Response:
             lines,
             "mint_driver_sampling_sessions_inflight",
             driver_state.get("sampling_sessions_inflight"),
-        )
-
-    for (base_model, event), count in sorted(megatron_actor_lifecycle_counts.items()):
-        _append_metric(
-            lines,
-            "mint_megatron_actor_lifecycle_events_total",
-            count,
-            labels={"base_model": base_model, "event": event},
         )
 
     ray_cluster = stats.get("ray_cluster")

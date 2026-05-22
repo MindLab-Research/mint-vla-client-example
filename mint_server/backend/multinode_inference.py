@@ -41,6 +41,7 @@ from .gpu_binding_helpers import gpu_bindings_from_ray_gpu_ids
 from .multinode_resources import MultiNodeEngineResources, compute_multinode_engine_resources
 from .ray_placement_groups import PlacementGroupMismatchError, get_named_placement_group
 from .ray_keepalive import ray_get_with_model_actor_supervisor_keepalive
+from .runtime_actor_metrics import current_ray_actor_name, init_vllm_runtime_otel_metrics
 from .vllm_scheduler_observability import (
     VllmStatsObserver,
     install_vllm_iteration_observability_patches,
@@ -701,6 +702,11 @@ def _create_mint_vllm_multinode_actor(
                 "MINT_VLLM_SERIALIZE_ADD_LORA_UNTIL_IDLE", default=False
             )
             self._vllm_stats_observer = VllmStatsObserver()
+            self._otel_runtime_metrics_enabled = init_vllm_runtime_otel_metrics(
+                snapshot_fn=self._vllm_stats_observer.snapshot,
+                actor_name=current_ray_actor_name("unknown"),
+                base_model=str(self.model_path or "unknown"),
+            )
             self._active_generates = 0
             self._active_generates_cond = asyncio.Condition()
             self._is_ready_timeout_s = float(os.environ.get("MINT_VLLM_IS_READY_TIMEOUT_S", "0.05"))
@@ -2477,7 +2483,6 @@ class MultiNodeInferenceEngine:
                     logger.warning(f"Error killing actor {self.actor_name}: {e}")
 
             node_ips: list[str] | None = None
-            gpus_per_node = 8
 
             # Preferred node pinning takes precedence over queue-based selection.
             preferred_placement = _model_gpu_placement_for_model(self.model_name)
