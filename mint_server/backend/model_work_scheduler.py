@@ -19,11 +19,13 @@ from ..config import (
     preferred_control_plane_resources,
 )
 from ..runtime_env import env_nonempty
+from ..server_info import _git_sha
 from .async_ray_control import async_get_ray_ref, sync_get_ray_ref
 
 logger = logging.getLogger(__name__)
 
 CLAIMABLE_REPLICA_STATUSES = frozenset({"healthy", "ready"})
+CURRENT_CODE_IDENTITY = os.environ.get("MINT_GIT_SHA") or _git_sha()
 
 
 class ModelWorkSchedulerUnavailableError(RuntimeError):
@@ -31,6 +33,10 @@ class ModelWorkSchedulerUnavailableError(RuntimeError):
 
 
 class ModelWorkSchedulerConflictError(RuntimeError):
+    pass
+
+
+class ModelWorkSchedulerCodeIdentityMismatchError(RuntimeError):
     pass
 
 
@@ -1285,6 +1291,7 @@ class _ModelWorkSchedulerActor:
         return {
             "actor_name": _ray_model_work_scheduler_actor_name(),
             "namespace": _ray_namespace(),
+            "code_identity": CURRENT_CODE_IDENTITY,
             "scheduler_instance_id": self._instance_id,
             "scheduler_epoch": self._scheduler_epoch,
             "task_state_store_enabled": self._use_task_state_store,
@@ -1319,6 +1326,7 @@ class _ModelWorkSchedulerActor:
             "actor_name": _ray_model_work_scheduler_actor_name(),
             "namespace": _ray_namespace(),
             "scheduler_instance_id": self._instance_id,
+            "code_identity": CURRENT_CODE_IDENTITY,
         }
 
 
@@ -1370,6 +1378,33 @@ class ModelWorkSchedulerClient:
     def _reset_ray_actor(self) -> None:
         self._ray_actor = None
 
+    def _validate_code_identity(self, snapshot: dict[str, Any]) -> None:
+        if not CURRENT_CODE_IDENTITY:
+            return
+        actor_code_identity = snapshot.get("code_identity")
+        if actor_code_identity == CURRENT_CODE_IDENTITY:
+            return
+        raise ModelWorkSchedulerCodeIdentityMismatchError(
+            "model work scheduler code identity mismatch: "
+            f"expected={CURRENT_CODE_IDENTITY!r} actual={actor_code_identity!r}"
+        )
+
+    def _kill_cached_actor_for_code_identity_mismatch(self, exc: BaseException) -> None:
+        actor = self._ray_actor
+        self._reset_ray_actor()
+        if actor is None:
+            raise exc
+        _append_model_work_scheduler_debug(
+            "kill_actor_code_identity_mismatch",
+            expected_code_identity=CURRENT_CODE_IDENTITY,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        try:
+            import ray
+        except Exception as e:
+            raise ModelWorkSchedulerUnavailableError("Ray import failed") from e
+        ray.kill(actor, no_restart=True)
+
     async def _get_ray_actor_async(
         self,
         *,
@@ -1390,13 +1425,16 @@ class ModelWorkSchedulerClient:
         if not ray.is_initialized():
             raise ModelWorkSchedulerUnavailableError("Ray not initialized")
         if self._ray_actor is not None:
-            if not require_ready:
-                return self._ray_actor
             try:
                 out = await self._await_ray_ref(self._ray_actor.ping.remote(), timeout_s=1.0)
                 if not isinstance(out, dict):
                     raise TypeError(f"ModelWorkScheduler.ping returned non-dict: {type(out)}")
+                self._validate_code_identity(out)
                 return self._ray_actor
+            except ModelWorkSchedulerCodeIdentityMismatchError:
+                self._reset_ray_actor()
+                if not create_if_missing:
+                    raise
             except Exception:
                 self._reset_ray_actor()
 
@@ -1407,7 +1445,18 @@ class ModelWorkSchedulerClient:
                 actor_name,
                 namespace=_ray_namespace(),
             )
+            out = await self._await_ray_ref(
+                self._ray_actor.ping.remote(),
+                timeout_s=5.0 if require_ready else 1.0,
+            )
+            if not isinstance(out, dict):
+                raise TypeError(f"ModelWorkScheduler.ping returned non-dict: {type(out)}")
+            self._validate_code_identity(out)
             return self._ray_actor
+        except ModelWorkSchedulerCodeIdentityMismatchError as e:
+            if not create_if_missing:
+                raise
+            await asyncio.to_thread(self._kill_cached_actor_for_code_identity_mismatch, e)
         except ValueError:
             if not create_if_missing:
                 raise ModelWorkSchedulerUnavailableError(
@@ -1715,6 +1764,17 @@ class ModelWorkSchedulerClient:
         out = await self._await_ray_ref(actor.stats.remote(), timeout_s=timeout_s)
         if not isinstance(out, dict):
             raise TypeError(f"ModelWorkScheduler.stats returned non-dict: {type(out)}")
+        try:
+            self._validate_code_identity(out)
+        except ModelWorkSchedulerCodeIdentityMismatchError as e:
+            if not create_if_missing:
+                raise
+            await asyncio.to_thread(self._kill_cached_actor_for_code_identity_mismatch, e)
+            actor = await self._get_ray_actor_async(require_ready=False, create_if_missing=True)
+            out = await self._await_ray_ref(actor.stats.remote(), timeout_s=timeout_s)
+            if not isinstance(out, dict):
+                raise TypeError(f"ModelWorkScheduler.stats returned non-dict: {type(out)}")
+            self._validate_code_identity(out)
         return out
 
     async def async_ping(self, *, timeout_s: float = 5.0) -> dict[str, Any]:
@@ -1728,6 +1788,7 @@ class ModelWorkSchedulerClient:
             raise TypeError(f"ModelWorkScheduler.ping returned non-dict: {type(out)}")
         if not bool(out.get("ok")):
             raise ModelWorkSchedulerUnavailableError(f"ModelWorkScheduler ping failed: {out!r}")
+        self._validate_code_identity(out)
         return out
 
     async def ping(self, *, timeout_s: float = 5.0) -> dict[str, Any]:
