@@ -28,6 +28,12 @@ _REAPER_METRICS: dict[str, float] = {
     "delete_tombstone": 0.0,
 }
 _REAPER_PAYLOAD_EVICT_ERRORS_TOTAL = 0.0
+_FUTURE_TIMEOUT_METRICS: dict[str, Any] = {
+    "queue": 0.0,
+    "execution": 0.0,
+    "total": 0.0,
+    "by_op": {},
+}
 _BILLING_EVENT_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "mindlab.mint.billing.usage_event.v1")
 BILLING_OUTBOX_STATUSES = frozenset({"pending", "flushing", "failed"})
 _BILLING_FLUSH_METRICS: dict[str, float] = {
@@ -286,6 +292,32 @@ def _inc_payload_evict_errors(count: int = 1) -> None:
         pass
 
 
+def _inc_future_timeout(kind: str, *, op: str | None = None, count: int = 1) -> None:
+    if int(count) <= 0:
+        return
+    normalized = str(kind or "execution")
+    if normalized not in {"queue", "execution"}:
+        normalized = "execution"
+    amount = float(count)
+    _FUTURE_TIMEOUT_METRICS[normalized] = float(_FUTURE_TIMEOUT_METRICS.get(normalized) or 0.0) + amount
+    _FUTURE_TIMEOUT_METRICS["total"] = float(_FUTURE_TIMEOUT_METRICS.get("total") or 0.0) + amount
+    if isinstance(op, str) and op.strip():
+        by_op = _FUTURE_TIMEOUT_METRICS.setdefault("by_op", {})
+        if isinstance(by_op, dict):
+            op_key = op.strip()
+            rec = by_op.setdefault(op_key, {"queue": 0.0, "execution": 0.0, "total": 0.0})
+            if isinstance(rec, dict):
+                rec[normalized] = float(rec.get(normalized) or 0.0) + amount
+                rec["total"] = float(rec.get("total") or 0.0) + amount
+    try:
+        from ..logging_context import record_task_futures_timeout_metric
+
+        record_task_futures_timeout_metric(kind=normalized, op=op)
+        record_task_futures_timeout_metric(kind="total", op=op)
+    except Exception:
+        pass
+
+
 def _inc_billing_metric(key: str, count: int = 1) -> None:
     if int(count) <= 0:
         return
@@ -301,6 +333,26 @@ def task_future_reaper_metrics_snapshot() -> dict[str, Any]:
     return {
         "rows_total": dict(_REAPER_METRICS),
         "payload_evict_errors_total": float(_REAPER_PAYLOAD_EVICT_ERRORS_TOTAL),
+    }
+
+
+def future_timeout_metrics_snapshot() -> dict[str, Any]:
+    by_op: dict[str, dict[str, float]] = {}
+    raw_by_op = _FUTURE_TIMEOUT_METRICS.get("by_op")
+    if isinstance(raw_by_op, dict):
+        for op, rec in raw_by_op.items():
+            if not isinstance(rec, dict):
+                continue
+            by_op[str(op)] = {
+                "queue": float(rec.get("queue") or 0.0),
+                "execution": float(rec.get("execution") or 0.0),
+                "total": float(rec.get("total") or 0.0),
+            }
+    return {
+        "queue": float(_FUTURE_TIMEOUT_METRICS.get("queue") or 0.0),
+        "execution": float(_FUTURE_TIMEOUT_METRICS.get("execution") or 0.0),
+        "total": float(_FUTURE_TIMEOUT_METRICS.get("total") or 0.0),
+        "by_op": by_op,
     }
 
 
@@ -1380,8 +1432,10 @@ class TaskStateStore:
                 (cutoff, batch_limit),
             ).fetchall()
             expired: list[str] = []
+            expired_by_op: dict[str, int] = {}
             for row in rows:
                 request_id = str(row["request_id"])
+                op = str(row["op"] or "unknown")
                 metadata = _json_loads(row["metadata_json"])
                 metadata.setdefault("terminal_status", "expired")
                 metadata.setdefault("expired_at", ts)
@@ -1407,7 +1461,10 @@ class TaskStateStore:
                         now=ts,
                     )
                     expired.append(request_id)
+                    expired_by_op[op] = expired_by_op.get(op, 0) + 1
             _inc_reaper_rows("expire_pending", len(expired))
+            for op, count in expired_by_op.items():
+                _inc_future_timeout("execution", op=op, count=count)
             return expired
 
     def list_terminal_payloads_for_eviction(
@@ -2468,6 +2525,7 @@ class TaskStateStore:
                 "errors_count": int(errors),
                 "refs_count": refs,
             },
+            "timeout_counts": future_timeout_metrics_snapshot(),
         }
 
     def list_expired_leases(self, *, now: float | None = None, limit: int | None = None) -> list[dict[str, Any]]:
@@ -2853,6 +2911,28 @@ class _TaskStateStoreActor:
             _gauge("mint_task_futures_result_refs_count", _nested_scalar("payload_stats", "result_refs_count"))
             _gauge("mint_task_futures_errors_count", _nested_scalar("payload_stats", "errors_count"))
             _gauge("mint_task_futures_refs_count", _nested_scalar("payload_stats", "refs_count"))
+
+            def _future_timeouts(_options):
+                timeout_counts = self.stats().get("timeout_counts")
+                if not isinstance(timeout_counts, dict):
+                    return []
+                observations = []
+                for kind in ("queue", "execution", "total"):
+                    value = _metric_number(timeout_counts.get(kind))
+                    if value is not None:
+                        observations.append(Observation(value, _attrs(kind=kind)))
+                by_op = timeout_counts.get("by_op")
+                if isinstance(by_op, dict):
+                    for op, rec in sorted(by_op.items()):
+                        if not isinstance(rec, dict):
+                            continue
+                        for kind in ("queue", "execution", "total"):
+                            value = _metric_number(rec.get(kind))
+                            if value is not None:
+                                observations.append(Observation(value, _attrs(op=op, kind=kind)))
+                return observations
+
+            _gauge("mint_task_futures_timeouts_total", _future_timeouts)
 
             def _billing_status(field: str):
                 def _callback(_options):

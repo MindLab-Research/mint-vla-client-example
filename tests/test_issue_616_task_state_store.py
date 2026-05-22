@@ -102,6 +102,12 @@ def test_task_state_store_actor_wait_status_change_notifies(tmp_path) -> None:
 
 
 def test_issue_638_task_state_store_stats_include_future_dashboard_fields(tmp_path) -> None:
+    import mint_server.backend.task_state_store as task_state_store_module
+
+    task_state_store_module._FUTURE_TIMEOUT_METRICS.clear()
+    task_state_store_module._FUTURE_TIMEOUT_METRICS.update(
+        {"queue": 0.0, "execution": 0.0, "total": 0.0, "by_op": {}}
+    )
     actor = _TaskStateStoreActor(str(tmp_path / "task-state-metrics.sqlite3"))
     try:
         actor.create_task(
@@ -136,6 +142,15 @@ def test_issue_638_task_state_store_stats_include_future_dashboard_fields(tmp_pa
         assert stats["by_op"]["sampling.asample"]["results"] == 1
         assert stats["age_stats"]["oldest_pending_s"] >= 0
         assert stats["payload_stats"]["result_refs_count"] == 1
+        assert stats["timeout_counts"]["total"] == 0.0
+
+        expired = actor.expire_active_tasks(older_than_s=10.0, now=200.0)
+        assert expired == ["req-pending"]
+        stats = actor.stats()
+        assert stats["timeout_counts"]["execution"] == 1.0
+        assert stats["timeout_counts"]["total"] == 1.0
+        assert stats["timeout_counts"]["by_op"]["sampling.asample"]["execution"] == 1.0
+        assert stats["timeout_counts"]["by_op"]["sampling.asample"]["total"] == 1.0
     finally:
         actor.close()
 
@@ -146,7 +161,13 @@ def test_issue_638_task_state_store_registers_otel_future_and_billing_gauges(
 ) -> None:
     import opentelemetry.metrics as otel_metrics
 
+    import mint_server.backend.task_state_store as task_state_store_module
     import mint_server.logging_context as logging_context
+
+    task_state_store_module._FUTURE_TIMEOUT_METRICS.clear()
+    task_state_store_module._FUTURE_TIMEOUT_METRICS.update(
+        {"queue": 0.0, "execution": 0.0, "total": 0.0, "by_op": {}}
+    )
 
     gauges: dict[str, list] = {}
 
@@ -172,6 +193,7 @@ def test_issue_638_task_state_store_registers_otel_future_and_billing_gauges(
 
         assert "mint_task_futures_pending" in gauges
         assert "mint_task_futures_oldest_pending_s" in gauges
+        assert "mint_task_futures_timeouts_total" in gauges
         assert "mint_billing_outbox_rows" in gauges
         assert "mint_billing_outbox_flush_attempts_total" in gauges
         assert "mint_billing_observation_skipped_total" in gauges
@@ -183,6 +205,10 @@ def test_issue_638_task_state_store_registers_otel_future_and_billing_gauges(
             assert obs.attributes["deployment.env"] == "prod"
             assert obs.attributes["mint.cluster_id"] == "volcano"
             assert "request_id" not in obs.attributes
+        timeout_obs = gauges["mint_task_futures_timeouts_total"][0](None)
+        assert any(obs.value == 0.0 and obs.attributes.get("kind") == "queue" for obs in timeout_obs)
+        assert any(obs.value == 0.0 and obs.attributes.get("kind") == "execution" for obs in timeout_obs)
+        assert all("request_id" not in obs.attributes for obs in timeout_obs)
     finally:
         actor.close()
 
