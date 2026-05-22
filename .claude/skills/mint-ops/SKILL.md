@@ -65,7 +65,7 @@ curl -s -H "X-API-Key: $MINT_API_KEY" "$BASE/internal/actors?type=vllm" | jq
 | `/api/v1/healthz` | External business health; unauthenticated and cache-backed |
 | `/api/v1/internal/healthz` | Internal operations health; supervisor/control-plane cached snapshot |
 | `/internal/admission_stats` | Combined scheduler, actor, store, process, Ray summary |
-| `/internal/metrics` | Prometheus-style metrics |
+| `/internal/metrics` | Debug-only Prometheus text fallback; normal dashboards use OTel push |
 | `/internal/model_work_scheduler` | Scheduler health and hot subqueue state |
 | `/internal/model_work_scheduler/debug_state` | Scheduler debug snapshot |
 | `/internal/debug/scheduler_decisions` | Scheduler decision history; supports filters |

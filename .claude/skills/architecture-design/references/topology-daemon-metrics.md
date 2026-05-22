@@ -554,6 +554,48 @@ when `MINT_DEPLOYMENT_ENV` is set, otherwise `/vePFS-Mindverse/share/mint`.
 Override it with `MINT_NODE_METRICS_DISK_PATH` for local development or
 specialized mounts.
 
+### Head Ray / GCS Metrics
+
+Exactly one head `NodeMetricsCollectorActor` pushes global Ray/GCS gauges from
+its cached background samples. Worker node collectors must not register these
+families.
+
+Ray live-state gauges:
+
+- `mint_ray_cluster_up`
+- `mint_ray_cluster_warning_count`
+- `mint_ray_cluster_probe_error_count`
+- `mint_ray_cluster_slow_probe_count`
+- `mint_ray_cluster_total_probe_latency_ms`
+- `mint_ray_cluster_cache_age_s`
+- `mint_ray_cluster_last_success_unixtime`
+- `mint_ray_cluster_last_success_age_s`
+- `mint_ray_cluster_nodes{state=alive|dead}`
+- `mint_ray_cluster_dead_nodes_missing_heartbeats`
+- `mint_ray_cluster_{cpu,gpu,memory,object_store_memory}_{total|available}`
+- `mint_ray_cluster_placement_groups_{total|created|removed|pending|pending_gpu}`
+- `mint_ray_cluster_named_actors_total`
+- `mint_ray_cluster_named_actors_namespace`
+- `mint_ray_cluster_probe_success{probe}`
+- `mint_ray_cluster_probe_latency_ms{probe}`
+
+GCS bridge gauges:
+
+- `mint_ray_gcs_metrics_bridge_up`
+- `mint_ray_gcs_metrics_bridge_scrape_error_count`
+- `mint_ray_gcs_metrics_bridge_sample_count`
+- `mint_ray_gcs_metrics_bridge_scrape_latency_ms`
+- `mint_ray_gcs_metrics_bridge_cache_age_s`
+- `mint_ray_gcs_metrics_bridge_last_success_unixtime`
+- `mint_ray_gcs_metrics_bridge_last_success_age_s`
+
+The head collector also pushes selected raw GCS/grpc aggregates as
+`mint_ray_gcs_raw_<upstream_name>` gauges, plus MinT-derived `mint_ray_gcs_*`
+gauges such as task-event drop/store ratios and histogram means. It must not
+attach source addresses, raw errors, node IDs, actor names, or placement group
+names as metric labels. Do not push new MinT-owned metrics without the `mint_`
+prefix.
+
 ## Actor Correlation
 
 Actor-to-GPU correlation stays in supervisor-owned inventory:
@@ -628,8 +670,10 @@ Existing Prometheus metrics may be removed or reduced only after their signals
 are covered by OTel push metrics and any dependent dashboard/alert has migrated.
 
 If `/internal/metrics` is enabled for debugging, it must remain authenticated and
-must not trigger node-local sampling. It may render cached process-local state
-only.
+must not trigger node-local sampling or Ray/GCS probing. It may render cached
+process-local state only. Ray/GCS families are owned by the head
+`NodeMetricsCollectorActor` and must not be re-rendered through
+`/internal/metrics`.
 
 ## Failure Semantics
 

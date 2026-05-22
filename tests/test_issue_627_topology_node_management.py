@@ -1781,6 +1781,8 @@ def test_issue_638_node_metrics_daemon_registers_head_ray_global_otel_gauges(
             "mint_ray_cluster_probe_latency_ms",
             "mint_ray_gcs_metrics_bridge_up",
             "mint_ray_gcs_metrics_bridge_sample_count",
+            "mint_ray_gcs_raw_gcs_actors_count",
+            "mint_ray_gcs_gcs_task_manager_task_events_drop_ratio",
         }:
             assert expected in created
     finally:
@@ -1862,6 +1864,8 @@ def test_issue_638_ray_global_otel_callbacks_use_bounded_labels(
         lambda: {
             "up": True,
             "sample_count": 3,
+            "aggregates": {"gcs_actors_count": 7.0},
+            "derived": {"gcs_task_manager_task_events_drop_ratio": 0.25},
             "scrape_errors": [{"address": "10.0.0.1:8080", "error": "do-not-label"}],
         },
     )
@@ -1893,8 +1897,19 @@ def test_issue_638_ray_global_otel_callbacks_use_bounded_labels(
             "mint_ray_cluster_probe_success",
             "mint_ray_cluster_probe_latency_ms",
             "mint_ray_gcs_metrics_bridge_sample_count",
+            "mint_ray_gcs_raw_gcs_actors_count",
+            "mint_ray_gcs_gcs_task_manager_task_events_drop_ratio",
         ):
             observations.extend(callbacks[name](None))
+        observed_by_name = {
+            name: callbacks[name](None)
+            for name in (
+                "mint_ray_gcs_raw_gcs_actors_count",
+                "mint_ray_gcs_gcs_task_manager_task_events_drop_ratio",
+            )
+        }
+        assert observed_by_name["mint_ray_gcs_raw_gcs_actors_count"][0].value == 7.0
+        assert observed_by_name["mint_ray_gcs_gcs_task_manager_task_events_drop_ratio"][0].value == 0.25
         for obs in observations:
             attrs = dict(obs.attributes)
             assert set(attrs) <= {

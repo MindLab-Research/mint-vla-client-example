@@ -462,8 +462,6 @@ def test_issue_588_admission_stats_rss_path_preserves_model_actor_inventory_meta
     sampling_route = importlib.import_module("mint_server.routes.sampling")
     service_route = importlib.import_module("mint_server.routes.service")
     dense_session_state_module = importlib.import_module("mint_server.backend.dense_session_state")
-    ray_cluster_health_module = importlib.import_module("mint_server.ray_cluster_health")
-    ray_gcs_metrics_module = importlib.import_module("mint_server.ray_gcs_metrics")
 
     class _FakeModelWorkScheduler:
         async def stats(self, *, timeout_s: float = 10.0) -> dict:
@@ -523,8 +521,8 @@ def test_issue_588_admission_stats_rss_path_preserves_model_actor_inventory_meta
     monkeypatch.setattr(sampling_route, "_lora_load_lock_count", lambda: 0)
     monkeypatch.setattr(service_route, "session_manager", None)
     monkeypatch.setattr(dense_session_state_module, "collect_dense_session_state_stats", lambda: {})
-    monkeypatch.setattr(ray_cluster_health_module, "get_ray_cluster_health_snapshot", lambda: {})
-    monkeypatch.setattr(ray_gcs_metrics_module, "get_ray_gcs_metrics_snapshot", lambda: {})
+    monkeypatch.setattr(internal_routes, "get_ray_cluster_health_snapshot", lambda: {})
+    monkeypatch.setattr(internal_routes, "get_ray_gcs_metrics_snapshot", lambda: {})
 
     stats = asyncio.run(internal_routes.admission_stats(include_actor_rss=True))
     rec = stats["actors"]["model_actor_inventory"][0]
@@ -546,9 +544,6 @@ def test_issue_248_admission_stats_metrics_path_uses_cached_pool_snapshot(monkey
     sampling_route = importlib.import_module("mint_server.routes.sampling")
     service_route = importlib.import_module("mint_server.routes.service")
     dense_session_state_module = importlib.import_module("mint_server.backend.dense_session_state")
-    ray_cluster_health_module = importlib.import_module("mint_server.ray_cluster_health")
-    ray_gcs_metrics_module = importlib.import_module("mint_server.ray_gcs_metrics")
-
     class _FakeModelWorkScheduler:
         async def stats(self, *, timeout_s: float = 10.0) -> dict:
             return {"depth": 0, "backlog_depth": 0, "replica_queues": {}, "leases": [], "counters": {}}
@@ -597,8 +592,16 @@ def test_issue_248_admission_stats_metrics_path_uses_cached_pool_snapshot(monkey
     monkeypatch.setattr(sampling_route, "_lora_load_lock_count", lambda: 0)
     monkeypatch.setattr(service_route, "session_manager", None)
     monkeypatch.setattr(dense_session_state_module, "collect_dense_session_state_stats", lambda: {})
-    monkeypatch.setattr(ray_cluster_health_module, "get_ray_cluster_health_snapshot", lambda: {})
-    monkeypatch.setattr(ray_gcs_metrics_module, "get_ray_gcs_metrics_snapshot", lambda: {})
+    monkeypatch.setattr(
+        internal_routes,
+        "get_ray_cluster_health_snapshot",
+        lambda: (_ for _ in ()).throw(AssertionError("metrics scrape must not probe Ray cluster health")),
+    )
+    monkeypatch.setattr(
+        internal_routes,
+        "get_ray_gcs_metrics_snapshot",
+        lambda: (_ for _ in ()).throw(AssertionError("metrics scrape must not scrape Ray GCS metrics")),
+    )
 
     stats = asyncio.run(internal_routes.admission_stats(include_actor_rss=False))
 
@@ -701,7 +704,7 @@ def test_issue_248_scheduler_decisions_debug_route_proxies_filters(monkeypatch) 
     assert payload["leases"] == [{"item": {"domain_key": "vllm:Qwen/Qwen3-4B-Instruct-2507"}}]
 
 
-def test_issue_248_internal_metrics_exports_ray_control_plane_cache_timestamps(monkeypatch) -> None:
+def test_issue_638_internal_metrics_does_not_export_migrated_ray_gcs_families(monkeypatch) -> None:
     monkeypatch.setenv("MINT_INTERNAL_PROMETHEUS_METRICS_ENABLED", "1")
 
     async def _fake_with_ray(*, include_actor_rss: bool = True) -> dict:
@@ -741,8 +744,7 @@ def test_issue_248_internal_metrics_exports_ray_control_plane_cache_timestamps(m
     resp = asyncio.run(internal_routes.metrics())
     text = resp.body.decode("utf-8")
 
-    assert "mint_ray_cluster_last_success_unixtime 1700000000" in text
-    assert "mint_ray_cluster_last_success_age_s 12" in text
-    assert "mint_ray_gcs_metrics_bridge_last_success_unixtime 1700000005" in text
-    assert "mint_ray_gcs_metrics_bridge_last_success_age_s 9" in text
-    assert 'gcs_actors_count{State="ALIVE"} 6' in text
+    assert "mint_ray_cluster_" not in text
+    assert "mint_ray_gcs_" not in text
+    assert "mint_ray_gcs_metrics_bridge_" not in text
+    assert "gcs_actors_count" not in text

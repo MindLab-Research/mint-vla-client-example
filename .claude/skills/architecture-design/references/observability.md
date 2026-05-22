@@ -21,11 +21,12 @@ making observability part of the request critical path.
 - `NodeMetricsCollectorActor` pushes node-local OS/NVML metrics from every ready
   topology node. The observed Ray head node is also represented as `mint-head`
   for metrics-daemon purposes so it can push Ray live-state, placement-group,
-  and GCS bridge health gauges without entering model placement or worker
-  provisioning semantics.
+  GCS bridge health, selected raw GCS/grpc aggregates, and MinT-derived GCS
+  gauges without entering model placement or worker provisioning semantics.
 - `/internal/metrics` is authenticated, opt-in, and debug/cached-only. Migrated
   dashboards must not require `up{job="mint-internal-metrics"}` for their normal
-  runtime data path.
+  runtime data path. It must not render Ray/GCS families that are owned by the
+  head `NodeMetricsCollectorActor`.
 
 Relevant implementation:
 - `mint_server/logging_context.py`

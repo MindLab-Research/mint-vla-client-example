@@ -27,6 +27,18 @@ def _ray_gcs_snapshot() -> dict[str, Any]:
     return get_ray_gcs_metrics_snapshot()
 
 
+def _ray_gcs_aggregate_metric_names() -> tuple[str, ...]:
+    from ..ray_gcs_metrics import RAY_GCS_AGGREGATE_METRIC_NAMES
+
+    return RAY_GCS_AGGREGATE_METRIC_NAMES
+
+
+def _ray_gcs_derived_metric_names() -> tuple[str, ...]:
+    from ..ray_gcs_metrics import RAY_GCS_DERIVED_METRIC_NAMES
+
+    return RAY_GCS_DERIVED_METRIC_NAMES
+
+
 def _observe_cluster_scalar_from_nodes(snapshot: dict[str, Any], field: str, observation_cls, attrs: dict[str, str]):
     nodes = snapshot.get("nodes")
     if not isinstance(nodes, dict):
@@ -597,6 +609,16 @@ class NodeMetricsCollectorActor:
                 return []
             return [observation_cls(float(value), self._ray_global_attrs())]
 
+        def _observe_gcs_nested_scalar(section: str, field: str):
+            snapshot = _gcs_snapshot_cached()
+            values = snapshot.get(section)
+            if not isinstance(values, dict):
+                return []
+            value = values.get(field)
+            if value is None:
+                return []
+            return [observation_cls(float(value), self._ray_global_attrs())]
+
         gauge_factory("mint_ray_cluster_up", lambda options: _observe_cluster_scalar("up"))
         gauge_factory("mint_ray_cluster_warning_count", lambda options: _observe_cluster_scalar("warning_count"))
         gauge_factory("mint_ray_cluster_probe_error_count", lambda options: _observe_cluster_scalar("probe_error_count"))
@@ -639,6 +661,16 @@ class NodeMetricsCollectorActor:
         gauge_factory("mint_ray_gcs_metrics_bridge_cache_age_s", lambda options: _observe_gcs_scalar("cache_age_s"), unit="s")
         gauge_factory("mint_ray_gcs_metrics_bridge_last_success_unixtime", lambda options: _observe_gcs_scalar("last_success_unixtime"))
         gauge_factory("mint_ray_gcs_metrics_bridge_last_success_age_s", lambda options: _observe_gcs_scalar("last_success_age_s"), unit="s")
+        for metric_name in _ray_gcs_aggregate_metric_names():
+            gauge_factory(
+                f"mint_ray_gcs_raw_{metric_name}",
+                lambda options, metric_name=metric_name: _observe_gcs_nested_scalar("aggregates", metric_name),
+            )
+        for metric_name in _ray_gcs_derived_metric_names():
+            gauge_factory(
+                f"mint_ray_gcs_{metric_name}",
+                lambda options, metric_name=metric_name: _observe_gcs_nested_scalar("derived", metric_name),
+            )
 
     def _sample_ray_global_once(self) -> None:
         if not self._spec.is_head_node:

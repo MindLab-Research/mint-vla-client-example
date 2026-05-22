@@ -38,6 +38,13 @@ _HISTOGRAM_BASE_NAMES = {
 
 _HISTOGRAM_SUFFIXES = {"bucket", "count", "sum"}
 
+RAY_GCS_AGGREGATE_METRIC_NAMES = tuple(sorted(_EXACT_METRIC_NAMES))
+RAY_GCS_DERIVED_METRIC_NAMES = (
+    "gcs_task_manager_task_events_drop_ratio",
+    "gcs_task_manager_task_events_store_ratio",
+    *tuple(f"{base}_mean" for base in sorted(_HISTOGRAM_BASE_NAMES)),
+)
+
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()

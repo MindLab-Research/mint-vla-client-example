@@ -59,6 +59,12 @@ maintenance-cron/startup degraded markers, then returns a small component
 summary. It must not perform per-request fanout to runtime actors and does not
 promise scheduler, task, topology, or reaper summaries.
 
+`/internal/metrics` is a debug text endpoint, not the production metrics
+transport. It must not probe Ray/GCS or render families owned by the head
+`NodeMetricsCollectorActor`; use `/internal/ray_cluster_health` and
+`/internal/ray_gcs_metrics` for explicit JSON diagnostics, and OTel push for
+dashboards/alerts.
+
 ## Actor admin semantics
 
 `/internal/actors` is an admin inventory view. It is not the scheduling source of truth.
