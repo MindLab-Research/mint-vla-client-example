@@ -1215,6 +1215,8 @@ class TopologyManager:
             return None, f"unknown worker_alias {alias!r}"
         if not node.ready:
             return None, f"worker_alias {alias!r} is not ready: state={node.state} error={node.last_error or ''}".strip()
+        if node.role != "gpu" or node.provider == "ray" or node.is_head_node:
+            return None, f"worker_alias {alias!r} is not valid for model placement: role={node.role}"
         return node.node_ip, None
 
     def snapshot(self) -> dict[str, Any]:

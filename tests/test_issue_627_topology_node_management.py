@@ -96,6 +96,7 @@ class _FakeRuntimeActor:
 class _FakeNodeMetricsActor:
     def __init__(self, spec: NodeMetricsDaemonSpec) -> None:
         self.spec = spec
+        self.shutdown_requested = False
 
     def health_snapshot(self) -> dict:
         return {
@@ -106,6 +107,7 @@ class _FakeNodeMetricsActor:
             "ray_node_id": self.spec.ray_node_id,
             "deployment_env": self.spec.deployment_env,
             "cluster_id": self.spec.cluster_id,
+            "is_head_node": self.spec.is_head_node,
             "sample_count": 0,
             "error_count": 0,
         }
@@ -117,6 +119,7 @@ class _FakeNodeMetricsActor:
             "ray_node_id": self.spec.ray_node_id,
             "deployment_env": self.spec.deployment_env,
             "cluster_id": self.spec.cluster_id,
+            "is_head_node": self.spec.is_head_node,
             "hostname": "worker-host",
             "load_1m": 1.0,
             "load_5m": 2.0,
@@ -157,6 +160,7 @@ class _FakeNodeMetricsActor:
         }
 
     def shutdown(self) -> bool:
+        self.shutdown_requested = True
         return True
 
 
@@ -1396,6 +1400,119 @@ async def test_issue_638_supervisor_adds_observed_ray_head_node_metrics_daemon(
 
 
 @pytest.mark.anyio
+async def test_issue_638_mint_head_alias_is_not_valid_model_placement(tmp_path) -> None:
+    config = load_topology_config(_write_topology_config(tmp_path, desired_nodes=[]))
+    manager = TopologyManager(
+        config,
+        provider_task_lister=lambda _config: [],
+        ray_node_lister=lambda: [
+            RayNodeState(
+                node_ip="10.0.0.1",
+                ray_node_id="ray-head",
+                alive=True,
+                gpu_count=0,
+                is_head_node=True,
+            )
+        ],
+    )
+    created: list[ModelActorSpec] = []
+
+    async def _factory(spec: ModelActorSpec, generation: int):
+        created.append(spec)
+        return _FakeRuntimeActor(
+            actor_name=spec.normalized_actor_name(),
+            domain_key=spec.domain_key,
+            replica_id=spec.replica_id,
+            generation=generation,
+        )
+
+    supervisor = ModelActorSupervisor(
+        specs=[
+            ModelActorSpec(
+                domain_key="vllm:Qwen/Test",
+                replica_id="replica-0",
+                base_model="Qwen/Test",
+                launcher_key="vllm",
+                worker_alias="mint-head",
+                gpu_count=1,
+            )
+        ],
+        topology_manager=manager,
+        runtime_factory=_factory,
+        node_metrics_enabled=False,
+        placement_reconciler=lambda _desired: {"ok": True, "blocked": {}},
+        scheduler_sync=lambda _registrations: None,
+    )
+
+    out = await supervisor.reconcile_once()
+
+    label = "vllm:Qwen/Test::replica-0"
+    assert out["snapshot"]["topology"]["nodes"]["mint-head"]["role"] == "head"
+    assert out["snapshot"]["replicas"][label]["state"] == "blocked"
+    assert "not valid for model placement" in out["snapshot"]["replicas"][label]["last_error"]
+    assert created == []
+
+
+@pytest.mark.anyio
+async def test_issue_638_node_metrics_daemon_recreated_when_spec_changes(
+    tmp_path,
+) -> None:
+    config = load_topology_config(_write_topology_config(tmp_path))
+    current_ray_nodes = [
+        RayNodeState(node_ip="10.0.0.7", ray_node_id="ray-0", alive=True, gpu_count=8)
+    ]
+    manager = TopologyManager(
+        config,
+        provider_task_lister=lambda _config: [
+            ProviderTaskState(
+                alias="mint-worker-0",
+                provider="volcano",
+                task_name="mint-prod-worker-0",
+                task_id="task-0",
+                live=True,
+                node_ip=current_ray_nodes[0].node_ip,
+                gpu_count=8,
+            )
+        ],
+        ray_node_lister=lambda: list(current_ray_nodes),
+    )
+    daemon_specs: list[NodeMetricsDaemonSpec] = []
+    actors: list[_FakeNodeMetricsActor] = []
+
+    async def _node_metrics_factory(spec: NodeMetricsDaemonSpec):
+        daemon_specs.append(spec)
+        actor = _FakeNodeMetricsActor(spec)
+        actors.append(actor)
+        return actor
+
+    supervisor = ModelActorSupervisor(
+        specs=[],
+        topology_manager=manager,
+        node_metrics_enabled=True,
+        node_metrics_factory=_node_metrics_factory,
+        placement_reconciler=lambda _desired: {"ok": True, "blocked": {}},
+        scheduler_sync=lambda _registrations: None,
+    )
+
+    await supervisor.reconcile_once()
+    current_ray_nodes[:] = [
+        RayNodeState(
+            node_ip="10.0.0.7",
+            ray_node_id="ray-0",
+            alive=True,
+            gpu_count=8,
+            is_head_node=True,
+        )
+    ]
+    out = await supervisor.reconcile_once()
+
+    assert [spec.is_head_node for spec in daemon_specs] == [False, True]
+    assert len(actors) == 2
+    assert actors[0].shutdown_requested is True
+    assert out["snapshot"]["daemons"]["node_metrics"]["nodes"]["mint-worker-0"]["health"]["is_head_node"] is True
+
+
+@pytest.mark.anyio
 async def test_issue_627_supervisor_node_metrics_daemonset_filters_ineligible_nodes(tmp_path) -> None:
     config = load_topology_config(
         _write_topology_config(
@@ -1695,6 +1812,86 @@ def test_issue_638_node_metrics_daemon_skips_ray_global_gauges_on_worker(
         assert actor.health_snapshot()["is_head_node"] is False
         assert "mint_ray_cluster_up" not in created
         assert "mint_ray_gcs_metrics_bridge_up" not in created
+    finally:
+        actor.shutdown()
+
+
+def test_issue_638_ray_global_otel_callbacks_use_bounded_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opentelemetry.metrics as otel_metrics
+
+    callbacks: dict[str, object] = {}
+
+    class _FakeMeter:
+        def create_observable_gauge(self, name, **kwargs):
+            callbacks[name] = kwargs["callbacks"][0]
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4317")
+    monkeypatch.setenv("MINT_RAY_NAMESPACE", "mint")
+    monkeypatch.setattr(otel_metrics, "get_meter", lambda _name: _FakeMeter())
+    monkeypatch.setattr(
+        node_metrics_daemon_module,
+        "_ray_cluster_snapshot",
+        lambda: {
+            "up": True,
+            "nodes": {
+                "alive": 2,
+                "dead": 1,
+                "dead_missing_heartbeats": 1,
+                "dead_missing_heartbeat_ips": ["10.0.0.9"],
+            },
+            "placement_groups": {
+                "pending_gpu": 1,
+                "pending_gpu_names": ["secret-high-cardinality-pg"],
+            },
+            "probes": {
+                "nodes": {"ok": True, "latency_ms": 1.5, "error": "do-not-label"},
+                "placement_groups": {"ok": False, "latency_ms": 2.5, "error": "do-not-label"},
+            },
+        },
+    )
+    monkeypatch.setattr(
+        node_metrics_daemon_module,
+        "_ray_gcs_snapshot",
+        lambda: {
+            "up": True,
+            "sample_count": 3,
+            "scrape_errors": [{"address": "10.0.0.1:8080", "error": "do-not-label"}],
+        },
+    )
+
+    actor = node_metrics_daemon_module.NodeMetricsCollectorActor(
+        worker_alias="mint-head",
+        node_ip="10.0.0.1",
+        deployment_env="prod",
+        cluster_id="volcano",
+        is_head_node=True,
+    )
+    try:
+        observations = []
+        for name in (
+            "mint_ray_cluster_nodes",
+            "mint_ray_cluster_dead_nodes_missing_heartbeats",
+            "mint_ray_cluster_placement_groups_pending_gpu",
+            "mint_ray_cluster_probe_success",
+            "mint_ray_cluster_probe_latency_ms",
+            "mint_ray_gcs_metrics_bridge_sample_count",
+        ):
+            observations.extend(callbacks[name](None))
+        for obs in observations:
+            attrs = dict(obs.attributes)
+            assert set(attrs) <= {
+                "worker_alias",
+                "deployment.env",
+                "mint.cluster_id",
+                "ray_namespace",
+                "probe",
+                "state",
+            }
+            assert "10.0.0.9" not in attrs.values()
+            assert "secret-high-cardinality-pg" not in attrs.values()
+            assert "do-not-label" not in attrs.values()
     finally:
         actor.shutdown()
 

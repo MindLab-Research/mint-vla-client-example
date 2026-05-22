@@ -1152,6 +1152,46 @@ class ModelActorSupervisorCore:
 
         for alias, spec in sorted(desired_specs.items()):
             actor = self._node_metric_actors.get(alias)
+            if actor is not None:
+                try:
+                    health = await _invoke_actor(actor, "health_snapshot")
+                    if not isinstance(health, dict):
+                        raise TypeError(f"node metrics health_snapshot returned {type(health)}")
+                    spec_mismatch = (
+                        str(health.get("node_ip") or "") != spec.node_ip
+                        or (health.get("ray_node_id") or None) != spec.ray_node_id
+                        or bool(health.get("is_head_node")) != bool(spec.is_head_node)
+                    )
+                    if spec_mismatch:
+                        await _invoke_actor(actor, "shutdown")
+                        self._node_metric_actors.pop(alias, None)
+                        self._node_metric_states[alias] = {
+                            **self._node_metric_states.get(alias, {}),
+                            "worker_alias": alias,
+                            "node_ip": spec.node_ip,
+                            "ray_node_id": spec.ray_node_id,
+                            "actor_name": spec.normalized_actor_name(),
+                            "state": "stale",
+                            "last_error": None,
+                            "last_action": "spec_changed_recreate",
+                            "last_action_at": time.time(),
+                        }
+                        actor = None
+                except Exception as e:
+                    self._node_metrics_reconcile_failures_total += 1
+                    self._node_metric_actors.pop(alias, None)
+                    self._node_metric_states[alias] = {
+                        **self._node_metric_states.get(alias, {}),
+                        "worker_alias": alias,
+                        "node_ip": spec.node_ip,
+                        "ray_node_id": spec.ray_node_id,
+                        "actor_name": spec.normalized_actor_name(),
+                        "state": "dead",
+                        "last_error": f"{type(e).__name__}: {e}",
+                        "last_action": "spec_check_failed",
+                        "last_action_at": time.time(),
+                    }
+                    actor = None
             if actor is None:
                 try:
                     actor = await _maybe_await(self._node_metrics_factory(spec))
