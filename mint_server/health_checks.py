@@ -57,10 +57,6 @@ async def _ping_public_dependencies(*, timeout_s: float) -> None:
     if scheduler_ping is None:
         scheduler_ping = getattr(model_work_scheduler, "ping")
     task_ping = getattr(task_futures, "async_ping", None)
-    if task_ping is None:
-        from .backend.future_state_store import future_state_store
-
-        task_ping = getattr(future_state_store, "async_ping", None)
 
     component_timeout_s = min(timeout_s, PUBLIC_HEALTHZ_COMPONENT_TIMEOUT_S)
 

@@ -2650,6 +2650,7 @@ class _TaskStateStoreActor:
         self._started_at = time.time()
         self._lock = threading.RLock()
         self._store = TaskStateStore(db_path or _task_state_store_db_path())
+        self._future_store = None
         self._watchers: dict[str, list[threading.Event]] = {}
         self._watcher_count = 0
         self._watcher_limit = max(1, int(os.environ.get("MINT_TASK_STATE_STORE_WATCHER_MAX", "8192")))
@@ -2663,10 +2664,25 @@ class _TaskStateStoreActor:
 
     def close(self) -> None:
         self._store.close()
+        if self._future_store is not None:
+            self._future_store.close()
+
+    def _future_store_or_create(self):
+        if self._future_store is None:
+            from .future_state_store import FutureStateStore, _future_state_store_db_path
+
+            self._future_store = FutureStateStore(_future_state_store_db_path())
+        return self._future_store
 
     def _read_task_or_none(self, request_id: str) -> dict[str, Any] | None:
         try:
             return self._store.get_task(str(request_id))
+        except TaskStateNotFoundError:
+            return None
+
+    def _read_future_task_or_none(self, request_id: str) -> dict[str, Any] | None:
+        try:
+            return self._future_store_or_create().get_task(str(request_id))
         except TaskStateNotFoundError:
             return None
 
@@ -2822,6 +2838,202 @@ class _TaskStateStoreActor:
                     return {"changed": True, "record": latest}
             finally:
                 self._remove_watcher(request_id, event)
+
+    def future_wait_task_status_change(
+        self,
+        *,
+        request_id: str,
+        timeout_s: float,
+        observed_status: str | None = None,
+        observed_updated_at: float | None = None,
+        terminal_only: bool = False,
+    ) -> dict[str, Any]:
+        request_id = str(request_id)
+        timeout_s = max(0.0, float(timeout_s))
+        record = self._read_future_task_or_none(request_id)
+        if record is None:
+            return {"changed": True, "missing": True, "request_id": request_id}
+
+        baseline_status = str(observed_status or record.get("status") or "")
+        try:
+            baseline_updated_at = float(observed_updated_at if observed_updated_at is not None else record.get("updated_at") or 0.0)
+        except Exception:
+            baseline_updated_at = 0.0
+
+        if self._record_changed(
+            record,
+            baseline_status=baseline_status,
+            baseline_updated_at=baseline_updated_at,
+            terminal_only=bool(terminal_only),
+        ):
+            return {"changed": True, "record": record}
+        if timeout_s <= 0:
+            return {"changed": False, "timeout": True, "record": record}
+
+        deadline = time.monotonic() + timeout_s
+        latest = record
+        while True:
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                return {"changed": False, "timeout": True, "record": latest}
+            event = threading.Event()
+            if not self._add_watcher(request_id, event):
+                return {
+                    "changed": False,
+                    "watch_skipped": True,
+                    "reason": "watcher_limit",
+                    "record": latest,
+                }
+            try:
+                latest = self._read_future_task_or_none(request_id)
+                if self._record_changed(
+                    latest,
+                    baseline_status=baseline_status,
+                    baseline_updated_at=baseline_updated_at,
+                    terminal_only=bool(terminal_only),
+                ):
+                    if latest is None:
+                        return {"changed": True, "missing": True, "request_id": request_id}
+                    return {"changed": True, "record": latest}
+                signaled = event.wait(timeout=max(0.0, remaining_s))
+                if not signaled:
+                    latest = self._read_future_task_or_none(request_id)
+                    if self._record_changed(
+                        latest,
+                        baseline_status=baseline_status,
+                        baseline_updated_at=baseline_updated_at,
+                        terminal_only=bool(terminal_only),
+                    ):
+                        if latest is None:
+                            return {"changed": True, "missing": True, "request_id": request_id}
+                        return {"changed": True, "record": latest}
+                    return {"changed": False, "timeout": True, "record": latest or record}
+            finally:
+                self._remove_watcher(request_id, event)
+
+    def future_ping(self) -> dict[str, Any]:
+        out = self._future_store_or_create().ping()
+        return {
+            **out,
+            "actor_name": _ray_task_state_store_actor_name(),
+            "namespace": _ray_namespace(),
+            "store": "future_state_store",
+            "started_at": self._started_at,
+        }
+
+    def future_stats(self) -> dict[str, Any]:
+        future_stats = self._future_store_or_create().future_metrics_stats()
+        active = self._future_store_or_create().list_active_tasks()
+        by_status: dict[str, int] = {}
+        for record in active:
+            status = str(record.get("status") or "unknown")
+            by_status[status] = by_status.get(status, 0) + 1
+        return {
+            "actor_name": _ray_task_state_store_actor_name(),
+            "namespace": _ray_namespace(),
+            "store": "future_state_store",
+            "db_path": self._future_store_or_create().db_path,
+            "started_at": self._started_at,
+            "active_tasks": len(active),
+            "active_by_status": by_status,
+            "watchers": self._watcher_count,
+            **future_stats,
+            "task_future_reaper": task_future_reaper_metrics_snapshot(),
+        }
+
+    def _future_call_and_notify(self, method: str, **kwargs: Any) -> Any:
+        out = getattr(self._future_store_or_create(), method)(**kwargs)
+        self._notify_task_changed(kwargs.get("request_id"))
+        return out
+
+    def future_acquire_scheduler_owner(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_store_or_create().acquire_scheduler_owner(**kwargs)
+
+    def future_renew_scheduler_owner(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_store_or_create().renew_scheduler_owner(**kwargs)
+
+    def future_create_task(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_call_and_notify("create_task", **kwargs)
+
+    def future_ensure_task(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_call_and_notify("ensure_task", **kwargs)
+
+    def future_update_task_metadata(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_call_and_notify("update_task_metadata", **kwargs)
+
+    def future_stage_payload(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_call_and_notify("stage_payload", **kwargs)
+
+    def future_complete_task_success(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_call_and_notify("complete_task_success", **kwargs)
+
+    def future_complete_task_failure(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_call_and_notify("complete_task_failure", **kwargs)
+
+    def future_mark_task_retrieved(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_call_and_notify("mark_task_retrieved", **kwargs)
+
+    def future_forget_task(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_call_and_notify("forget_task", **kwargs)
+
+    def future_expire_active_tasks(self, **kwargs: Any) -> list[str]:
+        out = self._future_store_or_create().expire_active_tasks(**kwargs)
+        for request_id in out:
+            self._notify_task_changed(str(request_id))
+        return out
+
+    def future_list_terminal_payloads_for_eviction(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return self._future_store_or_create().list_terminal_payloads_for_eviction(**kwargs)
+
+    def future_mark_payload_evicted(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_call_and_notify("mark_payload_evicted", **kwargs)
+
+    def future_delete_expired_tombstones(self, **kwargs: Any) -> list[str]:
+        out = self._future_store_or_create().delete_expired_tombstones(**kwargs)
+        for request_id in out:
+            self._notify_task_changed(str(request_id))
+        return out
+
+    def future_record_payload_evict_error(self, **kwargs: Any) -> dict[str, Any]:
+        out = self._future_store_or_create().record_payload_evict_error(**kwargs)
+        self._invalidate_stats_cache()
+        return out
+
+    def future_list_staged_payloads_for_gc(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return self._future_store_or_create().list_staged_payloads_for_gc(**kwargs)
+
+    def future_mark_staged_payload_gc_deleted(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_call_and_notify("mark_staged_payload_gc_deleted", **kwargs)
+
+    def future_list_tasks_by_metadata(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return self._future_store_or_create().list_tasks_by_metadata(**kwargs)
+
+    def future_assign_task(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_call_and_notify("assign_task", **kwargs)
+
+    def future_claim_task(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_call_and_notify("claim_task", **kwargs)
+
+    def future_begin_finalize(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_call_and_notify("begin_finalize", **kwargs)
+
+    def future_commit_finalize_success(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_call_and_notify("commit_finalize_success", **kwargs)
+
+    def future_commit_finalize_failure(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_call_and_notify("commit_finalize_failure", **kwargs)
+
+    def future_requeue_task(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_call_and_notify("requeue_task", **kwargs)
+
+    def future_list_active_tasks(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return self._future_store_or_create().list_active_tasks(**kwargs)
+
+    def future_list_expired_leases(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return self._future_store_or_create().list_expired_leases(**kwargs)
+
+    def future_get_task(self, request_id: str) -> dict[str, Any]:
+        return self._future_store_or_create().get_task(request_id)
 
     def stats(self) -> dict[str, Any]:
         now = time.monotonic()
@@ -3640,6 +3852,155 @@ class TaskStateStoreClient:
             terminal_only=bool(terminal_only),
         )
 
+    async def async_future_ping(self, *, timeout_s: float = 5.0) -> dict[str, Any]:
+        actor = await self._get_ray_actor_async(require_ready=False, create_if_missing=False)
+        try:
+            out = await async_get_ray_ref(actor.future_ping.remote(), timeout_s=timeout_s)
+        except Exception:
+            self._reset_ray_actor()
+            raise
+        if not isinstance(out, dict):
+            raise TypeError(f"TaskStateStore.future_ping returned non-dict: {type(out)}")
+        if not bool(out.get("ok")):
+            raise TaskStateStoreUnavailableError(f"TaskStateStore future ping failed: {out!r}")
+        return out
+
+    async def async_future_stats(self) -> dict[str, Any]:
+        return await self._dict_call("future_stats")
+
+    async def async_future_acquire_scheduler_owner(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_acquire_scheduler_owner", **kwargs)
+
+    async def async_future_renew_scheduler_owner(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_renew_scheduler_owner", **kwargs)
+
+    async def async_future_create_task(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_create_task", **kwargs)
+
+    async def async_future_ensure_task(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_ensure_task", **kwargs)
+
+    async def async_future_update_task_metadata(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_update_task_metadata", **kwargs)
+
+    async def async_future_stage_payload(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_stage_payload", **kwargs)
+
+    async def async_future_complete_task_success(self, **kwargs: Any) -> dict[str, Any]:
+        kwargs.pop("billing_observations", None)
+        return await self._dict_call("future_complete_task_success", **kwargs)
+
+    async def async_future_complete_task_failure(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_complete_task_failure", **kwargs)
+
+    async def async_future_mark_task_retrieved(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_mark_task_retrieved", **kwargs)
+
+    async def async_future_forget_task(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_forget_task", **kwargs)
+
+    async def async_future_expire_active_tasks(self, **kwargs: Any) -> list[str]:
+        out = await self._call("future_expire_active_tasks", **kwargs)
+        if not isinstance(out, list):
+            raise TypeError(f"TaskStateStore.future_expire_active_tasks returned non-list: {type(out)}")
+        return [str(x) for x in out]
+
+    async def async_future_list_terminal_payloads_for_eviction(self, **kwargs: Any) -> list[dict[str, Any]]:
+        out = await self._call("future_list_terminal_payloads_for_eviction", **kwargs)
+        if not isinstance(out, list):
+            raise TypeError(f"TaskStateStore.future_list_terminal_payloads_for_eviction returned non-list: {type(out)}")
+        return out
+
+    async def async_future_mark_payload_evicted(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_mark_payload_evicted", **kwargs)
+
+    async def async_future_delete_expired_tombstones(self, **kwargs: Any) -> list[str]:
+        out = await self._call("future_delete_expired_tombstones", **kwargs)
+        if not isinstance(out, list):
+            raise TypeError(f"TaskStateStore.future_delete_expired_tombstones returned non-list: {type(out)}")
+        return [str(x) for x in out]
+
+    async def async_future_record_payload_evict_error(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_record_payload_evict_error", **kwargs)
+
+    async def async_future_list_staged_payloads_for_gc(self, **kwargs: Any) -> list[dict[str, Any]]:
+        out = await self._call("future_list_staged_payloads_for_gc", **kwargs)
+        if not isinstance(out, list):
+            raise TypeError(f"TaskStateStore.future_list_staged_payloads_for_gc returned non-list: {type(out)}")
+        return out
+
+    async def async_future_mark_staged_payload_gc_deleted(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_mark_staged_payload_gc_deleted", **kwargs)
+
+    async def async_future_assign_task(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_assign_task", **kwargs)
+
+    async def async_future_claim_task(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_claim_task", **kwargs)
+
+    async def async_future_begin_finalize(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_begin_finalize", **kwargs)
+
+    async def async_future_commit_finalize_success(self, **kwargs: Any) -> dict[str, Any]:
+        kwargs.pop("billing_observations", None)
+        return await self._dict_call("future_commit_finalize_success", **kwargs)
+
+    async def async_future_commit_finalize_failure(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_commit_finalize_failure", **kwargs)
+
+    async def async_future_requeue_task(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_requeue_task", **kwargs)
+
+    async def async_future_get_task(self, request_id: str) -> dict[str, Any]:
+        return await self._dict_call("future_get_task", request_id=str(request_id))
+
+    async def async_future_wait_task_status_change(
+        self,
+        *,
+        request_id: str,
+        timeout_s: float,
+        observed_status: str | None = None,
+        observed_updated_at: float | None = None,
+        terminal_only: bool = False,
+    ) -> dict[str, Any]:
+        return await self._dict_call(
+            "future_wait_task_status_change",
+            request_id=str(request_id),
+            timeout_s=float(timeout_s),
+            observed_status=observed_status,
+            observed_updated_at=observed_updated_at,
+            terminal_only=bool(terminal_only),
+        )
+
+    async def async_future_list_active_tasks(self, *, limit: int | None = None) -> list[dict[str, Any]]:
+        out = await self._call("future_list_active_tasks", limit=limit)
+        if not isinstance(out, list):
+            raise TypeError(f"TaskStateStore.future_list_active_tasks returned non-list: {type(out)}")
+        return out
+
+    async def async_future_list_expired_leases(
+        self,
+        *,
+        now: float | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        out = await self._call("future_list_expired_leases", now=now, limit=limit)
+        if not isinstance(out, list):
+            raise TypeError(f"TaskStateStore.future_list_expired_leases returned non-list: {type(out)}")
+        return out
+
+    async def async_future_list_tasks_by_metadata(
+        self,
+        *,
+        filters: dict[str, Any] | None = None,
+        statuses: list[str] | None = None,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        out = await self._call("future_list_tasks_by_metadata", filters=filters, statuses=statuses, limit=limit)
+        if not isinstance(out, list):
+            raise TypeError(f"TaskStateStore.future_list_tasks_by_metadata returned non-list: {type(out)}")
+        return out
+
     def upsert_sampling_session(self, *, session_id: str, info: dict[str, Any]) -> None:
         self._call_sync("upsert_sampling_session", session_id=str(session_id), info=dict(info))
 
@@ -3986,6 +4347,52 @@ class TaskStateStoreClient:
         return out
 
 
+class _FutureStateAccess:
+    """Map future-state calls onto TaskStateStore future methods.
+
+    Tests may inject a local object with the old async_* method names; in that
+    case this adapter falls back to the injected methods without creating any
+    Ray actor.
+    """
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+
+    async def async_ensure_started(self) -> None:
+        ensure_started = getattr(self._client, "async_ensure_started", None)
+        if callable(ensure_started):
+            await ensure_started()
+        await self.async_ping(timeout_s=5.0)
+
+    async def async_ensure_ready(
+        self,
+        *,
+        timeout_s: float = 10.0,
+        create_if_missing: bool = False,
+    ) -> dict[str, Any]:
+        ensure_ready = getattr(self._client, "async_ensure_ready", None)
+        if callable(ensure_ready):
+            await ensure_ready(timeout_s=timeout_s, create_if_missing=create_if_missing)
+        return await self.async_ping(timeout_s=timeout_s)
+
+    async def async_ping(self, *, timeout_s: float = 5.0) -> dict[str, Any]:
+        future_ping = getattr(self._client, "async_future_ping", None)
+        if callable(future_ping):
+            return await future_ping(timeout_s=timeout_s)
+        ping = getattr(self._client, "async_ping", None)
+        if callable(ping):
+            return await ping(timeout_s=timeout_s)
+        return {"ok": True, "store": "future_state_store"}
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("async_"):
+            future_name = f"async_future_{name[len('async_'):]}"
+            future_method = getattr(self._client, future_name, None)
+            if callable(future_method):
+                return future_method
+        return getattr(self._client, name)
+
+
 class TaskFutureService:
     """Future polling facade backed by TaskStateStore metadata and payload files.
 
@@ -4005,16 +4412,12 @@ class TaskFutureService:
     ) -> None:
         self._task_state = task_state_client if task_state_client is not None else task_state_store
         self._future_state_client = future_state_client
-        if self._future_state_client is None and task_state_client is not None:
-            self._future_state_client = task_state_client
         self._payload_store = payload_store
 
     @property
     def _future_state(self) -> Any:
         if self._future_state_client is None:
-            from .future_state_store import future_state_store
-
-            self._future_state_client = future_state_store
+            self._future_state_client = _FutureStateAccess(self._task_state)
         return self._future_state_client
 
     @property

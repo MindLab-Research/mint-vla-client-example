@@ -488,8 +488,7 @@ class ServerConfig:
     task_state_store_owner_ttl_s: float = 30.0
     task_state_store_owner_renew_s: float = 10.0
 
-    # FutureStateStore settings (backend/future_state_store.py)
-    future_state_store_actor_name: str = "mint_future_state_store"
+    # Future-state RocksDB component owned by TaskStateStore actor.
     future_state_store_db_path: str = "/vePFS-Mindverse/share/mint/dev/data/future-state/futures.rocksdb"
 
     # Training settings (backend/verl_training.py)
@@ -832,11 +831,6 @@ class ServerConfig:
                 "MINT_TASK_STATE_STORE_OWNER_RENEW_S",
                 file_task_state_store.owner_renew_s if file_task_state_store is not None else None,
                 10.0,
-            ),
-            future_state_store_actor_name=_pick_str(
-                "MINT_FUTURE_STATE_STORE_ACTOR_NAME",
-                file_future_state_store.actor_name if file_future_state_store is not None else None,
-                "mint_future_state_store",
             ),
             future_state_store_db_path=_pick_str(
                 "MINT_FUTURE_STATE_STORE_DB_PATH",

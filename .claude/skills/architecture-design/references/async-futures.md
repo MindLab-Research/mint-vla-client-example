@@ -36,10 +36,12 @@ Most work runs on Ray GPU actors and can exceed typical HTTP request lifetimes. 
 ## Where futures live
 
 `TaskFutureService` is an in-process facade. Durable future state lives in a
-dedicated `FutureStateStore`; session/index/billing metadata remains in the
-detached `TaskStateStore` actor. Result payloads are written through the
-in-process `TaskPayloadStore` filesystem helper. `TaskPayloadStore` is not a Ray
-actor and has no lifecycle to reconcile.
+`FutureStateStore` RocksDB component owned by the existing detached
+`TaskStateStore` actor. There must not be a separate `FutureStateStore` Ray
+actor or a separate future-state detached lifecycle. Session/index/billing
+metadata also remains in the same `TaskStateStore` actor. Result payloads are
+written through the in-process `TaskPayloadStore` filesystem helper.
+`TaskPayloadStore` is not a Ray actor and has no lifecycle to reconcile.
 
 `FutureStateStore` owns the high-frequency future path:
 
@@ -50,20 +52,23 @@ actor and has no lifecycle to reconcile.
 - staged and abandoned payload pointers for GC
 - active and terminal indexes used by retrieve, scheduler hydration, and reaper
 
-The production implementation is a persistent RocksDB-backed KV store. This is
-not a cache of SQLite state: for futures, `FutureStateStore` is the source of
-truth. SQLite `TaskStateStore` must not be updated on the future hot path. A
-short migration window may read old SQLite future rows as a fallback for
-requests created before the cutover, but new writes go to `FutureStateStore`.
+The production implementation is a persistent RocksDB-backed KV store opened
+inside `TaskStateStore`. This is not a cache of SQLite state: for futures, the
+`FutureStateStore` component is the source of truth. SQLite `TaskStateStore`
+must not be updated on the future hot path. A short migration window may read
+old SQLite future rows as a fallback for requests created before the cutover,
+but new writes go through `TaskStateStore` into its `FutureStateStore`
+component.
 
 The facade preserves the old Tinker future methods (`async_resolve`,
 `async_fail`, `async_get_status`, etc.) while routing future state through
 `FutureStateStore`. Completed result payloads use a staged commit protocol:
-first `FutureStateStore` records the expected payload path, then the payload
-store helper atomically publishes the vePFS JSON file, then `FutureStateStore`
-commits the terminal status, checksum, size, and result pointer. The
-single-writer detached actor serializes these writes; if the KV backend exposes
-batch writes, the implementation should use them for the record plus indexes.
+first `TaskStateStore` records the expected payload path in its future-state
+component, then the payload store helper atomically publishes the vePFS JSON
+file, then `TaskStateStore` commits the terminal status, checksum, size, and
+result pointer. The existing `TaskStateStore` actor is the single writer that
+serializes these writes; if the KV backend exposes batch writes, the
+implementation should use them for the record plus indexes.
 Model-work finalization records the lease identity and
 `finalizing_until`; direct in-process future resolution records the staged path
 while leaving the task pending until terminal commit. This is primarily for GC
@@ -72,7 +77,9 @@ even if the process crashes between file publish and terminal metadata commit.
 
 Direct in-process future resolution always uses a fresh `future__<uuid>` staged path, even if request metadata contains a model-work attempt id. Model-work attempt ids are valid only on the scheduler lease finalization path.
 
-There is no separate future replay index. Retrieve hot-cache entries are process-local accelerators only; restart recovery, terminal replay, and payload-evicted detection all use `TaskStateStore`.
+There is no separate future replay index or detached future actor. Retrieve
+hot-cache entries are process-local accelerators only; restart recovery,
+terminal replay, and payload-evicted detection all use `TaskStateStore`.
 
 `FutureStateStore` uses `request_id` point lookups for retrieve and should keep
 active-task indexes (`pending`, `queued`, `assigned`, `leased`, `running`,
@@ -85,12 +92,12 @@ startup; it is not a second durable indexer.
 ## Admission and scheduling
 
 Async endpoints that require model-runtime scheduling go through `ModelWorkScheduler`:
-- API routes first create or ensure the task in `FutureStateStore` via `TaskFutureService`.
+- API routes first create or ensure the task in `TaskStateStore` future state via `TaskFutureService`.
 - The route appends a `ModelWorkItem` to the detached `ModelWorkScheduler` actor (`mint_model_work_scheduler` by default).
 - `ModelWorkScheduler` keeps the hot domain backlog, per-replica subqueues, leases, and fairness state in memory.
 - `ModelActorSupervisor` observes active scheduler domains and reconciles the matching desired runtime actors from config and placement JSON. A queued training domain can therefore create the runtime needed to claim it.
-- Runtime actors claim from their scheduler-owned subqueue. Claiming is independent of `retrieve_future`; result polling reads `FutureStateStore`.
-- Scheduler leases must include `attempt_id` and `scheduler_epoch`. `ModelRuntimeActor` owns terminal commit to `FutureStateStore` and lease completion/failure. Route-level `_do_*` functions may still use `TaskFutureService.async_resolve/async_fail` as an executor-local completion signal, but those calls are buffered while running under a model-work execution context and do not write terminal state directly. There is no scheduler-work fallback that writes terminal state through the facade.
+- Runtime actors claim from their scheduler-owned subqueue. Claiming is independent of `retrieve_future`; result polling reads `TaskStateStore` future state.
+- Scheduler leases must include `attempt_id` and `scheduler_epoch`. `ModelRuntimeActor` owns terminal commit to `TaskStateStore` future state and lease completion/failure. Route-level `_do_*` functions may still use `TaskFutureService.async_resolve/async_fail` as an executor-local completion signal, but those calls are buffered while running under a model-work execution context and do not write terminal state directly. There is no scheduler-work fallback that writes terminal state through the facade.
 
 On admission failure, the API must return HTTP 429 with a structured overload reason. V1 does not enforce a hard active-task cap; add one only if the active-task index becomes a measured bottleneck.
 
@@ -163,9 +170,9 @@ This is a deliberate tradeoff: global strict FIFO across sessions is relaxed for
 ## Reaping and cleanup
 
 `MaintenanceCronActor` owns periodic cleanup. `TaskFutureService.async_reap()`
-is the facade, but task/result retention policy belongs in `FutureStateStore`
-and payload deletion is performed through the in-process `TaskPayloadStore`
-helper.
+is the facade, but task/result retention policy belongs in `TaskStateStore`
+future state and payload deletion is performed through the in-process
+`TaskPayloadStore` helper.
 
 Reaper contract:
 
@@ -186,7 +193,7 @@ Reaper contract:
   work `finalizing` staged paths as referenced until the finalizing lease expires.
   If an active row is requeued or restaged, the previous staged path is retained
   in future metadata as an abandoned staged payload so GC can classify it from
-  `FutureStateStore` rather than from an unowned filesystem scan. The reaper
+  `TaskStateStore` future state rather than from an unowned filesystem scan. The reaper
   deletes GC-eligible staged/abandoned payload files separately from terminal
   result payload eviction. V1 uses `MINT_TASK_RESULT_TTL_S` as the safety window
   after finalizing expiry or abandoned-path update time; a dedicated staged GC
@@ -209,6 +216,7 @@ Future reaper metrics:
 ## Detached actor hygiene
 
 Detached actors do not hot-reload. Changes to `TaskStateStore`,
-`FutureStateStore`, `ModelWorkScheduler`, `ModelRuntimeActor`, or
-`MaintenanceCronActor` require killing the matching detached actors in the
-target namespace before restart.
+`ModelWorkScheduler`, `ModelRuntimeActor`, or `MaintenanceCronActor` require
+killing the matching detached actors in the target namespace before restart.
+Changing the future-state RocksDB component requires restarting
+`TaskStateStore`; there is no separate future-state actor to kill.

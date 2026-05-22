@@ -116,7 +116,6 @@ class _TaskStateStoreSection(BaseModel):
 class _FutureStateStoreSection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    actor_name: str | None = None
     db_path: str | None = None
 
 

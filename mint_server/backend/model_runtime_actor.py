@@ -24,7 +24,6 @@ from .model_actor_supervisor import consumer_id_for_replica, queue_id_for_replic
 from .model_work_scheduler import ModelWorkSchedulerClient, model_work_scheduler
 from .model_work_execution_context import ModelWorkFinalizeBuffer, model_work_execution_context
 from .task_payload_store import TaskPayloadStore
-from .future_state_store import future_state_store
 from .task_state_store import FutureStatus, task_futures, task_state_store
 
 logger = logging.getLogger(__name__)
@@ -212,7 +211,6 @@ class ModelRuntimeActor:
         scheduler_client: ModelWorkSchedulerClient | None = None,
         task_futures_client: Any | None = None,
         task_state_store_client: Any | None = None,
-        future_state_store_client: Any | None = None,
         payload_store: TaskPayloadStore | None = None,
         executor: ModelWorkExecutor | None = None,
     ) -> None:
@@ -252,9 +250,6 @@ class ModelRuntimeActor:
         self._task_state_store = (
             task_state_store_client if task_state_store_client is not None else task_state_store
         )
-        self._future_state_store = (
-            future_state_store_client if future_state_store_client is not None else future_state_store
-        )
         self._payload_store = payload_store if payload_store is not None else TaskPayloadStore()
         self._executor = executor if executor is not None else _default_executor
 
@@ -275,6 +270,16 @@ class ModelRuntimeActor:
         self._requeued_total = 0
         self._renewed_total = 0
         self._empty_polls_total = 0
+
+    async def _task_state_future_call(self, method: str, **kwargs: Any) -> Any:
+        async_method = getattr(self._task_state_store, f"async_future_{method}", None)
+        if callable(async_method):
+            return await async_method(**kwargs)
+        async_method = getattr(self._task_state_store, f"async_{method}", None)
+        if callable(async_method):
+            return await async_method(**kwargs)
+        sync_method = getattr(self._task_state_store, method)
+        return sync_method(**kwargs)
 
     @property
     def domain_key(self) -> str:
@@ -525,7 +530,8 @@ class ModelRuntimeActor:
                     }
             except Exception as e:
                 billing_metadata = {"billing_status": "dropped", "billing_error": f"{type(e).__name__}: {e}"}
-        await self._future_state_store.async_commit_finalize_success(
+        await self._task_state_future_call(
+            "commit_finalize_success",
             request_id=request_id,
             lease_id=str(lease["lease_id"]),
             attempt_id=attempt_id,
@@ -545,7 +551,8 @@ class ModelRuntimeActor:
     ) -> None:
         self._require_task_state_finalize(lease)
         item = lease["item"]
-        await self._future_state_store.async_commit_finalize_failure(
+        await self._task_state_future_call(
+            "commit_finalize_failure",
             request_id=str(item["request_id"]),
             lease_id=str(lease["lease_id"]),
             attempt_id=str(lease["attempt_id"]),

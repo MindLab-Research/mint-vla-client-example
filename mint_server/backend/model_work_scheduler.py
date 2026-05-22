@@ -482,9 +482,12 @@ class _ModelWorkSchedulerActor:
 
     async def _task_state_call(self, method: str, **kwargs: Any) -> Any:
         if self._task_state_store is None:
-            from .future_state_store import future_state_store
+            from .task_state_store import task_state_store
 
-            self._task_state_store = future_state_store
+            self._task_state_store = task_state_store
+        async_method = getattr(self._task_state_store, f"async_future_{method}", None)
+        if callable(async_method):
+            return await async_method(**kwargs)
         async_method = getattr(self._task_state_store, f"async_{method}", None)
         if callable(async_method):
             return await async_method(**kwargs)

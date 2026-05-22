@@ -751,22 +751,16 @@ def default_control_plane_dependencies() -> list[ControlPlaneDependency]:
     async def _ensure_task_state_store() -> Any:
         from .task_state_store import task_state_store
 
-        return await task_state_store.async_ensure_ready(timeout_s=5.0, create_if_missing=True)
+        out = await task_state_store.async_ensure_ready(timeout_s=5.0, create_if_missing=True)
+        await task_state_store.async_future_ping(timeout_s=5.0)
+        return out
 
     async def _ping_task_state_store() -> Any:
         from .task_state_store import task_state_store
 
-        return await task_state_store.async_ping(timeout_s=5.0)
-
-    async def _ensure_future_state_store() -> Any:
-        from .future_state_store import future_state_store
-
-        return await future_state_store.async_ensure_ready(timeout_s=5.0, create_if_missing=True)
-
-    async def _ping_future_state_store() -> Any:
-        from .future_state_store import future_state_store
-
-        return await future_state_store.async_ping(timeout_s=5.0)
+        out = await task_state_store.async_ping(timeout_s=5.0)
+        await task_state_store.async_future_ping(timeout_s=5.0)
+        return out
 
     async def _ensure_model_work_scheduler() -> Any:
         from .model_work_scheduler import model_work_scheduler
@@ -793,11 +787,6 @@ def default_control_plane_dependencies() -> list[ControlPlaneDependency]:
             name="task_state_store",
             ensure=_ensure_task_state_store,
             ping=_ping_task_state_store,
-        ),
-        ControlPlaneDependency(
-            name="future_state_store",
-            ensure=_ensure_future_state_store,
-            ping=_ping_future_state_store,
         ),
         ControlPlaneDependency(
             name="model_work_scheduler",
