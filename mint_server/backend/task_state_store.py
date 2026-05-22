@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import sqlite3
@@ -17,6 +16,7 @@ from ..config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_res
 from ..runtime_env import env_nonempty
 from .async_ray_control import async_get_ray_ref, sync_get_ray_ref
 from .model_work_execution_context import ModelWorkFinalize, get_current_model_work_finalize_buffer
+from .task_hot_kv_store import TaskHotKVStore
 
 
 ACTIVE_TASK_STATUSES = frozenset({"pending", "queued", "running", "assigned", "leased", "finalizing"})
@@ -457,13 +457,7 @@ class TaskStateStore:
     def __init__(self, db_path: str | os.PathLike[str]) -> None:
         self._db_path = str(db_path)
         self._lock = threading.RLock()
-        self._sampling_sessions: dict[str, dict[str, Any]] = {}
-        self._session_index: dict[str, dict[str, Any]] = {}
-        self._sampler_index: dict[str, dict[str, Any]] = {}
-        self._session_heartbeats: dict[str, float] = {}
-        self._training_sessions: dict[str, dict[str, Any]] = {}
-        self._gateway_sampling_sessions: dict[str, dict[str, str]] = {}
-        self._gateway_training_models: dict[str, dict[str, str | None]] = {}
+        self._hot_kv = TaskHotKVStore(":memory:" if self._db_path == ":memory:" else _task_hot_kv_store_db_path(self._db_path))
         self._session_heartbeat_max_age_s = float(
             os.environ.get("MINT_SESSION_HEARTBEAT_MAX_AGE_S", str(7 * 24 * 3600))
         )
@@ -492,6 +486,7 @@ class TaskStateStore:
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+        self._hot_kv.close()
 
     def ping(self) -> dict[str, Any]:
         with self._lock:
@@ -509,46 +504,50 @@ class TaskStateStore:
         incoming.setdefault("uses_base_model", False)
         incoming.setdefault("inflight_requests", 0)
         incoming_version = int(incoming.get("metadata_version") or 0)
-        with self._lock:
-            existing = self._sampling_sessions.get(session_id)
-            if existing is not None:
-                existing_version = int(existing.get("metadata_version") or 0)
-                if incoming_version and incoming_version < existing_version:
-                    if "last_activity" in incoming:
-                        existing["last_activity"] = max(
-                            float(existing.get("last_activity") or 0.0),
-                            float(incoming.get("last_activity") or 0.0),
-                        )
-                    return
-                merged = {**existing, **incoming}
-                merged["metadata_version"] = max(existing_version + 1, incoming_version, 1)
-                self._sampling_sessions[session_id] = merged
-                return
-            incoming["metadata_version"] = max(incoming_version, 1)
-            self._sampling_sessions[session_id] = incoming
+
+        def _mutate(existing: dict[str, Any] | None) -> dict[str, Any]:
+            if existing is None:
+                incoming["metadata_version"] = max(incoming_version, 1)
+                return incoming
+            existing_version = int(existing.get("metadata_version") or 0)
+            if incoming_version and incoming_version < existing_version:
+                if "last_activity" in incoming:
+                    existing["last_activity"] = max(
+                        float(existing.get("last_activity") or 0.0),
+                        float(incoming.get("last_activity") or 0.0),
+                    )
+                return existing
+            merged = {**existing, **incoming}
+            merged["metadata_version"] = max(existing_version + 1, incoming_version, 1)
+            return merged
+
+        self._hot_kv.mutate_record("sampling_session", session_id, _mutate)
 
     def delete_sampling_session(self, *, session_id: str) -> None:
-        with self._lock:
-            self._sampling_sessions.pop(str(session_id), None)
+        self._hot_kv.delete_record("sampling_session", str(session_id))
 
     def set_sampling_session_last_activity(self, *, session_id: str, last_activity: float) -> float | None:
         ts = float(last_activity)
-        with self._lock:
-            existing = self._sampling_sessions.get(str(session_id))
-            if existing is None:
-                return None
-            existing["last_activity"] = ts
-            existing["metadata_version"] = int(existing.get("metadata_version") or 0) + 1
-            return ts
+        updated = self._hot_kv.mutate_record(
+            "sampling_session",
+            str(session_id),
+            lambda existing: None
+            if existing is None
+            else {
+                **existing,
+                "last_activity": ts,
+                "metadata_version": int(existing.get("metadata_version") or 0) + 1,
+            },
+        )
+        if updated is None:
+            return None
+        return ts
 
     def get_sampling_session(self, *, session_id: str) -> dict[str, Any] | None:
-        with self._lock:
-            existing = self._sampling_sessions.get(str(session_id))
-            return dict(existing) if existing is not None else None
+        return self._hot_kv.get_record("sampling_session", str(session_id))
 
     def list_sampling_sessions(self) -> list[dict[str, Any]]:
-        with self._lock:
-            return [dict(value) for value in self._sampling_sessions.values()]
+        return self._hot_kv.list_records("sampling_session")
 
     def upsert_training_session(self, *, model_id: str, info: dict[str, Any]) -> None:
         model_id = str(model_id)
@@ -559,8 +558,9 @@ class TaskStateStore:
         incoming.setdefault("current_step", 0)
         incoming.setdefault("last_activity", time.time())
         incoming_version = max(1, int(incoming.get("metadata_version") or 1))
-        with self._lock:
-            current = dict(self._training_sessions.get(model_id, {}))
+
+        def _mutate(existing: dict[str, Any] | None) -> dict[str, Any]:
+            current = dict(existing or {})
             current_version = max(1, int(current.get("metadata_version") or 1))
             if incoming_version < current_version:
                 incoming_last_activity = float(incoming.get("last_activity", 0.0) or 0.0)
@@ -572,50 +572,57 @@ class TaskStateStore:
                     current["current_step"] = max(current_step, incoming_step)
                 except Exception:
                     pass
-                self._training_sessions[model_id] = current
-                return
+                return current
             merged = {**current, **incoming}
             merged.setdefault("current_step", int(current.get("current_step", 0)))
             merged.setdefault("last_activity", time.time())
             merged["metadata_version"] = incoming_version
-            self._training_sessions[model_id] = merged
+            return merged
+
+        self._hot_kv.mutate_record("training_session", model_id, _mutate)
 
     def delete_training_session(self, *, model_id: str) -> None:
-        with self._lock:
-            self._training_sessions.pop(str(model_id), None)
+        self._hot_kv.delete_record("training_session", str(model_id))
 
     def set_training_session_last_activity(self, *, model_id: str, last_activity: float) -> float | None:
-        with self._lock:
-            info = self._training_sessions.get(str(model_id))
-            if info is None:
-                return None
-            info["last_activity"] = float(last_activity)
-            return float(info["last_activity"])
+        updated = self._hot_kv.mutate_record(
+            "training_session",
+            str(model_id),
+            lambda info: None if info is None else {**info, "last_activity": float(last_activity)},
+        )
+        if updated is None:
+            return None
+        return float(updated["last_activity"])
 
     def get_training_session(self, *, model_id: str) -> dict[str, Any] | None:
-        with self._lock:
-            info = self._training_sessions.get(str(model_id))
-            return dict(info) if info is not None else None
+        return self._hot_kv.get_record("training_session", str(model_id))
 
     def bump_training_session_step(self, *, model_id: str) -> int:
-        with self._lock:
-            info = self._training_sessions.get(str(model_id))
-            if info is None:
-                return 0
-            info["current_step"] = int(info.get("current_step", 0)) + 1
-            return int(info["current_step"])
+        updated = self._hot_kv.mutate_record(
+            "training_session",
+            str(model_id),
+            lambda info: None
+            if info is None
+            else {**info, "current_step": int(info.get("current_step", 0)) + 1},
+        )
+        if updated is None:
+            return 0
+        return int(updated["current_step"])
 
     def set_training_session_step(self, *, model_id: str, step: int) -> int:
-        with self._lock:
-            info = self._training_sessions.get(str(model_id))
-            if info is None:
-                return int(step)
-            info["current_step"] = max(int(info.get("current_step", 0)), int(step))
-            return int(info["current_step"])
+        updated = self._hot_kv.mutate_record(
+            "training_session",
+            str(model_id),
+            lambda info: None
+            if info is None
+            else {**info, "current_step": max(int(info.get("current_step", 0)), int(step))},
+        )
+        if updated is None:
+            return int(step)
+        return int(updated["current_step"])
 
     def list_training_sessions(self) -> list[dict[str, Any]]:
-        with self._lock:
-            return [dict(value) for value in self._training_sessions.values()]
+        return self._hot_kv.list_records("training_session")
 
     def upsert_gateway_sampling_session(
         self,
@@ -624,20 +631,27 @@ class TaskStateStore:
         upstream_alias: str,
         base_model: str,
     ) -> None:
-        with self._lock:
-            self._gateway_sampling_sessions[str(sampling_session_id)] = {
+        self._hot_kv.replace_record(
+            "gateway_sampling_session",
+            str(sampling_session_id),
+            {
+                "sampling_session_id": str(sampling_session_id),
                 "upstream_alias": str(upstream_alias),
                 "base_model": str(base_model),
-            }
+            },
+        )
 
     def get_gateway_sampling_session(self, *, sampling_session_id: str) -> dict[str, str] | None:
-        with self._lock:
-            info = self._gateway_sampling_sessions.get(str(sampling_session_id))
-            return dict(info) if info is not None else None
+        info = self._hot_kv.get_record("gateway_sampling_session", str(sampling_session_id))
+        if info is None:
+            return None
+        return {
+            "upstream_alias": str(info.get("upstream_alias") or ""),
+            "base_model": str(info.get("base_model") or ""),
+        }
 
     def delete_gateway_sampling_session(self, *, sampling_session_id: str) -> None:
-        with self._lock:
-            self._gateway_sampling_sessions.pop(str(sampling_session_id), None)
+        self._hot_kv.delete_record("gateway_sampling_session", str(sampling_session_id))
 
     def upsert_gateway_training_model(
         self,
@@ -647,28 +661,45 @@ class TaskStateStore:
         base_model: str,
         owner_id: str | None = None,
     ) -> None:
-        with self._lock:
-            self._gateway_training_models[str(model_id)] = {
+        self._hot_kv.replace_record(
+            "gateway_training_model",
+            str(model_id),
+            {
+                "model_id": str(model_id),
                 "upstream_alias": str(upstream_alias),
                 "base_model": str(base_model),
                 "owner_id": None if owner_id is None else str(owner_id),
-            }
+            },
+        )
 
     def get_gateway_training_model(self, *, model_id: str) -> dict[str, str | None] | None:
-        with self._lock:
-            info = self._gateway_training_models.get(str(model_id))
-            return dict(info) if info is not None else None
+        info = self._hot_kv.get_record("gateway_training_model", str(model_id))
+        if info is None:
+            return None
+        return {
+            "upstream_alias": str(info.get("upstream_alias") or ""),
+            "base_model": str(info.get("base_model") or ""),
+            "owner_id": None if info.get("owner_id") is None else str(info.get("owner_id")),
+        }
 
     def delete_gateway_training_model(self, *, model_id: str) -> None:
-        with self._lock:
-            self._gateway_training_models.pop(str(model_id), None)
+        self._hot_kv.delete_record("gateway_training_model", str(model_id))
 
     def list_gateway_routes(self) -> dict[str, Any]:
-        with self._lock:
-            return {
-                "sampling_sessions": dict(self._gateway_sampling_sessions),
-                "training_models": dict(self._gateway_training_models),
-            }
+        return {
+            "sampling_sessions": {
+                str(item.get("sampling_session_id") or ""): {
+                    key: value
+                    for key, value in item.items()
+                    if key != "sampling_session_id"
+                }
+                for item in self._hot_kv.list_records("gateway_sampling_session")
+            },
+            "training_models": {
+                str(item.get("model_id") or ""): {key: value for key, value in item.items() if key != "model_id"}
+                for item in self._hot_kv.list_records("gateway_training_model")
+            },
+        }
 
     def upsert_session_index(self, *, session_id: str, info: dict[str, Any]) -> None:
         session_id = str(session_id)
@@ -676,13 +707,15 @@ class TaskStateStore:
             raise ValueError("session_id is required")
         incoming = dict(info)
         incoming["session_id"] = session_id
-        with self._lock:
-            existing = self._session_index.get(session_id, {})
+        def _mutate(existing: dict[str, Any] | None) -> dict[str, Any]:
+            existing = existing or {}
             merged = {**existing, **incoming}
             merged.setdefault("training_run_ids", list(existing.get("training_run_ids") or []))
             merged.setdefault("sampler_ids", list(existing.get("sampler_ids") or []))
             merged.setdefault("heartbeat_sampler_ids", list(existing.get("heartbeat_sampler_ids") or []))
-            self._session_index[session_id] = merged
+            return merged
+
+        self._hot_kv.mutate_record("session_index", session_id, _mutate)
 
     def add_training_run_to_session_index(
         self,
@@ -694,8 +727,8 @@ class TaskStateStore:
     ) -> None:
         session_id = str(session_id)
         training_run_id = str(training_run_id)
-        with self._lock:
-            item = dict(self._session_index.get(session_id) or {"session_id": session_id})
+        def _mutate(existing: dict[str, Any] | None) -> dict[str, Any]:
+            item = dict(existing or {"session_id": session_id})
             runs = list(item.get("training_run_ids") or [])
             if training_run_id not in runs:
                 runs.append(training_run_id)
@@ -706,7 +739,9 @@ class TaskStateStore:
                 item.setdefault("user_id", str(user_id))
             if created_at is not None:
                 item.setdefault("created_at", created_at)
-            self._session_index[session_id] = item
+            return item
+
+        self._hot_kv.mutate_record("session_index", session_id, _mutate)
 
     def add_sampler_to_session_index(
         self,
@@ -718,8 +753,8 @@ class TaskStateStore:
     ) -> None:
         session_id = str(session_id)
         sampler_id = str(sampler_id)
-        with self._lock:
-            item = dict(self._session_index.get(session_id) or {"session_id": session_id})
+        def _mutate(existing: dict[str, Any] | None) -> dict[str, Any]:
+            item = dict(existing or {"session_id": session_id})
             samplers = list(item.get("sampler_ids") or [])
             if sampler_id not in samplers:
                 samplers.append(sampler_id)
@@ -730,7 +765,9 @@ class TaskStateStore:
                 item.setdefault("user_id", str(user_id))
             if created_at is not None:
                 item.setdefault("created_at", created_at)
-            self._session_index[session_id] = item
+            return item
+
+        self._hot_kv.mutate_record("session_index", session_id, _mutate)
 
     def add_heartbeat_sampler_to_session_index(
         self,
@@ -742,8 +779,8 @@ class TaskStateStore:
     ) -> None:
         session_id = str(session_id)
         sampler_id = str(sampler_id)
-        with self._lock:
-            item = dict(self._session_index.get(session_id) or {"session_id": session_id})
+        def _mutate(existing: dict[str, Any] | None) -> dict[str, Any]:
+            item = dict(existing or {"session_id": session_id})
             samplers = list(item.get("sampler_ids") or [])
             if sampler_id not in samplers:
                 samplers.append(sampler_id)
@@ -757,27 +794,29 @@ class TaskStateStore:
                 item.setdefault("user_id", str(user_id))
             if created_at is not None:
                 item.setdefault("created_at", created_at)
-            self._session_index[session_id] = item
+            return item
+
+        self._hot_kv.mutate_record("session_index", session_id, _mutate)
 
     def remove_sampler_from_session_index(self, *, session_id: str, sampler_id: str) -> None:
-        with self._lock:
-            item = self._session_index.get(str(session_id))
+        def _mutate(existing: dict[str, Any] | None) -> dict[str, Any] | None:
+            item = existing
             if item is None:
-                return
+                return None
             sid = str(sampler_id)
             item["sampler_ids"] = [x for x in list(item.get("sampler_ids") or []) if str(x) != sid]
             item["heartbeat_sampler_ids"] = [
                 x for x in list(item.get("heartbeat_sampler_ids") or []) if str(x) != sid
             ]
+            return item
+
+        self._hot_kv.mutate_record("session_index", str(session_id), _mutate)
 
     def get_session_index(self, *, session_id: str) -> dict[str, Any] | None:
-        with self._lock:
-            existing = self._session_index.get(str(session_id))
-            return dict(existing) if existing is not None else None
+        return self._hot_kv.get_record("session_index", str(session_id))
 
     def list_session_index(self) -> list[dict[str, Any]]:
-        with self._lock:
-            return [dict(value) for value in self._session_index.values()]
+        return self._hot_kv.list_records("session_index")
 
     def upsert_sampler_index(self, *, sampler_id: str, info: dict[str, Any]) -> None:
         sampler_id = str(sampler_id)
@@ -785,46 +824,39 @@ class TaskStateStore:
             raise ValueError("sampler_id is required")
         incoming = dict(info)
         incoming["sampler_id"] = sampler_id
-        with self._lock:
-            self._sampler_index[sampler_id] = {**self._sampler_index.get(sampler_id, {}), **incoming}
+        self._hot_kv.upsert_record("sampler_index", sampler_id, incoming)
 
     def delete_sampler_index(self, *, sampler_id: str) -> None:
-        with self._lock:
-            self._sampler_index.pop(str(sampler_id), None)
+        self._hot_kv.delete_record("sampler_index", str(sampler_id))
 
     def get_sampler_index(self, *, sampler_id: str) -> dict[str, Any] | None:
-        with self._lock:
-            existing = self._sampler_index.get(str(sampler_id))
-            return dict(existing) if existing is not None else None
+        return self._hot_kv.get_record("sampler_index", str(sampler_id))
 
     def list_sampler_index(self) -> list[dict[str, Any]]:
-        with self._lock:
-            return [dict(value) for value in self._sampler_index.values()]
+        return self._hot_kv.list_records("sampler_index")
 
     def update_session_heartbeat(self, *, session_id: str, now: float | None = None) -> None:
         session_id = str(session_id)
         if not session_id:
             return
         ts = _now(now)
+        self._hot_kv.update_heartbeat(session_id=session_id, now=ts)
         with self._lock:
-            self._session_heartbeats[session_id] = ts
             self._session_heartbeat_updates_since_prune += 1
-            if self._session_heartbeat_updates_since_prune >= self._session_heartbeat_prune_every:
+            should_prune = self._session_heartbeat_updates_since_prune >= self._session_heartbeat_prune_every
+            if should_prune:
                 self._session_heartbeat_updates_since_prune = 0
-                self._prune_session_heartbeats_locked(now=ts, max_age_s=self._session_heartbeat_max_age_s)
+        if should_prune:
+            self._hot_kv.prune_heartbeats(now=ts, max_age_s=self._session_heartbeat_max_age_s)
 
     def get_session_heartbeat(self, *, session_id: str) -> float | None:
-        with self._lock:
-            value = self._session_heartbeats.get(str(session_id))
-            return None if value is None else float(value)
+        return self._hot_kv.get_heartbeat(session_id=str(session_id))
 
     def delete_session_heartbeat(self, *, session_id: str) -> bool:
-        with self._lock:
-            return self._session_heartbeats.pop(str(session_id), None) is not None
+        return self._hot_kv.delete_record("heartbeat", str(session_id))
 
     def session_heartbeat_size(self) -> int:
-        with self._lock:
-            return len(self._session_heartbeats)
+        return self._hot_kv.heartbeat_size()
 
     def is_session_heartbeat_stale(self, *, session_id: str, ttl_s: float, now: float | None = None) -> bool:
         ttl = float(ttl_s)
@@ -834,24 +866,16 @@ class TaskStateStore:
         if not session_id:
             return False
         ts = _now(now)
-        with self._lock:
-            last = self._session_heartbeats.get(session_id)
+        last = self._hot_kv.get_heartbeat(session_id=session_id)
         if last is None:
             return False
         return (ts - float(last)) > ttl
 
     def prune_session_heartbeats(self, *, max_age_s: float, now: float | None = None) -> int:
-        with self._lock:
-            return self._prune_session_heartbeats_locked(now=_now(now), max_age_s=float(max_age_s))
+        return self._hot_kv.prune_heartbeats(now=_now(now), max_age_s=float(max_age_s))
 
     def _prune_session_heartbeats_locked(self, *, now: float, max_age_s: float) -> int:
-        if max_age_s <= 0:
-            return 0
-        cutoff = float(now) - float(max_age_s)
-        stale = [sid for sid, seen in self._session_heartbeats.items() if float(seen) < cutoff]
-        for sid in stale:
-            self._session_heartbeats.pop(sid, None)
-        return len(stale)
+        return self._hot_kv.prune_heartbeats(now=now, max_age_s=max_age_s)
 
     def _configure_connection(self) -> None:
         if self._db_path != ":memory:":
@@ -1722,65 +1746,6 @@ class TaskStateStore:
         _inc_payload_evict_errors(int(count))
         return {"ok": True, "metrics": task_future_reaper_metrics_snapshot()}
 
-    def _append_billing_outbox_locked(
-        self,
-        conn: sqlite3.Connection,
-        *,
-        observations: list[dict[str, Any]],
-        source: str,
-        now: float,
-    ) -> dict[str, Any]:
-        inserted = 0
-        duplicate = 0
-        conflicts = 0
-        errors: list[dict[str, str]] = []
-        for observation in observations:
-            try:
-                event = billing_event_from_observation(observation)
-                event_json = _json_dumps(event)
-                event_hash = hashlib.sha256(event_json.encode("utf-8")).hexdigest()
-                existing = conn.execute(
-                    "SELECT event_hash FROM billing_outbox WHERE event_id = ?",
-                    (str(event["event_id"]),),
-                ).fetchone()
-                if existing is not None:
-                    if str(existing["event_hash"]) == event_hash:
-                        duplicate += 1
-                    else:
-                        conflicts += 1
-                        _inc_billing_metric("outbox_conflict", 1)
-                    continue
-                conn.execute(
-                    """
-                    INSERT INTO billing_outbox(
-                        event_id,
-                        event_json,
-                        event_hash,
-                        status,
-                        claim_id,
-                        claimed_until,
-                        attempt_count,
-                        last_error,
-                        created_at,
-                        updated_at
-                    )
-                    VALUES (?, ?, ?, 'pending', NULL, NULL, 0, NULL, ?, ?)
-                    """,
-                    (str(event["event_id"]), event_json, event_hash, now, now),
-                )
-                inserted += 1
-            except Exception as e:
-                errors.append({"error": f"{type(e).__name__}: {e}"})
-                _inc_billing_metric("write_error", 1)
-        return {
-            "ok": not errors and conflicts == 0,
-            "source": str(source),
-            "inserted": inserted,
-            "duplicate": duplicate,
-            "conflicts": conflicts,
-            "errors": errors,
-        }
-
     def append_billing_outbox(
         self,
         *,
@@ -1788,12 +1753,20 @@ class TaskStateStore:
         source: str = "unknown",
         now: float | None = None,
     ) -> dict[str, Any]:
-        ts = _now(now)
         normalized = [dict(item) for item in observations if isinstance(item, dict)]
         if not normalized:
             return {"ok": True, "source": str(source), "inserted": 0, "duplicate": 0, "conflicts": 0, "errors": []}
-        with self._transaction() as conn:
-            return self._append_billing_outbox_locked(conn, observations=normalized, source=source, now=ts)
+        out = self._hot_kv.append_billing_outbox(observations=normalized, source=source, now=now)
+        inserted = int(out.get("inserted") or 0)
+        conflicts = int(out.get("conflicts") or 0)
+        errors = out.get("errors") if isinstance(out.get("errors"), list) else []
+        if inserted:
+            _inc_billing_metric("event_inserted", inserted)
+        if conflicts:
+            _inc_billing_metric("outbox_conflict", conflicts)
+        if errors:
+            _inc_billing_metric("write_error", len(errors))
+        return out
 
     def claim_billing_outbox(
         self,
@@ -1803,42 +1776,12 @@ class TaskStateStore:
         lease_ttl_s: float = 60.0,
         now: float | None = None,
     ) -> list[dict[str, Any]]:
-        ts = _now(now)
-        claim_until = ts + max(1.0, float(lease_ttl_s))
-        max_rows = max(1, int(limit))
-        with self._transaction() as conn:
-            rows = conn.execute(
-                """
-                SELECT *
-                FROM billing_outbox
-                WHERE status = 'pending'
-                   OR (status = 'flushing' AND COALESCE(claimed_until, 0) <= ?)
-                ORDER BY created_at, outbox_id
-                LIMIT ?
-                """,
-                (ts, max_rows),
-            ).fetchall()
-            if not rows:
-                return []
-            outbox_ids = [int(row["outbox_id"]) for row in rows]
-            placeholders = ",".join("?" for _ in outbox_ids)
-            conn.execute(
-                f"""
-                UPDATE billing_outbox
-                SET status = 'flushing',
-                    claim_id = ?,
-                    claimed_until = ?,
-                    attempt_count = attempt_count + 1,
-                    updated_at = ?
-                WHERE outbox_id IN ({placeholders})
-                """,
-                (str(claim_id), claim_until, ts, *outbox_ids),
-            )
-            claimed = conn.execute(
-                f"SELECT * FROM billing_outbox WHERE outbox_id IN ({placeholders}) ORDER BY created_at, outbox_id",
-                tuple(outbox_ids),
-            ).fetchall()
-        return [self._billing_outbox_row_to_record(row) for row in claimed]
+        return self._hot_kv.claim_billing_outbox(
+            claim_id=str(claim_id),
+            limit=int(limit),
+            lease_ttl_s=float(lease_ttl_s),
+            now=now,
+        )
 
     def delete_billing_outbox_claim(
         self,
@@ -1846,16 +1789,10 @@ class TaskStateStore:
         claim_id: str,
         outbox_ids: list[int],
     ) -> dict[str, Any]:
-        ids = [int(value) for value in outbox_ids]
-        if not ids:
-            return {"ok": True, "deleted": 0}
-        with self._transaction() as conn:
-            placeholders = ",".join("?" for _ in ids)
-            cur = conn.execute(
-                f"DELETE FROM billing_outbox WHERE claim_id = ? AND outbox_id IN ({placeholders})",
-                (str(claim_id), *ids),
-            )
-            return {"ok": True, "deleted": int(cur.rowcount or 0)}
+        return self._hot_kv.delete_billing_outbox_claim(
+            claim_id=str(claim_id),
+            outbox_ids=[int(value) for value in outbox_ids],
+        )
 
     def mark_billing_outbox_claim_failed(
         self,
@@ -1866,63 +1803,18 @@ class TaskStateStore:
         error: str,
         now: float | None = None,
     ) -> dict[str, Any]:
-        ids = [int(value) for value in outbox_ids]
-        if not ids:
-            return {"ok": True, "updated": 0}
-        ts = _now(now)
-        status = "failed" if bool(permanent) else "pending"
-        with self._transaction() as conn:
-            placeholders = ",".join("?" for _ in ids)
-            cur = conn.execute(
-                f"""
-                UPDATE billing_outbox
-                SET status = ?,
-                    claim_id = NULL,
-                    claimed_until = NULL,
-                    last_error = ?,
-                    updated_at = ?
-                WHERE claim_id = ? AND outbox_id IN ({placeholders})
-                """,
-                (status, str(error), ts, str(claim_id), *ids),
-            )
-            return {"ok": True, "updated": int(cur.rowcount or 0)}
+        return self._hot_kv.mark_billing_outbox_claim_failed(
+            claim_id=str(claim_id),
+            outbox_ids=[int(value) for value in outbox_ids],
+            permanent=bool(permanent),
+            error=str(error),
+            now=now,
+        )
 
     def billing_outbox_stats(self, *, now: float | None = None) -> dict[str, Any]:
-        ts = _now(now)
-        with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT status, COUNT(*) AS rows, MIN(created_at) AS oldest_created_at
-                FROM billing_outbox
-                GROUP BY status
-                """
-            ).fetchall()
-        by_status: dict[str, dict[str, Any]] = {}
-        for row in rows:
-            status = str(row["status"] or "unknown")
-            oldest = row["oldest_created_at"]
-            by_status[status] = {
-                "rows": int(row["rows"] or 0),
-                "oldest_age_s": None if oldest is None else max(0.0, ts - float(oldest)),
-            }
-        return {
-            "by_status": by_status,
-            "metrics": billing_metrics_snapshot(),
-        }
-
-    def _billing_outbox_row_to_record(self, row: sqlite3.Row) -> dict[str, Any]:
-        return {
-            "outbox_id": int(row["outbox_id"]),
-            "event_id": row["event_id"],
-            "event": _json_loads(row["event_json"]),
-            "status": row["status"],
-            "claim_id": row["claim_id"],
-            "claimed_until": row["claimed_until"],
-            "attempt_count": int(row["attempt_count"] or 0),
-            "last_error": row["last_error"],
-            "created_at": row["created_at"],
-            "updated_at": row["updated_at"],
-        }
+        stats = self._hot_kv.billing_outbox_stats(now=now)
+        stats["metrics"] = billing_metrics_snapshot()
+        return stats
 
     def _terminal_completed_at(self, record: dict[str, Any]) -> float:
         metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
@@ -1995,8 +1887,7 @@ class TaskStateStore:
                 if not _require_staged_success_path(row, result_path):
                     self._raise_task_transition_error(conn, request_id, f"complete task {status}")
                 merged = {**_json_loads(row["metadata_json"]), **dict(metadata or {})}
-                billing_result = self._append_billing_outbox_locked(
-                    conn,
+                billing_result = self.append_billing_outbox(
                     observations=[dict(item) for item in (billing_observations or []) if isinstance(item, dict)],
                     source="task_terminal",
                     now=ts,
@@ -2359,8 +2250,7 @@ class TaskStateStore:
                 if not _require_staged_success_path(row, result_path):
                     self._raise_task_transition_error(conn, request_id, f"commit finalize {status}")
                 merged = _json_loads(row["metadata_json"])
-                billing_result = self._append_billing_outbox_locked(
-                    conn,
+                billing_result = self.append_billing_outbox(
                     observations=[dict(item) for item in (billing_observations or []) if isinstance(item, dict)],
                     source="model_work_terminal",
                     now=ts,
@@ -2637,6 +2527,18 @@ def _task_state_store_db_path() -> str:
             "/vePFS-Mindverse/share/mint/dev/data/task-state/task_state.sqlite3",
         )
     )
+
+
+def _task_hot_kv_store_db_path(task_state_db_path: str | None = None) -> str:
+    configured = os.environ.get("MINT_TASK_HOT_KV_STORE_DB_PATH") or getattr(
+        server_config,
+        "task_hot_kv_store_db_path",
+        None,
+    )
+    if configured:
+        return str(configured)
+    base = Path(str(task_state_db_path or _task_state_store_db_path()))
+    return str(base.parent.parent / "task-hot-kv" / "task_hot.rocksdb")
 
 
 class _TaskStateStoreActor:
@@ -3535,7 +3437,7 @@ def _create_ray_actor(*, require_ready: bool = True):
     actor_name = _ray_task_state_store_actor_name()
     namespace = _ray_namespace()
     db_path = _task_state_store_db_path()
-    max_concurrency = int(os.environ.get("MINT_TASK_STATE_STORE_ACTOR_MAX_CONCURRENCY", "16"))
+    max_concurrency = int(os.environ.get("MINT_TASK_STATE_STORE_ACTOR_MAX_CONCURRENCY", "64"))
 
     @ray.remote(num_cpus=0, max_concurrency=max_concurrency, max_restarts=0)
     class _RayTaskStateStoreActor(_TaskStateStoreActor):

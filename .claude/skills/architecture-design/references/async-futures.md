@@ -55,10 +55,8 @@ written through the in-process `TaskPayloadStore` filesystem helper.
 The production implementation is a persistent RocksDB-backed KV store opened
 inside `TaskStateStore`. This is not a cache of SQLite state: for futures, the
 `FutureStateStore` component is the source of truth. SQLite `TaskStateStore`
-must not be updated on the future hot path. A short migration window may read
-old SQLite future rows as a fallback for requests created before the cutover,
-but new writes go through `TaskStateStore` into its `FutureStateStore`
-component.
+must not be updated on the future hot path. New writes go through
+`TaskStateStore` into its `FutureStateStore` component.
 
 The facade preserves the old Tinker future methods (`async_resolve`,
 `async_fail`, `async_get_status`, etc.) while routing future state through
@@ -66,9 +64,13 @@ The facade preserves the old Tinker future methods (`async_resolve`,
 first `TaskStateStore` records the expected payload path in its future-state
 component, then the payload store helper atomically publishes the vePFS JSON
 file, then `TaskStateStore` commits the terminal status, checksum, size, and
-result pointer. The existing `TaskStateStore` actor is the single writer that
-serializes these writes; if the KV backend exposes batch writes, the
-implementation should use them for the record plus indexes.
+result pointer. The existing `TaskStateStore` actor is the lifecycle owner for
+these writes, but the KV helper must not use a single global lock for the
+retrieve/scheduler hot path. Future records use striped per-`request_id` locks
+plus explicit status/domain/metadata/lease/result/staged/created/updated
+indexes. Retrieve is a point lookup; scheduler hydration and reapers use those
+indexes rather than full task scans. If the KV backend exposes batch writes,
+the implementation should use them for the record plus indexes.
 Model-work finalization records the lease identity and
 `finalizing_until`; direct in-process future resolution records the staged path
 while leaving the task pending until terminal commit. This is primarily for GC
@@ -81,11 +83,11 @@ There is no separate future replay index or detached future actor. Retrieve
 hot-cache entries are process-local accelerators only; restart recovery,
 terminal replay, and payload-evicted detection all use `TaskStateStore`.
 
-`FutureStateStore` uses `request_id` point lookups for retrieve and should keep
+`FutureStateStore` uses `request_id` point lookups for retrieve and keeps
 active-task indexes (`pending`, `queued`, `assigned`, `leased`, `running`,
-`finalizing`) for scheduler hydration as volume grows. V1 may do bounded
-single-writer scans for scheduler startup and reaper paths, but retrieve and
-task status checks must never do full-table or full-keyspace scans.
+`finalizing`) for scheduler hydration. Reapers use terminal-result,
+lease-expiry, staged-payload, metadata, and updated indexes. Retrieve and task
+status checks must never do full-table or full-keyspace scans.
 `ModelWorkScheduler` must rebuild its in-memory projection from the store on
 startup; it is not a second durable indexer.
 

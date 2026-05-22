@@ -1041,9 +1041,9 @@ def test_billing_outbox_write_failure_sets_underbilling_signal(monkeypatch) -> N
         )
 
         def _fail_append(*_args, **_kwargs):
-            return {"ok": False, "errors": [{"error": "sqlite unavailable"}], "inserted": 0}
+            return {"ok": False, "errors": [{"error": "kv unavailable"}], "inserted": 0}
 
-        monkeypatch.setattr(store, "_append_billing_outbox_locked", _fail_append)
+        monkeypatch.setattr(store._hot_kv, "append_billing_outbox", _fail_append)
 
         completed = store.complete_task_success(
             request_id="future-bill-drop",
@@ -1056,7 +1056,7 @@ def test_billing_outbox_write_failure_sets_underbilling_signal(monkeypatch) -> N
         )
         assert completed["record"]["status"] == "done"
         assert completed["record"]["metadata"]["billing_status"] == "dropped"
-        assert completed["record"]["metadata"]["billing_error"]["errors"][0]["error"] == "sqlite unavailable"
+        assert completed["record"]["metadata"]["billing_error"]["errors"][0]["error"] == "kv unavailable"
     finally:
         store.close()
 
