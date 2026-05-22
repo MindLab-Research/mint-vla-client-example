@@ -578,6 +578,14 @@ def _checkpoint_owner_id() -> str | None:
     return _env_object_id("MINT_TEST_CHECKPOINT_OWNER_ID")
 
 
+def _mint_checkpoint_uri(model_path: str) -> str:
+    if model_path.startswith("mint://"):
+        return model_path
+    if model_path.startswith("tinker://"):
+        return "mint://" + model_path[len("tinker://") :]
+    raise ValueError(f"checkpoint model_path must start with 'mint://' or 'tinker://', got {model_path!r}")
+
+
 def _create_sampling_client_for_checkpoint(
     service_client: Any,
     *,
@@ -594,8 +602,7 @@ def _create_sampling_client_for_checkpoint(
         )
 
     holder = service_client.holder
-    if not model_path.startswith("mint://"):
-        raise ValueError("model_path must start with 'mint://'")
+    model_path = _mint_checkpoint_uri(model_path)
     assert holder._sampling_client_counter is not None
     sampling_session_seq_id = holder._sampling_client_counter
     holder._sampling_client_counter += 1
@@ -976,6 +983,37 @@ def _save_weights_and_get_sampling_client_with_retry(
             return sampling_client
         except Exception as e:
             last_exc = e
+            if sampling_path := locals().get("sampling_path"):
+                print(
+                    f"create_sampling_client({name!r}) failed after successful save: {e} "
+                    f"(attempt 1/{max_retries})"
+                )
+                create_last_exc: Exception = e
+                for create_attempt in range(1, max_retries):
+                    if create_attempt < max_retries - 1:
+                        time.sleep(min(backoff_s * (2 ** (create_attempt - 1)), 10.0))
+                    try:
+                        sampling_client = _time_call(
+                            lambda: _create_sampling_client_for_checkpoint(
+                                service_client,
+                                model_path=str(sampling_path),
+                                base_model=base_model,
+                                retry_config=SAMPLING_RETRY_CONFIG,
+                            ),
+                            stage_name="create_sampling_client",
+                            extra={"name": name, "model_path": str(sampling_path)},
+                        )
+                        _dbg(f"sampling_session_id={getattr(sampling_client, '_sampling_session_id', None)!r}")
+                        return sampling_client
+                    except Exception as create_exc:
+                        create_last_exc = create_exc
+                        print(
+                            f"create_sampling_client({name!r}) failed after successful save: {create_exc} "
+                            f"(attempt {create_attempt + 1}/{max_retries})"
+                        )
+                raise RuntimeError(
+                    f"Failed to create sampling client for {name!r} after successful save"
+                ) from create_last_exc
             print(
                 f"save_weights_for_sampler({name!r}) failed: {e} "
                 f"(attempt {attempt + 1}/{max_retries})"

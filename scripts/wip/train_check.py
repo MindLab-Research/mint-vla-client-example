@@ -463,6 +463,10 @@ def classify_failure(text: str, *, exit_code: int) -> str | None:
     if exit_code == 0:
         return None
     lowered = text.lower()
+    if "model_path must start with" in lowered or "checkpoint model_path must start with" in lowered:
+        return "client workflow"
+    if "valueerror" in lowered and "create_sampling_client" in lowered:
+        return "client workflow"
     if "cuda out of memory" in lowered or "actordiederror" in lowered or "enginedeaderror" in lowered:
         return "server exception"
     if "worker failed" in lowered or "requestfailederror" in lowered or "traceback" in lowered:
@@ -475,6 +479,11 @@ def classify_failure(text: str, *, exit_code: int) -> str | None:
 
 
 def failure_surface_from_logs(text: str) -> str | None:
+    lowered = text.lower()
+    if "model_path must start with" in lowered or "checkpoint model_path must start with" in lowered:
+        return "create_sampling_client"
+    if "valueerror" in lowered and "create_sampling_client" in lowered:
+        return "create_sampling_client"
     patterns = [
         r"FAIL in `?([A-Za-z0-9_./:-]+)`?",
         r"Failure surface:\s*([^.\n]+)",

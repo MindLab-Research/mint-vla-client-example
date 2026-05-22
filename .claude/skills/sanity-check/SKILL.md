@@ -98,6 +98,7 @@ If the wrapper reports any failure:
 1. Preserve all artifacts from the current attempt.
 2. Classify the failure as one of:
    - `client env/auth`: base URL, API key, auth, or checkpoint owner id.
+   - `client workflow`: wrapper/script compatibility problems, SDK URI mismatch, local validation errors, or report-generation bugs.
    - `capacity/scheduling`: placement pending, actor not registered, queue not consumed, GPU/PG held by stale actor.
    - `server exception`: traceback, 5xx, explicit request failure, actor crash, `ActorDiedError`, `EngineDeadError`, CUDA OOM.
    - `timing degradation`: no hard failure, but a stage is materially slower than expected.
