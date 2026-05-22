@@ -9,7 +9,7 @@ import socket
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Iterable
 
 from ..config import (
     PFS_PYTHONPATH,
@@ -113,6 +113,226 @@ def _reconcile_interval_s_from_env() -> float:
         )
         return 5.0
     return max(0.1, value)
+
+
+def _otel_metric_attrs() -> dict[str, str]:
+    attrs = {
+        "deployment.env": os.getenv("MINT_DEPLOYMENT_ENV", "").strip(),
+        "mint.cluster_id": os.getenv("MINT_CLUSTER_ID", "").strip(),
+        "ray_namespace": _ray_namespace(),
+    }
+    return {key: value for key, value in attrs.items() if value}
+
+
+def _prom_number(value: object) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _actor_workload(actor_type: object) -> str:
+    return "sample" if str(actor_type or "").strip().lower() == "vllm" else "train"
+
+
+def _model_actor_inventory_gpu_bindings(rec: dict[str, object]) -> list[dict[str, str]]:
+    metadata = rec.get("metadata") if isinstance(rec.get("metadata"), dict) else {}
+    actor_name = str(rec.get("actor_name") or "unknown")
+    workload = _actor_workload(rec.get("actor_type"))
+
+    bindings = metadata.get("gpu_bindings") if isinstance(metadata, dict) else None
+    if isinstance(bindings, list):
+        out: list[dict[str, str]] = []
+        for binding in bindings:
+            if not isinstance(binding, dict):
+                continue
+            gpu_uuid = binding.get("gpu_uuid")
+            if not isinstance(gpu_uuid, str) or not gpu_uuid.strip():
+                continue
+            out.append(
+                {
+                    "actor_name": actor_name,
+                    "workload": workload,
+                    "hostname": str(binding.get("hostname") or metadata.get("hostname") or "unknown"),
+                    "gpu_uuid": gpu_uuid.strip(),
+                }
+            )
+        if out:
+            return out
+
+    return []
+
+
+def _rss_state_for_record(rec: dict[str, object]) -> str:
+    rss_state = str(rec.get("rss_cache_state") or "").strip().lower()
+    if rss_state in {"fresh", "stale", "unknown"}:
+        return rss_state
+    if _prom_number(rec.get("rss_bytes")) is not None:
+        return "fresh"
+    if rec.get("rss_sample_age_s") is not None or rec.get("rss_sample_source") is not None:
+        return "stale"
+    return "unknown"
+
+
+def _inventory_otel_gauge_callbacks(supervisor: "ModelActorSupervisorCore", observation_cls, attrs_fn) -> Iterable[tuple[str, Callable, str | None]]:
+    def _inventory_records() -> list[dict[str, Any]]:
+        try:
+            return list(supervisor.cached_snapshot(refresh_metadata=False))
+        except Exception:
+            return []
+
+    def _actor_metric(field: str):
+        def _callback(_options):
+            observations = []
+            for rec in _inventory_records():
+                value = _prom_number(rec.get(field))
+                if value is None:
+                    continue
+                observations.append(
+                    observation_cls(
+                        value,
+                        attrs_fn(
+                            actor_type=rec.get("actor_type") or "unknown",
+                            model=rec.get("base_model") or "unknown",
+                            actor_name=rec.get("actor_name") or "unknown",
+                        ),
+                    )
+                )
+            return observations
+
+        return _callback
+
+    def _actor_rss_cache_state(_options):
+        return [
+            observation_cls(
+                1.0,
+                attrs_fn(
+                    actor_type=rec.get("actor_type") or "unknown",
+                    model=rec.get("base_model") or "unknown",
+                    actor_name=rec.get("actor_name") or "unknown",
+                    state=_rss_state_for_record(rec),
+                ),
+            )
+            for rec in _inventory_records()
+        ]
+
+    def _actor_gpu_binding(_options):
+        observations = []
+        for rec in _inventory_records():
+            for binding in _model_actor_inventory_gpu_bindings(rec):
+                observations.append(observation_cls(1.0, attrs_fn(**binding)))
+        return observations
+
+    def _grouped_records() -> dict[tuple[str, str], dict[str, float]]:
+        grouped: dict[tuple[str, str], dict[str, float]] = {}
+        for rec in _inventory_records():
+            actor_type = str(rec.get("actor_type") or "unknown")
+            model = str(rec.get("base_model") or "unknown")
+            rss_state = _rss_state_for_record(rec)
+            bucket = grouped.setdefault(
+                (actor_type, model),
+                {
+                    "count": 0.0,
+                    "rss_sum": 0.0,
+                    "rss_count": 0.0,
+                    "rss_fresh": 0.0,
+                    "rss_stale": 0.0,
+                    "rss_unknown": 0.0,
+                    "max_idle": 0.0,
+                    "max_age": 0.0,
+                },
+            )
+            bucket["count"] += 1.0
+            bucket[f"rss_{rss_state}"] += 1.0
+            idle = _prom_number(rec.get("idle_time"))
+            if idle is not None and idle > bucket["max_idle"]:
+                bucket["max_idle"] = idle
+            age = _prom_number(rec.get("age"))
+            if age is not None and age > bucket["max_age"]:
+                bucket["max_age"] = age
+            rss = _prom_number(rec.get("rss_bytes"))
+            if rss is not None:
+                bucket["rss_sum"] += rss
+                bucket["rss_count"] += 1.0
+        return grouped
+
+    def _group_metric(field: str, *, require_rss_count: bool = False):
+        def _callback(_options):
+            observations = []
+            for (actor_type, model), rec in sorted(_grouped_records().items()):
+                if require_rss_count and rec.get("rss_count", 0.0) <= 0.0:
+                    continue
+                value = _prom_number(rec.get(field))
+                if value is None:
+                    continue
+                observations.append(observation_cls(value, attrs_fn(actor_type=actor_type, model=model)))
+            return observations
+
+        return _callback
+
+    def _group_rss_cache_samples(_options):
+        observations = []
+        for (actor_type, model), rec in sorted(_grouped_records().items()):
+            for state in ("fresh", "stale", "unknown"):
+                value = _prom_number(rec.get(f"rss_{state}"))
+                if value is None or value <= 0.0:
+                    continue
+                observations.append(
+                    observation_cls(value, attrs_fn(actor_type=actor_type, model=model, state=state))
+                )
+        return observations
+
+    def _metadata_cache_metric(field: str):
+        def _callback(_options):
+            observations = []
+            for row in supervisor.metadata_cache_metrics_snapshot():
+                value = _prom_number(row.get(field))
+                if value is None:
+                    continue
+                observations.append(
+                    observation_cls(value, attrs_fn(actor_type=row.get("actor_type") or "unknown"))
+                )
+            return observations
+
+        return _callback
+
+    return (
+        ("mint_model_actor_inventory_actor_idle_time_s", _actor_metric("idle_time"), "s"),
+        ("mint_model_actor_inventory_actor_age_s", _actor_metric("age"), "s"),
+        ("mint_model_actor_inventory_actor_rss_bytes", _actor_metric("rss_bytes"), "By"),
+        ("mint_model_actor_inventory_actor_rss_sample_age_s", _actor_metric("rss_sample_age_s"), "s"),
+        ("mint_model_actor_inventory_actor_rss_cache_state", _actor_rss_cache_state, None),
+        ("mint_model_actor_inventory_actor_gpu_binding", _actor_gpu_binding, None),
+        ("mint_model_actor_inventory_actors", _group_metric("count"), None),
+        ("mint_model_actor_inventory_group_oldest_idle_time_s", _group_metric("max_idle"), "s"),
+        ("mint_model_actor_inventory_group_oldest_age_s", _group_metric("max_age"), "s"),
+        ("mint_model_actor_inventory_group_rss_bytes", _group_metric("rss_sum", require_rss_count=True), "By"),
+        ("mint_model_actor_inventory_group_rss_cache_samples", _group_rss_cache_samples, None),
+        (
+            "mint_model_actor_inventory_observability_cache_hits_total",
+            _metadata_cache_metric("cache_hits_total"),
+            None,
+        ),
+        (
+            "mint_model_actor_inventory_observability_cache_stale_total",
+            _metadata_cache_metric("cache_stale_total"),
+            None,
+        ),
+        (
+            "mint_model_actor_inventory_observability_refresh_success_total",
+            _metadata_cache_metric("refresh_success_total"),
+            None,
+        ),
+        (
+            "mint_model_actor_inventory_observability_refresh_failures_total",
+            _metadata_cache_metric("refresh_failures_total"),
+            None,
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -580,6 +800,12 @@ class ModelActorSupervisorCore:
         owner_ttl_s: float | None = None,
         state_event_limit: int | None = None,
     ) -> None:
+        try:
+            from ..logging_context import init_actor_observability
+
+            init_actor_observability()
+        except Exception:
+            logger.debug("[model_actor_supervisor] actor observability init skipped", exc_info=True)
         self._desired: dict[tuple[str, str], ModelActorSpec] = {}
         self._launcher_registry = launcher_registry or default_model_actor_launcher_registry()
         self._runtime_factory = runtime_factory
@@ -658,6 +884,9 @@ class ModelActorSupervisorCore:
         self._last_reconcile_loop_error: str | None = None
         for spec in specs or []:
             self.set_desired(spec)
+        self._otel_enabled = False
+        self._otel_error: str | None = None
+        self._init_otel_metrics()
 
     @staticmethod
     def _default_owner_id() -> str:
@@ -872,11 +1101,145 @@ class ModelActorSupervisorCore:
     def lifecycle_metrics_snapshot(self) -> list[dict[str, int | str]]:
         return self._inventory.lifecycle_metrics_snapshot()
 
-    def cached_snapshot(self) -> list[dict[str, Any]]:
-        return self._inventory.cached_snapshot()
+    def cached_snapshot(self, *, refresh_metadata: bool = True) -> list[dict[str, Any]]:
+        return self._inventory.cached_snapshot(refresh_metadata=refresh_metadata)
 
     def rss_snapshot(self, *, timeout_s: float = 10.0) -> list[dict]:
         return self._inventory.rss_snapshot(timeout_s=timeout_s)
+
+    def _init_otel_metrics(self) -> None:
+        endpoint = (os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT") or "").strip()
+        if not endpoint:
+            return
+        try:
+            from opentelemetry import metrics
+            from opentelemetry.metrics import Observation
+
+            meter = metrics.get_meter("mint.model_actor_supervisor")
+
+            def _gauge(name: str, callback, *, unit: str | None = None, description: str = "") -> None:
+                kwargs: dict[str, Any] = {"callbacks": [callback]}
+                if unit:
+                    kwargs["unit"] = unit
+                if description:
+                    kwargs["description"] = description
+                meter.create_observable_gauge(name, **kwargs)
+
+            def _attrs(**extra: object) -> dict[str, str]:
+                attrs = _otel_metric_attrs()
+                for key, value in extra.items():
+                    text = str(value if value is not None else "").strip()
+                    if text:
+                        attrs[key] = text
+                return attrs
+
+            def _scalar(field: str):
+                def _callback(_options):
+                    value = _prom_number(self.snapshot().get(field))
+                    if value is None:
+                        return []
+                    return [Observation(value, _attrs())]
+
+                return _callback
+
+            for key in (
+                "desired_total",
+                "managed_total",
+                "domain_total",
+                "reconcile_total",
+                "created_total",
+                "restarted_total",
+                "blocked_total",
+                "busy_recycle_skipped_total",
+                "scheduler_sync_failures_total",
+                "topology_reconcile_failures_total",
+                "node_metrics_created_total",
+                "node_metrics_reconcile_failures_total",
+            ):
+                _gauge(f"mint_model_actor_supervisor_{key}", _scalar(key))
+
+            def _domain_metric(field: str):
+                def _callback(_options):
+                    snapshot = self.snapshot()
+                    domains = snapshot.get("domains")
+                    if not isinstance(domains, dict):
+                        return []
+                    observations = []
+                    for domain_key, rec in sorted(domains.items()):
+                        if not isinstance(rec, dict):
+                            continue
+                        value = _prom_number(rec.get(field))
+                        if value is None:
+                            continue
+                        observations.append(
+                            Observation(
+                                value,
+                                _attrs(domain_key=domain_key),
+                            )
+                        )
+                    return observations
+
+                return _callback
+
+            _gauge("mint_model_actor_supervisor_domain_replicas", _domain_metric("replicas"))
+            _gauge("mint_model_actor_supervisor_domain_healthy", _domain_metric("healthy"))
+            _gauge("mint_model_actor_supervisor_domain_unhealthy", _domain_metric("unhealthy"))
+
+            def _replica_state(_options):
+                snapshot = self.snapshot()
+                replicas = snapshot.get("replicas")
+                if not isinstance(replicas, dict):
+                    return []
+                observations = []
+                for rec in replicas.values():
+                    if not isinstance(rec, dict):
+                        continue
+                    observations.append(
+                        Observation(
+                            1.0,
+                            _attrs(
+                                domain_key=rec.get("domain_key") or "unknown",
+                                replica_id=rec.get("replica_id") or "unknown",
+                                actor_name=rec.get("actor_name") or rec.get("desired_actor_name") or "unknown",
+                                state=rec.get("state") or "unknown",
+                            ),
+                        )
+                    )
+                return observations
+
+            def _replica_generation(_options):
+                snapshot = self.snapshot()
+                replicas = snapshot.get("replicas")
+                if not isinstance(replicas, dict):
+                    return []
+                observations = []
+                for rec in replicas.values():
+                    if not isinstance(rec, dict):
+                        continue
+                    value = _prom_number(rec.get("generation"))
+                    if value is None:
+                        continue
+                    observations.append(
+                        Observation(
+                            value,
+                            _attrs(
+                                domain_key=rec.get("domain_key") or "unknown",
+                                replica_id=rec.get("replica_id") or "unknown",
+                                actor_name=rec.get("actor_name") or rec.get("desired_actor_name") or "unknown",
+                                state=rec.get("state") or "unknown",
+                            ),
+                        )
+                    )
+                return observations
+
+            _gauge("mint_model_actor_supervisor_replica_state", _replica_state)
+            _gauge("mint_model_actor_supervisor_replica_generation", _replica_generation)
+
+            for name, callback, unit in _inventory_otel_gauge_callbacks(self, Observation, _attrs):
+                _gauge(name, callback, unit=unit)
+            self._otel_enabled = True
+        except Exception as e:
+            self._otel_error = f"{type(e).__name__}: {e}"
 
     def iter_entries(self, *, prune_stale: bool = False) -> list[ActorEntry]:
         return self._inventory.iter_entries(prune_stale=prune_stale)

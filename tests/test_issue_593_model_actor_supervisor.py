@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import sqlite3
 import sys
 import time
@@ -255,6 +254,176 @@ def test_issue_593_supervisor_detached_actor_options(monkeypatch: pytest.MonkeyP
     assert created["options"]["resources"] == {"node:10.1.2.3": 0.001}
     assert created["remote_kwargs"]["specs"] == desired_specs_from_env()
     assert actor.calls == [("snapshot", (), {})]
+
+
+def test_issue_638_supervisor_registers_actor_observability(monkeypatch: pytest.MonkeyPatch) -> None:
+    import mint_server.backend.model_actor_supervisor as supervisor_module
+    import mint_server.logging_context as logging_context
+
+    calls = {"count": 0}
+    monkeypatch.setattr(logging_context, "init_actor_observability", lambda: calls.__setitem__("count", calls["count"] + 1))
+
+    supervisor_module.ModelActorSupervisor(
+        specs=[],
+        state_store=SupervisorMemoryStateStore(),
+        node_metrics_enabled=False,
+        **_disabled_control_plane_kwargs(),
+    )
+
+    assert calls["count"] == 1
+
+
+def test_issue_638_supervisor_registers_otel_inventory_and_supervisor_gauges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opentelemetry.metrics as otel_metrics
+
+    import mint_server.backend.model_actor_supervisor as supervisor_module
+    import mint_server.logging_context as logging_context
+
+    gauges: dict[str, list] = {}
+
+    class _FakeMeter:
+        def create_observable_gauge(self, name, **kwargs):
+            gauges[name] = list(kwargs.get("callbacks") or [])
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel.example:4317")
+    monkeypatch.setattr(otel_metrics, "get_meter", lambda _name: _FakeMeter())
+    monkeypatch.setattr(logging_context, "init_actor_observability", lambda: None)
+
+    supervisor_module.ModelActorSupervisor(
+        specs=[],
+        state_store=SupervisorMemoryStateStore(),
+        node_metrics_enabled=False,
+        **_disabled_control_plane_kwargs(),
+    )
+
+    assert "mint_model_actor_supervisor_desired_total" in gauges
+    assert "mint_model_actor_supervisor_domain_replicas" in gauges
+    assert "mint_model_actor_supervisor_replica_state" in gauges
+    assert "mint_model_actor_inventory_actors" in gauges
+    assert "mint_model_actor_inventory_actor_gpu_binding" in gauges
+    assert "mint_model_actor_inventory_observability_cache_hits_total" in gauges
+
+
+def test_issue_638_supervisor_otel_inventory_callbacks_use_cached_snapshot_without_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opentelemetry.metrics as otel_metrics
+
+    import mint_server.backend.model_actor_inventory as inventory_module
+    import mint_server.backend.model_actor_supervisor as supervisor_module
+    import mint_server.logging_context as logging_context
+
+    gauges: dict[str, list] = {}
+
+    class _FakeMeter:
+        def create_observable_gauge(self, name, **kwargs):
+            gauges[name] = list(kwargs.get("callbacks") or [])
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel.example:4317")
+    monkeypatch.setenv("MINT_DEPLOYMENT_ENV", "prod")
+    monkeypatch.setenv("MINT_CLUSTER_ID", "volcano")
+    monkeypatch.setattr(otel_metrics, "get_meter", lambda _name: _FakeMeter())
+    monkeypatch.setattr(logging_context, "init_actor_observability", lambda: None)
+
+    supervisor = supervisor_module.ModelActorSupervisor(
+        specs=[],
+        state_store=SupervisorMemoryStateStore(),
+        node_metrics_enabled=False,
+        **_disabled_control_plane_kwargs(),
+    )
+    supervisor.register(
+        actor_name="mint_vllm_qwen3_0_6b",
+        actor_type=ActorType.VLLM,
+        num_gpus=1,
+        base_model="Qwen/Qwen3-0.6B",
+        metadata={
+            "gpu_bindings": [
+                {
+                    "hostname": "mint-worker-0",
+                    "gpu_uuid": "GPU-test-0",
+                    "gpu_index": 0,
+                    "node_ip": "10.0.0.7",
+                    "ray_node_id": "node-high-cardinality",
+                    "last_error": "free-form error",
+                }
+            ]
+        },
+    )
+
+    def _unexpected_refresh(*_args, **_kwargs):
+        raise AssertionError("OTel callbacks must not refresh runtime actor metadata")
+
+    monkeypatch.setattr(inventory_module.ModelActorInventory, "_refresh_entry_metadata", _unexpected_refresh)
+
+    actor_count_obs = gauges["mint_model_actor_inventory_actors"][0](None)
+    assert len(actor_count_obs) == 1
+    assert actor_count_obs[0].value == 1.0
+    assert actor_count_obs[0].attributes["actor_type"] == "vllm"
+    assert actor_count_obs[0].attributes["model"] == "Qwen/Qwen3-0.6B"
+    assert actor_count_obs[0].attributes["deployment.env"] == "prod"
+    assert actor_count_obs[0].attributes["mint.cluster_id"] == "volcano"
+
+    binding_obs = gauges["mint_model_actor_inventory_actor_gpu_binding"][0](None)
+    assert len(binding_obs) == 1
+    attrs = binding_obs[0].attributes
+    assert attrs["actor_name"] == "mint_vllm_qwen3_0_6b"
+    assert attrs["workload"] == "sample"
+    assert attrs["hostname"] == "mint-worker-0"
+    assert attrs["gpu_uuid"] == "GPU-test-0"
+    assert "gpu_index" not in attrs
+    assert "node_ip" not in attrs
+    assert "ray_node_id" not in attrs
+    assert "last_error" not in attrs
+
+
+def test_issue_638_supervisor_otel_callbacks_emit_supervisor_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opentelemetry.metrics as otel_metrics
+
+    import mint_server.backend.model_actor_supervisor as supervisor_module
+    import mint_server.logging_context as logging_context
+
+    gauges: dict[str, list] = {}
+
+    class _FakeMeter:
+        def create_observable_gauge(self, name, **kwargs):
+            gauges[name] = list(kwargs.get("callbacks") or [])
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel.example:4317")
+    monkeypatch.setattr(otel_metrics, "get_meter", lambda _name: _FakeMeter())
+    monkeypatch.setattr(logging_context, "init_actor_observability", lambda: None)
+
+    supervisor = supervisor_module.ModelActorSupervisor(
+        specs=[
+            ModelActorSpec(
+                domain_key="vllm:Qwen/Qwen3-0.6B",
+                replica_id="replica-0",
+                actor_name="mint_vllm_qwen3_0_6b",
+                base_model="Qwen/Qwen3-0.6B",
+            )
+        ],
+        state_store=SupervisorMemoryStateStore(),
+        node_metrics_enabled=False,
+        **_disabled_control_plane_kwargs(),
+    )
+    supervisor._states[("vllm:Qwen/Qwen3-0.6B", "replica-0")].update(
+        {"state": "healthy", "actor_name": "mint_vllm_qwen3_0_6b", "generation": 7}
+    )
+
+    desired_obs = gauges["mint_model_actor_supervisor_desired_total"][0](None)
+    assert desired_obs[0].value == 1.0
+
+    domain_obs = gauges["mint_model_actor_supervisor_domain_healthy"][0](None)
+    assert domain_obs[0].value == 1.0
+    assert domain_obs[0].attributes["domain_key"] == "vllm:Qwen/Qwen3-0.6B"
+
+    replica_obs = gauges["mint_model_actor_supervisor_replica_generation"][0](None)
+    assert replica_obs[0].value == 7.0
+    assert replica_obs[0].attributes["actor_name"] == "mint_vllm_qwen3_0_6b"
+    assert replica_obs[0].attributes["state"] == "healthy"
 
 
 def test_issue_593_supervisor_ensure_recreates_stale_code_identity(
