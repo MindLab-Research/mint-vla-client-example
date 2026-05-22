@@ -106,7 +106,7 @@ def test_mint_vllm_multinode_runtime_env_drops_driver_ray_attach_hints():
         "MINT_RAY_NODE_IP_ADDRESS": "192.168.39.234",
     }
 
-    mni._prepare_multinode_vllm_runtime_env(env_vars)
+    mni._prepare_mint_vllm_multinode_runtime_env(env_vars)
 
     assert "MINT_RAY_TEMP_DIR" not in env_vars
     assert "MINT_RAY_NODE_IP_ADDRESS" not in env_vars

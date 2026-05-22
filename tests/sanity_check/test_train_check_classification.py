@@ -16,7 +16,7 @@ def _load_train_check():
     return module
 
 
-def test_tinker_uri_owner_sampling_error_is_client_workflow():
+def test_mint_uri_owner_sampling_error_is_client_workflow():
     train_check = _load_train_check()
     text = """
     Traceback (most recent call last):
@@ -29,3 +29,16 @@ def test_tinker_uri_owner_sampling_error_is_client_workflow():
 
     assert train_check.classify_failure(text, exit_code=1) == "client workflow"
     assert train_check.failure_surface_from_logs(text) == "create_sampling_client"
+
+
+def test_incomplete_rl_loop_surfaces_as_step_not_completed():
+    train_check = _load_train_check()
+    text = """
+    [step 1] Failed to create sampling client: RequestFailedError: checkpoint already uploading
+    FAIL in rl_step_not_completed: RL sanity did not complete requested steps: completed=0/1;
+    last_failure=[step 1] Failed to create sampling client: RequestFailedError: checkpoint already uploading
+    RuntimeError: RL sanity did not complete requested steps: completed=0/1
+    """
+
+    assert train_check.classify_failure(text, exit_code=1) == "server exception"
+    assert train_check.failure_surface_from_logs(text) == "rl_step_not_completed"

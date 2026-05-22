@@ -581,9 +581,7 @@ def _checkpoint_owner_id() -> str | None:
 def _mint_checkpoint_uri(model_path: str) -> str:
     if model_path.startswith("mint://"):
         return model_path
-    if model_path.startswith("tinker://"):
-        return "mint://" + model_path[len("tinker://") :]
-    raise ValueError(f"checkpoint model_path must start with 'mint://' or 'tinker://', got {model_path!r}")
+    raise ValueError(f"checkpoint model_path must start with 'mint://', got {model_path!r}")
 
 
 def _create_sampling_client_for_checkpoint(
@@ -711,34 +709,6 @@ if inference_only and BASE_MODEL.startswith("Qwen/Qwen3-"):
 use_hf_tokenizer = BASE_MODEL.startswith("moonshotai/Kimi-K2-") or (
     inference_only and BASE_MODEL.startswith("Qwen/Qwen3-")
 )
-if use_hf_tokenizer:
-    from transformers import AutoTokenizer
-
-    tokenizer_model = BASE_MODEL if BASE_MODEL.startswith("moonshotai/Kimi-K2-") else tokenizer_source_model
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_model, trust_remote_code=True)
-    print(f"Tokenizer loaded from HF: {tokenizer_model}")
-    print(f"Tokenizer vocabulary size: {tokenizer.vocab_size:,} tokens")
-else:
-    tokenizer_training_client = _time_call(
-        lambda: service_client.create_lora_training_client(
-            base_model=tokenizer_source_model,
-            rank=LORA_RANK,
-            train_mlp=train_mlp if tokenizer_source_model == BASE_MODEL else False,
-            train_attn=train_attn if tokenizer_source_model == BASE_MODEL else True,
-            train_unembed=train_unembed if tokenizer_source_model == BASE_MODEL else False,
-        ),
-        stage_name="create_tokenizer_training_client",
-        extra={"tokenizer_source_model": tokenizer_source_model},
-    )
-    print(f"Tokenizer training client created for: {tokenizer_source_model}")
-    _dbg(f"tokenizer_training_model_id={getattr(tokenizer_training_client, 'model_id', None)!r}")
-
-    tokenizer = _time_call(
-        tokenizer_training_client.get_tokenizer,
-        stage_name="get_tokenizer",
-        extra={"tokenizer_source_model": tokenizer_source_model},
-    )
-    print(f"Tokenizer vocabulary size: {tokenizer.vocab_size:,} tokens")
 
 training_client = None
 if not inference_only:
@@ -754,6 +724,39 @@ if not inference_only:
     )
     print(f"Training client created for: {BASE_MODEL}")
     _dbg(f"training_model_id={getattr(training_client, 'model_id', None)!r}")
+
+if use_hf_tokenizer:
+    from transformers import AutoTokenizer
+
+    tokenizer_model = BASE_MODEL if BASE_MODEL.startswith("moonshotai/Kimi-K2-") else tokenizer_source_model
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_model, trust_remote_code=True)
+    print(f"Tokenizer loaded from HF: {tokenizer_model}")
+    print(f"Tokenizer vocabulary size: {tokenizer.vocab_size:,} tokens")
+else:
+    if training_client is None:
+        tokenizer_training_client = _time_call(
+            lambda: service_client.create_lora_training_client(
+                base_model=tokenizer_source_model,
+                rank=LORA_RANK,
+                train_mlp=train_mlp if tokenizer_source_model == BASE_MODEL else False,
+                train_attn=train_attn if tokenizer_source_model == BASE_MODEL else True,
+                train_unembed=train_unembed if tokenizer_source_model == BASE_MODEL else False,
+            ),
+            stage_name="create_tokenizer_training_client",
+            extra={"tokenizer_source_model": tokenizer_source_model},
+        )
+        print(f"Tokenizer training client created for: {tokenizer_source_model}")
+        _dbg(f"tokenizer_training_model_id={getattr(tokenizer_training_client, 'model_id', None)!r}")
+        tokenizer_client = tokenizer_training_client
+    else:
+        tokenizer_client = training_client
+
+    tokenizer = _time_call(
+        tokenizer_client.get_tokenizer,
+        stage_name="get_tokenizer",
+        extra={"tokenizer_source_model": tokenizer_source_model},
+    )
+    print(f"Tokenizer vocabulary size: {tokenizer.vocab_size:,} tokens")
 
 random.seed(42)  # For reproducibility
 
@@ -1281,6 +1284,9 @@ if inference_only:
         print(f"inference_only mean_reward={mean_reward:.3f} (n={len(all_rewards)}) base_model={BASE_MODEL!r}")
     raise SystemExit(0)
 
+completed_rl_steps = 0
+rl_loop_failure: str | None = None
+
 for step in range(NUM_RL_STEPS):
     step_t0 = time.time()
     try:
@@ -1291,7 +1297,8 @@ for step in range(NUM_RL_STEPS):
             name=f"rl-step-{step}",
         )
     except Exception as e:
-        print(f"[step {step + 1}] Failed to create sampling client: {e}")
+        rl_loop_failure = f"[step {step + 1}] Failed to create sampling client: {e}"
+        print(rl_loop_failure)
         break
 
     problems = [generate_rl_problem() for _ in range(BATCH_SIZE)]
@@ -1448,10 +1455,30 @@ for step in range(NUM_RL_STEPS):
         step_idx=step,
         extra={"num_datums": len(training_datums), "avg_reward": round(avg_reward, 6)},
     )
+    completed_rl_steps += 1
 
     print(
         f"Step {step + 1:2d}/{NUM_RL_STEPS}: Accuracy = {accuracy:5.1%}, Avg Reward = {avg_reward:.3f}"
     )
+
+if NUM_RL_STEPS > 0 and completed_rl_steps < NUM_RL_STEPS:
+    message = (
+        "RL sanity did not complete requested steps: "
+        f"completed={completed_rl_steps}/{NUM_RL_STEPS}; "
+        f"last_failure={rl_loop_failure or 'unknown'}"
+    )
+    _append_timing_event(
+        "rl_step_completion",
+        elapsed_s=0.0,
+        status="error",
+        extra={
+            "completed_steps": completed_rl_steps,
+            "expected_steps": NUM_RL_STEPS,
+            "last_failure": rl_loop_failure,
+        },
+    )
+    print(f"FAIL in rl_step_not_completed: {message}")
+    raise RuntimeError(message)
 
 print("\nRL training complete!")
 

@@ -383,16 +383,38 @@ def ray_dashboard_node_lister(
 
 
 def default_ray_node_lister_for_config(config: TopologyConfig | None) -> RayNodeLister:
+    def _read_config_head_ip() -> str | None:
+        if config is None or not config.ray_head_ip_path:
+            return None
+        try:
+            head_ip = Path(config.ray_head_ip_path).read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        return head_ip if head_ip and is_ip_address(head_ip) else None
+
+    def _mark_head_node(node: RayNodeState, *, head_ip: str | None) -> RayNodeState:
+        if node.is_head_node or not head_ip or node.node_ip != head_ip:
+            return node
+        return RayNodeState(
+            node_ip=node.node_ip,
+            ray_node_id=node.ray_node_id,
+            alive=node.alive,
+            gpu_count=node.gpu_count,
+            hostname=node.hostname,
+            is_head_node=True,
+        )
+
     def _list_nodes() -> Iterable[RayNodeState]:
+        head_ip = _read_config_head_ip()
         by_ip: dict[str, RayNodeState] = {}
         for node in default_ray_node_lister():
-            by_ip[node.node_ip] = node
+            by_ip[node.node_ip] = _mark_head_node(node, head_ip=head_ip)
         if config is not None:
             for node in ray_dashboard_node_lister(
                 dashboard_url=config.ray_dashboard_url,
                 head_ip_path=config.ray_head_ip_path,
             ):
-                by_ip[node.node_ip] = node
+                by_ip[node.node_ip] = _mark_head_node(node, head_ip=head_ip)
         return list(by_ip.values())
 
     return _list_nodes

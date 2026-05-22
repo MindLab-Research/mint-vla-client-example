@@ -195,10 +195,9 @@ def validate_production_env(base_url: str) -> str:
     if base_url != DEFAULT_BASE_URL:
         raise SystemExit(f"train-check expects base URL {DEFAULT_BASE_URL}, got: {base_url}")
 
-    api_key = os.environ.get("TINKER_API_KEY") or os.environ.get("MINT_API_KEY")
+    api_key = os.environ.get("MINT_API_KEY")
     if not api_key:
-        raise SystemExit("missing TINKER_API_KEY or MINT_API_KEY in env/.secrets.env")
-    os.environ.setdefault("TINKER_API_KEY", api_key)
+        raise SystemExit("missing MINT_API_KEY in env/.secrets.env")
     os.environ.setdefault("MINT_API_KEY", api_key)
 
     owner = os.environ.get("MINT_TEST_CHECKPOINT_OWNER_ID", "")
@@ -241,11 +240,9 @@ def make_run_root(results_root: Path, run_name: str | None, *, create: bool = Tr
 
 def build_runs(args: argparse.Namespace, run_root: Path, *, create_dirs: bool = True) -> list[ModelRun]:
     base_env = os.environ.copy()
-    base_env["TINKER_BASE_URL"] = args.base_url
     base_env["MINT_BASE_URL"] = args.base_url
     base_env.setdefault("PYTHONUNBUFFERED", "1")
     base_env["MINT_TEST_CHECKPOINT_OWNER_ID"] = os.environ["MINT_TEST_CHECKPOINT_OWNER_ID"]
-    base_env["TINKER_API_KEY"] = os.environ["TINKER_API_KEY"]
     base_env["MINT_API_KEY"] = os.environ["MINT_API_KEY"]
 
     runs = []
@@ -480,6 +477,8 @@ def classify_failure(text: str, *, exit_code: int) -> str | None:
 
 def failure_surface_from_logs(text: str) -> str | None:
     lowered = text.lower()
+    if "rl sanity did not complete requested steps" in lowered or "fail in rl_step_not_completed" in lowered:
+        return "rl_step_not_completed"
     if "model_path must start with" in lowered or "checkpoint model_path must start with" in lowered:
         return "create_sampling_client"
     if "valueerror" in lowered and "create_sampling_client" in lowered:

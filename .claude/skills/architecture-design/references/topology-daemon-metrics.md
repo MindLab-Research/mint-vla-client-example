@@ -119,6 +119,15 @@ input. If a live provider task and alive Ray node already satisfy an alias, V1
 must reuse it and must not submit a duplicate worker. V1 is scale-up only and
 does not cancel or tear down disabled/removed cloud nodes automatically.
 
+The Ray head node is not a desired worker and must not use the
+`mint-worker-{idx}` namespace. During reconcile, the topology manager observes
+the current Ray head from `ray.nodes()` and the Ray dashboard. If Ray does not
+mark the head explicitly, the node whose IP matches `ray.head_ip_path` is
+treated as the head. The runtime state then exposes it as `mint-head` with
+`provider: ray` and `role: head`. `mint-head` is output-only runtime state: it
+is eligible for the head `NodeMetricsCollectorActor`, but invalid for model
+placement and never causes provider worker submission.
+
 Worker creation is keyed by the numeric suffix in `mint-worker-{idx}` and by the
 stable provider task name for that alias. A reconcile pass may submit all
 missing desired workers in one bounded parallel batch
@@ -211,7 +220,9 @@ Dynamic placement V1 supports only a DaemonSet policy:
 - required eligibility checks: `enabled`, `role=gpu`, `gpu_count > 0`, alive Ray
   node, shared filesystem path availability, runtime env import probe, and NVML
   access probe
-- head/API-only CPU nodes are excluded unless explicitly labeled as eligible
+- head/API-only CPU nodes are excluded from model placement, but the observed
+  `mint-head` runtime alias is eligible for a head-only node metrics daemon so
+  Ray/GCS global gauges can be pushed without adding a separate actor class
 - actor pinning with `resources={f"node:{node_ip}": 0.001}`
 - `num_gpus=0`
 

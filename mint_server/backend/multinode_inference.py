@@ -109,7 +109,7 @@ def _set_default_vllm_runtime_env(env_vars: dict[str, str]) -> None:
     env_vars.setdefault("USE_FLAX", "0")
 
 
-def _prepare_multinode_vllm_runtime_env(env_vars: dict[str, str]) -> None:
+def _prepare_mint_vllm_multinode_runtime_env(env_vars: dict[str, str]) -> None:
     _set_default_vllm_runtime_env(env_vars)
     # Driver/head temp-dir hints are not portable into Ray worker-hosted vLLM
     # EngineCore subprocesses. Let each controller actor stamp its local node IP.
@@ -2677,7 +2677,7 @@ class MultiNodeInferenceEngine:
             )
             if "CUDA_LAUNCH_BLOCKING" in os.environ:
                 env_vars["CUDA_LAUNCH_BLOCKING"] = os.environ["CUDA_LAUNCH_BLOCKING"]
-            _prepare_multinode_vllm_runtime_env(env_vars)
+            _prepare_mint_vllm_multinode_runtime_env(env_vars)
             if "MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE" in os.environ:
                 env_vars["MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE"] = os.environ[
                     "MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE"

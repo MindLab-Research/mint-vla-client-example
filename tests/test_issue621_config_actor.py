@@ -130,7 +130,6 @@ def test_actor_env_from_environ_keeps_real_values_for_actor_hydration() -> None:
             "MINT_NEW_FEATURE_FLAG": "1",
             "MINT_CONFIG_ACTOR_HYDRATE": "1",
             "UNRELATED": "ignored",
-            "TINKER_API_KEY": "compat-secret",
         }
     )
 

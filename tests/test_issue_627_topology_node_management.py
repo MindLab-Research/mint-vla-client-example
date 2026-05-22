@@ -626,6 +626,77 @@ def test_issue_627_topology_manager_can_use_dashboard_nodes_without_ray_init(
     assert manager.resolve_alias("mint-worker-0") == ("10.0.0.7", None)
 
 
+def test_issue_638_topology_marks_head_alias_from_head_ip_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    state_path = tmp_path / "runtime" / "topology_state.yaml"
+    head_ip_path = tmp_path / "ray_head_ip.txt"
+    head_ip_path.write_text("10.0.0.1\n", encoding="utf-8")
+    config_path = _write_topology_config(tmp_path, state_path=state_path)
+    payload = yaml.safe_load(open(config_path, encoding="utf-8").read())
+    payload["ray"] = {"head_ip_path": str(head_ip_path)}
+    open(config_path, "w", encoding="utf-8").write(yaml.safe_dump(payload))
+    config = load_topology_config(config_path)
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps(
+                {
+                    "data": {
+                        "result": {
+                            "result": [
+                                {
+                                    "node_ip": "10.0.0.1",
+                                    "node_id": "ray-head",
+                                    "state": "ALIVE",
+                                    "resources_total": {"CPU": 16.0},
+                                },
+                                {
+                                    "node_ip": "10.0.0.7",
+                                    "node_id": "ray-0",
+                                    "state": "ALIVE",
+                                    "resources_total": {"GPU": 8.0},
+                                },
+                            ]
+                        }
+                    }
+                }
+            ).encode("utf-8")
+
+    monkeypatch.setattr("mint_server.backend.topology.urllib.request.urlopen", lambda *_args, **_kwargs: _Response())
+    manager = TopologyManager(
+        config,
+        provider_task_lister=lambda _config: [
+            ProviderTaskState(
+                alias="mint-worker-0",
+                provider="volcano",
+                task_name="mint-prod-worker-0",
+                task_id="task-0",
+                live=True,
+                node_ip="10.0.0.7",
+                gpu_count=8,
+            )
+        ],
+    )
+
+    state = manager.reconcile_once()
+
+    assert state is not None
+    assert state.nodes["mint-head"].state == "ready"
+    assert state.nodes["mint-head"].provider == "ray"
+    assert state.nodes["mint-head"].role == "head"
+    assert state.nodes["mint-head"].node_ip == "10.0.0.1"
+    assert state.nodes["mint-head"].is_head_node is True
+    assert "mint-head" in yaml.safe_load(state_path.read_text(encoding="utf-8"))["nodes"]
+
+
 def test_issue_627_topology_manager_submits_missing_task_and_blocks_alias(tmp_path) -> None:
     config = load_topology_config(_write_topology_config(tmp_path))
     submitted: list[str] = []

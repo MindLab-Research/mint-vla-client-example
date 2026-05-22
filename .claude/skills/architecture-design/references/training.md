@@ -16,9 +16,11 @@ See `training-multitenancy.md` for the dense vs Megatron swap mechanisms.
   `model_id`s, inflight counters, and create-time scratch state. It is not the
   durable authority.
 - `TaskStateStore` owns durable per-`model_id` training-session metadata,
-  session indexes, heartbeats, and restore records through the
+  session indexes, heartbeats, and restore records. The
   `training_session_store`, `session_index_store`, and
-  `session_heartbeat_store` facades.
+  `session_heartbeat_store` modules are compatibility facades backed by
+  `TaskStateStore`; they are not independent detached actors or durable
+  authorities.
 - The actual training state (weights, optimizer, step counters) lives inside Ray actors.
 - `ModelActorSupervisor` owns runtime reconciliation and its internal
   supervisor inventory; `ModelWorkScheduler` owns hot scheduling and leases.

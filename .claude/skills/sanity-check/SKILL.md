@@ -41,10 +41,11 @@ Use the canonical wrapper unless the wrapper itself fails before it can enforce 
 
 Wrapper contract:
 - Loads `.secrets.env` without printing secrets.
-- Forces `MINT_BASE_URL` and `TINKER_BASE_URL` to `https://mint.macaron.xin`.
-- Requires `MINT_API_KEY` or `TINKER_API_KEY`.
+- Forces `MINT_BASE_URL` to `https://mint.macaron.xin`.
+- Requires `MINT_API_KEY`.
 - Requires `MINT_TEST_CHECKPOINT_OWNER_ID` to be a 24-character production owner ObjectId.
 - Runs the real RL loop through `.claude/skills/sanity-check/mint_rl_test_long.py`; it must not use inference-only mode.
+- A model is `PASS` only if the runner completes all requested RL steps. Setup, final save, eval sampling, or `save_state` success after a skipped/failed RL step is still `FAIL`.
 - Runs the full model matrix sequentially in the required order.
 - Writes artifacts under `/root/run_results/mint/<timestamp>/`.
 - Captures per-model stdout/stderr and timing artifacts.
@@ -103,6 +104,7 @@ If the wrapper reports any failure:
    - `server exception`: traceback, 5xx, explicit request failure, actor crash, `ActorDiedError`, `EngineDeadError`, CUDA OOM.
    - `timing degradation`: no hard failure, but a stage is materially slower than expected.
 3. Inspect `summary.json`, `summary.md`, `stdout.log`, `stderr.log`, request IDs, and timing summaries before doing ops.
+   - If the failure surface is `rl_step_not_completed`, inspect the preceding failed stage/request first, commonly `save_weights_for_sampler`, `create_sampling_client`, `sample`, `forward_backward`, or `optim_step`.
 4. Use `telemetry-query`, `mint-prod`, `mint-ops`, and `volcano-cluster` as needed to gather narrow evidence. Do not assume `235B` is routed to a specific upstream; prove current routing from live config, capabilities, actor inventory, or logs.
 5. Remediate only when evidence supports it, and use the smallest blast radius. Prefer a model-specific actor action through `mint-ops`; restart the API process only when the API process is unhealthy. Do not restart Ray/head/worker nodes in this workflow.
 6. Record any remediation in `INCIDENT.md` under the run root: timestamp, model, symptom, request IDs, evidence, exact ops action, and observed result. Do not include secrets.

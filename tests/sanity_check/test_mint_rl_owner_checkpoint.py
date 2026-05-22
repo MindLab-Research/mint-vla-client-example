@@ -89,7 +89,7 @@ def test_owner_checkpoint_sampling_client_sends_owner_extra_body(monkeypatch):
     assert extra_body == {"owner_id": "0123456789abcdef01234567"}
 
 
-def test_owner_checkpoint_sampling_client_accepts_tinker_uri(monkeypatch):
+def test_owner_checkpoint_sampling_client_accepts_mint_uri(monkeypatch):
     helper = _load_helper()
     monkeypatch.setenv("MINT_TEST_CHECKPOINT_OWNER_ID", "0123456789abcdef01234567")
 
@@ -141,7 +141,7 @@ def test_owner_checkpoint_sampling_client_accepts_tinker_uri(monkeypatch):
 
     out = helper(
         SimpleNamespace(holder=_Holder()),
-        model_path="tinker://checkpoint/path",
+        model_path="mint://checkpoint/path",
         base_model="Qwen/Qwen3-0.6B",
         retry_config="retry",
     )
