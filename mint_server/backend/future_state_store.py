@@ -1126,8 +1126,7 @@ class FutureStateStore:
         return out
 
     def get_task(self, request_id: str) -> dict[str, Any]:
-        with self._lock_for_request(request_id):
-            return dict(self._load(str(request_id)))
+        return dict(self._load(str(request_id)))
 
     def future_metrics_stats(self, *, now: float | None = None) -> dict[str, Any]:
         ts = _now(now)

@@ -113,9 +113,9 @@ class _RocksKV:
 class TaskHotKVStore:
     """RocksDB-backed hot metadata store owned by TaskStateStore.
 
-    The store avoids a global mutex on hot paths. Point operations use a
-    per-key lock; list/claim paths use short index locks and then load records
-    without holding those locks.
+    Reads and single-key put/delete operations rely on the KV backend's own
+    concurrency. Per-key Python locks are only used for read-modify-write
+    transitions that need a compare/update window.
     """
 
     _STRIPES = 256
@@ -421,18 +421,14 @@ class TaskHotKVStore:
             return dict(updated)
 
     def replace_record(self, namespace: str, item_id: str, info: dict[str, Any]) -> None:
-        key = self._record_key(namespace, item_id)
-        with self._lock_for(key):
-            self._put_json(key, dict(info))
+        self._put_json(self._record_key(namespace, item_id), dict(info))
 
     def get_record(self, namespace: str, item_id: str) -> dict[str, Any] | None:
         record = self._get_json(self._record_key(namespace, item_id))
         return dict(record) if record is not None else None
 
     def delete_record(self, namespace: str, item_id: str) -> bool:
-        key = self._record_key(namespace, item_id)
-        with self._lock_for(key):
-            return self._delete(key)
+        return self._delete(self._record_key(namespace, item_id))
 
     def list_records(self, namespace: str) -> list[dict[str, Any]]:
         return [dict(record) for record in self._list_namespace(namespace)]

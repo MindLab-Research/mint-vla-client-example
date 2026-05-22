@@ -3437,7 +3437,7 @@ def _create_ray_actor(*, require_ready: bool = True):
     actor_name = _ray_task_state_store_actor_name()
     namespace = _ray_namespace()
     db_path = _task_state_store_db_path()
-    max_concurrency = int(os.environ.get("MINT_TASK_STATE_STORE_ACTOR_MAX_CONCURRENCY", "64"))
+    max_concurrency = int(os.environ.get("MINT_TASK_STATE_STORE_ACTOR_MAX_CONCURRENCY", "256"))
 
     @ray.remote(num_cpus=0, max_concurrency=max_concurrency, max_restarts=0)
     class _RayTaskStateStoreActor(_TaskStateStoreActor):

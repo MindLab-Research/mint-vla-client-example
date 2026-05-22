@@ -66,11 +66,13 @@ component, then the payload store helper atomically publishes the vePFS JSON
 file, then `TaskStateStore` commits the terminal status, checksum, size, and
 result pointer. The existing `TaskStateStore` actor is the lifecycle owner for
 these writes, but the KV helper must not use a single global lock for the
-retrieve/scheduler hot path. Future records use striped per-`request_id` locks
-plus explicit status/domain/metadata/lease/result/staged/created/updated
-indexes. Retrieve is a point lookup; scheduler hydration and reapers use those
-indexes rather than full task scans. If the KV backend exposes batch writes,
-the implementation should use them for the record plus indexes.
+retrieve/scheduler hot path. Future writes use per-`request_id` locks only
+while performing read-modify-write state transitions; retrieve/status reads are
+plain point lookups. Future records keep explicit
+status/domain/metadata/lease/result/staged/created/updated indexes. Scheduler
+hydration and reapers use those indexes rather than full task scans. If the KV
+backend exposes batch writes, the implementation should use them for the record
+plus indexes.
 Model-work finalization records the lease identity and
 `finalizing_until`; direct in-process future resolution records the staged path
 while leaving the task pending until terminal commit. This is primarily for GC

@@ -47,13 +47,15 @@ the same detached actor:
   sampling/training/gateway sessions, session/sampler indexes, and session
   heartbeats.
 
-Neither component is a separate Ray actor. High-frequency point mutations use
-striped per-key locks in the helper, while the detached `TaskStateStore` actor
-is configured with bounded Ray concurrency so independent keys are not forced
-through one Python mutex. Billing outbox claims and stats use explicit KV
-status/event indexes rather than SQLite scans or process-local index sets.
-SQLite remains available for legacy/non-hot task tables, but new future and hot
-metadata writes must not depend on SQLite table scans or a process-local dict.
+Neither component is a separate Ray actor. The detached `TaskStateStore` actor
+uses a high bounded Ray concurrency only as ingress backpressure; it is not a
+state mutex. KV reads and single-key put/delete operations rely on the KV
+backend's concurrency. Python locks are reserved for per-`request_id` or
+per-key read-modify-write transitions that must preserve a state-machine
+invariant. Billing outbox claims and stats use explicit KV status/event indexes
+rather than SQLite scans or process-local index sets. SQLite remains available
+for legacy/non-hot task tables, but new future and hot metadata writes must not
+depend on SQLite table scans or a process-local dict.
 
 State that is still in-process and lost on API restart:
 
