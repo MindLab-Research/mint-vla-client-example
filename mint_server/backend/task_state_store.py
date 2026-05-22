@@ -2639,31 +2639,6 @@ def _task_state_store_db_path() -> str:
     )
 
 
-class _LockedTaskStateStore:
-    """Serialize store calls made by concurrent Ray actor tasks.
-
-    Ray may run synchronous actor methods on multiple worker threads when
-    max_concurrency is greater than one. The store owns one SQLite connection
-    and in-memory indexes, so actor-level access must be serialized while still
-    allowing long-poll waiters to block outside the lock.
-    """
-
-    def __init__(self, store: TaskStateStore, lock: threading.RLock) -> None:
-        self._store = store
-        self._lock = lock
-
-    def __getattr__(self, name: str) -> Any:
-        attr = getattr(self._store, name)
-        if not callable(attr):
-            return attr
-
-        def _locked(*args: Any, **kwargs: Any) -> Any:
-            with self._lock:
-                return attr(*args, **kwargs)
-
-        return _locked
-
-
 class _TaskStateStoreActor:
     def __init__(self, db_path: str | None = None) -> None:
         try:
@@ -2674,10 +2649,7 @@ class _TaskStateStoreActor:
             pass
         self._started_at = time.time()
         self._lock = threading.RLock()
-        self._store = _LockedTaskStateStore(
-            TaskStateStore(db_path or _task_state_store_db_path()),
-            self._lock,
-        )
+        self._store = TaskStateStore(db_path or _task_state_store_db_path())
         self._watchers: dict[str, list[threading.Event]] = {}
         self._watcher_count = 0
         self._watcher_limit = max(1, int(os.environ.get("MINT_TASK_STATE_STORE_WATCHER_MAX", "8192")))
@@ -2748,7 +2720,12 @@ class _TaskStateStoreActor:
                 self._watchers.pop(str(request_id), None)
             self._watcher_count = max(0, self._watcher_count - removed)
 
+    def _invalidate_stats_cache(self) -> None:
+        self._stats_cache = None
+        self._stats_cache_at = 0.0
+
     def _notify_task_changed(self, request_id: str | None) -> None:
+        self._invalidate_stats_cache()
         if request_id is None:
             return
         with self._lock:
@@ -3135,23 +3112,34 @@ class _TaskStateStoreActor:
         return out
 
     def record_payload_evict_error(self, **kwargs: Any) -> dict[str, Any]:
-        return self._store.record_payload_evict_error(**kwargs)
+        out = self._store.record_payload_evict_error(**kwargs)
+        self._invalidate_stats_cache()
+        return out
 
     def record_billing_metrics(self, metrics: dict[str, Any]) -> dict[str, Any]:
         _inc_billing_metrics(dict(metrics or {}))
+        self._invalidate_stats_cache()
         return {"ok": True, "metrics": billing_metrics_snapshot()}
 
     def append_billing_outbox(self, **kwargs: Any) -> dict[str, Any]:
-        return self._store.append_billing_outbox(**kwargs)
+        out = self._store.append_billing_outbox(**kwargs)
+        self._invalidate_stats_cache()
+        return out
 
     def claim_billing_outbox(self, **kwargs: Any) -> list[dict[str, Any]]:
-        return self._store.claim_billing_outbox(**kwargs)
+        out = self._store.claim_billing_outbox(**kwargs)
+        self._invalidate_stats_cache()
+        return out
 
     def delete_billing_outbox_claim(self, **kwargs: Any) -> dict[str, Any]:
-        return self._store.delete_billing_outbox_claim(**kwargs)
+        out = self._store.delete_billing_outbox_claim(**kwargs)
+        self._invalidate_stats_cache()
+        return out
 
     def mark_billing_outbox_claim_failed(self, **kwargs: Any) -> dict[str, Any]:
-        return self._store.mark_billing_outbox_claim_failed(**kwargs)
+        out = self._store.mark_billing_outbox_claim_failed(**kwargs)
+        self._invalidate_stats_cache()
+        return out
 
     def billing_outbox_stats(self, **kwargs: Any) -> dict[str, Any]:
         return self._store.billing_outbox_stats(**kwargs)
