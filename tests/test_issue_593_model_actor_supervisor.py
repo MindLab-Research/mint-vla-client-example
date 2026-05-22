@@ -298,12 +298,28 @@ def test_issue_638_supervisor_registers_otel_inventory_and_supervisor_gauges(
         **_disabled_control_plane_kwargs(),
     )
 
-    assert "mint_model_actor_supervisor_desired_total" in gauges
-    assert "mint_model_actor_supervisor_domain_replicas" in gauges
-    assert "mint_model_actor_supervisor_replica_state" in gauges
-    assert "mint_model_actor_inventory_actors" in gauges
-    assert "mint_model_actor_inventory_actor_gpu_binding" in gauges
-    assert "mint_model_actor_inventory_observability_cache_hits_total" in gauges
+    expected = {
+        "mint_model_actor_supervisor_desired_total",
+        "mint_model_actor_supervisor_domain_replicas",
+        "mint_model_actor_supervisor_replica_state",
+        "mint_model_actor_inventory_actors",
+        "mint_model_actor_inventory_actor_gpu_binding",
+        "mint_model_actor_inventory_actor_gpu_binding_missing_uuid",
+        "mint_model_actor_inventory_actor_idle_time_s",
+        "mint_model_actor_inventory_actor_age_s",
+        "mint_model_actor_inventory_actor_rss_bytes",
+        "mint_model_actor_inventory_actor_rss_sample_age_s",
+        "mint_model_actor_inventory_actor_rss_cache_state",
+        "mint_model_actor_inventory_group_oldest_idle_time_s",
+        "mint_model_actor_inventory_group_oldest_age_s",
+        "mint_model_actor_inventory_group_rss_bytes",
+        "mint_model_actor_inventory_group_rss_cache_samples",
+        "mint_model_actor_inventory_observability_cache_hits_total",
+        "mint_model_actor_inventory_observability_cache_stale_total",
+        "mint_model_actor_inventory_observability_refresh_success_total",
+        "mint_model_actor_inventory_observability_refresh_failures_total",
+    }
+    assert expected.issubset(set(gauges))
 
 
 def test_issue_638_supervisor_otel_inventory_callbacks_use_cached_snapshot_without_refresh(
@@ -333,6 +349,7 @@ def test_issue_638_supervisor_otel_inventory_callbacks_use_cached_snapshot_witho
         node_metrics_enabled=False,
         **_disabled_control_plane_kwargs(),
     )
+    supervisor.clear(kill_actors=False)
     supervisor.register(
         actor_name="mint_vllm_qwen3_0_6b",
         actor_type=ActorType.VLLM,
@@ -376,6 +393,133 @@ def test_issue_638_supervisor_otel_inventory_callbacks_use_cached_snapshot_witho
     assert "node_ip" not in attrs
     assert "ray_node_id" not in attrs
     assert "last_error" not in attrs
+
+
+def test_issue_638_supervisor_otel_reports_missing_gpu_uuid_without_high_cardinality_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opentelemetry.metrics as otel_metrics
+
+    import mint_server.backend.model_actor_supervisor as supervisor_module
+    import mint_server.logging_context as logging_context
+
+    gauges: dict[str, list] = {}
+
+    class _FakeMeter:
+        def create_observable_gauge(self, name, **kwargs):
+            gauges[name] = list(kwargs.get("callbacks") or [])
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel.example:4317")
+    monkeypatch.setattr(otel_metrics, "get_meter", lambda _name: _FakeMeter())
+    monkeypatch.setattr(logging_context, "init_actor_observability", lambda: None)
+
+    supervisor = supervisor_module.ModelActorSupervisor(
+        specs=[],
+        state_store=SupervisorMemoryStateStore(),
+        node_metrics_enabled=False,
+        **_disabled_control_plane_kwargs(),
+    )
+    supervisor.clear(kill_actors=False)
+    supervisor.register(
+        actor_name="mint_vllm_no_uuid",
+        actor_type=ActorType.VLLM,
+        num_gpus=1,
+        base_model="Qwen/Qwen3-0.6B",
+        metadata={"hostname": "mint-worker-0", "gpu_indices": [0]},
+    )
+
+    assert gauges["mint_model_actor_inventory_actor_gpu_binding"][0](None) == []
+    missing_obs = gauges["mint_model_actor_inventory_actor_gpu_binding_missing_uuid"][0](None)
+
+    assert len(missing_obs) == 1
+    assert missing_obs[0].value == 1.0
+    attrs = missing_obs[0].attributes
+    assert attrs["actor_name"] == "mint_vllm_no_uuid"
+    assert attrs["workload"] == "sample"
+    assert attrs["hostname"] == "mint-worker-0"
+    assert "gpu_index" not in attrs
+    assert "node_ip" not in attrs
+    assert "ray_node_id" not in attrs
+
+
+def test_issue_638_supervisor_rss_snapshot_populates_otel_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opentelemetry.metrics as otel_metrics
+
+    import mint_server.backend.model_actor_inventory as inventory_module
+    import mint_server.backend.model_actor_supervisor as supervisor_module
+    import mint_server.logging_context as logging_context
+
+    gauges: dict[str, list] = {}
+
+    class _FakeRemote:
+        def remote(self):
+            return "rss-ref"
+
+    class _FakeHandle:
+        get_rss_bytes = _FakeRemote()
+
+    class _FakeMeter:
+        def create_observable_gauge(self, name, **kwargs):
+            gauges[name] = list(kwargs.get("callbacks") or [])
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel.example:4317")
+    monkeypatch.setattr(otel_metrics, "get_meter", lambda _name: _FakeMeter())
+    monkeypatch.setattr(logging_context, "init_actor_observability", lambda: None)
+    monkeypatch.setattr(inventory_module.ray, "get", lambda ref, timeout=None: 4096)
+
+    supervisor = supervisor_module.ModelActorSupervisor(
+        specs=[],
+        state_store=SupervisorMemoryStateStore(),
+        node_metrics_enabled=False,
+        **_disabled_control_plane_kwargs(),
+    )
+    supervisor.clear(kill_actors=False)
+    supervisor.register(
+        actor_name="mint_vllm_rss",
+        actor_type=ActorType.VLLM,
+        num_gpus=1,
+        actor_handle=_FakeHandle(),
+        base_model="Qwen/Qwen3-0.6B",
+    )
+
+    assert supervisor.rss_snapshot(timeout_s=1.0)[0]["rss_bytes"] == 4096
+    rss_obs = gauges["mint_model_actor_inventory_actor_rss_bytes"][0](None)
+    group_rss_obs = gauges["mint_model_actor_inventory_group_rss_bytes"][0](None)
+
+    assert rss_obs[0].value == 4096.0
+    assert rss_obs[0].attributes["actor_name"] == "mint_vllm_rss"
+    assert group_rss_obs[0].value == 4096.0
+
+
+def test_issue_638_supervisor_update_metadata_uses_sample_source() -> None:
+    import mint_server.backend.model_actor_supervisor as supervisor_module
+
+    supervisor = supervisor_module.ModelActorSupervisor(
+        specs=[],
+        state_store=SupervisorMemoryStateStore(),
+        node_metrics_enabled=False,
+        **_disabled_control_plane_kwargs(),
+    )
+    supervisor.clear(kill_actors=False)
+    supervisor.register(
+        actor_name="mint_dense_actor",
+        actor_type=ActorType.DENSE,
+        num_gpus=1,
+        base_model="Qwen/Qwen3-0.6B",
+    )
+
+    assert supervisor.update_metadata(
+        "mint_dense_actor",
+        {"poisoned": True},
+        sample_time=123.0,
+        sample_source="dense_retire",
+    ) is True
+    rec = supervisor.cached_snapshot(refresh_metadata=False)[0]
+
+    assert rec["metadata"] == {"poisoned": True}
+    assert rec["metadata_sample_source"] == "dense_retire"
 
 
 def test_issue_638_supervisor_otel_callbacks_emit_supervisor_state(

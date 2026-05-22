@@ -949,6 +949,15 @@ class ModelActorInventory:
             try:
                 rss = ray.get(handle.get_rss_bytes.remote(), timeout=float(timeout_s))
                 rec["rss_bytes"] = int(cast(Any, rss))
+                rec["rss_sample_age_s"] = 0.0
+                rec["rss_sample_source"] = "rss_snapshot"
+                rec["rss_cache_state"] = "fresh"
+                with self._local_lock:
+                    current = self._entries.get(entry.actor_name)
+                    if current is not None:
+                        current.rss_bytes = int(cast(Any, rss))
+                        current.rss_sample_time = now
+                        current.rss_sample_source = "rss_snapshot"
             except Exception as ex:
                 rec["rss_bytes"] = 0
                 rec["error"] = f"{type(ex).__name__}: {ex}"

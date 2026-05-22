@@ -167,6 +167,38 @@ def _model_actor_inventory_gpu_bindings(rec: dict[str, object]) -> list[dict[str
     return []
 
 
+def _model_actor_inventory_gpu_binding_missing_uuid(rec: dict[str, object]) -> list[dict[str, str]]:
+    metadata = rec.get("metadata") if isinstance(rec.get("metadata"), dict) else {}
+    actor_name = str(rec.get("actor_name") or "unknown")
+    workload = _actor_workload(rec.get("actor_type"))
+    hostname = str(metadata.get("hostname") or "unknown") if isinstance(metadata, dict) else "unknown"
+
+    missing = 0
+    bindings = metadata.get("gpu_bindings") if isinstance(metadata, dict) else None
+    if isinstance(bindings, list):
+        for binding in bindings:
+            if not isinstance(binding, dict):
+                continue
+            gpu_uuid = binding.get("gpu_uuid")
+            if isinstance(gpu_uuid, str) and gpu_uuid.strip():
+                continue
+            if binding.get("gpu_index") is not None:
+                missing += 1
+
+    gpu_indices = metadata.get("gpu_indices") if isinstance(metadata, dict) else None
+    if not missing and isinstance(gpu_indices, list):
+        missing = len([value for value in gpu_indices if value is not None])
+
+    return [
+        {
+            "actor_name": actor_name,
+            "workload": workload,
+            "hostname": hostname,
+            "missing_count": str(missing),
+        }
+    ] if missing > 0 else []
+
+
 def _rss_state_for_record(rec: dict[str, object]) -> str:
     rss_state = str(rec.get("rss_cache_state") or "").strip().lower()
     if rss_state in {"fresh", "stale", "unknown"}:
@@ -225,6 +257,14 @@ def _inventory_otel_gauge_callbacks(supervisor: "ModelActorSupervisorCore", obse
         for rec in _inventory_records():
             for binding in _model_actor_inventory_gpu_bindings(rec):
                 observations.append(observation_cls(1.0, attrs_fn(**binding)))
+        return observations
+
+    def _actor_gpu_binding_missing_uuid(_options):
+        observations = []
+        for rec in _inventory_records():
+            for binding in _model_actor_inventory_gpu_binding_missing_uuid(rec):
+                missing_count = float(binding.pop("missing_count"))
+                observations.append(observation_cls(missing_count, attrs_fn(**binding)))
         return observations
 
     def _grouped_records() -> dict[tuple[str, str], dict[str, float]]:
@@ -307,6 +347,7 @@ def _inventory_otel_gauge_callbacks(supervisor: "ModelActorSupervisorCore", obse
         ("mint_model_actor_inventory_actor_rss_sample_age_s", _actor_metric("rss_sample_age_s"), "s"),
         ("mint_model_actor_inventory_actor_rss_cache_state", _actor_rss_cache_state, None),
         ("mint_model_actor_inventory_actor_gpu_binding", _actor_gpu_binding, None),
+        ("mint_model_actor_inventory_actor_gpu_binding_missing_uuid", _actor_gpu_binding_missing_uuid, None),
         ("mint_model_actor_inventory_actors", _group_metric("count"), None),
         ("mint_model_actor_inventory_group_oldest_idle_time_s", _group_metric("max_idle"), "s"),
         ("mint_model_actor_inventory_group_oldest_age_s", _group_metric("max_age"), "s"),
@@ -1045,13 +1086,13 @@ class ModelActorSupervisorCore:
         metadata: dict[str, Any],
         *,
         sample_time: float | None = None,
-        source: str | None = None,
+        sample_source: str | None = None,
     ) -> bool:
         return self._inventory.update_metadata(
             actor_name,
-            metadata,
+            metadata=metadata,
             sample_time=sample_time,
-            source=source,
+            sample_source=sample_source,
         )
 
     async def async_update_metadata(
@@ -1060,13 +1101,13 @@ class ModelActorSupervisorCore:
         metadata: dict[str, Any],
         *,
         sample_time: float | None = None,
-        source: str | None = None,
+        sample_source: str | None = None,
     ) -> bool:
         return await self._inventory.async_update_metadata(
             actor_name,
-            metadata,
+            metadata=metadata,
             sample_time=sample_time,
-            source=source,
+            sample_source=sample_source,
         )
 
     def list_actors(
@@ -2506,15 +2547,15 @@ class ModelActorSupervisorClient:
         metadata: dict[str, Any],
         *,
         sample_time: float | None = None,
-        source: str | None = None,
+        sample_source: str | None = None,
     ) -> bool:
         return bool(
             self._call_sync(
                 "update_metadata",
                 actor_name,
-                metadata,
+                metadata=metadata,
                 sample_time=sample_time,
-                source=source,
+                sample_source=sample_source,
             )
         )
 
@@ -2524,15 +2565,15 @@ class ModelActorSupervisorClient:
         metadata: dict[str, Any],
         *,
         sample_time: float | None = None,
-        source: str | None = None,
+        sample_source: str | None = None,
     ) -> bool:
         return bool(
             await self._call_async(
                 "async_update_metadata",
                 actor_name,
-                metadata,
+                metadata=metadata,
                 sample_time=sample_time,
-                source=source,
+                sample_source=sample_source,
             )
         )
 
