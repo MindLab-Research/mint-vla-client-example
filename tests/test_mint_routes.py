@@ -19,8 +19,9 @@ class _StubTaskFutureService:
     async def async_create_with_id(self, request_id: str) -> None:
         self.created.append(request_id)
 
-    async def async_create_model_work_with_id(self, request_id: str, **_kwargs) -> None:
+    async def async_create_model_work_with_id(self, request_id: str, **kwargs) -> None:
         self.created.append(request_id)
+        self.queued.append((request_id, kwargs.get("meta")))
 
     async def async_update_meta(self, _request_id: str, _meta: dict) -> None:
         return None
@@ -96,8 +97,9 @@ def test_mint_action_route_cleans_up_future_when_enqueue_fails(monkeypatch) -> N
     )
 
     assert resp.status_code == 503, resp.text
-    assert task_futures.created == []
+    assert len(task_futures.created) == 1
     assert len(task_futures.cleaned) == 1
+    assert task_futures.cleaned == task_futures.created
     assert len(scheduler.calls) == 1
 
 
@@ -314,7 +316,7 @@ def test_mint_vla_train_step_route_enqueues_expected_request(monkeypatch) -> Non
 
     assert resp.status_code == 200, resp.text
     request_id = resp.json()["request_id"]
-    assert task_futures.created == []
+    assert task_futures.created == [request_id]
     queued_request_id, queued_meta = task_futures.queued[0]
     assert queued_request_id == request_id
     assert queued_meta["op"] == "mint.vla.train_step"
@@ -555,7 +557,7 @@ def test_mint_interpolate_route_enqueues_expected_request(monkeypatch) -> None:
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert "request_id" in body
-    assert task_futures.created == []
+    assert task_futures.created == [body["request_id"]]
     queued_request_id, queued_meta = task_futures.queued[0]
     assert queued_request_id == body["request_id"]
     assert queued_meta["op"] == "mint.interpolate_checkpoints"
@@ -856,7 +858,7 @@ def test_mint_reverse_kl_route_and_background_path(monkeypatch) -> None:
 
     assert resp.status_code == 200, resp.text
     request_id = resp.json()["request_id"]
-    assert task_futures.created == []
+    assert task_futures.created == [request_id]
     queued_request_id, queued_meta = task_futures.queued[0]
     assert queued_request_id == request_id
     assert queued_meta["op"] == "mint.forward_backward_reverse_kl"
@@ -960,7 +962,7 @@ def test_mint_reverse_kl_route_uses_detached_training_info_without_route_runtime
 
     assert resp.status_code == 200, resp.text
     request_id = resp.json()["request_id"]
-    assert task_futures.created == []
+    assert task_futures.created == [request_id]
     queued_request_id, queued_meta = task_futures.queued[0]
     assert queued_request_id == request_id
     assert queued_meta["op"] == "mint.forward_backward_reverse_kl"

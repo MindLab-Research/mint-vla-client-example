@@ -551,6 +551,39 @@ def test_scheduler_persists_append_assign_claim_and_begin_finalize_to_task_state
         store.close()
 
 
+def test_scheduler_accepts_pre_registered_pending_task_state_store_future() -> None:
+    store = TaskStateStore.in_memory()
+    actor = _ModelWorkSchedulerActor(
+        use_task_state_store=True,
+        task_state_store=store,
+        owner_id="scheduler-test",
+    )
+    work = _work("req-pre-registered")
+
+    async def _run() -> None:
+        store.create_task(
+            request_id=work["request_id"],
+            op=work["op"],
+            domain_key=work["domain_key"],
+            request_json=work["request_json"],
+            metadata={
+                "affinity_group": work["affinity_group"],
+                "ordering_key": work["ordering_key"],
+            },
+        )
+        await actor.sync_replicas([_replica("replica-0")])
+        out = await actor.append(work, assign=True)
+
+        assert out["ok"] is True
+        assert out["idempotent"] is True
+        assert store.get_task("req-pre-registered")["status"] == "assigned"
+
+    try:
+        asyncio.run(_run())
+    finally:
+        store.close()
+
+
 def test_scheduler_hydrates_active_task_state_after_restart() -> None:
     store = TaskStateStore.in_memory()
     actor_a = _ModelWorkSchedulerActor(

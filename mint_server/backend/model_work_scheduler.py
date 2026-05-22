@@ -610,6 +610,38 @@ class _ModelWorkSchedulerActor:
             self._task_state_hydrated = True
         return epoch
 
+    def _task_record_matches_work_item(self, record: dict[str, Any], item: ModelWorkItem) -> bool:
+        if str(record.get("request_id") or "") != item.request_id:
+            return False
+        if str(record.get("op") or "") != item.op:
+            return False
+        if str(record.get("domain_key") or "") != item.domain_key:
+            return False
+        record_json = record.get("request_json")
+        if record_json is not None and bytes(record_json) != item.request_json:
+            return False
+        metadata = record.get("metadata")
+        if not isinstance(metadata, dict):
+            return True
+        record_hash = metadata.get("payload_hash") or record.get("payload_hash")
+        item_hash = item.extra.get("payload_hash")
+        if record_hash is not None and item_hash is not None and str(record_hash) != str(item_hash):
+            return False
+        return True
+
+    async def _duplicate_append_matches_hydrated_pending_task(self, item: ModelWorkItem) -> bool:
+        if not self._use_task_state_store:
+            return False
+        if item.request_id not in self._all_request_ids():
+            return False
+        try:
+            record = await self._task_state_call("get_task", request_id=item.request_id)
+        except Exception:
+            return False
+        if not isinstance(record, dict) or not self._task_record_matches_work_item(record, item):
+            return False
+        return str(record.get("status") or "") in {"pending", "queued", "assigned"}
+
     def _backlog(self, domain_key: str) -> deque[ModelWorkItem]:
         return self._domain_backlog.setdefault(str(domain_key), deque())
 
@@ -760,11 +792,28 @@ class _ModelWorkSchedulerActor:
             await self._ensure_task_state_ready()
         async with self._cv:
             if work.request_id in self._all_request_ids():
+                if not await self._duplicate_append_matches_hydrated_pending_task(work):
+                    return {
+                        "ok": False,
+                        "reason": "duplicate_request_id",
+                        "request_id": work.request_id,
+                    }
+                assigned = (
+                    await self._assign_pending_locked(max_items=assign_max_items)
+                    if bool(assign)
+                    else {"ok": True, "assigned": 0, "skipped_domains": []}
+                )
+                self._cv.notify_all()
                 return {
-                    "ok": False,
-                    "reason": "duplicate_request_id",
+                    "ok": True,
                     "request_id": work.request_id,
+                    "domain_key": work.domain_key,
+                    "scheduler_instance_id": self._instance_id,
+                    "backlog_depth": len(self._backlog(work.domain_key)),
+                    "assigned": assigned,
+                    "idempotent": True,
                 }
+            created: dict[str, Any] | None = None
             if self._use_task_state_store:
                 created = await self._task_state_call(
                     "create_task",
@@ -785,11 +834,19 @@ class _ModelWorkSchedulerActor:
                     },
                 )
                 if isinstance(created, dict) and not bool(created.get("created", True)):
-                    return {
-                        "ok": False,
-                        "reason": "duplicate_request_id",
-                        "request_id": work.request_id,
-                    }
+                    record = created.get("record")
+                    if not isinstance(record, dict) or not self._task_record_matches_work_item(record, work):
+                        return {
+                            "ok": False,
+                            "reason": "duplicate_request_id",
+                            "request_id": work.request_id,
+                        }
+                    if str(record.get("status") or "") not in {"pending", "queued"}:
+                        return {
+                            "ok": False,
+                            "reason": "duplicate_request_id",
+                            "request_id": work.request_id,
+                        }
             self._backlog(work.domain_key).append(work)
             self._request_locations[work.request_id] = "backlog"
             self._appended += 1

@@ -62,6 +62,21 @@ async def enqueue_model_work(
     if payload_hash is not None:
         scheduler_extra["payload_hash"] = str(payload_hash)
     try:
+        if create_future and task_futures_client is not None:
+            create_model_work = getattr(task_futures_client, "async_create_model_work_with_id", None)
+            if callable(create_model_work):
+                await create_model_work(
+                    request_id,
+                    op=op,
+                    domain_key=domain_key,
+                    request_json=request_json,
+                    meta=scheduler_extra,
+                    payload_hash=payload_hash,
+                )
+            else:
+                create_with_id = getattr(task_futures_client, "async_create_with_id", None)
+                if callable(create_with_id):
+                    await create_with_id(request_id)
         append_coro = scheduler.append(
             request_id=request_id,
             op=op,
