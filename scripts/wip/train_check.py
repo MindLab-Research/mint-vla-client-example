@@ -56,6 +56,12 @@ class ModelRun:
     env: dict[str, str]
 
 
+@dataclass(frozen=True)
+class FailureClassification:
+    failure_class: str | None
+    detail: str | None = None
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run MinT production RL sanity checks with aligned params and artifacts."
@@ -407,6 +413,7 @@ def run_one(run: ModelRun) -> dict[str, object]:
     wall_clock_s = None
     if timing and isinstance(timing.get("wall_clock_s"), (int, float)):
         wall_clock_s = float(timing["wall_clock_s"])
+    classification = classify_failure_detail(combined_text, exit_code=rc)
     return {
         "model": run.model,
         "slug": run.slug,
@@ -418,7 +425,8 @@ def run_one(run: ModelRun) -> dict[str, object]:
         "experiment_dir": str(experiment_dir) if experiment_dir else None,
         "request_ids": meta["request_ids"],
         "session_ids": meta["session_ids"],
-        "failure_class": classify_failure(combined_text, exit_code=rc),
+        "failure_class": classification.failure_class,
+        "failure_detail": classification.detail,
         "failure_surface": failure_surface_from_logs(combined_text),
         "timing_summary_json": str(timing_json_path) if timing_json_path else None,
         "timing_summary_md": str(timing_md_path) if timing_md_path else None,
@@ -456,23 +464,90 @@ def _fmt_duration(value: object) -> str:
     return "n/a"
 
 
-def classify_failure(text: str, *, exit_code: int) -> str | None:
-    if exit_code == 0:
+def _compact_error_detail(text: str, *, max_chars: int = 260) -> str | None:
+    candidates: list[str] = []
+    for raw_line in reversed(text.splitlines()):
+        line = raw_line.strip()
+        if not line:
+            continue
+        lowered = line.lower()
+        if any(
+            marker in lowered
+            for marker in (
+                "requestfailederror",
+                "runtimeerror:",
+                "valueerror:",
+                "timeouterror:",
+                "traceback",
+                "fail in ",
+                "error:",
+                "exception",
+                "terminated due to",
+            )
+        ):
+            candidates.append(line)
+        if len(candidates) >= 3:
+            break
+    if not candidates:
+        for raw_line in reversed(text.splitlines()):
+            line = raw_line.strip()
+            if line:
+                candidates.append(line)
+                break
+    if not candidates:
         return None
+    detail = " | ".join(reversed(candidates))
+    detail = re.sub(r"\s+", " ", detail).strip()
+    detail = _sanitize_failure_detail(detail)
+    if len(detail) > max_chars:
+        return detail[: max_chars - 3].rstrip() + "..."
+    return detail
+
+
+def _sanitize_failure_detail(detail: str) -> str:
+    detail = re.sub(r"/(?:root|vePFS-Mindverse|tmp|mnt)/\S+", "<local_path>", detail)
+    detail = re.sub(
+        r"https?://(?:localhost|127\.0\.0\.1|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+"
+        r"|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+)(?::\d+)?\S*",
+        "<internal_url>",
+        detail,
+    )
+    detail = re.sub(r"\bsk-[A-Za-z0-9_-]{12,}\b", "<redacted_key>", detail)
+    return detail
+
+
+def classify_failure_detail(text: str, *, exit_code: int) -> FailureClassification:
+    if exit_code == 0:
+        return FailureClassification(None)
     lowered = text.lower()
     if "model_path must start with" in lowered or "checkpoint model_path must start with" in lowered:
-        return "client workflow"
+        return FailureClassification(
+            "client workflow",
+            "checkpoint URI was rejected by the sanity-check client workflow",
+        )
     if "valueerror" in lowered and "create_sampling_client" in lowered:
-        return "client workflow"
-    if "cuda out of memory" in lowered or "actordiederror" in lowered or "enginedeaderror" in lowered:
-        return "server exception"
-    if "worker failed" in lowered or "requestfailederror" in lowered or "traceback" in lowered:
-        return "server exception"
+        return FailureClassification(
+            "client workflow",
+            _compact_error_detail(text) or "create_sampling_client raised ValueError",
+        )
+    if "sampling session terminated due to sampling inactivity" in lowered:
+        return FailureClassification(
+            "capacity/scheduling",
+            "sampling session exceeded inactivity TTL while waiting for queued sampling work",
+        )
     if "no_resources" in lowered or "placement group" in lowered or "scheduling" in lowered:
-        return "capacity/scheduling"
+        return FailureClassification("capacity/scheduling", _compact_error_detail(text))
+    if "cuda out of memory" in lowered or "actordiederror" in lowered or "enginedeaderror" in lowered:
+        return FailureClassification("server exception", _compact_error_detail(text))
+    if "worker failed" in lowered or "requestfailederror" in lowered or "traceback" in lowered:
+        return FailureClassification("server exception", _compact_error_detail(text))
     if "api key" in lowered or "unauthorized" in lowered or "forbidden" in lowered:
-        return "client env/auth"
-    return "unknown"
+        return FailureClassification("client env/auth", _compact_error_detail(text))
+    return FailureClassification("unknown", _compact_error_detail(text) or "unmatched failure; inspect stdout/stderr artifacts")
+
+
+def classify_failure(text: str, *, exit_code: int) -> str | None:
+    return classify_failure_detail(text, exit_code=exit_code).failure_class
 
 
 def failure_surface_from_logs(text: str) -> str | None:
@@ -559,9 +634,13 @@ def build_feishu_report(results: list[dict[str, object]]) -> str:
         else:
             any_failed = True
             failure_class = result.get("failure_class") or "unknown"
-            lines.append(
-                f"- FAIL `{model}`: failed=`{_failure_surface(result)}`, class=`{failure_class}`, slowest_completed=`{slowest}`, max=`{max_s}`, wall=`{wall}`."
+            line = (
+                f"- FAIL `{model}`: failed=`{_failure_surface(result)}`, class=`{failure_class}`, "
+                f"slowest_completed=`{slowest}`, max=`{max_s}`, wall=`{wall}`."
             )
+            if result.get("failure_detail"):
+                line += f" detail={result['failure_detail']}"
+            lines.append(line)
     lines.append("")
     lines.append("**Ops:** none attempted by wrapper.")
     lines.append("**Issue:** not filed by wrapper.")
@@ -630,6 +709,8 @@ def write_summary(results: list[dict[str, object]], run_root: Path, args: argpar
         lines.append(f"- stderr_log: `{result['stderr_log']}`")
         if result.get("timing_summary_json"):
             lines.append(f"- timing_summary_json: `{result['timing_summary_json']}`")
+        if result.get("failure_detail"):
+            lines.append(f"- failure_detail: `{result['failure_detail']}`")
         lines.append("")
     md_path.write_text("\n".join(lines))
     return json_path, md_path

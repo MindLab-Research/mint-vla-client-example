@@ -42,3 +42,30 @@ def test_incomplete_rl_loop_surfaces_as_step_not_completed():
 
     assert train_check.classify_failure(text, exit_code=1) == "server exception"
     assert train_check.failure_surface_from_logs(text) == "rl_step_not_completed"
+
+
+def test_sampling_inactivity_is_capacity_scheduling_with_detail():
+    train_check = _load_train_check()
+    text = """
+    Request failed with non-retryable error: RequestFailedError: Request failed:
+    Sampling session terminated due to sampling inactivity (> 1800.0s)
+    for self.request_id='sample_fe75a3e6a65c15daf4642461ddf12776'
+    """
+
+    classification = train_check.classify_failure_detail(text, exit_code=1)
+
+    assert classification.failure_class == "capacity/scheduling"
+    assert "inactivity TTL" in classification.detail
+
+
+def test_unknown_failure_includes_compact_error_detail():
+    train_check = _load_train_check()
+    text = """
+    all previous stages looked normal
+    FatalWidgetMelt: allocator returned nonsense
+    """
+
+    classification = train_check.classify_failure_detail(text, exit_code=1)
+
+    assert classification.failure_class == "unknown"
+    assert "FatalWidgetMelt" in classification.detail
