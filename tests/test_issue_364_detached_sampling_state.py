@@ -545,7 +545,7 @@ async def test_issue_364_save_weights_for_sampler_persists_lora_int_id(
         SimpleNamespace(save_weights_for_sampler=_fake_save_weights_for_sampler),
     )
     monkeypatch.setattr(training_route, "inference_manager", _FakeInferenceManager())
-    async def _async_resolve(request_id: str, response):
+    async def _async_resolve(request_id: str, response, **_kwargs):
         resolved.update({"request_id": request_id, "response": response})
 
     async def _async_fail(*_args, **_kwargs):
@@ -678,6 +678,47 @@ async def test_issue_364_sampling_restore_drops_stale_local_snapshot_when_store_
 
 
 @pytest.mark.anyio
+async def test_issue_364_asample_missing_detached_sampler_is_404(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _async_get_sampling_session_info(_session_id: str):
+        return None
+
+    async def _async_remote_sampling_session(_session_id: str):
+        return None
+
+    monkeypatch.setattr(sampling_route, "session_manager", None)
+    monkeypatch.setattr(
+        "mint_server.backend.sampling_session_store.async_get_sampling_session_info",
+        _async_get_sampling_session_info,
+    )
+    monkeypatch.setattr(
+        "mint_server.gateway.async_remote_sampling_session",
+        _async_remote_sampling_session,
+    )
+    monkeypatch.setattr(
+        "mint_server.gateway.remote_sampling_session",
+        lambda _session_id: None,
+    )
+
+    from mint_server.models.types import ModelInput, SampleRequest, SamplingParams
+
+    req = SampleRequest(
+        sampling_session_id="sess-364-missing",
+        seq_id=1,
+        num_samples=1,
+        prompt=ModelInput.from_ints([1, 2, 3]),
+        sampling_params=SamplingParams(max_tokens=4),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await sampling_route.asample(req, SimpleNamespace(state=SimpleNamespace(user_data=None), headers={}))
+
+    assert exc_info.value.status_code == 404
+    assert "sess-364-missing" in str(exc_info.value.detail)
+
+
+@pytest.mark.anyio
 async def test_issue_364_compute_logprobs_marks_model_actor_inventory_inflight(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -696,7 +737,7 @@ async def test_issue_364_compute_logprobs_marks_model_actor_inventory_inflight(
     failed: list[str] = []
 
     monkeypatch.setattr(sampling_route, "session_manager", manager)
-    async def _async_resolve(request_id: str, response):
+    async def _async_resolve(request_id: str, response, **_kwargs):
         resolved.update({"request_id": request_id, "response": response})
 
     async def _async_fail(_request_id: str, error: str):

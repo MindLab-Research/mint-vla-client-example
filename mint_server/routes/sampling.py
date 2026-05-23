@@ -1015,8 +1015,6 @@ async def asample(
                 remote = remote_sampling_session(session_id)
             except Exception:
                 remote = None
-    if snapshot is None and remote is None and manager is None and request.sampling_session_id is not None:
-        raise HTTPException(status_code=503, detail="Sampling session store unavailable")
     if remote is not None:
         upstream_alias, base_model = remote
         upstream = upstream_for_alias(upstream_alias)
