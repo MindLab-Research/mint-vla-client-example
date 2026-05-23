@@ -220,7 +220,11 @@ Future reaper metrics:
 ## Detached actor hygiene
 
 Detached actors do not hot-reload. Changes to `TaskStateStore`,
-`ModelWorkScheduler`, `ModelRuntimeActor`, or `MaintenanceCronActor` require
-killing the matching detached actors in the target namespace before restart.
-Changing the future-state RocksDB component requires restarting
-`TaskStateStore`; there is no separate future-state actor to kill.
+`ModelRuntimeActor`, or persistent storage code still require the matching
+owner-specific restart or reconcile path. `ModelWorkScheduler` publishes
+`code_identity`; the supervisor dependency ensure path may recreate a stale
+scheduler via `stats(create_if_missing=True)`, while API request paths only
+validate identity and fail fast. `MaintenanceCronActor` follows the same
+owner-managed lifecycle under the supervisor. Changing the future-state KV
+component requires restarting `TaskStateStore`; there is no separate
+future-state actor to kill.

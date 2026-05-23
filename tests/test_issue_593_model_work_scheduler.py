@@ -4,7 +4,10 @@ import time
 import pytest
 
 from mint_server.backend.model_work_scheduler import (
+    CURRENT_CODE_IDENTITY,
     ModelWorkSchedulerConflictError,
+    ModelWorkSchedulerCodeIdentityMismatchError,
+    ModelWorkSchedulerClient,
     _ModelWorkSchedulerActor,
     _ray_model_work_scheduler_actor_name,
 )
@@ -94,6 +97,21 @@ def test_scheduler_default_actor_name_uses_mint_prefix(monkeypatch: pytest.Monke
     monkeypatch.delenv("MINT_MODEL_WORK_SCHEDULER_ACTOR_NAME", raising=False)
 
     assert _ray_model_work_scheduler_actor_name() == "mint_model_work_scheduler"
+
+
+def test_scheduler_snapshots_include_code_identity() -> None:
+    actor = _ModelWorkSchedulerActor()
+
+    assert actor.ping()["code_identity"] == CURRENT_CODE_IDENTITY
+    assert actor.stats()["code_identity"] == CURRENT_CODE_IDENTITY
+
+
+def test_scheduler_client_rejects_stale_code_identity() -> None:
+    client = ModelWorkSchedulerClient()
+
+    client._validate_code_identity({"code_identity": CURRENT_CODE_IDENTITY})
+    with pytest.raises(ModelWorkSchedulerCodeIdentityMismatchError):
+        client._validate_code_identity({"code_identity": "stale-scheduler-code"})
 
 
 def test_issue_638_scheduler_registers_actor_observability(monkeypatch: pytest.MonkeyPatch) -> None:
