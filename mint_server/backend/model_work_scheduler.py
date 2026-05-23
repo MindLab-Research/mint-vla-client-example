@@ -21,6 +21,7 @@ from ..config import (
 from ..runtime_env import env_nonempty
 from ..server_info import _git_sha
 from .async_ray_control import async_get_ray_ref, sync_get_ray_ref
+from .task_state_store import TERMINAL_TASK_STATUSES, TaskStateConflictError, TaskStateNotFoundError
 
 logger = logging.getLogger(__name__)
 
@@ -307,6 +308,7 @@ class _ModelWorkSchedulerActor:
         self._completed = 0
         self._failed = 0
         self._requeued = 0
+        self._stale_dropped = 0
         self._appended = 0
         self._assigned = 0
         self._claimed = 0
@@ -367,7 +369,15 @@ class _ModelWorkSchedulerActor:
 
                 return _callback
 
-            for key in ("appended", "assigned", "claimed", "completed", "failed", "requeued"):
+            for key in (
+                "appended",
+                "assigned",
+                "claimed",
+                "completed",
+                "failed",
+                "requeued",
+                "stale_dropped",
+            ):
                 _gauge(f"mint_model_work_scheduler_{key}_total", _counter(key))
 
             def _domain_backlog(_options):
@@ -714,6 +724,70 @@ class _ModelWorkSchedulerActor:
     def _remove_request_location(self, request_id: str) -> None:
         self._request_locations.pop(str(request_id), None)
         self._lease_id_by_request_id.pop(str(request_id), None)
+
+    def _claim_conflict_cause(self, exc: BaseException) -> TaskStateConflictError | None:
+        if isinstance(exc, TaskStateConflictError):
+            return exc
+        as_instanceof_cause = getattr(exc, "as_instanceof_cause", None)
+        if callable(as_instanceof_cause):
+            try:
+                cause = as_instanceof_cause()
+            except Exception:
+                cause = None
+            if isinstance(cause, TaskStateConflictError):
+                return cause
+        cause = getattr(exc, "cause", None)
+        if isinstance(cause, TaskStateConflictError):
+            return cause
+        return None
+
+    async def _reconcile_assigned_claim_conflict(
+        self,
+        assigned: _AssignedWork,
+        *,
+        conflict: TaskStateConflictError,
+    ) -> str | None:
+        if "cannot claim assigned task" not in str(conflict):
+            return None
+        try:
+            record = await self._task_state_call("get_task", request_id=assigned.item.request_id)
+        except TaskStateNotFoundError:
+            self._remove_request_location(assigned.item.request_id)
+            self._stale_dropped += 1
+            logger.warning(
+                "[model_work_scheduler] dropped stale assigned queue item with missing task state request_id=%s queue_id=%s",
+                assigned.item.request_id,
+                assigned.queue_id,
+            )
+            return "missing"
+        status = str(record.get("status") or "")
+        same_assignment = (
+            status == "assigned"
+            and str(record.get("subqueue_id") or "") == str(assigned.queue_id)
+            and int(record.get("scheduler_epoch") or 0) == int(self._scheduler_epoch or 0)
+        )
+        if same_assignment:
+            return None
+        if status == "pending":
+            self._backlog(assigned.item.domain_key).appendleft(assigned.item)
+            self._request_locations[assigned.item.request_id] = "backlog"
+            self._requeued += 1
+            logger.warning(
+                "[model_work_scheduler] requeued stale assigned queue item whose task state is pending request_id=%s queue_id=%s",
+                assigned.item.request_id,
+                assigned.queue_id,
+            )
+            return "pending_requeued"
+        self._remove_request_location(assigned.item.request_id)
+        self._stale_dropped += 1
+        logger.warning(
+            "[model_work_scheduler] dropped stale assigned queue item after task-state claim conflict request_id=%s queue_id=%s status=%s terminal=%s",
+            assigned.item.request_id,
+            assigned.queue_id,
+            status or "unknown",
+            status in TERMINAL_TASK_STATUSES,
+        )
+        return status or "unknown"
 
     async def _expire_leases_locked(self, *, now: float) -> int:
         expired = 0
@@ -1088,17 +1162,30 @@ class _ModelWorkSchedulerActor:
                     )
                     assigned.item = item
                 if self._use_task_state_store:
-                    await self._task_state_call(
-                        "claim_task",
-                        request_id=item.request_id,
-                        subqueue_id=assigned.queue_id,
-                        lease_id=lease_id,
-                        attempt_id=attempt_id,
-                        consumer_id=consumer_id,
-                        scheduler_epoch=int(self._scheduler_epoch or 0),
-                        runtime_generation=int(consumer_generation),
-                        lease_ttl_s=max(1.0, float(lease_ttl_s)),
-                    )
+                    try:
+                        await self._task_state_call(
+                            "claim_task",
+                            request_id=item.request_id,
+                            subqueue_id=assigned.queue_id,
+                            lease_id=lease_id,
+                            attempt_id=attempt_id,
+                            consumer_id=consumer_id,
+                            scheduler_epoch=int(self._scheduler_epoch or 0),
+                            runtime_generation=int(consumer_generation),
+                            lease_ttl_s=max(1.0, float(lease_ttl_s)),
+                        )
+                    except Exception as e:
+                        conflict = self._claim_conflict_cause(e)
+                        if conflict is None:
+                            raise
+                        reconciled = await self._reconcile_assigned_claim_conflict(
+                            assigned,
+                            conflict=conflict,
+                        )
+                        if reconciled is None:
+                            raise
+                        queue.popleft()
+                        continue
                 queue.popleft()
                 lease = ModelWorkLease(
                     lease_id=lease_id,
@@ -1313,6 +1400,7 @@ class _ModelWorkSchedulerActor:
                 "completed": self._completed,
                 "failed": self._failed,
                 "requeued": self._requeued,
+                "stale_dropped": self._stale_dropped,
             },
         }
 
