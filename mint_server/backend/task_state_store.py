@@ -212,8 +212,10 @@ def billing_observations_from_input(
     request_id: str,
     billing_input: dict | None,
 ) -> list[dict[str, Any]]:
-    if not isinstance(billing_input, dict):
+    if billing_input is None:
         return []
+    if not isinstance(billing_input, dict):
+        raise ValueError("billing input must be a dict")
     from ..gateway_auth import GatewayAuthContext
 
     required = ("charge_item", "quantity", "unit", "route", "dimension")
@@ -1379,6 +1381,7 @@ class TaskStateStore:
         now: float | None = None,
     ) -> dict[str, Any]:
         ts = _now(now)
+        out: dict[str, Any]
         with self._transaction() as conn:
             row = self._get_row(conn, request_id)
             if str(row["status"]) in TERMINAL_TASK_STATUSES:
@@ -1803,6 +1806,56 @@ class TaskStateStore:
             _inc_billing_metric("write_error", len(errors))
         return out
 
+    def _append_billing_outbox_after_terminal_success(
+        self,
+        *,
+        observations: list[dict[str, Any]] | None,
+        source: str,
+        now: float,
+    ) -> dict[str, Any]:
+        normalized = [dict(item) for item in (observations or []) if isinstance(item, dict)]
+        if not normalized:
+            return {}
+        try:
+            billing_result = self.append_billing_outbox(
+                observations=normalized,
+                source=source,
+                now=now,
+            )
+            if not bool(billing_result.get("ok")):
+                return {"billing_status": "dropped", "billing_error": billing_result}
+            inserted = int(billing_result.get("inserted") or 0)
+            if inserted > 0:
+                return {
+                    "billing_status": "outboxed",
+                    "billing_observation_count": inserted,
+                }
+            return {}
+        except Exception as e:
+            _inc_billing_metric("write_error", 1)
+            return {"billing_status": "dropped", "billing_error": f"{type(e).__name__}: {e}"}
+
+    def _best_effort_update_billing_metadata(
+        self,
+        *,
+        request_id: str,
+        metadata: dict[str, Any],
+        now: float,
+        fallback: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not metadata:
+            return fallback
+        try:
+            updated = self.update_task_metadata(request_id=request_id, metadata=metadata, now=now)
+            if isinstance(updated, dict) and isinstance(updated.get("record"), dict):
+                return updated["record"]
+        except Exception:
+            _inc_billing_metric("write_error", 1)
+        fallback_metadata = fallback.get("metadata")
+        if isinstance(fallback_metadata, dict):
+            fallback["metadata"] = {**fallback_metadata, **metadata}
+        return fallback
+
     def claim_billing_outbox(
         self,
         *,
@@ -1906,6 +1959,7 @@ class TaskStateStore:
         now: float | None,
     ) -> dict[str, Any]:
         ts = _now(now)
+        out: dict[str, Any]
         with self._transaction() as conn:
             row = self._get_row(conn, request_id)
             if str(row["status"]) in TERMINAL_TASK_STATUSES:
@@ -1922,17 +1976,6 @@ class TaskStateStore:
                 if not _require_staged_success_path(row, result_path):
                     self._raise_task_transition_error(conn, request_id, f"complete task {status}")
                 merged = {**_json_loads(row["metadata_json"]), **dict(metadata or {})}
-                billing_result = self.append_billing_outbox(
-                    observations=[dict(item) for item in (billing_observations or []) if isinstance(item, dict)],
-                    source="task_terminal",
-                    now=ts,
-                )
-                if not bool(billing_result.get("ok")):
-                    merged["billing_status"] = "dropped"
-                    merged["billing_error"] = billing_result
-                elif int(billing_result.get("inserted") or 0) > 0:
-                    merged["billing_status"] = "outboxed"
-                    merged["billing_observation_count"] = int(billing_result.get("inserted") or 0)
             else:
                 merged = _merge_metadata_with_abandoned_staged_payload(row, metadata)
             cur = conn.execute(
@@ -1975,7 +2018,20 @@ class TaskStateStore:
                 },
                 now=ts,
             )
-            return {"ok": True, "idempotent": False, "record": self._row_to_record(self._get_row(conn, request_id))}
+            out = {"ok": True, "idempotent": False, "record": self._row_to_record(self._get_row(conn, request_id))}
+        if status == "done" and billing_observations:
+            billing_metadata = self._append_billing_outbox_after_terminal_success(
+                observations=billing_observations,
+                source="task_terminal",
+                now=ts,
+            )
+            out["record"] = self._best_effort_update_billing_metadata(
+                request_id=request_id,
+                metadata=billing_metadata,
+                now=ts,
+                fallback=dict(out["record"]),
+            )
+        return out
 
     def assign_task(
         self,
@@ -2285,17 +2341,6 @@ class TaskStateStore:
                 if not _require_staged_success_path(row, result_path):
                     self._raise_task_transition_error(conn, request_id, f"commit finalize {status}")
                 merged = _json_loads(row["metadata_json"])
-                billing_result = self.append_billing_outbox(
-                    observations=[dict(item) for item in (billing_observations or []) if isinstance(item, dict)],
-                    source="model_work_terminal",
-                    now=ts,
-                )
-                if not bool(billing_result.get("ok")):
-                    merged["billing_status"] = "dropped"
-                    merged["billing_error"] = billing_result
-                elif int(billing_result.get("inserted") or 0) > 0:
-                    merged["billing_status"] = "outboxed"
-                    merged["billing_observation_count"] = int(billing_result.get("inserted") or 0)
             else:
                 merged = _merge_metadata_with_abandoned_staged_payload(row)
             cur = conn.execute(
@@ -2348,7 +2393,20 @@ class TaskStateStore:
                 },
                 now=ts,
             )
-            return {"ok": True, "idempotent": False, "record": self._row_to_record(self._get_row(conn, request_id))}
+            out = {"ok": True, "idempotent": False, "record": self._row_to_record(self._get_row(conn, request_id))}
+        if status == "done" and billing_observations:
+            billing_metadata = self._append_billing_outbox_after_terminal_success(
+                observations=billing_observations,
+                source="model_work_terminal",
+                now=ts,
+            )
+            out["record"] = self._best_effort_update_billing_metadata(
+                request_id=request_id,
+                metadata=billing_metadata,
+                now=ts,
+                fallback=dict(out["record"]),
+            )
+        return out
 
     def list_active_tasks(self, *, limit: int | None = None) -> list[dict[str, Any]]:
         sql = """

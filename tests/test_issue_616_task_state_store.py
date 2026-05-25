@@ -1017,6 +1017,60 @@ def test_billing_outbox_failure_terminal_is_not_billed() -> None:
         store.close()
 
 
+def test_billing_outbox_not_written_when_terminal_success_rejected(monkeypatch) -> None:
+    store = TaskStateStore.in_memory()
+    try:
+        store.ensure_task(
+            request_id="future-reject",
+            op="sampling.asample",
+            domain_key="future:default",
+            metadata={},
+            status="running",
+            now=100.0,
+        )
+        appended: list[dict] = []
+
+        def _append(*args, **kwargs):
+            appended.append({"args": args, "kwargs": kwargs})
+            return {"ok": True, "inserted": 1, "duplicate": 0, "conflicts": 0, "errors": []}
+
+        monkeypatch.setattr(store._hot_kv, "append_billing_outbox", _append)
+
+        def _fail_record_event(*_args, **_kwargs):
+            raise RuntimeError("terminal event write failed")
+
+        monkeypatch.setattr(store, "_record_event", _fail_record_event)
+
+        observation = build_billing_observation(
+            account_id="acct-1",
+            apikey_id="key-1",
+            request_id="future-reject",
+            charge_item="sampling",
+            quantity=7,
+            unit="tokens",
+            route="sampling.asample",
+            dimension="sample",
+            model="Qwen/Test",
+            observed_at=101.0,
+        )
+        with pytest.raises(RuntimeError, match="terminal event write failed"):
+            store.complete_task_success(
+                request_id="future-reject",
+                result_path="/tmp/result.json",
+                result_checksum="sha256:abc",
+                result_size_bytes=17,
+                metadata={"done_at": 102.0},
+                billing_observations=[observation],
+                now=102.0,
+            )
+
+        assert appended == []
+        assert store.billing_outbox_stats(now=103.0)["by_status"] == {}
+        assert store.get_task("future-reject")["status"] == "running"
+    finally:
+        store.close()
+
+
 def test_billing_observations_from_input_rejects_malformed_input() -> None:
     gateway_auth = {
         "user_id": "user-1",
@@ -1036,6 +1090,13 @@ def test_billing_observations_from_input_rejects_malformed_input() -> None:
                 "route": "sampling.asample",
             },
         )
+    for malformed in ([], "bad", True):
+        with pytest.raises(ValueError, match="must be a dict"):
+            billing_observations_from_input(
+                gateway_auth=gateway_auth,
+                request_id="req-bad-type",
+                billing_input=malformed,  # type: ignore[arg-type]
+            )
     with pytest.raises(ValueError, match="metadata"):
         billing_observations_from_input(
             gateway_auth=gateway_auth,
