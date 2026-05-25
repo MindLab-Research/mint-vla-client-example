@@ -13,6 +13,7 @@ from mint_server.backend.task_state_store import (
     TaskStateStore,
     TaskStateStoreClient,
     _TaskStateStoreActor,
+    billing_observations_from_input,
     build_billing_observation,
 )
 
@@ -1016,6 +1017,152 @@ def test_billing_outbox_failure_terminal_is_not_billed() -> None:
         store.close()
 
 
+def test_billing_outbox_not_written_when_terminal_success_rejected(monkeypatch) -> None:
+    store = TaskStateStore.in_memory()
+    try:
+        store.ensure_task(
+            request_id="future-reject",
+            op="sampling.asample",
+            domain_key="future:default",
+            metadata={},
+            status="running",
+            now=100.0,
+        )
+        appended: list[dict] = []
+
+        def _append(*args, **kwargs):
+            appended.append({"args": args, "kwargs": kwargs})
+            return {"ok": True, "inserted": 1, "duplicate": 0, "conflicts": 0, "errors": []}
+
+        monkeypatch.setattr(store._hot_kv, "append_billing_outbox", _append)
+
+        def _fail_record_event(*_args, **_kwargs):
+            raise RuntimeError("terminal event write failed")
+
+        monkeypatch.setattr(store, "_record_event", _fail_record_event)
+
+        observation = build_billing_observation(
+            account_id="acct-1",
+            apikey_id="key-1",
+            request_id="future-reject",
+            charge_item="sampling",
+            quantity=7,
+            unit="tokens",
+            route="sampling.asample",
+            dimension="sample",
+            model="Qwen/Test",
+            observed_at=101.0,
+        )
+        with pytest.raises(RuntimeError, match="terminal event write failed"):
+            store.complete_task_success(
+                request_id="future-reject",
+                result_path="/tmp/result.json",
+                result_checksum="sha256:abc",
+                result_size_bytes=17,
+                metadata={"done_at": 102.0},
+                billing_observations=[observation],
+                now=102.0,
+            )
+
+        assert appended == []
+        assert store.billing_outbox_stats(now=103.0)["by_status"] == {}
+        assert store.get_task("future-reject")["status"] == "running"
+    finally:
+        store.close()
+
+
+def test_billing_outbox_idempotent_terminal_retry_writes_missing_billing() -> None:
+    store = TaskStateStore.in_memory()
+    try:
+        store.ensure_task(
+            request_id="future-idempotent-bill",
+            op="sampling.asample",
+            domain_key="future:default",
+            metadata={},
+            status="running",
+            now=100.0,
+        )
+        store.complete_task_success(
+            request_id="future-idempotent-bill",
+            result_path="/tmp/result.json",
+            result_checksum="sha256:abc",
+            result_size_bytes=17,
+            metadata={"done_at": 101.0},
+            now=101.0,
+        )
+        assert store.billing_outbox_stats(now=102.0)["by_status"] == {}
+
+        observation = build_billing_observation(
+            account_id="acct-1",
+            apikey_id="key-1",
+            request_id="future-idempotent-bill",
+            charge_item="sampling",
+            quantity=7,
+            unit="tokens",
+            route="sampling.asample",
+            dimension="sample",
+            model="Qwen/Test",
+            observed_at=103.0,
+        )
+        repeated = store.complete_task_success(
+            request_id="future-idempotent-bill",
+            result_path="/tmp/result.json",
+            result_checksum="sha256:abc",
+            result_size_bytes=17,
+            metadata={"done_at": 101.0},
+            billing_observations=[observation],
+            now=104.0,
+        )
+        assert repeated["idempotent"] is True
+        assert repeated["record"]["metadata"]["billing_status"] == "outboxed"
+        claimed = store.claim_billing_outbox(claim_id="claim-idempotent", limit=10, lease_ttl_s=30.0)
+        assert len(claimed) == 1
+        assert claimed[0]["event"]["request_id"] == "future-idempotent-bill"
+    finally:
+        store.close()
+
+
+def test_billing_observations_from_input_rejects_malformed_input() -> None:
+    gateway_auth = {
+        "user_id": "user-1",
+        "user_role": "user",
+        "account_id": "acct-1",
+        "apikey_id": "key-1",
+        "request_id": "gw-1",
+    }
+    with pytest.raises(ValueError, match="missing required keys"):
+        billing_observations_from_input(
+            gateway_auth=gateway_auth,
+            request_id="req-bad",
+            billing_input={
+                "charge_item": "sampling",
+                "quantity": 1,
+                "unit": "tokens",
+                "route": "sampling.asample",
+            },
+        )
+    for malformed in ([], "bad", True):
+        with pytest.raises(ValueError, match="must be a dict"):
+            billing_observations_from_input(
+                gateway_auth=gateway_auth,
+                request_id="req-bad-type",
+                billing_input=malformed,  # type: ignore[arg-type]
+            )
+    with pytest.raises(ValueError, match="metadata"):
+        billing_observations_from_input(
+            gateway_auth=gateway_auth,
+            request_id="req-bad-meta",
+            billing_input={
+                "charge_item": "sampling",
+                "quantity": 1,
+                "unit": "tokens",
+                "route": "sampling.asample",
+                "dimension": "sample",
+                "metadata": "not-a-dict",
+            },
+        )
+
+
 def test_billing_outbox_write_failure_sets_underbilling_signal(monkeypatch) -> None:
     store = TaskStateStore.in_memory()
     try:
@@ -1638,12 +1785,28 @@ def test_task_future_service_stages_payload_metadata_before_direct_resolve(tmp_p
             async def async_complete_task_success(self, **kwargs):
                 return store.complete_task_success(**kwargs)
 
+            async def async_append_billing_outbox(self, **_kwargs):
+                raise AssertionError("billing must be committed through complete_task_success")
+
         service = TaskFutureService(
             task_state_client=_LocalTaskStateClient(),
             payload_store=TaskPayloadStore(tmp_path),
         )
 
-        asyncio.run(service.async_resolve("req-direct", {"ok": True}))
+        observation = build_billing_observation(
+            account_id="acct-1",
+            apikey_id="key-1",
+            request_id="req-direct",
+            charge_item="sampling",
+            quantity=3,
+            unit="tokens",
+            route="sampling.asample",
+            dimension="sample",
+            model="Qwen/Test",
+            observed_at=2.0,
+        )
+
+        asyncio.run(service.async_resolve("req-direct", {"ok": True}, billing_observations=[observation]))
 
         assert observed_updates[0]["request_id"] == "req-direct"
         assert observed_updates[0]["staged_payload_path"].startswith(str(tmp_path / "re" / "req-direct" / "future__"))
@@ -1657,8 +1820,64 @@ def test_task_future_service_stages_payload_metadata_before_direct_resolve(tmp_p
         assert record["staged_payload_path"] is None
         assert record["metadata"]["payload_state"] == "committed"
         assert record["metadata"]["staged_payload_path"] is None
+        assert record["metadata"]["billing_status"] == "outboxed"
+        claimed = store.claim_billing_outbox(claim_id="claim-direct", limit=10, lease_ttl_s=30.0)
+        assert len(claimed) == 1
+        assert claimed[0]["event"]["request_id"] == "req-direct"
     finally:
         store.close()
+
+
+def test_task_state_actor_future_success_preserves_billing_observations(tmp_path) -> None:
+    from mint_server.backend.future_state_store import FutureStateStore
+
+    actor = _TaskStateStoreActor(str(tmp_path / "task-state.sqlite3"))
+    actor._future_store = FutureStateStore.in_memory()
+    try:
+        actor.future_ensure_task(
+            request_id="future-actor-bill",
+            op="sampling.asample",
+            domain_key="future:default",
+            metadata={},
+            status="running",
+            now=100.0,
+        )
+        actor.future_stage_payload(
+            request_id="future-actor-bill",
+            staged_payload_path="/tmp/future-actor-result.json",
+            metadata={"staged_payload_path": "/tmp/future-actor-result.json"},
+            now=101.0,
+        )
+        observation = build_billing_observation(
+            account_id="acct-1",
+            apikey_id="key-1",
+            request_id="future-actor-bill",
+            charge_item="sampling",
+            quantity=11,
+            unit="tokens",
+            route="sampling.asample",
+            dimension="sample",
+            model="Qwen/Test",
+            observed_at=102.0,
+        )
+        out = actor.future_complete_task_success(
+            request_id="future-actor-bill",
+            result_path="/tmp/future-actor-result.json",
+            result_checksum="sha256:abc",
+            result_size_bytes=17,
+            metadata={"done_at": 103.0},
+            billing_observations=[observation],
+            now=103.0,
+        )
+
+        assert out["record"]["status"] == "done"
+        assert out["record"]["metadata"]["billing_status"] == "outboxed"
+        claimed = actor.claim_billing_outbox(claim_id="claim-future-actor", limit=10, lease_ttl_s=30.0)
+        assert len(claimed) == 1
+        assert claimed[0]["event"]["request_id"] == "future-actor-bill"
+        assert claimed[0]["event"]["quantity"] == 11
+    finally:
+        actor.close()
 
 
 def test_task_state_store_owns_gateway_routes() -> None:

@@ -206,6 +206,43 @@ def billing_observations_from_auth(
     ]
 
 
+def billing_observations_from_input(
+    *,
+    gateway_auth: dict | None,
+    request_id: str,
+    billing_input: dict | None,
+) -> list[dict[str, Any]]:
+    if billing_input is None:
+        return []
+    if not isinstance(billing_input, dict):
+        raise ValueError("billing input must be a dict")
+    from ..gateway_auth import GatewayAuthContext
+
+    required = ("charge_item", "quantity", "unit", "route", "dimension")
+    missing = [key for key in required if key not in billing_input]
+    if missing:
+        raise ValueError(f"billing input missing required keys: {', '.join(missing)}")
+    metadata = billing_input.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        raise ValueError("billing input metadata must be a dict")
+    auth_ctx = GatewayAuthContext(**gateway_auth) if gateway_auth else None
+    return billing_observations_from_auth(
+        auth_ctx=auth_ctx,
+        request_id=request_id,
+        charge_item=str(billing_input["charge_item"]),
+        quantity=int(billing_input["quantity"]),
+        unit=str(billing_input["unit"]),
+        route=str(billing_input["route"]),
+        dimension=str(billing_input["dimension"]),
+        model=(
+            None
+            if billing_input.get("model") in (None, "")
+            else str(billing_input.get("model"))
+        ),
+        metadata=metadata,
+    )
+
+
 def _now(now: float | None = None) -> float:
     return time.time() if now is None else float(now)
 
@@ -1344,6 +1381,7 @@ class TaskStateStore:
         now: float | None = None,
     ) -> dict[str, Any]:
         ts = _now(now)
+        out: dict[str, Any]
         with self._transaction() as conn:
             row = self._get_row(conn, request_id)
             if str(row["status"]) in TERMINAL_TASK_STATUSES:
@@ -1768,6 +1806,56 @@ class TaskStateStore:
             _inc_billing_metric("write_error", len(errors))
         return out
 
+    def _append_billing_outbox_after_terminal_success(
+        self,
+        *,
+        observations: list[dict[str, Any]] | None,
+        source: str,
+        now: float,
+    ) -> dict[str, Any]:
+        normalized = [dict(item) for item in (observations or []) if isinstance(item, dict)]
+        if not normalized:
+            return {}
+        try:
+            billing_result = self.append_billing_outbox(
+                observations=normalized,
+                source=source,
+                now=now,
+            )
+            if not bool(billing_result.get("ok")):
+                return {"billing_status": "dropped", "billing_error": billing_result}
+            inserted = int(billing_result.get("inserted") or 0)
+            if inserted > 0:
+                return {
+                    "billing_status": "outboxed",
+                    "billing_observation_count": inserted,
+                }
+            return {}
+        except Exception as e:
+            _inc_billing_metric("write_error", 1)
+            return {"billing_status": "dropped", "billing_error": f"{type(e).__name__}: {e}"}
+
+    def _best_effort_update_billing_metadata(
+        self,
+        *,
+        request_id: str,
+        metadata: dict[str, Any],
+        now: float,
+        fallback: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not metadata:
+            return fallback
+        try:
+            updated = self.update_task_metadata(request_id=request_id, metadata=metadata, now=now)
+            if isinstance(updated, dict) and isinstance(updated.get("record"), dict):
+                return updated["record"]
+        except Exception:
+            _inc_billing_metric("write_error", 1)
+        fallback_metadata = fallback.get("metadata")
+        if isinstance(fallback_metadata, dict):
+            fallback["metadata"] = {**fallback_metadata, **metadata}
+        return fallback
+
     def claim_billing_outbox(
         self,
         *,
@@ -1871,6 +1959,7 @@ class TaskStateStore:
         now: float | None,
     ) -> dict[str, Any]:
         ts = _now(now)
+        out: dict[str, Any]
         with self._transaction() as conn:
             row = self._get_row(conn, request_id)
             if str(row["status"]) in TERMINAL_TASK_STATUSES:
@@ -1881,66 +1970,70 @@ class TaskStateStore:
                     and row["result_size_bytes"] == result_size_bytes
                     and row["error"] == error
                 ):
-                    return {"ok": True, "idempotent": True, "record": self._row_to_record(row)}
-                raise TaskStateConflictError("terminal task commit payload mismatch")
-            if status == "done":
-                if not _require_staged_success_path(row, result_path):
+                    out = {"ok": True, "idempotent": True, "record": self._row_to_record(row)}
+                else:
+                    raise TaskStateConflictError("terminal task commit payload mismatch")
+            else:
+                if status == "done":
+                    if not _require_staged_success_path(row, result_path):
+                        self._raise_task_transition_error(conn, request_id, f"complete task {status}")
+                    merged = {**_json_loads(row["metadata_json"]), **dict(metadata or {})}
+                else:
+                    merged = _merge_metadata_with_abandoned_staged_payload(row, metadata)
+                cur = conn.execute(
+                    """
+                    UPDATE tasks
+                    SET status = ?,
+                        result_path = ?,
+                        result_checksum = ?,
+                        result_size_bytes = ?,
+                        staged_payload_path = NULL,
+                        staged_payload_checksum = NULL,
+                        staged_payload_size_bytes = NULL,
+                        error = ?,
+                        metadata_json = ?,
+                        updated_at = ?
+                    WHERE request_id = ?
+                    """,
+                    (
+                        str(status),
+                        result_path,
+                        result_checksum,
+                        result_size_bytes,
+                        error,
+                        _json_dumps(merged),
+                        ts,
+                        str(request_id),
+                    ),
+                )
+                if cur.rowcount != 1:
                     self._raise_task_transition_error(conn, request_id, f"complete task {status}")
-                merged = {**_json_loads(row["metadata_json"]), **dict(metadata or {})}
-                billing_result = self.append_billing_outbox(
-                    observations=[dict(item) for item in (billing_observations or []) if isinstance(item, dict)],
-                    source="task_terminal",
+                self._record_event(
+                    conn,
+                    request_id=str(request_id),
+                    event_type=f"task_{status}",
+                    payload={
+                        "result_path": result_path,
+                        "result_checksum": result_checksum,
+                        "result_size_bytes": result_size_bytes,
+                        "error": error,
+                    },
                     now=ts,
                 )
-                if not bool(billing_result.get("ok")):
-                    merged["billing_status"] = "dropped"
-                    merged["billing_error"] = billing_result
-                elif int(billing_result.get("inserted") or 0) > 0:
-                    merged["billing_status"] = "outboxed"
-                    merged["billing_observation_count"] = int(billing_result.get("inserted") or 0)
-            else:
-                merged = _merge_metadata_with_abandoned_staged_payload(row, metadata)
-            cur = conn.execute(
-                """
-                UPDATE tasks
-                SET status = ?,
-                    result_path = ?,
-                    result_checksum = ?,
-                    result_size_bytes = ?,
-                    staged_payload_path = NULL,
-                    staged_payload_checksum = NULL,
-                    staged_payload_size_bytes = NULL,
-                    error = ?,
-                    metadata_json = ?,
-                    updated_at = ?
-                WHERE request_id = ?
-                """,
-                (
-                    str(status),
-                    result_path,
-                    result_checksum,
-                    result_size_bytes,
-                    error,
-                    _json_dumps(merged),
-                    ts,
-                    str(request_id),
-                ),
-            )
-            if cur.rowcount != 1:
-                self._raise_task_transition_error(conn, request_id, f"complete task {status}")
-            self._record_event(
-                conn,
-                request_id=str(request_id),
-                event_type=f"task_{status}",
-                payload={
-                    "result_path": result_path,
-                    "result_checksum": result_checksum,
-                    "result_size_bytes": result_size_bytes,
-                    "error": error,
-                },
+                out = {"ok": True, "idempotent": False, "record": self._row_to_record(self._get_row(conn, request_id))}
+        if status == "done" and billing_observations:
+            billing_metadata = self._append_billing_outbox_after_terminal_success(
+                observations=billing_observations,
+                source="task_terminal",
                 now=ts,
             )
-            return {"ok": True, "idempotent": False, "record": self._row_to_record(self._get_row(conn, request_id))}
+            out["record"] = self._best_effort_update_billing_metadata(
+                request_id=request_id,
+                metadata=billing_metadata,
+                now=ts,
+                fallback=dict(out["record"]),
+            )
+        return out
 
     def assign_task(
         self,
@@ -2232,6 +2325,7 @@ class TaskStateStore:
         now: float | None,
     ) -> dict[str, Any]:
         ts = _now(now)
+        out: dict[str, Any]
         with self._transaction() as conn:
             row = self._get_row(conn, request_id)
             if str(row["status"]) in TERMINAL_TASK_STATUSES:
@@ -2244,76 +2338,80 @@ class TaskStateStore:
                     and (row["result_size_bytes"] == result_size_bytes)
                     and (row["error"] == error)
                 ):
-                    return {"ok": True, "idempotent": True, "record": self._row_to_record(row)}
-                raise TaskStateConflictError("terminal task commit payload mismatch")
-            if status == "done":
-                if not _require_staged_success_path(row, result_path):
+                    out = {"ok": True, "idempotent": True, "record": self._row_to_record(row)}
+                else:
+                    raise TaskStateConflictError("terminal task commit payload mismatch")
+            else:
+                if status == "done":
+                    if not _require_staged_success_path(row, result_path):
+                        self._raise_task_transition_error(conn, request_id, f"commit finalize {status}")
+                    merged = _json_loads(row["metadata_json"])
+                else:
+                    merged = _merge_metadata_with_abandoned_staged_payload(row)
+                cur = conn.execute(
+                    """
+                    UPDATE tasks
+                    SET status = ?,
+                        result_path = ?,
+                        result_checksum = ?,
+                        result_size_bytes = ?,
+                        staged_payload_path = NULL,
+                        staged_payload_checksum = NULL,
+                        staged_payload_size_bytes = NULL,
+                        error = ?,
+                        metadata_json = ?,
+                        finalizing_until = NULL,
+                        updated_at = ?
+                    WHERE request_id = ?
+                      AND status = 'finalizing'
+                      AND lease_id = ?
+                      AND attempt_id = ?
+                      AND scheduler_epoch = ?
+                      AND runtime_generation = ?
+                    """,
+                    (
+                        status,
+                        result_path,
+                        result_checksum,
+                        result_size_bytes,
+                        error,
+                        _json_dumps(merged),
+                        ts,
+                        str(request_id),
+                        str(lease_id),
+                        str(attempt_id),
+                        int(scheduler_epoch),
+                        int(runtime_generation),
+                    ),
+                )
+                if cur.rowcount != 1:
                     self._raise_task_transition_error(conn, request_id, f"commit finalize {status}")
-                merged = _json_loads(row["metadata_json"])
-                billing_result = self.append_billing_outbox(
-                    observations=[dict(item) for item in (billing_observations or []) if isinstance(item, dict)],
-                    source="model_work_terminal",
+                self._record_event(
+                    conn,
+                    request_id=str(request_id),
+                    event_type=f"task_{status}",
+                    payload={
+                        "result_path": result_path,
+                        "result_checksum": result_checksum,
+                        "result_size_bytes": result_size_bytes,
+                        "error": error,
+                    },
                     now=ts,
                 )
-                if not bool(billing_result.get("ok")):
-                    merged["billing_status"] = "dropped"
-                    merged["billing_error"] = billing_result
-                elif int(billing_result.get("inserted") or 0) > 0:
-                    merged["billing_status"] = "outboxed"
-                    merged["billing_observation_count"] = int(billing_result.get("inserted") or 0)
-            else:
-                merged = _merge_metadata_with_abandoned_staged_payload(row)
-            cur = conn.execute(
-                """
-                UPDATE tasks
-                SET status = ?,
-                    result_path = ?,
-                    result_checksum = ?,
-                    result_size_bytes = ?,
-                    staged_payload_path = NULL,
-                    staged_payload_checksum = NULL,
-                    staged_payload_size_bytes = NULL,
-                    error = ?,
-                    metadata_json = ?,
-                    finalizing_until = NULL,
-                    updated_at = ?
-                WHERE request_id = ?
-                  AND status = 'finalizing'
-                  AND lease_id = ?
-                  AND attempt_id = ?
-                  AND scheduler_epoch = ?
-                  AND runtime_generation = ?
-                """,
-                (
-                    status,
-                    result_path,
-                    result_checksum,
-                    result_size_bytes,
-                    error,
-                    _json_dumps(merged),
-                    ts,
-                    str(request_id),
-                    str(lease_id),
-                    str(attempt_id),
-                    int(scheduler_epoch),
-                    int(runtime_generation),
-                ),
-            )
-            if cur.rowcount != 1:
-                self._raise_task_transition_error(conn, request_id, f"commit finalize {status}")
-            self._record_event(
-                conn,
-                request_id=str(request_id),
-                event_type=f"task_{status}",
-                payload={
-                    "result_path": result_path,
-                    "result_checksum": result_checksum,
-                    "result_size_bytes": result_size_bytes,
-                    "error": error,
-                },
+                out = {"ok": True, "idempotent": False, "record": self._row_to_record(self._get_row(conn, request_id))}
+        if status == "done" and billing_observations:
+            billing_metadata = self._append_billing_outbox_after_terminal_success(
+                observations=billing_observations,
+                source="model_work_terminal",
                 now=ts,
             )
-            return {"ok": True, "idempotent": False, "record": self._row_to_record(self._get_row(conn, request_id))}
+            out["record"] = self._best_effort_update_billing_metadata(
+                request_id=request_id,
+                metadata=billing_metadata,
+                now=ts,
+                fallback=dict(out["record"]),
+            )
+        return out
 
     def list_active_tasks(self, *, limit: int | None = None) -> list[dict[str, Any]]:
         sql = """
@@ -2848,6 +2946,40 @@ class _TaskStateStoreActor:
         self._notify_task_changed(kwargs.get("request_id"))
         return out
 
+    def _future_append_billing_after_terminal_success(
+        self,
+        *,
+        request_id: str,
+        billing_observations: list[dict[str, Any]] | None,
+        source: str,
+        now: float | None = None,
+        out: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not billing_observations:
+            return out
+        ts = _now(now)
+        billing_metadata = self._store._append_billing_outbox_after_terminal_success(
+            observations=billing_observations,
+            source=source,
+            now=ts,
+        )
+        if billing_metadata:
+            try:
+                updated = self._future_store_or_create().update_task_metadata(
+                    request_id=str(request_id),
+                    metadata=billing_metadata,
+                    now=ts,
+                )
+                if isinstance(updated, dict) and isinstance(updated.get("record"), dict):
+                    out = {**dict(out), "record": updated["record"]}
+            except Exception:
+                _inc_billing_metric("write_error", 1)
+                record = out.get("record") if isinstance(out.get("record"), dict) else None
+                if isinstance(record, dict):
+                    out = {**dict(out), "record": {**record, "metadata": {**dict(record.get("metadata") or {}), **billing_metadata}}}
+        self._notify_task_changed(request_id)
+        return out
+
     def future_acquire_scheduler_owner(self, **kwargs: Any) -> dict[str, Any]:
         return self._future_store_or_create().acquire_scheduler_owner(**kwargs)
 
@@ -2867,7 +2999,15 @@ class _TaskStateStoreActor:
         return self._future_call_and_notify("stage_payload", **kwargs)
 
     def future_complete_task_success(self, **kwargs: Any) -> dict[str, Any]:
-        return self._future_call_and_notify("complete_task_success", **kwargs)
+        billing_observations = kwargs.pop("billing_observations", None)
+        out = self._future_call_and_notify("complete_task_success", **kwargs)
+        return self._future_append_billing_after_terminal_success(
+            request_id=str(kwargs.get("request_id")),
+            billing_observations=billing_observations,
+            source="task_terminal",
+            now=kwargs.get("now"),
+            out=out,
+        )
 
     def future_complete_task_failure(self, **kwargs: Any) -> dict[str, Any]:
         return self._future_call_and_notify("complete_task_failure", **kwargs)
@@ -2920,7 +3060,15 @@ class _TaskStateStoreActor:
         return self._future_call_and_notify("begin_finalize", **kwargs)
 
     def future_commit_finalize_success(self, **kwargs: Any) -> dict[str, Any]:
-        return self._future_call_and_notify("commit_finalize_success", **kwargs)
+        billing_observations = kwargs.pop("billing_observations", None)
+        out = self._future_call_and_notify("commit_finalize_success", **kwargs)
+        return self._future_append_billing_after_terminal_success(
+            request_id=str(kwargs.get("request_id")),
+            billing_observations=billing_observations,
+            source="model_work_terminal",
+            now=kwargs.get("now"),
+            out=out,
+        )
 
     def future_commit_finalize_failure(self, **kwargs: Any) -> dict[str, Any]:
         return self._future_call_and_notify("commit_finalize_failure", **kwargs)
@@ -3789,7 +3937,6 @@ class TaskStateStoreClient:
         return await self._dict_call("future_stage_payload", **kwargs)
 
     async def async_future_complete_task_success(self, **kwargs: Any) -> dict[str, Any]:
-        kwargs.pop("billing_observations", None)
         return await self._dict_call("future_complete_task_success", **kwargs)
 
     async def async_future_complete_task_failure(self, **kwargs: Any) -> dict[str, Any]:
@@ -3844,7 +3991,6 @@ class TaskStateStoreClient:
         return await self._dict_call("future_begin_finalize", **kwargs)
 
     async def async_future_commit_finalize_success(self, **kwargs: Any) -> dict[str, Any]:
-        kwargs.pop("billing_observations", None)
         return await self._dict_call("future_commit_finalize_success", **kwargs)
 
     async def async_future_commit_finalize_failure(self, **kwargs: Any) -> dict[str, Any]:
@@ -4423,23 +4569,6 @@ class TaskFutureService:
             attempt_id=attempt_id,
             payload=result,
         )
-        billing_metadata: dict[str, Any] = {}
-        if billing_observations:
-            try:
-                billing_result = await self._task_state.async_append_billing_outbox(
-                    observations=billing_observations,
-                    source="task_terminal",
-                )
-                if not bool(billing_result.get("ok")):
-                    billing_metadata = {"billing_status": "dropped", "billing_error": billing_result}
-                elif int(billing_result.get("inserted") or 0) > 0:
-                    billing_metadata = {
-                        "billing_status": "outboxed",
-                        "billing_observation_count": int(billing_result.get("inserted") or 0),
-                    }
-            except Exception as e:
-                _inc_billing_metric("write_error", 1)
-                billing_metadata = {"billing_status": "dropped", "billing_error": f"{type(e).__name__}: {e}"}
         await self._future_state.async_complete_task_success(
             request_id=str(request_id),
             result_path=str(payload["path"]),
@@ -4450,8 +4579,8 @@ class TaskFutureService:
                 "final_status": FutureStatus.DONE.value,
                 "payload_state": "committed",
                 "staged_payload_path": None,
-                **billing_metadata,
             },
+            billing_observations=billing_observations,
         )
 
     async def async_fail(self, request_id: str, error: str) -> None:

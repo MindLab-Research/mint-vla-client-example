@@ -6,7 +6,7 @@ import logging
 
 from fastapi import APIRouter
 
-from ..backend.task_state_store import task_futures
+from ..backend.task_state_store import billing_observations_from_input, task_futures
 from ..models.types import ActRequest
 
 logger = logging.getLogger(__name__)
@@ -17,7 +17,13 @@ router = APIRouter()
 action_session_manager: object | None = None
 
 
-async def _do_act(request_id: str, request: ActRequest) -> None:
+async def _do_act(
+    request_id: str,
+    request: ActRequest,
+    billing_observations: list[dict] | None = None,
+    gateway_auth: dict | None = None,
+    billing_observation_input: dict | None = None,
+) -> None:
     try:
         if action_session_manager is None:
             raise RuntimeError("Action session manager not initialized")
@@ -32,7 +38,19 @@ async def _do_act(request_id: str, request: ActRequest) -> None:
         payload["type"] = "act"
         async_resolve = getattr(task_futures, "async_resolve", None)
         if callable(async_resolve):
-            await async_resolve(request_id, payload)
+            await async_resolve(
+                request_id,
+                payload,
+                billing_observations=(
+                    billing_observations
+                    if billing_observations is not None
+                    else billing_observations_from_input(
+                        gateway_auth=gateway_auth,
+                        request_id=request_id,
+                        billing_input=billing_observation_input,
+                    )
+                ),
+            )
         else:
             task_futures.resolve(request_id, payload)
     except Exception as e:

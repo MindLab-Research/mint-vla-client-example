@@ -343,7 +343,13 @@ async def execute_model_work_item(item: Any, *, component: str = "model_work_dis
     if op == "mint.interpolate_checkpoints":
         async def _run():
             req = InterpolateCheckpointsRequest.model_validate_json(item.request_json)
-            await mint._do_interpolate_checkpoints(item.request_id, req, item.user_id)
+            await mint._do_interpolate_checkpoints(
+                item.request_id,
+                req,
+                item.user_id,
+                (item.extra or {}).get("gateway_auth"),
+                (item.extra or {}).get("billing_observation_input"),
+            )
 
         return await run_async_with_otel_span(
             "queue.stage.mint.interpolate_checkpoints",
@@ -371,7 +377,13 @@ async def execute_model_work_item(item: Any, *, component: str = "model_work_dis
     if op == "mint.vla.train_step":
         async def _run():
             req = VLATrainStepRequest.model_validate_json(item.request_json)
-            await mint._do_vla_train_step(item.request_id, req, item.user_id)
+            await mint._do_vla_train_step(
+                item.request_id,
+                req,
+                item.user_id,
+                (item.extra or {}).get("gateway_auth"),
+                (item.extra or {}).get("billing_observation_input"),
+            )
 
         return await run_async_with_otel_span(
             "queue.stage.mint.vla.train_step",
@@ -385,7 +397,12 @@ async def execute_model_work_item(item: Any, *, component: str = "model_work_dis
     if op == "mint.action.act":
         async def _run():
             req = ActRequest.model_validate_json(item.request_json)
-            await action_sampling._do_act(item.request_id, req)
+            await action_sampling._do_act(
+                item.request_id,
+                req,
+                gateway_auth=(item.extra or {}).get("gateway_auth"),
+                billing_observation_input=(item.extra or {}).get("billing_observation_input"),
+            )
 
         return await run_async_with_otel_span(
             "queue.stage.mint.action.act",

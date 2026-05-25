@@ -11,7 +11,7 @@ from fastapi import APIRouter, HTTPException, Request
 from ..auth_identity import can_bypass_ownership
 from ..auth_identity import get_user_data as _request_user_data
 from ..auth_identity import get_user_id as _request_user_id
-from ..backend.task_state_store import task_futures
+from ..backend.task_state_store import billing_observations_from_input, task_futures
 from ..backend.mintx_ops import interpolate_checkpoints_to_dir
 from ..checkpoints import (
     MIRROR_STATUS_PENDING,
@@ -32,6 +32,7 @@ from ..checkpoint_index import (
     claim_checkpoint_publication,
     mark_checkpoint_failed,
 )
+from ..gateway_auth import GatewayAuthContext, build_billing_auth_context
 from ..logging_context import classify_failure_reason, set_request_id
 from ..model_access_control import can_access_model, get_access_denied_error
 from ..queue_priority import merge_queue_priority_extra
@@ -68,6 +69,87 @@ def _get_user_data(request: Request) -> dict | None:
 
 def _get_user_id(request: Request) -> str | None:
     return _request_user_id(request)
+
+
+def _gateway_auth_dict(auth_ctx: GatewayAuthContext | None) -> dict | None:
+    return None if auth_ctx is None else dict(auth_ctx.__dict__)
+
+
+def _positive_int(value: object, default: int = 0) -> int:
+    try:
+        return max(0, int(value or default))
+    except Exception:
+        return max(0, int(default))
+
+
+def _model_input_estimated_tokens(model_input: object) -> int:
+    tokens = 0
+    for chunk in list(getattr(model_input, "chunks", []) or []):
+        if getattr(chunk, "type", None) == "encoded_text":
+            tokens += len(list(getattr(chunk, "tokens", []) or []))
+            continue
+        expected_tokens = getattr(chunk, "expected_tokens", None)
+        if expected_tokens is not None:
+            tokens += _positive_int(expected_tokens)
+    return tokens
+
+
+def _action_session_billing_metadata(action_session_id: str) -> dict[str, object]:
+    getter = getattr(action_session_manager, "get_billing_metadata", None)
+    if not callable(getter):
+        return {}
+    try:
+        metadata = getter(action_session_id)
+    except Exception:
+        logger.debug(
+            "Failed to load action session billing metadata: action_session_id=%s",
+            action_session_id,
+            exc_info=True,
+        )
+        return {}
+    return dict(metadata) if isinstance(metadata, dict) else {}
+
+
+def _action_billing_input(
+    *,
+    action_session_id: str,
+    request: VLAActRequest,
+) -> dict:
+    session_metadata = _action_session_billing_metadata(action_session_id)
+    input_tokens = _model_input_estimated_tokens(request.observation.model_input)
+    action_output_tokens = _positive_int(session_metadata.get("action_output_tokens"))
+    metadata = {
+        "action_session_id": str(action_session_id),
+        "input_tokens": int(input_tokens),
+        "action_output_tokens": int(action_output_tokens),
+    }
+    for key in ("base_model", "policy_family", "action_dim", "action_horizon", "action_token_budget"):
+        value = session_metadata.get(key)
+        if value not in (None, ""):
+            metadata[key] = value
+    if request.temperature is not None:
+        metadata["temperature"] = float(request.temperature)
+    return {
+        "charge_item": "inference",
+        "quantity": max(1, int(input_tokens) + int(action_output_tokens)),
+        "unit": "estimated_tokens",
+        "route": "mint.action.act",
+        "dimension": "action",
+        "model": str(session_metadata.get("base_model") or action_session_id),
+        "metadata": metadata,
+    }
+
+
+def _vla_billing_token_count(data: list[VLADatum]) -> int:
+    total_tokens = 0
+    for item in data:
+        total_tokens += _model_input_estimated_tokens(item.observation.model_input)
+        target_tokens = item.supervision.get("target_tokens")
+        if target_tokens is not None:
+            target_shape = list(target_tokens.shape)
+            if len(target_shape) == 1:
+                total_tokens += _positive_int(target_shape[0])
+    return max(1, total_tokens)
 
 
 async def _enqueue_mint_model_work(
@@ -360,9 +442,18 @@ async def act(
     )
     request_json = queued_request.model_dump_json().encode("utf-8")
     request_id = f"act_{uuid.uuid4().hex}"
+    billing_auth = build_billing_auth_context(http_request, fallback_request_id=request_id)
+    billing_input = _action_billing_input(
+        action_session_id=action_session_id,
+        request=request,
+    )
     try:
         from ..backend.model_actor_supervisor import domain_key_for_internal_runtime
 
+        extra = {
+            "gateway_auth": _gateway_auth_dict(billing_auth),
+            "billing_observation_input": billing_input,
+        }
         await _enqueue_mint_model_work(
             request_id=request_id,
             op="mint.action.act",
@@ -376,6 +467,7 @@ async def act(
             ),
             http_request=http_request,
             user_id=_get_user_id(http_request),
+            extra=extra,
         )
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Failed to enqueue action act request: {e}")
@@ -421,6 +513,20 @@ async def vla_train_step(
     user_id = _get_user_id(http_request)
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
+    billing_auth = build_billing_auth_context(http_request, fallback_request_id=request_id)
+    billing_input = {
+        "charge_item": "training",
+        "quantity": _vla_billing_token_count(request.data),
+        "unit": "estimated_tokens",
+        "route": "mint.vla.train_step",
+        "dimension": "train",
+        "model": base_model,
+        "metadata": {
+            "model_id": request.model_id,
+            "loss_fn": request.loss_fn,
+            "datum_count": len(request.data),
+        },
+    }
 
     inflight_marked = False
     try:
@@ -438,6 +544,9 @@ async def vla_train_step(
             from ..backend.model_actor_supervisor import domain_key_for_training_base_model
 
             domain_key = domain_key_for_training_base_model(base_model)
+        if billing_auth is not None:
+            scheduler_extra["gateway_auth"] = _gateway_auth_dict(billing_auth)
+        scheduler_extra["billing_observation_input"] = billing_input
         await training_routes._enqueue_training_request_with_trace(
             route_start_s=route_start_s,
             request_id=request_id,
@@ -547,9 +656,27 @@ async def interpolate_checkpoints(
     request = request.model_copy(update={"source_paths": resolved_sources})
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
+    billing_auth = build_billing_auth_context(http_request, fallback_request_id=request_id)
+    billing_input = {
+        "charge_item": "checkpoint_storage",
+        "quantity": max(1, len(request.source_paths)),
+        "unit": "checkpoint_inputs",
+        "route": "mint.interpolate_checkpoints",
+        "dimension": "checkpoint",
+        "model": None,
+        "metadata": {
+            "checkpoint_count": len(request.source_paths),
+            "output_path": request.output_path,
+            "output_checkpoint_type": request.output_checkpoint_type or "sampler",
+        },
+    }
     try:
         from ..backend.model_actor_supervisor import domain_key_for_internal_runtime
 
+        extra = {
+            "gateway_auth": _gateway_auth_dict(billing_auth),
+            "billing_observation_input": billing_input,
+        }
         await _enqueue_mint_model_work(
             request_id=request_id,
             op="mint.interpolate_checkpoints",
@@ -566,6 +693,7 @@ async def interpolate_checkpoints(
             ),
             http_request=http_request,
             user_id=user_id,
+            extra=extra,
         )
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Failed to enqueue interpolate_checkpoints request: {e}")
@@ -577,6 +705,8 @@ async def _do_interpolate_checkpoints(
     request_id: str,
     request: InterpolateCheckpointsRequest,
     user_id: str | None,
+    gateway_auth: dict | None = None,
+    billing_observation_input: dict | None = None,
 ) -> None:
     claimed_ckpt_id: str | None = None
     mirror_started = False
@@ -656,6 +786,11 @@ async def _do_interpolate_checkpoints(
                 "mirror_status": MIRROR_STATUS_PENDING,
                 "type": "mint_interpolate_checkpoints",
             },
+            billing_observations=billing_observations_from_input(
+                gateway_auth=gateway_auth,
+                request_id=request_id,
+                billing_input=billing_observation_input,
+            ),
         )
     except Exception as e:
         if not mirror_started:
@@ -788,6 +923,8 @@ async def _do_vla_train_step(
     request_id: str,
     request: VLATrainStepRequest,
     user_id: str | None,
+    gateway_auth: dict | None = None,
+    billing_observation_input: dict | None = None,
 ) -> None:
     from . import training as training_routes
 
@@ -807,4 +944,13 @@ async def _do_vla_train_step(
             training_manager.mark_inflight(request.model_id, -1)
         return
 
-    await training_routes._do_train_step(request_id, internal_request, user_id)
+    if billing_observation_input is None:
+        await training_routes._do_train_step(request_id, internal_request, user_id, gateway_auth)
+    else:
+        await training_routes._do_train_step(
+            request_id,
+            internal_request,
+            user_id,
+            gateway_auth,
+            billing_observation_input=billing_observation_input,
+        )
