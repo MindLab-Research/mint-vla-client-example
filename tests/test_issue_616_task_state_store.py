@@ -13,6 +13,7 @@ from mint_server.backend.task_state_store import (
     TaskStateStore,
     TaskStateStoreClient,
     _TaskStateStoreActor,
+    billing_observations_from_input,
     build_billing_observation,
 )
 
@@ -1016,6 +1017,40 @@ def test_billing_outbox_failure_terminal_is_not_billed() -> None:
         store.close()
 
 
+def test_billing_observations_from_input_rejects_malformed_input() -> None:
+    gateway_auth = {
+        "user_id": "user-1",
+        "user_role": "user",
+        "account_id": "acct-1",
+        "apikey_id": "key-1",
+        "request_id": "gw-1",
+    }
+    with pytest.raises(ValueError, match="missing required keys"):
+        billing_observations_from_input(
+            gateway_auth=gateway_auth,
+            request_id="req-bad",
+            billing_input={
+                "charge_item": "sampling",
+                "quantity": 1,
+                "unit": "tokens",
+                "route": "sampling.asample",
+            },
+        )
+    with pytest.raises(ValueError, match="metadata"):
+        billing_observations_from_input(
+            gateway_auth=gateway_auth,
+            request_id="req-bad-meta",
+            billing_input={
+                "charge_item": "sampling",
+                "quantity": 1,
+                "unit": "tokens",
+                "route": "sampling.asample",
+                "dimension": "sample",
+                "metadata": "not-a-dict",
+            },
+        )
+
+
 def test_billing_outbox_write_failure_sets_underbilling_signal(monkeypatch) -> None:
     store = TaskStateStore.in_memory()
     try:
@@ -1638,12 +1673,28 @@ def test_task_future_service_stages_payload_metadata_before_direct_resolve(tmp_p
             async def async_complete_task_success(self, **kwargs):
                 return store.complete_task_success(**kwargs)
 
+            async def async_append_billing_outbox(self, **_kwargs):
+                raise AssertionError("billing must be committed through complete_task_success")
+
         service = TaskFutureService(
             task_state_client=_LocalTaskStateClient(),
             payload_store=TaskPayloadStore(tmp_path),
         )
 
-        asyncio.run(service.async_resolve("req-direct", {"ok": True}))
+        observation = build_billing_observation(
+            account_id="acct-1",
+            apikey_id="key-1",
+            request_id="req-direct",
+            charge_item="sampling",
+            quantity=3,
+            unit="tokens",
+            route="sampling.asample",
+            dimension="sample",
+            model="Qwen/Test",
+            observed_at=2.0,
+        )
+
+        asyncio.run(service.async_resolve("req-direct", {"ok": True}, billing_observations=[observation]))
 
         assert observed_updates[0]["request_id"] == "req-direct"
         assert observed_updates[0]["staged_payload_path"].startswith(str(tmp_path / "re" / "req-direct" / "future__"))
@@ -1657,6 +1708,10 @@ def test_task_future_service_stages_payload_metadata_before_direct_resolve(tmp_p
         assert record["staged_payload_path"] is None
         assert record["metadata"]["payload_state"] == "committed"
         assert record["metadata"]["staged_payload_path"] is None
+        assert record["metadata"]["billing_status"] == "outboxed"
+        claimed = store.claim_billing_outbox(claim_id="claim-direct", limit=10, lease_ttl_s=30.0)
+        assert len(claimed) == 1
+        assert claimed[0]["event"]["request_id"] == "req-direct"
     finally:
         store.close()
 

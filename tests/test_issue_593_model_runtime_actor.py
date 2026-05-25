@@ -136,13 +136,14 @@ class _FakeTaskFutureService:
             raise KeyError(request_id)
         return {"model_work_attempt_id": "current-attempt"}
 
-    async def async_resolve(self, request_id: str, result):
+    async def async_resolve(self, request_id: str, result, *, billing_observations=None):
         buffer = get_current_model_work_finalize_buffer()
         if buffer is not None:
             buffer.finalization = ModelWorkFinalize(
                 kind="resolve",
                 request_id=str(request_id),
                 payload=result,
+                billing_observations=billing_observations,
             )
             return
         if self.fail_terminal_write:
@@ -294,9 +295,27 @@ async def test_issue_616_model_runtime_commits_success_to_task_state_store(tmp_p
     task_futures = _FakeTaskFutureService(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
     task_state_store = _FakeTaskStateStore()
     payload_store = TaskPayloadStore(tmp_path)
+    billing_observations = [
+        {
+            "account_id": "acct-1",
+            "apikey_id": "key-1",
+            "request_id": lease["item"]["request_id"],
+            "charge_item": "sampling",
+            "quantity": 3,
+            "unit": "tokens",
+            "route": "sampling.asample",
+            "dimension": "sample",
+            "model": "Qwen/Test",
+            "metadata": {},
+        }
+    ]
 
     async def _executor(_lease: dict) -> None:
-        await task_futures.async_resolve(_lease["item"]["request_id"], {"ok": True})
+        await task_futures.async_resolve(
+            _lease["item"]["request_id"],
+            {"ok": True},
+            billing_observations=billing_observations,
+        )
 
     actor = ModelRuntimeActor(
         domain_key="vllm:model-a",
@@ -322,6 +341,7 @@ async def test_issue_616_model_runtime_commits_success_to_task_state_store(tmp_p
     assert success["runtime_generation"] == 3
     assert success["result_checksum"].startswith("sha256:")
     assert success["result_size_bytes"] > 0
+    assert success["billing_observations"] == billing_observations
     assert payload_store.read_json_payload(
         path=success["result_path"],
         expected_checksum=success["result_checksum"],

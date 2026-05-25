@@ -214,29 +214,31 @@ def billing_observations_from_input(
 ) -> list[dict[str, Any]]:
     if not isinstance(billing_input, dict):
         return []
-    try:
-        from ..gateway_auth import GatewayAuthContext
+    from ..gateway_auth import GatewayAuthContext
 
-        auth_ctx = GatewayAuthContext(**gateway_auth) if gateway_auth else None
-        metadata = billing_input.get("metadata")
-        return billing_observations_from_auth(
-            auth_ctx=auth_ctx,
-            request_id=request_id,
-            charge_item=str(billing_input["charge_item"]),
-            quantity=int(billing_input["quantity"]),
-            unit=str(billing_input["unit"]),
-            route=str(billing_input["route"]),
-            dimension=str(billing_input["dimension"]),
-            model=(
-                None
-                if billing_input.get("model") in (None, "")
-                else str(billing_input.get("model"))
-            ),
-            metadata=metadata if isinstance(metadata, dict) else None,
-        )
-    except Exception:
-        _inc_billing_metric("write_error", 1)
-        return []
+    required = ("charge_item", "quantity", "unit", "route", "dimension")
+    missing = [key for key in required if key not in billing_input]
+    if missing:
+        raise ValueError(f"billing input missing required keys: {', '.join(missing)}")
+    metadata = billing_input.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        raise ValueError("billing input metadata must be a dict")
+    auth_ctx = GatewayAuthContext(**gateway_auth) if gateway_auth else None
+    return billing_observations_from_auth(
+        auth_ctx=auth_ctx,
+        request_id=request_id,
+        charge_item=str(billing_input["charge_item"]),
+        quantity=int(billing_input["quantity"]),
+        unit=str(billing_input["unit"]),
+        route=str(billing_input["route"]),
+        dimension=str(billing_input["dimension"]),
+        model=(
+            None
+            if billing_input.get("model") in (None, "")
+            else str(billing_input.get("model"))
+        ),
+        metadata=metadata,
+    )
 
 
 def _now(now: float | None = None) -> float:
@@ -3822,7 +3824,6 @@ class TaskStateStoreClient:
         return await self._dict_call("future_stage_payload", **kwargs)
 
     async def async_future_complete_task_success(self, **kwargs: Any) -> dict[str, Any]:
-        kwargs.pop("billing_observations", None)
         return await self._dict_call("future_complete_task_success", **kwargs)
 
     async def async_future_complete_task_failure(self, **kwargs: Any) -> dict[str, Any]:
@@ -3877,7 +3878,6 @@ class TaskStateStoreClient:
         return await self._dict_call("future_begin_finalize", **kwargs)
 
     async def async_future_commit_finalize_success(self, **kwargs: Any) -> dict[str, Any]:
-        kwargs.pop("billing_observations", None)
         return await self._dict_call("future_commit_finalize_success", **kwargs)
 
     async def async_future_commit_finalize_failure(self, **kwargs: Any) -> dict[str, Any]:
@@ -4456,23 +4456,6 @@ class TaskFutureService:
             attempt_id=attempt_id,
             payload=result,
         )
-        billing_metadata: dict[str, Any] = {}
-        if billing_observations:
-            try:
-                billing_result = await self._task_state.async_append_billing_outbox(
-                    observations=billing_observations,
-                    source="task_terminal",
-                )
-                if not bool(billing_result.get("ok")):
-                    billing_metadata = {"billing_status": "dropped", "billing_error": billing_result}
-                elif int(billing_result.get("inserted") or 0) > 0:
-                    billing_metadata = {
-                        "billing_status": "outboxed",
-                        "billing_observation_count": int(billing_result.get("inserted") or 0),
-                    }
-            except Exception as e:
-                _inc_billing_metric("write_error", 1)
-                billing_metadata = {"billing_status": "dropped", "billing_error": f"{type(e).__name__}: {e}"}
         await self._future_state.async_complete_task_success(
             request_id=str(request_id),
             result_path=str(payload["path"]),
@@ -4483,8 +4466,8 @@ class TaskFutureService:
                 "final_status": FutureStatus.DONE.value,
                 "payload_state": "committed",
                 "staged_payload_path": None,
-                **billing_metadata,
             },
+            billing_observations=billing_observations,
         )
 
     async def async_fail(self, request_id: str, error: str) -> None:

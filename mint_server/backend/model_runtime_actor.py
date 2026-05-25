@@ -515,22 +515,6 @@ class ModelRuntimeActor:
             attempt_id=self._payload_attempt_id_for_lease(lease),
             payload=payload,
         )
-        billing_metadata: dict[str, Any] = {}
-        if billing_observations:
-            try:
-                billing_result = await self._task_state_store.async_append_billing_outbox(
-                    observations=billing_observations,
-                    source="model_work_terminal",
-                )
-                if not bool(billing_result.get("ok")):
-                    billing_metadata = {"billing_status": "dropped", "billing_error": billing_result}
-                elif int(billing_result.get("inserted") or 0) > 0:
-                    billing_metadata = {
-                        "billing_status": "outboxed",
-                        "billing_observation_count": int(billing_result.get("inserted") or 0),
-                    }
-            except Exception as e:
-                billing_metadata = {"billing_status": "dropped", "billing_error": f"{type(e).__name__}: {e}"}
         await self._task_state_future_call(
             "commit_finalize_success",
             request_id=request_id,
@@ -541,7 +525,7 @@ class ModelRuntimeActor:
             result_path=str(payload_meta["path"]),
             result_checksum=str(payload_meta["checksum"]),
             result_size_bytes=int(payload_meta["size_bytes"]),
-            metadata=billing_metadata,
+            billing_observations=billing_observations,
         )
 
     async def _commit_task_state_failure(
