@@ -1071,6 +1071,57 @@ def test_billing_outbox_not_written_when_terminal_success_rejected(monkeypatch) 
         store.close()
 
 
+def test_billing_outbox_idempotent_terminal_retry_writes_missing_billing() -> None:
+    store = TaskStateStore.in_memory()
+    try:
+        store.ensure_task(
+            request_id="future-idempotent-bill",
+            op="sampling.asample",
+            domain_key="future:default",
+            metadata={},
+            status="running",
+            now=100.0,
+        )
+        store.complete_task_success(
+            request_id="future-idempotent-bill",
+            result_path="/tmp/result.json",
+            result_checksum="sha256:abc",
+            result_size_bytes=17,
+            metadata={"done_at": 101.0},
+            now=101.0,
+        )
+        assert store.billing_outbox_stats(now=102.0)["by_status"] == {}
+
+        observation = build_billing_observation(
+            account_id="acct-1",
+            apikey_id="key-1",
+            request_id="future-idempotent-bill",
+            charge_item="sampling",
+            quantity=7,
+            unit="tokens",
+            route="sampling.asample",
+            dimension="sample",
+            model="Qwen/Test",
+            observed_at=103.0,
+        )
+        repeated = store.complete_task_success(
+            request_id="future-idempotent-bill",
+            result_path="/tmp/result.json",
+            result_checksum="sha256:abc",
+            result_size_bytes=17,
+            metadata={"done_at": 101.0},
+            billing_observations=[observation],
+            now=104.0,
+        )
+        assert repeated["idempotent"] is True
+        assert repeated["record"]["metadata"]["billing_status"] == "outboxed"
+        claimed = store.claim_billing_outbox(claim_id="claim-idempotent", limit=10, lease_ttl_s=30.0)
+        assert len(claimed) == 1
+        assert claimed[0]["event"]["request_id"] == "future-idempotent-bill"
+    finally:
+        store.close()
+
+
 def test_billing_observations_from_input_rejects_malformed_input() -> None:
     gateway_auth = {
         "user_id": "user-1",
@@ -1775,6 +1826,58 @@ def test_task_future_service_stages_payload_metadata_before_direct_resolve(tmp_p
         assert claimed[0]["event"]["request_id"] == "req-direct"
     finally:
         store.close()
+
+
+def test_task_state_actor_future_success_preserves_billing_observations(tmp_path) -> None:
+    from mint_server.backend.future_state_store import FutureStateStore
+
+    actor = _TaskStateStoreActor(str(tmp_path / "task-state.sqlite3"))
+    actor._future_store = FutureStateStore.in_memory()
+    try:
+        actor.future_ensure_task(
+            request_id="future-actor-bill",
+            op="sampling.asample",
+            domain_key="future:default",
+            metadata={},
+            status="running",
+            now=100.0,
+        )
+        actor.future_stage_payload(
+            request_id="future-actor-bill",
+            staged_payload_path="/tmp/future-actor-result.json",
+            metadata={"staged_payload_path": "/tmp/future-actor-result.json"},
+            now=101.0,
+        )
+        observation = build_billing_observation(
+            account_id="acct-1",
+            apikey_id="key-1",
+            request_id="future-actor-bill",
+            charge_item="sampling",
+            quantity=11,
+            unit="tokens",
+            route="sampling.asample",
+            dimension="sample",
+            model="Qwen/Test",
+            observed_at=102.0,
+        )
+        out = actor.future_complete_task_success(
+            request_id="future-actor-bill",
+            result_path="/tmp/future-actor-result.json",
+            result_checksum="sha256:abc",
+            result_size_bytes=17,
+            metadata={"done_at": 103.0},
+            billing_observations=[observation],
+            now=103.0,
+        )
+
+        assert out["record"]["status"] == "done"
+        assert out["record"]["metadata"]["billing_status"] == "outboxed"
+        claimed = actor.claim_billing_outbox(claim_id="claim-future-actor", limit=10, lease_ttl_s=30.0)
+        assert len(claimed) == 1
+        assert claimed[0]["event"]["request_id"] == "future-actor-bill"
+        assert claimed[0]["event"]["quantity"] == 11
+    finally:
+        actor.close()
 
 
 def test_task_state_store_owns_gateway_routes() -> None:
