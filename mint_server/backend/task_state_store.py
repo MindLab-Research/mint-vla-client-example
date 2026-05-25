@@ -206,6 +206,39 @@ def billing_observations_from_auth(
     ]
 
 
+def billing_observations_from_input(
+    *,
+    gateway_auth: dict | None,
+    request_id: str,
+    billing_input: dict | None,
+) -> list[dict[str, Any]]:
+    if not isinstance(billing_input, dict):
+        return []
+    try:
+        from ..gateway_auth import GatewayAuthContext
+
+        auth_ctx = GatewayAuthContext(**gateway_auth) if gateway_auth else None
+        metadata = billing_input.get("metadata")
+        return billing_observations_from_auth(
+            auth_ctx=auth_ctx,
+            request_id=request_id,
+            charge_item=str(billing_input["charge_item"]),
+            quantity=int(billing_input["quantity"]),
+            unit=str(billing_input["unit"]),
+            route=str(billing_input["route"]),
+            dimension=str(billing_input["dimension"]),
+            model=(
+                None
+                if billing_input.get("model") in (None, "")
+                else str(billing_input.get("model"))
+            ),
+            metadata=metadata if isinstance(metadata, dict) else None,
+        )
+    except Exception:
+        _inc_billing_metric("write_error", 1)
+        return []
+
+
 def _now(now: float | None = None) -> float:
     return time.time() if now is None else float(now)
 

@@ -187,21 +187,17 @@ def test_mint_action_route_enqueues_billing_observation(monkeypatch) -> None:
 
     assert resp.status_code == 200, resp.text
     queued = scheduler.calls[0]
-    observations = queued["extra"]["billing_observations"]
-    assert len(observations) == 1
-    observation = observations[0]
-    assert observation["account_id"] == _ACCOUNT_ID
-    assert observation["apikey_id"] == _APIKEY_ID
-    assert observation["charge_item"] == "inference"
-    assert observation["quantity"] == 323
-    assert observation["request_id"] == "gateway-request-1"
-    assert observation["unit"] == "estimated_tokens"
-    assert observation["route"] == "mint.action.act"
-    assert observation["dimension"] == "action"
-    assert observation["model"] == "openpi/pi0-fast-libero-low-mem-finetune"
-    assert observation["metadata"]["input_tokens"] == 259
-    assert observation["metadata"]["action_output_tokens"] == 64
-    assert observation["metadata"]["action_token_budget"] == 64
+    assert "billing_observations" not in queued["extra"]
+    billing_input = queued["extra"]["billing_observation_input"]
+    assert billing_input["charge_item"] == "inference"
+    assert billing_input["quantity"] == 323
+    assert billing_input["unit"] == "estimated_tokens"
+    assert billing_input["route"] == "mint.action.act"
+    assert billing_input["dimension"] == "action"
+    assert billing_input["model"] == "openpi/pi0-fast-libero-low-mem-finetune"
+    assert billing_input["metadata"]["input_tokens"] == 259
+    assert billing_input["metadata"]["action_output_tokens"] == 64
+    assert billing_input["metadata"]["action_token_budget"] == 64
     assert queued["extra"]["gateway_auth"]["apikey_id"] == _APIKEY_ID
 
 
@@ -429,16 +425,15 @@ def test_mint_vla_train_step_route_enqueues_expected_request(monkeypatch) -> Non
     assert queued_meta["op"] == "mint.vla.train_step"
     assert queued_meta["model_id"] == "model-123"
     assert queued_meta["queue_state"] == "queued"
-    observations = queued["extra"]["billing_observations"]
-    assert len(observations) == 1
-    observation = observations[0]
-    assert observation["charge_item"] == "training"
-    assert observation["quantity"] == 261
-    assert observation["unit"] == "estimated_tokens"
-    assert observation["route"] == "mint.vla.train_step"
-    assert observation["dimension"] == "train"
-    assert observation["model"] == "openpi/pi0-fast-libero-low-mem-finetune"
-    assert observation["metadata"] == {
+    assert "billing_observations" not in queued["extra"]
+    billing_input = queued["extra"]["billing_observation_input"]
+    assert billing_input["charge_item"] == "training"
+    assert billing_input["quantity"] == 261
+    assert billing_input["unit"] == "estimated_tokens"
+    assert billing_input["route"] == "mint.vla.train_step"
+    assert billing_input["dimension"] == "train"
+    assert billing_input["model"] == "openpi/pi0-fast-libero-low-mem-finetune"
+    assert billing_input["metadata"] == {
         "model_id": "model-123",
         "loss_fn": "cross_entropy",
         "datum_count": 1,
@@ -593,13 +588,13 @@ def test_model_work_dispatch_executes_mint_vla_train_step(monkeypatch) -> None:
         request,
         user_id: str | None,
         gateway_auth=None,
-        billing_observations=None,
+        billing_observation_input=None,
     ) -> None:
         captured["request_id"] = request_id
         captured["request"] = request
         captured["user_id"] = user_id
         captured["gateway_auth"] = gateway_auth
-        captured["billing_observations"] = billing_observations
+        captured["billing_observation_input"] = billing_observation_input
 
     from mint_server.routes import mint as mint_routes
 
@@ -629,7 +624,7 @@ def test_model_work_dispatch_executes_mint_vla_train_step(monkeypatch) -> None:
         user_id="user-a",
         extra={
             "gateway_auth": {"account_id": "acct", "apikey_id": "key", "request_id": "gw-req"},
-            "billing_observations": [{"charge_item": "training", "quantity": 5}],
+            "billing_observation_input": {"charge_item": "training", "quantity": 5},
         },
     )
 
@@ -639,7 +634,7 @@ def test_model_work_dispatch_executes_mint_vla_train_step(monkeypatch) -> None:
     assert captured["user_id"] == "user-a"
     assert captured["request"].model_id == "model-123"
     assert captured["gateway_auth"]["apikey_id"] == "key"
-    assert captured["billing_observations"] == [{"charge_item": "training", "quantity": 5}]
+    assert captured["billing_observation_input"] == {"charge_item": "training", "quantity": 5}
 
 
 def test_model_work_dispatch_executes_mint_action_with_billing(monkeypatch) -> None:
@@ -648,10 +643,18 @@ def test_model_work_dispatch_executes_mint_action_with_billing(monkeypatch) -> N
 
     captured: dict[str, object] = {}
 
-    async def _fake_do_act(request_id: str, request, billing_observations=None) -> None:
+    async def _fake_do_act(
+        request_id: str,
+        request,
+        billing_observations=None,
+        gateway_auth=None,
+        billing_observation_input=None,
+    ) -> None:
         captured["request_id"] = request_id
         captured["request"] = request
         captured["billing_observations"] = billing_observations
+        captured["gateway_auth"] = gateway_auth
+        captured["billing_observation_input"] = billing_observation_input
 
     from mint_server.routes import action_sampling
 
@@ -669,14 +672,19 @@ def test_model_work_dispatch_executes_mint_action_with_billing(monkeypatch) -> N
             }
         ).encode("utf-8"),
         user_id="user-a",
-        extra={"billing_observations": [{"charge_item": "inference", "quantity": 67}]},
+        extra={
+            "gateway_auth": {"account_id": "acct", "apikey_id": "key", "request_id": "gw-act"},
+            "billing_observation_input": {"charge_item": "inference", "quantity": 67},
+        },
     )
 
     asyncio.run(dispatch.execute_model_work_item(item))
 
     assert captured["request_id"] == "act-1"
     assert captured["request"].action_session_id == "action-session-1"
-    assert captured["billing_observations"] == [{"charge_item": "inference", "quantity": 67}]
+    assert captured["billing_observations"] is None
+    assert captured["gateway_auth"]["apikey_id"] == "key"
+    assert captured["billing_observation_input"] == {"charge_item": "inference", "quantity": 67}
 
 
 def test_mint_interpolate_route_enqueues_expected_request(monkeypatch) -> None:
@@ -737,15 +745,14 @@ def test_mint_interpolate_route_enqueues_expected_request(monkeypatch) -> None:
     assert isinstance(queued_meta["queued_at"], float)
     assert queued_meta["checkpoint_count"] == 2
     assert queued_meta["output_path"] == "ema-0010"
-    observations = queued["extra"]["billing_observations"]
-    assert len(observations) == 1
-    observation = observations[0]
-    assert observation["charge_item"] == "checkpoint_storage"
-    assert observation["quantity"] == 2
-    assert observation["unit"] == "checkpoint_inputs"
-    assert observation["route"] == "mint.interpolate_checkpoints"
-    assert observation["dimension"] == "checkpoint"
-    assert observation["metadata"] == {
+    assert "billing_observations" not in queued["extra"]
+    billing_input = queued["extra"]["billing_observation_input"]
+    assert billing_input["charge_item"] == "checkpoint_storage"
+    assert billing_input["quantity"] == 2
+    assert billing_input["unit"] == "checkpoint_inputs"
+    assert billing_input["route"] == "mint.interpolate_checkpoints"
+    assert billing_input["dimension"] == "checkpoint"
+    assert billing_input["metadata"] == {
         "checkpoint_count": 2,
         "output_path": "ema-0010",
         "output_checkpoint_type": "sampler",
@@ -818,13 +825,30 @@ def test_mint_interpolate_do_path_claims_checkpoint_and_writes_ckpt_id(monkeypat
         retry=True,
     )
 
-    billing_observations = [{"charge_item": "checkpoint_storage", "quantity": 2}]
+    gateway_auth = {
+        "user_id": _USER_ID,
+        "user_role": "user",
+        "account_id": _ACCOUNT_ID,
+        "apikey_id": _APIKEY_ID,
+        "request_id": "gateway-request-1",
+        "cap_write": True,
+    }
+    billing_input = {
+        "charge_item": "checkpoint_storage",
+        "quantity": 2,
+        "unit": "checkpoint_inputs",
+        "route": "mint.interpolate_checkpoints",
+        "dimension": "checkpoint",
+        "model": None,
+        "metadata": {"checkpoint_count": 2},
+    }
     asyncio.run(
         mint_routes._do_interpolate_checkpoints(
             "req-interp-1",
             request,
             "owner-a",
-            billing_observations,
+            gateway_auth,
+            billing_input,
         )
     )
 
@@ -836,7 +860,14 @@ def test_mint_interpolate_do_path_claims_checkpoint_and_writes_ckpt_id(monkeypat
     assert written["metadata"]["ckpt_id"] == "ckpt-rec-1"
     assert "created_at" in written["metadata"]
     assert task_futures.failed == []
-    assert task_futures.billing_observations["req-interp-1"] == billing_observations
+    observations = task_futures.billing_observations["req-interp-1"]
+    assert len(observations) == 1
+    assert observations[0]["account_id"] == _ACCOUNT_ID
+    assert observations[0]["apikey_id"] == _APIKEY_ID
+    assert observations[0]["charge_item"] == "checkpoint_storage"
+    assert observations[0]["quantity"] == 2
+    assert observations[0]["route"] == "mint.interpolate_checkpoints"
+    assert observations[0]["metadata"] == {"checkpoint_count": 2}
     assert task_futures.resolved == [
         (
             "req-interp-1",

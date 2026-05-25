@@ -48,6 +48,17 @@ def _billing_observation(
     }
 
 
+def _gateway_auth() -> dict:
+    return {
+        "user_id": "user-1",
+        "user_role": "user",
+        "account_id": "acct-1",
+        "apikey_id": "key-1",
+        "request_id": "gateway-req-1",
+        "cap_write": True,
+    }
+
+
 def _commit_success_with_observations(*, request_id: str, observations: list[dict]) -> list[dict]:
     store = TaskStateStore.in_memory()
     try:
@@ -141,24 +152,34 @@ def test_issue_630_action_executor_attaches_billing_observation_on_success(monke
     monkeypatch.setattr(action_sampling, "task_futures", task_futures)
     monkeypatch.setattr(action_sampling, "action_session_manager", _ActionSessionManager())
 
-    observation = _billing_observation(
-        request_id="act-success-1",
-        charge_item="inference",
-        quantity=323,
-        route="mint.action.act",
-        dimension="action",
-    )
+    billing_input = {
+        "charge_item": "inference",
+        "quantity": 323,
+        "unit": "estimated_tokens",
+        "route": "mint.action.act",
+        "dimension": "action",
+        "model": "openpi/pi0-fast-libero-low-mem-finetune",
+        "metadata": {"issue": 630},
+    }
     request = ActRequest(
         action_session_id="action-session-1",
         observation=ModelInput.from_ints([1, 2, 3]),
         extra_inputs={},
     )
 
-    anyio.run(action_sampling._do_act, "act-success-1", request, [observation])
+    anyio.run(action_sampling._do_act, "act-success-1", request, None, _gateway_auth(), billing_input)
 
     assert task_futures.failed == {}
     assert task_futures.resolved["act-success-1"]["type"] == "act"
-    assert task_futures.billing_observations["act-success-1"] == [observation]
+    observations = task_futures.billing_observations["act-success-1"]
+    assert len(observations) == 1
+    assert observations[0]["account_id"] == "acct-1"
+    assert observations[0]["apikey_id"] == "key-1"
+    assert observations[0]["request_id"] == "gateway-req-1"
+    assert observations[0]["charge_item"] == "inference"
+    assert observations[0]["quantity"] == 323
+    assert observations[0]["route"] == "mint.action.act"
+    assert observations[0]["dimension"] == "action"
 
 
 def test_issue_630_vla_train_step_uses_mint_billing_observation_override(monkeypatch) -> None:
@@ -194,13 +215,15 @@ def test_issue_630_vla_train_step_uses_mint_billing_observation_override(monkeyp
 
     monkeypatch.setattr(training_routes, "_materialize_training_session_for_stateful_use", _materialize)
 
-    observation = _billing_observation(
-        request_id="mint-rl-train-override",
-        charge_item="training",
-        quantity=261,
-        route="mint.vla.train_step",
-        dimension="train",
-    )
+    billing_input = {
+        "charge_item": "training",
+        "quantity": 261,
+        "unit": "estimated_tokens",
+        "route": "mint.vla.train_step",
+        "dimension": "train",
+        "model": "openpi/pi0-fast-libero-low-mem-finetune",
+        "metadata": {"issue": 630},
+    }
     payload = {
         "model_id": "model-rl",
         "forward_backward_input": {
@@ -222,9 +245,18 @@ def test_issue_630_vla_train_step_uses_mint_billing_observation_override(monkeyp
         "mint-rl-train-override",
         request,
         "user-a",
+        _gateway_auth(),
         None,
-        [observation],
+        billing_input,
     )
 
     assert task_futures.failed == {}
-    assert task_futures.billing_observations["mint-rl-train-override"] == [observation]
+    observations = task_futures.billing_observations["mint-rl-train-override"]
+    assert len(observations) == 1
+    assert observations[0]["account_id"] == "acct-1"
+    assert observations[0]["apikey_id"] == "key-1"
+    assert observations[0]["request_id"] == "gateway-req-1"
+    assert observations[0]["charge_item"] == "training"
+    assert observations[0]["quantity"] == 261
+    assert observations[0]["route"] == "mint.vla.train_step"
+    assert observations[0]["dimension"] == "train"

@@ -347,7 +347,8 @@ async def execute_model_work_item(item: Any, *, component: str = "model_work_dis
                 item.request_id,
                 req,
                 item.user_id,
-                (item.extra or {}).get("billing_observations"),
+                (item.extra or {}).get("gateway_auth"),
+                (item.extra or {}).get("billing_observation_input"),
             )
 
         return await run_async_with_otel_span(
@@ -381,7 +382,7 @@ async def execute_model_work_item(item: Any, *, component: str = "model_work_dis
                 req,
                 item.user_id,
                 (item.extra or {}).get("gateway_auth"),
-                (item.extra or {}).get("billing_observations"),
+                (item.extra or {}).get("billing_observation_input"),
             )
 
         return await run_async_with_otel_span(
@@ -399,7 +400,8 @@ async def execute_model_work_item(item: Any, *, component: str = "model_work_dis
             await action_sampling._do_act(
                 item.request_id,
                 req,
-                (item.extra or {}).get("billing_observations"),
+                gateway_auth=(item.extra or {}).get("gateway_auth"),
+                billing_observation_input=(item.extra or {}).get("billing_observation_input"),
             )
 
         return await run_async_with_otel_span(

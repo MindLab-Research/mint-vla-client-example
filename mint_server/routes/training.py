@@ -55,7 +55,12 @@ from ..logging_context import (
     start_as_current_span_from_traceparent,
 )
 
-from ..backend.task_state_store import FutureStatus, billing_observations_from_auth, task_futures
+from ..backend.task_state_store import (
+    FutureStatus,
+    billing_observations_from_auth,
+    billing_observations_from_input,
+    task_futures,
+)
 from ..checkpoint_index import (
     CheckpointAlreadyExistsError,
     CheckpointAlreadyFailedError,
@@ -2762,6 +2767,7 @@ async def _do_train_step(
     user_id: str | None,
     gateway_auth: dict | None = None,
     billing_observations: list[dict] | None = None,
+    billing_observation_input: dict | None = None,
 ) -> None:
     """Background task for train_step."""
     inflight_marked = False
@@ -2813,6 +2819,12 @@ async def _do_train_step(
             billing_observations=(
                 billing_observations
                 if billing_observations is not None
+                else billing_observations_from_input(
+                    gateway_auth=gateway_auth,
+                    request_id=request_id,
+                    billing_input=billing_observation_input,
+                )
+                if billing_observation_input is not None
                 else _build_training_billing_observations(
                     gateway_auth=gateway_auth,
                     request_id=request_id,

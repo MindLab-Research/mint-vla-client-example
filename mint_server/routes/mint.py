@@ -11,7 +11,7 @@ from fastapi import APIRouter, HTTPException, Request
 from ..auth_identity import can_bypass_ownership
 from ..auth_identity import get_user_data as _request_user_data
 from ..auth_identity import get_user_id as _request_user_id
-from ..backend.task_state_store import billing_observations_from_auth, task_futures
+from ..backend.task_state_store import billing_observations_from_input, task_futures
 from ..backend.mintx_ops import interpolate_checkpoints_to_dir
 from ..checkpoints import (
     MIRROR_STATUS_PENDING,
@@ -110,13 +110,11 @@ def _action_session_billing_metadata(action_session_id: str) -> dict[str, object
     return dict(metadata) if isinstance(metadata, dict) else {}
 
 
-def _action_billing_observations(
+def _action_billing_input(
     *,
-    auth_ctx: GatewayAuthContext | None,
-    request_id: str,
     action_session_id: str,
     request: VLAActRequest,
-) -> list[dict]:
+) -> dict:
     session_metadata = _action_session_billing_metadata(action_session_id)
     input_tokens = _model_input_estimated_tokens(request.observation.model_input)
     action_output_tokens = _positive_int(session_metadata.get("action_output_tokens"))
@@ -131,17 +129,15 @@ def _action_billing_observations(
             metadata[key] = value
     if request.temperature is not None:
         metadata["temperature"] = float(request.temperature)
-    return billing_observations_from_auth(
-        auth_ctx=auth_ctx,
-        request_id=request_id,
-        charge_item="inference",
-        quantity=max(1, int(input_tokens) + int(action_output_tokens)),
-        unit="estimated_tokens",
-        route="mint.action.act",
-        dimension="action",
-        model=str(session_metadata.get("base_model") or action_session_id),
-        metadata=metadata,
-    )
+    return {
+        "charge_item": "inference",
+        "quantity": max(1, int(input_tokens) + int(action_output_tokens)),
+        "unit": "estimated_tokens",
+        "route": "mint.action.act",
+        "dimension": "action",
+        "model": str(session_metadata.get("base_model") or action_session_id),
+        "metadata": metadata,
+    }
 
 
 def _vla_billing_token_count(data: list[VLADatum]) -> int:
@@ -447,18 +443,17 @@ async def act(
     request_json = queued_request.model_dump_json().encode("utf-8")
     request_id = f"act_{uuid.uuid4().hex}"
     billing_auth = build_billing_auth_context(http_request, fallback_request_id=request_id)
-    billing_observations = _action_billing_observations(
-        auth_ctx=billing_auth,
-        request_id=request_id,
+    billing_input = _action_billing_input(
         action_session_id=action_session_id,
         request=request,
     )
     try:
         from ..backend.model_actor_supervisor import domain_key_for_internal_runtime
 
-        extra = {"gateway_auth": _gateway_auth_dict(billing_auth)}
-        if billing_observations:
-            extra["billing_observations"] = billing_observations
+        extra = {
+            "gateway_auth": _gateway_auth_dict(billing_auth),
+            "billing_observation_input": billing_input,
+        }
         await _enqueue_mint_model_work(
             request_id=request_id,
             op="mint.action.act",
@@ -519,21 +514,19 @@ async def vla_train_step(
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
     billing_auth = build_billing_auth_context(http_request, fallback_request_id=request_id)
-    billing_observations = billing_observations_from_auth(
-        auth_ctx=billing_auth,
-        request_id=request_id,
-        charge_item="training",
-        quantity=_vla_billing_token_count(request.data),
-        unit="estimated_tokens",
-        route="mint.vla.train_step",
-        dimension="train",
-        model=base_model,
-        metadata={
+    billing_input = {
+        "charge_item": "training",
+        "quantity": _vla_billing_token_count(request.data),
+        "unit": "estimated_tokens",
+        "route": "mint.vla.train_step",
+        "dimension": "train",
+        "model": base_model,
+        "metadata": {
             "model_id": request.model_id,
             "loss_fn": request.loss_fn,
             "datum_count": len(request.data),
         },
-    )
+    }
 
     inflight_marked = False
     try:
@@ -553,8 +546,7 @@ async def vla_train_step(
             domain_key = domain_key_for_training_base_model(base_model)
         if billing_auth is not None:
             scheduler_extra["gateway_auth"] = _gateway_auth_dict(billing_auth)
-        if billing_observations:
-            scheduler_extra["billing_observations"] = billing_observations
+        scheduler_extra["billing_observation_input"] = billing_input
         await training_routes._enqueue_training_request_with_trace(
             route_start_s=route_start_s,
             request_id=request_id,
@@ -665,27 +657,26 @@ async def interpolate_checkpoints(
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
     billing_auth = build_billing_auth_context(http_request, fallback_request_id=request_id)
-    billing_observations = billing_observations_from_auth(
-        auth_ctx=billing_auth,
-        request_id=request_id,
-        charge_item="checkpoint_storage",
-        quantity=max(1, len(request.source_paths)),
-        unit="checkpoint_inputs",
-        route="mint.interpolate_checkpoints",
-        dimension="checkpoint",
-        model=None,
-        metadata={
+    billing_input = {
+        "charge_item": "checkpoint_storage",
+        "quantity": max(1, len(request.source_paths)),
+        "unit": "checkpoint_inputs",
+        "route": "mint.interpolate_checkpoints",
+        "dimension": "checkpoint",
+        "model": None,
+        "metadata": {
             "checkpoint_count": len(request.source_paths),
             "output_path": request.output_path,
             "output_checkpoint_type": request.output_checkpoint_type or "sampler",
         },
-    )
+    }
     try:
         from ..backend.model_actor_supervisor import domain_key_for_internal_runtime
 
-        extra = {"gateway_auth": _gateway_auth_dict(billing_auth)}
-        if billing_observations:
-            extra["billing_observations"] = billing_observations
+        extra = {
+            "gateway_auth": _gateway_auth_dict(billing_auth),
+            "billing_observation_input": billing_input,
+        }
         await _enqueue_mint_model_work(
             request_id=request_id,
             op="mint.interpolate_checkpoints",
@@ -714,7 +705,8 @@ async def _do_interpolate_checkpoints(
     request_id: str,
     request: InterpolateCheckpointsRequest,
     user_id: str | None,
-    billing_observations: list[dict] | None = None,
+    gateway_auth: dict | None = None,
+    billing_observation_input: dict | None = None,
 ) -> None:
     claimed_ckpt_id: str | None = None
     mirror_started = False
@@ -794,7 +786,11 @@ async def _do_interpolate_checkpoints(
                 "mirror_status": MIRROR_STATUS_PENDING,
                 "type": "mint_interpolate_checkpoints",
             },
-            billing_observations=billing_observations,
+            billing_observations=billing_observations_from_input(
+                gateway_auth=gateway_auth,
+                request_id=request_id,
+                billing_input=billing_observation_input,
+            ),
         )
     except Exception as e:
         if not mirror_started:
@@ -928,7 +924,7 @@ async def _do_vla_train_step(
     request: VLATrainStepRequest,
     user_id: str | None,
     gateway_auth: dict | None = None,
-    billing_observations: list[dict] | None = None,
+    billing_observation_input: dict | None = None,
 ) -> None:
     from . import training as training_routes
 
@@ -948,7 +944,7 @@ async def _do_vla_train_step(
             training_manager.mark_inflight(request.model_id, -1)
         return
 
-    if billing_observations is None:
+    if billing_observation_input is None:
         await training_routes._do_train_step(request_id, internal_request, user_id, gateway_auth)
     else:
         await training_routes._do_train_step(
@@ -956,5 +952,5 @@ async def _do_vla_train_step(
             internal_request,
             user_id,
             gateway_auth,
-            billing_observations=billing_observations,
+            billing_observation_input=billing_observation_input,
         )
