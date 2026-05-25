@@ -84,6 +84,15 @@ def _append_timing_event(
         f.write("\n")
 
 
+def _numeric_sum(recs: list[dict[str, Any]], key: str) -> float:
+    total = 0.0
+    for rec in recs:
+        value = rec.get(key)
+        if isinstance(value, (int, float)):
+            total += float(value)
+    return total
+
+
 def _timing_summary() -> dict[str, Any]:
     per_stage: dict[str, list[dict[str, Any]]] = {}
     for rec in _TIMING_EVENTS:
@@ -96,18 +105,29 @@ def _timing_summary() -> dict[str, Any]:
         count = len(elapsed)
         ok_count = sum(1 for rec in recs if rec.get("status") == "ok")
         error_count = sum(1 for rec in recs if rec.get("status") == "error")
-        stage_summaries.append(
-            {
-                "stage": stage,
-                "count": count,
-                "ok_count": ok_count,
-                "error_count": error_count,
-                "total_s": round(total_s, 3),
-                "avg_s": round(total_s / count, 3),
-                "p50_s": round(elapsed[count // 2], 3),
-                "max_s": round(elapsed[-1], 3),
-            }
-        )
+        summary = {
+            "stage": stage,
+            "count": count,
+            "ok_count": ok_count,
+            "error_count": error_count,
+            "total_s": round(total_s, 3),
+            "avg_s": round(total_s / count, 3),
+            "p50_s": round(elapsed[count // 2], 3),
+            "max_s": round(elapsed[-1], 3),
+        }
+        output_tokens = _numeric_sum(recs, "output_tokens")
+        if output_tokens > 0:
+            sequence_count = _numeric_sum(recs, "sequence_count")
+            hit_max_count = _numeric_sum(recs, "hit_max_count")
+            summary.update(
+                {
+                    "output_tokens": int(output_tokens),
+                    "sequence_count": int(sequence_count),
+                    "hit_max_count": int(hit_max_count),
+                    "tokens_per_s": round(output_tokens / total_s, 3) if total_s > 0 else 0.0,
+                }
+            )
+        stage_summaries.append(summary)
 
     stage_summaries.sort(key=lambda item: (-float(item["total_s"]), str(item["stage"])))
     return {
@@ -135,13 +155,14 @@ def _write_timing_reports() -> None:
         f"- wall_clock_s: `{summary['wall_clock_s']}`",
         f"- event_count: `{summary['event_count']}`",
         "",
-        "| stage | count | ok | error | total_s | avg_s | p50_s | max_s |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| stage | count | ok | error | total_s | avg_s | p50_s | max_s | output_tokens | tok/s | hit_max |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for item in summary["stages"]:
         md_lines.append(
             f"| {item['stage']} | {item['count']} | {item['ok_count']} | {item['error_count']} | "
-            f"{item['total_s']:.3f} | {item['avg_s']:.3f} | {item['p50_s']:.3f} | {item['max_s']:.3f} |"
+            f"{item['total_s']:.3f} | {item['avg_s']:.3f} | {item['p50_s']:.3f} | {item['max_s']:.3f} | "
+            f"{item.get('output_tokens', '')} | {item.get('tokens_per_s', '')} | {item.get('hit_max_count', '')} |"
         )
     with open(_TIMING_SUMMARY_MD_PATH, "w", encoding="utf-8") as f:
         f.write("\n".join(md_lines) + "\n")
@@ -199,6 +220,7 @@ def _result_with_heartbeat(
     stage_name: str | None = None,
     step_idx: int | None = None,
     extra: dict[str, Any] | None = None,
+    result_extra_fn: Any | None = None,
 ) -> Any:
     # Prefer polling an underlying concurrent Future so we can print heartbeats
     # even if the public `.result(timeout=...)` doesn't respect timeouts.
@@ -260,6 +282,13 @@ def _result_with_heartbeat(
     event_extra = dict(extra or {})
     event_extra["label"] = label
     event_extra["request_id"] = _LAST_REQUEST_ID_BY_TYPE.get(label)
+    if result_extra_fn is not None:
+        try:
+            computed_extra = result_extra_fn(result)
+        except Exception as e:
+            computed_extra = {"result_extra_error": f"{type(e).__name__}: {e}"}
+        if isinstance(computed_extra, dict):
+            event_extra.update(computed_extra)
     _append_timing_event(
         stage,
         elapsed_s=time.time() - start,
@@ -268,6 +297,20 @@ def _result_with_heartbeat(
         extra=event_extra,
     )
     return result
+
+
+def _sample_result_timing_extra(result: Any, *, max_tokens: int) -> dict[str, Any]:
+    sequences = list(getattr(result, "sequences", []) or [])
+    lengths = [len(getattr(seq, "tokens", []) or []) for seq in sequences]
+    output_tokens = sum(lengths)
+    hit_max_count = sum(1 for length in lengths if length >= int(max_tokens))
+    return {
+        "sequence_count": len(sequences),
+        "output_tokens": int(output_tokens),
+        "max_output_tokens": max(lengths) if lengths else 0,
+        "hit_max_count": int(hit_max_count),
+        "hit_max": bool(hit_max_count),
+    }
 
 
 def _install_tinker_future_debug() -> None:
@@ -1245,6 +1288,7 @@ if inference_only:
                 stage_name="sample",
                 step_idx=step,
                 extra={"mode": "inference_only"},
+                result_extra_fn=lambda result: _sample_result_timing_extra(result, max_tokens=MAX_TOKENS),
             )
             all_lat_s.append(time.time() - t0)
 
@@ -1333,6 +1377,7 @@ for step in range(NUM_RL_STEPS):
             stage_name="sample",
             step_idx=step,
             extra={"mode": "training"},
+            result_extra_fn=lambda result: _sample_result_timing_extra(result, max_tokens=MAX_TOKENS),
         )
 
         group_rewards = []
@@ -1544,6 +1589,7 @@ for question, correct in rl_test_problems:
         timeout_s=TIMEOUT_S,
         stage_name="eval_sample",
         extra={"question": question},
+        result_extra_fn=lambda sample_result: _sample_result_timing_extra(sample_result, max_tokens=16),
     )
 
     response_for_reward = tokenizer.decode(

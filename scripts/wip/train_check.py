@@ -35,6 +35,13 @@ ALL_MODELS = [
     "Qwen/Qwen3-30B-A3B-Instruct-2507",
     "Qwen/Qwen3-235B-A22B-Instruct-2507",
 ]
+DEFAULT_DEGRADATION_THRESHOLDS = {
+    "Qwen/Qwen3-0.6B": {"wall_clock_s": 180.0, "slowest_max_s": 90.0},
+    "Qwen/Qwen3-4B-Instruct-2507": {"wall_clock_s": 180.0, "slowest_max_s": 90.0},
+    "Qwen/Qwen3-4B-Thinking-2507": {"wall_clock_s": 180.0, "slowest_max_s": 90.0},
+    "Qwen/Qwen3-30B-A3B-Instruct-2507": {"wall_clock_s": 1800.0, "slowest_max_s": 900.0},
+    "Qwen/Qwen3-235B-A22B-Instruct-2507": {"wall_clock_s": 1500.0, "slowest_max_s": 900.0},
+}
 RUNNER = Path(".claude/skills/sanity-check/mint_rl_test_long.py")
 REQUEST_RE = re.compile(r"request_type=([A-Za-z0-9_]+)\s+request_id=([A-Za-z0-9_:-]+)")
 KV_RE = {
@@ -372,6 +379,102 @@ def extract_slowest_stage(timing: dict[str, object] | None) -> tuple[str | None,
     return best_name, best_max
 
 
+def _load_degradation_thresholds() -> dict[str, dict[str, float]]:
+    raw = os.environ.get("MINT_SANITY_DEGRADATION_THRESHOLDS_JSON", "").strip()
+    if not raw:
+        return DEFAULT_DEGRADATION_THRESHOLDS
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return DEFAULT_DEGRADATION_THRESHOLDS
+    if not isinstance(payload, dict):
+        return DEFAULT_DEGRADATION_THRESHOLDS
+    out: dict[str, dict[str, float]] = {}
+    for model, thresholds in payload.items():
+        if not isinstance(thresholds, dict):
+            continue
+        model_thresholds: dict[str, float] = {}
+        for key in ("wall_clock_s", "slowest_max_s"):
+            value = thresholds.get(key)
+            if isinstance(value, (int, float)) and float(value) > 0:
+                model_thresholds[key] = float(value)
+        if model_thresholds:
+            out[str(model)] = model_thresholds
+    return {**DEFAULT_DEGRADATION_THRESHOLDS, **out}
+
+
+def classify_timing_degradation(
+    *,
+    model: str,
+    status: str,
+    wall_clock_s: object,
+    slowest_max_s: object,
+) -> str | None:
+    if status != "ok":
+        return None
+    thresholds = _load_degradation_thresholds().get(model)
+    if not thresholds:
+        return None
+    reasons = []
+    if isinstance(wall_clock_s, (int, float)):
+        limit = thresholds.get("wall_clock_s")
+        if limit is not None and float(wall_clock_s) > float(limit):
+            reasons.append(f"wall {_fmt_duration(wall_clock_s)} > {_fmt_duration(limit)}")
+    if isinstance(slowest_max_s, (int, float)):
+        limit = thresholds.get("slowest_max_s")
+        if limit is not None and float(slowest_max_s) > float(limit):
+            reasons.append(f"slowest max {_fmt_duration(slowest_max_s)} > {_fmt_duration(limit)}")
+    return "; ".join(reasons) if reasons else None
+
+
+def extract_generation_summary(timing: dict[str, object] | None) -> dict[str, object] | None:
+    if not timing:
+        return None
+    stages = timing.get("stages", {})
+    if isinstance(stages, dict):
+        iterable = stages.values()
+    elif isinstance(stages, list):
+        iterable = stages
+    else:
+        return None
+    output_tokens = 0
+    elapsed_s = 0.0
+    hit_max_count = 0
+    by_stage: dict[str, dict[str, object]] = {}
+    for raw_stage in iterable:
+        if not isinstance(raw_stage, dict):
+            continue
+        stage_name = str(raw_stage.get("stage") or raw_stage.get("name") or "unknown")
+        tokens = raw_stage.get("output_tokens")
+        stage_elapsed = raw_stage.get("total_s")
+        if not isinstance(tokens, (int, float)) or float(tokens) <= 0:
+            continue
+        if not isinstance(stage_elapsed, (int, float)) or float(stage_elapsed) <= 0:
+            continue
+        tokens_i = int(tokens)
+        elapsed_f = float(stage_elapsed)
+        hits = raw_stage.get("hit_max_count")
+        hits_i = int(hits) if isinstance(hits, (int, float)) else 0
+        output_tokens += tokens_i
+        elapsed_s += elapsed_f
+        hit_max_count += hits_i
+        by_stage[stage_name] = {
+            "output_tokens": tokens_i,
+            "elapsed_s": round(elapsed_f, 3),
+            "tokens_per_s": round(tokens_i / elapsed_f, 3),
+            "hit_max_count": hits_i,
+        }
+    if output_tokens <= 0 or elapsed_s <= 0:
+        return None
+    return {
+        "output_tokens": output_tokens,
+        "elapsed_s": round(elapsed_s, 3),
+        "tokens_per_s": round(output_tokens / elapsed_s, 3),
+        "hit_max_count": hit_max_count,
+        "by_stage": by_stage,
+    }
+
+
 def run_one(run: ModelRun) -> dict[str, object]:
     stdout_path = run.run_dir / "stdout.log"
     stderr_path = run.run_dir / "stderr.log"
@@ -413,12 +516,19 @@ def run_one(run: ModelRun) -> dict[str, object]:
     wall_clock_s = None
     if timing and isinstance(timing.get("wall_clock_s"), (int, float)):
         wall_clock_s = float(timing["wall_clock_s"])
+    status = "ok" if rc == 0 else "fail"
     classification = classify_failure_detail(combined_text, exit_code=rc)
+    degradation_reason = classify_timing_degradation(
+        model=run.model,
+        status=status,
+        wall_clock_s=wall_clock_s,
+        slowest_max_s=slowest_max_s,
+    )
     return {
         "model": run.model,
         "slug": run.slug,
         "exit_code": rc,
-        "status": "ok" if rc == 0 else "fail",
+        "status": status,
         "run_dir": str(run.run_dir),
         "stdout_log": str(stdout_path),
         "stderr_log": str(stderr_path),
@@ -434,6 +544,9 @@ def run_one(run: ModelRun) -> dict[str, object]:
         "wall_clock_s": wall_clock_s,
         "slowest_stage": slowest_stage,
         "slowest_max_s": slowest_max_s,
+        "generation_summary": extract_generation_summary(timing),
+        "timing_degraded": bool(degradation_reason),
+        "degradation_reason": degradation_reason,
         "started_at_epoch_s": started_at,
         "finished_at_epoch_s": time.time(),
     }
@@ -607,6 +720,9 @@ def preflight_failure_results(models: list[str], message: str) -> list[dict[str,
             "wall_clock_s": 0.0,
             "slowest_stage": "preflight",
             "slowest_max_s": 0.0,
+            "generation_summary": None,
+            "timing_degraded": False,
+            "degradation_reason": None,
             "started_at_epoch_s": time.time(),
             "finished_at_epoch_s": time.time(),
         }
@@ -618,7 +734,10 @@ def build_feishu_report(results: list[dict[str, object]]) -> str:
     lines: list[str] = []
     any_failed = False
     ok_count = sum(1 for result in results if result.get("status") == "ok")
+    degraded_count = sum(1 for result in results if result.get("status") == "ok" and result.get("timing_degraded"))
     status = "PASS" if ok_count == len(results) else "FAIL"
+    if status == "PASS" and degraded_count:
+        status = "PASS_WITH_DEGRADATION"
     lines.append(f"**Result:** {status} ({ok_count}/{len(results)} models passed)")
     lines.append("")
     lines.append("**Model timing**")
@@ -628,8 +747,22 @@ def build_feishu_report(results: list[dict[str, object]]) -> str:
         max_s = _fmt_duration(result.get("slowest_max_s"))
         wall = _fmt_duration(result.get("wall_clock_s"))
         if result.get("status") == "ok":
+            label = "DEGRADED" if result.get("timing_degraded") else "PASS"
+            generation = result.get("generation_summary")
+            gen_text = ""
+            if isinstance(generation, dict) and isinstance(generation.get("tokens_per_s"), (int, float)):
+                gen_text = (
+                    f" generated_tokens=`{generation.get('output_tokens')}`, "
+                    f"gen_tok_s=`{float(generation['tokens_per_s']):.2f}`"
+                )
+                if generation.get("hit_max_count"):
+                    gen_text += f", hit_max=`{generation['hit_max_count']}`"
+            degraded_text = ""
+            if result.get("degradation_reason"):
+                degraded_text = f" degradation=`{result['degradation_reason']}`"
             lines.append(
-                f"- PASS `{model}`: slowest=`{slowest}`, max=`{max_s}`, wall=`{wall}`."
+                f"- {label} `{model}`: slowest=`{slowest}`, max=`{max_s}`, wall=`{wall}`"
+                f"{gen_text}{degraded_text}."
             )
         else:
             any_failed = True
@@ -701,6 +834,10 @@ def write_summary(results: list[dict[str, object]], run_root: Path, args: argpar
             lines.append(
                 f"- timing: slowest stage=`{result['slowest_stage']}` max_s=`{result['slowest_max_s']}` wall_clock_s=`{result['wall_clock_s']}`"
             )
+        if result.get("timing_degraded"):
+            lines.append(f"- timing_degraded: `{result.get('degradation_reason')}`")
+        if result.get("generation_summary"):
+            lines.append(f"- generation_summary: `{json.dumps(result['generation_summary'], sort_keys=True)}`")
         session_ids = result.get("session_ids") or {}
         request_ids = result.get("request_ids") or {}
         lines.append(f"- session_ids: `{json.dumps(session_ids, sort_keys=True)}`")

@@ -114,8 +114,9 @@ If the wrapper reports any failure:
 ## Final Report
 
 The canonical wrapper owns the report format. The report must include:
-- Overall `PASS` or `FAIL` and passed-model count.
+- Overall `PASS`, `PASS_WITH_DEGRADATION`, or `FAIL` and passed-model count.
 - One line per model with status, slowest stage or slowest completed stage, `max`, and `wall`.
+- For passed models, generated-token throughput when timing artifacts contain it. Models that pass but exceed the configured timing-degradation threshold should be reported as `DEGRADED`.
 - For failed models: failing surface/class, ops attempted, and whether a GitHub issue was created.
 - A clear next action.
 

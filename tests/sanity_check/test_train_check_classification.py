@@ -69,3 +69,49 @@ def test_unknown_failure_includes_compact_error_detail():
 
     assert classification.failure_class == "unknown"
     assert "FatalWidgetMelt" in classification.detail
+
+
+def test_generation_summary_aggregates_sample_tokens():
+    train_check = _load_train_check()
+    timing = {
+        "stages": [
+            {
+                "stage": "sample",
+                "total_s": 10.0,
+                "output_tokens": 80,
+                "hit_max_count": 4,
+            },
+            {
+                "stage": "eval_sample",
+                "total_s": 5.0,
+                "output_tokens": 10,
+                "hit_max_count": 0,
+            },
+        ]
+    }
+
+    summary = train_check.extract_generation_summary(timing)
+
+    assert summary["output_tokens"] == 90
+    assert summary["tokens_per_s"] == 6.0
+    assert summary["hit_max_count"] == 4
+    assert summary["by_stage"]["sample"]["tokens_per_s"] == 8.0
+
+
+def test_timing_degradation_is_thresholded_for_success_only():
+    train_check = _load_train_check()
+
+    reason = train_check.classify_timing_degradation(
+        model="Qwen/Qwen3-4B-Thinking-2507",
+        status="ok",
+        wall_clock_s=258.8,
+        slowest_max_s=97.1,
+    )
+
+    assert "wall" in reason
+    assert train_check.classify_timing_degradation(
+        model="Qwen/Qwen3-4B-Thinking-2507",
+        status="fail",
+        wall_clock_s=258.8,
+        slowest_max_s=97.1,
+    ) is None

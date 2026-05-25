@@ -2756,6 +2756,7 @@ class MultiNodeInferenceEngine:
             # (e.g. Triton illegal memory access) but the Ray actor stays alive.
             if "MINT_VLLM_GENERATE_TIMEOUT_S" not in env_vars:
                 env_vars["MINT_VLLM_GENERATE_TIMEOUT_S"] = "3600"
+            env_vars["MINT_VLLM_BASE_MODEL_NAME"] = str(self.model_name or self.model_path)
 
             # Fully sharded LoRAs are the default for multinode MoE actors when
             # max_lora_rank is divisible by TP. Operators can still turn this off via:

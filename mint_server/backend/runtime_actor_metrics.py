@@ -111,6 +111,7 @@ def init_vllm_runtime_otel_metrics(
     endpoint = (os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT") or "").strip()
     if not endpoint:
         return False
+    label_base_model = (os.getenv("MINT_VLLM_BASE_MODEL_NAME") or "").strip() or str(base_model)
     try:
         from opentelemetry import metrics
         from opentelemetry.metrics import Observation
@@ -118,7 +119,7 @@ def init_vllm_runtime_otel_metrics(
         meter = metrics.get_meter("mint.vllm_runtime_actor")
 
         def _attrs() -> dict[str, str]:
-            return runtime_metric_attrs(actor_name=actor_name, base_model=base_model)
+            return runtime_metric_attrs(actor_name=actor_name, base_model=label_base_model)
 
         def _observe(field: str):
             def _callback(_options):

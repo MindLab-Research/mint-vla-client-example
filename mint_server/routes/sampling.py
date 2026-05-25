@@ -233,6 +233,13 @@ def _record_vllm_workload_finish(
     )
 
 
+async def _safe_update_sample_meta(request_id: str, meta: dict[str, object]) -> None:
+    try:
+        await task_futures.async_update_meta(request_id, meta)
+    except Exception:
+        pass
+
+
 def _snapshot_from_manager_getters(session_id: str) -> SamplingSessionSnapshot | None:
     manager = _active_session_manager()
     if manager is None:
@@ -1634,6 +1641,15 @@ async def _do_sample(
                 logger.info(
                     f"[sample path] request_id={request_id} session_id={session_id} stage=before_get_engine"
                 )
+                engine_acquire_started_at = time.time()
+                engine_acquire_t0 = time.perf_counter()
+                await _safe_update_sample_meta(
+                    request_id,
+                    {
+                        "stage": "engine_acquire",
+                        "engine_acquire_started_at": engine_acquire_started_at,
+                    },
+                )
                 engine = await run_async_with_otel_span(
                     "sampling.get_engine_for_session",
                     lambda: session_manager.get_engine_for_session(session_id),
@@ -1645,6 +1661,13 @@ async def _do_sample(
                         "base_model": snapshot.base_model if snapshot is not None else None,
                         "lora_rank": int(snapshot.lora_rank) if snapshot is not None else None,
                         "lora_loaded_before": bool(snapshot.lora_loaded) if snapshot is not None else None,
+                    },
+                )
+                await _safe_update_sample_meta(
+                    request_id,
+                    {
+                        "stage": "lora_load",
+                        "engine_acquire_s": max(0.0, time.perf_counter() - engine_acquire_t0),
                     },
                 )
                 logger.info(
@@ -1672,6 +1695,15 @@ async def _do_sample(
                     f"[sample path] session_id={session_id} "
                     f"prompt_tokens={len(token_ids)} num_samples={request.num_samples} stage=before_lora_load"
                 )
+                lora_load_started_at = time.time()
+                lora_load_t0 = time.perf_counter()
+                await _safe_update_sample_meta(
+                    request_id,
+                    {
+                        "stage": "lora_load",
+                        "lora_load_started_at": lora_load_started_at,
+                    },
+                )
                 await run_async_with_otel_span(
                     "sampling.ensure_lora_loaded",
                     lambda: _ensure_session_lora_loaded(engine, session_id, snapshot=snapshot),
@@ -1684,6 +1716,15 @@ async def _do_sample(
                         "lora_rank": int(snapshot.lora_rank) if snapshot is not None else None,
                         "lora_loaded_before": bool(snapshot.lora_loaded) if snapshot is not None else None,
                         "has_adapter_path": bool(snapshot.adapter_path) if snapshot is not None else None,
+                    },
+                )
+                await _safe_update_sample_meta(
+                    request_id,
+                    {
+                        "stage": "decode",
+                        "lora_load_s": max(0.0, time.perf_counter() - lora_load_t0),
+                        "generate_started_at": time.time(),
+                        "max_tokens": int(request.sampling_params.max_tokens),
                     },
                 )
                 logger.info(f"[sample path] session_id={session_id} stage=after_lora_load")
@@ -1710,6 +1751,7 @@ async def _do_sample(
                 )
                 if can_coalesce:
                     logger.info("[sample path] branch=coalesced_generate")
+                    generate_t0 = time.perf_counter()
                     results = await run_async_with_otel_span(
                         "sampling.generate",
                         lambda: _await_with_external_fail_abort(
@@ -1735,6 +1777,7 @@ async def _do_sample(
                     )
                 elif request.num_samples == 1:
                     logger.info("[sample path] branch=generate_single")
+                    generate_t0 = time.perf_counter()
                     one_result = await run_async_with_otel_span(
                         "sampling.generate",
                         lambda: _await_with_external_fail_abort(
@@ -1762,6 +1805,7 @@ async def _do_sample(
                     if gen_many is None:
                         raise RuntimeError(f"Engine for session {session_id} does not support generate_many()")
                     logger.info("[sample path] branch=generate_many")
+                    generate_t0 = time.perf_counter()
                     results = await run_async_with_otel_span(
                         "sampling.generate",
                         lambda: _await_with_external_fail_abort(
@@ -1785,6 +1829,7 @@ async def _do_sample(
                         request_id=request_id,
                         attributes={"sampling_session_id": session_id, "num_samples": request.num_samples},
                     )
+                generate_s = max(0.0, time.perf_counter() - generate_t0)
             else:
                 # Legacy mode: per-session engine
                 engine = session_manager.get_engine(session_id)
@@ -1824,6 +1869,16 @@ async def _do_sample(
             sequences = []
             for result in results:
                 sequences.append(sampled_sequence_from_result(result))
+            generated_tokens = sum(len(seq.tokens) for seq in sequences)
+            await _safe_update_sample_meta(
+                request_id,
+                {
+                    "stage": "postprocess",
+                    "generate_s": generate_s if "generate_s" in locals() else None,
+                    "generated_tokens": int(generated_tokens),
+                    "sequence_count": len(sequences),
+                },
+            )
 
             # Build response
             response = SampleResponse(sequences=sequences)
@@ -1922,7 +1977,7 @@ async def _do_sample(
                 billing_observations=billing_observations,
             )
             workload_status = "ok"
-            workload_generated_tokens = sum(len(seq.tokens) for seq in sequences)
+            workload_generated_tokens = generated_tokens
             workload_obs = _vllm_request_observation(results, workload_generated_tokens)
             logger.info(f"Sampling completed: {len(sequences)} sequences generated")
 

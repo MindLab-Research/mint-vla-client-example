@@ -16,6 +16,7 @@ from ..logging_context import (
     classify_failure_reason,
     extract_trace_id_from_traceparent,
     get_otel_tracer,
+    record_scheduler_decision_otel,
     set_request_id,
     set_trace_id,
 )
@@ -563,6 +564,14 @@ class ModelRuntimeActor:
 
     async def _mark_running(self, lease: dict[str, Any]) -> None:
         item = lease["item"]
+        extra = item.get("extra") if isinstance(item, dict) else {}
+        extra = extra if isinstance(extra, dict) else {}
+        running_at = time.time()
+        queued_at = extra.get("queued_at")
+        queue_wait_s = None
+        if isinstance(queued_at, (int, float)):
+            queue_wait_s = max(0.0, running_at - float(queued_at))
+        op = str(item.get("op") or "unknown")
         await self._task_futures.async_mark_running(
             str(item["request_id"]),
             meta={
@@ -573,12 +582,25 @@ class ModelRuntimeActor:
                 "replica_id": self._config.replica_id,
                 "queue_id": self._config.queue_id,
                 "lease_id": str(lease["lease_id"]),
-                "op": item.get("op"),
+                "op": op,
                 "queue_state": "running",
                 "stage": "prefill",
-                "running_at": time.time(),
+                "queued_at": queued_at,
+                "dequeue_at": running_at,
+                "running_at": running_at,
+                "executor_started_at": running_at,
+                "queue_wait_s": queue_wait_s,
             },
         )
+        if queue_wait_s is not None:
+            record_scheduler_decision_otel(
+                op=op,
+                backend="model_work",
+                queue_kind="model_work_scheduler",
+                reason="lease_claimed",
+                queue_wait_s=queue_wait_s,
+                switched=False,
+            )
 
     async def _renew_until_done(self, lease: dict[str, Any], task: asyncio.Task) -> None:
         interval_s = max(0.1, min(float(self._config.lease_ttl_s) / 3.0, 10.0))
@@ -673,6 +695,7 @@ class ModelRuntimeActor:
         task: asyncio.Task | None = None
         try:
             finalize_buffer = ModelWorkFinalizeBuffer()
+            executor_started_at = time.time()
             with model_work_execution_context(
                 lease_id=lease_id,
                 consumer_id=self._config.consumer_id,
@@ -682,6 +705,17 @@ class ModelRuntimeActor:
                 task = asyncio.create_task(self._run_executor(lease))
                 await self._renew_until_done(lease, task)
                 await task
+            executor_done_at = time.time()
+            try:
+                await self._task_futures.async_update_meta(
+                    request_id,
+                    {
+                        "executor_done_at": executor_done_at,
+                        "executor_exec_s": max(0.0, executor_done_at - executor_started_at),
+                    },
+                )
+            except Exception:
+                pass
             finalization = finalize_buffer.finalization
             if finalization is None:
                 raise RuntimeError("model work executor finished without resolving or failing future")
