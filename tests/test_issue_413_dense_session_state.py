@@ -12,9 +12,8 @@ from mint_server.backend import dense_session_state as dense_state_module
 import mint_server.backend.model_actor_inventory as model_actor_inventory_module
 from mint_server.backend.model_actor_supervisor import ActorType, ModelActorSupervisor
 from mint_server.backend.training_session_manager import TrainingSession
-from mint_server.backend.verl_training import SessionStateManager, TrainingWorker, VerlTrainingEngine
+from mint_server.backend.verl_training import TrainingWorker, VerlTrainingEngine
 from mint_server.config import config as server_config
-from mint_server.routes import internal as internal_routes
 
 
 @pytest.fixture
@@ -138,25 +137,78 @@ def test_issue_413_shutdown_session_reclaims_dense_state_for_shared_actor(
     pool.unregister(actor_name)
 
 
-@pytest.mark.anyio
-async def test_issue_413_internal_metrics_include_dense_session_state(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("MINT_INTERNAL_PROMETHEUS_METRICS_ENABLED", "1")
+def test_issue_413_otel_metrics_include_dense_session_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    import opentelemetry.metrics as otel_metrics
 
-    async def _fake_admission_stats(*, include_actor_rss: bool = True) -> dict:
-        assert include_actor_rss is False
-        return {
-            "driver_state": {
-                "dense_session_state_bytes": 1234,
-                "dense_session_state_dirs": 5,
-                "dense_session_state_oldest_age_s": 67.5,
-            }
-        }
+    import mint_server.logging_context as logging_context
 
-    monkeypatch.setattr(internal_routes, "admission_stats", _fake_admission_stats)
+    callbacks: dict[str, object] = {}
 
-    response = await internal_routes.metrics()
-    payload = bytes(response.body).decode("utf-8")
+    class _FakeMeter:
+        def create_counter(self, *_args, **_kwargs):
+            return None
 
-    assert "mint_dense_session_state_bytes 1234" in payload
-    assert "mint_dense_session_state_dirs 5" in payload
-    assert "mint_dense_session_state_oldest_age_s 67.5" in payload
+        def create_histogram(self, *_args, **_kwargs):
+            return None
+
+        def create_observable_gauge(self, name, **kwargs):
+            callbacks[name] = kwargs["callbacks"][0]
+
+    class _Observation:
+        def __init__(self, value, attributes):
+            self.value = value
+            self.attributes = attributes
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel.example:4317")
+    monkeypatch.setattr(otel_metrics, "get_meter", lambda _name: _FakeMeter())
+    monkeypatch.setattr(logging_context, "_OTEL_INITIALIZED", False)
+    monkeypatch.setattr(logging_context, "_API_PROCESS_OBSERVABLES_REGISTERED", False)
+    monkeypatch.setattr(
+        "mint_server.backend.dense_session_state.collect_dense_session_state_stats",
+        lambda: {
+            "dense_session_state_bytes": 1234,
+            "dense_session_state_dirs": 5,
+            "dense_session_state_oldest_age_s": 67.5,
+        },
+    )
+    monkeypatch.setattr("mint_server.backend.session_heartbeat_store.session_heartbeat_store.size", lambda: 0)
+    monkeypatch.setattr("mint_server.routes.sampling._lora_load_lock_count_sync", lambda: 0)
+    monkeypatch.setattr("mint_server.routes.service.session_manager", None)
+
+    logging_context._register_api_process_observable_metrics(_FakeMeter(), _Observation)
+
+    assert callbacks["mint_dense_session_state_bytes"](None)[0].value == 1234.0
+    assert callbacks["mint_dense_session_state_dirs"](None)[0].value == 5.0
+    assert callbacks["mint_dense_session_state_oldest_age_s"](None)[0].value == 67.5
+
+
+def test_issue_413_configure_logging_does_not_register_api_process_gauges_for_actors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opentelemetry.metrics as otel_metrics
+
+    import mint_server.logging_context as logging_context
+
+    created: list[str] = []
+
+    class _FakeMeter:
+        def create_counter(self, *_args, **_kwargs):
+            return None
+
+        def create_histogram(self, *_args, **_kwargs):
+            return None
+
+        def create_observable_gauge(self, name, **_kwargs):
+            created.append(name)
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel.example:4317")
+    monkeypatch.setattr(otel_metrics, "get_meter", lambda _name: _FakeMeter())
+    monkeypatch.setattr(logging_context, "_OTEL_INITIALIZED", False)
+    monkeypatch.setattr(logging_context, "_OTEL_ENABLED", False)
+    monkeypatch.setattr(logging_context, "_API_PROCESS_OBSERVABLES_REGISTERED", False)
+
+    logging_context._configure_opentelemetry(__import__("logging").getLogger("test"))
+
+    assert "mint_public_healthz_cache_age_seconds" in created
+    assert "mint_dense_session_state_bytes" not in created
+    assert "mint_driver_sampling_sessions_total" not in created

@@ -15,6 +15,40 @@ from ..config import PFS_PYTHONPATH, actor_runtime_env, otel_env_vars
 from ..runtime_env import env_nonempty
 
 
+def _ray_cluster_snapshot() -> dict[str, Any]:
+    from ..ray_cluster_health import get_ray_cluster_health_snapshot
+
+    return get_ray_cluster_health_snapshot()
+
+
+def _ray_gcs_snapshot() -> dict[str, Any]:
+    from ..ray_gcs_metrics import get_ray_gcs_metrics_snapshot
+
+    return get_ray_gcs_metrics_snapshot()
+
+
+def _ray_gcs_aggregate_metric_names() -> tuple[str, ...]:
+    from ..ray_gcs_metrics import RAY_GCS_AGGREGATE_METRIC_NAMES
+
+    return RAY_GCS_AGGREGATE_METRIC_NAMES
+
+
+def _ray_gcs_derived_metric_names() -> tuple[str, ...]:
+    from ..ray_gcs_metrics import RAY_GCS_DERIVED_METRIC_NAMES
+
+    return RAY_GCS_DERIVED_METRIC_NAMES
+
+
+def _observe_cluster_scalar_from_nodes(snapshot: dict[str, Any], field: str, observation_cls, attrs: dict[str, str]):
+    nodes = snapshot.get("nodes")
+    if not isinstance(nodes, dict):
+        return []
+    value = nodes.get(field)
+    if value is None:
+        return []
+    return [observation_cls(float(value), attrs)]
+
+
 def sanitize_worker_alias_for_actor_name(worker_alias: str) -> str:
     value = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(worker_alias or "").strip()).strip("-")
     return value or "unknown"
@@ -33,6 +67,7 @@ class NodeMetricsDaemonSpec:
     deployment_env: str | None = None
     cluster_id: str | None = None
     actor_name: str | None = None
+    is_head_node: bool = False
 
     def normalized_actor_name(self) -> str:
         return self.actor_name or node_metrics_actor_name(self.worker_alias)
@@ -234,6 +269,7 @@ class NodeMetricsCollectorActor:
         deployment_env: str | None = None,
         cluster_id: str | None = None,
         actor_name: str | None = None,
+        is_head_node: bool = False,
     ) -> None:
         from ..logging_context import init_actor_observability
 
@@ -246,6 +282,7 @@ class NodeMetricsCollectorActor:
             deployment_env=deployment_env or os.getenv("MINT_DEPLOYMENT_ENV") or "",
             cluster_id=cluster_id or os.getenv("MINT_CLUSTER_ID") or "",
             actor_name=actor_name,
+            is_head_node=bool(is_head_node),
         )
         self._started_at = time.time()
         self._sample_count = 0
@@ -254,6 +291,10 @@ class NodeMetricsCollectorActor:
         self._last_sample_duration_ms: float | None = None
         self._last_error: str | None = None
         self._last_sample: dict[str, Any] | None = None
+        self._last_ray_cluster_snapshot: dict[str, Any] | None = None
+        self._last_ray_cluster_sample_at: float | None = None
+        self._last_ray_gcs_snapshot: dict[str, Any] | None = None
+        self._last_ray_gcs_sample_at: float | None = None
         self._otel_enabled = False
         self._otel_error: str | None = None
         self._sample_interval_s = _sample_interval_s()
@@ -270,7 +311,7 @@ class NodeMetricsCollectorActor:
         while not self._shutdown_requested:
             started_at = time.perf_counter()
             try:
-                self.sample_once()
+                self.sample_once(collect_ray_global=True)
             except Exception as e:
                 self._record_sample_exception(e, started_at=started_at)
             if self._shutdown_requested:
@@ -393,7 +434,7 @@ class NodeMetricsCollectorActor:
                 return observations
 
             def _collector_up(_options):
-                return [Observation(0.0 if self._last_error else 1.0, self._metric_attrs())]
+                return [Observation(0.0 if self._last_error or self._otel_error else 1.0, self._metric_attrs())]
 
             def _sample_age(_options):
                 if self._last_sample_at is None:
@@ -454,14 +495,228 @@ class NodeMetricsCollectorActor:
             _gauge("mint_node_metrics_collector_sample_age_s", _sample_age, unit="s")
             _gauge("mint_node_metrics_collector_sample_duration_ms", _sample_duration, unit="ms")
             _gauge("mint_node_metrics_collector_errors_total", _errors_total)
+            if self._spec.is_head_node:
+                self._register_ray_global_otel_gauges(_gauge, Observation)
             self._otel_enabled = True
         except Exception as e:
             self._otel_error = f"{type(e).__name__}: {e}"
 
-    def sample_once(self) -> dict[str, Any]:
+    def _ray_global_attrs(self, **extra: str) -> dict[str, str]:
+        attrs = self._metric_attrs()
+        namespace = os.getenv("MINT_RAY_NAMESPACE", "").strip()
+        if namespace:
+            attrs["ray_namespace"] = namespace
+        for key, value in extra.items():
+            text = str(value or "").strip()
+            if text:
+                attrs[key] = text
+        return attrs
+
+    def _register_ray_global_otel_gauges(self, gauge_factory, observation_cls) -> None:
+        def _cluster_snapshot_cached() -> dict[str, Any]:
+            return self._cached_ray_cluster_snapshot()
+
+        def _gcs_snapshot_cached() -> dict[str, Any]:
+            return self._cached_ray_gcs_snapshot()
+
+        def _observe_cluster_scalar(field: str):
+            snapshot = _cluster_snapshot_cached()
+            value = snapshot.get(field)
+            if value is None:
+                return []
+            return [observation_cls(float(value), self._ray_global_attrs())]
+
+        def _observe_cluster_node_count(_options):
+            snapshot = _cluster_snapshot_cached()
+            nodes = snapshot.get("nodes")
+            if not isinstance(nodes, dict):
+                return []
+            observations = []
+            for state, field in (("alive", "alive"), ("dead", "dead")):
+                value = nodes.get(field)
+                if value is not None:
+                    observations.append(
+                        observation_cls(float(value), self._ray_global_attrs(state=state))
+                    )
+            return observations
+
+        def _observe_cluster_resource(field: str):
+            snapshot = _cluster_snapshot_cached()
+            resources = snapshot.get("resources")
+            if not isinstance(resources, dict):
+                return []
+            value = resources.get(field)
+            if value is None:
+                return []
+            return [observation_cls(float(value), self._ray_global_attrs())]
+
+        def _observe_cluster_pg(field: str):
+            snapshot = _cluster_snapshot_cached()
+            placement_groups = snapshot.get("placement_groups")
+            if not isinstance(placement_groups, dict):
+                return []
+            value = placement_groups.get(field)
+            if value is None:
+                return []
+            return [observation_cls(float(value), self._ray_global_attrs())]
+
+        def _observe_named_actor(field: str):
+            snapshot = _cluster_snapshot_cached()
+            named_actors = snapshot.get("named_actors")
+            if not isinstance(named_actors, dict):
+                return []
+            value = named_actors.get(field)
+            if value is None:
+                return []
+            return [observation_cls(float(value), self._ray_global_attrs())]
+
+        def _observe_cluster_probe_success(_options):
+            snapshot = _cluster_snapshot_cached()
+            probes = snapshot.get("probes")
+            if not isinstance(probes, dict):
+                return []
+            observations = []
+            for probe, rec in sorted(probes.items()):
+                if not isinstance(rec, dict):
+                    continue
+                value = 1.0 if bool(rec.get("ok")) else 0.0
+                observations.append(
+                    observation_cls(value, self._ray_global_attrs(probe=str(probe)))
+                )
+            return observations
+
+        def _observe_cluster_probe_latency(_options):
+            snapshot = _cluster_snapshot_cached()
+            probes = snapshot.get("probes")
+            if not isinstance(probes, dict):
+                return []
+            observations = []
+            for probe, rec in sorted(probes.items()):
+                if not isinstance(rec, dict):
+                    continue
+                value = rec.get("latency_ms")
+                if value is None:
+                    continue
+                observations.append(
+                    observation_cls(float(value), self._ray_global_attrs(probe=str(probe)))
+                )
+            return observations
+
+        def _observe_gcs_scalar(field: str):
+            snapshot = _gcs_snapshot_cached()
+            value = snapshot.get(field)
+            if value is None:
+                return []
+            return [observation_cls(float(value), self._ray_global_attrs())]
+
+        def _observe_gcs_nested_scalar(section: str, field: str):
+            snapshot = _gcs_snapshot_cached()
+            values = snapshot.get(section)
+            if not isinstance(values, dict):
+                return []
+            value = values.get(field)
+            if value is None:
+                return []
+            return [observation_cls(float(value), self._ray_global_attrs())]
+
+        gauge_factory("mint_ray_cluster_up", lambda options: _observe_cluster_scalar("up"))
+        gauge_factory("mint_ray_cluster_warning_count", lambda options: _observe_cluster_scalar("warning_count"))
+        gauge_factory("mint_ray_cluster_probe_error_count", lambda options: _observe_cluster_scalar("probe_error_count"))
+        gauge_factory("mint_ray_cluster_slow_probe_count", lambda options: _observe_cluster_scalar("slow_probe_count"))
+        gauge_factory("mint_ray_cluster_total_probe_latency_ms", lambda options: _observe_cluster_scalar("total_probe_latency_ms"), unit="ms")
+        gauge_factory("mint_ray_cluster_cache_age_s", lambda options: _observe_cluster_scalar("cache_age_s"), unit="s")
+        gauge_factory("mint_ray_cluster_last_success_unixtime", lambda options: _observe_cluster_scalar("last_success_unixtime"))
+        gauge_factory("mint_ray_cluster_last_success_age_s", lambda options: _observe_cluster_scalar("last_success_age_s"), unit="s")
+        gauge_factory("mint_ray_cluster_nodes", _observe_cluster_node_count)
+        gauge_factory(
+            "mint_ray_cluster_dead_nodes_missing_heartbeats",
+            lambda options: _observe_cluster_scalar_from_nodes(
+                _cluster_snapshot_cached(),
+                "dead_missing_heartbeats",
+                observation_cls,
+                self._ray_global_attrs(),
+            ),
+        )
+        gauge_factory("mint_ray_cluster_cpu_total", lambda options: _observe_cluster_resource("cpu_total"))
+        gauge_factory("mint_ray_cluster_cpu_available", lambda options: _observe_cluster_resource("cpu_available"))
+        gauge_factory("mint_ray_cluster_gpu_total", lambda options: _observe_cluster_resource("gpu_total"))
+        gauge_factory("mint_ray_cluster_gpu_available", lambda options: _observe_cluster_resource("gpu_available"))
+        gauge_factory("mint_ray_cluster_memory_total", lambda options: _observe_cluster_resource("memory_total"), unit="By")
+        gauge_factory("mint_ray_cluster_memory_available", lambda options: _observe_cluster_resource("memory_available"), unit="By")
+        gauge_factory("mint_ray_cluster_object_store_memory_total", lambda options: _observe_cluster_resource("object_store_memory_total"), unit="By")
+        gauge_factory("mint_ray_cluster_object_store_memory_available", lambda options: _observe_cluster_resource("object_store_memory_available"), unit="By")
+        for field in ("total", "created", "removed", "pending", "pending_gpu"):
+            gauge_factory(
+                f"mint_ray_cluster_placement_groups_{field}",
+                lambda options, field=field: _observe_cluster_pg(field),
+            )
+        gauge_factory("mint_ray_cluster_named_actors_total", lambda options: _observe_named_actor("total"))
+        gauge_factory("mint_ray_cluster_named_actors_namespace", lambda options: _observe_named_actor("namespace"))
+        gauge_factory("mint_ray_cluster_probe_success", _observe_cluster_probe_success)
+        gauge_factory("mint_ray_cluster_probe_latency_ms", _observe_cluster_probe_latency, unit="ms")
+        gauge_factory("mint_ray_gcs_metrics_bridge_up", lambda options: _observe_gcs_scalar("up"))
+        gauge_factory("mint_ray_gcs_metrics_bridge_scrape_error_count", lambda options: _observe_gcs_scalar("scrape_error_count"))
+        gauge_factory("mint_ray_gcs_metrics_bridge_sample_count", lambda options: _observe_gcs_scalar("sample_count"))
+        gauge_factory("mint_ray_gcs_metrics_bridge_scrape_latency_ms", lambda options: _observe_gcs_scalar("scrape_latency_ms"), unit="ms")
+        gauge_factory("mint_ray_gcs_metrics_bridge_cache_age_s", lambda options: _observe_gcs_scalar("cache_age_s"), unit="s")
+        gauge_factory("mint_ray_gcs_metrics_bridge_last_success_unixtime", lambda options: _observe_gcs_scalar("last_success_unixtime"))
+        gauge_factory("mint_ray_gcs_metrics_bridge_last_success_age_s", lambda options: _observe_gcs_scalar("last_success_age_s"), unit="s")
+        for metric_name in _ray_gcs_aggregate_metric_names():
+            gauge_factory(
+                f"mint_ray_gcs_raw_{metric_name}",
+                lambda options, metric_name=metric_name: _observe_gcs_nested_scalar("aggregates", metric_name),
+            )
+        for metric_name in _ray_gcs_derived_metric_names():
+            gauge_factory(
+                f"mint_ray_gcs_{metric_name}",
+                lambda options, metric_name=metric_name: _observe_gcs_nested_scalar("derived", metric_name),
+            )
+
+    def _sample_ray_global_once(self) -> None:
+        if not self._spec.is_head_node:
+            return
+        try:
+            self._last_ray_cluster_snapshot = dict(_ray_cluster_snapshot())
+            self._last_ray_cluster_sample_at = time.time()
+        except Exception as e:
+            self._last_ray_cluster_snapshot = {
+                "up": False,
+                "warning_count": 1,
+                "probe_error_count": 1,
+                "slow_probe_count": 0,
+                "error": f"{type(e).__name__}: {e}",
+            }
+            self._last_ray_cluster_sample_at = time.time()
+        try:
+            self._last_ray_gcs_snapshot = dict(_ray_gcs_snapshot())
+            self._last_ray_gcs_sample_at = time.time()
+        except Exception as e:
+            self._last_ray_gcs_snapshot = {
+                "up": False,
+                "scrape_error_count": 1,
+                "sample_count": 0,
+                "error": f"{type(e).__name__}: {e}",
+            }
+            self._last_ray_gcs_sample_at = time.time()
+
+    def _cached_ray_cluster_snapshot(self) -> dict[str, Any]:
+        snapshot = dict(self._last_ray_cluster_snapshot or {})
+        if self._last_ray_cluster_sample_at is not None:
+            snapshot["cache_age_s"] = max(0.0, time.time() - float(self._last_ray_cluster_sample_at))
+        return snapshot
+
+    def _cached_ray_gcs_snapshot(self) -> dict[str, Any]:
+        snapshot = dict(self._last_ray_gcs_snapshot or {})
+        if self._last_ray_gcs_sample_at is not None:
+            snapshot["cache_age_s"] = max(0.0, time.time() - float(self._last_ray_gcs_sample_at))
+        return snapshot
+
+    def sample_once(self, *, collect_ray_global: bool = False) -> dict[str, Any]:
         started_at = time.perf_counter()
         host = _sample_host_metrics()
         gpus, gpu_error = _sample_gpu_metrics()
+        if collect_ray_global:
+            self._sample_ray_global_once()
         self._sample_count += 1
         self._last_sample_at = time.time()
         self._last_sample_duration_ms = (time.perf_counter() - started_at) * 1000.0
@@ -493,6 +748,8 @@ class NodeMetricsCollectorActor:
             "host_error": host_error,
             "sampled_at": self._last_sample_at,
             "sample_duration_ms": self._last_sample_duration_ms,
+            "ray_cluster": self._cached_ray_cluster_snapshot() if self._spec.is_head_node else None,
+            "ray_gcs": self._cached_ray_gcs_snapshot() if self._spec.is_head_node else None,
         }
         self._last_sample = dict(sample)
         return sample
@@ -504,7 +761,7 @@ class NodeMetricsCollectorActor:
             and time.time() - self._last_sample_at <= float(max_age_s)
         ):
             return dict(self._last_sample)
-        return self.sample_once()
+        return self.sample_once(collect_ray_global=False)
 
     def health_snapshot(self) -> dict[str, Any]:
         return {
@@ -514,6 +771,7 @@ class NodeMetricsCollectorActor:
             "ray_node_id": self._spec.ray_node_id,
             "deployment_env": self._spec.deployment_env,
             "cluster_id": self._spec.cluster_id,
+            "is_head_node": self._spec.is_head_node,
             "expected_gpu_count": self._spec.gpu_count,
             "started_at": self._started_at,
             "sample_count": self._sample_count,
@@ -522,6 +780,8 @@ class NodeMetricsCollectorActor:
             "last_sample_duration_ms": self._last_sample_duration_ms,
             "last_error": self._last_error,
             "last_sample": self._last_sample,
+            "last_ray_cluster_snapshot": self._cached_ray_cluster_snapshot() if self._spec.is_head_node else None,
+            "last_ray_gcs_snapshot": self._cached_ray_gcs_snapshot() if self._spec.is_head_node else None,
             "otel_enabled": self._otel_enabled,
             "otel_error": self._otel_error,
             "sample_interval_s": self._sample_interval_s,
@@ -613,4 +873,5 @@ def get_or_create_node_metrics_collector_actor(spec: NodeMetricsDaemonSpec) -> A
         deployment_env=spec.deployment_env,
         cluster_id=spec.cluster_id,
         actor_name=name,
+        is_head_node=spec.is_head_node,
     )

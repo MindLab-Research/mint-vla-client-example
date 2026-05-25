@@ -163,6 +163,7 @@ class MultiLoRAInferenceEngine:
     def __init__(
         self,
         model_path: str,
+        model_name: str | None = None,
         tensor_parallel_size: int = 1,
         data_parallel_size: int = 1,
         gpu_memory_utilization: float = 0.85,
@@ -176,6 +177,7 @@ class MultiLoRAInferenceEngine:
         quantization: str | None = None,  # "fp8" for FP8 models like K2
     ):
         self.model_path = model_path
+        self.model_name = model_name
         self.tensor_parallel_size = tensor_parallel_size
         self.data_parallel_size = data_parallel_size
         self.quantization = quantization
@@ -452,14 +454,15 @@ class MultiLoRAInferenceEngine:
             env_vars = actor_runtime_env_vars(
                 pythonpath=worker_pythonpath,
                 extra={
-                "LD_LIBRARY_PATH": actor_ld_library_path(),
-                "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
-                "USE_TORCH": "1",
-                "USE_TF": "0",
-                "USE_FLAX": "0",
-                "HF_HOME": "/vePFS-Mindverse/share/huggingface",
-                "HF_HUB_OFFLINE": "1",
-                **otel_env_vars(),
+                    "LD_LIBRARY_PATH": actor_ld_library_path(),
+                    "MINT_VLLM_BASE_MODEL_NAME": str(self.model_name or self.model_path),
+                    "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+                    "USE_TORCH": "1",
+                    "USE_TF": "0",
+                    "USE_FLAX": "0",
+                    "HF_HOME": "/vePFS-Mindverse/share/huggingface",
+                    "HF_HUB_OFFLINE": "1",
+                    **otel_env_vars(),
                 },
             )
             env_vars.setdefault("VLLM_ATTENTION_BACKEND", server_config.vllm_attention_backend)
@@ -1777,6 +1780,7 @@ class MultiModelInferenceManager:
 
                 engine = MultiLoRAInferenceEngine(
                     model_path=model_path,
+                    model_name=model_name,
                     tensor_parallel_size=config.inference_tp,
                     data_parallel_size=config.inference_dp,
                     gpu_memory_utilization=model_gpu_util,

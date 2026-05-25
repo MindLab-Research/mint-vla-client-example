@@ -116,6 +116,13 @@ events:
 - `UsageStore` protocol (async write/query/summary/health)
 - `PostgresUsageStore` (asyncpg pool + idempotent PG writes)
 
+`PostgresUsageStore` instances are event-loop local. asyncpg pools and
+connections must not be shared across cron threads, API worker loops, or any
+temporary `asyncio.run(...)` loop. `MaintenanceCronActor` therefore runs the
+billing outbox flusher as an async runner on the actor event loop instead of
+`to_thread + asyncio.run`. Sync wrappers may exist for direct one-shot tools or
+tests, but detached actor loops must not use them.
+
 `TaskStateStore` owns the local durable outbox:
 
 - `billing_outbox` rows are written before or during terminal task commit.

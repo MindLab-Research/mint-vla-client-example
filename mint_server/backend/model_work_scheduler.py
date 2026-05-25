@@ -10,13 +10,23 @@ from collections import deque
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from ..config import PFS_PYTHONPATH, actor_runtime_env, config as server_config, otel_env_vars, preferred_control_plane_resources
+from ..config import (
+    PFS_PYTHONPATH,
+    actor_runtime_env,
+    apply_detached_actor_resources,
+    config as server_config,
+    otel_env_vars,
+    preferred_control_plane_resources,
+)
 from ..runtime_env import env_nonempty
+from ..server_info import _git_sha
 from .async_ray_control import async_get_ray_ref, sync_get_ray_ref
+from .task_state_store import TERMINAL_TASK_STATUSES, TaskStateConflictError, TaskStateNotFoundError
 
 logger = logging.getLogger(__name__)
 
 CLAIMABLE_REPLICA_STATUSES = frozenset({"healthy", "ready"})
+CURRENT_CODE_IDENTITY = os.environ.get("MINT_GIT_SHA") or _git_sha()
 
 
 class ModelWorkSchedulerUnavailableError(RuntimeError):
@@ -24,6 +34,10 @@ class ModelWorkSchedulerUnavailableError(RuntimeError):
 
 
 class ModelWorkSchedulerConflictError(RuntimeError):
+    pass
+
+
+class ModelWorkSchedulerCodeIdentityMismatchError(RuntimeError):
     pass
 
 
@@ -44,6 +58,37 @@ def _ray_model_work_scheduler_actor_name() -> str:
     if env_value:
         return str(env_value)
     return str(getattr(server_config, "model_work_scheduler_actor_name", "mint_model_work_scheduler"))
+
+
+def _otel_metric_attrs() -> dict[str, str]:
+    attrs = {
+        "deployment.env": os.getenv("MINT_DEPLOYMENT_ENV", "").strip(),
+        "mint.cluster_id": os.getenv("MINT_CLUSTER_ID", "").strip(),
+        "ray_namespace": _ray_namespace(),
+    }
+    return {key: value for key, value in attrs.items() if value}
+
+
+def _metric_number(value: object) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _scheduler_domain_base_model(domain_key: object) -> str | None:
+    domain = str(domain_key or "").strip()
+    if not domain or ":" not in domain:
+        return None
+    backend, model = domain.split(":", 1)
+    if backend.strip().lower() != "vllm":
+        return None
+    model = model.strip()
+    return model or None
 
 
 def _model_work_scheduler_actor_resources() -> dict[str, float] | None:
@@ -240,6 +285,12 @@ class _ModelWorkSchedulerActor:
         task_state_store: Any | None = None,
         owner_id: str | None = None,
     ) -> None:
+        try:
+            from ..logging_context import init_actor_observability
+
+            init_actor_observability()
+        except Exception:
+            logger.debug("[model_work_scheduler] actor observability init skipped", exc_info=True)
         self._cv = asyncio.Condition()
         self._instance_id = uuid.uuid4().hex
         self._owner_id = owner_id or f"{_ray_model_work_scheduler_actor_name()}:{self._instance_id}"
@@ -257,6 +308,7 @@ class _ModelWorkSchedulerActor:
         self._completed = 0
         self._failed = 0
         self._requeued = 0
+        self._stale_dropped = 0
         self._appended = 0
         self._assigned = 0
         self._claimed = 0
@@ -264,7 +316,182 @@ class _ModelWorkSchedulerActor:
         self._assignment_loop_interval_s = float(
             os.environ.get("MINT_MODEL_WORK_SCHEDULER_ASSIGNMENT_INTERVAL_S", "1.0")
         )
+        self._otel_enabled = False
+        self._otel_error: str | None = None
+        self._init_otel_metrics()
         self._ensure_assignment_loop_started()
+
+    def _init_otel_metrics(self) -> None:
+        endpoint = (os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT") or "").strip()
+        if not endpoint:
+            return
+        try:
+            from opentelemetry import metrics
+            from opentelemetry.metrics import Observation
+
+            meter = metrics.get_meter("mint.model_work_scheduler")
+
+            def _attrs(**extra: object) -> dict[str, str]:
+                attrs = _otel_metric_attrs()
+                for key, value in extra.items():
+                    text = str(value if value is not None else "").strip()
+                    if text:
+                        attrs[key] = text
+                return attrs
+
+            def _gauge(name: str, callback, *, unit: str | None = None) -> None:
+                kwargs: dict[str, Any] = {"callbacks": [callback]}
+                if unit:
+                    kwargs["unit"] = unit
+                meter.create_observable_gauge(name, **kwargs)
+
+            def _scalar(field: str):
+                def _callback(_options):
+                    value = _metric_number(self._stats_snapshot().get(field))
+                    if value is None:
+                        return []
+                    return [Observation(value, _attrs())]
+
+                return _callback
+
+            _gauge("mint_model_work_scheduler_depth", _scalar("depth"))
+            _gauge("mint_model_work_scheduler_backlog_depth", _scalar("backlog_depth"))
+
+            def _counter(field: str):
+                def _callback(_options):
+                    counters = self._stats_snapshot().get("counters")
+                    if not isinstance(counters, dict):
+                        return []
+                    value = _metric_number(counters.get(field))
+                    if value is None:
+                        return []
+                    return [Observation(value, _attrs())]
+
+                return _callback
+
+            for key in (
+                "appended",
+                "assigned",
+                "claimed",
+                "completed",
+                "failed",
+                "requeued",
+                "stale_dropped",
+            ):
+                _gauge(f"mint_model_work_scheduler_{key}_total", _counter(key))
+
+            def _domain_backlog(_options):
+                backlog_by_domain = self._stats_snapshot().get("backlog_depth_by_domain")
+                if not isinstance(backlog_by_domain, dict):
+                    return []
+                observations = []
+                for domain_key, depth in sorted(backlog_by_domain.items()):
+                    value = _metric_number(depth)
+                    if value is None:
+                        continue
+                    observations.append(Observation(value, _attrs(domain_key=domain_key)))
+                return observations
+
+            _gauge("mint_model_work_scheduler_domain_backlog_depth", _domain_backlog)
+
+            def _replica_queue_depth(_options):
+                replica_queues = self._stats_snapshot().get("replica_queues")
+                if not isinstance(replica_queues, dict):
+                    return []
+                observations = []
+                for queue_id, rec in sorted(replica_queues.items()):
+                    if not isinstance(rec, dict):
+                        continue
+                    value = _metric_number(rec.get("depth"))
+                    if value is None:
+                        continue
+                    observations.append(
+                        Observation(
+                            value,
+                            _attrs(
+                                domain_key=rec.get("domain_key") or "unknown",
+                                replica_id=rec.get("replica_id") or "unknown",
+                                queue_id=queue_id,
+                                status=rec.get("status") or "unknown",
+                            ),
+                        )
+                    )
+                return observations
+
+            _gauge("mint_model_work_scheduler_replica_queue_depth", _replica_queue_depth)
+
+            def _leases(_options):
+                leases = self._stats_snapshot().get("leases")
+                if not isinstance(leases, list):
+                    return []
+                return [Observation(float(len(leases)), _attrs())]
+
+            _gauge("mint_model_work_scheduler_leases", _leases)
+
+            def _sample_model_load(metric: str):
+                def _callback(_options):
+                    stats = self._stats_snapshot()
+                    load: dict[str, dict[str, float]] = {}
+                    replica_queues = stats.get("replica_queues")
+                    if isinstance(replica_queues, dict):
+                        for rec in replica_queues.values():
+                            if not isinstance(rec, dict):
+                                continue
+                            base_model = _scheduler_domain_base_model(rec.get("domain_key"))
+                            if not base_model:
+                                continue
+                            bucket = load.setdefault(
+                                base_model,
+                                {"pending_requests": 0.0, "inflight_workers": 0.0, "capacity_workers": 0.0},
+                            )
+                            bucket["pending_requests"] += float(_metric_number(rec.get("depth")) or 0.0)
+                            if str(rec.get("status") or "").lower() in CLAIMABLE_REPLICA_STATUSES:
+                                bucket["capacity_workers"] += 1.0
+                    leases = stats.get("leases")
+                    if isinstance(leases, list):
+                        for lease in leases:
+                            if not isinstance(lease, dict):
+                                continue
+                            item = lease.get("item") if isinstance(lease.get("item"), dict) else {}
+                            base_model = _scheduler_domain_base_model(
+                                item.get("domain_key") or lease.get("domain_key")
+                            )
+                            if not base_model:
+                                continue
+                            bucket = load.setdefault(
+                                base_model,
+                                {"pending_requests": 0.0, "inflight_workers": 0.0, "capacity_workers": 0.0},
+                            )
+                            bucket["inflight_workers"] += 1.0
+                    observations = []
+                    for base_model, bucket in sorted(load.items()):
+                        capacity = float(bucket.get("capacity_workers", 0.0))
+                        values = {
+                            "pending_requests": float(bucket.get("pending_requests", 0.0)),
+                            "inflight_workers": float(bucket.get("inflight_workers", 0.0)),
+                            "capacity_workers": capacity,
+                            "load_pct": 0.0
+                            if capacity <= 0.0
+                            else 100.0 * float(bucket.get("inflight_workers", 0.0)) / capacity,
+                        }
+                        observations.append(
+                            Observation(
+                                values[metric],
+                                _attrs(base_model=base_model, workload="sample"),
+                            )
+                        )
+                    return observations
+
+                return _callback
+
+            _gauge("mint_model_load_pct", _sample_model_load("load_pct"))
+            _gauge("mint_model_pending_requests", _sample_model_load("pending_requests"))
+            _gauge("mint_model_inflight_workers", _sample_model_load("inflight_workers"))
+            _gauge("mint_model_capacity_workers", _sample_model_load("capacity_workers"))
+
+            self._otel_enabled = True
+        except Exception as e:
+            self._otel_error = f"{type(e).__name__}: {e}"
 
     def _all_request_ids(self) -> set[str]:
         return set(self._request_locations)
@@ -274,6 +501,9 @@ class _ModelWorkSchedulerActor:
             from .task_state_store import task_state_store
 
             self._task_state_store = task_state_store
+        async_method = getattr(self._task_state_store, f"async_future_{method}", None)
+        if callable(async_method):
+            return await async_method(**kwargs)
         async_method = getattr(self._task_state_store, f"async_{method}", None)
         if callable(async_method):
             return await async_method(**kwargs)
@@ -396,6 +626,38 @@ class _ModelWorkSchedulerActor:
             self._task_state_hydrated = True
         return epoch
 
+    def _task_record_matches_work_item(self, record: dict[str, Any], item: ModelWorkItem) -> bool:
+        if str(record.get("request_id") or "") != item.request_id:
+            return False
+        if str(record.get("op") or "") != item.op:
+            return False
+        if str(record.get("domain_key") or "") != item.domain_key:
+            return False
+        record_json = record.get("request_json")
+        if record_json is not None and bytes(record_json) != item.request_json:
+            return False
+        metadata = record.get("metadata")
+        if not isinstance(metadata, dict):
+            return True
+        record_hash = metadata.get("payload_hash") or record.get("payload_hash")
+        item_hash = item.extra.get("payload_hash")
+        if record_hash is not None and item_hash is not None and str(record_hash) != str(item_hash):
+            return False
+        return True
+
+    async def _duplicate_append_matches_hydrated_pending_task(self, item: ModelWorkItem) -> bool:
+        if not self._use_task_state_store:
+            return False
+        if item.request_id not in self._all_request_ids():
+            return False
+        try:
+            record = await self._task_state_call("get_task", request_id=item.request_id)
+        except Exception:
+            return False
+        if not isinstance(record, dict) or not self._task_record_matches_work_item(record, item):
+            return False
+        return str(record.get("status") or "") in {"pending", "queued", "assigned"}
+
     def _backlog(self, domain_key: str) -> deque[ModelWorkItem]:
         return self._domain_backlog.setdefault(str(domain_key), deque())
 
@@ -462,6 +724,70 @@ class _ModelWorkSchedulerActor:
     def _remove_request_location(self, request_id: str) -> None:
         self._request_locations.pop(str(request_id), None)
         self._lease_id_by_request_id.pop(str(request_id), None)
+
+    def _claim_conflict_cause(self, exc: BaseException) -> TaskStateConflictError | None:
+        if isinstance(exc, TaskStateConflictError):
+            return exc
+        as_instanceof_cause = getattr(exc, "as_instanceof_cause", None)
+        if callable(as_instanceof_cause):
+            try:
+                cause = as_instanceof_cause()
+            except Exception:
+                cause = None
+            if isinstance(cause, TaskStateConflictError):
+                return cause
+        cause = getattr(exc, "cause", None)
+        if isinstance(cause, TaskStateConflictError):
+            return cause
+        return None
+
+    async def _reconcile_assigned_claim_conflict(
+        self,
+        assigned: _AssignedWork,
+        *,
+        conflict: TaskStateConflictError,
+    ) -> str | None:
+        if "cannot claim assigned task" not in str(conflict):
+            return None
+        try:
+            record = await self._task_state_call("get_task", request_id=assigned.item.request_id)
+        except TaskStateNotFoundError:
+            self._remove_request_location(assigned.item.request_id)
+            self._stale_dropped += 1
+            logger.warning(
+                "[model_work_scheduler] dropped stale assigned queue item with missing task state request_id=%s queue_id=%s",
+                assigned.item.request_id,
+                assigned.queue_id,
+            )
+            return "missing"
+        status = str(record.get("status") or "")
+        same_assignment = (
+            status == "assigned"
+            and str(record.get("subqueue_id") or "") == str(assigned.queue_id)
+            and int(record.get("scheduler_epoch") or 0) == int(self._scheduler_epoch or 0)
+        )
+        if same_assignment:
+            return None
+        if status == "pending":
+            self._backlog(assigned.item.domain_key).appendleft(assigned.item)
+            self._request_locations[assigned.item.request_id] = "backlog"
+            self._requeued += 1
+            logger.warning(
+                "[model_work_scheduler] requeued stale assigned queue item whose task state is pending request_id=%s queue_id=%s",
+                assigned.item.request_id,
+                assigned.queue_id,
+            )
+            return "pending_requeued"
+        self._remove_request_location(assigned.item.request_id)
+        self._stale_dropped += 1
+        logger.warning(
+            "[model_work_scheduler] dropped stale assigned queue item after task-state claim conflict request_id=%s queue_id=%s status=%s terminal=%s",
+            assigned.item.request_id,
+            assigned.queue_id,
+            status or "unknown",
+            status in TERMINAL_TASK_STATUSES,
+        )
+        return status or "unknown"
 
     async def _expire_leases_locked(self, *, now: float) -> int:
         expired = 0
@@ -546,11 +872,28 @@ class _ModelWorkSchedulerActor:
             await self._ensure_task_state_ready()
         async with self._cv:
             if work.request_id in self._all_request_ids():
+                if not await self._duplicate_append_matches_hydrated_pending_task(work):
+                    return {
+                        "ok": False,
+                        "reason": "duplicate_request_id",
+                        "request_id": work.request_id,
+                    }
+                assigned = (
+                    await self._assign_pending_locked(max_items=assign_max_items)
+                    if bool(assign)
+                    else {"ok": True, "assigned": 0, "skipped_domains": []}
+                )
+                self._cv.notify_all()
                 return {
-                    "ok": False,
-                    "reason": "duplicate_request_id",
+                    "ok": True,
                     "request_id": work.request_id,
+                    "domain_key": work.domain_key,
+                    "scheduler_instance_id": self._instance_id,
+                    "backlog_depth": len(self._backlog(work.domain_key)),
+                    "assigned": assigned,
+                    "idempotent": True,
                 }
+            created: dict[str, Any] | None = None
             if self._use_task_state_store:
                 created = await self._task_state_call(
                     "create_task",
@@ -571,11 +914,19 @@ class _ModelWorkSchedulerActor:
                     },
                 )
                 if isinstance(created, dict) and not bool(created.get("created", True)):
-                    return {
-                        "ok": False,
-                        "reason": "duplicate_request_id",
-                        "request_id": work.request_id,
-                    }
+                    record = created.get("record")
+                    if not isinstance(record, dict) or not self._task_record_matches_work_item(record, work):
+                        return {
+                            "ok": False,
+                            "reason": "duplicate_request_id",
+                            "request_id": work.request_id,
+                        }
+                    if str(record.get("status") or "") not in {"pending", "queued"}:
+                        return {
+                            "ok": False,
+                            "reason": "duplicate_request_id",
+                            "request_id": work.request_id,
+                        }
             self._backlog(work.domain_key).append(work)
             self._request_locations[work.request_id] = "backlog"
             self._appended += 1
@@ -811,17 +1162,30 @@ class _ModelWorkSchedulerActor:
                     )
                     assigned.item = item
                 if self._use_task_state_store:
-                    await self._task_state_call(
-                        "claim_task",
-                        request_id=item.request_id,
-                        subqueue_id=assigned.queue_id,
-                        lease_id=lease_id,
-                        attempt_id=attempt_id,
-                        consumer_id=consumer_id,
-                        scheduler_epoch=int(self._scheduler_epoch or 0),
-                        runtime_generation=int(consumer_generation),
-                        lease_ttl_s=max(1.0, float(lease_ttl_s)),
-                    )
+                    try:
+                        await self._task_state_call(
+                            "claim_task",
+                            request_id=item.request_id,
+                            subqueue_id=assigned.queue_id,
+                            lease_id=lease_id,
+                            attempt_id=attempt_id,
+                            consumer_id=consumer_id,
+                            scheduler_epoch=int(self._scheduler_epoch or 0),
+                            runtime_generation=int(consumer_generation),
+                            lease_ttl_s=max(1.0, float(lease_ttl_s)),
+                        )
+                    except Exception as e:
+                        conflict = self._claim_conflict_cause(e)
+                        if conflict is None:
+                            raise
+                        reconciled = await self._reconcile_assigned_claim_conflict(
+                            assigned,
+                            conflict=conflict,
+                        )
+                        if reconciled is None:
+                            raise
+                        queue.popleft()
+                        continue
                 queue.popleft()
                 lease = ModelWorkLease(
                     lease_id=lease_id,
@@ -993,8 +1357,7 @@ class _ModelWorkSchedulerActor:
                 self._cv.notify_all()
             return {"ok": True, "expired": expired}
 
-    def stats(self) -> dict[str, Any]:
-        self._ensure_assignment_loop_started()
+    def _stats_snapshot(self) -> dict[str, Any]:
         now = time.time()
         backlog_depth_by_domain = {
             domain: len(backlog) for domain, backlog in sorted(self._domain_backlog.items())
@@ -1015,6 +1378,7 @@ class _ModelWorkSchedulerActor:
         return {
             "actor_name": _ray_model_work_scheduler_actor_name(),
             "namespace": _ray_namespace(),
+            "code_identity": CURRENT_CODE_IDENTITY,
             "scheduler_instance_id": self._instance_id,
             "scheduler_epoch": self._scheduler_epoch,
             "task_state_store_enabled": self._use_task_state_store,
@@ -1036,8 +1400,13 @@ class _ModelWorkSchedulerActor:
                 "completed": self._completed,
                 "failed": self._failed,
                 "requeued": self._requeued,
+                "stale_dropped": self._stale_dropped,
             },
         }
+
+    def stats(self) -> dict[str, Any]:
+        self._ensure_assignment_loop_started()
+        return self._stats_snapshot()
 
     def ping(self) -> dict[str, Any]:
         return {
@@ -1045,6 +1414,7 @@ class _ModelWorkSchedulerActor:
             "actor_name": _ray_model_work_scheduler_actor_name(),
             "namespace": _ray_namespace(),
             "scheduler_instance_id": self._instance_id,
+            "code_identity": CURRENT_CODE_IDENTITY,
         }
 
 
@@ -1056,7 +1426,7 @@ def _create_ray_actor(*, require_ready: bool = True):
     import ray
 
     actor_name = _ray_model_work_scheduler_actor_name()
-    max_concurrency = int(os.environ.get("MINT_MODEL_WORK_SCHEDULER_ACTOR_MAX_CONCURRENCY", "256"))
+    max_concurrency = int(os.environ.get("MINT_MODEL_WORK_SCHEDULER_ACTOR_MAX_CONCURRENCY", "64"))
     options: dict[str, Any] = {
         "name": actor_name,
         "namespace": _ray_namespace(),
@@ -1067,16 +1437,25 @@ def _create_ray_actor(*, require_ready: bool = True):
     resources = _model_work_scheduler_actor_resources()
     if resources:
         options["resources"] = resources
+    else:
+        apply_detached_actor_resources(options, ray)
 
-    @ray.remote(num_cpus=0, max_concurrency=max_concurrency, max_restarts=0)
+    @ray.remote(
+        num_cpus=0,
+        max_concurrency=max_concurrency,
+        max_restarts=0,
+        concurrency_groups={"health": 8},
+    )
     class _RayModelWorkSchedulerActor(_ModelWorkSchedulerActor):
-        pass
+        @ray.method(concurrency_group="health")
+        def ping(self) -> dict[str, Any]:
+            return super().ping()
 
     actor = _RayModelWorkSchedulerActor.options(**options).remote(use_task_state_store=True)
     if require_ready:
-        stats = _await_ray_ref_sync(actor.stats.remote(), timeout_s=5.0)
-        if not isinstance(stats, dict):
-            raise TypeError(f"ModelWorkScheduler.stats returned non-dict: {type(stats)}")
+        out = _await_ray_ref_sync(actor.ping.remote(), timeout_s=5.0)
+        if not isinstance(out, dict):
+            raise TypeError(f"ModelWorkScheduler.ping returned non-dict: {type(out)}")
     return actor
 
 
@@ -1086,6 +1465,33 @@ class ModelWorkSchedulerClient:
 
     def _reset_ray_actor(self) -> None:
         self._ray_actor = None
+
+    def _validate_code_identity(self, snapshot: dict[str, Any]) -> None:
+        if not CURRENT_CODE_IDENTITY:
+            return
+        actor_code_identity = snapshot.get("code_identity")
+        if actor_code_identity == CURRENT_CODE_IDENTITY:
+            return
+        raise ModelWorkSchedulerCodeIdentityMismatchError(
+            "model work scheduler code identity mismatch: "
+            f"expected={CURRENT_CODE_IDENTITY!r} actual={actor_code_identity!r}"
+        )
+
+    def _kill_cached_actor_for_code_identity_mismatch(self, exc: BaseException) -> None:
+        actor = self._ray_actor
+        self._reset_ray_actor()
+        if actor is None:
+            raise exc
+        _append_model_work_scheduler_debug(
+            "kill_actor_code_identity_mismatch",
+            expected_code_identity=CURRENT_CODE_IDENTITY,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        try:
+            import ray
+        except Exception as e:
+            raise ModelWorkSchedulerUnavailableError("Ray import failed") from e
+        ray.kill(actor, no_restart=True)
 
     async def _get_ray_actor_async(
         self,
@@ -1107,13 +1513,16 @@ class ModelWorkSchedulerClient:
         if not ray.is_initialized():
             raise ModelWorkSchedulerUnavailableError("Ray not initialized")
         if self._ray_actor is not None:
-            if not require_ready:
-                return self._ray_actor
             try:
-                stats = await self._await_ray_ref(self._ray_actor.stats.remote(), timeout_s=1.0)
-                if not isinstance(stats, dict):
-                    raise TypeError(f"ModelWorkScheduler.stats returned non-dict: {type(stats)}")
+                out = await self._await_ray_ref(self._ray_actor.ping.remote(), timeout_s=1.0)
+                if not isinstance(out, dict):
+                    raise TypeError(f"ModelWorkScheduler.ping returned non-dict: {type(out)}")
+                self._validate_code_identity(out)
                 return self._ray_actor
+            except ModelWorkSchedulerCodeIdentityMismatchError:
+                self._reset_ray_actor()
+                if not create_if_missing:
+                    raise
             except Exception:
                 self._reset_ray_actor()
 
@@ -1124,7 +1533,18 @@ class ModelWorkSchedulerClient:
                 actor_name,
                 namespace=_ray_namespace(),
             )
+            out = await self._await_ray_ref(
+                self._ray_actor.ping.remote(),
+                timeout_s=5.0 if require_ready else 1.0,
+            )
+            if not isinstance(out, dict):
+                raise TypeError(f"ModelWorkScheduler.ping returned non-dict: {type(out)}")
+            self._validate_code_identity(out)
             return self._ray_actor
+        except ModelWorkSchedulerCodeIdentityMismatchError as e:
+            if not create_if_missing:
+                raise
+            await asyncio.to_thread(self._kill_cached_actor_for_code_identity_mismatch, e)
         except ValueError:
             if not create_if_missing:
                 raise ModelWorkSchedulerUnavailableError(
@@ -1432,6 +1852,17 @@ class ModelWorkSchedulerClient:
         out = await self._await_ray_ref(actor.stats.remote(), timeout_s=timeout_s)
         if not isinstance(out, dict):
             raise TypeError(f"ModelWorkScheduler.stats returned non-dict: {type(out)}")
+        try:
+            self._validate_code_identity(out)
+        except ModelWorkSchedulerCodeIdentityMismatchError as e:
+            if not create_if_missing:
+                raise
+            await asyncio.to_thread(self._kill_cached_actor_for_code_identity_mismatch, e)
+            actor = await self._get_ray_actor_async(require_ready=False, create_if_missing=True)
+            out = await self._await_ray_ref(actor.stats.remote(), timeout_s=timeout_s)
+            if not isinstance(out, dict):
+                raise TypeError(f"ModelWorkScheduler.stats returned non-dict: {type(out)}")
+            self._validate_code_identity(out)
         return out
 
     async def async_ping(self, *, timeout_s: float = 5.0) -> dict[str, Any]:
@@ -1445,6 +1876,7 @@ class ModelWorkSchedulerClient:
             raise TypeError(f"ModelWorkScheduler.ping returned non-dict: {type(out)}")
         if not bool(out.get("ok")):
             raise ModelWorkSchedulerUnavailableError(f"ModelWorkScheduler ping failed: {out!r}")
+        self._validate_code_identity(out)
         return out
 
     async def ping(self, *, timeout_s: float = 5.0) -> dict[str, Any]:

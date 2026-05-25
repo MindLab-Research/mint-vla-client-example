@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -916,12 +915,13 @@ class ModelActorInventory:
             rec["rss_cache_state"] = "stale"
         return rec
 
-    def cached_snapshot(self) -> list[dict[str, Any]]:
+    def cached_snapshot(self, *, refresh_metadata: bool = True) -> list[dict[str, Any]]:
         now = time.time()
         with self._pool_lock:
             entries = list(self._entries.values())
-        for entry in entries:
-            self._refresh_entry_metadata(entry, now=now)
+        if refresh_metadata:
+            for entry in entries:
+                self._refresh_entry_metadata(entry, now=now)
         return [self._cached_snapshot_record(entry, now=now) for entry in entries]
 
     def rss_snapshot(self, *, timeout_s: float = 10.0) -> list[dict]:
@@ -949,6 +949,15 @@ class ModelActorInventory:
             try:
                 rss = ray.get(handle.get_rss_bytes.remote(), timeout=float(timeout_s))
                 rec["rss_bytes"] = int(cast(Any, rss))
+                rec["rss_sample_age_s"] = 0.0
+                rec["rss_sample_source"] = "rss_snapshot"
+                rec["rss_cache_state"] = "fresh"
+                with self._local_lock:
+                    current = self._entries.get(entry.actor_name)
+                    if current is not None:
+                        current.rss_bytes = int(cast(Any, rss))
+                        current.rss_sample_time = now
+                        current.rss_sample_source = "rss_snapshot"
             except Exception as ex:
                 rec["rss_bytes"] = 0
                 rec["error"] = f"{type(ex).__name__}: {ex}"

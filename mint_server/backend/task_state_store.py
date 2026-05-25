@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import sqlite3
@@ -13,10 +12,11 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Iterator
 
-from ..config import PFS_PYTHONPATH, actor_runtime_env, config as server_config, otel_env_vars
+from ..config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources, config as server_config, otel_env_vars
 from ..runtime_env import env_nonempty
 from .async_ray_control import async_get_ray_ref, sync_get_ray_ref
 from .model_work_execution_context import ModelWorkFinalize, get_current_model_work_finalize_buffer
+from .task_hot_kv_store import TaskHotKVStore
 
 
 ACTIVE_TASK_STATUSES = frozenset({"pending", "queued", "running", "assigned", "leased", "finalizing"})
@@ -28,6 +28,12 @@ _REAPER_METRICS: dict[str, float] = {
     "delete_tombstone": 0.0,
 }
 _REAPER_PAYLOAD_EVICT_ERRORS_TOTAL = 0.0
+_FUTURE_TIMEOUT_METRICS: dict[str, Any] = {
+    "queue": 0.0,
+    "execution": 0.0,
+    "total": 0.0,
+    "by_op": {},
+}
 _BILLING_EVENT_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "mindlab.mint.billing.usage_event.v1")
 BILLING_OUTBOX_STATUSES = frozenset({"pending", "flushing", "failed"})
 _BILLING_FLUSH_METRICS: dict[str, float] = {
@@ -204,6 +210,26 @@ def _now(now: float | None = None) -> float:
     return time.time() if now is None else float(now)
 
 
+def _otel_metric_attrs() -> dict[str, str]:
+    attrs = {
+        "deployment.env": os.getenv("MINT_DEPLOYMENT_ENV", "").strip(),
+        "mint.cluster_id": os.getenv("MINT_CLUSTER_ID", "").strip(),
+        "ray_namespace": _ray_namespace(),
+    }
+    return {key: value for key, value in attrs.items() if value}
+
+
+def _metric_number(value: object) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _json_dumps(value: dict[str, Any] | None) -> str:
     return json.dumps({} if value is None else dict(value), ensure_ascii=True, sort_keys=True)
 
@@ -266,11 +292,46 @@ def _inc_payload_evict_errors(count: int = 1) -> None:
         pass
 
 
+def _inc_future_timeout(kind: str, *, op: str | None = None, count: int = 1) -> None:
+    if int(count) <= 0:
+        return
+    normalized = str(kind or "execution")
+    if normalized not in {"queue", "execution"}:
+        normalized = "execution"
+    amount = float(count)
+    _FUTURE_TIMEOUT_METRICS[normalized] = float(_FUTURE_TIMEOUT_METRICS.get(normalized) or 0.0) + amount
+    _FUTURE_TIMEOUT_METRICS["total"] = float(_FUTURE_TIMEOUT_METRICS.get("total") or 0.0) + amount
+    if isinstance(op, str) and op.strip():
+        by_op = _FUTURE_TIMEOUT_METRICS.setdefault("by_op", {})
+        if isinstance(by_op, dict):
+            op_key = op.strip()
+            rec = by_op.setdefault(op_key, {"queue": 0.0, "execution": 0.0, "total": 0.0})
+            if isinstance(rec, dict):
+                rec[normalized] = float(rec.get(normalized) or 0.0) + amount
+                rec["total"] = float(rec.get("total") or 0.0) + amount
+    try:
+        from ..logging_context import record_task_futures_timeout_metric
+
+        record_task_futures_timeout_metric(kind=normalized, op=op)
+        record_task_futures_timeout_metric(kind="total", op=op)
+    except Exception:
+        pass
+
+
 def _inc_billing_metric(key: str, count: int = 1) -> None:
     if int(count) <= 0:
         return
     name = str(key)
     _BILLING_FLUSH_METRICS[name] = float(_BILLING_FLUSH_METRICS.get(name, 0.0)) + float(count)
+
+
+def _inc_billing_metrics(metrics: dict[str, Any]) -> None:
+    for key, value in dict(metrics or {}).items():
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            continue
+        _inc_billing_metric(str(key), count)
 
 
 def billing_metrics_snapshot() -> dict[str, Any]:
@@ -281,6 +342,26 @@ def task_future_reaper_metrics_snapshot() -> dict[str, Any]:
     return {
         "rows_total": dict(_REAPER_METRICS),
         "payload_evict_errors_total": float(_REAPER_PAYLOAD_EVICT_ERRORS_TOTAL),
+    }
+
+
+def future_timeout_metrics_snapshot() -> dict[str, Any]:
+    by_op: dict[str, dict[str, float]] = {}
+    raw_by_op = _FUTURE_TIMEOUT_METRICS.get("by_op")
+    if isinstance(raw_by_op, dict):
+        for op, rec in raw_by_op.items():
+            if not isinstance(rec, dict):
+                continue
+            by_op[str(op)] = {
+                "queue": float(rec.get("queue") or 0.0),
+                "execution": float(rec.get("execution") or 0.0),
+                "total": float(rec.get("total") or 0.0),
+            }
+    return {
+        "queue": float(_FUTURE_TIMEOUT_METRICS.get("queue") or 0.0),
+        "execution": float(_FUTURE_TIMEOUT_METRICS.get("execution") or 0.0),
+        "total": float(_FUTURE_TIMEOUT_METRICS.get("total") or 0.0),
+        "by_op": by_op,
     }
 
 
@@ -376,13 +457,7 @@ class TaskStateStore:
     def __init__(self, db_path: str | os.PathLike[str]) -> None:
         self._db_path = str(db_path)
         self._lock = threading.RLock()
-        self._sampling_sessions: dict[str, dict[str, Any]] = {}
-        self._session_index: dict[str, dict[str, Any]] = {}
-        self._sampler_index: dict[str, dict[str, Any]] = {}
-        self._session_heartbeats: dict[str, float] = {}
-        self._training_sessions: dict[str, dict[str, Any]] = {}
-        self._gateway_sampling_sessions: dict[str, dict[str, str]] = {}
-        self._gateway_training_models: dict[str, dict[str, str | None]] = {}
+        self._hot_kv = TaskHotKVStore(":memory:" if self._db_path == ":memory:" else _task_hot_kv_store_db_path(self._db_path))
         self._session_heartbeat_max_age_s = float(
             os.environ.get("MINT_SESSION_HEARTBEAT_MAX_AGE_S", str(7 * 24 * 3600))
         )
@@ -411,6 +486,7 @@ class TaskStateStore:
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+        self._hot_kv.close()
 
     def ping(self) -> dict[str, Any]:
         with self._lock:
@@ -428,46 +504,50 @@ class TaskStateStore:
         incoming.setdefault("uses_base_model", False)
         incoming.setdefault("inflight_requests", 0)
         incoming_version = int(incoming.get("metadata_version") or 0)
-        with self._lock:
-            existing = self._sampling_sessions.get(session_id)
-            if existing is not None:
-                existing_version = int(existing.get("metadata_version") or 0)
-                if incoming_version and incoming_version < existing_version:
-                    if "last_activity" in incoming:
-                        existing["last_activity"] = max(
-                            float(existing.get("last_activity") or 0.0),
-                            float(incoming.get("last_activity") or 0.0),
-                        )
-                    return
-                merged = {**existing, **incoming}
-                merged["metadata_version"] = max(existing_version + 1, incoming_version, 1)
-                self._sampling_sessions[session_id] = merged
-                return
-            incoming["metadata_version"] = max(incoming_version, 1)
-            self._sampling_sessions[session_id] = incoming
+
+        def _mutate(existing: dict[str, Any] | None) -> dict[str, Any]:
+            if existing is None:
+                incoming["metadata_version"] = max(incoming_version, 1)
+                return incoming
+            existing_version = int(existing.get("metadata_version") or 0)
+            if incoming_version and incoming_version < existing_version:
+                if "last_activity" in incoming:
+                    existing["last_activity"] = max(
+                        float(existing.get("last_activity") or 0.0),
+                        float(incoming.get("last_activity") or 0.0),
+                    )
+                return existing
+            merged = {**existing, **incoming}
+            merged["metadata_version"] = max(existing_version + 1, incoming_version, 1)
+            return merged
+
+        self._hot_kv.mutate_record("sampling_session", session_id, _mutate)
 
     def delete_sampling_session(self, *, session_id: str) -> None:
-        with self._lock:
-            self._sampling_sessions.pop(str(session_id), None)
+        self._hot_kv.delete_record("sampling_session", str(session_id))
 
     def set_sampling_session_last_activity(self, *, session_id: str, last_activity: float) -> float | None:
         ts = float(last_activity)
-        with self._lock:
-            existing = self._sampling_sessions.get(str(session_id))
-            if existing is None:
-                return None
-            existing["last_activity"] = ts
-            existing["metadata_version"] = int(existing.get("metadata_version") or 0) + 1
-            return ts
+        updated = self._hot_kv.mutate_record(
+            "sampling_session",
+            str(session_id),
+            lambda existing: None
+            if existing is None
+            else {
+                **existing,
+                "last_activity": ts,
+                "metadata_version": int(existing.get("metadata_version") or 0) + 1,
+            },
+        )
+        if updated is None:
+            return None
+        return ts
 
     def get_sampling_session(self, *, session_id: str) -> dict[str, Any] | None:
-        with self._lock:
-            existing = self._sampling_sessions.get(str(session_id))
-            return dict(existing) if existing is not None else None
+        return self._hot_kv.get_record("sampling_session", str(session_id))
 
     def list_sampling_sessions(self) -> list[dict[str, Any]]:
-        with self._lock:
-            return [dict(value) for value in self._sampling_sessions.values()]
+        return self._hot_kv.list_records("sampling_session")
 
     def upsert_training_session(self, *, model_id: str, info: dict[str, Any]) -> None:
         model_id = str(model_id)
@@ -478,8 +558,9 @@ class TaskStateStore:
         incoming.setdefault("current_step", 0)
         incoming.setdefault("last_activity", time.time())
         incoming_version = max(1, int(incoming.get("metadata_version") or 1))
-        with self._lock:
-            current = dict(self._training_sessions.get(model_id, {}))
+
+        def _mutate(existing: dict[str, Any] | None) -> dict[str, Any]:
+            current = dict(existing or {})
             current_version = max(1, int(current.get("metadata_version") or 1))
             if incoming_version < current_version:
                 incoming_last_activity = float(incoming.get("last_activity", 0.0) or 0.0)
@@ -491,50 +572,57 @@ class TaskStateStore:
                     current["current_step"] = max(current_step, incoming_step)
                 except Exception:
                     pass
-                self._training_sessions[model_id] = current
-                return
+                return current
             merged = {**current, **incoming}
             merged.setdefault("current_step", int(current.get("current_step", 0)))
             merged.setdefault("last_activity", time.time())
             merged["metadata_version"] = incoming_version
-            self._training_sessions[model_id] = merged
+            return merged
+
+        self._hot_kv.mutate_record("training_session", model_id, _mutate)
 
     def delete_training_session(self, *, model_id: str) -> None:
-        with self._lock:
-            self._training_sessions.pop(str(model_id), None)
+        self._hot_kv.delete_record("training_session", str(model_id))
 
     def set_training_session_last_activity(self, *, model_id: str, last_activity: float) -> float | None:
-        with self._lock:
-            info = self._training_sessions.get(str(model_id))
-            if info is None:
-                return None
-            info["last_activity"] = float(last_activity)
-            return float(info["last_activity"])
+        updated = self._hot_kv.mutate_record(
+            "training_session",
+            str(model_id),
+            lambda info: None if info is None else {**info, "last_activity": float(last_activity)},
+        )
+        if updated is None:
+            return None
+        return float(updated["last_activity"])
 
     def get_training_session(self, *, model_id: str) -> dict[str, Any] | None:
-        with self._lock:
-            info = self._training_sessions.get(str(model_id))
-            return dict(info) if info is not None else None
+        return self._hot_kv.get_record("training_session", str(model_id))
 
     def bump_training_session_step(self, *, model_id: str) -> int:
-        with self._lock:
-            info = self._training_sessions.get(str(model_id))
-            if info is None:
-                return 0
-            info["current_step"] = int(info.get("current_step", 0)) + 1
-            return int(info["current_step"])
+        updated = self._hot_kv.mutate_record(
+            "training_session",
+            str(model_id),
+            lambda info: None
+            if info is None
+            else {**info, "current_step": int(info.get("current_step", 0)) + 1},
+        )
+        if updated is None:
+            return 0
+        return int(updated["current_step"])
 
     def set_training_session_step(self, *, model_id: str, step: int) -> int:
-        with self._lock:
-            info = self._training_sessions.get(str(model_id))
-            if info is None:
-                return int(step)
-            info["current_step"] = max(int(info.get("current_step", 0)), int(step))
-            return int(info["current_step"])
+        updated = self._hot_kv.mutate_record(
+            "training_session",
+            str(model_id),
+            lambda info: None
+            if info is None
+            else {**info, "current_step": max(int(info.get("current_step", 0)), int(step))},
+        )
+        if updated is None:
+            return int(step)
+        return int(updated["current_step"])
 
     def list_training_sessions(self) -> list[dict[str, Any]]:
-        with self._lock:
-            return [dict(value) for value in self._training_sessions.values()]
+        return self._hot_kv.list_records("training_session")
 
     def upsert_gateway_sampling_session(
         self,
@@ -543,20 +631,27 @@ class TaskStateStore:
         upstream_alias: str,
         base_model: str,
     ) -> None:
-        with self._lock:
-            self._gateway_sampling_sessions[str(sampling_session_id)] = {
+        self._hot_kv.replace_record(
+            "gateway_sampling_session",
+            str(sampling_session_id),
+            {
+                "sampling_session_id": str(sampling_session_id),
                 "upstream_alias": str(upstream_alias),
                 "base_model": str(base_model),
-            }
+            },
+        )
 
     def get_gateway_sampling_session(self, *, sampling_session_id: str) -> dict[str, str] | None:
-        with self._lock:
-            info = self._gateway_sampling_sessions.get(str(sampling_session_id))
-            return dict(info) if info is not None else None
+        info = self._hot_kv.get_record("gateway_sampling_session", str(sampling_session_id))
+        if info is None:
+            return None
+        return {
+            "upstream_alias": str(info.get("upstream_alias") or ""),
+            "base_model": str(info.get("base_model") or ""),
+        }
 
     def delete_gateway_sampling_session(self, *, sampling_session_id: str) -> None:
-        with self._lock:
-            self._gateway_sampling_sessions.pop(str(sampling_session_id), None)
+        self._hot_kv.delete_record("gateway_sampling_session", str(sampling_session_id))
 
     def upsert_gateway_training_model(
         self,
@@ -566,28 +661,45 @@ class TaskStateStore:
         base_model: str,
         owner_id: str | None = None,
     ) -> None:
-        with self._lock:
-            self._gateway_training_models[str(model_id)] = {
+        self._hot_kv.replace_record(
+            "gateway_training_model",
+            str(model_id),
+            {
+                "model_id": str(model_id),
                 "upstream_alias": str(upstream_alias),
                 "base_model": str(base_model),
                 "owner_id": None if owner_id is None else str(owner_id),
-            }
+            },
+        )
 
     def get_gateway_training_model(self, *, model_id: str) -> dict[str, str | None] | None:
-        with self._lock:
-            info = self._gateway_training_models.get(str(model_id))
-            return dict(info) if info is not None else None
+        info = self._hot_kv.get_record("gateway_training_model", str(model_id))
+        if info is None:
+            return None
+        return {
+            "upstream_alias": str(info.get("upstream_alias") or ""),
+            "base_model": str(info.get("base_model") or ""),
+            "owner_id": None if info.get("owner_id") is None else str(info.get("owner_id")),
+        }
 
     def delete_gateway_training_model(self, *, model_id: str) -> None:
-        with self._lock:
-            self._gateway_training_models.pop(str(model_id), None)
+        self._hot_kv.delete_record("gateway_training_model", str(model_id))
 
     def list_gateway_routes(self) -> dict[str, Any]:
-        with self._lock:
-            return {
-                "sampling_sessions": dict(self._gateway_sampling_sessions),
-                "training_models": dict(self._gateway_training_models),
-            }
+        return {
+            "sampling_sessions": {
+                str(item.get("sampling_session_id") or ""): {
+                    key: value
+                    for key, value in item.items()
+                    if key != "sampling_session_id"
+                }
+                for item in self._hot_kv.list_records("gateway_sampling_session")
+            },
+            "training_models": {
+                str(item.get("model_id") or ""): {key: value for key, value in item.items() if key != "model_id"}
+                for item in self._hot_kv.list_records("gateway_training_model")
+            },
+        }
 
     def upsert_session_index(self, *, session_id: str, info: dict[str, Any]) -> None:
         session_id = str(session_id)
@@ -595,13 +707,15 @@ class TaskStateStore:
             raise ValueError("session_id is required")
         incoming = dict(info)
         incoming["session_id"] = session_id
-        with self._lock:
-            existing = self._session_index.get(session_id, {})
+        def _mutate(existing: dict[str, Any] | None) -> dict[str, Any]:
+            existing = existing or {}
             merged = {**existing, **incoming}
             merged.setdefault("training_run_ids", list(existing.get("training_run_ids") or []))
             merged.setdefault("sampler_ids", list(existing.get("sampler_ids") or []))
             merged.setdefault("heartbeat_sampler_ids", list(existing.get("heartbeat_sampler_ids") or []))
-            self._session_index[session_id] = merged
+            return merged
+
+        self._hot_kv.mutate_record("session_index", session_id, _mutate)
 
     def add_training_run_to_session_index(
         self,
@@ -613,8 +727,8 @@ class TaskStateStore:
     ) -> None:
         session_id = str(session_id)
         training_run_id = str(training_run_id)
-        with self._lock:
-            item = dict(self._session_index.get(session_id) or {"session_id": session_id})
+        def _mutate(existing: dict[str, Any] | None) -> dict[str, Any]:
+            item = dict(existing or {"session_id": session_id})
             runs = list(item.get("training_run_ids") or [])
             if training_run_id not in runs:
                 runs.append(training_run_id)
@@ -625,7 +739,9 @@ class TaskStateStore:
                 item.setdefault("user_id", str(user_id))
             if created_at is not None:
                 item.setdefault("created_at", created_at)
-            self._session_index[session_id] = item
+            return item
+
+        self._hot_kv.mutate_record("session_index", session_id, _mutate)
 
     def add_sampler_to_session_index(
         self,
@@ -637,8 +753,8 @@ class TaskStateStore:
     ) -> None:
         session_id = str(session_id)
         sampler_id = str(sampler_id)
-        with self._lock:
-            item = dict(self._session_index.get(session_id) or {"session_id": session_id})
+        def _mutate(existing: dict[str, Any] | None) -> dict[str, Any]:
+            item = dict(existing or {"session_id": session_id})
             samplers = list(item.get("sampler_ids") or [])
             if sampler_id not in samplers:
                 samplers.append(sampler_id)
@@ -649,7 +765,9 @@ class TaskStateStore:
                 item.setdefault("user_id", str(user_id))
             if created_at is not None:
                 item.setdefault("created_at", created_at)
-            self._session_index[session_id] = item
+            return item
+
+        self._hot_kv.mutate_record("session_index", session_id, _mutate)
 
     def add_heartbeat_sampler_to_session_index(
         self,
@@ -661,8 +779,8 @@ class TaskStateStore:
     ) -> None:
         session_id = str(session_id)
         sampler_id = str(sampler_id)
-        with self._lock:
-            item = dict(self._session_index.get(session_id) or {"session_id": session_id})
+        def _mutate(existing: dict[str, Any] | None) -> dict[str, Any]:
+            item = dict(existing or {"session_id": session_id})
             samplers = list(item.get("sampler_ids") or [])
             if sampler_id not in samplers:
                 samplers.append(sampler_id)
@@ -676,27 +794,29 @@ class TaskStateStore:
                 item.setdefault("user_id", str(user_id))
             if created_at is not None:
                 item.setdefault("created_at", created_at)
-            self._session_index[session_id] = item
+            return item
+
+        self._hot_kv.mutate_record("session_index", session_id, _mutate)
 
     def remove_sampler_from_session_index(self, *, session_id: str, sampler_id: str) -> None:
-        with self._lock:
-            item = self._session_index.get(str(session_id))
+        def _mutate(existing: dict[str, Any] | None) -> dict[str, Any] | None:
+            item = existing
             if item is None:
-                return
+                return None
             sid = str(sampler_id)
             item["sampler_ids"] = [x for x in list(item.get("sampler_ids") or []) if str(x) != sid]
             item["heartbeat_sampler_ids"] = [
                 x for x in list(item.get("heartbeat_sampler_ids") or []) if str(x) != sid
             ]
+            return item
+
+        self._hot_kv.mutate_record("session_index", str(session_id), _mutate)
 
     def get_session_index(self, *, session_id: str) -> dict[str, Any] | None:
-        with self._lock:
-            existing = self._session_index.get(str(session_id))
-            return dict(existing) if existing is not None else None
+        return self._hot_kv.get_record("session_index", str(session_id))
 
     def list_session_index(self) -> list[dict[str, Any]]:
-        with self._lock:
-            return [dict(value) for value in self._session_index.values()]
+        return self._hot_kv.list_records("session_index")
 
     def upsert_sampler_index(self, *, sampler_id: str, info: dict[str, Any]) -> None:
         sampler_id = str(sampler_id)
@@ -704,46 +824,39 @@ class TaskStateStore:
             raise ValueError("sampler_id is required")
         incoming = dict(info)
         incoming["sampler_id"] = sampler_id
-        with self._lock:
-            self._sampler_index[sampler_id] = {**self._sampler_index.get(sampler_id, {}), **incoming}
+        self._hot_kv.upsert_record("sampler_index", sampler_id, incoming)
 
     def delete_sampler_index(self, *, sampler_id: str) -> None:
-        with self._lock:
-            self._sampler_index.pop(str(sampler_id), None)
+        self._hot_kv.delete_record("sampler_index", str(sampler_id))
 
     def get_sampler_index(self, *, sampler_id: str) -> dict[str, Any] | None:
-        with self._lock:
-            existing = self._sampler_index.get(str(sampler_id))
-            return dict(existing) if existing is not None else None
+        return self._hot_kv.get_record("sampler_index", str(sampler_id))
 
     def list_sampler_index(self) -> list[dict[str, Any]]:
-        with self._lock:
-            return [dict(value) for value in self._sampler_index.values()]
+        return self._hot_kv.list_records("sampler_index")
 
     def update_session_heartbeat(self, *, session_id: str, now: float | None = None) -> None:
         session_id = str(session_id)
         if not session_id:
             return
         ts = _now(now)
+        self._hot_kv.update_heartbeat(session_id=session_id, now=ts)
         with self._lock:
-            self._session_heartbeats[session_id] = ts
             self._session_heartbeat_updates_since_prune += 1
-            if self._session_heartbeat_updates_since_prune >= self._session_heartbeat_prune_every:
+            should_prune = self._session_heartbeat_updates_since_prune >= self._session_heartbeat_prune_every
+            if should_prune:
                 self._session_heartbeat_updates_since_prune = 0
-                self._prune_session_heartbeats_locked(now=ts, max_age_s=self._session_heartbeat_max_age_s)
+        if should_prune:
+            self._hot_kv.prune_heartbeats(now=ts, max_age_s=self._session_heartbeat_max_age_s)
 
     def get_session_heartbeat(self, *, session_id: str) -> float | None:
-        with self._lock:
-            value = self._session_heartbeats.get(str(session_id))
-            return None if value is None else float(value)
+        return self._hot_kv.get_heartbeat(session_id=str(session_id))
 
     def delete_session_heartbeat(self, *, session_id: str) -> bool:
-        with self._lock:
-            return self._session_heartbeats.pop(str(session_id), None) is not None
+        return self._hot_kv.delete_record("heartbeat", str(session_id))
 
     def session_heartbeat_size(self) -> int:
-        with self._lock:
-            return len(self._session_heartbeats)
+        return self._hot_kv.heartbeat_size()
 
     def is_session_heartbeat_stale(self, *, session_id: str, ttl_s: float, now: float | None = None) -> bool:
         ttl = float(ttl_s)
@@ -753,24 +866,16 @@ class TaskStateStore:
         if not session_id:
             return False
         ts = _now(now)
-        with self._lock:
-            last = self._session_heartbeats.get(session_id)
+        last = self._hot_kv.get_heartbeat(session_id=session_id)
         if last is None:
             return False
         return (ts - float(last)) > ttl
 
     def prune_session_heartbeats(self, *, max_age_s: float, now: float | None = None) -> int:
-        with self._lock:
-            return self._prune_session_heartbeats_locked(now=_now(now), max_age_s=float(max_age_s))
+        return self._hot_kv.prune_heartbeats(now=_now(now), max_age_s=float(max_age_s))
 
     def _prune_session_heartbeats_locked(self, *, now: float, max_age_s: float) -> int:
-        if max_age_s <= 0:
-            return 0
-        cutoff = float(now) - float(max_age_s)
-        stale = [sid for sid, seen in self._session_heartbeats.items() if float(seen) < cutoff]
-        for sid in stale:
-            self._session_heartbeats.pop(sid, None)
-        return len(stale)
+        return self._hot_kv.prune_heartbeats(now=now, max_age_s=max_age_s)
 
     def _configure_connection(self) -> None:
         if self._db_path != ":memory:":
@@ -1360,8 +1465,10 @@ class TaskStateStore:
                 (cutoff, batch_limit),
             ).fetchall()
             expired: list[str] = []
+            expired_by_op: dict[str, int] = {}
             for row in rows:
                 request_id = str(row["request_id"])
+                op = str(row["op"] or "unknown")
                 metadata = _json_loads(row["metadata_json"])
                 metadata.setdefault("terminal_status", "expired")
                 metadata.setdefault("expired_at", ts)
@@ -1387,7 +1494,10 @@ class TaskStateStore:
                         now=ts,
                     )
                     expired.append(request_id)
+                    expired_by_op[op] = expired_by_op.get(op, 0) + 1
             _inc_reaper_rows("expire_pending", len(expired))
+            for op, count in expired_by_op.items():
+                _inc_future_timeout("execution", op=op, count=count)
             return expired
 
     def list_terminal_payloads_for_eviction(
@@ -1636,65 +1746,6 @@ class TaskStateStore:
         _inc_payload_evict_errors(int(count))
         return {"ok": True, "metrics": task_future_reaper_metrics_snapshot()}
 
-    def _append_billing_outbox_locked(
-        self,
-        conn: sqlite3.Connection,
-        *,
-        observations: list[dict[str, Any]],
-        source: str,
-        now: float,
-    ) -> dict[str, Any]:
-        inserted = 0
-        duplicate = 0
-        conflicts = 0
-        errors: list[dict[str, str]] = []
-        for observation in observations:
-            try:
-                event = billing_event_from_observation(observation)
-                event_json = _json_dumps(event)
-                event_hash = hashlib.sha256(event_json.encode("utf-8")).hexdigest()
-                existing = conn.execute(
-                    "SELECT event_hash FROM billing_outbox WHERE event_id = ?",
-                    (str(event["event_id"]),),
-                ).fetchone()
-                if existing is not None:
-                    if str(existing["event_hash"]) == event_hash:
-                        duplicate += 1
-                    else:
-                        conflicts += 1
-                        _inc_billing_metric("outbox_conflict", 1)
-                    continue
-                conn.execute(
-                    """
-                    INSERT INTO billing_outbox(
-                        event_id,
-                        event_json,
-                        event_hash,
-                        status,
-                        claim_id,
-                        claimed_until,
-                        attempt_count,
-                        last_error,
-                        created_at,
-                        updated_at
-                    )
-                    VALUES (?, ?, ?, 'pending', NULL, NULL, 0, NULL, ?, ?)
-                    """,
-                    (str(event["event_id"]), event_json, event_hash, now, now),
-                )
-                inserted += 1
-            except Exception as e:
-                errors.append({"error": f"{type(e).__name__}: {e}"})
-                _inc_billing_metric("write_error", 1)
-        return {
-            "ok": not errors and conflicts == 0,
-            "source": str(source),
-            "inserted": inserted,
-            "duplicate": duplicate,
-            "conflicts": conflicts,
-            "errors": errors,
-        }
-
     def append_billing_outbox(
         self,
         *,
@@ -1702,12 +1753,20 @@ class TaskStateStore:
         source: str = "unknown",
         now: float | None = None,
     ) -> dict[str, Any]:
-        ts = _now(now)
         normalized = [dict(item) for item in observations if isinstance(item, dict)]
         if not normalized:
             return {"ok": True, "source": str(source), "inserted": 0, "duplicate": 0, "conflicts": 0, "errors": []}
-        with self._transaction() as conn:
-            return self._append_billing_outbox_locked(conn, observations=normalized, source=source, now=ts)
+        out = self._hot_kv.append_billing_outbox(observations=normalized, source=source, now=now)
+        inserted = int(out.get("inserted") or 0)
+        conflicts = int(out.get("conflicts") or 0)
+        errors = out.get("errors") if isinstance(out.get("errors"), list) else []
+        if inserted:
+            _inc_billing_metric("event_inserted", inserted)
+        if conflicts:
+            _inc_billing_metric("outbox_conflict", conflicts)
+        if errors:
+            _inc_billing_metric("write_error", len(errors))
+        return out
 
     def claim_billing_outbox(
         self,
@@ -1717,42 +1776,12 @@ class TaskStateStore:
         lease_ttl_s: float = 60.0,
         now: float | None = None,
     ) -> list[dict[str, Any]]:
-        ts = _now(now)
-        claim_until = ts + max(1.0, float(lease_ttl_s))
-        max_rows = max(1, int(limit))
-        with self._transaction() as conn:
-            rows = conn.execute(
-                """
-                SELECT *
-                FROM billing_outbox
-                WHERE status = 'pending'
-                   OR (status = 'flushing' AND COALESCE(claimed_until, 0) <= ?)
-                ORDER BY created_at, outbox_id
-                LIMIT ?
-                """,
-                (ts, max_rows),
-            ).fetchall()
-            if not rows:
-                return []
-            outbox_ids = [int(row["outbox_id"]) for row in rows]
-            placeholders = ",".join("?" for _ in outbox_ids)
-            conn.execute(
-                f"""
-                UPDATE billing_outbox
-                SET status = 'flushing',
-                    claim_id = ?,
-                    claimed_until = ?,
-                    attempt_count = attempt_count + 1,
-                    updated_at = ?
-                WHERE outbox_id IN ({placeholders})
-                """,
-                (str(claim_id), claim_until, ts, *outbox_ids),
-            )
-            claimed = conn.execute(
-                f"SELECT * FROM billing_outbox WHERE outbox_id IN ({placeholders}) ORDER BY created_at, outbox_id",
-                tuple(outbox_ids),
-            ).fetchall()
-        return [self._billing_outbox_row_to_record(row) for row in claimed]
+        return self._hot_kv.claim_billing_outbox(
+            claim_id=str(claim_id),
+            limit=int(limit),
+            lease_ttl_s=float(lease_ttl_s),
+            now=now,
+        )
 
     def delete_billing_outbox_claim(
         self,
@@ -1760,16 +1789,10 @@ class TaskStateStore:
         claim_id: str,
         outbox_ids: list[int],
     ) -> dict[str, Any]:
-        ids = [int(value) for value in outbox_ids]
-        if not ids:
-            return {"ok": True, "deleted": 0}
-        with self._transaction() as conn:
-            placeholders = ",".join("?" for _ in ids)
-            cur = conn.execute(
-                f"DELETE FROM billing_outbox WHERE claim_id = ? AND outbox_id IN ({placeholders})",
-                (str(claim_id), *ids),
-            )
-            return {"ok": True, "deleted": int(cur.rowcount or 0)}
+        return self._hot_kv.delete_billing_outbox_claim(
+            claim_id=str(claim_id),
+            outbox_ids=[int(value) for value in outbox_ids],
+        )
 
     def mark_billing_outbox_claim_failed(
         self,
@@ -1780,63 +1803,18 @@ class TaskStateStore:
         error: str,
         now: float | None = None,
     ) -> dict[str, Any]:
-        ids = [int(value) for value in outbox_ids]
-        if not ids:
-            return {"ok": True, "updated": 0}
-        ts = _now(now)
-        status = "failed" if bool(permanent) else "pending"
-        with self._transaction() as conn:
-            placeholders = ",".join("?" for _ in ids)
-            cur = conn.execute(
-                f"""
-                UPDATE billing_outbox
-                SET status = ?,
-                    claim_id = NULL,
-                    claimed_until = NULL,
-                    last_error = ?,
-                    updated_at = ?
-                WHERE claim_id = ? AND outbox_id IN ({placeholders})
-                """,
-                (status, str(error), ts, str(claim_id), *ids),
-            )
-            return {"ok": True, "updated": int(cur.rowcount or 0)}
+        return self._hot_kv.mark_billing_outbox_claim_failed(
+            claim_id=str(claim_id),
+            outbox_ids=[int(value) for value in outbox_ids],
+            permanent=bool(permanent),
+            error=str(error),
+            now=now,
+        )
 
     def billing_outbox_stats(self, *, now: float | None = None) -> dict[str, Any]:
-        ts = _now(now)
-        with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT status, COUNT(*) AS rows, MIN(created_at) AS oldest_created_at
-                FROM billing_outbox
-                GROUP BY status
-                """
-            ).fetchall()
-        by_status: dict[str, dict[str, Any]] = {}
-        for row in rows:
-            status = str(row["status"] or "unknown")
-            oldest = row["oldest_created_at"]
-            by_status[status] = {
-                "rows": int(row["rows"] or 0),
-                "oldest_age_s": None if oldest is None else max(0.0, ts - float(oldest)),
-            }
-        return {
-            "by_status": by_status,
-            "metrics": billing_metrics_snapshot(),
-        }
-
-    def _billing_outbox_row_to_record(self, row: sqlite3.Row) -> dict[str, Any]:
-        return {
-            "outbox_id": int(row["outbox_id"]),
-            "event_id": row["event_id"],
-            "event": _json_loads(row["event_json"]),
-            "status": row["status"],
-            "claim_id": row["claim_id"],
-            "claimed_until": row["claimed_until"],
-            "attempt_count": int(row["attempt_count"] or 0),
-            "last_error": row["last_error"],
-            "created_at": row["created_at"],
-            "updated_at": row["updated_at"],
-        }
+        stats = self._hot_kv.billing_outbox_stats(now=now)
+        stats["metrics"] = billing_metrics_snapshot()
+        return stats
 
     def _terminal_completed_at(self, record: dict[str, Any]) -> float:
         metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
@@ -1909,8 +1887,7 @@ class TaskStateStore:
                 if not _require_staged_success_path(row, result_path):
                     self._raise_task_transition_error(conn, request_id, f"complete task {status}")
                 merged = {**_json_loads(row["metadata_json"]), **dict(metadata or {})}
-                billing_result = self._append_billing_outbox_locked(
-                    conn,
+                billing_result = self.append_billing_outbox(
                     observations=[dict(item) for item in (billing_observations or []) if isinstance(item, dict)],
                     source="task_terminal",
                     now=ts,
@@ -2273,8 +2250,7 @@ class TaskStateStore:
                 if not _require_staged_success_path(row, result_path):
                     self._raise_task_transition_error(conn, request_id, f"commit finalize {status}")
                 merged = _json_loads(row["metadata_json"])
-                billing_result = self._append_billing_outbox_locked(
-                    conn,
+                billing_result = self.append_billing_outbox(
                     observations=[dict(item) for item in (billing_observations or []) if isinstance(item, dict)],
                     source="model_work_terminal",
                     now=ts,
@@ -2352,6 +2328,104 @@ class TaskStateStore:
         with self._lock:
             rows = self._conn.execute(sql, params).fetchall()
         return [self._row_to_record(row) for row in rows]
+
+    def future_metrics_stats(self, *, now: float | None = None) -> dict[str, Any]:
+        ts = _now(now)
+        active_statuses = tuple(sorted(ACTIVE_TASK_STATUSES))
+        terminal_statuses = tuple(sorted(TERMINAL_TASK_STATUSES))
+        with self._lock:
+            status_rows = self._conn.execute(
+                "SELECT status, COUNT(*) AS count FROM tasks GROUP BY status"
+            ).fetchall()
+            op_rows = self._conn.execute(
+                "SELECT op, status, COUNT(*) AS count FROM tasks GROUP BY op, status"
+            ).fetchall()
+            scalar_row = self._conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN result_path IS NOT NULL AND result_path != '' THEN 1 ELSE 0 END) AS refs,
+                    SUM(CASE WHEN metadata_json IS NOT NULL AND metadata_json != '{}' THEN 1 ELSE 0 END) AS meta
+                FROM tasks
+                """
+            ).fetchone()
+            pending_age_row = self._conn.execute(
+                f"""
+                SELECT
+                    COUNT(*) AS count,
+                    MAX(? - created_at) AS oldest_s,
+                    AVG(? - created_at) AS avg_s
+                FROM tasks
+                WHERE status IN ({",".join("?" for _ in active_statuses)})
+                """,
+                (ts, ts, *active_statuses),
+            ).fetchone()
+            done_age_row = self._conn.execute(
+                f"""
+                SELECT
+                    COUNT(*) AS count,
+                    MAX(? - updated_at) AS oldest_s,
+                    AVG(? - updated_at) AS avg_s
+                FROM tasks
+                WHERE status IN ({",".join("?" for _ in terminal_statuses)})
+                """,
+                (ts, ts, *terminal_statuses),
+            ).fetchone()
+
+        by_status = {str(row["status"]): int(row["count"] or 0) for row in status_rows}
+        pending_statuses = ACTIVE_TASK_STATUSES
+        result_statuses = {"done", "retrieved"}
+        error_statuses = {"failed"}
+
+        by_op: dict[str, dict[str, int]] = {}
+        for row in op_rows:
+            op = str(row["op"] or "unknown")
+            status = str(row["status"] or "unknown")
+            count = int(row["count"] or 0)
+            bucket = by_op.setdefault(op, {"pending": 0, "results": 0, "errors": 0})
+            if status in pending_statuses:
+                bucket["pending"] += count
+            elif status in result_statuses:
+                bucket["results"] += count
+            elif status in error_statuses:
+                bucket["errors"] += count
+
+        pending = sum(by_status.get(status, 0) for status in pending_statuses)
+        results = sum(by_status.get(status, 0) for status in result_statuses)
+        errors = sum(by_status.get(status, 0) for status in error_statuses)
+        refs = int(scalar_row["refs"] or 0) if scalar_row is not None else 0
+        meta = int(scalar_row["meta"] or 0) if scalar_row is not None else 0
+        oldest_pending_s = float(pending_age_row["oldest_s"] or 0.0) if pending_age_row is not None else 0.0
+        oldest_done_s = float(done_age_row["oldest_s"] or 0.0) if done_age_row is not None else 0.0
+        avg_pending_s = float(pending_age_row["avg_s"] or 0.0) if pending_age_row is not None else 0.0
+        avg_done_s = float(done_age_row["avg_s"] or 0.0) if done_age_row is not None else 0.0
+
+        return {
+            "pending": int(pending),
+            "results": int(results),
+            "errors": int(errors),
+            "refs": refs,
+            "meta": meta,
+            "expired": int(by_status.get("expired", 0)),
+            "retrieved": int(by_status.get("retrieved", 0)),
+            "execution_timeout_s": float(server_config.task_pending_ttl_s),
+            "queue_timeout_s": float(getattr(server_config, "retrieve_future_wait_timeout_s", 20.0)),
+            "result_ttl_s": float(server_config.task_result_ttl_s),
+            "tombstone_ttl_s": float(server_config.task_tombstone_ttl_s),
+            "by_op": by_op,
+            "age_stats": {
+                "oldest_pending_s": oldest_pending_s,
+                "oldest_done_s": oldest_done_s,
+                "avg_pending_s": avg_pending_s,
+                "avg_done_s": avg_done_s,
+            },
+            "payload_stats": {
+                "result_refs_count": refs,
+                "errors_count": int(errors),
+                "refs_count": refs,
+            },
+            "timeout_counts": future_timeout_metrics_snapshot(),
+        }
 
     def list_expired_leases(self, *, now: float | None = None, limit: int | None = None) -> list[dict[str, Any]]:
         ts = _now(now)
@@ -2455,20 +2529,62 @@ def _task_state_store_db_path() -> str:
     )
 
 
+def _task_hot_kv_store_db_path(task_state_db_path: str | None = None) -> str:
+    configured = os.environ.get("MINT_TASK_HOT_KV_STORE_DB_PATH") or getattr(
+        server_config,
+        "task_hot_kv_store_db_path",
+        None,
+    )
+    if configured:
+        return str(configured)
+    base = Path(str(task_state_db_path or _task_state_store_db_path()))
+    return str(base.parent.parent / "task-hot-kv" / "task_hot.rocksdb")
+
+
 class _TaskStateStoreActor:
     def __init__(self, db_path: str | None = None) -> None:
+        try:
+            from ..logging_context import init_actor_observability
+
+            init_actor_observability()
+        except Exception:
+            pass
         self._started_at = time.time()
+        self._lock = threading.RLock()
         self._store = TaskStateStore(db_path or _task_state_store_db_path())
-        self._watchers: dict[str, list[tuple[asyncio.AbstractEventLoop, asyncio.Event]]] = {}
+        self._future_store = None
+        self._watchers: dict[str, list[threading.Event]] = {}
         self._watcher_count = 0
         self._watcher_limit = max(1, int(os.environ.get("MINT_TASK_STATE_STORE_WATCHER_MAX", "8192")))
+        self._stats_cache: dict[str, Any] | None = None
+        self._stats_cache_at = 0.0
+        self._stats_cache_ttl_s = max(0.0, float(os.environ.get("MINT_TASK_STATE_STORE_STATS_CACHE_TTL_S", "5")))
+        self._stats_lock = threading.Lock()
+        self._otel_enabled = False
+        self._otel_error: str | None = None
+        self._init_otel_metrics()
 
     def close(self) -> None:
         self._store.close()
+        if self._future_store is not None:
+            self._future_store.close()
+
+    def _future_store_or_create(self):
+        if self._future_store is None:
+            from .future_state_store import FutureStateStore, _future_state_store_db_path
+
+            self._future_store = FutureStateStore(_future_state_store_db_path())
+        return self._future_store
 
     def _read_task_or_none(self, request_id: str) -> dict[str, Any] | None:
         try:
             return self._store.get_task(str(request_id))
+        except TaskStateNotFoundError:
+            return None
+
+    def _read_future_task_or_none(self, request_id: str) -> dict[str, Any] | None:
+        try:
+            return self._future_store_or_create().get_task(str(request_id))
         except TaskStateNotFoundError:
             return None
 
@@ -2496,46 +2612,50 @@ class _TaskStateStoreActor:
     def _add_watcher(
         self,
         request_id: str,
-        loop: asyncio.AbstractEventLoop,
-        event: asyncio.Event,
+        event: threading.Event,
     ) -> bool:
-        if self._watcher_count >= self._watcher_limit:
-            return False
-        self._watchers.setdefault(str(request_id), []).append((loop, event))
-        self._watcher_count += 1
-        return True
+        with self._lock:
+            if self._watcher_count >= self._watcher_limit:
+                return False
+            self._watchers.setdefault(str(request_id), []).append(event)
+            self._watcher_count += 1
+            return True
 
-    def _remove_watcher(self, request_id: str, event: asyncio.Event) -> None:
-        waiters = self._watchers.get(str(request_id))
-        if not waiters:
-            return
-        kept: list[tuple[asyncio.AbstractEventLoop, asyncio.Event]] = []
-        removed = 0
-        for waiter in waiters:
-            if waiter[1] is event:
-                removed += 1
+    def _remove_watcher(self, request_id: str, event: threading.Event) -> None:
+        with self._lock:
+            waiters = self._watchers.get(str(request_id))
+            if not waiters:
+                return
+            kept: list[threading.Event] = []
+            removed = 0
+            for waiter in waiters:
+                if waiter is event:
+                    removed += 1
+                else:
+                    kept.append(waiter)
+            if kept:
+                self._watchers[str(request_id)] = kept
             else:
-                kept.append(waiter)
-        if kept:
-            self._watchers[str(request_id)] = kept
-        else:
-            self._watchers.pop(str(request_id), None)
-        self._watcher_count = max(0, self._watcher_count - removed)
+                self._watchers.pop(str(request_id), None)
+            self._watcher_count = max(0, self._watcher_count - removed)
+
+    def _invalidate_stats_cache(self) -> None:
+        self._stats_cache = None
+        self._stats_cache_at = 0.0
 
     def _notify_task_changed(self, request_id: str | None) -> None:
+        self._invalidate_stats_cache()
         if request_id is None:
             return
-        waiters = self._watchers.pop(str(request_id), [])
-        if not waiters:
-            return
-        self._watcher_count = max(0, self._watcher_count - len(waiters))
-        for loop, event in waiters:
-            try:
-                loop.call_soon_threadsafe(event.set)
-            except RuntimeError:
-                pass
+        with self._lock:
+            waiters = self._watchers.pop(str(request_id), [])
+            if not waiters:
+                return
+            self._watcher_count = max(0, self._watcher_count - len(waiters))
+        for event in waiters:
+            event.set()
 
-    async def wait_task_status_change(
+    def wait_task_status_change(
         self,
         *,
         request_id: str,
@@ -2572,9 +2692,8 @@ class _TaskStateStoreActor:
             remaining_s = deadline - time.monotonic()
             if remaining_s <= 0:
                 return {"changed": False, "timeout": True, "record": latest}
-            loop = asyncio.get_running_loop()
-            event = asyncio.Event()
-            if not self._add_watcher(request_id, loop, event):
+            event = threading.Event()
+            if not self._add_watcher(request_id, event):
                 return {
                     "changed": False,
                     "watch_skipped": True,
@@ -2593,8 +2712,10 @@ class _TaskStateStoreActor:
                         return {"changed": True, "missing": True, "request_id": request_id}
                     return {"changed": True, "record": latest}
                 try:
-                    await asyncio.wait_for(event.wait(), timeout=remaining_s)
-                except asyncio.TimeoutError:
+                    signaled = event.wait(timeout=max(0.0, remaining_s))
+                except Exception:
+                    signaled = False
+                if not signaled:
                     latest = self._read_task_or_none(request_id)
                     if self._record_changed(
                         latest,
@@ -2620,8 +2741,91 @@ class _TaskStateStoreActor:
             finally:
                 self._remove_watcher(request_id, event)
 
-    def stats(self) -> dict[str, Any]:
-        active = self._store.list_active_tasks()
+    def future_wait_task_status_change(
+        self,
+        *,
+        request_id: str,
+        timeout_s: float,
+        observed_status: str | None = None,
+        observed_updated_at: float | None = None,
+        terminal_only: bool = False,
+    ) -> dict[str, Any]:
+        request_id = str(request_id)
+        timeout_s = max(0.0, float(timeout_s))
+        record = self._read_future_task_or_none(request_id)
+        if record is None:
+            return {"changed": True, "missing": True, "request_id": request_id}
+
+        baseline_status = str(observed_status or record.get("status") or "")
+        try:
+            baseline_updated_at = float(observed_updated_at if observed_updated_at is not None else record.get("updated_at") or 0.0)
+        except Exception:
+            baseline_updated_at = 0.0
+
+        if self._record_changed(
+            record,
+            baseline_status=baseline_status,
+            baseline_updated_at=baseline_updated_at,
+            terminal_only=bool(terminal_only),
+        ):
+            return {"changed": True, "record": record}
+        if timeout_s <= 0:
+            return {"changed": False, "timeout": True, "record": record}
+
+        deadline = time.monotonic() + timeout_s
+        latest = record
+        while True:
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                return {"changed": False, "timeout": True, "record": latest}
+            event = threading.Event()
+            if not self._add_watcher(request_id, event):
+                return {
+                    "changed": False,
+                    "watch_skipped": True,
+                    "reason": "watcher_limit",
+                    "record": latest,
+                }
+            try:
+                latest = self._read_future_task_or_none(request_id)
+                if self._record_changed(
+                    latest,
+                    baseline_status=baseline_status,
+                    baseline_updated_at=baseline_updated_at,
+                    terminal_only=bool(terminal_only),
+                ):
+                    if latest is None:
+                        return {"changed": True, "missing": True, "request_id": request_id}
+                    return {"changed": True, "record": latest}
+                signaled = event.wait(timeout=max(0.0, remaining_s))
+                if not signaled:
+                    latest = self._read_future_task_or_none(request_id)
+                    if self._record_changed(
+                        latest,
+                        baseline_status=baseline_status,
+                        baseline_updated_at=baseline_updated_at,
+                        terminal_only=bool(terminal_only),
+                    ):
+                        if latest is None:
+                            return {"changed": True, "missing": True, "request_id": request_id}
+                        return {"changed": True, "record": latest}
+                    return {"changed": False, "timeout": True, "record": latest or record}
+            finally:
+                self._remove_watcher(request_id, event)
+
+    def future_ping(self) -> dict[str, Any]:
+        out = self._future_store_or_create().ping()
+        return {
+            **out,
+            "actor_name": _ray_task_state_store_actor_name(),
+            "namespace": _ray_namespace(),
+            "store": "future_state_store",
+            "started_at": self._started_at,
+        }
+
+    def future_stats(self) -> dict[str, Any]:
+        future_stats = self._future_store_or_create().future_metrics_stats()
+        active = self._future_store_or_create().list_active_tasks()
         by_status: dict[str, int] = {}
         for record in active:
             status = str(record.get("status") or "unknown")
@@ -2629,21 +2833,338 @@ class _TaskStateStoreActor:
         return {
             "actor_name": _ray_task_state_store_actor_name(),
             "namespace": _ray_namespace(),
-            "db_path": self._store.db_path,
+            "store": "future_state_store",
+            "db_path": self._future_store_or_create().db_path,
             "started_at": self._started_at,
             "active_tasks": len(active),
             "active_by_status": by_status,
             "watchers": self._watcher_count,
+            **future_stats,
             "task_future_reaper": task_future_reaper_metrics_snapshot(),
-            "billing_outbox": self._store.billing_outbox_stats(),
         }
 
+    def _future_call_and_notify(self, method: str, **kwargs: Any) -> Any:
+        out = getattr(self._future_store_or_create(), method)(**kwargs)
+        self._notify_task_changed(kwargs.get("request_id"))
+        return out
+
+    def future_acquire_scheduler_owner(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_store_or_create().acquire_scheduler_owner(**kwargs)
+
+    def future_renew_scheduler_owner(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_store_or_create().renew_scheduler_owner(**kwargs)
+
+    def future_create_task(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_call_and_notify("create_task", **kwargs)
+
+    def future_ensure_task(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_call_and_notify("ensure_task", **kwargs)
+
+    def future_update_task_metadata(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_call_and_notify("update_task_metadata", **kwargs)
+
+    def future_stage_payload(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_call_and_notify("stage_payload", **kwargs)
+
+    def future_complete_task_success(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_call_and_notify("complete_task_success", **kwargs)
+
+    def future_complete_task_failure(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_call_and_notify("complete_task_failure", **kwargs)
+
+    def future_mark_task_retrieved(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_call_and_notify("mark_task_retrieved", **kwargs)
+
+    def future_forget_task(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_call_and_notify("forget_task", **kwargs)
+
+    def future_expire_active_tasks(self, **kwargs: Any) -> list[str]:
+        out = self._future_store_or_create().expire_active_tasks(**kwargs)
+        for request_id in out:
+            self._notify_task_changed(str(request_id))
+        return out
+
+    def future_list_terminal_payloads_for_eviction(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return self._future_store_or_create().list_terminal_payloads_for_eviction(**kwargs)
+
+    def future_mark_payload_evicted(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_call_and_notify("mark_payload_evicted", **kwargs)
+
+    def future_delete_expired_tombstones(self, **kwargs: Any) -> list[str]:
+        out = self._future_store_or_create().delete_expired_tombstones(**kwargs)
+        for request_id in out:
+            self._notify_task_changed(str(request_id))
+        return out
+
+    def future_record_payload_evict_error(self, **kwargs: Any) -> dict[str, Any]:
+        out = self._future_store_or_create().record_payload_evict_error(**kwargs)
+        self._invalidate_stats_cache()
+        return out
+
+    def future_list_staged_payloads_for_gc(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return self._future_store_or_create().list_staged_payloads_for_gc(**kwargs)
+
+    def future_mark_staged_payload_gc_deleted(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_call_and_notify("mark_staged_payload_gc_deleted", **kwargs)
+
+    def future_list_tasks_by_metadata(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return self._future_store_or_create().list_tasks_by_metadata(**kwargs)
+
+    def future_assign_task(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_call_and_notify("assign_task", **kwargs)
+
+    def future_claim_task(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_call_and_notify("claim_task", **kwargs)
+
+    def future_begin_finalize(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_call_and_notify("begin_finalize", **kwargs)
+
+    def future_commit_finalize_success(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_call_and_notify("commit_finalize_success", **kwargs)
+
+    def future_commit_finalize_failure(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_call_and_notify("commit_finalize_failure", **kwargs)
+
+    def future_requeue_task(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_call_and_notify("requeue_task", **kwargs)
+
+    def future_list_active_tasks(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return self._future_store_or_create().list_active_tasks(**kwargs)
+
+    def future_list_expired_leases(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return self._future_store_or_create().list_expired_leases(**kwargs)
+
+    def future_get_task(self, request_id: str) -> dict[str, Any]:
+        return self._future_store_or_create().get_task(request_id)
+
+    def stats(self) -> dict[str, Any]:
+        now = time.monotonic()
+        cached = self._stats_cache
+        if cached is not None and now - self._stats_cache_at <= self._stats_cache_ttl_s:
+            return dict(cached)
+        with self._stats_lock:
+            now = time.monotonic()
+            cached = self._stats_cache
+            if cached is not None and now - self._stats_cache_at <= self._stats_cache_ttl_s:
+                return dict(cached)
+            active = self._store.list_active_tasks()
+            by_status: dict[str, int] = {}
+            for record in active:
+                status = str(record.get("status") or "unknown")
+                by_status[status] = by_status.get(status, 0) + 1
+            future_stats = self._store.future_metrics_stats()
+            out = {
+                "actor_name": _ray_task_state_store_actor_name(),
+                "namespace": _ray_namespace(),
+                "db_path": self._store.db_path,
+                "started_at": self._started_at,
+                "active_tasks": len(active),
+                "active_by_status": by_status,
+                "watchers": self._watcher_count,
+                **future_stats,
+                "task_future_reaper": task_future_reaper_metrics_snapshot(),
+                "billing_outbox": self._store.billing_outbox_stats(),
+            }
+            self._stats_cache = dict(out)
+            self._stats_cache_at = time.monotonic()
+            return out
+
+    def _init_otel_metrics(self) -> None:
+        endpoint = (os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT") or "").strip()
+        if not endpoint:
+            return
+        try:
+            from opentelemetry import metrics
+            from opentelemetry.metrics import Observation
+
+            meter = metrics.get_meter("mint.task_state_store")
+
+            def _attrs(**extra: object) -> dict[str, str]:
+                attrs = _otel_metric_attrs()
+                for key, value in extra.items():
+                    text = str(value if value is not None else "").strip()
+                    if text:
+                        attrs[key] = text
+                return attrs
+
+            def _gauge(name: str, callback, *, unit: str | None = None) -> None:
+                kwargs: dict[str, Any] = {"callbacks": [callback]}
+                if unit:
+                    kwargs["unit"] = unit
+                meter.create_observable_gauge(name, **kwargs)
+
+            def _scalar(field: str):
+                def _callback(_options):
+                    value = _metric_number(self.stats().get(field))
+                    if value is None:
+                        return []
+                    return [Observation(value, _attrs())]
+
+                return _callback
+
+            for key in (
+                "refs",
+                "meta",
+                "expired",
+                "retrieved",
+                "execution_timeout_s",
+                "queue_timeout_s",
+                "result_ttl_s",
+                "tombstone_ttl_s",
+            ):
+                _gauge(f"mint_task_futures_{key}", _scalar(key), unit="s" if key.endswith("_s") else None)
+
+            def _future_count(field: str):
+                def _callback(_options):
+                    stats = self.stats()
+                    observations = []
+                    value = _metric_number(stats.get(field))
+                    if value is not None:
+                        observations.append(Observation(value, _attrs()))
+                    by_op = stats.get("by_op")
+                    if not isinstance(by_op, dict):
+                        return observations
+                    for op, rec in sorted(by_op.items()):
+                        if not isinstance(rec, dict):
+                            continue
+                        op_value = _metric_number(rec.get(field))
+                        if op_value is None:
+                            continue
+                        observations.append(Observation(op_value, _attrs(op=op)))
+                    return observations
+
+                return _callback
+
+            _gauge("mint_task_futures_pending", _future_count("pending"))
+            _gauge("mint_task_futures_results", _future_count("results"))
+            _gauge("mint_task_futures_errors", _future_count("errors"))
+
+            def _nested_scalar(section: str, field: str):
+                def _callback(_options):
+                    section_value = self.stats().get(section)
+                    if not isinstance(section_value, dict):
+                        return []
+                    value = _metric_number(section_value.get(field))
+                    if value is None:
+                        return []
+                    return [Observation(value, _attrs())]
+
+                return _callback
+
+            for field in ("oldest_pending_s", "oldest_done_s", "avg_pending_s", "avg_done_s"):
+                _gauge(f"mint_task_futures_{field}", _nested_scalar("age_stats", field), unit="s")
+            _gauge("mint_task_futures_result_refs_count", _nested_scalar("payload_stats", "result_refs_count"))
+            _gauge("mint_task_futures_errors_count", _nested_scalar("payload_stats", "errors_count"))
+            _gauge("mint_task_futures_refs_count", _nested_scalar("payload_stats", "refs_count"))
+
+            def _future_timeouts(_options):
+                timeout_counts = self.stats().get("timeout_counts")
+                if not isinstance(timeout_counts, dict):
+                    return []
+                observations = []
+                for kind in ("queue", "execution", "total"):
+                    value = _metric_number(timeout_counts.get(kind))
+                    if value is not None:
+                        observations.append(Observation(value, _attrs(kind=kind)))
+                by_op = timeout_counts.get("by_op")
+                if isinstance(by_op, dict):
+                    for op, rec in sorted(by_op.items()):
+                        if not isinstance(rec, dict):
+                            continue
+                        for kind in ("queue", "execution", "total"):
+                            value = _metric_number(rec.get(kind))
+                            if value is not None:
+                                observations.append(Observation(value, _attrs(op=op, kind=kind)))
+                return observations
+
+            _gauge("mint_task_futures_timeouts_total", _future_timeouts)
+
+            def _billing_status(field: str):
+                def _callback(_options):
+                    billing = self.stats().get("billing_outbox")
+                    by_status = billing.get("by_status") if isinstance(billing, dict) else None
+                    if not isinstance(by_status, dict):
+                        return []
+                    observations = []
+                    for status, rec in sorted(by_status.items()):
+                        if not isinstance(rec, dict):
+                            continue
+                        value = _metric_number(rec.get(field))
+                        if value is None:
+                            continue
+                        observations.append(Observation(value, _attrs(status=status)))
+                    return observations
+
+                return _callback
+
+            _gauge("mint_billing_outbox_rows", _billing_status("rows"))
+            _gauge("mint_billing_outbox_oldest_age_s", _billing_status("oldest_age_s"), unit="s")
+
+            def _billing_metric(field: str, labels: dict[str, str] | None = None):
+                def _callback(_options):
+                    billing = self.stats().get("billing_outbox")
+                    metrics_map = billing.get("metrics") if isinstance(billing, dict) else None
+                    if not isinstance(metrics_map, dict):
+                        return []
+                    value = _metric_number(metrics_map.get(field))
+                    if value is None:
+                        return []
+                    return [Observation(value, _attrs(**dict(labels or {})))]
+
+                return _callback
+
+            def _billing_metric_by_result(mapping: tuple[tuple[str, str], ...]):
+                def _callback(_options):
+                    billing = self.stats().get("billing_outbox")
+                    metrics_map = billing.get("metrics") if isinstance(billing, dict) else None
+                    if not isinstance(metrics_map, dict):
+                        return []
+                    observations = []
+                    for result, field in mapping:
+                        value = _metric_number(metrics_map.get(field))
+                        if value is None:
+                            continue
+                        observations.append(Observation(value, _attrs(result=result)))
+                    return observations
+
+                return _callback
+
+            _gauge(
+                "mint_billing_outbox_flush_attempts_total",
+                _billing_metric_by_result(
+                    (
+                        ("success", "flush_success"),
+                        ("transient_error", "flush_transient_error"),
+                        ("permanent_error", "flush_permanent_error"),
+                    )
+                ),
+            )
+            _gauge(
+                "mint_billing_outbox_events_total",
+                _billing_metric_by_result(
+                    (
+                        ("inserted", "event_inserted"),
+                        ("conflict", "event_conflict"),
+                        ("failed", "event_failed"),
+                    )
+                ),
+            )
+            _gauge("mint_billing_outbox_write_errors_total", _billing_metric("write_error"))
+            _gauge("mint_billing_outbox_conflict_total", _billing_metric("outbox_conflict"))
+            _gauge(
+                "mint_billing_observation_skipped_total",
+                _billing_metric("skipped_missing_billing_context", {"reason": "missing_billing_context"}),
+            )
+            self._otel_enabled = True
+        except Exception as e:
+            self._otel_error = f"{type(e).__name__}: {e}"
+
     def ping(self) -> dict[str, Any]:
-        out = self._store.ping()
         return {
-            "ok": bool(out.get("ok")),
+            "ok": True,
             "actor_name": _ray_task_state_store_actor_name(),
             "namespace": _ray_namespace(),
+            "started_at": self._started_at,
         }
 
     def integrity_check(self) -> str:
@@ -2711,19 +3232,34 @@ class _TaskStateStoreActor:
         return out
 
     def record_payload_evict_error(self, **kwargs: Any) -> dict[str, Any]:
-        return self._store.record_payload_evict_error(**kwargs)
+        out = self._store.record_payload_evict_error(**kwargs)
+        self._invalidate_stats_cache()
+        return out
+
+    def record_billing_metrics(self, metrics: dict[str, Any]) -> dict[str, Any]:
+        _inc_billing_metrics(dict(metrics or {}))
+        self._invalidate_stats_cache()
+        return {"ok": True, "metrics": billing_metrics_snapshot()}
 
     def append_billing_outbox(self, **kwargs: Any) -> dict[str, Any]:
-        return self._store.append_billing_outbox(**kwargs)
+        out = self._store.append_billing_outbox(**kwargs)
+        self._invalidate_stats_cache()
+        return out
 
     def claim_billing_outbox(self, **kwargs: Any) -> list[dict[str, Any]]:
-        return self._store.claim_billing_outbox(**kwargs)
+        out = self._store.claim_billing_outbox(**kwargs)
+        self._invalidate_stats_cache()
+        return out
 
     def delete_billing_outbox_claim(self, **kwargs: Any) -> dict[str, Any]:
-        return self._store.delete_billing_outbox_claim(**kwargs)
+        out = self._store.delete_billing_outbox_claim(**kwargs)
+        self._invalidate_stats_cache()
+        return out
 
     def mark_billing_outbox_claim_failed(self, **kwargs: Any) -> dict[str, Any]:
-        return self._store.mark_billing_outbox_claim_failed(**kwargs)
+        out = self._store.mark_billing_outbox_claim_failed(**kwargs)
+        self._invalidate_stats_cache()
+        return out
 
     def billing_outbox_stats(self, **kwargs: Any) -> dict[str, Any]:
         return self._store.billing_outbox_stats(**kwargs)
@@ -2901,7 +3437,7 @@ def _create_ray_actor(*, require_ready: bool = True):
     actor_name = _ray_task_state_store_actor_name()
     namespace = _ray_namespace()
     db_path = _task_state_store_db_path()
-    max_concurrency = int(os.environ.get("MINT_TASK_STATE_STORE_ACTOR_MAX_CONCURRENCY", "128"))
+    max_concurrency = int(os.environ.get("MINT_TASK_STATE_STORE_ACTOR_MAX_CONCURRENCY", "256"))
 
     @ray.remote(num_cpus=0, max_concurrency=max_concurrency, max_restarts=0)
     class _RayTaskStateStoreActor(_TaskStateStoreActor):
@@ -2914,11 +3450,12 @@ def _create_ray_actor(*, require_ready: bool = True):
         "get_if_exists": True,
         "runtime_env": actor_runtime_env(pythonpath=PFS_PYTHONPATH, extra=otel_env_vars()),
     }
+    apply_detached_actor_resources(options, ray)
     actor = _RayTaskStateStoreActor.options(**options).remote(db_path)
     if require_ready:
-        out = sync_get_ray_ref(actor.stats.remote(), timeout_s=5.0)
+        out = sync_get_ray_ref(actor.ping.remote(), timeout_s=5.0)
         if not isinstance(out, dict):
-            raise TypeError(f"TaskStateStore.stats returned non-dict: {type(out)}")
+            raise TypeError(f"TaskStateStore.ping returned non-dict: {type(out)}")
     return actor
 
 
@@ -2940,9 +3477,9 @@ class TaskStateStoreClient:
             if not require_ready:
                 return self._ray_actor
             try:
-                out = sync_get_ray_ref(self._ray_actor.stats.remote(), timeout_s=1.0)
+                out = sync_get_ray_ref(self._ray_actor.ping.remote(), timeout_s=1.0)
                 if not isinstance(out, dict):
-                    raise TypeError(f"TaskStateStore.stats returned non-dict: {type(out)}")
+                    raise TypeError(f"TaskStateStore.ping returned non-dict: {type(out)}")
                 return self._ray_actor
             except Exception:
                 self._reset_ray_actor()
@@ -2973,9 +3510,9 @@ class TaskStateStoreClient:
             if not require_ready:
                 return self._ray_actor
             try:
-                out = await async_get_ray_ref(self._ray_actor.stats.remote(), timeout_s=1.0)
+                out = await async_get_ray_ref(self._ray_actor.ping.remote(), timeout_s=1.0)
                 if not isinstance(out, dict):
-                    raise TypeError(f"TaskStateStore.stats returned non-dict: {type(out)}")
+                    raise TypeError(f"TaskStateStore.ping returned non-dict: {type(out)}")
                 return self._ray_actor
             except Exception:
                 self._reset_ray_actor()
@@ -3018,16 +3555,23 @@ class TaskStateStoreClient:
         create_if_missing: bool = False,
     ) -> dict[str, Any]:
         actor = self._get_ray_actor_sync(require_ready=False, create_if_missing=create_if_missing)
-        out = sync_get_ray_ref(actor.stats.remote(), timeout_s=timeout_s)
+        try:
+            out = sync_get_ray_ref(actor.ping.remote(), timeout_s=timeout_s)
+        except Exception:
+            self._reset_ray_actor()
+            if not create_if_missing:
+                raise
+            actor = self._get_ray_actor_sync(require_ready=False, create_if_missing=True)
+            out = sync_get_ray_ref(actor.ping.remote(), timeout_s=timeout_s)
         if not isinstance(out, dict):
-            raise TypeError(f"TaskStateStore.stats returned non-dict: {type(out)}")
+            raise TypeError(f"TaskStateStore.ping returned non-dict: {type(out)}")
         return out
 
     def ensure_started(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
         actor = self._get_ray_actor_sync(require_ready=False, create_if_missing=True)
-        out = sync_get_ray_ref(actor.stats.remote(), timeout_s=timeout_s)
+        out = sync_get_ray_ref(actor.ping.remote(), timeout_s=timeout_s)
         if not isinstance(out, dict):
-            raise TypeError(f"TaskStateStore.stats returned non-dict: {type(out)}")
+            raise TypeError(f"TaskStateStore.ping returned non-dict: {type(out)}")
         return out
 
     def ping(self, *, timeout_s: float = 5.0) -> dict[str, Any]:
@@ -3053,9 +3597,16 @@ class TaskStateStoreClient:
         create_if_missing: bool = False,
     ) -> dict[str, Any]:
         actor = await self._get_ray_actor_async(require_ready=False, create_if_missing=create_if_missing)
-        out = await async_get_ray_ref(actor.stats.remote(), timeout_s=timeout_s)
+        try:
+            out = await async_get_ray_ref(actor.ping.remote(), timeout_s=timeout_s)
+        except Exception:
+            self._reset_ray_actor()
+            if not create_if_missing:
+                raise
+            actor = await self._get_ray_actor_async(require_ready=False, create_if_missing=True)
+            out = await async_get_ray_ref(actor.ping.remote(), timeout_s=timeout_s)
         if not isinstance(out, dict):
-            raise TypeError(f"TaskStateStore.stats returned non-dict: {type(out)}")
+            raise TypeError(f"TaskStateStore.ping returned non-dict: {type(out)}")
         return out
 
     async def async_ping(self, *, timeout_s: float = 5.0) -> dict[str, Any]:
@@ -3134,6 +3685,9 @@ class TaskStateStoreClient:
     async def async_record_payload_evict_error(self, **kwargs: Any) -> dict[str, Any]:
         return await self._dict_call("record_payload_evict_error", **kwargs)
 
+    async def async_record_billing_metrics(self, metrics: dict[str, Any]) -> dict[str, Any]:
+        return await self._dict_call("record_billing_metrics", metrics=dict(metrics or {}))
+
     async def async_append_billing_outbox(self, **kwargs: Any) -> dict[str, Any]:
         return await self._dict_call("append_billing_outbox", **kwargs)
 
@@ -3199,6 +3753,155 @@ class TaskStateStoreClient:
             observed_updated_at=observed_updated_at,
             terminal_only=bool(terminal_only),
         )
+
+    async def async_future_ping(self, *, timeout_s: float = 5.0) -> dict[str, Any]:
+        actor = await self._get_ray_actor_async(require_ready=False, create_if_missing=False)
+        try:
+            out = await async_get_ray_ref(actor.future_ping.remote(), timeout_s=timeout_s)
+        except Exception:
+            self._reset_ray_actor()
+            raise
+        if not isinstance(out, dict):
+            raise TypeError(f"TaskStateStore.future_ping returned non-dict: {type(out)}")
+        if not bool(out.get("ok")):
+            raise TaskStateStoreUnavailableError(f"TaskStateStore future ping failed: {out!r}")
+        return out
+
+    async def async_future_stats(self) -> dict[str, Any]:
+        return await self._dict_call("future_stats")
+
+    async def async_future_acquire_scheduler_owner(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_acquire_scheduler_owner", **kwargs)
+
+    async def async_future_renew_scheduler_owner(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_renew_scheduler_owner", **kwargs)
+
+    async def async_future_create_task(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_create_task", **kwargs)
+
+    async def async_future_ensure_task(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_ensure_task", **kwargs)
+
+    async def async_future_update_task_metadata(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_update_task_metadata", **kwargs)
+
+    async def async_future_stage_payload(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_stage_payload", **kwargs)
+
+    async def async_future_complete_task_success(self, **kwargs: Any) -> dict[str, Any]:
+        kwargs.pop("billing_observations", None)
+        return await self._dict_call("future_complete_task_success", **kwargs)
+
+    async def async_future_complete_task_failure(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_complete_task_failure", **kwargs)
+
+    async def async_future_mark_task_retrieved(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_mark_task_retrieved", **kwargs)
+
+    async def async_future_forget_task(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_forget_task", **kwargs)
+
+    async def async_future_expire_active_tasks(self, **kwargs: Any) -> list[str]:
+        out = await self._call("future_expire_active_tasks", **kwargs)
+        if not isinstance(out, list):
+            raise TypeError(f"TaskStateStore.future_expire_active_tasks returned non-list: {type(out)}")
+        return [str(x) for x in out]
+
+    async def async_future_list_terminal_payloads_for_eviction(self, **kwargs: Any) -> list[dict[str, Any]]:
+        out = await self._call("future_list_terminal_payloads_for_eviction", **kwargs)
+        if not isinstance(out, list):
+            raise TypeError(f"TaskStateStore.future_list_terminal_payloads_for_eviction returned non-list: {type(out)}")
+        return out
+
+    async def async_future_mark_payload_evicted(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_mark_payload_evicted", **kwargs)
+
+    async def async_future_delete_expired_tombstones(self, **kwargs: Any) -> list[str]:
+        out = await self._call("future_delete_expired_tombstones", **kwargs)
+        if not isinstance(out, list):
+            raise TypeError(f"TaskStateStore.future_delete_expired_tombstones returned non-list: {type(out)}")
+        return [str(x) for x in out]
+
+    async def async_future_record_payload_evict_error(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_record_payload_evict_error", **kwargs)
+
+    async def async_future_list_staged_payloads_for_gc(self, **kwargs: Any) -> list[dict[str, Any]]:
+        out = await self._call("future_list_staged_payloads_for_gc", **kwargs)
+        if not isinstance(out, list):
+            raise TypeError(f"TaskStateStore.future_list_staged_payloads_for_gc returned non-list: {type(out)}")
+        return out
+
+    async def async_future_mark_staged_payload_gc_deleted(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_mark_staged_payload_gc_deleted", **kwargs)
+
+    async def async_future_assign_task(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_assign_task", **kwargs)
+
+    async def async_future_claim_task(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_claim_task", **kwargs)
+
+    async def async_future_begin_finalize(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_begin_finalize", **kwargs)
+
+    async def async_future_commit_finalize_success(self, **kwargs: Any) -> dict[str, Any]:
+        kwargs.pop("billing_observations", None)
+        return await self._dict_call("future_commit_finalize_success", **kwargs)
+
+    async def async_future_commit_finalize_failure(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_commit_finalize_failure", **kwargs)
+
+    async def async_future_requeue_task(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_requeue_task", **kwargs)
+
+    async def async_future_get_task(self, request_id: str) -> dict[str, Any]:
+        return await self._dict_call("future_get_task", request_id=str(request_id))
+
+    async def async_future_wait_task_status_change(
+        self,
+        *,
+        request_id: str,
+        timeout_s: float,
+        observed_status: str | None = None,
+        observed_updated_at: float | None = None,
+        terminal_only: bool = False,
+    ) -> dict[str, Any]:
+        return await self._dict_call(
+            "future_wait_task_status_change",
+            request_id=str(request_id),
+            timeout_s=float(timeout_s),
+            observed_status=observed_status,
+            observed_updated_at=observed_updated_at,
+            terminal_only=bool(terminal_only),
+        )
+
+    async def async_future_list_active_tasks(self, *, limit: int | None = None) -> list[dict[str, Any]]:
+        out = await self._call("future_list_active_tasks", limit=limit)
+        if not isinstance(out, list):
+            raise TypeError(f"TaskStateStore.future_list_active_tasks returned non-list: {type(out)}")
+        return out
+
+    async def async_future_list_expired_leases(
+        self,
+        *,
+        now: float | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        out = await self._call("future_list_expired_leases", now=now, limit=limit)
+        if not isinstance(out, list):
+            raise TypeError(f"TaskStateStore.future_list_expired_leases returned non-list: {type(out)}")
+        return out
+
+    async def async_future_list_tasks_by_metadata(
+        self,
+        *,
+        filters: dict[str, Any] | None = None,
+        statuses: list[str] | None = None,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        out = await self._call("future_list_tasks_by_metadata", filters=filters, statuses=statuses, limit=limit)
+        if not isinstance(out, list):
+            raise TypeError(f"TaskStateStore.future_list_tasks_by_metadata returned non-list: {type(out)}")
+        return out
 
     def upsert_sampling_session(self, *, session_id: str, info: dict[str, Any]) -> None:
         self._call_sync("upsert_sampling_session", session_id=str(session_id), info=dict(info))
@@ -3546,6 +4249,52 @@ class TaskStateStoreClient:
         return out
 
 
+class _FutureStateAccess:
+    """Map future-state calls onto TaskStateStore future methods.
+
+    Tests may inject a local object with the old async_* method names; in that
+    case this adapter falls back to the injected methods without creating any
+    Ray actor.
+    """
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+
+    async def async_ensure_started(self) -> None:
+        ensure_started = getattr(self._client, "async_ensure_started", None)
+        if callable(ensure_started):
+            await ensure_started()
+        await self.async_ping(timeout_s=5.0)
+
+    async def async_ensure_ready(
+        self,
+        *,
+        timeout_s: float = 10.0,
+        create_if_missing: bool = False,
+    ) -> dict[str, Any]:
+        ensure_ready = getattr(self._client, "async_ensure_ready", None)
+        if callable(ensure_ready):
+            await ensure_ready(timeout_s=timeout_s, create_if_missing=create_if_missing)
+        return await self.async_ping(timeout_s=timeout_s)
+
+    async def async_ping(self, *, timeout_s: float = 5.0) -> dict[str, Any]:
+        future_ping = getattr(self._client, "async_future_ping", None)
+        if callable(future_ping):
+            return await future_ping(timeout_s=timeout_s)
+        ping = getattr(self._client, "async_ping", None)
+        if callable(ping):
+            return await ping(timeout_s=timeout_s)
+        return {"ok": True, "store": "future_state_store"}
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("async_"):
+            future_name = f"async_future_{name[len('async_'):]}"
+            future_method = getattr(self._client, future_name, None)
+            if callable(future_method):
+                return future_method
+        return getattr(self._client, name)
+
+
 class TaskFutureService:
     """Future polling facade backed by TaskStateStore metadata and payload files.
 
@@ -3560,10 +4309,18 @@ class TaskFutureService:
         self,
         *,
         task_state_client: TaskStateStoreClient | None = None,
+        future_state_client: Any | None = None,
         payload_store: Any | None = None,
     ) -> None:
         self._task_state = task_state_client if task_state_client is not None else task_state_store
+        self._future_state_client = future_state_client
         self._payload_store = payload_store
+
+    @property
+    def _future_state(self) -> Any:
+        if self._future_state_client is None:
+            self._future_state_client = _FutureStateAccess(self._task_state)
+        return self._future_state_client
 
     @property
     def _payloads(self) -> Any:
@@ -3574,7 +4331,7 @@ class TaskFutureService:
         return self._payload_store
 
     async def async_create_with_id(self, request_id: str) -> str:
-        await self._task_state.async_ensure_task(request_id=str(request_id), status="pending")
+        await self._future_state.async_ensure_task(request_id=str(request_id), status="pending")
         return str(request_id)
 
     async def async_create_model_work_with_id(
@@ -3587,7 +4344,7 @@ class TaskFutureService:
         meta: dict[str, Any] | None = None,
         payload_hash: str | None = None,
     ) -> str:
-        await self._task_state.async_ensure_task(
+        await self._future_state.async_ensure_task(
             request_id=str(request_id),
             op=str(op),
             domain_key=str(domain_key),
@@ -3599,7 +4356,7 @@ class TaskFutureService:
         return str(request_id)
 
     async def async_ensure_pending(self, request_id: str, meta: dict[str, Any] | None = None) -> dict[str, Any]:
-        out = await self._task_state.async_ensure_task(
+        out = await self._future_state.async_ensure_task(
             request_id=str(request_id),
             op=str((meta or {}).get("op") or "unknown"),
             domain_key=str((meta or {}).get("domain_key") or "future:default"),
@@ -3609,7 +4366,7 @@ class TaskFutureService:
         return {"created": bool(out.get("created")), "meta": out.get("record", {}).get("metadata") or {}}
 
     async def async_mark_queued(self, request_id: str, meta: dict[str, Any] | None = None) -> None:
-        await self._task_state.async_ensure_task(
+        await self._future_state.async_ensure_task(
             request_id=str(request_id),
             op=str((meta or {}).get("op") or "unknown"),
             domain_key=str((meta or {}).get("domain_key") or "future:default"),
@@ -3618,14 +4375,14 @@ class TaskFutureService:
         )
 
     async def async_mark_running(self, request_id: str, meta: dict[str, Any] | None = None) -> None:
-        await self._task_state.async_update_task_metadata(
+        await self._future_state.async_update_task_metadata(
             request_id=str(request_id),
             metadata={**dict(meta or {}), "queue_state": "running"},
             status="running",
         )
 
     async def async_update_meta(self, request_id: str, meta: dict[str, Any] | None = None) -> None:
-        await self._task_state.async_update_task_metadata(
+        await self._future_state.async_update_task_metadata(
             request_id=str(request_id),
             metadata=dict(meta or {}),
         )
@@ -3653,7 +4410,7 @@ class TaskFutureService:
                 attempt_id=attempt_id,
             )
         )
-        await self._task_state.async_stage_payload(
+        await self._future_state.async_stage_payload(
             request_id=str(request_id),
             staged_payload_path=staged_payload_path,
             metadata={
@@ -3666,7 +4423,24 @@ class TaskFutureService:
             attempt_id=attempt_id,
             payload=result,
         )
-        await self._task_state.async_complete_task_success(
+        billing_metadata: dict[str, Any] = {}
+        if billing_observations:
+            try:
+                billing_result = await self._task_state.async_append_billing_outbox(
+                    observations=billing_observations,
+                    source="task_terminal",
+                )
+                if not bool(billing_result.get("ok")):
+                    billing_metadata = {"billing_status": "dropped", "billing_error": billing_result}
+                elif int(billing_result.get("inserted") or 0) > 0:
+                    billing_metadata = {
+                        "billing_status": "outboxed",
+                        "billing_observation_count": int(billing_result.get("inserted") or 0),
+                    }
+            except Exception as e:
+                _inc_billing_metric("write_error", 1)
+                billing_metadata = {"billing_status": "dropped", "billing_error": f"{type(e).__name__}: {e}"}
+        await self._future_state.async_complete_task_success(
             request_id=str(request_id),
             result_path=str(payload["path"]),
             result_checksum=str(payload["checksum"]),
@@ -3676,26 +4450,26 @@ class TaskFutureService:
                 "final_status": FutureStatus.DONE.value,
                 "payload_state": "committed",
                 "staged_payload_path": None,
+                **billing_metadata,
             },
-            billing_observations=billing_observations,
         )
 
     async def async_fail(self, request_id: str, error: str) -> None:
         if self._buffer_model_work_finalize(kind="fail", request_id=request_id, payload=str(error)):
             return
         try:
-            await self._task_state.async_complete_task_failure(
+            await self._future_state.async_complete_task_failure(
                 request_id=str(request_id),
                 error=str(error),
                 metadata={"failed_at": time.time(), "done_at": time.time(), "final_status": FutureStatus.FAILED.value},
             )
         except (KeyError, TaskStateNotFoundError):
-            await self._task_state.async_ensure_task(
+            await self._future_state.async_ensure_task(
                 request_id=str(request_id),
                 status="pending",
                 metadata={"failed_at": time.time()},
             )
-            await self._task_state.async_complete_task_failure(
+            await self._future_state.async_complete_task_failure(
                 request_id=str(request_id),
                 error=str(error),
                 metadata={"failed_at": time.time(), "done_at": time.time(), "final_status": FutureStatus.FAILED.value},
@@ -3709,7 +4483,7 @@ class TaskFutureService:
         expected_meta: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         try:
-            record = await self._task_state.async_get_task(str(request_id))
+            record = await self._future_state.async_get_task(str(request_id))
         except (KeyError, TaskStateNotFoundError):
             return {"failed": False, "reason": "unknown"}
         if _status_from_task_record(record) != FutureStatus.PENDING:
@@ -3723,9 +4497,12 @@ class TaskFutureService:
 
     async def async_get_status(self, request_id: str) -> FutureStatus:
         try:
-            record = await self._task_state.async_get_task(str(request_id))
+            record = await self._future_state.async_get_task(str(request_id))
         except (KeyError, TaskStateNotFoundError):
-            raise KeyError(f"Unknown request_id: {request_id}") from None
+            try:
+                record = await self._task_state.async_get_task(str(request_id))
+            except (KeyError, TaskStateNotFoundError):
+                raise KeyError(f"Unknown request_id: {request_id}") from None
         return _status_from_task_record(record)
 
     async def async_wait_status_change(
@@ -3735,7 +4512,7 @@ class TaskFutureService:
         timeout_s: float,
         terminal_only: bool = False,
     ) -> FutureStatus | None:
-        wait = getattr(self._task_state, "async_wait_task_status_change", None)
+        wait = getattr(self._future_state, "async_wait_task_status_change", None)
         if wait is None:
             return None
         out = await wait(
@@ -3753,7 +4530,12 @@ class TaskFutureService:
         return _status_from_task_record(record)
 
     async def async_get_result(self, request_id: str) -> Any:
-        record = await self._task_state.async_get_task(str(request_id))
+        try:
+            record = await self._future_state.async_get_task(str(request_id))
+            state_client = self._future_state
+        except (KeyError, TaskStateNotFoundError):
+            record = await self._task_state.async_get_task(str(request_id))
+            state_client = self._task_state
         status = str(record.get("status"))
         metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
         if status == "retrieved" and str(metadata.get("terminal_status") or "done") != "done":
@@ -3769,15 +4551,21 @@ class TaskFutureService:
             expected_checksum=record.get("result_checksum"),
         )
         if status != "retrieved":
-            await self._task_state.async_mark_task_retrieved(request_id=str(request_id))
+            await state_client.async_mark_task_retrieved(request_id=str(request_id))
         return payload
 
     async def async_get_error(self, request_id: str) -> str | None:
-        record = await self._task_state.async_get_task(str(request_id))
+        try:
+            record = await self._future_state.async_get_task(str(request_id))
+        except (KeyError, TaskStateNotFoundError):
+            record = await self._task_state.async_get_task(str(request_id))
         return None if record.get("error") is None else str(record.get("error"))
 
     async def async_get_meta(self, request_id: str) -> dict[str, Any] | None:
-        record = await self._task_state.async_get_task(str(request_id))
+        try:
+            record = await self._future_state.async_get_task(str(request_id))
+        except (KeyError, TaskStateNotFoundError):
+            record = await self._task_state.async_get_task(str(request_id))
         metadata = record.get("metadata")
         return dict(metadata) if isinstance(metadata, dict) else None
 
@@ -3787,7 +4575,7 @@ class TaskFutureService:
         *,
         limit: int = 1000,
     ) -> list[dict[str, Any]]:
-        records = await self._task_state.async_list_tasks_by_metadata(
+        records = await self._future_state.async_list_tasks_by_metadata(
             filters=dict(filters or {}),
             statuses=["pending", "queued", "assigned", "leased", "running", "finalizing"],
             limit=int(limit),
@@ -3822,7 +4610,7 @@ class TaskFutureService:
         op_prefix: str,
         error: str,
     ) -> list[str]:
-        records = await self._task_state.async_list_tasks_by_metadata(
+        records = await self._future_state.async_list_tasks_by_metadata(
             filters=dict(filters),
             statuses=["pending", "queued", "assigned", "leased", "running", "finalizing"],
             limit=10000,
@@ -3838,13 +4626,13 @@ class TaskFutureService:
         return failed
 
     async def async_forget(self, request_id: str) -> None:
-        await self._task_state.async_forget_task(request_id=str(request_id))
+        await self._future_state.async_forget_task(request_id=str(request_id))
 
     async def async_cleanup(self, request_id: str) -> None:
         try:
-            await self._task_state.async_mark_task_retrieved(request_id=str(request_id))
+            await self._future_state.async_mark_task_retrieved(request_id=str(request_id))
         except Exception:
-            await self._task_state.async_forget_task(request_id=str(request_id))
+            await self._future_state.async_forget_task(request_id=str(request_id))
 
     async def async_reap(self) -> dict[str, Any]:
         from ..config import config as cfg
@@ -3852,7 +4640,7 @@ class TaskFutureService:
         now = time.time()
         batch_size = max(1, int(os.environ.get("MINT_TASK_FUTURE_REAPER_BATCH_SIZE", "1000")))
 
-        expired = await self._task_state.async_expire_active_tasks(
+        expired = await self._future_state.async_expire_active_tasks(
             older_than_s=float(getattr(cfg, "task_pending_ttl_s", 86400.0)),
             now=now,
             limit=batch_size,
@@ -3862,7 +4650,7 @@ class TaskFutureService:
         payload_evict_errors: list[dict[str, str]] = []
         staged_payload_gc_deleted: list[str] = []
         staged_payload_gc_errors: list[dict[str, str]] = []
-        payload_candidates = await self._task_state.async_list_terminal_payloads_for_eviction(
+        payload_candidates = await self._future_state.async_list_terminal_payloads_for_eviction(
             older_than_s=float(getattr(cfg, "task_result_ttl_s", 86400.0)),
             now=now,
             limit=batch_size,
@@ -3875,7 +4663,7 @@ class TaskFutureService:
             try:
                 await self._payloads.async_delete_json_payload(path=result_path)
             except Exception as e:
-                await self._task_state.async_record_payload_evict_error(count=1)
+                await self._future_state.async_record_payload_evict_error(count=1)
                 payload_evict_errors.append(
                     {
                         "request_id": request_id,
@@ -3883,7 +4671,7 @@ class TaskFutureService:
                     }
                 )
                 continue
-            marked = await self._task_state.async_mark_payload_evicted(
+            marked = await self._future_state.async_mark_payload_evicted(
                 request_id=request_id,
                 expected_result_path=result_path,
                 now=now,
@@ -3891,7 +4679,7 @@ class TaskFutureService:
             if bool(marked.get("ok")):
                 evicted.append(request_id)
 
-        staged_candidates = await self._task_state.async_list_staged_payloads_for_gc(
+        staged_candidates = await self._future_state.async_list_staged_payloads_for_gc(
             older_than_s=float(getattr(cfg, "task_result_ttl_s", 86400.0)),
             now=now,
             limit=batch_size,
@@ -3906,7 +4694,7 @@ class TaskFutureService:
             except FileNotFoundError:
                 pass
             except Exception as e:
-                await self._task_state.async_record_payload_evict_error(count=1)
+                await self._future_state.async_record_payload_evict_error(count=1)
                 staged_payload_gc_errors.append(
                     {
                         "request_id": request_id,
@@ -3914,7 +4702,7 @@ class TaskFutureService:
                     }
                 )
                 continue
-            marked = await self._task_state.async_mark_staged_payload_gc_deleted(
+            marked = await self._future_state.async_mark_staged_payload_gc_deleted(
                 request_id=request_id,
                 expected_staged_payload_path=path,
                 now=now,
@@ -3922,7 +4710,7 @@ class TaskFutureService:
             if bool(marked.get("ok")):
                 staged_payload_gc_deleted.append(request_id)
 
-        deleted_tombstones = await self._task_state.async_delete_expired_tombstones(
+        deleted_tombstones = await self._future_state.async_delete_expired_tombstones(
             older_than_s=float(getattr(cfg, "task_tombstone_ttl_s", 604800.0)),
             now=now,
             limit=batch_size,
@@ -3940,7 +4728,7 @@ class TaskFutureService:
         }
 
     async def async_fail_stale_running_requests(self, active_consumer_job_id: str, error: str) -> list[str]:
-        records = await self._task_state.async_list_tasks_by_metadata(
+        records = await self._future_state.async_list_tasks_by_metadata(
             filters={"consumer_job_id": str(active_consumer_job_id)},
             statuses=["running"],
             limit=10000,
@@ -3952,7 +4740,7 @@ class TaskFutureService:
         return failed
 
     async def async_ensure_started(self) -> None:
-        await self._task_state.async_ensure_started()
+        await self._future_state.async_ensure_started()
 
     async def async_ensure_ready(
         self,
@@ -3960,21 +4748,17 @@ class TaskFutureService:
         timeout_s: float = 10.0,
         create_if_missing: bool = False,
     ) -> dict[str, Any]:
-        actor = await self._task_state._get_ray_actor_async(
-            require_ready=False,
+        return await self._future_state.async_ensure_ready(
+            timeout_s=timeout_s,
             create_if_missing=create_if_missing,
         )
-        out = await async_get_ray_ref(actor.stats.remote(), timeout_s=timeout_s)
-        if not isinstance(out, dict):
-            raise TypeError(f"TaskStateStore.stats returned non-dict: {type(out)}")
-        return out
 
     async def async_ping(self, *, timeout_s: float = 5.0) -> dict[str, Any]:
-        return await self._task_state.async_ping(timeout_s=timeout_s)
+        return await self._future_state.async_ping(timeout_s=timeout_s)
 
     def metrics_snapshot(self) -> dict[str, Any]:
         return {
-            "backend": "task_state_store",
+            "backend": "future_state_store",
             "task_future_reaper": task_future_reaper_metrics_snapshot(),
             "billing_outbox": billing_metrics_snapshot(),
         }
@@ -4000,9 +4784,13 @@ class TaskFutureService:
     async def async_debug_snapshot(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
         _ = timeout_s
         try:
-            return {"backend": "task_state_store", "task_state_store": await self._task_state.async_stats()}
+            return {
+                "backend": "future_state_store",
+                "future_state_store": await self._future_state.async_stats(),
+                "task_state_store": await self._task_state.async_stats(),
+            }
         except Exception as e:
-            return {"backend": "task_state_store", "error": f"{type(e).__name__}: {e}"}
+            return {"backend": "future_state_store", "error": f"{type(e).__name__}: {e}"}
 
     async def async_flush_billing_outbox(
         self,
@@ -4044,9 +4832,15 @@ class TaskFutureService:
             inserted_ids = set(await usage_store.write_events(events))
             conflict = max(0, len(events) - len(inserted_ids))
             await self._task_state.async_delete_billing_outbox_claim(claim_id=claim, outbox_ids=outbox_ids)
-            _inc_billing_metric("flush_success", 1)
-            _inc_billing_metric("event_inserted", len(inserted_ids))
-            _inc_billing_metric("event_conflict", conflict)
+            billing_metrics = {
+                "flush_success": 1,
+                "event_inserted": len(inserted_ids),
+                "event_conflict": conflict,
+            }
+            try:
+                await self._task_state.async_record_billing_metrics(billing_metrics)
+            except Exception:
+                pass
             return {
                 "ok": True,
                 "claimed": len(rows),
@@ -4065,8 +4859,14 @@ class TaskFutureService:
                 permanent=permanent,
                 error=f"{type(e).__name__}: {e}",
             )
-            _inc_billing_metric("flush_permanent_error" if permanent else "flush_transient_error", 1)
-            _inc_billing_metric("event_failed", len(rows))
+            billing_metrics = {
+                "flush_permanent_error" if permanent else "flush_transient_error": 1,
+                "event_failed": len(rows),
+            }
+            try:
+                await self._task_state.async_record_billing_metrics(billing_metrics)
+            except Exception:
+                pass
             return {
                 "ok": False,
                 "claimed": len(rows),

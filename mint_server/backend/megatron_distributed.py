@@ -32,6 +32,11 @@ import ray
 
 from . import ray_kill
 from .gpu_binding_helpers import gpu_bindings_from_ray_gpu_ids
+from .runtime_actor_metrics import (
+    current_ray_actor_name,
+    init_megatron_group_runtime_otel_metrics,
+    init_megatron_rank_runtime_otel_metrics,
+)
 from ..logging_context import (
     get_current_traceparent,
     get_request_id,
@@ -747,6 +752,7 @@ class MegatronRankWorker:
         distributed_config: DistributedConfig,
         traceparent: str | None = None,
         request_id: str | None = None,
+        observability_actor_name: str | None = None,
     ):
         """Create worker but don't initialize distributed yet.
         
@@ -764,6 +770,10 @@ class MegatronRankWorker:
         self.master_addr = master_addr
         self.master_port = master_port
         self.base_model = base_model
+        self.observability_base_model = str(base_model or "unknown")
+        self.observability_actor_name = str(
+            observability_actor_name or current_ray_actor_name(f"megatron-rank-{rank}")
+        )
         self.lora_rank = lora_rank
         self.learning_rate = learning_rate
         self.config = distributed_config
@@ -804,6 +814,12 @@ class MegatronRankWorker:
         self._sticky_train_mode_enter_total: int = 0
         self._sticky_train_mode_reuse_total: int = 0
         self._sticky_train_mode_exit_total: int = 0
+        self._otel_runtime_metrics_enabled = init_megatron_rank_runtime_otel_metrics(
+            snapshot_fn=self._runtime_memory_observability_snapshot,
+            actor_name=self.observability_actor_name,
+            base_model=self.observability_base_model,
+            rank=int(self.rank),
+        )
 
         logger.info(f"[MegatronRankWorker] Worker {rank}/{world_size} created (not yet initialized)")
 
@@ -1092,17 +1108,7 @@ class MegatronRankWorker:
         page_size = int(os.sysconf("SC_PAGE_SIZE"))
         return rss_pages * page_size
 
-    def get_observability_binding(self) -> dict[str, object]:
-        import socket
-
-        hostname = socket.gethostname()
-        node_id = None
-        try:
-            node_id = str(ray.get_runtime_context().get_node_id())
-        except Exception:
-            node_id = None
-        gpu_bindings = gpu_bindings_from_ray_gpu_ids(hostname=hostname, node_id=node_id, rank=int(self.rank))
-        gpu_indices = [binding["gpu_index"] for binding in gpu_bindings if "gpu_index" in binding]
+    def _runtime_memory_observability_snapshot(self) -> dict[str, object]:
         mem: dict[str, int] = {}
         try:
             torch = _get_torch()
@@ -1116,6 +1122,20 @@ class MegatronRankWorker:
                 }
         except Exception:
             mem = {}
+        return mem
+
+    def get_observability_binding(self) -> dict[str, object]:
+        import socket
+
+        hostname = socket.gethostname()
+        node_id = None
+        try:
+            node_id = str(ray.get_runtime_context().get_node_id())
+        except Exception:
+            node_id = None
+        gpu_bindings = gpu_bindings_from_ray_gpu_ids(hostname=hostname, node_id=node_id, rank=int(self.rank))
+        gpu_indices = [binding["gpu_index"] for binding in gpu_bindings if "gpu_index" in binding]
+        mem = self._runtime_memory_observability_snapshot()
         return {
             "hostname": hostname,
             "node_id": node_id,
@@ -6810,6 +6830,7 @@ class MegatronWorkerGroup:
         self._bind_traceparent(traceparent)
         self.base_model = base_model
         self.observability_base_model = str(observability_base_model or base_model or "unknown")
+        self._observability_actor_name = current_ray_actor_name("unknown")
         self.lora_rank = lora_rank  # This is max_lora_rank for Phase 7
         self.learning_rate = learning_rate
         self.config = distributed_config or DistributedConfig()
@@ -6833,6 +6854,11 @@ class MegatronWorkerGroup:
         self._master_port: int | None = None
         self._placement_bundle_node_ips: list[str | None] = []
         self._placement_requested_node_ips: list[str] = []
+        self._otel_runtime_metrics_enabled = init_megatron_group_runtime_otel_metrics(
+            snapshot_fn=self._runtime_observability_snapshot,
+            actor_name=self._observability_actor_name,
+            base_model=self.observability_base_model,
+        )
 
         with start_as_current_span_from_traceparent(
             "training.create_model.megatron.worker_group.initialize",
@@ -7190,6 +7216,7 @@ class MegatronWorkerGroup:
                     distributed_config=self.config,
                     traceparent=traceparent,
                     request_id=request_id,
+                    observability_actor_name=self._observability_actor_name,
                 )
                 self.workers.append(worker)
 
@@ -9625,16 +9652,21 @@ class MegatronWorkerGroup:
             bindings = list(self._observability_gpu_bindings_cache)
         out: dict[str, object] = {
             "gpu_bindings": bindings,
-            "active_sessions": int(self._current_session is not None),
-            "session_unknown": int(bool(self._session_unknown_due_to_partial_swap)),
-            "session_step": max(0, int(self._step_count)),
-            "learning_rate": max(0.0, float(self.learning_rate)),
+            **self._runtime_observability_snapshot(),
             "max_lora_rank": max(0, int(self.lora_rank)),
             "actual_rank": max(0, int(self._actual_rank or self.lora_rank)),
         }
         if self._observability_memory_cache:
             out.update(dict(self._observability_memory_cache))
         return out
+
+    def _runtime_observability_snapshot(self) -> dict[str, object]:
+        return {
+            "active_sessions": int(self._current_session is not None),
+            "session_unknown": int(bool(self._session_unknown_due_to_partial_swap)),
+            "session_step": max(0, int(self._step_count)),
+            "learning_rate": max(0.0, float(self.learning_rate)),
+        }
 
 
     # ========================================================================

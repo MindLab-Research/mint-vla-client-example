@@ -16,6 +16,8 @@ This reference is split by topic for faster lookup. Start here, then open the re
 - Weights and checkpoints: `weights-checkpoints.md`
 - Auto eviction and GPU allocation: `eviction.md`
 - Authentication and model access: `auth-access.md`
+- Observability architecture and OTel conventions: `observability.md`
+- Dashboard observability suite: `dashboard-observability-suite.md`
 - Dependency architecture (runtime env root, image boundary, host bootstrap): `dependency-architecture.md`
 - Runtime configuration and ConfigActor: `runtime-config.md`
 - Topology-aware supervision and node metrics DaemonSet: `topology-daemon-metrics.md`

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -552,6 +553,212 @@ def test_issue_319_list_checkpoints_skips_invalid_sampler_dirs(monkeypatch, tmp_
 
     assert checkpoint_ids == ["weights/training-good"]
     assert "sampler_weights/sampler-bad" not in checkpoint_ids
+
+
+def test_issue_641_publish_checkpoint_catalog_recovers_valid_failed_staging(monkeypatch) -> None:
+    from mint_server import checkpoint_index
+
+    ckpt_id = "64100000-0000-0000-0000-000000000001"
+    state = {
+        "staging": {
+            ckpt_id: {
+                "ckpt_id": ckpt_id,
+                "owner_id": "owner-a",
+                "model_id": "run-641",
+                "raw_checkpoint_id": "arithmetic-rl-final",
+                "checkpoint_type": "training",
+                "storage_layout_version": 2,
+                "model_name": "Qwen/Qwen3-235B-A22B-Instruct-2507",
+                "checkpoint_created_at": "2026-05-22T03:46:09Z",
+                "status": "failed",
+                "fail_reason": "mirror_failed",
+            }
+        },
+        "catalog": {},
+        "closed": False,
+    }
+
+    class _Tx:
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    class _Conn:
+        def transaction(self):
+            return _Tx()
+
+        async def fetchrow(self, sql: str, *args):
+            text = sql.strip()
+            if text.startswith("SELECT owner_id") and "FROM checkpoint_staging" in text:
+                row = state["staging"].get(args[0])
+                if row is None:
+                    return None
+                return {
+                    "owner_id": row["owner_id"],
+                    "model_id": row["model_id"],
+                    "raw_checkpoint_id": row["raw_checkpoint_id"],
+                    "checkpoint_type": row["checkpoint_type"],
+                }
+            if text.startswith("DELETE FROM checkpoint_staging"):
+                row = state["staging"].get(args[0])
+                if row is None or row["status"] not in {"uploading", "failed"}:
+                    return None
+                return state["staging"].pop(args[0])
+            if "FROM checkpoint_catalog" in text and "WHERE ckpt_id = $1" in text:
+                return state["catalog"].get(args[0])
+            raise AssertionError(f"unexpected fetchrow SQL: {text}")
+
+        async def execute(self, sql: str, *args):
+            text = sql.strip()
+            if text.startswith("SELECT pg_advisory_xact_lock"):
+                return "SELECT"
+            if text.startswith("INSERT INTO checkpoint_catalog"):
+                row = {
+                    "ckpt_id": args[0],
+                    "owner_id": args[1],
+                    "model_id": args[2],
+                    "raw_checkpoint_id": args[3],
+                    "checkpoint_type": args[4],
+                    "storage_root": args[5],
+                    "storage_layout_version": args[6],
+                    "model_name": args[7],
+                    "checkpoint_created_at": args[8],
+                    "size_bytes": args[9],
+                    "published_at": "now",
+                    "updated_at": "now",
+                }
+                state["catalog"].setdefault(args[0], row)
+                return "INSERT"
+            raise AssertionError(f"unexpected execute SQL: {text}")
+
+        async def close(self):
+            state["closed"] = True
+
+    async def _connect():
+        return _Conn()
+
+    async def _ensure_schema(_conn):
+        return None
+
+    monkeypatch.setattr(checkpoint_index, "checkpoint_index_enabled", lambda: True)
+    monkeypatch.setattr(checkpoint_index, "_connect", _connect)
+    monkeypatch.setattr(checkpoint_index, "_ensure_schema", _ensure_schema)
+
+    row = asyncio.run(
+        checkpoint_index.publish_checkpoint_catalog(
+            ckpt_id,
+            storage_root="/vePFS-Mindverse/share/mint/prod/checkpoints",
+            size_bytes=235,
+        )
+    )
+
+    assert row["ckpt_id"] == ckpt_id
+    assert row["checkpoint_type"] == "training"
+    assert row["size_bytes"] == 235
+    assert ckpt_id not in state["staging"]
+    assert state["catalog"][ckpt_id]["storage_root"] == "/vePFS-Mindverse/share/mint/prod/checkpoints"
+    assert state["closed"] is True
+
+
+def test_issue_641_claim_checkpoint_reuses_failed_staging_row(monkeypatch) -> None:
+    from mint_server import checkpoint_index
+
+    ckpt_id = "64100000-0000-0000-0000-000000000002"
+    state = {
+        "staging": [
+            {
+                "ckpt_id": ckpt_id,
+                "owner_id": "owner-a",
+                "model_id": "run-641",
+                "raw_checkpoint_id": "arithmetic-rl-final",
+                "checkpoint_type": "training",
+                "status": "failed",
+                "fail_reason": "mirror_failed",
+                "updated_at": None,
+            }
+        ],
+        "catalog": [],
+        "closed": False,
+    }
+
+    class _Tx:
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    class _Conn:
+        def transaction(self):
+            return _Tx()
+
+        async def fetchrow(self, sql: str, *args):
+            text = sql.strip()
+            if "FROM checkpoint_catalog" in text and "owner_id = $1" in text:
+                return None
+            raise AssertionError(f"unexpected fetchrow SQL: {text}")
+
+        async def fetch(self, sql: str, *args):
+            text = sql.strip()
+            if "FROM checkpoint_staging" in text:
+                owner_id, model_id, raw_checkpoint_id, checkpoint_type = args
+                return [
+                    row
+                    for row in state["staging"]
+                    if row["owner_id"] == owner_id
+                    and row["model_id"] == model_id
+                    and row["raw_checkpoint_id"] == raw_checkpoint_id
+                    and row["checkpoint_type"] == checkpoint_type
+                ]
+            raise AssertionError(f"unexpected fetch SQL: {text}")
+
+        async def execute(self, sql: str, *args):
+            text = sql.strip()
+            if text.startswith("SELECT pg_advisory_xact_lock"):
+                return "SELECT"
+            if text.startswith("UPDATE checkpoint_staging") and "SET status = 'uploading'" in text:
+                row = state["staging"][0]
+                assert args[0] == ckpt_id
+                row["status"] = "uploading"
+                row["fail_reason"] = None
+                row["storage_root"] = args[1]
+                row["model_name"] = args[2]
+                row["checkpoint_created_at"] = args[3]
+                return "UPDATE 1"
+            raise AssertionError(f"unexpected execute SQL: {text}")
+
+        async def close(self):
+            state["closed"] = True
+
+    async def _connect():
+        return _Conn()
+
+    async def _ensure_schema(_conn):
+        return None
+
+    monkeypatch.setattr(checkpoint_index, "checkpoint_index_enabled", lambda: True)
+    monkeypatch.setattr(checkpoint_index, "_connect", _connect)
+    monkeypatch.setattr(checkpoint_index, "_ensure_schema", _ensure_schema)
+
+    claimed = asyncio.run(
+        checkpoint_index.claim_checkpoint_publication(
+            owner_id="owner-a",
+            model_id="run-641",
+            raw_checkpoint_id="arithmetic-rl-final",
+            checkpoint_type="training",
+            storage_root="/vePFS-Mindverse/share/mint/prod/runtime/persistent_cache",
+            model_name="Qwen/Qwen3-235B-A22B-Instruct-2507",
+            checkpoint_created_at="2026-05-22T04:00:00Z",
+        )
+    )
+
+    assert claimed == ckpt_id
+    assert state["staging"][0]["status"] == "uploading"
+    assert state["staging"][0]["fail_reason"] is None
+    assert state["staging"][0]["storage_root"] == "/vePFS-Mindverse/share/mint/prod/runtime/persistent_cache"
+    assert state["closed"] is True
 
 
 def test_issue_319_list_checkpoints_skips_shard_only_sampler_dirs(monkeypatch, tmp_path: Path) -> None:

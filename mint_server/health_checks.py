@@ -51,16 +51,12 @@ def public_healthz_cache_age_seconds() -> float | None:
 
 async def _ping_public_dependencies(*, timeout_s: float) -> None:
     from .backend.model_work_scheduler import model_work_scheduler
-    from .backend.task_state_store import task_futures, task_state_store
+    from .backend.task_state_store import task_futures
 
     scheduler_ping = getattr(model_work_scheduler, "async_ping", None)
     if scheduler_ping is None:
         scheduler_ping = getattr(model_work_scheduler, "ping")
-    task_ping = getattr(task_state_store, "async_ping", None)
-    if task_ping is None:
-        task_ping = getattr(task_futures, "async_ping", None)
-    if task_ping is None:
-        task_ping = getattr(task_state_store, "ping")
+    task_ping = getattr(task_futures, "async_ping", None)
 
     component_timeout_s = min(timeout_s, PUBLIC_HEALTHZ_COMPONENT_TIMEOUT_S)
 

@@ -47,6 +47,7 @@ from mint_server.runtime_env import (
 from . import ray_kill
 from .gpu_binding_helpers import gpu_bindings_from_ray_gpu_ids
 from .node_placement import assert_node_ip_capacity, parse_model_gpu_placement
+from .runtime_actor_metrics import current_ray_actor_name, init_vllm_runtime_otel_metrics
 from .vllm_scheduler_observability import (
     VllmStatsObserver,
     attach_vllm_stats_logger,
@@ -808,6 +809,16 @@ def _create_extended_server_class(
                         )
             super(ExtendedVLLMHttpServer, self).__init__(*args, **call_kwargs)
             self._vllm_stats_observer = VllmStatsObserver()
+            self._otel_runtime_metrics_enabled = init_vllm_runtime_otel_metrics(
+                snapshot_fn=self._vllm_stats_observer.snapshot,
+                actor_name=current_ray_actor_name("unknown"),
+                base_model=str(
+                    getattr(self, "model_path", None)
+                    or call_kwargs.get("path")
+                    or call_kwargs.get("model_path")
+                    or "unknown"
+                ),
+            )
             # Track local paths for multi-LoRA (needed for GPU/CPU swap)
             self._lora_paths: dict[int, str] = {}
             self._owned_lora_paths: set[int] = set()

@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 import mint_server.logging_context as logging_context
+import mint_server.backend.runtime_actor_metrics as runtime_actor_metrics
 import mint_server.backend.vllm_scheduler_observability as vllm_obs_mod
 from mint_server.backend.runtime_observability import RuntimeObservability
 from mint_server.backend.verl_training import VerlTrainingEngine
@@ -730,6 +731,103 @@ def test_issue_432_vllm_stats_observer_tracks_scheduler_and_finished_request_met
     assert snap["add_request_wait_s_count"] == 0
 
 
+def test_issue_638_vllm_runtime_actor_registers_otel_gauges(monkeypatch) -> None:
+    import opentelemetry.metrics as otel_metrics
+
+    gauges: dict[str, list] = {}
+
+    class FakeMeter:
+        def create_observable_gauge(self, name, callbacks, **_kwargs):
+            gauges[name] = list(callbacks)
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel:4317")
+    monkeypatch.setenv("MINT_DEPLOYMENT_ENV", "prod")
+    monkeypatch.setenv("MINT_CLUSTER_ID", "volcano")
+    monkeypatch.setenv("MINT_RAY_NAMESPACE", "mint")
+    monkeypatch.setattr(otel_metrics, "get_meter", lambda _name: FakeMeter())
+
+    snapshot = {
+        "scheduler_waiting_requests": 4,
+        "scheduler_running_requests": 2,
+        "scheduler_kv_cache_usage_ratio": 0.75,
+        "prefix_cache_queries_total": 100,
+        "prefix_cache_hits_total": 60,
+        "prefix_cache_hit_ratio": 0.6,
+        "preemptions_total": 3,
+        "queue_time_s_total": 12.0,
+        "queue_time_s_count": 4,
+        "queue_time_s_max": 4.5,
+        "queue_time_s_p50_recent": 1.4,
+        "queue_time_s_p95_recent": 3.2,
+    }
+
+    assert runtime_actor_metrics.init_vllm_runtime_otel_metrics(
+        snapshot_fn=lambda: snapshot,
+        actor_name="mint_vllm_qwen3_0_6b_replica_0",
+        base_model="Qwen/Qwen3-0.6B",
+    )
+
+    obs = gauges["mint_vllm_scheduler_waiting_requests"][0](None)
+    assert obs[0].value == pytest.approx(4.0)
+    assert obs[0].attributes == {
+        "deployment.env": "prod",
+        "mint.cluster_id": "volcano",
+        "ray_namespace": "mint",
+        "actor_name": "mint_vllm_qwen3_0_6b_replica_0",
+        "base_model": "Qwen/Qwen3-0.6B",
+    }
+    assert gauges["mint_vllm_queue_time_s_sum"][0](None)[0].value == pytest.approx(12.0)
+    assert gauges["mint_vllm_queue_time_s_p95_recent"][0](None)[0].value == pytest.approx(3.2)
+
+
+def test_issue_638_megatron_runtime_actor_registers_group_and_rank_otel_gauges(monkeypatch) -> None:
+    import opentelemetry.metrics as otel_metrics
+
+    gauges: dict[str, list] = {}
+
+    class FakeMeter:
+        def create_observable_gauge(self, name, callbacks, **_kwargs):
+            gauges.setdefault(name, []).extend(callbacks)
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel:4317")
+    monkeypatch.setenv("MINT_DEPLOYMENT_ENV", "prod")
+    monkeypatch.setenv("MINT_CLUSTER_ID", "volcano")
+    monkeypatch.setattr(otel_metrics, "get_meter", lambda _name: FakeMeter())
+
+    assert runtime_actor_metrics.init_megatron_group_runtime_otel_metrics(
+        snapshot_fn=lambda: {
+            "active_sessions": 1,
+            "session_unknown": 0,
+            "session_step": 17,
+            "learning_rate": 5e-5,
+        },
+        actor_name="mint_megatron_qwen3_30b_replica_0",
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+    )
+    assert runtime_actor_metrics.init_megatron_rank_runtime_otel_metrics(
+        snapshot_fn=lambda: {
+            "gpu_memory_allocated_bytes": 48_000_000_000,
+            "gpu_memory_reserved_bytes": 52_000_000_000,
+            "gpu_memory_fragmentation_bytes": 4_000_000_000,
+        },
+        actor_name="mint_megatron_qwen3_30b_replica_0",
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        rank=3,
+    )
+
+    active = gauges["mint_megatron_active_sessions"][0](None)[0]
+    assert active.value == pytest.approx(1.0)
+    assert active.attributes["actor_name"] == "mint_megatron_qwen3_30b_replica_0"
+    assert active.attributes["base_model"] == "Qwen/Qwen3-30B-A3B-Instruct-2507"
+
+    memory = gauges["mint_megatron_gpu_memory_reserved_bytes"][0](None)[0]
+    assert memory.value == pytest.approx(52_000_000_000.0)
+    assert memory.attributes["actor_name"] == "mint_megatron_qwen3_30b_replica_0"
+    assert memory.attributes["rank"] == "3"
+    assert "request_id" not in memory.attributes
+    assert "session_id" not in memory.attributes
+
+
 def test_issue_432_scheduler_decision_otel_records_experience_metrics(monkeypatch) -> None:
     decision_counter = _Recorder()
     switch_counter = _Recorder()
@@ -855,4 +953,59 @@ def test_issue_432_megatron_switch_otel_flushes_pending_aggregate(monkeypatch) -
                 "phase": "total",
             },
         ),
+    ]
+
+
+def test_issue_638_megatron_lifecycle_otel_records_events(monkeypatch) -> None:
+    counter = _Recorder()
+
+    monkeypatch.setattr(logging_context, "_OTEL_ENABLED", True)
+    monkeypatch.setattr(logging_context, "_MEGATRON_ACTOR_LIFECYCLE_COUNTER", counter)
+
+    obs = RuntimeObservability()
+    obs.record_megatron_actor_lifecycle(
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        event="recreate",
+    )
+
+    assert counter.calls == [
+        (
+            "add",
+            1,
+            {
+                "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+                "event": "recreate",
+            },
+        )
+    ]
+
+
+def test_issue_638_megatron_lifecycle_event_label_is_bounded(monkeypatch) -> None:
+    counter = _Recorder()
+
+    monkeypatch.setattr(logging_context, "_OTEL_ENABLED", True)
+    monkeypatch.setattr(logging_context, "_MEGATRON_ACTOR_LIFECYCLE_COUNTER", counter)
+
+    obs = RuntimeObservability()
+    obs.record_megatron_actor_lifecycle(
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        event="free-form-error-with-request-id-123",
+    )
+
+    assert obs.snapshot()["megatron_actor_lifecycle"] == [
+        {
+            "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "event": "unknown",
+            "count": 1,
+        }
+    ]
+    assert counter.calls == [
+        (
+            "add",
+            1,
+            {
+                "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+                "event": "unknown",
+            },
+        )
     ]

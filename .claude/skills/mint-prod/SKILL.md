@@ -31,7 +31,7 @@ auth-required; do not guess process names, paths, or credentials.
 | Runtime root | `/vePFS-Mindverse/share/mint/prod/runtime` |
 | Public config | `/vePFS-Mindverse/share/mint/prod/config/prod.env` |
 | Private config | `/vePFS-Mindverse/share/mint/prod/config/secrets.env` |
-| Log file | `/vePFS-Mindverse/share/mint/prod/logs/tinker_server_auth.log` |
+| Log file | `/vePFS-Mindverse/share/mint/prod/logs/mint_server_auth.log` |
 
 Production config is split deliberately:
 - `prod.env`: non-secret deployment config such as port, Ray address, runtime
@@ -107,7 +107,7 @@ target for restart. Do not use broad `pkill` patterns in production.
 
 ```bash
 curl http://localhost:18000/api/v1/healthz
-ssh mint-prod-volcano 'tail -n 200 /vePFS-Mindverse/share/mint/prod/logs/tinker_server_auth.log'
+ssh mint-prod-volcano 'tail -n 200 /vePFS-Mindverse/share/mint/prod/logs/mint_server_auth.log'
 ssh mint-prod-volcano 'ps aux | grep "[s]cripts/run_server.py"'
 ```
 
@@ -132,8 +132,6 @@ Public `/api/v1/healthz` is only a cheap API-worker health check.
   models.
 - Volcano production hosts Qwen3 0.6B, Qwen3 4B Instruct, Qwen3 4B Thinking,
   Qwen3 30B A3B Instruct, Qwen3 235B A22B Instruct, and OpenPI runtime models.
-- Do not advertise `zai-org/GLM-5.1` unless a current registry/gateway route is
-  configured for it.
 - 235B is deployed locally on Volcano with 16 GPUs for vLLM and 16 GPUs for
   Megatron. This requires the production model override to set the 235B
   Megatron world size to 16 GPUs.

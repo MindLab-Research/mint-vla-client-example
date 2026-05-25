@@ -196,7 +196,7 @@ Actor naming reference:
 | vLLM per model | `mint_vllm_{model_slug}` |
 | Dense trainer | `mint_dense_{model_slug}` |
 | Runtime session | `mint_model_runtime_*` |
-| Node metrics daemon | `mint_node_metrics_{worker_alias}` |
+| Node metrics daemon | `mint_daemon_node_metrics_{worker_alias}` |
 
 `vllm_server` is not a valid default actor for new topology-managed model runtime.
 

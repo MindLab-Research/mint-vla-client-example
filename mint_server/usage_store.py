@@ -645,8 +645,8 @@ class DisabledUsageStore:
         return None
 
 
-_usage_store: UsageStore | None = None
-_usage_store_guard = asyncio.Lock()
+_usage_stores_by_loop: dict[asyncio.AbstractEventLoop, UsageStore] = {}
+_usage_store_guards_by_loop: dict[asyncio.AbstractEventLoop, asyncio.Lock] = {}
 
 
 def _build_usage_store() -> UsageStore:
@@ -670,18 +670,25 @@ def _build_usage_store() -> UsageStore:
 
 
 async def get_usage_store() -> UsageStore:
-    global _usage_store
-    if _usage_store is not None:
-        return _usage_store
-    async with _usage_store_guard:
-        if _usage_store is None:
-            _usage_store = _build_usage_store()
-    return _usage_store
+    loop = asyncio.get_running_loop()
+    existing = _usage_stores_by_loop.get(loop)
+    if existing is not None:
+        return existing
+    guard = _usage_store_guards_by_loop.get(loop)
+    if guard is None:
+        guard = asyncio.Lock()
+        _usage_store_guards_by_loop[loop] = guard
+    async with guard:
+        existing = _usage_stores_by_loop.get(loop)
+        if existing is None:
+            existing = _build_usage_store()
+            _usage_stores_by_loop[loop] = existing
+        return existing
 
 
 async def close_usage_store() -> None:
-    global _usage_store
-    async with _usage_store_guard:
-        if _usage_store is not None:
-            await _usage_store.close()
-            _usage_store = None
+    loop = asyncio.get_running_loop()
+    store = _usage_stores_by_loop.pop(loop, None)
+    _usage_store_guards_by_loop.pop(loop, None)
+    if store is not None:
+        await store.close()

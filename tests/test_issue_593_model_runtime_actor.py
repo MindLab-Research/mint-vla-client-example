@@ -193,6 +193,12 @@ class _FakeTaskStateStore:
         self.failures.append(dict(kwargs))
         return {"ok": True, "record": dict(kwargs)}
 
+    async def async_future_commit_finalize_success(self, **kwargs):
+        return await self.async_commit_finalize_success(**kwargs)
+
+    async def async_future_commit_finalize_failure(self, **kwargs):
+        return await self.async_commit_finalize_failure(**kwargs)
+
 
 @pytest.mark.anyio
 async def test_issue_593_model_runtime_claims_executes_renews_and_completes() -> None:

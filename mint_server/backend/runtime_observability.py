@@ -5,10 +5,18 @@ import time
 from dataclasses import dataclass
 
 from ..logging_context import (
+    record_megatron_actor_lifecycle_otel,
     record_megatron_session_switch_otel,
     record_training_operation_latency_otel,
     record_vllm_actor_latency_otel,
 )
+
+_MEGATRON_LIFECYCLE_EVENTS = frozenset({"startup_timeout", "recreate", "evicted", "unknown"})
+
+
+def _bounded_megatron_lifecycle_event(event: str | None) -> str:
+    value = str(event or "unknown").strip() or "unknown"
+    return value if value in _MEGATRON_LIFECYCLE_EVENTS else "unknown"
 
 
 @dataclass
@@ -114,9 +122,10 @@ class RuntimeObservability:
             self._megatron_session_switch_failures[key] = int(self._megatron_session_switch_failures.get(key, 0)) + 1
 
     def record_megatron_actor_lifecycle(self, *, base_model: str, event: str) -> None:
-        key = (str(base_model or "unknown"), str(event or "unknown"))
+        key = (str(base_model or "unknown"), _bounded_megatron_lifecycle_event(event))
         with self._lock:
             self._megatron_actor_lifecycle[key] = int(self._megatron_actor_lifecycle.get(key, 0)) + 1
+        record_megatron_actor_lifecycle_otel(base_model=key[0], event=key[1])
 
     def begin_vllm_request(self, *, actor_name: str | None, base_model: str, op: str) -> None:
         key = (str(actor_name or "unknown"), str(base_model or "unknown"), str(op or "unknown"))

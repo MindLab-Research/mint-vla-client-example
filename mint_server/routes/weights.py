@@ -404,6 +404,13 @@ async def _enqueue_weights_request_with_trace(
         )
 
 
+async def _safe_update_weights_meta(request_id: str, meta: dict[str, object]) -> None:
+    try:
+        await task_futures.async_update_meta(request_id, meta)
+    except Exception:
+        pass
+
+
 def _resolve_mint_path(
     mint_uri: str,
     *,
@@ -1235,6 +1242,14 @@ async def _do_save_state(
 
         # Save training checkpoint on worker, returns path
         async def _save_state_once() -> None:
+            await _safe_update_weights_meta(
+                request_id,
+                {
+                    "stage": "checkpoint_export",
+                    "checkpoint_export_started_at": time.time(),
+                },
+            )
+            checkpoint_export_t0 = time.perf_counter()
             await run_async_with_otel_span(
                 "weights.save_state.execute",
                 lambda: training_engine.save_weights(session, save_path),
@@ -1247,6 +1262,13 @@ async def _do_save_state(
                     "backend": str(getattr(session, "backend", "unknown")),
                     "checkpoint_type": "training",
                     "checkpoint_name": str(checkpoint_name),
+                },
+            )
+            await _safe_update_weights_meta(
+                request_id,
+                {
+                    "stage": "validate_checkpoint",
+                    "checkpoint_export_s": max(0.0, time.perf_counter() - checkpoint_export_t0),
                 },
             )
 
@@ -1272,6 +1294,7 @@ async def _do_save_state(
         # Save ownership metadata (for user-scoped checkpoint API)
         # Note: Directory is created by Ray Worker on GPU node, but shared filesystem
         # sync may not be complete yet. Create directory on API server to ensure it exists.
+        validate_checkpoint_t0 = time.perf_counter()
         os.makedirs(save_path, exist_ok=True)
 
         optimizer_present = bool(checkpoint_has_optimizer_state(save_path))
@@ -1285,6 +1308,13 @@ async def _do_save_state(
             raise RuntimeError(
                 f"save_state produced an invalid training checkpoint at {save_path}: {e}"
             ) from e
+        await _safe_update_weights_meta(
+            request_id,
+            {
+                "stage": "write_checkpoint_metadata",
+                "validate_checkpoint_s": max(0.0, time.perf_counter() - validate_checkpoint_t0),
+            },
+        )
 
         metadata = {
             "checkpoint_id": checkpoint_name,
@@ -1301,8 +1331,17 @@ async def _do_save_state(
             "ttl_seconds": request.ttl_seconds,
             "ckpt_id": claimed_ckpt_id,
         }
+        write_metadata_t0 = time.perf_counter()
         write_checkpoint_metadata(save_path, metadata)
+        await _safe_update_weights_meta(
+            request_id,
+            {
+                "stage": "begin_async_checkpoint_mirror",
+                "write_checkpoint_metadata_s": max(0.0, time.perf_counter() - write_metadata_t0),
+            },
+        )
 
+        mirror_t0 = time.perf_counter()
         persistent_path = begin_async_checkpoint_mirror(
             save_path,
             user_id=user_id,
@@ -1311,6 +1350,13 @@ async def _do_save_state(
             checkpoint_type="training",
         )
         mirror_started = True
+        await _safe_update_weights_meta(
+            request_id,
+            {
+                "stage": "ready",
+                "begin_async_checkpoint_mirror_s": max(0.0, time.perf_counter() - mirror_t0),
+            },
+        )
 
         # Sampling engines load checkpoints on demand via checkpoint_uri/create_sampling_session.
         # Do not block save_state completion on vLLM engine creation or LoRA hot-load.

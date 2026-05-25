@@ -36,6 +36,7 @@ from .logging_context import (
     get_trace_id,
     get_otel_tracer,
     record_http_server_metrics,
+    register_api_process_observable_metrics,
     set_trace_id,
 )
 from .ray_utils import init_ray, ray_connection_epoch, ray_reconnect_poll_s
@@ -235,6 +236,7 @@ async def lifespan(app: FastAPI):
     # processes. Initialize logging/OTel here so each request-serving process
     # owns its metric provider and process identity.
     configure_logging()
+    register_api_process_observable_metrics()
     # ==========================================================================
     # Ray driver: startup invariant
     # ==========================================================================
@@ -490,9 +492,7 @@ _OTEL_EXCLUDED_PATHS: set[str] = set() if _OTEL_EXCLUDE_NONE else {
     "/api/v1/internal/healthz",
     "/api/v1/telemetry",
     "/api/v1/session_heartbeat",
-    "/api/v1/internal/admission_stats",
     "/internal/admission_stats",
-    "/api/v1/internal/metrics",
     "/internal/metrics",
 }
 

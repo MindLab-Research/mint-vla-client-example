@@ -37,12 +37,12 @@ def test_task_state_store_client_async_ensure_ready_can_create_actor(monkeypatch
 
     calls: dict[str, object] = {}
 
-    class _StatsRemote:
+    class _PingRemote:
         def remote(self) -> dict[str, object]:
-            return {"actor_name": "mint_task_state_store", "active_tasks": 0}
+            return {"ok": True, "actor_name": "mint_task_state_store"}
 
     class _Actor:
-        stats = _StatsRemote()
+        ping = _PingRemote()
 
     async def _fake_async_get_ray_ref(ref, *, timeout_s=10.0):
         calls["timeout_s"] = timeout_s
@@ -60,7 +60,7 @@ def test_task_state_store_client_async_ensure_ready_can_create_actor(monkeypatch
     client = TaskStateStoreClient()
     out = asyncio.run(client.async_ensure_ready(timeout_s=7.0, create_if_missing=True))
 
-    assert out == {"actor_name": "mint_task_state_store", "active_tasks": 0}
+    assert out == {"ok": True, "actor_name": "mint_task_state_store"}
     assert calls == {"require_ready": False, "timeout_s": 7.0}
 
 
@@ -77,7 +77,8 @@ def test_task_state_store_actor_wait_status_change_notifies(tmp_path) -> None:
             )
 
             waiter = asyncio.create_task(
-                actor.wait_task_status_change(
+                asyncio.to_thread(
+                    actor.wait_task_status_change,
                     request_id="req-watch",
                     timeout_s=1.0,
                 )
@@ -101,6 +102,145 @@ def test_task_state_store_actor_wait_status_change_notifies(tmp_path) -> None:
     asyncio.run(_run())
 
 
+def test_issue_638_task_state_store_stats_include_future_dashboard_fields(tmp_path) -> None:
+    import mint_server.backend.task_state_store as task_state_store_module
+
+    task_state_store_module._FUTURE_TIMEOUT_METRICS.clear()
+    task_state_store_module._FUTURE_TIMEOUT_METRICS.update(
+        {"queue": 0.0, "execution": 0.0, "total": 0.0, "by_op": {}}
+    )
+    task_state_store_module._BILLING_FLUSH_METRICS.clear()
+    actor = _TaskStateStoreActor(str(tmp_path / "task-state-metrics.sqlite3"))
+    try:
+        actor.create_task(
+            request_id="req-pending",
+            op="sampling.asample",
+            domain_key="vllm:test",
+            request_json=b"{}",
+            now=100.0,
+        )
+        actor.create_task(
+            request_id="req-done",
+            op="sampling.asample",
+            domain_key="vllm:test",
+            request_json=b"{}",
+            now=90.0,
+        )
+        actor.complete_task_success(
+            request_id="req-done",
+            result_path="/tmp/result.json",
+            result_checksum="sha256:abc",
+            result_size_bytes=17,
+            metadata={"done_at": 101.0},
+            now=101.0,
+        )
+
+        stats = actor.stats()
+
+        assert stats["pending"] == 1
+        assert stats["results"] == 1
+        assert stats["refs"] == 1
+        assert stats["by_op"]["sampling.asample"]["pending"] == 1
+        assert stats["by_op"]["sampling.asample"]["results"] == 1
+        assert stats["age_stats"]["oldest_pending_s"] >= 0
+        assert stats["payload_stats"]["result_refs_count"] == 1
+        assert stats["timeout_counts"]["total"] == 0.0
+
+        expired = actor.expire_active_tasks(older_than_s=10.0, now=200.0)
+        assert expired == ["req-pending"]
+        stats = actor.stats()
+        assert stats["timeout_counts"]["execution"] == 1.0
+        assert stats["timeout_counts"]["total"] == 1.0
+        assert stats["timeout_counts"]["by_op"]["sampling.asample"]["execution"] == 1.0
+        assert stats["timeout_counts"]["by_op"]["sampling.asample"]["total"] == 1.0
+
+        actor.record_billing_metrics({"flush_success": 1, "event_inserted": 2, "event_conflict": 1})
+        stats = actor.stats()
+        assert stats["billing_outbox"]["metrics"]["flush_success"] == 1.0
+        assert stats["billing_outbox"]["metrics"]["event_inserted"] == 2.0
+        assert stats["billing_outbox"]["metrics"]["event_conflict"] == 1.0
+    finally:
+        actor.close()
+
+
+def test_issue_638_task_state_store_registers_otel_future_and_billing_gauges(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opentelemetry.metrics as otel_metrics
+
+    import mint_server.backend.task_state_store as task_state_store_module
+    import mint_server.logging_context as logging_context
+
+    task_state_store_module._FUTURE_TIMEOUT_METRICS.clear()
+    task_state_store_module._FUTURE_TIMEOUT_METRICS.update(
+        {"queue": 0.0, "execution": 0.0, "total": 0.0, "by_op": {}}
+    )
+    task_state_store_module._BILLING_FLUSH_METRICS.clear()
+
+    gauges: dict[str, list] = {}
+
+    class _FakeMeter:
+        def create_observable_gauge(self, name, **kwargs):
+            gauges[name] = list(kwargs.get("callbacks") or [])
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel.example:4317")
+    monkeypatch.setenv("MINT_DEPLOYMENT_ENV", "prod")
+    monkeypatch.setenv("MINT_CLUSTER_ID", "volcano")
+    monkeypatch.setattr(otel_metrics, "get_meter", lambda _name: _FakeMeter())
+    monkeypatch.setattr(logging_context, "init_actor_observability", lambda: None)
+
+    actor = _TaskStateStoreActor(str(tmp_path / "task-state-otel.sqlite3"))
+    try:
+        actor.create_task(
+            request_id="req-pending",
+            op="sampling.asample",
+            domain_key="vllm:test",
+            request_json=b"{}",
+            now=100.0,
+        )
+        actor.record_billing_metrics(
+            {
+                "flush_success": 1,
+                "flush_transient_error": 2,
+                "event_inserted": 3,
+                "skipped_missing_billing_context": 4,
+            }
+        )
+
+        assert "mint_task_futures_pending" in gauges
+        assert "mint_task_futures_oldest_pending_s" in gauges
+        assert "mint_task_futures_timeouts_total" in gauges
+        assert "mint_billing_outbox_rows" in gauges
+        assert "mint_billing_outbox_flush_attempts_total" in gauges
+        assert "mint_billing_observation_skipped_total" in gauges
+
+        pending_obs = gauges["mint_task_futures_pending"][0](None)
+        assert any(obs.value == 1.0 and obs.attributes.get("op") is None for obs in pending_obs)
+        assert any(obs.value == 1.0 and obs.attributes.get("op") == "sampling.asample" for obs in pending_obs)
+        for obs in pending_obs:
+            assert obs.attributes["deployment.env"] == "prod"
+            assert obs.attributes["mint.cluster_id"] == "volcano"
+            assert "request_id" not in obs.attributes
+        timeout_obs = gauges["mint_task_futures_timeouts_total"][0](None)
+        assert any(obs.value == 0.0 and obs.attributes.get("kind") == "queue" for obs in timeout_obs)
+        assert any(obs.value == 0.0 and obs.attributes.get("kind") == "execution" for obs in timeout_obs)
+        assert all("request_id" not in obs.attributes for obs in timeout_obs)
+        billing_flush_obs = gauges["mint_billing_outbox_flush_attempts_total"][0](None)
+        assert any(obs.value == 1.0 and obs.attributes.get("result") == "success" for obs in billing_flush_obs)
+        assert any(obs.value == 2.0 and obs.attributes.get("result") == "transient_error" for obs in billing_flush_obs)
+        billing_event_obs = gauges["mint_billing_outbox_events_total"][0](None)
+        assert any(obs.value == 3.0 and obs.attributes.get("result") == "inserted" for obs in billing_event_obs)
+        skipped_obs = gauges["mint_billing_observation_skipped_total"][0](None)
+        assert skipped_obs[0].value == 4.0
+        assert skipped_obs[0].attributes.get("reason") == "missing_billing_context"
+        for observations in (billing_flush_obs, billing_event_obs, skipped_obs):
+            for obs in observations:
+                assert "request_id" not in obs.attributes
+    finally:
+        actor.close()
+
+
 def test_task_state_store_actor_wait_status_change_times_out(tmp_path) -> None:
     async def _run() -> None:
         actor = _TaskStateStoreActor(str(tmp_path / "task-state-watch-timeout.sqlite3"))
@@ -113,7 +253,8 @@ def test_task_state_store_actor_wait_status_change_times_out(tmp_path) -> None:
                 now=1.0,
             )
 
-            out = await actor.wait_task_status_change(
+            out = await asyncio.to_thread(
+                actor.wait_task_status_change,
                 request_id="req-watch-timeout",
                 timeout_s=0.01,
             )
@@ -141,7 +282,8 @@ def test_task_state_store_actor_wait_terminal_only_ignores_active_progress(tmp_p
             )
 
             waiter = asyncio.create_task(
-                actor.wait_task_status_change(
+                asyncio.to_thread(
+                    actor.wait_task_status_change,
                     request_id="req-terminal-watch",
                     timeout_s=1.0,
                     terminal_only=True,
@@ -899,9 +1041,9 @@ def test_billing_outbox_write_failure_sets_underbilling_signal(monkeypatch) -> N
         )
 
         def _fail_append(*_args, **_kwargs):
-            return {"ok": False, "errors": [{"error": "sqlite unavailable"}], "inserted": 0}
+            return {"ok": False, "errors": [{"error": "kv unavailable"}], "inserted": 0}
 
-        monkeypatch.setattr(store, "_append_billing_outbox_locked", _fail_append)
+        monkeypatch.setattr(store._hot_kv, "append_billing_outbox", _fail_append)
 
         completed = store.complete_task_success(
             request_id="future-bill-drop",
@@ -914,7 +1056,7 @@ def test_billing_outbox_write_failure_sets_underbilling_signal(monkeypatch) -> N
         )
         assert completed["record"]["status"] == "done"
         assert completed["record"]["metadata"]["billing_status"] == "dropped"
-        assert completed["record"]["metadata"]["billing_error"]["errors"][0]["error"] == "sqlite unavailable"
+        assert completed["record"]["metadata"]["billing_error"]["errors"][0]["error"] == "kv unavailable"
     finally:
         store.close()
 

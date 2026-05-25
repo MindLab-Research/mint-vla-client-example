@@ -41,6 +41,7 @@ from .gpu_binding_helpers import gpu_bindings_from_ray_gpu_ids
 from .multinode_resources import MultiNodeEngineResources, compute_multinode_engine_resources
 from .ray_placement_groups import PlacementGroupMismatchError, get_named_placement_group
 from .ray_keepalive import ray_get_with_model_actor_supervisor_keepalive
+from .runtime_actor_metrics import current_ray_actor_name, init_vllm_runtime_otel_metrics
 from .vllm_scheduler_observability import (
     VllmStatsObserver,
     install_vllm_iteration_observability_patches,
@@ -108,7 +109,7 @@ def _set_default_vllm_runtime_env(env_vars: dict[str, str]) -> None:
     env_vars.setdefault("USE_FLAX", "0")
 
 
-def _prepare_multinode_vllm_runtime_env(env_vars: dict[str, str]) -> None:
+def _prepare_mint_vllm_multinode_runtime_env(env_vars: dict[str, str]) -> None:
     _set_default_vllm_runtime_env(env_vars)
     # Driver/head temp-dir hints are not portable into Ray worker-hosted vLLM
     # EngineCore subprocesses. Let each controller actor stamp its local node IP.
@@ -701,6 +702,11 @@ def _create_mint_vllm_multinode_actor(
                 "MINT_VLLM_SERIALIZE_ADD_LORA_UNTIL_IDLE", default=False
             )
             self._vllm_stats_observer = VllmStatsObserver()
+            self._otel_runtime_metrics_enabled = init_vllm_runtime_otel_metrics(
+                snapshot_fn=self._vllm_stats_observer.snapshot,
+                actor_name=current_ray_actor_name("unknown"),
+                base_model=str(self.model_path or "unknown"),
+            )
             self._active_generates = 0
             self._active_generates_cond = asyncio.Condition()
             self._is_ready_timeout_s = float(os.environ.get("MINT_VLLM_IS_READY_TIMEOUT_S", "0.05"))
@@ -2477,7 +2483,6 @@ class MultiNodeInferenceEngine:
                     logger.warning(f"Error killing actor {self.actor_name}: {e}")
 
             node_ips: list[str] | None = None
-            gpus_per_node = 8
 
             # Preferred node pinning takes precedence over queue-based selection.
             preferred_placement = _model_gpu_placement_for_model(self.model_name)
@@ -2672,7 +2677,7 @@ class MultiNodeInferenceEngine:
             )
             if "CUDA_LAUNCH_BLOCKING" in os.environ:
                 env_vars["CUDA_LAUNCH_BLOCKING"] = os.environ["CUDA_LAUNCH_BLOCKING"]
-            _prepare_multinode_vllm_runtime_env(env_vars)
+            _prepare_mint_vllm_multinode_runtime_env(env_vars)
             if "MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE" in os.environ:
                 env_vars["MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE"] = os.environ[
                     "MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE"
@@ -2751,6 +2756,7 @@ class MultiNodeInferenceEngine:
             # (e.g. Triton illegal memory access) but the Ray actor stays alive.
             if "MINT_VLLM_GENERATE_TIMEOUT_S" not in env_vars:
                 env_vars["MINT_VLLM_GENERATE_TIMEOUT_S"] = "3600"
+            env_vars["MINT_VLLM_BASE_MODEL_NAME"] = str(self.model_name or self.model_path)
 
             # Fully sharded LoRAs are the default for multinode MoE actors when
             # max_lora_rank is divisible by TP. Operators can still turn this off via:

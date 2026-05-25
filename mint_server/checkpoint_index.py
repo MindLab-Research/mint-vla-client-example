@@ -282,10 +282,26 @@ async def claim_checkpoint_publication(
                 raise CheckpointAlreadyUploadingError(
                     f"checkpoint already uploading: {model_id}/{raw_checkpoint_id}/{checkpoint_type}"
                 )
-            if active_rows and not retry:
-                raise CheckpointAlreadyFailedError(
-                    f"checkpoint previously failed: {model_id}/{raw_checkpoint_id}/{checkpoint_type}"
+            failed_row = next((row for row in active_rows if str(row["status"]) == "failed"), None)
+            if failed_row is not None:
+                await conn.execute(
+                    f"""
+                    UPDATE {_CHECKPOINT_STAGING_TABLE}
+                    SET status = 'uploading',
+                        fail_reason = NULL,
+                        storage_root = $2,
+                        model_name = $3,
+                        checkpoint_created_at = $4,
+                        updated_at = now()
+                    WHERE ckpt_id = $1
+                      AND status = 'failed'
+                    """,
+                    str(failed_row["ckpt_id"]),
+                    storage_root,
+                    model_name,
+                    created_at,
                 )
+                return str(failed_row["ckpt_id"])
 
             ckpt_id = str(uuid.uuid4())
             await conn.execute(
@@ -386,11 +402,15 @@ async def publish_checkpoint_catalog(
                 raw_checkpoint_id=row["raw_checkpoint_id"],
                 checkpoint_type=row["checkpoint_type"],
             )
+            # The caller reaches catalog publication only after validating the
+            # mirrored checkpoint artifacts.  Allow a failed staging row to be
+            # recovered here so a transient upload/mirror state race cannot
+            # permanently strand a valid checkpoint outside the catalog.
             moved = await conn.fetchrow(
                 f"""
                 DELETE FROM {_CHECKPOINT_STAGING_TABLE}
                 WHERE ckpt_id = $1
-                  AND status = 'uploading'
+                  AND status IN ('uploading', 'failed')
                 RETURNING ckpt_id, owner_id, model_id, raw_checkpoint_id, checkpoint_type,
                           storage_layout_version, model_name, checkpoint_created_at
                 """,

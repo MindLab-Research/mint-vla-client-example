@@ -36,6 +36,26 @@ State that survives an API restart in detached control-plane actors:
 - session and sampler index metadata
 - training-session recovery metadata
 - gateway routing metadata for remote sampling sessions and training models
+- billing outbox rows awaiting PG flush
+- session heartbeat metadata used by cleanup and REST metadata checks
+
+`TaskStateStore` owns these through two local persistence components inside
+the same detached actor:
+
+- `FutureStateStore`: RocksDB-backed future/task KV keyed by `request_id`.
+- `TaskHotKVStore`: RocksDB-backed hot metadata KV for billing outbox,
+  sampling/training/gateway sessions, session/sampler indexes, and session
+  heartbeats.
+
+Neither component is a separate Ray actor. The detached `TaskStateStore` actor
+uses a high bounded Ray concurrency only as ingress backpressure; it is not a
+state mutex. KV reads and single-key put/delete operations rely on the KV
+backend's concurrency. Python locks are reserved for per-`request_id` or
+per-key read-modify-write transitions that must preserve a state-machine
+invariant. Billing outbox claims and stats use explicit KV status/event indexes
+rather than SQLite scans or process-local index sets. SQLite remains available
+for legacy/non-hot task tables, but new future and hot metadata writes must not
+depend on SQLite table scans or a process-local dict.
 
 State that is still in-process and lost on API restart:
 

@@ -23,35 +23,13 @@ import json
 import math
 import os
 import random
-import re
 import statistics
-import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 import requests
-
-
-METRIC_NAMES = [
-    "mint_vllm_scheduler_waiting_requests",
-    "mint_vllm_scheduler_running_requests",
-    "mint_vllm_scheduler_kv_cache_usage_ratio",
-    "mint_vllm_prefix_cache_queries_total",
-    "mint_vllm_prefix_cache_hits_total",
-    "mint_vllm_queue_time_s_sum",
-    "mint_vllm_queue_time_s_count",
-    "mint_vllm_prefill_time_s_sum",
-    "mint_vllm_prefill_time_s_count",
-    "mint_vllm_decode_time_s_sum",
-    "mint_vllm_decode_time_s_count",
-    "mint_vllm_time_per_output_token_s_sum",
-    "mint_vllm_time_per_output_token_s_count",
-    "mint_vllm_workload_requests_total",
-    "mint_vllm_workload_prompt_tokens_total",
-    "mint_vllm_workload_generated_tokens_total",
-]
 
 
 def _ts() -> str:
@@ -129,34 +107,6 @@ def _get(base_url: str, path: str, *, timeout_s: float, headers: dict[str, str])
     r.raise_for_status()
     out = r.json()
     assert isinstance(out, dict)
-    return out
-
-
-_METRIC_RE = re.compile(r"^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)(?P<labels>\{[^}]*\})? (?P<value>[-+0-9.eE]+)$")
-
-
-def _fetch_metrics(
-    base_url: str,
-    model: str,
-    *,
-    timeout_s: float,
-    headers: dict[str, str],
-) -> dict[str, float]:
-    r = requests.get(f"{base_url}/internal/metrics", timeout=timeout_s, headers=headers)
-    r.raise_for_status()
-    model_key = f'base_model="{model}"'
-    out: dict[str, float] = {}
-    for line in r.text.splitlines():
-        m = _METRIC_RE.match(line)
-        if not m:
-            continue
-        name = m.group("name")
-        if name not in METRIC_NAMES:
-            continue
-        labels = m.group("labels") or ""
-        if model_key not in labels:
-            continue
-        out[name] = float(m.group("value"))
     return out
 
 
@@ -409,55 +359,6 @@ def _run_one(
         )
 
 
-def _summarize_metric_deltas(before: dict[str, float], after: dict[str, float]) -> dict[str, float | None]:
-    def delta(name: str) -> float:
-        return after.get(name, 0.0) - before.get(name, 0.0)
-
-    q_n = delta("mint_vllm_queue_time_s_count")
-    p_n = delta("mint_vllm_prefill_time_s_count")
-    d_n = delta("mint_vllm_decode_time_s_count")
-    t_n = delta("mint_vllm_time_per_output_token_s_count")
-    prefix_q = delta("mint_vllm_prefix_cache_queries_total")
-    prefix_h = delta("mint_vllm_prefix_cache_hits_total")
-    return {
-        "queue_time_avg_s": (delta("mint_vllm_queue_time_s_sum") / q_n) if q_n > 0 else None,
-        "prefill_time_avg_s": (delta("mint_vllm_prefill_time_s_sum") / p_n) if p_n > 0 else None,
-        "decode_time_avg_s": (delta("mint_vllm_decode_time_s_sum") / d_n) if d_n > 0 else None,
-        "time_per_output_token_avg_s": (delta("mint_vllm_time_per_output_token_s_sum") / t_n) if t_n > 0 else None,
-        "prefix_cache_query_delta": prefix_q,
-        "prefix_cache_hit_delta": prefix_h,
-        "prefix_cache_hit_ratio_delta": (prefix_h / prefix_q) if prefix_q > 0 else None,
-        "workload_request_delta": delta("mint_vllm_workload_requests_total"),
-        "workload_prompt_token_delta": delta("mint_vllm_workload_prompt_tokens_total"),
-        "workload_generated_token_delta": delta("mint_vllm_workload_generated_tokens_total"),
-    }
-
-
-def _summarize_poll(samples: list[dict[str, Any]]) -> dict[str, float | None]:
-    waits = [s.get("mint_vllm_scheduler_waiting_requests", 0.0) for s in samples]
-    runs = [s.get("mint_vllm_scheduler_running_requests", 0.0) for s in samples]
-    kvs = [s.get("mint_vllm_scheduler_kv_cache_usage_ratio", 0.0) for s in samples]
-    if not samples:
-        return {
-            "poll_samples": 0,
-            "waiting_avg": None,
-            "waiting_max": None,
-            "running_avg": None,
-            "running_max": None,
-            "kv_avg": None,
-            "kv_max": None,
-        }
-    return {
-        "poll_samples": len(samples),
-        "waiting_avg": statistics.mean(waits),
-        "waiting_max": max(waits),
-        "running_avg": statistics.mean(runs),
-        "running_max": max(runs),
-        "kv_avg": statistics.mean(kvs),
-        "kv_max": max(kvs),
-    }
-
-
 def _run_distribution(
     *,
     base_url: str,
@@ -474,8 +375,6 @@ def _run_distribution(
     arrival_rate_qps: float,
     call_timeout_s: float,
     poll_s: float,
-    metrics_poll_s: float,
-    metrics_settle_s: float,
     out_dir: Path,
     seed: int,
     headers: dict[str, str],
@@ -495,23 +394,6 @@ def _run_distribution(
         seed=seed,
         headers=headers,
     )
-
-    before = _fetch_metrics(base_url, model, timeout_s=30.0, headers=headers)
-    poll_stop = threading.Event()
-    poll_rows: list[dict[str, Any]] = []
-
-    def _poller() -> None:
-        while not poll_stop.is_set():
-            try:
-                row = _fetch_metrics(base_url, model, timeout_s=30.0, headers=headers)
-                row["ts"] = time.time()
-                poll_rows.append(row)
-            except Exception as e:
-                poll_rows.append({"ts": time.time(), "error": f"{type(e).__name__}: {e}"})
-            poll_stop.wait(metrics_poll_s)
-
-    poll_thread = threading.Thread(target=_poller, daemon=True)
-    poll_thread.start()
 
     req_path = out_dir / f"requests_{distribution}_rep{repeat}.jsonl"
     wall_t0 = time.monotonic()
@@ -539,11 +421,6 @@ def _run_distribution(
         for fut in futs:
             results.append(fut.result())
     wall_s = time.monotonic() - wall_t0
-    if metrics_settle_s > 0:
-        time.sleep(metrics_settle_s)
-    poll_stop.set()
-    poll_thread.join(timeout=metrics_poll_s + metrics_settle_s + 5.0)
-    after = _fetch_metrics(base_url, model, timeout_s=30.0, headers=headers)
 
     req_path.parent.mkdir(parents=True, exist_ok=True)
     with req_path.open("w", encoding="utf-8") as f:
@@ -581,17 +458,14 @@ def _run_distribution(
         "family_count": len(family_counts),
         "family_histogram": {str(k): v for k, v in sorted(family_counts.items())},
         "errors": [r.error for r in err[:5]],
-        "metrics_delta": _summarize_metric_deltas(before, after),
-        "metrics_poll": _summarize_poll([x for x in poll_rows if "error" not in x]),
+        "observability_note": "runtime metrics are exported through OTel push; query telemetry instead of /internal/metrics",
         "request_jsonl": str(req_path),
     }
     metrics_path = out_dir / f"metrics_{distribution}_rep{repeat}.json"
     metrics_path.write_text(
         json.dumps(
             {
-                "before": before,
-                "after": after,
-                "poll": poll_rows,
+                "observability_note": summary["observability_note"],
                 "summary": summary,
             },
             indent=2,
@@ -609,8 +483,6 @@ def _run_distribution(
                 "ok": summary["ok"],
                 "latency_p50_s": summary["latency_p50_s"],
                 "request_throughput_rps": summary["request_throughput_rps"],
-                "waiting_max": summary["metrics_poll"]["waiting_max"],
-                "running_max": summary["metrics_poll"]["running_max"],
             },
             sort_keys=True,
         ),
@@ -621,10 +493,10 @@ def _run_distribution(
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--base-url", default=os.environ.get("MINT_BASE_URL") or os.environ.get("MINT_BASE_URL") or "http://localhost:8000")
+    p.add_argument("--base-url", default=os.environ.get("MINT_BASE_URL") or "http://localhost:8000")
     p.add_argument("--model", required=True)
     p.add_argument("--distributions", default="distinct,uniform,skewed,identical")
-    p.add_argument("--api-key", default=os.environ.get("MINT_API_KEY") or os.environ.get("MINT_API_KEY") or "")
+    p.add_argument("--api-key", default=os.environ.get("MINT_API_KEY") or "")
     p.add_argument("--num-requests", type=int, default=24)
     p.add_argument("--num-samples", type=int, default=8)
     p.add_argument("--prompt-lens", default="2048,8192,16000")
@@ -637,8 +509,6 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--call-timeout-s", type=float, default=3600.0)
     p.add_argument("--poll-s", type=float, default=1.0)
-    p.add_argument("--metrics-poll-s", type=float, default=1.0)
-    p.add_argument("--metrics-settle-s", type=float, default=5.0)
     p.add_argument("--run-dir", default=None)
     args = p.parse_args()
 
@@ -702,8 +572,6 @@ def main() -> None:
                     arrival_rate_qps=args.arrival_rate_qps,
                     call_timeout_s=args.call_timeout_s,
                     poll_s=args.poll_s,
-                    metrics_poll_s=args.metrics_poll_s,
-                    metrics_settle_s=args.metrics_settle_s,
                     out_dir=run_dir,
                     seed=args.seed + rep * 1000 + i * 100,
                     headers=headers,

@@ -69,6 +69,7 @@ class RayNodeState:
     alive: bool = True
     gpu_count: int | None = None
     hostname: str | None = None
+    is_head_node: bool = False
 
 
 @dataclass(frozen=True)
@@ -84,6 +85,7 @@ class TopologyNodeRuntime:
     runtime_env_ok: bool = True
     node_ip: str | None = None
     ray_node_id: str | None = None
+    is_head_node: bool = False
     provider_task_id: str | None = None
     gpu_count: int | None = None
     validated_at: float | None = None
@@ -308,6 +310,7 @@ def default_ray_node_lister() -> Iterable[RayNodeState]:
                 alive=bool(row.get("Alive", False)),
                 gpu_count=gpu_count,
                 hostname=str(row.get("NodeName") or "").strip() or None,
+                is_head_node=bool(row.get("IsHeadNode")),
             )
         )
     return nodes
@@ -349,6 +352,7 @@ def _ray_nodes_from_dashboard_payload(payload: Any) -> list[RayNodeState]:
                 alive=state == "ALIVE" if state else bool(row.get("alive", True)),
                 gpu_count=gpu_count,
                 hostname=str(row.get("node_name") or row.get("hostname") or "").strip() or None,
+                is_head_node=bool(row.get("is_head_node") or row.get("isHeadNode") or row.get("IsHeadNode")),
             )
         )
     return nodes
@@ -379,16 +383,38 @@ def ray_dashboard_node_lister(
 
 
 def default_ray_node_lister_for_config(config: TopologyConfig | None) -> RayNodeLister:
+    def _read_config_head_ip() -> str | None:
+        if config is None or not config.ray_head_ip_path:
+            return None
+        try:
+            head_ip = Path(config.ray_head_ip_path).read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        return head_ip if head_ip and is_ip_address(head_ip) else None
+
+    def _mark_head_node(node: RayNodeState, *, head_ip: str | None) -> RayNodeState:
+        if node.is_head_node or not head_ip or node.node_ip != head_ip:
+            return node
+        return RayNodeState(
+            node_ip=node.node_ip,
+            ray_node_id=node.ray_node_id,
+            alive=node.alive,
+            gpu_count=node.gpu_count,
+            hostname=node.hostname,
+            is_head_node=True,
+        )
+
     def _list_nodes() -> Iterable[RayNodeState]:
+        head_ip = _read_config_head_ip()
         by_ip: dict[str, RayNodeState] = {}
         for node in default_ray_node_lister():
-            by_ip[node.node_ip] = node
+            by_ip[node.node_ip] = _mark_head_node(node, head_ip=head_ip)
         if config is not None:
             for node in ray_dashboard_node_lister(
                 dashboard_url=config.ray_dashboard_url,
                 head_ip_path=config.ray_head_ip_path,
             ):
-                by_ip[node.node_ip] = node
+                by_ip[node.node_ip] = _mark_head_node(node, head_ip=head_ip)
         return list(by_ip.values())
 
     return _list_nodes
@@ -1026,6 +1052,7 @@ class TopologyManager:
                     runtime_env_ok=desired.runtime_env_ok,
                     provider_task_id=task.task_id if task else None,
                     node_ip=task.node_ip if task else None,
+                    is_head_node=False,
                     gpu_count=task.gpu_count if task else desired.gpu_count,
                     last_error=last_error,
                 )
@@ -1061,6 +1088,7 @@ class TopologyManager:
                     runtime_env_ok=desired.runtime_env_ok,
                     provider_task_id=task.task_id,
                     node_ip=node_ip,
+                    is_head_node=bool(ray_node.is_head_node) if ray_node is not None else False,
                     gpu_count=task.gpu_count or desired.gpu_count,
                     last_error=f"Ray node {node_ip} is not alive",
                 )
@@ -1080,6 +1108,7 @@ class TopologyManager:
                     provider_task_id=task.task_id,
                     node_ip=node_ip,
                     ray_node_id=ray_node.ray_node_id,
+                    is_head_node=bool(ray_node.is_head_node),
                     gpu_count=gpu_count,
                     last_error=f"Ray node GPU count {gpu_count} < desired {desired.gpu_count}",
                 )
@@ -1097,7 +1126,33 @@ class TopologyManager:
                 provider_task_id=task.task_id,
                 node_ip=node_ip,
                 ray_node_id=ray_node.ray_node_id,
+                is_head_node=bool(ray_node.is_head_node),
                 gpu_count=gpu_count,
+                validated_at=time.time(),
+                last_error=None,
+            )
+        for ray_node in ray_nodes_by_ip.values():
+            if not ray_node.alive or not ray_node.is_head_node:
+                continue
+            if any(node.node_ip == ray_node.node_ip for node in runtime_nodes.values()):
+                continue
+            alias = "mint-head"
+            if alias in runtime_nodes:
+                continue
+            runtime_nodes[alias] = TopologyNodeRuntime(
+                alias=alias,
+                state="ready",
+                provider="ray",
+                provider_task_name=alias,
+                template="observed-ray-head",
+                enabled=True,
+                role="head",
+                mount_ok=True,
+                runtime_env_ok=True,
+                node_ip=ray_node.node_ip,
+                ray_node_id=ray_node.ray_node_id,
+                is_head_node=True,
+                gpu_count=ray_node.gpu_count,
                 validated_at=time.time(),
                 last_error=None,
             )
@@ -1119,6 +1174,7 @@ class TopologyManager:
                 provider_task_id=node.provider_task_id,
                 node_ip=node.node_ip,
                 ray_node_id=node.ray_node_id,
+                is_head_node=node.is_head_node,
                 gpu_count=node.gpu_count,
                 validated_at=node.validated_at,
                 last_error=error,
@@ -1181,6 +1237,8 @@ class TopologyManager:
             return None, f"unknown worker_alias {alias!r}"
         if not node.ready:
             return None, f"worker_alias {alias!r} is not ready: state={node.state} error={node.last_error or ''}".strip()
+        if node.role != "gpu" or node.provider == "ray" or node.is_head_node:
+            return None, f"worker_alias {alias!r} is not valid for model placement: role={node.role}"
         return node.node_ip, None
 
     def snapshot(self) -> dict[str, Any]:
@@ -1209,6 +1267,7 @@ def topology_state_to_dict(state: TopologyRuntimeState | None) -> dict[str, Any]
                 "runtime_env_ok": node.runtime_env_ok,
                 "node_ip": node.node_ip,
                 "ray_node_id": node.ray_node_id,
+                "is_head_node": node.is_head_node,
                 "gpu_count": node.gpu_count,
                 "validated_at": node.validated_at,
                 "last_error": node.last_error,

@@ -119,6 +119,15 @@ input. If a live provider task and alive Ray node already satisfy an alias, V1
 must reuse it and must not submit a duplicate worker. V1 is scale-up only and
 does not cancel or tear down disabled/removed cloud nodes automatically.
 
+The Ray head node is not a desired worker and must not use the
+`mint-worker-{idx}` namespace. During reconcile, the topology manager observes
+the current Ray head from `ray.nodes()` and the Ray dashboard. If Ray does not
+mark the head explicitly, the node whose IP matches `ray.head_ip_path` is
+treated as the head. The runtime state then exposes it as `mint-head` with
+`provider: ray` and `role: head`. `mint-head` is output-only runtime state: it
+is eligible for the head `NodeMetricsCollectorActor`, but invalid for model
+placement and never causes provider worker submission.
+
 Worker creation is keyed by the numeric suffix in `mint-worker-{idx}` and by the
 stable provider task name for that alias. A reconcile pass may submit all
 missing desired workers in one bounded parallel batch
@@ -211,7 +220,9 @@ Dynamic placement V1 supports only a DaemonSet policy:
 - required eligibility checks: `enabled`, `role=gpu`, `gpu_count > 0`, alive Ray
   node, shared filesystem path availability, runtime env import probe, and NVML
   access probe
-- head/API-only CPU nodes are excluded unless explicitly labeled as eligible
+- head/API-only CPU nodes are excluded from model placement, but the observed
+  `mint-head` runtime alias is eligible for a head-only node metrics daemon so
+  Ray/GCS global gauges can be pushed without adding a separate actor class
 - actor pinning with `resources={f"node:{node_ip}": 0.001}`
 - `num_gpus=0`
 
@@ -554,6 +565,48 @@ when `MINT_DEPLOYMENT_ENV` is set, otherwise `/vePFS-Mindverse/share/mint`.
 Override it with `MINT_NODE_METRICS_DISK_PATH` for local development or
 specialized mounts.
 
+### Head Ray / GCS Metrics
+
+Exactly one head `NodeMetricsCollectorActor` pushes global Ray/GCS gauges from
+its cached background samples. Worker node collectors must not register these
+families.
+
+Ray live-state gauges:
+
+- `mint_ray_cluster_up`
+- `mint_ray_cluster_warning_count`
+- `mint_ray_cluster_probe_error_count`
+- `mint_ray_cluster_slow_probe_count`
+- `mint_ray_cluster_total_probe_latency_ms`
+- `mint_ray_cluster_cache_age_s`
+- `mint_ray_cluster_last_success_unixtime`
+- `mint_ray_cluster_last_success_age_s`
+- `mint_ray_cluster_nodes{state=alive|dead}`
+- `mint_ray_cluster_dead_nodes_missing_heartbeats`
+- `mint_ray_cluster_{cpu,gpu,memory,object_store_memory}_{total|available}`
+- `mint_ray_cluster_placement_groups_{total|created|removed|pending|pending_gpu}`
+- `mint_ray_cluster_named_actors_total`
+- `mint_ray_cluster_named_actors_namespace`
+- `mint_ray_cluster_probe_success{probe}`
+- `mint_ray_cluster_probe_latency_ms{probe}`
+
+GCS bridge gauges:
+
+- `mint_ray_gcs_metrics_bridge_up`
+- `mint_ray_gcs_metrics_bridge_scrape_error_count`
+- `mint_ray_gcs_metrics_bridge_sample_count`
+- `mint_ray_gcs_metrics_bridge_scrape_latency_ms`
+- `mint_ray_gcs_metrics_bridge_cache_age_s`
+- `mint_ray_gcs_metrics_bridge_last_success_unixtime`
+- `mint_ray_gcs_metrics_bridge_last_success_age_s`
+
+The head collector also pushes selected raw GCS/grpc aggregates as
+`mint_ray_gcs_raw_<upstream_name>` gauges, plus MinT-derived `mint_ray_gcs_*`
+gauges such as task-event drop/store ratios and histogram means. It must not
+attach source addresses, raw errors, node IDs, actor names, or placement group
+names as metric labels. Do not push new MinT-owned metrics without the `mint_`
+prefix.
+
 ## Actor Correlation
 
 Actor-to-GPU correlation stays in supervisor-owned inventory:
@@ -624,12 +677,12 @@ disabled by default. The required feature flag is
 return `404 Not Found` so Prometheus scrapes fail closed and operators do not
 mistake it for the supported metrics path.
 
-Existing Prometheus metrics may be removed or reduced only after their signals
-are covered by OTel push metrics and any dependent dashboard/alert has migrated.
-
-If `/internal/metrics` is enabled for debugging, it must remain authenticated and
-must not trigger node-local sampling. It may render cached process-local state
-only.
+After OTel migration, `/internal/metrics` is sentinel-only. If enabled, it must
+remain authenticated and must not trigger node-local sampling, Ray/GCS probing,
+Ray actor snapshot collection, scheduler inspection, supervisor inspection, or
+TaskStateStore inspection. Ray/GCS families are owned by the head
+`NodeMetricsCollectorActor`; runtime, scheduler, supervisor, node, and
+TaskStateStore families are pushed by their owning process or actor.
 
 ## Failure Semantics
 

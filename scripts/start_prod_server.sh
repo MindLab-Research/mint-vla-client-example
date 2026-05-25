@@ -20,58 +20,10 @@ fi
 set +a
 
 if [ -z "${MINT_RUNTIME_CHECKPOINT_DIR:-}" ]; then
-  export MINT_RUNTIME_CHECKPOINT_DIR="${TINKER_RUNTIME_CHECKPOINT_DIR:-/vePFS-Mindverse/share/mint/prod/data/runtime-checkpoints}"
+  export MINT_RUNTIME_CHECKPOINT_DIR="/vePFS-Mindverse/share/mint/prod/data/runtime-checkpoints"
 fi
 if [ -z "${MINT_CODE_ROOT:-}" ]; then
-  export MINT_CODE_ROOT="${PFS_TINKER_PATH:-$repo_root}"
-fi
-
-if [ -z "${MINT_GATEWAY_GLM51_MODEL:-}" ] && [ -n "${TINKER_GATEWAY_GLM51_MODEL:-}" ]; then
-  export MINT_GATEWAY_GLM51_MODEL="${TINKER_GATEWAY_GLM51_MODEL}"
-fi
-if [ -z "${MINT_GATEWAY_GLM51_ALIAS:-}" ] && [ -n "${TINKER_GATEWAY_GLM51_ALIAS:-}" ]; then
-  export MINT_GATEWAY_GLM51_ALIAS="${TINKER_GATEWAY_GLM51_ALIAS}"
-fi
-if [ -z "${MINT_GATEWAY_GLM51_BASE_URL:-}" ] && [ -n "${TINKER_GATEWAY_GLM51_BASE_URL:-}" ]; then
-  export MINT_GATEWAY_GLM51_BASE_URL="${TINKER_GATEWAY_GLM51_BASE_URL}"
-fi
-if [ -z "${MINT_GATEWAY_GLM51_AUTH_MODE:-}" ] && [ -n "${TINKER_GATEWAY_GLM51_AUTH_MODE:-}" ]; then
-  export MINT_GATEWAY_GLM51_AUTH_MODE="${TINKER_GATEWAY_GLM51_AUTH_MODE}"
-fi
-
-if [ -n "${MINT_GATEWAY_GLM51_BASE_URL:-}" ]; then
-  if [ "${MINT_GATEWAY_GLM51_AUTH_MODE:-static_api_key}" != "static_api_key" ]; then
-    echo "unsupported GLM5.1 gateway auth mode: ${MINT_GATEWAY_GLM51_AUTH_MODE}" >&2
-    exit 1
-  fi
-  if [ -z "${MINT_API_KEY:-}" ]; then
-    echo "missing MINT_API_KEY for GLM5.1 static gateway auth" >&2
-    exit 1
-  fi
-  export MINT_GATEWAY_CONFIG_JSON="$(python - <<'PY'
-import json
-import os
-
-raw = os.environ.get("MINT_GATEWAY_CONFIG_JSON", "").strip()
-cfg = json.loads(raw) if raw else {}
-model_to_upstream = dict(cfg.get("model_to_upstream") or {})
-upstreams = dict(cfg.get("upstreams") or {})
-alias = os.environ["MINT_GATEWAY_GLM51_ALIAS"].strip()
-model = os.environ["MINT_GATEWAY_GLM51_MODEL"].strip()
-base_url = os.environ["MINT_GATEWAY_GLM51_BASE_URL"].strip().rstrip("/")
-if not alias or not model or not base_url:
-    raise SystemExit("GLM5.1 gateway config is incomplete")
-model_to_upstream[model] = alias
-upstreams[alias] = {
-    "base_url": base_url,
-    "auth_mode": "static_api_key",
-    "api_key": os.environ["MINT_API_KEY"].strip(),
-}
-cfg["model_to_upstream"] = model_to_upstream
-cfg["upstreams"] = upstreams
-print(json.dumps(cfg, separators=(",", ":")))
-PY
-)"
+  export MINT_CODE_ROOT="$repo_root"
 fi
 
 api_tmp_root="${MINT_TMP_ROOT}/api/${USER:-unknown}"

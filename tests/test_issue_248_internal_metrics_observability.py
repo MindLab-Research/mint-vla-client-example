@@ -241,6 +241,12 @@ async def _fake_admission_stats(*, include_actor_rss: bool = True) -> dict:
             "result_ttl_s": 100,
             "tombstone_ttl_s": 10,
             "by_op": {"asample": {"pending": 1, "results": 4, "errors": 0}},
+            "timeout_counts": {
+                "queue": 2,
+                "execution": 1,
+                "total": 3,
+                "by_op": {"asample": {"queue": 2, "execution": 1, "total": 3}},
+            },
             "age_stats": {
                 "oldest_pending_s": 8.0,
                 "oldest_done_s": 3.0,
@@ -291,155 +297,45 @@ async def _fake_admission_stats_with_stale_cached_rss(*, include_actor_rss: bool
     return stats
 
 
-def test_issue_248_internal_metrics_omits_unknown_model_actor_inventory_rss(monkeypatch) -> None:
+def test_issue_248_internal_metrics_is_sentinel_only_after_otel_migration(monkeypatch) -> None:
     monkeypatch.setenv("MINT_INTERNAL_PROMETHEUS_METRICS_ENABLED", "1")
-    monkeypatch.setattr(internal_routes, "admission_stats", _fake_admission_stats)
-    monkeypatch.setattr(
-        "mint_server.backend.task_state_store.billing_metrics_snapshot",
-        lambda: {},
-    )
+
+    async def _unexpected_admission_stats(*, include_actor_rss: bool = True) -> dict:
+        raise AssertionError("/internal/metrics must not collect actor snapshots after OTel migration")
+
+    monkeypatch.setattr(internal_routes, "admission_stats", _unexpected_admission_stats)
+
     resp = asyncio.run(internal_routes.metrics())
     text = resp.body.decode("utf-8")
 
-    expected_lines = (
-        "mint_model_work_scheduler_depth 4",
-        "mint_model_work_scheduler_backlog_depth 2",
-        "mint_model_work_scheduler_appended_total 10",
-        "mint_model_work_scheduler_assigned_total 8",
-        'mint_model_work_scheduler_domain_backlog_depth{domain_key="vllm:Qwen/Qwen3-4B-Instruct-2507"} 2',
-        'mint_model_work_scheduler_replica_queue_depth{domain_key="vllm:Qwen/Qwen3-4B-Instruct-2507",queue_id="vllm:Qwen/Qwen3-4B-Instruct-2507::replica-0",replica_id="replica-0",status="healthy"} 3',
-        "mint_model_work_scheduler_leases 1",
-        "mint_task_futures_pending 1",
-        'mint_task_futures_pending{op="asample"} 1',
-        "mint_task_futures_oldest_pending_s 8",
-        "mint_task_futures_result_refs_count 4",
-        'mint_billing_outbox_rows{status="pending"} 2',
-        'mint_billing_outbox_oldest_age_s{status="pending"} 11',
-        'mint_billing_outbox_flush_attempts_total{result="success"} 5',
-        'mint_billing_outbox_flush_attempts_total{result="transient_error"} 1',
-        'mint_billing_outbox_events_total{result="inserted"} 9',
-        'mint_billing_outbox_events_total{result="conflict"} 2',
-        "mint_billing_outbox_write_errors_total 1",
-        "mint_billing_outbox_conflict_total 4",
-        'mint_billing_observation_skipped_total{reason="missing_billing_context"} 3',
-        'mint_model_actor_inventory_actor_idle_time_s{actor_name="vllm-1",actor_type="vllm",model="Qwen/Qwen3-4B-Instruct-2507"} 2',
-        'mint_model_actor_inventory_actor_age_s{actor_name="vllm-1",actor_type="vllm",model="Qwen/Qwen3-4B-Instruct-2507"} 50',
-        'mint_model_actor_inventory_actors{actor_type="vllm",model="Qwen/Qwen3-4B-Instruct-2507"} 1',
-        'mint_model_actor_inventory_actor_rss_cache_state{actor_name="vllm-1",actor_type="vllm",model="Qwen/Qwen3-4B-Instruct-2507",state="unknown"} 1',
-        'mint_model_actor_inventory_group_rss_cache_samples{actor_type="vllm",model="Qwen/Qwen3-4B-Instruct-2507",state="unknown"} 1',
-        "mint_api_server_process_rss_bytes 12345",
-        "mint_metrics_up 1",
-    )
-    for line in expected_lines:
-        assert line in text, f"missing metric line: {line}"
-
-    extra_lines = (
-        'mint_model_load_pct{base_model="Qwen/Qwen3-4B-Instruct-2507",workload="sample"} 100',
-        'mint_model_pending_requests{base_model="Qwen/Qwen3-4B-Instruct-2507",workload="sample"} 3',
-        'mint_model_inflight_workers{base_model="Qwen/Qwen3-4B-Instruct-2507",workload="sample"} 1',
-        'mint_model_capacity_workers{base_model="Qwen/Qwen3-4B-Instruct-2507",workload="sample"} 1',
-        'mint_model_actor_inventory_actor_gpu_binding{actor_name="vllm-1",gpu_index="0",hostname="host-a",workload="sample"} 1',
-        'mint_vllm_scheduler_waiting_requests{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 4',
-        'mint_vllm_scheduler_running_requests{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 2',
-        'mint_vllm_scheduler_kv_cache_usage_ratio{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 0.75',
-        'mint_vllm_prefix_cache_queries_total{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 100',
-        'mint_vllm_prefix_cache_hits_total{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 60',
-        'mint_vllm_prefix_cache_hit_ratio{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 0.6',
-        'mint_vllm_preemptions_total{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 3',
-        'mint_vllm_queue_time_s_sum{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 12',
-        'mint_vllm_queue_time_s_p50_recent{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 1.4',
-        'mint_vllm_queue_time_s_p95_recent{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 3.2',
-        'mint_vllm_prefill_time_s_sum{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 16',
-        'mint_vllm_decode_time_s_sum{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 40',
-        'mint_vllm_time_per_output_token_s_sum{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 0.96',
-        'mint_vllm_scheduled_tokens_iter_sum{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 512',
-        'mint_vllm_scheduled_new_requests_iter_p95_recent{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 4.8',
-        'mint_vllm_prefill_requests_iter_sum{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 20',
-        'mint_vllm_decode_requests_iter_sum{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 44',
-        'mint_vllm_prompt_tokens_iter_p50_recent{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 512',
-        'mint_vllm_generation_tokens_iter_max{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 64',
-        'mint_vllm_time_to_first_token_s_sum{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 9.6',
-        'mint_vllm_inter_token_latency_s_p95_recent{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 0.15',
-        'mint_vllm_executor_execute_model_s_sum{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 3.2',
-        'mint_vllm_worker_execute_model_s_p50_recent{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 0.31',
-        'mint_vllm_seq_slot_wait_s_sum{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 5',
-        'mint_vllm_seq_slot_wait_s_p95_recent{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 1.2',
-        'mint_vllm_generate_lock_wait_s_sum{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 1.2',
-        'mint_vllm_generate_lock_wait_s_p95_recent{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 0.35',
-        'mint_vllm_engine_read_lock_wait_s_sum{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 0.8',
-        'mint_vllm_engine_read_lock_wait_s_p95_recent{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 0.28',
-        'mint_vllm_add_request_wait_s_sum{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 2.4',
-        'mint_vllm_add_request_exec_s_p50_recent{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 0.07',
-        'mint_vllm_first_token_observed_s_max{actor_name="vllm-1",base_model="Qwen/Qwen3-4B-Instruct-2507"} 1.9',
-        'mint_megatron_active_sessions{actor_name="megatron-1",base_model="Qwen/Qwen3-30B-A3B-Instruct-2507"} 1',
-        'mint_megatron_session_unknown{actor_name="megatron-1",base_model="Qwen/Qwen3-30B-A3B-Instruct-2507"} 0',
-        'mint_megatron_session_step{actor_name="megatron-1",base_model="Qwen/Qwen3-30B-A3B-Instruct-2507"} 17',
-        'mint_megatron_learning_rate{actor_name="megatron-1",base_model="Qwen/Qwen3-30B-A3B-Instruct-2507"} 5e-05',
-        'mint_megatron_gpu_memory_allocated_bytes{actor_name="megatron-1",base_model="Qwen/Qwen3-30B-A3B-Instruct-2507"} 48000000000',
-        'mint_megatron_gpu_memory_reserved_bytes{actor_name="megatron-1",base_model="Qwen/Qwen3-30B-A3B-Instruct-2507"} 52000000000',
-        'mint_megatron_gpu_memory_fragmentation_bytes{actor_name="megatron-1",base_model="Qwen/Qwen3-30B-A3B-Instruct-2507"} 4000000000',
-        'mint_model_actor_inventory_actor_gpu_binding{actor_name="megatron-1",gpu_index="0",gpu_uuid="GPU-host-b-0",hostname="host-b",workload="train"} 1',
-        'mint_model_actor_inventory_actor_gpu_binding{actor_name="megatron-1",gpu_index="1",gpu_uuid="GPU-host-b-1",hostname="host-b",workload="train"} 1',
-        'mint_model_actor_inventory_observability_cache_hits_total{actor_type="megatron"} 9',
-        'mint_model_actor_inventory_observability_cache_stale_total{actor_type="megatron"} 3',
-        'mint_model_actor_inventory_observability_refresh_success_total{actor_type="megatron"} 2',
-        'mint_model_actor_inventory_observability_refresh_failures_total{actor_type="megatron"} 1',
-        'mint_model_actor_inventory_observability_cache_hits_total{actor_type="vllm"} 12',
-        'mint_model_actor_inventory_observability_refresh_success_total{actor_type="vllm"} 3',
-        'mint_dense_actor_poisoned{actor_name="mint_dense_qwen__qwen3_4b_instruct_2507",base_model="Qwen/Qwen3-4B-Instruct-2507",last_fatal_op="reinit_lora_weights"} 1',
-        'mint_dense_poisoned_actors{base_model="Qwen/Qwen3-4B-Instruct-2507",last_fatal_op="reinit_lora_weights"} 1',
-    )
-    for line in extra_lines:
-        assert line in text, f"missing metric line: {line}"
-    assert 'mint_dense_actor_poisoned_age_s{actor_name="mint_dense_qwen__qwen3_4b_instruct_2507",base_model="Qwen/Qwen3-4B-Instruct-2507",last_fatal_op="reinit_lora_weights"}' in text
-
-    assert 'mint_actor_rss_bytes{actor="task_futures"}' not in text
-    assert 'mint_model_actor_inventory_actor_rss_bytes{actor_name="vllm-1"' not in text
-    assert 'mint_model_actor_inventory_group_rss_bytes{actor_type="vllm",model="Qwen/Qwen3-4B-Instruct-2507"}' not in text
+    assert "mint_metrics_up 1" in text
+    assert "mint_model_work_scheduler_" not in text
+    assert "mint_model_actor_inventory_" not in text
+    assert "mint_task_futures_" not in text
+    assert "mint_billing_" not in text
+    assert "mint_api_server_process_" not in text
 
 
-def test_issue_248_internal_metrics_emits_group_rss_when_cached_sample_exists(monkeypatch) -> None:
+def test_issue_248_internal_metrics_no_longer_exports_cached_actor_rss(monkeypatch) -> None:
     monkeypatch.setenv("MINT_INTERNAL_PROMETHEUS_METRICS_ENABLED", "1")
     monkeypatch.setattr(internal_routes, "admission_stats", _fake_admission_stats_with_cached_rss)
     resp = asyncio.run(internal_routes.metrics())
     text = resp.body.decode("utf-8")
 
-    assert (
-        'mint_model_actor_inventory_group_rss_bytes{actor_type="vllm",model="Qwen/Qwen3-4B-Instruct-2507"} 4096'
-        in text
-    )
-    assert (
-        'mint_model_actor_inventory_actor_rss_bytes{actor_name="vllm-1",actor_type="vllm",model="Qwen/Qwen3-4B-Instruct-2507"} 4096'
-        in text
-    )
-    assert (
-        'mint_model_actor_inventory_actor_rss_cache_state{actor_name="vllm-1",actor_type="vllm",model="Qwen/Qwen3-4B-Instruct-2507",state="fresh"} 1'
-        in text
-    )
-    assert (
-        'mint_model_actor_inventory_group_rss_cache_samples{actor_type="vllm",model="Qwen/Qwen3-4B-Instruct-2507",state="fresh"} 1'
-        in text
-    )
+    assert "mint_metrics_up 1" in text
+    assert "mint_model_actor_inventory_actor_rss_bytes" not in text
+    assert "mint_model_actor_inventory_group_rss_bytes" not in text
 
 
-def test_issue_248_internal_metrics_marks_stale_cached_rss_without_emitting_value(monkeypatch) -> None:
+def test_issue_248_internal_metrics_no_longer_exports_stale_actor_rss_state(monkeypatch) -> None:
     monkeypatch.setenv("MINT_INTERNAL_PROMETHEUS_METRICS_ENABLED", "1")
     monkeypatch.setattr(internal_routes, "admission_stats", _fake_admission_stats_with_stale_cached_rss)
     resp = asyncio.run(internal_routes.metrics())
     text = resp.body.decode("utf-8")
 
-    assert (
-        'mint_model_actor_inventory_actor_rss_cache_state{actor_name="vllm-1",actor_type="vllm",model="Qwen/Qwen3-4B-Instruct-2507",state="stale"} 1'
-        in text
-    )
-    assert (
-        'mint_model_actor_inventory_group_rss_cache_samples{actor_type="vllm",model="Qwen/Qwen3-4B-Instruct-2507",state="stale"} 1'
-        in text
-    )
-    assert (
-        'mint_model_actor_inventory_actor_rss_sample_age_s{actor_name="vllm-1",actor_type="vllm",model="Qwen/Qwen3-4B-Instruct-2507"} 120'
-        in text
-    )
+    assert "mint_metrics_up 1" in text
+    assert "mint_model_actor_inventory_actor_rss_cache_state" not in text
+    assert "mint_model_actor_inventory_actor_rss_sample_age_s" not in text
     assert 'mint_model_actor_inventory_actor_rss_bytes{actor_name="vllm-1"' not in text
     assert 'mint_model_actor_inventory_group_rss_bytes{actor_type="vllm",model="Qwen/Qwen3-4B-Instruct-2507"}' not in text
 
@@ -454,8 +350,6 @@ def test_issue_588_admission_stats_rss_path_preserves_model_actor_inventory_meta
     sampling_route = importlib.import_module("mint_server.routes.sampling")
     service_route = importlib.import_module("mint_server.routes.service")
     dense_session_state_module = importlib.import_module("mint_server.backend.dense_session_state")
-    ray_cluster_health_module = importlib.import_module("mint_server.ray_cluster_health")
-    ray_gcs_metrics_module = importlib.import_module("mint_server.ray_gcs_metrics")
 
     class _FakeModelWorkScheduler:
         async def stats(self, *, timeout_s: float = 10.0) -> dict:
@@ -515,8 +409,8 @@ def test_issue_588_admission_stats_rss_path_preserves_model_actor_inventory_meta
     monkeypatch.setattr(sampling_route, "_lora_load_lock_count", lambda: 0)
     monkeypatch.setattr(service_route, "session_manager", None)
     monkeypatch.setattr(dense_session_state_module, "collect_dense_session_state_stats", lambda: {})
-    monkeypatch.setattr(ray_cluster_health_module, "get_ray_cluster_health_snapshot", lambda: {})
-    monkeypatch.setattr(ray_gcs_metrics_module, "get_ray_gcs_metrics_snapshot", lambda: {})
+    monkeypatch.setattr(internal_routes, "get_ray_cluster_health_snapshot", lambda: {})
+    monkeypatch.setattr(internal_routes, "get_ray_gcs_metrics_snapshot", lambda: {})
 
     stats = asyncio.run(internal_routes.admission_stats(include_actor_rss=True))
     rec = stats["actors"]["model_actor_inventory"][0]
@@ -538,9 +432,6 @@ def test_issue_248_admission_stats_metrics_path_uses_cached_pool_snapshot(monkey
     sampling_route = importlib.import_module("mint_server.routes.sampling")
     service_route = importlib.import_module("mint_server.routes.service")
     dense_session_state_module = importlib.import_module("mint_server.backend.dense_session_state")
-    ray_cluster_health_module = importlib.import_module("mint_server.ray_cluster_health")
-    ray_gcs_metrics_module = importlib.import_module("mint_server.ray_gcs_metrics")
-
     class _FakeModelWorkScheduler:
         async def stats(self, *, timeout_s: float = 10.0) -> dict:
             return {"depth": 0, "backlog_depth": 0, "replica_queues": {}, "leases": [], "counters": {}}
@@ -589,8 +480,16 @@ def test_issue_248_admission_stats_metrics_path_uses_cached_pool_snapshot(monkey
     monkeypatch.setattr(sampling_route, "_lora_load_lock_count", lambda: 0)
     monkeypatch.setattr(service_route, "session_manager", None)
     monkeypatch.setattr(dense_session_state_module, "collect_dense_session_state_stats", lambda: {})
-    monkeypatch.setattr(ray_cluster_health_module, "get_ray_cluster_health_snapshot", lambda: {})
-    monkeypatch.setattr(ray_gcs_metrics_module, "get_ray_gcs_metrics_snapshot", lambda: {})
+    monkeypatch.setattr(
+        internal_routes,
+        "get_ray_cluster_health_snapshot",
+        lambda: (_ for _ in ()).throw(AssertionError("metrics scrape must not probe Ray cluster health")),
+    )
+    monkeypatch.setattr(
+        internal_routes,
+        "get_ray_gcs_metrics_snapshot",
+        lambda: (_ for _ in ()).throw(AssertionError("metrics scrape must not scrape Ray GCS metrics")),
+    )
 
     stats = asyncio.run(internal_routes.admission_stats(include_actor_rss=False))
 
@@ -598,7 +497,7 @@ def test_issue_248_admission_stats_metrics_path_uses_cached_pool_snapshot(monkey
     assert isinstance(stats.get("actors", {}).get("model_actor_inventory"), list)
 
 
-def test_issue_248_metrics_path_exports_cached_scheduler_model_load(monkeypatch) -> None:
+def test_issue_248_metrics_path_no_longer_exports_cached_scheduler_model_load(monkeypatch) -> None:
     monkeypatch.setenv("MINT_INTERNAL_PROMETHEUS_METRICS_ENABLED", "1")
 
     async def _stats(*, include_actor_rss: bool = True) -> dict:
@@ -636,16 +535,10 @@ def test_issue_248_metrics_path_exports_cached_scheduler_model_load(monkeypatch)
     resp = asyncio.run(internal_routes.metrics())
     text = resp.body.decode("utf-8")
 
-    assert "mint_model_work_scheduler_depth 5" in text
-    assert "mint_model_work_scheduler_backlog_depth 2" in text
-    assert (
-        'mint_model_load_pct{base_model="Qwen/Qwen3-4B-Instruct-2507",workload="sample"} 50'
-        in text
-    )
-    assert (
-        'mint_model_pending_requests{base_model="Qwen/Qwen3-4B-Instruct-2507",workload="sample"} 3'
-        in text
-    )
+    assert "mint_metrics_up 1" in text
+    assert "mint_model_work_scheduler_depth" not in text
+    assert "mint_model_load_pct" not in text
+    assert "mint_model_pending_requests" not in text
 
 
 def test_issue_248_scheduler_decisions_debug_route_proxies_filters(monkeypatch) -> None:
@@ -693,7 +586,7 @@ def test_issue_248_scheduler_decisions_debug_route_proxies_filters(monkeypatch) 
     assert payload["leases"] == [{"item": {"domain_key": "vllm:Qwen/Qwen3-4B-Instruct-2507"}}]
 
 
-def test_issue_248_internal_metrics_exports_ray_control_plane_cache_timestamps(monkeypatch) -> None:
+def test_issue_638_internal_metrics_does_not_export_migrated_ray_gcs_families(monkeypatch) -> None:
     monkeypatch.setenv("MINT_INTERNAL_PROMETHEUS_METRICS_ENABLED", "1")
 
     async def _fake_with_ray(*, include_actor_rss: bool = True) -> dict:
@@ -733,8 +626,7 @@ def test_issue_248_internal_metrics_exports_ray_control_plane_cache_timestamps(m
     resp = asyncio.run(internal_routes.metrics())
     text = resp.body.decode("utf-8")
 
-    assert "mint_ray_cluster_last_success_unixtime 1700000000" in text
-    assert "mint_ray_cluster_last_success_age_s 12" in text
-    assert "mint_ray_gcs_metrics_bridge_last_success_unixtime 1700000005" in text
-    assert "mint_ray_gcs_metrics_bridge_last_success_age_s 9" in text
-    assert 'gcs_actors_count{State="ALIVE"} 6' in text
+    assert "mint_ray_cluster_" not in text
+    assert "mint_ray_gcs_" not in text
+    assert "mint_ray_gcs_metrics_bridge_" not in text
+    assert "gcs_actors_count" not in text

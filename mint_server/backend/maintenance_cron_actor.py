@@ -121,17 +121,19 @@ def run_sampling_cleanup_once() -> dict[str, Any]:
     return {"cleaned": list(cleaned)}
 
 
-def run_billing_outbox_once() -> dict[str, Any]:
+async def async_run_billing_outbox_once() -> dict[str, Any]:
     from .task_state_store import task_futures
 
     limit = int(os.environ.get("MINT_BILLING_OUTBOX_FLUSH_BATCH_SIZE", "100"))
     lease_ttl_s = float(os.environ.get("MINT_BILLING_OUTBOX_CLAIM_TTL_S", "60"))
-    return asyncio.run(
-        task_futures.async_flush_billing_outbox(
-            limit=limit,
-            lease_ttl_s=lease_ttl_s,
-        )
+    return await task_futures.async_flush_billing_outbox(
+        limit=limit,
+        lease_ttl_s=lease_ttl_s,
     )
+
+
+def run_billing_outbox_once() -> dict[str, Any]:
+    return asyncio.run(async_run_billing_outbox_once())
 
 
 async def _await_ray_ref(ref: Any) -> Any:
@@ -220,7 +222,8 @@ def _get_or_create_actor():
                 _LOOP_BILLING_OUTBOX: {
                     "interval_s": _billing_outbox_interval_s(),
                     "run_immediately": False,
-                    "runner": run_billing_outbox_once,
+                    "runner": async_run_billing_outbox_once,
+                    "async_runner": True,
                 },
             }
             for name, spec in self._loop_specs.items():
@@ -244,7 +247,10 @@ def _get_or_create_actor():
             state["running"] = True
             state["last_tick_at"] = time.time()
             try:
-                result = await asyncio.to_thread(runner)
+                if bool(self._loop_specs[loop_name].get("async_runner")):
+                    result = await runner()
+                else:
+                    result = await asyncio.to_thread(runner)
                 state["last_success_at"] = time.time()
                 state["success_count"] = int(state["success_count"]) + 1
                 state["last_result"] = result

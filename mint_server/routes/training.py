@@ -301,6 +301,13 @@ async def _enqueue_training_request_with_trace(
         return out
 
 
+async def _safe_update_training_meta(request_id: str, meta: dict[str, object]) -> None:
+    try:
+        await task_futures.async_update_meta(request_id, meta)
+    except Exception:
+        pass
+
+
 def _training_model_work_domain_key(*, backend: str, base_model: str, model_id: str) -> str:
     backend_value = str(backend or "").strip()
     base = str(base_model or "").strip()
@@ -3553,6 +3560,14 @@ async def _do_save_weights_for_sampler(
         train_mlp = bool(getattr(getattr(session, "lora_config", None), "train_mlp", False))
 
         # Save weights
+        checkpoint_export_t0 = time.perf_counter()
+        await _safe_update_training_meta(
+            request_id,
+            {
+                "stage": "checkpoint_export",
+                "checkpoint_export_started_at": time.time(),
+            },
+        )
         save_path = await run_async_with_otel_span(
             "training.save_weights_for_sampler.execute",
             lambda: engine.save_weights_for_sampler(
@@ -3572,7 +3587,15 @@ async def _do_save_weights_for_sampler(
                 "train_mlp": bool(train_mlp),
             },
         )
+        await _safe_update_training_meta(
+            request_id,
+            {
+                "stage": "validate_checkpoint",
+                "checkpoint_export_s": max(0.0, time.perf_counter() - checkpoint_export_t0),
+            },
+        )
 
+        validate_checkpoint_t0 = time.perf_counter()
         with start_as_current_span(
             "training.save_weights_for_sampler.validate_checkpoint",
             component="routes.training",
@@ -3595,9 +3618,17 @@ async def _do_save_weights_for_sampler(
                     f"save_weights_for_sampler produced an invalid sampler checkpoint at {save_path}: {e}"
                 ) from e
 
+        await _safe_update_training_meta(
+            request_id,
+            {
+                "stage": "write_checkpoint_metadata",
+                "validate_checkpoint_s": max(0.0, time.perf_counter() - validate_checkpoint_t0),
+            },
+        )
         ttl_seconds = request.ttl_seconds
         if request.path is None and ttl_seconds is None:
             ttl_seconds = None
+        write_metadata_t0 = time.perf_counter()
         with start_as_current_span(
             "training.save_weights_for_sampler.write_checkpoint_metadata",
             component="routes.training",
@@ -3628,9 +3659,24 @@ async def _do_save_weights_for_sampler(
                     "ckpt_id": claimed_ckpt_id,
                 },
             )
+        await _safe_update_training_meta(
+            request_id,
+            {
+                "stage": "checkpoint_ready",
+                "write_checkpoint_metadata_s": max(0.0, time.perf_counter() - write_metadata_t0),
+            },
+        )
 
         persistent_path = None
         if request.path is not None:
+            mirror_t0 = time.perf_counter()
+            await _safe_update_training_meta(
+                request_id,
+                {
+                    "stage": "begin_async_checkpoint_mirror",
+                    "mirror_started_at": time.time(),
+                },
+            )
             with start_as_current_span(
                 "training.save_weights_for_sampler.begin_async_checkpoint_mirror",
                 component="routes.training",
@@ -3650,6 +3696,13 @@ async def _do_save_weights_for_sampler(
                     checkpoint_type="sampler",
                 )
                 mirror_started = True
+            await _safe_update_training_meta(
+                request_id,
+                {
+                    "stage": "checkpoint_ready",
+                    "begin_async_checkpoint_mirror_s": max(0.0, time.perf_counter() - mirror_t0),
+                },
+            )
 
         from ..client_compat import checkpoint_uri
 
@@ -3722,6 +3775,14 @@ async def _do_save_weights_for_sampler(
                 setattr(inf_mgr, "_background_engine_warm_tasks", pending_warms)
 
             existing_warm = pending_warms.get(base_model)
+            warm_schedule_t0 = time.perf_counter()
+            await _safe_update_training_meta(
+                request_id,
+                {
+                    "stage": "schedule_background_engine_warm",
+                    "engine_warm_started_at": time.time(),
+                },
+            )
             with start_as_current_span(
                 "training.save_weights_for_sampler.schedule_background_engine_warm",
                 component="routes.training",
@@ -3795,6 +3856,14 @@ async def _do_save_weights_for_sampler(
                     adapter_path=save_path,
                     lora_loaded=False,
                 )
+            await _safe_update_training_meta(
+                request_id,
+                {
+                    "stage": "session_index_write",
+                    "engine_warm_schedule_s": max(0.0, time.perf_counter() - warm_schedule_t0),
+                    "sampling_session_id": str(sampling_session_id),
+                },
+            )
 
             logger.info(
                 f"[save_weights_for_sampler] Multi-LoRA: registered lazy-load session "
@@ -3805,6 +3874,7 @@ async def _do_save_weights_for_sampler(
                 from ..backend.session_index_store import add_heartbeat_sampler_to_session, upsert_sampler_index
 
                 created_at = datetime.now().isoformat()
+                session_index_t0 = time.perf_counter()
                 with start_as_current_span(
                     "training.save_weights_for_sampler.session_index_write",
                     component="routes.training",
@@ -3837,6 +3907,13 @@ async def _do_save_weights_for_sampler(
                             "model_path_raw": tinker_uri,
                         }
                     )
+                await _safe_update_training_meta(
+                    request_id,
+                    {
+                        "stage": "ready",
+                        "session_index_write_s": max(0.0, time.perf_counter() - session_index_t0),
+                    },
+                )
             except Exception as e:
                 logger.warning("[save_weights_for_sampler] session index write failed: %s", e)
 

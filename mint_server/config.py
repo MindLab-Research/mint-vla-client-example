@@ -188,6 +188,11 @@ def otel_env_vars() -> dict[str, str]:
 def preferred_control_plane_resources(cluster_resources: dict[str, float] | None) -> dict[str, float] | None:
     if not cluster_resources:
         return None
+    configured_node_ip = _env_nonempty(os.environ, "MINT_CONTROL_PLANE_NODE_IP")
+    if configured_node_ip is not None:
+        configured_node_key = f"node:{configured_node_ip}"
+        if configured_node_key in cluster_resources:
+            return {configured_node_key: 0.001}
     try:
         from ray.util import get_node_ip_address
 
@@ -244,6 +249,7 @@ def actor_runtime_env_vars(
         "MINT_RAY_CLIENT_ADDRESS",
         "RAY_CLIENT_ADDRESS",
         "MINT_RAY_NODE_IP_ADDRESS",
+        "MINT_CONTROL_PLANE_NODE_IP",
         "MINT_RAY_TEMP_DIR",
         "MINT_RAY_JOB_WORKING_DIR",
         "MINT_RAY_WORKING_DIR",
@@ -482,6 +488,9 @@ class ServerConfig:
     task_state_store_owner_ttl_s: float = 30.0
     task_state_store_owner_renew_s: float = 10.0
 
+    # Future-state RocksDB component owned by TaskStateStore actor.
+    future_state_store_db_path: str = "/vePFS-Mindverse/share/mint/dev/data/future-state/futures.rocksdb"
+
     # Training settings (backend/verl_training.py)
     training_inactivity_timeout_s: int = 3600
     training_force_grad_checkpointing: bool = True
@@ -531,6 +540,7 @@ class ServerConfig:
         file_supervisor_state = config_file.supervisor_state if config_file is not None else None
         file_future = config_file.future if config_file is not None else None
         file_task_state_store = config_file.task_state_store if config_file is not None else None
+        file_future_state_store = config_file.future_state_store if config_file is not None else None
         file_training = config_file.training if config_file is not None else None
         file_docs = config_file.docs if config_file is not None else None
         file_internal = config_file.internal if config_file is not None else None
@@ -821,6 +831,15 @@ class ServerConfig:
                 "MINT_TASK_STATE_STORE_OWNER_RENEW_S",
                 file_task_state_store.owner_renew_s if file_task_state_store is not None else None,
                 10.0,
+            ),
+            future_state_store_db_path=_pick_str(
+                "MINT_FUTURE_STATE_STORE_DB_PATH",
+                file_future_state_store.db_path if file_future_state_store is not None else None,
+                str(Path(_pick_str(
+                    "MINT_TASK_STATE_STORE_DB_PATH",
+                    file_task_state_store.db_path if file_task_state_store is not None else None,
+                    _default_task_state_store_db_path(auth_enabled=auth_enabled),
+                )).parent.parent / "future-state" / "futures.rocksdb"),
             ),
             # Training settings
             training_inactivity_timeout_s=_pick_int(

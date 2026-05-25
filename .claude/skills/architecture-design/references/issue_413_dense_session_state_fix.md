@@ -51,7 +51,7 @@
 - 统计当前 dense session-state 的大小、目录数、最老目录年龄
 - 启动时执行一次 legacy 迁移 / 清理
 
-这样后面不管是 worker、engine、route 还是 internal metrics，都走同一套逻辑，不会再散落在多个文件里各写一份。
+这样后面不管是 worker、engine、route 还是 OTel gauge，都走同一套逻辑，不会再散落在多个文件里各写一份。
 
 ### 3. `SessionStateManager` 改为支持 legacy 自动迁移
 
@@ -100,13 +100,13 @@ server 启动时会：
 
 ### 7. 加了 observability
 
-在 internal metrics / admission stats 里新增了三项观测值：
+在 API worker OTel push 里新增了三项观测值：
 
 - `mint_dense_session_state_bytes`
 - `mint_dense_session_state_dirs`
 - `mint_dense_session_state_oldest_age_s`
 
-同时 `driver_state` 中也会带出对应字段，方便排查：
+同时 `/internal/admission_stats` 的 `driver_state` 中也会带出对应字段，方便排查：
 
 - `dense_session_state_root`
 - `dense_session_state_bytes`
@@ -139,7 +139,7 @@ server 启动时会：
 1. legacy `/tmp` session-state 能自动迁移到新根目录
 2. 启动时能把 active legacy session 迁走，并清理 stale legacy 目录
 3. shared dense actor 删除单个 session 时，会真正回收对应 session dir
-4. internal metrics 会暴露 dense session-state 的三项指标
+4. API worker OTel gauge 会暴露 dense session-state 的三项指标，并且 `/internal/metrics` 不会暴露这些业务指标
 
 ## 给 mentor / reviewer 的重点说明
 

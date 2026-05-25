@@ -18,10 +18,10 @@ fi
 set +a
 
 if [ -z "${MINT_RUNTIME_CHECKPOINT_DIR:-}" ]; then
-  export MINT_RUNTIME_CHECKPOINT_DIR="${TINKER_RUNTIME_CHECKPOINT_DIR:-/vePFS-Mindverse/share/mint/dev/data/runtime-checkpoints}"
+  export MINT_RUNTIME_CHECKPOINT_DIR="/vePFS-Mindverse/share/mint/dev/data/runtime-checkpoints"
 fi
 if [ -z "${MINT_CODE_ROOT:-}" ]; then
-  export MINT_CODE_ROOT="${PFS_TINKER_PATH:-$repo_root}"
+  export MINT_CODE_ROOT="$repo_root"
 fi
 
 api_tmp_root="${MINT_TMP_ROOT}/api/${USER:-unknown}"

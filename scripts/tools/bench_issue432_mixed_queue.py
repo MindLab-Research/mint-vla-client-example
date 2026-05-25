@@ -359,13 +359,6 @@ def _get_json(session: requests.Session, url: str, *, headers: dict[str, str], t
     return out
 
 
-def _get_text(session: requests.Session, url: str, *, headers: dict[str, str], timeout_s: float) -> str:
-    r = session.get(url, headers=headers, timeout=min(timeout_s, 60.0))
-    if r.status_code >= 400:
-        raise RuntimeError(f"GET {url} failed status={r.status_code} body={r.text[:500]}")
-    return r.text
-
-
 def _poll_future(
     session: requests.Session,
     *,
@@ -904,10 +897,8 @@ def main() -> None:
 
             before_admission = _get_json(session, f"{cfg.base_url}/internal/admission_stats", headers=cfg.headers, timeout_s=cfg.timeout_s)
             before_debug = _get_json(session, f"{cfg.base_url}/internal/model_work_scheduler/debug_state", headers=cfg.headers, timeout_s=cfg.timeout_s)
-            before_metrics = _get_text(session, f"{cfg.base_url}/internal/metrics", headers=cfg.headers, timeout_s=cfg.timeout_s)
             _write_json(cfg.raw_dir / "before.admission.json", before_admission)
             _write_json(cfg.raw_dir / "before.debug.json", before_debug)
-            _write_text(cfg.raw_dir / "before.metrics.prom", before_metrics)
 
             sampler_thread = threading.Thread(target=sampler.run, name="issue432-sampler", daemon=True)
             legacy_thread = threading.Thread(target=legacy.run, name="issue432-legacy", daemon=True)
@@ -928,10 +919,8 @@ def main() -> None:
 
             after_admission = _get_json(session, f"{cfg.base_url}/internal/admission_stats", headers=cfg.headers, timeout_s=cfg.timeout_s)
             after_debug = _get_json(session, f"{cfg.base_url}/internal/model_work_scheduler/debug_state", headers=cfg.headers, timeout_s=cfg.timeout_s)
-            after_metrics = _get_text(session, f"{cfg.base_url}/internal/metrics", headers=cfg.headers, timeout_s=cfg.timeout_s)
             _write_json(cfg.raw_dir / "after.admission.json", after_admission)
             _write_json(cfg.raw_dir / "after.debug.json", after_debug)
-            _write_text(cfg.raw_dir / "after.metrics.prom", after_metrics)
 
             _write_json(cfg.raw_dir / "training.results.json", results)
             sample_rows = _load_jsonl(samples_path)
@@ -955,8 +944,6 @@ def main() -> None:
                 "after_admission": cfg.raw_dir / "after.admission.json",
                 "before_debug": cfg.raw_dir / "before.debug.json",
                 "after_debug": cfg.raw_dir / "after.debug.json",
-                "before_metrics": cfg.raw_dir / "before.metrics.prom",
-                "after_metrics": cfg.raw_dir / "after.metrics.prom",
                 "training_results": cfg.raw_dir / "training.results.json",
             }
             _write_json(summary_path, summary)

@@ -7,6 +7,20 @@ import pytest
 from mint_server.routes import internal as internal_routes
 
 
+def test_issue_593_operator_routes_do_not_keep_api_v1_internal_aliases() -> None:
+    from mint_server.app import _OTEL_EXCLUDED_PATHS, app
+
+    paths = {getattr(route, "path", "") for route in app.routes}
+
+    assert "/api/v1/internal/healthz" in paths
+    assert "/internal/admission_stats" in paths
+    assert "/internal/metrics" in paths
+    assert "/api/v1/internal/admission_stats" not in paths
+    assert "/api/v1/internal/metrics" not in paths
+    assert "/api/v1/internal/admission_stats" not in _OTEL_EXCLUDED_PATHS
+    assert "/api/v1/internal/metrics" not in _OTEL_EXCLUDED_PATHS
+
+
 @pytest.mark.anyio
 async def test_issue_593_internal_model_visibility_endpoints(monkeypatch: pytest.MonkeyPatch) -> None:
     import mint_server.backend.model_actor_supervisor as supervisor_module
@@ -105,172 +119,22 @@ async def test_issue_593_internal_admission_stats_observes_without_creating(monk
     assert out["maintenance_cron_actor"]["actor_name"] == "mint_maintenance_cron"
 
 
-def test_issue_593_internal_metrics_exports_scheduler_and_supervisor(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_issue_593_internal_metrics_is_sentinel_only(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MINT_INTERNAL_PROMETHEUS_METRICS_ENABLED", "1")
 
     async def _fake_admission_stats(*, include_actor_rss: bool = True) -> dict:
-        assert include_actor_rss is False
-        return {
-            "capacity": {},
-            "task_futures": {},
-            "actors": {},
-            "model_work_scheduler": {
-                "depth": 5,
-                "backlog_depth": 2,
-                "backlog_depth_by_domain": {"vllm:model-a": 2},
-                "replica_queues": {
-                    "vllm:model-a::replica-0": {
-                        "domain_key": "vllm:model-a",
-                        "replica_id": "replica-0",
-                        "depth": 3,
-                        "status": "healthy",
-                    }
-                },
-                "leases": [{"lease_id": "lease-a"}],
-                "counters": {
-                    "appended": 7,
-                    "assigned": 5,
-                    "claimed": 4,
-                    "completed": 3,
-                    "failed": 1,
-                    "requeued": 2,
-                },
-            },
-            "model_actor_supervisor": {
-                "desired_total": 1,
-                "managed_total": 1,
-                "domain_total": 1,
-                "reconcile_total": 8,
-                "created_total": 1,
-                "restarted_total": 1,
-                "blocked_total": 0,
-                "busy_recycle_skipped_total": 0,
-                "scheduler_sync_failures_total": 0,
-                "topology_reconcile_failures_total": 0,
-                "node_metrics_created_total": 1,
-                "node_metrics_reconcile_failures_total": 0,
-                "topology": {
-                    "nodes": {
-                        "mint-worker-0": {
-                            "state": "ready",
-                            "provider": "volcano",
-                            "gpu_count": 8,
-                        }
-                    }
-                },
-                "daemons": {
-                    "node_metrics": {
-                        "enabled": True,
-                        "desired_total": 1,
-                        "managed_total": 1,
-                        "nodes": {
-                            "mint-worker-0": {
-                                "state": "healthy",
-                                "health": {
-                                    "sample_count": 3,
-                                    "error_count": 0,
-                                    "last_sample": {
-                                        "worker_alias": "mint-worker-0",
-                                        "deployment_env": "prod",
-                                        "cluster_id": "volcano",
-                                        "load_1m": 1.0,
-                                        "load_5m": 2.0,
-                                        "load_15m": 3.0,
-                                        "cpu_utilization_ratio": 0.5,
-                                        "memory_used_bytes": 1024,
-                                        "memory_total_bytes": 2048,
-                                        "disk_used_bytes": 4096,
-                                        "disk_total_bytes": 8192,
-                                        "sample_duration_ms": 12.5,
-                                        "sampled_at": 1000.0,
-                                        "gpus": [
-                                            {
-                                                "gpu_uuid": "GPU-test",
-                                                "utilization_gpu_percent": 77,
-                                                "memory_used_bytes": 512,
-                                                "memory_total_bytes": 1024,
-                                                "power_draw_watts": 300,
-                                                "power_limit_watts": 400,
-                                                "temperature_celsius": 61,
-                                                "sm_clock_mhz": 1200,
-                                                "memory_clock_mhz": 1500,
-                                                "pcie_link_gen": 4,
-                                                "pcie_link_width": 16,
-                                                "processes": [
-                                                    {
-                                                        "process_class": "vllm",
-                                                        "process_count": 2,
-                                                        "memory_used_bytes": 256,
-                                                    }
-                                                ],
-                                            }
-                                        ],
-                                    },
-                                },
-                            }
-                        },
-                    }
-                },
-                "domains": {"vllm:model-a": {"replicas": 1, "healthy": 1, "unhealthy": 0}},
-                "replicas": {
-                    "vllm:model-a::replica-0": {
-                        "domain_key": "vllm:model-a",
-                        "replica_id": "replica-0",
-                        "actor_name": "actor-a",
-                        "state": "healthy",
-                        "generation": 42,
-                    }
-                },
-            },
-        }
+        raise AssertionError("/internal/metrics must not collect actor snapshots after OTel migration")
 
     monkeypatch.setattr(internal_routes, "admission_stats", _fake_admission_stats)
 
     response = asyncio.run(internal_routes.metrics())
     body = response.body.decode("utf-8")
 
-    assert "mint_model_work_scheduler_depth 5" in body
-    assert 'mint_model_work_scheduler_domain_backlog_depth{domain_key="vllm:model-a"} 2' in body
-    assert (
-        'mint_model_work_scheduler_replica_queue_depth{domain_key="vllm:model-a",'
-        'queue_id="vllm:model-a::replica-0",replica_id="replica-0",status="healthy"} 3'
-    ) in body
-    assert "mint_model_work_scheduler_leases 1" in body
-    assert "mint_model_actor_supervisor_desired_total 1" in body
-    assert "mint_model_actor_supervisor_node_metrics_created_total 1" in body
-    assert (
-        'mint_topology_node_state{provider="volcano",state="ready",worker_alias="mint-worker-0"} 1'
-        in body
-    )
-    assert (
-        'mint_node_metrics_daemon_state{state="healthy",worker_alias="mint-worker-0"} 1'
-        in body
-    )
-    assert (
-        'mint_node_metrics_daemon_sample_count{state="healthy",worker_alias="mint-worker-0"} 3'
-        in body
-    )
-    assert (
-        'mint_node_gpu_memory_total_bytes{cluster_id="volcano",deployment_env="prod",'
-        'gpu_uuid="GPU-test",worker_alias="mint-worker-0"} 1024'
-    ) in body
-    assert (
-        'mint_node_gpu_processes{cluster_id="volcano",deployment_env="prod",'
-        'gpu_uuid="GPU-test",process_class="vllm",worker_alias="mint-worker-0"} 2'
-    ) in body
-    assert (
-        'mint_node_cpu_utilization_ratio{cluster_id="volcano",deployment_env="prod",'
-        'worker_alias="mint-worker-0"} 0.5'
-    ) in body
-    assert 'mint_model_actor_supervisor_domain_healthy{domain_key="vllm:model-a"} 1' in body
-    assert (
-        'mint_model_actor_supervisor_replica_state{actor_name="actor-a",domain_key="vllm:model-a",'
-        'replica_id="replica-0",state="healthy"} 1'
-    ) in body
-    assert (
-        'mint_model_actor_supervisor_replica_generation{actor_name="actor-a",domain_key="vllm:model-a",'
-        'replica_id="replica-0",state="healthy"} 42'
-    ) in body
+    assert "mint_metrics_up 1" in body
+    assert "mint_model_work_scheduler_" not in body
+    assert "mint_model_actor_supervisor_" not in body
+    assert "mint_topology_node_" not in body
+    assert "mint_node_metrics_daemon_" not in body
 
 
 @pytest.mark.anyio

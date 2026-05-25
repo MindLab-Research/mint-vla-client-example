@@ -93,6 +93,7 @@ def test_launcher_observability_reports_normalization_flags() -> None:
 def test_main_uses_import_string_when_workers_default(monkeypatch) -> None:
     module = _load_run_server_module()
     calls: list[tuple[object, dict[str, object]]] = []
+    logging_calls: list[str] = []
 
     monkeypatch.setattr(module, "_parse_args", lambda _argv: SimpleNamespace(config_path=None))
     monkeypatch.setattr(module, "_reexec_to_runtime_host_python_if_needed", lambda: None)
@@ -104,7 +105,14 @@ def test_main_uses_import_string_when_workers_default(monkeypatch) -> None:
     monkeypatch.setattr(module, "_set_exact_pythonpath", lambda entries: entries)
     monkeypatch.setattr(module, "_set_exact_torch_ld_library_path", lambda: "/tmp/torch")
     monkeypatch.setattr(module, "_reexec_if_env_mismatch", lambda **_kwargs: None)
-    monkeypatch.setitem(sys.modules, "mint_server.logging_context", SimpleNamespace(configure_logging=lambda: None))
+    monkeypatch.setitem(
+        sys.modules,
+        "mint_server.logging_context",
+        SimpleNamespace(
+            configure_logging=lambda: logging_calls.append("configure_logging"),
+            register_api_process_observable_metrics=lambda: logging_calls.append("api_process_gauges"),
+        ),
+    )
     monkeypatch.setitem(sys.modules, "mint_server.app", SimpleNamespace(app="APP"))
     monkeypatch.setitem(
         sys.modules,
@@ -123,3 +131,4 @@ def test_main_uses_import_string_when_workers_default(monkeypatch) -> None:
     assert kwargs["timeout_worker_healthcheck"] == 120
     assert kwargs["host"] == "127.0.0.1"
     assert kwargs["port"] == 8123
+    assert logging_calls == ["configure_logging"]

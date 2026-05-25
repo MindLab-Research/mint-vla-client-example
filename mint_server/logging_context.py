@@ -25,6 +25,7 @@ import functools
 import inspect
 import logging
 import logging.handlers
+import math
 import os
 import re
 import socket
@@ -78,12 +79,14 @@ _TRAINING_OPERATION_COUNTER: Any | None = None
 _TRAINING_OPERATION_DURATION_HISTOGRAM: Any | None = None
 _MEGATRON_SESSION_SWITCH_COUNTER: Any | None = None
 _MEGATRON_SESSION_SWITCH_DURATION_COUNTER: Any | None = None
+_MEGATRON_ACTOR_LIFECYCLE_COUNTER: Any | None = None
 _SCHEDULER_DECISION_COUNTER: Any | None = None
 _SCHEDULER_SWITCH_COUNTER: Any | None = None
 _SCHEDULER_QUEUE_WAIT_HISTOGRAM: Any | None = None
 _SCHEDULER_READY_SESSIONS_HISTOGRAM: Any | None = None
 _SCHEDULER_CHOSEN_QUEUE_DEPTH_HISTOGRAM: Any | None = None
 _PUBLIC_HEALTHZ_REFRESH_COUNTER: Any | None = None
+_API_PROCESS_OBSERVABLES_REGISTERED = False
 _TRACER: Any | None = None
 _OP_PREFIX_RE = re.compile(r"^\[([A-Za-z0-9_.:-]+)\]")
 _ACTOR_OBS_INITIALIZED = False
@@ -91,6 +94,12 @@ _ACTOR_OBS_LOCK = threading.Lock()
 _OTEL_RESOURCE_LOGGED = False
 _T = TypeVar("_T")
 _PROCESS_INSTANCE_TOKEN = uuid.uuid4().hex
+_MEGATRON_LIFECYCLE_EVENTS = frozenset({"startup_timeout", "recreate", "evicted", "unknown"})
+
+
+def _bounded_megatron_lifecycle_event(event: str | None) -> str:
+    value = str(event or "unknown").strip() or "unknown"
+    return value if value in _MEGATRON_LIFECYCLE_EVENTS else "unknown"
 
 
 def _detect_hostname() -> str:
@@ -143,6 +152,115 @@ def _otel_process_metric_attributes() -> dict[str, str]:
     # dotted labels may be dropped by intermediate conversion. Use Prometheus-
     # native naming for the process identity dimension.
     return {"mint_instance_id": _otel_service_instance_id(os.getpid())}
+
+
+def _metric_number(value: object) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(out):
+        return None
+    return out
+
+
+def _self_rss_bytes() -> int:
+    try:
+        import resource
+
+        rss = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        if sys.platform == "darwin":
+            return rss
+        return rss * 1024
+    except Exception:
+        return 0
+
+
+def _driver_observability_snapshot() -> dict[str, object]:
+    snapshot: dict[str, object] = {
+        "api_server_process_pid": int(os.getpid()),
+        "api_server_process_rss_bytes": int(_self_rss_bytes()),
+        "driver_process_rss_bytes": int(_self_rss_bytes()),
+    }
+    try:
+        from .backend.session_heartbeat_store import session_heartbeat_store
+
+        size_fn = getattr(session_heartbeat_store, "size", None)
+        if callable(size_fn):
+            snapshot["driver_session_heartbeat_entries"] = int(size_fn())
+    except Exception:
+        pass
+    try:
+        from .routes import sampling as sampling_route
+
+        count_fn = getattr(sampling_route, "_lora_load_lock_count_sync", None)
+        if callable(count_fn):
+            snapshot["driver_lora_load_locks"] = int(count_fn())
+    except Exception:
+        pass
+    try:
+        from .routes import service as service_route
+
+        manager = getattr(service_route, "session_manager", None)
+        if manager is not None and hasattr(manager, "observability_snapshot"):
+            data = manager.observability_snapshot()
+            if isinstance(data, dict):
+                snapshot.update(data)
+    except Exception:
+        pass
+    try:
+        from .backend.dense_session_state import collect_dense_session_state_stats
+
+        data = collect_dense_session_state_stats()
+        if isinstance(data, dict):
+            snapshot.update(data)
+    except Exception:
+        pass
+    return snapshot
+
+
+def _register_api_process_observable_metrics(meter: Any, observation_cls: Any) -> None:
+    global _API_PROCESS_OBSERVABLES_REGISTERED
+    if _API_PROCESS_OBSERVABLES_REGISTERED:
+        return
+
+    def _attrs() -> dict[str, str]:
+        return _otel_process_metric_attributes()
+
+    def _observe_snapshot_field(field: str):
+        def _callback(_options):
+            value = _metric_number(_driver_observability_snapshot().get(field))
+            if value is None:
+                return []
+            return [observation_cls(value, _attrs())]
+
+        return _callback
+
+    def _gauge(name: str, field: str, *, unit: str | None = None, description: str = "") -> None:
+        kwargs: dict[str, Any] = {"callbacks": [_observe_snapshot_field(field)]}
+        if unit:
+            kwargs["unit"] = unit
+        if description:
+            kwargs["description"] = description
+        meter.create_observable_gauge(name, **kwargs)
+
+    _gauge("mint_api_server_process_rss_bytes", "api_server_process_rss_bytes", unit="By")
+    _gauge("mint_api_server_process_pid", "api_server_process_pid")
+    _gauge("mint_driver_process_rss_bytes", "driver_process_rss_bytes", unit="By")
+    _gauge("mint_driver_sdk_sessions_fallback", "sdk_sessions_fallback")
+    _gauge("mint_driver_session_heartbeat_entries", "driver_session_heartbeat_entries")
+    _gauge("mint_driver_lora_load_locks", "driver_lora_load_locks")
+    _gauge("mint_driver_sampling_sessions_total", "sampling_sessions_total")
+    _gauge("mint_driver_sampling_sessions_multi_lora", "sampling_sessions_multi_lora")
+    _gauge("mint_driver_sampling_sessions_base_model", "sampling_sessions_base_model")
+    _gauge("mint_driver_sampling_sessions_lora_loaded", "sampling_sessions_lora_loaded")
+    _gauge("mint_driver_sampling_sessions_inflight", "sampling_sessions_inflight")
+    _gauge("mint_dense_session_state_bytes", "dense_session_state_bytes", unit="By")
+    _gauge("mint_dense_session_state_dirs", "dense_session_state_dirs")
+    _gauge("mint_dense_session_state_oldest_age_s", "dense_session_state_oldest_age_s", unit="s")
+    _API_PROCESS_OBSERVABLES_REGISTERED = True
 
 
 def _coerce_file_line(pathname: object, lineno: object) -> tuple[str, int, str]:
@@ -650,9 +768,10 @@ def _configure_opentelemetry(root_logger: logging.Logger) -> None:
     global _VLLM_ACTOR_REQUEST_COUNTER, _VLLM_ACTOR_REQUEST_DURATION_HISTOGRAM
     global _TRAINING_OPERATION_COUNTER, _TRAINING_OPERATION_DURATION_HISTOGRAM
     global _MEGATRON_SESSION_SWITCH_COUNTER, _MEGATRON_SESSION_SWITCH_DURATION_COUNTER
+    global _MEGATRON_ACTOR_LIFECYCLE_COUNTER
     global _SCHEDULER_DECISION_COUNTER, _SCHEDULER_SWITCH_COUNTER, _SCHEDULER_QUEUE_WAIT_HISTOGRAM
     global _SCHEDULER_READY_SESSIONS_HISTOGRAM, _SCHEDULER_CHOSEN_QUEUE_DEPTH_HISTOGRAM
-    global _PUBLIC_HEALTHZ_REFRESH_COUNTER, _TRACER
+    global _PUBLIC_HEALTHZ_REFRESH_COUNTER, _API_PROCESS_OBSERVABLES_REGISTERED, _TRACER
 
     if _OTEL_INITIALIZED:
         return
@@ -787,6 +906,11 @@ def _configure_opentelemetry(root_logger: logging.Logger) -> None:
             unit="s",
             description="Megatron session-switch duration totals observed by mint",
         )
+        _MEGATRON_ACTOR_LIFECYCLE_COUNTER = meter.create_counter(
+            "mint_megatron_actor_lifecycle_events_total",
+            unit="{event}",
+            description="Megatron actor lifecycle events observed by mint",
+        )
         _SCHEDULER_DECISION_COUNTER = meter.create_counter(
             "mint_scheduler_decision_total",
             unit="{decision}",
@@ -862,6 +986,19 @@ def _configure_opentelemetry(root_logger: logging.Logger) -> None:
         _OTEL_INITIALIZED = True
     except Exception as e:
         print(f"Warning: Failed to configure OpenTelemetry exporters: {e}", file=sys.stderr)
+
+
+def register_api_process_observable_metrics() -> None:
+    """Register API/driver-local gauges in request-serving processes only."""
+    if not _OTEL_ENABLED:
+        return
+    try:
+        from opentelemetry import metrics
+        from opentelemetry.metrics import Observation
+
+        _register_api_process_observable_metrics(metrics.get_meter("mint.http"), Observation)
+    except Exception:
+        pass
 
 
 def get_otel_tracer() -> Any | None:
@@ -1052,6 +1189,27 @@ def record_megatron_session_switch_otel(
                 if total <= 0.0:
                     continue
                 _MEGATRON_SESSION_SWITCH_DURATION_COUNTER.add(total, attributes={**attrs, "phase": str(phase)})
+    except Exception:
+        pass
+
+
+def record_megatron_actor_lifecycle_otel(
+    *,
+    base_model: str,
+    event: str,
+    count: int = 1,
+) -> None:
+    if not _OTEL_ENABLED:
+        return
+    try:
+        if _MEGATRON_ACTOR_LIFECYCLE_COUNTER is not None and int(count) > 0:
+            _MEGATRON_ACTOR_LIFECYCLE_COUNTER.add(
+                int(count),
+                attributes={
+                    "base_model": str(base_model or "unknown"),
+                    "event": _bounded_megatron_lifecycle_event(event),
+                },
+            )
     except Exception:
         pass
 

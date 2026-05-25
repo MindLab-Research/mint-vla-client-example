@@ -113,6 +113,12 @@ class _TaskStateStoreSection(BaseModel):
     owner_renew_s: float | None = None
 
 
+class _FutureStateStoreSection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    db_path: str | None = None
+
+
 class _TrainingSection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -152,6 +158,7 @@ class MintConfigFile(BaseModel):
     supervisor_state: _SupervisorStateSection = Field(default_factory=_SupervisorStateSection)
     future: _FutureSection = Field(default_factory=_FutureSection)
     task_state_store: _TaskStateStoreSection = Field(default_factory=_TaskStateStoreSection)
+    future_state_store: _FutureStateStoreSection = Field(default_factory=_FutureStateStoreSection)
     training: _TrainingSection = Field(default_factory=_TrainingSection)
     docs: _DocsSection = Field(default_factory=_DocsSection)
     internal: _InternalSection = Field(default_factory=_InternalSection)

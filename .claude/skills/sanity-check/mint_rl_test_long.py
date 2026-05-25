@@ -84,6 +84,15 @@ def _append_timing_event(
         f.write("\n")
 
 
+def _numeric_sum(recs: list[dict[str, Any]], key: str) -> float:
+    total = 0.0
+    for rec in recs:
+        value = rec.get(key)
+        if isinstance(value, (int, float)):
+            total += float(value)
+    return total
+
+
 def _timing_summary() -> dict[str, Any]:
     per_stage: dict[str, list[dict[str, Any]]] = {}
     for rec in _TIMING_EVENTS:
@@ -96,18 +105,29 @@ def _timing_summary() -> dict[str, Any]:
         count = len(elapsed)
         ok_count = sum(1 for rec in recs if rec.get("status") == "ok")
         error_count = sum(1 for rec in recs if rec.get("status") == "error")
-        stage_summaries.append(
-            {
-                "stage": stage,
-                "count": count,
-                "ok_count": ok_count,
-                "error_count": error_count,
-                "total_s": round(total_s, 3),
-                "avg_s": round(total_s / count, 3),
-                "p50_s": round(elapsed[count // 2], 3),
-                "max_s": round(elapsed[-1], 3),
-            }
-        )
+        summary = {
+            "stage": stage,
+            "count": count,
+            "ok_count": ok_count,
+            "error_count": error_count,
+            "total_s": round(total_s, 3),
+            "avg_s": round(total_s / count, 3),
+            "p50_s": round(elapsed[count // 2], 3),
+            "max_s": round(elapsed[-1], 3),
+        }
+        output_tokens = _numeric_sum(recs, "output_tokens")
+        if output_tokens > 0:
+            sequence_count = _numeric_sum(recs, "sequence_count")
+            hit_max_count = _numeric_sum(recs, "hit_max_count")
+            summary.update(
+                {
+                    "output_tokens": int(output_tokens),
+                    "sequence_count": int(sequence_count),
+                    "hit_max_count": int(hit_max_count),
+                    "tokens_per_s": round(output_tokens / total_s, 3) if total_s > 0 else 0.0,
+                }
+            )
+        stage_summaries.append(summary)
 
     stage_summaries.sort(key=lambda item: (-float(item["total_s"]), str(item["stage"])))
     return {
@@ -135,13 +155,14 @@ def _write_timing_reports() -> None:
         f"- wall_clock_s: `{summary['wall_clock_s']}`",
         f"- event_count: `{summary['event_count']}`",
         "",
-        "| stage | count | ok | error | total_s | avg_s | p50_s | max_s |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| stage | count | ok | error | total_s | avg_s | p50_s | max_s | output_tokens | tok/s | hit_max |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for item in summary["stages"]:
         md_lines.append(
             f"| {item['stage']} | {item['count']} | {item['ok_count']} | {item['error_count']} | "
-            f"{item['total_s']:.3f} | {item['avg_s']:.3f} | {item['p50_s']:.3f} | {item['max_s']:.3f} |"
+            f"{item['total_s']:.3f} | {item['avg_s']:.3f} | {item['p50_s']:.3f} | {item['max_s']:.3f} | "
+            f"{item.get('output_tokens', '')} | {item.get('tokens_per_s', '')} | {item.get('hit_max_count', '')} |"
         )
     with open(_TIMING_SUMMARY_MD_PATH, "w", encoding="utf-8") as f:
         f.write("\n".join(md_lines) + "\n")
@@ -199,6 +220,7 @@ def _result_with_heartbeat(
     stage_name: str | None = None,
     step_idx: int | None = None,
     extra: dict[str, Any] | None = None,
+    result_extra_fn: Any | None = None,
 ) -> Any:
     # Prefer polling an underlying concurrent Future so we can print heartbeats
     # even if the public `.result(timeout=...)` doesn't respect timeouts.
@@ -260,6 +282,13 @@ def _result_with_heartbeat(
     event_extra = dict(extra or {})
     event_extra["label"] = label
     event_extra["request_id"] = _LAST_REQUEST_ID_BY_TYPE.get(label)
+    if result_extra_fn is not None:
+        try:
+            computed_extra = result_extra_fn(result)
+        except Exception as e:
+            computed_extra = {"result_extra_error": f"{type(e).__name__}: {e}"}
+        if isinstance(computed_extra, dict):
+            event_extra.update(computed_extra)
     _append_timing_event(
         stage,
         elapsed_s=time.time() - start,
@@ -268,6 +297,20 @@ def _result_with_heartbeat(
         extra=event_extra,
     )
     return result
+
+
+def _sample_result_timing_extra(result: Any, *, max_tokens: int) -> dict[str, Any]:
+    sequences = list(getattr(result, "sequences", []) or [])
+    lengths = [len(getattr(seq, "tokens", []) or []) for seq in sequences]
+    output_tokens = sum(lengths)
+    hit_max_count = sum(1 for length in lengths if length >= int(max_tokens))
+    return {
+        "sequence_count": len(sequences),
+        "output_tokens": int(output_tokens),
+        "max_output_tokens": max(lengths) if lengths else 0,
+        "hit_max_count": int(hit_max_count),
+        "hit_max": bool(hit_max_count),
+    }
 
 
 def _install_tinker_future_debug() -> None:
@@ -578,6 +621,14 @@ def _checkpoint_owner_id() -> str | None:
     return _env_object_id("MINT_TEST_CHECKPOINT_OWNER_ID")
 
 
+def _mint_checkpoint_uri(model_path: str) -> str:
+    if model_path.startswith("mint://"):
+        return model_path
+    if model_path.startswith("tinker://"):
+        return "mint://" + model_path[len("tinker://") :]
+    raise ValueError(f"checkpoint model_path must start with 'mint://', got {model_path!r}")
+
+
 def _create_sampling_client_for_checkpoint(
     service_client: Any,
     *,
@@ -594,8 +645,7 @@ def _create_sampling_client_for_checkpoint(
         )
 
     holder = service_client.holder
-    if not model_path.startswith("mint://"):
-        raise ValueError("model_path must start with 'mint://'")
+    model_path = _mint_checkpoint_uri(model_path)
     assert holder._sampling_client_counter is not None
     sampling_session_seq_id = holder._sampling_client_counter
     holder._sampling_client_counter += 1
@@ -704,34 +754,6 @@ if inference_only and BASE_MODEL.startswith("Qwen/Qwen3-"):
 use_hf_tokenizer = BASE_MODEL.startswith("moonshotai/Kimi-K2-") or (
     inference_only and BASE_MODEL.startswith("Qwen/Qwen3-")
 )
-if use_hf_tokenizer:
-    from transformers import AutoTokenizer
-
-    tokenizer_model = BASE_MODEL if BASE_MODEL.startswith("moonshotai/Kimi-K2-") else tokenizer_source_model
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_model, trust_remote_code=True)
-    print(f"Tokenizer loaded from HF: {tokenizer_model}")
-    print(f"Tokenizer vocabulary size: {tokenizer.vocab_size:,} tokens")
-else:
-    tokenizer_training_client = _time_call(
-        lambda: service_client.create_lora_training_client(
-            base_model=tokenizer_source_model,
-            rank=LORA_RANK,
-            train_mlp=train_mlp if tokenizer_source_model == BASE_MODEL else False,
-            train_attn=train_attn if tokenizer_source_model == BASE_MODEL else True,
-            train_unembed=train_unembed if tokenizer_source_model == BASE_MODEL else False,
-        ),
-        stage_name="create_tokenizer_training_client",
-        extra={"tokenizer_source_model": tokenizer_source_model},
-    )
-    print(f"Tokenizer training client created for: {tokenizer_source_model}")
-    _dbg(f"tokenizer_training_model_id={getattr(tokenizer_training_client, 'model_id', None)!r}")
-
-    tokenizer = _time_call(
-        tokenizer_training_client.get_tokenizer,
-        stage_name="get_tokenizer",
-        extra={"tokenizer_source_model": tokenizer_source_model},
-    )
-    print(f"Tokenizer vocabulary size: {tokenizer.vocab_size:,} tokens")
 
 training_client = None
 if not inference_only:
@@ -747,6 +769,39 @@ if not inference_only:
     )
     print(f"Training client created for: {BASE_MODEL}")
     _dbg(f"training_model_id={getattr(training_client, 'model_id', None)!r}")
+
+if use_hf_tokenizer:
+    from transformers import AutoTokenizer
+
+    tokenizer_model = BASE_MODEL if BASE_MODEL.startswith("moonshotai/Kimi-K2-") else tokenizer_source_model
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_model, trust_remote_code=True)
+    print(f"Tokenizer loaded from HF: {tokenizer_model}")
+    print(f"Tokenizer vocabulary size: {tokenizer.vocab_size:,} tokens")
+else:
+    if training_client is None:
+        tokenizer_training_client = _time_call(
+            lambda: service_client.create_lora_training_client(
+                base_model=tokenizer_source_model,
+                rank=LORA_RANK,
+                train_mlp=train_mlp if tokenizer_source_model == BASE_MODEL else False,
+                train_attn=train_attn if tokenizer_source_model == BASE_MODEL else True,
+                train_unembed=train_unembed if tokenizer_source_model == BASE_MODEL else False,
+            ),
+            stage_name="create_tokenizer_training_client",
+            extra={"tokenizer_source_model": tokenizer_source_model},
+        )
+        print(f"Tokenizer training client created for: {tokenizer_source_model}")
+        _dbg(f"tokenizer_training_model_id={getattr(tokenizer_training_client, 'model_id', None)!r}")
+        tokenizer_client = tokenizer_training_client
+    else:
+        tokenizer_client = training_client
+
+    tokenizer = _time_call(
+        tokenizer_client.get_tokenizer,
+        stage_name="get_tokenizer",
+        extra={"tokenizer_source_model": tokenizer_source_model},
+    )
+    print(f"Tokenizer vocabulary size: {tokenizer.vocab_size:,} tokens")
 
 random.seed(42)  # For reproducibility
 
@@ -976,6 +1031,37 @@ def _save_weights_and_get_sampling_client_with_retry(
             return sampling_client
         except Exception as e:
             last_exc = e
+            if sampling_path := locals().get("sampling_path"):
+                print(
+                    f"create_sampling_client({name!r}) failed after successful save: {e} "
+                    f"(attempt 1/{max_retries})"
+                )
+                create_last_exc: Exception = e
+                for create_attempt in range(1, max_retries):
+                    if create_attempt < max_retries - 1:
+                        time.sleep(min(backoff_s * (2 ** (create_attempt - 1)), 10.0))
+                    try:
+                        sampling_client = _time_call(
+                            lambda: _create_sampling_client_for_checkpoint(
+                                service_client,
+                                model_path=str(sampling_path),
+                                base_model=base_model,
+                                retry_config=SAMPLING_RETRY_CONFIG,
+                            ),
+                            stage_name="create_sampling_client",
+                            extra={"name": name, "model_path": str(sampling_path)},
+                        )
+                        _dbg(f"sampling_session_id={getattr(sampling_client, '_sampling_session_id', None)!r}")
+                        return sampling_client
+                    except Exception as create_exc:
+                        create_last_exc = create_exc
+                        print(
+                            f"create_sampling_client({name!r}) failed after successful save: {create_exc} "
+                            f"(attempt {create_attempt + 1}/{max_retries})"
+                        )
+                raise RuntimeError(
+                    f"Failed to create sampling client for {name!r} after successful save"
+                ) from create_last_exc
             print(
                 f"save_weights_for_sampler({name!r}) failed: {e} "
                 f"(attempt {attempt + 1}/{max_retries})"
@@ -1202,6 +1288,7 @@ if inference_only:
                 stage_name="sample",
                 step_idx=step,
                 extra={"mode": "inference_only"},
+                result_extra_fn=lambda result: _sample_result_timing_extra(result, max_tokens=MAX_TOKENS),
             )
             all_lat_s.append(time.time() - t0)
 
@@ -1243,6 +1330,9 @@ if inference_only:
         print(f"inference_only mean_reward={mean_reward:.3f} (n={len(all_rewards)}) base_model={BASE_MODEL!r}")
     raise SystemExit(0)
 
+completed_rl_steps = 0
+rl_loop_failure: str | None = None
+
 for step in range(NUM_RL_STEPS):
     step_t0 = time.time()
     try:
@@ -1253,7 +1343,8 @@ for step in range(NUM_RL_STEPS):
             name=f"rl-step-{step}",
         )
     except Exception as e:
-        print(f"[step {step + 1}] Failed to create sampling client: {e}")
+        rl_loop_failure = f"[step {step + 1}] Failed to create sampling client: {e}"
+        print(rl_loop_failure)
         break
 
     problems = [generate_rl_problem() for _ in range(BATCH_SIZE)]
@@ -1286,6 +1377,7 @@ for step in range(NUM_RL_STEPS):
             stage_name="sample",
             step_idx=step,
             extra={"mode": "training"},
+            result_extra_fn=lambda result: _sample_result_timing_extra(result, max_tokens=MAX_TOKENS),
         )
 
         group_rewards = []
@@ -1410,10 +1502,30 @@ for step in range(NUM_RL_STEPS):
         step_idx=step,
         extra={"num_datums": len(training_datums), "avg_reward": round(avg_reward, 6)},
     )
+    completed_rl_steps += 1
 
     print(
         f"Step {step + 1:2d}/{NUM_RL_STEPS}: Accuracy = {accuracy:5.1%}, Avg Reward = {avg_reward:.3f}"
     )
+
+if NUM_RL_STEPS > 0 and completed_rl_steps < NUM_RL_STEPS:
+    message = (
+        "RL sanity did not complete requested steps: "
+        f"completed={completed_rl_steps}/{NUM_RL_STEPS}; "
+        f"last_failure={rl_loop_failure or 'unknown'}"
+    )
+    _append_timing_event(
+        "rl_step_completion",
+        elapsed_s=0.0,
+        status="error",
+        extra={
+            "completed_steps": completed_rl_steps,
+            "expected_steps": NUM_RL_STEPS,
+            "last_failure": rl_loop_failure,
+        },
+    )
+    print(f"FAIL in rl_step_not_completed: {message}")
+    raise RuntimeError(message)
 
 print("\nRL training complete!")
 
@@ -1477,6 +1589,7 @@ for question, correct in rl_test_problems:
         timeout_s=TIMEOUT_S,
         stage_name="eval_sample",
         extra={"question": question},
+        result_extra_fn=lambda sample_result: _sample_result_timing_extra(sample_result, max_tokens=16),
     )
 
     response_for_reward = tokenizer.decode(

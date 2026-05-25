@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 
@@ -47,21 +48,17 @@ def _tracked_text_files() -> list[Path]:
         ".yml",
         ".zsh",
     }
+    tracked = subprocess.check_output(["git", "ls-files", *roots], cwd=REPO_ROOT, text=True).splitlines()
     out: list[Path] = []
-    for rel in roots:
-        path = REPO_ROOT / rel
-        if path.is_dir():
-            for p in path.rglob("*"):
-                if not p.is_file() or p.suffix not in text_suffixes:
-                    continue
-                rel_path = str(p.relative_to(REPO_ROOT))
-                if rel_path in excluded_exact:
-                    continue
-                if any(rel_path.startswith(prefix) for prefix in excluded_prefixes):
-                    continue
-                out.append(p)
-        elif path.is_file():
-            out.append(path)
+    for rel_path in tracked:
+        p = REPO_ROOT / rel_path
+        if not p.is_file() or p.suffix not in text_suffixes:
+            continue
+        if rel_path in excluded_exact:
+            continue
+        if any(rel_path.startswith(prefix) for prefix in excluded_prefixes):
+            continue
+        out.append(p)
     return sorted(out)
 
 
