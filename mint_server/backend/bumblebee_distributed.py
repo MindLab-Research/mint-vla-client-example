@@ -397,6 +397,7 @@ class BumblebeeRankWorker:
         from bumblebee.runtime.adapters.mint import (
             actor_update_output_to_mint_forward_backward,
             make_mint_actor_loss_fn,
+            make_mint_sft_loss_fn,
             mint_datums_to_packed_batch,
         )
 
@@ -425,15 +426,22 @@ class BumblebeeRankWorker:
         else:
             batch = mint_datums_to_packed_batch(data_items, loss_fn=loss_fn, device=device)
             runtime_batch = self._mint_batch_to_runtime_dict(batch)
-            result = rt.forward_backward(handle, [runtime_batch], None, num_microbatches=1)
-            loss_value = _coerce_scalar(result.metrics.get("loss"))
+            result = rt.forward_backward(
+                handle,
+                [runtime_batch],
+                make_mint_sft_loss_fn(),
+                num_microbatches=1,
+            )
+            metrics = dict(result.metrics)
+            loss_value = _coerce_scalar(metrics.get("loss", metrics.get("loss:mean")))
+            metrics["loss"] = loss_value
             payload = {
                 "loss_fn_output_type": f"{loss_fn}_loss",
                 "loss_fn_outputs": [
                     {"loss": {"data": [loss_value], "shape": [1], "dtype": "float32"}}
                     for _ in data_items
                 ],
-                "metrics": {"loss": loss_value},
+                "metrics": metrics,
             }
 
         payload.setdefault("metrics", {})
@@ -460,20 +468,31 @@ class BumblebeeRankWorker:
         rt, handle = self._require_runtime()
         switch = self._ensure_session_loaded(session_id, actual_rank)
 
-        from bumblebee.runtime.adapters.mint import mint_datums_to_packed_batch
+        from bumblebee.runtime.adapters.mint import make_mint_sft_loss_fn, mint_datums_to_packed_batch
 
         batch = mint_datums_to_packed_batch(data_items, loss_fn="cross_entropy", device="cuda")
         runtime_batch = self._mint_batch_to_runtime_dict(batch)
-        result = rt.forward_backward(handle, [runtime_batch], None, num_microbatches=1, forward_only=True)
+        result = rt.forward_backward(
+            handle,
+            [runtime_batch],
+            make_mint_sft_loss_fn(),
+            num_microbatches=1,
+            forward_only=True,
+        )
+        metrics = dict(result.metrics)
+        loss_value = _coerce_scalar(metrics.get("loss", metrics.get("loss:mean")))
+        metrics.update(
+            {
+                "backend": "bumblebee",
+                "loss": loss_value,
+                "rank": self.rank,
+                "session_state": switch["session_state"],
+            }
+        )
         payload = {
             "loss_fn_output_type": "cross_entropy_loss",
             "loss_fn_outputs": [],
-            "metrics": {
-                "backend": "bumblebee",
-                "loss": _coerce_scalar(result.metrics.get("loss")),
-                "rank": self.rank,
-                "session_state": switch["session_state"],
-            },
+            "metrics": metrics,
         }
         return payload
 
