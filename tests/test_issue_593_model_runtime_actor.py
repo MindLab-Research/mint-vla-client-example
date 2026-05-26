@@ -611,6 +611,101 @@ async def test_issue_653_model_runtime_executor_timeout_fails_future_and_lease()
     assert "TimeoutError: model work executor timed out" in snapshot["last_error"]
 
 
+def test_issue_656_save_weights_runtime_timeout_uses_model_cap(monkeypatch) -> None:
+    lease = _lease("runtime-req-save-timeout")
+    lease["item"]["op"] = "training.save_weights_for_sampler"
+    monkeypatch.setenv("MINT_SAVE_LORA_TIMEOUT_S", "1800")
+    monkeypatch.delenv("MINT_MODEL_RUNTIME_SAVE_WEIGHTS_TIMEOUT_S", raising=False)
+    monkeypatch.delenv("MINT_MODEL_RUNTIME_EXECUTION_TIMEOUT_GRACE_S", raising=False)
+
+    actor = ModelRuntimeActor(
+        domain_key="training:Qwen/Qwen3-0.6B",
+        replica_id="replica-0",
+        actor_name="runtime-a",
+        actor_generation=3,
+        base_model="Qwen/Qwen3-0.6B",
+    )
+
+    assert actor._execution_timeout_s_for_lease(lease) == 360.0
+
+
+def test_issue_656_save_weights_runtime_timeout_explicit_env_override(monkeypatch) -> None:
+    lease = _lease("runtime-req-save-timeout-explicit")
+    lease["item"]["op"] = "training.save_weights_for_sampler"
+    monkeypatch.setenv("MINT_SAVE_LORA_TIMEOUT_S", "1800")
+    monkeypatch.setenv("MINT_MODEL_RUNTIME_SAVE_WEIGHTS_TIMEOUT_S", "42")
+
+    actor = ModelRuntimeActor(
+        domain_key="training:Qwen/Qwen3-0.6B",
+        replica_id="replica-0",
+        actor_name="runtime-a",
+        actor_generation=3,
+        base_model="Qwen/Qwen3-0.6B",
+    )
+
+    assert actor._execution_timeout_s_for_lease(lease) == 42.0
+
+
+@pytest.mark.anyio
+async def test_issue_656_stale_recovered_generation_fails_without_executor() -> None:
+    lease = _lease("runtime-req-stale-generation")
+    lease["item"]["extra"] = {
+        **dict(lease["item"].get("extra") or {}),
+        "actor_generation": 2,
+        "queue_state": "running",
+    }
+    scheduler = _FakeScheduler(claims=[[lease]])
+    task_futures = _FakeTaskFutureService(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
+    task_state_store = _FakeTaskStateStore()
+    called = False
+
+    async def _executor(_lease: dict) -> None:
+        nonlocal called
+        called = True
+
+    actor = ModelRuntimeActor(
+        domain_key="vllm:model-a",
+        replica_id="replica-0",
+        actor_name="runtime-a",
+        actor_generation=3,
+        scheduler_client=scheduler,
+        task_futures_client=task_futures,
+        task_state_store_client=task_state_store,
+        executor=_executor,
+    )
+
+    result = await actor.run_once()
+
+    assert result == {"claimed": 1, "executed": 1}
+    assert called is False
+    assert task_state_store.failures == [
+        {
+            "request_id": lease["item"]["request_id"],
+            "lease_id": lease["lease_id"],
+            "attempt_id": lease["attempt_id"],
+            "scheduler_epoch": lease["scheduler_epoch"],
+            "runtime_generation": 3,
+            "error": (
+                "executor failed: model work request recovered from stale runtime generation "
+                "actor_generation=2 current_actor_generation=3; request must be retried"
+            ),
+        }
+    ]
+    assert scheduler.failed == [
+        {
+            "lease_id": lease["lease_id"],
+            "consumer_id": "vllm:model-a::replica-0::generation::3",
+            "consumer_generation": 3,
+            "reason": "stale_runtime_generation",
+            "requeue": False,
+        }
+    ]
+    snapshot = actor.health_snapshot()
+    assert snapshot["failed_total"] == 1
+    assert snapshot["active_request_id"] is None
+    assert "stale runtime generation" in snapshot["last_error"]
+
+
 @pytest.mark.anyio
 async def test_issue_593_model_runtime_future_fail_finalization_fails_lease() -> None:
     lease = _lease("runtime-req-finalized-fail")

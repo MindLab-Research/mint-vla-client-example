@@ -467,6 +467,25 @@ class ModelRuntimeActor:
             return 600.0
         return 300.0
 
+    def _recovered_stale_generation_error(self, lease: dict[str, Any]) -> RuntimeError | None:
+        item = lease.get("item") if isinstance(lease, dict) else {}
+        extra = item.get("extra") if isinstance(item, dict) and isinstance(item.get("extra"), dict) else {}
+        raw = extra.get("actor_generation")
+        if raw is None:
+            return None
+        try:
+            recovered_generation = int(raw)
+        except (TypeError, ValueError):
+            return None
+        current_generation = int(self._config.actor_generation)
+        if recovered_generation == current_generation:
+            return None
+        return RuntimeError(
+            "model work request recovered from stale runtime generation "
+            f"actor_generation={recovered_generation} current_actor_generation={current_generation}; "
+            "request must be retried"
+        )
+
     def _execution_timeout_s_for_lease(self, lease: dict[str, Any]) -> float | None:
         if self._config.execution_timeout_s is not None:
             return self._config.execution_timeout_s
@@ -481,9 +500,7 @@ class ModelRuntimeActor:
         if explicit is not None:
             return explicit
 
-        save_timeout_s = self._normalize_optional_timeout_s(os.environ.get("MINT_SAVE_LORA_TIMEOUT_S"))
-        if save_timeout_s is None:
-            save_timeout_s = self._default_save_lora_timeout_s()
+        save_timeout_s = self._default_save_lora_timeout_s()
         grace_s = self._normalize_optional_timeout_s(
             os.environ.get("MINT_MODEL_RUNTIME_EXECUTION_TIMEOUT_GRACE_S")
         )
@@ -782,6 +799,61 @@ class ModelRuntimeActor:
                 self._requeued_total += 1
             except Exception:
                 pass
+            self._active_request_id = None
+            self._active_lease_id = None
+            return
+
+        stale_generation_error = self._recovered_stale_generation_error(lease)
+        if stale_generation_error is not None:
+            self._record_error(stale_generation_error)
+            try:
+                begin_finalize = await self._scheduler.begin_finalize_lease(
+                    lease_id=lease_id,
+                    consumer_id=self._config.consumer_id,
+                    consumer_generation=self._config.actor_generation,
+                    finalize_ttl_s=self._config.lease_ttl_s,
+                )
+                if isinstance(begin_finalize, dict) and bool(begin_finalize.get("ok")):
+                    await self._commit_task_state_failure(
+                        lease,
+                        error=f"executor failed: {stale_generation_error}",
+                    )
+                    await self._scheduler.fail_lease(
+                        lease_id=lease_id,
+                        consumer_id=self._config.consumer_id,
+                        consumer_generation=self._config.actor_generation,
+                        reason="stale_runtime_generation",
+                        requeue=False,
+                    )
+                    self._processed_total += 1
+                    self._failed_total += 1
+                else:
+                    await self._fail_lost_lease_if_still_pending(
+                        request_id,
+                        "model work scheduler lost stale-generation lease; request must be retried",
+                        attempt_id=attempt_id,
+                    )
+                    self._requeued_total += 1
+            except Exception as e:
+                self._record_error(e)
+                logger.error(
+                    "[model_runtime] stale-generation lease failure failed actor=%s request_id=%s error_type=%s error=%s",
+                    self._config.actor_name,
+                    request_id,
+                    type(e).__name__,
+                    e,
+                )
+                try:
+                    await self._scheduler.fail_lease(
+                        lease_id=lease_id,
+                        consumer_id=self._config.consumer_id,
+                        consumer_generation=self._config.actor_generation,
+                        reason="stale_runtime_generation_finalize_failed",
+                        requeue=True,
+                    )
+                    self._requeued_total += 1
+                except Exception:
+                    pass
             self._active_request_id = None
             self._active_lease_id = None
             return
