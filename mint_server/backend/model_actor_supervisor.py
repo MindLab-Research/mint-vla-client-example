@@ -2449,6 +2449,8 @@ def _create_ray_actor(*, require_ready: bool = True):
     extra_env = otel_env_vars()
     if CURRENT_CODE_IDENTITY:
         extra_env["MINT_GIT_SHA"] = str(CURRENT_CODE_IDENTITY)
+    if "MINT_VLLM_MODEL_RUNTIME_MAX_CLAIM" in os.environ:
+        extra_env["MINT_VLLM_MODEL_RUNTIME_MAX_CLAIM"] = os.environ["MINT_VLLM_MODEL_RUNTIME_MAX_CLAIM"]
 
     options: dict[str, Any] = {
         "name": actor_name,
