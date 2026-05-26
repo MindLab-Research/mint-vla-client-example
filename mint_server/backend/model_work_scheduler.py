@@ -1021,6 +1021,12 @@ class _ModelWorkSchedulerActor:
                 ):
                     changed_unclaimable.add(key)
 
+            for key in removed:
+                self._replica_queues.pop(key, None)
+            self._replicas = incoming
+            for key in incoming:
+                self._replica_queues.setdefault(key, deque())
+
             for key in changed_unclaimable:
                 queue = self._replica_queues.get(key)
                 while queue:
@@ -1058,11 +1064,6 @@ class _ModelWorkSchedulerActor:
                         else:
                             self._remove_request_location(lease.item.request_id)
 
-            for key in removed:
-                self._replica_queues.pop(key, None)
-            self._replicas = incoming
-            for key in incoming:
-                self._replica_queues.setdefault(key, deque())
             expired = await self._expire_leases_locked(now=now)
             assigned_pending = await self._assign_pending_locked()
             self._cv.notify_all()

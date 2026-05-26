@@ -321,6 +321,58 @@ def test_replica_can_claim_only_own_queue_and_generation() -> None:
     asyncio.run(_run())
 
 
+def test_scheduler_sync_reassigns_requeued_work_to_new_consumer_generation() -> None:
+    actor = _ModelWorkSchedulerActor()
+
+    async def _run() -> None:
+        await actor.sync_replicas(
+            [_replica("replica-0", consumer_id="consumer-old", generation=1)]
+        )
+        assert (await actor.append(_work("req-recycle"), assign=True))["ok"] is True
+        claimed = await actor.claim_from_replica_queue(
+            domain_key="vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
+            replica_id="replica-0",
+            consumer_id="consumer-old",
+            consumer_generation=1,
+            max_items=1,
+            lease_ttl_s=30.0,
+        )
+        assert [lease["item"]["request_id"] for lease in claimed["leases"]] == ["req-recycle"]
+
+        await actor.sync_replicas(
+            [_replica("replica-0", consumer_id="consumer-new", generation=2)]
+        )
+        stats = actor.stats()
+        queue = stats["replica_queues"]["vllm:Qwen/Qwen3-30B-A3B-Instruct-2507::replica-0"]
+        assert queue["consumer_id"] == "consumer-new"
+        assert queue["generation"] == 2
+        assert queue["depth"] == 1
+
+        with pytest.raises(ModelWorkSchedulerConflictError, match="consumer_id mismatch"):
+            await actor.claim_from_replica_queue(
+                domain_key="vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
+                replica_id="replica-0",
+                consumer_id="consumer-old",
+                consumer_generation=1,
+            )
+
+        claimed_after_recycle = await actor.claim_from_replica_queue(
+            domain_key="vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
+            replica_id="replica-0",
+            consumer_id="consumer-new",
+            consumer_generation=2,
+            max_items=1,
+            lease_ttl_s=30.0,
+        )
+        assert [lease["item"]["request_id"] for lease in claimed_after_recycle["leases"]] == [
+            "req-recycle"
+        ]
+        assert claimed_after_recycle["leases"][0]["consumer_id"] == "consumer-new"
+        assert claimed_after_recycle["leases"][0]["consumer_generation"] == 2
+
+    asyncio.run(_run())
+
+
 def test_affinity_sticks_to_same_healthy_replica() -> None:
     actor = _ModelWorkSchedulerActor()
 
