@@ -2651,6 +2651,7 @@ class _TaskStateStoreActor:
         self._lock = threading.RLock()
         self._store = TaskStateStore(db_path or _task_state_store_db_path())
         self._future_store = None
+        self._future_store_lock = threading.Lock()
         self._watchers: dict[str, list[threading.Event]] = {}
         self._watcher_count = 0
         self._watcher_limit = max(1, int(os.environ.get("MINT_TASK_STATE_STORE_WATCHER_MAX", "8192")))
@@ -2663,16 +2664,26 @@ class _TaskStateStoreActor:
         self._init_otel_metrics()
 
     def close(self) -> None:
+        with self._future_store_lock:
+            future_store = self._future_store
+            self._future_store = None
         self._store.close()
-        if self._future_store is not None:
-            self._future_store.close()
+        if future_store is not None:
+            future_store.close()
 
     def _future_store_or_create(self):
-        if self._future_store is None:
+        future_store = self._future_store
+        if future_store is not None:
+            return future_store
+        with self._future_store_lock:
+            future_store = self._future_store
+            if future_store is not None:
+                return future_store
             from .future_state_store import FutureStateStore, _future_state_store_db_path
 
-            self._future_store = FutureStateStore(_future_state_store_db_path())
-        return self._future_store
+            future_store = FutureStateStore(_future_state_store_db_path())
+            self._future_store = future_store
+            return future_store
 
     def _read_task_or_none(self, request_id: str) -> dict[str, Any] | None:
         try:
