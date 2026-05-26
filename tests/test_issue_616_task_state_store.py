@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -100,6 +102,49 @@ def test_task_state_store_actor_wait_status_change_notifies(tmp_path) -> None:
             actor.close()
 
     asyncio.run(_run())
+
+
+def test_task_state_store_actor_future_store_init_is_singleton_under_concurrency(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mint_server.backend.future_state_store as future_state_store_module
+
+    actor = _TaskStateStoreActor(str(tmp_path / "task-state-concurrency.sqlite3"))
+    created: list[object] = []
+
+    class _FakeFutureStateStore:
+        def __init__(self, path: str) -> None:
+            self.db_path = path
+            created.append(self)
+            time.sleep(0.05)
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(future_state_store_module, "FutureStateStore", _FakeFutureStateStore)
+
+    barrier = threading.Barrier(3)
+    results: list[object] = []
+
+    def _worker() -> None:
+        barrier.wait()
+        results.append(actor._future_store_or_create())
+
+    threads = [threading.Thread(target=_worker) for _ in range(2)]
+    try:
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=1.0)
+        assert all(not thread.is_alive() for thread in threads)
+        assert len(created) == 1
+        assert len(results) == 2
+        assert results[0] is results[1]
+        assert results[0] is created[0]
+    finally:
+        actor.close()
 
 
 def test_issue_638_task_state_store_stats_include_future_dashboard_fields(tmp_path) -> None:
