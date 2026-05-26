@@ -17,6 +17,7 @@ from mint_server.runtime_config import (
     REDACTED_VALUE,
     ConfigSnapshot,
     actor_env_from_environ,
+    actor_env_with_legacy_bridges,
     build_config_snapshot,
     classify_env,
     classify_env_key,
@@ -45,6 +46,8 @@ def test_runtime_config_classifies_bootstrap_actor_creation_snapshot_and_observa
     assert classify_env_key("MINT_CLUSTER_ID") == CONFIG_CLASS_OBSERVABILITY
     assert classify_env_key("MINT_TASK_STATE_STORE_DB_PATH") == CONFIG_CLASS_TASK_STATE
     assert classify_env_key("MINT_TASK_STATE_STORE_OWNER_TTL_S") == CONFIG_CLASS_TASK_STATE
+    assert classify_env_key("VOLCENGINE_ACCESS_KEY") == CONFIG_CLASS_SNAPSHOT_CONFIG
+    assert classify_env_key("VOLCENGINE_SECRET_KEY") == CONFIG_CLASS_SNAPSHOT_CONFIG
 
     grouped = classify_env(
         {
@@ -57,6 +60,8 @@ def test_runtime_config_classifies_bootstrap_actor_creation_snapshot_and_observa
             "MINT_CLUSTER_ID": "volcano",
             "MINT_TASK_STATE_STORE_DB_PATH": "/tmp/task.sqlite3",
             "MINT_TASK_STATE_STORE_OWNER_RENEW_S": "10",
+            "VOLCENGINE_ACCESS_KEY": "volc-ak",
+            "VOLCENGINE_SECRET_KEY": "volc-sk",
             "UNRELATED_ENV": "ignored",
         }
     )
@@ -70,6 +75,8 @@ def test_runtime_config_classifies_bootstrap_actor_creation_snapshot_and_observa
     assert grouped[CONFIG_CLASS_OBSERVABILITY]["MINT_CLUSTER_ID"] == "volcano"
     assert grouped[CONFIG_CLASS_TASK_STATE]["MINT_TASK_STATE_STORE_DB_PATH"] == "/tmp/task.sqlite3"
     assert grouped[CONFIG_CLASS_TASK_STATE]["MINT_TASK_STATE_STORE_OWNER_RENEW_S"] == "10"
+    assert grouped[CONFIG_CLASS_SNAPSHOT_CONFIG]["VOLCENGINE_ACCESS_KEY"] == "volc-ak"
+    assert grouped[CONFIG_CLASS_SNAPSHOT_CONFIG]["VOLCENGINE_SECRET_KEY"] == REDACTED_VALUE
     assert "UNRELATED_ENV" not in grouped["unclassified"]
 
 
@@ -125,6 +132,9 @@ def test_actor_env_from_environ_keeps_real_values_for_actor_hydration() -> None:
             "OTEL_EXPORTER_OTLP_HEADERS": "Authorization=secret",
             "MINT_TASK_STATE_STORE_DB_PATH": "/tmp/task.sqlite3",
             "MINT_TASK_STATE_STORE_OWNER_TTL_S": "30",
+            "VOLCENGINE_ACCESS_KEY": "volc-ak",
+            "VOLCENGINE_SECRET_KEY": "volc-sk",
+            "VOLCENGINE_PROFILE": "prod",
             "MINT_API_KEY": "api-secret",
             "MINT_BASE_URL": "http://client-only",
             "MINT_NEW_FEATURE_FLAG": "1",
@@ -144,11 +154,59 @@ def test_actor_env_from_environ_keeps_real_values_for_actor_hydration() -> None:
     assert actor_env["OTEL_EXPORTER_OTLP_HEADERS"] == "Authorization=secret"
     assert actor_env["MINT_TASK_STATE_STORE_DB_PATH"] == "/tmp/task.sqlite3"
     assert actor_env["MINT_TASK_STATE_STORE_OWNER_TTL_S"] == "30"
+    assert actor_env["VOLCENGINE_ACCESS_KEY"] == "volc-ak"
+    assert actor_env["VOLCENGINE_SECRET_KEY"] == "volc-sk"
+    assert actor_env["VOLCENGINE_PROFILE"] == "prod"
     assert "MINT_API_KEY" not in actor_env
     assert "MINT_BASE_URL" not in actor_env
     assert "MINT_NEW_FEATURE_FLAG" not in actor_env
     assert "MINT_CONFIG_ACTOR_HYDRATE" not in actor_env
     assert "UNRELATED" not in actor_env
+
+
+def test_actor_env_with_legacy_bridges_lifts_volc_cli_credentials(tmp_path, monkeypatch) -> None:
+    volc_home = tmp_path / ".volc"
+    volc_home.mkdir()
+    (volc_home / "credentials").write_text(
+        "[prod]\n"
+        "access_key_id = legacy-ak\n"
+        "secret_access_key = legacy-sk\n"
+        "session_token = legacy-token\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    actor_env = actor_env_with_legacy_bridges(
+        {
+            "VOLC_CLI_HOME": str(volc_home),
+            "VOLC_PROFILE": "prod",
+        }
+    )
+
+    assert actor_env["VOLCENGINE_ACCESS_KEY"] == "legacy-ak"
+    assert actor_env["VOLCENGINE_SECRET_KEY"] == "legacy-sk"
+    assert actor_env["VOLCENGINE_SESSION_TOKEN"] == "legacy-token"
+    assert actor_env["VOLCENGINE_PROFILE"] == "prod"
+
+
+def test_actor_env_with_legacy_bridges_prefers_modern_volcengine_env(tmp_path) -> None:
+    volc_home = tmp_path / ".volc"
+    volc_home.mkdir()
+    (volc_home / "credentials").write_text(
+        "[default]\naccess_key_id = legacy-ak\nsecret_access_key = legacy-sk\n",
+        encoding="utf-8",
+    )
+
+    actor_env = actor_env_with_legacy_bridges(
+        {
+            "VOLC_CLI_HOME": str(volc_home),
+            "VOLCENGINE_ACCESS_KEY": "modern-ak",
+            "VOLCENGINE_SECRET_KEY": "modern-sk",
+        }
+    )
+
+    assert actor_env["VOLCENGINE_ACCESS_KEY"] == "modern-ak"
+    assert actor_env["VOLCENGINE_SECRET_KEY"] == "modern-sk"
 
 
 def test_config_actor_exposes_no_mutating_api() -> None:

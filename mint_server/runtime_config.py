@@ -7,7 +7,9 @@ import json
 import os
 import re
 import time
+from configparser import ConfigParser
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Mapping
 
 from .config import ServerConfig, config as server_config
@@ -223,6 +225,14 @@ SNAPSHOT_CONFIG_ENV_KEYS = frozenset(
         "MINT_ROUTER_REPLAY_MODE",
         "MINT_DOC_PATH",
         "MINT_CHECKPOINT_DIR",
+        "VOLCENGINE_ACCESS_KEY",
+        "VOLCENGINE_SECRET_KEY",
+        "VOLCENGINE_SESSION_TOKEN",
+        "VOLCENGINE_CLI_CONFIG_FILE",
+        "VOLCENGINE_PROFILE",
+        "VOLC_PROFILE",
+        "VOLC_CLI_HOME",
+        "VOLCENGINE_LEGACY_CLI_HOME",
     }
 )
 
@@ -368,6 +378,66 @@ def actor_env_from_environ(environ: Mapping[str, str]) -> dict[str, str]:
     return out
 
 
+def _legacy_volc_cli_home(environ: Mapping[str, str]) -> Path | None:
+    for name in ("VOLC_CLI_HOME", "VOLCENGINE_LEGACY_CLI_HOME"):
+        raw = str(environ.get(name) or "").strip()
+        if raw:
+            path = Path(raw).expanduser()
+            if path.is_dir():
+                return path
+    path = Path(os.path.expanduser("~/.volc"))
+    if path.is_dir():
+        return path
+    return None
+
+
+def _legacy_volcengine_actor_env(environ: Mapping[str, str]) -> dict[str, str]:
+    has_modern_source = any(
+        str(environ.get(name) or "").strip()
+        for name in (
+            "VOLCENGINE_ACCESS_KEY",
+            "VOLCENGINE_SECRET_KEY",
+            "VOLCENGINE_SESSION_TOKEN",
+            "VOLCENGINE_CLI_CONFIG_FILE",
+        )
+    ) or Path(os.path.expanduser("~/.volcengine/config.json")).is_file()
+    if has_modern_source:
+        return {}
+
+    home = _legacy_volc_cli_home(environ)
+    if home is None:
+        return {}
+    cred_path = home / "credentials"
+    if not cred_path.is_file():
+        return {}
+    section = str(environ.get("VOLC_PROFILE") or environ.get("VOLCENGINE_PROFILE") or "default")
+    creds = ConfigParser()
+    creds.read(cred_path, encoding="utf-8")
+    if not creds.has_section(section):
+        return {}
+    ak = str(creds.get(section, "access_key_id", fallback="")).strip()
+    sk = str(creds.get(section, "secret_access_key", fallback="")).strip()
+    token = str(creds.get(section, "session_token", fallback="")).strip()
+    if not ak or not sk:
+        return {}
+
+    out = {
+        "VOLCENGINE_ACCESS_KEY": ak,
+        "VOLCENGINE_SECRET_KEY": sk,
+        "VOLCENGINE_PROFILE": section,
+    }
+    if token:
+        out["VOLCENGINE_SESSION_TOKEN"] = token
+    return out
+
+
+def actor_env_with_legacy_bridges(environ: Mapping[str, str]) -> dict[str, str]:
+    out = actor_env_from_environ(environ)
+    for key, value in _legacy_volcengine_actor_env(environ).items():
+        out.setdefault(key, value)
+    return out
+
+
 @dataclass(frozen=True)
 class ConfigSnapshot:
     schema_version: int
@@ -415,7 +485,7 @@ def build_config_snapshot(
         "actor_name": str(actor),
         "config_path": cfg.config_path,
         "env": classify_env(environ),
-        "actor_env": actor_env_from_environ(environ),
+        "actor_env": actor_env_with_legacy_bridges(environ),
         "server_config": _redact_server_config(asdict(cfg)),
         "fingerprint": "",
     }
