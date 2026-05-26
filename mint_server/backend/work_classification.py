@@ -39,7 +39,7 @@ def infer_scheduler_capacity_owner(scheduler_domain: Any) -> str | None:
         if "::replica::" in domain_key:
             return "vllm_replica_single_worker"
         return "model_registry_inference_dp"
-    if backend in ("megatron", "peft"):
+    if backend in ("megatron", "bumblebee", "peft"):
         return "single_worker"
     return None
 

@@ -829,7 +829,7 @@ def test_actor_state_fallback_omits_address_when_ray_is_already_initialized(
     assert seen["limit"] == 10000
 
 
-def test_actor_state_fallback_uses_subprocess_after_direct_lookup_failure(
+def test_actor_state_fallback_does_not_spawn_after_direct_lookup_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     vp = _import_node_placement(monkeypatch)
@@ -843,27 +843,14 @@ def test_actor_state_fallback_uses_subprocess_after_direct_lookup_failure(
         raise RuntimeError("not initialized in this thread")
 
     monkeypatch.setattr(vp.ray.util.state, "list_actors", _list_actors)
-    subprocess_calls: list[list[str]] = []
-
-    def _check_output(cmd, text, timeout, env):
-        subprocess_calls.append(list(cmd))
-        assert text is True
-        assert timeout == 60
-        assert "RAY_ADDRESS" not in env
-        assert "MINT_RAY_CLIENT_ADDRESS" not in env
-        assert "RAY_CLIENT_ADDRESS" not in env
-        return "[]"
-
-    monkeypatch.setattr(vp.subprocess, "check_output", _check_output)
 
     used, ok = vp._actor_used_gpus_by_node_from_state_api(context="test")
 
-    assert ok is True
+    assert ok is False
     assert used == {}
     assert len(calls) == 1
     assert "address" not in calls[0]
-    assert len(subprocess_calls) == 1
-    assert subprocess_calls[0][-1] == "192.168.39.87:6379"
+    assert not hasattr(vp, "subprocess")
 
 
 def test_assert_node_ip_capacity_handles_list_shaped_pg_table(

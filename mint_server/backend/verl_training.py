@@ -43,6 +43,46 @@ logger = logging.getLogger(__name__)
 # session shutdown, explicit admin actions, and supervisor reconciliation.
 DEFAULT_IDLE_TIMEOUT = 0
 
+_DISTRIBUTED_MOE_BACKENDS = {"megatron", "bumblebee"}
+
+
+def _canonical_moe_training_backend(value: str | None) -> str:
+    backend = str(value or "bumblebee").strip().lower()
+    aliases = {
+        "bb": "bumblebee",
+        "bumblebee": "bumblebee",
+        "megatron": "megatron",
+    }
+    if backend not in aliases:
+        raise ValueError(
+            f"unsupported MoE training backend {value!r}; expected one of {sorted(set(aliases.values()))}"
+        )
+    return aliases[backend]
+
+
+def _is_qwen3_30b_model(model: str | None) -> bool:
+    return "qwen3-30b-a3b" in str(model or "").lower()
+
+
+def _is_qwen3_235b_model(model: str | None) -> bool:
+    return "qwen3-235b-a22b" in str(model or "").lower()
+
+
+def _select_moe_training_backend(requested_model: str | None) -> str:
+    """Select the resident MoE trainer for Mint text sessions.
+
+    Bumblebee is the default path for the Qwen3 MoE SFT/RL integration.  The
+    model-specific env switches are rollback levers while the PR bakes.
+    """
+    env_name = None
+    if _is_qwen3_30b_model(requested_model):
+        env_name = "MINT_QWEN3_30B_TRAINING_BACKEND"
+    elif _is_qwen3_235b_model(requested_model):
+        env_name = "MINT_QWEN3_235B_TRAINING_BACKEND"
+    if env_name and os.environ.get(env_name):
+        return _canonical_moe_training_backend(os.environ.get(env_name))
+    return _canonical_moe_training_backend(os.environ.get("MINT_MOE_TRAINING_BACKEND"))
+
 
 # =====================================================================
 # Session State Manager - Per-iteration state persistence for stateless trainers
@@ -2311,6 +2351,16 @@ class VerlTrainingEngine:
                 self._actor_volatile_sessions.pop(actor_name, None)
             return worker
 
+        if session.backend == "bumblebee":
+            await self._rebind_bumblebee_worker(session, reason=f"{op}:{type(cause).__name__}")
+            err = (
+                f"[{session.model_id}] bumblebee actor recycle detected after op={op}; "
+                "operation may have partially executed before the crash; "
+                "reload from checkpoint before retrying."
+            )
+            self._poisoned_sessions[session.model_id] = err
+            raise RuntimeError(err) from cause
+
         worker = await self._recycle_dense_actor(session, op=op, cause=cause)
         if op != "load_weights":
             err = (
@@ -2336,6 +2386,20 @@ class VerlTrainingEngine:
             )
         return resolved, requested_model
 
+    def _resolve_bumblebee_base_model(self, session: "TrainingSession") -> tuple[str, str]:
+        """Resolve Bumblebee base model path strictly; never fallback to unrelated defaults."""
+        requested_model = session.base_model or self.default_base_model
+        if not requested_model:
+            raise RuntimeError(f"[{session.model_id}] could not resolve Bumblebee base model: empty model id")
+        if requested_model.startswith("/"):
+            return requested_model, requested_model
+        resolved = self._resolve_hf_model_path(requested_model)
+        if not resolved:
+            raise RuntimeError(
+                f"[{session.model_id}] could not resolve Bumblebee base model {requested_model!r} to local path"
+            )
+        return resolved, requested_model
+
     def _resolve_session_base_model(self, session: "TrainingSession") -> tuple[str | None, str | None]:
         requested_model = session.base_model or self.default_base_model
         if requested_model and not requested_model.startswith("/"):
@@ -2358,6 +2422,31 @@ class VerlTrainingEngine:
         train_tp, train_pp, train_ep, train_cp, train_etp = get_training_parallelism(
             requested_model or base_model or ""
         )
+        return DistributedConfig(
+            tensor_parallel_size=train_tp,
+            pipeline_parallel_size=train_pp,
+            expert_parallel_size=train_ep,
+            context_parallel_size=train_cp,
+            expert_tensor_parallel_size=train_etp,
+            use_fp8=bool(getattr(cfg, "train_use_fp8", False)),
+            router_replay_mode=server_config.router_replay_mode,
+        )
+
+    def _build_bumblebee_distributed_config(
+        self,
+        *,
+        requested_model: str | None,
+        base_model: str | None,
+    ):
+        from .megatron_distributed import DistributedConfig
+        from .model_registry import get_model_config, get_training_parallelism
+
+        model_key = requested_model or base_model or ""
+        cfg = get_model_config(model_key)
+        if _is_qwen3_30b_model(model_key):
+            train_tp, train_pp, train_ep, train_cp, train_etp = 4, 1, 4, 1, 1
+        else:
+            train_tp, train_pp, train_ep, train_cp, train_etp = get_training_parallelism(model_key)
         return DistributedConfig(
             tensor_parallel_size=train_tp,
             pipeline_parallel_size=train_pp,
@@ -2447,6 +2536,96 @@ class VerlTrainingEngine:
         session.is_active = True
         logger.warning(
             "[%s] megatron worker rebound without recycle actor=%s reason=%s",
+            session.model_id,
+            actor_name,
+            reason,
+        )
+        return worker
+
+    async def _rebind_bumblebee_worker(
+        self,
+        session: "TrainingSession",
+        *,
+        reason: str,
+        allow_create: bool = True,
+    ) -> ray.actor.ActorHandle:
+        from .bumblebee_distributed import (
+            PERSISTENT_NAMESPACE,
+            _make_bumblebee_actor_name,
+            async_get_or_create_bumblebee_worker_group,
+        )
+        from .model_actor_inventory import ActorType
+        from .model_actor_publication import BackendModelActorLaunch, publish_backend_model_actor
+        from .model_registry import is_topology_desired_model
+
+        base_model, requested_model = self._resolve_bumblebee_base_model(session)
+        actor_name = _make_bumblebee_actor_name(base_model or requested_model or session.base_model or "")
+        actual_rank = session.lora_config.rank if session.lora_config else self.default_lora_rank
+        trainer_lora_rank = int(server_config.max_lora_rank)
+        distributed_config = self._build_bumblebee_distributed_config(
+            requested_model=requested_model,
+            base_model=base_model,
+        )
+
+        if allow_create:
+            worker = await async_get_or_create_bumblebee_worker_group(
+                base_model=base_model,
+                lora_rank=trainer_lora_rank,
+                learning_rate=session.learning_rate,
+                distributed_config=distributed_config,
+                session_id=session.model_id,
+                actual_rank=actual_rank,
+                observability_base_model=requested_model or base_model,
+            )
+            ready_timeout_s = (
+                float(server_config.training_actor_ready_timeout_s)
+                if server_config.training_actor_ready_timeout_s is not None
+                else 3600.0
+            )
+            try:
+                await self._await_with_keepalive(
+                    worker.__ray_ready__.remote(),
+                    session,
+                    interval_s=30.0,
+                    timeout_s=ready_timeout_s,
+                )
+            except Exception as e:
+                if self._is_dead_actor_error(e):
+                    raise RuntimeError(f"[{session.model_id}] missing worker for backend=bumblebee") from e
+                raise
+        else:
+            try:
+                worker = await asyncio.to_thread(ray.get_actor, actor_name, namespace=PERSISTENT_NAMESPACE)
+            except ValueError as e:
+                raise RuntimeError(f"[{session.model_id}] missing worker for backend=bumblebee") from e
+
+        publish_backend_model_actor(
+            BackendModelActorLaunch(
+                actor_name=actor_name,
+                actor_type=ActorType.MEGATRON,
+                num_gpus=distributed_config.world_size,
+                actor_handle=worker,
+                namespace=PERSISTENT_NAMESPACE,
+                base_model=base_model or requested_model or "",
+                session_id=session.model_id,
+                protected=is_topology_desired_model(base_model or requested_model or ""),
+                metadata={
+                    "backend": "bumblebee",
+                    "max_lora_rank": trainer_lora_rank,
+                    "actual_rank": actual_rank,
+                },
+            ),
+            refresh_observability=False,
+        )
+        self._model_actor_supervisor_actor_names[session.model_id] = actor_name
+        self._workers[session.model_id] = worker
+        self._touch_actor(session)
+        session.backend = "bumblebee"
+        session.actor_name = actor_name
+        session.namespace = PERSISTENT_NAMESPACE
+        session.is_active = True
+        logger.warning(
+            "[%s] bumblebee worker rebound actor=%s reason=%s",
             session.model_id,
             actor_name,
             reason,
@@ -3148,6 +3327,12 @@ class VerlTrainingEngine:
                     reason=f"{op}:missing_worker",
                     allow_create=allow_recover,
                 )
+            if session.backend == "bumblebee":
+                return await self._rebind_bumblebee_worker(
+                    session,
+                    reason=f"{op}:missing_worker",
+                    allow_create=allow_recover,
+                )
             if session.backend == "peft" and allow_recover:
                 return await self._recover_dense_worker(session, reason=f"{op}:missing_worker")
             raise RuntimeError(f"[{model_id}] missing worker for backend={session.backend}")
@@ -3487,7 +3672,6 @@ class VerlTrainingEngine:
         Args:
             session: TrainingSession with configuration.
         """
-        from .megatron_distributed import async_get_or_create_megatron_worker_group, DistributedConfig
         from .model_registry import get_model_config
 
         model_id = session.model_id
@@ -3499,8 +3683,10 @@ class VerlTrainingEngine:
             session.lora_config.rank if session.lora_config else self.default_lora_rank
         )
 
-        # Check if this is an MoE model requiring Megatron backend
-        use_megatron = get_model_config(requested_model or "").is_moe
+        model_is_moe = bool(get_model_config(requested_model or "").is_moe)
+        moe_backend = _select_moe_training_backend(requested_model) if model_is_moe else None
+        use_megatron = model_is_moe and moe_backend == "megatron"
+        use_bumblebee = model_is_moe and moe_backend == "bumblebee"
 
         # Resolve model path based on backend
         with start_as_current_span(
@@ -3512,9 +3698,21 @@ class VerlTrainingEngine:
                 "model_id": str(model_id),
                 "requested_model": str(requested_model) if requested_model is not None else None,
                 "use_megatron": bool(use_megatron),
+                "use_bumblebee": bool(use_bumblebee),
+                "moe_backend": str(moe_backend or ""),
             },
         ):
-            if requested_model and not requested_model.startswith("/"):
+            if model_is_moe:
+                resolver = self._resolve_megatron_base_model if use_megatron else self._resolve_bumblebee_base_model
+                base_model, requested_model = resolver(session)
+                logger.info(
+                    "[%s] Resolved %s MoE model to local: %s (requested=%s)",
+                    model_id,
+                    moe_backend,
+                    base_model,
+                    requested_model,
+                )
+            elif requested_model and not requested_model.startswith("/"):
                 # HuggingFace model ID - resolve to local cache path
                 base_model = self._resolve_hf_model_path(requested_model)
                 if base_model:
@@ -3529,13 +3727,14 @@ class VerlTrainingEngine:
         observability_base_model = str(requested_model or base_model or "unknown")
 
         print(
-            f"[DEBUG {model_id}] create_training_session start: requested_model={requested_model} use_megatron={use_megatron} base_model={base_model}",
+            f"[DEBUG {model_id}] create_training_session start: requested_model={requested_model} moe_backend={moe_backend} base_model={base_model}",
             flush=True,
         )
         observability_base_model = str(requested_model or base_model or "")
 
         if use_megatron:
             import asyncio
+            from .megatron_distributed import async_get_or_create_megatron_worker_group
             # MoE models need tensor/expert parallelism from model registry
             from .model_registry import get_training_parallelism, get_model_config
 
@@ -3544,14 +3743,9 @@ class VerlTrainingEngine:
             train_tp, train_pp, train_ep, train_cp, train_etp = get_training_parallelism(requested_model or base_model or "")
             use_fp8 = bool(getattr(cfg, "train_use_fp8", False))
             trainer_lora_rank = int(server_config.max_lora_rank)
-            distributed_config = DistributedConfig(
-                tensor_parallel_size=train_tp,
-                pipeline_parallel_size=train_pp,
-                expert_parallel_size=train_ep,
-                context_parallel_size=train_cp,
-                expert_tensor_parallel_size=train_etp,
-                use_fp8=use_fp8,
-                router_replay_mode=server_config.router_replay_mode,
+            distributed_config = self._build_megatron_distributed_config(
+                requested_model=requested_model,
+                base_model=base_model,
             )
             logger.info(f"[{model_id}] Creating MegatronWorkerGroup for MoE model (base={base_model}, actual_rank={lora_rank}, trainer_lora_rank={trainer_lora_rank}, TP={train_tp}, PP={train_pp}, EP={train_ep}, CP={train_cp}, ETP={train_etp}, world_size={distributed_config.world_size}, fp8={use_fp8})")
 
@@ -3620,10 +3814,102 @@ class VerlTrainingEngine:
             session.backend = "megatron"
             from .megatron_distributed import _make_megatron_actor_name
 
-            self._model_actor_supervisor_actor_names[model_id] = _make_megatron_actor_name(base_model or "")
+            actor_name = _make_megatron_actor_name(base_model or "")
+            self._model_actor_supervisor_actor_names[model_id] = actor_name
+            session.actor_name = actor_name
+            session.namespace = RAY_NAMESPACE
             self._touch_actor(session)
             # Note: reinit_lora_weights is now called inside get_or_create_megatron_worker_group
             # with session_id for proper session state management (Issue #44)
+        elif use_bumblebee:
+            import asyncio
+            from .bumblebee_distributed import (
+                _make_bumblebee_actor_name,
+                async_get_or_create_bumblebee_worker_group,
+            )
+
+            trainer_lora_rank = int(server_config.max_lora_rank)
+            distributed_config = self._build_bumblebee_distributed_config(
+                requested_model=requested_model,
+                base_model=base_model,
+            )
+            logger.info(
+                "[%s] Creating BumblebeeWorkerGroup for MoE model "
+                "(base=%s, requested=%s, actual_rank=%s, trainer_lora_rank=%s, "
+                "TP=%s, PP=%s, EP=%s, CP=%s, ETP=%s, world_size=%s)",
+                model_id,
+                base_model,
+                requested_model,
+                lora_rank,
+                trainer_lora_rank,
+                distributed_config.tensor_parallel_size,
+                distributed_config.pipeline_parallel_size,
+                distributed_config.expert_parallel_size,
+                distributed_config.context_parallel_size,
+                distributed_config.expert_tensor_parallel_size,
+                distributed_config.world_size,
+            )
+            bumblebee_timeout_s = float(server_config.training_megatron_create_timeout_s)
+            print(
+                f"[DEBUG {model_id}] bumblebee get_or_create start: timeout_s={bumblebee_timeout_s}",
+                flush=True,
+            )
+            try:
+                worker = await run_async_with_otel_span(
+                    "training.create_model.get_or_create_bumblebee_worker_group",
+                    lambda: asyncio.wait_for(
+                        async_get_or_create_bumblebee_worker_group(
+                            base_model=base_model,
+                            lora_rank=trainer_lora_rank,
+                            learning_rate=session.learning_rate,
+                            distributed_config=distributed_config,
+                            session_id=session.model_id,
+                            actual_rank=lora_rank,
+                            observability_base_model=observability_base_model,
+                        ),
+                        timeout=bumblebee_timeout_s,
+                    ),
+                    component="backend.verl_training",
+                    op="training.create_model.get_or_create_bumblebee_worker_group",
+                    request_id=str(get_request_id() or "") or None,
+                    attributes={
+                        "model_id": str(model_id),
+                        "base_model": str(base_model),
+                        "requested_model": str(requested_model) if requested_model is not None else None,
+                        "world_size": int(distributed_config.world_size),
+                        "train_tp": int(distributed_config.tensor_parallel_size),
+                        "train_pp": int(distributed_config.pipeline_parallel_size),
+                        "train_ep": int(distributed_config.expert_parallel_size),
+                        "train_cp": int(distributed_config.context_parallel_size),
+                        "bumblebee_timeout_s": float(bumblebee_timeout_s),
+                    },
+                )
+            except asyncio.TimeoutError:
+                actor_name = _make_bumblebee_actor_name(base_model or requested_model or "")
+                try:
+                    actor = ray.get_actor(actor_name, namespace=RAY_NAMESPACE)
+                    ray_kill.kill(
+                        actor,
+                        reason="bumblebee_create_timeout",
+                        actor_name=actor_name,
+                        namespace=RAY_NAMESPACE,
+                        no_restart=True,
+                        model_id=model_id,
+                        timeout_s=bumblebee_timeout_s,
+                    )
+                except Exception:
+                    pass
+                raise
+            print(
+                f"[DEBUG {model_id}] bumblebee get_or_create done",
+                flush=True,
+            )
+            session.backend = "bumblebee"
+            actor_name = _make_bumblebee_actor_name(base_model or "")
+            self._model_actor_supervisor_actor_names[model_id] = actor_name
+            session.actor_name = actor_name
+            session.namespace = RAY_NAMESPACE
+            self._touch_actor(session)
         else:
             logger.info(
                 f"[{model_id}] Using pooled PEFT trainer actors for dense model (base={base_model}, lora_rank={lora_rank})"
@@ -3728,7 +4014,7 @@ class VerlTrainingEngine:
 
         # Wait for actor to be ready (model loaded)
         # Use await instead of ray.get() to not block the event loop
-        default_ready_timeout_s = 3600.0 if session.backend == "megatron" else 900.0
+        default_ready_timeout_s = 3600.0 if session.backend in _DISTRIBUTED_MOE_BACKENDS else 900.0
         ready_timeout_s = (
             float(server_config.training_actor_ready_timeout_s)
             if server_config.training_actor_ready_timeout_s is not None
@@ -3803,9 +4089,9 @@ class VerlTrainingEngine:
         session_rollout_corr = getattr(session, "rollout_correction_config", None)
         rollout_correction_config = None
         if loss_fn in ("ppo", "importance_sampling") and isinstance(session_rollout_corr, dict):
-            if session.backend != "megatron":
+            if session.backend not in _DISTRIBUTED_MOE_BACKENDS:
                 raise ValueError(
-                    "session-level rollout_correction_config is only supported on Megatron backend "
+                    "session-level rollout_correction_config is only supported on distributed MoE backends "
                     f"(got backend={session.backend!r})"
                 )
             rollout_correction_config = dict(session_rollout_corr)
@@ -3823,7 +4109,7 @@ class VerlTrainingEngine:
         traceparent = get_current_traceparent()
 
         # Remote call - pass session_id for stateless trainer pattern
-        if session.backend == "megatron":
+        if session.backend in _DISTRIBUTED_MOE_BACKENDS:
             pending = worker.forward_backward.remote(
                 data_items,
                 loss_fn,
@@ -4037,7 +4323,7 @@ class VerlTrainingEngine:
         traceparent = get_current_traceparent()
 
         # Remote call - pass session_id for stateless trainer pattern
-        if session.backend == "megatron":
+        if session.backend in _DISTRIBUTED_MOE_BACKENDS:
             pending = worker.forward.remote(
                 data_items,
                 session.model_id,
@@ -4155,7 +4441,7 @@ class VerlTrainingEngine:
         traceparent = get_current_traceparent()
 
         # Remote call - pass session_id for stateless trainer pattern
-        if session.backend == "megatron":
+        if session.backend in _DISTRIBUTED_MOE_BACKENDS:
             pending = worker.optim_step.remote(
                 lr,
                 session.model_id,
@@ -4229,9 +4515,9 @@ class VerlTrainingEngine:
         session_rollout_corr = getattr(session, "rollout_correction_config", None)
         rollout_correction_config = None
         if loss_fn in ("ppo", "importance_sampling") and isinstance(session_rollout_corr, dict):
-            if session.backend != "megatron":
+            if session.backend not in _DISTRIBUTED_MOE_BACKENDS:
                 raise ValueError(
-                    "session-level rollout_correction_config is only supported on Megatron backend "
+                    "session-level rollout_correction_config is only supported on distributed MoE backends "
                     f"(got backend={session.backend!r})"
                 )
             rollout_correction_config = dict(session_rollout_corr)
@@ -4257,7 +4543,7 @@ class VerlTrainingEngine:
             is_moe = bool(get_model_config(session.base_model or "").is_moe)
         except Exception:
             is_moe = False
-        use_train_step = session.backend == "megatron" and is_moe
+        use_train_step = session.backend in _DISTRIBUTED_MOE_BACKENDS and is_moe
 
         if use_train_step:
             # MoE: Use combined train_step to keep gradients in same context
@@ -4284,7 +4570,7 @@ class VerlTrainingEngine:
         else:
             # Dense models: Use separate calls (they don't have param_offload issues)
             # Pass session_id for stateless trainer pattern
-            if session.backend == "megatron":
+            if session.backend in _DISTRIBUTED_MOE_BACKENDS:
                 fb_pending = worker.forward_backward.remote(
                     data_items,
                     loss_fn,
@@ -4313,7 +4599,7 @@ class VerlTrainingEngine:
                 worker=worker,
                 interval_s=30.0,
             )
-            if session.backend == "megatron":
+            if session.backend in _DISTRIBUTED_MOE_BACKENDS:
                 opt_pending = worker.optim_step.remote(
                     lr,
                     session.model_id,
@@ -4434,7 +4720,7 @@ class VerlTrainingEngine:
         save_path = os.path.join(checkpoint_base_dir, session.model_id, checkpoint_name)
         if checkpoint_type:
             save_path = os.path.join(save_path, checkpoint_type)
-        if session.backend == "megatron":
+        if session.backend in _DISTRIBUTED_MOE_BACKENDS:
             return await self.save_lora_weights_for_sampler(session, save_path)
         return await self.save_dense_lora_weights_for_sampler(session, save_path)
 
@@ -4660,7 +4946,7 @@ class VerlTrainingEngine:
             default_timeout_s = 300
         timeout_s = int(os.environ.get("MINT_SAVE_CHECKPOINT_TIMEOUT_S", str(default_timeout_s)))
 
-        if session.backend == "megatron":
+        if session.backend in _DISTRIBUTED_MOE_BACKENDS:
             traceparent = get_current_traceparent()
             lora_cfg = getattr(session, "lora_config", None)
             train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
@@ -4751,7 +5037,7 @@ class VerlTrainingEngine:
                     ready_attempts += 1
                     worker = await self._recycle_worker_after_failure(session, op="load_weights", cause=e)
 
-        default_timeout_s = 1800.0 if session.backend == "megatron" else 120.0
+        default_timeout_s = 1800.0 if session.backend in _DISTRIBUTED_MOE_BACKENDS else 120.0
         load_timeout_s = float(os.environ.get("MINT_LOAD_CHECKPOINT_TIMEOUT_S", str(default_timeout_s)))
 
         traceparent = get_current_traceparent()
@@ -4759,6 +5045,8 @@ class VerlTrainingEngine:
             "traceparent": traceparent,
             "session_id": session.model_id,
         }
+        if session.backend == "bumblebee" and session.lora_config is not None:
+            kwargs["actual_rank"] = session.lora_config.rank
         if session.backend == "megatron" and not os.path.isfile(os.path.join(load_path, "adapter_config.json")):
             lora_config = getattr(session, "lora_config", None)
             for key in ("train_attn", "train_mlp", "train_unembed"):

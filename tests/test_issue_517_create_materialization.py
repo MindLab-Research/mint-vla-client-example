@@ -41,7 +41,7 @@ class _AsyncTaskFutureService:
     async def async_cleanup(self, request_id: str) -> None:
         self.cleaned.append(request_id)
 
-    async def async_resolve(self, request_id: str, payload: object) -> None:
+    async def async_resolve(self, request_id: str, payload: object, **_kwargs) -> None:
         self.resolved.update({"request_id": request_id, "payload": payload})
 
     async def async_fail(self, request_id: str, error: str) -> None:
@@ -103,11 +103,11 @@ async def test_issue_517_do_create_model_persists_unmaterialized_session_without
     assert create_calls == []
     assert persisted["materialization_state"] == MATERIALIZATION_STATE_UNMATERIALIZED
     assert persisted["actor_name"] is None
-    assert persisted["backend"] == "megatron"
+    assert persisted["backend"] == "bumblebee"
     assert persisted["tokenizer_info"] == {"vocab_size": 151936}
     assert task_futures.resolved["request_id"] == "rid-517-create"
     assert task_futures.resolved["payload"]["model_id"] == "s517_0"
-    assert task_futures.resolved["payload"]["backend"] == "megatron"
+    assert task_futures.resolved["payload"]["backend"] == "bumblebee"
     session = manager.get_local_session("s517_0")
     assert session is not None
     assert session.materialization_state == MATERIALIZATION_STATE_UNMATERIALIZED

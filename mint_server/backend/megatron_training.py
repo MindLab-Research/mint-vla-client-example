@@ -147,7 +147,6 @@ def mint_datum_to_tensordict(
             raise ValueError(f"Item {item_index}: missing loss_mask/mask/weights")
         _ensure_len(weights_key, weights_data, tokens_len, item_index)
         weights = weights_data
-        loss_mask_list.append(weights)
 
         # Derive prompt/response split from loss_mask (response assumed to be suffix).
         # loss_mask aligns to target tokens (shifted); use non-zero span to handle gaps/negative weights.
@@ -181,6 +180,16 @@ def mint_datum_to_tensordict(
             response_mask_list.append([])
             response_log_probs_list.append([] if logprobs is not None else None)
             response_advantages_list.append([] if advantages is not None else None)
+            slice_start = slice_end = 0
+
+        if logprobs is not None and advantages is not None:
+            causal_loss_mask = [0.0 for _ in weights]
+            for idx in range(slice_start, slice_end):
+                if weights[idx] != 0:
+                    causal_loss_mask[idx] = 1.0
+            loss_mask_list.append(causal_loss_mask)
+        else:
+            loss_mask_list.append(weights)
 
         # External labels (target_tokens) - correctly shifted with true last token
         # This solves the verl roll bug where last position gets wrapped first token

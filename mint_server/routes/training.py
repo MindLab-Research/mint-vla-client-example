@@ -311,8 +311,8 @@ async def _safe_update_training_meta(request_id: str, meta: dict[str, object]) -
 def _training_model_work_domain_key(*, backend: str, base_model: str, model_id: str) -> str:
     backend_value = str(backend or "").strip()
     base = str(base_model or "").strip()
-    if backend_value == "megatron" and base:
-        return f"megatron:{_normalize_megatron_scheduler_domain_key(base)}"
+    if backend_value in {"bumblebee", "megatron"} and base:
+        return f"{backend_value}:{_normalize_megatron_scheduler_domain_key(base)}"
     if base:
         return f"training:{base}"
     return f"training_session:{model_id}"
@@ -1144,11 +1144,15 @@ def _infer_training_backend_for_base_model(base_model: str) -> str:
         return "openpi_fast"
     if training_backend == "openpi_pi05":
         return "openpi_pi05"
-    return "megatron" if bool(getattr(cfg, "is_moe", False)) else "peft"
+    if bool(getattr(cfg, "is_moe", False)):
+        from ..backend.verl_training import _select_moe_training_backend
+
+        return _select_moe_training_backend(base_model)
+    return "peft"
 
 
 def _supports_control_plane_tokenizer_metadata(backend: str) -> bool:
-    return str(backend) in {"megatron", "peft"}
+    return str(backend) in {"bumblebee", "megatron", "peft"}
 
 
 def _resolve_local_tokenizer_source_path(base_model: str) -> str:
@@ -1215,7 +1219,7 @@ def _load_tokenizer_info_from_local_source(
         "unk_token": getattr(tokenizer, "unk_token", None),
         "unk_token_id": getattr(tokenizer, "unk_token_id", None),
     }
-    if str(backend) == "megatron":
+    if str(backend) in {"bumblebee", "megatron"}:
         info["vocab_size"] = len(tokenizer)
     return info
 

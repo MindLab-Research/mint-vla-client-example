@@ -5,8 +5,6 @@ import logging
 import math
 import os
 import re
-import subprocess
-import sys
 from dataclasses import dataclass
 from hashlib import sha1
 from urllib.parse import urlsplit
@@ -185,35 +183,11 @@ def _actor_used_gpus_by_node_from_state_api(*, context: str) -> tuple[dict[str, 
         actors = list_actors(
             detail=True,
             limit=10000,
+            raise_on_missing_output=False,
         )
     except Exception as e:
-        if not address:
-            logger.warning("%s: actor state fallback failed: %s", context, e)
-            return {}, False
-        try:
-            child_env = dict(os.environ)
-            for name in ("RAY_ADDRESS", "MINT_RAY_CLIENT_ADDRESS", "RAY_CLIENT_ADDRESS"):
-                child_env.pop(name, None)
-            raw = subprocess.check_output(
-                [
-                    sys.executable,
-                    "-c",
-                    (
-                        "import json, sys\n"
-                        "from ray.util import state as ray_state\n"
-                        "rows = ray_state.list_actors(address=sys.argv[1], detail=True, limit=10000)\n"
-                        "print(json.dumps([row.asdict() for row in rows]))\n"
-                    ),
-                    address,
-                ],
-                text=True,
-                timeout=60,
-                env=child_env,
-            )
-            actors = json.loads(raw)
-        except Exception as e2:
-            logger.warning("%s: actor state fallback failed: %s", context, e2)
-            return {}, False
+        logger.warning("%s: actor state fallback failed: %s", context, e)
+        return {}, False
 
     used_gpus_by_node: dict[str, float] = {}
     for actor in actors:

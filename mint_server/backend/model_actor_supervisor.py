@@ -2564,7 +2564,7 @@ class ModelActorSupervisorClient:
 
     def ensure_started(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
         self._ray_actor = _create_ray_actor(require_ready=False)
-        out = sync_get_ray_ref(self._ray_actor.snapshot.remote(), timeout_s=min(float(timeout_s), 10.0))
+        out = sync_get_ray_ref(self._ray_actor.snapshot.remote(), timeout_s=float(timeout_s))
         if not isinstance(out, dict):
             raise TypeError(f"ModelActorSupervisor.snapshot returned non-dict: {type(out)}")
         try:
@@ -2582,7 +2582,7 @@ class ModelActorSupervisorClient:
         self._ray_actor = _create_ray_actor(require_ready=False)
         out = await async_get_ray_ref(
             self._ray_actor.snapshot.remote(),
-            timeout_s=min(float(timeout_s), 10.0),
+            timeout_s=float(timeout_s),
         )
         if not isinstance(out, dict):
             raise TypeError(f"ModelActorSupervisor.snapshot returned non-dict: {type(out)}")
