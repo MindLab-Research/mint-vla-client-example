@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from inspect import isawaitable
 from typing import Any, Awaitable, Callable, Protocol
@@ -136,13 +137,20 @@ def placement_env_for_spec(spec: ModelActorSpecLike) -> dict[str, str]:
 async def launch_model_runtime_actor(spec: ModelActorSpecLike, generation: int) -> Any:
     from .model_runtime_actor import get_or_create_model_runtime_actor
 
+    launcher_key = str(getattr(spec, "launcher_key", "") or "")
+    max_claim = (
+        int(os.environ.get("MINT_VLLM_MODEL_RUNTIME_MAX_CLAIM", "64"))
+        if launcher_key == "vllm"
+        else 1
+    )
+
     return get_or_create_model_runtime_actor(
         domain_key=spec.domain_key,
         replica_id=spec.replica_id,
         actor_name=spec.normalized_actor_name(),
         actor_generation=int(generation),
         base_model=_base_model_from_spec(spec),
-        max_claim=1,
+        max_claim=max_claim,
         runtime_env_extra=placement_env_for_spec(spec),
     )
 
