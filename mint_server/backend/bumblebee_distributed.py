@@ -161,6 +161,179 @@ def _coerce_int(value: Any, default: int = 0) -> int:
         return int(default)
 
 
+def _record_benchmark_logprobs_enabled() -> bool:
+    return os.environ.get("MINT_BENCH_RECORD_LOGPROBS", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _record_benchmark_logits_enabled() -> bool:
+    return os.environ.get("MINT_BENCH_RECORD_LOGITS", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _record_benchmark_inputs_enabled() -> bool:
+    return os.environ.get("MINT_BENCH_RECORD_INPUTS", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _record_benchmark_model_state_enabled() -> bool:
+    return os.environ.get("MINT_BENCH_RECORD_MODEL_STATE", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _json_debug_value(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _json_debug_value(v) for k, v in list(value.items())[:64]}
+    if isinstance(value, (list, tuple)):
+        return [_json_debug_value(v) for v in list(value)[:64]]
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    return str(value)
+
+
+def _tensor_debug_signature(name: str, tensor: Any) -> dict[str, Any]:
+    import torch
+
+    detached = tensor.detach()
+    stats = detached.float()
+    flat = stats.reshape(-1)
+    sample_flat = flat[: min(4096, flat.numel())]
+    if sample_flat.numel() == 0:
+        sample = []
+        tensor_sum = tensor_abs_mean = tensor_norm = 0.0
+    else:
+        sample = sample_flat[: min(8, sample_flat.numel())].cpu().tolist()
+        tensor_sum = float(sample_flat.sum().detach().cpu().item())
+        tensor_abs_mean = float(sample_flat.abs().mean().detach().cpu().item())
+        tensor_norm = float(torch.linalg.vector_norm(sample_flat).detach().cpu().item())
+    return {
+        "name": str(name),
+        "shape": [int(dim) for dim in getattr(detached, "shape", ())],
+        "dtype": str(getattr(detached, "dtype", "unknown")).replace("torch.", ""),
+        "device": str(getattr(detached, "device", "unknown")),
+        "requires_grad": bool(getattr(tensor, "requires_grad", False)),
+        "numel": int(detached.numel()),
+        "signature_numel": int(sample_flat.numel()),
+        "sample_sum_fp32": tensor_sum,
+        "sample_abs_mean_fp32": tensor_abs_mean,
+        "sample_norm_fp32": tensor_norm,
+        "sample_fp32": [float(value) for value in sample],
+    }
+
+
+def _select_debug_parameter_signatures(
+    named_parameters: Any,
+    *,
+    max_base: int = 24,
+    max_adapter: int = 24,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    base_signatures: list[dict[str, Any]] = []
+    adapter_signatures: list[dict[str, Any]] = []
+    counts = {
+        "param_tensors": 0,
+        "trainable_tensors": 0,
+        "adapter_tensors": 0,
+        "base_tensors": 0,
+        "trainable_names": [],
+    }
+    base_patterns = (
+        "embedding",
+        "embed",
+        "qkv",
+        "proj",
+        "linear_qkv",
+        "linear_proj",
+        "fc1",
+        "fc2",
+        "linear_fc1",
+        "linear_fc2",
+        "gate",
+        "router",
+        "norm",
+        "output",
+        "head",
+    )
+    seen_base_patterns: set[str] = set()
+    for name, param in named_parameters:
+        lname = str(name).lower()
+        counts["param_tensors"] += 1
+        if bool(getattr(param, "requires_grad", False)):
+            counts["trainable_tensors"] += 1
+            if len(counts["trainable_names"]) < 64:
+                counts["trainable_names"].append(str(name))
+        is_adapter = "lora" in lname or "adapter" in lname
+        if is_adapter:
+            counts["adapter_tensors"] += 1
+            if len(adapter_signatures) < max_adapter:
+                adapter_signatures.append(_tensor_debug_signature(str(name), param))
+            continue
+        counts["base_tensors"] += 1
+        if len(base_signatures) >= max_base:
+            continue
+        matched = next((pattern for pattern in base_patterns if pattern in lname), None)
+        if matched is None:
+            continue
+        # Keep coverage broad before adding repeated examples.
+        if matched in seen_base_patterns and len(base_signatures) >= len(base_patterns):
+            continue
+        seen_base_patterns.add(matched)
+        base_signatures.append(_tensor_debug_signature(str(name), param))
+    counts["trainable_names"] = list(counts["trainable_names"])
+    return base_signatures, adapter_signatures, counts
+
+
+def _flatten_tensor_values(value: Any) -> list[float]:
+    if value is None:
+        return []
+    if getattr(value, "is_nested", False):
+        rows = [row.reshape(-1) for row in value.unbind()]
+        if not rows:
+            return []
+        import torch
+
+        value = torch.cat(rows, dim=0)
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    if hasattr(value, "reshape"):
+        value = value.reshape(-1)
+    if hasattr(value, "tolist"):
+        return [float(item) for item in value.tolist()]
+    return [float(item) for item in value]
+
+
+def _batch_seq_lens(batch: Any, default_count: int) -> list[int]:
+    seq_lens = getattr(batch, "seq_lens", None)
+    if seq_lens is None and isinstance(batch, dict):
+        seq_lens = batch.get("seq_lens")
+    values = _flatten_tensor_values(seq_lens)
+    if values:
+        return [int(value) for value in values]
+    return [default_count]
+
+
+def _split_flat_debug_values(
+    values: Any,
+    seq_lens: list[int],
+    *,
+    width: int = 1,
+    cast=float,
+) -> list[list[Any]]:
+    if values is None:
+        return [[] for _ in seq_lens]
+    flat = [cast(value) for value in values]
+    rows: list[list[Any]] = []
+    offset = 0
+    width = max(1, int(width))
+    for seq_len in seq_lens:
+        count = int(seq_len) * width
+        rows.append(flat[offset : offset + count])
+        offset += count
+    return rows
+
+
 @dataclass
 class BumblebeeSessionMeta:
     step_count: int = 0
@@ -289,7 +462,7 @@ class BumblebeeRankWorker:
             for name in ("lora_a", "lora_A"):
                 param = getattr(module, name, None)
                 if param is not None:
-                    torch.nn.init.normal_(param, mean=0.0, std=0.02)
+                    torch.nn.init.xavier_uniform_(param)
             for name in ("lora_b", "lora_B"):
                 param = getattr(module, name, None)
                 if param is not None:
@@ -297,12 +470,99 @@ class BumblebeeRankWorker:
 
     def _reset_optimizer_state(self) -> None:
         _, handle = self._require_runtime()
+        self._zero_gradients()
         optimizer = handle._optimizer
         if optimizer is None:
             return
-        state = getattr(optimizer, "state", None)
-        if isinstance(state, dict):
-            state.clear()
+        seen: set[int] = set()
+
+        def clear_state(opt: Any) -> None:
+            if opt is None or id(opt) in seen:
+                return
+            seen.add(id(opt))
+            for child in getattr(opt, "chained_optimizers", ()) or ():
+                clear_state(child)
+            state = getattr(opt, "state", None)
+            if isinstance(state, dict):
+                state.clear()
+            try:
+                inner = getattr(opt, "optimizer", None)
+            except AssertionError:
+                inner = None
+            if inner is not None:
+                clear_state(inner)
+
+        clear_state(optimizer)
+
+    def _zero_gradients(self) -> None:
+        rt, handle = self._require_runtime()
+        zero_grad = getattr(rt, "zero_grad", None)
+        if callable(zero_grad):
+            zero_grad(handle)
+            return
+        optimizer = getattr(handle, "_optimizer", None)
+        if optimizer is not None and hasattr(optimizer, "zero_grad"):
+            optimizer.zero_grad()
+        extras = getattr(handle, "_extras", {}) or {}
+        model = getattr(handle, "_model", None)
+        for chunk in extras.get("model_chunks", [model] if model is not None else []):
+            zero_grad_buffer = getattr(chunk, "zero_grad_buffer", None)
+            if callable(zero_grad_buffer):
+                zero_grad_buffer()
+
+    def _benchmark_model_state_debug(self) -> dict[str, Any]:
+        _, handle = self._require_runtime()
+        extras = getattr(handle, "_extras", {}) or {}
+        chunks = extras.get("model_chunks")
+        if not chunks:
+            model = getattr(handle, "_model", None)
+            chunks = [model] if model is not None else []
+        named_params: list[tuple[str, Any]] = []
+        chunk_classes: list[str] = []
+        config_payload: dict[str, Any] = {}
+        for chunk_idx, chunk in enumerate(chunks):
+            if chunk is None:
+                continue
+            chunk_classes.append(type(chunk).__name__)
+            config_obj = getattr(chunk, "config", None)
+            if config_obj is not None and not config_payload:
+                if hasattr(config_obj, "to_dict"):
+                    config_payload = _json_debug_value(config_obj.to_dict())
+                else:
+                    config_payload = _json_debug_value(vars(config_obj))
+            for name, param in chunk.named_parameters():
+                named_params.append((f"chunk{chunk_idx}.{name}", param))
+        base_signatures, adapter_signatures, counts = _select_debug_parameter_signatures(named_params)
+        ps = getattr(handle, "_parallel_state", None)
+        parallel = {
+            "tp_size": getattr(ps, "tp_size", None),
+            "tp_rank": getattr(ps, "tp_rank", None),
+            "pp_size": getattr(ps, "pp_size", None),
+            "pp_rank": getattr(ps, "pp_rank", None),
+            "ep_size": getattr(ps, "ep_size", None),
+            "ep_rank": getattr(ps, "ep_rank", None),
+            "cp_size": getattr(ps, "cp_size", None),
+            "cp_rank": getattr(ps, "cp_rank", None),
+            "etp_size": getattr(ps, "etp_size", None),
+            "etp_rank": getattr(ps, "etp_rank", None),
+        }
+        return {
+            "debug_model_backend": "bumblebee",
+            "debug_model_rank": int(self.rank),
+            "debug_model_world_size": int(self.world_size),
+            "debug_model_base_model": str(self.base_model),
+            "debug_model_impl": os.environ.get("MINT_BUMBLEBEE_IMPL", "lite"),
+            "debug_model_optimizer": os.environ.get("MINT_BUMBLEBEE_OPTIMIZER", "mc_full"),
+            "debug_model_lora_rank": int(self.lora_rank),
+            "debug_model_lora_alpha": int(_env_int("MINT_BUMBLEBEE_LORA_ALPHA", self.lora_rank * 2)),
+            "debug_model_active_adapter_id": str(extras.get("active_adapter_id")),
+            "debug_model_chunk_classes": chunk_classes,
+            "debug_model_config": config_payload,
+            "debug_model_parallel": _json_debug_value(parallel),
+            "debug_model_param_counts": counts,
+            "debug_model_base_param_signatures": base_signatures,
+            "debug_model_adapter_param_signatures": adapter_signatures,
+        }
 
     def _mint_batch_to_runtime_dict(self, batch: Any) -> dict[str, Any]:
         _, handle = self._require_runtime()
@@ -400,8 +660,10 @@ class BumblebeeRankWorker:
             make_mint_sft_loss_fn,
             mint_datums_to_packed_batch,
         )
+        from mint_server.backend.megatron_training import benchmark_debug_input_entries
 
         device = "cuda"
+        self._zero_gradients()
         if loss_fn in {"ppo", "importance_sampling", "grpo"}:
             batch = mint_datums_to_packed_batch(data_items, loss_fn=loss_fn, device=device)
             runtime_batch = self._mint_batch_to_runtime_dict(batch)
@@ -435,14 +697,107 @@ class BumblebeeRankWorker:
             metrics = dict(result.metrics)
             loss_value = _coerce_scalar(metrics.get("loss", metrics.get("loss:mean")))
             metrics["loss"] = loss_value
+            logprobs_by_sample: list[list[float]] = [[] for _ in data_items]
+            seq_lens = _batch_seq_lens(batch, 0)
+            if _record_benchmark_logprobs_enabled():
+                flat_logprobs = metrics.pop("_mint_sft_logprobs", None)
+                if flat_logprobs is None:
+                    flat_logprobs = _flatten_tensor_values(result.model_output.log_probs)
+                else:
+                    flat_logprobs = [float(value) for value in flat_logprobs]
+                if not seq_lens or seq_lens == [0]:
+                    seq_lens = _batch_seq_lens(batch, len(flat_logprobs))
+                logprobs_by_sample = []
+                offset = 0
+                for seq_len in seq_lens[: len(data_items)]:
+                    logprobs_by_sample.append(flat_logprobs[offset : offset + seq_len])
+                    offset += seq_len
+                while len(logprobs_by_sample) < len(data_items):
+                    logprobs_by_sample.append([])
+            target_logits_by_sample: list[list[float]] = [[] for _ in data_items]
+            logsumexp_by_sample: list[list[float]] = [[] for _ in data_items]
+            topk_indices_by_sample: list[list[int]] = [[] for _ in data_items]
+            topk_logits_by_sample: list[list[float]] = [[] for _ in data_items]
+            topk_k = int(metrics.pop("_mint_sft_topk_k", 0) or 0)
+            if _record_benchmark_logits_enabled():
+                target_logits_by_sample = _split_flat_debug_values(
+                    metrics.pop("_mint_sft_target_logits", None),
+                    seq_lens[: len(data_items)],
+                    cast=float,
+                )
+                logsumexp_by_sample = _split_flat_debug_values(
+                    metrics.pop("_mint_sft_logsumexp", None),
+                    seq_lens[: len(data_items)],
+                    cast=float,
+                )
+                if topk_k > 0:
+                    topk_indices_by_sample = _split_flat_debug_values(
+                        metrics.pop("_mint_sft_topk_indices", None),
+                        seq_lens[: len(data_items)],
+                        width=topk_k,
+                        cast=int,
+                    )
+                    topk_logits_by_sample = _split_flat_debug_values(
+                        metrics.pop("_mint_sft_topk_logits", None),
+                        seq_lens[: len(data_items)],
+                        width=topk_k,
+                        cast=float,
+                    )
+                while len(target_logits_by_sample) < len(data_items):
+                    target_logits_by_sample.append([])
+                    logsumexp_by_sample.append([])
+                    topk_indices_by_sample.append([])
+                    topk_logits_by_sample.append([])
+            loss_fn_outputs = []
+            for item_idx, logprobs in enumerate(logprobs_by_sample):
+                output_entry: dict[str, Any] = {
+                    "loss": {"data": [loss_value], "shape": [1], "dtype": "float32"},
+                }
+                if _record_benchmark_logprobs_enabled():
+                    output_entry["logprobs"] = {
+                        "data": logprobs,
+                        "shape": [len(logprobs)],
+                        "dtype": "float32",
+                    }
+                if _record_benchmark_logits_enabled():
+                    target_logits = target_logits_by_sample[item_idx] if item_idx < len(target_logits_by_sample) else []
+                    logsumexp = logsumexp_by_sample[item_idx] if item_idx < len(logsumexp_by_sample) else []
+                    output_entry["target_logits"] = {
+                        "data": target_logits,
+                        "shape": [len(target_logits)],
+                        "dtype": "float32",
+                    }
+                    output_entry["logsumexp"] = {
+                        "data": logsumexp,
+                        "shape": [len(logsumexp)],
+                        "dtype": "float32",
+                    }
+                    if topk_k > 0:
+                        topk_indices = topk_indices_by_sample[item_idx] if item_idx < len(topk_indices_by_sample) else []
+                        topk_logits = topk_logits_by_sample[item_idx] if item_idx < len(topk_logits_by_sample) else []
+                        output_entry["topk_indices"] = {
+                            "data": topk_indices,
+                            "shape": [len(topk_indices) // topk_k, topk_k],
+                            "dtype": "int64",
+                        }
+                        output_entry["topk_logits"] = {
+                            "data": topk_logits,
+                            "shape": [len(topk_logits) // topk_k, topk_k],
+                            "dtype": "float32",
+                        }
+                loss_fn_outputs.append(output_entry)
             payload = {
                 "loss_fn_output_type": f"{loss_fn}_loss",
-                "loss_fn_outputs": [
-                    {"loss": {"data": [loss_value], "shape": [1], "dtype": "float32"}}
-                    for _ in data_items
-                ],
+                "loss_fn_outputs": loss_fn_outputs,
                 "metrics": metrics,
             }
+
+        if _record_benchmark_inputs_enabled():
+            loss_fn_outputs = payload.setdefault("loss_fn_outputs", [])
+            for item_idx, debug_entry in enumerate(benchmark_debug_input_entries(data_items)):
+                while len(loss_fn_outputs) <= item_idx:
+                    loss_fn_outputs.append({})
+                loss_fn_outputs[item_idx].update(debug_entry)
 
         payload.setdefault("metrics", {})
         payload["metrics"].update(
@@ -452,6 +807,8 @@ class BumblebeeRankWorker:
                 "session_state": switch["session_state"],
             }
         )
+        if _record_benchmark_model_state_enabled():
+            payload["metrics"].update(self._benchmark_model_state_debug())
         return payload
 
     def forward(
@@ -508,6 +865,7 @@ class BumblebeeRankWorker:
             self.learning_rate = float(learning_rate)
         update_successful, grad_norm, num_zeros = rt.optimizer_step(handle)
         lr = rt.lr_scheduler_step(handle)
+        self._zero_gradients()
         meta = self._session_meta.setdefault(session_id, BumblebeeSessionMeta())
         meta.step_count += 1
         meta.learning_rate = float(self.learning_rate)
@@ -868,6 +1226,11 @@ class BumblebeeWorkerGroup:
             "BUMBLEBEE_RL_DEBUG_METRICS",
             "BUMBLEBEE_Q3MOE_GQA_PROBE",
             "BUMBLEBEE_Q3MOE_GQA_PROBE_ALL_RANKS",
+            "MINT_BENCH_RECORD_LOGPROBS",
+            "MINT_BENCH_RECORD_LOGITS",
+            "MINT_BENCH_RECORD_TOPK",
+            "MINT_BENCH_RECORD_INPUTS",
+            "MINT_BENCH_RECORD_MODEL_STATE",
             "CUDA_LAUNCH_BLOCKING",
             "TORCH_DISTRIBUTED_DEBUG",
             "NCCL_DEBUG",
@@ -1251,6 +1614,11 @@ def get_or_create_bumblebee_worker_group(
             "BUMBLEBEE_RL_DEBUG_METRICS",
             "BUMBLEBEE_Q3MOE_GQA_PROBE",
             "BUMBLEBEE_Q3MOE_GQA_PROBE_ALL_RANKS",
+            "MINT_BENCH_RECORD_LOGPROBS",
+            "MINT_BENCH_RECORD_LOGITS",
+            "MINT_BENCH_RECORD_TOPK",
+            "MINT_BENCH_RECORD_INPUTS",
+            "MINT_BENCH_RECORD_MODEL_STATE",
             "NVTE_DEBUG",
             "NVTE_DEBUG_LEVEL",
         ):

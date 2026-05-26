@@ -20,7 +20,7 @@ import threading
 import time
 import types
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import torch
@@ -84,6 +84,115 @@ def _unwrap_megatron_model(model):
     except ModuleNotFoundError:
         return model
     return unwrap_model(model)
+
+
+def _record_benchmark_model_state_enabled() -> bool:
+    return os.environ.get("MINT_BENCH_RECORD_MODEL_STATE", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _json_debug_value(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _json_debug_value(v) for k, v in list(value.items())[:64]}
+    if isinstance(value, (list, tuple)):
+        return [_json_debug_value(v) for v in list(value)[:64]]
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    return str(value)
+
+
+def _tensor_debug_signature(name: str, tensor: Any) -> dict[str, Any]:
+    import torch
+
+    detached = tensor.detach()
+    stats = detached.float()
+    flat = stats.reshape(-1)
+    sample_flat = flat[: min(4096, flat.numel())]
+    if sample_flat.numel() == 0:
+        sample = []
+        tensor_sum = tensor_abs_mean = tensor_norm = 0.0
+    else:
+        sample = sample_flat[: min(8, sample_flat.numel())].cpu().tolist()
+        tensor_sum = float(sample_flat.sum().detach().cpu().item())
+        tensor_abs_mean = float(sample_flat.abs().mean().detach().cpu().item())
+        tensor_norm = float(torch.linalg.vector_norm(sample_flat).detach().cpu().item())
+    return {
+        "name": str(name),
+        "shape": [int(dim) for dim in getattr(detached, "shape", ())],
+        "dtype": str(getattr(detached, "dtype", "unknown")).replace("torch.", ""),
+        "device": str(getattr(detached, "device", "unknown")),
+        "requires_grad": bool(getattr(tensor, "requires_grad", False)),
+        "numel": int(detached.numel()),
+        "signature_numel": int(sample_flat.numel()),
+        "sample_sum_fp32": tensor_sum,
+        "sample_abs_mean_fp32": tensor_abs_mean,
+        "sample_norm_fp32": tensor_norm,
+        "sample_fp32": [float(value) for value in sample],
+    }
+
+
+def _select_debug_parameter_signatures(
+    named_parameters: Any,
+    *,
+    max_base: int = 24,
+    max_adapter: int = 24,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    base_signatures: list[dict[str, Any]] = []
+    adapter_signatures: list[dict[str, Any]] = []
+    counts = {
+        "param_tensors": 0,
+        "trainable_tensors": 0,
+        "adapter_tensors": 0,
+        "base_tensors": 0,
+        "trainable_names": [],
+    }
+    base_patterns = (
+        "embedding",
+        "embed",
+        "qkv",
+        "proj",
+        "linear_qkv",
+        "linear_proj",
+        "fc1",
+        "fc2",
+        "linear_fc1",
+        "linear_fc2",
+        "gate",
+        "router",
+        "norm",
+        "output",
+        "head",
+    )
+    seen_base_patterns: set[str] = set()
+    for name, param in named_parameters:
+        lname = str(name).lower()
+        counts["param_tensors"] += 1
+        if bool(getattr(param, "requires_grad", False)):
+            counts["trainable_tensors"] += 1
+            if len(counts["trainable_names"]) < 64:
+                counts["trainable_names"].append(str(name))
+        is_adapter = "lora" in lname or "adapter" in lname
+        if is_adapter:
+            counts["adapter_tensors"] += 1
+            if len(adapter_signatures) < max_adapter:
+                adapter_signatures.append(_tensor_debug_signature(str(name), param))
+            continue
+        counts["base_tensors"] += 1
+        if len(base_signatures) >= max_base:
+            continue
+        matched = next((pattern for pattern in base_patterns if pattern in lname), None)
+        if matched is None:
+            continue
+        if matched in seen_base_patterns and len(base_signatures) >= len(base_patterns):
+            continue
+        seen_base_patterns.add(matched)
+        base_signatures.append(_tensor_debug_signature(str(name), param))
+    counts["trainable_names"] = list(counts["trainable_names"])
+    return base_signatures, adapter_signatures, counts
 
 
 def _install_noop_tensorboard() -> None:
@@ -2868,6 +2977,7 @@ class MegatronRankWorker:
         """
         import torch
         from mint_server.backend.megatron_training import (
+            benchmark_debug_input_entries,
             create_sft_loss_fn, create_ppo_loss_fn, mint_datum_to_tensordict
         )
 
@@ -2933,6 +3043,7 @@ class MegatronRankWorker:
         train_mode_reused = False
         grad_restore_skipped = False
         forward_backward_batch_ms = 0.0
+        debug_model_state = None
 
         def _run_forward_backward_compute():
             nonlocal result, forward_backward_batch_ms
@@ -2996,6 +3107,8 @@ class MegatronRankWorker:
                 )
 
             try:
+                if _record_benchmark_model_state_enabled() and output_rank:
+                    debug_model_state = self._benchmark_model_state_debug()
                 _run_forward_backward_compute()
                 self._zero_lora_rank_tail(actual_rank=actual_rank, zero_grads=True)
                 self._sticky_train_mode_last_used_s = time.perf_counter()
@@ -3039,6 +3152,8 @@ class MegatronRankWorker:
 
                 _run_forward_backward_compute()
                 self._zero_lora_rank_tail(actual_rank=actual_rank, zero_grads=True)
+                if _record_benchmark_model_state_enabled() and output_rank:
+                    debug_model_state = self._benchmark_model_state_debug()
 
                 # Capture gradients BEFORE exiting train_mode (exit destroys GPU grads)
                 if session_id is not None:
@@ -3113,6 +3228,8 @@ class MegatronRankWorker:
                 # Extract top-k tensors if present (from verl_patches.py)
                 model_topk_indices = model_output.get("topk_indices")  # (batch, seq_len, k)
                 model_topk_logits = model_output.get("topk_logits")    # (batch, seq_len, k)
+                model_target_logits = model_output.get("target_logits")
+                model_logsumexp = model_output.get("logsumexp")
                 if model_topk_indices is not None:
                     logger.info(f"[Rank {self.rank}] Got topk_indices shape={model_topk_indices.shape}")
                 else:
@@ -3129,6 +3246,7 @@ class MegatronRankWorker:
             # Concatenate and split log_probs into per-sample tensors for loss_fn_outputs
             # Also split topk tensors which are in THD format (1, total_tokens, k)
             topk_offset = 0  # Track offset into concatenated topk tensor
+            debug_offset = 0
 
             # NaN guard: detect and report NaN/Inf in loss_value before it propagates to JSON
             # (orjson converts NaN to null, which causes pydantic validation failures on client)
@@ -3153,24 +3271,72 @@ class MegatronRankWorker:
                     if model_topk_indices is not None and model_topk_logits is not None:
                         # Check if THD format (batch=1, concatenated sequences)
                         if model_topk_indices.dim() == 3 and model_topk_indices.shape[0] == 1:
-                            # Convert to int to avoid symbolic shape comparison issues
-                            total_tokens = int(model_topk_indices.shape[1])
-                            k = int(model_topk_indices.shape[2])
-                            if topk_offset + seq_len <= total_tokens:
-                                # TensorData.data must be flattened (per tinker schema)
-                                topk_idx = model_topk_indices[0, topk_offset:topk_offset + seq_len, :].flatten().tolist()
-                                topk_lp = model_topk_logits[0, topk_offset:topk_offset + seq_len, :].flatten().tolist()
+                            topk_idx_rows = (
+                                model_topk_indices[0, topk_offset:topk_offset + seq_len, :]
+                                .detach()
+                                .cpu()
+                                .tolist()
+                            )
+                            topk_lp_rows = (
+                                model_topk_logits[0, topk_offset:topk_offset + seq_len, :]
+                                .detach()
+                                .cpu()
+                                .tolist()
+                            )
+                            if len(topk_idx_rows) == seq_len and len(topk_lp_rows) == seq_len:
+                                k = len(topk_idx_rows[0]) if topk_idx_rows else 0
+                                topk_idx = [value for row in topk_idx_rows for value in row]
+                                topk_lp = [value for row in topk_lp_rows for value in row]
                                 output_entry["topk_indices"] = {"data": topk_idx, "shape": [seq_len, k], "dtype": "int64"}
                                 output_entry["topk_logits"] = {"data": topk_lp, "shape": [seq_len, k], "dtype": "float32"}
                                 topk_offset += seq_len
                         elif sample_idx < model_topk_indices.shape[0]:
                             # Per-sample format: (num_samples, seq_len, k)
-                            k = model_topk_indices.shape[2]
+                            topk_idx_rows = model_topk_indices[sample_idx, :seq_len, :].detach().cpu().tolist()
+                            topk_lp_rows = model_topk_logits[sample_idx, :seq_len, :].detach().cpu().tolist()
+                            k = len(topk_idx_rows[0]) if topk_idx_rows else 0
                             # TensorData.data must be flattened (per tinker schema)
-                            topk_idx = model_topk_indices[sample_idx, :seq_len, :].flatten().tolist()
-                            topk_lp = model_topk_logits[sample_idx, :seq_len, :].flatten().tolist()
+                            topk_idx = [value for row in topk_idx_rows for value in row]
+                            topk_lp = [value for row in topk_lp_rows for value in row]
                             output_entry["topk_indices"] = {"data": topk_idx, "shape": [seq_len, k], "dtype": "int64"}
                             output_entry["topk_logits"] = {"data": topk_lp, "shape": [seq_len, k], "dtype": "float32"}
+                    if model_target_logits is not None and model_logsumexp is not None:
+                        if hasattr(model_target_logits, "detach"):
+                            model_target_logits = model_target_logits.detach()
+                        if hasattr(model_logsumexp, "detach"):
+                            model_logsumexp = model_logsumexp.detach()
+                        if model_target_logits.dim() == 2 and model_target_logits.shape[0] == 1:
+                            target_logits = (
+                                model_target_logits[0, debug_offset:debug_offset + seq_len]
+                                .float()
+                                .cpu()
+                                .tolist()
+                            )
+                            logsumexp = (
+                                model_logsumexp[0, debug_offset:debug_offset + seq_len]
+                                .float()
+                                .cpu()
+                                .tolist()
+                            )
+                            if len(target_logits) == seq_len and len(logsumexp) == seq_len:
+                                output_entry["target_logits"] = {"data": target_logits, "shape": [seq_len], "dtype": "float32"}
+                                output_entry["logsumexp"] = {"data": logsumexp, "shape": [seq_len], "dtype": "float32"}
+                                debug_offset += seq_len
+                        elif sample_idx < model_target_logits.shape[0]:
+                            target_logits_tensor = model_target_logits[sample_idx, :seq_len].float().cpu()
+                            logsumexp_tensor = model_logsumexp[sample_idx, :seq_len].float().cpu()
+                            target_logits = target_logits_tensor.tolist()
+                            logsumexp = logsumexp_tensor.tolist()
+                            output_entry["target_logits"] = {
+                                "data": target_logits,
+                                "shape": [len(target_logits)],
+                                "dtype": "float32",
+                            }
+                            output_entry["logsumexp"] = {
+                                "data": logsumexp,
+                                "shape": [len(logsumexp)],
+                                "dtype": "float32",
+                            }
                     loss_fn_outputs.append(output_entry)
             elif loss_fn == "cross_entropy" and all_log_probs and seq_lengths:
                 combined_log_probs = torch.cat(all_log_probs, dim=0) if len(all_log_probs) > 1 else all_log_probs[0]
@@ -3194,6 +3360,12 @@ class MegatronRankWorker:
                         "loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
                         "logprobs": {"data": [], "shape": [0], "dtype": "float32"},
                     })
+
+            if os.environ.get("MINT_BENCH_RECORD_INPUTS", "0").strip().lower() in {"1", "true", "yes", "on"}:
+                for sample_idx, debug_entry in enumerate(benchmark_debug_input_entries(data_items)):
+                    while len(loss_fn_outputs) <= sample_idx:
+                        loss_fn_outputs.append({})
+                    loss_fn_outputs[sample_idx].update(debug_entry)
 
             # Calculate precision difference metrics if log_probs present
             debug_metrics = {}
@@ -3253,6 +3425,8 @@ class MegatronRankWorker:
                 "train_mode_reuse_total": float(self._sticky_train_mode_reuse_total),
                 "train_mode_exit_total": float(self._sticky_train_mode_exit_total),
             }
+            if debug_model_state is not None:
+                result_dict["debug_model_state"] = debug_model_state
             # Add debug metrics if present
             if debug_metrics:
                 result_dict["debug_metrics"] = debug_metrics
@@ -4665,6 +4839,82 @@ class MegatronRankWorker:
             "non_lora": non_lora,
             "unknown": unknown,
             "non_lora_names": non_lora_names,
+        }
+
+    def _benchmark_model_state_debug(self) -> dict[str, Any]:
+        modules = self.engine.module if isinstance(self.engine.module, list) else [self.engine.module]
+        named_params: list[tuple[str, Any]] = []
+        seen_param_ids: set[int] = set()
+        module_classes: list[str] = []
+        config_payload: dict[str, Any] = {}
+        for module_idx, module in enumerate(modules):
+            module_classes.append(type(module).__name__)
+            config_obj = getattr(module, "config", None)
+            if config_obj is not None and not config_payload:
+                if hasattr(config_obj, "to_dict"):
+                    config_payload = _json_debug_value(config_obj.to_dict())
+                else:
+                    config_payload = _json_debug_value(vars(config_obj))
+            for name, param in module.named_parameters():
+                if id(param) in seen_param_ids:
+                    continue
+                seen_param_ids.add(id(param))
+                named_params.append((f"module{module_idx}.{name}", param))
+
+        unwrapped = _unwrap_megatron_model(self.engine.module)
+        unwrapped_modules = unwrapped if isinstance(unwrapped, list) else [unwrapped]
+        for module_idx, module in enumerate(unwrapped_modules):
+            if module is None:
+                continue
+            config_obj = getattr(module, "config", None)
+            if config_obj is not None and not config_payload:
+                if hasattr(config_obj, "to_dict"):
+                    config_payload = _json_debug_value(config_obj.to_dict())
+                else:
+                    config_payload = _json_debug_value(vars(config_obj))
+            for name, param in module.named_parameters():
+                if id(param) in seen_param_ids:
+                    continue
+                seen_param_ids.add(id(param))
+                named_params.append((f"unwrapped{module_idx}.{name}", param))
+
+        base_signatures, adapter_signatures, counts = _select_debug_parameter_signatures(named_params)
+        parallel: dict[str, Any] = {}
+        try:
+            from megatron.core import parallel_state as mpu
+
+            parallel = {
+                "tp_size": int(mpu.get_tensor_model_parallel_world_size()),
+                "tp_rank": int(mpu.get_tensor_model_parallel_rank()),
+                "pp_size": int(mpu.get_pipeline_model_parallel_world_size()),
+                "pp_rank": int(mpu.get_pipeline_model_parallel_rank()),
+                "ep_size": int(mpu.get_expert_model_parallel_world_size()),
+                "ep_rank": int(mpu.get_expert_model_parallel_rank()),
+                "etp_size": int(mpu.get_expert_tensor_parallel_world_size()),
+                "etp_rank": int(mpu.get_expert_tensor_parallel_rank()),
+                "cp_size": int(mpu.get_context_parallel_world_size()),
+                "cp_rank": int(mpu.get_context_parallel_rank()),
+            }
+        except Exception as exc:
+            parallel = {"error": f"{type(exc).__name__}: {exc}"}
+
+        bridge = getattr(self.engine, "bridge", None)
+        return {
+            "debug_model_backend": "megatron",
+            "debug_model_rank": int(self.rank),
+            "debug_model_world_size": int(self.world_size),
+            "debug_model_base_model": str(self.base_model),
+            "debug_model_lora_rank": int(self.lora_rank),
+            "debug_model_lora_alpha": int(self.lora_rank * 2),
+            "debug_model_module_classes": module_classes,
+            "debug_model_engine_class": type(self.engine).__name__,
+            "debug_model_bridge_class": type(bridge).__name__ if bridge is not None else None,
+            "debug_model_config": config_payload,
+            "debug_model_parallel": _json_debug_value(parallel),
+            "debug_model_param_counts": counts,
+            "debug_model_optimizer_param_counts": self.get_optimizer_param_counts(),
+            "debug_model_base_param_signatures": base_signatures,
+            "debug_model_adapter_param_signatures": adapter_signatures,
         }
 
     def reinit_lora_weights(
@@ -8202,6 +8452,10 @@ class MegatronWorkerGroup:
                 metrics.update(filtered_debug_metrics)
                 logger.info(f"[MegatronWorkerGroup] Debug metrics: {filtered_debug_metrics}")
 
+        debug_model_state = rank0_result.get("debug_model_state")
+        if isinstance(debug_model_state, dict):
+            metrics["debug_model_state"] = debug_model_state
+
         logger.info(f"[MegatronWorkerGroup] forward_backward ({loss_fn}): loss={loss_value:.4f}")
 
         loss_fn_outputs = rank0_result.get("loss_fn_outputs")
@@ -10418,6 +10672,10 @@ def get_or_create_megatron_worker_group(
             "MINT_MEGATRON_STACK_DUMP_LIMIT",
             "MINT_MBRIDGE_EXPORT_GLOO_TIMEOUT_S",
             "MINT_MBRIDGE_EXPORT_GATHER_DEBUG",
+            "MINT_BENCH_RECORD_LOGITS",
+            "MINT_BENCH_RECORD_TOPK",
+            "MINT_BENCH_RECORD_INPUTS",
+            "MINT_BENCH_RECORD_MODEL_STATE",
         ):
             v = os.environ.get(k)
             if v is not None:

@@ -27,6 +27,59 @@ from mint_server.model_input_utils import flatten_encoded_text_chunks
 logger = logging.getLogger(__name__)
 
 
+def _wire_data(field: dict | list | None) -> list | None:
+    if field is None:
+        return None
+    if isinstance(field, list):
+        return field
+    if isinstance(field, dict):
+        data = field.get("data")
+        if isinstance(data, list):
+            return data
+    return None
+
+
+def benchmark_debug_input_entries(data_items: list[dict]) -> list[dict[str, Any]]:
+    """Build opt-in per-sample input payload diagnostics for benchmark artifacts."""
+    entries: list[dict[str, Any]] = []
+    for item in data_items:
+        tokens = [int(token) for token in flatten_encoded_text_chunks(item.get("model_input", {}))]
+        loss_fn_inputs = item.get("loss_fn_inputs", {}) or {}
+        entry: dict[str, Any] = {
+            "debug_input_ids": {"data": tokens, "shape": [len(tokens)], "dtype": "int64"},
+            "debug_position_ids": {
+                "data": list(range(len(tokens))),
+                "shape": [len(tokens)],
+                "dtype": "int64",
+            },
+        }
+
+        target_tokens = _wire_data(loss_fn_inputs.get("target_tokens"))
+        if target_tokens is not None:
+            values = [int(token) for token in target_tokens]
+            entry["debug_target_tokens"] = {"data": values, "shape": [len(values)], "dtype": "int64"}
+
+        for mask_key in ("loss_mask", "mask", "weights"):
+            mask_values = _wire_data(loss_fn_inputs.get(mask_key))
+            if mask_values is not None:
+                values = [float(value) for value in mask_values]
+                entry["debug_loss_mask"] = {"data": values, "shape": [len(values)], "dtype": "float32"}
+                break
+
+        logprobs = _wire_data(loss_fn_inputs.get("logprobs"))
+        if logprobs is not None:
+            values = [float(value) for value in logprobs]
+            entry["debug_rollout_logprobs"] = {"data": values, "shape": [len(values)], "dtype": "float32"}
+
+        advantages = _wire_data(loss_fn_inputs.get("advantages"))
+        if advantages is not None:
+            values = [float(value) for value in advantages]
+            entry["debug_advantages"] = {"data": values, "shape": [len(values)], "dtype": "float32"}
+
+        entries.append(entry)
+    return entries
+
+
 def mint_datum_to_tensordict(
     data_items: list[dict],
     max_token_len_per_gpu: int = 10240,  # Single sample max: prompt (~2K) + max_tokens (8K)
