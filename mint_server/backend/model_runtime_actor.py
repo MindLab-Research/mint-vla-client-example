@@ -44,6 +44,7 @@ class ModelRuntimeActorConfig:
     lease_ttl_s: float = 30.0
     max_claim: int = 1
     token_budget: int | None = None
+    execution_timeout_s: float | None = None
 
     @property
     def consumer_id(self) -> str:
@@ -86,6 +87,7 @@ def get_or_create_model_runtime_actor(
     lease_ttl_s: float | None = None,
     max_claim: int = 1,
     token_budget: int | None = None,
+    execution_timeout_s: float | None = None,
     runtime_env_extra: dict[str, str] | None = None,
 ) -> Any:
     import ray
@@ -153,6 +155,7 @@ def get_or_create_model_runtime_actor(
         lease_ttl_s=lease_ttl_s,
         max_claim=max_claim,
         token_budget=token_budget,
+        execution_timeout_s=execution_timeout_s,
     )
 
 
@@ -209,6 +212,7 @@ class ModelRuntimeActor:
         lease_ttl_s: float | None = None,
         max_claim: int = 1,
         token_budget: int | None = None,
+        execution_timeout_s: float | None = None,
         scheduler_client: ModelWorkSchedulerClient | None = None,
         task_futures_client: Any | None = None,
         task_state_store_client: Any | None = None,
@@ -245,6 +249,11 @@ class ModelRuntimeActor:
             ),
             max_claim=max(1, int(max_claim)),
             token_budget=None if token_budget is None else int(token_budget),
+            execution_timeout_s=self._normalize_optional_timeout_s(
+                execution_timeout_s
+                if execution_timeout_s is not None
+                else os.environ.get("MINT_MODEL_RUNTIME_EXECUTION_TIMEOUT_S")
+            ),
         )
         self._scheduler = scheduler_client if scheduler_client is not None else model_work_scheduler
         self._task_futures = task_futures_client if task_futures_client is not None else task_futures
@@ -331,6 +340,7 @@ class ModelRuntimeActor:
             "lease_ttl_s": float(self._config.lease_ttl_s),
             "max_claim": int(self._config.max_claim),
             "token_budget": self._config.token_budget,
+            "execution_timeout_s": self._config.execution_timeout_s,
         }
 
     async def start(self) -> dict[str, Any]:
@@ -427,6 +437,78 @@ class ModelRuntimeActor:
         if "modelworkschedulerconflicterror" in error or "consumer_id mismatch" in error:
             self._last_error = None
             self._last_error_traceback = None
+
+    @staticmethod
+    def _normalize_optional_timeout_s(value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            timeout_s = float(value)
+        except (TypeError, ValueError):
+            return None
+        if timeout_s <= 0:
+            return None
+        return max(0.1, timeout_s)
+
+    def _default_save_lora_timeout_s(self) -> float:
+        base_model = str(self._config.base_model or "")
+        try:
+            from .model_registry import get_model_config
+
+            train_gpus = int(get_model_config(base_model).train_gpus) if base_model else 1
+        except Exception:
+            train_gpus = 1
+
+        if train_gpus >= 32:
+            return 3600.0
+        if train_gpus >= 16:
+            return 1800.0
+        if train_gpus >= 4:
+            return 600.0
+        return 300.0
+
+    def _execution_timeout_s_for_lease(self, lease: dict[str, Any]) -> float | None:
+        if self._config.execution_timeout_s is not None:
+            return self._config.execution_timeout_s
+        item = lease.get("item") if isinstance(lease, dict) else {}
+        op = str(item.get("op") if isinstance(item, dict) else "")
+        if op != "training.save_weights_for_sampler":
+            return None
+
+        explicit = self._normalize_optional_timeout_s(
+            os.environ.get("MINT_MODEL_RUNTIME_SAVE_WEIGHTS_TIMEOUT_S")
+        )
+        if explicit is not None:
+            return explicit
+
+        save_timeout_s = self._normalize_optional_timeout_s(os.environ.get("MINT_SAVE_LORA_TIMEOUT_S"))
+        if save_timeout_s is None:
+            save_timeout_s = self._default_save_lora_timeout_s()
+        grace_s = self._normalize_optional_timeout_s(
+            os.environ.get("MINT_MODEL_RUNTIME_EXECUTION_TIMEOUT_GRACE_S")
+        )
+        if grace_s is None:
+            grace_s = 60.0
+        return save_timeout_s + grace_s
+
+    async def _cancel_executor_task(self, task: asyncio.Task | None, *, reason: str) -> None:
+        if task is None or task.done():
+            return
+        task.cancel()
+        done, pending = await asyncio.wait({task}, timeout=5.0)
+        for done_task in done:
+            try:
+                done_task.exception()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+        if pending:
+            logger.warning(
+                "[model_runtime] executor task did not stop after cancellation actor=%s reason=%s",
+                self._config.actor_name,
+                reason,
+            )
 
     async def _status_is_pending(self, lease: dict[str, Any]) -> bool:
         item = lease["item"]
@@ -586,13 +668,41 @@ class ModelRuntimeActor:
                 switched=False,
             )
 
-    async def _renew_until_done(self, lease: dict[str, Any], task: asyncio.Task) -> None:
+    async def _renew_until_done(
+        self,
+        lease: dict[str, Any],
+        task: asyncio.Task,
+        *,
+        execution_timeout_s: float | None = None,
+    ) -> None:
         interval_s = max(0.1, min(float(self._config.lease_ttl_s) / 3.0, 10.0))
+        started = time.monotonic()
         while not task.done():
+            wait_s = interval_s
+            if execution_timeout_s is not None:
+                elapsed_s = time.monotonic() - started
+                remaining_s = float(execution_timeout_s) - elapsed_s
+                if remaining_s <= 0:
+                    item = lease.get("item") if isinstance(lease, dict) else {}
+                    op = str(item.get("op") if isinstance(item, dict) else "unknown")
+                    raise TimeoutError(
+                        f"model work executor timed out after {execution_timeout_s:.1f}s op={op}"
+                    )
+                wait_s = min(wait_s, remaining_s)
             try:
-                await asyncio.wait_for(asyncio.shield(task), timeout=interval_s)
+                await asyncio.wait_for(asyncio.shield(task), timeout=wait_s)
                 return
             except asyncio.TimeoutError:
+                if (
+                    execution_timeout_s is not None
+                    and time.monotonic() - started >= float(execution_timeout_s)
+                    and not task.done()
+                ):
+                    item = lease.get("item") if isinstance(lease, dict) else {}
+                    op = str(item.get("op") if isinstance(item, dict) else "unknown")
+                    raise TimeoutError(
+                        f"model work executor timed out after {execution_timeout_s:.1f}s op={op}"
+                    )
                 result = await self._scheduler.renew_lease(
                     lease_id=str(lease["lease_id"]),
                     consumer_id=self._config.consumer_id,
@@ -687,7 +797,11 @@ class ModelRuntimeActor:
                 finalize_buffer=finalize_buffer,
             ):
                 task = asyncio.create_task(self._run_executor(lease))
-                await self._renew_until_done(lease, task)
+                await self._renew_until_done(
+                    lease,
+                    task,
+                    execution_timeout_s=self._execution_timeout_s_for_lease(lease),
+                )
                 await task
             executor_done_at = time.time()
             try:
@@ -833,9 +947,7 @@ class ModelRuntimeActor:
             self._last_error_traceback = None
             self._last_completed_at = time.time()
         except asyncio.CancelledError:
-            if task is not None:
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
+            await self._cancel_executor_task(task, reason="runtime_cancelled")
             try:
                 await self._scheduler.fail_lease(
                     lease_id=lease_id,
@@ -849,6 +961,7 @@ class ModelRuntimeActor:
                 pass
             raise
         except Exception as e:
+            await self._cancel_executor_task(task, reason=type(e).__name__)
             self._record_error(e)
             logger.error(
                 "[model_runtime] executor failed actor=%s request_id=%s op=%s error_type=%s failure_reason=%s",

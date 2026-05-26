@@ -547,6 +547,71 @@ async def test_issue_593_model_runtime_executor_failure_fails_future_and_lease()
 
 
 @pytest.mark.anyio
+async def test_issue_653_model_runtime_executor_timeout_fails_future_and_lease() -> None:
+    lease = _lease("runtime-req-timeout")
+    lease["item"]["op"] = "training.save_weights_for_sampler"
+    scheduler = _FakeScheduler(claims=[[lease]])
+    task_futures = _FakeTaskFutureService(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
+    task_state_store = _FakeTaskStateStore()
+    cancelled = False
+
+    async def _executor(_lease: dict) -> None:
+        nonlocal cancelled
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+
+    actor = ModelRuntimeActor(
+        domain_key="training:Qwen/Qwen3-0.6B",
+        replica_id="replica-0",
+        actor_name="runtime-a",
+        actor_generation=3,
+        scheduler_client=scheduler,
+        task_futures_client=task_futures,
+        task_state_store_client=task_state_store,
+        executor=_executor,
+        execution_timeout_s=0.05,
+    )
+
+    result = await actor.run_once()
+
+    assert result == {"claimed": 1, "executed": 1}
+    assert cancelled is True
+    assert task_futures.failed == []
+    assert task_state_store.failures == [
+        {
+            "request_id": lease["item"]["request_id"],
+            "lease_id": lease["lease_id"],
+            "attempt_id": lease["attempt_id"],
+            "scheduler_epoch": lease["scheduler_epoch"],
+            "runtime_generation": 3,
+            "error": (
+                "executor failed: model work executor timed out after 0.1s "
+                "op=training.save_weights_for_sampler"
+            ),
+        }
+    ]
+    assert scheduler.completed == []
+    assert scheduler.failed == [
+        {
+            "lease_id": lease["lease_id"],
+            "consumer_id": "training:Qwen/Qwen3-0.6B::replica-0::generation::3",
+            "consumer_generation": 3,
+            "reason": "executor_failed",
+            "requeue": False,
+        }
+    ]
+    snapshot = actor.health_snapshot()
+    assert snapshot["completed_total"] == 0
+    assert snapshot["failed_total"] == 1
+    assert snapshot["active_request_id"] is None
+    assert snapshot["execution_timeout_s"] == 0.1
+    assert "TimeoutError: model work executor timed out" in snapshot["last_error"]
+
+
+@pytest.mark.anyio
 async def test_issue_593_model_runtime_future_fail_finalization_fails_lease() -> None:
     lease = _lease("runtime-req-finalized-fail")
     scheduler = _FakeScheduler(claims=[[lease]])
