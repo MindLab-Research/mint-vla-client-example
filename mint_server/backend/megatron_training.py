@@ -27,6 +27,59 @@ from mint_server.model_input_utils import flatten_encoded_text_chunks
 logger = logging.getLogger(__name__)
 
 
+def _wire_data(field: dict | list | None) -> list | None:
+    if field is None:
+        return None
+    if isinstance(field, list):
+        return field
+    if isinstance(field, dict):
+        data = field.get("data")
+        if isinstance(data, list):
+            return data
+    return None
+
+
+def benchmark_debug_input_entries(data_items: list[dict]) -> list[dict[str, Any]]:
+    """Build opt-in per-sample input payload diagnostics for benchmark artifacts."""
+    entries: list[dict[str, Any]] = []
+    for item in data_items:
+        tokens = [int(token) for token in flatten_encoded_text_chunks(item.get("model_input", {}))]
+        loss_fn_inputs = item.get("loss_fn_inputs", {}) or {}
+        entry: dict[str, Any] = {
+            "debug_input_ids": {"data": tokens, "shape": [len(tokens)], "dtype": "int64"},
+            "debug_position_ids": {
+                "data": list(range(len(tokens))),
+                "shape": [len(tokens)],
+                "dtype": "int64",
+            },
+        }
+
+        target_tokens = _wire_data(loss_fn_inputs.get("target_tokens"))
+        if target_tokens is not None:
+            values = [int(token) for token in target_tokens]
+            entry["debug_target_tokens"] = {"data": values, "shape": [len(values)], "dtype": "int64"}
+
+        for mask_key in ("loss_mask", "mask", "weights"):
+            mask_values = _wire_data(loss_fn_inputs.get(mask_key))
+            if mask_values is not None:
+                values = [float(value) for value in mask_values]
+                entry["debug_loss_mask"] = {"data": values, "shape": [len(values)], "dtype": "float32"}
+                break
+
+        logprobs = _wire_data(loss_fn_inputs.get("logprobs"))
+        if logprobs is not None:
+            values = [float(value) for value in logprobs]
+            entry["debug_rollout_logprobs"] = {"data": values, "shape": [len(values)], "dtype": "float32"}
+
+        advantages = _wire_data(loss_fn_inputs.get("advantages"))
+        if advantages is not None:
+            values = [float(value) for value in advantages]
+            entry["debug_advantages"] = {"data": values, "shape": [len(values)], "dtype": "float32"}
+
+        entries.append(entry)
+    return entries
+
+
 def mint_datum_to_tensordict(
     data_items: list[dict],
     max_token_len_per_gpu: int = 10240,  # Single sample max: prompt (~2K) + max_tokens (8K)
@@ -147,7 +200,6 @@ def mint_datum_to_tensordict(
             raise ValueError(f"Item {item_index}: missing loss_mask/mask/weights")
         _ensure_len(weights_key, weights_data, tokens_len, item_index)
         weights = weights_data
-        loss_mask_list.append(weights)
 
         # Derive prompt/response split from loss_mask (response assumed to be suffix).
         # loss_mask aligns to target tokens (shifted); use non-zero span to handle gaps/negative weights.
@@ -181,6 +233,16 @@ def mint_datum_to_tensordict(
             response_mask_list.append([])
             response_log_probs_list.append([] if logprobs is not None else None)
             response_advantages_list.append([] if advantages is not None else None)
+            slice_start = slice_end = 0
+
+        if logprobs is not None and advantages is not None:
+            causal_loss_mask = [0.0 for _ in weights]
+            for idx in range(slice_start, slice_end):
+                if weights[idx] != 0:
+                    causal_loss_mask[idx] = 1.0
+            loss_mask_list.append(causal_loss_mask)
+        else:
+            loss_mask_list.append(weights)
 
         # External labels (target_tokens) - correctly shifted with true last token
         # This solves the verl roll bug where last position gets wrapped first token

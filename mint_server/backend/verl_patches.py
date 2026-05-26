@@ -170,6 +170,67 @@ def vocab_parallel_topk(logits: torch.Tensor, k: int = 10) -> tuple[torch.Tensor
     return final_topk_indices, final_topk_logits
 
 
+def _mint_record_logits_enabled() -> bool:
+    import os
+
+    return os.environ.get("MINT_BENCH_RECORD_LOGITS", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _mint_record_topk() -> int:
+    import os
+
+    if not _mint_record_logits_enabled():
+        return 0
+    raw = os.environ.get("MINT_BENCH_RECORD_TOPK", "5").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 5
+
+
+def vocab_parallel_target_logits(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """Select raw target logits from vocab-parallel logits."""
+    from megatron.core import parallel_state as mpu
+    import torch.distributed as dist
+
+    logits_f = logits.float()
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    tp_size = mpu.get_tensor_model_parallel_world_size()
+    tp_group = mpu.get_tensor_model_parallel_group()
+    partition_vocab_size = logits_f.size(-1)
+    vocab_start = tp_rank * partition_vocab_size
+    vocab_end = vocab_start + partition_vocab_size
+
+    target_mask = (labels < vocab_start) | (labels >= vocab_end)
+    local_labels = labels.clone() - vocab_start
+    local_labels[target_mask] = 0
+    logits_2d = logits_f.reshape(-1, partition_vocab_size)
+    label_1d = local_labels.reshape(-1)
+    rows = torch.arange(logits_2d.size(0), device=logits_2d.device)
+    selected = logits_2d[rows, label_1d].reshape_as(labels)
+    selected = selected.masked_fill(target_mask, 0.0)
+    if tp_size > 1:
+        dist.all_reduce(selected, op=dist.ReduceOp.SUM, group=tp_group)
+    return selected
+
+
+def vocab_parallel_logsumexp(logits: torch.Tensor) -> torch.Tensor:
+    """Compute global logsumexp across vocab-parallel logits."""
+    from megatron.core import parallel_state as mpu
+    import torch.distributed as dist
+
+    logits_f = logits.float()
+    tp_size = mpu.get_tensor_model_parallel_world_size()
+    tp_group = mpu.get_tensor_model_parallel_group()
+    logits_max = logits_f.max(dim=-1).values
+    if tp_size > 1:
+        dist.all_reduce(logits_max, op=dist.ReduceOp.MAX, group=tp_group)
+    exp_sum = torch.exp(logits_f - logits_max.unsqueeze(-1)).sum(dim=-1)
+    if tp_size > 1:
+        dist.all_reduce(exp_sum, op=dist.ReduceOp.SUM, group=tp_group)
+    return torch.log(exp_sum) + logits_max
+
+
 def _is_mla_model(hf_config) -> bool:
     """Check if model uses Multi-Latent Attention (MLA).
 
@@ -348,6 +409,14 @@ def _apply_external_label_patch():
 
             if return_vocab_parallel_logits:
                 ret["vocab_parallel_logits"] = logits_bak
+            if _mint_record_logits_enabled():
+                ret["target_logits"] = vocab_parallel_target_logits(logits_bak, label)
+                ret["logsumexp"] = vocab_parallel_logsumexp(logits_bak)
+                topk = _mint_record_topk()
+                if topk > 0:
+                    topk_indices, topk_logits = vocab_parallel_topk(logits_bak, k=topk)
+                    ret["topk_indices"] = topk_indices
+                    ret["topk_logits"] = topk_logits
 
             # Compute log_probs via cross-entropy
             log_probs = vocab_parallel_log_probs_from_logits(logits_bak, label)

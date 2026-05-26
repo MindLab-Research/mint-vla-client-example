@@ -176,8 +176,24 @@ def _driver_runtime_env() -> dict[str, Any]:
         runtime_env["working_dir"] = working_dir
 
     py_modules_csv = os.environ.get("MINT_RAY_PY_MODULES_CSV", "").strip()
+    py_modules: list[str] = []
     if py_modules_csv:
-        runtime_env["py_modules"] = [x.strip() for x in py_modules_csv.split(",") if x.strip()]
+        py_modules.extend(x.strip() for x in py_modules_csv.split(",") if x.strip())
+
+    bumblebee_repo = os.environ.get("MINT_BUMBLEBEE_REPO_PATH", "").strip()
+    if bumblebee_repo:
+        bumblebee_repo_path = Path(bumblebee_repo)
+        bumblebee_package_path = bumblebee_repo_path / "bumblebee"
+        bumblebee_module_path = (
+            str(bumblebee_package_path)
+            if (bumblebee_package_path / "__init__.py").exists()
+            else str(bumblebee_repo_path)
+        )
+        if bumblebee_module_path not in py_modules and Path(bumblebee_module_path).exists():
+            py_modules.append(bumblebee_module_path)
+
+    if py_modules:
+        runtime_env["py_modules"] = py_modules
 
     return runtime_env
 
