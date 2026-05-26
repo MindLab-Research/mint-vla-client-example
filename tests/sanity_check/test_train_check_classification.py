@@ -96,6 +96,48 @@ def test_generation_summary_aggregates_sample_tokens():
     assert summary["tokens_per_s"] == 6.0
     assert summary["hit_max_count"] == 4
     assert summary["by_stage"]["sample"]["tokens_per_s"] == 8.0
+    assert summary["by_stage"]["eval_sample"]["tokens_per_s"] == 2.0
+
+
+def test_feishu_report_splits_sample_and_eval_throughput():
+    train_check = _load_train_check()
+    report = train_check.build_feishu_report(
+        [
+            {
+                "model": "Qwen/Test",
+                "status": "ok",
+                "slowest_stage": "rl_step_total",
+                "slowest_max_s": 10.0,
+                "wall_clock_s": 20.0,
+                "timing_degraded": False,
+                "generation_summary": {
+                    "output_tokens": 90,
+                    "tokens_per_s": 6.0,
+                    "hit_max_count": 4,
+                    "by_stage": {
+                        "sample": {
+                            "output_tokens": 80,
+                            "elapsed_s": 10.0,
+                            "tokens_per_s": 8.0,
+                            "hit_max_count": 4,
+                        },
+                        "eval_sample": {
+                            "output_tokens": 10,
+                            "elapsed_s": 5.0,
+                            "tokens_per_s": 2.0,
+                            "hit_max_count": 0,
+                        },
+                    },
+                },
+                "degradation_reason": None,
+            }
+        ]
+    )
+
+    assert "sample_e2e_tok_s=`8.00`" in report
+    assert "eval_e2e_tok_s=`2.00`" in report
+    assert "total_e2e_tok_s=`6.00`" in report
+    assert "gen_tok_s" not in report
 
 
 def test_timing_degradation_is_thresholded_for_success_only():

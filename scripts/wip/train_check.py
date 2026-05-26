@@ -475,6 +475,30 @@ def extract_generation_summary(timing: dict[str, object] | None) -> dict[str, ob
     }
 
 
+def _format_generation_summary(generation: object) -> str:
+    if not isinstance(generation, dict):
+        return ""
+    parts: list[str] = []
+    output_tokens = generation.get("output_tokens")
+    if isinstance(output_tokens, (int, float)):
+        parts.append(f"generated_tokens=`{int(output_tokens)}`")
+
+    by_stage = generation.get("by_stage")
+    if isinstance(by_stage, dict):
+        sample = by_stage.get("sample")
+        if isinstance(sample, dict) and isinstance(sample.get("tokens_per_s"), (int, float)):
+            parts.append(f"sample_e2e_tok_s=`{float(sample['tokens_per_s']):.2f}`")
+        eval_sample = by_stage.get("eval_sample")
+        if isinstance(eval_sample, dict) and isinstance(eval_sample.get("tokens_per_s"), (int, float)):
+            parts.append(f"eval_e2e_tok_s=`{float(eval_sample['tokens_per_s']):.2f}`")
+
+    if isinstance(generation.get("tokens_per_s"), (int, float)):
+        parts.append(f"total_e2e_tok_s=`{float(generation['tokens_per_s']):.2f}`")
+    if generation.get("hit_max_count"):
+        parts.append(f"hit_max=`{generation['hit_max_count']}`")
+    return (" " + ", ".join(parts)) if parts else ""
+
+
 def run_one(run: ModelRun) -> dict[str, object]:
     stdout_path = run.run_dir / "stdout.log"
     stderr_path = run.run_dir / "stderr.log"
@@ -748,15 +772,7 @@ def build_feishu_report(results: list[dict[str, object]]) -> str:
         wall = _fmt_duration(result.get("wall_clock_s"))
         if result.get("status") == "ok":
             label = "DEGRADED" if result.get("timing_degraded") else "PASS"
-            generation = result.get("generation_summary")
-            gen_text = ""
-            if isinstance(generation, dict) and isinstance(generation.get("tokens_per_s"), (int, float)):
-                gen_text = (
-                    f" generated_tokens=`{generation.get('output_tokens')}`, "
-                    f"gen_tok_s=`{float(generation['tokens_per_s']):.2f}`"
-                )
-                if generation.get("hit_max_count"):
-                    gen_text += f", hit_max=`{generation['hit_max_count']}`"
+            gen_text = _format_generation_summary(result.get("generation_summary"))
             degraded_text = ""
             if result.get("degradation_reason"):
                 degraded_text = f" degradation=`{result['degradation_reason']}`"
