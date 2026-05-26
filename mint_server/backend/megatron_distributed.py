@@ -2043,6 +2043,17 @@ class MegatronRankWorker:
         if self._current_session_id == session_id:
             return True
         return session_id in self._session_hot_cache
+
+    def rank_liveness_probe(self) -> dict:
+        """Cheap rank-local liveness check used by the detached worker group."""
+        return {
+            "ok": True,
+            "rank": int(self.rank),
+            "world_size": int(self.world_size),
+            "current_session_id": self._current_session_id,
+            "base_model": self.base_model,
+        }
+
     def mark_session_loaded(self, session_id: str, actual_rank: int | None = None) -> None:
         """Record that a checkpoint-loaded session is now active on this rank."""
         self._drop_hot_session(session_id)
@@ -9546,6 +9557,137 @@ class MegatronWorkerGroup:
             "cold_sessions": cold_session_ids,
         }
 
+    def _get_rank_worker_health_diagnostics(self, timeout_s: float = 5.0) -> dict:
+        expected_workers = int(getattr(self.config, "world_size", len(self.workers)) or len(self.workers))
+        actual_workers = len(self.workers)
+        if actual_workers == 0:
+            return {
+                "healthy": False,
+                "expected_workers": expected_workers,
+                "actual_workers": actual_workers,
+                "responded_workers": 0,
+                "reason": "no_workers",
+            }
+        if actual_workers != expected_workers:
+            return {
+                "healthy": False,
+                "expected_workers": expected_workers,
+                "actual_workers": actual_workers,
+                "responded_workers": 0,
+                "reason": "worker_count_mismatch",
+            }
+
+        refs: list[object] = []
+        for worker in self.workers:
+            probe = getattr(worker, "rank_liveness_probe", None)
+            remote = getattr(probe, "remote", None)
+            if not callable(remote):
+                return {
+                    "healthy": None,
+                    "expected_workers": expected_workers,
+                    "actual_workers": actual_workers,
+                    "responded_workers": 0,
+                    "reason": "probe_method_unavailable",
+                }
+            try:
+                refs.append(remote())
+            except Exception as e:
+                if not isinstance(e, ray.exceptions.RayActorError):
+                    logger.warning(
+                        "[MegatronWorkerGroup] Rank liveness probe submission was inconclusive: %s: %s",
+                        type(e).__name__,
+                        e,
+                    )
+                    return {
+                        "healthy": None,
+                        "expected_workers": expected_workers,
+                        "actual_workers": actual_workers,
+                        "responded_workers": 0,
+                        "reason": "rank_probe_submit_inconclusive",
+                        "error_type": type(e).__name__,
+                        "error": str(e),
+                    }
+                logger.warning(
+                    "[MegatronWorkerGroup] Rank liveness probe submission failed: %s: %s",
+                    type(e).__name__,
+                    e,
+                )
+                return {
+                    "healthy": False,
+                    "expected_workers": expected_workers,
+                    "actual_workers": actual_workers,
+                    "responded_workers": 0,
+                    "reason": "rank_probe_submit_failed",
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                }
+
+        try:
+            responses = ray.get(refs, timeout=timeout_s)
+        except ray.exceptions.GetTimeoutError as e:
+            logger.warning(
+                "[MegatronWorkerGroup] Rank liveness probe timed out; treating health as unknown: %s",
+                e,
+            )
+            return {
+                "healthy": None,
+                "expected_workers": expected_workers,
+                "actual_workers": actual_workers,
+                "responded_workers": 0,
+                "reason": "rank_probe_timeout",
+                "error_type": type(e).__name__,
+                "error": str(e),
+            }
+        except ray.exceptions.RayActorError as e:
+            logger.warning(
+                "[MegatronWorkerGroup] Rank liveness probe failed: %s: %s",
+                type(e).__name__,
+                e,
+            )
+            return {
+                "healthy": False,
+                "expected_workers": expected_workers,
+                "actual_workers": actual_workers,
+                "responded_workers": 0,
+                "reason": "rank_probe_actor_failed",
+                "error_type": type(e).__name__,
+                "error": str(e),
+            }
+        except Exception as e:
+            logger.warning(
+                "[MegatronWorkerGroup] Rank liveness probe was inconclusive: %s: %s",
+                type(e).__name__,
+                e,
+            )
+            return {
+                "healthy": None,
+                "expected_workers": expected_workers,
+                "actual_workers": actual_workers,
+                "responded_workers": 0,
+                "reason": "rank_probe_inconclusive",
+                "error_type": type(e).__name__,
+                "error": str(e),
+            }
+
+        healthy_responses = [
+            response
+            for response in responses
+            if isinstance(response, dict) and response.get("ok") is True
+        ]
+        healthy = len(healthy_responses) == expected_workers
+        return {
+            "healthy": healthy,
+            "expected_workers": expected_workers,
+            "actual_workers": actual_workers,
+            "responded_workers": len(healthy_responses),
+            "reason": "ok" if healthy else "rank_probe_incomplete",
+            "ranks": [
+                int(response["rank"])
+                for response in healthy_responses
+                if isinstance(response.get("rank"), int) and not isinstance(response.get("rank"), bool)
+            ],
+        }
+
     def get_diagnostics(self) -> dict:
         """Return diagnostic info about the worker group."""
         return {
@@ -9557,6 +9699,7 @@ class MegatronWorkerGroup:
             "num_workers": len(self.workers),
             "base_model": self.base_model,
             "lora_rank": self.lora_rank,
+            "rank_worker_health": self._get_rank_worker_health_diagnostics(),
             "session_cache": self._get_session_cache_diagnostics(),
             "session_cache_store": {
                 "sampled": False,
@@ -10185,6 +10328,25 @@ def get_or_create_megatron_worker_group(
                 expected_lora_rank=int(lora_rank),
             )
             raise ValueError("Actor lora_rank mismatch, will recreate")
+
+        rank_worker_health = diagnostics.get("rank_worker_health") if isinstance(diagnostics, dict) else None
+        if isinstance(rank_worker_health, dict) and rank_worker_health.get("healthy") is False:
+            logger.warning(
+                "Megatron actor %s has unhealthy rank workers; recreating: %s",
+                actor_name,
+                rank_worker_health,
+            )
+            ray_kill.kill(
+                actor,
+                reason="megatron_actor_rank_workers_unhealthy",
+                actor_name=actor_name,
+                namespace=PERSISTENT_NAMESPACE,
+                no_restart=True,
+                verify_absent=True,
+                base_model=base_model,
+                rank_worker_health=rank_worker_health,
+            )
+            raise ValueError("Actor rank workers unhealthy, will recreate")
 
     if not ray.is_initialized():
         init_ray(

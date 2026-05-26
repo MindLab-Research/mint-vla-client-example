@@ -2204,6 +2204,7 @@ class VerlTrainingEngine:
         *,
         op: str,
         cause: BaseException,
+        explicit_checkpoint_path: str | None = None,
     ) -> str | None:
         if not isinstance(cause, RuntimeError) or "missing worker" not in str(cause):
             return None
@@ -2230,6 +2231,19 @@ class VerlTrainingEngine:
                 f"dirty_sibling session(s) detected on shared actor cache: {siblings}. "
                 "Reload all dirty sessions from explicit checkpoints before continuing."
             )
+        if (
+            op == "load_weights"
+            and isinstance(explicit_checkpoint_path, str)
+            and os.path.isdir(explicit_checkpoint_path)
+        ):
+            if session.model_id in dirty_sessions:
+                logger.warning(
+                    "[%s] megatron actor was missing before explicit load_weights; "
+                    "deferring same-session actor-only marker cleanup until checkpoint load succeeds: %s",
+                    session.model_id,
+                    explicit_checkpoint_path,
+                )
+            return None
         if session.model_id in dirty_sessions:
             return (
                 f"[{session.model_id}] megatron actor was missing before op={op}, and this session has "
@@ -2260,13 +2274,22 @@ class VerlTrainingEngine:
         op: str,
         cause: BaseException,
         request_started: bool = False,
+        explicit_checkpoint_path: str | None = None,
     ) -> ray.actor.ActorHandle:
         actor_name = self._actor_name_for_session(session)
         lost_session_ids: list[str] = []
         if actor_name is not None:
             lost_session_ids = sorted(self._actor_volatile_sessions.get(actor_name, set()))
 
-        if session.backend == "megatron" and lost_session_ids:
+        explicit_same_session_reload = (
+            session.backend == "megatron"
+            and op == "load_weights"
+            and not request_started
+            and lost_session_ids == [session.model_id]
+            and isinstance(explicit_checkpoint_path, str)
+            and os.path.isdir(explicit_checkpoint_path)
+        )
+        if session.backend == "megatron" and lost_session_ids and not explicit_same_session_reload:
             joined = ", ".join(lost_session_ids)
             err = (
                 f"[{session.model_id}] megatron actor recycle detected after op={op}, but "
@@ -2281,11 +2304,20 @@ class VerlTrainingEngine:
                 self._actor_volatile_sessions.pop(actor_name, None)
             raise RuntimeError(err) from cause
 
+        if explicit_same_session_reload and actor_name:
+            logger.warning(
+                "[%s] megatron actor recycle before explicit load_weights; "
+                "deferring same-session volatile marker cleanup until checkpoint load succeeds: %s",
+                session.model_id,
+                explicit_checkpoint_path,
+            )
+
         if session.backend == "megatron":
             missing_actor_error = self._megatron_missing_actor_recovery_error(
                 session,
                 op=op,
                 cause=cause,
+                explicit_checkpoint_path=explicit_checkpoint_path,
             )
             if missing_actor_error is not None:
                 self._poisoned_sessions[session.model_id] = missing_actor_error
@@ -2306,7 +2338,7 @@ class VerlTrainingEngine:
                     self._actor_volatile_sessions.pop(actor_name, None)
                 raise RuntimeError(err) from cause
             worker = await self._recycle_megatron_actor(session, op=op, cause=cause)
-            if actor_name:
+            if actor_name and not explicit_same_session_reload:
                 self._actor_loaded_sessions.pop(actor_name, None)
                 self._actor_volatile_sessions.pop(actor_name, None)
             return worker
@@ -2618,6 +2650,7 @@ class VerlTrainingEngine:
         interval_s: float = 30.0,
         timeout_s: float | None = None,
         allow_recover: bool = False,
+        explicit_checkpoint_path: str | None = None,
     ):
         self._raise_if_session_poisoned(session, op=op)
         try:
@@ -2625,7 +2658,12 @@ class VerlTrainingEngine:
         except RuntimeError as e:
             if "missing worker" not in str(e):
                 raise
-            worker = await self._recycle_worker_after_failure(session, op=op, cause=e)
+            worker = await self._recycle_worker_after_failure(
+                session,
+                op=op,
+                cause=e,
+                explicit_checkpoint_path=explicit_checkpoint_path,
+            )
 
         self._touch_actor(session)
         await self._log_worker_request_context(
@@ -2668,6 +2706,7 @@ class VerlTrainingEngine:
                     op=op,
                     cause=e,
                     request_started=True,
+                    explicit_checkpoint_path=explicit_checkpoint_path,
                 )
                 await self._log_worker_request_context(
                     session,
@@ -4727,7 +4766,12 @@ class VerlTrainingEngine:
         except RuntimeError as e:
             if "missing worker" not in str(e):
                 raise
-            worker = await self._recycle_worker_after_failure(session, op="load_weights", cause=e)
+            worker = await self._recycle_worker_after_failure(
+                session,
+                op="load_weights",
+                cause=e,
+                explicit_checkpoint_path=load_path,
+            )
 
         if session.backend == "megatron":
             ready_timeout_s = (
@@ -4749,7 +4793,12 @@ class VerlTrainingEngine:
                     if not self._is_dead_actor_error(e) or ready_attempts >= 1:
                         raise
                     ready_attempts += 1
-                    worker = await self._recycle_worker_after_failure(session, op="load_weights", cause=e)
+                    worker = await self._recycle_worker_after_failure(
+                        session,
+                        op="load_weights",
+                        cause=e,
+                        explicit_checkpoint_path=load_path,
+                    )
 
         default_timeout_s = 1800.0 if session.backend == "megatron" else 120.0
         load_timeout_s = float(os.environ.get("MINT_LOAD_CHECKPOINT_TIMEOUT_S", str(default_timeout_s)))
@@ -4776,6 +4825,7 @@ class VerlTrainingEngine:
             interval_s=30.0,
             timeout_s=load_timeout_s,
             allow_recover=(session.backend == "peft"),
+            explicit_checkpoint_path=load_path,
         )
 
         if session.backend == "megatron":

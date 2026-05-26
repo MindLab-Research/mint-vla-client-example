@@ -103,8 +103,9 @@ def test_issue_193_megatron_load_weights_recovers_when_ready_probe_actor_dies(mo
             raise ray.exceptions.ActorDiedError()
         return {"status": "ok"}
 
-    async def fake_recycle(recycle_session, *, op, cause):
+    async def fake_recycle(recycle_session, *, op, cause, explicit_checkpoint_path=None):
         assert recycle_session is session
+        assert explicit_checkpoint_path == "/tmp/issue_193_megatron_ready_recycle"
         recycle_calls.append((op, type(cause).__name__))
         engine._workers[model_id] = recovered_worker
         return recovered_worker
@@ -323,6 +324,95 @@ def test_issue_193_megatron_recycle_fails_loud_when_live_state_was_only_in_memor
     assert keepalive_calls == [dead_worker]
     assert recycle_calls == []
     assert "Reload the lost session from a checkpoint before continuing." in engine._poisoned_sessions[model_id]
+
+
+def test_issue_651_explicit_load_recycle_defers_same_session_volatile_cleanup(monkeypatch, tmp_path):
+    engine = VerlTrainingEngine()
+    model_id = "model_issue_651_megatron_explicit_load_dirty"
+    actor_name = "shared-megatron-actor"
+    checkpoint_path = tmp_path / "checkpoint"
+    checkpoint_path.mkdir()
+    recovered_worker = object()
+    engine._model_actor_supervisor_actor_names[model_id] = actor_name
+    engine._actor_loaded_sessions[actor_name] = model_id
+    engine._actor_volatile_sessions[actor_name] = {model_id}
+
+    session = TrainingSession(
+        model_id=model_id,
+        session_id="session_issue_651_megatron_explicit_load_dirty",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        backend="megatron",
+    )
+
+    async def fake_recycle(recycle_session, *, op, cause, allow_create=True):
+        assert recycle_session is session
+        assert op == "load_weights"
+        assert allow_create is True
+        return recovered_worker
+
+    class _CleanSessionManager:
+        def list_actor_only_state_sessions(self, actor_name_arg):
+            assert actor_name_arg == actor_name
+            return []
+
+    monkeypatch.setattr(engine, "_recycle_megatron_actor", fake_recycle)
+    monkeypatch.setattr(
+        "mint_server.backend.megatron_distributed.MegatronSessionStateManager",
+        _CleanSessionManager,
+    )
+
+    result = asyncio.run(
+        engine._recycle_worker_after_failure(
+            session,
+            op="load_weights",
+            cause=RuntimeError(f"[{model_id}] missing worker for backend=megatron"),
+            explicit_checkpoint_path=str(checkpoint_path),
+        )
+    )
+
+    assert result is recovered_worker
+    assert engine._actor_loaded_sessions[actor_name] == model_id
+    assert engine._actor_volatile_sessions[actor_name] == {model_id}
+    assert model_id not in engine._poisoned_sessions
+
+
+def test_issue_651_explicit_load_recycle_still_fails_after_request_started(monkeypatch, tmp_path):
+    engine = VerlTrainingEngine()
+    model_id = "model_issue_651_megatron_explicit_load_started_dirty"
+    actor_name = "shared-megatron-actor"
+    checkpoint_path = tmp_path / "checkpoint"
+    checkpoint_path.mkdir()
+    engine._model_actor_supervisor_actor_names[model_id] = actor_name
+    engine._actor_loaded_sessions[actor_name] = model_id
+    engine._actor_volatile_sessions[actor_name] = {model_id}
+
+    session = TrainingSession(
+        model_id=model_id,
+        session_id="session_issue_651_megatron_explicit_load_started_dirty",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        backend="megatron",
+    )
+
+    async def fake_recycle(*_args, **_kwargs):
+        raise AssertionError("request-started actor death must fail before recycle")
+
+    monkeypatch.setattr(engine, "_recycle_megatron_actor", fake_recycle)
+
+    async def _run():
+        await engine._recycle_worker_after_failure(
+            session,
+            op="load_weights",
+            cause=ray.exceptions.ActorDiedError(),
+            request_started=True,
+            explicit_checkpoint_path=str(checkpoint_path),
+        )
+
+    with pytest.raises(RuntimeError, match="live in-memory state that was never persisted"):
+        asyncio.run(_run())
+
+    assert model_id in engine._poisoned_sessions
 
 
 def test_issue_193_megatron_recycle_retries_when_no_live_state_was_lost(monkeypatch):
@@ -1020,6 +1110,91 @@ def test_issue_193_megatron_missing_actor_with_persisted_dirty_marker_fails_clos
     assert model_id in engine._poisoned_sessions
 
 
+def test_issue_651_explicit_load_defers_same_session_actor_only_marker_cleanup(monkeypatch, tmp_path):
+    engine = VerlTrainingEngine()
+    model_id = "model_issue_651_explicit_load_defers_self_dirty"
+    actor_name = "shared-megatron-actor"
+    checkpoint_path = tmp_path / "checkpoint"
+    checkpoint_path.mkdir()
+    session = TrainingSession(
+        model_id=model_id,
+        session_id="session_issue_651_explicit_load_defers_self_dirty",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        backend="megatron",
+    )
+    engine._model_actor_supervisor_actor_names[model_id] = actor_name
+
+    class _DirtySelfSessionManager:
+        def list_actor_only_state_sessions(self, actor_name_arg):
+            assert actor_name_arg == actor_name
+            return [model_id]
+
+        def clear_actor_only_state(self, session_id):
+            raise AssertionError("marker cleanup must wait until checkpoint load succeeds")
+
+        def clear_persisted_actor_only_state(self, session_id):
+            raise AssertionError("marker cleanup must wait until checkpoint load succeeds")
+
+        def session_exists(self, session_id):
+            raise AssertionError("explicit checkpoint reload should not require an existing session cache")
+
+    monkeypatch.setattr(
+        "mint_server.backend.megatron_distributed.MegatronSessionStateManager",
+        _DirtySelfSessionManager,
+    )
+
+    error = engine._megatron_missing_actor_recovery_error(
+        session,
+        op="load_weights",
+        cause=RuntimeError(f"[{model_id}] missing worker for backend=megatron"),
+        explicit_checkpoint_path=str(checkpoint_path),
+    )
+
+    assert error is None
+
+
+def test_issue_651_explicit_load_preserves_dirty_sibling_fail_closed(monkeypatch, tmp_path):
+    engine = VerlTrainingEngine()
+    model_id = "model_issue_651_explicit_load_dirty_sibling"
+    sibling_id = "model_issue_651_other_dirty_session"
+    checkpoint_path = tmp_path / "checkpoint"
+    checkpoint_path.mkdir()
+    session = TrainingSession(
+        model_id=model_id,
+        session_id="session_issue_651_explicit_load_dirty_sibling",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        backend="megatron",
+    )
+
+    class _DirtySiblingSessionManager:
+        def list_actor_only_state_sessions(self, actor_name):
+            return [model_id, sibling_id]
+
+        def clear_actor_only_state(self, session_id):
+            raise AssertionError("dirty sibling must fail closed before clearing actor-only state")
+
+        def clear_persisted_actor_only_state(self, session_id):
+            raise AssertionError("dirty sibling must fail closed before clearing actor-only state")
+
+    monkeypatch.setattr(
+        "mint_server.backend.megatron_distributed.MegatronSessionStateManager",
+        _DirtySiblingSessionManager,
+    )
+
+    error = engine._megatron_missing_actor_recovery_error(
+        session,
+        op="load_weights",
+        cause=RuntimeError(f"[{model_id}] missing worker for backend=megatron"),
+        explicit_checkpoint_path=str(checkpoint_path),
+    )
+
+    assert error is not None
+    assert "dirty_sibling" in error
+    assert sibling_id in error
+
+
 def test_issue_193_megatron_missing_actor_with_dirty_sibling_fails_closed(monkeypatch):
     engine = VerlTrainingEngine()
     monkeypatch.setattr(engine, "_resolve_hf_model_path", lambda requested_model: f"/resolved/{requested_model}")
@@ -1072,3 +1247,60 @@ def test_issue_193_megatron_missing_actor_with_dirty_sibling_fails_closed(monkey
         asyncio.run(_run())
 
     assert model_id in engine._poisoned_sessions
+
+
+class _Issue651ProbeRemoteMethod:
+    def __init__(self, ref):
+        self.ref = ref
+
+    def remote(self):
+        return self.ref
+
+
+class _Issue651ProbeWorker:
+    def __init__(self, ref):
+        self.rank_liveness_probe = _Issue651ProbeRemoteMethod(ref)
+
+
+def _issue651_worker_group_for_rank_health(world_size=2, refs=None):
+    group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
+    group = group_cls.__new__(group_cls)
+    group.config = SimpleNamespace(world_size=world_size)
+    group.workers = [_Issue651ProbeWorker(ref) for ref in (refs or range(world_size))]
+    return group
+
+
+def test_issue_651_rank_worker_health_reports_healthy(monkeypatch):
+    group = _issue651_worker_group_for_rank_health(refs=["rank-0", "rank-1"])
+
+    def fake_get(refs, timeout=None):
+        assert refs == ["rank-0", "rank-1"]
+        assert timeout == 5.0
+        return [
+            {"ok": True, "rank": 0, "world_size": 2},
+            {"ok": True, "rank": 1, "world_size": 2},
+        ]
+
+    monkeypatch.setattr(ray, "get", fake_get)
+
+    health = group._get_rank_worker_health_diagnostics()
+
+    assert health["healthy"] is True
+    assert health["responded_workers"] == 2
+    assert health["ranks"] == [0, 1]
+
+
+def test_issue_651_rank_worker_health_treats_timeout_as_unknown(monkeypatch):
+    group = _issue651_worker_group_for_rank_health(refs=["rank-0", "rank-1"])
+
+    def fake_get(refs, timeout=None):
+        raise ray.exceptions.GetTimeoutError("rank worker probe timed out")
+
+    monkeypatch.setattr(ray, "get", fake_get)
+
+    health = group._get_rank_worker_health_diagnostics()
+
+    assert health["healthy"] is None
+    assert health["reason"] == "rank_probe_timeout"
+    assert health["error_type"] == "GetTimeoutError"
+    assert "rank worker probe timed out" in health["error"]
