@@ -317,7 +317,9 @@ def _training_model_work_domain_key(*, backend: str, base_model: str, model_id: 
     backend_value = str(backend or "").strip()
     base = str(base_model or "").strip()
     if backend_value in {"bumblebee", "megatron"} and base:
-        return f"{backend_value}:{_normalize_megatron_scheduler_domain_key(base)}"
+        from ..backend.model_actor_supervisor import domain_key_for_training_base_model
+
+        return domain_key_for_training_base_model(base, backend=backend_value)
     if base:
         return f"training:{base}"
     return f"training_session:{model_id}"
@@ -1545,7 +1547,10 @@ def _build_training_scheduler_extra(
     openpi_train_step = training_op == "train_step" and backend in {"openpi_fast", "openpi_pi05"}
     if openpi_train_step:
         enabled = True
-    domain_key = domain_key_for_training_base_model(base_model) if base_model else f"training_session:{model_id}"
+    if backend in {"bumblebee", "megatron"} and base_model:
+        domain_key = domain_key_for_training_base_model(base_model, backend=backend)
+    else:
+        domain_key = domain_key_for_training_base_model(base_model) if base_model else f"training_session:{model_id}"
     extra: dict[str, Any] = {
         "scheduler_enabled": bool(enabled),
         "scheduler_domain": domain_key,

@@ -43,3 +43,21 @@ def test_non_openpi_train_step_scheduler_extra_follows_global_toggle(monkeypatch
     assert extra["scheduler_enabled"] is False
     assert "scheduler_fairness" not in extra
     assert "scheduler_max_consecutive" not in extra
+
+
+def test_moe_train_step_scheduler_extra_uses_session_backend_domain(monkeypatch):
+    monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "1")
+    session = SimpleNamespace(
+        backend="bumblebee",
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+    )
+
+    extra = _build_training_scheduler_extra(
+        session=session,
+        model_id="model-3",
+        training_op="forward_backward",
+    )
+
+    assert extra["scheduler_enabled"] is True
+    assert extra["scheduler_domain"] == "bumblebee:mint_megatron_qwen3_30b_a3b_instruct_2507"
+    assert extra["scheduler_session_key"] == "model-3"

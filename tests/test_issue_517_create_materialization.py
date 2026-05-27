@@ -196,7 +196,12 @@ async def test_issue_517_forward_backward_materializes_unmaterialized_session_on
     assert session.actor_name == "actor-517"
 
 
-def test_issue_517_build_create_scheduler_extra_uses_control_plane_lane_only_for_plain_create() -> None:
+def test_issue_517_build_create_scheduler_extra_uses_control_plane_lane_only_for_plain_create(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MINT_QWEN3_235B_TRAINING_BACKEND", raising=False)
+    monkeypatch.delenv("MINT_MOE_TRAINING_BACKEND", raising=False)
+
     extra_create = training_route._build_create_scheduler_extra(
         base_model="Qwen/Qwen3-235B-A22B-Instruct-2507",
         model_id="run-517",
@@ -208,8 +213,8 @@ def test_issue_517_build_create_scheduler_extra_uses_control_plane_lane_only_for
         training_op="create_model_from_state",
     )
 
-    assert extra_create["scheduler_domain"] == "megatron:mint_megatron_qwen3_235b_a22b_instruct_2507"
-    assert extra_restore["scheduler_domain"] == "megatron:mint_megatron_qwen3_235b_a22b_instruct_2507"
+    assert extra_create["scheduler_domain"] == "bumblebee:mint_megatron_qwen3_235b_a22b_instruct_2507"
+    assert extra_restore["scheduler_domain"] == "bumblebee:mint_megatron_qwen3_235b_a22b_instruct_2507"
 
 
 @pytest.mark.anyio

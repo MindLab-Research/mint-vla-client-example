@@ -682,7 +682,7 @@ async def test_issue_281_public_healthz_ignores_timeout_observation(monkeypatch)
             return {"ok": True}
 
     monkeypatch.setattr(mws, "model_work_scheduler", _Ping())
-    monkeypatch.setattr(tss, "task_state_store", _Ping())
+    monkeypatch.setattr(tss, "task_futures", _Ping())
 
     payload = await service.healthz()
     assert payload["status"] == "ready"
@@ -707,7 +707,7 @@ async def test_issue_281_public_healthz_ignores_pending_pg_observation(monkeypat
             return {"ok": True}
 
     monkeypatch.setattr(mws, "model_work_scheduler", _Ping())
-    monkeypatch.setattr(tss, "task_state_store", _Ping())
+    monkeypatch.setattr(tss, "task_futures", _Ping())
 
     payload = await service.healthz()
     assert payload["status"] == "ready"
