@@ -4,6 +4,7 @@ from types import MethodType, SimpleNamespace
 
 import torch
 
+from mint_server.checkpoints import checkpoint_has_optimizer_state, validate_checkpoint_dir
 from mint_server.backend.verl_training import (
     VerlTrainingEngine,
     _select_moe_training_backend,
@@ -114,6 +115,15 @@ def _make_rank_worker_for_checkpoint_test():
     worker._ensure_session_loaded = MethodType(lambda self, session_id, actual_rank: {}, worker)
     worker._require_runtime = MethodType(lambda self: (runtime, handle), worker)
     worker._reset_optimizer_state = MethodType(lambda self: None, worker)
+
+    def fake_save_lora_adapter_artifacts(self, save_path, *, session_id, actual_rank, checkpoint_type):
+        del session_id, actual_rank, checkpoint_type
+        from safetensors.torch import save_file
+
+        save_file({"layer.lora_a": torch.tensor([1.0])}, f"{save_path}/adapter_model.safetensors")
+        return {"adapter_model": f"{save_path}/adapter_model.safetensors"}
+
+    worker._save_lora_adapter_artifacts = MethodType(fake_save_lora_adapter_artifacts, worker)
     return worker, runtime
 
 
@@ -246,6 +256,9 @@ def test_bumblebee_checkpoint_save_writes_optimizer_backed_train_state(tmp_path)
     assert payload["rng_state"] is not None
     assert meta["optimizer_restored"] is True
     assert (tmp_path / BUMBLEBEE_TRAIN_STATE_META_FILE).exists()
+    assert (tmp_path / "adapter_model.safetensors").exists()
+    assert checkpoint_has_optimizer_state(str(tmp_path)) is True
+    validate_checkpoint_dir(str(tmp_path), checkpoint_type="training")
 
 
 def test_bumblebee_checkpoint_load_restores_training_state(tmp_path):

@@ -251,10 +251,20 @@ def checkpoint_has_openpi_training_state(path: str) -> bool:
 
 
 def checkpoint_has_optimizer_state(path: str) -> bool:
+    bumblebee_meta_path = os.path.join(path, "training_meta.json")
+    bumblebee_rank_states = glob.glob(os.path.join(path, "rank_*", "adapter_train_state.pt"))
+    bumblebee_has_optimizer = False
+    if bumblebee_rank_states and os.path.exists(bumblebee_meta_path):
+        try:
+            with open(bumblebee_meta_path, encoding="utf-8") as f:
+                bumblebee_has_optimizer = bool(json.load(f).get("has_optimizer"))
+        except Exception:
+            bumblebee_has_optimizer = False
     return (
         os.path.exists(os.path.join(path, "optimizer.pt"))
         or bool(glob.glob(os.path.join(path, "*_optimizer.pt")))
         or bool(glob.glob(os.path.join(path, "*", "train_state", "_METADATA")))
+        or bumblebee_has_optimizer
     )
 
 

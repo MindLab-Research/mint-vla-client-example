@@ -1029,6 +1029,39 @@ class BumblebeeRankWorker:
         )
         return meta
 
+    def _save_lora_adapter_artifacts(
+        self,
+        save_path: str,
+        *,
+        session_id: str,
+        actual_rank: int | None,
+        checkpoint_type: str,
+    ) -> dict[str, Any]:
+        _, handle = self._require_runtime()
+        from bumblebee.model.qwen3_moe.lite.lora_adapter import save_lora_adapter
+
+        logical_rank = int(actual_rank if actual_rank is not None else self.lora_rank)
+        chunks = handle._extras.get("model_chunks", [handle._model])
+        return save_lora_adapter(
+            chunks,
+            handle._extras["model_cfg"],
+            handle._parallel_state,
+            save_path,
+            base_model_name_or_path=self.base_model,
+            lora_config={
+                "rank": logical_rank,
+                "max_rank": int(self.lora_rank),
+                "alpha": int(_env_int("MINT_BUMBLEBEE_LORA_ALPHA", self.lora_rank * 2)),
+                "target_modules": ["linear_qkv", "linear_proj", "linear_fc1", "linear_fc2"],
+            },
+            metadata={
+                "backend": "bumblebee",
+                "checkpoint_type": checkpoint_type,
+                "session_id": session_id,
+                "rank": self.rank,
+            },
+        )
+
     def save_training_state(
         self,
         save_path: str,
@@ -1100,6 +1133,14 @@ class BumblebeeRankWorker:
                 json.dumps(meta, indent=2, sort_keys=True) + "\n",
                 encoding="utf-8",
             )
+        adapter_meta = self._save_lora_adapter_artifacts(
+            str(root),
+            session_id=session_id,
+            actual_rank=actual_rank,
+            checkpoint_type="training",
+        )
+        if adapter_meta:
+            meta.update(adapter_meta)
         return meta
 
     def load_checkpoint(
