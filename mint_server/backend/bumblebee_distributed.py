@@ -1178,6 +1178,23 @@ class BumblebeeWorkerGroup:
             "pid": os.getpid(),
         }
 
+    def get_tokenizer_info(self) -> dict[str, Any]:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(self.base_model, trust_remote_code=True, local_files_only=True)
+        return {
+            "vocab_size": len(tokenizer),
+            "model_max_length": getattr(tokenizer, "model_max_length", None),
+            "pad_token": getattr(tokenizer, "pad_token", None),
+            "pad_token_id": getattr(tokenizer, "pad_token_id", None),
+            "eos_token": getattr(tokenizer, "eos_token", None),
+            "eos_token_id": getattr(tokenizer, "eos_token_id", None),
+            "bos_token": getattr(tokenizer, "bos_token", None),
+            "bos_token_id": getattr(tokenizer, "bos_token_id", None),
+            "unk_token": getattr(tokenizer, "unk_token", None),
+            "unk_token_id": getattr(tokenizer, "unk_token_id", None),
+        }
+
     def _initialize(self) -> None:
         world_size = int(self.config.world_size)
         bundles: list[dict[str, float | int]] = [{"GPU": 1, "CPU": 1} for _ in range(world_size)]
