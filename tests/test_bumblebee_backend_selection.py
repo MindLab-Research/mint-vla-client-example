@@ -13,6 +13,7 @@ from mint_server.backend.bumblebee_distributed import (
     BUMBLEBEE_TRAIN_STATE_FILE,
     BUMBLEBEE_TRAIN_STATE_META_FILE,
     BumblebeeRankWorker,
+    BumblebeeWorkerGroup,
     BumblebeeSessionMeta,
     _bumblebee_runtime_etp,
     _coerce_int,
@@ -200,6 +201,29 @@ def test_bumblebee_forward_result_actor_logprobs_are_mutated_to_flat_layout():
 
     assert result.model_output.log_probs.shape == (3,)
     assert torch.equal(result.model_output.log_probs, torch.tensor([9.0, 8.0, 7.0]))
+
+
+def test_bumblebee_worker_group_merges_only_numeric_tinker_metrics():
+    group_cls = BumblebeeWorkerGroup.__ray_actor_class__
+    group = object.__new__(group_cls)
+    group.config = SimpleNamespace(world_size=4)
+
+    payload = group._merge_rank_payloads(
+        [
+            {
+                "loss_fn_outputs": [],
+                "metrics": {
+                    "loss": 1.25,
+                    "rank": 0,
+                    "backend": "bumblebee",
+                    "session_state": "restored",
+                    "rank_metrics": [{"loss": 1.25}],
+                },
+            }
+        ]
+    )
+
+    assert payload["metrics"] == {"loss": 1.25, "rank": 0, "world_size": 4}
 
 
 def test_bumblebee_checkpoint_save_writes_optimizer_backed_train_state(tmp_path):

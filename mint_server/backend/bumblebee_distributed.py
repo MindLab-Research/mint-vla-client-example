@@ -1631,11 +1631,12 @@ class BumblebeeWorkerGroup:
     def _merge_rank_payloads(self, results: list[Any]) -> dict[str, Any]:
         primary = next((item for item in results if isinstance(item, dict)), {})
         payload = dict(primary)
-        metrics = dict(payload.get("metrics") or {})
-        rank_metrics = [dict(item.get("metrics") or {}) for item in results if isinstance(item, dict)]
-        metrics["backend"] = "bumblebee"
+        metrics = {
+            key: value
+            for key, value in dict(payload.get("metrics") or {}).items()
+            if isinstance(value, int | float) and not isinstance(value, bool)
+        }
         metrics["world_size"] = int(self.config.world_size)
-        metrics["rank_metrics"] = rank_metrics
         payload["metrics"] = metrics
         return payload
 
