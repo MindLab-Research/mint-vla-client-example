@@ -597,10 +597,41 @@ class BumblebeeRankWorker:
         if isinstance(batch, RLPackedActorBatch):
             if int(getattr(ps, "cp_size", 1)) != 1:
                 raise NotImplementedError("Bumblebee MinT RL actor payloads are not wired for CP>1 yet")
-            runtime_batch["rollout_logprobs"] = batch.rollout_logprobs.reshape_as(thd.loss_mask)
-            runtime_batch["advantages"] = batch.advantages.reshape_as(thd.loss_mask)
+            runtime_batch["rollout_logprobs"] = self._pad_flat_actor_tensor_to_thd(
+                batch.rollout_logprobs,
+                batch=batch,
+                thd=thd,
+                name="rollout_logprobs",
+            )
+            runtime_batch["advantages"] = self._pad_flat_actor_tensor_to_thd(
+                batch.advantages,
+                batch=batch,
+                thd=thd,
+                name="advantages",
+            )
             runtime_batch["return_log_probs"] = True
         return runtime_batch
+
+    def _pad_flat_actor_tensor_to_thd(self, tensor: Any, *, batch: Any, thd: Any, name: str) -> Any:
+        if thd.loss_mask is None:
+            raise ValueError(f"{name} cannot be aligned without THD loss_mask")
+        if tuple(getattr(tensor, "shape", ())) == tuple(thd.loss_mask.shape):
+            return tensor
+        flat = tensor.reshape(-1)
+        seq_lens = [int(value) for value in batch.sizes().tolist()]
+        total_tokens = sum(seq_lens)
+        if int(flat.numel()) != total_tokens:
+            raise ValueError(f"{name} numel {flat.numel()} != batch total_tokens {total_tokens}")
+        packed_params = thd.packed_seq_params
+        cu_padded = packed_params.cu_seqlens_q_padded.tolist()
+        out = flat.new_zeros(thd.loss_mask.shape)
+        out_flat = out.reshape(-1)
+        src_offset = 0
+        for idx, seq_len in enumerate(seq_lens):
+            dst_start = int(cu_padded[idx])
+            out_flat[dst_start : dst_start + seq_len] = flat[src_offset : src_offset + seq_len]
+            src_offset += seq_len
+        return out
 
     def _ensure_session_loaded(self, session_id: str, actual_rank: int | None) -> dict[str, Any]:
         rt, handle = self._require_runtime()
