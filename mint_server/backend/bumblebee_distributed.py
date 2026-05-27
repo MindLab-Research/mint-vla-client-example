@@ -1158,6 +1158,115 @@ class BumblebeeRankWorker:
             actual_rank=actual_rank,
         )
 
+    def _load_megatron_peft_adapter_for_bumblebee(
+        self,
+        root: Path,
+        *,
+        session_id: str,
+        actual_rank: int | None,
+        requested_optimizer_restore: bool,
+    ) -> dict[str, Any] | None:
+        adapter_path = root / "adapter_model.safetensors"
+        adapter_config_path = root / "adapter_config.json"
+        if not adapter_path.exists() or not adapter_config_path.exists():
+            return None
+        adapter_config: dict[str, Any] = {}
+        try:
+            loaded_adapter_config = json.loads(adapter_config_path.read_text(encoding="utf-8"))
+            if isinstance(loaded_adapter_config, dict):
+                adapter_config = loaded_adapter_config
+        except Exception as e:
+            raise RuntimeError(f"Failed to read adapter_config.json for Bumblebee migration: {e}") from e
+        checkpoint_rank = adapter_config.get("r")
+        if not isinstance(checkpoint_rank, int) or isinstance(checkpoint_rank, bool) or checkpoint_rank <= 0:
+            raise RuntimeError(
+                f"Invalid adapter_config.json rank for Bumblebee migration: {checkpoint_rank!r}"
+            )
+        target_rank = int(actual_rank if actual_rank is not None else self.lora_rank)
+        if int(checkpoint_rank) != target_rank:
+            raise RuntimeError(
+                "Megatron to Bumblebee weights-only migration requires matching LoRA rank: "
+                f"checkpoint rank={checkpoint_rank}, requested rank={target_rank}"
+            )
+        try:
+            names = os.listdir(root)
+        except OSError:
+            names = []
+        has_megatron_shards = any(name.startswith("mp_rank_") and name.endswith("_adapter.pt") for name in names)
+        metadata: dict[str, Any] = {}
+        metadata_path = root / "metadata.json"
+        if metadata_path.exists():
+            try:
+                loaded_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                if isinstance(loaded_metadata, dict):
+                    metadata = loaded_metadata
+            except Exception:
+                logger.warning("Failed to read checkpoint metadata.json from %s", metadata_path, exc_info=True)
+        if metadata.get("backend") != "megatron" and not has_megatron_shards:
+            return None
+
+        _, handle = self._require_runtime()
+        extras = getattr(handle, "_extras", {}) or {}
+        chunks = extras.get("model_chunks")
+        if not chunks:
+            model = getattr(handle, "_model", None)
+            chunks = [model] if model is not None else []
+        if not chunks:
+            raise RuntimeError("Bumblebee runtime handle does not expose model chunks for adapter migration")
+        model_cfg = extras.get("model_cfg")
+        parallel_state = extras.get("parallel_state")
+        if model_cfg is None or parallel_state is None:
+            raise RuntimeError("Bumblebee runtime handle is missing model_cfg or parallel_state for adapter migration")
+
+        from bumblebee.model.qwen3_moe.lite.lora_adapter import load_lora_adapter
+
+        load_meta = load_lora_adapter(chunks, root, model_cfg, parallel_state, strict=True)
+        self._reset_optimizer_state()
+
+        session_meta = self._session_meta.setdefault(
+            session_id,
+            BumblebeeSessionMeta(learning_rate=float(self.learning_rate), actual_rank=actual_rank),
+        )
+        training_meta: dict[str, Any] = {}
+        training_meta_path = root / "training_meta.json"
+        if training_meta_path.exists():
+            try:
+                loaded_training_meta = json.loads(training_meta_path.read_text(encoding="utf-8"))
+                if isinstance(loaded_training_meta, dict):
+                    training_meta = loaded_training_meta
+            except Exception:
+                logger.warning(
+                    "Failed to read Megatron training_meta.json from %s during Bumblebee migration",
+                    training_meta_path,
+                    exc_info=True,
+                )
+        step = training_meta.get("current_step", metadata.get("step", metadata.get("current_step")))
+        if isinstance(step, int) and not isinstance(step, bool):
+            session_meta.step_count = step
+        lr = training_meta.get("learning_rate", metadata.get("learning_rate"))
+        if lr is not None:
+            try:
+                session_meta.learning_rate = float(lr)
+            except Exception:
+                logger.warning("Ignoring invalid migrated checkpoint learning_rate=%r", lr)
+        session_meta.actual_rank = actual_rank
+        self._current_session = session_id
+        return {
+            "backend": "bumblebee",
+            "current_step": int(session_meta.step_count),
+            "learning_rate": float(session_meta.learning_rate or self.learning_rate),
+            "actual_rank": target_rank,
+            "checkpoint_path": str(root),
+            "adapter_model_path": str(adapter_path),
+            "migration_source_backend": "megatron",
+            "migration_target_backend": "bumblebee",
+            "migration_mode": "weights_only",
+            "optimizer_restored": False,
+            "optimizer_reset": True,
+            "requested_optimizer_restore": bool(requested_optimizer_restore),
+            **dict(load_meta or {}),
+        }
+
     def load_training_state(
         self,
         load_path: str,
@@ -1173,6 +1282,14 @@ class BumblebeeRankWorker:
         root = Path(load_path).resolve()
         state_path = root / f"rank_{self.rank:05d}" / BUMBLEBEE_TRAIN_STATE_FILE
         if not state_path.exists():
+            migrated = self._load_megatron_peft_adapter_for_bumblebee(
+                root,
+                session_id=session_id,
+                actual_rank=actual_rank,
+                requested_optimizer_restore=load_optimizer,
+            )
+            if migrated is not None:
+                return migrated
             raise FileNotFoundError(
                 f"Bumblebee training checkpoint is missing rank state: {state_path}"
             )

@@ -1177,6 +1177,21 @@ def _resolve_local_tokenizer_source_path(base_model: str) -> str:
     raise RuntimeError(f"Tokenizer source is not available on this API host for base_model {candidate!r}")
 
 
+def _public_load_metadata(meta: object) -> dict[str, object] | None:
+    if not isinstance(meta, dict):
+        return None
+    allowed_keys = {
+        "migration_mode",
+        "migration_source_backend",
+        "migration_target_backend",
+        "optimizer_restored",
+        "optimizer_reset",
+        "requested_optimizer_restore",
+    }
+    public = {key: meta[key] for key in allowed_keys if key in meta}
+    return public or None
+
+
 def _tokenizer_identity_from_source_path(source_path: str) -> str:
     path = os.path.realpath(str(source_path))
     if os.path.isdir(path):
@@ -2307,13 +2322,13 @@ async def _do_create_model_from_state(
 
         async def _create_and_restore_model():
             await engine.create_training_session(session)
-            await engine.load_weights(
+            return await engine.load_weights(
                 session=session,
                 load_path=load_path,
                 load_optimizer=request.load_optimizer,
             )
 
-        await run_async_with_otel_span(
+        load_metadata = await run_async_with_otel_span(
             "training.create_model_from_state.execute",
             _create_and_restore_model,
             component="routes.training",
@@ -2375,8 +2390,9 @@ async def _do_create_model_from_state(
             request_id=request_id,
             model_id=model_id,
             type="create_model_from_state",
+            load_metadata=_public_load_metadata(load_metadata),
         )
-        await task_futures.async_resolve(request_id, response.model_dump())
+        await task_futures.async_resolve(request_id, response.model_dump(exclude_none=True))
 
     except Exception as e:
         logger.exception(

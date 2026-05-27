@@ -478,14 +478,53 @@ def _read_checkpoint_json_object(path: str, *, label: str) -> dict[str, object]:
     return payload
 
 
-def _checkpoint_can_recreate_training_client(path: str, *, backend: str, declared_type: object) -> bool:
+def _checkpoint_has_megatron_adapter_shards(path: str) -> bool:
+    try:
+        return any(name.startswith("mp_rank_") and name.endswith("_adapter.pt") for name in os.listdir(path))
+    except OSError:
+        return False
+
+
+def _checkpoint_has_peft_adapter(path: str) -> bool:
+    return os.path.isfile(os.path.join(path, "adapter_model.safetensors")) and os.path.isfile(
+        os.path.join(path, "adapter_config.json")
+    )
+
+
+def _checkpoint_declared_backend(path: str, metadata: dict[str, object]) -> str | None:
+    backend = metadata.get("backend")
+    if isinstance(backend, str) and backend:
+        return backend
+    if _checkpoint_has_megatron_adapter_shards(path):
+        return "megatron"
+    try:
+        names = os.listdir(path)
+    except OSError:
+        return None
+    if any(name.startswith("rank_") for name in names) and os.path.isfile(
+        os.path.join(path, "training_meta.json")
+    ):
+        return "bumblebee"
+    if _checkpoint_has_peft_adapter(path):
+        return "peft"
+    return None
+
+
+def _checkpoint_can_recreate_training_client(
+    path: str,
+    *,
+    backend: str,
+    declared_type: object,
+    checkpoint_backend: str | None = None,
+) -> bool:
     if backend in {"openpi_fast", "openpi_pi05"}:
         return checkpoint_has_openpi_training_state(path)
     if backend == "megatron":
-        try:
-            return any(name.startswith("mp_rank_") and name.endswith("_adapter.pt") for name in os.listdir(path))
-        except OSError:
-            return False
+        return _checkpoint_has_megatron_adapter_shards(path)
+    if backend == "bumblebee":
+        if checkpoint_backend == "megatron":
+            return declared_type == "training" and _checkpoint_has_peft_adapter(path)
+        return checkpoint_backend == "bumblebee" and checkpoint_has_optimizer_state(path)
     if backend != "peft":
         return False
     try:
@@ -545,7 +584,13 @@ async def weights_info(
         backend = _infer_training_backend_for_base_model(base_model)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
-    if not _checkpoint_can_recreate_training_client(path, backend=backend, declared_type=declared_type):
+    checkpoint_backend = _checkpoint_declared_backend(path, metadata)
+    if not _checkpoint_can_recreate_training_client(
+        path,
+        backend=backend,
+        declared_type=declared_type,
+        checkpoint_backend=checkpoint_backend,
+    ):
         raise HTTPException(
             status_code=400,
             detail=f"Checkpoint artifacts cannot recreate a {backend} training client",

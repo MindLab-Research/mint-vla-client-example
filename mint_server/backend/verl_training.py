@@ -5034,7 +5034,7 @@ class VerlTrainingEngine:
         session: TrainingSession,
         load_path: str,
         load_optimizer: bool = True,
-    ) -> None:
+    ) -> dict[str, object] | None:
         """Load checkpoint via Ray actor.
 
         Args:
@@ -5169,6 +5169,7 @@ class VerlTrainingEngine:
         self._poisoned_sessions.pop(session.model_id, None)
 
         logger.info(f"[{model_id}] load_weights: step={session.current_step}")
+        return meta if isinstance(meta, dict) else None
 
     async def shutdown_session(self, session: TrainingSession) -> None:
         """Delete actor-local session state, then release or unbind the worker."""

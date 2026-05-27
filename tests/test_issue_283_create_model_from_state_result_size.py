@@ -207,8 +207,19 @@ def test_issue_283_create_model_from_state_background_uses_resolved_path(tmp_pat
         async def create_training_session(self, session) -> None:
             return None
 
-        async def load_weights(self, *, session, load_path: str, load_optimizer: bool) -> None:
+        async def load_weights(self, *, session, load_path: str, load_optimizer: bool) -> dict:
             self.load_calls.append({"load_path": load_path, "load_optimizer": load_optimizer})
+            return {
+                "backend": "bumblebee",
+                "checkpoint_path": str(checkpoint_dir),
+                "adapter_model_path": str(checkpoint_dir / "adapter_model.safetensors"),
+                "loaded_tensors": 123,
+                "migration_source_backend": "megatron",
+                "migration_target_backend": "bumblebee",
+                "migration_mode": "weights_only",
+                "optimizer_restored": False,
+                "requested_optimizer_restore": bool(load_optimizer),
+            }
 
         async def get_tokenizer_info(self, session) -> dict:
             _ = session
@@ -266,7 +277,21 @@ def test_issue_283_create_model_from_state_background_uses_resolved_path(tmp_pat
         {"load_path": str(checkpoint_dir), "load_optimizer": True}
     ]
     assert stub_task_futures.resolved == [
-        ("req-283-bg", {"request_id": "req-283-bg", "model_id": "s283-bg_0", "type": "create_model_from_state"})
+        (
+            "req-283-bg",
+            {
+                "request_id": "req-283-bg",
+                "model_id": "s283-bg_0",
+                "type": "create_model_from_state",
+                "load_metadata": {
+                    "migration_source_backend": "megatron",
+                    "migration_target_backend": "bumblebee",
+                    "migration_mode": "weights_only",
+                    "optimizer_restored": False,
+                    "requested_optimizer_restore": True,
+                },
+            },
+        )
     ]
     assert training_store_updates[0]["model_id"] == "s283-bg_0"
     assert training_store_updates[0]["base_model"] == "Qwen/Qwen3-30B-A3B-Instruct-2507"

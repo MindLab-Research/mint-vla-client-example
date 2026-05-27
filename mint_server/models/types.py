@@ -914,6 +914,7 @@ class CreateModelFromStateResponse(BaseModel):
     request_id: str
     model_id: str
     type: Literal["create_model_from_state"] = "create_model_from_state"
+    load_metadata: dict[str, Any] | None = None
 
 
 # =============================================================================
