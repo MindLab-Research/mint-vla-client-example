@@ -1,7 +1,9 @@
+import json
 import sys
 import types
 from types import MethodType, SimpleNamespace
 
+import pytest
 import torch
 
 from mint_server.checkpoints import checkpoint_has_optimizer_state, validate_checkpoint_dir
@@ -284,6 +286,108 @@ def test_bumblebee_checkpoint_load_restores_training_state(tmp_path):
     assert flags["restore_lr_scheduler"] is True
     assert flags["restore_rng"] is True
     assert meta["optimizer_restored"] is True
+
+
+def test_issue_662_bumblebee_loads_megatron_peft_adapter_as_weights_only_migration(
+    tmp_path,
+    monkeypatch,
+):
+    worker, runtime = _make_rank_worker_for_checkpoint_test()
+    worker._session_meta = {}
+    reset_calls = []
+    worker._reset_optimizer_state = MethodType(lambda self: reset_calls.append(True), worker)
+    handle = SimpleNamespace(
+        _model=object(),
+        _extras={
+            "model_chunks": ["chunk"],
+            "model_cfg": object(),
+            "parallel_state": object(),
+        },
+    )
+    worker._require_runtime = MethodType(lambda self: (runtime, handle), worker)
+
+    (tmp_path / "metadata.json").write_text(
+        json.dumps(
+            {
+                "backend": "megatron",
+                "checkpoint_type": "training",
+                "step": 75,
+                "learning_rate": 1e-5,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "training_meta.json").write_text(
+        json.dumps(
+            {
+                "current_step": 76,
+                "learning_rate": 4e-5,
+                "actual_rank": 32,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 32}), encoding="utf-8")
+    (tmp_path / "adapter_model.safetensors").write_bytes(b"adapter")
+    (tmp_path / "mp_rank_00_adapter.pt").write_bytes(b"adapter-rank")
+    (tmp_path / "mp_rank_00_optimizer.pt").write_bytes(b"optimizer")
+
+    fake_lora_adapter = types.ModuleType("bumblebee.model.qwen3_moe.lite.lora_adapter")
+    load_calls = []
+
+    def fake_load_lora_adapter(chunks, adapter_dir, model_cfg, parallel_state, *, strict):
+        load_calls.append(
+            {
+                "chunks": chunks,
+                "adapter_dir": adapter_dir,
+                "model_cfg": model_cfg,
+                "parallel_state": parallel_state,
+                "strict": strict,
+            }
+        )
+        return {"loaded_tensors": 123}
+
+    fake_lora_adapter.load_lora_adapter = fake_load_lora_adapter
+    monkeypatch.setitem(sys.modules, "bumblebee.model.qwen3_moe.lite.lora_adapter", fake_lora_adapter)
+
+    meta = worker.load_training_state(
+        str(tmp_path),
+        load_optimizer=True,
+        session_id="session-b",
+        actual_rank=32,
+    )
+
+    assert load_calls and load_calls[0]["strict"] is True
+    assert reset_calls == [True]
+    assert runtime.loaded is None
+    assert meta["migration_source_backend"] == "megatron"
+    assert meta["migration_target_backend"] == "bumblebee"
+    assert meta["migration_mode"] == "weights_only"
+    assert meta["optimizer_restored"] is False
+    assert meta["optimizer_reset"] is True
+    assert meta["requested_optimizer_restore"] is True
+    assert meta["current_step"] == 76
+    assert meta["learning_rate"] == 4e-5
+    assert meta["loaded_tensors"] == 123
+
+
+def test_issue_662_bumblebee_rejects_megatron_adapter_rank_mismatch(tmp_path):
+    worker, _runtime = _make_rank_worker_for_checkpoint_test()
+    (tmp_path / "metadata.json").write_text(
+        json.dumps({"backend": "megatron", "checkpoint_type": "training"}),
+        encoding="utf-8",
+    )
+    (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 16}), encoding="utf-8")
+    (tmp_path / "adapter_model.safetensors").write_bytes(b"adapter")
+    (tmp_path / "mp_rank_00_adapter.pt").write_bytes(b"adapter-rank")
+
+    with pytest.raises(RuntimeError, match="requires matching LoRA rank"):
+        worker.load_training_state(
+            str(tmp_path),
+            load_optimizer=True,
+            session_id="session-b",
+            actual_rank=32,
+        )
 
 
 def test_bumblebee_sft_forward_backward_uses_masked_external_loss(monkeypatch):

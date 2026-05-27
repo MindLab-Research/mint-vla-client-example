@@ -182,7 +182,78 @@ def test_issue_417_weights_info_rejects_megatron_peft_shape_without_rank_shards(
     response = client.post("/api/v1/weights_info", json={"tinker_path": "mint://run/weights/megatron-peft"})
 
     assert response.status_code == 400, response.text
-    assert "Checkpoint artifacts cannot recreate a megatron training client" in response.text
+    assert "Checkpoint artifacts cannot recreate a bumblebee training client" in response.text
+
+
+def test_issue_662_weights_info_accepts_megatron_training_checkpoint_for_bumblebee(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from mint_server.routes import training as training_routes
+    from mint_server.routes import weights as weights_routes
+
+    ckpt = tmp_path / "megatron_to_bumblebee"
+    ckpt.mkdir()
+    (ckpt / "metadata.json").write_text(
+        json.dumps(
+            {
+                "backend": "megatron",
+                "model_name": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+                "checkpoint_type": "training",
+                "optimizer_present": True,
+                "step": 76,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (ckpt / "adapter_config.json").write_text(
+        json.dumps(
+            {
+                "r": 32,
+                "target_modules": [
+                    "q_proj",
+                    "k_proj",
+                    "v_proj",
+                    "o_proj",
+                    "gate_proj",
+                    "up_proj",
+                    "down_proj",
+                ],
+                "base_model_name_or_path": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (ckpt / "adapter_model.safetensors").write_bytes(b"adapter")
+    (ckpt / "mp_rank_00_adapter.pt").write_bytes(b"adapter-rank")
+    (ckpt / "mp_rank_00_optimizer.pt").write_bytes(b"optimizer")
+
+    monkeypatch.setattr(
+        weights_routes,
+        "_resolve_mint_path",
+        lambda mint_uri, *, user_id, is_admin=False: str(ckpt),
+    )
+    monkeypatch.setattr(
+        training_routes,
+        "_infer_training_backend_for_base_model",
+        lambda base_model: "bumblebee",
+    )
+
+    app = FastAPI()
+    app.include_router(weights_routes.router, prefix="/api/v1")
+    client = TestClient(app)
+
+    response = client.post("/api/v1/weights_info", json={"tinker_path": "mint://run/weights/000076"})
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+        "is_lora": True,
+        "lora_rank": 32,
+        "train_unembed": False,
+        "train_mlp": True,
+        "train_attn": True,
+    }
 
 
 def test_issue_417_weights_info_accepts_peft_training_adapter_checkpoint(
@@ -341,6 +412,7 @@ def test_issue_417_weights_info_accepts_optimizerless_training_adapter_checkpoin
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    from mint_server.routes import training as training_routes
     from mint_server.routes import weights as weights_routes
 
     ckpt = tmp_path / "adapter_only_training_ckpt"
@@ -378,6 +450,11 @@ def test_issue_417_weights_info_accepts_optimizerless_training_adapter_checkpoin
         weights_routes,
         "_resolve_mint_path",
         lambda mint_uri, *, user_id, is_admin=False: str(ckpt),
+    )
+    monkeypatch.setattr(
+        training_routes,
+        "_infer_training_backend_for_base_model",
+        lambda base_model: "megatron",
     )
 
     app = FastAPI()
