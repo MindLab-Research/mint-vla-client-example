@@ -214,6 +214,8 @@ def test_bumblebee_worker_group_merges_only_numeric_tinker_metrics():
                 "loss_fn_outputs": [],
                 "metrics": {
                     "loss": 1.25,
+                    "loss:mean": 1.25,
+                    "num_tokens:sum": 8,
                     "rank": 0,
                     "backend": "bumblebee",
                     "session_state": "restored",
@@ -223,7 +225,7 @@ def test_bumblebee_worker_group_merges_only_numeric_tinker_metrics():
         ]
     )
 
-    assert payload["metrics"] == {"loss": 1.25, "rank": 0, "world_size": 4}
+    assert payload["metrics"] == {"loss:mean": 1.25, "num_tokens:sum": 8}
 
 
 def test_bumblebee_checkpoint_save_writes_optimizer_backed_train_state(tmp_path):
