@@ -367,9 +367,11 @@ async def test_issue_281_compute_logprobs_enqueues_scheduler_metadata(monkeypatc
 @pytest.mark.anyio
 async def test_issue_281_do_create_model_active_duplicate_fails_without_deleting_existing(monkeypatch) -> None:
     from mint_server.models.types import CreateModelRequest, LoRAConfig
+    import mint_server.backend.training_session_store as training_session_store
     from mint_server.routes import training as tr
 
     deleted: list[str] = []
+    deleted_store: list[str] = []
     failed: dict = {}
 
     existing = SimpleNamespace(is_active=True)
@@ -393,6 +395,7 @@ async def test_issue_281_do_create_model_active_duplicate_fails_without_deleting
             async_fail=_async_fail,
         ),
     )
+    monkeypatch.setattr(training_session_store, "delete_training_session", deleted_store.append)
 
     await tr._do_create_model(
         "rid-dup",
@@ -407,6 +410,7 @@ async def test_issue_281_do_create_model_active_duplicate_fails_without_deleting
     )
 
     assert deleted == []
+    assert deleted_store == []
     assert failed["request_id"] == "rid-dup"
     assert "already exists" in failed["error"]
 
@@ -414,9 +418,11 @@ async def test_issue_281_do_create_model_active_duplicate_fails_without_deleting
 @pytest.mark.anyio
 async def test_issue_281_do_create_model_from_state_active_duplicate_fails_without_deleting_existing(monkeypatch) -> None:
     from mint_server.models.types import CreateModelFromStateRequest, LoRAConfig
+    import mint_server.backend.training_session_store as training_session_store
     from mint_server.routes import training as tr
 
     deleted: list[str] = []
+    deleted_store: list[str] = []
     failed: dict = {}
 
     existing = SimpleNamespace(is_active=True)
@@ -440,6 +446,7 @@ async def test_issue_281_do_create_model_from_state_active_duplicate_fails_witho
             async_fail=_async_fail,
         ),
     )
+    monkeypatch.setattr(training_session_store, "delete_training_session", deleted_store.append)
 
     await tr._do_create_model_from_state(
         "rid-dup2",
@@ -455,6 +462,7 @@ async def test_issue_281_do_create_model_from_state_active_duplicate_fails_witho
     )
 
     assert deleted == []
+    assert deleted_store == []
     assert failed["request_id"] == "rid-dup2"
     assert "already exists" in failed["error"]
 

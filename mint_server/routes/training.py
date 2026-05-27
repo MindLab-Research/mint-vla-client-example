@@ -1993,12 +1993,13 @@ async def _do_create_model(
             session = get_local_session(model_id) if callable(get_local_session) else training_manager.get_session(model_id)
             if session is not None:
                 training_manager.delete_session(model_id)
-        try:
-            from ..backend.training_session_store import delete_training_session
+        if session_created:
+            try:
+                from ..backend.training_session_store import delete_training_session
 
-            delete_training_session(model_id)
-        except Exception:
-            pass
+                delete_training_session(model_id)
+            except Exception:
+                pass
         try:
             from ..backend.model_actor_supervisor import get_model_actor_supervisor
 
@@ -2402,12 +2403,13 @@ async def _do_create_model_from_state(
                     )
             if session is not None:
                 training_manager.delete_session(model_id)
-        try:
-            from ..backend.training_session_store import delete_training_session
+        if session_created:
+            try:
+                from ..backend.training_session_store import delete_training_session
 
-            delete_training_session(model_id)
-        except Exception:
-            pass
+                delete_training_session(model_id)
+            except Exception:
+                pass
         await task_futures.async_fail(request_id, str(e))
     finally:
         if inflight_marked and training_manager is not None:
