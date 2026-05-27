@@ -113,7 +113,16 @@ def _bumblebee_runtime_etp(base_model: str, config: DistributedConfig) -> int | 
 
 
 def _bumblebee_repo_path() -> str:
-    return os.environ.get("MINT_BUMBLEBEE_REPO_PATH", "/root/code/bumblebee")
+    configured = os.environ.get("MINT_BUMBLEBEE_REPO_PATH")
+    if configured:
+        return configured
+    for candidate in (
+        "/vePFS-Mindverse/user/nolanho/code/bumblebee",
+        "/root/code/bumblebee",
+    ):
+        if (Path(candidate) / "bumblebee" / "__init__.py").exists():
+            return candidate
+    return "/root/code/bumblebee"
 
 
 def _ensure_bumblebee_repo_importable() -> str:
