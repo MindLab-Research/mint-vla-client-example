@@ -156,6 +156,13 @@ models:
           replica: 0
 ```
 
+For MoE training runtimes, `megatron` is a legacy topology key for distributed
+training placement. The runtime domain follows the selected MoE backend
+(`MINT_MOE_TRAINING_BACKEND` or the model-specific override), so the same
+placement can rebuild as `bumblebee:*` when Bumblebee is selected or
+`megatron:*` when rolling back. New configs may use `training` for backend
+selection, or `bumblebee` when the placement should be explicit.
+
 Equivalent normalized placement item:
 
 ```yaml

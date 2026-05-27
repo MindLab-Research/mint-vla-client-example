@@ -1511,6 +1511,74 @@ def test_issue_593_topology_specs_inherit_runtime_placement(
     ]
 
 
+def test_topology_legacy_megatron_launcher_follows_selected_moe_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    base_model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    monkeypatch.delenv("MINT_QWEN3_30B_TRAINING_BACKEND", raising=False)
+    monkeypatch.delenv("MINT_MOE_TRAINING_BACKEND", raising=False)
+    monkeypatch.setenv(
+        "MINT_TOPOLOGY_CONFIG_PATH",
+        _write_supervisor_topology(
+            tmp_path,
+            {
+                base_model: {
+                    "megatron": {
+                        "placement": [
+                            {"replica": 0, "worker_alias": "mint-worker-0", "gpu_count": 4},
+                            {"replica": 0, "worker_alias": "mint-worker-1", "gpu_count": 4},
+                        ]
+                    }
+                }
+            },
+        ),
+    )
+
+    specs = desired_specs_from_env()
+    training_specs = [spec for spec in specs if spec.base_model == base_model and spec.launcher_key == "training"]
+
+    assert training_specs == [
+        ModelActorSpec(
+            domain_key="bumblebee:mint_megatron_qwen3_30b_a3b_instruct_2507",
+            base_model=base_model,
+            launcher_key="training",
+            worker_aliases=("mint-worker-0", "mint-worker-1"),
+            placement_alias_slices=(
+                ("replica-0", "mint-worker-0", 4),
+                ("replica-0", "mint-worker-1", 4),
+            ),
+            gpu_count=4,
+        )
+    ]
+    assert training_specs[0].normalized_actor_name().startswith("mint_model_runtime_bumblebee-")
+
+
+def test_topology_legacy_megatron_launcher_can_roll_back_to_megatron_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    base_model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    monkeypatch.setenv("MINT_QWEN3_30B_TRAINING_BACKEND", "megatron")
+    monkeypatch.setenv(
+        "MINT_TOPOLOGY_CONFIG_PATH",
+        _write_supervisor_topology(
+            tmp_path,
+            {
+                base_model: {
+                    "megatron": {"placement": [{"replica": 0, "worker_alias": "mint-worker-0", "gpu_count": 4}]}
+                }
+            },
+        ),
+    )
+
+    specs = desired_specs_from_env()
+    training_specs = [spec for spec in specs if spec.base_model == base_model and spec.launcher_key == "training"]
+
+    assert training_specs[0].domain_key == "megatron:mint_megatron_qwen3_30b_a3b_instruct_2507"
+    assert training_specs[0].normalized_actor_name().startswith("mint_model_runtime_megatron-")
+
+
 def test_issue_593_topology_specs_preserve_multi_node_placement(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,

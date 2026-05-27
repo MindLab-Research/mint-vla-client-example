@@ -451,17 +451,38 @@ def _normalize_megatron_domain_key(base_model: str) -> str:
     return f"mint_megatron_{model_name}" if model_name else "mint_megatron_model"
 
 
-def domain_key_for_training_base_model(base_model: str) -> str:
-    model = str(base_model).strip()
-    if not model:
-        raise ValueError("base_model is required")
+def _is_moe_training_model(model: str) -> bool:
     try:
         from .model_registry import get_model_config
 
-        if bool(getattr(get_model_config(model), "is_moe", False)):
-            return f"megatron:{_normalize_megatron_domain_key(model)}"
+        return bool(getattr(get_model_config(model), "is_moe", False))
     except Exception:
         logger.debug("training domain model config lookup failed for %s", model, exc_info=True)
+        return False
+
+
+def _selected_moe_training_backend(model: str, backend: str | None = None) -> str:
+    raw_backend = str(backend or "").strip().lower()
+    if raw_backend:
+        if raw_backend not in {"bumblebee", "megatron"}:
+            raise ValueError(f"unsupported MoE training backend for topology domain: {backend!r}")
+        return raw_backend
+    try:
+        from .verl_training import _select_moe_training_backend
+
+        return str(_select_moe_training_backend(model)).strip().lower()
+    except Exception:
+        logger.debug("MoE training backend lookup failed for %s", model, exc_info=True)
+        return "megatron"
+
+
+def domain_key_for_training_base_model(base_model: str, *, backend: str | None = None) -> str:
+    model = str(base_model).strip()
+    if not model:
+        raise ValueError("base_model is required")
+    if _is_moe_training_model(model):
+        moe_backend = _selected_moe_training_backend(model, backend=backend)
+        return f"{moe_backend}:{_normalize_megatron_domain_key(model)}"
     return f"training:{model}"
 
 
@@ -531,16 +552,31 @@ def _topology_model_specs_from_config_models(models: dict[str, Any]) -> list[Mod
         base_model = str(model).strip()
         if not base_model:
             continue
-        for launcher_key, domain_key in (
-            ("vllm", domain_key_for_vllm_base_model(base_model)),
-            ("training", domain_key_for_training_base_model(base_model)),
-            ("megatron", domain_key_for_training_base_model(base_model)),
-        ):
+        for launcher_key in ("vllm", "training", "megatron", "bumblebee"):
             raw_launcher_cfg = raw_cfg.get(launcher_key)
             if raw_launcher_cfg is None:
                 continue
             launcher_cfg = raw_launcher_cfg if isinstance(raw_launcher_cfg, dict) else {}
-            if launcher_key == "megatron" and not domain_key.startswith("megatron:"):
+            backend_override = launcher_cfg.get("backend", launcher_cfg.get("training_backend"))
+            if launcher_key == "vllm":
+                domain_key = domain_key_for_vllm_base_model(base_model)
+            elif launcher_key == "bumblebee":
+                domain_key = domain_key_for_training_base_model(base_model, backend="bumblebee")
+            elif launcher_key == "megatron":
+                # Legacy topology files used `megatron` to mean distributed MoE
+                # training placement. Keep the key as a compatibility alias for
+                # the selected MoE backend so backend flips rebuild the runtime
+                # actor domain instead of pinning the old Megatron domain.
+                domain_key = domain_key_for_training_base_model(
+                    base_model,
+                    backend=None if backend_override is None else str(backend_override),
+                )
+            else:
+                domain_key = domain_key_for_training_base_model(
+                    base_model,
+                    backend=None if backend_override is None else str(backend_override),
+                )
+            if launcher_key in {"megatron", "bumblebee"} and domain_key.startswith("training:"):
                 continue
             placement_items = launcher_cfg.get("placement") or []
             if isinstance(placement_items, dict):
@@ -605,7 +641,7 @@ def _topology_model_specs_from_config_models(models: dict[str, Any]) -> list[Mod
                     "placement_alias_slices": [],
                     "gpu_count": default_gpu_count,
                 }
-            spec_launcher = "training" if launcher_key == "megatron" else launcher_key
+            spec_launcher = "training" if launcher_key in {"megatron", "bumblebee"} else launcher_key
             for replica_id, bucket in sorted(by_replica.items()):
                 gpu_count = bucket.get("gpu_count")
                 specs.append(
@@ -687,10 +723,31 @@ def _spec_for_scheduler_domain_from_env(domain_key: str) -> ModelActorSpec | Non
             base_model=base_model,
             launcher_key="training",
         )
-    if domain.startswith("megatron:"):
+    if domain.startswith(("megatron:", "bumblebee:")):
         for spec in supported.values():
             if spec.domain_key == domain:
                 return spec
+        normalized = domain.split(":", 1)[1].strip()
+        for spec in supported.values():
+            if (
+                spec.base_model
+                and _normalize_megatron_domain_key(spec.base_model) == normalized
+                and spec.launcher_key == "training"
+            ):
+                return ModelActorSpec(
+                    domain_key=domain,
+                    replica_id=spec.replica_id,
+                    base_model=spec.base_model,
+                    launcher_key="training",
+                    node_pin=spec.node_pin,
+                    node_pins=spec.node_pins,
+                    placement_slices=spec.placement_slices,
+                    worker_alias=spec.worker_alias,
+                    worker_aliases=spec.worker_aliases,
+                    placement_alias_slices=spec.placement_alias_slices,
+                    gpu_count=spec.gpu_count,
+                    enabled=spec.enabled,
+                )
     return None
 
 
