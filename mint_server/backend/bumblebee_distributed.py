@@ -633,6 +633,72 @@ class BumblebeeRankWorker:
             src_offset += seq_len
         return out
 
+    def _unpad_thd_actor_tensor_to_flat(
+        self,
+        tensor: Any,
+        *,
+        batch: Any,
+        thd_loss_mask: Any,
+        packed_seq_params: Any,
+        name: str,
+    ) -> Any:
+        if tensor is None:
+            return None
+        actor_loss_mask = getattr(batch, "actor_loss_mask", None)
+        target_numel = int(actor_loss_mask.numel()) if actor_loss_mask is not None else sum(
+            int(value) for value in batch.sizes().tolist()
+        )
+        if int(tensor.numel()) == target_numel:
+            if actor_loss_mask is not None:
+                return tensor.reshape_as(actor_loss_mask)
+            return tensor.reshape(-1)
+        if thd_loss_mask is None:
+            raise ValueError(f"{name} cannot be unpadded without THD loss_mask")
+        if int(tensor.numel()) != int(thd_loss_mask.numel()):
+            raise ValueError(
+                f"{name} numel {tensor.numel()} is neither flat tokens {target_numel} "
+                f"nor THD padded tokens {thd_loss_mask.numel()}"
+            )
+
+        source = tensor
+        if source.dim() >= 2 and int(source.shape[0]) == 1:
+            source = source[0]
+        if source.dim() == 0:
+            raise ValueError(f"{name} cannot be unpadded from scalar tensor")
+        if int(source.shape[0]) != int(thd_loss_mask.numel()):
+            source = source.reshape(-1)
+
+        import torch
+
+        seq_lens = [int(value) for value in batch.sizes().tolist()]
+        cu_padded = packed_seq_params.cu_seqlens_q_padded.tolist()
+        pieces = []
+        for idx, seq_len in enumerate(seq_lens):
+            src_start = int(cu_padded[idx])
+            pieces.append(source[src_start : src_start + seq_len])
+        if not pieces:
+            out = source.new_empty((0,))
+        else:
+            out = torch.cat(pieces, dim=0)
+        if actor_loss_mask is not None:
+            return out.reshape_as(actor_loss_mask)
+        return out.reshape(-1)
+
+    def _unpad_thd_forward_result_actor_outputs(self, result: Any, *, batch: Any, runtime_batch: dict[str, Any]) -> None:
+        model_output = getattr(result, "model_output", None)
+        if model_output is None:
+            return
+        log_probs = getattr(model_output, "log_probs", None)
+        if log_probs is None:
+            return
+        model_output.log_probs = self._unpad_thd_actor_tensor_to_flat(
+            log_probs,
+            batch=batch,
+            thd_loss_mask=runtime_batch.get("loss_mask"),
+            packed_seq_params=runtime_batch["packed_seq_params"],
+            name="actor_logprobs",
+        )
+
     def _ensure_session_loaded(self, session_id: str, actual_rank: int | None) -> dict[str, Any]:
         rt, handle = self._require_runtime()
         if self._current_session == session_id:
@@ -713,6 +779,7 @@ class BumblebeeRankWorker:
                 make_mint_actor_loss_fn(loss_fn, loss_cfg),
                 num_microbatches=1,
             )
+            self._unpad_thd_forward_result_actor_outputs(result, batch=batch, runtime_batch=runtime_batch)
             from bumblebee.runtime.adapters.rl import actor_update_output_from_forward_result
             from bumblebee.runtime.contracts.rl import RLActorUpdateRequest
             from bumblebee.runtime.adapters.mint import mint_loss_fn_to_actor_objective

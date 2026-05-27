@@ -151,6 +151,57 @@ def _make_rank_worker_for_sft_loss_test():
     return worker, runtime
 
 
+def test_bumblebee_unpads_thd_actor_logprobs_for_rl_adapter():
+    worker_cls = BumblebeeRankWorker.__ray_actor_class__
+    worker = object.__new__(worker_cls)
+
+    class FakeBatch:
+        actor_loss_mask = torch.ones(5)
+
+        def sizes(self):
+            return torch.tensor([2, 3], dtype=torch.int32)
+
+    packed_seq_params = SimpleNamespace(
+        cu_seqlens_q_padded=torch.tensor([0, 4, 8], dtype=torch.int32),
+    )
+    padded_logprobs = torch.tensor([[1.0, 2.0, 0.0, 0.0, 3.0, 4.0, 5.0, 0.0]])
+
+    unpadded = worker._unpad_thd_actor_tensor_to_flat(
+        padded_logprobs,
+        batch=FakeBatch(),
+        thd_loss_mask=torch.ones((1, 8)),
+        packed_seq_params=packed_seq_params,
+        name="actor_logprobs",
+    )
+
+    assert unpadded.shape == (5,)
+    assert torch.equal(unpadded, torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0]))
+
+
+def test_bumblebee_forward_result_actor_logprobs_are_mutated_to_flat_layout():
+    worker_cls = BumblebeeRankWorker.__ray_actor_class__
+    worker = object.__new__(worker_cls)
+
+    class FakeBatch:
+        actor_loss_mask = torch.ones(3)
+
+        def sizes(self):
+            return torch.tensor([1, 2], dtype=torch.int32)
+
+    result = SimpleNamespace(model_output=SimpleNamespace(log_probs=torch.tensor([[9.0, 0.0, 8.0, 7.0]])))
+    runtime_batch = {
+        "loss_mask": torch.ones((1, 4)),
+        "packed_seq_params": SimpleNamespace(
+            cu_seqlens_q_padded=torch.tensor([0, 2, 4], dtype=torch.int32),
+        ),
+    }
+
+    worker._unpad_thd_forward_result_actor_outputs(result, batch=FakeBatch(), runtime_batch=runtime_batch)
+
+    assert result.model_output.log_probs.shape == (3,)
+    assert torch.equal(result.model_output.log_probs, torch.tensor([9.0, 8.0, 7.0]))
+
+
 def test_bumblebee_checkpoint_save_writes_optimizer_backed_train_state(tmp_path):
     worker, _runtime = _make_rank_worker_for_checkpoint_test()
 
@@ -227,6 +278,9 @@ def test_bumblebee_sft_forward_backward_uses_masked_external_loss(monkeypatch):
     monkeypatch.setitem(sys.modules, "bumblebee.runtime", types.ModuleType("bumblebee.runtime"))
     monkeypatch.setitem(sys.modules, "bumblebee.runtime.adapters", types.ModuleType("bumblebee.runtime.adapters"))
     monkeypatch.setitem(sys.modules, "bumblebee.runtime.adapters.mint", mint_module)
+    megatron_training_module = types.ModuleType("mint_server.backend.megatron_training")
+    megatron_training_module.benchmark_debug_input_entries = lambda data_items: []
+    monkeypatch.setitem(sys.modules, "mint_server.backend.megatron_training", megatron_training_module)
 
     payload = worker.forward_backward(
         [{"input_ids": [1, 2, 3]}],
